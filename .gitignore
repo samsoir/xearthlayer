@@ -1,0 +1,45 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock for libraries (keep it for binaries)
+# Uncomment if this becomes a library crate
+# Cargo.lock
+
+# Generated documentation
+/doc/
+
+# Profiling and benchmarking
+flamegraph.svg
+perf.data
+perf.data.old
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude Code resources (tool-specific, not for version control)
+CLAUDE.md
+.claude/
+.cursor/
+.cursorrules
+
+# Environment and local configuration
+.env
+.env.local
+*.local
+
+# Test coverage
+tarpaulin-report.html
+cobertura.xml
+lcov.info
+
+# Platform-specific
+Thumbs.db
+.Spotlight-V100
+.Trashes
