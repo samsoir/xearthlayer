@@ -110,6 +110,128 @@ pub fn tile_to_lat_lon(tile: &TileCoord) -> (f64, f64) {
     (lat, lon)
 }
 
+/// Converts tile coordinates to a Bing Maps quadkey.
+///
+/// Quadkeys are base-4 strings where each digit (0-3) represents which quadrant
+/// the tile is in at each zoom level. This is Bing Maps' tile naming scheme.
+///
+/// # Arguments
+///
+/// * `tile` - The tile coordinates to convert
+///
+/// # Returns
+///
+/// A string of digits 0-3, with length equal to the zoom level.
+/// Zoom 0 returns an empty string.
+///
+/// # Quadkey Encoding
+///
+/// Each digit represents a quadrant:
+/// - 0 = top-left (northwest)
+/// - 1 = top-right (northeast)
+/// - 2 = bottom-left (southwest)
+/// - 3 = bottom-right (southeast)
+///
+/// # Example
+///
+/// ```
+/// use xearthlayer::coord::{TileCoord, tile_to_quadkey};
+///
+/// let tile = TileCoord { row: 5, col: 3, zoom: 3 };
+/// assert_eq!(tile_to_quadkey(&tile), "213");
+/// ```
+#[inline]
+pub fn tile_to_quadkey(tile: &TileCoord) -> String {
+    let mut quadkey = String::with_capacity(tile.zoom as usize);
+
+    // Build quadkey from most significant to least significant zoom level
+    for i in (1..=tile.zoom).rev() {
+        let mut digit = 0u8;
+        let mask = 1u32 << (i - 1);
+
+        // Check if column bit is set (east/west)
+        if (tile.col & mask) != 0 {
+            digit += 1;
+        }
+
+        // Check if row bit is set (north/south)
+        if (tile.row & mask) != 0 {
+            digit += 2;
+        }
+
+        quadkey.push((b'0' + digit) as char);
+    }
+
+    quadkey
+}
+
+/// Converts a Bing Maps quadkey to tile coordinates.
+///
+/// This is the inverse of `tile_to_quadkey`.
+///
+/// # Arguments
+///
+/// * `quadkey` - A string containing only digits 0-3
+///
+/// # Returns
+///
+/// A `Result` containing the tile coordinates or an error if the quadkey is invalid.
+///
+/// # Errors
+///
+/// Returns `CoordError::InvalidQuadkey` if:
+/// - The quadkey contains characters other than '0'-'3'
+/// - The quadkey length exceeds `MAX_ZOOM` (18)
+///
+/// # Example
+///
+/// ```
+/// use xearthlayer::coord::{quadkey_to_tile, TileCoord};
+///
+/// let tile = quadkey_to_tile("213").unwrap();
+/// assert_eq!(tile, TileCoord { row: 5, col: 3, zoom: 3 });
+/// ```
+#[inline]
+pub fn quadkey_to_tile(quadkey: &str) -> Result<TileCoord, CoordError> {
+    // Validate quadkey length
+    if quadkey.len() > MAX_ZOOM as usize {
+        return Err(CoordError::InvalidQuadkey(quadkey.to_string()));
+    }
+
+    let mut row = 0u32;
+    let mut col = 0u32;
+
+    // Parse quadkey from left to right (most significant to least significant)
+    for c in quadkey.chars() {
+        // Validate character is a digit 0-3
+        let digit = match c {
+            '0' => 0,
+            '1' => 1,
+            '2' => 2,
+            '3' => 3,
+            _ => return Err(CoordError::InvalidQuadkey(quadkey.to_string())),
+        };
+
+        // Shift existing coordinates left (multiply by 2)
+        row <<= 1;
+        col <<= 1;
+
+        // Add bit based on digit
+        if (digit & 1) != 0 {
+            col |= 1; // East
+        }
+        if (digit & 2) != 0 {
+            row |= 1; // South
+        }
+    }
+
+    Ok(TileCoord {
+        row,
+        col,
+        zoom: quadkey.len() as u8,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,6 +542,181 @@ mod tests {
         assert_eq!(seen.len(), 256, "Should have 256 unique chunks");
     }
 
+    // Quadkey conversion tests
+    #[test]
+    fn test_tile_to_quadkey_zoom_0() {
+        // Zoom 0 has only one tile, quadkey should be empty
+        let tile = TileCoord {
+            row: 0,
+            col: 0,
+            zoom: 0,
+        };
+        assert_eq!(tile_to_quadkey(&tile), "");
+    }
+
+    #[test]
+    fn test_tile_to_quadkey_zoom_1() {
+        // Zoom 1 has 2×2 tiles, quadkeys are "0", "1", "2", "3"
+        assert_eq!(
+            tile_to_quadkey(&TileCoord {
+                row: 0,
+                col: 0,
+                zoom: 1
+            }),
+            "0"
+        ); // top-left
+        assert_eq!(
+            tile_to_quadkey(&TileCoord {
+                row: 0,
+                col: 1,
+                zoom: 1
+            }),
+            "1"
+        ); // top-right
+        assert_eq!(
+            tile_to_quadkey(&TileCoord {
+                row: 1,
+                col: 0,
+                zoom: 1
+            }),
+            "2"
+        ); // bottom-left
+        assert_eq!(
+            tile_to_quadkey(&TileCoord {
+                row: 1,
+                col: 1,
+                zoom: 1
+            }),
+            "3"
+        ); // bottom-right
+    }
+
+    #[test]
+    fn test_tile_to_quadkey_bing_example() {
+        // Example from Bing Maps documentation
+        // Tile (3, 5, 3) should be quadkey "213"
+        let tile = TileCoord {
+            row: 5,
+            col: 3,
+            zoom: 3,
+        };
+        assert_eq!(tile_to_quadkey(&tile), "213");
+    }
+
+    #[test]
+    fn test_tile_to_quadkey_length() {
+        // Quadkey length should equal zoom level
+        for zoom in 0..=18 {
+            let tile = TileCoord {
+                row: 0,
+                col: 0,
+                zoom,
+            };
+            assert_eq!(
+                tile_to_quadkey(&tile).len(),
+                zoom as usize,
+                "Quadkey length should match zoom level"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tile_to_quadkey_nyc() {
+        // New York City tile at zoom 16
+        let tile = TileCoord {
+            row: 24640,
+            col: 19295,
+            zoom: 16,
+        };
+        let quadkey = tile_to_quadkey(&tile);
+        assert_eq!(quadkey.len(), 16);
+        // Quadkey should only contain digits 0-3
+        assert!(quadkey.chars().all(|c| c >= '0' && c <= '3'));
+    }
+
+    #[test]
+    fn test_quadkey_to_tile_zoom_0() {
+        // Empty quadkey should return zoom 0 tile at origin
+        let tile = quadkey_to_tile("").unwrap();
+        assert_eq!(tile.row, 0);
+        assert_eq!(tile.col, 0);
+        assert_eq!(tile.zoom, 0);
+    }
+
+    #[test]
+    fn test_quadkey_to_tile_zoom_1() {
+        // Single digit quadkeys should map to zoom 1 tiles
+        assert_eq!(
+            quadkey_to_tile("0").unwrap(),
+            TileCoord {
+                row: 0,
+                col: 0,
+                zoom: 1
+            }
+        ); // top-left
+        assert_eq!(
+            quadkey_to_tile("1").unwrap(),
+            TileCoord {
+                row: 0,
+                col: 1,
+                zoom: 1
+            }
+        ); // top-right
+        assert_eq!(
+            quadkey_to_tile("2").unwrap(),
+            TileCoord {
+                row: 1,
+                col: 0,
+                zoom: 1
+            }
+        ); // bottom-left
+        assert_eq!(
+            quadkey_to_tile("3").unwrap(),
+            TileCoord {
+                row: 1,
+                col: 1,
+                zoom: 1
+            }
+        ); // bottom-right
+    }
+
+    #[test]
+    fn test_quadkey_to_tile_bing_example() {
+        // Reverse of Bing example
+        let tile = quadkey_to_tile("213").unwrap();
+        assert_eq!(tile.row, 5);
+        assert_eq!(tile.col, 3);
+        assert_eq!(tile.zoom, 3);
+    }
+
+    #[test]
+    fn test_quadkey_to_tile_invalid_characters() {
+        // Quadkey with invalid characters should error
+        assert!(quadkey_to_tile("012a").is_err());
+        assert!(quadkey_to_tile("4").is_err());
+        assert!(quadkey_to_tile("01-3").is_err());
+    }
+
+    #[test]
+    fn test_quadkey_to_tile_too_long() {
+        // Quadkey longer than MAX_ZOOM should error
+        let long_quadkey = "0123012301230123012"; // 19 digits
+        assert!(quadkey_to_tile(long_quadkey).is_err());
+    }
+
+    #[test]
+    fn test_quadkey_roundtrip() {
+        // Converting tile → quadkey → tile should be identity
+        let original = TileCoord {
+            row: 24640,
+            col: 19295,
+            zoom: 16,
+        };
+        let quadkey = tile_to_quadkey(&original);
+        let converted = quadkey_to_tile(&quadkey).unwrap();
+        assert_eq!(converted, original);
+    }
+
     // Property-based tests using proptest
     mod property_tests {
         use super::*;
@@ -656,6 +953,107 @@ mod tests {
                 }
 
                 prop_assert_eq!(seen.len(), 256);
+            }
+
+            // Quadkey property tests
+            #[test]
+            fn test_quadkey_roundtrip_property(
+                row in 0u32..100000,
+                col in 0u32..100000,
+                zoom in 0u8..=18
+            ) {
+                // Constrain row/col to valid range for zoom level
+                let max_coord = 2u32.pow(zoom as u32);
+                let row = row % max_coord.max(1);
+                let col = col % max_coord.max(1);
+
+                let original = TileCoord { row, col, zoom };
+                let quadkey = tile_to_quadkey(&original);
+                let converted = quadkey_to_tile(&quadkey)?;
+
+                prop_assert_eq!(converted, original,
+                    "Roundtrip failed: {:?} -> {} -> {:?}", original, quadkey, converted);
+            }
+
+            #[test]
+            fn test_quadkey_length_equals_zoom(
+                row in 0u32..1000,
+                col in 0u32..1000,
+                zoom in 0u8..=18
+            ) {
+                // Quadkey length should always equal zoom level
+                let max_coord = 2u32.pow(zoom as u32);
+                let row = row % max_coord.max(1);
+                let col = col % max_coord.max(1);
+
+                let tile = TileCoord { row, col, zoom };
+                let quadkey = tile_to_quadkey(&tile);
+
+                prop_assert_eq!(quadkey.len(), zoom as usize,
+                    "Quadkey length {} doesn't match zoom {}", quadkey.len(), zoom);
+            }
+
+            #[test]
+            fn test_quadkey_only_valid_digits(
+                row in 0u32..1000,
+                col in 0u32..1000,
+                zoom in 1u8..=18
+            ) {
+                // Quadkeys should only contain digits 0-3
+                let max_coord = 2u32.pow(zoom as u32);
+                let row = row % max_coord;
+                let col = col % max_coord;
+
+                let tile = TileCoord { row, col, zoom };
+                let quadkey = tile_to_quadkey(&tile);
+
+                for c in quadkey.chars() {
+                    prop_assert!(
+                        c >= '0' && c <= '3',
+                        "Quadkey {} contains invalid character '{}'", quadkey, c
+                    );
+                }
+            }
+
+            #[test]
+            fn test_quadkey_deterministic(
+                row in 0u32..1000,
+                col in 0u32..1000,
+                zoom in 0u8..=18
+            ) {
+                // Same tile should always produce same quadkey
+                let max_coord = 2u32.pow(zoom as u32);
+                let row = row % max_coord.max(1);
+                let col = col % max_coord.max(1);
+
+                let tile = TileCoord { row, col, zoom };
+                let quadkey1 = tile_to_quadkey(&tile);
+                let quadkey2 = tile_to_quadkey(&tile);
+
+                prop_assert_eq!(quadkey1, quadkey2, "Quadkey generation not deterministic");
+            }
+
+            #[test]
+            fn test_quadkey_to_tile_validates_length(
+                quadkey_len in 19usize..30
+            ) {
+                // Quadkeys longer than MAX_ZOOM should be rejected
+                let quadkey: String = std::iter::repeat('0').take(quadkey_len).collect();
+                let result = quadkey_to_tile(&quadkey);
+
+                prop_assert!(result.is_err(), "Should reject quadkey length {}", quadkey_len);
+                prop_assert!(matches!(result.unwrap_err(), CoordError::InvalidQuadkey(_)));
+            }
+
+            #[test]
+            fn test_quadkey_zoom_0_always_empty(
+                _row in 0u32..100,
+                _col in 0u32..100
+            ) {
+                // Zoom 0 tiles should always produce empty quadkey
+                let tile = TileCoord { row: 0, col: 0, zoom: 0 };
+                let quadkey = tile_to_quadkey(&tile);
+                prop_assert_eq!(quadkey, "", "Zoom 0 should produce empty quadkey");
             }
         }
     }

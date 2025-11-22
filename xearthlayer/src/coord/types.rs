@@ -124,6 +124,8 @@ pub enum CoordError {
     InvalidLongitude(f64),
     /// Zoom level is outside valid range (0 to 18)
     InvalidZoom(u8),
+    /// Quadkey contains invalid characters or is too long
+    InvalidQuadkey(String),
 }
 
 impl fmt::Display for CoordError {
@@ -148,6 +150,13 @@ impl fmt::Display for CoordError {
                     f,
                     "Invalid zoom level: {} (must be between {} and {})",
                     zoom, MIN_ZOOM, MAX_ZOOM
+                )
+            }
+            CoordError::InvalidQuadkey(quadkey) => {
+                write!(
+                    f,
+                    "Invalid quadkey: '{}' (must contain only digits 0-3 and length <= {})",
+                    quadkey, MAX_ZOOM
                 )
             }
         }
