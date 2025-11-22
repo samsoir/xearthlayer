@@ -3,6 +3,8 @@
 //! This library provides the core functionality for streaming satellite imagery
 //! to X-Plane flight simulator via a FUSE virtual filesystem.
 
+pub mod coord;
+
 /// Returns a greeting message from XEarthLayer.
 ///
 /// This is a placeholder function demonstrating the library architecture.
@@ -25,5 +27,13 @@ mod tests {
     fn test_greeting_is_not_empty() {
         let message = greeting();
         assert!(!message.is_empty(), "Greeting should not be empty");
+    }
+
+    #[test]
+    fn test_coord_module_exists() {
+        // Verify coord module is accessible
+        use crate::coord::to_tile_coords;
+        let result = to_tile_coords(40.7128, -74.0060, 16);
+        assert!(result.is_ok());
     }
 }
