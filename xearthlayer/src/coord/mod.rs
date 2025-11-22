@@ -383,7 +383,8 @@ mod tests {
         // Global coords should be: tile * 16 + chunk_offset
         assert_eq!(global_row, 100 * 16 + 5); // 1605
         assert_eq!(global_col, 200 * 16 + 7); // 3207
-        assert_eq!(zoom, 10);
+                                              // Zoom should be +4 from tile zoom (10 + 4 = 14)
+        assert_eq!(zoom, 14);
     }
 
     #[test]
@@ -899,7 +900,7 @@ mod tests {
 
                 prop_assert_eq!(global_row, tile_row * 16 + chunk_row as u32);
                 prop_assert_eq!(global_col, tile_col * 16 + chunk_col as u32);
-                prop_assert_eq!(global_zoom, zoom);
+                prop_assert_eq!(global_zoom, zoom + 4);
             }
 
             #[test]

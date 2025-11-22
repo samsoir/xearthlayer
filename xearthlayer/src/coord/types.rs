@@ -107,11 +107,14 @@ impl ChunkCoord {
     ///
     /// This is used when requesting chunks from satellite imagery providers,
     /// which expect global tile coordinates at the chunk resolution.
+    ///
+    /// Returns coordinates at zoom+4, because a tile at zoom Z is composed
+    /// of 16×16 chunks, where each chunk is a 256×256 tile from zoom Z+4.
     #[inline]
     pub fn to_global_coords(&self) -> (u32, u32, u8) {
         let global_row = self.tile_row * 16 + self.chunk_row as u32;
         let global_col = self.tile_col * 16 + self.chunk_col as u32;
-        (global_row, global_col, self.zoom)
+        (global_row, global_col, self.zoom + 4)
     }
 }
 
