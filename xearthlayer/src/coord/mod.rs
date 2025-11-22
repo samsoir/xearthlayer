@@ -50,9 +50,18 @@ pub fn to_tile_coords(lat: f64, lon: f64, zoom: u8) -> Result<TileCoord, CoordEr
 ///
 /// Returns the latitude/longitude of the tile's northwest corner.
 #[inline]
-pub fn tile_to_lat_lon(_tile: &TileCoord) -> (f64, f64) {
-    // TODO: Implement
-    todo!()
+pub fn tile_to_lat_lon(tile: &TileCoord) -> (f64, f64) {
+    let n = 2.0_f64.powi(tile.zoom as i32);
+
+    // Convert tile X coordinate to longitude
+    let lon = tile.col as f64 / n * 360.0 - 180.0;
+
+    // Convert tile Y coordinate to latitude using inverse Web Mercator
+    let y = tile.row as f64 / n;
+    let lat_rad = (PI * (1.0 - 2.0 * y)).sinh().atan();
+    let lat = lat_rad * 180.0 / PI;
+
+    (lat, lon)
 }
 
 #[cfg(test)]
@@ -79,5 +88,98 @@ mod tests {
             result.unwrap_err(),
             CoordError::InvalidLatitude(_)
         ));
+    }
+
+    #[test]
+    fn test_tile_to_lat_lon_northwest_corner() {
+        // Tile should return its northwest corner coordinates
+        let tile = TileCoord {
+            row: 24640,
+            col: 19295,
+            zoom: 16,
+        };
+
+        let (lat, lon) = tile_to_lat_lon(&tile);
+
+        // Should be close to NYC but not exact (northwest corner of tile)
+        assert!(
+            (lat - 40.713).abs() < 0.01,
+            "Latitude should be close to 40.713"
+        );
+        assert!(
+            (lon - (-74.007)).abs() < 0.01,
+            "Longitude should be close to -74.007"
+        );
+    }
+
+    #[test]
+    fn test_tile_to_lat_lon_at_equator() {
+        // Tile at equator, prime meridian
+        let tile = TileCoord {
+            row: 512,
+            col: 512,
+            zoom: 10,
+        };
+
+        let (lat, lon) = tile_to_lat_lon(&tile);
+
+        // At zoom 10, tile 512,512 should be near 0,0
+        assert!(lat.abs() < 1.0, "Should be near equator");
+        assert!(lon.abs() < 1.0, "Should be near prime meridian");
+    }
+
+    #[test]
+    fn test_roundtrip_conversion() {
+        // Convert lat/lon → tile → lat/lon should give similar coordinates
+        let original_lat = 40.7128;
+        let original_lon = -74.0060;
+        let zoom = 16;
+
+        // Forward conversion
+        let tile = to_tile_coords(original_lat, original_lon, zoom).unwrap();
+
+        // Reverse conversion
+        let (converted_lat, converted_lon) = tile_to_lat_lon(&tile);
+
+        // Should be close (within tile precision)
+        // At zoom 16, each tile is ~1.2km, so tolerance should be small
+        assert!(
+            (converted_lat - original_lat).abs() < 0.01,
+            "Latitude should roundtrip within 0.01 degrees"
+        );
+        assert!(
+            (converted_lon - original_lon).abs() < 0.01,
+            "Longitude should roundtrip within 0.01 degrees"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_at_different_zooms() {
+        let lat = 51.5074; // London
+        let lon = -0.1278;
+
+        for zoom in [0, 5, 10, 15, 18] {
+            let tile = to_tile_coords(lat, lon, zoom).unwrap();
+            let (converted_lat, converted_lon) = tile_to_lat_lon(&tile);
+
+            // Tolerance is the size of one tile at this zoom level
+            // Since tile_to_lat_lon returns northwest corner, we need full tile tolerance
+            let tile_size_degrees = 360.0 / (2.0_f64.powi(zoom as i32));
+
+            assert!(
+                (converted_lat - lat).abs() < tile_size_degrees,
+                "Zoom {}: lat diff {} exceeds tile size {}",
+                zoom,
+                (converted_lat - lat).abs(),
+                tile_size_degrees
+            );
+            assert!(
+                (converted_lon - lon).abs() < tile_size_degrees,
+                "Zoom {}: lon diff {} exceeds tile size {}",
+                zoom,
+                (converted_lon - lon).abs(),
+                tile_size_degrees
+            );
+        }
     }
 }
