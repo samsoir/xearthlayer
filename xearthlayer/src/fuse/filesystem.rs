@@ -3,17 +3,18 @@
 //! Provides a virtual filesystem that intercepts X-Plane texture file reads
 //! and generates satellite imagery DDS files on-demand.
 
-use crate::coord::TileCoord;
+use crate::coord::to_tile_coords;
 use crate::dds::{DdsEncoder, DdsFormat};
-use crate::fuse::{generate_default_placeholder, parse_dds_filename};
+use crate::fuse::{generate_default_placeholder, parse_dds_filename, DdsFilename};
 use crate::orchestrator::TileOrchestrator;
 use crate::provider::Provider;
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
 };
-use libc::{ENOENT, ENOSYS};
+use libc::ENOENT;
+use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tracing::{debug, error, info, warn};
 
@@ -35,7 +36,6 @@ const TTL: Duration = Duration::from_secs(1);
 ///     ├── +37-122_BI16.dds (generated on-demand)
 ///     └── ...
 /// ```
-#[allow(dead_code)] // Will be used when implementing full FUSE server
 pub struct XEarthLayerFS<P: Provider> {
     /// Tile orchestrator for downloading imagery
     orchestrator: Arc<TileOrchestrator<P>>,
@@ -43,6 +43,10 @@ pub struct XEarthLayerFS<P: Provider> {
     dds_format: DdsFormat,
     /// Number of mipmap levels
     mipmap_count: usize,
+    /// Cache mapping inode numbers to DDS filenames
+    inode_cache: Arc<Mutex<HashMap<u64, DdsFilename>>>,
+    /// Cache of generated DDS files (inode -> DDS data)
+    dds_cache: Arc<Mutex<HashMap<u64, Vec<u8>>>>,
 }
 
 impl<P: Provider + 'static> XEarthLayerFS<P> {
@@ -62,6 +66,8 @@ impl<P: Provider + 'static> XEarthLayerFS<P> {
             orchestrator: Arc::new(orchestrator),
             dds_format,
             mipmap_count,
+            inode_cache: Arc::new(Mutex::new(HashMap::new())),
+            dds_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -134,7 +140,7 @@ impl<P: Provider + 'static> XEarthLayerFS<P> {
         }
     }
 
-    /// Generate inode number from filename.
+    /// Generate inode number from filename and cache the mapping.
     fn filename_to_inode(&self, name: &OsStr) -> Option<u64> {
         let name_str = name.to_str()?;
 
@@ -146,6 +152,12 @@ impl<P: Provider + 'static> XEarthLayerFS<P> {
                 + ((coords.row.unsigned_abs() as u64) * 1000000)
                 + ((coords.col.unsigned_abs() as u64) * 1000)
                 + (coords.zoom as u64);
+
+            // Store the mapping in the cache
+            if let Ok(mut cache) = self.inode_cache.lock() {
+                cache.insert(inode, coords);
+            }
+
             Some(inode)
         } else {
             None
@@ -153,19 +165,37 @@ impl<P: Provider + 'static> XEarthLayerFS<P> {
     }
 
     /// Generate DDS file on-demand for the given coordinates.
-    #[allow(dead_code)] // Will be used when read() is fully implemented
-    fn generate_tile_dds(&self, coords: &crate::fuse::DdsFilename) -> Vec<u8> {
+    fn generate_tile_dds(&self, coords: &DdsFilename) -> Vec<u8> {
         info!(
-            "Generating DDS for tile: row={}, col={}, zoom={}",
+            "Generating DDS for tile: lat={}, lon={}, zoom={}",
             coords.row, coords.col, coords.zoom
         );
 
-        // Convert DDS filename coords to TileCoord
-        // Note: DDS filename uses row/col, we need to use our TileCoord system
-        let tile = TileCoord {
-            row: coords.row as u32,
-            col: coords.col as u32,
-            zoom: coords.zoom,
+        // Convert DDS filename coords (lat/lon in degrees) to TileCoord
+        // The DDS filename format is: +LAT+LON_MAPTYPE_ZOOM.dds
+        // For example: +37-123_BI16.dds means lat=37°, lon=-123°, zoom=16
+        let lat = coords.row as f64;
+        let lon = coords.col as f64;
+
+        let tile = match to_tile_coords(lat, lon, coords.zoom) {
+            Ok(t) => {
+                info!(
+                    "Converted lat={}, lon={}, zoom={} to tile row={}, col={}",
+                    lat, lon, coords.zoom, t.row, t.col
+                );
+                t
+            }
+            Err(e) => {
+                error!("Failed to convert coordinates: {}", e);
+                warn!("Returning magenta placeholder for invalid coordinates");
+                return match generate_default_placeholder() {
+                    Ok(placeholder) => placeholder,
+                    Err(placeholder_err) => {
+                        error!("Failed to generate placeholder: {}", placeholder_err);
+                        Vec::new()
+                    }
+                };
+            }
         };
 
         // Download tile imagery
@@ -273,17 +303,75 @@ impl<P: Provider + 'static> Filesystem for XEarthLayerFS<P> {
 
         // Only handle tile files
         if ino < TILE_FILE_INODE_BASE {
-            reply.error(ENOSYS);
+            reply.error(ENOENT);
             return;
         }
 
-        // We need to get the filename from the inode
-        // For now, this is a limitation - we can't easily reverse the inode mapping
-        // In a real implementation, we'd cache the inode->filename mapping
-        // For Phase 1, we'll generate a test tile response
+        // Look up the filename from the inode cache
+        let coords = {
+            let cache = match self.inode_cache.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to lock inode cache: {}", e);
+                    reply.error(libc::EIO);
+                    return;
+                }
+            };
 
-        error!("read: inode-to-filename reverse mapping not yet implemented");
-        reply.error(ENOSYS);
+            match cache.get(&ino) {
+                Some(coords) => coords.clone(),
+                None => {
+                    error!("Inode {} not found in cache", ino);
+                    reply.error(ENOENT);
+                    return;
+                }
+            }
+        };
+
+        // Get or generate the DDS data
+        let dds_data = {
+            // First, check if we already have this file in the DDS cache
+            let mut dds_cache = match self.dds_cache.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to lock DDS cache: {}", e);
+                    reply.error(libc::EIO);
+                    return;
+                }
+            };
+
+            if let Some(data) = dds_cache.get(&ino) {
+                info!("DDS cache hit for inode {}", ino);
+                data.clone()
+            } else {
+                // Generate the DDS file
+                info!("DDS cache miss for inode {}, generating...", ino);
+                let data = self.generate_tile_dds(&coords);
+                dds_cache.insert(ino, data.clone());
+                data
+            }
+        };
+
+        // Return the requested portion of the data
+        let offset = offset as usize;
+        let size = size as usize;
+
+        if offset >= dds_data.len() {
+            // Offset is beyond the file
+            reply.data(&[]);
+            return;
+        }
+
+        let end = std::cmp::min(offset + size, dds_data.len());
+        let data = &dds_data[offset..end];
+
+        debug!(
+            "Returning {} bytes (requested {}, available {})",
+            data.len(),
+            size,
+            dds_data.len()
+        );
+        reply.data(data);
     }
 
     fn readdir(
