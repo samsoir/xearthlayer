@@ -13,6 +13,12 @@ path = "src/lib.rs"
 [dependencies]
 reqwest = { version = "0.12", features = ["blocking"] }
 image = "0.25"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+fuser = "0.14"
+libc = "0.2"
+regex = "1.10"
 
 [dev-dependencies]
 proptest = "1.4"

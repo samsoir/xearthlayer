@@ -92,6 +92,17 @@ The following modules from the AutoOrtho architecture remain to be implemented:
 
 ## Getting Started
 
+### Version Information
+
+XEarthLayer uses a single version number for both the library and CLI components, maintained in the `VERSION` file at the repository root. Both components are released together with synchronized versions.
+
+```bash
+# Check version
+./target/release/xearthlayer --version
+```
+
+The version is also logged at the start of each command execution and is available programmatically via `xearthlayer::VERSION`.
+
 ### Development Setup
 
 ```bash
@@ -118,17 +129,20 @@ Download a satellite imagery tile for any location:
 # Build the CLI
 cargo build --release
 
+# Check version
+./target/release/xearthlayer --version
+
 # Download NYC area at zoom 15 (maximum for Bing Maps)
-./target/release/xearthlayer \
+./target/release/xearthlayer download \
   --lat 40.7128 \
-  --lon -74.0060 \
+  --lon=-74.0060 \
   --zoom 15 \
   --output nyc_tile.jpg
 
 # Download San Francisco
-./target/release/xearthlayer \
+./target/release/xearthlayer download \
   --lat 37.7749 \
-  --lon -122.4194 \
+  --lon=-122.4194 \
   --zoom 15 \
   --output sf_tile.jpg
 ```
@@ -141,23 +155,20 @@ The CLI can generate DDS (DirectX Surface) texture files with BC1/BC3 compressio
 
 ```bash
 # Generate BC1 DDS texture (auto-detected from .dds extension)
-./target/release/xearthlayer \
+./target/release/xearthlayer download \
   --lat 37.7749 \
   --lon=-122.4194 \
   --zoom 15 \
   --output sf_tile.dds
 
 # Generate BC3 DDS with custom mipmap count
-./target/release/xearthlayer \
+./target/release/xearthlayer download \
   --lat 40.7128 \
   --lon=-74.0060 \
   --zoom 15 \
   --dds-format bc3 \
   --mipmap-count 5 \
   --output nyc_tile.dds
-
-# Test DDS generation with script
-./test_dds_output.sh
 ```
 
 **DDS Format Options:**
@@ -212,7 +223,7 @@ Google Maps provides higher resolution imagery (up to zoom 18 vs Bing's zoom 15)
 
 ```bash
 # Download with Google Maps provider
-./target/release/xearthlayer \
+./target/release/xearthlayer download \
   --lat 37.7749 \
   --lon=-122.4194 \
   --zoom 18 \
@@ -222,7 +233,7 @@ Google Maps provides higher resolution imagery (up to zoom 18 vs Bing's zoom 15)
 
 # Comparison: Bing Maps (zoom 15) vs Google Maps (zoom 18)
 # Bing - lower resolution, free
-./target/release/xearthlayer \
+./target/release/xearthlayer download \
   --lat 40.7128 \
   --lon=-74.0060 \
   --zoom 15 \
@@ -230,7 +241,7 @@ Google Maps provides higher resolution imagery (up to zoom 18 vs Bing's zoom 15)
   --output nyc_bing.jpg
 
 # Google - higher resolution, requires API key
-./target/release/xearthlayer \
+./target/release/xearthlayer download \
   --lat 40.7128 \
   --lon=-74.0060 \
   --zoom 18 \

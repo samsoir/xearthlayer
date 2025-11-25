@@ -2,10 +2,13 @@
 //!
 //! This binary provides a command-line interface to the XEarthLayer library.
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::process;
+use tracing::{error, info};
 use xearthlayer::coord::to_tile_coords;
 use xearthlayer::dds::{DdsEncoder, DdsFormat};
+use xearthlayer::fuse::XEarthLayerFS;
+use xearthlayer::logging::{default_log_dir, default_log_file, init_logging};
 use xearthlayer::orchestrator::TileOrchestrator;
 use xearthlayer::provider::{BingMapsProvider, GoogleMapsProvider, Provider, ReqwestClient};
 
@@ -35,66 +38,190 @@ enum DdsCompressionFormat {
 
 #[derive(Parser)]
 #[command(name = "xearthlayer")]
-#[command(about = "Download satellite imagery tiles for X-Plane", long_about = None)]
-struct Args {
-    /// Latitude in decimal degrees
-    #[arg(long)]
-    lat: f64,
+#[command(version = xearthlayer::VERSION)]
+#[command(about = "Satellite imagery streaming for X-Plane", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    /// Longitude in decimal degrees
-    #[arg(long)]
-    lon: f64,
+#[derive(Subcommand)]
+enum Commands {
+    /// Download a single tile to a file
+    Download {
+        /// Latitude in decimal degrees
+        #[arg(long)]
+        lat: f64,
 
-    /// Zoom level (max: 15 for Bing, 18 for Google)
-    #[arg(long, default_value = "15")]
-    zoom: u8,
+        /// Longitude in decimal degrees
+        #[arg(long)]
+        lon: f64,
 
-    /// Output file path (auto-detects format from extension: .jpg/.dds)
-    #[arg(long)]
-    output: String,
+        /// Zoom level (max: 15 for Bing, 18 for Google)
+        #[arg(long, default_value = "15")]
+        zoom: u8,
 
-    /// Output format (auto-detected from file extension if not specified)
-    #[arg(long, value_enum)]
-    format: Option<OutputFormat>,
+        /// Output file path (auto-detects format from extension: .jpg/.dds)
+        #[arg(long)]
+        output: String,
 
-    /// DDS compression format (BC1 or BC3)
-    #[arg(long, value_enum, default_value = "bc1")]
-    dds_format: DdsCompressionFormat,
+        /// Output format (auto-detected from file extension if not specified)
+        #[arg(long, value_enum)]
+        format: Option<OutputFormat>,
 
-    /// Number of mipmap levels for DDS (default: 5 for 4096→256)
-    #[arg(long, default_value = "5")]
-    mipmap_count: usize,
+        /// DDS compression format (BC1 or BC3)
+        #[arg(long, value_enum, default_value = "bc1")]
+        dds_format: DdsCompressionFormat,
 
-    /// Imagery provider to use
-    #[arg(long, value_enum, default_value = "bing")]
-    provider: ProviderType,
+        /// Number of mipmap levels for DDS (default: 5 for 4096→256)
+        #[arg(long, default_value = "5")]
+        mipmap_count: usize,
 
-    /// Google Maps API key (required when using --provider google)
-    #[arg(long, required_if_eq("provider", "google"))]
-    google_api_key: Option<String>,
+        /// Imagery provider to use
+        #[arg(long, value_enum, default_value = "bing")]
+        provider: ProviderType,
+
+        /// Google Maps API key (required when using --provider google)
+        #[arg(long, required_if_eq("provider", "google"))]
+        google_api_key: Option<String>,
+    },
+
+    /// Start FUSE server for on-demand texture generation
+    Serve {
+        /// FUSE mountpoint directory
+        #[arg(long)]
+        mountpoint: String,
+
+        /// Imagery provider to use
+        #[arg(long, value_enum, default_value = "bing")]
+        provider: ProviderType,
+
+        /// Google Maps API key (required when using --provider google)
+        #[arg(long, required_if_eq("provider", "google"))]
+        google_api_key: Option<String>,
+
+        /// DDS compression format (BC1 or BC3)
+        #[arg(long, value_enum, default_value = "bc1")]
+        dds_format: DdsCompressionFormat,
+
+        /// Number of mipmap levels for DDS (default: 5 for 4096→256)
+        #[arg(long, default_value = "5")]
+        mipmap_count: usize,
+
+        /// Download timeout in seconds
+        #[arg(long, default_value = "30")]
+        timeout: u64,
+
+        /// Number of retry attempts per chunk
+        #[arg(long, default_value = "3")]
+        retries: usize,
+
+        /// Maximum parallel downloads
+        #[arg(long, default_value = "32")]
+        parallel: usize,
+    },
 }
 
 fn main() {
-    let args = Args::parse();
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Download {
+            lat,
+            lon,
+            zoom,
+            output,
+            format,
+            dds_format,
+            mipmap_count,
+            provider,
+            google_api_key,
+        } => {
+            handle_download(
+                lat,
+                lon,
+                zoom,
+                &output,
+                &format,
+                &dds_format,
+                mipmap_count,
+                provider,
+                google_api_key,
+            );
+        }
+        Commands::Serve {
+            mountpoint,
+            provider,
+            google_api_key,
+            dds_format,
+            mipmap_count,
+            timeout,
+            retries,
+            parallel,
+        } => {
+            handle_serve(
+                &mountpoint,
+                provider,
+                google_api_key,
+                &dds_format,
+                mipmap_count,
+                timeout,
+                retries,
+                parallel,
+            );
+        }
+    }
+}
+
+fn handle_download(
+    lat: f64,
+    lon: f64,
+    zoom: u8,
+    output: &str,
+    format: &Option<OutputFormat>,
+    dds_format: &DdsCompressionFormat,
+    mipmap_count: usize,
+    provider: ProviderType,
+    google_api_key: Option<String>,
+) {
+    // Initialize logging (keep guard alive for entire function)
+    let _logging_guard = match init_logging(default_log_dir(), default_log_file()) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("Failed to initialize logging: {}", e);
+            process::exit(1);
+        }
+    };
+
+    info!("XEarthLayer v{}", xearthlayer::VERSION);
+    info!("XEarthLayer CLI: download command");
 
     // Validate zoom level
-    if args.zoom < 1 || args.zoom > 19 {
+    if !(1..=19).contains(&zoom) {
+        error!("Invalid zoom level: {}", zoom);
         eprintln!("Error: Zoom level must be between 1 and 19");
         process::exit(1);
     }
 
     // Convert coordinates to tile
-    let tile = match to_tile_coords(args.lat, args.lon, args.zoom) {
-        Ok(t) => t,
+    let tile = match to_tile_coords(lat, lon, zoom) {
+        Ok(t) => {
+            info!(
+                "Converted coordinates to tile: lat={}, lon={}, zoom={} -> row={}, col={}",
+                lat, lon, zoom, t.row, t.col
+            );
+            t
+        }
         Err(e) => {
+            error!("Failed to convert coordinates: {}", e);
             eprintln!("Error converting coordinates: {}", e);
             process::exit(1);
         }
     };
 
     println!("Downloading tile for:");
-    println!("  Location: {}, {}", args.lat, args.lon);
-    println!("  Zoom: {}", args.zoom);
+    println!("  Location: {}, {}", lat, lon);
+    println!("  Zoom: {}", zoom);
     println!(
         "  Tile: row={}, col={}, zoom={}",
         tile.row, tile.col, tile.zoom
@@ -103,26 +230,37 @@ fn main() {
 
     // Create HTTP client
     let http_client = match ReqwestClient::new() {
-        Ok(client) => client,
+        Ok(client) => {
+            info!("HTTP client created successfully");
+            client
+        }
         Err(e) => {
+            error!("Failed to create HTTP client: {}", e);
             eprintln!("Error creating HTTP client: {}", e);
             process::exit(1);
         }
     };
 
-    // Create provider based on selection
-    match args.provider {
+    // Create provider and orchestrator based on selection
+    match provider {
         ProviderType::Bing => {
             let provider = BingMapsProvider::new(http_client);
             let name = provider.name().to_string();
             let max = provider.max_zoom();
 
-            // Validate zoom level - chunks are downloaded at zoom+4
-            if args.zoom + 4 > max {
+            // Validate zoom level
+            if zoom + 4 > max {
+                error!(
+                    "Zoom level {} requires chunks at zoom {}, but {} only supports up to zoom {}",
+                    zoom,
+                    zoom + 4,
+                    name,
+                    max
+                );
                 eprintln!(
                     "Error: Zoom level {} requires chunks at zoom {}, but {} only supports up to zoom {}",
-                    args.zoom,
-                    args.zoom + 4,
+                    zoom,
+                    zoom + 4,
                     name,
                     max
                 );
@@ -130,26 +268,31 @@ fn main() {
                 process::exit(1);
             }
 
+            info!("Using provider: {} (no API key required)", name);
             println!("Using provider: {} (no API key required)", name);
 
-            // Create orchestrator (30s timeout, 3 retries per chunk, 32 parallel downloads)
             let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
             download_and_save(
                 orchestrator,
                 &tile,
-                &args.output,
-                &args.format,
-                &args.dds_format,
-                args.mipmap_count,
+                output,
+                format,
+                dds_format,
+                mipmap_count,
             );
         }
         ProviderType::Google => {
-            let api_key = args.google_api_key.clone().unwrap(); // Safe: required_if_eq
+            let api_key = google_api_key.unwrap(); // Safe: required_if_eq
 
+            info!("Creating Google Maps session...");
             println!("Creating Google Maps session...");
             let provider = match GoogleMapsProvider::new(http_client, api_key) {
-                Ok(p) => p,
+                Ok(p) => {
+                    info!("Google Maps session created successfully");
+                    p
+                }
                 Err(e) => {
+                    error!("Failed to create Google Maps provider: {}", e);
                     eprintln!("Error creating Google Maps provider: {}", e);
                     eprintln!("Make sure:");
                     eprintln!("  1. Map Tiles API is enabled in Google Cloud Console");
@@ -163,11 +306,18 @@ fn main() {
             let max = provider.max_zoom();
 
             // Validate zoom level
-            if args.zoom + 4 > max {
+            if zoom + 4 > max {
+                error!(
+                    "Zoom level {} requires chunks at zoom {}, but {} only supports up to zoom {}",
+                    zoom,
+                    zoom + 4,
+                    name,
+                    max
+                );
                 eprintln!(
                     "Error: Zoom level {} requires chunks at zoom {}, but {} only supports up to zoom {}",
-                    args.zoom,
-                    args.zoom + 4,
+                    zoom,
+                    zoom + 4,
                     name,
                     max
                 );
@@ -175,18 +325,165 @@ fn main() {
                 process::exit(1);
             }
 
+            info!("Using provider: {} (session created successfully)", name);
             println!("Using provider: {} (session created successfully)", name);
 
-            // Create orchestrator
             let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
             download_and_save(
                 orchestrator,
                 &tile,
-                &args.output,
-                &args.format,
-                &args.dds_format,
-                args.mipmap_count,
+                output,
+                format,
+                dds_format,
+                mipmap_count,
             );
+        }
+    }
+}
+
+fn handle_serve(
+    mountpoint: &str,
+    provider: ProviderType,
+    google_api_key: Option<String>,
+    dds_format: &DdsCompressionFormat,
+    mipmap_count: usize,
+    timeout: u64,
+    retries: usize,
+    parallel: usize,
+) {
+    // Initialize logging (keep guard alive for entire function)
+    let _logging_guard = match init_logging(default_log_dir(), default_log_file()) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("Failed to initialize logging: {}", e);
+            process::exit(1);
+        }
+    };
+
+    info!("XEarthLayer v{}", xearthlayer::VERSION);
+    info!("XEarthLayer CLI: serve command");
+    info!("Starting FUSE server");
+    println!("XEarthLayer FUSE Server v{}", xearthlayer::VERSION);
+    println!("=======================");
+    println!();
+    println!("Mountpoint: {}", mountpoint);
+    println!("DDS Format: {:?}", dds_format);
+    println!("Mipmap Levels: {}", mipmap_count);
+    println!();
+
+    // Check if mountpoint exists
+    if !std::path::Path::new(mountpoint).exists() {
+        error!("Mountpoint does not exist: {}", mountpoint);
+        eprintln!("Error: Mountpoint directory does not exist: {}", mountpoint);
+        eprintln!("Please create it first: mkdir -p {}", mountpoint);
+        process::exit(1);
+    }
+
+    // Create HTTP client
+    let http_client = match ReqwestClient::new() {
+        Ok(client) => {
+            info!("HTTP client created successfully");
+            client
+        }
+        Err(e) => {
+            error!("Failed to create HTTP client: {}", e);
+            eprintln!("Error creating HTTP client: {}", e);
+            process::exit(1);
+        }
+    };
+
+    // Convert DDS format
+    let format = match dds_format {
+        DdsCompressionFormat::Bc1 => DdsFormat::BC1,
+        DdsCompressionFormat::Bc3 => DdsFormat::BC3,
+    };
+
+    // Create provider and start FUSE based on selection
+    match provider {
+        ProviderType::Bing => {
+            let provider = BingMapsProvider::new(http_client);
+            let name = provider.name().to_string();
+
+            info!("Using provider: {} (no API key required)", name);
+            println!("Provider: {} (no API key required)", name);
+            println!();
+
+            let orchestrator = TileOrchestrator::new(provider, timeout, retries as u32, parallel);
+            let fs = XEarthLayerFS::new(orchestrator, format, mipmap_count);
+
+            info!("Mounting FUSE filesystem at {}", mountpoint);
+            println!("Mounting filesystem...");
+            println!("Press Ctrl+C to unmount and exit");
+            println!();
+
+            let options = vec![
+                fuser::MountOption::RO,
+                fuser::MountOption::FSName("xearthlayer".to_string()),
+            ];
+
+            match fuser::mount2(fs, mountpoint, &options) {
+                Ok(_) => {
+                    info!("FUSE filesystem unmounted successfully");
+                    println!("Filesystem unmounted.");
+                }
+                Err(e) => {
+                    error!("Failed to mount FUSE filesystem: {}", e);
+                    eprintln!("Error mounting filesystem: {}", e);
+                    eprintln!();
+                    eprintln!("Common issues:");
+                    eprintln!("  1. FUSE not installed: sudo apt install fuse (Linux)");
+                    eprintln!("  2. Permissions: You may need to add your user to 'fuse' group");
+                    eprintln!("  3. Mountpoint in use: Try unmounting with: fusermount -u {}", mountpoint);
+                    process::exit(1);
+                }
+            }
+        }
+        ProviderType::Google => {
+            let api_key = google_api_key.unwrap(); // Safe: required_if_eq
+
+            info!("Creating Google Maps session...");
+            println!("Creating Google Maps session...");
+            let provider = match GoogleMapsProvider::new(http_client, api_key) {
+                Ok(p) => {
+                    info!("Google Maps session created successfully");
+                    p
+                }
+                Err(e) => {
+                    error!("Failed to create Google Maps provider: {}", e);
+                    eprintln!("Error creating Google Maps provider: {}", e);
+                    process::exit(1);
+                }
+            };
+
+            let name = provider.name().to_string();
+            info!("Using provider: {}", name);
+            println!("Provider: {}", name);
+            println!();
+
+            let orchestrator = TileOrchestrator::new(provider, timeout, retries as u32, parallel);
+            let fs = XEarthLayerFS::new(orchestrator, format, mipmap_count);
+
+            info!("Mounting FUSE filesystem at {}", mountpoint);
+            println!("Mounting filesystem...");
+            println!("Press Ctrl+C to unmount and exit");
+            println!();
+
+            let options = vec![
+                fuser::MountOption::RO,
+                fuser::MountOption::FSName("xearthlayer".to_string()),
+            ];
+
+            match fuser::mount2(fs, mountpoint, &options) {
+                Ok(_) => {
+                    info!("FUSE filesystem unmounted successfully");
+                    println!("Filesystem unmounted.");
+                }
+                Err(e) => {
+                    error!("Failed to mount FUSE filesystem: {}", e);
+                    eprintln!("Error mounting filesystem: {}", e);
+                    process::exit(1);
+                }
+            }
         }
     }
 }
@@ -200,12 +497,21 @@ fn download_and_save<P: Provider + 'static>(
     mipmap_count: usize,
 ) {
     // Download tile
+    info!("Starting download of 256 chunks in parallel");
     println!("Downloading 256 chunks in parallel...");
     let start = std::time::Instant::now();
 
     let image = match orchestrator.download_tile(tile) {
-        Ok(img) => img,
+        Ok(img) => {
+            info!(
+                "Tile downloaded successfully: {}x{} pixels",
+                img.width(),
+                img.height()
+            );
+            img
+        }
         Err(e) => {
+            error!("Failed to download tile: {}", e);
             eprintln!("Error downloading tile: {}", e);
             process::exit(1);
         }
@@ -213,6 +519,7 @@ fn download_and_save<P: Provider + 'static>(
 
     let elapsed = start.elapsed();
 
+    info!("Download completed in {:.2}s", elapsed.as_secs_f64());
     println!("Downloaded successfully in {:.2}s", elapsed.as_secs_f64());
     println!("Image size: {}x{}", image.width(), image.height());
     println!();
@@ -238,6 +545,7 @@ fn download_and_save<P: Provider + 'static>(
 }
 
 fn save_jpeg(image: &image::RgbaImage, output_path: &str) {
+    info!("Encoding as JPEG (90% quality)");
     println!("Encoding as JPEG (90% quality)...");
 
     // Convert RGBA to RGB for JPEG
@@ -247,6 +555,7 @@ fn save_jpeg(image: &image::RgbaImage, output_path: &str) {
     let file = match std::fs::File::create(output_path) {
         Ok(f) => f,
         Err(e) => {
+            error!("Failed to create output file: {}", e);
             eprintln!("Error creating output file: {}", e);
             process::exit(1);
         }
@@ -262,6 +571,11 @@ fn save_jpeg(image: &image::RgbaImage, output_path: &str) {
     ) {
         Ok(_) => {
             let file_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+            info!(
+                "JPEG saved successfully: {} ({:.2} MB)",
+                output_path,
+                file_size as f64 / 1_048_576.0
+            );
             println!(
                 "✓ Saved successfully: {} ({:.2} MB)",
                 output_path,
@@ -269,6 +583,7 @@ fn save_jpeg(image: &image::RgbaImage, output_path: &str) {
             );
         }
         Err(e) => {
+            error!("Failed to encode JPEG: {}", e);
             eprintln!("Error encoding JPEG: {}", e);
             process::exit(1);
         }
@@ -286,6 +601,10 @@ fn save_dds(
         DdsCompressionFormat::Bc3 => DdsFormat::BC3,
     };
 
+    info!(
+        "Encoding as DDS ({:?} compression, {} mipmap levels)",
+        format, mipmap_count
+    );
     println!(
         "Encoding as DDS ({:?} compression, {} mipmap levels)...",
         format, mipmap_count
@@ -297,8 +616,16 @@ fn save_dds(
     let encoder = DdsEncoder::new(format).with_mipmap_count(mipmap_count);
 
     let dds_data = match encoder.encode(image) {
-        Ok(data) => data,
+        Ok(data) => {
+            info!(
+                "DDS encoding completed: {} bytes in {:.2}s",
+                data.len(),
+                encode_start.elapsed().as_secs_f64()
+            );
+            data
+        }
         Err(e) => {
+            error!("Failed to encode DDS: {}", e);
             eprintln!("Error encoding DDS: {}", e);
             process::exit(1);
         }
@@ -309,6 +636,13 @@ fn save_dds(
     // Write to file
     match std::fs::write(output_path, &dds_data) {
         Ok(_) => {
+            info!(
+                "DDS saved successfully: {} ({:.2} MB, format: {:?}, mipmaps: {})",
+                output_path,
+                dds_data.len() as f64 / 1_048_576.0,
+                format,
+                mipmap_count
+            );
             println!(
                 "✓ Saved successfully: {} ({:.2} MB, encoded in {:.2}s)",
                 output_path,
@@ -320,6 +654,7 @@ fn save_dds(
             println!("  Dimensions: {}×{}", image.width(), image.height());
         }
         Err(e) => {
+            error!("Failed to write DDS file: {}", e);
             eprintln!("Error writing DDS file: {}", e);
             process::exit(1);
         }

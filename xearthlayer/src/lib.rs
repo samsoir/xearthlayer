@@ -5,8 +5,16 @@
 
 pub mod coord;
 pub mod dds;
+pub mod fuse;
+pub mod logging;
 pub mod orchestrator;
 pub mod provider;
+
+/// Version of the XEarthLayer library and CLI.
+///
+/// This is synchronized across all components in the workspace.
+/// The version is defined in `Cargo.toml` and injected at compile time.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Returns a greeting message from XEarthLayer.
 ///
