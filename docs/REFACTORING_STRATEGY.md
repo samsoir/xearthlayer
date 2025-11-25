@@ -680,7 +680,7 @@ fn main() {
 | Phase | Effort | Impact | Dependencies | Status |
 |-------|--------|--------|--------------|--------|
 | Phase 5: Provider Factory | Low | Medium | Phase 4 | ✅ Complete |
-| Phase 6: Service Facade | Medium | High | All above | Pending |
+| Phase 6: Service Facade | Medium | High | All above | ✅ Complete |
 
 ---
 
@@ -723,7 +723,11 @@ xearthlayer/src/
 │   ├── mod.rs
 │   ├── generator.rs       # TileGenerator trait
 │   └── request.rs         # TileRequest
-└── service.rs              # NEW - XEarthLayerService facade
+└── service/                # NEW - High-level service facade
+    ├── mod.rs              # Module exports
+    ├── config.rs           # ServiceConfig and builder
+    ├── error.rs            # ServiceError types
+    └── facade.rs           # XEarthLayerService implementation
 ```
 
 ---
@@ -772,11 +776,15 @@ xearthlayer/src/
 - [x] Refactor `handle_download` and `handle_serve` to use factory
 - [x] Verify tests still pass (369 unit tests + 22 doc tests)
 
-### Phase 6: Service Facade
-- [ ] Create `service.rs` with XEarthLayerService
-- [ ] Implement serve() and download_tile()
-- [ ] Simplify CLI to use service
-- [ ] Add integration tests
+### Phase 6: Service Facade ✅ COMPLETE
+- [x] Create `service/` module with XEarthLayerService
+- [x] Create `service/config.rs` with ServiceConfig and builder
+- [x] Create `service/error.rs` with ServiceError types
+- [x] Create `service/facade.rs` with XEarthLayerService implementation
+- [x] Implement serve() method for FUSE server
+- [x] Implement download_tile() method for single tile downloads
+- [x] Simplify CLI to use service (reduced from ~657 to ~470 lines)
+- [x] Verify tests still pass (390 unit tests + 23 doc tests)
 
 ---
 

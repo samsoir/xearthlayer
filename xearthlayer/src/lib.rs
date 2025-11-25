@@ -2,6 +2,19 @@
 //!
 //! This library provides the core functionality for streaming satellite imagery
 //! to X-Plane flight simulator via a FUSE virtual filesystem.
+//!
+//! # High-Level API
+//!
+//! For most use cases, the [`service`] module provides a simplified facade:
+//!
+//! ```ignore
+//! use xearthlayer::service::{XEarthLayerService, ServiceConfig};
+//! use xearthlayer::provider::ProviderConfig;
+//!
+//! let config = ServiceConfig::default();
+//! let service = XEarthLayerService::new(config, ProviderConfig::bing())?;
+//! let tile_data = service.download_tile(37.7749, -122.4194, 15)?;
+//! ```
 
 pub mod cache;
 pub mod config;
@@ -11,6 +24,7 @@ pub mod fuse;
 pub mod logging;
 pub mod orchestrator;
 pub mod provider;
+pub mod service;
 pub mod texture;
 pub mod tile;
 
