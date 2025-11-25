@@ -3,6 +3,7 @@
 //! This library provides the core functionality for streaming satellite imagery
 //! to X-Plane flight simulator via a FUSE virtual filesystem.
 
+pub mod cache;
 pub mod coord;
 pub mod dds;
 pub mod fuse;

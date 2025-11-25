@@ -4,7 +4,9 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::process;
+use std::sync::Arc;
 use tracing::{error, info};
+use xearthlayer::cache::{Cache, CacheConfig, CacheSystem, NoOpCache};
 use xearthlayer::coord::to_tile_coords;
 use xearthlayer::dds::{DdsEncoder, DdsFormat};
 use xearthlayer::fuse::XEarthLayerFS;
@@ -119,6 +121,10 @@ enum Commands {
         /// Maximum parallel downloads
         #[arg(long, default_value = "32")]
         parallel: usize,
+
+        /// Disable caching (always generate tiles fresh - useful for testing)
+        #[arg(long)]
+        no_cache: bool,
     },
 }
 
@@ -158,6 +164,7 @@ fn main() {
             timeout,
             retries,
             parallel,
+            no_cache,
         } => {
             handle_serve(
                 &mountpoint,
@@ -168,11 +175,13 @@ fn main() {
                 timeout,
                 retries,
                 parallel,
+                no_cache,
             );
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_download(
     lat: f64,
     lon: f64,
@@ -341,6 +350,7 @@ fn handle_download(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_serve(
     mountpoint: &str,
     provider: ProviderType,
@@ -350,6 +360,7 @@ fn handle_serve(
     timeout: u64,
     retries: usize,
     parallel: usize,
+    no_cache: bool,
 ) {
     // Initialize logging (keep guard alive for entire function)
     let _logging_guard = match init_logging(default_log_dir(), default_log_file()) {
@@ -409,7 +420,30 @@ fn handle_serve(
             println!();
 
             let orchestrator = TileOrchestrator::new(provider, timeout, retries as u32, parallel);
-            let fs = XEarthLayerFS::new(orchestrator, format, mipmap_count);
+
+            // Create cache system or no-op cache
+            let cache: Arc<dyn Cache> = if no_cache {
+                info!("Caching disabled (--no-cache)");
+                println!("Cache: Disabled (all tiles generated fresh)");
+                Arc::new(NoOpCache::new("bing"))
+            } else {
+                let cache_config = CacheConfig::new("bing");
+                match CacheSystem::new(cache_config) {
+                    Ok(cache) => {
+                        info!("Cache enabled: 2GB memory, 20GB disk");
+                        println!("Cache: Enabled (2GB memory, 20GB disk at ~/.cache/xearthlayer)");
+                        Arc::new(cache)
+                    }
+                    Err(e) => {
+                        error!("Failed to create cache system: {}", e);
+                        eprintln!("Error: Failed to create cache system: {}", e);
+                        process::exit(1);
+                    }
+                }
+            };
+            println!();
+
+            let fs = XEarthLayerFS::new(orchestrator, cache, format, mipmap_count);
 
             info!("Mounting FUSE filesystem at {}", mountpoint);
             println!("Mounting filesystem...");
@@ -433,7 +467,10 @@ fn handle_serve(
                     eprintln!("Common issues:");
                     eprintln!("  1. FUSE not installed: sudo apt install fuse (Linux)");
                     eprintln!("  2. Permissions: You may need to add your user to 'fuse' group");
-                    eprintln!("  3. Mountpoint in use: Try unmounting with: fusermount -u {}", mountpoint);
+                    eprintln!(
+                        "  3. Mountpoint in use: Try unmounting with: fusermount -u {}",
+                        mountpoint
+                    );
                     process::exit(1);
                 }
             }
@@ -461,7 +498,30 @@ fn handle_serve(
             println!();
 
             let orchestrator = TileOrchestrator::new(provider, timeout, retries as u32, parallel);
-            let fs = XEarthLayerFS::new(orchestrator, format, mipmap_count);
+
+            // Create cache system or no-op cache
+            let cache: Arc<dyn Cache> = if no_cache {
+                info!("Caching disabled (--no-cache)");
+                println!("Cache: Disabled (all tiles generated fresh)");
+                Arc::new(NoOpCache::new("google"))
+            } else {
+                let cache_config = CacheConfig::new("google");
+                match CacheSystem::new(cache_config) {
+                    Ok(cache) => {
+                        info!("Cache enabled: 2GB memory, 20GB disk");
+                        println!("Cache: Enabled (2GB memory, 20GB disk at ~/.cache/xearthlayer)");
+                        Arc::new(cache)
+                    }
+                    Err(e) => {
+                        error!("Failed to create cache system: {}", e);
+                        eprintln!("Error: Failed to create cache system: {}", e);
+                        process::exit(1);
+                    }
+                }
+            };
+            println!();
+
+            let fs = XEarthLayerFS::new(orchestrator, cache, format, mipmap_count);
 
             info!("Mounting FUSE filesystem at {}", mountpoint);
             println!("Mounting filesystem...");

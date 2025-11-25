@@ -3,6 +3,7 @@
 //! Provides a virtual filesystem that intercepts X-Plane texture file reads
 //! and generates satellite imagery DDS files on-demand.
 
+use crate::cache::{Cache, CacheKey};
 use crate::coord::to_tile_coords;
 use crate::dds::{DdsEncoder, DdsFormat};
 use crate::fuse::{generate_default_placeholder, parse_dds_filename, DdsFilename};
@@ -39,14 +40,14 @@ const TTL: Duration = Duration::from_secs(1);
 pub struct XEarthLayerFS<P: Provider> {
     /// Tile orchestrator for downloading imagery
     orchestrator: Arc<TileOrchestrator<P>>,
+    /// Cache implementation (can be CacheSystem, NoOpCache, or custom)
+    cache: Arc<dyn Cache>,
     /// DDS compression format
     dds_format: DdsFormat,
     /// Number of mipmap levels
     mipmap_count: usize,
-    /// Cache mapping inode numbers to DDS filenames
+    /// Cache mapping inode numbers to DDS filenames for FUSE operations
     inode_cache: Arc<Mutex<HashMap<u64, DdsFilename>>>,
-    /// Cache of generated DDS files (inode -> DDS data)
-    dds_cache: Arc<Mutex<HashMap<u64, Vec<u8>>>>,
 }
 
 impl<P: Provider + 'static> XEarthLayerFS<P> {
@@ -55,19 +56,44 @@ impl<P: Provider + 'static> XEarthLayerFS<P> {
     /// # Arguments
     ///
     /// * `orchestrator` - Tile orchestrator for downloading imagery
+    /// * `cache` - Cache implementation (CacheSystem, NoOpCache, or custom)
     /// * `dds_format` - DDS compression format (BC1 or BC3)
     /// * `mipmap_count` - Number of mipmap levels (typically 5)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use xearthlayer::fuse::XEarthLayerFS;
+    /// use xearthlayer::cache::{CacheSystem, CacheConfig, NoOpCache};
+    /// use xearthlayer::orchestrator::TileOrchestrator;
+    /// use xearthlayer::provider::BingMapsProvider;
+    /// use xearthlayer::dds::DdsFormat;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// // With caching
+    /// let cache_config = CacheConfig::new("bing");
+    /// let cache = CacheSystem::new(cache_config)?;
+    /// // let fs = XEarthLayerFS::new(orchestrator, Arc::new(cache), DdsFormat::BC1, 5);
+    ///
+    /// // Without caching (for testing)
+    /// let no_cache = NoOpCache::new("bing");
+    /// // let fs = XEarthLayerFS::new(orchestrator, Arc::new(no_cache), DdsFormat::BC1, 5);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(
         orchestrator: TileOrchestrator<P>,
+        cache: Arc<dyn Cache>,
         dds_format: DdsFormat,
         mipmap_count: usize,
     ) -> Self {
         Self {
             orchestrator: Arc::new(orchestrator),
+            cache,
             dds_format,
             mipmap_count,
             inode_cache: Arc::new(Mutex::new(HashMap::new())),
-            dds_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -328,28 +354,44 @@ impl<P: Provider + 'static> Filesystem for XEarthLayerFS<P> {
             }
         };
 
-        // Get or generate the DDS data
-        let dds_data = {
-            // First, check if we already have this file in the DDS cache
-            let mut dds_cache = match self.dds_cache.lock() {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("Failed to lock DDS cache: {}", e);
-                    reply.error(libc::EIO);
-                    return;
-                }
-            };
-
-            if let Some(data) = dds_cache.get(&ino) {
-                info!("DDS cache hit for inode {}", ino);
-                data.clone()
-            } else {
-                // Generate the DDS file
-                info!("DDS cache miss for inode {}, generating...", ino);
-                let data = self.generate_tile_dds(&coords);
-                dds_cache.insert(ino, data.clone());
-                data
+        // Convert coordinates to tile coordinates
+        let tile = match to_tile_coords(coords.row as f64, coords.col as f64, coords.zoom) {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Failed to convert coordinates: {}", e);
+                warn!("Returning magenta placeholder for invalid coordinates");
+                let placeholder = match generate_default_placeholder() {
+                    Ok(p) => p,
+                    Err(placeholder_err) => {
+                        error!("Failed to generate placeholder: {}", placeholder_err);
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                };
+                reply.data(&placeholder[offset as usize..]);
+                return;
             }
+        };
+
+        // Create cache key
+        let cache_key = CacheKey::new(self.cache.provider(), self.dds_format, tile);
+
+        // Try to get from cache (memory → disk → none)
+        let dds_data = if let Some(data) = self.cache.get(&cache_key) {
+            info!("Cache hit for tile {:?}", tile);
+            data
+        } else {
+            // Cache miss - generate tile
+            info!("Cache miss for tile {:?}, generating...", tile);
+            let data = self.generate_tile_dds(&coords);
+
+            // Cache the generated tile
+            if let Err(e) = self.cache.put(cache_key, data.clone()) {
+                warn!("Failed to cache tile: {}", e);
+                // Continue anyway - we have the data
+            }
+
+            data
         };
 
         // Return the requested portion of the data

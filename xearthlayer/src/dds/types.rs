@@ -3,7 +3,7 @@
 use std::fmt;
 
 /// DDS compression format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DdsFormat {
     /// BC1/DXT1 compression (4:1, no alpha or 1-bit alpha)
     BC1,
