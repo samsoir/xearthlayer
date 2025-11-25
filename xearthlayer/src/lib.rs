@@ -4,6 +4,7 @@
 //! to X-Plane flight simulator via a FUSE virtual filesystem.
 
 pub mod cache;
+pub mod config;
 pub mod coord;
 pub mod dds;
 pub mod fuse;

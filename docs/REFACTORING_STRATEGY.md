@@ -666,7 +666,7 @@ fn main() {
 | Phase | Effort | Impact | Dependencies | Status |
 |-------|--------|--------|--------------|--------|
 | Phase 1: TextureEncoder | Medium | High | None | ✅ Complete |
-| Phase 4: Config Builders | Low | High | None | Pending |
+| Phase 4: Config Builders | Low | High | None | ✅ Complete |
 
 ### Priority 2: Core Architecture
 
@@ -756,12 +756,13 @@ xearthlayer/src/
 - [x] Update all tests to use trait objects
 - [x] Verify tests still pass (347 unit tests + 18 doc tests)
 
-### Phase 4: Config Builders
-- [ ] Create `config/mod.rs`
-- [ ] Create TextureConfig, DownloadConfig, CacheConfig
-- [ ] Create ServerConfig with builder
-- [ ] Update CLI to use config builders
-- [ ] Add derive_builder dependency
+### Phase 4: Config Builders ✅ COMPLETE
+- [x] Create `config/mod.rs` with TextureConfig and DownloadConfig
+- [x] Create TextureConfig for DDS format and mipmap settings
+- [x] Create DownloadConfig for timeout, retries, and parallel downloads
+- [x] Add `with_config()` constructor to TileOrchestrator
+- [x] Update CLI to use config builders (reduced function parameters)
+- [x] Verify tests still pass (365 unit tests + 21 doc tests)
 
 ### Phase 5: Provider Factory
 - [ ] Create `provider/factory.rs`

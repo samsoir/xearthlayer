@@ -7,6 +7,7 @@ use std::process;
 use std::sync::Arc;
 use tracing::{error, info};
 use xearthlayer::cache::{Cache, CacheConfig, CacheSystem, NoOpCache};
+use xearthlayer::config::{DownloadConfig, TextureConfig};
 use xearthlayer::coord::to_tile_coords;
 use xearthlayer::dds::{DdsEncoder, DdsFormat};
 use xearthlayer::fuse::XEarthLayerFS;
@@ -145,14 +146,22 @@ fn main() {
             provider,
             google_api_key,
         } => {
+            // Convert CLI format to DdsFormat
+            let dds_fmt = match dds_format {
+                DdsCompressionFormat::Bc1 => DdsFormat::BC1,
+                DdsCompressionFormat::Bc3 => DdsFormat::BC3,
+            };
+
+            // Build texture configuration
+            let texture_config = TextureConfig::new(dds_fmt).with_mipmap_count(mipmap_count);
+
             handle_download(
                 lat,
                 lon,
                 zoom,
                 &output,
                 &format,
-                &dds_format,
-                mipmap_count,
+                texture_config,
                 provider,
                 google_api_key,
             );
@@ -168,15 +177,26 @@ fn main() {
             parallel,
             no_cache,
         } => {
+            // Convert CLI format to DdsFormat
+            let format = match dds_format {
+                DdsCompressionFormat::Bc1 => DdsFormat::BC1,
+                DdsCompressionFormat::Bc3 => DdsFormat::BC3,
+            };
+
+            // Build configuration objects from CLI arguments
+            let texture_config = TextureConfig::new(format).with_mipmap_count(mipmap_count);
+
+            let download_config = DownloadConfig::new()
+                .with_timeout_secs(timeout)
+                .with_max_retries(retries as u32)
+                .with_parallel_downloads(parallel);
+
             handle_serve(
                 &mountpoint,
                 provider,
                 google_api_key,
-                &dds_format,
-                mipmap_count,
-                timeout,
-                retries,
-                parallel,
+                texture_config,
+                download_config,
                 no_cache,
             );
         }
@@ -190,8 +210,7 @@ fn handle_download(
     zoom: u8,
     output: &str,
     format: &Option<OutputFormat>,
-    dds_format: &DdsCompressionFormat,
-    mipmap_count: usize,
+    texture_config: TextureConfig,
     provider: ProviderType,
     google_api_key: Option<String>,
 ) {
@@ -309,27 +328,17 @@ fn handle_download(
     info!("Using provider: {}", name);
     println!("Using provider: {}", name);
 
-    let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
-    download_and_save(
-        orchestrator,
-        &tile,
-        output,
-        format,
-        dds_format,
-        mipmap_count,
-    );
+    // Use default download config for download command
+    let orchestrator = TileOrchestrator::with_config(provider, DownloadConfig::default());
+    download_and_save(orchestrator, &tile, output, format, texture_config);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_serve(
     mountpoint: &str,
     provider: ProviderType,
     google_api_key: Option<String>,
-    dds_format: &DdsCompressionFormat,
-    mipmap_count: usize,
-    timeout: u64,
-    retries: usize,
-    parallel: usize,
+    texture_config: TextureConfig,
+    download_config: DownloadConfig,
     no_cache: bool,
 ) {
     // Initialize logging (keep guard alive for entire function)
@@ -348,8 +357,8 @@ fn handle_serve(
     println!("=======================");
     println!();
     println!("Mountpoint: {}", mountpoint);
-    println!("DDS Format: {:?}", dds_format);
-    println!("Mipmap Levels: {}", mipmap_count);
+    println!("DDS Format: {:?}", texture_config.format());
+    println!("Mipmap Levels: {}", texture_config.mipmap_count());
     println!();
 
     // Check if mountpoint exists
@@ -373,17 +382,17 @@ fn handle_serve(
         }
     };
 
-    // Convert DDS format
-    let format = match dds_format {
-        DdsCompressionFormat::Bc1 => DdsFormat::BC1,
-        DdsCompressionFormat::Bc3 => DdsFormat::BC3,
-    };
-
-    // Create texture encoder
-    let encoder: Arc<dyn TextureEncoder> =
-        Arc::new(DdsTextureEncoder::new(format).with_mipmap_count(mipmap_count));
+    // Create texture encoder from config
+    let encoder: Arc<dyn TextureEncoder> = Arc::new(
+        DdsTextureEncoder::new(texture_config.format())
+            .with_mipmap_count(texture_config.mipmap_count()),
+    );
     info!("Using texture encoder: {}", encoder.name());
-    println!("Encoder: {} ({} mipmaps)", encoder.name(), mipmap_count);
+    println!(
+        "Encoder: {} ({} mipmaps)",
+        encoder.name(),
+        texture_config.mipmap_count()
+    );
 
     // Create provider based on selection
     let (provider, provider_name): (Arc<dyn Provider>, String) = match provider {
@@ -418,7 +427,8 @@ fn handle_serve(
     };
     println!();
 
-    let orchestrator = TileOrchestrator::new(provider, timeout, retries as u32, parallel);
+    // Create orchestrator from config
+    let orchestrator = TileOrchestrator::with_config(provider, download_config);
 
     // Create tile generator (combines orchestrator + encoder)
     let generator: Arc<dyn TileGenerator> =
@@ -447,7 +457,7 @@ fn handle_serve(
     };
     println!();
 
-    let fs = XEarthLayerFS::new(generator, cache, format);
+    let fs = XEarthLayerFS::new(generator, cache, texture_config.format());
 
     info!("Mounting FUSE filesystem at {}", mountpoint);
     println!("Mounting filesystem...");
@@ -485,8 +495,7 @@ fn download_and_save(
     tile: &xearthlayer::coord::TileCoord,
     output_path: &str,
     format: &Option<OutputFormat>,
-    dds_format: &DdsCompressionFormat,
-    mipmap_count: usize,
+    texture_config: TextureConfig,
 ) {
     // Download tile
     info!("Starting download of 256 chunks in parallel");
@@ -532,7 +541,7 @@ fn download_and_save(
     // Save based on format
     match output_format {
         OutputFormat::Jpeg => save_jpeg(&image, output_path),
-        OutputFormat::Dds => save_dds(&image, output_path, dds_format, mipmap_count),
+        OutputFormat::Dds => save_dds(&image, output_path, texture_config),
     }
 }
 
@@ -582,16 +591,9 @@ fn save_jpeg(image: &image::RgbaImage, output_path: &str) {
     }
 }
 
-fn save_dds(
-    image: &image::RgbaImage,
-    output_path: &str,
-    dds_format: &DdsCompressionFormat,
-    mipmap_count: usize,
-) {
-    let format = match dds_format {
-        DdsCompressionFormat::Bc1 => DdsFormat::BC1,
-        DdsCompressionFormat::Bc3 => DdsFormat::BC3,
-    };
+fn save_dds(image: &image::RgbaImage, output_path: &str, texture_config: TextureConfig) {
+    let format = texture_config.format();
+    let mipmap_count = texture_config.mipmap_count();
 
     info!(
         "Encoding as DDS ({:?} compression, {} mipmap levels)",

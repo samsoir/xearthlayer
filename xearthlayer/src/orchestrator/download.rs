@@ -1,6 +1,7 @@
 //! Tile download orchestration implementation
 
 use super::types::{ChunkResult, OrchestratorError};
+use crate::config::DownloadConfig;
 use crate::coord::TileCoord;
 use crate::provider::Provider;
 use image::RgbaImage;
@@ -16,12 +17,21 @@ use std::time::Instant;
 ///
 /// ```ignore
 /// use xearthlayer::orchestrator::TileOrchestrator;
+/// use xearthlayer::config::DownloadConfig;
 /// use xearthlayer::provider::{BingMapsProvider, ReqwestClient};
 /// use std::sync::Arc;
 ///
 /// let http_client = ReqwestClient::new()?;
 /// let provider: Arc<dyn Provider> = Arc::new(BingMapsProvider::new(http_client));
-/// let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
+///
+/// // Using explicit parameters
+/// let orchestrator = TileOrchestrator::new(provider.clone(), 30, 3, 32);
+///
+/// // Using configuration object
+/// let config = DownloadConfig::new()
+///     .with_timeout_secs(60)
+///     .with_max_retries(5);
+/// let orchestrator = TileOrchestrator::with_config(provider, config);
 /// ```
 pub struct TileOrchestrator {
     provider: Arc<dyn Provider>,
@@ -50,6 +60,39 @@ impl TileOrchestrator {
             timeout_secs,
             max_retries_per_chunk,
             max_parallel_downloads,
+        }
+    }
+
+    /// Creates a new TileOrchestrator with the given provider and configuration.
+    ///
+    /// This constructor accepts a `DownloadConfig` object which groups all
+    /// download-related parameters together.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - The imagery provider to download chunks from
+    /// * `config` - Download configuration settings
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use xearthlayer::orchestrator::TileOrchestrator;
+    /// use xearthlayer::config::DownloadConfig;
+    /// use std::sync::Arc;
+    ///
+    /// let config = DownloadConfig::new()
+    ///     .with_timeout_secs(60)
+    ///     .with_max_retries(5)
+    ///     .with_parallel_downloads(16);
+    ///
+    /// let orchestrator = TileOrchestrator::with_config(provider, config);
+    /// ```
+    pub fn with_config(provider: Arc<dyn Provider>, config: DownloadConfig) -> Self {
+        Self {
+            provider,
+            timeout_secs: config.timeout_secs(),
+            max_retries_per_chunk: config.max_retries(),
+            max_parallel_downloads: config.parallel_downloads(),
         }
     }
 
@@ -216,6 +259,7 @@ impl TileOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DownloadConfig;
     use crate::provider::BingMapsProvider;
     use crate::provider::{MockHttpClient, ProviderError};
 
@@ -299,5 +343,38 @@ mod tests {
     fn test_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TileOrchestrator>();
+    }
+
+    #[test]
+    fn test_orchestrator_with_config() {
+        let mock = MockHttpClient {
+            response: Ok(vec![]),
+        };
+        let provider: Arc<dyn Provider> = Arc::new(BingMapsProvider::new(mock));
+
+        let config = DownloadConfig::new()
+            .with_timeout_secs(60)
+            .with_max_retries(5)
+            .with_parallel_downloads(16);
+
+        let orchestrator = TileOrchestrator::with_config(provider, config);
+
+        assert_eq!(orchestrator.timeout_secs, 60);
+        assert_eq!(orchestrator.max_retries_per_chunk, 5);
+        assert_eq!(orchestrator.max_parallel_downloads, 16);
+    }
+
+    #[test]
+    fn test_orchestrator_with_default_config() {
+        let mock = MockHttpClient {
+            response: Ok(vec![]),
+        };
+        let provider: Arc<dyn Provider> = Arc::new(BingMapsProvider::new(mock));
+
+        let orchestrator = TileOrchestrator::with_config(provider, DownloadConfig::default());
+
+        assert_eq!(orchestrator.timeout_secs, 30);
+        assert_eq!(orchestrator.max_retries_per_chunk, 3);
+        assert_eq!(orchestrator.max_parallel_downloads, 32);
     }
 }
