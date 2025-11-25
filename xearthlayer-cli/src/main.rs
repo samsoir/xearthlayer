@@ -252,52 +252,20 @@ fn handle_download(
         }
     };
 
-    // Create provider and orchestrator based on selection
-    match provider {
+    // Create provider based on selection
+    let (provider, name, max): (Arc<dyn Provider>, String, u8) = match provider {
         ProviderType::Bing => {
-            let provider = BingMapsProvider::new(http_client);
-            let name = provider.name().to_string();
-            let max = provider.max_zoom();
-
-            // Validate zoom level
-            if zoom + 4 > max {
-                error!(
-                    "Zoom level {} requires chunks at zoom {}, but {} only supports up to zoom {}",
-                    zoom,
-                    zoom + 4,
-                    name,
-                    max
-                );
-                eprintln!(
-                    "Error: Zoom level {} requires chunks at zoom {}, but {} only supports up to zoom {}",
-                    zoom,
-                    zoom + 4,
-                    name,
-                    max
-                );
-                eprintln!("Maximum usable zoom level for {} is {}", name, max - 4);
-                process::exit(1);
-            }
-
-            info!("Using provider: {} (no API key required)", name);
-            println!("Using provider: {} (no API key required)", name);
-
-            let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
-            download_and_save(
-                orchestrator,
-                &tile,
-                output,
-                format,
-                dds_format,
-                mipmap_count,
-            );
+            let p = BingMapsProvider::new(http_client);
+            let name = p.name().to_string();
+            let max = p.max_zoom();
+            (Arc::new(p), name, max)
         }
         ProviderType::Google => {
             let api_key = google_api_key.unwrap(); // Safe: required_if_eq
 
             info!("Creating Google Maps session...");
             println!("Creating Google Maps session...");
-            let provider = match GoogleMapsProvider::new(http_client, api_key) {
+            let p = match GoogleMapsProvider::new(http_client, api_key) {
                 Ok(p) => {
                     info!("Google Maps session created successfully");
                     p
@@ -312,44 +280,44 @@ fn handle_download(
                     process::exit(1);
                 }
             };
-
-            let name = provider.name().to_string();
-            let max = provider.max_zoom();
-
-            // Validate zoom level
-            if zoom + 4 > max {
-                error!(
-                    "Zoom level {} requires chunks at zoom {}, but {} only supports up to zoom {}",
-                    zoom,
-                    zoom + 4,
-                    name,
-                    max
-                );
-                eprintln!(
-                    "Error: Zoom level {} requires chunks at zoom {}, but {} only supports up to zoom {}",
-                    zoom,
-                    zoom + 4,
-                    name,
-                    max
-                );
-                eprintln!("Maximum usable zoom level for {} is {}", name, max - 4);
-                process::exit(1);
-            }
-
-            info!("Using provider: {} (session created successfully)", name);
-            println!("Using provider: {} (session created successfully)", name);
-
-            let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
-            download_and_save(
-                orchestrator,
-                &tile,
-                output,
-                format,
-                dds_format,
-                mipmap_count,
-            );
+            let name = p.name().to_string();
+            let max = p.max_zoom();
+            (Arc::new(p), name, max)
         }
+    };
+
+    // Validate zoom level
+    if zoom + 4 > max {
+        error!(
+            "Zoom level {} requires chunks at zoom {}, but {} only supports up to zoom {}",
+            zoom,
+            zoom + 4,
+            name,
+            max
+        );
+        eprintln!(
+            "Error: Zoom level {} requires chunks at zoom {}, but {} only supports up to zoom {}",
+            zoom,
+            zoom + 4,
+            name,
+            max
+        );
+        eprintln!("Maximum usable zoom level for {} is {}", name, max - 4);
+        process::exit(1);
     }
+
+    info!("Using provider: {}", name);
+    println!("Using provider: {}", name);
+
+    let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
+    download_and_save(
+        orchestrator,
+        &tile,
+        output,
+        format,
+        dds_format,
+        mipmap_count,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -417,83 +385,21 @@ fn handle_serve(
     info!("Using texture encoder: {}", encoder.name());
     println!("Encoder: {} ({} mipmaps)", encoder.name(), mipmap_count);
 
-    // Create provider and start FUSE based on selection
-    match provider {
+    // Create provider based on selection
+    let (provider, provider_name): (Arc<dyn Provider>, String) = match provider {
         ProviderType::Bing => {
-            let provider = BingMapsProvider::new(http_client);
-            let name = provider.name().to_string();
-
+            let p = BingMapsProvider::new(http_client);
+            let name = p.name().to_string();
             info!("Using provider: {} (no API key required)", name);
             println!("Provider: {} (no API key required)", name);
-            println!();
-
-            let orchestrator = TileOrchestrator::new(provider, timeout, retries as u32, parallel);
-
-            // Create tile generator (combines orchestrator + encoder)
-            let generator: Arc<dyn TileGenerator> =
-                Arc::new(DefaultTileGenerator::new(orchestrator, encoder.clone()));
-            info!("Tile generator created");
-
-            // Create cache system or no-op cache
-            let cache: Arc<dyn Cache> = if no_cache {
-                info!("Caching disabled (--no-cache)");
-                println!("Cache: Disabled (all tiles generated fresh)");
-                Arc::new(NoOpCache::new("bing"))
-            } else {
-                let cache_config = CacheConfig::new("bing");
-                match CacheSystem::new(cache_config) {
-                    Ok(cache) => {
-                        info!("Cache enabled: 2GB memory, 20GB disk");
-                        println!("Cache: Enabled (2GB memory, 20GB disk at ~/.cache/xearthlayer)");
-                        Arc::new(cache)
-                    }
-                    Err(e) => {
-                        error!("Failed to create cache system: {}", e);
-                        eprintln!("Error: Failed to create cache system: {}", e);
-                        process::exit(1);
-                    }
-                }
-            };
-            println!();
-
-            let fs = XEarthLayerFS::new(generator, cache, format);
-
-            info!("Mounting FUSE filesystem at {}", mountpoint);
-            println!("Mounting filesystem...");
-            println!("Press Ctrl+C to unmount and exit");
-            println!();
-
-            let options = vec![
-                fuser::MountOption::RO,
-                fuser::MountOption::FSName("xearthlayer".to_string()),
-            ];
-
-            match fuser::mount2(fs, mountpoint, &options) {
-                Ok(_) => {
-                    info!("FUSE filesystem unmounted successfully");
-                    println!("Filesystem unmounted.");
-                }
-                Err(e) => {
-                    error!("Failed to mount FUSE filesystem: {}", e);
-                    eprintln!("Error mounting filesystem: {}", e);
-                    eprintln!();
-                    eprintln!("Common issues:");
-                    eprintln!("  1. FUSE not installed: sudo apt install fuse (Linux)");
-                    eprintln!("  2. Permissions: You may need to add your user to 'fuse' group");
-                    eprintln!(
-                        "  3. Mountpoint in use: Try unmounting with: fusermount -u {}",
-                        mountpoint
-                    );
-                    process::exit(1);
-                }
-            }
+            (Arc::new(p), name)
         }
         ProviderType::Google => {
             let api_key = google_api_key.unwrap(); // Safe: required_if_eq
 
             info!("Creating Google Maps session...");
             println!("Creating Google Maps session...");
-            let provider = match GoogleMapsProvider::new(http_client, api_key) {
+            let p = match GoogleMapsProvider::new(http_client, api_key) {
                 Ok(p) => {
                     info!("Google Maps session created successfully");
                     p
@@ -504,70 +410,78 @@ fn handle_serve(
                     process::exit(1);
                 }
             };
-
-            let name = provider.name().to_string();
+            let name = p.name().to_string();
             info!("Using provider: {}", name);
             println!("Provider: {}", name);
-            println!();
+            (Arc::new(p), name)
+        }
+    };
+    println!();
 
-            let orchestrator = TileOrchestrator::new(provider, timeout, retries as u32, parallel);
+    let orchestrator = TileOrchestrator::new(provider, timeout, retries as u32, parallel);
 
-            // Create tile generator (combines orchestrator + encoder)
-            let generator: Arc<dyn TileGenerator> =
-                Arc::new(DefaultTileGenerator::new(orchestrator, encoder.clone()));
-            info!("Tile generator created");
+    // Create tile generator (combines orchestrator + encoder)
+    let generator: Arc<dyn TileGenerator> =
+        Arc::new(DefaultTileGenerator::new(orchestrator, encoder.clone()));
+    info!("Tile generator created");
 
-            // Create cache system or no-op cache
-            let cache: Arc<dyn Cache> = if no_cache {
-                info!("Caching disabled (--no-cache)");
-                println!("Cache: Disabled (all tiles generated fresh)");
-                Arc::new(NoOpCache::new("google"))
-            } else {
-                let cache_config = CacheConfig::new("google");
-                match CacheSystem::new(cache_config) {
-                    Ok(cache) => {
-                        info!("Cache enabled: 2GB memory, 20GB disk");
-                        println!("Cache: Enabled (2GB memory, 20GB disk at ~/.cache/xearthlayer)");
-                        Arc::new(cache)
-                    }
-                    Err(e) => {
-                        error!("Failed to create cache system: {}", e);
-                        eprintln!("Error: Failed to create cache system: {}", e);
-                        process::exit(1);
-                    }
-                }
-            };
-            println!();
-
-            let fs = XEarthLayerFS::new(generator, cache, format);
-
-            info!("Mounting FUSE filesystem at {}", mountpoint);
-            println!("Mounting filesystem...");
-            println!("Press Ctrl+C to unmount and exit");
-            println!();
-
-            let options = vec![
-                fuser::MountOption::RO,
-                fuser::MountOption::FSName("xearthlayer".to_string()),
-            ];
-
-            match fuser::mount2(fs, mountpoint, &options) {
-                Ok(_) => {
-                    info!("FUSE filesystem unmounted successfully");
-                    println!("Filesystem unmounted.");
-                }
-                Err(e) => {
-                    error!("Failed to mount FUSE filesystem: {}", e);
-                    eprintln!("Error mounting filesystem: {}", e);
-                    process::exit(1);
-                }
+    // Create cache system or no-op cache
+    let cache: Arc<dyn Cache> = if no_cache {
+        info!("Caching disabled (--no-cache)");
+        println!("Cache: Disabled (all tiles generated fresh)");
+        Arc::new(NoOpCache::new(&provider_name))
+    } else {
+        let cache_config = CacheConfig::new(&provider_name);
+        match CacheSystem::new(cache_config) {
+            Ok(cache) => {
+                info!("Cache enabled: 2GB memory, 20GB disk");
+                println!("Cache: Enabled (2GB memory, 20GB disk at ~/.cache/xearthlayer)");
+                Arc::new(cache)
             }
+            Err(e) => {
+                error!("Failed to create cache system: {}", e);
+                eprintln!("Error: Failed to create cache system: {}", e);
+                process::exit(1);
+            }
+        }
+    };
+    println!();
+
+    let fs = XEarthLayerFS::new(generator, cache, format);
+
+    info!("Mounting FUSE filesystem at {}", mountpoint);
+    println!("Mounting filesystem...");
+    println!("Press Ctrl+C to unmount and exit");
+    println!();
+
+    let options = vec![
+        fuser::MountOption::RO,
+        fuser::MountOption::FSName("xearthlayer".to_string()),
+    ];
+
+    match fuser::mount2(fs, mountpoint, &options) {
+        Ok(_) => {
+            info!("FUSE filesystem unmounted successfully");
+            println!("Filesystem unmounted.");
+        }
+        Err(e) => {
+            error!("Failed to mount FUSE filesystem: {}", e);
+            eprintln!("Error mounting filesystem: {}", e);
+            eprintln!();
+            eprintln!("Common issues:");
+            eprintln!("  1. FUSE not installed: sudo apt install fuse (Linux)");
+            eprintln!("  2. Permissions: You may need to add your user to 'fuse' group");
+            eprintln!(
+                "  3. Mountpoint in use: Try unmounting with: fusermount -u {}",
+                mountpoint
+            );
+            process::exit(1);
         }
     }
 }
 
-fn download_and_save<P: Provider + 'static>(
-    orchestrator: TileOrchestrator<P>,
+fn download_and_save(
+    orchestrator: TileOrchestrator,
     tile: &xearthlayer::coord::TileCoord,
     output_path: &str,
     format: &Option<OutputFormat>,

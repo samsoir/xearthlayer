@@ -11,30 +11,42 @@ use std::time::Instant;
 ///
 /// Downloads all 256 chunks (16×16) of a tile in parallel using multiple threads,
 /// with per-chunk retry logic and overall timeout.
-pub struct TileOrchestrator<P: Provider> {
-    provider: Arc<P>,
+///
+/// # Example
+///
+/// ```ignore
+/// use xearthlayer::orchestrator::TileOrchestrator;
+/// use xearthlayer::provider::{BingMapsProvider, ReqwestClient};
+/// use std::sync::Arc;
+///
+/// let http_client = ReqwestClient::new()?;
+/// let provider: Arc<dyn Provider> = Arc::new(BingMapsProvider::new(http_client));
+/// let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
+/// ```
+pub struct TileOrchestrator {
+    provider: Arc<dyn Provider>,
     timeout_secs: u64,
     max_retries_per_chunk: u32,
     max_parallel_downloads: usize,
 }
 
-impl<P: Provider + 'static> TileOrchestrator<P> {
+impl TileOrchestrator {
     /// Creates a new TileOrchestrator with the given provider and settings.
     ///
     /// # Arguments
     ///
-    /// * `provider` - The imagery provider to download chunks from
+    /// * `provider` - The imagery provider to download chunks from (as trait object)
     /// * `timeout_secs` - Maximum time to spend downloading a tile
     /// * `max_retries_per_chunk` - Number of retry attempts per failed chunk
     /// * `max_parallel_downloads` - Maximum number of concurrent downloads
     pub fn new(
-        provider: P,
+        provider: Arc<dyn Provider>,
         timeout_secs: u64,
         max_retries_per_chunk: u32,
         max_parallel_downloads: usize,
     ) -> Self {
         Self {
-            provider: Arc::new(provider),
+            provider,
             timeout_secs,
             max_retries_per_chunk,
             max_parallel_downloads,
@@ -232,7 +244,7 @@ mod tests {
         let mock = MockHttpClient {
             response: Ok(vec![]),
         };
-        let provider = BingMapsProvider::new(mock);
+        let provider: Arc<dyn Provider> = Arc::new(BingMapsProvider::new(mock));
         let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
 
         assert_eq!(orchestrator.timeout_secs, 30);
@@ -245,7 +257,7 @@ mod tests {
         let mock = MockHttpClient {
             response: Ok(create_mock_jpeg_chunk()),
         };
-        let provider = BingMapsProvider::new(mock);
+        let provider: Arc<dyn Provider> = Arc::new(BingMapsProvider::new(mock));
         let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
 
         let tile = TileCoord {
@@ -269,7 +281,7 @@ mod tests {
         let mock = MockHttpClient {
             response: Err(ProviderError::HttpError("404".to_string())),
         };
-        let provider = BingMapsProvider::new(mock);
+        let provider: Arc<dyn Provider> = Arc::new(BingMapsProvider::new(mock));
         let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
 
         let tile = TileCoord {
@@ -281,5 +293,11 @@ mod tests {
         let result = orchestrator.download_tile(&tile);
         assert!(result.is_err());
         // Should error due to too many failures
+    }
+
+    #[test]
+    fn test_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TileOrchestrator>();
     }
 }

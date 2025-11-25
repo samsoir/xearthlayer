@@ -7,7 +7,6 @@
 use crate::coord::to_tile_coords;
 use crate::fuse::generate_default_placeholder;
 use crate::orchestrator::TileOrchestrator;
-use crate::provider::Provider;
 use crate::texture::TextureEncoder;
 use crate::tile::{TileGenerator, TileGeneratorError, TileRequest};
 use std::sync::Arc;
@@ -25,13 +24,13 @@ use tracing::{error, info, warn};
 /// use xearthlayer::tile::{DefaultTileGenerator, TileGenerator, TileRequest};
 /// use xearthlayer::texture::{DdsTextureEncoder, TextureEncoder};
 /// use xearthlayer::orchestrator::TileOrchestrator;
-/// use xearthlayer::provider::{BingMapsProvider, ReqwestClient};
+/// use xearthlayer::provider::{BingMapsProvider, Provider, ReqwestClient};
 /// use xearthlayer::dds::DdsFormat;
 /// use std::sync::Arc;
 ///
 /// // Create components (requires network access)
 /// let http_client = ReqwestClient::new()?;
-/// let provider = BingMapsProvider::new(http_client);
+/// let provider: Arc<dyn Provider> = Arc::new(BingMapsProvider::new(http_client));
 /// let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
 /// let encoder: Arc<dyn TextureEncoder> = Arc::new(
 ///     DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(5)
@@ -46,21 +45,21 @@ use tracing::{error, info, warn};
 /// let request = TileRequest::new(37, -123, 16);
 /// let data = generator.generate(&request)?;
 /// ```
-pub struct DefaultTileGenerator<P: Provider> {
+pub struct DefaultTileGenerator {
     /// Tile orchestrator for downloading imagery
-    orchestrator: Arc<TileOrchestrator<P>>,
+    orchestrator: Arc<TileOrchestrator>,
     /// Texture encoder
     encoder: Arc<dyn TextureEncoder>,
 }
 
-impl<P: Provider + 'static> DefaultTileGenerator<P> {
+impl DefaultTileGenerator {
     /// Create a new default tile generator.
     ///
     /// # Arguments
     ///
     /// * `orchestrator` - Tile orchestrator for downloading imagery
     /// * `encoder` - Texture encoder for encoding to target format
-    pub fn new(orchestrator: TileOrchestrator<P>, encoder: Arc<dyn TextureEncoder>) -> Self {
+    pub fn new(orchestrator: TileOrchestrator, encoder: Arc<dyn TextureEncoder>) -> Self {
         Self {
             orchestrator: Arc::new(orchestrator),
             encoder,
@@ -73,7 +72,7 @@ impl<P: Provider + 'static> DefaultTileGenerator<P> {
     }
 }
 
-impl<P: Provider + 'static> TileGenerator for DefaultTileGenerator<P> {
+impl TileGenerator for DefaultTileGenerator {
     fn generate(&self, request: &TileRequest) -> Result<Vec<u8>, TileGeneratorError> {
         info!(
             "Generating tile: lat={}, lon={}, zoom={}",
@@ -155,7 +154,7 @@ impl<P: Provider + 'static> TileGenerator for DefaultTileGenerator<P> {
 mod tests {
     use super::*;
     use crate::dds::DdsFormat;
-    use crate::provider::{BingMapsProvider, MockHttpClient, ProviderError};
+    use crate::provider::{BingMapsProvider, MockHttpClient, Provider, ProviderError};
     use crate::texture::DdsTextureEncoder;
     use image::{Rgb, RgbImage};
     use std::io::Cursor;
@@ -181,7 +180,7 @@ mod tests {
         let mock = MockHttpClient {
             response: Ok(create_mock_jpeg_chunk()),
         };
-        let provider = BingMapsProvider::new(mock);
+        let provider: Arc<dyn Provider> = Arc::new(BingMapsProvider::new(mock));
         let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
         let encoder: Arc<dyn TextureEncoder> =
             Arc::new(DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(5));
@@ -195,7 +194,7 @@ mod tests {
         let mock = MockHttpClient {
             response: Ok(create_mock_jpeg_chunk()),
         };
-        let provider = BingMapsProvider::new(mock);
+        let provider: Arc<dyn Provider> = Arc::new(BingMapsProvider::new(mock));
         let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
         let encoder: Arc<dyn TextureEncoder> =
             Arc::new(DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(5));
@@ -211,7 +210,7 @@ mod tests {
         let mock = MockHttpClient {
             response: Ok(create_mock_jpeg_chunk()),
         };
-        let provider = BingMapsProvider::new(mock);
+        let provider: Arc<dyn Provider> = Arc::new(BingMapsProvider::new(mock));
         let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
         let encoder: Arc<dyn TextureEncoder> =
             Arc::new(DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(1));
@@ -233,7 +232,7 @@ mod tests {
         let mock = MockHttpClient {
             response: Err(ProviderError::HttpError("404".to_string())),
         };
-        let provider = BingMapsProvider::new(mock);
+        let provider: Arc<dyn Provider> = Arc::new(BingMapsProvider::new(mock));
         let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
         let encoder: Arc<dyn TextureEncoder> =
             Arc::new(DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(1));
@@ -256,7 +255,7 @@ mod tests {
         let mock = MockHttpClient {
             response: Ok(create_mock_jpeg_chunk()),
         };
-        let provider = BingMapsProvider::new(mock);
+        let provider: Arc<dyn Provider> = Arc::new(BingMapsProvider::new(mock));
         let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
         let encoder: Arc<dyn TextureEncoder> =
             Arc::new(DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(5));
@@ -271,7 +270,7 @@ mod tests {
     #[test]
     fn test_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<DefaultTileGenerator<BingMapsProvider<MockHttpClient>>>();
+        assert_send_sync::<DefaultTileGenerator>();
     }
 
     #[test]
@@ -279,7 +278,7 @@ mod tests {
         let mock = MockHttpClient {
             response: Ok(create_mock_jpeg_chunk()),
         };
-        let provider = BingMapsProvider::new(mock);
+        let provider: Arc<dyn Provider> = Arc::new(BingMapsProvider::new(mock));
         let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
         let encoder: Arc<dyn TextureEncoder> =
             Arc::new(DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(5));
