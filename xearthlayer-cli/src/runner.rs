@@ -1,0 +1,83 @@
+//! CLI runner for common setup and operations.
+//!
+//! Encapsulates logging initialization, service creation, and file operations
+//! to reduce duplication across command handlers.
+
+use crate::error::CliError;
+use tracing::info;
+use xearthlayer::config::TextureConfig;
+use xearthlayer::logging::{default_log_dir, default_log_file, init_logging, LoggingGuard};
+use xearthlayer::provider::ProviderConfig;
+use xearthlayer::service::{ServiceConfig, XEarthLayerService};
+
+/// Runner that manages CLI lifecycle and common operations.
+pub struct CliRunner {
+    /// Logging guard - keeps logging active while runner exists
+    #[allow(dead_code)]
+    logging_guard: LoggingGuard,
+}
+
+impl CliRunner {
+    /// Create a new CLI runner, initializing logging.
+    pub fn new() -> Result<Self, CliError> {
+        let logging_guard = init_logging(default_log_dir(), default_log_file())
+            .map_err(|e| CliError::LoggingInit(e.to_string()))?;
+
+        Ok(Self { logging_guard })
+    }
+
+    /// Log startup information for a command.
+    pub fn log_startup(&self, command: &str) {
+        info!("XEarthLayer v{}", xearthlayer::VERSION);
+        info!("XEarthLayer CLI: {} command", command);
+    }
+
+    /// Create a service with the given configuration.
+    pub fn create_service(
+        &self,
+        config: ServiceConfig,
+        provider_config: &ProviderConfig,
+    ) -> Result<XEarthLayerService, CliError> {
+        if provider_config.requires_api_key() {
+            info!("Creating {} session...", provider_config.name());
+            println!("Creating {} session...", provider_config.name());
+        }
+
+        XEarthLayerService::new(config, provider_config.clone())
+            .map_err(CliError::ServiceCreation)
+            .inspect(|_| info!("Service created successfully"))
+    }
+
+    /// Save DDS data to a file.
+    pub fn save_dds(
+        &self,
+        path: &str,
+        data: &[u8],
+        texture_config: &TextureConfig,
+    ) -> Result<(), CliError> {
+        let format = texture_config.format();
+        let mipmap_count = texture_config.mipmap_count();
+
+        info!(
+            "Saving DDS ({:?} compression, {} mipmap levels)",
+            format, mipmap_count
+        );
+        println!(
+            "Saving DDS ({:?} compression, {} mipmap levels)...",
+            format, mipmap_count
+        );
+
+        std::fs::write(path, data).map_err(|e| CliError::FileWrite {
+            path: path.to_string(),
+            error: e,
+        })?;
+
+        let size_mb = data.len() as f64 / 1_048_576.0;
+        info!("DDS saved successfully: {} ({:.2} MB)", path, size_mb);
+        println!("✓ Saved successfully: {} ({:.2} MB)", path, size_mb);
+        println!("  Format: {:?}", format);
+        println!("  Mipmaps: {}", mipmap_count);
+
+        Ok(())
+    }
+}
