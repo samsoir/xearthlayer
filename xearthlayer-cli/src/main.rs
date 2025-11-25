@@ -13,7 +13,7 @@ use xearthlayer::dds::{DdsEncoder, DdsFormat};
 use xearthlayer::fuse::XEarthLayerFS;
 use xearthlayer::logging::{default_log_dir, default_log_file, init_logging};
 use xearthlayer::orchestrator::TileOrchestrator;
-use xearthlayer::provider::{BingMapsProvider, GoogleMapsProvider, Provider, ReqwestClient};
+use xearthlayer::provider::{ProviderConfig, ProviderFactory, ReqwestClient};
 use xearthlayer::texture::{DdsTextureEncoder, TextureEncoder};
 use xearthlayer::tile::{DefaultTileGenerator, TileGenerator};
 
@@ -131,6 +131,17 @@ enum Commands {
     },
 }
 
+/// Convert CLI provider type and optional API key to ProviderConfig.
+fn to_provider_config(provider: &ProviderType, api_key: Option<String>) -> ProviderConfig {
+    match provider {
+        ProviderType::Bing => ProviderConfig::bing(),
+        ProviderType::Google => {
+            // Safe: clap's required_if_eq ensures API key is present for Google
+            ProviderConfig::google(api_key.unwrap())
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -155,6 +166,9 @@ fn main() {
             // Build texture configuration
             let texture_config = TextureConfig::new(dds_fmt).with_mipmap_count(mipmap_count);
 
+            // Build provider configuration from CLI arguments
+            let provider_config = to_provider_config(&provider, google_api_key);
+
             handle_download(
                 lat,
                 lon,
@@ -162,8 +176,7 @@ fn main() {
                 &output,
                 &format,
                 texture_config,
-                provider,
-                google_api_key,
+                provider_config,
             );
         }
         Commands::Serve {
@@ -191,10 +204,12 @@ fn main() {
                 .with_max_retries(retries as u32)
                 .with_parallel_downloads(parallel);
 
+            // Build provider configuration from CLI arguments
+            let provider_config = to_provider_config(&provider, google_api_key);
+
             handle_serve(
                 &mountpoint,
-                provider,
-                google_api_key,
+                provider_config,
                 texture_config,
                 download_config,
                 no_cache,
@@ -203,7 +218,6 @@ fn main() {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_download(
     lat: f64,
     lon: f64,
@@ -211,8 +225,7 @@ fn handle_download(
     output: &str,
     format: &Option<OutputFormat>,
     texture_config: TextureConfig,
-    provider: ProviderType,
-    google_api_key: Option<String>,
+    provider_config: ProviderConfig,
 ) {
     // Initialize logging (keep guard alive for entire function)
     let _logging_guard = match init_logging(default_log_dir(), default_log_file()) {
@@ -258,7 +271,7 @@ fn handle_download(
     );
     println!();
 
-    // Create HTTP client
+    // Create HTTP client and provider using factory
     let http_client = match ReqwestClient::new() {
         Ok(client) => {
             info!("HTTP client created successfully");
@@ -271,41 +284,33 @@ fn handle_download(
         }
     };
 
-    // Create provider based on selection
-    let (provider, name, max): (Arc<dyn Provider>, String, u8) = match provider {
-        ProviderType::Bing => {
-            let p = BingMapsProvider::new(http_client);
-            let name = p.name().to_string();
-            let max = p.max_zoom();
-            (Arc::new(p), name, max)
-        }
-        ProviderType::Google => {
-            let api_key = google_api_key.unwrap(); // Safe: required_if_eq
+    // Log provider type
+    if provider_config.requires_api_key() {
+        info!("Creating {} session...", provider_config.name());
+        println!("Creating {} session...", provider_config.name());
+    }
 
-            info!("Creating Google Maps session...");
-            println!("Creating Google Maps session...");
-            let p = match GoogleMapsProvider::new(http_client, api_key) {
-                Ok(p) => {
-                    info!("Google Maps session created successfully");
-                    p
-                }
-                Err(e) => {
-                    error!("Failed to create Google Maps provider: {}", e);
-                    eprintln!("Error creating Google Maps provider: {}", e);
-                    eprintln!("Make sure:");
-                    eprintln!("  1. Map Tiles API is enabled in Google Cloud Console");
-                    eprintln!("  2. Billing is enabled for your project");
-                    eprintln!("  3. Your API key is valid and unrestricted");
-                    process::exit(1);
-                }
-            };
-            let name = p.name().to_string();
-            let max = p.max_zoom();
-            (Arc::new(p), name, max)
+    // Create provider using factory
+    let factory = ProviderFactory::new(http_client);
+    let (provider, name, max) = match factory.create(&provider_config) {
+        Ok(result) => {
+            info!("Provider created successfully");
+            result
+        }
+        Err(e) => {
+            error!("Failed to create provider: {}", e);
+            eprintln!("Error creating provider: {}", e);
+            if provider_config.requires_api_key() {
+                eprintln!("Make sure:");
+                eprintln!("  1. Map Tiles API is enabled in Google Cloud Console");
+                eprintln!("  2. Billing is enabled for your project");
+                eprintln!("  3. Your API key is valid and unrestricted");
+            }
+            process::exit(1);
         }
     };
 
-    // Validate zoom level
+    // Validate zoom level against provider's max
     if zoom + 4 > max {
         error!(
             "Zoom level {} requires chunks at zoom {}, but {} only supports up to zoom {}",
@@ -335,8 +340,7 @@ fn handle_download(
 
 fn handle_serve(
     mountpoint: &str,
-    provider: ProviderType,
-    google_api_key: Option<String>,
+    provider_config: ProviderConfig,
     texture_config: TextureConfig,
     download_config: DownloadConfig,
     no_cache: bool,
@@ -394,37 +398,33 @@ fn handle_serve(
         texture_config.mipmap_count()
     );
 
-    // Create provider based on selection
-    let (provider, provider_name): (Arc<dyn Provider>, String) = match provider {
-        ProviderType::Bing => {
-            let p = BingMapsProvider::new(http_client);
-            let name = p.name().to_string();
-            info!("Using provider: {} (no API key required)", name);
-            println!("Provider: {} (no API key required)", name);
-            (Arc::new(p), name)
-        }
-        ProviderType::Google => {
-            let api_key = google_api_key.unwrap(); // Safe: required_if_eq
+    // Log provider type
+    if provider_config.requires_api_key() {
+        info!("Creating {} session...", provider_config.name());
+        println!("Creating {} session...", provider_config.name());
+    }
 
-            info!("Creating Google Maps session...");
-            println!("Creating Google Maps session...");
-            let p = match GoogleMapsProvider::new(http_client, api_key) {
-                Ok(p) => {
-                    info!("Google Maps session created successfully");
-                    p
-                }
-                Err(e) => {
-                    error!("Failed to create Google Maps provider: {}", e);
-                    eprintln!("Error creating Google Maps provider: {}", e);
-                    process::exit(1);
-                }
-            };
-            let name = p.name().to_string();
-            info!("Using provider: {}", name);
-            println!("Provider: {}", name);
-            (Arc::new(p), name)
+    // Create provider using factory
+    let factory = ProviderFactory::new(http_client);
+    let (provider, provider_name, _max_zoom) = match factory.create(&provider_config) {
+        Ok(result) => {
+            info!("Provider created successfully");
+            result
+        }
+        Err(e) => {
+            error!("Failed to create provider: {}", e);
+            eprintln!("Error creating provider: {}", e);
+            process::exit(1);
         }
     };
+
+    if provider_config.requires_api_key() {
+        info!("Using provider: {}", provider_name);
+        println!("Provider: {}", provider_name);
+    } else {
+        info!("Using provider: {} (no API key required)", provider_name);
+        println!("Provider: {} (no API key required)", provider_name);
+    }
     println!();
 
     // Create orchestrator from config

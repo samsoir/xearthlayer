@@ -679,7 +679,7 @@ fn main() {
 
 | Phase | Effort | Impact | Dependencies | Status |
 |-------|--------|--------|--------------|--------|
-| Phase 5: Provider Factory | Low | Medium | Phase 4 | Pending |
+| Phase 5: Provider Factory | Low | Medium | Phase 4 | ✅ Complete |
 | Phase 6: Service Facade | Medium | High | All above | Pending |
 
 ---
@@ -764,11 +764,13 @@ xearthlayer/src/
 - [x] Update CLI to use config builders (reduced function parameters)
 - [x] Verify tests still pass (365 unit tests + 21 doc tests)
 
-### Phase 5: Provider Factory
-- [ ] Create `provider/factory.rs`
-- [ ] Create ProviderConfig enum
-- [ ] Update CLI to use factory
-- [ ] Remove duplicated provider creation
+### Phase 5: Provider Factory ✅ COMPLETE
+- [x] Create `provider/factory.rs` with ProviderFactory struct
+- [x] Create ProviderConfig enum (Bing, Google variants)
+- [x] Add helper methods: `name()`, `requires_api_key()`
+- [x] Update CLI with `to_provider_config()` helper
+- [x] Refactor `handle_download` and `handle_serve` to use factory
+- [x] Verify tests still pass (369 unit tests + 22 doc tests)
 
 ### Phase 6: Service Facade
 - [ ] Create `service.rs` with XEarthLayerService
