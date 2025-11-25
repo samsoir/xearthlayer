@@ -178,7 +178,7 @@ impl XEarthLayerService {
             });
         }
 
-        // Convert coordinates to tile
+        // Convert lat/lon to tile coordinates
         let tile =
             to_tile_coords(lat, lon, zoom).map_err(|e| ServiceError::InvalidCoordinates {
                 lat,
@@ -186,7 +186,7 @@ impl XEarthLayerService {
                 reason: e.to_string(),
             })?;
 
-        // Create tile request
+        // Create tile request with tile row/col coordinates
         let request = TileRequest::new(tile.row as i32, tile.col as i32, zoom);
 
         // Generate tile

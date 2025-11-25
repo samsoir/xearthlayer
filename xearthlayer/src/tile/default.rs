@@ -4,7 +4,7 @@
 //! using a `TileOrchestrator` and encodes it to texture format using a
 //! `TextureEncoder`.
 
-use crate::coord::to_tile_coords;
+use crate::coord::TileCoord;
 use crate::fuse::generate_default_placeholder;
 use crate::orchestrator::TileOrchestrator;
 use crate::texture::TextureEncoder;
@@ -75,32 +75,32 @@ impl DefaultTileGenerator {
 impl TileGenerator for DefaultTileGenerator {
     fn generate(&self, request: &TileRequest) -> Result<Vec<u8>, TileGeneratorError> {
         info!(
-            "Generating tile: lat={}, lon={}, zoom={}",
-            request.lat(),
-            request.lon(),
+            "Generating tile: row={}, col={}, zoom={}",
+            request.row(),
+            request.col(),
             request.zoom()
         );
 
-        // Convert request coordinates to TileCoord
-        let tile = match to_tile_coords(request.lat_f64(), request.lon_f64(), request.zoom()) {
-            Ok(t) => {
-                info!(
-                    "Converted lat={}, lon={}, zoom={} to tile row={}, col={}",
-                    request.lat(),
-                    request.lon(),
-                    request.zoom(),
-                    t.row,
-                    t.col
-                );
-                t
-            }
-            Err(e) => {
-                error!("Failed to convert coordinates: {}", e);
-                warn!("Returning magenta placeholder for invalid coordinates");
-                return generate_default_placeholder().map_err(|e| {
-                    TileGeneratorError::Internal(format!("Failed to generate placeholder: {}", e))
-                });
-            }
+        // Validate coordinates are non-negative (tile indices must be positive)
+        if request.row() < 0 || request.col() < 0 {
+            error!(
+                "Invalid tile coordinates: row={}, col={} (must be non-negative)",
+                request.row(),
+                request.col()
+            );
+            warn!("Returning magenta placeholder for invalid coordinates");
+            return generate_default_placeholder().map_err(|e| {
+                TileGeneratorError::Internal(format!("Failed to generate placeholder: {}", e))
+            });
+        }
+
+        // TileRequest already contains tile coordinates (row/col), not lat/lon
+        // These come from FUSE filenames like "+37+123_BI16.dds" where
+        // 37 is the tile row and 123 is the tile column
+        let tile = TileCoord {
+            row: request.row() as u32,
+            col: request.col() as u32,
+            zoom: request.zoom(),
         };
 
         // Download tile imagery
@@ -216,7 +216,8 @@ mod tests {
             Arc::new(DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(1));
 
         let generator = DefaultTileGenerator::new(orchestrator, encoder);
-        let request = TileRequest::new(37, -123, 10);
+        // Use valid tile coordinates at zoom 10: row and col in range 0-1023
+        let request = TileRequest::new(300, 500, 10);
 
         let result = generator.generate(&request);
         assert!(result.is_ok());
@@ -238,7 +239,8 @@ mod tests {
             Arc::new(DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(1));
 
         let generator = DefaultTileGenerator::new(orchestrator, encoder);
-        let request = TileRequest::new(37, -123, 10);
+        // Use valid tile coordinates at zoom 10: row and col in range 0-1023
+        let request = TileRequest::new(300, 500, 10);
 
         // Should return placeholder instead of error
         let result = generator.generate(&request);
