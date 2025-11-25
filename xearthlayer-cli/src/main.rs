@@ -5,6 +5,7 @@
 use clap::{Parser, ValueEnum};
 use std::process;
 use xearthlayer::coord::to_tile_coords;
+use xearthlayer::dds::{DdsEncoder, DdsFormat};
 use xearthlayer::orchestrator::TileOrchestrator;
 use xearthlayer::provider::{BingMapsProvider, GoogleMapsProvider, Provider, ReqwestClient};
 
@@ -14,6 +15,22 @@ enum ProviderType {
     Bing,
     /// Google Maps satellite imagery (requires API key)
     Google,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum OutputFormat {
+    /// JPEG image format (90% quality)
+    Jpeg,
+    /// DDS texture format for X-Plane
+    Dds,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum DdsCompressionFormat {
+    /// BC1/DXT1 compression (4:1, best for opaque textures)
+    Bc1,
+    /// BC3/DXT5 compression (4:1, with full alpha channel)
+    Bc3,
 }
 
 #[derive(Parser)]
@@ -32,9 +49,21 @@ struct Args {
     #[arg(long, default_value = "15")]
     zoom: u8,
 
-    /// Output file path (JPEG format)
+    /// Output file path (auto-detects format from extension: .jpg/.dds)
     #[arg(long)]
     output: String,
+
+    /// Output format (auto-detected from file extension if not specified)
+    #[arg(long, value_enum)]
+    format: Option<OutputFormat>,
+
+    /// DDS compression format (BC1 or BC3)
+    #[arg(long, value_enum, default_value = "bc1")]
+    dds_format: DdsCompressionFormat,
+
+    /// Number of mipmap levels for DDS (default: 5 for 4096→256)
+    #[arg(long, default_value = "5")]
+    mipmap_count: usize,
 
     /// Imagery provider to use
     #[arg(long, value_enum, default_value = "bing")]
@@ -105,7 +134,14 @@ fn main() {
 
             // Create orchestrator (30s timeout, 3 retries per chunk, 32 parallel downloads)
             let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
-            download_and_save(orchestrator, &tile, &args.output);
+            download_and_save(
+                orchestrator,
+                &tile,
+                &args.output,
+                &args.format,
+                &args.dds_format,
+                args.mipmap_count,
+            );
         }
         ProviderType::Google => {
             let api_key = args.google_api_key.clone().unwrap(); // Safe: required_if_eq
@@ -143,7 +179,14 @@ fn main() {
 
             // Create orchestrator
             let orchestrator = TileOrchestrator::new(provider, 30, 3, 32);
-            download_and_save(orchestrator, &tile, &args.output);
+            download_and_save(
+                orchestrator,
+                &tile,
+                &args.output,
+                &args.format,
+                &args.dds_format,
+                args.mipmap_count,
+            );
         }
     }
 }
@@ -152,6 +195,9 @@ fn download_and_save<P: Provider + 'static>(
     orchestrator: TileOrchestrator<P>,
     tile: &xearthlayer::coord::TileCoord,
     output_path: &str,
+    format: &Option<OutputFormat>,
+    dds_format: &DdsCompressionFormat,
+    mipmap_count: usize,
 ) {
     // Download tile
     println!("Downloading 256 chunks in parallel...");
@@ -171,11 +217,31 @@ fn download_and_save<P: Provider + 'static>(
     println!("Image size: {}x{}", image.width(), image.height());
     println!();
 
-    // Save as JPEG with 90% quality
-    println!("Saving to {}...", output_path);
+    // Determine output format (from flag or file extension)
+    let output_format = match format {
+        Some(f) => f.clone(),
+        None => {
+            // Auto-detect from file extension
+            if output_path.to_lowercase().ends_with(".dds") {
+                OutputFormat::Dds
+            } else {
+                OutputFormat::Jpeg
+            }
+        }
+    };
+
+    // Save based on format
+    match output_format {
+        OutputFormat::Jpeg => save_jpeg(&image, output_path),
+        OutputFormat::Dds => save_dds(&image, output_path, dds_format, mipmap_count),
+    }
+}
+
+fn save_jpeg(image: &image::RgbaImage, output_path: &str) {
+    println!("Encoding as JPEG (90% quality)...");
 
     // Convert RGBA to RGB for JPEG
-    let rgb_image = image::DynamicImage::ImageRgba8(image).to_rgb8();
+    let rgb_image = image::DynamicImage::ImageRgba8(image.clone()).to_rgb8();
 
     // Use JPEG encoder with quality setting
     let file = match std::fs::File::create(output_path) {
@@ -195,10 +261,66 @@ fn download_and_save<P: Provider + 'static>(
         image::ExtendedColorType::Rgb8,
     ) {
         Ok(_) => {
-            println!("Saved successfully with 90% quality!");
+            let file_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "✓ Saved successfully: {} ({:.2} MB)",
+                output_path,
+                file_size as f64 / 1_048_576.0
+            );
         }
         Err(e) => {
             eprintln!("Error encoding JPEG: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
+fn save_dds(
+    image: &image::RgbaImage,
+    output_path: &str,
+    dds_format: &DdsCompressionFormat,
+    mipmap_count: usize,
+) {
+    let format = match dds_format {
+        DdsCompressionFormat::Bc1 => DdsFormat::BC1,
+        DdsCompressionFormat::Bc3 => DdsFormat::BC3,
+    };
+
+    println!(
+        "Encoding as DDS ({:?} compression, {} mipmap levels)...",
+        format, mipmap_count
+    );
+
+    let encode_start = std::time::Instant::now();
+
+    // Create encoder and encode
+    let encoder = DdsEncoder::new(format).with_mipmap_count(mipmap_count);
+
+    let dds_data = match encoder.encode(image) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Error encoding DDS: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let encode_elapsed = encode_start.elapsed();
+
+    // Write to file
+    match std::fs::write(output_path, &dds_data) {
+        Ok(_) => {
+            println!(
+                "✓ Saved successfully: {} ({:.2} MB, encoded in {:.2}s)",
+                output_path,
+                dds_data.len() as f64 / 1_048_576.0,
+                encode_elapsed.as_secs_f64()
+            );
+            println!("  Format: {:?}", format);
+            println!("  Mipmaps: {}", mipmap_count);
+            println!("  Dimensions: {}×{}", image.width(), image.height());
+        }
+        Err(e) => {
+            eprintln!("Error writing DDS file: {}", e);
             process::exit(1);
         }
     }

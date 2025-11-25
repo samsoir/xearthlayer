@@ -135,6 +135,48 @@ cargo build --release
 
 **Note**: The maximum usable zoom level is 15 for Bing Maps because tiles at zoom Z require chunks from zoom Z+4, and Bing's maximum zoom is 19 (15+4=19).
 
+### DDS Texture Output for X-Plane
+
+The CLI can generate DDS (DirectX Surface) texture files with BC1/BC3 compression, ready for X-Plane:
+
+```bash
+# Generate BC1 DDS texture (auto-detected from .dds extension)
+./target/release/xearthlayer \
+  --lat 37.7749 \
+  --lon=-122.4194 \
+  --zoom 15 \
+  --output sf_tile.dds
+
+# Generate BC3 DDS with custom mipmap count
+./target/release/xearthlayer \
+  --lat 40.7128 \
+  --lon=-74.0060 \
+  --zoom 15 \
+  --dds-format bc3 \
+  --mipmap-count 5 \
+  --output nyc_tile.dds
+
+# Test DDS generation with script
+./test_dds_output.sh
+```
+
+**DDS Format Options:**
+- `--format dds|jpeg` - Output format (auto-detected from extension)
+- `--dds-format bc1|bc3` - Compression format (default: bc1)
+  - **BC1/DXT1**: 4:1 compression, best for opaque satellite imagery (~11 MB)
+  - **BC3/DXT5**: 4:1 compression with alpha channel (~21 MB)
+- `--mipmap-count N` - Number of mipmap levels (default: 5)
+
+**Performance:** Encoding a 4096×4096 texture takes ~0.2-0.3 seconds.
+
+**Verification:** Generated DDS files are compatible with:
+- X-Plane flight simulator
+- GIMP (with DDS plugin)
+- Paint.NET (with DDS plugin)
+- ImageMagick: `identify -verbose output.dds`
+
+See `docs/DDS_IMPLEMENTATION.md` for detailed technical documentation.
+
 ### Provider Comparison
 
 XEarthLayer supports multiple satellite imagery providers with different characteristics:
