@@ -222,9 +222,8 @@ This document provides a comprehensive overview of all modules in the XEarthLaye
 
 **Commands**:
 - `xearthlayer init` - Initialize configuration file
-- `xearthlayer mount` - Mount scenery pack with passthrough filesystem
+- `xearthlayer start` - Start XEarthLayer with passthrough filesystem
 - `xearthlayer download` - Download a single tile to file
-- `xearthlayer serve` - Start standalone FUSE server
 
 **Key Features**:
 - Signal handling (Ctrl+C, SIGTERM) with graceful shutdown

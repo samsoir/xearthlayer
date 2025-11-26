@@ -22,11 +22,11 @@ XEarthLayer mounts a virtual filesystem that intercepts X-Plane's texture file r
 # Build release binary
 make release
 
-# Mount a scenery pack (auto-detects X-Plane Custom Scenery folder)
-./target/release/xearthlayer mount --source /path/to/z_ortho_scenery
+# Start with a scenery pack (auto-detects X-Plane Custom Scenery folder)
+./target/release/xearthlayer start --source /path/to/z_ortho_scenery
 
 # Or specify mountpoint explicitly
-./target/release/xearthlayer mount \
+./target/release/xearthlayer start \
   --source /path/to/z_ortho_scenery \
   --mountpoint "/path/to/X-Plane 12/Custom Scenery/z_ortho_scenery"
 ```
@@ -102,14 +102,11 @@ make doc-open       # Generate and open documentation
 # Initialize configuration file
 xearthlayer init
 
-# Mount scenery pack with passthrough filesystem
-xearthlayer mount --source <scenery_dir> [--mountpoint <path>]
+# Start XEarthLayer with a scenery pack (passthrough filesystem)
+xearthlayer start --source <scenery_dir> [--mountpoint <path>]
 
 # Download a single tile (for testing)
 xearthlayer download --lat <lat> --lon <lon> --zoom <zoom> --output <file.dds>
-
-# Start FUSE server (standalone, no passthrough)
-xearthlayer serve --mountpoint <path>
 ```
 
 Run `xearthlayer --help` for all options.

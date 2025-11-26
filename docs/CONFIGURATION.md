@@ -208,16 +208,16 @@ Most configuration settings can be overridden via CLI arguments:
 
 ```bash
 # Override provider
-xearthlayer mount --source ./scenery --provider google --google-api-key YOUR_KEY
+xearthlayer start --source ./scenery --provider google --google-api-key YOUR_KEY
 
 # Override DDS format
-xearthlayer mount --source ./scenery --dds-format bc3
+xearthlayer start --source ./scenery --dds-format bc3
 
 # Override download settings
-xearthlayer mount --source ./scenery --timeout 60 --parallel 16
+xearthlayer start --source ./scenery --timeout 60 --parallel 16
 
 # Disable caching
-xearthlayer mount --source ./scenery --no-cache
+xearthlayer start --source ./scenery --no-cache
 ```
 
 ## Regenerating Config

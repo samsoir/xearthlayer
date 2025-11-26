@@ -102,8 +102,8 @@ enum Commands {
     /// Initialize configuration file at ~/.xearthlayer/config.ini
     Init,
 
-    /// Mount a scenery pack with passthrough for real files and on-demand DDS generation
-    Mount {
+    /// Start XEarthLayer with a scenery pack (passthrough for real files, on-demand DDS generation)
+    Start {
         /// Source scenery pack directory to overlay
         #[arg(long)]
         source: String,
@@ -137,7 +137,7 @@ enum Commands {
         no_cache: bool,
     },
 
-    /// Download a single tile to a file
+    /// Download a single tile to a file (for testing)
     Download {
         /// Latitude in decimal degrees
         #[arg(long)]
@@ -167,37 +167,6 @@ enum Commands {
         #[arg(long)]
         google_api_key: Option<String>,
     },
-
-    /// Start FUSE server for on-demand texture generation
-    Serve {
-        /// FUSE mountpoint directory
-        #[arg(long)]
-        mountpoint: String,
-
-        /// Imagery provider (default: from config)
-        #[arg(long, value_enum)]
-        provider: Option<ProviderType>,
-
-        /// Google Maps API key (default: from config)
-        #[arg(long)]
-        google_api_key: Option<String>,
-
-        /// DDS compression format (default: from config)
-        #[arg(long, value_enum)]
-        dds_format: Option<DdsCompression>,
-
-        /// Download timeout in seconds (default: from config)
-        #[arg(long)]
-        timeout: Option<u64>,
-
-        /// Maximum parallel downloads (default: from config)
-        #[arg(long)]
-        parallel: Option<usize>,
-
-        /// Disable caching (always generate tiles fresh)
-        #[arg(long)]
-        no_cache: bool,
-    },
 }
 
 // ============================================================================
@@ -209,7 +178,7 @@ fn main() {
 
     let result = match cli.command {
         Commands::Init => run_init(),
-        Commands::Mount {
+        Commands::Start {
             source,
             mountpoint,
             provider,
@@ -218,7 +187,7 @@ fn main() {
             timeout,
             parallel,
             no_cache,
-        } => run_mount(
+        } => run_start(
             source,
             mountpoint,
             provider,
@@ -237,23 +206,6 @@ fn main() {
             provider,
             google_api_key,
         } => run_download(lat, lon, zoom, output, dds_format, provider, google_api_key),
-        Commands::Serve {
-            mountpoint,
-            provider,
-            google_api_key,
-            dds_format,
-            timeout,
-            parallel,
-            no_cache,
-        } => run_serve(
-            mountpoint,
-            provider,
-            google_api_key,
-            dds_format,
-            timeout,
-            parallel,
-            no_cache,
-        ),
     };
 
     if let Err(e) = result {
@@ -299,7 +251,7 @@ fn resolve_dds_format(cli_format: Option<DdsCompression>, config: &ConfigFile) -
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_mount(
+fn run_start(
     source: String,
     mountpoint: Option<String>,
     provider: Option<ProviderType>,
@@ -310,7 +262,7 @@ fn run_mount(
     no_cache: bool,
 ) -> Result<(), CliError> {
     let runner = CliRunner::new()?;
-    runner.log_startup("mount");
+    runner.log_startup("start");
     let config = runner.config();
 
     // Determine mountpoint: CLI > config > auto-detect
@@ -479,97 +431,5 @@ fn run_download(
     // Save to file
     runner.save_dds(&output, &dds_data, &texture_config)?;
 
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_serve(
-    mountpoint: String,
-    provider: Option<ProviderType>,
-    google_api_key: Option<String>,
-    dds_format: Option<DdsCompression>,
-    timeout: Option<u64>,
-    parallel: Option<usize>,
-    no_cache: bool,
-) -> Result<(), CliError> {
-    let runner = CliRunner::new()?;
-    runner.log_startup("serve");
-    let config = runner.config();
-
-    // Resolve settings from CLI and config
-    let provider_config = resolve_provider(provider, google_api_key, config)?;
-    let format = resolve_dds_format(dds_format, config);
-    let timeout_secs = timeout.unwrap_or(config.download.timeout);
-    let parallel_downloads = parallel.unwrap_or(config.download.parallel);
-
-    // Build configurations
-    let texture_config = TextureConfig::new(format).with_mipmap_count(5);
-
-    let download_config = DownloadConfig::new()
-        .with_timeout_secs(timeout_secs)
-        .with_max_retries(3)
-        .with_parallel_downloads(parallel_downloads);
-
-    let service_config = ServiceConfig::builder()
-        .texture(texture_config)
-        .download(download_config)
-        .cache_enabled(!no_cache)
-        .mountpoint(&mountpoint)
-        .cache_directory(config.cache.directory.clone())
-        .cache_memory_size(config.cache.memory_size)
-        .cache_disk_size(config.cache.disk_size)
-        .generation_threads(config.generation.threads)
-        .generation_timeout(config.generation.timeout)
-        .build();
-
-    // Print banner
-    println!("XEarthLayer FUSE Server v{}", xearthlayer::VERSION);
-    println!("=======================");
-    println!();
-    println!("Mountpoint: {}", mountpoint);
-    println!("DDS Format: {:?}", texture_config.format());
-    println!();
-
-    let service = runner.create_service(service_config, &provider_config)?;
-
-    // Print service info
-    if service.cache_enabled() {
-        println!(
-            "Cache: Enabled ({} memory, {} disk)",
-            xearthlayer::config::format_size(config.cache.memory_size),
-            xearthlayer::config::format_size(config.cache.disk_size)
-        );
-    } else {
-        println!("Cache: Disabled (all tiles generated fresh)");
-    }
-    println!("Provider: {}", service.provider_name());
-    println!();
-
-    println!("Mounting filesystem...");
-    println!("Press Ctrl+C to unmount and exit");
-    println!();
-
-    // Set up signal handler for graceful shutdown
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-
-    ctrlc::set_handler(move || {
-        println!();
-        println!("Received shutdown signal, unmounting...");
-        shutdown_clone.store(true, Ordering::SeqCst);
-    })
-    .map_err(|e| CliError::Config(format!("Failed to set signal handler: {}", e)))?;
-
-    // Start serving in background
-    // The BackgroundSession auto-unmounts when dropped
-    let _session = service.serve_background().map_err(CliError::Serve)?;
-
-    // Wait for shutdown signal
-    while !shutdown.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    // Session drops here, triggering unmount
-    println!("Filesystem unmounted.");
     Ok(())
 }

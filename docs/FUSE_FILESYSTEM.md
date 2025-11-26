@@ -364,16 +364,16 @@ Packs are distributed as compressed archives:
 ### Runtime Management
 
 ```bash
-# Mount a scenery pack with auto-detected X-Plane path
-xearthlayer mount --source /path/to/scenery/z_xel_europe
+# Start with a scenery pack using auto-detected X-Plane path
+xearthlayer start --source /path/to/scenery/z_xel_europe
 
-# Mount with explicit mountpoint
-xearthlayer mount \
+# Start with explicit mountpoint
+xearthlayer start \
   --source /path/to/scenery/z_xel_europe \
   --mountpoint "/path/to/X-Plane 12/Custom Scenery/z_xel_europe"
 
-# Mount without caching (for testing)
-xearthlayer mount --source /path/to/scenery/z_xel_test --no-cache
+# Start without caching (for testing)
+xearthlayer start --source /path/to/scenery/z_xel_test --no-cache
 
 # Unmount (use fusermount on Linux/macOS)
 fusermount -u "/path/to/X-Plane 12/Custom Scenery/z_xel_europe"

@@ -502,8 +502,8 @@ OVERALL
 ### CLI Arguments
 
 ```bash
-xearthlayer serve \
-  --mountpoint /tmp/mount \
+xearthlayer start \
+  --source /path/to/scenery \
   --provider bing \                      # Imagery provider
   --memory-cache-size 2G \               # Memory cache size (default: 2G)
   --disk-cache-size 20G \                # Disk cache size (default: 20G)
@@ -604,11 +604,11 @@ A key design goal is enabling users to compare imagery quality between providers
 
 ```bash
 # Day 1: Try Bing Maps (free)
-xearthlayer serve --provider bing --mountpoint /mnt
+xearthlayer start --source /path/to/scenery --provider bing
 # Flies around Bay Area, caches 100 tiles (~1.1 GB)
 
 # Day 2: Compare with Google Maps
-xearthlayer serve --provider google --mountpoint /mnt
+xearthlayer start --source /path/to/scenery --provider google
 # Bing cache preserved at cache/bing/
 # Google tiles cached to cache/google/
 # Can instantly switch back to Bing without re-downloading
