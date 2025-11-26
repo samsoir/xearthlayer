@@ -1,5 +1,6 @@
 //! Two-tier cache system coordinator.
 
+use crate::cache::daemon::DiskCacheDaemon;
 use crate::cache::disk::DiskCache;
 use crate::cache::memory::MemoryCache;
 use crate::cache::r#trait::Cache;
@@ -13,6 +14,9 @@ use std::sync::Arc;
 /// 1. Check memory cache (fast: <1ms)
 /// 2. If miss, check disk cache (medium: 10-50ms)
 /// 3. If miss, caller generates tile and caches it
+///
+/// The cache system also runs a background daemon that periodically
+/// checks the disk cache size and evicts LRU entries when needed.
 ///
 /// # Example
 ///
@@ -42,10 +46,16 @@ pub struct CacheSystem {
     disk: Arc<DiskCache>,
     /// Provider name
     provider: String,
+    /// Background daemon for disk cache garbage collection
+    #[allow(dead_code)]
+    daemon: DiskCacheDaemon,
 }
 
 impl CacheSystem {
     /// Create a new two-tier cache system.
+    ///
+    /// This also starts a background daemon that periodically checks
+    /// the disk cache size and evicts LRU entries when needed.
     ///
     /// # Arguments
     ///
@@ -58,10 +68,14 @@ impl CacheSystem {
             config.disk.max_size_bytes,
         )?);
 
+        // Start background daemon for disk cache garbage collection
+        let daemon = DiskCacheDaemon::start(disk.clone(), config.disk.daemon_interval_secs);
+
         Ok(Self {
             memory,
             disk,
             provider: config.provider,
+            daemon,
         })
     }
 

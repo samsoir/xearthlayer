@@ -51,6 +51,9 @@ impl DiskCache {
         // Scan existing cache to build index
         cache.scan_cache_dir()?;
 
+        // Evict if over limit on startup (cleanup before simulator requests tiles)
+        cache.evict_if_over_limit()?;
+
         Ok(cache)
     }
 

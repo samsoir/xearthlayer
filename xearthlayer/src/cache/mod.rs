@@ -3,6 +3,7 @@
 //! Provides memory and disk caching with LRU eviction, statistics tracking,
 //! and provider-specific hierarchical storage.
 
+mod daemon;
 mod disk;
 mod memory;
 mod path;
@@ -11,6 +12,7 @@ mod system;
 mod r#trait;
 mod types;
 
+pub use daemon::DiskCacheDaemon;
 pub use disk::DiskCache;
 pub use memory::MemoryCache;
 pub use r#trait::{Cache, NoOpCache};

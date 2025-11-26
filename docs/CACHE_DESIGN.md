@@ -154,14 +154,17 @@ enum EvictionPolicy {
 
 **When**: Memory cache exceeds `max_size_bytes`
 
-**How**: LRU (Least Recently Used)
-1. Sort entries by `last_accessed` timestamp
-2. Evict oldest entries until under limit
-3. Log eviction statistics
+**How**: LRU (Least Recently Used) on `put()`
+1. When adding a new entry would exceed the limit
+2. Sort entries by `last_accessed` timestamp
+3. Evict oldest entries until space is available
+4. Log eviction statistics
 
-**Thread**: Memory cache daemon (separate thread)
-
-**Frequency**: Checked every 5-10 seconds
+**Trigger**: Eviction happens synchronously during `put()` operations. This is efficient because:
+- Memory operations are fast (<1ms to sort and evict)
+- No separate daemon thread needed for memory cache
+- Cache size is always maintained under limit
+- Stale entries remain valid until space is needed
 
 ## Cache Tier 2: Disk Cache
 
@@ -308,79 +311,78 @@ struct DiskWriteRequest {
 **When**: Disk cache exceeds `max_size_bytes`
 
 **How**:
-1. Scan cache directory tree (per provider)
-2. Sort files by last access time (filesystem atime/mtime)
-3. Delete oldest files until under limit
-4. Update index
+1. Sort cached files by modification time (oldest first)
+2. Delete oldest files until cache is at 90% of limit
+3. Update index and statistics
+4. Log eviction activity
 
-**Thread**: Disk cache daemon (separate thread)
+**Trigger**: Two mechanisms ensure disk cache stays under limit:
 
-**Frequency**: Every 60 seconds
+1. **Startup Eviction**: When `DiskCache` is created, it scans the cache directory and immediately evicts if over limit. This handles cleanup from previous sessions before the simulator starts requesting tiles.
+
+2. **Background Daemon**: A `DiskCacheDaemon` thread runs every 60 seconds (configurable via `daemon_interval_secs`), checking the cache size and evicting LRU entries if needed. This keeps eviction off the critical path of serving tiles to X-Plane.
+
+**Rationale for Background GC**:
+- Disk I/O for eviction is slow (scanning directories, deleting files)
+- Eviction during `put()` would block tile delivery to X-Plane
+- Background thread allows eviction to happen asynchronously
+- 60-second interval is sufficient since tiles are ~11MB each
 
 ## Thread Architecture
 
-### Thread Separation Decision
+### Design Decision
 
-**Decision**: Use separate threads for memory and disk cache daemons
+**Decision**: Memory cache uses synchronous eviction-on-put; disk cache uses a background daemon.
 
 **Rationale**:
-- Memory operations are time-critical (FUSE performance)
-- Disk operations can be lazier (slower cleanup acceptable)
-- Memory daemon can evict quickly without blocking on disk I/O
-- Disk daemon handles compression, file organization independently
-- Better separation of concerns
-- Similar to AutoOrtho's architecture
+- Memory eviction is fast (in-memory sort and remove) - no daemon needed
+- Disk eviction is slow (filesystem I/O) - must not block tile delivery
+- Simpler architecture than having multiple daemon threads
+- Clean shutdown via `Drop` trait ensures daemon terminates gracefully
 
 ### Main FUSE Thread
 - Handles FUSE operations (lookup, read, etc.)
 - Queries memory cache synchronously
 - Triggers disk reads synchronously (if memory miss)
-- Sends disk writes asynchronously
+- Writes to disk synchronously (write-through strategy)
 
-### Disk Write Thread
-- Receives write requests via channel
-- Creates directory structure (provider/format/zoom/row)
-- Writes DDS files to disk
-- Updates cache index
-- Logs write statistics
-
-### Memory Cache Daemon
-- Monitors memory cache size
-- Evicts entries when over limit (LRU)
-- Updates statistics
-- Runs every 5-10 seconds
-
-### Disk Cache Daemon
-- Monitors disk cache size (per provider)
-- Evicts old files when over limit
-- Scans for orphaned files
-- Updates statistics
-- Runs every 60 seconds
+### Disk Cache GC Daemon
+- Single background thread named `disk-cache-gc`
+- Sleeps in 1-second intervals (for responsive shutdown)
+- Runs eviction check every `daemon_interval_secs` (default: 60s)
+- Uses `AtomicBool` for clean shutdown signaling
+- Automatically started when `CacheSystem` is created
+- Automatically stopped when `CacheSystem` is dropped
 
 ### Thread Communication
 
 ```rust
-struct CacheSystem {
-    // Shared state (protected by Arc<Mutex>)
-    memory_cache: Arc<Mutex<HashMap<u64, CacheEntry>>>,
-    disk_index: Arc<Mutex<HashMap<u64, PathBuf>>>,
-    stats: Arc<Mutex<CacheStats>>,
+/// Background daemon for disk cache garbage collection.
+pub struct DiskCacheDaemon {
+    /// Handle to the daemon thread
+    thread_handle: Option<JoinHandle<()>>,
+    /// Shutdown signal (AtomicBool for lock-free signaling)
+    shutdown: Arc<AtomicBool>,
+}
 
-    // Async communication
-    disk_write_tx: mpsc::Sender<DiskWriteRequest>,
-    disk_write_rx: mpsc::Receiver<DiskWriteRequest>,
-
-    // Configuration
-    memory_config: MemoryCacheConfig,
-    disk_config: DiskCacheConfig,
+/// Two-tier cache system with integrated GC daemon.
+pub struct CacheSystem {
+    /// Memory cache (Tier 1: fast, evicts on put)
+    memory: Arc<MemoryCache>,
+    /// Disk cache (Tier 2: persistent)
+    disk: Arc<DiskCache>,
+    /// Provider name
     provider: String,
-
-    // Thread handles
-    disk_writer_handle: Option<JoinHandle<()>>,
-    memory_daemon_handle: Option<JoinHandle<()>>,
-    disk_daemon_handle: Option<JoinHandle<()>>,
+    /// Background daemon for disk cache GC
+    daemon: DiskCacheDaemon,
 }
 ```
+
+### Lifecycle
+
+1. **Startup**: `CacheSystem::new()` creates caches and starts the GC daemon
+2. **Running**: Daemon wakes every 60s, checks disk size, evicts if needed
+3. **Shutdown**: `drop(CacheSystem)` signals daemon to stop and waits for thread to join
 
 ## Cache Statistics
 
@@ -620,24 +622,26 @@ rm -rf ~/.cache/xearthlayer/bing/
 
 ### Phase 1: Basic Memory Cache ✅
 - ✅ In-memory HashMap cache
-- ✅ Basic inode cache for reverse mapping
+- ✅ CacheKey with provider/format/tile coordinates
 
 ### Phase 2: Memory Cache with LRU ✅
 - ✅ Memory size limits (2GB default, configurable)
-- ✅ LRU eviction
-- ✅ Background cleanup thread
-- ✅ Statistics tracking
+- ✅ LRU eviction on `put()` operations
+- ✅ Statistics tracking (hits, misses, evictions)
 
 ### Phase 3: Disk Cache ✅
 - ✅ Hierarchical disk cache structure (provider/format/zoom/row)
-- ✅ Async disk writes
+- ✅ Synchronous disk writes (write-through)
 - ✅ Disk cache with size limits (20GB default, configurable)
 - ✅ LRU eviction for disk cache
+- ✅ Startup eviction (cleanup before simulator starts)
+- ✅ Background GC daemon (60-second interval)
+- ✅ Clean daemon shutdown on drop
 
 ### Phase 4: Advanced Features (Partial)
-- ❌ Virtual `/stats` file (not implemented)
+- ❌ Virtual `/stats` file (planned)
 - ✅ Configurable cache sizes via config.ini
-- ❌ Age-based eviction (not implemented)
+- ❌ Age-based eviction (config exists, not implemented)
 - ❌ Corruption detection/recovery (not implemented)
 - ❌ Cache pre-warming (not implemented)
 
@@ -701,11 +705,23 @@ du -sh ~/.cache/xearthlayer/*/* | sort -h
 
 ### Automated Cleanup
 
-The disk cache daemon automatically:
-- Evicts oldest tiles when size limit exceeded (per provider)
-- Removes orphaned index entries
-- Deletes corrupted files
-- Logs cleanup operations
+The disk cache garbage collection runs automatically:
+
+**On Startup**:
+- Scans cache directory and builds index
+- Evicts if over limit before simulator starts requesting tiles
+- Ensures clean state from previous sessions
+
+**Background Daemon** (every 60 seconds):
+- Checks if cache exceeds `max_size_bytes`
+- Evicts oldest tiles (by mtime) until at 90% of limit
+- Logs eviction statistics at INFO level
+- Uses minimal CPU when cache is under limit
+
+**On Shutdown**:
+- Daemon receives shutdown signal
+- Thread joins cleanly (waits up to 1 second)
+- No orphaned threads or resources
 
 ## Future Enhancements
 
