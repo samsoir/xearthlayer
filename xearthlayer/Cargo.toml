@@ -21,6 +21,7 @@ libc = "0.2"
 regex = "1.10"
 thiserror = "1.0"
 dirs = "5.0"
+rust-ini = "0.21"
 
 [dev-dependencies]
 proptest = "1.4"

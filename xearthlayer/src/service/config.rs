@@ -1,6 +1,7 @@
 //! Service configuration types.
 
 use crate::config::{DownloadConfig, TextureConfig};
+use std::path::PathBuf;
 
 /// Configuration for the XEarthLayer service.
 ///
@@ -31,6 +32,12 @@ pub struct ServiceConfig {
     cache_enabled: bool,
     /// FUSE mountpoint (optional, only needed for serve command)
     mountpoint: Option<String>,
+    /// Cache directory path
+    cache_directory: Option<PathBuf>,
+    /// Memory cache size in bytes
+    cache_memory_size: Option<usize>,
+    /// Disk cache size in bytes
+    cache_disk_size: Option<usize>,
 }
 
 impl ServiceConfig {
@@ -58,6 +65,21 @@ impl ServiceConfig {
     pub fn mountpoint(&self) -> Option<&str> {
         self.mountpoint.as_deref()
     }
+
+    /// Get the cache directory, if configured.
+    pub fn cache_directory(&self) -> Option<&PathBuf> {
+        self.cache_directory.as_ref()
+    }
+
+    /// Get the memory cache size in bytes, if configured.
+    pub fn cache_memory_size(&self) -> Option<usize> {
+        self.cache_memory_size
+    }
+
+    /// Get the disk cache size in bytes, if configured.
+    pub fn cache_disk_size(&self) -> Option<usize> {
+        self.cache_disk_size
+    }
 }
 
 impl Default for ServiceConfig {
@@ -67,6 +89,9 @@ impl Default for ServiceConfig {
             download: DownloadConfig::default(),
             cache_enabled: true,
             mountpoint: None,
+            cache_directory: None,
+            cache_memory_size: None,
+            cache_disk_size: None,
         }
     }
 }
@@ -80,6 +105,9 @@ pub struct ServiceConfigBuilder {
     download: Option<DownloadConfig>,
     cache_enabled: Option<bool>,
     mountpoint: Option<String>,
+    cache_directory: Option<PathBuf>,
+    cache_memory_size: Option<usize>,
+    cache_disk_size: Option<usize>,
 }
 
 impl ServiceConfigBuilder {
@@ -107,6 +135,24 @@ impl ServiceConfigBuilder {
         self
     }
 
+    /// Set the cache directory.
+    pub fn cache_directory(mut self, path: PathBuf) -> Self {
+        self.cache_directory = Some(path);
+        self
+    }
+
+    /// Set the memory cache size in bytes.
+    pub fn cache_memory_size(mut self, size: usize) -> Self {
+        self.cache_memory_size = Some(size);
+        self
+    }
+
+    /// Set the disk cache size in bytes.
+    pub fn cache_disk_size(mut self, size: usize) -> Self {
+        self.cache_disk_size = Some(size);
+        self
+    }
+
     /// Build the configuration with defaults for unset values.
     pub fn build(self) -> ServiceConfig {
         ServiceConfig {
@@ -114,6 +160,9 @@ impl ServiceConfigBuilder {
             download: self.download.unwrap_or_default(),
             cache_enabled: self.cache_enabled.unwrap_or(true),
             mountpoint: self.mountpoint,
+            cache_directory: self.cache_directory,
+            cache_memory_size: self.cache_memory_size,
+            cache_disk_size: self.cache_disk_size,
         }
     }
 }

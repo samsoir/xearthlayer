@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::process;
+use xearthlayer::config::ConfigFileError;
 use xearthlayer::service::ServiceError;
 
 /// CLI-specific errors with user-friendly messages.
@@ -14,6 +15,8 @@ pub enum CliError {
     LoggingInit(String),
     /// Configuration error
     Config(String),
+    /// Failed to load config file
+    ConfigFile(ConfigFileError),
     /// Failed to create service
     ServiceCreation(ServiceError),
     /// Failed to download tile
@@ -31,6 +34,11 @@ impl CliError {
 
         // Print additional help for specific errors
         match self {
+            CliError::ConfigFile(_) => {
+                eprintln!();
+                eprintln!("Check your config file at ~/.xearthlayer/config.ini");
+                eprintln!("Run 'xearthlayer init' to create a default config file.");
+            }
             CliError::ServiceCreation(ServiceError::ProviderError(_)) => {
                 eprintln!();
                 eprintln!("If using Google Maps provider, make sure:");
@@ -59,6 +67,7 @@ impl fmt::Display for CliError {
         match self {
             CliError::LoggingInit(msg) => write!(f, "Failed to initialize logging: {}", msg),
             CliError::Config(msg) => write!(f, "Configuration error: {}", msg),
+            CliError::ConfigFile(e) => write!(f, "Config file error: {}", e),
             CliError::ServiceCreation(e) => write!(f, "Failed to create service: {}", e),
             CliError::Download(e) => write!(f, "Failed to download tile: {}", e),
             CliError::FileWrite { path, error } => {
@@ -72,6 +81,7 @@ impl fmt::Display for CliError {
 impl std::error::Error for CliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            CliError::ConfigFile(e) => Some(e),
             CliError::ServiceCreation(e) => Some(e),
             CliError::Download(e) => Some(e),
             CliError::FileWrite { error, .. } => Some(error),
@@ -84,5 +94,11 @@ impl std::error::Error for CliError {
 impl From<ServiceError> for CliError {
     fn from(e: ServiceError) -> Self {
         CliError::Download(e)
+    }
+}
+
+impl From<ConfigFileError> for CliError {
+    fn from(e: ConfigFileError) -> Self {
+        CliError::ConfigFile(e)
     }
 }

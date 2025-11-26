@@ -91,7 +91,19 @@ impl XEarthLayerService {
 
         // Create cache system based on configuration
         let cache: Arc<dyn Cache> = if config.cache_enabled() {
-            let cache_config = CacheConfig::new(&provider_name);
+            let mut cache_config = CacheConfig::new(&provider_name);
+
+            // Apply cache settings from config if provided
+            if let Some(dir) = config.cache_directory() {
+                cache_config = cache_config.with_cache_dir(dir.clone());
+            }
+            if let Some(size) = config.cache_memory_size() {
+                cache_config = cache_config.with_memory_size(size);
+            }
+            if let Some(size) = config.cache_disk_size() {
+                cache_config = cache_config.with_disk_size(size);
+            }
+
             match CacheSystem::new(cache_config) {
                 Ok(cache) => Arc::new(cache),
                 Err(e) => return Err(ServiceError::CacheError(e.to_string())),

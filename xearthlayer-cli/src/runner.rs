@@ -5,8 +5,8 @@
 
 use crate::error::CliError;
 use tracing::info;
-use xearthlayer::config::TextureConfig;
-use xearthlayer::logging::{default_log_dir, default_log_file, init_logging, LoggingGuard};
+use xearthlayer::config::{ConfigFile, TextureConfig};
+use xearthlayer::logging::{init_logging, LoggingGuard};
 use xearthlayer::provider::ProviderConfig;
 use xearthlayer::service::{ServiceConfig, XEarthLayerService};
 
@@ -15,15 +15,39 @@ pub struct CliRunner {
     /// Logging guard - keeps logging active while runner exists
     #[allow(dead_code)]
     logging_guard: LoggingGuard,
+    /// Loaded configuration file
+    config: ConfigFile,
 }
 
 impl CliRunner {
-    /// Create a new CLI runner, initializing logging.
+    /// Create a new CLI runner, loading config and initializing logging.
     pub fn new() -> Result<Self, CliError> {
-        let logging_guard = init_logging(default_log_dir(), default_log_file())
-            .map_err(|e| CliError::LoggingInit(e.to_string()))?;
+        // Load config file (or use defaults if not present)
+        let config = ConfigFile::load()?;
 
-        Ok(Self { logging_guard })
+        // Use log path from config
+        let log_path = &config.logging.file;
+        let log_dir = log_path
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string());
+        let log_file = log_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "xearthlayer.log".to_string());
+
+        let logging_guard =
+            init_logging(&log_dir, &log_file).map_err(|e| CliError::LoggingInit(e.to_string()))?;
+
+        Ok(Self {
+            logging_guard,
+            config,
+        })
+    }
+
+    /// Get the loaded configuration.
+    pub fn config(&self) -> &ConfigFile {
+        &self.config
     }
 
     /// Log startup information for a command.

@@ -11,6 +11,15 @@ pub enum DdsFormat {
     BC3,
 }
 
+impl fmt::Display for DdsFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DdsFormat::BC1 => write!(f, "BC1"),
+            DdsFormat::BC3 => write!(f, "BC3"),
+        }
+    }
+}
+
 /// Errors that can occur during DDS encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DdsError {

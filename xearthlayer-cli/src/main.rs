@@ -8,6 +8,11 @@
 //! - `Cli` / `Commands`: Argument parsing (clap)
 //! - `CliRunner`: Common setup (logging, service creation)
 //! - `CliError`: Centralized error handling with user-friendly messages
+//!
+//! # Configuration
+//!
+//! Settings are loaded from `~/.xearthlayer/config.ini` on startup.
+//! CLI arguments override config file values when specified.
 
 mod error;
 mod runner;
@@ -16,7 +21,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use error::CliError;
 use runner::CliRunner;
 use std::path::Path;
-use xearthlayer::config::{derive_mountpoint, DownloadConfig, TextureConfig};
+use xearthlayer::config::{derive_mountpoint, ConfigFile, DownloadConfig, TextureConfig};
 use xearthlayer::dds::DdsFormat;
 use xearthlayer::provider::ProviderConfig;
 use xearthlayer::service::ServiceConfig;
@@ -25,7 +30,7 @@ use xearthlayer::service::ServiceConfig;
 // CLI Argument Definitions
 // ============================================================================
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum, PartialEq)]
 enum ProviderType {
     /// Bing Maps aerial imagery (no API key required)
     Bing,
@@ -34,13 +39,28 @@ enum ProviderType {
 }
 
 impl ProviderType {
-    fn to_config(&self, api_key: Option<String>) -> ProviderConfig {
+    fn to_config(&self, api_key: Option<String>) -> Result<ProviderConfig, CliError> {
         match self {
-            ProviderType::Bing => ProviderConfig::bing(),
+            ProviderType::Bing => Ok(ProviderConfig::bing()),
             ProviderType::Google => {
-                // Safe: clap's required_if_eq ensures API key is present for Google
-                ProviderConfig::google(api_key.unwrap())
+                let key = api_key.ok_or_else(|| {
+                    CliError::Config(
+                        "Google Maps provider requires an API key. \
+                         Set google_api_key in config.ini or use --google-api-key"
+                            .to_string(),
+                    )
+                })?;
+                Ok(ProviderConfig::google(key))
             }
+        }
+    }
+
+    /// Parse from config file string.
+    fn from_config_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "bing" => Some(ProviderType::Bing),
+            "google" => Some(ProviderType::Google),
+            _ => None,
         }
     }
 }
@@ -73,46 +93,40 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize configuration file at ~/.xearthlayer/config.ini
+    Init,
+
     /// Mount a scenery pack with passthrough for real files and on-demand DDS generation
     Mount {
         /// Source scenery pack directory to overlay
         #[arg(long)]
         source: String,
 
-        /// FUSE mountpoint directory. If not specified, automatically detects
-        /// X-Plane 12 Custom Scenery folder and uses the source pack name.
+        /// FUSE mountpoint directory (default: from config or auto-detect)
         #[arg(long)]
         mountpoint: Option<String>,
 
-        /// Imagery provider to use
-        #[arg(long, value_enum, default_value = "bing")]
-        provider: ProviderType,
+        /// Imagery provider (default: from config)
+        #[arg(long, value_enum)]
+        provider: Option<ProviderType>,
 
-        /// Google Maps API key (required when using --provider google)
-        #[arg(long, required_if_eq("provider", "google"))]
+        /// Google Maps API key (default: from config)
+        #[arg(long)]
         google_api_key: Option<String>,
 
-        /// DDS compression format (BC1 or BC3)
-        #[arg(long, value_enum, default_value = "bc1")]
-        dds_format: DdsCompression,
+        /// DDS compression format (default: from config)
+        #[arg(long, value_enum)]
+        dds_format: Option<DdsCompression>,
 
-        /// Number of mipmap levels for DDS (default: 5 for 4096→256)
-        #[arg(long, default_value = "5")]
-        mipmap_count: usize,
+        /// Download timeout in seconds (default: from config)
+        #[arg(long)]
+        timeout: Option<u64>,
 
-        /// Download timeout in seconds
-        #[arg(long, default_value = "30")]
-        timeout: u64,
+        /// Maximum parallel downloads (default: from config)
+        #[arg(long)]
+        parallel: Option<usize>,
 
-        /// Number of retry attempts per chunk
-        #[arg(long, default_value = "3")]
-        retries: usize,
-
-        /// Maximum parallel downloads
-        #[arg(long, default_value = "32")]
-        parallel: usize,
-
-        /// Disable caching (always generate tiles fresh - useful for testing)
+        /// Disable caching (always generate tiles fresh)
         #[arg(long)]
         no_cache: bool,
     },
@@ -135,20 +149,16 @@ enum Commands {
         #[arg(long)]
         output: String,
 
-        /// DDS compression format (BC1 or BC3)
-        #[arg(long, value_enum, default_value = "bc1")]
-        dds_format: DdsCompression,
+        /// DDS compression format (default: from config)
+        #[arg(long, value_enum)]
+        dds_format: Option<DdsCompression>,
 
-        /// Number of mipmap levels for DDS (default: 5 for 4096→256)
-        #[arg(long, default_value = "5")]
-        mipmap_count: usize,
+        /// Imagery provider (default: from config)
+        #[arg(long, value_enum)]
+        provider: Option<ProviderType>,
 
-        /// Imagery provider to use
-        #[arg(long, value_enum, default_value = "bing")]
-        provider: ProviderType,
-
-        /// Google Maps API key (required when using --provider google)
-        #[arg(long, required_if_eq("provider", "google"))]
+        /// Google Maps API key (default: from config)
+        #[arg(long)]
         google_api_key: Option<String>,
     },
 
@@ -158,35 +168,27 @@ enum Commands {
         #[arg(long)]
         mountpoint: String,
 
-        /// Imagery provider to use
-        #[arg(long, value_enum, default_value = "bing")]
-        provider: ProviderType,
+        /// Imagery provider (default: from config)
+        #[arg(long, value_enum)]
+        provider: Option<ProviderType>,
 
-        /// Google Maps API key (required when using --provider google)
-        #[arg(long, required_if_eq("provider", "google"))]
+        /// Google Maps API key (default: from config)
+        #[arg(long)]
         google_api_key: Option<String>,
 
-        /// DDS compression format (BC1 or BC3)
-        #[arg(long, value_enum, default_value = "bc1")]
-        dds_format: DdsCompression,
+        /// DDS compression format (default: from config)
+        #[arg(long, value_enum)]
+        dds_format: Option<DdsCompression>,
 
-        /// Number of mipmap levels for DDS (default: 5 for 4096→256)
-        #[arg(long, default_value = "5")]
-        mipmap_count: usize,
+        /// Download timeout in seconds (default: from config)
+        #[arg(long)]
+        timeout: Option<u64>,
 
-        /// Download timeout in seconds
-        #[arg(long, default_value = "30")]
-        timeout: u64,
+        /// Maximum parallel downloads (default: from config)
+        #[arg(long)]
+        parallel: Option<usize>,
 
-        /// Number of retry attempts per chunk
-        #[arg(long, default_value = "3")]
-        retries: usize,
-
-        /// Maximum parallel downloads
-        #[arg(long, default_value = "32")]
-        parallel: usize,
-
-        /// Disable caching (always generate tiles fresh - useful for testing)
+        /// Disable caching (always generate tiles fresh)
         #[arg(long)]
         no_cache: bool,
     },
@@ -200,15 +202,14 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
+        Commands::Init => run_init(),
         Commands::Mount {
             source,
             mountpoint,
             provider,
             google_api_key,
             dds_format,
-            mipmap_count,
             timeout,
-            retries,
             parallel,
             no_cache,
         } => run_mount(
@@ -217,9 +218,7 @@ fn main() {
             provider,
             google_api_key,
             dds_format,
-            mipmap_count,
             timeout,
-            retries,
             parallel,
             no_cache,
         ),
@@ -229,27 +228,15 @@ fn main() {
             zoom,
             output,
             dds_format,
-            mipmap_count,
             provider,
             google_api_key,
-        } => run_download(
-            lat,
-            lon,
-            zoom,
-            output,
-            dds_format,
-            mipmap_count,
-            provider,
-            google_api_key,
-        ),
+        } => run_download(lat, lon, zoom, output, dds_format, provider, google_api_key),
         Commands::Serve {
             mountpoint,
             provider,
             google_api_key,
             dds_format,
-            mipmap_count,
             timeout,
-            retries,
             parallel,
             no_cache,
         } => run_serve(
@@ -257,9 +244,7 @@ fn main() {
             provider,
             google_api_key,
             dds_format,
-            mipmap_count,
             timeout,
-            retries,
             parallel,
             no_cache,
         ),
@@ -274,57 +259,107 @@ fn main() {
 // Command Implementations
 // ============================================================================
 
+/// Initialize configuration file.
+fn run_init() -> Result<(), CliError> {
+    let path = ConfigFile::ensure_exists()?;
+    println!("Configuration file: {}", path.display());
+    println!();
+    println!("Edit this file to customize XEarthLayer settings.");
+    println!("CLI arguments override config file values when specified.");
+    Ok(())
+}
+
+/// Resolve provider settings from CLI args and config.
+fn resolve_provider(
+    cli_provider: Option<ProviderType>,
+    cli_api_key: Option<String>,
+    config: &ConfigFile,
+) -> Result<ProviderConfig, CliError> {
+    // CLI takes precedence, then config
+    let provider = cli_provider
+        .or_else(|| ProviderType::from_config_str(&config.provider.provider_type))
+        .unwrap_or(ProviderType::Bing);
+
+    let api_key = cli_api_key.or_else(|| config.provider.google_api_key.clone());
+
+    provider.to_config(api_key)
+}
+
+/// Resolve DDS format from CLI args and config.
+fn resolve_dds_format(cli_format: Option<DdsCompression>, config: &ConfigFile) -> DdsFormat {
+    cli_format
+        .map(DdsFormat::from)
+        .unwrap_or(config.texture.format)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_mount(
     source: String,
     mountpoint: Option<String>,
-    provider: ProviderType,
+    provider: Option<ProviderType>,
     google_api_key: Option<String>,
-    dds_format: DdsCompression,
-    mipmap_count: usize,
-    timeout: u64,
-    retries: usize,
-    parallel: usize,
+    dds_format: Option<DdsCompression>,
+    timeout: Option<u64>,
+    parallel: Option<usize>,
     no_cache: bool,
 ) -> Result<(), CliError> {
     let runner = CliRunner::new()?;
     runner.log_startup("mount");
+    let config = runner.config();
 
-    // Determine mountpoint: use provided value or derive from X-Plane installation
+    // Determine mountpoint: CLI > config > auto-detect
     let mountpoint = match mountpoint {
         Some(mp) => mp,
         None => {
-            // Try to derive from X-Plane installation
-            let source_path = Path::new(&source);
-            match derive_mountpoint(source_path) {
-                Ok(mp) => {
-                    println!("Auto-detected X-Plane 12 Custom Scenery directory");
-                    mp.to_string_lossy().to_string()
-                }
-                Err(e) => {
-                    return Err(CliError::Config(format!(
-                        "Could not determine mountpoint: {}. \
-                         Please specify --mountpoint explicitly or ensure X-Plane 12 is installed.",
-                        e
-                    )));
+            // Try config scenery_dir first
+            if let Some(ref scenery_dir) = config.xplane.scenery_dir {
+                let source_path = Path::new(&source);
+                let pack_name = source_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "scenery".to_string());
+                scenery_dir.join(&pack_name).to_string_lossy().to_string()
+            } else {
+                // Fall back to auto-detection
+                let source_path = Path::new(&source);
+                match derive_mountpoint(source_path) {
+                    Ok(mp) => {
+                        println!("Auto-detected X-Plane 12 Custom Scenery directory");
+                        mp.to_string_lossy().to_string()
+                    }
+                    Err(e) => {
+                        return Err(CliError::Config(format!(
+                            "Could not determine mountpoint: {}. \
+                             Set scenery_dir in config.ini or use --mountpoint.",
+                            e
+                        )));
+                    }
                 }
             }
         }
     };
 
+    // Resolve settings from CLI and config
+    let provider_config = resolve_provider(provider, google_api_key, config)?;
+    let format = resolve_dds_format(dds_format, config);
+    let timeout_secs = timeout.unwrap_or(config.download.timeout);
+    let parallel_downloads = parallel.unwrap_or(config.download.parallel);
+
     // Build configurations
-    let texture_config = TextureConfig::new(dds_format.into()).with_mipmap_count(mipmap_count);
-    let provider_config = provider.to_config(google_api_key);
+    let texture_config = TextureConfig::new(format).with_mipmap_count(5);
 
     let download_config = DownloadConfig::new()
-        .with_timeout_secs(timeout)
-        .with_max_retries(retries as u32)
-        .with_parallel_downloads(parallel);
+        .with_timeout_secs(timeout_secs)
+        .with_max_retries(3)
+        .with_parallel_downloads(parallel_downloads);
 
     let service_config = ServiceConfig::builder()
         .texture(texture_config)
         .download(download_config)
         .cache_enabled(!no_cache)
+        .cache_directory(config.cache.directory.clone())
+        .cache_memory_size(config.cache.memory_size)
+        .cache_disk_size(config.cache.disk_size)
         .build();
 
     // Print banner
@@ -334,14 +369,17 @@ fn run_mount(
     println!("Source:     {}", source);
     println!("Mountpoint: {}", mountpoint);
     println!("DDS Format: {:?}", texture_config.format());
-    println!("Mipmap Levels: {}", texture_config.mipmap_count());
     println!();
 
     let service = runner.create_service(service_config, &provider_config)?;
 
     // Print service info
     if service.cache_enabled() {
-        println!("Cache: Enabled (2GB memory, 20GB disk at ~/.cache/xearthlayer)");
+        println!(
+            "Cache: Enabled ({} memory, {} disk)",
+            xearthlayer::config::format_size(config.cache.memory_size),
+            xearthlayer::config::format_size(config.cache.disk_size)
+        );
     } else {
         println!("Cache: Disabled (all tiles generated fresh)");
     }
@@ -370,17 +408,20 @@ fn run_download(
     lon: f64,
     zoom: u8,
     output: String,
-    dds_format: DdsCompression,
-    mipmap_count: usize,
-    provider: ProviderType,
+    dds_format: Option<DdsCompression>,
+    provider: Option<ProviderType>,
     google_api_key: Option<String>,
 ) -> Result<(), CliError> {
     let runner = CliRunner::new()?;
     runner.log_startup("download");
+    let config = runner.config();
+
+    // Resolve settings from CLI and config
+    let provider_config = resolve_provider(provider, google_api_key, config)?;
+    let format = resolve_dds_format(dds_format, config);
 
     // Build configurations
-    let texture_config = TextureConfig::new(dds_format.into()).with_mipmap_count(mipmap_count);
-    let provider_config = provider.to_config(google_api_key);
+    let texture_config = TextureConfig::new(format).with_mipmap_count(5);
 
     // Caching disabled for single downloads
     let service_config = ServiceConfig::builder()
@@ -418,32 +459,39 @@ fn run_download(
 #[allow(clippy::too_many_arguments)]
 fn run_serve(
     mountpoint: String,
-    provider: ProviderType,
+    provider: Option<ProviderType>,
     google_api_key: Option<String>,
-    dds_format: DdsCompression,
-    mipmap_count: usize,
-    timeout: u64,
-    retries: usize,
-    parallel: usize,
+    dds_format: Option<DdsCompression>,
+    timeout: Option<u64>,
+    parallel: Option<usize>,
     no_cache: bool,
 ) -> Result<(), CliError> {
     let runner = CliRunner::new()?;
     runner.log_startup("serve");
+    let config = runner.config();
+
+    // Resolve settings from CLI and config
+    let provider_config = resolve_provider(provider, google_api_key, config)?;
+    let format = resolve_dds_format(dds_format, config);
+    let timeout_secs = timeout.unwrap_or(config.download.timeout);
+    let parallel_downloads = parallel.unwrap_or(config.download.parallel);
 
     // Build configurations
-    let texture_config = TextureConfig::new(dds_format.into()).with_mipmap_count(mipmap_count);
-    let provider_config = provider.to_config(google_api_key);
+    let texture_config = TextureConfig::new(format).with_mipmap_count(5);
 
     let download_config = DownloadConfig::new()
-        .with_timeout_secs(timeout)
-        .with_max_retries(retries as u32)
-        .with_parallel_downloads(parallel);
+        .with_timeout_secs(timeout_secs)
+        .with_max_retries(3)
+        .with_parallel_downloads(parallel_downloads);
 
     let service_config = ServiceConfig::builder()
         .texture(texture_config)
         .download(download_config)
         .cache_enabled(!no_cache)
         .mountpoint(&mountpoint)
+        .cache_directory(config.cache.directory.clone())
+        .cache_memory_size(config.cache.memory_size)
+        .cache_disk_size(config.cache.disk_size)
         .build();
 
     // Print banner
@@ -452,14 +500,17 @@ fn run_serve(
     println!();
     println!("Mountpoint: {}", mountpoint);
     println!("DDS Format: {:?}", texture_config.format());
-    println!("Mipmap Levels: {}", texture_config.mipmap_count());
     println!();
 
     let service = runner.create_service(service_config, &provider_config)?;
 
     // Print service info
     if service.cache_enabled() {
-        println!("Cache: Enabled (2GB memory, 20GB disk at ~/.cache/xearthlayer)");
+        println!(
+            "Cache: Enabled ({} memory, {} disk)",
+            xearthlayer::config::format_size(config.cache.memory_size),
+            xearthlayer::config::format_size(config.cache.disk_size)
+        );
     } else {
         println!("Cache: Disabled (all tiles generated fresh)");
     }
