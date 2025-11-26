@@ -353,8 +353,9 @@ type = {}
 google_api_key = {}
 
 [cache]
-; Cache directory (default: ~/.cache/xearthlayer)
-directory = {}
+; Cache directory for storing downloaded tiles (default: ~/.cache/xearthlayer)
+; Uncomment and modify to use a custom location:
+; directory = /path/to/custom/cache
 ; Memory cache size (default: 2GB) - uses RAM for fastest access
 ; Supports: KB, MB, GB suffixes (e.g., 500MB, 2GB, 4GB)
 memory_size = {}
@@ -393,7 +394,6 @@ file = {}
 "#,
             self.provider.provider_type,
             google_api_key,
-            path_to_string(&self.cache.directory),
             format_size(self.cache.memory_size),
             format_size(self.cache.disk_size),
             self.texture.format.to_string().to_lowercase(),
