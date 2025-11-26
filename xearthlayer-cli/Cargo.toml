@@ -16,3 +16,4 @@ clap = { version = "4.5", features = ["derive"] }
 image = "0.25"
 tracing = "0.1"
 fuser = "0.14"
+ctrlc = "3.4"

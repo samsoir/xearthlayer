@@ -21,6 +21,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use error::CliError;
 use runner::CliRunner;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use xearthlayer::config::{derive_mountpoint, ConfigFile, DownloadConfig, TextureConfig};
 use xearthlayer::dds::DdsFormat;
 use xearthlayer::provider::ProviderConfig;
@@ -395,11 +397,29 @@ fn run_mount(
     println!("Press Ctrl+C to unmount and exit");
     println!();
 
-    // Start serving with passthrough (blocks until unmount)
-    service
-        .serve_passthrough(&source, &mountpoint)
+    // Set up signal handler for graceful shutdown
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+
+    ctrlc::set_handler(move || {
+        println!();
+        println!("Received shutdown signal, unmounting...");
+        shutdown_clone.store(true, Ordering::SeqCst);
+    })
+    .map_err(|e| CliError::Config(format!("Failed to set signal handler: {}", e)))?;
+
+    // Start serving with passthrough in background
+    // The BackgroundSession auto-unmounts when dropped
+    let _session = service
+        .serve_passthrough_background(&source, &mountpoint)
         .map_err(CliError::Serve)?;
 
+    // Wait for shutdown signal
+    while !shutdown.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Session drops here, triggering unmount
     println!("Filesystem unmounted.");
     Ok(())
 }
@@ -525,9 +545,27 @@ fn run_serve(
     println!("Press Ctrl+C to unmount and exit");
     println!();
 
-    // Start serving (blocks until unmount)
-    service.serve().map_err(CliError::Serve)?;
+    // Set up signal handler for graceful shutdown
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
 
+    ctrlc::set_handler(move || {
+        println!();
+        println!("Received shutdown signal, unmounting...");
+        shutdown_clone.store(true, Ordering::SeqCst);
+    })
+    .map_err(|e| CliError::Config(format!("Failed to set signal handler: {}", e)))?;
+
+    // Start serving in background
+    // The BackgroundSession auto-unmounts when dropped
+    let _session = service.serve_background().map_err(CliError::Serve)?;
+
+    // Wait for shutdown signal
+    while !shutdown.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Session drops here, triggering unmount
     println!("Filesystem unmounted.");
     Ok(())
 }

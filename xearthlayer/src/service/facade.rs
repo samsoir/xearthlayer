@@ -11,6 +11,7 @@ use crate::texture::{DdsTextureEncoder, TextureEncoder};
 use crate::tile::{
     DefaultTileGenerator, ParallelConfig, ParallelTileGenerator, TileGenerator, TileRequest,
 };
+use fuser::BackgroundSession;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -272,6 +273,42 @@ impl XEarthLayerService {
         fuser::mount2(fs, mountpoint, &[]).map_err(ServiceError::from)
     }
 
+    /// Start the FUSE filesystem server in the background.
+    ///
+    /// Returns a `BackgroundSession` that can be used to manage the mount's lifecycle.
+    /// When the session is dropped, the filesystem is automatically unmounted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No mountpoint is configured
+    /// - Mountpoint directory doesn't exist
+    /// - FUSE mount fails
+    pub fn serve_background(&self) -> Result<BackgroundSession, ServiceError> {
+        let mountpoint = self
+            .config
+            .mountpoint()
+            .ok_or_else(|| ServiceError::ConfigError("No mountpoint configured".to_string()))?;
+
+        // Check if mountpoint exists
+        if !std::path::Path::new(mountpoint).exists() {
+            return Err(ServiceError::IoError(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Mountpoint does not exist: {}", mountpoint),
+            )));
+        }
+
+        // Create FUSE filesystem
+        let fs = XEarthLayerFS::new(
+            self.generator.clone(),
+            self.cache.clone(),
+            self.config.texture().format(),
+        );
+
+        // Mount filesystem in background
+        fuser::spawn_mount2(fs, mountpoint, &[]).map_err(ServiceError::from)
+    }
+
     /// Start the passthrough FUSE filesystem server.
     ///
     /// Overlays an existing scenery pack directory, passing through real files
@@ -325,6 +362,56 @@ impl XEarthLayerService {
 
         // Mount filesystem
         fuser::mount2(fs, mountpoint, &[]).map_err(ServiceError::from)
+    }
+
+    /// Start the passthrough FUSE filesystem server in the background.
+    ///
+    /// Returns a `BackgroundSession` that can be used to manage the mount's lifecycle.
+    /// When the session is dropped, the filesystem is automatically unmounted.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_dir` - Path to the scenery pack directory to overlay
+    /// * `mountpoint` - Path where the virtual filesystem will be mounted
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Source directory doesn't exist
+    /// - Mountpoint directory doesn't exist
+    /// - FUSE mount fails
+    pub fn serve_passthrough_background(
+        &self,
+        source_dir: &str,
+        mountpoint: &str,
+    ) -> Result<BackgroundSession, ServiceError> {
+        // Check if source directory exists
+        let source_path = PathBuf::from(source_dir);
+        if !source_path.exists() {
+            return Err(ServiceError::IoError(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Source directory does not exist: {}", source_dir),
+            )));
+        }
+
+        // Check if mountpoint exists
+        if !std::path::Path::new(mountpoint).exists() {
+            return Err(ServiceError::IoError(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Mountpoint does not exist: {}", mountpoint),
+            )));
+        }
+
+        // Create passthrough FUSE filesystem
+        let fs = PassthroughFS::new(
+            source_path,
+            self.generator.clone(),
+            self.cache.clone(),
+            self.config.texture().format(),
+        );
+
+        // Mount filesystem in background
+        fuser::spawn_mount2(fs, mountpoint, &[]).map_err(ServiceError::from)
     }
 }
 
