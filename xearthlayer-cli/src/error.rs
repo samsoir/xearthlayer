@@ -12,6 +12,8 @@ use xearthlayer::service::ServiceError;
 pub enum CliError {
     /// Failed to initialize logging
     LoggingInit(String),
+    /// Configuration error
+    Config(String),
     /// Failed to create service
     ServiceCreation(ServiceError),
     /// Failed to download tile
@@ -56,6 +58,7 @@ impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CliError::LoggingInit(msg) => write!(f, "Failed to initialize logging: {}", msg),
+            CliError::Config(msg) => write!(f, "Configuration error: {}", msg),
             CliError::ServiceCreation(e) => write!(f, "Failed to create service: {}", e),
             CliError::Download(e) => write!(f, "Failed to download tile: {}", e),
             CliError::FileWrite { path, error } => {

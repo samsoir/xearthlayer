@@ -2,6 +2,24 @@
 
 This document describes XEarthLayer's FUSE virtual filesystem implementation for serving X-Plane scenery with on-demand orthophoto generation.
 
+## Current Implementation Status
+
+The following features are **implemented and working**:
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| PassthroughFS | ✅ Complete | FUSE filesystem that overlays existing scenery packs |
+| X-Plane Path Detection | ✅ Complete | Auto-detects X-Plane 12 install from reference file |
+| On-demand DDS Generation | ✅ Complete | Downloads Bing imagery and encodes to BC1/BC3 DDS |
+| CLI `mount` Command | ✅ Complete | Mount scenery packs with optional auto-detection |
+| Two-tier Caching | ✅ Complete | Memory + disk cache for generated textures |
+
+**Not yet implemented** (planned for future releases):
+- Pack management CLI (`pack install`, `pack update`)
+- Overlay pack support (`y_xel_*` packs)
+- Multi-region simultaneous mounting
+- Configuration file (`config.toml`)
+
 ## Overview
 
 XEarthLayer creates virtual filesystem mounts that appear as standard X-Plane scenery folders. The FUSE layer intercepts file requests and either:
@@ -349,21 +367,28 @@ Packs are distributed as compressed archives:
 ### Runtime Management
 
 ```bash
-# Start XEarthLayer (mount all enabled packs)
-xearthlayer start
+# Mount a scenery pack with auto-detected X-Plane path
+xearthlayer mount --source /path/to/scenery/z_xel_europe
 
-# Stop XEarthLayer (unmount all)
-xearthlayer stop
+# Mount with explicit mountpoint
+xearthlayer mount \
+  --source /path/to/scenery/z_xel_europe \
+  --mountpoint "/path/to/X-Plane 12/Custom Scenery/z_xel_europe"
 
-# Mount a specific pack
-xearthlayer mount europe
+# Mount without caching (for testing)
+xearthlayer mount --source /path/to/scenery/z_xel_test --no-cache
 
-# Unmount a specific pack
-xearthlayer unmount europe
-
-# Check status
-xearthlayer status
+# Unmount (use fusermount on Linux/macOS)
+fusermount -u "/path/to/X-Plane 12/Custom Scenery/z_xel_europe"
 ```
+
+**X-Plane Path Detection:**
+
+When `--mountpoint` is omitted, XEarthLayer automatically detects the X-Plane 12 installation:
+- **Linux/macOS**: Reads `~/.x-plane/x-plane_install_12.txt`
+- **Windows**: Reads `%LOCALAPPDATA%\x-plane\x-plane_install_12.txt`
+
+The mountpoint is derived as: `{X-Plane 12}/Custom Scenery/{source_pack_name}`
 
 ## Error Handling
 
@@ -396,33 +421,45 @@ XEarthLayer prioritizes availability:
 xearthlayer/src/
 ├── fuse/
 │   ├── mod.rs           # Module exports
-│   ├── filesystem.rs    # Main FUSE implementation (ortho packs)
-│   ├── filename.rs      # DDS filename parsing
-│   ├── passthrough.rs   # Real file operations (NEW)
-│   ├── router.rs        # Request routing logic (NEW)
-│   ├── synthesizer.rs   # Attribute synthesis (NEW)
-│   └── overlay.rs       # Overlay passthrough filesystem (NEW)
-├── pack/                # Pack management (NEW)
-│   ├── mod.rs
-│   ├── manager.rs       # Install/update/remove (ortho + overlay)
-│   ├── downloader.rs    # Pack download
-│   └── config.rs        # Pack configuration
-└── mount/               # Mount management (NEW)
-    ├── mod.rs
-    ├── lifecycle.rs     # Start/stop/status
-    └── registry.rs      # Track active mounts (ortho + overlay)
+│   ├── filesystem.rs    # Pure virtual filesystem (textures/ directory only)
+│   ├── filename.rs      # DDS filename parsing (row_col_maptypeZZ.dds)
+│   ├── passthrough.rs   # Passthrough + on-demand DDS (IMPLEMENTED)
+│   └── placeholder.rs   # Magenta placeholder generation
+├── config/
+│   ├── mod.rs           # Module exports
+│   ├── download.rs      # Download configuration
+│   ├── texture.rs       # Texture encoding configuration
+│   └── xplane.rs        # X-Plane path detection (IMPLEMENTED)
+├── service/
+│   ├── mod.rs           # Module exports
+│   ├── config.rs        # Service configuration
+│   ├── error.rs         # Service errors
+│   └── facade.rs        # High-level service API (serve, serve_passthrough)
+├── tile/                # Tile generation pipeline
+├── orchestrator/        # Chunk download orchestration
+├── texture/             # DDS texture encoding
+├── cache/               # Two-tier caching system
+└── provider/            # Satellite imagery providers (Bing, Google)
 ```
 
 ### FUSE Filesystem Types
 
-XEarthLayer uses two types of FUSE filesystems:
+XEarthLayer currently implements two FUSE filesystem types:
 
 | Type | Module | Purpose | On-demand Generation |
 |------|--------|---------|---------------------|
-| Ortho | `filesystem.rs` | Serve terrain with DDS textures | Yes (orthophotos) |
-| Overlay | `overlay.rs` | Serve overlay DSF files | No (pure passthrough) |
+| Virtual | `filesystem.rs` | Pure virtual textures/ directory | Yes (all DDS files) |
+| Passthrough | `passthrough.rs` | Overlay existing scenery pack | Yes (missing DDS files only) |
 
-The overlay filesystem is simpler since it only needs to pass through existing files without any generation logic.
+**PassthroughFS** is the primary filesystem for X-Plane integration:
+- **Real files**: DSF, .ter, .png files pass through directly from source
+- **Virtual DDS**: Non-existent .dds files are generated on-demand
+- **Transparent**: X-Plane sees a complete scenery pack
+
+**XEarthLayerFS** is a simpler virtual filesystem for testing:
+- Only exposes a `textures/` directory
+- All DDS files are generated on-demand
+- No passthrough capability
 
 ## Security Considerations
 

@@ -4,11 +4,12 @@ use super::config::ServiceConfig;
 use super::error::ServiceError;
 use crate::cache::{Cache, CacheConfig, CacheSystem, NoOpCache};
 use crate::coord::to_tile_coords;
-use crate::fuse::XEarthLayerFS;
+use crate::fuse::{PassthroughFS, XEarthLayerFS};
 use crate::orchestrator::TileOrchestrator;
 use crate::provider::{ProviderConfig, ProviderFactory, ReqwestClient};
 use crate::texture::{DdsTextureEncoder, TextureEncoder};
 use crate::tile::{DefaultTileGenerator, TileGenerator, TileRequest};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// High-level facade for XEarthLayer operations.
@@ -226,6 +227,61 @@ impl XEarthLayerService {
 
         // Create FUSE filesystem
         let fs = XEarthLayerFS::new(
+            self.generator.clone(),
+            self.cache.clone(),
+            self.config.texture().format(),
+        );
+
+        // Mount filesystem
+        fuser::mount2(fs, mountpoint, &[]).map_err(ServiceError::from)
+    }
+
+    /// Start the passthrough FUSE filesystem server.
+    ///
+    /// Overlays an existing scenery pack directory, passing through real files
+    /// and generating DDS textures on-demand for virtual files.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_dir` - Path to the scenery pack directory to overlay
+    /// * `mountpoint` - Path where the virtual filesystem will be mounted
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Source directory doesn't exist
+    /// - Mountpoint directory doesn't exist
+    /// - FUSE mount fails
+    ///
+    /// # Note
+    ///
+    /// This method blocks until the filesystem is unmounted (e.g., via Ctrl+C
+    /// or `fusermount -u`).
+    pub fn serve_passthrough(
+        &self,
+        source_dir: &str,
+        mountpoint: &str,
+    ) -> Result<(), ServiceError> {
+        // Check if source directory exists
+        let source_path = PathBuf::from(source_dir);
+        if !source_path.exists() {
+            return Err(ServiceError::IoError(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Source directory does not exist: {}", source_dir),
+            )));
+        }
+
+        // Check if mountpoint exists
+        if !std::path::Path::new(mountpoint).exists() {
+            return Err(ServiceError::IoError(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Mountpoint does not exist: {}", mountpoint),
+            )));
+        }
+
+        // Create passthrough FUSE filesystem
+        let fs = PassthroughFS::new(
+            source_path,
             self.generator.clone(),
             self.cache.clone(),
             self.config.texture().format(),

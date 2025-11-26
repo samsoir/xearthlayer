@@ -23,6 +23,10 @@
 
 mod download;
 mod texture;
+mod xplane;
 
 pub use download::DownloadConfig;
 pub use texture::TextureConfig;
+pub use xplane::{
+    derive_mountpoint, detect_custom_scenery, detect_xplane_install, XPlanePathError,
+};
