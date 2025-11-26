@@ -33,11 +33,31 @@ Tracking issues discovered during development and testing.
   - DDS format compatibility
   - Tile boundary seams
 
-## Future Enhancements
+## Tech Debt
 
-### E1: Parallel Tile Generation
-- Allow multiple tiles to be generated concurrently
-- Currently FUSE operations are serialized
+### TD1: Migrate to Async FUSE Model
+- **Status**: Open
+- **Priority**: Medium
+- **Description**: Current implementation uses blocking thread pool for parallel tile generation.
+  The FUSE library (`fuser`) supports an async model that could provide better scalability.
+- **Current Implementation**: `ParallelTileGenerator` wraps tile generation with:
+  - Blocking thread pool (std::thread)
+  - mpsc channels for work distribution
+  - Request coalescing via HashMap
+- **Future Implementation**:
+  - Use `fuser`'s async filesystem trait
+  - Integrate with tokio runtime
+  - Replace blocking channels with async equivalents
+- **Benefits**:
+  - Better thread utilization under high load
+  - More efficient I/O waiting
+  - Native async/await integration
+- **Risks**:
+  - Significant refactoring required
+  - Need to verify compatibility with current architecture
+- **Added**: 2025-11-25
+
+## Future Enhancements
 
 ### E2: Tile Pre-fetching
 - Predict which tiles will be needed based on aircraft position/heading
@@ -53,7 +73,14 @@ Tracking issues discovered during development and testing.
 
 ## Completed
 
-(Move items here when fixed)
+### E1: Parallel Tile Generation ✓
+- **Completed**: 2025-11-25
+- **Implementation**: `ParallelTileGenerator` in `xearthlayer/src/tile/parallel.rs`
+- **Features**:
+  - Configurable thread pool (default: num_cpus)
+  - Request coalescing for duplicate tile requests
+  - Timeout handling with magenta placeholder fallback
+  - Configuration via `[generation]` section in config.ini
 
 ---
 

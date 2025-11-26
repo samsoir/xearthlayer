@@ -8,9 +8,12 @@ use crate::fuse::{PassthroughFS, XEarthLayerFS};
 use crate::orchestrator::TileOrchestrator;
 use crate::provider::{ProviderConfig, ProviderFactory, ReqwestClient};
 use crate::texture::{DdsTextureEncoder, TextureEncoder};
-use crate::tile::{DefaultTileGenerator, TileGenerator, TileRequest};
+use crate::tile::{
+    DefaultTileGenerator, ParallelConfig, ParallelTileGenerator, TileGenerator, TileRequest,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::info;
 
 /// High-level facade for XEarthLayer operations.
 ///
@@ -85,9 +88,30 @@ impl XEarthLayerService {
         // Create orchestrator with download config
         let orchestrator = TileOrchestrator::with_config(provider, *config.download());
 
-        // Create tile generator
-        let generator: Arc<dyn TileGenerator> =
+        // Create base tile generator
+        let base_generator: Arc<dyn TileGenerator> =
             Arc::new(DefaultTileGenerator::new(orchestrator, encoder));
+
+        // Wrap with parallel generator for concurrent tile requests
+        let parallel_config = ParallelConfig::default()
+            .with_threads(config.generation_threads().unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            }))
+            .with_timeout_secs(config.generation_timeout().unwrap_or(10))
+            .with_dds_format(config.texture().format())
+            .with_mipmap_count(config.texture().mipmap_count());
+
+        let generator: Arc<dyn TileGenerator> = Arc::new(ParallelTileGenerator::new(
+            base_generator,
+            parallel_config.clone(),
+        ));
+
+        info!(
+            "Tile generation: {} threads, {}s timeout",
+            parallel_config.threads, parallel_config.timeout_secs
+        );
 
         // Create cache system based on configuration
         let cache: Arc<dyn Cache> = if config.cache_enabled() {

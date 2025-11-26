@@ -129,7 +129,7 @@ See [TODO.md](TODO.md) for current bugs and planned enhancements.
 
 This project is architecturally influenced by [AutoOrtho](https://github.com/kubilus1/autoortho) by [kubilus1](https://github.com/kubilus1). XEarthLayer is an independent Rust implementation focused on performance, memory safety, and cross-platform compatibility.
 
-Developed with significant assistance from [Claude](https://claude.ai) by Anthropic, using [Claude Code](https://claude.ai/code).
+Developed with assistance from [Claude](https://claude.ai) by Anthropic, using [Claude Code](https://claude.ai/code).
 
 ## License
 

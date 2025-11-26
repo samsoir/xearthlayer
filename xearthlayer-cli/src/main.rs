@@ -360,6 +360,8 @@ fn run_mount(
         .cache_directory(config.cache.directory.clone())
         .cache_memory_size(config.cache.memory_size)
         .cache_disk_size(config.cache.disk_size)
+        .generation_threads(config.generation.threads)
+        .generation_timeout(config.generation.timeout)
         .build();
 
     // Print banner
@@ -492,6 +494,8 @@ fn run_serve(
         .cache_directory(config.cache.directory.clone())
         .cache_memory_size(config.cache.memory_size)
         .cache_disk_size(config.cache.disk_size)
+        .generation_threads(config.generation.threads)
+        .generation_timeout(config.generation.timeout)
         .build();
 
     // Print banner

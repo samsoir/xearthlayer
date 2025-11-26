@@ -56,9 +56,11 @@
 mod default;
 mod error;
 mod generator;
+mod parallel;
 mod request;
 
 pub use default::DefaultTileGenerator;
 pub use error::TileGeneratorError;
 pub use generator::TileGenerator;
+pub use parallel::{ParallelConfig, ParallelTileGenerator};
 pub use request::TileRequest;

@@ -44,6 +44,8 @@ pub struct ConfigFile {
     pub texture: TextureSettings,
     /// Download settings
     pub download: DownloadSettings,
+    /// Generation settings
+    pub generation: GenerationSettings,
     /// X-Plane settings
     pub xplane: XPlaneSettings,
     /// Logging settings
@@ -86,6 +88,18 @@ pub struct DownloadSettings {
     pub parallel: usize,
 }
 
+/// Generation configuration.
+#[derive(Debug, Clone)]
+pub struct GenerationSettings {
+    /// Number of threads for parallel tile generation.
+    /// Default: number of CPU cores.
+    pub threads: usize,
+    /// Timeout in seconds for generating a single tile.
+    /// If exceeded, returns a magenta placeholder.
+    /// Default: 10 seconds.
+    pub timeout: u64,
+}
+
 /// X-Plane configuration.
 #[derive(Debug, Clone)]
 pub struct XPlaneSettings {
@@ -124,12 +138,23 @@ impl Default for ConfigFile {
                 timeout: 30,
                 parallel: 32,
             },
+            generation: GenerationSettings {
+                threads: num_cpus(),
+                timeout: 10,
+            },
             xplane: XPlaneSettings { scenery_dir: None },
             logging: LoggingSettings {
                 file: config_dir.join("xearthlayer.log"),
             },
         }
     }
+}
+
+/// Get the number of available CPU cores.
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 impl ConfigFile {
@@ -264,6 +289,28 @@ impl ConfigFile {
             }
         }
 
+        // [generation] section
+        if let Some(section) = ini.section(Some("generation")) {
+            if let Some(v) = section.get("threads") {
+                config.generation.threads =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "generation".to_string(),
+                        key: "threads".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("timeout") {
+                config.generation.timeout =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "generation".to_string(),
+                        key: "timeout".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (seconds)".to_string(),
+                    })?;
+            }
+        }
+
         // [xplane] section
         if let Some(section) = ini.section(Some("xplane")) {
             if let Some(v) = section.get("scenery_dir") {
@@ -327,6 +374,14 @@ timeout = {}
 ; Higher values = faster downloads but more bandwidth/CPU usage
 parallel = {}
 
+[generation]
+; Number of threads for parallel tile generation (default: number of CPU cores)
+; WARNING: Do not set this higher than your CPU core count
+threads = {}
+; Timeout in seconds for generating a single tile (default: 10)
+; If exceeded, returns a magenta placeholder texture
+timeout = {}
+
 [xplane]
 ; X-Plane Custom Scenery directory for mounting scenery packs
 ; If empty, auto-detects from ~/.x-plane/x-plane_install_12.txt
@@ -344,6 +399,8 @@ file = {}
             self.texture.format.to_string().to_lowercase(),
             self.download.timeout,
             self.download.parallel,
+            self.generation.threads,
+            self.generation.timeout,
             scenery_dir,
             path_to_string(&self.logging.file),
         )

@@ -7,7 +7,7 @@
 use std::fmt;
 
 /// Errors that can occur during tile generation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TileGeneratorError {
     /// Invalid coordinates (latitude/longitude out of range)
     InvalidCoordinates {

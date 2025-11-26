@@ -38,6 +38,10 @@ pub struct ServiceConfig {
     cache_memory_size: Option<usize>,
     /// Disk cache size in bytes
     cache_disk_size: Option<usize>,
+    /// Number of threads for parallel tile generation
+    generation_threads: Option<usize>,
+    /// Timeout in seconds for generating a single tile
+    generation_timeout: Option<u64>,
 }
 
 impl ServiceConfig {
@@ -80,6 +84,16 @@ impl ServiceConfig {
     pub fn cache_disk_size(&self) -> Option<usize> {
         self.cache_disk_size
     }
+
+    /// Get the number of threads for parallel tile generation, if configured.
+    pub fn generation_threads(&self) -> Option<usize> {
+        self.generation_threads
+    }
+
+    /// Get the timeout in seconds for generating a single tile, if configured.
+    pub fn generation_timeout(&self) -> Option<u64> {
+        self.generation_timeout
+    }
 }
 
 impl Default for ServiceConfig {
@@ -92,6 +106,8 @@ impl Default for ServiceConfig {
             cache_directory: None,
             cache_memory_size: None,
             cache_disk_size: None,
+            generation_threads: None,
+            generation_timeout: None,
         }
     }
 }
@@ -108,6 +124,8 @@ pub struct ServiceConfigBuilder {
     cache_directory: Option<PathBuf>,
     cache_memory_size: Option<usize>,
     cache_disk_size: Option<usize>,
+    generation_threads: Option<usize>,
+    generation_timeout: Option<u64>,
 }
 
 impl ServiceConfigBuilder {
@@ -153,6 +171,18 @@ impl ServiceConfigBuilder {
         self
     }
 
+    /// Set the number of threads for parallel tile generation.
+    pub fn generation_threads(mut self, threads: usize) -> Self {
+        self.generation_threads = Some(threads);
+        self
+    }
+
+    /// Set the timeout in seconds for generating a single tile.
+    pub fn generation_timeout(mut self, timeout: u64) -> Self {
+        self.generation_timeout = Some(timeout);
+        self
+    }
+
     /// Build the configuration with defaults for unset values.
     pub fn build(self) -> ServiceConfig {
         ServiceConfig {
@@ -163,6 +193,8 @@ impl ServiceConfigBuilder {
             cache_directory: self.cache_directory,
             cache_memory_size: self.cache_memory_size,
             cache_disk_size: self.cache_disk_size,
+            generation_threads: self.generation_threads,
+            generation_timeout: self.generation_timeout,
         }
     }
 }
