@@ -30,13 +30,14 @@
 
 use crate::dds::DdsFormat;
 use crate::fuse::generate_magenta_placeholder;
+use crate::log::Logger;
 use crate::tile::{TileGenerator, TileGeneratorError, TileRequest};
+use crate::{log_debug, log_error, log_info, log_warn};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
 
 /// Configuration for the parallel tile generator.
 #[derive(Debug, Clone)]
@@ -121,6 +122,8 @@ pub struct ParallelTileGenerator {
     cond: Arc<Condvar>,
     /// Shutdown flag
     shutdown: Arc<Mutex<bool>>,
+    /// Logger for diagnostic output
+    logger: Arc<dyn Logger>,
 }
 
 impl ParallelTileGenerator {
@@ -130,16 +133,23 @@ impl ParallelTileGenerator {
     ///
     /// * `inner` - The inner tile generator to wrap
     /// * `config` - Configuration for parallel generation
-    pub fn new(inner: Arc<dyn TileGenerator>, config: ParallelConfig) -> Self {
+    /// * `logger` - Logger for diagnostic output
+    pub fn new(
+        inner: Arc<dyn TileGenerator>,
+        config: ParallelConfig,
+        logger: Arc<dyn Logger>,
+    ) -> Self {
         let (work_sender, work_receiver) = mpsc::channel::<WorkItem>();
         let work_receiver = Arc::new(Mutex::new(work_receiver));
         let in_flight = Arc::new(Mutex::new(HashMap::new()));
         let cond = Arc::new(Condvar::new());
         let shutdown = Arc::new(Mutex::new(false));
 
-        info!(
+        log_info!(
+            logger,
             "Starting parallel tile generator with {} threads, {}s timeout",
-            config.threads, config.timeout_secs
+            config.threads,
+            config.timeout_secs
         );
 
         // Spawn worker threads
@@ -149,11 +159,19 @@ impl ParallelTileGenerator {
             let in_flight = Arc::clone(&in_flight);
             let cond = Arc::clone(&cond);
             let shutdown = Arc::clone(&shutdown);
+            let worker_logger = Arc::clone(&logger);
 
             thread::Builder::new()
                 .name(format!("tile-worker-{}", i))
                 .spawn(move || {
-                    Self::worker_loop(inner, work_receiver, in_flight, cond, shutdown);
+                    Self::worker_loop(
+                        inner,
+                        work_receiver,
+                        in_flight,
+                        cond,
+                        shutdown,
+                        worker_logger,
+                    );
                 })
                 .expect("Failed to spawn tile worker thread");
         }
@@ -165,6 +183,7 @@ impl ParallelTileGenerator {
             config,
             cond,
             shutdown,
+            logger,
         }
     }
 
@@ -175,6 +194,7 @@ impl ParallelTileGenerator {
         in_flight: Arc<Mutex<HashMap<TileRequest, InFlight>>>,
         cond: Arc<Condvar>,
         shutdown: Arc<Mutex<bool>>,
+        logger: Arc<dyn Logger>,
     ) {
         loop {
             // Check shutdown
@@ -195,7 +215,7 @@ impl ParallelTileGenerator {
             };
 
             // Generate tile
-            debug!("Worker generating tile {:?}", work_item.request);
+            log_debug!(logger, "Worker generating tile {:?}", work_item.request);
             let result = inner.generate(&work_item.request);
 
             // Send result and notify waiters
@@ -222,7 +242,7 @@ impl ParallelTileGenerator {
         {
             let mut map = self.in_flight.lock().unwrap();
             if let Some(flight) = map.get_mut(request) {
-                debug!("Coalescing request for tile {:?}", request);
+                log_debug!(self.logger, "Coalescing request for tile {:?}", request);
                 flight.result_senders.push(result_sender.clone());
                 // Wait for result with timeout
                 drop(map);
@@ -265,14 +285,15 @@ impl ParallelTileGenerator {
         match receiver.recv_timeout(timeout) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
-                warn!(
+                log_warn!(
+                    self.logger,
                     "Tile generation timed out after {}s, returning placeholder",
                     self.config.timeout_secs
                 );
                 self.generate_placeholder()
             }
             Err(RecvTimeoutError::Disconnected) => {
-                error!("Tile generation worker disconnected");
+                log_error!(self.logger, "Tile generation worker disconnected");
                 self.generate_placeholder()
             }
         }
@@ -306,8 +327,13 @@ impl Drop for ParallelTileGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log::NoOpLogger;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
+
+    fn test_logger() -> Arc<dyn Logger> {
+        Arc::new(NoOpLogger)
+    }
 
     /// Mock generator that tracks calls and can simulate delays.
     struct MockGenerator {
@@ -374,8 +400,11 @@ mod tests {
     fn test_parallel_generation() {
         let inner = Arc::new(MockGenerator::new());
         let config = ParallelConfig::default().with_threads(4);
-        let generator =
-            ParallelTileGenerator::new(Arc::clone(&inner) as Arc<dyn TileGenerator>, config);
+        let generator = ParallelTileGenerator::new(
+            Arc::clone(&inner) as Arc<dyn TileGenerator>,
+            config,
+            test_logger(),
+        );
 
         let request = TileRequest::new(100, 200, 16);
         let result = generator.generate(&request);
@@ -393,6 +422,7 @@ mod tests {
         let generator = Arc::new(ParallelTileGenerator::new(
             Arc::clone(&inner) as Arc<dyn TileGenerator>,
             config,
+            test_logger(),
         ));
 
         let request = TileRequest::new(100, 200, 16);
@@ -428,8 +458,11 @@ mod tests {
         let config = ParallelConfig::default()
             .with_threads(1)
             .with_timeout_secs(1); // 1 second timeout
-        let generator =
-            ParallelTileGenerator::new(Arc::clone(&inner) as Arc<dyn TileGenerator>, config);
+        let generator = ParallelTileGenerator::new(
+            Arc::clone(&inner) as Arc<dyn TileGenerator>,
+            config,
+            test_logger(),
+        );
 
         let request = TileRequest::new(100, 200, 16);
         let start = Instant::now();
@@ -460,6 +493,7 @@ mod tests {
         let generator = Arc::new(ParallelTileGenerator::new(
             Arc::clone(&inner) as Arc<dyn TileGenerator>,
             config,
+            test_logger(),
         ));
 
         let start = Instant::now();
@@ -495,8 +529,11 @@ mod tests {
     fn test_error_propagation() {
         let inner = Arc::new(MockGenerator::with_failure());
         let config = ParallelConfig::default().with_threads(1);
-        let generator =
-            ParallelTileGenerator::new(Arc::clone(&inner) as Arc<dyn TileGenerator>, config);
+        let generator = ParallelTileGenerator::new(
+            Arc::clone(&inner) as Arc<dyn TileGenerator>,
+            config,
+            test_logger(),
+        );
 
         let request = TileRequest::new(100, 200, 16);
         let result = generator.generate(&request);
@@ -508,8 +545,11 @@ mod tests {
     fn test_expected_size_delegation() {
         let inner = Arc::new(MockGenerator::new());
         let config = ParallelConfig::default();
-        let generator =
-            ParallelTileGenerator::new(Arc::clone(&inner) as Arc<dyn TileGenerator>, config);
+        let generator = ParallelTileGenerator::new(
+            Arc::clone(&inner) as Arc<dyn TileGenerator>,
+            config,
+            test_logger(),
+        );
 
         assert_eq!(generator.expected_size(), 4096);
     }

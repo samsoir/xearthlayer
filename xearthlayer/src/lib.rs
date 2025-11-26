@@ -21,6 +21,7 @@ pub mod config;
 pub mod coord;
 pub mod dds;
 pub mod fuse;
+pub mod log;
 pub mod logging;
 pub mod orchestrator;
 pub mod provider;

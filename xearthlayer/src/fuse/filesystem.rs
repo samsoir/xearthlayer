@@ -7,7 +7,9 @@ use crate::cache::{Cache, CacheKey};
 use crate::coord::TileCoord;
 use crate::dds::DdsFormat;
 use crate::fuse::{generate_default_placeholder, parse_dds_filename, DdsFilename};
+use crate::log::Logger;
 use crate::tile::{TileGenerator, TileRequest};
+use crate::{log_debug, log_error, log_info, log_warn};
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
 };
@@ -16,7 +18,6 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
-use tracing::{debug, error, info, warn};
 
 /// Inode numbers for filesystem entries.
 const ROOT_INODE: u64 = 1;
@@ -45,6 +46,8 @@ pub struct XEarthLayerFS {
     dds_format: DdsFormat,
     /// Cache mapping inode numbers to DDS filenames for FUSE operations
     inode_cache: Arc<Mutex<HashMap<u64, DdsFilename>>>,
+    /// Logger for diagnostic output
+    logger: Arc<dyn Logger>,
 }
 
 impl XEarthLayerFS {
@@ -92,12 +95,14 @@ impl XEarthLayerFS {
         generator: Arc<dyn TileGenerator>,
         cache: Arc<dyn Cache>,
         dds_format: DdsFormat,
+        logger: Arc<dyn Logger>,
     ) -> Self {
         Self {
             generator,
             cache,
             dds_format,
             inode_cache: Arc::new(Mutex::new(HashMap::new())),
+            logger,
         }
     }
 
@@ -198,14 +203,18 @@ impl XEarthLayerFS {
         match self.generator.generate(&request) {
             Ok(data) => data,
             Err(e) => {
-                error!("Failed to generate tile: {}", e);
-                warn!("Returning magenta placeholder");
+                log_error!(self.logger, "Failed to generate tile: {}", e);
+                log_warn!(self.logger, "Returning magenta placeholder");
 
                 // Return placeholder instead of failing
                 match generate_default_placeholder() {
                     Ok(placeholder) => placeholder,
                     Err(placeholder_err) => {
-                        error!("Failed to generate placeholder: {}", placeholder_err);
+                        log_error!(
+                            self.logger,
+                            "Failed to generate placeholder: {}",
+                            placeholder_err
+                        );
                         Vec::new()
                     }
                 }
@@ -216,7 +225,7 @@ impl XEarthLayerFS {
 
 impl Filesystem for XEarthLayerFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        debug!("lookup: parent={}, name={:?}", parent, name);
+        log_debug!(self.logger, "lookup: parent={}, name={:?}", parent, name);
 
         match parent {
             ROOT_INODE => {
@@ -244,7 +253,7 @@ impl Filesystem for XEarthLayerFS {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        debug!("getattr: ino={}", ino);
+        log_debug!(self.logger, "getattr: ino={}", ino);
 
         if let Some(attr) = self.get_attrs(ino) {
             reply.attr(&TTL, &attr);
@@ -264,7 +273,13 @@ impl Filesystem for XEarthLayerFS {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        debug!("read: ino={}, offset={}, size={}", ino, offset, size);
+        log_debug!(
+            self.logger,
+            "read: ino={}, offset={}, size={}",
+            ino,
+            offset,
+            size
+        );
 
         // Only handle tile files
         if ino < TILE_FILE_INODE_BASE {
@@ -277,7 +292,7 @@ impl Filesystem for XEarthLayerFS {
             let cache = match self.inode_cache.lock() {
                 Ok(c) => c,
                 Err(e) => {
-                    error!("Failed to lock inode cache: {}", e);
+                    log_error!(self.logger, "Failed to lock inode cache: {}", e);
                     reply.error(libc::EIO);
                     return;
                 }
@@ -286,7 +301,7 @@ impl Filesystem for XEarthLayerFS {
             match cache.get(&ino) {
                 Some(coords) => coords.clone(),
                 None => {
-                    error!("Inode {} not found in cache", ino);
+                    log_error!(self.logger, "Inode {} not found in cache", ino);
                     reply.error(ENOENT);
                     return;
                 }
@@ -304,10 +319,15 @@ impl Filesystem for XEarthLayerFS {
             zoom: tile_zoom,
         };
 
-        info!(
+        log_info!(
+            self.logger,
             "Processing tile request: filename coords ({}, {}, zoom {}), tile coords ({}, {}, zoom {})",
-            coords.row, coords.col, coords.zoom,
-            tile.row, tile.col, tile_zoom
+            coords.row,
+            coords.col,
+            coords.zoom,
+            tile.row,
+            tile.col,
+            tile_zoom
         );
 
         // Create cache key
@@ -315,16 +335,16 @@ impl Filesystem for XEarthLayerFS {
 
         // Try to get from cache (memory → disk → none)
         let dds_data = if let Some(data) = self.cache.get(&cache_key) {
-            info!("Cache hit for tile {:?}", tile);
+            log_info!(self.logger, "Cache hit for tile {:?}", tile);
             data
         } else {
             // Cache miss - generate tile using injected generator
-            info!("Cache miss for tile {:?}, generating...", tile);
+            log_info!(self.logger, "Cache miss for tile {:?}, generating...", tile);
             let data = self.generate_tile(&coords);
 
             // Cache the generated tile
             if let Err(e) = self.cache.put(cache_key, data.clone()) {
-                warn!("Failed to cache tile: {}", e);
+                log_warn!(self.logger, "Failed to cache tile: {}", e);
                 // Continue anyway - we have the data
             }
 
@@ -344,7 +364,8 @@ impl Filesystem for XEarthLayerFS {
         let end = std::cmp::min(offset + size, dds_data.len());
         let data = &dds_data[offset..end];
 
-        debug!(
+        log_debug!(
+            self.logger,
             "Returning {} bytes (requested {}, available {})",
             data.len(),
             size,
@@ -361,7 +382,7 @@ impl Filesystem for XEarthLayerFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        debug!("readdir: ino={}, offset={}", ino, offset);
+        log_debug!(self.logger, "readdir: ino={}, offset={}", ino, offset);
 
         match ino {
             ROOT_INODE => {

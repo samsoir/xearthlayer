@@ -5,6 +5,8 @@ use super::error::ServiceError;
 use crate::cache::{Cache, CacheConfig, CacheSystem, NoOpCache};
 use crate::coord::to_tile_coords;
 use crate::fuse::{PassthroughFS, XEarthLayerFS};
+use crate::log::Logger;
+use crate::log_info;
 use crate::orchestrator::TileOrchestrator;
 use crate::provider::{ProviderConfig, ProviderFactory, ReqwestClient};
 use crate::texture::{DdsTextureEncoder, TextureEncoder};
@@ -14,7 +16,6 @@ use crate::tile::{
 use fuser::BackgroundSession;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
 
 /// High-level facade for XEarthLayer operations.
 ///
@@ -46,6 +47,8 @@ pub struct XEarthLayerService {
     generator: Arc<dyn TileGenerator>,
     /// Cache implementation
     cache: Arc<dyn Cache>,
+    /// Logger for diagnostic output
+    logger: Arc<dyn Logger>,
 }
 
 impl XEarthLayerService {
@@ -71,6 +74,7 @@ impl XEarthLayerService {
     pub fn new(
         config: ServiceConfig,
         provider_config: ProviderConfig,
+        logger: Arc<dyn Logger>,
     ) -> Result<Self, ServiceError> {
         // Create HTTP client
         let http_client =
@@ -90,8 +94,11 @@ impl XEarthLayerService {
         let orchestrator = TileOrchestrator::with_config(provider, *config.download());
 
         // Create base tile generator
-        let base_generator: Arc<dyn TileGenerator> =
-            Arc::new(DefaultTileGenerator::new(orchestrator, encoder));
+        let base_generator: Arc<dyn TileGenerator> = Arc::new(DefaultTileGenerator::new(
+            orchestrator,
+            encoder,
+            logger.clone(),
+        ));
 
         // Wrap with parallel generator for concurrent tile requests
         let parallel_config = ParallelConfig::default()
@@ -107,11 +114,14 @@ impl XEarthLayerService {
         let generator: Arc<dyn TileGenerator> = Arc::new(ParallelTileGenerator::new(
             base_generator,
             parallel_config.clone(),
+            logger.clone(),
         ));
 
-        info!(
+        log_info!(
+            logger,
             "Tile generation: {} threads, {}s timeout",
-            parallel_config.threads, parallel_config.timeout_secs
+            parallel_config.threads,
+            parallel_config.timeout_secs
         );
 
         // Create cache system based on configuration
@@ -143,6 +153,7 @@ impl XEarthLayerService {
             max_zoom,
             generator,
             cache,
+            logger,
         })
     }
 
@@ -267,6 +278,7 @@ impl XEarthLayerService {
             self.generator.clone(),
             self.cache.clone(),
             self.config.texture().format(),
+            self.logger.clone(),
         );
 
         // Mount filesystem
@@ -303,6 +315,7 @@ impl XEarthLayerService {
             self.generator.clone(),
             self.cache.clone(),
             self.config.texture().format(),
+            self.logger.clone(),
         );
 
         // Mount filesystem in background
@@ -358,6 +371,7 @@ impl XEarthLayerService {
             self.generator.clone(),
             self.cache.clone(),
             self.config.texture().format(),
+            self.logger.clone(),
         );
 
         // Mount filesystem
@@ -408,6 +422,7 @@ impl XEarthLayerService {
             self.generator.clone(),
             self.cache.clone(),
             self.config.texture().format(),
+            self.logger.clone(),
         );
 
         // Mount filesystem in background

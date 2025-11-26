@@ -8,7 +8,9 @@ use crate::cache::{Cache, CacheKey};
 use crate::coord::TileCoord;
 use crate::dds::DdsFormat;
 use crate::fuse::{generate_default_placeholder, parse_dds_filename, DdsFilename};
+use crate::log::Logger;
 use crate::tile::{TileGenerator, TileRequest};
+use crate::{log_debug, log_error, log_info, log_warn};
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
 };
@@ -21,7 +23,6 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, info, warn};
 
 /// Time-to-live for attribute caching.
 const TTL: Duration = Duration::from_secs(1);
@@ -51,6 +52,8 @@ pub struct PassthroughFS {
     virtual_inode_to_dds: Arc<Mutex<HashMap<u64, DdsFilename>>>,
     /// Next available inode for real files
     next_inode: Arc<Mutex<u64>>,
+    /// Logger for diagnostic output
+    logger: Arc<dyn Logger>,
 }
 
 impl PassthroughFS {
@@ -62,11 +65,13 @@ impl PassthroughFS {
     /// * `generator` - Tile generator for on-demand DDS creation
     /// * `cache` - Cache implementation
     /// * `dds_format` - DDS compression format
+    /// * `logger` - Logger for diagnostic output
     pub fn new(
         source_dir: PathBuf,
         generator: Arc<dyn TileGenerator>,
         cache: Arc<dyn Cache>,
         dds_format: DdsFormat,
+        logger: Arc<dyn Logger>,
     ) -> Self {
         let mut inode_to_path = HashMap::new();
         let mut path_to_inode = HashMap::new();
@@ -84,6 +89,7 @@ impl PassthroughFS {
             path_to_inode: Arc::new(Mutex::new(path_to_inode)),
             virtual_inode_to_dds: Arc::new(Mutex::new(HashMap::new())),
             next_inode: Arc::new(Mutex::new(2)),
+            logger,
         }
     }
 
@@ -210,22 +216,22 @@ impl PassthroughFS {
         let cache_key = CacheKey::new(self.cache.provider(), self.dds_format, tile);
 
         if let Some(data) = self.cache.get(&cache_key) {
-            info!("Cache hit for DDS {:?}", coords);
+            log_info!(self.logger, "Cache hit for DDS {:?}", coords);
             return data;
         }
 
-        info!("Generating DDS for coords {:?}", coords);
+        log_info!(self.logger, "Generating DDS for coords {:?}", coords);
 
         match self.generator.generate(&request) {
             Ok(data) => {
                 // Cache the result
                 if let Err(e) = self.cache.put(cache_key, data.clone()) {
-                    warn!("Failed to cache DDS: {}", e);
+                    log_warn!(self.logger, "Failed to cache DDS: {}", e);
                 }
                 data
             }
             Err(e) => {
-                error!("Failed to generate DDS: {}", e);
+                log_error!(self.logger, "Failed to generate DDS: {}", e);
                 generate_default_placeholder().unwrap_or_default()
             }
         }
@@ -234,7 +240,7 @@ impl PassthroughFS {
 
 impl Filesystem for PassthroughFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        debug!("lookup: parent={}, name={:?}", parent, name);
+        log_debug!(self.logger, "lookup: parent={}, name={:?}", parent, name);
 
         // Get parent path
         let parent_path = match self.get_path(parent) {
@@ -258,7 +264,12 @@ impl Filesystem for PassthroughFS {
                     return;
                 }
                 Err(e) => {
-                    debug!("Failed to get metadata for {:?}: {}", child_path, e);
+                    log_debug!(
+                        self.logger,
+                        "Failed to get metadata for {:?}: {}",
+                        child_path,
+                        e
+                    );
                 }
             }
         }
@@ -277,7 +288,7 @@ impl Filesystem for PassthroughFS {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        debug!("getattr: ino={}", ino);
+        log_debug!(self.logger, "getattr: ino={}", ino);
 
         // Check if it's a virtual inode
         if Self::is_virtual_inode(ino) {
@@ -321,7 +332,13 @@ impl Filesystem for PassthroughFS {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        debug!("read: ino={}, offset={}, size={}", ino, offset, size);
+        log_debug!(
+            self.logger,
+            "read: ino={}, offset={}, size={}",
+            ino,
+            offset,
+            size
+        );
 
         // Check if it's a virtual DDS file
         if Self::is_virtual_inode(ino) {
@@ -358,14 +375,14 @@ impl Filesystem for PassthroughFS {
         let mut file = match File::open(&path) {
             Ok(f) => f,
             Err(e) => {
-                error!("Failed to open file {:?}: {}", path, e);
+                log_error!(self.logger, "Failed to open file {:?}: {}", path, e);
                 reply.error(libc::EIO);
                 return;
             }
         };
 
         if let Err(e) = file.seek(SeekFrom::Start(offset as u64)) {
-            error!("Failed to seek in {:?}: {}", path, e);
+            log_error!(self.logger, "Failed to seek in {:?}: {}", path, e);
             reply.error(libc::EIO);
             return;
         }
@@ -377,7 +394,7 @@ impl Filesystem for PassthroughFS {
                 reply.data(&buffer);
             }
             Err(e) => {
-                error!("Failed to read from {:?}: {}", path, e);
+                log_error!(self.logger, "Failed to read from {:?}: {}", path, e);
                 reply.error(libc::EIO);
             }
         }
@@ -391,7 +408,7 @@ impl Filesystem for PassthroughFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        debug!("readdir: ino={}, offset={}", ino, offset);
+        log_debug!(self.logger, "readdir: ino={}, offset={}", ino, offset);
 
         let path = match self.get_path(ino) {
             Some(p) => p,
@@ -443,7 +460,7 @@ impl Filesystem for PassthroughFS {
                 }
             }
             Err(e) => {
-                error!("Failed to read directory {:?}: {}", path, e);
+                log_error!(self.logger, "Failed to read directory {:?}: {}", path, e);
                 reply.error(libc::EIO);
                 return;
             }

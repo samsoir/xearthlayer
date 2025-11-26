@@ -4,8 +4,10 @@
 //! to reduce duplication across command handlers.
 
 use crate::error::CliError;
+use std::sync::Arc;
 use tracing::info;
 use xearthlayer::config::{ConfigFile, TextureConfig};
+use xearthlayer::log::TracingLogger;
 use xearthlayer::logging::{init_logging, LoggingGuard};
 use xearthlayer::provider::ProviderConfig;
 use xearthlayer::service::{ServiceConfig, XEarthLayerService};
@@ -67,7 +69,10 @@ impl CliRunner {
             println!("Creating {} session...", provider_config.name());
         }
 
-        XEarthLayerService::new(config, provider_config.clone())
+        // Use TracingLogger to delegate library logging to tracing crate
+        let logger = Arc::new(TracingLogger);
+
+        XEarthLayerService::new(config, provider_config.clone(), logger)
             .map_err(CliError::ServiceCreation)
             .inspect(|_| info!("Service created successfully"))
     }

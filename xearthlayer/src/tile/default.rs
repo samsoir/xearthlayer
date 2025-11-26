@@ -6,11 +6,12 @@
 
 use crate::coord::TileCoord;
 use crate::fuse::generate_default_placeholder;
+use crate::log::Logger;
 use crate::orchestrator::TileOrchestrator;
 use crate::texture::TextureEncoder;
 use crate::tile::{TileGenerator, TileGeneratorError, TileRequest};
+use crate::{log_error, log_info, log_warn};
 use std::sync::Arc;
-use tracing::{error, info, warn};
 
 /// Default tile generator that downloads imagery and encodes to texture format.
 ///
@@ -50,6 +51,8 @@ pub struct DefaultTileGenerator {
     orchestrator: Arc<TileOrchestrator>,
     /// Texture encoder
     encoder: Arc<dyn TextureEncoder>,
+    /// Logger for diagnostic output
+    logger: Arc<dyn Logger>,
 }
 
 impl DefaultTileGenerator {
@@ -59,10 +62,16 @@ impl DefaultTileGenerator {
     ///
     /// * `orchestrator` - Tile orchestrator for downloading imagery
     /// * `encoder` - Texture encoder for encoding to target format
-    pub fn new(orchestrator: TileOrchestrator, encoder: Arc<dyn TextureEncoder>) -> Self {
+    /// * `logger` - Logger for diagnostic output
+    pub fn new(
+        orchestrator: TileOrchestrator,
+        encoder: Arc<dyn TextureEncoder>,
+        logger: Arc<dyn Logger>,
+    ) -> Self {
         Self {
             orchestrator: Arc::new(orchestrator),
             encoder,
+            logger,
         }
     }
 
@@ -89,7 +98,8 @@ impl TileGenerator for DefaultTileGenerator {
             zoom: tile_zoom,
         };
 
-        info!(
+        log_info!(
+            self.logger,
             "Generating tile: chunk coords ({}, {}, zoom {}) -> tile coords ({}, {}, zoom {})",
             request.row(),
             request.col(),
@@ -102,7 +112,8 @@ impl TileGenerator for DefaultTileGenerator {
         // Download tile imagery
         let image = match self.orchestrator.download_tile(&tile) {
             Ok(img) => {
-                info!(
+                log_info!(
+                    self.logger,
                     "Downloaded tile successfully: {}×{} pixels",
                     img.width(),
                     img.height()
@@ -110,8 +121,8 @@ impl TileGenerator for DefaultTileGenerator {
                 img
             }
             Err(e) => {
-                error!("Failed to download tile: {}", e);
-                warn!("Returning magenta placeholder for failed tile");
+                log_error!(self.logger, "Failed to download tile: {}", e);
+                log_warn!(self.logger, "Returning magenta placeholder for failed tile");
 
                 return generate_default_placeholder().map_err(|e| {
                     TileGeneratorError::Internal(format!("Failed to generate placeholder: {}", e))
@@ -122,7 +133,8 @@ impl TileGenerator for DefaultTileGenerator {
         // Encode to texture format
         match self.encoder.encode(&image) {
             Ok(texture_data) => {
-                info!(
+                log_info!(
+                    self.logger,
                     "Texture encoding completed ({} encoder): {} bytes",
                     self.encoder.name(),
                     texture_data.len()
@@ -130,8 +142,11 @@ impl TileGenerator for DefaultTileGenerator {
                 Ok(texture_data)
             }
             Err(e) => {
-                error!("Failed to encode texture: {}", e);
-                warn!("Returning magenta placeholder for failed encoding");
+                log_error!(self.logger, "Failed to encode texture: {}", e);
+                log_warn!(
+                    self.logger,
+                    "Returning magenta placeholder for failed encoding"
+                );
 
                 generate_default_placeholder().map_err(|e| {
                     TileGeneratorError::Internal(format!("Failed to generate placeholder: {}", e))
@@ -150,10 +165,15 @@ impl TileGenerator for DefaultTileGenerator {
 mod tests {
     use super::*;
     use crate::dds::DdsFormat;
+    use crate::log::NoOpLogger;
     use crate::provider::{BingMapsProvider, MockHttpClient, Provider, ProviderError};
     use crate::texture::DdsTextureEncoder;
     use image::{Rgb, RgbImage};
     use std::io::Cursor;
+
+    fn test_logger() -> Arc<dyn Logger> {
+        Arc::new(NoOpLogger)
+    }
 
     fn create_mock_jpeg_chunk() -> Vec<u8> {
         // Create a 256×256 test image
@@ -181,7 +201,7 @@ mod tests {
         let encoder: Arc<dyn TextureEncoder> =
             Arc::new(DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(5));
 
-        let generator = DefaultTileGenerator::new(orchestrator, encoder);
+        let generator = DefaultTileGenerator::new(orchestrator, encoder, test_logger());
         assert!(generator.expected_size() > 0);
     }
 
@@ -195,7 +215,7 @@ mod tests {
         let encoder: Arc<dyn TextureEncoder> =
             Arc::new(DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(5));
 
-        let generator = DefaultTileGenerator::new(orchestrator, encoder.clone());
+        let generator = DefaultTileGenerator::new(orchestrator, encoder.clone(), test_logger());
 
         // Should match encoder's expected size for 4096×4096
         assert_eq!(generator.expected_size(), encoder.expected_size(4096, 4096));
@@ -211,7 +231,7 @@ mod tests {
         let encoder: Arc<dyn TextureEncoder> =
             Arc::new(DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(1));
 
-        let generator = DefaultTileGenerator::new(orchestrator, encoder);
+        let generator = DefaultTileGenerator::new(orchestrator, encoder, test_logger());
         // Use chunk-aligned coordinates (divisible by 16) at zoom 14
         // This will be converted to tile coords: row=18, col=31, zoom=10
         let request = TileRequest::new(288, 496, 14);
@@ -235,7 +255,7 @@ mod tests {
         let encoder: Arc<dyn TextureEncoder> =
             Arc::new(DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(1));
 
-        let generator = DefaultTileGenerator::new(orchestrator, encoder);
+        let generator = DefaultTileGenerator::new(orchestrator, encoder, test_logger());
         // Use chunk-aligned coordinates at zoom 14
         let request = TileRequest::new(288, 496, 14);
 
@@ -259,8 +279,11 @@ mod tests {
         let encoder: Arc<dyn TextureEncoder> =
             Arc::new(DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(5));
 
-        let generator: Arc<dyn TileGenerator> =
-            Arc::new(DefaultTileGenerator::new(orchestrator, encoder));
+        let generator: Arc<dyn TileGenerator> = Arc::new(DefaultTileGenerator::new(
+            orchestrator,
+            encoder,
+            test_logger(),
+        ));
 
         // Should work through trait object
         assert!(generator.expected_size() > 0);
@@ -282,7 +305,7 @@ mod tests {
         let encoder: Arc<dyn TextureEncoder> =
             Arc::new(DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(5));
 
-        let generator = DefaultTileGenerator::new(orchestrator, encoder);
+        let generator = DefaultTileGenerator::new(orchestrator, encoder, test_logger());
 
         assert_eq!(generator.encoder().name(), "DDS BC1");
         assert_eq!(generator.encoder().extension(), "dds");
