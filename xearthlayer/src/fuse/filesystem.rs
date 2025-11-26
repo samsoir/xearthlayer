@@ -4,7 +4,7 @@
 //! and generates satellite imagery DDS files on-demand.
 
 use crate::cache::{Cache, CacheKey};
-use crate::coord::to_tile_coords;
+use crate::coord::TileCoord;
 use crate::dds::DdsFormat;
 use crate::fuse::{generate_default_placeholder, parse_dds_filename, DdsFilename};
 use crate::tile::{TileGenerator, TileRequest};
@@ -293,24 +293,22 @@ impl Filesystem for XEarthLayerFS {
             }
         };
 
-        // Convert coordinates to tile coordinates for cache key
-        let tile = match to_tile_coords(coords.row as f64, coords.col as f64, coords.zoom) {
-            Ok(t) => t,
-            Err(e) => {
-                error!("Failed to convert coordinates: {}", e);
-                warn!("Returning magenta placeholder for invalid coordinates");
-                let placeholder = match generate_default_placeholder() {
-                    Ok(p) => p,
-                    Err(placeholder_err) => {
-                        error!("Failed to generate placeholder: {}", placeholder_err);
-                        reply.error(libc::EIO);
-                        return;
-                    }
-                };
-                reply.data(&placeholder[offset as usize..]);
-                return;
-            }
+        // DdsFilename already contains Web Mercator tile coordinates from the filename
+        // e.g., "100000_125184_BI18.dds" -> row=100000, col=125184, zoom=18
+        // These are chunk-level coordinates, so we need to convert to tile-level
+        // Tile zoom = chunk zoom - 4 (because each tile = 16x16 chunks = 2^4)
+        let tile_zoom = coords.zoom.saturating_sub(4);
+        let tile = TileCoord {
+            row: coords.row / 16,
+            col: coords.col / 16,
+            zoom: tile_zoom,
         };
+
+        info!(
+            "Processing tile request: filename coords ({}, {}, zoom {}), tile coords ({}, {}, zoom {})",
+            coords.row, coords.col, coords.zoom,
+            tile.row, tile.col, tile_zoom
+        );
 
         // Create cache key
         let cache_key = CacheKey::new(self.cache.provider(), self.dds_format, tile);
