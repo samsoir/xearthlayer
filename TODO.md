@@ -8,17 +8,7 @@ Tracking issues discovered during development and testing.
 
 ## Visual Glitches
 
-### V1: Scenery Glitches (TBD)
-- **Status**: Open, needs investigation
-- **Severity**: Unknown
-- **Description**: Visual glitches observed during first test flight
-- **Observed**: 2025-11-25, first X-Plane integration test
-- **Details**: To be documented after further investigation
-- **Potential Causes**:
-  - Tile coordinate misalignment
-  - Mipmap generation issues
-  - DDS format compatibility
-  - Tile boundary seams
+(None currently open)
 
 ## Tech Debt
 
@@ -84,6 +74,11 @@ Tracking issues discovered during development and testing.
   - No stale mounts left behind
 
 ---
+
+### V1: Scenery Glitches ✓
+- **Closed**: 2025-11-26
+- **Original Issue**: Visual glitches observed during first test flight
+- **Resolution**: Not an XEarthLayer issue - caused by Ortho4XP scenery pack configuration for X-Plane 12. Improved with better Ortho4XP settings.
 
 ## Notes
 

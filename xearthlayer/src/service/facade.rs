@@ -139,7 +139,7 @@ impl XEarthLayerService {
                 cache_config = cache_config.with_disk_size(size);
             }
 
-            match CacheSystem::new(cache_config) {
+            match CacheSystem::new(cache_config, logger.clone()) {
                 Ok(cache) => Arc::new(cache),
                 Err(e) => return Err(ServiceError::CacheError(e.to_string())),
             }

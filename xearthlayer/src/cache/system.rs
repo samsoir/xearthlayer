@@ -6,7 +6,169 @@ use crate::cache::memory::MemoryCache;
 use crate::cache::r#trait::Cache;
 use crate::cache::types::{CacheConfig, CacheError, CacheKey};
 use crate::cache::{CacheStatistics, CacheStats};
+use crate::config::format_size;
+use crate::log::Logger;
+use crate::{log_debug, log_info};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+/// Background thread for periodic cache statistics logging.
+///
+/// Logs cache statistics at a configurable interval using the injected logger.
+struct CacheStatsLogger {
+    /// Handle to the logger thread
+    thread_handle: Option<JoinHandle<()>>,
+    /// Shutdown signal
+    shutdown: Arc<AtomicBool>,
+}
+
+impl CacheStatsLogger {
+    /// Start the stats logger thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `memory` - Arc to the memory cache
+    /// * `disk` - Arc to the disk cache
+    /// * `logger` - Logger for output
+    /// * `provider` - Provider name for log messages
+    /// * `interval_secs` - Logging interval in seconds
+    fn start(
+        memory: Arc<MemoryCache>,
+        disk: Arc<DiskCache>,
+        logger: Arc<dyn Logger>,
+        provider: String,
+        interval_secs: u64,
+    ) -> Self {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+
+        let thread_handle = thread::Builder::new()
+            .name("cache-stats".to_string())
+            .spawn(move || {
+                Self::run_loop(
+                    memory,
+                    disk,
+                    logger,
+                    provider,
+                    interval_secs,
+                    shutdown_clone,
+                );
+            })
+            .expect("Failed to spawn cache stats logger thread");
+
+        Self {
+            thread_handle: Some(thread_handle),
+            shutdown,
+        }
+    }
+
+    /// The main logger loop.
+    fn run_loop(
+        memory: Arc<MemoryCache>,
+        disk: Arc<DiskCache>,
+        logger: Arc<dyn Logger>,
+        provider: String,
+        interval_secs: u64,
+        shutdown: Arc<AtomicBool>,
+    ) {
+        let interval = Duration::from_secs(interval_secs);
+
+        // Use shorter sleep intervals for responsive shutdown
+        let check_interval = Duration::from_secs(1);
+        let mut elapsed = Duration::ZERO;
+
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                log_debug!(logger, "Cache stats logger received shutdown signal");
+                break;
+            }
+
+            thread::sleep(check_interval);
+            elapsed += check_interval;
+
+            if elapsed >= interval {
+                elapsed = Duration::ZERO;
+                Self::log_stats(&memory, &disk, &logger, &provider);
+            }
+        }
+    }
+
+    /// Log current cache statistics.
+    fn log_stats(memory: &MemoryCache, disk: &DiskCache, logger: &Arc<dyn Logger>, provider: &str) {
+        let mem_stats = memory.stats();
+        let disk_stats = disk.stats();
+
+        // Memory cache stats
+        let mem_entries = memory.entry_count();
+        let mem_size = memory.size_bytes();
+        let mem_hit_rate = mem_stats.memory_hit_rate() * 100.0;
+
+        log_info!(
+            logger,
+            "[CACHE] Memory: {} tiles ({}), hits: {} ({:.1}%), evictions: {}",
+            mem_entries,
+            format_size(mem_size),
+            mem_stats.memory_hits,
+            mem_hit_rate,
+            mem_stats.memory_evictions
+        );
+
+        // Disk cache stats
+        let disk_entries = disk.entry_count();
+        let disk_size = disk.size_bytes();
+        let disk_max = disk.max_size_bytes();
+        let disk_hit_rate = disk_stats.disk_hit_rate() * 100.0;
+
+        log_info!(
+            logger,
+            "[CACHE] Disk: {} tiles ({} / {}), hits: {} ({:.1}%), writes: {}, evictions: {}",
+            disk_entries,
+            format_size(disk_size),
+            format_size(disk_max),
+            disk_stats.disk_hits,
+            disk_hit_rate,
+            disk_stats.disk_writes,
+            disk_stats.disk_evictions
+        );
+
+        // Overall hit rate (only if there have been requests)
+        let total_hits = mem_stats.memory_hits + disk_stats.disk_hits;
+        let total_requests = total_hits + disk_stats.disk_misses;
+
+        if total_requests > 0 {
+            let overall_hit_rate = (total_hits as f64 / total_requests as f64) * 100.0;
+            log_info!(
+                logger,
+                "[CACHE] Overall: {:.1}% hit rate ({} hits / {} requests), provider: {}",
+                overall_hit_rate,
+                total_hits,
+                total_requests,
+                provider
+            );
+        }
+    }
+
+    /// Signal shutdown.
+    fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Wait for thread to finish.
+    fn join(&mut self) {
+        if let Some(handle) = self.thread_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for CacheStatsLogger {
+    fn drop(&mut self) {
+        self.shutdown();
+        self.join();
+    }
+}
 
 /// Two-tier cache system coordinating memory and disk caches.
 ///
@@ -15,8 +177,9 @@ use std::sync::Arc;
 /// 2. If miss, check disk cache (medium: 10-50ms)
 /// 3. If miss, caller generates tile and caches it
 ///
-/// The cache system also runs a background daemon that periodically
-/// checks the disk cache size and evicts LRU entries when needed.
+/// The cache system runs two background threads:
+/// - Disk cache garbage collection daemon
+/// - Statistics logger (logs cache stats periodically)
 ///
 /// # Example
 ///
@@ -24,9 +187,12 @@ use std::sync::Arc;
 /// use xearthlayer::cache::{CacheSystem, CacheConfig, CacheKey};
 /// use xearthlayer::coord::TileCoord;
 /// use xearthlayer::dds::DdsFormat;
+/// use xearthlayer::log::NoOpLogger;
+/// use std::sync::Arc;
 ///
 /// let config = CacheConfig::new("bing");
-/// let cache = CacheSystem::new(config).unwrap();
+/// let logger = Arc::new(NoOpLogger);
+/// let cache = CacheSystem::new(config, logger).unwrap();
 ///
 /// let key = CacheKey::new("bing", DdsFormat::BC1, TileCoord { row: 100, col: 200, zoom: 15 });
 ///
@@ -49,18 +215,23 @@ pub struct CacheSystem {
     /// Background daemon for disk cache garbage collection
     #[allow(dead_code)]
     daemon: DiskCacheDaemon,
+    /// Background stats logger (optional, None if interval is 0)
+    #[allow(dead_code)]
+    stats_logger: Option<CacheStatsLogger>,
 }
 
 impl CacheSystem {
     /// Create a new two-tier cache system.
     ///
-    /// This also starts a background daemon that periodically checks
-    /// the disk cache size and evicts LRU entries when needed.
+    /// This starts background threads for:
+    /// - Disk cache garbage collection
+    /// - Statistics logging (if interval > 0)
     ///
     /// # Arguments
     ///
     /// * `config` - Cache configuration with memory and disk settings
-    pub fn new(config: CacheConfig) -> Result<Self, CacheError> {
+    /// * `logger` - Logger for statistics output
+    pub fn new(config: CacheConfig, logger: Arc<dyn Logger>) -> Result<Self, CacheError> {
         let memory = Arc::new(MemoryCache::new(config.memory.max_size_bytes));
 
         let disk = Arc::new(DiskCache::new(
@@ -71,11 +242,25 @@ impl CacheSystem {
         // Start background daemon for disk cache garbage collection
         let daemon = DiskCacheDaemon::start(disk.clone(), config.disk.daemon_interval_secs);
 
+        // Start stats logger if interval > 0
+        let stats_logger = if config.stats_interval_secs > 0 {
+            Some(CacheStatsLogger::start(
+                memory.clone(),
+                disk.clone(),
+                logger,
+                config.provider.clone(),
+                config.stats_interval_secs,
+            ))
+        } else {
+            None
+        };
+
         Ok(Self {
             memory,
             disk,
             provider: config.provider,
             daemon,
+            stats_logger,
         })
     }
 
@@ -248,6 +433,7 @@ mod tests {
     use super::*;
     use crate::coord::TileCoord;
     use crate::dds::DdsFormat;
+    use crate::log::NoOpLogger;
     use tempfile::TempDir;
 
     fn create_test_cache() -> (CacheSystem, TempDir) {
@@ -255,9 +441,11 @@ mod tests {
         let config = CacheConfig::new("bing")
             .with_memory_size(10_000)
             .with_disk_size(100_000)
-            .with_cache_dir(temp_dir.path().to_path_buf());
+            .with_cache_dir(temp_dir.path().to_path_buf())
+            .with_stats_interval(0); // Disable stats logging in tests
 
-        let cache = CacheSystem::new(config).unwrap();
+        let logger: Arc<dyn Logger> = Arc::new(NoOpLogger);
+        let cache = CacheSystem::new(config, logger).unwrap();
         (cache, temp_dir)
     }
 
@@ -441,9 +629,11 @@ mod tests {
         let config = CacheConfig::new("bing")
             .with_memory_size(1_000_000)
             .with_disk_size(10_000) // Small disk limit
-            .with_cache_dir(temp_dir.path().to_path_buf());
+            .with_cache_dir(temp_dir.path().to_path_buf())
+            .with_stats_interval(0);
 
-        let cache = CacheSystem::new(config).unwrap();
+        let logger: Arc<dyn Logger> = Arc::new(NoOpLogger);
+        let cache = CacheSystem::new(config, logger).unwrap();
         let data = vec![0u8; 5000];
 
         // Add entries that exceed disk limit
@@ -462,14 +652,18 @@ mod tests {
     #[test]
     fn test_cache_system_multiple_providers() {
         let temp_dir = TempDir::new().unwrap();
+        let logger: Arc<dyn Logger> = Arc::new(NoOpLogger);
 
         // Create caches for different providers
-        let config_bing = CacheConfig::new("bing").with_cache_dir(temp_dir.path().to_path_buf());
-        let cache_bing = CacheSystem::new(config_bing).unwrap();
+        let config_bing = CacheConfig::new("bing")
+            .with_cache_dir(temp_dir.path().to_path_buf())
+            .with_stats_interval(0);
+        let cache_bing = CacheSystem::new(config_bing, logger.clone()).unwrap();
 
-        let config_google =
-            CacheConfig::new("google").with_cache_dir(temp_dir.path().to_path_buf());
-        let cache_google = CacheSystem::new(config_google).unwrap();
+        let config_google = CacheConfig::new("google")
+            .with_cache_dir(temp_dir.path().to_path_buf())
+            .with_stats_interval(0);
+        let cache_google = CacheSystem::new(config_google, logger).unwrap();
 
         let key_bing = CacheKey::new(
             "bing",

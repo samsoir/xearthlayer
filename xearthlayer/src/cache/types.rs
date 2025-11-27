@@ -105,6 +105,8 @@ pub struct CacheConfig {
     pub disk: DiskCacheConfig,
     /// Active provider name
     pub provider: String,
+    /// Stats logging interval in seconds (default: 60, 0 to disable)
+    pub stats_interval_secs: u64,
 }
 
 impl CacheConfig {
@@ -114,6 +116,7 @@ impl CacheConfig {
             memory: MemoryCacheConfig::default(),
             disk: DiskCacheConfig::default(),
             provider: provider.into(),
+            stats_interval_secs: 60,
         }
     }
 
@@ -138,6 +141,12 @@ impl CacheConfig {
     /// Set maximum age in days for disk cache.
     pub fn with_max_age_days(mut self, days: u32) -> Self {
         self.disk.max_age_days = Some(days);
+        self
+    }
+
+    /// Set stats logging interval in seconds (0 to disable).
+    pub fn with_stats_interval(mut self, secs: u64) -> Self {
+        self.stats_interval_secs = secs;
         self
     }
 }

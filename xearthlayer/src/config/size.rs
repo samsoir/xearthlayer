@@ -76,28 +76,47 @@ pub fn parse_size(s: &str) -> Result<usize, SizeParseError> {
 
 /// Format a byte count as a human-readable string.
 ///
+/// Always produces a unit-based output (GB, MB, KB, or bytes).
+/// Uses decimal format for non-exact multiples.
+///
 /// # Examples
 ///
 /// ```
 /// use xearthlayer::config::format_size;
 ///
-/// assert_eq!(format_size(1024), "1KB");
-/// assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2GB");
-/// assert_eq!(format_size(500 * 1024 * 1024), "500MB");
+/// assert_eq!(format_size(1024), "1 KB");
+/// assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2 GB");
+/// assert_eq!(format_size(500 * 1024 * 1024), "500 MB");
+/// assert_eq!(format_size(1536 * 1024 * 1024), "1.5 GB");
 /// ```
 pub fn format_size(bytes: usize) -> String {
     const GB: usize = 1024 * 1024 * 1024;
     const MB: usize = 1024 * 1024;
     const KB: usize = 1024;
 
-    if bytes >= GB && bytes.is_multiple_of(GB) {
-        format!("{}GB", bytes / GB)
-    } else if bytes >= MB && bytes.is_multiple_of(MB) {
-        format!("{}MB", bytes / MB)
-    } else if bytes >= KB && bytes.is_multiple_of(KB) {
-        format!("{}KB", bytes / KB)
+    if bytes >= GB {
+        let value = bytes as f64 / GB as f64;
+        if value.fract() == 0.0 {
+            format!("{} GB", value as usize)
+        } else {
+            format!("{:.1} GB", value)
+        }
+    } else if bytes >= MB {
+        let value = bytes as f64 / MB as f64;
+        if value.fract() == 0.0 {
+            format!("{} MB", value as usize)
+        } else {
+            format!("{:.1} MB", value)
+        }
+    } else if bytes >= KB {
+        let value = bytes as f64 / KB as f64;
+        if value.fract() == 0.0 {
+            format!("{} KB", value as usize)
+        } else {
+            format!("{:.1} KB", value)
+        }
     } else {
-        format!("{}", bytes)
+        format!("{} B", bytes)
     }
 }
 
@@ -188,20 +207,29 @@ mod tests {
 
     #[test]
     fn test_format_size() {
-        assert_eq!(format_size(1024), "1KB");
-        assert_eq!(format_size(1024 * 1024), "1MB");
-        assert_eq!(format_size(1024 * 1024 * 1024), "1GB");
-        assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2GB");
-        assert_eq!(format_size(500 * 1024 * 1024), "500MB");
-        assert_eq!(format_size(1000), "1000"); // Not evenly divisible
+        assert_eq!(format_size(1024), "1 KB");
+        assert_eq!(format_size(1024 * 1024), "1 MB");
+        assert_eq!(format_size(1024 * 1024 * 1024), "1 GB");
+        assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2 GB");
+        assert_eq!(format_size(500 * 1024 * 1024), "500 MB");
+        assert_eq!(format_size(1000), "1000 B"); // Less than 1KB
+        assert_eq!(format_size(1536 * 1024 * 1024), "1.5 GB"); // Non-exact multiple
+        assert_eq!(format_size(1536 * 1024), "1.5 MB");
+        assert_eq!(format_size(0), "0 B");
     }
 
     #[test]
     fn test_size_roundtrip() {
-        let sizes = vec!["1KB", "500MB", "2GB", "20GB"];
-        for s in sizes {
-            let parsed: Size = s.parse().unwrap();
-            assert_eq!(parsed.to_string(), s);
+        // Note: roundtrip only works for exact multiples due to space in format
+        let test_cases = vec![
+            ("1KB", "1 KB"),
+            ("500MB", "500 MB"),
+            ("2GB", "2 GB"),
+            ("20GB", "20 GB"),
+        ];
+        for (input, expected_output) in test_cases {
+            let parsed: Size = input.parse().unwrap();
+            assert_eq!(parsed.to_string(), expected_output);
         }
     }
 
