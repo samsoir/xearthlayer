@@ -27,6 +27,7 @@
 mod config;
 mod error;
 mod facade;
+mod network_logger;
 
 pub use config::{ServiceConfig, ServiceConfigBuilder};
 pub use error::ServiceError;

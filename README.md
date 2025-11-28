@@ -119,6 +119,7 @@ Run `xearthlayer --help` for all options.
 | [FUSE Filesystem](docs/FUSE_FILESYSTEM.md) | Virtual filesystem architecture and passthrough implementation |
 | [Parallel Processing](docs/PARALLEL_PROCESSING.md) | Thread pool architecture and request coalescing |
 | [Cache Design](docs/CACHE_DESIGN.md) | Two-tier caching strategy (memory + disk) |
+| [Network Statistics](docs/NETWORK_STATS.md) | Download metrics, bandwidth tracking, and periodic logging |
 | [DDS Implementation](docs/DDS_IMPLEMENTATION.md) | BC1/BC3 texture compression and mipmap generation |
 | [Coordinate System](docs/COORDINATE_SYSTEM.md) | Web Mercator projection and tile coordinate system |
 | [Design Principles](docs/DESIGN_PRINCIPLES.md) | SOLID principles and TDD guidelines |

@@ -2,12 +2,13 @@
 
 use super::config::ServiceConfig;
 use super::error::ServiceError;
+use super::network_logger::NetworkStatsLogger;
 use crate::cache::{Cache, CacheConfig, CacheSystem, NoOpCache};
 use crate::coord::to_tile_coords;
 use crate::fuse::{PassthroughFS, XEarthLayerFS};
 use crate::log::Logger;
 use crate::log_info;
-use crate::orchestrator::TileOrchestrator;
+use crate::orchestrator::{NetworkStats, TileOrchestrator};
 use crate::provider::{ProviderConfig, ProviderFactory, ReqwestClient};
 use crate::texture::{DdsTextureEncoder, TextureEncoder};
 use crate::tile::{
@@ -49,6 +50,9 @@ pub struct XEarthLayerService {
     cache: Arc<dyn Cache>,
     /// Logger for diagnostic output
     logger: Arc<dyn Logger>,
+    /// Network stats logger (keeps logger thread alive)
+    #[allow(dead_code)]
+    network_stats_logger: Option<NetworkStatsLogger>,
 }
 
 impl XEarthLayerService {
@@ -90,8 +94,12 @@ impl XEarthLayerService {
                 .with_mipmap_count(config.texture().mipmap_count()),
         );
 
-        // Create orchestrator with download config
-        let orchestrator = TileOrchestrator::with_config(provider, *config.download());
+        // Create network stats tracker
+        let network_stats = Arc::new(NetworkStats::new());
+
+        // Create orchestrator with download config and network stats
+        let orchestrator = TileOrchestrator::with_config(provider, *config.download())
+            .with_network_stats(network_stats.clone());
 
         // Create base tile generator
         let base_generator: Arc<dyn TileGenerator> = Arc::new(DefaultTileGenerator::new(
@@ -147,6 +155,13 @@ impl XEarthLayerService {
             Arc::new(NoOpCache::new(&provider_name))
         };
 
+        // Start network stats logger (uses same interval as cache stats: 60s)
+        let network_stats_logger = Some(NetworkStatsLogger::start(
+            network_stats,
+            logger.clone(),
+            60, // Log every 60 seconds
+        ));
+
         Ok(Self {
             config,
             provider_name,
@@ -154,6 +169,7 @@ impl XEarthLayerService {
             generator,
             cache,
             logger,
+            network_stats_logger,
         })
     }
 

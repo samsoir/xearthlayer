@@ -1,5 +1,6 @@
 //! Tile download orchestration implementation
 
+use super::stats::NetworkStats;
 use super::types::{ChunkResult, OrchestratorError};
 use crate::config::DownloadConfig;
 use crate::coord::TileCoord;
@@ -38,6 +39,8 @@ pub struct TileOrchestrator {
     timeout_secs: u64,
     max_retries_per_chunk: u32,
     max_parallel_downloads: usize,
+    /// Optional network stats for session-wide tracking
+    network_stats: Option<Arc<NetworkStats>>,
 }
 
 impl TileOrchestrator {
@@ -60,7 +63,17 @@ impl TileOrchestrator {
             timeout_secs,
             max_retries_per_chunk,
             max_parallel_downloads,
+            network_stats: None,
         }
+    }
+
+    /// Set network stats tracker for session-wide metrics.
+    ///
+    /// When set, the orchestrator will record download metrics (bytes, chunks,
+    /// retries, failures) to the provided stats tracker.
+    pub fn with_network_stats(mut self, stats: Arc<NetworkStats>) -> Self {
+        self.network_stats = Some(stats);
+        self
     }
 
     /// Creates a new TileOrchestrator with the given provider and configuration.
@@ -93,6 +106,7 @@ impl TileOrchestrator {
             timeout_secs: config.timeout_secs(),
             max_retries_per_chunk: config.max_retries(),
             max_parallel_downloads: config.parallel_downloads(),
+            network_stats: None,
         }
     }
 
@@ -139,6 +153,7 @@ impl TileOrchestrator {
         for batch in chunks.chunks(batch_size) {
             for chunk in batch {
                 let provider = Arc::clone(&self.provider);
+                let network_stats = self.network_stats.clone();
                 let tx = tx.clone();
                 let chunk_row = chunk.chunk_row;
                 let chunk_col = chunk.chunk_col;
@@ -156,8 +171,19 @@ impl TileOrchestrator {
                             break;
                         }
 
+                        // Record retry if not first attempt
+                        if attempt > 0 {
+                            if let Some(ref stats) = network_stats {
+                                stats.record_retry();
+                            }
+                        }
+
                         match provider.download_chunk(global_row, global_col, zoom) {
                             Ok(chunk_data) => {
+                                // Record success
+                                if let Some(ref stats) = network_stats {
+                                    stats.record_chunk_success(chunk_data.len());
+                                }
                                 data = Some(chunk_data);
                                 break;
                             }
@@ -166,7 +192,10 @@ impl TileOrchestrator {
                                 continue;
                             }
                             Err(_) => {
-                                // Final attempt failed
+                                // Final attempt failed - record failure
+                                if let Some(ref stats) = network_stats {
+                                    stats.record_chunk_failure();
+                                }
                                 break;
                             }
                         }
