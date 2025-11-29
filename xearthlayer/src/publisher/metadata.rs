@@ -10,7 +10,7 @@ use std::path::Path;
 use chrono::Utc;
 use semver::Version;
 
-use super::{PublishError, PublishResult, Repository};
+use super::{archive_filename, PublishError, PublishResult, Repository};
 use crate::package::{
     parse_package_metadata, serialize_package_metadata, ArchivePart, PackageMetadata, PackageType,
 };
@@ -219,7 +219,8 @@ pub fn generate_initial_metadata(
         .unwrap_or("unknown")
         .to_string();
 
-    let filename = format!("{}-{}.tar.gz", mountpoint, version);
+    // Use the archive_filename function for consistency with the archive builder
+    let filename = archive_filename(region, package_type, &version);
 
     let metadata = create_metadata(region, version, package_type, &mountpoint, &filename);
 
