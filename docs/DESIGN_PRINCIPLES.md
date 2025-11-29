@@ -41,7 +41,7 @@ All developers must use these Make targets instead of running commands directly:
 
 **Testing:**
 - `make test-unit` - Run unit tests only
-- `make test-integration` - Run integration tests only
+- `make integration-tests` - Run integration tests only (requires built binary)
 - `make coverage` - Generate coverage report
 
 **Release:**

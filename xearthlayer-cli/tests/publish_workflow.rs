@@ -2,6 +2,18 @@
 //!
 //! These tests validate the complete publishing pipeline using temporary
 //! directories and mock tile data structures that simulate Ortho4XP output.
+//!
+//! # Running Integration Tests
+//!
+//! Integration tests are excluded from regular test runs. Use:
+//! ```bash
+//! make integration-tests
+//! ```
+//!
+//! Or directly:
+//! ```bash
+//! cargo test --test '*' -- --ignored --nocapture
+//! ```
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -150,6 +162,7 @@ fn assert_success(output: &std::process::Output, context: &str) {
 }
 
 #[test]
+#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_init_creates_repository_structure() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let repo_path = temp.path().join("test-repo");
@@ -171,6 +184,7 @@ fn test_init_creates_repository_structure() {
 }
 
 #[test]
+#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_init_with_custom_part_size() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let repo_path = temp.path().join("test-repo");
@@ -194,6 +208,7 @@ fn test_init_with_custom_part_size() {
 }
 
 #[test]
+#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_scan_discovers_tiles() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let tiles_dir = temp.path().join("tiles");
@@ -222,6 +237,7 @@ fn test_scan_discovers_tiles() {
 }
 
 #[test]
+#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_scan_suggests_region() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let tiles_dir = temp.path().join("tiles");
@@ -246,6 +262,7 @@ fn test_scan_suggests_region() {
 }
 
 #[test]
+#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_full_workflow_init_scan_add() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let repo_path = temp.path().join("repo");
@@ -293,6 +310,7 @@ fn test_full_workflow_init_scan_add() {
 }
 
 #[test]
+#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_status_shows_package_info() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let repo_path = temp.path().join("repo");
@@ -335,6 +353,7 @@ fn test_status_shows_package_info() {
 }
 
 #[test]
+#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_validate_empty_repository() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let repo_path = temp.path().join("repo");
@@ -348,6 +367,7 @@ fn test_validate_empty_repository() {
 }
 
 #[test]
+#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_init_fails_on_existing_repository() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let repo_path = temp.path().join("repo");
@@ -365,6 +385,7 @@ fn test_init_fails_on_existing_repository() {
 }
 
 #[test]
+#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_add_fails_without_init() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let repo_path = temp.path().join("repo");
@@ -397,6 +418,7 @@ fn test_add_fails_without_init() {
 }
 
 #[test]
+#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_scan_fails_on_empty_directory() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let empty_dir = temp.path().join("empty");
@@ -418,6 +440,7 @@ fn test_scan_fails_on_empty_directory() {
 }
 
 #[test]
+#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_invalid_version_string_rejected() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let repo_path = temp.path().join("repo");
@@ -456,6 +479,7 @@ fn test_invalid_version_string_rejected() {
 }
 
 #[test]
+#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_multiple_packages_in_same_repository() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let repo_path = temp.path().join("repo");
@@ -529,6 +553,7 @@ fn test_multiple_packages_in_same_repository() {
 }
 
 #[test]
+#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_version_bump_workflow() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let repo_path = temp.path().join("repo");

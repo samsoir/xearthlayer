@@ -84,10 +84,11 @@ test-unit: ## Run unit tests only
 	@echo "$(BLUE)Running unit tests...$(NC)"
 	RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test $(CARGO_FLAGS) --lib -- --nocapture
 
-.PHONY: test-integration
-test-integration: ## Run integration tests only
+.PHONY: integration-tests
+integration-tests: build ## Run integration tests only (requires built binary)
 	@echo "$(BLUE)Running integration tests...$(NC)"
-	RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test $(CARGO_FLAGS) --test '*' -- --nocapture
+	RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test $(CARGO_FLAGS) --test '*' -- --ignored --nocapture
+	@echo "$(GREEN)Integration tests complete!$(NC)"
 
 .PHONY: test-doc
 test-doc: ## Run documentation tests

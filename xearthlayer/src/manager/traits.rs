@@ -133,6 +133,7 @@ mod tests {
     use std::sync::Arc;
 
     /// Mock library client for testing.
+    #[allow(dead_code)] // Will be used in Phase 6 implementation tests
     struct MockLibraryClient {
         library_response: Option<PackageLibrary>,
         metadata_response: Option<PackageMetadata>,
