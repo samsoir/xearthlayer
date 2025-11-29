@@ -752,6 +752,226 @@ pub fn encode_mipmap(&self, data: &[u8]) -> Vec<u8> { /* ... */ }
 pub fn encode_mipmap(&self, data: Vec<u8>) -> Vec<u8> { /* ... */ }
 ```
 
+## CLI Command Architecture
+
+When implementing CLI commands with multiple subcommands, use the **Command Pattern with Trait-Based Dependency Injection**. This pattern ensures handlers are testable, maintainable, and follow SOLID principles.
+
+### Pattern Overview
+
+```
+commands/<feature>/
+├── mod.rs        # Module exports and command dispatch
+├── traits.rs     # Core interfaces (Output, Service, CommandHandler)
+├── services.rs   # Concrete implementations wrapping library functions
+├── args.rs       # CLI argument types (clap-derived)
+├── handlers.rs   # Command handlers implementing business logic
+└── output.rs     # Shared output formatting utilities
+```
+
+### Core Traits
+
+#### 1. Output Trait
+
+Abstracts console output for testable handlers:
+
+```rust
+/// Abstracts user-facing output
+pub trait Output: Send + Sync {
+    fn println(&self, message: &str);
+    fn print(&self, message: &str);
+    fn newline(&self);
+    fn header(&self, title: &str);
+    fn indented(&self, message: &str);
+}
+
+/// Production implementation
+pub struct ConsoleOutput;
+
+impl Output for ConsoleOutput {
+    fn println(&self, message: &str) {
+        println!("{}", message);
+    }
+    // ...
+}
+```
+
+#### 2. Service Trait
+
+Abstracts library operations for dependency injection:
+
+```rust
+/// Abstracts all library operations
+pub trait FeatureService: Send + Sync {
+    fn operation_one(&self, args: Args) -> Result<Output, Error>;
+    fn operation_two(&self, args: Args) -> Result<Output, Error>;
+    // ...
+}
+
+/// Production implementation wrapping library
+pub struct DefaultFeatureService;
+
+impl FeatureService for DefaultFeatureService {
+    fn operation_one(&self, args: Args) -> Result<Output, Error> {
+        // Delegate to library function
+        library::operation_one(args)
+            .map_err(|e| Error::from(e))
+    }
+}
+```
+
+#### 3. CommandHandler Trait
+
+Uniform interface for all command handlers:
+
+```rust
+/// Each command handler implements this trait
+pub trait CommandHandler {
+    type Args;
+    fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError>;
+}
+```
+
+#### 4. CommandContext
+
+Bundles dependencies for injection:
+
+```rust
+/// Context providing dependencies to command handlers
+pub struct CommandContext<'a> {
+    pub output: &'a dyn Output,
+    pub service: &'a dyn FeatureService,
+}
+
+impl<'a> CommandContext<'a> {
+    pub fn new(output: &'a dyn Output, service: &'a dyn FeatureService) -> Self {
+        Self { output, service }
+    }
+}
+```
+
+### Handler Implementation
+
+Each handler focuses only on orchestration and output:
+
+```rust
+pub struct InitHandler;
+
+impl CommandHandler for InitHandler {
+    type Args = InitArgs;
+
+    fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
+        // Use service for operations
+        let result = ctx.service.initialize(&args.path)?;
+
+        // Use output for user feedback
+        ctx.output.println("Initialized successfully!");
+        ctx.output.indented(&format!("Location: {}", result.path.display()));
+
+        Ok(())
+    }
+}
+```
+
+### Command Dispatch
+
+The module's `run()` function creates the production context and dispatches:
+
+```rust
+pub fn run(command: Commands) -> Result<(), CliError> {
+    // Create production context
+    let output = ConsoleOutput::new();
+    let service = DefaultFeatureService::new();
+    let ctx = CommandContext::new(&output, &service);
+
+    // Dispatch to appropriate handler
+    match command {
+        Commands::Init { path } => InitHandler::execute(InitArgs { path }, &ctx),
+        Commands::List { verbose } => ListHandler::execute(ListArgs { verbose }, &ctx),
+        // ...
+    }
+}
+```
+
+### Testing Benefits
+
+Handlers can be tested with mock implementations:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockOutput {
+        messages: RefCell<Vec<String>>,
+    }
+
+    impl Output for MockOutput {
+        fn println(&self, message: &str) {
+            self.messages.borrow_mut().push(message.to_string());
+        }
+        // ...
+    }
+
+    struct MockService {
+        init_result: Result<InitResult, Error>,
+    }
+
+    impl FeatureService for MockService {
+        fn initialize(&self, _path: &Path) -> Result<InitResult, Error> {
+            self.init_result.clone()
+        }
+    }
+
+    #[test]
+    fn test_init_handler_success() {
+        let output = MockOutput::new();
+        let service = MockService::with_success();
+        let ctx = CommandContext::new(&output, &service);
+
+        let result = InitHandler::execute(InitArgs { path: PathBuf::from(".") }, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("Initialized successfully"));
+    }
+
+    #[test]
+    fn test_init_handler_failure() {
+        let output = MockOutput::new();
+        let service = MockService::with_error("disk full");
+        let ctx = CommandContext::new(&output, &service);
+
+        let result = InitHandler::execute(InitArgs { path: PathBuf::from(".") }, &ctx);
+
+        assert!(result.is_err());
+    }
+}
+```
+
+### Design Benefits
+
+| Benefit | Description |
+|---------|-------------|
+| **Single Responsibility** | Each handler owns one command's logic |
+| **Dependency Injection** | Handlers depend only on trait interfaces |
+| **Testability** | Handlers can be tested with mock implementations |
+| **Extensibility** | Adding commands means adding a handler file |
+| **Consistent Interface** | CommandHandler trait enforces uniform API |
+| **Separation of Concerns** | Output formatting separate from business logic |
+
+### When to Use This Pattern
+
+Use this CLI architecture when:
+- A command has **3+ subcommands**
+- Subcommands have **non-trivial logic**
+- You need **testable command handlers**
+- Multiple subcommands share **common dependencies**
+
+For simple commands with 1-2 subcommands and minimal logic, a simpler approach may suffice.
+
+### Reference Implementation
+
+See `xearthlayer-cli/src/commands/publish/` for the complete reference implementation used by the Publisher CLI.
+
 ## Summary
 
 1. **Follow SOLID principles** - Each component has clear responsibility and dependencies
@@ -761,5 +981,6 @@ pub fn encode_mipmap(&self, data: Vec<u8>) -> Vec<u8> { /* ... */ }
 5. **Maintain high coverage** - Minimum 80%, target 90%+
 6. **Handle errors gracefully** - Return `Result` for expected failures
 7. **Optimize judiciously** - Measure before optimizing
+8. **Use Command Pattern for CLI** - Trait-based DI for testable command handlers
 
 These principles ensure XEarthLayer remains maintainable, testable, and extensible as it grows.
