@@ -49,6 +49,7 @@ Foundation types and parsers used by both Publisher and Manager.
 - [x] `xearthlayer/src/package/types.rs`
 - [x] `xearthlayer/src/package/metadata.rs`
 - [x] `xearthlayer/src/package/library.rs`
+- [x] `xearthlayer/src/package/naming.rs` - Centralized naming (SRP)
 
 ### Dependencies Added
 
@@ -234,38 +235,75 @@ xearthlayer-cli/src/commands/publish/
 
 ---
 
-## Phase 5: Create Test Package
+## Phase 5: Publisher Testing & Verification ✓
 
-Use Publisher to create real North America ortho package from California Ortho4XP data.
+Manual verification of Publisher CLI with real Ortho4XP data, plus integration tests.
 
-### Tasks
+### Stage 1: Manual Verification ✓
 
-- [ ] Initialize test repository
-- [ ] Process California tiles into NA ortho package
-- [ ] Build archives
-- [ ] Configure test URLs (local filesystem or test server)
-- [ ] Generate library index
-- [ ] Verify package structure
+Tested complete workflow with real California Ortho4XP data:
 
-### Deliverable
+- [x] Initialize test repository (`xearthlayer publish init`)
+- [x] Scan tiles (62 tiles discovered)
+- [x] Add package with region/type/version
+- [x] Build archives (split into 3 parts)
+- [x] Configure URLs (local HTTP server for testing)
+- [x] Check status (workflow state machine)
+- [x] Release to library index
+- [x] Validate repository structure
 
-- [ ] Working NA ortho package for Manager testing
+### Stage 2: Integration Tests ✓
+
+- [x] Create integration test suite (`xearthlayer-cli/tests/publish_workflow.rs`)
+- [x] 13 integration tests covering full Publisher CLI workflow
+- [x] MockTileBuilder for creating Ortho4XP-like tile structures
+- [x] Tests excluded from regular `make test` via `#[ignore]` attribute
+- [x] Run integration tests with `make integration-tests`
+
+### Files Added
+
+- [x] `xearthlayer-cli/tests/publish_workflow.rs` - Integration tests
+
+### Bug Fixes
+
+- [x] Fixed archive filename mismatch (`zzXEL_na-0.1.0.tar.gz` → `zzXEL_na_ortho-0.1.0.tar.gz`)
+- [x] Created centralized naming module for SRP compliance
 
 ---
 
-## Phase 6: Package Manager - Read Operations
+## Phase 6: Package Manager - Read Operations [~]
 
 Discover and compare packages.
 
+### Module Groundwork ✓
+
+- [x] Create manager module structure
+- [x] Define error types (`ManagerError`, `ManagerResult`)
+- [x] Define configuration (`ManagerConfig` with builder pattern)
+- [x] Define traits for dependency injection:
+  - [x] `LibraryClient` - Fetch library indexes and metadata
+  - [x] `PackageDownloader` - Download archive parts
+  - [x] `ArchiveExtractor` - Extract archives
+- [x] Local package store (`LocalPackageStore`, `InstalledPackage`)
+
+### Files Added
+
+- [x] `xearthlayer/src/manager/mod.rs`
+- [x] `xearthlayer/src/manager/error.rs`
+- [x] `xearthlayer/src/manager/config.rs`
+- [x] `xearthlayer/src/manager/traits.rs`
+- [x] `xearthlayer/src/manager/local.rs`
+
 ### Local Package Discovery
 
-- [ ] Scan install location for packages
+- [x] Scan install location for packages (basic structure in `LocalPackageStore`)
 - [ ] Parse package metadata files
 - [ ] Build installed packages state
 - [ ] Track mount status for ortho packages
 
 ### Remote Library Fetching
 
+- [ ] Implement `LibraryClient` trait (HTTP client)
 - [ ] Fetch library index from `library_root`
 - [ ] Parse library index
 - [ ] Cache with TTL
@@ -276,13 +314,6 @@ Discover and compare packages.
 - [ ] Compare local vs remote versions
 - [ ] Identify available updates
 - [ ] Sequence number comparison for quick check
-
-### Files
-
-- [ ] `xearthlayer/src/manager/mod.rs`
-- [ ] `xearthlayer/src/manager/scanner.rs`
-- [ ] `xearthlayer/src/manager/library_client.rs`
-- [ ] `xearthlayer/src/manager/updates.rs`
 
 ---
 
@@ -418,11 +449,11 @@ Phase 3 (Publisher Archive - Ortho) ✓
     ↓
 Phase 4 (Publisher CLI) ✓
     ↓
-Phase 5 (Test Ortho Package)
+Phase 5 (Publisher Testing) ✓
+    ↓
+Phase 6 (Manager Read) [~] ←── Currently in progress (groundwork done)
     ↓
 Phase 3b (Publisher - Overlay Support)
-    ↓
-Phase 6 (Manager Read) ←── Test packages ready
     ↓
 Phase 7 (Manager Install)
     ↓
@@ -435,7 +466,7 @@ Phase 10 (Config/Polish)
 Phase 11 (Integration Tests)
 ```
 
-**Note:** Phase 3b (Overlay Support) is sequenced after Phase 5 to allow end-to-end testing of the ortho pipeline before adding overlay complexity. The Manager (Phase 6+) will support both package types from the start.
+**Note:** Phase 3b (Overlay Support) has been moved after Phase 6 groundwork. The Manager traits and structures are designed to support both package types from the start.
 
 ---
 
@@ -487,6 +518,10 @@ Record significant decisions made during implementation:
 | 2025-11-28 | Command Pattern for CLI | Separates concerns - handlers own logic, services abstract library, traits enable testing |
 | 2025-11-28 | Trait-based dependency injection | Handlers depend on Output/PublisherService interfaces, not implementations |
 | 2025-11-28 | CommandContext bundles dependencies | Single injection point for handler dependencies |
+| 2025-11-29 | Centralized naming module | SRP compliance - `naming.rs` is single source for mountpoint/archive filenames |
+| 2025-11-29 | `_ortho`/`_overlay` suffix in all names | Consistent naming: `zzXEL_na_ortho`, `zzXEL_na_ortho-1.0.0.tar.gz` |
+| 2025-11-29 | Integration tests use `#[ignore]` | Run with `make integration-tests`, excluded from regular `make test` |
+| 2025-11-29 | Manager traits for DI | `LibraryClient`, `PackageDownloader`, `ArchiveExtractor` enable testing |
 
 ---
 
