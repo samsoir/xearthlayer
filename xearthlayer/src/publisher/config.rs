@@ -152,7 +152,7 @@ impl RepoConfig {
 /// Parse a size string with optional suffix (K, M, G).
 ///
 /// Examples: "500M", "1G", "500000000"
-fn parse_size(s: &str) -> Result<u64, String> {
+pub fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty string".to_string());

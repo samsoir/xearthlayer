@@ -14,6 +14,7 @@
 //! Settings are loaded from `~/.xearthlayer/config.ini` on startup.
 //! CLI arguments override config file values when specified.
 
+mod commands;
 mod error;
 mod runner;
 
@@ -114,6 +115,12 @@ enum Commands {
         action: CacheAction,
     },
 
+    /// Package publisher commands (create and manage scenery packages)
+    Publish {
+        #[command(subcommand)]
+        command: commands::publish::PublishCommands,
+    },
+
     /// Start XEarthLayer with a scenery pack (passthrough for real files, on-demand DDS generation)
     Start {
         /// Source scenery pack directory to overlay
@@ -199,6 +206,7 @@ fn main() {
     let result = match cli.command {
         Commands::Init => run_init(),
         Commands::Cache { action } => run_cache(action),
+        Commands::Publish { command } => commands::publish::run(command),
         Commands::Start {
             source,
             mountpoint,

@@ -29,6 +29,8 @@ pub enum CliError {
     CacheClear(String),
     /// Failed to get cache stats
     CacheStats(String),
+    /// Publisher error
+    Publish(String),
 }
 
 impl CliError {
@@ -59,6 +61,10 @@ impl CliError {
                     "  3. Mountpoint in use: Try unmounting with: fusermount -u <mountpoint>"
                 );
             }
+            CliError::Publish(_) => {
+                eprintln!();
+                eprintln!("Run 'xearthlayer publish --help' for usage information.");
+            }
             _ => {}
         }
 
@@ -80,6 +86,7 @@ impl fmt::Display for CliError {
             CliError::Serve(e) => write!(f, "FUSE server error: {}", e),
             CliError::CacheClear(msg) => write!(f, "Failed to clear cache: {}", msg),
             CliError::CacheStats(msg) => write!(f, "Failed to get cache stats: {}", msg),
+            CliError::Publish(msg) => write!(f, "Publisher error: {}", msg),
         }
     }
 }

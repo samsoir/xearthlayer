@@ -54,7 +54,8 @@ pub use archive::{
     ArchivePart,
 };
 pub use config::{
-    read_config, write_config, RepoConfig, DEFAULT_PART_SIZE, MAX_PART_SIZE, MIN_PART_SIZE,
+    parse_size, read_config, write_config, RepoConfig, DEFAULT_PART_SIZE, MAX_PART_SIZE,
+    MIN_PART_SIZE,
 };
 pub use error::{PublishError, PublishResult};
 pub use library::{LibraryManager, DEFAULT_SCOPE, LIBRARY_FILENAME, SPEC_VERSION};
