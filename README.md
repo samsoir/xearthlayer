@@ -124,6 +124,16 @@ Run `xearthlayer --help` for all options.
 | [Coordinate System](docs/COORDINATE_SYSTEM.md) | Web Mercator projection and tile coordinate system |
 | [Design Principles](docs/DESIGN_PRINCIPLES.md) | SOLID principles and TDD guidelines |
 
+### Scenery Package System (In Development)
+
+| Document | Description |
+|----------|-------------|
+| [Scenery Overview](docs/SCENERY_OVERVIEW.md) | High-level system architecture and concepts |
+| [Package Specification](docs/SCENERY_PACKAGES.md) | File formats and naming conventions |
+| [Package Manager](docs/PACKAGE_MANAGER.md) | Downloading and installing packages |
+| [Package Publisher](docs/PACKAGE_PUBLISHER.md) | Creating and publishing packages |
+| [Implementation Plan](docs/SCENERY_PACKAGE_PLAN.md) | Development roadmap and progress |
+
 ## Known Issues
 
 See [TODO.md](TODO.md) for current bugs and planned enhancements.
