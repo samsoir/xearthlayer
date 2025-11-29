@@ -15,39 +15,45 @@ The implementation is divided into phases, with the Publisher built first to gen
 
 ---
 
-## Phase 1: Core Data Structures & Parsing
+## Phase 1: Core Data Structures & Parsing ✓
 
 Foundation types and parsers used by both Publisher and Manager.
 
 ### Data Types
 
-- [ ] `Region` enum (Africa, Antarctica, Asia, Australia, Europe, NorthAmerica, SouthAmerica)
-- [ ] `PackageType` enum (Ortho, Overlay)
-- [ ] `Version` struct (semver parsing and comparison)
-- [ ] `PackageMetadata` struct (parsed from `xearthlayer_scenery_package.txt`)
-- [ ] `PackageLibrary` struct (parsed from `xearthlayer_package_library.txt`)
-- [ ] `ArchivePart` struct (checksum, local filename, remote URL)
+- [x] `PackageType` enum (Ortho, Overlay) - type code, sort prefix, folder suffix
+- [x] `ArchivePart` struct (checksum, local filename, remote URL)
+- [x] `PackageMetadata` struct (parsed from `xearthlayer_scenery_package.txt`)
+- [x] `PackageLibrary` struct (parsed from `xearthlayer_package_library.txt`)
+- [x] `LibraryEntry` struct (checksum, type, title, version, metadata URL)
+- [x] Re-export `semver::Version` for package versioning
+
+**Design Decision**: Region is a flexible `String` field (not enum) to allow publishers to define their own regional groupings.
 
 ### Parsers
 
-- [ ] `parse_package_metadata()` - Parse `xearthlayer_scenery_package.txt`
-- [ ] `serialize_package_metadata()` - Write `xearthlayer_scenery_package.txt`
-- [ ] `parse_package_library()` - Parse `xearthlayer_package_library.txt`
-- [ ] `serialize_package_library()` - Write `xearthlayer_package_library.txt`
+- [x] `parse_package_metadata()` - Parse `xearthlayer_scenery_package.txt`
+- [x] `serialize_package_metadata()` - Write `xearthlayer_scenery_package.txt`
+- [x] `parse_package_library()` - Parse `xearthlayer_package_library.txt`
+- [x] `serialize_package_library()` - Write `xearthlayer_package_library.txt`
 
 ### Tests
 
-- [ ] Unit tests for all parsers with sample data
-- [ ] Round-trip tests (parse → serialize → parse)
-- [ ] Error handling tests (malformed input)
+- [x] Unit tests for all parsers with sample data
+- [x] Round-trip tests (parse → serialize → parse)
+- [x] Error handling tests (malformed input)
 
 ### Files
 
-- [ ] `xearthlayer/src/package/mod.rs`
-- [ ] `xearthlayer/src/package/types.rs`
-- [ ] `xearthlayer/src/package/metadata.rs`
-- [ ] `xearthlayer/src/package/library.rs`
-- [ ] `xearthlayer/src/package/version.rs`
+- [x] `xearthlayer/src/package/mod.rs`
+- [x] `xearthlayer/src/package/types.rs`
+- [x] `xearthlayer/src/package/metadata.rs`
+- [x] `xearthlayer/src/package/library.rs`
+
+### Dependencies Added
+
+- `semver = "1.0"` - Semantic versioning
+- `chrono = { version = "0.4", default-features = false, features = ["std"] }` - UTC timestamps
 
 ---
 
@@ -371,6 +377,8 @@ Record significant decisions made during implementation:
 | 2025-11-28 | Symlinks for overlays | No FUSE overhead for static content |
 | 2025-11-28 | Scan-based state (no index) | Self-healing, single source of truth |
 | 2025-11-28 | Multi-mount (one per region) | Simpler than merged filesystem |
+| 2025-11-28 | Region as String not enum | Allows publishers to define custom regional groupings |
+| 2025-11-28 | Use semver crate | Less code to maintain, standard implementation |
 
 ---
 

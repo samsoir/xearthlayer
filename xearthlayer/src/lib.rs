@@ -24,6 +24,7 @@ pub mod fuse;
 pub mod log;
 pub mod logging;
 pub mod orchestrator;
+pub mod package;
 pub mod provider;
 pub mod service;
 pub mod texture;
