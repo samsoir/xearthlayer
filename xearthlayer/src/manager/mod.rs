@@ -38,12 +38,16 @@
 //! let installed = manager.list_installed()?;
 //! ```
 
+mod client;
 mod config;
 mod error;
 mod local;
 mod traits;
+mod updates;
 
+pub use client::HttpLibraryClient;
 pub use config::ManagerConfig;
 pub use error::{ManagerError, ManagerResult};
 pub use local::{InstalledPackage, LocalPackageStore};
 pub use traits::{LibraryClient, PackageDownloader};
+pub use updates::{PackageInfo, PackageStatus, UpdateChecker};

@@ -293,27 +293,31 @@ Discover and compare packages.
 - [x] `xearthlayer/src/manager/config.rs`
 - [x] `xearthlayer/src/manager/traits.rs`
 - [x] `xearthlayer/src/manager/local.rs`
+- [x] `xearthlayer/src/manager/client.rs` - HTTP library client
+- [x] `xearthlayer/src/manager/updates.rs` - Update detection
 
-### Local Package Discovery
+### Local Package Discovery ✓
 
-- [x] Scan install location for packages (basic structure in `LocalPackageStore`)
-- [ ] Parse package metadata files
-- [ ] Build installed packages state
+- [x] Scan install location for packages (`LocalPackageStore`)
+- [x] Parse package metadata files
+- [x] Build installed packages state (`InstalledPackage`)
 - [ ] Track mount status for ortho packages
 
-### Remote Library Fetching
+### Remote Library Fetching ✓
 
-- [ ] Implement `LibraryClient` trait (HTTP client)
-- [ ] Fetch library index from `library_root`
-- [ ] Parse library index
+- [x] Implement `LibraryClient` trait (`HttpLibraryClient`)
+- [x] Fetch library index from URL
+- [x] Parse library index
 - [ ] Cache with TTL
 - [ ] Force refresh option
 
-### Update Detection
+### Update Detection ✓
 
-- [ ] Compare local vs remote versions
-- [ ] Identify available updates
-- [ ] Sequence number comparison for quick check
+- [x] Compare local vs remote versions (`UpdateChecker`)
+- [x] Identify available updates (`list_updates()`)
+- [x] `PackageStatus` enum (UpToDate, UpdateAvailable, NotInstalled, Orphaned)
+- [x] `PackageInfo` struct with version info
+- [x] Merge multiple library sources
 
 ---
 

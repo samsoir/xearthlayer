@@ -36,6 +36,17 @@ pub struct PackageLibrary {
 }
 
 impl PackageLibrary {
+    /// Create a new empty package library.
+    pub fn new() -> Self {
+        Self {
+            spec_version: Version::new(1, 0, 0),
+            scope: "EARTH".to_string(),
+            sequence: 0,
+            published_at: Utc::now(),
+            entries: Vec::new(),
+        }
+    }
+
     /// Find an entry by region and package type.
     pub fn find(&self, region: &str, package_type: PackageType) -> Option<&LibraryEntry> {
         self.entries
@@ -57,6 +68,12 @@ impl PackageLibrary {
         regions.sort();
         regions.dedup();
         regions
+    }
+}
+
+impl Default for PackageLibrary {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
