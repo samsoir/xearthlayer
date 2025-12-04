@@ -271,7 +271,7 @@ Tested complete workflow with real California Ortho4XP data:
 
 ---
 
-## Phase 6: Package Manager - Read Operations [~]
+## Phase 6: Package Manager - Read Operations ✓
 
 Discover and compare packages.
 
@@ -295,21 +295,22 @@ Discover and compare packages.
 - [x] `xearthlayer/src/manager/local.rs`
 - [x] `xearthlayer/src/manager/client.rs` - HTTP library client
 - [x] `xearthlayer/src/manager/updates.rs` - Update detection
+- [x] `xearthlayer/src/manager/cache.rs` - Library caching with TTL
 
 ### Local Package Discovery ✓
 
 - [x] Scan install location for packages (`LocalPackageStore`)
 - [x] Parse package metadata files
 - [x] Build installed packages state (`InstalledPackage`)
-- [ ] Track mount status for ortho packages
+- [x] Track mount status for ortho packages (`MountStatus` enum)
 
 ### Remote Library Fetching ✓
 
 - [x] Implement `LibraryClient` trait (`HttpLibraryClient`)
 - [x] Fetch library index from URL
 - [x] Parse library index
-- [ ] Cache with TTL
-- [ ] Force refresh option
+- [x] Cache with TTL (`CachedLibraryClient`)
+- [x] Force refresh option (`fetch_fresh()`, `invalidate()`, `clear_cache()`)
 
 ### Update Detection ✓
 
@@ -455,11 +456,11 @@ Phase 4 (Publisher CLI) ✓
     ↓
 Phase 5 (Publisher Testing) ✓
     ↓
-Phase 6 (Manager Read) [~] ←── Currently in progress (groundwork done)
+Phase 6 (Manager Read) ✓
     ↓
 Phase 3b (Publisher - Overlay Support)
     ↓
-Phase 7 (Manager Install)
+Phase 7 (Manager Install) ←── Next
     ↓
 Phase 8 (Manager CLI)
     ↓
@@ -470,7 +471,7 @@ Phase 10 (Config/Polish)
 Phase 11 (Integration Tests)
 ```
 
-**Note:** Phase 3b (Overlay Support) has been moved after Phase 6 groundwork. The Manager traits and structures are designed to support both package types from the start.
+**Note:** Phase 3b (Overlay Support) can be done at any point. The Manager is designed to support both package types from the start.
 
 ---
 
@@ -526,6 +527,9 @@ Record significant decisions made during implementation:
 | 2025-11-29 | `_ortho`/`_overlay` suffix in all names | Consistent naming: `zzXEL_na_ortho`, `zzXEL_na_ortho-1.0.0.tar.gz` |
 | 2025-11-29 | Integration tests use `#[ignore]` | Run with `make integration-tests`, excluded from regular `make test` |
 | 2025-11-29 | Manager traits for DI | `LibraryClient`, `PackageDownloader`, `ArchiveExtractor` enable testing |
+| 2025-12-03 | CachedLibraryClient decorator | Wraps any LibraryClient with TTL-based caching; thread-safe |
+| 2025-12-03 | MountStatus enum | Tracks ortho package mount state (Mounted/NotMounted/Unknown) via /proc/mounts |
+| 2025-12-03 | PackageStatus enum | UpToDate, UpdateAvailable, NotInstalled, Orphaned for version comparison |
 
 ---
 

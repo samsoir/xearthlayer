@@ -38,6 +38,7 @@
 //! let installed = manager.list_installed()?;
 //! ```
 
+mod cache;
 mod client;
 mod config;
 mod error;
@@ -45,9 +46,10 @@ mod local;
 mod traits;
 mod updates;
 
+pub use cache::{CacheStats, CachedLibraryClient};
 pub use client::HttpLibraryClient;
 pub use config::ManagerConfig;
 pub use error::{ManagerError, ManagerResult};
-pub use local::{InstalledPackage, LocalPackageStore};
+pub use local::{InstalledPackage, LocalPackageStore, MountStatus};
 pub use traits::{LibraryClient, PackageDownloader};
 pub use updates::{PackageInfo, PackageStatus, UpdateChecker};

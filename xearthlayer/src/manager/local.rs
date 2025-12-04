@@ -9,6 +9,24 @@ use crate::package::{self, parse_package_metadata, PackageMetadata, PackageType}
 
 use super::{ManagerError, ManagerResult};
 
+/// Mount status for ortho packages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountStatus {
+    /// Package is mounted (FUSE filesystem active).
+    Mounted,
+    /// Package is not mounted.
+    NotMounted,
+    /// Mount status unknown (not applicable or couldn't determine).
+    Unknown,
+}
+
+impl MountStatus {
+    /// Returns true if the package is mounted.
+    pub fn is_mounted(&self) -> bool {
+        matches!(self, Self::Mounted)
+    }
+}
+
 /// Information about an installed package.
 #[derive(Debug, Clone)]
 pub struct InstalledPackage {
@@ -18,6 +36,8 @@ pub struct InstalledPackage {
     pub path: PathBuf,
     /// Size of the package on disk (bytes).
     pub size_bytes: u64,
+    /// Mount status (for ortho packages).
+    pub mount_status: MountStatus,
 }
 
 impl InstalledPackage {
@@ -105,11 +125,13 @@ impl LocalPackageStore {
         })?;
 
         let size_bytes = calculate_dir_size(&package_dir).unwrap_or(0);
+        let mount_status = check_mount_status(&package_dir, package_type);
 
         Ok(InstalledPackage {
             metadata,
             path: package_dir,
             size_bytes,
+            mount_status,
         })
     }
 
@@ -142,10 +164,12 @@ impl LocalPackageStore {
             if let Ok(content) = fs::read_to_string(&metadata_path) {
                 if let Ok(metadata) = parse_package_metadata(&content) {
                     let size_bytes = calculate_dir_size(&path).unwrap_or(0);
+                    let mount_status = check_mount_status(&path, metadata.package_type);
                     packages.push(InstalledPackage {
                         metadata,
                         path,
                         size_bytes,
+                        mount_status,
                     });
                 }
             }
@@ -225,6 +249,41 @@ fn calculate_dir_size(path: &Path) -> std::io::Result<u64> {
     }
 
     Ok(total)
+}
+
+/// Check if a package directory is mounted.
+///
+/// Only ortho packages can be mounted (via FUSE). Overlay packages
+/// return `Unknown` since they don't use FUSE mounts.
+fn check_mount_status(path: &Path, package_type: PackageType) -> MountStatus {
+    // Only ortho packages can be mounted
+    if package_type != PackageType::Ortho {
+        return MountStatus::Unknown;
+    }
+
+    // On Linux, check /proc/mounts for the path
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+            let path_str = path.to_string_lossy();
+            for line in mounts.lines() {
+                // /proc/mounts format: device mountpoint type options dump pass
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 && parts[1] == path_str {
+                    return MountStatus::Mounted;
+                }
+            }
+            return MountStatus::NotMounted;
+        }
+    }
+
+    // On other platforms, return Unknown
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path; // Suppress unused warning
+    }
+
+    MountStatus::Unknown
 }
 
 #[cfg(test)]
@@ -312,6 +371,9 @@ mod tests {
         assert_eq!(package.package_type(), PackageType::Ortho);
         assert_eq!(package.version(), &Version::new(1, 0, 0));
         assert!(package.size_bytes > 0);
+        // Not actually mounted, so should be NotMounted on Linux
+        #[cfg(target_os = "linux")]
+        assert_eq!(package.mount_status, MountStatus::NotMounted);
     }
 
     #[test]
@@ -381,5 +443,24 @@ mod tests {
 
         let path = store.install_path("na", PackageType::Ortho);
         assert!(path.ends_with("zzXEL_na_ortho"));
+    }
+
+    #[test]
+    fn test_mount_status_overlay_unknown() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+
+        create_mock_package(temp.path(), "na", PackageType::Overlay, "1.0.0");
+
+        let package = store.get("na", PackageType::Overlay).unwrap();
+        // Overlay packages don't use FUSE mounts
+        assert_eq!(package.mount_status, MountStatus::Unknown);
+    }
+
+    #[test]
+    fn test_mount_status_is_mounted() {
+        assert!(MountStatus::Mounted.is_mounted());
+        assert!(!MountStatus::NotMounted.is_mounted());
+        assert!(!MountStatus::Unknown.is_mounted());
     }
 }
