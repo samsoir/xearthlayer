@@ -26,9 +26,18 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// let client = HttpLibraryClient::new();
 /// let library = client.fetch_library("https://example.com/library.txt")?;
 /// ```
+#[derive(Clone)]
 pub struct HttpLibraryClient {
     client: Client,
     timeout: Duration,
+}
+
+impl std::fmt::Debug for HttpLibraryClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpLibraryClient")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl Default for HttpLibraryClient {

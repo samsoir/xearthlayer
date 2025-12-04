@@ -31,6 +31,8 @@ pub enum CliError {
     CacheStats(String),
     /// Publisher error
     Publish(String),
+    /// Package manager error
+    Packages(String),
 }
 
 impl CliError {
@@ -65,6 +67,10 @@ impl CliError {
                 eprintln!();
                 eprintln!("Run 'xearthlayer publish --help' for usage information.");
             }
+            CliError::Packages(_) => {
+                eprintln!();
+                eprintln!("Run 'xearthlayer packages --help' for usage information.");
+            }
             _ => {}
         }
 
@@ -87,6 +93,7 @@ impl fmt::Display for CliError {
             CliError::CacheClear(msg) => write!(f, "Failed to clear cache: {}", msg),
             CliError::CacheStats(msg) => write!(f, "Failed to get cache stats: {}", msg),
             CliError::Publish(msg) => write!(f, "Publisher error: {}", msg),
+            CliError::Packages(msg) => write!(f, "Package manager error: {}", msg),
         }
     }
 }

@@ -384,22 +384,41 @@ Download and install packages.
 
 ---
 
-## Phase 8: Package Manager CLI
+## Phase 8: Package Manager CLI ✓
 
 Command-line interface for Manager.
 
 ### Commands
 
-- [ ] `xearthlayer packages list`
-- [ ] `xearthlayer packages check`
-- [ ] `xearthlayer packages install <region> [--type]`
-- [ ] `xearthlayer packages update [<region>] [--all]`
-- [ ] `xearthlayer packages remove <region> [--type]`
-- [ ] `xearthlayer packages info <region>`
+- [x] `xearthlayer packages list [--verbose]`
+- [x] `xearthlayer packages check --library-url <url>`
+- [x] `xearthlayer packages install <region> --type <ortho|overlay> --library-url <url>`
+- [x] `xearthlayer packages update [--region <region>] [--type <type>] [--all] --library-url <url>`
+- [x] `xearthlayer packages remove <region> --type <ortho|overlay> [--force]`
+- [x] `xearthlayer packages info <region> --type <ortho|overlay>`
+
+### Architecture
+
+```
+xearthlayer-cli/src/commands/packages/
+├── mod.rs        # Module exports and command dispatch
+├── traits.rs     # Core interfaces (Output, PackageManagerService, UserInteraction)
+├── services.rs   # Concrete implementations wrapping xearthlayer manager
+├── args.rs       # CLI argument types and parsing (clap-derived)
+└── handlers.rs   # Command handlers implementing business logic
+```
 
 ### Files
 
-- [ ] `xearthlayer-cli/src/commands/packages.rs`
+- [x] `xearthlayer-cli/src/commands/packages/mod.rs`
+- [x] `xearthlayer-cli/src/commands/packages/traits.rs`
+- [x] `xearthlayer-cli/src/commands/packages/services.rs`
+- [x] `xearthlayer-cli/src/commands/packages/args.rs`
+- [x] `xearthlayer-cli/src/commands/packages/handlers.rs`
+
+### Notes
+
+Follows same Command Pattern architecture as Publisher CLI with trait-based dependency injection for testability.
 
 ---
 
@@ -488,9 +507,9 @@ Phase 3b (Publisher - Overlay Support) ✓
     ↓
 Phase 7 (Manager Install) ✓
     ↓
-Phase 8 (Manager CLI) ←── Next
+Phase 8 (Manager CLI) ✓
     ↓
-Phase 9 (Multi-Mount)
+Phase 9 (Multi-Mount) ←── Next
     ↓
 Phase 10 (Config/Polish)
     ↓

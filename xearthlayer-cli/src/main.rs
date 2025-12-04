@@ -121,6 +121,12 @@ enum Commands {
         command: commands::publish::PublishCommands,
     },
 
+    /// Package manager commands (install and manage scenery packages)
+    Packages {
+        #[command(subcommand)]
+        command: commands::packages::PackagesCommands,
+    },
+
     /// Start XEarthLayer with a scenery pack (passthrough for real files, on-demand DDS generation)
     Start {
         /// Source scenery pack directory to overlay
@@ -207,6 +213,7 @@ fn main() {
         Commands::Init => run_init(),
         Commands::Cache { action } => run_cache(action),
         Commands::Publish { command } => commands::publish::run(command),
+        Commands::Packages { command } => commands::packages::run(command),
         Commands::Start {
             source,
             mountpoint,
