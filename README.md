@@ -1,59 +1,72 @@
 # XEarthLayer
 
-High-quality satellite imagery for X-Plane, on demand.
+High-quality satellite imagery for X-Plane, streamed on demand.
 
-XEarthLayer provides two ways to get satellite scenery into X-Plane:
+## What It Does
 
-1. **Scenery Packages** - Download pre-built regional packages (easiest)
-2. **Live Streaming** - Stream imagery in real-time as you fly
+XEarthLayer delivers satellite/aerial imagery to X-Plane without massive downloads. Instead of pre-downloading hundreds of gigabytes of textures, XEarthLayer:
+
+1. **Installs small regional packages** (megabytes) containing terrain definitions
+2. **Streams textures on-demand** as you fly, generating them from satellite imagery providers
+
+The result: complete orthophoto scenery with minimal disk usage and no lengthy initial downloads.
+
+## How It Works
+
+```
+Regional Package (small)          XEarthLayer Service (running)
+┌────────────────────────┐        ┌────────────────────────┐
+│ Terrain definitions    │        │ Satellite Providers    │
+│ (DSF, TER files)       │───────→│ (Bing, Google)         │
+│ References textures    │        │                        │
+│ that don't exist       │        │ Generates DDS textures │
+└────────────────────────┘        │ on-demand              │
+                                  └────────────────────────┘
+                                             │
+                                             ▼
+                                  ┌────────────────────────┐
+                                  │ X-Plane sees complete  │
+                                  │ scenery with textures  │
+                                  └────────────────────────┘
+```
+
+See [How It Works](docs/how-it-works.md) for detailed architecture.
 
 ## Features
 
-- Install scenery packages with a single command
-- Stream satellite imagery on-demand from Bing Maps or Google Maps
-- Two-tier caching (memory + disk) for instant subsequent loads
-- High-quality DDS textures with mipmap chains
+- Small regional packages (megabytes, not gigabytes)
+- On-demand texture streaming from Bing Maps or Google Maps
+- Two-tier caching for instant repeat visits
+- High-quality BC1/BC3 DDS textures with mipmaps
 - Works with Ortho4XP-generated scenery
 - Linux support (Windows and macOS planned)
 
 ## Quick Start
 
-### Install from Source
-
 ```bash
+# Build from source
 git clone https://github.com/youruser/xearthlayer.git
 cd xearthlayer
 make release
-```
 
-### Initialize Configuration
-
-```bash
+# Initialize configuration
 xearthlayer init
-```
 
-This creates `~/.xearthlayer/config.ini` with sensible defaults.
-
-### Install a Scenery Package
-
-```bash
-# Configure your package library
-# Edit ~/.xearthlayer/config.ini and set:
+# Configure your package library in ~/.xearthlayer/config.ini:
 # [packages]
 # library_url = https://example.com/xearthlayer_package_library.txt
 
-# Check available packages
-xearthlayer packages check
-
-# Install a package
+# Install a regional package
 xearthlayer packages install eu-paris
+
+# Start the streaming service
+xearthlayer start --source "Custom Scenery/zzXEL_eu-paris_ortho"
+
+# Add the _xel mount point to X-Plane's scenery_packs.ini
+# Fly!
 ```
 
-### Or Stream Live
-
-```bash
-xearthlayer start --source /path/to/scenery
-```
+See [Getting Started](docs/getting-started.md) for the complete guide.
 
 ## Documentation
 
@@ -61,46 +74,37 @@ xearthlayer start --source /path/to/scenery
 
 | Guide | Description |
 |-------|-------------|
-| [Getting Started](docs/getting-started.md) | First-time setup and basic usage |
+| [How It Works](docs/how-it-works.md) | Architecture and system overview |
+| [Getting Started](docs/getting-started.md) | First-time setup and usage |
 | [Configuration](docs/configuration.md) | All configuration options |
 | [Package Management](docs/package-management.md) | Installing, updating, removing packages |
-| [Running the Service](docs/running-service.md) | Live streaming mode |
+| [Running the Service](docs/running-service.md) | Streaming service options |
 | [Content Publishing](docs/content-publishing.md) | Create packages from Ortho4XP |
 
 ### Developer Documentation
 
-| Document | Description |
-|----------|-------------|
-| [Design Principles](docs/dev/design-principles.md) | SOLID principles and TDD guidelines |
-| [Architecture](docs/dev/architecture.md) | System overview and module dependencies |
-| [Coordinate System](docs/dev/coordinate-system.md) | Web Mercator projection and tile math |
-| [DDS Implementation](docs/dev/dds-implementation.md) | Texture compression details |
-| [FUSE Filesystem](docs/dev/fuse-filesystem.md) | Virtual filesystem implementation |
-| [Cache Design](docs/dev/cache-design.md) | Two-tier caching strategy |
-| [Parallel Processing](docs/dev/parallel-processing.md) | Thread pool and request coalescing |
+See [Developer Documentation](docs/dev/) for architecture, design principles, and implementation details.
 
 ## CLI Reference
 
 ```bash
-# Configuration
-xearthlayer init                    # Create config file
+# Setup
+xearthlayer init                      # Create config file
 
 # Package Management
-xearthlayer packages check          # Check for available/updates
-xearthlayer packages list           # List installed packages
-xearthlayer packages install <region>   # Install a package
-xearthlayer packages update [region]    # Update packages
-xearthlayer packages remove <region>    # Remove a package
-xearthlayer packages info <region>      # Package details
+xearthlayer packages check            # Check available packages
+xearthlayer packages install <region> # Install a package
+xearthlayer packages list             # List installed packages
+xearthlayer packages update [region]  # Update packages
+xearthlayer packages remove <region>  # Remove a package
 
 # Streaming Service
-xearthlayer start --source <path>   # Start streaming service
-xearthlayer cache stats             # View cache statistics
-xearthlayer cache clear             # Clear cache
+xearthlayer start --source <path>     # Start streaming (mount on <path>_xel)
+xearthlayer cache stats               # View cache usage
+xearthlayer cache clear               # Clear cache
 
 # Content Publishing
-xearthlayer publish init            # Initialize package repository
-xearthlayer publish scan --source <path>    # Scan Ortho4XP tiles
+xearthlayer publish init              # Initialize repository
 xearthlayer publish add --source <path> --region <code>  # Create package
 xearthlayer publish build --region <code>   # Build archives
 xearthlayer publish release --region <code> # Release to library
@@ -112,11 +116,9 @@ Run `xearthlayer --help` for all options.
 
 - **X-Plane 12** (X-Plane 11 may work but is untested)
 - **Linux** with FUSE support
-- **Internet connection** for streaming or package downloads
+- **Internet connection** for streaming imagery
 
 ## Contributing
-
-### Development Setup
 
 ```bash
 # Install Rust via rustup.rs
@@ -129,14 +131,7 @@ make init
 make verify
 ```
 
-### Code Guidelines
-
-- Follow TDD (Test-Driven Development)
-- Follow SOLID principles
-- Run `make verify` before committing
-- Maintain test coverage above 80%
-
-See [Developer Documentation](docs/dev/) for architecture details.
+See [Developer Documentation](docs/dev/) for architecture and guidelines.
 
 ## Credits
 

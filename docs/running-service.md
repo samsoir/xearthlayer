@@ -1,26 +1,36 @@
 # Running the Streaming Service
 
-XEarthLayer can stream satellite imagery on-demand, generating DDS textures in real-time as X-Plane requests them. This is useful for:
+The XEarthLayer streaming service is the component that generates satellite imagery textures on-demand. It works alongside regional scenery packages to provide complete orthophoto scenery.
 
-- Regions without pre-built packages
-- Testing new areas before committing to a full download
-- Situations where disk space is limited
+## Understanding the Relationship
+
+**Important:** The streaming service does not work standalone. You need:
+
+1. **A regional scenery package** - Contains terrain definitions (DSF/TER files) that reference texture filenames
+2. **The streaming service** - Generates those textures on-demand when X-Plane requests them
+
+The package tells X-Plane *what* to display; the streaming service provides *how* it looks.
+
+See [How It Works](how-it-works.md) for the full architectural explanation.
 
 ## How It Works
 
-XEarthLayer creates a virtual filesystem (using FUSE) that overlays your existing scenery folder. When X-Plane requests a texture file:
+XEarthLayer creates a virtual filesystem (using FUSE) that overlays a regional scenery package. When X-Plane requests a texture file:
 
-1. XEarthLayer intercepts the request
+1. XEarthLayer intercepts the DDS request
 2. Downloads satellite imagery tiles from the configured provider
 3. Encodes them into DDS format
 4. Returns the texture to X-Plane
+
+Non-texture files (DSF, TER, etc.) pass through unchanged from the source package.
 
 The result is cached so subsequent requests are instant.
 
 ## Prerequisites
 
 - **Linux** with FUSE support (most distributions have this built-in)
-- **Existing scenery** with terrain definitions (DSF files) but missing textures
+- **A regional scenery package** installed (contains DSF/TER files referencing textures)
+- **Internet connection** for downloading satellite imagery
 
 ## Basic Usage
 

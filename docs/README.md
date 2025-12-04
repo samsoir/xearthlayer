@@ -4,10 +4,11 @@
 
 | Guide | Description |
 |-------|-------------|
+| [How It Works](how-it-works.md) | Architecture overview - how packages and streaming work together |
 | [Getting Started](getting-started.md) | First-time setup, installation, and basic usage |
 | [Configuration](configuration.md) | All configuration options and INI file reference |
 | [Package Management](package-management.md) | Installing, updating, and removing scenery packages |
-| [Running the Service](running-service.md) | Live streaming mode for on-demand imagery |
+| [Running the Service](running-service.md) | Streaming service options and management |
 | [Content Publishing](content-publishing.md) | Creating and distributing packages from Ortho4XP |
 
 ## Developer Documentation
