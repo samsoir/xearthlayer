@@ -283,6 +283,14 @@ impl PublisherService for MockPublisherService {
         }
     }
 
+    fn scan_overlay(&self, _source: &Path) -> Result<SceneryScanResult, CliError> {
+        // Use the same scan_result for overlays in tests
+        match &self.scan_result {
+            Ok(result) => Ok(result.clone()),
+            Err(e) => Err(CliError::Publish(e.clone())),
+        }
+    }
+
     fn analyze_tiles(&self, coords: &[(i32, i32)]) -> RegionSuggestion {
         if coords.is_empty() {
             RegionSuggestion {
@@ -706,7 +714,7 @@ mod add_tests {
         let result = AddHandler::execute(args, &ctx);
 
         assert!(result.is_ok());
-        assert!(output.contains("Processing Ortho4XP output"));
+        assert!(output.contains("Processing Ortho4XP tiles output"));
         assert!(output.contains("Region: NA"));
         assert!(output.contains("Found 2 tiles"));
         assert!(output.contains("Package created successfully"));
@@ -759,6 +767,40 @@ mod add_tests {
         if let Err(CliError::Publish(msg)) = result {
             assert!(msg.contains("Invalid version"));
         }
+    }
+
+    #[test]
+    fn test_add_overlay_success() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_scan_success(create_test_scan_result())
+            .with_process_success(ProcessSummary {
+                tile_count: 2,
+                dsf_count: 2,
+                ter_count: 0,
+                mask_count: 0,
+                dds_skipped: 0,
+                warnings: Vec::new(),
+            })
+            .build();
+        let ctx = CommandContext::new(&output, &publisher);
+
+        let args = AddArgs {
+            source: PathBuf::from("/ortho4xp/overlays"),
+            region: "na".to_string(),
+            package_type: PackageTypeArg::Overlay,
+            version: "1.0.0".to_string(),
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = AddHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("Processing Ortho4XP overlays output"));
+        assert!(output.contains("Region: NA"));
+        assert!(output.contains("Found 2 tiles"));
+        assert!(output.contains("Package created successfully"));
     }
 }
 

@@ -175,21 +175,35 @@ Multi-phase workflow to handle the "genesis paradox" (can't have URLs before fil
 
 ---
 
-## Phase 3b: Publisher - Overlay Support
+## Phase 3b: Publisher - Overlay Support ✓
 
 Add overlay package support to the publisher.
 
 ### Overlay Processing
 
-- [ ] Create `OverlayProcessor` implementing `SceneryProcessor` trait
-- [ ] Scan `yOrtho4XP_Overlays/` directory structure
-- [ ] Handle consolidated overlay format (not per-tile like ortho)
-- [ ] Package type `Y` with `yzXEL_` folder prefix
+- [x] Create `OverlayProcessor` implementing `SceneryProcessor` trait
+- [x] Scan `yOrtho4XP_Overlays/` directory structure (`Earth nav data/+NN+NNN/`)
+- [x] Handle consolidated overlay format (only DSF files, not per-tile like ortho)
+- [x] Package type `Y` with `yzXEL_` folder prefix
 
-### Integration
+### CLI Integration
 
-- [ ] Verify archive/release workflow works for overlays
-- [ ] Update any ortho-specific assumptions in Phase 3 code
+- [x] Add `scan_overlay()` method to `PublisherService` trait
+- [x] Update `AddHandler` to dispatch to correct scanner based on package type
+- [x] Update `process_tiles()` to use correct processor based on package type
+- [x] Add test for overlay add command
+
+### Files Added
+
+- [x] `xearthlayer/src/publisher/processor/overlay.rs`
+
+### Notes
+
+Ortho4XP overlay structure differs from ortho tiles:
+- Overlays are in a single `yOrtho4XP_Overlays/` directory
+- Only contains `Earth nav data/+NN+NNN/+NN+NNN.dsf` files
+- No terrain files (`.ter`) or textures (PNG/DDS)
+- DSFs organized into 10° × 10° grid subdirectories
 
 ---
 
@@ -458,7 +472,7 @@ Phase 5 (Publisher Testing) ✓
     ↓
 Phase 6 (Manager Read) ✓
     ↓
-Phase 3b (Publisher - Overlay Support)
+Phase 3b (Publisher - Overlay Support) ✓
     ↓
 Phase 7 (Manager Install) ←── Next
     ↓
@@ -471,7 +485,7 @@ Phase 10 (Config/Polish)
 Phase 11 (Integration Tests)
 ```
 
-**Note:** Phase 3b (Overlay Support) can be done at any point. The Manager is designed to support both package types from the start.
+**Note:** Phase 3b (Overlay Support) completed. Both ortho and overlay package types are now fully supported by the Publisher.
 
 ---
 
@@ -530,6 +544,8 @@ Record significant decisions made during implementation:
 | 2025-12-03 | CachedLibraryClient decorator | Wraps any LibraryClient with TTL-based caching; thread-safe |
 | 2025-12-03 | MountStatus enum | Tracks ortho package mount state (Mounted/NotMounted/Unknown) via /proc/mounts |
 | 2025-12-03 | PackageStatus enum | UpToDate, UpdateAvailable, NotInstalled, Orphaned for version comparison |
+| 2025-12-03 | OverlayProcessor for overlays | Separate processor for overlays; scans `Earth nav data/` for DSF files only |
+| 2025-12-03 | Overlay DSF-only structure | Overlays have no ter/texture files; only DSF in 10° grid subdirectories |
 
 ---
 

@@ -133,7 +133,13 @@ impl CommandHandler for AddHandler {
         // Open repository
         let repo = ctx.publisher.open_repository(&args.repo)?;
 
-        ctx.output.println("Processing Ortho4XP output...");
+        let source_type = match package_type {
+            PackageType::Ortho => "Ortho4XP tiles",
+            PackageType::Overlay => "Ortho4XP overlays",
+        };
+
+        ctx.output
+            .println(&format!("Processing {} output...", source_type));
         ctx.output
             .indented(&format!("Source: {}", args.source.display()));
         ctx.output
@@ -142,9 +148,12 @@ impl CommandHandler for AddHandler {
         ctx.output.indented(&format!("Version: {}", version));
         ctx.output.newline();
 
-        // Scan and process
-        ctx.output.println("Scanning tiles...");
-        let scan_result = ctx.publisher.scan_scenery(&args.source)?;
+        // Scan using appropriate processor
+        ctx.output.println("Scanning...");
+        let scan_result = match package_type {
+            PackageType::Ortho => ctx.publisher.scan_scenery(&args.source)?,
+            PackageType::Overlay => ctx.publisher.scan_overlay(&args.source)?,
+        };
 
         if scan_result.tiles.is_empty() {
             return Err(CliError::Publish("No valid tiles found".to_string()));

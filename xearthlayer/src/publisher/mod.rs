@@ -19,7 +19,8 @@
 //! Different scenery creation tools produce output in different formats.
 //! The [`SceneryProcessor`] trait abstracts this, with implementations for:
 //!
-//! - [`Ortho4XPProcessor`] - Processes Ortho4XP output (X-Plane 12)
+//! - [`Ortho4XPProcessor`] - Processes Ortho4XP tile output (X-Plane 12)
+//! - [`OverlayProcessor`] - Processes Ortho4XP overlay output (X-Plane 12)
 //!
 //! # Example
 //!
@@ -65,8 +66,8 @@ pub use metadata::{
     VersionBump, METADATA_FILENAME,
 };
 pub use processor::{
-    Ortho4XPProcessor, ProcessSummary, SceneryFormat, SceneryProcessor, SceneryScanResult,
-    TileInfo, TileWarning,
+    Ortho4XPProcessor, OverlayProcessor, ProcessSummary, SceneryFormat, SceneryProcessor,
+    SceneryScanResult, TileInfo, TileWarning,
 };
 pub use region::{analyze_tiles, suggest_region, RegionSuggestion, SuggestedRegion};
 pub use release::{

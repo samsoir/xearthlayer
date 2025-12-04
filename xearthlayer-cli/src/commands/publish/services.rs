@@ -120,6 +120,14 @@ impl PublisherService for DefaultPublisherService {
             .map_err(|e| CliError::Publish(format!("Scan failed: {}", e)))
     }
 
+    fn scan_overlay(&self, source: &Path) -> Result<SceneryScanResult, CliError> {
+        use xearthlayer::publisher::{OverlayProcessor, SceneryProcessor};
+        let processor = OverlayProcessor::new();
+        processor
+            .scan(source)
+            .map_err(|e| CliError::Publish(format!("Scan failed: {}", e)))
+    }
+
     fn analyze_tiles(&self, coords: &[(i32, i32)]) -> RegionSuggestion {
         xearthlayer::publisher::analyze_tiles(coords)
     }
@@ -131,7 +139,7 @@ impl PublisherService for DefaultPublisherService {
         package_type: PackageType,
         repo: &dyn RepositoryOperations,
     ) -> Result<ProcessSummary, CliError> {
-        use xearthlayer::publisher::{Ortho4XPProcessor, SceneryProcessor};
+        use xearthlayer::publisher::{Ortho4XPProcessor, OverlayProcessor, SceneryProcessor};
 
         // We need to get the actual Repository from the wrapper
         // This is a limitation - we need to downcast or use a different approach
@@ -139,10 +147,21 @@ impl PublisherService for DefaultPublisherService {
         let actual_repo = xearthlayer::publisher::Repository::open(repo.root())
             .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))?;
 
-        let processor = Ortho4XPProcessor::new();
-        processor
-            .process(scan_result, region, package_type, &actual_repo)
-            .map_err(|e| CliError::Publish(format!("Processing failed: {}", e)))
+        // Use appropriate processor based on package type
+        match package_type {
+            PackageType::Ortho => {
+                let processor = Ortho4XPProcessor::new();
+                processor
+                    .process(scan_result, region, package_type, &actual_repo)
+                    .map_err(|e| CliError::Publish(format!("Processing failed: {}", e)))
+            }
+            PackageType::Overlay => {
+                let processor = OverlayProcessor::new();
+                processor
+                    .process(scan_result, region, package_type, &actual_repo)
+                    .map_err(|e| CliError::Publish(format!("Processing failed: {}", e)))
+            }
+        }
     }
 
     fn generate_initial_metadata(

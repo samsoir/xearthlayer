@@ -92,8 +92,11 @@ pub trait PublisherService: Send + Sync {
     /// Write repository configuration.
     fn write_config(&self, repo_root: &Path, config: &RepoConfig) -> Result<(), CliError>;
 
-    /// Scan scenery source for tiles.
+    /// Scan scenery source for tiles (ortho tiles).
     fn scan_scenery(&self, source: &Path) -> Result<SceneryScanResult, CliError>;
+
+    /// Scan scenery source for overlays.
+    fn scan_overlay(&self, source: &Path) -> Result<SceneryScanResult, CliError>;
 
     /// Analyze tiles and suggest a region.
     fn analyze_tiles(&self, coords: &[(i32, i32)]) -> RegionSuggestion;

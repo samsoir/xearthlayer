@@ -11,9 +11,11 @@ use super::{PublishResult, Repository};
 use crate::package::PackageType;
 
 mod ortho4xp;
+mod overlay;
 mod tile;
 
 pub use ortho4xp::Ortho4XPProcessor;
+pub use overlay::OverlayProcessor;
 pub use tile::{ProcessSummary, TileInfo, TileWarning};
 
 /// Scenery format identifier.
