@@ -19,26 +19,26 @@ The Package Manager is responsible for discovering, downloading, installing, upd
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      Package Manager                             │
+│                      Package Manager                            │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │   Library    │  │   Package    │  │      Download        │  │
-│  │   Client     │  │   Scanner    │  │      Manager         │  │
-│  │              │  │              │  │                      │  │
-│  │ Fetch remote │  │ Scan local   │  │ Parallel downloads   │  │
-│  │ library idx  │  │ packages     │  │ Resume support       │  │
-│  │ Parse meta   │  │ Build state  │  │ Checksum verify      │  │
-│  └──────────────┘  └──────────────┘  └──────────────────────┘  │
-│                                                                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │   Installer  │  │   Mount      │  │      Update          │  │
-│  │              │  │   Coordinator│  │      Checker         │  │
-│  │ Extract pkg  │  │              │  │                      │  │
-│  │ Create links │  │ Track mounts │  │ Compare local/remote │  │
-│  │ Verify files │  │ Start/stop   │  │ Notify user          │  │
-│  └──────────────┘  └──────────────┘  └──────────────────────┘  │
-│                                                                  │
+│                                                                 │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
+│  │   Library    │  │   Package    │  │      Download        │   │
+│  │   Client     │  │   Scanner    │  │      Manager         │   │
+│  │              │  │              │  │                      │   │
+│  │ Fetch remote │  │ Scan local   │  │ Parallel downloads   │   │
+│  │ library idx  │  │ packages     │  │ Resume support       │   │
+│  │ Parse meta   │  │ Build state  │  │ Checksum verify      │   │
+│  └──────────────┘  └──────────────┘  └──────────────────────┘   │
+│                                                                 │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
+│  │   Installer  │  │   Mount      │  │      Update          │   │
+│  │              │  │   Coordinator│  │      Checker         │   │
+│  │ Extract pkg  │  │              │  │                      │   │
+│  │ Create links │  │ Track mounts │  │ Compare local/remote │   │
+│  │ Verify files │  │ Start/stop   │  │ Notify user          │   │
+│  └──────────────┘  └──────────────┘  └──────────────────────┘   │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 

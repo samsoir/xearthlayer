@@ -20,38 +20,38 @@ XEarthLayer solves this by separating the **metadata** (DSF/TER files) from the 
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         X-Plane                                      │
-│                                                                      │
+│                         X-Plane                                     │
+│                                                                     │
 │  Requests texture: textures/100_200_ZL16.dds                        │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    XEarthLayer FUSE Mount                           │
-│                                                                      │
+│                                                                     │
 │  Mount Point: Custom Scenery/zzXEL_region_ortho_xel                 │
 │  Source:      Custom Scenery/zzXEL_region_ortho                     │
-│                                                                      │
-│  ┌─────────────────────────────────────────────────────────────┐   │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────────┐   │
 │  │ Is this a DDS texture request?                               │   │
-│  │                                                               │   │
-│  │  NO  → Pass through to source folder (DSF, TER, etc.)       │   │
+│  │                                                              │   │
+│  │  NO  → Pass through to source folder (DSF, TER, etc.)        │   │
 │  │  YES → Generate on-demand from satellite imagery             │   │
-│  └─────────────────────────────────────────────────────────────┘   │
+│  └──────────────────────────────────────────────────────────────┘   │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │ (DDS request)
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    Tile Generation Pipeline                         │
-│                                                                      │
-│  1. Parse filename: 100_200_ZL16.dds → row=100, col=200, zoom=16   │
+│                                                                     │
+│  1. Parse filename: 100_200_ZL16.dds → row=100, col=200, zoom=16    │
 │  2. Check cache (memory → disk)                                     │
 │  3. If not cached:                                                  │
-│     a. Download 256 satellite image chunks (16×16 grid)            │
-│     b. Composite into 4096×4096 image                              │
-│     c. Encode as BC1/BC3 DDS with mipmaps                          │
+│     a. Download 256 satellite image chunks (16×16 grid)             │
+│     b. Composite into 4096×4096 image                               │
+│     c. Encode as BC1/BC3 DDS with mipmaps                           │
 │     d. Cache result                                                 │
-│  4. Return DDS data to X-Plane                                     │
+│  4. Return DDS data to X-Plane                                      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 

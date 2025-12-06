@@ -4,10 +4,10 @@ This document provides a high-level overview of the XEarthLayer Scenery Package 
 
 ## Related Documentation
 
-- [Scenery Package Specification](SCENERY_PACKAGES.md) - Package formats and conventions
-- [Package Manager Design](PACKAGE_MANAGER.md) - Consuming and installing packages
-- [Package Publisher Design](PACKAGE_PUBLISHER.md) - Creating and publishing packages
-- [Implementation Plan](SCENERY_PACKAGE_PLAN.md) - Development roadmap and progress
+- [Scenery Package Specification](scenery-packages.md) - Package formats and conventions
+- [Package Manager Design](package-manager-design.md) - Consuming and installing packages
+- [Package Publisher Design](package-publisher-design.md) - Creating and publishing packages
+- [Implementation Plan](scenery-package-plan.md) - Development roadmap and progress
 
 ## System Overview
 
@@ -15,24 +15,24 @@ XEarthLayer Scenery Packages are pre-built X-Plane 12 scenery containers that wo
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        Package Ecosystem                                 │
+│                        Package Ecosystem                                │
 ├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│   ┌──────────────┐         ┌──────────────┐         ┌──────────────┐   │
-│   │   Publisher  │         │   Library    │         │   Manager    │   │
-│   │              │ ──────► │   (Remote)   │ ──────► │              │   │
-│   │ Creates and  │ publish │              │  fetch  │ Downloads &  │   │
-│   │ uploads pkgs │         │ Index of all │         │ installs     │   │
-│   └──────────────┘         │ available    │         └──────┬───────┘   │
-│         ▲                  │ packages     │                │           │
-│         │                  └──────────────┘                │           │
-│         │                                                  ▼           │
-│   ┌─────┴────────┐                                 ┌──────────────┐   │
-│   │  Ortho4XP    │                                 │ Local        │   │
-│   │  Output      │                                 │ Packages     │   │
-│   └──────────────┘                                 └──────┬───────┘   │
-│                                                           │           │
-└───────────────────────────────────────────────────────────┼───────────┘
+│                                                                         │
+│   ┌──────────────┐         ┌──────────────┐         ┌──────────────┐    │
+│   │   Publisher  │         │   Library    │         │   Manager    │    │
+│   │              │ ──────► │   (Remote)   │ ──────► │              │    │
+│   │ Creates and  │ publish │              │  fetch  │ Downloads &  │    │
+│   │ uploads pkgs │         │ Index of all │         │ installs     │    │
+│   └──────────────┘         │ available    │         └──────┬───────┘    │
+│         ▲                  │ packages     │                │            │
+│         │                  └──────────────┘                │            │
+│         │                                                  ▼            │
+│   ┌─────┴────────┐                                 ┌──────────────┐     │
+│   │  Ortho4XP    │                                 │ Local        │     │
+│   │  Output      │                                 │ Packages     │     │
+│   └──────────────┘                                 └──────┬───────┘     │
+│                                                           │             │
+└───────────────────────────────────────────────────────────┼─────────────┘
                                                             │
                                                             ▼
                                               ┌─────────────────────────┐
@@ -166,7 +166,7 @@ install_location = ~/.xearthlayer/packages
 
 ## Next Steps
 
-- See [Scenery Package Specification](SCENERY_PACKAGES.md) for detailed file formats
-- See [Package Manager Design](PACKAGE_MANAGER.md) for installation workflow
-- See [Package Publisher Design](PACKAGE_PUBLISHER.md) for creating packages
-- See [Implementation Plan](SCENERY_PACKAGE_PLAN.md) for development status
+- See [Scenery Package Specification](scenery-packages.md) for detailed file formats
+- See [Package Manager Design](package-manager-design.md) for installation workflow
+- See [Package Publisher Design](package-publisher-design.md) for creating packages
+- See [Implementation Plan](scenery-package-plan.md) for development status

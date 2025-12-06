@@ -301,7 +301,7 @@ FileAttr {
 
 ### User Configuration
 
-XEarthLayer uses INI configuration at `~/.xearthlayer/config.ini`. See [CONFIGURATION.md](./CONFIGURATION.md) for full reference.
+XEarthLayer uses INI configuration at `~/.xearthlayer/config.ini`. See [configuration.md](../configuration.md) for full reference.
 
 Example configuration excerpt:
 ```ini
@@ -476,7 +476,7 @@ XEarthLayer currently implements two FUSE filesystem types:
 
 ### Caching Strategy
 
-See [CACHE_DESIGN.md](./CACHE_DESIGN.md) for detailed caching architecture.
+See [cache-design.md](cache-design.md) for detailed caching architecture.
 
 Summary:
 1. Memory cache for hot tiles
