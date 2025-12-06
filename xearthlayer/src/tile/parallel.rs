@@ -329,7 +329,6 @@ mod tests {
     use super::*;
     use crate::log::NoOpLogger;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
 
     fn test_logger() -> Arc<dyn Logger> {
         Arc::new(NoOpLogger)
@@ -454,7 +453,33 @@ mod tests {
 
     #[test]
     fn test_timeout_returns_placeholder() {
-        let inner = Arc::new(MockGenerator::with_delay(30000)); // 30 second delay
+        // Use a channel to control when the mock completes - it will block until signaled
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+        struct BlockingMock {
+            receiver: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            call_count: std::sync::atomic::AtomicUsize,
+        }
+
+        impl TileGenerator for BlockingMock {
+            fn generate(&self, _request: &TileRequest) -> Result<Vec<u8>, TileGeneratorError> {
+                self.call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Block until signaled (or channel dropped)
+                let _ = self.receiver.lock().unwrap().recv();
+                Ok(b"mock-data".to_vec())
+            }
+
+            fn expected_size(&self) -> usize {
+                4096
+            }
+        }
+
+        let inner = Arc::new(BlockingMock {
+            receiver: std::sync::Mutex::new(rx),
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+
         let config = ParallelConfig::default()
             .with_threads(1)
             .with_timeout_secs(1); // 1 second timeout
@@ -465,28 +490,69 @@ mod tests {
         );
 
         let request = TileRequest::new(100, 200, 16);
-        let start = Instant::now();
         let result = generator.generate(&request);
-        let elapsed = start.elapsed();
 
-        // Should timeout and return placeholder
+        // Should timeout and return placeholder (not the mock's "mock-data" response)
         assert!(result.is_ok(), "Should return placeholder on timeout");
-        // Should complete faster than the mock delay (30s)
-        // Allow plenty of time for placeholder generation (~4s on some systems)
-        assert!(
-            elapsed < Duration::from_secs(15),
-            "Should not wait for full mock delay, took {:?}",
-            elapsed
-        );
 
-        // Verify it's a DDS file (starts with "DDS ")
+        // Verify it's a DDS placeholder (starts with "DDS "), not the mock response
         let data = result.unwrap();
         assert_eq!(&data[0..4], b"DDS ", "Should return valid DDS placeholder");
+        assert_ne!(&data[..], b"mock-data", "Should not return mock data");
+
+        // Verify the inner generator was called (work was submitted)
+        assert_eq!(
+            inner.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Inner generator should have been called"
+        );
+
+        // Unblock the worker thread so it can clean up
+        drop(tx);
     }
 
     #[test]
     fn test_different_tiles_processed_in_parallel() {
-        let inner = Arc::new(MockGenerator::with_delay(100));
+        // Track peak concurrent executions to verify parallelism
+        use std::sync::atomic::AtomicUsize;
+
+        struct ConcurrencyTrackingMock {
+            current_count: AtomicUsize,
+            peak_count: AtomicUsize,
+            call_count: AtomicUsize,
+            barrier: std::sync::Barrier,
+        }
+
+        impl TileGenerator for ConcurrencyTrackingMock {
+            fn generate(&self, _request: &TileRequest) -> Result<Vec<u8>, TileGeneratorError> {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+
+                // Increment current count and update peak
+                let current = self.current_count.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak_count.fetch_max(current, Ordering::SeqCst);
+
+                // Wait at barrier - all threads must reach here before any can proceed
+                // This ensures we measure true concurrency
+                self.barrier.wait();
+
+                // Decrement current count
+                self.current_count.fetch_sub(1, Ordering::SeqCst);
+
+                Ok(b"tile-data".to_vec())
+            }
+
+            fn expected_size(&self) -> usize {
+                4096
+            }
+        }
+
+        let inner = Arc::new(ConcurrencyTrackingMock {
+            current_count: AtomicUsize::new(0),
+            peak_count: AtomicUsize::new(0),
+            call_count: AtomicUsize::new(0),
+            barrier: std::sync::Barrier::new(4), // Wait for all 4 to be concurrent
+        });
+
         let config = ParallelConfig::default()
             .with_threads(4)
             .with_timeout_secs(10);
@@ -495,8 +561,6 @@ mod tests {
             config,
             test_logger(),
         ));
-
-        let start = Instant::now();
 
         // Request 4 different tiles in parallel
         let mut handles = vec![];
@@ -513,16 +577,17 @@ mod tests {
             assert!(handle.join().unwrap().is_ok());
         }
 
-        let elapsed = start.elapsed();
-
-        // With 4 threads processing 4 tiles with 100ms delay each,
-        // should complete in roughly 100ms (parallel), not 400ms (sequential)
-        assert!(
-            elapsed < Duration::from_millis(300),
-            "Tiles should be processed in parallel, took {:?}",
-            elapsed
+        // Verify parallelism: peak concurrent count should be 4 (all running simultaneously)
+        assert_eq!(
+            inner.peak_count.load(Ordering::SeqCst),
+            4,
+            "All 4 tiles should be processed concurrently"
         );
-        assert_eq!(inner.call_count(), 4, "Each tile should be generated once");
+        assert_eq!(
+            inner.call_count.load(Ordering::SeqCst),
+            4,
+            "Each tile should be generated once"
+        );
     }
 
     #[test]
