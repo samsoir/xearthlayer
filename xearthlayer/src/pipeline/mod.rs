@@ -1,0 +1,50 @@
+//! Async tile generation pipeline.
+//!
+//! This module implements a multi-stage asynchronous pipeline for generating
+//! DDS textures from satellite imagery. The pipeline is designed to maximize
+//! throughput by matching X-Plane's concurrent file request patterns.
+//!
+//! # Architecture
+//!
+//! ```text
+//! FUSE Request → Job → Download Stage → Assembly Stage → Encode Stage → Cache Stage → Response
+//! ```
+//!
+//! # Key Components
+//!
+//! - [`Job`] - Represents a request for a DDS tile
+//! - [`JobId`] - Unique identifier for tracking jobs through the pipeline
+//! - [`JobResult`] - The result of processing a job
+//!
+//! # Example
+//!
+//! ```ignore
+//! use xearthlayer::pipeline::{Job, JobId, Priority};
+//! use xearthlayer::coord::TileCoord;
+//! use tokio::sync::oneshot;
+//!
+//! let (tx, rx) = oneshot::channel();
+//! let job = Job::new(
+//!     TileCoord { row: 100, col: 200, zoom: 16 },
+//!     Priority::Normal,
+//!     tx,
+//! );
+//!
+//! // Submit job to pipeline...
+//! let result = rx.await?;
+//! ```
+
+mod context;
+mod error;
+mod job;
+mod processor;
+pub mod stages;
+
+pub use context::{
+    ChunkDownloadError, ChunkProvider, DiskCache, MemoryCache, PipelineConfig, PipelineContext,
+    TextureEncodeError, TextureEncoderAsync,
+};
+pub use error::{ChunkFailure, ChunkResults, ChunkSuccess, JobError, StageError};
+pub use job::{Job, JobId, JobResult, Priority};
+pub use processor::{process_job, process_tile};
+pub use stages::{assembly_stage, cache_stage, download_stage, encode_stage};

@@ -1,0 +1,411 @@
+//! Job processor - orchestrates pipeline stages.
+//!
+//! The processor takes a Job and runs it through all pipeline stages:
+//! 1. Check memory cache (short-circuit if hit)
+//! 2. Download chunks
+//! 3. Assemble into image
+//! 4. Encode to DDS
+//! 5. Write to cache
+//! 6. Return result
+
+use crate::coord::TileCoord;
+use crate::pipeline::stages::{assembly_stage, cache_stage, check_memory_cache, download_stage, encode_stage};
+use crate::pipeline::{
+    ChunkProvider, DiskCache, Job, JobError, JobId, JobResult, MemoryCache, PipelineConfig,
+    PipelineContext, TextureEncoderAsync,
+};
+use std::sync::Arc;
+use std::time::Instant;
+use tracing::{info, instrument, warn};
+
+/// Processes a job through all pipeline stages.
+///
+/// This is the main entry point for job processing. It orchestrates all stages
+/// and produces a `JobResult` that can be sent back to the FUSE handler.
+///
+/// # Flow
+///
+/// ```text
+/// Job → Cache Check → [hit] → Return cached data
+///                   → [miss] → Download → Assemble → Encode → Cache → Return
+/// ```
+///
+/// # Error Handling
+///
+/// The processor follows an optimistic strategy:
+/// - Individual chunk failures result in magenta placeholders, not job failure
+/// - Only catastrophic failures (e.g., all chunks fail, encoding crashes) fail the job
+/// - A job always produces _some_ result (possibly all magenta)
+#[instrument(skip(ctx), fields(job_id = %job.id, tile = ?job.tile_coords))]
+pub async fn process_job<P, E, M, D>(
+    job: Job,
+    ctx: &PipelineContext<P, E, M, D>,
+) -> Result<JobResult, JobError>
+where
+    P: ChunkProvider,
+    E: TextureEncoderAsync,
+    M: MemoryCache,
+    D: DiskCache,
+{
+    let start = Instant::now();
+    let job_id = job.id;
+    let tile = job.tile_coords;
+
+    // Stage 0: Check memory cache
+    if let Some(cached_data) = check_memory_cache(tile, ctx.memory_cache.as_ref()) {
+        info!(job_id = %job_id, "Memory cache hit");
+        return Ok(JobResult::cache_hit(job_id, cached_data, start.elapsed()));
+    }
+
+    // Stage 1: Download chunks
+    let chunks = download_stage(
+        job_id,
+        tile,
+        Arc::clone(&ctx.provider),
+        Arc::clone(&ctx.disk_cache),
+        &ctx.config,
+    )
+    .await;
+
+    let failed_chunks = chunks.failure_count() as u16;
+
+    // Stage 2: Assemble image
+    let image = assembly_stage(job_id, chunks).await?;
+
+    // Stage 3: Encode to DDS
+    let dds_data = encode_stage(job_id, image, Arc::clone(&ctx.encoder)).await?;
+
+    // Stage 4: Write to memory cache
+    cache_stage(job_id, tile, &dds_data, Arc::clone(&ctx.memory_cache)).await;
+
+    let duration = start.elapsed();
+    info!(
+        job_id = %job_id,
+        duration_ms = duration.as_millis(),
+        failed_chunks,
+        size_bytes = dds_data.len(),
+        "Job complete"
+    );
+
+    Ok(JobResult::partial(job_id, dds_data, duration, failed_chunks))
+}
+
+/// Simplified processor that only needs the essential components.
+///
+/// This is a convenience function for cases where you have the components
+/// but not a full `PipelineContext`.
+pub async fn process_tile<P, E, M, D>(
+    job_id: JobId,
+    tile: TileCoord,
+    provider: Arc<P>,
+    encoder: Arc<E>,
+    memory_cache: Arc<M>,
+    disk_cache: Arc<D>,
+    config: &PipelineConfig,
+) -> Result<JobResult, JobError>
+where
+    P: ChunkProvider,
+    E: TextureEncoderAsync,
+    M: MemoryCache,
+    D: DiskCache,
+{
+    let start = Instant::now();
+
+    // Stage 0: Check memory cache
+    if let Some(cached_data) = check_memory_cache(tile, memory_cache.as_ref()) {
+        info!(job_id = %job_id, "Memory cache hit");
+        return Ok(JobResult::cache_hit(job_id, cached_data, start.elapsed()));
+    }
+
+    // Stage 1: Download chunks
+    let chunks = download_stage(
+        job_id,
+        tile,
+        Arc::clone(&provider),
+        Arc::clone(&disk_cache),
+        config,
+    )
+    .await;
+
+    let failed_chunks = chunks.failure_count() as u16;
+
+    // Stage 2: Assemble image
+    let image = assembly_stage(job_id, chunks).await?;
+
+    // Stage 3: Encode to DDS
+    let dds_data = encode_stage(job_id, image, encoder).await?;
+
+    // Stage 4: Write to memory cache
+    cache_stage(job_id, tile, &dds_data, memory_cache).await;
+
+    let duration = start.elapsed();
+
+    Ok(JobResult::partial(job_id, dds_data, duration, failed_chunks))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::{ChunkDownloadError, TextureEncodeError};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    // Mock implementations for testing
+
+    struct MockProvider;
+
+    impl ChunkProvider for MockProvider {
+        async fn download_chunk(
+            &self,
+            row: u32,
+            col: u32,
+            zoom: u8,
+        ) -> Result<Vec<u8>, ChunkDownloadError> {
+            // Return a simple 1x1 PNG (smallest valid image)
+            // In reality this would be a 256x256 JPEG
+            Ok(create_test_png())
+        }
+
+        fn name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct FailingProvider;
+
+    impl ChunkProvider for FailingProvider {
+        async fn download_chunk(
+            &self,
+            _row: u32,
+            _col: u32,
+            _zoom: u8,
+        ) -> Result<Vec<u8>, ChunkDownloadError> {
+            Err(ChunkDownloadError::permanent("always fails"))
+        }
+
+        fn name(&self) -> &str {
+            "failing"
+        }
+    }
+
+    struct MockEncoder;
+
+    impl TextureEncoderAsync for MockEncoder {
+        fn encode(&self, image: &image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
+            // Return mock DDS data
+            Ok(vec![0xDD, 0x53, 0x20, 0x00])
+        }
+
+        fn expected_size(&self, _width: u32, _height: u32) -> usize {
+            4
+        }
+    }
+
+    struct MockMemoryCache {
+        data: Mutex<HashMap<(u32, u32, u8), Vec<u8>>>,
+    }
+
+    impl MockMemoryCache {
+        fn new() -> Self {
+            Self {
+                data: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn with_cached(self, row: u32, col: u32, zoom: u8, data: Vec<u8>) -> Self {
+            self.data.lock().unwrap().insert((row, col, zoom), data);
+            self
+        }
+    }
+
+    impl MemoryCache for MockMemoryCache {
+        fn get(&self, row: u32, col: u32, zoom: u8) -> Option<Vec<u8>> {
+            self.data.lock().unwrap().get(&(row, col, zoom)).cloned()
+        }
+
+        fn put(&self, row: u32, col: u32, zoom: u8, data: Vec<u8>) {
+            self.data.lock().unwrap().insert((row, col, zoom), data);
+        }
+
+        fn size_bytes(&self) -> usize {
+            0
+        }
+
+        fn entry_count(&self) -> usize {
+            self.data.lock().unwrap().len()
+        }
+    }
+
+    struct NullDiskCache;
+
+    impl DiskCache for NullDiskCache {
+        async fn get(
+            &self,
+            _tile_row: u32,
+            _tile_col: u32,
+            _zoom: u8,
+            _chunk_row: u8,
+            _chunk_col: u8,
+        ) -> Option<Vec<u8>> {
+            None
+        }
+
+        async fn put(
+            &self,
+            _tile_row: u32,
+            _tile_col: u32,
+            _zoom: u8,
+            _chunk_row: u8,
+            _chunk_col: u8,
+            _data: Vec<u8>,
+        ) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+
+    fn create_test_png() -> Vec<u8> {
+        // Create a minimal valid PNG (1x1 red pixel)
+        use image::{Rgba, RgbaImage};
+        let img = RgbaImage::from_pixel(256, 256, Rgba([255, 0, 0, 255]));
+        let mut buffer = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut buffer);
+        img.write_to(&mut cursor, image::ImageFormat::Png).unwrap();
+        buffer
+    }
+
+    #[tokio::test]
+    async fn test_process_tile_success() {
+        let provider = Arc::new(MockProvider);
+        let encoder = Arc::new(MockEncoder);
+        let memory_cache = Arc::new(MockMemoryCache::new());
+        let disk_cache = Arc::new(NullDiskCache);
+        let config = PipelineConfig {
+            max_retries: 1,
+            ..Default::default()
+        };
+
+        let tile = TileCoord {
+            row: 100,
+            col: 200,
+            zoom: 16,
+        };
+
+        let result = process_tile(
+            JobId::new(),
+            tile,
+            provider,
+            encoder,
+            memory_cache,
+            disk_cache,
+            &config,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let job_result = result.unwrap();
+        assert!(!job_result.cache_hit);
+        assert_eq!(job_result.failed_chunks, 0);
+    }
+
+    #[tokio::test]
+    async fn test_process_tile_cache_hit() {
+        let provider = Arc::new(MockProvider);
+        let encoder = Arc::new(MockEncoder);
+        let cached_data = vec![0xCA, 0xCE, 0x0D, 0xDA, 0xAA];
+        let memory_cache = Arc::new(
+            MockMemoryCache::new().with_cached(100, 200, 16, cached_data.clone()),
+        );
+        let disk_cache = Arc::new(NullDiskCache);
+        let config = PipelineConfig::default();
+
+        let tile = TileCoord {
+            row: 100,
+            col: 200,
+            zoom: 16,
+        };
+
+        let result = process_tile(
+            JobId::new(),
+            tile,
+            provider,
+            encoder,
+            memory_cache,
+            disk_cache,
+            &config,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let job_result = result.unwrap();
+        assert!(job_result.cache_hit);
+        assert_eq!(job_result.dds_data, cached_data);
+    }
+
+    #[tokio::test]
+    async fn test_process_tile_with_failures() {
+        let provider = Arc::new(FailingProvider);
+        let encoder = Arc::new(MockEncoder);
+        let memory_cache = Arc::new(MockMemoryCache::new());
+        let disk_cache = Arc::new(NullDiskCache);
+        let config = PipelineConfig {
+            max_retries: 1,
+            ..Default::default()
+        };
+
+        let tile = TileCoord {
+            row: 100,
+            col: 200,
+            zoom: 16,
+        };
+
+        let result = process_tile(
+            JobId::new(),
+            tile,
+            provider,
+            encoder,
+            memory_cache,
+            disk_cache,
+            &config,
+        )
+        .await;
+
+        // Should still succeed (with magenta placeholders)
+        assert!(result.is_ok());
+        let job_result = result.unwrap();
+        assert_eq!(job_result.failed_chunks, 256); // All chunks failed
+    }
+
+    #[tokio::test]
+    async fn test_process_tile_writes_to_cache() {
+        let provider = Arc::new(MockProvider);
+        let encoder = Arc::new(MockEncoder);
+        let memory_cache = Arc::new(MockMemoryCache::new());
+        let disk_cache = Arc::new(NullDiskCache);
+        let config = PipelineConfig {
+            max_retries: 1,
+            ..Default::default()
+        };
+
+        let tile = TileCoord {
+            row: 100,
+            col: 200,
+            zoom: 16,
+        };
+
+        // Process the tile
+        let _ = process_tile(
+            JobId::new(),
+            tile,
+            Arc::clone(&provider),
+            Arc::clone(&encoder),
+            Arc::clone(&memory_cache),
+            Arc::clone(&disk_cache),
+            &config,
+        )
+        .await;
+
+        // Verify it's now in cache
+        let cached = memory_cache.get(100, 200, 16);
+        assert!(cached.is_some());
+    }
+}
