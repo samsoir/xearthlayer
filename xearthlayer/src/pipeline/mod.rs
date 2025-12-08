@@ -34,6 +34,7 @@
 //! let result = rx.await?;
 //! ```
 
+pub mod adapters;
 mod context;
 mod error;
 mod executor;

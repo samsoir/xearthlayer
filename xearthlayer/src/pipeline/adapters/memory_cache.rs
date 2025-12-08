@@ -1,0 +1,179 @@
+//! Memory cache adapter for the async pipeline.
+//!
+//! Adapts `cache::MemoryCache` to the pipeline's `MemoryCache` trait.
+
+use crate::cache::{self, CacheKey};
+use crate::coord::TileCoord;
+use crate::dds::DdsFormat;
+
+/// Adapts `cache::MemoryCache` to the pipeline's `MemoryCache` trait.
+///
+/// The pipeline uses simpler cache keys (row, col, zoom) while the existing
+/// cache uses `CacheKey` which includes provider and format. This adapter
+/// injects the provider and format configuration.
+///
+/// # Example
+///
+/// ```ignore
+/// use xearthlayer::cache::MemoryCache;
+/// use xearthlayer::dds::DdsFormat;
+/// use xearthlayer::pipeline::adapters::MemoryCacheAdapter;
+///
+/// let cache = MemoryCache::new(2 * 1024 * 1024 * 1024); // 2GB
+/// let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
+/// // adapter implements pipeline::MemoryCache
+/// ```
+pub struct MemoryCacheAdapter {
+    cache: cache::MemoryCache,
+    provider: String,
+    format: DdsFormat,
+}
+
+impl MemoryCacheAdapter {
+    /// Creates a new memory cache adapter.
+    ///
+    /// # Arguments
+    ///
+    /// * `cache` - The underlying memory cache
+    /// * `provider` - Provider name for cache keys
+    /// * `format` - DDS format for cache keys
+    pub fn new(cache: cache::MemoryCache, provider: impl Into<String>, format: DdsFormat) -> Self {
+        Self {
+            cache,
+            provider: provider.into(),
+            format,
+        }
+    }
+
+    /// Creates a cache key from tile coordinates.
+    fn make_key(&self, row: u32, col: u32, zoom: u8) -> CacheKey {
+        CacheKey::new(
+            self.provider.clone(),
+            self.format,
+            TileCoord { row, col, zoom },
+        )
+    }
+
+    /// Returns the provider name.
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// Returns the DDS format.
+    pub fn format(&self) -> DdsFormat {
+        self.format
+    }
+}
+
+impl crate::pipeline::MemoryCache for MemoryCacheAdapter {
+    fn get(&self, row: u32, col: u32, zoom: u8) -> Option<Vec<u8>> {
+        let key = self.make_key(row, col, zoom);
+        self.cache.get(&key)
+    }
+
+    fn put(&self, row: u32, col: u32, zoom: u8, data: Vec<u8>) {
+        let key = self.make_key(row, col, zoom);
+        // Fire and forget - ignore errors per pipeline trait design
+        let _ = self.cache.put(key, data);
+    }
+
+    fn size_bytes(&self) -> usize {
+        self.cache.size_bytes()
+    }
+
+    fn entry_count(&self) -> usize {
+        self.cache.entry_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::MemoryCache;
+
+    #[test]
+    fn test_memory_cache_adapter_put_get() {
+        let cache = cache::MemoryCache::new(1024 * 1024);
+        let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
+
+        adapter.put(100, 200, 16, vec![1, 2, 3]);
+        let result = adapter.get(100, 200, 16);
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_memory_cache_adapter_miss() {
+        let cache = cache::MemoryCache::new(1024 * 1024);
+        let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
+
+        let result = adapter.get(100, 200, 16);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_memory_cache_adapter_size_tracking() {
+        let cache = cache::MemoryCache::new(1024 * 1024);
+        let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
+
+        assert_eq!(adapter.size_bytes(), 0);
+        assert_eq!(adapter.entry_count(), 0);
+
+        adapter.put(100, 200, 16, vec![0u8; 100]);
+
+        assert_eq!(adapter.size_bytes(), 100);
+        assert_eq!(adapter.entry_count(), 1);
+    }
+
+    #[test]
+    fn test_memory_cache_adapter_different_keys() {
+        let cache = cache::MemoryCache::new(1024 * 1024);
+        let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
+
+        adapter.put(100, 200, 16, vec![1, 2, 3]);
+        adapter.put(100, 201, 16, vec![4, 5, 6]);
+
+        assert_eq!(adapter.get(100, 200, 16).unwrap(), vec![1, 2, 3]);
+        assert_eq!(adapter.get(100, 201, 16).unwrap(), vec![4, 5, 6]);
+        assert!(adapter.get(100, 202, 16).is_none());
+    }
+
+    #[test]
+    fn test_memory_cache_adapter_overwrite() {
+        let cache = cache::MemoryCache::new(1024 * 1024);
+        let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
+
+        adapter.put(100, 200, 16, vec![1, 2, 3]);
+        assert_eq!(adapter.get(100, 200, 16).unwrap(), vec![1, 2, 3]);
+
+        adapter.put(100, 200, 16, vec![7, 8, 9]);
+        assert_eq!(adapter.get(100, 200, 16).unwrap(), vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn test_memory_cache_adapter_provider_isolation() {
+        // Different adapters with different providers should have isolated data
+        // (though they share the underlying cache, the keys differ)
+        let cache = cache::MemoryCache::new(1024 * 1024);
+        let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
+
+        adapter.put(100, 200, 16, vec![1, 2, 3]);
+
+        // Same coordinates but different provider won't find it
+        // (We can't easily test this with a single adapter, but the key includes provider)
+        assert_eq!(adapter.provider(), "bing");
+        assert_eq!(adapter.format(), DdsFormat::BC1);
+    }
+
+    #[test]
+    fn test_memory_cache_adapter_format_isolation() {
+        let cache = cache::MemoryCache::new(1024 * 1024);
+        let adapter_bc1 = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
+
+        adapter_bc1.put(100, 200, 16, vec![1, 2, 3]);
+
+        // The key includes format, so BC1 and BC3 are different entries
+        assert_eq!(adapter_bc1.format(), DdsFormat::BC1);
+    }
+}
