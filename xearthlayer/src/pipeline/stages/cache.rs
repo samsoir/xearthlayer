@@ -7,7 +7,7 @@
 use crate::coord::TileCoord;
 use crate::pipeline::{JobId, MemoryCache};
 use std::sync::Arc;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument};
 
 /// Stores a generated tile in the memory cache.
 ///
@@ -28,12 +28,8 @@ use tracing::{debug, instrument, warn};
 /// This function never fails - cache write errors are logged but ignored
 /// because caching is purely an optimization.
 #[instrument(skip(dds_data, memory_cache), fields(job_id = %job_id))]
-pub async fn cache_stage<M>(
-    job_id: JobId,
-    tile: TileCoord,
-    dds_data: &[u8],
-    memory_cache: Arc<M>,
-) where
+pub async fn cache_stage<M>(job_id: JobId, tile: TileCoord, dds_data: &[u8], memory_cache: Arc<M>)
+where
     M: MemoryCache,
 {
     let size = dds_data.len();
@@ -99,12 +95,7 @@ mod tests {
         }
 
         fn size_bytes(&self) -> usize {
-            self.data
-                .lock()
-                .unwrap()
-                .values()
-                .map(|v| v.len())
-                .sum()
+            self.data.lock().unwrap().values().map(|v| v.len()).sum()
         }
 
         fn entry_count(&self) -> usize {

@@ -3,9 +3,8 @@
 //! This stage takes downloaded chunks and assembles them into a 4096x4096
 //! RGBA image. Failed chunks are replaced with magenta placeholders.
 
-use crate::pipeline::{ChunkResults, JobError, JobId};
+use crate::pipeline::{BlockingExecutor, ChunkResults, JobError, JobId};
 use image::{Rgba, RgbaImage};
-use tokio::task::spawn_blocking;
 use tracing::{debug, instrument, warn};
 
 /// Tile dimensions
@@ -27,20 +26,29 @@ const MAGENTA: Rgba<u8> = Rgba([255, 0, 255, 255]);
 ///
 /// * `job_id` - For logging correlation
 /// * `chunks` - Results from the download stage
+/// * `executor` - Executor for running blocking work
 ///
 /// # Returns
 ///
 /// The assembled RGBA image, or an error if assembly fails catastrophically.
-#[instrument(skip(chunks), fields(job_id = %job_id))]
-pub async fn assembly_stage(job_id: JobId, chunks: ChunkResults) -> Result<RgbaImage, JobError> {
+#[instrument(skip(chunks, executor), fields(job_id = %job_id))]
+pub async fn assembly_stage<E>(
+    job_id: JobId,
+    chunks: ChunkResults,
+    executor: &E,
+) -> Result<RgbaImage, JobError>
+where
+    E: BlockingExecutor,
+{
     let success_count = chunks.success_count();
     let failure_count = chunks.failure_count();
 
-    // Move the CPU-intensive work to a blocking task
-    let image = spawn_blocking(move || assemble_chunks(chunks))
+    // Move the CPU-intensive work to a blocking task via the executor
+    let image = executor
+        .execute_blocking(move || assemble_chunks(chunks))
         .await
-        .map_err(|e| JobError::Internal(format!("assembly task panicked: {}", e)))?
-        .map_err(|e| JobError::AssemblyFailed(e))?;
+        .map_err(|e| JobError::Internal(format!("assembly task failed: {}", e)))?
+        .map_err(JobError::AssemblyFailed)?;
 
     debug!(
         job_id = %job_id,
@@ -91,8 +99,8 @@ fn assemble_chunks(chunks: ChunkResults) -> Result<RgbaImage, String> {
 
 /// Decodes JPEG data into an RGBA image.
 fn decode_chunk(jpeg_data: &[u8]) -> Result<RgbaImage, String> {
-    let img = image::load_from_memory(jpeg_data)
-        .map_err(|e| format!("image decode error: {}", e))?;
+    let img =
+        image::load_from_memory(jpeg_data).map_err(|e| format!("image decode error: {}", e))?;
     Ok(img.to_rgba8())
 }
 
@@ -180,7 +188,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_assembly_stage_complete() {
+    async fn test_assembly_stage_complete_with_tokio() {
+        use crate::pipeline::TokioExecutor;
+
         let mut chunks = ChunkResults::new();
 
         // Add all 256 chunks
@@ -190,7 +200,28 @@ mod tests {
             }
         }
 
-        let result = assembly_stage(JobId::new(), chunks).await.unwrap();
+        let executor = TokioExecutor::new();
+        let result = assembly_stage(JobId::new(), chunks, &executor)
+            .await
+            .unwrap();
+
+        assert_eq!(result.width(), TILE_SIZE);
+        assert_eq!(result.height(), TILE_SIZE);
+    }
+
+    // This test demonstrates DIP - it doesn't require Tokio!
+    #[test]
+    fn test_assembly_stage_with_sync_executor() {
+        use crate::pipeline::executor::SyncExecutor;
+
+        let mut chunks = ChunkResults::new();
+        chunks.add_success(0, 0, create_test_jpeg(255, 0, 0));
+
+        let executor = SyncExecutor;
+        let future = assembly_stage(JobId::new(), chunks, &executor);
+
+        // Can run without Tokio runtime
+        let result = futures::executor::block_on(future).unwrap();
 
         assert_eq!(result.width(), TILE_SIZE);
         assert_eq!(result.height(), TILE_SIZE);

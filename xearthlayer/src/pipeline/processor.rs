@@ -9,14 +9,16 @@
 //! 6. Return result
 
 use crate::coord::TileCoord;
-use crate::pipeline::stages::{assembly_stage, cache_stage, check_memory_cache, download_stage, encode_stage};
+use crate::pipeline::stages::{
+    assembly_stage, cache_stage, check_memory_cache, download_stage, encode_stage,
+};
 use crate::pipeline::{
-    ChunkProvider, DiskCache, Job, JobError, JobId, JobResult, MemoryCache, PipelineConfig,
-    PipelineContext, TextureEncoderAsync,
+    BlockingExecutor, ChunkProvider, DiskCache, Job, JobError, JobId, JobResult, MemoryCache,
+    PipelineConfig, PipelineContext, TextureEncoderAsync,
 };
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument};
 
 /// Processes a job through all pipeline stages.
 ///
@@ -37,15 +39,16 @@ use tracing::{info, instrument, warn};
 /// - Only catastrophic failures (e.g., all chunks fail, encoding crashes) fail the job
 /// - A job always produces _some_ result (possibly all magenta)
 #[instrument(skip(ctx), fields(job_id = %job.id, tile = ?job.tile_coords))]
-pub async fn process_job<P, E, M, D>(
+pub async fn process_job<P, E, M, D, X>(
     job: Job,
-    ctx: &PipelineContext<P, E, M, D>,
+    ctx: &PipelineContext<P, E, M, D, X>,
 ) -> Result<JobResult, JobError>
 where
     P: ChunkProvider,
     E: TextureEncoderAsync,
     M: MemoryCache,
     D: DiskCache,
+    X: BlockingExecutor,
 {
     let start = Instant::now();
     let job_id = job.id;
@@ -70,10 +73,16 @@ where
     let failed_chunks = chunks.failure_count() as u16;
 
     // Stage 2: Assemble image
-    let image = assembly_stage(job_id, chunks).await?;
+    let image = assembly_stage(job_id, chunks, ctx.executor.as_ref()).await?;
 
     // Stage 3: Encode to DDS
-    let dds_data = encode_stage(job_id, image, Arc::clone(&ctx.encoder)).await?;
+    let dds_data = encode_stage(
+        job_id,
+        image,
+        Arc::clone(&ctx.encoder),
+        ctx.executor.as_ref(),
+    )
+    .await?;
 
     // Stage 4: Write to memory cache
     cache_stage(job_id, tile, &dds_data, Arc::clone(&ctx.memory_cache)).await;
@@ -87,20 +96,27 @@ where
         "Job complete"
     );
 
-    Ok(JobResult::partial(job_id, dds_data, duration, failed_chunks))
+    Ok(JobResult::partial(
+        job_id,
+        dds_data,
+        duration,
+        failed_chunks,
+    ))
 }
 
 /// Simplified processor that only needs the essential components.
 ///
 /// This is a convenience function for cases where you have the components
 /// but not a full `PipelineContext`.
-pub async fn process_tile<P, E, M, D>(
+#[allow(clippy::too_many_arguments)]
+pub async fn process_tile<P, E, M, D, X>(
     job_id: JobId,
     tile: TileCoord,
     provider: Arc<P>,
     encoder: Arc<E>,
     memory_cache: Arc<M>,
     disk_cache: Arc<D>,
+    executor: &X,
     config: &PipelineConfig,
 ) -> Result<JobResult, JobError>
 where
@@ -108,6 +124,7 @@ where
     E: TextureEncoderAsync,
     M: MemoryCache,
     D: DiskCache,
+    X: BlockingExecutor,
 {
     let start = Instant::now();
 
@@ -130,23 +147,28 @@ where
     let failed_chunks = chunks.failure_count() as u16;
 
     // Stage 2: Assemble image
-    let image = assembly_stage(job_id, chunks).await?;
+    let image = assembly_stage(job_id, chunks, executor).await?;
 
     // Stage 3: Encode to DDS
-    let dds_data = encode_stage(job_id, image, encoder).await?;
+    let dds_data = encode_stage(job_id, image, encoder, executor).await?;
 
     // Stage 4: Write to memory cache
     cache_stage(job_id, tile, &dds_data, memory_cache).await;
 
     let duration = start.elapsed();
 
-    Ok(JobResult::partial(job_id, dds_data, duration, failed_chunks))
+    Ok(JobResult::partial(
+        job_id,
+        dds_data,
+        duration,
+        failed_chunks,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::{ChunkDownloadError, TextureEncodeError};
+    use crate::pipeline::{ChunkDownloadError, TextureEncodeError, TokioExecutor};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -157,9 +179,9 @@ mod tests {
     impl ChunkProvider for MockProvider {
         async fn download_chunk(
             &self,
-            row: u32,
-            col: u32,
-            zoom: u8,
+            _row: u32,
+            _col: u32,
+            _zoom: u8,
         ) -> Result<Vec<u8>, ChunkDownloadError> {
             // Return a simple 1x1 PNG (smallest valid image)
             // In reality this would be a 256x256 JPEG
@@ -191,7 +213,7 @@ mod tests {
     struct MockEncoder;
 
     impl TextureEncoderAsync for MockEncoder {
-        fn encode(&self, image: &image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
+        fn encode(&self, _image: &image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
             // Return mock DDS data
             Ok(vec![0xDD, 0x53, 0x20, 0x00])
         }
@@ -279,6 +301,7 @@ mod tests {
         let encoder = Arc::new(MockEncoder);
         let memory_cache = Arc::new(MockMemoryCache::new());
         let disk_cache = Arc::new(NullDiskCache);
+        let executor = TokioExecutor::new();
         let config = PipelineConfig {
             max_retries: 1,
             ..Default::default()
@@ -297,6 +320,7 @@ mod tests {
             encoder,
             memory_cache,
             disk_cache,
+            &executor,
             &config,
         )
         .await;
@@ -312,10 +336,10 @@ mod tests {
         let provider = Arc::new(MockProvider);
         let encoder = Arc::new(MockEncoder);
         let cached_data = vec![0xCA, 0xCE, 0x0D, 0xDA, 0xAA];
-        let memory_cache = Arc::new(
-            MockMemoryCache::new().with_cached(100, 200, 16, cached_data.clone()),
-        );
+        let memory_cache =
+            Arc::new(MockMemoryCache::new().with_cached(100, 200, 16, cached_data.clone()));
         let disk_cache = Arc::new(NullDiskCache);
+        let executor = TokioExecutor::new();
         let config = PipelineConfig::default();
 
         let tile = TileCoord {
@@ -331,6 +355,7 @@ mod tests {
             encoder,
             memory_cache,
             disk_cache,
+            &executor,
             &config,
         )
         .await;
@@ -347,6 +372,7 @@ mod tests {
         let encoder = Arc::new(MockEncoder);
         let memory_cache = Arc::new(MockMemoryCache::new());
         let disk_cache = Arc::new(NullDiskCache);
+        let executor = TokioExecutor::new();
         let config = PipelineConfig {
             max_retries: 1,
             ..Default::default()
@@ -365,6 +391,7 @@ mod tests {
             encoder,
             memory_cache,
             disk_cache,
+            &executor,
             &config,
         )
         .await;
@@ -381,6 +408,7 @@ mod tests {
         let encoder = Arc::new(MockEncoder);
         let memory_cache = Arc::new(MockMemoryCache::new());
         let disk_cache = Arc::new(NullDiskCache);
+        let executor = TokioExecutor::new();
         let config = PipelineConfig {
             max_retries: 1,
             ..Default::default()
@@ -400,6 +428,7 @@ mod tests {
             Arc::clone(&encoder),
             Arc::clone(&memory_cache),
             Arc::clone(&disk_cache),
+            &executor,
             &config,
         )
         .await;

@@ -5,9 +5,7 @@
 //! transient failures.
 
 use crate::coord::TileCoord;
-use crate::pipeline::{
-    ChunkDownloadError, ChunkProvider, ChunkResults, DiskCache, JobId, PipelineConfig,
-};
+use crate::pipeline::{ChunkProvider, ChunkResults, DiskCache, JobId, PipelineConfig};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::{debug, instrument, warn};
@@ -166,7 +164,9 @@ where
                 let chunk_data = data.clone();
                 tokio::spawn(async move {
                     let _ = dc
-                        .put(tile.row, tile.col, tile.zoom, chunk_row, chunk_col, chunk_data)
+                        .put(
+                            tile.row, tile.col, tile.zoom, chunk_row, chunk_col, chunk_data,
+                        )
                         .await;
                 });
 
@@ -205,6 +205,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::ChunkDownloadError;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -286,8 +287,19 @@ mod tests {
             }
         }
 
-        fn with_cached(self, tile_row: u32, tile_col: u32, zoom: u8, chunk_row: u8, chunk_col: u8, data: Vec<u8>) -> Self {
-            self.cached.lock().unwrap().insert((tile_row, tile_col, zoom, chunk_row, chunk_col), data);
+        fn with_cached(
+            self,
+            tile_row: u32,
+            tile_col: u32,
+            zoom: u8,
+            chunk_row: u8,
+            chunk_col: u8,
+            data: Vec<u8>,
+        ) -> Self {
+            self.cached
+                .lock()
+                .unwrap()
+                .insert((tile_row, tile_col, zoom, chunk_row, chunk_col), data);
             self
         }
     }
@@ -301,7 +313,11 @@ mod tests {
             chunk_row: u8,
             chunk_col: u8,
         ) -> Option<Vec<u8>> {
-            self.cached.lock().unwrap().get(&(tile_row, tile_col, zoom, chunk_row, chunk_col)).cloned()
+            self.cached
+                .lock()
+                .unwrap()
+                .get(&(tile_row, tile_col, zoom, chunk_row, chunk_col))
+                .cloned()
         }
 
         async fn put(
@@ -313,7 +329,10 @@ mod tests {
             chunk_col: u8,
             data: Vec<u8>,
         ) -> Result<(), std::io::Error> {
-            self.cached.lock().unwrap().insert((tile_row, tile_col, zoom, chunk_row, chunk_col), data);
+            self.cached
+                .lock()
+                .unwrap()
+                .insert((tile_row, tile_col, zoom, chunk_row, chunk_col), data);
             Ok(())
         }
     }
@@ -339,14 +358,12 @@ mod tests {
     #[tokio::test]
     async fn test_download_stage_with_failures() {
         // Make one chunk fail permanently
-        let provider = Arc::new(
-            MockProvider::new().with_failure(
-                100 * 16 + 5,  // chunk (5, 0)
-                200 * 16 + 10, // at tile (100, 200)
-                20,            // zoom 16 + 4
-                ChunkDownloadError::permanent("not found"),
-            ),
-        );
+        let provider = Arc::new(MockProvider::new().with_failure(
+            100 * 16 + 5,  // chunk (5, 0)
+            200 * 16 + 10, // at tile (100, 200)
+            20,            // zoom 16 + 4
+            ChunkDownloadError::permanent("not found"),
+        ));
         let cache = Arc::new(NullDiskCache);
         let config = PipelineConfig {
             max_retries: 1, // Quick test
@@ -368,10 +385,8 @@ mod tests {
     #[tokio::test]
     async fn test_download_stage_uses_cache() {
         let provider = Arc::new(MockProvider::new());
-        let cache = Arc::new(
-            MockDiskCache::new()
-                .with_cached(100, 200, 16, 0, 0, vec![0xCA, 0xCE, 0xD])
-        );
+        let cache =
+            Arc::new(MockDiskCache::new().with_cached(100, 200, 16, 0, 0, vec![0xCA, 0xCE, 0xD]));
         let config = PipelineConfig::default();
         let tile = TileCoord {
             row: 100,

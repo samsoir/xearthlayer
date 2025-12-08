@@ -3,10 +3,9 @@
 //! This stage takes an assembled RGBA image and compresses it to DDS format
 //! with BC1 or BC3 compression and mipmaps.
 
-use crate::pipeline::{JobError, JobId, TextureEncoderAsync};
+use crate::pipeline::{BlockingExecutor, JobError, JobId, TextureEncoderAsync};
 use image::RgbaImage;
 use std::sync::Arc;
-use tokio::task::spawn_blocking;
 use tracing::{debug, instrument};
 
 /// Encodes an RGBA image to DDS format.
@@ -21,26 +20,30 @@ use tracing::{debug, instrument};
 /// * `job_id` - For logging correlation
 /// * `image` - The assembled 4096x4096 RGBA image
 /// * `encoder` - The texture encoder to use
+/// * `executor` - Executor for running blocking work
 ///
 /// # Returns
 ///
 /// The encoded DDS data as bytes.
-#[instrument(skip(image, encoder), fields(job_id = %job_id))]
-pub async fn encode_stage<E>(
+#[instrument(skip(image, encoder, executor), fields(job_id = %job_id))]
+pub async fn encode_stage<E, X>(
     job_id: JobId,
     image: RgbaImage,
     encoder: Arc<E>,
+    executor: &X,
 ) -> Result<Vec<u8>, JobError>
 where
     E: TextureEncoderAsync,
+    X: BlockingExecutor,
 {
     let width = image.width();
     let height = image.height();
 
-    // Move the CPU-intensive encoding to a blocking task
-    let dds_data = spawn_blocking(move || encoder.encode(&image))
+    // Move the CPU-intensive encoding to a blocking task via the executor
+    let dds_data = executor
+        .execute_blocking(move || encoder.encode(&image))
         .await
-        .map_err(|e| JobError::Internal(format!("encode task panicked: {}", e)))?
+        .map_err(|e| JobError::Internal(format!("encode task failed: {}", e)))?
         .map_err(|e| JobError::EncodingFailed(e.message))?;
 
     debug!(
@@ -75,13 +78,12 @@ mod tests {
     }
 
     impl TextureEncoderAsync for MockEncoder {
-        fn encode(&self, image: &RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
+        fn encode(&self, _image: &RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
             if self.fail {
                 return Err(TextureEncodeError::new("mock encoding failure"));
             }
-            // Return a simple mock DDS header + some data based on image size
-            let size = image.width() * image.height();
-            Ok(vec![0xDD, 0x53, (size & 0xFF) as u8, ((size >> 8) & 0xFF) as u8])
+            // Return a simple mock DDS header
+            Ok(vec![0xDD, 0x53, 0x20, 0x00])
         }
 
         fn expected_size(&self, width: u32, height: u32) -> usize {
@@ -90,11 +92,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_encode_stage_success() {
+    async fn test_encode_stage_success_with_tokio() {
+        use crate::pipeline::TokioExecutor;
+
         let image = RgbaImage::new(256, 256);
         let encoder = Arc::new(MockEncoder::new());
+        let executor = TokioExecutor::new();
 
-        let result = encode_stage(JobId::new(), image, encoder).await;
+        let result = encode_stage(JobId::new(), image, encoder, &executor).await;
 
         assert!(result.is_ok());
         let dds_data = result.unwrap();
@@ -103,11 +108,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_encode_stage_failure() {
+    async fn test_encode_stage_failure_with_tokio() {
+        use crate::pipeline::TokioExecutor;
+
         let image = RgbaImage::new(256, 256);
         let encoder = Arc::new(MockEncoder::failing());
+        let executor = TokioExecutor::new();
 
-        let result = encode_stage(JobId::new(), image, encoder).await;
+        let result = encode_stage(JobId::new(), image, encoder, &executor).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -116,5 +124,21 @@ mod tests {
             }
             other => panic!("unexpected error type: {:?}", other),
         }
+    }
+
+    // This test demonstrates DIP - it doesn't require Tokio!
+    #[test]
+    fn test_encode_stage_with_sync_executor() {
+        use crate::pipeline::executor::SyncExecutor;
+
+        let image = RgbaImage::new(256, 256);
+        let encoder = Arc::new(MockEncoder::new());
+        let executor = SyncExecutor;
+
+        let future = encode_stage(JobId::new(), image, encoder, &executor);
+
+        // Can run without Tokio runtime
+        let result = futures::executor::block_on(future).unwrap();
+        assert_eq!(result[0], 0xDD);
     }
 }

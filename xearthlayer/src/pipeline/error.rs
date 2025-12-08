@@ -48,19 +48,11 @@ pub enum JobError {
 pub enum StageError {
     /// HTTP request failed
     #[error("HTTP error for chunk ({row}, {col}): {message}")]
-    HttpError {
-        row: u8,
-        col: u8,
-        message: String,
-    },
+    HttpError { row: u8, col: u8, message: String },
 
     /// Invalid or corrupt image data received
     #[error("invalid image data for chunk ({row}, {col}): {message}")]
-    InvalidImageData {
-        row: u8,
-        col: u8,
-        message: String,
-    },
+    InvalidImageData { row: u8, col: u8, message: String },
 
     /// Image decoding failed
     #[error("image decode failed: {0}")]

@@ -38,18 +38,21 @@ impl Default for PipelineConfig {
     }
 }
 
+use crate::pipeline::executor::BlockingExecutor;
+
 /// Shared context for pipeline stages.
 ///
 /// This struct holds references to all shared resources that pipeline stages
 /// need. It's designed to be cheaply cloneable (via Arc) for passing to
 /// spawned tasks.
 #[derive(Clone)]
-pub struct PipelineContext<P, E, M, D>
+pub struct PipelineContext<P, E, M, D, X>
 where
     P: ChunkProvider,
     E: TextureEncoderAsync,
     M: MemoryCache,
     D: DiskCache,
+    X: BlockingExecutor,
 {
     /// Provider for downloading chunks
     pub provider: Arc<P>,
@@ -63,16 +66,20 @@ where
     /// Disk cache (chunk-level)
     pub disk_cache: Arc<D>,
 
+    /// Executor for blocking operations
+    pub executor: Arc<X>,
+
     /// Pipeline configuration
     pub config: PipelineConfig,
 }
 
-impl<P, E, M, D> PipelineContext<P, E, M, D>
+impl<P, E, M, D, X> PipelineContext<P, E, M, D, X>
 where
     P: ChunkProvider,
     E: TextureEncoderAsync,
     M: MemoryCache,
     D: DiskCache,
+    X: BlockingExecutor,
 {
     /// Creates a new pipeline context.
     pub fn new(
@@ -80,6 +87,7 @@ where
         encoder: Arc<E>,
         memory_cache: Arc<M>,
         disk_cache: Arc<D>,
+        executor: Arc<X>,
         config: PipelineConfig,
     ) -> Self {
         Self {
@@ -87,6 +95,7 @@ where
             encoder,
             memory_cache,
             disk_cache,
+            executor,
             config,
         }
     }
