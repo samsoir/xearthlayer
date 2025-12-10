@@ -1,8 +1,8 @@
 # Async Pipeline Architecture
 
-**Status**: Phase 1 complete, Phase 2 in progress
+**Status**: Phase 1 complete, Phase 2 complete
 **Created**: 2025-12-07
-**Last Updated**: 2025-12-07
+**Last Updated**: 2025-12-09
 
 ## Overview
 
@@ -1491,6 +1491,59 @@ where
 
 **Trade-off**: More verbose type signatures, but this is contained within the pipeline module.
 
+### AsyncPassthroughFS Design (Phase 2)
+
+**Decision**: Bridge synchronous FUSE callbacks to async pipeline using `Handle::block_on()` with oneshot channels.
+
+**Rationale**: The FUSE `read()` callback is synchronous and must return data before the function returns. We need to:
+1. Submit work to the async Tokio runtime
+2. Wait for the result without spinning
+3. Handle timeouts gracefully
+
+**Implementation**:
+
+```rust
+// Key types in fuse/async_passthrough.rs
+pub struct DdsRequest {
+    pub job_id: JobId,
+    pub tile: TileCoord,
+    pub result_tx: oneshot::Sender<DdsResponse>,
+}
+
+pub type DdsHandler = Arc<dyn Fn(DdsRequest) + Send + Sync>;
+
+// The bridge pattern
+fn request_dds(&self, coords: &DdsFilename) -> Vec<u8> {
+    let (tx, rx) = oneshot::channel();
+    let request = DdsRequest { job_id, tile, result_tx: tx };
+
+    // Submit to async runtime (doesn't block)
+    (self.dds_handler)(request);
+
+    // Block this FUSE thread waiting for result
+    let result = self.runtime_handle.block_on(async {
+        tokio::time::timeout(self.generation_timeout, rx).await
+    });
+
+    // Handle result or return placeholder on timeout
+    ...
+}
+```
+
+**Pipeline Runner**: `create_dds_handler()` in `pipeline/runner.rs` creates a `DdsHandler` that:
+1. Spawns an async task on the Tokio runtime
+2. Calls `process_tile()` through the pipeline stages
+3. Sends result back via oneshot channel
+
+**Coordinate Conversion**: DDS filenames use chunk-level coordinates (zoom + 4), but tiles use tile-level coordinates:
+- Tile row = chunk row / 16
+- Tile col = chunk col / 16
+- Tile zoom = chunk zoom - 4
+
+**Virtual Inodes**: DDS files that don't exist on disk get virtual inodes starting at `0x1000_0000_0000_0000` to distinguish them from real file inodes.
+
+**Testing Note**: Tests that call `request_dds()` cannot use `#[tokio::test]` because `block_on()` panics when called from within a runtime. Tests create a new runtime manually instead.
+
 ### Module Organization
 
 **Decision**: Pipeline module organized by responsibility:
@@ -1530,12 +1583,13 @@ pipeline/
 8. ✅ Create adapters for existing types (`adapters/`)
 9. ✅ Unit test each stage in isolation (72 pipeline tests)
 
-### Phase 2: FUSE Integration 🚧 In Progress
+### Phase 2: FUSE Integration ✅ Complete
 
-1. ⏳ Create new AsyncPassthroughFS
-2. ⏳ Implement multi-threaded FUSE dispatch
-3. ⏳ Wire up job submission channel
-4. ⏳ Integration test with mock pipeline
+1. ✅ Create new AsyncPassthroughFS (`fuse/async_passthrough.rs`)
+2. ✅ Implement multi-threaded FUSE dispatch with `runtime_handle.block_on()`
+3. ✅ Wire up job submission via `DdsHandler` callback and oneshot channels
+4. ✅ Create `create_dds_handler()` runner to connect FUSE to pipeline (`pipeline/runner.rs`)
+5. ✅ Unit tests for async FUSE integration (8 tests)
 
 ### Phase 3: Full Integration
 
@@ -1584,3 +1638,4 @@ pipeline/
 | 2025-12-07 | Added telemetry architecture with tracing integration and CLI visualization |
 | 2025-12-07 | Phase 1 complete: Core pipeline, DIP for Tokio, adapters for existing types |
 | 2025-12-07 | Added Implementation Notes section documenting design decisions |
+| 2025-12-09 | Phase 2 complete: AsyncPassthroughFS, pipeline runner, FUSE integration |
