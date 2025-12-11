@@ -1,27 +1,23 @@
-//! Async passthrough FUSE filesystem with pipeline integration.
+//! AsyncPassthroughFS implementation.
 //!
-//! This filesystem overlays an existing scenery pack directory and:
-//! - Passes through all real files (DSF, .ter, .png, etc.)
-//! - Generates DDS textures on-demand via the async pipeline
-//!
-//! Unlike `PassthroughFS`, this implementation submits jobs to a Tokio-based
-//! async pipeline for tile generation, allowing true concurrent I/O.
+//! This module contains the FUSE filesystem implementation that coordinates
+//! between real file passthrough and virtual DDS generation.
 
+use super::attributes::{
+    file_type_from_metadata, metadata_to_attr, virtual_dds_attr, VirtualDdsConfig,
+};
+use super::inode::InodeManager;
+use super::types::{DdsHandler, DdsRequest, DdsResponse};
 use crate::coord::TileCoord;
 use crate::fuse::{generate_default_placeholder, parse_dds_filename, DdsFilename};
-use crate::pipeline::{JobId, JobResult};
-use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
-};
+use crate::pipeline::JobId;
+use fuser::{FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
 use libc::{ENOENT, ENOTDIR};
-use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
@@ -29,69 +25,36 @@ use tracing::{debug, error, info, warn};
 /// Time-to-live for attribute caching.
 const TTL: Duration = Duration::from_secs(1);
 
-/// Base inode for generated DDS files (virtual files).
-const VIRTUAL_INODE_BASE: u64 = 0x1000_0000_0000_0000;
-
-/// Request for DDS generation sent to the async pipeline.
-#[derive(Debug)]
-pub struct DdsRequest {
-    /// Unique request ID for tracing
-    pub job_id: JobId,
-    /// Tile coordinates (tile-level, not chunk-level)
-    pub tile: TileCoord,
-    /// Channel to send result back
-    pub result_tx: oneshot::Sender<DdsResponse>,
-}
-
-/// Response from the async pipeline.
-#[derive(Debug)]
-pub struct DdsResponse {
-    /// The generated DDS data
-    pub data: Vec<u8>,
-    /// Whether this was a cache hit
-    pub cache_hit: bool,
-    /// Generation duration
-    pub duration: Duration,
-}
-
-impl From<JobResult> for DdsResponse {
-    fn from(result: JobResult) -> Self {
-        Self {
-            data: result.dds_data,
-            cache_hit: result.cache_hit,
-            duration: result.duration,
-        }
-    }
-}
-
-/// Handler function type for processing DDS requests.
-///
-/// This is called by the filesystem when a virtual DDS file is read.
-/// The handler should process the request asynchronously and send the
-/// result back via the oneshot channel in the request.
-pub type DdsHandler = Arc<dyn Fn(DdsRequest) + Send + Sync>;
-
 /// Async passthrough FUSE filesystem with pipeline integration.
 ///
 /// This filesystem overlays an existing scenery pack:
 /// - Real files are passed through directly from the source directory
 /// - DDS textures that don't exist are generated via the async pipeline
 ///
-/// # Architecture
+/// # Responsibilities
 ///
-/// ```text
-/// FUSE Handler Thread          Tokio Runtime
-/// ┌─────────────────┐          ┌─────────────────┐
-/// │  read() called  │          │                 │
-/// │       │         │          │  Pipeline       │
-/// │       ▼         │          │  Processor      │
-/// │ Create oneshot  │──req───►│       │         │
-/// │       │         │          │       ▼         │
-/// │   Block on rx   │◄──res───│  DDS Data       │
-/// │       │         │          │                 │
-/// │       ▼         │          └─────────────────┘
-/// │  reply.data()   │
-/// └─────────────────┘
+/// This struct acts as a coordinator, delegating to:
+/// - [`InodeManager`] for inode allocation and mapping
+/// - [`DdsHandler`] for DDS generation requests
+/// - Attribute helpers for file metadata conversion
+///
+/// # Example
+///
+/// ```ignore
+/// use xearthlayer::fuse::async_passthrough::{AsyncPassthroughFS, DdsHandler};
+/// use std::sync::Arc;
+/// use tokio::runtime::Handle;
+///
+/// let handler: DdsHandler = Arc::new(|req| {
+///     // Process DDS request...
+/// });
+///
+/// let fs = AsyncPassthroughFS::new(
+///     PathBuf::from("/scenery/pack"),
+///     handler,
+///     Handle::current(),
+///     11_174_016, // Expected BC1 DDS size
+/// );
 /// ```
 pub struct AsyncPassthroughFS {
     /// Source directory containing the scenery pack
@@ -100,16 +63,10 @@ pub struct AsyncPassthroughFS {
     dds_handler: DdsHandler,
     /// Handle to the Tokio runtime for blocking on channels
     runtime_handle: Handle,
-    /// Expected DDS file size
-    expected_dds_size: usize,
-    /// Inode to path mapping for real files
-    inode_to_path: Arc<Mutex<HashMap<u64, PathBuf>>>,
-    /// Path to inode mapping for real files
-    path_to_inode: Arc<Mutex<HashMap<PathBuf, u64>>>,
-    /// Virtual inode to DDS filename mapping
-    virtual_inode_to_dds: Arc<Mutex<HashMap<u64, DdsFilename>>>,
-    /// Next available inode for real files
-    next_inode: Arc<Mutex<u64>>,
+    /// Inode manager for path/coordinate mappings
+    inode_manager: InodeManager,
+    /// Configuration for virtual DDS attributes
+    virtual_dds_config: VirtualDdsConfig,
     /// Timeout for DDS generation
     generation_timeout: Duration,
 }
@@ -129,22 +86,12 @@ impl AsyncPassthroughFS {
         runtime_handle: Handle,
         expected_dds_size: usize,
     ) -> Self {
-        let mut inode_to_path = HashMap::new();
-        let mut path_to_inode = HashMap::new();
-
-        // Reserve inode 1 for root
-        inode_to_path.insert(1, source_dir.clone());
-        path_to_inode.insert(source_dir.clone(), 1);
-
         Self {
+            inode_manager: InodeManager::new(source_dir.clone()),
             source_dir,
             dds_handler,
             runtime_handle,
-            expected_dds_size,
-            inode_to_path: Arc::new(Mutex::new(inode_to_path)),
-            path_to_inode: Arc::new(Mutex::new(path_to_inode)),
-            virtual_inode_to_dds: Arc::new(Mutex::new(HashMap::new())),
-            next_inode: Arc::new(Mutex::new(2)),
+            virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
             generation_timeout: Duration::from_secs(30),
         }
     }
@@ -155,115 +102,6 @@ impl AsyncPassthroughFS {
         self
     }
 
-    /// Get or create an inode for a real path.
-    fn get_or_create_inode(&self, path: &Path) -> u64 {
-        let mut path_to_inode = self.path_to_inode.lock().unwrap();
-
-        if let Some(&inode) = path_to_inode.get(path) {
-            return inode;
-        }
-
-        let mut next_inode = self.next_inode.lock().unwrap();
-        let inode = *next_inode;
-        *next_inode += 1;
-
-        path_to_inode.insert(path.to_path_buf(), inode);
-        drop(path_to_inode);
-
-        let mut inode_to_path = self.inode_to_path.lock().unwrap();
-        inode_to_path.insert(inode, path.to_path_buf());
-
-        inode
-    }
-
-    /// Get path for an inode.
-    fn get_path(&self, inode: u64) -> Option<PathBuf> {
-        let inode_to_path = self.inode_to_path.lock().unwrap();
-        inode_to_path.get(&inode).cloned()
-    }
-
-    /// Create a virtual inode for a DDS file.
-    fn create_virtual_inode(&self, coords: DdsFilename) -> u64 {
-        // Create a unique virtual inode from coordinates
-        let inode = VIRTUAL_INODE_BASE
-            + ((coords.row as u64) << 32)
-            + ((coords.col as u64) << 8)
-            + (coords.zoom as u64);
-
-        let mut virtual_map = self.virtual_inode_to_dds.lock().unwrap();
-        virtual_map.insert(inode, coords);
-
-        inode
-    }
-
-    /// Check if an inode is virtual (generated DDS).
-    fn is_virtual_inode(inode: u64) -> bool {
-        inode >= VIRTUAL_INODE_BASE
-    }
-
-    /// Get DDS coords for a virtual inode.
-    fn get_virtual_dds(&self, inode: u64) -> Option<DdsFilename> {
-        let virtual_map = self.virtual_inode_to_dds.lock().unwrap();
-        virtual_map.get(&inode).cloned()
-    }
-
-    /// Convert filesystem metadata to FUSE FileAttr.
-    fn metadata_to_attr(&self, inode: u64, metadata: &fs::Metadata) -> FileAttr {
-        let kind = if metadata.is_dir() {
-            FileType::Directory
-        } else if metadata.is_symlink() {
-            FileType::Symlink
-        } else {
-            FileType::RegularFile
-        };
-
-        let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        let atime = metadata.accessed().unwrap_or(SystemTime::UNIX_EPOCH);
-        let ctime = UNIX_EPOCH + Duration::from_secs(metadata.ctime() as u64);
-
-        FileAttr {
-            ino: inode,
-            size: metadata.size(),
-            blocks: metadata.blocks(),
-            atime,
-            mtime,
-            ctime,
-            crtime: mtime,
-            kind,
-            perm: (metadata.mode() & 0o7777) as u16,
-            nlink: metadata.nlink() as u32,
-            uid: metadata.uid(),
-            gid: metadata.gid(),
-            rdev: metadata.rdev() as u32,
-            blksize: metadata.blksize() as u32,
-            flags: 0,
-        }
-    }
-
-    /// Create FileAttr for a virtual DDS file.
-    fn virtual_dds_attr(&self, inode: u64) -> FileAttr {
-        let now = SystemTime::now();
-        let size = self.expected_dds_size as u64;
-
-        FileAttr {
-            ino: inode,
-            size,
-            blocks: size.div_ceil(512),
-            atime: now,
-            mtime: now,
-            ctime: now,
-            crtime: now,
-            kind: FileType::RegularFile,
-            perm: 0o644,
-            nlink: 1,
-            uid: 1000,
-            gid: 1000,
-            rdev: 0,
-            blksize: 512,
-            flags: 0,
-        }
-    }
-
     /// Request DDS generation from the async pipeline.
     ///
     /// This method blocks the calling thread until the DDS is generated
@@ -272,12 +110,7 @@ impl AsyncPassthroughFS {
         let job_id = JobId::new();
 
         // Convert chunk coordinates to tile coordinates
-        let tile_zoom = coords.zoom.saturating_sub(4);
-        let tile = TileCoord {
-            row: coords.row / 16,
-            col: coords.col / 16,
-            zoom: tile_zoom,
-        };
+        let tile = Self::chunk_to_tile_coords(coords);
 
         debug!(
             job_id = %job_id,
@@ -303,6 +136,21 @@ impl AsyncPassthroughFS {
         (self.dds_handler)(request);
 
         // Block waiting for response with timeout
+        self.wait_for_response(job_id, rx)
+    }
+
+    /// Convert chunk-level coordinates to tile-level coordinates.
+    fn chunk_to_tile_coords(coords: &DdsFilename) -> TileCoord {
+        let tile_zoom = coords.zoom.saturating_sub(4);
+        TileCoord {
+            row: coords.row / 16,
+            col: coords.col / 16,
+            zoom: tile_zoom,
+        }
+    }
+
+    /// Wait for DDS response with timeout handling.
+    fn wait_for_response(&self, job_id: JobId, rx: oneshot::Receiver<DdsResponse>) -> Vec<u8> {
         let result = self
             .runtime_handle
             .block_on(async { tokio::time::timeout(self.generation_timeout, rx).await });
@@ -334,137 +182,10 @@ impl AsyncPassthroughFS {
             }
         }
     }
-}
 
-impl Filesystem for AsyncPassthroughFS {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        debug!(parent = parent, name = ?name, "lookup");
-
-        // Get parent path
-        let parent_path = match self.get_path(parent) {
-            Some(p) => p,
-            None => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        let child_path = parent_path.join(name);
-        let name_str = name.to_string_lossy();
-
-        // Check if the file exists on disk
-        if child_path.exists() {
-            match fs::metadata(&child_path) {
-                Ok(metadata) => {
-                    let inode = self.get_or_create_inode(&child_path);
-                    let attr = self.metadata_to_attr(inode, &metadata);
-                    reply.entry(&TTL, &attr, 0);
-                    return;
-                }
-                Err(e) => {
-                    debug!(
-                        path = ?child_path,
-                        error = %e,
-                        "Failed to get metadata"
-                    );
-                }
-            }
-        }
-
-        // File doesn't exist - check if it's a DDS file we can generate
-        if name_str.ends_with(".dds") {
-            if let Ok(coords) = parse_dds_filename(&name_str) {
-                let inode = self.create_virtual_inode(coords);
-                let attr = self.virtual_dds_attr(inode);
-                reply.entry(&TTL, &attr, 0);
-                return;
-            }
-        }
-
-        reply.error(ENOENT);
-    }
-
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        debug!(ino = ino, "getattr");
-
-        // Check if it's a virtual inode
-        if Self::is_virtual_inode(ino) {
-            if self.get_virtual_dds(ino).is_some() {
-                let attr = self.virtual_dds_attr(ino);
-                reply.attr(&TTL, &attr);
-                return;
-            }
-            reply.error(ENOENT);
-            return;
-        }
-
-        // Real file
-        let path = match self.get_path(ino) {
-            Some(p) => p,
-            None => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        match fs::metadata(&path) {
-            Ok(metadata) => {
-                let attr = self.metadata_to_attr(ino, &metadata);
-                reply.attr(&TTL, &attr);
-            }
-            Err(_) => {
-                reply.error(ENOENT);
-            }
-        }
-    }
-
-    fn read(
-        &mut self,
-        _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        size: u32,
-        _flags: i32,
-        _lock: Option<u64>,
-        reply: ReplyData,
-    ) {
-        debug!(ino = ino, offset = offset, size = size, "read");
-
-        // Check if it's a virtual DDS file
-        if Self::is_virtual_inode(ino) {
-            let coords = match self.get_virtual_dds(ino) {
-                Some(c) => c,
-                None => {
-                    reply.error(ENOENT);
-                    return;
-                }
-            };
-
-            // Request DDS from the async pipeline
-            let data = self.request_dds(&coords);
-            let offset = offset as usize;
-            let size = size as usize;
-
-            if offset >= data.len() {
-                reply.data(&[]);
-            } else {
-                let end = std::cmp::min(offset + size, data.len());
-                reply.data(&data[offset..end]);
-            }
-            return;
-        }
-
-        // Real file - read from disk
-        let path = match self.get_path(ino) {
-            Some(p) => p,
-            None => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        let mut file = match File::open(&path) {
+    /// Read data from a real file on disk.
+    fn read_real_file(&self, path: &PathBuf, offset: i64, size: u32, reply: ReplyData) {
+        let mut file = match File::open(path) {
             Ok(f) => f,
             Err(e) => {
                 error!(path = ?path, error = %e, "Failed to open file");
@@ -491,6 +212,138 @@ impl Filesystem for AsyncPassthroughFS {
             }
         }
     }
+}
+
+impl Filesystem for AsyncPassthroughFS {
+    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        debug!(parent = parent, name = ?name, "lookup");
+
+        // Get parent path
+        let parent_path = match self.inode_manager.get_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        let child_path = parent_path.join(name);
+        let name_str = name.to_string_lossy();
+
+        // Check if the file exists on disk
+        if child_path.exists() {
+            match fs::metadata(&child_path) {
+                Ok(metadata) => {
+                    let inode = self.inode_manager.get_or_create_inode(&child_path);
+                    let attr = metadata_to_attr(inode, &metadata);
+                    reply.entry(&TTL, &attr, 0);
+                    return;
+                }
+                Err(e) => {
+                    debug!(
+                        path = ?child_path,
+                        error = %e,
+                        "Failed to get metadata"
+                    );
+                }
+            }
+        }
+
+        // File doesn't exist - check if it's a DDS file we can generate
+        if name_str.ends_with(".dds") {
+            if let Ok(coords) = parse_dds_filename(&name_str) {
+                let inode = self.inode_manager.create_virtual_inode(coords);
+                let attr = virtual_dds_attr(inode, &self.virtual_dds_config);
+                reply.entry(&TTL, &attr, 0);
+                return;
+            }
+        }
+
+        reply.error(ENOENT);
+    }
+
+    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        debug!(ino = ino, "getattr");
+
+        // Check if it's a virtual inode
+        if InodeManager::is_virtual_inode(ino) {
+            if self.inode_manager.get_virtual_dds(ino).is_some() {
+                let attr = virtual_dds_attr(ino, &self.virtual_dds_config);
+                reply.attr(&TTL, &attr);
+                return;
+            }
+            reply.error(ENOENT);
+            return;
+        }
+
+        // Real file
+        let path = match self.inode_manager.get_path(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        match fs::metadata(&path) {
+            Ok(metadata) => {
+                let attr = metadata_to_attr(ino, &metadata);
+                reply.attr(&TTL, &attr);
+            }
+            Err(_) => {
+                reply.error(ENOENT);
+            }
+        }
+    }
+
+    fn read(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock: Option<u64>,
+        reply: ReplyData,
+    ) {
+        debug!(ino = ino, offset = offset, size = size, "read");
+
+        // Check if it's a virtual DDS file
+        if InodeManager::is_virtual_inode(ino) {
+            let coords = match self.inode_manager.get_virtual_dds(ino) {
+                Some(c) => c,
+                None => {
+                    reply.error(ENOENT);
+                    return;
+                }
+            };
+
+            // Request DDS from the async pipeline
+            let data = self.request_dds(&coords);
+            let offset = offset as usize;
+            let size = size as usize;
+
+            if offset >= data.len() {
+                reply.data(&[]);
+            } else {
+                let end = std::cmp::min(offset + size, data.len());
+                reply.data(&data[offset..end]);
+            }
+            return;
+        }
+
+        // Real file - read from disk
+        let path = match self.inode_manager.get_path(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        self.read_real_file(&path, offset, size, reply);
+    }
 
     fn readdir(
         &mut self,
@@ -502,7 +355,7 @@ impl Filesystem for AsyncPassthroughFS {
     ) {
         debug!(ino = ino, offset = offset, "readdir");
 
-        let path = match self.get_path(ino) {
+        let path = match self.inode_manager.get_path(ino) {
             Some(p) => p,
             None => {
                 reply.error(ENOENT);
@@ -524,8 +377,7 @@ impl Filesystem for AsyncPassthroughFS {
         let parent_inode = if path == self.source_dir {
             ino // Root's parent is itself
         } else if let Some(parent) = path.parent() {
-            let parent_inodes = self.path_to_inode.lock().unwrap();
-            *parent_inodes.get(parent).unwrap_or(&1)
+            self.inode_manager.get_inode(parent).unwrap_or(1)
         } else {
             1
         };
@@ -539,14 +391,8 @@ impl Filesystem for AsyncPassthroughFS {
                     let entry_name = entry.file_name();
 
                     if let Ok(metadata) = entry.metadata() {
-                        let entry_inode = self.get_or_create_inode(&entry_path);
-                        let file_type = if metadata.is_dir() {
-                            FileType::Directory
-                        } else if metadata.is_symlink() {
-                            FileType::Symlink
-                        } else {
-                            FileType::RegularFile
-                        };
+                        let entry_inode = self.inode_manager.get_or_create_inode(&entry_path);
+                        let file_type = file_type_from_metadata(&metadata);
                         entries.push((entry_inode, file_type, entry_name));
                     }
                 }
@@ -603,6 +449,7 @@ impl Filesystem for AsyncPassthroughFS {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn create_test_handler() -> (DdsHandler, Arc<AtomicUsize>) {
         let call_count = Arc::new(AtomicUsize::new(0));
@@ -624,34 +471,39 @@ mod tests {
     }
 
     #[test]
-    fn test_virtual_inode_detection() {
-        assert!(!AsyncPassthroughFS::is_virtual_inode(1));
-        assert!(!AsyncPassthroughFS::is_virtual_inode(1000));
-        assert!(AsyncPassthroughFS::is_virtual_inode(VIRTUAL_INODE_BASE));
-        assert!(AsyncPassthroughFS::is_virtual_inode(VIRTUAL_INODE_BASE + 1));
+    fn test_chunk_to_tile_coords() {
+        let coords = DdsFilename {
+            row: 160000,
+            col: 84000,
+            zoom: 20,
+            map_type: "BI".to_string(),
+        };
+
+        let tile = AsyncPassthroughFS::chunk_to_tile_coords(&coords);
+
+        assert_eq!(tile.row, 10000); // 160000 / 16
+        assert_eq!(tile.col, 5250); // 84000 / 16
+        assert_eq!(tile.zoom, 16); // 20 - 4
     }
 
     #[test]
-    fn test_dds_response_from_job_result() {
-        let result = JobResult {
-            job_id: JobId::new(),
-            dds_data: vec![1, 2, 3],
-            duration: Duration::from_secs(1),
-            failed_chunks: 0,
-            cache_hit: true,
+    fn test_chunk_to_tile_coords_low_zoom() {
+        let coords = DdsFilename {
+            row: 16,
+            col: 32,
+            zoom: 4,
+            map_type: "BI".to_string(),
         };
 
-        let response: DdsResponse = result.into();
+        let tile = AsyncPassthroughFS::chunk_to_tile_coords(&coords);
 
-        assert_eq!(response.data, vec![1, 2, 3]);
-        assert!(response.cache_hit);
-        assert_eq!(response.duration, Duration::from_secs(1));
+        assert_eq!(tile.row, 1);
+        assert_eq!(tile.col, 2);
+        assert_eq!(tile.zoom, 0); // saturating_sub prevents underflow
     }
 
     #[test]
     fn test_handler_called() {
-        // Create a new runtime - request_dds uses block_on internally,
-        // which simulates FUSE calling from a sync context
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (handler, call_count) = create_test_handler();
 
@@ -678,7 +530,6 @@ mod tests {
 
     #[test]
     fn test_timeout_returns_placeholder() {
-        // Create a new runtime for this test
         let runtime = tokio::runtime::Runtime::new().unwrap();
 
         // Handler that never responds
@@ -694,7 +545,7 @@ mod tests {
             runtime.handle().clone(),
             1024,
         )
-        .with_timeout(Duration::from_millis(100)); // Very short timeout for test
+        .with_timeout(Duration::from_millis(100));
 
         let coords = DdsFilename {
             row: 160000,
@@ -710,9 +561,13 @@ mod tests {
     }
 
     #[test]
-    fn test_create_virtual_inode_unique() {
-        let (handler, _) = create_test_handler();
+    fn test_channel_closed_returns_placeholder() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        // Handler that drops the sender immediately
+        let handler: DdsHandler = Arc::new(|req: DdsRequest| {
+            drop(req.result_tx);
+        });
 
         let temp_dir = tempfile::tempdir().unwrap();
         let fs = AsyncPassthroughFS::new(
@@ -722,24 +577,16 @@ mod tests {
             1024,
         );
 
-        let coords1 = DdsFilename {
+        let coords = DdsFilename {
             row: 100,
             col: 200,
             zoom: 16,
             map_type: "BI".to_string(),
         };
-        let coords2 = DdsFilename {
-            row: 100,
-            col: 201,
-            zoom: 16,
-            map_type: "BI".to_string(),
-        };
 
-        let inode1 = fs.create_virtual_inode(coords1);
-        let inode2 = fs.create_virtual_inode(coords2);
+        let data = fs.request_dds(&coords);
 
-        assert_ne!(inode1, inode2);
-        assert!(AsyncPassthroughFS::is_virtual_inode(inode1));
-        assert!(AsyncPassthroughFS::is_virtual_inode(inode2));
+        // Should return placeholder
+        assert!(!data.is_empty());
     }
 }
