@@ -167,42 +167,143 @@ The thread pool size provides natural backpressure:
 | Initial load (KOAK) | 4-5 min | ~1 min (target) |
 | Memory per tile | ~50MB | ~50MB × threads |
 
-## Future: Async FUSE Model
+## Async Pipeline with Request Coalescing
 
-The current implementation uses blocking threads. A future enhancement (tracked as TD1 in TODO.md) would migrate to `fuser`'s async model:
+The async pipeline (`xearthlayer/src/pipeline/`) provides an alternative processing path
+that uses fully asynchronous I/O, avoiding thread pool exhaustion issues.
 
-### Current (Blocking)
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         X-Plane Flight Simulator                         │
+│               (Multiple threads requesting tiles concurrently)           │
+└─────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     AsyncPassthroughFS (FUSE)                            │
+│                 Receives read() calls for DDS files                      │
+└─────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       DdsHandler (runner.rs)                             │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                   RequestCoalescer                               │    │
+│  │     HashMap<TileCoord, broadcast::Sender<Result>>                │    │
+│  │    (Duplicate tile requests wait for single processing)          │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                     │                                    │
+│                          If new request                                  │
+│                                     ▼                                    │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │               Tokio Runtime (async tasks)                        │    │
+│  │          256 concurrent chunk downloads via async I/O            │    │
+│  │                 No thread pool exhaustion                        │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      AsyncProvider (async HTTP)                          │
+│           Non-blocking downloads using async reqwest                     │
+│         AsyncBingMapsProvider / AsyncGo2Provider / etc.                  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Components
+
+#### RequestCoalescer
+
+Location: `xearthlayer/src/pipeline/coalesce.rs`
+
+Prevents duplicate tile processing when multiple FUSE requests arrive for the same tile:
 
 ```rust
-impl Filesystem for PassthroughFS {
-    fn read(&mut self, ..., reply: ReplyData) {
-        // Blocks thread until tile generated
-        let data = self.generator.generate(&request);
-        reply.data(&data);
-    }
+pub struct RequestCoalescer {
+    in_flight: Mutex<HashMap<TileCoord, broadcast::Sender<Result>>>,
+    stats: Mutex<CoalescerStats>,
 }
 ```
 
-### Future (Async)
+When a request arrives:
+1. Check if tile is already being processed
+2. If yes: subscribe to broadcast channel, wait for result
+3. If no: register as new request, process tile, broadcast result
+
+Benefits:
+- Prevents 5× duplicate work when X-Plane opens multiple file handles
+- All waiters receive the same result
+- Statistics tracking for monitoring coalescing effectiveness
+
+#### AsyncProvider Trait
+
+Location: `xearthlayer/src/provider/types.rs`
+
+Async version of the Provider trait for non-blocking HTTP:
 
 ```rust
-impl AsyncFilesystem for PassthroughFS {
-    async fn read(&self, ...) -> Result<Vec<u8>> {
-        // Yields thread while waiting
-        self.generator.generate_async(&request).await
-    }
+pub trait AsyncProvider: Send + Sync {
+    async fn download_chunk(&self, row: u32, col: u32, zoom: u8) -> Result<Vec<u8>, ProviderError>;
+    fn name(&self) -> &str;
+    fn min_zoom(&self) -> u8;
+    fn max_zoom(&self) -> u8;
 }
 ```
 
-Benefits of async model:
-- Better thread utilization under high concurrency
-- More efficient I/O waiting (no blocked threads)
-- Native integration with tokio ecosystem
+Implementations:
+- `AsyncBingMapsProvider` - Bing Maps with async reqwest
+- `AsyncGo2Provider` - Google GO2 with async reqwest
+- `AsyncGoogleMapsProvider` - Google Maps API with async session creation
 
-Risks:
-- Significant refactoring required
-- Need to verify FUSE async compatibility
-- May require changes to provider/orchestrator layers
+#### AsyncHttpClient
+
+Location: `xearthlayer/src/provider/http.rs`
+
+Non-blocking HTTP client using async reqwest:
+
+```rust
+pub trait AsyncHttpClient: Send + Sync {
+    fn get(&self, url: &str) -> impl Future<Output = Result<Vec<u8>, ProviderError>> + Send;
+}
+```
+
+### Why Async I/O Matters
+
+The blocking I/O approach had a critical flaw:
+
+```
+Problem: spawn_blocking for 256 chunks per tile
+         × multiple concurrent tile requests
+         = thread pool exhaustion → deadlock
+
+With 10 tiles requested simultaneously:
+  10 tiles × 256 chunks = 2,560 spawn_blocking calls
+  Tokio's default blocking pool = 512 threads
+  Result: Deadlock after ~181,000 requests
+```
+
+The async approach eliminates this:
+- All chunk downloads use non-blocking I/O
+- Single connection pool shared across all downloads
+- Natural backpressure through semaphores
+- No thread pool exhaustion possible
+
+### Performance Comparison
+
+| Aspect | Blocking (spawn_blocking) | Async (async reqwest) |
+|--------|--------------------------|----------------------|
+| Threads per tile | 256 (blocking) | 0 (uses event loop) |
+| Max concurrent tiles | ~2 (before pool exhaustion) | Limited only by bandwidth |
+| Deadlock risk | High under load | None |
+| Connection reuse | Per-call client | Shared connection pool |
+| Memory per tile | ~2MB (thread stacks) | ~256KB (futures) |
+
+### Configuration
+
+The async pipeline is used automatically when the service is configured with
+an async provider. No additional configuration required.
 
 ## Related Files
 

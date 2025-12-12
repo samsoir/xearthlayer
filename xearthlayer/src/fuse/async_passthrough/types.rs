@@ -21,7 +21,7 @@ pub struct DdsRequest {
 }
 
 /// Response from the async pipeline.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DdsResponse {
     /// The generated DDS data
     pub data: Vec<u8>,

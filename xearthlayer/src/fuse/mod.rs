@@ -5,18 +5,15 @@
 //!
 //! # Implementations
 //!
-//! - [`PassthroughFS`] - Synchronous passthrough with blocking tile generation
-//! - [`AsyncPassthroughFS`] - Async passthrough with pipeline integration (recommended)
+//! - [`AsyncPassthroughFS`] - Async passthrough with pipeline integration (primary)
 //! - [`XEarthLayerFS`] - Standalone virtual-only filesystem
 
 mod async_passthrough;
 mod filename;
 mod filesystem;
-mod passthrough;
 mod placeholder;
 
 pub use async_passthrough::{AsyncPassthroughFS, DdsHandler, DdsRequest, DdsResponse};
 pub use filename::{parse_dds_filename, DdsFilename, ParseError};
 pub use filesystem::XEarthLayerFS;
-pub use passthrough::PassthroughFS;
 pub use placeholder::{generate_default_placeholder, generate_magenta_placeholder};

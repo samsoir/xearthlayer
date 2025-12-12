@@ -1,11 +1,15 @@
 //! HTTP client abstraction for testability
 
 use super::types::ProviderError;
+use std::future::Future;
 
-/// Trait for HTTP client operations.
+/// Trait for synchronous HTTP client operations.
 ///
 /// This abstraction allows for dependency injection and easier testing
 /// by enabling mock HTTP clients in tests.
+///
+/// **Note**: This is the legacy synchronous trait. For new code, prefer
+/// [`AsyncHttpClient`] which uses non-blocking I/O.
 pub trait HttpClient: Send + Sync {
     /// Performs an HTTP GET request.
     ///
@@ -29,6 +33,39 @@ pub trait HttpClient: Send + Sync {
     ///
     /// The response body as bytes or an error.
     fn post_json(&self, url: &str, json_body: &str) -> Result<Vec<u8>, ProviderError>;
+}
+
+/// Trait for asynchronous HTTP client operations.
+///
+/// This is the preferred HTTP client trait for new code. It uses non-blocking
+/// I/O via async/await, avoiding thread pool exhaustion under high load.
+pub trait AsyncHttpClient: Send + Sync {
+    /// Performs an async HTTP GET request.
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The URL to request
+    ///
+    /// # Returns
+    ///
+    /// The response body as bytes or an error.
+    fn get(&self, url: &str) -> impl Future<Output = Result<Vec<u8>, ProviderError>> + Send;
+
+    /// Performs an async HTTP POST request with JSON body.
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The URL to request
+    /// * `json_body` - JSON body as a string
+    ///
+    /// # Returns
+    ///
+    /// The response body as bytes or an error.
+    fn post_json(
+        &self,
+        url: &str,
+        json_body: &str,
+    ) -> impl Future<Output = Result<Vec<u8>, ProviderError>> + Send;
 }
 
 /// Real HTTP client implementation using reqwest.
@@ -125,11 +162,108 @@ impl HttpClient for ReqwestClient {
     }
 }
 
+/// Async HTTP client implementation using reqwest.
+///
+/// This client uses non-blocking I/O and is the preferred choice for
+/// high-throughput scenarios. Unlike the blocking `ReqwestClient`, this
+/// does not consume threads from Tokio's blocking pool.
+pub struct AsyncReqwestClient {
+    client: reqwest::Client,
+}
+
+impl AsyncReqwestClient {
+    /// Creates a new AsyncReqwestClient with default configuration.
+    pub fn new() -> Result<Self, ProviderError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent(DEFAULT_USER_AGENT)
+            .build()
+            .map_err(|e| {
+                ProviderError::HttpError(format!("Failed to create async HTTP client: {}", e))
+            })?;
+
+        Ok(Self { client })
+    }
+
+    /// Creates a new AsyncReqwestClient with custom timeout.
+    pub fn with_timeout(timeout_secs: u64) -> Result<Self, ProviderError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .user_agent(DEFAULT_USER_AGENT)
+            .build()
+            .map_err(|e| {
+                ProviderError::HttpError(format!("Failed to create async HTTP client: {}", e))
+            })?;
+
+        Ok(Self { client })
+    }
+}
+
+impl Default for AsyncReqwestClient {
+    fn default() -> Self {
+        Self::new().expect("Failed to create default async HTTP client")
+    }
+}
+
+impl AsyncHttpClient for AsyncReqwestClient {
+    async fn get(&self, url: &str) -> Result<Vec<u8>, ProviderError> {
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| ProviderError::HttpError(format!("Request failed: {}", e)))?;
+
+        // Check HTTP status
+        if !response.status().is_success() {
+            return Err(ProviderError::HttpError(format!(
+                "HTTP {} from {}",
+                response.status(),
+                url
+            )));
+        }
+
+        // Read response body
+        response
+            .bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| ProviderError::HttpError(format!("Failed to read response: {}", e)))
+    }
+
+    async fn post_json(&self, url: &str, json_body: &str) -> Result<Vec<u8>, ProviderError> {
+        let response = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .body(json_body.to_string())
+            .send()
+            .await
+            .map_err(|e| ProviderError::HttpError(format!("POST request failed: {}", e)))?;
+
+        // Check HTTP status
+        if !response.status().is_success() {
+            return Err(ProviderError::HttpError(format!(
+                "HTTP {} from POST {}",
+                response.status(),
+                url
+            )));
+        }
+
+        // Read response body
+        response
+            .bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| ProviderError::HttpError(format!("Failed to read response: {}", e)))
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
 
-    /// Mock HTTP client for testing
+    /// Mock HTTP client for testing (synchronous)
     pub struct MockHttpClient {
         pub response: Result<Vec<u8>, ProviderError>,
     }
@@ -140,6 +274,21 @@ pub mod tests {
         }
 
         fn post_json(&self, _url: &str, _json_body: &str) -> Result<Vec<u8>, ProviderError> {
+            self.response.clone()
+        }
+    }
+
+    /// Mock async HTTP client for testing
+    pub struct MockAsyncHttpClient {
+        pub response: Result<Vec<u8>, ProviderError>,
+    }
+
+    impl AsyncHttpClient for MockAsyncHttpClient {
+        async fn get(&self, _url: &str) -> Result<Vec<u8>, ProviderError> {
+            self.response.clone()
+        }
+
+        async fn post_json(&self, _url: &str, _json_body: &str) -> Result<Vec<u8>, ProviderError> {
             self.response.clone()
         }
     }
@@ -162,6 +311,27 @@ pub mod tests {
         };
 
         let result = mock.get("http://example.com");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_mock_async_client_success() {
+        let mock = MockAsyncHttpClient {
+            response: Ok(vec![1, 2, 3, 4]),
+        };
+
+        let result = mock.get("http://example.com").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_mock_async_client_error() {
+        let mock = MockAsyncHttpClient {
+            response: Err(ProviderError::HttpError("Test error".to_string())),
+        };
+
+        let result = mock.get("http://example.com").await;
         assert!(result.is_err());
     }
 }

@@ -10,11 +10,19 @@
 //! FUSE Request → Job → Download Stage → Assembly Stage → Encode Stage → Cache Stage → Response
 //! ```
 //!
+//! # Request Coalescing
+//!
+//! The pipeline includes automatic request coalescing via [`RequestCoalescer`].
+//! When multiple requests for the same tile arrive simultaneously, only one
+//! processing task runs - all waiters receive the same result. This prevents
+//! duplicate work during X-Plane's burst loading patterns.
+//!
 //! # Key Components
 //!
 //! - [`Job`] - Represents a request for a DDS tile
 //! - [`JobId`] - Unique identifier for tracking jobs through the pipeline
 //! - [`JobResult`] - The result of processing a job
+//! - [`RequestCoalescer`] - Coalesces duplicate requests for efficiency
 //!
 //! # Example
 //!
@@ -35,6 +43,7 @@
 //! ```
 
 pub mod adapters;
+mod coalesce;
 mod context;
 mod error;
 mod executor;
@@ -43,6 +52,7 @@ mod processor;
 mod runner;
 pub mod stages;
 
+pub use coalesce::{CoalescerStats, RequestCoalescer};
 pub use context::{
     ChunkDownloadError, ChunkProvider, DiskCache, MemoryCache, PipelineConfig, PipelineContext,
     TextureEncodeError, TextureEncoderAsync,

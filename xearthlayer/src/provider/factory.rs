@@ -2,12 +2,17 @@
 //!
 //! This module provides a factory pattern for creating imagery providers,
 //! eliminating duplication in CLI code and centralizing provider configuration.
+//!
+//! # Factories
+//!
+//! - [`ProviderFactory`] - Creates sync `Provider` instances (legacy)
+//! - [`AsyncProviderFactory`] - Creates `AsyncProvider` instances (preferred)
 
-use super::bing::BingMapsProvider;
-use super::go2::Go2Provider;
-use super::google::GoogleMapsProvider;
-use super::http::ReqwestClient;
-use super::types::{Provider, ProviderError};
+use super::bing::{AsyncBingMapsProvider, BingMapsProvider};
+use super::go2::{AsyncGo2Provider, Go2Provider};
+use super::google::{AsyncGoogleMapsProvider, GoogleMapsProvider};
+use super::http::{AsyncReqwestClient, ReqwestClient};
+use super::types::{AsyncProvider, Provider, ProviderError};
 use std::sync::Arc;
 
 /// Configuration for creating a provider.
@@ -148,6 +153,122 @@ impl ProviderFactory {
                 let name = provider.name().to_string();
                 let max_zoom = provider.max_zoom();
                 Ok((Arc::new(provider), name, max_zoom))
+            }
+        }
+    }
+}
+
+/// Factory for creating async provider instances.
+///
+/// This is the preferred factory for production use. It creates `AsyncProvider`
+/// implementations that use non-blocking I/O, avoiding thread pool exhaustion
+/// under high concurrent load.
+///
+/// # Example
+///
+/// ```ignore
+/// use xearthlayer::provider::{AsyncProviderFactory, ProviderConfig, AsyncReqwestClient};
+///
+/// let http_client = AsyncReqwestClient::new()?;
+/// let factory = AsyncProviderFactory::new(http_client);
+///
+/// // Create a Bing Maps provider (sync operation)
+/// let (provider, name, max_zoom) = factory.create_sync(&ProviderConfig::Bing)?;
+///
+/// // Create a Google Maps provider (async - requires session creation)
+/// let google_config = ProviderConfig::google("YOUR_API_KEY");
+/// let (provider, name, max_zoom) = factory.create(&google_config).await?;
+/// ```
+pub struct AsyncProviderFactory {
+    http_client: AsyncReqwestClient,
+}
+
+/// Enum to hold different async provider types.
+///
+/// This allows the factory to return different concrete provider types
+/// while maintaining a common interface.
+pub enum AsyncProviderType {
+    Bing(AsyncBingMapsProvider<AsyncReqwestClient>),
+    Go2(AsyncGo2Provider<AsyncReqwestClient>),
+    Google(AsyncGoogleMapsProvider<AsyncReqwestClient>),
+}
+
+impl AsyncProvider for AsyncProviderType {
+    async fn download_chunk(&self, row: u32, col: u32, zoom: u8) -> Result<Vec<u8>, ProviderError> {
+        match self {
+            Self::Bing(p) => p.download_chunk(row, col, zoom).await,
+            Self::Go2(p) => p.download_chunk(row, col, zoom).await,
+            Self::Google(p) => p.download_chunk(row, col, zoom).await,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Bing(p) => p.name(),
+            Self::Go2(p) => p.name(),
+            Self::Google(p) => p.name(),
+        }
+    }
+
+    fn min_zoom(&self) -> u8 {
+        match self {
+            Self::Bing(p) => p.min_zoom(),
+            Self::Go2(p) => p.min_zoom(),
+            Self::Google(p) => p.min_zoom(),
+        }
+    }
+
+    fn max_zoom(&self) -> u8 {
+        match self {
+            Self::Bing(p) => p.max_zoom(),
+            Self::Go2(p) => p.max_zoom(),
+            Self::Google(p) => p.max_zoom(),
+        }
+    }
+}
+
+impl AsyncProviderFactory {
+    /// Create a new async provider factory with the given HTTP client.
+    pub fn new(http_client: AsyncReqwestClient) -> Self {
+        Self { http_client }
+    }
+
+    /// Create an async provider from the given configuration.
+    ///
+    /// This is an async method because some providers (like Google Maps)
+    /// require async initialization (session creation).
+    ///
+    /// Returns a tuple of:
+    /// - The provider
+    /// - The provider's name (for logging)
+    /// - The provider's maximum zoom level
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if provider creation fails.
+    pub async fn create(
+        self,
+        config: &ProviderConfig,
+    ) -> Result<(AsyncProviderType, String, u8), ProviderError> {
+        match config {
+            ProviderConfig::Bing => {
+                let provider = AsyncBingMapsProvider::new(self.http_client);
+                let name = provider.name().to_string();
+                let max_zoom = provider.max_zoom();
+                Ok((AsyncProviderType::Bing(provider), name, max_zoom))
+            }
+            ProviderConfig::Go2 => {
+                let provider = AsyncGo2Provider::new(self.http_client);
+                let name = provider.name().to_string();
+                let max_zoom = provider.max_zoom();
+                Ok((AsyncProviderType::Go2(provider), name, max_zoom))
+            }
+            ProviderConfig::Google { api_key } => {
+                let provider =
+                    AsyncGoogleMapsProvider::new(self.http_client, api_key.clone()).await?;
+                let name = provider.name().to_string();
+                let max_zoom = provider.max_zoom();
+                Ok((AsyncProviderType::Google(provider), name, max_zoom))
             }
         }
     }

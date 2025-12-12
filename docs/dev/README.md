@@ -14,11 +14,12 @@ Technical documentation for XEarthLayer developers and contributors.
 
 | Document | Description |
 |----------|-------------|
+| [Async Pipeline Architecture](async-pipeline-architecture.md) | **Primary design doc**: multi-stage async processing, request coalescing, thread pool exhaustion fix |
 | [Coordinate System](coordinate-system.md) | Web Mercator projection, tile math, zoom levels |
 | [DDS Implementation](dds-implementation.md) | BC1/BC3 texture compression, mipmap generation |
 | [FUSE Filesystem](fuse-filesystem.md) | Virtual filesystem, passthrough implementation |
 | [Cache Design](cache-design.md) | Two-tier caching (memory + disk), LRU eviction |
-| [Parallel Processing](parallel-processing.md) | Thread pools, request coalescing |
+| [Parallel Processing](parallel-processing.md) | Thread pools, legacy coalescing (see async pipeline for current) |
 | [Network Stats](network-stats.md) | Download metrics, bandwidth tracking |
 
 ## Package System
@@ -42,12 +43,14 @@ Technical documentation for XEarthLayer developers and contributors.
 ```
 xearthlayer-cli
     └── xearthlayer (library)
-            ├── provider (Bing, Google, GO2)
-            ├── orchestrator (parallel downloads)
-            ├── tile (generation pipeline)
-            │       └── texture (DDS encoding)
+            ├── provider (Bing, Go2, Google - sync + async variants)
+            ├── pipeline (async tile processing)
+            │       ├── coalesce (request coalescing)
+            │       ├── stages (download, assembly, encode, cache)
+            │       └── adapters (bridges to providers, cache)
+            ├── texture (DDS encoding)
             ├── cache (memory + disk)
-            ├── fuse (virtual filesystem)
+            ├── fuse/async_passthrough (virtual filesystem)
             ├── package (metadata, library parsing)
             ├── manager (install, update, remove)
             └── publisher (scan, build, release)

@@ -6,7 +6,8 @@
 //!
 //! # Adapters
 //!
-//! - [`ProviderAdapter`] - Adapts `Provider` to `ChunkProvider`
+//! - [`ProviderAdapter`] - Adapts sync `Provider` to `ChunkProvider` (legacy)
+//! - [`AsyncProviderAdapter`] - Adapts `AsyncProvider` to `ChunkProvider` (preferred)
 //! - [`TextureEncoderAdapter`] - Adapts `TextureEncoder` to `TextureEncoderAsync`
 //! - [`MemoryCacheAdapter`] - Adapts `cache::MemoryCache` to pipeline `MemoryCache`
 //! - [`DiskCacheAdapter`] - Adapts disk cache operations to pipeline `DiskCache`
@@ -19,5 +20,5 @@ mod texture_encoder;
 
 pub use disk_cache::{DiskCacheAdapter, NullDiskCache};
 pub use memory_cache::MemoryCacheAdapter;
-pub use provider::ProviderAdapter;
+pub use provider::{AsyncProviderAdapter, ProviderAdapter};
 pub use texture_encoder::TextureEncoderAdapter;

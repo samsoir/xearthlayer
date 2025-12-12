@@ -22,12 +22,12 @@ mod google;
 mod http;
 mod types;
 
-pub use bing::BingMapsProvider;
-pub use factory::{ProviderConfig, ProviderFactory};
-pub use go2::Go2Provider;
-pub use google::GoogleMapsProvider;
-pub use http::{HttpClient, ReqwestClient};
-pub use types::{Provider, ProviderError};
+pub use bing::{AsyncBingMapsProvider, BingMapsProvider};
+pub use factory::{AsyncProviderFactory, AsyncProviderType, ProviderConfig, ProviderFactory};
+pub use go2::{AsyncGo2Provider, Go2Provider};
+pub use google::{AsyncGoogleMapsProvider, GoogleMapsProvider};
+pub use http::{AsyncHttpClient, AsyncReqwestClient, HttpClient, ReqwestClient};
+pub use types::{AsyncProvider, Provider, ProviderError};
 
 #[cfg(test)]
-pub use http::tests::MockHttpClient;
+pub use http::tests::{MockAsyncHttpClient, MockHttpClient};

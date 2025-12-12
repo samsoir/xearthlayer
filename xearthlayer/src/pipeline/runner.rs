@@ -2,21 +2,33 @@
 //!
 //! This module provides the connection between the FUSE filesystem's
 //! `DdsHandler` callback and the async pipeline processor.
+//!
+//! # Request Coalescing
+//!
+//! The runner includes automatic request coalescing to prevent duplicate work
+//! when multiple requests for the same tile arrive simultaneously. This is
+//! common during X-Plane's burst loading patterns where multiple file handles
+//! request the same texture concurrently.
 
 use crate::fuse::{DdsHandler, DdsRequest, DdsResponse};
+use crate::pipeline::coalesce::{CoalesceResult, RequestCoalescer};
 use crate::pipeline::{
     process_tile, BlockingExecutor, ChunkProvider, DiskCache, MemoryCache, PipelineConfig,
     TextureEncoderAsync,
 };
 use std::sync::Arc;
 use tokio::runtime::Handle;
-use tracing::{error, instrument};
+use tracing::{debug, error, info, instrument};
 
 /// Creates a `DdsHandler` that processes requests through the async pipeline.
 ///
 /// This function creates the bridge between FUSE's synchronous callback model
 /// and the async pipeline. Each DDS request spawns a task on the Tokio runtime
 /// that processes the tile and sends the result back via oneshot channel.
+///
+/// **Request Coalescing**: When multiple requests for the same tile arrive
+/// simultaneously, only one processing task runs. All waiters receive the
+/// same result, preventing duplicate work.
 ///
 /// # Type Parameters
 ///
@@ -71,31 +83,58 @@ where
     D: DiskCache + 'static,
     X: BlockingExecutor + 'static,
 {
+    // Create shared coalescer for all requests
+    let coalescer = Arc::new(RequestCoalescer::new());
+
+    info!("Created DDS handler with request coalescing enabled");
+
     Arc::new(move |request: DdsRequest| {
         let provider = Arc::clone(&provider);
         let encoder = Arc::clone(&encoder);
         let memory_cache = Arc::clone(&memory_cache);
         let disk_cache = Arc::clone(&disk_cache);
         let executor = Arc::clone(&executor);
+        let coalescer = Arc::clone(&coalescer);
         let config = config.clone();
+        let job_id = request.job_id;
+        let tile = request.tile;
+
+        debug!(
+            job_id = %job_id,
+            tile = ?tile,
+            "Received DDS request"
+        );
 
         // Spawn the processing task on the Tokio runtime
-        runtime_handle.spawn(async move {
-            process_dds_request(
+        let spawn_result = runtime_handle.spawn(async move {
+            process_dds_request_coalesced(
                 request,
                 provider,
                 encoder,
                 memory_cache,
                 disk_cache,
                 executor,
+                coalescer,
                 config,
             )
             .await;
         });
+
+        // Check if spawn succeeded (it should, but let's be sure)
+        if spawn_result.is_finished() {
+            error!(
+                job_id = %job_id,
+                "Task finished immediately after spawn - this is unexpected"
+            );
+        }
     })
 }
 
 /// Process a single DDS request through the pipeline.
+///
+/// This is the non-coalescing version, useful for testing or when coalescing
+/// is not desired.
+#[allow(dead_code)]
 #[instrument(skip_all, fields(job_id = %request.job_id, tile = ?request.tile))]
 async fn process_dds_request<P, E, M, D, X>(
     request: DdsRequest,
@@ -112,6 +151,12 @@ async fn process_dds_request<P, E, M, D, X>(
     D: DiskCache,
     X: BlockingExecutor,
 {
+    info!(
+        job_id = %request.job_id,
+        tile = ?request.tile,
+        "Processing DDS request - starting pipeline"
+    );
+
     let result = process_tile(
         request.job_id,
         request.tile,
@@ -123,6 +168,12 @@ async fn process_dds_request<P, E, M, D, X>(
         &config,
     )
     .await;
+
+    info!(
+        job_id = %request.job_id,
+        success = result.is_ok(),
+        "Pipeline processing finished"
+    );
 
     let response = match result {
         Ok(job_result) => DdsResponse::from(job_result),
@@ -139,7 +190,135 @@ async fn process_dds_request<P, E, M, D, X>(
 
     // Send response back to FUSE handler
     // Ignore error if receiver dropped (FUSE handler timed out)
+    info!(
+        job_id = %request.job_id,
+        data_len = response.data.len(),
+        "Sending response"
+    );
     let _ = request.result_tx.send(response);
+}
+
+/// Process a DDS request with coalescing support.
+///
+/// This function checks if another request for the same tile is already in flight.
+/// If so, it waits for that request to complete and shares the result.
+/// Otherwise, it processes the tile and broadcasts the result to any waiting requests.
+#[allow(clippy::too_many_arguments)]
+#[instrument(skip_all, fields(job_id = %request.job_id, tile = ?request.tile))]
+async fn process_dds_request_coalesced<P, E, M, D, X>(
+    request: DdsRequest,
+    provider: Arc<P>,
+    encoder: Arc<E>,
+    memory_cache: Arc<M>,
+    disk_cache: Arc<D>,
+    executor: Arc<X>,
+    coalescer: Arc<RequestCoalescer>,
+    config: PipelineConfig,
+) where
+    P: ChunkProvider,
+    E: TextureEncoderAsync,
+    M: MemoryCache,
+    D: DiskCache,
+    X: BlockingExecutor,
+{
+    let tile = request.tile;
+    let job_id = request.job_id;
+
+    // Try to register this request with the coalescer
+    let coalesce_result = coalescer.register(tile).await;
+
+    match coalesce_result {
+        CoalesceResult::Coalesced(mut rx) => {
+            // Another request is in flight - wait for its result
+            debug!(
+                job_id = %job_id,
+                tile = ?tile,
+                "Waiting for coalesced result"
+            );
+
+            let response = match rx.recv().await {
+                Ok(result) => {
+                    debug!(
+                        job_id = %job_id,
+                        tile = ?tile,
+                        data_len = result.data.len(),
+                        "Received coalesced result"
+                    );
+                    DdsResponse {
+                        data: (*result.data).clone(),
+                        cache_hit: result.cache_hit,
+                        duration: result.duration,
+                    }
+                }
+                Err(_) => {
+                    // Channel closed without sending - this shouldn't happen
+                    // but handle gracefully with a placeholder
+                    error!(
+                        job_id = %job_id,
+                        tile = ?tile,
+                        "Coalesced request failed - channel closed"
+                    );
+                    DdsResponse {
+                        data: crate::fuse::generate_default_placeholder().unwrap_or_default(),
+                        cache_hit: false,
+                        duration: std::time::Duration::ZERO,
+                    }
+                }
+            };
+
+            // Send response back to FUSE handler
+            let _ = request.result_tx.send(response);
+        }
+        CoalesceResult::NewRequest { .. } => {
+            // This is the first request for this tile - process it
+            info!(
+                job_id = %job_id,
+                tile = ?tile,
+                "Processing DDS request - starting pipeline"
+            );
+
+            let result = process_tile(
+                job_id,
+                tile,
+                provider,
+                encoder,
+                memory_cache,
+                disk_cache,
+                executor.as_ref(),
+                &config,
+            )
+            .await;
+
+            info!(
+                job_id = %job_id,
+                success = result.is_ok(),
+                "Pipeline processing finished"
+            );
+
+            let response = match result {
+                Ok(job_result) => DdsResponse::from(job_result),
+                Err(e) => {
+                    error!(error = %e, "Pipeline processing failed");
+                    DdsResponse {
+                        data: crate::fuse::generate_default_placeholder().unwrap_or_default(),
+                        cache_hit: false,
+                        duration: std::time::Duration::ZERO,
+                    }
+                }
+            };
+
+            // Complete the coalesced request - broadcasts to all waiters
+            coalescer.complete(tile, response.clone()).await;
+
+            // Send response back to the original requester
+            info!(
+                job_id = %job_id,
+                data_len = response.data.len(),
+                "Sending response"
+            );
+            let _ = request.result_tx.send(response);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -377,5 +556,106 @@ mod tests {
         // Cache should now have an entry
         assert_eq!(memory_cache.entry_count(), 1);
         assert!(memory_cache.get(100, 200, 16).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_coalescing_multiple_requests_same_tile() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Provider that tracks how many times it's called
+        struct CountingProvider {
+            call_count: AtomicUsize,
+        }
+
+        impl CountingProvider {
+            fn new() -> Self {
+                Self {
+                    call_count: AtomicUsize::new(0),
+                }
+            }
+        }
+
+        impl ChunkProvider for CountingProvider {
+            async fn download_chunk(
+                &self,
+                _row: u32,
+                _col: u32,
+                _zoom: u8,
+            ) -> Result<Vec<u8>, ChunkDownloadError> {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+                // Add a small delay to allow coalescing to happen
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(create_test_png())
+            }
+
+            fn name(&self) -> &str {
+                "counting"
+            }
+        }
+
+        let provider = Arc::new(CountingProvider::new());
+        let encoder = Arc::new(MockEncoder);
+        let memory_cache = Arc::new(MockMemoryCache::new());
+        let disk_cache = Arc::new(NullDiskCache);
+        let executor = Arc::new(TokioExecutor::new());
+        let config = PipelineConfig {
+            max_retries: 1,
+            ..Default::default()
+        };
+
+        let handler = create_dds_handler(
+            Arc::clone(&provider),
+            encoder,
+            memory_cache,
+            disk_cache,
+            executor,
+            config,
+            Handle::current(),
+        );
+
+        // Send multiple requests for the same tile concurrently
+        let tile = TileCoord {
+            row: 100,
+            col: 200,
+            zoom: 16,
+        };
+
+        let mut handles = vec![];
+        for _ in 0..5 {
+            let (tx, rx) = oneshot::channel();
+            let request = DdsRequest {
+                job_id: JobId::new(),
+                tile,
+                result_tx: tx,
+            };
+
+            handler(request);
+            handles.push(rx);
+        }
+
+        // Wait for all responses
+        for handle in handles {
+            let response = tokio::time::timeout(Duration::from_secs(60), handle)
+                .await
+                .expect("timeout")
+                .expect("channel closed");
+
+            // All should succeed
+            assert!(!response.data.is_empty());
+        }
+
+        // With coalescing, the provider should be called significantly fewer times
+        // than 5 * 256 = 1280 times (one per chunk per request).
+        // In the ideal case with perfect coalescing, it would be 256 calls
+        // (one per chunk for the single processing request).
+        let total_calls = provider.call_count.load(Ordering::SeqCst);
+
+        // Allow some variance due to timing, but expect significant reduction
+        // from 1280 (without coalescing) to ~256 (with perfect coalescing)
+        assert!(
+            total_calls < 1000,
+            "Expected coalescing to reduce calls, got {} calls (expected <1000)",
+            total_calls
+        );
     }
 }

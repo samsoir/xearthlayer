@@ -24,6 +24,8 @@ pub enum ServiceError {
     InvalidCoordinates { lat: f64, lon: f64, reason: String },
     /// Zoom level out of range
     InvalidZoom { zoom: u8, min: u8, max: u8 },
+    /// Failed to create Tokio runtime
+    RuntimeError(String),
 }
 
 impl fmt::Display for ServiceError {
@@ -45,6 +47,7 @@ impl fmt::Display for ServiceError {
                     zoom, min, max
                 )
             }
+            Self::RuntimeError(msg) => write!(f, "Runtime error: {}", msg),
         }
     }
 }
@@ -136,5 +139,12 @@ mod tests {
     fn test_error_trait() {
         let err = ServiceError::ConfigError("test".to_string());
         let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn test_display_runtime_error() {
+        let err = ServiceError::RuntimeError("failed to spawn runtime".to_string());
+        assert!(err.to_string().contains("Runtime error"));
+        assert!(err.to_string().contains("failed to spawn runtime"));
     }
 }

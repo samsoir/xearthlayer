@@ -82,6 +82,9 @@ pub struct ActiveMount {
 pub struct MountManager {
     /// Active background sessions, keyed by region.
     sessions: HashMap<String, BackgroundSession>,
+    /// Services that own the Tokio runtimes - MUST be kept alive while sessions are active.
+    /// The service contains the runtime that processes DDS generation requests.
+    services: HashMap<String, XEarthLayerService>,
     /// Mount information for display purposes.
     mounts: HashMap<String, ActiveMount>,
     /// Target scenery directory for mounts (e.g., X-Plane Custom Scenery).
@@ -94,6 +97,7 @@ impl MountManager {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            services: HashMap::new(),
             mounts: HashMap::new(),
             scenery_path: None,
         }
@@ -106,6 +110,7 @@ impl MountManager {
     pub fn with_scenery_path(scenery_path: &std::path::Path) -> Self {
         Self {
             sessions: HashMap::new(),
+            services: HashMap::new(),
             mounts: HashMap::new(),
             scenery_path: Some(scenery_path.to_path_buf()),
         }
@@ -263,6 +268,10 @@ impl MountManager {
                 };
 
                 self.sessions.insert(region.clone(), session);
+                // CRITICAL: Store the service to keep its Tokio runtime alive.
+                // The DdsHandler closure holds a Handle to the runtime owned by the service.
+                // If the service is dropped, the runtime shuts down and spawned tasks abort.
+                self.services.insert(region.clone(), service);
                 self.mounts.insert(region.clone(), mount_info);
 
                 MountResult::success(region, package.package_type(), mountpoint)
@@ -291,8 +300,10 @@ impl MountManager {
             });
         }
 
-        // Remove session - Drop will trigger unmount
+        // Remove session first - Drop will trigger unmount
         self.sessions.remove(&key);
+        // Then remove service - this shuts down the runtime
+        self.services.remove(&key);
         self.mounts.remove(&key);
 
         Ok(())
@@ -306,7 +317,10 @@ impl MountManager {
         let keys: Vec<String> = self.sessions.keys().cloned().collect();
 
         for key in keys.into_iter().rev() {
+            // Remove session first to unmount filesystem
             self.sessions.remove(&key);
+            // Then remove service to shut down runtime
+            self.services.remove(&key);
             self.mounts.remove(&key);
         }
     }
