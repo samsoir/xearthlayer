@@ -99,10 +99,6 @@ enum Commands {
         /// Disable caching (always generate tiles fresh)
         #[arg(long)]
         no_cache: bool,
-
-        /// Use fuse3 async multi-threaded backend (experimental, higher performance)
-        #[arg(long)]
-        fuse3: bool,
     },
 
     /// Start XEarthLayer and mount all installed ortho packages for X-Plane
@@ -134,10 +130,6 @@ enum Commands {
         /// Disable caching (always generate tiles fresh)
         #[arg(long)]
         no_cache: bool,
-
-        /// Use fuse3 async multi-threaded backend (experimental, higher performance)
-        #[arg(long)]
-        fuse3: bool,
     },
 
     /// Download a single tile to a file (for testing)
@@ -194,7 +186,6 @@ fn main() {
             timeout,
             parallel,
             no_cache,
-            fuse3,
         } => commands::start::run(commands::start::StartArgs {
             source,
             mountpoint,
@@ -204,7 +195,6 @@ fn main() {
             timeout,
             parallel,
             no_cache,
-            fuse3,
         }),
         Commands::Download {
             lat,
@@ -230,7 +220,6 @@ fn main() {
             timeout,
             parallel,
             no_cache,
-            fuse3,
         } => commands::run::run(commands::run::RunArgs {
             provider,
             google_api_key,
@@ -238,7 +227,6 @@ fn main() {
             timeout,
             parallel,
             no_cache,
-            fuse3,
         }),
     };
 

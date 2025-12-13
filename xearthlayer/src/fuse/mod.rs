@@ -3,20 +3,20 @@
 //! Provides a virtual filesystem that intercepts X-Plane texture reads
 //! and generates satellite imagery DDS files on demand.
 //!
-//! # Implementations
+//! # Implementation
 //!
-//! - [`fuse3::Fuse3PassthroughFS`] - Async multi-threaded passthrough (recommended)
-//! - [`AsyncPassthroughFS`] - Legacy single-threaded passthrough (fuser-based)
-//! - [`XEarthLayerFS`] - Standalone virtual-only filesystem
+//! Uses [`Fuse3PassthroughFS`] - an async multi-threaded passthrough filesystem
+//! that overlays existing scenery directories while generating DDS textures on-demand.
 
-pub mod async_passthrough;
+// Internal modules for shared types (used by fuse3)
+pub(crate) mod async_passthrough;
+
 mod filename;
-mod filesystem;
 pub mod fuse3;
 mod placeholder;
 
-pub use async_passthrough::{AsyncPassthroughFS, DdsHandler, DdsRequest, DdsResponse};
+// Re-export types for public API
+pub use async_passthrough::{DdsHandler, DdsRequest, DdsResponse};
 pub use filename::{parse_dds_filename, DdsFilename, ParseError};
-pub use filesystem::XEarthLayerFS;
 pub use fuse3::{Fuse3Error, Fuse3PassthroughFS, Fuse3Result, MountHandle, SpawnedMountHandle};
 pub use placeholder::{generate_default_placeholder, generate_magenta_placeholder};

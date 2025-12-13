@@ -170,3 +170,99 @@ impl Drop for SpawnedMountHandle {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fuse3_error_io() {
+        let io_err = io::Error::new(io::ErrorKind::NotFound, "file not found");
+        let err: Fuse3Error = io_err.into();
+        assert!(err.to_string().contains("I/O error"));
+    }
+
+    #[test]
+    fn test_fuse3_error_mount_failed() {
+        let err = Fuse3Error::MountFailed("permission denied".to_string());
+        assert!(err.to_string().contains("Mount failed"));
+        assert!(err.to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn test_fuse3_error_invalid_path() {
+        let err = Fuse3Error::InvalidPath("/invalid/path".to_string());
+        assert!(err.to_string().contains("Invalid path"));
+        assert!(err.to_string().contains("/invalid/path"));
+    }
+
+    #[test]
+    fn test_fuse3_result_type() {
+        // Test that Fuse3Result works as expected
+        let ok_result: Fuse3Result<i32> = Ok(42);
+        assert_eq!(ok_result.unwrap(), 42);
+
+        let err_result: Fuse3Result<i32> = Err(Fuse3Error::InvalidPath("test".to_string()));
+        assert!(err_result.is_err());
+    }
+
+    #[test]
+    fn test_spawned_mount_handle_creation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let (tx, _rx) = oneshot::channel();
+            let task = tokio::spawn(async { Ok(()) });
+            let mountpoint = PathBuf::from("/test/mount");
+
+            let handle = SpawnedMountHandle::new(task, tx, mountpoint.clone());
+
+            // Handle should have task and channel
+            assert!(handle.task.is_some());
+            assert!(handle.unmount_tx.is_some());
+            assert_eq!(handle.mountpoint, mountpoint);
+        });
+    }
+
+    #[tokio::test]
+    async fn test_spawned_mount_handle_unmount_async() {
+        let (tx, rx) = oneshot::channel();
+
+        // Create a task that waits for unmount signal
+        let task = tokio::spawn(async move {
+            let _ = rx.await;
+            Ok(())
+        });
+
+        let mountpoint = PathBuf::from("/test/mount");
+        let handle = SpawnedMountHandle::new(task, tx, mountpoint);
+
+        // Unmount should complete successfully
+        let result = handle.unmount().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_spawned_mount_handle_unmount_task_already_done() {
+        let (tx, _rx) = oneshot::channel();
+
+        // Create a task that completes immediately
+        let task = tokio::spawn(async { Ok(()) });
+
+        // Wait for task to complete
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let mountpoint = PathBuf::from("/test/mount");
+        let mut handle = SpawnedMountHandle::new(task, tx, mountpoint);
+
+        // Take the unmount_tx before calling unmount
+        handle.unmount_tx.take();
+        handle.task.take();
+
+        // Unmount with no task should succeed
+        let result = handle.unmount().await;
+        assert!(result.is_ok());
+    }
+}

@@ -18,7 +18,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "local-time"] }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 tracing-appender = "0.2"
-# FUSE libraries - fuser (legacy, single-threaded) and fuse3 (new, async multi-threaded)
+# FUSE libraries - fuse3 is the active implementation (async multi-threaded)
+# fuser is retained for legacy type definitions but not used at runtime
 fuser = "0.14"
 fuse3 = { version = "0.8", features = ["tokio-runtime", "unprivileged"] }
 libc = "0.2"

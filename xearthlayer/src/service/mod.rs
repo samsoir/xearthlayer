@@ -25,10 +25,14 @@
 //! ```
 
 mod config;
+mod dds_handler;
 mod error;
 mod facade;
+mod fuse_mount;
 mod network_logger;
 
 pub use config::{ServiceConfig, ServiceConfigBuilder};
+pub use dds_handler::DdsHandlerBuilder;
 pub use error::ServiceError;
 pub use facade::XEarthLayerService;
+pub use fuse_mount::{FuseMountConfig, FuseMountService};

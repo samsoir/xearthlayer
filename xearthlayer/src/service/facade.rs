@@ -1,22 +1,16 @@
 //! XEarthLayer service facade implementation.
 
 use super::config::ServiceConfig;
+use super::dds_handler::DdsHandlerBuilder;
 use super::error::ServiceError;
+use super::fuse_mount::{FuseMountConfig, FuseMountService};
 use super::network_logger::NetworkStatsLogger;
 use crate::cache::{Cache, CacheConfig, CacheSystem, MemoryCache, NoOpCache};
 use crate::coord::to_tile_coords;
-use crate::fuse::{
-    AsyncPassthroughFS, DdsHandler, Fuse3PassthroughFS, MountHandle, SpawnedMountHandle,
-    XEarthLayerFS,
-};
+use crate::fuse::{DdsHandler, MountHandle, SpawnedMountHandle};
 use crate::log::Logger;
 use crate::log_info;
 use crate::orchestrator::{NetworkStats, TileOrchestrator};
-use crate::pipeline::adapters::{
-    AsyncProviderAdapter, MemoryCacheAdapter, NullDiskCache, ParallelDiskCache, ProviderAdapter,
-    TextureEncoderAdapter,
-};
-use crate::pipeline::{create_dds_handler_with_metrics, PipelineConfig, TokioExecutor};
 use crate::provider::{
     AsyncProviderFactory, AsyncProviderType, AsyncReqwestClient, Provider, ProviderConfig,
     ProviderFactory, ReqwestClient,
@@ -26,7 +20,6 @@ use crate::texture::{DdsTextureEncoder, TextureEncoder};
 use crate::tile::{
     DefaultTileGenerator, ParallelConfig, ParallelTileGenerator, TileGenerator, TileRequest,
 };
-use fuser::BackgroundSession;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -427,206 +420,38 @@ impl XEarthLayerService {
             .map_err(ServiceError::from)
     }
 
-    /// Start the FUSE filesystem server.
-    ///
-    /// Mounts a virtual filesystem at the configured mountpoint that serves
-    /// DDS textures on-demand.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - No mountpoint is configured
-    /// - Mountpoint directory doesn't exist
-    /// - FUSE mount fails
-    ///
-    /// # Note
-    ///
-    /// This method blocks until the filesystem is unmounted (e.g., via Ctrl+C
-    /// or `fusermount -u`).
-    pub fn serve(&self) -> Result<(), ServiceError> {
-        let mountpoint = self
-            .config
-            .mountpoint()
-            .ok_or_else(|| ServiceError::ConfigError("No mountpoint configured".to_string()))?;
-
-        // Check if mountpoint exists
-        if !std::path::Path::new(mountpoint).exists() {
-            return Err(ServiceError::IoError(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Mountpoint does not exist: {}", mountpoint),
-            )));
-        }
-
-        // Create FUSE filesystem
-        let fs = XEarthLayerFS::new(
-            self.generator.clone(),
-            self.cache.clone(),
-            self.config.texture().format(),
-            self.logger.clone(),
-        );
-
-        // Mount filesystem
-        fuser::mount2(fs, mountpoint, &[]).map_err(ServiceError::from)
-    }
-
-    /// Start the FUSE filesystem server in the background.
-    ///
-    /// Returns a `BackgroundSession` that can be used to manage the mount's lifecycle.
-    /// When the session is dropped, the filesystem is automatically unmounted.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - No mountpoint is configured
-    /// - Mountpoint directory doesn't exist
-    /// - FUSE mount fails
-    pub fn serve_background(&self) -> Result<BackgroundSession, ServiceError> {
-        let mountpoint = self
-            .config
-            .mountpoint()
-            .ok_or_else(|| ServiceError::ConfigError("No mountpoint configured".to_string()))?;
-
-        // Check if mountpoint exists
-        if !std::path::Path::new(mountpoint).exists() {
-            return Err(ServiceError::IoError(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Mountpoint does not exist: {}", mountpoint),
-            )));
-        }
-
-        // Create FUSE filesystem
-        let fs = XEarthLayerFS::new(
-            self.generator.clone(),
-            self.cache.clone(),
-            self.config.texture().format(),
-            self.logger.clone(),
-        );
-
-        // Mount filesystem in background
-        fuser::spawn_mount2(fs, mountpoint, &[]).map_err(ServiceError::from)
-    }
-
     /// Create the DDS handler for the async pipeline.
     ///
     /// This wires up all the pipeline components and returns a handler
-    /// that can be used with `AsyncPassthroughFS`.
+    /// that can be used with `Fuse3PassthroughFS`.
     ///
-    /// When an async provider is available, uses `AsyncProviderAdapter` which
-    /// avoids `spawn_blocking` for HTTP calls, preventing thread pool exhaustion.
+    /// Uses `DdsHandlerBuilder` for clean configuration of the pipeline.
     fn create_dds_handler(&self) -> DdsHandler {
-        let format = self.config.texture().format();
+        let mut builder = DdsHandlerBuilder::new(&self.provider_name)
+            .with_format(self.config.texture().format())
+            .with_mipmap_count(self.config.texture().mipmap_count())
+            .with_timeout(Duration::from_secs(self.config.download().timeout_secs()))
+            .with_max_retries(self.config.download().max_retries())
+            .with_metrics(Arc::clone(&self.metrics));
 
-        // Create texture encoder adapter - create a new encoder for the pipeline
-        // (the adapter takes ownership, so we create a fresh encoder with the same config)
-        let pipeline_encoder =
-            DdsTextureEncoder::new(format).with_mipmap_count(self.config.texture().mipmap_count());
-        let encoder_adapter = Arc::new(TextureEncoderAdapter::new(pipeline_encoder));
-
-        // Create memory cache adapter
-        let memory_cache_adapter = Arc::new(match &self.memory_cache {
-            Some(cache) => MemoryCacheAdapter::new(
-                MemoryCache::new(cache.max_size_bytes()),
-                &self.provider_name,
-                format,
-            ),
-            None => MemoryCacheAdapter::new(
-                MemoryCache::new(0), // Minimal cache when disabled
-                &self.provider_name,
-                format,
-            ),
-        });
-
-        // Create executor
-        let executor = Arc::new(TokioExecutor::new());
-
-        // Create pipeline config
-        let pipeline_config = PipelineConfig {
-            request_timeout: Duration::from_secs(self.config.download().timeout_secs()),
-            max_retries: self.config.download().max_retries(),
-            dds_format: format,
-            mipmap_count: self.config.texture().mipmap_count(),
-            max_concurrent_downloads: 256,
-        };
-
-        // Create the handler - use async provider if available (preferred),
-        // otherwise fall back to sync provider with spawn_blocking (legacy)
-        //
-        // Use ParallelDiskCache for optimized disk I/O with semaphore-limited
-        // concurrency (default 64 concurrent reads) to avoid overwhelming the FS.
-        let metrics = Some(Arc::clone(&self.metrics));
-        match (&self.async_provider, &self.cache_dir) {
-            // Async provider with disk cache (PREFERRED - non-blocking I/O)
-            (Some(async_prov), Some(dir)) => {
-                let provider_adapter =
-                    Arc::new(AsyncProviderAdapter::from_arc(Arc::clone(async_prov)));
-                let disk_cache = Arc::new(ParallelDiskCache::with_defaults(
-                    dir.clone(),
-                    &self.provider_name,
-                ));
-                tracing::info!("Using async provider with parallel disk cache (non-blocking I/O)");
-                create_dds_handler_with_metrics(
-                    provider_adapter,
-                    encoder_adapter,
-                    memory_cache_adapter,
-                    disk_cache,
-                    executor,
-                    pipeline_config,
-                    self.runtime_handle.clone(),
-                    metrics,
-                )
-            }
-            // Async provider without disk cache (PREFERRED - non-blocking I/O)
-            (Some(async_prov), None) => {
-                let provider_adapter =
-                    Arc::new(AsyncProviderAdapter::from_arc(Arc::clone(async_prov)));
-                let disk_cache = Arc::new(NullDiskCache);
-                tracing::info!("Using async provider for DDS pipeline (non-blocking I/O)");
-                create_dds_handler_with_metrics(
-                    provider_adapter,
-                    encoder_adapter,
-                    memory_cache_adapter,
-                    disk_cache,
-                    executor,
-                    pipeline_config,
-                    self.runtime_handle.clone(),
-                    metrics,
-                )
-            }
-            // No async provider - use sync provider with spawn_blocking (LEGACY)
-            (None, Some(dir)) => {
-                let provider_adapter = Arc::new(ProviderAdapter::new(Arc::clone(&self.provider)));
-                let disk_cache = Arc::new(ParallelDiskCache::with_defaults(
-                    dir.clone(),
-                    &self.provider_name,
-                ));
-                tracing::warn!("Using sync provider with spawn_blocking (may exhaust thread pool under high load)");
-                create_dds_handler_with_metrics(
-                    provider_adapter,
-                    encoder_adapter,
-                    memory_cache_adapter,
-                    disk_cache,
-                    executor,
-                    pipeline_config,
-                    self.runtime_handle.clone(),
-                    metrics,
-                )
-            }
-            (None, None) => {
-                let provider_adapter = Arc::new(ProviderAdapter::new(Arc::clone(&self.provider)));
-                let disk_cache = Arc::new(NullDiskCache);
-                tracing::warn!("Using sync provider with spawn_blocking (may exhaust thread pool under high load)");
-                create_dds_handler_with_metrics(
-                    provider_adapter,
-                    encoder_adapter,
-                    memory_cache_adapter,
-                    disk_cache,
-                    executor,
-                    pipeline_config,
-                    self.runtime_handle.clone(),
-                    metrics,
-                )
-            }
+        // Configure provider (prefer async, fallback to sync)
+        if let Some(ref async_prov) = self.async_provider {
+            builder = builder.with_async_provider(Arc::clone(async_prov));
+        } else {
+            builder = builder.with_sync_provider(Arc::clone(&self.provider));
         }
+
+        // Configure disk cache if enabled
+        if let Some(ref dir) = self.cache_dir {
+            builder = builder.with_disk_cache(dir.clone());
+        }
+
+        // Configure memory cache if enabled
+        if let Some(ref cache) = self.memory_cache {
+            builder = builder.with_memory_cache(MemoryCache::new(cache.max_size_bytes()));
+        }
+
+        builder.build(self.runtime_handle.clone())
     }
 
     /// Calculate the expected DDS file size based on encoder configuration.
@@ -634,143 +459,20 @@ impl XEarthLayerService {
         self.dds_encoder.expected_size(4096, 4096)
     }
 
-    /// Start the passthrough FUSE filesystem server.
-    ///
-    /// Overlays an existing scenery pack directory, passing through real files
-    /// and generating DDS textures on-demand via the async pipeline.
-    ///
-    /// # Arguments
-    ///
-    /// * `source_dir` - Path to the scenery pack directory to overlay
-    /// * `mountpoint` - Path where the virtual filesystem will be mounted
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Source directory doesn't exist
-    /// - Mountpoint directory doesn't exist
-    /// - FUSE mount fails
-    ///
-    /// # Note
-    ///
-    /// This method blocks until the filesystem is unmounted (e.g., via Ctrl+C
-    /// or `fusermount -u`).
-    pub fn serve_passthrough(
-        &self,
-        source_dir: &str,
-        mountpoint: &str,
-    ) -> Result<(), ServiceError> {
-        // Check if source directory exists
-        let source_path = PathBuf::from(source_dir);
-        if !source_path.exists() {
-            return Err(ServiceError::IoError(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Source directory does not exist: {}", source_dir),
-            )));
-        }
-
-        // Check if mountpoint exists
-        if !std::path::Path::new(mountpoint).exists() {
-            return Err(ServiceError::IoError(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Mountpoint does not exist: {}", mountpoint),
-            )));
-        }
-
-        // Create the DDS handler for async pipeline
-        let dds_handler = self.create_dds_handler();
-
-        // Create async passthrough FUSE filesystem
-        let fs = AsyncPassthroughFS::new(
-            source_path,
-            dds_handler,
-            self.runtime_handle.clone(),
-            self.expected_dds_size(),
-        )
-        .with_timeout(Duration::from_secs(
-            self.config.generation_timeout().unwrap_or(30),
-        ));
-
-        log_info!(
-            self.logger,
-            "Starting async passthrough filesystem: {} -> {}",
-            source_dir,
-            mountpoint
-        );
-
-        // Mount filesystem
-        fuser::mount2(fs, mountpoint, &[]).map_err(ServiceError::from)
-    }
-
-    /// Start the passthrough FUSE filesystem server in the background.
-    ///
-    /// Returns a `BackgroundSession` that can be used to manage the mount's lifecycle.
-    /// When the session is dropped, the filesystem is automatically unmounted.
-    ///
-    /// # Arguments
-    ///
-    /// * `source_dir` - Path to the scenery pack directory to overlay
-    /// * `mountpoint` - Path where the virtual filesystem will be mounted
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Source directory doesn't exist
-    /// - Mountpoint directory doesn't exist
-    /// - FUSE mount fails
-    pub fn serve_passthrough_background(
-        &self,
-        source_dir: &str,
-        mountpoint: &str,
-    ) -> Result<BackgroundSession, ServiceError> {
-        // Check if source directory exists
-        let source_path = PathBuf::from(source_dir);
-        if !source_path.exists() {
-            return Err(ServiceError::IoError(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Source directory does not exist: {}", source_dir),
-            )));
-        }
-
-        // Check if mountpoint exists
-        if !std::path::Path::new(mountpoint).exists() {
-            return Err(ServiceError::IoError(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Mountpoint does not exist: {}", mountpoint),
-            )));
-        }
-
-        // Create the DDS handler for async pipeline
-        let dds_handler = self.create_dds_handler();
-
-        // Create async passthrough FUSE filesystem
-        let fs = AsyncPassthroughFS::new(
-            source_path,
-            dds_handler,
-            self.runtime_handle.clone(),
-            self.expected_dds_size(),
-        )
-        .with_timeout(Duration::from_secs(
-            self.config.generation_timeout().unwrap_or(30),
-        ));
-
-        log_info!(
-            self.logger,
-            "Starting async passthrough filesystem (background): {} -> {}",
-            source_dir,
-            mountpoint
-        );
-
-        // Mount filesystem in background
-        fuser::spawn_mount2(fs, mountpoint, &[]).map_err(ServiceError::from)
+    /// Create a mount configuration for FUSE filesystem.
+    fn create_mount_config(&self) -> FuseMountConfig {
+        FuseMountConfig::new(self.create_dds_handler(), self.expected_dds_size())
+            .with_timeout(Duration::from_secs(
+                self.config.generation_timeout().unwrap_or(30),
+            ))
+            .with_logger(Arc::clone(&self.logger))
     }
 
     /// Start the passthrough FUSE filesystem server using fuse3 (async multi-threaded).
     ///
-    /// This is the recommended method for high-performance scenarios where X-Plane
-    /// requests many DDS files concurrently. Unlike the `fuser`-based implementation,
-    /// fuse3 runs all FUSE operations asynchronously on the Tokio runtime, enabling
-    /// true parallel I/O processing.
+    /// Uses the fuse3 library which runs all FUSE operations asynchronously on the
+    /// Tokio runtime, enabling true parallel I/O processing. This is optimized for
+    /// high-concurrency scenarios like X-Plane scene loading.
     ///
     /// # Arguments
     ///
@@ -793,44 +495,8 @@ impl XEarthLayerService {
         source_dir: &str,
         mountpoint: &str,
     ) -> Result<MountHandle, ServiceError> {
-        // Check if source directory exists
-        let source_path = PathBuf::from(source_dir);
-        if !source_path.exists() {
-            return Err(ServiceError::IoError(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Source directory does not exist: {}", source_dir),
-            )));
-        }
-
-        // Check if mountpoint exists
-        if !std::path::Path::new(mountpoint).exists() {
-            return Err(ServiceError::IoError(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Mountpoint does not exist: {}", mountpoint),
-            )));
-        }
-
-        // Create the DDS handler for async pipeline
-        let dds_handler = self.create_dds_handler();
-
-        // Create fuse3 passthrough FUSE filesystem
-        let fs =
-            Fuse3PassthroughFS::new(source_path.clone(), dds_handler, self.expected_dds_size())
-                .with_timeout(Duration::from_secs(
-                    self.config.generation_timeout().unwrap_or(30),
-                ));
-
-        log_info!(
-            self.logger,
-            "Starting fuse3 passthrough filesystem (async multi-threaded): {} -> {}",
-            source_dir,
-            mountpoint
-        );
-
-        // Mount filesystem
-        fs.mount(mountpoint)
-            .await
-            .map_err(|e| ServiceError::FuseError(e.to_string()))
+        let config = self.create_mount_config();
+        FuseMountService::mount_fuse3(&config, source_dir, mountpoint).await
     }
 
     /// Start the passthrough FUSE filesystem server using fuse3 (synchronous wrapper).
@@ -853,15 +519,13 @@ impl XEarthLayerService {
         source_dir: &str,
         mountpoint: &str,
     ) -> Result<(), ServiceError> {
-        self.runtime_handle.block_on(async {
-            let handle = self.serve_passthrough_fuse3(source_dir, mountpoint).await?;
-
-            // Wait for the mount to be unmounted (blocks until Ctrl+C or umount)
-            // The handle's future resolves when unmounted
-            handle
-                .await
-                .map_err(|e| ServiceError::FuseError(e.to_string()))
-        })
+        let config = self.create_mount_config();
+        FuseMountService::mount_fuse3_blocking(
+            &config,
+            source_dir,
+            mountpoint,
+            &self.runtime_handle,
+        )
     }
 
     /// Start the passthrough FUSE filesystem server using fuse3 as a background task.
@@ -885,44 +549,8 @@ impl XEarthLayerService {
         source_dir: &str,
         mountpoint: &str,
     ) -> Result<SpawnedMountHandle, ServiceError> {
-        // Check if source directory exists
-        let source_path = PathBuf::from(source_dir);
-        if !source_path.exists() {
-            return Err(ServiceError::IoError(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Source directory does not exist: {}", source_dir),
-            )));
-        }
-
-        // Check if mountpoint exists
-        if !std::path::Path::new(mountpoint).exists() {
-            return Err(ServiceError::IoError(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Mountpoint does not exist: {}", mountpoint),
-            )));
-        }
-
-        // Create the DDS handler for async pipeline
-        let dds_handler = self.create_dds_handler();
-
-        // Create fuse3 passthrough FUSE filesystem
-        let fs =
-            Fuse3PassthroughFS::new(source_path.clone(), dds_handler, self.expected_dds_size())
-                .with_timeout(Duration::from_secs(
-                    self.config.generation_timeout().unwrap_or(30),
-                ));
-
-        log_info!(
-            self.logger,
-            "Starting fuse3 passthrough filesystem (async multi-threaded, spawned): {} -> {}",
-            source_dir,
-            mountpoint
-        );
-
-        // Mount filesystem as spawned background task
-        fs.mount_spawned(mountpoint)
-            .await
-            .map_err(|e| ServiceError::FuseError(e.to_string()))
+        let config = self.create_mount_config();
+        FuseMountService::mount_fuse3_spawned(&config, source_dir, mountpoint).await
     }
 }
 

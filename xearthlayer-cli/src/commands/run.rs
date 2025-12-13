@@ -23,7 +23,6 @@ pub struct RunArgs {
     pub timeout: Option<u64>,
     pub parallel: Option<usize>,
     pub no_cache: bool,
-    pub fuse3: bool,
 }
 
 /// Run the run command.
@@ -116,11 +115,6 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         .build();
 
     // Print banner
-    let fuse_backend = if args.fuse3 {
-        "fuse3 (async multi-threaded)"
-    } else {
-        "fuser (legacy single-threaded)"
-    };
     println!("XEarthLayer v{}", xearthlayer::VERSION);
     println!("{}", "=".repeat(40));
     println!();
@@ -128,7 +122,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     println!("Custom Scenery: {}", custom_scenery_path.display());
     println!("DDS Format:     {:?}", texture_config.format());
     println!("Provider:       {}", provider_config.name());
-    println!("FUSE Backend:   {}", fuse_backend);
+    println!("FUSE Backend:   fuse3 (async multi-threaded)");
     println!();
 
     // List discovered packages
@@ -151,8 +145,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     println!();
 
     // Create mount manager with the custom scenery path as target
-    let mut mount_manager =
-        MountManager::with_scenery_path(&custom_scenery_path).with_fuse3(args.fuse3);
+    let mut mount_manager = MountManager::with_scenery_path(&custom_scenery_path);
 
     // Create a logger for all services
     let logger: Arc<dyn xearthlayer::log::Logger> = Arc::new(TracingLogger);

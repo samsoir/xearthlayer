@@ -9,28 +9,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fuser::BackgroundSession;
-
-use crate::fuse::SpawnedMountHandle as Fuse3SpawnedHandle;
+use crate::fuse::SpawnedMountHandle;
 use crate::package::PackageType;
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
 use crate::telemetry::TelemetrySnapshot;
 
 use super::local::{InstalledPackage, LocalPackageStore};
 use super::{ManagerError, ManagerResult};
-
-/// Active mount session - can be either fuser (legacy) or fuse3 (async).
-///
-/// The session is stored to keep the mount alive. When dropped, the filesystem
-/// is automatically unmounted.
-#[allow(dead_code)] // Fields are intentionally kept to trigger cleanup on drop
-enum MountSession {
-    /// Legacy fuser-based session (single-threaded FUSE handler).
-    Fuser(BackgroundSession),
-    /// Fuse3-based session (async multi-threaded FUSE handler).
-    /// Uses SpawnedMountHandle which can be safely dropped from any context.
-    Fuse3(Fuse3SpawnedHandle),
-}
 
 /// Result of mounting a single package.
 #[derive(Debug)]
@@ -97,7 +82,8 @@ pub struct ActiveMount {
 /// static DSF files that don't need on-demand generation.
 pub struct MountManager {
     /// Active mount sessions, keyed by region.
-    sessions: HashMap<String, MountSession>,
+    /// Uses SpawnedMountHandle which can be safely dropped from any context.
+    sessions: HashMap<String, SpawnedMountHandle>,
     /// Services that own the Tokio runtimes - MUST be kept alive while sessions are active.
     /// The service contains the runtime that processes DDS generation requests.
     services: HashMap<String, XEarthLayerService>,
@@ -106,8 +92,6 @@ pub struct MountManager {
     /// Target scenery directory for mounts (e.g., X-Plane Custom Scenery).
     /// If None, packages are mounted in-place.
     scenery_path: Option<PathBuf>,
-    /// Whether to use fuse3 (async multi-threaded) instead of fuser (legacy).
-    use_fuse3: bool,
 }
 
 impl MountManager {
@@ -118,7 +102,6 @@ impl MountManager {
             services: HashMap::new(),
             mounts: HashMap::new(),
             scenery_path: None,
-            use_fuse3: false,
         }
     }
 
@@ -132,19 +115,7 @@ impl MountManager {
             services: HashMap::new(),
             mounts: HashMap::new(),
             scenery_path: Some(scenery_path.to_path_buf()),
-            use_fuse3: false,
         }
-    }
-
-    /// Enable fuse3 async multi-threaded backend.
-    ///
-    /// When enabled, mounts will use the fuse3 library which runs all FUSE
-    /// operations asynchronously on the Tokio runtime, enabling true parallel
-    /// I/O processing. This provides better performance for high-concurrency
-    /// scenarios like X-Plane scene loading.
-    pub fn with_fuse3(mut self, use_fuse3: bool) -> Self {
-        self.use_fuse3 = use_fuse3;
-        self
     }
 
     /// Get the number of active mounts.
@@ -285,26 +256,17 @@ impl MountManager {
             }
         }
 
-        // Mount the filesystem
+        // Mount the filesystem using fuse3 async multi-threaded backend
         // Source = the installed package directory
         // Mountpoint = either in Custom Scenery (if scenery_path set) or in-place
         let source_str = package.path.to_string_lossy();
         let mountpoint_str = mountpoint.to_string_lossy();
 
-        // Choose backend based on use_fuse3 setting
-        let mount_result = if self.use_fuse3 {
-            // Use fuse3 async multi-threaded backend with spawned task
-            // This uses SpawnedMountHandle which can be safely dropped from any context
-            service
-                .runtime_handle()
-                .block_on(service.serve_passthrough_fuse3_spawned(&source_str, &mountpoint_str))
-                .map(MountSession::Fuse3)
-        } else {
-            // Use legacy fuser single-threaded backend
-            service
-                .serve_passthrough_background(&source_str, &mountpoint_str)
-                .map(MountSession::Fuser)
-        };
+        // Use fuse3 async multi-threaded backend with spawned task
+        // This uses SpawnedMountHandle which can be safely dropped from any context
+        let mount_result = service
+            .runtime_handle()
+            .block_on(service.serve_passthrough_fuse3_spawned(&source_str, &mountpoint_str));
 
         match mount_result {
             Ok(session) => {
@@ -347,9 +309,7 @@ impl MountManager {
             });
         }
 
-        // Remove session first - Drop will trigger unmount
-        // For Fuse3 sessions (SpawnedMountHandle), drop uses fusermount as fallback
-        // For Fuser sessions (BackgroundSession), drop handles cleanup automatically
+        // Remove session first - Drop will trigger unmount via fusermount
         self.sessions.remove(&key);
         // Then remove service - this shuts down the runtime
         self.services.remove(&key);
@@ -366,9 +326,7 @@ impl MountManager {
         let keys: Vec<String> = self.sessions.keys().cloned().collect();
 
         for key in keys.into_iter().rev() {
-            // Remove session first - Drop will trigger unmount
-            // For Fuse3 sessions (SpawnedMountHandle), drop uses fusermount as fallback
-            // For Fuser sessions (BackgroundSession), drop handles cleanup automatically
+            // Remove session first - Drop will trigger unmount via fusermount
             self.sessions.remove(&key);
             // Then remove service - this shuts down the runtime
             self.services.remove(&key);

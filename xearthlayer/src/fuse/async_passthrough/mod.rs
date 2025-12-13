@@ -1,37 +1,22 @@
-//! Async passthrough FUSE filesystem with pipeline integration.
+//! Shared types for FUSE filesystem DDS generation.
 //!
-//! This module provides a FUSE filesystem that overlays an existing scenery
-//! pack directory and generates DDS textures on-demand via an async pipeline.
-//!
-//! # Module Structure
-//!
+//! This module provides types used by the fuse3 passthrough filesystem:
 //! - [`types`] - Request/response types for DDS generation
 //! - [`inode`] - Inode allocation and management
-//! - [`attributes`] - File attribute conversion utilities
 //!
-//! # Architecture
-//!
-//! ```text
-//! FUSE Handler Thread          Tokio Runtime
-//! ┌─────────────────┐          ┌─────────────────┐
-//! │  read() called  │          │                 │
-//! │       │         │          │  Pipeline       │
-//! │       ▼         │          │  Processor      │
-//! │ Create oneshot  │──req───►│       │         │
-//! │       │         │          │       ▼         │
-//! │   Block on rx   │◄──res───│  DDS Data       │
-//! │       │         │          │                 │
-//! │       ▼         │          └─────────────────┘
-//! │  reply.data()   │
-//! └─────────────────┘
-//! ```
+//! Note: The legacy fuser-based AsyncPassthroughFS implementation is retained
+//! here for reference but is no longer used. The fuse3 implementation is the
+//! active code path.
 
+// Legacy fuser implementation (unused, retained for reference)
+#[allow(dead_code)]
 mod attributes;
+#[allow(dead_code)]
 mod filesystem;
+
+// Shared types used by fuse3
 pub mod inode;
 mod types;
 
-// Re-export public API
-pub use filesystem::AsyncPassthroughFS;
-pub use inode::InodeManager;
+// Re-export shared types for use by fuse3 and public API
 pub use types::{DdsHandler, DdsRequest, DdsResponse};

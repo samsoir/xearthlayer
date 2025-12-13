@@ -1,8 +1,6 @@
 //! Start command - mount a single scenery pack with FUSE passthrough.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use xearthlayer::config::{derive_mountpoint, DownloadConfig, TextureConfig};
 use xearthlayer::service::ServiceConfig;
@@ -21,7 +19,6 @@ pub struct StartArgs {
     pub timeout: Option<u64>,
     pub parallel: Option<usize>,
     pub no_cache: bool,
-    pub fuse3: bool,
 }
 
 /// Run the start command.
@@ -112,98 +109,21 @@ pub fn run(args: StartArgs) -> Result<(), CliError> {
     println!("Provider: {}", service.provider_name());
     println!();
 
-    let fuse_backend = if args.fuse3 {
-        "fuse3 (async multi-threaded)"
-    } else {
-        "fuser (legacy single-threaded)"
-    };
     println!("Mounting passthrough filesystem...");
-    println!("  Backend:    {}", fuse_backend);
+    println!("  Backend:    fuse3 (async multi-threaded)");
     println!("  Real files: Passed through from source");
     println!("  DDS files:  Generated on-demand");
     println!();
     println!("Press Ctrl+C to unmount and exit");
     println!();
 
-    // Set up signal handler for graceful shutdown
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-
-    ctrlc::set_handler(move || {
-        println!();
-        println!("Received shutdown signal, unmounting...");
-        shutdown_clone.store(true, Ordering::SeqCst);
-    })
-    .map_err(|e| CliError::Config(format!("Failed to set signal handler: {}", e)))?;
-
-    // Start serving with passthrough
-    if args.fuse3 {
-        // Use fuse3 async multi-threaded backend
-        // This runs synchronously but all FUSE operations are async internally
-        service
-            .serve_passthrough_fuse3_blocking(&args.source, &mountpoint)
-            .map_err(CliError::Serve)?;
-
-        // fuse3 blocks until unmounted, so we get here after unmount
-        println!();
-        println!("Filesystem unmounted.");
-        return Ok(());
-    }
-
-    // Start serving with passthrough in background (legacy fuser backend)
-    // The BackgroundSession auto-unmounts when dropped
-    let _session = service
-        .serve_passthrough_background(&args.source, &mountpoint)
+    // Start serving with fuse3 async multi-threaded backend
+    // This runs synchronously but all FUSE operations are async internally
+    service
+        .serve_passthrough_fuse3_blocking(&args.source, &mountpoint)
         .map_err(CliError::Serve)?;
 
-    // Wait for shutdown signal, displaying telemetry periodically
-    let mut last_telemetry = std::time::Instant::now();
-    let telemetry_interval = std::time::Duration::from_secs(30);
-
-    while !shutdown.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        // Display telemetry every 30 seconds
-        if last_telemetry.elapsed() >= telemetry_interval {
-            let snapshot = service.telemetry_snapshot();
-            if snapshot.jobs_completed > 0 || snapshot.jobs_active > 0 {
-                println!(
-                    "[{}] Tiles: {} completed, {} active | Throughput: {} | Coalescing: {:.0}%",
-                    snapshot.uptime_human(),
-                    snapshot.jobs_completed,
-                    snapshot.jobs_active,
-                    snapshot.throughput_human(),
-                    snapshot.coalescing_rate() * 100.0
-                );
-            }
-            last_telemetry = std::time::Instant::now();
-        }
-    }
-
-    // Print final telemetry summary
-    let final_snapshot = service.telemetry_snapshot();
-    if final_snapshot.jobs_completed > 0 {
-        println!();
-        println!("Session Summary");
-        println!("───────────────");
-        println!(
-            "  Tiles generated: {} ({} failed)",
-            final_snapshot.jobs_completed, final_snapshot.jobs_failed
-        );
-        println!(
-            "  Tiles coalesced: {} ({:.0}% savings)",
-            final_snapshot.jobs_coalesced,
-            final_snapshot.coalescing_rate() * 100.0
-        );
-        println!(
-            "  Data downloaded: {}",
-            final_snapshot.bytes_downloaded_human()
-        );
-        println!("  Avg throughput:  {}", final_snapshot.throughput_human());
-        println!("  Uptime: {}", final_snapshot.uptime_human());
-    }
-
-    // Session drops here, triggering unmount
+    // fuse3 blocks until unmounted, so we get here after unmount
     println!();
     println!("Filesystem unmounted.");
     Ok(())
