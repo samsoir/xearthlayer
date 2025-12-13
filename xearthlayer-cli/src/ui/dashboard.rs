@@ -154,9 +154,9 @@ impl Dashboard {
             .constraints([
                 Constraint::Length(3), // Header
                 Constraint::Length(6), // Pipeline
-                Constraint::Length(2), // Network
+                Constraint::Length(3), // Network (increased from 2)
                 Constraint::Length(6), // Cache
-                Constraint::Length(2), // Errors
+                Constraint::Length(3), // Errors (increased from 2)
                 Constraint::Min(0),    // Padding
             ])
             .split(size);

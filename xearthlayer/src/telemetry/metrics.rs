@@ -51,10 +51,14 @@ pub struct PipelineMetrics {
     memory_cache_hits: AtomicU64,
     /// Memory cache misses (tile level)
     memory_cache_misses: AtomicU64,
+    /// Memory cache current size in bytes
+    memory_cache_size_bytes: AtomicU64,
     /// Disk cache hits (chunk level)
     disk_cache_hits: AtomicU64,
     /// Disk cache misses (chunk level)
     disk_cache_misses: AtomicU64,
+    /// Disk cache current size in bytes
+    disk_cache_size_bytes: AtomicU64,
 
     // === Encoding metrics ===
     /// Encode operations completed
@@ -96,8 +100,10 @@ impl PipelineMetrics {
             downloads_active: AtomicUsize::new(0),
             memory_cache_hits: AtomicU64::new(0),
             memory_cache_misses: AtomicU64::new(0),
+            memory_cache_size_bytes: AtomicU64::new(0),
             disk_cache_hits: AtomicU64::new(0),
             disk_cache_misses: AtomicU64::new(0),
+            disk_cache_size_bytes: AtomicU64::new(0),
             encodes_completed: AtomicU64::new(0),
             encodes_active: AtomicUsize::new(0),
             bytes_encoded: AtomicU64::new(0),
@@ -204,6 +210,16 @@ impl PipelineMetrics {
         self.disk_cache_misses.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Update memory cache size.
+    pub fn set_memory_cache_size(&self, bytes: u64) {
+        self.memory_cache_size_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Update disk cache size.
+    pub fn set_disk_cache_size(&self, bytes: u64) {
+        self.disk_cache_size_bytes.store(bytes, Ordering::Relaxed);
+    }
+
     // === Encode tracking ===
 
     /// Record an encode operation starting.
@@ -296,6 +312,7 @@ impl PipelineMetrics {
             } else {
                 0.0
             },
+            memory_cache_size_bytes: self.memory_cache_size_bytes.load(Ordering::Relaxed),
             disk_cache_hits,
             disk_cache_misses,
             disk_cache_hit_rate: if disk_cache_total > 0 {
@@ -303,6 +320,7 @@ impl PipelineMetrics {
             } else {
                 0.0
             },
+            disk_cache_size_bytes: self.disk_cache_size_bytes.load(Ordering::Relaxed),
 
             // Encode metrics
             encodes_completed: self.encodes_completed.load(Ordering::Relaxed),
@@ -340,8 +358,10 @@ impl PipelineMetrics {
         self.downloads_active.store(0, Ordering::Relaxed);
         self.memory_cache_hits.store(0, Ordering::Relaxed);
         self.memory_cache_misses.store(0, Ordering::Relaxed);
+        self.memory_cache_size_bytes.store(0, Ordering::Relaxed);
         self.disk_cache_hits.store(0, Ordering::Relaxed);
         self.disk_cache_misses.store(0, Ordering::Relaxed);
+        self.disk_cache_size_bytes.store(0, Ordering::Relaxed);
         self.encodes_completed.store(0, Ordering::Relaxed);
         self.encodes_active.store(0, Ordering::Relaxed);
         self.bytes_encoded.store(0, Ordering::Relaxed);

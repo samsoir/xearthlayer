@@ -31,10 +31,6 @@ impl Default for CacheConfig {
 pub struct CacheWidget<'a> {
     snapshot: &'a TelemetrySnapshot,
     config: CacheConfig,
-    /// Current memory cache size (if known).
-    memory_current_bytes: Option<usize>,
-    /// Current disk cache size (if known).
-    disk_current_bytes: Option<usize>,
 }
 
 impl<'a> CacheWidget<'a> {
@@ -42,25 +38,11 @@ impl<'a> CacheWidget<'a> {
         Self {
             snapshot,
             config: CacheConfig::default(),
-            memory_current_bytes: None,
-            disk_current_bytes: None,
         }
     }
 
     pub fn with_config(mut self, config: CacheConfig) -> Self {
         self.config = config;
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn with_memory_size(mut self, bytes: usize) -> Self {
-        self.memory_current_bytes = Some(bytes);
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn with_disk_size(mut self, bytes: usize) -> Self {
-        self.disk_current_bytes = Some(bytes);
         self
     }
 
@@ -93,7 +75,7 @@ impl Widget for CacheWidget<'_> {
         let block = Block::default().borders(Borders::NONE);
 
         // Memory cache line
-        let memory_current = self.memory_current_bytes.unwrap_or(0);
+        let memory_current = self.snapshot.memory_cache_size_bytes as usize;
         let memory_bar = Self::progress_bar(memory_current, self.config.memory_max_bytes, 16);
         let memory_hits = self.snapshot.memory_cache_hits;
         let memory_misses = self.snapshot.memory_cache_misses;
@@ -144,7 +126,7 @@ impl Widget for CacheWidget<'_> {
         ]);
 
         // Disk cache line
-        let disk_current = self.disk_current_bytes.unwrap_or(0);
+        let disk_current = self.snapshot.disk_cache_size_bytes as usize;
         let disk_bar = Self::progress_bar(disk_current, self.config.disk_max_bytes, 16);
         let disk_hits = self.snapshot.disk_cache_hits;
         let disk_misses = self.snapshot.disk_cache_misses;

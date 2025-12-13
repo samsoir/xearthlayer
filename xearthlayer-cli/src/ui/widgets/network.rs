@@ -108,13 +108,20 @@ impl Widget for NetworkWidget<'_> {
         let peak_val = self.history.peak().max(self.snapshot.peak_bytes_per_second);
         let peak = Self::format_throughput(peak_val);
 
+        // Color based on activity level
+        let throughput_color = if self.snapshot.bytes_per_second > 0.0 {
+            Color::Green
+        } else {
+            Color::DarkGray
+        };
+
         let line = Line::from(vec![
             Span::styled("  Network:  ", Style::default().fg(Color::White)),
-            Span::styled(sparkline, Style::default().fg(Color::Green)),
+            Span::styled(sparkline, Style::default().fg(throughput_color)),
             Span::raw("  "),
             Span::styled(
                 format!("{:>10}", current),
-                Style::default().fg(Color::Green),
+                Style::default().fg(throughput_color),
             ),
             Span::styled(
                 format!(" (peak: {})", peak),
@@ -124,7 +131,11 @@ impl Widget for NetworkWidget<'_> {
             Span::styled("Chunks: ", Style::default().fg(Color::White)),
             Span::styled(
                 format!("{:.1}/s", self.snapshot.chunks_per_second),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(if self.snapshot.chunks_per_second > 0.0 {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }),
             ),
         ]);
 

@@ -86,8 +86,8 @@ pub struct XEarthLayerService {
     async_provider: Option<Arc<AsyncProviderType>>,
     /// Texture encoder for async pipeline (concrete type for adapter compatibility)
     dds_encoder: Arc<DdsTextureEncoder>,
-    /// Memory cache for async pipeline (tile-level)
-    memory_cache: Option<MemoryCache>,
+    /// Shared memory cache for async pipeline (tile-level)
+    memory_cache: Option<Arc<MemoryCache>>,
     /// Cache directory for disk cache
     cache_dir: Option<PathBuf>,
     /// Pipeline telemetry metrics
@@ -235,7 +235,7 @@ impl XEarthLayerService {
         // Create cache system based on configuration
         let (cache, memory_cache, cache_dir): (
             Arc<dyn Cache>,
-            Option<MemoryCache>,
+            Option<Arc<MemoryCache>>,
             Option<PathBuf>,
         ) = if config.cache_enabled() {
             let mut cache_config = CacheConfig::new(&provider_name);
@@ -262,8 +262,8 @@ impl XEarthLayerService {
                 cache_config = cache_config.with_disk_size(size);
             }
 
-            // Create separate memory cache for async pipeline
-            let mem_cache = MemoryCache::new(mem_size);
+            // Create shared memory cache for async pipeline
+            let mem_cache = Arc::new(MemoryCache::new(mem_size));
 
             match CacheSystem::new(cache_config, logger.clone()) {
                 Ok(cache) => (Arc::new(cache), Some(mem_cache), Some(dir_for_pipeline)),
@@ -348,11 +348,36 @@ impl XEarthLayerService {
     /// - Job counts (submitted, completed, failed, coalesced)
     /// - Download statistics (chunks, bytes, throughput)
     /// - Cache hit rates (memory and disk)
+    /// - Cache sizes (memory and disk)
     /// - Timing information
     ///
     /// The snapshot is safe to use for display without blocking the pipeline.
+    ///
+    /// Note: This automatically updates cache size metrics before taking
+    /// the snapshot, ensuring accurate cache utilization data.
     pub fn telemetry_snapshot(&self) -> TelemetrySnapshot {
+        // Update cache sizes from the cache system
+        self.update_cache_sizes();
         self.metrics.snapshot()
+    }
+
+    /// Update cache size metrics from the cache systems.
+    ///
+    /// This is called automatically by `telemetry_snapshot()`, but can also
+    /// be called manually if you need to update metrics without taking a
+    /// snapshot.
+    fn update_cache_sizes(&self) {
+        // Get memory cache size from the shared async pipeline cache
+        if let Some(ref mem_cache) = self.memory_cache {
+            self.metrics
+                .set_memory_cache_size(mem_cache.size_bytes() as u64);
+        }
+
+        // Get disk cache size from CacheSystem
+        if let Some(cache_system) = self.cache.as_any().downcast_ref::<CacheSystem>() {
+            self.metrics
+                .set_disk_cache_size(cache_system.disk_size_bytes() as u64);
+        }
     }
 
     /// Get a reference to the pipeline metrics for direct access.
@@ -446,9 +471,9 @@ impl XEarthLayerService {
             builder = builder.with_disk_cache(dir.clone());
         }
 
-        // Configure memory cache if enabled
+        // Configure memory cache if enabled (use the shared instance)
         if let Some(ref cache) = self.memory_cache {
-            builder = builder.with_memory_cache(MemoryCache::new(cache.max_size_bytes()));
+            builder = builder.with_memory_cache(Arc::clone(cache));
         }
 
         builder.build(self.runtime_handle.clone())

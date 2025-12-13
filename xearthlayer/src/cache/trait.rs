@@ -2,6 +2,7 @@
 
 use crate::cache::types::{CacheError, CacheKey};
 use crate::cache::CacheStatistics;
+use std::any::Any;
 
 /// Cache abstraction for DDS tiles.
 ///
@@ -54,6 +55,12 @@ pub trait Cache: Send + Sync {
 
     /// Get the provider name.
     fn provider(&self) -> &str;
+
+    /// Get a reference to self as Any for downcasting.
+    ///
+    /// This enables runtime type inspection for cache implementations,
+    /// which is useful for accessing implementation-specific features.
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// No-op cache implementation that never caches.
@@ -123,6 +130,10 @@ impl Cache for NoOpCache {
 
     fn provider(&self) -> &str {
         &self.provider
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

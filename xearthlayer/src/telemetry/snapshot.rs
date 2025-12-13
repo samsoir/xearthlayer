@@ -52,12 +52,16 @@ pub struct TelemetrySnapshot {
     pub memory_cache_misses: u64,
     /// Memory cache hit rate (0.0 - 1.0)
     pub memory_cache_hit_rate: f64,
+    /// Memory cache current size in bytes
+    pub memory_cache_size_bytes: u64,
     /// Disk cache hits
     pub disk_cache_hits: u64,
     /// Disk cache misses
     pub disk_cache_misses: u64,
     /// Disk cache hit rate (0.0 - 1.0)
     pub disk_cache_hit_rate: f64,
+    /// Disk cache current size in bytes
+    pub disk_cache_size_bytes: u64,
 
     // === Encode metrics ===
     /// Encode operations completed
@@ -262,9 +266,11 @@ mod tests {
             memory_cache_hits: 30,
             memory_cache_misses: 60,
             memory_cache_hit_rate: 0.333,
+            memory_cache_size_bytes: 500_000_000,
             disk_cache_hits: 5000,
             disk_cache_misses: 18040,
             disk_cache_hit_rate: 0.217,
+            disk_cache_size_bytes: 5_000_000_000,
             encodes_completed: 90,
             encodes_active: 2,
             bytes_encoded: 1_000_000_000, // ~1 GB

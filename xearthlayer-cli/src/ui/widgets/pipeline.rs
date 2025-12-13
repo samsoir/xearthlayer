@@ -47,36 +47,50 @@ impl Widget for PipelineWidget<'_> {
         let encode_active = self.snapshot.encodes_active;
         let completed = self.snapshot.jobs_completed;
 
-        // Use fixed-width columns for alignment
-        // Each column: 12 chars for header, centered
-        // FUSE(4) DOWNLOAD(8) ASSEMBLE(8) ENCODE(6) CACHE(5) DONE(4)
+        // Use fixed-width columns for perfect alignment
+        // Column widths: FUSE=8, arrow=5, DOWNLOAD=12, arrow=5, ASSEMBLE=12, arrow=5, ENCODE=10, arrow=5, CACHE=9, arrow=5, DONE=10
+        //
+        // Layout (each stage centered in its column):
+        //   FUSE   ──►   DOWNLOAD   ──►   ASSEMBLE   ──►   ENCODE   ──►   CACHE   ──►    DONE
+        //    0           ░░░░   0          ░░░░   0         ░░░░  0        ░░░░  0          0
+        //   wait          active            active           active        active      completed
 
-        // Pipeline flow line with arrows
+        // Pipeline flow line with arrows - use fixed column widths
         let flow_line = Line::from(vec![
             Span::raw("  "),
-            Span::styled("FUSE", Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{:^6}", "FUSE"), Style::default().fg(Color::Cyan)),
             Span::raw(" ──► "),
-            Span::styled("DOWNLOAD", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("{:^10}", "DOWNLOAD"),
+                Style::default().fg(Color::Yellow),
+            ),
             Span::raw(" ──► "),
-            Span::styled("ASSEMBLE", Style::default().fg(Color::Magenta)),
+            Span::styled(
+                format!("{:^10}", "ASSEMBLE"),
+                Style::default().fg(Color::Magenta),
+            ),
             Span::raw(" ──► "),
-            Span::styled("ENCODE", Style::default().fg(Color::Blue)),
+            Span::styled(
+                format!("{:^10}", "ENCODE"),
+                Style::default().fg(Color::Blue),
+            ),
             Span::raw(" ──► "),
-            Span::styled("CACHE", Style::default().fg(Color::Green)),
+            Span::styled(
+                format!("{:^10}", "CACHE"),
+                Style::default().fg(Color::Green),
+            ),
             Span::raw(" ──► "),
-            Span::styled("DONE", Style::default().fg(Color::White)),
+            Span::styled(format!("{:^10}", "DONE"), Style::default().fg(Color::White)),
         ]);
 
-        // Counts line - align under stage names
-        // "  FUSE ──► DOWNLOAD ──► ASSEMBLE ──► ENCODE ──► CACHE ──► DONE"
-        //  "   12       ██░░ 128      ██░░ 45     ██░░ 8    ██░░ 2     1247"
+        // Counts line - each column same width as header
         let counts_line = Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled(
-                format!("{:<4}", fuse_waiting),
+                format!("{:^6}", fuse_waiting),
                 Style::default().fg(Color::Cyan),
             ),
-            Span::raw("    "),
+            Span::raw("      "), // arrow spacer
             Span::styled(
                 format!(
                     "{} {:>3}",
@@ -85,7 +99,7 @@ impl Widget for PipelineWidget<'_> {
                 ),
                 Style::default().fg(Color::Yellow),
             ),
-            Span::raw("       "),
+            Span::raw("     "), // arrow spacer
             Span::styled(
                 format!(
                     "{} {:>3}",
@@ -94,7 +108,7 @@ impl Widget for PipelineWidget<'_> {
                 ),
                 Style::default().fg(Color::Magenta),
             ),
-            Span::raw("      "),
+            Span::raw("     "), // arrow spacer
             Span::styled(
                 format!(
                     "{} {:>3}",
@@ -103,31 +117,50 @@ impl Widget for PipelineWidget<'_> {
                 ),
                 Style::default().fg(Color::Blue),
             ),
-            Span::raw("     "),
+            Span::raw("     "), // arrow spacer
             Span::styled(
                 format!("{} {:>3}", Self::progress_bar(0, 4), 0),
                 Style::default().fg(Color::Green),
             ),
-            Span::raw("    "),
+            Span::raw("      "), // arrow spacer
             Span::styled(
-                format!("{:>6}", completed),
+                format!("{:^10}", completed),
                 Style::default().fg(Color::White),
             ),
         ]);
 
-        // Labels line - align under counts
+        // Labels line - centered in each column
         let labels_line = Line::from(vec![
-            Span::styled("  wait", Style::default().fg(Color::DarkGray)),
-            Span::raw("       "),
-            Span::styled("active", Style::default().fg(Color::DarkGray)),
-            Span::raw("          "),
-            Span::styled("active", Style::default().fg(Color::DarkGray)),
-            Span::raw("         "),
-            Span::styled("active", Style::default().fg(Color::DarkGray)),
-            Span::raw("        "),
-            Span::styled("active", Style::default().fg(Color::DarkGray)),
-            Span::raw("     "),
-            Span::styled("completed", Style::default().fg(Color::DarkGray)),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:^6}", "wait"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("      "), // arrow spacer
+            Span::styled(
+                format!("{:^10}", "active"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("     "), // arrow spacer
+            Span::styled(
+                format!("{:^10}", "active"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("     "), // arrow spacer
+            Span::styled(
+                format!("{:^10}", "active"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("     "), // arrow spacer
+            Span::styled(
+                format!("{:^10}", "active"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("      "), // arrow spacer
+            Span::styled(
+                format!("{:^10}", "completed"),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]);
 
         let text = vec![

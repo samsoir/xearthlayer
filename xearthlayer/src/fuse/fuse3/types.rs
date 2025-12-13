@@ -3,7 +3,7 @@
 use fuse3::raw::MountHandle as Fuse3MountHandle;
 use std::future::Future;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
 use std::task::{Context, Poll};
@@ -129,21 +129,41 @@ impl SpawnedMountHandle {
             let _ = tx.send(());
         }
 
-        // Use fusermount to unmount
+        // Check if mount is still active before trying fusermount
         let mountpoint_str = self.mountpoint.to_string_lossy();
+        if !Self::is_mounted(&self.mountpoint) {
+            debug!(mountpoint = %mountpoint_str, "Already unmounted, skipping fusermount");
+            // Still cancel the task if it exists
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
+            return;
+        }
+
         debug!(mountpoint = %mountpoint_str, "Unmounting via fusermount");
 
-        match Command::new("fusermount")
+        // Try fusermount3 first (fuse3), then fall back to fusermount (fuse2)
+        let result = Command::new("fusermount3")
             .args(["-u", &mountpoint_str])
             .output()
-        {
+            .or_else(|_| {
+                Command::new("fusermount")
+                    .args(["-u", &mountpoint_str])
+                    .output()
+            });
+
+        match result {
             Ok(output) => {
                 if !output.status.success() {
-                    warn!(
-                        mountpoint = %mountpoint_str,
-                        stderr = %String::from_utf8_lossy(&output.stderr),
-                        "fusermount -u failed"
-                    );
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    // Don't warn for expected "not found" or "not mounted" errors
+                    if !stderr.contains("not found") && !stderr.contains("not mounted") {
+                        warn!(
+                            mountpoint = %mountpoint_str,
+                            stderr = %stderr,
+                            "fusermount -u failed"
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -159,6 +179,21 @@ impl SpawnedMountHandle {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+    }
+
+    /// Check if a path is currently mounted.
+    fn is_mounted(path: &Path) -> bool {
+        // Read /proc/mounts to check if the path is mounted
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+            let path_str = path.to_string_lossy();
+            for line in mounts.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 && parts[1] == path_str {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 

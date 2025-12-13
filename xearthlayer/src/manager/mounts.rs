@@ -356,9 +356,11 @@ impl MountManager {
             memory_cache_hits: 0,
             memory_cache_misses: 0,
             memory_cache_hit_rate: 0.0,
+            memory_cache_size_bytes: 0,
             disk_cache_hits: 0,
             disk_cache_misses: 0,
             disk_cache_hit_rate: 0.0,
+            disk_cache_size_bytes: 0,
             encodes_completed: 0,
             encodes_active: 0,
             bytes_encoded: 0,
@@ -394,8 +396,10 @@ impl MountManager {
             total.downloads_active += snapshot.downloads_active;
             total.memory_cache_hits += snapshot.memory_cache_hits;
             total.memory_cache_misses += snapshot.memory_cache_misses;
+            total.memory_cache_size_bytes += snapshot.memory_cache_size_bytes;
             total.disk_cache_hits += snapshot.disk_cache_hits;
             total.disk_cache_misses += snapshot.disk_cache_misses;
+            total.disk_cache_size_bytes += snapshot.disk_cache_size_bytes;
             total.encodes_completed += snapshot.encodes_completed;
             total.encodes_active += snapshot.encodes_active;
             total.bytes_encoded += snapshot.bytes_encoded;

@@ -46,10 +46,11 @@ use crate::texture::DdsTextureEncoder;
 /// # Example
 ///
 /// ```ignore
+/// let memory_cache = Arc::new(MemoryCache::new(2 * 1024 * 1024 * 1024));
 /// let handler = DdsHandlerBuilder::new()
 ///     .with_async_provider(async_provider)
 ///     .with_disk_cache("/path/to/cache", "bing")
-///     .with_memory_cache(cache)
+///     .with_memory_cache(Arc::clone(&memory_cache))
 ///     .with_format(DdsFormat::BC1)
 ///     .with_mipmap_count(5)
 ///     .with_timeout(Duration::from_secs(30))
@@ -65,8 +66,8 @@ pub struct DdsHandlerBuilder {
     provider_name: String,
     /// Disk cache directory (None = no disk cache)
     cache_dir: Option<PathBuf>,
-    /// Memory cache (None = minimal/disabled)
-    memory_cache: Option<MemoryCache>,
+    /// Shared memory cache (None = minimal/disabled)
+    memory_cache: Option<Arc<MemoryCache>>,
     /// DDS compression format
     dds_format: DdsFormat,
     /// Number of mipmap levels
@@ -126,8 +127,11 @@ impl DdsHandlerBuilder {
         self
     }
 
-    /// Set the memory cache for tile-level caching.
-    pub fn with_memory_cache(mut self, cache: MemoryCache) -> Self {
+    /// Set the shared memory cache for tile-level caching.
+    ///
+    /// The cache should be wrapped in `Arc` and shared across the application
+    /// to allow telemetry to query actual cache sizes.
+    pub fn with_memory_cache(mut self, cache: Arc<MemoryCache>) -> Self {
         self.memory_cache = Some(cache);
         self
     }
@@ -182,16 +186,19 @@ impl DdsHandlerBuilder {
         let encoder = DdsTextureEncoder::new(self.dds_format).with_mipmap_count(self.mipmap_count);
         let encoder_adapter = Arc::new(TextureEncoderAdapter::new(encoder));
 
-        // Create memory cache adapter
+        // Create memory cache adapter using the shared cache
         let memory_cache_adapter = Arc::new(match self.memory_cache {
-            Some(cache) => MemoryCacheAdapter::new(
-                MemoryCache::new(cache.max_size_bytes()),
-                &self.provider_name,
-                self.dds_format,
-            ),
+            Some(cache) => {
+                // Use the shared cache directly
+                MemoryCacheAdapter::new(cache, &self.provider_name, self.dds_format)
+            }
             None => {
                 // Minimal cache when disabled
-                MemoryCacheAdapter::new(MemoryCache::new(0), &self.provider_name, self.dds_format)
+                MemoryCacheAdapter::new(
+                    Arc::new(MemoryCache::new(0)),
+                    &self.provider_name,
+                    self.dds_format,
+                )
             }
         });
 
@@ -339,7 +346,7 @@ mod tests {
 
     #[test]
     fn test_builder_with_memory_cache() {
-        let cache = MemoryCache::new(1024 * 1024);
+        let cache = Arc::new(MemoryCache::new(1024 * 1024));
         let builder = DdsHandlerBuilder::new("bing").with_memory_cache(cache);
         assert!(builder.memory_cache.is_some());
     }

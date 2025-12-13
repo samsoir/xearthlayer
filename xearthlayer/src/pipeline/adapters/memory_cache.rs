@@ -5,6 +5,7 @@
 use crate::cache::{self, CacheKey};
 use crate::coord::TileCoord;
 use crate::dds::DdsFormat;
+use std::sync::Arc;
 
 /// Adapts `cache::MemoryCache` to the pipeline's `MemoryCache` trait.
 ///
@@ -18,13 +19,15 @@ use crate::dds::DdsFormat;
 /// use xearthlayer::cache::MemoryCache;
 /// use xearthlayer::dds::DdsFormat;
 /// use xearthlayer::pipeline::adapters::MemoryCacheAdapter;
+/// use std::sync::Arc;
 ///
-/// let cache = MemoryCache::new(2 * 1024 * 1024 * 1024); // 2GB
-/// let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
+/// let cache = Arc::new(MemoryCache::new(2 * 1024 * 1024 * 1024)); // 2GB
+/// let adapter = MemoryCacheAdapter::new(Arc::clone(&cache), "bing", DdsFormat::BC1);
 /// // adapter implements pipeline::MemoryCache
+/// // cache can be shared with telemetry for size queries
 /// ```
 pub struct MemoryCacheAdapter {
-    cache: cache::MemoryCache,
+    cache: Arc<cache::MemoryCache>,
     provider: String,
     format: DdsFormat,
 }
@@ -34,10 +37,14 @@ impl MemoryCacheAdapter {
     ///
     /// # Arguments
     ///
-    /// * `cache` - The underlying memory cache
+    /// * `cache` - Shared reference to the underlying memory cache
     /// * `provider` - Provider name for cache keys
     /// * `format` - DDS format for cache keys
-    pub fn new(cache: cache::MemoryCache, provider: impl Into<String>, format: DdsFormat) -> Self {
+    pub fn new(
+        cache: Arc<cache::MemoryCache>,
+        provider: impl Into<String>,
+        format: DdsFormat,
+    ) -> Self {
         Self {
             cache,
             provider: provider.into(),
@@ -93,7 +100,7 @@ mod tests {
 
     #[test]
     fn test_memory_cache_adapter_put_get() {
-        let cache = cache::MemoryCache::new(1024 * 1024);
+        let cache = Arc::new(cache::MemoryCache::new(1024 * 1024));
         let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
 
         adapter.put(100, 200, 16, vec![1, 2, 3]);
@@ -105,7 +112,7 @@ mod tests {
 
     #[test]
     fn test_memory_cache_adapter_miss() {
-        let cache = cache::MemoryCache::new(1024 * 1024);
+        let cache = Arc::new(cache::MemoryCache::new(1024 * 1024));
         let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
 
         let result = adapter.get(100, 200, 16);
@@ -114,7 +121,7 @@ mod tests {
 
     #[test]
     fn test_memory_cache_adapter_size_tracking() {
-        let cache = cache::MemoryCache::new(1024 * 1024);
+        let cache = Arc::new(cache::MemoryCache::new(1024 * 1024));
         let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
 
         assert_eq!(adapter.size_bytes(), 0);
@@ -128,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_memory_cache_adapter_different_keys() {
-        let cache = cache::MemoryCache::new(1024 * 1024);
+        let cache = Arc::new(cache::MemoryCache::new(1024 * 1024));
         let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
 
         adapter.put(100, 200, 16, vec![1, 2, 3]);
@@ -141,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_memory_cache_adapter_overwrite() {
-        let cache = cache::MemoryCache::new(1024 * 1024);
+        let cache = Arc::new(cache::MemoryCache::new(1024 * 1024));
         let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
 
         adapter.put(100, 200, 16, vec![1, 2, 3]);
@@ -155,7 +162,7 @@ mod tests {
     fn test_memory_cache_adapter_provider_isolation() {
         // Different adapters with different providers should have isolated data
         // (though they share the underlying cache, the keys differ)
-        let cache = cache::MemoryCache::new(1024 * 1024);
+        let cache = Arc::new(cache::MemoryCache::new(1024 * 1024));
         let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
 
         adapter.put(100, 200, 16, vec![1, 2, 3]);
@@ -168,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_memory_cache_adapter_format_isolation() {
-        let cache = cache::MemoryCache::new(1024 * 1024);
+        let cache = Arc::new(cache::MemoryCache::new(1024 * 1024));
         let adapter_bc1 = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
 
         adapter_bc1.put(100, 200, 16, vec![1, 2, 3]);

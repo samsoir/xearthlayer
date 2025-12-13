@@ -426,6 +426,10 @@ impl Cache for CacheSystem {
     fn provider(&self) -> &str {
         self.provider()
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]
