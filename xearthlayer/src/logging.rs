@@ -32,7 +32,7 @@ pub struct LoggingGuard {
 /// Initialize logging system.
 ///
 /// Creates logs directory if needed, clears previous log file,
-/// and sets up dual output to both file and stdout.
+/// and sets up output to file and optionally stdout.
 ///
 /// # Arguments
 ///
@@ -47,6 +47,32 @@ pub struct LoggingGuard {
 ///
 /// Returns error if log directory cannot be created or log file cannot be cleared
 pub fn init_logging(log_dir: &str, log_file: &str) -> Result<LoggingGuard, io::Error> {
+    init_logging_with_options(log_dir, log_file, true)
+}
+
+/// Initialize logging system with options.
+///
+/// Creates logs directory if needed, clears previous log file,
+/// and sets up output to file and optionally stdout.
+///
+/// # Arguments
+///
+/// * `log_dir` - Directory for log files (e.g., "logs")
+/// * `log_file` - Log filename (e.g., "xearthlayer.log")
+/// * `stdout_enabled` - Whether to also output to stdout (disable for TUI mode)
+///
+/// # Returns
+///
+/// LoggingGuard that must be kept alive for logging to work
+///
+/// # Errors
+///
+/// Returns error if log directory cannot be created or log file cannot be cleared
+pub fn init_logging_with_options(
+    log_dir: &str,
+    log_file: &str,
+    stdout_enabled: bool,
+) -> Result<LoggingGuard, io::Error> {
     // Create logs directory if it doesn't exist
     fs::create_dir_all(log_dir)?;
 
@@ -72,11 +98,14 @@ pub fn init_logging(log_dir: &str, log_file: &str) -> Result<LoggingGuard, io::E
             .with_span_events(FmtSpan::CLOSE)
             .pretty();
 
-        let stdout_layer = tracing_subscriber::fmt::layer()
-            .with_writer(io::stdout)
-            .with_ansi(true)
-            .with_span_events(FmtSpan::CLOSE)
-            .pretty();
+        // Only add stdout layer if enabled (disabled for TUI mode)
+        let stdout_layer = stdout_enabled.then(|| {
+            tracing_subscriber::fmt::layer()
+                .with_writer(io::stdout)
+                .with_ansi(true)
+                .with_span_events(FmtSpan::CLOSE)
+                .pretty()
+        });
 
         tracing_subscriber::registry()
             .with(env_filter)
@@ -102,13 +131,16 @@ pub fn init_logging(log_dir: &str, log_file: &str) -> Result<LoggingGuard, io::E
             .with_line_number(false)
             .with_timer(timer.clone());
 
-        let stdout_layer = tracing_subscriber::fmt::layer()
-            .with_writer(io::stdout)
-            .with_ansi(true)
-            .with_target(false)
-            .with_file(false)
-            .with_line_number(false)
-            .with_timer(timer);
+        // Only add stdout layer if enabled (disabled for TUI mode)
+        let stdout_layer = stdout_enabled.then(|| {
+            tracing_subscriber::fmt::layer()
+                .with_writer(io::stdout)
+                .with_ansi(true)
+                .with_target(false)
+                .with_file(false)
+                .with_line_number(false)
+                .with_timer(timer)
+        });
 
         tracing_subscriber::registry()
             .with(env_filter)

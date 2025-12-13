@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tracing::info;
 use xearthlayer::config::{ConfigFile, TextureConfig};
 use xearthlayer::log::TracingLogger;
-use xearthlayer::logging::{init_logging, LoggingGuard};
+use xearthlayer::logging::{init_logging_with_options, LoggingGuard};
 use xearthlayer::provider::ProviderConfig;
 use xearthlayer::service::{ServiceConfig, XEarthLayerService};
 
@@ -23,6 +23,9 @@ pub struct CliRunner {
 
 impl CliRunner {
     /// Create a new CLI runner, loading config and initializing logging.
+    ///
+    /// When stdout is a TTY, stdout logging is disabled to prevent
+    /// interference with the TUI dashboard.
     pub fn new() -> Result<Self, CliError> {
         // Load config file (or use defaults if not present)
         let config = ConfigFile::load()?;
@@ -38,8 +41,12 @@ impl CliRunner {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "xearthlayer.log".to_string());
 
-        let logging_guard =
-            init_logging(&log_dir, &log_file).map_err(|e| CliError::LoggingInit(e.to_string()))?;
+        // Disable stdout logging when running in a TTY since TUI will take over
+        // This prevents log messages from corrupting the TUI display
+        let stdout_enabled = !atty::is(atty::Stream::Stdout);
+
+        let logging_guard = init_logging_with_options(&log_dir, &log_file, stdout_enabled)
+            .map_err(|e| CliError::LoggingInit(e.to_string()))?;
 
         Ok(Self {
             logging_guard,
