@@ -1,5 +1,5 @@
 Name:           xearthlayer
-Version:        0.2.0
+Version:        0.2.3
 Release:        1%{?dist}
 Summary:        High-quality satellite imagery for X-Plane, streamed on demand
 
@@ -12,6 +12,9 @@ BuildRequires:  cargo
 BuildRequires:  fuse3-devel
 
 Requires:       fuse3
+
+# Disable debug packages (release builds have no debug symbols)
+%global debug_package %{nil}
 
 %description
 XEarthLayer delivers satellite/aerial imagery to X-Plane without massive
@@ -44,7 +47,7 @@ install -Dm644 README.md %{buildroot}%{_docdir}/%{name}/README.md
 %{_bindir}/xearthlayer
 
 %changelog
-* Sun Dec 15 2025 Sam de Freyssinet <sam@def.reyssi.net> - 0.2.0-1
+* Mon Dec 15 2025 Sam de Freyssinet <sam@def.reyssi.net> - 0.2.0-1
 - Initial RPM release
 - Async pipeline architecture for improved performance
 - HTTP concurrency limiting to prevent network exhaustion
