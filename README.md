@@ -45,7 +45,7 @@ See [How It Works](docs/how-it-works.md) for detailed architecture.
 
 ```bash
 # Build from source
-git clone https://github.com/youruser/xearthlayer.git
+git clone https://github.com/samsoir/xearthlayer.git
 cd xearthlayer
 make release
 
@@ -132,7 +132,7 @@ XEarthLayer is not tested with X-Plane 11, but should work in principle. The sce
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and build
-git clone https://github.com/youruser/xearthlayer.git
+git clone https://github.com/samsoir/xearthlayer.git
 cd xearthlayer
 make init
 make verify
@@ -146,7 +146,7 @@ Architecturally influenced by [AutoOrtho](https://github.com/kubilus1/autoortho)
 
 Developed with assistance from [Claude](https://claude.ai) by Anthropic.
 
-Made with :heart: in Californa.
+Made with :heart: in California.
 
 ## License
 

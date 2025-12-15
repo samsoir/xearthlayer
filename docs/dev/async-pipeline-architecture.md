@@ -1,8 +1,8 @@
 # Async Pipeline Architecture
 
-**Status**: Phase 1 complete, Phase 2 complete, Phase 3 complete, Phase 3.1 complete (async HTTP + coalescing), Phase 3.2 complete (HTTP concurrency limiting)
+**Status**: Phase 1-3 complete, Phase 3.1 complete (async HTTP + coalescing), Phase 3.2 complete (HTTP concurrency limiting), Phase 3.3 complete (cancellation support)
 **Created**: 2025-12-07
-**Last Updated**: 2025-12-14
+**Last Updated**: 2025-12-15
 
 ## Overview
 
@@ -1833,6 +1833,125 @@ The `download.parallel` config setting was removed as it was unused and confusin
 
 After this change, X-Plane successfully loads scenery without crashes. The concurrency limiter prevents network stack exhaustion while still maintaining good throughput by allowing many concurrent requests (just not unbounded).
 
+### Phase 3.3: Cancellation Support ✅ Complete
+
+This phase addressed resource leaks from orphaned pipeline tasks when FUSE timeouts occur.
+
+#### Problem: Orphaned Tasks on Timeout
+
+When FUSE requests timed out, spawned pipeline tasks continued running indefinitely:
+
+```
+FUSE timeout (30s) → returns placeholder to X-Plane
+But: spawned pipeline task continues running
+     → HTTP connections held
+     → Semaphore permits held
+     → Memory allocated
+
+Under sustained timeouts: resources accumulate → system freeze
+```
+
+This was observed as issue #5 where XEarthLayer froze after extended use.
+
+#### Solution: Cooperative Cancellation
+
+Added `CancellationToken` from `tokio_util` to enable clean abort of in-flight work:
+
+1. **CancellationToken in DdsRequest** (`fuse/async_passthrough/types.rs`)
+   ```rust
+   pub struct DdsRequest {
+       pub job_id: JobId,
+       pub tile: TileCoord,
+       pub result_tx: oneshot::Sender<DdsResponse>,
+       pub cancellation_token: CancellationToken,  // NEW
+   }
+   ```
+
+2. **FUSE timeout triggers cancellation** (`fuse/fuse3/filesystem.rs`)
+   ```rust
+   async fn request_dds(&self, coords: &DdsFilename) -> Vec<u8> {
+       let cancellation_token = CancellationToken::new();
+       let request = DdsRequest { ..., cancellation_token: cancellation_token.clone() };
+
+       match tokio::time::timeout(self.generation_timeout, rx).await {
+           Ok(Ok(response)) => response.data,
+           Ok(Err(_)) | Err(_) => {
+               cancellation_token.cancel();  // Abort in-flight work
+               get_default_placeholder()
+           }
+       }
+   }
+   ```
+
+3. **Cancellable download stage** (`pipeline/stages/download.rs`)
+   ```rust
+   pub async fn download_stage_cancellable<P, D>(
+       // ...
+       cancellation_token: CancellationToken,
+   ) -> ChunkResults {
+       loop {
+           tokio::select! {
+               biased;
+               _ = cancellation_token.cancelled() => {
+                   downloads.abort_all();  // Stop remaining downloads
+                   break;
+               }
+               result = downloads.join_next() => { ... }
+           }
+       }
+   }
+   ```
+
+4. **Coalescer cleanup on cancellation** (`pipeline/coalesce.rs`)
+   ```rust
+   pub fn cancel(&self, tile: TileCoord) {
+       self.in_flight.remove(&tile);
+       // Dropping sender notifies all waiters via RecvError
+   }
+   ```
+
+5. **Metrics balance fix** (`telemetry/metrics.rs`)
+   ```rust
+   pub fn download_cancelled(&self) {
+       self.downloads_active.fetch_sub(1, Ordering::Relaxed);
+   }
+   ```
+
+#### Cancellation Points
+
+The pipeline checks for cancellation at key points:
+
+| Location | Action on Cancellation |
+|----------|----------------------|
+| Before processing | Return early, don't start work |
+| Waiting for HTTP permit | Return error, release any held resources |
+| During HTTP download | Abort request, return error |
+| During retry backoff | Skip backoff, return error |
+| After download stage | Check before assembly, return early |
+| After assembly stage | Check before encode, return early |
+
+#### Files Modified
+
+- `Cargo.toml` - Added `tokio-util = "0.7"` dependency
+- `fuse/async_passthrough/types.rs` - Added `cancellation_token` to `DdsRequest`
+- `fuse/fuse3/filesystem.rs` - Create and cancel token on timeout
+- `fuse/async_passthrough/filesystem.rs` - Same for fuser-based implementation
+- `pipeline/processor.rs` - Added `process_tile_cancellable()`
+- `pipeline/stages/download.rs` - Added `download_stage_cancellable()`
+- `pipeline/runner.rs` - Use cancellable processing
+- `pipeline/coalesce.rs` - Added `cancel()` method
+- `telemetry/metrics.rs` - Added `download_cancelled()`
+
+#### Results
+
+After this change, FUSE timeouts properly release all held resources:
+- HTTP connections closed
+- Semaphore permits released
+- Coalescer entries cleaned up
+- Metrics counters balanced
+
+Extended testing showed no resource accumulation or freezes.
+
 ### Phase 4: Polish
 
 1. Add comprehensive telemetry
@@ -1877,3 +1996,4 @@ After this change, X-Plane successfully loads scenery without crashes. The concu
 | 2025-12-10 | Phase 3 complete: Full integration with XEarthLayerService, runtime DI, removed sync PassthroughFS |
 | 2025-12-11 | Phase 3.1 complete: Refactored to async HTTP to fix thread pool exhaustion; added RequestCoalescer at pipeline level |
 | 2025-12-14 | Phase 3.2 complete: Added HTTP concurrency limiter to prevent network stack exhaustion under load |
+| 2025-12-15 | Phase 3.3 complete: Added cancellation support to fix resource leaks from orphaned tasks (issue #5) |

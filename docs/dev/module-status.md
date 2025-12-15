@@ -11,6 +11,8 @@ This document provides a comprehensive overview of all modules in the XEarthLaye
 
 ## Recent Updates
 
+**2025-12-15**: Async pipeline architecture complete. Migrated from blocking thread pool to fully async fuse3-based implementation. Added HTTP concurrency limiter to prevent network exhaustion. Implemented cooperative cancellation for FUSE timeout handling. Added TUI dashboard for real-time monitoring.
+
 **2025-12-06**: Added `xearthlayer run` command as primary interface. Automatically discovers and mounts all installed ortho packages to Custom Scenery. User-friendly error messages when no packages installed.
 
 **2025-12-05**: Package Manager download module refactored using SOLID principles. Decomposed 757-line monolithic file into 6 focused modules using Strategy pattern for sequential/parallel downloads.
@@ -126,21 +128,60 @@ This document provides a comprehensive overview of all modules in the XEarthLaye
 
 ### ✅ FUSE Virtual Filesystem (`fuse/`)
 
-**Status**: Fully implemented with passthrough support
+**Status**: Fully implemented with async fuse3 support
 
 **Purpose**: Virtual filesystem that intercepts X-Plane texture file requests and generates imagery on-demand.
 
-**Files**:
-- `filesystem.rs` - `XEarthLayerFS` (standalone FUSE server)
-- `passthrough.rs` - `PassthroughFS` (overlay real files, generate DDS on-demand)
-- `filename.rs` - DDS filename pattern parsing
-- `placeholder.rs` - Magenta placeholder generation for failed tiles
+**Implementations**:
+- **fuse3/** - Primary async implementation using `fuse3` crate (recommended)
+- **async_passthrough/** - Legacy `fuser`-based implementation
+
+**Files (fuse3)**:
+- `filesystem.rs` - `Fuse3PassthroughFS` (async filesystem with timeout handling)
+- `types.rs` - `DdsRequest`, `DdsResponse` with cancellation token
 
 **Key Functionality**:
+- Fully async FUSE operations (no blocking)
 - Passthrough mode overlays real scenery files
 - DDS textures generated on-demand when X-Plane requests them
 - Pattern matching: `{row}_{col}_ZL{zoom}.dds`
 - Graceful degradation with magenta placeholders
+- Cancellation token support for timeout handling
+
+---
+
+### ✅ Async Pipeline (`pipeline/`)
+
+**Status**: Fully implemented with comprehensive tests
+
+**Purpose**: Multi-stage async processing pipeline for DDS texture generation.
+
+**Files**:
+- `mod.rs` - Module exports and pipeline configuration
+- `runner.rs` - DDS handler creation with coalescing
+- `processor.rs` - `process_tile()` and `process_tile_cancellable()` functions
+- `coalesce.rs` - Lock-free request coalescing via `DashMap`
+- `http_limiter.rs` - Global HTTP concurrency limiter (semaphore-based)
+- `stages/download.rs` - Parallel chunk downloads with cancellation
+- `stages/assembly.rs` - Image assembly from chunks
+- `stages/encode.rs` - DDS texture encoding
+- `stages/cache.rs` - Memory cache operations
+- `adapters/` - Bridges between pipeline traits and concrete types
+
+**Architecture**:
+```
+DdsRequest → Provider (download) → Assembly → Encoder → Cache → DdsResponse
+                ↓                                          ↓
+          HTTP Limiter                              Memory Cache
+          (semaphore)                               Disk Cache
+```
+
+**Key Features**:
+- Request coalescing: duplicate tile requests share single pipeline run
+- HTTP concurrency limiting: prevents network stack exhaustion
+- Cooperative cancellation: clean abort on FUSE timeout
+- Parallel chunk downloads: up to 256 concurrent per tile
+- Multi-stage metrics tracking for telemetry
 
 ---
 

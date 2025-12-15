@@ -26,28 +26,6 @@ Tracking issues discovered during development and testing.
   - Easier to test validation in isolation
 - **Added**: 2025-12-05
 
-### TD1: Migrate to Async FUSE Model
-- **Status**: Open
-- **Priority**: Medium
-- **Description**: Current implementation uses blocking thread pool for parallel tile generation.
-  The FUSE library (`fuser`) supports an async model that could provide better scalability.
-- **Current Implementation**: `ParallelTileGenerator` wraps tile generation with:
-  - Blocking thread pool (std::thread)
-  - mpsc channels for work distribution
-  - Request coalescing via HashMap
-- **Future Implementation**:
-  - Use `fuser`'s async filesystem trait
-  - Integrate with tokio runtime
-  - Replace blocking channels with async equivalents
-- **Benefits**:
-  - Better thread utilization under high load
-  - More efficient I/O waiting
-  - Native async/await integration
-- **Risks**:
-  - Significant refactoring required
-  - Need to verify compatibility with current architecture
-- **Added**: 2025-11-25
-
 ## Future Enhancements
 
 ### E5: Diagnostic Magenta Chunks
@@ -75,6 +53,21 @@ Tracking issues discovered during development and testing.
 - Pre-warm cache for known flight areas
 
 ## Completed
+
+### TD1: Migrate to Async FUSE Model ✓
+- **Completed**: 2025-12-15
+- **Description**: Migrated from blocking thread pool to fully async pipeline architecture.
+- **Implementation**:
+  - New `fuse3` module using `fuse3` crate with async filesystem trait
+  - Multi-stage async pipeline: Download → Assembly → Encode → Cache
+  - Request coalescing via lock-free `DashMap`
+  - HTTP concurrency limiter to prevent network stack exhaustion
+  - Cancellation token support for FUSE timeout handling
+- **Benefits Achieved**:
+  - Eliminated thread pool exhaustion under heavy load
+  - Native async/await integration with tokio runtime
+  - Cooperative cancellation prevents resource leaks on timeout
+  - Better scalability for concurrent tile requests
 
 ### P1: Slow Initial Load ✓
 - **Completed**: 2025-11-25

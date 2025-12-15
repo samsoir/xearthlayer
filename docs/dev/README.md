@@ -60,7 +60,7 @@ xearthlayer-cli
 
 ```bash
 # Clone and build
-git clone https://github.com/youruser/xearthlayer.git
+git clone https://github.com/samsoir/xearthlayer.git
 cd xearthlayer
 make init
 make verify
