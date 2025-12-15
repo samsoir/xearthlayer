@@ -10,13 +10,20 @@ use ratatui::{
 use xearthlayer::telemetry::TelemetrySnapshot;
 
 /// Rolling history for sparkline display.
+///
+/// Tracks instantaneous throughput by computing the delta between
+/// consecutive samples rather than using average rates.
 pub struct NetworkHistory {
-    /// Bytes per second samples (most recent last).
+    /// Instantaneous bytes per second samples (most recent last).
     samples: Vec<f64>,
     /// Maximum samples to keep.
     max_samples: usize,
-    /// Peak throughput observed.
+    /// Peak instantaneous throughput observed.
     peak_bps: f64,
+    /// Last total bytes downloaded (for delta calculation).
+    last_bytes_downloaded: u64,
+    /// Current instantaneous throughput.
+    current_bps: f64,
 }
 
 impl NetworkHistory {
@@ -25,18 +32,44 @@ impl NetworkHistory {
             samples: Vec::with_capacity(max_samples),
             max_samples,
             peak_bps: 0.0,
+            last_bytes_downloaded: 0,
+            current_bps: 0.0,
         }
     }
 
-    /// Add a new sample.
-    pub fn push(&mut self, bytes_per_second: f64) {
+    /// Update with new telemetry snapshot.
+    ///
+    /// Calculates instantaneous throughput as the delta in bytes downloaded
+    /// since the last sample, divided by the sample interval (assumed ~100ms).
+    pub fn update(&mut self, bytes_downloaded: u64, sample_interval_secs: f64) {
+        // Calculate bytes downloaded since last sample
+        let bytes_delta = bytes_downloaded.saturating_sub(self.last_bytes_downloaded);
+        self.last_bytes_downloaded = bytes_downloaded;
+
+        // Calculate instantaneous throughput (bytes per second)
+        let instant_bps = if sample_interval_secs > 0.0 {
+            bytes_delta as f64 / sample_interval_secs
+        } else {
+            0.0
+        };
+
+        self.current_bps = instant_bps;
+
+        // Add to history
         if self.samples.len() >= self.max_samples {
             self.samples.remove(0);
         }
-        self.samples.push(bytes_per_second);
-        if bytes_per_second > self.peak_bps {
-            self.peak_bps = bytes_per_second;
+        self.samples.push(instant_bps);
+
+        // Update peak
+        if instant_bps > self.peak_bps {
+            self.peak_bps = instant_bps;
         }
+    }
+
+    /// Get the current instantaneous throughput.
+    pub fn current(&self) -> f64 {
+        self.current_bps
     }
 
     /// Get the peak throughput.
@@ -103,13 +136,13 @@ impl Widget for NetworkWidget<'_> {
         let block = Block::default().borders(Borders::NONE);
 
         let sparkline = self.history.sparkline(12);
-        let current = Self::format_throughput(self.snapshot.bytes_per_second);
-        // Use the higher of local history peak or metrics peak
-        let peak_val = self.history.peak().max(self.snapshot.peak_bytes_per_second);
-        let peak = Self::format_throughput(peak_val);
+        // Use instantaneous throughput from history, not average from snapshot
+        let current_bps = self.history.current();
+        let current = Self::format_throughput(current_bps);
+        let peak = Self::format_throughput(self.history.peak());
 
         // Color based on activity level
-        let throughput_color = if self.snapshot.bytes_per_second > 0.0 {
+        let throughput_color = if current_bps > 0.0 {
             Color::Green
         } else {
             Color::DarkGray

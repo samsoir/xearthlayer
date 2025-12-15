@@ -3,6 +3,7 @@
 //! Adapts disk cache operations to the pipeline's `DiskCache` trait.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Adapts disk cache operations to the pipeline's `DiskCache` trait.
 ///
@@ -31,6 +32,8 @@ use std::path::PathBuf;
 pub struct DiskCacheAdapter {
     cache_dir: PathBuf,
     provider: String,
+    /// Approximate bytes written to disk cache (tracked atomically).
+    bytes_written: AtomicU64,
 }
 
 impl DiskCacheAdapter {
@@ -44,6 +47,7 @@ impl DiskCacheAdapter {
         Self {
             cache_dir,
             provider: provider.into(),
+            bytes_written: AtomicU64::new(0),
         }
     }
 
@@ -55,6 +59,14 @@ impl DiskCacheAdapter {
     /// Returns the provider name.
     pub fn provider(&self) -> &str {
         &self.provider
+    }
+
+    /// Returns the approximate bytes written to the disk cache.
+    ///
+    /// This tracks bytes written during this session only, not the total
+    /// disk usage of the cache directory.
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written.load(Ordering::Relaxed)
     }
 
     /// Constructs the path for a chunk file.
@@ -101,6 +113,7 @@ impl crate::pipeline::DiskCache for DiskCacheAdapter {
         data: Vec<u8>,
     ) -> Result<(), std::io::Error> {
         let path = self.chunk_path(tile_row, tile_col, zoom, chunk_row, chunk_col);
+        let data_len = data.len() as u64;
 
         // Create parent directories
         if let Some(parent) = path.parent() {
@@ -108,7 +121,12 @@ impl crate::pipeline::DiskCache for DiskCacheAdapter {
         }
 
         // Write the chunk data
-        tokio::fs::write(&path, data).await
+        tokio::fs::write(&path, data).await?;
+
+        // Track bytes written
+        self.bytes_written.fetch_add(data_len, Ordering::Relaxed);
+
+        Ok(())
     }
 }
 

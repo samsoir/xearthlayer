@@ -231,6 +231,14 @@ impl PipelineMetrics {
         self.disk_cache_size_bytes.store(bytes, Ordering::Relaxed);
     }
 
+    /// Add bytes to the disk cache size counter.
+    ///
+    /// Use this when chunks are written to disk cache to track cumulative size.
+    pub fn add_disk_cache_bytes(&self, bytes: u64) {
+        self.disk_cache_size_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
     // === Encode tracking ===
 
     /// Record an encode operation starting.

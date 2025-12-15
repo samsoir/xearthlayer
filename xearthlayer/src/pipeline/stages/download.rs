@@ -261,12 +261,21 @@ where
                 // Success - cache the chunk (fire and forget, don't block on cache write)
                 let dc = Arc::clone(&disk_cache);
                 let chunk_data = data.clone();
+                let cache_bytes = chunk_data.len() as u64;
+                let cache_metrics = metrics.clone();
                 tokio::spawn(async move {
-                    let _ = dc
+                    if dc
                         .put(
                             tile.row, tile.col, tile.zoom, chunk_row, chunk_col, chunk_data,
                         )
-                        .await;
+                        .await
+                        .is_ok()
+                    {
+                        // Track disk cache growth
+                        if let Some(ref m) = cache_metrics {
+                            m.add_disk_cache_bytes(cache_bytes);
+                        }
+                    }
                 });
 
                 return Ok(ChunkData {

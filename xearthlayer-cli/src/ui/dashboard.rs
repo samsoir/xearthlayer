@@ -58,6 +58,7 @@ pub struct Dashboard {
     network_history: NetworkHistory,
     shutdown: Arc<AtomicBool>,
     start_time: Instant,
+    last_draw: Instant,
 }
 
 impl Dashboard {
@@ -69,12 +70,14 @@ impl Dashboard {
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
 
+        let now = Instant::now();
         Ok(Self {
             terminal,
             config,
             network_history: NetworkHistory::new(60), // 60 samples for sparkline
             shutdown,
-            start_time: Instant::now(),
+            start_time: now,
+            last_draw: now,
         })
     }
 
@@ -88,8 +91,14 @@ impl Dashboard {
 
     /// Draw the dashboard with the given telemetry snapshot.
     pub fn draw(&mut self, snapshot: &TelemetrySnapshot) -> io::Result<()> {
-        // Update network history
-        self.network_history.push(snapshot.bytes_per_second);
+        // Calculate time since last draw for instantaneous rate calculation
+        let now = Instant::now();
+        let sample_interval = now.duration_since(self.last_draw).as_secs_f64();
+        self.last_draw = now;
+
+        // Update network history with instantaneous throughput
+        self.network_history
+            .update(snapshot.bytes_downloaded, sample_interval);
 
         let uptime = self.start_time.elapsed();
         let cache_config = CacheConfig {
@@ -207,7 +216,7 @@ impl Dashboard {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
             .title(Span::styled(
-                " XEarthLayer Pipeline Status ",
+                format!(" XEarthLayer Status v{} ", xearthlayer::VERSION),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
