@@ -15,40 +15,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Build static binary with musl for maximum compatibility
-  build-linux-musl:
-    name: Build Linux (musl static)
+  # Build Linux binary tarball
+  build-linux:
+    name: Build Linux Binary
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install musl tools
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo apt-get install -y libfuse3-dev
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build static binary
+      - name: Build release binary
         run: |
-          cargo build --release --target x86_64-unknown-linux-musl
+          cargo build --release
 
       - name: Package binary
         run: |
           mkdir -p dist
-          cp target/x86_64-unknown-linux-musl/release/xearthlayer dist/
+          cp target/release/xearthlayer dist/
           cp README.md LICENSE dist/
           cd dist
-          tar czvf xearthlayer-${{ github.ref_name || inputs.tag }}-x86_64-linux-musl.tar.gz xearthlayer README.md LICENSE
+          tar czvf xearthlayer-${{ github.ref_name || inputs.tag }}-x86_64-linux.tar.gz xearthlayer README.md LICENSE
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: linux-musl-binary
+          name: linux-binary
           path: dist/*.tar.gz
 
   # Build .deb package for Debian/Ubuntu
@@ -100,7 +98,7 @@ jobs:
           dnf install -y rust cargo fuse3-devel rpm-build
 
       - name: Build release binary
-        run: cargo build --release --locked
+        run: cargo build --release
 
       - name: Build RPM package
         run: |
@@ -130,7 +128,7 @@ jobs:
   # Create GitHub Release with all artifacts
   release:
     name: Create Release
-    needs: [build-linux-musl, build-deb, build-rpm]
+    needs: [build-linux, build-deb, build-rpm]
     runs-on: ubuntu-latest
     permissions:
       contents: write
