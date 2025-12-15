@@ -12,6 +12,7 @@
 
 use crate::fuse::{DdsHandler, DdsRequest, DdsResponse, EXPECTED_DDS_SIZE};
 use crate::pipeline::coalesce::{CoalesceResult, RequestCoalescer};
+use crate::pipeline::http_limiter::HttpConcurrencyLimiter;
 use crate::pipeline::{
     process_tile, BlockingExecutor, ChunkProvider, DiskCache, MemoryCache, PipelineConfig,
     TextureEncoderAsync,
@@ -121,9 +122,13 @@ where
     // Create shared coalescer for all requests
     let coalescer = Arc::new(RequestCoalescer::new());
 
+    // Create global HTTP concurrency limiter based on config
+    let http_limiter = Arc::new(HttpConcurrencyLimiter::new(config.max_global_http_requests));
+
     info!(
         metrics_enabled = metrics.is_some(),
-        "Created DDS handler with request coalescing enabled"
+        max_http_concurrent = config.max_global_http_requests,
+        "Created DDS handler with request coalescing and HTTP concurrency limiting"
     );
 
     Arc::new(move |request: DdsRequest| {
@@ -133,6 +138,7 @@ where
         let disk_cache = Arc::clone(&disk_cache);
         let executor = Arc::clone(&executor);
         let coalescer = Arc::clone(&coalescer);
+        let http_limiter = Arc::clone(&http_limiter);
         let metrics = metrics.clone();
         let config = config.clone();
         let job_id = request.job_id;
@@ -154,6 +160,7 @@ where
                 disk_cache,
                 executor,
                 coalescer,
+                http_limiter,
                 metrics,
                 config,
             )
@@ -207,6 +214,7 @@ async fn process_dds_request<P, E, M, D, X>(
         executor.as_ref(),
         &config,
         None, // No metrics for legacy non-coalescing path
+        None, // No HTTP limiter for legacy non-coalescing path
     )
     .await;
 
@@ -254,6 +262,7 @@ async fn process_dds_request_coalesced<P, E, M, D, X>(
     disk_cache: Arc<D>,
     executor: Arc<X>,
     coalescer: Arc<RequestCoalescer>,
+    http_limiter: Arc<HttpConcurrencyLimiter>,
     metrics: Option<Arc<PipelineMetrics>>,
     config: PipelineConfig,
 ) where
@@ -363,6 +372,7 @@ async fn process_dds_request_coalesced<P, E, M, D, X>(
                 executor.as_ref(),
                 &config,
                 metrics.clone(),
+                Some(http_limiter),
             )
             .await;
 

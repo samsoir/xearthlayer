@@ -84,10 +84,8 @@ pub struct TextureSettings {
 /// Download configuration.
 #[derive(Debug, Clone)]
 pub struct DownloadSettings {
-    /// Timeout in seconds
+    /// Timeout in seconds for HTTP requests.
     pub timeout: u64,
-    /// Parallel downloads
-    pub parallel: usize,
 }
 
 /// Generation configuration.
@@ -153,10 +151,7 @@ impl Default for ConfigFile {
             texture: TextureSettings {
                 format: DdsFormat::BC1,
             },
-            download: DownloadSettings {
-                timeout: 30,
-                parallel: 32,
-            },
+            download: DownloadSettings { timeout: 30 },
             generation: GenerationSettings {
                 threads: num_cpus(),
                 timeout: 10,
@@ -304,15 +299,6 @@ impl ConfigFile {
                     reason: "must be a positive integer (seconds)".to_string(),
                 })?;
             }
-            if let Some(v) = section.get("parallel") {
-                config.download.parallel =
-                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                        section: "download".to_string(),
-                        key: "parallel".to_string(),
-                        value: v.to_string(),
-                        reason: "must be a positive integer".to_string(),
-                    })?;
-            }
         }
 
         // [generation] section
@@ -454,11 +440,8 @@ disk_size = {}
 format = {}
 
 [download]
-; Timeout in seconds for downloading a single tile (default: 30)
+; Timeout in seconds for HTTP requests (default: 30)
 timeout = {}
-; Maximum parallel chunk downloads (default: 32)
-; Higher values = faster downloads but more bandwidth/CPU usage
-parallel = {}
 
 [generation]
 ; Number of threads for parallel tile generation (default: number of CPU cores)
@@ -499,7 +482,6 @@ file = {}
             format_size(self.cache.disk_size),
             self.texture.format.to_string().to_lowercase(),
             self.download.timeout,
-            self.download.parallel,
             self.generation.threads,
             self.generation.timeout,
             scenery_dir,
@@ -572,7 +554,6 @@ mod tests {
         assert_eq!(config.cache.disk_size, 20 * 1024 * 1024 * 1024);
         assert_eq!(config.texture.format, DdsFormat::BC1);
         assert_eq!(config.download.timeout, 30);
-        assert_eq!(config.download.parallel, 32);
         assert!(config.xplane.scenery_dir.is_none());
     }
 
@@ -585,7 +566,7 @@ mod tests {
         config.provider.provider_type = "google".to_string();
         config.provider.google_api_key = Some("test-api-key".to_string());
         config.cache.memory_size = 4 * 1024 * 1024 * 1024; // 4GB
-        config.download.parallel = 64;
+        config.download.timeout = 60;
 
         config.save_to(&config_path).unwrap();
 
@@ -597,7 +578,7 @@ mod tests {
             Some("test-api-key".to_string())
         );
         assert_eq!(loaded.cache.memory_size, 4 * 1024 * 1024 * 1024);
-        assert_eq!(loaded.download.parallel, 64);
+        assert_eq!(loaded.download.timeout, 60);
     }
 
     #[test]
@@ -703,7 +684,7 @@ type = google
 google_api_key = my-key
 
 [download]
-parallel = 16
+timeout = 45
 "#,
         )
         .unwrap();
@@ -713,11 +694,10 @@ parallel = 16
         // Specified values
         assert_eq!(config.provider.provider_type, "google");
         assert_eq!(config.provider.google_api_key, Some("my-key".to_string()));
-        assert_eq!(config.download.parallel, 16);
+        assert_eq!(config.download.timeout, 45);
 
         // Default values
         assert_eq!(config.cache.memory_size, 2 * 1024 * 1024 * 1024);
-        assert_eq!(config.download.timeout, 30);
         assert_eq!(config.texture.format, DdsFormat::BC1);
     }
 

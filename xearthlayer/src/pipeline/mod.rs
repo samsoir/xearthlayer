@@ -47,6 +47,7 @@ mod coalesce;
 mod context;
 mod error;
 mod executor;
+mod http_limiter;
 mod job;
 mod processor;
 mod runner;
@@ -59,7 +60,10 @@ pub use context::{
 };
 pub use error::{ChunkFailure, ChunkResults, ChunkSuccess, JobError, StageError};
 pub use executor::{BlockingExecutor, ConcurrentRunner, ExecutorError, Timer, TokioExecutor};
+pub use http_limiter::HttpConcurrencyLimiter;
 pub use job::{Job, JobId, JobResult, Priority};
 pub use processor::{process_job, process_tile};
 pub use runner::{create_dds_handler, create_dds_handler_with_metrics};
-pub use stages::{assembly_stage, cache_stage, download_stage, encode_stage};
+pub use stages::{
+    assembly_stage, cache_stage, download_stage, download_stage_with_limiter, encode_stage,
+};

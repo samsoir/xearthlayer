@@ -1,18 +1,32 @@
 # Performance Bottlenecks and Optimization Strategy
 
-**Status**: Investigation in progress
+**Status**: Resolved - See [Async Pipeline Architecture](./async-pipeline-architecture.md) for implementation details
 **Created**: 2025-12-07
-**Last Updated**: 2025-12-07
+**Last Updated**: 2025-12-14
 
 ## Executive Summary
 
-XEarthLayer is experiencing suboptimal throughput during initial scene loading:
+This document captured the original performance analysis that led to the async pipeline architecture redesign. The issues identified here have been resolved through:
+
+- **Phase 3.1**: Async HTTP with request coalescing (fixed thread pool exhaustion)
+- **Phase 3.2**: HTTP concurrency limiting (fixed network stack exhaustion)
+
+### Original Issues (Now Resolved)
+
 - **Observed**: 4-6 MB/s average network throughput, 11 MB/s peak
 - **Expected**: Should saturate available bandwidth (50+ MB/s on typical connections)
 - **CPU utilization**: Far below capacity during load
 - **Critical issue**: Network activity stops completely after ~20 minutes (suspected deadlock)
 
-This document captures the system architecture analysis, identified bottlenecks, and proposed mitigation strategies.
+### Resolution
+
+The async pipeline architecture with HTTP concurrency limiting now:
+- Handles X-Plane's concurrent requests efficiently
+- Prevents network stack exhaustion through semaphore-based rate limiting
+- Automatically tunes concurrency based on CPU count: `min(cpus * 16, 256)`
+- Successfully loads scenery in X-Plane without crashes
+
+This document is preserved for historical reference. See [Async Pipeline Architecture](./async-pipeline-architecture.md) for the current implementation.
 
 ---
 
@@ -537,3 +551,4 @@ Any changes should be validated with:
 | Date | Change |
 |------|--------|
 | 2025-12-07 | Initial document created with architecture analysis |
+| 2025-12-14 | Marked as resolved; issues fixed by async pipeline phases 3.1 and 3.2 |

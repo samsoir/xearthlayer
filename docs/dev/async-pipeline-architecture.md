@@ -1,8 +1,8 @@
 # Async Pipeline Architecture
 
-**Status**: Phase 1 complete, Phase 2 complete, Phase 3 complete, Phase 3.1 complete (async HTTP + coalescing)
+**Status**: Phase 1 complete, Phase 2 complete, Phase 3 complete, Phase 3.1 complete (async HTTP + coalescing), Phase 3.2 complete (HTTP concurrency limiting)
 **Created**: 2025-12-07
-**Last Updated**: 2025-12-11
+**Last Updated**: 2025-12-14
 
 ## Overview
 
@@ -1738,6 +1738,101 @@ pub fn create_dds_handler<...>(...) -> DdsHandler {
 - `pipeline/runner.rs` - Integrated coalescing into `create_dds_handler`
 - `service/facade.rs` - Wired up async provider creation
 
+### Phase 3.2: HTTP Concurrency Limiting ✅ Complete
+
+This phase addressed network stack exhaustion discovered during X-Plane load testing.
+
+#### Problem: Network Stack Exhaustion
+
+During X-Plane scene loading, the system spawned too many concurrent HTTP requests:
+
+```
+256 chunks per tile × multiple concurrent tiles = thousands of HTTP requests
+Result: Network stack exhaustion → connection failures → X-Plane crash
+```
+
+Log analysis showed 1,221 chunk download failures within 3 seconds, with errors like "error sending request" indicating the OS networking stack was overwhelmed.
+
+#### Solution: Global HTTP Concurrency Limiter
+
+Added `HttpConcurrencyLimiter` using Tokio semaphores to cap concurrent HTTP requests:
+
+1. **HttpConcurrencyLimiter** (`pipeline/http_limiter.rs`)
+   ```rust
+   pub struct HttpConcurrencyLimiter {
+       semaphore: Arc<Semaphore>,
+       max_permits: usize,
+       in_flight: AtomicUsize,
+       peak_in_flight: AtomicUsize,
+   }
+
+   impl HttpConcurrencyLimiter {
+       pub fn with_default_concurrency() -> Self {
+           // CPU-aware default: min(num_cpus * 16, 256)
+           let cpus = std::thread::available_parallelism()
+               .map(|p| p.get())
+               .unwrap_or(4);
+           Self::new((cpus * 16).min(256))
+       }
+
+       pub async fn acquire(&self) -> HttpPermit<'_> {
+           // Blocks until permit available
+       }
+   }
+   ```
+
+2. **Integration in download stage** (`pipeline/stages/download.rs`)
+   ```rust
+   pub async fn download_stage_with_limiter<P, D>(
+       // ...existing params...
+       http_limiter: Option<Arc<HttpConcurrencyLimiter>>,
+   ) -> ChunkResults {
+       // Each chunk download acquires permit before HTTP request
+       // Permit released after response received (not after processing)
+   }
+   ```
+
+3. **Injection point** (`pipeline/runner.rs`)
+   ```rust
+   let http_limiter = Arc::new(HttpConcurrencyLimiter::new(
+       config.max_global_http_requests
+   ));
+   // Passed through create_dds_handler to process_tile
+   ```
+
+#### Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| CPU-based default sizing | `min(cpus * 16, 256)` balances concurrency with OS limits |
+| Semaphore-based | Natural async primitive, no busy-waiting |
+| Permit per HTTP request | Granular control, cache hits don't consume permits |
+| Release after response | Don't hold permits during image decoding/processing |
+| Injected at runner level | Single creation point, domain-appropriate location |
+
+#### Configuration
+
+The `max_global_http_requests` field in `PipelineConfig` controls the limit:
+- Auto-detected based on CPU count
+- Formula: `min(num_cpus * 16, 256)`
+- Example: 8-core system → 128 concurrent HTTP requests max
+
+The `download.parallel` config setting was removed as it was unused and confusing to users. HTTP concurrency is now automatically tuned based on system capabilities.
+
+#### Files Modified
+
+- `pipeline/http_limiter.rs` - New module with `HttpConcurrencyLimiter`
+- `pipeline/context.rs` - Added `max_global_http_requests` to `PipelineConfig`
+- `pipeline/stages/download.rs` - Added `download_stage_with_limiter()`
+- `pipeline/processor.rs` - Pass limiter through `process_tile()`
+- `pipeline/runner.rs` - Create and inject limiter
+- `config/file.rs` - Removed unused `download.parallel` setting
+- `config/keys.rs` - Removed `DownloadParallel` config key
+
+#### Results
+
+After this change, X-Plane successfully loads scenery without crashes. The concurrency limiter prevents network stack exhaustion while still maintaining good throughput by allowing many concurrent requests (just not unbounded).
+
 ### Phase 4: Polish
 
 1. Add comprehensive telemetry
@@ -1781,3 +1876,4 @@ pub fn create_dds_handler<...>(...) -> DdsHandler {
 | 2025-12-09 | Phase 2 complete: AsyncPassthroughFS, pipeline runner, FUSE integration |
 | 2025-12-10 | Phase 3 complete: Full integration with XEarthLayerService, runtime DI, removed sync PassthroughFS |
 | 2025-12-11 | Phase 3.1 complete: Refactored to async HTTP to fix thread pool exhaustion; added RequestCoalescer at pipeline level |
+| 2025-12-14 | Phase 3.2 complete: Added HTTP concurrency limiter to prevent network stack exhaustion under load |

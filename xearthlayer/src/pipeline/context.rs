@@ -23,7 +23,18 @@ pub struct PipelineConfig {
     pub mipmap_count: usize,
 
     /// Maximum concurrent downloads per job (up to 256)
+    /// This limits concurrency within a single tile's download stage.
     pub max_concurrent_downloads: usize,
+
+    /// Global maximum concurrent HTTP requests across all jobs.
+    /// This prevents overwhelming the network stack when multiple tiles
+    /// are being processed simultaneously.
+    ///
+    /// Recommended: `num_cpus * 16` capped at 256.
+    /// - 4-core system: 64-128 concurrent requests
+    /// - 8-core system: 128-256 concurrent requests
+    /// - 12+ core system: 256 concurrent requests (cap)
+    pub max_global_http_requests: usize,
 }
 
 impl Default for PipelineConfig {
@@ -34,7 +45,27 @@ impl Default for PipelineConfig {
             dds_format: DdsFormat::BC1,
             mipmap_count: 5,
             max_concurrent_downloads: 256,
+            max_global_http_requests: Self::default_global_http_requests(),
         }
+    }
+}
+
+impl PipelineConfig {
+    /// Calculates a sensible default for global HTTP concurrency based on CPU count.
+    ///
+    /// Formula: `min(num_cpus * 16, 256)`
+    ///
+    /// This balances throughput with system resource constraints:
+    /// - HTTP requests are I/O-bound, so we can have many more than CPU count
+    /// - But too many overwhelms the network stack and causes connection failures
+    /// - 256 is the practical ceiling where diminishing returns set in
+    pub fn default_global_http_requests() -> usize {
+        let cpus = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4);
+
+        // Scale with CPU count but cap at 256
+        (cpus * 16).min(256)
     }
 }
 
@@ -253,6 +284,17 @@ mod tests {
         assert_eq!(config.dds_format, DdsFormat::BC1);
         assert_eq!(config.mipmap_count, 5);
         assert_eq!(config.max_concurrent_downloads, 256);
+        // Global HTTP should be CPU-based, between 64 and 256
+        assert!(config.max_global_http_requests >= 64);
+        assert!(config.max_global_http_requests <= 256);
+    }
+
+    #[test]
+    fn test_default_global_http_requests() {
+        let default = PipelineConfig::default_global_http_requests();
+        // Should be num_cpus * 16, capped at 256
+        assert!(default >= 64); // At least 4 CPUs * 16
+        assert!(default <= 256); // Capped at 256
     }
 
     #[test]

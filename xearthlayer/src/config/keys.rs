@@ -43,7 +43,6 @@ pub enum ConfigKey {
 
     // Download settings
     DownloadTimeout,
-    DownloadParallel,
 
     // Generation settings
     GenerationThreads,
@@ -78,7 +77,6 @@ impl FromStr for ConfigKey {
             "texture.format" => Ok(ConfigKey::TextureFormat),
 
             "download.timeout" => Ok(ConfigKey::DownloadTimeout),
-            "download.parallel" => Ok(ConfigKey::DownloadParallel),
 
             "generation.threads" => Ok(ConfigKey::GenerationThreads),
             "generation.timeout" => Ok(ConfigKey::GenerationTimeout),
@@ -109,7 +107,6 @@ impl ConfigKey {
             ConfigKey::CacheDiskSize => "cache.disk_size",
             ConfigKey::TextureFormat => "texture.format",
             ConfigKey::DownloadTimeout => "download.timeout",
-            ConfigKey::DownloadParallel => "download.parallel",
             ConfigKey::GenerationThreads => "generation.threads",
             ConfigKey::GenerationTimeout => "generation.timeout",
             ConfigKey::XplaneSceneryDir => "xplane.scenery_dir",
@@ -144,7 +141,6 @@ impl ConfigKey {
             ConfigKey::CacheDiskSize => format_size(config.cache.disk_size),
             ConfigKey::TextureFormat => config.texture.format.to_string().to_lowercase(),
             ConfigKey::DownloadTimeout => config.download.timeout.to_string(),
-            ConfigKey::DownloadParallel => config.download.parallel.to_string(),
             ConfigKey::GenerationThreads => config.generation.threads.to_string(),
             ConfigKey::GenerationTimeout => config.generation.timeout.to_string(),
             ConfigKey::XplaneSceneryDir => config
@@ -219,9 +215,6 @@ impl ConfigKey {
             ConfigKey::DownloadTimeout => {
                 config.download.timeout = value.parse().unwrap();
             }
-            ConfigKey::DownloadParallel => {
-                config.download.parallel = value.parse().unwrap();
-            }
             ConfigKey::GenerationThreads => {
                 config.generation.threads = value.parse().unwrap();
             }
@@ -274,7 +267,6 @@ impl ConfigKey {
             ConfigKey::CacheDiskSize => Box::new(SizeSpec),
             ConfigKey::TextureFormat => Box::new(OneOfSpec::new(&["bc1", "bc3"])),
             ConfigKey::DownloadTimeout => Box::new(PositiveIntegerSpec),
-            ConfigKey::DownloadParallel => Box::new(PositiveIntegerSpec),
             ConfigKey::GenerationThreads => Box::new(PositiveIntegerSpec),
             ConfigKey::GenerationTimeout => Box::new(PositiveIntegerSpec),
             ConfigKey::XplaneSceneryDir => Box::new(OptionalPathSpec),
@@ -297,7 +289,6 @@ impl ConfigKey {
             ConfigKey::CacheDiskSize,
             ConfigKey::TextureFormat,
             ConfigKey::DownloadTimeout,
-            ConfigKey::DownloadParallel,
             ConfigKey::GenerationThreads,
             ConfigKey::GenerationTimeout,
             ConfigKey::XplaneSceneryDir,

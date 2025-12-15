@@ -10,8 +10,9 @@
 
 use crate::coord::TileCoord;
 use crate::fuse::EXPECTED_DDS_SIZE;
+use crate::pipeline::http_limiter::HttpConcurrencyLimiter;
 use crate::pipeline::stages::{
-    assembly_stage, cache_stage, check_memory_cache, download_stage, encode_stage,
+    assembly_stage, cache_stage, check_memory_cache, download_stage_with_limiter, encode_stage,
 };
 use crate::pipeline::{
     BlockingExecutor, ChunkProvider, DiskCache, Job, JobError, JobId, JobResult, MemoryCache,
@@ -40,11 +41,12 @@ use tracing::{debug, instrument, warn};
 /// - Individual chunk failures result in magenta placeholders, not job failure
 /// - Only catastrophic failures (e.g., all chunks fail, encoding crashes) fail the job
 /// - A job always produces _some_ result (possibly all magenta)
-#[instrument(skip(ctx, metrics), fields(job_id = %job.id, tile = ?job.tile_coords))]
+#[instrument(skip(ctx, metrics, http_limiter), fields(job_id = %job.id, tile = ?job.tile_coords))]
 pub async fn process_job<P, E, M, D, X>(
     job: Job,
     ctx: &PipelineContext<P, E, M, D, X>,
     metrics: Option<Arc<PipelineMetrics>>,
+    http_limiter: Option<Arc<HttpConcurrencyLimiter>>,
 ) -> Result<JobResult, JobError>
 where
     P: ChunkProvider,
@@ -64,14 +66,15 @@ where
         return Ok(JobResult::cache_hit(job_id, cached_data, start.elapsed()));
     }
 
-    // Stage 1: Download chunks
-    let chunks = download_stage(
+    // Stage 1: Download chunks (with optional HTTP concurrency limiting)
+    let chunks = download_stage_with_limiter(
         job_id,
         tile,
         Arc::clone(&ctx.provider),
         Arc::clone(&ctx.disk_cache),
         &ctx.config,
         metrics.clone(),
+        http_limiter,
     )
     .await;
 
@@ -147,6 +150,11 @@ where
 ///
 /// This is a convenience function for cases where you have the components
 /// but not a full `PipelineContext`.
+///
+/// # Arguments
+///
+/// * `http_limiter` - Optional global HTTP concurrency limiter. When provided,
+///   limits the total concurrent HTTP requests across all tiles being processed.
 #[allow(clippy::too_many_arguments)]
 pub async fn process_tile<P, E, M, D, X>(
     job_id: JobId,
@@ -158,6 +166,7 @@ pub async fn process_tile<P, E, M, D, X>(
     executor: &X,
     config: &PipelineConfig,
     metrics: Option<Arc<PipelineMetrics>>,
+    http_limiter: Option<Arc<HttpConcurrencyLimiter>>,
 ) -> Result<JobResult, JobError>
 where
     P: ChunkProvider,
@@ -174,14 +183,15 @@ where
         return Ok(JobResult::cache_hit(job_id, cached_data, start.elapsed()));
     }
 
-    // Stage 1: Download chunks
-    let chunks = download_stage(
+    // Stage 1: Download chunks (with optional HTTP concurrency limiting)
+    let chunks = download_stage_with_limiter(
         job_id,
         tile,
         Arc::clone(&provider),
         Arc::clone(&disk_cache),
         config,
         metrics.clone(),
+        http_limiter,
     )
     .await;
 
@@ -396,6 +406,7 @@ mod tests {
             &executor,
             &config,
             None,
+            None, // No HTTP limiter for test
         )
         .await;
 
@@ -432,6 +443,7 @@ mod tests {
             &executor,
             &config,
             None,
+            None, // No HTTP limiter for test
         )
         .await;
 
@@ -469,6 +481,7 @@ mod tests {
             &executor,
             &config,
             None,
+            None, // No HTTP limiter for test
         )
         .await;
 
@@ -507,6 +520,7 @@ mod tests {
             &executor,
             &config,
             None,
+            None, // No HTTP limiter for test
         )
         .await;
 
@@ -545,6 +559,7 @@ mod tests {
             &executor,
             &config,
             None,
+            None, // No HTTP limiter for test
         )
         .await;
 

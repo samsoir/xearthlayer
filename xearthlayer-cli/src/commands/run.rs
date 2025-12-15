@@ -89,7 +89,8 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     let provider_config = resolve_provider(args.provider, args.google_api_key, config)?;
     let format = resolve_dds_format(args.dds_format, config);
     let timeout_secs = args.timeout.unwrap_or(config.download.timeout);
-    let parallel_downloads = args.parallel.unwrap_or(config.download.parallel);
+    // Default parallel downloads is handled by DownloadConfig::default()
+    let parallel_downloads = args.parallel.unwrap_or(32);
 
     // Build configurations
     let texture_config = TextureConfig::new(format).with_mipmap_count(5);

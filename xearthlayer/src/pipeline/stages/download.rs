@@ -3,8 +3,19 @@
 //! This stage downloads all 256 chunks (16x16 grid) that compose a single tile.
 //! It uses Tokio's JoinSet for concurrent downloads and handles retries for
 //! transient failures.
+//!
+//! # Concurrency Control
+//!
+//! The download stage supports an optional global HTTP concurrency limiter
+//! (`HttpConcurrencyLimiter`) that constrains the total number of concurrent
+//! HTTP requests across all tiles being processed. This prevents network
+//! stack exhaustion under heavy load.
+//!
+//! Without the limiter, all 256 chunks per tile are downloaded concurrently.
+//! With the limiter, downloads wait for permits before making HTTP requests.
 
 use crate::coord::TileCoord;
+use crate::pipeline::http_limiter::HttpConcurrencyLimiter;
 use crate::pipeline::{ChunkProvider, ChunkResults, DiskCache, JobId, PipelineConfig};
 use crate::telemetry::PipelineMetrics;
 use std::sync::Arc;
@@ -27,6 +38,7 @@ use tracing::{debug, instrument, warn};
 /// * `provider` - Chunk download provider
 /// * `disk_cache` - Disk cache for chunk persistence
 /// * `config` - Pipeline configuration
+/// * `metrics` - Optional metrics collector
 ///
 /// # Returns
 ///
@@ -44,6 +56,42 @@ where
     P: ChunkProvider,
     D: DiskCache,
 {
+    download_stage_with_limiter(job_id, tile, provider, disk_cache, config, metrics, None).await
+}
+
+/// Downloads all chunks for a tile with optional global HTTP concurrency limiting.
+///
+/// This is the primary download function that supports constrained HTTP concurrency.
+/// When an `http_limiter` is provided, download tasks will wait for permits before
+/// making HTTP requests, preventing network stack exhaustion under heavy load.
+///
+/// # Arguments
+///
+/// * `job_id` - For logging correlation
+/// * `tile` - The tile coordinates to download
+/// * `provider` - Chunk download provider
+/// * `disk_cache` - Disk cache for chunk persistence
+/// * `config` - Pipeline configuration
+/// * `metrics` - Optional metrics collector
+/// * `http_limiter` - Optional global HTTP concurrency limiter
+///
+/// # Returns
+///
+/// `ChunkResults` containing successful downloads and failures.
+#[instrument(skip(provider, disk_cache, config, metrics, http_limiter), fields(job_id = %job_id))]
+pub async fn download_stage_with_limiter<P, D>(
+    job_id: JobId,
+    tile: TileCoord,
+    provider: Arc<P>,
+    disk_cache: Arc<D>,
+    config: &PipelineConfig,
+    metrics: Option<Arc<PipelineMetrics>>,
+    http_limiter: Option<Arc<HttpConcurrencyLimiter>>,
+) -> ChunkResults
+where
+    P: ChunkProvider,
+    D: DiskCache,
+{
     let mut results = ChunkResults::new();
     let mut downloads = JoinSet::new();
 
@@ -52,6 +100,7 @@ where
         let provider = Arc::clone(&provider);
         let disk_cache = Arc::clone(&disk_cache);
         let metrics = metrics.clone();
+        let http_limiter = http_limiter.clone();
         let timeout = config.request_timeout;
         let max_retries = config.max_retries;
 
@@ -65,6 +114,7 @@ where
                 timeout,
                 max_retries,
                 metrics,
+                http_limiter,
             )
             .await
         });
@@ -124,6 +174,10 @@ struct ChunkError {
 }
 
 /// Downloads a single chunk, checking cache first.
+///
+/// If an `http_limiter` is provided, acquires a permit before making the HTTP
+/// request. The permit is held for the duration of the HTTP request only,
+/// not during cache checks or retries.
 #[allow(clippy::too_many_arguments)]
 async fn download_chunk_with_cache<P, D>(
     tile: TileCoord,
@@ -134,12 +188,13 @@ async fn download_chunk_with_cache<P, D>(
     timeout: std::time::Duration,
     max_retries: u32,
     metrics: Option<Arc<PipelineMetrics>>,
+    http_limiter: Option<Arc<HttpConcurrencyLimiter>>,
 ) -> Result<ChunkData, ChunkError>
 where
     P: ChunkProvider,
     D: DiskCache,
 {
-    // Check disk cache first
+    // Check disk cache first (no HTTP permit needed)
     if let Some(cached) = disk_cache
         .get(tile.row, tile.col, tile.zoom, chunk_row, chunk_col)
         .await
@@ -174,6 +229,18 @@ where
         }
         let start = Instant::now();
 
+        // Acquire HTTP permit if limiter is configured.
+        // The permit is held only for the duration of the HTTP request.
+        // We acquire inside the retry loop so that:
+        // 1. Cache hits don't consume permits
+        // 2. Backoff delays don't hold permits
+        // 3. Other downloads can proceed during our backoff
+        let _http_permit = if let Some(ref limiter) = http_limiter {
+            Some(limiter.acquire().await)
+        } else {
+            None
+        };
+
         match tokio::time::timeout(
             timeout,
             provider.download_chunk(global_row, global_col, chunk_zoom),
@@ -187,6 +254,9 @@ where
                 if let Some(ref m) = metrics {
                     m.download_completed(bytes, duration_us);
                 }
+
+                // Release permit before cache write (permit drops here)
+                drop(_http_permit);
 
                 // Success - cache the chunk (fire and forget, don't block on cache write)
                 let dc = Arc::clone(&disk_cache);
@@ -211,6 +281,10 @@ where
                     m.download_failed();
                 }
                 last_error = e.message.clone();
+
+                // Release permit before backoff (permit drops here)
+                drop(_http_permit);
+
                 if !e.is_retryable {
                     // Permanent error, don't retry
                     break;
@@ -228,6 +302,10 @@ where
                     m.download_failed();
                 }
                 last_error = "timeout".to_string();
+
+                // Release permit before backoff (permit drops here)
+                drop(_http_permit);
+
                 // Record retry
                 if attempt < max_retries {
                     if let Some(ref m) = metrics {
@@ -238,6 +316,7 @@ where
         }
 
         // Brief delay before retry (exponential backoff)
+        // Permit is already released so other downloads can proceed
         if attempt < max_retries {
             tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << attempt))).await;
         }
@@ -450,5 +529,130 @@ mod tests {
         // Check that chunk (0, 0) has cached data
         let cached_chunk = results.get(0, 0).unwrap();
         assert_eq!(cached_chunk, &[0xCA, 0xCE, 0xD]);
+    }
+
+    #[tokio::test]
+    async fn test_download_stage_with_limiter() {
+        let provider = Arc::new(MockProvider::new());
+        let cache = Arc::new(NullDiskCache);
+        let config = PipelineConfig::default();
+        let tile = TileCoord {
+            row: 100,
+            col: 200,
+            zoom: 16,
+        };
+
+        // Create a limiter with only 10 concurrent requests
+        let limiter = Arc::new(HttpConcurrencyLimiter::new(10));
+
+        let results = download_stage_with_limiter(
+            JobId::new(),
+            tile,
+            provider,
+            cache,
+            &config,
+            None,
+            Some(Arc::clone(&limiter)),
+        )
+        .await;
+
+        // All 256 chunks should still succeed
+        assert_eq!(results.success_count(), 256);
+        assert_eq!(results.failure_count(), 0);
+        assert!(results.is_complete());
+
+        // Limiter should have tracked peak usage (should be <= 10)
+        assert!(limiter.peak_in_flight() <= 10);
+        // After completion, no requests should be in flight
+        assert_eq!(limiter.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_download_stage_limiter_constrains_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Track maximum concurrent downloads observed
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let current_concurrent = Arc::new(AtomicUsize::new(0));
+
+        /// Mock provider that tracks concurrency
+        struct ConcurrencyTrackingProvider {
+            current: Arc<AtomicUsize>,
+            max: Arc<AtomicUsize>,
+        }
+
+        impl ChunkProvider for ConcurrencyTrackingProvider {
+            async fn download_chunk(
+                &self,
+                row: u32,
+                col: u32,
+                zoom: u8,
+            ) -> Result<Vec<u8>, ChunkDownloadError> {
+                // Increment current count
+                let current = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+
+                // Update max if this is a new peak
+                let mut max = self.max.load(Ordering::SeqCst);
+                while current > max {
+                    match self.max.compare_exchange_weak(
+                        max,
+                        current,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        Err(m) => max = m,
+                    }
+                }
+
+                // Simulate some async work to allow other tasks to run
+                tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+
+                // Decrement current count
+                self.current.fetch_sub(1, Ordering::SeqCst);
+
+                Ok(vec![row as u8, col as u8, zoom])
+            }
+
+            fn name(&self) -> &str {
+                "concurrency-tracker"
+            }
+        }
+
+        let provider = Arc::new(ConcurrencyTrackingProvider {
+            current: Arc::clone(&current_concurrent),
+            max: Arc::clone(&max_concurrent),
+        });
+        let cache = Arc::new(NullDiskCache);
+        let config = PipelineConfig::default();
+        let tile = TileCoord {
+            row: 100,
+            col: 200,
+            zoom: 16,
+        };
+
+        // Limit to 16 concurrent HTTP requests
+        let limiter = Arc::new(HttpConcurrencyLimiter::new(16));
+
+        let results = download_stage_with_limiter(
+            JobId::new(),
+            tile,
+            provider,
+            cache,
+            &config,
+            None,
+            Some(limiter),
+        )
+        .await;
+
+        assert_eq!(results.success_count(), 256);
+
+        // Maximum observed concurrency should not exceed limiter's cap
+        let observed_max = max_concurrent.load(Ordering::SeqCst);
+        assert!(
+            observed_max <= 16,
+            "Expected max concurrent <= 16, got {}",
+            observed_max
+        );
     }
 }

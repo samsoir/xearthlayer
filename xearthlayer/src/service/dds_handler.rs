@@ -212,6 +212,7 @@ impl DdsHandlerBuilder {
             dds_format: self.dds_format,
             mipmap_count: self.mipmap_count,
             max_concurrent_downloads: self.max_concurrent_downloads,
+            max_global_http_requests: PipelineConfig::default_global_http_requests(),
         };
 
         // Build handler based on available provider and cache configuration

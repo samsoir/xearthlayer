@@ -108,18 +108,16 @@ Controls network download behavior.
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `timeout` | integer | `30` | Download timeout in seconds for a single chunk |
-| `parallel` | integer | `32` | Maximum concurrent chunk downloads per tile |
 | `retries` | integer | `3` | Number of retry attempts for failed downloads |
 
 **Example:**
 ```ini
 [download]
 timeout = 30
-parallel = 32
 retries = 3
 ```
 
-**Note:** Each 4096x4096 tile requires downloading 256 chunks (16x16 grid of 256x256 tiles). Higher `parallel` values speed up downloads but use more bandwidth.
+**Note:** Each 4096x4096 tile requires downloading 256 chunks (16x16 grid of 256x256 tiles). HTTP concurrency is automatically tuned based on your system's CPU count to prevent network stack exhaustion while maintaining good throughput.
 
 ### [generation]
 
@@ -216,7 +214,6 @@ mipmaps = 5
 
 [download]
 timeout = 30
-parallel = 32
 retries = 3
 
 [generation]
@@ -292,7 +289,6 @@ Values are validated before being saved. Invalid values will produce an error me
 | `cache.disk_size` | size (e.g., `20GB`) | Disk cache size |
 | `texture.format` | `bc1`, `bc3` | DDS compression format |
 | `download.timeout` | positive integer | Chunk download timeout (seconds) |
-| `download.parallel` | positive integer | Max parallel downloads |
 | `generation.threads` | positive integer | Worker threads |
 | `generation.timeout` | positive integer | Tile generation timeout (seconds) |
 | `xplane.scenery_dir` | path | X-Plane Custom Scenery directory |
@@ -314,8 +310,8 @@ xearthlayer start --source ./scenery --provider google --google-api-key YOUR_KEY
 # Override DDS format
 xearthlayer start --source ./scenery --dds-format bc3
 
-# Override download settings
-xearthlayer start --source ./scenery --timeout 60 --parallel 16
+# Override download timeout
+xearthlayer start --source ./scenery --timeout 60
 
 # Disable caching
 xearthlayer start --source ./scenery --no-cache
