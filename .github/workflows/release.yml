@@ -167,40 +167,102 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Update PKGBUILD with new version checksums (for maintainer reference)
-  update-pkgbuild:
-    name: Generate PKGBUILD checksums
-    needs: [build-linux-musl]
+  # Prepare AUR package files
+  prepare-aur:
+    name: Prepare AUR Package
+    needs: [release]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download musl binary
-        uses: actions/download-artifact@v4
-        with:
-          name: linux-musl-binary
-          path: artifacts
-
-      - name: Calculate SHA256
-        id: sha256
+      - name: Install Arch Linux tools
         run: |
-          TARBALL=$(ls artifacts/*.tar.gz)
-          SHA256=$(sha256sum "$TARBALL" | cut -d' ' -f1)
-          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          # Install pacman for makepkg (we only need --printsrcinfo)
+          sudo apt-get update
+          sudo apt-get install -y libarchive-tools
+
+      - name: Prepare AUR package
+        id: aur
+        run: |
+          TAG="${{ github.ref_name || inputs.tag }}"
+          VERSION="${TAG#v}"
+
+          echo "Preparing AUR package for $TAG (version $VERSION)"
+
+          # Create AUR directory
+          mkdir -p pkg/aur
+
+          # Download source tarball to calculate checksum
+          curl -sL "https://github.com/samsoir/xearthlayer/archive/${TAG}.tar.gz" -o "pkg/aur/xearthlayer-${VERSION}.tar.gz"
+
+          # Calculate SHA256
+          SHA256=$(sha256sum "pkg/aur/xearthlayer-${VERSION}.tar.gz" | cut -d' ' -f1)
           echo "SHA256: $SHA256"
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
 
-      - name: Output PKGBUILD update instructions
+          # Generate PKGBUILD with correct version and checksum
+          sed -e "s/^pkgver=.*/pkgver=${VERSION}/" \
+              -e "s/^sha256sums=.*/sha256sums=('${SHA256}')/" \
+              pkg/arch/PKGBUILD > pkg/aur/PKGBUILD
+
+          # Generate .SRCINFO manually (since we don't have makepkg)
+          cat > pkg/aur/.SRCINFO << EOF
+          pkgbase = xearthlayer
+          	pkgdesc = High-quality satellite imagery for X-Plane, streamed on demand
+          	pkgver = ${VERSION}
+          	pkgrel = 1
+          	url = https://github.com/samsoir/xearthlayer
+          	arch = x86_64
+          	license = MIT
+          	makedepends = rust
+          	makedepends = cargo
+          	depends = fuse3
+          	optdepends = xplane12: X-Plane 12 flight simulator
+          	options = !lto
+          	source = xearthlayer-${VERSION}.tar.gz::https://github.com/samsoir/xearthlayer/archive/v${VERSION}.tar.gz
+          	sha256sums = ${SHA256}
+
+          pkgname = xearthlayer
+          EOF
+
+          # Clean up tarball
+          rm "pkg/aur/xearthlayer-${VERSION}.tar.gz"
+
+          echo "Generated files:"
+          ls -la pkg/aur/
+
+      - name: Upload AUR package files
+        uses: actions/upload-artifact@v4
+        with:
+          name: aur-package
+          path: |
+            pkg/aur/PKGBUILD
+            pkg/aur/.SRCINFO
+
+      - name: Output AUR submission instructions
         run: |
+          TAG="${{ github.ref_name || inputs.tag }}"
+          VERSION="${TAG#v}"
+
+          echo ""
           echo "=============================================="
-          echo "PKGBUILD Update Instructions for AUR"
+          echo "AUR Package Ready for Submission"
           echo "=============================================="
           echo ""
-          echo "Update pkg/arch/PKGBUILD with:"
-          echo "  pkgver=${{ github.ref_name || inputs.tag }}"
-          echo "  sha256sums=('${{ steps.sha256.outputs.sha256 }}')"
+          echo "The PKGBUILD and .SRCINFO files have been generated and"
+          echo "uploaded as release artifacts."
           echo ""
-          echo "Then submit to AUR:"
-          echo "  1. Clone the AUR repo: git clone ssh://aur@aur.archlinux.org/xearthlayer.git"
-          echo "  2. Copy the updated PKGBUILD"
-          echo "  3. Update .SRCINFO: makepkg --printsrcinfo > .SRCINFO"
-          echo "  4. Commit and push"
+          echo "To publish to AUR manually:"
+          echo "  1. Download the 'aur-package' artifact from the release"
+          echo "  2. Clone the AUR repo:"
+          echo "     git clone ssh://aur@aur.archlinux.org/xearthlayer.git"
+          echo "  3. Copy PKGBUILD and .SRCINFO into the repo"
+          echo "  4. Commit and push:"
+          echo "     git add PKGBUILD .SRCINFO"
+          echo "     git commit -m 'Update to ${VERSION}'"
+          echo "     git push"
+          echo ""
+          echo "Or use the Makefile target locally:"
+          echo "  make aur-prepare TAG=${TAG}"
+          echo "  make aur-test TAG=${TAG}"
+          echo "  make aur-publish TAG=${TAG}"

@@ -216,6 +216,123 @@ uninstall: ## Uninstall binary from system
 	$(CARGO) uninstall xearthlayer
 	@echo "$(GREEN)Uninstall complete!$(NC)"
 
+##@ Packaging
+
+# Package configuration
+PKG_NAME := xearthlayer
+PKG_VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+AUR_DIR := pkg/aur
+AUR_REPO := ssh://aur@aur.archlinux.org/$(PKG_NAME).git
+
+.PHONY: pkg-deb
+pkg-deb: release ## Build Debian package (.deb)
+	@echo "$(BLUE)Building Debian package...$(NC)"
+	@command -v cargo-deb >/dev/null 2>&1 || { echo "$(YELLOW)Installing cargo-deb...$(NC)"; cargo install cargo-deb; }
+	cd xearthlayer-cli && $(CARGO) deb --no-build
+	@echo "$(GREEN)Debian package built: target/debian/$(PKG_NAME)_$(PKG_VERSION)-1_amd64.deb$(NC)"
+
+.PHONY: pkg-rpm
+pkg-rpm: release ## Build RPM package (.rpm) - requires rpmbuild
+	@echo "$(BLUE)Building RPM package...$(NC)"
+	@command -v rpmbuild >/dev/null 2>&1 || { echo "$(RED)Error: rpmbuild not found. Install rpm-build package.$(NC)"; exit 1; }
+	@mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+	@mkdir -p $(PKG_NAME)-$(PKG_VERSION)
+	@cp -r * $(PKG_NAME)-$(PKG_VERSION)/ 2>/dev/null || true
+	@tar czvf ~/rpmbuild/SOURCES/$(PKG_NAME)-$(PKG_VERSION).tar.gz $(PKG_NAME)-$(PKG_VERSION)
+	@rm -rf $(PKG_NAME)-$(PKG_VERSION)
+	@cp pkg/rpm/$(PKG_NAME).spec ~/rpmbuild/SPECS/
+	rpmbuild -bb ~/rpmbuild/SPECS/$(PKG_NAME).spec
+	@echo "$(GREEN)RPM package built in ~/rpmbuild/RPMS/$(NC)"
+
+.PHONY: pkg-tarball
+pkg-tarball: release ## Build release tarball
+	@echo "$(BLUE)Building release tarball...$(NC)"
+	@mkdir -p dist
+	@cp target/release/xearthlayer dist/
+	@cp README.md LICENSE dist/
+	@cd dist && tar czvf $(PKG_NAME)-$(PKG_VERSION)-x86_64-linux.tar.gz xearthlayer README.md LICENSE
+	@rm dist/xearthlayer dist/README.md dist/LICENSE
+	@echo "$(GREEN)Tarball built: dist/$(PKG_NAME)-$(PKG_VERSION)-x86_64-linux.tar.gz$(NC)"
+
+.PHONY: aur-prepare
+aur-prepare: ## Prepare AUR package for a tagged release (TAG=v0.2.0)
+	@if [ -z "$(TAG)" ]; then echo "$(RED)Error: TAG is required. Usage: make aur-prepare TAG=v0.2.0$(NC)"; exit 1; fi
+	@echo "$(BLUE)Preparing AUR package for $(TAG)...$(NC)"
+	@# Extract version from tag (remove 'v' prefix)
+	$(eval VERSION := $(shell echo $(TAG) | sed 's/^v//'))
+	@# Create AUR working directory
+	@rm -rf $(AUR_DIR)
+	@mkdir -p $(AUR_DIR)
+	@# Download source tarball from GitHub
+	@echo "$(BLUE)Downloading source tarball...$(NC)"
+	@curl -sL "https://github.com/samsoir/xearthlayer/archive/$(TAG).tar.gz" -o "$(AUR_DIR)/$(PKG_NAME)-$(VERSION).tar.gz"
+	@# Calculate SHA256
+	$(eval SHA256 := $(shell sha256sum "$(AUR_DIR)/$(PKG_NAME)-$(VERSION).tar.gz" | cut -d' ' -f1))
+	@echo "$(BLUE)SHA256: $(SHA256)$(NC)"
+	@# Generate PKGBUILD with correct version and checksum
+	@sed -e 's/^pkgver=.*/pkgver=$(VERSION)/' \
+	     -e "s/^sha256sums=.*/sha256sums=('$(SHA256)')/" \
+	     pkg/arch/PKGBUILD > $(AUR_DIR)/PKGBUILD
+	@# Generate .SRCINFO
+	@cd $(AUR_DIR) && makepkg --printsrcinfo > .SRCINFO
+	@# Clean up downloaded tarball (not needed for AUR)
+	@rm "$(AUR_DIR)/$(PKG_NAME)-$(VERSION).tar.gz"
+	@echo ""
+	@echo "$(GREEN)AUR package prepared in $(AUR_DIR)/$(NC)"
+	@echo "$(BLUE)Contents:$(NC)"
+	@ls -la $(AUR_DIR)/
+	@echo ""
+	@echo "$(YELLOW)Next steps:$(NC)"
+	@echo "  1. Review the PKGBUILD: cat $(AUR_DIR)/PKGBUILD"
+	@echo "  2. Test locally: cd $(AUR_DIR) && makepkg -si"
+	@echo "  3. Submit to AUR: make aur-publish TAG=$(TAG)"
+
+.PHONY: aur-publish
+aur-publish: ## Publish prepared AUR package (TAG=v0.2.0)
+	@if [ -z "$(TAG)" ]; then echo "$(RED)Error: TAG is required. Usage: make aur-publish TAG=v0.2.0$(NC)"; exit 1; fi
+	@if [ ! -f "$(AUR_DIR)/PKGBUILD" ]; then echo "$(RED)Error: Run 'make aur-prepare TAG=$(TAG)' first$(NC)"; exit 1; fi
+	@echo "$(BLUE)Publishing AUR package for $(TAG)...$(NC)"
+	$(eval VERSION := $(shell echo $(TAG) | sed 's/^v//'))
+	@# Clone or update AUR repo
+	@if [ -d "$(AUR_DIR)/aur-repo" ]; then \
+		echo "$(BLUE)Updating existing AUR repo...$(NC)"; \
+		cd $(AUR_DIR)/aur-repo && git pull; \
+	else \
+		echo "$(BLUE)Cloning AUR repo...$(NC)"; \
+		git clone $(AUR_REPO) $(AUR_DIR)/aur-repo || { \
+			echo "$(YELLOW)AUR repo doesn't exist yet. Creating new package...$(NC)"; \
+			mkdir -p $(AUR_DIR)/aur-repo && cd $(AUR_DIR)/aur-repo && git init; \
+		}; \
+	fi
+	@# Copy PKGBUILD and .SRCINFO to AUR repo
+	@cp $(AUR_DIR)/PKGBUILD $(AUR_DIR)/.SRCINFO $(AUR_DIR)/aur-repo/
+	@# Commit and push
+	@cd $(AUR_DIR)/aur-repo && \
+		git add PKGBUILD .SRCINFO && \
+		git commit -m "Update to $(VERSION)" && \
+		echo "$(BLUE)Pushing to AUR...$(NC)" && \
+		git push origin master
+	@echo ""
+	@echo "$(GREEN)Successfully published $(PKG_NAME) $(VERSION) to AUR!$(NC)"
+	@echo "$(BLUE)View at: https://aur.archlinux.org/packages/$(PKG_NAME)$(NC)"
+
+.PHONY: aur-test
+aur-test: ## Test AUR package build locally (TAG=v0.2.0)
+	@if [ -z "$(TAG)" ]; then echo "$(RED)Error: TAG is required. Usage: make aur-test TAG=v0.2.0$(NC)"; exit 1; fi
+	@if [ ! -f "$(AUR_DIR)/PKGBUILD" ]; then \
+		echo "$(YELLOW)AUR package not prepared. Running aur-prepare first...$(NC)"; \
+		$(MAKE) aur-prepare TAG=$(TAG); \
+	fi
+	@echo "$(BLUE)Testing AUR package build...$(NC)"
+	@cd $(AUR_DIR) && makepkg -sf
+	@echo "$(GREEN)AUR package built successfully!$(NC)"
+	@echo "$(BLUE)Package:$(NC)"
+	@ls -la $(AUR_DIR)/*.pkg.tar.zst 2>/dev/null || ls -la $(AUR_DIR)/*.pkg.tar.xz 2>/dev/null
+
+.PHONY: pkg-all
+pkg-all: pkg-deb pkg-tarball ## Build all packages (deb + tarball)
+	@echo "$(GREEN)All packages built!$(NC)"
+
 ##@ Maintenance
 
 .PHONY: clean-all
@@ -224,6 +341,8 @@ clean-all: clean ## Deep clean (including cargo cache)
 	$(CARGO) clean
 	@rm -rf target/
 	@rm -rf Cargo.lock
+	@rm -rf dist/
+	@rm -rf $(AUR_DIR)/
 	@echo "$(GREEN)Deep clean complete!$(NC)"
 
 .PHONY: reset
