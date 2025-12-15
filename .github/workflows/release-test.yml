@@ -1,0 +1,154 @@
+name: Release Test
+
+on:
+  push:
+    branches:
+      - 'release/*'
+  pull_request:
+    branches:
+      - 'release/*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Verify version in Cargo.toml matches release branch
+  check-version:
+    name: Check Version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract and verify version
+        run: |
+          # Get version from Cargo.toml
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "Cargo.toml version: $CARGO_VERSION"
+
+          # Get version from branch name (release/X.Y.Z -> X.Y.Z)
+          BRANCH_VERSION=$(echo "${{ github.ref_name }}" | sed 's|release/||')
+          echo "Branch version: $BRANCH_VERSION"
+
+          # For PRs, extract from head ref
+          if [ -n "${{ github.head_ref }}" ]; then
+            BRANCH_VERSION=$(echo "${{ github.head_ref }}" | sed 's|release/||')
+            echo "PR branch version: $BRANCH_VERSION"
+          fi
+
+          # Verify they match (allowing for -rc suffixes in branch)
+          BRANCH_BASE=$(echo "$BRANCH_VERSION" | sed 's/-.*//')
+          if [ "$CARGO_VERSION" != "$BRANCH_BASE" ] && [ "$CARGO_VERSION" != "$BRANCH_VERSION" ]; then
+            echo "::warning::Version mismatch: Cargo.toml ($CARGO_VERSION) vs branch ($BRANCH_VERSION)"
+            echo "Consider updating Cargo.toml version before releasing"
+          fi
+
+  # Test Linux binary build
+  test-build-linux:
+    name: Test Linux Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Verify binary exists
+        run: |
+          ls -la target/release/xearthlayer
+          file target/release/xearthlayer
+
+  # Test Debian package build
+  test-build-deb:
+    name: Test Debian Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Build .deb package
+        run: |
+          cd xearthlayer-cli
+          cargo deb --no-build
+
+      - name: Verify package
+        run: |
+          ls -la target/debian/*.deb
+          dpkg-deb --info target/debian/*.deb
+
+  # Test RPM package build
+  test-build-rpm:
+    name: Test RPM Package
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y rust cargo fuse3-devel rpm-build
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Build RPM package
+        run: |
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+
+          # Create source tarball
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          mkdir -p xearthlayer-${VERSION}
+          cp -r * xearthlayer-${VERSION}/ 2>/dev/null || true
+          tar czvf ~/rpmbuild/SOURCES/xearthlayer-${VERSION}.tar.gz xearthlayer-${VERSION}
+
+          # Copy spec file
+          cp pkg/rpm/xearthlayer.spec ~/rpmbuild/SPECS/
+
+          # Build RPM (binary only, skip source RPM)
+          rpmbuild -bb ~/rpmbuild/SPECS/xearthlayer.spec
+
+      - name: Verify package
+        run: |
+          ls -la ~/rpmbuild/RPMS/*/*.rpm
+          rpm -qip ~/rpmbuild/RPMS/*/*.rpm
+
+  # Summary job for branch protection
+  release-test-success:
+    name: Release Tests
+    needs: [check-version, test-build-linux, test-build-deb, test-build-rpm]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [ "${{ needs.check-version.result }}" != "success" ] || \
+             [ "${{ needs.test-build-linux.result }}" != "success" ] || \
+             [ "${{ needs.test-build-deb.result }}" != "success" ] || \
+             [ "${{ needs.test-build-rpm.result }}" != "success" ]; then
+            echo "One or more release tests failed"
+            exit 1
+          fi
+          echo "All release tests passed!"

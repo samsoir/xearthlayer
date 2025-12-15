@@ -333,6 +333,42 @@ aur-test: ## Test AUR package build locally (TAG=v0.2.0)
 pkg-all: pkg-deb pkg-tarball ## Build all packages (deb + tarball)
 	@echo "$(GREEN)All packages built!$(NC)"
 
+##@ Release Management
+
+.PHONY: version
+version: ## Show current version
+	@echo "$(BLUE)Current version:$(NC) $(PKG_VERSION)"
+
+.PHONY: bump-version
+bump-version: ## Bump version across all files (VERSION=x.y.z)
+	@if [ -z "$(VERSION)" ]; then echo "$(RED)Error: VERSION is required. Usage: make bump-version VERSION=0.3.0$(NC)"; exit 1; fi
+	@echo "$(BLUE)Bumping version to $(VERSION)...$(NC)"
+	@# Update workspace Cargo.toml
+	@sed -i 's/^version = ".*"/version = "$(VERSION)"/' Cargo.toml
+	@# Update RPM spec file
+	@sed -i 's/^Version:.*/Version:        $(VERSION)/' pkg/rpm/xearthlayer.spec
+	@echo "$(GREEN)Version bumped to $(VERSION)$(NC)"
+	@echo ""
+	@echo "$(YELLOW)Next steps:$(NC)"
+	@echo "  1. Update CHANGELOG.md with release notes"
+	@echo "  2. Commit: git add -A && git commit -m 'Bump version to $(VERSION)'"
+	@echo "  3. Tag: git tag v$(VERSION)"
+	@echo "  4. Push: git push origin HEAD && git push origin v$(VERSION)"
+
+.PHONY: release-checklist
+release-checklist: ## Show release checklist
+	@echo "$(BLUE)Release Checklist$(NC)"
+	@echo ""
+	@echo "  1. [ ] Ensure all tests pass: make verify"
+	@echo "  2. [ ] Update version: make bump-version VERSION=x.y.z"
+	@echo "  3. [ ] Update CHANGELOG.md with release notes"
+	@echo "  4. [ ] Commit version bump"
+	@echo "  5. [ ] Push to release branch and verify CI passes"
+	@echo "  6. [ ] Create and push tag: git tag vx.y.z && git push origin vx.y.z"
+	@echo "  7. [ ] Review and publish draft release on GitHub"
+	@echo "  8. [ ] (Optional) Publish to AUR: make aur-publish TAG=vx.y.z"
+	@echo ""
+
 ##@ Maintenance
 
 .PHONY: clean-all
