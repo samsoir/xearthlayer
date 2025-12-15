@@ -168,6 +168,21 @@ impl RequestCoalescer {
         }
     }
 
+    /// Cancels a request, removing it from in-flight and notifying waiters.
+    ///
+    /// This should be called when processing is cancelled (e.g., due to FUSE timeout).
+    /// Dropping the broadcast sender will cause all waiters to receive an error,
+    /// which they should handle gracefully.
+    pub fn cancel(&self, tile: TileCoord) {
+        if let Some((_, _tx)) = self.in_flight.remove(&tile) {
+            debug!(
+                tile = ?tile,
+                "Cancelled in-flight request - waiters will receive error"
+            );
+            // Dropping tx will close the channel, causing waiters to get RecvError
+        }
+    }
+
     /// Returns a snapshot of the current statistics.
     pub fn stats(&self) -> CoalescerStats {
         CoalescerStats {

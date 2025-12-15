@@ -8,6 +8,7 @@ use crate::pipeline::{JobId, JobResult};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 /// Request for DDS generation sent to the async pipeline.
 #[derive(Debug)]
@@ -18,6 +19,9 @@ pub struct DdsRequest {
     pub tile: TileCoord,
     /// Channel to send result back
     pub result_tx: oneshot::Sender<DdsResponse>,
+    /// Cancellation token for aborting the request when FUSE times out.
+    /// When cancelled, the pipeline should stop processing and release resources.
+    pub cancellation_token: CancellationToken,
 }
 
 /// Response from the async pipeline.
@@ -95,15 +99,26 @@ mod tests {
             zoom: 16,
         };
         let (tx, _rx) = oneshot::channel();
+        let cancellation_token = CancellationToken::new();
 
         let request = DdsRequest {
             job_id,
             tile,
             result_tx: tx,
+            cancellation_token,
         };
 
         assert_eq!(request.tile.row, 100);
         assert_eq!(request.tile.col, 200);
         assert_eq!(request.tile.zoom, 16);
+    }
+
+    #[test]
+    fn test_cancellation_token() {
+        let token = CancellationToken::new();
+        assert!(!token.is_cancelled());
+
+        token.cancel();
+        assert!(token.is_cancelled());
     }
 }

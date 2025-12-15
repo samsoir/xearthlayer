@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace, warn};
 
 /// Time-to-live for attribute caching.
@@ -191,7 +192,9 @@ impl Fuse3PassthroughFS {
 
     /// Request DDS generation from the async pipeline.
     ///
-    /// This is fully async - no blocking calls.
+    /// This is fully async - no blocking calls. When the FUSE timeout expires,
+    /// the cancellation token is triggered to abort the pipeline processing,
+    /// releasing resources (HTTP connections, semaphore permits, etc.).
     async fn request_dds(&self, coords: &DdsFilename) -> Vec<u8> {
         let job_id = JobId::new();
 
@@ -212,10 +215,14 @@ impl Fuse3PassthroughFS {
         // Create oneshot channel for response
         let (tx, rx) = oneshot::channel();
 
+        // Create cancellation token to abort pipeline on timeout
+        let cancellation_token = CancellationToken::new();
+
         let request = DdsRequest {
             job_id,
             tile,
             result_tx: tx,
+            cancellation_token: cancellation_token.clone(),
         };
 
         // Submit request to the handler
@@ -236,15 +243,18 @@ impl Fuse3PassthroughFS {
             Ok(Err(_)) => {
                 // Channel closed - sender dropped
                 error!(job_id = %job_id, "DDS generation channel closed unexpectedly");
+                // Cancel any in-flight work
+                cancellation_token.cancel();
                 get_default_placeholder()
             }
             Err(_) => {
-                // Timeout
+                // Timeout - cancel the pipeline to release resources
                 warn!(
                     job_id = %job_id,
                     timeout_secs = self.generation_timeout.as_secs(),
-                    "DDS generation timed out"
+                    "DDS generation timed out - cancelling pipeline"
                 );
+                cancellation_token.cancel();
                 get_default_placeholder()
             }
         };

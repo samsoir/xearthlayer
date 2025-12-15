@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 /// Time-to-live for attribute caching.
@@ -126,17 +127,32 @@ impl AsyncPassthroughFS {
         // Create oneshot channel for response
         let (tx, rx) = oneshot::channel();
 
+        // Create cancellation token (note: fuser-based implementation is synchronous
+        // and doesn't benefit from cancellation as much as fuse3, but we include it
+        // for API consistency)
+        let cancellation_token = CancellationToken::new();
+
         let request = DdsRequest {
             job_id,
             tile,
             result_tx: tx,
+            cancellation_token: cancellation_token.clone(),
         };
 
         // Submit request to the handler
         (self.dds_handler)(request);
 
         // Block waiting for response with timeout
-        self.wait_for_response(job_id, rx)
+        // If timeout occurs, cancel the token to abort any in-flight work
+        let result = self.wait_for_response(job_id, rx);
+
+        // Cancel if we timed out or got an error (the wait_for_response already
+        // returned a placeholder in those cases, so this just ensures cleanup)
+        if result.len() == get_default_placeholder().len() && result == get_default_placeholder() {
+            cancellation_token.cancel();
+        }
+
+        result
     }
 
     /// Convert chunk-level coordinates to tile-level coordinates.

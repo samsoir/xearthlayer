@@ -12,7 +12,8 @@ use crate::coord::TileCoord;
 use crate::fuse::EXPECTED_DDS_SIZE;
 use crate::pipeline::http_limiter::HttpConcurrencyLimiter;
 use crate::pipeline::stages::{
-    assembly_stage, cache_stage, check_memory_cache, download_stage_with_limiter, encode_stage,
+    assembly_stage, cache_stage, check_memory_cache, download_stage_cancellable,
+    download_stage_with_limiter, encode_stage,
 };
 use crate::pipeline::{
     BlockingExecutor, ChunkProvider, DiskCache, Job, JobError, JobId, JobResult, MemoryCache,
@@ -21,6 +22,7 @@ use crate::pipeline::{
 use crate::telemetry::PipelineMetrics;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
 /// Processes a job through all pipeline stages.
@@ -228,6 +230,126 @@ where
     // Stage 4: Write to memory cache (only if no failed chunks)
     // We don't cache tiles with magenta placeholders - they would return
     // corrupted imagery on subsequent requests
+    if failed_chunks == 0 {
+        cache_stage(job_id, tile, &dds_data, memory_cache).await;
+    } else {
+        debug!(
+            job_id = %job_id,
+            failed_chunks,
+            "Skipping memory cache write due to failed chunks"
+        );
+    }
+
+    let duration = start.elapsed();
+
+    Ok(JobResult::partial(
+        job_id,
+        dds_data,
+        duration,
+        failed_chunks,
+    ))
+}
+
+/// Processor with cancellation support for FUSE timeout handling.
+///
+/// This version accepts a `CancellationToken` that can be used to abort
+/// processing when the FUSE layer times out waiting for a response.
+/// This prevents orphaned tasks from consuming resources indefinitely.
+///
+/// # Arguments
+///
+/// * `http_limiter` - Optional global HTTP concurrency limiter
+/// * `cancellation_token` - Token to signal cancellation (e.g., from FUSE timeout)
+#[allow(clippy::too_many_arguments)]
+pub async fn process_tile_cancellable<P, E, M, D, X>(
+    job_id: JobId,
+    tile: TileCoord,
+    provider: Arc<P>,
+    encoder: Arc<E>,
+    memory_cache: Arc<M>,
+    disk_cache: Arc<D>,
+    executor: &X,
+    config: &PipelineConfig,
+    metrics: Option<Arc<PipelineMetrics>>,
+    http_limiter: Option<Arc<HttpConcurrencyLimiter>>,
+    cancellation_token: CancellationToken,
+) -> Result<JobResult, JobError>
+where
+    P: ChunkProvider,
+    E: TextureEncoderAsync,
+    M: MemoryCache,
+    D: DiskCache,
+    X: BlockingExecutor,
+{
+    let start = Instant::now();
+
+    // Check for early cancellation
+    if cancellation_token.is_cancelled() {
+        return Err(JobError::Cancelled);
+    }
+
+    // Stage 0: Check memory cache
+    if let Some(cached_data) = check_memory_cache(tile, memory_cache.as_ref(), metrics.as_ref()) {
+        debug!(job_id = %job_id, "Memory cache hit");
+        return Ok(JobResult::cache_hit(job_id, cached_data, start.elapsed()));
+    }
+
+    // Stage 1: Download chunks (with cancellation support)
+    let chunks = download_stage_cancellable(
+        job_id,
+        tile,
+        Arc::clone(&provider),
+        Arc::clone(&disk_cache),
+        config,
+        metrics.clone(),
+        http_limiter,
+        cancellation_token.clone(),
+    )
+    .await;
+
+    // Check cancellation after download stage (most time-consuming)
+    if cancellation_token.is_cancelled() {
+        debug!(job_id = %job_id, "Cancelled after download stage");
+        return Err(JobError::Cancelled);
+    }
+
+    let failed_chunks = chunks.failure_count() as u16;
+
+    // Stage 2: Assemble image
+    let image = assembly_stage(job_id, chunks, executor).await?;
+
+    // Check cancellation after assembly
+    if cancellation_token.is_cancelled() {
+        debug!(job_id = %job_id, "Cancelled after assembly stage");
+        return Err(JobError::Cancelled);
+    }
+
+    // Stage 3: Encode to DDS
+    let dds_data = encode_stage(job_id, image, encoder, executor, metrics).await?;
+
+    // Validate encoded DDS size - log warning if unexpected
+    if dds_data.len() != EXPECTED_DDS_SIZE {
+        warn!(
+            job_id = %job_id,
+            tile = ?tile,
+            actual_size = dds_data.len(),
+            expected_size = EXPECTED_DDS_SIZE,
+            failed_chunks,
+            "Encoded DDS has unexpected size - may cause validation to substitute placeholder"
+        );
+    }
+
+    // Validate DDS magic bytes
+    if dds_data.len() < 4 || &dds_data[0..4] != b"DDS " {
+        warn!(
+            job_id = %job_id,
+            tile = ?tile,
+            size = dds_data.len(),
+            "Encoded DDS has invalid magic bytes - will be replaced with placeholder"
+        );
+    }
+
+    // Stage 4: Write to memory cache (only if no failed chunks)
     if failed_chunks == 0 {
         cache_stage(job_id, tile, &dds_data, memory_cache).await;
     } else {

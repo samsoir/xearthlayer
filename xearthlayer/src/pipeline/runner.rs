@@ -13,9 +13,9 @@
 use crate::fuse::{DdsHandler, DdsRequest, DdsResponse, EXPECTED_DDS_SIZE};
 use crate::pipeline::coalesce::{CoalesceResult, RequestCoalescer};
 use crate::pipeline::http_limiter::HttpConcurrencyLimiter;
+use crate::pipeline::processor::{process_tile, process_tile_cancellable};
 use crate::pipeline::{
-    process_tile, BlockingExecutor, ChunkProvider, DiskCache, MemoryCache, PipelineConfig,
-    TextureEncoderAsync,
+    BlockingExecutor, ChunkProvider, DiskCache, MemoryCache, PipelineConfig, TextureEncoderAsync,
 };
 use crate::telemetry::PipelineMetrics;
 use std::sync::Arc;
@@ -247,11 +247,14 @@ async fn process_dds_request<P, E, M, D, X>(
     let _ = request.result_tx.send(response);
 }
 
-/// Process a DDS request with coalescing support.
+/// Process a DDS request with coalescing support and cancellation.
 ///
 /// This function checks if another request for the same tile is already in flight.
 /// If so, it waits for that request to complete and shares the result.
 /// Otherwise, it processes the tile and broadcasts the result to any waiting requests.
+///
+/// When the cancellation token is triggered (e.g., FUSE timeout), the pipeline
+/// processing is aborted early to release resources.
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip_all, fields(job_id = %request.job_id, tile = ?request.tile))]
 async fn process_dds_request_coalesced<P, E, M, D, X>(
@@ -274,6 +277,13 @@ async fn process_dds_request_coalesced<P, E, M, D, X>(
 {
     let tile = request.tile;
     let job_id = request.job_id;
+    let cancellation_token = request.cancellation_token.clone();
+
+    // Check for early cancellation before doing any work
+    if cancellation_token.is_cancelled() {
+        debug!(job_id = %job_id, tile = ?tile, "Request already cancelled before processing");
+        return;
+    }
 
     // Record job submission (request arrived, now waiting for processing)
     if let Some(ref m) = metrics {
@@ -298,50 +308,64 @@ async fn process_dds_request_coalesced<P, E, M, D, X>(
                 "Waiting for coalesced result"
             );
 
-            let response = match rx.recv().await {
-                Ok(result) => {
-                    let data_len = result.data.len();
-                    debug!(
-                        job_id = %job_id,
-                        tile = ?tile,
-                        data_len,
-                        "Received coalesced result"
-                    );
-
-                    // Validate coalesced data size
-                    if data_len != EXPECTED_DDS_SIZE {
-                        warn!(
-                            job_id = %job_id,
-                            tile = ?tile,
-                            actual_size = data_len,
-                            expected_size = EXPECTED_DDS_SIZE,
-                            "Coalesced result has unexpected size - FUSE layer will validate"
-                        );
+            // Wait for result OR cancellation
+            let response = tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => {
+                    debug!(job_id = %job_id, tile = ?tile, "Coalesced wait cancelled");
+                    // Record cancellation as failure
+                    if let Some(ref m) = metrics {
+                        m.job_failed();
                     }
-
-                    DdsResponse {
-                        data: (*result.data).clone(),
-                        cache_hit: result.cache_hit,
-                        duration: result.duration,
-                    }
+                    // Don't send response - FUSE already timed out
+                    return;
                 }
-                Err(_) => {
-                    // Channel closed without sending - this shouldn't happen
-                    // but handle gracefully with a placeholder
-                    error!(
-                        job_id = %job_id,
-                        tile = ?tile,
-                        "Coalesced request failed - channel closed"
-                    );
-                    DdsResponse {
-                        data: crate::fuse::get_default_placeholder(),
-                        cache_hit: false,
-                        duration: std::time::Duration::ZERO,
+                result = rx.recv() => {
+                    match result {
+                        Ok(result) => {
+                            let data_len = result.data.len();
+                            debug!(
+                                job_id = %job_id,
+                                tile = ?tile,
+                                data_len,
+                                "Received coalesced result"
+                            );
+
+                            // Validate coalesced data size
+                            if data_len != EXPECTED_DDS_SIZE {
+                                warn!(
+                                    job_id = %job_id,
+                                    tile = ?tile,
+                                    actual_size = data_len,
+                                    expected_size = EXPECTED_DDS_SIZE,
+                                    "Coalesced result has unexpected size - FUSE layer will validate"
+                                );
+                            }
+
+                            DdsResponse {
+                                data: (*result.data).clone(),
+                                cache_hit: result.cache_hit,
+                                duration: result.duration,
+                            }
+                        }
+                        Err(_) => {
+                            // Channel closed without sending - leader was cancelled
+                            debug!(
+                                job_id = %job_id,
+                                tile = ?tile,
+                                "Coalesced request failed - leader cancelled"
+                            );
+                            DdsResponse {
+                                data: crate::fuse::get_default_placeholder(),
+                                cache_hit: false,
+                                duration: std::time::Duration::ZERO,
+                            }
+                        }
                     }
                 }
             };
 
-            // Send response back to FUSE handler
+            // Send response back to FUSE handler (may fail if already timed out)
             let _ = request.result_tx.send(response);
 
             // Record job completion (coalesced jobs still count as completed)
@@ -362,7 +386,7 @@ async fn process_dds_request_coalesced<P, E, M, D, X>(
                 "Processing DDS request - starting pipeline"
             );
 
-            let result = process_tile(
+            let result = process_tile_cancellable(
                 job_id,
                 tile,
                 provider,
@@ -373,12 +397,14 @@ async fn process_dds_request_coalesced<P, E, M, D, X>(
                 &config,
                 metrics.clone(),
                 Some(http_limiter),
+                cancellation_token.clone(),
             )
             .await;
 
             debug!(
                 job_id = %job_id,
                 success = result.is_ok(),
+                cancelled = cancellation_token.is_cancelled(),
                 "Pipeline processing finished"
             );
 
@@ -405,6 +431,17 @@ async fn process_dds_request_coalesced<P, E, M, D, X>(
                     DdsResponse::from(job_result)
                 }
                 Err(e) => {
+                    // Check if this was a cancellation
+                    if cancellation_token.is_cancelled() {
+                        debug!(job_id = %job_id, tile = ?tile, "Pipeline cancelled");
+                        if let Some(ref m) = metrics {
+                            m.job_failed();
+                        }
+                        // Clean up coalescer entry so waiters get notified
+                        coalescer.cancel(tile);
+                        return;
+                    }
+
                     error!(error = %e, "Pipeline processing failed");
                     // Record job failure
                     if let Some(ref m) = metrics {
@@ -441,6 +478,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
 
     // Mock implementations for testing
 
@@ -572,6 +610,7 @@ mod tests {
                 zoom: 16,
             },
             result_tx: tx,
+            cancellation_token: CancellationToken::new(),
         };
 
         // Call the handler
@@ -608,6 +647,7 @@ mod tests {
                 zoom: 16,
             },
             result_tx: tx,
+            cancellation_token: CancellationToken::new(),
         };
 
         process_dds_request(
@@ -649,6 +689,7 @@ mod tests {
                 zoom: 16,
             },
             result_tx: tx,
+            cancellation_token: CancellationToken::new(),
         };
 
         process_dds_request(
@@ -738,6 +779,7 @@ mod tests {
                 job_id: JobId::new(),
                 tile,
                 result_tx: tx,
+                cancellation_token: CancellationToken::new(),
             };
 
             handler(request);

@@ -14,5 +14,5 @@ mod encode;
 
 pub use assembly::assembly_stage;
 pub use cache::{cache_stage, check_memory_cache};
-pub use download::{download_stage, download_stage_with_limiter};
+pub use download::{download_stage, download_stage_cancellable, download_stage_with_limiter};
 pub use encode::encode_stage;

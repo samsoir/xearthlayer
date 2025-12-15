@@ -199,6 +199,14 @@ impl PipelineMetrics {
         self.chunks_retried.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a download being cancelled (balances download_started).
+    ///
+    /// This is called when a download is aborted due to cancellation (e.g., FUSE timeout).
+    /// It decrements the active counter without counting as success or failure.
+    pub fn download_cancelled(&self) {
+        self.downloads_active.fetch_sub(1, Ordering::Relaxed);
+    }
+
     // === Cache tracking ===
 
     /// Record a memory cache hit.

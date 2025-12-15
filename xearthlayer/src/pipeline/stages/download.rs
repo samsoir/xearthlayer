@@ -21,6 +21,7 @@ use crate::telemetry::PipelineMetrics;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
 /// Downloads all chunks for a tile.
@@ -156,6 +157,355 @@ where
     );
 
     results
+}
+
+/// Downloads all chunks for a tile with cancellation support.
+///
+/// This version accepts a `CancellationToken` that can abort in-progress downloads
+/// when the FUSE layer times out waiting for a response. This prevents orphaned
+/// downloads from holding HTTP connections and semaphore permits indefinitely.
+///
+/// When cancelled:
+/// - Completes already-started chunk downloads (to avoid leaving connections in bad state)
+/// - Aborts waiting/pending chunk downloads immediately
+/// - Returns partial results with whatever was completed
+///
+/// # Arguments
+///
+/// * `job_id` - For logging correlation
+/// * `tile` - The tile coordinates to download
+/// * `provider` - Chunk download provider
+/// * `disk_cache` - Disk cache for chunk persistence
+/// * `config` - Pipeline configuration
+/// * `metrics` - Optional metrics collector
+/// * `http_limiter` - Optional global HTTP concurrency limiter
+/// * `cancellation_token` - Token to signal cancellation
+///
+/// # Returns
+///
+/// `ChunkResults` containing successful downloads and failures. If cancelled,
+/// returns partial results.
+#[allow(clippy::too_many_arguments)]
+#[instrument(skip(provider, disk_cache, config, metrics, http_limiter, cancellation_token), fields(job_id = %job_id))]
+pub async fn download_stage_cancellable<P, D>(
+    job_id: JobId,
+    tile: TileCoord,
+    provider: Arc<P>,
+    disk_cache: Arc<D>,
+    config: &PipelineConfig,
+    metrics: Option<Arc<PipelineMetrics>>,
+    http_limiter: Option<Arc<HttpConcurrencyLimiter>>,
+    cancellation_token: CancellationToken,
+) -> ChunkResults
+where
+    P: ChunkProvider,
+    D: DiskCache,
+{
+    let mut results = ChunkResults::new();
+
+    // Early cancellation check
+    if cancellation_token.is_cancelled() {
+        debug!(job_id = %job_id, "Download stage cancelled before starting");
+        return results;
+    }
+
+    let mut downloads = JoinSet::new();
+
+    // Spawn download tasks for all 256 chunks
+    for chunk in tile.chunks() {
+        let provider = Arc::clone(&provider);
+        let disk_cache = Arc::clone(&disk_cache);
+        let metrics = metrics.clone();
+        let http_limiter = http_limiter.clone();
+        let timeout = config.request_timeout;
+        let max_retries = config.max_retries;
+        let token = cancellation_token.clone();
+
+        downloads.spawn(async move {
+            download_chunk_cancellable(
+                tile,
+                chunk.chunk_row,
+                chunk.chunk_col,
+                provider,
+                disk_cache,
+                timeout,
+                max_retries,
+                metrics,
+                http_limiter,
+                token,
+            )
+            .await
+        });
+    }
+
+    // Collect results as they complete, checking for cancellation
+    loop {
+        tokio::select! {
+            biased;
+
+            // Check cancellation first
+            _ = cancellation_token.cancelled() => {
+                debug!(
+                    job_id = %job_id,
+                    completed = results.total_count(),
+                    "Download stage cancelled - aborting remaining downloads"
+                );
+                // Abort remaining tasks in the JoinSet
+                downloads.abort_all();
+                break;
+            }
+
+            // Wait for next download to complete
+            result = downloads.join_next() => {
+                match result {
+                    Some(Ok(Ok(chunk_data))) => {
+                        results.add_success(chunk_data.row, chunk_data.col, chunk_data.data);
+                    }
+                    Some(Ok(Err(chunk_err))) => {
+                        // Don't log if this was due to cancellation
+                        if !cancellation_token.is_cancelled() {
+                            warn!(
+                                job_id = %job_id,
+                                chunk_row = chunk_err.row,
+                                chunk_col = chunk_err.col,
+                                error = %chunk_err.error,
+                                "Chunk download failed"
+                            );
+                        }
+                        results.add_failure(
+                            chunk_err.row,
+                            chunk_err.col,
+                            chunk_err.attempts,
+                            chunk_err.error,
+                        );
+                    }
+                    Some(Err(join_err)) => {
+                        // Task was aborted (likely due to cancellation) or panicked
+                        if !join_err.is_cancelled() {
+                            warn!(job_id = %job_id, error = %join_err, "Download task panicked");
+                        }
+                    }
+                    None => {
+                        // All tasks completed
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    debug!(
+        job_id = %job_id,
+        success = results.success_count(),
+        failed = results.failure_count(),
+        cancelled = cancellation_token.is_cancelled(),
+        "Download stage complete"
+    );
+
+    results
+}
+
+/// Downloads a single chunk with cancellation support.
+#[allow(clippy::too_many_arguments)]
+async fn download_chunk_cancellable<P, D>(
+    tile: TileCoord,
+    chunk_row: u8,
+    chunk_col: u8,
+    provider: Arc<P>,
+    disk_cache: Arc<D>,
+    timeout: std::time::Duration,
+    max_retries: u32,
+    metrics: Option<Arc<PipelineMetrics>>,
+    http_limiter: Option<Arc<HttpConcurrencyLimiter>>,
+    cancellation_token: CancellationToken,
+) -> Result<ChunkData, ChunkError>
+where
+    P: ChunkProvider,
+    D: DiskCache,
+{
+    // Check disk cache first (no HTTP permit needed, fast operation)
+    if let Some(cached) = disk_cache
+        .get(tile.row, tile.col, tile.zoom, chunk_row, chunk_col)
+        .await
+    {
+        if let Some(ref m) = metrics {
+            m.disk_cache_hit();
+        }
+        return Ok(ChunkData {
+            row: chunk_row,
+            col: chunk_col,
+            data: cached,
+        });
+    }
+
+    // Check cancellation before network request
+    if cancellation_token.is_cancelled() {
+        return Err(ChunkError {
+            row: chunk_row,
+            col: chunk_col,
+            attempts: 0,
+            error: "cancelled".to_string(),
+        });
+    }
+
+    if let Some(ref m) = metrics {
+        m.disk_cache_miss();
+    }
+
+    let global_row = tile.row * 16 + chunk_row as u32;
+    let global_col = tile.col * 16 + chunk_col as u32;
+    let chunk_zoom = tile.zoom + 4;
+
+    let mut last_error = String::new();
+    for attempt in 1..=max_retries {
+        // Check cancellation before each retry
+        if cancellation_token.is_cancelled() {
+            return Err(ChunkError {
+                row: chunk_row,
+                col: chunk_col,
+                attempts: attempt - 1,
+                error: "cancelled".to_string(),
+            });
+        }
+
+        if let Some(ref m) = metrics {
+            m.download_started();
+        }
+        let start = Instant::now();
+
+        // Acquire HTTP permit (with cancellation check while waiting)
+        let _http_permit = if let Some(ref limiter) = http_limiter {
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => {
+                    // IMPORTANT: Balance the download_started() call above
+                    if let Some(ref m) = metrics {
+                        m.download_cancelled();
+                    }
+                    return Err(ChunkError {
+                        row: chunk_row,
+                        col: chunk_col,
+                        attempts: attempt - 1,
+                        error: "cancelled while waiting for HTTP permit".to_string(),
+                    });
+                }
+                permit = limiter.acquire() => Some(permit),
+            }
+        } else {
+            None
+        };
+
+        // Perform the download with cancellation support
+        let download_result = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => {
+                // IMPORTANT: Balance the download_started() call above
+                if let Some(ref m) = metrics {
+                    m.download_cancelled();
+                }
+                return Err(ChunkError {
+                    row: chunk_row,
+                    col: chunk_col,
+                    attempts: attempt,
+                    error: "cancelled during download".to_string(),
+                });
+            }
+            result = tokio::time::timeout(
+                timeout,
+                provider.download_chunk(global_row, global_col, chunk_zoom),
+            ) => result,
+        };
+
+        match download_result {
+            Ok(Ok(data)) => {
+                let duration_us = start.elapsed().as_micros() as u64;
+                let bytes = data.len() as u64;
+                if let Some(ref m) = metrics {
+                    m.download_completed(bytes, duration_us);
+                }
+
+                drop(_http_permit);
+
+                // Cache write (fire and forget)
+                let dc = Arc::clone(&disk_cache);
+                let chunk_data = data.clone();
+                let cache_bytes = chunk_data.len() as u64;
+                let cache_metrics = metrics.clone();
+                tokio::spawn(async move {
+                    if dc
+                        .put(
+                            tile.row, tile.col, tile.zoom, chunk_row, chunk_col, chunk_data,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        if let Some(ref m) = cache_metrics {
+                            m.add_disk_cache_bytes(cache_bytes);
+                        }
+                    }
+                });
+
+                return Ok(ChunkData {
+                    row: chunk_row,
+                    col: chunk_col,
+                    data,
+                });
+            }
+            Ok(Err(e)) => {
+                if let Some(ref m) = metrics {
+                    m.download_failed();
+                }
+                last_error = e.message.clone();
+                drop(_http_permit);
+
+                if !e.is_retryable {
+                    break;
+                }
+                if attempt < max_retries {
+                    if let Some(ref m) = metrics {
+                        m.download_retried();
+                    }
+                }
+            }
+            Err(_) => {
+                if let Some(ref m) = metrics {
+                    m.download_failed();
+                }
+                last_error = "timeout".to_string();
+                drop(_http_permit);
+
+                if attempt < max_retries {
+                    if let Some(ref m) = metrics {
+                        m.download_retried();
+                    }
+                }
+            }
+        }
+
+        // Backoff with cancellation check
+        if attempt < max_retries {
+            let backoff = std::time::Duration::from_millis(100 * (1 << attempt));
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => {
+                    return Err(ChunkError {
+                        row: chunk_row,
+                        col: chunk_col,
+                        attempts: attempt,
+                        error: "cancelled during backoff".to_string(),
+                    });
+                }
+                _ = tokio::time::sleep(backoff) => {}
+            }
+        }
+    }
+
+    Err(ChunkError {
+        row: chunk_row,
+        col: chunk_col,
+        attempts: max_retries,
+        error: last_error,
+    })
 }
 
 /// Result of a successful chunk download.
