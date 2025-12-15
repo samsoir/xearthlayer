@@ -1,0 +1,206 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.2.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build static binary with musl for maximum compatibility
+  build-linux-musl:
+    name: Build Linux (musl static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build static binary
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/xearthlayer dist/
+          cp README.md LICENSE dist/
+          cd dist
+          tar czvf xearthlayer-${{ github.ref_name || inputs.tag }}-x86_64-linux-musl.tar.gz xearthlayer README.md LICENSE
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-musl-binary
+          path: dist/*.tar.gz
+
+  # Build .deb package for Debian/Ubuntu
+  build-deb:
+    name: Build Debian Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Build .deb package
+        run: |
+          cd xearthlayer-cli
+          cargo deb --no-build
+          mkdir -p ../dist
+          cp ../target/debian/*.deb ../dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-package
+          path: dist/*.deb
+
+  # Build .rpm package for Fedora/RHEL/openSUSE
+  build-rpm:
+    name: Build RPM Package
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y rust cargo fuse3-devel rpm-build
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Build RPM package
+        run: |
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+
+          # Create source tarball
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          mkdir -p xearthlayer-${VERSION}
+          cp -r * xearthlayer-${VERSION}/ 2>/dev/null || true
+          tar czvf ~/rpmbuild/SOURCES/xearthlayer-${VERSION}.tar.gz xearthlayer-${VERSION}
+
+          # Copy spec file
+          cp pkg/rpm/xearthlayer.spec ~/rpmbuild/SPECS/
+
+          # Build RPM (binary only, skip source RPM)
+          rpmbuild -bb ~/rpmbuild/SPECS/xearthlayer.spec
+
+          mkdir -p dist
+          cp ~/rpmbuild/RPMS/*/*.rpm dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-package
+          path: dist/*.rpm
+
+  # Create GitHub Release with all artifacts
+  release:
+    name: Create Release
+    needs: [build-linux-musl, build-deb, build-rpm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.deb" -o -name "*.rpm" \) -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name || inputs.tag }}
+          name: XEarthLayer ${{ github.ref_name || inputs.tag }}
+          draft: true
+          prerelease: ${{ contains(github.ref_name || inputs.tag, '-') }}
+          generate_release_notes: true
+          files: |
+            release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Update PKGBUILD with new version checksums (for maintainer reference)
+  update-pkgbuild:
+    name: Generate PKGBUILD checksums
+    needs: [build-linux-musl]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download musl binary
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-musl-binary
+          path: artifacts
+
+      - name: Calculate SHA256
+        id: sha256
+        run: |
+          TARBALL=$(ls artifacts/*.tar.gz)
+          SHA256=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "SHA256: $SHA256"
+
+      - name: Output PKGBUILD update instructions
+        run: |
+          echo "=============================================="
+          echo "PKGBUILD Update Instructions for AUR"
+          echo "=============================================="
+          echo ""
+          echo "Update pkg/arch/PKGBUILD with:"
+          echo "  pkgver=${{ github.ref_name || inputs.tag }}"
+          echo "  sha256sums=('${{ steps.sha256.outputs.sha256 }}')"
+          echo ""
+          echo "Then submit to AUR:"
+          echo "  1. Clone the AUR repo: git clone ssh://aur@aur.archlinux.org/xearthlayer.git"
+          echo "  2. Copy the updated PKGBUILD"
+          echo "  3. Update .SRCINFO: makepkg --printsrcinfo > .SRCINFO"
+          echo "  4. Commit and push"

@@ -1,0 +1,54 @@
+# Maintainer: Sam de Freyssinet <sam@def.reyssi.net>
+pkgname=xearthlayer
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="High-quality satellite imagery for X-Plane, streamed on demand"
+arch=('x86_64')
+url="https://github.com/samsoir/xearthlayer"
+license=('MIT')
+depends=('fuse3')
+makedepends=('rust' 'cargo')
+optdepends=(
+    'xplane12: X-Plane 12 flight simulator'
+)
+backup=()
+options=(!lto)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --frozen
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+
+    # Install binary
+    install -Dm755 "target/release/xearthlayer" "$pkgdir/usr/bin/xearthlayer"
+
+    # Install license
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    # Install documentation
+    install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+
+    # Install shell completions (if generated)
+    # install -Dm644 "completions/xearthlayer.bash" "$pkgdir/usr/share/bash-completion/completions/xearthlayer"
+    # install -Dm644 "completions/xearthlayer.zsh" "$pkgdir/usr/share/zsh/site-functions/_xearthlayer"
+    # install -Dm644 "completions/xearthlayer.fish" "$pkgdir/usr/share/fish/vendor_completions.d/xearthlayer.fish"
+}

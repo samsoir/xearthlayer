@@ -5,10 +5,33 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "High-quality satellite imagery for X-Plane, streamed on demand"
+readme = "../README.md"
+keywords = ["xplane", "flight-simulator", "satellite-imagery", "fuse"]
+categories = ["command-line-utilities", "filesystem"]
 
 [[bin]]
 name = "xearthlayer"
 path = "src/main.rs"
+
+# cargo-deb configuration for Debian/Ubuntu packages
+[package.metadata.deb]
+name = "xearthlayer"
+maintainer = "Sam de Freyssinet <sam@def.reyssi.net>"
+copyright = "2025, XEarthLayer Contributors"
+license-file = ["../LICENSE", "0"]
+extended-description = """\
+XEarthLayer delivers satellite/aerial imagery to X-Plane without massive downloads. \
+Instead of pre-downloading thousands of gigabytes of textures, XEarthlayer installs \
+small regional packages and streams textures on-demand as you fly."""
+depends = "$auto, libfuse3-3"
+section = "games"
+priority = "optional"
+assets = [
+    ["target/release/xearthlayer", "usr/bin/", "755"],
+    ["../README.md", "usr/share/doc/xearthlayer/README.md", "644"],
+    ["../LICENSE", "usr/share/doc/xearthlayer/LICENSE", "644"],
+]
 
 [dependencies]
 xearthlayer = { path = "../xearthlayer" }

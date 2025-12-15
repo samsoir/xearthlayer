@@ -10,7 +10,7 @@ version = "0.2.0"
 edition = "2021"
 authors = ["XEarthLayer Contributors"]
 license = "MIT"
-repository = "https://github.com/yourusername/xearthlayer"
+repository = "https://github.com/samsoir/xearthlayer"
 
 [workspace.dependencies]
 # Shared dependencies will be added here as needed

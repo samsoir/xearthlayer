@@ -1,0 +1,55 @@
+# Maintainer: Sam de Freyssinet <sam@def.reyssi.net>
+pkgname=xearthlayer-git
+pkgver=r0.0.0
+pkgrel=1
+pkgdesc="High-quality satellite imagery for X-Plane, streamed on demand (git version)"
+arch=('x86_64')
+url="https://github.com/samsoir/xearthlayer"
+license=('MIT')
+depends=('fuse3')
+makedepends=('rust' 'cargo' 'git')
+optdepends=(
+    'xplane12: X-Plane 12 flight simulator'
+)
+provides=("xearthlayer=${pkgver#r}")
+conflicts=('xearthlayer')
+options=(!lto)
+source=("$pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$pkgname"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+    cd "$pkgname"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgname"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release
+}
+
+check() {
+    cd "$pkgname"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --frozen
+}
+
+package() {
+    cd "$pkgname"
+
+    # Install binary
+    install -Dm755 "target/release/xearthlayer" "$pkgdir/usr/bin/xearthlayer"
+
+    # Install license
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    # Install documentation
+    install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
