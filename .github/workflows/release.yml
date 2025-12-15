@@ -154,14 +154,36 @@ jobs:
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          TAG="${{ github.ref_name || inputs.tag }}"
+          VERSION="${TAG#v}"
+
+          # Extract the section for this version from CHANGELOG.md
+          # Matches from "## [version]" to the next "## [" or end of file
+          CHANGELOG=$(awk -v ver="$VERSION" '
+            /^## \[/ {
+              if (found) exit
+              if (index($0, "[" ver "]")) found=1
+            }
+            found { print }
+          ' CHANGELOG.md)
+
+          # Store in file for multi-line handling
+          echo "$CHANGELOG" > release_notes.md
+
+          echo "Extracted changelog:"
+          cat release_notes.md
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ github.ref_name || inputs.tag }}
           name: XEarthLayer ${{ github.ref_name || inputs.tag }}
+          body_path: release_notes.md
           draft: true
           prerelease: ${{ contains(github.ref_name || inputs.tag, '-') }}
-          generate_release_notes: true
           files: |
             release/*
         env:
