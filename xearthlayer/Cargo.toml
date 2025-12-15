@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs", "macros"] }
-reqwest = { version = "0.12", features = ["blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 image = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "local-time"] }
