@@ -13,12 +13,35 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
 
 jobs:
+  # Run make verify first - gate all builds behind this
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev
+
+      - name: Run make verify
+        run: make verify
+
   # Build Linux binary tarball
   build-linux:
     name: Build Linux Binary
     runs-on: ubuntu-latest
+    needs: [verify]
     steps:
       - uses: actions/checkout@v4
 
@@ -53,6 +76,7 @@ jobs:
   build-deb:
     name: Build Debian Package
     runs-on: ubuntu-latest
+    needs: [verify]
     steps:
       - uses: actions/checkout@v4
 
@@ -88,6 +112,7 @@ jobs:
   build-rpm:
     name: Build RPM Package
     runs-on: ubuntu-latest
+    needs: [verify]
     container:
       image: fedora:latest
     steps:
@@ -128,7 +153,7 @@ jobs:
   # Create GitHub Release with all artifacts
   release:
     name: Create Release
-    needs: [build-linux, build-deb, build-rpm]
+    needs: [verify, build-linux, build-deb, build-rpm]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -180,7 +205,7 @@ jobs:
           tag_name: ${{ github.ref_name || inputs.tag }}
           name: XEarthLayer ${{ github.ref_name || inputs.tag }}
           body_path: release_notes.md
-          draft: true
+          draft: false
           prerelease: ${{ contains(github.ref_name || inputs.tag, '-') }}
           files: |
             release/*
