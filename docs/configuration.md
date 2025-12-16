@@ -16,16 +16,21 @@ Controls which satellite imagery provider to use.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `type` | string | `bing` | Imagery provider: `bing`, `go2`, or `google` (see below) |
+| `type` | string | `bing` | Imagery provider (see below for options) |
 | `google_api_key` | string | (empty) | Google Maps API key. Required only when `type = google`. |
+| `mapbox_access_token` | string | (empty) | MapBox access token. Required only when `type = mapbox`. |
 
 **Available Providers:**
 
-| Provider | API Key | Cost | Notes |
-|----------|---------|------|-------|
-| `bing` | Not required | Free | Bing Maps aerial imagery. Recommended for most users. |
-| `go2` | Not required | Free | Google Maps via public tile servers. Same endpoint as Ortho4XP's GO2 provider. |
-| `google` | Required | Paid | Google Maps official API. Has usage limits (15,000 requests/day). |
+| Provider | API Key | Cost | Coverage | Max Zoom | Notes |
+|----------|---------|------|----------|----------|-------|
+| `bing` | Not required | Free | Global | 19 | Recommended for most users |
+| `go2` | Not required | Free | Global | 22 | Google Maps via public tile servers (same as Ortho4XP GO2) |
+| `google` | Required | Paid | Global | 22 | Official Google Maps API with usage limits |
+| `apple` | Not required | Free | Global | 20 | High quality imagery, tokens auto-acquired |
+| `arcgis` | Not required | Free | Global | 19 | ESRI World Imagery service |
+| `mapbox` | Required | Freemium | Global | 22 | MapBox Satellite, requires access token |
+| `usgs` | Not required | Free | US only | 16 | USGS orthoimagery, excellent quality for US |
 
 **Examples:**
 
@@ -48,10 +53,40 @@ type = google
 google_api_key = AIzaSy...your-key-here
 ```
 
-**Notes:**
-- **GO2** uses the same Google tile servers as Ortho4XP, making it ideal for use with Ortho4XP-generated scenery packs.
-- **Google official API** has strict rate limits (15,000 requests/day). With 256 chunks per tile, this allows approximately 58 tiles per day.
-- **Bing Maps** is recommended for general use due to its reliability and no rate limits.
+Apple Maps (auto-acquires tokens):
+```ini
+[provider]
+type = apple
+```
+
+ArcGIS World Imagery:
+```ini
+[provider]
+type = arcgis
+```
+
+MapBox Satellite (requires token):
+```ini
+[provider]
+type = mapbox
+mapbox_access_token = pk.eyJ1...your-token-here
+```
+
+USGS (US coverage only):
+```ini
+[provider]
+type = usgs
+```
+
+**Provider Notes:**
+
+- **Bing Maps** - Recommended for general use due to reliability and global coverage.
+- **GO2** - Uses the same Google tile servers as Ortho4XP, ideal for Ortho4XP-generated scenery.
+- **Google official API** - Strict rate limits (15,000 requests/day). With 256 chunks per tile, allows ~58 tiles/day.
+- **Apple Maps** - Automatically acquires access tokens via DuckDuckGo's MapKit integration. Tokens refresh automatically on authentication errors.
+- **ArcGIS** - ESRI's World Imagery service, good global coverage with no authentication required.
+- **MapBox** - Requires a free account at mapbox.com. Free tier includes 200,000 tile requests/month.
+- **USGS** - Excellent quality orthoimagery for the United States only. Will fail for non-US locations.
 
 ### [cache]
 
@@ -282,8 +317,9 @@ Values are validated before being saved. Invalid values will produce an error me
 
 | Key | Valid Values | Description |
 |-----|--------------|-------------|
-| `provider.type` | `bing`, `go2`, `google` | Imagery provider |
+| `provider.type` | `apple`, `arcgis`, `bing`, `go2`, `google`, `mapbox`, `usgs` | Imagery provider |
 | `provider.google_api_key` | string | Google Maps API key |
+| `provider.mapbox_access_token` | string | MapBox access token |
 | `cache.directory` | path | Cache directory |
 | `cache.memory_size` | size (e.g., `2GB`) | Memory cache size |
 | `cache.disk_size` | size (e.g., `20GB`) | Disk cache size |
@@ -306,6 +342,12 @@ Most configuration settings can be overridden via CLI arguments:
 ```bash
 # Override provider
 xearthlayer start --source ./scenery --provider google --google-api-key YOUR_KEY
+
+# Use MapBox with token
+xearthlayer start --source ./scenery --provider mapbox --mapbox-token YOUR_TOKEN
+
+# Use Apple Maps (no key needed)
+xearthlayer start --source ./scenery --provider apple
 
 # Override DDS format
 xearthlayer start --source ./scenery --dds-format bc3

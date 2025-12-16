@@ -17,10 +17,11 @@ The result: complete orthophoto scenery with minimal disk usage and no lengthy i
 Regional Package (small)          XEarthLayer Service (running)
 ┌────────────────────────┐        ┌────────────────────────┐
 │ Terrain definitions    │        │ Satellite Providers    │
-│ (DSF, TER files)       │───────→│ (Bing, Google)         │
-│ References textures    │        │                        │
-│ that don't exist       │        │ Generates DDS textures │
-└────────────────────────┘        │ on-demand              │
+│ (DSF, TER files)       │───────→│ (Bing, Google, Apple,  │
+│ References textures    │        │  ArcGIS, MapBox, USGS) │
+│ that don't exist       │        │                        │
+└────────────────────────┘        │ Generates DDS textures │
+                                  │ on-demand              │
                                   └────────────────────────┘
                                              │
                                              ▼
@@ -35,7 +36,13 @@ See [How It Works](docs/how-it-works.md) for detailed architecture.
 ## Features
 
 - Small regional packages (megabytes, not gigabytes)
-- On-demand texture streaming from Bing Maps or Google Maps
+- On-demand texture streaming from multiple providers:
+  - **Bing Maps** - Free, global coverage (recommended)
+  - **Google Maps** - Via GO2 (free) or official API (paid)
+  - **Apple Maps** - High quality, auto-acquires tokens
+  - **ArcGIS** - Free, global coverage
+  - **MapBox** - Requires access token
+  - **USGS** - Free, US coverage only
 - Two-tier caching for instant repeat visits
 - High-quality BC1/BC3 DDS textures with mipmaps
 - Works with Ortho4XP-generated scenery

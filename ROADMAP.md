@@ -13,17 +13,17 @@ XEarthLayer aims to be a high-performance, reliable virtual filesystem for servi
 - Two-tier caching (memory + disk)
 - TUI dashboard for real-time monitoring
 - Linux distribution packages (.deb, .rpm, AUR)
-- Bing Maps tile source
+- Multiple imagery providers (Bing, Google, USGS, ArcGIS, Apple Maps, MapBox)
 
 ## Planned Features
 
 ### Near Term
 
-#### Additional Tile Sources
-- **USGS** - High-quality imagery for United States
-- **ArcGIS** - World imagery service
-- **Apple Maps** - High Quality closed source mapping provider
-- **MapBox** - Commercial mapping service built on top of openstreetmap
+#### ~~Additional Tile Sources~~ ✓ Completed
+- ~~**USGS** - High-quality imagery for United States~~
+- ~~**ArcGIS** - World imagery service~~
+- ~~**Apple Maps** - High Quality closed source mapping provider~~
+- ~~**MapBox** - Commercial mapping service built on top of openstreetmap~~
 
 #### Linux GTK GUI
 - User interface for XEarthLayer for linux desktop environments built using the gtk5 framework
@@ -74,4 +74,4 @@ If you'd like to contribute to a roadmap item, please open an issue to discuss t
 
 ---
 
-*Last updated: 2025-12-15*
+*Last updated: 2025-12-16*
