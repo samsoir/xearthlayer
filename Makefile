@@ -7,12 +7,12 @@ CARGO := cargo
 CARGO_FLAGS :=
 COVERAGE_MIN := 80
 
-# Colors for output
-RED := \033[0;31m
-GREEN := \033[0;32m
-YELLOW := \033[0;33m
-BLUE := \033[0;36m
-NC := \033[0m # No Color
+# Colors for output (using shell printf for proper escape sequence handling)
+RED := $(shell printf '\033[0;31m')
+GREEN := $(shell printf '\033[0;32m')
+YELLOW := $(shell printf '\033[0;33m')
+BLUE := $(shell printf '\033[0;36m')
+NC := $(shell printf '\033[0m')
 
 .DEFAULT_GOAL := help
 

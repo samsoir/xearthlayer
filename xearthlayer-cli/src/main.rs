@@ -54,6 +54,9 @@ enum Commands {
         action: CacheAction,
     },
 
+    /// Output system diagnostics for bug reports
+    Diagnostics,
+
     /// Package publisher commands (create and manage scenery packages)
     Publish {
         #[command(subcommand)]
@@ -175,6 +178,7 @@ fn main() {
         Commands::Init => commands::init::run(),
         Commands::Config { command } => commands::config::run(command),
         Commands::Cache { action } => commands::cache::run(action),
+        Commands::Diagnostics => commands::diagnostics::run(),
         Commands::Publish { command } => commands::publish::run(command),
         Commands::Packages { command } => commands::packages::run(command),
         Commands::Start {

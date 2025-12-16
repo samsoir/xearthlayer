@@ -20,6 +20,7 @@ pub mod cache;
 pub mod config;
 pub mod coord;
 pub mod dds;
+pub mod diagnostics;
 pub mod fuse;
 pub mod log;
 pub mod logging;
