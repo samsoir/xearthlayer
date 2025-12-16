@@ -1,5 +1,5 @@
 Name:           xearthlayer
-Version:        0.2.3
+Version:        0.2.4
 Release:        1%{?dist}
 Summary:        High-quality satellite imagery for X-Plane, streamed on demand
 
