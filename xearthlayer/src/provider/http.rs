@@ -69,6 +69,7 @@ pub trait AsyncHttpClient: Send + Sync {
 }
 
 /// Real HTTP client implementation using reqwest.
+#[derive(Clone)]
 pub struct ReqwestClient {
     client: reqwest::blocking::Client,
 }
@@ -167,6 +168,7 @@ impl HttpClient for ReqwestClient {
 /// This client uses non-blocking I/O and is the preferred choice for
 /// high-throughput scenarios. Unlike the blocking `ReqwestClient`, this
 /// does not consume threads from Tokio's blocking pool.
+#[derive(Clone)]
 pub struct AsyncReqwestClient {
     client: reqwest::Client,
 }
@@ -281,6 +283,7 @@ pub mod tests {
     use super::*;
 
     /// Mock HTTP client for testing (synchronous)
+    #[derive(Clone)]
     pub struct MockHttpClient {
         pub response: Result<Vec<u8>, ProviderError>,
     }
@@ -296,6 +299,7 @@ pub mod tests {
     }
 
     /// Mock async HTTP client for testing
+    #[derive(Clone)]
     pub struct MockAsyncHttpClient {
         pub response: Result<Vec<u8>, ProviderError>,
     }

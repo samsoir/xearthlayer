@@ -16,6 +16,7 @@ pub struct DownloadArgs {
     pub dds_format: Option<DdsCompression>,
     pub provider: Option<ProviderType>,
     pub google_api_key: Option<String>,
+    pub mapbox_token: Option<String>,
 }
 
 /// Run the download command.
@@ -25,7 +26,12 @@ pub fn run(args: DownloadArgs) -> Result<(), CliError> {
     let config = runner.config();
 
     // Resolve settings from CLI and config
-    let provider_config = resolve_provider(args.provider, args.google_api_key, config)?;
+    let provider_config = resolve_provider(
+        args.provider,
+        args.google_api_key,
+        args.mapbox_token,
+        config,
+    )?;
     let format = resolve_dds_format(args.dds_format, config);
 
     // Build configurations

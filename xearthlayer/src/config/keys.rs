@@ -260,7 +260,9 @@ impl ConfigKey {
     /// Get the validation specification for this key.
     fn specification(&self) -> Box<dyn ValueSpecification> {
         match self {
-            ConfigKey::ProviderType => Box::new(OneOfSpec::new(&["bing", "go2", "google"])),
+            ConfigKey::ProviderType => Box::new(OneOfSpec::new(&[
+                "apple", "arcgis", "bing", "go2", "google", "mapbox", "usgs",
+            ])),
             ConfigKey::ProviderGoogleApiKey => Box::new(AnyStringSpec),
             ConfigKey::CacheDirectory => Box::new(PathSpec),
             ConfigKey::CacheMemorySize => Box::new(SizeSpec),
@@ -520,9 +522,13 @@ mod tests {
 
     #[test]
     fn test_validate_provider_type() {
+        assert!(ConfigKey::ProviderType.validate("apple").is_ok());
+        assert!(ConfigKey::ProviderType.validate("arcgis").is_ok());
         assert!(ConfigKey::ProviderType.validate("bing").is_ok());
         assert!(ConfigKey::ProviderType.validate("go2").is_ok());
         assert!(ConfigKey::ProviderType.validate("google").is_ok());
+        assert!(ConfigKey::ProviderType.validate("mapbox").is_ok());
+        assert!(ConfigKey::ProviderType.validate("usgs").is_ok());
         assert!(ConfigKey::ProviderType.validate("BING").is_ok()); // Case insensitive
         assert!(ConfigKey::ProviderType.validate("invalid").is_err());
     }

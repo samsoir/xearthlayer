@@ -87,6 +87,10 @@ enum Commands {
         #[arg(long)]
         google_api_key: Option<String>,
 
+        /// MapBox access token (default: from config)
+        #[arg(long)]
+        mapbox_token: Option<String>,
+
         /// DDS compression format (default: from config)
         #[arg(long, value_enum)]
         dds_format: Option<DdsCompression>,
@@ -117,6 +121,10 @@ enum Commands {
         /// Google Maps API key (default: from config)
         #[arg(long)]
         google_api_key: Option<String>,
+
+        /// MapBox access token (default: from config)
+        #[arg(long)]
+        mapbox_token: Option<String>,
 
         /// DDS compression format (default: from config)
         #[arg(long, value_enum)]
@@ -164,6 +172,10 @@ enum Commands {
         /// Google Maps API key (default: from config)
         #[arg(long)]
         google_api_key: Option<String>,
+
+        /// MapBox access token (default: from config)
+        #[arg(long)]
+        mapbox_token: Option<String>,
     },
 }
 
@@ -186,6 +198,7 @@ fn main() {
             mountpoint,
             provider,
             google_api_key,
+            mapbox_token,
             dds_format,
             timeout,
             parallel,
@@ -195,6 +208,7 @@ fn main() {
             mountpoint,
             provider,
             google_api_key,
+            mapbox_token,
             dds_format,
             timeout,
             parallel,
@@ -208,6 +222,7 @@ fn main() {
             dds_format,
             provider,
             google_api_key,
+            mapbox_token,
         } => commands::download::run(commands::download::DownloadArgs {
             lat,
             lon,
@@ -216,10 +231,12 @@ fn main() {
             dds_format,
             provider,
             google_api_key,
+            mapbox_token,
         }),
         Commands::Run {
             provider,
             google_api_key,
+            mapbox_token,
             dds_format,
             timeout,
             parallel,
@@ -227,6 +244,7 @@ fn main() {
         } => commands::run::run(commands::run::RunArgs {
             provider,
             google_api_key,
+            mapbox_token,
             dds_format,
             timeout,
             parallel,

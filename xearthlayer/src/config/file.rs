@@ -57,10 +57,12 @@ pub struct ConfigFile {
 /// Provider configuration.
 #[derive(Debug, Clone)]
 pub struct ProviderSettings {
-    /// Provider type: "bing", "go2", or "google"
+    /// Provider type: "apple", "arcgis", "bing", "go2", "google", "mapbox", or "usgs"
     pub provider_type: String,
     /// Google Maps API key (only required for "google" provider)
     pub google_api_key: Option<String>,
+    /// MapBox access token (only required for "mapbox" provider)
+    pub mapbox_access_token: Option<String>,
 }
 
 /// Cache configuration.
@@ -142,6 +144,7 @@ impl Default for ConfigFile {
             provider: ProviderSettings {
                 provider_type: "bing".to_string(),
                 google_api_key: None,
+                mapbox_access_token: None,
             },
             cache: CacheSettings {
                 directory: cache_dir,
@@ -224,12 +227,15 @@ impl ConfigFile {
         if let Some(section) = ini.section(Some("provider")) {
             if let Some(v) = section.get("type") {
                 let v = v.to_lowercase();
-                if v != "bing" && v != "go2" && v != "google" {
+                let valid_providers =
+                    ["apple", "arcgis", "bing", "go2", "google", "mapbox", "usgs"];
+                if !valid_providers.contains(&v.as_str()) {
                     return Err(ConfigFileError::InvalidValue {
                         section: "provider".to_string(),
                         key: "type".to_string(),
                         value: v,
-                        reason: "must be 'bing', 'go2', or 'google'".to_string(),
+                        reason: "must be one of: apple, arcgis, bing, go2, google, mapbox, usgs"
+                            .to_string(),
                     });
                 }
                 config.provider.provider_type = v;
@@ -238,6 +244,12 @@ impl ConfigFile {
                 let v = v.trim();
                 if !v.is_empty() {
                     config.provider.google_api_key = Some(v.to_string());
+                }
+            }
+            if let Some(v) = section.get("mapbox_access_token") {
+                let v = v.trim();
+                if !v.is_empty() {
+                    config.provider.mapbox_access_token = Some(v.to_string());
                 }
             }
         }
@@ -381,6 +393,7 @@ impl ConfigFile {
     /// Convert to INI format with proper comments.
     fn to_config_string(&self) -> String {
         let google_api_key = self.provider.google_api_key.as_deref().unwrap_or("");
+        let mapbox_access_token = self.provider.mapbox_access_token.as_deref().unwrap_or("");
         let scenery_dir = self
             .xplane
             .scenery_dir
@@ -415,13 +428,20 @@ impl ConfigFile {
         format!(
             r#"[provider]
 ; Imagery provider:
-;   bing  - Bing Maps (free, no key required)
-;   go2   - Google Maps via public tile servers (free, no key required, same as Ortho4XP)
+;   apple  - Apple Maps (free, tokens auto-acquired via DuckDuckGo)
+;   arcgis - ArcGIS World Imagery (free, global coverage)
+;   bing   - Bing Maps (free, no key required)
+;   go2    - Google Maps via public tile servers (free, no key required, same as Ortho4XP)
 ;   google - Google Maps official API (paid, requires API key)
+;   mapbox - MapBox satellite (free tier available, requires access token)
+;   usgs   - USGS orthoimagery (free, US coverage only)
 type = {}
 ; Google Maps API key (only required when type = google)
 ; Get one at: https://console.cloud.google.com (enable Map Tiles API)
 google_api_key = {}
+; MapBox access token (only required when type = mapbox)
+; Get one at: https://www.mapbox.com/
+mapbox_access_token = {}
 
 [cache]
 ; Cache directory for storing downloaded tiles (default: ~/.cache/xearthlayer)
@@ -478,6 +498,7 @@ file = {}
 "#,
             self.provider.provider_type,
             google_api_key,
+            mapbox_access_token,
             format_size(self.cache.memory_size),
             format_size(self.cache.disk_size),
             self.texture.format.to_string().to_lowercase(),
@@ -613,9 +634,9 @@ type = invalid
         let result = ConfigFile::load_from(&config_path);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("must be 'bing', 'go2', or 'google'"));
+        // Check for the updated error message that includes all providers
+        assert!(err.to_string().contains("must be one of:"));
+        assert!(err.to_string().contains("bing"));
     }
 
     #[test]

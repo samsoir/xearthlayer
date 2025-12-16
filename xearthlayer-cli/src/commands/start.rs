@@ -15,6 +15,7 @@ pub struct StartArgs {
     pub mountpoint: Option<String>,
     pub provider: Option<ProviderType>,
     pub google_api_key: Option<String>,
+    pub mapbox_token: Option<String>,
     pub dds_format: Option<DdsCompression>,
     pub timeout: Option<u64>,
     pub parallel: Option<usize>,
@@ -61,7 +62,12 @@ pub fn run(args: StartArgs) -> Result<(), CliError> {
     };
 
     // Resolve settings from CLI and config
-    let provider_config = resolve_provider(args.provider, args.google_api_key, config)?;
+    let provider_config = resolve_provider(
+        args.provider,
+        args.google_api_key,
+        args.mapbox_token,
+        config,
+    )?;
     let format = resolve_dds_format(args.dds_format, config);
     let timeout_secs = args.timeout.unwrap_or(config.download.timeout);
     // Default parallel downloads is handled by DownloadConfig::default()
