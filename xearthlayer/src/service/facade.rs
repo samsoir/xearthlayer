@@ -1,25 +1,19 @@
 //! XEarthLayer service facade implementation.
 
+use super::builder::{self, CacheComponents, GeneratorComponents, ProviderComponents};
 use super::config::ServiceConfig;
 use super::dds_handler::DdsHandlerBuilder;
 use super::error::ServiceError;
 use super::fuse_mount::{FuseMountConfig, FuseMountService};
 use super::network_logger::NetworkStatsLogger;
-use crate::cache::{Cache, CacheConfig, CacheSystem, MemoryCache, NoOpCache};
+use crate::cache::{Cache, MemoryCache};
 use crate::coord::to_tile_coords;
 use crate::fuse::{DdsHandler, MountHandle, SpawnedMountHandle};
 use crate::log::Logger;
-use crate::log_info;
-use crate::orchestrator::{NetworkStats, TileOrchestrator};
-use crate::provider::{
-    AsyncProviderFactory, AsyncProviderType, AsyncReqwestClient, Provider, ProviderConfig,
-    ProviderFactory, ReqwestClient,
-};
+use crate::provider::{AsyncProviderType, Provider, ProviderConfig};
 use crate::telemetry::{PipelineMetrics, TelemetrySnapshot};
 use crate::texture::{DdsTextureEncoder, TextureEncoder};
-use crate::tile::{
-    DefaultTileGenerator, ParallelConfig, ParallelTileGenerator, TileGenerator, TileRequest,
-};
+use crate::tile::{TileGenerator, TileRequest};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -161,6 +155,9 @@ impl XEarthLayerService {
     }
 
     /// Internal builder that does the actual construction.
+    ///
+    /// This method delegates to focused builder functions in the `builder` module
+    /// for each component, keeping the overall flow clear and each piece testable.
     fn build(
         config: ServiceConfig,
         provider_config: ProviderConfig,
@@ -168,150 +165,40 @@ impl XEarthLayerService {
         runtime_handle: Handle,
         owned_runtime: Option<Runtime>,
     ) -> Result<Self, ServiceError> {
-        // Create sync HTTP client for legacy pipeline (TileOrchestrator)
-        let http_client =
-            ReqwestClient::new().map_err(|e| ServiceError::HttpClientError(e.to_string()))?;
+        // 1. Create providers (sync for legacy pipeline, async for new pipeline)
+        let ProviderComponents {
+            sync_provider: provider,
+            async_provider,
+            name: provider_name,
+            max_zoom,
+        } = builder::create_providers(&provider_config, &runtime_handle)?;
 
-        // Create sync provider using factory (for legacy tile generator)
-        let factory = ProviderFactory::new(http_client);
-        let (provider, provider_name, max_zoom) = factory.create(&provider_config)?;
-
-        // Create async HTTP client for async pipeline (non-blocking I/O)
-        let async_http_client =
-            AsyncReqwestClient::new().map_err(|e| ServiceError::HttpClientError(e.to_string()))?;
-
-        // Create async provider - this eliminates spawn_blocking for HTTP calls
-        let async_factory = AsyncProviderFactory::new(async_http_client);
-        let async_provider = runtime_handle
-            .block_on(async_factory.create(&provider_config))
-            .map(|(provider, _, _)| Arc::new(provider))
-            .ok();
-
-        // Create texture encoder from config
-        let dds_encoder = Arc::new(
-            DdsTextureEncoder::new(config.texture().format())
-                .with_mipmap_count(config.texture().mipmap_count()),
-        );
+        // 2. Create texture encoder
+        let dds_encoder = builder::create_encoder(&config);
         let encoder: Arc<dyn TextureEncoder> = Arc::clone(&dds_encoder) as Arc<dyn TextureEncoder>;
 
-        // Create network stats tracker
-        let network_stats = Arc::new(NetworkStats::new());
+        // 3. Create tile generator pipeline
+        let GeneratorComponents {
+            generator,
+            network_stats,
+        } = builder::create_generator(&config, Arc::clone(&provider), encoder, logger.clone());
 
-        // Create orchestrator with download config and network stats
-        let orchestrator = TileOrchestrator::with_config(Arc::clone(&provider), *config.download())
-            .with_network_stats(network_stats.clone());
+        // 4. Create cache system
+        let CacheComponents {
+            cache,
+            memory_cache,
+            cache_dir,
+        } = builder::create_cache(&config, &provider_name, logger.clone())?;
 
-        // Create base tile generator
-        let base_generator: Arc<dyn TileGenerator> = Arc::new(DefaultTileGenerator::new(
-            orchestrator,
-            Arc::clone(&encoder),
-            logger.clone(),
-        ));
+        // 5. Create network stats logger (if not in quiet mode)
+        let network_stats_logger =
+            builder::create_network_logger(&config, network_stats, logger.clone());
 
-        // Wrap with parallel generator for concurrent tile requests
-        let parallel_config = ParallelConfig::default()
-            .with_threads(config.generation_threads().unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
-            }))
-            .with_timeout_secs(config.generation_timeout().unwrap_or(10))
-            .with_dds_format(config.texture().format())
-            .with_mipmap_count(config.texture().mipmap_count());
-
-        let generator: Arc<dyn TileGenerator> = Arc::new(ParallelTileGenerator::new(
-            base_generator,
-            parallel_config.clone(),
-            logger.clone(),
-        ));
-
-        log_info!(
-            logger,
-            "Tile generation: {} threads, {}s timeout",
-            parallel_config.threads,
-            parallel_config.timeout_secs
-        );
-
-        // Create cache system based on configuration
-        let (cache, memory_cache, cache_dir): (
-            Arc<dyn Cache>,
-            Option<Arc<MemoryCache>>,
-            Option<PathBuf>,
-        ) = if config.cache_enabled() {
-            let mut cache_config = CacheConfig::new(&provider_name);
-
-            // Disable cache stats logging when quiet mode is enabled (e.g., TUI active)
-            if config.quiet_mode() {
-                cache_config = cache_config.with_stats_interval(0);
-            }
-
-            // Track the cache directory for async pipeline
-            let mut dir_for_pipeline = cache_config.disk.cache_dir.clone();
-            let mut mem_size = cache_config.memory.max_size_bytes;
-
-            // Apply cache settings from config if provided
-            if let Some(dir) = config.cache_directory() {
-                cache_config = cache_config.with_cache_dir(dir.clone());
-                dir_for_pipeline = dir.clone();
-            }
-            if let Some(size) = config.cache_memory_size() {
-                cache_config = cache_config.with_memory_size(size);
-                mem_size = size;
-            }
-            if let Some(size) = config.cache_disk_size() {
-                cache_config = cache_config.with_disk_size(size);
-            }
-
-            // Create shared memory cache for async pipeline
-            let mem_cache = Arc::new(MemoryCache::new(mem_size));
-
-            match CacheSystem::new(cache_config, logger.clone()) {
-                Ok(cache) => (Arc::new(cache), Some(mem_cache), Some(dir_for_pipeline)),
-                Err(e) => return Err(ServiceError::CacheError(e.to_string())),
-            }
-        } else {
-            (Arc::new(NoOpCache::new(&provider_name)), None, None)
-        };
-
-        // Start network stats logger (uses same interval as cache stats: 60s)
-        // Skip in quiet mode (e.g., when TUI is active)
-        let network_stats_logger = if config.quiet_mode() {
-            None
-        } else {
-            Some(NetworkStatsLogger::start(
-                network_stats,
-                logger.clone(),
-                60, // Log every 60 seconds
-            ))
-        };
-
-        // Create pipeline telemetry metrics
+        // 6. Create pipeline telemetry metrics
         let metrics = Arc::new(PipelineMetrics::new());
 
-        // Initialize disk cache size from existing cache directory
-        // This runs in the background to avoid blocking startup for large caches
-        if let Some(ref dir) = cache_dir {
-            let chunks_dir = dir.join("chunks");
-            if chunks_dir.exists() {
-                let metrics_clone = Arc::clone(&metrics);
-                let chunks_dir_clone = chunks_dir.clone();
-                runtime_handle.spawn(async move {
-                    match calculate_directory_size(&chunks_dir_clone).await {
-                        Ok(size) => {
-                            metrics_clone.set_disk_cache_size(size);
-                            tracing::info!(
-                                size_bytes = size,
-                                size_human = %crate::config::format_size(size as usize),
-                                "Initialized disk cache size from existing cache"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Failed to calculate disk cache size");
-                        }
-                    }
-                });
-            }
-        }
+        // 7. Initialize disk cache size from existing cache (async background task)
+        builder::init_disk_cache_metrics(cache_dir.as_ref(), &metrics, &runtime_handle);
 
         Ok(Self {
             config,
@@ -600,39 +487,6 @@ impl XEarthLayerService {
         let config = self.create_mount_config();
         FuseMountService::mount_fuse3_spawned(&config, source_dir, mountpoint).await
     }
-}
-
-/// Calculate the total size of a directory recursively.
-///
-/// This is used to initialize the disk cache size metric on startup.
-/// For large caches (100GB+), this runs asynchronously to avoid blocking.
-async fn calculate_directory_size(path: &std::path::Path) -> std::io::Result<u64> {
-    use tokio::fs;
-
-    let mut total_size = 0u64;
-    let mut dirs_to_scan = vec![path.to_path_buf()];
-
-    while let Some(dir) = dirs_to_scan.pop() {
-        let mut entries = match fs::read_dir(&dir).await {
-            Ok(entries) => entries,
-            Err(_) => continue, // Skip directories we can't read
-        };
-
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let metadata = match entry.metadata().await {
-                Ok(m) => m,
-                Err(_) => continue, // Skip entries we can't stat
-            };
-
-            if metadata.is_dir() {
-                dirs_to_scan.push(entry.path());
-            } else if metadata.is_file() {
-                total_size += metadata.len();
-            }
-        }
-    }
-
-    Ok(total_size)
 }
 
 #[cfg(test)]

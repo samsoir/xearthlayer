@@ -24,6 +24,7 @@
 //! let data = service.download_tile(37.7749, -122.4194, 15)?;
 //! ```
 
+mod builder;
 mod config;
 mod dds_handler;
 mod error;
