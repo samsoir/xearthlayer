@@ -14,6 +14,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
+  # Use inputs.tag for workflow_dispatch, otherwise use the tag from push event
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   # Run make verify first - gate all builds behind this
@@ -64,7 +66,7 @@ jobs:
           cp target/release/xearthlayer dist/
           cp README.md LICENSE dist/
           cd dist
-          tar czvf xearthlayer-${{ github.ref_name || inputs.tag }}-x86_64-linux.tar.gz xearthlayer README.md LICENSE
+          tar czvf xearthlayer-${{ env.RELEASE_TAG }}-x86_64-linux.tar.gz xearthlayer README.md LICENSE
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -180,7 +182,7 @@ jobs:
       - name: Extract changelog for this version
         id: changelog
         run: |
-          TAG="${{ github.ref_name || inputs.tag }}"
+          TAG="${{ env.RELEASE_TAG }}"
           VERSION="${TAG#v}"
 
           # Extract the section for this version from CHANGELOG.md
@@ -202,8 +204,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.ref_name || inputs.tag }}
-          name: XEarthLayer ${{ github.ref_name || inputs.tag }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: XEarthLayer ${{ env.RELEASE_TAG }}
           body_path: release_notes.md
           draft: false
           prerelease: ${{ contains(github.ref_name || inputs.tag, '-') }}
@@ -229,7 +231,7 @@ jobs:
       - name: Prepare AUR package
         id: aur
         run: |
-          TAG="${{ github.ref_name || inputs.tag }}"
+          TAG="${{ env.RELEASE_TAG }}"
           VERSION="${TAG#v}"
 
           echo "Preparing AUR package for $TAG (version $VERSION)"
@@ -286,7 +288,7 @@ jobs:
 
       - name: Output AUR submission instructions
         run: |
-          TAG="${{ github.ref_name || inputs.tag }}"
+          TAG="${{ env.RELEASE_TAG }}"
           VERSION="${TAG#v}"
 
           echo ""
