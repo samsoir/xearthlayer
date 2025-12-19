@@ -3497,7 +3497,7 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 
 [[package]]
 name = "xearthlayer"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "bytes",
  "chrono",
@@ -3528,7 +3528,7 @@ dependencies = [
 
 [[package]]
 name = "xearthlayer-cli"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "atty",
  "chrono",

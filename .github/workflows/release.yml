@@ -152,8 +152,9 @@ jobs:
           cp -r * xearthlayer-${VERSION}/ 2>/dev/null || true
           tar czvf ~/rpmbuild/SOURCES/xearthlayer-${VERSION}.tar.gz xearthlayer-${VERSION}
 
-          # Copy spec file
+          # Copy spec file and update version
           cp pkg/rpm/xearthlayer.spec ~/rpmbuild/SPECS/
+          sed -i "s/^Version:.*/Version:        ${VERSION}/" ~/rpmbuild/SPECS/xearthlayer.spec
 
           # Build RPM (binary only, skip source RPM)
           rpmbuild -bb ~/rpmbuild/SPECS/xearthlayer.spec

@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2025-12-19
+
+### Added
+
+- **Additional Imagery Providers**: Four new satellite imagery sources
+  - Apple Maps - High quality imagery with automatic token acquisition via DuckDuckGo MapKit
+  - ArcGIS World Imagery - ESRI's global satellite imagery service (no API key required)
+  - MapBox Satellite - High resolution imagery (requires free access token)
+  - USGS Orthoimagery - Excellent quality imagery for United States coverage
+
+- **Disk I/O Concurrency Limiting**: Prevents file descriptor exhaustion under heavy load
+  - Semaphore-based rate limiting for FUSE file reads and directory operations
+  - Configurable scaling formula: `min(num_cpus * 16, 256)` concurrent operations
+  - Addresses potential crashes during X-Plane scene loading with warm cache
+
+- **Debug Logging Flag**: New `--debug` flag for `xearthlayer run` command
+  - Enables debug-level logging for troubleshooting
+  - Useful for diagnosing issues in the field without modifying config
+
+### Changed
+
+- HTTP client now supports Bearer token authentication (required for Apple Maps)
+- Improved provider validation in configuration system
+
+### Fixed
+
+- Apple Maps token extraction updated for new DuckDuckGo JWT format
+- Apple Maps authentication now uses proper Bearer token header
+
+### Acknowledgements
+
+- Thanks to [xjs36uk](https://forums.x-plane.org/profile/1171657-xjs36uk/) from the X-Plane.org forums for testing v0.2.5 and reporting the disk I/O concurrency issue
+
 ## [0.2.5] - 2025-12-15
 
 ### Changed
@@ -91,6 +124,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Linux support only (Windows and macOS planned for future releases)
 - Requires FUSE3 for filesystem mounting
 
-[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/samsoir/xearthlayer/compare/v0.2.5...v0.2.6
+[0.2.5]: https://github.com/samsoir/xearthlayer/compare/v0.2.0...v0.2.5
 [0.2.0]: https://github.com/samsoir/xearthlayer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/samsoir/xearthlayer/releases/tag/v0.1.0
