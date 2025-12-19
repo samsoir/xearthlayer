@@ -73,6 +73,34 @@ pub fn init_logging_with_options(
     log_file: &str,
     stdout_enabled: bool,
 ) -> Result<LoggingGuard, io::Error> {
+    init_logging_full(log_dir, log_file, stdout_enabled, false)
+}
+
+/// Initialize logging system with full options including debug mode.
+///
+/// Creates logs directory if needed, clears previous log file,
+/// and sets up output to file and optionally stdout.
+///
+/// # Arguments
+///
+/// * `log_dir` - Directory for log files (e.g., "logs")
+/// * `log_file` - Log filename (e.g., "xearthlayer.log")
+/// * `stdout_enabled` - Whether to also output to stdout (disable for TUI mode)
+/// * `debug_mode` - Whether to enable debug-level logging (overrides RUST_LOG)
+///
+/// # Returns
+///
+/// LoggingGuard that must be kept alive for logging to work
+///
+/// # Errors
+///
+/// Returns error if log directory cannot be created or log file cannot be cleared
+pub fn init_logging_full(
+    log_dir: &str,
+    log_file: &str,
+    stdout_enabled: bool,
+    debug_mode: bool,
+) -> Result<LoggingGuard, io::Error> {
     // Create logs directory if it doesn't exist
     fs::create_dir_all(log_dir)?;
 
@@ -85,8 +113,13 @@ pub fn init_logging_with_options(
     let file_appender = tracing_appender::rolling::never(log_dir, log_file);
     let (non_blocking_file, file_guard) = tracing_appender::non_blocking(file_appender);
 
-    // Create env filter (defaults to INFO if RUST_LOG not set)
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Create env filter
+    // Priority: debug_mode flag > RUST_LOG env var > default (info)
+    let env_filter = if debug_mode {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    };
 
     // Use different formats for debug vs release builds
     #[cfg(debug_assertions)]

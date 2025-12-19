@@ -10,7 +10,7 @@ use crate::fuse::async_passthrough::{DdsHandler, DdsRequest};
 use crate::fuse::{
     get_default_placeholder, parse_dds_filename, validate_dds_or_placeholder, DdsFilename,
 };
-use crate::pipeline::JobId;
+use crate::pipeline::{ConcurrencyLimiter, JobId};
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
@@ -24,6 +24,7 @@ use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::oneshot;
@@ -63,6 +64,13 @@ impl VirtualDdsConfig {
 /// Unlike the `fuser`-based implementation, all operations are async and
 /// run concurrently on the Tokio runtime. This enables parallel processing
 /// of X-Plane's DDS texture requests.
+///
+/// # Disk I/O Concurrency
+///
+/// To prevent file descriptor exhaustion under heavy load, disk I/O operations
+/// are protected by a semaphore-based concurrency limiter. This prevents the
+/// system from opening too many file handles simultaneously when X-Plane
+/// requests many files during scene loading.
 pub struct Fuse3PassthroughFS {
     /// Source directory containing the scenery pack
     source_dir: PathBuf,
@@ -74,10 +82,14 @@ pub struct Fuse3PassthroughFS {
     virtual_dds_config: VirtualDdsConfig,
     /// Timeout for DDS generation
     generation_timeout: Duration,
+    /// Limiter for concurrent disk I/O operations
+    disk_io_limiter: Arc<ConcurrencyLimiter>,
 }
 
 impl Fuse3PassthroughFS {
     /// Create a new fuse3 passthrough filesystem.
+    ///
+    /// Uses default disk I/O concurrency limits: `min(num_cpus * 16, 256)`.
     ///
     /// # Arguments
     ///
@@ -85,12 +97,42 @@ impl Fuse3PassthroughFS {
     /// * `dds_handler` - Handler function for DDS generation requests
     /// * `expected_dds_size` - Expected size of generated DDS files
     pub fn new(source_dir: PathBuf, dds_handler: DdsHandler, expected_dds_size: usize) -> Self {
+        let disk_io_limiter = Arc::new(ConcurrencyLimiter::with_defaults("fuse_disk_io"));
+        debug!(
+            max_concurrent = disk_io_limiter.max_concurrent(),
+            "FUSE disk I/O concurrency limiter initialized"
+        );
         Self {
             inode_manager: InodeManager::new(source_dir.clone()),
             source_dir,
             dds_handler,
             virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
             generation_timeout: Duration::from_secs(30),
+            disk_io_limiter,
+        }
+    }
+
+    /// Create a new fuse3 passthrough filesystem with custom disk I/O limits.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_dir` - Path to the scenery pack directory
+    /// * `dds_handler` - Handler function for DDS generation requests
+    /// * `expected_dds_size` - Expected size of generated DDS files
+    /// * `disk_io_limiter` - Custom concurrency limiter for disk I/O operations
+    pub fn with_disk_io_limiter(
+        source_dir: PathBuf,
+        dds_handler: DdsHandler,
+        expected_dds_size: usize,
+        disk_io_limiter: Arc<ConcurrencyLimiter>,
+    ) -> Self {
+        Self {
+            inode_manager: InodeManager::new(source_dir.clone()),
+            source_dir,
+            dds_handler,
+            virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
+            generation_timeout: Duration::from_secs(30),
+            disk_io_limiter,
         }
     }
 
@@ -98,6 +140,11 @@ impl Fuse3PassthroughFS {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.generation_timeout = timeout;
         self
+    }
+
+    /// Returns the disk I/O limiter for monitoring/metrics.
+    pub fn disk_io_limiter(&self) -> &Arc<ConcurrencyLimiter> {
+        &self.disk_io_limiter
     }
 
     /// Mount the filesystem at the given path.
@@ -459,12 +506,14 @@ impl Filesystem for Fuse3PassthroughFS {
             });
         }
 
-        // Real file - read from disk
+        // Real file - read from disk with concurrency limiting
         let path = self
             .inode_manager
             .get_path(ino)
             .ok_or(Errno::from(libc::ENOENT))?;
 
+        // Acquire disk I/O permit to prevent file descriptor exhaustion
+        let _permit = self.disk_io_limiter.acquire().await;
         let data = fs::read(&path).await.map_err(|_| Errno::from(libc::EIO))?;
 
         let offset = offset as usize;
@@ -525,7 +574,8 @@ impl Filesystem for Fuse3PassthroughFS {
             offset: 2,
         });
 
-        // Read directory contents
+        // Read directory contents with concurrency limiting
+        let _permit = self.disk_io_limiter.acquire().await;
         let mut dir_entries = fs::read_dir(&path)
             .await
             .map_err(|_| Errno::from(libc::EIO))?;

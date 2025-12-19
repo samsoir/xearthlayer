@@ -44,6 +44,7 @@
 
 pub mod adapters;
 mod coalesce;
+mod concurrency_limiter;
 mod context;
 mod error;
 mod executor;
@@ -54,6 +55,9 @@ mod runner;
 pub mod stages;
 
 pub use coalesce::{CoalescerStats, RequestCoalescer};
+pub use concurrency_limiter::{
+    ConcurrencyLimiter, ConcurrencyPermit, DEFAULT_CEILING, DEFAULT_SCALING_FACTOR,
+};
 pub use context::{
     ChunkDownloadError, ChunkProvider, DiskCache, MemoryCache, PipelineConfig, PipelineContext,
     TextureEncodeError, TextureEncoderAsync,

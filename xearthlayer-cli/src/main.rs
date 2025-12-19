@@ -141,6 +141,10 @@ enum Commands {
         /// Disable caching (always generate tiles fresh)
         #[arg(long)]
         no_cache: bool,
+
+        /// Enable debug-level logging for troubleshooting
+        #[arg(long)]
+        debug: bool,
     },
 
     /// Download a single tile to a file (for testing)
@@ -241,6 +245,7 @@ fn main() {
             timeout,
             parallel,
             no_cache,
+            debug,
         } => commands::run::run(commands::run::RunArgs {
             provider,
             google_api_key,
@@ -249,6 +254,7 @@ fn main() {
             timeout,
             parallel,
             no_cache,
+            debug,
         }),
     };
 

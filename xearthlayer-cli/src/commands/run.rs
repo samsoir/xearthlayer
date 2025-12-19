@@ -24,11 +24,12 @@ pub struct RunArgs {
     pub timeout: Option<u64>,
     pub parallel: Option<usize>,
     pub no_cache: bool,
+    pub debug: bool,
 }
 
 /// Run the run command.
 pub fn run(args: RunArgs) -> Result<(), CliError> {
-    let runner = CliRunner::new()?;
+    let runner = CliRunner::with_debug(args.debug)?;
     runner.log_startup("run");
     let config = runner.config();
 
