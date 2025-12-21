@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2025-12-21
+
+### Fixed
+
+- **Deadlock with Cached Chunks**: Fixed system freeze when loading scenery with partially cached tiles
+  - Root cause: Unlimited assembly tasks monopolized blocking thread pool, starving disk I/O and encode stages
+  - Solution: Added concurrency limiter to assembly stage and merged with encode into shared CPU limiter
+
+### Added
+
+- **Storage-Aware Disk I/O Profiles**: Automatic detection and tuning of disk I/O concurrency based on storage type
+  - Auto-detection via `/sys/block/<device>/queue/rotational` on Linux
+  - HDD profile: Conservative concurrency (1-4 ops) for seek-bound devices
+  - SSD profile: Moderate concurrency (32-64 ops) - default fallback
+  - NVMe profile: Aggressive concurrency (128-256 ops) for high-performance drives
+  - Configurable via `cache.disk_io_profile` setting (auto/hdd/ssd/nvme)
+
+- **Shared CPU Limiter with Over-Subscription**: Improved CPU utilization during tile generation
+  - Merged assemble and encode stages into single shared limiter
+  - Formula: `max(num_cpus * 1.25, num_cpus + 2)` keeps cores busy during brief I/O waits
+  - Prevents blocking thread pool exhaustion while maximizing throughput
+
+### Changed
+
+- Disk I/O concurrency now tuned per storage type instead of fixed formula
+- Assembly and encode stages share concurrency limit instead of separate limiters
+
 ## [0.2.6] - 2025-12-19
 
 ### Added
@@ -124,7 +151,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Linux support only (Windows and macOS planned for future releases)
 - Requires FUSE3 for filesystem mounting
 
-[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/samsoir/xearthlayer/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/samsoir/xearthlayer/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/samsoir/xearthlayer/compare/v0.2.0...v0.2.5
 [0.2.0]: https://github.com/samsoir/xearthlayer/compare/v0.1.0...v0.2.0
