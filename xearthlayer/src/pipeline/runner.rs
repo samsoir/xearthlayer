@@ -126,16 +126,16 @@ where
     // Create global HTTP concurrency limiter based on config
     let http_limiter = Arc::new(HttpConcurrencyLimiter::new(config.max_global_http_requests));
 
-    // Create global concurrency limiters to prevent blocking thread pool exhaustion
-    // Both assemble and encode are CPU-bound, limit to num_cpus each
-    let assemble_limiter = Arc::new(ConcurrencyLimiter::with_cpu_defaults("assemble"));
-    let encode_limiter = Arc::new(ConcurrencyLimiter::with_cpu_defaults("encode"));
+    // Create shared CPU limiter for both assemble and encode stages
+    // Both are CPU-bound and compete for blocking thread pool, so sharing a limiter
+    // with modest over-subscription (~1.25x cores) keeps cores busy during brief
+    // I/O waits while preventing deadlock from thread pool exhaustion
+    let cpu_limiter = Arc::new(ConcurrencyLimiter::with_cpu_oversubscribe("cpu_bound"));
 
     info!(
         metrics_enabled = metrics.is_some(),
         max_http_concurrent = config.max_global_http_requests,
-        max_assemble_concurrent = assemble_limiter.max_concurrent(),
-        max_encode_concurrent = encode_limiter.max_concurrent(),
+        max_cpu_concurrent = cpu_limiter.max_concurrent(),
         "Created DDS handler with request coalescing and concurrency limiting"
     );
 
@@ -147,8 +147,7 @@ where
         let executor = Arc::clone(&executor);
         let coalescer = Arc::clone(&coalescer);
         let http_limiter = Arc::clone(&http_limiter);
-        let assemble_limiter = Arc::clone(&assemble_limiter);
-        let encode_limiter = Arc::clone(&encode_limiter);
+        let cpu_limiter = Arc::clone(&cpu_limiter);
         let metrics = metrics.clone();
         let config = config.clone();
         let job_id = request.job_id;
@@ -171,8 +170,8 @@ where
                 executor,
                 coalescer,
                 http_limiter,
-                assemble_limiter,
-                encode_limiter,
+                Arc::clone(&cpu_limiter), // Shared for assemble
+                cpu_limiter,              // Shared for encode
                 metrics,
                 config,
             )

@@ -4,6 +4,7 @@
 
 use crate::config::size::{format_size, parse_size};
 use crate::dds::DdsFormat;
+use crate::pipeline::DiskIoProfile;
 use ini::Ini;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -74,6 +75,8 @@ pub struct CacheSettings {
     pub memory_size: usize,
     /// Disk cache size in bytes
     pub disk_size: usize,
+    /// Disk I/O profile for tuning concurrency based on storage type
+    pub disk_io_profile: DiskIoProfile,
 }
 
 /// Texture configuration.
@@ -150,6 +153,7 @@ impl Default for ConfigFile {
                 directory: cache_dir,
                 memory_size: 2 * 1024 * 1024 * 1024, // 2GB
                 disk_size: 20 * 1024 * 1024 * 1024,  // 20GB
+                disk_io_profile: DiskIoProfile::Auto,
             },
             texture: TextureSettings {
                 format: DdsFormat::BC1,
@@ -278,6 +282,15 @@ impl ConfigFile {
                         key: "disk_size".to_string(),
                         value: v.to_string(),
                         reason: "expected format like '20GB', '500MB', or '1024KB'".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("disk_io_profile") {
+                config.cache.disk_io_profile =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "cache".to_string(),
+                        key: "disk_io_profile".to_string(),
+                        value: v.to_string(),
+                        reason: "must be one of: auto, hdd, ssd, nvme".to_string(),
                     })?;
             }
         }
@@ -453,6 +466,12 @@ memory_size = {}
 ; Disk cache size (default: 20GB) - persistent storage for tiles
 ; Supports: KB, MB, GB suffixes (e.g., 10GB, 20GB, 50GB)
 disk_size = {}
+; Disk I/O concurrency profile based on storage type (default: auto)
+;   auto - Auto-detect storage type (recommended)
+;   hdd  - Spinning disk (conservative: 1-4 concurrent ops)
+;   ssd  - SATA/AHCI SSD (moderate: ~32-64 concurrent ops)
+;   nvme - NVMe SSD (aggressive: ~128-256 concurrent ops)
+disk_io_profile = {}
 
 [texture]
 ; DDS compression format: bc1 (smaller, opaque) or bc3 (larger, with alpha)
@@ -501,6 +520,7 @@ file = {}
             mapbox_access_token,
             format_size(self.cache.memory_size),
             format_size(self.cache.disk_size),
+            self.cache.disk_io_profile.as_str(),
             self.texture.format.to_string().to_lowercase(),
             self.download.timeout,
             self.generation.threads,

@@ -53,6 +53,7 @@ mod job;
 mod processor;
 mod runner;
 pub mod stages;
+mod storage;
 
 pub use coalesce::{CoalescerStats, RequestCoalescer};
 pub use concurrency_limiter::{
@@ -72,3 +73,4 @@ pub use stages::{
     assembly_stage, cache_stage, download_stage, download_stage_cancellable,
     download_stage_with_limiter, encode_stage,
 };
+pub use storage::DiskIoProfile;

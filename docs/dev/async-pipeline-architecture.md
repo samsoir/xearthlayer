@@ -1,8 +1,8 @@
 # Async Pipeline Architecture
 
-**Status**: Phase 1-3 complete, Phase 3.1 complete (async HTTP + coalescing), Phase 3.2 complete (HTTP concurrency limiting), Phase 3.3 complete (cancellation support)
+**Status**: Phase 1-3 complete, Phase 3.1 complete (async HTTP + coalescing), Phase 3.2 complete (HTTP concurrency limiting), Phase 3.3 complete (cancellation support), Phase 3.4 complete (resource concurrency tuning)
 **Created**: 2025-12-07
-**Last Updated**: 2025-12-15
+**Last Updated**: 2025-12-21
 
 ## Overview
 
@@ -1952,6 +1952,164 @@ After this change, FUSE timeouts properly release all held resources:
 
 Extended testing showed no resource accumulation or freezes.
 
+### Phase 3.4: Resource Concurrency Tuning ✅ Complete
+
+This phase addressed deadlocks and performance issues discovered during X-Plane load testing with cached chunks.
+
+#### Problem: Blocking Thread Pool Exhaustion
+
+During scene loading with partially cached scenery, the system would deadlock:
+
+```
+12 assemble tasks + 6 encode tasks running
+All blocking threads occupied
+Disk I/O tasks waiting for thread pool
+Assemble/encode tasks waiting for disk I/O
+Result: Deadlock - no progress possible
+```
+
+Root cause: The assembly stage had **no concurrency limiter**, allowing unlimited `spawn_blocking` tasks to monopolize Tokio's blocking thread pool. This starved disk I/O and encode operations that were holding semaphore permits while waiting for blocking threads.
+
+#### Solution: Shared CPU Limiter with Over-Subscription
+
+1. **Merged assemble and encode into shared CPU limiter** (`pipeline/runner.rs`)
+   ```rust
+   // Before: Separate limiters
+   let assemble_limiter = Arc::new(ConcurrencyLimiter::with_cpu_defaults("assemble"));
+   let encode_limiter = Arc::new(ConcurrencyLimiter::with_cpu_defaults("encode"));
+
+   // After: Single shared limiter with modest over-subscription
+   let cpu_limiter = Arc::new(ConcurrencyLimiter::with_cpu_oversubscribe("cpu_bound"));
+   ```
+
+2. **Over-subscription formula** (`pipeline/concurrency_limiter.rs`)
+   ```rust
+   pub fn with_cpu_oversubscribe(label: impl Into<String>) -> Self {
+       let cpus = std::thread::available_parallelism()
+           .map(|p| p.get())
+           .unwrap_or(4);
+       // Modest over-subscription: 1.25x cores or cores+2, whichever is larger
+       let oversubscribed = ((cpus as f64 * 1.25).ceil() as usize).max(cpus + 2);
+       Self::new(oversubscribed, label)
+   }
+   ```
+
+**Rationale**: Both assemble and encode stages are CPU-bound and compete for the same blocking thread pool. A shared limiter with modest over-subscription (~1.25x cores) keeps cores busy during brief I/O waits while preventing deadlock from thread pool exhaustion.
+
+#### Solution: Storage-Aware Disk I/O Profiling
+
+Different storage types have vastly different optimal I/O concurrency:
+
+| Storage Type | Optimal Concurrency | Characteristic |
+|--------------|---------------------|----------------|
+| HDD | 1-4 | Seek-bound, queue depth hurts performance |
+| SSD | 32-64 | Queue depth ~32, parallelism helps |
+| NVMe | 128-256 | Multiple queues, high parallelism optimal |
+
+1. **DiskIoProfile enum** (`pipeline/storage.rs`)
+   ```rust
+   pub enum DiskIoProfile {
+       Auto,  // Auto-detect from storage device
+       Hdd,   // Conservative: scaling=1, ceiling=4
+       Ssd,   // Moderate: scaling=4, ceiling=64
+       Nvme,  // Aggressive: scaling=8, ceiling=256
+   }
+
+   impl DiskIoProfile {
+       pub fn concurrency_params(&self) -> (usize, usize) {
+           match self {
+               Self::Auto | Self::Ssd => (4, 64),
+               Self::Hdd => (1, 4),
+               Self::Nvme => (8, 256),
+           }
+       }
+   }
+   ```
+
+2. **Linux storage detection** (`pipeline/storage.rs`)
+   ```rust
+   fn detect_storage_type(path: &Path) -> Option<DiskIoProfile> {
+       // 1. Get device ID from path metadata
+       // 2. Find block device in /sys/block/
+       // 3. Check /sys/block/<device>/queue/rotational
+       //    - "1" = HDD
+       //    - "0" = SSD (check device name for NVMe)
+   }
+   ```
+
+3. **Profile-based limiter creation** (`pipeline/concurrency_limiter.rs`)
+   ```rust
+   pub fn for_disk_io_profile(profile: DiskIoProfile, label: impl Into<String>) -> Self {
+       let (scaling_factor, ceiling) = profile.concurrency_params();
+       Self::with_scaling(scaling_factor, ceiling, label)
+   }
+   ```
+
+4. **Configuration integration** (`config/file.rs`, `config/keys.rs`)
+   ```ini
+   [cache]
+   disk_io_profile = auto  ; auto, hdd, ssd, or nvme
+   ```
+
+5. **Service wiring** (`manager/mounts.rs`)
+   ```rust
+   impl ServiceBuilder {
+       pub fn with_disk_io_profile(
+           service_config: ServiceConfig,
+           provider_config: ProviderConfig,
+           logger: Arc<dyn Logger>,
+           disk_io_profile: DiskIoProfile,
+       ) -> Self {
+           // Resolve Auto profile based on cache directory
+           let resolved_profile = disk_io_profile.resolve_for_path(cache_path);
+           let disk_io_limiter = Arc::new(
+               ConcurrencyLimiter::for_disk_io_profile(resolved_profile, "global_disk_io")
+           );
+           // ...
+       }
+   }
+   ```
+
+#### Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| Shared CPU limiter vs separate | Both stages compete for same thread pool; separation causes starvation |
+| 1.25x over-subscription | Keeps cores busy during brief I/O waits without excessive context switching |
+| Auto-detection default | Most users don't know their storage type; detection works on Linux |
+| SSD as fallback | Safe middle-ground when detection fails |
+| Profile in config | Power users can override if detection is wrong |
+| Resolution at service start | Cache directory known, one-time detection cost |
+
+#### Concurrency Limits Summary
+
+| Resource | Limiter | Formula | Example (8 cores) |
+|----------|---------|---------|-------------------|
+| HTTP requests | `HttpConcurrencyLimiter` | `min(cpus * 16, 256)` | 128 |
+| CPU-bound work | `ConcurrencyLimiter` (shared) | `max(cpus * 1.25, cpus + 2)` | 10 |
+| Disk I/O (SSD) | `ConcurrencyLimiter` | `min(cpus * 4, 64)` | 32 |
+| Disk I/O (HDD) | `ConcurrencyLimiter` | `min(cpus * 1, 4)` | 4 |
+| Disk I/O (NVMe) | `ConcurrencyLimiter` | `min(cpus * 8, 256)` | 64 |
+
+#### Files Modified
+
+- `pipeline/storage.rs` - New module with `DiskIoProfile` and storage detection
+- `pipeline/concurrency_limiter.rs` - Added `with_cpu_oversubscribe()`, `for_disk_io_profile()`
+- `pipeline/runner.rs` - Uses shared `cpu_limiter` for assemble and encode
+- `pipeline/stages/assembly.rs` - Already had limiter parameter (from deadlock fix)
+- `config/file.rs` - Added `disk_io_profile` to `CacheSettings`
+- `config/keys.rs` - Added `CacheDiskIoProfile` key
+- `manager/mounts.rs` - Added `ServiceBuilder::with_disk_io_profile()`
+- `xearthlayer-cli/src/commands/run.rs` - Pass profile from config to ServiceBuilder
+
+#### Results
+
+After these changes:
+- No deadlocks during scene loading with cached chunks
+- Disk I/O concurrency automatically tuned to storage type
+- CPU utilization stays near 100% during tile generation
+- Configurable for users with non-standard setups
+
 ### Phase 4: Polish
 
 1. Add comprehensive telemetry
@@ -1997,3 +2155,4 @@ Extended testing showed no resource accumulation or freezes.
 | 2025-12-11 | Phase 3.1 complete: Refactored to async HTTP to fix thread pool exhaustion; added RequestCoalescer at pipeline level |
 | 2025-12-14 | Phase 3.2 complete: Added HTTP concurrency limiter to prevent network stack exhaustion under load |
 | 2025-12-15 | Phase 3.3 complete: Added cancellation support to fix resource leaks from orphaned tasks (issue #5) |
+| 2025-12-21 | Phase 3.4 complete: Added storage-aware disk I/O profiling and shared CPU limiter to fix deadlocks with cached chunks |

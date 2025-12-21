@@ -37,6 +37,7 @@ pub enum ConfigKey {
     CacheDirectory,
     CacheMemorySize,
     CacheDiskSize,
+    CacheDiskIoProfile,
 
     // Texture settings
     TextureFormat,
@@ -73,6 +74,7 @@ impl FromStr for ConfigKey {
             "cache.directory" => Ok(ConfigKey::CacheDirectory),
             "cache.memory_size" => Ok(ConfigKey::CacheMemorySize),
             "cache.disk_size" => Ok(ConfigKey::CacheDiskSize),
+            "cache.disk_io_profile" => Ok(ConfigKey::CacheDiskIoProfile),
 
             "texture.format" => Ok(ConfigKey::TextureFormat),
 
@@ -105,6 +107,7 @@ impl ConfigKey {
             ConfigKey::CacheDirectory => "cache.directory",
             ConfigKey::CacheMemorySize => "cache.memory_size",
             ConfigKey::CacheDiskSize => "cache.disk_size",
+            ConfigKey::CacheDiskIoProfile => "cache.disk_io_profile",
             ConfigKey::TextureFormat => "texture.format",
             ConfigKey::DownloadTimeout => "download.timeout",
             ConfigKey::GenerationThreads => "generation.threads",
@@ -139,6 +142,7 @@ impl ConfigKey {
             ConfigKey::CacheDirectory => path_to_display(&config.cache.directory),
             ConfigKey::CacheMemorySize => format_size(config.cache.memory_size),
             ConfigKey::CacheDiskSize => format_size(config.cache.disk_size),
+            ConfigKey::CacheDiskIoProfile => config.cache.disk_io_profile.as_str().to_string(),
             ConfigKey::TextureFormat => config.texture.format.to_string().to_lowercase(),
             ConfigKey::DownloadTimeout => config.download.timeout.to_string(),
             ConfigKey::GenerationThreads => config.generation.threads.to_string(),
@@ -205,6 +209,9 @@ impl ConfigKey {
             ConfigKey::CacheDiskSize => {
                 config.cache.disk_size = parse_size(value).unwrap();
             }
+            ConfigKey::CacheDiskIoProfile => {
+                config.cache.disk_io_profile = value.parse().unwrap();
+            }
             ConfigKey::TextureFormat => {
                 config.texture.format = match value.to_lowercase().as_str() {
                     "bc1" => DdsFormat::BC1,
@@ -267,6 +274,9 @@ impl ConfigKey {
             ConfigKey::CacheDirectory => Box::new(PathSpec),
             ConfigKey::CacheMemorySize => Box::new(SizeSpec),
             ConfigKey::CacheDiskSize => Box::new(SizeSpec),
+            ConfigKey::CacheDiskIoProfile => {
+                Box::new(OneOfSpec::new(&["auto", "hdd", "ssd", "nvme"]))
+            }
             ConfigKey::TextureFormat => Box::new(OneOfSpec::new(&["bc1", "bc3"])),
             ConfigKey::DownloadTimeout => Box::new(PositiveIntegerSpec),
             ConfigKey::GenerationThreads => Box::new(PositiveIntegerSpec),
@@ -289,6 +299,7 @@ impl ConfigKey {
             ConfigKey::CacheDirectory,
             ConfigKey::CacheMemorySize,
             ConfigKey::CacheDiskSize,
+            ConfigKey::CacheDiskIoProfile,
             ConfigKey::TextureFormat,
             ConfigKey::DownloadTimeout,
             ConfigKey::GenerationThreads,

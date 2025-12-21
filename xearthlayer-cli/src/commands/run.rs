@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use xearthlayer::config::{format_size, ConfigFile, DownloadConfig, TextureConfig};
 use xearthlayer::log::TracingLogger;
-use xearthlayer::manager::{LocalPackageStore, MountManager};
+use xearthlayer::manager::{LocalPackageStore, MountManager, ServiceBuilder};
 use xearthlayer::package::PackageType;
 use xearthlayer::service::ServiceConfig;
 
@@ -158,16 +158,19 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     // Create a logger for all services
     let logger: Arc<dyn xearthlayer::log::Logger> = Arc::new(TracingLogger);
 
+    // Create service builder with shared disk I/O limiter and configured profile
+    // This ensures all packages share a single limiter tuned for the storage type
+    let service_builder = ServiceBuilder::with_disk_io_profile(
+        service_config.clone(),
+        provider_config.clone(),
+        logger.clone(),
+        config.cache.disk_io_profile,
+    );
+
     // Mount all packages
     println!("Mounting packages to Custom Scenery...");
     let results = mount_manager
-        .mount_all(&store, |_pkg| {
-            xearthlayer::service::XEarthLayerService::new(
-                service_config.clone(),
-                provider_config.clone(),
-                logger.clone(),
-            )
-        })
+        .mount_all(&store, |pkg| service_builder.build(pkg))
         .map_err(|e| CliError::Packages(e.to_string()))?;
 
     // Report results

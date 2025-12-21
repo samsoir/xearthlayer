@@ -97,14 +97,29 @@ Controls tile caching behavior.
 | `directory` | path | `~/.cache/xearthlayer` | Directory for storing cached tiles. Supports `~` expansion. |
 | `memory_size` | size | `2GB` | Maximum RAM for in-memory cache. Supports KB, MB, GB suffixes. |
 | `disk_size` | size | `20GB` | Maximum disk space for persistent cache. Supports KB, MB, GB suffixes. |
+| `disk_io_profile` | string | `auto` | Disk I/O concurrency profile based on storage type (see below) |
+
+**Disk I/O Profile:**
+
+The `disk_io_profile` setting tunes disk I/O concurrency based on your storage type. Different storage devices have vastly different optimal concurrency levels:
+
+| Profile | Description | Concurrent Ops | Best For |
+|---------|-------------|----------------|----------|
+| `auto` | Auto-detect storage type (recommended) | Varies | Most users |
+| `hdd` | Spinning disk, seek-bound | 1-4 | Traditional hard drives |
+| `ssd` | SATA/AHCI SSD | 32-64 | Most SSDs |
+| `nvme` | NVMe SSD, multiple queues | 128-256 | NVMe drives |
+
+**Auto-detection (Linux):** When set to `auto`, XEarthLayer detects the storage type by checking `/sys/block/<device>/queue/rotational`. If detection fails, it defaults to the `ssd` profile as a safe middle-ground.
 
 **Example:**
 ```ini
 [cache]
-; Use custom cache location
-directory = /mnt/ssd/xearthlayer-cache
+; Use custom cache location on NVMe drive
+directory = /mnt/nvme/xearthlayer-cache
 memory_size = 4GB
 disk_size = 100GB
+disk_io_profile = nvme
 ```
 
 **Cache Structure:**
@@ -242,6 +257,7 @@ type = bing
 ; directory = /custom/cache/path
 memory_size = 4GB
 disk_size = 50GB
+; disk_io_profile = auto  ; auto-detect storage type (default)
 
 [texture]
 format = bc1
@@ -323,6 +339,7 @@ Values are validated before being saved. Invalid values will produce an error me
 | `cache.directory` | path | Cache directory |
 | `cache.memory_size` | size (e.g., `2GB`) | Memory cache size |
 | `cache.disk_size` | size (e.g., `20GB`) | Disk cache size |
+| `cache.disk_io_profile` | `auto`, `hdd`, `ssd`, `nvme` | Disk I/O concurrency profile |
 | `texture.format` | `bc1`, `bc3` | DDS compression format |
 | `download.timeout` | positive integer | Chunk download timeout (seconds) |
 | `generation.threads` | positive integer | Worker threads |
