@@ -4,10 +4,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
 use xearthlayer::config::{format_size, ConfigFile, DownloadConfig, TextureConfig};
 use xearthlayer::log::TracingLogger;
 use xearthlayer::manager::{LocalPackageStore, MountManager, ServiceBuilder};
 use xearthlayer::package::PackageType;
+use xearthlayer::prefetch::{
+    PrefetchScheduler, SchedulerConfig, SharedPrefetchStatus, TelemetryListener, TilePredictor,
+};
 use xearthlayer::service::ServiceConfig;
 
 use super::common::{resolve_dds_format, resolve_provider, DdsCompression, ProviderType};
@@ -25,6 +31,7 @@ pub struct RunArgs {
     pub parallel: Option<usize>,
     pub no_cache: bool,
     pub debug: bool,
+    pub no_prefetch: bool,
 }
 
 /// Run the run command.
@@ -150,6 +157,20 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     } else {
         println!("Cache: Disabled");
     }
+
+    // Print prefetch status
+    let prefetch_enabled = config.prefetch.enabled && !args.no_prefetch;
+    if prefetch_enabled {
+        println!(
+            "Prefetch: Enabled (UDP port {}, {}° cone, {}nm distance, {}nm radial)",
+            config.prefetch.udp_port,
+            config.prefetch.cone_angle,
+            config.prefetch.cone_distance_nm,
+            config.prefetch.radial_radius_nm
+        );
+    } else {
+        println!("Prefetch: Disabled");
+    }
     println!();
 
     // Create mount manager with the custom scenery path as target
@@ -215,6 +236,68 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     );
     println!();
 
+    // Start prefetch system if enabled
+    let prefetch_cancellation = CancellationToken::new();
+    let shared_prefetch_status = SharedPrefetchStatus::new();
+    if prefetch_enabled {
+        if let Some(service) = mount_manager.get_service() {
+            let dds_handler = service.create_prefetch_handler();
+            let cache = Arc::clone(service.cache());
+            let dds_format = service.dds_format();
+            let runtime_handle = service.runtime_handle().clone();
+            let provider_name = service.provider_name().to_string();
+
+            let predictor = TilePredictor::new(
+                config.prefetch.cone_angle,
+                config.prefetch.cone_distance_nm,
+                config.prefetch.radial_radius_nm,
+            );
+
+            let scheduler_config = SchedulerConfig {
+                zoom: 14, // Standard ortho zoom level (tile zoom, not chunk zoom)
+                provider: provider_name,
+                dds_format,
+                batch_size: config.prefetch.batch_size,
+                max_in_flight: config.prefetch.max_in_flight,
+            };
+
+            // Create channels for telemetry data
+            let (state_tx, state_rx) = mpsc::channel(32);
+
+            // Start the telemetry listener
+            let listener = TelemetryListener::new(config.prefetch.udp_port);
+            let listener_cancel = prefetch_cancellation.clone();
+            runtime_handle.spawn(async move {
+                tokio::select! {
+                    result = listener.run(state_tx) => {
+                        if let Err(e) = result {
+                            tracing::warn!("Telemetry listener error: {}", e);
+                        }
+                    }
+                    _ = listener_cancel.cancelled() => {
+                        tracing::debug!("Telemetry listener cancelled");
+                    }
+                }
+            });
+
+            // Start the prefetch scheduler with shared status for TUI display
+            let scheduler = PrefetchScheduler::new(predictor, dds_handler, cache, scheduler_config)
+                .with_shared_status(Arc::clone(&shared_prefetch_status));
+            let scheduler_cancel = prefetch_cancellation.clone();
+            runtime_handle.spawn(async move {
+                scheduler.run(state_rx, scheduler_cancel).await;
+            });
+
+            println!(
+                "Prefetch system started (listening on UDP port {})",
+                config.prefetch.udp_port
+            );
+        } else {
+            println!("Warning: No services available for prefetch");
+        }
+    }
+    println!();
+
     // Set up signal handler for graceful shutdown
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
@@ -226,10 +309,20 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
 
     if use_tui {
         // Run with TUI dashboard
-        run_with_dashboard(&mut mount_manager, shutdown, config)?;
+        run_with_dashboard(
+            &mut mount_manager,
+            shutdown,
+            config,
+            Arc::clone(&shared_prefetch_status),
+        )?;
     } else {
         // Fallback to simple text output for non-TTY
         run_with_simple_output(&mut mount_manager, shutdown)?;
+    }
+
+    // Cancel prefetch system
+    if prefetch_enabled {
+        prefetch_cancellation.cancel();
     }
 
     // Get final telemetry before unmounting
@@ -254,6 +347,7 @@ fn run_with_dashboard(
     mount_manager: &mut MountManager,
     shutdown: Arc<AtomicBool>,
     config: &ConfigFile,
+    prefetch_status: Arc<SharedPrefetchStatus>,
 ) -> Result<(), CliError> {
     use ui::{Dashboard, DashboardConfig, DashboardEvent};
 
@@ -263,7 +357,8 @@ fn run_with_dashboard(
     };
 
     let mut dashboard = Dashboard::new(dashboard_config, shutdown.clone())
-        .map_err(|e| CliError::Config(format!("Failed to create dashboard: {}", e)))?;
+        .map_err(|e| CliError::Config(format!("Failed to create dashboard: {}", e)))?
+        .with_prefetch_status(prefetch_status);
 
     // Main event loop
     let tick_rate = std::time::Duration::from_millis(100);

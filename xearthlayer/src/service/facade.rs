@@ -303,6 +303,20 @@ impl XEarthLayerService {
         &self.metrics
     }
 
+    /// Get the DDS format used by this service.
+    pub fn dds_format(&self) -> crate::dds::DdsFormat {
+        self.config.texture().format()
+    }
+
+    /// Create a DDS handler for prefetch operations.
+    ///
+    /// This returns a handler that can be used by the prefetch scheduler
+    /// to submit background tile requests. The handler uses the same
+    /// pipeline as FUSE requests, enabling automatic request coalescing.
+    pub fn create_prefetch_handler(&self) -> DdsHandler {
+        self.create_dds_handler()
+    }
+
     /// Set the shared disk I/O concurrency limiter.
     ///
     /// When multiple packages are mounted, sharing a single limiter across

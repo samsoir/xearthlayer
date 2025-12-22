@@ -45,6 +45,8 @@ dirs = "5"
 ratatui = "0.29"
 crossterm = "0.28"
 atty = "0.2"
+tokio = { version = "1", features = ["sync", "macros"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

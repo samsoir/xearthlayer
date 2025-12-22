@@ -137,6 +137,7 @@ impl AsyncPassthroughFS {
             tile,
             result_tx: tx,
             cancellation_token: cancellation_token.clone(),
+            is_prefetch: false,
         };
 
         // Submit request to the handler

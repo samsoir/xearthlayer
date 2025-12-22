@@ -292,12 +292,46 @@ async fn process_dds_request_coalesced<P, E, M, D, X>(
 {
     let tile = request.tile;
     let job_id = request.job_id;
+    let is_prefetch = request.is_prefetch;
     let cancellation_token = request.cancellation_token.clone();
 
     // Check for early cancellation before doing any work
     if cancellation_token.is_cancelled() {
         debug!(job_id = %job_id, tile = ?tile, "Request already cancelled before processing");
         return;
+    }
+
+    // For prefetch requests, check if the system has available capacity.
+    // If resources are busy, skip this prefetch to avoid blocking on-demand requests.
+    // Prefetch uses non-blocking resource acquisition: if we can't get permits
+    // immediately, we defer the work to avoid starving on-demand FUSE requests.
+    if is_prefetch {
+        // Try to acquire all required resources non-blocking
+        // If any are unavailable, skip this prefetch
+        if http_limiter.try_acquire().is_none() {
+            debug!(
+                job_id = %job_id,
+                tile = ?tile,
+                "Prefetch skipped - HTTP limiter at capacity"
+            );
+            return;
+        }
+        if encode_limiter.try_acquire().is_none() {
+            debug!(
+                job_id = %job_id,
+                tile = ?tile,
+                "Prefetch skipped - encoder at capacity"
+            );
+            return;
+        }
+        // We don't hold these permits - we're just checking availability.
+        // The actual pipeline will acquire them properly.
+        // This is a quick "should we even try" check.
+        debug!(
+            job_id = %job_id,
+            tile = ?tile,
+            "Prefetch proceeding - resources available"
+        );
     }
 
     // Record job submission (request arrived, now waiting for processing)
@@ -628,6 +662,7 @@ mod tests {
             },
             result_tx: tx,
             cancellation_token: CancellationToken::new(),
+            is_prefetch: false,
         };
 
         // Call the handler
@@ -665,6 +700,7 @@ mod tests {
             },
             result_tx: tx,
             cancellation_token: CancellationToken::new(),
+            is_prefetch: false,
         };
 
         process_dds_request(
@@ -707,6 +743,7 @@ mod tests {
             },
             result_tx: tx,
             cancellation_token: CancellationToken::new(),
+            is_prefetch: false,
         };
 
         process_dds_request(
@@ -797,6 +834,7 @@ mod tests {
                 tile,
                 result_tx: tx,
                 cancellation_token: CancellationToken::new(),
+                is_prefetch: false,
             };
 
             handler(request);
