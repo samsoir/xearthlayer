@@ -22,6 +22,10 @@ pub struct DdsRequest {
     /// Cancellation token for aborting the request when FUSE times out.
     /// When cancelled, the pipeline should stop processing and release resources.
     pub cancellation_token: CancellationToken,
+    /// Whether this is a prefetch request (background caching).
+    /// Prefetch requests use non-blocking resource acquisition and are
+    /// lower priority than on-demand FUSE requests.
+    pub is_prefetch: bool,
 }
 
 /// Response from the async pipeline.
@@ -106,11 +110,35 @@ mod tests {
             tile,
             result_tx: tx,
             cancellation_token,
+            is_prefetch: false,
         };
 
         assert_eq!(request.tile.row, 100);
         assert_eq!(request.tile.col, 200);
         assert_eq!(request.tile.zoom, 16);
+        assert!(!request.is_prefetch);
+    }
+
+    #[test]
+    fn test_dds_request_prefetch() {
+        let job_id = JobId::new();
+        let tile = TileCoord {
+            row: 100,
+            col: 200,
+            zoom: 16,
+        };
+        let (tx, _rx) = oneshot::channel();
+        let cancellation_token = CancellationToken::new();
+
+        let request = DdsRequest {
+            job_id,
+            tile,
+            result_tx: tx,
+            cancellation_token,
+            is_prefetch: true,
+        };
+
+        assert!(request.is_prefetch);
     }
 
     #[test]

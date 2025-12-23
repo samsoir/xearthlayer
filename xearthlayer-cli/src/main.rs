@@ -145,6 +145,10 @@ enum Commands {
         /// Enable debug-level logging for troubleshooting
         #[arg(long)]
         debug: bool,
+
+        /// Disable predictive tile prefetching
+        #[arg(long)]
+        no_prefetch: bool,
     },
 
     /// Download a single tile to a file (for testing)
@@ -246,6 +250,7 @@ fn main() {
             parallel,
             no_cache,
             debug,
+            no_prefetch,
         } => commands::run::run(commands::run::RunArgs {
             provider,
             google_api_key,
@@ -255,6 +260,7 @@ fn main() {
             parallel,
             no_cache,
             debug,
+            no_prefetch,
         }),
     };
 

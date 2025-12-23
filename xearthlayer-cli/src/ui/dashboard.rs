@@ -21,6 +21,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame, Terminal,
 };
+use xearthlayer::prefetch::{PrefetchStatusSnapshot, SharedPrefetchStatus};
 use xearthlayer::telemetry::TelemetrySnapshot;
 
 use super::widgets::{
@@ -59,6 +60,8 @@ pub struct Dashboard {
     shutdown: Arc<AtomicBool>,
     start_time: Instant,
     last_draw: Instant,
+    /// Optional prefetch status for display.
+    prefetch_status: Option<Arc<SharedPrefetchStatus>>,
 }
 
 impl Dashboard {
@@ -78,7 +81,14 @@ impl Dashboard {
             shutdown,
             start_time: now,
             last_draw: now,
+            prefetch_status: None,
         })
+    }
+
+    /// Set the prefetch status source for display.
+    pub fn with_prefetch_status(mut self, status: Arc<SharedPrefetchStatus>) -> Self {
+        self.prefetch_status = Some(status);
+        self
     }
 
     /// Restore terminal to normal state.
@@ -109,6 +119,13 @@ impl Dashboard {
             disk_max_bytes: self.config.disk_cache_max,
         };
 
+        // Get prefetch status if available
+        let prefetch_snapshot = self
+            .prefetch_status
+            .as_ref()
+            .map(|s| s.snapshot())
+            .unwrap_or_default();
+
         self.terminal.draw(|frame| {
             Self::render_ui(
                 frame,
@@ -116,6 +133,7 @@ impl Dashboard {
                 &self.network_history,
                 uptime,
                 &cache_config,
+                &prefetch_snapshot,
             );
         })?;
 
@@ -156,19 +174,21 @@ impl Dashboard {
         network_history: &NetworkHistory,
         uptime: Duration,
         cache_config: &CacheConfig,
+        prefetch_snapshot: &PrefetchStatusSnapshot,
     ) {
         let size = frame.area();
 
-        // Main layout: header, pipeline, network, cache, errors
+        // Main layout: header, prefetch, pipeline, network, cache, errors
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(0)
             .constraints([
                 Constraint::Length(3), // Header
+                Constraint::Length(4), // Prefetch / Aircraft
                 Constraint::Length(6), // Pipeline
-                Constraint::Length(3), // Network (increased from 2)
+                Constraint::Length(3), // Network
                 Constraint::Length(6), // Cache
-                Constraint::Length(3), // Errors (increased from 2)
+                Constraint::Length(3), // Errors
                 Constraint::Min(0),    // Padding
             ])
             .split(size);
@@ -176,28 +196,31 @@ impl Dashboard {
         // Header
         Self::render_header(frame, chunks[0], uptime);
 
+        // Prefetch/Aircraft widget
+        Self::render_prefetch(frame, chunks[1], prefetch_snapshot);
+
         // Pipeline widget
         let pipeline_block = Block::default()
             .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
             .border_style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(pipeline_block, chunks[1]);
-        let pipeline_inner = Self::inner_rect(chunks[1], 1, 1);
+        frame.render_widget(pipeline_block, chunks[2]);
+        let pipeline_inner = Self::inner_rect(chunks[2], 1, 1);
         frame.render_widget(PipelineWidget::new(snapshot), pipeline_inner);
 
         // Network widget
         let network_block = Block::default()
             .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
             .border_style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(network_block, chunks[2]);
-        let network_inner = Self::inner_rect(chunks[2], 1, 1);
+        frame.render_widget(network_block, chunks[3]);
+        let network_inner = Self::inner_rect(chunks[3], 1, 1);
         frame.render_widget(NetworkWidget::new(snapshot, network_history), network_inner);
 
         // Cache widget
         let cache_block = Block::default()
             .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
             .border_style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(cache_block, chunks[3]);
-        let cache_inner = Self::inner_rect(chunks[3], 1, 1);
+        frame.render_widget(cache_block, chunks[4]);
+        let cache_inner = Self::inner_rect(chunks[4], 1, 1);
         frame.render_widget(
             CacheWidget::new(snapshot).with_config(cache_config.clone()),
             cache_inner,
@@ -207,9 +230,48 @@ impl Dashboard {
         let errors_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(errors_block, chunks[4]);
-        let errors_inner = Self::inner_rect(chunks[4], 1, 1);
+        frame.render_widget(errors_block, chunks[5]);
+        let errors_inner = Self::inner_rect(chunks[5], 1, 1);
         frame.render_widget(ErrorsWidget::new(snapshot), errors_inner);
+    }
+
+    /// Render the prefetch/aircraft status section.
+    fn render_prefetch(frame: &mut Frame, area: Rect, prefetch: &PrefetchStatusSnapshot) {
+        let prefetch_block = Block::default()
+            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                " Aircraft / Prefetch ",
+                Style::default().fg(Color::Magenta),
+            ));
+
+        frame.render_widget(prefetch_block, area);
+        let inner = Self::inner_rect(area, 1, 1);
+
+        // Create lines for aircraft and prefetch status
+        let aircraft_line = if prefetch.aircraft.is_some() {
+            Line::from(vec![
+                Span::styled("Aircraft: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(prefetch.aircraft_line(), Style::default().fg(Color::Green)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("Aircraft: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "Waiting for X-Plane telemetry...",
+                    Style::default().fg(Color::Yellow),
+                ),
+            ])
+        };
+
+        let prefetch_line = Line::from(vec![
+            Span::styled("Prefetch: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(prefetch.stats_line(), Style::default().fg(Color::Cyan)),
+        ]);
+
+        let text = vec![aircraft_line, prefetch_line];
+        let paragraph = Paragraph::new(text);
+        frame.render_widget(paragraph, inner);
     }
 
     fn render_header(frame: &mut Frame, area: Rect, uptime: Duration) {

@@ -4,10 +4,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
 use xearthlayer::config::{format_size, ConfigFile, DownloadConfig, TextureConfig};
 use xearthlayer::log::TracingLogger;
 use xearthlayer::manager::{LocalPackageStore, MountManager, ServiceBuilder};
 use xearthlayer::package::PackageType;
+use xearthlayer::prefetch::{
+    Prefetcher, RadialPrefetchConfig, RadialPrefetcher, SharedPrefetchStatus, TelemetryListener,
+};
 use xearthlayer::service::ServiceConfig;
 
 use super::common::{resolve_dds_format, resolve_provider, DdsCompression, ProviderType};
@@ -25,6 +31,7 @@ pub struct RunArgs {
     pub parallel: Option<usize>,
     pub no_cache: bool,
     pub debug: bool,
+    pub no_prefetch: bool,
 }
 
 /// Run the run command.
@@ -150,6 +157,12 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     } else {
         println!("Cache: Disabled");
     }
+
+    // Print prefetch status (details printed later after prefetcher starts)
+    let prefetch_enabled = config.prefetch.enabled && !args.no_prefetch;
+    if !prefetch_enabled {
+        println!("Prefetch: Disabled");
+    }
     println!();
 
     // Create mount manager with the custom scenery path as target
@@ -215,6 +228,77 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     );
     println!();
 
+    // Start prefetch system if enabled
+    let prefetch_cancellation = CancellationToken::new();
+    let shared_prefetch_status = SharedPrefetchStatus::new();
+    let mut prefetch_started = false;
+
+    if prefetch_enabled {
+        if let Some(service) = mount_manager.get_service() {
+            // Get shared memory cache adapter for cache-aware prefetching
+            // This is the same adapter instance used by the pipeline
+            if let Some(memory_cache) = service.memory_cache_adapter() {
+                let dds_handler = service.create_prefetch_handler();
+                let runtime_handle = service.runtime_handle().clone();
+
+                // Configure radial prefetcher
+                // Uses configurable tile radius around current position
+                let prefetch_config = RadialPrefetchConfig {
+                    radius: config.prefetch.radial_radius, // Configured tile radius
+                    zoom: 14,                              // Standard ortho zoom level
+                    attempt_ttl: std::time::Duration::from_secs(60), // Don't retry for 60s
+                };
+
+                // Create channels for telemetry data
+                let (state_tx, state_rx) = mpsc::channel(32);
+
+                // Start the telemetry listener
+                let listener = TelemetryListener::new(config.prefetch.udp_port);
+                let listener_cancel = prefetch_cancellation.clone();
+                runtime_handle.spawn(async move {
+                    tokio::select! {
+                        result = listener.run(state_tx) => {
+                            if let Err(e) = result {
+                                tracing::warn!("Telemetry listener error: {}", e);
+                            }
+                        }
+                        _ = listener_cancel.cancelled() => {
+                            tracing::debug!("Telemetry listener cancelled");
+                        }
+                    }
+                });
+
+                // Create prefetcher strategy (currently using RadialPrefetcher)
+                // The prefetcher checks memory cache before submitting requests,
+                // only fetching tiles that aren't already cached
+                let prefetcher: Box<dyn Prefetcher> = Box::new(
+                    RadialPrefetcher::new(memory_cache, dds_handler, prefetch_config)
+                        .with_shared_status(Arc::clone(&shared_prefetch_status)),
+                );
+
+                // Get startup info before prefetcher is consumed
+                let startup_info = prefetcher.startup_info();
+
+                // Start the prefetcher
+                let prefetcher_cancel = prefetch_cancellation.clone();
+                runtime_handle.spawn(async move {
+                    prefetcher.run(state_rx, prefetcher_cancel).await;
+                });
+
+                println!(
+                    "Prefetch system started ({}, UDP port {})",
+                    startup_info, config.prefetch.udp_port
+                );
+                prefetch_started = true;
+            } else {
+                println!("Warning: Memory cache not available, prefetch disabled");
+            }
+        } else {
+            println!("Warning: No services available for prefetch");
+        }
+    }
+    println!();
+
     // Set up signal handler for graceful shutdown
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
@@ -226,10 +310,20 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
 
     if use_tui {
         // Run with TUI dashboard
-        run_with_dashboard(&mut mount_manager, shutdown, config)?;
+        run_with_dashboard(
+            &mut mount_manager,
+            shutdown,
+            config,
+            Arc::clone(&shared_prefetch_status),
+        )?;
     } else {
         // Fallback to simple text output for non-TTY
         run_with_simple_output(&mut mount_manager, shutdown)?;
+    }
+
+    // Cancel prefetch system
+    if prefetch_started {
+        prefetch_cancellation.cancel();
     }
 
     // Get final telemetry before unmounting
@@ -254,6 +348,7 @@ fn run_with_dashboard(
     mount_manager: &mut MountManager,
     shutdown: Arc<AtomicBool>,
     config: &ConfigFile,
+    prefetch_status: Arc<SharedPrefetchStatus>,
 ) -> Result<(), CliError> {
     use ui::{Dashboard, DashboardConfig, DashboardEvent};
 
@@ -263,7 +358,8 @@ fn run_with_dashboard(
     };
 
     let mut dashboard = Dashboard::new(dashboard_config, shutdown.clone())
-        .map_err(|e| CliError::Config(format!("Failed to create dashboard: {}", e)))?;
+        .map_err(|e| CliError::Config(format!("Failed to create dashboard: {}", e)))?
+        .with_prefetch_status(prefetch_status);
 
     // Main event loop
     let tick_rate = std::time::Duration::from_millis(100);

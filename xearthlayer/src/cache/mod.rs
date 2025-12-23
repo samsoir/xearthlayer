@@ -1,24 +1,19 @@
-//! Two-tier cache system for DDS tiles.
+//! Cache system for the async pipeline.
 //!
-//! Provides memory and disk caching with LRU eviction, statistics tracking,
-//! and provider-specific hierarchical storage.
+//! The async pipeline uses:
+//! - `MemoryCache` for DDS tiles (LRU eviction, thread-safe)
+//! - `ParallelDiskCache` (in `pipeline/disk_cache.rs`) for chunks
+//!
+//! This module provides the memory cache and supporting types.
 
-mod daemon;
-mod disk;
 mod memory;
 mod path;
 mod stats;
-mod system;
-mod r#trait;
 mod types;
 
-pub use daemon::DiskCacheDaemon;
-pub use disk::DiskCache;
 pub use memory::MemoryCache;
-pub use r#trait::{Cache, NoOpCache};
 pub use stats::{CacheStatistics, CacheStats};
-pub use system::CacheSystem;
-pub use types::{CacheConfig, CacheError, CacheKey, DiskCacheConfig, MemoryCacheConfig};
+pub use types::{CacheError, CacheKey, DiskCacheConfig, MemoryCacheConfig};
 
 // Re-export path utilities for convenience
 pub use path::{

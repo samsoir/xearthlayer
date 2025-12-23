@@ -53,6 +53,8 @@ pub struct ConfigFile {
     pub packages: PackagesSettings,
     /// Logging settings
     pub logging: LoggingSettings,
+    /// Prefetch settings for predictive tile caching
+    pub prefetch: PrefetchSettings,
 }
 
 /// Provider configuration.
@@ -136,6 +138,27 @@ pub struct LoggingSettings {
     pub file: PathBuf,
 }
 
+/// Prefetch configuration for predictive tile caching.
+#[derive(Debug, Clone)]
+pub struct PrefetchSettings {
+    /// Enable predictive tile prefetching based on X-Plane telemetry
+    pub enabled: bool,
+    /// UDP port for X-Plane telemetry (default: 49002 for ForeFlight protocol)
+    pub udp_port: u16,
+    /// Prediction cone half-angle in degrees (default: 45)
+    pub cone_angle: f32,
+    /// Cone distance ahead in nautical miles (default: 100)
+    pub cone_distance_nm: f32,
+    /// Radial buffer radius in nautical miles (default: 60)
+    pub radial_radius_nm: f32,
+    /// Maximum prefetch requests per prediction cycle (default: 500)
+    pub batch_size: usize,
+    /// Maximum concurrent in-flight prefetch requests (default: 2000)
+    pub max_in_flight: usize,
+    /// Radial prefetcher tile radius (default: 3, giving a 7×7 = 49 tile grid)
+    pub radial_radius: u8,
+}
+
 impl Default for ConfigFile {
     fn default() -> Self {
         let config_dir = config_directory();
@@ -173,6 +196,16 @@ impl Default for ConfigFile {
             },
             logging: LoggingSettings {
                 file: config_dir.join("xearthlayer.log"),
+            },
+            prefetch: PrefetchSettings {
+                enabled: true,
+                udp_port: 49002, // ForeFlight protocol port
+                cone_angle: 45.0,
+                cone_distance_nm: 100.0,
+                radial_radius_nm: 60.0,
+                batch_size: 500,
+                max_in_flight: 2000,
+                radial_radius: 3, // 7×7 = 49 tile grid
             },
         }
     }
@@ -400,6 +433,77 @@ impl ConfigFile {
             }
         }
 
+        // [prefetch] section
+        if let Some(section) = ini.section(Some("prefetch")) {
+            if let Some(v) = section.get("enabled") {
+                let v = v.trim().to_lowercase();
+                config.prefetch.enabled = v == "true" || v == "1" || v == "yes" || v == "on";
+            }
+            if let Some(v) = section.get("udp_port") {
+                config.prefetch.udp_port =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "udp_port".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a valid port number (1-65535)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("cone_angle") {
+                config.prefetch.cone_angle =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "cone_angle".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive number (degrees)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("cone_distance_nm") {
+                config.prefetch.cone_distance_nm =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "cone_distance_nm".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive number (nautical miles)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("radial_radius_nm") {
+                config.prefetch.radial_radius_nm =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "radial_radius_nm".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive number (nautical miles)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("batch_size") {
+                config.prefetch.batch_size =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "batch_size".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("max_in_flight") {
+                config.prefetch.max_in_flight =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "max_in_flight".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("radial_radius") {
+                config.prefetch.radial_radius =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "radial_radius".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (1-20)".to_string(),
+                    })?;
+            }
+        }
+
         Ok(config)
     }
 
@@ -514,6 +618,29 @@ temp_dir = {}
 [logging]
 ; Log file path (default: ~/.xearthlayer/xearthlayer.log)
 file = {}
+
+[prefetch]
+; Enable predictive tile prefetching based on X-Plane telemetry (default: true)
+; Requires X-Plane to send ForeFlight data: Settings > Network > Send to ForeFlight
+enabled = {}
+; UDP port for telemetry (default: 49002 for ForeFlight protocol)
+udp_port = {}
+; Prediction cone half-angle in degrees (default: 45)
+; Wider angles prefetch more tiles but use more bandwidth
+cone_angle = {}
+; Cone distance ahead in nautical miles (default: 100)
+; How far ahead to prefetch tiles along flight path
+cone_distance_nm = {}
+; Radial buffer radius in nautical miles (default: 60)
+; Catches lateral movements and unexpected direction changes
+radial_radius_nm = {}
+; Maximum tiles to submit per prediction cycle (default: 500)
+batch_size = {}
+; Maximum concurrent prefetch requests (default: 2000)
+max_in_flight = {}
+; Radial prefetcher tile radius (default: 3, giving 7x7 = 49 tiles)
+; Higher values prefetch more tiles around aircraft position
+radial_radius = {}
 "#,
             self.provider.provider_type,
             google_api_key,
@@ -532,6 +659,14 @@ file = {}
             auto_install_overlays,
             temp_dir,
             path_to_string(&self.logging.file),
+            self.prefetch.enabled,
+            self.prefetch.udp_port,
+            self.prefetch.cone_angle,
+            self.prefetch.cone_distance_nm,
+            self.prefetch.radial_radius_nm,
+            self.prefetch.batch_size,
+            self.prefetch.max_in_flight,
+            self.prefetch.radial_radius,
         )
     }
 

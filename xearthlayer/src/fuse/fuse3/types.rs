@@ -124,13 +124,20 @@ impl SpawnedMountHandle {
     ///
     /// This is a fallback for when we can't use async unmount.
     pub fn unmount_sync(&mut self) {
+        let mountpoint_str = self.mountpoint.to_string_lossy();
+
         // Signal the task to stop (if channel still exists)
         if let Some(tx) = self.unmount_tx.take() {
+            debug!(mountpoint = %mountpoint_str, "Sending unmount signal");
             let _ = tx.send(());
         }
 
-        // Check if mount is still active before trying fusermount
-        let mountpoint_str = self.mountpoint.to_string_lossy();
+        // Give the task a moment to process the unmount signal
+        // This helps avoid race conditions where we check is_mounted
+        // before the task has had a chance to unmount
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Check if mount is still active after giving the task time to unmount
         if !Self::is_mounted(&self.mountpoint) {
             debug!(mountpoint = %mountpoint_str, "Already unmounted, skipping fusermount");
             // Still cancel the task if it exists
@@ -140,7 +147,7 @@ impl SpawnedMountHandle {
             return;
         }
 
-        debug!(mountpoint = %mountpoint_str, "Unmounting via fusermount");
+        debug!(mountpoint = %mountpoint_str, "Still mounted, unmounting via fusermount");
 
         // Try fusermount3 first (fuse3), then fall back to fusermount (fuse2)
         let result = Command::new("fusermount3")
@@ -154,7 +161,9 @@ impl SpawnedMountHandle {
 
         match result {
             Ok(output) => {
-                if !output.status.success() {
+                if output.status.success() {
+                    debug!(mountpoint = %mountpoint_str, "fusermount succeeded");
+                } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     // Don't warn for expected "not found" or "not mounted" errors
                     if !stderr.contains("not found") && !stderr.contains("not mounted") {

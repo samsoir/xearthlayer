@@ -96,61 +96,6 @@ impl Default for DiskCacheConfig {
     }
 }
 
-/// Complete cache system configuration.
-#[derive(Debug, Clone)]
-pub struct CacheConfig {
-    /// Memory cache configuration
-    pub memory: MemoryCacheConfig,
-    /// Disk cache configuration
-    pub disk: DiskCacheConfig,
-    /// Active provider name
-    pub provider: String,
-    /// Stats logging interval in seconds (default: 60, 0 to disable)
-    pub stats_interval_secs: u64,
-}
-
-impl CacheConfig {
-    /// Create a new cache configuration with the given provider.
-    pub fn new(provider: impl Into<String>) -> Self {
-        Self {
-            memory: MemoryCacheConfig::default(),
-            disk: DiskCacheConfig::default(),
-            provider: provider.into(),
-            stats_interval_secs: 60,
-        }
-    }
-
-    /// Set memory cache size in bytes.
-    pub fn with_memory_size(mut self, size: usize) -> Self {
-        self.memory.max_size_bytes = size;
-        self
-    }
-
-    /// Set disk cache size in bytes.
-    pub fn with_disk_size(mut self, size: usize) -> Self {
-        self.disk.max_size_bytes = size;
-        self
-    }
-
-    /// Set cache directory.
-    pub fn with_cache_dir(mut self, dir: PathBuf) -> Self {
-        self.disk.cache_dir = dir;
-        self
-    }
-
-    /// Set maximum age in days for disk cache.
-    pub fn with_max_age_days(mut self, days: u32) -> Self {
-        self.disk.max_age_days = Some(days);
-        self
-    }
-
-    /// Set stats logging interval in seconds (0 to disable).
-    pub fn with_stats_interval(mut self, secs: u64) -> Self {
-        self.stats_interval_secs = secs;
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,29 +184,5 @@ mod tests {
         assert_eq!(config.daemon_interval_secs, 60);
         assert!(config.max_age_days.is_none());
         assert!(config.cache_dir.ends_with("xearthlayer"));
-    }
-
-    #[test]
-    fn test_cache_config_builder() {
-        let config = CacheConfig::new("bing")
-            .with_memory_size(1_000_000_000)
-            .with_disk_size(10_000_000_000)
-            .with_cache_dir(PathBuf::from("/tmp/cache"))
-            .with_max_age_days(30);
-
-        assert_eq!(config.provider, "bing");
-        assert_eq!(config.memory.max_size_bytes, 1_000_000_000);
-        assert_eq!(config.disk.max_size_bytes, 10_000_000_000);
-        assert_eq!(config.disk.cache_dir, PathBuf::from("/tmp/cache"));
-        assert_eq!(config.disk.max_age_days, Some(30));
-    }
-
-    #[test]
-    fn test_cache_config_default_values() {
-        let config = CacheConfig::new("google");
-
-        assert_eq!(config.provider, "google");
-        assert_eq!(config.memory.max_size_bytes, 2 * 1024 * 1024 * 1024);
-        assert_eq!(config.disk.max_size_bytes, 20 * 1024 * 1024 * 1024);
     }
 }

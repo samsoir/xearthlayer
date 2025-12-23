@@ -68,8 +68,10 @@ pub struct DdsHandlerBuilder {
     provider_name: String,
     /// Disk cache directory (None = no disk cache)
     cache_dir: Option<PathBuf>,
-    /// Shared memory cache (None = minimal/disabled)
+    /// Shared memory cache (raw cache for size queries)
     memory_cache: Option<Arc<MemoryCache>>,
+    /// Shared memory cache adapter (implements pipeline::MemoryCache trait)
+    memory_cache_adapter: Option<Arc<MemoryCacheAdapter>>,
     /// Shared disk I/O limiter (None = local limiter per cache)
     disk_io_limiter: Option<Arc<ConcurrencyLimiter>>,
     /// DDS compression format
@@ -95,6 +97,7 @@ impl DdsHandlerBuilder {
             provider_name: provider_name.to_string(),
             cache_dir: None,
             memory_cache: None,
+            memory_cache_adapter: None,
             disk_io_limiter: None,
             dds_format: DdsFormat::BC1,
             mipmap_count: 5,
@@ -164,8 +167,21 @@ impl DdsHandlerBuilder {
     ///
     /// The cache should be wrapped in `Arc` and shared across the application
     /// to allow telemetry to query actual cache sizes.
+    ///
+    /// Note: If you also call `with_memory_cache_adapter()`, the adapter will
+    /// be used and this raw cache is only kept for compatibility.
     pub fn with_memory_cache(mut self, cache: Arc<MemoryCache>) -> Self {
         self.memory_cache = Some(cache);
+        self
+    }
+
+    /// Set a pre-created memory cache adapter.
+    ///
+    /// This allows sharing the same adapter instance between the pipeline
+    /// and other components (e.g., the prefetcher). When set, this adapter
+    /// is used directly instead of creating a new one from the raw cache.
+    pub fn with_memory_cache_adapter(mut self, adapter: Arc<MemoryCacheAdapter>) -> Self {
+        self.memory_cache_adapter = Some(adapter);
         self
     }
 
@@ -219,21 +235,27 @@ impl DdsHandlerBuilder {
         let encoder = DdsTextureEncoder::new(self.dds_format).with_mipmap_count(self.mipmap_count);
         let encoder_adapter = Arc::new(TextureEncoderAdapter::new(encoder));
 
-        // Create memory cache adapter using the shared cache
-        let memory_cache_adapter = Arc::new(match self.memory_cache {
-            Some(cache) => {
-                // Use the shared cache directly
-                MemoryCacheAdapter::new(cache, &self.provider_name, self.dds_format)
+        // Use pre-created adapter if available, otherwise create from raw cache
+        let memory_cache_adapter = match self.memory_cache_adapter {
+            Some(adapter) => {
+                // Use the shared adapter instance (preferred - enables sharing with prefetcher)
+                adapter
             }
-            None => {
-                // Minimal cache when disabled
-                MemoryCacheAdapter::new(
-                    Arc::new(MemoryCache::new(0)),
-                    &self.provider_name,
-                    self.dds_format,
-                )
-            }
-        });
+            None => Arc::new(match self.memory_cache {
+                Some(cache) => {
+                    // Create adapter from the shared cache
+                    MemoryCacheAdapter::new(cache, &self.provider_name, self.dds_format)
+                }
+                None => {
+                    // Minimal cache when disabled
+                    MemoryCacheAdapter::new(
+                        Arc::new(MemoryCache::new(0)),
+                        &self.provider_name,
+                        self.dds_format,
+                    )
+                }
+            }),
+        };
 
         // Create executor
         let executor = Arc::new(TokioExecutor::new());
@@ -246,6 +268,7 @@ impl DdsHandlerBuilder {
             mipmap_count: self.mipmap_count,
             max_concurrent_downloads: self.max_concurrent_downloads,
             max_global_http_requests: PipelineConfig::default_global_http_requests(),
+            max_prefetch_in_flight: PipelineConfig::default_prefetch_in_flight(),
         };
 
         // Build handler based on available provider and cache configuration

@@ -28,6 +28,7 @@ pub mod manager;
 pub mod orchestrator;
 pub mod package;
 pub mod pipeline;
+pub mod prefetch;
 pub mod provider;
 pub mod publisher;
 pub mod service;

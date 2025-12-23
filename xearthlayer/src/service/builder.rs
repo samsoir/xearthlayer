@@ -6,7 +6,7 @@
 use super::config::ServiceConfig;
 use super::error::ServiceError;
 use super::network_logger::NetworkStatsLogger;
-use crate::cache::{Cache, CacheConfig, CacheSystem, MemoryCache, NoOpCache};
+use crate::cache::{DiskCacheConfig, MemoryCache, MemoryCacheConfig};
 use crate::log::Logger;
 use crate::log_info;
 use crate::orchestrator::{NetworkStats, TileOrchestrator};
@@ -35,11 +35,9 @@ pub struct ProviderComponents {
 
 /// Result of cache initialization.
 pub struct CacheComponents {
-    /// Cache implementation (CacheSystem or NoOpCache)
-    pub cache: Arc<dyn Cache>,
-    /// Shared memory cache for async pipeline
+    /// Shared memory cache for async pipeline (DDS tiles in memory with LRU eviction).
     pub memory_cache: Option<Arc<MemoryCache>>,
-    /// Cache directory path for disk cache
+    /// Cache directory path for disk cache (chunks stored via ParallelDiskCache).
     pub cache_dir: Option<PathBuf>,
 }
 
@@ -143,53 +141,42 @@ pub fn create_generator(
     }
 }
 
-/// Create cache system from configuration.
+/// Create cache components from configuration.
+///
+/// The async pipeline uses:
+/// - `MemoryCache` for DDS tiles (LRU eviction, shared across requests)
+/// - `ParallelDiskCache` for chunks (configured via `DdsHandlerBuilder::with_disk_cache`)
 pub fn create_cache(
     config: &ServiceConfig,
-    provider_name: &str,
-    logger: Arc<dyn Logger>,
+    _provider_name: &str,
+    _logger: Arc<dyn Logger>,
 ) -> Result<CacheComponents, ServiceError> {
     if !config.cache_enabled() {
         return Ok(CacheComponents {
-            cache: Arc::new(NoOpCache::new(provider_name)),
             memory_cache: None,
             cache_dir: None,
         });
     }
 
-    let mut cache_config = CacheConfig::new(provider_name);
+    // Get defaults from config types
+    let disk_defaults = DiskCacheConfig::default();
+    let memory_defaults = MemoryCacheConfig::default();
 
-    // Disable stats logging in quiet mode (e.g., TUI active)
-    if config.quiet_mode() {
-        cache_config = cache_config.with_stats_interval(0);
-    }
-
-    // Track cache directory and memory size for async pipeline
-    let mut cache_dir = cache_config.disk.cache_dir.clone();
-    let mut mem_size = cache_config.memory.max_size_bytes;
+    let mut cache_dir = disk_defaults.cache_dir;
+    let mut mem_size = memory_defaults.max_size_bytes;
 
     // Apply user-configured overrides
     if let Some(dir) = config.cache_directory() {
-        cache_config = cache_config.with_cache_dir(dir.clone());
         cache_dir = dir.clone();
     }
     if let Some(size) = config.cache_memory_size() {
-        cache_config = cache_config.with_memory_size(size);
         mem_size = size;
-    }
-    if let Some(size) = config.cache_disk_size() {
-        cache_config = cache_config.with_disk_size(size);
     }
 
     // Create shared memory cache for async pipeline
     let memory_cache = Arc::new(MemoryCache::new(mem_size));
 
-    // Create the full cache system
-    let cache = CacheSystem::new(cache_config, logger)
-        .map_err(|e| ServiceError::CacheError(e.to_string()))?;
-
     Ok(CacheComponents {
-        cache: Arc::new(cache),
         memory_cache: Some(memory_cache),
         cache_dir: Some(cache_dir),
     })

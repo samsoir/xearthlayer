@@ -6,10 +6,11 @@ use super::dds_handler::DdsHandlerBuilder;
 use super::error::ServiceError;
 use super::fuse_mount::{FuseMountConfig, FuseMountService};
 use super::network_logger::NetworkStatsLogger;
-use crate::cache::{Cache, MemoryCache};
+use crate::cache::MemoryCache;
 use crate::coord::to_tile_coords;
 use crate::fuse::{DdsHandler, MountHandle, SpawnedMountHandle};
 use crate::log::Logger;
+use crate::pipeline::adapters::MemoryCacheAdapter;
 use crate::pipeline::ConcurrencyLimiter;
 use crate::provider::{AsyncProviderType, Provider, ProviderConfig};
 use crate::telemetry::{PipelineMetrics, TelemetrySnapshot};
@@ -63,8 +64,6 @@ pub struct XEarthLayerService {
     max_zoom: u8,
     /// Tile generator (handles download + encoding)
     generator: Arc<dyn TileGenerator>,
-    /// Cache implementation
-    cache: Arc<dyn Cache>,
     /// Logger for diagnostic output
     logger: Arc<dyn Logger>,
     /// Network stats logger (keeps logger thread alive)
@@ -83,6 +82,8 @@ pub struct XEarthLayerService {
     dds_encoder: Arc<DdsTextureEncoder>,
     /// Shared memory cache for async pipeline (tile-level)
     memory_cache: Option<Arc<MemoryCache>>,
+    /// Shared memory cache adapter (implements pipeline::MemoryCache trait)
+    memory_cache_adapter: Option<Arc<MemoryCacheAdapter>>,
     /// Cache directory for disk cache
     cache_dir: Option<PathBuf>,
     /// Pipeline telemetry metrics
@@ -186,21 +187,29 @@ impl XEarthLayerService {
             network_stats,
         } = builder::create_generator(&config, Arc::clone(&provider), encoder, logger.clone());
 
-        // 4. Create cache system
+        // 4. Create cache components
         let CacheComponents {
-            cache,
             memory_cache,
             cache_dir,
         } = builder::create_cache(&config, &provider_name, logger.clone())?;
 
-        // 5. Create network stats logger (if not in quiet mode)
+        // 5. Create shared memory cache adapter (used by both pipeline and prefetcher)
+        let memory_cache_adapter = memory_cache.as_ref().map(|cache| {
+            Arc::new(MemoryCacheAdapter::new(
+                Arc::clone(cache),
+                &provider_name,
+                config.texture().format(),
+            ))
+        });
+
+        // 6. Create network stats logger (if not in quiet mode)
         let network_stats_logger =
             builder::create_network_logger(&config, network_stats, logger.clone());
 
-        // 6. Create pipeline telemetry metrics
+        // 7. Create pipeline telemetry metrics
         let metrics = Arc::new(PipelineMetrics::new());
 
-        // 7. Initialize disk cache size from existing cache (async background task)
+        // 8. Initialize disk cache size from existing cache (async background task)
         builder::init_disk_cache_metrics(cache_dir.as_ref(), &metrics, &runtime_handle);
 
         Ok(Self {
@@ -208,7 +217,6 @@ impl XEarthLayerService {
             provider_name,
             max_zoom,
             generator,
-            cache,
             logger,
             network_stats_logger,
             owned_runtime,
@@ -217,6 +225,7 @@ impl XEarthLayerService {
             async_provider,
             dds_encoder,
             memory_cache,
+            memory_cache_adapter,
             cache_dir,
             metrics,
             disk_io_limiter: None,
@@ -246,11 +255,6 @@ impl XEarthLayerService {
     /// Get the tile generator.
     pub fn generator(&self) -> &Arc<dyn TileGenerator> {
         &self.generator
-    }
-
-    /// Get the cache.
-    pub fn cache(&self) -> &Arc<dyn Cache> {
-        &self.cache
     }
 
     /// Get the runtime handle.
@@ -290,8 +294,8 @@ impl XEarthLayerService {
         }
 
         // Note: Disk cache size (chunk-level) is tracked incrementally in the
-        // download stage via add_disk_cache_bytes(). We don't query CacheSystem
-        // here because that tracks tile-level cache, not chunk-level.
+        // download stage via add_disk_cache_bytes(). The ParallelDiskCache stores
+        // chunks directly, and the download stage updates metrics as chunks are written.
     }
 
     /// Get a reference to the pipeline metrics for direct access.
@@ -301,6 +305,40 @@ impl XEarthLayerService {
     /// computed rates and formatted values.
     pub fn metrics(&self) -> &Arc<PipelineMetrics> {
         &self.metrics
+    }
+
+    /// Get the DDS format used by this service.
+    pub fn dds_format(&self) -> crate::dds::DdsFormat {
+        self.config.texture().format()
+    }
+
+    /// Create a DDS handler for prefetch operations.
+    ///
+    /// This returns a handler that can be used by the prefetch scheduler
+    /// to submit background tile requests. The handler uses the same
+    /// pipeline as FUSE requests, enabling automatic request coalescing.
+    pub fn create_prefetch_handler(&self) -> DdsHandler {
+        self.create_dds_handler()
+    }
+
+    /// Get the raw memory cache for size queries.
+    ///
+    /// Returns a reference to the shared memory cache, if enabled.
+    /// For prefetch operations that need to check cache contents,
+    /// use `memory_cache_adapter()` instead.
+    pub fn memory_cache(&self) -> Option<Arc<MemoryCache>> {
+        self.memory_cache.clone()
+    }
+
+    /// Get the shared memory cache adapter.
+    ///
+    /// Returns the adapter that implements `pipeline::MemoryCache` trait.
+    /// This is the same adapter instance used by the pipeline, ensuring
+    /// the prefetcher sees the same cached tiles.
+    ///
+    /// Returns `None` if caching is disabled.
+    pub fn memory_cache_adapter(&self) -> Option<Arc<MemoryCacheAdapter>> {
+        self.memory_cache_adapter.clone()
     }
 
     /// Set the shared disk I/O concurrency limiter.
@@ -403,9 +441,10 @@ impl XEarthLayerService {
             builder = builder.with_disk_io_limiter(Arc::clone(limiter));
         }
 
-        // Configure memory cache if enabled (use the shared instance)
-        if let Some(ref cache) = self.memory_cache {
-            builder = builder.with_memory_cache(Arc::clone(cache));
+        // Configure memory cache adapter if enabled (use the shared instance)
+        // This ensures the prefetcher and pipeline share the same adapter
+        if let Some(ref adapter) = self.memory_cache_adapter {
+            builder = builder.with_memory_cache_adapter(Arc::clone(adapter));
         }
 
         builder.build(self.runtime_handle.clone())

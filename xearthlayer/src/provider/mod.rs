@@ -26,7 +26,9 @@ mod mapbox;
 mod types;
 mod usgs;
 
-pub use apple::{AppleMapsProvider, AsyncAppleMapsProvider};
+pub use apple::{
+    AppleMapsProvider, AppleTokenStatus, AppleTokenStatusSnapshot, AsyncAppleMapsProvider,
+};
 pub use arcgis::{ArcGisProvider, AsyncArcGisProvider};
 pub use bing::{AsyncBingMapsProvider, BingMapsProvider};
 pub use factory::{AsyncProviderFactory, AsyncProviderType, ProviderConfig, ProviderFactory};

@@ -335,6 +335,14 @@ impl MountManager {
         }
     }
 
+    /// Get a reference to a mounted service (if any).
+    ///
+    /// This returns a reference to the first available service, useful for
+    /// accessing shared components like the DdsHandler for prefetch.
+    pub fn get_service(&self) -> Option<&XEarthLayerService> {
+        self.services.values().next()
+    }
+
     /// Get aggregated telemetry from all mounted services.
     ///
     /// This combines metrics from all active service instances into a single

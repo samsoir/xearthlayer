@@ -61,6 +61,16 @@ pub enum ConfigKey {
 
     // Logging settings
     LoggingFile,
+
+    // Prefetch settings
+    PrefetchEnabled,
+    PrefetchUdpPort,
+    PrefetchConeAngle,
+    PrefetchConeDistanceNm,
+    PrefetchRadialRadiusNm,
+    PrefetchBatchSize,
+    PrefetchMaxInFlight,
+    PrefetchRadialRadius,
 }
 
 impl FromStr for ConfigKey {
@@ -93,6 +103,15 @@ impl FromStr for ConfigKey {
 
             "logging.file" => Ok(ConfigKey::LoggingFile),
 
+            "prefetch.enabled" => Ok(ConfigKey::PrefetchEnabled),
+            "prefetch.udp_port" => Ok(ConfigKey::PrefetchUdpPort),
+            "prefetch.cone_angle" => Ok(ConfigKey::PrefetchConeAngle),
+            "prefetch.cone_distance_nm" => Ok(ConfigKey::PrefetchConeDistanceNm),
+            "prefetch.radial_radius_nm" => Ok(ConfigKey::PrefetchRadialRadiusNm),
+            "prefetch.batch_size" => Ok(ConfigKey::PrefetchBatchSize),
+            "prefetch.max_in_flight" => Ok(ConfigKey::PrefetchMaxInFlight),
+            "prefetch.radial_radius" => Ok(ConfigKey::PrefetchRadialRadius),
+
             _ => Err(ConfigKeyError::UnknownKey(s.to_string())),
         }
     }
@@ -119,6 +138,14 @@ impl ConfigKey {
             ConfigKey::PackagesAutoInstallOverlays => "packages.auto_install_overlays",
             ConfigKey::PackagesTempDir => "packages.temp_dir",
             ConfigKey::LoggingFile => "logging.file",
+            ConfigKey::PrefetchEnabled => "prefetch.enabled",
+            ConfigKey::PrefetchUdpPort => "prefetch.udp_port",
+            ConfigKey::PrefetchConeAngle => "prefetch.cone_angle",
+            ConfigKey::PrefetchConeDistanceNm => "prefetch.cone_distance_nm",
+            ConfigKey::PrefetchRadialRadiusNm => "prefetch.radial_radius_nm",
+            ConfigKey::PrefetchBatchSize => "prefetch.batch_size",
+            ConfigKey::PrefetchMaxInFlight => "prefetch.max_in_flight",
+            ConfigKey::PrefetchRadialRadius => "prefetch.radial_radius",
         }
     }
 
@@ -178,6 +205,14 @@ impl ConfigKey {
                 .map(|p| path_to_display(p))
                 .unwrap_or_default(),
             ConfigKey::LoggingFile => path_to_display(&config.logging.file),
+            ConfigKey::PrefetchEnabled => config.prefetch.enabled.to_string(),
+            ConfigKey::PrefetchUdpPort => config.prefetch.udp_port.to_string(),
+            ConfigKey::PrefetchConeAngle => config.prefetch.cone_angle.to_string(),
+            ConfigKey::PrefetchConeDistanceNm => config.prefetch.cone_distance_nm.to_string(),
+            ConfigKey::PrefetchRadialRadiusNm => config.prefetch.radial_radius_nm.to_string(),
+            ConfigKey::PrefetchBatchSize => config.prefetch.batch_size.to_string(),
+            ConfigKey::PrefetchMaxInFlight => config.prefetch.max_in_flight.to_string(),
+            ConfigKey::PrefetchRadialRadius => config.prefetch.radial_radius.to_string(),
         }
     }
 
@@ -251,6 +286,31 @@ impl ConfigKey {
             ConfigKey::LoggingFile => {
                 config.logging.file = expand_tilde(value);
             }
+            ConfigKey::PrefetchEnabled => {
+                let v = value.to_lowercase();
+                config.prefetch.enabled = v == "true" || v == "1" || v == "yes" || v == "on";
+            }
+            ConfigKey::PrefetchUdpPort => {
+                config.prefetch.udp_port = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchConeAngle => {
+                config.prefetch.cone_angle = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchConeDistanceNm => {
+                config.prefetch.cone_distance_nm = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchRadialRadiusNm => {
+                config.prefetch.radial_radius_nm = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchBatchSize => {
+                config.prefetch.batch_size = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchMaxInFlight => {
+                config.prefetch.max_in_flight = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchRadialRadius => {
+                config.prefetch.radial_radius = value.parse().unwrap();
+            }
         }
     }
 
@@ -288,6 +348,14 @@ impl ConfigKey {
             ConfigKey::PackagesAutoInstallOverlays => Box::new(BooleanSpec),
             ConfigKey::PackagesTempDir => Box::new(OptionalPathSpec),
             ConfigKey::LoggingFile => Box::new(PathSpec),
+            ConfigKey::PrefetchEnabled => Box::new(BooleanSpec),
+            ConfigKey::PrefetchUdpPort => Box::new(PositiveIntegerSpec),
+            ConfigKey::PrefetchConeAngle => Box::new(PositiveNumberSpec),
+            ConfigKey::PrefetchConeDistanceNm => Box::new(PositiveNumberSpec),
+            ConfigKey::PrefetchRadialRadiusNm => Box::new(PositiveNumberSpec),
+            ConfigKey::PrefetchBatchSize => Box::new(PositiveIntegerSpec),
+            ConfigKey::PrefetchMaxInFlight => Box::new(PositiveIntegerSpec),
+            ConfigKey::PrefetchRadialRadius => Box::new(PositiveIntegerSpec),
         }
     }
 
@@ -311,6 +379,14 @@ impl ConfigKey {
             ConfigKey::PackagesAutoInstallOverlays,
             ConfigKey::PackagesTempDir,
             ConfigKey::LoggingFile,
+            ConfigKey::PrefetchEnabled,
+            ConfigKey::PrefetchUdpPort,
+            ConfigKey::PrefetchConeAngle,
+            ConfigKey::PrefetchConeDistanceNm,
+            ConfigKey::PrefetchRadialRadiusNm,
+            ConfigKey::PrefetchBatchSize,
+            ConfigKey::PrefetchMaxInFlight,
+            ConfigKey::PrefetchRadialRadius,
         ]
     }
 }
@@ -377,6 +453,24 @@ impl ValueSpecification for PositiveIntegerSpec {
             .parse::<u64>()
             .map(|_| ())
             .map_err(|_| "must be a positive integer".to_string())
+    }
+}
+
+/// Specification for positive floating-point number values.
+struct PositiveNumberSpec;
+
+impl ValueSpecification for PositiveNumberSpec {
+    fn is_satisfied_by(&self, value: &str) -> Result<(), String> {
+        value
+            .parse::<f64>()
+            .map_err(|_| "must be a positive number".to_string())
+            .and_then(|n| {
+                if n >= 0.0 {
+                    Ok(())
+                } else {
+                    Err("must be a positive number".to_string())
+                }
+            })
     }
 }
 
