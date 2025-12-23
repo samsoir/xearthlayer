@@ -35,6 +35,14 @@ pub struct PipelineConfig {
     /// - 8-core system: 128-256 concurrent requests
     /// - 12+ core system: 256 concurrent requests (cap)
     pub max_global_http_requests: usize,
+
+    /// Maximum concurrent prefetch jobs in flight.
+    /// This prevents prefetch from overwhelming the system when using
+    /// large radial prefetch configurations.
+    ///
+    /// Default: `max(num_cpus / 4, 2)` - leaves 75% of resources for on-demand.
+    /// Each prefetch job processes one tile through the full pipeline.
+    pub max_prefetch_in_flight: usize,
 }
 
 impl Default for PipelineConfig {
@@ -46,6 +54,7 @@ impl Default for PipelineConfig {
             mipmap_count: 5,
             max_concurrent_downloads: 256,
             max_global_http_requests: Self::default_global_http_requests(),
+            max_prefetch_in_flight: Self::default_prefetch_in_flight(),
         }
     }
 }
@@ -66,6 +75,24 @@ impl PipelineConfig {
 
         // Scale with CPU count but cap at 256
         (cpus * 16).min(256)
+    }
+
+    /// Calculates a sensible default for prefetch concurrency based on CPU count.
+    ///
+    /// Formula: `max(num_cpus / 4, 2)`
+    ///
+    /// This leaves 75% of resources available for on-demand requests:
+    /// - 4-core system: 2 concurrent prefetch jobs
+    /// - 8-core system: 2 concurrent prefetch jobs
+    /// - 16-core system: 4 concurrent prefetch jobs
+    /// - 32-core system: 8 concurrent prefetch jobs
+    pub fn default_prefetch_in_flight() -> usize {
+        let cpus = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4);
+
+        // Use 1/4 of cores, minimum 2
+        (cpus / 4).max(2)
     }
 }
 

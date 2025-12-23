@@ -382,6 +382,13 @@ impl<M: MemoryCache + 'static> Prefetcher for RadialPrefetcher<M> {
     fn description(&self) -> &'static str {
         "Simple cache-aware radial expansion around current position"
     }
+
+    fn startup_info(&self) -> String {
+        format!(
+            "radial, {}-tile radius, zoom {}",
+            self.config.radius, self.config.zoom
+        )
+    }
 }
 
 #[cfg(test)]

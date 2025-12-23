@@ -158,17 +158,9 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         println!("Cache: Disabled");
     }
 
-    // Print prefetch status
+    // Print prefetch status (details printed later after prefetcher starts)
     let prefetch_enabled = config.prefetch.enabled && !args.no_prefetch;
-    if prefetch_enabled {
-        println!(
-            "Prefetch: Enabled (UDP port {}, {}° cone, {}nm distance, {}nm radial)",
-            config.prefetch.udp_port,
-            config.prefetch.cone_angle,
-            config.prefetch.cone_distance_nm,
-            config.prefetch.radial_radius_nm
-        );
-    } else {
+    if !prefetch_enabled {
         println!("Prefetch: Disabled");
     }
     println!();
@@ -250,10 +242,10 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
                 let runtime_handle = service.runtime_handle().clone();
 
                 // Configure radial prefetcher
-                // Uses a simple 3-tile radius (7×7 = 49 tiles) around current position
+                // Uses configurable tile radius around current position
                 let prefetch_config = RadialPrefetchConfig {
-                    radius: 3,                                       // 3-tile radius = 49 tiles max per cycle
-                    zoom: 14,                                        // Standard ortho zoom level
+                    radius: config.prefetch.radial_radius, // Configured tile radius
+                    zoom: 14,                              // Standard ortho zoom level
                     attempt_ttl: std::time::Duration::from_secs(60), // Don't retry for 60s
                 };
 
@@ -284,8 +276,8 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
                         .with_shared_status(Arc::clone(&shared_prefetch_status)),
                 );
 
-                // Log the strategy being used
-                let strategy_name = prefetcher.name();
+                // Get startup info before prefetcher is consumed
+                let startup_info = prefetcher.startup_info();
 
                 // Start the prefetcher
                 let prefetcher_cancel = prefetch_cancellation.clone();
@@ -294,8 +286,8 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
                 });
 
                 println!(
-                    "Prefetch system started ({}, 3-tile radius, UDP port {})",
-                    strategy_name, config.prefetch.udp_port
+                    "Prefetch system started ({}, UDP port {})",
+                    startup_info, config.prefetch.udp_port
                 );
                 prefetch_started = true;
             } else {

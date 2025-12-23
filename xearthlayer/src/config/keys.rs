@@ -70,6 +70,7 @@ pub enum ConfigKey {
     PrefetchRadialRadiusNm,
     PrefetchBatchSize,
     PrefetchMaxInFlight,
+    PrefetchRadialRadius,
 }
 
 impl FromStr for ConfigKey {
@@ -109,6 +110,7 @@ impl FromStr for ConfigKey {
             "prefetch.radial_radius_nm" => Ok(ConfigKey::PrefetchRadialRadiusNm),
             "prefetch.batch_size" => Ok(ConfigKey::PrefetchBatchSize),
             "prefetch.max_in_flight" => Ok(ConfigKey::PrefetchMaxInFlight),
+            "prefetch.radial_radius" => Ok(ConfigKey::PrefetchRadialRadius),
 
             _ => Err(ConfigKeyError::UnknownKey(s.to_string())),
         }
@@ -143,6 +145,7 @@ impl ConfigKey {
             ConfigKey::PrefetchRadialRadiusNm => "prefetch.radial_radius_nm",
             ConfigKey::PrefetchBatchSize => "prefetch.batch_size",
             ConfigKey::PrefetchMaxInFlight => "prefetch.max_in_flight",
+            ConfigKey::PrefetchRadialRadius => "prefetch.radial_radius",
         }
     }
 
@@ -209,6 +212,7 @@ impl ConfigKey {
             ConfigKey::PrefetchRadialRadiusNm => config.prefetch.radial_radius_nm.to_string(),
             ConfigKey::PrefetchBatchSize => config.prefetch.batch_size.to_string(),
             ConfigKey::PrefetchMaxInFlight => config.prefetch.max_in_flight.to_string(),
+            ConfigKey::PrefetchRadialRadius => config.prefetch.radial_radius.to_string(),
         }
     }
 
@@ -304,6 +308,9 @@ impl ConfigKey {
             ConfigKey::PrefetchMaxInFlight => {
                 config.prefetch.max_in_flight = value.parse().unwrap();
             }
+            ConfigKey::PrefetchRadialRadius => {
+                config.prefetch.radial_radius = value.parse().unwrap();
+            }
         }
     }
 
@@ -348,6 +355,7 @@ impl ConfigKey {
             ConfigKey::PrefetchRadialRadiusNm => Box::new(PositiveNumberSpec),
             ConfigKey::PrefetchBatchSize => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchMaxInFlight => Box::new(PositiveIntegerSpec),
+            ConfigKey::PrefetchRadialRadius => Box::new(PositiveIntegerSpec),
         }
     }
 
@@ -378,6 +386,7 @@ impl ConfigKey {
             ConfigKey::PrefetchRadialRadiusNm,
             ConfigKey::PrefetchBatchSize,
             ConfigKey::PrefetchMaxInFlight,
+            ConfigKey::PrefetchRadialRadius,
         ]
     }
 }

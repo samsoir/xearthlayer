@@ -155,6 +155,8 @@ pub struct PrefetchSettings {
     pub batch_size: usize,
     /// Maximum concurrent in-flight prefetch requests (default: 2000)
     pub max_in_flight: usize,
+    /// Radial prefetcher tile radius (default: 3, giving a 7×7 = 49 tile grid)
+    pub radial_radius: u8,
 }
 
 impl Default for ConfigFile {
@@ -203,6 +205,7 @@ impl Default for ConfigFile {
                 radial_radius_nm: 60.0,
                 batch_size: 500,
                 max_in_flight: 2000,
+                radial_radius: 3, // 7×7 = 49 tile grid
             },
         }
     }
@@ -490,6 +493,15 @@ impl ConfigFile {
                         reason: "must be a positive integer".to_string(),
                     })?;
             }
+            if let Some(v) = section.get("radial_radius") {
+                config.prefetch.radial_radius =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "radial_radius".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (1-20)".to_string(),
+                    })?;
+            }
         }
 
         Ok(config)
@@ -626,6 +638,9 @@ radial_radius_nm = {}
 batch_size = {}
 ; Maximum concurrent prefetch requests (default: 2000)
 max_in_flight = {}
+; Radial prefetcher tile radius (default: 3, giving 7x7 = 49 tiles)
+; Higher values prefetch more tiles around aircraft position
+radial_radius = {}
 "#,
             self.provider.provider_type,
             google_api_key,
@@ -651,6 +666,7 @@ max_in_flight = {}
             self.prefetch.radial_radius_nm,
             self.prefetch.batch_size,
             self.prefetch.max_in_flight,
+            self.prefetch.radial_radius,
         )
     }
 

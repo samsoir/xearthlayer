@@ -76,6 +76,14 @@ impl TilePredictor {
         Self::new(45.0, 100.0, 60.0)
     }
 
+    /// Get a startup info string describing the predictor configuration.
+    pub fn startup_info(&self) -> String {
+        format!(
+            "{}° cone, {}nm distance, {}nm radial",
+            self.cone_angle as u32, self.cone_distance_nm as u32, self.radial_radius_nm as u32
+        )
+    }
+
     /// Predict tiles to pre-fetch based on current aircraft state.
     ///
     /// Returns tiles sorted by priority (lowest first = highest priority).

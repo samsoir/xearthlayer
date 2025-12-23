@@ -268,6 +268,7 @@ impl DdsHandlerBuilder {
             mipmap_count: self.mipmap_count,
             max_concurrent_downloads: self.max_concurrent_downloads,
             max_global_http_requests: PipelineConfig::default_global_http_requests(),
+            max_prefetch_in_flight: PipelineConfig::default_prefetch_in_flight(),
         };
 
         // Build handler based on available provider and cache configuration

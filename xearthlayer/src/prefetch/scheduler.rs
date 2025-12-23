@@ -363,6 +363,10 @@ impl Prefetcher for PrefetchScheduler {
     fn description(&self) -> &'static str {
         "Complex flight-path prediction with cone and radial calculations"
     }
+
+    fn startup_info(&self) -> String {
+        format!("flight-path, {}", self.predictor.startup_info())
+    }
 }
 
 #[cfg(test)]

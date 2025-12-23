@@ -76,4 +76,16 @@ pub trait Prefetcher: Send {
 
     /// Get a description of this prefetcher strategy.
     fn description(&self) -> &'static str;
+
+    /// Get a startup info string describing the prefetcher configuration.
+    ///
+    /// This is displayed during initialization to inform the user about
+    /// the prefetcher settings. Each implementation should provide relevant
+    /// configuration details.
+    ///
+    /// # Example output
+    ///
+    /// - RadialPrefetcher: "radial, 3-tile radius, zoom 14"
+    /// - PrefetchScheduler: "flight-path, 45° cone, 10nm distance"
+    fn startup_info(&self) -> String;
 }

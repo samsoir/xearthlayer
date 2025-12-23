@@ -21,6 +21,7 @@ use crate::pipeline::{
 use crate::telemetry::PipelineMetrics;
 use std::sync::Arc;
 use tokio::runtime::Handle;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, instrument, warn};
 
 /// Creates a `DdsHandler` that processes requests through the async pipeline.
@@ -132,10 +133,16 @@ where
     // I/O waits while preventing deadlock from thread pool exhaustion
     let cpu_limiter = Arc::new(ConcurrencyLimiter::with_cpu_oversubscribe("cpu_bound"));
 
+    // Create prefetch concurrency limiter to prevent prefetch from overwhelming
+    // the system. This limits how many prefetch jobs can be in-flight at once,
+    // ensuring on-demand requests have priority access to resources.
+    let prefetch_limiter = Arc::new(Semaphore::new(config.max_prefetch_in_flight));
+
     info!(
         metrics_enabled = metrics.is_some(),
         max_http_concurrent = config.max_global_http_requests,
         max_cpu_concurrent = cpu_limiter.max_concurrent(),
+        max_prefetch_concurrent = config.max_prefetch_in_flight,
         "Created DDS handler with request coalescing and concurrency limiting"
     );
 
@@ -148,19 +155,44 @@ where
         let coalescer = Arc::clone(&coalescer);
         let http_limiter = Arc::clone(&http_limiter);
         let cpu_limiter = Arc::clone(&cpu_limiter);
+        let prefetch_limiter = Arc::clone(&prefetch_limiter);
         let metrics = metrics.clone();
         let config = config.clone();
         let job_id = request.job_id;
         let tile = request.tile;
+        let is_prefetch = request.is_prefetch;
 
         debug!(
             job_id = %job_id,
             tile = ?tile,
+            is_prefetch = is_prefetch,
             "Received DDS request"
         );
 
+        // For prefetch requests, try to acquire a permit non-blocking.
+        // If we can't get one, skip this prefetch to avoid overwhelming the system.
+        // The permit is held through the job's lifetime to limit concurrent prefetch.
+        let prefetch_permit: Option<OwnedSemaphorePermit> = if is_prefetch {
+            match prefetch_limiter.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    debug!(
+                        job_id = %job_id,
+                        tile = ?tile,
+                        "Prefetch skipped - prefetch limiter at capacity"
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         // Spawn the processing task on the Tokio runtime
         let spawn_result = runtime_handle.spawn(async move {
+            // Hold the prefetch permit through the job's lifetime
+            let _prefetch_permit = prefetch_permit;
+
             process_dds_request_coalesced(
                 request,
                 provider,
@@ -292,7 +324,6 @@ async fn process_dds_request_coalesced<P, E, M, D, X>(
 {
     let tile = request.tile;
     let job_id = request.job_id;
-    let is_prefetch = request.is_prefetch;
     let cancellation_token = request.cancellation_token.clone();
 
     // Check for early cancellation before doing any work
@@ -301,38 +332,10 @@ async fn process_dds_request_coalesced<P, E, M, D, X>(
         return;
     }
 
-    // For prefetch requests, check if the system has available capacity.
-    // If resources are busy, skip this prefetch to avoid blocking on-demand requests.
-    // Prefetch uses non-blocking resource acquisition: if we can't get permits
-    // immediately, we defer the work to avoid starving on-demand FUSE requests.
-    if is_prefetch {
-        // Try to acquire all required resources non-blocking
-        // If any are unavailable, skip this prefetch
-        if http_limiter.try_acquire().is_none() {
-            debug!(
-                job_id = %job_id,
-                tile = ?tile,
-                "Prefetch skipped - HTTP limiter at capacity"
-            );
-            return;
-        }
-        if encode_limiter.try_acquire().is_none() {
-            debug!(
-                job_id = %job_id,
-                tile = ?tile,
-                "Prefetch skipped - encoder at capacity"
-            );
-            return;
-        }
-        // We don't hold these permits - we're just checking availability.
-        // The actual pipeline will acquire them properly.
-        // This is a quick "should we even try" check.
-        debug!(
-            job_id = %job_id,
-            tile = ?tile,
-            "Prefetch proceeding - resources available"
-        );
-    }
+    // Note: Prefetch concurrency limiting is handled at the entry point
+    // (create_dds_handler_with_metrics) using a dedicated semaphore that
+    // holds permits through the job's lifetime. This prevents prefetch from
+    // overwhelming the system while allowing on-demand requests to proceed.
 
     // Record job submission (request arrived, now waiting for processing)
     if let Some(ref m) = metrics {
