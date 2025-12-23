@@ -29,7 +29,10 @@
 //! - Z: Zoom level (0 to 20)
 
 use crate::provider::{AsyncHttpClient, AsyncProvider, HttpClient, Provider, ProviderError};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
+use tracing::{error, info, warn};
 
 /// DuckDuckGo endpoint for obtaining the initial bearer token.
 const DUCKDUCKGO_TOKEN_URL: &str = "https://duckduckgo.com/local.js?get_mk_token=1";
@@ -52,6 +55,95 @@ const MAX_ZOOM: u8 = 20;
 struct AppleCredentials {
     access_key: String,
     version: String,
+}
+
+/// Shared status for Apple Maps token health.
+///
+/// This can be cloned and shared with the UI to display token status.
+#[derive(Clone, Default)]
+pub struct AppleTokenStatus {
+    inner: Arc<AppleTokenStatusInner>,
+}
+
+#[derive(Default)]
+struct AppleTokenStatusInner {
+    /// Number of successful token refreshes
+    refresh_success_count: AtomicU64,
+    /// Number of failed token refresh attempts
+    refresh_failure_count: AtomicU64,
+    /// Last refresh error message (if any)
+    last_error: RwLock<Option<String>>,
+    /// Timestamp of last successful refresh
+    last_success: RwLock<Option<Instant>>,
+    /// Whether the token is currently valid
+    token_valid: RwLock<bool>,
+}
+
+impl AppleTokenStatus {
+    /// Create a new status tracker with token initially valid.
+    pub fn new_valid() -> Self {
+        let status = Self::default();
+        *status.inner.token_valid.write().unwrap() = true;
+        status
+    }
+
+    /// Record a successful token refresh.
+    pub fn record_success(&self) {
+        self.inner
+            .refresh_success_count
+            .fetch_add(1, Ordering::Relaxed);
+        *self.inner.last_success.write().unwrap() = Some(Instant::now());
+        *self.inner.last_error.write().unwrap() = None;
+        *self.inner.token_valid.write().unwrap() = true;
+    }
+
+    /// Record a failed token refresh.
+    pub fn record_failure(&self, error: &str) {
+        self.inner
+            .refresh_failure_count
+            .fetch_add(1, Ordering::Relaxed);
+        *self.inner.last_error.write().unwrap() = Some(error.to_string());
+        *self.inner.token_valid.write().unwrap() = false;
+    }
+
+    /// Check if the token is currently valid.
+    pub fn is_valid(&self) -> bool {
+        *self.inner.token_valid.read().unwrap()
+    }
+
+    /// Get the last error message, if any.
+    pub fn last_error(&self) -> Option<String> {
+        self.inner.last_error.read().unwrap().clone()
+    }
+
+    /// Get the number of successful refreshes.
+    pub fn refresh_success_count(&self) -> u64 {
+        self.inner.refresh_success_count.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of failed refresh attempts.
+    pub fn refresh_failure_count(&self) -> u64 {
+        self.inner.refresh_failure_count.load(Ordering::Relaxed)
+    }
+
+    /// Get a snapshot for display.
+    pub fn snapshot(&self) -> AppleTokenStatusSnapshot {
+        AppleTokenStatusSnapshot {
+            is_valid: self.is_valid(),
+            refresh_success_count: self.refresh_success_count(),
+            refresh_failure_count: self.refresh_failure_count(),
+            last_error: self.last_error(),
+        }
+    }
+}
+
+/// Snapshot of Apple token status for UI display.
+#[derive(Clone, Debug)]
+pub struct AppleTokenStatusSnapshot {
+    pub is_valid: bool,
+    pub refresh_success_count: u64,
+    pub refresh_failure_count: u64,
+    pub last_error: Option<String>,
 }
 
 /// Manages Apple Maps token lifecycle.
@@ -332,6 +424,7 @@ impl<C: HttpClient + Clone> Provider for AppleMapsProvider<C> {
 pub struct AsyncAppleMapsProvider<C: AsyncHttpClient> {
     http_client: C,
     token_manager: AppleTokenManager,
+    status: AppleTokenStatus,
 }
 
 impl<C: AsyncHttpClient + Clone> AsyncAppleMapsProvider<C> {
@@ -343,14 +436,22 @@ impl<C: AsyncHttpClient + Clone> AsyncAppleMapsProvider<C> {
     ///
     /// Returns an error if credential acquisition fails.
     pub async fn new(http_client: C) -> Result<Self, ProviderError> {
+        info!("Initializing Apple Maps provider - fetching access token");
         let credentials = fetch_credentials_async(&http_client).await?;
+        info!("Apple Maps token acquired successfully");
         Ok(Self {
             http_client,
             token_manager: AppleTokenManager::with_credentials(
                 credentials.access_key,
                 credentials.version,
             ),
+            status: AppleTokenStatus::new_valid(),
         })
+    }
+
+    /// Get the shared token status for UI display.
+    pub fn token_status(&self) -> AppleTokenStatus {
+        self.status.clone()
     }
 
     /// Builds the tile URL for the given coordinates.
@@ -367,11 +468,24 @@ impl<C: AsyncHttpClient + Clone> AsyncAppleMapsProvider<C> {
 
     /// Refresh credentials after an authentication failure.
     async fn refresh_credentials(&self) -> Result<(), ProviderError> {
+        warn!("Apple Maps token expired - attempting refresh");
         self.token_manager.clear_credentials();
-        let credentials = fetch_credentials_async(&self.http_client).await?;
-        self.token_manager
-            .set_credentials(credentials.access_key, credentials.version);
-        Ok(())
+
+        match fetch_credentials_async(&self.http_client).await {
+            Ok(credentials) => {
+                self.token_manager
+                    .set_credentials(credentials.access_key, credentials.version);
+                self.status.record_success();
+                info!("Apple Maps token refreshed successfully");
+                Ok(())
+            }
+            Err(e) => {
+                let error_msg = format!("Token refresh failed: {}", e);
+                error!("{}", error_msg);
+                self.status.record_failure(&error_msg);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -384,11 +498,35 @@ impl<C: AsyncHttpClient + Clone> AsyncProvider for AsyncAppleMapsProvider<C> {
         let url = self.build_url(row, col, zoom)?;
         match self.http_client.get(&url).await {
             Ok(data) => Ok(data),
-            Err(ProviderError::HttpError(msg)) if msg.contains("403") || msg.contains("410") => {
+            Err(ProviderError::HttpError(ref msg))
+                if msg.contains("403") || msg.contains("410") =>
+            {
                 // Token expired, refresh and retry
-                self.refresh_credentials().await?;
+                warn!(
+                    row = row,
+                    col = col,
+                    zoom = zoom,
+                    "Apple Maps returned auth error, refreshing token"
+                );
+
+                if let Err(e) = self.refresh_credentials().await {
+                    // Refresh failed - log and return original error
+                    error!("Failed to refresh Apple Maps token: {}", e);
+                    return Err(ProviderError::ProviderSpecific(format!(
+                        "Token refresh failed: {}",
+                        e
+                    )));
+                }
+
+                // Retry with new token
                 let url = self.build_url(row, col, zoom)?;
-                self.http_client.get(&url).await
+                match self.http_client.get(&url).await {
+                    Ok(data) => Ok(data),
+                    Err(e) => {
+                        error!("Request failed after token refresh: {}", e);
+                        Err(e)
+                    }
+                }
             }
             Err(e) => Err(e),
         }
@@ -520,5 +658,32 @@ mod tests {
     fn test_zoom_constants() {
         assert_eq!(MIN_ZOOM, 0);
         assert_eq!(MAX_ZOOM, 20);
+    }
+
+    #[test]
+    fn test_token_status_lifecycle() {
+        let status = AppleTokenStatus::new_valid();
+        assert!(status.is_valid());
+        assert_eq!(status.refresh_success_count(), 0);
+        assert_eq!(status.refresh_failure_count(), 0);
+        assert!(status.last_error().is_none());
+
+        // Record a success
+        status.record_success();
+        assert!(status.is_valid());
+        assert_eq!(status.refresh_success_count(), 1);
+
+        // Record a failure
+        status.record_failure("Test error");
+        assert!(!status.is_valid());
+        assert_eq!(status.refresh_failure_count(), 1);
+        assert_eq!(status.last_error(), Some("Test error".to_string()));
+
+        // Snapshot
+        let snapshot = status.snapshot();
+        assert!(!snapshot.is_valid);
+        assert_eq!(snapshot.refresh_success_count, 1);
+        assert_eq!(snapshot.refresh_failure_count, 1);
+        assert_eq!(snapshot.last_error, Some("Test error".to_string()));
     }
 }
