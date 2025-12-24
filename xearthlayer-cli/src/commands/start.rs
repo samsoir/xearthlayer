@@ -90,6 +90,7 @@ pub fn run(args: StartArgs) -> Result<(), CliError> {
         .cache_disk_size(config.cache.disk_size)
         .generation_threads(config.generation.threads)
         .generation_timeout(config.generation.timeout)
+        .pipeline(config.pipeline.clone())
         .build();
 
     // Print banner

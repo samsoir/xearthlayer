@@ -1,5 +1,6 @@
 //! Texture encoding configuration.
 
+use super::file::DEFAULT_MIPMAP_COUNT;
 use crate::dds::DdsFormat;
 
 /// Configuration for texture encoding.
@@ -35,11 +36,11 @@ pub struct TextureConfig {
 impl TextureConfig {
     /// Create a new texture configuration with the specified format.
     ///
-    /// Uses default mipmap count of 5 (suitable for 4096×4096 → 256×256 chain).
+    /// Uses default mipmap count (suitable for 4096×4096 → 256×256 chain).
     pub fn new(format: DdsFormat) -> Self {
         Self {
             format,
-            mipmap_count: 5,
+            mipmap_count: DEFAULT_MIPMAP_COUNT,
         }
     }
 
@@ -69,7 +70,7 @@ impl Default for TextureConfig {
     fn default() -> Self {
         Self {
             format: DdsFormat::BC1,
-            mipmap_count: 5,
+            mipmap_count: DEFAULT_MIPMAP_COUNT,
         }
     }
 }
@@ -82,14 +83,14 @@ mod tests {
     fn test_default_config() {
         let config = TextureConfig::default();
         assert_eq!(config.format(), DdsFormat::BC1);
-        assert_eq!(config.mipmap_count(), 5);
+        assert_eq!(config.mipmap_count(), DEFAULT_MIPMAP_COUNT);
     }
 
     #[test]
     fn test_new_with_format() {
         let config = TextureConfig::new(DdsFormat::BC3);
         assert_eq!(config.format(), DdsFormat::BC3);
-        assert_eq!(config.mipmap_count(), 5); // Default mipmaps
+        assert_eq!(config.mipmap_count(), DEFAULT_MIPMAP_COUNT); // Default mipmaps
     }
 
     #[test]

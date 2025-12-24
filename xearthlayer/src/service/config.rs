@@ -1,6 +1,6 @@
 //! Service configuration types.
 
-use crate::config::{DownloadConfig, TextureConfig};
+use crate::config::{DownloadConfig, PipelineSettings, TextureConfig};
 use std::path::PathBuf;
 
 /// Configuration for the XEarthLayer service.
@@ -44,6 +44,8 @@ pub struct ServiceConfig {
     generation_timeout: Option<u64>,
     /// Quiet mode - disables periodic stats logging (for TUI mode)
     quiet_mode: bool,
+    /// Pipeline configuration for concurrency and retry behavior
+    pipeline: PipelineSettings,
 }
 
 impl ServiceConfig {
@@ -101,10 +103,20 @@ impl ServiceConfig {
     pub fn quiet_mode(&self) -> bool {
         self.quiet_mode
     }
+
+    /// Get the pipeline configuration for concurrency and retry behavior.
+    pub fn pipeline(&self) -> &PipelineSettings {
+        &self.pipeline
+    }
 }
 
 impl Default for ServiceConfig {
     fn default() -> Self {
+        use crate::config::{
+            default_cpu_concurrent, default_http_concurrent, default_prefetch_in_flight,
+            DEFAULT_COALESCE_CHANNEL_CAPACITY, DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SECS,
+            DEFAULT_RETRY_BASE_DELAY_MS,
+        };
         Self {
             texture: TextureConfig::default(),
             download: DownloadConfig::default(),
@@ -116,6 +128,15 @@ impl Default for ServiceConfig {
             generation_threads: None,
             generation_timeout: None,
             quiet_mode: false,
+            pipeline: PipelineSettings {
+                max_http_concurrent: default_http_concurrent(),
+                max_cpu_concurrent: default_cpu_concurrent(),
+                max_prefetch_in_flight: default_prefetch_in_flight(),
+                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+                max_retries: DEFAULT_MAX_RETRIES,
+                retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
+                coalesce_channel_capacity: DEFAULT_COALESCE_CHANNEL_CAPACITY,
+            },
         }
     }
 }
@@ -135,6 +156,7 @@ pub struct ServiceConfigBuilder {
     generation_threads: Option<usize>,
     generation_timeout: Option<u64>,
     quiet_mode: Option<bool>,
+    pipeline: Option<PipelineSettings>,
 }
 
 impl ServiceConfigBuilder {
@@ -198,8 +220,19 @@ impl ServiceConfigBuilder {
         self
     }
 
+    /// Set the pipeline configuration for concurrency and retry behavior.
+    pub fn pipeline(mut self, settings: PipelineSettings) -> Self {
+        self.pipeline = Some(settings);
+        self
+    }
+
     /// Build the configuration with defaults for unset values.
     pub fn build(self) -> ServiceConfig {
+        use crate::config::{
+            default_cpu_concurrent, default_http_concurrent, default_prefetch_in_flight,
+            DEFAULT_COALESCE_CHANNEL_CAPACITY, DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SECS,
+            DEFAULT_RETRY_BASE_DELAY_MS,
+        };
         ServiceConfig {
             texture: self.texture.unwrap_or_default(),
             download: self.download.unwrap_or_default(),
@@ -211,6 +244,15 @@ impl ServiceConfigBuilder {
             generation_threads: self.generation_threads,
             generation_timeout: self.generation_timeout,
             quiet_mode: self.quiet_mode.unwrap_or(false),
+            pipeline: self.pipeline.unwrap_or(PipelineSettings {
+                max_http_concurrent: default_http_concurrent(),
+                max_cpu_concurrent: default_cpu_concurrent(),
+                max_prefetch_in_flight: default_prefetch_in_flight(),
+                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+                max_retries: DEFAULT_MAX_RETRIES,
+                retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
+                coalesce_channel_capacity: DEFAULT_COALESCE_CHANNEL_CAPACITY,
+            }),
         }
     }
 }

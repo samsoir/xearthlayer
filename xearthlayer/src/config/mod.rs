@@ -39,9 +39,49 @@ mod xplane;
 
 pub use download::DownloadConfig;
 pub use file::{
-    config_directory, config_file_path, CacheSettings, ConfigFile, ConfigFileError,
-    DownloadSettings, GenerationSettings, LoggingSettings, PackagesSettings, ProviderSettings,
-    TextureSettings, XPlaneSettings,
+    config_directory,
+    config_file_path,
+    default_cpu_concurrent,
+    default_http_concurrent,
+    default_prefetch_in_flight,
+    num_cpus,
+    CacheSettings,
+    ConfigFile,
+    ConfigFileError,
+    DownloadSettings,
+    GenerationSettings,
+    LoggingSettings,
+    PackagesSettings,
+    PipelineSettings,
+    PrefetchSettings,
+    ProviderSettings,
+    TextureSettings,
+    XPlaneSettings,
+    // Pipeline defaults
+    DEFAULT_COALESCE_CHANNEL_CAPACITY,
+    // Cache defaults
+    DEFAULT_DISK_CACHE_SIZE,
+    // Download defaults
+    DEFAULT_DOWNLOAD_TIMEOUT_SECS,
+    // Generation defaults
+    DEFAULT_GENERATION_TIMEOUT_SECS,
+    DEFAULT_MAX_CONCURRENT_DOWNLOADS,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_MEMORY_CACHE_SIZE,
+    // Texture defaults
+    DEFAULT_MIPMAP_COUNT,
+    // DownloadConfig defaults
+    DEFAULT_PARALLEL_DOWNLOADS,
+    // Prefetch defaults
+    DEFAULT_PREFETCH_BATCH_SIZE,
+    DEFAULT_PREFETCH_CONE_ANGLE,
+    DEFAULT_PREFETCH_CONE_DISTANCE_NM,
+    DEFAULT_PREFETCH_MAX_IN_FLIGHT,
+    DEFAULT_PREFETCH_RADIAL_RADIUS,
+    DEFAULT_PREFETCH_RADIAL_RADIUS_NM,
+    DEFAULT_PREFETCH_UDP_PORT,
+    DEFAULT_REQUEST_TIMEOUT_SECS,
+    DEFAULT_RETRY_BASE_DELAY_MS,
 };
 pub use keys::{ConfigKey, ConfigKeyError};
 pub use size::{format_size, parse_size, Size, SizeParseError};

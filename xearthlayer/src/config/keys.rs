@@ -49,6 +49,15 @@ pub enum ConfigKey {
     GenerationThreads,
     GenerationTimeout,
 
+    // Pipeline settings
+    PipelineMaxHttpConcurrent,
+    PipelineMaxCpuConcurrent,
+    PipelineMaxPrefetchInFlight,
+    PipelineRequestTimeoutSecs,
+    PipelineMaxRetries,
+    PipelineRetryBaseDelayMs,
+    PipelineCoalesceChannelCapacity,
+
     // X-Plane settings
     XplaneSceneryDir,
 
@@ -93,6 +102,14 @@ impl FromStr for ConfigKey {
             "generation.threads" => Ok(ConfigKey::GenerationThreads),
             "generation.timeout" => Ok(ConfigKey::GenerationTimeout),
 
+            "pipeline.max_http_concurrent" => Ok(ConfigKey::PipelineMaxHttpConcurrent),
+            "pipeline.max_cpu_concurrent" => Ok(ConfigKey::PipelineMaxCpuConcurrent),
+            "pipeline.max_prefetch_in_flight" => Ok(ConfigKey::PipelineMaxPrefetchInFlight),
+            "pipeline.request_timeout_secs" => Ok(ConfigKey::PipelineRequestTimeoutSecs),
+            "pipeline.max_retries" => Ok(ConfigKey::PipelineMaxRetries),
+            "pipeline.retry_base_delay_ms" => Ok(ConfigKey::PipelineRetryBaseDelayMs),
+            "pipeline.coalesce_channel_capacity" => Ok(ConfigKey::PipelineCoalesceChannelCapacity),
+
             "xplane.scenery_dir" => Ok(ConfigKey::XplaneSceneryDir),
 
             "packages.library_url" => Ok(ConfigKey::PackagesLibraryUrl),
@@ -131,6 +148,13 @@ impl ConfigKey {
             ConfigKey::DownloadTimeout => "download.timeout",
             ConfigKey::GenerationThreads => "generation.threads",
             ConfigKey::GenerationTimeout => "generation.timeout",
+            ConfigKey::PipelineMaxHttpConcurrent => "pipeline.max_http_concurrent",
+            ConfigKey::PipelineMaxCpuConcurrent => "pipeline.max_cpu_concurrent",
+            ConfigKey::PipelineMaxPrefetchInFlight => "pipeline.max_prefetch_in_flight",
+            ConfigKey::PipelineRequestTimeoutSecs => "pipeline.request_timeout_secs",
+            ConfigKey::PipelineMaxRetries => "pipeline.max_retries",
+            ConfigKey::PipelineRetryBaseDelayMs => "pipeline.retry_base_delay_ms",
+            ConfigKey::PipelineCoalesceChannelCapacity => "pipeline.coalesce_channel_capacity",
             ConfigKey::XplaneSceneryDir => "xplane.scenery_dir",
             ConfigKey::PackagesLibraryUrl => "packages.library_url",
             ConfigKey::PackagesInstallLocation => "packages.install_location",
@@ -174,6 +198,19 @@ impl ConfigKey {
             ConfigKey::DownloadTimeout => config.download.timeout.to_string(),
             ConfigKey::GenerationThreads => config.generation.threads.to_string(),
             ConfigKey::GenerationTimeout => config.generation.timeout.to_string(),
+            ConfigKey::PipelineMaxHttpConcurrent => config.pipeline.max_http_concurrent.to_string(),
+            ConfigKey::PipelineMaxCpuConcurrent => config.pipeline.max_cpu_concurrent.to_string(),
+            ConfigKey::PipelineMaxPrefetchInFlight => {
+                config.pipeline.max_prefetch_in_flight.to_string()
+            }
+            ConfigKey::PipelineRequestTimeoutSecs => {
+                config.pipeline.request_timeout_secs.to_string()
+            }
+            ConfigKey::PipelineMaxRetries => config.pipeline.max_retries.to_string(),
+            ConfigKey::PipelineRetryBaseDelayMs => config.pipeline.retry_base_delay_ms.to_string(),
+            ConfigKey::PipelineCoalesceChannelCapacity => {
+                config.pipeline.coalesce_channel_capacity.to_string()
+            }
             ConfigKey::XplaneSceneryDir => config
                 .xplane
                 .scenery_dir
@@ -263,6 +300,27 @@ impl ConfigKey {
             ConfigKey::GenerationTimeout => {
                 config.generation.timeout = value.parse().unwrap();
             }
+            ConfigKey::PipelineMaxHttpConcurrent => {
+                config.pipeline.max_http_concurrent = value.parse().unwrap();
+            }
+            ConfigKey::PipelineMaxCpuConcurrent => {
+                config.pipeline.max_cpu_concurrent = value.parse().unwrap();
+            }
+            ConfigKey::PipelineMaxPrefetchInFlight => {
+                config.pipeline.max_prefetch_in_flight = value.parse().unwrap();
+            }
+            ConfigKey::PipelineRequestTimeoutSecs => {
+                config.pipeline.request_timeout_secs = value.parse().unwrap();
+            }
+            ConfigKey::PipelineMaxRetries => {
+                config.pipeline.max_retries = value.parse().unwrap();
+            }
+            ConfigKey::PipelineRetryBaseDelayMs => {
+                config.pipeline.retry_base_delay_ms = value.parse().unwrap();
+            }
+            ConfigKey::PipelineCoalesceChannelCapacity => {
+                config.pipeline.coalesce_channel_capacity = value.parse().unwrap();
+            }
             ConfigKey::XplaneSceneryDir => {
                 config.xplane.scenery_dir = optional_path(value);
             }
@@ -341,6 +399,13 @@ impl ConfigKey {
             ConfigKey::DownloadTimeout => Box::new(PositiveIntegerSpec),
             ConfigKey::GenerationThreads => Box::new(PositiveIntegerSpec),
             ConfigKey::GenerationTimeout => Box::new(PositiveIntegerSpec),
+            ConfigKey::PipelineMaxHttpConcurrent => Box::new(PositiveIntegerSpec),
+            ConfigKey::PipelineMaxCpuConcurrent => Box::new(PositiveIntegerSpec),
+            ConfigKey::PipelineMaxPrefetchInFlight => Box::new(PositiveIntegerSpec),
+            ConfigKey::PipelineRequestTimeoutSecs => Box::new(PositiveIntegerSpec),
+            ConfigKey::PipelineMaxRetries => Box::new(PositiveIntegerSpec),
+            ConfigKey::PipelineRetryBaseDelayMs => Box::new(PositiveIntegerSpec),
+            ConfigKey::PipelineCoalesceChannelCapacity => Box::new(PositiveIntegerSpec),
             ConfigKey::XplaneSceneryDir => Box::new(OptionalPathSpec),
             ConfigKey::PackagesLibraryUrl => Box::new(OptionalUrlSpec),
             ConfigKey::PackagesInstallLocation => Box::new(OptionalPathSpec),
@@ -372,6 +437,13 @@ impl ConfigKey {
             ConfigKey::DownloadTimeout,
             ConfigKey::GenerationThreads,
             ConfigKey::GenerationTimeout,
+            ConfigKey::PipelineMaxHttpConcurrent,
+            ConfigKey::PipelineMaxCpuConcurrent,
+            ConfigKey::PipelineMaxPrefetchInFlight,
+            ConfigKey::PipelineRequestTimeoutSecs,
+            ConfigKey::PipelineMaxRetries,
+            ConfigKey::PipelineRetryBaseDelayMs,
+            ConfigKey::PipelineCoalesceChannelCapacity,
             ConfigKey::XplaneSceneryDir,
             ConfigKey::PackagesLibraryUrl,
             ConfigKey::PackagesInstallLocation,

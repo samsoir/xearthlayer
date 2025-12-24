@@ -417,11 +417,17 @@ impl XEarthLayerService {
     ///
     /// Uses `DdsHandlerBuilder` for clean configuration of the pipeline.
     fn create_dds_handler(&self) -> DdsHandler {
+        let pipeline = self.config.pipeline();
         let mut builder = DdsHandlerBuilder::new(&self.provider_name)
             .with_format(self.config.texture().format())
             .with_mipmap_count(self.config.texture().mipmap_count())
-            .with_timeout(Duration::from_secs(self.config.download().timeout_secs()))
-            .with_max_retries(self.config.download().max_retries())
+            .with_timeout(Duration::from_secs(pipeline.request_timeout_secs))
+            .with_max_retries(pipeline.max_retries)
+            .with_max_global_http_requests(pipeline.max_http_concurrent)
+            .with_max_cpu_concurrent(pipeline.max_cpu_concurrent)
+            .with_max_prefetch_in_flight(pipeline.max_prefetch_in_flight)
+            .with_retry_base_delay_ms(pipeline.retry_base_delay_ms)
+            .with_coalesce_channel_capacity(pipeline.coalesce_channel_capacity)
             .with_metrics(Arc::clone(&self.metrics));
 
         // Configure provider (prefer async, fallback to sync)

@@ -126,6 +126,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         .cache_disk_size(config.cache.disk_size)
         .generation_threads(config.generation.threads)
         .generation_timeout(config.generation.timeout)
+        .pipeline(config.pipeline.clone())
         .quiet_mode(use_tui) // Disable stats logging when TUI is active
         .build();
 

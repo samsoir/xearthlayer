@@ -1,5 +1,7 @@
 //! Download/orchestrator configuration.
 
+use super::file::{DEFAULT_DOWNLOAD_TIMEOUT_SECS, DEFAULT_MAX_RETRIES, DEFAULT_PARALLEL_DOWNLOADS};
+
 /// Configuration for tile downloading and orchestration.
 ///
 /// Groups all parameters needed to configure the download orchestrator,
@@ -85,9 +87,9 @@ impl DownloadConfig {
 impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
-            timeout_secs: 30,
-            max_retries: 3,
-            parallel_downloads: 32,
+            timeout_secs: DEFAULT_DOWNLOAD_TIMEOUT_SECS,
+            max_retries: DEFAULT_MAX_RETRIES,
+            parallel_downloads: DEFAULT_PARALLEL_DOWNLOADS,
         }
     }
 }
@@ -99,9 +101,9 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = DownloadConfig::default();
-        assert_eq!(config.timeout_secs(), 30);
-        assert_eq!(config.max_retries(), 3);
-        assert_eq!(config.parallel_downloads(), 32);
+        assert_eq!(config.timeout_secs(), DEFAULT_DOWNLOAD_TIMEOUT_SECS);
+        assert_eq!(config.max_retries(), DEFAULT_MAX_RETRIES);
+        assert_eq!(config.parallel_downloads(), DEFAULT_PARALLEL_DOWNLOADS);
     }
 
     #[test]
@@ -115,23 +117,23 @@ mod tests {
     fn test_with_timeout_secs() {
         let config = DownloadConfig::new().with_timeout_secs(60);
         assert_eq!(config.timeout_secs(), 60);
-        assert_eq!(config.max_retries(), 3); // Unchanged
-        assert_eq!(config.parallel_downloads(), 32); // Unchanged
+        assert_eq!(config.max_retries(), DEFAULT_MAX_RETRIES); // Unchanged
+        assert_eq!(config.parallel_downloads(), DEFAULT_PARALLEL_DOWNLOADS); // Unchanged
     }
 
     #[test]
     fn test_with_max_retries() {
         let config = DownloadConfig::new().with_max_retries(5);
-        assert_eq!(config.timeout_secs(), 30); // Unchanged
+        assert_eq!(config.timeout_secs(), DEFAULT_DOWNLOAD_TIMEOUT_SECS); // Unchanged
         assert_eq!(config.max_retries(), 5);
-        assert_eq!(config.parallel_downloads(), 32); // Unchanged
+        assert_eq!(config.parallel_downloads(), DEFAULT_PARALLEL_DOWNLOADS); // Unchanged
     }
 
     #[test]
     fn test_with_parallel_downloads() {
         let config = DownloadConfig::new().with_parallel_downloads(16);
-        assert_eq!(config.timeout_secs(), 30); // Unchanged
-        assert_eq!(config.max_retries(), 3); // Unchanged
+        assert_eq!(config.timeout_secs(), DEFAULT_DOWNLOAD_TIMEOUT_SECS); // Unchanged
+        assert_eq!(config.max_retries(), DEFAULT_MAX_RETRIES); // Unchanged
         assert_eq!(config.parallel_downloads(), 16);
     }
 
@@ -170,6 +172,6 @@ mod tests {
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("DownloadConfig"));
         assert!(debug_str.contains("timeout_secs"));
-        assert!(debug_str.contains("30"));
+        assert!(debug_str.contains(&DEFAULT_DOWNLOAD_TIMEOUT_SECS.to_string()));
     }
 }

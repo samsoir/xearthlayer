@@ -27,6 +27,11 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 
 use crate::cache::MemoryCache;
+use crate::config::{
+    default_cpu_concurrent, default_http_concurrent, default_prefetch_in_flight,
+    DEFAULT_COALESCE_CHANNEL_CAPACITY, DEFAULT_MAX_CONCURRENT_DOWNLOADS, DEFAULT_MAX_RETRIES,
+    DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_RETRY_BASE_DELAY_MS,
+};
 use crate::dds::DdsFormat;
 use crate::fuse::DdsHandler;
 use crate::pipeline::adapters::{
@@ -84,6 +89,16 @@ pub struct DdsHandlerBuilder {
     max_retries: u32,
     /// Max concurrent downloads per tile
     max_concurrent_downloads: usize,
+    /// Global maximum concurrent HTTP requests
+    max_global_http_requests: usize,
+    /// Maximum concurrent prefetch jobs in flight
+    max_prefetch_in_flight: usize,
+    /// Base delay in milliseconds for retry backoff
+    retry_base_delay_ms: u64,
+    /// Broadcast channel capacity for request coalescing
+    coalesce_channel_capacity: usize,
+    /// Maximum concurrent CPU-bound operations
+    max_cpu_concurrent: usize,
     /// Pipeline telemetry metrics
     metrics: Option<Arc<PipelineMetrics>>,
 }
@@ -101,9 +116,14 @@ impl DdsHandlerBuilder {
             disk_io_limiter: None,
             dds_format: DdsFormat::BC1,
             mipmap_count: 5,
-            timeout: Duration::from_secs(30),
-            max_retries: 3,
-            max_concurrent_downloads: 256,
+            timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+            max_retries: DEFAULT_MAX_RETRIES,
+            max_concurrent_downloads: DEFAULT_MAX_CONCURRENT_DOWNLOADS,
+            max_global_http_requests: default_http_concurrent(),
+            max_prefetch_in_flight: default_prefetch_in_flight(),
+            retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
+            coalesce_channel_capacity: DEFAULT_COALESCE_CHANNEL_CAPACITY,
+            max_cpu_concurrent: default_cpu_concurrent(),
             metrics: None,
         }
     }
@@ -221,6 +241,36 @@ impl DdsHandlerBuilder {
         self
     }
 
+    /// Set the global maximum concurrent HTTP requests.
+    pub fn with_max_global_http_requests(mut self, count: usize) -> Self {
+        self.max_global_http_requests = count;
+        self
+    }
+
+    /// Set the maximum concurrent prefetch jobs in flight.
+    pub fn with_max_prefetch_in_flight(mut self, count: usize) -> Self {
+        self.max_prefetch_in_flight = count;
+        self
+    }
+
+    /// Set the base delay for retry backoff in milliseconds.
+    pub fn with_retry_base_delay_ms(mut self, ms: u64) -> Self {
+        self.retry_base_delay_ms = ms;
+        self
+    }
+
+    /// Set the coalesce channel capacity.
+    pub fn with_coalesce_channel_capacity(mut self, capacity: usize) -> Self {
+        self.coalesce_channel_capacity = capacity;
+        self
+    }
+
+    /// Set the maximum concurrent CPU-bound operations.
+    pub fn with_max_cpu_concurrent(mut self, count: usize) -> Self {
+        self.max_cpu_concurrent = count;
+        self
+    }
+
     /// Build the DDS handler.
     ///
     /// # Arguments
@@ -267,8 +317,11 @@ impl DdsHandlerBuilder {
             dds_format: self.dds_format,
             mipmap_count: self.mipmap_count,
             max_concurrent_downloads: self.max_concurrent_downloads,
-            max_global_http_requests: PipelineConfig::default_global_http_requests(),
-            max_prefetch_in_flight: PipelineConfig::default_prefetch_in_flight(),
+            max_global_http_requests: self.max_global_http_requests,
+            max_prefetch_in_flight: self.max_prefetch_in_flight,
+            retry_base_delay_ms: self.retry_base_delay_ms,
+            coalesce_channel_capacity: self.coalesce_channel_capacity,
+            max_cpu_concurrent: self.max_cpu_concurrent,
         };
 
         // Build handler based on available provider and cache configuration
@@ -373,9 +426,23 @@ mod tests {
         assert_eq!(builder.provider_name, "bing");
         assert_eq!(builder.dds_format, DdsFormat::BC1);
         assert_eq!(builder.mipmap_count, 5);
-        assert_eq!(builder.timeout, Duration::from_secs(30));
-        assert_eq!(builder.max_retries, 3);
-        assert_eq!(builder.max_concurrent_downloads, 256);
+        assert_eq!(
+            builder.timeout,
+            Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)
+        );
+        assert_eq!(builder.max_retries, DEFAULT_MAX_RETRIES);
+        assert_eq!(
+            builder.max_concurrent_downloads,
+            DEFAULT_MAX_CONCURRENT_DOWNLOADS
+        );
+        assert_eq!(builder.max_global_http_requests, default_http_concurrent());
+        assert_eq!(builder.max_prefetch_in_flight, default_prefetch_in_flight());
+        assert_eq!(builder.retry_base_delay_ms, DEFAULT_RETRY_BASE_DELAY_MS);
+        assert_eq!(
+            builder.coalesce_channel_capacity,
+            DEFAULT_COALESCE_CHANNEL_CAPACITY
+        );
+        assert_eq!(builder.max_cpu_concurrent, default_cpu_concurrent());
         assert!(builder.async_provider.is_none());
         assert!(builder.sync_provider.is_none());
         assert!(builder.cache_dir.is_none());

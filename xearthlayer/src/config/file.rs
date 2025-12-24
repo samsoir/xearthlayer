@@ -47,6 +47,8 @@ pub struct ConfigFile {
     pub download: DownloadSettings,
     /// Generation settings
     pub generation: GenerationSettings,
+    /// Pipeline settings for concurrency and retry behavior
+    pub pipeline: PipelineSettings,
     /// X-Plane settings
     pub xplane: XPlaneSettings,
     /// Package manager settings
@@ -105,6 +107,33 @@ pub struct GenerationSettings {
     /// If exceeded, returns a magenta placeholder.
     /// Default: 10 seconds.
     pub timeout: u64,
+}
+
+/// Pipeline configuration for concurrency and retry behavior.
+#[derive(Debug, Clone)]
+pub struct PipelineSettings {
+    /// Maximum concurrent HTTP requests across all tiles.
+    /// Default: min(num_cpus * 16, 256)
+    pub max_http_concurrent: usize,
+    /// Maximum concurrent CPU-bound operations (assemble + encode stages).
+    /// Default: num_cpus * 1.25, minimum num_cpus + 2
+    pub max_cpu_concurrent: usize,
+    /// Maximum concurrent prefetch jobs in flight.
+    /// Default: max(num_cpus / 4, 2) - leaves 75% of resources for on-demand
+    pub max_prefetch_in_flight: usize,
+    /// HTTP request timeout in seconds for individual chunk downloads.
+    /// Default: 10 seconds
+    pub request_timeout_secs: u64,
+    /// Maximum retry attempts per failed chunk download.
+    /// Default: 3
+    pub max_retries: u32,
+    /// Base delay in milliseconds for exponential backoff between retries.
+    /// Actual delay = base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms, 800ms)
+    /// Default: 100
+    pub retry_base_delay_ms: u64,
+    /// Broadcast channel capacity for request coalescing.
+    /// Default: 16
+    pub coalesce_channel_capacity: usize,
 }
 
 /// X-Plane configuration.
@@ -174,17 +203,28 @@ impl Default for ConfigFile {
             },
             cache: CacheSettings {
                 directory: cache_dir,
-                memory_size: 2 * 1024 * 1024 * 1024, // 2GB
-                disk_size: 20 * 1024 * 1024 * 1024,  // 20GB
+                memory_size: DEFAULT_MEMORY_CACHE_SIZE,
+                disk_size: DEFAULT_DISK_CACHE_SIZE,
                 disk_io_profile: DiskIoProfile::Auto,
             },
             texture: TextureSettings {
                 format: DdsFormat::BC1,
             },
-            download: DownloadSettings { timeout: 30 },
+            download: DownloadSettings {
+                timeout: DEFAULT_DOWNLOAD_TIMEOUT_SECS,
+            },
             generation: GenerationSettings {
                 threads: num_cpus(),
-                timeout: 10,
+                timeout: DEFAULT_GENERATION_TIMEOUT_SECS,
+            },
+            pipeline: PipelineSettings {
+                max_http_concurrent: default_http_concurrent(),
+                max_cpu_concurrent: default_cpu_concurrent(),
+                max_prefetch_in_flight: default_prefetch_in_flight(),
+                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+                max_retries: DEFAULT_MAX_RETRIES,
+                retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
+                coalesce_channel_capacity: DEFAULT_COALESCE_CHANNEL_CAPACITY,
             },
             xplane: XPlaneSettings { scenery_dir: None },
             packages: PackagesSettings {
@@ -199,24 +239,118 @@ impl Default for ConfigFile {
             },
             prefetch: PrefetchSettings {
                 enabled: true,
-                udp_port: 49002, // ForeFlight protocol port
-                cone_angle: 45.0,
-                cone_distance_nm: 100.0,
-                radial_radius_nm: 60.0,
-                batch_size: 500,
-                max_in_flight: 2000,
-                radial_radius: 3, // 7×7 = 49 tile grid
+                udp_port: DEFAULT_PREFETCH_UDP_PORT,
+                cone_angle: DEFAULT_PREFETCH_CONE_ANGLE,
+                cone_distance_nm: DEFAULT_PREFETCH_CONE_DISTANCE_NM,
+                radial_radius_nm: DEFAULT_PREFETCH_RADIAL_RADIUS_NM,
+                batch_size: DEFAULT_PREFETCH_BATCH_SIZE,
+                max_in_flight: DEFAULT_PREFETCH_MAX_IN_FLIGHT,
+                radial_radius: DEFAULT_PREFETCH_RADIAL_RADIUS,
             },
         }
     }
 }
 
 /// Get the number of available CPU cores.
-fn num_cpus() -> usize {
+pub fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
 }
+
+/// Default HTTP concurrency limit: min(num_cpus * 16, 256)
+pub fn default_http_concurrent() -> usize {
+    (num_cpus() * 16).min(256)
+}
+
+/// Default CPU concurrency limit: num_cpus * 1.25, minimum num_cpus + 2
+pub fn default_cpu_concurrent() -> usize {
+    let cpus = num_cpus();
+    ((cpus as f64 * 1.25).ceil() as usize).max(cpus + 2)
+}
+
+/// Default prefetch in-flight limit: max(num_cpus / 4, 2)
+pub fn default_prefetch_in_flight() -> usize {
+    (num_cpus() / 4).max(2)
+}
+
+/// Default request timeout in seconds.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 10;
+
+/// Default maximum retry attempts.
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
+
+/// Default retry backoff base delay in milliseconds.
+pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 100;
+
+/// Default coalesce channel capacity.
+pub const DEFAULT_COALESCE_CHANNEL_CAPACITY: usize = 16;
+
+/// Default maximum concurrent downloads per tile.
+pub const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 256;
+
+// =============================================================================
+// Cache defaults
+// =============================================================================
+
+/// Default memory cache size (2GB).
+pub const DEFAULT_MEMORY_CACHE_SIZE: usize = 2 * 1024 * 1024 * 1024;
+
+/// Default disk cache size (20GB).
+pub const DEFAULT_DISK_CACHE_SIZE: usize = 20 * 1024 * 1024 * 1024;
+
+// =============================================================================
+// Download defaults
+// =============================================================================
+
+/// Default download timeout in seconds.
+pub const DEFAULT_DOWNLOAD_TIMEOUT_SECS: u64 = 30;
+
+// =============================================================================
+// Generation defaults
+// =============================================================================
+
+/// Default generation timeout in seconds.
+pub const DEFAULT_GENERATION_TIMEOUT_SECS: u64 = 10;
+
+// =============================================================================
+// Prefetch defaults
+// =============================================================================
+
+/// Default UDP port for X-Plane telemetry (ForeFlight protocol).
+pub const DEFAULT_PREFETCH_UDP_PORT: u16 = 49002;
+
+/// Default prediction cone half-angle in degrees.
+pub const DEFAULT_PREFETCH_CONE_ANGLE: f32 = 45.0;
+
+/// Default cone distance ahead in nautical miles.
+pub const DEFAULT_PREFETCH_CONE_DISTANCE_NM: f32 = 100.0;
+
+/// Default radial buffer radius in nautical miles.
+pub const DEFAULT_PREFETCH_RADIAL_RADIUS_NM: f32 = 60.0;
+
+/// Default maximum tiles per prediction cycle.
+pub const DEFAULT_PREFETCH_BATCH_SIZE: usize = 500;
+
+/// Default maximum concurrent prefetch requests.
+pub const DEFAULT_PREFETCH_MAX_IN_FLIGHT: usize = 2000;
+
+/// Default radial prefetcher tile radius (7×7 = 49 tiles).
+pub const DEFAULT_PREFETCH_RADIAL_RADIUS: u8 = 3;
+
+// =============================================================================
+// Texture defaults
+// =============================================================================
+
+/// Default mipmap count (5 levels: 4096 → 2048 → 1024 → 512 → 256).
+pub const DEFAULT_MIPMAP_COUNT: usize = 5;
+
+// =============================================================================
+// Download config defaults (for DownloadConfig struct)
+// =============================================================================
+
+/// Default parallel downloads per tile.
+pub const DEFAULT_PARALLEL_DOWNLOADS: usize = 32;
 
 impl ConfigFile {
     /// Load configuration from the default path (~/.xearthlayer/config.ini).
@@ -377,6 +511,73 @@ impl ConfigFile {
                         key: "timeout".to_string(),
                         value: v.to_string(),
                         reason: "must be a positive integer (seconds)".to_string(),
+                    })?;
+            }
+        }
+
+        // [pipeline] section
+        if let Some(section) = ini.section(Some("pipeline")) {
+            if let Some(v) = section.get("max_http_concurrent") {
+                config.pipeline.max_http_concurrent =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "pipeline".to_string(),
+                        key: "max_http_concurrent".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("max_cpu_concurrent") {
+                config.pipeline.max_cpu_concurrent =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "pipeline".to_string(),
+                        key: "max_cpu_concurrent".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("max_prefetch_in_flight") {
+                config.pipeline.max_prefetch_in_flight =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "pipeline".to_string(),
+                        key: "max_prefetch_in_flight".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("request_timeout_secs") {
+                config.pipeline.request_timeout_secs =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "pipeline".to_string(),
+                        key: "request_timeout_secs".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (seconds)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("max_retries") {
+                config.pipeline.max_retries =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "pipeline".to_string(),
+                        key: "max_retries".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("retry_base_delay_ms") {
+                config.pipeline.retry_base_delay_ms =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "pipeline".to_string(),
+                        key: "retry_base_delay_ms".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (milliseconds)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("coalesce_channel_capacity") {
+                config.pipeline.coalesce_channel_capacity =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "pipeline".to_string(),
+                        key: "coalesce_channel_capacity".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
                     })?;
             }
         }
@@ -594,6 +795,30 @@ threads = {}
 ; If exceeded, returns a magenta placeholder texture
 timeout = {}
 
+[pipeline]
+; Advanced concurrency and retry settings. Defaults are tuned for most systems.
+; Only modify if you understand the implications.
+
+; Maximum concurrent HTTP requests across all tiles (default: min(num_cpus * 16, 256))
+; Higher values increase throughput but may overwhelm network stack
+max_http_concurrent = {}
+; Maximum concurrent CPU-bound operations for tile assembly and encoding
+; (default: num_cpus * 1.25, minimum num_cpus + 2)
+max_cpu_concurrent = {}
+; Maximum concurrent prefetch jobs (default: max(num_cpus / 4, 2))
+; Lower values leave more resources for on-demand tile requests
+max_prefetch_in_flight = {}
+; HTTP request timeout in seconds for individual chunk downloads (default: 10)
+request_timeout_secs = {}
+; Maximum retry attempts per failed chunk download (default: 3)
+max_retries = {}
+; Base delay in milliseconds for exponential backoff between retries (default: 100)
+; Actual delay = base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms, 800ms)
+retry_base_delay_ms = {}
+; Broadcast channel capacity for request coalescing (default: 16)
+; Rarely needs adjustment
+coalesce_channel_capacity = {}
+
 [xplane]
 ; X-Plane Custom Scenery directory for mounting scenery packs
 ; If empty, auto-detects from ~/.x-plane/x-plane_install_12.txt
@@ -652,6 +877,13 @@ radial_radius = {}
             self.download.timeout,
             self.generation.threads,
             self.generation.timeout,
+            self.pipeline.max_http_concurrent,
+            self.pipeline.max_cpu_concurrent,
+            self.pipeline.max_prefetch_in_flight,
+            self.pipeline.request_timeout_secs,
+            self.pipeline.max_retries,
+            self.pipeline.retry_base_delay_ms,
+            self.pipeline.coalesce_channel_capacity,
             scenery_dir,
             library_url,
             install_location,
@@ -726,10 +958,10 @@ mod tests {
 
         assert_eq!(config.provider.provider_type, "bing");
         assert!(config.provider.google_api_key.is_none());
-        assert_eq!(config.cache.memory_size, 2 * 1024 * 1024 * 1024);
-        assert_eq!(config.cache.disk_size, 20 * 1024 * 1024 * 1024);
+        assert_eq!(config.cache.memory_size, DEFAULT_MEMORY_CACHE_SIZE);
+        assert_eq!(config.cache.disk_size, DEFAULT_DISK_CACHE_SIZE);
         assert_eq!(config.texture.format, DdsFormat::BC1);
-        assert_eq!(config.download.timeout, 30);
+        assert_eq!(config.download.timeout, DEFAULT_DOWNLOAD_TIMEOUT_SECS);
         assert!(config.xplane.scenery_dir.is_none());
     }
 
@@ -753,7 +985,7 @@ mod tests {
             loaded.provider.google_api_key,
             Some("test-api-key".to_string())
         );
-        assert_eq!(loaded.cache.memory_size, 4 * 1024 * 1024 * 1024);
+        assert_eq!(loaded.cache.memory_size, 4 * 1024 * 1024 * 1024); // 4GB from config
         assert_eq!(loaded.download.timeout, 60);
     }
 
@@ -873,7 +1105,7 @@ timeout = 45
         assert_eq!(config.download.timeout, 45);
 
         // Default values
-        assert_eq!(config.cache.memory_size, 2 * 1024 * 1024 * 1024);
+        assert_eq!(config.cache.memory_size, DEFAULT_MEMORY_CACHE_SIZE);
         assert_eq!(config.texture.format, DdsFormat::BC1);
     }
 

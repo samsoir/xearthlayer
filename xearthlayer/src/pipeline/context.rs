@@ -3,6 +3,11 @@
 //! The `PipelineContext` provides access to all shared resources needed by
 //! pipeline stages, including HTTP clients, caches, encoders, and configuration.
 
+use crate::config::{
+    default_cpu_concurrent, default_http_concurrent, default_prefetch_in_flight,
+    DEFAULT_COALESCE_CHANNEL_CAPACITY, DEFAULT_MAX_CONCURRENT_DOWNLOADS, DEFAULT_MAX_RETRIES,
+    DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_RETRY_BASE_DELAY_MS,
+};
 use crate::dds::DdsFormat;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,58 +48,45 @@ pub struct PipelineConfig {
     /// Default: `max(num_cpus / 4, 2)` - leaves 75% of resources for on-demand.
     /// Each prefetch job processes one tile through the full pipeline.
     pub max_prefetch_in_flight: usize,
+
+    /// Base delay in milliseconds for exponential backoff between retries.
+    /// Actual delay = base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms, 800ms)
+    ///
+    /// Default: 100
+    pub retry_base_delay_ms: u64,
+
+    /// Broadcast channel capacity for request coalescing.
+    /// Higher values allow more concurrent waiters for the same tile.
+    ///
+    /// Default: 16
+    pub coalesce_channel_capacity: usize,
+
+    /// Maximum concurrent CPU-bound operations (assemble + encode stages).
+    /// Shared limiter prevents blocking thread pool exhaustion.
+    ///
+    /// Default: `num_cpus * 1.25`, minimum `num_cpus + 2`
+    pub max_cpu_concurrent: usize,
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
-            request_timeout: Duration::from_secs(10),
-            max_retries: 3,
+            request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+            max_retries: DEFAULT_MAX_RETRIES,
             dds_format: DdsFormat::BC1,
             mipmap_count: 5,
-            max_concurrent_downloads: 256,
-            max_global_http_requests: Self::default_global_http_requests(),
-            max_prefetch_in_flight: Self::default_prefetch_in_flight(),
+            max_concurrent_downloads: DEFAULT_MAX_CONCURRENT_DOWNLOADS,
+            max_global_http_requests: default_http_concurrent(),
+            max_prefetch_in_flight: default_prefetch_in_flight(),
+            retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
+            coalesce_channel_capacity: DEFAULT_COALESCE_CHANNEL_CAPACITY,
+            max_cpu_concurrent: default_cpu_concurrent(),
         }
     }
 }
 
-impl PipelineConfig {
-    /// Calculates a sensible default for global HTTP concurrency based on CPU count.
-    ///
-    /// Formula: `min(num_cpus * 16, 256)`
-    ///
-    /// This balances throughput with system resource constraints:
-    /// - HTTP requests are I/O-bound, so we can have many more than CPU count
-    /// - But too many overwhelms the network stack and causes connection failures
-    /// - 256 is the practical ceiling where diminishing returns set in
-    pub fn default_global_http_requests() -> usize {
-        let cpus = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4);
-
-        // Scale with CPU count but cap at 256
-        (cpus * 16).min(256)
-    }
-
-    /// Calculates a sensible default for prefetch concurrency based on CPU count.
-    ///
-    /// Formula: `max(num_cpus / 4, 2)`
-    ///
-    /// This leaves 75% of resources available for on-demand requests:
-    /// - 4-core system: 2 concurrent prefetch jobs
-    /// - 8-core system: 2 concurrent prefetch jobs
-    /// - 16-core system: 4 concurrent prefetch jobs
-    /// - 32-core system: 8 concurrent prefetch jobs
-    pub fn default_prefetch_in_flight() -> usize {
-        let cpus = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4);
-
-        // Use 1/4 of cores, minimum 2
-        (cpus / 4).max(2)
-    }
-}
+// Note: Default calculation functions are now in crate::config module.
+// Use default_http_concurrent(), default_prefetch_in_flight(), default_cpu_concurrent() from there.
 
 use crate::pipeline::executor::BlockingExecutor;
 
@@ -318,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_default_global_http_requests() {
-        let default = PipelineConfig::default_global_http_requests();
+        let default = default_http_concurrent();
         // Should be num_cpus * 16, capped at 256
         assert!(default >= 64); // At least 4 CPUs * 16
         assert!(default <= 256); // Capped at 256
