@@ -54,10 +54,11 @@ pub struct HttpConcurrencyLimiter {
     max_permits: usize,
 
     /// Current number of in-flight requests (for metrics)
-    in_flight: AtomicUsize,
+    /// Wrapped in Arc so permits can be 'static
+    in_flight: Arc<AtomicUsize>,
 
     /// Peak concurrent requests observed (for tuning)
-    peak_in_flight: AtomicUsize,
+    peak_in_flight: Arc<AtomicUsize>,
 }
 
 impl HttpConcurrencyLimiter {
@@ -76,8 +77,8 @@ impl HttpConcurrencyLimiter {
         Self {
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             max_permits: max_concurrent,
-            in_flight: AtomicUsize::new(0),
-            peak_in_flight: AtomicUsize::new(0),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak_in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -99,7 +100,7 @@ impl HttpConcurrencyLimiter {
     /// requests limit has been reached.
     ///
     /// The permit is automatically released when dropped.
-    pub async fn acquire(&self) -> HttpPermit<'_> {
+    pub async fn acquire(&self) -> HttpPermit {
         let permit = self
             .semaphore
             .clone()
@@ -126,14 +127,14 @@ impl HttpConcurrencyLimiter {
 
         HttpPermit {
             _permit: permit,
-            in_flight: &self.in_flight,
+            in_flight: Arc::clone(&self.in_flight),
         }
     }
 
     /// Tries to acquire a permit without waiting.
     ///
     /// Returns `None` if no permits are available.
-    pub fn try_acquire(&self) -> Option<HttpPermit<'_>> {
+    pub fn try_acquire(&self) -> Option<HttpPermit> {
         let permit = self.semaphore.clone().try_acquire_owned().ok()?;
 
         let current = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
@@ -153,7 +154,7 @@ impl HttpConcurrencyLimiter {
 
         Some(HttpPermit {
             _permit: permit,
-            in_flight: &self.in_flight,
+            in_flight: Arc::clone(&self.in_flight),
         })
     }
 
@@ -187,12 +188,14 @@ impl HttpConcurrencyLimiter {
 ///
 /// While this permit is held, it counts against the global concurrency limit.
 /// The permit is automatically released when dropped.
-pub struct HttpPermit<'a> {
+///
+/// This permit is `'static` so it can be moved into spawned tasks.
+pub struct HttpPermit {
     _permit: OwnedSemaphorePermit,
-    in_flight: &'a AtomicUsize,
+    in_flight: Arc<AtomicUsize>,
 }
 
-impl Drop for HttpPermit<'_> {
+impl Drop for HttpPermit {
     fn drop(&mut self) {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
     }

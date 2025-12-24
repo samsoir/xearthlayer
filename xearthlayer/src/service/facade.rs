@@ -11,7 +11,10 @@ use crate::coord::to_tile_coords;
 use crate::fuse::{DdsHandler, MountHandle, SpawnedMountHandle};
 use crate::log::Logger;
 use crate::pipeline::adapters::MemoryCacheAdapter;
-use crate::pipeline::ConcurrencyLimiter;
+use crate::pipeline::control_plane::{
+    ControlPlaneConfig, ControlPlaneHealth, PipelineControlPlane,
+};
+use crate::pipeline::{ConcurrencyLimiter, DiskIoProfile, RequestCoalescer};
 use crate::provider::{AsyncProviderType, Provider, ProviderConfig};
 use crate::telemetry::{PipelineMetrics, TelemetrySnapshot};
 use crate::texture::{DdsTextureEncoder, TextureEncoder};
@@ -20,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::{Handle, Runtime};
+use tokio::task::JoinHandle;
 
 /// High-level facade for XEarthLayer operations.
 ///
@@ -90,12 +94,18 @@ pub struct XEarthLayerService {
     metrics: Arc<PipelineMetrics>,
     /// Shared disk I/O concurrency limiter (for global limiting across packages)
     disk_io_limiter: Option<Arc<ConcurrencyLimiter>>,
+    /// Pipeline control plane for job management and health monitoring
+    control_plane: Arc<PipelineControlPlane>,
+    /// Health monitor join handle (runs in background)
+    #[allow(dead_code)]
+    health_monitor_handle: Option<JoinHandle<()>>,
 }
 
 impl XEarthLayerService {
     /// Create a new XEarthLayer service with a default Tokio runtime.
     ///
-    /// This is a convenience constructor that creates its own runtime internally.
+    /// This is a convenience constructor that creates its own runtime internally
+    /// with default SSD disk profile settings.
     /// For advanced use cases or testing, use [`with_runtime`] instead.
     ///
     /// # Arguments
@@ -112,13 +122,44 @@ impl XEarthLayerService {
         provider_config: ProviderConfig,
         logger: Arc<dyn Logger>,
     ) -> Result<Self, ServiceError> {
-        // Create multi-threaded runtime with worker threads
+        Self::with_disk_profile(config, provider_config, logger, DiskIoProfile::default())
+    }
+
+    /// Create a new XEarthLayer service with a Tokio runtime tuned for the disk profile.
+    ///
+    /// This constructor configures the Tokio runtime's blocking thread pool
+    /// based on the storage profile:
+    /// - **HDD**: Conservative blocking threads (seek-bound operations)
+    /// - **SSD**: Moderate blocking threads (SATA queue depth)
+    /// - **NVMe**: Higher blocking threads (multiple queues)
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Service configuration
+    /// * `provider_config` - Provider-specific configuration
+    /// * `logger` - Logger implementation
+    /// * `disk_profile` - Storage profile for tuning (use Auto for detection)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any component fails to initialize.
+    pub fn with_disk_profile(
+        config: ServiceConfig,
+        provider_config: ProviderConfig,
+        logger: Arc<dyn Logger>,
+        disk_profile: DiskIoProfile,
+    ) -> Result<Self, ServiceError> {
+        // Get CPU count for worker threads
         let num_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(4);
+            .unwrap_or(crate::pipeline::DEFAULT_CPU_FALLBACK);
+
+        // Get max blocking threads based on disk profile
+        let max_blocking_threads = disk_profile.max_blocking_threads();
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(num_cpus)
+            .max_blocking_threads(max_blocking_threads)
             .enable_all()
             .thread_name("xearthlayer-tokio")
             .build()
@@ -126,7 +167,9 @@ impl XEarthLayerService {
 
         tracing::info!(
             worker_threads = num_cpus,
-            "Created Tokio runtime with worker threads"
+            max_blocking_threads = max_blocking_threads,
+            disk_profile = %disk_profile,
+            "Created Tokio runtime with configured thread pools"
         );
 
         let handle = runtime.handle().clone();
@@ -212,6 +255,28 @@ impl XEarthLayerService {
         // 8. Initialize disk cache size from existing cache (async background task)
         builder::init_disk_cache_metrics(cache_dir.as_ref(), &metrics, &runtime_handle);
 
+        // 9. Create pipeline control plane for job management and health monitoring
+        let control_plane_config = ControlPlaneConfig {
+            max_concurrent_jobs: config.control_plane().max_concurrent_jobs,
+            stall_threshold: Duration::from_secs(config.control_plane().stall_threshold_secs),
+            health_check_interval: Duration::from_secs(
+                config.control_plane().health_check_interval_secs,
+            ),
+            semaphore_timeout: Duration::from_secs(config.control_plane().semaphore_timeout_secs),
+        };
+
+        // Create coalescer for the control plane (used for recovery operations)
+        let coalescer = Arc::new(RequestCoalescer::new());
+        let control_plane = Arc::new(PipelineControlPlane::new(control_plane_config, coalescer));
+
+        // 10. Start the health monitor in the background (using runtime handle since we're not in async context)
+        let health_monitor_handle = {
+            let cp = Arc::clone(&control_plane);
+            runtime_handle.spawn(async move {
+                cp.run_health_monitor_loop().await;
+            })
+        };
+
         Ok(Self {
             config,
             provider_name,
@@ -229,6 +294,8 @@ impl XEarthLayerService {
             cache_dir,
             metrics,
             disk_io_limiter: None,
+            control_plane,
+            health_monitor_handle: Some(health_monitor_handle),
         })
     }
 
@@ -305,6 +372,24 @@ impl XEarthLayerService {
     /// computed rates and formatted values.
     pub fn metrics(&self) -> &Arc<PipelineMetrics> {
         &self.metrics
+    }
+
+    /// Get a reference to the control plane health for dashboard display.
+    ///
+    /// The control plane health provides real-time status including:
+    /// - Jobs in progress
+    /// - Jobs recovered (stall detection)
+    /// - Semaphore timeouts
+    /// - Health status (healthy, degraded, critical)
+    pub fn control_plane_health(&self) -> Arc<ControlPlaneHealth> {
+        Arc::clone(self.control_plane.health())
+    }
+
+    /// Get the maximum concurrent jobs configured for the control plane.
+    ///
+    /// This is used by the dashboard to display capacity utilization.
+    pub fn max_concurrent_jobs(&self) -> usize {
+        self.control_plane.max_concurrent_jobs()
     }
 
     /// Get the DDS format used by this service.
@@ -452,6 +537,9 @@ impl XEarthLayerService {
         if let Some(ref adapter) = self.memory_cache_adapter {
             builder = builder.with_memory_cache_adapter(Arc::clone(adapter));
         }
+
+        // Configure control plane for job management and health monitoring
+        builder = builder.with_control_plane(Arc::clone(&self.control_plane));
 
         builder.build(self.runtime_handle.clone())
     }

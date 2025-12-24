@@ -14,5 +14,9 @@ mod encode;
 
 pub use assembly::assembly_stage;
 pub use cache::{cache_stage, check_memory_cache};
-pub use download::{download_stage, download_stage_cancellable, download_stage_with_limiter};
+pub use download::{
+    download_stage, download_stage_bounded, download_stage_cancellable, download_stage_with_limiter,
+};
+// Note: download_stage_bounded is the recommended function for production use
+// as it prevents task avalanche by only spawning tasks when HTTP permits are available
 pub use encode::encode_stage;

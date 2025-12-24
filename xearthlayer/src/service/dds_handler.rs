@@ -38,8 +38,9 @@ use crate::pipeline::adapters::{
     AsyncProviderAdapter, MemoryCacheAdapter, NullDiskCache, ParallelDiskCache, ProviderAdapter,
     TextureEncoderAdapter,
 };
+use crate::pipeline::control_plane::PipelineControlPlane;
 use crate::pipeline::{
-    create_dds_handler_with_metrics, ConcurrencyLimiter, PipelineConfig, TokioExecutor,
+    create_dds_handler_with_control_plane, ConcurrencyLimiter, PipelineConfig, TokioExecutor,
 };
 use crate::provider::{AsyncProviderType, Provider};
 use crate::telemetry::PipelineMetrics;
@@ -101,6 +102,8 @@ pub struct DdsHandlerBuilder {
     max_cpu_concurrent: usize,
     /// Pipeline telemetry metrics
     metrics: Option<Arc<PipelineMetrics>>,
+    /// Pipeline control plane for job management and health monitoring
+    control_plane: Option<Arc<PipelineControlPlane>>,
 }
 
 impl DdsHandlerBuilder {
@@ -125,6 +128,7 @@ impl DdsHandlerBuilder {
             coalesce_channel_capacity: DEFAULT_COALESCE_CHANNEL_CAPACITY,
             max_cpu_concurrent: default_cpu_concurrent(),
             metrics: None,
+            control_plane: None,
         }
     }
 
@@ -271,6 +275,20 @@ impl DdsHandlerBuilder {
         self
     }
 
+    /// Set the control plane for job management and health monitoring.
+    ///
+    /// When a control plane is set, the handler will:
+    /// - Submit all work through the control plane's `submit()` method
+    /// - Report stage transitions to the control plane for tracking
+    /// - Respect job-level concurrency limits
+    /// - Enable stall detection and recovery
+    ///
+    /// This is the recommended configuration for production use.
+    pub fn with_control_plane(mut self, control_plane: Arc<PipelineControlPlane>) -> Self {
+        self.control_plane = Some(control_plane);
+        self
+    }
+
     /// Build the DDS handler.
     ///
     /// # Arguments
@@ -286,15 +304,15 @@ impl DdsHandlerBuilder {
         let encoder_adapter = Arc::new(TextureEncoderAdapter::new(encoder));
 
         // Use pre-created adapter if available, otherwise create from raw cache
-        let memory_cache_adapter = match self.memory_cache_adapter {
+        let memory_cache_adapter = match &self.memory_cache_adapter {
             Some(adapter) => {
                 // Use the shared adapter instance (preferred - enables sharing with prefetcher)
-                adapter
+                Arc::clone(adapter)
             }
-            None => Arc::new(match self.memory_cache {
+            None => Arc::new(match &self.memory_cache {
                 Some(cache) => {
                     // Create adapter from the shared cache
-                    MemoryCacheAdapter::new(cache, &self.provider_name, self.dds_format)
+                    MemoryCacheAdapter::new(Arc::clone(cache), &self.provider_name, self.dds_format)
                 }
                 None => {
                     // Minimal cache when disabled
@@ -324,8 +342,13 @@ impl DdsHandlerBuilder {
             max_cpu_concurrent: self.max_cpu_concurrent,
         };
 
+        // Clone fields before the match to avoid partial move
+        let cache_dir = self.cache_dir.clone();
+        let async_provider = self.async_provider.clone();
+        let sync_provider = self.sync_provider.clone();
+
         // Build handler based on available provider and cache configuration
-        match (self.async_provider, self.sync_provider, self.cache_dir) {
+        match (async_provider, sync_provider, cache_dir) {
             // Async provider with disk cache (PREFERRED)
             (Some(async_prov), _, Some(dir)) => {
                 let provider_adapter = Arc::new(AsyncProviderAdapter::from_arc(async_prov));
@@ -337,8 +360,7 @@ impl DdsHandlerBuilder {
                     )),
                     None => Arc::new(ParallelDiskCache::with_defaults(dir, &self.provider_name)),
                 };
-                tracing::info!("DDS handler: async provider + parallel disk cache");
-                create_dds_handler_with_metrics(
+                self.build_handler(
                     provider_adapter,
                     encoder_adapter,
                     memory_cache_adapter,
@@ -346,15 +368,14 @@ impl DdsHandlerBuilder {
                     executor,
                     pipeline_config,
                     runtime_handle,
-                    self.metrics,
+                    "async provider + parallel disk cache",
                 )
             }
             // Async provider without disk cache (PREFERRED)
             (Some(async_prov), _, None) => {
                 let provider_adapter = Arc::new(AsyncProviderAdapter::from_arc(async_prov));
                 let disk_cache = Arc::new(NullDiskCache);
-                tracing::info!("DDS handler: async provider, no disk cache");
-                create_dds_handler_with_metrics(
+                self.build_handler(
                     provider_adapter,
                     encoder_adapter,
                     memory_cache_adapter,
@@ -362,7 +383,7 @@ impl DdsHandlerBuilder {
                     executor,
                     pipeline_config,
                     runtime_handle,
-                    self.metrics,
+                    "async provider, no disk cache",
                 )
             }
             // Sync provider with disk cache (FALLBACK)
@@ -376,8 +397,8 @@ impl DdsHandlerBuilder {
                     )),
                     None => Arc::new(ParallelDiskCache::with_defaults(dir, &self.provider_name)),
                 };
-                tracing::warn!("DDS handler: sync provider + disk cache (may exhaust thread pool)");
-                create_dds_handler_with_metrics(
+                tracing::warn!("Using sync provider (may exhaust thread pool under load)");
+                self.build_handler(
                     provider_adapter,
                     encoder_adapter,
                     memory_cache_adapter,
@@ -385,17 +406,15 @@ impl DdsHandlerBuilder {
                     executor,
                     pipeline_config,
                     runtime_handle,
-                    self.metrics,
+                    "sync provider + disk cache",
                 )
             }
             // Sync provider without disk cache (FALLBACK)
             (None, Some(sync_prov), None) => {
                 let provider_adapter = Arc::new(ProviderAdapter::new(sync_prov));
                 let disk_cache = Arc::new(NullDiskCache);
-                tracing::warn!(
-                    "DDS handler: sync provider, no disk cache (may exhaust thread pool)"
-                );
-                create_dds_handler_with_metrics(
+                tracing::warn!("Using sync provider (may exhaust thread pool under load)");
+                self.build_handler(
                     provider_adapter,
                     encoder_adapter,
                     memory_cache_adapter,
@@ -403,7 +422,7 @@ impl DdsHandlerBuilder {
                     executor,
                     pipeline_config,
                     runtime_handle,
-                    self.metrics,
+                    "sync provider, no disk cache",
                 )
             }
             // No provider configured
@@ -413,6 +432,54 @@ impl DdsHandlerBuilder {
                 )
             }
         }
+    }
+
+    /// Internal helper to build the handler with control plane.
+    ///
+    /// # Panics
+    ///
+    /// Panics if control plane is not set. Use `with_control_plane()` before calling `build()`.
+    #[allow(clippy::too_many_arguments)]
+    fn build_handler<P, E, M, D, X>(
+        &self,
+        provider: Arc<P>,
+        encoder: Arc<E>,
+        memory_cache: Arc<M>,
+        disk_cache: Arc<D>,
+        executor: Arc<X>,
+        config: PipelineConfig,
+        runtime_handle: Handle,
+        description: &str,
+    ) -> DdsHandler
+    where
+        P: crate::pipeline::ChunkProvider + 'static,
+        E: crate::pipeline::TextureEncoderAsync + 'static,
+        M: crate::pipeline::MemoryCache + 'static,
+        D: crate::pipeline::DiskCache + 'static,
+        X: crate::pipeline::BlockingExecutor + 'static,
+    {
+        let control_plane = self
+            .control_plane
+            .as_ref()
+            .expect("DdsHandlerBuilder requires control_plane to be set via with_control_plane()");
+
+        tracing::info!(
+            description = description,
+            max_concurrent_jobs = control_plane.max_concurrent_jobs(),
+            "DDS handler with control plane"
+        );
+
+        create_dds_handler_with_control_plane(
+            Arc::clone(control_plane),
+            provider,
+            encoder,
+            memory_cache,
+            disk_cache,
+            executor,
+            config,
+            runtime_handle,
+            self.metrics.clone(),
+        )
     }
 }
 

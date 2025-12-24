@@ -80,6 +80,12 @@ pub enum ConfigKey {
     PrefetchBatchSize,
     PrefetchMaxInFlight,
     PrefetchRadialRadius,
+
+    // Control plane settings
+    ControlPlaneMaxConcurrentJobs,
+    ControlPlaneStallThresholdSecs,
+    ControlPlaneHealthCheckIntervalSecs,
+    ControlPlaneSemaphoreTimeoutSecs,
 }
 
 impl FromStr for ConfigKey {
@@ -129,6 +135,15 @@ impl FromStr for ConfigKey {
             "prefetch.max_in_flight" => Ok(ConfigKey::PrefetchMaxInFlight),
             "prefetch.radial_radius" => Ok(ConfigKey::PrefetchRadialRadius),
 
+            "control_plane.max_concurrent_jobs" => Ok(ConfigKey::ControlPlaneMaxConcurrentJobs),
+            "control_plane.stall_threshold_secs" => Ok(ConfigKey::ControlPlaneStallThresholdSecs),
+            "control_plane.health_check_interval_secs" => {
+                Ok(ConfigKey::ControlPlaneHealthCheckIntervalSecs)
+            }
+            "control_plane.semaphore_timeout_secs" => {
+                Ok(ConfigKey::ControlPlaneSemaphoreTimeoutSecs)
+            }
+
             _ => Err(ConfigKeyError::UnknownKey(s.to_string())),
         }
     }
@@ -170,6 +185,12 @@ impl ConfigKey {
             ConfigKey::PrefetchBatchSize => "prefetch.batch_size",
             ConfigKey::PrefetchMaxInFlight => "prefetch.max_in_flight",
             ConfigKey::PrefetchRadialRadius => "prefetch.radial_radius",
+            ConfigKey::ControlPlaneMaxConcurrentJobs => "control_plane.max_concurrent_jobs",
+            ConfigKey::ControlPlaneStallThresholdSecs => "control_plane.stall_threshold_secs",
+            ConfigKey::ControlPlaneHealthCheckIntervalSecs => {
+                "control_plane.health_check_interval_secs"
+            }
+            ConfigKey::ControlPlaneSemaphoreTimeoutSecs => "control_plane.semaphore_timeout_secs",
         }
     }
 
@@ -250,6 +271,18 @@ impl ConfigKey {
             ConfigKey::PrefetchBatchSize => config.prefetch.batch_size.to_string(),
             ConfigKey::PrefetchMaxInFlight => config.prefetch.max_in_flight.to_string(),
             ConfigKey::PrefetchRadialRadius => config.prefetch.radial_radius.to_string(),
+            ConfigKey::ControlPlaneMaxConcurrentJobs => {
+                config.control_plane.max_concurrent_jobs.to_string()
+            }
+            ConfigKey::ControlPlaneStallThresholdSecs => {
+                config.control_plane.stall_threshold_secs.to_string()
+            }
+            ConfigKey::ControlPlaneHealthCheckIntervalSecs => {
+                config.control_plane.health_check_interval_secs.to_string()
+            }
+            ConfigKey::ControlPlaneSemaphoreTimeoutSecs => {
+                config.control_plane.semaphore_timeout_secs.to_string()
+            }
         }
     }
 
@@ -369,6 +402,18 @@ impl ConfigKey {
             ConfigKey::PrefetchRadialRadius => {
                 config.prefetch.radial_radius = value.parse().unwrap();
             }
+            ConfigKey::ControlPlaneMaxConcurrentJobs => {
+                config.control_plane.max_concurrent_jobs = value.parse().unwrap();
+            }
+            ConfigKey::ControlPlaneStallThresholdSecs => {
+                config.control_plane.stall_threshold_secs = value.parse().unwrap();
+            }
+            ConfigKey::ControlPlaneHealthCheckIntervalSecs => {
+                config.control_plane.health_check_interval_secs = value.parse().unwrap();
+            }
+            ConfigKey::ControlPlaneSemaphoreTimeoutSecs => {
+                config.control_plane.semaphore_timeout_secs = value.parse().unwrap();
+            }
         }
     }
 
@@ -421,6 +466,10 @@ impl ConfigKey {
             ConfigKey::PrefetchBatchSize => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchMaxInFlight => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchRadialRadius => Box::new(PositiveIntegerSpec),
+            ConfigKey::ControlPlaneMaxConcurrentJobs => Box::new(PositiveIntegerSpec),
+            ConfigKey::ControlPlaneStallThresholdSecs => Box::new(PositiveIntegerSpec),
+            ConfigKey::ControlPlaneHealthCheckIntervalSecs => Box::new(PositiveIntegerSpec),
+            ConfigKey::ControlPlaneSemaphoreTimeoutSecs => Box::new(PositiveIntegerSpec),
         }
     }
 
@@ -459,6 +508,10 @@ impl ConfigKey {
             ConfigKey::PrefetchBatchSize,
             ConfigKey::PrefetchMaxInFlight,
             ConfigKey::PrefetchRadialRadius,
+            ConfigKey::ControlPlaneMaxConcurrentJobs,
+            ConfigKey::ControlPlaneStallThresholdSecs,
+            ConfigKey::ControlPlaneHealthCheckIntervalSecs,
+            ConfigKey::ControlPlaneSemaphoreTimeoutSecs,
         ]
     }
 }

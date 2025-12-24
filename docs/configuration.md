@@ -221,6 +221,39 @@ request_timeout_secs = 15
 - **CPU concurrency**: `num_cpus * 1.25` - modest oversubscription for blocking thread pool efficiency
 - **Prefetch in-flight**: `max(num_cpus / 4, 2)` - leaves 75% of resources for on-demand requests
 
+### [control_plane]
+
+Controls the pipeline control plane for job management, health monitoring, and deadlock prevention. The control plane limits how many tiles can be processed simultaneously and recovers stalled jobs.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `max_concurrent_jobs` | integer | `num_cpus × 2` | Maximum concurrent tile processing jobs |
+| `stall_threshold_secs` | integer | `60` | Time in seconds before a job is considered stalled |
+| `health_check_interval_secs` | integer | `5` | Interval between health checks (seconds) |
+| `semaphore_timeout_secs` | integer | `30` | Timeout for job slot acquisition (seconds) |
+
+**Example:**
+```ini
+[control_plane]
+; Increase concurrent jobs for high-core-count systems
+max_concurrent_jobs = 32
+; Increase stall threshold for slow networks
+stall_threshold_secs = 120
+```
+
+**How it works:**
+- **Job limiting**: Prevents unbounded tile starts that would overwhelm downstream resources. With 8 CPUs, defaults to 16 concurrent tiles.
+- **Stall detection**: Jobs exceeding `stall_threshold_secs` are cancelled and recovered automatically.
+- **Prefetch behavior**: Prefetch jobs use non-blocking slot acquisition - if no slots are available, they're skipped rather than waiting.
+- **On-demand behavior**: On-demand requests (from X-Plane) block up to `semaphore_timeout_secs` waiting for a slot.
+
+**Dashboard display:**
+The TUI dashboard shows control plane health including:
+- Jobs in progress / max concurrent
+- Jobs recovered (stall detection)
+- Semaphore timeouts
+- Health status (Healthy, Degraded, Critical)
+
 ### [prefetch]
 
 Controls predictive tile prefetching based on X-Plane telemetry.
@@ -340,6 +373,13 @@ timeout = 10
 ; max_retries = 3
 ; retry_base_delay_ms = 100
 
+[control_plane]
+; Job management and health monitoring (defaults are tuned for most systems)
+; max_concurrent_jobs = 16  ; num_cpus × 2
+; stall_threshold_secs = 60
+; health_check_interval_secs = 5
+; semaphore_timeout_secs = 30
+
 [prefetch]
 ; Predictive tile prefetching based on X-Plane telemetry
 enabled = true
@@ -426,6 +466,10 @@ Values are validated before being saved. Invalid values will produce an error me
 | `pipeline.max_retries` | positive integer | Max retry attempts |
 | `pipeline.retry_base_delay_ms` | positive integer | Retry backoff base delay (ms) |
 | `pipeline.coalesce_channel_capacity` | positive integer | Coalesce channel capacity |
+| `control_plane.max_concurrent_jobs` | positive integer | Max concurrent tile jobs |
+| `control_plane.stall_threshold_secs` | positive integer | Job stall timeout (seconds) |
+| `control_plane.health_check_interval_secs` | positive integer | Health check interval (seconds) |
+| `control_plane.semaphore_timeout_secs` | positive integer | Slot acquisition timeout (seconds) |
 | `prefetch.enabled` | `true`, `false` | Enable predictive prefetching |
 | `prefetch.udp_port` | positive integer | X-Plane telemetry UDP port |
 | `prefetch.cone_angle` | positive number | Prediction cone half-angle (degrees) |

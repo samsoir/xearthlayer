@@ -27,6 +27,7 @@ pub mod logging;
 pub mod manager;
 pub mod orchestrator;
 pub mod package;
+pub mod panic;
 pub mod pipeline;
 pub mod prefetch;
 pub mod provider;

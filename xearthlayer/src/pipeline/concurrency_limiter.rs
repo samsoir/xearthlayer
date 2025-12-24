@@ -37,6 +37,7 @@
 use super::storage::DiskIoProfile;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Default scaling factor for calculating max concurrency.
@@ -257,6 +258,57 @@ impl ConcurrencyLimiter {
         })
     }
 
+    /// Acquires a permit with a timeout.
+    ///
+    /// Returns `Err(AcquireTimeoutError)` if the timeout expires before
+    /// a permit becomes available. This provides defense-in-depth against
+    /// potential stalls in the pipeline.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for a permit
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let limiter = ConcurrencyLimiter::new(10, "test");
+    /// match limiter.acquire_timeout(Duration::from_secs(30)).await {
+    ///     Ok(permit) => {
+    ///         // Use permit...
+    ///     }
+    ///     Err(_) => {
+    ///         // Handle timeout - potential stall detected
+    ///     }
+    /// }
+    /// ```
+    pub async fn acquire_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<ConcurrencyPermit<'_>, AcquireTimeoutError> {
+        match tokio::time::timeout(timeout, self.semaphore.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => {
+                let current = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+                self.update_peak(current);
+
+                Ok(ConcurrencyPermit {
+                    _permit: permit,
+                    in_flight: &self.in_flight,
+                })
+            }
+            Ok(Err(_)) => {
+                // Semaphore closed - shouldn't happen in normal operation
+                Err(AcquireTimeoutError::SemaphoreClosed)
+            }
+            Err(_) => {
+                // Timeout elapsed
+                Err(AcquireTimeoutError::Timeout {
+                    limiter_label: self.label.clone(),
+                    timeout,
+                })
+            }
+        }
+    }
+
     /// Updates the peak counter if current exceeds it.
     fn update_peak(&self, current: usize) {
         let mut peak = self.peak_in_flight.load(Ordering::Relaxed);
@@ -318,6 +370,42 @@ impl Drop for ConcurrencyPermit<'_> {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 }
+
+/// Error returned when `acquire_timeout` fails.
+#[derive(Debug, Clone)]
+pub enum AcquireTimeoutError {
+    /// The timeout elapsed before a permit became available.
+    Timeout {
+        /// Label of the limiter that timed out
+        limiter_label: String,
+        /// The timeout that was exceeded
+        timeout: Duration,
+    },
+    /// The semaphore was closed (should not happen in normal operation).
+    SemaphoreClosed,
+}
+
+impl std::fmt::Display for AcquireTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout {
+                limiter_label,
+                timeout,
+            } => {
+                write!(
+                    f,
+                    "Timeout ({:?}) waiting for {} limiter permit",
+                    timeout, limiter_label
+                )
+            }
+            Self::SemaphoreClosed => {
+                write!(f, "Semaphore closed unexpectedly")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AcquireTimeoutError {}
 
 #[cfg(test)]
 mod tests {
@@ -461,5 +549,69 @@ mod tests {
         }
 
         assert_eq!(limiter.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_timeout_success() {
+        let limiter = ConcurrencyLimiter::new(2, "test");
+
+        // Should succeed quickly when permits available
+        let permit = limiter
+            .acquire_timeout(Duration::from_secs(1))
+            .await
+            .expect("should acquire permit");
+
+        assert_eq!(limiter.in_flight(), 1);
+        drop(permit);
+        assert_eq!(limiter.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_timeout_expires() {
+        let limiter = ConcurrencyLimiter::new(1, "test_limiter");
+
+        // Take the only permit
+        let _permit = limiter.acquire().await;
+
+        // Try to acquire with short timeout - should fail
+        let result = limiter.acquire_timeout(Duration::from_millis(50)).await;
+
+        assert!(result.is_err());
+        match result {
+            Err(AcquireTimeoutError::Timeout { limiter_label, .. }) => {
+                assert_eq!(limiter_label, "test_limiter");
+            }
+            _ => panic!("Expected timeout error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acquire_timeout_succeeds_after_release() {
+        use tokio::sync::oneshot;
+
+        let limiter = Arc::new(ConcurrencyLimiter::new(1, "test"));
+        let limiter_holder = Arc::clone(&limiter);
+        let limiter_waiter = Arc::clone(&limiter);
+
+        // Channel to signal when holder has acquired
+        let (tx, rx) = oneshot::channel();
+
+        // Spawn a task that holds the permit briefly
+        tokio::spawn(async move {
+            let _permit = limiter_holder.acquire().await;
+            let _ = tx.send(()); // Signal that we have the permit
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Permit released when _permit goes out of scope
+        });
+
+        // Wait for holder to acquire
+        let _ = rx.await;
+
+        // Should succeed with longer timeout (holder releases after 50ms)
+        let result = limiter_waiter
+            .acquire_timeout(Duration::from_millis(200))
+            .await;
+
+        assert!(result.is_ok());
     }
 }

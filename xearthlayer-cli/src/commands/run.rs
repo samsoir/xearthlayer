@@ -11,6 +11,7 @@ use xearthlayer::config::{format_size, ConfigFile, DownloadConfig, TextureConfig
 use xearthlayer::log::TracingLogger;
 use xearthlayer::manager::{LocalPackageStore, MountManager, ServiceBuilder};
 use xearthlayer::package::PackageType;
+use xearthlayer::panic as panic_handler;
 use xearthlayer::prefetch::{
     Prefetcher, RadialPrefetchConfig, RadialPrefetcher, SharedPrefetchStatus, TelemetryListener,
 };
@@ -36,6 +37,9 @@ pub struct RunArgs {
 
 /// Run the run command.
 pub fn run(args: RunArgs) -> Result<(), CliError> {
+    // Initialize panic handler early for crash cleanup
+    panic_handler::init();
+
     let runner = CliRunner::with_debug(args.debug)?;
     runner.log_startup("run");
     let config = runner.config();
@@ -361,6 +365,13 @@ fn run_with_dashboard(
     let mut dashboard = Dashboard::new(dashboard_config, shutdown.clone())
         .map_err(|e| CliError::Config(format!("Failed to create dashboard: {}", e)))?
         .with_prefetch_status(prefetch_status);
+
+    // Wire in control plane health if available
+    if let Some(service) = mount_manager.get_service() {
+        let control_plane_health = service.control_plane_health();
+        let max_concurrent_jobs = service.max_concurrent_jobs();
+        dashboard = dashboard.with_control_plane(control_plane_health, max_concurrent_jobs);
+    }
 
     // Main event loop
     let tick_rate = std::time::Duration::from_millis(100);

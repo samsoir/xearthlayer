@@ -26,8 +26,10 @@ pub struct TelemetrySnapshot {
     pub jobs_submitted: u64,
     /// Jobs completed successfully
     pub jobs_completed: u64,
-    /// Jobs that failed
+    /// Jobs that failed due to pipeline errors
     pub jobs_failed: u64,
+    /// Jobs that timed out (FUSE timeout, work may have completed in background)
+    pub jobs_timed_out: u64,
     /// Currently active jobs
     pub jobs_active: usize,
     /// Jobs that were coalesced
@@ -97,12 +99,24 @@ impl TelemetrySnapshot {
     }
 
     /// Returns the error rate (0.0 - 1.0).
+    ///
+    /// This only counts actual pipeline errors, not timeouts.
     pub fn error_rate(&self) -> f64 {
-        let total = self.jobs_completed + self.jobs_failed;
+        let total = self.jobs_completed + self.jobs_failed + self.jobs_timed_out;
         if total == 0 {
             0.0
         } else {
             self.jobs_failed as f64 / total as f64
+        }
+    }
+
+    /// Returns the timeout rate (0.0 - 1.0).
+    pub fn timeout_rate(&self) -> f64 {
+        let total = self.jobs_completed + self.jobs_failed + self.jobs_timed_out;
+        if total == 0 {
+            0.0
+        } else {
+            self.jobs_timed_out as f64 / total as f64
         }
     }
 
@@ -157,7 +171,8 @@ impl fmt::Display for TelemetrySnapshot {
             self.jobs_completed, self.jobs_per_second
         )?;
         writeln!(f, "  Active: {}", self.jobs_active)?;
-        writeln!(f, "  Failed: {}", self.jobs_failed)?;
+        writeln!(f, "  Timed out: {}", self.jobs_timed_out)?;
+        writeln!(f, "  Errors: {}", self.jobs_failed)?;
         writeln!(
             f,
             "  Coalesced: {} ({:.1}%)",
@@ -255,7 +270,8 @@ mod tests {
             fuse_requests_waiting: 12,
             jobs_submitted: 100,
             jobs_completed: 90,
-            jobs_failed: 5,
+            jobs_failed: 2,
+            jobs_timed_out: 3,
             jobs_active: 5,
             jobs_coalesced: 20,
             chunks_downloaded: 23040, // 90 tiles × 256 chunks
@@ -287,9 +303,17 @@ mod tests {
     #[test]
     fn test_error_rate() {
         let snapshot = test_snapshot();
-        // 5 failed out of 95 total (90 + 5)
-        let expected = 5.0 / 95.0;
+        // 2 failed out of 95 total (90 completed + 2 failed + 3 timed_out)
+        let expected = 2.0 / 95.0;
         assert!((snapshot.error_rate() - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_timeout_rate() {
+        let snapshot = test_snapshot();
+        // 3 timed_out out of 95 total (90 completed + 2 failed + 3 timed_out)
+        let expected = 3.0 / 95.0;
+        assert!((snapshot.timeout_rate() - expected).abs() < 0.001);
     }
 
     #[test]

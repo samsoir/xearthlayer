@@ -43,11 +43,13 @@ pub use file::{
     config_file_path,
     default_cpu_concurrent,
     default_http_concurrent,
+    default_max_concurrent_jobs,
     default_prefetch_in_flight,
     num_cpus,
     CacheSettings,
     ConfigFile,
     ConfigFileError,
+    ControlPlaneSettings,
     DownloadSettings,
     GenerationSettings,
     LoggingSettings,
@@ -59,6 +61,11 @@ pub use file::{
     XPlaneSettings,
     // Pipeline defaults
     DEFAULT_COALESCE_CHANNEL_CAPACITY,
+    // Control plane defaults
+    DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
+    DEFAULT_CONTROL_PLANE_JOB_SCALING_FACTOR,
+    DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
+    DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS,
     // Cache defaults
     DEFAULT_DISK_CACHE_SIZE,
     // Download defaults

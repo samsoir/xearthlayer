@@ -27,8 +27,10 @@ pub struct PipelineMetrics {
     jobs_submitted: AtomicU64,
     /// Jobs completed successfully (includes partial success)
     jobs_completed: AtomicU64,
-    /// Jobs that failed entirely
+    /// Jobs that failed due to pipeline errors
     jobs_failed: AtomicU64,
+    /// Jobs that timed out (FUSE timeout, but work may have completed in background)
+    jobs_timed_out: AtomicU64,
     /// Currently active jobs in the pipeline
     jobs_active: AtomicUsize,
     /// Jobs that were coalesced (waited for existing work)
@@ -91,6 +93,7 @@ impl PipelineMetrics {
             jobs_submitted: AtomicU64::new(0),
             jobs_completed: AtomicU64::new(0),
             jobs_failed: AtomicU64::new(0),
+            jobs_timed_out: AtomicU64::new(0),
             jobs_active: AtomicUsize::new(0),
             jobs_coalesced: AtomicU64::new(0),
             chunks_downloaded: AtomicU64::new(0),
@@ -161,9 +164,18 @@ impl PipelineMetrics {
         self.jobs_active.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Record a job failing.
+    /// Record a job failing due to a pipeline error.
     pub fn job_failed(&self) {
         self.jobs_failed.fetch_add(1, Ordering::Relaxed);
+        self.jobs_active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Record a job timing out (FUSE timeout).
+    ///
+    /// This is distinct from `job_failed()` - the work may still complete
+    /// in the background, but FUSE didn't receive the response in time.
+    pub fn job_timed_out(&self) {
+        self.jobs_timed_out.fetch_add(1, Ordering::Relaxed);
         self.jobs_active.fetch_sub(1, Ordering::Relaxed);
     }
 
@@ -321,6 +333,7 @@ impl PipelineMetrics {
             jobs_submitted: self.jobs_submitted.load(Ordering::Relaxed),
             jobs_completed,
             jobs_failed: self.jobs_failed.load(Ordering::Relaxed),
+            jobs_timed_out: self.jobs_timed_out.load(Ordering::Relaxed),
             jobs_active: self.jobs_active.load(Ordering::Relaxed),
             jobs_coalesced: self.jobs_coalesced.load(Ordering::Relaxed),
 
@@ -376,6 +389,7 @@ impl PipelineMetrics {
         self.jobs_submitted.store(0, Ordering::Relaxed);
         self.jobs_completed.store(0, Ordering::Relaxed);
         self.jobs_failed.store(0, Ordering::Relaxed);
+        self.jobs_timed_out.store(0, Ordering::Relaxed);
         self.jobs_active.store(0, Ordering::Relaxed);
         self.jobs_coalesced.store(0, Ordering::Relaxed);
         self.chunks_downloaded.store(0, Ordering::Relaxed);

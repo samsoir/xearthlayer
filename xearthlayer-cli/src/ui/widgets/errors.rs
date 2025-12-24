@@ -31,7 +31,7 @@ impl Widget for ErrorsWidget<'_> {
             0.0
         };
 
-        let error_color = if self.snapshot.jobs_failed > 0 || chunk_fail_rate > 1.0 {
+        let chunk_color = if self.snapshot.chunks_failed > 0 && chunk_fail_rate > 1.0 {
             Color::Red
         } else if chunk_fail_rate > 0.1 {
             Color::Yellow
@@ -40,10 +40,10 @@ impl Widget for ErrorsWidget<'_> {
         };
 
         let line = Line::from(vec![
-            Span::styled("  Errors:  ", Style::default().fg(Color::White)),
+            Span::styled("  Chunks:  ", Style::default().fg(Color::White)),
             Span::styled(
-                format!("{} chunks failed", self.snapshot.chunks_failed),
-                Style::default().fg(error_color),
+                format!("{} failed", self.snapshot.chunks_failed),
+                Style::default().fg(chunk_color),
             ),
             Span::styled(
                 format!(" ({:.2}%)", chunk_fail_rate),
@@ -54,7 +54,16 @@ impl Widget for ErrorsWidget<'_> {
                 format!("{}", self.snapshot.chunks_retried),
                 Style::default().fg(Color::White),
             ),
-            Span::styled("  │  Jobs failed: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  │  Timeouts: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", self.snapshot.jobs_timed_out),
+                Style::default().fg(if self.snapshot.jobs_timed_out > 0 {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                }),
+            ),
+            Span::styled("  │  Errors: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("{}", self.snapshot.jobs_failed),
                 Style::default().fg(if self.snapshot.jobs_failed > 0 {

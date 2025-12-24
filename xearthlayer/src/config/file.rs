@@ -57,6 +57,8 @@ pub struct ConfigFile {
     pub logging: LoggingSettings,
     /// Prefetch settings for predictive tile caching
     pub prefetch: PrefetchSettings,
+    /// Control plane settings for job management and health monitoring
+    pub control_plane: ControlPlaneSettings,
 }
 
 /// Provider configuration.
@@ -188,6 +190,25 @@ pub struct PrefetchSettings {
     pub radial_radius: u8,
 }
 
+/// Control plane configuration for job management and health monitoring.
+#[derive(Debug, Clone)]
+pub struct ControlPlaneSettings {
+    /// Maximum concurrent jobs (DDS requests) allowed.
+    /// Default: num_cpus × 2
+    pub max_concurrent_jobs: usize,
+    /// Time threshold in seconds for considering a job stalled.
+    /// Jobs in the same stage longer than this are recovered.
+    /// Default: 60 seconds
+    pub stall_threshold_secs: u64,
+    /// Interval in seconds for health monitoring checks.
+    /// Default: 5 seconds
+    pub health_check_interval_secs: u64,
+    /// Timeout in seconds for acquiring a job slot.
+    /// On-demand requests wait up to this long before failing.
+    /// Default: 30 seconds
+    pub semaphore_timeout_secs: u64,
+}
+
 impl Default for ConfigFile {
     fn default() -> Self {
         let config_dir = config_directory();
@@ -246,6 +267,12 @@ impl Default for ConfigFile {
                 batch_size: DEFAULT_PREFETCH_BATCH_SIZE,
                 max_in_flight: DEFAULT_PREFETCH_MAX_IN_FLIGHT,
                 radial_radius: DEFAULT_PREFETCH_RADIAL_RADIUS,
+            },
+            control_plane: ControlPlaneSettings {
+                max_concurrent_jobs: default_max_concurrent_jobs(),
+                stall_threshold_secs: DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS,
+                health_check_interval_secs: DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
+                semaphore_timeout_secs: DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
             },
         }
     }
@@ -337,6 +364,27 @@ pub const DEFAULT_PREFETCH_MAX_IN_FLIGHT: usize = 2000;
 
 /// Default radial prefetcher tile radius (7×7 = 49 tiles).
 pub const DEFAULT_PREFETCH_RADIAL_RADIUS: u8 = 3;
+
+// =============================================================================
+// Control plane defaults
+// =============================================================================
+
+/// Default stall threshold in seconds (jobs stuck longer than this are recovered).
+pub const DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS: u64 = 60;
+
+/// Default health check interval in seconds.
+pub const DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
+
+/// Default semaphore timeout in seconds for acquiring a job slot.
+pub const DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS: u64 = 30;
+
+/// Scaling factor for max concurrent jobs relative to CPU count.
+pub const DEFAULT_CONTROL_PLANE_JOB_SCALING_FACTOR: usize = 2;
+
+/// Default max concurrent jobs: num_cpus × scaling factor
+pub fn default_max_concurrent_jobs() -> usize {
+    num_cpus() * DEFAULT_CONTROL_PLANE_JOB_SCALING_FACTOR
+}
 
 // =============================================================================
 // Texture defaults
@@ -705,6 +753,46 @@ impl ConfigFile {
             }
         }
 
+        // [control_plane] section
+        if let Some(section) = ini.section(Some("control_plane")) {
+            if let Some(v) = section.get("max_concurrent_jobs") {
+                config.control_plane.max_concurrent_jobs =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "control_plane".to_string(),
+                        key: "max_concurrent_jobs".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("stall_threshold_secs") {
+                config.control_plane.stall_threshold_secs =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "control_plane".to_string(),
+                        key: "stall_threshold_secs".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (seconds)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("health_check_interval_secs") {
+                config.control_plane.health_check_interval_secs =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "control_plane".to_string(),
+                        key: "health_check_interval_secs".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (seconds)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("semaphore_timeout_secs") {
+                config.control_plane.semaphore_timeout_secs =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "control_plane".to_string(),
+                        key: "semaphore_timeout_secs".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (seconds)".to_string(),
+                    })?;
+            }
+        }
+
         Ok(config)
     }
 
@@ -866,6 +954,23 @@ max_in_flight = {}
 ; Radial prefetcher tile radius (default: 3, giving 7x7 = 49 tiles)
 ; Higher values prefetch more tiles around aircraft position
 radial_radius = {}
+
+[control_plane]
+; Advanced settings for job management and health monitoring.
+; Defaults are tuned for most systems. Only modify if you understand the implications.
+
+; Maximum concurrent DDS requests (jobs) allowed (default: num_cpus × 2)
+; Higher values increase parallelism but may cause resource contention
+max_concurrent_jobs = {}
+; Time threshold in seconds for considering a job stalled (default: 60)
+; Jobs in the same stage longer than this are automatically recovered
+stall_threshold_secs = {}
+; Interval in seconds for health monitoring checks (default: 5)
+; More frequent checks detect issues faster but add overhead
+health_check_interval_secs = {}
+; Timeout in seconds for acquiring a job slot (default: 30)
+; On-demand requests wait up to this long before timing out
+semaphore_timeout_secs = {}
 "#,
             self.provider.provider_type,
             google_api_key,
@@ -899,6 +1004,10 @@ radial_radius = {}
             self.prefetch.batch_size,
             self.prefetch.max_in_flight,
             self.prefetch.radial_radius,
+            self.control_plane.max_concurrent_jobs,
+            self.control_plane.stall_threshold_secs,
+            self.control_plane.health_check_interval_secs,
+            self.control_plane.semaphore_timeout_secs,
         )
     }
 

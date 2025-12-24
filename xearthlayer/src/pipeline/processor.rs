@@ -10,10 +10,11 @@
 
 use crate::coord::TileCoord;
 use crate::fuse::EXPECTED_DDS_SIZE;
+use crate::pipeline::control_plane::{JobStage, StageObserver};
 use crate::pipeline::http_limiter::HttpConcurrencyLimiter;
 use crate::pipeline::stages::{
-    assembly_stage, cache_stage, check_memory_cache, download_stage_cancellable,
-    download_stage_with_limiter, encode_stage,
+    assembly_stage, cache_stage, check_memory_cache, download_stage_bounded,
+    download_stage_cancellable, download_stage_with_limiter, encode_stage,
 };
 use crate::pipeline::{
     BlockingExecutor, ChunkProvider, ConcurrencyLimiter, DiskCache, Job, JobError, JobId,
@@ -307,18 +308,34 @@ where
         return Ok(JobResult::cache_hit(job_id, cached_data, start.elapsed()));
     }
 
-    // Stage 1: Download chunks (with cancellation support)
-    let chunks = download_stage_cancellable(
-        job_id,
-        tile,
-        Arc::clone(&provider),
-        Arc::clone(&disk_cache),
-        config,
-        metrics.clone(),
-        http_limiter,
-        cancellation_token.clone(),
-    )
-    .await;
+    // Stage 1: Download chunks
+    // Use permit-bounded downloads when HTTP limiter is available to prevent
+    // task avalanche (spawning thousands of waiting tasks).
+    let chunks = if let Some(limiter) = http_limiter {
+        download_stage_bounded(
+            job_id,
+            tile,
+            Arc::clone(&provider),
+            Arc::clone(&disk_cache),
+            config,
+            metrics.clone(),
+            limiter,
+            cancellation_token.clone(),
+        )
+        .await
+    } else {
+        download_stage_cancellable(
+            job_id,
+            tile,
+            Arc::clone(&provider),
+            Arc::clone(&disk_cache),
+            config,
+            metrics.clone(),
+            None,
+            cancellation_token.clone(),
+        )
+        .await
+    };
 
     // Check cancellation after download stage (most time-consuming)
     if cancellation_token.is_cancelled() {
@@ -375,6 +392,187 @@ where
 
     let duration = start.elapsed();
 
+    Ok(JobResult::partial(
+        job_id,
+        dds_data,
+        duration,
+        failed_chunks,
+    ))
+}
+
+/// Processor with stage observer for control plane integration.
+///
+/// This version accepts an optional `StageObserver` that receives notifications
+/// as the job progresses through pipeline stages. The observer is typically
+/// provided by the control plane for tracking purposes.
+///
+/// The processor remains a pure worker - it doesn't know about the control plane,
+/// only that it should emit stage events to whoever is observing.
+///
+/// # Arguments
+///
+/// * `http_limiter` - Optional global HTTP concurrency limiter
+/// * `assemble_limiter` - Optional concurrency limiter for CPU-bound assembly
+/// * `encode_limiter` - Optional concurrency limiter for CPU-bound encoding
+/// * `cancellation_token` - Token to signal cancellation (e.g., from FUSE timeout)
+/// * `observer` - Optional stage observer for progress tracking
+///
+/// # Example
+///
+/// ```ignore
+/// let result = process_tile_with_observer(
+///     job_id,
+///     tile,
+///     provider,
+///     encoder,
+///     memory_cache,
+///     disk_cache,
+///     &executor,
+///     &config,
+///     None, // metrics
+///     None, // http_limiter
+///     None, // assemble_limiter
+///     None, // encode_limiter
+///     cancellation_token,
+///     Some(observer), // control plane's observer
+/// ).await;
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub async fn process_tile_with_observer<P, E, M, D, X>(
+    job_id: JobId,
+    tile: TileCoord,
+    provider: Arc<P>,
+    encoder: Arc<E>,
+    memory_cache: Arc<M>,
+    disk_cache: Arc<D>,
+    executor: &X,
+    config: &PipelineConfig,
+    metrics: Option<Arc<PipelineMetrics>>,
+    http_limiter: Option<Arc<HttpConcurrencyLimiter>>,
+    assemble_limiter: Option<Arc<ConcurrencyLimiter>>,
+    encode_limiter: Option<Arc<ConcurrencyLimiter>>,
+    cancellation_token: CancellationToken,
+    observer: Option<Arc<dyn StageObserver>>,
+) -> Result<JobResult, JobError>
+where
+    P: ChunkProvider,
+    E: TextureEncoderAsync,
+    M: MemoryCache,
+    D: DiskCache,
+    X: BlockingExecutor,
+{
+    let start = Instant::now();
+
+    // Helper to emit stage changes
+    let emit_stage = |stage: JobStage| {
+        if let Some(ref obs) = observer {
+            obs.on_stage_change(job_id, stage);
+        }
+    };
+
+    // Check for early cancellation
+    if cancellation_token.is_cancelled() {
+        return Err(JobError::Cancelled);
+    }
+
+    // Stage 0: Check memory cache
+    if let Some(cached_data) = check_memory_cache(tile, memory_cache.as_ref(), metrics.as_ref()) {
+        debug!(job_id = %job_id, "Memory cache hit");
+        emit_stage(JobStage::Completed);
+        return Ok(JobResult::cache_hit(job_id, cached_data, start.elapsed()));
+    }
+
+    // Stage 1: Download chunks
+    // Use permit-bounded downloads when HTTP limiter is available to prevent
+    // task avalanche (spawning thousands of waiting tasks). This ensures
+    // downloads_active accurately reflects actual HTTP connections.
+    emit_stage(JobStage::Downloading);
+    let chunks = if let Some(limiter) = http_limiter {
+        download_stage_bounded(
+            job_id,
+            tile,
+            Arc::clone(&provider),
+            Arc::clone(&disk_cache),
+            config,
+            metrics.clone(),
+            limiter,
+            cancellation_token.clone(),
+        )
+        .await
+    } else {
+        // Fallback for tests without HTTP limiter
+        download_stage_cancellable(
+            job_id,
+            tile,
+            Arc::clone(&provider),
+            Arc::clone(&disk_cache),
+            config,
+            metrics.clone(),
+            None,
+            cancellation_token.clone(),
+        )
+        .await
+    };
+
+    // Check cancellation after download stage (most time-consuming)
+    if cancellation_token.is_cancelled() {
+        debug!(job_id = %job_id, "Cancelled after download stage");
+        return Err(JobError::Cancelled);
+    }
+
+    let failed_chunks = chunks.failure_count() as u16;
+
+    // Stage 2: Assemble image
+    emit_stage(JobStage::Assembling);
+    let image = assembly_stage(job_id, chunks, executor, assemble_limiter).await?;
+
+    // Check cancellation after assembly
+    if cancellation_token.is_cancelled() {
+        debug!(job_id = %job_id, "Cancelled after assembly stage");
+        return Err(JobError::Cancelled);
+    }
+
+    // Stage 3: Encode to DDS
+    emit_stage(JobStage::Encoding);
+    let dds_data = encode_stage(job_id, image, encoder, executor, metrics, encode_limiter).await?;
+
+    // Validate encoded DDS size - log warning if unexpected
+    if dds_data.len() != EXPECTED_DDS_SIZE {
+        warn!(
+            job_id = %job_id,
+            tile = ?tile,
+            actual_size = dds_data.len(),
+            expected_size = EXPECTED_DDS_SIZE,
+            failed_chunks,
+            "Encoded DDS has unexpected size - may cause validation to substitute placeholder"
+        );
+    }
+
+    // Validate DDS magic bytes
+    if dds_data.len() < 4 || &dds_data[0..4] != b"DDS " {
+        warn!(
+            job_id = %job_id,
+            tile = ?tile,
+            size = dds_data.len(),
+            "Encoded DDS has invalid magic bytes - will be replaced with placeholder"
+        );
+    }
+
+    // Stage 4: Write to memory cache (only if no failed chunks)
+    emit_stage(JobStage::Caching);
+    if failed_chunks == 0 {
+        cache_stage(job_id, tile, &dds_data, memory_cache).await;
+    } else {
+        debug!(
+            job_id = %job_id,
+            failed_chunks,
+            "Skipping memory cache write due to failed chunks"
+        );
+    }
+
+    let duration = start.elapsed();
+
+    emit_stage(JobStage::Completed);
     Ok(JobResult::partial(
         job_id,
         dds_data,

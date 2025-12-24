@@ -1,6 +1,6 @@
 //! Service configuration types.
 
-use crate::config::{DownloadConfig, PipelineSettings, TextureConfig};
+use crate::config::{ControlPlaneSettings, DownloadConfig, PipelineSettings, TextureConfig};
 use std::path::PathBuf;
 
 /// Configuration for the XEarthLayer service.
@@ -46,6 +46,8 @@ pub struct ServiceConfig {
     quiet_mode: bool,
     /// Pipeline configuration for concurrency and retry behavior
     pipeline: PipelineSettings,
+    /// Control plane configuration for job management and health monitoring
+    control_plane: ControlPlaneSettings,
 }
 
 impl ServiceConfig {
@@ -108,14 +110,22 @@ impl ServiceConfig {
     pub fn pipeline(&self) -> &PipelineSettings {
         &self.pipeline
     }
+
+    /// Get the control plane configuration for job management and health monitoring.
+    pub fn control_plane(&self) -> &ControlPlaneSettings {
+        &self.control_plane
+    }
 }
 
 impl Default for ServiceConfig {
     fn default() -> Self {
         use crate::config::{
-            default_cpu_concurrent, default_http_concurrent, default_prefetch_in_flight,
-            DEFAULT_COALESCE_CHANNEL_CAPACITY, DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SECS,
-            DEFAULT_RETRY_BASE_DELAY_MS,
+            default_cpu_concurrent, default_http_concurrent, default_max_concurrent_jobs,
+            default_prefetch_in_flight, DEFAULT_COALESCE_CHANNEL_CAPACITY,
+            DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
+            DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
+            DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS, DEFAULT_MAX_RETRIES,
+            DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_RETRY_BASE_DELAY_MS,
         };
         Self {
             texture: TextureConfig::default(),
@@ -137,6 +147,12 @@ impl Default for ServiceConfig {
                 retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
                 coalesce_channel_capacity: DEFAULT_COALESCE_CHANNEL_CAPACITY,
             },
+            control_plane: ControlPlaneSettings {
+                max_concurrent_jobs: default_max_concurrent_jobs(),
+                stall_threshold_secs: DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS,
+                health_check_interval_secs: DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
+                semaphore_timeout_secs: DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
+            },
         }
     }
 }
@@ -157,6 +173,7 @@ pub struct ServiceConfigBuilder {
     generation_timeout: Option<u64>,
     quiet_mode: Option<bool>,
     pipeline: Option<PipelineSettings>,
+    control_plane: Option<ControlPlaneSettings>,
 }
 
 impl ServiceConfigBuilder {
@@ -226,12 +243,21 @@ impl ServiceConfigBuilder {
         self
     }
 
+    /// Set the control plane configuration for job management and health monitoring.
+    pub fn control_plane(mut self, settings: ControlPlaneSettings) -> Self {
+        self.control_plane = Some(settings);
+        self
+    }
+
     /// Build the configuration with defaults for unset values.
     pub fn build(self) -> ServiceConfig {
         use crate::config::{
-            default_cpu_concurrent, default_http_concurrent, default_prefetch_in_flight,
-            DEFAULT_COALESCE_CHANNEL_CAPACITY, DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SECS,
-            DEFAULT_RETRY_BASE_DELAY_MS,
+            default_cpu_concurrent, default_http_concurrent, default_max_concurrent_jobs,
+            default_prefetch_in_flight, DEFAULT_COALESCE_CHANNEL_CAPACITY,
+            DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
+            DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
+            DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS, DEFAULT_MAX_RETRIES,
+            DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_RETRY_BASE_DELAY_MS,
         };
         ServiceConfig {
             texture: self.texture.unwrap_or_default(),
@@ -252,6 +278,12 @@ impl ServiceConfigBuilder {
                 max_retries: DEFAULT_MAX_RETRIES,
                 retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
                 coalesce_channel_capacity: DEFAULT_COALESCE_CHANNEL_CAPACITY,
+            }),
+            control_plane: self.control_plane.unwrap_or(ControlPlaneSettings {
+                max_concurrent_jobs: default_max_concurrent_jobs(),
+                stall_threshold_secs: DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS,
+                health_check_interval_secs: DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
+                semaphore_timeout_secs: DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
             }),
         }
     }
