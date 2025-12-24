@@ -11,6 +11,7 @@ use xearthlayer::config::{format_size, ConfigFile, DownloadConfig, TextureConfig
 use xearthlayer::log::TracingLogger;
 use xearthlayer::manager::{LocalPackageStore, MountManager, ServiceBuilder};
 use xearthlayer::package::PackageType;
+use xearthlayer::panic as panic_handler;
 use xearthlayer::prefetch::{
     Prefetcher, RadialPrefetchConfig, RadialPrefetcher, SharedPrefetchStatus, TelemetryListener,
 };
@@ -36,6 +37,9 @@ pub struct RunArgs {
 
 /// Run the run command.
 pub fn run(args: RunArgs) -> Result<(), CliError> {
+    // Initialize panic handler early for crash cleanup
+    panic_handler::init();
+
     let runner = CliRunner::with_debug(args.debug)?;
     runner.log_startup("run");
     let config = runner.config();

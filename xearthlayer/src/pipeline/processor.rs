@@ -13,8 +13,8 @@ use crate::fuse::EXPECTED_DDS_SIZE;
 use crate::pipeline::control_plane::{JobStage, StageObserver};
 use crate::pipeline::http_limiter::HttpConcurrencyLimiter;
 use crate::pipeline::stages::{
-    assembly_stage, cache_stage, check_memory_cache, download_stage_cancellable,
-    download_stage_with_limiter, encode_stage,
+    assembly_stage, cache_stage, check_memory_cache, download_stage_bounded,
+    download_stage_cancellable, download_stage_with_limiter, encode_stage,
 };
 use crate::pipeline::{
     BlockingExecutor, ChunkProvider, ConcurrencyLimiter, DiskCache, Job, JobError, JobId,
@@ -308,18 +308,34 @@ where
         return Ok(JobResult::cache_hit(job_id, cached_data, start.elapsed()));
     }
 
-    // Stage 1: Download chunks (with cancellation support)
-    let chunks = download_stage_cancellable(
-        job_id,
-        tile,
-        Arc::clone(&provider),
-        Arc::clone(&disk_cache),
-        config,
-        metrics.clone(),
-        http_limiter,
-        cancellation_token.clone(),
-    )
-    .await;
+    // Stage 1: Download chunks
+    // Use permit-bounded downloads when HTTP limiter is available to prevent
+    // task avalanche (spawning thousands of waiting tasks).
+    let chunks = if let Some(limiter) = http_limiter {
+        download_stage_bounded(
+            job_id,
+            tile,
+            Arc::clone(&provider),
+            Arc::clone(&disk_cache),
+            config,
+            metrics.clone(),
+            limiter,
+            cancellation_token.clone(),
+        )
+        .await
+    } else {
+        download_stage_cancellable(
+            job_id,
+            tile,
+            Arc::clone(&provider),
+            Arc::clone(&disk_cache),
+            config,
+            metrics.clone(),
+            None,
+            cancellation_token.clone(),
+        )
+        .await
+    };
 
     // Check cancellation after download stage (most time-consuming)
     if cancellation_token.is_cancelled() {
@@ -466,19 +482,37 @@ where
         return Ok(JobResult::cache_hit(job_id, cached_data, start.elapsed()));
     }
 
-    // Stage 1: Download chunks (with cancellation support)
+    // Stage 1: Download chunks
+    // Use permit-bounded downloads when HTTP limiter is available to prevent
+    // task avalanche (spawning thousands of waiting tasks). This ensures
+    // downloads_active accurately reflects actual HTTP connections.
     emit_stage(JobStage::Downloading);
-    let chunks = download_stage_cancellable(
-        job_id,
-        tile,
-        Arc::clone(&provider),
-        Arc::clone(&disk_cache),
-        config,
-        metrics.clone(),
-        http_limiter,
-        cancellation_token.clone(),
-    )
-    .await;
+    let chunks = if let Some(limiter) = http_limiter {
+        download_stage_bounded(
+            job_id,
+            tile,
+            Arc::clone(&provider),
+            Arc::clone(&disk_cache),
+            config,
+            metrics.clone(),
+            limiter,
+            cancellation_token.clone(),
+        )
+        .await
+    } else {
+        // Fallback for tests without HTTP limiter
+        download_stage_cancellable(
+            job_id,
+            tile,
+            Arc::clone(&provider),
+            Arc::clone(&disk_cache),
+            config,
+            metrics.clone(),
+            None,
+            cancellation_token.clone(),
+        )
+        .await
+    };
 
     // Check cancellation after download stage (most time-consuming)
     if cancellation_token.is_cancelled() {

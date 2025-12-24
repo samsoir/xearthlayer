@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use crate::fuse::SpawnedMountHandle;
 use crate::package::PackageType;
+use crate::panic as panic_handler;
 use crate::pipeline::{ConcurrencyLimiter, DiskIoProfile};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
 use crate::telemetry::TelemetrySnapshot;
@@ -277,6 +278,9 @@ impl MountManager {
                     mountpoint: mountpoint.clone(),
                 };
 
+                // Register mount point with panic handler for cleanup on crash
+                panic_handler::register_mount(mountpoint.clone());
+
                 self.sessions.insert(region.clone(), session);
                 // CRITICAL: Store the service to keep its Tokio runtime alive.
                 // The DdsHandler closure holds a Handle to the runtime owned by the service.
@@ -310,6 +314,11 @@ impl MountManager {
             });
         }
 
+        // Unregister from panic handler before unmounting
+        if let Some(mount) = self.mounts.get(&key) {
+            panic_handler::unregister_mount(&mount.mountpoint);
+        }
+
         // Remove session first - Drop will trigger unmount via fusermount
         self.sessions.remove(&key);
         // Then remove service - this shuts down the runtime
@@ -327,6 +336,11 @@ impl MountManager {
         let keys: Vec<String> = self.sessions.keys().cloned().collect();
 
         for key in keys.into_iter().rev() {
+            // Unregister from panic handler before unmounting
+            if let Some(mount) = self.mounts.get(&key) {
+                panic_handler::unregister_mount(&mount.mountpoint);
+            }
+
             // Remove session first - Drop will trigger unmount via fusermount
             self.sessions.remove(&key);
             // Then remove service - this shuts down the runtime

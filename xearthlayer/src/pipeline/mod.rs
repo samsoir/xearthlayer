@@ -49,6 +49,7 @@ mod context;
 pub mod control_plane;
 mod error;
 mod executor;
+mod fd_budget;
 mod http_limiter;
 mod job;
 mod processor;
@@ -67,6 +68,9 @@ pub use context::{
 };
 pub use error::{ChunkFailure, ChunkResults, ChunkSuccess, JobError, StageError};
 pub use executor::{BlockingExecutor, ConcurrentRunner, ExecutorError, Timer, TokioExecutor};
+pub use fd_budget::{
+    FdBudget, FdReservation, SharedFdBudget, DEFAULT_FD_BUDGET_PERCENT, MIN_FD_BUDGET,
+};
 pub use http_limiter::HttpConcurrencyLimiter;
 pub use job::{Job, JobId, JobResult, Priority};
 pub use processor::{
