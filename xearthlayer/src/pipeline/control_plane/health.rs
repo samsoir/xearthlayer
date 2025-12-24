@@ -83,6 +83,12 @@ pub struct ControlPlaneHealth {
     /// Peak concurrent jobs (high water mark)
     peak_concurrent_jobs: AtomicUsize,
 
+    /// Total jobs submitted (for rate calculations)
+    total_jobs_submitted: AtomicU64,
+
+    /// Total jobs completed (for rate calculations)
+    total_jobs_completed: AtomicU64,
+
     /// Total jobs recovered by control plane
     jobs_recovered: AtomicU64,
 
@@ -105,6 +111,8 @@ impl ControlPlaneHealth {
             start_instant: Instant::now(),
             jobs_in_progress: AtomicUsize::new(0),
             peak_concurrent_jobs: AtomicUsize::new(0),
+            total_jobs_submitted: AtomicU64::new(0),
+            total_jobs_completed: AtomicU64::new(0),
             jobs_recovered: AtomicU64::new(0),
             jobs_rejected_capacity: AtomicU64::new(0),
             semaphore_timeouts: AtomicU64::new(0),
@@ -166,9 +174,10 @@ impl ControlPlaneHealth {
         }
     }
 
-    /// Increments jobs in progress and updates peak.
+    /// Increments jobs in progress, updates peak, and tracks submission.
     pub fn job_started(&self) {
         let current = self.jobs_in_progress.fetch_add(1, Ordering::AcqRel) + 1;
+        self.total_jobs_submitted.fetch_add(1, Ordering::Relaxed);
 
         // Update peak if necessary (CAS loop for correctness)
         loop {
@@ -186,9 +195,10 @@ impl ControlPlaneHealth {
         }
     }
 
-    /// Decrements jobs in progress.
+    /// Decrements jobs in progress and tracks completion.
     pub fn job_finished(&self) {
         self.jobs_in_progress.fetch_sub(1, Ordering::AcqRel);
+        self.total_jobs_completed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Returns current jobs in progress.
@@ -201,6 +211,18 @@ impl ControlPlaneHealth {
     #[inline]
     pub fn peak_concurrent_jobs(&self) -> usize {
         self.peak_concurrent_jobs.load(Ordering::Acquire)
+    }
+
+    /// Returns total jobs submitted (for rate calculations).
+    #[inline]
+    pub fn total_jobs_submitted(&self) -> u64 {
+        self.total_jobs_submitted.load(Ordering::Relaxed)
+    }
+
+    /// Returns total jobs completed (for rate calculations).
+    #[inline]
+    pub fn total_jobs_completed(&self) -> u64 {
+        self.total_jobs_completed.load(Ordering::Relaxed)
     }
 
     /// Records a job recovery.
@@ -268,6 +290,8 @@ impl ControlPlaneHealth {
             time_since_last_success: self.time_since_last_success(),
             jobs_in_progress: self.jobs_in_progress(),
             peak_concurrent_jobs: self.peak_concurrent_jobs(),
+            total_jobs_submitted: self.total_jobs_submitted(),
+            total_jobs_completed: self.total_jobs_completed(),
             jobs_recovered: self.jobs_recovered(),
             jobs_rejected_capacity: self.jobs_rejected_capacity(),
             semaphore_timeouts: self.semaphore_timeouts(),
@@ -292,6 +316,10 @@ pub struct HealthSnapshot {
     pub jobs_in_progress: usize,
     /// Peak concurrent jobs
     pub peak_concurrent_jobs: usize,
+    /// Total jobs submitted (for rate calculations)
+    pub total_jobs_submitted: u64,
+    /// Total jobs completed (for rate calculations)
+    pub total_jobs_completed: u64,
     /// Total jobs recovered
     pub jobs_recovered: u64,
     /// Jobs rejected due to capacity

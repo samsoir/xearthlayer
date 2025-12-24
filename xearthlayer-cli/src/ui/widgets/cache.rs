@@ -226,7 +226,7 @@ impl Widget for CacheWidget<'_> {
         let text = vec![
             memory_line,
             memory_stats_line,
-            Line::raw(""),
+            Line::raw(""), // Blank line between memory and disk cache
             disk_line,
             disk_stats_line,
         ];
