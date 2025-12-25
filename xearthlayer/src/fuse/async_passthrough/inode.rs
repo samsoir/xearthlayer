@@ -5,11 +5,17 @@
 //! - Virtual DDS files and their inodes
 //!
 //! Virtual inodes use a high base value to distinguish them from real file inodes.
+//!
+//! # Thread Safety
+//!
+//! This module uses lock-free data structures (`DashMap` and `AtomicU64`) to
+//! ensure safe concurrent access from async contexts without blocking Tokio
+//! worker threads.
 
 use crate::fuse::DdsFilename;
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Base inode for generated DDS files (virtual files).
 ///
@@ -19,6 +25,8 @@ pub const VIRTUAL_INODE_BASE: u64 = 0x1000_0000_0000_0000;
 /// Manages inode allocation and path/coordinate mappings.
 ///
 /// This struct is thread-safe and can be shared across FUSE handler threads.
+/// Uses lock-free data structures (`DashMap` and `AtomicU64`) to avoid blocking
+/// Tokio worker threads during FUSE operations.
 ///
 /// # Responsibilities
 ///
@@ -43,14 +51,14 @@ pub const VIRTUAL_INODE_BASE: u64 = 0x1000_0000_0000_0000;
 /// let virtual_inode = manager.create_virtual_inode(coords);
 /// ```
 pub struct InodeManager {
-    /// Inode to path mapping for real files
-    inode_to_path: Mutex<HashMap<u64, PathBuf>>,
-    /// Path to inode mapping for real files
-    path_to_inode: Mutex<HashMap<PathBuf, u64>>,
-    /// Virtual inode to DDS filename mapping
-    virtual_inode_to_dds: Mutex<HashMap<u64, DdsFilename>>,
-    /// Next available inode for real files
-    next_inode: Mutex<u64>,
+    /// Inode to path mapping for real files (lock-free)
+    inode_to_path: DashMap<u64, PathBuf>,
+    /// Path to inode mapping for real files (lock-free)
+    path_to_inode: DashMap<PathBuf, u64>,
+    /// Virtual inode to DDS filename mapping (lock-free)
+    virtual_inode_to_dds: DashMap<u64, DdsFilename>,
+    /// Next available inode for real files (atomic)
+    next_inode: AtomicU64,
 }
 
 impl InodeManager {
@@ -58,18 +66,18 @@ impl InodeManager {
     ///
     /// The root directory is assigned inode 1 (the FUSE root inode).
     pub fn new(root_dir: PathBuf) -> Self {
-        let mut inode_to_path = HashMap::new();
-        let mut path_to_inode = HashMap::new();
+        let inode_to_path = DashMap::new();
+        let path_to_inode = DashMap::new();
 
         // Reserve inode 1 for root
         inode_to_path.insert(1, root_dir.clone());
         path_to_inode.insert(root_dir, 1);
 
         Self {
-            inode_to_path: Mutex::new(inode_to_path),
-            path_to_inode: Mutex::new(path_to_inode),
-            virtual_inode_to_dds: Mutex::new(HashMap::new()),
-            next_inode: Mutex::new(2),
+            inode_to_path,
+            path_to_inode,
+            virtual_inode_to_dds: DashMap::new(),
+            next_inode: AtomicU64::new(2),
         }
     }
 
@@ -77,22 +85,22 @@ impl InodeManager {
     ///
     /// If the path already has an inode, returns it.
     /// Otherwise, allocates a new inode and stores the mapping.
+    ///
+    /// This operation is lock-free and safe to call from async contexts.
     pub fn get_or_create_inode(&self, path: &Path) -> u64 {
-        let mut path_to_inode = self.path_to_inode.lock().unwrap();
-
-        if let Some(&inode) = path_to_inode.get(path) {
-            return inode;
+        // Fast path: check if inode already exists
+        if let Some(inode) = self.path_to_inode.get(path) {
+            return *inode;
         }
 
-        let mut next_inode = self.next_inode.lock().unwrap();
-        let inode = *next_inode;
-        *next_inode += 1;
+        // Slow path: allocate new inode atomically
+        // Use fetch_add for atomic increment - this is lock-free
+        let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
 
-        path_to_inode.insert(path.to_path_buf(), inode);
-        drop(path_to_inode);
-
-        let mut inode_to_path = self.inode_to_path.lock().unwrap();
-        inode_to_path.insert(inode, path.to_path_buf());
+        // Insert into both maps
+        // DashMap handles concurrent inserts safely
+        self.path_to_inode.insert(path.to_path_buf(), inode);
+        self.inode_to_path.insert(inode, path.to_path_buf());
 
         inode
     }
@@ -100,29 +108,27 @@ impl InodeManager {
     /// Get the path for a real file inode.
     ///
     /// Returns `None` if the inode is not mapped to a path.
+    /// This operation is lock-free.
     pub fn get_path(&self, inode: u64) -> Option<PathBuf> {
-        let inode_to_path = self.inode_to_path.lock().unwrap();
-        inode_to_path.get(&inode).cloned()
+        self.inode_to_path.get(&inode).map(|r| r.value().clone())
     }
 
     /// Get the inode for a path if it exists.
     ///
     /// Unlike `get_or_create_inode`, this does not allocate a new inode.
+    /// This operation is lock-free.
     pub fn get_inode(&self, path: &Path) -> Option<u64> {
-        let path_to_inode = self.path_to_inode.lock().unwrap();
-        path_to_inode.get(path).copied()
+        self.path_to_inode.get(path).map(|r| *r.value())
     }
 
     /// Create a virtual inode for a DDS file.
     ///
     /// The inode is deterministically computed from the coordinates,
     /// ensuring the same coordinates always produce the same inode.
+    /// This operation is lock-free.
     pub fn create_virtual_inode(&self, coords: DdsFilename) -> u64 {
         let inode = Self::compute_virtual_inode(&coords);
-
-        let mut virtual_map = self.virtual_inode_to_dds.lock().unwrap();
-        virtual_map.insert(inode, coords);
-
+        self.virtual_inode_to_dds.insert(inode, coords);
         inode
     }
 
@@ -144,9 +150,11 @@ impl InodeManager {
     /// Get DDS coordinates for a virtual inode.
     ///
     /// Returns `None` if the inode is not a registered virtual inode.
+    /// This operation is lock-free.
     pub fn get_virtual_dds(&self, inode: u64) -> Option<DdsFilename> {
-        let virtual_map = self.virtual_inode_to_dds.lock().unwrap();
-        virtual_map.get(&inode).cloned()
+        self.virtual_inode_to_dds
+            .get(&inode)
+            .map(|r| r.value().clone())
     }
 }
 
@@ -325,5 +333,53 @@ mod tests {
         };
         let virtual_inode = manager.create_virtual_inode(coords);
         assert!(InodeManager::is_virtual_inode(virtual_inode));
+    }
+
+    #[test]
+    fn test_concurrent_inode_allocation() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let temp = tempdir().unwrap();
+        let manager = Arc::new(InodeManager::new(temp.path().to_path_buf()));
+        let mut handles = Vec::new();
+
+        // Spawn 10 threads, each creating 100 inodes
+        for t in 0..10 {
+            let manager = Arc::clone(&manager);
+            let base_path = temp.path().to_path_buf();
+            handles.push(thread::spawn(move || {
+                let mut inodes = Vec::new();
+                for i in 0..100 {
+                    let path = base_path.join(format!("thread{}_file{}.dsf", t, i));
+                    let inode = manager.get_or_create_inode(&path);
+                    inodes.push((path, inode));
+                }
+                inodes
+            }));
+        }
+
+        // Collect all results
+        let mut all_inodes = Vec::new();
+        for handle in handles {
+            all_inodes.extend(handle.join().unwrap());
+        }
+
+        // Verify: all inodes should be unique (no duplicates from race conditions)
+        let mut seen_inodes = std::collections::HashSet::new();
+        for (path, inode) in &all_inodes {
+            assert!(
+                seen_inodes.insert(*inode),
+                "Duplicate inode {} for path {:?}",
+                inode,
+                path
+            );
+            // Verify mapping is correct
+            assert_eq!(manager.get_path(*inode), Some(path.clone()));
+            assert_eq!(manager.get_inode(path), Some(*inode));
+        }
+
+        // Should have 1000 unique inodes (10 threads × 100 files)
+        assert_eq!(seen_inodes.len(), 1000);
     }
 }
