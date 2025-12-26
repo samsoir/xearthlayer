@@ -458,6 +458,28 @@ impl XEarthLayerService {
         self.tile_request_callback = Some(callback);
     }
 
+    /// Set the shared memory cache.
+    ///
+    /// When multiple packages are mounted, sharing a single memory cache across
+    /// all services ensures the configured memory limit is respected globally,
+    /// not per-package. Without this, mounting N packages could use N times
+    /// the configured memory limit.
+    ///
+    /// This should be called before mounting the filesystem.
+    ///
+    /// # Arguments
+    ///
+    /// * `cache` - The shared memory cache
+    /// * `adapter` - The shared memory cache adapter (wraps the cache with provider/format context)
+    pub fn set_shared_memory_cache(
+        &mut self,
+        cache: Arc<MemoryCache>,
+        adapter: Arc<MemoryCacheAdapter>,
+    ) {
+        self.memory_cache = Some(cache);
+        self.memory_cache_adapter = Some(adapter);
+    }
+
     /// Download a single tile for the given coordinates.
     ///
     /// Converts lat/lon coordinates to tile coordinates and generates
