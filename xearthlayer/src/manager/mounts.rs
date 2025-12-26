@@ -13,6 +13,7 @@ use crate::fuse::SpawnedMountHandle;
 use crate::package::PackageType;
 use crate::panic as panic_handler;
 use crate::pipeline::{ConcurrencyLimiter, DiskIoProfile};
+use crate::prefetch::TileRequestCallback;
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
 use crate::telemetry::TelemetrySnapshot;
 
@@ -488,6 +489,9 @@ pub struct ServiceBuilder {
     /// Shared disk I/O limiter across all service instances.
     /// Created lazily on first build to avoid allocation when unused.
     disk_io_limiter: Arc<ConcurrencyLimiter>,
+    /// Shared tile request callback for FUSE-based position inference.
+    /// When set, all services forward tile requests to this callback.
+    tile_request_callback: Option<TileRequestCallback>,
 }
 
 impl ServiceBuilder {
@@ -552,7 +556,22 @@ impl ServiceBuilder {
             provider_config,
             logger,
             disk_io_limiter,
+            tile_request_callback: None,
         }
+    }
+
+    /// Set the tile request callback for FUSE-based position inference.
+    ///
+    /// When set, all services built by this builder will forward tile requests
+    /// to this callback. This enables the `FuseRequestAnalyzer` to track tile
+    /// loading patterns for position inference when telemetry is unavailable.
+    ///
+    /// # Arguments
+    ///
+    /// * `callback` - The callback to invoke for each tile request
+    pub fn with_tile_request_callback(mut self, callback: TileRequestCallback) -> Self {
+        self.tile_request_callback = Some(callback);
+        self
     }
 
     /// Build a service for the given package.
@@ -568,6 +587,11 @@ impl ServiceBuilder {
 
         // Set shared disk I/O limiter to prevent I/O exhaustion across packages
         service.set_disk_io_limiter(Arc::clone(&self.disk_io_limiter));
+
+        // Wire tile request callback for FUSE-based position inference
+        if let Some(ref callback) = self.tile_request_callback {
+            service.set_tile_request_callback(callback.clone());
+        }
 
         Ok(service)
     }

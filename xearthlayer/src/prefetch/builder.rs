@@ -71,6 +71,9 @@ pub struct PrefetcherBuilder<M: MemoryCache> {
     radial_radius: u8,
     zoom: u8,
     attempt_ttl_secs: u64,
+
+    // External FUSE analyzer (for wiring callback to services before building)
+    fuse_analyzer: Option<Arc<FuseRequestAnalyzer>>,
 }
 
 /// Available prefetch strategies.
@@ -113,6 +116,7 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
             radial_radius: 3,
             zoom: DEFAULT_ZOOM,
             attempt_ttl_secs: DEFAULT_ATTEMPT_TTL_SECS,
+            fuse_analyzer: None,
         }
     }
 
@@ -189,6 +193,31 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
         self
     }
 
+    /// Set the FUSE request analyzer for position inference.
+    ///
+    /// When provided, this analyzer is used instead of creating a new one.
+    /// This allows wiring the analyzer's callback to services before building
+    /// the prefetcher.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let analyzer = Arc::new(FuseRequestAnalyzer::new(FuseInferenceConfig::default()));
+    /// let callback = analyzer.callback();
+    ///
+    /// // Wire callback to services...
+    ///
+    /// let prefetcher = PrefetcherBuilder::new()
+    ///     .memory_cache(cache)
+    ///     .dds_handler(handler)
+    ///     .with_fuse_analyzer(analyzer)
+    ///     .build();
+    /// ```
+    pub fn with_fuse_analyzer(mut self, analyzer: Arc<FuseRequestAnalyzer>) -> Self {
+        self.fuse_analyzer = Some(analyzer);
+        self
+    }
+
     /// Build the prefetcher instance.
     ///
     /// # Panics
@@ -239,8 +268,11 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
                     radial_fallback_radius: self.radial_radius,
                 };
 
-                // Create FUSE request analyzer for inference-based fallback
-                let fuse_analyzer = Arc::new(FuseRequestAnalyzer::new(fuse_config));
+                // Use provided analyzer or create a new one
+                // Providing an external analyzer allows wiring its callback to services
+                let fuse_analyzer = self
+                    .fuse_analyzer
+                    .unwrap_or_else(|| Arc::new(FuseRequestAnalyzer::new(fuse_config)));
 
                 let mut prefetcher =
                     HeadingAwarePrefetcher::new(memory_cache, dds_handler, config, fuse_analyzer);

@@ -12,7 +12,10 @@ use xearthlayer::log::TracingLogger;
 use xearthlayer::manager::{LocalPackageStore, MountManager, ServiceBuilder};
 use xearthlayer::package::PackageType;
 use xearthlayer::panic as panic_handler;
-use xearthlayer::prefetch::{PrefetcherBuilder, SharedPrefetchStatus, TelemetryListener};
+use xearthlayer::prefetch::{
+    FuseInferenceConfig, FuseRequestAnalyzer, PrefetcherBuilder, SharedPrefetchStatus,
+    TelemetryListener,
+};
 use xearthlayer::service::ServiceConfig;
 
 use super::common::{resolve_dds_format, resolve_provider, DdsCompression, ProviderType};
@@ -174,14 +177,30 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     // Create a logger for all services
     let logger: Arc<dyn xearthlayer::log::Logger> = Arc::new(TracingLogger);
 
+    // Create FUSE request analyzer for position inference (if prefetch is enabled)
+    // The analyzer is created early so its callback can be wired to services before mounting.
+    // This enables FUSE-based position inference when telemetry is unavailable.
+    let fuse_analyzer = if prefetch_enabled {
+        Some(Arc::new(FuseRequestAnalyzer::new(
+            FuseInferenceConfig::default(),
+        )))
+    } else {
+        None
+    };
+
     // Create service builder with shared disk I/O limiter and configured profile
     // This ensures all packages share a single limiter tuned for the storage type
-    let service_builder = ServiceBuilder::with_disk_io_profile(
+    let mut service_builder = ServiceBuilder::with_disk_io_profile(
         service_config.clone(),
         provider_config.clone(),
         logger.clone(),
         config.cache.disk_io_profile,
     );
+
+    // Wire FUSE analyzer callback to services for position inference
+    if let Some(ref analyzer) = fuse_analyzer {
+        service_builder = service_builder.with_tile_request_callback(analyzer.callback());
+    }
 
     // Mount all packages
     println!("Mounting packages to Custom Scenery...");
@@ -265,15 +284,22 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
 
                 // Build prefetcher using the builder with configuration
                 // Strategies: radial (simple), heading-aware (directional), auto (graceful degradation)
-                let prefetcher = PrefetcherBuilder::new()
+                let mut builder = PrefetcherBuilder::new()
                     .memory_cache(memory_cache)
                     .dds_handler(dds_handler)
                     .strategy(&config.prefetch.strategy)
                     .shared_status(Arc::clone(&shared_prefetch_status))
                     .cone_half_angle(config.prefetch.cone_angle)
                     .outer_radius_nm(config.prefetch.cone_distance_nm)
-                    .radial_radius(config.prefetch.radial_radius)
-                    .build();
+                    .radial_radius(config.prefetch.radial_radius);
+
+                // Wire FUSE analyzer for heading-aware/auto strategies
+                // This enables FUSE-based position inference when telemetry is unavailable
+                if let Some(analyzer) = fuse_analyzer {
+                    builder = builder.with_fuse_analyzer(analyzer);
+                }
+
+                let prefetcher = builder.build();
 
                 // Get startup info before prefetcher is consumed
                 let startup_info = prefetcher.startup_info();

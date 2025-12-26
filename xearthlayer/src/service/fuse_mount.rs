@@ -37,6 +37,7 @@ use tokio::runtime::Handle;
 use crate::fuse::{DdsHandler, Fuse3PassthroughFS, MountHandle, SpawnedMountHandle};
 use crate::log::Logger;
 use crate::log_info;
+use crate::prefetch::TileRequestCallback;
 
 use super::error::ServiceError;
 
@@ -51,6 +52,8 @@ pub struct FuseMountConfig {
     timeout: Duration,
     /// Optional logger for diagnostic messages
     logger: Option<std::sync::Arc<dyn Logger>>,
+    /// Optional callback for tile request tracking (for FUSE-based position inference)
+    tile_request_callback: Option<TileRequestCallback>,
 }
 
 impl FuseMountConfig {
@@ -66,6 +69,7 @@ impl FuseMountConfig {
             expected_dds_size,
             timeout: Duration::from_secs(30),
             logger: None,
+            tile_request_callback: None,
         }
     }
 
@@ -78,6 +82,16 @@ impl FuseMountConfig {
     /// Set the logger for diagnostic messages.
     pub fn with_logger(mut self, logger: std::sync::Arc<dyn Logger>) -> Self {
         self.logger = Some(logger);
+        self
+    }
+
+    /// Set the tile request callback for FUSE-based position inference.
+    ///
+    /// The callback is invoked for each DDS tile request, allowing the
+    /// prefetcher to track X-Plane's tile loading patterns and infer
+    /// aircraft position when telemetry is unavailable.
+    pub fn with_tile_request_callback(mut self, callback: TileRequestCallback) -> Self {
+        self.tile_request_callback = Some(callback);
         self
     }
 }
@@ -128,12 +142,19 @@ impl FuseMountService {
 
     /// Create a Fuse3PassthroughFS instance with the given configuration.
     fn create_filesystem(config: &FuseMountConfig, source_path: PathBuf) -> Fuse3PassthroughFS {
-        Fuse3PassthroughFS::new(
+        let mut fs = Fuse3PassthroughFS::new(
             source_path,
             config.dds_handler.clone(),
             config.expected_dds_size,
         )
-        .with_timeout(config.timeout)
+        .with_timeout(config.timeout);
+
+        // Wire tile request callback for FUSE-based position inference
+        if let Some(ref callback) = config.tile_request_callback {
+            fs = fs.with_tile_request_callback(callback.clone());
+        }
+
+        fs
     }
 
     /// Mount a FUSE passthrough filesystem (async).
