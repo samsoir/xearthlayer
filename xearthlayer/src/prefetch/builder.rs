@@ -304,14 +304,6 @@ mod tests {
         entries: RwLock<HashMap<(u32, u32, u8), Vec<u8>>>,
     }
 
-    impl MockCache {
-        fn new() -> Self {
-            Self {
-                entries: RwLock::new(HashMap::new()),
-            }
-        }
-    }
-
     impl MemoryCache for MockCache {
         fn get(
             &self,

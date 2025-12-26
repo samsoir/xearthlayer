@@ -19,7 +19,7 @@
 //! 2. Use that to authenticate with Apple's MapKit bootstrap API
 //! 3. Extract the access key and version from the satellite tile source
 //!
-//! Tokens may expire, requiring automatic refresh on 403/410 responses.
+//! Tokens may expire, requiring automatic refresh on 400/403/410 responses.
 //!
 //! # Coordinate System
 //!
@@ -32,6 +32,7 @@ use crate::provider::{AsyncHttpClient, AsyncProvider, HttpClient, Provider, Prov
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, info, warn};
 
 /// DuckDuckGo endpoint for obtaining the initial bearer token.
@@ -43,6 +44,12 @@ const APPLE_BOOTSTRAP_URL: &str =
 
 /// Base URL for Apple Maps satellite tiles.
 const APPLE_TILE_URL: &str = "https://sat-cdn.apple-mapkit.com/tile";
+
+/// Origin header required by Apple Maps (tokens are bound to this origin).
+const APPLE_ORIGIN: &str = "https://duckduckgo.com";
+
+/// Referer header required by Apple Maps.
+const APPLE_REFERER: &str = "https://duckduckgo.com/";
 
 /// Minimum zoom level supported by Apple Maps.
 const MIN_ZOOM: u8 = 0;
@@ -149,9 +156,12 @@ pub struct AppleTokenStatusSnapshot {
 /// Manages Apple Maps token lifecycle.
 ///
 /// Handles token acquisition, caching, and automatic refresh on expiration.
+/// Uses a refresh lock to prevent concurrent token refreshes causing race conditions.
 #[derive(Clone)]
 struct AppleTokenManager {
     credentials: Arc<RwLock<Option<AppleCredentials>>>,
+    /// Generation counter to detect stale refresh attempts
+    generation: Arc<AtomicU64>,
 }
 
 impl AppleTokenManager {
@@ -162,6 +172,7 @@ impl AppleTokenManager {
                 access_key,
                 version,
             }))),
+            generation: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -170,13 +181,20 @@ impl AppleTokenManager {
         self.credentials.read().ok()?.clone()
     }
 
+    /// Get current generation counter.
+    fn get_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
     /// Update credentials after a successful token fetch.
+    /// Increments the generation counter to invalidate stale refresh attempts.
     fn set_credentials(&self, access_key: String, version: String) {
         if let Ok(mut creds) = self.credentials.write() {
             *creds = Some(AppleCredentials {
                 access_key,
                 version,
             });
+            self.generation.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -394,8 +412,11 @@ impl<C: HttpClient + Clone> Provider for AppleMapsProvider<C> {
         let url = self.build_url(row, col, zoom)?;
         match self.http_client.get(&url) {
             Ok(data) => Ok(data),
-            Err(ProviderError::HttpError(msg)) if msg.contains("403") || msg.contains("410") => {
-                // Token expired, refresh and retry
+            Err(ProviderError::HttpError(msg))
+                if msg.contains("400") || msg.contains("403") || msg.contains("410") =>
+            {
+                // Token expired or invalid, refresh and retry
+                // Apple Maps may return 400, 403, or 410 for expired tokens
                 self.refresh_credentials()?;
                 let url = self.build_url(row, col, zoom)?;
                 self.http_client.get(&url)
@@ -425,6 +446,8 @@ pub struct AsyncAppleMapsProvider<C: AsyncHttpClient> {
     http_client: C,
     token_manager: AppleTokenManager,
     status: AppleTokenStatus,
+    /// Lock to serialize token refresh attempts
+    refresh_lock: Arc<AsyncMutex<()>>,
 }
 
 impl<C: AsyncHttpClient + Clone> AsyncAppleMapsProvider<C> {
@@ -446,6 +469,7 @@ impl<C: AsyncHttpClient + Clone> AsyncAppleMapsProvider<C> {
                 credentials.version,
             ),
             status: AppleTokenStatus::new_valid(),
+            refresh_lock: Arc::new(AsyncMutex::new(())),
         })
     }
 
@@ -467,7 +491,24 @@ impl<C: AsyncHttpClient + Clone> AsyncAppleMapsProvider<C> {
     }
 
     /// Refresh credentials after an authentication failure.
-    async fn refresh_credentials(&self) -> Result<(), ProviderError> {
+    ///
+    /// Uses a lock to ensure only one refresh happens at a time.
+    /// The `failed_generation` parameter is the generation when the failure occurred;
+    /// if the current generation is different, another request already refreshed the token.
+    async fn refresh_credentials_if_needed(
+        &self,
+        failed_generation: u64,
+    ) -> Result<(), ProviderError> {
+        // Acquire the refresh lock to serialize refresh attempts
+        let _lock = self.refresh_lock.lock().await;
+
+        // Check if another request already refreshed the token while we were waiting
+        let current_generation = self.token_manager.get_generation();
+        if current_generation != failed_generation {
+            // Token was already refreshed by another request, skip
+            return Ok(());
+        }
+
         warn!("Apple Maps token expired - attempting refresh");
         self.token_manager.clear_credentials();
 
@@ -495,21 +536,31 @@ impl<C: AsyncHttpClient + Clone> AsyncProvider for AsyncAppleMapsProvider<C> {
             return Err(ProviderError::UnsupportedZoom(zoom));
         }
 
+        // Required headers - Apple Maps tokens are bound to the DuckDuckGo origin
+        let headers = [("Origin", APPLE_ORIGIN), ("Referer", APPLE_REFERER)];
+
+        // Capture the generation before making the request
+        let generation_before = self.token_manager.get_generation();
         let url = self.build_url(row, col, zoom)?;
-        match self.http_client.get(&url).await {
+
+        match self.http_client.get_with_headers(&url, &headers).await {
             Ok(data) => Ok(data),
             Err(ProviderError::HttpError(ref msg))
-                if msg.contains("403") || msg.contains("410") =>
+                if msg.contains("400") || msg.contains("403") || msg.contains("410") =>
             {
-                // Token expired, refresh and retry
-                warn!(
-                    row = row,
-                    col = col,
-                    zoom = zoom,
-                    "Apple Maps returned auth error, refreshing token"
-                );
+                // Token expired or invalid, refresh and retry
+                // Apple Maps may return 400 Bad Request, 403 Forbidden, or 410 Gone
+                // for expired/invalid tokens
+                let error_code = if msg.contains("400") {
+                    "400"
+                } else if msg.contains("403") {
+                    "403"
+                } else {
+                    "410"
+                };
 
-                if let Err(e) = self.refresh_credentials().await {
+                // Use generation-based refresh to avoid concurrent refresh stampede
+                if let Err(e) = self.refresh_credentials_if_needed(generation_before).await {
                     // Refresh failed - log and return original error
                     error!("Failed to refresh Apple Maps token: {}", e);
                     return Err(ProviderError::ProviderSpecific(format!(
@@ -518,12 +569,21 @@ impl<C: AsyncHttpClient + Clone> AsyncProvider for AsyncAppleMapsProvider<C> {
                     )));
                 }
 
-                // Retry with new token
+                // Retry with new token (or token refreshed by another request)
                 let url = self.build_url(row, col, zoom)?;
-                match self.http_client.get(&url).await {
+                match self.http_client.get_with_headers(&url, &headers).await {
                     Ok(data) => Ok(data),
                     Err(e) => {
-                        error!("Request failed after token refresh: {}", e);
+                        // Only log once per tile, not per chunk
+                        if row.is_multiple_of(16) && col.is_multiple_of(16) {
+                            warn!(
+                                row = row,
+                                col = col,
+                                zoom = zoom,
+                                error_code = error_code,
+                                "Apple Maps request failed after token refresh"
+                            );
+                        }
                         Err(e)
                     }
                 }
