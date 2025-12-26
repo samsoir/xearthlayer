@@ -172,7 +172,8 @@ impl<M: MemoryCache> RadialPrefetcher<M> {
             "Radial prefetcher started"
         );
 
-        let mut last_cycle = Instant::now();
+        // Initialize last_cycle in the past so first cycle can run immediately
+        let mut last_cycle = Instant::now() - MIN_CYCLE_INTERVAL;
 
         loop {
             tokio::select! {
