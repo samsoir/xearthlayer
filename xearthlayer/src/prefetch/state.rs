@@ -5,6 +5,53 @@ use std::time::Instant;
 
 use super::scheduler::PrefetchStatsSnapshot;
 
+/// GPS/telemetry connection status for UI display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpsStatus {
+    /// XGPS2 configured and receiving data from X-Plane.
+    Connected,
+    /// XGPS2 configured but not yet receiving data.
+    #[default]
+    Acquiring,
+    /// XGPS2 not configured; using FUSE-based position inference.
+    Inferred,
+}
+
+impl std::fmt::Display for GpsStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connected => write!(f, "Connected"),
+            Self::Acquiring => write!(f, "Acquiring..."),
+            Self::Inferred => write!(f, "Inferred"),
+        }
+    }
+}
+
+/// Prefetch operating mode for UI display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrefetchMode {
+    /// Using UDP telemetry for heading-aware cone prefetch.
+    #[default]
+    Telemetry,
+    /// Using FUSE request analysis for position/heading inference.
+    FuseInference,
+    /// Fallback to simple radial prefetch (no heading data).
+    Radial,
+    /// Prefetch system is idle (no data received yet).
+    Idle,
+}
+
+impl std::fmt::Display for PrefetchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Telemetry => write!(f, "Heading-Aware (Telemetry)"),
+            Self::FuseInference => write!(f, "Heading-Aware (Inferred)"),
+            Self::Radial => write!(f, "Radial"),
+            Self::Idle => write!(f, "Idle"),
+        }
+    }
+}
+
 /// Shared prefetch status for display in the UI.
 ///
 /// This provides a thread-safe way to share the current prefetch state
@@ -22,7 +69,9 @@ impl SharedPrefetchStatus {
         })
     }
 
-    /// Update the aircraft state.
+    /// Update the aircraft state from telemetry.
+    ///
+    /// This also sets GPS status to Connected since we received data.
     pub fn update_aircraft(&self, state: &AircraftState) {
         if let Ok(mut inner) = self.inner.write() {
             inner.aircraft = Some(AircraftSnapshot {
@@ -32,6 +81,8 @@ impl SharedPrefetchStatus {
                 ground_speed: state.ground_speed,
                 altitude: state.altitude,
             });
+            // Receiving telemetry means GPS is connected
+            inner.gps_status = GpsStatus::Connected;
         }
     }
 
@@ -39,6 +90,20 @@ impl SharedPrefetchStatus {
     pub fn update_stats(&self, stats: PrefetchStatsSnapshot) {
         if let Ok(mut inner) = self.inner.write() {
             inner.stats = stats;
+        }
+    }
+
+    /// Update the GPS connection status.
+    pub fn update_gps_status(&self, status: GpsStatus) {
+        if let Ok(mut inner) = self.inner.write() {
+            inner.gps_status = status;
+        }
+    }
+
+    /// Update the current prefetch operating mode.
+    pub fn update_prefetch_mode(&self, mode: PrefetchMode) {
+        if let Ok(mut inner) = self.inner.write() {
+            inner.prefetch_mode = mode;
         }
     }
 
@@ -55,6 +120,10 @@ pub struct PrefetchStatusSnapshot {
     pub aircraft: Option<AircraftSnapshot>,
     /// Prefetch statistics.
     pub stats: PrefetchStatsSnapshot,
+    /// GPS/telemetry connection status.
+    pub gps_status: GpsStatus,
+    /// Current prefetch operating mode.
+    pub prefetch_mode: PrefetchMode,
 }
 
 /// Aircraft state snapshot for display (without Instant which can't be cloned easily).

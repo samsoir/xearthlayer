@@ -68,7 +68,10 @@ pub use radial::{
     RadialPrefetchConfig, RadialPrefetchStats, RadialPrefetchStatsSnapshot, RadialPrefetcher,
 };
 pub use scheduler::{PrefetchScheduler, PrefetchStats, PrefetchStatsSnapshot, SchedulerConfig};
-pub use state::{AircraftSnapshot, AircraftState, PrefetchStatusSnapshot, SharedPrefetchStatus};
+pub use state::{
+    AircraftSnapshot, AircraftState, GpsStatus, PrefetchMode, PrefetchStatusSnapshot,
+    SharedPrefetchStatus,
+};
 pub use strategy::Prefetcher;
 
 // Heading-aware prefetch exports

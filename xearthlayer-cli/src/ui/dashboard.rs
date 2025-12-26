@@ -22,7 +22,9 @@ use ratatui::{
     Frame, Terminal,
 };
 use xearthlayer::pipeline::control_plane::{ControlPlaneHealth, HealthSnapshot};
-use xearthlayer::prefetch::{PrefetchStatusSnapshot, SharedPrefetchStatus};
+use xearthlayer::prefetch::{
+    GpsStatus, PrefetchMode, PrefetchStatusSnapshot, SharedPrefetchStatus,
+};
 use xearthlayer::telemetry::TelemetrySnapshot;
 
 use super::widgets::{
@@ -269,7 +271,7 @@ impl Dashboard {
             .margin(0)
             .constraints([
                 Constraint::Length(3), // Header
-                Constraint::Length(4), // Prefetch / Aircraft
+                Constraint::Length(5), // Aircraft Position (GPS Status, Position, Prefetch)
                 Constraint::Length(5), // Control Plane (needs 4 rows + 1 border)
                 Constraint::Length(6), // Pipeline (Tile Pipeline)
                 Constraint::Length(3), // Chunk Tasks (moved above Network)
@@ -379,28 +381,44 @@ impl Dashboard {
         }
     }
 
-    /// Render the prefetch/aircraft status section.
+    /// Render the aircraft position section.
     fn render_prefetch(frame: &mut Frame, area: Rect, prefetch: &PrefetchStatusSnapshot) {
         let prefetch_block = Block::default()
             .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
             .border_style(Style::default().fg(Color::DarkGray))
             .title(Span::styled(
-                " Aircraft GPS Position ",
+                " Aircraft Position ",
                 Style::default().fg(Color::Magenta),
             ));
 
         frame.render_widget(prefetch_block, area);
         let inner = Self::inner_rect(area, 1, 1);
 
-        // Create lines for aircraft and prefetch status
-        let aircraft_line = if prefetch.aircraft.is_some() {
+        // GPS Status line with colored indicator
+        let (gps_indicator, gps_text, gps_color) = match prefetch.gps_status {
+            GpsStatus::Connected => ("●", "Connected", Color::Green),
+            GpsStatus::Acquiring => ("●", "Acquiring...", Color::Yellow),
+            GpsStatus::Inferred => ("●", "Inferred", Color::Red),
+        };
+
+        let gps_line = Line::from(vec![
+            Span::styled("GPS Status: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} ", gps_indicator),
+                Style::default().fg(gps_color),
+            ),
+            Span::styled(gps_text, Style::default().fg(gps_color)),
+        ]);
+
+        // Position line
+        let position_line = if prefetch.aircraft.is_some() {
             Line::from(vec![
-                Span::styled("Position: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Position:   ", Style::default().fg(Color::DarkGray)),
                 Span::styled(prefetch.aircraft_line(), Style::default().fg(Color::Green)),
             ])
         } else {
             Line::from(vec![
-                Span::styled("Position: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Position:   ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "Waiting for X-Plane telemetry...",
                     Style::default().fg(Color::Yellow),
@@ -408,12 +426,23 @@ impl Dashboard {
             ])
         };
 
+        // Prefetch mode line
+        let mode_color = match prefetch.prefetch_mode {
+            PrefetchMode::Telemetry => Color::Green,
+            PrefetchMode::FuseInference => Color::Yellow,
+            PrefetchMode::Radial => Color::Cyan,
+            PrefetchMode::Idle => Color::DarkGray,
+        };
+
         let prefetch_line = Line::from(vec![
-            Span::styled("Cache Warming: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(prefetch.stats_line(), Style::default().fg(Color::Cyan)),
+            Span::styled("Prefetch:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", prefetch.prefetch_mode),
+                Style::default().fg(mode_color),
+            ),
         ]);
 
-        let text = vec![aircraft_line, prefetch_line];
+        let text = vec![gps_line, position_line, prefetch_line];
         let paragraph = Paragraph::new(text);
         frame.render_widget(paragraph, inner);
     }

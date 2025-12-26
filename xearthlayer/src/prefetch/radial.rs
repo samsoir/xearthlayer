@@ -21,7 +21,7 @@ use crate::coord::{to_tile_coords, TileCoord};
 use crate::fuse::{DdsHandler, DdsRequest};
 use crate::pipeline::{JobId, MemoryCache};
 
-use super::state::{AircraftState, SharedPrefetchStatus};
+use super::state::{AircraftState, PrefetchMode, SharedPrefetchStatus};
 use super::strategy::Prefetcher;
 
 /// Default radius in tiles around current position.
@@ -328,6 +328,7 @@ impl<M: MemoryCache> RadialPrefetcher<M> {
                 prediction_cycles: self.stats.cycles.load(Ordering::Relaxed),
             };
             status.update_stats(stats);
+            status.update_prefetch_mode(PrefetchMode::Radial);
         }
     }
 

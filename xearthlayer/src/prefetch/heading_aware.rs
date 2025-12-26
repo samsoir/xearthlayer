@@ -63,7 +63,7 @@ use super::buffer::BufferGenerator;
 use super::cone::ConeGenerator;
 use super::config::{FuseInferenceConfig, HeadingAwarePrefetchConfig};
 use super::inference::FuseRequestAnalyzer;
-use super::state::{AircraftState, SharedPrefetchStatus};
+use super::state::{AircraftState, GpsStatus, PrefetchMode, SharedPrefetchStatus};
 use super::strategy::Prefetcher;
 use super::types::{PrefetchTile, PrefetchZone, TurnDirection, TurnState};
 
@@ -377,6 +377,23 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
                 prediction_cycles: self.stats.cycles.load(Ordering::Relaxed),
             };
             status.update_stats(stats);
+
+            // Update prefetch mode for UI display
+            let display_mode = match mode {
+                InputMode::Telemetry => PrefetchMode::Telemetry,
+                InputMode::FuseInference => PrefetchMode::FuseInference,
+                InputMode::RadialFallback => PrefetchMode::Radial,
+            };
+            status.update_prefetch_mode(display_mode);
+
+            // Update GPS status based on input mode
+            // Telemetry mode: GPS is connected (update_aircraft already sets this)
+            // FUSE/Radial mode: GPS is inferred (using FUSE-based position)
+            let gps_status = match mode {
+                InputMode::Telemetry => GpsStatus::Connected,
+                InputMode::FuseInference | InputMode::RadialFallback => GpsStatus::Inferred,
+            };
+            status.update_gps_status(gps_status);
         }
 
         // Clean up expired attempts
