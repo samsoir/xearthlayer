@@ -220,7 +220,6 @@ impl Default for RequestCoalescer {
 }
 
 /// Result of attempting to register a request.
-#[allow(dead_code)]
 pub(crate) enum CoalesceResult {
     /// This is a new request - caller should process and call complete()
     NewRequest {
@@ -233,6 +232,7 @@ pub(crate) enum CoalesceResult {
     Coalesced(broadcast::Receiver<CoalescedResult>),
 }
 
+// Helper methods for CoalesceResult - used in tests and available for future use
 #[allow(dead_code)]
 impl CoalesceResult {
     /// Returns true if this is a new request that needs processing.

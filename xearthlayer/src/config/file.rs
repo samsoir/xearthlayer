@@ -350,7 +350,8 @@ fn clamp_http_concurrent(value: usize) -> usize {
             requested = value,
             min = MIN_HTTP_CONCURRENT,
             max = MAX_HTTP_CONCURRENT,
-            "max_http_concurrent below minimum, clamping to {}", MIN_HTTP_CONCURRENT
+            "max_http_concurrent below minimum, clamping to {}",
+            MIN_HTTP_CONCURRENT
         );
         MIN_HTTP_CONCURRENT
     } else if value > MAX_HTTP_CONCURRENT {
@@ -670,13 +671,12 @@ impl ConfigFile {
         // [pipeline] section
         if let Some(section) = ini.section(Some("pipeline")) {
             if let Some(v) = section.get("max_http_concurrent") {
-                let parsed: usize =
-                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                        section: "pipeline".to_string(),
-                        key: "max_http_concurrent".to_string(),
-                        value: v.to_string(),
-                        reason: "must be a positive integer".to_string(),
-                    })?;
+                let parsed: usize = v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                    section: "pipeline".to_string(),
+                    key: "max_http_concurrent".to_string(),
+                    value: v.to_string(),
+                    reason: "must be a positive integer".to_string(),
+                })?;
                 // Enforce hard limits to prevent provider rate limiting
                 config.pipeline.max_http_concurrent = clamp_http_concurrent(parsed);
             }
