@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8] - 2025-12-27
+
+### Added
+
+- **Heading-Aware Prefetch**: Intelligent tile prefetching based on aircraft heading and flight path
+  - Prediction cone prefetches tiles ahead of aircraft in direction of travel
+  - Graceful degradation to radial prefetch when telemetry unavailable
+  - Configurable cone angle (default 45°) and prefetch zone (85-95nm from aircraft)
+  - Strategy selection via `prefetch.strategy` setting (auto/heading-aware/radial)
+
+- **Multi-Zoom Prefetch (ZL12)**: Prefetch distant terrain at lower resolution
+  - ZL12 tiles reduce stutters at the ~90nm scenery boundary
+  - Separate configurable zone (88-100nm) for distant terrain
+  - Toggle via `prefetch.enable_zl12` setting
+
+- **Configuration Auto-Upgrade**: Safely update config files when new settings are added
+  - New `xearthlayer config upgrade` command with `--dry-run` preview mode
+  - Creates timestamped backup before modifying configuration
+  - Startup warning when config is missing new settings
+  - Syncs all 43 ConfigKey entries with ConfigFile settings
+
+- **Pipeline Control Plane**: Improved job management and health monitoring
+  - Semaphore-based concurrency limiting prevents resource exhaustion
+  - Stall detection and automatic job recovery (default 60s threshold)
+  - Health monitoring with configurable check intervals
+  - Dashboard shows control plane status (Healthy/Degraded/Critical)
+
+- **Quit Confirmation**: Prevents accidental X-Plane crashes from premature exit
+  - Press 'q' twice or Ctrl+C twice to confirm quit
+  - Warning message explains potential impact on X-Plane
+
+- **Dashboard Improvements**: Enhanced real-time monitoring
+  - GPS status indicator shows telemetry source (UDP/FUSE/None)
+  - Prefetch mode display (Heading-Aware/Radial)
+  - Grid layouts with section titles for better organization
+  - On-demand tile request instrumentation
+
+- **Predictive Tile Caching**: X-Plane 12 telemetry integration
+  - ForeFlight protocol UDP listener (port 49002)
+  - FUSE-based position inference as fallback
+  - TTL tracking prevents re-requesting failed tiles
+
+### Fixed
+
+- **Apple Maps Authentication**: Token race condition and missing headers
+  - Added Origin and Referer headers required by Apple's tile server
+  - Fixed token refresh race condition during concurrent requests
+  - Improved token refresh logging and status tracking
+
+- **Memory Cache Overflow**: Shared cache across multiple packages
+  - Cache size now correctly tracked across all mounted scenery packages
+
+- **Coordinate Calculation Bug**: Scenery-aware prefetch tile positioning
+  - Fixed incorrect tile coordinates causing cache misses
+
+- **FUSE Unmount Race Condition**: Orphaned mounts on shutdown
+  - Proper synchronization prevents mount table corruption
+
+- **First-Cycle Rate Limiting**: Prefetch now respects rate limits from startup
+
+### Changed
+
+- **Async Cache Implementation**: Replaced blocking synchronization primitives
+  - `MemoryCache` now uses moka async cache instead of std::sync::Mutex
+  - `InodeManager` uses DashMap instead of blocking Mutex
+  - Eliminates potential deadlocks under high concurrency
+
+- **HTTP Concurrency Ceiling**: Hard limit of 256 concurrent requests
+  - Prevents provider rate limiting (HTTP 429) and cascade failures
+  - Configurable via `pipeline.max_http_concurrent` (64-256 range)
+
+- **Configurable Radial Radius**: `prefetch.radial_radius` setting
+  - Default 3 (7×7 = 49 tiles), adjustable for bandwidth/coverage tradeoff
+
+### Performance
+
+- **Permit-Bounded Downloads**: Semaphore-based download limiting with panic recovery
+- **Request Coalescing**: Control plane deduplicates concurrent requests for same tile
+- **Prefetch Concurrency Limiting**: Dedicated limiter prevents prefetch from starving on-demand requests
+
 ## [0.2.7] - 2025-12-21
 
 ### Fixed
@@ -151,7 +231,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Linux support only (Windows and macOS planned for future releases)
 - Requires FUSE3 for filesystem mounting
 
-[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.2.7...HEAD
+[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.2.8...HEAD
+[0.2.8]: https://github.com/samsoir/xearthlayer/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/samsoir/xearthlayer/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/samsoir/xearthlayer/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/samsoir/xearthlayer/compare/v0.2.0...v0.2.5
