@@ -35,6 +35,7 @@ mod file;
 mod keys;
 mod size;
 mod texture;
+mod upgrade;
 mod xplane;
 
 pub use download::DownloadConfig;
@@ -100,6 +101,9 @@ pub use file::{
 pub use keys::{ConfigKey, ConfigKeyError};
 pub use size::{format_size, parse_size, Size, SizeParseError};
 pub use texture::TextureConfig;
+pub use upgrade::{
+    analyze_config, upgrade_config, ConfigUpgradeAnalysis, UpgradeResult, DEPRECATED_KEYS,
+};
 pub use xplane::{
     derive_mountpoint, detect_custom_scenery, detect_scenery_dir, detect_xplane_install,
     detect_xplane_installs, SceneryDetectionResult, XPlanePathError,
