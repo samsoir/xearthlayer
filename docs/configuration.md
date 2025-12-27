@@ -492,6 +492,30 @@ xearthlayer config set packages.auto_install_overlays true
 
 Values are validated before being saved. Invalid values will produce an error message explaining the expected format.
 
+### Upgrade Configuration
+
+When XEarthLayer is updated, new configuration settings may be added. The `config upgrade` command safely adds missing settings with their default values while preserving your existing settings:
+
+```bash
+# Preview what would change (dry run)
+xearthlayer config upgrade --dry-run
+
+# Perform the upgrade
+xearthlayer config upgrade
+```
+
+**What it does:**
+- **Adds missing settings** with sensible default values
+- **Preserves all your existing settings** unchanged
+- **Creates a timestamped backup** before modifying (e.g., `config.ini.backup.1735315200`)
+- **Flags unknown settings** in case of typos (but doesn't remove them)
+
+**Startup warning:** XEarthLayer will warn you on startup if your configuration is missing new settings:
+```
+Warning: Your configuration file is missing 3 new setting(s).
+Run 'xearthlayer config upgrade' to update your configuration.
+```
+
 ### Available Configuration Keys
 
 | Key | Valid Values | Description |

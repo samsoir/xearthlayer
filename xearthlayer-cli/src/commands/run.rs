@@ -7,7 +7,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use xearthlayer::config::{format_size, ConfigFile, DownloadConfig, TextureConfig};
+use xearthlayer::config::{
+    analyze_config, config_file_path, format_size, ConfigFile, DownloadConfig, TextureConfig,
+};
 use xearthlayer::log::TracingLogger;
 use xearthlayer::manager::{LocalPackageStore, MountManager, ServiceBuilder};
 use xearthlayer::package::PackageType;
@@ -44,6 +46,9 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     let runner = CliRunner::with_debug(args.debug)?;
     runner.log_startup("run");
     let config = runner.config();
+
+    // Check for config upgrade needs
+    check_config_upgrade_warning();
 
     // Get install location (where packages are stored)
     let install_location = config.packages.install_location.clone().unwrap_or_else(|| {
@@ -498,4 +503,45 @@ fn run_with_simple_output(
     }
 
     Ok(())
+}
+
+/// Display warning if configuration file needs upgrade.
+///
+/// Checks if the user's config.ini is missing settings from the current version
+/// and displays a helpful message with instructions on how to upgrade.
+fn check_config_upgrade_warning() {
+    let path = config_file_path();
+
+    // Only check if config file exists
+    if !path.exists() {
+        return;
+    }
+
+    match analyze_config(&path) {
+        Ok(analysis) if analysis.needs_upgrade => {
+            let missing_count = analysis.missing_keys.len();
+            let deprecated_count = analysis.deprecated_keys.len();
+
+            eprintln!();
+            eprintln!(
+                "Warning: Your configuration file is missing {} new setting(s)",
+                missing_count
+            );
+            if deprecated_count > 0 {
+                eprintln!(
+                    "         and contains {} deprecated setting(s).",
+                    deprecated_count
+                );
+            }
+            eprintln!();
+            eprintln!("Run 'xearthlayer config upgrade' to update your configuration.");
+            eprintln!("Use 'xearthlayer config upgrade --dry-run' to preview changes first.");
+            eprintln!();
+        }
+        Ok(_) => {} // Up to date, no message needed
+        Err(e) => {
+            // Log error but don't fail - config upgrade is informational
+            tracing::warn!("Failed to analyze config for upgrade: {}", e);
+        }
+    }
 }

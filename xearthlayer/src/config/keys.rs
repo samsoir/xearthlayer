@@ -32,6 +32,7 @@ pub enum ConfigKey {
     // Provider settings
     ProviderType,
     ProviderGoogleApiKey,
+    ProviderMapboxAccessToken,
 
     // Cache settings
     CacheDirectory,
@@ -73,6 +74,7 @@ pub enum ConfigKey {
 
     // Prefetch settings
     PrefetchEnabled,
+    PrefetchStrategy,
     PrefetchUdpPort,
     PrefetchConeAngle,
     PrefetchConeDistanceNm,
@@ -80,6 +82,13 @@ pub enum ConfigKey {
     PrefetchBatchSize,
     PrefetchMaxInFlight,
     PrefetchRadialRadius,
+    PrefetchInnerRadiusNm,
+    PrefetchOuterRadiusNm,
+    PrefetchMaxTilesPerCycle,
+    PrefetchCycleIntervalMs,
+    PrefetchEnableZl12,
+    PrefetchZl12InnerRadiusNm,
+    PrefetchZl12OuterRadiusNm,
 
     // Control plane settings
     ControlPlaneMaxConcurrentJobs,
@@ -95,6 +104,7 @@ impl FromStr for ConfigKey {
         match s.to_lowercase().as_str() {
             "provider.type" => Ok(ConfigKey::ProviderType),
             "provider.google_api_key" => Ok(ConfigKey::ProviderGoogleApiKey),
+            "provider.mapbox_access_token" => Ok(ConfigKey::ProviderMapboxAccessToken),
 
             "cache.directory" => Ok(ConfigKey::CacheDirectory),
             "cache.memory_size" => Ok(ConfigKey::CacheMemorySize),
@@ -127,6 +137,7 @@ impl FromStr for ConfigKey {
             "logging.file" => Ok(ConfigKey::LoggingFile),
 
             "prefetch.enabled" => Ok(ConfigKey::PrefetchEnabled),
+            "prefetch.strategy" => Ok(ConfigKey::PrefetchStrategy),
             "prefetch.udp_port" => Ok(ConfigKey::PrefetchUdpPort),
             "prefetch.cone_angle" => Ok(ConfigKey::PrefetchConeAngle),
             "prefetch.cone_distance_nm" => Ok(ConfigKey::PrefetchConeDistanceNm),
@@ -134,6 +145,13 @@ impl FromStr for ConfigKey {
             "prefetch.batch_size" => Ok(ConfigKey::PrefetchBatchSize),
             "prefetch.max_in_flight" => Ok(ConfigKey::PrefetchMaxInFlight),
             "prefetch.radial_radius" => Ok(ConfigKey::PrefetchRadialRadius),
+            "prefetch.inner_radius_nm" => Ok(ConfigKey::PrefetchInnerRadiusNm),
+            "prefetch.outer_radius_nm" => Ok(ConfigKey::PrefetchOuterRadiusNm),
+            "prefetch.max_tiles_per_cycle" => Ok(ConfigKey::PrefetchMaxTilesPerCycle),
+            "prefetch.cycle_interval_ms" => Ok(ConfigKey::PrefetchCycleIntervalMs),
+            "prefetch.enable_zl12" => Ok(ConfigKey::PrefetchEnableZl12),
+            "prefetch.zl12_inner_radius_nm" => Ok(ConfigKey::PrefetchZl12InnerRadiusNm),
+            "prefetch.zl12_outer_radius_nm" => Ok(ConfigKey::PrefetchZl12OuterRadiusNm),
 
             "control_plane.max_concurrent_jobs" => Ok(ConfigKey::ControlPlaneMaxConcurrentJobs),
             "control_plane.stall_threshold_secs" => Ok(ConfigKey::ControlPlaneStallThresholdSecs),
@@ -155,6 +173,7 @@ impl ConfigKey {
         match self {
             ConfigKey::ProviderType => "provider.type",
             ConfigKey::ProviderGoogleApiKey => "provider.google_api_key",
+            ConfigKey::ProviderMapboxAccessToken => "provider.mapbox_access_token",
             ConfigKey::CacheDirectory => "cache.directory",
             ConfigKey::CacheMemorySize => "cache.memory_size",
             ConfigKey::CacheDiskSize => "cache.disk_size",
@@ -178,6 +197,7 @@ impl ConfigKey {
             ConfigKey::PackagesTempDir => "packages.temp_dir",
             ConfigKey::LoggingFile => "logging.file",
             ConfigKey::PrefetchEnabled => "prefetch.enabled",
+            ConfigKey::PrefetchStrategy => "prefetch.strategy",
             ConfigKey::PrefetchUdpPort => "prefetch.udp_port",
             ConfigKey::PrefetchConeAngle => "prefetch.cone_angle",
             ConfigKey::PrefetchConeDistanceNm => "prefetch.cone_distance_nm",
@@ -185,6 +205,13 @@ impl ConfigKey {
             ConfigKey::PrefetchBatchSize => "prefetch.batch_size",
             ConfigKey::PrefetchMaxInFlight => "prefetch.max_in_flight",
             ConfigKey::PrefetchRadialRadius => "prefetch.radial_radius",
+            ConfigKey::PrefetchInnerRadiusNm => "prefetch.inner_radius_nm",
+            ConfigKey::PrefetchOuterRadiusNm => "prefetch.outer_radius_nm",
+            ConfigKey::PrefetchMaxTilesPerCycle => "prefetch.max_tiles_per_cycle",
+            ConfigKey::PrefetchCycleIntervalMs => "prefetch.cycle_interval_ms",
+            ConfigKey::PrefetchEnableZl12 => "prefetch.enable_zl12",
+            ConfigKey::PrefetchZl12InnerRadiusNm => "prefetch.zl12_inner_radius_nm",
+            ConfigKey::PrefetchZl12OuterRadiusNm => "prefetch.zl12_outer_radius_nm",
             ConfigKey::ControlPlaneMaxConcurrentJobs => "control_plane.max_concurrent_jobs",
             ConfigKey::ControlPlaneStallThresholdSecs => "control_plane.stall_threshold_secs",
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => {
@@ -211,6 +238,11 @@ impl ConfigKey {
             ConfigKey::ProviderGoogleApiKey => {
                 config.provider.google_api_key.clone().unwrap_or_default()
             }
+            ConfigKey::ProviderMapboxAccessToken => config
+                .provider
+                .mapbox_access_token
+                .clone()
+                .unwrap_or_default(),
             ConfigKey::CacheDirectory => path_to_display(&config.cache.directory),
             ConfigKey::CacheMemorySize => format_size(config.cache.memory_size),
             ConfigKey::CacheDiskSize => format_size(config.cache.disk_size),
@@ -264,6 +296,7 @@ impl ConfigKey {
                 .unwrap_or_default(),
             ConfigKey::LoggingFile => path_to_display(&config.logging.file),
             ConfigKey::PrefetchEnabled => config.prefetch.enabled.to_string(),
+            ConfigKey::PrefetchStrategy => config.prefetch.strategy.clone(),
             ConfigKey::PrefetchUdpPort => config.prefetch.udp_port.to_string(),
             ConfigKey::PrefetchConeAngle => config.prefetch.cone_angle.to_string(),
             ConfigKey::PrefetchConeDistanceNm => config.prefetch.cone_distance_nm.to_string(),
@@ -271,6 +304,17 @@ impl ConfigKey {
             ConfigKey::PrefetchBatchSize => config.prefetch.batch_size.to_string(),
             ConfigKey::PrefetchMaxInFlight => config.prefetch.max_in_flight.to_string(),
             ConfigKey::PrefetchRadialRadius => config.prefetch.radial_radius.to_string(),
+            ConfigKey::PrefetchInnerRadiusNm => config.prefetch.inner_radius_nm.to_string(),
+            ConfigKey::PrefetchOuterRadiusNm => config.prefetch.outer_radius_nm.to_string(),
+            ConfigKey::PrefetchMaxTilesPerCycle => config.prefetch.max_tiles_per_cycle.to_string(),
+            ConfigKey::PrefetchCycleIntervalMs => config.prefetch.cycle_interval_ms.to_string(),
+            ConfigKey::PrefetchEnableZl12 => config.prefetch.enable_zl12.to_string(),
+            ConfigKey::PrefetchZl12InnerRadiusNm => {
+                config.prefetch.zl12_inner_radius_nm.to_string()
+            }
+            ConfigKey::PrefetchZl12OuterRadiusNm => {
+                config.prefetch.zl12_outer_radius_nm.to_string()
+            }
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs.to_string()
             }
@@ -303,6 +347,9 @@ impl ConfigKey {
             }
             ConfigKey::ProviderGoogleApiKey => {
                 config.provider.google_api_key = optional_string(value);
+            }
+            ConfigKey::ProviderMapboxAccessToken => {
+                config.provider.mapbox_access_token = optional_string(value);
             }
             ConfigKey::CacheDirectory => {
                 config.cache.directory = expand_tilde(value);
@@ -381,6 +428,9 @@ impl ConfigKey {
                 let v = value.to_lowercase();
                 config.prefetch.enabled = v == "true" || v == "1" || v == "yes" || v == "on";
             }
+            ConfigKey::PrefetchStrategy => {
+                config.prefetch.strategy = value.to_lowercase();
+            }
             ConfigKey::PrefetchUdpPort => {
                 config.prefetch.udp_port = value.parse().unwrap();
             }
@@ -401,6 +451,28 @@ impl ConfigKey {
             }
             ConfigKey::PrefetchRadialRadius => {
                 config.prefetch.radial_radius = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchInnerRadiusNm => {
+                config.prefetch.inner_radius_nm = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchOuterRadiusNm => {
+                config.prefetch.outer_radius_nm = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchMaxTilesPerCycle => {
+                config.prefetch.max_tiles_per_cycle = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchCycleIntervalMs => {
+                config.prefetch.cycle_interval_ms = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchEnableZl12 => {
+                let v = value.to_lowercase();
+                config.prefetch.enable_zl12 = v == "true" || v == "1" || v == "yes" || v == "on";
+            }
+            ConfigKey::PrefetchZl12InnerRadiusNm => {
+                config.prefetch.zl12_inner_radius_nm = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchZl12OuterRadiusNm => {
+                config.prefetch.zl12_outer_radius_nm = value.parse().unwrap();
             }
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs = value.parse().unwrap();
@@ -434,6 +506,7 @@ impl ConfigKey {
                 "apple", "arcgis", "bing", "go2", "google", "mapbox", "usgs",
             ])),
             ConfigKey::ProviderGoogleApiKey => Box::new(AnyStringSpec),
+            ConfigKey::ProviderMapboxAccessToken => Box::new(AnyStringSpec),
             ConfigKey::CacheDirectory => Box::new(PathSpec),
             ConfigKey::CacheMemorySize => Box::new(SizeSpec),
             ConfigKey::CacheDiskSize => Box::new(SizeSpec),
@@ -459,6 +532,9 @@ impl ConfigKey {
             ConfigKey::PackagesTempDir => Box::new(OptionalPathSpec),
             ConfigKey::LoggingFile => Box::new(PathSpec),
             ConfigKey::PrefetchEnabled => Box::new(BooleanSpec),
+            ConfigKey::PrefetchStrategy => {
+                Box::new(OneOfSpec::new(&["auto", "heading-aware", "radial"]))
+            }
             ConfigKey::PrefetchUdpPort => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchConeAngle => Box::new(PositiveNumberSpec),
             ConfigKey::PrefetchConeDistanceNm => Box::new(PositiveNumberSpec),
@@ -466,6 +542,13 @@ impl ConfigKey {
             ConfigKey::PrefetchBatchSize => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchMaxInFlight => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchRadialRadius => Box::new(PositiveIntegerSpec),
+            ConfigKey::PrefetchInnerRadiusNm => Box::new(PositiveNumberSpec),
+            ConfigKey::PrefetchOuterRadiusNm => Box::new(PositiveNumberSpec),
+            ConfigKey::PrefetchMaxTilesPerCycle => Box::new(PositiveIntegerSpec),
+            ConfigKey::PrefetchCycleIntervalMs => Box::new(PositiveIntegerSpec),
+            ConfigKey::PrefetchEnableZl12 => Box::new(BooleanSpec),
+            ConfigKey::PrefetchZl12InnerRadiusNm => Box::new(PositiveNumberSpec),
+            ConfigKey::PrefetchZl12OuterRadiusNm => Box::new(PositiveNumberSpec),
             ConfigKey::ControlPlaneMaxConcurrentJobs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneStallThresholdSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => Box::new(PositiveIntegerSpec),
@@ -478,6 +561,7 @@ impl ConfigKey {
         &[
             ConfigKey::ProviderType,
             ConfigKey::ProviderGoogleApiKey,
+            ConfigKey::ProviderMapboxAccessToken,
             ConfigKey::CacheDirectory,
             ConfigKey::CacheMemorySize,
             ConfigKey::CacheDiskSize,
@@ -501,6 +585,7 @@ impl ConfigKey {
             ConfigKey::PackagesTempDir,
             ConfigKey::LoggingFile,
             ConfigKey::PrefetchEnabled,
+            ConfigKey::PrefetchStrategy,
             ConfigKey::PrefetchUdpPort,
             ConfigKey::PrefetchConeAngle,
             ConfigKey::PrefetchConeDistanceNm,
@@ -508,6 +593,13 @@ impl ConfigKey {
             ConfigKey::PrefetchBatchSize,
             ConfigKey::PrefetchMaxInFlight,
             ConfigKey::PrefetchRadialRadius,
+            ConfigKey::PrefetchInnerRadiusNm,
+            ConfigKey::PrefetchOuterRadiusNm,
+            ConfigKey::PrefetchMaxTilesPerCycle,
+            ConfigKey::PrefetchCycleIntervalMs,
+            ConfigKey::PrefetchEnableZl12,
+            ConfigKey::PrefetchZl12InnerRadiusNm,
+            ConfigKey::PrefetchZl12OuterRadiusNm,
             ConfigKey::ControlPlaneMaxConcurrentJobs,
             ConfigKey::ControlPlaneStallThresholdSecs,
             ConfigKey::ControlPlaneHealthCheckIntervalSecs,
