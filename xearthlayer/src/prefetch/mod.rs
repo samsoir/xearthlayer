@@ -23,6 +23,11 @@
 //!                                        DdsHandler (existing pipeline)
 //! ```
 //!
+//! ## Heading-Aware Prefetcher (Coming Soon)
+//!
+//! Direction-aware prefetching with forward cone and turn detection.
+//! See [`config::HeadingAwarePrefetchConfig`] for configuration options.
+//!
 //! ## Legacy Scheduler
 //!
 //! Complex flight-path prediction (cone + radial). Use RadialPrefetcher instead.
@@ -36,14 +41,23 @@
 //! 4. Set port (default 49003)
 //! 5. Enable data indices: 3 (speeds), 17 (heading), 20 (position)
 
+mod buffer;
+mod builder;
 mod condition;
+pub mod cone;
+pub mod config;
+pub mod coordinates;
 mod error;
+mod heading_aware;
+pub mod inference;
 mod listener;
 mod predictor;
 mod radial;
+mod scenery_index;
 mod scheduler;
 mod state;
 mod strategy;
+pub mod types;
 
 pub use condition::{
     AlwaysActiveCondition, MinimumSpeedCondition, NeverActiveCondition, PrefetchCondition,
@@ -55,5 +69,25 @@ pub use radial::{
     RadialPrefetchConfig, RadialPrefetchStats, RadialPrefetchStatsSnapshot, RadialPrefetcher,
 };
 pub use scheduler::{PrefetchScheduler, PrefetchStats, PrefetchStatsSnapshot, SchedulerConfig};
-pub use state::{AircraftSnapshot, AircraftState, PrefetchStatusSnapshot, SharedPrefetchStatus};
+pub use state::{
+    AircraftSnapshot, AircraftState, DetailedPrefetchStats, GpsStatus, PrefetchMode,
+    PrefetchStatusSnapshot, SharedPrefetchStatus,
+};
 pub use strategy::Prefetcher;
+
+// Heading-aware prefetch exports
+pub use buffer::{merge_prefetch_tiles, BufferGenerator};
+pub use cone::ConeGenerator;
+pub use config::{FuseInferenceConfig, HeadingAwarePrefetchConfig, ZoomLevelPrefetchConfig};
+pub use heading_aware::{
+    HeadingAwarePrefetchStats, HeadingAwarePrefetchStatsSnapshot, HeadingAwarePrefetcher,
+    HeadingAwarePrefetcherConfig,
+};
+pub use inference::{Direction, FuseRequestAnalyzer, LoadedEnvelope, TileRequestCallback};
+pub use types::{InputMode, PrefetchTile, PrefetchZone, TurnDirection, TurnState};
+
+// Builder for prefetcher strategy creation
+pub use builder::{PrefetchStrategy, PrefetcherBuilder};
+
+// Scenery-aware prefetch
+pub use scenery_index::{SceneryIndex, SceneryIndexConfig, SceneryIndexError, SceneryTile};

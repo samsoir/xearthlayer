@@ -116,6 +116,7 @@ impl Bc3Encoder {
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
 
@@ -212,7 +213,7 @@ mod tests {
         // All values should be in range [100, 200]
         for &val in &palette {
             assert!(
-                val >= 100 && val <= 200,
+                (100..=200).contains(&val),
                 "Palette value {} out of range",
                 val
             );

@@ -22,7 +22,9 @@ use ratatui::{
     Frame, Terminal,
 };
 use xearthlayer::pipeline::control_plane::{ControlPlaneHealth, HealthSnapshot};
-use xearthlayer::prefetch::{PrefetchStatusSnapshot, SharedPrefetchStatus};
+use xearthlayer::prefetch::{
+    GpsStatus, PrefetchMode, PrefetchStatusSnapshot, SharedPrefetchStatus,
+};
 use xearthlayer::telemetry::TelemetrySnapshot;
 
 use super::widgets::{
@@ -70,6 +72,9 @@ impl JobRates {
     }
 }
 
+/// Timeout for quit confirmation (auto-cancels after this duration).
+const QUIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The main dashboard UI.
 pub struct Dashboard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -87,6 +92,8 @@ pub struct Dashboard {
     max_concurrent_jobs: usize,
     /// Previous control plane snapshot for rate calculation.
     prev_control_plane_snapshot: Option<HealthSnapshot>,
+    /// Quit confirmation state - Some(timestamp) when awaiting confirmation.
+    quit_confirmation: Option<Instant>,
 }
 
 impl Dashboard {
@@ -111,6 +118,7 @@ impl Dashboard {
             control_plane_health: None,
             max_concurrent_jobs: 0,
             prev_control_plane_snapshot: None,
+            quit_confirmation: None,
         })
     }
 
@@ -202,6 +210,9 @@ impl Dashboard {
         // Clone pipeline history for use in closure
         let pipeline_history = self.pipeline_history.clone();
 
+        // Calculate confirmation remaining time for display
+        let confirmation_remaining = self.confirmation_remaining();
+
         self.terminal.draw(|frame| {
             Self::render_ui(
                 frame,
@@ -214,6 +225,7 @@ impl Dashboard {
                 control_plane_snapshot.as_ref(),
                 max_concurrent_jobs,
                 job_rates.as_ref(),
+                confirmation_remaining,
             );
         })?;
 
@@ -221,30 +233,71 @@ impl Dashboard {
     }
 
     /// Check for events (non-blocking).
-    pub fn poll_event(&self) -> io::Result<Option<DashboardEvent>> {
-        // Check shutdown flag first
+    ///
+    /// Implements a confirmation flow for quit to prevent accidental termination:
+    /// - First 'q' press: enters confirmation mode (5 second timeout)
+    /// - Second 'q' or 'y'/'Y': confirms quit
+    /// - 'n'/'N' or Esc: cancels confirmation
+    /// - Timeout: auto-cancels after 5 seconds
+    pub fn poll_event(&mut self) -> io::Result<Option<DashboardEvent>> {
+        // Check shutdown flag first (e.g., Ctrl+C signal)
         if self.shutdown.load(Ordering::SeqCst) {
             return Ok(Some(DashboardEvent::Quit));
+        }
+
+        // Check for confirmation timeout (auto-cancel)
+        if let Some(confirm_time) = self.quit_confirmation {
+            if confirm_time.elapsed() > QUIT_CONFIRM_TIMEOUT {
+                self.quit_confirmation = None;
+            }
         }
 
         // Poll for keyboard events
         if event::poll(Duration::from_millis(10))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Char('Q') => {
-                            return Ok(Some(DashboardEvent::Quit));
+                    // Handle based on confirmation state
+                    if self.quit_confirmation.is_some() {
+                        // Currently awaiting confirmation
+                        match key.code {
+                            // Confirm quit
+                            KeyCode::Char('q')
+                            | KeyCode::Char('Q')
+                            | KeyCode::Char('y')
+                            | KeyCode::Char('Y') => {
+                                return Ok(Some(DashboardEvent::Quit));
+                            }
+                            // Cancel confirmation
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                self.quit_confirmation = None;
+                            }
+                            _ => {}
                         }
-                        KeyCode::Esc => {
-                            return Ok(Some(DashboardEvent::Quit));
+                    } else {
+                        // Not in confirmation mode
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                // Enter confirmation mode instead of quitting immediately
+                                self.quit_confirmation = Some(Instant::now());
+                            }
+                            KeyCode::Esc => {
+                                // Esc also triggers confirmation
+                                self.quit_confirmation = Some(Instant::now());
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
         }
 
         Ok(None)
+    }
+
+    /// Returns the remaining time for confirmation timeout, if confirming.
+    fn confirmation_remaining(&self) -> Option<Duration> {
+        self.quit_confirmation
+            .map(|t| QUIT_CONFIRM_TIMEOUT.saturating_sub(t.elapsed()))
     }
 
     /// Render the UI to the frame.
@@ -260,6 +313,7 @@ impl Dashboard {
         control_plane_snapshot: Option<&HealthSnapshot>,
         max_concurrent_jobs: usize,
         job_rates: Option<&JobRates>,
+        confirmation_remaining: Option<Duration>,
     ) {
         let size = frame.area();
 
@@ -269,7 +323,7 @@ impl Dashboard {
             .margin(0)
             .constraints([
                 Constraint::Length(3), // Header
-                Constraint::Length(4), // Prefetch / Aircraft
+                Constraint::Length(5), // Aircraft Position (GPS Status, Position, Prefetch)
                 Constraint::Length(5), // Control Plane (needs 4 rows + 1 border)
                 Constraint::Length(6), // Pipeline (Tile Pipeline)
                 Constraint::Length(3), // Chunk Tasks (moved above Network)
@@ -341,6 +395,90 @@ impl Dashboard {
             CacheWidget::new(snapshot).with_config(cache_config.clone()),
             cache_inner,
         );
+
+        // Quit confirmation overlay (if active)
+        if let Some(remaining) = confirmation_remaining {
+            Self::render_quit_confirmation(frame, size, remaining);
+        }
+    }
+
+    /// Render the quit confirmation overlay banner.
+    fn render_quit_confirmation(frame: &mut Frame, area: Rect, remaining: Duration) {
+        // Calculate banner position (centered, near top)
+        let banner_width = 60u16;
+        let banner_height = 5u16;
+        let x = area.x + (area.width.saturating_sub(banner_width)) / 2;
+        let y = area.y + 4; // Below header
+
+        let banner_area = Rect {
+            x,
+            y,
+            width: banner_width.min(area.width),
+            height: banner_height,
+        };
+
+        // Clear the background
+        let clear_block = Block::default().style(Style::default().bg(Color::Black));
+        frame.render_widget(clear_block, banner_area);
+
+        // Banner with warning styling
+        let remaining_secs = remaining.as_secs();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red))
+            .style(Style::default().bg(Color::Black))
+            .title(Span::styled(
+                " ⚠ Confirm Quit ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+
+        let text = vec![
+            Line::from(vec![Span::styled(
+                "Quitting will crash X-Plane if scenery is loaded!",
+                Style::default().fg(Color::Yellow),
+            )]),
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(Color::White)),
+                Span::styled(
+                    "y",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" or ", Style::default().fg(Color::White)),
+                Span::styled(
+                    "q",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" to quit, ", Style::default().fg(Color::White)),
+                Span::styled(
+                    "n",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" or ", Style::default().fg(Color::White)),
+                Span::styled(
+                    "Esc",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" to cancel", Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("  ({}s)", remaining_secs),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+        ];
+
+        let paragraph = Paragraph::new(text)
+            .block(block)
+            .alignment(ratatui::layout::Alignment::Center);
+
+        frame.render_widget(paragraph, banner_area);
     }
 
     /// Render the control plane status section.
@@ -379,28 +517,44 @@ impl Dashboard {
         }
     }
 
-    /// Render the prefetch/aircraft status section.
+    /// Render the aircraft position section.
     fn render_prefetch(frame: &mut Frame, area: Rect, prefetch: &PrefetchStatusSnapshot) {
         let prefetch_block = Block::default()
             .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
             .border_style(Style::default().fg(Color::DarkGray))
             .title(Span::styled(
-                " Aircraft GPS Position ",
+                " Aircraft Position ",
                 Style::default().fg(Color::Magenta),
             ));
 
         frame.render_widget(prefetch_block, area);
         let inner = Self::inner_rect(area, 1, 1);
 
-        // Create lines for aircraft and prefetch status
-        let aircraft_line = if prefetch.aircraft.is_some() {
+        // GPS Status line with colored indicator
+        let (gps_indicator, gps_text, gps_color) = match prefetch.gps_status {
+            GpsStatus::Connected => ("●", "Connected", Color::Green),
+            GpsStatus::Acquiring => ("●", "Acquiring...", Color::Yellow),
+            GpsStatus::Inferred => ("●", "Inferred", Color::Red),
+        };
+
+        let gps_line = Line::from(vec![
+            Span::styled("GPS Status: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} ", gps_indicator),
+                Style::default().fg(gps_color),
+            ),
+            Span::styled(gps_text, Style::default().fg(gps_color)),
+        ]);
+
+        // Position line
+        let position_line = if prefetch.aircraft.is_some() {
             Line::from(vec![
-                Span::styled("Position: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Position:   ", Style::default().fg(Color::DarkGray)),
                 Span::styled(prefetch.aircraft_line(), Style::default().fg(Color::Green)),
             ])
         } else {
             Line::from(vec![
-                Span::styled("Position: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Position:   ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "Waiting for X-Plane telemetry...",
                     Style::default().fg(Color::Yellow),
@@ -408,12 +562,81 @@ impl Dashboard {
             ])
         };
 
-        let prefetch_line = Line::from(vec![
-            Span::styled("Cache Warming: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(prefetch.stats_line(), Style::default().fg(Color::Cyan)),
-        ]);
+        // Prefetch mode line
+        let mode_color = match prefetch.prefetch_mode {
+            PrefetchMode::Telemetry => Color::Green,
+            PrefetchMode::FuseInference => Color::Yellow,
+            PrefetchMode::Radial => Color::Cyan,
+            PrefetchMode::Idle => Color::DarkGray,
+        };
 
-        let text = vec![aircraft_line, prefetch_line];
+        // Build the prefetch line with detailed stats if available
+        let prefetch_line = if let Some(ref stats) = prefetch.detailed_stats {
+            // Format: "Prefetch: Mode | 45/cycle | Cache: 120↑ TTL: 5⊘ | ZL14"
+            let activity_indicator = if stats.is_active { "●" } else { "○" };
+            let activity_color = if stats.is_active {
+                Color::Green
+            } else {
+                Color::DarkGray
+            };
+
+            // Format zoom levels
+            let zoom_str = if stats.active_zoom_levels.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "ZL{}",
+                    stats
+                        .active_zoom_levels
+                        .iter()
+                        .map(|z| z.to_string())
+                        .collect::<Vec<_>>()
+                        .join("+")
+                )
+            };
+
+            Line::from(vec![
+                Span::styled("Prefetch:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{} ", activity_indicator),
+                    Style::default().fg(activity_color),
+                ),
+                Span::styled(
+                    format!("{}", prefetch.prefetch_mode),
+                    Style::default().fg(mode_color),
+                ),
+                Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}/cyc", stats.tiles_submitted_last_cycle),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+                Span::styled("↑", Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!("{}", stats.cache_hits),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(" ", Style::default()),
+                Span::styled("⊘", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{}", stats.ttl_skipped),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(zoom_str, Style::default().fg(Color::Cyan)),
+            ])
+        } else {
+            // Fallback to simple display when no detailed stats
+            Line::from(vec![
+                Span::styled("Prefetch:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", prefetch.prefetch_mode),
+                    Style::default().fg(mode_color),
+                ),
+            ])
+        };
+
+        let text = vec![gps_line, position_line, prefetch_line];
         let paragraph = Paragraph::new(text);
         frame.render_widget(paragraph, inner);
     }

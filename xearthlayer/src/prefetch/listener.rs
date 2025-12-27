@@ -40,6 +40,7 @@ use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::{debug, info, trace, warn};
 
+use super::coordinates::normalize_heading;
 use super::error::PrefetchError;
 use super::state::AircraftState;
 
@@ -48,19 +49,6 @@ const DATA_HEADER_SIZE: usize = 5;
 
 /// Size of each data record (4-byte index + 8 floats).
 const DATA_RECORD_SIZE: usize = 36;
-
-/// Normalize a heading to the range [0, 360).
-///
-/// Aviation headings should always be expressed as positive values.
-#[inline]
-fn normalize_heading(heading: f32) -> f32 {
-    let h = heading % 360.0;
-    if h < 0.0 {
-        h + 360.0
-    } else {
-        h
-    }
-}
 
 /// Maximum packet size we expect.
 const MAX_PACKET_SIZE: usize = 1024;
@@ -756,7 +744,7 @@ mod tests {
             for &h in &test_values {
                 let normalized = normalize_heading(h);
                 assert!(
-                    normalized >= 0.0 && normalized < 360.0,
+                    (0.0..360.0).contains(&normalized),
                     "normalize_heading({}) = {} is not in [0, 360)",
                     h,
                     normalized

@@ -137,7 +137,7 @@ impl RequestCoalescer {
                     in_flight_count = self.in_flight.len(),
                     "New request - starting processing"
                 );
-                CoalesceResult::NewRequest { tile, sender: tx }
+                CoalesceResult::NewRequest { tile, _sender: tx }
             }
         }
     }
@@ -220,19 +220,20 @@ impl Default for RequestCoalescer {
 }
 
 /// Result of attempting to register a request.
-#[allow(dead_code)]
 pub(crate) enum CoalesceResult {
     /// This is a new request - caller should process and call complete()
     NewRequest {
         tile: TileCoord,
         /// The broadcast sender is kept internally for potential future use
-        /// (e.g., progress updates or cancellation)
-        sender: broadcast::Sender<CoalescedResult>,
+        /// (e.g., progress updates or cancellation). Prefixed with underscore
+        /// to suppress dead_code warning since it's held but not read.
+        _sender: broadcast::Sender<CoalescedResult>,
     },
     /// Request is coalesced - wait on this receiver for the result
     Coalesced(broadcast::Receiver<CoalescedResult>),
 }
 
+// Helper methods for CoalesceResult - used in tests and available for future use
 #[allow(dead_code)]
 impl CoalesceResult {
     /// Returns true if this is a new request that needs processing.

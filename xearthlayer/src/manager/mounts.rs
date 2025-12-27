@@ -9,10 +9,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::cache::MemoryCache;
 use crate::fuse::SpawnedMountHandle;
 use crate::package::PackageType;
 use crate::panic as panic_handler;
+use crate::pipeline::adapters::MemoryCacheAdapter;
 use crate::pipeline::{ConcurrencyLimiter, DiskIoProfile};
+use crate::prefetch::TileRequestCallback;
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
 use crate::telemetry::TelemetrySnapshot;
 
@@ -421,10 +424,17 @@ impl MountManager {
             total.downloads_active += snapshot.downloads_active;
             total.memory_cache_hits += snapshot.memory_cache_hits;
             total.memory_cache_misses += snapshot.memory_cache_misses;
-            total.memory_cache_size_bytes += snapshot.memory_cache_size_bytes;
+            // Use max() for cache sizes since all services share the same cache
+            // (summing would incorrectly report N times the actual size)
+            total.memory_cache_size_bytes = total
+                .memory_cache_size_bytes
+                .max(snapshot.memory_cache_size_bytes);
             total.disk_cache_hits += snapshot.disk_cache_hits;
             total.disk_cache_misses += snapshot.disk_cache_misses;
-            total.disk_cache_size_bytes += snapshot.disk_cache_size_bytes;
+            // Disk cache is also shared across services, so use max()
+            total.disk_cache_size_bytes = total
+                .disk_cache_size_bytes
+                .max(snapshot.disk_cache_size_bytes);
             total.encodes_completed += snapshot.encodes_completed;
             total.encodes_active += snapshot.encodes_active;
             total.bytes_encoded += snapshot.bytes_encoded;
@@ -479,8 +489,9 @@ impl Drop for MountManager {
 /// Builder for creating services for each package.
 ///
 /// This helper creates properly configured service instances for mounting.
-/// When multiple packages are mounted, all services share a single disk I/O
-/// concurrency limiter to prevent the combined I/O from overwhelming the system.
+/// When multiple packages are mounted, all services share:
+/// - A single disk I/O concurrency limiter to prevent I/O exhaustion
+/// - A single memory cache to respect the configured memory limit globally
 pub struct ServiceBuilder {
     service_config: ServiceConfig,
     provider_config: crate::provider::ProviderConfig,
@@ -488,6 +499,15 @@ pub struct ServiceBuilder {
     /// Shared disk I/O limiter across all service instances.
     /// Created lazily on first build to avoid allocation when unused.
     disk_io_limiter: Arc<ConcurrencyLimiter>,
+    /// Shared memory cache across all service instances.
+    /// Without this, each package would have its own cache with the full
+    /// configured limit, potentially using N times the expected memory.
+    shared_memory_cache: Option<Arc<MemoryCache>>,
+    /// Shared memory cache adapter (wraps cache with provider/format context).
+    shared_memory_cache_adapter: Option<Arc<MemoryCacheAdapter>>,
+    /// Shared tile request callback for FUSE-based position inference.
+    /// When set, all services forward tile requests to this callback.
+    tile_request_callback: Option<TileRequestCallback>,
 }
 
 impl ServiceBuilder {
@@ -547,18 +567,60 @@ impl ServiceBuilder {
             "Created shared disk I/O limiter for multi-package mounting"
         );
 
+        // Create shared memory cache if caching is enabled
+        // This ensures the configured memory limit is respected globally across all packages
+        let (shared_memory_cache, shared_memory_cache_adapter) = if service_config.cache_enabled() {
+            // Get memory cache size from config (or use default)
+            let mem_size = service_config
+                .cache_memory_size()
+                .unwrap_or(2 * 1024 * 1024 * 1024); // 2GB default
+
+            let cache = Arc::new(MemoryCache::new(mem_size));
+            let adapter = Arc::new(MemoryCacheAdapter::new(
+                Arc::clone(&cache),
+                provider_config.name(),
+                service_config.texture().format(),
+            ));
+
+            tracing::info!(
+                max_size_mb = mem_size / (1024 * 1024),
+                "Created shared memory cache for multi-package mounting"
+            );
+
+            (Some(cache), Some(adapter))
+        } else {
+            (None, None)
+        };
+
         Self {
             service_config,
             provider_config,
             logger,
             disk_io_limiter,
+            shared_memory_cache,
+            shared_memory_cache_adapter,
+            tile_request_callback: None,
         }
+    }
+
+    /// Set the tile request callback for FUSE-based position inference.
+    ///
+    /// When set, all services built by this builder will forward tile requests
+    /// to this callback. This enables the `FuseRequestAnalyzer` to track tile
+    /// loading patterns for position inference when telemetry is unavailable.
+    ///
+    /// # Arguments
+    ///
+    /// * `callback` - The callback to invoke for each tile request
+    pub fn with_tile_request_callback(mut self, callback: TileRequestCallback) -> Self {
+        self.tile_request_callback = Some(callback);
+        self
     }
 
     /// Build a service for the given package.
     ///
-    /// The service will share the disk I/O concurrency limiter with all other
-    /// services built by this builder.
+    /// The service will share the disk I/O concurrency limiter and memory cache
+    /// with all other services built by this builder.
     pub fn build(&self, _package: &InstalledPackage) -> Result<XEarthLayerService, ServiceError> {
         let mut service = XEarthLayerService::new(
             self.service_config.clone(),
@@ -568,6 +630,20 @@ impl ServiceBuilder {
 
         // Set shared disk I/O limiter to prevent I/O exhaustion across packages
         service.set_disk_io_limiter(Arc::clone(&self.disk_io_limiter));
+
+        // Set shared memory cache to ensure global memory limit is respected
+        // Without this, each package would have its own cache potentially using
+        // N times the configured memory limit
+        if let (Some(ref cache), Some(ref adapter)) =
+            (&self.shared_memory_cache, &self.shared_memory_cache_adapter)
+        {
+            service.set_shared_memory_cache(Arc::clone(cache), Arc::clone(adapter));
+        }
+
+        // Wire tile request callback for FUSE-based position inference
+        if let Some(ref callback) = self.tile_request_callback {
+            service.set_tile_request_callback(callback.clone());
+        }
 
         Ok(service)
     }

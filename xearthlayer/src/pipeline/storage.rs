@@ -392,15 +392,15 @@ mod tests {
     fn test_max_concurrent_respects_ceiling() {
         // HDD is bounded by HDD_IO_CEILING
         let hdd_max = DiskIoProfile::Hdd.max_concurrent();
-        assert!(hdd_max >= 1 && hdd_max <= HDD_IO_CEILING);
+        assert!((1..=HDD_IO_CEILING).contains(&hdd_max));
 
         // SSD is bounded by SSD_IO_CEILING
         let ssd_max = DiskIoProfile::Ssd.max_concurrent();
-        assert!(ssd_max >= 1 && ssd_max <= SSD_IO_CEILING);
+        assert!((1..=SSD_IO_CEILING).contains(&ssd_max));
 
         // NVMe is bounded by NVME_IO_CEILING
         let nvme_max = DiskIoProfile::Nvme.max_concurrent();
-        assert!(nvme_max >= 1 && nvme_max <= NVME_IO_CEILING);
+        assert!((1..=NVME_IO_CEILING).contains(&nvme_max));
     }
 
     #[test]
@@ -458,15 +458,15 @@ mod tests {
     fn test_max_blocking_threads_respects_ceiling() {
         // HDD is bounded by HDD_BLOCKING_CEILING
         let hdd_max = DiskIoProfile::Hdd.max_blocking_threads();
-        assert!(hdd_max >= 1 && hdd_max <= HDD_BLOCKING_CEILING);
+        assert!((1..=HDD_BLOCKING_CEILING).contains(&hdd_max));
 
         // SSD is bounded by SSD_BLOCKING_CEILING
         let ssd_max = DiskIoProfile::Ssd.max_blocking_threads();
-        assert!(ssd_max >= 1 && ssd_max <= SSD_BLOCKING_CEILING);
+        assert!((1..=SSD_BLOCKING_CEILING).contains(&ssd_max));
 
         // NVMe is bounded by NVME_BLOCKING_CEILING
         let nvme_max = DiskIoProfile::Nvme.max_blocking_threads();
-        assert!(nvme_max >= 1 && nvme_max <= NVME_BLOCKING_CEILING);
+        assert!((1..=NVME_BLOCKING_CEILING).contains(&nvme_max));
     }
 
     #[cfg(target_os = "linux")]

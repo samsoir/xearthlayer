@@ -52,6 +52,7 @@ mod executor;
 mod fd_budget;
 mod http_limiter;
 mod job;
+mod priority_limiter;
 mod processor;
 mod runner;
 pub mod stages;
@@ -73,6 +74,7 @@ pub use fd_budget::{
 };
 pub use http_limiter::HttpConcurrencyLimiter;
 pub use job::{Job, JobId, JobResult, Priority};
+pub use priority_limiter::{PriorityConcurrencyLimiter, PriorityPermit, RequestPriority};
 pub use processor::{
     process_job, process_tile, process_tile_cancellable, process_tile_with_observer,
 };

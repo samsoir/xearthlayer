@@ -17,8 +17,8 @@ use crate::pipeline::stages::{
     download_stage_cancellable, download_stage_with_limiter, encode_stage,
 };
 use crate::pipeline::{
-    BlockingExecutor, ChunkProvider, ConcurrencyLimiter, DiskCache, Job, JobError, JobId,
-    JobResult, MemoryCache, PipelineConfig, PipelineContext, TextureEncoderAsync,
+    BlockingExecutor, ChunkProvider, DiskCache, Job, JobError, JobId, JobResult, MemoryCache,
+    PipelineConfig, PipelineContext, PriorityConcurrencyLimiter, TextureEncoderAsync,
 };
 use crate::telemetry::PipelineMetrics;
 use std::sync::Arc;
@@ -50,8 +50,9 @@ pub async fn process_job<P, E, M, D, X>(
     ctx: &PipelineContext<P, E, M, D, X>,
     metrics: Option<Arc<PipelineMetrics>>,
     http_limiter: Option<Arc<HttpConcurrencyLimiter>>,
-    assemble_limiter: Option<Arc<ConcurrencyLimiter>>,
-    encode_limiter: Option<Arc<ConcurrencyLimiter>>,
+    assemble_limiter: Option<Arc<PriorityConcurrencyLimiter>>,
+    encode_limiter: Option<Arc<PriorityConcurrencyLimiter>>,
+    is_prefetch: bool,
 ) -> Result<JobResult, JobError>
 where
     P: ChunkProvider,
@@ -87,7 +88,14 @@ where
     let failed_chunks = chunks.failure_count() as u16;
 
     // Stage 2: Assemble image
-    let image = assembly_stage(job_id, chunks, ctx.executor.as_ref(), assemble_limiter).await?;
+    let image = assembly_stage(
+        job_id,
+        chunks,
+        ctx.executor.as_ref(),
+        assemble_limiter,
+        is_prefetch,
+    )
+    .await?;
 
     // Stage 3: Encode to DDS
     let dds_data = encode_stage(
@@ -97,6 +105,7 @@ where
         ctx.executor.as_ref(),
         metrics,
         encode_limiter,
+        is_prefetch,
     )
     .await?;
 
@@ -178,8 +187,9 @@ pub async fn process_tile<P, E, M, D, X>(
     config: &PipelineConfig,
     metrics: Option<Arc<PipelineMetrics>>,
     http_limiter: Option<Arc<HttpConcurrencyLimiter>>,
-    assemble_limiter: Option<Arc<ConcurrencyLimiter>>,
-    encode_limiter: Option<Arc<ConcurrencyLimiter>>,
+    assemble_limiter: Option<Arc<PriorityConcurrencyLimiter>>,
+    encode_limiter: Option<Arc<PriorityConcurrencyLimiter>>,
+    is_prefetch: bool,
 ) -> Result<JobResult, JobError>
 where
     P: ChunkProvider,
@@ -213,10 +223,19 @@ where
     let failed_chunks = chunks.failure_count() as u16;
 
     // Stage 2: Assemble image
-    let image = assembly_stage(job_id, chunks, executor, assemble_limiter).await?;
+    let image = assembly_stage(job_id, chunks, executor, assemble_limiter, is_prefetch).await?;
 
     // Stage 3: Encode to DDS
-    let dds_data = encode_stage(job_id, image, encoder, executor, metrics, encode_limiter).await?;
+    let dds_data = encode_stage(
+        job_id,
+        image,
+        encoder,
+        executor,
+        metrics,
+        encode_limiter,
+        is_prefetch,
+    )
+    .await?;
 
     // Validate encoded DDS size - log warning if unexpected
     if dds_data.len() != EXPECTED_DDS_SIZE {
@@ -287,9 +306,10 @@ pub async fn process_tile_cancellable<P, E, M, D, X>(
     config: &PipelineConfig,
     metrics: Option<Arc<PipelineMetrics>>,
     http_limiter: Option<Arc<HttpConcurrencyLimiter>>,
-    assemble_limiter: Option<Arc<ConcurrencyLimiter>>,
-    encode_limiter: Option<Arc<ConcurrencyLimiter>>,
+    assemble_limiter: Option<Arc<PriorityConcurrencyLimiter>>,
+    encode_limiter: Option<Arc<PriorityConcurrencyLimiter>>,
     cancellation_token: CancellationToken,
+    is_prefetch: bool,
 ) -> Result<JobResult, JobError>
 where
     P: ChunkProvider,
@@ -351,7 +371,7 @@ where
     let failed_chunks = chunks.failure_count() as u16;
 
     // Stage 2: Assemble image
-    let image = assembly_stage(job_id, chunks, executor, assemble_limiter).await?;
+    let image = assembly_stage(job_id, chunks, executor, assemble_limiter, is_prefetch).await?;
 
     // Check cancellation after assembly
     if cancellation_token.is_cancelled() {
@@ -360,7 +380,16 @@ where
     }
 
     // Stage 3: Encode to DDS
-    let dds_data = encode_stage(job_id, image, encoder, executor, metrics, encode_limiter).await?;
+    let dds_data = encode_stage(
+        job_id,
+        image,
+        encoder,
+        executor,
+        metrics,
+        encode_limiter,
+        is_prefetch,
+    )
+    .await?;
 
     // Validate encoded DDS size - log warning if unexpected
     if dds_data.len() != EXPECTED_DDS_SIZE {
@@ -417,10 +446,11 @@ where
 /// # Arguments
 ///
 /// * `http_limiter` - Optional global HTTP concurrency limiter
-/// * `assemble_limiter` - Optional concurrency limiter for CPU-bound assembly
-/// * `encode_limiter` - Optional concurrency limiter for CPU-bound encoding
+/// * `assemble_limiter` - Optional priority-aware concurrency limiter for CPU-bound assembly
+/// * `encode_limiter` - Optional priority-aware concurrency limiter for CPU-bound encoding
 /// * `cancellation_token` - Token to signal cancellation (e.g., from FUSE timeout)
 /// * `observer` - Optional stage observer for progress tracking
+/// * `is_prefetch` - Whether this is a prefetch request (lower priority for CPU-bound work)
 ///
 /// # Example
 ///
@@ -440,6 +470,7 @@ where
 ///     None, // encode_limiter
 ///     cancellation_token,
 ///     Some(observer), // control plane's observer
+///     false, // is_prefetch - on-demand requests get high priority
 /// ).await;
 /// ```
 #[allow(clippy::too_many_arguments)]
@@ -454,10 +485,11 @@ pub async fn process_tile_with_observer<P, E, M, D, X>(
     config: &PipelineConfig,
     metrics: Option<Arc<PipelineMetrics>>,
     http_limiter: Option<Arc<HttpConcurrencyLimiter>>,
-    assemble_limiter: Option<Arc<ConcurrencyLimiter>>,
-    encode_limiter: Option<Arc<ConcurrencyLimiter>>,
+    assemble_limiter: Option<Arc<PriorityConcurrencyLimiter>>,
+    encode_limiter: Option<Arc<PriorityConcurrencyLimiter>>,
     cancellation_token: CancellationToken,
     observer: Option<Arc<dyn StageObserver>>,
+    is_prefetch: bool,
 ) -> Result<JobResult, JobError>
 where
     P: ChunkProvider,
@@ -531,7 +563,7 @@ where
 
     // Stage 2: Assemble image
     emit_stage(JobStage::Assembling);
-    let image = assembly_stage(job_id, chunks, executor, assemble_limiter).await?;
+    let image = assembly_stage(job_id, chunks, executor, assemble_limiter, is_prefetch).await?;
 
     // Check cancellation after assembly
     if cancellation_token.is_cancelled() {
@@ -541,7 +573,16 @@ where
 
     // Stage 3: Encode to DDS
     emit_stage(JobStage::Encoding);
-    let dds_data = encode_stage(job_id, image, encoder, executor, metrics, encode_limiter).await?;
+    let dds_data = encode_stage(
+        job_id,
+        image,
+        encoder,
+        executor,
+        metrics,
+        encode_limiter,
+        is_prefetch,
+    )
+    .await?;
 
     // Validate encoded DDS size - log warning if unexpected
     if dds_data.len() != EXPECTED_DDS_SIZE {
@@ -750,9 +791,10 @@ mod tests {
             &executor,
             &config,
             None,
-            None, // No HTTP limiter for test
-            None, // No assemble limiter for test
-            None, // No encode limiter for test
+            None,  // No HTTP limiter for test
+            None,  // No assemble limiter for test
+            None,  // No encode limiter for test
+            false, // is_prefetch: on-demand request
         )
         .await;
 
@@ -789,9 +831,10 @@ mod tests {
             &executor,
             &config,
             None,
-            None, // No HTTP limiter for test
-            None, // No assemble limiter for test
-            None, // No encode limiter for test
+            None,  // No HTTP limiter for test
+            None,  // No assemble limiter for test
+            None,  // No encode limiter for test
+            false, // is_prefetch: on-demand request
         )
         .await;
 
@@ -829,9 +872,10 @@ mod tests {
             &executor,
             &config,
             None,
-            None, // No HTTP limiter for test
-            None, // No assemble limiter for test
-            None, // No encode limiter for test
+            None,  // No HTTP limiter for test
+            None,  // No assemble limiter for test
+            None,  // No encode limiter for test
+            false, // is_prefetch: on-demand request
         )
         .await;
 
@@ -870,9 +914,10 @@ mod tests {
             &executor,
             &config,
             None,
-            None, // No HTTP limiter for test
-            None, // No assemble limiter for test
-            None, // No encode limiter for test
+            None,  // No HTTP limiter for test
+            None,  // No assemble limiter for test
+            None,  // No encode limiter for test
+            false, // is_prefetch: on-demand request
         )
         .await;
 
@@ -911,9 +956,10 @@ mod tests {
             &executor,
             &config,
             None,
-            None, // No HTTP limiter for test
-            None, // No assemble limiter for test
-            None, // No encode limiter for test
+            None,  // No HTTP limiter for test
+            None,  // No assemble limiter for test
+            None,  // No encode limiter for test
+            false, // is_prefetch: on-demand request
         )
         .await;
 

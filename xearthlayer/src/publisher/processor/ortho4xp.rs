@@ -754,7 +754,7 @@ mod tests {
             fn grid_lat_is_multiple_of_10(lat in -90i32..=90i32) {
                 let grid_lat = (lat.div_euclid(10)) * 10;
                 prop_assert_eq!(grid_lat % 10, 0, "Grid lat {} should be multiple of 10", grid_lat);
-                prop_assert!(grid_lat >= -90 && grid_lat <= 90, "Grid lat {} out of range", grid_lat);
+                prop_assert!((-90..=90).contains(&grid_lat), "Grid lat {} out of range", grid_lat);
             }
 
             /// Grid longitude is always a multiple of 10 and within valid range
@@ -762,7 +762,7 @@ mod tests {
             fn grid_lon_is_multiple_of_10(lon in -180i32..=180i32) {
                 let grid_lon = (lon.div_euclid(10)) * 10;
                 prop_assert_eq!(grid_lon % 10, 0, "Grid lon {} should be multiple of 10", grid_lon);
-                prop_assert!(grid_lon >= -180 && grid_lon <= 180, "Grid lon {} out of range", grid_lon);
+                prop_assert!((-180..=180).contains(&grid_lon), "Grid lon {} out of range", grid_lon);
             }
 
             /// Original coordinate always falls within its grid cell

@@ -38,13 +38,18 @@ pub fn to_tile_coords(lat: f64, lon: f64, zoom: u8) -> Result<TileCoord, CoordEr
 
     // Calculate number of tiles at this zoom level
     let n = 2.0_f64.powi(zoom as i32);
+    let max_coord = (n as u32).saturating_sub(1);
 
     // Convert longitude to tile X coordinate
-    let col = ((lon + 180.0) / 360.0 * n) as u32;
+    // Clamp to valid range to handle floating-point edge cases
+    let col_f = (lon + 180.0) / 360.0 * n;
+    let col = (col_f as u32).min(max_coord);
 
     // Convert latitude to tile Y coordinate using Web Mercator projection
+    // Clamp to valid range to handle floating-point edge cases
     let lat_rad = lat * PI / 180.0;
-    let row = ((1.0 - lat_rad.tan().asinh() / PI) / 2.0 * n) as u32;
+    let row_f = (1.0 - lat_rad.tan().asinh() / PI) / 2.0 * n;
+    let row = (row_f as u32).min(max_coord);
 
     Ok(TileCoord { row, col, zoom })
 }
@@ -72,12 +77,18 @@ pub fn to_chunk_coords(lat: f64, lon: f64, zoom: u8) -> Result<ChunkCoord, Coord
     // Each tile is divided into 16×16 chunks
     // We calculate at chunk resolution (zoom + 4 for 2^4 = 16)
     let chunk_zoom_offset = 4; // log2(16) = 4
-    let n_chunks = 2.0_f64.powi((zoom + chunk_zoom_offset) as i32);
+    let chunk_zoom = zoom + chunk_zoom_offset;
+    let n_chunks = 2.0_f64.powi(chunk_zoom as i32);
+    let max_chunk_coord = (n_chunks as u32).saturating_sub(1);
 
     // Calculate chunk-level coordinates
-    let chunk_col_global = ((lon + 180.0) / 360.0 * n_chunks) as u32;
+    // Clamp to valid range to handle floating-point edge cases
+    let chunk_col_f = (lon + 180.0) / 360.0 * n_chunks;
+    let chunk_col_global = (chunk_col_f as u32).min(max_chunk_coord);
+
     let lat_rad = lat * PI / 180.0;
-    let chunk_row_global = ((1.0 - lat_rad.tan().asinh() / PI) / 2.0 * n_chunks) as u32;
+    let chunk_row_f = (1.0 - lat_rad.tan().asinh() / PI) / 2.0 * n_chunks;
+    let chunk_row_global = (chunk_row_f as u32).min(max_chunk_coord);
 
     // Extract the chunk position within the tile (0-15)
     let chunk_row = (chunk_row_global % 16) as u8;
@@ -738,7 +749,7 @@ mod tests {
         let quadkey = tile_to_quadkey(&tile);
         assert_eq!(quadkey.len(), 16);
         // Quadkey should only contain digits 0-3
-        assert!(quadkey.chars().all(|c| c >= '0' && c <= '3'));
+        assert!(quadkey.chars().all(|c| ('0'..='3').contains(&c)));
     }
 
     #[test]
@@ -913,12 +924,12 @@ mod tests {
 
                 // Results should be in valid geographic bounds
                 prop_assert!(
-                    lat >= MIN_LAT && lat <= MAX_LAT,
+                    (MIN_LAT..=MAX_LAT).contains(&lat),
                     "Latitude {} out of bounds [{}, {}]",
                     lat, MIN_LAT, MAX_LAT
                 );
                 prop_assert!(
-                    lon >= -180.0 && lon <= 180.0,
+                    (-180.0..=180.0).contains(&lon),
                     "Longitude {} out of bounds [-180, 180]",
                     lon
                 );
@@ -1116,7 +1127,7 @@ mod tests {
 
                 for c in quadkey.chars() {
                     prop_assert!(
-                        c >= '0' && c <= '3',
+                        ('0'..='3').contains(&c),
                         "Quadkey {} contains invalid character '{}'", quadkey, c
                     );
                 }
@@ -1145,7 +1156,7 @@ mod tests {
                 quadkey_len in 19usize..30
             ) {
                 // Quadkeys longer than MAX_ZOOM should be rejected
-                let quadkey: String = std::iter::repeat('0').take(quadkey_len).collect();
+                let quadkey: String = std::iter::repeat_n('0', quadkey_len).collect();
                 let result = quadkey_to_tile(&quadkey);
 
                 prop_assert!(result.is_err(), "Should reject quadkey length {}", quadkey_len);

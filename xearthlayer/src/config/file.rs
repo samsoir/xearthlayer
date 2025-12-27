@@ -115,7 +115,11 @@ pub struct GenerationSettings {
 #[derive(Debug, Clone)]
 pub struct PipelineSettings {
     /// Maximum concurrent HTTP requests across all tiles.
-    /// Default: min(num_cpus * 16, 256)
+    /// Default: 128 (conservative value stable with all providers)
+    ///
+    /// Hard limits: 64-256 (values outside this range are clamped).
+    /// The ceiling prevents overwhelming imagery providers, which causes
+    /// rate limiting (HTTP 429) and cascade failures.
     pub max_http_concurrent: usize,
     /// Maximum concurrent CPU-bound operations (assemble + encode stages).
     /// Default: num_cpus * 1.25, minimum num_cpus + 2
@@ -174,6 +178,12 @@ pub struct LoggingSettings {
 pub struct PrefetchSettings {
     /// Enable predictive tile prefetching based on X-Plane telemetry
     pub enabled: bool,
+    /// Prefetch strategy: "auto", "heading-aware", or "radial" (default: "auto")
+    ///
+    /// - "auto": Uses heading-aware with graceful degradation to radial
+    /// - "heading-aware": Direction-aware cone prefetching (requires telemetry)
+    /// - "radial": Simple radius-based prefetching (no heading data required)
+    pub strategy: String,
     /// UDP port for X-Plane telemetry (default: 49002 for ForeFlight protocol)
     pub udp_port: u16,
     /// Prediction cone half-angle in degrees (default: 45)
@@ -188,6 +198,27 @@ pub struct PrefetchSettings {
     pub max_in_flight: usize,
     /// Radial prefetcher tile radius (default: 3, giving a 7×7 = 49 tile grid)
     pub radial_radius: u8,
+    /// Inner radius where prefetch zone starts (nautical miles).
+    /// This is just inside X-Plane's ~90nm loaded zone. Default: 85nm.
+    pub inner_radius_nm: f32,
+    /// Outer radius where prefetch zone ends (nautical miles).
+    /// This is how far beyond X-Plane's boundary to prefetch. Default: 95nm.
+    pub outer_radius_nm: f32,
+    /// Maximum tiles to submit per prefetch cycle. Default: 50.
+    /// Lower values reduce bandwidth competition with on-demand requests.
+    pub max_tiles_per_cycle: usize,
+    /// Interval between prefetch cycles in milliseconds. Default: 2000ms.
+    /// Higher values reduce prefetch aggressiveness.
+    pub cycle_interval_ms: u64,
+    /// Enable ZL12 (zoom level 12) prefetching. Default: true.
+    /// ZL12 tiles are used for distant terrain and reduce stutters at the 90nm boundary.
+    pub enable_zl12: bool,
+    /// Inner radius for ZL12 prefetch zone (nautical miles). Default: 88nm.
+    /// ZL12 prefetch zone starts here (just inside the 90nm boundary).
+    pub zl12_inner_radius_nm: f32,
+    /// Outer radius for ZL12 prefetch zone (nautical miles). Default: 100nm.
+    /// ZL12 prefetch zone ends here (beyond the 90nm boundary).
+    pub zl12_outer_radius_nm: f32,
 }
 
 /// Control plane configuration for job management and health monitoring.
@@ -260,6 +291,7 @@ impl Default for ConfigFile {
             },
             prefetch: PrefetchSettings {
                 enabled: true,
+                strategy: "auto".to_string(),
                 udp_port: DEFAULT_PREFETCH_UDP_PORT,
                 cone_angle: DEFAULT_PREFETCH_CONE_ANGLE,
                 cone_distance_nm: DEFAULT_PREFETCH_CONE_DISTANCE_NM,
@@ -267,6 +299,13 @@ impl Default for ConfigFile {
                 batch_size: DEFAULT_PREFETCH_BATCH_SIZE,
                 max_in_flight: DEFAULT_PREFETCH_MAX_IN_FLIGHT,
                 radial_radius: DEFAULT_PREFETCH_RADIAL_RADIUS,
+                inner_radius_nm: DEFAULT_PREFETCH_INNER_RADIUS_NM,
+                outer_radius_nm: DEFAULT_PREFETCH_OUTER_RADIUS_NM,
+                max_tiles_per_cycle: DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE,
+                cycle_interval_ms: DEFAULT_PREFETCH_CYCLE_INTERVAL_MS,
+                enable_zl12: DEFAULT_PREFETCH_ENABLE_ZL12,
+                zl12_inner_radius_nm: DEFAULT_PREFETCH_ZL12_INNER_RADIUS_NM,
+                zl12_outer_radius_nm: DEFAULT_PREFETCH_ZL12_OUTER_RADIUS_NM,
             },
             control_plane: ControlPlaneSettings {
                 max_concurrent_jobs: default_max_concurrent_jobs(),
@@ -285,9 +324,48 @@ pub fn num_cpus() -> usize {
         .unwrap_or(4)
 }
 
-/// Default HTTP concurrency limit: min(num_cpus * 16, 256)
+/// Minimum HTTP concurrency limit.
+/// Below this, performance suffers significantly.
+pub const MIN_HTTP_CONCURRENT: usize = 64;
+
+/// Maximum HTTP concurrency limit.
+/// Above this, providers get rate-limited causing cascade failures.
+pub const MAX_HTTP_CONCURRENT: usize = 256;
+
+/// Default HTTP concurrency limit.
+/// Conservative default of 128 prevents provider rate limiting while
+/// maintaining good performance. Tested stable with Apple/Bing providers.
+pub const DEFAULT_HTTP_CONCURRENT: usize = 128;
+
+/// Default HTTP concurrency limit.
+/// Returns a conservative value (128) that works reliably with all providers.
 pub fn default_http_concurrent() -> usize {
-    (num_cpus() * 16).min(256)
+    DEFAULT_HTTP_CONCURRENT
+}
+
+/// Clamps HTTP concurrency to valid range and logs a warning if clamped.
+fn clamp_http_concurrent(value: usize) -> usize {
+    if value < MIN_HTTP_CONCURRENT {
+        tracing::warn!(
+            requested = value,
+            min = MIN_HTTP_CONCURRENT,
+            max = MAX_HTTP_CONCURRENT,
+            "max_http_concurrent below minimum, clamping to {}",
+            MIN_HTTP_CONCURRENT
+        );
+        MIN_HTTP_CONCURRENT
+    } else if value > MAX_HTTP_CONCURRENT {
+        tracing::warn!(
+            requested = value,
+            min = MIN_HTTP_CONCURRENT,
+            max = MAX_HTTP_CONCURRENT,
+            "max_http_concurrent above maximum, clamping to {} (prevents provider rate limiting)",
+            MAX_HTTP_CONCURRENT
+        );
+        MAX_HTTP_CONCURRENT
+    } else {
+        value
+    }
 }
 
 /// Default CPU concurrency limit: num_cpus * 1.25, minimum num_cpus + 2
@@ -364,6 +442,33 @@ pub const DEFAULT_PREFETCH_MAX_IN_FLIGHT: usize = 2000;
 
 /// Default radial prefetcher tile radius (7×7 = 49 tiles).
 pub const DEFAULT_PREFETCH_RADIAL_RADIUS: u8 = 3;
+
+/// Default inner radius where prefetch zone starts (nautical miles).
+/// Just inside X-Plane's ~90nm loaded zone boundary.
+pub const DEFAULT_PREFETCH_INNER_RADIUS_NM: f32 = 85.0;
+
+/// Default outer radius where prefetch zone ends (nautical miles).
+/// Narrowed from 105nm to 95nm to reduce prefetch aggressiveness.
+pub const DEFAULT_PREFETCH_OUTER_RADIUS_NM: f32 = 95.0;
+
+/// Default maximum tiles to submit per prefetch cycle.
+/// Reduced from 100 to 50 to leave more bandwidth for on-demand requests.
+pub const DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE: usize = 50;
+
+/// Default interval between prefetch cycles in milliseconds.
+/// Increased from 1000ms to 2000ms to reduce prefetch aggressiveness.
+pub const DEFAULT_PREFETCH_CYCLE_INTERVAL_MS: u64 = 2000;
+
+/// Default enable ZL12 prefetching.
+pub const DEFAULT_PREFETCH_ENABLE_ZL12: bool = true;
+
+/// Default inner radius for ZL12 prefetch zone (nautical miles).
+/// Just inside X-Plane's 90nm loaded zone boundary.
+pub const DEFAULT_PREFETCH_ZL12_INNER_RADIUS_NM: f32 = 88.0;
+
+/// Default outer radius for ZL12 prefetch zone (nautical miles).
+/// Beyond X-Plane's 90nm boundary for distant terrain prefetch.
+pub const DEFAULT_PREFETCH_ZL12_OUTER_RADIUS_NM: f32 = 100.0;
 
 // =============================================================================
 // Control plane defaults
@@ -566,13 +671,14 @@ impl ConfigFile {
         // [pipeline] section
         if let Some(section) = ini.section(Some("pipeline")) {
             if let Some(v) = section.get("max_http_concurrent") {
-                config.pipeline.max_http_concurrent =
-                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                        section: "pipeline".to_string(),
-                        key: "max_http_concurrent".to_string(),
-                        value: v.to_string(),
-                        reason: "must be a positive integer".to_string(),
-                    })?;
+                let parsed: usize = v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                    section: "pipeline".to_string(),
+                    key: "max_http_concurrent".to_string(),
+                    value: v.to_string(),
+                    reason: "must be a positive integer".to_string(),
+                })?;
+                // Enforce hard limits to prevent provider rate limiting
+                config.pipeline.max_http_concurrent = clamp_http_concurrent(parsed);
             }
             if let Some(v) = section.get("max_cpu_concurrent") {
                 config.pipeline.max_cpu_concurrent =
@@ -688,6 +794,22 @@ impl ConfigFile {
                 let v = v.trim().to_lowercase();
                 config.prefetch.enabled = v == "true" || v == "1" || v == "yes" || v == "on";
             }
+            if let Some(v) = section.get("strategy") {
+                let v = v.trim().to_lowercase();
+                match v.as_str() {
+                    "auto" | "heading-aware" | "radial" => {
+                        config.prefetch.strategy = v;
+                    }
+                    _ => {
+                        return Err(ConfigFileError::InvalidValue {
+                            section: "prefetch".to_string(),
+                            key: "strategy".to_string(),
+                            value: v.to_string(),
+                            reason: "must be 'auto', 'heading-aware', or 'radial'".to_string(),
+                        });
+                    }
+                }
+            }
             if let Some(v) = section.get("udp_port") {
                 config.prefetch.udp_port =
                     v.parse().map_err(|_| ConfigFileError::InvalidValue {
@@ -749,6 +871,64 @@ impl ConfigFile {
                         key: "radial_radius".to_string(),
                         value: v.to_string(),
                         reason: "must be a positive integer (1-20)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("inner_radius_nm") {
+                config.prefetch.inner_radius_nm =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "inner_radius_nm".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive number (nautical miles)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("outer_radius_nm") {
+                config.prefetch.outer_radius_nm =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "outer_radius_nm".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive number (nautical miles)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("max_tiles_per_cycle") {
+                config.prefetch.max_tiles_per_cycle =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "max_tiles_per_cycle".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("cycle_interval_ms") {
+                config.prefetch.cycle_interval_ms =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "cycle_interval_ms".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (milliseconds)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("enable_zl12") {
+                let v = v.trim().to_lowercase();
+                config.prefetch.enable_zl12 = v == "true" || v == "1" || v == "yes" || v == "on";
+            }
+            if let Some(v) = section.get("zl12_inner_radius_nm") {
+                config.prefetch.zl12_inner_radius_nm =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "zl12_inner_radius_nm".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive number (nautical miles)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("zl12_outer_radius_nm") {
+                config.prefetch.zl12_outer_radius_nm =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "zl12_outer_radius_nm".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive number (nautical miles)".to_string(),
                     })?;
             }
         }
@@ -888,8 +1068,8 @@ timeout = {}
 ; Advanced concurrency and retry settings. Defaults are tuned for most systems.
 ; Only modify if you understand the implications.
 
-; Maximum concurrent HTTP requests across all tiles (default: min(num_cpus * 16, 256))
-; Higher values increase throughput but may overwhelm network stack
+; Maximum concurrent HTTP requests across all tiles (default: 128, limits: 64-256)
+; Values outside 64-256 are clamped. The ceiling prevents provider rate limiting.
 max_http_concurrent = {}
 ; Maximum concurrent CPU-bound operations for tile assembly and encoding
 ; (default: num_cpus * 1.25, minimum num_cpus + 2)
@@ -937,6 +1117,11 @@ file = {}
 ; Enable predictive tile prefetching based on X-Plane telemetry (default: true)
 ; Requires X-Plane to send ForeFlight data: Settings > Network > Send to ForeFlight
 enabled = {}
+; Prefetch strategy (default: auto)
+;   auto         - Uses heading-aware with graceful degradation to radial
+;   heading-aware - Direction-aware cone prefetching (requires telemetry)
+;   radial       - Simple radius-based prefetching (no heading data required)
+strategy = {}
 ; UDP port for telemetry (default: 49002 for ForeFlight protocol)
 udp_port = {}
 ; Prediction cone half-angle in degrees (default: 45)
@@ -955,6 +1140,27 @@ max_in_flight = {}
 ; Radial prefetcher tile radius (default: 3, giving 7x7 = 49 tiles)
 ; Higher values prefetch more tiles around aircraft position
 radial_radius = {}
+; Inner radius where prefetch zone starts (nautical miles, default: 85)
+; Just inside X-Plane's ~90nm loaded zone boundary
+inner_radius_nm = {}
+; Outer radius where prefetch zone ends (nautical miles, default: 95)
+; How far beyond X-Plane's boundary to prefetch
+outer_radius_nm = {}
+; Maximum tiles to submit per prefetch cycle (default: 50)
+; Lower values leave more bandwidth for on-demand requests
+max_tiles_per_cycle = {}
+; Interval between prefetch cycles in milliseconds (default: 2000)
+; Higher values reduce prefetch aggressiveness
+cycle_interval_ms = {}
+; Enable ZL12 prefetching for distant terrain (default: true)
+; ZL12 tiles reduce stutters at the 90nm scenery boundary
+enable_zl12 = {}
+; Inner radius for ZL12 prefetch zone (nautical miles, default: 88)
+; Just inside X-Plane's ~90nm loaded zone boundary
+zl12_inner_radius_nm = {}
+; Outer radius for ZL12 prefetch zone (nautical miles, default: 100)
+; Beyond X-Plane's boundary for distant terrain prefetch
+zl12_outer_radius_nm = {}
 
 [control_plane]
 ; Advanced settings for job management and health monitoring.
@@ -999,6 +1205,7 @@ semaphore_timeout_secs = {}
             temp_dir,
             path_to_string(&self.logging.file),
             self.prefetch.enabled,
+            self.prefetch.strategy,
             self.prefetch.udp_port,
             self.prefetch.cone_angle,
             self.prefetch.cone_distance_nm,
@@ -1006,6 +1213,13 @@ semaphore_timeout_secs = {}
             self.prefetch.batch_size,
             self.prefetch.max_in_flight,
             self.prefetch.radial_radius,
+            self.prefetch.inner_radius_nm,
+            self.prefetch.outer_radius_nm,
+            self.prefetch.max_tiles_per_cycle,
+            self.prefetch.cycle_interval_ms,
+            self.prefetch.enable_zl12,
+            self.prefetch.zl12_inner_radius_nm,
+            self.prefetch.zl12_outer_radius_nm,
             self.control_plane.max_concurrent_jobs,
             self.control_plane.stall_threshold_secs,
             self.control_plane.health_check_interval_secs,
@@ -1251,5 +1465,62 @@ temp_dir = /tmp/xearthlayer
         let config = ConfigFile::default();
         assert!(config.packages.library_url.is_none());
         assert!(config.packages.temp_dir.is_none());
+    }
+
+    #[test]
+    fn test_http_concurrent_clamped_to_ceiling() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+
+        // Test value above maximum gets clamped to 256
+        std::fs::write(
+            &config_path,
+            r#"
+[pipeline]
+max_http_concurrent = 500
+"#,
+        )
+        .unwrap();
+
+        let config = ConfigFile::load_from(&config_path).unwrap();
+        assert_eq!(config.pipeline.max_http_concurrent, MAX_HTTP_CONCURRENT);
+    }
+
+    #[test]
+    fn test_http_concurrent_clamped_to_floor() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+
+        // Test value below minimum gets clamped to 64
+        std::fs::write(
+            &config_path,
+            r#"
+[pipeline]
+max_http_concurrent = 10
+"#,
+        )
+        .unwrap();
+
+        let config = ConfigFile::load_from(&config_path).unwrap();
+        assert_eq!(config.pipeline.max_http_concurrent, MIN_HTTP_CONCURRENT);
+    }
+
+    #[test]
+    fn test_http_concurrent_in_range_unchanged() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+
+        // Test value within range is unchanged
+        std::fs::write(
+            &config_path,
+            r#"
+[pipeline]
+max_http_concurrent = 128
+"#,
+        )
+        .unwrap();
+
+        let config = ConfigFile::load_from(&config_path).unwrap();
+        assert_eq!(config.pipeline.max_http_concurrent, 128);
     }
 }

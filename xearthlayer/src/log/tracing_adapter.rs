@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn test_tracing_logger_default() {
-        let logger = TracingLogger::default();
+        let logger = TracingLogger;
         let _ = logger;
     }
 

@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn test_processor_default() {
-        let processor = OverlayProcessor::default();
+        let processor = OverlayProcessor;
         assert_eq!(processor.name(), "Ortho4XP Overlays");
     }
 

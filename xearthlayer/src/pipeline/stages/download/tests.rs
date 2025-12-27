@@ -1,5 +1,7 @@
 //! Tests for download stage functionality.
 
+#![allow(clippy::type_complexity)]
+
 use super::*;
 use crate::pipeline::ChunkDownloadError;
 use std::collections::HashMap;

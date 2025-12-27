@@ -3,7 +3,10 @@
 //! This stage takes an assembled RGBA image and compresses it to DDS format
 //! with BC1 or BC3 compression and mipmaps.
 
-use crate::pipeline::{BlockingExecutor, ConcurrencyLimiter, JobError, JobId, TextureEncoderAsync};
+use crate::pipeline::{
+    BlockingExecutor, JobError, JobId, PriorityConcurrencyLimiter, RequestPriority,
+    TextureEncoderAsync,
+};
 use crate::telemetry::PipelineMetrics;
 use image::RgbaImage;
 use std::sync::Arc;
@@ -24,7 +27,8 @@ use tracing::{debug, instrument};
 /// * `encoder` - The texture encoder to use
 /// * `executor` - Executor for running blocking work
 /// * `metrics` - Optional telemetry metrics
-/// * `encode_limiter` - Optional concurrency limiter for CPU-bound encoding
+/// * `encode_limiter` - Optional priority-aware concurrency limiter
+/// * `is_prefetch` - Whether this is a prefetch request (lower priority)
 ///
 /// # Returns
 ///
@@ -36,7 +40,8 @@ pub async fn encode_stage<E, X>(
     encoder: Arc<E>,
     executor: &X,
     metrics: Option<Arc<PipelineMetrics>>,
-    encode_limiter: Option<Arc<ConcurrencyLimiter>>,
+    encode_limiter: Option<Arc<PriorityConcurrencyLimiter>>,
+    is_prefetch: bool,
 ) -> Result<Vec<u8>, JobError>
 where
     E: TextureEncoderAsync,
@@ -51,11 +56,27 @@ where
     }
     let start = Instant::now();
 
-    // Acquire encode permit if limiter is provided
-    // This prevents too many concurrent encode operations from exhausting
-    // the blocking thread pool and starving disk I/O
+    // Acquire encode permit if limiter is provided.
+    // Priority-aware: on-demand (high priority) always gets a permit,
+    // prefetch (low priority) backs off if no permits available.
+    let priority = if is_prefetch {
+        RequestPriority::Low
+    } else {
+        RequestPriority::High
+    };
+
     let _encode_permit = if let Some(ref limiter) = encode_limiter {
-        Some(limiter.acquire().await)
+        match limiter.acquire(priority).await {
+            Some(permit) => Some(permit),
+            None => {
+                // Prefetch couldn't get a permit - CPU is busy, skip encode
+                debug!(
+                    job_id = %job_id,
+                    "Prefetch encode skipped - CPU busy"
+                );
+                return Err(JobError::Internal("Prefetch skipped: CPU busy".to_string()));
+            }
+        }
     } else {
         None
     };
@@ -127,7 +148,7 @@ mod tests {
         let encoder = Arc::new(MockEncoder::new());
         let executor = TokioExecutor::new();
 
-        let result = encode_stage(JobId::new(), image, encoder, &executor, None, None).await;
+        let result = encode_stage(JobId::new(), image, encoder, &executor, None, None, false).await;
 
         assert!(result.is_ok());
         let dds_data = result.unwrap();
@@ -143,7 +164,7 @@ mod tests {
         let encoder = Arc::new(MockEncoder::failing());
         let executor = TokioExecutor::new();
 
-        let result = encode_stage(JobId::new(), image, encoder, &executor, None, None).await;
+        let result = encode_stage(JobId::new(), image, encoder, &executor, None, None, false).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -163,7 +184,7 @@ mod tests {
         let encoder = Arc::new(MockEncoder::new());
         let executor = SyncExecutor;
 
-        let future = encode_stage(JobId::new(), image, encoder, &executor, None, None);
+        let future = encode_stage(JobId::new(), image, encoder, &executor, None, None, false);
 
         // Can run without Tokio runtime
         let result = futures::executor::block_on(future).unwrap();
@@ -177,10 +198,18 @@ mod tests {
         let image = RgbaImage::new(256, 256);
         let encoder = Arc::new(MockEncoder::new());
         let executor = TokioExecutor::new();
-        let limiter = Arc::new(ConcurrencyLimiter::new(2, "test_encode"));
+        let limiter = Arc::new(PriorityConcurrencyLimiter::new(2, 50, "test_encode"));
 
-        let result =
-            encode_stage(JobId::new(), image, encoder, &executor, None, Some(limiter)).await;
+        let result = encode_stage(
+            JobId::new(),
+            image,
+            encoder,
+            &executor,
+            None,
+            Some(limiter),
+            false,
+        )
+        .await;
 
         assert!(result.is_ok());
     }

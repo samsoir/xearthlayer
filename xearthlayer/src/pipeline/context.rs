@@ -35,10 +35,10 @@ pub struct PipelineConfig {
     /// This prevents overwhelming the network stack when multiple tiles
     /// are being processed simultaneously.
     ///
-    /// Recommended: `num_cpus * 16` capped at 256.
-    /// - 4-core system: 64-128 concurrent requests
-    /// - 8-core system: 128-256 concurrent requests
-    /// - 12+ core system: 256 concurrent requests (cap)
+    /// Default: 128 (conservative value stable with all providers)
+    /// Hard limits: 64-256 (values outside this range are clamped)
+    /// The ceiling prevents overwhelming imagery providers with too many
+    /// requests, which causes rate limiting (HTTP 429) and cascade failures.
     pub max_global_http_requests: usize,
 
     /// Maximum concurrent prefetch jobs in flight.
@@ -334,9 +334,10 @@ mod tests {
     #[test]
     fn test_default_global_http_requests() {
         let default = default_http_concurrent();
-        // Should be num_cpus * 16, capped at 256
-        assert!(default >= 64); // At least 4 CPUs * 16
-        assert!(default <= 256); // Capped at 256
+        // Default is 128, hard limits are 64-256
+        assert_eq!(default, 128);
+        assert!(default >= 64);
+        assert!(default <= 256);
     }
 
     #[test]

@@ -5,6 +5,75 @@ use std::time::Instant;
 
 use super::scheduler::PrefetchStatsSnapshot;
 
+/// GPS/telemetry connection status for UI display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpsStatus {
+    /// XGPS2 configured and receiving data from X-Plane.
+    Connected,
+    /// XGPS2 configured but not yet receiving data.
+    #[default]
+    Acquiring,
+    /// XGPS2 not configured; using FUSE-based position inference.
+    Inferred,
+}
+
+impl std::fmt::Display for GpsStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connected => write!(f, "Connected"),
+            Self::Acquiring => write!(f, "Acquiring..."),
+            Self::Inferred => write!(f, "Inferred"),
+        }
+    }
+}
+
+/// Prefetch operating mode for UI display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrefetchMode {
+    /// Using UDP telemetry for heading-aware cone prefetch.
+    #[default]
+    Telemetry,
+    /// Using FUSE request analysis for position/heading inference.
+    FuseInference,
+    /// Fallback to simple radial prefetch (no heading data).
+    Radial,
+    /// Prefetch system is idle (no data received yet).
+    Idle,
+}
+
+/// Detailed prefetch statistics for dashboard display.
+///
+/// Provides real-time visibility into prefetch activity beyond the basic
+/// mode indicator, allowing users to diagnose performance issues.
+#[derive(Debug, Clone, Default)]
+pub struct DetailedPrefetchStats {
+    /// Total prefetch cycles completed.
+    pub cycles: u64,
+    /// Tiles submitted in the most recent cycle.
+    pub tiles_submitted_last_cycle: u64,
+    /// Total tiles submitted across all cycles.
+    pub tiles_submitted_total: u64,
+    /// Tiles skipped because they were already in cache.
+    pub cache_hits: u64,
+    /// Tiles skipped due to TTL (recently attempted).
+    pub ttl_skipped: u64,
+    /// Zoom levels active in the most recent cycle.
+    pub active_zoom_levels: Vec<u8>,
+    /// Whether the prefetcher is actively submitting tiles.
+    pub is_active: bool,
+}
+
+impl std::fmt::Display for PrefetchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Telemetry => write!(f, "Heading-Aware (Telemetry)"),
+            Self::FuseInference => write!(f, "Heading-Aware (Inferred)"),
+            Self::Radial => write!(f, "Radial"),
+            Self::Idle => write!(f, "Idle"),
+        }
+    }
+}
+
 /// Shared prefetch status for display in the UI.
 ///
 /// This provides a thread-safe way to share the current prefetch state
@@ -22,7 +91,9 @@ impl SharedPrefetchStatus {
         })
     }
 
-    /// Update the aircraft state.
+    /// Update the aircraft state from telemetry.
+    ///
+    /// This also sets GPS status to Connected since we received data.
     pub fn update_aircraft(&self, state: &AircraftState) {
         if let Ok(mut inner) = self.inner.write() {
             inner.aircraft = Some(AircraftSnapshot {
@@ -32,6 +103,8 @@ impl SharedPrefetchStatus {
                 ground_speed: state.ground_speed,
                 altitude: state.altitude,
             });
+            // Receiving telemetry means GPS is connected
+            inner.gps_status = GpsStatus::Connected;
         }
     }
 
@@ -39,6 +112,30 @@ impl SharedPrefetchStatus {
     pub fn update_stats(&self, stats: PrefetchStatsSnapshot) {
         if let Ok(mut inner) = self.inner.write() {
             inner.stats = stats;
+        }
+    }
+
+    /// Update the GPS connection status.
+    pub fn update_gps_status(&self, status: GpsStatus) {
+        if let Ok(mut inner) = self.inner.write() {
+            inner.gps_status = status;
+        }
+    }
+
+    /// Update the current prefetch operating mode.
+    pub fn update_prefetch_mode(&self, mode: PrefetchMode) {
+        if let Ok(mut inner) = self.inner.write() {
+            inner.prefetch_mode = mode;
+        }
+    }
+
+    /// Update the detailed prefetch statistics.
+    ///
+    /// Called by the prefetcher after each cycle to provide real-time
+    /// visibility into prefetch activity.
+    pub fn update_detailed_stats(&self, stats: DetailedPrefetchStats) {
+        if let Ok(mut inner) = self.inner.write() {
+            inner.detailed_stats = Some(stats);
         }
     }
 
@@ -55,6 +152,12 @@ pub struct PrefetchStatusSnapshot {
     pub aircraft: Option<AircraftSnapshot>,
     /// Prefetch statistics.
     pub stats: PrefetchStatsSnapshot,
+    /// GPS/telemetry connection status.
+    pub gps_status: GpsStatus,
+    /// Current prefetch operating mode.
+    pub prefetch_mode: PrefetchMode,
+    /// Detailed prefetch statistics for dashboard display.
+    pub detailed_stats: Option<DetailedPrefetchStats>,
 }
 
 /// Aircraft state snapshot for display (without Instant which can't be cloned easily).

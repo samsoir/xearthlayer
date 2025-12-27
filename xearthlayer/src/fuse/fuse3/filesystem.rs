@@ -11,6 +11,7 @@ use crate::fuse::{
     get_default_placeholder, parse_dds_filename, validate_dds_or_placeholder, DdsFilename,
 };
 use crate::pipeline::{ConcurrencyLimiter, JobId};
+use crate::prefetch::TileRequestCallback;
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
@@ -84,6 +85,8 @@ pub struct Fuse3PassthroughFS {
     generation_timeout: Duration,
     /// Limiter for concurrent disk I/O operations
     disk_io_limiter: Arc<ConcurrencyLimiter>,
+    /// Optional callback for tile request tracking (for FUSE inference).
+    tile_request_callback: Option<TileRequestCallback>,
 }
 
 impl Fuse3PassthroughFS {
@@ -109,6 +112,7 @@ impl Fuse3PassthroughFS {
             virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
             generation_timeout: Duration::from_secs(30),
             disk_io_limiter,
+            tile_request_callback: None,
         }
     }
 
@@ -133,12 +137,26 @@ impl Fuse3PassthroughFS {
             virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
             generation_timeout: Duration::from_secs(30),
             disk_io_limiter,
+            tile_request_callback: None,
         }
     }
 
     /// Set the timeout for DDS generation.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.generation_timeout = timeout;
+        self
+    }
+
+    /// Set the callback for tile request tracking.
+    ///
+    /// This callback is invoked for every tile request from X-Plane, enabling
+    /// FUSE-based position inference when UDP telemetry is unavailable.
+    ///
+    /// # Arguments
+    ///
+    /// * `callback` - Function to call with tile coordinates when a DDS request is made
+    pub fn with_tile_request_callback(mut self, callback: TileRequestCallback) -> Self {
+        self.tile_request_callback = Some(callback);
         self
     }
 
@@ -247,6 +265,11 @@ impl Fuse3PassthroughFS {
 
         // Convert chunk coordinates to tile coordinates
         let tile = Self::chunk_to_tile_coords(coords);
+
+        // Notify tile request callback for FUSE inference (fast, non-blocking)
+        if let Some(ref callback) = self.tile_request_callback {
+            callback(tile);
+        }
 
         debug!(
             job_id = %job_id,

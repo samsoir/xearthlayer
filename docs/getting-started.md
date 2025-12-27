@@ -20,6 +20,35 @@ See [How It Works](how-it-works.md) for a detailed architectural explanation.
 - **Internet connection** for streaming imagery
 - Basic familiarity with the command line
 
+## Recommended: Enable X-Plane Telemetry
+
+For the **best experience**, enable X-Plane's telemetry output. This allows XEarthLayer to predict where you're flying and pre-download textures before you need them, resulting in smoother scenery loading with fewer pop-ins.
+
+### How to Enable (Strongly Recommended)
+
+1. In X-Plane, go to **Settings** → **Network**
+2. Find the **"XAVION, FOREFLIGHT OR OTHER EFB (GDL-90)"** section
+3. In the "Enter IP address" field, type `127.0.0.1`
+4. Click **"Add Connection to Xavion or other EFB"**
+
+That's it! XEarthLayer will automatically receive your aircraft position and heading on UDP port 49002.
+
+### What This Enables
+
+- **Predictive prefetching**: XEarthLayer downloads tiles ahead of your flight path
+- **Heading-aware caching**: Tiles in your direction of travel are prioritized
+- **Smoother scenery loading**: Tiles are often ready before X-Plane requests them
+- **Reduced stutter**: Fewer texture pop-ins during flight
+
+### Without Telemetry
+
+XEarthLayer still works without telemetry! It will:
+- Generate textures on-demand as X-Plane requests them
+- Use basic radial prefetching around recently requested tiles
+- Cache textures for subsequent visits
+
+However, you may notice more tile pop-ins when flying into new areas, especially at higher speeds.
+
 ## Installation
 
 ### From Source

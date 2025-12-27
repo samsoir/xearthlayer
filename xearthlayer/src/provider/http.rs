@@ -63,6 +63,22 @@ pub trait AsyncHttpClient: Send + Sync {
     /// The response body as bytes or an error.
     fn get(&self, url: &str) -> impl Future<Output = Result<Vec<u8>, ProviderError>> + Send;
 
+    /// Performs an async HTTP GET request with custom headers.
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The URL to request
+    /// * `headers` - Slice of (header_name, header_value) tuples
+    ///
+    /// # Returns
+    ///
+    /// The response body as bytes or an error.
+    fn get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> impl Future<Output = Result<Vec<u8>, ProviderError>> + Send;
+
     /// Performs an async HTTP GET request with Bearer token authentication.
     ///
     /// # Arguments
@@ -302,6 +318,39 @@ impl AsyncHttpClient for AsyncReqwestClient {
             .map_err(|e| ProviderError::HttpError(format!("Failed to read response: {}", e)))
     }
 
+    async fn get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Vec<u8>, ProviderError> {
+        let mut request = self.client.get(url);
+
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| ProviderError::HttpError(format!("Request failed: {}", e)))?;
+
+        // Check HTTP status
+        if !response.status().is_success() {
+            return Err(ProviderError::HttpError(format!(
+                "HTTP {} from {}",
+                response.status(),
+                url
+            )));
+        }
+
+        // Read response body
+        response
+            .bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| ProviderError::HttpError(format!("Failed to read response: {}", e)))
+    }
+
     async fn get_with_bearer(
         &self,
         url: &str,
@@ -396,6 +445,14 @@ pub mod tests {
 
     impl AsyncHttpClient for MockAsyncHttpClient {
         async fn get(&self, _url: &str) -> Result<Vec<u8>, ProviderError> {
+            self.response.clone()
+        }
+
+        async fn get_with_headers(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> Result<Vec<u8>, ProviderError> {
             self.response.clone()
         }
 

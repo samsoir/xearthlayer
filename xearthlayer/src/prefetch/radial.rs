@@ -21,7 +21,7 @@ use crate::coord::{to_tile_coords, TileCoord};
 use crate::fuse::{DdsHandler, DdsRequest};
 use crate::pipeline::{JobId, MemoryCache};
 
-use super::state::{AircraftState, SharedPrefetchStatus};
+use super::state::{AircraftState, PrefetchMode, SharedPrefetchStatus};
 use super::strategy::Prefetcher;
 
 /// Default radius in tiles around current position.
@@ -172,7 +172,8 @@ impl<M: MemoryCache> RadialPrefetcher<M> {
             "Radial prefetcher started"
         );
 
-        let mut last_cycle = Instant::now();
+        // Initialize last_cycle in the past so first cycle can run immediately
+        let mut last_cycle = Instant::now() - MIN_CYCLE_INTERVAL;
 
         loop {
             tokio::select! {
@@ -327,6 +328,7 @@ impl<M: MemoryCache> RadialPrefetcher<M> {
                 prediction_cycles: self.stats.cycles.load(Ordering::Relaxed),
             };
             status.update_stats(stats);
+            status.update_prefetch_mode(PrefetchMode::Radial);
         }
     }
 
@@ -497,7 +499,7 @@ mod tests {
 
         // Should have fewer tiles (some would be negative)
         assert!(tiles.len() < 49);
-        assert!(tiles.len() > 0);
+        assert!(!tiles.is_empty());
 
         // All tiles should have valid coordinates
         for tile in &tiles {

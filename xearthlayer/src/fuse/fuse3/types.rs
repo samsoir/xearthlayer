@@ -241,6 +241,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unnecessary_literal_unwrap)]
     fn test_fuse3_result_type() {
         // Test that Fuse3Result works as expected
         let ok_result: Fuse3Result<i32> = Ok(42);

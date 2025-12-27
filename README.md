@@ -43,8 +43,14 @@ See [How It Works](docs/how-it-works.md) for detailed architecture.
   - **ArcGIS** - Free, global coverage
   - **MapBox** - Requires access token
   - **USGS** - Free, US coverage only
+- **Predictive prefetching** - Tiles loaded ahead of your flight path
+  - Heading-aware cone prefetching using X-Plane telemetry
+  - Multi-zoom support (ZL14 near, ZL12 distant)
+  - Scenery-aware indexing for exact tile lookup
+  - Graceful degradation when telemetry unavailable
 - Two-tier caching for instant repeat visits
 - High-quality BC1/BC3 DDS textures with mipmaps
+- Real-time dashboard showing cache, download, and prefetch status
 - Works with Ortho4XP-generated scenery
 - Linux support (Windows and macOS planned)
 
@@ -73,6 +79,23 @@ xearthlayer run
 ```
 
 See [Getting Started](docs/getting-started.md) for the complete guide.
+
+## Predictive Prefetching
+
+XEarthLayer reduces FPS drops by prefetching tiles ahead of your aircraft. For best results:
+
+1. **Enable ForeFlight telemetry** in X-Plane:
+   - Settings → Network → Enable "Send to ForeFlight"
+   - XEarthLayer receives position/heading on UDP port 49002
+
+2. **Prefetch modes** (automatic selection):
+   - **Telemetry mode**: Precise cone-based prefetching using heading data
+   - **FUSE inference**: Infers position from file access patterns when telemetry is stale
+   - **Radial fallback**: Simple 7×7 grid when no heading data available
+
+The dashboard shows real-time prefetch status: `Prefetch: Telemetry | 23/cycle | Cache: 156↑ TTL: 8⊘ | ZL14 ZL12`
+
+See [Configuration](docs/configuration.md#prefetch) and [Predictive Caching Design](docs/dev/predictive-caching.md) for tuning options.
 
 ## Documentation
 

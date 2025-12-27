@@ -13,7 +13,8 @@ use xearthlayer::manager::{LocalPackageStore, MountManager, ServiceBuilder};
 use xearthlayer::package::PackageType;
 use xearthlayer::panic as panic_handler;
 use xearthlayer::prefetch::{
-    Prefetcher, RadialPrefetchConfig, RadialPrefetcher, SharedPrefetchStatus, TelemetryListener,
+    FuseInferenceConfig, FuseRequestAnalyzer, PrefetcherBuilder, SceneryIndex,
+    SharedPrefetchStatus, TelemetryListener,
 };
 use xearthlayer::service::ServiceConfig;
 
@@ -176,14 +177,30 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     // Create a logger for all services
     let logger: Arc<dyn xearthlayer::log::Logger> = Arc::new(TracingLogger);
 
+    // Create FUSE request analyzer for position inference (if prefetch is enabled)
+    // The analyzer is created early so its callback can be wired to services before mounting.
+    // This enables FUSE-based position inference when telemetry is unavailable.
+    let fuse_analyzer = if prefetch_enabled {
+        Some(Arc::new(FuseRequestAnalyzer::new(
+            FuseInferenceConfig::default(),
+        )))
+    } else {
+        None
+    };
+
     // Create service builder with shared disk I/O limiter and configured profile
     // This ensures all packages share a single limiter tuned for the storage type
-    let service_builder = ServiceBuilder::with_disk_io_profile(
+    let mut service_builder = ServiceBuilder::with_disk_io_profile(
         service_config.clone(),
         provider_config.clone(),
         logger.clone(),
         config.cache.disk_io_profile,
     );
+
+    // Wire FUSE analyzer callback to services for position inference
+    if let Some(ref analyzer) = fuse_analyzer {
+        service_builder = service_builder.with_tile_request_callback(analyzer.callback());
+    }
 
     // Mount all packages
     println!("Mounting packages to Custom Scenery...");
@@ -246,14 +263,6 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
                 let dds_handler = service.create_prefetch_handler();
                 let runtime_handle = service.runtime_handle().clone();
 
-                // Configure radial prefetcher
-                // Uses configurable tile radius around current position
-                let prefetch_config = RadialPrefetchConfig {
-                    radius: config.prefetch.radial_radius, // Configured tile radius
-                    zoom: 14,                              // Standard ortho zoom level
-                    attempt_ttl: std::time::Duration::from_secs(60), // Don't retry for 60s
-                };
-
                 // Create channels for telemetry data
                 let (state_tx, state_rx) = mpsc::channel(32);
 
@@ -273,13 +282,76 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
                     }
                 });
 
-                // Create prefetcher strategy (currently using RadialPrefetcher)
-                // The prefetcher checks memory cache before submitting requests,
-                // only fetching tiles that aren't already cached
-                let prefetcher: Box<dyn Prefetcher> = Box::new(
-                    RadialPrefetcher::new(memory_cache, dds_handler, prefetch_config)
-                        .with_shared_status(Arc::clone(&shared_prefetch_status)),
-                );
+                // Build scenery index for scenery-aware prefetching
+                // This enables exact tile lookup from .ter files instead of coordinate calculation
+                let scenery_index = {
+                    let index = Arc::new(SceneryIndex::with_defaults());
+                    let mut total_tiles = 0usize;
+                    for pkg in &ortho_packages {
+                        match index.build_from_package(&pkg.path) {
+                            Ok(count) => {
+                                total_tiles += count;
+                                tracing::debug!(
+                                    region = %pkg.region(),
+                                    tiles = count,
+                                    "Indexed scenery package"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    region = %pkg.region(),
+                                    error = %e,
+                                    "Failed to index scenery package"
+                                );
+                            }
+                        }
+                    }
+                    if total_tiles > 0 {
+                        println!(
+                            "Scenery index: {} tiles ({} land, {} sea)",
+                            total_tiles,
+                            index.land_tile_count(),
+                            index.sea_tile_count()
+                        );
+                        Some(index)
+                    } else {
+                        tracing::warn!(
+                            "No scenery tiles indexed, falling back to coordinate-based prefetch"
+                        );
+                        None
+                    }
+                };
+
+                // Build prefetcher using the builder with configuration
+                // Strategies: radial (simple), heading-aware (directional), auto (graceful degradation)
+                let mut builder = PrefetcherBuilder::new()
+                    .memory_cache(memory_cache)
+                    .dds_handler(dds_handler)
+                    .strategy(&config.prefetch.strategy)
+                    .shared_status(Arc::clone(&shared_prefetch_status))
+                    .cone_half_angle(config.prefetch.cone_angle)
+                    .inner_radius_nm(config.prefetch.inner_radius_nm)
+                    .outer_radius_nm(config.prefetch.outer_radius_nm)
+                    .max_tiles_per_cycle(config.prefetch.max_tiles_per_cycle)
+                    .cycle_interval_ms(config.prefetch.cycle_interval_ms)
+                    .radial_radius(config.prefetch.radial_radius)
+                    .enable_zl12(config.prefetch.enable_zl12)
+                    .zl12_inner_radius_nm(config.prefetch.zl12_inner_radius_nm)
+                    .zl12_outer_radius_nm(config.prefetch.zl12_outer_radius_nm);
+
+                // Wire FUSE analyzer for heading-aware/auto strategies
+                // This enables FUSE-based position inference when telemetry is unavailable
+                if let Some(analyzer) = fuse_analyzer {
+                    builder = builder.with_fuse_analyzer(analyzer);
+                }
+
+                // Wire scenery index for scenery-aware prefetching
+                // This enables exact tile lookup instead of coordinate calculation
+                if let Some(index) = scenery_index {
+                    builder = builder.with_scenery_index(index);
+                }
+
+                let prefetcher = builder.build();
 
                 // Get startup info before prefetcher is consumed
                 let startup_info = prefetcher.startup_info();

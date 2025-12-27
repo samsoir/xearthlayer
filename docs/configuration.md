@@ -197,7 +197,7 @@ Advanced concurrency and retry settings for the tile processing pipeline. These 
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `max_http_concurrent` | integer | `min(num_cpus * 16, 256)` | Maximum concurrent HTTP requests across all tiles |
+| `max_http_concurrent` | integer | `128` | Maximum concurrent HTTP requests (hard limits: 64-256) |
 | `max_cpu_concurrent` | integer | `num_cpus * 1.25` | Maximum concurrent CPU-bound operations (assembly + encoding) |
 | `max_prefetch_in_flight` | integer | `max(num_cpus / 4, 2)` | Maximum concurrent prefetch jobs |
 | `request_timeout_secs` | integer | `10` | HTTP request timeout for individual chunk downloads (seconds) |
@@ -216,8 +216,8 @@ max_prefetch_in_flight = 8
 request_timeout_secs = 15
 ```
 
-**Concurrency Formula Details:**
-- **HTTP concurrency**: `min(num_cpus * 16, 256)` - scales with CPU count but capped to prevent network stack exhaustion
+**Concurrency Settings:**
+- **HTTP concurrency**: Default 128, hard limits 64-256. Values outside this range are automatically clamped. The ceiling prevents overwhelming imagery providers with too many requests (causes HTTP 429 rate limiting and cascade failures).
 - **CPU concurrency**: `num_cpus * 1.25` - modest oversubscription for blocking thread pool efficiency
 - **Prefetch in-flight**: `max(num_cpus / 4, 2)` - leaves 75% of resources for on-demand requests
 
@@ -256,33 +256,66 @@ The TUI dashboard shows control plane health including:
 
 ### [prefetch]
 
-Controls predictive tile prefetching based on X-Plane telemetry.
+Controls predictive tile prefetching based on X-Plane telemetry. The prefetch system pre-loads tiles ahead of the aircraft to reduce FPS drops when new scenery loads.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable/disable predictive tile prefetching |
+| `strategy` | string | `auto` | Prefetch strategy: `auto`, `heading-aware`, or `radial` |
 | `udp_port` | integer | `49002` | UDP port for X-Plane telemetry (ForeFlight protocol) |
 | `cone_angle` | float | `45` | Prediction cone half-angle in degrees |
-| `cone_distance_nm` | float | `100` | How far ahead to prefetch along flight path (nautical miles) |
-| `radial_radius_nm` | float | `60` | Radial buffer radius around current position (nautical miles) |
-| `batch_size` | integer | `500` | Maximum tiles to submit per prediction cycle |
-| `max_in_flight` | integer | `2000` | Maximum concurrent prefetch requests |
-| `radial_radius` | integer | `3` | Radial prefetcher tile radius (3 = 7x7 = 49 tiles) |
+| `inner_radius_nm` | float | `85` | Inner edge of prefetch zone (nautical miles) |
+| `outer_radius_nm` | float | `95` | Outer edge of prefetch zone (nautical miles) |
+| `max_tiles_per_cycle` | integer | `50` | Maximum tiles to submit per prefetch cycle |
+| `cycle_interval_ms` | integer | `2000` | Interval between prefetch cycles (milliseconds) |
+| `radial_radius` | integer | `3` | Radial fallback tile radius (3 = 7×7 = 49 tiles) |
+| `enable_zl12` | bool | `true` | Enable ZL12 prefetching for distant terrain |
+| `zl12_inner_radius_nm` | float | `88` | Inner edge of ZL12 prefetch zone (nautical miles) |
+| `zl12_outer_radius_nm` | float | `100` | Outer edge of ZL12 prefetch zone (nautical miles) |
+
+**Strategy Options:**
+
+| Strategy | Description |
+|----------|-------------|
+| `auto` | Heading-aware with graceful degradation to radial (recommended) |
+| `heading-aware` | Direction-aware cone prefetching, requires telemetry |
+| `radial` | Simple grid around current position, works without telemetry |
+
+**Multi-Zoom Prefetching:**
+
+XEarthLayer prefetches tiles at two zoom levels:
+- **ZL14** (primary): High-resolution tiles for nearby scenery (85-95nm)
+- **ZL12** (secondary): Low-resolution tiles for distant scenery (88-100nm)
+
+This eliminates stutters when transitioning between zoom levels at the ~90nm boundary.
 
 **Example:**
 ```ini
 [prefetch]
 enabled = true
+strategy = auto
 udp_port = 49002
-; Increase radial buffer for slower aircraft
-radial_radius = 6
+
+; Primary prefetch zone (ZL14)
+cone_angle = 45
+inner_radius_nm = 85
+outer_radius_nm = 95
+max_tiles_per_cycle = 50
+cycle_interval_ms = 2000
+
+; Secondary prefetch zone (ZL12) for distant terrain
+enable_zl12 = true
+zl12_inner_radius_nm = 88
+zl12_outer_radius_nm = 100
 ```
 
 **X-Plane Setup:**
 To enable prefetching, configure X-Plane to send ForeFlight telemetry:
-1. Go to **Settings > Network**
+1. Go to **Settings → Network**
 2. Enable **Send to ForeFlight**
 3. XEarthLayer will receive position/heading updates on UDP port 49002
+
+**Note:** Even without telemetry, XEarthLayer can infer aircraft position from FUSE file access patterns (FUSE inference mode) and fall back to radial prefetching if needed
 
 ### [xplane]
 
@@ -383,8 +416,23 @@ timeout = 10
 [prefetch]
 ; Predictive tile prefetching based on X-Plane telemetry
 enabled = true
+strategy = auto  ; auto, heading-aware, or radial
 ; udp_port = 49002
-; radial_radius = 3
+
+; Primary prefetch zone (ZL14 - high resolution near scenery)
+; cone_angle = 45              ; half-angle of prediction cone (degrees)
+; inner_radius_nm = 85         ; start prefetching just inside 90nm boundary
+; outer_radius_nm = 95         ; 10nm prefetch depth
+; max_tiles_per_cycle = 50     ; tiles per cycle (lower = less bandwidth)
+; cycle_interval_ms = 2000     ; cycle interval (higher = less aggressive)
+
+; Secondary prefetch zone (ZL12 - low resolution distant scenery)
+enable_zl12 = true            ; prefetch distant terrain tiles
+; zl12_inner_radius_nm = 88
+; zl12_outer_radius_nm = 100
+
+; Radial fallback (when telemetry unavailable)
+; radial_radius = 3            ; 7×7 tile grid
 
 [xplane]
 ; scenery_dir = /path/to/X-Plane 12/Custom Scenery
@@ -471,13 +519,17 @@ Values are validated before being saved. Invalid values will produce an error me
 | `control_plane.health_check_interval_secs` | positive integer | Health check interval (seconds) |
 | `control_plane.semaphore_timeout_secs` | positive integer | Slot acquisition timeout (seconds) |
 | `prefetch.enabled` | `true`, `false` | Enable predictive prefetching |
+| `prefetch.strategy` | `auto`, `heading-aware`, `radial` | Prefetch strategy |
 | `prefetch.udp_port` | positive integer | X-Plane telemetry UDP port |
 | `prefetch.cone_angle` | positive number | Prediction cone half-angle (degrees) |
-| `prefetch.cone_distance_nm` | positive number | Cone distance (nautical miles) |
-| `prefetch.radial_radius_nm` | positive number | Radial buffer radius (nautical miles) |
-| `prefetch.batch_size` | positive integer | Max tiles per prediction cycle |
-| `prefetch.max_in_flight` | positive integer | Max concurrent prefetch requests |
-| `prefetch.radial_radius` | positive integer | Radial prefetcher tile radius |
+| `prefetch.inner_radius_nm` | positive number | Inner edge of prefetch zone (nm) |
+| `prefetch.outer_radius_nm` | positive number | Outer edge of prefetch zone (nm) |
+| `prefetch.max_tiles_per_cycle` | positive integer | Max tiles per prefetch cycle |
+| `prefetch.cycle_interval_ms` | positive integer | Prefetch cycle interval (ms) |
+| `prefetch.radial_radius` | positive integer | Radial fallback tile radius |
+| `prefetch.enable_zl12` | `true`, `false` | Enable ZL12 distant terrain prefetch |
+| `prefetch.zl12_inner_radius_nm` | positive number | ZL12 zone inner edge (nm) |
+| `prefetch.zl12_outer_radius_nm` | positive number | ZL12 zone outer edge (nm) |
 | `xplane.scenery_dir` | path | X-Plane Custom Scenery directory |
 | `packages.library_url` | URL | Package library index URL |
 | `packages.install_location` | path | Package installation directory |

@@ -15,6 +15,7 @@ use crate::pipeline::control_plane::{
     ControlPlaneConfig, ControlPlaneHealth, PipelineControlPlane,
 };
 use crate::pipeline::{ConcurrencyLimiter, DiskIoProfile, RequestCoalescer};
+use crate::prefetch::TileRequestCallback;
 use crate::provider::{AsyncProviderType, Provider, ProviderConfig};
 use crate::telemetry::{PipelineMetrics, TelemetrySnapshot};
 use crate::texture::{DdsTextureEncoder, TextureEncoder};
@@ -99,6 +100,8 @@ pub struct XEarthLayerService {
     /// Health monitor join handle (runs in background)
     #[allow(dead_code)]
     health_monitor_handle: Option<JoinHandle<()>>,
+    /// Tile request callback for FUSE-based position inference
+    tile_request_callback: Option<TileRequestCallback>,
 }
 
 impl XEarthLayerService {
@@ -296,6 +299,7 @@ impl XEarthLayerService {
             disk_io_limiter: None,
             control_plane,
             health_monitor_handle: Some(health_monitor_handle),
+            tile_request_callback: None,
         })
     }
 
@@ -439,6 +443,43 @@ impl XEarthLayerService {
         self.disk_io_limiter = Some(limiter);
     }
 
+    /// Set the tile request callback for FUSE-based position inference.
+    ///
+    /// When set, this callback is invoked for each DDS tile request received
+    /// via FUSE. The `FuseRequestAnalyzer` uses these requests to infer
+    /// aircraft position and heading when telemetry is unavailable.
+    ///
+    /// This should be called before mounting the filesystem.
+    ///
+    /// # Arguments
+    ///
+    /// * `callback` - The callback to invoke for each tile request
+    pub fn set_tile_request_callback(&mut self, callback: TileRequestCallback) {
+        self.tile_request_callback = Some(callback);
+    }
+
+    /// Set the shared memory cache.
+    ///
+    /// When multiple packages are mounted, sharing a single memory cache across
+    /// all services ensures the configured memory limit is respected globally,
+    /// not per-package. Without this, mounting N packages could use N times
+    /// the configured memory limit.
+    ///
+    /// This should be called before mounting the filesystem.
+    ///
+    /// # Arguments
+    ///
+    /// * `cache` - The shared memory cache
+    /// * `adapter` - The shared memory cache adapter (wraps the cache with provider/format context)
+    pub fn set_shared_memory_cache(
+        &mut self,
+        cache: Arc<MemoryCache>,
+        adapter: Arc<MemoryCacheAdapter>,
+    ) {
+        self.memory_cache = Some(cache);
+        self.memory_cache_adapter = Some(adapter);
+    }
+
     /// Download a single tile for the given coordinates.
     ///
     /// Converts lat/lon coordinates to tile coordinates and generates
@@ -551,11 +592,18 @@ impl XEarthLayerService {
 
     /// Create a mount configuration for FUSE filesystem.
     fn create_mount_config(&self) -> FuseMountConfig {
-        FuseMountConfig::new(self.create_dds_handler(), self.expected_dds_size())
+        let mut config = FuseMountConfig::new(self.create_dds_handler(), self.expected_dds_size())
             .with_timeout(Duration::from_secs(
                 self.config.generation_timeout().unwrap_or(30),
             ))
-            .with_logger(Arc::clone(&self.logger))
+            .with_logger(Arc::clone(&self.logger));
+
+        // Wire tile request callback for FUSE-based position inference
+        if let Some(ref callback) = self.tile_request_callback {
+            config = config.with_tile_request_callback(callback.clone());
+        }
+
+        config
     }
 
     /// Start the passthrough FUSE filesystem server using fuse3 (async multi-threaded).

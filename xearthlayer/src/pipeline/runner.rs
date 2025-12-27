@@ -23,8 +23,8 @@ use crate::pipeline::control_plane::{PipelineControlPlane, StageObserver, Submit
 use crate::pipeline::http_limiter::HttpConcurrencyLimiter;
 use crate::pipeline::processor::process_tile_with_observer;
 use crate::pipeline::{
-    BlockingExecutor, ChunkProvider, ConcurrencyLimiter, DiskCache, MemoryCache, PipelineConfig,
-    TextureEncoderAsync,
+    BlockingExecutor, ChunkProvider, DiskCache, MemoryCache, PipelineConfig,
+    PriorityConcurrencyLimiter, TextureEncoderAsync,
 };
 use crate::telemetry::PipelineMetrics;
 use std::sync::Arc;
@@ -76,13 +76,14 @@ where
     // Create HTTP concurrency limiter (stage-level, not job-level)
     let http_limiter = Arc::new(HttpConcurrencyLimiter::new(config.max_global_http_requests));
 
-    // Create shared CPU limiter for both assemble and encode stages
-    let cpu_limiter = Arc::new(ConcurrencyLimiter::with_cpu_oversubscribe("cpu_bound"));
+    // Create shared priority-aware CPU limiter for both assemble and encode stages.
+    // On-demand requests (from X-Plane) get priority over prefetch requests.
+    let cpu_limiter = Arc::new(PriorityConcurrencyLimiter::with_cpu_defaults("cpu_bound"));
 
     info!(
         metrics_enabled = metrics.is_some(),
         max_http_concurrent = config.max_global_http_requests,
-        max_cpu_concurrent = cpu_limiter.max_concurrent(),
+        max_cpu_concurrent = cpu_limiter.total_permits(),
         max_concurrent_jobs = control_plane.max_concurrent_jobs(),
         "Created DDS handler with control plane integration"
     );
@@ -155,8 +156,8 @@ async fn process_dds_request_with_control_plane<P, E, M, D, X>(
     disk_cache: Arc<D>,
     executor: Arc<X>,
     http_limiter: Arc<HttpConcurrencyLimiter>,
-    assemble_limiter: Arc<ConcurrencyLimiter>,
-    encode_limiter: Arc<ConcurrencyLimiter>,
+    assemble_limiter: Arc<PriorityConcurrencyLimiter>,
+    encode_limiter: Arc<PriorityConcurrencyLimiter>,
     metrics: Option<Arc<PipelineMetrics>>,
     config: PipelineConfig,
 ) where
@@ -317,6 +318,7 @@ async fn process_dds_request_with_control_plane<P, E, M, D, X>(
                                 encode_limiter,
                                 cancellation_token,
                                 Some(observer),
+                                is_prefetch,
                             )
                             .await
                         }

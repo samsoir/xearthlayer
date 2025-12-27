@@ -51,7 +51,7 @@ mod tests {
 
     #[test]
     fn test_noop_logger_default() {
-        let logger = NoOpLogger::default();
+        let logger = NoOpLogger;
         logger.info(format_args!("test"));
     }
 
