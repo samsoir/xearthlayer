@@ -68,28 +68,7 @@ use super::state::{
     AircraftState, DetailedPrefetchStats, GpsStatus, PrefetchMode, SharedPrefetchStatus,
 };
 use super::strategy::Prefetcher;
-use super::types::{PrefetchTile, PrefetchZone, TurnDirection, TurnState};
-
-/// Input mode for the prefetcher.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputMode {
-    /// UDP telemetry available - use precise ConeGenerator.
-    Telemetry,
-    /// FUSE inference active - use dynamic envelope with fuzzy margins.
-    FuseInference,
-    /// No heading data - fall back to simple radial.
-    RadialFallback,
-}
-
-impl std::fmt::Display for InputMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            InputMode::Telemetry => write!(f, "telemetry"),
-            InputMode::FuseInference => write!(f, "fuse-inference"),
-            InputMode::RadialFallback => write!(f, "radial-fallback"),
-        }
-    }
-}
+use super::types::{InputMode, PrefetchTile, PrefetchZone, TurnDirection, TurnState};
 
 /// Configuration for the heading-aware prefetcher.
 #[derive(Debug, Clone)]
@@ -887,13 +866,6 @@ mod tests {
         fn entry_count(&self) -> usize {
             self.tiles.lock().unwrap().len()
         }
-    }
-
-    #[test]
-    fn test_input_mode_display() {
-        assert_eq!(InputMode::Telemetry.to_string(), "telemetry");
-        assert_eq!(InputMode::FuseInference.to_string(), "fuse-inference");
-        assert_eq!(InputMode::RadialFallback.to_string(), "radial-fallback");
     }
 
     #[test]

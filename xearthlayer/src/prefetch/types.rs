@@ -1,7 +1,8 @@
 //! Types for the heading-aware prefetch system.
 //!
 //! This module defines types specific to heading-aware prefetching,
-//! including turn detection, priority-based tile selection, and prefetch zones.
+//! including turn detection, priority-based tile selection, prefetch zones,
+//! and input mode selection for graceful degradation.
 //!
 //! Types from other modules are re-exported for convenience:
 //! - [`TileCoord`] from `crate::coord` - tile coordinates
@@ -10,6 +11,41 @@
 // Re-export common types used across prefetch modules
 pub use super::state::AircraftState;
 pub use crate::coord::TileCoord;
+
+/// Input mode for the heading-aware prefetcher.
+///
+/// The prefetcher automatically selects the best mode based on data availability,
+/// degrading gracefully when higher-quality inputs become unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    /// UDP telemetry available - use precise ConeGenerator.
+    ///
+    /// This is the highest-quality mode, using X-Plane's UDP broadcast
+    /// for exact position, heading, and ground speed.
+    Telemetry,
+
+    /// FUSE inference active - use dynamic envelope with fuzzy margins.
+    ///
+    /// When telemetry is stale (>5s), falls back to inferring position
+    /// and heading from FUSE file access patterns.
+    FuseInference,
+
+    /// No heading data - fall back to simple radial.
+    ///
+    /// When no heading can be determined, uses a simple 7×7 grid
+    /// around the inferred or last-known position.
+    RadialFallback,
+}
+
+impl std::fmt::Display for InputMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InputMode::Telemetry => write!(f, "telemetry"),
+            InputMode::FuseInference => write!(f, "fuse-inference"),
+            InputMode::RadialFallback => write!(f, "radial-fallback"),
+        }
+    }
+}
 
 /// Turn state for heading-aware prefetching.
 ///
@@ -145,5 +181,19 @@ mod tests {
         assert!(
             PrefetchZone::LateralBuffer.base_priority() < PrefetchZone::RearBuffer.base_priority()
         );
+    }
+
+    #[test]
+    fn test_input_mode_display() {
+        assert_eq!(InputMode::Telemetry.to_string(), "telemetry");
+        assert_eq!(InputMode::FuseInference.to_string(), "fuse-inference");
+        assert_eq!(InputMode::RadialFallback.to_string(), "radial-fallback");
+    }
+
+    #[test]
+    fn test_input_mode_equality() {
+        assert_eq!(InputMode::Telemetry, InputMode::Telemetry);
+        assert_ne!(InputMode::Telemetry, InputMode::FuseInference);
+        assert_ne!(InputMode::FuseInference, InputMode::RadialFallback);
     }
 }

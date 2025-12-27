@@ -81,10 +81,10 @@ pub use cone::ConeGenerator;
 pub use config::{FuseInferenceConfig, HeadingAwarePrefetchConfig, ZoomLevelPrefetchConfig};
 pub use heading_aware::{
     HeadingAwarePrefetchStats, HeadingAwarePrefetchStatsSnapshot, HeadingAwarePrefetcher,
-    HeadingAwarePrefetcherConfig, InputMode,
+    HeadingAwarePrefetcherConfig,
 };
 pub use inference::{Direction, FuseRequestAnalyzer, LoadedEnvelope, TileRequestCallback};
-pub use types::{PrefetchTile, PrefetchZone, TurnDirection, TurnState};
+pub use types::{InputMode, PrefetchTile, PrefetchZone, TurnDirection, TurnState};
 
 // Builder for prefetcher strategy creation
 pub use builder::{PrefetchStrategy, PrefetcherBuilder};

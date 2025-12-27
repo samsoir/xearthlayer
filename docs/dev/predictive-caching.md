@@ -1,6 +1,6 @@
 # Predictive Tile Caching
 
-**Status**: Implemented
+**Status**: Implemented (v0.2.7+)
 
 ## Overview
 
@@ -23,6 +23,7 @@ Even with fast internet and NVMe storage, the latency is perceptible. The soluti
 3. **Resource efficiency**: Don't starve on-demand requests or waste bandwidth
 4. **Seamless integration**: Reuse existing pipeline infrastructure
 5. **Configurability**: Allow users to tune behavior for their setup
+6. **Graceful degradation**: Work even without telemetry using FUSE request analysis
 
 ## Architecture
 
@@ -42,20 +43,24 @@ Even with fast internet and NVMe storage, the latency is perceptible. The soluti
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                   Prefetcher (Strategy Pattern)                  │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │  RadialPrefetcher (Recommended)                         │    │
-│  │  - 7×7 tile grid around current position (49 tiles)     │    │
-│  │  - Check memory cache before submitting                 │    │
-│  │  - TTL tracking to avoid re-requesting failed tiles     │    │
-│  │  - 10-second timeout per request                        │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │  PrefetchScheduler (Legacy)                             │    │
-│  │  - Complex cone + radial prediction                     │    │
-│  │  - Can generate 21,000+ tile requests per cycle         │    │
-│  │  - Not recommended for production use                   │    │
-│  └─────────────────────────────────────────────────────────┘    │
+│           HeadingAwarePrefetcher (Recommended - "auto")          │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │  Graceful Degradation Chain:                                ││
+│  │                                                             ││
+│  │  ┌──────────┐ stale(>5s) ┌──────────────┐ low    ┌────────┐││
+│  │  │Telemetry │──────────→│FUSE Inference│──────→ │ Radial │││
+│  │  │ (precise)│           │(fuzzy margins)│ conf   │Fallback│││
+│  │  └──────────┘           └──────────────┘        └────────┘││
+│  │    ~50-80                  ~100-150               49 tiles ││
+│  │  tiles/cycle              tiles/cycle            (7×7 grid)││
+│  └─────────────────────────────────────────────────────────────┘│
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │  SceneryIndex (Optional Enhancement)                        ││
+│  │  - Reads .ter files for exact tile coordinates              ││
+│  │  - Knows correct zoom level per tile (ZL12, ZL14)           ││
+│  │  - Deprioritizes sea tiles (~33% of tiles)                  ││
+│  └─────────────────────────────────────────────────────────────┘│
 └──────────────────────────┬──────────────────────────────────────┘
                            │
                            ▼
@@ -83,12 +88,16 @@ pub trait Prefetcher: Send {
 
     /// Get a description of this prefetcher strategy.
     fn description(&self) -> &'static str;
+
+    /// Get startup info string for logging.
+    fn startup_info(&self) -> String;
 }
 ```
 
 **Available Strategies**:
-- `RadialPrefetcher` (name: "radial") - Simple, cache-aware, recommended
-- `PrefetchScheduler` (name: "flight-path") - Complex prediction, legacy
+- `HeadingAwarePrefetcher` (name: "heading-aware") - Direction-aware with graceful degradation (recommended)
+- `RadialPrefetcher` (name: "radial") - Simple grid around position
+- Strategy "auto" uses HeadingAwarePrefetcher with automatic fallback
 
 ### Components
 
@@ -120,55 +129,140 @@ pub struct AircraftState {
 }
 ```
 
-#### 2. Radial Prefetcher (`xearthlayer/src/prefetch/radial.rs`) - Recommended
+#### 2. HeadingAwarePrefetcher (`xearthlayer/src/prefetch/heading_aware.rs`) - Recommended
 
-Simple, cache-aware prefetching that maintains a buffer of tiles around the current position.
+Unified prefetcher with automatic mode selection based on available input:
 
-**Algorithm**:
-1. Convert aircraft position to tile coordinates
-2. Calculate all tiles within configured radius (default: 3 tiles = 7×7 grid = 49 tiles)
-3. Check memory cache for each tile (shared with pipeline)
-4. Skip tiles that were recently attempted (TTL tracking, default: 60 seconds)
-5. Submit prefetch requests for missing tiles with 10-second timeout
+**Input Modes**:
+1. **Telemetry Mode**: Uses precise cone generator when UDP telemetry is available
+2. **FUSE Inference Mode**: Uses dynamic envelope when telemetry is stale (>5s)
+3. **Radial Fallback Mode**: Simple radius when no heading data is available
 
-**Key Features**:
-- **Shared Memory Cache**: Uses the same `MemoryCacheAdapter` instance as the pipeline, ensuring accurate cache hit detection
-- **TTL Tracking**: Tiles that fail are not re-requested for 60 seconds, preventing provider hammering
-- **Request Timeout**: Each prefetch request has a 10-second timeout via `CancellationToken`
-- **Rate Limiting**: Minimum 2 seconds between prefetch cycles
-- **Movement Detection**: Only runs when aircraft moves to a new tile
+**Graceful Degradation**:
+```
+┌─────────────────┐   stale (>5s)   ┌──────────────────┐   low confidence   ┌────────────────┐
+│   Telemetry     │ ───────────────▶│  FUSE Inference  │ ──────────────────▶│ Radial Fallback│
+│  (precise)      │                 │  (fuzzy margins) │                    │   (no heading) │
+└─────────────────┘                 └──────────────────┘                    └────────────────┘
+     ~50-80                              ~100-150                               49 tiles
+   tiles/cycle                         tiles/cycle                             (7×7 grid)
+```
 
-**Configuration** (`RadialPrefetchConfig`):
+**Telemetry Mode Features**:
+- **ConeGenerator**: Projects a cone ahead of aircraft based on heading
+- **BufferGenerator**: Covers lateral and rear areas around aircraft
+- **Turn Detection**: Widens cone during turns for better coverage
+- **Multi-Zoom**: Generates both ZL14 (near) and ZL12 (far) tiles
+
+**Configuration** (`HeadingAwarePrefetcherConfig`):
 ```rust
-pub struct RadialPrefetchConfig {
-    pub radius: u8,           // Tile radius (default: 3 = 49 tiles)
-    pub zoom: u8,             // Zoom level (default: 14)
-    pub attempt_ttl: Duration, // Don't retry failed tiles for this long (default: 60s)
+pub struct HeadingAwarePrefetcherConfig {
+    pub heading: HeadingAwarePrefetchConfig,  // Cone/buffer settings
+    pub fuse_inference: FuseInferenceConfig,  // FUSE fallback settings
+    pub telemetry_stale_threshold: Duration,  // When to switch to FUSE (default: 5s)
+    pub fuse_confidence_threshold: f32,       // Min confidence for FUSE mode (default: 0.3)
+    pub radial_fallback_radius: u8,           // Radial grid size (default: 3 = 7×7)
 }
 ```
 
-**Performance**:
-- 49 tiles per cycle (vs 21,000+ with legacy scheduler)
-- Typically 7-13 new requests per cycle (rest are cache hits or TTL-skipped)
-- ~40-80% cache hit rate during continuous flight
+#### 3. ConeGenerator (`xearthlayer/src/prefetch/cone.rs`)
 
-#### 3. Legacy Scheduler (`xearthlayer/src/prefetch/scheduler.rs`)
+Generates tiles in a cone-shaped region ahead of the aircraft.
 
-Complex flight-path prediction with cone and radial calculations. Not recommended due to:
-- Generates 21,000+ tile predictions per cycle
-- Can overwhelm tile providers (causes throttling)
-- Complex coordinate math with edge cases
+**Algorithm**:
+1. Calculate aircraft position in tile coordinates
+2. Project a cone with configurable half-angle (default: 45°)
+3. Generate tiles within inner-to-outer radius range (default: 85-95nm)
+4. Assign priority based on distance and zone (center higher than edges)
+5. Support turn widening: expand cone during detected turns
 
-Kept for reference and potential future optimization.
+**Multi-Zoom Support**:
+```rust
+pub fn generate_cone_tiles_for_zoom(
+    &self,
+    position: (f64, f64),
+    heading: f32,
+    turn_state: &TurnState,
+    zoom: u8,
+    inner_radius_nm: f32,
+    outer_radius_nm: f32,
+    priority_offset: u32,
+) -> Vec<PrefetchTile>
+```
 
-#### 4. Pre-fetch Condition (`xearthlayer/src/prefetch/condition.rs`)
+**Prefetch Zones**:
+```rust
+pub enum PrefetchZone {
+    ForwardCenter,  // Highest priority - directly ahead
+    ForwardEdge,    // Medium priority - cone edges
+    Lateral,        // Lower priority - sides
+    Rear,           // Lowest priority - behind aircraft
+}
+```
 
-Determines when prefetching should be active using dependency-injected condition logic.
+#### 4. BufferGenerator (`xearthlayer/src/prefetch/buffer.rs`)
 
-**Implementations**:
-- `MinimumSpeedCondition` - Activates prefetch above a threshold speed (default 30kt)
-- `AlwaysActiveCondition` - Always allows prefetch (testing)
-- `NeverActiveCondition` - Never allows prefetch (testing)
+Generates tiles in lateral and rear buffer zones for coverage during maneuvers.
+
+**Coverage Areas**:
+- Side buffers: 2-tile strips on each side
+- Rear buffer: 2-tile strip behind aircraft
+- Priorities lower than forward cone
+
+#### 5. FUSE Request Analyzer (`xearthlayer/src/prefetch/inference.rs`)
+
+Infers aircraft position and heading from FUSE file access patterns when telemetry is unavailable.
+
+**Algorithm**:
+1. Monitor DDS file requests from X-Plane
+2. Track tile request patterns over time
+3. Infer position as centroid of recent requests
+4. Infer heading from request direction vector
+5. Calculate confidence based on pattern consistency
+
+**Confidence Calculation**:
+- High confidence: Consistent linear request pattern
+- Medium confidence: Clustered but directional
+- Low confidence: Scattered or insufficient data
+
+#### 6. SceneryIndex (`xearthlayer/src/prefetch/scenery_index.rs`)
+
+Spatial index of tiles from installed scenery packages. Provides exact tile coordinates from .ter files instead of calculating them.
+
+**Benefits**:
+- **Exact zoom levels**: Reads actual zoom from DDS filenames in .ter files
+- **Only real tiles**: Only prefetches tiles that exist in the package
+- **Sea tile detection**: Deprioritizes sea tiles (~33% of typical package)
+- **Fast lookup**: Grid-based spatial index for O(1) queries
+
+**Building the Index**:
+```rust
+let index = SceneryIndex::with_defaults();
+for pkg in &ortho_packages {
+    match index.build_from_package(&pkg.path) {
+        Ok(count) => println!("Indexed {} tiles from {}", count, pkg.region()),
+        Err(e) => warn!("Failed to index {}: {}", pkg.region(), e),
+    }
+}
+```
+
+**Querying Tiles**:
+```rust
+let tiles = index.tiles_near(lat, lon, radius_nm);
+// Returns Vec<SceneryTile> with exact coordinates and zoom levels
+```
+
+**Index Structure**:
+```rust
+pub struct SceneryTile {
+    pub row: u32,        // Tile row at chunk_zoom
+    pub col: u32,        // Tile column at chunk_zoom
+    pub chunk_zoom: u8,  // Zoom level from filename (16 or 18)
+    pub lat: f32,        // Center latitude from LOAD_CENTER
+    pub lon: f32,        // Center longitude from LOAD_CENTER
+    pub is_sea: bool,    // Detected from filepath (z_sea_water_*)
+}
+```
 
 ### Timeout Mechanism
 
@@ -194,13 +288,44 @@ The prefetcher shares the same `MemoryCacheAdapter` instance with the pipeline:
 ```rust
 // In XEarthLayerService
 if let Some(memory_cache) = service.memory_cache_adapter() {
-    let prefetcher: Box<dyn Prefetcher> = Box::new(
-        RadialPrefetcher::new(memory_cache, dds_handler, config)
-    );
+    let prefetcher = PrefetcherBuilder::new()
+        .memory_cache(memory_cache)
+        .dds_handler(service.create_prefetch_handler())
+        // ... other config
+        .build();
 }
 ```
 
 This ensures prefetch cache checks are accurate - if a tile is in the pipeline's memory cache, the prefetcher will see it.
+
+### Multi-Zoom Prefetching
+
+XEarthLayer supports prefetching at multiple zoom levels simultaneously:
+
+**ZL14 (Primary)**: High-resolution tiles for nearby scenery
+- Inner radius: 85nm (just inside X-Plane's ~90nm boundary)
+- Outer radius: 95nm (10nm prefetch depth)
+- Max tiles per cycle: 50
+
+**ZL12 (Secondary)**: Low-resolution tiles for distant scenery
+- Inner radius: 88nm
+- Outer radius: 100nm (extends beyond 90nm boundary)
+- Max tiles per cycle: 25
+- Lower priority than ZL14
+
+**Configuration**:
+```ini
+[prefetch]
+# Primary (ZL14) zone
+inner_radius_nm = 85
+outer_radius_nm = 95
+max_tiles_per_cycle = 50
+
+# Secondary (ZL12) zone
+enable_zl12 = true
+zl12_inner_radius_nm = 88
+zl12_outer_radius_nm = 100
+```
 
 ## Configuration
 
@@ -208,42 +333,67 @@ Configuration keys in `[prefetch]` section:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `prefetch.enabled` | bool | `true` | Enable/disable predictive caching |
-| `prefetch.udp_port` | u16 | `49002` | X-Plane UDP broadcast port |
-| `prefetch.cone_angle` | f32 | `45.0` | Half-angle of prediction cone (degrees) - legacy |
-| `prefetch.cone_distance_nm` | f32 | `10.0` | Look-ahead distance in nautical miles - legacy |
-| `prefetch.radial_radius_nm` | f32 | `5.0` | Radial buffer in nautical miles - legacy |
+| `enabled` | bool | `true` | Enable/disable predictive caching |
+| `strategy` | string | `auto` | Strategy: `auto`, `heading-aware`, or `radial` |
+| `udp_port` | u16 | `49002` | X-Plane UDP broadcast port |
+| `cone_angle` | f32 | `45.0` | Half-angle of prediction cone (degrees) |
+| `inner_radius_nm` | f32 | `85.0` | Inner edge of ZL14 prefetch zone (nm) |
+| `outer_radius_nm` | f32 | `95.0` | Outer edge of ZL14 prefetch zone (nm) |
+| `max_tiles_per_cycle` | usize | `50` | Max tiles to submit per cycle |
+| `cycle_interval_ms` | u64 | `2000` | Interval between prefetch cycles (ms) |
+| `radial_radius` | u8 | `3` | Radial fallback radius (tiles) |
+| `enable_zl12` | bool | `true` | Enable ZL12 prefetching for distant terrain |
+| `zl12_inner_radius_nm` | f32 | `88.0` | Inner edge of ZL12 prefetch zone (nm) |
+| `zl12_outer_radius_nm` | f32 | `100.0` | Outer edge of ZL12 prefetch zone (nm) |
 
 Example `config.ini`:
 ```ini
 [prefetch]
 enabled = true
+strategy = auto
 udp_port = 49002
+
+# Tune prefetch zone (default is optimized for most setups)
+cone_angle = 45
+inner_radius_nm = 85
+outer_radius_nm = 95
+max_tiles_per_cycle = 50
+cycle_interval_ms = 2000
+
+# ZL12 for distant terrain (reduces stutters at 90nm boundary)
+enable_zl12 = true
+zl12_inner_radius_nm = 88
+zl12_outer_radius_nm = 100
 ```
 
 ## X-Plane Setup
 
 Users must enable UDP data output in X-Plane:
 
+**Option 1: ForeFlight Protocol (Recommended)**
+1. Settings → Network
+2. Enable "Send to ForeFlight"
+3. XEarthLayer receives position/heading on UDP port 49002
+
+**Option 2: DATA Protocol**
 1. Settings → Data Output
 2. Enable "Network via UDP"
 3. Set destination IP to localhost (127.0.0.1) or machine running XEarthLayer
-4. Set port (default 49002 for ForeFlight protocol)
+4. Set port to 49003
 5. Enable data indices: 3 (speeds), 17 (orientation), 20 (position)
-
-Alternatively, enable ForeFlight broadcast which sends XGPS/XATT packets.
 
 ## CLI Usage
 
 The prefetcher is automatically started with `xearthlayer run`:
 
 ```
-Prefetch system started (radial, 3-tile radius, UDP port 49002)
+Scenery index: 42548 tiles (28032 land, 14516 sea)
+Prefetch system started (heading-aware, 45° cone, 85-95nm zone, zoom 14, UDP port 49002)
 ```
 
 Dashboard shows real-time prefetch status:
 ```
-Prefetch: 7 submitted, 26 in-flight skipped, 49 predicted (cycle #701)
+Prefetch: Telemetry | 23/cycle | Cache: 156↑ TTL: 8⊘ | ZL14 ZL12
 ```
 
 Disable with `--no-prefetch` flag:
@@ -253,17 +403,46 @@ xearthlayer run --no-prefetch
 
 ## Design Decisions
 
-### DD-001: Radial vs Flight-Path Prediction
+### DD-001: HeadingAware vs Radial Prefetching
 
-**Decision**: Use simple radial prefetching instead of complex flight-path prediction.
+**Decision**: Use HeadingAwarePrefetcher with graceful degradation as the default strategy.
 
 **Rationale**:
-- Flight-path prediction generated 21,000+ tiles per cycle, overwhelming providers
-- Radial approach generates only 49 tiles with high cache hit rate
-- Works for all flight profiles (cruise, pattern work, orbits)
-- Simpler code with fewer edge cases
+- Telemetry mode provides precise, direction-aware prefetching
+- FUSE inference provides fallback when telemetry is unavailable
+- Radial fallback ensures basic functionality in all cases
+- Single unified implementation reduces code complexity
 
-### DD-002: Shared Memory Cache
+### DD-002: Graceful Degradation Chain
+
+**Decision**: Automatically degrade from Telemetry → FUSE Inference → Radial based on data availability.
+
+**Rationale**:
+- Users don't need to manually configure for their setup
+- System adapts to changing conditions (e.g., UDP packet loss)
+- Each mode provides appropriate coverage for its confidence level
+
+### DD-003: Multi-Zoom Prefetching
+
+**Decision**: Prefetch both ZL14 (near) and ZL12 (far) tiles simultaneously.
+
+**Rationale**:
+- X-Plane uses different zoom levels at different distances
+- ZL12 tiles cover distant terrain (beyond 90nm boundary)
+- Eliminates stutters when transitioning between zoom levels
+- ZL14 prioritized higher than ZL12 (closer = more important)
+
+### DD-004: Scenery-Aware Prefetch
+
+**Decision**: Build index from .ter files to know exact tile coordinates.
+
+**Rationale**:
+- Coordinate calculation can produce tiles that don't exist
+- Zoom levels vary by provider and region
+- Sea tiles can be deprioritized (33% bandwidth savings)
+- Index build is fast (~3s for 42k tiles)
+
+### DD-005: Shared Memory Cache
 
 **Decision**: Prefetcher uses the same memory cache adapter instance as the pipeline.
 
@@ -272,7 +451,7 @@ xearthlayer run --no-prefetch
 - No duplicate cache instances consuming memory
 - Consistent behavior between prefetch and on-demand requests
 
-### DD-003: Per-Request Timeout
+### DD-006: Per-Request Timeout
 
 **Decision**: Each prefetch request has a 10-second timeout via CancellationToken.
 
@@ -281,7 +460,7 @@ xearthlayer run --no-prefetch
 - Matches FUSE on-demand request timeout
 - Failed requests are TTL-tracked to prevent immediate retry
 
-### DD-004: TTL Tracking
+### DD-007: TTL Tracking
 
 **Decision**: Recently-attempted tiles are skipped for 60 seconds.
 
@@ -290,7 +469,7 @@ xearthlayer run --no-prefetch
 - Reduces wasted bandwidth
 - Allows transient failures to recover
 
-### DD-005: Strategy Pattern
+### DD-008: Strategy Pattern
 
 **Decision**: Use `Prefetcher` trait for strategy abstraction.
 
@@ -303,35 +482,67 @@ xearthlayer run --no-prefetch
 ## Metrics
 
 TUI dashboard displays:
-- Tiles predicted (total in radius)
-- Tiles submitted (new requests this cycle)
-- In-flight skipped (TTL or already processing)
-- Cycle number
-- Aircraft position
+- Current mode (Telemetry/FUSE/Radial)
+- Tiles submitted per cycle
+- Cache hits (tiles already in memory)
+- TTL skipped (recently attempted)
+- Active zoom levels (ZL12, ZL14)
 
 Log entries show detailed cycle information:
 ```
-INFO Prefetch cycle complete lat="55.6292" lon="12.6734" tile_row=5131 tile_col=8768
-     total=49 cache_hits=38 submitted=7 ttl_skipped=4
+INFO Prefetch cycle complete mode="telemetry" generated=47 submitted=12 cache_hits=28 ttl_skipped=7
 ```
+
+## Module Structure
+
+```
+xearthlayer/src/prefetch/
+├── mod.rs              # Module exports
+├── strategy.rs         # Prefetcher trait
+├── heading_aware.rs    # HeadingAwarePrefetcher (recommended)
+├── radial.rs           # RadialPrefetcher (simple fallback)
+├── cone.rs             # ConeGenerator for forward prefetch
+├── buffer.rs           # BufferGenerator for lateral/rear
+├── inference.rs        # FUSE request analyzer
+├── scenery_index.rs    # SceneryIndex for exact tile lookup
+├── listener.rs         # UDP telemetry listener
+├── config.rs           # Configuration types
+├── builder.rs          # PrefetcherBuilder
+├── state.rs            # Shared status for dashboard
+├── types.rs            # Common types (PrefetchTile, zones)
+├── coordinates.rs      # Coordinate conversion utilities
+├── condition.rs        # Prefetch conditions (speed thresholds)
+├── predictor.rs        # Legacy predictor (deprecated)
+├── scheduler.rs        # Legacy scheduler (deprecated)
+└── error.rs            # Error types
+```
+
+## Performance Characteristics
+
+| Metric | Telemetry Mode | FUSE Inference | Radial Fallback |
+|--------|---------------|----------------|-----------------|
+| Tiles/cycle | 50-80 | 100-150 | 49 |
+| Accuracy | High | Medium | Low |
+| Coverage | Direction-aware | Fuzzy envelope | Uniform grid |
+| Turn handling | Cone widening | Envelope expansion | N/A |
 
 ## Future Enhancements
 
-### FE-001: Heading-Aware Prioritization
+### FE-001: Adaptive Radius
 
-Prioritize tiles in the direction of flight within the radial grid.
+Adjust prefetch radius based on ground speed - larger radius at higher speeds.
 
-### FE-002: Adaptive Radius
+### FE-002: Flight Plan Integration
 
-Adjust radius based on ground speed - larger radius at higher speeds.
+Parse X-Plane flight plan to pre-fetch entire route before takeoff.
 
 ### FE-003: Cache Visualization
 
 Map view showing cached tiles, prefetch requests, and aircraft position.
 
-### FE-004: Flight Plan Integration
+### FE-004: Provider-Aware Throttling
 
-Parse X-Plane flight plan to pre-fetch entire route before takeoff.
+Reduce prefetch rate when provider shows signs of throttling.
 
 ---
 
@@ -340,5 +551,7 @@ Parse X-Plane flight plan to pre-fetch entire route before takeoff.
 | Date | Author | Changes |
 |------|--------|---------|
 | 2025-12-21 | Claude | Initial design document |
-| 2025-12-22 | Claude | Implementation updates: ForeFlight protocol support, PrefetchCondition trait, MinimumSpeedCondition (30kt default), removed redundant cache checking (DdsHandler handles it), heading normalization (0-360) |
+| 2025-12-22 | Claude | Implementation updates: ForeFlight protocol support, PrefetchCondition trait, MinimumSpeedCondition (30kt default) |
 | 2025-12-23 | Claude | Major refactor: RadialPrefetcher as recommended strategy (49 tiles vs 21,000+), Prefetcher trait for strategy pattern, shared memory cache adapter, 10-second request timeout, TTL tracking for failed tiles |
+| 2025-12-25 | Claude | HeadingAwarePrefetcher: Cone and buffer generators, turn detection, multi-zoom (ZL12+ZL14), FUSE inference fallback, graceful degradation chain |
+| 2025-12-26 | Claude | SceneryIndex: Parse .ter files for exact tile coordinates, sea tile detection, grid-based spatial index |
