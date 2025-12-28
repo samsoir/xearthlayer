@@ -30,8 +30,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
+use tokio::sync::mpsc;
 use tracing::{info, trace};
 
 use crate::coord::TileCoord;
@@ -287,6 +288,109 @@ impl SceneryIndex {
         *self.tile_count.write().unwrap() = 0;
         *self.sea_tile_count.write().unwrap() = 0;
     }
+
+    /// Build the index from multiple packages with progress reporting.
+    ///
+    /// This is an async method that builds the index from a list of package paths
+    /// and sends progress updates through the provided channel. The actual file I/O
+    /// is performed using `spawn_blocking` to avoid blocking the async runtime.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - Arc-wrapped SceneryIndex to build into
+    /// * `packages` - List of (name, path) tuples for packages to scan
+    /// * `progress_tx` - Channel to send progress updates
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let index = Arc::new(SceneryIndex::with_defaults());
+    /// let (tx, mut rx) = mpsc::channel(32);
+    /// let packages = vec![("eu_spain".to_string(), PathBuf::from("/path/to/package"))];
+    ///
+    /// tokio::spawn(async move {
+    ///     SceneryIndex::build_from_packages_with_progress(index, packages, tx).await;
+    /// });
+    ///
+    /// while let Some(progress) = rx.recv().await {
+    ///     match progress {
+    ///         IndexingProgress::PackageStarted { name, .. } => println!("Scanning {}", name),
+    ///         IndexingProgress::Complete { total, .. } => println!("Done: {} tiles", total),
+    ///         _ => {}
+    ///     }
+    /// }
+    /// ```
+    pub async fn build_from_packages_with_progress(
+        index: Arc<Self>,
+        packages: Vec<(String, PathBuf)>,
+        progress_tx: mpsc::Sender<IndexingProgress>,
+    ) {
+        let total_packages = packages.len();
+
+        for (i, (name, path)) in packages.into_iter().enumerate() {
+            // Send PackageStarted notification
+            let _ = progress_tx
+                .send(IndexingProgress::PackageStarted {
+                    name: name.clone(),
+                    index: i,
+                    total: total_packages,
+                })
+                .await;
+
+            // Clone what we need for the blocking task
+            let index_clone = Arc::clone(&index);
+            let path_clone = path.clone();
+            let name_clone = name.clone();
+
+            // Run the blocking file I/O in a separate thread pool
+            let result = tokio::task::spawn_blocking(move || {
+                index_clone.build_from_package(&path_clone)
+            })
+            .await;
+
+            // Get the tile count from the result
+            let tiles = match result {
+                Ok(Ok(count)) => count,
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        package = %name_clone,
+                        error = %e,
+                        "Failed to index package"
+                    );
+                    0
+                }
+                Err(e) => {
+                    tracing::error!(
+                        package = %name_clone,
+                        error = %e,
+                        "Blocking task panicked"
+                    );
+                    0
+                }
+            };
+
+            // Send PackageCompleted notification
+            let _ = progress_tx
+                .send(IndexingProgress::PackageCompleted { name, tiles })
+                .await;
+        }
+
+        // Send Complete notification
+        let total = index.tile_count();
+        let land = index.land_tile_count();
+        let sea = index.sea_tile_count();
+
+        let _ = progress_tx
+            .send(IndexingProgress::Complete { total, land, sea })
+            .await;
+
+        info!(
+            total = total,
+            land = land,
+            sea = sea,
+            "Scenery index build complete"
+        );
+    }
 }
 
 impl Default for SceneryIndex {
@@ -418,6 +522,38 @@ pub enum SceneryIndexError {
     IoError(String),
     /// Failed to parse .ter file
     ParseError(String),
+}
+
+/// Progress updates during scenery index building.
+///
+/// Sent via a channel to notify the UI of indexing progress.
+#[derive(Debug, Clone)]
+pub enum IndexingProgress {
+    /// Started scanning a package.
+    PackageStarted {
+        /// Name of the package being scanned.
+        name: String,
+        /// Index of the package (0-based).
+        index: usize,
+        /// Total number of packages to scan.
+        total: usize,
+    },
+    /// Finished scanning a package.
+    PackageCompleted {
+        /// Name of the completed package.
+        name: String,
+        /// Number of tiles indexed from this package.
+        tiles: usize,
+    },
+    /// All packages have been indexed.
+    Complete {
+        /// Total tiles indexed.
+        total: usize,
+        /// Number of land tiles.
+        land: usize,
+        /// Number of sea tiles.
+        sea: usize,
+    },
 }
 
 impl std::fmt::Display for SceneryIndexError {

@@ -36,8 +36,6 @@ mod keys;
 mod size;
 mod texture;
 mod upgrade;
-mod xplane;
-
 pub use download::DownloadConfig;
 pub use file::{
     config_directory,
@@ -101,7 +99,9 @@ pub use texture::TextureConfig;
 pub use upgrade::{
     analyze_config, upgrade_config, ConfigUpgradeAnalysis, UpgradeResult, DEPRECATED_KEYS,
 };
-pub use xplane::{
+// Re-export X-Plane utilities for backwards compatibility
+// Prefer using xearthlayer::xplane module directly for new code
+pub use crate::xplane::{
     derive_mountpoint, detect_custom_scenery, detect_scenery_dir, detect_xplane_install,
     detect_xplane_installs, SceneryDetectionResult, XPlanePathError,
 };

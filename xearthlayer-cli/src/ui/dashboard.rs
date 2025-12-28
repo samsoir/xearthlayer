@@ -37,6 +37,156 @@ use super::widgets::{
 pub enum DashboardEvent {
     /// User requested quit (Ctrl+C or 'q').
     Quit,
+    /// User requested cancel of current operation (e.g., pre-warm).
+    Cancel,
+}
+
+/// State of the dashboard.
+///
+/// The dashboard transitions through states during startup:
+/// 1. Loading - Building the SceneryIndex (shows progress)
+/// 2. Prewarming - Pre-loading tiles around an airport (if --airport specified)
+/// 3. Running - Normal operation with full dashboard
+#[derive(Debug, Clone, Default)]
+pub enum DashboardState {
+    /// Building the SceneryIndex - shows loading progress.
+    Loading(LoadingProgress),
+    /// Pre-warming tiles around an airport.
+    Prewarming(PrewarmProgress),
+    /// Normal operation - full dashboard display.
+    #[default]
+    Running,
+}
+
+/// Progress information during SceneryIndex loading.
+#[derive(Debug, Clone)]
+pub struct LoadingProgress {
+    /// Name of the package currently being scanned.
+    pub current_package: String,
+    /// Number of packages scanned so far.
+    pub packages_scanned: usize,
+    /// Total number of packages to scan.
+    pub total_packages: usize,
+    /// Total tiles indexed so far.
+    pub tiles_indexed: usize,
+    /// When loading started.
+    pub start_time: Instant,
+}
+
+impl Default for LoadingProgress {
+    fn default() -> Self {
+        Self {
+            current_package: String::new(),
+            packages_scanned: 0,
+            total_packages: 0,
+            tiles_indexed: 0,
+            start_time: Instant::now(),
+        }
+    }
+}
+
+impl LoadingProgress {
+    /// Create a new loading progress tracker.
+    pub fn new(total_packages: usize) -> Self {
+        Self {
+            current_package: String::new(),
+            packages_scanned: 0,
+            total_packages,
+            tiles_indexed: 0,
+            start_time: Instant::now(),
+        }
+    }
+
+    /// Update with a new package being scanned.
+    pub fn scanning(&mut self, package_name: &str) {
+        self.current_package = package_name.to_string();
+    }
+
+    /// Mark a package as completed.
+    pub fn package_completed(&mut self, tiles_added: usize) {
+        self.packages_scanned += 1;
+        self.tiles_indexed += tiles_added;
+    }
+
+    /// Get the elapsed time.
+    pub fn elapsed(&self) -> Duration {
+        self.start_time.elapsed()
+    }
+
+    /// Get the completion percentage (0.0 to 1.0).
+    pub fn progress_fraction(&self) -> f64 {
+        if self.total_packages == 0 {
+            0.0
+        } else {
+            self.packages_scanned as f64 / self.total_packages as f64
+        }
+    }
+}
+
+/// Progress information during cache pre-warming.
+#[derive(Debug, Clone)]
+pub struct PrewarmProgress {
+    /// ICAO code of the airport.
+    pub icao: String,
+    /// Name of the airport.
+    pub airport_name: String,
+    /// Number of tiles loaded so far.
+    pub tiles_loaded: usize,
+    /// Total tiles to load.
+    pub total_tiles: usize,
+    /// Number of cache hits (tiles already cached).
+    pub cache_hits: usize,
+    /// When prewarming started.
+    pub start_time: Instant,
+}
+
+impl Default for PrewarmProgress {
+    fn default() -> Self {
+        Self {
+            icao: String::new(),
+            airport_name: String::new(),
+            tiles_loaded: 0,
+            total_tiles: 0,
+            cache_hits: 0,
+            start_time: Instant::now(),
+        }
+    }
+}
+
+impl PrewarmProgress {
+    /// Create a new prewarm progress tracker.
+    pub fn new(icao: &str, airport_name: &str, total_tiles: usize) -> Self {
+        Self {
+            icao: icao.to_string(),
+            airport_name: airport_name.to_string(),
+            tiles_loaded: 0,
+            total_tiles,
+            cache_hits: 0,
+            start_time: Instant::now(),
+        }
+    }
+
+    /// Update progress with a tile loaded.
+    pub fn tile_loaded(&mut self, was_cache_hit: bool) {
+        self.tiles_loaded += 1;
+        if was_cache_hit {
+            self.cache_hits += 1;
+        }
+    }
+
+    /// Get the elapsed time.
+    pub fn elapsed(&self) -> Duration {
+        self.start_time.elapsed()
+    }
+
+    /// Get the completion percentage (0.0 to 1.0).
+    pub fn progress_fraction(&self) -> f64 {
+        if self.total_tiles == 0 {
+            0.0
+        } else {
+            self.tiles_loaded as f64 / self.total_tiles as f64
+        }
+    }
 }
 
 /// Dashboard configuration.
@@ -75,6 +225,9 @@ impl JobRates {
 /// Timeout for quit confirmation (auto-cancels after this duration).
 const QUIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Spinner animation frames.
+const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
 /// The main dashboard UI.
 pub struct Dashboard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -84,6 +237,10 @@ pub struct Dashboard {
     shutdown: Arc<AtomicBool>,
     start_time: Instant,
     last_draw: Instant,
+    /// Current state of the dashboard (Loading, Prewarming, or Running).
+    state: DashboardState,
+    /// Spinner frame index for loading/prewarming animations.
+    spinner_frame: usize,
     /// Optional prefetch status for display.
     prefetch_status: Option<Arc<SharedPrefetchStatus>>,
     /// Optional control plane health for display.
@@ -97,8 +254,17 @@ pub struct Dashboard {
 }
 
 impl Dashboard {
-    /// Create a new dashboard.
+    /// Create a new dashboard in the Running state.
     pub fn new(config: DashboardConfig, shutdown: Arc<AtomicBool>) -> io::Result<Self> {
+        Self::with_state(config, shutdown, DashboardState::Running)
+    }
+
+    /// Create a new dashboard with a specific initial state.
+    pub fn with_state(
+        config: DashboardConfig,
+        shutdown: Arc<AtomicBool>,
+        state: DashboardState,
+    ) -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
@@ -114,6 +280,8 @@ impl Dashboard {
             shutdown,
             start_time: now,
             last_draw: now,
+            state,
+            spinner_frame: 0,
             prefetch_status: None,
             control_plane_health: None,
             max_concurrent_jobs: 0,
@@ -137,6 +305,47 @@ impl Dashboard {
         self.control_plane_health = Some(health);
         self.max_concurrent_jobs = max_concurrent_jobs;
         self
+    }
+
+    /// Get the current state.
+    pub fn state(&self) -> &DashboardState {
+        &self.state
+    }
+
+    /// Set the dashboard state.
+    pub fn set_state(&mut self, state: DashboardState) {
+        self.state = state;
+    }
+
+    /// Transition to the Running state.
+    pub fn transition_to_running(&mut self) {
+        self.state = DashboardState::Running;
+        self.start_time = Instant::now(); // Reset uptime for running phase
+    }
+
+    /// Update loading progress.
+    pub fn update_loading_progress(&mut self, progress: LoadingProgress) {
+        self.state = DashboardState::Loading(progress);
+    }
+
+    /// Update prewarm progress.
+    pub fn update_prewarm_progress(&mut self, progress: PrewarmProgress) {
+        self.state = DashboardState::Prewarming(progress);
+    }
+
+    /// Check if in Loading state.
+    pub fn is_loading(&self) -> bool {
+        matches!(self.state, DashboardState::Loading(_))
+    }
+
+    /// Check if in Prewarming state.
+    pub fn is_prewarming(&self) -> bool {
+        matches!(self.state, DashboardState::Prewarming(_))
+    }
+
+    /// Check if in Running state.
+    pub fn is_running(&self) -> bool {
+        matches!(self.state, DashboardState::Running)
     }
 
     /// Restore terminal to normal state.
@@ -283,6 +492,12 @@ impl Dashboard {
                             KeyCode::Esc => {
                                 // Esc also triggers confirmation
                                 self.quit_confirmation = Some(Instant::now());
+                            }
+                            KeyCode::Char('c') | KeyCode::Char('C') => {
+                                // Cancel current operation (e.g., pre-warm)
+                                if self.is_prewarming() {
+                                    return Ok(Some(DashboardEvent::Cancel));
+                                }
                             }
                             _ => {}
                         }
@@ -666,6 +881,238 @@ impl Dashboard {
         .alignment(ratatui::layout::Alignment::Right);
 
         frame.render_widget(uptime_text, area);
+    }
+
+    /// Draw the loading state UI.
+    pub fn draw_loading(&mut self) -> io::Result<()> {
+        // Advance spinner
+        self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+        let spinner = SPINNER_FRAMES[self.spinner_frame];
+
+        let state = self.state.clone();
+        if let DashboardState::Loading(ref progress) = state {
+            self.terminal.draw(|frame| {
+                Self::render_loading_ui(frame, progress, spinner);
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Draw the prewarming state UI.
+    pub fn draw_prewarming(&mut self) -> io::Result<()> {
+        // Advance spinner
+        self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+        let spinner = SPINNER_FRAMES[self.spinner_frame];
+
+        let state = self.state.clone();
+        if let DashboardState::Prewarming(ref progress) = state {
+            self.terminal.draw(|frame| {
+                Self::render_prewarming_ui(frame, progress, spinner);
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Render the loading UI.
+    fn render_loading_ui(frame: &mut Frame, progress: &LoadingProgress, spinner: char) {
+        let size = frame.area();
+
+        // Calculate centered box dimensions
+        let box_width = 60u16.min(size.width.saturating_sub(4));
+        let box_height = 11u16;
+        let x = (size.width.saturating_sub(box_width)) / 2;
+        let y = (size.height.saturating_sub(box_height)) / 2;
+
+        let area = Rect {
+            x,
+            y,
+            width: box_width,
+            height: box_height,
+        };
+
+        // Main container block
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(Span::styled(
+                format!(" X-Plane Earth Layer {} ", xearthlayer::VERSION),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+
+        frame.render_widget(block, area);
+
+        // Inner content area
+        let inner = Self::inner_rect(area, 2, 1);
+
+        // Build content lines
+        let mut lines = vec![
+            Line::from(vec![Span::styled(
+                "Building Scenery Index...",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+        ];
+
+        // Spinner + current package line
+        if !progress.current_package.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} ", spinner), Style::default().fg(Color::Yellow)),
+                Span::styled("Scanning: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(&progress.current_package, Style::default().fg(Color::Green)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} ", spinner), Style::default().fg(Color::Yellow)),
+                Span::styled("Initializing...", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+
+        // Progress bar
+        let progress_width = (inner.width.saturating_sub(14)) as usize; // "Packages: " + "XX/XX"
+        let filled = (progress.progress_fraction() * progress_width as f64) as usize;
+        let empty = progress_width.saturating_sub(filled);
+        let progress_bar = format!("[{}{}]", "█".repeat(filled), "░".repeat(empty));
+
+        lines.push(Line::from(vec![
+            Span::styled("Packages: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(progress_bar, Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!(" {}/{}", progress.packages_scanned, progress.total_packages),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+
+        // Tiles indexed line
+        lines.push(Line::from(vec![
+            Span::styled("Tiles indexed: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", progress.tiles_indexed),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+
+        lines.push(Line::from(""));
+
+        // Elapsed time
+        let elapsed = progress.elapsed();
+        lines.push(Line::from(vec![
+            Span::styled("Elapsed: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}s", elapsed.as_secs()),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+
+        let paragraph = Paragraph::new(lines);
+        frame.render_widget(paragraph, inner);
+    }
+
+    /// Render the prewarming UI.
+    fn render_prewarming_ui(frame: &mut Frame, progress: &PrewarmProgress, spinner: char) {
+        let size = frame.area();
+
+        // Calculate centered box dimensions
+        let box_width = 60u16.min(size.width.saturating_sub(4));
+        let box_height = 12u16;
+        let x = (size.width.saturating_sub(box_width)) / 2;
+        let y = (size.height.saturating_sub(box_height)) / 2;
+
+        let area = Rect {
+            x,
+            y,
+            width: box_width,
+            height: box_height,
+        };
+
+        // Main container block
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(Span::styled(
+                format!(" X-Plane Earth Layer {} ", xearthlayer::VERSION),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+
+        frame.render_widget(block, area);
+
+        // Inner content area
+        let inner = Self::inner_rect(area, 2, 1);
+
+        // Build content lines
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Pre-warming cache for ", Style::default().fg(Color::White)),
+                Span::styled(
+                    &progress.icao,
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("...", Style::default().fg(Color::White)),
+            ]),
+            Line::from(""),
+        ];
+
+        // Spinner + airport name line
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", spinner), Style::default().fg(Color::Yellow)),
+            Span::styled("Loading tiles around ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&progress.airport_name, Style::default().fg(Color::White)),
+        ]));
+
+        lines.push(Line::from(""));
+
+        // Progress bar
+        let progress_width = (inner.width.saturating_sub(20)) as usize;
+        let filled = (progress.progress_fraction() * progress_width as f64) as usize;
+        let empty = progress_width.saturating_sub(filled);
+        let progress_bar = format!("[{}{}]", "█".repeat(filled), "░".repeat(empty));
+        let percent = (progress.progress_fraction() * 100.0) as u8;
+
+        lines.push(Line::from(vec![
+            Span::styled("Progress: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(progress_bar, Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!(" {}/{} ({}%)", progress.tiles_loaded, progress.total_tiles, percent),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+
+        // Cache hits line
+        lines.push(Line::from(vec![
+            Span::styled("Cache hits: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", progress.cache_hits),
+                Style::default().fg(Color::Green),
+            ),
+        ]));
+
+        lines.push(Line::from(""));
+
+        // Cancel hint
+        lines.push(Line::from(vec![
+            Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "c",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" to cancel pre-warm", Style::default().fg(Color::DarkGray)),
+        ]));
+
+        let paragraph = Paragraph::new(lines);
+        frame.render_widget(paragraph, inner);
     }
 
     fn inner_rect(area: Rect, margin_x: u16, margin_y: u16) -> Rect {

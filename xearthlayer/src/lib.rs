@@ -16,6 +16,7 @@
 //! let tile_data = service.download_tile(37.7749, -122.4194, 15)?;
 //! ```
 
+pub mod airport;
 pub mod cache;
 pub mod config;
 pub mod coord;
@@ -36,6 +37,7 @@ pub mod service;
 pub mod telemetry;
 pub mod texture;
 pub mod tile;
+pub mod xplane;
 
 /// Version of the XEarthLayer library and CLI.
 ///

@@ -95,6 +95,9 @@ pub enum ConfigKey {
     ControlPlaneStallThresholdSecs,
     ControlPlaneHealthCheckIntervalSecs,
     ControlPlaneSemaphoreTimeoutSecs,
+
+    // Prewarm settings
+    PrewarmRadiusNm,
 }
 
 impl FromStr for ConfigKey {
@@ -162,6 +165,9 @@ impl FromStr for ConfigKey {
                 Ok(ConfigKey::ControlPlaneSemaphoreTimeoutSecs)
             }
 
+            // Prewarm settings
+            "prewarm.radius_nm" => Ok(ConfigKey::PrewarmRadiusNm),
+
             _ => Err(ConfigKeyError::UnknownKey(s.to_string())),
         }
     }
@@ -218,6 +224,9 @@ impl ConfigKey {
                 "control_plane.health_check_interval_secs"
             }
             ConfigKey::ControlPlaneSemaphoreTimeoutSecs => "control_plane.semaphore_timeout_secs",
+
+            // Prewarm settings
+            ConfigKey::PrewarmRadiusNm => "prewarm.radius_nm",
         }
     }
 
@@ -327,6 +336,9 @@ impl ConfigKey {
             ConfigKey::ControlPlaneSemaphoreTimeoutSecs => {
                 config.control_plane.semaphore_timeout_secs.to_string()
             }
+
+            // Prewarm settings
+            ConfigKey::PrewarmRadiusNm => config.prewarm.radius_nm.to_string(),
         }
     }
 
@@ -485,6 +497,11 @@ impl ConfigKey {
             ConfigKey::ControlPlaneSemaphoreTimeoutSecs => {
                 config.control_plane.semaphore_timeout_secs = value.parse().unwrap();
             }
+
+            // Prewarm settings
+            ConfigKey::PrewarmRadiusNm => {
+                config.prewarm.radius_nm = value.parse().unwrap();
+            }
         }
     }
 
@@ -552,6 +569,9 @@ impl ConfigKey {
             ConfigKey::ControlPlaneStallThresholdSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneSemaphoreTimeoutSecs => Box::new(PositiveIntegerSpec),
+
+            // Prewarm settings
+            ConfigKey::PrewarmRadiusNm => Box::new(PositiveNumberSpec),
         }
     }
 
@@ -603,6 +623,8 @@ impl ConfigKey {
             ConfigKey::ControlPlaneStallThresholdSecs,
             ConfigKey::ControlPlaneHealthCheckIntervalSecs,
             ConfigKey::ControlPlaneSemaphoreTimeoutSecs,
+            // Prewarm settings
+            ConfigKey::PrewarmRadiusNm,
         ]
     }
 }

@@ -1,4 +1,4 @@
-//! X-Plane 12 installation path detection.
+//! X-Plane 12 installation detection.
 //!
 //! Provides utilities for detecting X-Plane 12 installation paths across
 //! different operating systems.
@@ -6,6 +6,8 @@
 use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
+
+use super::paths;
 
 /// Result of detecting X-Plane Custom Scenery directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,31 +43,10 @@ pub enum XPlanePathError {
     /// Custom Scenery directory not found.
     #[error("Custom Scenery directory not found: {0}")]
     CustomSceneryNotFound(PathBuf),
-}
 
-/// Get the path to the X-Plane install reference file.
-///
-/// The location varies by OS:
-/// - Linux: `~/.x-plane/x-plane_install_12.txt`
-/// - macOS: `~/.x-plane/x-plane_install_12.txt`
-/// - Windows: `%LOCALAPPDATA%\x-plane\x-plane_install_12.txt`
-fn get_install_reference_path() -> Result<PathBuf, XPlanePathError> {
-    #[cfg(target_os = "windows")]
-    {
-        // Windows uses LOCALAPPDATA
-        let local_app_data =
-            std::env::var("LOCALAPPDATA").map_err(|_| XPlanePathError::NoHomeDirectory)?;
-        Ok(PathBuf::from(local_app_data)
-            .join("x-plane")
-            .join("x-plane_install_12.txt"))
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        // Linux and macOS use ~/.x-plane
-        let home = dirs::home_dir().ok_or(XPlanePathError::NoHomeDirectory)?;
-        Ok(home.join(".x-plane").join("x-plane_install_12.txt"))
-    }
+    /// Multiple X-Plane installations found - user must choose.
+    #[error("Multiple X-Plane 12 installations found. Please specify which to use.")]
+    MultipleInstallations(Vec<PathBuf>),
 }
 
 /// Detect all X-Plane 12 installation directories.
@@ -81,7 +62,7 @@ fn get_install_reference_path() -> Result<PathBuf, XPlanePathError> {
 /// # Example
 ///
 /// ```ignore
-/// use xearthlayer::config::detect_xplane_installs;
+/// use xearthlayer::xplane::detect_xplane_installs;
 ///
 /// let installs = detect_xplane_installs();
 /// match installs.len() {
@@ -91,7 +72,7 @@ fn get_install_reference_path() -> Result<PathBuf, XPlanePathError> {
 /// }
 /// ```
 pub fn detect_xplane_installs() -> Vec<PathBuf> {
-    let reference_path = match get_install_reference_path() {
+    let reference_path = match paths::get_install_reference_path() {
         Ok(path) => path,
         Err(_) => return Vec::new(),
     };
@@ -133,7 +114,7 @@ pub fn detect_xplane_installs() -> Vec<PathBuf> {
 /// # Example
 ///
 /// ```ignore
-/// use xearthlayer::config::detect_xplane_install;
+/// use xearthlayer::xplane::detect_xplane_install;
 ///
 /// match detect_xplane_install() {
 ///     Ok(path) => println!("X-Plane 12 installed at: {}", path.display()),
@@ -144,7 +125,7 @@ pub fn detect_xplane_install() -> Result<PathBuf, XPlanePathError> {
     let installs = detect_xplane_installs();
 
     installs.into_iter().next().ok_or_else(|| {
-        let reference_path = get_install_reference_path()
+        let reference_path = paths::get_install_reference_path()
             .unwrap_or_else(|_| PathBuf::from("~/.x-plane/x-plane_install_12.txt"));
         XPlanePathError::InstallFileNotFound(reference_path)
     })
@@ -168,7 +149,7 @@ pub fn detect_xplane_install() -> Result<PathBuf, XPlanePathError> {
 /// # Example
 ///
 /// ```ignore
-/// use xearthlayer::config::detect_custom_scenery;
+/// use xearthlayer::xplane::detect_custom_scenery;
 ///
 /// match detect_custom_scenery() {
 ///     Ok(path) => println!("Custom Scenery at: {}", path.display()),
@@ -210,7 +191,7 @@ pub fn detect_custom_scenery() -> Result<PathBuf, XPlanePathError> {
 /// # Example
 ///
 /// ```ignore
-/// use xearthlayer::config::derive_mountpoint;
+/// use xearthlayer::xplane::derive_mountpoint;
 /// use std::path::Path;
 ///
 /// let source = Path::new("/data/scenery/z_xel_north_america");
@@ -245,7 +226,7 @@ pub fn derive_mountpoint(source_path: &std::path::Path) -> Result<PathBuf, XPlan
 /// # Example
 ///
 /// ```
-/// use xearthlayer::config::{detect_scenery_dir, SceneryDetectionResult};
+/// use xearthlayer::xplane::{detect_scenery_dir, SceneryDetectionResult};
 ///
 /// match detect_scenery_dir() {
 ///     SceneryDetectionResult::NotFound => {
@@ -282,16 +263,6 @@ pub fn detect_scenery_dir() -> SceneryDetectionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_get_install_reference_path() {
-        // Should not panic and return a valid path structure
-        let result = get_install_reference_path();
-        assert!(result.is_ok());
-
-        let path = result.unwrap();
-        assert!(path.to_string_lossy().contains("x-plane_install_12.txt"));
-    }
 
     #[test]
     fn test_detect_xplane_install_no_file() {

@@ -149,6 +149,13 @@ enum Commands {
         /// Disable predictive tile prefetching
         #[arg(long)]
         no_prefetch: bool,
+
+        /// ICAO airport code for cold-start pre-warming (e.g., LFBO, KJFK)
+        ///
+        /// When specified, pre-loads tiles around the airport before starting.
+        /// Useful for pre-warming the cache before a flight.
+        #[arg(long)]
+        airport: Option<String>,
     },
 
     /// Download a single tile to a file (for testing)
@@ -251,6 +258,7 @@ fn main() {
             no_cache,
             debug,
             no_prefetch,
+            airport,
         } => commands::run::run(commands::run::RunArgs {
             provider,
             google_api_key,
@@ -261,6 +269,7 @@ fn main() {
             no_cache,
             debug,
             no_prefetch,
+            airport,
         }),
     };
 

@@ -6,4 +6,6 @@
 pub mod dashboard;
 pub mod widgets;
 
-pub use dashboard::{Dashboard, DashboardConfig, DashboardEvent};
+pub use dashboard::{
+    Dashboard, DashboardConfig, DashboardEvent, DashboardState, LoadingProgress, PrewarmProgress,
+};
