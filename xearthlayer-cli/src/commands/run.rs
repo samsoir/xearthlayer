@@ -18,8 +18,9 @@ use xearthlayer::manager::{InstalledPackage, LocalPackageStore, MountManager, Se
 use xearthlayer::package::PackageType;
 use xearthlayer::panic as panic_handler;
 use xearthlayer::prefetch::{
-    FuseInferenceConfig, FuseRequestAnalyzer, IndexingProgress, PrefetcherBuilder, PrewarmConfig,
-    PrewarmPrefetcher, PrewarmProgress as LibPrewarmProgress, SceneryIndex, SharedPrefetchStatus,
+    load_cache, save_cache, CacheLoadResult, FuseInferenceConfig, FuseRequestAnalyzer,
+    IndexingProgress, PrefetcherBuilder, PrewarmConfig, PrewarmPrefetcher,
+    PrewarmProgress as LibPrewarmProgress, SceneryIndex, SceneryIndexConfig, SharedPrefetchStatus,
     TelemetryListener,
 };
 use xearthlayer::service::ServiceConfig;
@@ -544,21 +545,79 @@ fn run_with_dashboard(ctx: TuiContext) -> Result<CancellationToken, CliError> {
         );
     }
 
-    // Create the scenery index and spawn the async building task
-    let scenery_index = Arc::new(SceneryIndex::with_defaults());
-    let index_for_build = Arc::clone(&scenery_index);
+    // Try to load scenery index from cache first
+    let (scenery_index, cache_loaded) = match load_cache(&packages_for_index) {
+        CacheLoadResult::Loaded {
+            tiles,
+            total_tiles,
+            sea_tiles,
+        } => {
+            tracing::info!(
+                tiles = total_tiles,
+                sea = sea_tiles,
+                "Loaded scenery index from cache"
+            );
 
-    runtime_handle.spawn(async move {
-        SceneryIndex::build_from_packages_with_progress(
-            index_for_build,
-            packages_for_index,
-            progress_tx,
-        )
-        .await;
-    });
+            // Update loading progress to show cache was used
+            let mut loading = LoadingProgress::new(packages_for_index.len());
+            loading.tiles_indexed = total_tiles;
+            loading.packages_scanned = packages_for_index.len();
+            loading.current_package = "Cache loaded".to_string();
+            dashboard.update_loading_progress(loading);
+
+            // Create index from cached tiles
+            let index = Arc::new(SceneryIndex::from_tiles(
+                tiles,
+                SceneryIndexConfig::default(),
+            ));
+
+            // Send completion signal through the channel
+            let _ = progress_tx
+                .try_send(IndexingProgress::Complete {
+                    total: total_tiles,
+                    land: total_tiles - sea_tiles,
+                    sea: sea_tiles,
+                })
+                .ok();
+
+            (index, true)
+        }
+        CacheLoadResult::Stale { reason } => {
+            tracing::info!(reason = %reason, "Scenery cache is stale, rebuilding");
+            (Arc::new(SceneryIndex::with_defaults()), false)
+        }
+        CacheLoadResult::NotFound => {
+            tracing::info!("No scenery cache found, building index");
+            (Arc::new(SceneryIndex::with_defaults()), false)
+        }
+        CacheLoadResult::Invalid { error } => {
+            tracing::warn!(error = %error, "Scenery cache invalid, rebuilding");
+            (Arc::new(SceneryIndex::with_defaults()), false)
+        }
+    };
+
+    // If cache wasn't loaded, build index from scratch and save cache on completion
+    if !cache_loaded {
+        let index_for_build = Arc::clone(&scenery_index);
+        let packages_for_cache = packages_for_index.clone();
+
+        runtime_handle.spawn(async move {
+            SceneryIndex::build_from_packages_with_progress(
+                Arc::clone(&index_for_build),
+                packages_for_index,
+                progress_tx,
+            )
+            .await;
+
+            // Save cache for next launch
+            if let Err(e) = save_cache(&index_for_build, &packages_for_cache) {
+                tracing::warn!(error = %e, "Failed to save scenery cache");
+            }
+        });
+    }
 
     // Track state transitions
-    let mut indexing_complete = false;
+    let mut indexing_complete = cache_loaded; // True if loaded from cache
     let mut prewarm_active = false;
     let mut prewarm_complete = false;
     let mut prefetcher_started = false;

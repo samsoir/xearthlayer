@@ -55,6 +55,7 @@ mod listener;
 mod predictor;
 mod prewarm;
 mod radial;
+pub mod scenery_cache;
 mod scenery_index;
 mod scheduler;
 mod state;
@@ -98,3 +99,8 @@ pub use scenery_index::{
 
 // Cold-start prewarm
 pub use prewarm::{PrewarmConfig, PrewarmPrefetcher, PrewarmProgress};
+
+// Scenery index cache
+pub use scenery_cache::{
+    cache_path as scenery_cache_path, load_cache, save_cache, CacheLoadResult,
+};

@@ -322,6 +322,31 @@ impl SceneryIndex {
         *self.sea_tile_count.write().unwrap() = 0;
     }
 
+    /// Create an index from pre-loaded tiles (from cache).
+    ///
+    /// This is the fast-path for loading a cached index. Instead of parsing
+    /// `.ter` files, it directly adds tiles that were previously serialized.
+    pub fn from_tiles(tiles: Vec<SceneryTile>, config: SceneryIndexConfig) -> Self {
+        let index = Self::new(config);
+        for tile in tiles {
+            index.add_tile(tile);
+        }
+        index
+    }
+
+    /// Iterate all tiles in the index.
+    ///
+    /// Returns an iterator over all tiles across all grid cells.
+    /// Used for serializing the index to cache.
+    pub fn all_tiles(&self) -> Vec<SceneryTile> {
+        self.grid
+            .read()
+            .unwrap()
+            .values()
+            .flat_map(|cell| cell.tiles.iter().copied())
+            .collect()
+    }
+
     /// Build the index from multiple packages with progress reporting.
     ///
     /// This is an async method that builds the index from a list of package paths
