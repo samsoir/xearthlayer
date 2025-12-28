@@ -77,16 +77,9 @@ pub enum ConfigKey {
     PrefetchStrategy,
     PrefetchUdpPort,
     PrefetchConeAngle,
-    PrefetchConeDistanceNm,
-    PrefetchRadialRadiusNm,
-    PrefetchBatchSize,
-    PrefetchMaxInFlight,
     PrefetchRadialRadius,
     PrefetchInnerRadiusNm,
     PrefetchOuterRadiusNm,
-    PrefetchRadialOuterRadiusNm,
-    PrefetchConeOuterRadiusNm,
-    PrefetchConeHalfAngle,
     PrefetchMaxTilesPerCycle,
     PrefetchCycleIntervalMs,
 
@@ -143,16 +136,9 @@ impl FromStr for ConfigKey {
             "prefetch.strategy" => Ok(ConfigKey::PrefetchStrategy),
             "prefetch.udp_port" => Ok(ConfigKey::PrefetchUdpPort),
             "prefetch.cone_angle" => Ok(ConfigKey::PrefetchConeAngle),
-            "prefetch.cone_distance_nm" => Ok(ConfigKey::PrefetchConeDistanceNm),
-            "prefetch.radial_radius_nm" => Ok(ConfigKey::PrefetchRadialRadiusNm),
-            "prefetch.batch_size" => Ok(ConfigKey::PrefetchBatchSize),
-            "prefetch.max_in_flight" => Ok(ConfigKey::PrefetchMaxInFlight),
             "prefetch.radial_radius" => Ok(ConfigKey::PrefetchRadialRadius),
             "prefetch.inner_radius_nm" => Ok(ConfigKey::PrefetchInnerRadiusNm),
             "prefetch.outer_radius_nm" => Ok(ConfigKey::PrefetchOuterRadiusNm),
-            "prefetch.radial_outer_radius_nm" => Ok(ConfigKey::PrefetchRadialOuterRadiusNm),
-            "prefetch.cone_outer_radius_nm" => Ok(ConfigKey::PrefetchConeOuterRadiusNm),
-            "prefetch.cone_half_angle" => Ok(ConfigKey::PrefetchConeHalfAngle),
             "prefetch.max_tiles_per_cycle" => Ok(ConfigKey::PrefetchMaxTilesPerCycle),
             "prefetch.cycle_interval_ms" => Ok(ConfigKey::PrefetchCycleIntervalMs),
 
@@ -206,16 +192,9 @@ impl ConfigKey {
             ConfigKey::PrefetchStrategy => "prefetch.strategy",
             ConfigKey::PrefetchUdpPort => "prefetch.udp_port",
             ConfigKey::PrefetchConeAngle => "prefetch.cone_angle",
-            ConfigKey::PrefetchConeDistanceNm => "prefetch.cone_distance_nm",
-            ConfigKey::PrefetchRadialRadiusNm => "prefetch.radial_radius_nm",
-            ConfigKey::PrefetchBatchSize => "prefetch.batch_size",
-            ConfigKey::PrefetchMaxInFlight => "prefetch.max_in_flight",
             ConfigKey::PrefetchRadialRadius => "prefetch.radial_radius",
             ConfigKey::PrefetchInnerRadiusNm => "prefetch.inner_radius_nm",
             ConfigKey::PrefetchOuterRadiusNm => "prefetch.outer_radius_nm",
-            ConfigKey::PrefetchRadialOuterRadiusNm => "prefetch.radial_outer_radius_nm",
-            ConfigKey::PrefetchConeOuterRadiusNm => "prefetch.cone_outer_radius_nm",
-            ConfigKey::PrefetchConeHalfAngle => "prefetch.cone_half_angle",
             ConfigKey::PrefetchMaxTilesPerCycle => "prefetch.max_tiles_per_cycle",
             ConfigKey::PrefetchCycleIntervalMs => "prefetch.cycle_interval_ms",
             ConfigKey::ControlPlaneMaxConcurrentJobs => "control_plane.max_concurrent_jobs",
@@ -308,20 +287,9 @@ impl ConfigKey {
             ConfigKey::PrefetchStrategy => config.prefetch.strategy.clone(),
             ConfigKey::PrefetchUdpPort => config.prefetch.udp_port.to_string(),
             ConfigKey::PrefetchConeAngle => config.prefetch.cone_angle.to_string(),
-            ConfigKey::PrefetchConeDistanceNm => config.prefetch.cone_distance_nm.to_string(),
-            ConfigKey::PrefetchRadialRadiusNm => config.prefetch.radial_radius_nm.to_string(),
-            ConfigKey::PrefetchBatchSize => config.prefetch.batch_size.to_string(),
-            ConfigKey::PrefetchMaxInFlight => config.prefetch.max_in_flight.to_string(),
             ConfigKey::PrefetchRadialRadius => config.prefetch.radial_radius.to_string(),
             ConfigKey::PrefetchInnerRadiusNm => config.prefetch.inner_radius_nm.to_string(),
             ConfigKey::PrefetchOuterRadiusNm => config.prefetch.outer_radius_nm.to_string(),
-            ConfigKey::PrefetchRadialOuterRadiusNm => {
-                config.prefetch.radial_outer_radius_nm.to_string()
-            }
-            ConfigKey::PrefetchConeOuterRadiusNm => {
-                config.prefetch.cone_outer_radius_nm.to_string()
-            }
-            ConfigKey::PrefetchConeHalfAngle => config.prefetch.cone_half_angle.to_string(),
             ConfigKey::PrefetchMaxTilesPerCycle => config.prefetch.max_tiles_per_cycle.to_string(),
             ConfigKey::PrefetchCycleIntervalMs => config.prefetch.cycle_interval_ms.to_string(),
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
@@ -449,18 +417,6 @@ impl ConfigKey {
             ConfigKey::PrefetchConeAngle => {
                 config.prefetch.cone_angle = value.parse().unwrap();
             }
-            ConfigKey::PrefetchConeDistanceNm => {
-                config.prefetch.cone_distance_nm = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchRadialRadiusNm => {
-                config.prefetch.radial_radius_nm = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchBatchSize => {
-                config.prefetch.batch_size = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchMaxInFlight => {
-                config.prefetch.max_in_flight = value.parse().unwrap();
-            }
             ConfigKey::PrefetchRadialRadius => {
                 config.prefetch.radial_radius = value.parse().unwrap();
             }
@@ -469,15 +425,6 @@ impl ConfigKey {
             }
             ConfigKey::PrefetchOuterRadiusNm => {
                 config.prefetch.outer_radius_nm = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchRadialOuterRadiusNm => {
-                config.prefetch.radial_outer_radius_nm = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchConeOuterRadiusNm => {
-                config.prefetch.cone_outer_radius_nm = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchConeHalfAngle => {
-                config.prefetch.cone_half_angle = value.parse().unwrap();
             }
             ConfigKey::PrefetchMaxTilesPerCycle => {
                 config.prefetch.max_tiles_per_cycle = value.parse().unwrap();
@@ -553,16 +500,9 @@ impl ConfigKey {
             }
             ConfigKey::PrefetchUdpPort => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchConeAngle => Box::new(PositiveNumberSpec),
-            ConfigKey::PrefetchConeDistanceNm => Box::new(PositiveNumberSpec),
-            ConfigKey::PrefetchRadialRadiusNm => Box::new(PositiveNumberSpec),
-            ConfigKey::PrefetchBatchSize => Box::new(PositiveIntegerSpec),
-            ConfigKey::PrefetchMaxInFlight => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchRadialRadius => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchInnerRadiusNm => Box::new(PositiveNumberSpec),
             ConfigKey::PrefetchOuterRadiusNm => Box::new(PositiveNumberSpec),
-            ConfigKey::PrefetchRadialOuterRadiusNm => Box::new(PositiveNumberSpec),
-            ConfigKey::PrefetchConeOuterRadiusNm => Box::new(PositiveNumberSpec),
-            ConfigKey::PrefetchConeHalfAngle => Box::new(PositiveNumberSpec),
             ConfigKey::PrefetchMaxTilesPerCycle => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchCycleIntervalMs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneMaxConcurrentJobs => Box::new(PositiveIntegerSpec),
@@ -607,16 +547,9 @@ impl ConfigKey {
             ConfigKey::PrefetchStrategy,
             ConfigKey::PrefetchUdpPort,
             ConfigKey::PrefetchConeAngle,
-            ConfigKey::PrefetchConeDistanceNm,
-            ConfigKey::PrefetchRadialRadiusNm,
-            ConfigKey::PrefetchBatchSize,
-            ConfigKey::PrefetchMaxInFlight,
             ConfigKey::PrefetchRadialRadius,
             ConfigKey::PrefetchInnerRadiusNm,
             ConfigKey::PrefetchOuterRadiusNm,
-            ConfigKey::PrefetchRadialOuterRadiusNm,
-            ConfigKey::PrefetchConeOuterRadiusNm,
-            ConfigKey::PrefetchConeHalfAngle,
             ConfigKey::PrefetchMaxTilesPerCycle,
             ConfigKey::PrefetchCycleIntervalMs,
             ConfigKey::ControlPlaneMaxConcurrentJobs,

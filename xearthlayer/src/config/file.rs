@@ -190,32 +190,13 @@ pub struct PrefetchSettings {
     pub udp_port: u16,
     /// Prediction cone half-angle in degrees (default: 45)
     pub cone_angle: f32,
-    /// Cone distance ahead in nautical miles (default: 100)
-    pub cone_distance_nm: f32,
-    /// Radial buffer radius in nautical miles (default: 60)
-    pub radial_radius_nm: f32,
-    /// Maximum prefetch requests per prediction cycle (default: 500)
-    pub batch_size: usize,
-    /// Maximum concurrent in-flight prefetch requests (default: 2000)
-    pub max_in_flight: usize,
     /// Radial prefetcher tile radius (default: 3, giving a 7×7 = 49 tile grid)
     pub radial_radius: u8,
     /// Inner radius where prefetch zone starts (nautical miles).
     /// This is just inside X-Plane's ~90nm loaded zone. Default: 85nm.
-    /// Applies to BOTH radial buffer and heading cone.
     pub inner_radius_nm: f32,
-    /// Legacy outer radius (for backward compatibility). Default: 95nm.
-    /// New code should use radial_outer_radius_nm and cone_outer_radius_nm.
+    /// Outer radius where prefetch zone ends (nautical miles). Default: 95nm.
     pub outer_radius_nm: f32,
-    /// Outer radius for RADIAL BUFFER (360° around aircraft). Default: 100nm.
-    /// Provides coverage for unexpected turns in all directions.
-    pub radial_outer_radius_nm: f32,
-    /// Outer radius for HEADING CONE (forward direction only). Default: 120nm.
-    /// Provides deep lookahead along the flight path.
-    pub cone_outer_radius_nm: f32,
-    /// Half-angle of the heading cone in degrees. Default: 30.
-    /// Total cone width is 2× this value (e.g., 30° = 60° total).
-    pub cone_half_angle: f32,
     /// Maximum tiles to submit per prefetch cycle. Default: 50.
     /// Lower values reduce bandwidth competition with on-demand requests.
     pub max_tiles_per_cycle: usize,
@@ -305,16 +286,9 @@ impl Default for ConfigFile {
                 strategy: "auto".to_string(),
                 udp_port: DEFAULT_PREFETCH_UDP_PORT,
                 cone_angle: DEFAULT_PREFETCH_CONE_ANGLE,
-                cone_distance_nm: DEFAULT_PREFETCH_CONE_DISTANCE_NM,
-                radial_radius_nm: DEFAULT_PREFETCH_RADIAL_RADIUS_NM,
-                batch_size: DEFAULT_PREFETCH_BATCH_SIZE,
-                max_in_flight: DEFAULT_PREFETCH_MAX_IN_FLIGHT,
                 radial_radius: DEFAULT_PREFETCH_RADIAL_RADIUS,
                 inner_radius_nm: DEFAULT_PREFETCH_INNER_RADIUS_NM,
                 outer_radius_nm: DEFAULT_PREFETCH_OUTER_RADIUS_NM,
-                radial_outer_radius_nm: DEFAULT_PREFETCH_RADIAL_OUTER_RADIUS_NM,
-                cone_outer_radius_nm: DEFAULT_PREFETCH_CONE_OUTER_RADIUS_NM,
-                cone_half_angle: DEFAULT_PREFETCH_CONE_HALF_ANGLE,
                 max_tiles_per_cycle: DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE,
                 cycle_interval_ms: DEFAULT_PREFETCH_CYCLE_INTERVAL_MS,
             },
@@ -440,43 +414,15 @@ pub const DEFAULT_PREFETCH_UDP_PORT: u16 = 49002;
 /// Default prediction cone half-angle in degrees.
 pub const DEFAULT_PREFETCH_CONE_ANGLE: f32 = 45.0;
 
-/// Default cone distance ahead in nautical miles.
-pub const DEFAULT_PREFETCH_CONE_DISTANCE_NM: f32 = 100.0;
-
-/// Default radial buffer radius in nautical miles.
-pub const DEFAULT_PREFETCH_RADIAL_RADIUS_NM: f32 = 60.0;
-
-/// Default maximum tiles per prediction cycle.
-pub const DEFAULT_PREFETCH_BATCH_SIZE: usize = 500;
-
-/// Default maximum concurrent prefetch requests.
-pub const DEFAULT_PREFETCH_MAX_IN_FLIGHT: usize = 2000;
-
 /// Default radial prefetcher tile radius (7×7 = 49 tiles).
 pub const DEFAULT_PREFETCH_RADIAL_RADIUS: u8 = 3;
 
 /// Default inner radius where prefetch zone starts (nautical miles).
 /// Just inside X-Plane's ~90nm loaded zone boundary.
-/// Applies to BOTH radial buffer and heading cone.
 pub const DEFAULT_PREFETCH_INNER_RADIUS_NM: f32 = 85.0;
 
 /// Default outer radius where prefetch zone ends (nautical miles).
-/// Legacy value for backward compatibility.
 pub const DEFAULT_PREFETCH_OUTER_RADIUS_NM: f32 = 95.0;
-
-/// Default outer radius for RADIAL BUFFER (nautical miles).
-/// Extends 10nm beyond X-Plane's 90nm boundary in ALL directions (360°).
-/// Catches unexpected turns and lateral movements.
-pub const DEFAULT_PREFETCH_RADIAL_OUTER_RADIUS_NM: f32 = 100.0;
-
-/// Default outer radius for HEADING CONE (nautical miles).
-/// Extends 30nm beyond X-Plane's 90nm boundary in the FORWARD direction.
-/// Provides deep lookahead along the flight path.
-pub const DEFAULT_PREFETCH_CONE_OUTER_RADIUS_NM: f32 = 120.0;
-
-/// Default half-angle of the heading cone in degrees.
-/// Creates a 60° total cone width (30° to each side of heading).
-pub const DEFAULT_PREFETCH_CONE_HALF_ANGLE: f32 = 30.0;
 
 /// Default maximum tiles to submit per prefetch cycle.
 /// Reduced from 100 to 50 to leave more bandwidth for on-demand requests.
@@ -844,42 +790,8 @@ impl ConfigFile {
                         reason: "must be a positive number (degrees)".to_string(),
                     })?;
             }
-            if let Some(v) = section.get("cone_distance_nm") {
-                config.prefetch.cone_distance_nm =
-                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                        section: "prefetch".to_string(),
-                        key: "cone_distance_nm".to_string(),
-                        value: v.to_string(),
-                        reason: "must be a positive number (nautical miles)".to_string(),
-                    })?;
-            }
-            if let Some(v) = section.get("radial_radius_nm") {
-                config.prefetch.radial_radius_nm =
-                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                        section: "prefetch".to_string(),
-                        key: "radial_radius_nm".to_string(),
-                        value: v.to_string(),
-                        reason: "must be a positive number (nautical miles)".to_string(),
-                    })?;
-            }
-            if let Some(v) = section.get("batch_size") {
-                config.prefetch.batch_size =
-                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                        section: "prefetch".to_string(),
-                        key: "batch_size".to_string(),
-                        value: v.to_string(),
-                        reason: "must be a positive integer".to_string(),
-                    })?;
-            }
-            if let Some(v) = section.get("max_in_flight") {
-                config.prefetch.max_in_flight =
-                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                        section: "prefetch".to_string(),
-                        key: "max_in_flight".to_string(),
-                        value: v.to_string(),
-                        reason: "must be a positive integer".to_string(),
-                    })?;
-            }
+            // Deprecated: cone_distance_nm, radial_radius_nm, batch_size, max_in_flight
+            // These are ignored if present in config file (removed in v0.2.9)
             if let Some(v) = section.get("radial_radius") {
                 config.prefetch.radial_radius =
                     v.parse().map_err(|_| ConfigFileError::InvalidValue {
@@ -907,33 +819,8 @@ impl ConfigFile {
                         reason: "must be a positive number (nautical miles)".to_string(),
                     })?;
             }
-            if let Some(v) = section.get("radial_outer_radius_nm") {
-                config.prefetch.radial_outer_radius_nm =
-                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                        section: "prefetch".to_string(),
-                        key: "radial_outer_radius_nm".to_string(),
-                        value: v.to_string(),
-                        reason: "must be a positive number (nautical miles)".to_string(),
-                    })?;
-            }
-            if let Some(v) = section.get("cone_outer_radius_nm") {
-                config.prefetch.cone_outer_radius_nm =
-                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                        section: "prefetch".to_string(),
-                        key: "cone_outer_radius_nm".to_string(),
-                        value: v.to_string(),
-                        reason: "must be a positive number (nautical miles)".to_string(),
-                    })?;
-            }
-            if let Some(v) = section.get("cone_half_angle") {
-                config.prefetch.cone_half_angle =
-                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                        section: "prefetch".to_string(),
-                        key: "cone_half_angle".to_string(),
-                        value: v.to_string(),
-                        reason: "must be a positive number (degrees)".to_string(),
-                    })?;
-            }
+            // Deprecated: radial_outer_radius_nm, cone_outer_radius_nm, cone_half_angle
+            // These are ignored if present in config file (removed in v0.2.9)
             if let Some(v) = section.get("max_tiles_per_cycle") {
                 config.prefetch.max_tiles_per_cycle =
                     v.parse().map_err(|_| ConfigFileError::InvalidValue {
@@ -1161,35 +1048,14 @@ udp_port = {}
 ; Prediction cone half-angle in degrees (default: 45)
 ; Wider angles prefetch more tiles but use more bandwidth
 cone_angle = {}
-; Cone distance ahead in nautical miles (default: 100)
-; How far ahead to prefetch tiles along flight path
-cone_distance_nm = {}
-; Radial buffer radius in nautical miles (default: 60)
-; Catches lateral movements and unexpected direction changes
-radial_radius_nm = {}
-; Maximum tiles to submit per prediction cycle (default: 500)
-batch_size = {}
-; Maximum concurrent prefetch requests (default: 2000)
-max_in_flight = {}
 ; Radial prefetcher tile radius (default: 3, giving 7x7 = 49 tiles)
 ; Higher values prefetch more tiles around aircraft position
 radial_radius = {}
 ; Inner radius where prefetch zone starts (nautical miles, default: 85)
 ; Just inside X-Plane's ~90nm loaded zone boundary
-; Applies to BOTH radial buffer and heading cone
 inner_radius_nm = {}
-; Legacy outer radius (nautical miles, default: 95)
-; Kept for backward compatibility; prefer radial_outer_radius_nm and cone_outer_radius_nm
+; Outer radius where prefetch zone ends (nautical miles, default: 95)
 outer_radius_nm = {}
-; Outer radius for RADIAL BUFFER (nautical miles, default: 100)
-; Extends in ALL directions (360°) around aircraft for unexpected turns
-radial_outer_radius_nm = {}
-; Outer radius for HEADING CONE (nautical miles, default: 120)
-; Extends only in FORWARD direction for deep lookahead along flight path
-cone_outer_radius_nm = {}
-; Half-angle of the heading cone in degrees (default: 30)
-; Total cone width is 2× this value (e.g., 30° = 60° total cone)
-cone_half_angle = {}
 ; Maximum tiles to submit per prefetch cycle (default: 50)
 ; Lower values leave more bandwidth for on-demand requests
 max_tiles_per_cycle = {}
@@ -1250,16 +1116,9 @@ radius_nm = {}
             self.prefetch.strategy,
             self.prefetch.udp_port,
             self.prefetch.cone_angle,
-            self.prefetch.cone_distance_nm,
-            self.prefetch.radial_radius_nm,
-            self.prefetch.batch_size,
-            self.prefetch.max_in_flight,
             self.prefetch.radial_radius,
             self.prefetch.inner_radius_nm,
             self.prefetch.outer_radius_nm,
-            self.prefetch.radial_outer_radius_nm,
-            self.prefetch.cone_outer_radius_nm,
-            self.prefetch.cone_half_angle,
             self.prefetch.max_tiles_per_cycle,
             self.prefetch.cycle_interval_ms,
             self.control_plane.max_concurrent_jobs,

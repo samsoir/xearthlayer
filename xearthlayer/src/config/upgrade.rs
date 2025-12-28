@@ -45,6 +45,18 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "prefetch.enable_zl12",
     "prefetch.zl12_inner_radius_nm",
     "prefetch.zl12_outer_radius_nm",
+    // Removed in v0.2.9 - Legacy prefetch settings from old Predictor/Scheduler
+    // These were never wired to the current PrefetcherBuilder
+    "prefetch.cone_distance_nm",
+    "prefetch.radial_radius_nm",
+    "prefetch.batch_size",
+    "prefetch.max_in_flight",
+    // Removed in v0.2.9 - Separate radial/cone outer radii never used from config
+    // Use outer_radius_nm instead (applies to both)
+    "prefetch.radial_outer_radius_nm",
+    "prefetch.cone_outer_radius_nm",
+    // Removed in v0.2.9 - Duplicate of cone_angle (cone_angle is the one actually used)
+    "prefetch.cone_half_angle",
 ];
 
 /// Result of analyzing a configuration file for upgrade needs.
