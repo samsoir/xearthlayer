@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 600" width="600" height="600">
+  <defs>
+    <!-- Gradient for X-Plane loaded zone -->
+    <radialGradient id="xplaneGradient" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" style="stop-color:#4a9eff;stop-opacity:0.3"/>
+      <stop offset="100%" style="stop-color:#2d5aa0;stop-opacity:0.4"/>
+    </radialGradient>
+
+    <!-- Pattern for radial buffer -->
+    <pattern id="radialPattern" patternUnits="userSpaceOnUse" width="8" height="8">
+      <rect width="8" height="8" fill="#ffd700" fill-opacity="0.4"/>
+      <circle cx="4" cy="4" r="1" fill="#b8860b" fill-opacity="0.6"/>
+    </pattern>
+
+    <!-- Gradient for heading cone -->
+    <linearGradient id="coneGradient" x1="50%" y1="100%" x2="50%" y2="0%">
+      <stop offset="0%" style="stop-color:#ff6b6b;stop-opacity:0.5"/>
+      <stop offset="100%" style="stop-color:#ff0000;stop-opacity:0.7"/>
+    </linearGradient>
+
+    <!-- Arrow marker -->
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#333"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="600" height="600" fill="#f5f5f5"/>
+
+  <!-- Title -->
+  <text x="300" y="30" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#333">
+    XEarthLayer Dual-Zone Prefetch System
+  </text>
+
+  <!-- Outer circle: Cone outer boundary (120nm) -->
+  <circle cx="300" cy="320" r="240" fill="none" stroke="#ff6b6b" stroke-width="1" stroke-dasharray="5,5" opacity="0.5"/>
+
+  <!-- Heading cone (85-120nm forward, 60 degrees) -->
+  <path d="M 300 320
+           L 178 80
+           A 240 240 0 0 1 422 80
+           Z"
+        fill="url(#coneGradient)" stroke="#cc0000" stroke-width="2"/>
+
+  <!-- Inner cone cutout (make the cone annular at 85nm) -->
+  <path d="M 300 320
+           L 243 157
+           A 170 170 0 0 1 357 157
+           Z"
+        fill="#f5f5f5"/>
+
+  <!-- Radial buffer (85-100nm, 360 degrees) -->
+  <circle cx="300" cy="320" r="200" fill="none" stroke="#ffd700" stroke-width="30" opacity="0.5"/>
+
+  <!-- X-Plane loaded zone (0-90nm) -->
+  <circle cx="300" cy="320" r="170" fill="url(#xplaneGradient)" stroke="#2d5aa0" stroke-width="2"/>
+
+  <!-- Inner boundary of prefetch (85nm) -->
+  <circle cx="300" cy="320" r="170" fill="none" stroke="#666" stroke-width="1" stroke-dasharray="10,5"/>
+
+  <!-- Aircraft symbol -->
+  <g transform="translate(300, 320)">
+    <!-- Aircraft body -->
+    <polygon points="0,-15 -8,10 0,5 8,10" fill="#333" stroke="#000" stroke-width="1"/>
+    <!-- Wings -->
+    <polygon points="-20,0 -5,-2 -5,2 -20,0" fill="#333"/>
+    <polygon points="20,0 5,-2 5,2 20,0" fill="#333"/>
+  </g>
+
+  <!-- Heading arrow -->
+  <line x1="300" y1="280" x2="300" y2="60" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <text x="300" y="50" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#333">Heading</text>
+
+  <!-- Distance labels -->
+  <!-- 85nm label -->
+  <text x="480" y="320" font-family="Arial, sans-serif" font-size="11" fill="#666">85nm</text>
+  <line x1="470" y1="320" x2="472" y2="320" stroke="#666" stroke-width="1"/>
+
+  <!-- 90nm label (X-Plane boundary) -->
+  <text x="495" y="300" font-family="Arial, sans-serif" font-size="11" fill="#2d5aa0">~90nm</text>
+
+  <!-- 100nm label -->
+  <text x="510" y="280" font-family="Arial, sans-serif" font-size="11" fill="#b8860b">100nm</text>
+
+  <!-- 120nm label -->
+  <text x="545" y="260" font-family="Arial, sans-serif" font-size="11" fill="#cc0000">120nm</text>
+
+  <!-- Legend -->
+  <g transform="translate(20, 480)">
+    <text x="0" y="0" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#333">Legend:</text>
+
+    <!-- X-Plane loaded zone -->
+    <rect x="0" y="15" width="20" height="15" fill="url(#xplaneGradient)" stroke="#2d5aa0"/>
+    <text x="28" y="27" font-family="Arial, sans-serif" font-size="12" fill="#333">X-Plane Loaded Scenery (~90nm)</text>
+
+    <!-- Radial buffer -->
+    <rect x="0" y="38" width="20" height="15" fill="#ffd700" fill-opacity="0.5" stroke="#b8860b"/>
+    <text x="28" y="50" font-family="Arial, sans-serif" font-size="12" fill="#333">Radial Buffer (85-100nm, 360°)</text>
+
+    <!-- Heading cone -->
+    <rect x="0" y="61" width="20" height="15" fill="url(#coneGradient)" stroke="#cc0000"/>
+    <text x="28" y="73" font-family="Arial, sans-serif" font-size="12" fill="#333">Heading Cone (85-120nm, 60°)</text>
+
+    <!-- Aircraft -->
+    <g transform="translate(10, 91)">
+      <polygon points="0,-7 -4,5 0,2 4,5" fill="#333"/>
+    </g>
+    <text x="28" y="95" font-family="Arial, sans-serif" font-size="12" fill="#333">Aircraft Position</text>
+  </g>
+
+  <!-- Zone annotations -->
+  <g font-family="Arial, sans-serif" font-size="11">
+    <!-- Radial buffer annotation -->
+    <text x="450" y="420" fill="#b8860b" font-weight="bold">RADIAL BUFFER</text>
+    <text x="450" y="435" fill="#666">Catches unexpected</text>
+    <text x="450" y="448" fill="#666">turns in all directions</text>
+
+    <!-- Cone annotation -->
+    <text x="350" y="100" fill="#cc0000" font-weight="bold">HEADING CONE</text>
+    <text x="350" y="115" fill="#666">Deep lookahead</text>
+    <text x="350" y="128" fill="#666">along flight path</text>
+
+    <!-- X-Plane zone annotation -->
+    <text x="220" y="380" fill="#2d5aa0" font-weight="bold">X-PLANE LOADED</text>
+    <text x="220" y="395" fill="#666">Already cached by sim</text>
+    <text x="220" y="408" fill="#666">(not prefetched)</text>
+  </g>
+
+  <!-- Angle indicator for cone -->
+  <path d="M 300 320 L 260 280" stroke="#666" stroke-width="1" stroke-dasharray="3,3"/>
+  <path d="M 300 320 L 340 280" stroke="#666" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="300" y="295" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#666">60°</text>
+</svg>

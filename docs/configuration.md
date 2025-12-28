@@ -260,14 +260,24 @@ The TUI dashboard shows control plane health including:
 
 Controls predictive tile prefetching based on X-Plane telemetry. The prefetch system pre-loads tiles ahead of the aircraft to reduce FPS drops when new scenery loads.
 
+**Dual-Zone Architecture:**
+
+XEarthLayer uses a dual-zone prefetch system that targets the boundary around X-Plane's ~90nm loaded scenery:
+
+![Heading-Aware Prefetch Zones](images/heading-aware-prefetch.png)
+
+- **Radial Buffer (85-100nm, 360°)**: Catches unexpected turns in any direction
+- **Heading Cone (85-120nm, 60° forward)**: Deep lookahead along the flight path
+
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable/disable predictive tile prefetching |
 | `strategy` | string | `auto` | Prefetch strategy: `auto`, `heading-aware`, or `radial` |
 | `udp_port` | integer | `49002` | UDP port for X-Plane telemetry (ForeFlight protocol) |
-| `cone_angle` | float | `45` | Prediction cone half-angle in degrees |
-| `inner_radius_nm` | float | `85` | Inner edge of prefetch zone (nautical miles) |
-| `outer_radius_nm` | float | `95` | Outer edge of prefetch zone (nautical miles) |
+| `inner_radius_nm` | float | `85` | Inner edge of prefetch zone (both radial and cone) |
+| `radial_outer_radius_nm` | float | `100` | Outer edge of 360° radial buffer |
+| `cone_outer_radius_nm` | float | `120` | Outer edge of forward heading cone |
+| `cone_half_angle` | float | `30` | Half-angle of heading cone (30° = 60° total width) |
 | `max_tiles_per_cycle` | integer | `50` | Maximum tiles to submit per prefetch cycle |
 | `cycle_interval_ms` | integer | `2000` | Interval between prefetch cycles (milliseconds) |
 | `radial_radius` | integer | `3` | Radial fallback tile radius (3 = 7×7 = 49 tiles) |
@@ -291,10 +301,13 @@ enabled = true
 strategy = auto
 udp_port = 49002
 
-; Prefetch zone configuration
-cone_angle = 45
-inner_radius_nm = 85
-outer_radius_nm = 95
+; Dual-zone prefetch boundaries
+inner_radius_nm = 85           ; Start prefetching 5nm inside X-Plane's 90nm boundary
+radial_outer_radius_nm = 100   ; 360° buffer extends 10nm beyond boundary
+cone_outer_radius_nm = 120     ; Forward cone extends 30nm beyond boundary
+cone_half_angle = 30           ; 60° total cone width
+
+; Rate limiting
 max_tiles_per_cycle = 50
 cycle_interval_ms = 2000
 ```
@@ -409,10 +422,13 @@ enabled = true
 strategy = auto  ; auto, heading-aware, or radial
 ; udp_port = 49002
 
-; Prefetch zone configuration
-; cone_angle = 45              ; half-angle of prediction cone (degrees)
-; inner_radius_nm = 85         ; start prefetching just inside 90nm boundary
-; outer_radius_nm = 95         ; 10nm prefetch depth
+; Dual-zone prefetch boundaries (see docs for diagram)
+; inner_radius_nm = 85              ; inner edge (5nm inside X-Plane's 90nm zone)
+; radial_outer_radius_nm = 100      ; 360° buffer (10nm beyond boundary)
+; cone_outer_radius_nm = 120        ; forward cone (30nm beyond boundary)
+; cone_half_angle = 30              ; half-angle of cone (60° total width)
+
+; Rate limiting
 ; max_tiles_per_cycle = 50     ; tiles per cycle (lower = less bandwidth)
 ; cycle_interval_ms = 2000     ; cycle interval (higher = less aggressive)
 
@@ -530,9 +546,10 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `prefetch.enabled` | `true`, `false` | Enable predictive prefetching |
 | `prefetch.strategy` | `auto`, `heading-aware`, `radial` | Prefetch strategy |
 | `prefetch.udp_port` | positive integer | X-Plane telemetry UDP port |
-| `prefetch.cone_angle` | positive number | Prediction cone half-angle (degrees) |
 | `prefetch.inner_radius_nm` | positive number | Inner edge of prefetch zone (nm) |
-| `prefetch.outer_radius_nm` | positive number | Outer edge of prefetch zone (nm) |
+| `prefetch.radial_outer_radius_nm` | positive number | Outer edge of 360° radial buffer (nm) |
+| `prefetch.cone_outer_radius_nm` | positive number | Outer edge of forward heading cone (nm) |
+| `prefetch.cone_half_angle` | positive number | Half-angle of heading cone (degrees) |
 | `prefetch.max_tiles_per_cycle` | positive integer | Max tiles per prefetch cycle |
 | `prefetch.cycle_interval_ms` | positive integer | Prefetch cycle interval (ms) |
 | `prefetch.radial_radius` | positive integer | Radial fallback tile radius |

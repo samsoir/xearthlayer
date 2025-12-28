@@ -2,6 +2,8 @@
 
 High-quality satellite imagery for X-Plane, streamed on demand.
 
+![XEarthLayer flying over northern Spain](docs/images/xearthlayer-v0.2.8-iberia.jpg)
+
 ## What It Does
 
 XEarthLayer delivers photo scenery to X-Plane without massive downloads. Instead of pre-downloading thousands of gigabytes of textures, XEarthLayer:
@@ -80,6 +82,12 @@ xearthlayer run
 
 See [Getting Started](docs/getting-started.md) for the complete guide.
 
+### Real-Time Dashboard
+
+XEarthLayer provides a real-time terminal dashboard showing cache status, download activity, and prefetch progress:
+
+![XEarthLayer CLI Dashboard](docs/images/xearthlayer-v0.2.8.png)
+
 ## XEarthLayer Regional Scenery Package Project
 
 XEarthLayer requires regional scenery packages to be installed in order for it to work. XEarthLayer is creating a regional package library for general public use. It is possible for anyone to create and publish their own package server.
@@ -88,7 +96,11 @@ XEarthLayer requires regional scenery packages to be installed in order for it t
 
 ## Predictive Prefetching
 
-XEarthLayer reduces FPS drops by prefetching tiles ahead of your aircraft. For best results:
+XEarthLayer reduces FPS drops by prefetching tiles ahead of your aircraft using a dual-zone system:
+
+![Heading-Aware Prefetch Zones](docs/images/heading-aware-prefetch.png)
+
+For best results:
 
 1. **Enable ForeFlight telemetry** in X-Plane:
    - Settings → Network → Enable "Send to ForeFlight"
@@ -134,7 +146,7 @@ xearthlayer packages update [region]  # Update packages
 xearthlayer packages remove <region>  # Remove a package
 
 # Running (primary command)
-xearthlayer run                       # Mount all packages and start streaming
+xearthlayer run                       # Mount all packages and start streaming (with real-time dashboard)
 
 # Advanced: Single Package Mode
 xearthlayer start --source <path>     # Start streaming for a single scenery pack

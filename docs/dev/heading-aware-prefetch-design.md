@@ -1,8 +1,8 @@
 # Heading-Aware Prefetch Design
 
-## Status: Implemented (Phases 1-4 Complete)
+## Status: Implemented (Phases 1-4 Complete, Dual-Zone v0.2.9)
 **Author**: Sam de Freyssinet & Claude Code
-**Date**: 2025-12-25
+**Date**: 2025-12-25 (updated 2025-12-28)
 **Related**: `docs/dev/predictive-caching.md`
 
 ---
@@ -219,27 +219,33 @@ redundant - they're already in our cache from recent FUSE requests.
 Our prefetch zone targets the ring *around* this boundary—prefetching tiles just
 before X-Plane needs them and extending beyond where it currently loads.
 
-**Solution: Annular Cone (Ring-Shaped Prefetch Zone)**
+**Solution: Dual-Zone Prefetch System (v0.2.9+)**
 
-Instead of a solid cone from the aircraft, we use an **annular cone** that wraps
-around X-Plane's 90nm loaded zone boundary:
+![Dual-Zone Prefetch Diagram](prefetch-zones.svg)
+
+Instead of a single annular cone, we use a **dual-zone system** that combines:
+1. A 360° **radial buffer** around X-Plane's boundary
+2. A forward **heading cone** for deep lookahead
 
 ```
-      ┌───────────────────────────────────────────────────────┐
-       ╲                                                     ╱
-        ╲              PREFETCH ZONE                        ╱
-         ╲       (inner_radius_nm → outer_radius_nm)       ╱
-          ╲           85nm ────────── 105nm               ╱
-           ╲─────────────────────────────────────────────╱
-            ╲                                           ╱
-             ╲───────── X-Plane 90nm boundary ─────────╱
-              │                                       │
-              │      X-PLANE'S LOADED ZONE            │
-              │      (0 → 90nm from aircraft)         │
-              │      ← X-Plane handles these          │
-              │                                       │
-              └─────────────────✈─────────────────────┘
-                             aircraft
+                              Heading
+                                 ↑
+                           ┌─────────────┐
+                          ╱   HEADING     ╲
+                         ╱     CONE        ╲         ← 85-120nm forward
+                        ╱   (60° wide)      ╲          (35nm deep lookahead)
+                       ╱                     ╲
+          ┌───────────┴───────────────────────┴───────────┐
+          │              RADIAL BUFFER (360°)             │ ← 85-100nm
+          │  ┌───────────────────────────────────────┐    │   (15nm wide ring)
+          │  │                                       │    │
+          │  │       X-PLANE LOADED SCENERY          │    │
+          │  │          (~90nm radius)               │    │
+          │  │                                       │    │
+          │  │              ✈ Aircraft               │    │
+          │  │                                       │    │
+          │  └───────────────────────────────────────┘    │
+          └───────────────────────────────────────────────┘
 ```
 
 **Key Parameters:**
@@ -247,13 +253,23 @@ around X-Plane's 90nm loaded zone boundary:
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
 | `XPLANE_LOADED_ZONE_NM` | 90.0 nm | X-Plane's loaded tile radius (constant) |
-| `inner_radius_nm` | 85.0 nm | Where prefetch zone STARTS (90nm - 5nm margin) |
-| `outer_radius_nm` | 105.0 nm | Where prefetch zone ENDS (90nm + 15nm buffer) |
+| `inner_radius_nm` | 85.0 nm | Where both zones START (5nm margin inside boundary) |
+| `radial_outer_radius_nm` | 100.0 nm | Outer edge of 360° radial buffer |
+| `cone_outer_radius_nm` | 120.0 nm | Outer edge of forward heading cone |
+| `cone_half_angle` | 30.0° | Half-angle of cone (60° total width) |
 
-**Prefetch Zone:**
-- **Inner boundary (85nm):** Start prefetching 5nm *inside* X-Plane's 90nm edge to ensure tiles are ready before X-Plane reaches them
-- **Outer boundary (105nm):** Extend 15nm *beyond* X-Plane's current loaded zone for sustained flight
-- **Zone width:** 20nm ring around the 90nm boundary
+**Radial Buffer (85-100nm, 360°):**
+- Covers all directions for unexpected turns, orbits, and course changes
+- 15nm wide ring around X-Plane's boundary
+- Lower priority than heading cone tiles
+
+**Heading Cone (85-120nm, 60° forward):**
+- Deep lookahead along the flight path (35nm beyond boundary)
+- Highest priority for smooth forward flight
+- Narrows to 60° total width to focus on flight direction
+
+**Both zones run every cycle:** Tiles are combined and deduplicated via request coalescing.
+The dual-zone approach catches unexpected turns while providing deep forward coverage.
 
 ---
 
@@ -294,17 +310,22 @@ Replace the symmetric radial grid with a **directional cone** that prioritizes t
 
 ```rust
 pub struct HeadingAwarePrefetchConfig {
-    // === Annular Cone (Inner Exclusion Zone) ===
+    // === Dual-Zone Boundaries (v0.2.9+) ===
 
-    /// Inner radius in nautical miles - tiles closer than this are masked.
-    /// X-Plane's active loading zone handles tiles within this radius.
-    /// (default: 3.0 nm)
+    /// Inner radius in nautical miles - where both zones START.
+    /// Set 5nm inside X-Plane's ~90nm boundary to ensure tiles are ready.
+    /// (default: 85.0 nm)
     pub inner_radius_nm: f32,
 
-    /// Overlap margin in nautical miles - safety buffer at the inner boundary.
-    /// Prefetch starts at (inner_radius_nm - overlap_margin_nm) to handle
-    /// edge cases like cache eviction or network delays. (default: 1.0 nm)
-    pub overlap_margin_nm: f32,
+    /// Outer radius for the 360° radial buffer.
+    /// Covers all directions for unexpected turns.
+    /// (default: 100.0 nm = 10nm beyond X-Plane's boundary)
+    pub radial_outer_radius_nm: f32,
+
+    /// Outer radius for the forward heading cone.
+    /// Deep lookahead along flight path.
+    /// (default: 120.0 nm = 30nm beyond X-Plane's boundary)
+    pub cone_outer_radius_nm: f32,
 
     // === Cone Geometry ===
 
@@ -333,10 +354,7 @@ pub struct HeadingAwarePrefetchConfig {
 
     // === General ===
 
-    /// Zoom level for prefetch (default: 14, matching DDS tiles)
-    pub zoom: u8,
-
-    /// Maximum tiles per prefetch cycle (default: 100)
+    /// Maximum tiles per prefetch cycle (default: 50)
     pub max_tiles_per_cycle: usize,
 
     /// TTL for failed tile attempts (default: 60s)
@@ -346,9 +364,10 @@ pub struct HeadingAwarePrefetchConfig {
 impl Default for HeadingAwarePrefetchConfig {
     fn default() -> Self {
         Self {
-            // Annular cone
-            inner_radius_nm: 3.0,
-            overlap_margin_nm: 1.0,
+            // Dual-zone boundaries
+            inner_radius_nm: 85.0,
+            radial_outer_radius_nm: 100.0,
+            cone_outer_radius_nm: 120.0,
             // Cone geometry
             cone_half_angle: 30.0,
             min_lookahead_nm: 5.0,
@@ -359,12 +378,21 @@ impl Default for HeadingAwarePrefetchConfig {
             lateral_buffer_angle: 45.0,
             lateral_buffer_depth: 3,
             // General
-            zoom: 14,
-            max_tiles_per_cycle: 100,
+            max_tiles_per_cycle: 50,
             attempt_ttl: Duration::from_secs(60),
         }
     }
 }
+```
+
+**Configuration via config.ini:**
+
+```ini
+[prefetch]
+inner_radius_nm = 85              # 5nm inside X-Plane's 90nm boundary
+radial_outer_radius_nm = 100      # 360° buffer extends 10nm beyond
+cone_outer_radius_nm = 120        # Forward cone extends 30nm beyond
+cone_half_angle = 30              # 60° total cone width
 ```
 
 **Effective Prefetch Zone Calculation:**

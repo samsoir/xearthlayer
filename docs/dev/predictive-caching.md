@@ -1,10 +1,49 @@
 # Predictive Tile Caching
 
-**Status**: Implemented (v0.2.7+)
+**Status**: Implemented (v0.2.7+, dual-zone architecture v0.2.9+)
 
 ## Overview
 
 This document describes the design and implementation of predictive tile caching in XEarthLayer. The feature pre-fetches tiles ahead of the aircraft's position to reduce FPS drops when the simulator loads new scenery.
+
+## Dual-Zone Prefetch Architecture
+
+XEarthLayer v0.2.9+ uses a dual-zone prefetch system that targets the boundary around X-Plane's ~90nm loaded scenery:
+
+![Dual-Zone Prefetch Diagram](prefetch-zones.svg)
+
+```
+                              Heading
+                                 ↑
+                           ┌─────────────┐
+                          ╱   HEADING     ╲
+                         ╱     CONE        ╲         ← 85-120nm forward
+                        ╱   (60° wide)      ╲          (deep lookahead)
+                       ╱                     ╲
+          ┌───────────┴───────────────────────┴───────────┐
+          │              RADIAL BUFFER (360°)             │ ← 85-100nm
+          │  ┌───────────────────────────────────────┐    │   (all directions)
+          │  │                                       │    │
+          │  │       X-PLANE LOADED SCENERY          │    │
+          │  │          (~90nm radius)               │    │
+          │  │                                       │    │
+          │  │              ✈ Aircraft               │    │
+          │  │                                       │    │
+          │  └───────────────────────────────────────┘    │
+          └───────────────────────────────────────────────┘
+```
+
+**Key Design Principles:**
+
+1. **Don't prefetch what X-Plane already has**: X-Plane maintains ~90nm of loaded tiles. Prefetching inside this zone is redundant.
+
+2. **Radial Buffer (85-100nm, 360°)**: A 15nm-wide ring around the boundary catches unexpected turns, orbits, and lateral movements. Every direction is covered.
+
+3. **Heading Cone (85-120nm, 60° forward)**: Extends 35nm along the flight path for deep lookahead. This is where smooth flight comes from.
+
+4. **Both zones run every cycle**: The radial buffer and heading cone are combined each cycle, with duplicates removed via request coalescing.
+
+5. **Intersection-based tile selection**: Tiles are included if *any part* intersects the prefetch zone, not just the center point. This prevents edge tiles from being missed.
 
 ## Problem Statement
 
@@ -303,9 +342,10 @@ Configuration keys in `[prefetch]` section:
 | `enabled` | bool | `true` | Enable/disable predictive caching |
 | `strategy` | string | `auto` | Strategy: `auto`, `heading-aware`, or `radial` |
 | `udp_port` | u16 | `49002` | X-Plane UDP broadcast port |
-| `cone_angle` | f32 | `45.0` | Half-angle of prediction cone (degrees) |
-| `inner_radius_nm` | f32 | `85.0` | Inner edge of prefetch zone (nm) |
-| `outer_radius_nm` | f32 | `95.0` | Outer edge of prefetch zone (nm) |
+| `inner_radius_nm` | f32 | `85.0` | Inner edge of prefetch zone (both radial and cone) |
+| `radial_outer_radius_nm` | f32 | `100.0` | Outer edge of 360° radial buffer |
+| `cone_outer_radius_nm` | f32 | `120.0` | Outer edge of forward heading cone |
+| `cone_half_angle` | f32 | `30.0` | Half-angle of heading cone (degrees) |
 | `max_tiles_per_cycle` | usize | `50` | Max tiles to submit per cycle |
 | `cycle_interval_ms` | u64 | `2000` | Interval between prefetch cycles (ms) |
 | `radial_radius` | u8 | `3` | Radial fallback radius (tiles) |
@@ -317,10 +357,13 @@ enabled = true
 strategy = auto
 udp_port = 49002
 
-# Tune prefetch zone (default is optimized for most setups)
-cone_angle = 45
-inner_radius_nm = 85
-outer_radius_nm = 95
+# Dual-zone prefetch boundaries
+inner_radius_nm = 85              # Start 5nm inside X-Plane's 90nm boundary
+radial_outer_radius_nm = 100      # 360° buffer extends 10nm beyond
+cone_outer_radius_nm = 120        # Forward cone extends 30nm beyond
+cone_half_angle = 30              # 60° total cone width
+
+# Rate limiting
 max_tiles_per_cycle = 50
 cycle_interval_ms = 2000
 ```
@@ -463,6 +506,7 @@ xearthlayer/src/prefetch/
 ├── radial.rs           # RadialPrefetcher (simple fallback)
 ├── cone.rs             # ConeGenerator for forward prefetch
 ├── buffer.rs           # BufferGenerator for lateral/rear
+├── intersection.rs     # Tile/zone intersection testing (NEW in v0.2.9)
 ├── inference.rs        # FUSE request analyzer
 ├── scenery_index.rs    # SceneryIndex for exact tile lookup
 ├── listener.rs         # UDP telemetry listener
@@ -515,3 +559,4 @@ Reduce prefetch rate when provider shows signs of throttling.
 | 2025-12-23 | Claude | Major refactor: RadialPrefetcher as recommended strategy (49 tiles vs 21,000+), Prefetcher trait for strategy pattern, shared memory cache adapter, 10-second request timeout, TTL tracking for failed tiles |
 | 2025-12-25 | Claude | HeadingAwarePrefetcher: Cone and buffer generators, turn detection, FUSE inference fallback, graceful degradation chain |
 | 2025-12-26 | Claude | SceneryIndex: Parse .ter files for exact tile coordinates, sea tile detection, grid-based spatial index |
+| 2025-12-28 | Claude | **Dual-zone architecture**: Radial buffer (85-100nm, 360°) + heading cone (85-120nm, 60° forward). New intersection.rs module for proper tile/zone intersection testing. Config keys: radial_outer_radius_nm, cone_outer_radius_nm, cone_half_angle. Three-pool CPU limiter gives prefetch guaranteed capacity. |
