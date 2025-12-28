@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9] - 2025-12-28
+
+### Added
+
+- **Disk Cache Eviction Daemon**: Background task enforcing disk cache size limits
+  - Runs every 60 seconds via async tokio task
+  - Immediate eviction check on startup
+  - LRU eviction based on file modification time (mtime)
+  - Evicts to 90% of limit to leave headroom for new writes
+  - Diagnostic logging for troubleshooting cache issues
+
+- **SceneryIndex Persistent Cache**: Dramatically faster startup times
+  - Caches scenery tile index to `~/.cache/xearthlayer/scenery_index.bin`
+  - Cache validated against package list on each startup
+  - Rebuilds automatically when packages change
+  - Reduces startup from 30+ seconds to <1 second on subsequent launches
+
+- **SceneryIndex CLI Commands**: Manage the scenery index cache
+  - `xearthlayer scenery-index status` - Show cache status and tile counts
+  - `xearthlayer scenery-index update` - Force rebuild from installed packages
+  - `xearthlayer scenery-index clear` - Delete cache file
+
+- **Cold-Start Prewarm**: Pre-populate cache before X-Plane starts loading
+  - New `--airport <ICAO>` flag for `xearthlayer run`
+  - Loads tiles within configurable radius (default 100nm) of departure airport
+  - Runs in background after scenery index loads
+  - Press 'c' to cancel prewarm and proceed to flight
+  - Configure radius via `prewarm.radius_nm` in config.ini
+
+- **Dashboard Loading State**: Visual feedback during startup
+  - Shows scenery index building progress (packages scanned, tiles indexed)
+  - Displays "Cache loaded" message when using cached index
+  - Smooth transition to running state when ready
+
+### Fixed
+
+- **Disk Cache Size Enforcement**: Cache now respects configured limits
+  - Previously, disk cache would grow unbounded (design existed but wasn't implemented)
+  - Eviction daemon now actively removes oldest tiles when over limit
+
+- **Config Upgrade Detection**: Properly identifies deprecated and unknown keys
+  - `xearthlayer config upgrade` now correctly detects all config issues
+  - Fixed false negatives where deprecated keys were not flagged
+
+- **Airport Coordinate Parsing**: Fixed prewarm searching wrong locations
+  - Corrected lat/lon parsing from apt.dat files
+  - Fixed potential deadlock during prewarm initialization
+
+### Changed
+
+- **Dual-Zone Prefetch Architecture**: Configurable inner and outer boundaries
+  - `prefetch.inner_radius_nm` (default 85nm) - Inner boundary of prefetch zone
+  - `prefetch.outer_radius_nm` (default 95nm) - Outer boundary of prefetch zone
+  - Replaced single distance setting with explicit zone boundaries
+  - See updated docs for zone configuration guidance
+
+- **Dashboard Modularization**: Refactored into focused submodules
+  - Improved maintainability and testability
+  - No user-visible changes
+
+- **Concurrency Limiter Naming**: Clearer internal naming for debugging
+  - HTTP limiter, CPU limiter, Disk I/O limiter now consistently named
+  - Helps identify bottlenecks in logs
+
+- **Prewarm Radius**: Reverted from 300nm to 100nm default
+  - 100nm matches X-Plane's standard DSF loading radius
+  - Larger radius wastes bandwidth on tiles X-Plane won't request
+
+### Removed
+
+- **Deprecated Prefetch Settings**: Cleaned up unused configuration
+  - Removed `prefetch.prediction_distance_nm` (replaced by inner/outer radius)
+  - Removed `prefetch.time_horizon_secs` (no longer used)
+
+### Upgrade Notes
+
+**Recommended `config.ini` changes for v0.2.9:**
+
+```ini
+[prefetch]
+# New dual-zone settings (replace prediction_distance_nm if present)
+inner_radius_nm = 85
+outer_radius_nm = 95
+
+[prewarm]
+# Optional: adjust prewarm radius for Extended DSFs
+radius_nm = 100    ; Default covers standard DSF loading
+; radius_nm = 150  ; Use for Extended DSFs setting
+```
+
+Run `xearthlayer config upgrade` to automatically add new settings with defaults.
+
 ## [0.2.8] - 2025-12-27
 
 ### Added
@@ -231,7 +323,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Linux support only (Windows and macOS planned for future releases)
 - Requires FUSE3 for filesystem mounting
 
-[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.2.8...HEAD
+[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.2.9...HEAD
+[0.2.9]: https://github.com/samsoir/xearthlayer/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/samsoir/xearthlayer/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/samsoir/xearthlayer/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/samsoir/xearthlayer/compare/v0.2.5...v0.2.6
