@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use xearthlayer::airport::AirportIndex;
+use xearthlayer::cache::{run_eviction_daemon, DiskCacheConfig};
 use xearthlayer::config::{
     analyze_config, config_file_path, format_size, ConfigFile, DownloadConfig, TextureConfig,
 };
@@ -276,6 +277,29 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         println!();
     }
 
+    // Start disk cache eviction daemon (shared between TUI and non-TUI paths)
+    // This runs in the background and evicts oldest files when cache exceeds limit
+    let eviction_cancellation = CancellationToken::new();
+    if !args.no_cache {
+        if let Some(service) = mount_manager.get_service() {
+            let eviction_config = DiskCacheConfig {
+                cache_dir: config.cache.directory.clone(),
+                max_size_bytes: config.cache.disk_size,
+                daemon_interval_secs: 60,
+                max_age_days: None,
+            };
+            let eviction_cancel = eviction_cancellation.clone();
+            let runtime_handle = service.runtime_handle().clone();
+            runtime_handle.spawn(async move {
+                run_eviction_daemon(eviction_config, eviction_cancel).await;
+            });
+            tracing::debug!(
+                max_size = config.cache.disk_size,
+                "Disk cache eviction daemon started"
+            );
+        }
+    }
+
     // Start prefetch system if enabled (non-TUI path only)
     // TUI path handles prefetch setup inside run_with_dashboard after index is built
     let prefetch_cancellation = CancellationToken::new();
@@ -447,6 +471,9 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
 
     // Cancel prefetch system for TUI path
     cleanup_cancellation.cancel();
+
+    // Cancel disk cache eviction daemon
+    eviction_cancellation.cancel();
 
     // Get final telemetry before unmounting
     let final_snapshot = mount_manager.aggregated_telemetry();

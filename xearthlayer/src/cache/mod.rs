@@ -3,14 +3,17 @@
 //! The async pipeline uses:
 //! - `MemoryCache` for DDS tiles (LRU eviction, thread-safe)
 //! - `ParallelDiskCache` (in `pipeline/disk_cache.rs`) for chunks
+//! - `DiskCacheDaemon` for periodic disk cache eviction
 //!
-//! This module provides the memory cache and supporting types.
+//! This module provides the memory cache, disk eviction daemon, and supporting types.
 
+mod disk_eviction;
 mod memory;
 mod path;
 mod stats;
 mod types;
 
+pub use disk_eviction::{run_eviction_daemon, EvictionResult};
 pub use memory::MemoryCache;
 pub use stats::{CacheStatistics, CacheStats};
 pub use types::{CacheError, CacheKey, DiskCacheConfig, MemoryCacheConfig};

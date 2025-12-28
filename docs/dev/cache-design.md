@@ -328,61 +328,73 @@ struct DiskWriteRequest {
 - Background thread allows eviction to happen asynchronously
 - 60-second interval is sufficient since tiles are ~11MB each
 
-## Thread Architecture
+## Async Architecture
 
 ### Design Decision
 
-**Decision**: Memory cache uses synchronous eviction-on-put; disk cache uses a background daemon.
+**Decision**: Memory cache uses moka's automatic LRU eviction; disk cache uses an async tokio daemon.
 
 **Rationale**:
-- Memory eviction is fast (in-memory sort and remove) - no daemon needed
+- Memory cache: `moka::future::Cache` provides efficient, lock-free LRU eviction
 - Disk eviction is slow (filesystem I/O) - must not block tile delivery
-- Simpler architecture than having multiple daemon threads
-- Clean shutdown via `Drop` trait ensures daemon terminates gracefully
+- Uses tokio async tasks instead of OS threads for better integration with async pipeline
+- Clean shutdown via `CancellationToken` for graceful termination
 
-### Main FUSE Thread
-- Handles FUSE operations (lookup, read, etc.)
-- Queries memory cache synchronously
-- Triggers disk reads synchronously (if memory miss)
-- Writes to disk synchronously (write-through strategy)
+### FUSE Async Operations
+- Handles FUSE operations asynchronously via fuse3
+- Queries memory cache (moka provides sub-millisecond access)
+- Triggers disk reads via async I/O with concurrency limiting
+- Writes to disk asynchronously (write-through strategy)
 
-### Disk Cache GC Daemon
-- Single background thread named `disk-cache-gc`
-- Sleeps in 1-second intervals (for responsive shutdown)
-- Runs eviction check every `daemon_interval_secs` (default: 60s)
-- Uses `AtomicBool` for clean shutdown signaling
-- Automatically started when `CacheSystem` is created
-- Automatically stopped when `CacheSystem` is dropped
+### Disk Cache Eviction Daemon
+- Spawned as tokio async task via `runtime_handle.spawn()`
+- Runs eviction check every 60 seconds (configurable via `daemon_interval_secs`)
+- Uses `CancellationToken` for clean shutdown signaling
+- Filesystem operations wrapped in `spawn_blocking` to avoid blocking the async runtime
+- LRU eviction based on file modification time (mtime)
+- Evicts to 90% of limit to provide headroom for new writes
 
-### Thread Communication
+### Implementation
 
 ```rust
-/// Background daemon for disk cache garbage collection.
-pub struct DiskCacheDaemon {
-    /// Handle to the daemon thread
-    thread_handle: Option<JoinHandle<()>>,
-    /// Shutdown signal (AtomicBool for lock-free signaling)
-    shutdown: Arc<AtomicBool>,
+/// Disk cache eviction daemon configuration.
+pub struct DiskCacheConfig {
+    pub cache_dir: PathBuf,
+    pub max_size_bytes: usize,
+    pub daemon_interval_secs: u64,  // Default: 60
+    pub max_age_days: Option<u32>,
 }
 
-/// Two-tier cache system with integrated GC daemon.
-pub struct CacheSystem {
-    /// Memory cache (Tier 1: fast, evicts on put)
-    memory: Arc<MemoryCache>,
-    /// Disk cache (Tier 2: persistent)
-    disk: Arc<DiskCache>,
-    /// Provider name
-    provider: String,
-    /// Background daemon for disk cache GC
-    daemon: DiskCacheDaemon,
+/// Run the disk cache eviction daemon.
+pub async fn run_eviction_daemon(
+    config: DiskCacheConfig,
+    cancellation: CancellationToken,
+) {
+    // Initial eviction check on startup
+    if let Some(result) = evict_if_over_limit(&config).await {
+        log_eviction_result(&result);
+    }
+
+    // Periodic eviction loop
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => break,
+            _ = tokio::time::sleep(Duration::from_secs(config.daemon_interval_secs)) => {
+                if let Some(result) = evict_if_over_limit(&config).await {
+                    log_eviction_result(&result);
+                }
+            }
+        }
+    }
 }
 ```
 
 ### Lifecycle
 
-1. **Startup**: `CacheSystem::new()` creates caches and starts the GC daemon
-2. **Running**: Daemon wakes every 60s, checks disk size, evicts if needed
-3. **Shutdown**: `drop(CacheSystem)` signals daemon to stop and waits for thread to join
+1. **Startup**: `run.rs` spawns eviction daemon with `runtime_handle.spawn()`
+2. **Initial Check**: Immediately evicts if over limit on startup
+3. **Running**: Daemon wakes every 60s, checks disk size, evicts if needed
+4. **Shutdown**: `CancellationToken` signals daemon to stop gracefully
 
 ## Cache Statistics
 
@@ -621,29 +633,30 @@ rm -rf ~/.cache/xearthlayer/bing/
 ## Implementation Status
 
 ### Phase 1: Basic Memory Cache ✅
-- ✅ In-memory HashMap cache
+- ✅ In-memory cache using moka::future::Cache
 - ✅ CacheKey with provider/format/tile coordinates
 
 ### Phase 2: Memory Cache with LRU ✅
 - ✅ Memory size limits (2GB default, configurable)
-- ✅ LRU eviction on `put()` operations
+- ✅ Automatic LRU eviction via moka weigher
 - ✅ Statistics tracking (hits, misses, evictions)
 
 ### Phase 3: Disk Cache ✅
 - ✅ Hierarchical disk cache structure (provider/format/zoom/row)
-- ✅ Synchronous disk writes (write-through)
+- ✅ Async disk writes with concurrency limiting
 - ✅ Disk cache with size limits (20GB default, configurable)
-- ✅ LRU eviction for disk cache
-- ✅ Startup eviction (cleanup before simulator starts)
-- ✅ Background GC daemon (60-second interval)
-- ✅ Clean daemon shutdown on drop
+- ✅ LRU eviction based on file mtime
+- ✅ Startup eviction (immediate check before simulator starts)
+- ✅ Background eviction daemon (60-second interval, async tokio task)
+- ✅ Clean daemon shutdown via CancellationToken
+- ✅ Eviction to 90% of limit (10% headroom)
 
 ### Phase 4: Advanced Features (Partial)
 - ❌ Virtual `/stats` file (planned)
 - ✅ Configurable cache sizes via config.ini
 - ❌ Age-based eviction (config exists, not implemented)
 - ❌ Corruption detection/recovery (not implemented)
-- ❌ Cache pre-warming (not implemented)
+- ✅ Cache pre-warming via `--airport` flag
 
 ## Directory Size Estimates
 
@@ -705,23 +718,26 @@ du -sh ~/.cache/xearthlayer/*/* | sort -h
 
 ### Automated Cleanup
 
-The disk cache garbage collection runs automatically:
+The disk cache eviction daemon (`cache/disk_eviction.rs`) runs automatically:
 
 **On Startup**:
-- Scans cache directory and builds index
-- Evicts if over limit before simulator starts requesting tiles
-- Ensures clean state from previous sessions
+- Daemon spawned via `runtime_handle.spawn()` in `run.rs`
+- Immediate eviction check before the 60-second loop begins
+- Evicts to 90% of limit if over, leaving headroom for new writes
+- Logs scan results: files collected, collectable size, target size
 
 **Background Daemon** (every 60 seconds):
 - Checks if cache exceeds `max_size_bytes`
-- Evicts oldest tiles (by mtime) until at 90% of limit
-- Logs eviction statistics at INFO level
-- Uses minimal CPU when cache is under limit
+- Collects all cache files and sorts by mtime (oldest first)
+- Deletes oldest files until at 90% of limit
+- Cleans up empty directories after eviction
+- Logs eviction statistics: files deleted, bytes freed, duration
+- Uses minimal CPU when cache is under limit (just stat calls)
 
 **On Shutdown**:
-- Daemon receives shutdown signal
-- Thread joins cleanly (waits up to 1 second)
-- No orphaned threads or resources
+- `CancellationToken` signals daemon to stop
+- Daemon completes current operation and exits cleanly
+- No orphaned tasks or resources
 
 ## Future Enhancements
 
