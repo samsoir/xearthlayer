@@ -78,7 +78,7 @@ pub use strategy::Prefetcher;
 // Heading-aware prefetch exports
 pub use buffer::{merge_prefetch_tiles, BufferGenerator};
 pub use cone::ConeGenerator;
-pub use config::{FuseInferenceConfig, HeadingAwarePrefetchConfig, ZoomLevelPrefetchConfig};
+pub use config::{FuseInferenceConfig, HeadingAwarePrefetchConfig};
 pub use heading_aware::{
     HeadingAwarePrefetchStats, HeadingAwarePrefetchStatsSnapshot, HeadingAwarePrefetcher,
     HeadingAwarePrefetcherConfig,

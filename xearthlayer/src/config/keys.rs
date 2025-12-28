@@ -86,9 +86,6 @@ pub enum ConfigKey {
     PrefetchOuterRadiusNm,
     PrefetchMaxTilesPerCycle,
     PrefetchCycleIntervalMs,
-    PrefetchEnableZl12,
-    PrefetchZl12InnerRadiusNm,
-    PrefetchZl12OuterRadiusNm,
 
     // Control plane settings
     ControlPlaneMaxConcurrentJobs,
@@ -149,9 +146,6 @@ impl FromStr for ConfigKey {
             "prefetch.outer_radius_nm" => Ok(ConfigKey::PrefetchOuterRadiusNm),
             "prefetch.max_tiles_per_cycle" => Ok(ConfigKey::PrefetchMaxTilesPerCycle),
             "prefetch.cycle_interval_ms" => Ok(ConfigKey::PrefetchCycleIntervalMs),
-            "prefetch.enable_zl12" => Ok(ConfigKey::PrefetchEnableZl12),
-            "prefetch.zl12_inner_radius_nm" => Ok(ConfigKey::PrefetchZl12InnerRadiusNm),
-            "prefetch.zl12_outer_radius_nm" => Ok(ConfigKey::PrefetchZl12OuterRadiusNm),
 
             "control_plane.max_concurrent_jobs" => Ok(ConfigKey::ControlPlaneMaxConcurrentJobs),
             "control_plane.stall_threshold_secs" => Ok(ConfigKey::ControlPlaneStallThresholdSecs),
@@ -209,9 +203,6 @@ impl ConfigKey {
             ConfigKey::PrefetchOuterRadiusNm => "prefetch.outer_radius_nm",
             ConfigKey::PrefetchMaxTilesPerCycle => "prefetch.max_tiles_per_cycle",
             ConfigKey::PrefetchCycleIntervalMs => "prefetch.cycle_interval_ms",
-            ConfigKey::PrefetchEnableZl12 => "prefetch.enable_zl12",
-            ConfigKey::PrefetchZl12InnerRadiusNm => "prefetch.zl12_inner_radius_nm",
-            ConfigKey::PrefetchZl12OuterRadiusNm => "prefetch.zl12_outer_radius_nm",
             ConfigKey::ControlPlaneMaxConcurrentJobs => "control_plane.max_concurrent_jobs",
             ConfigKey::ControlPlaneStallThresholdSecs => "control_plane.stall_threshold_secs",
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => {
@@ -308,13 +299,6 @@ impl ConfigKey {
             ConfigKey::PrefetchOuterRadiusNm => config.prefetch.outer_radius_nm.to_string(),
             ConfigKey::PrefetchMaxTilesPerCycle => config.prefetch.max_tiles_per_cycle.to_string(),
             ConfigKey::PrefetchCycleIntervalMs => config.prefetch.cycle_interval_ms.to_string(),
-            ConfigKey::PrefetchEnableZl12 => config.prefetch.enable_zl12.to_string(),
-            ConfigKey::PrefetchZl12InnerRadiusNm => {
-                config.prefetch.zl12_inner_radius_nm.to_string()
-            }
-            ConfigKey::PrefetchZl12OuterRadiusNm => {
-                config.prefetch.zl12_outer_radius_nm.to_string()
-            }
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs.to_string()
             }
@@ -464,16 +448,6 @@ impl ConfigKey {
             ConfigKey::PrefetchCycleIntervalMs => {
                 config.prefetch.cycle_interval_ms = value.parse().unwrap();
             }
-            ConfigKey::PrefetchEnableZl12 => {
-                let v = value.to_lowercase();
-                config.prefetch.enable_zl12 = v == "true" || v == "1" || v == "yes" || v == "on";
-            }
-            ConfigKey::PrefetchZl12InnerRadiusNm => {
-                config.prefetch.zl12_inner_radius_nm = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchZl12OuterRadiusNm => {
-                config.prefetch.zl12_outer_radius_nm = value.parse().unwrap();
-            }
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs = value.parse().unwrap();
             }
@@ -546,9 +520,6 @@ impl ConfigKey {
             ConfigKey::PrefetchOuterRadiusNm => Box::new(PositiveNumberSpec),
             ConfigKey::PrefetchMaxTilesPerCycle => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchCycleIntervalMs => Box::new(PositiveIntegerSpec),
-            ConfigKey::PrefetchEnableZl12 => Box::new(BooleanSpec),
-            ConfigKey::PrefetchZl12InnerRadiusNm => Box::new(PositiveNumberSpec),
-            ConfigKey::PrefetchZl12OuterRadiusNm => Box::new(PositiveNumberSpec),
             ConfigKey::ControlPlaneMaxConcurrentJobs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneStallThresholdSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => Box::new(PositiveIntegerSpec),
@@ -597,9 +568,6 @@ impl ConfigKey {
             ConfigKey::PrefetchOuterRadiusNm,
             ConfigKey::PrefetchMaxTilesPerCycle,
             ConfigKey::PrefetchCycleIntervalMs,
-            ConfigKey::PrefetchEnableZl12,
-            ConfigKey::PrefetchZl12InnerRadiusNm,
-            ConfigKey::PrefetchZl12OuterRadiusNm,
             ConfigKey::ControlPlaneMaxConcurrentJobs,
             ConfigKey::ControlPlaneStallThresholdSecs,
             ConfigKey::ControlPlaneHealthCheckIntervalSecs,

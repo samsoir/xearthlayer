@@ -179,7 +179,8 @@ See [Developer Documentation](docs/dev/) for architecture and guidelines.
 ## Credits
 
 Architecturally influenced by [AutoOrtho](https://github.com/kubilus1/autoortho) by [kubilus1](https://github.com/kubilus1). XEarthLayer is an independent Rust implementation focused on performance and memory safety.
-XEarthLayer Regional Scenery Packages created using (Shred86 fork of Ortho4XP)[https://github.com/shred86/Ortho4XP]
+
+XEarthLayer Regional Scenery Packages created using [Shred86 fork of Ortho4XP](https://github.com/shred86/Ortho4XP)
 
 Developed with assistance from [Claude](https://claude.ai) by Anthropic.
 

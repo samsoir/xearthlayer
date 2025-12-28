@@ -251,83 +251,6 @@ pub struct HeadingAwarePrefetchConfig {
     ///
     /// Prevents hammering tiles that failed to download.
     pub attempt_ttl_secs: u64,
-
-    /// Secondary zoom levels for multi-zoom prefetch.
-    ///
-    /// When configured, the prefetcher generates tiles at multiple zoom levels.
-    /// Each entry defines a separate prefetch zone with its own boundaries.
-    /// The primary zoom level (above) is always used; these are additional.
-    pub secondary_zoom_levels: Vec<ZoomLevelPrefetchConfig>,
-}
-
-/// Configuration for a secondary zoom level in multi-zoom prefetch.
-///
-/// Allows prefetching at different zoom levels with independent zone boundaries.
-/// For example, ZL12 tiles can be prefetched at a different (typically outer)
-/// zone compared to ZL14 tiles.
-///
-/// ```text
-///                    outer_radius_nm
-///                         │
-///     ┌───────────────────▼───────────────────┐
-///      ╲     ZL12 PREFETCH ZONE (88-100nm)   ╱
-///       ╲                                   ╱
-///        ╲─────── inner_radius_nm ─────────╱
-///         ╲                               ╱
-///          ╲    ZL14 ZONE (85-95nm)      ╱
-///           ╲           ✈              ╱
-///            ╲                        ╱
-///             ╲______________________╱
-/// ```
-#[derive(Debug, Clone)]
-pub struct ZoomLevelPrefetchConfig {
-    /// Zoom level for this configuration.
-    pub zoom: u8,
-
-    /// Inner radius in nautical miles - where this zoom's prefetch zone starts.
-    pub inner_radius_nm: f32,
-
-    /// Outer radius in nautical miles - where this zoom's prefetch zone ends.
-    pub outer_radius_nm: f32,
-
-    /// Maximum tiles to prefetch per cycle for this zoom level.
-    pub max_tiles_per_cycle: usize,
-
-    /// Priority weight (lower = higher priority).
-    ///
-    /// Used when merging tiles from multiple zoom levels. Tiles with lower
-    /// priority values are submitted first when bandwidth is limited.
-    /// Typically ZL14 (close scenery) should have higher priority than ZL12.
-    pub priority_weight: u32,
-}
-
-impl Default for ZoomLevelPrefetchConfig {
-    fn default() -> Self {
-        Self {
-            zoom: 12,
-            inner_radius_nm: 88.0,
-            outer_radius_nm: 100.0,
-            max_tiles_per_cycle: 25,
-            priority_weight: 100, // Lower priority than ZL14's default 0
-        }
-    }
-}
-
-impl ZoomLevelPrefetchConfig {
-    /// Create a ZL12 configuration with default values.
-    pub fn zl12() -> Self {
-        Self::default()
-    }
-
-    /// Create a custom zoom level configuration.
-    pub fn new(zoom: u8, inner_radius_nm: f32, outer_radius_nm: f32) -> Self {
-        Self {
-            zoom,
-            inner_radius_nm,
-            outer_radius_nm,
-            ..Self::default()
-        }
-    }
 }
 
 impl Default for HeadingAwarePrefetchConfig {
@@ -355,9 +278,6 @@ impl Default for HeadingAwarePrefetchConfig {
             max_tiles_per_cycle: DEFAULT_MAX_TILES_PER_CYCLE,
             cycle_interval_ms: DEFAULT_CYCLE_INTERVAL_MS,
             attempt_ttl_secs: DEFAULT_ATTEMPT_TTL_SECS,
-
-            // Multi-zoom (empty by default, enable via builder or config)
-            secondary_zoom_levels: Vec::new(),
         }
     }
 }

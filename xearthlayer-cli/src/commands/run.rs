@@ -339,10 +339,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
                     .outer_radius_nm(config.prefetch.outer_radius_nm)
                     .max_tiles_per_cycle(config.prefetch.max_tiles_per_cycle)
                     .cycle_interval_ms(config.prefetch.cycle_interval_ms)
-                    .radial_radius(config.prefetch.radial_radius)
-                    .enable_zl12(config.prefetch.enable_zl12)
-                    .zl12_inner_radius_nm(config.prefetch.zl12_inner_radius_nm)
-                    .zl12_outer_radius_nm(config.prefetch.zl12_outer_radius_nm);
+                    .radial_radius(config.prefetch.radial_radius);
 
                 // Wire FUSE analyzer for heading-aware/auto strategies
                 // This enables FUSE-based position inference when telemetry is unavailable

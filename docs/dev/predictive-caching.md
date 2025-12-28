@@ -56,9 +56,9 @@ Even with fast internet and NVMe storage, the latency is perceptible. The soluti
 │  └─────────────────────────────────────────────────────────────┘│
 │                                                                  │
 │  ┌─────────────────────────────────────────────────────────────┐│
-│  │  SceneryIndex (Optional Enhancement)                        ││
+│  │  SceneryIndex (Source of Truth)                             ││
 │  │  - Reads .ter files for exact tile coordinates              ││
-│  │  - Knows correct zoom level per tile (ZL12, ZL14)           ││
+│  │  - Knows correct zoom level per tile from packages          ││
 │  │  - Deprioritizes sea tiles (~33% of tiles)                  ││
 │  └─────────────────────────────────────────────────────────────┘│
 └──────────────────────────┬──────────────────────────────────────┘
@@ -152,7 +152,7 @@ Unified prefetcher with automatic mode selection based on available input:
 - **ConeGenerator**: Projects a cone ahead of aircraft based on heading
 - **BufferGenerator**: Covers lateral and rear areas around aircraft
 - **Turn Detection**: Widens cone during turns for better coverage
-- **Multi-Zoom**: Generates both ZL14 (near) and ZL12 (far) tiles
+- **SceneryIndex**: Uses scenery package data for exact tile coordinates and zoom levels
 
 **Configuration** (`HeadingAwarePrefetcherConfig`):
 ```rust
@@ -175,20 +175,6 @@ Generates tiles in a cone-shaped region ahead of the aircraft.
 3. Generate tiles within inner-to-outer radius range (default: 85-95nm)
 4. Assign priority based on distance and zone (center higher than edges)
 5. Support turn widening: expand cone during detected turns
-
-**Multi-Zoom Support**:
-```rust
-pub fn generate_cone_tiles_for_zoom(
-    &self,
-    position: (f64, f64),
-    heading: f32,
-    turn_state: &TurnState,
-    zoom: u8,
-    inner_radius_nm: f32,
-    outer_radius_nm: f32,
-    priority_offset: u32,
-) -> Vec<PrefetchTile>
-```
 
 **Prefetch Zones**:
 ```rust
@@ -298,34 +284,15 @@ if let Some(memory_cache) = service.memory_cache_adapter() {
 
 This ensures prefetch cache checks are accurate - if a tile is in the pipeline's memory cache, the prefetcher will see it.
 
-### Multi-Zoom Prefetching
+### Zoom Level Handling
 
-XEarthLayer supports prefetching at multiple zoom levels simultaneously:
+XEarthLayer uses the **SceneryIndex** as the source of truth for which tiles to prefetch. The index reads `.ter` files from your scenery packages to determine:
 
-**ZL14 (Primary)**: High-resolution tiles for nearby scenery
-- Inner radius: 85nm (just inside X-Plane's ~90nm boundary)
-- Outer radius: 95nm (10nm prefetch depth)
-- Max tiles per cycle: 50
+- **Exact tile coordinates** from the package's terrain files
+- **Correct zoom levels** as defined by the package (not hardcoded)
+- **Tile type** (land vs sea) for priority ordering
 
-**ZL12 (Secondary)**: Low-resolution tiles for distant scenery
-- Inner radius: 88nm
-- Outer radius: 100nm (extends beyond 90nm boundary)
-- Max tiles per cycle: 25
-- Lower priority than ZL14
-
-**Configuration**:
-```ini
-[prefetch]
-# Primary (ZL14) zone
-inner_radius_nm = 85
-outer_radius_nm = 95
-max_tiles_per_cycle = 50
-
-# Secondary (ZL12) zone
-enable_zl12 = true
-zl12_inner_radius_nm = 88
-zl12_outer_radius_nm = 100
-```
+This approach means no zoom level configuration is needed - the prefetcher automatically handles whatever zoom levels exist in your scenery packages.
 
 ## Configuration
 
@@ -337,14 +304,11 @@ Configuration keys in `[prefetch]` section:
 | `strategy` | string | `auto` | Strategy: `auto`, `heading-aware`, or `radial` |
 | `udp_port` | u16 | `49002` | X-Plane UDP broadcast port |
 | `cone_angle` | f32 | `45.0` | Half-angle of prediction cone (degrees) |
-| `inner_radius_nm` | f32 | `85.0` | Inner edge of ZL14 prefetch zone (nm) |
-| `outer_radius_nm` | f32 | `95.0` | Outer edge of ZL14 prefetch zone (nm) |
+| `inner_radius_nm` | f32 | `85.0` | Inner edge of prefetch zone (nm) |
+| `outer_radius_nm` | f32 | `95.0` | Outer edge of prefetch zone (nm) |
 | `max_tiles_per_cycle` | usize | `50` | Max tiles to submit per cycle |
 | `cycle_interval_ms` | u64 | `2000` | Interval between prefetch cycles (ms) |
 | `radial_radius` | u8 | `3` | Radial fallback radius (tiles) |
-| `enable_zl12` | bool | `true` | Enable ZL12 prefetching for distant terrain |
-| `zl12_inner_radius_nm` | f32 | `88.0` | Inner edge of ZL12 prefetch zone (nm) |
-| `zl12_outer_radius_nm` | f32 | `100.0` | Outer edge of ZL12 prefetch zone (nm) |
 
 Example `config.ini`:
 ```ini
@@ -359,11 +323,6 @@ inner_radius_nm = 85
 outer_radius_nm = 95
 max_tiles_per_cycle = 50
 cycle_interval_ms = 2000
-
-# ZL12 for distant terrain (reduces stutters at 90nm boundary)
-enable_zl12 = true
-zl12_inner_radius_nm = 88
-zl12_outer_radius_nm = 100
 ```
 
 ## X-Plane Setup
@@ -393,7 +352,7 @@ Prefetch system started (heading-aware, 45° cone, 85-95nm zone, zoom 14, UDP po
 
 Dashboard shows real-time prefetch status:
 ```
-Prefetch: Telemetry | 23/cycle | Cache: 156↑ TTL: 8⊘ | ZL14 ZL12
+Prefetch: Telemetry | 23/cycle | Cache: 156↑ TTL: 8⊘
 ```
 
 Disable with `--no-prefetch` flag:
@@ -422,15 +381,16 @@ xearthlayer run --no-prefetch
 - System adapts to changing conditions (e.g., UDP packet loss)
 - Each mode provides appropriate coverage for its confidence level
 
-### DD-003: Multi-Zoom Prefetching
+### DD-003: SceneryIndex as Source of Truth
 
-**Decision**: Prefetch both ZL14 (near) and ZL12 (far) tiles simultaneously.
+**Decision**: Use SceneryIndex to determine which tiles (and at which zoom levels) to prefetch.
 
 **Rationale**:
-- X-Plane uses different zoom levels at different distances
-- ZL12 tiles cover distant terrain (beyond 90nm boundary)
-- Eliminates stutters when transitioning between zoom levels
-- ZL14 prioritized higher than ZL12 (closer = more important)
+- Scenery packages define reality - they contain specific tiles at specific zoom levels
+- Configuration-based zoom level management was redundant
+- SceneryIndex reads `.ter` files to know exact tile coordinates
+- Eliminates need for zoom-level-specific configuration
+- Tiles prioritized by distance (closer = more important)
 
 ### DD-004: Scenery-Aware Prefetch
 
@@ -486,7 +446,7 @@ TUI dashboard displays:
 - Tiles submitted per cycle
 - Cache hits (tiles already in memory)
 - TTL skipped (recently attempted)
-- Active zoom levels (ZL12, ZL14)
+- Active zoom level
 
 Log entries show detailed cycle information:
 ```
@@ -553,5 +513,5 @@ Reduce prefetch rate when provider shows signs of throttling.
 | 2025-12-21 | Claude | Initial design document |
 | 2025-12-22 | Claude | Implementation updates: ForeFlight protocol support, PrefetchCondition trait, MinimumSpeedCondition (30kt default) |
 | 2025-12-23 | Claude | Major refactor: RadialPrefetcher as recommended strategy (49 tiles vs 21,000+), Prefetcher trait for strategy pattern, shared memory cache adapter, 10-second request timeout, TTL tracking for failed tiles |
-| 2025-12-25 | Claude | HeadingAwarePrefetcher: Cone and buffer generators, turn detection, multi-zoom (ZL12+ZL14), FUSE inference fallback, graceful degradation chain |
+| 2025-12-25 | Claude | HeadingAwarePrefetcher: Cone and buffer generators, turn detection, FUSE inference fallback, graceful degradation chain |
 | 2025-12-26 | Claude | SceneryIndex: Parse .ter files for exact tile coordinates, sea tile detection, grid-based spatial index |

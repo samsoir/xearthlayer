@@ -26,7 +26,7 @@ use std::time::Duration;
 use crate::fuse::DdsHandler;
 use crate::pipeline::MemoryCache;
 
-use super::config::{FuseInferenceConfig, HeadingAwarePrefetchConfig, ZoomLevelPrefetchConfig};
+use super::config::{FuseInferenceConfig, HeadingAwarePrefetchConfig};
 use super::heading_aware::{HeadingAwarePrefetcher, HeadingAwarePrefetcherConfig};
 use super::inference::FuseRequestAnalyzer;
 use super::radial::{RadialPrefetchConfig, RadialPrefetcher};
@@ -77,11 +77,6 @@ pub struct PrefetcherBuilder<M: MemoryCache> {
     max_tiles_per_cycle: usize,
     cycle_interval_ms: u64,
 
-    // ZL12 (secondary zoom level) configuration
-    enable_zl12: bool,
-    zl12_inner_radius_nm: f32,
-    zl12_outer_radius_nm: f32,
-
     // External FUSE analyzer (for wiring callback to services before building)
     fuse_analyzer: Option<Arc<FuseRequestAnalyzer>>,
 
@@ -131,9 +126,6 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
             attempt_ttl_secs: DEFAULT_ATTEMPT_TTL_SECS,
             max_tiles_per_cycle: 50, // Reduced from 100 for better bandwidth sharing
             cycle_interval_ms: 2000, // Increased from 1000ms for less aggressive prefetch
-            enable_zl12: true,
-            zl12_inner_radius_nm: 88.0,
-            zl12_outer_radius_nm: 100.0,
             fuse_analyzer: None,
             scenery_index: None,
         }
@@ -224,24 +216,6 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
         self
     }
 
-    /// Enable or disable ZL12 prefetching.
-    pub fn enable_zl12(mut self, enable: bool) -> Self {
-        self.enable_zl12 = enable;
-        self
-    }
-
-    /// Set the inner radius for ZL12 prefetch zone (nautical miles).
-    pub fn zl12_inner_radius_nm(mut self, nm: f32) -> Self {
-        self.zl12_inner_radius_nm = nm;
-        self
-    }
-
-    /// Set the outer radius for ZL12 prefetch zone (nautical miles).
-    pub fn zl12_outer_radius_nm(mut self, nm: f32) -> Self {
-        self.zl12_outer_radius_nm = nm;
-        self
-    }
-
     /// Set the FUSE request analyzer for position inference.
     ///
     /// When provided, this analyzer is used instead of creating a new one.
@@ -325,19 +299,6 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
             }
             PrefetchStrategy::HeadingAware | PrefetchStrategy::Auto => {
                 // Heading-aware prefetcher with graceful degradation
-                // Build secondary zoom levels (e.g., ZL12 for distant terrain)
-                let secondary_zoom_levels = if self.enable_zl12 {
-                    vec![ZoomLevelPrefetchConfig {
-                        zoom: 12,
-                        inner_radius_nm: self.zl12_inner_radius_nm,
-                        outer_radius_nm: self.zl12_outer_radius_nm,
-                        max_tiles_per_cycle: 25, // ZL12 tiles are larger, need fewer
-                        priority_weight: 100,    // Lower priority than ZL14
-                    }]
-                } else {
-                    Vec::new()
-                };
-
                 let heading_config = HeadingAwarePrefetchConfig {
                     cone_half_angle: self.cone_half_angle,
                     inner_radius_nm: self.inner_radius_nm,
@@ -345,7 +306,6 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
                     zoom: self.zoom,
                     max_tiles_per_cycle: self.max_tiles_per_cycle,
                     cycle_interval_ms: self.cycle_interval_ms,
-                    secondary_zoom_levels,
                     ..HeadingAwarePrefetchConfig::default()
                 };
 

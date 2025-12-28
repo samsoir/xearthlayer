@@ -271,9 +271,6 @@ Controls predictive tile prefetching based on X-Plane telemetry. The prefetch sy
 | `max_tiles_per_cycle` | integer | `50` | Maximum tiles to submit per prefetch cycle |
 | `cycle_interval_ms` | integer | `2000` | Interval between prefetch cycles (milliseconds) |
 | `radial_radius` | integer | `3` | Radial fallback tile radius (3 = 7×7 = 49 tiles) |
-| `enable_zl12` | bool | `true` | Enable ZL12 prefetching for distant terrain |
-| `zl12_inner_radius_nm` | float | `88` | Inner edge of ZL12 prefetch zone (nautical miles) |
-| `zl12_outer_radius_nm` | float | `100` | Outer edge of ZL12 prefetch zone (nautical miles) |
 
 **Strategy Options:**
 
@@ -283,13 +280,9 @@ Controls predictive tile prefetching based on X-Plane telemetry. The prefetch sy
 | `heading-aware` | Direction-aware cone prefetching, requires telemetry |
 | `radial` | Simple grid around current position, works without telemetry |
 
-**Multi-Zoom Prefetching:**
+**Zoom Level Handling:**
 
-XEarthLayer prefetches tiles at two zoom levels:
-- **ZL14** (primary): High-resolution tiles for nearby scenery (85-95nm)
-- **ZL12** (secondary): Low-resolution tiles for distant scenery (88-100nm)
-
-This eliminates stutters when transitioning between zoom levels at the ~90nm boundary.
+XEarthLayer automatically prefetches tiles at the correct zoom levels by reading the `.ter` files in your scenery packages. The SceneryIndex knows exactly which tiles exist and at what zoom level, so no manual zoom level configuration is needed.
 
 **Example:**
 ```ini
@@ -298,17 +291,12 @@ enabled = true
 strategy = auto
 udp_port = 49002
 
-; Primary prefetch zone (ZL14)
+; Prefetch zone configuration
 cone_angle = 45
 inner_radius_nm = 85
 outer_radius_nm = 95
 max_tiles_per_cycle = 50
 cycle_interval_ms = 2000
-
-; Secondary prefetch zone (ZL12) for distant terrain
-enable_zl12 = true
-zl12_inner_radius_nm = 88
-zl12_outer_radius_nm = 100
 ```
 
 **X-Plane Setup:**
@@ -421,17 +409,12 @@ enabled = true
 strategy = auto  ; auto, heading-aware, or radial
 ; udp_port = 49002
 
-; Primary prefetch zone (ZL14 - high resolution near scenery)
+; Prefetch zone configuration
 ; cone_angle = 45              ; half-angle of prediction cone (degrees)
 ; inner_radius_nm = 85         ; start prefetching just inside 90nm boundary
 ; outer_radius_nm = 95         ; 10nm prefetch depth
 ; max_tiles_per_cycle = 50     ; tiles per cycle (lower = less bandwidth)
 ; cycle_interval_ms = 2000     ; cycle interval (higher = less aggressive)
-
-; Secondary prefetch zone (ZL12 - low resolution distant scenery)
-enable_zl12 = true            ; prefetch distant terrain tiles
-; zl12_inner_radius_nm = 88
-; zl12_outer_radius_nm = 100
 
 ; Radial fallback (when telemetry unavailable)
 ; radial_radius = 3            ; 7×7 tile grid
@@ -553,9 +536,6 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `prefetch.max_tiles_per_cycle` | positive integer | Max tiles per prefetch cycle |
 | `prefetch.cycle_interval_ms` | positive integer | Prefetch cycle interval (ms) |
 | `prefetch.radial_radius` | positive integer | Radial fallback tile radius |
-| `prefetch.enable_zl12` | `true`, `false` | Enable ZL12 distant terrain prefetch |
-| `prefetch.zl12_inner_radius_nm` | positive number | ZL12 zone inner edge (nm) |
-| `prefetch.zl12_outer_radius_nm` | positive number | ZL12 zone outer edge (nm) |
 | `xplane.scenery_dir` | path | X-Plane Custom Scenery directory |
 | `packages.library_url` | URL | Package library index URL |
 | `packages.install_location` | path | Package installation directory |

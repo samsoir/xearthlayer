@@ -265,8 +265,8 @@ impl ConeGenerator {
 
     /// Generate tiles for a specific zoom level with custom zone boundaries.
     ///
-    /// This is used for multi-zoom prefetching where different zoom levels
-    /// have different prefetch zones (e.g., ZL12 tiles at 88-100nm, ZL14 at 85-95nm).
+    /// This is used for generating tiles at a specific zoom level with custom
+    /// prefetch zone boundaries different from the configured defaults.
     ///
     /// # Arguments
     ///

@@ -210,15 +210,6 @@ pub struct PrefetchSettings {
     /// Interval between prefetch cycles in milliseconds. Default: 2000ms.
     /// Higher values reduce prefetch aggressiveness.
     pub cycle_interval_ms: u64,
-    /// Enable ZL12 (zoom level 12) prefetching. Default: true.
-    /// ZL12 tiles are used for distant terrain and reduce stutters at the 90nm boundary.
-    pub enable_zl12: bool,
-    /// Inner radius for ZL12 prefetch zone (nautical miles). Default: 88nm.
-    /// ZL12 prefetch zone starts here (just inside the 90nm boundary).
-    pub zl12_inner_radius_nm: f32,
-    /// Outer radius for ZL12 prefetch zone (nautical miles). Default: 100nm.
-    /// ZL12 prefetch zone ends here (beyond the 90nm boundary).
-    pub zl12_outer_radius_nm: f32,
 }
 
 /// Control plane configuration for job management and health monitoring.
@@ -303,9 +294,6 @@ impl Default for ConfigFile {
                 outer_radius_nm: DEFAULT_PREFETCH_OUTER_RADIUS_NM,
                 max_tiles_per_cycle: DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE,
                 cycle_interval_ms: DEFAULT_PREFETCH_CYCLE_INTERVAL_MS,
-                enable_zl12: DEFAULT_PREFETCH_ENABLE_ZL12,
-                zl12_inner_radius_nm: DEFAULT_PREFETCH_ZL12_INNER_RADIUS_NM,
-                zl12_outer_radius_nm: DEFAULT_PREFETCH_ZL12_OUTER_RADIUS_NM,
             },
             control_plane: ControlPlaneSettings {
                 max_concurrent_jobs: default_max_concurrent_jobs(),
@@ -458,17 +446,6 @@ pub const DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE: usize = 50;
 /// Default interval between prefetch cycles in milliseconds.
 /// Increased from 1000ms to 2000ms to reduce prefetch aggressiveness.
 pub const DEFAULT_PREFETCH_CYCLE_INTERVAL_MS: u64 = 2000;
-
-/// Default enable ZL12 prefetching.
-pub const DEFAULT_PREFETCH_ENABLE_ZL12: bool = true;
-
-/// Default inner radius for ZL12 prefetch zone (nautical miles).
-/// Just inside X-Plane's 90nm loaded zone boundary.
-pub const DEFAULT_PREFETCH_ZL12_INNER_RADIUS_NM: f32 = 88.0;
-
-/// Default outer radius for ZL12 prefetch zone (nautical miles).
-/// Beyond X-Plane's 90nm boundary for distant terrain prefetch.
-pub const DEFAULT_PREFETCH_ZL12_OUTER_RADIUS_NM: f32 = 100.0;
 
 // =============================================================================
 // Control plane defaults
@@ -909,28 +886,6 @@ impl ConfigFile {
                         reason: "must be a positive integer (milliseconds)".to_string(),
                     })?;
             }
-            if let Some(v) = section.get("enable_zl12") {
-                let v = v.trim().to_lowercase();
-                config.prefetch.enable_zl12 = v == "true" || v == "1" || v == "yes" || v == "on";
-            }
-            if let Some(v) = section.get("zl12_inner_radius_nm") {
-                config.prefetch.zl12_inner_radius_nm =
-                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                        section: "prefetch".to_string(),
-                        key: "zl12_inner_radius_nm".to_string(),
-                        value: v.to_string(),
-                        reason: "must be a positive number (nautical miles)".to_string(),
-                    })?;
-            }
-            if let Some(v) = section.get("zl12_outer_radius_nm") {
-                config.prefetch.zl12_outer_radius_nm =
-                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                        section: "prefetch".to_string(),
-                        key: "zl12_outer_radius_nm".to_string(),
-                        value: v.to_string(),
-                        reason: "must be a positive number (nautical miles)".to_string(),
-                    })?;
-            }
         }
 
         // [control_plane] section
@@ -1152,15 +1107,6 @@ max_tiles_per_cycle = {}
 ; Interval between prefetch cycles in milliseconds (default: 2000)
 ; Higher values reduce prefetch aggressiveness
 cycle_interval_ms = {}
-; Enable ZL12 prefetching for distant terrain (default: true)
-; ZL12 tiles reduce stutters at the 90nm scenery boundary
-enable_zl12 = {}
-; Inner radius for ZL12 prefetch zone (nautical miles, default: 88)
-; Just inside X-Plane's ~90nm loaded zone boundary
-zl12_inner_radius_nm = {}
-; Outer radius for ZL12 prefetch zone (nautical miles, default: 100)
-; Beyond X-Plane's boundary for distant terrain prefetch
-zl12_outer_radius_nm = {}
 
 [control_plane]
 ; Advanced settings for job management and health monitoring.
@@ -1217,9 +1163,6 @@ semaphore_timeout_secs = {}
             self.prefetch.outer_radius_nm,
             self.prefetch.max_tiles_per_cycle,
             self.prefetch.cycle_interval_ms,
-            self.prefetch.enable_zl12,
-            self.prefetch.zl12_inner_radius_nm,
-            self.prefetch.zl12_outer_radius_nm,
             self.control_plane.max_concurrent_jobs,
             self.control_plane.stall_threshold_secs,
             self.control_plane.health_check_interval_secs,

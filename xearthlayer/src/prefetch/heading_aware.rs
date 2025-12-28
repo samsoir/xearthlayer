@@ -476,12 +476,10 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
 
     /// Generate tiles using telemetry-based cone generator.
     ///
-    /// Generates tiles at the primary zoom level (ZL14) and any configured
-    /// secondary zoom levels (e.g., ZL12) with their own prefetch zones.
+    /// Generates tiles at the configured zoom level with cone and buffer coverage.
     fn generate_telemetry_tiles(&self, state: &AircraftState) -> Vec<PrefetchTile> {
         let position = (state.latitude, state.longitude);
 
-        // Generate primary zoom level tiles
         // Generate cone tiles (turn state affects widening internally)
         let cone_tiles =
             self.cone_generator
@@ -492,34 +490,11 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
             self.buffer_generator
                 .generate_buffer_tiles(position, state.heading, &self.turn_state);
 
-        // Collect all tile sources
-        let mut all_sources = vec![cone_tiles, buffer_tiles];
-
-        // Generate tiles for secondary zoom levels (e.g., ZL12)
-        for secondary in &self.config.heading.secondary_zoom_levels {
-            let secondary_tiles = self.cone_generator.generate_cone_tiles_for_zoom(
-                position,
-                state.heading,
-                &self.turn_state,
-                secondary.zoom,
-                secondary.inner_radius_nm,
-                secondary.outer_radius_nm,
-                secondary.priority_weight, // Priority offset for this zoom level
-            );
-
-            // Limit secondary tiles per their config
-            let limited: Vec<_> = secondary_tiles
-                .into_iter()
-                .take(secondary.max_tiles_per_cycle)
-                .collect();
-            all_sources.push(limited);
-        }
-
-        // Merge all tiles and sort by priority
-        let mut merged = super::buffer::merge_prefetch_tiles(all_sources);
+        // Merge tiles and sort by priority
+        let mut merged = super::buffer::merge_prefetch_tiles(vec![cone_tiles, buffer_tiles]);
         merged.sort_by_key(|t| t.priority);
 
-        // Limit to max tiles per cycle (total across all zoom levels)
+        // Limit to max tiles per cycle
         merged.truncate(self.config.heading.max_tiles_per_cycle);
 
         merged
@@ -527,13 +502,7 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
 
     /// Get the list of active zoom levels for dashboard display.
     fn active_zoom_levels(&self) -> Vec<u8> {
-        let mut levels = vec![self.config.heading.zoom];
-        for secondary in &self.config.heading.secondary_zoom_levels {
-            levels.push(secondary.zoom);
-        }
-        levels.sort();
-        levels.dedup();
-        levels
+        vec![self.config.heading.zoom]
     }
 
     /// Generate tiles using radial fallback.
@@ -631,7 +600,7 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
                 // Deprioritize sea tiles (add 200 to priority, making them lower priority)
                 let type_priority = if st.is_sea { 200 } else { 0 };
 
-                // Higher zoom levels are higher priority (ZL14 before ZL12)
+                // Include zoom level in priority (closer zoom levels get slight priority)
                 let zoom_priority = (20u8.saturating_sub(st.tile_zoom())) as u32 * 5;
 
                 let priority = PrefetchZone::ForwardCenter.base_priority()
