@@ -13,17 +13,17 @@ use xearthlayer::airport::AirportIndex;
 use xearthlayer::config::{
     analyze_config, config_file_path, format_size, ConfigFile, DownloadConfig, TextureConfig,
 };
-use xearthlayer::xplane::XPlaneEnvironment;
 use xearthlayer::log::TracingLogger;
 use xearthlayer::manager::{InstalledPackage, LocalPackageStore, MountManager, ServiceBuilder};
 use xearthlayer::package::PackageType;
 use xearthlayer::panic as panic_handler;
 use xearthlayer::prefetch::{
-    FuseInferenceConfig, FuseRequestAnalyzer, IndexingProgress, PrefetcherBuilder,
-    PrewarmConfig, PrewarmPrefetcher, PrewarmProgress as LibPrewarmProgress,
-    SceneryIndex, SharedPrefetchStatus, TelemetryListener,
+    FuseInferenceConfig, FuseRequestAnalyzer, IndexingProgress, PrefetcherBuilder, PrewarmConfig,
+    PrewarmPrefetcher, PrewarmProgress as LibPrewarmProgress, SceneryIndex, SharedPrefetchStatus,
+    TelemetryListener,
 };
 use xearthlayer::service::ServiceConfig;
+use xearthlayer::xplane::XPlaneEnvironment;
 
 use super::common::{resolve_dds_format, resolve_provider, DdsCompression, ProviderType};
 use crate::error::CliError;
@@ -411,9 +411,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     .map_err(|e| CliError::Config(format!("Failed to set signal handler: {}", e)))?;
 
     // Track which cancellation token to use for cleanup
-    let cleanup_cancellation: CancellationToken;
-
-    if use_tui {
+    let cleanup_cancellation = if use_tui {
         // TUI path: Start dashboard in Loading state, build index async, then start prefetcher
         // This provides immediate visual feedback during the 30+ second index build
         let ctx = TuiContext {
@@ -427,11 +425,14 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
             prefetch_cancellation,
             airport_icao: args.airport.clone(),
             // Derive X-Plane environment from Custom Scenery path
-            xplane_env: config.packages.custom_scenery_path.as_ref()
+            xplane_env: config
+                .packages
+                .custom_scenery_path
+                .as_ref()
                 .or(config.xplane.scenery_dir.as_ref())
                 .and_then(|p| XPlaneEnvironment::from_custom_scenery_path(p).ok()),
         };
-        cleanup_cancellation = run_with_dashboard(ctx)?;
+        run_with_dashboard(ctx)?
     } else {
         // Fallback to simple text output for non-TTY
         run_with_simple_output(&mut mount_manager, shutdown)?;
@@ -440,8 +441,8 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         if prefetch_started {
             prefetch_cancellation.cancel();
         }
-        cleanup_cancellation = CancellationToken::new(); // Dummy token, already cancelled above
-    }
+        CancellationToken::new() // Dummy token, already cancelled above
+    };
 
     // Cancel prefetch system for TUI path
     cleanup_cancellation.cancel();
@@ -500,9 +501,10 @@ fn run_with_dashboard(ctx: TuiContext) -> Result<CancellationToken, CliError> {
 
     // Start dashboard in Loading state
     let initial_state = DashboardState::Loading(loading_progress);
-    let mut dashboard = Dashboard::with_state(dashboard_config, ctx.shutdown.clone(), initial_state)
-        .map_err(|e| CliError::Config(format!("Failed to create dashboard: {}", e)))?
-        .with_prefetch_status(Arc::clone(&ctx.prefetch_status));
+    let mut dashboard =
+        Dashboard::with_state(dashboard_config, ctx.shutdown.clone(), initial_state)
+            .map_err(|e| CliError::Config(format!("Failed to create dashboard: {}", e)))?
+            .with_prefetch_status(Arc::clone(&ctx.prefetch_status));
 
     // Wire in control plane health if available
     if let Some(service) = ctx.mount_manager.get_service() {
@@ -533,7 +535,12 @@ fn run_with_dashboard(ctx: TuiContext) -> Result<CancellationToken, CliError> {
     let index_for_build = Arc::clone(&scenery_index);
 
     runtime_handle.spawn(async move {
-        SceneryIndex::build_from_packages_with_progress(index_for_build, packages_for_index, progress_tx).await;
+        SceneryIndex::build_from_packages_with_progress(
+            index_for_build,
+            packages_for_index,
+            progress_tx,
+        )
+        .await;
     });
 
     // Track state transitions
@@ -619,7 +626,8 @@ fn run_with_dashboard(ctx: TuiContext) -> Result<CancellationToken, CliError> {
                         prewarm_active = true;
 
                         // Transition to Prewarming state
-                        let prewarm_progress = PrewarmProgress::new(icao, &airport_name, total_tiles);
+                        let prewarm_progress =
+                            PrewarmProgress::new(icao, &airport_name, total_tiles);
                         dashboard.update_prewarm_progress(prewarm_progress);
                     }
                     Err(e) => {
@@ -660,7 +668,11 @@ fn run_with_dashboard(ctx: TuiContext) -> Result<CancellationToken, CliError> {
                             dashboard.update_prewarm_progress(updated);
                         }
                     }
-                    LibPrewarmProgress::Complete { tiles_loaded, cache_hits, failures } => {
+                    LibPrewarmProgress::Complete {
+                        tiles_loaded,
+                        cache_hits,
+                        failures,
+                    } => {
                         tracing::info!(
                             tiles_loaded = tiles_loaded,
                             cache_hits = cache_hits,
@@ -814,16 +826,15 @@ fn start_prewarm(
     runtime_handle: &Handle,
 ) -> Result<(mpsc::Receiver<LibPrewarmProgress>, String, usize), String> {
     // Get X-Plane environment for apt.dat lookup
-    let xplane_env = xplane_env
-        .ok_or_else(|| "X-Plane installation not detected".to_string())?;
+    let xplane_env = xplane_env.ok_or_else(|| "X-Plane installation not detected".to_string())?;
 
     // Get apt.dat path
-    let apt_dat_path = xplane_env
-        .apt_dat_path()
-        .ok_or_else(|| format!(
+    let apt_dat_path = xplane_env.apt_dat_path().ok_or_else(|| {
+        format!(
             "Airport database not found at {}",
             xplane_env.earth_nav_data_path().display()
-        ))?;
+        )
+    })?;
 
     // Load airport index from apt.dat
     let airport_index = AirportIndex::from_apt_dat(&apt_dat_path)
@@ -882,7 +893,9 @@ fn start_prewarm(
 
     // Spawn the prewarm task
     runtime_handle.spawn(async move {
-        prewarm.run(airport_lat, airport_lon, progress_tx, cancel_token).await;
+        prewarm
+            .run(airport_lat, airport_lon, progress_tx, cancel_token)
+            .await;
     });
 
     Ok((progress_rx, airport_name, total_tiles))

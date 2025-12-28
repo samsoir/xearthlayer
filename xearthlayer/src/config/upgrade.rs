@@ -41,7 +41,10 @@ use super::keys::ConfigKey;
 /// ];
 /// ```
 pub const DEPRECATED_KEYS: &[&str] = &[
-    // No deprecated keys yet - add entries here when deprecating settings
+    // Removed in v0.2.9 - ZL12 prefetching simplified to use same radii as ZL14
+    "prefetch.enable_zl12",
+    "prefetch.zl12_inner_radius_nm",
+    "prefetch.zl12_outer_radius_nm",
 ];
 
 /// Result of analyzing a configuration file for upgrade needs.
@@ -89,6 +92,10 @@ impl ConfigUpgradeAnalysis {
                 "{} deprecated setting(s)",
                 self.deprecated_keys.len()
             ));
+        }
+
+        if !self.unknown_keys.is_empty() {
+            parts.push(format!("{} obsolete setting(s)", self.unknown_keys.len()));
         }
 
         if parts.is_empty() {
@@ -206,7 +213,10 @@ pub fn analyze_config(path: &Path) -> Result<ConfigUpgradeAnalysis, ConfigFileEr
         .collect();
     unknown_keys.sort();
 
-    let needs_upgrade = !missing_keys.is_empty() || !deprecated_keys.is_empty();
+    // Upgrade needed if there are missing keys, deprecated keys, OR unknown keys
+    // Unknown keys are stale settings from old versions that should be cleaned up
+    let needs_upgrade =
+        !missing_keys.is_empty() || !deprecated_keys.is_empty() || !unknown_keys.is_empty();
 
     Ok(ConfigUpgradeAnalysis {
         missing_keys,

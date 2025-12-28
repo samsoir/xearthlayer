@@ -343,10 +343,9 @@ impl SceneryIndex {
             let name_clone = name.clone();
 
             // Run the blocking file I/O in a separate thread pool
-            let result = tokio::task::spawn_blocking(move || {
-                index_clone.build_from_package(&path_clone)
-            })
-            .await;
+            let result =
+                tokio::task::spawn_blocking(move || index_clone.build_from_package(&path_clone))
+                    .await;
 
             // Get the tile count from the result
             let tiles = match result {

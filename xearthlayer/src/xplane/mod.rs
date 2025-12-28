@@ -59,8 +59,8 @@ mod paths;
 use std::path::{Path, PathBuf};
 
 pub use detection::{
-    detect_custom_scenery, detect_scenery_dir, detect_xplane_install, detect_xplane_installs,
-    derive_mountpoint, SceneryDetectionResult, XPlanePathError,
+    derive_mountpoint, detect_custom_scenery, detect_scenery_dir, detect_xplane_install,
+    detect_xplane_installs, SceneryDetectionResult, XPlanePathError,
 };
 
 /// Represents a detected X-Plane 12 installation environment.
@@ -140,7 +140,9 @@ impl XPlaneEnvironment {
     pub fn detect_all() -> Vec<Self> {
         detect_xplane_installs()
             .into_iter()
-            .map(|path| Self { installation_path: path })
+            .map(|path| Self {
+                installation_path: path,
+            })
             .collect()
     }
 
@@ -166,7 +168,9 @@ impl XPlaneEnvironment {
     /// let env = XPlaneEnvironment::from_custom_scenery_path(&custom_scenery)?;
     /// assert!(env.apt_dat_path().is_some());
     /// ```
-    pub fn from_custom_scenery_path<P: AsRef<Path>>(custom_scenery_path: P) -> Result<Self, XPlanePathError> {
+    pub fn from_custom_scenery_path<P: AsRef<Path>>(
+        custom_scenery_path: P,
+    ) -> Result<Self, XPlanePathError> {
         let path = custom_scenery_path.as_ref();
 
         // Custom Scenery is at {X-Plane 12}/Custom Scenery, so parent is the installation
@@ -328,7 +332,10 @@ mod tests {
             assert_eq!(env.installation_path(), temp_dir.as_path());
             assert_eq!(env.custom_scenery_path(), temp_dir.join("Custom Scenery"));
             assert_eq!(env.resources_path(), temp_dir.join("Resources"));
-            assert_eq!(env.mountpoint_for("my_pack"), temp_dir.join("Custom Scenery").join("my_pack"));
+            assert_eq!(
+                env.mountpoint_for("my_pack"),
+                temp_dir.join("Custom Scenery").join("my_pack")
+            );
         }
 
         // Cleanup

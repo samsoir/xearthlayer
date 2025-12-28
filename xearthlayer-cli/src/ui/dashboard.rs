@@ -136,7 +136,8 @@ pub struct PrewarmProgress {
     pub total_tiles: usize,
     /// Number of cache hits (tiles already cached).
     pub cache_hits: usize,
-    /// When prewarming started.
+    /// When prewarming started (reserved for future elapsed time display).
+    #[allow(dead_code)]
     pub start_time: Instant,
 }
 
@@ -175,6 +176,7 @@ impl PrewarmProgress {
     }
 
     /// Get the elapsed time.
+    #[allow(dead_code)]
     pub fn elapsed(&self) -> Duration {
         self.start_time.elapsed()
     }
@@ -255,6 +257,7 @@ pub struct Dashboard {
 
 impl Dashboard {
     /// Create a new dashboard in the Running state.
+    #[allow(dead_code)]
     pub fn new(config: DashboardConfig, shutdown: Arc<AtomicBool>) -> io::Result<Self> {
         Self::with_state(config, shutdown, DashboardState::Running)
     }
@@ -313,6 +316,7 @@ impl Dashboard {
     }
 
     /// Set the dashboard state.
+    #[allow(dead_code)]
     pub fn set_state(&mut self, state: DashboardState) {
         self.state = state;
     }
@@ -344,6 +348,7 @@ impl Dashboard {
     }
 
     /// Check if in Running state.
+    #[allow(dead_code)]
     pub fn is_running(&self) -> bool {
         matches!(self.state, DashboardState::Running)
     }
@@ -1066,7 +1071,10 @@ impl Dashboard {
         // Spinner + airport name line
         lines.push(Line::from(vec![
             Span::styled(format!("{} ", spinner), Style::default().fg(Color::Yellow)),
-            Span::styled("Loading tiles around ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Loading tiles around ",
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(&progress.airport_name, Style::default().fg(Color::White)),
         ]));
 
@@ -1083,7 +1091,10 @@ impl Dashboard {
             Span::styled("Progress: ", Style::default().fg(Color::DarkGray)),
             Span::styled(progress_bar, Style::default().fg(Color::Cyan)),
             Span::styled(
-                format!(" {}/{} ({}%)", progress.tiles_loaded, progress.total_tiles, percent),
+                format!(
+                    " {}/{} ({}%)",
+                    progress.tiles_loaded, progress.total_tiles, percent
+                ),
                 Style::default().fg(Color::White),
             ),
         ]));

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use super::detection::XPlanePathError;
 
 /// Well-known X-Plane subdirectories.
+#[allow(dead_code)]
 pub mod subdirs {
     /// Custom Scenery directory name.
     pub const CUSTOM_SCENERY: &str = "Custom Scenery";
@@ -48,6 +49,7 @@ pub fn get_install_reference_path() -> Result<PathBuf, XPlanePathError> {
 }
 
 /// Construct the path to apt.dat from an X-Plane installation root.
+#[allow(dead_code)]
 pub fn apt_dat_path(xplane_root: &std::path::Path) -> PathBuf {
     xplane_root
         .join(subdirs::RESOURCES)
@@ -58,11 +60,13 @@ pub fn apt_dat_path(xplane_root: &std::path::Path) -> PathBuf {
 }
 
 /// Construct the path to Custom Scenery from an X-Plane installation root.
+#[allow(dead_code)]
 pub fn custom_scenery_path(xplane_root: &std::path::Path) -> PathBuf {
     xplane_root.join(subdirs::CUSTOM_SCENERY)
 }
 
 /// Construct the path to Resources from an X-Plane installation root.
+#[allow(dead_code)]
 pub fn resources_path(xplane_root: &std::path::Path) -> PathBuf {
     xplane_root.join(subdirs::RESOURCES)
 }

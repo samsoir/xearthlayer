@@ -106,7 +106,9 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmPrefetcher<M> {
         cancellation: CancellationToken,
     ) -> usize {
         // Find all tiles within radius
-        let tiles = self.scenery_index.tiles_near(lat, lon, self.config.radius_nm);
+        let tiles = self
+            .scenery_index
+            .tiles_near(lat, lon, self.config.radius_nm);
 
         if tiles.is_empty() {
             info!(
@@ -186,7 +188,7 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmPrefetcher<M> {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let request = DdsRequest {
                     job_id: JobId::new(),
-                    tile: coord.clone(),
+                    tile: coord,
                     result_tx: tx,
                     cancellation_token: cancel_token.clone(),
                     is_prefetch: true,
