@@ -239,6 +239,7 @@ pub fn test_zone_intersection(
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     fn make_tile(lat: f32, lon: f32, chunk_zoom: u8) -> SceneryTile {
         SceneryTile {
             row: 0,
