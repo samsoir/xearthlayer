@@ -91,11 +91,12 @@ scenery_dir = /path/to/X-Plane 12/Custom Scenery
 
 [packages]
 # URL to a package library (get this from your scenery provider)
-library_url = https://example.com/xearthlayer_package_library.txt
+library_url = https://raw.githubusercontent.com/samsoir/xearthlayer-regional-scenery/main/xearthlayer_package_library.txt
+auto_install_overlays = true
 
 [provider]
 # Satellite imagery source: bing, go2, or google
-type = bing
+type = apple
 ```
 
 See the [Configuration Guide](configuration.md) for all available options.
@@ -112,15 +113,15 @@ xearthlayer packages check
 ```
 Checking for package updates...
 
-  EU-PARIS (ortho) v1.0.0 - Not installed
-  NA-SOCAL (ortho) v2.1.0 - Not installed
+  EU (ortho) v0.1.0 - Not installed
+  NA (ortho) v0.1.1 - Not installed
 
 2 package(s) available for installation.
 ```
 
 ```bash
 # Install a package
-xearthlayer packages install eu-paris
+xearthlayer packages install eu
 ```
 
 ```
@@ -128,12 +129,12 @@ Installing eu-paris (ortho)...
 
 Fetching library index...
 Fetching package metadata...
-Package: EU-PARIS v1.0.0
+Package: EU v0.1.0
 
-Success: Installed EU-PARIS (ortho) v1.0.0 to Custom Scenery/zzXEL_eu-paris_ortho
+Success: Installed EU (ortho) v0.1.0 to Custom Scenery/zzXEL_eu-paris_ortho
 ```
 
-**Note:** The package is small (megabytes) because it only contains terrain definitions, not textures.
+**Note:** The package is smaller than a regular Ortho4XP tile because it only contains terrain definitions, not textures.
 
 ## Step 2: Start XEarthLayer
 
@@ -153,12 +154,12 @@ DDS Format:     BC1
 Provider:       Bing Maps
 
 Installed ortho packages (1):
-  EU-PARIS v1.0.0
+  EU v0.1.0
 
 Cache: 2 GB memory, 20 GB disk
 
 Mounting packages to Custom Scenery...
-  ✓ EU-PARIS → /home/user/X-Plane 12/Custom Scenery/zzXEL_eu-paris_ortho
+  ✓ EU → /home/user/X-Plane 12/Custom Scenery/zzXEL_eu_ortho
 
 Ready! 1 package(s) mounted
 
@@ -181,23 +182,21 @@ Start X-Plane and load a flight in the Paris region.
 
 ## Stopping the Service
 
-When you're done flying:
+Complete your flight in X-Plane and close down the simulator. Once the sim has exited fully:
 
 ```bash
-# Press Ctrl+C in the terminal running XEarthLayer
-^C
-Shutting down...
+Press the 'q' key and follow the prompt to confirm
 ```
 
-Always stop XEarthLayer cleanly before shutting down.
+Always stop XEarthLayer cleanly before shutting down. Terminating the XEarthLayer process while X-Plane 12 is running will cause X-Plane to crash to desktop.
 
 ## Managing Multiple Regions
 
 Install additional packages for other regions:
 
 ```bash
-xearthlayer packages install na-socal
-xearthlayer packages install eu-alps
+xearthlayer packages install na
+xearthlayer packages install eu
 ```
 
 All installed packages are mounted automatically when you run `xearthlayer run`.
@@ -211,7 +210,7 @@ Check for and install package updates:
 xearthlayer packages check
 
 # Update a specific package
-xearthlayer packages update eu-paris
+xearthlayer packages update eu
 
 # Update all packages
 xearthlayer packages update --all

@@ -4,22 +4,22 @@ High-quality satellite imagery for X-Plane, streamed on demand.
 
 ## What It Does
 
-XEarthLayer delivers satellite/aerial imagery to X-Plane without massive downloads. Instead of pre-downloading thousands of gigabytes of textures, XEarthLayer:
+XEarthLayer delivers photo scenery to X-Plane without massive downloads. Instead of pre-downloading thousands of gigabytes of textures, XEarthLayer:
 
-1. **Installs small regional packages** (single digit gigabytes) containing terrain definitions
-2. **Streams textures on-demand** as you fly, generating them from satellite imagery providers
+1. **Installs smaller regional packages** (tens of gigabytes) containing terrain detail
+2. **Streams textures on-demand** as you fly, downloading satellite imagery from a variety of providers
 
-The result: complete orthophoto scenery with minimal disk usage and no lengthy initial downloads.
+The result: complete orthophoto scenery with less overall disk usage implemented in a fast, modern, memory safe language.
 
 ## How It Works
 
 ```
-Regional Package (small)          XEarthLayer Service (running)
+Regional Package (base data)      XEarthLayer Service (running)
 ┌────────────────────────┐        ┌────────────────────────┐
 │ Terrain definitions    │        │ Satellite Providers    │
 │ (DSF, TER files)       │───────→│ (Bing, Google, Apple,  │
 │ References textures    │        │  ArcGIS, MapBox, USGS) │
-│ that don't exist       │        │                        │
+│ for download           │        │                        │
 └────────────────────────┘        │ Generates DDS textures │
                                   │ on-demand              │
                                   └────────────────────────┘
@@ -35,7 +35,7 @@ See [How It Works](docs/how-it-works.md) for detailed architecture.
 
 ## Features
 
-- Small regional packages (megabytes, not gigabytes)
+- Small regional packages (gigabytes, not terrabytes)
 - On-demand texture streaming from multiple providers:
   - **Bing Maps** - Free, global coverage (recommended)
   - **Google Maps** - Via GO2 (free) or official API (paid)
@@ -52,7 +52,7 @@ See [How It Works](docs/how-it-works.md) for detailed architecture.
 - High-quality BC1/BC3 DDS textures with mipmaps
 - Real-time dashboard showing cache, download, and prefetch status
 - Works with Ortho4XP-generated scenery
-- Linux support (Windows and macOS planned)
+- Linux support
 
 ## Quick Start
 
@@ -67,10 +67,10 @@ xearthlayer init
 
 # Configure your package library in ~/.xearthlayer/config.ini:
 # [packages]
-# library_url = https://example.com/xearthlayer_package_library.txt
+library_url = https://raw.githubusercontent.com/samsoir/xearthlayer-regional-scenery/main/xearthlayer_package_library.txt
 
 # Install a regional package
-xearthlayer packages install eu-paris
+xearthlayer packages install eu
 
 # Start XEarthLayer (mounts all installed packages automatically)
 xearthlayer run
@@ -79,6 +79,12 @@ xearthlayer run
 ```
 
 See [Getting Started](docs/getting-started.md) for the complete guide.
+
+## XEarthLayer Regional Scenery Package Project
+
+XEarthLayer requires regional scenery packages to be installed in order for it to work. XEarthLayer is creating a regional package library for general public use. It is possible for anyone to create and publish their own package server.
+
+[XEarthLayer Scenery Packages](https://github.com/samsoir/xearthlayer-regional-scenery) are hosted on Github.
 
 ## Predictive Prefetching
 
@@ -173,6 +179,7 @@ See [Developer Documentation](docs/dev/) for architecture and guidelines.
 ## Credits
 
 Architecturally influenced by [AutoOrtho](https://github.com/kubilus1/autoortho) by [kubilus1](https://github.com/kubilus1). XEarthLayer is an independent Rust implementation focused on performance and memory safety.
+XEarthLayer Regional Scenery Packages created using (Shred86 fork of Ortho4XP)[https://github.com/shred86/Ortho4XP]
 
 Developed with assistance from [Claude](https://claude.ai) by Anthropic.
 

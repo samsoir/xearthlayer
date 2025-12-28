@@ -8,6 +8,8 @@ XEarthLayer uses an INI configuration file located at `~/.xearthlayer/config.ini
 - **Log file**: `~/.xearthlayer/xearthlayer.log` (default)
 - **Cache directory**: `~/.cache/xearthlayer/` (default)
 
+For best results, set the cache directory to a fast NVMe or SSD that you can fill with data and is not the primary volume for your system.
+
 ## Sections
 
 ### [provider]
@@ -24,10 +26,10 @@ Controls which satellite imagery provider to use.
 
 | Provider | API Key | Cost | Coverage | Max Zoom | Notes |
 |----------|---------|------|----------|----------|-------|
-| `bing` | Not required | Free | Global | 19 | Recommended for most users |
-| `go2` | Not required | Free | Global | 22 | Google Maps via public tile servers (same as Ortho4XP GO2) |
+| `bing` | Not required | Free | Global | 19 | Same source as MSFS 2020/4 |
+| `go2` | Not required | Free | Global | 22 | Recommended for most users, Google Maps via public tile servers |
 | `google` | Required | Paid | Global | 22 | Official Google Maps API with usage limits |
-| `apple` | Not required | Free | Global | 20 | High quality imagery, tokens auto-acquired |
+| `apple` | Not required | Free | Global | 20 | Recommended for high fidelity flying (VFR), high quality imagery, tokens auto-acquired |
 | `arcgis` | Not required | Free | Global | 19 | ESRI World Imagery service |
 | `mapbox` | Required | Freemium | Global | 22 | MapBox Satellite, requires access token |
 | `usgs` | Not required | Free | US only | 16 | USGS orthoimagery, excellent quality for US |
@@ -81,7 +83,7 @@ type = usgs
 **Provider Notes:**
 
 - **Bing Maps** - Recommended for general use due to reliability and global coverage.
-- **GO2** - Uses the same Google tile servers as Ortho4XP, ideal for Ortho4XP-generated scenery.
+- **GO2** - Recommended for most users, the same Google tile servers.
 - **Google official API** - Strict rate limits (15,000 requests/day). With 256 chunks per tile, allows ~58 tiles/day.
 - **Apple Maps** - Automatically acquires access tokens via DuckDuckGo's MapKit integration. Tokens refresh automatically on authentication errors.
 - **ArcGIS** - ESRI's World Imagery service, good global coverage with no authentication required.
@@ -117,9 +119,9 @@ The `disk_io_profile` setting tunes disk I/O concurrency based on your storage t
 [cache]
 ; Use custom cache location on NVMe drive
 directory = /mnt/nvme/xearthlayer-cache
-memory_size = 4GB
-disk_size = 100GB
-disk_io_profile = nvme
+memory_size = 8GB
+disk_size = 50GB
+disk_io_profile = auto
 ```
 
 **Cache Structure:**
@@ -209,7 +211,7 @@ Advanced concurrency and retry settings for the tile processing pipeline. These 
 ```ini
 [pipeline]
 ; Increase HTTP concurrency for fast connections
-max_http_concurrent = 256
+max_http_concurrent = 128
 ; Allow more prefetch jobs on high-core-count systems
 max_prefetch_in_flight = 8
 ; Increase timeout for slow connections

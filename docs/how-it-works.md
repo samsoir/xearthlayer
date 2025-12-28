@@ -125,13 +125,13 @@ Regional Package (installed)          XEarthLayer Service (running)
 2. **Install a regional package**
    ```bash
    xearthlayer packages install eu-paris
-   # Installs to: Custom Scenery/zzXEL_eu-paris_ortho/
+   # Installs to: Custom Scenery/zzXEL_eu_ortho/
    ```
 
 3. **Start the streaming service**
    ```bash
-   xearthlayer start --source "Custom Scenery/zzXEL_eu-paris_ortho"
-   # Creates mount: Custom Scenery/zzXEL_eu-paris_ortho_xel/
+   xearthlayer start --source "Custom Scenery/zzXEL_eu_ortho"
+   # Creates mount: Custom Scenery/zzXEL_eu_ortho_xel/
    ```
 
 4. **Configure X-Plane**
@@ -149,8 +149,8 @@ Regional Package (installed)          XEarthLayer Service (running)
 
 2. **Create a package** (strips out DDS files, keeps DSF/TER)
    ```bash
-   xearthlayer publish add --source ./Ortho4XP_Tiles --region eu-paris
-   xearthlayer publish build --region eu-paris
+   xearthlayer publish add --source ./Ortho4XP_Tiles --region eu
+   xearthlayer publish build --region eu
    ```
 
 3. **Distribute the package** (small, just metadata)
@@ -163,15 +163,15 @@ Users install your package and run XEarthLayer to get the textures.
 
 | Aspect | Traditional Ortho | XEarthLayer |
 |--------|-------------------|-------------|
-| Package size | 50-100+ GB | 5-50 MB |
+| Package size | 500+ GB | <100 GB |
 | Download time | Hours | Minutes |
 | Disk usage | Full size | Cache only |
-| First load | Instant | 1-2s per tile |
-| Repeat visits | Instant | Instant (cached) |
+| First load | 1-2 mins | 4-5 minutes |
+| Repeat visits | 1-2 mins | 1-2 minutes |
 
 ### The Trade-off
 
-- **First visit**: Slight delay as textures are downloaded and encoded
+- **First visit**: Longer load time as textures are downloaded and encoded
 - **Requires internet**: For uncached areas (cache can be pre-warmed)
 - **Service must run**: XEarthLayer needs to be running while flying
 
