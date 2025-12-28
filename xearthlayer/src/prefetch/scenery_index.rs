@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 
 use crate::coord::TileCoord;
 
@@ -138,12 +138,26 @@ impl SceneryIndex {
     ///
     /// Parses all `.ter` files in the `terrain` subdirectory.
     pub fn build_from_package(&self, package_path: &Path) -> Result<usize, SceneryIndexError> {
+        debug!(
+            package = %package_path.display(),
+            "Building scenery index from package"
+        );
+
         let terrain_path = package_path.join("terrain");
         if !terrain_path.exists() {
+            debug!(
+                terrain_path = %terrain_path.display(),
+                "Terrain directory not found"
+            );
             return Err(SceneryIndexError::TerrainDirNotFound(
                 terrain_path.to_path_buf(),
             ));
         }
+
+        debug!(
+            terrain_path = %terrain_path.display(),
+            "Found terrain directory"
+        );
 
         let mut count = 0;
         let entries =
@@ -217,12 +231,24 @@ impl SceneryIndex {
         let min_lon_cell = ((lon - radius_deg) / self.cell_size).floor() as i16;
         let max_lon_cell = ((lon + radius_deg) / self.cell_size).ceil() as i16;
 
+        debug!(
+            lat = lat,
+            lon = lon,
+            radius_nm = radius_nm,
+            lat_cells = format!("{}..={}", min_lat_cell, max_lat_cell),
+            lon_cells = format!("{}..={}", min_lon_cell, max_lon_cell),
+            total_tiles_indexed = *self.tile_count.read().unwrap(),
+            "Searching tiles_near"
+        );
+
         let grid = self.grid.read().unwrap();
         let mut result = Vec::new();
+        let mut cells_with_tiles = 0;
 
         for lat_cell in min_lat_cell..=max_lat_cell {
             for lon_cell in min_lon_cell..=max_lon_cell {
                 if let Some(cell) = grid.get(&(lat_cell, lon_cell)) {
+                    cells_with_tiles += 1;
                     for tile in &cell.tiles {
                         // Check actual distance
                         let dist = approximate_distance_nm(lat, lon, tile.lat, tile.lon);
@@ -233,6 +259,13 @@ impl SceneryIndex {
                 }
             }
         }
+
+        debug!(
+            cells_searched = (max_lat_cell - min_lat_cell + 1) * (max_lon_cell - min_lon_cell + 1),
+            cells_with_tiles = cells_with_tiles,
+            tiles_found = result.len(),
+            "tiles_near search complete"
+        );
 
         result
     }
@@ -295,6 +328,12 @@ impl SceneryIndex {
     /// and sends progress updates through the provided channel. The actual file I/O
     /// is performed using `spawn_blocking` to avoid blocking the async runtime.
     ///
+    /// Progress updates are sent:
+    /// - When each package starts (`PackageStarted`)
+    /// - Every 100ms during indexing (`TileProgress`) with the running tile count
+    /// - When each package completes (`PackageCompleted`)
+    /// - When all packages are done (`Complete`)
+    ///
     /// # Arguments
     ///
     /// * `index` - Arc-wrapped SceneryIndex to build into
@@ -315,6 +354,7 @@ impl SceneryIndex {
     /// while let Some(progress) = rx.recv().await {
     ///     match progress {
     ///         IndexingProgress::PackageStarted { name, .. } => println!("Scanning {}", name),
+    ///         IndexingProgress::TileProgress { tiles_indexed } => println!("Tiles: {}", tiles_indexed),
     ///         IndexingProgress::Complete { total, .. } => println!("Done: {} tiles", total),
     ///         _ => {}
     ///     }
@@ -325,6 +365,9 @@ impl SceneryIndex {
         packages: Vec<(String, PathBuf)>,
         progress_tx: mpsc::Sender<IndexingProgress>,
     ) {
+        use std::time::Duration;
+        use tokio::time::interval;
+
         let total_packages = packages.len();
 
         for (i, (name, path)) in packages.into_iter().enumerate() {
@@ -342,10 +385,36 @@ impl SceneryIndex {
             let path_clone = path.clone();
             let name_clone = name.clone();
 
-            // Run the blocking file I/O in a separate thread pool
-            let result =
-                tokio::task::spawn_blocking(move || index_clone.build_from_package(&path_clone))
-                    .await;
+            // Spawn the blocking task
+            let blocking_handle =
+                tokio::task::spawn_blocking(move || index_clone.build_from_package(&path_clone));
+
+            // Clone index for progress polling
+            let index_for_poll = Arc::clone(&index);
+            let progress_tx_poll = progress_tx.clone();
+
+            // Poll tile count every 100ms while the blocking task runs
+            let mut poll_interval = interval(Duration::from_millis(100));
+            poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            // Pin the blocking handle for use in the select loop
+            tokio::pin!(blocking_handle);
+
+            let result = loop {
+                tokio::select! {
+                    // Blocking task completed
+                    result = &mut blocking_handle => {
+                        break result;
+                    }
+                    // Poll interval tick - send progress update
+                    _ = poll_interval.tick() => {
+                        let tiles_indexed = index_for_poll.tile_count();
+                        let _ = progress_tx_poll
+                            .send(IndexingProgress::TileProgress { tiles_indexed })
+                            .await;
+                    }
+                }
+            };
 
             // Get the tile count from the result
             let tiles = match result {
@@ -536,6 +605,12 @@ pub enum IndexingProgress {
         index: usize,
         /// Total number of packages to scan.
         total: usize,
+    },
+    /// Incremental tile count update during package scanning.
+    /// Sent periodically while a package is being indexed.
+    TileProgress {
+        /// Current total tiles indexed across all packages.
+        tiles_indexed: usize,
     },
     /// Finished scanning a package.
     PackageCompleted {

@@ -530,6 +530,20 @@ fn run_with_dashboard(ctx: TuiContext) -> Result<CancellationToken, CliError> {
         .map(|p| (p.region().to_string(), p.path.clone()))
         .collect();
 
+    // Debug: Log what packages are being indexed
+    tracing::debug!(
+        package_count = packages_for_index.len(),
+        "Preparing to build scenery index"
+    );
+    for (name, path) in &packages_for_index {
+        tracing::debug!(
+            region = %name,
+            path = %path.display(),
+            terrain_exists = path.join("terrain").exists(),
+            "Package for indexing"
+        );
+    }
+
     // Create the scenery index and spawn the async building task
     let scenery_index = Arc::new(SceneryIndex::with_defaults());
     let index_for_build = Arc::clone(&scenery_index);
@@ -590,6 +604,13 @@ fn run_with_dashboard(ctx: TuiContext) -> Result<CancellationToken, CliError> {
                         dashboard.update_loading_progress(updated);
                     }
                 }
+                IndexingProgress::TileProgress { tiles_indexed } => {
+                    if let DashboardState::Loading(ref mut progress) = dashboard.state().clone() {
+                        let mut updated = progress.clone();
+                        updated.tiles_indexed = tiles_indexed;
+                        dashboard.update_loading_progress(updated);
+                    }
+                }
                 IndexingProgress::Complete { total, land, sea } => {
                     tracing::info!(
                         total = total,
@@ -602,10 +623,13 @@ fn run_with_dashboard(ctx: TuiContext) -> Result<CancellationToken, CliError> {
             }
         }
 
-        // After indexing, check if we should prewarm (once)
+        // After indexing, transition to Running state and start prewarm in background
         if indexing_complete && !prewarm_active && !prewarm_complete && !prefetcher_started {
+            // Transition to Running state immediately
+            dashboard.transition_to_running();
+
+            // Start prewarm in background if airport specified
             if let Some(ref icao) = ctx.airport_icao {
-                // Try to start prewarm
                 match start_prewarm(
                     ctx.mount_manager,
                     ctx.config,
@@ -620,14 +644,13 @@ fn run_with_dashboard(ctx: TuiContext) -> Result<CancellationToken, CliError> {
                             icao = %icao,
                             airport = %airport_name,
                             tiles = total_tiles,
-                            "Starting prewarm"
+                            "Starting prewarm in background"
                         );
                         prewarm_progress_rx = Some(rx);
                         prewarm_active = true;
 
-                        // Transition to Prewarming state
-                        let prewarm_progress =
-                            PrewarmProgress::new(icao, &airport_name, total_tiles);
+                        // Set prewarm status (displays in header while Running)
+                        let prewarm_progress = PrewarmProgress::new(icao, total_tiles);
                         dashboard.update_prewarm_progress(prewarm_progress);
                     }
                     Err(e) => {
@@ -640,30 +663,45 @@ fn run_with_dashboard(ctx: TuiContext) -> Result<CancellationToken, CliError> {
                 // No airport specified, skip prewarm
                 prewarm_complete = true;
             }
+
+            // Start prefetcher immediately (doesn't wait for prewarm)
+            if ctx.prefetch_enabled {
+                prefetcher_started = start_prefetcher(
+                    ctx.mount_manager,
+                    ctx.config,
+                    &ctx.prefetch_status,
+                    &scenery_index,
+                    ctx.fuse_analyzer.clone(),
+                    &prewarm_cancellation,
+                    &runtime_handle,
+                );
+            } else {
+                prefetcher_started = true; // Prevent re-entry
+            }
         }
 
-        // Handle prewarm progress updates
+        // Handle prewarm progress updates (runs in background)
         if let Some(ref mut rx) = prewarm_progress_rx {
             while let Ok(progress) = rx.try_recv() {
                 match progress {
                     LibPrewarmProgress::Starting { total_tiles } => {
-                        if let DashboardState::Prewarming(ref prewarm) = dashboard.state().clone() {
-                            let mut updated = prewarm.clone();
+                        if let Some(prewarm) = dashboard.prewarm_status().cloned() {
+                            let mut updated = prewarm;
                             updated.total_tiles = total_tiles;
                             dashboard.update_prewarm_progress(updated);
                         }
                     }
                     LibPrewarmProgress::TileLoaded { cache_hit } => {
-                        if let DashboardState::Prewarming(ref prewarm) = dashboard.state().clone() {
-                            let mut updated = prewarm.clone();
+                        if let Some(prewarm) = dashboard.prewarm_status().cloned() {
+                            let mut updated = prewarm;
                             updated.tile_loaded(cache_hit);
                             dashboard.update_prewarm_progress(updated);
                         }
                     }
                     LibPrewarmProgress::TileFailed => {
                         // Count as loaded (progress) but not a cache hit
-                        if let DashboardState::Prewarming(ref prewarm) = dashboard.state().clone() {
-                            let mut updated = prewarm.clone();
+                        if let Some(prewarm) = dashboard.prewarm_status().cloned() {
+                            let mut updated = prewarm;
                             updated.tiles_loaded += 1;
                             dashboard.update_prewarm_progress(updated);
                         }
@@ -681,17 +719,19 @@ fn run_with_dashboard(ctx: TuiContext) -> Result<CancellationToken, CliError> {
                         );
                         prewarm_complete = true;
                         prewarm_active = false;
+                        dashboard.clear_prewarm_status();
                     }
                     LibPrewarmProgress::Cancelled { tiles_loaded } => {
                         tracing::info!(tiles_loaded = tiles_loaded, "Prewarm cancelled");
                         prewarm_complete = true;
                         prewarm_active = false;
+                        dashboard.clear_prewarm_status();
                     }
                 }
             }
         }
 
-        // Start prefetcher after prewarm completes (or if skipped)
+        // Legacy prefetcher start block - now handled above, keep for backwards compat
         if indexing_complete && prewarm_complete && !prefetcher_started {
             if ctx.prefetch_enabled {
                 prefetcher_started = start_prefetcher(
@@ -715,10 +755,6 @@ fn run_with_dashboard(ctx: TuiContext) -> Result<CancellationToken, CliError> {
             if dashboard.is_loading() {
                 dashboard
                     .draw_loading()
-                    .map_err(|e| CliError::Config(format!("Dashboard draw error: {}", e)))?;
-            } else if dashboard.is_prewarming() {
-                dashboard
-                    .draw_prewarming()
                     .map_err(|e| CliError::Config(format!("Dashboard draw error: {}", e)))?;
             } else {
                 let snapshot = ctx.mount_manager.aggregated_telemetry();
@@ -848,13 +884,30 @@ fn start_prewarm(
     // Get prewarm radius from config
     let radius_nm = config.prewarm.radius_nm;
 
+    // Log scenery index stats and airport coordinates for debugging
+    tracing::debug!(
+        airport_lat = airport.latitude,
+        airport_lon = airport.longitude,
+        airport_name = %airport.name,
+        scenery_tiles_total = scenery_index.tile_count(),
+        scenery_land_tiles = scenery_index.land_tile_count(),
+        scenery_sea_tiles = scenery_index.sea_tile_count(),
+        radius_nm = radius_nm,
+        "Searching for tiles near airport"
+    );
+
     // Find tiles within radius
     let tiles = scenery_index.tiles_near(airport.latitude, airport.longitude, radius_nm);
 
+    tracing::debug!(tiles_found = tiles.len(), "Tiles found in radius");
+
     if tiles.is_empty() {
         return Err(format!(
-            "No scenery tiles found within {}nm of {} ({})",
-            radius_nm, icao, airport.name
+            "No scenery tiles found within {}nm of {} ({}). Scenery index contains {} tiles total.",
+            radius_nm,
+            icao,
+            airport.name,
+            scenery_index.tile_count()
         ));
     }
 

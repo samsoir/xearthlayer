@@ -154,77 +154,141 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmPrefetcher<M> {
 
         let total_tiles = unique_tiles.len();
 
-        // Spawn tasks for each tile
-        for tile in unique_tiles {
-            if cancellation.is_cancelled() {
-                break;
-            }
+        debug!(
+            total_tiles = unique_tiles.len(),
+            "Prewarm starting tile iteration"
+        );
 
-            let permit = match semaphore.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => break,
-            };
+        // Spawn the tile iteration in a separate task to avoid deadlock.
+        // The iteration and result collection must run concurrently because:
+        // - The result channel has bounded capacity (32)
+        // - Tasks block on send() when channel is full
+        // - If iteration blocks waiting for semaphore permits from tasks
+        //   that are blocked on send(), we deadlock
+        let iteration_semaphore = Arc::clone(&semaphore);
+        let iteration_cancel = cancellation.clone();
+        let iteration_tx = result_tx.clone();
+        let iteration_handler = Arc::clone(&self.dds_handler);
+        let iteration_cache = Arc::clone(&self.memory_cache);
 
-            let coord = tile.to_tile_coord();
-            let result_sender = result_tx.clone();
-            let dds_handler = Arc::clone(&self.dds_handler);
-            let memory_cache = Arc::clone(&self.memory_cache);
-            let cancel_token = cancellation.clone();
-
-            tokio::spawn(async move {
-                let _permit = permit;
-
-                // Check if already cached
-                if memory_cache
-                    .get(coord.row, coord.col, coord.zoom)
-                    .await
-                    .is_some()
-                {
-                    let _ = result_sender.send((coord, Ok(true))).await;
-                    return;
+        let iteration_task = tokio::spawn(async move {
+            for (idx, tile) in unique_tiles.iter().enumerate() {
+                if iteration_cancel.is_cancelled() {
+                    debug!("Prewarm cancelled during tile iteration");
+                    break;
                 }
 
-                // Create the request
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let request = DdsRequest {
-                    job_id: JobId::new(),
-                    tile: coord,
-                    result_tx: tx,
-                    cancellation_token: cancel_token.clone(),
-                    is_prefetch: true,
+                let permit = match iteration_semaphore.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        debug!("Semaphore closed during prewarm");
+                        break;
+                    }
                 };
 
-                // Submit the request
-                (dds_handler)(request);
+                let coord = tile.to_tile_coord();
+                debug!(
+                    idx = idx,
+                    row = coord.row,
+                    col = coord.col,
+                    zoom = coord.zoom,
+                    "Prewarm spawning tile task"
+                );
 
-                // Wait for result
-                match rx.await {
-                    Ok(response) => {
-                        let _ = result_sender.send((coord, Ok(response.cache_hit))).await;
-                    }
-                    Err(_) => {
-                        debug!(
-                            row = coord.row,
-                            col = coord.col,
-                            zoom = coord.zoom,
-                            "Prewarm tile request cancelled"
-                        );
-                        let _ = result_sender.send((coord, Err(()))).await;
-                    }
-                }
-            });
-        }
+                let result_sender = iteration_tx.clone();
+                let dds_handler = Arc::clone(&iteration_handler);
+                let memory_cache = Arc::clone(&iteration_cache);
+                let cancel_token = iteration_cancel.clone();
 
-        // Drop original sender so receiver knows when all tasks are done
+                tokio::spawn(async move {
+                    let _permit = permit;
+
+                    debug!(
+                        row = coord.row,
+                        col = coord.col,
+                        zoom = coord.zoom,
+                        "Prewarm tile task started"
+                    );
+
+                    // Check if already cached
+                    if memory_cache
+                        .get(coord.row, coord.col, coord.zoom)
+                        .await
+                        .is_some()
+                    {
+                        let _ = result_sender.send((coord, Ok(true))).await;
+                        return;
+                    }
+
+                    // Create the request
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let job_id = JobId::new();
+                    let request = DdsRequest {
+                        job_id,
+                        tile: coord,
+                        result_tx: tx,
+                        cancellation_token: cancel_token.clone(),
+                        is_prefetch: true,
+                    };
+
+                    debug!(
+                        job_id = %job_id,
+                        row = coord.row,
+                        col = coord.col,
+                        zoom = coord.zoom,
+                        "Prewarm submitting tile request to handler"
+                    );
+
+                    // Submit the request
+                    (dds_handler)(request);
+
+                    debug!(
+                        job_id = %job_id,
+                        row = coord.row,
+                        col = coord.col,
+                        zoom = coord.zoom,
+                        "Prewarm waiting for tile response"
+                    );
+
+                    // Wait for result
+                    match rx.await {
+                        Ok(response) => {
+                            debug!(
+                                job_id = %job_id,
+                                row = coord.row,
+                                col = coord.col,
+                                zoom = coord.zoom,
+                                cache_hit = response.cache_hit,
+                                "Prewarm tile completed successfully"
+                            );
+                            let _ = result_sender.send((coord, Ok(response.cache_hit))).await;
+                        }
+                        Err(_) => {
+                            debug!(
+                                job_id = %job_id,
+                                row = coord.row,
+                                col = coord.col,
+                                zoom = coord.zoom,
+                                "Prewarm tile request failed (channel closed)"
+                            );
+                            let _ = result_sender.send((coord, Err(()))).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        // Drop our sender so the channel closes when iteration task finishes
         drop(result_tx);
 
-        // Collect results
+        // Collect results concurrently with iteration
         loop {
             if cancellation.is_cancelled() {
                 info!(tiles_loaded = tiles_loaded, "Prewarm cancelled");
-                let _ = progress_tx
-                    .send(PrewarmProgress::Cancelled { tiles_loaded })
-                    .await;
+                // Use try_send to avoid blocking on progress channel
+                let _ = progress_tx.try_send(PrewarmProgress::Cancelled { tiles_loaded });
+                // Abort iteration task
+                iteration_task.abort();
                 return tiles_loaded;
             }
 
@@ -236,13 +300,14 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmPrefetcher<M> {
                             if was_cached {
                                 cache_hits += 1;
                             }
-                            let _ = progress_tx.send(PrewarmProgress::TileLoaded {
+                            // Use try_send to avoid blocking - UI will catch up
+                            let _ = progress_tx.try_send(PrewarmProgress::TileLoaded {
                                 cache_hit: was_cached,
-                            }).await;
+                            });
                         }
                         Some((_coord, Err(_))) => {
                             failures += 1;
-                            let _ = progress_tx.send(PrewarmProgress::TileFailed).await;
+                            let _ = progress_tx.try_send(PrewarmProgress::TileFailed);
                         }
                         None => {
                             // Channel closed, all tiles processed
@@ -252,11 +317,15 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmPrefetcher<M> {
                 }
                 _ = cancellation.cancelled() => {
                     info!(tiles_loaded = tiles_loaded, "Prewarm cancelled");
-                    let _ = progress_tx.send(PrewarmProgress::Cancelled { tiles_loaded }).await;
+                    let _ = progress_tx.try_send(PrewarmProgress::Cancelled { tiles_loaded });
+                    iteration_task.abort();
                     return tiles_loaded;
                 }
             }
         }
+
+        // Wait for iteration task to complete (should already be done since channel closed)
+        let _ = iteration_task.await;
 
         // Calculate any tiles that didn't get submitted due to cancellation
         let not_submitted = total_tiles.saturating_sub(tiles_loaded + failures);
@@ -271,13 +340,12 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmPrefetcher<M> {
             "Prewarm complete"
         );
 
-        let _ = progress_tx
-            .send(PrewarmProgress::Complete {
-                tiles_loaded,
-                cache_hits,
-                failures,
-            })
-            .await;
+        // Final progress update - use try_send
+        let _ = progress_tx.try_send(PrewarmProgress::Complete {
+            tiles_loaded,
+            cache_hits,
+            failures,
+        });
 
         tiles_loaded
     }

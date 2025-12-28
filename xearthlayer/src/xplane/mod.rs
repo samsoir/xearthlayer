@@ -262,25 +262,62 @@ impl XPlaneEnvironment {
     /// }
     /// ```
     pub fn apt_dat_path(&self) -> Option<PathBuf> {
-        let path = self
+        // X-Plane 12 location: Global Scenery/Global Airports/Earth nav data/apt.dat
+        let xp12_path = self
+            .installation_path
+            .join("Global Scenery")
+            .join("Global Airports")
+            .join("Earth nav data");
+
+        // Check X-Plane 12 location first
+        let xp12_apt = xp12_path.join("apt.dat");
+        if xp12_apt.exists() {
+            return Some(xp12_apt);
+        }
+
+        let xp12_apt_gz = xp12_path.join("apt.dat.gz");
+        if xp12_apt_gz.exists() {
+            return Some(xp12_apt_gz);
+        }
+
+        // Fallback: X-Plane 11 location: Resources/default scenery/default apt dat/Earth nav data/apt.dat
+        let xp11_path = self
             .installation_path
             .join("Resources")
             .join("default scenery")
             .join("default apt dat")
-            .join("Earth nav data")
-            .join("apt.dat");
+            .join("Earth nav data");
 
-        if path.exists() {
-            Some(path)
-        } else {
-            None
+        let xp11_apt = xp11_path.join("apt.dat");
+        if xp11_apt.exists() {
+            return Some(xp11_apt);
         }
+
+        let xp11_apt_gz = xp11_path.join("apt.dat.gz");
+        if xp11_apt_gz.exists() {
+            return Some(xp11_apt_gz);
+        }
+
+        None
     }
 
     /// Get the path to the Earth nav data directory.
     ///
     /// This directory contains navigation data files like apt.dat, nav.dat, etc.
+    /// Returns the X-Plane 12 location if it exists, otherwise falls back to X-Plane 11 location.
     pub fn earth_nav_data_path(&self) -> PathBuf {
+        // X-Plane 12 location
+        let xp12_path = self
+            .installation_path
+            .join("Global Scenery")
+            .join("Global Airports")
+            .join("Earth nav data");
+
+        if xp12_path.exists() {
+            return xp12_path;
+        }
+
+        // Fallback to X-Plane 11 location
         self.installation_path
             .join("Resources")
             .join("default scenery")

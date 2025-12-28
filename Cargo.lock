@@ -3578,6 +3578,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "dirs",
+ "flate2",
  "fuse3",
  "fuser",
  "futures",

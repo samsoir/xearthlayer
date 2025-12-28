@@ -41,31 +41,68 @@ impl AirportIndex {
     ///
     /// * `xplane_path` - Path to X-Plane installation (e.g., "/home/user/X-Plane 12")
     ///
-    /// The apt.dat file is expected at:
-    /// `{xplane_path}/Resources/default scenery/default apt dat/Earth nav data/apt.dat`
+    /// Checks these locations in order:
+    /// - X-Plane 12: `{xplane_path}/Global Scenery/Global Airports/Earth nav data/apt.dat`
+    /// - X-Plane 11: `{xplane_path}/Resources/default scenery/default apt dat/Earth nav data/apt.dat`
     pub fn from_xplane_path<P: AsRef<Path>>(xplane_path: P) -> Result<Self, AirportIndexError> {
-        let apt_dat_path = xplane_path
-            .as_ref()
+        let xplane_path = xplane_path.as_ref();
+
+        // X-Plane 12 location
+        let xp12_path = xplane_path
+            .join("Global Scenery")
+            .join("Global Airports")
+            .join("Earth nav data")
+            .join("apt.dat");
+
+        if xp12_path.exists() {
+            return Self::from_apt_dat(&xp12_path);
+        }
+
+        // X-Plane 12 compressed
+        let xp12_path_gz = xplane_path
+            .join("Global Scenery")
+            .join("Global Airports")
+            .join("Earth nav data")
+            .join("apt.dat.gz");
+
+        if xp12_path_gz.exists() {
+            return Self::from_apt_dat(&xp12_path_gz);
+        }
+
+        // Fallback to X-Plane 11 location
+        let xp11_path = xplane_path
             .join("Resources")
             .join("default scenery")
             .join("default apt dat")
             .join("Earth nav data")
             .join("apt.dat");
 
-        Self::from_apt_dat(&apt_dat_path)
+        Self::from_apt_dat(&xp11_path)
     }
 
     /// Build an airport index from an apt.dat file.
+    ///
+    /// Supports both uncompressed `.dat` and gzip compressed `.dat.gz` files.
     pub fn from_apt_dat<P: AsRef<Path>>(path: P) -> Result<Self, AirportIndexError> {
+        use flate2::read::GzDecoder;
+
         let path = path.as_ref();
         if !path.exists() {
             return Err(AirportIndexError::NotFound(path.to_path_buf()));
         }
 
         let file = File::open(path)?;
-        let reader = BufReader::new(file);
 
-        Self::from_reader(reader)
+        // Check if the file is gzip compressed by extension
+        if path.extension().is_some_and(|ext| ext == "gz") {
+            tracing::debug!(path = %path.display(), "Loading gzip compressed apt.dat");
+            let decoder = GzDecoder::new(file);
+            let reader = BufReader::new(decoder);
+            Self::from_reader(reader)
+        } else {
+            let reader = BufReader::new(file);
+            Self::from_reader(reader)
+        }
     }
 
     /// Build an airport index from a reader.
