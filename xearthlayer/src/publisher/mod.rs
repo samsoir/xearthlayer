@@ -41,6 +41,7 @@
 
 mod archive;
 mod config;
+pub mod coverage;
 mod error;
 mod library;
 mod metadata;

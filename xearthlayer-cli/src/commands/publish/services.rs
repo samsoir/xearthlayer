@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 
 use semver::Version;
 
-use super::traits::{Output, PublisherService, RepositoryOperations};
+use super::traits::{CoverageResult, Output, PublisherService, RepositoryOperations};
 use crate::error::CliError;
 use xearthlayer::package::{PackageMetadata, PackageType};
 use xearthlayer::publisher::{
+    coverage::{CoverageConfig, CoverageMapGenerator},
     BuildResult, ProcessSummary, RegionSuggestion, ReleaseResult, ReleaseStatus, RepoConfig,
     SceneryScanResult, UrlConfigResult, VersionBump,
 };
@@ -280,5 +281,43 @@ impl PublisherService for DefaultPublisherService {
 
         xearthlayer::publisher::validate_repository(&actual_repo)
             .map_err(|e| CliError::Publish(format!("Validation failed: {}", e)))
+    }
+
+    fn generate_coverage_map(
+        &self,
+        packages_dir: &Path,
+        output_path: &Path,
+        width: u32,
+        height: u32,
+        dark: bool,
+    ) -> Result<CoverageResult, CliError> {
+        let mut config = if dark {
+            CoverageConfig::dark()
+        } else {
+            CoverageConfig::default()
+        };
+        config.width = width;
+        config.height = height;
+
+        let generator = CoverageMapGenerator::new(config);
+
+        // Scan packages
+        let tiles = generator
+            .scan_packages(packages_dir)
+            .map_err(|e| CliError::Publish(format!("Failed to scan packages: {}", e)))?;
+
+        // Get counts before generating map
+        let tiles_by_region = CoverageMapGenerator::count_by_region(&tiles);
+        let total_tiles = tiles.len();
+
+        // Generate the map
+        generator
+            .generate_map(&tiles, output_path)
+            .map_err(|e| CliError::Publish(format!("Failed to generate coverage map: {}", e)))?;
+
+        Ok(CoverageResult {
+            total_tiles,
+            tiles_by_region,
+        })
     }
 }

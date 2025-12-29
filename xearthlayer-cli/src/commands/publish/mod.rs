@@ -45,15 +45,15 @@ mod tests;
 // Re-export public types
 pub use args::PublishCommands;
 pub use handlers::{
-    AddHandler, BuildHandler, InitHandler, ListHandler, ReleaseHandler, ScanHandler, StatusHandler,
-    UrlsHandler, ValidateHandler, VersionHandler,
+    AddHandler, BuildHandler, CoverageHandler, InitHandler, ListHandler, ReleaseHandler,
+    ScanHandler, StatusHandler, UrlsHandler, ValidateHandler, VersionHandler,
 };
 pub use services::{ConsoleOutput, DefaultPublisherService};
 pub use traits::CommandHandler;
 
 use args::{
-    AddArgs, BuildArgs, InitArgs, ListArgs, ReleaseArgs, ScanArgs, StatusArgs, UrlsArgs,
-    ValidateArgs, VersionArgs,
+    AddArgs, BuildArgs, CoverageArgs, InitArgs, ListArgs, ReleaseArgs, ScanArgs, StatusArgs,
+    UrlsArgs, ValidateArgs, VersionArgs,
 };
 use traits::CommandContext;
 
@@ -181,5 +181,22 @@ pub fn run(command: PublishCommands) -> Result<(), CliError> {
         ),
 
         PublishCommands::Validate { repo } => ValidateHandler::execute(ValidateArgs { repo }, &ctx),
+
+        PublishCommands::Coverage {
+            output,
+            width,
+            height,
+            dark,
+            repo,
+        } => CoverageHandler::execute(
+            CoverageArgs {
+                output,
+                width,
+                height,
+                dark,
+                repo,
+            },
+            &ctx,
+        ),
     }
 }

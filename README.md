@@ -1,12 +1,12 @@
-# XEarthLayer
+# X-Plane Earth Layer
 
 High-quality satellite imagery for X-Plane, streamed on demand.
 
-![XEarthLayer flying over northern Spain](docs/images/xearthlayer-v0.2.8-iberia.jpg)
+![X-Plane Earth Layer flying over northern Spain](docs/images/xearthlayer-v0.2.8-iberia.jpg)
 
 ## What It Does
 
-XEarthLayer delivers photo scenery to X-Plane without massive downloads. Instead of pre-downloading thousands of gigabytes of textures, XEarthLayer:
+X-Plane Earth Layer (XEarthLayer or XEL) delivers photo scenery to X-Plane without massive downloads. Instead of pre-downloading thousands of gigabytes of textures, XEarthLayer:
 
 1. **Installs smaller regional packages** (tens of gigabytes) containing terrain detail
 2. **Streams textures on-demand** as you fly, downloading satellite imagery from a variety of providers

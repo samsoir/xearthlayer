@@ -4,6 +4,7 @@
 //! dependency injection and testability. Handlers never depend on concrete
 //! implementations directly.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use semver::Version;
@@ -14,6 +15,15 @@ use xearthlayer::publisher::{
     BuildResult, ProcessSummary, RegionSuggestion, ReleaseResult, ReleaseStatus, RepoConfig,
     SceneryScanResult, UrlConfigResult, VersionBump,
 };
+
+/// Result of coverage map generation.
+#[derive(Debug)]
+pub struct CoverageResult {
+    /// Total number of tiles included in the map.
+    pub total_tiles: usize,
+    /// Count of tiles by region.
+    pub tiles_by_region: HashMap<String, usize>,
+}
 
 // ============================================================================
 // Output Trait - Abstracts console/UI output
@@ -182,6 +192,16 @@ pub trait PublisherService: Send + Sync {
 
     /// Validate repository integrity.
     fn validate_repository(&self, repo: &dyn RepositoryOperations) -> Result<(), CliError>;
+
+    /// Generate a coverage map image.
+    fn generate_coverage_map(
+        &self,
+        packages_dir: &Path,
+        output_path: &Path,
+        width: u32,
+        height: u32,
+        dark: bool,
+    ) -> Result<CoverageResult, CliError>;
 }
 
 // ============================================================================

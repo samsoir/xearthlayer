@@ -21,17 +21,17 @@ GitHub Releases provides free hosting for package archives with these benefits:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                     Publishing Workflow                              │
+│                     Publishing Workflow                             │
 ├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
+│                                                                     │
 │  1. Process Tiles ──► 2. Set Version ──► 3. Build Archives          │
-│                                                │                     │
-│                                                ▼                     │
+│                                                │                    │
+│                                                ▼                    │
 │  6. Release ◄── 5. Configure URLs ◄── 4. Upload to GitHub           │
-│       │                                                              │
-│       ▼                                                              │
-│  7. Push Library Index                                               │
-│                                                                      │
+│       │                                                             │
+│       ▼                                                             │
+│  7. Push Library Index                                              │
+│                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
