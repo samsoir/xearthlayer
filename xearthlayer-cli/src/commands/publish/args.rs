@@ -212,21 +212,25 @@ pub enum PublishCommands {
 
     /// Generate a coverage map image showing tile coverage
     Coverage {
-        /// Output PNG file path
+        /// Output file path (PNG or GeoJSON based on --geojson flag)
         #[arg(long, short, default_value = "coverage.png")]
         output: PathBuf,
 
-        /// Image width in pixels
+        /// Image width in pixels (PNG only)
         #[arg(long, default_value = "1200")]
         width: u32,
 
-        /// Image height in pixels
+        /// Image height in pixels (PNG only)
         #[arg(long, default_value = "600")]
         height: u32,
 
-        /// Use dark mode (CartoDB Dark Matter tiles)
+        /// Use dark mode (CartoDB Dark Matter tiles, PNG only)
         #[arg(long)]
         dark: bool,
+
+        /// Generate GeoJSON instead of PNG (for interactive maps)
+        #[arg(long)]
+        geojson: bool,
 
         /// Repository path (default: current directory)
         #[arg(default_value = ".")]
@@ -316,5 +320,6 @@ pub struct CoverageArgs {
     pub width: u32,
     pub height: u32,
     pub dark: bool,
+    pub geojson: bool,
     pub repo: PathBuf,
 }

@@ -438,6 +438,31 @@ impl PublisherService for MockPublisherService {
     fn validate_repository(&self, _repo: &dyn RepositoryOperations) -> Result<(), CliError> {
         Ok(())
     }
+
+    fn generate_coverage_map(
+        &self,
+        _packages_dir: &Path,
+        _output_path: &Path,
+        _width: u32,
+        _height: u32,
+        _dark: bool,
+    ) -> Result<CoverageResult, CliError> {
+        Ok(CoverageResult {
+            total_tiles: 100,
+            tiles_by_region: [("na".to_string(), 100)].into_iter().collect(),
+        })
+    }
+
+    fn generate_coverage_geojson(
+        &self,
+        _packages_dir: &Path,
+        _output_path: &Path,
+    ) -> Result<CoverageResult, CliError> {
+        Ok(CoverageResult {
+            total_tiles: 100,
+            tiles_by_region: [("na".to_string(), 100)].into_iter().collect(),
+        })
+    }
 }
 
 // ============================================================================

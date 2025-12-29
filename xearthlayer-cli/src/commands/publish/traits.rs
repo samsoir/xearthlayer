@@ -193,7 +193,7 @@ pub trait PublisherService: Send + Sync {
     /// Validate repository integrity.
     fn validate_repository(&self, repo: &dyn RepositoryOperations) -> Result<(), CliError>;
 
-    /// Generate a coverage map image.
+    /// Generate a coverage map image (PNG).
     fn generate_coverage_map(
         &self,
         packages_dir: &Path,
@@ -201,6 +201,13 @@ pub trait PublisherService: Send + Sync {
         width: u32,
         height: u32,
         dark: bool,
+    ) -> Result<CoverageResult, CliError>;
+
+    /// Generate a coverage map in GeoJSON format.
+    fn generate_coverage_geojson(
+        &self,
+        packages_dir: &Path,
+        output_path: &Path,
     ) -> Result<CoverageResult, CliError>;
 }
 

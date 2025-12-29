@@ -320,4 +320,32 @@ impl PublisherService for DefaultPublisherService {
             tiles_by_region,
         })
     }
+
+    fn generate_coverage_geojson(
+        &self,
+        packages_dir: &Path,
+        output_path: &Path,
+    ) -> Result<CoverageResult, CliError> {
+        let config = CoverageConfig::default();
+        let generator = CoverageMapGenerator::new(config);
+
+        // Scan packages
+        let tiles = generator
+            .scan_packages(packages_dir)
+            .map_err(|e| CliError::Publish(format!("Failed to scan packages: {}", e)))?;
+
+        // Get counts before generating
+        let tiles_by_region = CoverageMapGenerator::count_by_region(&tiles);
+        let total_tiles = tiles.len();
+
+        // Generate the GeoJSON
+        generator
+            .generate_geojson(&tiles, output_path)
+            .map_err(|e| CliError::Publish(format!("Failed to generate GeoJSON: {}", e)))?;
+
+        Ok(CoverageResult {
+            total_tiles,
+            tiles_by_region,
+        })
+    }
 }

@@ -421,6 +421,51 @@ gh release upload na-v0.3.0 dist/na/ortho/*.tar.gz.*
 | Build archive | 5-10 min | 15-30 min |
 | Upload (good connection) | 30-60 min | 1-2 hours |
 
+## Generating Coverage Maps
+
+After publishing packages, generate visual coverage maps for your repository README:
+
+### Static PNG Map
+
+```bash
+# Light theme (OpenStreetMap tiles)
+xearthlayer publish coverage --output coverage.png
+
+# Dark theme (CartoDB Dark Matter tiles) - recommended for GitHub READMEs
+xearthlayer publish coverage --dark --output coverage.png
+
+# Custom dimensions
+xearthlayer publish coverage --dark --width 1600 --height 800 --output coverage.png
+```
+
+### Interactive GeoJSON Map
+
+GitHub automatically renders `.geojson` files with an interactive map viewer:
+
+```bash
+xearthlayer publish coverage --geojson --output coverage.geojson
+```
+
+### Embedding in README
+
+```markdown
+## Coverage Map
+
+![Tile Coverage Map](coverage.png)
+
+*NA tiles shown in blue, EU tiles in orange. [View interactive map](coverage.geojson) for exact tile boundaries.*
+```
+
+### Coverage Command Options
+
+| Option | Description |
+|--------|-------------|
+| `--output, -o` | Output file path (default: coverage.png) |
+| `--width` | Image width in pixels (PNG only, default: 1200) |
+| `--height` | Image height in pixels (PNG only, default: 600) |
+| `--dark` | Use dark theme with CartoDB tiles (PNG only) |
+| `--geojson` | Generate GeoJSON instead of PNG |
+
 ## See Also
 
 - [Content Publishing Guide](../content-publishing.md) - General publishing concepts

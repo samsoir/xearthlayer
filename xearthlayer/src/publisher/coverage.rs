@@ -91,16 +91,23 @@ impl Default for CoverageConfig {
 impl CoverageConfig {
     /// Create a dark mode configuration with adjusted colors for visibility.
     pub fn dark() -> Self {
-        let mut config = Self::default();
-        config.style = MapStyle::Dark;
+        let mut region_colors = HashMap::new();
         // Brighter colors for dark background
-        config.region_colors.insert("na".to_string(), (100, 180, 255, 200));
-        config.region_colors.insert("eu".to_string(), (255, 180, 100, 200));
-        config.region_colors.insert("as".to_string(), (100, 255, 150, 200));
-        config.region_colors.insert("oc".to_string(), (200, 100, 255, 200));
-        config.default_color = (150, 150, 150, 200);
-        config.border_color = (80, 80, 80, 255);
-        config
+        region_colors.insert("na".to_string(), (100, 180, 255, 200));
+        region_colors.insert("eu".to_string(), (255, 180, 100, 200));
+        region_colors.insert("as".to_string(), (100, 255, 150, 200));
+        region_colors.insert("oc".to_string(), (200, 100, 255, 200));
+
+        Self {
+            width: 1200,
+            height: 600,
+            padding: (20, 20),
+            region_colors,
+            default_color: (150, 150, 150, 200),
+            border_color: (80, 80, 80, 255),
+            border_width: 0.5,
+            style: MapStyle::Dark,
+        }
     }
 }
 
@@ -395,12 +402,11 @@ impl CoverageMapGenerator {
         }
 
         // Save the map
-        map.save_png(output_path).map_err(|e| {
-            PublishError::WriteFailed {
+        map.save_png(output_path)
+            .map_err(|e| PublishError::WriteFailed {
                 path: output_path.to_path_buf(),
                 source: std::io::Error::other(e.to_string()),
-            }
-        })?;
+            })?;
 
         Ok(())
     }
@@ -424,6 +430,125 @@ impl CoverageMapGenerator {
             *counts.entry(tile.region.to_lowercase()).or_insert(0) += 1;
         }
         counts
+    }
+
+    /// Generate a GeoJSON file from tile coverage data.
+    ///
+    /// Creates a GeoJSON FeatureCollection where each tile is represented as a
+    /// Polygon feature with styling properties compatible with GitHub's GeoJSON
+    /// renderer and other mapping tools.
+    ///
+    /// # Arguments
+    /// * `tiles` - Vector of tile coverage information
+    /// * `output_path` - Path to save the GeoJSON file
+    pub fn generate_geojson(
+        &self,
+        tiles: &[TileCoverage],
+        output_path: &Path,
+    ) -> PublishResult<()> {
+        use std::io::Write;
+
+        if tiles.is_empty() {
+            return Err(PublishError::InvalidSource(
+                "No tiles found to generate GeoJSON".to_string(),
+            ));
+        }
+
+        let mut file =
+            std::fs::File::create(output_path).map_err(|e| PublishError::WriteFailed {
+                path: output_path.to_path_buf(),
+                source: e,
+            })?;
+
+        // Start the FeatureCollection
+        write!(file, "{{\"type\": \"FeatureCollection\", \"features\": [").map_err(|e| {
+            PublishError::WriteFailed {
+                path: output_path.to_path_buf(),
+                source: e,
+            }
+        })?;
+
+        let mut first = true;
+        for tile in tiles {
+            let (r, g, b, _a) = self
+                .config
+                .region_colors
+                .get(&tile.region.to_lowercase())
+                .copied()
+                .unwrap_or(self.config.default_color);
+
+            let fill_color = format!("#{:02x}{:02x}{:02x}", r, g, b);
+            let fill_opacity = 0.4;
+            let stroke_opacity = 0.8;
+            let stroke_width = 0.5;
+
+            // Tile coordinates (southwest corner)
+            let lat = tile.latitude;
+            let lon = tile.longitude;
+
+            // GeoJSON coordinates are [lon, lat] order
+            // Polygon: SW -> SE -> NE -> NW -> SW (closed)
+            let coords = format!(
+                "[[{}, {}], [{}, {}], [{}, {}], [{}, {}], [{}, {}]]",
+                lon,
+                lat, // SW
+                lon + 1,
+                lat, // SE
+                lon + 1,
+                lat + 1, // NE
+                lon,
+                lat + 1, // NW
+                lon,
+                lat // Close
+            );
+
+            if !first {
+                write!(file, ", ").map_err(|e| PublishError::WriteFailed {
+                    path: output_path.to_path_buf(),
+                    source: e,
+                })?;
+            }
+            first = false;
+
+            write!(
+                file,
+                "{{\"type\": \"Feature\", \"properties\": {{\"region\": \"{}\", \"fill\": \"{}\", \"fill-opacity\": {}, \"stroke\": \"{}\", \"stroke-width\": {}, \"stroke-opacity\": {}}}, \"geometry\": {{\"type\": \"Polygon\", \"coordinates\": [{}]}}}}",
+                tile.region.to_uppercase(),
+                fill_color,
+                fill_opacity,
+                fill_color,
+                stroke_width,
+                stroke_opacity,
+                coords
+            ).map_err(|e| PublishError::WriteFailed {
+                path: output_path.to_path_buf(),
+                source: e,
+            })?;
+        }
+
+        // Close the FeatureCollection
+        writeln!(file, "]}}").map_err(|e| PublishError::WriteFailed {
+            path: output_path.to_path_buf(),
+            source: e,
+        })?;
+
+        Ok(())
+    }
+
+    /// Generate a GeoJSON coverage file from a packages directory.
+    ///
+    /// This is a convenience method that combines `scan_packages` and `generate_geojson`.
+    ///
+    /// # Arguments
+    /// * `packages_dir` - Path to the packages directory
+    /// * `output_path` - Path to save the GeoJSON file
+    pub fn generate_geojson_from_packages(
+        &self,
+        packages_dir: &Path,
+        output_path: &Path,
+    ) -> PublishResult<()> {
+        let tiles = self.scan_packages(packages_dir)?;
+        self.generate_geojson(&tiles, output_path)
     }
 }
 

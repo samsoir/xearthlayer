@@ -663,22 +663,35 @@ impl CommandHandler for CoverageHandler {
         let repo = ctx.publisher.open_repository(&args.repo)?;
         let packages_dir = repo.root().join("packages");
 
-        ctx.output.println("Generating coverage map...");
+        let format_type = if args.geojson { "GeoJSON" } else { "PNG" };
+        ctx.output
+            .println(&format!("Generating {} coverage map...", format_type));
         ctx.output.newline();
 
-        let result = ctx.publisher.generate_coverage_map(
-            &packages_dir,
-            &args.output,
-            args.width,
-            args.height,
-            args.dark,
-        )?;
+        let result = if args.geojson {
+            ctx.publisher
+                .generate_coverage_geojson(&packages_dir, &args.output)?
+        } else {
+            ctx.publisher.generate_coverage_map(
+                &packages_dir,
+                &args.output,
+                args.width,
+                args.height,
+                args.dark,
+            )?
+        };
 
-        ctx.output.println("Coverage map generated successfully!");
+        ctx.output.println(&format!(
+            "{} coverage map generated successfully!",
+            format_type
+        ));
         ctx.output.newline();
         ctx.output
             .indented(&format!("Output:  {}", args.output.display()));
-        ctx.output.indented(&format!("Size:    {}x{}", args.width, args.height));
+        if !args.geojson {
+            ctx.output
+                .indented(&format!("Size:    {}x{}", args.width, args.height));
+        }
         ctx.output
             .indented(&format!("Tiles:   {}", result.total_tiles));
         ctx.output.newline();
