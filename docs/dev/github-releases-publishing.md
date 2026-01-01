@@ -566,7 +566,35 @@ When you push library index updates to the regional-scenery repository, the publ
 | Website File | Source | Description |
 |--------------|--------|-------------|
 | `/packages/xearthlayer_package_library.txt` | Regional scenery repo | Package index for CLI |
+| `/images/coverage.png` | Regional scenery repo | Coverage map image |
 | `/docs/packages/` (Available Regions table) | Generated from library | Region list with versions |
+| `/docs/packages/` (Coverage map + legend) | Generated from metadata | Visual coverage display |
+
+### Region Metadata File
+
+The `region_metadata.json` file in the regional-scenery repo provides region names, coverage descriptions, and colors for the website:
+
+```json
+{
+  "regions": {
+    "EU": {
+      "name": "Europe",
+      "coverage": "Western and Central Europe",
+      "color": "orange"
+    },
+    "NA": {
+      "name": "North America",
+      "coverage": "United States, Canada, Caribbean",
+      "color": "blue"
+    }
+  }
+}
+```
+
+**When to update:** Add/modify entries when releasing new regions or updating coverage areas. The website sync workflow automatically:
+1. Fetches `region_metadata.json`
+2. Generates the Available Regions table with correct descriptions
+3. Builds the coverage map legend dynamically (e.g., "NA in blue, EU in orange")
 
 ### Sync Triggers
 
@@ -616,6 +644,94 @@ gh workflow run sync-packages.yml --repo samsoir/xearthlayer-website
 # Or trigger via repository dispatch (requires token)
 gh api repos/samsoir/xearthlayer-website/dispatches \
   -f event_type=package-library-updated
+```
+
+## App Version Sync
+
+In addition to package sync, the website automatically updates download links when new XEarthLayer versions are released.
+
+### Version File
+
+The `version.json` file in the main xearthlayer repo tracks the current release:
+
+```json
+{
+  "version": "0.2.9",
+  "tag": "v0.2.9",
+  "release_date": "2025-12-28",
+  "homepage": "https://xearthlayer.app",
+  "assets": {
+    "deb": {
+      "filename": "xearthlayer_0.2.9-1_amd64.deb",
+      "description": "Debian/Ubuntu package"
+    },
+    "rpm": {
+      "filename": "xearthlayer-0.2.9-1.fc43.x86_64.rpm",
+      "description": "Fedora/RHEL package"
+    },
+    "tarball": {
+      "filename": "xearthlayer-v0.2.9-x86_64-linux.tar.gz",
+      "description": "Linux binary tarball"
+    }
+  },
+  "download_base_url": "https://github.com/samsoir/xearthlayer/releases/download/v0.2.9"
+}
+```
+
+### Automation Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     App Version Sync Automation                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  XEarthLayer Repo                      Website Repo                     │
+│  ────────────────                      ────────────                     │
+│                                                                         │
+│  1. Tag v0.x.x pushed                                                   │
+│        │                                                                │
+│        ▼                                                                │
+│  2. release.yml builds packages                                         │
+│        │                                                                │
+│        ▼                                                                │
+│  3. Publish release                                                     │
+│        │                                                                │
+│        ▼                                                                │
+│  4. Update version.json (auto)  ─────►  sync-version.yml               │
+│        │                         repo        │                          │
+│        ▼                         dispatch    ▼                          │
+│  5. Notify website                      Fetch version.json              │
+│                                              │                          │
+│                                              ▼                          │
+│                                         Update getting-started.md       │
+│                                         (download links)                │
+│                                              │                          │
+│                                              ▼                          │
+│                                         Deploy site                     │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### What Gets Updated
+
+The `sync-version.yml` workflow updates download links in `/docs/getting-started/`:
+
+| Pattern | Example |
+|---------|---------|
+| DEB filename | `xearthlayer_0.2.9-1_amd64.deb` → `xearthlayer_0.3.0-1_amd64.deb` |
+| RPM filename | `xearthlayer-0.2.9-1.fc43.x86_64.rpm` → `xearthlayer-0.3.0-1.fc43.x86_64.rpm` |
+| Tarball filename | `xearthlayer-v0.2.9-x86_64-linux.tar.gz` → `xearthlayer-v0.3.0-x86_64-linux.tar.gz` |
+
+### Required Token
+
+The xearthlayer main repo needs the same `WEBSITE_DISPATCH_TOKEN` secret to trigger website updates on release. See [Token Configuration](#required-token-website_dispatch_token) above.
+
+### Manual Version Sync
+
+To force a version sync:
+
+```bash
+gh workflow run sync-version.yml --repo samsoir/xearthlayer-website
 ```
 
 ## See Also
