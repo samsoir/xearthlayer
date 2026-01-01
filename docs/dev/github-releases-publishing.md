@@ -20,28 +20,40 @@ GitHub Releases provides free hosting for package archives with these benefits:
 ## Workflow Summary
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     Publishing Workflow                             │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  1. Process Tiles ──► 2. Set Version ──► 3. Build Archives          │
-│                                                │                    │
-│                                                ▼                    │
-│                              4. Generate Coverage Maps              │
-│                                                │                    │
-│                                                ▼                    │
-│                              5. Update README & Commit              │
-│                                                │                    │
-│                                                ▼                    │
-│  9. Release ◄── 8. Configure URLs ◄── 7. Upload ◄── 6. Create Tag   │
-│       │                                                             │
-│       ▼                                                             │
-│  10. Push Library Index                                             │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Publishing Workflow                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  1. Process Tiles ──► 2. Set Version ──► 3. Build Archives              │
+│                                                │                        │
+│                                                ▼                        │
+│                              4. Generate Coverage Maps                  │
+│                                                │                        │
+│                                                ▼                        │
+│                              5. Update README & Commit                  │
+│                                                │                        │
+│                                                ▼                        │
+│           6. Create Draft Release ──► 7. Upload Archives                │
+│                                                │                        │
+│                                                ▼                        │
+│                                       8. Configure URLs                 │
+│                                                │                        │
+│                                                ▼                        │
+│                              9. Upload Metadata Files  ◄── IMPORTANT!   │
+│                                                │                        │
+│                                                ▼                        │
+│              10. Release to Library ──► 11. Push Changes                │
+│                                                │                        │
+│                                                ▼                        │
+│                              12. Publish Draft Release                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Important:** Steps 4-5 (coverage maps and README) must be committed BEFORE creating the GitHub release tag. This ensures the tag captures all documentation updates.
+**Important Notes:**
+- Steps 4-5 (coverage maps and README) must be committed BEFORE creating the GitHub release tag
+- Step 9 (metadata upload) is critical - the `publish release` command needs the metadata URLs to be accessible
+- Use draft releases to allow fixing issues before publishing
 
 ## Complete Step-by-Step Guide
 
