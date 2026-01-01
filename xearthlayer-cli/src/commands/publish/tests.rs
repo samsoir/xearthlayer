@@ -13,6 +13,7 @@ use super::handlers::*;
 use super::traits::*;
 use crate::error::CliError;
 use xearthlayer::package::{ArchivePart, PackageMetadata, PackageType};
+use xearthlayer::publisher::dedupe::{DedupeFilter, GapAnalysisResult, ZoomPriority};
 use xearthlayer::publisher::{
     ArchiveBuildResult, BuildResult, ProcessSummary, RegionSuggestion, ReleaseResult,
     ReleaseStatus, RepoConfig, SceneryScanResult, SuggestedRegion, TileInfo, UrlConfigResult,
@@ -43,12 +44,6 @@ impl MockOutput {
         Self::default()
     }
 
-    /// Get all captured messages.
-    #[allow(dead_code)]
-    pub fn messages(&self) -> Vec<String> {
-        self.messages.read().unwrap().clone()
-    }
-
     /// Check if any message contains the given substring.
     pub fn contains(&self, substring: &str) -> bool {
         self.messages
@@ -56,12 +51,6 @@ impl MockOutput {
             .unwrap()
             .iter()
             .any(|m| m.contains(substring))
-    }
-
-    /// Get the full output as a single string.
-    #[allow(dead_code)]
-    pub fn full_output(&self) -> String {
-        self.messages.read().unwrap().join("\n")
     }
 }
 
@@ -154,12 +143,6 @@ impl MockPublisherServiceBuilder {
         self
     }
 
-    #[allow(dead_code)]
-    pub fn with_open_error(mut self, error: &str) -> Self {
-        self.open_result = Some(Err(error.to_string()));
-        self
-    }
-
     pub fn with_packages(mut self, packages: Vec<(String, PackageType)>) -> Self {
         self.packages = packages;
         self
@@ -187,12 +170,6 @@ impl MockPublisherServiceBuilder {
 
     pub fn with_metadata(mut self, metadata: PackageMetadata) -> Self {
         self.read_metadata_result = Some(Ok(metadata));
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn with_metadata_error(mut self, error: &str) -> Self {
-        self.read_metadata_result = Some(Err(error.to_string()));
         self
     }
 
@@ -462,6 +439,47 @@ impl PublisherService for MockPublisherService {
             total_tiles: 100,
             tiles_by_region: [("na".to_string(), 100)].into_iter().collect(),
         })
+    }
+
+    fn dedupe_package(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        _region: &str,
+        _package_type: PackageType,
+        _priority: ZoomPriority,
+        _filter: Option<DedupeFilter>,
+        dry_run: bool,
+    ) -> Result<DedupeReport, CliError> {
+        // Return a mock dedupe result
+        Ok(DedupeReport {
+            tiles_analyzed: 100,
+            zoom_levels_present: vec![16, 18],
+            overlaps_by_pair: [(18, 16)].into_iter().map(|k| (k, 10)).collect(),
+            tiles_removed: Vec::new(),
+            tiles_preserved: Vec::new(),
+            dry_run,
+        })
+    }
+
+    fn scan_overlaps(&self, _source: &Path) -> Result<OverlapSummary, CliError> {
+        // Return a mock overlap summary
+        Ok(OverlapSummary {
+            tiles_scanned: 100,
+            tiles_by_zoom: [(16, 80), (18, 20)].into_iter().collect(),
+            overlaps_by_pair: [(18, 16)].into_iter().map(|k| (k, 10)).collect(),
+            total_overlaps: 10,
+        })
+    }
+
+    fn analyze_gaps(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        _region: &str,
+        _package_type: PackageType,
+        _filter: Option<DedupeFilter>,
+    ) -> Result<GapAnalysisResult, CliError> {
+        // Return an empty gap analysis result
+        Ok(GapAnalysisResult::default())
     }
 }
 
@@ -736,6 +754,8 @@ mod add_tests {
             region: "na".to_string(),
             package_type: PackageTypeArg::Ortho,
             version: "1.0.0".to_string(),
+            dedupe: false,
+            priority: ZoomPriorityArg("highest".to_string()),
             repo: PathBuf::from("/test/repo"),
         };
 
@@ -762,6 +782,8 @@ mod add_tests {
             region: "na".to_string(),
             package_type: PackageTypeArg::Ortho,
             version: "1.0.0".to_string(),
+            dedupe: false,
+            priority: ZoomPriorityArg("highest".to_string()),
             repo: PathBuf::from("/test/repo"),
         };
 
@@ -786,6 +808,8 @@ mod add_tests {
             region: "na".to_string(),
             package_type: PackageTypeArg::Ortho,
             version: "not-a-version".to_string(),
+            dedupe: false,
+            priority: ZoomPriorityArg("highest".to_string()),
             repo: PathBuf::from("/test/repo"),
         };
 
@@ -819,6 +843,8 @@ mod add_tests {
             region: "na".to_string(),
             package_type: PackageTypeArg::Overlay,
             version: "1.0.0".to_string(),
+            dedupe: false,
+            priority: ZoomPriorityArg("highest".to_string()),
             repo: PathBuf::from("/test/repo"),
         };
 
@@ -931,6 +957,8 @@ mod build_tests {
         let args = BuildArgs {
             region: "na".to_string(),
             package_type: PackageTypeArg::Ortho,
+            dedupe: false,
+            priority: ZoomPriorityArg("highest".to_string()),
             repo: PathBuf::from("/test/repo"),
         };
 

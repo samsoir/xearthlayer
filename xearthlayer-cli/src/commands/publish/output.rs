@@ -3,8 +3,9 @@
 //! This module provides helper functions for formatting output consistently
 //! across all publish command handlers.
 
-use super::traits::Output;
+use super::traits::{DedupeReport, Output, OverlapSummary};
 use xearthlayer::config::format_size;
+use xearthlayer::publisher::dedupe::GapAnalysisResult;
 use xearthlayer::publisher::{ProcessSummary, RegionSuggestion, ReleaseStatus, SceneryScanResult};
 
 /// Print scan results to the output.
@@ -103,4 +104,138 @@ pub fn format_status(status: &ReleaseStatus) -> String {
 /// Format a size in bytes as a human-readable string.
 pub fn format_size_display(size: u64) -> String {
     format_size(size as usize)
+}
+
+/// Print dedupe results to the output.
+pub fn print_dedupe_result(out: &dyn Output, report: &DedupeReport) {
+    out.header("Deduplication Results");
+    out.newline();
+
+    // Summary
+    out.println(&format!("Tiles analyzed: {}", report.tiles_analyzed));
+    out.println(&format!("Zoom levels:    {:?}", report.zoom_levels_present));
+    out.newline();
+
+    // Overlaps detected
+    if report.overlaps_by_pair.is_empty() {
+        out.println("No overlapping tiles detected.");
+    } else {
+        out.subheader("Overlaps Detected");
+        let mut pairs: Vec<_> = report.overlaps_by_pair.iter().collect();
+        pairs.sort_by_key(|((h, l), _)| (*h, *l));
+        for ((higher, lower), count) in pairs {
+            out.println(&format!(
+                "  ZL{} overlaps ZL{}: {} tiles",
+                higher, lower, count
+            ));
+        }
+        out.newline();
+
+        // Action taken
+        if report.dry_run {
+            out.println(&format!(
+                "Would remove {} tiles (dry run - no files modified)",
+                report.tiles_removed.len()
+            ));
+        } else {
+            out.println(&format!("Removed {} tiles", report.tiles_removed.len()));
+        }
+
+        out.println(&format!("Preserved {} tiles", report.tiles_preserved.len()));
+    }
+}
+
+/// Print gap analysis results to the output.
+pub fn print_gap_result(out: &dyn Output, result: &GapAnalysisResult) {
+    out.header("Coverage Gap Analysis");
+    out.newline();
+
+    // Summary
+    out.println(&format!("Tiles analyzed: {}", result.tiles_analyzed));
+    out.println(&format!("Zoom levels:    {:?}", result.zoom_levels_present));
+    out.newline();
+
+    if result.gaps.is_empty() {
+        out.println("No coverage gaps detected.");
+        out.println("All higher zoom level tiles have complete coverage.");
+    } else {
+        out.subheader("Gaps Found");
+        out.println(&format!(
+            "  {} parent tiles have incomplete ZL18 coverage",
+            result.gaps.len()
+        ));
+        out.println(&format!(
+            "  {} ZL18 tiles needed to complete coverage",
+            result.total_missing_tiles
+        ));
+        out.newline();
+
+        // Estimate download size
+        let estimated_download = result.total_missing_tiles * 50 * 1024 * 256;
+        out.println(&format!(
+            "Estimated download: ~{} (to generate missing tiles)",
+            format_size(estimated_download)
+        ));
+
+        // Show first few gaps as examples
+        if !result.gaps.is_empty() {
+            out.newline();
+            out.subheader("Example Gaps");
+            for gap in result.gaps.iter().take(5) {
+                out.println(&format!(
+                    "  ZL{} ({}, {}) at {:.2},{:.2}: {}/{} coverage ({:.1}%)",
+                    gap.parent.zoom,
+                    gap.parent.row,
+                    gap.parent.col,
+                    gap.parent.lat,
+                    gap.parent.lon,
+                    gap.existing_children.len(),
+                    gap.expected_count,
+                    gap.coverage_percent()
+                ));
+            }
+            if result.gaps.len() > 5 {
+                out.println(&format!("  ... and {} more gaps", result.gaps.len() - 5));
+            }
+        }
+    }
+}
+
+/// Print overlap summary from scan.
+pub fn print_overlap_summary(out: &dyn Output, summary: &OverlapSummary) {
+    if summary.tiles_scanned == 0 {
+        return;
+    }
+
+    out.subheader("Zoom Level Analysis");
+
+    // Print tiles by zoom level
+    let mut zooms: Vec<_> = summary.tiles_by_zoom.iter().collect();
+    zooms.sort_by_key(|(z, _)| *z);
+    for (zoom, count) in zooms {
+        out.println(&format!("  ZL{} tiles: {}", zoom, count));
+    }
+    out.newline();
+
+    // Print overlaps
+    if summary.total_overlaps > 0 {
+        out.println("Overlaps Detected:");
+        let mut pairs: Vec<_> = summary.overlaps_by_pair.iter().collect();
+        pairs.sort_by_key(|((h, l), _)| (*h, *l));
+        for ((higher, lower), count) in pairs {
+            out.println(&format!(
+                "  ZL{} overlaps ZL{}: {} tiles",
+                higher, lower, count
+            ));
+        }
+        out.println(&format!(
+            "  Total redundant tiles: {}",
+            summary.total_overlaps
+        ));
+        out.newline();
+        out.println("Recommendation:");
+        out.indented("Use 'publish dedupe' to remove redundant tiles before building.");
+    } else {
+        out.println("No overlapping tiles detected.");
+    }
 }

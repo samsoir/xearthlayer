@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use clap::{Subcommand, ValueEnum};
 
 use xearthlayer::package::PackageType;
+use xearthlayer::publisher::dedupe::ZoomPriority;
 use xearthlayer::publisher::VersionBump;
 
 /// Package type argument for CLI.
@@ -47,6 +48,35 @@ impl From<BumpType> for VersionBump {
             BumpType::Patch => VersionBump::Patch,
         }
     }
+}
+
+/// Zoom level priority argument for CLI.
+#[derive(Debug, Clone)]
+pub struct ZoomPriorityArg(pub String);
+
+impl ZoomPriorityArg {
+    /// Parse the priority string into a ZoomPriority.
+    pub fn parse(&self) -> Result<ZoomPriority, String> {
+        ZoomPriority::parse(&self.0).map_err(|e| e.to_string())
+    }
+}
+
+impl std::str::FromStr for ZoomPriorityArg {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
+
+/// Report format argument for CLI.
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+pub enum ReportFormatArg {
+    /// Human-readable text format
+    #[default]
+    Text,
+    /// Machine-readable JSON format
+    Json,
 }
 
 /// Publisher subcommands.
@@ -92,6 +122,17 @@ pub enum PublishCommands {
         #[arg(long, default_value = "1.0.0")]
         version: String,
 
+        /// Remove overlapping zoom level tiles during import
+        #[arg(long)]
+        dedupe: bool,
+
+        /// Priority for resolving overlaps (used with --dedupe):
+        /// - "highest" (default): Keep highest zoom level (best quality)
+        /// - "lowest": Keep lowest zoom level (smallest package)
+        /// - "zl##" (e.g., "zl16"): Keep specific zoom level
+        #[arg(long, default_value = "highest")]
+        priority: ZoomPriorityArg,
+
         /// Repository path (default: current directory)
         #[arg(long, default_value = ".")]
         repo: PathBuf,
@@ -117,6 +158,17 @@ pub enum PublishCommands {
         /// Package type
         #[arg(long, value_enum, default_value = "ortho")]
         r#type: PackageTypeArg,
+
+        /// Remove overlapping zoom level tiles before archiving
+        #[arg(long)]
+        dedupe: bool,
+
+        /// Priority for resolving overlaps (used with --dedupe):
+        /// - "highest" (default): Keep highest zoom level (best quality)
+        /// - "lowest": Keep lowest zoom level (smallest package)
+        /// - "zl##" (e.g., "zl16"): Keep specific zoom level
+        #[arg(long, default_value = "highest")]
+        priority: ZoomPriorityArg,
 
         /// Repository path (default: current directory)
         #[arg(long, default_value = ".")]
@@ -236,6 +288,90 @@ pub enum PublishCommands {
         #[arg(default_value = ".")]
         repo: PathBuf,
     },
+
+    /// Deduplicate overlapping zoom level tiles in a package
+    ///
+    /// Detects and removes redundant tiles where multiple zoom levels
+    /// cover the same geographic area, eliminating Z-fighting artifacts.
+    Dedupe {
+        /// Region code (e.g., "na", "eur", "asia")
+        #[arg(long)]
+        region: String,
+
+        /// Package type
+        #[arg(long, value_enum, default_value = "ortho")]
+        r#type: PackageTypeArg,
+
+        /// Priority for resolving overlaps:
+        /// - "highest" (default): Keep highest zoom level (best quality)
+        /// - "lowest": Keep lowest zoom level (smallest package)
+        /// - "zl##" (e.g., "zl16"): Keep specific zoom level
+        #[arg(long, default_value = "highest")]
+        priority: ZoomPriorityArg,
+
+        /// Limit operation to a specific 1°×1° tile (format: "lat,lon", e.g., "37,-122")
+        #[arg(long)]
+        tile: Option<String>,
+
+        /// Preview changes without modifying files
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output a report file with details of changes
+        #[arg(long)]
+        report: Option<PathBuf>,
+
+        /// Format for the report file (text or json)
+        #[arg(long, value_enum, default_value = "text")]
+        report_format: ReportFormatArg,
+
+        /// Repository path (default: current directory)
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+
+    /// Analyze coverage gaps where higher zoom tiles partially cover lower zoom tiles
+    ///
+    /// Identifies missing tiles needed to complete ZL18 coverage over ZL16 areas.
+    /// Outputs coordinates that can be used to regenerate tiles in Ortho4XP.
+    Gaps {
+        /// Region code (e.g., "na", "eur", "asia")
+        #[arg(long)]
+        region: String,
+
+        /// Package type
+        #[arg(long, value_enum, default_value = "ortho")]
+        r#type: PackageTypeArg,
+
+        /// Limit operation to a specific 1°×1° tile (format: "lat,lon", e.g., "37,-122")
+        #[arg(long)]
+        tile: Option<String>,
+
+        /// Output a report file with details
+        #[arg(long)]
+        report: Option<PathBuf>,
+
+        /// Format for the report file
+        #[arg(long, value_enum, default_value = "text")]
+        report_format: GapReportFormatArg,
+
+        /// Repository path (default: current directory)
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+}
+
+/// Report format options for gap analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum GapReportFormatArg {
+    /// Human-readable text format
+    Text,
+    /// Machine-readable JSON format
+    Json,
+    /// Ortho4XP-compatible coordinate list
+    Ortho4xp,
+    /// Summary grouped by 1°×1° cells
+    Summary,
 }
 
 // ============================================================================
@@ -260,6 +396,8 @@ pub struct AddArgs {
     pub region: String,
     pub package_type: PackageTypeArg,
     pub version: String,
+    pub dedupe: bool,
+    pub priority: ZoomPriorityArg,
     pub repo: PathBuf,
 }
 
@@ -273,6 +411,8 @@ pub struct ListArgs {
 pub struct BuildArgs {
     pub region: String,
     pub package_type: PackageTypeArg,
+    pub dedupe: bool,
+    pub priority: ZoomPriorityArg,
     pub repo: PathBuf,
 }
 
@@ -321,5 +461,27 @@ pub struct CoverageArgs {
     pub height: u32,
     pub dark: bool,
     pub geojson: bool,
+    pub repo: PathBuf,
+}
+
+/// Arguments for the dedupe command.
+pub struct DedupeArgs {
+    pub region: String,
+    pub package_type: PackageTypeArg,
+    pub priority: ZoomPriorityArg,
+    pub tile: Option<String>,
+    pub dry_run: bool,
+    pub report: Option<PathBuf>,
+    pub report_format: ReportFormatArg,
+    pub repo: PathBuf,
+}
+
+/// Arguments for the gaps command.
+pub struct GapsArgs {
+    pub region: String,
+    pub package_type: PackageTypeArg,
+    pub tile: Option<String>,
+    pub report: Option<PathBuf>,
+    pub report_format: GapReportFormatArg,
     pub repo: PathBuf,
 }

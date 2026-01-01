@@ -42,6 +42,7 @@
 mod archive;
 mod config;
 pub mod coverage;
+pub mod dedupe;
 mod error;
 mod library;
 mod metadata;

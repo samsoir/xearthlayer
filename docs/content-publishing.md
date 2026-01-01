@@ -141,6 +141,88 @@ Next steps:
 
 **Note:** DDS texture files are intentionally skipped - XEarthLayer streams these on-demand.
 
+## Step 4a: Analyze Zoom Level Overlaps (Optional)
+
+If your Ortho4XP tiles include multiple zoom levels (e.g., ZL16 base with ZL18 airports), you may have overlapping tiles that cause visual artifacts (striping) in X-Plane.
+
+### Scan for Overlaps
+
+The scan command automatically reports zoom level overlaps:
+
+```bash
+xearthlayer publish scan --source /path/to/Ortho4XP_Tiles
+```
+
+Output includes:
+```
+Zoom Level Analysis
+-------------------
+  ZL16 tiles: 12,456
+  ZL18 tiles: 847
+
+Overlaps Detected:
+  ZL18 overlaps ZL16: 312 tiles
+  Total redundant tiles: 312
+
+Recommendation:
+  Use 'publish dedupe' to remove redundant tiles before building.
+```
+
+### Analyze Coverage Gaps
+
+Before deduplicating, check if your ZL18 coverage is complete:
+
+```bash
+xearthlayer publish gaps --region eu-paris --type ortho
+```
+
+Output:
+```
+Coverage Gap Analysis
+=====================
+Tiles analyzed: 13,303
+Zoom levels:    [16, 18]
+
+Gaps Found
+  42 parent tiles have incomplete ZL18 coverage
+  398 ZL18 tiles needed to complete coverage
+
+Estimated download: ~4.8 GB (to generate missing tiles)
+```
+
+**Important:** Only deduplicate if coverage is complete (0 gaps). Partial coverage means some areas would have no texture if the ZL16 parent is removed.
+
+### Export Missing Tiles for Ortho4XP
+
+Generate coordinates for Ortho4XP to regenerate missing tiles:
+
+```bash
+xearthlayer publish gaps --region eu-paris --type ortho \
+  --format ortho4xp --output missing_tiles.txt
+```
+
+This creates a file with coordinates you can use in Ortho4XP to generate the missing ZL18 tiles.
+
+### Deduplicate Overlapping Tiles
+
+Remove redundant lower-resolution tiles where higher-resolution exists:
+
+```bash
+# Preview what would be removed (dry run)
+xearthlayer publish dedupe --region eu-paris --type ortho --dry-run
+
+# Actually remove redundant tiles
+xearthlayer publish dedupe --region eu-paris --type ortho
+```
+
+Options:
+- `--priority highest` (default): Keep highest zoom level, remove lower
+- `--priority lowest`: Keep lowest zoom level, remove higher
+- `--priority zl16`: Keep specific zoom level
+- `--tile 48,2`: Target a specific 1°×1° tile
+
+**Note:** Deduplication only removes tiles when ALL higher-resolution children exist. This prevents creating visible gaps in scenery.
+
 ## Step 5: Build Archives
 
 Create distributable archive files:

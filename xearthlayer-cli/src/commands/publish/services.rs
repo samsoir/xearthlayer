@@ -7,9 +7,14 @@ use std::path::{Path, PathBuf};
 
 use semver::Version;
 
-use super::traits::{CoverageResult, Output, PublisherService, RepositoryOperations};
+use super::traits::{
+    CoverageResult, DedupeReport, Output, OverlapSummary, PublisherService, RepositoryOperations,
+};
 use crate::error::CliError;
 use xearthlayer::package::{PackageMetadata, PackageType};
+use xearthlayer::publisher::dedupe::{
+    resolve_overlaps, DedupeFilter, GapAnalysisResult, OverlapDetector, ZoomPriority,
+};
 use xearthlayer::publisher::{
     coverage::{CoverageConfig, CoverageMapGenerator},
     BuildResult, ProcessSummary, RegionSuggestion, ReleaseResult, ReleaseStatus, RepoConfig,
@@ -347,5 +352,130 @@ impl PublisherService for DefaultPublisherService {
             total_tiles,
             tiles_by_region,
         })
+    }
+
+    fn dedupe_package(
+        &self,
+        repo: &dyn RepositoryOperations,
+        region: &str,
+        package_type: PackageType,
+        priority: ZoomPriority,
+        filter: Option<DedupeFilter>,
+        dry_run: bool,
+    ) -> Result<DedupeReport, CliError> {
+        // Get the package directory
+        let package_dir = repo.package_dir(region, package_type);
+        if !package_dir.exists() {
+            return Err(CliError::Publish(format!(
+                "Package not found: {} {}",
+                region.to_uppercase(),
+                package_type
+            )));
+        }
+
+        // Scan the package for tiles
+        let detector = OverlapDetector::new();
+        let all_tiles = detector
+            .scan_package(&package_dir)
+            .map_err(|e| CliError::Publish(format!("Failed to scan package: {}", e)))?;
+
+        // Apply filter if specified
+        let tiles: Vec<_> = match &filter {
+            Some(f) => all_tiles.iter().filter(|t| f.matches(t)).cloned().collect(),
+            None => all_tiles,
+        };
+
+        // Detect overlaps
+        let overlaps = detector.detect_overlaps(&tiles);
+
+        // Resolve overlaps based on priority
+        let result = resolve_overlaps(&tiles, &overlaps, priority);
+
+        // If not a dry run, actually remove the files
+        if !dry_run {
+            for tile in &result.tiles_removed {
+                // Remove the .ter file
+                if tile.ter_path.exists() {
+                    std::fs::remove_file(&tile.ter_path).map_err(|e| {
+                        CliError::Publish(format!(
+                            "Failed to remove {}: {}",
+                            tile.ter_path.display(),
+                            e
+                        ))
+                    })?;
+                }
+            }
+        }
+
+        Ok(DedupeReport {
+            tiles_analyzed: result.tiles_analyzed,
+            zoom_levels_present: result.zoom_levels_present,
+            overlaps_by_pair: result.overlaps_by_pair,
+            tiles_removed: result.tiles_removed,
+            tiles_preserved: result.tiles_preserved,
+            dry_run,
+        })
+    }
+
+    fn scan_overlaps(&self, source: &Path) -> Result<OverlapSummary, CliError> {
+        let detector = OverlapDetector::new();
+
+        // Scan the source directory for tiles
+        let tiles = detector
+            .scan_package(source)
+            .map_err(|e| CliError::Publish(format!("Failed to scan for overlaps: {}", e)))?;
+
+        if tiles.is_empty() {
+            return Ok(OverlapSummary::default());
+        }
+
+        // Get zoom levels and counts
+        let mut tiles_by_zoom = std::collections::HashMap::new();
+        for tile in &tiles {
+            *tiles_by_zoom.entry(tile.zoom).or_insert(0usize) += 1;
+        }
+
+        // Detect overlaps
+        let overlaps = detector.detect_overlaps(&tiles);
+
+        // Count overlaps by pair
+        let mut overlaps_by_pair = std::collections::HashMap::new();
+        for overlap in &overlaps {
+            let key = (overlap.higher_zl.zoom, overlap.lower_zl.zoom);
+            *overlaps_by_pair.entry(key).or_insert(0usize) += 1;
+        }
+
+        Ok(OverlapSummary {
+            tiles_scanned: tiles.len(),
+            tiles_by_zoom,
+            overlaps_by_pair,
+            total_overlaps: overlaps.len(),
+        })
+    }
+
+    fn analyze_gaps(
+        &self,
+        repo: &dyn RepositoryOperations,
+        region: &str,
+        package_type: PackageType,
+        filter: Option<DedupeFilter>,
+    ) -> Result<GapAnalysisResult, CliError> {
+        let package_dir = repo.package_dir(region, package_type);
+
+        // Create detector with optional filter
+        let detector = match filter {
+            Some(f) => OverlapDetector::with_filter(f),
+            None => OverlapDetector::new(),
+        };
+
+        // Scan package for tiles
+        let tiles = detector
+            .scan_package(&package_dir)
+            .map_err(|e| CliError::Publish(format!("Failed to scan package: {}", e)))?;
+
+        // Analyze gaps
+        let result = detector.analyze_gaps(&tiles);
+
+        Ok(result)
     }
 }

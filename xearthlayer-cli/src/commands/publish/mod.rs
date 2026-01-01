@@ -45,15 +45,16 @@ mod tests;
 // Re-export public types
 pub use args::PublishCommands;
 pub use handlers::{
-    AddHandler, BuildHandler, CoverageHandler, InitHandler, ListHandler, ReleaseHandler,
-    ScanHandler, StatusHandler, UrlsHandler, ValidateHandler, VersionHandler,
+    AddHandler, BuildHandler, CoverageHandler, DedupeHandler, GapsHandler, InitHandler,
+    ListHandler, ReleaseHandler, ScanHandler, StatusHandler, UrlsHandler, ValidateHandler,
+    VersionHandler,
 };
 pub use services::{ConsoleOutput, DefaultPublisherService};
 pub use traits::CommandHandler;
 
 use args::{
-    AddArgs, BuildArgs, CoverageArgs, InitArgs, ListArgs, ReleaseArgs, ScanArgs, StatusArgs,
-    UrlsArgs, ValidateArgs, VersionArgs,
+    AddArgs, BuildArgs, CoverageArgs, DedupeArgs, GapsArgs, InitArgs, ListArgs, ReleaseArgs,
+    ScanArgs, StatusArgs, UrlsArgs, ValidateArgs, VersionArgs,
 };
 use traits::CommandContext;
 
@@ -89,6 +90,8 @@ pub fn run(command: PublishCommands) -> Result<(), CliError> {
             region,
             r#type,
             version,
+            dedupe,
+            priority,
             repo,
         } => AddHandler::execute(
             AddArgs {
@@ -96,6 +99,8 @@ pub fn run(command: PublishCommands) -> Result<(), CliError> {
                 region,
                 package_type: r#type,
                 version,
+                dedupe,
+                priority,
                 repo,
             },
             &ctx,
@@ -108,11 +113,15 @@ pub fn run(command: PublishCommands) -> Result<(), CliError> {
         PublishCommands::Build {
             region,
             r#type,
+            dedupe,
+            priority,
             repo,
         } => BuildHandler::execute(
             BuildArgs {
                 region,
                 package_type: r#type,
+                dedupe,
+                priority,
                 repo,
             },
             &ctx,
@@ -196,6 +205,48 @@ pub fn run(command: PublishCommands) -> Result<(), CliError> {
                 height,
                 dark,
                 geojson,
+                repo,
+            },
+            &ctx,
+        ),
+
+        PublishCommands::Dedupe {
+            region,
+            r#type,
+            priority,
+            tile,
+            dry_run,
+            report,
+            report_format,
+            repo,
+        } => DedupeHandler::execute(
+            DedupeArgs {
+                region,
+                package_type: r#type,
+                priority,
+                tile,
+                dry_run,
+                report,
+                report_format,
+                repo,
+            },
+            &ctx,
+        ),
+
+        PublishCommands::Gaps {
+            region,
+            r#type,
+            tile,
+            report,
+            report_format,
+            repo,
+        } => GapsHandler::execute(
+            GapsArgs {
+                region,
+                package_type: r#type,
+                tile,
+                report,
+                report_format,
                 repo,
             },
             &ctx,
