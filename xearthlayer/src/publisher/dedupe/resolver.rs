@@ -2,7 +2,7 @@
 //!
 //! Determines which tiles to remove based on the configured priority strategy.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use super::types::{DedupeResult, OverlapCoverage, TileReference, ZoomOverlap, ZoomPriority};
@@ -155,29 +155,6 @@ fn get_sorted_zoom_levels(tiles: &[TileReference]) -> Vec<u8> {
     levels
 }
 
-/// Group tiles by their zoom level.
-#[allow(dead_code)]
-pub fn group_by_zoom(tiles: &[TileReference]) -> HashMap<u8, Vec<&TileReference>> {
-    tiles.iter().fold(HashMap::new(), |mut acc, tile| {
-        acc.entry(tile.zoom).or_default().push(tile);
-        acc
-    })
-}
-
-/// Estimate space savings from removing tiles.
-///
-/// Note: This is an approximation based on average DDS file sizes.
-/// Actual savings depend on the specific textures.
-#[allow(dead_code)]
-pub fn estimate_space_savings(removed: &[TileReference]) -> u64 {
-    // Approximate DDS file sizes by zoom level
-    // ZL16: ~5.5MB per tile (4096x4096 BC1)
-    // ZL18: ~5.5MB per tile (same resolution, different coverage)
-    const APPROX_DDS_SIZE: u64 = 5_500_000;
-
-    removed.len() as u64 * APPROX_DDS_SIZE
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,28 +279,6 @@ mod tests {
         assert_eq!(set.len(), 1);
         assert!(set.contains(&path1));
         assert!(!set.contains(&path2));
-    }
-
-    #[test]
-    fn test_group_by_zoom() {
-        let tiles = vec![
-            make_tile(100032, 42688, 18),
-            make_tile(25008, 10672, 16),
-            make_tile(25009, 10673, 16),
-        ];
-
-        let grouped = group_by_zoom(&tiles);
-        assert_eq!(grouped.get(&18).map(|v| v.len()), Some(1));
-        assert_eq!(grouped.get(&16).map(|v| v.len()), Some(2));
-    }
-
-    #[test]
-    fn test_estimate_space_savings() {
-        let tiles = vec![make_tile(100032, 42688, 18), make_tile(25008, 10672, 16)];
-
-        let savings = estimate_space_savings(&tiles);
-        // 2 tiles * ~5.5MB
-        assert!(savings > 10_000_000);
     }
 
     #[test]

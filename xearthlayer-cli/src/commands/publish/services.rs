@@ -435,9 +435,6 @@ impl PublisherService for DefaultPublisherService {
             *tiles_by_zoom.entry(tile.zoom).or_insert(0usize) += 1;
         }
 
-        let mut zoom_levels: Vec<u8> = tiles_by_zoom.keys().copied().collect();
-        zoom_levels.sort();
-
         // Detect overlaps
         let overlaps = detector.detect_overlaps(&tiles);
 
@@ -450,7 +447,6 @@ impl PublisherService for DefaultPublisherService {
 
         Ok(OverlapSummary {
             tiles_scanned: tiles.len(),
-            zoom_levels,
             tiles_by_zoom,
             overlaps_by_pair,
             total_overlaps: overlaps.len(),

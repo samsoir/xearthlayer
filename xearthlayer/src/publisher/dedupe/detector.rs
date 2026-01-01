@@ -120,9 +120,16 @@ impl OverlapDetector {
     /// Returns a `GapAnalysisResult` containing all gaps and missing tiles needed
     /// to complete coverage.
     pub fn analyze_gaps(&self, tiles: &[TileReference]) -> GapAnalysisResult {
+        // Get sorted zoom levels
+        let zoom_levels_present = {
+            let mut levels: Vec<u8> = tiles.iter().map(|t| t.zoom).collect::<HashSet<_>>().into_iter().collect();
+            levels.sort();
+            levels
+        };
+
         let mut result = GapAnalysisResult {
             tiles_analyzed: tiles.len(),
-            zoom_levels_present: get_zoom_levels(tiles),
+            zoom_levels_present,
             tile_filter: self.filter.tile.map(|c| (c.lat, c.lon)),
             ..Default::default()
         };
@@ -451,24 +458,6 @@ fn parse_dds_filename(filename: &str) -> Option<(u32, u32, u8, String)> {
     Some((row, col, zoom, provider))
 }
 
-/// Get zoom levels present in a collection of tiles.
-#[allow(dead_code)]
-pub fn get_zoom_levels(tiles: &[TileReference]) -> Vec<u8> {
-    let levels: HashSet<u8> = tiles.iter().map(|t| t.zoom).collect();
-    let mut sorted: Vec<u8> = levels.into_iter().collect();
-    sorted.sort();
-    sorted
-}
-
-/// Count tiles by zoom level.
-#[allow(dead_code)]
-pub fn count_by_zoom(tiles: &[TileReference]) -> HashMap<u8, usize> {
-    tiles.iter().fold(HashMap::new(), |mut acc, tile| {
-        *acc.entry(tile.zoom).or_insert(0) += 1;
-        acc
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,84 +641,5 @@ mod tests {
 
         // Should detect: ZL18→ZL16, ZL18→ZL14, ZL16→ZL14
         assert_eq!(overlaps.len(), 3);
-    }
-
-    #[test]
-    fn test_get_zoom_levels() {
-        let tiles = vec![
-            TileReference {
-                row: 100032,
-                col: 42688,
-                zoom: 18,
-                provider: "BI".to_string(),
-                lat: 39.15,
-                lon: -121.36,
-                ter_path: PathBuf::from("test.ter"),
-                is_sea: false,
-            },
-            TileReference {
-                row: 25008,
-                col: 10672,
-                zoom: 16,
-                provider: "BI".to_string(),
-                lat: 39.13,
-                lon: -121.33,
-                ter_path: PathBuf::from("test.ter"),
-                is_sea: false,
-            },
-            TileReference {
-                row: 25009,
-                col: 10673,
-                zoom: 16,
-                provider: "BI".to_string(),
-                lat: 39.14,
-                lon: -121.34,
-                ter_path: PathBuf::from("test.ter"),
-                is_sea: false,
-            },
-        ];
-
-        let levels = get_zoom_levels(&tiles);
-        assert_eq!(levels, vec![16, 18]);
-    }
-
-    #[test]
-    fn test_count_by_zoom() {
-        let tiles = vec![
-            TileReference {
-                row: 100032,
-                col: 42688,
-                zoom: 18,
-                provider: "BI".to_string(),
-                lat: 39.15,
-                lon: -121.36,
-                ter_path: PathBuf::from("test.ter"),
-                is_sea: false,
-            },
-            TileReference {
-                row: 25008,
-                col: 10672,
-                zoom: 16,
-                provider: "BI".to_string(),
-                lat: 39.13,
-                lon: -121.33,
-                ter_path: PathBuf::from("test.ter"),
-                is_sea: false,
-            },
-            TileReference {
-                row: 25009,
-                col: 10673,
-                zoom: 16,
-                provider: "BI".to_string(),
-                lat: 39.14,
-                lon: -121.34,
-                ter_path: PathBuf::from("test.ter"),
-                is_sea: false,
-            },
-        ];
-
-        let counts = count_by_zoom(&tiles);
-        assert_eq!(counts.get(&16), Some(&2));
-        assert_eq!(counts.get(&18), Some(&1));
     }
 }

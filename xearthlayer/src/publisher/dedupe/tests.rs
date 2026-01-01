@@ -50,8 +50,7 @@ fn make_complete_zl18_coverage(
     children
 }
 
-/// Create a ZoomOverlap for two tiles.
-#[allow(dead_code)]
+/// Create a ZoomOverlap for two tiles (test helper).
 fn make_overlap(higher: &TileReference, lower: &TileReference) -> ZoomOverlap {
     ZoomOverlap {
         higher_zl: higher.clone(),

@@ -44,12 +44,6 @@ impl MockOutput {
         Self::default()
     }
 
-    /// Get all captured messages.
-    #[allow(dead_code)]
-    pub fn messages(&self) -> Vec<String> {
-        self.messages.read().unwrap().clone()
-    }
-
     /// Check if any message contains the given substring.
     pub fn contains(&self, substring: &str) -> bool {
         self.messages
@@ -57,12 +51,6 @@ impl MockOutput {
             .unwrap()
             .iter()
             .any(|m| m.contains(substring))
-    }
-
-    /// Get the full output as a single string.
-    #[allow(dead_code)]
-    pub fn full_output(&self) -> String {
-        self.messages.read().unwrap().join("\n")
     }
 }
 
@@ -155,12 +143,6 @@ impl MockPublisherServiceBuilder {
         self
     }
 
-    #[allow(dead_code)]
-    pub fn with_open_error(mut self, error: &str) -> Self {
-        self.open_result = Some(Err(error.to_string()));
-        self
-    }
-
     pub fn with_packages(mut self, packages: Vec<(String, PackageType)>) -> Self {
         self.packages = packages;
         self
@@ -188,12 +170,6 @@ impl MockPublisherServiceBuilder {
 
     pub fn with_metadata(mut self, metadata: PackageMetadata) -> Self {
         self.read_metadata_result = Some(Ok(metadata));
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn with_metadata_error(mut self, error: &str) -> Self {
-        self.read_metadata_result = Some(Err(error.to_string()));
         self
     }
 
@@ -489,7 +465,6 @@ impl PublisherService for MockPublisherService {
         // Return a mock overlap summary
         Ok(OverlapSummary {
             tiles_scanned: 100,
-            zoom_levels: vec![16, 18],
             tiles_by_zoom: [(16, 80), (18, 20)].into_iter().collect(),
             overlaps_by_pair: [(18, 16)].into_iter().map(|k| (k, 10)).collect(),
             total_overlaps: 10,

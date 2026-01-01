@@ -50,9 +50,6 @@ pub struct DedupeReport {
 pub struct OverlapSummary {
     /// Total .ter files scanned.
     pub tiles_scanned: usize,
-    /// Zoom levels present.
-    #[allow(dead_code)]
-    pub zoom_levels: Vec<u8>,
     /// Count of tiles by zoom level.
     pub tiles_by_zoom: HashMap<u8, usize>,
     /// Overlap counts by (higher_zl, lower_zl) pair.
