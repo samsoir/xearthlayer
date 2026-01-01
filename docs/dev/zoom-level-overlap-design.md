@@ -30,10 +30,24 @@ Both reference overlapping geographic areas. X-Plane renders both, causing Z-buf
 
 ### Measured Impact
 
-In a sample NA ortho package:
-- Total ZL16 tiles: 373,687
-- Total ZL18 tiles: 19,051
-- **Overlapping tiles: 1,083** (5.7% of ZL18)
+In the NA ortho package (as of December 2024):
+- Total tiles: 616,980
+- ZL16 tiles: ~600,000+
+- ZL18 tiles: ~16,000+
+- **ZL16 tiles with partial ZL18 overlap: 2,165**
+- **Missing ZL18 tiles to complete coverage: 32,475**
+
+### Critical Discovery: Gap Protection
+
+Initial implementation revealed a critical issue: **blindly removing ZL16 tiles when any ZL18 child exists creates gaps**. Each ZL16 tile has 16 potential ZL18 children (4×4 grid). If only 1-15 children exist, removing the ZL16 parent creates visible holes in the scenery.
+
+| Coverage | Safe to Remove Parent? | Reason |
+|----------|----------------------|--------|
+| 16/16 (100%) | ✅ Yes | All children exist, no gaps |
+| 1-15/16 (6-94%) | ❌ No | Missing children = visible gaps |
+| 0/16 (0%) | N/A | No overlap, nothing to dedupe |
+
+The deduplication algorithm now uses "parent-centric" detection: for each lower ZL tile, count ALL existing higher ZL children before marking an overlap as safe to resolve.
 
 ## Design Goals
 
@@ -165,6 +179,77 @@ xearthlayer publish dedupe \
 - `optimize` - Too broad (could mean compression, etc.)
 - `dedupe` - **Chosen**: Clear meaning (de-duplicate), familiar term
 
+### New: `publish gaps`
+
+Analyze coverage gaps where higher zoom level tiles only partially cover lower zoom level areas:
+
+```bash
+xearthlayer publish gaps \
+  --region na \
+  --type ortho \
+  [--tile <lat>,<lon>] \
+  [--output <file>] \
+  [--format <text|json|ortho4xp|summary>] \
+  [<repo_path>]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--tile <lat>,<lon>` | Target a specific 1°×1° tile by coordinates |
+| `--output <file>` | Write report to file instead of stdout |
+| `--format <mode>` | Output format (default: `text`) |
+
+**Output Formats:**
+
+| Format | Description |
+|--------|-------------|
+| `text` | Human-readable detailed report |
+| `json` | Machine-readable JSON structure |
+| `ortho4xp` | Coordinates for Ortho4XP tile regeneration |
+| `summary` | Compact per-tile summary |
+
+**Example Output (text format):**
+```
+Coverage Gap Analysis
+=====================
+Tiles analyzed: 616,980
+Zoom levels:    [16, 18]
+
+Gaps Found
+  2,165 parent tiles have incomplete ZL18 coverage
+  32,475 ZL18 tiles needed to complete coverage
+
+Estimated download: ~396 GB (to generate missing tiles)
+
+Example Gaps
+  ZL16 (25008, 10672) at 39.15,-121.34: 4/16 coverage (25.0%)
+  ZL16 (25012, 10676) at 39.28,-121.12: 8/16 coverage (50.0%)
+  ...
+```
+
+**Example Output (ortho4xp format):**
+```
+# Ortho4XP Missing Tile Coordinates
+# Format: latitude, longitude, zoom_level
+
+41.1563, -72.6533, 18
+41.1563, -72.5283, 18
+41.2813, -72.6533, 18
+...
+```
+
+**Use Case:**
+The `gaps` command helps package publishers identify what tiles need to be generated in Ortho4XP to achieve complete ZL18 coverage. Only with complete coverage can deduplication safely remove lower ZL tiles without creating visible gaps.
+
+**Tile Size Reference:**
+
+| Zoom Level | Approximate Area at 37°N | Tiles per Parent |
+|------------|--------------------------|------------------|
+| ZL16 | ~5 × 5 NM (22 NM²) | - |
+| ZL18 | ~1.2 × 1.2 NM (1.4 NM²) | 16 per ZL16 |
+
+Each ZL16 tile has 16 potential ZL18 children arranged in a 4×4 grid. Partial coverage (1-15 of 16) creates striping artifacts if the parent is removed.
+
 ## Targeted Tile Operations
 
 All deduplication commands support targeting a specific 1°×1° tile using latitude/longitude coordinates. This enables:
@@ -195,6 +280,7 @@ The coordinates map directly to X-Plane's tile naming convention:
 |---------|----------------------|
 | `publish scan` | Report overlaps only within specified tile |
 | `publish dedupe` | Remove overlapping tiles only within specified tile |
+| `publish gaps` | Analyze coverage gaps only within specified tile |
 | `publish build --dedupe` | Exclude overlaps only within specified tile from archive |
 
 ### Usage Examples
@@ -403,6 +489,42 @@ pub struct DedupeResult {
     pub tiles_preserved: Vec<TileReference>,
     pub partial_overlaps: Vec<ZoomOverlap>,
 }
+
+/// A missing tile that would complete coverage
+#[derive(Debug, Clone)]
+pub struct MissingTile {
+    pub row: u32,
+    pub col: u32,
+    pub zoom: u8,
+    pub lat: f32,  // Center latitude for Ortho4XP
+    pub lon: f32,  // Center longitude for Ortho4XP
+}
+
+/// A coverage gap representing incomplete higher-ZL coverage
+#[derive(Debug, Clone)]
+pub struct CoverageGap {
+    pub parent: TileReference,          // The lower-ZL parent tile
+    pub existing_children: Vec<TileReference>,  // Children that exist
+    pub missing_tiles: Vec<MissingTile>,        // Children that don't exist
+    pub expected_count: u32,            // Always 16 for ZL+2
+}
+
+impl CoverageGap {
+    /// Calculate coverage percentage
+    pub fn coverage_percent(&self) -> f32 {
+        (self.existing_children.len() as f32 / self.expected_count as f32) * 100.0
+    }
+}
+
+/// Result of gap analysis operation
+#[derive(Debug, Clone, Default)]
+pub struct GapAnalysisResult {
+    pub tiles_analyzed: usize,
+    pub zoom_levels_present: Vec<u8>,
+    pub gaps: Vec<CoverageGap>,
+    pub total_missing_tiles: usize,
+    pub tile_filter: Option<(i32, i32)>,  // Applied tile filter
+}
 ```
 
 ### Module Structure
@@ -412,10 +534,11 @@ xearthlayer/src/publisher/
 ├── mod.rs
 ├── dedupe/
 │   ├── mod.rs           # Module exports
-│   ├── detector.rs      # Overlap detection logic
+│   ├── detector.rs      # Overlap detection + gap analysis
 │   ├── resolver.rs      # Resolution strategy implementation
-│   ├── report.rs        # Audit report generation
-│   └── types.rs         # ZoomOverlap, TileReference, etc.
+│   ├── report.rs        # DedupeAuditReport + GapAuditReport
+│   ├── types.rs         # ZoomOverlap, TileReference, CoverageGap, etc.
+│   └── tests.rs         # Unit tests for detection and resolution
 └── ...
 ```
 
@@ -514,7 +637,7 @@ impl Ortho4XPProcessor {
 
 #### PublisherService Trait
 
-Extend with deduplication methods:
+Extend with deduplication and gap analysis methods:
 
 ```rust
 pub trait PublisherService: Send + Sync {
@@ -535,6 +658,15 @@ pub trait PublisherService: Send + Sync {
         filter: DedupeFilter,
         dry_run: bool,
     ) -> Result<DedupeResult, CliError>;
+
+    /// Analyze coverage gaps in a package
+    fn analyze_gaps(
+        &self,
+        packages_dir: &Path,
+        region: &str,
+        scenery_type: &str,
+        filter: DedupeFilter,
+    ) -> Result<GapAnalysisResult, CliError>;
 }
 ```
 
@@ -735,6 +867,17 @@ test_fixtures/overlapping_tiles/
     └── ...
 ```
 
+## Implementation Status
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Core overlap detection | ✅ Complete | Parent-centric algorithm with gap protection |
+| `publish dedupe` command | ✅ Complete | All priority modes, dry-run, tile filter |
+| `publish gaps` command | ✅ Complete | Multiple output formats including Ortho4XP |
+| `publish scan` overlap reporting | ✅ Complete | Integrated with existing scan |
+| `publish add --dedupe` | ⏳ Planned | Phase 4 of original design |
+| `publish build --dedupe` | ⏳ Planned | Phase 4 of original design |
+
 ## Future Considerations
 
 1. **Automatic detection in `xearthlayer run`**: Warn if mounted packages have overlaps
@@ -742,3 +885,4 @@ test_fixtures/overlapping_tiles/
 3. **Undo support**: Track removed tiles for potential restoration
 4. **Visualization**: Integrate with coverage map to show overlap regions by ZL
 5. **ZL-aware coverage maps**: Color tiles by zoom level in coverage generator
+6. **Ortho4XP integration**: Script to automate tile regeneration from gaps output

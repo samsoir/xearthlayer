@@ -41,6 +41,14 @@ The Package Publisher creates distributable XEarthLayer Scenery Packages from Or
 │  │ URLs         │  │ Publish      │  │ Changelog            │  │
 │  └──────────────┘  └──────────────┘  └──────────────────────┘  │
 │                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │               Zoom Level Dedupe Module                    │  │
+│  │                                                           │  │
+│  │ Detector: Find overlapping tiles across zoom levels      │  │
+│  │ Resolver: Apply priority-based removal (highest/lowest)  │  │
+│  │ Gap Analysis: Find incomplete coverage, export to O4XP   │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -342,6 +350,24 @@ xearthlayer publish status \
 
 # Validate repository integrity
 xearthlayer publish validate [<repo_path>]
+
+# Analyze coverage gaps (incomplete ZL18 coverage over ZL16)
+xearthlayer publish gaps \
+  --region <region_code> \
+  [--type <ortho|overlay>] \
+  [--tile <lat,lon>] \
+  [--format <text|json|ortho4xp|summary>] \
+  [--output <file>] \
+  [<repo_path>]
+
+# Remove overlapping zoom level tiles
+xearthlayer publish dedupe \
+  --region <region_code> \
+  [--type <ortho|overlay>] \
+  [--priority <highest|lowest|zl##>] \
+  [--tile <lat,lon>] \
+  [--dry-run] \
+  [<repo_path>]
 ```
 
 ### CLI Architecture
@@ -630,3 +656,7 @@ Benefits:
 - Generate checksums for integrity, not security
 - HTTPS recommended for download URLs
 - No secrets stored in repository (URLs are public)
+
+## Related Documentation
+
+- **Zoom Level Overlap Management**: See `docs/dev/zoom-level-overlap-design.md` for detailed design of the dedupe module, gap analysis algorithm, and gap protection mechanisms.
