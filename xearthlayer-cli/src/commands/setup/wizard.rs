@@ -77,10 +77,10 @@ pub fn run_wizard() -> Result<(), CliError> {
         }
     }
 
-    // Step 1: X-Plane Installation
+    // Step 1: X-Plane Custom Scenery
     println!(
         "{}",
-        style("Step 1: X-Plane Installation").bold().underlined()
+        style("Step 1: X-Plane Custom Scenery").bold().underlined()
     );
     println!();
     let xplane_scenery_dir = step_xplane(&theme)?;
@@ -195,7 +195,7 @@ fn step_xplane(theme: &ColorfulTheme) -> Result<Option<PathBuf>, CliError> {
         SceneryDetectionResult::NotFound => {
             println!(
                 "{}",
-                style("X-Plane 12 installation not detected.").yellow()
+                style("X-Plane 12 Custom Scenery folder not detected.").yellow()
             );
             println!("You can configure this later in ~/.xearthlayer/config.ini");
             println!();
@@ -244,7 +244,7 @@ fn step_xplane(theme: &ColorfulTheme) -> Result<Option<PathBuf>, CliError> {
         SceneryDetectionResult::Multiple(paths) => {
             println!(
                 "{}",
-                style("Multiple X-Plane 12 installations detected:").green()
+                style("Multiple X-Plane 12 Custom Scenery folders detected:").green()
             );
             println!();
 
@@ -255,7 +255,7 @@ fn step_xplane(theme: &ColorfulTheme) -> Result<Option<PathBuf>, CliError> {
                 .collect();
 
             let selection = Select::with_theme(theme)
-                .with_prompt("Select X-Plane installation")
+                .with_prompt("Select Custom Scenery folder")
                 .items(&items)
                 .default(0)
                 .interact()
