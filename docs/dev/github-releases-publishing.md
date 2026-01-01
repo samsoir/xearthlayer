@@ -519,6 +519,93 @@ xearthlayer publish coverage --geojson --output coverage.geojson
 | `--dark` | Use dark theme with CartoDB tiles (PNG only) |
 | `--geojson` | Generate GeoJSON instead of PNG |
 
+## Website Sync Integration
+
+When you push library index updates to the regional-scenery repository, the public website at [xearthlayer.app](https://xearthlayer.app) is automatically updated.
+
+### Automation Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Website Sync Automation                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Regional Scenery Repo              Website Repo                        │
+│  ─────────────────────              ────────────                        │
+│                                                                         │
+│  Push to main         ─────────►   sync-packages.yml                    │
+│  (library updated)    repository        │                               │
+│                       dispatch          ▼                               │
+│                                    Fetch library                        │
+│                                    Update packages.md                   │
+│                                    Commit changes                       │
+│                                         │                               │
+│                                         ▼                               │
+│                                    deploy.yml                           │
+│                                         │                               │
+│                                         ▼                               │
+│                                    Live at xearthlayer.app              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### What Gets Updated Automatically
+
+| Website File | Source | Description |
+|--------------|--------|-------------|
+| `/packages/xearthlayer_package_library.txt` | Regional scenery repo | Package index for CLI |
+| `/docs/packages/` (Available Regions table) | Generated from library | Region list with versions |
+
+### Sync Triggers
+
+| Trigger | Description |
+|---------|-------------|
+| `repository_dispatch` | Immediate sync when regional-scenery pushes library updates |
+| `schedule` (00:00 UTC) | Daily fallback if dispatch fails |
+| `workflow_dispatch` | Manual trigger via GitHub Actions UI |
+
+### Required Token: WEBSITE_DISPATCH_TOKEN
+
+The regional-scenery repo requires a fine-grained PAT to trigger the website sync.
+
+**Token Configuration:**
+- **Repository access:** `samsoir/xearthlayer-website`
+- **Permissions:** Contents (read/write)
+- **Location:** Regional-scenery repo → Settings → Secrets → `WEBSITE_DISPATCH_TOKEN`
+
+### Token Refresh Maintenance
+
+⚠️ **The token expires every 90 days** (GitHub's maximum for fine-grained PATs).
+
+**Refresh Procedure:**
+
+1. Go to GitHub → Settings → Developer Settings → Personal Access Tokens → Fine-grained tokens
+2. Find `xearthlayer-website-dispatch` token
+3. Click "Regenerate token"
+4. Copy the new token
+5. Go to `samsoir/xearthlayer-regional-scenery` → Settings → Secrets → Actions
+6. Update `WEBSITE_DISPATCH_TOKEN` with the new value
+
+**If Token Expires:**
+- Immediate syncs will fail (silently)
+- Daily cron sync still works (fetches directly, no dispatch needed)
+- Website updates will be delayed up to 24 hours
+
+**Recommended:** Set a calendar reminder for day 80 after each token refresh.
+
+### Manual Sync
+
+If you need to force a website sync:
+
+```bash
+# Trigger sync workflow manually
+gh workflow run sync-packages.yml --repo samsoir/xearthlayer-website
+
+# Or trigger via repository dispatch (requires token)
+gh api repos/samsoir/xearthlayer-website/dispatches \
+  -f event_type=package-library-updated
+```
+
 ## See Also
 
 - [Content Publishing Guide](../content-publishing.md) - General publishing concepts
