@@ -122,7 +122,12 @@ impl OverlapDetector {
     pub fn analyze_gaps(&self, tiles: &[TileReference]) -> GapAnalysisResult {
         // Get sorted zoom levels
         let zoom_levels_present = {
-            let mut levels: Vec<u8> = tiles.iter().map(|t| t.zoom).collect::<HashSet<_>>().into_iter().collect();
+            let mut levels: Vec<u8> = tiles
+                .iter()
+                .map(|t| t.zoom)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
             levels.sort();
             levels
         };
