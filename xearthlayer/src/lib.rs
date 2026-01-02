@@ -34,6 +34,7 @@ pub mod prefetch;
 pub mod provider;
 pub mod publisher;
 pub mod service;
+pub mod system;
 pub mod telemetry;
 pub mod texture;
 pub mod tile;

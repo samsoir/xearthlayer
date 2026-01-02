@@ -2,6 +2,16 @@
 //!
 //! Guides users through initial XEarthLayer configuration using
 //! dialoguer prompts for a friendly terminal experience.
+//!
+//! # Architecture
+//!
+//! This module handles only the **presentation layer** (TUI prompts and formatting).
+//! All business logic lives in the core library:
+//!
+//! - System detection: [`xearthlayer::system::SystemInfo`]
+//! - Recommendations: [`xearthlayer::system::RecommendedSettings`]
+//! - X-Plane detection: [`xearthlayer::config::detect_scenery_dir`]
+//! - Configuration: [`xearthlayer::config::ConfigFile`]
 
 use std::path::PathBuf;
 
@@ -12,8 +22,8 @@ use xearthlayer::config::{
     config_file_path, detect_scenery_dir, format_size, ConfigFile, SceneryDetectionResult,
 };
 use xearthlayer::pipeline::DiskIoProfile;
+use xearthlayer::system::SystemInfo;
 
-use super::detection::SystemInfo;
 use crate::error::CliError;
 
 /// Configuration result from the setup wizard.
@@ -366,12 +376,12 @@ fn step_system_config(
 
     let recommended_memory = system_info.recommended_memory_cache();
     let recommended_disk = system_info.recommended_disk_cache();
-    let recommended_profile = system_info.storage_type;
+    let recommended_profile = system_info.disk_io_profile;
 
     println!("{}", style("Recommended Settings:").bold());
     println!(
         "  Memory Cache:   {} (of {} available)",
-        style(system_info.recommended_cache_display()).cyan(),
+        style(system_info.recommended_memory_cache_display()).cyan(),
         system_info.memory_display()
     );
     println!(
@@ -380,7 +390,7 @@ fn step_system_config(
     );
     println!(
         "  I/O Profile:    {} ({})",
-        style(system_info.recommended_io_profile()).cyan(),
+        style(system_info.recommended_disk_io_profile()).cyan(),
         match recommended_profile {
             DiskIoProfile::Nvme => "high concurrency",
             DiskIoProfile::Ssd => "moderate concurrency",
