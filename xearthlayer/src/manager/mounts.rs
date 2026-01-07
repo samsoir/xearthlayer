@@ -370,6 +370,7 @@ impl MountManager {
             fuse_requests_active: 0,
             fuse_requests_waiting: 0,
             jobs_submitted: 0,
+            fuse_jobs_submitted: 0,
             jobs_completed: 0,
             jobs_failed: 0,
             jobs_timed_out: 0,
@@ -392,6 +393,7 @@ impl MountManager {
             encodes_active: 0,
             bytes_encoded: 0,
             jobs_per_second: 0.0,
+            fuse_jobs_per_second: 0.0,
             chunks_per_second: 0.0,
             bytes_per_second: 0.0,
             peak_bytes_per_second: 0.0,
@@ -412,6 +414,7 @@ impl MountManager {
             total.fuse_requests_active += snapshot.fuse_requests_active;
             total.fuse_requests_waiting += snapshot.fuse_requests_waiting;
             total.jobs_submitted += snapshot.jobs_submitted;
+            total.fuse_jobs_submitted += snapshot.fuse_jobs_submitted;
             total.jobs_completed += snapshot.jobs_completed;
             total.jobs_failed += snapshot.jobs_failed;
             total.jobs_timed_out += snapshot.jobs_timed_out;
@@ -451,6 +454,7 @@ impl MountManager {
         // Recalculate rates based on aggregated data
         let uptime_secs = total.uptime.as_secs_f64().max(0.001);
         total.jobs_per_second = total.jobs_completed as f64 / uptime_secs;
+        total.fuse_jobs_per_second = total.fuse_jobs_submitted as f64 / uptime_secs;
         total.chunks_per_second = total.chunks_downloaded as f64 / uptime_secs;
         total.bytes_per_second = total.bytes_downloaded as f64 / uptime_secs;
 

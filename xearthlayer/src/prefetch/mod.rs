@@ -43,6 +43,7 @@
 
 mod buffer;
 mod builder;
+mod circuit_breaker;
 mod condition;
 pub mod cone;
 pub mod config;
@@ -62,6 +63,7 @@ mod state;
 mod strategy;
 pub mod types;
 
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use condition::{
     AlwaysActiveCondition, MinimumSpeedCondition, NeverActiveCondition, PrefetchCondition,
 };

@@ -149,7 +149,8 @@ fn aircraft_state(lat: f64, lon: f64, heading: f32, ground_speed: f32) -> Aircra
 /// Create a default radial prefetch config for testing.
 fn test_radial_config() -> RadialPrefetchConfig {
     RadialPrefetchConfig {
-        radius: 2, // 5x5 grid for faster tests
+        inner_radius_nm: 1.0, // Small ring for faster tests
+        outer_radius_nm: 3.0,
         zoom: 14,
         attempt_ttl: Duration::from_secs(60),
     }
@@ -660,11 +661,12 @@ async fn test_builder_creates_radial_prefetcher() {
         .memory_cache(cache)
         .dds_handler(handler)
         .strategy("radial")
-        .radial_radius(2)
+        .inner_radius_nm(10.0) // Small ring for testing
+        .outer_radius_nm(20.0)
         .build();
 
-    // Verify it starts correctly (format: "radial, {radius}-tile radius, zoom {zoom}")
-    assert_eq!(prefetcher.startup_info(), "radial, 2-tile radius, zoom 14");
+    // Verify it starts correctly (format: "radial ring ({inner}-{outer}nm), zoom {zoom}")
+    assert_eq!(prefetcher.startup_info(), "radial ring (10-20nm), zoom 14");
 
     let (tx, rx) = mpsc::channel(32);
     let token = CancellationToken::new();

@@ -25,6 +25,9 @@ pub struct PipelineMetrics {
     // === Job metrics ===
     /// Total jobs submitted to the pipeline
     jobs_submitted: AtomicU64,
+    /// Jobs submitted from FUSE (X-Plane requests, NOT prefetch).
+    /// Used by circuit breaker to detect scenery loading bursts.
+    fuse_jobs_submitted: AtomicU64,
     /// Jobs completed successfully (includes partial success)
     jobs_completed: AtomicU64,
     /// Jobs that failed due to pipeline errors
@@ -91,6 +94,7 @@ impl PipelineMetrics {
             fuse_requests_active: AtomicUsize::new(0),
             fuse_requests_waiting: AtomicUsize::new(0),
             jobs_submitted: AtomicU64::new(0),
+            fuse_jobs_submitted: AtomicU64::new(0),
             jobs_completed: AtomicU64::new(0),
             jobs_failed: AtomicU64::new(0),
             jobs_timed_out: AtomicU64::new(0),
@@ -147,6 +151,14 @@ impl PipelineMetrics {
     pub fn job_submitted(&self) {
         self.jobs_submitted.fetch_add(1, Ordering::Relaxed);
         self.fuse_requests_waiting.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a job submitted from FUSE (X-Plane request, NOT prefetch).
+    ///
+    /// This counter is used by the circuit breaker to detect scenery loading
+    /// bursts. Only call this for on-demand FUSE requests where `is_prefetch: false`.
+    pub fn fuse_job_submitted(&self) {
+        self.fuse_jobs_submitted.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a job starting active processing.
@@ -293,6 +305,7 @@ impl PipelineMetrics {
         let uptime_secs = uptime.as_secs_f64().max(0.001); // Avoid division by zero
 
         let jobs_completed = self.jobs_completed.load(Ordering::Relaxed);
+        let fuse_jobs_submitted = self.fuse_jobs_submitted.load(Ordering::Relaxed);
         let chunks_downloaded = self.chunks_downloaded.load(Ordering::Relaxed);
         let bytes_downloaded = self.bytes_downloaded.load(Ordering::Relaxed);
 
@@ -331,6 +344,7 @@ impl PipelineMetrics {
 
             // Job metrics
             jobs_submitted: self.jobs_submitted.load(Ordering::Relaxed),
+            fuse_jobs_submitted,
             jobs_completed,
             jobs_failed: self.jobs_failed.load(Ordering::Relaxed),
             jobs_timed_out: self.jobs_timed_out.load(Ordering::Relaxed),
@@ -369,6 +383,7 @@ impl PipelineMetrics {
 
             // Computed rates
             jobs_per_second: jobs_completed as f64 / uptime_secs,
+            fuse_jobs_per_second: fuse_jobs_submitted as f64 / uptime_secs,
             chunks_per_second: chunks_downloaded as f64 / uptime_secs,
             bytes_per_second,
             peak_bytes_per_second,
@@ -387,6 +402,7 @@ impl PipelineMetrics {
         self.fuse_requests_active.store(0, Ordering::Relaxed);
         self.fuse_requests_waiting.store(0, Ordering::Relaxed);
         self.jobs_submitted.store(0, Ordering::Relaxed);
+        self.fuse_jobs_submitted.store(0, Ordering::Relaxed);
         self.jobs_completed.store(0, Ordering::Relaxed);
         self.jobs_failed.store(0, Ordering::Relaxed);
         self.jobs_timed_out.store(0, Ordering::Relaxed);

@@ -1,6 +1,6 @@
 # Predictive Tile Caching
 
-**Status**: Implemented (v0.2.7+, dual-zone architecture v0.2.9+)
+**Status**: Implemented (v0.2.7+, dual-zone architecture v0.2.9+, circuit breaker v0.2.11+)
 
 ## Overview
 
@@ -332,6 +332,37 @@ The cache is invalidated when any of these conditions are detected:
 
 Cache file size: ~15-25 bytes per tile × 445,000 tiles ≈ **7-11 MB**
 
+### Circuit Breaker (`xearthlayer/src/prefetch/circuit_breaker.rs`)
+
+The circuit breaker automatically pauses prefetching when X-Plane is loading scenery. This prevents prefetch jobs from competing with on-demand requests during high-load periods.
+
+**How it works:**
+1. The pipeline tracks FUSE-originated jobs (X-Plane requests, NOT prefetch requests)
+2. When FUSE jobs/second exceeds threshold (default: 5.0) for sustained duration (default: 5s), circuit opens
+3. While open, prefetch cycles are skipped entirely
+4. After load drops below threshold, circuit enters half-open state
+5. If load stays low during cooloff period (default: 5s), circuit closes and prefetching resumes
+
+**State Machine:**
+```
+Closed --[fuse_rate > threshold for open_duration]--> Open
+Open --[fuse_rate < threshold]--> HalfOpen
+HalfOpen --[half_open_duration elapsed + try_close()]--> Closed
+HalfOpen --[fuse_rate > threshold]--> Open (reset)
+```
+
+**CRITICAL Design Decision:**
+- Circuit breaker only monitors FUSE-originated jobs (`!is_prefetch`)
+- This prevents self-fulfilling lockup where prefetch jobs trigger the breaker
+- Only X-Plane's own scenery loading requests affect the circuit state
+
+**TUI Display:**
+| Circuit State | TUI Shows |
+|---------------|-----------|
+| Closed | "Active" (normal prefetching) |
+| Open | "Paused (high X-Plane load)" |
+| HalfOpen | "Resuming..." |
+
 ### Timeout Mechanism
 
 Prefetch requests include a 10-second timeout to prevent stuck jobs:
@@ -385,13 +416,17 @@ Configuration keys in `[prefetch]` section:
 | `enabled` | bool | `true` | Enable/disable predictive caching |
 | `strategy` | string | `auto` | Strategy: `auto`, `heading-aware`, or `radial` |
 | `udp_port` | u16 | `49002` | X-Plane UDP broadcast port |
-| `inner_radius_nm` | f32 | `85.0` | Inner edge of prefetch zone (both radial and cone) |
-| `radial_outer_radius_nm` | f32 | `100.0` | Outer edge of 360° radial buffer |
-| `cone_outer_radius_nm` | f32 | `120.0` | Outer edge of forward heading cone |
-| `cone_half_angle` | f32 | `30.0` | Half-angle of heading cone (degrees) |
-| `max_tiles_per_cycle` | usize | `50` | Max tiles to submit per cycle |
+| `inner_radius_nm` | f32 | `85.0` | Inner edge of prefetch zone (nautical miles) |
+| `outer_radius_nm` | f32 | `120.0` | Outer edge of prefetch zone (nautical miles) |
+| `cone_angle` | f32 | `80.0` | Half-angle of heading cone (degrees) |
+| `max_tiles_per_cycle` | usize | `200` | Max tiles to submit per cycle |
 | `cycle_interval_ms` | u64 | `2000` | Interval between prefetch cycles (ms) |
-| `radial_radius` | u8 | `3` | Radial fallback radius (tiles) |
+| `circuit_breaker_threshold` | f64 | `5.0` | FUSE jobs/second to trip circuit breaker |
+| `circuit_breaker_open_secs` | u64 | `5` | Sustained load duration to open circuit |
+| `circuit_breaker_half_open_secs` | u64 | `5` | Cooloff time before closing circuit |
+
+**Removed in v0.2.11:**
+- `radial_radius` - Replaced by nautical-mile ring (`inner_radius_nm`/`outer_radius_nm`)
 
 Example `config.ini`:
 ```ini
@@ -400,15 +435,21 @@ enabled = true
 strategy = auto
 udp_port = 49002
 
-# Dual-zone prefetch boundaries
+# Zone boundaries (nautical miles)
 inner_radius_nm = 85              # Start 5nm inside X-Plane's 90nm boundary
-radial_outer_radius_nm = 100      # 360° buffer extends 10nm beyond
-cone_outer_radius_nm = 120        # Forward cone extends 30nm beyond
-cone_half_angle = 30              # 60° total cone width
+outer_radius_nm = 120             # Extend 30nm beyond for lookahead
 
-# Rate limiting
-max_tiles_per_cycle = 50
+# Heading-aware cone
+cone_angle = 80                   # 160° total cone width
+
+# Cycle limits
+max_tiles_per_cycle = 200
 cycle_interval_ms = 2000
+
+# Circuit breaker (pause prefetch during X-Plane scenery loading)
+circuit_breaker_threshold = 5.0   # FUSE jobs/sec to trip
+circuit_breaker_open_secs = 5     # How long high rate must be sustained
+circuit_breaker_half_open_secs = 5  # Cooloff before resume
 ```
 
 ## X-Plane Setup
@@ -583,18 +624,19 @@ xearthlayer/src/prefetch/
 ├── mod.rs              # Module exports
 ├── strategy.rs         # Prefetcher trait
 ├── heading_aware.rs    # HeadingAwarePrefetcher (recommended)
-├── radial.rs           # RadialPrefetcher (simple fallback)
+├── radial.rs           # RadialPrefetcher (ring-based, nautical mile annulus)
 ├── cone.rs             # ConeGenerator for forward prefetch
 ├── buffer.rs           # BufferGenerator for lateral/rear
 ├── intersection.rs     # Tile/zone intersection testing
 ├── inference.rs        # FUSE request analyzer
 ├── scenery_index.rs    # SceneryIndex for exact tile lookup
 ├── scenery_cache.rs    # Persistent cache for SceneryIndex
+├── circuit_breaker.rs  # Circuit breaker for X-Plane load detection
 ├── prewarm.rs          # Cold-start cache warming
 ├── listener.rs         # UDP telemetry listener
 ├── config.rs           # Configuration types
 ├── builder.rs          # PrefetcherBuilder
-├── state.rs            # Shared status for dashboard
+├── state.rs            # Shared status for dashboard (+ CircuitState display)
 ├── types.rs            # Common types (PrefetchTile, zones)
 ├── coordinates.rs      # Coordinate conversion utilities
 ├── condition.rs        # Prefetch conditions (speed thresholds)
@@ -655,3 +697,4 @@ Use `tokio::fs` for non-blocking cache read/write operations. Currently cache op
 | 2025-12-26 | Claude | SceneryIndex: Parse .ter files for exact tile coordinates, sea tile detection, grid-based spatial index |
 | 2025-12-28 | Claude | **Dual-zone architecture**: Radial buffer (85-100nm, 360°) + heading cone (85-120nm, 60° forward). New intersection.rs module for proper tile/zone intersection testing. Config keys: radial_outer_radius_nm, cone_outer_radius_nm, cone_half_angle. Three-pool CPU limiter gives prefetch guaranteed capacity. |
 | 2025-12-28 | Claude | **SceneryIndex persistent cache**: New `scenery_cache.rs` module caches the SceneryIndex to disk (~7-11 MB for 445k tiles). First launch: ~20s build + save. Subsequent launches: ~200-500ms load. Cache invalidates on package changes (mtime, file count). Added `from_tiles()` and `all_tiles()` methods to SceneryIndex. Future enhancements: FE-005 (incremental updates), FE-006 (binary format), FE-007 (async I/O). |
+| 2026-01-06 | Claude | **Ring-based radial prefetch + Circuit breaker**: (1) RadialPrefetcher now uses nautical-mile annulus (85-120nm) instead of tile-count grid. `radial_radius` deprecated. (2) Circuit breaker pauses prefetch when X-Plane is loading scenery (FUSE job rate > 5/sec). Three states: Closed (active), Open (paused), HalfOpen (resuming). Only counts FUSE-originated jobs to prevent self-fulfilling lockup. New config keys: `circuit_breaker_threshold`, `circuit_breaker_open_secs`, `circuit_breaker_half_open_secs`. Updated defaults: `cone_angle` 45°→80°, `outer_radius_nm` 95→120nm, `max_tiles_per_cycle` 50→200. |

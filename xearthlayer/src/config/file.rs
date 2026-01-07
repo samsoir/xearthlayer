@@ -188,21 +188,28 @@ pub struct PrefetchSettings {
     pub strategy: String,
     /// UDP port for X-Plane telemetry (default: 49002 for ForeFlight protocol)
     pub udp_port: u16,
-    /// Prediction cone half-angle in degrees (default: 45)
+    /// Prediction cone half-angle in degrees (default: 80)
     pub cone_angle: f32,
-    /// Radial prefetcher tile radius (default: 3, giving a 7×7 = 49 tile grid)
-    pub radial_radius: u8,
     /// Inner radius where prefetch zone starts (nautical miles).
     /// This is just inside X-Plane's ~90nm loaded zone. Default: 85nm.
     pub inner_radius_nm: f32,
-    /// Outer radius where prefetch zone ends (nautical miles). Default: 95nm.
+    /// Outer radius where prefetch zone ends (nautical miles). Default: 120nm.
     pub outer_radius_nm: f32,
-    /// Maximum tiles to submit per prefetch cycle. Default: 50.
+    /// Maximum tiles to submit per prefetch cycle. Default: 200.
     /// Lower values reduce bandwidth competition with on-demand requests.
     pub max_tiles_per_cycle: usize,
     /// Interval between prefetch cycles in milliseconds. Default: 2000ms.
     /// Higher values reduce prefetch aggressiveness.
     pub cycle_interval_ms: u64,
+    /// Circuit breaker threshold: FUSE jobs per second to trip the breaker.
+    /// When X-Plane is loading scenery, FUSE request rate spikes. Default: 5.0.
+    pub circuit_breaker_threshold: f64,
+    /// How long (seconds) high FUSE rate must be sustained to open circuit.
+    /// Default: 5 seconds.
+    pub circuit_breaker_open_secs: u64,
+    /// Cooloff time (seconds) before trying to close the circuit.
+    /// Default: 5 seconds.
+    pub circuit_breaker_half_open_secs: u64,
 }
 
 /// Control plane configuration for job management and health monitoring.
@@ -286,11 +293,13 @@ impl Default for ConfigFile {
                 strategy: "auto".to_string(),
                 udp_port: DEFAULT_PREFETCH_UDP_PORT,
                 cone_angle: DEFAULT_PREFETCH_CONE_ANGLE,
-                radial_radius: DEFAULT_PREFETCH_RADIAL_RADIUS,
                 inner_radius_nm: DEFAULT_PREFETCH_INNER_RADIUS_NM,
                 outer_radius_nm: DEFAULT_PREFETCH_OUTER_RADIUS_NM,
                 max_tiles_per_cycle: DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE,
                 cycle_interval_ms: DEFAULT_PREFETCH_CYCLE_INTERVAL_MS,
+                circuit_breaker_threshold: DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
+                circuit_breaker_open_secs: DEFAULT_CIRCUIT_BREAKER_OPEN_SECS,
+                circuit_breaker_half_open_secs: DEFAULT_CIRCUIT_BREAKER_HALF_OPEN_SECS,
             },
             control_plane: ControlPlaneSettings {
                 max_concurrent_jobs: default_max_concurrent_jobs(),
@@ -412,25 +421,33 @@ pub const DEFAULT_GENERATION_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_PREFETCH_UDP_PORT: u16 = 49002;
 
 /// Default prediction cone half-angle in degrees.
-pub const DEFAULT_PREFETCH_CONE_ANGLE: f32 = 45.0;
-
-/// Default radial prefetcher tile radius (7×7 = 49 tiles).
-pub const DEFAULT_PREFETCH_RADIAL_RADIUS: u8 = 3;
+/// Wider angle (80°) covers more area ahead of aircraft.
+pub const DEFAULT_PREFETCH_CONE_ANGLE: f32 = 80.0;
 
 /// Default inner radius where prefetch zone starts (nautical miles).
 /// Just inside X-Plane's ~90nm loaded zone boundary.
 pub const DEFAULT_PREFETCH_INNER_RADIUS_NM: f32 = 85.0;
 
 /// Default outer radius where prefetch zone ends (nautical miles).
-pub const DEFAULT_PREFETCH_OUTER_RADIUS_NM: f32 = 95.0;
+/// Extended to 120nm for better look-ahead coverage.
+pub const DEFAULT_PREFETCH_OUTER_RADIUS_NM: f32 = 120.0;
 
 /// Default maximum tiles to submit per prefetch cycle.
-/// Reduced from 100 to 50 to leave more bandwidth for on-demand requests.
-pub const DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE: usize = 50;
+/// Increased to 200 for faster cache warming.
+pub const DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE: usize = 200;
 
 /// Default interval between prefetch cycles in milliseconds.
-/// Increased from 1000ms to 2000ms to reduce prefetch aggressiveness.
 pub const DEFAULT_PREFETCH_CYCLE_INTERVAL_MS: u64 = 2000;
+
+/// Default circuit breaker threshold: FUSE jobs per second to trip.
+/// When X-Plane is loading scenery, FUSE request rate spikes.
+pub const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: f64 = 5.0;
+
+/// Default duration (seconds) high FUSE rate must be sustained to open circuit.
+pub const DEFAULT_CIRCUIT_BREAKER_OPEN_SECS: u64 = 5;
+
+/// Default cooloff time (seconds) before trying to close the circuit.
+pub const DEFAULT_CIRCUIT_BREAKER_HALF_OPEN_SECS: u64 = 5;
 
 // =============================================================================
 // Control plane defaults
@@ -798,17 +815,8 @@ impl ConfigFile {
                         reason: "must be a positive number (degrees)".to_string(),
                     })?;
             }
-            // Deprecated: cone_distance_nm, radial_radius_nm, batch_size, max_in_flight
-            // These are ignored if present in config file (removed in v0.2.9)
-            if let Some(v) = section.get("radial_radius") {
-                config.prefetch.radial_radius =
-                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                        section: "prefetch".to_string(),
-                        key: "radial_radius".to_string(),
-                        value: v.to_string(),
-                        reason: "must be a positive integer (1-20)".to_string(),
-                    })?;
-            }
+            // Deprecated: cone_distance_nm, radial_radius_nm, batch_size, max_in_flight, radial_radius
+            // These are ignored if present in config file (removed in v0.2.9/v0.2.11)
             if let Some(v) = section.get("inner_radius_nm") {
                 config.prefetch.inner_radius_nm =
                     v.parse().map_err(|_| ConfigFileError::InvalidValue {
@@ -845,6 +853,33 @@ impl ConfigFile {
                         key: "cycle_interval_ms".to_string(),
                         value: v.to_string(),
                         reason: "must be a positive integer (milliseconds)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("circuit_breaker_threshold") {
+                config.prefetch.circuit_breaker_threshold =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "circuit_breaker_threshold".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive number (FUSE jobs/second)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("circuit_breaker_open_secs") {
+                config.prefetch.circuit_breaker_open_secs =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "circuit_breaker_open_secs".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (seconds)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("circuit_breaker_half_open_secs") {
+                config.prefetch.circuit_breaker_half_open_secs =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "circuit_breaker_half_open_secs".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (seconds)".to_string(),
                     })?;
             }
         }
@@ -1053,23 +1088,34 @@ enabled = {}
 strategy = {}
 ; UDP port for telemetry (default: 49002 for ForeFlight protocol)
 udp_port = {}
-; Prediction cone half-angle in degrees (default: 45)
-; Wider angles prefetch more tiles but use more bandwidth
-cone_angle = {}
-; Radial prefetcher tile radius (default: 3, giving 7x7 = 49 tiles)
-; Higher values prefetch more tiles around aircraft position
-radial_radius = {}
-; Inner radius where prefetch zone starts (nautical miles, default: 85)
+
+; Zone boundaries (nautical miles)
+; Inner radius where prefetch zone starts (default: 85)
 ; Just inside X-Plane's ~90nm loaded zone boundary
 inner_radius_nm = {}
-; Outer radius where prefetch zone ends (nautical miles, default: 95)
+; Outer radius where prefetch zone ends (default: 120)
 outer_radius_nm = {}
-; Maximum tiles to submit per prefetch cycle (default: 50)
+
+; Heading-aware cone (prediction cone half-angle in degrees, default: 80)
+; Wider angles prefetch more tiles but use more bandwidth
+cone_angle = {}
+
+; Cycle limits
+; Maximum tiles to submit per prefetch cycle (default: 200)
 ; Lower values leave more bandwidth for on-demand requests
 max_tiles_per_cycle = {}
 ; Interval between prefetch cycles in milliseconds (default: 2000)
 ; Higher values reduce prefetch aggressiveness
 cycle_interval_ms = {}
+
+; Circuit breaker (pause prefetch during X-Plane scenery loading)
+; Only counts FUSE-originated requests, not prefetch jobs
+; FUSE jobs per second threshold to trip the breaker (default: 5.0)
+circuit_breaker_threshold = {}
+; Duration (seconds) high FUSE rate must be sustained to open circuit (default: 5)
+circuit_breaker_open_secs = {}
+; Cooloff time (seconds) before trying to close the circuit (default: 5)
+circuit_breaker_half_open_secs = {}
 
 [control_plane]
 ; Advanced settings for job management and health monitoring.
@@ -1123,12 +1169,14 @@ radius_nm = {}
             self.prefetch.enabled,
             self.prefetch.strategy,
             self.prefetch.udp_port,
-            self.prefetch.cone_angle,
-            self.prefetch.radial_radius,
             self.prefetch.inner_radius_nm,
             self.prefetch.outer_radius_nm,
+            self.prefetch.cone_angle,
             self.prefetch.max_tiles_per_cycle,
             self.prefetch.cycle_interval_ms,
+            self.prefetch.circuit_breaker_threshold,
+            self.prefetch.circuit_breaker_open_secs,
+            self.prefetch.circuit_breaker_half_open_secs,
             self.control_plane.max_concurrent_jobs,
             self.control_plane.stall_threshold_secs,
             self.control_plane.health_check_interval_secs,

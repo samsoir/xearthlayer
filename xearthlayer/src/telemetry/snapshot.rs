@@ -24,6 +24,9 @@ pub struct TelemetrySnapshot {
     // === Job metrics ===
     /// Total jobs submitted
     pub jobs_submitted: u64,
+    /// Jobs submitted from FUSE (X-Plane requests, NOT prefetch).
+    /// Used by circuit breaker to detect scenery loading bursts.
+    pub fuse_jobs_submitted: u64,
     /// Jobs completed successfully
     pub jobs_completed: u64,
     /// Jobs that failed due to pipeline errors
@@ -76,6 +79,9 @@ pub struct TelemetrySnapshot {
     // === Computed rates ===
     /// Jobs per second
     pub jobs_per_second: f64,
+    /// FUSE jobs per second (X-Plane requests only, NOT prefetch).
+    /// Used by circuit breaker to detect scenery loading bursts.
+    pub fuse_jobs_per_second: f64,
     /// Chunks per second
     pub chunks_per_second: f64,
     /// Bytes per second (download throughput)
@@ -269,6 +275,7 @@ mod tests {
             fuse_requests_active: 8,
             fuse_requests_waiting: 12,
             jobs_submitted: 100,
+            fuse_jobs_submitted: 80, // 80 from FUSE, 20 from prefetch
             jobs_completed: 90,
             jobs_failed: 2,
             jobs_timed_out: 3,
@@ -291,6 +298,7 @@ mod tests {
             encodes_active: 2,
             bytes_encoded: 1_000_000_000, // ~1 GB
             jobs_per_second: 0.0246,
+            fuse_jobs_per_second: 0.0218, // 80 FUSE jobs / 3661 seconds
             chunks_per_second: 6.3,
             bytes_per_second: 19_125.0,
             peak_bytes_per_second: 50_000.0,

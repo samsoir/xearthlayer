@@ -103,6 +103,14 @@ where
         let tile = request.tile;
         let is_prefetch = request.is_prefetch;
 
+        // Track FUSE-originated jobs for circuit breaker
+        // Only count non-prefetch jobs (X-Plane requests)
+        if let Some(ref m) = metrics {
+            if !is_prefetch {
+                m.fuse_job_submitted();
+            }
+        }
+
         debug!(
             job_id = %job_id,
             tile = ?tile,

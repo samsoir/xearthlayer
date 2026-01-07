@@ -400,8 +400,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
                     .inner_radius_nm(config.prefetch.inner_radius_nm)
                     .outer_radius_nm(config.prefetch.outer_radius_nm)
                     .max_tiles_per_cycle(config.prefetch.max_tiles_per_cycle)
-                    .cycle_interval_ms(config.prefetch.cycle_interval_ms)
-                    .radial_radius(config.prefetch.radial_radius);
+                    .cycle_interval_ms(config.prefetch.cycle_interval_ms);
 
                 // Wire FUSE analyzer for heading-aware/auto strategies
                 // This enables FUSE-based position inference when telemetry is unavailable
@@ -925,8 +924,7 @@ fn start_prefetcher(
         .inner_radius_nm(config.prefetch.inner_radius_nm)
         .outer_radius_nm(config.prefetch.outer_radius_nm)
         .max_tiles_per_cycle(config.prefetch.max_tiles_per_cycle)
-        .cycle_interval_ms(config.prefetch.cycle_interval_ms)
-        .radial_radius(config.prefetch.radial_radius);
+        .cycle_interval_ms(config.prefetch.cycle_interval_ms);
 
     if let Some(analyzer) = fuse_analyzer {
         builder = builder.with_fuse_analyzer(analyzer);

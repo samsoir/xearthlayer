@@ -77,11 +77,13 @@ pub enum ConfigKey {
     PrefetchStrategy,
     PrefetchUdpPort,
     PrefetchConeAngle,
-    PrefetchRadialRadius,
     PrefetchInnerRadiusNm,
     PrefetchOuterRadiusNm,
     PrefetchMaxTilesPerCycle,
     PrefetchCycleIntervalMs,
+    PrefetchCircuitBreakerThreshold,
+    PrefetchCircuitBreakerOpenSecs,
+    PrefetchCircuitBreakerHalfOpenSecs,
 
     // Control plane settings
     ControlPlaneMaxConcurrentJobs,
@@ -136,11 +138,15 @@ impl FromStr for ConfigKey {
             "prefetch.strategy" => Ok(ConfigKey::PrefetchStrategy),
             "prefetch.udp_port" => Ok(ConfigKey::PrefetchUdpPort),
             "prefetch.cone_angle" => Ok(ConfigKey::PrefetchConeAngle),
-            "prefetch.radial_radius" => Ok(ConfigKey::PrefetchRadialRadius),
             "prefetch.inner_radius_nm" => Ok(ConfigKey::PrefetchInnerRadiusNm),
             "prefetch.outer_radius_nm" => Ok(ConfigKey::PrefetchOuterRadiusNm),
             "prefetch.max_tiles_per_cycle" => Ok(ConfigKey::PrefetchMaxTilesPerCycle),
             "prefetch.cycle_interval_ms" => Ok(ConfigKey::PrefetchCycleIntervalMs),
+            "prefetch.circuit_breaker_threshold" => Ok(ConfigKey::PrefetchCircuitBreakerThreshold),
+            "prefetch.circuit_breaker_open_secs" => Ok(ConfigKey::PrefetchCircuitBreakerOpenSecs),
+            "prefetch.circuit_breaker_half_open_secs" => {
+                Ok(ConfigKey::PrefetchCircuitBreakerHalfOpenSecs)
+            }
 
             "control_plane.max_concurrent_jobs" => Ok(ConfigKey::ControlPlaneMaxConcurrentJobs),
             "control_plane.stall_threshold_secs" => Ok(ConfigKey::ControlPlaneStallThresholdSecs),
@@ -192,11 +198,15 @@ impl ConfigKey {
             ConfigKey::PrefetchStrategy => "prefetch.strategy",
             ConfigKey::PrefetchUdpPort => "prefetch.udp_port",
             ConfigKey::PrefetchConeAngle => "prefetch.cone_angle",
-            ConfigKey::PrefetchRadialRadius => "prefetch.radial_radius",
             ConfigKey::PrefetchInnerRadiusNm => "prefetch.inner_radius_nm",
             ConfigKey::PrefetchOuterRadiusNm => "prefetch.outer_radius_nm",
             ConfigKey::PrefetchMaxTilesPerCycle => "prefetch.max_tiles_per_cycle",
             ConfigKey::PrefetchCycleIntervalMs => "prefetch.cycle_interval_ms",
+            ConfigKey::PrefetchCircuitBreakerThreshold => "prefetch.circuit_breaker_threshold",
+            ConfigKey::PrefetchCircuitBreakerOpenSecs => "prefetch.circuit_breaker_open_secs",
+            ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => {
+                "prefetch.circuit_breaker_half_open_secs"
+            }
             ConfigKey::ControlPlaneMaxConcurrentJobs => "control_plane.max_concurrent_jobs",
             ConfigKey::ControlPlaneStallThresholdSecs => "control_plane.stall_threshold_secs",
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => {
@@ -287,11 +297,19 @@ impl ConfigKey {
             ConfigKey::PrefetchStrategy => config.prefetch.strategy.clone(),
             ConfigKey::PrefetchUdpPort => config.prefetch.udp_port.to_string(),
             ConfigKey::PrefetchConeAngle => config.prefetch.cone_angle.to_string(),
-            ConfigKey::PrefetchRadialRadius => config.prefetch.radial_radius.to_string(),
             ConfigKey::PrefetchInnerRadiusNm => config.prefetch.inner_radius_nm.to_string(),
             ConfigKey::PrefetchOuterRadiusNm => config.prefetch.outer_radius_nm.to_string(),
             ConfigKey::PrefetchMaxTilesPerCycle => config.prefetch.max_tiles_per_cycle.to_string(),
             ConfigKey::PrefetchCycleIntervalMs => config.prefetch.cycle_interval_ms.to_string(),
+            ConfigKey::PrefetchCircuitBreakerThreshold => {
+                config.prefetch.circuit_breaker_threshold.to_string()
+            }
+            ConfigKey::PrefetchCircuitBreakerOpenSecs => {
+                config.prefetch.circuit_breaker_open_secs.to_string()
+            }
+            ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => {
+                config.prefetch.circuit_breaker_half_open_secs.to_string()
+            }
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs.to_string()
             }
@@ -417,9 +435,6 @@ impl ConfigKey {
             ConfigKey::PrefetchConeAngle => {
                 config.prefetch.cone_angle = value.parse().unwrap();
             }
-            ConfigKey::PrefetchRadialRadius => {
-                config.prefetch.radial_radius = value.parse().unwrap();
-            }
             ConfigKey::PrefetchInnerRadiusNm => {
                 config.prefetch.inner_radius_nm = value.parse().unwrap();
             }
@@ -431,6 +446,15 @@ impl ConfigKey {
             }
             ConfigKey::PrefetchCycleIntervalMs => {
                 config.prefetch.cycle_interval_ms = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchCircuitBreakerThreshold => {
+                config.prefetch.circuit_breaker_threshold = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchCircuitBreakerOpenSecs => {
+                config.prefetch.circuit_breaker_open_secs = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => {
+                config.prefetch.circuit_breaker_half_open_secs = value.parse().unwrap();
             }
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs = value.parse().unwrap();
@@ -500,11 +524,13 @@ impl ConfigKey {
             }
             ConfigKey::PrefetchUdpPort => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchConeAngle => Box::new(PositiveNumberSpec),
-            ConfigKey::PrefetchRadialRadius => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchInnerRadiusNm => Box::new(PositiveNumberSpec),
             ConfigKey::PrefetchOuterRadiusNm => Box::new(PositiveNumberSpec),
             ConfigKey::PrefetchMaxTilesPerCycle => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchCycleIntervalMs => Box::new(PositiveIntegerSpec),
+            ConfigKey::PrefetchCircuitBreakerThreshold => Box::new(PositiveNumberSpec),
+            ConfigKey::PrefetchCircuitBreakerOpenSecs => Box::new(PositiveIntegerSpec),
+            ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneMaxConcurrentJobs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneStallThresholdSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => Box::new(PositiveIntegerSpec),
@@ -547,11 +573,13 @@ impl ConfigKey {
             ConfigKey::PrefetchStrategy,
             ConfigKey::PrefetchUdpPort,
             ConfigKey::PrefetchConeAngle,
-            ConfigKey::PrefetchRadialRadius,
             ConfigKey::PrefetchInnerRadiusNm,
             ConfigKey::PrefetchOuterRadiusNm,
             ConfigKey::PrefetchMaxTilesPerCycle,
             ConfigKey::PrefetchCycleIntervalMs,
+            ConfigKey::PrefetchCircuitBreakerThreshold,
+            ConfigKey::PrefetchCircuitBreakerOpenSecs,
+            ConfigKey::PrefetchCircuitBreakerHalfOpenSecs,
             ConfigKey::ControlPlaneMaxConcurrentJobs,
             ConfigKey::ControlPlaneStallThresholdSecs,
             ConfigKey::ControlPlaneHealthCheckIntervalSecs,

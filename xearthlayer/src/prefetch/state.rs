@@ -39,6 +39,8 @@ pub enum PrefetchMode {
     Radial,
     /// Prefetch system is idle (no data received yet).
     Idle,
+    /// Prefetch blocked due to high FUSE load (circuit breaker open).
+    CircuitOpen,
 }
 
 /// Detailed prefetch statistics for dashboard display.
@@ -61,6 +63,9 @@ pub struct DetailedPrefetchStats {
     pub active_zoom_levels: Vec<u8>,
     /// Whether the prefetcher is actively submitting tiles.
     pub is_active: bool,
+    /// Circuit breaker state (None if circuit breaker is disabled).
+    /// Used by TUI to show prefetch pause status.
+    pub circuit_state: Option<super::circuit_breaker::CircuitState>,
 }
 
 impl std::fmt::Display for PrefetchMode {
@@ -70,6 +75,7 @@ impl std::fmt::Display for PrefetchMode {
             Self::FuseInference => write!(f, "Heading-Aware (Inferred)"),
             Self::Radial => write!(f, "Radial"),
             Self::Idle => write!(f, "Idle"),
+            Self::CircuitOpen => write!(f, "Paused"),
         }
     }
 }

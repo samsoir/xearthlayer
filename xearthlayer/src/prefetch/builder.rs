@@ -282,9 +282,10 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
 
         match self.strategy {
             PrefetchStrategy::Radial => {
-                // Simple radial prefetcher
+                // Ring-based radial prefetcher (uses nautical mile annulus)
                 let config = RadialPrefetchConfig {
-                    radius: self.radial_radius,
+                    inner_radius_nm: self.inner_radius_nm,
+                    outer_radius_nm: self.outer_radius_nm,
                     zoom: self.zoom,
                     attempt_ttl: Duration::from_secs(self.attempt_ttl_secs),
                 };

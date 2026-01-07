@@ -21,11 +21,18 @@ use crate::coord::{to_tile_coords, TileCoord};
 use crate::fuse::{DdsHandler, DdsRequest};
 use crate::pipeline::{JobId, MemoryCache};
 
-use super::state::{AircraftState, PrefetchMode, SharedPrefetchStatus};
+use super::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use super::coordinates::{distance_to_tile, tile_size_nm_at_lat};
+use super::state::{AircraftState, DetailedPrefetchStats, PrefetchMode, SharedPrefetchStatus};
 use super::strategy::Prefetcher;
 
-/// Default radius in tiles around current position.
-const DEFAULT_RADIUS: u8 = 3;
+use crate::telemetry::PipelineMetrics;
+
+/// Default inner radius in nautical miles (inside this = X-Plane's preload zone).
+const DEFAULT_INNER_RADIUS_NM: f32 = 85.0;
+
+/// Default outer radius in nautical miles (prefetch out to this distance).
+const DEFAULT_OUTER_RADIUS_NM: f32 = 120.0;
 
 /// Default TTL for recently-attempted tiles (don't re-request for this long).
 const DEFAULT_ATTEMPT_TTL: Duration = Duration::from_secs(60);
@@ -37,10 +44,19 @@ const PREFETCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MIN_CYCLE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Configuration for the radial prefetcher.
+///
+/// The prefetcher maintains an annular (ring-shaped) buffer zone around the
+/// aircraft position. Tiles inside the inner radius are assumed to be in
+/// X-Plane's preload zone and are not prefetched. Tiles between the inner
+/// and outer radius are prefetched to create a buffer.
 #[derive(Debug, Clone)]
 pub struct RadialPrefetchConfig {
-    /// Radius in tiles around current position (default: 3 = 7×7 grid = 49 tiles).
-    pub radius: u8,
+    /// Inner radius in nautical miles (default: 85nm).
+    /// Tiles closer than this are in X-Plane's preload zone.
+    pub inner_radius_nm: f32,
+    /// Outer radius in nautical miles (default: 120nm).
+    /// Tiles beyond this are too far ahead to prefetch.
+    pub outer_radius_nm: f32,
     /// Zoom level for tile predictions (default: 14).
     pub zoom: u8,
     /// How long to wait before re-attempting a tile (default: 60s).
@@ -50,7 +66,8 @@ pub struct RadialPrefetchConfig {
 impl Default for RadialPrefetchConfig {
     fn default() -> Self {
         Self {
-            radius: DEFAULT_RADIUS,
+            inner_radius_nm: DEFAULT_INNER_RADIUS_NM,
+            outer_radius_nm: DEFAULT_OUTER_RADIUS_NM,
             zoom: 14,
             attempt_ttl: DEFAULT_ATTEMPT_TTL,
         }
@@ -119,6 +136,10 @@ pub struct RadialPrefetcher<M: MemoryCache> {
     shared_status: Option<Arc<SharedPrefetchStatus>>,
     /// Last position used for prefetch (to detect movement).
     last_tile: Option<TileCoord>,
+    /// Circuit breaker for pausing prefetch during X-Plane scenery loading.
+    circuit_breaker: Option<CircuitBreaker>,
+    /// Pipeline metrics for monitoring FUSE job rate (used by circuit breaker).
+    metrics: Option<Arc<PipelineMetrics>>,
 }
 
 impl<M: MemoryCache> RadialPrefetcher<M> {
@@ -142,6 +163,8 @@ impl<M: MemoryCache> RadialPrefetcher<M> {
             stats: Arc::new(RadialPrefetchStats::default()),
             shared_status: None,
             last_tile: None,
+            circuit_breaker: None,
+            metrics: None,
         }
     }
 
@@ -151,9 +174,63 @@ impl<M: MemoryCache> RadialPrefetcher<M> {
         self
     }
 
+    /// Enable circuit breaker to pause prefetching during X-Plane scenery loading.
+    ///
+    /// The circuit breaker monitors FUSE-originated job rate and pauses prefetch
+    /// when X-Plane is actively loading scenery (detected by high job rate).
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Circuit breaker configuration (thresholds and durations)
+    /// * `metrics` - Pipeline metrics for monitoring FUSE job rate
+    pub fn with_circuit_breaker(
+        mut self,
+        config: CircuitBreakerConfig,
+        metrics: Arc<PipelineMetrics>,
+    ) -> Self {
+        self.circuit_breaker = Some(CircuitBreaker::new(config));
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Get access to statistics for monitoring.
     pub fn stats(&self) -> Arc<RadialPrefetchStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Check the circuit breaker and update shared status.
+    ///
+    /// Returns true if the circuit is open (prefetch should be blocked).
+    fn check_circuit_breaker(&mut self) -> bool {
+        let (Some(ref mut circuit_breaker), Some(ref metrics)) =
+            (&mut self.circuit_breaker, &self.metrics)
+        else {
+            return false;
+        };
+
+        // Get FUSE-only job rate from metrics
+        let snapshot = metrics.snapshot();
+        let is_open = circuit_breaker.update(snapshot.fuse_jobs_per_second);
+
+        // Update shared status for TUI display
+        if let Some(ref status) = self.shared_status {
+            if is_open {
+                status.update_prefetch_mode(PrefetchMode::CircuitOpen);
+            }
+            // Update detailed stats with circuit state
+            status.update_detailed_stats(DetailedPrefetchStats {
+                cycles: self.stats.cycles.load(Ordering::Relaxed),
+                tiles_submitted_last_cycle: 0,
+                tiles_submitted_total: self.stats.tiles_submitted.load(Ordering::Relaxed),
+                cache_hits: self.stats.cache_hits.load(Ordering::Relaxed),
+                ttl_skipped: self.stats.ttl_skipped.load(Ordering::Relaxed),
+                active_zoom_levels: vec![self.config.zoom],
+                is_active: !is_open,
+                circuit_state: Some(circuit_breaker.state()),
+            });
+        }
+
+        is_open
     }
 
     /// Run the prefetcher, processing state updates from the channel.
@@ -166,10 +243,11 @@ impl<M: MemoryCache> RadialPrefetcher<M> {
         cancellation_token: CancellationToken,
     ) {
         info!(
-            radius = self.config.radius,
+            inner_nm = self.config.inner_radius_nm,
+            outer_nm = self.config.outer_radius_nm,
             zoom = self.config.zoom,
             ttl_secs = self.config.attempt_ttl.as_secs(),
-            "Radial prefetcher started"
+            "Radial prefetcher started (ring-based)"
         );
 
         // Initialize last_cycle in the past so first cycle can run immediately
@@ -193,6 +271,12 @@ impl<M: MemoryCache> RadialPrefetcher<M> {
                     // Rate limit prefetch cycles
                     if last_cycle.elapsed() < MIN_CYCLE_INTERVAL {
                         trace!("Skipping prefetch cycle - rate limited");
+                        continue;
+                    }
+
+                    // Check circuit breaker (uses FUSE-only job rate)
+                    if self.check_circuit_breaker() {
+                        trace!("Prefetch cycle skipped - circuit breaker open");
                         continue;
                     }
 
@@ -233,8 +317,8 @@ impl<M: MemoryCache> RadialPrefetcher<M> {
         // Clean up expired TTL entries
         self.cleanup_expired_attempts();
 
-        // Calculate tiles in radius
-        let tiles = self.tiles_in_radius(&current_tile);
+        // Calculate tiles in ring (annulus) around aircraft position
+        let tiles = self.tiles_in_ring(state.latitude, state.longitude);
         let total_tiles = tiles.len();
 
         let mut cache_hits = 0u64;
@@ -329,30 +413,92 @@ impl<M: MemoryCache> RadialPrefetcher<M> {
             };
             status.update_stats(stats);
             status.update_prefetch_mode(PrefetchMode::Radial);
+
+            // Update detailed stats for TUI dashboard
+            let circuit_state = self.circuit_breaker.as_ref().map(|cb| cb.state());
+            status.update_detailed_stats(DetailedPrefetchStats {
+                cycles: self.stats.cycles.load(Ordering::Relaxed),
+                tiles_submitted_last_cycle: submitted,
+                tiles_submitted_total: self.stats.tiles_submitted.load(Ordering::Relaxed),
+                cache_hits: self.stats.cache_hits.load(Ordering::Relaxed),
+                ttl_skipped: self.stats.ttl_skipped.load(Ordering::Relaxed),
+                active_zoom_levels: vec![self.config.zoom],
+                is_active: submitted > 0,
+                circuit_state,
+            });
         }
     }
 
-    /// Calculate all tiles within the configured radius of the center tile.
-    fn tiles_in_radius(&self, center: &TileCoord) -> Vec<TileCoord> {
-        let radius = self.config.radius as i32;
-        let max_coord = 2i64.pow(center.zoom as u32);
-        let mut tiles = Vec::with_capacity(((radius * 2 + 1) * (radius * 2 + 1)) as usize);
+    /// Calculate all tiles within the configured ring (annulus) around a position.
+    ///
+    /// This method finds all tiles whose centers are between inner_radius_nm
+    /// and outer_radius_nm from the given position. The result is an annular
+    /// (ring-shaped) set of tiles.
+    ///
+    /// # Arguments
+    ///
+    /// * `lat` - Aircraft latitude in degrees
+    /// * `lon` - Aircraft longitude in degrees
+    ///
+    /// # Returns
+    ///
+    /// Vector of tiles in the ring, ordered by proximity to the inner edge.
+    fn tiles_in_ring(&self, lat: f64, lon: f64) -> Vec<TileCoord> {
+        let zoom = self.config.zoom;
+        let inner_nm = self.config.inner_radius_nm;
+        let outer_nm = self.config.outer_radius_nm;
 
-        for dr in -radius..=radius {
-            for dc in -radius..=radius {
+        // Calculate tile size at this latitude to determine search grid
+        let tile_size = tile_size_nm_at_lat(lat, zoom) as f32;
+
+        // Search radius in tiles (add buffer for edge cases)
+        let search_radius_tiles = ((outer_nm / tile_size) as i32) + 2;
+
+        // Get center tile for the aircraft position
+        let center = match to_tile_coords(lat, lon, zoom) {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+
+        let max_coord = 2i64.pow(zoom as u32);
+        let mut tiles = Vec::new();
+
+        // Scan a square grid and filter by distance
+        for dr in -search_radius_tiles..=search_radius_tiles {
+            for dc in -search_radius_tiles..=search_radius_tiles {
                 let new_row = center.row as i64 + dr as i64;
                 let new_col = center.col as i64 + dc as i64;
 
                 // Validate coordinates
-                if new_row >= 0 && new_row < max_coord && new_col >= 0 && new_col < max_coord {
-                    tiles.push(TileCoord {
-                        row: new_row as u32,
-                        col: new_col as u32,
-                        zoom: center.zoom,
-                    });
+                if new_row < 0 || new_row >= max_coord || new_col < 0 || new_col >= max_coord {
+                    continue;
+                }
+
+                let tile = TileCoord {
+                    row: new_row as u32,
+                    col: new_col as u32,
+                    zoom,
+                };
+
+                // Calculate distance from aircraft to tile center
+                let dist = distance_to_tile((lat, lon), &tile);
+
+                // Keep tiles within the ring
+                if dist >= inner_nm && dist <= outer_nm {
+                    tiles.push(tile);
                 }
             }
         }
+
+        // Sort by distance from inner edge (closest to inner radius first)
+        let position = (lat, lon);
+        tiles.sort_by(|a, b| {
+            let dist_a = distance_to_tile(position, a);
+            let dist_b = distance_to_tile(position, b);
+            dist_a
+                .partial_cmp(&dist_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         tiles
     }
@@ -383,13 +529,13 @@ impl<M: MemoryCache + 'static> Prefetcher for RadialPrefetcher<M> {
     }
 
     fn description(&self) -> &'static str {
-        "Simple cache-aware radial expansion around current position"
+        "Ring-based prefetching (nautical mile annulus)"
     }
 
     fn startup_info(&self) -> String {
         format!(
-            "radial, {}-tile radius, zoom {}",
-            self.config.radius, self.config.zoom
+            "radial ring ({:.0}-{:.0}nm), zoom {}",
+            self.config.inner_radius_nm, self.config.outer_radius_nm, self.config.zoom
         )
     }
 }
@@ -410,17 +556,6 @@ mod tests {
             Self {
                 data: Mutex::new(HashMap::new()),
             }
-        }
-
-        fn with_cached(self, row: u32, col: u32, zoom: u8) -> Self {
-            // Use blocking lock since this is called from sync context in tests
-            futures::executor::block_on(async {
-                self.data
-                    .lock()
-                    .await
-                    .insert((row, col, zoom), vec![0xDD, 0x53]);
-            });
-            self
         }
     }
 
@@ -453,104 +588,14 @@ mod tests {
         (handler, call_count)
     }
 
-    #[test]
-    fn test_tiles_in_radius() {
-        let cache = Arc::new(MockMemoryCache::new());
-        let (handler, _) = create_test_handler();
-        let config = RadialPrefetchConfig::default();
-        let prefetcher = RadialPrefetcher::new(cache, handler, config);
-
-        let center = TileCoord {
-            row: 100,
-            col: 100,
-            zoom: 14,
-        };
-
-        let tiles = prefetcher.tiles_in_radius(&center);
-
-        // 3-tile radius = 7×7 = 49 tiles
-        assert_eq!(tiles.len(), 49);
-
-        // Center tile should be included
-        assert!(tiles.iter().any(|t| t.row == 100 && t.col == 100));
-
-        // Corner tiles should be included
-        assert!(tiles.iter().any(|t| t.row == 97 && t.col == 97));
-        assert!(tiles.iter().any(|t| t.row == 97 && t.col == 103));
-        assert!(tiles.iter().any(|t| t.row == 103 && t.col == 97));
-        assert!(tiles.iter().any(|t| t.row == 103 && t.col == 103));
-    }
-
-    #[test]
-    fn test_tiles_in_radius_at_edge() {
-        let cache = Arc::new(MockMemoryCache::new());
-        let (handler, _) = create_test_handler();
-        let config = RadialPrefetchConfig::default();
-        let prefetcher = RadialPrefetcher::new(cache, handler, config);
-
-        // Near the edge of the map
-        let center = TileCoord {
-            row: 1,
-            col: 1,
-            zoom: 14,
-        };
-
-        let tiles = prefetcher.tiles_in_radius(&center);
-
-        // Should have fewer tiles (some would be negative)
-        assert!(tiles.len() < 49);
-        assert!(!tiles.is_empty());
-
-        // All tiles should have valid coordinates
-        for tile in &tiles {
-            assert!(tile.row < 2u32.pow(14));
-            assert!(tile.col < 2u32.pow(14));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_prefetch_skips_cached_tiles() {
-        // Calculate the actual tile coordinates for (45.0, -122.0) at zoom 14
-        let actual_tile = to_tile_coords(45.0, -122.0, 14).unwrap();
-
-        // Pre-cache the center tile
-        let cache =
-            Arc::new(MockMemoryCache::new().with_cached(actual_tile.row, actual_tile.col, 14));
-        let (handler, call_count) = create_test_handler();
-        let config = RadialPrefetchConfig {
-            radius: 1, // 3×3 = 9 tiles
-            zoom: 14,
-            attempt_ttl: Duration::from_secs(60),
-        };
-
-        let mut prefetcher = RadialPrefetcher::new(cache, handler, config);
-
-        // Aircraft at position that maps to the cached tile
-        let state = AircraftState::new(45.0, -122.0, 90.0, 150.0, 10000.0);
-
-        // Force last_tile to be different so cycle runs
-        prefetcher.last_tile = Some(TileCoord {
-            row: 0,
-            col: 0,
-            zoom: 14,
-        });
-
-        prefetcher.prefetch_cycle(&state).await;
-
-        // Should have submitted less than 9 requests (center tile was cached)
-        let submitted = call_count.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(submitted < 9, "Expected < 9 submissions, got {}", submitted);
-
-        // Stats should show at least one cache hit (the center tile)
-        assert!(prefetcher.stats.cache_hits.load(Ordering::Relaxed) >= 1);
-    }
-
     #[tokio::test]
     async fn test_ttl_prevents_resubmission() {
+        // Use a small ring for faster testing
         let cache = Arc::new(MockMemoryCache::new());
         let (handler, call_count) = create_test_handler();
         let config = RadialPrefetchConfig {
-            radius: 1,
+            inner_radius_nm: 1.0,
+            outer_radius_nm: 3.0,
             zoom: 14,
             attempt_ttl: Duration::from_secs(60),
         };
@@ -592,8 +637,166 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = RadialPrefetchConfig::default();
-        assert_eq!(config.radius, 3);
+        assert!((config.inner_radius_nm - 85.0).abs() < 0.01);
+        assert!((config.outer_radius_nm - 120.0).abs() < 0.01);
         assert_eq!(config.zoom, 14);
         assert_eq!(config.attempt_ttl, Duration::from_secs(60));
+    }
+
+    // ==================== tiles_in_ring tests (TDD) ====================
+
+    #[test]
+    fn test_tiles_in_ring_excludes_inner() {
+        // Ring-based prefetching: tiles inside the inner radius should be excluded
+        // Using 85nm inner radius and 120nm outer radius (per plan)
+        use super::super::coordinates::distance_to_tile;
+
+        let cache = Arc::new(MockMemoryCache::new());
+        let (handler, _) = create_test_handler();
+        let config = RadialPrefetchConfig {
+            inner_radius_nm: 85.0,
+            outer_radius_nm: 120.0,
+            zoom: 14,
+            attempt_ttl: Duration::from_secs(60),
+        };
+        let prefetcher = RadialPrefetcher::new(cache, handler, config);
+
+        // Position at mid-latitude (Portland, OR area)
+        let lat = 45.5;
+        let lon = -122.7;
+        let tiles = prefetcher.tiles_in_ring(lat, lon);
+
+        // Verify no tile is closer than the inner radius
+        for tile in &tiles {
+            let dist = distance_to_tile((lat, lon), tile);
+            assert!(
+                dist >= 80.0, // Allow small tolerance for tile-center calculations
+                "Tile at ({}, {}) is too close: {}nm < inner radius 85nm",
+                tile.row,
+                tile.col,
+                dist
+            );
+        }
+    }
+
+    #[test]
+    fn test_tiles_in_ring_includes_outer() {
+        // Ring should include tiles out to the outer radius
+        use super::super::coordinates::distance_to_tile;
+
+        let cache = Arc::new(MockMemoryCache::new());
+        let (handler, _) = create_test_handler();
+        let config = RadialPrefetchConfig {
+            inner_radius_nm: 85.0,
+            outer_radius_nm: 120.0,
+            zoom: 14,
+            attempt_ttl: Duration::from_secs(60),
+        };
+        let prefetcher = RadialPrefetcher::new(cache, handler, config);
+
+        let lat = 45.5;
+        let lon = -122.7;
+        let tiles = prefetcher.tiles_in_ring(lat, lon);
+
+        // Should have tiles (ring should not be empty for reasonable radii)
+        assert!(!tiles.is_empty(), "Ring should contain tiles");
+
+        // Find the furthest tile
+        let max_dist = tiles
+            .iter()
+            .map(|t| distance_to_tile((lat, lon), t))
+            .fold(0.0_f32, |a, b| a.max(b));
+
+        // The furthest tile should be near the outer radius
+        assert!(
+            max_dist >= 100.0, // Should have tiles reasonably close to outer edge
+            "Max tile distance {}nm is too short for 120nm outer radius",
+            max_dist
+        );
+        assert!(
+            max_dist <= 130.0, // But not too far beyond outer radius
+            "Max tile distance {}nm exceeds 120nm outer radius by too much",
+            max_dist
+        );
+    }
+
+    #[test]
+    fn test_tiles_in_ring_at_high_latitude() {
+        // Tiles at high latitudes are smaller in the east-west direction
+        // The ring should still work correctly despite Mercator distortion
+        use super::super::coordinates::{distance_to_tile, tile_size_nm_at_lat};
+
+        let cache = Arc::new(MockMemoryCache::new());
+        let (handler, _) = create_test_handler();
+        let config = RadialPrefetchConfig {
+            inner_radius_nm: 85.0,
+            outer_radius_nm: 120.0,
+            zoom: 14,
+            attempt_ttl: Duration::from_secs(60),
+        };
+        let prefetcher = RadialPrefetcher::new(cache, handler, config);
+
+        // High latitude position (Alaska)
+        let lat = 61.0;
+        let lon = -149.0;
+
+        // Verify tile size is smaller at this latitude
+        let tile_size = tile_size_nm_at_lat(lat, 14);
+        let equator_tile_size = tile_size_nm_at_lat(0.0, 14);
+        assert!(
+            tile_size < equator_tile_size * 0.6,
+            "Tile size at 61°N ({}) should be significantly smaller than at equator ({})",
+            tile_size,
+            equator_tile_size
+        );
+
+        let tiles = prefetcher.tiles_in_ring(lat, lon);
+
+        // Should still produce a valid ring
+        assert!(
+            !tiles.is_empty(),
+            "Ring should contain tiles at high latitude"
+        );
+
+        // Verify all tiles are within the expected distance bounds
+        for tile in &tiles {
+            let dist = distance_to_tile((lat, lon), tile);
+            assert!(dist >= 80.0, "High-latitude tile too close: {}nm", dist);
+            assert!(dist <= 130.0, "High-latitude tile too far: {}nm", dist);
+        }
+    }
+
+    #[test]
+    fn test_tiles_in_ring_is_annular() {
+        // The ring should be annular (donut-shaped), not a filled circle
+        // There should be a "hole" in the middle
+        use super::super::coordinates::distance_to_tile;
+
+        let cache = Arc::new(MockMemoryCache::new());
+        let (handler, _) = create_test_handler();
+        let config = RadialPrefetchConfig {
+            inner_radius_nm: 85.0,
+            outer_radius_nm: 120.0,
+            zoom: 14,
+            attempt_ttl: Duration::from_secs(60),
+        };
+        let prefetcher = RadialPrefetcher::new(cache, handler, config);
+
+        let lat = 45.5;
+        let lon = -122.7;
+        let tiles = prefetcher.tiles_in_ring(lat, lon);
+
+        // Find the minimum distance (should be close to inner radius)
+        let min_dist = tiles
+            .iter()
+            .map(|t| distance_to_tile((lat, lon), t))
+            .fold(f32::MAX, |a, b| a.min(b));
+
+        // The minimum distance should be at or above the inner radius
+        assert!(
+            min_dist >= 80.0,
+            "Min tile distance {}nm should be >= inner radius 85nm",
+            min_dist
+        );
     }
 }

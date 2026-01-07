@@ -103,6 +103,7 @@ pub fn render_prefetch(frame: &mut Frame, area: Rect, prefetch: &PrefetchStatusS
         PrefetchMode::FuseInference => Color::Yellow,
         PrefetchMode::Radial => Color::Cyan,
         PrefetchMode::Idle => Color::DarkGray,
+        PrefetchMode::CircuitOpen => Color::Magenta, // Paused due to high X-Plane load
     };
 
     // Build the prefetch line with detailed stats if available

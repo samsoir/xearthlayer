@@ -58,8 +58,10 @@ use tracing::{debug, info, trace, warn};
 use crate::coord::{to_tile_coords, TileCoord};
 use crate::fuse::{DdsHandler, DdsRequest};
 use crate::pipeline::{JobId, MemoryCache};
+use crate::telemetry::PipelineMetrics;
 
 use super::buffer::BufferGenerator;
+use super::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use super::cone::ConeGenerator;
 use super::config::{FuseInferenceConfig, HeadingAwarePrefetchConfig};
 use super::inference::FuseRequestAnalyzer;
@@ -205,6 +207,12 @@ pub struct HeadingAwarePrefetcher<M: MemoryCache> {
     // Scenery-aware prefetch (optional)
     /// Optional scenery index for exact tile lookup.
     scenery_index: Option<Arc<SceneryIndex>>,
+
+    // Circuit breaker (optional)
+    /// Circuit breaker for pausing prefetch during X-Plane scenery loading.
+    circuit_breaker: Option<CircuitBreaker>,
+    /// Pipeline metrics for monitoring FUSE job rate.
+    metrics: Option<Arc<PipelineMetrics>>,
 }
 
 impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
@@ -241,6 +249,8 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
             stats: Arc::new(HeadingAwarePrefetchStats::default()),
             shared_status: None,
             scenery_index: None,
+            circuit_breaker: None,
+            metrics: None,
         }
     }
 
@@ -262,6 +272,25 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
         self
     }
 
+    /// Enable circuit breaker to pause prefetching during X-Plane scenery loading.
+    ///
+    /// The circuit breaker monitors FUSE-originated job rate and pauses prefetch
+    /// when X-Plane is actively loading scenery (detected by high job rate).
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Circuit breaker configuration (thresholds and durations)
+    /// * `metrics` - Pipeline metrics for monitoring FUSE job rate
+    pub fn with_circuit_breaker(
+        mut self,
+        config: CircuitBreakerConfig,
+        metrics: Arc<PipelineMetrics>,
+    ) -> Self {
+        self.circuit_breaker = Some(CircuitBreaker::new(config));
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Get access to statistics.
     pub fn stats(&self) -> Arc<HeadingAwarePrefetchStats> {
         Arc::clone(&self.stats)
@@ -270,6 +299,56 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
     /// Get the FUSE analyzer for callback wiring.
     pub fn fuse_analyzer(&self) -> Arc<FuseRequestAnalyzer> {
         Arc::clone(&self.fuse_analyzer)
+    }
+
+    /// Check the circuit breaker and update shared status.
+    ///
+    /// Returns true if the circuit is open (prefetch should be blocked).
+    fn check_circuit_breaker(&mut self) -> bool {
+        // Early return if circuit breaker is not configured
+        if self.circuit_breaker.is_none() || self.metrics.is_none() {
+            return false;
+        }
+
+        // Get FUSE-only job rate from metrics
+        let fuse_rate = self
+            .metrics
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .fuse_jobs_per_second;
+
+        // Update circuit breaker state
+        let circuit_breaker = self.circuit_breaker.as_mut().unwrap();
+        let is_open = circuit_breaker.update(fuse_rate);
+        let circuit_state = circuit_breaker.state();
+
+        // Gather values before borrowing shared_status
+        let zoom_levels = self.active_zoom_levels();
+        let cycles = self.stats.cycles.load(Ordering::Relaxed);
+        let tiles_submitted_total = self.stats.tiles_submitted.load(Ordering::Relaxed);
+        let cache_hits = self.stats.cache_hits.load(Ordering::Relaxed);
+        let ttl_skipped = self.stats.ttl_skipped.load(Ordering::Relaxed);
+
+        // Update shared status for TUI display
+        if let Some(ref status) = self.shared_status {
+            if is_open {
+                status.update_prefetch_mode(PrefetchMode::CircuitOpen);
+            }
+            // Update detailed stats with circuit state
+            status.update_detailed_stats(DetailedPrefetchStats {
+                cycles,
+                tiles_submitted_last_cycle: 0,
+                tiles_submitted_total,
+                cache_hits,
+                ttl_skipped,
+                active_zoom_levels: zoom_levels,
+                is_active: !is_open,
+                circuit_state: Some(circuit_state),
+            });
+        }
+
+        is_open
     }
 
     /// Run the prefetcher, processing state updates.
@@ -309,6 +388,11 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
                 }
 
                 _ = interval.tick() => {
+                    // Check circuit breaker (uses FUSE-only job rate)
+                    if self.check_circuit_breaker() {
+                        trace!("Prefetch cycle skipped - circuit breaker open");
+                        continue;
+                    }
                     self.run_prefetch_cycle().await;
                 }
             }
@@ -407,6 +491,7 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
             trace!(mode = %mode, "No tiles to prefetch this cycle");
             // Still report stats even when idle
             if let Some(ref status) = self.shared_status {
+                let circuit_state = self.circuit_breaker.as_ref().map(|cb| cb.state());
                 status.update_detailed_stats(DetailedPrefetchStats {
                     cycles: self.stats.cycles.load(Ordering::Relaxed),
                     tiles_submitted_last_cycle: 0,
@@ -415,6 +500,7 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
                     ttl_skipped: self.stats.ttl_skipped.load(Ordering::Relaxed),
                     active_zoom_levels: self.active_zoom_levels(),
                     is_active: false,
+                    circuit_state,
                 });
             }
             return;
@@ -460,6 +546,7 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
             status.update_gps_status(gps_status);
 
             // Update detailed stats for dashboard visibility
+            let circuit_state = self.circuit_breaker.as_ref().map(|cb| cb.state());
             status.update_detailed_stats(DetailedPrefetchStats {
                 cycles: self.stats.cycles.load(Ordering::Relaxed),
                 tiles_submitted_last_cycle: cycle_results.submitted,
@@ -468,6 +555,7 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
                 ttl_skipped: self.stats.ttl_skipped.load(Ordering::Relaxed),
                 active_zoom_levels: self.active_zoom_levels(),
                 is_active: cycle_results.submitted > 0,
+                circuit_state,
             });
         }
 
