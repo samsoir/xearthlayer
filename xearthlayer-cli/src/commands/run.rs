@@ -404,6 +404,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
                     .cone_half_angle(config.prefetch.cone_angle)
                     .inner_radius_nm(config.prefetch.inner_radius_nm)
                     .outer_radius_nm(config.prefetch.outer_radius_nm)
+                    .radial_radius(config.prefetch.radial_radius)
                     .max_tiles_per_cycle(config.prefetch.max_tiles_per_cycle)
                     .cycle_interval_ms(config.prefetch.cycle_interval_ms)
                     // Wire circuit breaker throttler to pause prefetch during high X-Plane load
@@ -941,6 +942,7 @@ fn start_prefetcher(
         .cone_half_angle(config.prefetch.cone_angle)
         .inner_radius_nm(config.prefetch.inner_radius_nm)
         .outer_radius_nm(config.prefetch.outer_radius_nm)
+        .radial_radius(config.prefetch.radial_radius)
         .max_tiles_per_cycle(config.prefetch.max_tiles_per_cycle)
         .cycle_interval_ms(config.prefetch.cycle_interval_ms)
         // Wire circuit breaker throttler to pause prefetch during high X-Plane load

@@ -84,6 +84,7 @@ pub enum ConfigKey {
     PrefetchCircuitBreakerThreshold,
     PrefetchCircuitBreakerOpenMs,
     PrefetchCircuitBreakerHalfOpenSecs,
+    PrefetchRadialRadius,
 
     // Control plane settings
     ControlPlaneMaxConcurrentJobs,
@@ -147,6 +148,7 @@ impl FromStr for ConfigKey {
             "prefetch.circuit_breaker_half_open_secs" => {
                 Ok(ConfigKey::PrefetchCircuitBreakerHalfOpenSecs)
             }
+            "prefetch.radial_radius" => Ok(ConfigKey::PrefetchRadialRadius),
 
             "control_plane.max_concurrent_jobs" => Ok(ConfigKey::ControlPlaneMaxConcurrentJobs),
             "control_plane.stall_threshold_secs" => Ok(ConfigKey::ControlPlaneStallThresholdSecs),
@@ -207,6 +209,7 @@ impl ConfigKey {
             ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => {
                 "prefetch.circuit_breaker_half_open_secs"
             }
+            ConfigKey::PrefetchRadialRadius => "prefetch.radial_radius",
             ConfigKey::ControlPlaneMaxConcurrentJobs => "control_plane.max_concurrent_jobs",
             ConfigKey::ControlPlaneStallThresholdSecs => "control_plane.stall_threshold_secs",
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => {
@@ -310,6 +313,7 @@ impl ConfigKey {
             ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => {
                 config.prefetch.circuit_breaker_half_open_secs.to_string()
             }
+            ConfigKey::PrefetchRadialRadius => config.prefetch.radial_radius.to_string(),
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs.to_string()
             }
@@ -456,6 +460,9 @@ impl ConfigKey {
             ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => {
                 config.prefetch.circuit_breaker_half_open_secs = value.parse().unwrap();
             }
+            ConfigKey::PrefetchRadialRadius => {
+                config.prefetch.radial_radius = value.parse().unwrap();
+            }
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs = value.parse().unwrap();
             }
@@ -531,6 +538,7 @@ impl ConfigKey {
             ConfigKey::PrefetchCircuitBreakerThreshold => Box::new(PositiveNumberSpec),
             ConfigKey::PrefetchCircuitBreakerOpenMs => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => Box::new(PositiveIntegerSpec),
+            ConfigKey::PrefetchRadialRadius => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneMaxConcurrentJobs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneStallThresholdSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => Box::new(PositiveIntegerSpec),
@@ -580,6 +588,7 @@ impl ConfigKey {
             ConfigKey::PrefetchCircuitBreakerThreshold,
             ConfigKey::PrefetchCircuitBreakerOpenMs,
             ConfigKey::PrefetchCircuitBreakerHalfOpenSecs,
+            ConfigKey::PrefetchRadialRadius,
             ConfigKey::ControlPlaneMaxConcurrentJobs,
             ConfigKey::ControlPlaneStallThresholdSecs,
             ConfigKey::ControlPlaneHealthCheckIntervalSecs,

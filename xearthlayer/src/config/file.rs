@@ -210,6 +210,9 @@ pub struct PrefetchSettings {
     /// Cooloff time (seconds) before trying to close the circuit.
     /// Default: 5 seconds.
     pub circuit_breaker_half_open_secs: u64,
+    /// Radial prefetcher tile radius (number of tiles in each direction).
+    /// Default: 120 tiles. Maximum: 255.
+    pub radial_radius: u8,
 }
 
 /// Control plane configuration for job management and health monitoring.
@@ -300,6 +303,7 @@ impl Default for ConfigFile {
                 circuit_breaker_threshold: DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
                 circuit_breaker_open_ms: DEFAULT_CIRCUIT_BREAKER_OPEN_MS,
                 circuit_breaker_half_open_secs: DEFAULT_CIRCUIT_BREAKER_HALF_OPEN_SECS,
+                radial_radius: DEFAULT_PREFETCH_RADIAL_RADIUS,
             },
             control_plane: ControlPlaneSettings {
                 max_concurrent_jobs: default_max_concurrent_jobs(),
@@ -429,8 +433,8 @@ pub const DEFAULT_PREFETCH_CONE_ANGLE: f32 = 80.0;
 pub const DEFAULT_PREFETCH_INNER_RADIUS_NM: f32 = 85.0;
 
 /// Default outer radius where prefetch zone ends (nautical miles).
-/// Extended to 120nm for better look-ahead coverage.
-pub const DEFAULT_PREFETCH_OUTER_RADIUS_NM: f32 = 120.0;
+/// Extended to 180nm for better look-ahead coverage.
+pub const DEFAULT_PREFETCH_OUTER_RADIUS_NM: f32 = 180.0;
 
 /// Default maximum tiles to submit per prefetch cycle.
 /// Increased to 200 for faster cache warming.
@@ -451,6 +455,10 @@ pub const DEFAULT_CIRCUIT_BREAKER_OPEN_MS: u64 = 500;
 /// Default cooloff time (seconds) before trying to close the circuit.
 /// Set to 2 seconds for faster recovery after load drops.
 pub const DEFAULT_CIRCUIT_BREAKER_HALF_OPEN_SECS: u64 = 2;
+
+/// Default radial prefetcher tile radius.
+/// 120 tiles provides wide coverage around aircraft position.
+pub const DEFAULT_PREFETCH_RADIAL_RADIUS: u8 = 120;
 
 // =============================================================================
 // Control plane defaults
@@ -885,6 +893,15 @@ impl ConfigFile {
                         reason: "must be a positive integer (seconds)".to_string(),
                     })?;
             }
+            if let Some(v) = section.get("radial_radius") {
+                config.prefetch.radial_radius =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "radial_radius".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (tiles)".to_string(),
+                    })?;
+            }
         }
 
         // [control_plane] section
@@ -1096,8 +1113,12 @@ udp_port = {}
 ; Inner radius where prefetch zone starts (default: 85)
 ; Just inside X-Plane's ~90nm loaded zone boundary
 inner_radius_nm = {}
-; Outer radius where prefetch zone ends (default: 120)
+; Outer radius where prefetch zone ends (default: 180)
 outer_radius_nm = {}
+
+; Radial prefetcher tile radius (default: 120)
+; Higher values prefetch more tiles around aircraft position
+radial_radius = {}
 
 ; Heading-aware cone (prediction cone half-angle in degrees, default: 80)
 ; Wider angles prefetch more tiles but use more bandwidth
@@ -1174,6 +1195,7 @@ radius_nm = {}
             self.prefetch.udp_port,
             self.prefetch.inner_radius_nm,
             self.prefetch.outer_radius_nm,
+            self.prefetch.radial_radius,
             self.prefetch.cone_angle,
             self.prefetch.max_tiles_per_cycle,
             self.prefetch.cycle_interval_ms,

@@ -57,9 +57,6 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "prefetch.cone_outer_radius_nm",
     // Removed in v0.2.9 - Duplicate of cone_angle (cone_angle is the one actually used)
     "prefetch.cone_half_angle",
-    // Removed in v0.2.11 - Radial prefetcher now uses nautical-mile ring (inner/outer_radius_nm)
-    // instead of tile-count grid
-    "prefetch.radial_radius",
     // Removed in v0.2.11 - Circuit breaker now uses milliseconds instead of seconds
     "prefetch.circuit_breaker_open_secs",
 ];
