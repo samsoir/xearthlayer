@@ -60,6 +60,8 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     // Removed in v0.2.11 - Radial prefetcher now uses nautical-mile ring (inner/outer_radius_nm)
     // instead of tile-count grid
     "prefetch.radial_radius",
+    // Removed in v0.2.11 - Circuit breaker now uses milliseconds instead of seconds
+    "prefetch.circuit_breaker_open_secs",
 ];
 
 /// Result of analyzing a configuration file for upgrade needs.

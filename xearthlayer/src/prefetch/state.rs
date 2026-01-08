@@ -31,13 +31,13 @@ impl std::fmt::Display for GpsStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PrefetchMode {
     /// Using UDP telemetry for heading-aware cone prefetch.
-    #[default]
     Telemetry,
     /// Using FUSE request analysis for position/heading inference.
     FuseInference,
     /// Fallback to simple radial prefetch (no heading data).
     Radial,
     /// Prefetch system is idle (no data received yet).
+    #[default]
     Idle,
     /// Prefetch blocked due to high FUSE load (circuit breaker open).
     CircuitOpen,

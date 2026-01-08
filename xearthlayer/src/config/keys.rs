@@ -82,7 +82,7 @@ pub enum ConfigKey {
     PrefetchMaxTilesPerCycle,
     PrefetchCycleIntervalMs,
     PrefetchCircuitBreakerThreshold,
-    PrefetchCircuitBreakerOpenSecs,
+    PrefetchCircuitBreakerOpenMs,
     PrefetchCircuitBreakerHalfOpenSecs,
 
     // Control plane settings
@@ -143,7 +143,7 @@ impl FromStr for ConfigKey {
             "prefetch.max_tiles_per_cycle" => Ok(ConfigKey::PrefetchMaxTilesPerCycle),
             "prefetch.cycle_interval_ms" => Ok(ConfigKey::PrefetchCycleIntervalMs),
             "prefetch.circuit_breaker_threshold" => Ok(ConfigKey::PrefetchCircuitBreakerThreshold),
-            "prefetch.circuit_breaker_open_secs" => Ok(ConfigKey::PrefetchCircuitBreakerOpenSecs),
+            "prefetch.circuit_breaker_open_ms" => Ok(ConfigKey::PrefetchCircuitBreakerOpenMs),
             "prefetch.circuit_breaker_half_open_secs" => {
                 Ok(ConfigKey::PrefetchCircuitBreakerHalfOpenSecs)
             }
@@ -203,7 +203,7 @@ impl ConfigKey {
             ConfigKey::PrefetchMaxTilesPerCycle => "prefetch.max_tiles_per_cycle",
             ConfigKey::PrefetchCycleIntervalMs => "prefetch.cycle_interval_ms",
             ConfigKey::PrefetchCircuitBreakerThreshold => "prefetch.circuit_breaker_threshold",
-            ConfigKey::PrefetchCircuitBreakerOpenSecs => "prefetch.circuit_breaker_open_secs",
+            ConfigKey::PrefetchCircuitBreakerOpenMs => "prefetch.circuit_breaker_open_ms",
             ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => {
                 "prefetch.circuit_breaker_half_open_secs"
             }
@@ -304,8 +304,8 @@ impl ConfigKey {
             ConfigKey::PrefetchCircuitBreakerThreshold => {
                 config.prefetch.circuit_breaker_threshold.to_string()
             }
-            ConfigKey::PrefetchCircuitBreakerOpenSecs => {
-                config.prefetch.circuit_breaker_open_secs.to_string()
+            ConfigKey::PrefetchCircuitBreakerOpenMs => {
+                config.prefetch.circuit_breaker_open_ms.to_string()
             }
             ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => {
                 config.prefetch.circuit_breaker_half_open_secs.to_string()
@@ -450,8 +450,8 @@ impl ConfigKey {
             ConfigKey::PrefetchCircuitBreakerThreshold => {
                 config.prefetch.circuit_breaker_threshold = value.parse().unwrap();
             }
-            ConfigKey::PrefetchCircuitBreakerOpenSecs => {
-                config.prefetch.circuit_breaker_open_secs = value.parse().unwrap();
+            ConfigKey::PrefetchCircuitBreakerOpenMs => {
+                config.prefetch.circuit_breaker_open_ms = value.parse().unwrap();
             }
             ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => {
                 config.prefetch.circuit_breaker_half_open_secs = value.parse().unwrap();
@@ -529,7 +529,7 @@ impl ConfigKey {
             ConfigKey::PrefetchMaxTilesPerCycle => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchCycleIntervalMs => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchCircuitBreakerThreshold => Box::new(PositiveNumberSpec),
-            ConfigKey::PrefetchCircuitBreakerOpenSecs => Box::new(PositiveIntegerSpec),
+            ConfigKey::PrefetchCircuitBreakerOpenMs => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneMaxConcurrentJobs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneStallThresholdSecs => Box::new(PositiveIntegerSpec),
@@ -578,7 +578,7 @@ impl ConfigKey {
             ConfigKey::PrefetchMaxTilesPerCycle,
             ConfigKey::PrefetchCycleIntervalMs,
             ConfigKey::PrefetchCircuitBreakerThreshold,
-            ConfigKey::PrefetchCircuitBreakerOpenSecs,
+            ConfigKey::PrefetchCircuitBreakerOpenMs,
             ConfigKey::PrefetchCircuitBreakerHalfOpenSecs,
             ConfigKey::ControlPlaneMaxConcurrentJobs,
             ConfigKey::ControlPlaneStallThresholdSecs,

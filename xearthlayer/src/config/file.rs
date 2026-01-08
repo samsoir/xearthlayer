@@ -202,11 +202,11 @@ pub struct PrefetchSettings {
     /// Higher values reduce prefetch aggressiveness.
     pub cycle_interval_ms: u64,
     /// Circuit breaker threshold: FUSE jobs per second to trip the breaker.
-    /// When X-Plane is loading scenery, FUSE request rate spikes. Default: 5.0.
+    /// When X-Plane is loading scenery, FUSE request rate spikes. Default: 10.0.
     pub circuit_breaker_threshold: f64,
-    /// How long (seconds) high FUSE rate must be sustained to open circuit.
-    /// Default: 5 seconds.
-    pub circuit_breaker_open_secs: u64,
+    /// How long (milliseconds) high FUSE rate must be sustained to open circuit.
+    /// Default: 500ms (0.5 seconds) to catch bursty loads.
+    pub circuit_breaker_open_ms: u64,
     /// Cooloff time (seconds) before trying to close the circuit.
     /// Default: 5 seconds.
     pub circuit_breaker_half_open_secs: u64,
@@ -298,7 +298,7 @@ impl Default for ConfigFile {
                 max_tiles_per_cycle: DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE,
                 cycle_interval_ms: DEFAULT_PREFETCH_CYCLE_INTERVAL_MS,
                 circuit_breaker_threshold: DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
-                circuit_breaker_open_secs: DEFAULT_CIRCUIT_BREAKER_OPEN_SECS,
+                circuit_breaker_open_ms: DEFAULT_CIRCUIT_BREAKER_OPEN_MS,
                 circuit_breaker_half_open_secs: DEFAULT_CIRCUIT_BREAKER_HALF_OPEN_SECS,
             },
             control_plane: ControlPlaneSettings {
@@ -440,14 +440,17 @@ pub const DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE: usize = 200;
 pub const DEFAULT_PREFETCH_CYCLE_INTERVAL_MS: u64 = 2000;
 
 /// Default circuit breaker threshold: FUSE jobs per second to trip.
-/// When X-Plane is loading scenery, FUSE request rate spikes.
-pub const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: f64 = 5.0;
+/// Normal flight activity is typically 5-30 jobs/sec, scene loading is 90-500+.
+/// Set at 50 to cleanly separate flight activity from scene loading.
+pub const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: f64 = 50.0;
 
-/// Default duration (seconds) high FUSE rate must be sustained to open circuit.
-pub const DEFAULT_CIRCUIT_BREAKER_OPEN_SECS: u64 = 5;
+/// Default duration (milliseconds) high FUSE rate must be sustained to open circuit.
+/// Set low (500ms) to catch bursty scene loading patterns quickly.
+pub const DEFAULT_CIRCUIT_BREAKER_OPEN_MS: u64 = 500;
 
 /// Default cooloff time (seconds) before trying to close the circuit.
-pub const DEFAULT_CIRCUIT_BREAKER_HALF_OPEN_SECS: u64 = 5;
+/// Set to 2 seconds for faster recovery after load drops.
+pub const DEFAULT_CIRCUIT_BREAKER_HALF_OPEN_SECS: u64 = 2;
 
 // =============================================================================
 // Control plane defaults
@@ -864,13 +867,13 @@ impl ConfigFile {
                         reason: "must be a positive number (FUSE jobs/second)".to_string(),
                     })?;
             }
-            if let Some(v) = section.get("circuit_breaker_open_secs") {
-                config.prefetch.circuit_breaker_open_secs =
+            if let Some(v) = section.get("circuit_breaker_open_ms") {
+                config.prefetch.circuit_breaker_open_ms =
                     v.parse().map_err(|_| ConfigFileError::InvalidValue {
                         section: "prefetch".to_string(),
-                        key: "circuit_breaker_open_secs".to_string(),
+                        key: "circuit_breaker_open_ms".to_string(),
                         value: v.to_string(),
-                        reason: "must be a positive integer (seconds)".to_string(),
+                        reason: "must be a positive integer (milliseconds)".to_string(),
                     })?;
             }
             if let Some(v) = section.get("circuit_breaker_half_open_secs") {
@@ -1112,8 +1115,8 @@ cycle_interval_ms = {}
 ; Only counts FUSE-originated requests, not prefetch jobs
 ; FUSE jobs per second threshold to trip the breaker (default: 5.0)
 circuit_breaker_threshold = {}
-; Duration (seconds) high FUSE rate must be sustained to open circuit (default: 5)
-circuit_breaker_open_secs = {}
+; Duration (milliseconds) high FUSE rate must be sustained to open circuit (default: 500)
+circuit_breaker_open_ms = {}
 ; Cooloff time (seconds) before trying to close the circuit (default: 5)
 circuit_breaker_half_open_secs = {}
 
@@ -1175,7 +1178,7 @@ radius_nm = {}
             self.prefetch.max_tiles_per_cycle,
             self.prefetch.cycle_interval_ms,
             self.prefetch.circuit_breaker_threshold,
-            self.prefetch.circuit_breaker_open_secs,
+            self.prefetch.circuit_breaker_open_ms,
             self.prefetch.circuit_breaker_half_open_secs,
             self.control_plane.max_concurrent_jobs,
             self.control_plane.stall_threshold_secs,

@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -97,6 +98,9 @@ pub struct MountManager {
     /// Target scenery directory for mounts (e.g., X-Plane Custom Scenery).
     /// If None, packages are mounted in-place.
     scenery_path: Option<PathBuf>,
+    /// Shared counter for FUSE-originated jobs across all services.
+    /// Used by the circuit breaker to detect when X-Plane is loading scenery.
+    shared_fuse_counter: Arc<AtomicU64>,
 }
 
 impl MountManager {
@@ -107,6 +111,7 @@ impl MountManager {
             services: HashMap::new(),
             mounts: HashMap::new(),
             scenery_path: None,
+            shared_fuse_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -120,6 +125,7 @@ impl MountManager {
             services: HashMap::new(),
             mounts: HashMap::new(),
             scenery_path: Some(scenery_path.to_path_buf()),
+            shared_fuse_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -360,6 +366,20 @@ impl MountManager {
         self.services.values().next()
     }
 
+    /// Get the shared FUSE jobs counter.
+    ///
+    /// This counter is incremented by all DDS handlers across all services
+    /// when they receive a FUSE-originated request (not prefetch).
+    /// Used by the circuit breaker to detect when X-Plane is loading scenery.
+    pub fn shared_fuse_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.shared_fuse_counter)
+    }
+
+    /// Get the current count of FUSE-originated jobs across all services.
+    pub fn fuse_jobs_submitted(&self) -> u64 {
+        self.shared_fuse_counter.load(Ordering::Relaxed)
+    }
+
     /// Get aggregated telemetry from all mounted services.
     ///
     /// This combines metrics from all active service instances into a single
@@ -496,6 +516,7 @@ impl Drop for MountManager {
 /// When multiple packages are mounted, all services share:
 /// - A single disk I/O concurrency limiter to prevent I/O exhaustion
 /// - A single memory cache to respect the configured memory limit globally
+/// - A single FUSE jobs counter for circuit breaker
 pub struct ServiceBuilder {
     service_config: ServiceConfig,
     provider_config: crate::provider::ProviderConfig,
@@ -512,6 +533,9 @@ pub struct ServiceBuilder {
     /// Shared tile request callback for FUSE-based position inference.
     /// When set, all services forward tile requests to this callback.
     tile_request_callback: Option<TileRequestCallback>,
+    /// Shared FUSE jobs counter for circuit breaker.
+    /// All services increment this counter for FUSE-originated requests.
+    shared_fuse_counter: Arc<AtomicU64>,
 }
 
 impl ServiceBuilder {
@@ -604,7 +628,18 @@ impl ServiceBuilder {
             shared_memory_cache,
             shared_memory_cache_adapter,
             tile_request_callback: None,
+            shared_fuse_counter: Arc::new(AtomicU64::new(0)), // Default, can be overridden
         }
+    }
+
+    /// Set the shared FUSE jobs counter for circuit breaker.
+    ///
+    /// When set, all services built by this builder will increment this counter
+    /// for FUSE-originated requests. This enables the circuit breaker to track
+    /// aggregate load across all mounted packages.
+    pub fn with_shared_fuse_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.shared_fuse_counter = counter;
+        self
     }
 
     /// Set the tile request callback for FUSE-based position inference.
@@ -648,6 +683,9 @@ impl ServiceBuilder {
         if let Some(ref callback) = self.tile_request_callback {
             service.set_tile_request_callback(callback.clone());
         }
+
+        // Wire shared FUSE counter for circuit breaker
+        service.set_shared_fuse_counter(Arc::clone(&self.shared_fuse_counter));
 
         Ok(service)
     }

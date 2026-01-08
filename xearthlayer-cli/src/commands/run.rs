@@ -235,6 +235,10 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         service_builder = service_builder.with_tile_request_callback(analyzer.callback());
     }
 
+    // Wire shared FUSE counter for circuit breaker
+    // This allows the circuit breaker to see aggregate load across all mounted packages
+    service_builder = service_builder.with_shared_fuse_counter(mount_manager.shared_fuse_counter());
+
     // Mount all packages
     if !use_tui {
         println!("Mounting packages to Custom Scenery...");
@@ -400,7 +404,14 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
                     .inner_radius_nm(config.prefetch.inner_radius_nm)
                     .outer_radius_nm(config.prefetch.outer_radius_nm)
                     .max_tiles_per_cycle(config.prefetch.max_tiles_per_cycle)
-                    .cycle_interval_ms(config.prefetch.cycle_interval_ms);
+                    .cycle_interval_ms(config.prefetch.cycle_interval_ms)
+                    // Wire circuit breaker to pause prefetch during high X-Plane load
+                    // Uses shared counter to aggregate FUSE jobs across all mounted packages
+                    .with_metrics(Arc::clone(service.metrics()))
+                    .with_fuse_counter(mount_manager.shared_fuse_counter())
+                    .circuit_breaker_threshold(config.prefetch.circuit_breaker_threshold)
+                    .circuit_breaker_open_ms(config.prefetch.circuit_breaker_open_ms)
+                    .circuit_breaker_half_open_secs(config.prefetch.circuit_breaker_half_open_secs);
 
                 // Wire FUSE analyzer for heading-aware/auto strategies
                 // This enables FUSE-based position inference when telemetry is unavailable
@@ -924,7 +935,14 @@ fn start_prefetcher(
         .inner_radius_nm(config.prefetch.inner_radius_nm)
         .outer_radius_nm(config.prefetch.outer_radius_nm)
         .max_tiles_per_cycle(config.prefetch.max_tiles_per_cycle)
-        .cycle_interval_ms(config.prefetch.cycle_interval_ms);
+        .cycle_interval_ms(config.prefetch.cycle_interval_ms)
+        // Wire circuit breaker to pause prefetch during high X-Plane load
+        // Uses shared counter to aggregate FUSE jobs across all mounted packages
+        .with_metrics(Arc::clone(service.metrics()))
+        .with_fuse_counter(mount_manager.shared_fuse_counter())
+        .circuit_breaker_threshold(config.prefetch.circuit_breaker_threshold)
+        .circuit_breaker_open_ms(config.prefetch.circuit_breaker_open_ms)
+        .circuit_breaker_half_open_secs(config.prefetch.circuit_breaker_half_open_secs);
 
     if let Some(analyzer) = fuse_analyzer {
         builder = builder.with_fuse_analyzer(analyzer);

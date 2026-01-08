@@ -25,7 +25,9 @@ use std::time::Duration;
 
 use crate::fuse::DdsHandler;
 use crate::pipeline::MemoryCache;
+use crate::telemetry::PipelineMetrics;
 
+use super::circuit_breaker::CircuitBreakerConfig;
 use super::config::{FuseInferenceConfig, HeadingAwarePrefetchConfig};
 use super::heading_aware::{HeadingAwarePrefetcher, HeadingAwarePrefetcherConfig};
 use super::inference::FuseRequestAnalyzer;
@@ -82,6 +84,16 @@ pub struct PrefetcherBuilder<M: MemoryCache> {
 
     // Scenery-aware prefetch (optional)
     scenery_index: Option<Arc<SceneryIndex>>,
+
+    // Circuit breaker configuration (optional)
+    // When metrics are provided, the circuit breaker pauses prefetch during high FUSE load
+    metrics: Option<Arc<PipelineMetrics>>,
+    /// Shared FUSE jobs counter (aggregated across all services).
+    /// Takes precedence over metrics.fuse_jobs_submitted when set.
+    fuse_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+    circuit_breaker_threshold: f64,
+    circuit_breaker_open_ms: u64,
+    circuit_breaker_half_open_secs: u64,
 }
 
 /// Available prefetch strategies.
@@ -111,6 +123,11 @@ impl std::str::FromStr for PrefetchStrategy {
 impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
     /// Create a new prefetcher builder with default settings.
     pub fn new() -> Self {
+        use crate::config::{
+            DEFAULT_CIRCUIT_BREAKER_HALF_OPEN_SECS, DEFAULT_CIRCUIT_BREAKER_OPEN_MS,
+            DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
+        };
+
         Self {
             memory_cache: None,
             dds_handler: None,
@@ -128,6 +145,12 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
             cycle_interval_ms: 2000, // Increased from 1000ms for less aggressive prefetch
             fuse_analyzer: None,
             scenery_index: None,
+            // Circuit breaker defaults (only active when metrics or fuse_counter are provided)
+            metrics: None,
+            fuse_counter: None,
+            circuit_breaker_threshold: DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
+            circuit_breaker_open_ms: DEFAULT_CIRCUIT_BREAKER_OPEN_MS,
+            circuit_breaker_half_open_secs: DEFAULT_CIRCUIT_BREAKER_HALF_OPEN_SECS,
         }
     }
 
@@ -267,6 +290,74 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
         self
     }
 
+    /// Set the pipeline metrics for circuit breaker integration.
+    ///
+    /// When provided, the circuit breaker monitors FUSE job rate and pauses
+    /// prefetching when X-Plane is under heavy load. This prevents prefetch
+    /// from competing with X-Plane's immediate tile requests during scenery loading.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let prefetcher = PrefetcherBuilder::new()
+    ///     .memory_cache(cache)
+    ///     .dds_handler(handler)
+    ///     .with_metrics(service.metrics().clone())
+    ///     .circuit_breaker_threshold(5.0)  // trips at 5 FUSE jobs/sec
+    ///     .build();
+    /// ```
+    pub fn with_metrics(mut self, metrics: Arc<PipelineMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Set the shared FUSE jobs counter for circuit breaker.
+    ///
+    /// When set, this counter is used instead of the single-service metrics.
+    /// This is important when multiple packages are mounted, as each package
+    /// has its own metrics but all contribute to X-Plane load.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let prefetcher = PrefetcherBuilder::new()
+    ///     .memory_cache(cache)
+    ///     .dds_handler(handler)
+    ///     .with_fuse_counter(mount_manager.shared_fuse_counter())
+    ///     .build();
+    /// ```
+    pub fn with_fuse_counter(mut self, counter: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.fuse_counter = Some(counter);
+        self
+    }
+
+    /// Set the circuit breaker threshold in FUSE jobs per second.
+    ///
+    /// When the FUSE job rate exceeds this threshold for the open duration,
+    /// the circuit breaker opens and prefetching is paused.
+    ///
+    /// Default: 5.0 jobs/sec
+    pub fn circuit_breaker_threshold(mut self, threshold: f64) -> Self {
+        self.circuit_breaker_threshold = threshold;
+        self
+    }
+
+    /// Set how long (in milliseconds) the FUSE rate must exceed threshold before opening.
+    ///
+    /// Default: 500ms
+    pub fn circuit_breaker_open_ms(mut self, ms: u64) -> Self {
+        self.circuit_breaker_open_ms = ms;
+        self
+    }
+
+    /// Set the cooloff period (in seconds) before attempting to close the circuit.
+    ///
+    /// Default: 5 seconds
+    pub fn circuit_breaker_half_open_secs(mut self, secs: u64) -> Self {
+        self.circuit_breaker_half_open_secs = secs;
+        self
+    }
+
     /// Build the prefetcher instance.
     ///
     /// # Panics
@@ -279,6 +370,13 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
         let dds_handler = self
             .dds_handler
             .expect("dds_handler is required for PrefetcherBuilder");
+
+        // Build circuit breaker config (only used when metrics are provided)
+        let circuit_breaker_config = CircuitBreakerConfig {
+            threshold_jobs_per_sec: self.circuit_breaker_threshold,
+            open_duration: Duration::from_millis(self.circuit_breaker_open_ms),
+            half_open_duration: Duration::from_secs(self.circuit_breaker_half_open_secs),
+        };
 
         match self.strategy {
             PrefetchStrategy::Radial => {
@@ -294,6 +392,15 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
 
                 if let Some(status) = self.shared_status {
                     prefetcher = prefetcher.with_shared_status(status);
+                }
+
+                // Wire circuit breaker when metrics or fuse_counter are provided
+                if let Some(ref metrics) = self.metrics {
+                    prefetcher = prefetcher
+                        .with_circuit_breaker(circuit_breaker_config.clone(), Arc::clone(metrics));
+                }
+                if let Some(ref counter) = self.fuse_counter {
+                    prefetcher = prefetcher.with_fuse_counter(Arc::clone(counter));
                 }
 
                 Box::new(prefetcher)
@@ -335,6 +442,15 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
 
                 if let Some(index) = self.scenery_index {
                     prefetcher = prefetcher.with_scenery_index(index);
+                }
+
+                // Wire circuit breaker when metrics or fuse_counter are provided
+                if let Some(ref metrics) = self.metrics {
+                    prefetcher = prefetcher
+                        .with_circuit_breaker(circuit_breaker_config, Arc::clone(metrics));
+                }
+                if let Some(ref counter) = self.fuse_counter {
+                    prefetcher = prefetcher.with_fuse_counter(Arc::clone(counter));
                 }
 
                 Box::new(prefetcher)

@@ -213,6 +213,9 @@ pub struct HeadingAwarePrefetcher<M: MemoryCache> {
     circuit_breaker: Option<CircuitBreaker>,
     /// Pipeline metrics for monitoring FUSE job rate.
     metrics: Option<Arc<PipelineMetrics>>,
+    /// Shared FUSE jobs counter (aggregated across all services).
+    /// Takes precedence over metrics when set.
+    fuse_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
@@ -251,6 +254,7 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
             scenery_index: None,
             circuit_breaker: None,
             metrics: None,
+            fuse_counter: None,
         }
     }
 
@@ -291,6 +295,15 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
         self
     }
 
+    /// Set the shared FUSE jobs counter for circuit breaker.
+    ///
+    /// When set, this counter is used instead of the single-service metrics.
+    /// This is important when multiple packages are mounted.
+    pub fn with_fuse_counter(mut self, counter: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.fuse_counter = Some(counter);
+        self
+    }
+
     /// Get access to statistics.
     pub fn stats(&self) -> Arc<HeadingAwarePrefetchStats> {
         Arc::clone(&self.stats)
@@ -306,22 +319,45 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
     /// Returns true if the circuit is open (prefetch should be blocked).
     fn check_circuit_breaker(&mut self) -> bool {
         // Early return if circuit breaker is not configured
-        if self.circuit_breaker.is_none() || self.metrics.is_none() {
+        if self.circuit_breaker.is_none() {
             return false;
         }
 
-        // Get FUSE-only job rate from metrics
-        let fuse_rate = self
-            .metrics
-            .as_ref()
-            .unwrap()
-            .snapshot()
-            .fuse_jobs_per_second;
+        // Get FUSE-only job count: prefer shared counter (aggregated across all services)
+        // over single-service metrics
+        let fuse_jobs_total = if let Some(ref counter) = self.fuse_counter {
+            counter.load(std::sync::atomic::Ordering::Relaxed)
+        } else if let Some(ref metrics) = self.metrics {
+            metrics.snapshot().fuse_jobs_submitted
+        } else {
+            return false; // No source for fuse jobs count
+        };
 
         // Update circuit breaker state
         let circuit_breaker = self.circuit_breaker.as_mut().unwrap();
-        let is_open = circuit_breaker.update(fuse_rate);
+        let was_open = circuit_breaker.is_open();
+        circuit_breaker.update(fuse_jobs_total);
+
+        // Try to close the circuit if in half-open state and cooloff has elapsed
+        circuit_breaker.try_close();
+
+        let is_open = circuit_breaker.is_open();
         let circuit_state = circuit_breaker.state();
+
+        // Log state transitions
+        if is_open != was_open {
+            tracing::info!(
+                fuse_jobs = fuse_jobs_total,
+                state = ?circuit_state,
+                "Circuit breaker state changed"
+            );
+        } else if is_open {
+            tracing::debug!(
+                fuse_jobs = fuse_jobs_total,
+                state = ?circuit_state,
+                "Circuit breaker still open"
+            );
+        }
 
         // Gather values before borrowing shared_status
         let zoom_levels = self.active_zoom_levels();

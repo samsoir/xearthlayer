@@ -102,6 +102,9 @@ pub struct XEarthLayerService {
     health_monitor_handle: Option<JoinHandle<()>>,
     /// Tile request callback for FUSE-based position inference
     tile_request_callback: Option<TileRequestCallback>,
+    /// Shared FUSE jobs counter for circuit breaker.
+    /// When set, this is incremented for FUSE-originated requests.
+    shared_fuse_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl XEarthLayerService {
@@ -300,6 +303,7 @@ impl XEarthLayerService {
             control_plane,
             health_monitor_handle: Some(health_monitor_handle),
             tile_request_callback: None,
+            shared_fuse_counter: None,
         })
     }
 
@@ -458,6 +462,15 @@ impl XEarthLayerService {
         self.tile_request_callback = Some(callback);
     }
 
+    /// Set the shared FUSE jobs counter for circuit breaker.
+    ///
+    /// When set, this counter is incremented for each FUSE-originated request.
+    /// This enables the circuit breaker to track aggregate load across all
+    /// mounted packages.
+    pub fn set_shared_fuse_counter(&mut self, counter: Arc<std::sync::atomic::AtomicU64>) {
+        self.shared_fuse_counter = Some(counter);
+    }
+
     /// Set the shared memory cache.
     ///
     /// When multiple packages are mounted, sharing a single memory cache across
@@ -581,6 +594,11 @@ impl XEarthLayerService {
 
         // Configure control plane for job management and health monitoring
         builder = builder.with_control_plane(Arc::clone(&self.control_plane));
+
+        // Configure shared FUSE counter for circuit breaker
+        if let Some(ref counter) = self.shared_fuse_counter {
+            builder = builder.with_shared_fuse_counter(Arc::clone(counter));
+        }
 
         builder.build(self.runtime_handle.clone())
     }

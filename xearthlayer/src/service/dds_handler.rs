@@ -104,6 +104,8 @@ pub struct DdsHandlerBuilder {
     metrics: Option<Arc<PipelineMetrics>>,
     /// Pipeline control plane for job management and health monitoring
     control_plane: Option<Arc<PipelineControlPlane>>,
+    /// Shared FUSE jobs counter for circuit breaker.
+    shared_fuse_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl DdsHandlerBuilder {
@@ -129,6 +131,7 @@ impl DdsHandlerBuilder {
             max_cpu_concurrent: default_cpu_concurrent(),
             metrics: None,
             control_plane: None,
+            shared_fuse_counter: None,
         }
     }
 
@@ -286,6 +289,17 @@ impl DdsHandlerBuilder {
     /// This is the recommended configuration for production use.
     pub fn with_control_plane(mut self, control_plane: Arc<PipelineControlPlane>) -> Self {
         self.control_plane = Some(control_plane);
+        self
+    }
+
+    /// Set a shared FUSE jobs counter for circuit breaker integration.
+    ///
+    /// When multiple packages are mounted, sharing a single counter across all
+    /// services allows the circuit breaker to see the aggregate FUSE job rate.
+    /// This prevents the circuit breaker from missing load spikes that occur
+    /// on services it isn't directly monitoring.
+    pub fn with_shared_fuse_counter(mut self, counter: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.shared_fuse_counter = Some(counter);
         self
     }
 
@@ -479,6 +493,7 @@ impl DdsHandlerBuilder {
             config,
             runtime_handle,
             self.metrics.clone(),
+            self.shared_fuse_counter.clone(),
         )
     }
 }

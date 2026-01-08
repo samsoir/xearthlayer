@@ -108,27 +108,12 @@ pub fn render_prefetch(frame: &mut Frame, area: Rect, prefetch: &PrefetchStatusS
 
     // Build the prefetch line with detailed stats if available
     let prefetch_line = if let Some(ref stats) = prefetch.detailed_stats {
-        // Format: "Prefetch: Mode | 45/cycle | Cache: 120↑ TTL: 5⊘ | ZL14"
+        // Format: "Prefetch: ● Mode | 45/cyc | ↑120 ⊘5"
         let activity_indicator = if stats.is_active { "●" } else { "○" };
         let activity_color = if stats.is_active {
             Color::Green
         } else {
             Color::DarkGray
-        };
-
-        // Format zoom levels
-        let zoom_str = if stats.active_zoom_levels.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "ZL{}",
-                stats
-                    .active_zoom_levels
-                    .iter()
-                    .map(|z| z.to_string())
-                    .collect::<Vec<_>>()
-                    .join("+")
-            )
         };
 
         Line::from(vec![
@@ -158,8 +143,6 @@ pub fn render_prefetch(frame: &mut Frame, area: Rect, prefetch: &PrefetchStatusS
                 format!("{}", stats.ttl_skipped),
                 Style::default().fg(Color::Yellow),
             ),
-            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(zoom_str, Style::default().fg(Color::Cyan)),
         ])
     } else {
         // Fallback to simple display when no detailed stats

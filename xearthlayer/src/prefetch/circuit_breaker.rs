@@ -78,6 +78,10 @@ pub struct CircuitBreaker {
     high_load_start: Option<Instant>,
     /// When we entered half-open state (for cooloff calculation).
     half_open_start: Option<Instant>,
+    /// Previous FUSE job count (for delta rate calculation).
+    last_fuse_jobs: u64,
+    /// Time of last rate check (for delta rate calculation).
+    last_check_time: Instant,
 }
 
 impl CircuitBreaker {
@@ -88,19 +92,53 @@ impl CircuitBreaker {
             state: CircuitState::Closed,
             high_load_start: None,
             half_open_start: None,
+            last_fuse_jobs: 0,
+            last_check_time: Instant::now(),
         }
     }
 
-    /// Update circuit state based on current FUSE jobs/second rate.
+    /// Update circuit state based on current FUSE job count.
     ///
-    /// **IMPORTANT**: Only pass FUSE-originated job rate here, NOT prefetch jobs.
+    /// Calculates the delta rate (jobs/sec since last check) rather than using
+    /// a lifetime average. This allows detecting load spikes even after the
+    /// session has been running for a while.
+    ///
+    /// **IMPORTANT**: Only pass FUSE-originated job count here, NOT prefetch jobs.
     /// This prevents self-fulfilling lockup.
+    ///
+    /// # Arguments
+    ///
+    /// * `fuse_jobs_total` - Total FUSE jobs submitted since session start
     ///
     /// # Returns
     ///
     /// `true` if circuit is open (prefetch should be blocked), `false` otherwise.
-    pub fn update(&mut self, fuse_jobs_per_second: f64) -> bool {
+    pub fn update(&mut self, fuse_jobs_total: u64) -> bool {
+        // Calculate delta rate since last check
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_check_time);
+        let elapsed_secs = elapsed.as_secs_f64().max(0.001); // Avoid division by zero
+
+        let jobs_delta = fuse_jobs_total.saturating_sub(self.last_fuse_jobs);
+        let fuse_jobs_per_second = jobs_delta as f64 / elapsed_secs;
+
+        // Update tracking for next check
+        self.last_fuse_jobs = fuse_jobs_total;
+        self.last_check_time = now;
+
         let is_high_load = fuse_jobs_per_second > self.config.threshold_jobs_per_sec;
+
+        // Log rate calculation for debugging (INFO temporarily for diagnosis)
+        tracing::info!(
+            jobs_total = fuse_jobs_total,
+            jobs_delta = jobs_delta,
+            elapsed_ms = elapsed.as_millis(),
+            rate = format!("{:.1}", fuse_jobs_per_second),
+            threshold = self.config.threshold_jobs_per_sec,
+            is_high_load = is_high_load,
+            state = ?self.state,
+            "Circuit breaker rate check"
+        );
 
         match self.state {
             CircuitState::Closed => {
@@ -108,6 +146,11 @@ impl CircuitBreaker {
                     // Start tracking sustained high load
                     if self.high_load_start.is_none() {
                         self.high_load_start = Some(Instant::now());
+                        tracing::info!(
+                            rate = format!("{:.1}", fuse_jobs_per_second),
+                            threshold = self.config.threshold_jobs_per_sec,
+                            "Circuit breaker: high load detected, starting tracking"
+                        );
                     }
 
                     // Check if high load has been sustained long enough to trip
@@ -115,10 +158,18 @@ impl CircuitBreaker {
                         if start.elapsed() >= self.config.open_duration {
                             self.state = CircuitState::Open;
                             self.high_load_start = None;
+                            tracing::info!(
+                                rate = format!("{:.1}", fuse_jobs_per_second),
+                                sustained_secs = self.config.open_duration.as_secs(),
+                                "Circuit breaker OPENED - prefetch paused"
+                            );
                         }
                     }
                 } else {
                     // Load dropped, reset tracking
+                    if self.high_load_start.is_some() {
+                        tracing::debug!("Circuit breaker: load dropped, resetting tracking");
+                    }
                     self.high_load_start = None;
                 }
             }
@@ -127,6 +178,10 @@ impl CircuitBreaker {
                     // Load dropped, transition to half-open to test recovery
                     self.state = CircuitState::HalfOpen;
                     self.half_open_start = Some(Instant::now());
+                    tracing::info!(
+                        rate = format!("{:.1}", fuse_jobs_per_second),
+                        "Circuit breaker: load dropped, transitioning to half-open"
+                    );
                 }
             }
             CircuitState::HalfOpen => {
@@ -134,6 +189,10 @@ impl CircuitBreaker {
                     // Load spiked again, go back to open
                     self.state = CircuitState::Open;
                     self.half_open_start = None;
+                    tracing::info!(
+                        rate = format!("{:.1}", fuse_jobs_per_second),
+                        "Circuit breaker: load spike in half-open, returning to open"
+                    );
                 }
                 // If still low load, stay in half-open until try_close() is called
             }
@@ -189,6 +248,27 @@ mod tests {
     use super::*;
     use std::thread;
 
+    /// Helper to simulate high load: sleep then update with jobs that exceed threshold.
+    /// Returns the new total job count.
+    fn simulate_high_load(cb: &mut CircuitBreaker, current_jobs: u64, sleep_ms: u64) -> u64 {
+        thread::sleep(Duration::from_millis(sleep_ms));
+        // Add enough jobs to exceed 5 jobs/sec threshold
+        // e.g., 100ms sleep + 10 jobs = 100 jobs/sec
+        let new_jobs = current_jobs + 10;
+        cb.update(new_jobs);
+        new_jobs
+    }
+
+    /// Helper to simulate low load: sleep then update with few jobs (below threshold).
+    /// Returns the new total job count.
+    fn simulate_low_load(cb: &mut CircuitBreaker, current_jobs: u64, sleep_ms: u64) -> u64 {
+        thread::sleep(Duration::from_millis(sleep_ms));
+        // Add minimal jobs to stay below 5 jobs/sec threshold
+        // e.g., 100ms sleep + 0 jobs = 0 jobs/sec
+        cb.update(current_jobs);
+        current_jobs
+    }
+
     #[test]
     fn test_circuit_breaker_initial_state() {
         let cb = CircuitBreaker::new(CircuitBreakerConfig::default());
@@ -215,16 +295,19 @@ mod tests {
         };
         let mut cb = CircuitBreaker::new(config);
 
+        // First update establishes baseline
+        cb.update(0);
+
         // Single high load update shouldn't trip immediately
-        cb.update(10.0);
+        let jobs = simulate_high_load(&mut cb, 0, 50);
         assert_eq!(cb.state(), CircuitState::Closed);
 
-        // Load drops before sustained period
-        cb.update(2.0);
+        // Load drops before sustained period (resets tracking)
+        let jobs = simulate_low_load(&mut cb, jobs, 30);
         assert_eq!(cb.state(), CircuitState::Closed);
 
-        // Another spike
-        cb.update(10.0);
+        // Another spike - starts tracking again but hasn't sustained
+        let _jobs = simulate_high_load(&mut cb, jobs, 50);
         assert_eq!(cb.state(), CircuitState::Closed);
     }
 
@@ -238,15 +321,15 @@ mod tests {
         };
         let mut cb = CircuitBreaker::new(config);
 
-        // Start high load
-        cb.update(10.0);
+        // First update establishes baseline
+        cb.update(0);
+
+        // Start high load - first spike starts tracking
+        let jobs = simulate_high_load(&mut cb, 0, 30);
         assert_eq!(cb.state(), CircuitState::Closed);
 
-        // Wait for sustained period
-        thread::sleep(Duration::from_millis(60));
-
-        // Update again with high load - should trip
-        cb.update(10.0);
+        // Sustained high load should trip after open_duration
+        let _jobs = simulate_high_load(&mut cb, jobs, 60);
         assert_eq!(cb.state(), CircuitState::Open);
         assert!(cb.is_open());
     }
@@ -255,19 +338,21 @@ mod tests {
     fn test_circuit_breaker_transitions_to_half_open() {
         let config = CircuitBreakerConfig {
             threshold_jobs_per_sec: 5.0,
-            open_duration: Duration::from_millis(10),
+            open_duration: Duration::from_millis(30),
             half_open_duration: Duration::from_millis(50),
         };
         let mut cb = CircuitBreaker::new(config);
 
-        // Trip the circuit
-        cb.update(10.0);
-        thread::sleep(Duration::from_millis(20));
-        cb.update(10.0);
+        // First update establishes baseline
+        cb.update(0);
+
+        // Trip the circuit with sustained high load
+        let jobs = simulate_high_load(&mut cb, 0, 20);
+        let jobs = simulate_high_load(&mut cb, jobs, 40);
         assert_eq!(cb.state(), CircuitState::Open);
 
         // Load drops - should go to half-open
-        cb.update(2.0);
+        let _jobs = simulate_low_load(&mut cb, jobs, 50);
         assert_eq!(cb.state(), CircuitState::HalfOpen);
         assert!(cb.is_open()); // Still considered "open" for blocking purposes
     }
@@ -276,19 +361,21 @@ mod tests {
     fn test_circuit_breaker_half_open_then_closes() {
         let config = CircuitBreakerConfig {
             threshold_jobs_per_sec: 5.0,
-            open_duration: Duration::from_millis(10),
-            half_open_duration: Duration::from_millis(30),
+            open_duration: Duration::from_millis(30),
+            half_open_duration: Duration::from_millis(40),
         };
         let mut cb = CircuitBreaker::new(config);
 
+        // First update establishes baseline
+        cb.update(0);
+
         // Trip the circuit
-        cb.update(10.0);
-        thread::sleep(Duration::from_millis(20));
-        cb.update(10.0);
+        let jobs = simulate_high_load(&mut cb, 0, 20);
+        let jobs = simulate_high_load(&mut cb, jobs, 40);
         assert_eq!(cb.state(), CircuitState::Open);
 
         // Go to half-open
-        cb.update(2.0);
+        let _jobs = simulate_low_load(&mut cb, jobs, 50);
         assert_eq!(cb.state(), CircuitState::HalfOpen);
 
         // try_close() too early - should fail
@@ -296,7 +383,7 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::HalfOpen);
 
         // Wait for half-open duration
-        thread::sleep(Duration::from_millis(40));
+        thread::sleep(Duration::from_millis(50));
 
         // Now try_close() should succeed
         assert!(cb.try_close());
@@ -308,20 +395,22 @@ mod tests {
     fn test_circuit_breaker_resets_on_load_spike_in_half_open() {
         let config = CircuitBreakerConfig {
             threshold_jobs_per_sec: 5.0,
-            open_duration: Duration::from_millis(10),
+            open_duration: Duration::from_millis(30),
             half_open_duration: Duration::from_millis(100),
         };
         let mut cb = CircuitBreaker::new(config);
 
+        // First update establishes baseline
+        cb.update(0);
+
         // Trip the circuit and go to half-open
-        cb.update(10.0);
-        thread::sleep(Duration::from_millis(20));
-        cb.update(10.0);
-        cb.update(2.0);
+        let jobs = simulate_high_load(&mut cb, 0, 20);
+        let jobs = simulate_high_load(&mut cb, jobs, 40);
+        let jobs = simulate_low_load(&mut cb, jobs, 50);
         assert_eq!(cb.state(), CircuitState::HalfOpen);
 
         // Load spikes again - should go back to open
-        cb.update(10.0);
+        let _jobs = simulate_high_load(&mut cb, jobs, 30);
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
@@ -338,14 +427,18 @@ mod tests {
     fn test_circuit_breaker_low_load_never_trips() {
         let config = CircuitBreakerConfig {
             threshold_jobs_per_sec: 5.0,
-            open_duration: Duration::from_millis(10),
-            half_open_duration: Duration::from_millis(10),
+            open_duration: Duration::from_millis(30),
+            half_open_duration: Duration::from_millis(30),
         };
         let mut cb = CircuitBreaker::new(config);
 
-        // Many updates with low load
-        for _ in 0..100 {
-            cb.update(2.0);
+        // First update establishes baseline
+        cb.update(0);
+
+        // Many updates with low load (no new jobs)
+        for _ in 0..10 {
+            thread::sleep(Duration::from_millis(10));
+            cb.update(0);
         }
 
         assert_eq!(cb.state(), CircuitState::Closed);
@@ -362,22 +455,51 @@ mod tests {
     fn test_circuit_breaker_update_returns_is_open() {
         let config = CircuitBreakerConfig {
             threshold_jobs_per_sec: 5.0,
-            open_duration: Duration::from_millis(10),
-            half_open_duration: Duration::from_millis(10),
+            open_duration: Duration::from_millis(30),
+            half_open_duration: Duration::from_millis(30),
         };
         let mut cb = CircuitBreaker::new(config);
 
-        // Closed state - should return false
-        assert!(!cb.update(2.0));
+        // First update establishes baseline
+        cb.update(0);
 
-        // Trip the circuit
-        cb.update(10.0);
-        thread::sleep(Duration::from_millis(20));
+        // Closed state with low load - should return false
+        thread::sleep(Duration::from_millis(50));
+        assert!(!cb.update(0));
+
+        // Build up high load to trip
+        let jobs = simulate_high_load(&mut cb, 0, 20);
+        let jobs = simulate_high_load(&mut cb, jobs, 40);
 
         // Open state - should return true
-        assert!(cb.update(10.0));
+        assert!(cb.is_open());
 
-        // Half-open state - should still return true (blocking)
-        assert!(cb.update(2.0));
+        // Transition to half-open with low load - should still return true
+        let _jobs = simulate_low_load(&mut cb, jobs, 50);
+        assert!(cb.is_open());
+    }
+
+    #[test]
+    fn test_circuit_breaker_delta_rate_calculation() {
+        let config = CircuitBreakerConfig {
+            threshold_jobs_per_sec: 10.0, // 10 jobs/sec threshold
+            open_duration: Duration::from_millis(30),
+            half_open_duration: Duration::from_millis(30),
+        };
+        let mut cb = CircuitBreaker::new(config);
+
+        // First update establishes baseline at 0 jobs
+        cb.update(0);
+
+        // Wait 100ms, then add 5 jobs = 50 jobs/sec (above threshold)
+        thread::sleep(Duration::from_millis(100));
+        cb.update(5);
+        // Should start tracking high load
+        assert_eq!(cb.state(), CircuitState::Closed);
+
+        // Wait another 50ms with more jobs to sustain and trip
+        thread::sleep(Duration::from_millis(50));
+        cb.update(15); // 10 more jobs in 50ms = 200 jobs/sec
+        assert_eq!(cb.state(), CircuitState::Open);
     }
 }
