@@ -9,18 +9,19 @@ The following features are **implemented and working**:
 | Feature | Status | Description |
 |---------|--------|-------------|
 | PassthroughFS | ✅ Complete | FUSE filesystem that overlays existing scenery packs |
+| UnionFS | ✅ Complete | Union filesystem for consolidated multi-source mounting |
 | X-Plane Path Detection | ✅ Complete | Auto-detects X-Plane 12 install from reference file |
-| On-demand DDS Generation | ✅ Complete | Downloads Bing imagery and encodes to BC1/BC3 DDS |
-| CLI `mount` Command | ✅ Complete | Mount scenery packs with optional auto-detection |
+| On-demand DDS Generation | ✅ Complete | Downloads satellite imagery and encodes to BC1/BC3 DDS |
+| Multi-provider Support | ✅ Complete | Bing Maps, Google GO2, Google Maps API |
 | Two-tier Caching | ✅ Complete | Memory + disk cache for generated textures |
-| Parallel Tile Generation | ✅ Complete | Thread pool with request coalescing |
+| Async Pipeline | ✅ Complete | Request coalescing, parallel downloads, async encoding |
 | Graceful Shutdown | ✅ Complete | Auto-unmount on SIGTERM/SIGINT |
-| INI Configuration | ✅ Complete | `~/.xearthlayer/config.ini` |
-
-**Not yet implemented** (planned for future releases):
-- Pack management CLI (`pack install`, `pack update`)
-- Overlay pack support (`y_xel_*` packs)
-- Multi-region simultaneous mounting
+| Package Management | ✅ Complete | Install, update, remove regional packages |
+| Consolidated Mounting | ✅ Complete | Single mount for all sources (v0.2.11+) |
+| Tile Patches | ✅ Complete | Custom mesh/elevation from airport addons |
+| Overlay Support | ✅ Complete | Consolidated overlay symlinks |
+| Predictive Prefetch | ✅ Complete | Radial prefetcher with X-Plane telemetry |
+| Scenery Index | ✅ Complete | Fast tile coordinate lookup across packages |
 
 ## Overview
 
@@ -31,25 +32,89 @@ XEarthLayer creates virtual filesystem mounts that appear as standard X-Plane sc
 
 This allows distributing compact scenery packs (DSF + terrain files) without the massive storage requirements of pre-rendered orthophotos.
 
-## Regional Scenery Packs
+## Consolidated Mounting (v0.2.11+)
 
-XEarthLayer distributes scenery in continent-based regional packs:
+Starting with v0.2.11, XEarthLayer uses **consolidated mounting** - a single FUSE mount that combines all ortho sources (patches + regional packages) into one unified view.
 
-| Region | Pack Name | Mount Point |
-|--------|-----------|-------------|
-| Europe | `z_xel_europe` | `/Custom Scenery/z_xel_europe/` |
-| Africa | `z_xel_africa` | `/Custom Scenery/z_xel_africa/` |
-| North America | `z_xel_north_america` | `/Custom Scenery/z_xel_north_america/` |
-| South America | `z_xel_south_america` | `/Custom Scenery/z_xel_south_america/` |
-| Asia | `z_xel_asia` | `/Custom Scenery/z_xel_asia/` |
-| Australia | `z_xel_australia` | `/Custom Scenery/z_xel_australia/` |
-| Antarctica | `z_xel_antarctica` | `/Custom Scenery/z_xel_antarctica/` |
+### Benefits
 
-The `z_` prefix ensures these packs load after default scenery in X-Plane's alphabetical loading order.
+| Before (≤0.2.10) | After (≥0.2.11) |
+|------------------|-----------------|
+| N mounts for N packages | Single `zzXEL_ortho` mount |
+| Separate patches mount | Patches integrated into main mount |
+| Per-region overlays | Single `yzXEL_overlay` folder |
+| N FUSE sessions | Single shared FUSE session |
+| N XEarthLayerService instances | Single shared service |
 
-## Overlay Packs
+### Mount Points
 
-Overlays restore roads, railways, powerlines, and forests that are excluded from orthophoto tiles. Each regional scenery pack has a corresponding overlay pack.
+| Mount | Type | Description | Priority |
+|-------|------|-------------|----------|
+| `yzXEL_overlay` | Symlinks | Consolidated overlay DSFs | Highest (loaded first) |
+| `zzXEL_ortho` | FUSE | All ortho sources (patches + packages) | Lowest (loaded last) |
+
+### Source Priority
+
+Within the consolidated mount, file resolution follows **alphabetical folder name** ordering:
+
+```
+Priority (highest to lowest):
+1. _patches/A_KDEN_Mesh/    ('_' prefix sorts first)
+2. _patches/B_KLAX_Mesh/
+3. eu/                      (alphabetically: eu < na < sa)
+4. na/
+5. sa/
+```
+
+Patches automatically have highest priority because their internal `_patches/` prefix sorts before region codes.
+
+## Regional Scenery Packages
+
+XEarthLayer distributes scenery in regional packages. Each region includes both ortho and overlay components.
+
+### Available Regions
+
+| Region | Code | Description |
+|--------|------|-------------|
+| North America | `na` | Continental US, Canada, Mexico |
+| Europe | `eu` | European continent |
+| South America | `sa` | South American continent |
+
+### Package Structure
+
+Each regional package follows standard X-Plane scenery structure:
+
+```
+na/
+├── ortho/
+│   ├── Earth nav data/
+│   │   └── +30-120/
+│   │       ├── +33-119.dsf
+│   │       └── ...
+│   └── terrain/
+│       ├── 94800_47888_BI18.ter
+│       └── ...
+└── overlay/
+    └── Earth nav data/
+        └── +30-120/
+            ├── +33-119.dsf
+            └── ...
+```
+
+**Included in ortho packages:**
+- DSF files (mesh, airports, objects)
+- Terrain files (.ter)
+- Water masks and transitions (.png)
+
+**NOT included in ortho packages:**
+- Orthophoto textures (.dds) - generated on-demand
+
+**Included in overlay packages:**
+- DSF files with road networks, railways, powerlines, forest placement
+
+## Overlays
+
+Overlays restore roads, railways, powerlines, and forests that are excluded from orthophoto tiles.
 
 ### Why Overlays Are Needed
 
@@ -61,142 +126,39 @@ Orthophoto imagery shows the ground as photographed from satellites, but X-Plane
 
 Without overlays, orthophoto scenery would show roads in the imagery but lack the 3D elements X-Plane expects.
 
-### Overlay Pack Structure
+### Consolidated Overlays
 
-| Region | Overlay Pack Name | Mount Point |
-|--------|-------------------|-------------|
-| Europe | `y_xel_europe_overlays` | `/Custom Scenery/y_xel_europe_overlays/` |
-| Africa | `y_xel_africa_overlays` | `/Custom Scenery/y_xel_africa_overlays/` |
-| North America | `y_xel_north_america_overlays` | `/Custom Scenery/y_xel_north_america_overlays/` |
-| South America | `y_xel_south_america_overlays` | `/Custom Scenery/y_xel_south_america_overlays/` |
-| Asia | `y_xel_asia_overlays` | `/Custom Scenery/y_xel_asia_overlays/` |
-| Australia | `y_xel_australia_overlays` | `/Custom Scenery/y_xel_australia_overlays/` |
-| Antarctica | `y_xel_antarctica_overlays` | `/Custom Scenery/y_xel_antarctica_overlays/` |
-
-The `y_` prefix ensures overlays load **before** the `z_` orthophoto packs (alphabetically), which is required for proper rendering - overlay elements draw on top of the orthophoto terrain.
-
-### Overlay Contents
-
-Overlay packs contain only DSF files with vector overlay data:
+All overlay packages are combined into a single `yzXEL_overlay` folder:
 
 ```
-y_xel_europe_overlays/
+X-Plane 12/Custom Scenery/yzXEL_overlay/
 └── Earth nav data/
-    ├── +40-010/
-    │   ├── +40-001.dsf
-    │   ├── +40-002.dsf
+    ├── +30-120/           <- From na/overlay
+    │   ├── +33-119.dsf
     │   └── ...
-    ├── +50+000/
-    │   ├── +50+000.dsf
+    ├── +40+000/           <- From eu/overlay
+    │   ├── +48+002.dsf
     │   └── ...
     └── ...
 ```
 
-**Included in overlay packs:**
-- DSF files with road networks, railways, powerlines, forest placement
+The `yz` prefix ensures overlays load **before** the `zz` orthophoto mount (alphabetically), which is required for proper rendering - overlay elements draw on top of the orthophoto terrain.
 
-**NOT included:**
-- Terrain files (.ter) - these are in the main orthophoto pack
-- Textures - overlays use X-Plane's built-in textures
+## Tile Patches
 
-### Regional Scope
+Tile patches allow using custom mesh/elevation data from third-party airport addons. See [patches.md](../patches.md) for full documentation.
 
-Unlike AutoOrtho which provides a single global overlay pack, XEarthLayer provides **region-specific overlays**. This is an improvement because:
+### How Patches Integrate
 
-1. **No conflicts** - Only overlay data for regions you're using is loaded
-2. **Smaller downloads** - Download only the overlays you need
-3. **Faster loading** - X-Plane doesn't scan unnecessary DSF files
-4. **Cleaner organization** - Each region is self-contained
-
-### Overlay FUSE Mounts
-
-Overlay packs use FUSE mounts (not symlinks) for clean lifecycle management:
-
-- **When XEarthLayer starts**: Overlay mounts appear in Custom Scenery
-- **When XEarthLayer stops**: Overlay mounts disappear cleanly
-- **No artifacts**: X-Plane's scenery folder stays clean when XEarthLayer isn't running
-
-Since overlay packs contain only static DSF files, the FUSE mount is pure passthrough - no on-demand generation is needed.
-
-### Load Order
-
-X-Plane loads scenery alphabetically. XEarthLayer's naming ensures correct order:
+Patches are stored in `~/.xearthlayer/patches/` and automatically included in the consolidated mount with highest priority:
 
 ```
-Custom Scenery/
-├── Global Airports/              # X-Plane default
-├── y_xel_europe_overlays/        # 1. Overlays load first (y_)
-├── y_xel_asia_overlays/          #    Roads, railways, forests
-├── z_xel_europe/                 # 2. Ortho packs load second (z_)
-├── z_xel_asia/                   #    Terrain with orthophotos
-└── ...
-```
-
-This order ensures overlay elements (roads, trees) render on top of the orthophoto terrain.
-
-### Pack Structure
-
-Each regional pack follows standard X-Plane scenery structure:
-
-```
-z_xel_europe/
-├── Earth nav data/
-│   └── +40-010/
-│       ├── +39-009.dsf
-│       ├── +39-008.dsf
-│       └── ...
-├── terrain/
-│   ├── 100000_125184_BI18.ter
-│   ├── 100016_125184_BI18.ter
-│   └── ...
-└── textures/
-    ├── water_transition.png
-    ├── water_mask_100000_125184.png
-    └── ...
-```
-
-**Included in packs:**
-- DSF files (mesh, airports, objects)
-- Terrain files (.ter)
-- Water masks and transitions (.png)
-
-**NOT included in packs:**
-- Orthophoto textures (.dds) - generated on-demand
-
-## Storage Locations
-
-### Source Pack Location (Configurable)
-
-Users can configure where scenery packs are stored:
-
-```
-Default: ~/.xearthlayer/scenery_packs/
-         ├── y_xel_europe_overlays/
-         ├── y_xel_africa_overlays/
-         ├── z_xel_europe/
-         ├── z_xel_africa/
-         └── ...
-
-Custom:  /mnt/large_drive/xearthlayer/scenery_packs/
-         ├── y_xel_europe_overlays/
-         ├── z_xel_europe/
-         └── ...
-```
-
-This flexibility allows users with limited SSD space to store packs on larger drives.
-
-### Mount Points (X-Plane Custom Scenery)
-
-FUSE mounts appear in X-Plane's Custom Scenery folder:
-
-```
-X-Plane 12/Custom Scenery/
-├── Global Airports/              <- Real folder
-├── y_xel_europe_overlays/        <- FUSE mount (overlays)
-├── y_xel_asia_overlays/          <- FUSE mount (overlays)
-├── z_xel_europe/                 <- FUSE mount (ortho)
-├── z_xel_asia/                   <- FUSE mount (ortho)
-└── ...
+zzXEL_ortho (consolidated mount)
+├── _patches/A_KLAX_Mesh/   <- Highest priority
+├── _patches/B_KDEN_Mesh/
+├── eu/                      <- Regional packages
+├── na/
+└── sa/
 ```
 
 ## Request Routing
@@ -213,7 +175,13 @@ X-Plane 12/Custom Scenery/
                               │
                               ▼
                  ┌────────────────────────┐
-                 │ File exists in pack?   │
+                 │  OrthoUnionIndex       │
+                 │  Resolve source        │
+                 └────────────────────────┘
+                              │
+                              ▼
+                 ┌────────────────────────┐
+                 │ File exists in source? │
                  └────────────────────────┘
                     │              │
                    Yes             No
@@ -230,7 +198,7 @@ X-Plane 12/Custom Scenery/
                           ┌─────────────┐  ┌─────────┐
                           │  Generate   │  │ ENOENT  │
                           │  on-demand  │  │ (not    │
-                          │  via tile   │  │ found)  │
+                          │  via async  │  │ found)  │
                           │  pipeline   │  └─────────┘
                           └─────────────┘
 ```
@@ -239,9 +207,9 @@ X-Plane 12/Custom Scenery/
 
 | File Type | Pattern | Handling |
 |-----------|---------|----------|
-| DSF | `*.dsf` | Passthrough from pack |
-| Terrain | `*.ter` | Passthrough from pack |
-| Water masks | `water_*.png` | Passthrough from pack |
+| DSF | `*.dsf` | Passthrough from source |
+| Terrain | `*.ter` | Passthrough from source |
+| Water masks | `water_*.png` | Passthrough from source |
 | Other PNG | `*.png` | Passthrough if exists, else ENOENT |
 | Orthophoto DDS | `{row}_{col}_{maptype}{zoom}.dds` | Generate on-demand |
 | Other DDS | `*.dds` | ENOENT (not an orthophoto) |
@@ -271,16 +239,16 @@ The regex pattern for recognition:
 
 | Operation | Behavior |
 |-----------|----------|
-| `readdir` | List real files from pack + synthesize DDS entries from .ter references |
-| `getattr` | Return real attributes for pack files, synthesized attributes for DDS |
-| `lookup` | Check pack first, then pattern match for DDS |
+| `readdir` | Union of all sources, with priority ordering |
+| `getattr` | Return attributes from winning source |
+| `lookup` | Resolve via OrthoUnionIndex, pattern match for DDS |
 
 ### File Operations
 
 | Operation | Behavior |
 |-----------|----------|
-| `open` | For DDS: trigger generation pipeline; For others: open real file |
-| `read` | For DDS: serve from cache/generated; For others: read real file |
+| `open` | For DDS: trigger async pipeline; For others: open from source |
+| `read` | For DDS: serve from cache/generated; For others: read from source |
 | `release` | Clean up handles |
 
 ### Synthesized DDS Attributes
@@ -297,44 +265,62 @@ FileAttr {
 }
 ```
 
-## Pack Management
+## Package Management
 
-### User Configuration
+### CLI Commands
 
-XEarthLayer uses INI configuration at `~/.xearthlayer/config.ini`. See [configuration.md](../configuration.md) for full reference.
+| Command | Description |
+|---------|-------------|
+| `xearthlayer packages list` | List available and installed packages |
+| `xearthlayer packages install <region>` | Download and install a region |
+| `xearthlayer packages update [region]` | Update installed packages |
+| `xearthlayer packages remove <region>` | Remove a package |
+| `xearthlayer packages check` | Check for available updates |
 
-Example configuration excerpt:
-```ini
-[xplane]
-; Auto-detected from ~/.x-plane/x-plane_install_12.txt if not specified
-; scenery_dir = /path/to/X-Plane 12/Custom Scenery
+Installing a region (e.g., `na`) downloads both ortho and overlay components.
 
-[cache]
-memory_size = 2GB
-disk_size = 20GB
+### Package Distribution
+
+Packages are distributed as split archives:
+- Format: `.tar.gz` split into parts
+- Hosted on: GitHub Releases
+- Versioning: Semantic versioning per region
+- Discovery: Library index at configured URL
+
+## Storage Locations
+
+### Package Location (Configurable)
+
+```
+Default: ~/.xearthlayer/packages/
+         ├── na/
+         │   ├── ortho/
+         │   └── overlay/
+         ├── eu/
+         │   ├── ortho/
+         │   └── overlay/
+         └── ...
 ```
 
-### Pack Operations
+### Patches Location
 
-| Operation | Description |
-|-----------|-------------|
-| `xearthlayer pack list` | List available and installed packs |
-| `xearthlayer pack install <region>` | Download and install ortho + overlay packs for a region |
-| `xearthlayer pack update <region>` | Update installed packs for a region |
-| `xearthlayer pack remove <region>` | Remove ortho + overlay packs for a region |
-| `xearthlayer pack status` | Show status of all packs |
+```
+~/.xearthlayer/patches/
+├── A_KLAX_Mesh/
+│   ├── Earth nav data/
+│   └── terrain/
+└── B_KDEN_Mesh/
+    └── ...
+```
 
-Installing a region (e.g., `europe`) downloads and installs both:
-- `z_xel_europe` (orthophoto pack)
-- `y_xel_europe_overlays` (overlay pack)
+### Mount Points (X-Plane Custom Scenery)
 
-### Pack Distribution
-
-Packs are distributed as compressed archives:
-- Format: `.tar.zst` (tar with Zstandard compression)
-- Hosted on: GitHub Releases or dedicated CDN
-- Versioning: Semantic versioning per region
-- Each region has two archives: `z_xel_<region>.tar.zst` and `y_xel_<region>_overlays.tar.zst`
+```
+X-Plane 12/Custom Scenery/
+├── Global Airports/              <- Real folder (X-Plane default)
+├── yzXEL_overlay/                <- Symlink folder (consolidated overlays)
+└── zzXEL_ortho/                  <- FUSE mount (consolidated ortho)
+```
 
 ## Mount Lifecycle
 
@@ -342,60 +328,100 @@ Packs are distributed as compressed archives:
 
 ```
 1. Read configuration
-2. For each enabled region:
-   a. Verify overlay pack exists at configured location
-   b. Create FUSE mount for overlay at X-Plane Custom Scenery (y_xel_*)
-   c. Verify ortho pack exists at configured location
-   d. Create FUSE mount for ortho at X-Plane Custom Scenery (z_xel_*)
-   e. Initialize tile generator for on-demand DDS
-3. Start background services (cache cleanup, etc.)
+2. Discover installed packages from packages directory
+3. Discover patches from patches directory
+4. Build OrthoUnionIndex (patches + packages, sorted)
+5. Create shared XEarthLayerService (cache, pipeline, limiters)
+6. Mount Fuse3OrthoUnionFS at zzXEL_ortho
+7. Create consolidated overlay symlinks at yzXEL_overlay
+8. Start prefetch listener if telemetry enabled
+9. Display dashboard and wait for Ctrl+C
 ```
 
 ### Shutdown Sequence
 
 ```
-1. Signal shutdown to all mounts
-2. Flush pending writes to cache
-3. Unmount all FUSE filesystems (ortho and overlay mounts)
-4. Clean up resources
-5. X-Plane Custom Scenery folder is left clean (no XEarthLayer artifacts)
+1. Signal shutdown (Ctrl+C received)
+2. Stop prefetch listener
+3. Unmount FUSE filesystem
+4. Flush pending cache writes
+5. Clean up resources
+6. Remove overlay symlinks (optional)
 ```
 
 ### Runtime Management
 
 ```bash
-# Start with a scenery pack using auto-detected X-Plane path
-xearthlayer start --source /path/to/scenery/z_xel_europe
+# Primary command - mount all installed packages
+xearthlayer run
 
-# Start with explicit mountpoint
-xearthlayer start \
-  --source /path/to/scenery/z_xel_europe \
-  --mountpoint "/path/to/X-Plane 12/Custom Scenery/z_xel_europe"
+# With pre-warming around an airport
+xearthlayer run --airport KJFK
 
-# Start without caching (for testing)
-xearthlayer start --source /path/to/scenery/z_xel_test --no-cache
+# Override provider for this session
+xearthlayer run --provider go2
 
-# Unmount (use fusermount on Linux/macOS)
-fusermount -u "/path/to/X-Plane 12/Custom Scenery/z_xel_europe"
+# Advanced: mount single scenery pack (debugging)
+xearthlayer start --source /path/to/scenery
 ```
 
-**X-Plane Path Detection:**
+## Implementation Modules
 
-When `--mountpoint` is omitted, XEarthLayer automatically detects the X-Plane 12 installation:
-- **Linux/macOS**: Reads `~/.x-plane/x-plane_install_12.txt`
-- **Windows**: Reads `%LOCALAPPDATA%\x-plane\x-plane_install_12.txt`
+```
+xearthlayer/src/
+├── fuse/
+│   ├── mod.rs              # Module exports
+│   ├── fuse3/              # Async multi-threaded FUSE (primary)
+│   │   ├── mod.rs          # Fuse3 module exports
+│   │   ├── passthrough_fs.rs   # Single-source passthrough
+│   │   ├── union_fs.rs         # Multi-source union (patches)
+│   │   └── ortho_union_fs.rs   # Consolidated ortho mount
+│   ├── filename.rs         # DDS filename parsing
+│   └── placeholder.rs      # Magenta placeholder generation
+├── ortho_union/
+│   ├── mod.rs              # Module exports
+│   ├── index.rs            # OrthoUnionIndex (tile → source mapping)
+│   └── source.rs           # OrthoSource, SourceType
+├── patches/
+│   ├── mod.rs              # Module exports
+│   ├── discovery.rs        # Patch directory scanning
+│   └── index.rs            # PatchUnionIndex
+├── service/
+│   ├── mod.rs              # Module exports
+│   ├── facade.rs           # High-level service API
+│   ├── dds_handler.rs      # DDS request handling
+│   └── fuse_mount.rs       # FUSE mount management
+├── manager/
+│   ├── mod.rs              # Module exports
+│   ├── mounts.rs           # MountManager for consolidated mounting
+│   └── symlinks.rs         # Overlay symlink management
+├── pipeline/
+│   ├── mod.rs              # Module exports
+│   ├── runner.rs           # DDS pipeline with coalescing
+│   ├── coalesce.rs         # Request coalescing
+│   └── stages/             # Pipeline stages (download, assemble, encode)
+├── prefetch/
+│   ├── mod.rs              # Module exports
+│   ├── strategy.rs         # Prefetcher trait
+│   ├── radial.rs           # RadialPrefetcher (recommended)
+│   └── telemetry.rs        # X-Plane UDP telemetry
+├── config/                 # Configuration system
+├── cache/                  # Two-tier caching
+├── provider/               # Imagery providers
+└── texture/                # DDS encoding
+```
 
-The mountpoint is derived as: `{X-Plane 12}/Custom Scenery/{source_pack_name}`
+### Key Types
+
+| Type | Module | Purpose |
+|------|--------|---------|
+| `Fuse3OrthoUnionFS` | `fuse/fuse3/ortho_union_fs.rs` | Consolidated FUSE filesystem |
+| `OrthoUnionIndex` | `ortho_union/index.rs` | Maps files to sources with priority |
+| `MountManager` | `manager/mounts.rs` | Orchestrates consolidated mounting |
+| `DdsHandler` | `service/dds_handler.rs` | Async DDS generation pipeline |
+| `RadialPrefetcher` | `prefetch/radial.rs` | Predictive tile caching |
 
 ## Error Handling
-
-### Pack Errors
-
-| Error | Handling |
-|-------|----------|
-| Pack not found | Log error, skip mount, continue with others |
-| Pack corrupted | Log error, skip mount, suggest re-download |
-| Mount point busy | Log error, skip mount |
 
 ### Runtime Errors
 
@@ -403,6 +429,7 @@ The mountpoint is derived as: `{X-Plane 12}/Custom Scenery/{source_pack_name}`
 |-------|----------|
 | DDS generation fails | Return magenta placeholder texture |
 | Network timeout | Return cached version if available, else placeholder |
+| Source file missing | Check next source in priority order |
 | Disk full | Log warning, evict cache entries |
 
 ### Graceful Degradation
@@ -412,66 +439,6 @@ XEarthLayer prioritizes availability:
 2. Never crash the FUSE mount due to transient errors
 3. Log errors for debugging but don't block X-Plane
 
-## Implementation Modules
-
-```
-xearthlayer/src/
-├── fuse/
-│   ├── mod.rs           # Module exports
-│   ├── filesystem.rs    # Pure virtual filesystem (textures/ directory only)
-│   ├── filename.rs      # DDS filename parsing (row_col_maptypeZZ.dds)
-│   ├── passthrough.rs   # Passthrough + on-demand DDS (IMPLEMENTED)
-│   └── placeholder.rs   # Magenta placeholder generation
-├── config/
-│   ├── mod.rs           # Module exports
-│   ├── download.rs      # Download configuration
-│   ├── texture.rs       # Texture encoding configuration
-│   └── xplane.rs        # X-Plane path detection (IMPLEMENTED)
-├── service/
-│   ├── mod.rs           # Module exports
-│   ├── config.rs        # Service configuration
-│   ├── error.rs         # Service errors
-│   └── facade.rs        # High-level service API (serve, serve_passthrough)
-├── tile/                # Tile generation pipeline
-├── orchestrator/        # Chunk download orchestration
-├── texture/             # DDS texture encoding
-├── cache/               # Two-tier caching system
-└── provider/            # Satellite imagery providers (Bing, Google)
-```
-
-### FUSE Filesystem Types
-
-XEarthLayer currently implements two FUSE filesystem types:
-
-| Type | Module | Purpose | On-demand Generation |
-|------|--------|---------|---------------------|
-| Virtual | `filesystem.rs` | Pure virtual textures/ directory | Yes (all DDS files) |
-| Passthrough | `passthrough.rs` | Overlay existing scenery pack | Yes (missing DDS files only) |
-
-**PassthroughFS** is the primary filesystem for X-Plane integration:
-- **Real files**: DSF, .ter, .png files pass through directly from source
-- **Virtual DDS**: Non-existent .dds files are generated on-demand
-- **Transparent**: X-Plane sees a complete scenery pack
-
-**XEarthLayerFS** is a simpler virtual filesystem for testing:
-- Only exposes a `textures/` directory
-- All DDS files are generated on-demand
-- No passthrough capability
-
-## Security Considerations
-
-### Mount Permissions
-
-- FUSE mounts are user-space, no root required (with fuse group membership)
-- Mount points are read-only to X-Plane
-- Pack files are read-only
-
-### Network Access
-
-- Orthophoto downloads only from configured providers
-- HTTPS required for all downloads
-- No execution of downloaded content
-
 ## Performance Considerations
 
 ### Caching Strategy
@@ -479,24 +446,41 @@ XEarthLayer currently implements two FUSE filesystem types:
 See [cache-design.md](cache-design.md) for detailed caching architecture.
 
 Summary:
-1. Memory cache for hot tiles
-2. Disk cache for generated DDS files
-3. Chunk cache for downloaded imagery
+1. Memory cache for hot tiles (2GB default)
+2. Disk cache for generated DDS files (20GB default)
+3. Request coalescing prevents duplicate work
 
-### Passthrough Optimization
+### Async Pipeline
 
-For real files in packs:
-- Direct file descriptor passing (no copy)
-- mmap for large files when supported
-- Minimal overhead vs. real filesystem
+The DDS generation pipeline is fully async:
+- HTTP downloads via tokio + reqwest
+- Request coalescing via broadcast channels
+- CPU-bound work (encode) via spawn_blocking
+- Semaphore-based concurrency limiting
 
-### Directory Listing
+### Concurrency Limiting
 
-- Cache directory listings
-- Lazy DDS entry synthesis
-- Incremental readdir support
+| Resource | Limiter | Scaling |
+|----------|---------|---------|
+| HTTP | `ConcurrencyLimiter` | `min(cpus * 16, 256)` |
+| CPU (assemble + encode) | `CPUConcurrencyLimiter` | `max(cpus * 1.25, cpus + 2)` |
+| Disk I/O | `StorageConcurrencyLimiter` | Auto-detected by storage type |
 
-## Compatibility Notes
+## Security Considerations
+
+### Mount Permissions
+
+- FUSE mounts are user-space, no root required (with fuse group membership)
+- Mount points are read-only to X-Plane
+- Source files are read-only
+
+### Network Access
+
+- Orthophoto downloads only from configured providers
+- HTTPS required for all downloads
+- No execution of downloaded content
+
+## Compatibility
 
 ### X-Plane Versions
 
@@ -505,30 +489,10 @@ For real files in packs:
 
 ### Operating Systems
 
-- Linux: Native FUSE support
-- macOS: Requires macFUSE
-- Windows: Requires WinFSP (future)
+- Linux: Native FUSE support (✅ fully working)
+- macOS: Requires macFUSE (⏳ planned)
+- Windows: Requires WinFSP (⏳ planned)
 
 ### Scenery Compatibility
 
-XEarthLayer manages its own scenery packs created with Ortho4XP. It is **not** designed to be compatible with:
-- AutoOrtho scenery packs
-- Other third-party orthophoto systems
-
-This allows XEarthLayer to optimize its format and features without legacy constraints.
-
-## Future Enhancements
-
-### Planned Features
-
-- [ ] Pack integrity verification (checksums)
-- [ ] Delta updates (download only changed files)
-- [ ] Pack subscription service
-- [ ] Multi-region pack bundles
-- [ ] Custom regional boundaries
-
-### Under Consideration
-
-- Peer-to-peer pack distribution
-- User-contributed regional packs
-- Integration with Ortho4XP for custom pack creation
+XEarthLayer manages its own scenery packages created with Ortho4XP. Third-party patches (custom airport mesh) are supported via the patches system.
