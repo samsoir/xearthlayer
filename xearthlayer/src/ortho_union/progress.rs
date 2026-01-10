@@ -38,7 +38,7 @@ pub struct IndexBuildProgress {
 }
 
 impl IndexBuildProgress {
-    /// Create a new progress tracker.
+    /// Create a new progress tracker in the discovering phase.
     pub fn new(sources_total: usize) -> Self {
         Self {
             phase: IndexBuildPhase::Discovering,
@@ -61,6 +61,85 @@ impl IndexBuildProgress {
             files_scanned: files_count,
             directories_scanned: 0,
             using_cache: true,
+        }
+    }
+
+    // =========================================================================
+    // Factory methods for creating progress at specific phases
+    // =========================================================================
+
+    /// Create progress for the checking cache phase.
+    pub fn at_checking_cache(sources_total: usize) -> Self {
+        Self::new(sources_total).checking_cache()
+    }
+
+    /// Create progress for starting the scanning phase.
+    pub fn at_scanning_start(sources_total: usize) -> Self {
+        Self {
+            phase: IndexBuildPhase::Scanning,
+            current_source: None,
+            sources_complete: 0,
+            sources_total,
+            files_scanned: 0,
+            directories_scanned: 0,
+            using_cache: false,
+        }
+    }
+
+    /// Create progress for scanning a specific source.
+    pub fn at_scanning_source(
+        source_name: &str,
+        sources_complete: usize,
+        sources_total: usize,
+        files_scanned: usize,
+    ) -> Self {
+        Self {
+            phase: IndexBuildPhase::Scanning,
+            current_source: Some(source_name.to_string()),
+            sources_complete,
+            sources_total,
+            files_scanned,
+            directories_scanned: 0,
+            using_cache: false,
+        }
+    }
+
+    /// Create progress for the merging phase.
+    pub fn at_merging(sources_total: usize, files_scanned: usize) -> Self {
+        Self {
+            phase: IndexBuildPhase::Merging,
+            current_source: None,
+            sources_complete: sources_total,
+            sources_total,
+            files_scanned,
+            directories_scanned: 0,
+            using_cache: false,
+        }
+    }
+
+    /// Create progress for the saving cache phase.
+    pub fn at_saving_cache(sources_total: usize, files_scanned: usize) -> Self {
+        Self {
+            phase: IndexBuildPhase::SavingCache,
+            current_source: None,
+            sources_complete: sources_total,
+            sources_total,
+            files_scanned,
+            directories_scanned: 0,
+            using_cache: false,
+        }
+    }
+
+    /// Create progress for the complete phase.
+    pub fn at_complete(sources_total: usize, files_scanned: usize) -> Self {
+        Self {
+            phase: IndexBuildPhase::Complete,
+            current_source: None,
+            sources_complete: sources_total,
+            sources_total,
+            files_scanned,
+            directories_scanned: 0,
+            using_cache: false,
         }
     }
 

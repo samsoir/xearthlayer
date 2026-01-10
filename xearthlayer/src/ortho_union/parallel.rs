@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use rayon::prelude::*;
 
 use super::index::{DirEntry, FileSource, OrthoUnionIndex};
-use super::progress::{IndexBuildPhase, IndexBuildProgress, IndexBuildProgressCallback};
+use super::progress::{IndexBuildProgress, IndexBuildProgressCallback};
 use super::source::OrthoSource;
 
 /// Result of scanning a single source.
@@ -230,15 +230,7 @@ pub fn scan_sources_parallel(
 
     // Report starting
     if let Some(cb) = progress {
-        cb(IndexBuildProgress {
-            phase: IndexBuildPhase::Scanning,
-            current_source: None,
-            sources_complete: 0,
-            sources_total: total_sources,
-            files_scanned: 0,
-            directories_scanned: 0,
-            using_cache: false,
-        });
+        cb(IndexBuildProgress::at_scanning_start(total_sources));
     }
 
     // Parallel scan using rayon
@@ -248,15 +240,12 @@ pub fn scan_sources_parallel(
         .filter_map(|(idx, source)| {
             // Report starting this source
             if let Some(cb) = progress {
-                cb(IndexBuildProgress {
-                    phase: IndexBuildPhase::Scanning,
-                    current_source: Some(source.display_name.clone()),
-                    sources_complete: completed.load(Ordering::Relaxed),
-                    sources_total: total_sources,
-                    files_scanned: total_files.load(Ordering::Relaxed),
-                    directories_scanned: 0,
-                    using_cache: false,
-                });
+                cb(IndexBuildProgress::at_scanning_source(
+                    &source.display_name,
+                    completed.load(Ordering::Relaxed),
+                    total_sources,
+                    total_files.load(Ordering::Relaxed),
+                ));
             }
 
             // Scan the source
@@ -265,15 +254,12 @@ pub fn scan_sources_parallel(
             // Report completion
             let sources_done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             if let Some(cb) = progress {
-                cb(IndexBuildProgress {
-                    phase: IndexBuildPhase::Scanning,
-                    current_source: Some(source.display_name.clone()),
-                    sources_complete: sources_done,
-                    sources_total: total_sources,
-                    files_scanned: total_files.load(Ordering::Relaxed),
-                    directories_scanned: 0,
-                    using_cache: false,
-                });
+                cb(IndexBuildProgress::at_scanning_source(
+                    &source.display_name,
+                    sources_done,
+                    total_sources,
+                    total_files.load(Ordering::Relaxed),
+                ));
             }
 
             match result {
@@ -303,15 +289,8 @@ pub fn merge_partial_indexes(
 ) -> OrthoUnionIndex {
     // Report merging phase
     if let Some(cb) = progress {
-        cb(IndexBuildProgress {
-            phase: IndexBuildPhase::Merging,
-            current_source: None,
-            sources_complete: sources.len(),
-            sources_total: sources.len(),
-            files_scanned: partial_indexes.iter().map(|p| p.file_count).sum(),
-            directories_scanned: 0,
-            using_cache: false,
-        });
+        let files_scanned: usize = partial_indexes.iter().map(|p| p.file_count).sum();
+        cb(IndexBuildProgress::at_merging(sources.len(), files_scanned));
     }
 
     // Sort by source_idx to ensure priority order

@@ -29,10 +29,12 @@
 mod filesystem;
 mod inode;
 mod ortho_union_fs;
+mod shared;
 mod types;
 mod union_fs;
 
 pub use filesystem::Fuse3PassthroughFS;
 pub use ortho_union_fs::Fuse3OrthoUnionFS;
+pub use shared::{chunk_to_tile_coords, DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
 pub use types::{Fuse3Error, Fuse3Result, MountHandle, SpawnedMountHandle};
 pub use union_fs::Fuse3UnionFS;

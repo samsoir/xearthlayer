@@ -4,18 +4,16 @@
 //! All operations are async and run concurrently on the Tokio runtime.
 
 use super::inode::InodeManager;
+use super::shared::{DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
 use super::types::{Fuse3Error, Fuse3Result, MountHandle};
-use crate::coord::TileCoord;
-use crate::fuse::async_passthrough::{DdsHandler, DdsRequest};
-use crate::fuse::{
-    get_default_placeholder, parse_dds_filename, validate_dds_or_placeholder, DdsFilename,
-};
-use crate::pipeline::{JobId, StorageConcurrencyLimiter};
+use crate::fuse::async_passthrough::DdsHandler;
+use crate::fuse::parse_dds_filename;
+use crate::pipeline::StorageConcurrencyLimiter;
 use crate::prefetch::TileRequestCallback;
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
-    DirectoryEntry, DirectoryEntryPlus, FileAttr, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
+    DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     ReplyInit, ReplyStatFs,
 };
 use fuse3::raw::Filesystem;
@@ -23,38 +21,11 @@ use fuse3::{Errno, MountOptions, Result as Fuse3InternalResult};
 use futures::stream::{self, BoxStream, StreamExt};
 use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::fs;
-use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, trace, warn};
-
-/// Time-to-live for attribute caching.
-const TTL: Duration = Duration::from_secs(1);
-
-/// Configuration for virtual DDS file attributes.
-struct VirtualDdsConfig {
-    /// Expected size of generated DDS files
-    size: u64,
-    /// Block size for filesystem reporting
-    blksize: u32,
-}
-
-impl VirtualDdsConfig {
-    fn new(size: u64) -> Self {
-        Self {
-            size,
-            blksize: 4096,
-        }
-    }
-
-    fn blocks(&self) -> u64 {
-        self.size.div_ceil(self.blksize as u64)
-    }
-}
+use tracing::{debug, trace};
 
 /// Async multi-threaded FUSE filesystem using fuse3.
 ///
@@ -254,146 +225,33 @@ impl Fuse3PassthroughFS {
             mount_path_for_handle,
         ))
     }
+}
 
-    /// Request DDS generation from the async pipeline.
-    ///
-    /// This is fully async - no blocking calls. When the FUSE timeout expires,
-    /// the cancellation token is triggered to abort the pipeline processing,
-    /// releasing resources (HTTP connections, semaphore permits, etc.).
-    async fn request_dds(&self, coords: &DdsFilename) -> Vec<u8> {
-        let job_id = JobId::new();
+// =============================================================================
+// Trait Implementations for Shared FUSE Functionality
+// =============================================================================
 
-        // Convert chunk coordinates to tile coordinates
-        let tile = Self::chunk_to_tile_coords(coords);
+impl FileAttrBuilder for Fuse3PassthroughFS {
+    fn virtual_dds_config(&self) -> &VirtualDdsConfig {
+        &self.virtual_dds_config
+    }
+}
 
-        // Notify tile request callback for FUSE inference (fast, non-blocking)
-        if let Some(ref callback) = self.tile_request_callback {
-            callback(tile);
-        }
-
-        debug!(
-            job_id = %job_id,
-            chunk_row = coords.row,
-            chunk_col = coords.col,
-            chunk_zoom = coords.zoom,
-            tile_row = tile.row,
-            tile_col = tile.col,
-            tile_zoom = tile.zoom,
-            "Requesting DDS generation (fuse3 async)"
-        );
-
-        // Create oneshot channel for response
-        let (tx, rx) = oneshot::channel();
-
-        // Create cancellation token to abort pipeline on timeout
-        let cancellation_token = CancellationToken::new();
-
-        let request = DdsRequest {
-            job_id,
-            tile,
-            result_tx: tx,
-            cancellation_token: cancellation_token.clone(),
-            is_prefetch: false,
-        };
-
-        // Submit request to the handler
-        (self.dds_handler)(request);
-
-        // Await response with timeout (fully async - no blocking!)
-        let data = match tokio::time::timeout(self.generation_timeout, rx).await {
-            Ok(Ok(response)) => {
-                // Log on-demand tile request at debug level (high volume)
-                debug!(
-                    tile_row = tile.row,
-                    tile_col = tile.col,
-                    tile_zoom = tile.zoom,
-                    cache_hit = response.cache_hit,
-                    duration_ms = response.duration.as_millis(),
-                    "On-demand tile request"
-                );
-                response.data
-            }
-            Ok(Err(_)) => {
-                // Channel closed - sender dropped
-                error!(job_id = %job_id, "DDS generation channel closed unexpectedly");
-                // Cancel any in-flight work
-                cancellation_token.cancel();
-                get_default_placeholder()
-            }
-            Err(_) => {
-                // Timeout - cancel the pipeline to release resources
-                warn!(
-                    job_id = %job_id,
-                    timeout_secs = self.generation_timeout.as_secs(),
-                    "DDS generation timed out - cancelling pipeline"
-                );
-                cancellation_token.cancel();
-                get_default_placeholder()
-            }
-        };
-
-        // Critical: Validate DDS before returning to X-Plane
-        // Invalid DDS data causes X-Plane to crash
-        let context = format!("tile({},{},{})", tile.row, tile.col, tile.zoom);
-        validate_dds_or_placeholder(data, &context)
+impl DdsRequestor for Fuse3PassthroughFS {
+    fn dds_handler(&self) -> &DdsHandler {
+        &self.dds_handler
     }
 
-    /// Convert chunk-level coordinates to tile-level coordinates.
-    fn chunk_to_tile_coords(coords: &DdsFilename) -> TileCoord {
-        let tile_zoom = coords.zoom.saturating_sub(4);
-        TileCoord {
-            row: coords.row / 16,
-            col: coords.col / 16,
-            zoom: tile_zoom,
-        }
+    fn generation_timeout(&self) -> Duration {
+        self.generation_timeout
     }
 
-    /// Convert std metadata to fuse3 FileAttr.
-    fn metadata_to_attr(&self, ino: u64, metadata: &std::fs::Metadata) -> FileAttr {
-        let kind = if metadata.is_dir() {
-            FileType::Directory
-        } else if metadata.is_symlink() {
-            FileType::Symlink
-        } else {
-            FileType::RegularFile
-        };
-
-        FileAttr {
-            ino,
-            size: metadata.len(),
-            blocks: metadata.blocks(),
-            atime: metadata.accessed().unwrap_or(UNIX_EPOCH).into(),
-            mtime: metadata.modified().unwrap_or(UNIX_EPOCH).into(),
-            ctime: UNIX_EPOCH.into(), // Creation time not available on all platforms
-            kind,
-            perm: (metadata.mode() & 0o7777) as u16,
-            nlink: metadata.nlink() as u32,
-            uid: metadata.uid(),
-            gid: metadata.gid(),
-            rdev: metadata.rdev() as u32,
-            blksize: 4096,
-        }
+    fn context_label(&self) -> &'static str {
+        "fuse3"
     }
 
-    /// Create attributes for a virtual DDS file.
-    fn virtual_dds_attr(&self, ino: u64) -> FileAttr {
-        let now = SystemTime::now().into();
-
-        FileAttr {
-            ino,
-            size: self.virtual_dds_config.size,
-            blocks: self.virtual_dds_config.blocks(),
-            atime: now,
-            mtime: now,
-            ctime: now,
-            kind: FileType::RegularFile,
-            perm: 0o444, // Read-only
-            nlink: 1,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
-            blksize: self.virtual_dds_config.blksize,
-        }
+    fn tile_request_callback(&self) -> Option<&TileRequestCallback> {
+        self.tile_request_callback.as_ref()
     }
 }
 
@@ -518,7 +376,7 @@ impl Filesystem for Fuse3PassthroughFS {
                 .ok_or(Errno::from(libc::ENOENT))?;
 
             // Request DDS from the async pipeline (fully async!)
-            let data = self.request_dds(&coords).await;
+            let data = self.request_dds_impl(&coords).await;
             let offset = offset as usize;
             let size = size as usize;
 
@@ -688,7 +546,8 @@ impl Filesystem for Fuse3PassthroughFS {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fuse::async_passthrough::DdsResponse;
+    use crate::fuse::async_passthrough::{DdsRequest, DdsResponse};
+    use crate::fuse::DdsFilename;
     use std::sync::Arc;
 
     fn create_test_handler() -> DdsHandler {
@@ -704,6 +563,8 @@ mod tests {
 
     #[test]
     fn test_chunk_to_tile_coords() {
+        use super::super::shared::chunk_to_tile_coords;
+
         let coords = DdsFilename {
             row: 160000,
             col: 84000,
@@ -711,7 +572,7 @@ mod tests {
             map_type: "BI".to_string(),
         };
 
-        let tile = Fuse3PassthroughFS::chunk_to_tile_coords(&coords);
+        let tile = chunk_to_tile_coords(&coords);
 
         assert_eq!(tile.row, 10000); // 160000 / 16
         assert_eq!(tile.col, 5250); // 84000 / 16
@@ -721,8 +582,8 @@ mod tests {
     #[test]
     fn test_virtual_dds_config() {
         let config = VirtualDdsConfig::new(11_174_016);
-        assert_eq!(config.size, 11_174_016);
-        assert_eq!(config.blksize, 4096);
+        assert_eq!(config.size(), 11_174_016);
+        assert_eq!(config.blksize(), 4096);
         // 11_174_016 / 4096 = 2728.125, ceiling = 2729 blocks
         assert_eq!(config.blocks(), 2729);
     }
@@ -742,7 +603,7 @@ mod tests {
             map_type: "BI".to_string(),
         };
 
-        let data = fs.request_dds(&coords).await;
+        let data = fs.request_dds_impl(&coords).await;
 
         // Invalid DDS should be replaced with placeholder
         // Placeholder is 4096×4096 BC1 with 5 mipmaps = 11,174,016 bytes

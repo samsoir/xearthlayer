@@ -28,17 +28,17 @@
 //! missing textures dynamically using its configured imagery provider.
 
 use super::inode::InodeManager;
+use super::shared::{DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
 use super::types::{Fuse3Error, Fuse3Result};
-use crate::coord::TileCoord;
-use crate::fuse::async_passthrough::{DdsHandler, DdsRequest};
-use crate::fuse::{get_default_placeholder, parse_dds_filename, validate_dds_or_placeholder};
+use crate::fuse::async_passthrough::DdsHandler;
+use crate::fuse::{get_default_placeholder, parse_dds_filename};
 use crate::patches::PatchUnionIndex;
-use crate::pipeline::{JobId, StorageConcurrencyLimiter};
+use crate::pipeline::StorageConcurrencyLimiter;
 use crate::prefetch::TileRequestCallback;
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
-    DirectoryEntry, DirectoryEntryPlus, FileAttr, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
+    DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     ReplyInit, ReplyStatFs,
 };
 use fuse3::raw::Filesystem;
@@ -46,38 +46,12 @@ use fuse3::{Errno, MountOptions, Result as Fuse3InternalResult};
 use futures::stream::{self, BoxStream, StreamExt};
 use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::fs;
 use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, trace, warn};
-
-/// Time-to-live for attribute caching.
-const TTL: Duration = Duration::from_secs(1);
-
-/// Configuration for virtual DDS file attributes.
-struct VirtualDdsConfig {
-    /// Expected size of generated DDS files
-    size: u64,
-    /// Block size for filesystem reporting
-    blksize: u32,
-}
-
-impl VirtualDdsConfig {
-    fn new(size: u64) -> Self {
-        Self {
-            size,
-            blksize: 4096,
-        }
-    }
-
-    fn blocks(&self) -> u64 {
-        self.size.div_ceil(self.blksize as u64)
-    }
-}
+use tracing::{debug, trace};
 
 /// Union FUSE filesystem for patch tiles.
 ///
@@ -241,173 +215,40 @@ impl Fuse3UnionFS {
         ))
     }
 
-    /// Request DDS generation from the async pipeline.
+    /// Request DDS generation by filename string.
+    ///
+    /// Wrapper around the trait method that parses the filename first.
     async fn request_dds(&self, name_str: &str) -> Option<Vec<u8>> {
         let coords = parse_dds_filename(name_str).ok()?;
-        let job_id = JobId::new();
+        Some(self.request_dds_impl(&coords).await)
+    }
+}
 
-        // Convert chunk coordinates to tile coordinates
-        let tile = Self::chunk_to_tile_coords(&coords);
+// =============================================================================
+// Trait Implementations for Shared FUSE Functionality
+// =============================================================================
 
-        // Notify tile request callback for FUSE inference
-        if let Some(ref callback) = self.tile_request_callback {
-            callback(tile);
-        }
+impl FileAttrBuilder for Fuse3UnionFS {
+    fn virtual_dds_config(&self) -> &VirtualDdsConfig {
+        &self.virtual_dds_config
+    }
+}
 
-        debug!(
-            job_id = %job_id,
-            chunk_row = coords.row,
-            chunk_col = coords.col,
-            chunk_zoom = coords.zoom,
-            tile_row = tile.row,
-            tile_col = tile.col,
-            tile_zoom = tile.zoom,
-            "Requesting DDS generation (union fs)"
-        );
-
-        let (tx, rx) = oneshot::channel();
-        let cancellation_token = CancellationToken::new();
-
-        let request = DdsRequest {
-            job_id,
-            tile,
-            result_tx: tx,
-            cancellation_token: cancellation_token.clone(),
-            is_prefetch: false,
-        };
-
-        (self.dds_handler)(request);
-
-        let data = match tokio::time::timeout(self.generation_timeout, rx).await {
-            Ok(Ok(response)) => {
-                debug!(
-                    tile_row = tile.row,
-                    tile_col = tile.col,
-                    tile_zoom = tile.zoom,
-                    cache_hit = response.cache_hit,
-                    duration_ms = response.duration.as_millis(),
-                    "Patch DDS generated"
-                );
-                response.data
-            }
-            Ok(Err(_)) => {
-                error!(job_id = %job_id, "DDS generation channel closed unexpectedly");
-                cancellation_token.cancel();
-                get_default_placeholder()
-            }
-            Err(_) => {
-                warn!(
-                    job_id = %job_id,
-                    timeout_secs = self.generation_timeout.as_secs(),
-                    "DDS generation timed out - cancelling pipeline"
-                );
-                cancellation_token.cancel();
-                get_default_placeholder()
-            }
-        };
-
-        let context = format!("patch_tile({},{},{})", tile.row, tile.col, tile.zoom);
-        Some(validate_dds_or_placeholder(data, &context))
+impl DdsRequestor for Fuse3UnionFS {
+    fn dds_handler(&self) -> &DdsHandler {
+        &self.dds_handler
     }
 
-    /// Convert chunk-level coordinates to tile-level coordinates.
-    fn chunk_to_tile_coords(coords: &crate::fuse::DdsFilename) -> TileCoord {
-        let tile_zoom = coords.zoom.saturating_sub(4);
-        TileCoord {
-            row: coords.row / 16,
-            col: coords.col / 16,
-            zoom: tile_zoom,
-        }
+    fn generation_timeout(&self) -> Duration {
+        self.generation_timeout
     }
 
-    /// Convert std metadata to fuse3 FileAttr.
-    fn metadata_to_attr(&self, ino: u64, metadata: &std::fs::Metadata) -> FileAttr {
-        let kind = if metadata.is_dir() {
-            FileType::Directory
-        } else if metadata.is_symlink() {
-            FileType::Symlink
-        } else {
-            FileType::RegularFile
-        };
-
-        FileAttr {
-            ino,
-            size: metadata.len(),
-            blocks: metadata.blocks(),
-            atime: metadata.accessed().unwrap_or(UNIX_EPOCH).into(),
-            mtime: metadata.modified().unwrap_or(UNIX_EPOCH).into(),
-            ctime: UNIX_EPOCH.into(),
-            kind,
-            perm: (metadata.mode() & 0o7777) as u16,
-            nlink: metadata.nlink() as u32,
-            uid: metadata.uid(),
-            gid: metadata.gid(),
-            rdev: metadata.rdev() as u32,
-            blksize: 4096,
-        }
+    fn context_label(&self) -> &'static str {
+        "union_fs"
     }
 
-    /// Create attributes for a virtual DDS file.
-    fn virtual_dds_attr(&self, ino: u64) -> FileAttr {
-        let now = SystemTime::now().into();
-
-        FileAttr {
-            ino,
-            size: self.virtual_dds_config.size,
-            blocks: self.virtual_dds_config.blocks(),
-            atime: now,
-            mtime: now,
-            ctime: now,
-            kind: FileType::RegularFile,
-            perm: 0o444,
-            nlink: 1,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
-            blksize: self.virtual_dds_config.blksize,
-        }
-    }
-
-    /// Create attributes for the root directory.
-    fn root_dir_attr(&self) -> FileAttr {
-        let now = SystemTime::now().into();
-
-        FileAttr {
-            ino: 1,
-            size: 4096,
-            blocks: 1,
-            atime: now,
-            mtime: now,
-            ctime: now,
-            kind: FileType::Directory,
-            perm: 0o555,
-            nlink: 2,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
-            blksize: 4096,
-        }
-    }
-
-    /// Create attributes for a virtual directory.
-    fn virtual_dir_attr(&self, ino: u64) -> FileAttr {
-        let now = SystemTime::now().into();
-
-        FileAttr {
-            ino,
-            size: 4096,
-            blocks: 1,
-            atime: now,
-            mtime: now,
-            ctime: now,
-            kind: FileType::Directory,
-            perm: 0o555,
-            nlink: 2,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
-            blksize: 4096,
-        }
+    fn tile_request_callback(&self) -> Option<&TileRequestCallback> {
+        self.tile_request_callback.as_ref()
     }
 }
 
@@ -736,8 +577,9 @@ impl Filesystem for Fuse3UnionFS {
 
 #[cfg(test)]
 mod tests {
+    use super::super::shared::chunk_to_tile_coords;
     use super::*;
-    use crate::fuse::async_passthrough::DdsResponse;
+    use crate::fuse::async_passthrough::{DdsRequest, DdsResponse};
     use crate::patches::PatchInfo;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -790,8 +632,8 @@ mod tests {
     #[test]
     fn test_virtual_dds_config() {
         let config = VirtualDdsConfig::new(11_174_016);
-        assert_eq!(config.size, 11_174_016);
-        assert_eq!(config.blksize, 4096);
+        assert_eq!(config.size(), 11_174_016);
+        assert_eq!(config.blksize(), 4096);
         assert_eq!(config.blocks(), 2729);
     }
 
@@ -804,7 +646,7 @@ mod tests {
             map_type: "BI".to_string(),
         };
 
-        let tile = Fuse3UnionFS::chunk_to_tile_coords(&coords);
+        let tile = chunk_to_tile_coords(&coords);
 
         assert_eq!(tile.row, 10000);
         assert_eq!(tile.col, 5250);

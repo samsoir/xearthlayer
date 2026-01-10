@@ -13,7 +13,7 @@ use crate::patches::PatchDiscovery;
 use super::cache::{save_index_cache, try_load_cached_index, IndexCacheKey};
 use super::index::OrthoUnionIndex;
 use super::parallel::{merge_partial_indexes, scan_sources_parallel};
-use super::progress::{IndexBuildPhase, IndexBuildProgress, IndexBuildProgressCallback};
+use super::progress::{IndexBuildProgress, IndexBuildProgressCallback};
 use super::source::OrthoSource;
 
 /// Builder for constructing an [`OrthoUnionIndex`].
@@ -196,15 +196,7 @@ impl OrthoUnionIndexBuilder {
     ) -> std::io::Result<OrthoUnionIndex> {
         // Phase 1: Discover sources
         if let Some(ref cb) = progress {
-            cb(IndexBuildProgress {
-                phase: IndexBuildPhase::Discovering,
-                current_source: None,
-                sources_complete: 0,
-                sources_total: 0,
-                files_scanned: 0,
-                directories_scanned: 0,
-                using_cache: false,
-            });
+            cb(IndexBuildProgress::new(0));
         }
 
         let sources = self.discover_sources()?;
@@ -212,15 +204,7 @@ impl OrthoUnionIndexBuilder {
         // If no sources, return empty index
         if sources.is_empty() {
             if let Some(ref cb) = progress {
-                cb(IndexBuildProgress {
-                    phase: IndexBuildPhase::Complete,
-                    current_source: None,
-                    sources_complete: 0,
-                    sources_total: 0,
-                    files_scanned: 0,
-                    directories_scanned: 0,
-                    using_cache: false,
-                });
+                cb(IndexBuildProgress::at_complete(0, 0));
             }
             return Ok(OrthoUnionIndex::with_sources(sources));
         }
@@ -230,15 +214,7 @@ impl OrthoUnionIndexBuilder {
 
         if let Some(cache_path) = cache_path {
             if let Some(ref cb) = progress {
-                cb(IndexBuildProgress {
-                    phase: IndexBuildPhase::CheckingCache,
-                    current_source: None,
-                    sources_complete: 0,
-                    sources_total: sources.len(),
-                    files_scanned: 0,
-                    directories_scanned: 0,
-                    using_cache: false,
-                });
+                cb(IndexBuildProgress::at_checking_cache(sources.len()));
             }
 
             if let Some(cached_index) = try_load_cached_index(cache_path, &cache_key) {
@@ -249,15 +225,10 @@ impl OrthoUnionIndexBuilder {
                 );
 
                 if let Some(ref cb) = progress {
-                    cb(IndexBuildProgress {
-                        phase: IndexBuildPhase::Complete,
-                        current_source: None,
-                        sources_complete: sources.len(),
-                        sources_total: sources.len(),
-                        files_scanned: cached_index.file_count(),
-                        directories_scanned: 0,
-                        using_cache: true,
-                    });
+                    cb(IndexBuildProgress::cache_hit(
+                        sources.len(),
+                        cached_index.file_count(),
+                    ));
                 }
 
                 return Ok(cached_index);
@@ -281,15 +252,10 @@ impl OrthoUnionIndexBuilder {
         // Phase 5: Save to cache
         if let Some(cache_path) = cache_path {
             if let Some(ref cb) = progress {
-                cb(IndexBuildProgress {
-                    phase: IndexBuildPhase::SavingCache,
-                    current_source: None,
-                    sources_complete: index.source_count(),
-                    sources_total: index.source_count(),
-                    files_scanned: index.file_count(),
-                    directories_scanned: 0,
-                    using_cache: false,
-                });
+                cb(IndexBuildProgress::at_saving_cache(
+                    index.source_count(),
+                    index.file_count(),
+                ));
             }
 
             if let Err(e) = save_index_cache(cache_path, cache_key, &index) {
@@ -301,15 +267,10 @@ impl OrthoUnionIndexBuilder {
 
         // Phase 6: Complete
         if let Some(ref cb) = progress {
-            cb(IndexBuildProgress {
-                phase: IndexBuildPhase::Complete,
-                current_source: None,
-                sources_complete: index.source_count(),
-                sources_total: index.source_count(),
-                files_scanned: index.file_count(),
-                directories_scanned: 0,
-                using_cache: false,
-            });
+            cb(IndexBuildProgress::at_complete(
+                index.source_count(),
+                index.file_count(),
+            ));
         }
 
         Ok(index)
