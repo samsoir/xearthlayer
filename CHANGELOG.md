@@ -7,6 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-01-10
+
+> **Note**: v0.2.11 was skipped due to a release infrastructure issue.
+
+### Added
+
+- **Consolidated FUSE Mounting**: Single mount point for all ortho sources
+  - All ortho packages and patches merged into one FUSE mount (`zzXEL_ortho`)
+  - `OrthoUnionIndex` provides efficient merged index with priority-based collision resolution
+  - Patches (`_patches/*`) always take priority over regional packages
+  - Parallel source scanning via rayon for fast index building
+  - Index caching with automatic mtime-based invalidation
+
+- **Tile Patches Support**: Custom mesh/elevation from airport add-ons
+  - Place scenery folders in `~/.xearthlayer/patches/`
+  - Patches with `Earth nav data/` containing DSF files are automatically discovered
+  - Patches override regional package tiles for the same coordinates
+  - See `docs/dev/index-building-optimization.md` for details
+
+- **Circuit Breaker for Prefetch**: Intelligent prefetch throttling during scene loading
+  - Detects X-Plane scene loading via FUSE request rate spikes
+  - Pauses prefetch when load exceeds threshold to reduce resource contention
+  - Three states: Closed (normal), Open (paused), Half-Open (testing recovery)
+  - Configurable threshold and timing via new config settings
+
+- **Ring-Based Radial Prefetching**: Improved prefetch tile selection
+  - Configurable tile radius for prefetch zone
+  - Shared FUSE load counter across all mounted services
+
+### Fixed
+
+- **DDS Zoom Level Bug**: Fixed incorrect texture generation at wrong zoom levels
+  - Previously hardcoded zoom level 18 for all DDS requests
+  - Now correctly extracts zoom from DDS filename (`{row}_{col}_ZL{zoom}.dds`)
+  - Fixes terrain texture mismatches and visual artifacts
+
+- **Index Building Performance**: Lazy resolution for terrain/textures directories
+  - Skips pre-scanning of large `terrain/` and `textures/` folders
+  - Resolves file paths on-demand during FUSE operations
+  - Dramatically reduces startup time for large scenery packages
+
+### Changed
+
+- **FUSE3 System Architecture**: Major refactoring for maintainability
+  - New shared traits module (`fuse3/shared.rs`)
+  - `FileAttrBuilder` trait for unified metadata conversion
+  - `DdsRequestor` trait for common DDS request handling
+  - Eliminated ~650 lines of duplicated code across FUSE filesystems
+
+- **Prefetch Configuration**: New circuit breaker settings
+  - `prefetch.circuit_breaker_threshold` - FUSE requests/sec to trigger (default: 50)
+  - `prefetch.circuit_breaker_open_ms` - Pause duration in milliseconds (default: 500)
+  - `prefetch.circuit_breaker_half_open_secs` - Recovery test interval (default: 2)
+  - `prefetch.radial_radius` - Tile radius for prefetch zone (default: 120)
+
+- **Log Verbosity**: Moved high-volume tile request logs from INFO to DEBUG
+  - Reduces log noise during normal operation
+  - Use `--debug` flag to see detailed tile request logging
+
+### Removed
+
+- **Deprecated Prefetch Setting**: `prefetch.circuit_breaker_open_secs`
+  - Replaced by `prefetch.circuit_breaker_open_ms` for finer control
+
+### Upgrade Notes
+
+**New `config.ini` settings for v0.2.12:**
+
+```ini
+[prefetch]
+# Circuit breaker settings (pause prefetch during X-Plane scene loading)
+circuit_breaker_threshold = 50     ; FUSE requests/sec threshold
+circuit_breaker_open_ms = 500      ; Pause duration in milliseconds
+circuit_breaker_half_open_secs = 2 ; Recovery test interval
+
+# Radial prefetch tile radius
+radial_radius = 120                ; Tiles in each direction (max: 255)
+```
+
+**Patches directory setup:**
+
+To use custom mesh/elevation from airport add-ons:
+
+1. Create the patches directory: `mkdir -p ~/.xearthlayer/patches/`
+2. Copy your scenery folders into it (e.g., `KDEN_Mesh/`)
+3. Each patch must contain `Earth nav data/` with DSF files
+4. Patches are automatically discovered on next `xearthlayer run`
+
+Run `xearthlayer config upgrade` to automatically add new settings with defaults.
+
 ## [0.2.10] - 2026-01-02
 
 ### Added
@@ -374,7 +464,8 @@ Run `xearthlayer config upgrade` to automatically add new settings with defaults
 - Linux support only (Windows and macOS planned for future releases)
 - Requires FUSE3 for filesystem mounting
 
-[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.2.10...HEAD
+[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.2.12...HEAD
+[0.2.12]: https://github.com/samsoir/xearthlayer/compare/v0.2.10...v0.2.12
 [0.2.10]: https://github.com/samsoir/xearthlayer/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/samsoir/xearthlayer/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/samsoir/xearthlayer/compare/v0.2.7...v0.2.8

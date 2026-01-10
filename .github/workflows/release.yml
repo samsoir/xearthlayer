@@ -52,9 +52,9 @@ jobs:
       - name: Run make verify
         run: make verify
 
-  # Build Linux binary tarball
-  build-linux:
-    name: Build Linux Binary
+  # Build the release binary once for reuse across Linux tarball and Debian package
+  build-binary:
+    name: Build Release Binary
     runs-on: ubuntu-latest
     needs: [verify]
     steps:
@@ -72,10 +72,31 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binary
+          path: target/release/xearthlayer
+
+  # Package Linux binary tarball (uses pre-built binary)
+  package-linux:
+    name: Package Linux Binary
+    runs-on: ubuntu-latest
+    needs: [verify, build-binary]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: release-binary
+          path: target/release
+
       - name: Package binary
         env:
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
         run: |
+          chmod +x target/release/xearthlayer
           mkdir -p dist
           cp target/release/xearthlayer dist/
           cp README.md LICENSE dist/
@@ -88,28 +109,27 @@ jobs:
           name: linux-binary
           path: dist/*.tar.gz
 
-  # Build .deb package for Debian/Ubuntu
-  build-deb:
-    name: Build Debian Package
+  # Build .deb package for Debian/Ubuntu (uses pre-built binary)
+  package-deb:
+    name: Package Debian Package
     runs-on: ubuntu-latest
-    needs: [verify]
+    needs: [verify, build-binary]
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: release-binary
+          path: target/release
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfuse3-dev
+      - name: Make binary executable
+        run: chmod +x target/release/xearthlayer
 
       - name: Install cargo-deb
         run: cargo install cargo-deb
-
-      - name: Build release binary
-        run: cargo build --release
 
       - name: Build .deb package
         run: |
@@ -251,7 +271,7 @@ jobs:
   publish:
     name: Publish Release
     runs-on: ubuntu-latest
-    needs: [verify, build-linux, build-deb, build-rpm, prepare-aur]
+    needs: [verify, package-linux, package-deb, build-rpm, prepare-aur]
     permissions:
       contents: write
     steps:
@@ -298,6 +318,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
         run: |
+          # Delete any existing release for this tag (handles manual releases or retries)
+          if gh release view "${RELEASE_TAG}" &>/dev/null; then
+            echo "Existing release found for ${RELEASE_TAG}, deleting..."
+            gh release delete "${RELEASE_TAG}" --yes
+          fi
+
           # Create draft release (not published yet)
           gh release create "${RELEASE_TAG}" \
             --draft \
@@ -413,25 +439,73 @@ jobs:
             echo "WEBSITE_DISPATCH_TOKEN not set - website notification skipped"
           fi
 
-      - name: Output AUR submission instructions
+      - name: Publish to AUR
         env:
-          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          echo ""
+          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo "=============================================="
+            echo "AUR Package Ready for Manual Submission"
+            echo "=============================================="
+            echo ""
+            echo "AUR_SSH_PRIVATE_KEY secret not configured."
+            echo "The PKGBUILD and .SRCINFO files have been uploaded"
+            echo "as release artifacts (aur-package.zip)."
+            echo ""
+            echo "To publish to AUR manually:"
+            echo "  1. Download 'aur-package.zip' from the release"
+            echo "  2. Clone the AUR repo:"
+            echo "     git clone ssh://aur@aur.archlinux.org/xearthlayer.git"
+            echo "  3. Extract and copy PKGBUILD and .SRCINFO into the repo"
+            echo "  4. Commit and push:"
+            echo "     git add PKGBUILD .SRCINFO"
+            echo "     git commit -m 'Update to ${VERSION}'"
+            echo "     git push"
+            echo ""
+            echo "To enable automatic AUR publishing:"
+            echo "  1. Generate an SSH key: ssh-keygen -t ed25519 -f aur_key -N ''"
+            echo "  2. Add public key to your AUR account"
+            echo "  3. Add private key as AUR_SSH_PRIVATE_KEY secret in GitHub"
+            exit 0
+          fi
+
+          echo "Publishing to AUR..."
+
+          # Setup SSH for AUR
+          mkdir -p ~/.ssh
+          echo "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+
+          # Configure SSH to use the key for AUR
+          cat >> ~/.ssh/config << EOF
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur_key
+            User aur
+            StrictHostKeyChecking accept-new
+          EOF
+
+          # Configure git
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Clone the AUR repository
+          git clone ssh://aur@aur.archlinux.org/xearthlayer.git aur-repo
+
+          # Copy the generated files
+          cp artifacts/aur-package/PKGBUILD aur-repo/
+          cp artifacts/aur-package/.SRCINFO aur-repo/
+
+          # Commit and push
+          cd aur-repo
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${VERSION}"
+          git push
+
           echo "=============================================="
-          echo "AUR Package Ready for Submission"
+          echo "AUR Package Published Successfully!"
           echo "=============================================="
-          echo ""
-          echo "The PKGBUILD and .SRCINFO files have been generated and"
-          echo "uploaded as release artifacts (aur-package.zip)."
-          echo ""
-          echo "To publish to AUR manually:"
-          echo "  1. Download 'aur-package.zip' from the release"
-          echo "  2. Clone the AUR repo:"
-          echo "     git clone ssh://aur@aur.archlinux.org/xearthlayer.git"
-          echo "  3. Extract and copy PKGBUILD and .SRCINFO into the repo"
-          echo "  4. Commit and push:"
-          echo "     git add PKGBUILD .SRCINFO"
-          echo "     git commit -m 'Update to ${VERSION}'"
-          echo "     git push"
+          echo "Package: https://aur.archlinux.org/packages/xearthlayer"
+
+          # Cleanup
+          rm -f ~/.ssh/aur_key
