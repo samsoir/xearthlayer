@@ -1,19 +1,19 @@
 {
-  "version": "0.2.10",
-  "tag": "v0.2.10",
-  "release_date": "2026-01-02",
+  "version": "0.2.12",
+  "tag": "v0.2.12",
+  "release_date": "2026-01-10",
   "homepage": "https://xearthlayer.app",
   "assets": {
     "deb": {
-      "filename": "xearthlayer_0.2.10-1_amd64.deb",
+      "filename": "xearthlayer_0.2.12-1_amd64.deb",
       "description": "Debian/Ubuntu package"
     },
     "rpm": {
-      "filename": "xearthlayer-0.2.10-1.fc43.x86_64.rpm",
+      "filename": "xearthlayer-0.2.12-1.fc43.x86_64.rpm",
       "description": "Fedora/RHEL package"
     },
     "tarball": {
-      "filename": "xearthlayer-v0.2.10-x86_64-linux.tar.gz",
+      "filename": "xearthlayer-v0.2.12-x86_64-linux.tar.gz",
       "description": "Linux binary tarball"
     },
     "aur": {
@@ -21,5 +21,5 @@
       "description": "Arch Linux AUR package"
     }
   },
-  "download_base_url": "https://github.com/samsoir/xearthlayer/releases/download/v0.2.10"
+  "download_base_url": "https://github.com/samsoir/xearthlayer/releases/download/v0.2.12"
 }
