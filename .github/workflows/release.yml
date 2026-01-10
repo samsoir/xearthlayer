@@ -318,6 +318,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
         run: |
+          # Delete any existing release for this tag (handles manual releases or retries)
+          if gh release view "${RELEASE_TAG}" &>/dev/null; then
+            echo "Existing release found for ${RELEASE_TAG}, deleting..."
+            gh release delete "${RELEASE_TAG}" --yes
+          fi
+
           # Create draft release (not published yet)
           gh release create "${RELEASE_TAG}" \
             --draft \
