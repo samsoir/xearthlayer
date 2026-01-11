@@ -1,8 +1,17 @@
 # Async Pipeline Architecture
 
-**Status**: Phase 1-3 complete, Phase 3.1 complete (async HTTP + coalescing), Phase 3.2 complete (HTTP concurrency limiting), Phase 3.3 complete (cancellation support), Phase 3.4 complete (resource concurrency tuning)
+> ⚠️ **DEPRECATED**: This pipeline architecture is superseded by the **Job Executor Framework**
+> as of v0.3.0. The new architecture provides a more flexible, trait-based job/task model with
+> hierarchical job spawning, priority scheduling, and daemon-based orchestration.
+>
+> See [`docs/dev/job-executor-design.md`](./job-executor-design.md) for the replacement architecture.
+>
+> This document is retained for historical reference and understanding of the original design
+> decisions. The legacy pipeline code will be removed in a future release.
+
+**Status**: ~~Phase 1-3 complete~~ **DEPRECATED** - Replaced by Job Executor Framework (v0.3.0)
 **Created**: 2025-12-07
-**Last Updated**: 2025-12-21
+**Last Updated**: 2026-01-11
 
 ## Overview
 
