@@ -24,6 +24,7 @@
 
 use crate::texture::TextureError;
 use image::RgbaImage;
+use std::sync::Arc;
 
 /// Trait for texture encoding strategies.
 ///
@@ -86,6 +87,29 @@ pub trait TextureEncoder: Send + Sync {
     ///
     /// Encoder name (e.g., "DDS BC1", "DDS BC3").
     fn name(&self) -> &str;
+}
+
+/// Blanket implementation for Arc-wrapped encoders.
+///
+/// This allows sharing encoders across threads without changing the adapter pattern.
+/// `Arc<DdsTextureEncoder>` automatically implements `TextureEncoder` by delegating
+/// to the inner encoder.
+impl<T: TextureEncoder + ?Sized> TextureEncoder for Arc<T> {
+    fn encode(&self, image: &RgbaImage) -> Result<Vec<u8>, TextureError> {
+        (**self).encode(image)
+    }
+
+    fn expected_size(&self, width: u32, height: u32) -> usize {
+        (**self).expected_size(width, height)
+    }
+
+    fn extension(&self) -> &str {
+        (**self).extension()
+    }
+
+    fn name(&self) -> &str {
+        (**self).name()
+    }
 }
 
 #[cfg(test)]

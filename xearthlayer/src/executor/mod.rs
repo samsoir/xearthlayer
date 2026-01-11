@@ -104,6 +104,7 @@
 //! - `kill()`: Cancel all tasks immediately
 
 // Module declarations
+mod cache_adapter;
 mod client;
 mod context;
 mod daemon;
@@ -165,3 +166,6 @@ pub use client::{ChannelDdsClient, DdsClient, DdsClientError};
 pub use daemon::{
     DaemonMemoryCache, ExecutorDaemon, ExecutorDaemonConfig, DEFAULT_REQUEST_CHANNEL_CAPACITY,
 };
+
+// Cache adapter (decoupled from pipeline module)
+pub use cache_adapter::ExecutorCacheAdapter;

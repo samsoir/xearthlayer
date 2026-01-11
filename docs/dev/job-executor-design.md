@@ -1437,8 +1437,39 @@ xearthlayer/src/
 ### Phase 5: Wire Up & Remove Legacy (Next)
 
 1. Wire up `XEarthLayerRuntime` in the service layer
-2. Remove legacy pipeline stages and DdsHandler
-3. Integration testing with X-Plane
+2. Decouple traits from pipeline module (see Technical Debt below)
+3. Remove legacy pipeline stages and DdsHandler
+4. Integration testing with X-Plane
+
+### Technical Debt: Pipeline Module Dependencies
+
+The executor/jobs/tasks modules currently depend on traits defined in `pipeline/`:
+
+| Module | Dependencies |
+|--------|--------------|
+| `executor/daemon.rs` | `CoalesceResult`, `RequestCoalescer`, `MemoryCache` (blanket impl) |
+| `executor/resource_pool.rs` | `DiskIoProfile` |
+| `jobs/factory.rs` | `ChunkProvider`, `TextureEncoderAsync`, `MemoryCache`, `DiskCache`, `BlockingExecutor` |
+| `jobs/dds_generate.rs` | Same as factory |
+| `tasks/*.rs` | `ChunkProvider`, `DiskCache`, `BlockingExecutor`, `TextureEncoderAsync`, `ChunkResults`, `PipelineConfig` |
+| `runtime/orchestrator.rs` | `RequestCoalescer` |
+
+**Resolution Plan**:
+
+1. Move core traits to `executor/traits.rs`:
+   - `ChunkProvider`, `DiskCache`, `MemoryCache`, `TextureEncoderAsync`, `BlockingExecutor`
+   - `ChunkResults`, `PipelineConfig` (or inline where used)
+
+2. Move `RequestCoalescer` to `executor/coalescer.rs` or `runtime/coalescer.rs`
+
+3. Move `DiskIoProfile` to `executor/resource_pool.rs` or a config module
+
+4. Keep adapters (`AsyncProviderAdapter`, `ParallelDiskCache`, etc.) in standalone `adapters/` module
+
+5. Delete remaining `pipeline/` module (stages, runner, control_plane)
+
+**Already Decoupled**:
+- `ExecutorCacheAdapter` in `executor/cache_adapter.rs` (replaces `MemoryCacheAdapter` dependency)
 
 ## Success Criteria
 
