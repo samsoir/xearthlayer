@@ -47,8 +47,8 @@ use crate::prefetch::TileRequestCallback;
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
-    DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyInit, ReplyStatFs,
+    DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
+    ReplyEntry, ReplyInit, ReplyOpen, ReplyStatFs,
 };
 use fuse3::raw::Filesystem;
 use fuse3::{Errno, MountOptions, Result as Fuse3InternalResult};
@@ -202,6 +202,8 @@ impl Fuse3OrthoUnionFS {
         let mut mount_options = MountOptions::default();
         mount_options.read_only(true);
         mount_options.force_readdir_plus(false);
+        // Tell kernel we don't implement opendir - it should call readdir directly
+        mount_options.no_open_dir_support(true);
 
         let mount_path = PathBuf::from(mountpoint);
 
@@ -239,6 +241,8 @@ impl Fuse3OrthoUnionFS {
         let mut mount_options = MountOptions::default();
         mount_options.read_only(true);
         mount_options.force_readdir_plus(false);
+        // Tell kernel we don't implement opendir - it should call readdir directly
+        mount_options.no_open_dir_support(true);
 
         let mount_path = PathBuf::from(mountpoint);
         let mount_path_for_handle = mount_path.clone();
@@ -552,7 +556,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         _fh: u64,
         offset: i64,
     ) -> Fuse3InternalResult<ReplyDirectory<Self::DirEntryStream<'_>>> {
-        trace!(ino = ino, offset = offset, "fuse3 ortho union: readdir");
+        tracing::info!(ino = ino, offset = offset, "FUSE readdir called");
 
         // Get virtual path for this directory
         let virtual_path = if ino == 1 {
@@ -625,6 +629,112 @@ impl Filesystem for Fuse3OrthoUnionFS {
         Ok(ReplyDirectory {
             entries: stream::iter(entries).boxed(),
         })
+    }
+
+    async fn readdirplus(
+        &self,
+        _req: Request,
+        ino: u64,
+        _fh: u64,
+        offset: u64,
+        _lock_owner: u64,
+    ) -> Fuse3InternalResult<ReplyDirectoryPlus<Self::DirEntryPlusStream<'_>>> {
+        tracing::info!(ino = ino, offset = offset, "FUSE readdirplus called");
+
+        // Get virtual path for this directory
+        let virtual_path = if ino == 1 {
+            PathBuf::new()
+        } else {
+            self.inode_manager
+                .get_path(ino)
+                .ok_or(Errno::from(libc::ENOENT))?
+        };
+
+        // Verify it's a directory
+        if ino != 1 && !self.index.is_directory(&virtual_path) {
+            return Err(Errno::from(libc::ENOTDIR));
+        }
+
+        let mut entries: Vec<DirectoryEntryPlus> = Vec::new();
+
+        // Add . entry
+        entries.push(DirectoryEntryPlus {
+            inode: ino,
+            generation: 0,
+            kind: FileType::Directory,
+            name: OsString::from("."),
+            offset: 1,
+            attr: self.virtual_dir_attr(ino),
+            entry_ttl: TTL,
+            attr_ttl: TTL,
+        });
+
+        // Parent inode for ..
+        let parent_inode = if ino == 1 {
+            1 // Root's parent is itself
+        } else if let Some(parent) = virtual_path.parent() {
+            if parent.as_os_str().is_empty() {
+                1 // Parent is root
+            } else {
+                self.inode_manager.get_inode(parent).unwrap_or(1)
+            }
+        } else {
+            1
+        };
+
+        entries.push(DirectoryEntryPlus {
+            inode: parent_inode,
+            generation: 0,
+            kind: FileType::Directory,
+            name: OsString::from(".."),
+            offset: 2,
+            attr: self.virtual_dir_attr(parent_inode),
+            entry_ttl: TTL,
+            attr_ttl: TTL,
+        });
+
+        // Get entries from union index
+        let mut entry_offset = 3i64;
+        for dir_entry in self.index.list_directory(&virtual_path) {
+            let child_path = virtual_path.join(&dir_entry.name);
+            let entry_inode = self.inode_manager.get_or_create_inode(&child_path);
+
+            let (kind, attr) = if dir_entry.is_dir {
+                (FileType::Directory, self.virtual_dir_attr(entry_inode))
+            } else {
+                (FileType::RegularFile, self.virtual_dds_attr(entry_inode))
+            };
+
+            entries.push(DirectoryEntryPlus {
+                inode: entry_inode,
+                generation: 0,
+                kind,
+                name: dir_entry.name.clone(),
+                offset: entry_offset,
+                attr,
+                entry_ttl: TTL,
+                attr_ttl: TTL,
+            });
+            entry_offset += 1;
+        }
+
+        // Skip entries based on offset
+        let entries: Vec<_> = entries.into_iter().skip(offset as usize).map(Ok).collect();
+
+        Ok(ReplyDirectoryPlus {
+            entries: stream::iter(entries).boxed(),
+        })
+    }
+
+    async fn opendir(
+        &self,
+        _req: Request,
+        ino: u64,
+        _flags: u32,
+    ) -> Fuse3InternalResult<ReplyOpen> {
+        tracing::info!(ino = ino, "FUSE opendir called");
+        // Return success with fh=0 for stateless directory I/O
+        Ok(ReplyOpen { fh: 0, flags: 0 })
     }
 
     async fn access(&self, _req: Request, _ino: u64, _mask: u32) -> Fuse3InternalResult<()> {

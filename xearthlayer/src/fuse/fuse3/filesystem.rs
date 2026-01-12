@@ -14,7 +14,7 @@ use bytes::Bytes;
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
     DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyInit, ReplyStatFs,
+    ReplyInit, ReplyOpen, ReplyStatFs,
 };
 use fuse3::raw::Filesystem;
 use fuse3::{Errno, MountOptions, Result as Fuse3InternalResult};
@@ -147,6 +147,8 @@ impl Fuse3PassthroughFS {
         let mut mount_options = MountOptions::default();
         mount_options.read_only(true);
         mount_options.force_readdir_plus(false);
+        // Tell kernel we don't implement opendir - it should call readdir directly
+        mount_options.no_open_dir_support(true);
 
         let mount_path = PathBuf::from(mountpoint);
 
@@ -183,6 +185,8 @@ impl Fuse3PassthroughFS {
         let mut mount_options = MountOptions::default();
         mount_options.read_only(true);
         mount_options.force_readdir_plus(false);
+        // Tell kernel we don't implement opendir - it should call readdir directly
+        mount_options.no_open_dir_support(true);
 
         let mount_path = PathBuf::from(mountpoint);
         let mount_path_for_handle = mount_path.clone();
@@ -495,6 +499,18 @@ impl Filesystem for Fuse3PassthroughFS {
         Ok(ReplyDirectory {
             entries: stream::iter(entries).boxed(),
         })
+    }
+
+    /// Open a directory for reading.
+    async fn opendir(
+        &self,
+        _req: Request,
+        ino: u64,
+        _flags: u32,
+    ) -> Fuse3InternalResult<ReplyOpen> {
+        trace!(ino = ino, "fuse3: opendir");
+        // Return success with fh=0 for stateless directory I/O
+        Ok(ReplyOpen { fh: 0, flags: 0 })
     }
 
     /// Check file access permissions.
