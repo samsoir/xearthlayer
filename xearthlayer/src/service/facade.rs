@@ -10,7 +10,7 @@ use crate::cache::MemoryCache;
 use crate::config::DiskIoProfile;
 use crate::coord::to_tile_coords;
 use crate::executor::{DdsClient, ExecutorCacheAdapter, MemoryCacheAdapter};
-use crate::fuse::{create_dds_handler_from_client, DdsHandler, MountHandle, SpawnedMountHandle};
+use crate::fuse::{MountHandle, SpawnedMountHandle};
 use crate::log::Logger;
 use crate::prefetch::{FuseLoadMonitor, TileRequestCallback};
 use crate::provider::{AsyncProviderType, Provider, ProviderConfig};
@@ -437,15 +437,6 @@ impl XEarthLayerService {
         self.config.texture().format()
     }
 
-    /// Create a DDS handler for prefetch operations.
-    ///
-    /// This returns a handler that can be used by the prefetch scheduler
-    /// to submit background tile requests. The handler uses the same
-    /// pipeline as FUSE requests, enabling automatic request coalescing.
-    pub fn create_prefetch_handler(&self) -> DdsHandler {
-        self.create_dds_handler()
-    }
-
     /// Get the raw memory cache for size queries.
     ///
     /// Returns a reference to the shared memory cache, if enabled.
@@ -464,6 +455,17 @@ impl XEarthLayerService {
     /// Returns `None` if caching is disabled.
     pub fn memory_cache_adapter(&self) -> Option<Arc<MemoryCacheAdapter>> {
         self.memory_cache_adapter.clone()
+    }
+
+    /// Get the DDS client for requesting tile generation.
+    ///
+    /// Returns the `DdsClient` that FUSE handlers use to request DDS generation
+    /// from the job executor daemon. This is the modern architecture that replaces
+    /// the legacy `DdsHandler` callback pattern.
+    ///
+    /// Returns `None` if the async provider is not configured (sync-only mode).
+    pub fn dds_client(&self) -> Option<Arc<dyn DdsClient>> {
+        self.dds_client.clone()
     }
 
     /// Set the tile request callback for FUSE-based position inference.
@@ -568,23 +570,6 @@ impl XEarthLayerService {
             .map_err(ServiceError::from)
     }
 
-    /// Create the DDS handler for the async pipeline.
-    ///
-    /// This returns a handler that forwards requests to the job executor
-    /// daemon via the DdsClient. The handler can be used with `Fuse3PassthroughFS`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the DdsClient is not initialized (requires async provider).
-    fn create_dds_handler(&self) -> DdsHandler {
-        let client = self
-            .dds_client
-            .as_ref()
-            .expect("DdsClient not initialized - async provider required");
-
-        create_dds_handler_from_client(Arc::clone(client), self.runtime_handle.clone())
-    }
-
     /// Calculate the expected DDS file size based on encoder configuration.
     ///
     /// Returns the expected file size for a standard 4096×4096 DDS texture
@@ -594,8 +579,17 @@ impl XEarthLayerService {
     }
 
     /// Create a mount configuration for FUSE filesystem.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the DdsClient is not initialized (requires async provider).
     fn create_mount_config(&self) -> FuseMountConfig {
-        let mut config = FuseMountConfig::new(self.create_dds_handler(), self.expected_dds_size())
+        let client = self
+            .dds_client
+            .as_ref()
+            .expect("DdsClient not initialized - async provider required");
+
+        let mut config = FuseMountConfig::new(Arc::clone(client), self.expected_dds_size())
             .with_timeout(Duration::from_secs(
                 self.config.generation_timeout().unwrap_or(30),
             ))

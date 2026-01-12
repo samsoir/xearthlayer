@@ -611,13 +611,21 @@ impl MountManager {
             }
         };
 
-        // Get DdsHandler and runtime from the service
-        let dds_handler = service.create_prefetch_handler();
+        // Get DdsClient and runtime from the service
+        let dds_client = match service.dds_client() {
+            Some(client) => client,
+            None => {
+                return PatchesMountResult::failure(
+                    mountpoint,
+                    "DDS client not available (async provider required)".to_string(),
+                );
+            }
+        };
         let expected_dds_size = service.expected_dds_size();
         let runtime_handle = service.runtime_handle().clone();
 
         // Create and mount the union filesystem
-        let union_fs = Fuse3UnionFS::new(index, dds_handler, expected_dds_size);
+        let union_fs = Fuse3UnionFS::new(index, dds_client, expected_dds_size);
         let mountpoint_str = mountpoint.to_string_lossy();
 
         let mount_result = runtime_handle.block_on(union_fs.mount_spawned(&mountpoint_str));
@@ -824,13 +832,21 @@ impl MountManager {
             }
         };
 
-        // Get DdsHandler and runtime from the service
-        let dds_handler = service.create_prefetch_handler();
+        // Get DdsClient and runtime from the service
+        let dds_client = match service.dds_client() {
+            Some(client) => client,
+            None => {
+                return ConsolidatedOrthoMountResult::failure(
+                    mountpoint,
+                    "DDS client not available (async provider required)".to_string(),
+                );
+            }
+        };
         let expected_dds_size = service.expected_dds_size();
         let runtime_handle = service.runtime_handle().clone();
 
         // Create and mount the consolidated ortho union filesystem
-        let ortho_union_fs = Fuse3OrthoUnionFS::new(index, dds_handler, expected_dds_size);
+        let ortho_union_fs = Fuse3OrthoUnionFS::new(index, dds_client, expected_dds_size);
         let mountpoint_str = mountpoint.to_string_lossy();
 
         let mount_result = runtime_handle.block_on(ortho_union_fs.mount_spawned(&mountpoint_str));

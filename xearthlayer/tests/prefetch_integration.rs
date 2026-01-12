@@ -14,18 +14,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use xearthlayer::coord::{to_tile_coords, TileCoord};
-use xearthlayer::executor::MemoryCache;
-use xearthlayer::fuse::{DdsHandler, DdsRequest};
+use xearthlayer::executor::{DdsClient, DdsClientError, MemoryCache, Priority};
 use xearthlayer::prefetch::config::HeadingAwarePrefetchConfig as HeadingConfig;
 use xearthlayer::prefetch::{
     AircraftState, FuseInferenceConfig, FuseRequestAnalyzer, HeadingAwarePrefetcher,
     HeadingAwarePrefetcherConfig, PrefetcherBuilder, RadialPrefetchConfig, RadialPrefetcher,
     SharedPrefetchStatus,
 };
+use xearthlayer::runtime::{DdsResponse, JobRequest, RequestOrigin};
 
 // ============================================================================
 // Mock Implementations
@@ -105,28 +105,58 @@ impl MemoryCache for MockMemoryCache {
     }
 }
 
-/// Tracking DDS handler that records request counts.
-struct MockDdsHandler {
-    call_count: AtomicUsize,
+/// Mock DDS client that tracks prefetch requests.
+struct MockDdsClient {
+    prefetch_count: AtomicUsize,
 }
 
-impl MockDdsHandler {
+impl MockDdsClient {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            call_count: AtomicUsize::new(0),
+            prefetch_count: AtomicUsize::new(0),
         })
     }
 
     fn call_count(&self) -> usize {
-        self.call_count.load(Ordering::SeqCst)
+        self.prefetch_count.load(Ordering::SeqCst)
+    }
+}
+
+impl DdsClient for MockDdsClient {
+    fn submit(&self, _request: JobRequest) -> Result<(), DdsClientError> {
+        Ok(())
     }
 
-    /// Create a DdsHandler closure that forwards to this mock.
-    fn handler(self: &Arc<Self>) -> DdsHandler {
-        let mock = Arc::clone(self);
-        Arc::new(move |_request: DdsRequest| {
-            mock.call_count.fetch_add(1, Ordering::SeqCst);
-        })
+    fn request_dds(
+        &self,
+        _tile: TileCoord,
+        _cancellation: CancellationToken,
+    ) -> oneshot::Receiver<DdsResponse> {
+        let (tx, rx) = oneshot::channel();
+        drop(tx);
+        rx
+    }
+
+    fn request_dds_with_options(
+        &self,
+        tile: TileCoord,
+        _priority: Priority,
+        _origin: RequestOrigin,
+        cancellation: CancellationToken,
+    ) -> oneshot::Receiver<DdsResponse> {
+        self.request_dds(tile, cancellation)
+    }
+
+    fn prefetch(&self, _tile: TileCoord) {
+        self.prefetch_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn prefetch_with_cancellation(&self, tile: TileCoord, _cancellation: CancellationToken) {
+        self.prefetch(tile);
+    }
+
+    fn is_connected(&self) -> bool {
+        true
     }
 }
 
@@ -181,11 +211,11 @@ fn test_heading_config() -> HeadingAwarePrefetcherConfig {
 #[tokio::test]
 async fn test_telemetry_triggers_prefetch() {
     let cache = Arc::new(MockMemoryCache::new());
-    let handler_mock = MockDdsHandler::new();
-    let handler = handler_mock.handler();
+    let mock_client = MockDdsClient::new();
+    let dds_client: Arc<dyn DdsClient> = Arc::clone(&mock_client) as Arc<dyn DdsClient>;
 
     let config = test_radial_config();
-    let prefetcher = RadialPrefetcher::new(Arc::clone(&cache), handler, config);
+    let prefetcher = RadialPrefetcher::new(Arc::clone(&cache), dds_client.clone(), config);
 
     // Create state channel
     let (tx, rx) = mpsc::channel(32);
@@ -207,7 +237,7 @@ async fn test_telemetry_triggers_prefetch() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Verify tiles were submitted
-    let call_count = handler_mock.call_count();
+    let call_count = mock_client.call_count();
     assert!(
         call_count > 0,
         "Expected prefetch submissions, got {}",
@@ -238,11 +268,11 @@ async fn test_prefetch_skips_cached_tiles() {
         (center_tile.row + 1, center_tile.col, 14),
     ];
     let cache = Arc::new(MockMemoryCache::new().with_cached(&cached_tiles));
-    let handler_mock = MockDdsHandler::new();
-    let handler = handler_mock.handler();
+    let mock_client = MockDdsClient::new();
+    let dds_client: Arc<dyn DdsClient> = Arc::clone(&mock_client) as Arc<dyn DdsClient>;
 
     let config = test_radial_config();
-    let prefetcher = RadialPrefetcher::new(Arc::clone(&cache), handler, config);
+    let prefetcher = RadialPrefetcher::new(Arc::clone(&cache), dds_client.clone(), config);
 
     let (tx, rx) = mpsc::channel(32);
     let token = CancellationToken::new();
@@ -268,7 +298,7 @@ async fn test_prefetch_skips_cached_tiles() {
 
     // Submissions should be less than full grid (some skipped due to cache)
     // For radius=2, full grid is 5x5=25 tiles, minus 2 cached = 23 max
-    let call_count = handler_mock.call_count();
+    let call_count = mock_client.call_count();
     assert!(
         call_count < 25,
         "Expected fewer submissions due to cache hits, got {}",
@@ -283,11 +313,11 @@ async fn test_prefetch_skips_cached_tiles() {
 #[tokio::test]
 async fn test_telemetry_deduplication() {
     let cache = Arc::new(MockMemoryCache::new());
-    let handler_mock = MockDdsHandler::new();
-    let handler = handler_mock.handler();
+    let mock_client = MockDdsClient::new();
+    let dds_client: Arc<dyn DdsClient> = Arc::clone(&mock_client) as Arc<dyn DdsClient>;
 
     let config = test_radial_config();
-    let prefetcher = RadialPrefetcher::new(Arc::clone(&cache), handler, config);
+    let prefetcher = RadialPrefetcher::new(Arc::clone(&cache), dds_client.clone(), config);
 
     let (tx, rx) = mpsc::channel(32);
     let token = CancellationToken::new();
@@ -308,7 +338,7 @@ async fn test_telemetry_deduplication() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Due to TTL tracking, tiles shouldn't be re-submitted
-    let call_count = handler_mock.call_count();
+    let call_count = mock_client.call_count();
 
     // First batch submits ~25 tiles, second batch should be mostly skipped
     // Allow some tolerance for timing variations
@@ -506,15 +536,19 @@ async fn test_fuse_heading_inference() {
 #[tokio::test]
 async fn test_heading_aware_with_telemetry() {
     let cache = Arc::new(MockMemoryCache::new());
-    let handler_mock = MockDdsHandler::new();
-    let handler = handler_mock.handler();
+    let mock_client = MockDdsClient::new();
+    let dds_client: Arc<dyn DdsClient> = Arc::clone(&mock_client) as Arc<dyn DdsClient>;
     let analyzer = Arc::new(FuseRequestAnalyzer::new(FuseInferenceConfig::default()));
     let status = SharedPrefetchStatus::new();
 
     let config = test_heading_config();
-    let prefetcher =
-        HeadingAwarePrefetcher::new(Arc::clone(&cache), handler, config, Arc::clone(&analyzer))
-            .with_shared_status(Arc::clone(&status));
+    let prefetcher = HeadingAwarePrefetcher::new(
+        Arc::clone(&cache),
+        dds_client.clone(),
+        config,
+        Arc::clone(&analyzer),
+    )
+    .with_shared_status(Arc::clone(&status));
 
     let (tx, rx) = mpsc::channel(32);
     let token = CancellationToken::new();
@@ -534,7 +568,7 @@ async fn test_heading_aware_with_telemetry() {
 
     // Should have submitted tiles
     assert!(
-        handler_mock.call_count() > 0,
+        mock_client.call_count() > 0,
         "HeadingAwarePrefetcher should submit tiles with telemetry"
     );
 
@@ -546,16 +580,20 @@ async fn test_heading_aware_with_telemetry() {
 #[tokio::test]
 async fn test_heading_aware_stale_telemetry() {
     let cache = Arc::new(MockMemoryCache::new());
-    let handler_mock = MockDdsHandler::new();
-    let handler = handler_mock.handler();
+    let mock_client = MockDdsClient::new();
+    let dds_client: Arc<dyn DdsClient> = Arc::clone(&mock_client) as Arc<dyn DdsClient>;
     let analyzer = Arc::new(FuseRequestAnalyzer::new(FuseInferenceConfig::default()));
 
     // Use very short stale threshold
     let mut config = test_heading_config();
     config.telemetry_stale_threshold = Duration::from_millis(50);
 
-    let prefetcher =
-        HeadingAwarePrefetcher::new(Arc::clone(&cache), handler, config, Arc::clone(&analyzer));
+    let prefetcher = HeadingAwarePrefetcher::new(
+        Arc::clone(&cache),
+        dds_client.clone(),
+        config,
+        Arc::clone(&analyzer),
+    );
 
     let (tx, rx) = mpsc::channel(32);
     let token = CancellationToken::new();
@@ -573,13 +611,13 @@ async fn test_heading_aware_stale_telemetry() {
 
     // Wait for first cycle
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let first_count = handler_mock.call_count();
+    let first_count = mock_client.call_count();
 
     // Wait for telemetry to become stale and another cycle
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Should still have made submissions (using fallback mode)
-    let final_count = handler_mock.call_count();
+    let final_count = mock_client.call_count();
     assert!(
         final_count >= first_count,
         "Should continue prefetching after telemetry goes stale"
@@ -593,8 +631,8 @@ async fn test_heading_aware_stale_telemetry() {
 #[tokio::test]
 async fn test_fuse_inference_drives_prefetch() {
     let cache = Arc::new(MockMemoryCache::new());
-    let handler_mock = MockDdsHandler::new();
-    let handler = handler_mock.handler();
+    let mock_client = MockDdsClient::new();
+    let dds_client: Arc<dyn DdsClient> = Arc::clone(&mock_client) as Arc<dyn DdsClient>;
     let analyzer = Arc::new(FuseRequestAnalyzer::new(FuseInferenceConfig {
         min_requests_for_inference: 3,
         ..FuseInferenceConfig::default()
@@ -616,8 +654,12 @@ async fn test_fuse_inference_drives_prefetch() {
     config.telemetry_stale_threshold = Duration::from_millis(10);
     config.fuse_confidence_threshold = 0.1; // Low threshold for test
 
-    let prefetcher =
-        HeadingAwarePrefetcher::new(Arc::clone(&cache), handler, config, Arc::clone(&analyzer));
+    let prefetcher = HeadingAwarePrefetcher::new(
+        Arc::clone(&cache),
+        dds_client.clone(),
+        config,
+        Arc::clone(&analyzer),
+    );
 
     let (tx, rx) = mpsc::channel(32);
     let token = CancellationToken::new();
@@ -638,7 +680,7 @@ async fn test_fuse_inference_drives_prefetch() {
 
     // Should have made submissions using FUSE inference or radial fallback
     assert!(
-        handler_mock.call_count() > 0,
+        mock_client.call_count() > 0,
         "Should submit tiles even with stale telemetry"
     );
 
@@ -654,12 +696,12 @@ async fn test_fuse_inference_drives_prefetch() {
 #[tokio::test]
 async fn test_builder_creates_radial_prefetcher() {
     let cache = Arc::new(MockMemoryCache::new());
-    let handler_mock = MockDdsHandler::new();
-    let handler = handler_mock.handler();
+    let mock_client = MockDdsClient::new();
+    let dds_client: Arc<dyn DdsClient> = Arc::clone(&mock_client) as Arc<dyn DdsClient>;
 
     let prefetcher = PrefetcherBuilder::new()
         .memory_cache(cache)
-        .dds_handler(handler)
+        .dds_client(dds_client.clone())
         .strategy("radial")
         .inner_radius_nm(10.0) // Small ring for testing
         .outer_radius_nm(20.0)
@@ -683,7 +725,7 @@ async fn test_builder_creates_radial_prefetcher() {
 
     // Should have made submissions
     assert!(
-        handler_mock.call_count() > 0,
+        mock_client.call_count() > 0,
         "Radial prefetcher should submit tiles"
     );
 
@@ -695,13 +737,13 @@ async fn test_builder_creates_radial_prefetcher() {
 #[tokio::test]
 async fn test_builder_creates_heading_aware_prefetcher() {
     let cache = Arc::new(MockMemoryCache::new());
-    let handler_mock = MockDdsHandler::new();
-    let handler = handler_mock.handler();
+    let mock_client = MockDdsClient::new();
+    let dds_client: Arc<dyn DdsClient> = Arc::clone(&mock_client) as Arc<dyn DdsClient>;
     let status = SharedPrefetchStatus::new();
 
     let prefetcher = PrefetcherBuilder::new()
         .memory_cache(cache)
-        .dds_handler(handler)
+        .dds_client(dds_client.clone())
         .strategy("heading-aware")
         .shared_status(Arc::clone(&status))
         .cone_half_angle(30.0)
@@ -731,7 +773,7 @@ async fn test_builder_creates_heading_aware_prefetcher() {
 
     // Should have made submissions
     assert!(
-        handler_mock.call_count() > 0,
+        mock_client.call_count() > 0,
         "Heading-aware prefetcher should submit tiles"
     );
 
@@ -743,8 +785,8 @@ async fn test_builder_creates_heading_aware_prefetcher() {
 #[tokio::test]
 async fn test_builder_with_external_analyzer() {
     let cache = Arc::new(MockMemoryCache::new());
-    let handler_mock = MockDdsHandler::new();
-    let handler = handler_mock.handler();
+    let mock_client = MockDdsClient::new();
+    let dds_client: Arc<dyn DdsClient> = Arc::clone(&mock_client) as Arc<dyn DdsClient>;
     let analyzer = Arc::new(FuseRequestAnalyzer::new(FuseInferenceConfig::default()));
     let status = SharedPrefetchStatus::new();
 
@@ -759,7 +801,7 @@ async fn test_builder_with_external_analyzer() {
 
     let prefetcher = PrefetcherBuilder::new()
         .memory_cache(cache)
-        .dds_handler(handler)
+        .dds_client(dds_client.clone())
         .strategy("auto")
         .shared_status(Arc::clone(&status))
         .with_fuse_analyzer(Arc::clone(&analyzer))
@@ -787,7 +829,7 @@ async fn test_builder_with_external_analyzer() {
 
     // Should have made tile submissions
     assert!(
-        handler_mock.call_count() > 0,
+        mock_client.call_count() > 0,
         "Should submit tiles with external analyzer"
     );
 
@@ -799,12 +841,12 @@ async fn test_builder_with_external_analyzer() {
 #[tokio::test]
 async fn test_builder_auto_strategy() {
     let cache = Arc::new(MockMemoryCache::new());
-    let handler_mock = MockDdsHandler::new();
-    let handler = handler_mock.handler();
+    let mock_client = MockDdsClient::new();
+    let dds_client: Arc<dyn DdsClient> = Arc::clone(&mock_client) as Arc<dyn DdsClient>;
 
     let prefetcher = PrefetcherBuilder::new()
         .memory_cache(cache)
-        .dds_handler(handler)
+        .dds_client(dds_client.clone())
         .strategy("auto") // Should create HeadingAwarePrefetcher
         .build();
 
@@ -831,7 +873,7 @@ async fn test_builder_auto_strategy() {
 
     // Should have made submissions
     assert!(
-        handler_mock.call_count() > 0,
+        mock_client.call_count() > 0,
         "Auto prefetcher should submit tiles"
     );
 

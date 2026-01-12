@@ -14,8 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace};
 
 use crate::dds::DdsFormat;
-use crate::executor::JobId;
-use crate::fuse::{DdsHandler, DdsRequest};
+use crate::executor::DdsClient;
 
 use super::condition::PrefetchCondition;
 use super::predictor::TilePredictor;
@@ -96,8 +95,8 @@ pub struct PrefetchStatsSnapshot {
 pub struct PrefetchScheduler {
     /// Tile predictor engine.
     predictor: TilePredictor,
-    /// DDS handler for submitting prefetch requests.
-    dds_handler: DdsHandler,
+    /// DDS client for submitting prefetch requests.
+    dds_client: Arc<dyn DdsClient>,
     /// Scheduler configuration.
     config: SchedulerConfig,
     /// Condition for determining if prefetching should be active.
@@ -118,19 +117,19 @@ impl PrefetchScheduler {
     /// # Arguments
     ///
     /// * `predictor` - Tile predictor for calculating tiles to prefetch
-    /// * `dds_handler` - Handler for submitting DDS requests to the pipeline
+    /// * `dds_client` - Client for submitting prefetch requests
     /// * `config` - Scheduler configuration
     /// * `condition` - Condition for determining when prefetching is active
     pub fn new(
         predictor: TilePredictor,
-        dds_handler: DdsHandler,
+        dds_client: Arc<dyn DdsClient>,
         config: SchedulerConfig,
         condition: Box<dyn PrefetchCondition>,
     ) -> Self {
         let stats = Arc::new(PrefetchStats::default());
         Self {
             predictor,
-            dds_handler,
+            dds_client,
             config,
             condition,
             in_flight: HashSet::new(),
@@ -293,17 +292,6 @@ impl PrefetchScheduler {
                 continue;
             }
 
-            // Submit prefetch request - the DDS handler/coalescer will check
-            // memory cache and disk chunk cache, only downloading if needed
-            let (tx, _rx) = tokio::sync::oneshot::channel();
-            let request = DdsRequest {
-                job_id: JobId::auto(),
-                tile,
-                result_tx: tx,
-                cancellation_token: CancellationToken::new(),
-                is_prefetch: true,
-            };
-
             trace!(
                 row = tile.row,
                 col = tile.col,
@@ -311,7 +299,8 @@ impl PrefetchScheduler {
                 "Submitting prefetch request"
             );
 
-            (self.dds_handler)(request);
+            // Submit prefetch request via DdsClient (fire-and-forget)
+            self.dds_client.prefetch(tile);
             self.in_flight.insert(tile_key);
             submitted += 1;
         }
@@ -372,29 +361,75 @@ impl Prefetcher for PrefetchScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coord::TileCoord;
+    use crate::executor::{DdsClientError, Priority};
     use crate::prefetch::{AlwaysActiveCondition, MinimumSpeedCondition, NeverActiveCondition};
+    use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
     use proptest::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
 
-    fn create_test_handler() -> (DdsHandler, Arc<AtomicUsize>) {
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let count_clone = Arc::clone(&call_count);
+    /// Mock DdsClient that counts calls for testing.
+    struct MockDdsClient {
+        call_count: Arc<AtomicUsize>,
+    }
 
-        let handler: DdsHandler = Arc::new(move |_request: DdsRequest| {
-            count_clone.fetch_add(1, Ordering::SeqCst);
-        });
+    impl MockDdsClient {
+        fn new() -> (Arc<Self>, Arc<AtomicUsize>) {
+            let count = Arc::new(AtomicUsize::new(0));
+            let client = Arc::new(Self {
+                call_count: Arc::clone(&count),
+            });
+            (client, count)
+        }
+    }
 
-        (handler, call_count)
+    impl DdsClient for MockDdsClient {
+        fn submit(&self, _request: JobRequest) -> Result<(), DdsClientError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn request_dds(
+            &self,
+            _tile: TileCoord,
+            _cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = oneshot::channel();
+            drop(tx);
+            rx
+        }
+
+        fn request_dds_with_options(
+            &self,
+            tile: TileCoord,
+            _priority: Priority,
+            _origin: RequestOrigin,
+            cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            self.request_dds(tile, cancellation)
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
+    fn create_test_client() -> (Arc<dyn DdsClient>, Arc<AtomicUsize>) {
+        let (client, count) = MockDdsClient::new();
+        (client as Arc<dyn DdsClient>, count)
     }
 
     #[test]
     fn test_scheduler_creation() {
         let predictor = TilePredictor::new(45.0, 100.0, 60.0);
-        let (handler, _) = create_test_handler();
+        let (client, _) = create_test_client();
         let config = SchedulerConfig::default();
         let condition = Box::new(AlwaysActiveCondition);
 
-        let scheduler = PrefetchScheduler::new(predictor, handler, config, condition);
+        let scheduler = PrefetchScheduler::new(predictor, client, config, condition);
 
         assert!(scheduler.in_flight.is_empty());
         assert!(scheduler.last_state.is_none());
@@ -421,11 +456,11 @@ mod tests {
             altitude in 0.0f32..50000.0f32,
         ) {
             let predictor = TilePredictor::new(45.0, 100.0, 60.0);
-            let (handler, call_count) = create_test_handler();
+            let (client, call_count) = create_test_client();
             let config = SchedulerConfig::default();
             let condition = Box::new(NeverActiveCondition);
 
-            let mut scheduler = PrefetchScheduler::new(predictor, handler, config, condition);
+            let mut scheduler = PrefetchScheduler::new(predictor, client, config, condition);
             let state = AircraftState::new(lat, lon, heading, speed, altitude);
             scheduler.process_state(&state);
 
@@ -443,11 +478,11 @@ mod tests {
             altitude in 1000.0f32..50000.0f32,
         ) {
             let predictor = TilePredictor::new(45.0, 100.0, 60.0);
-            let (handler, call_count) = create_test_handler();
+            let (client, call_count) = create_test_client();
             let config = SchedulerConfig::default();
             let condition = Box::new(AlwaysActiveCondition);
 
-            let mut scheduler = PrefetchScheduler::new(predictor, handler, config, condition);
+            let mut scheduler = PrefetchScheduler::new(predictor, client, config, condition);
             let state = AircraftState::new(lat, lon, heading, speed, altitude);
             scheduler.process_state(&state);
 
@@ -465,11 +500,11 @@ mod tests {
             altitude in 0.0f32..50000.0f32,
         ) {
             let predictor = TilePredictor::new(45.0, 100.0, 60.0);
-            let (handler, call_count) = create_test_handler();
+            let (client, call_count) = create_test_client();
             let config = SchedulerConfig::default();
             let condition = Box::new(MinimumSpeedCondition::new(30.0));
 
-            let mut scheduler = PrefetchScheduler::new(predictor, handler, config, condition);
+            let mut scheduler = PrefetchScheduler::new(predictor, client, config, condition);
             let state = AircraftState::new(lat, lon, heading, speed, altitude);
             scheduler.process_state(&state);
 
@@ -487,11 +522,11 @@ mod tests {
             altitude in 1000.0f32..50000.0f32,
         ) {
             let predictor = TilePredictor::new(45.0, 100.0, 60.0);
-            let (handler, call_count) = create_test_handler();
+            let (client, call_count) = create_test_client();
             let config = SchedulerConfig::default();
             let condition = Box::new(MinimumSpeedCondition::new(30.0));
 
-            let mut scheduler = PrefetchScheduler::new(predictor, handler, config, condition);
+            let mut scheduler = PrefetchScheduler::new(predictor, client, config, condition);
             let state = AircraftState::new(lat, lon, heading, speed, altitude);
             scheduler.process_state(&state);
 
@@ -509,12 +544,12 @@ mod tests {
             altitude in 1000.0f32..50000.0f32,
         ) {
             let predictor = TilePredictor::new(45.0, 100.0, 60.0);
-            let (handler, call_count) = create_test_handler();
+            let (client, call_count) = create_test_client();
             let config = SchedulerConfig::default();
             let batch_size = config.batch_size;
             let condition = Box::new(AlwaysActiveCondition);
 
-            let mut scheduler = PrefetchScheduler::new(predictor, handler, config, condition);
+            let mut scheduler = PrefetchScheduler::new(predictor, client, config, condition);
             let state = AircraftState::new(lat, lon, heading, speed, altitude);
             scheduler.process_state(&state);
 

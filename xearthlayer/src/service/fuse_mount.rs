@@ -30,11 +30,13 @@
 //! ```
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::runtime::Handle;
 
-use crate::fuse::{DdsHandler, Fuse3PassthroughFS, MountHandle, SpawnedMountHandle};
+use crate::executor::DdsClient;
+use crate::fuse::{Fuse3PassthroughFS, MountHandle, SpawnedMountHandle};
 use crate::log::Logger;
 use crate::log_info;
 use crate::prefetch::TileRequestCallback;
@@ -42,16 +44,15 @@ use crate::prefetch::TileRequestCallback;
 use super::error::ServiceError;
 
 /// Configuration for FUSE filesystem mounting.
-#[derive(Clone)]
 pub struct FuseMountConfig {
-    /// Handler for DDS generation requests
-    dds_handler: DdsHandler,
+    /// Client for DDS generation requests (daemon architecture)
+    dds_client: Arc<dyn DdsClient>,
     /// Expected size of generated DDS files
     expected_dds_size: usize,
     /// Generation timeout
     timeout: Duration,
     /// Optional logger for diagnostic messages
-    logger: Option<std::sync::Arc<dyn Logger>>,
+    logger: Option<Arc<dyn Logger>>,
     /// Optional callback for tile request tracking (for FUSE-based position inference)
     tile_request_callback: Option<TileRequestCallback>,
 }
@@ -61,11 +62,11 @@ impl FuseMountConfig {
     ///
     /// # Arguments
     ///
-    /// * `dds_handler` - Handler for DDS generation requests
+    /// * `dds_client` - Client for DDS generation requests (daemon architecture)
     /// * `expected_dds_size` - Expected size of generated DDS files in bytes
-    pub fn new(dds_handler: DdsHandler, expected_dds_size: usize) -> Self {
+    pub fn new(dds_client: Arc<dyn DdsClient>, expected_dds_size: usize) -> Self {
         Self {
-            dds_handler,
+            dds_client,
             expected_dds_size,
             timeout: Duration::from_secs(30),
             logger: None,
@@ -144,7 +145,7 @@ impl FuseMountService {
     fn create_filesystem(config: &FuseMountConfig, source_path: PathBuf) -> Fuse3PassthroughFS {
         let mut fs = Fuse3PassthroughFS::new(
             source_path,
-            config.dds_handler.clone(),
+            Arc::clone(&config.dds_client),
             config.expected_dds_size,
         )
         .with_timeout(config.timeout);
@@ -275,17 +276,66 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::tempdir;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio_util::sync::CancellationToken;
 
-    fn create_test_handler() -> DdsHandler {
-        Arc::new(|_req| {
-            // Test handler does nothing
-        })
+    use crate::coord::TileCoord;
+    use crate::executor::{DdsClient, DdsClientError, Priority};
+    use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
+
+    /// Mock DdsClient for testing configuration
+    struct MockDdsClient {
+        tx: mpsc::Sender<TileCoord>,
+    }
+
+    impl MockDdsClient {
+        fn new() -> (Self, mpsc::Receiver<TileCoord>) {
+            let (tx, rx) = mpsc::channel(16);
+            (Self { tx }, rx)
+        }
+    }
+
+    impl DdsClient for MockDdsClient {
+        fn submit(&self, _request: JobRequest) -> Result<(), DdsClientError> {
+            Ok(())
+        }
+
+        fn request_dds(
+            &self,
+            tile: TileCoord,
+            _cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            let _ = self.tx.try_send(tile);
+            let (tx, rx) = oneshot::channel();
+            // Drop tx immediately - tests don't need responses
+            drop(tx);
+            rx
+        }
+
+        fn request_dds_with_options(
+            &self,
+            tile: TileCoord,
+            _priority: Priority,
+            _origin: RequestOrigin,
+            cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            self.request_dds(tile, cancellation)
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
+    fn create_test_client() -> Arc<dyn DdsClient> {
+        let (client, _rx) = MockDdsClient::new();
+        Arc::new(client)
     }
 
     #[test]
     fn test_mount_config_new() {
-        let handler = create_test_handler();
-        let config = FuseMountConfig::new(handler, 4096 * 4096);
+        let client = create_test_client();
+        let config = FuseMountConfig::new(client, 4096 * 4096);
 
         assert_eq!(config.expected_dds_size, 4096 * 4096);
         assert_eq!(config.timeout, Duration::from_secs(30));
@@ -294,8 +344,8 @@ mod tests {
 
     #[test]
     fn test_mount_config_with_timeout() {
-        let handler = create_test_handler();
-        let config = FuseMountConfig::new(handler, 1024).with_timeout(Duration::from_secs(60));
+        let client = create_test_client();
+        let config = FuseMountConfig::new(client, 1024).with_timeout(Duration::from_secs(60));
 
         assert_eq!(config.timeout, Duration::from_secs(60));
     }

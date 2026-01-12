@@ -39,8 +39,7 @@
 use super::inode::InodeManager;
 use super::shared::{DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
 use super::types::{Fuse3Error, Fuse3Result};
-use crate::executor::StorageConcurrencyLimiter;
-use crate::fuse::async_passthrough::DdsHandler;
+use crate::executor::{DdsClient, StorageConcurrencyLimiter};
 use crate::fuse::{get_default_placeholder, parse_dds_filename};
 use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::TileRequestCallback;
@@ -90,8 +89,8 @@ use tracing::{debug, trace};
 pub struct Fuse3OrthoUnionFS {
     /// Union index mapping virtual paths to real file locations
     index: Arc<OrthoUnionIndex>,
-    /// Handler for DDS generation requests
-    dds_handler: DdsHandler,
+    /// Client for DDS generation requests (new daemon architecture)
+    dds_client: Arc<dyn DdsClient>,
     /// Inode manager for path mappings
     inode_manager: InodeManager,
     /// Configuration for virtual DDS attributes
@@ -110,15 +109,19 @@ impl Fuse3OrthoUnionFS {
     /// # Arguments
     ///
     /// * `index` - Pre-built union index of all ortho sources
-    /// * `dds_handler` - Handler for DDS generation requests
+    /// * `dds_client` - Client for DDS generation requests (daemon architecture)
     /// * `expected_dds_size` - Expected size of generated DDS files
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let fs = Fuse3OrthoUnionFS::new(index, dds_handler, 11_174_016);
+    /// let fs = Fuse3OrthoUnionFS::new(index, dds_client, 11_174_016);
     /// ```
-    pub fn new(index: OrthoUnionIndex, dds_handler: DdsHandler, expected_dds_size: usize) -> Self {
+    pub fn new(
+        index: OrthoUnionIndex,
+        dds_client: Arc<dyn DdsClient>,
+        expected_dds_size: usize,
+    ) -> Self {
         let disk_io_limiter = Arc::new(StorageConcurrencyLimiter::with_defaults(
             "ortho_union_disk_io",
         ));
@@ -134,7 +137,7 @@ impl Fuse3OrthoUnionFS {
 
         Self {
             index: Arc::new(index),
-            dds_handler,
+            dds_client,
             inode_manager: InodeManager::new(virtual_root),
             virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
             generation_timeout: Duration::from_secs(30),
@@ -149,7 +152,7 @@ impl Fuse3OrthoUnionFS {
     /// filesystems or customize the concurrency limits.
     pub fn with_disk_io_limiter(
         index: OrthoUnionIndex,
-        dds_handler: DdsHandler,
+        dds_client: Arc<dyn DdsClient>,
         expected_dds_size: usize,
         disk_io_limiter: Arc<StorageConcurrencyLimiter>,
     ) -> Self {
@@ -157,7 +160,7 @@ impl Fuse3OrthoUnionFS {
 
         Self {
             index: Arc::new(index),
-            dds_handler,
+            dds_client,
             inode_manager: InodeManager::new(virtual_root),
             virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
             generation_timeout: Duration::from_secs(30),
@@ -295,8 +298,8 @@ impl FileAttrBuilder for Fuse3OrthoUnionFS {
 }
 
 impl DdsRequestor for Fuse3OrthoUnionFS {
-    fn dds_handler(&self) -> &DdsHandler {
-        &self.dds_handler
+    fn dds_client(&self) -> &Arc<dyn DdsClient> {
+        &self.dds_client
     }
 
     fn generation_timeout(&self) -> Duration {
@@ -779,22 +782,80 @@ impl Filesystem for Fuse3OrthoUnionFS {
 mod tests {
     use super::super::shared::chunk_to_tile_coords;
     use super::*;
-    use crate::fuse::async_passthrough::{DdsRequest, DdsResponse};
+    use crate::coord::TileCoord;
+    use crate::executor::{DdsClientError, Priority};
     use crate::ortho_union::OrthoUnionIndexBuilder;
     use crate::package::{InstalledPackage, Package, PackageType};
+    use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
     use semver::Version;
     use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio_util::sync::CancellationToken;
 
-    fn create_test_handler() -> DdsHandler {
-        Arc::new(|req: DdsRequest| {
-            let response = DdsResponse {
-                data: vec![0xDD, 0x53, 0x20, 0x00],
-                cache_hit: false,
-                duration: Duration::from_millis(100),
+    /// Mock DdsClient for testing
+    struct MockDdsClient {
+        tx: mpsc::Sender<JobRequest>,
+    }
+
+    impl MockDdsClient {
+        fn new() -> (Arc<Self>, mpsc::Receiver<JobRequest>) {
+            let (tx, rx) = mpsc::channel(10);
+            (Arc::new(Self { tx }), rx)
+        }
+    }
+
+    impl DdsClient for MockDdsClient {
+        fn submit(&self, request: JobRequest) -> Result<(), DdsClientError> {
+            self.tx
+                .try_send(request)
+                .map_err(|_| DdsClientError::ChannelClosed)
+        }
+
+        fn request_dds(
+            &self,
+            tile: TileCoord,
+            cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            let (tx, rx) = oneshot::channel();
+            let request = JobRequest {
+                tile,
+                priority: Priority::ON_DEMAND,
+                cancellation,
+                response_tx: Some(tx),
+                origin: RequestOrigin::Fuse,
             };
-            let _ = req.result_tx.send(response);
-        })
+            let _ = self.tx.try_send(request);
+            rx
+        }
+
+        fn request_dds_with_options(
+            &self,
+            tile: TileCoord,
+            priority: Priority,
+            origin: RequestOrigin,
+            cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            let (tx, rx) = oneshot::channel();
+            let request = JobRequest {
+                tile,
+                priority,
+                cancellation,
+                response_tx: Some(tx),
+                origin,
+            };
+            let _ = self.tx.try_send(request);
+            rx
+        }
+
+        fn is_connected(&self) -> bool {
+            !self.tx.is_closed()
+        }
+    }
+
+    fn create_test_client() -> Arc<dyn DdsClient> {
+        let (client, _rx) = MockDdsClient::new();
+        client
     }
 
     fn create_test_patch(temp: &TempDir, name: &str) {
@@ -836,8 +897,8 @@ mod tests {
             .build()
             .unwrap();
 
-        let handler = create_test_handler();
-        let fs = Fuse3OrthoUnionFS::new(index, handler, 1024);
+        let client = create_test_client();
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
 
         assert_eq!(fs.index().source_count(), 1);
         assert!(fs.index().file_count() > 0);
@@ -853,8 +914,8 @@ mod tests {
             .build()
             .unwrap();
 
-        let handler = create_test_handler();
-        let fs = Fuse3OrthoUnionFS::new(index, handler, 1024);
+        let client = create_test_client();
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
 
         assert_eq!(fs.index().source_count(), 1);
         assert!(fs.index().file_count() > 0);
@@ -878,8 +939,8 @@ mod tests {
             .build()
             .unwrap();
 
-        let handler = create_test_handler();
-        let fs = Fuse3OrthoUnionFS::new(index, handler, 1024);
+        let client = create_test_client();
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
 
         // At least 1 source (package is guaranteed)
         assert!(fs.index().source_count() >= 1);
@@ -919,10 +980,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let handler = create_test_handler();
+        let client = create_test_client();
         let limiter = Arc::new(StorageConcurrencyLimiter::with_defaults("test"));
 
-        let fs = Fuse3OrthoUnionFS::with_disk_io_limiter(index, handler, 1024, limiter.clone());
+        let fs = Fuse3OrthoUnionFS::with_disk_io_limiter(index, client, 1024, limiter.clone());
 
         assert!(Arc::ptr_eq(fs.disk_io_limiter(), &limiter));
     }
@@ -937,8 +998,8 @@ mod tests {
             .build()
             .unwrap();
 
-        let handler = create_test_handler();
-        let fs = Fuse3OrthoUnionFS::new(index, handler, 1024).with_timeout(Duration::from_secs(60));
+        let client = create_test_client();
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024).with_timeout(Duration::from_secs(60));
 
         assert_eq!(fs.generation_timeout, Duration::from_secs(60));
     }

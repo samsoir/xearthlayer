@@ -363,7 +363,9 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
             // Get shared memory cache adapter for cache-aware prefetching
             // This is the same adapter instance used by the pipeline
             if let Some(memory_cache) = service.memory_cache_adapter() {
-                let dds_handler = service.create_prefetch_handler();
+                let dds_client = service
+                    .dds_client()
+                    .expect("DDS client should be available");
                 let runtime_handle = service.runtime_handle().clone();
 
                 // Create channels for telemetry data
@@ -429,7 +431,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
                 // Strategies: radial (simple), heading-aware (directional), auto (graceful degradation)
                 let mut builder = PrefetcherBuilder::new()
                     .memory_cache(memory_cache)
-                    .dds_handler(dds_handler)
+                    .dds_client(dds_client)
                     .strategy(&config.prefetch.strategy)
                     .shared_status(Arc::clone(&shared_prefetch_status))
                     .cone_half_angle(config.prefetch.cone_angle)
@@ -966,38 +968,37 @@ fn run_with_dashboard(
                             dashboard.update_prewarm_progress(updated);
                         }
                     }
-                    LibPrewarmProgress::TileLoaded { cache_hit } => {
+                    LibPrewarmProgress::TileSubmitted => {
+                        // Tile was submitted for prefetch (not a cache hit)
                         if let Some(prewarm) = dashboard.prewarm_status().cloned() {
                             let mut updated = prewarm;
-                            updated.tile_loaded(cache_hit);
+                            updated.tile_loaded(false);
                             dashboard.update_prewarm_progress(updated);
                         }
                     }
-                    LibPrewarmProgress::TileFailed => {
-                        // Count as loaded (progress) but not a cache hit
+                    LibPrewarmProgress::TileCached => {
+                        // Tile was already cached (counts as cache hit)
                         if let Some(prewarm) = dashboard.prewarm_status().cloned() {
                             let mut updated = prewarm;
-                            updated.tiles_loaded += 1;
+                            updated.tile_loaded(true);
                             dashboard.update_prewarm_progress(updated);
                         }
                     }
                     LibPrewarmProgress::Complete {
-                        tiles_loaded,
+                        tiles_submitted,
                         cache_hits,
-                        failures,
                     } => {
                         tracing::info!(
-                            tiles_loaded = tiles_loaded,
+                            tiles_submitted = tiles_submitted,
                             cache_hits = cache_hits,
-                            failures = failures,
                             "Prewarm complete"
                         );
                         prewarm_complete = true;
                         prewarm_active = false;
                         dashboard.clear_prewarm_status();
                     }
-                    LibPrewarmProgress::Cancelled { tiles_loaded } => {
-                        tracing::info!(tiles_loaded = tiles_loaded, "Prewarm cancelled");
+                    LibPrewarmProgress::Cancelled { tiles_submitted } => {
+                        tracing::info!(tiles_submitted = tiles_submitted, "Prewarm cancelled");
                         prewarm_complete = true;
                         prewarm_active = false;
                         dashboard.clear_prewarm_status();
@@ -1067,7 +1068,9 @@ fn start_prefetcher(
         return false;
     };
 
-    let dds_handler = service.create_prefetch_handler();
+    let dds_client = service
+        .dds_client()
+        .expect("DDS client should be available");
 
     // Create channels for telemetry data
     let (state_tx, state_rx) = mpsc::channel(32);
@@ -1091,7 +1094,7 @@ fn start_prefetcher(
     // Build prefetcher
     let mut builder = PrefetcherBuilder::new()
         .memory_cache(memory_cache)
-        .dds_handler(dds_handler)
+        .dds_client(dds_client)
         .strategy(&config.prefetch.strategy)
         .shared_status(Arc::clone(prefetch_status))
         .cone_half_angle(config.prefetch.cone_angle)
@@ -1206,18 +1209,20 @@ fn start_prewarm(
         .memory_cache_adapter()
         .ok_or_else(|| "Memory cache not available for prewarm".to_string())?;
 
-    let dds_handler = service.create_prefetch_handler();
+    let dds_client = service
+        .dds_client()
+        .expect("DDS client should be available");
 
     // Create prewarm config
     let prewarm_config = PrewarmConfig {
         radius_nm,
-        max_concurrent: 8,
+        batch_size: 50,
     };
 
     // Create the prewarm prefetcher
     let prewarm = PrewarmPrefetcher::new(
         Arc::clone(scenery_index),
-        dds_handler,
+        dds_client,
         memory_cache,
         prewarm_config,
     );

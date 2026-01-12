@@ -138,7 +138,7 @@ pub fn scan_source_optimized(
                 tracing::debug!(
                     source = %source.display_name,
                     dir = %name_str,
-                    "Skipping non-scenery directory at root"
+                    "Filtering out non-scenery directory at root"
                 );
                 continue;
             }
@@ -173,7 +173,7 @@ pub fn scan_source_optimized(
             tracing::debug!(
                 source = %source.display_name,
                 file = %name_str,
-                "Skipping file at root level"
+                "Filtering out file at root level"
             );
         }
     }

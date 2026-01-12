@@ -18,9 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace};
 
 use crate::coord::{to_tile_coords, TileCoord};
-use crate::executor::DdsClient;
-use crate::executor::{JobId, MemoryCache};
-use crate::fuse::{DdsHandler, DdsRequest};
+use crate::executor::{DdsClient, MemoryCache};
 
 use super::circuit_breaker::CircuitState;
 use super::coordinates::{distance_to_tile, tile_size_nm_at_lat};
@@ -36,9 +34,6 @@ const DEFAULT_OUTER_RADIUS_NM: f32 = 120.0;
 
 /// Default TTL for recently-attempted tiles (don't re-request for this long).
 const DEFAULT_ATTEMPT_TTL: Duration = Duration::from_secs(60);
-
-/// Timeout for prefetch requests (cancel if taking too long).
-const PREFETCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Minimum time between prefetch cycles.
 const MIN_CYCLE_INTERVAL: Duration = Duration::from_secs(2);
@@ -124,10 +119,8 @@ pub struct RadialPrefetchStatsSnapshot {
 pub struct RadialPrefetcher<M: MemoryCache> {
     /// Memory cache for checking what's already cached.
     memory_cache: Arc<M>,
-    /// DDS handler for submitting prefetch requests (legacy).
-    dds_handler: DdsHandler,
-    /// DDS client for the new daemon architecture (preferred if set).
-    dds_client: Option<Arc<dyn DdsClient>>,
+    /// DDS client for submitting prefetch requests.
+    dds_client: Arc<dyn DdsClient>,
     /// Configuration.
     config: RadialPrefetchConfig,
     /// Recently-attempted tiles with timestamp (for TTL tracking).
@@ -148,17 +141,16 @@ impl<M: MemoryCache> RadialPrefetcher<M> {
     /// # Arguments
     ///
     /// * `memory_cache` - The memory cache to check for existing tiles
-    /// * `dds_handler` - Handler for submitting prefetch requests
+    /// * `dds_client` - Client for submitting prefetch requests
     /// * `config` - Prefetch configuration
     pub fn new(
         memory_cache: Arc<M>,
-        dds_handler: DdsHandler,
+        dds_client: Arc<dyn DdsClient>,
         config: RadialPrefetchConfig,
     ) -> Self {
         Self {
             memory_cache,
-            dds_handler,
-            dds_client: None,
+            dds_client,
             config,
             recently_attempted: HashMap::new(),
             stats: Arc::new(RadialPrefetchStats::default()),
@@ -180,16 +172,6 @@ impl<M: MemoryCache> RadialPrefetcher<M> {
     /// and pauses prefetching when X-Plane is actively loading scenery.
     pub fn with_throttler(mut self, throttler: Arc<dyn PrefetchThrottler>) -> Self {
         self.throttler = Some(throttler);
-        self
-    }
-
-    /// Set the DDS client for the new daemon architecture.
-    ///
-    /// When set, the prefetcher will use the DdsClient for submitting
-    /// prefetch requests instead of the legacy DdsHandler callback.
-    /// This enables integration with the new channel-based daemon model.
-    pub fn with_dds_client(mut self, client: Arc<dyn DdsClient>) -> Self {
-        self.dds_client = Some(client);
         self
     }
 
@@ -352,36 +334,11 @@ impl<M: MemoryCache> RadialPrefetcher<M> {
                 row = tile.row,
                 col = tile.col,
                 zoom = tile.zoom,
-                using_daemon = self.dds_client.is_some(),
                 "Submitting prefetch request"
             );
 
-            // Submit prefetch request via DdsClient or legacy DdsHandler
-            if let Some(ref client) = self.dds_client {
-                // New daemon architecture - fire-and-forget prefetch
-                client.prefetch(tile);
-            } else {
-                // Legacy architecture - DdsHandler callback with timeout
-                let cancellation_token = CancellationToken::new();
-                let timeout_token = cancellation_token.clone();
-
-                // Spawn timeout task to cancel the request if it takes too long
-                tokio::spawn(async move {
-                    tokio::time::sleep(PREFETCH_REQUEST_TIMEOUT).await;
-                    timeout_token.cancel();
-                });
-
-                let (tx, _rx) = tokio::sync::oneshot::channel();
-                let request = DdsRequest {
-                    job_id: JobId::auto(),
-                    tile,
-                    result_tx: tx,
-                    cancellation_token,
-                    is_prefetch: true,
-                };
-
-                (self.dds_handler)(request);
-            }
+            // Submit prefetch request via DdsClient (fire-and-forget)
+            self.dds_client.prefetch(tile);
             self.recently_attempted.insert(tile_key, Instant::now());
             submitted += 1;
         }
@@ -555,8 +512,64 @@ impl<M: MemoryCache + 'static> Prefetcher for RadialPrefetcher<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coord::TileCoord;
+    use crate::executor::{DdsClient, DdsClientError, Priority};
+    use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
     use std::collections::HashMap;
-    use tokio::sync::Mutex;
+    use tokio::sync::{oneshot, Mutex};
+    use tokio_util::sync::CancellationToken;
+
+    /// Mock DDS client for testing that tracks prefetch calls.
+    struct MockDdsClient {
+        prefetch_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MockDdsClient {
+        fn new() -> Self {
+            Self {
+                prefetch_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl DdsClient for MockDdsClient {
+        fn submit(&self, _request: JobRequest) -> Result<(), DdsClientError> {
+            Ok(())
+        }
+
+        fn request_dds(
+            &self,
+            _tile: TileCoord,
+            _cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            let (tx, rx) = oneshot::channel();
+            drop(tx);
+            rx
+        }
+
+        fn request_dds_with_options(
+            &self,
+            tile: TileCoord,
+            _priority: Priority,
+            _origin: RequestOrigin,
+            cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            self.request_dds(tile, cancellation)
+        }
+
+        fn prefetch(&self, _tile: TileCoord) {
+            self.prefetch_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn prefetch_with_cancellation(&self, tile: TileCoord, _cancellation: CancellationToken) {
+            self.prefetch(tile);
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
 
     /// Mock memory cache for testing.
     struct MockMemoryCache {
@@ -589,22 +602,17 @@ mod tests {
         }
     }
 
-    fn create_test_handler() -> (DdsHandler, Arc<std::sync::atomic::AtomicUsize>) {
-        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let count_clone = Arc::clone(&call_count);
-
-        let handler: DdsHandler = Arc::new(move |_request: DdsRequest| {
-            count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        });
-
-        (handler, call_count)
+    fn create_test_client() -> (Arc<dyn DdsClient>, Arc<MockDdsClient>) {
+        let client = Arc::new(MockDdsClient::new());
+        let dyn_client: Arc<dyn DdsClient> = Arc::clone(&client) as Arc<dyn DdsClient>;
+        (dyn_client, client)
     }
 
     #[tokio::test]
     async fn test_ttl_prevents_resubmission() {
         // Use a small ring for faster testing
         let cache = Arc::new(MockMemoryCache::new());
-        let (handler, call_count) = create_test_handler();
+        let (dds_client, mock_client) = create_test_client();
         let config = RadialPrefetchConfig {
             inner_radius_nm: 1.0,
             outer_radius_nm: 3.0,
@@ -612,7 +620,7 @@ mod tests {
             attempt_ttl: Duration::from_secs(60),
         };
 
-        let mut prefetcher = RadialPrefetcher::new(cache, handler, config);
+        let mut prefetcher = RadialPrefetcher::new(cache, dds_client, config);
         let state = AircraftState::new(45.0, -122.0, 90.0, 150.0, 10000.0);
 
         // First cycle - should submit requests
@@ -622,12 +630,16 @@ mod tests {
             zoom: 14,
         });
         prefetcher.prefetch_cycle(&state).await;
-        let first_count = call_count.load(std::sync::atomic::Ordering::SeqCst);
+        let first_count = mock_client
+            .prefetch_count
+            .load(std::sync::atomic::Ordering::SeqCst);
         assert!(first_count > 0);
 
         // Second cycle at same position - should skip (no tile movement)
         prefetcher.prefetch_cycle(&state).await;
-        let second_count = call_count.load(std::sync::atomic::Ordering::SeqCst);
+        let second_count = mock_client
+            .prefetch_count
+            .load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
             first_count, second_count,
             "Should skip when aircraft hasn't moved"
@@ -664,14 +676,14 @@ mod tests {
         use super::super::coordinates::distance_to_tile;
 
         let cache = Arc::new(MockMemoryCache::new());
-        let (handler, _) = create_test_handler();
+        let (dds_client, _) = create_test_client();
         let config = RadialPrefetchConfig {
             inner_radius_nm: 85.0,
             outer_radius_nm: 120.0,
             zoom: 14,
             attempt_ttl: Duration::from_secs(60),
         };
-        let prefetcher = RadialPrefetcher::new(cache, handler, config);
+        let prefetcher = RadialPrefetcher::new(cache, dds_client, config);
 
         // Position at mid-latitude (Portland, OR area)
         let lat = 45.5;
@@ -697,14 +709,14 @@ mod tests {
         use super::super::coordinates::distance_to_tile;
 
         let cache = Arc::new(MockMemoryCache::new());
-        let (handler, _) = create_test_handler();
+        let (dds_client, _) = create_test_client();
         let config = RadialPrefetchConfig {
             inner_radius_nm: 85.0,
             outer_radius_nm: 120.0,
             zoom: 14,
             attempt_ttl: Duration::from_secs(60),
         };
-        let prefetcher = RadialPrefetcher::new(cache, handler, config);
+        let prefetcher = RadialPrefetcher::new(cache, dds_client, config);
 
         let lat = 45.5;
         let lon = -122.7;
@@ -739,14 +751,14 @@ mod tests {
         use super::super::coordinates::{distance_to_tile, tile_size_nm_at_lat};
 
         let cache = Arc::new(MockMemoryCache::new());
-        let (handler, _) = create_test_handler();
+        let (dds_client, _) = create_test_client();
         let config = RadialPrefetchConfig {
             inner_radius_nm: 85.0,
             outer_radius_nm: 120.0,
             zoom: 14,
             attempt_ttl: Duration::from_secs(60),
         };
-        let prefetcher = RadialPrefetcher::new(cache, handler, config);
+        let prefetcher = RadialPrefetcher::new(cache, dds_client, config);
 
         // High latitude position (Alaska)
         let lat = 61.0;
@@ -785,14 +797,14 @@ mod tests {
         use super::super::coordinates::distance_to_tile;
 
         let cache = Arc::new(MockMemoryCache::new());
-        let (handler, _) = create_test_handler();
+        let (dds_client, _) = create_test_client();
         let config = RadialPrefetchConfig {
             inner_radius_nm: 85.0,
             outer_radius_nm: 120.0,
             zoom: 14,
             attempt_ttl: Duration::from_secs(60),
         };
-        let prefetcher = RadialPrefetcher::new(cache, handler, config);
+        let prefetcher = RadialPrefetcher::new(cache, dds_client, config);
 
         let lat = 45.5;
         let lon = -122.7;

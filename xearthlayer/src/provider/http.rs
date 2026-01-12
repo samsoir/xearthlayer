@@ -2,6 +2,7 @@
 
 use super::types::ProviderError;
 use std::future::Future;
+use tracing::{debug, trace, warn};
 
 /// Trait for synchronous HTTP client operations.
 ///
@@ -294,15 +295,37 @@ impl Default for AsyncReqwestClient {
 
 impl AsyncHttpClient for AsyncReqwestClient {
     async fn get(&self, url: &str) -> Result<Vec<u8>, ProviderError> {
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| ProviderError::HttpError(format!("Request failed: {}", e)))?;
+        trace!(url = url, "HTTP GET request starting");
+
+        let response = match self.client.get(url).send().await {
+            Ok(resp) => {
+                debug!(
+                    url = url,
+                    status = resp.status().as_u16(),
+                    "HTTP response received"
+                );
+                resp
+            }
+            Err(e) => {
+                warn!(
+                    url = url,
+                    error = %e,
+                    is_connect = e.is_connect(),
+                    is_timeout = e.is_timeout(),
+                    is_request = e.is_request(),
+                    "HTTP request failed"
+                );
+                return Err(ProviderError::HttpError(format!("Request failed: {}", e)));
+            }
+        };
 
         // Check HTTP status
         if !response.status().is_success() {
+            warn!(
+                url = url,
+                status = response.status().as_u16(),
+                "HTTP error status"
+            );
             return Err(ProviderError::HttpError(format!(
                 "HTTP {} from {}",
                 response.status(),
@@ -311,11 +334,19 @@ impl AsyncHttpClient for AsyncReqwestClient {
         }
 
         // Read response body
-        response
-            .bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| ProviderError::HttpError(format!("Failed to read response: {}", e)))
+        match response.bytes().await {
+            Ok(bytes) => {
+                trace!(url = url, bytes = bytes.len(), "HTTP response body read");
+                Ok(bytes.to_vec())
+            }
+            Err(e) => {
+                warn!(url = url, error = %e, "Failed to read response body");
+                Err(ProviderError::HttpError(format!(
+                    "Failed to read response: {}",
+                    e
+                )))
+            }
+        }
     }
 
     async fn get_with_headers(

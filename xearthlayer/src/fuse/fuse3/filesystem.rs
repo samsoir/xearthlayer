@@ -6,8 +6,7 @@
 use super::inode::InodeManager;
 use super::shared::{DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
 use super::types::{Fuse3Error, Fuse3Result, MountHandle};
-use crate::executor::StorageConcurrencyLimiter;
-use crate::fuse::async_passthrough::DdsHandler;
+use crate::executor::{DdsClient, StorageConcurrencyLimiter};
 use crate::fuse::parse_dds_filename;
 use crate::prefetch::TileRequestCallback;
 use bytes::Bytes;
@@ -46,8 +45,8 @@ use tracing::{debug, trace};
 pub struct Fuse3PassthroughFS {
     /// Source directory containing the scenery pack
     source_dir: PathBuf,
-    /// Handler for DDS generation requests
-    dds_handler: DdsHandler,
+    /// Client for DDS generation requests (daemon architecture)
+    dds_client: Arc<dyn DdsClient>,
     /// Inode manager for path/coordinate mappings
     inode_manager: InodeManager,
     /// Configuration for virtual DDS attributes
@@ -68,9 +67,13 @@ impl Fuse3PassthroughFS {
     /// # Arguments
     ///
     /// * `source_dir` - Path to the scenery pack directory
-    /// * `dds_handler` - Handler function for DDS generation requests
+    /// * `dds_client` - Client for DDS generation requests (daemon architecture)
     /// * `expected_dds_size` - Expected size of generated DDS files
-    pub fn new(source_dir: PathBuf, dds_handler: DdsHandler, expected_dds_size: usize) -> Self {
+    pub fn new(
+        source_dir: PathBuf,
+        dds_client: Arc<dyn DdsClient>,
+        expected_dds_size: usize,
+    ) -> Self {
         let disk_io_limiter = Arc::new(StorageConcurrencyLimiter::with_defaults("fuse_disk_io"));
         debug!(
             max_concurrent = disk_io_limiter.max_concurrent(),
@@ -79,7 +82,7 @@ impl Fuse3PassthroughFS {
         Self {
             inode_manager: InodeManager::new(source_dir.clone()),
             source_dir,
-            dds_handler,
+            dds_client,
             virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
             generation_timeout: Duration::from_secs(30),
             disk_io_limiter,
@@ -92,19 +95,19 @@ impl Fuse3PassthroughFS {
     /// # Arguments
     ///
     /// * `source_dir` - Path to the scenery pack directory
-    /// * `dds_handler` - Handler function for DDS generation requests
+    /// * `dds_client` - Client for DDS generation requests (daemon architecture)
     /// * `expected_dds_size` - Expected size of generated DDS files
     /// * `disk_io_limiter` - Custom concurrency limiter for disk I/O operations
     pub fn with_disk_io_limiter(
         source_dir: PathBuf,
-        dds_handler: DdsHandler,
+        dds_client: Arc<dyn DdsClient>,
         expected_dds_size: usize,
         disk_io_limiter: Arc<StorageConcurrencyLimiter>,
     ) -> Self {
         Self {
             inode_manager: InodeManager::new(source_dir.clone()),
             source_dir,
-            dds_handler,
+            dds_client,
             virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
             generation_timeout: Duration::from_secs(30),
             disk_io_limiter,
@@ -242,8 +245,8 @@ impl FileAttrBuilder for Fuse3PassthroughFS {
 }
 
 impl DdsRequestor for Fuse3PassthroughFS {
-    fn dds_handler(&self) -> &DdsHandler {
-        &self.dds_handler
+    fn dds_client(&self) -> &Arc<dyn DdsClient> {
+        &self.dds_client
     }
 
     fn generation_timeout(&self) -> Duration {
@@ -562,19 +565,77 @@ impl Filesystem for Fuse3PassthroughFS {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fuse::async_passthrough::{DdsRequest, DdsResponse};
+    use crate::coord::TileCoord;
+    use crate::executor::{DdsClientError, Priority};
     use crate::fuse::DdsFilename;
+    use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
     use std::sync::Arc;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio_util::sync::CancellationToken;
 
-    fn create_test_handler() -> DdsHandler {
-        Arc::new(|req: DdsRequest| {
-            let response = DdsResponse {
-                data: vec![0xDD, 0x53, 0x20, 0x00], // Invalid DDS (wrong size/magic)
-                cache_hit: false,
-                duration: Duration::from_millis(100),
+    /// Mock DdsClient for testing that returns invalid DDS data
+    struct MockDdsClient {
+        tx: mpsc::Sender<JobRequest>,
+    }
+
+    impl MockDdsClient {
+        fn new() -> (Arc<Self>, mpsc::Receiver<JobRequest>) {
+            let (tx, rx) = mpsc::channel(10);
+            (Arc::new(Self { tx }), rx)
+        }
+    }
+
+    impl DdsClient for MockDdsClient {
+        fn submit(&self, request: JobRequest) -> Result<(), DdsClientError> {
+            self.tx
+                .try_send(request)
+                .map_err(|_| DdsClientError::ChannelClosed)
+        }
+
+        fn request_dds(
+            &self,
+            tile: TileCoord,
+            cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            let (tx, rx) = oneshot::channel();
+            let request = JobRequest {
+                tile,
+                priority: Priority::ON_DEMAND,
+                cancellation,
+                response_tx: Some(tx),
+                origin: RequestOrigin::Fuse,
             };
-            let _ = req.result_tx.send(response);
-        })
+            let _ = self.tx.try_send(request);
+            rx
+        }
+
+        fn request_dds_with_options(
+            &self,
+            tile: TileCoord,
+            priority: Priority,
+            origin: RequestOrigin,
+            cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            let (tx, rx) = oneshot::channel();
+            let request = JobRequest {
+                tile,
+                priority,
+                cancellation,
+                response_tx: Some(tx),
+                origin,
+            };
+            let _ = self.tx.try_send(request);
+            rx
+        }
+
+        fn is_connected(&self) -> bool {
+            !self.tx.is_closed()
+        }
+    }
+
+    fn create_test_client() -> Arc<dyn DdsClient> {
+        let (client, _rx) = MockDdsClient::new();
+        client
     }
 
     #[test]
@@ -605,12 +666,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_request_dds_invalid_returns_placeholder() {
-        // Test that invalid DDS data (wrong size/format) is replaced with placeholder
+    async fn test_request_dds_timeout_returns_placeholder() {
+        // Test that timeout returns placeholder (mock doesn't respond)
         let temp_dir = tempfile::tempdir().unwrap();
-        let handler = create_test_handler(); // Returns only 4 bytes (invalid DDS)
+        let client = create_test_client();
 
-        let fs = Fuse3PassthroughFS::new(temp_dir.path().to_path_buf(), handler, 1024);
+        let fs = Fuse3PassthroughFS::new(temp_dir.path().to_path_buf(), client, 1024)
+            .with_timeout(Duration::from_millis(100)); // Short timeout for test
 
         let coords = DdsFilename {
             row: 160000,
@@ -621,7 +683,7 @@ mod tests {
 
         let data = fs.request_dds_impl(&coords).await;
 
-        // Invalid DDS should be replaced with placeholder
+        // Timeout should return placeholder
         // Placeholder is 4096×4096 BC1 with 5 mipmaps = 11,174,016 bytes
         assert_eq!(data.len(), 11_174_016);
         assert_eq!(&data[0..4], b"DDS "); // Valid DDS magic

@@ -1,40 +1,39 @@
 //! DDS generation job implementation.
 //!
 //! [`DdsGenerateJob`] orchestrates the generation of a single DDS texture file
-//! from satellite imagery. It creates a sequence of tasks:
+//! from satellite imagery. It creates two sequential tasks:
 //!
 //! 1. [`DownloadChunksTask`] - Downloads 256 chunks (16×16) from imagery provider
-//! 2. [`AssembleImageTask`] - Assembles chunks into a 4096×4096 RGBA image
-//! 3. [`EncodeDdsTask`] - Encodes the image to DDS format with mipmaps
-//! 4. [`CacheWriteTask`] - Writes the DDS data to memory cache
+//! 2. [`BuildAndCacheDdsTask`] - Assembles, encodes, and caches the DDS tile
 //!
 //! # Resource Dependencies
 //!
 //! Each task receives only the resources it needs (explicit dependency injection):
 //! - Download: provider, disk_cache
-//! - Assemble: executor (for spawn_blocking)
-//! - Encode: encoder, executor
-//! - Cache: memory_cache
+//! - BuildAndCache: encoder, memory_cache, executor
 
 use crate::coord::TileCoord;
 use crate::executor::{
     BlockingExecutor, ChunkProvider, DiskCache, MemoryCache, TextureEncoderAsync,
 };
 use crate::executor::{ErrorPolicy, Job, JobId, JobResult, JobStatus, Priority, Task};
-use crate::tasks::{AssembleImageTask, CacheWriteTask, DownloadChunksTask, EncodeDdsTask};
+use crate::tasks::{BuildAndCacheDdsTask, DownloadChunksTask};
 use std::sync::Arc;
 
 /// Job for generating a single DDS texture from satellite imagery.
 ///
-/// This job coordinates four sequential tasks to transform raw satellite
+/// This job coordinates two sequential tasks to transform raw satellite
 /// imagery chunks into a complete DDS texture with mipmaps.
 ///
 /// # Task Flow
 ///
 /// ```text
-/// DownloadChunks → AssembleImage → EncodeDds → CacheWrite
-///     (Network)      (CPU)          (CPU)       (CPU)
+/// DownloadChunks → BuildAndCacheDds
+///    (Network)         (CPU)
 /// ```
+///
+/// The download task runs 256 chunk downloads concurrently. Once complete,
+/// the build task assembles, encodes, and caches the result in a single step.
 ///
 /// # Error Policy
 ///
@@ -177,15 +176,11 @@ where
                 Arc::clone(&self.provider),
                 Arc::clone(&self.disk_cache),
             )),
-            Box::new(AssembleImageTask::new(Arc::clone(&self.executor))),
-            Box::new(EncodeDdsTask::new(
+            Box::new(BuildAndCacheDdsTask::new(
                 self.tile,
                 Arc::clone(&self.encoder),
-                Arc::clone(&self.executor),
-            )),
-            Box::new(CacheWriteTask::new(
-                self.tile,
                 Arc::clone(&self.memory_cache),
+                Arc::clone(&self.executor),
             )),
         ]
     }

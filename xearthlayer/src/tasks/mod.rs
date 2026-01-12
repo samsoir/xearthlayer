@@ -5,7 +5,13 @@
 //!
 //! # DDS Pipeline Tasks
 //!
-//! - [`DownloadChunksTask`] - Downloads satellite imagery chunks (Network)
+//! The DDS pipeline uses two sequential tasks:
+//!
+//! - [`DownloadChunksTask`] - Downloads 256 satellite imagery chunks (Network)
+//! - [`BuildAndCacheDdsTask`] - Assembles, encodes, and caches the DDS tile (CPU)
+//!
+//! # Legacy Tasks (kept for reference/testing)
+//!
 //! - [`AssembleImageTask`] - Assembles chunks into a full image (CPU)
 //! - [`EncodeDdsTask`] - Encodes image to DDS format (CPU)
 //! - [`CacheWriteTask`] - Writes DDS data to memory cache (CPU)
@@ -16,13 +22,11 @@
 //!
 //! # Data Flow
 //!
-//! ## DDS Pipeline
+//! ## DDS Pipeline (optimized 2-task flow)
 //!
 //! ```text
-//! DownloadChunks → "chunks": ChunkResults
-//! AssembleImage  → "image": RgbaImage
-//! EncodeDds      → "dds_data": Vec<u8>
-//! CacheWrite     → (reads "dds_data")
+//! DownloadChunks     → "chunks": ChunkResults
+//! BuildAndCacheDds   → (reads "chunks", writes to memory cache)
 //! ```
 //!
 //! ## Prefetch
@@ -36,23 +40,25 @@
 //!
 //! Each task declares its resource type for the executor's resource pools:
 //! - `DownloadChunksTask`: `ResourceType::Network`
-//! - `AssembleImageTask`: `ResourceType::CPU`
-//! - `EncodeDdsTask`: `ResourceType::CPU`
-//! - `CacheWriteTask`: `ResourceType::CPU`
+//! - `BuildAndCacheDdsTask`: `ResourceType::CPU`
 //! - `GenerateTileListTask`: `ResourceType::CPU`
 
 mod assemble_image;
+mod build_and_cache_dds;
 mod cache_write;
 mod download_chunks;
 mod encode_dds;
 mod generate_tile_list;
 
-// Task types
+// Primary task types
+pub use build_and_cache_dds::BuildAndCacheDdsTask;
+pub use download_chunks::DownloadChunksTask;
+pub use generate_tile_list::GenerateTileListTask;
+
+// Legacy task types (kept for testing/flexibility)
 pub use assemble_image::AssembleImageTask;
 pub use cache_write::CacheWriteTask;
-pub use download_chunks::DownloadChunksTask;
 pub use encode_dds::EncodeDdsTask;
-pub use generate_tile_list::GenerateTileListTask;
 
 // Output keys and helpers
 pub use assemble_image::{get_image_from_output, OUTPUT_KEY_IMAGE};

@@ -12,7 +12,7 @@
 //! let prefetcher = PrefetcherBuilder::new()
 //!     .strategy("auto")
 //!     .memory_cache(memory_cache)
-//!     .dds_handler(handler)
+//!     .dds_client(client)
 //!     .shared_status(status)
 //!     .cone_half_angle(45.0)
 //!     .outer_radius_nm(105.0)
@@ -23,8 +23,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::executor::MemoryCache;
-use crate::fuse::DdsHandler;
+use crate::executor::{DdsClient, MemoryCache};
 
 use super::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use super::config::{FuseInferenceConfig, HeadingAwarePrefetchConfig};
@@ -56,7 +55,7 @@ const DEFAULT_ATTEMPT_TTL_SECS: u64 = 60;
 pub struct PrefetcherBuilder<M: MemoryCache> {
     // Required components
     memory_cache: Option<Arc<M>>,
-    dds_handler: Option<DdsHandler>,
+    dds_client: Option<Arc<dyn DdsClient>>,
 
     // Strategy selection
     strategy: PrefetchStrategy,
@@ -120,7 +119,7 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
     pub fn new() -> Self {
         Self {
             memory_cache: None,
-            dds_handler: None,
+            dds_client: None,
             strategy: PrefetchStrategy::Auto,
             shared_status: None,
             cone_half_angle: 30.0,
@@ -145,9 +144,9 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
         self
     }
 
-    /// Set the DDS handler (required).
-    pub fn dds_handler(mut self, handler: DdsHandler) -> Self {
-        self.dds_handler = Some(handler);
+    /// Set the DDS client for submitting prefetch requests (required).
+    pub fn dds_client(mut self, client: Arc<dyn DdsClient>) -> Self {
+        self.dds_client = Some(client);
         self
     }
 
@@ -240,7 +239,7 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
     ///
     /// let prefetcher = PrefetcherBuilder::new()
     ///     .memory_cache(cache)
-    ///     .dds_handler(handler)
+    ///     .dds_client(client)
     ///     .with_fuse_analyzer(analyzer)
     ///     .build();
     /// ```
@@ -266,7 +265,7 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
     ///
     /// let prefetcher = PrefetcherBuilder::new()
     ///     .memory_cache(cache)
-    ///     .dds_handler(handler)
+    ///     .dds_client(client)
     ///     .with_scenery_index(index)
     ///     .build();
     /// ```
@@ -287,7 +286,7 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
     ///
     /// let prefetcher = PrefetcherBuilder::new()
     ///     .memory_cache(cache)
-    ///     .dds_handler(handler)
+    ///     .dds_client(client)
     ///     .with_throttler(Arc::new(NeverThrottle)) // For testing
     ///     .build();
     /// ```
@@ -321,7 +320,7 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
     ///
     /// let prefetcher = PrefetcherBuilder::new()
     ///     .memory_cache(cache)
-    ///     .dds_handler(handler)
+    ///     .dds_client(client)
     ///     .with_circuit_breaker_throttler(load_monitor, config)
     ///     .build();
     /// ```
@@ -339,14 +338,14 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
     ///
     /// # Panics
     ///
-    /// Panics if required components (memory_cache, dds_handler) are not set.
+    /// Panics if required components (memory_cache, dds_client) are not set.
     pub fn build(self) -> Box<dyn Prefetcher> {
         let memory_cache = self
             .memory_cache
             .expect("memory_cache is required for PrefetcherBuilder");
-        let dds_handler = self
-            .dds_handler
-            .expect("dds_handler is required for PrefetcherBuilder");
+        let dds_client = self
+            .dds_client
+            .expect("dds_client is required for PrefetcherBuilder");
 
         match self.strategy {
             PrefetchStrategy::Radial => {
@@ -358,7 +357,7 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
                     attempt_ttl: Duration::from_secs(self.attempt_ttl_secs),
                 };
 
-                let mut prefetcher = RadialPrefetcher::new(memory_cache, dds_handler, config);
+                let mut prefetcher = RadialPrefetcher::new(memory_cache, dds_client, config);
 
                 if let Some(status) = self.shared_status {
                     prefetcher = prefetcher.with_shared_status(status);
@@ -399,7 +398,7 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
                     .unwrap_or_else(|| Arc::new(FuseRequestAnalyzer::new(fuse_config)));
 
                 let mut prefetcher =
-                    HeadingAwarePrefetcher::new(memory_cache, dds_handler, config, fuse_analyzer);
+                    HeadingAwarePrefetcher::new(memory_cache, dds_client, config, fuse_analyzer);
 
                 if let Some(status) = self.shared_status {
                     prefetcher = prefetcher.with_shared_status(status);

@@ -21,7 +21,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
-use tracing::{debug, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Task that downloads all chunks for a tile.
 ///
@@ -257,6 +257,13 @@ where
         .get(tile.row, tile.col, tile.zoom, chunk_row, chunk_col)
         .await
     {
+        trace!(
+            tile_row = tile.row,
+            tile_col = tile.col,
+            chunk_row = chunk_row,
+            chunk_col = chunk_col,
+            "Chunk cache hit"
+        );
         return Ok(ChunkData {
             row: chunk_row,
             col: chunk_col,
@@ -269,9 +276,29 @@ where
     let global_col = tile.col * 16 + chunk_col as u32;
     let chunk_zoom = tile.zoom + 4;
 
+    trace!(
+        tile = ?tile,
+        chunk_row = chunk_row,
+        chunk_col = chunk_col,
+        global_row = global_row,
+        global_col = global_col,
+        chunk_zoom = chunk_zoom,
+        provider = provider.name(),
+        "Starting chunk download"
+    );
+
     // Try downloading with retries
     let mut last_error = String::new();
     for attempt in 1..=max_retries {
+        debug!(
+            provider = provider.name(),
+            global_row = global_row,
+            global_col = global_col,
+            zoom = chunk_zoom,
+            attempt = attempt,
+            "HTTP download attempt"
+        );
+
         match tokio::time::timeout(
             timeout,
             provider.download_chunk(global_row, global_col, chunk_zoom),
@@ -279,6 +306,16 @@ where
         .await
         {
             Ok(Ok(data)) => {
+                info!(
+                    provider = provider.name(),
+                    global_row = global_row,
+                    global_col = global_col,
+                    zoom = chunk_zoom,
+                    bytes = data.len(),
+                    attempt = attempt,
+                    "Chunk download success"
+                );
+
                 // Cache the chunk (fire and forget)
                 spawn_cache_write(
                     Arc::clone(&disk_cache),
@@ -295,19 +332,40 @@ where
                 });
             }
             Ok(Err(e)) => {
+                warn!(
+                    provider = provider.name(),
+                    global_row = global_row,
+                    global_col = global_col,
+                    zoom = chunk_zoom,
+                    attempt = attempt,
+                    error = %e.message,
+                    retryable = e.is_retryable,
+                    "Chunk download error"
+                );
                 last_error = e.message.clone();
                 if !e.is_retryable {
                     break;
                 }
             }
             Err(_) => {
+                warn!(
+                    provider = provider.name(),
+                    global_row = global_row,
+                    global_col = global_col,
+                    zoom = chunk_zoom,
+                    attempt = attempt,
+                    timeout_secs = timeout.as_secs(),
+                    "Chunk download timeout"
+                );
                 last_error = "timeout".to_string();
             }
         }
 
         // Exponential backoff before retry
         if attempt < max_retries {
-            tokio::time::sleep(Duration::from_millis(100 * (1 << attempt))).await;
+            let backoff = Duration::from_millis(100 * (1 << attempt));
+            trace!(backoff_ms = backoff.as_millis(), "Backoff before retry");
+            tokio::time::sleep(backoff).await;
         }
     }
 

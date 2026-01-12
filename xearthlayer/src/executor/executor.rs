@@ -46,19 +46,20 @@
 //! let result = handle.wait().await;
 //! ```
 
-use super::context::{SpawnedChildJob, TaskContext};
+use super::context::{SharedTaskOutputs, SpawnedChildJob, TaskContext};
 use super::handle::{JobHandle, JobStatus, Signal};
 use super::job::{Job, JobId, JobResult};
 use super::policy::{ErrorPolicy, Priority};
 use super::queue::{PriorityQueue, QueuedTask};
 use super::resource_pool::{ResourcePoolConfig, ResourcePools};
-use super::task::{Task, TaskOutput, TaskResult};
+use super::task::{Task, TaskResult};
 use super::telemetry::{NullTelemetrySink, TelemetryEvent, TelemetrySink};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 
 // =============================================================================
 // Configuration Constants
@@ -231,8 +232,8 @@ struct ActiveJob {
     /// Names of tasks that were cancelled.
     cancelled_tasks: Vec<String>,
 
-    /// Outputs from completed tasks.
-    task_outputs: HashMap<String, TaskOutput>,
+    /// Outputs from completed tasks (shared with task contexts).
+    task_outputs: SharedTaskOutputs,
 
     /// Child jobs that have been spawned.
     child_job_ids: Vec<JobId>,
@@ -270,7 +271,7 @@ impl ActiveJob {
             succeeded_tasks: Vec::new(),
             failed_tasks: Vec::new(),
             cancelled_tasks: Vec::new(),
-            task_outputs: HashMap::new(),
+            task_outputs: Arc::new(std::sync::RwLock::new(HashMap::new())),
             child_job_ids: Vec::new(),
             succeeded_children: Vec::new(),
             failed_children: Vec::new(),
@@ -520,6 +521,13 @@ impl JobExecutor {
         let name = submitted.name.clone();
         let priority = submitted.priority;
 
+        info!(
+            job_id = %job_id,
+            job_name = %name,
+            priority = ?priority,
+            "Job submitted"
+        );
+
         // Emit telemetry
         self.telemetry.emit(TelemetryEvent::JobSubmitted {
             job_id: job_id.clone(),
@@ -539,25 +547,30 @@ impl JobExecutor {
             job_id: job_id.clone(),
         });
 
-        // Enqueue initial tasks
-        let tasks_to_enqueue: Vec<_> = active.pending_tasks.drain(..).collect();
-        let _queue_depth = {
+        // Enqueue ONLY the first task - tasks run sequentially within a job
+        // to ensure proper data flow between dependent tasks
+        let total_tasks = active.pending_tasks.len();
+
+        info!(
+            job_id = %job_id,
+            task_count = total_tasks,
+            "Job started"
+        );
+
+        if let Some(first_task) = active.pending_tasks.drain(..1).next() {
+            let task_name = first_task.name().to_string();
+            let queued = QueuedTask::new(first_task, job_id.clone(), priority);
+
+            self.telemetry.emit(TelemetryEvent::TaskEnqueued {
+                job_id: job_id.clone(),
+                task_name,
+                priority,
+                queue_depth: 0,
+            });
+
             let mut queue = self.task_queue.lock().await;
-            for task in tasks_to_enqueue {
-                let task_name = task.name().to_string();
-                let queued = QueuedTask::new(task, job_id.clone(), priority);
-
-                self.telemetry.emit(TelemetryEvent::TaskEnqueued {
-                    job_id: job_id.clone(),
-                    task_name,
-                    priority,
-                    queue_depth: queue.len(),
-                });
-
-                queue.push(queued);
-            }
-            queue.len()
-        };
+            queue.push(queued);
+        }
 
         // Store active job
         let mut jobs = self.active_jobs.lock().await;
@@ -623,11 +636,12 @@ impl JobExecutor {
                         continue;
                     }
 
-                    // Create task context
+                    // Create task context with shared reference to accumulated outputs
                     let ctx = TaskContext::with_child_sender(
                         job_id.clone(),
                         job.cancellation.clone(),
                         job.child_job_tx.clone(),
+                        Arc::clone(&job.task_outputs),
                     );
                     (true, ctx)
                 } else {
@@ -650,6 +664,13 @@ impl JobExecutor {
 
             self.dispatched_count += 1;
             let task_name = task.name().to_string();
+
+            info!(
+                job_id = %job_id,
+                task_name = %task_name,
+                resource_type = ?resource_type,
+                "Task started"
+            );
 
             // Emit telemetry
             self.telemetry.emit(TelemetryEvent::TaskStarted {
@@ -700,6 +721,43 @@ impl JobExecutor {
 
         let result_kind = completion.result.kind();
 
+        match &completion.result {
+            TaskResult::Success | TaskResult::SuccessWithOutput(_) => {
+                info!(
+                    job_id = %completion.job_id,
+                    task_name = %completion.task_name,
+                    duration_ms = completion.duration.as_millis(),
+                    "Task completed successfully"
+                );
+            }
+            TaskResult::Failed(err) => {
+                error!(
+                    job_id = %completion.job_id,
+                    task_name = %completion.task_name,
+                    error = %err,
+                    duration_ms = completion.duration.as_millis(),
+                    "Task failed"
+                );
+            }
+            TaskResult::Retry(err) => {
+                warn!(
+                    job_id = %completion.job_id,
+                    task_name = %completion.task_name,
+                    error = %err,
+                    duration_ms = completion.duration.as_millis(),
+                    "Task needs retry"
+                );
+            }
+            TaskResult::Cancelled => {
+                warn!(
+                    job_id = %completion.job_id,
+                    task_name = %completion.task_name,
+                    duration_ms = completion.duration.as_millis(),
+                    "Task cancelled"
+                );
+            }
+        }
+
         // Emit telemetry
         self.telemetry.emit(TelemetryEvent::TaskCompleted {
             job_id: completion.job_id.clone(),
@@ -716,14 +774,20 @@ impl JobExecutor {
 
         job.tasks_in_flight -= 1;
 
+        // Track whether to enqueue the next task
+        let mut should_enqueue_next = false;
+
         match completion.result {
             TaskResult::Success => {
                 job.succeeded_tasks.push(completion.task_name);
+                should_enqueue_next = true;
             }
             TaskResult::SuccessWithOutput(output) => {
-                job.task_outputs
-                    .insert(completion.task_name.clone(), output);
+                if let Ok(mut outputs) = job.task_outputs.write() {
+                    outputs.insert(completion.task_name.clone(), output);
+                }
                 job.succeeded_tasks.push(completion.task_name);
+                should_enqueue_next = true;
             }
             TaskResult::Failed(_error) => {
                 // Check if we should retry
@@ -738,6 +802,7 @@ impl JobExecutor {
                     job.update_status(status);
                     job.cancellation.cancel();
                 }
+                // Don't enqueue next task on failure
             }
             TaskResult::Retry(_error) => {
                 // For now, treat retry as failure
@@ -750,10 +815,47 @@ impl JobExecutor {
                     attempt: 1,
                     delay: Duration::from_millis(100),
                 });
+                // Don't enqueue next task on retry/failure
             }
             TaskResult::Cancelled => {
                 job.cancelled_tasks.push(completion.task_name);
+                // Don't enqueue next task on cancellation
             }
+        }
+
+        // Sequential task execution: enqueue the next pending task on success
+        let next_task_info = if should_enqueue_next && !job.pending_tasks.is_empty() {
+            let next_task = job.pending_tasks.remove(0);
+            let priority = job.priority;
+            Some((next_task, priority))
+        } else {
+            None
+        };
+
+        // Release jobs lock before acquiring task_queue lock to avoid deadlock
+        let job_id_for_enqueue = completion.job_id.clone();
+        drop(jobs);
+
+        // Enqueue the next task if available
+        if let Some((task, priority)) = next_task_info {
+            let task_name = task.name().to_string();
+            let queued = QueuedTask::new(task, job_id_for_enqueue.clone(), priority);
+
+            info!(
+                job_id = %job_id_for_enqueue,
+                task_name = %task_name,
+                "Enqueuing next sequential task"
+            );
+
+            self.telemetry.emit(TelemetryEvent::TaskEnqueued {
+                job_id: job_id_for_enqueue,
+                task_name,
+                priority,
+                queue_depth: 0,
+            });
+
+            let mut queue = self.task_queue.lock().await;
+            queue.push(queued);
         }
 
         self.work_notify.notify_one();
@@ -894,6 +996,35 @@ impl JobExecutor {
                     continue;
                 }
             };
+
+            // Log job completion
+            match final_status {
+                JobStatus::Succeeded => {
+                    info!(
+                        job_id = %job_id,
+                        duration_ms = result.duration.as_millis(),
+                        tasks_succeeded = result.succeeded_tasks.len(),
+                        "Job completed successfully"
+                    );
+                }
+                JobStatus::Failed => {
+                    error!(
+                        job_id = %job_id,
+                        duration_ms = result.duration.as_millis(),
+                        tasks_succeeded = result.succeeded_tasks.len(),
+                        tasks_failed = result.failed_tasks.len(),
+                        "Job failed"
+                    );
+                }
+                _ => {
+                    warn!(
+                        job_id = %job_id,
+                        status = ?final_status,
+                        duration_ms = result.duration.as_millis(),
+                        "Job ended"
+                    );
+                }
+            }
 
             // Emit completion telemetry
             self.telemetry.emit(TelemetryEvent::JobCompleted {

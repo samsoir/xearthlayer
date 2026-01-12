@@ -32,7 +32,11 @@
 use super::job::{Job, JobId};
 use super::task::TaskOutput;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
+
+/// Shared reference to task outputs, allowing multiple readers.
+pub type SharedTaskOutputs = Arc<RwLock<HashMap<String, TaskOutput>>>;
 
 // =============================================================================
 // Task Context
@@ -56,8 +60,8 @@ pub struct TaskContext {
     /// Cancellation token for cooperative cancellation.
     cancellation: CancellationToken,
 
-    /// Outputs from completed tasks, keyed by task name.
-    task_outputs: HashMap<String, TaskOutput>,
+    /// Shared reference to outputs from completed tasks, keyed by task name.
+    task_outputs: SharedTaskOutputs,
 
     /// Channel for spawning child jobs.
     child_job_sender: Option<ChildJobSender>,
@@ -95,7 +99,7 @@ impl TaskContext {
         Self {
             job_id,
             cancellation,
-            task_outputs: HashMap::new(),
+            task_outputs: Arc::new(RwLock::new(HashMap::new())),
             child_job_sender: None,
             spawned_children: 0,
         }
@@ -108,15 +112,17 @@ impl TaskContext {
     /// * `job_id` - The parent job's ID
     /// * `cancellation` - Token for cooperative cancellation
     /// * `child_sender` - Channel for spawning child jobs
+    /// * `task_outputs` - Shared reference to outputs from previously completed tasks
     pub fn with_child_sender(
         job_id: JobId,
         cancellation: CancellationToken,
         child_sender: tokio::sync::mpsc::UnboundedSender<SpawnedChildJob>,
+        task_outputs: SharedTaskOutputs,
     ) -> Self {
         Self {
             job_id,
             cancellation,
-            task_outputs: HashMap::new(),
+            task_outputs,
             child_job_sender: Some(ChildJobSender {
                 sender: child_sender,
             }),
@@ -150,11 +156,16 @@ impl TaskContext {
     /// This is called by the executor after a task completes successfully
     /// with `TaskResult::SuccessWithOutput`.
     #[allow(dead_code)] // Infrastructure for future executor use
-    pub(crate) fn add_task_output(&mut self, task_name: String, output: TaskOutput) {
-        self.task_outputs.insert(task_name, output);
+    pub(crate) fn add_task_output(&self, task_name: String, output: TaskOutput) {
+        if let Ok(mut outputs) = self.task_outputs.write() {
+            outputs.insert(task_name, output);
+        }
     }
 
-    /// Gets a typed value from a previous task's output.
+    /// Gets a cloned value from a previous task's output.
+    ///
+    /// Since task outputs are behind a RwLock, this method clones the value
+    /// to return an owned copy.
     ///
     /// # Arguments
     ///
@@ -163,26 +174,29 @@ impl TaskContext {
     ///
     /// # Returns
     ///
-    /// The value if it exists and has the correct type, `None` otherwise.
+    /// A cloned copy of the value if it exists and has the correct type, `None` otherwise.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let chunks: Option<&Vec<Bytes>> = ctx.get_output("DownloadChunks", "data");
+    /// let chunks: Option<ChunkResults> = ctx.get_output("DownloadChunks", "chunks");
     /// ```
-    pub fn get_output<T: std::any::Any + Send + Sync>(
+    pub fn get_output<T: std::any::Any + Send + Sync + Clone>(
         &self,
         task_name: &str,
         key: &str,
-    ) -> Option<&T> {
-        self.task_outputs
-            .get(task_name)
-            .and_then(|output| output.get(key))
+    ) -> Option<T> {
+        let outputs = self.task_outputs.read().ok()?;
+        let output = outputs.get(task_name)?;
+        output.get::<T>(key).cloned()
     }
 
     /// Returns true if output from a task exists.
     pub fn has_output(&self, task_name: &str) -> bool {
-        self.task_outputs.contains_key(task_name)
+        self.task_outputs
+            .read()
+            .map(|outputs| outputs.contains_key(task_name))
+            .unwrap_or(false)
     }
 
     /// Spawns a child job.
@@ -254,13 +268,16 @@ impl TaskContext {
 
 impl std::fmt::Debug for TaskContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let output_keys: Vec<String> = self
+            .task_outputs
+            .read()
+            .map(|outputs| outputs.keys().cloned().collect())
+            .unwrap_or_default();
+
         f.debug_struct("TaskContext")
             .field("job_id", &self.job_id)
             .field("is_cancelled", &self.is_cancelled())
-            .field(
-                "task_outputs",
-                &self.task_outputs.keys().collect::<Vec<_>>(),
-            )
+            .field("task_outputs", &output_keys)
             .field("can_spawn_children", &self.can_spawn_children())
             .field("spawned_children", &self.spawned_children)
             .finish()
@@ -337,7 +354,7 @@ mod tests {
     #[test]
     fn test_context_task_outputs() {
         let token = CancellationToken::new();
-        let mut ctx = TaskContext::new(JobId::new("test"), token);
+        let ctx = TaskContext::new(JobId::new("test"), token);
 
         // Initially no outputs
         assert!(!ctx.has_output("task1"));
@@ -349,12 +366,12 @@ mod tests {
         output.set("name", "test".to_string());
         ctx.add_task_output("task1".to_string(), output);
 
-        // Now we can retrieve it
+        // Now we can retrieve it (returns owned clone)
         assert!(ctx.has_output("task1"));
-        assert_eq!(ctx.get_output::<i32>("task1", "value"), Some(&42));
+        assert_eq!(ctx.get_output::<i32>("task1", "value"), Some(42));
         assert_eq!(
             ctx.get_output::<String>("task1", "name"),
-            Some(&"test".to_string())
+            Some("test".to_string())
         );
 
         // Wrong type returns None
@@ -371,7 +388,8 @@ mod tests {
     async fn test_context_spawn_children() {
         let token = CancellationToken::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut ctx = TaskContext::with_child_sender(JobId::new("parent"), token, tx);
+        let outputs = Arc::new(RwLock::new(HashMap::new()));
+        let mut ctx = TaskContext::with_child_sender(JobId::new("parent"), token, tx, outputs);
 
         assert!(ctx.can_spawn_children());
         assert_eq!(ctx.spawned_children_count(), 0);

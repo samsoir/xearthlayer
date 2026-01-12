@@ -17,7 +17,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuse3::raw::reply::FileAttr;
 use fuse3::FileType;
-use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
@@ -25,8 +24,6 @@ use std::sync::Arc;
 
 use crate::coord::TileCoord;
 use crate::executor::DdsClient;
-use crate::executor::JobId;
-use crate::fuse::async_passthrough::{DdsHandler, DdsRequest};
 use crate::fuse::coalesce::{CoalesceResult, CoalescedResult, RequestCoalescer};
 use crate::fuse::{get_default_placeholder, validate_dds_or_placeholder, DdsFilename};
 
@@ -269,13 +266,22 @@ pub fn chunk_to_tile_coords(coords: &DdsFilename) -> TileCoord {
 ///
 /// The default implementation handles:
 /// 1. Converting chunk coordinates to tile coordinates
-/// 2. Submitting requests to the DDS handler
+/// 2. Submitting requests to the DdsClient (new daemon architecture)
 /// 3. Timeout handling with cancellation
 /// 4. Response validation to prevent X-Plane crashes
+///
+/// # Migration
+///
+/// Implementations should provide `dds_client()`. The legacy `dds_handler()`
+/// method exists for backward compatibility but should not be used in new code.
 #[allow(async_fn_in_trait)] // Internal trait, Send bounds not needed
 pub trait DdsRequestor: FileAttrBuilder {
-    /// Get the DDS handler for submitting requests.
-    fn dds_handler(&self) -> &DdsHandler;
+    /// Get the DdsClient for submitting requests (new daemon architecture).
+    ///
+    /// This is the primary method for DDS generation. Implementations should
+    /// return their DdsClient here. The client sends requests to the job
+    /// executor daemon which handles tile generation asynchronously.
+    fn dds_client(&self) -> &Arc<dyn DdsClient>;
 
     /// Get the timeout duration for DDS generation.
     fn generation_timeout(&self) -> Duration;
@@ -285,17 +291,6 @@ pub trait DdsRequestor: FileAttrBuilder {
 
     /// Get the optional tile request callback.
     fn tile_request_callback(&self) -> Option<&crate::prefetch::TileRequestCallback>;
-
-    /// Get the optional DdsClient for the new daemon architecture.
-    ///
-    /// When this returns `Some`, the new daemon-based architecture is used.
-    /// When `None` (default), the legacy `dds_handler()` callback is used.
-    ///
-    /// This allows gradual migration from the legacy architecture to the new
-    /// channel-based daemon model without breaking existing implementations.
-    fn dds_client(&self) -> Option<&Arc<dyn DdsClient>> {
-        None
-    }
 
     /// Get the optional request coalescer for deduplicating concurrent requests.
     ///
@@ -315,7 +310,7 @@ pub trait DdsRequestor: FileAttrBuilder {
     /// 1. Converts coordinates and notifies tile callback
     /// 2. **Coalescing check**: If a coalescer is configured, duplicate requests
     ///    for the same tile wait for the in-flight result instead of starting new work
-    /// 3. Submits request via DdsClient (new) or DdsHandler (legacy)
+    /// 3. Submits request via DdsClient (daemon architecture)
     /// 4. Awaits response with timeout
     /// 5. Validates DDS data before returning
     ///
@@ -324,11 +319,6 @@ pub trait DdsRequestor: FileAttrBuilder {
     /// If `request_coalescer()` returns `Some`, requests are deduplicated at the
     /// FUSE layer. X-Plane commonly requests the same tile multiple times during
     /// scene loading - coalescing ensures only one actual generation runs.
-    ///
-    /// # Architecture Selection
-    ///
-    /// If `dds_client()` returns `Some`, the new daemon architecture is used.
-    /// Otherwise, the legacy `dds_handler()` callback is used.
     ///
     /// # Arguments
     ///
@@ -348,7 +338,6 @@ pub trait DdsRequestor: FileAttrBuilder {
         }
 
         let using_coalescer = self.request_coalescer().is_some();
-        let using_daemon = self.dds_client().is_some();
 
         debug!(
             chunk_row = coords.row,
@@ -359,7 +348,6 @@ pub trait DdsRequestor: FileAttrBuilder {
             tile_zoom = tile.zoom,
             context = context_label,
             using_coalescer,
-            using_daemon,
             "Requesting DDS generation"
         );
 
@@ -425,32 +413,14 @@ pub trait DdsRequestor: FileAttrBuilder {
 
     /// Perform the actual DDS request (without coalescing).
     ///
-    /// This is the inner implementation that handles the daemon vs legacy
-    /// architecture selection.
+    /// Sends the request to the job executor daemon via DdsClient.
     async fn do_request(
         &self,
         tile: TileCoord,
         timeout: Duration,
         context_label: &'static str,
     ) -> Vec<u8> {
-        if let Some(client) = self.dds_client() {
-            // New daemon architecture via DdsClient
-            self.request_via_client(client, tile, timeout, context_label)
-                .await
-        } else {
-            // Legacy architecture via DdsHandler callback
-            self.request_via_handler(tile, timeout, context_label).await
-        }
-    }
-
-    /// Request DDS via the new DdsClient (daemon architecture).
-    async fn request_via_client(
-        &self,
-        client: &Arc<dyn DdsClient>,
-        tile: TileCoord,
-        timeout: Duration,
-        context_label: &'static str,
-    ) -> Vec<u8> {
+        let client = self.dds_client();
         let cancellation_token = CancellationToken::new();
 
         // Submit request via DdsClient
@@ -466,7 +436,7 @@ pub trait DdsRequestor: FileAttrBuilder {
                     cache_hit = response.cache_hit,
                     duration_ms = response.duration.as_millis(),
                     context = context_label,
-                    "DDS request completed (daemon)"
+                    "DDS request completed"
                 );
                 response.data
             }
@@ -484,69 +454,7 @@ pub trait DdsRequestor: FileAttrBuilder {
                 warn!(
                     timeout_secs = timeout.as_secs(),
                     context = context_label,
-                    "DDS generation timed out (daemon) - cancelling"
-                );
-                cancellation_token.cancel();
-                get_default_placeholder()
-            }
-        }
-    }
-
-    /// Request DDS via the legacy DdsHandler callback.
-    async fn request_via_handler(
-        &self,
-        tile: TileCoord,
-        timeout: Duration,
-        context_label: &'static str,
-    ) -> Vec<u8> {
-        let job_id = JobId::auto();
-        let cancellation_token = CancellationToken::new();
-
-        // Create oneshot channel for response
-        let (tx, rx) = oneshot::channel();
-
-        let request = DdsRequest {
-            job_id: job_id.clone(),
-            tile,
-            result_tx: tx,
-            cancellation_token: cancellation_token.clone(),
-            is_prefetch: false,
-        };
-
-        // Submit request to the handler
-        (self.dds_handler())(request);
-
-        // Await response with timeout (fully async - no blocking!)
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(response)) => {
-                debug!(
-                    tile_row = tile.row,
-                    tile_col = tile.col,
-                    tile_zoom = tile.zoom,
-                    cache_hit = response.cache_hit,
-                    duration_ms = response.duration.as_millis(),
-                    context = context_label,
-                    "DDS request completed (legacy)"
-                );
-                response.data
-            }
-            Ok(Err(_)) => {
-                // Channel closed - sender dropped
-                error!(
-                    job_id = %job_id,
-                    context = context_label,
-                    "DDS generation channel closed unexpectedly"
-                );
-                cancellation_token.cancel();
-                get_default_placeholder()
-            }
-            Err(_) => {
-                // Timeout - cancel the pipeline to release resources
-                warn!(
-                    job_id = %job_id,
-                    timeout_secs = timeout.as_secs(),
-                    context = context_label,
-                    "DDS generation timed out - cancelling pipeline"
+                    "DDS generation timed out - cancelling"
                 );
                 cancellation_token.cancel();
                 get_default_placeholder()

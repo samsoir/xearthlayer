@@ -35,7 +35,7 @@
 //! // Create the prefetcher
 //! let prefetcher = HeadingAwarePrefetcher::new(
 //!     memory_cache,
-//!     dds_handler,
+//!     dds_client,
 //!     HeadingAwarePrefetcherConfig::default(),
 //!     analyzer,
 //! );
@@ -56,8 +56,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 use crate::coord::{to_tile_coords, TileCoord};
-use crate::executor::{JobId, MemoryCache};
-use crate::fuse::{DdsHandler, DdsRequest};
+use crate::executor::{DdsClient, MemoryCache};
 
 use super::buffer::BufferGenerator;
 use super::circuit_breaker::CircuitState;
@@ -146,9 +145,6 @@ pub struct HeadingAwarePrefetchStatsSnapshot {
     pub ttl_skipped: u64,
 }
 
-/// Timeout for prefetch requests.
-const PREFETCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Results from a single prefetch cycle.
 #[derive(Debug, Clone, Default)]
 struct CycleResults {
@@ -169,8 +165,8 @@ struct CycleResults {
 pub struct HeadingAwarePrefetcher<M: MemoryCache> {
     /// Memory cache for checking existing tiles.
     memory_cache: Arc<M>,
-    /// DDS handler for submitting requests.
-    dds_handler: DdsHandler,
+    /// DDS client for submitting prefetch requests.
+    dds_client: Arc<dyn DdsClient>,
     /// Configuration.
     config: HeadingAwarePrefetcherConfig,
 
@@ -219,12 +215,12 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
     /// # Arguments
     ///
     /// * `memory_cache` - Memory cache for checking existing tiles
-    /// * `dds_handler` - Handler for submitting prefetch requests
+    /// * `dds_client` - Client for submitting prefetch requests
     /// * `config` - Prefetcher configuration
     /// * `fuse_analyzer` - FUSE request analyzer (always active for fallback)
     pub fn new(
         memory_cache: Arc<M>,
-        dds_handler: DdsHandler,
+        dds_client: Arc<dyn DdsClient>,
         config: HeadingAwarePrefetcherConfig,
         fuse_analyzer: Arc<FuseRequestAnalyzer>,
     ) -> Self {
@@ -233,7 +229,7 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
 
         Self {
             memory_cache,
-            dds_handler,
+            dds_client,
             config,
             cone_generator,
             buffer_generator,
@@ -811,24 +807,6 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
                 }
             }
 
-            // Submit request
-            let cancellation_token = CancellationToken::new();
-            let timeout_token = cancellation_token.clone();
-
-            tokio::spawn(async move {
-                tokio::time::sleep(PREFETCH_REQUEST_TIMEOUT).await;
-                timeout_token.cancel();
-            });
-
-            let (tx, _rx) = tokio::sync::oneshot::channel();
-            let request = DdsRequest {
-                job_id: JobId::auto(),
-                tile: tile.coord,
-                result_tx: tx,
-                cancellation_token,
-                is_prefetch: true,
-            };
-
             trace!(
                 row = tile.coord.row,
                 col = tile.coord.col,
@@ -837,7 +815,8 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
                 "Submitting prefetch request"
             );
 
-            (self.dds_handler)(request);
+            // Submit prefetch request via DdsClient (fire-and-forget)
+            self.dds_client.prefetch(tile.coord);
             self.recently_attempted.insert(tile_key, Instant::now());
             submitted += 1;
         }
@@ -946,8 +925,50 @@ impl<M: MemoryCache> std::fmt::Debug for HeadingAwarePrefetcher<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coord::TileCoord;
+    use crate::executor::{DdsClient, DdsClientError, Priority};
+    use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
     use std::collections::HashMap as StdHashMap;
     use std::sync::Mutex;
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+
+    /// Mock DDS client for testing.
+    struct MockDdsClient;
+
+    impl DdsClient for MockDdsClient {
+        fn submit(&self, _request: JobRequest) -> Result<(), DdsClientError> {
+            Ok(())
+        }
+
+        fn request_dds(
+            &self,
+            _tile: TileCoord,
+            _cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            let (tx, rx) = oneshot::channel();
+            drop(tx); // Drop sender to simulate no response
+            rx
+        }
+
+        fn request_dds_with_options(
+            &self,
+            tile: TileCoord,
+            _priority: Priority,
+            _origin: RequestOrigin,
+            cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            self.request_dds(tile, cancellation)
+        }
+
+        fn prefetch(&self, _tile: TileCoord) {}
+
+        fn prefetch_with_cancellation(&self, _tile: TileCoord, _cancellation: CancellationToken) {}
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
 
     /// Mock memory cache for testing.
     struct MockCache {
@@ -1018,12 +1039,12 @@ mod tests {
     #[test]
     fn test_prefetcher_startup_info() {
         let cache = Arc::new(MockCache::new());
-        let handler: DdsHandler = Arc::new(|_| {});
+        let dds_client: Arc<dyn DdsClient> = Arc::new(MockDdsClient);
         let analyzer = Arc::new(FuseRequestAnalyzer::new(FuseInferenceConfig::default()));
 
         let prefetcher = HeadingAwarePrefetcher::new(
             cache,
-            handler,
+            dds_client,
             HeadingAwarePrefetcherConfig::default(),
             analyzer,
         );
@@ -1036,12 +1057,12 @@ mod tests {
     #[test]
     fn test_prefetcher_name() {
         let cache = Arc::new(MockCache::new());
-        let handler: DdsHandler = Arc::new(|_| {});
+        let dds_client: Arc<dyn DdsClient> = Arc::new(MockDdsClient);
         let analyzer = Arc::new(FuseRequestAnalyzer::new(FuseInferenceConfig::default()));
 
         let prefetcher = HeadingAwarePrefetcher::new(
             cache,
-            handler,
+            dds_client,
             HeadingAwarePrefetcherConfig::default(),
             analyzer,
         );
@@ -1052,12 +1073,12 @@ mod tests {
     #[test]
     fn test_determine_mode_radial_initially() {
         let cache = Arc::new(MockCache::new());
-        let handler: DdsHandler = Arc::new(|_| {});
+        let dds_client: Arc<dyn DdsClient> = Arc::new(MockDdsClient);
         let analyzer = Arc::new(FuseRequestAnalyzer::new(FuseInferenceConfig::default()));
 
         let prefetcher = HeadingAwarePrefetcher::new(
             cache,
-            handler,
+            dds_client,
             HeadingAwarePrefetcherConfig::default(),
             analyzer,
         );
