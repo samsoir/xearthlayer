@@ -1,15 +1,14 @@
-//! Disk cache adapter for the async pipeline.
+//! Disk cache adapter for the executor framework.
 //!
-//! Adapts disk cache operations to the pipeline's `DiskCache` trait.
+//! Adapts disk cache operations to the executor's `DiskCache` trait.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Adapts disk cache operations to the pipeline's `DiskCache` trait.
+/// Adapts disk cache operations to the executor's `DiskCache` trait.
 ///
-/// The pipeline's disk cache operates at the chunk level (individual 256x256
-/// images) while the existing disk cache operates at the tile level. This
-/// adapter provides chunk-level caching with a hierarchical directory structure.
+/// The executor's disk cache operates at the chunk level (individual 256x256
+/// images) with a hierarchical directory structure.
 ///
 /// # Directory Structure
 ///
@@ -20,14 +19,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// # Example
 ///
 /// ```ignore
-/// use xearthlayer::pipeline::adapters::DiskCacheAdapter;
+/// use xearthlayer::executor::adapters::DiskCacheAdapter;
 /// use std::path::PathBuf;
 ///
 /// let adapter = DiskCacheAdapter::new(
 ///     PathBuf::from("/home/user/.cache/xearthlayer"),
 ///     "bing",
 /// );
-/// // adapter implements pipeline::DiskCache
+/// // adapter implements executor::DiskCache
 /// ```
 pub struct DiskCacheAdapter {
     cache_dir: PathBuf,
@@ -88,7 +87,7 @@ impl DiskCacheAdapter {
     }
 }
 
-impl crate::pipeline::DiskCache for DiskCacheAdapter {
+impl crate::executor::DiskCache for DiskCacheAdapter {
     async fn get(
         &self,
         tile_row: u32,
@@ -135,7 +134,7 @@ impl crate::pipeline::DiskCache for DiskCacheAdapter {
 /// Useful for testing or when disk caching is disabled.
 pub struct NullDiskCache;
 
-impl crate::pipeline::DiskCache for NullDiskCache {
+impl crate::executor::DiskCache for NullDiskCache {
     async fn get(
         &self,
         _tile_row: u32,
@@ -163,7 +162,7 @@ impl crate::pipeline::DiskCache for NullDiskCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::DiskCache;
+    use crate::executor::DiskCache;
 
     #[test]
     fn test_disk_cache_adapter_path_construction() {

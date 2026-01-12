@@ -28,8 +28,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use xearthlayer::pipeline::control_plane::{ControlPlaneHealth, HealthSnapshot};
 use xearthlayer::prefetch::SharedPrefetchStatus;
+use xearthlayer::runtime::{HealthSnapshot, SharedRuntimeHealth};
 use xearthlayer::telemetry::TelemetrySnapshot;
 
 use crate::ui::widgets::{CacheConfig, NetworkHistory, PipelineHistory};
@@ -58,8 +58,8 @@ pub struct Dashboard {
     spinner_frame: usize,
     /// Optional prefetch status for display.
     prefetch_status: Option<Arc<SharedPrefetchStatus>>,
-    /// Optional control plane health for display.
-    control_plane_health: Option<Arc<ControlPlaneHealth>>,
+    /// Optional runtime health for display.
+    runtime_health: Option<SharedRuntimeHealth>,
     /// Maximum concurrent jobs for the control plane display.
     max_concurrent_jobs: usize,
     /// Previous control plane snapshot for rate calculation.
@@ -101,7 +101,7 @@ impl Dashboard {
             state,
             spinner_frame: 0,
             prefetch_status: None,
-            control_plane_health: None,
+            runtime_health: None,
             max_concurrent_jobs: 0,
             prev_control_plane_snapshot: None,
             quit_confirmation: None,
@@ -115,13 +115,13 @@ impl Dashboard {
         self
     }
 
-    /// Set the control plane health source for display.
-    pub fn with_control_plane(
+    /// Set the runtime health source for display.
+    pub fn with_runtime_health(
         mut self,
-        health: Arc<ControlPlaneHealth>,
+        health: SharedRuntimeHealth,
         max_concurrent_jobs: usize,
     ) -> Self {
-        self.control_plane_health = Some(health);
+        self.runtime_health = Some(health);
         self.max_concurrent_jobs = max_concurrent_jobs;
         self
     }
@@ -210,7 +210,7 @@ impl Dashboard {
             .unwrap_or_default();
 
         // Get control plane health if available
-        let control_plane_snapshot = self.control_plane_health.as_ref().map(|h| h.snapshot());
+        let control_plane_snapshot = self.runtime_health.as_ref().map(|h| h.snapshot());
         let max_concurrent_jobs = self.max_concurrent_jobs;
 
         // Calculate job rates from control plane snapshots

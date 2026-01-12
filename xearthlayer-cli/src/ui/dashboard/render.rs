@@ -11,8 +11,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use xearthlayer::pipeline::control_plane::HealthSnapshot;
 use xearthlayer::prefetch::PrefetchStatusSnapshot;
+use xearthlayer::runtime::HealthSnapshot;
 use xearthlayer::telemetry::TelemetrySnapshot;
 
 use super::render_sections::{inner_rect, render_control_plane, render_prefetch};

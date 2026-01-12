@@ -15,8 +15,10 @@
 //!
 //! Produces `TaskOutput` with key "image" containing `RgbaImage`.
 
-use crate::executor::{ResourceType, Task, TaskContext, TaskError, TaskOutput, TaskResult};
-use crate::pipeline::{BlockingExecutor, ChunkResults};
+use crate::executor::{
+    BlockingExecutor, ChunkResults, ResourceType, Task, TaskContext, TaskError, TaskOutput,
+    TaskResult,
+};
 use image::{Rgba, RgbaImage};
 use std::future::Future;
 use std::pin::Pin;

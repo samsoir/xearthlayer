@@ -56,9 +56,7 @@
 //! ```
 
 use crate::executor::{ExecutorConfig, JobExecutor, JobStatus, JobSubmitter as ExecutorSubmitter};
-use crate::fuse::DdsResponse as FuseDdsResponse;
 use crate::jobs::DdsJobFactory;
-use crate::pipeline::{CoalesceResult, RequestCoalescer};
 use crate::runtime::{DdsResponse, JobRequest};
 use std::sync::Arc;
 use std::time::Instant;
@@ -110,10 +108,10 @@ pub trait DaemonMemoryCache: Send + Sync + 'static {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>;
 }
 
-/// Blanket implementation for any type implementing the pipeline MemoryCache trait.
+/// Blanket implementation for any type implementing the executor's MemoryCache trait.
 impl<T> DaemonMemoryCache for T
 where
-    T: crate::pipeline::MemoryCache,
+    T: crate::executor::MemoryCache,
 {
     fn get(
         &self,
@@ -121,7 +119,7 @@ where
         col: u32,
         zoom: u8,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
-        Box::pin(async move { crate::pipeline::MemoryCache::get(self, row, col, zoom).await })
+        Box::pin(async move { crate::executor::MemoryCache::get(self, row, col, zoom).await })
     }
 }
 
@@ -133,6 +131,9 @@ where
 ///
 /// Owns the job executor and receives requests from producers via channel.
 /// Runs as a long-lived background task.
+///
+/// Request coalescing is handled by the FUSE layer (see `fuse::RequestCoalescer`),
+/// not by this daemon. This daemon receives already-deduplicated requests.
 ///
 /// # Type Parameters
 ///
@@ -154,9 +155,6 @@ where
 
     /// Memory cache for fast-path cache hits.
     memory_cache: Arc<M>,
-
-    /// Request coalescer (prevents duplicate work).
-    coalescer: Arc<RequestCoalescer>,
 
     /// Channel receiver for requests.
     request_rx: mpsc::Receiver<JobRequest>,
@@ -181,23 +179,6 @@ where
         factory: Arc<F>,
         memory_cache: Arc<M>,
     ) -> (Self, mpsc::Sender<JobRequest>) {
-        Self::with_coalescer(
-            config,
-            factory,
-            memory_cache,
-            Arc::new(RequestCoalescer::new()),
-        )
-    }
-
-    /// Creates a new daemon with an existing coalescer.
-    ///
-    /// This allows sharing a coalescer with the legacy pipeline during migration.
-    pub fn with_coalescer(
-        config: ExecutorDaemonConfig,
-        factory: Arc<F>,
-        memory_cache: Arc<M>,
-        coalescer: Arc<RequestCoalescer>,
-    ) -> (Self, mpsc::Sender<JobRequest>) {
         let (request_tx, request_rx) = mpsc::channel(config.channel_capacity);
         let (executor, submitter) = JobExecutor::new(config.executor);
 
@@ -206,7 +187,6 @@ where
             submitter,
             factory,
             memory_cache,
-            coalescer,
             request_rx,
         };
 
@@ -220,6 +200,9 @@ where
     /// - Checks cache for hits
     /// - Runs jobs via the executor
     /// - Returns results to callers
+    ///
+    /// Note: Request coalescing is handled by the FUSE layer before requests
+    /// reach this daemon. Each request received here is unique.
     pub async fn run(self, shutdown: CancellationToken) {
         info!("Executor daemon starting");
 
@@ -228,7 +211,6 @@ where
             submitter,
             factory,
             memory_cache,
-            coalescer,
             mut request_rx,
         } = self;
 
@@ -256,7 +238,6 @@ where
                         &submitter,
                         &factory,
                         &memory_cache,
-                        &coalescer,
                     ).await;
                 }
             }
@@ -272,7 +253,6 @@ where
         submitter: &ExecutorSubmitter,
         factory: &Arc<F>,
         memory_cache: &Arc<M>,
-        coalescer: &Arc<RequestCoalescer>,
     ) {
         let start = Instant::now();
         let tile = request.tile;
@@ -312,91 +292,53 @@ where
             return;
         }
 
-        // Check coalescer for in-flight request
-        let coalesce_result = coalescer.register(tile);
+        // Create and submit job (coalescing is handled by FUSE layer)
+        let job = factory.create_job(tile, priority);
+        let handle = submitter.try_submit_boxed(job);
 
-        match coalesce_result {
-            CoalesceResult::Coalesced(mut rx) => {
-                // Wait for existing request to complete
-                debug!(tile = ?tile, "Request coalesced - waiting for in-flight processing");
+        match handle {
+            Some(mut handle) => {
+                let memory_cache = Arc::clone(memory_cache);
+                let cancellation = request.cancellation.clone();
 
-                if let Some(response_tx) = request.response_tx {
-                    tokio::spawn(async move {
-                        match rx.recv().await {
-                            Ok(result) => {
-                                let response =
-                                    DdsResponse::from_fuse(FuseDdsResponse::from(result));
-                                let _ = response_tx.send(response);
-                            }
-                            Err(_) => {
-                                // Channel closed - send empty response
-                                let _ = response_tx.send(DdsResponse::empty(start.elapsed()));
+                tokio::spawn(async move {
+                    // Wait for job completion
+                    tokio::select! {
+                        _ = handle.wait() => {
+                            let status = handle.status();
+                            let duration = start.elapsed();
+
+                            // Read result from cache
+                            let data = if status == JobStatus::Succeeded {
+                                memory_cache.get(tile.row, tile.col, tile.zoom).await
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
+
+                            let response = DdsResponse::cache_miss(data, duration);
+
+                            // Send response if requested
+                            if let Some(tx) = request.response_tx {
+                                let _ = tx.send(response);
                             }
                         }
-                    });
-                }
+                        _ = cancellation.cancelled() => {
+                            debug!(tile = ?tile, "Job cancelled");
+                            handle.kill();
+
+                            if let Some(tx) = request.response_tx {
+                                let _ = tx.send(DdsResponse::empty(start.elapsed()));
+                            }
+                        }
+                    }
+                });
             }
-            CoalesceResult::NewRequest { tile, .. } => {
-                // Create and submit new job
-                let job = factory.create_job(tile, priority);
-                let handle = submitter.try_submit_boxed(job);
+            None => {
+                warn!(tile = ?tile, "Failed to submit job - executor may be shutdown");
 
-                match handle {
-                    Some(mut handle) => {
-                        let memory_cache = Arc::clone(memory_cache);
-                        let coalescer = Arc::clone(coalescer);
-                        let cancellation = request.cancellation.clone();
-
-                        tokio::spawn(async move {
-                            // Wait for job completion
-                            tokio::select! {
-                                _ = handle.wait() => {
-                                    let status = handle.status();
-                                    let duration = start.elapsed();
-
-                                    // Read result from cache
-                                    let data = if status == JobStatus::Succeeded {
-                                        memory_cache.get(tile.row, tile.col, tile.zoom).await
-                                            .unwrap_or_default()
-                                    } else {
-                                        Vec::new()
-                                    };
-
-                                    let response = DdsResponse::cache_miss(data.clone(), duration);
-
-                                    // Notify coalescer
-                                    let fuse_response = FuseDdsResponse {
-                                        data,
-                                        cache_hit: false,
-                                        duration,
-                                    };
-                                    coalescer.complete(tile, fuse_response);
-
-                                    // Send response if requested
-                                    if let Some(tx) = request.response_tx {
-                                        let _ = tx.send(response);
-                                    }
-                                }
-                                _ = cancellation.cancelled() => {
-                                    debug!(tile = ?tile, "Job cancelled");
-                                    handle.kill();
-                                    coalescer.cancel(tile);
-
-                                    if let Some(tx) = request.response_tx {
-                                        let _ = tx.send(DdsResponse::empty(start.elapsed()));
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    None => {
-                        warn!(tile = ?tile, "Failed to submit job - executor may be shutdown");
-                        coalescer.cancel(tile);
-
-                        if let Some(tx) = request.response_tx {
-                            let _ = tx.send(DdsResponse::empty(start.elapsed()));
-                        }
-                    }
+                if let Some(tx) = request.response_tx {
+                    let _ = tx.send(DdsResponse::empty(start.elapsed()));
                 }
             }
         }

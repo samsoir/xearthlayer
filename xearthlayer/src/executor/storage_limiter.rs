@@ -18,7 +18,7 @@
 //!
 //! ```ignore
 //! use std::sync::Arc;
-//! use xearthlayer::pipeline::StorageConcurrencyLimiter;
+//! use xearthlayer::executor::StorageConcurrencyLimiter;
 //!
 //! // Create limiter with default scaling (num_cpus * 16, max 256)
 //! let limiter = Arc::new(StorageConcurrencyLimiter::with_defaults());
@@ -34,7 +34,7 @@
 //! }
 //! ```
 
-use super::storage::DiskIoProfile;
+use crate::config::DiskIoProfile;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;

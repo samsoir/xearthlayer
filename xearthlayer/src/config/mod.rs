@@ -34,6 +34,7 @@ mod download;
 mod file;
 mod keys;
 mod size;
+mod storage;
 mod texture;
 mod upgrade;
 pub use download::DownloadConfig;
@@ -95,6 +96,12 @@ pub use file::{
 };
 pub use keys::{ConfigKey, ConfigKeyError};
 pub use size::{format_size, parse_size, Size, SizeParseError};
+pub use storage::{
+    DiskIoProfile, DEFAULT_CPU_FALLBACK, HDD_BLOCKING_CEILING, HDD_BLOCKING_SCALING_FACTOR,
+    HDD_IO_CEILING, HDD_IO_SCALING_FACTOR, NVME_BLOCKING_CEILING, NVME_BLOCKING_SCALING_FACTOR,
+    NVME_IO_CEILING, NVME_IO_SCALING_FACTOR, SSD_BLOCKING_CEILING, SSD_BLOCKING_SCALING_FACTOR,
+    SSD_IO_CEILING, SSD_IO_SCALING_FACTOR,
+};
 pub use texture::TextureConfig;
 pub use upgrade::{
     analyze_config, upgrade_config, ConfigUpgradeAnalysis, UpgradeResult, DEPRECATED_KEYS,

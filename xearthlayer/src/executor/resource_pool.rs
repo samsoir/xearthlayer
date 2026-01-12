@@ -42,7 +42,7 @@
 //! drop(permit); // Release the permit
 //! ```
 
-use crate::pipeline::DiskIoProfile;
+use crate::config::DiskIoProfile;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};

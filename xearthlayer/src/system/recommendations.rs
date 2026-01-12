@@ -4,7 +4,7 @@
 //! detected hardware capabilities.
 
 use crate::config::format_size;
-use crate::pipeline::DiskIoProfile;
+use crate::config::DiskIoProfile;
 
 /// Size constants for clarity.
 const GB: usize = 1024 * 1024 * 1024;

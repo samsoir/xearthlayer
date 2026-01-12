@@ -25,9 +25,10 @@ use std::sync::Arc;
 
 use crate::coord::TileCoord;
 use crate::executor::DdsClient;
+use crate::executor::JobId;
 use crate::fuse::async_passthrough::{DdsHandler, DdsRequest};
+use crate::fuse::coalesce::{CoalesceResult, CoalescedResult, RequestCoalescer};
 use crate::fuse::{get_default_placeholder, validate_dds_or_placeholder, DdsFilename};
-use crate::pipeline::JobId;
 
 /// Time-to-live for FUSE attribute caching.
 ///
@@ -296,13 +297,33 @@ pub trait DdsRequestor: FileAttrBuilder {
         None
     }
 
+    /// Get the optional request coalescer for deduplicating concurrent requests.
+    ///
+    /// When this returns `Some`, requests for the same tile are coalesced at the
+    /// FUSE layer. Only one request is sent to the executor; all others wait for
+    /// the same result. This prevents duplicate work during X-Plane's burst
+    /// loading patterns.
+    ///
+    /// When `None` (default), no coalescing is performed at the FUSE layer.
+    fn request_coalescer(&self) -> Option<&Arc<RequestCoalescer>> {
+        None
+    }
+
     /// Request DDS generation from the async pipeline.
     ///
     /// This method handles the full request lifecycle:
     /// 1. Converts coordinates and notifies tile callback
-    /// 2. Submits request via DdsClient (new) or DdsHandler (legacy)
-    /// 3. Awaits response with timeout
-    /// 4. Validates DDS data before returning
+    /// 2. **Coalescing check**: If a coalescer is configured, duplicate requests
+    ///    for the same tile wait for the in-flight result instead of starting new work
+    /// 3. Submits request via DdsClient (new) or DdsHandler (legacy)
+    /// 4. Awaits response with timeout
+    /// 5. Validates DDS data before returning
+    ///
+    /// # Request Coalescing
+    ///
+    /// If `request_coalescer()` returns `Some`, requests are deduplicated at the
+    /// FUSE layer. X-Plane commonly requests the same tile multiple times during
+    /// scene loading - coalescing ensures only one actual generation runs.
     ///
     /// # Architecture Selection
     ///
@@ -326,6 +347,9 @@ pub trait DdsRequestor: FileAttrBuilder {
             callback(tile);
         }
 
+        let using_coalescer = self.request_coalescer().is_some();
+        let using_daemon = self.dds_client().is_some();
+
         debug!(
             chunk_row = coords.row,
             chunk_col = coords.col,
@@ -334,18 +358,62 @@ pub trait DdsRequestor: FileAttrBuilder {
             tile_col = tile.col,
             tile_zoom = tile.zoom,
             context = context_label,
-            using_daemon = self.dds_client().is_some(),
+            using_coalescer,
+            using_daemon,
             "Requesting DDS generation"
         );
 
-        // Choose architecture: new daemon-based or legacy callback
-        let data = if let Some(client) = self.dds_client() {
-            // New daemon architecture via DdsClient
-            self.request_via_client(client, tile, timeout, context_label)
-                .await
+        // Request coalescing: if enabled, check for in-flight requests
+        let data = if let Some(coalescer) = self.request_coalescer() {
+            let coalesce_result = coalescer.register(tile);
+
+            match coalesce_result {
+                CoalesceResult::Coalesced(mut rx) => {
+                    // Another request is in-flight - wait for its result
+                    debug!(
+                        tile = ?tile,
+                        context = context_label,
+                        "Request coalesced - waiting for in-flight result"
+                    );
+
+                    match tokio::time::timeout(timeout, rx.recv()).await {
+                        Ok(Ok(result)) => {
+                            debug!(
+                                tile = ?tile,
+                                cache_hit = result.cache_hit,
+                                duration_ms = result.duration.as_millis(),
+                                context = context_label,
+                                "Coalesced request completed"
+                            );
+                            result.into_data()
+                        }
+                        Ok(Err(_)) | Err(_) => {
+                            // Broadcast channel error or timeout - return placeholder
+                            warn!(
+                                tile = ?tile,
+                                context = context_label,
+                                "Coalesced request failed - using placeholder"
+                            );
+                            get_default_placeholder()
+                        }
+                    }
+                }
+                CoalesceResult::NewRequest { tile, .. } => {
+                    // This is the first request - do the actual work
+                    let start = std::time::Instant::now();
+                    let data = self.do_request(tile, timeout, context_label).await;
+                    let duration = start.elapsed();
+
+                    // Complete the coalescer so waiting requests receive the result
+                    let result = CoalescedResult::new(data.clone(), false, duration);
+                    coalescer.complete(tile, result);
+
+                    data
+                }
+            }
         } else {
-            // Legacy architecture via DdsHandler callback
-            self.request_via_handler(tile, timeout, context_label).await
+            // No coalescing - send request directly
+            self.do_request(tile, timeout, context_label).await
         };
 
         // Critical: Validate DDS before returning to X-Plane
@@ -353,6 +421,26 @@ pub trait DdsRequestor: FileAttrBuilder {
         let validation_context =
             format!("{}({},{},{})", context_label, tile.row, tile.col, tile.zoom);
         validate_dds_or_placeholder(data, &validation_context)
+    }
+
+    /// Perform the actual DDS request (without coalescing).
+    ///
+    /// This is the inner implementation that handles the daemon vs legacy
+    /// architecture selection.
+    async fn do_request(
+        &self,
+        tile: TileCoord,
+        timeout: Duration,
+        context_label: &'static str,
+    ) -> Vec<u8> {
+        if let Some(client) = self.dds_client() {
+            // New daemon architecture via DdsClient
+            self.request_via_client(client, tile, timeout, context_label)
+                .await
+        } else {
+            // Legacy architecture via DdsHandler callback
+            self.request_via_handler(tile, timeout, context_label).await
+        }
     }
 
     /// Request DDS via the new DdsClient (daemon architecture).
@@ -411,14 +499,14 @@ pub trait DdsRequestor: FileAttrBuilder {
         timeout: Duration,
         context_label: &'static str,
     ) -> Vec<u8> {
-        let job_id = JobId::new();
+        let job_id = JobId::auto();
         let cancellation_token = CancellationToken::new();
 
         // Create oneshot channel for response
         let (tx, rx) = oneshot::channel();
 
         let request = DdsRequest {
-            job_id,
+            job_id: job_id.clone(),
             tile,
             result_tx: tx,
             cancellation_token: cancellation_token.clone(),

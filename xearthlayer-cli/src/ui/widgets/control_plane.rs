@@ -11,7 +11,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
-use xearthlayer::pipeline::control_plane::{HealthSnapshot, HealthStatus};
+use xearthlayer::runtime::{HealthSnapshot, HealthStatus};
 
 use crate::ui::dashboard::JobRates;
 

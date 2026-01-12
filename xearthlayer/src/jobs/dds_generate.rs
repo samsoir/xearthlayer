@@ -17,10 +17,10 @@
 //! - Cache: memory_cache
 
 use crate::coord::TileCoord;
-use crate::executor::{ErrorPolicy, Job, JobId, JobResult, JobStatus, Priority, Task};
-use crate::pipeline::{
+use crate::executor::{
     BlockingExecutor, ChunkProvider, DiskCache, MemoryCache, TextureEncoderAsync,
 };
+use crate::executor::{ErrorPolicy, Job, JobId, JobResult, JobStatus, Priority, Task};
 use crate::tasks::{AssembleImageTask, CacheWriteTask, DownloadChunksTask, EncodeDdsTask};
 use std::sync::Arc;
 

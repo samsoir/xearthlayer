@@ -1,15 +1,15 @@
-//! Memory cache adapter for the async pipeline.
+//! Memory cache adapter for the executor framework.
 //!
-//! Adapts `cache::MemoryCache` to the pipeline's `MemoryCache` trait.
+//! Adapts `cache::MemoryCache` to the executor's `MemoryCache` trait.
 
 use crate::cache::{self, CacheKey};
 use crate::coord::TileCoord;
 use crate::dds::DdsFormat;
 use std::sync::Arc;
 
-/// Adapts `cache::MemoryCache` to the pipeline's `MemoryCache` trait.
+/// Adapts `cache::MemoryCache` to the executor's `MemoryCache` trait.
 ///
-/// The pipeline uses simpler cache keys (row, col, zoom) while the existing
+/// The executor uses simpler cache keys (row, col, zoom) while the existing
 /// cache uses `CacheKey` which includes provider and format. This adapter
 /// injects the provider and format configuration.
 ///
@@ -18,12 +18,12 @@ use std::sync::Arc;
 /// ```ignore
 /// use xearthlayer::cache::MemoryCache;
 /// use xearthlayer::dds::DdsFormat;
-/// use xearthlayer::pipeline::adapters::MemoryCacheAdapter;
+/// use xearthlayer::executor::adapters::MemoryCacheAdapter;
 /// use std::sync::Arc;
 ///
 /// let cache = Arc::new(MemoryCache::new(2 * 1024 * 1024 * 1024)); // 2GB
 /// let adapter = MemoryCacheAdapter::new(Arc::clone(&cache), "bing", DdsFormat::BC1);
-/// // adapter implements pipeline::MemoryCache
+/// // adapter implements executor::MemoryCache
 /// // cache can be shared with telemetry for size queries
 /// ```
 pub struct MemoryCacheAdapter {
@@ -72,7 +72,7 @@ impl MemoryCacheAdapter {
     }
 }
 
-impl crate::pipeline::MemoryCache for MemoryCacheAdapter {
+impl crate::executor::MemoryCache for MemoryCacheAdapter {
     async fn get(&self, row: u32, col: u32, zoom: u8) -> Option<Vec<u8>> {
         let key = self.make_key(row, col, zoom);
         self.cache.get(&key).await
@@ -95,7 +95,7 @@ impl crate::pipeline::MemoryCache for MemoryCacheAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::MemoryCache;
+    use crate::executor::MemoryCache;
 
     #[tokio::test]
     async fn test_memory_cache_adapter_put_get() {

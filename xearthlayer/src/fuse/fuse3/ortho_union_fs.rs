@@ -39,10 +39,10 @@
 use super::inode::InodeManager;
 use super::shared::{DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
 use super::types::{Fuse3Error, Fuse3Result};
+use crate::executor::StorageConcurrencyLimiter;
 use crate::fuse::async_passthrough::DdsHandler;
 use crate::fuse::{get_default_placeholder, parse_dds_filename};
 use crate::ortho_union::OrthoUnionIndex;
-use crate::pipeline::StorageConcurrencyLimiter;
 use crate::prefetch::TileRequestCallback;
 use bytes::Bytes;
 use fuse3::raw::prelude::*;

@@ -1,21 +1,22 @@
-//! Request coalescing for the DDS pipeline.
+//! Request coalescing for FUSE DDS requests.
 //!
 //! This module provides request coalescing to prevent duplicate tile processing.
-//! When multiple FUSE requests arrive for the same tile simultaneously, only one
-//! actual processing task runs - all other waiters receive the same result.
+//! When multiple FUSE requests arrive for the same tile simultaneously (common
+//! during X-Plane scene loading), only one actual processing task runs - all
+//! other waiters receive the same result.
 //!
 //! # Architecture
 //!
 //! ```text
-//! FUSE Request A ─┐
-//!                 │                              Pipeline
-//! FUSE Request B ─┼──► RequestCoalescer ──────► Processor
-//!                 │        │                        │
-//! FUSE Request C ─┘        │                        │
-//!                          ▼                        ▼
-//!                    [A, B, C all                [One task]
-//!                     receive same                  │
-//!                     result]◄─────────────────────┘
+//! X-Plane Request A ─┐
+//!                    │                              Job
+//! X-Plane Request B ─┼──► RequestCoalescer ──────► Executor
+//!                    │        │                        │
+//! X-Plane Request C ─┘        │                        │
+//!                             ▼                        ▼
+//!                       [A, B, C all                [One job]
+//!                        receive same                  │
+//!                        result]◄─────────────────────┘
 //! ```
 //!
 //! # Implementation
@@ -24,10 +25,10 @@
 //! registration without lock contention. Statistics use atomic counters.
 
 use crate::coord::TileCoord;
-use crate::fuse::DdsResponse;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, info};
 
@@ -81,16 +82,23 @@ pub struct CoalescedResult {
     /// Whether this was a cache hit.
     pub cache_hit: bool,
     /// How long the request took.
-    pub duration: std::time::Duration,
+    pub duration: Duration,
 }
 
-impl From<CoalescedResult> for DdsResponse {
-    fn from(result: CoalescedResult) -> Self {
+impl CoalescedResult {
+    /// Creates a new coalesced result.
+    pub fn new(data: Vec<u8>, cache_hit: bool, duration: Duration) -> Self {
         Self {
-            data: (*result.data).clone(),
-            cache_hit: result.cache_hit,
-            duration: result.duration,
+            data: Arc::new(data),
+            cache_hit,
+            duration,
         }
+    }
+
+    /// Returns the data as a cloned Vec.
+    pub fn into_data(self) -> Vec<u8> {
+        // Clone the data out of the Arc
+        (*self.data).clone()
     }
 }
 
@@ -150,14 +158,8 @@ impl RequestCoalescer {
     /// Completes a request, broadcasting the result to all waiters.
     ///
     /// This should be called by the original processor when it finishes.
-    pub fn complete(&self, tile: TileCoord, response: DdsResponse) {
+    pub fn complete(&self, tile: TileCoord, result: CoalescedResult) {
         if let Some((_, tx)) = self.in_flight.remove(&tile) {
-            let result = CoalescedResult {
-                data: Arc::new(response.data),
-                cache_hit: response.cache_hit,
-                duration: response.duration,
-            };
-
             // Send to all waiters - ignore errors (receivers may have been dropped)
             let subscriber_count = tx.receiver_count();
             let _ = tx.send(result);
@@ -238,33 +240,10 @@ pub enum CoalesceResult {
     Coalesced(broadcast::Receiver<CoalescedResult>),
 }
 
-// Helper methods for CoalesceResult - used in tests and available for future use
-#[allow(dead_code)]
 impl CoalesceResult {
     /// Returns true if this is a new request that needs processing.
     pub fn is_new_request(&self) -> bool {
         matches!(self, Self::NewRequest { .. })
-    }
-
-    /// Waits for the coalesced result if this is a coalesced request.
-    ///
-    /// Returns `None` if this is a new request (caller should process it).
-    /// Returns `Some(response)` with the result if coalesced.
-    pub async fn wait_for_coalesced(self) -> Option<DdsResponse> {
-        match self {
-            Self::Coalesced(mut rx) => {
-                // Wait for the result from the broadcast channel
-                match rx.recv().await {
-                    Ok(result) => Some(result.into()),
-                    Err(_) => {
-                        // Channel closed without sending - shouldn't happen normally
-                        // Return None to indicate caller should handle this case
-                        None
-                    }
-                }
-            }
-            Self::NewRequest { .. } => None,
-        }
     }
 
     /// Extracts the tile for a new request, or None if coalesced.
@@ -274,24 +253,34 @@ impl CoalesceResult {
             Self::Coalesced(_) => None,
         }
     }
+
+    /// Waits for the coalesced result if this is a coalesced request.
+    ///
+    /// Returns `None` if this is a new request (caller should process it).
+    /// Returns `Some(result)` with the result if coalesced.
+    pub async fn wait_for_coalesced(self) -> Option<CoalescedResult> {
+        match self {
+            Self::Coalesced(mut rx) => {
+                // Wait for the result from the broadcast channel
+                // Returns None if channel closed without sending
+                rx.recv().await.ok()
+            }
+            Self::NewRequest { .. } => None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use tokio::time::sleep;
 
     fn test_tile(row: u32, col: u32) -> TileCoord {
         TileCoord { row, col, zoom: 16 }
     }
 
-    fn test_response() -> DdsResponse {
-        DdsResponse {
-            data: vec![0xDD, 0x53, 0x20],
-            cache_hit: false,
-            duration: Duration::from_millis(100),
-        }
+    fn test_result() -> CoalescedResult {
+        CoalescedResult::new(vec![0xDD, 0x53, 0x20], false, Duration::from_millis(100))
     }
 
     #[tokio::test]
@@ -345,15 +334,14 @@ mod tests {
         let second = coalescer.register(tile);
 
         // Complete the request
-        let response = test_response();
-        coalescer.complete(tile, response.clone());
+        let result = test_result();
+        coalescer.complete(tile, result.clone());
 
         // Second request should receive the result
         if let CoalesceResult::Coalesced(mut rx) = second {
             let result = rx.recv().await.unwrap();
-            let response: DdsResponse = result.into();
-            assert_eq!(response.data, vec![0xDD, 0x53, 0x20]);
-            assert!(!response.cache_hit);
+            assert_eq!(result.data.as_ref(), &vec![0xDD, 0x53, 0x20]);
+            assert!(!result.cache_hit);
         } else {
             panic!("Expected coalesced result");
         }
@@ -388,8 +376,8 @@ mod tests {
             .collect();
 
         // Complete the request
-        let response = test_response();
-        coalescer_clone.complete(tile, response);
+        let result = test_result();
+        coalescer_clone.complete(tile, result);
 
         // All waiters should receive the result
         for handle in handles {
@@ -407,7 +395,7 @@ mod tests {
         let _first = coalescer.register(tile);
         assert_eq!(coalescer.in_flight_count(), 1);
 
-        coalescer.complete(tile, test_response());
+        coalescer.complete(tile, test_result());
         assert_eq!(coalescer.in_flight_count(), 0);
 
         // New request for same tile should be new (not coalesced)
@@ -477,14 +465,14 @@ mod tests {
         let c = Arc::clone(&coalescer);
         tokio::spawn(async move {
             sleep(Duration::from_millis(10)).await;
-            c.complete(tile, test_response());
+            c.complete(tile, test_result());
         });
 
         // Wait for result
-        let response = second.wait_for_coalesced().await;
-        assert!(response.is_some());
-        let response = response.unwrap();
-        assert_eq!(response.data, vec![0xDD, 0x53, 0x20]);
+        let result = second.wait_for_coalesced().await;
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert_eq!(result.data.as_ref(), &vec![0xDD, 0x53, 0x20]);
     }
 
     #[tokio::test]
@@ -534,5 +522,12 @@ mod tests {
         let stats = coalescer.stats();
         assert_eq!(stats.total_requests, (num_tiles * requests_per_tile) as u64);
         assert_eq!(stats.new_requests, num_tiles as u64);
+    }
+
+    #[tokio::test]
+    async fn test_coalesced_result_into_data() {
+        let result = CoalescedResult::new(vec![1, 2, 3], true, Duration::from_secs(1));
+        let data = result.into_data();
+        assert_eq!(data, vec![1, 2, 3]);
     }
 }

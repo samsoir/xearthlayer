@@ -17,8 +17,7 @@
 //! No output - cache writes are fire-and-forget.
 
 use crate::coord::TileCoord;
-use crate::executor::{ResourceType, Task, TaskContext, TaskError, TaskResult};
-use crate::pipeline::MemoryCache;
+use crate::executor::{MemoryCache, ResourceType, Task, TaskContext, TaskError, TaskResult};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

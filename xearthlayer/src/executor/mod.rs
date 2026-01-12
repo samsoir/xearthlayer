@@ -104,10 +104,13 @@
 //! - `kill()`: Cancel all tasks immediately
 
 // Module declarations
+pub mod adapters;
 mod cache_adapter;
+mod chunk_results;
 mod client;
 mod context;
 mod daemon;
+mod download_config;
 #[allow(clippy::module_inception)]
 mod executor;
 mod handle;
@@ -115,8 +118,10 @@ mod job;
 mod policy;
 mod queue;
 mod resource_pool;
+mod storage_limiter;
 mod task;
 mod telemetry;
+mod traits;
 
 // Re-export public types
 
@@ -169,3 +174,28 @@ pub use daemon::{
 
 // Cache adapter (decoupled from pipeline module)
 pub use cache_adapter::ExecutorCacheAdapter;
+
+// Core traits (decoupled from pipeline module)
+pub use traits::{
+    BlockingExecutor, ChunkDownloadError, ChunkProvider, ConcurrentResults, ConcurrentRunner,
+    DiskCache, ExecutorError, MemoryCache, TextureEncodeError, TextureEncoderAsync, Timer,
+    TokioExecutor,
+};
+
+// Chunk results (for download/assemble stages)
+pub use chunk_results::{ChunkFailure, ChunkResults, ChunkSuccess};
+
+// Download configuration
+pub use download_config::DownloadConfig;
+
+// Adapters (bridge external implementations to executor traits)
+pub use adapters::{
+    AsyncProviderAdapter, DiskCacheAdapter, MemoryCacheAdapter, NullDiskCache, ProviderAdapter,
+    TextureEncoderAdapter,
+};
+
+// Storage concurrency limiter (semaphore-based I/O limiting)
+pub use storage_limiter::{
+    AcquireTimeoutError, StorageConcurrencyLimiter, StoragePermit, DEFAULT_CEILING,
+    DEFAULT_SCALING_FACTOR, DISK_IO_CEILING, DISK_IO_SCALING_FACTOR,
+};

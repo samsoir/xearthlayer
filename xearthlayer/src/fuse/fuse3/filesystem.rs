@@ -6,9 +6,9 @@
 use super::inode::InodeManager;
 use super::shared::{DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
 use super::types::{Fuse3Error, Fuse3Result, MountHandle};
+use crate::executor::StorageConcurrencyLimiter;
 use crate::fuse::async_passthrough::DdsHandler;
 use crate::fuse::parse_dds_filename;
-use crate::pipeline::StorageConcurrencyLimiter;
 use crate::prefetch::TileRequestCallback;
 use bytes::Bytes;
 use fuse3::raw::prelude::*;

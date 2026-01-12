@@ -12,8 +12,10 @@
 //! Produces `TaskOutput` with key "chunks" containing `ChunkResults`.
 
 use crate::coord::TileCoord;
-use crate::executor::{ResourceType, Task, TaskContext, TaskOutput, TaskResult};
-use crate::pipeline::{ChunkProvider, ChunkResults, DiskCache, PipelineConfig};
+use crate::executor::{
+    ChunkProvider, ChunkResults, DiskCache, DownloadConfig, ResourceType, Task, TaskContext,
+    TaskOutput, TaskResult,
+};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -44,8 +46,8 @@ where
     /// Disk cache for storing individual chunks
     disk_cache: Arc<D>,
 
-    /// Pipeline configuration (timeout, retries)
-    config: PipelineConfig,
+    /// Download configuration (timeout, retries)
+    config: DownloadConfig,
 }
 
 impl<P, D> DownloadChunksTask<P, D>
@@ -65,7 +67,7 @@ where
             tile,
             provider,
             disk_cache,
-            config: PipelineConfig::default(),
+            config: DownloadConfig::default(),
         }
     }
 
@@ -74,7 +76,7 @@ where
         tile: TileCoord,
         provider: Arc<P>,
         disk_cache: Arc<D>,
-        config: PipelineConfig,
+        config: DownloadConfig,
     ) -> Self {
         Self {
             tile,
@@ -177,7 +179,7 @@ async fn download_all_chunks<P, D>(
     tile: TileCoord,
     provider: Arc<P>,
     disk_cache: Arc<D>,
-    config: &PipelineConfig,
+    config: &DownloadConfig,
 ) -> ChunkResults
 where
     P: ChunkProvider,

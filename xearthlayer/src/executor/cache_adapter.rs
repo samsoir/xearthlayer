@@ -6,29 +6,21 @@
 //! # Design Rationale
 //!
 //! The executor daemon needs a minimal interface for memory cache operations
-//! (just `get` for fast-path lookups). Rather than depending on the full
-//! `pipeline::MemoryCache` trait (which is being deprecated), we define a
-//! standalone adapter that works directly with the `cache::MemoryCache` type.
+//! (just `get` for fast-path lookups). This adapter implements the
+//! `executor::MemoryCache` trait and works directly with `cache::MemoryCache`.
 //!
-//! This decouples the job executor framework from the legacy pipeline module.
-//!
-//! # Temporary Coupling
-//!
-//! Currently, this adapter implements `pipeline::MemoryCache` to work with
-//! `DefaultDdsJobFactory`. The `DaemonMemoryCache` trait has a blanket impl
-//! for any `pipeline::MemoryCache`, so this adapter gets `DaemonMemoryCache`
-//! for free. This coupling will be removed when the pipeline traits are moved
-//! to the executor module (see Technical Debt in job-executor-design.md).
+//! The `DaemonMemoryCache` trait has a blanket impl for any `executor::MemoryCache`,
+//! so this adapter gets `DaemonMemoryCache` for free.
 
 use crate::cache::{CacheKey, MemoryCache};
 use crate::coord::TileCoord;
 use crate::dds::DdsFormat;
 use std::sync::Arc;
 
-/// Adapter that bridges `cache::MemoryCache` to the pipeline's `MemoryCache` trait.
+/// Adapter that bridges `cache::MemoryCache` to the executor's `MemoryCache` trait.
 ///
 /// This adapter automatically implements `DaemonMemoryCache` via the blanket impl
-/// in `executor/daemon.rs` that covers all `pipeline::MemoryCache` implementors.
+/// in `executor/daemon.rs` that covers all `executor::MemoryCache` implementors.
 ///
 /// Handles cache key generation with provider and format context.
 ///
@@ -108,9 +100,9 @@ impl ExecutorCacheAdapter {
     }
 }
 
-// Implement pipeline::MemoryCache to work with DefaultDdsJobFactory.
-// This also gives us DaemonMemoryCache via the blanket impl in daemon.rs.
-impl crate::pipeline::MemoryCache for ExecutorCacheAdapter {
+// Implement executor::MemoryCache trait.
+// This also provides DaemonMemoryCache via the blanket impl in daemon.rs.
+impl super::MemoryCache for ExecutorCacheAdapter {
     async fn get(&self, row: u32, col: u32, zoom: u8) -> Option<Vec<u8>> {
         let key = self.make_key(row, col, zoom);
         self.cache.get(&key).await
@@ -148,24 +140,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_returns_none_for_empty_cache() {
-        use crate::pipeline::MemoryCache as PipelineMemoryCache;
+        use crate::executor::MemoryCache;
 
         let adapter = create_test_adapter();
-        let result = PipelineMemoryCache::get(&adapter, 100, 200, 14).await;
+        let result = MemoryCache::get(&adapter, 100, 200, 14).await;
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_put_and_get() {
-        use crate::pipeline::MemoryCache as PipelineMemoryCache;
+        use crate::executor::MemoryCache;
 
         let adapter = create_test_adapter();
 
         // Put some data
-        PipelineMemoryCache::put(&adapter, 100, 200, 14, vec![1, 2, 3, 4]).await;
+        MemoryCache::put(&adapter, 100, 200, 14, vec![1, 2, 3, 4]).await;
 
         // Get it back
-        let result = PipelineMemoryCache::get(&adapter, 100, 200, 14).await;
+        let result = MemoryCache::get(&adapter, 100, 200, 14).await;
         assert_eq!(result, Some(vec![1, 2, 3, 4]));
     }
 

@@ -18,8 +18,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use xearthlayer::coord::{to_tile_coords, TileCoord};
+use xearthlayer::executor::MemoryCache;
 use xearthlayer::fuse::{DdsHandler, DdsRequest};
-use xearthlayer::pipeline::MemoryCache;
 use xearthlayer::prefetch::config::HeadingAwarePrefetchConfig as HeadingConfig;
 use xearthlayer::prefetch::{
     AircraftState, FuseInferenceConfig, FuseRequestAnalyzer, HeadingAwarePrefetcher,

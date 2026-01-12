@@ -2,21 +2,19 @@
 
 use super::builder::{self, CacheComponents, GeneratorComponents, ProviderComponents};
 use super::config::ServiceConfig;
-use super::dds_handler::DdsHandlerBuilder;
 use super::error::ServiceError;
 use super::fuse_mount::{FuseMountConfig, FuseMountService};
 use super::network_logger::NetworkStatsLogger;
+use super::runtime_builder::RuntimeBuilder;
 use crate::cache::MemoryCache;
+use crate::config::DiskIoProfile;
 use crate::coord::to_tile_coords;
-use crate::fuse::{DdsHandler, MountHandle, SpawnedMountHandle};
+use crate::executor::{DdsClient, ExecutorCacheAdapter, MemoryCacheAdapter};
+use crate::fuse::{create_dds_handler_from_client, DdsHandler, MountHandle, SpawnedMountHandle};
 use crate::log::Logger;
-use crate::pipeline::adapters::MemoryCacheAdapter;
-use crate::pipeline::control_plane::{
-    ControlPlaneConfig, ControlPlaneHealth, PipelineControlPlane,
-};
-use crate::pipeline::{DiskIoProfile, RequestCoalescer, StorageConcurrencyLimiter};
 use crate::prefetch::{FuseLoadMonitor, TileRequestCallback};
 use crate::provider::{AsyncProviderType, Provider, ProviderConfig};
+use crate::runtime::{SharedRuntimeHealth, XEarthLayerRuntime};
 use crate::telemetry::{PipelineMetrics, TelemetrySnapshot};
 use crate::texture::{DdsTextureEncoder, TextureEncoder};
 use crate::tile::{TileGenerator, TileRequest};
@@ -24,7 +22,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::{Handle, Runtime};
-use tokio::task::JoinHandle;
 
 /// High-level facade for XEarthLayer operations.
 ///
@@ -79,27 +76,30 @@ pub struct XEarthLayerService {
     owned_runtime: Option<Runtime>,
     /// Handle to the Tokio runtime
     runtime_handle: Handle,
-    /// Sync provider for legacy pipeline (TileOrchestrator)
+    /// Sync provider (retained for future use)
+    #[allow(dead_code)]
     provider: Arc<dyn Provider>,
-    /// Async provider for async pipeline (non-blocking I/O)
+    /// Async provider for tile generation
+    #[allow(dead_code)]
     async_provider: Option<Arc<AsyncProviderType>>,
-    /// Texture encoder for async pipeline (concrete type for adapter compatibility)
+    /// Texture encoder for DDS generation
     dds_encoder: Arc<DdsTextureEncoder>,
-    /// Shared memory cache for async pipeline (tile-level)
+    /// Shared memory cache for tile-level caching
     memory_cache: Option<Arc<MemoryCache>>,
-    /// Shared memory cache adapter (implements pipeline::MemoryCache trait)
+    /// Shared memory cache adapter (implements executor::MemoryCache trait)
     memory_cache_adapter: Option<Arc<MemoryCacheAdapter>>,
+    /// Executor cache adapter (implements DaemonMemoryCache trait)
+    #[allow(dead_code)]
+    executor_cache_adapter: Option<Arc<ExecutorCacheAdapter>>,
     /// Cache directory for disk cache
+    #[allow(dead_code)]
     cache_dir: Option<PathBuf>,
     /// Pipeline telemetry metrics
     metrics: Arc<PipelineMetrics>,
-    /// Shared disk I/O concurrency limiter (for global limiting across packages)
-    disk_io_limiter: Option<Arc<StorageConcurrencyLimiter>>,
-    /// Pipeline control plane for job management and health monitoring
-    control_plane: Arc<PipelineControlPlane>,
-    /// Health monitor join handle (runs in background)
-    #[allow(dead_code)]
-    health_monitor_handle: Option<JoinHandle<()>>,
+    /// XEarthLayer runtime (job executor daemon)
+    xearthlayer_runtime: Option<XEarthLayerRuntime>,
+    /// DDS client for requesting tile generation
+    dds_client: Option<Arc<dyn DdsClient>>,
     /// Tile request callback for FUSE-based position inference
     tile_request_callback: Option<TileRequestCallback>,
     /// Load monitor for circuit breaker integration.
@@ -156,9 +156,10 @@ impl XEarthLayerService {
         disk_profile: DiskIoProfile,
     ) -> Result<Self, ServiceError> {
         // Get CPU count for worker threads
+        const DEFAULT_CPU_FALLBACK: usize = 4;
         let num_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(crate::pipeline::DEFAULT_CPU_FALLBACK);
+            .unwrap_or(DEFAULT_CPU_FALLBACK);
 
         // Get max blocking threads based on disk profile
         let max_blocking_threads = disk_profile.max_blocking_threads();
@@ -242,7 +243,7 @@ impl XEarthLayerService {
             cache_dir,
         } = builder::create_cache(&config, &provider_name, logger.clone())?;
 
-        // 5. Create shared memory cache adapter (used by both pipeline and prefetcher)
+        // 5. Create shared memory cache adapter (used by prefetcher for cache checks)
         let memory_cache_adapter = memory_cache.as_ref().map(|cache| {
             Arc::new(MemoryCacheAdapter::new(
                 Arc::clone(cache),
@@ -251,36 +252,55 @@ impl XEarthLayerService {
             ))
         });
 
-        // 6. Create network stats logger (if not in quiet mode)
+        // 6. Create executor cache adapter (implements DaemonMemoryCache for the executor daemon)
+        let executor_cache_adapter = memory_cache.as_ref().map(|cache| {
+            Arc::new(ExecutorCacheAdapter::new(
+                Arc::clone(cache),
+                &provider_name,
+                config.texture().format(),
+            ))
+        });
+
+        // 7. Create network stats logger (if not in quiet mode)
         let network_stats_logger =
             builder::create_network_logger(&config, network_stats, logger.clone());
 
-        // 7. Create pipeline telemetry metrics
+        // 8. Create pipeline telemetry metrics
         let metrics = Arc::new(PipelineMetrics::new());
 
-        // 8. Initialize disk cache size from existing cache (async background task)
+        // 9. Initialize disk cache size from existing cache (async background task)
         builder::init_disk_cache_metrics(cache_dir.as_ref(), &metrics, &runtime_handle);
 
-        // 9. Create pipeline control plane for job management and health monitoring
-        let control_plane_config = ControlPlaneConfig {
-            max_concurrent_jobs: config.control_plane().max_concurrent_jobs,
-            stall_threshold: Duration::from_secs(config.control_plane().stall_threshold_secs),
-            health_check_interval: Duration::from_secs(
-                config.control_plane().health_check_interval_secs,
-            ),
-            semaphore_timeout: Duration::from_secs(config.control_plane().semaphore_timeout_secs),
-        };
+        // 10. Create XEarthLayer runtime with job executor daemon
+        // Note: The runtime is created lazily when needed (when async_provider is available)
+        // For now, store None and create on first DDS handler request
+        let (xearthlayer_runtime, dds_client) = if let Some(ref async_prov) = async_provider {
+            if let Some(ref _cache_adapter) = executor_cache_adapter {
+                let runtime = RuntimeBuilder::new(
+                    &provider_name,
+                    config.texture().format(),
+                    Arc::clone(&dds_encoder),
+                )
+                .with_async_provider(Arc::clone(async_prov))
+                .with_memory_cache(
+                    memory_cache
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(MemoryCache::new(0))),
+                )
+                .with_cache_dir(
+                    cache_dir
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("/tmp/xearthlayer")),
+                )
+                .build();
 
-        // Create coalescer for the control plane (used for recovery operations)
-        let coalescer = Arc::new(RequestCoalescer::new());
-        let control_plane = Arc::new(PipelineControlPlane::new(control_plane_config, coalescer));
-
-        // 10. Start the health monitor in the background (using runtime handle since we're not in async context)
-        let health_monitor_handle = {
-            let cp = Arc::clone(&control_plane);
-            runtime_handle.spawn(async move {
-                cp.run_health_monitor_loop().await;
-            })
+                let client = runtime.dds_client();
+                (Some(runtime), Some(client))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
         };
 
         Ok(Self {
@@ -297,11 +317,11 @@ impl XEarthLayerService {
             dds_encoder,
             memory_cache,
             memory_cache_adapter,
+            executor_cache_adapter,
             cache_dir,
             metrics,
-            disk_io_limiter: None,
-            control_plane,
-            health_monitor_handle: Some(health_monitor_handle),
+            xearthlayer_runtime,
+            dds_client,
             tile_request_callback: None,
             load_monitor: None,
         })
@@ -382,22 +402,33 @@ impl XEarthLayerService {
         &self.metrics
     }
 
-    /// Get a reference to the control plane health for dashboard display.
+    /// Check if the XEarthLayer runtime is running.
     ///
-    /// The control plane health provides real-time status including:
-    /// - Jobs in progress
-    /// - Jobs recovered (stall detection)
-    /// - Semaphore timeouts
-    /// - Health status (healthy, degraded, critical)
-    pub fn control_plane_health(&self) -> Arc<ControlPlaneHealth> {
-        Arc::clone(self.control_plane.health())
+    /// Returns true if the job executor daemon is running and accepting requests.
+    pub fn is_runtime_running(&self) -> bool {
+        self.xearthlayer_runtime
+            .as_ref()
+            .map(|r| r.is_running())
+            .unwrap_or(false)
     }
 
-    /// Get the maximum concurrent jobs configured for the control plane.
+    /// Get the maximum concurrent jobs configured for the executor.
     ///
     /// This is used by the dashboard to display capacity utilization.
+    /// Returns the configured value from the control plane settings.
     pub fn max_concurrent_jobs(&self) -> usize {
-        self.control_plane.max_concurrent_jobs()
+        self.config.control_plane().max_concurrent_jobs
+    }
+
+    /// Get the runtime health monitor for dashboard display.
+    ///
+    /// Returns `None` if the runtime is not yet started or health tracking
+    /// is not available. The TUI can handle this gracefully.
+    ///
+    /// TODO: Wire up to actual runtime health tracking.
+    pub fn runtime_health(&self) -> Option<SharedRuntimeHealth> {
+        // Not yet implemented - will be connected during TUI update
+        None
     }
 
     /// Get the DDS format used by this service.
@@ -425,26 +456,13 @@ impl XEarthLayerService {
 
     /// Get the shared memory cache adapter.
     ///
-    /// Returns the adapter that implements `pipeline::MemoryCache` trait.
-    /// This is the same adapter instance used by the pipeline, ensuring
+    /// Returns the adapter that implements `executor::MemoryCache` trait.
+    /// This is the same adapter instance used by the executor daemon, ensuring
     /// the prefetcher sees the same cached tiles.
     ///
     /// Returns `None` if caching is disabled.
     pub fn memory_cache_adapter(&self) -> Option<Arc<MemoryCacheAdapter>> {
         self.memory_cache_adapter.clone()
-    }
-
-    /// Set the shared disk I/O concurrency limiter.
-    ///
-    /// When multiple packages are mounted, sharing a single limiter across
-    /// all disk cache instances prevents the combined I/O from overwhelming
-    /// the system. This should be called before mounting the filesystem.
-    ///
-    /// # Arguments
-    ///
-    /// * `limiter` - The shared concurrency limiter for disk I/O operations
-    pub fn set_disk_io_limiter(&mut self, limiter: Arc<StorageConcurrencyLimiter>) {
-        self.disk_io_limiter = Some(limiter);
     }
 
     /// Set the tile request callback for FUSE-based position inference.
@@ -551,56 +569,19 @@ impl XEarthLayerService {
 
     /// Create the DDS handler for the async pipeline.
     ///
-    /// This wires up all the pipeline components and returns a handler
-    /// that can be used with `Fuse3PassthroughFS`.
+    /// This returns a handler that forwards requests to the job executor
+    /// daemon via the DdsClient. The handler can be used with `Fuse3PassthroughFS`.
     ///
-    /// Uses `DdsHandlerBuilder` for clean configuration of the pipeline.
+    /// # Panics
+    ///
+    /// Panics if the DdsClient is not initialized (requires async provider).
     fn create_dds_handler(&self) -> DdsHandler {
-        let pipeline = self.config.pipeline();
-        let mut builder = DdsHandlerBuilder::new(&self.provider_name)
-            .with_format(self.config.texture().format())
-            .with_mipmap_count(self.config.texture().mipmap_count())
-            .with_timeout(Duration::from_secs(pipeline.request_timeout_secs))
-            .with_max_retries(pipeline.max_retries)
-            .with_max_global_http_requests(pipeline.max_http_concurrent)
-            .with_max_cpu_concurrent(pipeline.max_cpu_concurrent)
-            .with_max_prefetch_in_flight(pipeline.max_prefetch_in_flight)
-            .with_retry_base_delay_ms(pipeline.retry_base_delay_ms)
-            .with_coalesce_channel_capacity(pipeline.coalesce_channel_capacity)
-            .with_metrics(Arc::clone(&self.metrics));
+        let client = self
+            .dds_client
+            .as_ref()
+            .expect("DdsClient not initialized - async provider required");
 
-        // Configure provider (prefer async, fallback to sync)
-        if let Some(ref async_prov) = self.async_provider {
-            builder = builder.with_async_provider(Arc::clone(async_prov));
-        } else {
-            builder = builder.with_sync_provider(Arc::clone(&self.provider));
-        }
-
-        // Configure disk cache if enabled
-        if let Some(ref dir) = self.cache_dir {
-            builder = builder.with_disk_cache(dir.clone());
-        }
-
-        // Configure shared disk I/O limiter if set (for global limiting across packages)
-        if let Some(ref limiter) = self.disk_io_limiter {
-            builder = builder.with_disk_io_limiter(Arc::clone(limiter));
-        }
-
-        // Configure memory cache adapter if enabled (use the shared instance)
-        // This ensures the prefetcher and pipeline share the same adapter
-        if let Some(ref adapter) = self.memory_cache_adapter {
-            builder = builder.with_memory_cache_adapter(Arc::clone(adapter));
-        }
-
-        // Configure control plane for job management and health monitoring
-        builder = builder.with_control_plane(Arc::clone(&self.control_plane));
-
-        // Configure load monitor for circuit breaker integration
-        if let Some(ref monitor) = self.load_monitor {
-            builder = builder.with_load_monitor(Arc::clone(monitor));
-        }
-
-        builder.build(self.runtime_handle.clone())
+        create_dds_handler_from_client(Arc::clone(client), self.runtime_handle.clone())
     }
 
     /// Calculate the expected DDS file size based on encoder configuration.

@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cache::MemoryCache;
+use crate::config::DiskIoProfile;
+use crate::executor::{MemoryCacheAdapter, StorageConcurrencyLimiter};
 use crate::fuse::fuse3::{Fuse3OrthoUnionFS, Fuse3UnionFS};
 use crate::fuse::SpawnedMountHandle;
 use crate::ortho_union::{default_cache_path, IndexBuildProgressCallback, OrthoUnionIndexBuilder};
@@ -18,8 +20,6 @@ use crate::package::{
 };
 use crate::panic as panic_handler;
 use crate::patches::{PatchDiscovery, PatchUnionIndex};
-use crate::pipeline::adapters::MemoryCacheAdapter;
-use crate::pipeline::{DiskIoProfile, StorageConcurrencyLimiter};
 use crate::prefetch::{FuseLoadMonitor, SharedFuseLoadMonitor, TileRequestCallback};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
 use crate::telemetry::TelemetrySnapshot;
@@ -1125,7 +1125,9 @@ pub struct ServiceBuilder {
     provider_config: crate::provider::ProviderConfig,
     logger: Arc<dyn crate::log::Logger>,
     /// Shared disk I/O limiter across all service instances.
-    /// Created lazily on first build to avoid allocation when unused.
+    /// Note: Currently unused as DiskCacheAdapter handles I/O internally.
+    /// Kept for potential future use with shared I/O limiting.
+    #[allow(dead_code)]
     disk_io_limiter: Arc<StorageConcurrencyLimiter>,
     /// Shared memory cache across all service instances.
     /// Without this, each package would have its own cache with the full
@@ -1270,9 +1272,6 @@ impl ServiceBuilder {
             self.logger.clone(),
         )?;
 
-        // Set shared disk I/O limiter to prevent I/O exhaustion across packages
-        service.set_disk_io_limiter(Arc::clone(&self.disk_io_limiter));
-
         // Set shared memory cache to ensure global memory limit is respected
         // Without this, each package would have its own cache potentially using
         // N times the configured memory limit
@@ -1304,9 +1303,6 @@ impl ServiceBuilder {
             self.provider_config.clone(),
             self.logger.clone(),
         )?;
-
-        // Set shared disk I/O limiter to prevent I/O exhaustion across packages
-        service.set_disk_io_limiter(Arc::clone(&self.disk_io_limiter));
 
         // Set shared memory cache to ensure global memory limit is respected
         if let (Some(ref cache), Some(ref adapter)) =

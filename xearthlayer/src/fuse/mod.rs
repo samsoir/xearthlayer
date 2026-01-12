@@ -11,12 +11,16 @@
 // Internal modules for shared types (used by fuse3)
 pub(crate) mod async_passthrough;
 
+mod client_adapter;
+mod coalesce;
 mod filename;
 pub mod fuse3;
 mod placeholder;
 
 // Re-export types for public API
 pub use async_passthrough::{DdsHandler, DdsRequest, DdsResponse};
+pub use client_adapter::create_dds_handler_from_client;
+pub use coalesce::{CoalesceResult, CoalescedResult, CoalescerStats, RequestCoalescer};
 pub use filename::{parse_dds_filename, DdsFilename, ParseError};
 pub use fuse3::{Fuse3Error, Fuse3PassthroughFS, Fuse3Result, MountHandle, SpawnedMountHandle};
 pub use placeholder::{

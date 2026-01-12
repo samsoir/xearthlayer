@@ -11,8 +11,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use xearthlayer::pipeline::control_plane::HealthSnapshot;
 use xearthlayer::prefetch::{GpsStatus, PrefetchMode, PrefetchStatusSnapshot};
+use xearthlayer::runtime::HealthSnapshot;
 
 use super::state::JobRates;
 use crate::ui::widgets::ControlPlaneWidget;

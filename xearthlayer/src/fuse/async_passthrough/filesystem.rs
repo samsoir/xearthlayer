@@ -9,8 +9,8 @@ use super::attributes::{
 use super::inode::InodeManager;
 use super::types::{DdsHandler, DdsRequest, DdsResponse};
 use crate::coord::TileCoord;
+use crate::executor::JobId;
 use crate::fuse::{get_default_placeholder, parse_dds_filename, DdsFilename};
-use crate::pipeline::JobId;
 use fuser::{FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
 use libc::{ENOENT, ENOTDIR};
 use std::ffi::{OsStr, OsString};
@@ -108,7 +108,7 @@ impl AsyncPassthroughFS {
     /// This method blocks the calling thread until the DDS is generated
     /// or the timeout is reached.
     fn request_dds(&self, coords: &DdsFilename) -> Vec<u8> {
-        let job_id = JobId::new();
+        let job_id = JobId::auto();
 
         // Convert chunk coordinates to tile coordinates
         let tile = Self::chunk_to_tile_coords(coords);
@@ -133,7 +133,7 @@ impl AsyncPassthroughFS {
         let cancellation_token = CancellationToken::new();
 
         let request = DdsRequest {
-            job_id,
+            job_id: job_id.clone(),
             tile,
             result_tx: tx,
             cancellation_token: cancellation_token.clone(),

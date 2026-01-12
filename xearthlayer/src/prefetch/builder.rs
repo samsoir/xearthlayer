@@ -23,8 +23,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::executor::MemoryCache;
 use crate::fuse::DdsHandler;
-use crate::pipeline::MemoryCache;
 
 use super::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use super::config::{FuseInferenceConfig, HeadingAwarePrefetchConfig};

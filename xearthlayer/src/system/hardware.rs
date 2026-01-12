@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use crate::config::format_size;
-use crate::pipeline::DiskIoProfile;
+use crate::config::DiskIoProfile;
 
 use super::recommendations::{
     recommended_disk_cache, recommended_disk_io_profile, recommended_memory_cache,

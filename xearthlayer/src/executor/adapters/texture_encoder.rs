@@ -1,13 +1,13 @@
-//! Texture encoder adapter for the async pipeline.
+//! Texture encoder adapter for the executor framework.
 //!
 //! Adapts the `TextureEncoder` trait to the `TextureEncoderAsync` trait.
 
-use crate::pipeline::{TextureEncodeError, TextureEncoderAsync};
+use crate::executor::{TextureEncodeError, TextureEncoderAsync};
 use crate::texture::{TextureEncoder, TextureError};
 
 /// Adapts a `TextureEncoder` to the `TextureEncoderAsync` trait.
 ///
-/// The pipeline's `TextureEncoderAsync` trait is designed to be used with
+/// The executor's `TextureEncoderAsync` trait is designed to be used with
 /// `spawn_blocking`, so this adapter simply delegates to the underlying
 /// encoder and maps error types.
 ///
@@ -16,7 +16,7 @@ use crate::texture::{TextureEncoder, TextureError};
 /// ```ignore
 /// use xearthlayer::texture::DdsTextureEncoder;
 /// use xearthlayer::dds::DdsFormat;
-/// use xearthlayer::pipeline::adapters::TextureEncoderAdapter;
+/// use xearthlayer::executor::adapters::TextureEncoderAdapter;
 ///
 /// let encoder = DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(5);
 /// let adapter = TextureEncoderAdapter::new(encoder);
@@ -43,7 +43,7 @@ impl<E: TextureEncoder + 'static> TextureEncoderAsync for TextureEncoderAdapter<
     }
 }
 
-/// Maps texture errors to pipeline encode errors.
+/// Maps texture errors to executor encode errors.
 fn map_texture_error(err: TextureError) -> TextureEncodeError {
     TextureEncodeError::new(err.to_string())
 }

@@ -97,8 +97,10 @@
 //! }
 //! ```
 
+mod health;
 mod orchestrator;
 mod request;
 
+pub use health::{HealthSnapshot, HealthStatus, RuntimeHealth, SharedRuntimeHealth};
 pub use orchestrator::{RuntimeConfig, XEarthLayerRuntime};
 pub use request::{DdsResponse, JobRequest, RequestOrigin};

@@ -25,9 +25,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::coord::TileCoord;
+use crate::executor::{JobId, MemoryCache};
 use crate::fuse::{DdsHandler, DdsRequest};
-use crate::pipeline::JobId;
-use crate::pipeline::MemoryCache;
 
 use super::{SceneryIndex, SceneryTile};
 
@@ -222,9 +221,9 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmPrefetcher<M> {
 
                     // Create the request
                     let (tx, rx) = tokio::sync::oneshot::channel();
-                    let job_id = JobId::new();
+                    let job_id = JobId::auto();
                     let request = DdsRequest {
-                        job_id,
+                        job_id: job_id.clone(),
                         tile: coord,
                         result_tx: tx,
                         cancellation_token: cancel_token.clone(),

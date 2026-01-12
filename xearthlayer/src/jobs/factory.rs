@@ -19,11 +19,11 @@
 //! ```
 
 use crate::coord::TileCoord;
-use crate::executor::{Job, Priority};
-use crate::jobs::DdsGenerateJob;
-use crate::pipeline::{
+use crate::executor::{
     BlockingExecutor, ChunkProvider, DiskCache, MemoryCache, TextureEncoderAsync,
 };
+use crate::executor::{Job, Priority};
+use crate::jobs::DdsGenerateJob;
 use std::sync::Arc;
 
 /// Factory trait for creating DDS generation jobs.

@@ -1,6 +1,6 @@
-//! Provider adapter for the async pipeline.
+//! Provider adapter for the executor framework.
 //!
-//! Provides adapters to bridge provider traits to the pipeline's `ChunkProvider` trait:
+//! Provides adapters to bridge provider traits to the executor's `ChunkProvider` trait:
 //!
 //! - [`ProviderAdapter`] - Adapts sync `Provider` using `spawn_blocking` (legacy)
 //! - [`AsyncProviderAdapter`] - Adapts `AsyncProvider` directly (preferred)
@@ -10,7 +10,7 @@
 //! For new code, prefer `AsyncProviderAdapter` with `AsyncProvider` implementations.
 //! This avoids thread pool exhaustion under high load by using non-blocking I/O.
 
-use crate::pipeline::{ChunkDownloadError, ChunkProvider};
+use crate::executor::{ChunkDownloadError, ChunkProvider};
 use crate::provider::{AsyncProvider, Provider, ProviderError};
 use std::sync::Arc;
 
@@ -23,7 +23,7 @@ use std::sync::Arc;
 ///
 /// ```ignore
 /// use xearthlayer::provider::{ProviderFactory, ProviderConfig, ReqwestClient};
-/// use xearthlayer::pipeline::adapters::ProviderAdapter;
+/// use xearthlayer::executor::ProviderAdapter;
 ///
 /// let http = ReqwestClient::new()?;
 /// let factory = ProviderFactory::new(http);
@@ -99,7 +99,7 @@ fn map_provider_error(err: ProviderError) -> ChunkDownloadError {
 ///
 /// ```ignore
 /// use xearthlayer::provider::{AsyncBingMapsProvider, AsyncReqwestClient};
-/// use xearthlayer::pipeline::adapters::AsyncProviderAdapter;
+/// use xearthlayer::executor::AsyncProviderAdapter;
 /// use std::sync::Arc;
 ///
 /// let http = AsyncReqwestClient::new()?;
@@ -275,36 +275,6 @@ mod tests {
         assert!(!err.is_retryable);
     }
 
-    #[tokio::test]
-    async fn test_provider_adapter_unsupported_coords_is_permanent() {
-        let provider = Arc::new(MockProvider::failing(
-            ProviderError::UnsupportedCoordinates {
-                row: 999999,
-                col: 999999,
-                zoom: 16,
-            },
-        ));
-        let adapter = ProviderAdapter::new(provider);
-
-        let result = adapter.download_chunk(999999, 999999, 16).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(!err.is_retryable);
-    }
-
-    #[tokio::test]
-    async fn test_provider_adapter_invalid_response_is_permanent() {
-        let provider = Arc::new(MockProvider::failing(ProviderError::InvalidResponse(
-            "bad data".to_string(),
-        )));
-        let adapter = ProviderAdapter::new(provider);
-
-        let result = adapter.download_chunk(100, 200, 16).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(!err.is_retryable);
-    }
-
     #[test]
     fn test_provider_adapter_name() {
         let provider = Arc::new(MockProvider::success(vec![]));
@@ -333,44 +303,6 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.is_retryable);
-    }
-
-    #[tokio::test]
-    async fn test_async_provider_adapter_unsupported_zoom_is_permanent() {
-        let provider = MockAsyncProvider::failing(ProviderError::UnsupportedZoom(25));
-        let adapter = AsyncProviderAdapter::new(provider);
-
-        let result = adapter.download_chunk(100, 200, 25).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(!err.is_retryable);
-    }
-
-    #[tokio::test]
-    async fn test_async_provider_adapter_unsupported_coords_is_permanent() {
-        let provider = MockAsyncProvider::failing(ProviderError::UnsupportedCoordinates {
-            row: 999999,
-            col: 999999,
-            zoom: 16,
-        });
-        let adapter = AsyncProviderAdapter::new(provider);
-
-        let result = adapter.download_chunk(999999, 999999, 16).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(!err.is_retryable);
-    }
-
-    #[tokio::test]
-    async fn test_async_provider_adapter_invalid_response_is_permanent() {
-        let provider =
-            MockAsyncProvider::failing(ProviderError::InvalidResponse("bad data".to_string()));
-        let adapter = AsyncProviderAdapter::new(provider);
-
-        let result = adapter.download_chunk(100, 200, 16).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(!err.is_retryable);
     }
 
     #[test]

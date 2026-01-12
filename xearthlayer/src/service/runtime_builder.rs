@@ -11,7 +11,7 @@
 //! AsyncProviderType    →  AsyncProviderAdapter    →  ChunkProvider
 //! DdsTextureEncoder    →  TextureEncoderAdapter   →  TextureEncoderAsync
 //! cache::MemoryCache   →  ExecutorCacheAdapter    →  DaemonMemoryCache
-//! cache_dir            →  ParallelDiskCache       →  DiskCache
+//! cache_dir            →  DiskCacheAdapter        →  DiskCache
 //! (implicit)           →  TokioExecutor           →  BlockingExecutor
 //!                             ↓
 //!                      DefaultDdsJobFactory
@@ -23,12 +23,11 @@
 
 use crate::cache::MemoryCache;
 use crate::dds::DdsFormat;
-use crate::executor::ExecutorCacheAdapter;
-use crate::jobs::DefaultDdsJobFactory;
-use crate::pipeline::adapters::{
-    AsyncProviderAdapter, NullDiskCache, ParallelDiskCache, TextureEncoderAdapter,
+use crate::executor::{
+    AsyncProviderAdapter, DiskCacheAdapter, ExecutorCacheAdapter, NullDiskCache,
+    TextureEncoderAdapter, TokioExecutor,
 };
-use crate::pipeline::{StorageConcurrencyLimiter, TokioExecutor};
+use crate::jobs::DefaultDdsJobFactory;
 use crate::provider::AsyncProviderType;
 use crate::runtime::{RuntimeConfig, XEarthLayerRuntime};
 use crate::texture::DdsTextureEncoder;
@@ -56,8 +55,6 @@ pub struct RuntimeBuilder {
     memory_cache: Option<Arc<MemoryCache>>,
     /// Cache directory for disk cache
     cache_dir: Option<PathBuf>,
-    /// Shared disk I/O limiter (for global limiting across packages)
-    disk_io_limiter: Option<Arc<StorageConcurrencyLimiter>>,
     /// Runtime configuration
     config: RuntimeConfig,
 }
@@ -82,7 +79,6 @@ impl RuntimeBuilder {
             encoder,
             memory_cache: None,
             cache_dir: None,
-            disk_io_limiter: None,
             config: RuntimeConfig::default(),
         }
     }
@@ -108,15 +104,6 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Sets the shared disk I/O limiter.
-    ///
-    /// When multiple packages are mounted, sharing a single limiter coordinates
-    /// disk I/O across all cache instances.
-    pub fn with_disk_io_limiter(mut self, limiter: Arc<StorageConcurrencyLimiter>) -> Self {
-        self.disk_io_limiter = Some(limiter);
-        self
-    }
-
     /// Sets the runtime configuration.
     pub fn with_config(mut self, config: RuntimeConfig) -> Self {
         self.config = config;
@@ -125,7 +112,7 @@ impl RuntimeBuilder {
 
     /// Builds the XEarthLayerRuntime with disk caching enabled.
     ///
-    /// This method creates the runtime with a `ParallelDiskCache` for chunk caching.
+    /// This method creates the runtime with a `DiskCacheAdapter` for chunk caching.
     ///
     /// # Panics
     ///
@@ -150,23 +137,8 @@ impl RuntimeBuilder {
             self.format,
         ));
 
-        // Create disk cache
-        let disk_cache = if let Some(ref limiter) = self.disk_io_limiter {
-            Arc::new(ParallelDiskCache::with_shared_limiter(
-                cache_dir,
-                &self.provider_name,
-                Arc::clone(limiter),
-            ))
-        } else {
-            let default_concurrent = std::thread::available_parallelism()
-                .map(|n| (n.get() * 16).min(256))
-                .unwrap_or(64);
-            Arc::new(ParallelDiskCache::new(
-                cache_dir,
-                &self.provider_name,
-                default_concurrent,
-            ))
-        };
+        // Create disk cache adapter
+        let disk_cache = Arc::new(DiskCacheAdapter::new(cache_dir, &self.provider_name));
 
         let factory = Self::create_factory_with_disk_cache(
             async_provider,
@@ -211,18 +183,18 @@ impl RuntimeBuilder {
         XEarthLayerRuntime::new(factory, cache_adapter, self.config)
     }
 
-    /// Creates a factory with ParallelDiskCache.
+    /// Creates a factory with DiskCacheAdapter.
     fn create_factory_with_disk_cache(
         async_provider: Arc<AsyncProviderType>,
         encoder: Arc<DdsTextureEncoder>,
         cache_adapter: Arc<ExecutorCacheAdapter>,
-        disk_cache: Arc<ParallelDiskCache>,
+        disk_cache: Arc<DiskCacheAdapter>,
     ) -> Arc<
         DefaultDdsJobFactory<
             ProviderAdapter,
             EncoderAdapter,
             ExecutorCacheAdapter,
-            ParallelDiskCache,
+            DiskCacheAdapter,
             TokioExecutor,
         >,
     > {

@@ -1,16 +1,18 @@
 //! Types for async DDS generation requests and responses.
 //!
 //! This module defines the communication types between the FUSE filesystem
-//! and the async pipeline processor.
+//! and the async tile generation system.
 
 use crate::coord::TileCoord;
-use crate::pipeline::{JobId, JobResult};
+use crate::executor::JobId;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-/// Request for DDS generation sent to the async pipeline.
+// Re-export DdsResponse from runtime for consistency
+pub use crate::runtime::DdsResponse;
+
+/// Request for DDS generation sent to the tile generation system.
 #[derive(Debug)]
 pub struct DdsRequest {
     /// Unique request ID for tracing
@@ -20,33 +22,12 @@ pub struct DdsRequest {
     /// Channel to send result back
     pub result_tx: oneshot::Sender<DdsResponse>,
     /// Cancellation token for aborting the request when FUSE times out.
-    /// When cancelled, the pipeline should stop processing and release resources.
+    /// When cancelled, the system should stop processing and release resources.
     pub cancellation_token: CancellationToken,
     /// Whether this is a prefetch request (background caching).
     /// Prefetch requests use non-blocking resource acquisition and are
     /// lower priority than on-demand FUSE requests.
     pub is_prefetch: bool,
-}
-
-/// Response from the async pipeline.
-#[derive(Debug, Clone)]
-pub struct DdsResponse {
-    /// The generated DDS data
-    pub data: Vec<u8>,
-    /// Whether this was a cache hit
-    pub cache_hit: bool,
-    /// Generation duration
-    pub duration: Duration,
-}
-
-impl From<JobResult> for DdsResponse {
-    fn from(result: JobResult) -> Self {
-        Self {
-            data: result.dds_data,
-            cache_hit: result.cache_hit,
-            duration: result.duration,
-        }
-    }
 }
 
 /// Handler function type for processing DDS requests.
@@ -59,18 +40,11 @@ pub type DdsHandler = Arc<dyn Fn(DdsRequest) + Send + Sync>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
-    fn test_dds_response_from_job_result() {
-        let result = JobResult {
-            job_id: JobId::new(),
-            dds_data: vec![1, 2, 3],
-            duration: Duration::from_secs(1),
-            failed_chunks: 0,
-            cache_hit: true,
-        };
-
-        let response: DdsResponse = result.into();
+    fn test_dds_response_creation() {
+        let response = DdsResponse::new(vec![1, 2, 3], true, Duration::from_secs(1));
 
         assert_eq!(response.data, vec![1, 2, 3]);
         assert!(response.cache_hit);
@@ -78,16 +52,8 @@ mod tests {
     }
 
     #[test]
-    fn test_dds_response_from_job_result_no_cache_hit() {
-        let result = JobResult {
-            job_id: JobId::new(),
-            dds_data: vec![0xDD, 0x53],
-            duration: Duration::from_millis(500),
-            failed_chunks: 2,
-            cache_hit: false,
-        };
-
-        let response: DdsResponse = result.into();
+    fn test_dds_response_cache_miss() {
+        let response = DdsResponse::new(vec![0xDD, 0x53], false, Duration::from_millis(500));
 
         assert_eq!(response.data, vec![0xDD, 0x53]);
         assert!(!response.cache_hit);
@@ -96,7 +62,7 @@ mod tests {
 
     #[test]
     fn test_dds_request_creation() {
-        let job_id = JobId::new();
+        let job_id = JobId::auto();
         let tile = TileCoord {
             row: 100,
             col: 200,
@@ -121,7 +87,7 @@ mod tests {
 
     #[test]
     fn test_dds_request_prefetch() {
-        let job_id = JobId::new();
+        let job_id = JobId::auto();
         let tile = TileCoord {
             row: 100,
             col: 200,

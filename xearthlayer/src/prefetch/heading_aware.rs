@@ -56,8 +56,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 use crate::coord::{to_tile_coords, TileCoord};
+use crate::executor::{JobId, MemoryCache};
 use crate::fuse::{DdsHandler, DdsRequest};
-use crate::pipeline::{JobId, MemoryCache};
 
 use super::buffer::BufferGenerator;
 use super::circuit_breaker::CircuitState;
@@ -822,7 +822,7 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
 
             let (tx, _rx) = tokio::sync::oneshot::channel();
             let request = DdsRequest {
-                job_id: JobId::new(),
+                job_id: JobId::auto(),
                 tile: tile.coord,
                 result_tx: tx,
                 cancellation_token,

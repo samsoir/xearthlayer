@@ -1,79 +1,8 @@
-//! Error types for the async pipeline.
+//! Chunk download results for tile generation.
 //!
-//! Errors are categorized by pipeline stage to aid in debugging and
-//! to enable stage-specific error handling strategies.
-
-use thiserror::Error;
-
-/// Errors that can occur during job processing.
-///
-/// These errors represent failures at the job level. Individual chunk
-/// failures during download are handled gracefully (magenta placeholders)
-/// and don't necessarily cause a JobError.
-#[derive(Debug, Error)]
-pub enum JobError {
-    /// Download stage failed catastrophically
-    #[error("download stage failed: {0}")]
-    DownloadFailed(#[from] StageError),
-
-    /// Assembly stage failed
-    #[error("assembly stage failed: {0}")]
-    AssemblyFailed(String),
-
-    /// Encoding stage failed
-    #[error("encoding stage failed: {0}")]
-    EncodingFailed(String),
-
-    /// Cache write failed (non-fatal, logged as warning)
-    #[error("cache write failed: {0}")]
-    CacheFailed(String),
-
-    /// Job was cancelled (e.g., FUSE request dropped)
-    #[error("job cancelled")]
-    Cancelled,
-
-    /// Job timed out
-    #[error("job timed out after {0:?}")]
-    Timeout(std::time::Duration),
-
-    /// Internal error (e.g., channel closed unexpectedly)
-    #[error("internal error: {0}")]
-    Internal(String),
-}
-
-/// Errors that can occur during individual pipeline stages.
-///
-/// These provide detailed context for debugging specific failures.
-#[derive(Debug, Error)]
-pub enum StageError {
-    /// HTTP request failed
-    #[error("HTTP error for chunk ({row}, {col}): {message}")]
-    HttpError { row: u8, col: u8, message: String },
-
-    /// Invalid or corrupt image data received
-    #[error("invalid image data for chunk ({row}, {col}): {message}")]
-    InvalidImageData { row: u8, col: u8, message: String },
-
-    /// Image decoding failed
-    #[error("image decode failed: {0}")]
-    ImageDecodeFailed(String),
-
-    /// DDS encoding failed
-    #[error("DDS encoding failed: {0}")]
-    DdsEncodeFailed(String),
-
-    /// File I/O error
-    #[error("I/O error: {0}")]
-    IoError(String),
-
-    /// Task panicked during spawn_blocking
-    #[error("task panicked: {0}")]
-    TaskPanicked(String),
-
-    /// Provider returned an error
-    #[error("provider error: {0}")]
-    ProviderError(String),
-}
+//! This module provides types for tracking successful and failed chunk downloads
+//! during tile generation. A tile consists of 256 chunks (16×16 grid), and each
+//! chunk is downloaded independently with retry logic.
 
 /// Result of downloading chunks for a tile.
 ///
@@ -250,27 +179,5 @@ mod tests {
 
         assert!(results.is_complete());
         assert_eq!(results.success_rate(), 100.0);
-    }
-
-    #[test]
-    fn test_job_error_display() {
-        let err = JobError::Timeout(std::time::Duration::from_secs(30));
-        assert_eq!(format!("{}", err), "job timed out after 30s");
-
-        let err = JobError::Cancelled;
-        assert_eq!(format!("{}", err), "job cancelled");
-    }
-
-    #[test]
-    fn test_stage_error_display() {
-        let err = StageError::HttpError {
-            row: 5,
-            col: 10,
-            message: "connection refused".to_string(),
-        };
-        assert_eq!(
-            format!("{}", err),
-            "HTTP error for chunk (5, 10): connection refused"
-        );
     }
 }

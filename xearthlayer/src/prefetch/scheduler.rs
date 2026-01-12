@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace};
 
 use crate::dds::DdsFormat;
+use crate::executor::JobId;
 use crate::fuse::{DdsHandler, DdsRequest};
-use crate::pipeline::JobId;
 
 use super::condition::PrefetchCondition;
 use super::predictor::TilePredictor;
@@ -297,7 +297,7 @@ impl PrefetchScheduler {
             // memory cache and disk chunk cache, only downloading if needed
             let (tx, _rx) = tokio::sync::oneshot::channel();
             let request = DdsRequest {
-                job_id: JobId::new(),
+                job_id: JobId::auto(),
                 tile,
                 result_tx: tx,
                 cancellation_token: CancellationToken::new(),

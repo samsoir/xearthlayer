@@ -720,11 +720,12 @@ fn run_with_dashboard(
         tracing::warn!(error = %error, "Failed to create consolidated overlay");
     }
 
-    // Wire in control plane health now that service is available
+    // Wire in runtime health now that service is available
     if let Some(service) = ctx.mount_manager.get_service() {
-        let control_plane_health = service.control_plane_health();
-        let max_concurrent_jobs = service.max_concurrent_jobs();
-        dashboard = dashboard.with_control_plane(control_plane_health, max_concurrent_jobs);
+        if let Some(runtime_health) = service.runtime_health() {
+            let max_concurrent_jobs = service.max_concurrent_jobs();
+            dashboard = dashboard.with_runtime_health(runtime_health, max_concurrent_jobs);
+        }
     }
 
     // Get the runtime handle for spawning async tasks

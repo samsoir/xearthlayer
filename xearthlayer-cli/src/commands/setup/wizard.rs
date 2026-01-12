@@ -18,10 +18,10 @@ use std::path::PathBuf;
 use console::style;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 
+use xearthlayer::config::DiskIoProfile;
 use xearthlayer::config::{
     config_file_path, detect_scenery_dir, format_size, ConfigFile, SceneryDetectionResult,
 };
-use xearthlayer::pipeline::DiskIoProfile;
 use xearthlayer::system::SystemInfo;
 
 use crate::error::CliError;

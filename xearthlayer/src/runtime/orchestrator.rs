@@ -19,13 +19,16 @@
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
+//! Request coalescing is handled by the FUSE layer before requests reach
+//! the runtime. The daemon receives already-deduplicated requests.
+//!
 //! # Usage
 //!
 //! ```ignore
 //! use xearthlayer::runtime::XEarthLayerRuntime;
 //!
 //! // Create runtime with dependencies
-//! let runtime = XEarthLayerRuntime::new(factory, memory_cache, coalescer, config);
+//! let runtime = XEarthLayerRuntime::new(factory, memory_cache, config);
 //!
 //! // Get client for producers
 //! let client = runtime.dds_client();
@@ -44,7 +47,6 @@ use crate::executor::{
     ChannelDdsClient, DaemonMemoryCache, DdsClient, ExecutorDaemon, ExecutorDaemonConfig,
 };
 use crate::jobs::DdsJobFactory;
-use crate::pipeline::RequestCoalescer;
 
 /// Configuration for the XEarthLayer runtime.
 #[derive(Debug, Clone, Default)]
@@ -95,8 +97,7 @@ impl XEarthLayerRuntime {
     /// Create a new runtime with the given dependencies.
     ///
     /// This starts the executor daemon in a background task immediately.
-    /// Creates its own internal `RequestCoalescer`. For sharing a coalescer
-    /// with legacy code, use `with_coalescer()` instead.
+    /// Request coalescing is handled by the FUSE layer, not the daemon.
     ///
     /// # Arguments
     ///
@@ -113,39 +114,10 @@ impl XEarthLayerRuntime {
         F: DdsJobFactory + 'static,
         M: DaemonMemoryCache + 'static,
     {
-        Self::with_coalescer(
-            factory,
-            memory_cache,
-            Arc::new(RequestCoalescer::new()),
-            config,
-        )
-    }
-
-    /// Create a new runtime with an existing coalescer.
-    ///
-    /// This allows sharing a coalescer with the legacy pipeline during migration.
-    ///
-    /// # Arguments
-    ///
-    /// * `factory` - Factory for creating DDS generation jobs
-    /// * `memory_cache` - Memory cache for fast-path lookups
-    /// * `coalescer` - Request coalescer for deduplication
-    /// * `config` - Runtime configuration
-    pub fn with_coalescer<F, M>(
-        factory: Arc<F>,
-        memory_cache: Arc<M>,
-        coalescer: Arc<RequestCoalescer>,
-        config: RuntimeConfig,
-    ) -> Self
-    where
-        F: DdsJobFactory + 'static,
-        M: DaemonMemoryCache + 'static,
-    {
         info!("Starting XEarthLayer runtime");
 
-        // Create the daemon and its channel (with shared coalescer)
-        let (daemon, job_tx) =
-            ExecutorDaemon::with_coalescer(config.daemon_config, factory, memory_cache, coalescer);
+        // Create the daemon and its channel
+        let (daemon, job_tx) = ExecutorDaemon::new(config.daemon_config, factory, memory_cache);
 
         // Create the DDS client for producers
         let dds_client = Arc::new(ChannelDdsClient::new(job_tx));
@@ -298,19 +270,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_runtime_with_shared_coalescer() {
-        let factory = Arc::new(MockJobFactory);
-        let memory_cache = Arc::new(MockMemoryCache);
-        let coalescer = Arc::new(RequestCoalescer::new());
-        let config = RuntimeConfig::default();
+    async fn test_runtime_multiple_instances() {
+        // Test that multiple runtimes can be created and shut down independently
+        let factory1 = Arc::new(MockJobFactory);
+        let memory_cache1 = Arc::new(MockMemoryCache);
+        let config1 = RuntimeConfig::default();
+        let runtime1 = XEarthLayerRuntime::new(factory1, memory_cache1, config1);
 
-        // Use with_coalescer() for shared coalescer scenarios
-        let runtime = XEarthLayerRuntime::with_coalescer(factory, memory_cache, coalescer, config);
+        let factory2 = Arc::new(MockJobFactory);
+        let memory_cache2 = Arc::new(MockMemoryCache);
+        let config2 = RuntimeConfig::default();
+        let runtime2 = XEarthLayerRuntime::new(factory2, memory_cache2, config2);
 
-        // Runtime should be running
-        assert!(runtime.is_running());
+        // Both should be running
+        assert!(runtime1.is_running());
+        assert!(runtime2.is_running());
 
-        runtime.shutdown().await;
+        // Shutdown in reverse order
+        runtime2.shutdown().await;
+        runtime1.shutdown().await;
     }
 
     #[tokio::test]

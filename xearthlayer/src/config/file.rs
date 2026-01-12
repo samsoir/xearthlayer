@@ -2,9 +2,9 @@
 //!
 //! Loads and saves user configuration with sensible defaults.
 
+use super::DiskIoProfile;
 use crate::config::size::{format_size, parse_size};
 use crate::dds::DdsFormat;
-use crate::pipeline::DiskIoProfile;
 use ini::Ini;
 use std::path::{Path, PathBuf};
 use thiserror::Error;

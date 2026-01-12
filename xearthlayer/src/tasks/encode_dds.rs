@@ -16,8 +16,10 @@
 //! Produces `TaskOutput` with key "dds_data" containing `Vec<u8>`.
 
 use crate::coord::TileCoord;
-use crate::executor::{ResourceType, Task, TaskContext, TaskError, TaskOutput, TaskResult};
-use crate::pipeline::{BlockingExecutor, TextureEncoderAsync};
+use crate::executor::{
+    BlockingExecutor, ResourceType, Task, TaskContext, TaskError, TaskOutput, TaskResult,
+    TextureEncoderAsync,
+};
 use image::RgbaImage;
 use std::future::Future;
 use std::pin::Pin;

@@ -26,7 +26,6 @@
 
 mod builder;
 mod config;
-mod dds_handler;
 mod error;
 mod facade;
 mod fuse_mount;
@@ -34,7 +33,6 @@ mod network_logger;
 mod runtime_builder;
 
 pub use config::{ServiceConfig, ServiceConfigBuilder};
-pub use dds_handler::{DdsHandlerBuilder, MonitoringConfig, PipelineLimits, RetryConfig};
 pub use error::ServiceError;
 pub use facade::XEarthLayerService;
 pub use fuse_mount::{FuseMountConfig, FuseMountService};
