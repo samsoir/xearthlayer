@@ -337,7 +337,7 @@ struct DiskWriteRequest {
 **Rationale**:
 - Memory cache: `moka::future::Cache` provides efficient, lock-free LRU eviction
 - Disk eviction is slow (filesystem I/O) - must not block tile delivery
-- Uses tokio async tasks instead of OS threads for better integration with async pipeline
+- Uses tokio async tasks instead of OS threads for better integration with the job executor daemon
 - Clean shutdown via `CancellationToken` for graceful termination
 
 ### FUSE Async Operations

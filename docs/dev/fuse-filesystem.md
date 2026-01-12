@@ -395,11 +395,23 @@ xearthlayer/src/
 │   ├── mod.rs              # Module exports
 │   ├── mounts.rs           # MountManager for consolidated mounting
 │   └── symlinks.rs         # Overlay symlink management
-├── pipeline/
+├── executor/
 │   ├── mod.rs              # Module exports
-│   ├── runner.rs           # DDS pipeline with coalescing
-│   ├── coalesce.rs         # Request coalescing
-│   └── stages/             # Pipeline stages (download, assemble, encode)
+│   ├── daemon.rs           # JobExecutorDaemon (channel-based job processing)
+│   ├── client.rs           # DdsClient trait, job submission
+│   └── resource_pool.rs    # Concurrency limiting by resource type
+├── runtime/
+│   ├── mod.rs              # Module exports
+│   └── health.rs           # RuntimeHealth monitoring
+├── jobs/
+│   ├── mod.rs              # Module exports
+│   └── dds_generate.rs     # DdsGenerateJob
+├── tasks/
+│   ├── mod.rs              # Module exports
+│   ├── download_chunks.rs  # Parallel chunk downloads
+│   ├── assemble_image.rs   # JPEG decode, canvas assembly
+│   ├── encode_dds.rs       # BC1/BC3 compression
+│   └── cache_write.rs      # Memory cache write
 ├── prefetch/
 │   ├── mod.rs              # Module exports
 │   ├── strategy.rs         # Prefetcher trait
@@ -450,13 +462,14 @@ Summary:
 2. Disk cache for generated DDS files (20GB default)
 3. Request coalescing prevents duplicate work
 
-### Async Pipeline
+### Job Executor Daemon
 
-The DDS generation pipeline is fully async:
-- HTTP downloads via tokio + reqwest
-- Request coalescing via broadcast channels
+The DDS generation system uses a job/task framework:
+- Jobs (DdsGenerateJob) submitted via DdsClient trait
+- Tasks execute sequentially: Download → Assemble → Encode → Cache
+- HTTP downloads via tokio + reqwest (non-blocking)
 - CPU-bound work (encode) via spawn_blocking
-- Semaphore-based concurrency limiting
+- Resource pools limit concurrency by type (Network, CPU, DiskIO)
 
 ### Concurrency Limiting
 

@@ -59,6 +59,16 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "prefetch.cone_half_angle",
     // Removed in v0.2.11 - Circuit breaker now uses milliseconds instead of seconds
     "prefetch.circuit_breaker_open_secs",
+    // Removed in v0.3.0 - Pipeline module replaced by executor daemon architecture
+    // These settings were parsed but never wired through to the new executor.
+    // The executor uses its own internal defaults via ResourcePoolConfig.
+    "pipeline.max_http_concurrent",
+    "pipeline.max_cpu_concurrent",
+    "pipeline.max_prefetch_in_flight",
+    "pipeline.request_timeout_secs",
+    "pipeline.max_retries",
+    "pipeline.retry_base_delay_ms",
+    "pipeline.coalesce_channel_capacity",
 ];
 
 /// Result of analyzing a configuration file for upgrade needs.

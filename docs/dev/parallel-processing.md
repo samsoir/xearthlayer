@@ -1,5 +1,7 @@
 # Parallel Tile Processing Design
 
+> **⚠️ DEPRECATED (v0.3.0)**: This document describes the legacy pipeline architecture. The async pipeline section at the bottom has been superseded by the **Job Executor Framework** (`docs/dev/job-executor-design.md`). The new architecture uses a channel-based job executor daemon with explicit job/task separation. See [Job Executor Design](job-executor-design.md) for the current implementation.
+
 This document describes the design of XEarthLayer's parallel tile generation system, which enables concurrent processing of multiple tile requests from X-Plane.
 
 ## Overview

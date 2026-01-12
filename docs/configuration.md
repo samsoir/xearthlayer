@@ -207,39 +207,25 @@ timeout = 10
 - The timeout prevents X-Plane from hanging if a tile download stalls
 - Magenta placeholder tiles indicate timeouts or download failures
 
-### [pipeline]
+### [pipeline] (DEPRECATED)
 
-Advanced concurrency and retry settings for the tile processing pipeline. These defaults are tuned for most systems; only modify if you understand the implications.
+> **Deprecated in v0.3.0**: The `[pipeline]` section is deprecated and will be removed in a future release. The pipeline module has been replaced by the new job executor daemon architecture, which uses internal defaults via `ResourcePoolConfig`. These settings are parsed but no longer have any effect.
+>
+> Run `xearthlayer config upgrade` to remove deprecated settings from your configuration file.
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `max_http_concurrent` | integer | `128` | Maximum concurrent HTTP requests (hard limits: 64-256) |
-| `max_cpu_concurrent` | integer | `num_cpus * 1.25` | Maximum concurrent CPU-bound operations (assembly + encoding) |
-| `max_prefetch_in_flight` | integer | `max(num_cpus / 4, 2)` | Maximum concurrent prefetch jobs |
-| `request_timeout_secs` | integer | `10` | HTTP request timeout for individual chunk downloads (seconds) |
-| `max_retries` | integer | `3` | Maximum retry attempts per failed chunk download |
-| `retry_base_delay_ms` | integer | `100` | Base delay for exponential backoff (actual = base * 2^attempt) |
-| `coalesce_channel_capacity` | integer | `16` | Broadcast channel capacity for request coalescing |
-
-**Example:**
-```ini
-[pipeline]
-; Increase HTTP concurrency for fast connections
-max_http_concurrent = 128
-; Allow more prefetch jobs on high-core-count systems
-max_prefetch_in_flight = 8
-; Increase timeout for slow connections
-request_timeout_secs = 15
-```
-
-**Concurrency Settings:**
-- **HTTP concurrency**: Default 128, hard limits 64-256. Values outside this range are automatically clamped. The ceiling prevents overwhelming imagery providers with too many requests (causes HTTP 429 rate limiting and cascade failures).
-- **CPU concurrency**: `num_cpus * 1.25` - modest oversubscription for blocking thread pool efficiency
-- **Prefetch in-flight**: `max(num_cpus / 4, 2)` - leaves 75% of resources for on-demand requests
+| Setting | Status | Notes |
+|---------|--------|-------|
+| `max_http_concurrent` | Deprecated | Executor uses internal HTTP concurrency limits |
+| `max_cpu_concurrent` | Deprecated | Executor uses `ResourcePoolConfig` defaults |
+| `max_prefetch_in_flight` | Deprecated | Prefetch concurrency is now automatic |
+| `request_timeout_secs` | Deprecated | Timeout configured via `control_plane` settings |
+| `max_retries` | Deprecated | Retry logic built into executor tasks |
+| `retry_base_delay_ms` | Deprecated | Built into executor retry policy |
+| `coalesce_channel_capacity` | Deprecated | Request coalescing uses dynamic buffering |
 
 ### [control_plane]
 
-Controls the pipeline control plane for job management, health monitoring, and deadlock prevention. The control plane limits how many tiles can be processed simultaneously and recovers stalled jobs.
+Controls the job executor daemon for concurrent tile processing and health monitoring.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
@@ -506,14 +492,8 @@ retries = 3
 threads = 8
 timeout = 10
 
-[pipeline]
-; Advanced concurrency settings (defaults are tuned for most systems)
-; max_http_concurrent = 256
-; max_cpu_concurrent = 20
-; max_prefetch_in_flight = 4
-; request_timeout_secs = 10
-; max_retries = 3
-; retry_base_delay_ms = 100
+; [pipeline] section is DEPRECATED in v0.3.0 - settings are no longer used
+; Run 'xearthlayer config upgrade' to remove deprecated settings
 
 [control_plane]
 ; Job management and health monitoring (defaults are tuned for most systems)
@@ -653,13 +633,7 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `download.timeout` | positive integer | Chunk download timeout (seconds) |
 | `generation.threads` | positive integer | Worker threads |
 | `generation.timeout` | positive integer | Tile generation timeout (seconds) |
-| `pipeline.max_http_concurrent` | positive integer | Max concurrent HTTP requests |
-| `pipeline.max_cpu_concurrent` | positive integer | Max concurrent CPU operations |
-| `pipeline.max_prefetch_in_flight` | positive integer | Max concurrent prefetch jobs |
-| `pipeline.request_timeout_secs` | positive integer | HTTP request timeout (seconds) |
-| `pipeline.max_retries` | positive integer | Max retry attempts |
-| `pipeline.retry_base_delay_ms` | positive integer | Retry backoff base delay (ms) |
-| `pipeline.coalesce_channel_capacity` | positive integer | Coalesce channel capacity |
+| `pipeline.*` | *(deprecated)* | All pipeline settings deprecated in v0.3.0 |
 | `control_plane.max_concurrent_jobs` | positive integer | Max concurrent tile jobs |
 | `control_plane.stall_threshold_secs` | positive integer | Job stall timeout (seconds) |
 | `control_plane.health_check_interval_secs` | positive integer | Health check interval (seconds) |

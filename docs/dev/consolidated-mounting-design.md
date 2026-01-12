@@ -63,13 +63,13 @@ This document describes the design for consolidating XEarthLayer's FUSE mounts i
                                         │
                                         ▼
 ┌────────────────────────────────────────────────────────────────────────────────┐
-│                         Shared DdsHandler                                      │
+│                      Shared Job Executor Daemon                                │
 │                                                                                │
-│  Single pipeline instance serving all sources:                                 │
-│    - RequestCoalescer (prevents duplicate work)                                │
+│  Single executor instance serving all sources:                                 │
+│    - DdsClient for job submission                                              │
 │    - Shared memory cache (LRU, ~2GB)                                           │
 │    - Shared disk cache (LRU, ~20GB)                                            │
-│    - Concurrency limiters (HTTP, CPU, Disk I/O)                                │
+│    - Resource pools (Network, CPU, DiskIO concurrency limiting)                │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 

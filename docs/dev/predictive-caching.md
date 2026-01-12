@@ -60,7 +60,7 @@ Even with fast internet and NVMe storage, the latency is perceptible. The soluti
 1. **Reduce FPS drops**: Pre-cached tiles serve from memory cache with <10ms latency
 2. **Predictive accuracy**: Use aircraft telemetry to anticipate tile needs
 3. **Resource efficiency**: Don't starve on-demand requests or waste bandwidth
-4. **Seamless integration**: Reuse existing pipeline infrastructure
+4. **Seamless integration**: Submit jobs to the shared job executor daemon
 5. **Configurability**: Allow users to tune behavior for their setup
 6. **Graceful degradation**: Work even without telemetry using FUSE request analysis
 
@@ -104,8 +104,8 @@ Even with fast internet and NVMe storage, the latency is perceptible. The soluti
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│              Existing Pipeline (unchanged)                       │
-│         Download → Assemble → Encode → Cache (Memory + Disk)    │
+│              Job Executor Daemon                                 │
+│         DdsGenerateJob → Tasks: Download, Assemble, Encode, Cache│
 └─────────────────────────────────────────────────────────────────┘
 ```
 

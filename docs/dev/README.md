@@ -14,13 +14,14 @@ Technical documentation for XEarthLayer developers and contributors.
 
 | Document | Description |
 |----------|-------------|
-| [Async Pipeline Architecture](async-pipeline-architecture.md) | **Primary design doc**: multi-stage async processing, request coalescing, thread pool exhaustion fix |
+| [Job Executor Design](job-executor-design.md) | **Primary design doc**: job/task framework, daemon architecture, resource pools (v0.3.0+) |
 | [FUSE Filesystem](fuse-filesystem.md) | Virtual filesystem, consolidated mounting, passthrough implementation |
 | [Coordinate System](coordinate-system.md) | Web Mercator projection, tile math, zoom levels |
 | [DDS Implementation](dds-implementation.md) | BC1/BC3 texture compression, mipmap generation |
 | [Cache Design](cache-design.md) | Two-tier caching (memory + disk), LRU eviction |
-| [Parallel Processing](parallel-processing.md) | Thread pools, legacy coalescing (see async pipeline for current) |
+| [Parallel Processing](parallel-processing.md) | Thread pools, legacy coalescing |
 | [Network Stats](network-stats.md) | Download metrics, bandwidth tracking |
+| ~~[Async Pipeline Architecture](async-pipeline-architecture.md)~~ | **(DEPRECATED)** Superseded by Job Executor Framework in v0.3.0 |
 
 ## Package System
 
@@ -64,16 +65,21 @@ Historical documents that describe superseded designs or completed implementatio
 xearthlayer-cli
     └── xearthlayer (library)
             ├── provider (Bing, Go2, Google - async variants)
-            ├── pipeline (async tile processing)
-            │       ├── coalesce (request coalescing)
-            │       ├── stages (download, assembly, encode, cache)
-            │       └── adapters (bridges to providers, cache)
+            ├── executor (job executor daemon, tasks)
+            │       ├── daemon (channel-based job processing)
+            │       ├── client (DdsClient trait, request submission)
+            │       ├── resource_pool (concurrency limiting)
+            │       └── adapters (cache, provider bridges)
+            ├── runtime (orchestration, health monitoring)
+            ├── jobs (DdsGenerateJob, TilePrefetchJob)
+            ├── tasks (download, assemble, encode, cache)
             ├── texture (DDS encoding)
             ├── cache (memory + disk)
             ├── fuse/fuse3 (async multi-threaded filesystem)
             │       ├── passthrough_fs (single source)
             │       ├── union_fs (multi-source patches)
-            │       └── ortho_union_fs (consolidated mount)
+            │       ├── ortho_union_fs (consolidated mount)
+            │       └── coalesce (request coalescing)
             ├── ortho_union (tile → source mapping)
             ├── patches (patch discovery, validation)
             ├── prefetch (radial prefetcher, telemetry)
