@@ -149,6 +149,9 @@ pub fn scan_source_optimized(
                 // Mark as lazy - don't scan contents
                 partial.add_lazy_directory(virtual_path.clone());
 
+                // Register as a directory (empty for now, contents resolved lazily)
+                partial.ensure_directory(&virtual_path);
+
                 // Add directory entry to root
                 if let Ok(dir_entry) = DirEntry::from_path(&real_path) {
                     partial.add_directory_entry(Path::new(""), dir_entry);
