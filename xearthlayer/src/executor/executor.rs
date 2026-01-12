@@ -100,6 +100,16 @@ impl Default for ExecutorConfig {
     }
 }
 
+impl From<&crate::config::ExecutorSettings> for ExecutorConfig {
+    fn from(settings: &crate::config::ExecutorSettings) -> Self {
+        Self {
+            resource_pools: ResourcePoolConfig::from(settings),
+            job_channel_capacity: settings.job_channel_capacity,
+            max_concurrent_tasks: settings.max_concurrent_tasks,
+        }
+    }
+}
+
 // =============================================================================
 // Job Submitter
 // =============================================================================

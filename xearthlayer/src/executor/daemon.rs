@@ -90,6 +90,15 @@ impl Default for ExecutorDaemonConfig {
     }
 }
 
+impl From<&crate::config::ExecutorSettings> for ExecutorDaemonConfig {
+    fn from(settings: &crate::config::ExecutorSettings) -> Self {
+        Self {
+            executor: ExecutorConfig::from(settings),
+            channel_capacity: settings.request_channel_capacity,
+        }
+    }
+}
+
 // =============================================================================
 // Memory Cache Trait (minimal interface for daemon)
 // =============================================================================

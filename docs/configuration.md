@@ -256,6 +256,55 @@ The TUI dashboard shows control plane health including:
 - Semaphore timeouts
 - Health status (Healthy, Degraded, Critical)
 
+### [executor]
+
+Controls the job executor daemon's resource pools and concurrency limits. The executor is the core tile processing engine that manages parallel downloads, encoding, and caching.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `network_concurrent` | integer | `128` | Concurrent HTTP connections (clamped to 64-256) |
+| `cpu_concurrent` | integer | `num_cpus × 1.25` | Concurrent CPU-bound operations (assemble + encode) |
+| `disk_io_concurrent` | integer | `64` | Concurrent disk I/O operations (auto-detected from storage type) |
+| `max_concurrent_tasks` | integer | `128` | Maximum concurrent tasks the executor can run |
+| `job_channel_capacity` | integer | `256` | Internal job queue size |
+| `request_channel_capacity` | integer | `1000` | External request queue (from FUSE/prefetch) |
+| `request_timeout_secs` | integer | `10` | HTTP request timeout per chunk (seconds) |
+| `max_retries` | integer | `3` | Maximum retry attempts per failed chunk |
+| `retry_base_delay_ms` | integer | `100` | Base delay for exponential backoff (ms) |
+
+**Example:**
+```ini
+[executor]
+; Resource pool sizing (defaults are tuned for most systems)
+network_concurrent = 128         ; HTTP connections (64-256 range)
+cpu_concurrent = 10              ; CPU-bound ops (defaults to ~num_cpus * 1.25)
+disk_io_concurrent = 64          ; Disk I/O (auto-detected from storage type)
+
+; Task scheduling
+max_concurrent_tasks = 128       ; Max tasks in flight
+job_channel_capacity = 256       ; Internal job queue
+request_channel_capacity = 1000  ; External request queue
+
+; Download behavior
+request_timeout_secs = 10        ; Per-chunk timeout
+max_retries = 3                  ; Retry attempts
+retry_base_delay_ms = 100        ; Exponential backoff base (100ms, 200ms, 400ms...)
+```
+
+**Resource Pool Details:**
+
+- **Network pool**: Limits concurrent HTTP connections to prevent overwhelming imagery providers. Values outside 64-256 are automatically clamped.
+- **CPU pool**: Limits concurrent encoding operations. Default formula: `max(num_cpus × 1.25, num_cpus + 2)`.
+- **Disk I/O pool**: Limits concurrent disk operations. Auto-detected from storage type (HDD: 4, SSD: 64, NVMe: 256).
+
+**Retry Behavior:**
+
+Failed chunk downloads are retried with exponential backoff:
+- Attempt 1: immediate
+- Attempt 2: 100ms delay
+- Attempt 3: 200ms delay
+- Attempt 4: 400ms delay
+
 ### [prefetch]
 
 Controls predictive tile prefetching based on X-Plane telemetry. The prefetch system pre-loads tiles ahead of the aircraft to reduce FPS drops when new scenery loads.
@@ -502,6 +551,18 @@ timeout = 10
 ; health_check_interval_secs = 5
 ; semaphore_timeout_secs = 30
 
+[executor]
+; Resource pools for job executor daemon (defaults are auto-tuned)
+; network_concurrent = 128         ; HTTP connections (64-256 range)
+; cpu_concurrent = 10              ; CPU-bound ops (~num_cpus * 1.25)
+; disk_io_concurrent = 64          ; Disk I/O (auto-detected)
+; max_concurrent_tasks = 128       ; Max tasks in flight
+; job_channel_capacity = 256       ; Internal job queue
+; request_channel_capacity = 1000  ; External request queue
+; request_timeout_secs = 10        ; Per-chunk HTTP timeout
+; max_retries = 3                  ; Download retry attempts
+; retry_base_delay_ms = 100        ; Backoff base delay
+
 [prefetch]
 ; Predictive tile prefetching based on X-Plane telemetry
 enabled = true
@@ -638,6 +699,15 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `control_plane.stall_threshold_secs` | positive integer | Job stall timeout (seconds) |
 | `control_plane.health_check_interval_secs` | positive integer | Health check interval (seconds) |
 | `control_plane.semaphore_timeout_secs` | positive integer | Slot acquisition timeout (seconds) |
+| `executor.network_concurrent` | positive integer | Concurrent HTTP connections (64-256) |
+| `executor.cpu_concurrent` | positive integer | Concurrent CPU-bound operations |
+| `executor.disk_io_concurrent` | positive integer | Concurrent disk I/O operations |
+| `executor.max_concurrent_tasks` | positive integer | Max concurrent tasks |
+| `executor.job_channel_capacity` | positive integer | Internal job queue size |
+| `executor.request_channel_capacity` | positive integer | External request queue size |
+| `executor.request_timeout_secs` | positive integer | Per-chunk HTTP timeout (seconds) |
+| `executor.max_retries` | positive integer | Max retry attempts per chunk |
+| `executor.retry_base_delay_ms` | positive integer | Exponential backoff base (ms) |
 | `prefetch.enabled` | `true`, `false` | Enable predictive prefetching |
 | `prefetch.strategy` | `auto`, `heading-aware`, `radial` | Prefetch strategy |
 | `prefetch.udp_port` | positive integer | X-Plane telemetry UDP port |

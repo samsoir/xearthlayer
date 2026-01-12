@@ -310,6 +310,16 @@ impl ResourcePoolConfig {
     }
 }
 
+impl From<&crate::config::ExecutorSettings> for ResourcePoolConfig {
+    fn from(settings: &crate::config::ExecutorSettings) -> Self {
+        Self {
+            network: settings.network_concurrent,
+            disk_io: settings.disk_io_concurrent,
+            cpu: settings.cpu_concurrent,
+        }
+    }
+}
+
 // =============================================================================
 // Resource Pools Collection
 // =============================================================================

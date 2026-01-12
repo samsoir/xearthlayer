@@ -98,6 +98,17 @@ pub enum ConfigKey {
     // Patches settings
     PatchesEnabled,
     PatchesDirectory,
+
+    // Executor settings
+    ExecutorNetworkConcurrent,
+    ExecutorCpuConcurrent,
+    ExecutorDiskIoConcurrent,
+    ExecutorMaxConcurrentTasks,
+    ExecutorJobChannelCapacity,
+    ExecutorRequestChannelCapacity,
+    ExecutorRequestTimeoutSecs,
+    ExecutorMaxRetries,
+    ExecutorRetryBaseDelayMs,
 }
 
 impl FromStr for ConfigKey {
@@ -170,6 +181,17 @@ impl FromStr for ConfigKey {
             "patches.enabled" => Ok(ConfigKey::PatchesEnabled),
             "patches.directory" => Ok(ConfigKey::PatchesDirectory),
 
+            // Executor settings
+            "executor.network_concurrent" => Ok(ConfigKey::ExecutorNetworkConcurrent),
+            "executor.cpu_concurrent" => Ok(ConfigKey::ExecutorCpuConcurrent),
+            "executor.disk_io_concurrent" => Ok(ConfigKey::ExecutorDiskIoConcurrent),
+            "executor.max_concurrent_tasks" => Ok(ConfigKey::ExecutorMaxConcurrentTasks),
+            "executor.job_channel_capacity" => Ok(ConfigKey::ExecutorJobChannelCapacity),
+            "executor.request_channel_capacity" => Ok(ConfigKey::ExecutorRequestChannelCapacity),
+            "executor.request_timeout_secs" => Ok(ConfigKey::ExecutorRequestTimeoutSecs),
+            "executor.max_retries" => Ok(ConfigKey::ExecutorMaxRetries),
+            "executor.retry_base_delay_ms" => Ok(ConfigKey::ExecutorRetryBaseDelayMs),
+
             _ => Err(ConfigKeyError::UnknownKey(s.to_string())),
         }
     }
@@ -231,6 +253,17 @@ impl ConfigKey {
             // Patches settings
             ConfigKey::PatchesEnabled => "patches.enabled",
             ConfigKey::PatchesDirectory => "patches.directory",
+
+            // Executor settings
+            ConfigKey::ExecutorNetworkConcurrent => "executor.network_concurrent",
+            ConfigKey::ExecutorCpuConcurrent => "executor.cpu_concurrent",
+            ConfigKey::ExecutorDiskIoConcurrent => "executor.disk_io_concurrent",
+            ConfigKey::ExecutorMaxConcurrentTasks => "executor.max_concurrent_tasks",
+            ConfigKey::ExecutorJobChannelCapacity => "executor.job_channel_capacity",
+            ConfigKey::ExecutorRequestChannelCapacity => "executor.request_channel_capacity",
+            ConfigKey::ExecutorRequestTimeoutSecs => "executor.request_timeout_secs",
+            ConfigKey::ExecutorMaxRetries => "executor.max_retries",
+            ConfigKey::ExecutorRetryBaseDelayMs => "executor.retry_base_delay_ms",
         }
     }
 
@@ -350,6 +383,25 @@ impl ConfigKey {
                 .as_ref()
                 .map(|p| path_to_display(p))
                 .unwrap_or_default(),
+
+            // Executor settings
+            ConfigKey::ExecutorNetworkConcurrent => config.executor.network_concurrent.to_string(),
+            ConfigKey::ExecutorCpuConcurrent => config.executor.cpu_concurrent.to_string(),
+            ConfigKey::ExecutorDiskIoConcurrent => config.executor.disk_io_concurrent.to_string(),
+            ConfigKey::ExecutorMaxConcurrentTasks => {
+                config.executor.max_concurrent_tasks.to_string()
+            }
+            ConfigKey::ExecutorJobChannelCapacity => {
+                config.executor.job_channel_capacity.to_string()
+            }
+            ConfigKey::ExecutorRequestChannelCapacity => {
+                config.executor.request_channel_capacity.to_string()
+            }
+            ConfigKey::ExecutorRequestTimeoutSecs => {
+                config.executor.request_timeout_secs.to_string()
+            }
+            ConfigKey::ExecutorMaxRetries => config.executor.max_retries.to_string(),
+            ConfigKey::ExecutorRetryBaseDelayMs => config.executor.retry_base_delay_ms.to_string(),
         }
     }
 
@@ -510,6 +562,35 @@ impl ConfigKey {
             ConfigKey::PatchesDirectory => {
                 config.patches.directory = optional_path(value);
             }
+
+            // Executor settings
+            ConfigKey::ExecutorNetworkConcurrent => {
+                config.executor.network_concurrent = value.parse().unwrap();
+            }
+            ConfigKey::ExecutorCpuConcurrent => {
+                config.executor.cpu_concurrent = value.parse().unwrap();
+            }
+            ConfigKey::ExecutorDiskIoConcurrent => {
+                config.executor.disk_io_concurrent = value.parse().unwrap();
+            }
+            ConfigKey::ExecutorMaxConcurrentTasks => {
+                config.executor.max_concurrent_tasks = value.parse().unwrap();
+            }
+            ConfigKey::ExecutorJobChannelCapacity => {
+                config.executor.job_channel_capacity = value.parse().unwrap();
+            }
+            ConfigKey::ExecutorRequestChannelCapacity => {
+                config.executor.request_channel_capacity = value.parse().unwrap();
+            }
+            ConfigKey::ExecutorRequestTimeoutSecs => {
+                config.executor.request_timeout_secs = value.parse().unwrap();
+            }
+            ConfigKey::ExecutorMaxRetries => {
+                config.executor.max_retries = value.parse().unwrap();
+            }
+            ConfigKey::ExecutorRetryBaseDelayMs => {
+                config.executor.retry_base_delay_ms = value.parse().unwrap();
+            }
         }
     }
 
@@ -580,10 +661,25 @@ impl ConfigKey {
             // Patches settings
             ConfigKey::PatchesEnabled => Box::new(BooleanSpec),
             ConfigKey::PatchesDirectory => Box::new(OptionalPathSpec),
+
+            // Executor settings
+            ConfigKey::ExecutorNetworkConcurrent => Box::new(PositiveIntegerSpec),
+            ConfigKey::ExecutorCpuConcurrent => Box::new(PositiveIntegerSpec),
+            ConfigKey::ExecutorDiskIoConcurrent => Box::new(PositiveIntegerSpec),
+            ConfigKey::ExecutorMaxConcurrentTasks => Box::new(PositiveIntegerSpec),
+            ConfigKey::ExecutorJobChannelCapacity => Box::new(PositiveIntegerSpec),
+            ConfigKey::ExecutorRequestChannelCapacity => Box::new(PositiveIntegerSpec),
+            ConfigKey::ExecutorRequestTimeoutSecs => Box::new(PositiveIntegerSpec),
+            ConfigKey::ExecutorMaxRetries => Box::new(PositiveIntegerSpec),
+            ConfigKey::ExecutorRetryBaseDelayMs => Box::new(PositiveIntegerSpec),
         }
     }
 
     /// Get all supported configuration keys.
+    ///
+    /// Note: Deprecated keys (like pipeline.*) are NOT included here.
+    /// They remain parseable for backwards compatibility but are not
+    /// expected in new configs. See upgrade.rs DEPRECATED_KEYS for the list.
     pub fn all() -> &'static [ConfigKey] {
         &[
             ConfigKey::ProviderType,
@@ -597,13 +693,7 @@ impl ConfigKey {
             ConfigKey::DownloadTimeout,
             ConfigKey::GenerationThreads,
             ConfigKey::GenerationTimeout,
-            ConfigKey::PipelineMaxHttpConcurrent,
-            ConfigKey::PipelineMaxCpuConcurrent,
-            ConfigKey::PipelineMaxPrefetchInFlight,
-            ConfigKey::PipelineRequestTimeoutSecs,
-            ConfigKey::PipelineMaxRetries,
-            ConfigKey::PipelineRetryBaseDelayMs,
-            ConfigKey::PipelineCoalesceChannelCapacity,
+            // Note: pipeline.* keys are deprecated - use executor.* instead
             ConfigKey::XplaneSceneryDir,
             ConfigKey::PackagesLibraryUrl,
             ConfigKey::PackagesInstallLocation,
@@ -632,6 +722,16 @@ impl ConfigKey {
             // Patches settings
             ConfigKey::PatchesEnabled,
             ConfigKey::PatchesDirectory,
+            // Executor settings
+            ConfigKey::ExecutorNetworkConcurrent,
+            ConfigKey::ExecutorCpuConcurrent,
+            ConfigKey::ExecutorDiskIoConcurrent,
+            ConfigKey::ExecutorMaxConcurrentTasks,
+            ConfigKey::ExecutorJobChannelCapacity,
+            ConfigKey::ExecutorRequestChannelCapacity,
+            ConfigKey::ExecutorRequestTimeoutSecs,
+            ConfigKey::ExecutorMaxRetries,
+            ConfigKey::ExecutorRetryBaseDelayMs,
         ]
     }
 }

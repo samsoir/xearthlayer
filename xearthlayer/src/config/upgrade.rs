@@ -404,7 +404,17 @@ memory_size = 2GB
 
         let analysis = analyze_config(&config_path).unwrap();
 
-        assert!(!analysis.needs_upgrade);
+        // Debug output (always print)
+        eprintln!("Missing keys: {:?}", analysis.missing_keys);
+        eprintln!("Unknown keys: {:?}", analysis.unknown_keys);
+        eprintln!("Deprecated keys: {:?}", analysis.deprecated_keys);
+        eprintln!("Needs upgrade: {}", analysis.needs_upgrade);
+
+        assert!(
+            !analysis.needs_upgrade,
+            "Expected no upgrade needed but missing={:?} unknown={:?} deprecated={:?}",
+            analysis.missing_keys, analysis.unknown_keys, analysis.deprecated_keys
+        );
         assert!(analysis.missing_keys.is_empty());
     }
 

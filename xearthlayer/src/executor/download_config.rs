@@ -55,6 +55,15 @@ impl DownloadConfig {
     }
 }
 
+impl From<&crate::config::ExecutorSettings> for DownloadConfig {
+    fn from(settings: &crate::config::ExecutorSettings) -> Self {
+        Self {
+            request_timeout: Duration::from_secs(settings.request_timeout_secs),
+            max_retries: settings.max_retries,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

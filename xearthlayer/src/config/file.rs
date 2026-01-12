@@ -63,6 +63,8 @@ pub struct ConfigFile {
     pub prewarm: PrewarmSettings,
     /// Patches settings for custom Ortho4XP tile patches
     pub patches: PatchesSettings,
+    /// Executor daemon settings for job/task framework
+    pub executor: ExecutorSettings,
 }
 
 /// Provider configuration.
@@ -257,6 +259,38 @@ pub struct PatchesSettings {
     pub directory: Option<PathBuf>,
 }
 
+/// Executor daemon configuration for the job/task framework.
+#[derive(Debug, Clone)]
+pub struct ExecutorSettings {
+    /// Network resource pool capacity (concurrent HTTP connections).
+    /// Default: 128 (clamped to 64-256 range)
+    pub network_concurrent: usize,
+    /// CPU resource pool capacity (concurrent assemble/encode operations).
+    /// Default: num_cpus * 1.25, minimum num_cpus + 2
+    pub cpu_concurrent: usize,
+    /// Disk I/O resource pool capacity (concurrent disk operations).
+    /// Default: 64 for SSD, auto-detected from storage type
+    pub disk_io_concurrent: usize,
+    /// Maximum concurrent tasks the executor can run.
+    /// Default: 128
+    pub max_concurrent_tasks: usize,
+    /// Internal job channel capacity (job queue size).
+    /// Default: 256
+    pub job_channel_capacity: usize,
+    /// External request channel capacity (request queue from FUSE/prefetch).
+    /// Default: 1000
+    pub request_channel_capacity: usize,
+    /// HTTP request timeout in seconds for individual chunk downloads.
+    /// Default: 10 seconds
+    pub request_timeout_secs: u64,
+    /// Maximum retry attempts per failed chunk download.
+    /// Default: 3
+    pub max_retries: u32,
+    /// Base delay in milliseconds for exponential backoff between retries.
+    /// Default: 100ms
+    pub retry_base_delay_ms: u64,
+}
+
 impl Default for ConfigFile {
     fn default() -> Self {
         let config_dir = config_directory();
@@ -330,6 +364,17 @@ impl Default for ConfigFile {
             patches: PatchesSettings {
                 enabled: true,
                 directory: Some(config_dir.join("patches")),
+            },
+            executor: ExecutorSettings {
+                network_concurrent: DEFAULT_EXECUTOR_NETWORK_CONCURRENT,
+                cpu_concurrent: default_executor_cpu_concurrent(),
+                disk_io_concurrent: DEFAULT_EXECUTOR_DISK_IO_CONCURRENT,
+                max_concurrent_tasks: DEFAULT_EXECUTOR_MAX_CONCURRENT_TASKS,
+                job_channel_capacity: DEFAULT_EXECUTOR_JOB_CHANNEL_CAPACITY,
+                request_channel_capacity: DEFAULT_EXECUTOR_REQUEST_CHANNEL_CAPACITY,
+                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+                max_retries: DEFAULT_MAX_RETRIES,
+                retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
             },
         }
     }
@@ -506,6 +551,32 @@ pub fn default_max_concurrent_jobs() -> usize {
 
 /// Default mipmap count (5 levels: 4096 → 2048 → 1024 → 512 → 256).
 pub const DEFAULT_MIPMAP_COUNT: usize = 5;
+
+// =============================================================================
+// Executor defaults
+// =============================================================================
+
+/// Default network resource pool capacity.
+/// Conservative default of 128 prevents provider rate limiting.
+pub const DEFAULT_EXECUTOR_NETWORK_CONCURRENT: usize = 128;
+
+/// Default disk I/O resource pool capacity for SSD storage.
+pub const DEFAULT_EXECUTOR_DISK_IO_CONCURRENT: usize = 64;
+
+/// Default maximum concurrent tasks in the executor.
+pub const DEFAULT_EXECUTOR_MAX_CONCURRENT_TASKS: usize = 128;
+
+/// Default job channel capacity (internal job queue).
+pub const DEFAULT_EXECUTOR_JOB_CHANNEL_CAPACITY: usize = 256;
+
+/// Default request channel capacity (external request queue).
+pub const DEFAULT_EXECUTOR_REQUEST_CHANNEL_CAPACITY: usize = 1000;
+
+/// Default executor CPU concurrent: num_cpus * 1.25, minimum num_cpus + 2
+pub fn default_executor_cpu_concurrent() -> usize {
+    let cpus = num_cpus();
+    ((cpus as f64 * 1.25).ceil() as usize).max(cpus + 2)
+}
 
 // =============================================================================
 // Package manager defaults
@@ -989,6 +1060,92 @@ impl ConfigFile {
             }
         }
 
+        // [executor] section
+        if let Some(section) = ini.section(Some("executor")) {
+            if let Some(v) = section.get("network_concurrent") {
+                let parsed: usize = v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                    section: "executor".to_string(),
+                    key: "network_concurrent".to_string(),
+                    value: v.to_string(),
+                    reason: "must be a positive integer".to_string(),
+                })?;
+                // Clamp to valid range (same as HTTP concurrent)
+                config.executor.network_concurrent = clamp_http_concurrent(parsed);
+            }
+            if let Some(v) = section.get("cpu_concurrent") {
+                config.executor.cpu_concurrent =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "executor".to_string(),
+                        key: "cpu_concurrent".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("disk_io_concurrent") {
+                config.executor.disk_io_concurrent =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "executor".to_string(),
+                        key: "disk_io_concurrent".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("max_concurrent_tasks") {
+                config.executor.max_concurrent_tasks =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "executor".to_string(),
+                        key: "max_concurrent_tasks".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("job_channel_capacity") {
+                config.executor.job_channel_capacity =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "executor".to_string(),
+                        key: "job_channel_capacity".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("request_channel_capacity") {
+                config.executor.request_channel_capacity =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "executor".to_string(),
+                        key: "request_channel_capacity".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("request_timeout_secs") {
+                config.executor.request_timeout_secs =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "executor".to_string(),
+                        key: "request_timeout_secs".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (seconds)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("max_retries") {
+                config.executor.max_retries =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "executor".to_string(),
+                        key: "max_retries".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("retry_base_delay_ms") {
+                config.executor.retry_base_delay_ms =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "executor".to_string(),
+                        key: "retry_base_delay_ms".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (milliseconds)".to_string(),
+                    })?;
+            }
+        }
+
         Ok(config)
     }
 
@@ -1080,19 +1237,27 @@ threads = {}
 ; If exceeded, returns a magenta placeholder texture
 timeout = {}
 
-[pipeline]
-; Advanced concurrency and retry settings. Defaults are tuned for most systems.
-; Only modify if you understand the implications.
+[executor]
+; Job executor daemon settings for tile generation.
+; These control resource pools, concurrency, and retry behavior.
 
-; Maximum concurrent HTTP requests across all tiles (default: 128, limits: 64-256)
-; Values outside 64-256 are clamped. The ceiling prevents provider rate limiting.
-max_http_concurrent = {}
-; Maximum concurrent CPU-bound operations for tile assembly and encoding
-; (default: num_cpus * 1.25, minimum num_cpus + 2)
-max_cpu_concurrent = {}
-; Maximum concurrent prefetch jobs (default: max(num_cpus / 4, 2))
-; Lower values leave more resources for on-demand tile requests
-max_prefetch_in_flight = {}
+; Resource pool capacities (concurrent operations by type)
+; Network: HTTP connections for chunk downloads (default: 128, clamped to 64-256)
+network_concurrent = {}
+; CPU: Assemble + encode operations (default: num_cpus * 1.25)
+cpu_concurrent = {}
+; Disk I/O: Cache read/write operations (default: 64 for SSD)
+disk_io_concurrent = {}
+
+; Job processing limits
+; Maximum concurrent tasks the executor can run (default: 128)
+max_concurrent_tasks = {}
+; Internal job queue capacity (default: 256)
+job_channel_capacity = {}
+; External request queue from FUSE/prefetch (default: 1000)
+request_channel_capacity = {}
+
+; Download behavior
 ; HTTP request timeout in seconds for individual chunk downloads (default: 10)
 request_timeout_secs = {}
 ; Maximum retry attempts per failed chunk download (default: 3)
@@ -1100,9 +1265,6 @@ max_retries = {}
 ; Base delay in milliseconds for exponential backoff between retries (default: 100)
 ; Actual delay = base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms, 800ms)
 retry_base_delay_ms = {}
-; Broadcast channel capacity for request coalescing (default: 16)
-; Rarely needs adjustment
-coalesce_channel_capacity = {}
 
 [xplane]
 ; X-Plane Custom Scenery directory for mounting scenery packs
@@ -1223,13 +1385,16 @@ directory = {}
             self.download.timeout,
             self.generation.threads,
             self.generation.timeout,
-            self.pipeline.max_http_concurrent,
-            self.pipeline.max_cpu_concurrent,
-            self.pipeline.max_prefetch_in_flight,
-            self.pipeline.request_timeout_secs,
-            self.pipeline.max_retries,
-            self.pipeline.retry_base_delay_ms,
-            self.pipeline.coalesce_channel_capacity,
+            // Executor settings
+            self.executor.network_concurrent,
+            self.executor.cpu_concurrent,
+            self.executor.disk_io_concurrent,
+            self.executor.max_concurrent_tasks,
+            self.executor.job_channel_capacity,
+            self.executor.request_channel_capacity,
+            self.executor.request_timeout_secs,
+            self.executor.max_retries,
+            self.executor.retry_base_delay_ms,
             scenery_dir,
             library_url,
             install_location,
