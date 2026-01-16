@@ -1,4 +1,14 @@
 //! Cache status widgets showing memory and disk cache utilization.
+//!
+//! Displays cache statistics in a compact format:
+//! ```text
+//! Memory: [████████░░] 1.2/2.0 GB (65%) | Hit: 89.2%
+//! Disk:   [██████░░░░] 6.5/20.0 GB (32%) | Hit: 72.5%
+//! ```
+//!
+//! Note: CacheWidget is deprecated - use CacheWidgetCompact instead.
+
+#![allow(dead_code)] // Legacy CacheWidget kept for compatibility
 
 use ratatui::{
     buffer::Buffer,
@@ -8,6 +18,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 use xearthlayer::telemetry::TelemetrySnapshot;
+
+use super::primitives::{format_bytes, format_bytes_usize, ProgressBar, ProgressBarStyle};
 
 /// Configuration for cache display.
 #[derive(Clone)]
@@ -27,7 +39,13 @@ impl Default for CacheConfig {
     }
 }
 
-/// Widget displaying cache statistics.
+/// Widget displaying cache statistics in compact format.
+///
+/// Shows memory and disk cache on separate lines with:
+/// - Progress bar with fractional block precision
+/// - Current/max size
+/// - Utilization percentage
+/// - Hit rate
 pub struct CacheWidget<'a> {
     snapshot: &'a TelemetrySnapshot,
     config: CacheConfig,
@@ -46,75 +64,61 @@ impl<'a> CacheWidget<'a> {
         self
     }
 
-    fn format_bytes(bytes: usize) -> String {
-        if bytes >= 1_000_000_000 {
-            format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
-        } else if bytes >= 1_000_000 {
-            format!("{:.1} MB", bytes as f64 / 1_000_000.0)
-        } else if bytes >= 1_000 {
-            format!("{:.1} KB", bytes as f64 / 1_000.0)
+    /// Get color for hit rate based on threshold.
+    fn hit_rate_color(rate: f64) -> Color {
+        if rate > 80.0 {
+            Color::Green
+        } else if rate > 50.0 {
+            Color::Yellow
         } else {
-            format!("{} B", bytes)
+            Color::Red
         }
     }
 
-    fn progress_bar(current: usize, max: usize, width: usize) -> String {
-        // Handle edge cases where max might be 0 or current might exceed max
-        let ratio = if max > 0 {
-            (current as f64 / max as f64).clamp(0.0, 1.0)
-        } else if current > 0 {
-            // If max is 0 but we have data, show as full
-            1.0
-        } else {
-            0.0
-        };
-        let filled = (ratio * width as f64).round() as usize;
-        let empty = width.saturating_sub(filled);
-        format!("{}{}", "█".repeat(filled), "░".repeat(empty))
-    }
-
-    /// Progress bar for u64 values with fractional block support.
-    ///
-    /// Uses Unicode partial block characters (▏▎▍▌▋▊▉█) to show
-    /// sub-character precision, giving 8x the visual resolution.
-    fn progress_bar_u64(current: u64, max: u64, width: usize) -> String {
-        // Fractional block characters: 1/8 through 8/8
-        const BLOCKS: [char; 9] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
-
-        let ratio = if max > 0 {
-            (current as f64 / max as f64).clamp(0.0, 1.0)
-        } else if current > 0 {
-            1.0
+    /// Build a compact cache line with all metrics.
+    fn build_cache_line(
+        label: &str,
+        current_bytes: u64,
+        max_bytes: u64,
+        hit_rate: f64,
+        bar_color: Color,
+    ) -> Line<'static> {
+        let utilization = if max_bytes > 0 {
+            (current_bytes as f64 / max_bytes as f64) * 100.0
         } else {
             0.0
         };
 
-        // Calculate total eighths filled (width * 8 possible positions)
-        let total_eighths = (ratio * (width * 8) as f64) as usize;
+        let progress_bar = ProgressBar::from_u64(current_bytes, max_bytes, 10)
+            .bar_style(ProgressBarStyle::Fractional)
+            .to_string();
 
-        // Full blocks and remaining eighths
-        let full_blocks = total_eighths / 8;
-        let remainder_eighths = total_eighths % 8;
-
-        let mut result = String::with_capacity(width);
-
-        // Add full blocks
-        for _ in 0..full_blocks {
-            result.push('█');
-        }
-
-        // Add partial block if there's a remainder
-        if full_blocks < width && remainder_eighths > 0 {
-            result.push(BLOCKS[remainder_eighths]);
-        }
-
-        // Fill remaining with empty
-        let chars_used = full_blocks + if remainder_eighths > 0 { 1 } else { 0 };
-        for _ in chars_used..width {
-            result.push('░');
-        }
-
-        result
+        Line::from(vec![
+            Span::styled(format!("  {}: ", label), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("[{}]", progress_bar),
+                Style::default().fg(bar_color),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!(
+                    "{}/{}",
+                    format_bytes(current_bytes),
+                    format_bytes(max_bytes)
+                ),
+                Style::default().fg(bar_color),
+            ),
+            Span::styled(
+                format!(" ({:.0}%)", utilization),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Hit: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:.1}%", hit_rate),
+                Style::default().fg(Self::hit_rate_color(hit_rate)),
+            ),
+        ])
     }
 }
 
@@ -122,114 +126,153 @@ impl Widget for CacheWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block = Block::default().borders(Borders::NONE);
 
-        // Memory cache line
-        let memory_current = self.snapshot.memory_cache_size_bytes as usize;
-        let memory_bar = Self::progress_bar(memory_current, self.config.memory_max_bytes, 16);
+        // Memory cache metrics
+        let memory_current = self.snapshot.memory_cache_size_bytes;
+        let memory_max = self.config.memory_max_bytes as u64;
+        let memory_hit_rate = self.snapshot.memory_cache_hit_rate * 100.0;
+
+        // Disk cache metrics
+        let disk_current = self.snapshot.disk_cache_size_bytes;
+        let disk_max = self.config.disk_max_bytes as u64;
+        let disk_hit_rate = self.snapshot.disk_cache_hit_rate * 100.0;
+
+        let memory_line = Self::build_cache_line(
+            "Memory",
+            memory_current,
+            memory_max,
+            memory_hit_rate,
+            Color::Cyan,
+        );
+
+        let disk_line =
+            Self::build_cache_line("Disk  ", disk_current, disk_max, disk_hit_rate, Color::Blue);
+
+        let text = vec![memory_line, disk_line];
+
+        let paragraph = Paragraph::new(text).block(block);
+        paragraph.render(area, buf);
+    }
+}
+
+/// Compact cache widget for the new dashboard layout.
+///
+/// An even more compact version that fits in 4 lines with additional
+/// stats like hits/misses on a second row per cache type.
+pub struct CacheWidgetCompact<'a> {
+    snapshot: &'a TelemetrySnapshot,
+    config: CacheConfig,
+}
+
+impl<'a> CacheWidgetCompact<'a> {
+    pub fn new(snapshot: &'a TelemetrySnapshot) -> Self {
+        Self {
+            snapshot,
+            config: CacheConfig::default(),
+        }
+    }
+
+    pub fn with_config(mut self, config: CacheConfig) -> Self {
+        self.config = config;
+        self
+    }
+}
+
+impl Widget for CacheWidgetCompact<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let block = Block::default().borders(Borders::NONE);
+
+        // Memory cache
+        let memory_current = self.snapshot.memory_cache_size_bytes;
+        let memory_max = self.config.memory_max_bytes as u64;
+        let memory_hit_rate = self.snapshot.memory_cache_hit_rate * 100.0;
         let memory_hits = self.snapshot.memory_cache_hits;
         let memory_misses = self.snapshot.memory_cache_misses;
-        let memory_hit_rate = self.snapshot.memory_cache_hit_rate * 100.0;
-        let memory_tiles = memory_hits + memory_misses; // Approximate tile count
 
-        let memory_line = Line::from(vec![
-            Span::styled("  Memory Cache:  ", Style::default().fg(Color::White)),
-            Span::styled(memory_bar, Style::default().fg(Color::Cyan)),
-            Span::raw("  "),
+        let memory_bar = ProgressBar::from_u64(memory_current, memory_max, 10)
+            .bar_style(ProgressBarStyle::Fractional)
+            .to_string();
+
+        let memory_line1 = Line::from(vec![
+            Span::styled("  Memory: ", Style::default().fg(Color::White)),
+            Span::styled(
+                format!("[{}]", memory_bar),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw(" "),
             Span::styled(
                 format!(
-                    "{} / {}",
-                    Self::format_bytes(memory_current),
-                    Self::format_bytes(self.config.memory_max_bytes)
+                    "{}/{}",
+                    format_bytes(memory_current),
+                    format_bytes_usize(self.config.memory_max_bytes)
                 ),
                 Style::default().fg(Color::Cyan),
             ),
+        ]);
+
+        let memory_line2 = Line::from(vec![
+            Span::raw("           "),
+            Span::styled("Hit: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("  ({} tiles)", memory_tiles),
+                format!("{:.1}%", memory_hit_rate),
+                Style::default().fg(CacheWidget::hit_rate_color(memory_hit_rate)),
+            ),
+            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} hits", memory_hits),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} miss", memory_misses),
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
 
-        let memory_stats_line = Line::from(vec![
-            Span::raw("                 "),
-            Span::styled("Hit rate: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{:.1}%", memory_hit_rate),
-                Style::default().fg(if memory_hit_rate > 80.0 {
-                    Color::Green
-                } else if memory_hit_rate > 50.0 {
-                    Color::Yellow
-                } else {
-                    Color::Red
-                }),
-            ),
-            Span::styled("  │  Hits: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}", memory_hits),
-                Style::default().fg(Color::White),
-            ),
-            Span::styled("  │  Misses: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}", memory_misses),
-                Style::default().fg(Color::White),
-            ),
-        ]);
-
-        // Disk cache line - use u64 directly for large cache sizes
+        // Disk cache
         let disk_current = self.snapshot.disk_cache_size_bytes;
         let disk_max = self.config.disk_max_bytes as u64;
-        let disk_bar = Self::progress_bar_u64(disk_current, disk_max, 16);
+        let disk_hit_rate = self.snapshot.disk_cache_hit_rate * 100.0;
         let disk_hits = self.snapshot.disk_cache_hits;
         let disk_misses = self.snapshot.disk_cache_misses;
-        let disk_hit_rate = self.snapshot.disk_cache_hit_rate * 100.0;
-        let disk_chunks = disk_hits + disk_misses;
 
-        let disk_line = Line::from(vec![
-            Span::raw(""),
-            Span::styled("  Disk Cache:    ", Style::default().fg(Color::White)),
-            Span::styled(disk_bar, Style::default().fg(Color::Blue)),
-            Span::raw("  "),
+        let disk_bar = ProgressBar::from_u64(disk_current, disk_max, 10)
+            .bar_style(ProgressBarStyle::Fractional)
+            .to_string();
+
+        let disk_line1 = Line::from(vec![
+            Span::styled("  Disk:   ", Style::default().fg(Color::White)),
+            Span::styled(format!("[{}]", disk_bar), Style::default().fg(Color::Blue)),
+            Span::raw(" "),
             Span::styled(
                 format!(
-                    "{} / {}",
-                    Self::format_bytes(disk_current as usize),
-                    Self::format_bytes(self.config.disk_max_bytes)
+                    "{}/{}",
+                    format_bytes(disk_current),
+                    format_bytes_usize(self.config.disk_max_bytes)
                 ),
                 Style::default().fg(Color::Blue),
             ),
+        ]);
+
+        let disk_line2 = Line::from(vec![
+            Span::raw("           "),
+            Span::styled("Hit: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("  ({} chunks)", disk_chunks),
+                format!("{:.1}%", disk_hit_rate),
+                Style::default().fg(CacheWidget::hit_rate_color(disk_hit_rate)),
+            ),
+            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} hits", disk_hits),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} miss", disk_misses),
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
 
-        let disk_stats_line = Line::from(vec![
-            Span::raw("                 "),
-            Span::styled("Hit rate: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{:.1}%", disk_hit_rate),
-                Style::default().fg(if disk_hit_rate > 80.0 {
-                    Color::Green
-                } else if disk_hit_rate > 50.0 {
-                    Color::Yellow
-                } else {
-                    Color::Red
-                }),
-            ),
-            Span::styled("  │  Hits: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{}", disk_hits), Style::default().fg(Color::White)),
-            Span::styled("  │  Misses: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}", disk_misses),
-                Style::default().fg(Color::White),
-            ),
-        ]);
-
-        let text = vec![
-            memory_line,
-            memory_stats_line,
-            Line::raw(""), // Blank line between memory and disk cache
-            disk_line,
-            disk_stats_line,
-        ];
+        let text = vec![memory_line1, memory_line2, disk_line1, disk_line2];
 
         let paragraph = Paragraph::new(text).block(block);
         paragraph.render(area, buf);

@@ -1,4 +1,8 @@
 //! Error summary widget.
+//!
+//! Note: Deprecated in v0.3.0 - errors are now shown in ScenerySystemWidget.
+
+#![allow(dead_code)] // Deprecated widget, kept for compatibility
 
 use ratatui::{
     buffer::Buffer,

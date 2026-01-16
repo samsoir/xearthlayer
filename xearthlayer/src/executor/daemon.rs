@@ -55,7 +55,10 @@
 //! let response = response_rx.await?;
 //! ```
 
-use crate::executor::{ExecutorConfig, JobExecutor, JobStatus, JobSubmitter as ExecutorSubmitter};
+use crate::executor::{
+    ExecutorConfig, JobExecutor, JobStatus, JobSubmitter as ExecutorSubmitter, TelemetrySink,
+    TracingTelemetrySink,
+};
 use crate::jobs::DdsJobFactory;
 use crate::runtime::{DdsResponse, JobRequest};
 use std::sync::Arc;
@@ -177,6 +180,7 @@ where
     /// Creates a new daemon with its channel.
     ///
     /// Returns the daemon and a sender that can be cloned for producers.
+    /// Uses a default `TracingTelemetrySink` for logging.
     ///
     /// # Arguments
     ///
@@ -188,8 +192,32 @@ where
         factory: Arc<F>,
         memory_cache: Arc<M>,
     ) -> (Self, mpsc::Sender<JobRequest>) {
+        Self::with_telemetry(
+            config,
+            factory,
+            memory_cache,
+            Arc::new(TracingTelemetrySink),
+        )
+    }
+
+    /// Creates a new daemon with a custom telemetry sink.
+    ///
+    /// Returns the daemon and a sender that can be cloned for producers.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Daemon configuration
+    /// * `factory` - Factory for creating DDS jobs
+    /// * `memory_cache` - Memory cache for fast-path lookups
+    /// * `telemetry` - Telemetry sink for emitting executor events
+    pub fn with_telemetry(
+        config: ExecutorDaemonConfig,
+        factory: Arc<F>,
+        memory_cache: Arc<M>,
+        telemetry: Arc<dyn TelemetrySink>,
+    ) -> (Self, mpsc::Sender<JobRequest>) {
         let (request_tx, request_rx) = mpsc::channel(config.channel_capacity);
-        let (executor, submitter) = JobExecutor::new(config.executor);
+        let (executor, submitter) = JobExecutor::with_telemetry(config.executor, telemetry);
 
         let daemon = Self {
             executor,

@@ -321,6 +321,7 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
                 active_zoom_levels: zoom_levels,
                 is_active: !should_throttle,
                 circuit_state,
+                loading_tiles: vec![],
             });
         }
 
@@ -481,6 +482,7 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
                     active_zoom_levels: self.active_zoom_levels(),
                     is_active: false,
                     circuit_state,
+                    loading_tiles: vec![],
                 });
             }
             return;
@@ -540,6 +542,7 @@ impl<M: MemoryCache> HeadingAwarePrefetcher<M> {
                 active_zoom_levels: self.active_zoom_levels(),
                 is_active: cycle_results.submitted > 0,
                 circuit_state,
+                loading_tiles: vec![],
             });
         }
 

@@ -611,6 +611,7 @@ fn run_with_dashboard(
     let dashboard_config = DashboardConfig {
         memory_cache_max: ctx.config.cache.memory_size,
         disk_cache_max: ctx.config.cache.disk_size,
+        provider_name: ctx.config.provider.provider_type.clone(),
     };
 
     // Create initial loading progress for OrthoUnionIndex building

@@ -30,6 +30,7 @@ use crate::executor::{
 use crate::jobs::DefaultDdsJobFactory;
 use crate::provider::AsyncProviderType;
 use crate::runtime::{RuntimeConfig, XEarthLayerRuntime};
+use crate::telemetry::PipelineMetrics;
 use crate::texture::DdsTextureEncoder;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,6 +60,8 @@ pub struct RuntimeBuilder {
     config: RuntimeConfig,
     /// Tokio runtime handle for spawning tasks
     runtime_handle: Option<tokio::runtime::Handle>,
+    /// Pipeline metrics for telemetry (updates dashboard UI)
+    metrics: Option<Arc<PipelineMetrics>>,
 }
 
 impl RuntimeBuilder {
@@ -83,6 +86,7 @@ impl RuntimeBuilder {
             cache_dir: None,
             config: RuntimeConfig::default(),
             runtime_handle: None,
+            metrics: None,
         }
     }
 
@@ -118,6 +122,15 @@ impl RuntimeBuilder {
     /// This is required for the runtime to spawn background tasks.
     pub fn with_runtime_handle(mut self, handle: tokio::runtime::Handle) -> Self {
         self.runtime_handle = Some(handle);
+        self
+    }
+
+    /// Sets the pipeline metrics for telemetry.
+    ///
+    /// When metrics are provided, the executor daemon emits events that update
+    /// the metrics, enabling the dashboard UI to show job activity.
+    pub fn with_metrics(mut self, metrics: Arc<PipelineMetrics>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -162,7 +175,13 @@ impl RuntimeBuilder {
             disk_cache,
         );
 
-        XEarthLayerRuntime::new(factory, cache_adapter, self.config, runtime_handle)
+        XEarthLayerRuntime::with_metrics(
+            factory,
+            cache_adapter,
+            self.config,
+            runtime_handle,
+            self.metrics,
+        )
     }
 
     /// Builds the XEarthLayerRuntime without disk caching.
@@ -199,7 +218,13 @@ impl RuntimeBuilder {
             Arc::clone(&cache_adapter),
         );
 
-        XEarthLayerRuntime::new(factory, cache_adapter, self.config, runtime_handle)
+        XEarthLayerRuntime::with_metrics(
+            factory,
+            cache_adapter,
+            self.config,
+            runtime_handle,
+            self.metrics,
+        )
     }
 
     /// Creates a factory with DiskCacheAdapter.

@@ -66,6 +66,9 @@ pub struct DetailedPrefetchStats {
     /// Circuit breaker state (None if circuit breaker is disabled).
     /// Used by TUI to show prefetch pause status.
     pub circuit_state: Option<super::circuit_breaker::CircuitState>,
+    /// Tile coordinates currently being prefetched (limited to 10 for display).
+    /// Each tuple is (latitude, longitude) of the tile's southwest corner.
+    pub loading_tiles: Vec<(i32, i32)>,
 }
 
 impl std::fmt::Display for PrefetchMode {

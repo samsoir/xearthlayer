@@ -32,7 +32,9 @@ use xearthlayer::prefetch::SharedPrefetchStatus;
 use xearthlayer::runtime::{HealthSnapshot, SharedRuntimeHealth};
 use xearthlayer::telemetry::TelemetrySnapshot;
 
-use crate::ui::widgets::{CacheConfig, NetworkHistory, PipelineHistory};
+use crate::ui::widgets::{
+    CacheConfig, DiskHistory, NetworkHistory, PipelineHistory, SceneryHistory,
+};
 
 // Re-export public types from state module
 pub use state::{
@@ -49,6 +51,10 @@ pub struct Dashboard {
     config: DashboardConfig,
     network_history: NetworkHistory,
     pipeline_history: PipelineHistory,
+    /// History for scenery system sparklines (new v0.3.0 layout).
+    scenery_history: SceneryHistory,
+    /// History for disk I/O sparklines (new v0.3.0 layout).
+    disk_history: DiskHistory,
     shutdown: Arc<AtomicBool>,
     start_time: Instant,
     last_draw: Instant,
@@ -95,6 +101,8 @@ impl Dashboard {
             config,
             network_history: NetworkHistory::new(60), // 60 samples for sparkline
             pipeline_history: PipelineHistory::new(12), // 12 samples for pipeline sparkline
+            scenery_history: SceneryHistory::new(12), // 12 samples for scenery sparklines
+            disk_history: DiskHistory::new(12),       // 12 samples for disk I/O sparkline
             shutdown,
             start_time: now,
             last_draw: now,
@@ -196,6 +204,13 @@ impl Dashboard {
         // Update pipeline history for sparklines
         self.pipeline_history.update(snapshot, sample_interval);
 
+        // Update scenery history for new layout sparklines
+        self.scenery_history.update(snapshot, sample_interval);
+
+        // Update disk history (using disk cache size as proxy for disk writes)
+        self.disk_history
+            .update(snapshot.disk_cache_size_bytes, sample_interval);
+
         let uptime = self.start_time.elapsed();
         let cache_config = CacheConfig {
             memory_max_bytes: self.config.memory_cache_max,
@@ -242,8 +257,11 @@ impl Dashboard {
         // Store current snapshot for next rate calculation
         self.prev_control_plane_snapshot = control_plane_snapshot.clone();
 
-        // Clone pipeline history for use in closure
+        // Clone histories for use in closure
         let pipeline_history = self.pipeline_history.clone();
+        let scenery_history = self.scenery_history.clone();
+        let disk_history = self.disk_history.clone();
+        let provider_name = self.config.provider_name.clone();
 
         // Calculate confirmation remaining time for display
         let confirmation_remaining = self.confirmation_remaining();
@@ -263,6 +281,9 @@ impl Dashboard {
                 snapshot,
                 &self.network_history,
                 &pipeline_history,
+                &scenery_history,
+                &disk_history,
+                &provider_name,
                 uptime,
                 &cache_config,
                 &prefetch_snapshot,

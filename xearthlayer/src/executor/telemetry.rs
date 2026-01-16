@@ -397,6 +397,97 @@ impl std::fmt::Debug for MultiplexTelemetrySink {
     }
 }
 
+/// Sink that updates `PipelineMetrics` with executor events.
+///
+/// This bridges the executor's event system with the telemetry metrics
+/// used by the dashboard UI. Without this sink, the UI shows zero activity.
+///
+/// # Usage
+///
+/// ```ignore
+/// use xearthlayer::executor::MetricsTelemetrySink;
+/// use xearthlayer::telemetry::PipelineMetrics;
+///
+/// let metrics = Arc::new(PipelineMetrics::new());
+/// let sink = MetricsTelemetrySink::new(Arc::clone(&metrics));
+/// ```
+pub struct MetricsTelemetrySink {
+    metrics: Arc<crate::telemetry::PipelineMetrics>,
+}
+
+impl MetricsTelemetrySink {
+    /// Creates a new metrics sink wrapping the given metrics instance.
+    pub fn new(metrics: Arc<crate::telemetry::PipelineMetrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+impl TelemetrySink for MetricsTelemetrySink {
+    fn emit(&self, event: TelemetryEvent) {
+        use super::handle::JobStatus;
+
+        match event {
+            TelemetryEvent::JobSubmitted { .. } => {
+                // Job submitted - increment the submitted counter
+                // Note: fuse_job_submitted is called separately by the FUSE layer
+                // This event just means a job entered the queue
+                self.metrics.job_submitted();
+            }
+
+            TelemetryEvent::JobStarted { .. } => {
+                // Job started processing
+                self.metrics.job_started();
+            }
+
+            TelemetryEvent::JobCompleted { status, .. } => {
+                // Job finished - update based on status
+                match status {
+                    JobStatus::Succeeded => {
+                        self.metrics.job_completed();
+                    }
+                    JobStatus::Failed => {
+                        self.metrics.job_failed();
+                    }
+                    JobStatus::Cancelled | JobStatus::Stopped => {
+                        // Cancelled/stopped jobs don't count as completed or failed
+                        // but we need to decrement active count
+                        self.metrics.jobs_active_decrement();
+                    }
+                    JobStatus::Pending | JobStatus::Running | JobStatus::Paused => {
+                        // These statuses shouldn't appear in JobCompleted event
+                        // but if they do, treat as failed
+                        self.metrics.job_failed();
+                    }
+                }
+            }
+
+            TelemetryEvent::TaskRetrying { .. } => {
+                // Task is retrying - could track as download retry if it's a download task
+                // For now, we don't have enough context to know the task type
+            }
+
+            // Other events don't directly map to metrics
+            TelemetryEvent::JobSignalled { .. }
+            | TelemetryEvent::TaskStarted { .. }
+            | TelemetryEvent::TaskCompleted { .. }
+            | TelemetryEvent::ChildJobSpawned { .. }
+            | TelemetryEvent::ResourcePoolExhausted { .. }
+            | TelemetryEvent::ResourcePoolAvailable { .. }
+            | TelemetryEvent::TaskEnqueued { .. }
+            | TelemetryEvent::TaskDequeued { .. } => {
+                // These events are for detailed observability but don't map
+                // directly to the high-level metrics shown in the dashboard
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for MetricsTelemetrySink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsTelemetrySink").finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

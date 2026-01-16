@@ -1,4 +1,13 @@
 //! Network throughput widget with sparkline.
+//!
+//! TODO: Refactor NetworkHistory to use primitives::SparklineHistory instead of
+//! the inline sparkline implementation. This will consolidate sparkline logic
+//! and ensure consistent visualization across all widgets.
+//!
+//! Note: NetworkWidget is deprecated in v0.3.0 - use InputOutputWidget instead.
+//! NetworkHistory is still used by InputOutputWidget.
+
+#![allow(dead_code)] // NetworkWidget deprecated, NetworkHistory methods kept for API
 
 use ratatui::{
     buffer::Buffer,
@@ -78,7 +87,7 @@ impl NetworkHistory {
     }
 
     /// Generate sparkline characters.
-    fn sparkline(&self, width: usize) -> String {
+    pub fn sparkline(&self, width: usize) -> String {
         const SPARK_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
         if self.samples.is_empty() {

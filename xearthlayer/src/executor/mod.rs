@@ -152,7 +152,8 @@ pub use resource_pool::{
 
 // Telemetry
 pub use telemetry::{
-    MultiplexTelemetrySink, NullTelemetrySink, TelemetryEvent, TelemetrySink, TracingTelemetrySink,
+    MetricsTelemetrySink, MultiplexTelemetrySink, NullTelemetrySink, TelemetryEvent, TelemetrySink,
+    TracingTelemetrySink,
 };
 
 // Queue
@@ -186,7 +187,7 @@ pub use traits::{
 pub use chunk_results::{ChunkFailure, ChunkResults, ChunkSuccess};
 
 // Download configuration
-pub use download_config::DownloadConfig;
+pub use download_config::{DownloadConfig, DEFAULT_MAX_CONCURRENT_CHUNKS};
 
 // Adapters (bridge external implementations to executor traits)
 pub use adapters::{

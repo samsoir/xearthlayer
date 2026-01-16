@@ -293,6 +293,7 @@ impl XEarthLayerService {
                         .unwrap_or_else(|| PathBuf::from("/tmp/xearthlayer")),
                 )
                 .with_runtime_handle(runtime_handle.clone())
+                .with_metrics(Arc::clone(&metrics)) // Wire metrics for dashboard UI
                 .build();
 
                 let client = runtime.dds_client();

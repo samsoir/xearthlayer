@@ -196,6 +196,14 @@ impl PipelineMetrics {
         self.jobs_coalesced.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Decrement the active jobs counter (for cancelled jobs).
+    ///
+    /// This is used when a job is cancelled - it shouldn't count as
+    /// completed or failed, but we need to track that it's no longer active.
+    pub fn jobs_active_decrement(&self) {
+        self.jobs_active.fetch_sub(1, Ordering::Relaxed);
+    }
+
     // === Download tracking ===
 
     /// Record a download starting.

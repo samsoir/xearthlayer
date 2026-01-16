@@ -3,6 +3,10 @@
 //! Shows pipeline stages with sparklines and throughput rates in 4 columns:
 //! DOWNLOAD | ASSEMBLY | ENCODE | TILES
 //! Each with sparkline, rate, and active count using grid layout.
+//!
+//! Note: Deprecated in v0.3.0 - replaced by ScenerySystemWidget.
+
+#![allow(dead_code)] // Deprecated widget, kept for compatibility
 
 use ratatui::{
     buffer::Buffer,

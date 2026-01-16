@@ -110,7 +110,8 @@ impl super::MemoryCache for ExecutorCacheAdapter {
 
     async fn put(&self, row: u32, col: u32, zoom: u8, data: Vec<u8>) {
         let key = self.make_key(row, col, zoom);
-        self.cache.put_sync(key, data);
+        // Use async put to ensure write completes (put_sync can drop writes!)
+        self.cache.put(key, data).await;
     }
 
     fn size_bytes(&self) -> usize {

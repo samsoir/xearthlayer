@@ -3,6 +3,10 @@
 //! This module contains rendering functions for specific dashboard sections:
 //! - Aircraft position / prefetch status
 //! - Control plane metrics
+//!
+//! Note: Some functions here are legacy (v0.2.x) and kept for reference.
+
+#![allow(dead_code)] // Legacy render functions kept for reference
 
 use ratatui::{
     layout::Rect,

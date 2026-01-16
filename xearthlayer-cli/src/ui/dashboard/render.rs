@@ -1,6 +1,26 @@
 //! Main dashboard rendering.
 //!
 //! This module contains the top-level layout orchestration and header rendering.
+//!
+//! ## Layout v0.3.0
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────┐
+//! │ Header (3 lines)                                        │
+//! ├─────────────────────────────────────────────────────────┤
+//! │ Aircraft Position (4 lines)                             │
+//! ├─────────────────────────────────────────────────────────┤
+//! │ Prefetch System (4 lines)                               │
+//! ├─────────────────────────────────────────────────────────┤
+//! │ Scenery System (8 lines) - 2-column                     │
+//! │ TILE REQUESTS        │ TILE PROCESSING                  │
+//! ├─────────────────────────────────────────────────────────┤
+//! │ Input/Output (8 lines) - 2-column                       │
+//! │ NETWORK              │ DISK                             │
+//! ├─────────────────────────────────────────────────────────┤
+//! │ Caches (6 lines)                                        │
+//! └─────────────────────────────────────────────────────────┘
+//! ```
 
 use std::time::Duration;
 
@@ -15,109 +35,107 @@ use xearthlayer::prefetch::PrefetchStatusSnapshot;
 use xearthlayer::runtime::HealthSnapshot;
 use xearthlayer::telemetry::TelemetrySnapshot;
 
-use super::render_sections::{inner_rect, render_control_plane, render_prefetch};
+use super::render_sections::inner_rect;
 use super::state::{JobRates, PrewarmProgress};
 use super::utils::format_duration;
 use crate::ui::widgets::{
-    CacheConfig, CacheWidget, ErrorsWidget, NetworkHistory, NetworkWidget, PipelineHistory,
-    PipelineWidget,
+    CacheConfig, CacheWidgetCompact, DiskHistory, InputOutputWidget, NetworkHistory,
+    PipelineHistory, PrefetchSystemWidget, SceneryHistory, ScenerySystemWidget,
 };
 
 /// Render the main dashboard UI to the frame.
+///
+/// # Layout v0.3.0
+///
+/// The new layout consolidates the old 8-section layout into 6 sections
+/// with side-by-side panels for better information density.
 #[allow(clippy::too_many_arguments)]
 pub fn render_ui(
     frame: &mut Frame,
     snapshot: &TelemetrySnapshot,
     network_history: &NetworkHistory,
-    pipeline_history: &PipelineHistory,
+    #[allow(unused_variables)] pipeline_history: &PipelineHistory, // Legacy, kept for compatibility
+    scenery_history: &SceneryHistory,
+    disk_history: &DiskHistory,
+    provider_name: &str,
     uptime: Duration,
     cache_config: &CacheConfig,
     prefetch_snapshot: &PrefetchStatusSnapshot,
     control_plane_snapshot: Option<&HealthSnapshot>,
     max_concurrent_jobs: usize,
-    job_rates: Option<&JobRates>,
+    #[allow(unused_variables)] job_rates: Option<&JobRates>, // Legacy, kept for compatibility
     confirmation_remaining: Option<Duration>,
     prewarm_status: Option<&PrewarmProgress>,
     prewarm_spinner: Option<char>,
 ) {
     let size = frame.area();
 
-    // Main layout: header, prefetch, control plane, pipeline, chunks, network, cache
+    // New v0.3.0 layout: 6 sections
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(0)
         .constraints([
             Constraint::Length(3), // Header
-            Constraint::Length(5), // Aircraft Position (GPS Status, Position, Prefetch)
-            Constraint::Length(5), // Control Plane (needs 4 rows + 1 border)
-            Constraint::Length(6), // Pipeline (Tile Pipeline)
-            Constraint::Length(3), // Chunk Tasks (moved above Network)
-            Constraint::Length(3), // Network
-            Constraint::Length(7), // Cache (5 content + 1 border + 1 title)
+            Constraint::Length(4), // Aircraft Position
+            Constraint::Length(4), // Prefetch System
+            Constraint::Length(8), // Scenery System (2-column)
+            Constraint::Length(8), // Input/Output (2-column)
+            Constraint::Length(6), // Caches
             Constraint::Min(0),    // Padding
         ])
         .split(size);
 
-    // Header
+    // 1. Header
     render_header(frame, chunks[0], uptime, prewarm_status, prewarm_spinner);
 
-    // Prefetch/Aircraft widget
-    render_prefetch(frame, chunks[1], prefetch_snapshot);
+    // 2. Aircraft Position (simplified - prefetch moved to its own panel)
+    render_aircraft_position(frame, chunks[1], prefetch_snapshot);
 
-    // Control plane widget
-    render_control_plane(
-        frame,
-        chunks[2],
-        control_plane_snapshot,
-        max_concurrent_jobs,
-        job_rates,
-    );
+    // 3. Prefetch System (new panel)
+    render_prefetch_system(frame, chunks[2], prefetch_snapshot);
 
-    // Pipeline widget (Tile Pipeline)
-    let pipeline_block = Block::default()
+    // 4. Scenery System (replaces Control Plane + Pipeline)
+    let scenery_block = Block::default()
         .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
-            " Tile Pipeline ",
+            " Scenery System ",
             Style::default().fg(Color::Blue),
         ));
-    frame.render_widget(pipeline_block, chunks[3]);
-    let pipeline_inner = inner_rect(chunks[3], 1, 1);
+    frame.render_widget(scenery_block, chunks[3]);
+    let scenery_inner = inner_rect(chunks[3], 1, 1);
     frame.render_widget(
-        PipelineWidget::new(snapshot).with_history(pipeline_history),
-        pipeline_inner,
+        ScenerySystemWidget::new(snapshot, max_concurrent_jobs)
+            .with_health(control_plane_snapshot)
+            .with_history(scenery_history),
+        scenery_inner,
     );
 
-    // Chunk Tasks widget (moved above Network)
-    let chunks_block = Block::default()
+    // 5. Input/Output (replaces Network + Chunk Tasks)
+    let io_block = Block::default()
         .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
-            " Chunk Tasks ",
+            " Input / Output ",
             Style::default().fg(Color::Blue),
         ));
-    frame.render_widget(chunks_block, chunks[4]);
-    let chunks_inner = inner_rect(chunks[4], 1, 1);
-    frame.render_widget(ErrorsWidget::new(snapshot), chunks_inner);
+    frame.render_widget(io_block, chunks[4]);
+    let io_inner = inner_rect(chunks[4], 1, 1);
+    frame.render_widget(
+        InputOutputWidget::new(snapshot, network_history, provider_name)
+            .with_disk_history(disk_history),
+        io_inner,
+    );
 
-    // Network widget
-    let network_block = Block::default()
-        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(" Network ", Style::default().fg(Color::Blue)));
-    frame.render_widget(network_block, chunks[5]);
-    let network_inner = inner_rect(chunks[5], 1, 1);
-    frame.render_widget(NetworkWidget::new(snapshot, network_history), network_inner);
-
-    // Cache widget
+    // 6. Caches (compact format)
     let cache_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(" Cache ", Style::default().fg(Color::Blue)));
-    frame.render_widget(cache_block, chunks[6]);
-    let cache_inner = inner_rect(chunks[6], 1, 1);
+        .title(Span::styled(" Caches ", Style::default().fg(Color::Blue)));
+    frame.render_widget(cache_block, chunks[5]);
+    let cache_inner = inner_rect(chunks[5], 1, 1);
     frame.render_widget(
-        CacheWidget::new(snapshot).with_config(cache_config.clone()),
+        CacheWidgetCompact::new(snapshot).with_config(cache_config.clone()),
         cache_inner,
     );
 
@@ -125,6 +143,79 @@ pub fn render_ui(
     if let Some(remaining) = confirmation_remaining {
         render_quit_confirmation(frame, size, remaining);
     }
+}
+
+/// Render the aircraft position section (simplified for v0.3.0).
+///
+/// Shows GPS status and position only. Prefetch details moved to dedicated panel.
+fn render_aircraft_position(frame: &mut Frame, area: Rect, prefetch: &PrefetchStatusSnapshot) {
+    use xearthlayer::prefetch::GpsStatus;
+
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " Aircraft Position ",
+            Style::default().fg(Color::Magenta),
+        ));
+
+    frame.render_widget(block, area);
+    let inner = inner_rect(area, 1, 1);
+
+    // GPS Status line with colored indicator
+    let (gps_indicator, gps_text, gps_color) = match prefetch.gps_status {
+        GpsStatus::Connected => ("●", "Connected", Color::Green),
+        GpsStatus::Acquiring => ("●", "Acquiring...", Color::Yellow),
+        GpsStatus::Inferred => ("●", "Inferred", Color::Red),
+    };
+
+    let gps_line = Line::from(vec![
+        Span::styled("GPS Status: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{} ", gps_indicator),
+            Style::default().fg(gps_color),
+        ),
+        Span::styled(gps_text, Style::default().fg(gps_color)),
+    ]);
+
+    // Position line
+    let position_line = if prefetch.aircraft.is_some() {
+        Line::from(vec![
+            Span::styled("Position:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(prefetch.aircraft_line(), Style::default().fg(Color::Green)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("Position:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Waiting for X-Plane telemetry...",
+                Style::default().fg(Color::Yellow),
+            ),
+        ])
+    };
+
+    let text = vec![gps_line, position_line];
+    let paragraph = Paragraph::new(text);
+    frame.render_widget(paragraph, inner);
+}
+
+/// Render the prefetch system panel (new in v0.3.0).
+fn render_prefetch_system(frame: &mut Frame, area: Rect, prefetch: &PrefetchStatusSnapshot) {
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " Prefetch System ",
+            Style::default().fg(Color::Yellow),
+        ));
+
+    frame.render_widget(block, area);
+    let inner = inner_rect(area, 1, 1);
+
+    frame.render_widget(
+        PrefetchSystemWidget::new(prefetch.prefetch_mode, prefetch.detailed_stats.as_ref()),
+        inner,
+    );
 }
 
 /// Render the quit confirmation overlay banner.

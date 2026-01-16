@@ -234,6 +234,8 @@ pub struct DashboardConfig {
     pub memory_cache_max: usize,
     /// Disk cache max size.
     pub disk_cache_max: usize,
+    /// Provider name for display (e.g., "Bing", "Google", "Go2").
+    pub provider_name: String,
 }
 
 impl Default for DashboardConfig {
@@ -241,11 +243,15 @@ impl Default for DashboardConfig {
         Self {
             memory_cache_max: 2 * 1024 * 1024 * 1024,
             disk_cache_max: 20 * 1024 * 1024 * 1024,
+            provider_name: "Unknown".to_string(),
         }
     }
 }
 
 /// Job rate metrics for the control plane display.
+///
+/// Note: Used by legacy ControlPlaneWidget, kept for compatibility.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct JobRates {
     /// Jobs submitted per second (instantaneous rate).

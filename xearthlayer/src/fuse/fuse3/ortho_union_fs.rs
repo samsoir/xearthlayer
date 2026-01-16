@@ -40,6 +40,7 @@ use super::inode::InodeManager;
 use super::shared::{DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
 use super::types::{Fuse3Error, Fuse3Result};
 use crate::executor::{DdsClient, StorageConcurrencyLimiter};
+use crate::fuse::coalesce::RequestCoalescer;
 use crate::fuse::{get_default_placeholder, parse_dds_filename};
 use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::TileRequestCallback;
@@ -101,6 +102,8 @@ pub struct Fuse3OrthoUnionFS {
     disk_io_limiter: Arc<StorageConcurrencyLimiter>,
     /// Optional callback for tile request tracking
     tile_request_callback: Option<TileRequestCallback>,
+    /// Request coalescer for deduplicating concurrent requests
+    request_coalescer: Arc<RequestCoalescer>,
 }
 
 impl Fuse3OrthoUnionFS {
@@ -125,6 +128,7 @@ impl Fuse3OrthoUnionFS {
         let disk_io_limiter = Arc::new(StorageConcurrencyLimiter::with_defaults(
             "ortho_union_disk_io",
         ));
+        let request_coalescer = Arc::new(RequestCoalescer::new());
         debug!(
             max_concurrent = disk_io_limiter.max_concurrent(),
             sources = index.source_count(),
@@ -143,6 +147,7 @@ impl Fuse3OrthoUnionFS {
             generation_timeout: Duration::from_secs(30),
             disk_io_limiter,
             tile_request_callback: None,
+            request_coalescer,
         }
     }
 
@@ -157,6 +162,7 @@ impl Fuse3OrthoUnionFS {
         disk_io_limiter: Arc<StorageConcurrencyLimiter>,
     ) -> Self {
         let virtual_root = PathBuf::from("/");
+        let request_coalescer = Arc::new(RequestCoalescer::new());
 
         Self {
             index: Arc::new(index),
@@ -166,6 +172,7 @@ impl Fuse3OrthoUnionFS {
             generation_timeout: Duration::from_secs(30),
             disk_io_limiter,
             tile_request_callback: None,
+            request_coalescer,
         }
     }
 
@@ -312,6 +319,10 @@ impl DdsRequestor for Fuse3OrthoUnionFS {
 
     fn tile_request_callback(&self) -> Option<&TileRequestCallback> {
         self.tile_request_callback.as_ref()
+    }
+
+    fn request_coalescer(&self) -> Option<&Arc<RequestCoalescer>> {
+        Some(&self.request_coalescer)
     }
 }
 
@@ -705,7 +716,23 @@ impl Filesystem for Fuse3OrthoUnionFS {
             let (kind, attr) = if dir_entry.is_dir {
                 (FileType::Directory, self.virtual_dir_attr(entry_inode))
             } else {
-                (FileType::RegularFile, self.virtual_dds_attr(entry_inode))
+                // For real files, get actual metadata from the source path
+                // This is critical for DSF and other passthrough files that need
+                // accurate file sizes reported to X-Plane
+                if let Some(source) = self.index.resolve(&child_path) {
+                    if let Ok(metadata) = fs::metadata(&source.real_path).await {
+                        (
+                            FileType::RegularFile,
+                            self.metadata_to_attr(entry_inode, &metadata),
+                        )
+                    } else {
+                        // Fallback if metadata read fails
+                        (FileType::RegularFile, self.virtual_dds_attr(entry_inode))
+                    }
+                } else {
+                    // Entry not in index (shouldn't happen for list_directory entries)
+                    (FileType::RegularFile, self.virtual_dds_attr(entry_inode))
+                }
             };
 
             entries.push(DirectoryEntryPlus {
@@ -1002,5 +1029,81 @@ mod tests {
         let fs = Fuse3OrthoUnionFS::new(index, client, 1024).with_timeout(Duration::from_secs(60));
 
         assert_eq!(fs.generation_timeout, Duration::from_secs(60));
+    }
+
+    /// Test that readdirplus returns correct file sizes for passthrough files.
+    ///
+    /// This is a regression test for a bug where readdirplus was using virtual_dds_attr()
+    /// for ALL non-directory files, causing passthrough files (like DSF) to report
+    /// incorrect sizes (~11MB instead of actual size). X-Plane reads DSF files based
+    /// on the reported size, so incorrect sizes caused dsf_ErrMissingAtom crashes.
+    #[tokio::test]
+    async fn test_readdirplus_returns_correct_file_sizes_for_passthrough_files() {
+        use fuse3::raw::Filesystem;
+
+        let temp = TempDir::new().unwrap();
+
+        // Create a package with a DSF file of known size
+        let pkg_dir = temp.path().join("test_ortho");
+        let dsf_dir = pkg_dir.join("Earth nav data/+40-080");
+        std::fs::create_dir_all(&dsf_dir).unwrap();
+
+        // Create a DSF file with specific content (size = 27 bytes)
+        let dsf_content = b"this is fake dsf content!!";
+        let dsf_path = dsf_dir.join("+40-074.dsf");
+        std::fs::write(&dsf_path, dsf_content).unwrap();
+
+        let pkg = InstalledPackage::new(
+            Package::new("test", PackageType::Ortho, Version::new(1, 0, 0)),
+            &pkg_dir,
+        );
+
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(pkg)
+            .build()
+            .unwrap();
+
+        let client = create_test_client();
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+
+        // Get the inode for the directory containing the DSF
+        let dsf_dir_virtual = std::path::Path::new("Earth nav data/+40-080");
+        let dir_inode = fs.inode_manager.get_or_create_inode(dsf_dir_virtual);
+
+        // Create a fake request (uid/gid don't matter for this test)
+        let req = fuse3::raw::Request {
+            unique: 1,
+            uid: 1000,
+            gid: 1000,
+            pid: 1000,
+        };
+
+        // Call readdirplus (req, ino, fh, offset, lock_owner)
+        let result = fs.readdirplus(req, dir_inode, 0, 0, 0).await.unwrap();
+
+        // Collect entries from the stream
+        let entries: Vec<_> = result.entries.collect().await;
+
+        // Find the DSF file entry
+        let dsf_entry = entries
+            .iter()
+            .filter_map(|e| e.as_ref().ok())
+            .find(|e| e.name.to_string_lossy().ends_with(".dsf"))
+            .expect("DSF file should be in directory listing");
+
+        // The critical assertion: file size should match actual file content size,
+        // NOT the virtual DDS size (~11MB)
+        let actual_size = dsf_content.len() as u64;
+        let virtual_dds_size = 11_174_016u64; // VirtualDdsConfig::default().size()
+
+        assert_eq!(
+            dsf_entry.attr.size, actual_size,
+            "DSF file size should be {} bytes (actual), not {} bytes (virtual DDS)",
+            actual_size, dsf_entry.attr.size
+        );
+        assert_ne!(
+            dsf_entry.attr.size, virtual_dds_size,
+            "DSF file should NOT have virtual DDS size"
+        );
     }
 }

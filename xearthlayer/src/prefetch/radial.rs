@@ -210,6 +210,7 @@ impl<M: MemoryCache> RadialPrefetcher<M> {
                 active_zoom_levels: vec![self.config.zoom],
                 is_active: !should_throttle,
                 circuit_state,
+                loading_tiles: vec![],
             });
         }
 
@@ -394,6 +395,7 @@ impl<M: MemoryCache> RadialPrefetcher<M> {
                 active_zoom_levels: vec![self.config.zoom],
                 is_active: submitted > 0,
                 circuit_state,
+                loading_tiles: vec![], // TODO: Track in-progress tiles
             });
         }
     }

@@ -20,6 +20,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{debug, info, trace, warn};
 
@@ -174,7 +175,10 @@ struct ChunkError {
     error: String,
 }
 
-/// Downloads all 256 chunks for a tile in parallel.
+/// Downloads all 256 chunks for a tile with controlled concurrency.
+///
+/// Uses a semaphore to limit concurrent HTTP requests, preventing
+/// provider rate limiting while still achieving good throughput.
 async fn download_all_chunks<P, D>(
     tile: TileCoord,
     provider: Arc<P>,
@@ -188,14 +192,22 @@ where
     let mut results = ChunkResults::new();
     let mut downloads = JoinSet::new();
 
+    // Semaphore to limit concurrent HTTP requests within this tile
+    // This prevents flooding the provider when multiple tiles download simultaneously
+    let semaphore = Arc::new(Semaphore::new(config.max_concurrent_chunks));
+
     // Spawn download tasks for all 256 chunks
     for chunk in tile.chunks() {
         let provider = Arc::clone(&provider);
         let disk_cache = Arc::clone(&disk_cache);
         let timeout = config.request_timeout;
         let max_retries = config.max_retries;
+        let sem = Arc::clone(&semaphore);
 
         downloads.spawn(async move {
+            // Acquire semaphore permit before starting download
+            let _permit = sem.acquire().await.expect("semaphore closed unexpectedly");
+
             download_chunk_with_cache(
                 tile,
                 chunk.chunk_row,

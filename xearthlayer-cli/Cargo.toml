@@ -52,4 +52,5 @@ console = "0.15"
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+proptest = "1.4"
 tempfile = "3"

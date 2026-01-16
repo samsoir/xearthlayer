@@ -3799,6 +3799,7 @@ dependencies = [
  "dirs",
  "fuser",
  "image",
+ "proptest",
  "ratatui",
  "semver",
  "tempfile",
