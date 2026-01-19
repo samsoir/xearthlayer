@@ -2,7 +2,7 @@
 //!
 //! This module provides a builder for creating prefetcher instances based on
 //! configuration settings. It encapsulates the complexity of configuring
-//! different prefetch strategies (radial, heading-aware).
+//! different prefetch strategies (radial, heading-aware, tile-based).
 //!
 //! # Example
 //!
@@ -23,7 +23,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::mpsc;
+
 use crate::executor::{DdsClient, MemoryCache};
+use crate::ortho_union::OrthoUnionIndex;
 
 use super::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use super::config::{FuseInferenceConfig, HeadingAwarePrefetchConfig};
@@ -35,6 +38,7 @@ use super::scenery_index::SceneryIndex;
 use super::state::SharedPrefetchStatus;
 use super::strategy::Prefetcher;
 use super::throttler::PrefetchThrottler;
+use super::tile_based::{DdsAccessEvent, TileBasedConfig, TileBasedPrefetcher};
 
 /// Default telemetry staleness threshold in seconds.
 const DEFAULT_TELEMETRY_STALE_SECS: u64 = 5;
@@ -88,6 +92,9 @@ pub struct PrefetcherBuilder<M: MemoryCache> {
     // Throttler for circuit breaker integration (optional)
     // When provided, the prefetcher checks this before each prefetch cycle
     throttler: Option<Arc<dyn PrefetchThrottler>>,
+
+    // Tile-based configuration
+    tile_based_rows_ahead: u32,
 }
 
 /// Available prefetch strategies.
@@ -97,6 +104,9 @@ pub enum PrefetchStrategy {
     Radial,
     /// Direction-aware prefetching with forward cone and turn detection.
     HeadingAware,
+    /// DSF tile-based prefetching aligned with X-Plane's loading behavior.
+    /// Tracks 1° × 1° DSF tiles and prefetches neighboring tiles during quiet periods.
+    TileBased,
     /// Automatic strategy selection with graceful degradation.
     /// Uses heading-aware when telemetry available, falls back to radial.
     Auto,
@@ -109,6 +119,7 @@ impl std::str::FromStr for PrefetchStrategy {
         Ok(match s.to_lowercase().as_str() {
             "radial" => Self::Radial,
             "heading-aware" => Self::HeadingAware,
+            "tile-based" => Self::TileBased,
             _ => Self::Auto, // Default to auto for "auto" or unknown values
         })
     }
@@ -135,6 +146,7 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
             fuse_analyzer: None,
             scenery_index: None,
             throttler: None,
+            tile_based_rows_ahead: 1,
         }
     }
 
@@ -334,6 +346,69 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
         self
     }
 
+    /// Set the number of DSF tile rows to prefetch ahead (for tile-based strategy).
+    ///
+    /// Higher values prefetch more aggressively but use more bandwidth.
+    /// Default: 1 (prefetch the immediate next row of tiles).
+    pub fn tile_based_rows_ahead(mut self, rows: u32) -> Self {
+        self.tile_based_rows_ahead = rows;
+        self
+    }
+
+    /// Build a tile-based prefetcher instance.
+    ///
+    /// This method requires additional components specific to tile-based prefetching:
+    /// - `ortho_index`: Index for enumerating DDS files in DSF tiles
+    /// - `access_rx`: Channel receiving DDS access events from FUSE
+    ///
+    /// # Panics
+    ///
+    /// Panics if required components (memory_cache, dds_client, throttler) are not set.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let (tx, rx) = mpsc::unbounded_channel();
+    ///
+    /// let prefetcher = PrefetcherBuilder::new()
+    ///     .memory_cache(cache)
+    ///     .dds_client(client)
+    ///     .with_throttler(circuit_breaker)
+    ///     .tile_based_rows_ahead(1)
+    ///     .build_tile_based(ortho_index, rx);
+    /// ```
+    pub fn build_tile_based(
+        self,
+        ortho_index: Arc<OrthoUnionIndex>,
+        access_rx: mpsc::UnboundedReceiver<DdsAccessEvent>,
+    ) -> Box<dyn Prefetcher> {
+        let memory_cache = self
+            .memory_cache
+            .expect("memory_cache is required for build_tile_based");
+        let dds_client = self
+            .dds_client
+            .expect("dds_client is required for build_tile_based");
+        let throttler = self
+            .throttler
+            .expect("throttler is required for build_tile_based (use with_throttler or with_circuit_breaker_throttler)");
+
+        let config = TileBasedConfig {
+            rows_ahead: self.tile_based_rows_ahead,
+            ..TileBasedConfig::default()
+        };
+
+        let prefetcher = TileBasedPrefetcher::new(
+            ortho_index,
+            dds_client,
+            memory_cache,
+            access_rx,
+            throttler,
+            config,
+        );
+
+        Box::new(prefetcher)
+    }
+
     /// Build the prefetcher instance.
     ///
     /// # Panics
@@ -414,6 +489,12 @@ impl<M: MemoryCache + 'static> PrefetcherBuilder<M> {
 
                 Box::new(prefetcher)
             }
+            PrefetchStrategy::TileBased => {
+                panic!(
+                    "TileBased strategy requires build_tile_based() instead of build(). \
+                     TileBased needs OrthoUnionIndex and DDS access channel from FUSE."
+                );
+            }
         }
     }
 }
@@ -477,12 +558,20 @@ mod tests {
             PrefetchStrategy::HeadingAware
         );
         assert_eq!(
+            "tile-based".parse::<PrefetchStrategy>().unwrap(),
+            PrefetchStrategy::TileBased
+        );
+        assert_eq!(
             "auto".parse::<PrefetchStrategy>().unwrap(),
             PrefetchStrategy::Auto
         );
         assert_eq!(
             "RADIAL".parse::<PrefetchStrategy>().unwrap(),
             PrefetchStrategy::Radial
+        );
+        assert_eq!(
+            "TILE-BASED".parse::<PrefetchStrategy>().unwrap(),
+            PrefetchStrategy::TileBased
         );
         assert_eq!(
             "unknown".parse::<PrefetchStrategy>().unwrap(),

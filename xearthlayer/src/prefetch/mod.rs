@@ -63,6 +63,7 @@ mod scheduler;
 mod state;
 mod strategy;
 mod throttler;
+pub mod tile_based;
 pub mod types;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
@@ -110,4 +111,10 @@ pub use prewarm::{PrewarmConfig, PrewarmPrefetcher, PrewarmProgress};
 pub use scenery_cache::{
     cache_path as scenery_cache_path, cache_status, load_cache, save_cache, CacheLoadResult,
     CacheStatus,
+};
+
+// Tile-based prefetch (DSF-aligned)
+pub use tile_based::{
+    DdsAccessEvent, DsfTileCoord, TileBasedConfig, TileBasedPrefetcher, TileBurstTracker,
+    TilePredictor as DsfTilePredictor,
 };

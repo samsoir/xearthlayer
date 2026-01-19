@@ -22,9 +22,9 @@ use xearthlayer::package::PackageType;
 use xearthlayer::panic as panic_handler;
 use xearthlayer::prefetch::{
     load_cache, save_cache, CacheLoadResult, CircuitBreakerConfig, FuseInferenceConfig,
-    FuseRequestAnalyzer, IndexingProgress, PrefetcherBuilder, PrewarmConfig, PrewarmPrefetcher,
-    PrewarmProgress as LibPrewarmProgress, SceneryIndex, SceneryIndexConfig, SharedPrefetchStatus,
-    TelemetryListener,
+    FuseRequestAnalyzer, IndexingProgress, PrefetchStrategy, PrefetcherBuilder, PrewarmConfig,
+    PrewarmPrefetcher, PrewarmProgress as LibPrewarmProgress, SceneryIndex, SceneryIndexConfig,
+    SharedPrefetchStatus, TelemetryListener,
 };
 use xearthlayer::service::ServiceConfig;
 use xearthlayer::xplane::XPlaneEnvironment;
@@ -1124,17 +1124,82 @@ fn start_prefetcher(
         builder = builder.with_scenery_index(Arc::clone(scenery_index));
     }
 
-    let prefetcher = builder.build();
-    let prefetcher_cancel = cancellation.clone();
-    runtime_handle.spawn(async move {
-        prefetcher.run(state_rx, prefetcher_cancel).await;
-    });
+    // Parse strategy to determine which build method to use
+    let strategy: PrefetchStrategy = config
+        .prefetch
+        .strategy
+        .parse()
+        .unwrap_or(PrefetchStrategy::Auto);
 
-    tracing::info!(
-        strategy = %config.prefetch.strategy,
-        udp_port = config.prefetch.udp_port,
-        "Prefetch system started"
-    );
+    // Build and start the prefetcher based on strategy
+    match strategy {
+        PrefetchStrategy::TileBased => {
+            // Tile-based prefetcher requires DDS access channel and OrthoUnionIndex
+            let Some(access_rx) = mount_manager.take_dds_access_receiver() else {
+                tracing::warn!(
+                    "DDS access receiver not available, falling back to radial prefetch"
+                );
+                // Fall back to radial prefetcher
+                let prefetcher = builder.strategy("radial").build();
+                let prefetcher_cancel = cancellation.clone();
+                runtime_handle.spawn(async move {
+                    prefetcher.run(state_rx, prefetcher_cancel).await;
+                });
+                tracing::info!(
+                    strategy = "radial (fallback)",
+                    udp_port = config.prefetch.udp_port,
+                    "Prefetch system started"
+                );
+                return true;
+            };
+
+            let Some(ortho_index) = mount_manager.ortho_union_index() else {
+                tracing::warn!("OrthoUnionIndex not available, falling back to radial prefetch");
+                // Fall back to radial prefetcher
+                let prefetcher = builder.strategy("radial").build();
+                let prefetcher_cancel = cancellation.clone();
+                runtime_handle.spawn(async move {
+                    prefetcher.run(state_rx, prefetcher_cancel).await;
+                });
+                tracing::info!(
+                    strategy = "radial (fallback)",
+                    udp_port = config.prefetch.udp_port,
+                    "Prefetch system started"
+                );
+                return true;
+            };
+
+            // Configure tile-based specific settings
+            builder = builder.tile_based_rows_ahead(config.prefetch.tile_based_rows_ahead);
+
+            let prefetcher = builder.build_tile_based(ortho_index, access_rx);
+            let prefetcher_cancel = cancellation.clone();
+            runtime_handle.spawn(async move {
+                prefetcher.run(state_rx, prefetcher_cancel).await;
+            });
+
+            tracing::info!(
+                strategy = "tile-based",
+                rows_ahead = config.prefetch.tile_based_rows_ahead,
+                udp_port = config.prefetch.udp_port,
+                "Prefetch system started"
+            );
+        }
+        _ => {
+            // Standard prefetcher (radial, heading-aware, auto)
+            let prefetcher = builder.build();
+            let prefetcher_cancel = cancellation.clone();
+            runtime_handle.spawn(async move {
+                prefetcher.run(state_rx, prefetcher_cancel).await;
+            });
+
+            tracing::info!(
+                strategy = %config.prefetch.strategy,
+                udp_port = config.prefetch.udp_port,
+                "Prefetch system started"
+            );
+        }
+    }
 
     true
 }

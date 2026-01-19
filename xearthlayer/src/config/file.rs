@@ -217,6 +217,10 @@ pub struct PrefetchSettings {
     /// Radial prefetcher tile radius (number of tiles in each direction).
     /// Default: 120 tiles. Maximum: 255.
     pub radial_radius: u8,
+    /// Tile-based prefetcher: number of DSF tile rows to prefetch ahead.
+    /// Higher values prefetch more aggressively but use more bandwidth.
+    /// Default: 1 (prefetch the immediate next row).
+    pub tile_based_rows_ahead: u32,
 }
 
 /// Control plane configuration for job management and health monitoring.
@@ -353,6 +357,7 @@ impl Default for ConfigFile {
                 circuit_breaker_open_ms: DEFAULT_CIRCUIT_BREAKER_OPEN_MS,
                 circuit_breaker_half_open_secs: DEFAULT_CIRCUIT_BREAKER_HALF_OPEN_SECS,
                 radial_radius: DEFAULT_PREFETCH_RADIAL_RADIUS,
+                tile_based_rows_ahead: DEFAULT_TILE_BASED_ROWS_AHEAD,
             },
             control_plane: ControlPlaneSettings {
                 max_concurrent_jobs: default_max_concurrent_jobs(),
@@ -523,6 +528,10 @@ pub const DEFAULT_CIRCUIT_BREAKER_HALF_OPEN_SECS: u64 = 2;
 /// Default radial prefetcher tile radius.
 /// 120 tiles provides wide coverage around aircraft position.
 pub const DEFAULT_PREFETCH_RADIAL_RADIUS: u8 = 120;
+
+/// Default tile-based prefetcher rows ahead.
+/// 1 row means prefetch the immediate next row of DSF tiles.
+pub const DEFAULT_TILE_BASED_ROWS_AHEAD: u32 = 1;
 
 // =============================================================================
 // Control plane defaults
@@ -883,7 +892,7 @@ impl ConfigFile {
             if let Some(v) = section.get("strategy") {
                 let v = v.trim().to_lowercase();
                 match v.as_str() {
-                    "auto" | "heading-aware" | "radial" => {
+                    "auto" | "heading-aware" | "radial" | "tile-based" => {
                         config.prefetch.strategy = v;
                     }
                     _ => {
@@ -891,7 +900,8 @@ impl ConfigFile {
                             section: "prefetch".to_string(),
                             key: "strategy".to_string(),
                             value: v.to_string(),
-                            reason: "must be 'auto', 'heading-aware', or 'radial'".to_string(),
+                            reason: "must be 'auto', 'heading-aware', 'radial', or 'tile-based'"
+                                .to_string(),
                         });
                     }
                 }
@@ -988,6 +998,15 @@ impl ConfigFile {
                         key: "radial_radius".to_string(),
                         value: v.to_string(),
                         reason: "must be a positive integer (tiles)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("tile_based_rows_ahead") {
+                config.prefetch.tile_based_rows_ahead =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "prefetch".to_string(),
+                        key: "tile_based_rows_ahead".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (rows)".to_string(),
                     })?;
             }
         }
@@ -1314,6 +1333,10 @@ outer_radius_nm = {}
 ; Higher values prefetch more tiles around aircraft position
 radial_radius = {}
 
+; Tile-based prefetcher rows ahead (default: 1)
+; Number of DSF tile rows (1° each) to prefetch ahead of aircraft
+tile_based_rows_ahead = {}
+
 ; Heading-aware cone (prediction cone half-angle in degrees, default: 80)
 ; Wider angles prefetch more tiles but use more bandwidth
 cone_angle = {}
@@ -1408,6 +1431,7 @@ directory = {}
             self.prefetch.inner_radius_nm,
             self.prefetch.outer_radius_nm,
             self.prefetch.radial_radius,
+            self.prefetch.tile_based_rows_ahead,
             self.prefetch.cone_angle,
             self.prefetch.max_tiles_per_cycle,
             self.prefetch.cycle_interval_ms,

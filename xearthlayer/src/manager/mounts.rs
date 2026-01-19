@@ -9,18 +9,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::mpsc;
+
 use crate::cache::MemoryCache;
 use crate::config::DiskIoProfile;
 use crate::executor::{MemoryCacheAdapter, StorageConcurrencyLimiter};
 use crate::fuse::fuse3::{Fuse3OrthoUnionFS, Fuse3UnionFS};
 use crate::fuse::SpawnedMountHandle;
 use crate::metrics::TelemetrySnapshot;
-use crate::ortho_union::{default_cache_path, IndexBuildProgressCallback, OrthoUnionIndexBuilder};
+use crate::ortho_union::{
+    default_cache_path, IndexBuildProgressCallback, OrthoUnionIndex, OrthoUnionIndexBuilder,
+};
 use crate::package::{
     InstalledPackage as PackageInstalledPackage, Package as PackageCore, PackageType,
 };
 use crate::panic as panic_handler;
 use crate::patches::{PatchDiscovery, PatchUnionIndex};
+use crate::prefetch::tile_based::DdsAccessEvent;
 use crate::prefetch::{FuseLoadMonitor, SharedFuseLoadMonitor, TileRequestCallback};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
 
@@ -263,6 +268,13 @@ pub struct MountManager {
     consolidated_mount: Option<ActiveMount>,
     /// Service for consolidated ortho (owns the runtime for DDS generation).
     consolidated_service: Option<XEarthLayerService>,
+    /// DDS access event receiver for tile-based prefetching.
+    /// This is populated when mounting consolidated ortho and can be retrieved
+    /// by the prefetcher via `take_dds_access_receiver()`.
+    dds_access_rx: Option<mpsc::UnboundedReceiver<DdsAccessEvent>>,
+    /// OrthoUnionIndex for DSF tile enumeration (tile-based prefetch).
+    /// This is populated when mounting consolidated ortho.
+    ortho_union_index: Option<Arc<OrthoUnionIndex>>,
 }
 
 impl MountManager {
@@ -280,6 +292,8 @@ impl MountManager {
             consolidated_session: None,
             consolidated_mount: None,
             consolidated_service: None,
+            dds_access_rx: None,
+            ortho_union_index: None,
         }
     }
 
@@ -300,6 +314,8 @@ impl MountManager {
             consolidated_session: None,
             consolidated_mount: None,
             consolidated_service: None,
+            dds_access_rx: None,
+            ortho_union_index: None,
         }
     }
 
@@ -845,8 +861,17 @@ impl MountManager {
         let expected_dds_size = service.expected_dds_size();
         let runtime_handle = service.runtime_handle().clone();
 
-        // Create and mount the consolidated ortho union filesystem
-        let ortho_union_fs = Fuse3OrthoUnionFS::new(index, dds_client, expected_dds_size);
+        // Create DDS access event channel for tile-based prefetching
+        // The sender goes to FUSE, the receiver goes to the prefetcher
+        let (dds_access_tx, dds_access_rx) = mpsc::unbounded_channel();
+
+        // Store the index for tile-based prefetcher to use later
+        let index_for_prefetch = Arc::new(index);
+
+        // Create and mount the consolidated ortho union filesystem with DDS access channel
+        let ortho_union_fs =
+            Fuse3OrthoUnionFS::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
+                .with_dds_access_channel(dds_access_tx);
         let mountpoint_str = mountpoint.to_string_lossy();
 
         let mount_result = runtime_handle.block_on(ortho_union_fs.mount_spawned(&mountpoint_str));
@@ -866,6 +891,10 @@ impl MountManager {
                 self.consolidated_service = Some(service);
                 self.consolidated_session = Some(session);
                 self.consolidated_mount = Some(mount_info);
+
+                // Store DDS access channel receiver and index for tile-based prefetcher
+                self.dds_access_rx = Some(dds_access_rx);
+                self.ortho_union_index = Some(index_for_prefetch);
 
                 tracing::info!(
                     mountpoint = %mountpoint.display(),
@@ -896,6 +925,32 @@ impl MountManager {
     /// Get consolidated ortho mount info (if mounted).
     pub fn consolidated_mount(&self) -> Option<&ActiveMount> {
         self.consolidated_mount.as_ref()
+    }
+
+    /// Take the DDS access event receiver for tile-based prefetching.
+    ///
+    /// This method takes ownership of the receiver, so it can only be called once.
+    /// The receiver is created when mounting consolidated ortho and is used by
+    /// the tile-based prefetcher to receive DDS access events from FUSE.
+    ///
+    /// # Returns
+    ///
+    /// `Some(receiver)` if consolidated ortho is mounted and receiver hasn't been taken,
+    /// `None` otherwise.
+    pub fn take_dds_access_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<DdsAccessEvent>> {
+        self.dds_access_rx.take()
+    }
+
+    /// Get a reference to the OrthoUnionIndex for tile-based prefetching.
+    ///
+    /// The index is created when mounting consolidated ortho and can be used
+    /// by the tile-based prefetcher to enumerate DDS files within DSF tiles.
+    ///
+    /// # Returns
+    ///
+    /// `Some(index)` if consolidated ortho is mounted, `None` otherwise.
+    pub fn ortho_union_index(&self) -> Option<Arc<OrthoUnionIndex>> {
+        self.ortho_union_index.clone()
     }
 
     /// Unmount a specific region.
@@ -963,6 +1018,10 @@ impl MountManager {
         self.consolidated_session = None;
         self.consolidated_mount = None;
         self.consolidated_service = None;
+
+        // Clear tile-based prefetch resources
+        self.dds_access_rx = None;
+        self.ortho_union_index = None;
     }
 
     /// Get a reference to a mounted service (if any).

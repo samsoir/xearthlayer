@@ -85,6 +85,7 @@ pub enum ConfigKey {
     PrefetchCircuitBreakerOpenMs,
     PrefetchCircuitBreakerHalfOpenSecs,
     PrefetchRadialRadius,
+    PrefetchTileBasedRowsAhead,
 
     // Control plane settings
     ControlPlaneMaxConcurrentJobs,
@@ -164,6 +165,7 @@ impl FromStr for ConfigKey {
                 Ok(ConfigKey::PrefetchCircuitBreakerHalfOpenSecs)
             }
             "prefetch.radial_radius" => Ok(ConfigKey::PrefetchRadialRadius),
+            "prefetch.tile_based_rows_ahead" => Ok(ConfigKey::PrefetchTileBasedRowsAhead),
 
             "control_plane.max_concurrent_jobs" => Ok(ConfigKey::ControlPlaneMaxConcurrentJobs),
             "control_plane.stall_threshold_secs" => Ok(ConfigKey::ControlPlaneStallThresholdSecs),
@@ -240,6 +242,7 @@ impl ConfigKey {
                 "prefetch.circuit_breaker_half_open_secs"
             }
             ConfigKey::PrefetchRadialRadius => "prefetch.radial_radius",
+            ConfigKey::PrefetchTileBasedRowsAhead => "prefetch.tile_based_rows_ahead",
             ConfigKey::ControlPlaneMaxConcurrentJobs => "control_plane.max_concurrent_jobs",
             ConfigKey::ControlPlaneStallThresholdSecs => "control_plane.stall_threshold_secs",
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => {
@@ -359,6 +362,9 @@ impl ConfigKey {
                 config.prefetch.circuit_breaker_half_open_secs.to_string()
             }
             ConfigKey::PrefetchRadialRadius => config.prefetch.radial_radius.to_string(),
+            ConfigKey::PrefetchTileBasedRowsAhead => {
+                config.prefetch.tile_based_rows_ahead.to_string()
+            }
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs.to_string()
             }
@@ -536,6 +542,9 @@ impl ConfigKey {
             ConfigKey::PrefetchRadialRadius => {
                 config.prefetch.radial_radius = value.parse().unwrap();
             }
+            ConfigKey::PrefetchTileBasedRowsAhead => {
+                config.prefetch.tile_based_rows_ahead = value.parse().unwrap();
+            }
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs = value.parse().unwrap();
             }
@@ -637,9 +646,12 @@ impl ConfigKey {
             ConfigKey::PackagesTempDir => Box::new(OptionalPathSpec),
             ConfigKey::LoggingFile => Box::new(PathSpec),
             ConfigKey::PrefetchEnabled => Box::new(BooleanSpec),
-            ConfigKey::PrefetchStrategy => {
-                Box::new(OneOfSpec::new(&["auto", "heading-aware", "radial"]))
-            }
+            ConfigKey::PrefetchStrategy => Box::new(OneOfSpec::new(&[
+                "auto",
+                "heading-aware",
+                "radial",
+                "tile-based",
+            ])),
             ConfigKey::PrefetchUdpPort => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchConeAngle => Box::new(PositiveNumberSpec),
             ConfigKey::PrefetchInnerRadiusNm => Box::new(PositiveNumberSpec),
@@ -650,6 +662,7 @@ impl ConfigKey {
             ConfigKey::PrefetchCircuitBreakerOpenMs => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchRadialRadius => Box::new(PositiveIntegerSpec),
+            ConfigKey::PrefetchTileBasedRowsAhead => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneMaxConcurrentJobs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneStallThresholdSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => Box::new(PositiveIntegerSpec),
@@ -713,6 +726,7 @@ impl ConfigKey {
             ConfigKey::PrefetchCircuitBreakerOpenMs,
             ConfigKey::PrefetchCircuitBreakerHalfOpenSecs,
             ConfigKey::PrefetchRadialRadius,
+            ConfigKey::PrefetchTileBasedRowsAhead,
             ConfigKey::ControlPlaneMaxConcurrentJobs,
             ConfigKey::ControlPlaneStallThresholdSecs,
             ConfigKey::ControlPlaneHealthCheckIntervalSecs,

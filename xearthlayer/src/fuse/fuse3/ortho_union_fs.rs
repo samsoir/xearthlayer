@@ -43,7 +43,7 @@ use crate::executor::{DdsClient, StorageConcurrencyLimiter};
 use crate::fuse::coalesce::RequestCoalescer;
 use crate::fuse::{get_default_placeholder, parse_dds_filename};
 use crate::ortho_union::OrthoUnionIndex;
-use crate::prefetch::TileRequestCallback;
+use crate::prefetch::{DdsAccessEvent, DsfTileCoord, TileRequestCallback};
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
@@ -59,6 +59,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
+use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::{debug, trace};
 
@@ -104,6 +105,12 @@ pub struct Fuse3OrthoUnionFS {
     tile_request_callback: Option<TileRequestCallback>,
     /// Request coalescer for deduplicating concurrent requests
     request_coalescer: Arc<RequestCoalescer>,
+    /// Optional channel for notifying prefetcher of DDS accesses.
+    ///
+    /// When set, the filesystem sends a [`DdsAccessEvent`] for each DDS
+    /// texture request, enabling the tile-based prefetcher to track
+    /// which DSF tiles X-Plane is loading.
+    dds_access_tx: Option<mpsc::UnboundedSender<DdsAccessEvent>>,
 }
 
 impl Fuse3OrthoUnionFS {
@@ -148,6 +155,7 @@ impl Fuse3OrthoUnionFS {
             disk_io_limiter,
             tile_request_callback: None,
             request_coalescer,
+            dds_access_tx: None,
         }
     }
 
@@ -173,6 +181,7 @@ impl Fuse3OrthoUnionFS {
             disk_io_limiter,
             tile_request_callback: None,
             request_coalescer,
+            dds_access_tx: None,
         }
     }
 
@@ -191,6 +200,28 @@ impl Fuse3OrthoUnionFS {
     /// the prefetch system to infer aircraft position from FUSE requests.
     pub fn with_tile_request_callback(mut self, callback: TileRequestCallback) -> Self {
         self.tile_request_callback = Some(callback);
+        self
+    }
+
+    /// Set the channel for DDS access events.
+    ///
+    /// When set, the filesystem sends a [`DdsAccessEvent`] for each DDS
+    /// texture accessed. This enables the tile-based prefetcher to track
+    /// which DSF tiles X-Plane is actively loading.
+    ///
+    /// The channel is fire-and-forget: sending is non-blocking and failures
+    /// are silently ignored to avoid impacting FUSE performance.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let (tx, rx) = mpsc::unbounded_channel();
+    /// let fs = Fuse3OrthoUnionFS::new(index, client, size)
+    ///     .with_dds_access_channel(tx);
+    /// // rx is passed to TileBasedPrefetcher
+    /// ```
+    pub fn with_dds_access_channel(mut self, tx: mpsc::UnboundedSender<DdsAccessEvent>) -> Self {
+        self.dds_access_tx = Some(tx);
         self
     }
 
@@ -507,6 +538,15 @@ impl Filesystem for Fuse3OrthoUnionFS {
                 .inode_manager
                 .get_virtual_dds(ino)
                 .ok_or(Errno::from(libc::ENOENT))?;
+
+            // Send DDS access event to tile-based prefetcher (fire-and-forget)
+            if let Some(ref tx) = self.dds_access_tx {
+                // Convert DDS tile coordinates to DSF tile (1° × 1°)
+                if let Some(dsf_tile) = DsfTileCoord::from_dds_filename(&format!("{}.dds", coords))
+                {
+                    let _ = tx.send(DdsAccessEvent::new(dsf_tile));
+                }
+            }
 
             // Build filename for request_dds (use Display impl which includes correct zoom)
             let filename = format!("{}.dds", coords);
