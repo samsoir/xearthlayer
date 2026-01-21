@@ -304,6 +304,14 @@ pub trait DdsRequestor: FileAttrBuilder {
         None
     }
 
+    /// Get the optional metrics client for reporting FUSE-level metrics.
+    ///
+    /// When `Some`, coalesced requests and other FUSE-specific metrics are
+    /// reported to the metrics system.
+    fn metrics_client(&self) -> Option<&crate::metrics::MetricsClient> {
+        None
+    }
+
     /// Request DDS generation from the async pipeline.
     ///
     /// This method handles the full request lifecycle:
@@ -363,6 +371,11 @@ pub trait DdsRequestor: FileAttrBuilder {
                         context = context_label,
                         "Request coalesced - waiting for in-flight result"
                     );
+
+                    // Report coalesced request to metrics
+                    if let Some(metrics) = self.metrics_client() {
+                        metrics.job_coalesced();
+                    }
 
                     match tokio::time::timeout(timeout, rx.recv()).await {
                         Ok(Ok(result)) => {

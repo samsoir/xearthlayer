@@ -116,6 +116,10 @@ pub struct Fuse3OrthoUnionFS {
     /// When set, records each DDS request so the circuit breaker can
     /// detect when X-Plane is heavily loading scenery and pause prefetching.
     load_monitor: Option<Arc<dyn FuseLoadMonitor>>,
+    /// Optional metrics client for reporting FUSE-level metrics.
+    ///
+    /// When set, reports coalesced requests and other FUSE-specific metrics.
+    metrics_client: Option<crate::metrics::MetricsClient>,
 }
 
 impl Fuse3OrthoUnionFS {
@@ -162,6 +166,7 @@ impl Fuse3OrthoUnionFS {
             request_coalescer,
             dds_access_tx: None,
             load_monitor: None,
+            metrics_client: None,
         }
     }
 
@@ -189,6 +194,7 @@ impl Fuse3OrthoUnionFS {
             request_coalescer,
             dds_access_tx: None,
             load_monitor: None,
+            metrics_client: None,
         }
     }
 
@@ -248,6 +254,15 @@ impl Fuse3OrthoUnionFS {
     /// ```
     pub fn with_load_monitor(mut self, monitor: Arc<dyn FuseLoadMonitor>) -> Self {
         self.load_monitor = Some(monitor);
+        self
+    }
+
+    /// Set the metrics client for reporting FUSE-level metrics.
+    ///
+    /// When set, reports coalesced requests and other FUSE-specific metrics
+    /// to the metrics system.
+    pub fn with_metrics(mut self, metrics: crate::metrics::MetricsClient) -> Self {
+        self.metrics_client = Some(metrics);
         self
     }
 
@@ -380,6 +395,10 @@ impl DdsRequestor for Fuse3OrthoUnionFS {
 
     fn request_coalescer(&self) -> Option<&Arc<RequestCoalescer>> {
         Some(&self.request_coalescer)
+    }
+
+    fn metrics_client(&self) -> Option<&crate::metrics::MetricsClient> {
+        self.metrics_client.as_ref()
     }
 }
 

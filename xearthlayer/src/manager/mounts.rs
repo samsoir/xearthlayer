@@ -870,10 +870,15 @@ impl MountManager {
 
         // Create and mount the consolidated ortho union filesystem with DDS access channel
         // Also wire the load monitor so circuit breaker can detect X-Plane load
-        let ortho_union_fs =
+        let mut ortho_union_fs =
             Fuse3OrthoUnionFS::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
                 .with_dds_access_channel(dds_access_tx)
                 .with_load_monitor(Arc::clone(&self.load_monitor) as Arc<dyn FuseLoadMonitor>);
+
+        // Wire metrics client for coalesced request tracking
+        if let Some(metrics) = service.metrics_client() {
+            ortho_union_fs = ortho_union_fs.with_metrics(metrics);
+        }
         let mountpoint_str = mountpoint.to_string_lossy();
 
         let mount_result = runtime_handle.block_on(ortho_union_fs.mount_spawned(&mountpoint_str));
