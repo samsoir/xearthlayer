@@ -194,6 +194,19 @@ pub trait DdsClient: Send + Sync + 'static {
     ///
     /// Returns `false` if the executor has been shut down.
     fn is_connected(&self) -> bool;
+
+    /// Returns a clone of the underlying sender for async operations.
+    ///
+    /// This allows callers to use `send().await` for backpressure-aware
+    /// submission, which is useful for bulk operations like prewarm.
+    ///
+    /// # Returns
+    ///
+    /// `Some(sender)` if the client has an underlying channel sender,
+    /// `None` for mock implementations.
+    fn sender(&self) -> Option<mpsc::Sender<JobRequest>> {
+        None
+    }
 }
 
 // =============================================================================
@@ -287,6 +300,10 @@ impl DdsClient for ChannelDdsClient {
 
     fn is_connected(&self) -> bool {
         !self.tx.is_closed()
+    }
+
+    fn sender(&self) -> Option<mpsc::Sender<JobRequest>> {
+        Some(self.tx.clone())
     }
 }
 

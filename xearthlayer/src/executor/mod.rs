@@ -186,7 +186,7 @@ pub use traits::{
 pub use chunk_results::{ChunkFailure, ChunkResults, ChunkSuccess};
 
 // Download configuration
-pub use download_config::{DownloadConfig, DEFAULT_MAX_CONCURRENT_CHUNKS};
+pub use download_config::{DownloadConfig, DEFAULT_MAX_CONCURRENT_HTTP};
 
 // Adapters (bridge external implementations to executor traits)
 pub use adapters::{

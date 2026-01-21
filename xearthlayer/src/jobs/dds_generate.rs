@@ -9,12 +9,12 @@
 //! # Resource Dependencies
 //!
 //! Each task receives only the resources it needs (explicit dependency injection):
-//! - Download: provider, disk_cache
+//! - Download: provider, disk_cache, download_config (shared HTTP semaphore)
 //! - BuildAndCache: encoder, memory_cache, executor
 
 use crate::coord::TileCoord;
 use crate::executor::{
-    BlockingExecutor, ChunkProvider, DiskCache, MemoryCache, TextureEncoderAsync,
+    BlockingExecutor, ChunkProvider, DiskCache, DownloadConfig, MemoryCache, TextureEncoderAsync,
 };
 use crate::executor::{ErrorPolicy, Job, JobId, JobResult, JobStatus, Priority, Task};
 use crate::tasks::{BuildAndCacheDdsTask, DownloadChunksTask};
@@ -32,8 +32,9 @@ use std::sync::Arc;
 ///    (Network)         (CPU)
 /// ```
 ///
-/// The download task runs 256 chunk downloads concurrently. Once complete,
-/// the build task assembles, encodes, and caches the result in a single step.
+/// The download task runs 256 chunk downloads concurrently (limited by the
+/// shared HTTP semaphore in `download_config`). Once complete, the build
+/// task assembles, encodes, and caches the result in a single step.
 ///
 /// # Error Policy
 ///
@@ -70,6 +71,9 @@ where
 
     /// Executor for CPU-bound blocking operations
     executor: Arc<X>,
+
+    /// Download configuration with shared HTTP semaphore
+    download_config: DownloadConfig,
 }
 
 impl<P, E, M, D, X> DdsGenerateJob<P, E, M, D, X>
@@ -91,6 +95,7 @@ where
     /// * `memory_cache` - Memory cache for tiles
     /// * `disk_cache` - Disk cache for chunks
     /// * `executor` - Blocking executor
+    /// * `download_config` - Download configuration with shared HTTP semaphore
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         tile: TileCoord,
@@ -100,6 +105,7 @@ where
         memory_cache: Arc<M>,
         disk_cache: Arc<D>,
         executor: Arc<X>,
+        download_config: DownloadConfig,
     ) -> Self {
         let id = JobId::new(format!("dds-{}_{}_ZL{}", tile.row, tile.col, tile.zoom));
         Self {
@@ -111,6 +117,7 @@ where
             memory_cache,
             disk_cache,
             executor,
+            download_config,
         }
     }
 
@@ -125,6 +132,7 @@ where
         memory_cache: Arc<M>,
         disk_cache: Arc<D>,
         executor: Arc<X>,
+        download_config: DownloadConfig,
     ) -> Self {
         Self {
             id,
@@ -135,6 +143,7 @@ where
             memory_cache,
             disk_cache,
             executor,
+            download_config,
         }
     }
 
@@ -171,10 +180,11 @@ where
 
     fn create_tasks(&self) -> Vec<Box<dyn Task>> {
         vec![
-            Box::new(DownloadChunksTask::new(
+            Box::new(DownloadChunksTask::with_config(
                 self.tile,
                 Arc::clone(&self.provider),
                 Arc::clone(&self.disk_cache),
+                self.download_config.clone(),
             )),
             Box::new(BuildAndCacheDdsTask::new(
                 self.tile,

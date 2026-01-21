@@ -7,6 +7,12 @@
 //!
 //! This task uses `ResourceType::Network` since it performs HTTP downloads.
 //!
+//! # HTTP Concurrency
+//!
+//! This task uses a **shared semaphore** from [`DownloadConfig`] to limit
+//! concurrent HTTP requests across all tiles. This prevents the multiplicative
+//! effect where N concurrent tiles × 256 chunks = overwhelming HTTP load.
+//!
 //! # Output
 //!
 //! Produces `TaskOutput` with key "chunks" containing `ChunkResults`.
@@ -21,7 +27,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{debug, info, trace, warn};
 
@@ -180,8 +185,9 @@ struct ChunkError {
 
 /// Downloads all 256 chunks for a tile with controlled concurrency.
 ///
-/// Uses a semaphore to limit concurrent HTTP requests, preventing
-/// provider rate limiting while still achieving good throughput.
+/// Uses the **shared semaphore** from [`DownloadConfig`] to limit concurrent
+/// HTTP requests across ALL tiles being downloaded. This prevents the
+/// multiplicative effect where N tiles × 256 chunks overwhelms the provider.
 async fn download_all_chunks<P, D>(
     tile: TileCoord,
     provider: Arc<P>,
@@ -196,9 +202,9 @@ where
     let mut results = ChunkResults::new();
     let mut downloads = JoinSet::new();
 
-    // Semaphore to limit concurrent HTTP requests within this tile
-    // This prevents flooding the provider when multiple tiles download simultaneously
-    let semaphore = Arc::new(Semaphore::new(config.max_concurrent_chunks));
+    // Use the SHARED semaphore from config - this limits HTTP requests across
+    // ALL concurrent tile downloads, not just within this single tile.
+    let semaphore = Arc::clone(&config.http_semaphore);
 
     // Spawn download tasks for all 256 chunks
     for chunk in tile.chunks() {

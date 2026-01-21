@@ -212,6 +212,12 @@ impl PrewarmProgress {
         }
     }
 
+    /// Update progress with a batch of tiles.
+    pub fn tiles_loaded_batch(&mut self, submitted: usize, cached: usize) {
+        self.tiles_loaded += submitted + cached;
+        self.cache_hits += cached;
+    }
+
     /// Get the elapsed time.
     #[allow(dead_code)]
     pub fn elapsed(&self) -> Duration {

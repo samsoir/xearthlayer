@@ -4,6 +4,12 @@
 //! `DdsGenerateJob` instances. This allows tasks that spawn child jobs (like
 //! `GenerateTileListTask`) to remain lean and focused on their core logic.
 //!
+//! # HTTP Concurrency
+//!
+//! The factory creates a **shared HTTP semaphore** that is passed to all jobs.
+//! This ensures that regardless of how many tiles are downloading concurrently,
+//! the total HTTP requests to the imagery provider stay within bounds.
+//!
 //! # Example
 //!
 //! ```ignore
@@ -15,12 +21,13 @@
 //! );
 //!
 //! // Use factory to create jobs without knowing dependency details
+//! // All jobs share the same HTTP semaphore for concurrency control
 //! let job = factory.create_job(tile, Priority::PREFETCH);
 //! ```
 
 use crate::coord::TileCoord;
 use crate::executor::{
-    BlockingExecutor, ChunkProvider, DiskCache, MemoryCache, TextureEncoderAsync,
+    BlockingExecutor, ChunkProvider, DiskCache, DownloadConfig, MemoryCache, TextureEncoderAsync,
 };
 use crate::executor::{Job, Priority};
 use crate::jobs::DdsGenerateJob;
@@ -56,7 +63,15 @@ pub trait DdsJobFactory: Send + Sync + 'static {
 ///
 /// This factory holds all the dependencies needed to create a complete
 /// DDS generation job: provider for downloads, encoder for compression,
-/// caches for storage, and executor for blocking operations.
+/// caches for storage, executor for blocking operations, and the shared
+/// HTTP semaphore for concurrency control.
+///
+/// # HTTP Concurrency Control
+///
+/// The factory creates a single `DownloadConfig` with a shared HTTP semaphore.
+/// All jobs created by this factory share this semaphore, ensuring total
+/// concurrent HTTP requests stay within bounds regardless of how many tiles
+/// are being processed.
 ///
 /// # Type Parameters
 ///
@@ -87,6 +102,9 @@ where
 
     /// Executor for CPU-bound blocking operations
     executor: Arc<X>,
+
+    /// Shared download configuration with HTTP semaphore
+    download_config: DownloadConfig,
 }
 
 impl<P, E, M, D, X> DefaultDdsJobFactory<P, E, M, D, X>
@@ -98,6 +116,9 @@ where
     X: BlockingExecutor,
 {
     /// Creates a new factory with the given dependencies.
+    ///
+    /// Uses default `DownloadConfig` which creates a shared HTTP semaphore
+    /// with 256 permits for global HTTP concurrency limiting.
     ///
     /// # Arguments
     ///
@@ -119,6 +140,37 @@ where
             memory_cache,
             disk_cache,
             executor,
+            download_config: DownloadConfig::default(),
+        }
+    }
+
+    /// Creates a new factory with custom download configuration.
+    ///
+    /// Use this to configure custom timeout, retries, or HTTP concurrency.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - Chunk provider for downloading satellite imagery
+    /// * `encoder` - Texture encoder for DDS compression
+    /// * `memory_cache` - Memory cache for storing completed tiles
+    /// * `disk_cache` - Disk cache for storing chunks
+    /// * `executor` - Executor for blocking operations
+    /// * `download_config` - Custom download configuration
+    pub fn with_config(
+        provider: Arc<P>,
+        encoder: Arc<E>,
+        memory_cache: Arc<M>,
+        disk_cache: Arc<D>,
+        executor: Arc<X>,
+        download_config: DownloadConfig,
+    ) -> Self {
+        Self {
+            provider,
+            encoder,
+            memory_cache,
+            disk_cache,
+            executor,
+            download_config,
         }
     }
 }
@@ -140,6 +192,7 @@ where
             Arc::clone(&self.memory_cache),
             Arc::clone(&self.disk_cache),
             Arc::clone(&self.executor),
+            self.download_config.clone(), // Clone shares the Arc<Semaphore>
         ))
     }
 }

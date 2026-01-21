@@ -224,6 +224,12 @@ struct ActiveJob {
     /// Number of tasks currently executing.
     tasks_in_flight: usize,
 
+    /// Number of tasks queued but not yet dispatched.
+    /// This prevents the race condition where job completion check sees
+    /// both pending_tasks empty and tasks_in_flight == 0 before a
+    /// sequential task is picked up from the queue.
+    queued_tasks: usize,
+
     /// Names of tasks that succeeded.
     succeeded_tasks: Vec<String>,
 
@@ -269,6 +275,7 @@ impl ActiveJob {
             child_job_rx,
             pending_tasks: Vec::new(),
             tasks_in_flight: 0,
+            queued_tasks: 0,
             succeeded_tasks: Vec::new(),
             failed_tasks: Vec::new(),
             cancelled_tasks: Vec::new(),
@@ -304,7 +311,10 @@ impl ActiveJob {
     }
 
     fn has_pending_work(&self) -> bool {
-        !self.pending_tasks.is_empty() || self.tasks_in_flight > 0 || !self.child_job_ids.is_empty()
+        !self.pending_tasks.is_empty()
+            || self.tasks_in_flight > 0
+            || self.queued_tasks > 0
+            || !self.child_job_ids.is_empty()
     }
 
     fn all_children_complete(&self) -> bool {
@@ -675,11 +685,16 @@ impl JobExecutor {
                 continue;
             }
 
-            // Update in-flight count
+            // Update in-flight count and queued count
             {
                 let mut jobs = self.active_jobs.lock().await;
                 if let Some(job) = jobs.get_mut(&job_id) {
                     job.tasks_in_flight += 1;
+                    // Decrement queued_tasks if this was a sequential task
+                    // (queued_tasks is incremented in handle_task_completion before enqueueing)
+                    if job.queued_tasks > 0 {
+                        job.queued_tasks -= 1;
+                    }
                 }
             }
 
@@ -845,7 +860,11 @@ impl JobExecutor {
         }
 
         // Sequential task execution: enqueue the next pending task on success
+        // IMPORTANT: Increment queued_tasks BEFORE removing from pending_tasks
+        // to prevent the race condition where job completion check sees both
+        // pending_tasks empty and tasks_in_flight == 0 before the task is dispatched.
         let next_task_info = if should_enqueue_next && !job.pending_tasks.is_empty() {
+            job.queued_tasks += 1; // Reserve the slot before removing from pending
             let next_task = job.pending_tasks.remove(0);
             let priority = job.priority;
             Some((next_task, priority))

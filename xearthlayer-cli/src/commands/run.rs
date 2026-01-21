@@ -911,7 +911,6 @@ fn run_with_dashboard(
                 match start_prewarm(
                     ctx.mount_manager,
                     ctx.config,
-                    &scenery_index,
                     icao,
                     ctx.xplane_env.as_ref(),
                     &prewarm_cancellation,
@@ -969,8 +968,8 @@ fn run_with_dashboard(
                             dashboard.update_prewarm_progress(updated);
                         }
                     }
-                    LibPrewarmProgress::TileSubmitted => {
-                        // Tile was submitted for prefetch (not a cache hit)
+                    LibPrewarmProgress::TileCompleted => {
+                        // Tile generation completed successfully
                         if let Some(prewarm) = dashboard.prewarm_status().cloned() {
                             let mut updated = prewarm;
                             updated.tile_loaded(false);
@@ -985,21 +984,42 @@ fn run_with_dashboard(
                             dashboard.update_prewarm_progress(updated);
                         }
                     }
+                    LibPrewarmProgress::BatchProgress {
+                        completed,
+                        cached,
+                        failed: _,
+                    } => {
+                        // Batch progress update (more efficient)
+                        if let Some(prewarm) = dashboard.prewarm_status().cloned() {
+                            let mut updated = prewarm;
+                            updated.tiles_loaded_batch(completed, cached);
+                            dashboard.update_prewarm_progress(updated);
+                        }
+                    }
                     LibPrewarmProgress::Complete {
-                        tiles_submitted,
+                        tiles_completed,
                         cache_hits,
+                        failed,
                     } => {
                         tracing::info!(
-                            tiles_submitted = tiles_submitted,
+                            tiles_completed = tiles_completed,
                             cache_hits = cache_hits,
+                            failed = failed,
                             "Prewarm complete"
                         );
                         prewarm_complete = true;
                         prewarm_active = false;
                         dashboard.clear_prewarm_status();
                     }
-                    LibPrewarmProgress::Cancelled { tiles_submitted } => {
-                        tracing::info!(tiles_submitted = tiles_submitted, "Prewarm cancelled");
+                    LibPrewarmProgress::Cancelled {
+                        tiles_completed,
+                        tiles_pending,
+                    } => {
+                        tracing::info!(
+                            tiles_completed = tiles_completed,
+                            tiles_pending = tiles_pending,
+                            "Prewarm cancelled"
+                        );
                         prewarm_complete = true;
                         prewarm_active = false;
                         dashboard.clear_prewarm_status();
@@ -1206,11 +1226,13 @@ fn start_prefetcher(
 
 /// Start prewarm for a given airport.
 ///
-/// Returns the progress receiver, airport name, and total tile count on success.
+/// Uses tile-based (DSF grid) enumeration to find all DDS textures within
+/// an N×N grid of 1°×1° tiles centered on the target airport.
+///
+/// Returns the progress receiver, airport name, and estimated tile count on success.
 fn start_prewarm(
     mount_manager: &mut MountManager,
     config: &ConfigFile,
-    scenery_index: &Arc<SceneryIndex>,
     icao: &str,
     xplane_env: Option<&XPlaneEnvironment>,
     cancellation: &CancellationToken,
@@ -1236,35 +1258,22 @@ fn start_prewarm(
         .get(icao)
         .ok_or_else(|| format!("Airport '{}' not found in apt.dat", icao))?;
 
-    // Get prewarm radius from config
-    let radius_nm = config.prewarm.radius_nm;
+    // Get prewarm grid size from config
+    let grid_size = config.prewarm.grid_size;
 
-    // Log scenery index stats and airport coordinates for debugging
+    // Get OrthoUnionIndex from mount manager
+    let ortho_index = mount_manager
+        .ortho_union_index()
+        .ok_or_else(|| "OrthoUnionIndex not available for prewarm".to_string())?;
+
+    // Log airport coordinates and grid info for debugging
     tracing::debug!(
         airport_lat = airport.latitude,
         airport_lon = airport.longitude,
         airport_name = %airport.name,
-        scenery_tiles_total = scenery_index.tile_count(),
-        scenery_land_tiles = scenery_index.land_tile_count(),
-        scenery_sea_tiles = scenery_index.sea_tile_count(),
-        radius_nm = radius_nm,
-        "Searching for tiles near airport"
+        grid_size = grid_size,
+        "Starting tile-based prewarm"
     );
-
-    // Find tiles within radius
-    let tiles = scenery_index.tiles_near(airport.latitude, airport.longitude, radius_nm);
-
-    tracing::debug!(tiles_found = tiles.len(), "Tiles found in radius");
-
-    if tiles.is_empty() {
-        return Err(format!(
-            "No scenery tiles found within {}nm of {} ({}). Scenery index contains {} tiles total.",
-            radius_nm,
-            icao,
-            airport.name,
-            scenery_index.tile_count()
-        ));
-    }
 
     // Get service for DDS handler and memory cache
     let service = mount_manager
@@ -1281,17 +1290,16 @@ fn start_prewarm(
 
     // Create prewarm config
     let prewarm_config = PrewarmConfig {
-        radius_nm,
+        grid_size,
         batch_size: 50,
     };
 
+    // Estimate tile count for UI progress (actual count determined at runtime)
+    // Rough estimate: grid_size² DSF tiles × ~100 DDS tiles per DSF tile on average
+    let estimated_tiles = (grid_size * grid_size * 50) as usize;
+
     // Create the prewarm prefetcher
-    let prewarm = PrewarmPrefetcher::new(
-        Arc::clone(scenery_index),
-        dds_client,
-        memory_cache,
-        prewarm_config,
-    );
+    let prewarm = PrewarmPrefetcher::new(ortho_index, dds_client, memory_cache, prewarm_config);
 
     // Create progress channel
     let (progress_tx, progress_rx) = mpsc::channel(32);
@@ -1299,7 +1307,6 @@ fn start_prewarm(
     let airport_lat = airport.latitude;
     let airport_lon = airport.longitude;
     let airport_name = airport.name.clone();
-    let total_tiles = tiles.len();
 
     // Spawn the prewarm task
     runtime_handle.spawn(async move {
@@ -1308,7 +1315,7 @@ fn start_prewarm(
             .await;
     });
 
-    Ok((progress_rx, airport_name, total_tiles))
+    Ok((progress_rx, airport_name, estimated_tiles))
 }
 
 /// Run with simple text output (for non-TTY environments).

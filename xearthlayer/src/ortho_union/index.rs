@@ -487,6 +487,139 @@ impl OrthoUnionIndex {
         results
     }
 
+    /// Returns all available tile coordinates within a 1° DSF tile boundary.
+    ///
+    /// This method efficiently scans actual `.ter` files in the `terrain/` directory
+    /// and filters by DSF tile bounds. Unlike `dds_files_in_dsf_tile()`, this finds
+    /// tiles that *can be* generated, not tiles that have already been cached as DDS.
+    ///
+    /// This is the correct method for prewarm - it tells us what tiles are available
+    /// in the installed packages, regardless of whether they've been generated yet.
+    ///
+    /// # Performance
+    ///
+    /// This method scans actual directory contents once, which is O(number_of_actual_files)
+    /// rather than O(possible_tiles × sources). This is much faster for sparse data.
+    ///
+    /// # Arguments
+    ///
+    /// * `dsf_tile` - The 1° × 1° DSF tile to enumerate
+    ///
+    /// # Returns
+    ///
+    /// Vector of `TileCoord` for all available tiles in this DSF tile.
+    pub fn available_tiles_in_dsf_tile(
+        &self,
+        dsf_tile: &DsfTileCoord,
+    ) -> Vec<crate::coord::TileCoord> {
+        // Get the DSF tile bounds (lat, lon)
+        let (min_lat, max_lat, min_lon, max_lon) = dsf_tile.bounds();
+
+        // Pre-calculate tile coordinate bounds for each zoom level
+        // This avoids repeated calculations during filtering
+        let zoom_bounds: Vec<(u8, u32, u32, u32, u32)> = Self::DDS_ZOOM_LEVELS
+            .iter()
+            .filter_map(|&zoom| {
+                let nw_tile = to_tile_coords(max_lat, min_lon, zoom).ok()?;
+                let se_tile = to_tile_coords(min_lat, max_lon, zoom).ok()?;
+                Some((zoom, nw_tile.row, se_tile.row, nw_tile.col, se_tile.col))
+            })
+            .collect();
+
+        if zoom_bounds.is_empty() {
+            return Vec::new();
+        }
+
+        let mut results = Vec::new();
+
+        // Scan each source's terrain directory and filter by bounds
+        for source in &self.sources {
+            let terrain_dir = source.source_path.join("terrain");
+            if !terrain_dir.exists() {
+                continue;
+            }
+
+            // Read directory contents (single syscall)
+            let entries = match std::fs::read_dir(&terrain_dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            for entry in entries.flatten() {
+                let filename = entry.file_name();
+                let filename_str = filename.to_string_lossy();
+
+                // Parse .ter filename: row_col_type+zoom.ter or row_col_type+zoom_sea.ter
+                if !filename_str.ends_with(".ter") {
+                    continue;
+                }
+
+                if let Some(tile) = Self::parse_ter_filename(&filename_str, &zoom_bounds) {
+                    results.push(tile);
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Parse a terrain filename and check if it falls within the given zoom bounds.
+    ///
+    /// # Arguments
+    ///
+    /// * `filename` - Filename like "18720_5056_BI16.ter" or "18720_5056_BI16_sea.ter"
+    /// * `zoom_bounds` - Pre-calculated (zoom, min_row, max_row, min_col, max_col) for each zoom
+    ///
+    /// # Returns
+    ///
+    /// `Some(TileCoord)` if the file matches and is within bounds, `None` otherwise.
+    fn parse_ter_filename(
+        filename: &str,
+        zoom_bounds: &[(u8, u32, u32, u32, u32)],
+    ) -> Option<crate::coord::TileCoord> {
+        use crate::coord::TileCoord;
+
+        // Remove .ter extension
+        let name = filename.strip_suffix(".ter")?;
+
+        // Handle _sea suffix
+        let name = name.strip_suffix("_sea").unwrap_or(name);
+
+        // Split by underscore: row_col_type+zoom (e.g., "18720_5056_BI16")
+        let parts: Vec<&str> = name.split('_').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+
+        // Parse row and column
+        let row: u32 = parts[0].parse().ok()?;
+        let col: u32 = parts[1].parse().ok()?;
+
+        // Parse zoom from provider+zoom (e.g., "BI16" -> 16, "GO218" -> 18)
+        let provider_zoom = parts[2];
+        if provider_zoom.len() < 2 {
+            return None;
+        }
+
+        // Zoom is last 2 digits
+        let zoom_str = &provider_zoom[provider_zoom.len() - 2..];
+        let zoom: u8 = zoom_str.parse().ok()?;
+
+        // Check if this tile falls within any of our zoom bounds
+        for &(bound_zoom, min_row, max_row, min_col, max_col) in zoom_bounds {
+            if zoom == bound_zoom
+                && row >= min_row
+                && row <= max_row
+                && col >= min_col
+                && col <= max_col
+            {
+                return Some(TileCoord { row, col, zoom });
+            }
+        }
+
+        None
+    }
+
     /// Set the files map (used by parallel merge).
     pub(crate) fn set_files(&mut self, files: HashMap<PathBuf, FileSource>) {
         self.files = files;

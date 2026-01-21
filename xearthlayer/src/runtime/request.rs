@@ -287,24 +287,35 @@ pub struct DdsResponse {
 
     /// How long the request took (including queue time).
     pub duration: Duration,
+
+    /// Whether the job succeeded.
+    ///
+    /// This is true if the job completed successfully, even if the data
+    /// couldn't be read from cache (due to async timing issues).
+    /// Callers should check this field for success, not just `has_data()`.
+    pub job_succeeded: bool,
 }
 
 impl DdsResponse {
     /// Creates a new response with generated data.
-    pub fn new(data: Vec<u8>, cache_hit: bool, duration: Duration) -> Self {
+    pub fn new(data: Vec<u8>, cache_hit: bool, duration: Duration, job_succeeded: bool) -> Self {
         Self {
             data,
             cache_hit,
             duration,
+            job_succeeded,
         }
     }
 
     /// Converts from the fuse module's DdsResponse.
     pub fn from_fuse(fuse: crate::fuse::DdsResponse) -> Self {
+        // FUSE responses are always "successful" since they come from actual data
+        let job_succeeded = !fuse.data.is_empty();
         Self {
             data: fuse.data,
             cache_hit: fuse.cache_hit,
             duration: fuse.duration,
+            job_succeeded,
         }
     }
 
@@ -314,27 +325,44 @@ impl DdsResponse {
             data: self.data,
             cache_hit: self.cache_hit,
             duration: self.duration,
+            job_succeeded: self.job_succeeded,
         }
     }
 
     /// Creates a cache hit response.
     pub fn cache_hit(data: Vec<u8>, duration: Duration) -> Self {
-        Self::new(data, true, duration)
+        Self::new(data, true, duration, true)
     }
 
     /// Creates a cache miss response (data was generated).
     pub fn cache_miss(data: Vec<u8>, duration: Duration) -> Self {
-        Self::new(data, false, duration)
+        Self::new(data, false, duration, true)
+    }
+
+    /// Creates a successful response where the job succeeded.
+    ///
+    /// Use this when the job completed successfully, regardless of whether
+    /// the data could be read from cache.
+    pub fn success(data: Vec<u8>, duration: Duration) -> Self {
+        Self::new(data, false, duration, true)
     }
 
     /// Creates an empty response (for errors or timeouts).
     pub fn empty(duration: Duration) -> Self {
-        Self::new(Vec::new(), false, duration)
+        Self::new(Vec::new(), false, duration, false)
     }
 
     /// Returns true if the response contains valid data.
     pub fn has_data(&self) -> bool {
         !self.data.is_empty()
+    }
+
+    /// Returns true if the job succeeded.
+    ///
+    /// This is the preferred way to check for success when you don't need
+    /// the actual data (e.g., for prewarm progress tracking).
+    pub fn is_success(&self) -> bool {
+        self.job_succeeded
     }
 }
 
@@ -439,10 +467,11 @@ mod tests {
         let data = vec![1, 2, 3, 4];
         let duration = Duration::from_millis(100);
 
-        let response = DdsResponse::new(data.clone(), true, duration);
+        let response = DdsResponse::new(data.clone(), true, duration, true);
         assert_eq!(response.data, data);
         assert!(response.cache_hit);
         assert_eq!(response.duration, duration);
+        assert!(response.is_success());
     }
 
     #[test]
@@ -452,6 +481,7 @@ mod tests {
 
         assert!(response.cache_hit);
         assert!(response.has_data());
+        assert!(response.is_success());
     }
 
     #[test]
@@ -461,6 +491,7 @@ mod tests {
 
         assert!(!response.cache_hit);
         assert!(response.has_data());
+        assert!(response.is_success());
     }
 
     #[test]
@@ -469,6 +500,16 @@ mod tests {
 
         assert!(!response.cache_hit);
         assert!(!response.has_data());
+        assert!(!response.is_success());
+    }
+
+    #[test]
+    fn test_dds_response_job_succeeded_no_data() {
+        // Job succeeded but data couldn't be read from cache
+        let response = DdsResponse::new(Vec::new(), false, Duration::from_secs(1), true);
+
+        assert!(!response.has_data());
+        assert!(response.is_success()); // Job still succeeded
     }
 
     #[tokio::test]

@@ -245,9 +245,9 @@ pub struct ControlPlaneSettings {
 /// Prewarm configuration for cold-start cache warming.
 #[derive(Debug, Clone)]
 pub struct PrewarmSettings {
-    /// Radius in nautical miles around an airport to prewarm.
-    /// Default: 100nm
-    pub radius_nm: f32,
+    /// Grid size in DSF tiles (N = N×N grid) around an airport to prewarm.
+    /// Default: 8 (8×8 grid = 64 DSF tiles, ~480nm × 480nm at mid-latitudes)
+    pub grid_size: u32,
 }
 
 /// Patches configuration for custom Ortho4XP tile patches.
@@ -365,7 +365,7 @@ impl Default for ConfigFile {
                 health_check_interval_secs: DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
                 semaphore_timeout_secs: DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
             },
-            prewarm: PrewarmSettings { radius_nm: 100.0 },
+            prewarm: PrewarmSettings { grid_size: 8 },
             patches: PatchesSettings {
                 enabled: true,
                 directory: Some(config_dir.join("patches")),
@@ -1053,13 +1053,13 @@ impl ConfigFile {
 
         // [prewarm] section
         if let Some(section) = ini.section(Some("prewarm")) {
-            if let Some(v) = section.get("radius_nm") {
-                config.prewarm.radius_nm =
+            if let Some(v) = section.get("grid_size") {
+                config.prewarm.grid_size =
                     v.parse().map_err(|_| ConfigFileError::InvalidValue {
                         section: "prewarm".to_string(),
-                        key: "radius_nm".to_string(),
+                        key: "grid_size".to_string(),
                         value: v.to_string(),
-                        reason: "must be a positive number (nautical miles)".to_string(),
+                        reason: "must be a positive integer (DSF tiles per side)".to_string(),
                     })?;
             }
         }
@@ -1379,8 +1379,10 @@ semaphore_timeout_secs = {}
 ; Settings for cold-start cache pre-warming.
 ; Use with --airport ICAO to pre-load tiles around an airport before flight.
 
-; Radius in nautical miles around the airport to prewarm (default: 100)
-radius_nm = {}
+; Grid size in DSF tiles (N = N×N grid) around the airport to prewarm.
+; 8 = 8×8 grid = 64 DSF tiles, approximately 480nm × 480nm at mid-latitudes.
+; Each DSF tile is 1° × 1° (roughly 60nm × 60nm at equator).
+grid_size = {}
 
 [patches]
 ; Settings for custom Ortho4XP tile patches (airport addon mesh/elevation support).
@@ -1442,7 +1444,7 @@ directory = {}
             self.control_plane.stall_threshold_secs,
             self.control_plane.health_check_interval_secs,
             self.control_plane.semaphore_timeout_secs,
-            self.prewarm.radius_nm,
+            self.prewarm.grid_size,
             self.patches.enabled,
             self.patches
                 .directory

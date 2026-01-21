@@ -94,7 +94,7 @@ pub enum ConfigKey {
     ControlPlaneSemaphoreTimeoutSecs,
 
     // Prewarm settings
-    PrewarmRadiusNm,
+    PrewarmGridSize,
 
     // Patches settings
     PatchesEnabled,
@@ -177,7 +177,7 @@ impl FromStr for ConfigKey {
             }
 
             // Prewarm settings
-            "prewarm.radius_nm" => Ok(ConfigKey::PrewarmRadiusNm),
+            "prewarm.grid_size" => Ok(ConfigKey::PrewarmGridSize),
 
             // Patches settings
             "patches.enabled" => Ok(ConfigKey::PatchesEnabled),
@@ -251,7 +251,7 @@ impl ConfigKey {
             ConfigKey::ControlPlaneSemaphoreTimeoutSecs => "control_plane.semaphore_timeout_secs",
 
             // Prewarm settings
-            ConfigKey::PrewarmRadiusNm => "prewarm.radius_nm",
+            ConfigKey::PrewarmGridSize => "prewarm.grid_size",
 
             // Patches settings
             ConfigKey::PatchesEnabled => "patches.enabled",
@@ -379,7 +379,7 @@ impl ConfigKey {
             }
 
             // Prewarm settings
-            ConfigKey::PrewarmRadiusNm => config.prewarm.radius_nm.to_string(),
+            ConfigKey::PrewarmGridSize => config.prewarm.grid_size.to_string(),
 
             // Patches settings
             ConfigKey::PatchesEnabled => config.patches.enabled.to_string(),
@@ -559,8 +559,8 @@ impl ConfigKey {
             }
 
             // Prewarm settings
-            ConfigKey::PrewarmRadiusNm => {
-                config.prewarm.radius_nm = value.parse().unwrap();
+            ConfigKey::PrewarmGridSize => {
+                config.prewarm.grid_size = value.parse().unwrap();
             }
 
             // Patches settings
@@ -669,7 +669,7 @@ impl ConfigKey {
             ConfigKey::ControlPlaneSemaphoreTimeoutSecs => Box::new(PositiveIntegerSpec),
 
             // Prewarm settings
-            ConfigKey::PrewarmRadiusNm => Box::new(PositiveNumberSpec),
+            ConfigKey::PrewarmGridSize => Box::new(PositiveIntegerSpec),
 
             // Patches settings
             ConfigKey::PatchesEnabled => Box::new(BooleanSpec),
@@ -732,7 +732,7 @@ impl ConfigKey {
             ConfigKey::ControlPlaneHealthCheckIntervalSecs,
             ConfigKey::ControlPlaneSemaphoreTimeoutSecs,
             // Prewarm settings
-            ConfigKey::PrewarmRadiusNm,
+            ConfigKey::PrewarmGridSize,
             // Patches settings
             ConfigKey::PatchesEnabled,
             ConfigKey::PatchesDirectory,

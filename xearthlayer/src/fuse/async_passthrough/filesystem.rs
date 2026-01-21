@@ -480,6 +480,7 @@ mod tests {
                 data: vec![0xDD, 0x53, 0x20, 0x00], // DDS magic bytes
                 cache_hit: false,
                 duration: Duration::from_millis(100),
+                job_succeeded: true,
             };
             let _ = req.result_tx.send(response);
         });

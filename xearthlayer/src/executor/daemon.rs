@@ -429,7 +429,9 @@ where
                                 Vec::new()
                             };
 
-                            let response = DdsResponse::cache_miss(data, duration);
+                            // Create response with job_succeeded flag set correctly
+                            // Even if cache read failed (returned empty), job may have succeeded
+                            let response = DdsResponse::new(data, false, duration, success);
 
                             // Send response if requested
                             if let Some(tx) = request.response_tx {

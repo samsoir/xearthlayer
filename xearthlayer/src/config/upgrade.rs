@@ -69,6 +69,9 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "pipeline.max_retries",
     "pipeline.retry_base_delay_ms",
     "pipeline.coalesce_channel_capacity",
+    // Removed in v0.3.1 - Prewarm now uses tile-based (DSF grid) instead of radius
+    // The new grid_size setting aligns prewarm with X-Plane's DSF tile boundaries.
+    "prewarm.radius_nm",
 ];
 
 /// Result of analyzing a configuration file for upgrade needs.
