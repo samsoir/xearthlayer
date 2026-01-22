@@ -16,6 +16,7 @@
 //! let tile_data = service.download_tile(37.7749, -122.4194, 15)?;
 //! ```
 
+pub mod aircraft_position;
 pub mod airport;
 pub mod cache;
 pub mod config;

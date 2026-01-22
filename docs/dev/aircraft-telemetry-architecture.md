@@ -32,18 +32,21 @@ XEarthLayer requires knowledge of the aircraft's position and trajectory to effi
 │  • Exposes loaded regions for queries                                       │
 │  • Does NOT interpret - consumers derive meaning                            │
 └───────────────────────────────┬─────────────────────────────────────────────┘
-                                │ query API (loaded bounds, regions)
+                                │ burst events + query API
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │              Aircraft Position & Telemetry - APT (Module 1)                 │
 │           Single source of truth for aircraft state                         │
 │                                                                             │
-│  Inputs:                                                                    │
-│  • GPS Telemetry (XGPS2 UDP) - precise, authoritative                       │
-│  • Scene Tracker data - derives position when no telemetry                  │
+│  Position Model: Maintains best-known position, refined by multiple sources │
+│                                                                             │
+│  Inputs (via channels):                                                     │
+│  • GPS Telemetry (XGPS2 UDP) - ~10m accuracy, continuous                    │
+│  • Prewarm position (airport ICAO) - ~100m accuracy, one-time seed          │
+│  • Scene Tracker inference - ~100km accuracy, on burst completion           │
 │                                                                             │
 │  Outputs:                                                                   │
-│  • Broadcast channel (position updates)                                     │
+│  • Broadcast channel (position updates at 1Hz)                              │
 │  • Query API (position, vectors, telemetry status)                          │
 └───────────────────────────────┬─────────────────────────────────────────────┘
                                 │ broadcast + query
@@ -64,19 +67,59 @@ XEarthLayer requires knowledge of the aircraft's position and trajectory to effi
 
 ### Responsibility
 
-Provide a **single source of truth** for aircraft position and vector data, abstracting over multiple data sources with varying accuracy.
+Provide a **single source of truth** for aircraft position and vector data via a **Position Model** that is continuously refined by multiple data sources with varying accuracy.
+
+### Core Concept: Position Model
+
+Instead of simple source switching (use GPS if available, else use inference), APT maintains a **persistent position model** that is refined by the best available data:
+
+> **The model is the source of truth, not any single input. Inputs refine the model based on their accuracy and freshness.**
+
+This mirrors how real aircraft navigation works:
+- **GPS** → Primary, recalibrates the model when available
+- **IRS** → Maintains the model via dead reckoning when GPS drops
+- **Initial alignment** → Seeds the model at startup
+
+For XEL:
+- **Telemetry** → Primary, high accuracy, updates model when connected
+- **Prewarm** → Seeds model at startup (airport ICAO location)
+- **Scene Inference** → Maintains model when telemetry unavailable
 
 ### Data Sources
 
-| Source | Accuracy | Data Available | When Used |
-|--------|----------|----------------|-----------|
-| GPS Telemetry (XGPS2) | Precise (meters) | Position, heading, ground speed, altitude | When X-Plane broadcasts enabled |
-| Scene Tracker Inference | ~1° (~60nm) | Position only (heading unreliable) | Fallback when no GPS |
+| Source | Accuracy | Confidence Decay | Update Pattern | When Available |
+|--------|----------|------------------|----------------|----------------|
+| GPS Telemetry (XGPS2) | ~10m | None (continuous) | 1Hz rate-limited | X-Plane UDP enabled |
+| Prewarm (Airport ICAO) | ~100m | Rapid (static fix) | One-time seed | `--airport` flag used |
+| Scene Tracker Inference | ~100km | Slow (current state) | On burst + 30s fallback | After first tiles loaded |
+
+**Key distinction: Accuracy vs Confidence**
+- **Accuracy**: Inherent precision of the measurement (Prewarm is more precise than Inference)
+- **Confidence**: Likelihood the position is still correct (Prewarm decays rapidly as aircraft moves)
 
 ### State Model
 
 ```rust
+/// Position accuracy in meters (lower is better).
+///
+/// Each position source reports its inherent measurement precision.
+/// This is combined with timestamp freshness to select the best position.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct PositionAccuracy(pub f32);
+
+impl PositionAccuracy {
+    /// GPS telemetry - meter-level precision
+    pub const TELEMETRY: Self = Self(10.0);
+
+    /// Airport reference point (ICAO) - precise fix
+    pub const AIRPORT_FIX: Self = Self(100.0);
+
+    /// Scene inference - derived from tile bounds (~60nm)
+    pub const SCENE_INFERENCE: Self = Self(100_000.0);
+}
+
 /// Telemetry connection status (binary - is X-Plane sending XGPS2?)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelemetryStatus {
     /// Receiving XGPS2 UDP data from X-Plane
     Connected,
@@ -85,34 +128,31 @@ pub enum TelemetryStatus {
 }
 
 /// Source of the current position data
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PositionSource {
     /// From GPS telemetry (XGPS2)
     Telemetry,
+    /// Seeded from prewarm airport location
+    Prewarm,
     /// Inferred from scene loading patterns
     SceneInference,
 }
 
-/// Position accuracy level
-pub enum PositionAccuracy {
-    /// Meter-level accuracy (GPS telemetry)
-    High,
-    /// ~1° (~60nm) accuracy (scene inference)
-    Low,
-}
-
 /// Aircraft state snapshot
+#[derive(Debug, Clone)]
 pub struct AircraftState {
     pub latitude: f64,
     pub longitude: f64,
     pub heading: f32,        // Degrees true, 0 if unknown
     pub ground_speed: f32,   // Knots, 0 if unknown
     pub altitude: f32,       // Feet MSL, 0 if unknown
-    pub timestamp: Instant,
+    pub timestamp: Instant,  // When this was measured/inferred
     pub source: PositionSource,
     pub accuracy: PositionAccuracy,
 }
 
 /// Complete APT status for consumers
+#[derive(Debug, Clone)]
 pub struct AircraftPositionStatus {
     /// Current aircraft state (if any position data available)
     pub state: Option<AircraftState>,
@@ -128,11 +168,45 @@ pub struct AircraftPositionStatus {
 **Key distinction:**
 - `TelemetryStatus` answers: "Is X-Plane broadcasting XGPS2?"
 - `PositionSource` answers: "Where did this position come from?"
-- `PositionAccuracy` answers: "How accurate is this position?"
+- `PositionAccuracy` answers: "How precise is this measurement?"
+- `timestamp` answers: "How fresh is this data?" (callers judge staleness)
 
 These are independent. For example:
 - Telemetry could be Connected but we're still using an older inferred position (brief gap)
-- Telemetry could be Disconnected but we have a recent inferred position
+- Prewarm position is high accuracy but becomes stale quickly once sim starts
+
+### Position Model Selection Logic
+
+```rust
+impl PositionModel {
+    /// Determine if an update should replace the current position.
+    ///
+    /// Decision factors:
+    /// 1. Higher accuracy always wins (lower meters = better)
+    /// 2. Equal accuracy: fresher wins
+    /// 3. Stale high-accuracy can be beaten by fresh lower-accuracy
+    fn should_accept(&self, update: &AircraftState, stale_threshold: Duration) -> bool {
+        let Some(current) = &self.current else {
+            return true; // No position yet - accept anything
+        };
+
+        let current_stale = current.timestamp.elapsed() > stale_threshold;
+        let update_more_accurate = update.accuracy.0 < current.accuracy.0;
+
+        // Higher accuracy always wins
+        if update_more_accurate {
+            return true;
+        }
+
+        // If current is stale, accept fresher data even if less accurate
+        if current_stale && update.timestamp > current.timestamp {
+            return true;
+        }
+
+        false
+    }
+}
+```
 
 ### Public Interface
 
@@ -160,24 +234,50 @@ pub trait AircraftPositionProvider: Send + Sync {
 
 /// Trait for subscribing to position updates (push API)
 pub trait AircraftPositionBroadcaster: Send + Sync {
-    /// Subscribe to position updates
+    /// Subscribe to position updates (broadcast at 1Hz max)
     fn subscribe(&self) -> broadcast::Receiver<AircraftState>;
 }
 ```
 
 ### Internal Components
 
-1. **TelemetryReceiver**: Listens for XGPS2 UDP packets, parses aircraft state
-2. **InferenceAdapter**: Subscribes to Scene Tracker for fallback position
-3. **StateAggregator**: Merges inputs, selects best source, broadcasts updates
+1. **TelemetryReceiver**: Listens for XGPS2 UDP packets, parses aircraft state, sends to aggregator
+2. **InferenceAdapter**: Subscribes to Scene Tracker burst events, derives position on burst completion, also runs 30s fallback timer
+3. **PositionModel**: Maintains best-known position, applies selection logic
+4. **StateAggregator**: Receives updates from all sources, applies to model, broadcasts changes at 1Hz
 
 ### Behavior
 
-- When GPS telemetry is available, it takes precedence (authoritative)
-- When GPS is unavailable, falls back to Scene Tracker inference
-- GPS status reflects actual data source being used
-- Broadcasts position updates on any change (rate-limited to avoid flooding)
-- Query API always returns latest known state
+- Position model persists across source transitions (no "lost" position)
+- Higher accuracy sources always update the model immediately
+- Stale positions can be replaced by fresher lower-accuracy data (configurable threshold)
+- Broadcasts position updates at 1Hz max (rate-limited to avoid flooding)
+- Query API always returns latest known state with timestamp (callers judge freshness)
+
+### State Transitions
+
+```
+┌──────────────┐     prewarm --airport LFBO      ┌──────────────┐
+│   No Data    │ ──────────────────────────────► │   Prewarm    │
+│              │                                 │ (100m, fresh)│
+└──────────────┘                                 └──────┬───────┘
+       │                                                │
+       │ first burst completes                          │ prewarm stale
+       │ (no prewarm)                                   │ + burst completes
+       ▼                                                ▼
+┌──────────────┐      prewarm stale              ┌──────────────┐
+│   Inferred   │ ◄───────────────────────────────│   Inferred   │
+│  (100km)     │      + no telemetry             │  (100km)     │
+└──────┬───────┘                                 └──────┬───────┘
+       │                                                │
+       │ telemetry connects                             │ telemetry
+       │ (10m > 100km)                                  │ connects
+       ▼                                                ▼
+┌──────────────────────────────────────────────────────────────┐
+│                      Telemetry (10m)                          │
+│              Always wins - highest accuracy                   │
+└──────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -268,7 +368,7 @@ Build and maintain a **mental model** of what scenery X-Plane has loaded, detect
 **Empirical data is the foundation. Inference is a calculation on top.**
 
 - **Store**: What X-Plane actually requested (DDS tile coordinates)
-- **Derive**: 1°×1° regions, position, bounds, etc. via calculation
+- **Derive**: 1x1 regions, position, bounds, etc. via calculation
 - **Never assume**: Mapping between DDS tiles and geographic regions
 
 This separation means:
@@ -290,14 +390,14 @@ pub struct DdsTileCoord {
 impl DdsTileCoord {
     /// Derive the geographic center of this tile
     pub fn to_lat_lon(&self) -> (f64, f64) {
-        // Web Mercator → WGS84 conversion
+        // Web Mercator -> WGS84 conversion
         let n = 2.0_f64.powi(self.zoom as i32);
         let lon = (self.col as f64 / n) * 360.0 - 180.0;
         let lat_rad = (std::f64::consts::PI * (1.0 - 2.0 * self.row as f64 / n)).sinh().atan();
         (lat_rad.to_degrees(), lon)
     }
 
-    /// Derive which 1°×1° region this tile falls within
+    /// Derive which 1x1 region this tile falls within
     pub fn to_geo_region(&self) -> GeoRegion {
         let (lat, lon) = self.to_lat_lon();
         GeoRegion {
@@ -307,11 +407,11 @@ impl DdsTileCoord {
     }
 }
 
-/// A 1°×1° geographic region (derived, not stored)
+/// A 1x1 geographic region (derived, not stored)
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]
 pub struct GeoRegion {
-    pub lat: i32,  // Floor of latitude (e.g., 53 for 53.5°)
-    pub lon: i32,  // Floor of longitude (e.g., 9 for 9.7°)
+    pub lat: i32,  // Floor of latitude (e.g., 53 for 53.5)
+    pub lon: i32,  // Floor of longitude (e.g., 9 for 9.7)
 }
 
 /// Scene loading state - empirical model of X-Plane's requests
@@ -358,9 +458,6 @@ pub enum BurstType {
 ```rust
 /// Trait for querying scene loading state (pull API)
 pub trait SceneTracker: Send + Sync {
-    /// Get current loading state snapshot
-    fn state(&self) -> SceneLoadingState;
-
     /// Get all DDS tiles X-Plane has requested this session (empirical data)
     fn requested_tiles(&self) -> HashSet<DdsTileCoord>;
 
@@ -373,12 +470,15 @@ pub trait SceneTracker: Send + Sync {
     /// Get tiles from the current/most recent burst
     fn current_burst_tiles(&self) -> Vec<DdsTileCoord>;
 
+    /// Get total number of tile requests this session
+    fn total_requests(&self) -> u64;
+
     // === Derived queries (calculated from empirical data) ===
 
-    /// Derive which 1°×1° regions have been loaded (calculated, not stored)
+    /// Derive which 1x1 regions have been loaded (calculated, not stored)
     fn loaded_regions(&self) -> HashSet<GeoRegion>;
 
-    /// Check if a 1°×1° region has any requested tiles
+    /// Check if a 1x1 region has any requested tiles
     fn is_region_loaded(&self, region: &GeoRegion) -> bool;
 
     /// Derive the geographic bounding box of all requested tiles
@@ -419,32 +519,51 @@ The Scene Tracker provides empirical data. Consumers derive meaning from it:
 
 | Consumer | What They Do With Scene Tracker Data |
 |----------|--------------------------------------|
-| **APT Module** | Derives position from center of loaded bounds (fallback) |
+| **APT Module** | Derives position from center of loaded bounds (on burst completion) |
 | **Prefetch System** | Queries loaded regions to avoid re-prefetching, predicts next regions |
 | **Dashboard** | Could display loaded area visualization |
 
 ### Position Inference (APT's Responsibility)
 
-APT uses Scene Tracker data to derive position when telemetry is unavailable:
+APT's InferenceAdapter subscribes to burst completion events and derives position:
 
 ```rust
 // In APT module, NOT Scene Tracker
-fn derive_position_from_scene(tracker: &dyn SceneTracker) -> Option<AircraftState> {
-    let bounds = tracker.loaded_bounds()?;
+impl InferenceAdapter {
+    /// Run the inference loop (spawned as background task).
+    async fn run(mut self, position_tx: mpsc::Sender<AircraftState>) {
+        let mut fallback_interval = tokio::time::interval(Duration::from_secs(30));
 
-    // Center of loaded area
-    let (lat, lon) = bounds.center();
+        loop {
+            tokio::select! {
+                // Trigger 1: Burst completed
+                Ok(burst) = self.burst_rx.recv() => {
+                    self.infer_and_send(&position_tx).await;
+                }
+                // Trigger 2: Fallback timer (for steady-state flying)
+                _ = fallback_interval.tick() => {
+                    self.infer_and_send(&position_tx).await;
+                }
+            }
+        }
+    }
 
-    Some(AircraftState {
-        latitude: lat,
-        longitude: lon,
-        heading: 0.0,        // Cannot derive from scene data
-        ground_speed: 0.0,   // Cannot derive from scene data
-        altitude: 0.0,       // Cannot derive from scene data
-        timestamp: Instant::now(),
-        source: PositionSource::SceneInference,
-        accuracy: PositionAccuracy::Low,  // ~1° error margin
-    })
+    async fn infer_and_send(&self, tx: &mpsc::Sender<AircraftState>) {
+        if let Some(bounds) = self.scene_tracker.loaded_bounds() {
+            let (lat, lon) = bounds.center();
+            let inferred = AircraftState {
+                latitude: lat,
+                longitude: lon,
+                heading: 0.0,
+                ground_speed: 0.0,
+                altitude: 0.0,
+                timestamp: Instant::now(),
+                source: PositionSource::SceneInference,
+                accuracy: PositionAccuracy::SCENE_INFERENCE,
+            };
+            let _ = tx.send(inferred).await;
+        }
+    }
 }
 ```
 
@@ -507,22 +626,6 @@ async fn handle_dds_read(&self, path: &str) -> Result<DdsData> {
 - Even if parsing fails, DDS delivery continues
 - Scene Tracker processes events asynchronously in its own task
 
-```
-// FUSE layer responsibility:
-// 1. Handle DDS read request → return resource (PRIORITY)
-// 2. Parse filename to extract row, col, zoom
-// 3. Fire-and-forget send to Scene Tracker channel
-// 4. Does NOT wait for Scene Tracker acknowledgment
-// 5. Does NOT interpret meaning - just reports what was requested
-
-// Scene Tracker responsibility (separate async task):
-// 1. Receives events from channel at its own pace
-// 2. Stores DdsTileCoord in requested_tiles set
-// 3. Manages burst state (active/ended based on timing)
-// 4. Broadcasts events to subscribers
-// 5. Does NOT interpret meaning - just maintains the model
-```
-
 ### Why Unbounded Channel?
 
 | Consideration | Decision |
@@ -544,17 +647,19 @@ async fn handle_dds_read(&self, path: &str) -> Result<DdsData> {
                               ┌─────────────────┐
                               │ TelemetryReceiver│
                               └────────┬────────┘
-                                       │ AircraftState (precise)
+                                       │ AircraftState (10m accuracy)
         ┌──────────────────────────────┼──────────────────────────────┐
         │                              │                              │
+        │   Prewarm ───────────────────┤                              │
+        │   (100m accuracy, one-time)  │                              │
         │                              ▼                              │
         │              ┌───────────────────────────────┐              │
         │              │    Aircraft Position &        │              │
         │              │    Telemetry (APT)            │              │
         │              │                               │              │
         │              │  ┌─────────────────────────┐  │              │
-        │   derive     │  │    StateAggregator      │  │  broadcast   │
-        │   position   │  │  (selects best source)  │  │  + query     │
+        │   burst +    │  │    Position Model       │  │  broadcast   │
+        │   30s timer  │  │  (selects best source)  │  │  @ 1Hz       │
         │      ┌───────┼──│                         │──┼───────┐      │
         │      │       │  └─────────────────────────┘  │       │      │
         │      │       └───────────────────────────────┘       │      │
@@ -587,17 +692,17 @@ async fn handle_dds_read(&self, path: &str) -> Result<DdsData> {
 └──────────────────────────┘
 ```
 
-**Key principle**: Data flows up from empirical observations (FUSE) through the Scene Tracker, which APT can query for derived position when telemetry is unavailable. The Prefetch System observes APT for position and queries Scene Tracker for loaded regions.
+**Key principle**: Data flows up from empirical observations (FUSE) through the Scene Tracker. APT maintains a Position Model that is refined by three sources: Telemetry (primary), Prewarm (seed), and Scene Inference (fallback). The Prefetch System observes APT for position and queries Scene Tracker for loaded regions.
 
 ---
 
 ## Current Code Mapping
 
-### Existing Components → New Architecture
+### Existing Components -> New Architecture
 
 | Current Code | New Location | Changes Needed |
 |--------------|--------------|----------------|
-| `TelemetryListener` | APT Module | Rename to TelemetryReceiver, add broadcast |
+| `TelemetryListener` | APT Module | Rename to TelemetryReceiver, send to aggregator channel |
 | `SharedPrefetchStatus` | Split | APT state + Prefetch stats become separate |
 | `TileBasedPrefetcher.BurstTracker` | Scene Tracker | Extract to standalone module |
 | `DdsAccessEvent` | Scene Tracker | Change `dsf_tile` to `DdsTileCoord` |
@@ -609,24 +714,26 @@ async fn handle_dds_read(&self, path: &str) -> Result<DdsData> {
 
 ```
 xearthlayer/src/
-├── aircraft/                    # New APT module
-│   ├── mod.rs                   # Module exports
-│   ├── provider.rs              # AircraftPositionProvider trait + impl
-│   ├── telemetry.rs             # TelemetryReceiver (from listener.rs)
-│   ├── state.rs                 # AircraftState, TelemetryStatus, PositionSource
-│   └── aggregator.rs            # Combines telemetry + scene inference
+├── aircraft_position/          # New APT module
+│   ├── mod.rs                  # Module exports
+│   ├── provider.rs             # AircraftPositionProvider trait + impl
+│   ├── telemetry.rs            # TelemetryReceiver (from listener.rs)
+│   ├── state.rs                # AircraftState, TelemetryStatus, PositionSource, PositionAccuracy
+│   ├── model.rs                # PositionModel (selection logic)
+│   ├── inference.rs            # InferenceAdapter (Scene Tracker -> position)
+│   └── aggregator.rs           # StateAggregator (combines all sources)
 │
-├── scene_tracker/               # New Scene Tracker module
-│   ├── mod.rs                   # Module exports
-│   ├── tracker.rs               # SceneTracker trait + impl
-│   ├── model.rs                 # DdsTileCoord, GeoRegion, SceneLoadingState
-│   ├── burst.rs                 # Burst detection logic
-│   └── coords.rs                # Coordinate conversion (DDS → geographic)
+├── scene_tracker/              # Scene Tracker module (Phase 1 - COMPLETE)
+│   ├── mod.rs                  # Module exports
+│   ├── tracker.rs              # SceneTracker trait + impl
+│   ├── model.rs                # DdsTileCoord, GeoRegion, SceneLoadingState
+│   ├── burst.rs                # Burst detection logic
+│   └── coords.rs               # Coordinate conversion (DDS -> geographic)
 │
-├── prefetch/                    # Refactored prefetch module
-│   ├── ...                      # Existing prefetch code
-│   ├── status.rs                # PrefetchStatus (stats only, no aircraft)
-│   └── apt_observer.rs          # APT observer integration
+├── prefetch/                   # Refactored prefetch module
+│   ├── ...                     # Existing prefetch code
+│   ├── status.rs               # PrefetchStatus (stats only, no aircraft)
+│   └── apt_observer.rs         # APT observer integration
 ```
 
 ### Files to Modify
@@ -637,6 +744,7 @@ xearthlayer/src/
 | `fuse/fuse3/shared.rs` | Parse DDS filename to `DdsTileCoord` |
 | `prefetch/tile_based/prefetcher.rs` | Remove aircraft state, observe APT, query Scene Tracker |
 | `prefetch/state.rs` | Remove aircraft state, keep prefetch stats only |
+| `prefetch/prewarm.rs` | Send prewarm position to APT via channel |
 | `ui/dashboard/` | Read from APT for position, Prefetch for stats |
 | `commands/run.rs` | Wire new modules, update startup sequence |
 
@@ -652,26 +760,28 @@ xearthlayer/src/
 
 ## Implementation Phases
 
-### Phase 1: Scene Tracker Module
+### Phase 1: Scene Tracker Module [COMPLETE]
 **Goal**: Extract X-Plane request tracking into standalone module
 
 1. Create `scene_tracker/` module structure
 2. Extract `BurstTracker` from tile-based prefetcher
 3. Create `SceneTracker` trait and implementation
-4. Wire FUSE → Scene Tracker unbounded channel
-5. Add position inference from loaded tiles
-6. Tests for burst detection and inference
+4. Wire FUSE -> Scene Tracker unbounded channel
+5. Scene Tracker implements `FuseLoadMonitor` (single source of truth)
+6. Tests for burst detection and loaded regions
 
 ### Phase 2: Aircraft Position & Telemetry Module
-**Goal**: Create unified position provider
+**Goal**: Create unified position provider with Position Model
 
-1. Create `aircraft/` module structure
-2. Move `TelemetryListener` → `TelemetryReceiver`
+1. Create `aircraft_position/` module structure
+2. Move `TelemetryListener` -> `TelemetryReceiver`
 3. Create `AircraftPositionProvider` trait
-4. Implement state aggregator (GPS + inference fallback)
-5. Add broadcast channel for updates
-6. Wire Scene Tracker as inference source
-7. Tests for source selection and broadcasting
+4. Implement Position Model (accuracy-based selection)
+5. Implement InferenceAdapter (burst subscription + 30s fallback)
+6. Add prewarm channel integration
+7. Add broadcast channel for updates (1Hz)
+8. Wire Scene Tracker as inference source
+9. Tests for source selection and model behavior
 
 ### Phase 3: Dashboard Integration
 **Goal**: Display position from APT module
@@ -705,34 +815,72 @@ xearthlayer/src/
 
 ### Unit Tests
 
-- **APT**: Source selection (GPS vs inference), broadcast behavior
-- **Scene Tracker**: Burst detection, tile tracking, inference accuracy
+- **APT**: Position Model selection (accuracy + staleness), broadcast behavior
+- **Scene Tracker**: Burst detection, tile tracking, loaded bounds
 - **Prefetch**: Observer integration, circuit breaker with new APIs
 
 ### Integration Tests
 
-- **FUSE → Scene Tracker → APT**: Position inference flow
-- **Telemetry → APT → Dashboard**: GPS status display
-- **APT → Prefetch**: Observer notification
+- **FUSE -> Scene Tracker -> APT**: Position inference flow
+- **Telemetry -> APT -> Dashboard**: GPS status display
+- **Prewarm -> APT**: Seed position flow
+- **APT -> Prefetch**: Observer notification
 
 ### Manual Testing
 
 - Start with GPS disabled, verify "Inferred" status and position
 - Enable GPS, verify "Connected" status and precise position
+- Use `--airport` flag, verify prewarm seeds position
 - Disable prefetch, verify position still displays
 - Heavy scene loading, verify burst detection
 
 ---
 
-## Open Questions
+## Design Decisions
 
-1. **Rate limiting**: How often should APT broadcast position updates? Every GPS packet (~2Hz) or rate-limited?
+This section documents key design decisions made during implementation.
 
-2. **Historical data**: Should Scene Tracker keep history of loaded tiles across sessions for cache warming?
+### D1: Numeric Accuracy Score vs Enum
 
-3. **Confidence decay**: Should position confidence decay over time if no updates received?
+**Decision**: Use numeric `PositionAccuracy(f32)` in meters instead of enum.
 
-4. **Multiple telemetry sources**: Future support for other position sources (e.g., SimConnect on Windows)?
+**Rationale**: Numeric scores are extensible - future sources (SimConnect, external GPS) can report their precision without modifying an enum. The model's selection logic remains unchanged.
+
+### D2: Position Model vs Simple Source Switching
+
+**Decision**: Maintain a persistent Position Model that sources refine, rather than switching between sources.
+
+**Rationale**: Mirrors real aircraft navigation (IRS + GPS). Solves cold start (prewarm seeds), handles telemetry dropout gracefully, and allows natural accuracy-based priority.
+
+### D3: Scene Tracker -> APT via Burst Subscription
+
+**Decision**: APT's InferenceAdapter subscribes to `subscribe_bursts()` plus 30s fallback timer, not a continuous `watch` channel.
+
+**Rationale**: Event-driven approach is cleaner - burst completion is a clear semantic trigger ("X-Plane just finished loading a region"). Avoids polling overhead and aligns with X-Plane's loading behavior.
+
+### D4: Prewarm as Position Source
+
+**Decision**: Prewarm (airport ICAO) is a third position source with ~100m accuracy but rapid confidence decay.
+
+**Rationale**: Solves cold start problem. When user runs `--airport LFBO`, we know the likely starting position. This seeds the model before telemetry or scene inference is available.
+
+### D5: Confidence via Timestamp (Caller Responsibility)
+
+**Decision**: Position includes timestamp; callers decide if data is stale. No scalar "confidence" field.
+
+**Rationale**: Different consumers have different staleness tolerances. Prefetch may accept 30s-old positions; dashboard may want fresher data. Timestamp provides the raw data for callers to decide.
+
+### D6: 1Hz Broadcast Rate Limit
+
+**Decision**: APT broadcasts position updates at maximum 1Hz.
+
+**Rationale**: No current use case requires higher precision. 1Hz is sufficient for prefetch prediction and dashboard display while minimizing broadcast overhead.
+
+### D7: Module Name `aircraft_position`
+
+**Decision**: Use `aircraft_position` (Rust-friendly snake_case) instead of `aircraft` or `apt`.
+
+**Rationale**: Clear, descriptive, follows Rust naming conventions.
 
 ---
 
@@ -740,7 +888,9 @@ xearthlayer/src/
 
 | Connection | Channel Type | Rationale |
 |------------|--------------|-----------|
-| FUSE → Scene Tracker | `mpsc::unbounded` | Critical events, must not drop |
-| APT → Consumers | `broadcast` | Multiple subscribers, ok to lag |
+| FUSE -> Scene Tracker | `mpsc::unbounded` | Critical events, must not drop |
+| Scene Tracker -> APT | `broadcast` (burst events) | APT subscribes to burst completion |
+| Telemetry -> APT | `mpsc` | Single receiver (aggregator) |
+| Prewarm -> APT | `mpsc` | Single receiver (aggregator), one-time send |
+| APT -> Consumers | `broadcast` | Multiple subscribers, ok to lag |
 | APT query | Direct method call | Synchronous current-state queries |
-| Scene Tracker → APT | `watch` | Latest value only, position inference |

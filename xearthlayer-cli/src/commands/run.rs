@@ -6,9 +6,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use xearthlayer::aircraft_position::{
+    SharedAircraftPosition, StateAggregator, TelemetryReceiver, TelemetryReceiverConfig,
+};
 use xearthlayer::airport::AirportIndex;
 use xearthlayer::cache::{run_eviction_daemon, DiskCacheConfig};
 use xearthlayer::config::{
@@ -502,6 +505,12 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     })
     .map_err(|e| CliError::Config(format!("Failed to set signal handler: {}", e)))?;
 
+    // Create Aircraft Position & Telemetry (APT) module
+    // This provides a unified position provider that aggregates telemetry, prewarm, and inference
+    let (apt_broadcast_tx, _apt_broadcast_rx) = broadcast::channel(16);
+    let apt_aggregator = StateAggregator::new(apt_broadcast_tx);
+    let aircraft_position = SharedAircraftPosition::new(apt_aggregator);
+
     // Track which cancellation token to use for cleanup
     let cleanup_cancellation = if use_tui {
         // TUI path: Start dashboard in Loading state, mount with progress, then start prefetcher
@@ -511,6 +520,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
             shutdown,
             config,
             prefetch_status: Arc::clone(&shared_prefetch_status),
+            aircraft_position: aircraft_position.clone(),
             ortho_packages: ortho_packages.clone(),
             prefetch_enabled,
             fuse_analyzer,
@@ -571,6 +581,8 @@ struct TuiContext<'a> {
     shutdown: Arc<AtomicBool>,
     config: &'a ConfigFile,
     prefetch_status: Arc<SharedPrefetchStatus>,
+    /// Unified aircraft position provider (APT module)
+    aircraft_position: SharedAircraftPosition,
     ortho_packages: Vec<&'a InstalledPackage>,
     prefetch_enabled: bool,
     fuse_analyzer: Option<Arc<FuseRequestAnalyzer>>,
@@ -737,6 +749,45 @@ fn run_with_dashboard(
         .get_service()
         .map(|s| s.runtime_handle().clone())
         .ok_or_else(|| CliError::Config("No runtime handle available".to_string()))?;
+
+    // Start APT TelemetryReceiver to listen for X-Plane UDP telemetry
+    // This provides real-time position updates with ~10m accuracy
+    {
+        let telemetry_port = ctx.config.prefetch.udp_port;
+        let (telemetry_tx, mut telemetry_rx) = mpsc::channel(32);
+        let telemetry_config = TelemetryReceiverConfig {
+            port: telemetry_port,
+            ..Default::default()
+        };
+        let receiver = TelemetryReceiver::new(telemetry_config, telemetry_tx);
+        let apt_cancellation = ctx.prefetch_cancellation.clone();
+
+        // Start the UDP receiver
+        runtime_handle.spawn(async move {
+            tokio::select! {
+                result = receiver.start() => {
+                    match result {
+                        Ok(Ok(())) => tracing::debug!("APT telemetry receiver stopped"),
+                        Ok(Err(e)) => tracing::warn!("APT telemetry receiver error: {}", e),
+                        Err(e) => tracing::warn!("APT telemetry receiver task failed: {}", e),
+                    }
+                }
+                _ = apt_cancellation.cancelled() => {
+                    tracing::debug!("APT telemetry receiver cancelled");
+                }
+            }
+        });
+
+        // Bridge task: forward telemetry states to APT aggregator
+        let aircraft_position = ctx.aircraft_position.clone();
+        runtime_handle.spawn(async move {
+            while let Some(state) = telemetry_rx.recv().await {
+                aircraft_position.receive_telemetry(state);
+            }
+        });
+
+        tracing::info!(port = telemetry_port, "APT telemetry receiver started");
+    }
 
     // Phase 2: Now build SceneryIndex for prefetching (update progress display)
 
@@ -913,6 +964,7 @@ fn run_with_dashboard(
                     ctx.config,
                     icao,
                     ctx.xplane_env.as_ref(),
+                    &ctx.aircraft_position,
                     &prewarm_cancellation,
                     &runtime_handle,
                 ) {
@@ -1235,6 +1287,7 @@ fn start_prewarm(
     config: &ConfigFile,
     icao: &str,
     xplane_env: Option<&XPlaneEnvironment>,
+    aircraft_position: &SharedAircraftPosition,
     cancellation: &CancellationToken,
     runtime_handle: &Handle,
 ) -> Result<(mpsc::Receiver<LibPrewarmProgress>, String, usize), String> {
@@ -1265,6 +1318,17 @@ fn start_prewarm(
     let ortho_index = mount_manager
         .ortho_union_index()
         .ok_or_else(|| "OrthoUnionIndex not available for prewarm".to_string())?;
+
+    // Seed APT with airport position (manual reference source)
+    // This provides initial position for prefetch and dashboard before telemetry connects
+    if aircraft_position.receive_manual_reference(airport.latitude, airport.longitude) {
+        tracing::info!(
+            icao = %icao,
+            lat = airport.latitude,
+            lon = airport.longitude,
+            "APT seeded with airport position"
+        );
+    }
 
     // Log airport coordinates and grid info for debugging
     tracing::debug!(
