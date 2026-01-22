@@ -26,8 +26,8 @@ use crate::package::{
 use crate::panic as panic_handler;
 use crate::patches::{PatchDiscovery, PatchUnionIndex};
 use crate::prefetch::tile_based::DdsAccessEvent;
-use crate::prefetch::{FuseLoadMonitor, SharedFuseLoadMonitor, TileRequestCallback};
-use crate::scene_tracker::FuseAccessEvent;
+use crate::prefetch::{FuseLoadMonitor, TileRequestCallback};
+use crate::scene_tracker::{DefaultSceneTracker, FuseAccessEvent};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
 
 use super::local::{InstalledPackage, LocalPackageStore};
@@ -254,9 +254,16 @@ pub struct MountManager {
     /// Target scenery directory for mounts (e.g., X-Plane Custom Scenery).
     /// If None, packages are mounted in-place.
     scenery_path: Option<PathBuf>,
-    /// Shared load monitor for tracking FUSE-originated requests.
-    /// Used by the circuit breaker to detect when X-Plane is loading scenery.
-    load_monitor: Arc<SharedFuseLoadMonitor>,
+    /// Scene Tracker for empirical X-Plane request tracking.
+    ///
+    /// This serves as the single source of truth for:
+    /// - Load monitoring (implements [`FuseLoadMonitor`] for circuit breaker)
+    /// - Tile tracking (which DDS tiles X-Plane has requested)
+    /// - Burst detection (identifying loading patterns)
+    ///
+    /// FUSE calls `scene_tracker.record_request()` for immediate visibility
+    /// and sends detailed events via channel for async processing.
+    scene_tracker: Arc<DefaultSceneTracker>,
     /// Active patches union filesystem mount (if any).
     patches_session: Option<SpawnedMountHandle>,
     /// Patches mount info for display.
@@ -290,7 +297,7 @@ impl MountManager {
             services: HashMap::new(),
             mounts: HashMap::new(),
             scenery_path: None,
-            load_monitor: Arc::new(SharedFuseLoadMonitor::new()),
+            scene_tracker: Arc::new(DefaultSceneTracker::with_defaults()),
             patches_session: None,
             patches_mount: None,
             patches_service: None,
@@ -313,7 +320,7 @@ impl MountManager {
             services: HashMap::new(),
             mounts: HashMap::new(),
             scenery_path: Some(scenery_path.to_path_buf()),
-            load_monitor: Arc::new(SharedFuseLoadMonitor::new()),
+            scene_tracker: Arc::new(DefaultSceneTracker::with_defaults()),
             patches_session: None,
             patches_mount: None,
             patches_service: None,
@@ -886,7 +893,7 @@ impl MountManager {
             Fuse3OrthoUnionFS::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
                 .with_dds_access_channel(dds_access_tx)
                 .with_scene_tracker_channel(scene_tracker_tx)
-                .with_load_monitor(Arc::clone(&self.load_monitor) as Arc<dyn FuseLoadMonitor>);
+                .with_load_monitor(Arc::clone(&self.scene_tracker) as Arc<dyn FuseLoadMonitor>);
 
         // Wire metrics client for coalesced request tracking
         if let Some(metrics) = service.metrics_client() {
@@ -1078,18 +1085,35 @@ impl MountManager {
             .or_else(|| self.services.values().next())
     }
 
-    /// Get the shared load monitor for circuit breaker integration.
+    /// Get the load monitor for circuit breaker integration.
     ///
-    /// All DDS handlers across all services call `record_request()` on this
-    /// monitor when they receive a FUSE-originated request (not prefetch).
-    /// Used by the circuit breaker to detect when X-Plane is loading scenery.
+    /// Returns the Scene Tracker as a [`FuseLoadMonitor`], which serves as the
+    /// single source of truth for X-Plane load detection. The circuit breaker
+    /// uses this to detect when X-Plane is actively loading scenery.
+    ///
+    /// Note: This returns the Scene Tracker cast to `FuseLoadMonitor`. For full
+    /// Scene Tracker functionality (tile tracking, burst detection), use
+    /// [`scene_tracker()`] instead.
     pub fn load_monitor(&self) -> Arc<dyn FuseLoadMonitor> {
-        Arc::clone(&self.load_monitor) as Arc<dyn FuseLoadMonitor>
+        Arc::clone(&self.scene_tracker) as Arc<dyn FuseLoadMonitor>
+    }
+
+    /// Get the Scene Tracker for empirical X-Plane request tracking.
+    ///
+    /// The Scene Tracker maintains an empirical model of what X-Plane has
+    /// requested, including:
+    /// - Which DDS tiles have been accessed
+    /// - Burst detection for loading patterns
+    /// - Geographic region tracking
+    ///
+    /// It also implements [`FuseLoadMonitor`] for circuit breaker integration.
+    pub fn scene_tracker(&self) -> Arc<DefaultSceneTracker> {
+        Arc::clone(&self.scene_tracker)
     }
 
     /// Get the current count of FUSE-originated requests across all services.
     pub fn fuse_jobs_submitted(&self) -> u64 {
-        self.load_monitor.total_requests()
+        FuseLoadMonitor::total_requests(&*self.scene_tracker)
     }
 
     /// Get aggregated telemetry from all mounted services.
@@ -1354,7 +1378,7 @@ impl ServiceBuilder {
             shared_memory_cache,
             shared_memory_cache_adapter,
             tile_request_callback: None,
-            load_monitor: Arc::new(SharedFuseLoadMonitor::new()), // Default, can be overridden
+            load_monitor: Arc::new(DefaultSceneTracker::with_defaults()), // Default, can be overridden
         }
     }
 
