@@ -10,7 +10,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use xearthlayer::aircraft_position::{
-    SharedAircraftPosition, StateAggregator, TelemetryReceiver, TelemetryReceiverConfig,
+    spawn_position_logger, SharedAircraftPosition, StateAggregator, TelemetryReceiver,
+    TelemetryReceiverConfig, DEFAULT_LOG_INTERVAL,
 };
 use xearthlayer::airport::AirportIndex;
 use xearthlayer::cache::{run_eviction_daemon, DiskCacheConfig};
@@ -762,6 +763,7 @@ fn run_with_dashboard(
         };
         let receiver = TelemetryReceiver::new(telemetry_config, telemetry_tx);
         let apt_cancellation = ctx.prefetch_cancellation.clone();
+        let logger_cancellation = apt_cancellation.clone();
 
         // Start the UDP receiver
         runtime_handle.spawn(async move {
@@ -786,6 +788,15 @@ fn run_with_dashboard(
                 aircraft_position.receive_telemetry(state);
             }
         });
+
+        // Periodic position logger for flight analysis (DEBUG level only)
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            spawn_position_logger(
+                ctx.aircraft_position.clone(),
+                logger_cancellation,
+                DEFAULT_LOG_INTERVAL,
+            );
+        }
 
         tracing::info!(port = telemetry_port, "APT telemetry receiver started");
     }

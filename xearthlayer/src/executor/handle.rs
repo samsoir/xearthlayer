@@ -24,7 +24,8 @@
 //! ```
 
 use super::job::{JobId, JobResult};
-use tokio::sync::{mpsc, watch};
+use std::sync::Arc;
+use tokio::sync::{mpsc, watch, Mutex};
 
 /// Handle to a submitted job for status queries and signalling.
 ///
@@ -35,6 +36,8 @@ pub struct JobHandle {
     job_id: JobId,
     status_rx: watch::Receiver<JobStatus>,
     signal_tx: mpsc::Sender<Signal>,
+    /// Result receiver - set by executor when job completes.
+    result: Arc<Mutex<Option<JobResult>>>,
 }
 
 impl JobHandle {
@@ -50,7 +53,13 @@ impl JobHandle {
             job_id,
             status_rx,
             signal_tx,
+            result: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Returns a clone of the result holder for the executor to set.
+    pub(crate) fn result_holder(&self) -> Arc<Mutex<Option<JobResult>>> {
+        Arc::clone(&self.result)
     }
 
     /// Returns the job's unique identifier.
@@ -80,9 +89,12 @@ impl JobHandle {
                 break;
             }
         }
-        // In a real implementation, we'd get the result from the executor.
-        // For now, return an empty result - the executor will fill this in.
-        JobResult::new()
+        // Take the result from the holder (set by executor on completion)
+        self.result
+            .lock()
+            .await
+            .take()
+            .unwrap_or_else(JobResult::new)
     }
 
     /// Pauses the job: no new tasks start, in-flight tasks continue.

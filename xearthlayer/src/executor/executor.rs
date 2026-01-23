@@ -169,6 +169,7 @@ impl JobSubmitter {
         let (signal_tx, signal_rx) = mpsc::channel(DEFAULT_SIGNAL_CHANNEL_CAPACITY);
 
         let handle = JobHandle::new(job_id.clone(), status_rx, signal_tx);
+        let result_holder = handle.result_holder();
 
         let submitted = SubmittedJob {
             job,
@@ -177,6 +178,7 @@ impl JobSubmitter {
             priority,
             status_tx,
             signal_rx,
+            result_holder,
         };
 
         self.sender.try_send(submitted).ok()?;
@@ -192,6 +194,7 @@ struct SubmittedJob {
     priority: Priority,
     status_tx: watch::Sender<JobStatus>,
     signal_rx: mpsc::Receiver<Signal>,
+    result_holder: std::sync::Arc<tokio::sync::Mutex<Option<JobResult>>>,
 }
 
 // =============================================================================
@@ -266,12 +269,16 @@ struct ActiveJob {
 
     /// Parent job ID if this is a child job.
     parent_job_id: Option<JobId>,
+
+    /// Result holder shared with the JobHandle for returning job output.
+    result_holder: std::sync::Arc<tokio::sync::Mutex<Option<JobResult>>>,
 }
 
 impl ActiveJob {
     fn new(submitted: SubmittedJob) -> Self {
         let (child_job_tx, child_job_rx) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
+        let result_holder = submitted.result_holder;
 
         Self {
             job: submitted.job,
@@ -295,6 +302,7 @@ impl ActiveJob {
             failed_children: Vec::new(),
             retry_counts: HashMap::new(),
             parent_job_id: None,
+            result_holder,
         }
     }
 
@@ -332,6 +340,16 @@ impl ActiveJob {
     }
 
     fn build_result(&self) -> JobResult {
+        // Extract DDS data from task outputs if available
+        // This is used by BuildAndCacheDdsTask to return data directly
+        let output_data = {
+            let outputs = self.task_outputs.read().unwrap();
+            outputs
+                .get("BuildAndCacheDds")
+                .and_then(|output| output.get::<Vec<u8>>("dds_data"))
+                .cloned()
+        };
+
         JobResult {
             succeeded_tasks: self.succeeded_tasks.clone(),
             failed_tasks: self.failed_tasks.clone(),
@@ -340,6 +358,7 @@ impl ActiveJob {
             failed_children: self.failed_children.clone(),
             cancelled_children: Vec::new(), // Not tracked separately
             duration: self.started_at.elapsed(),
+            output_data,
         }
     }
 
@@ -1085,6 +1104,9 @@ impl JobExecutor {
             let (status_tx, _status_rx) = watch::channel(JobStatus::Pending);
             let (_signal_tx, signal_rx) = mpsc::channel(DEFAULT_SIGNAL_CHANNEL_CAPACITY);
 
+            // Child jobs don't have external handles, so use a dummy result holder
+            let result_holder = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+
             let submitted = SubmittedJob {
                 job: child_job,
                 job_id: child_id.clone(),
@@ -1092,6 +1114,7 @@ impl JobExecutor {
                 priority,
                 status_tx,
                 signal_rx,
+                result_holder,
             };
 
             // Create active job with parent reference
@@ -1148,8 +1171,19 @@ impl JobExecutor {
                     } else {
                         job.compute_final_status()
                     };
+
+                    // Build result BEFORE updating status (handle waits on status change)
+                    let result = job.build_result();
+
+                    // Set the result in the holder for the JobHandle to read
+                    {
+                        let mut holder = job.result_holder.lock().await;
+                        *holder = Some(result.clone());
+                    }
+
+                    // Now update status - this triggers the handle's wait() to unblock
                     job.update_status(status);
-                    (status, job.build_result(), job.parent_job_id.clone())
+                    (status, result, job.parent_job_id.clone())
                 } else {
                     continue;
                 }

@@ -191,7 +191,7 @@ pub trait Job: Send + Sync + 'static {
 ///
 /// This struct contains the outcomes of all tasks and child jobs, allowing
 /// the job's `on_complete` method to determine the final status.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct JobResult {
     /// Names of tasks that completed successfully.
     pub succeeded_tasks: Vec<String>,
@@ -213,6 +213,13 @@ pub struct JobResult {
 
     /// Total execution duration.
     pub duration: std::time::Duration,
+
+    /// Output data from the job (e.g., generated DDS tile data).
+    ///
+    /// This allows jobs to return data directly to the caller without
+    /// relying on cache reads, avoiding race conditions with eventual
+    /// consistency caches like moka.
+    pub output_data: Option<Vec<u8>>,
 }
 
 impl JobResult {

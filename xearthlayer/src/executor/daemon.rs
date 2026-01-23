@@ -344,13 +344,20 @@ where
         let priority = request.priority;
         let origin = request.origin;
 
+        // Calculate geographic context for analysis logging
+        let (tile_lat, tile_lon) = tile.to_lat_lon();
+        let dsf_tile = tile.to_dsf_tile_name();
+
         debug!(
             tile_row = tile.row,
             tile_col = tile.col,
             tile_zoom = tile.zoom,
+            tile_lat = format!("{:.4}", tile_lat),
+            tile_lon = format!("{:.4}", tile_lon),
+            dsf_tile = %dsf_tile,
             priority = ?priority,
-            origin = ?origin,
-            "Received job request"
+            origin = %origin,
+            "DDS request received"
         );
 
         // Check for cancellation first
@@ -366,9 +373,15 @@ where
         if let Some(data) = memory_cache.get(tile.row, tile.col, tile.zoom).await {
             let duration = start.elapsed();
             debug!(
-                tile = ?tile,
-                duration_ms = duration.as_millis(),
-                "Cache hit"
+                tile_row = tile.row,
+                tile_col = tile.col,
+                tile_zoom = tile.zoom,
+                dsf_tile = %dsf_tile,
+                origin = %origin,
+                cache_status = "hit",
+                latency_ms = duration.as_millis(),
+                data_size = data.len(),
+                "DDS request completed"
             );
 
             // Track cache hit
@@ -383,6 +396,15 @@ where
         }
 
         // Track cache miss
+        debug!(
+            tile_row = tile.row,
+            tile_col = tile.col,
+            tile_zoom = tile.zoom,
+            dsf_tile = %dsf_tile,
+            origin = %origin,
+            cache_status = "miss",
+            "Cache miss - submitting job"
+        );
         if let Some(client) = metrics_client {
             client.memory_cache_miss();
         }
@@ -407,11 +429,12 @@ where
                 let memory_cache = Arc::clone(memory_cache);
                 let cancellation = request.cancellation.clone();
                 let metrics_for_completion = metrics_client.cloned();
+                let dsf_tile_for_log = dsf_tile.clone();
 
                 tokio::spawn(async move {
                     // Wait for job completion
                     tokio::select! {
-                        _ = handle.wait() => {
+                        job_result = handle.wait() => {
                             let status = handle.status();
                             let duration = start.elapsed();
 
@@ -421,20 +444,35 @@ where
                                 client.job_completed(success, duration.as_micros() as u64);
                             }
 
-                            // Read result from cache
+                            // Get DDS data directly from job result (avoids cache race conditions)
                             let data = if success {
-                                match memory_cache.get(tile.row, tile.col, tile.zoom).await {
-                                    Some(d) => d,
+                                match job_result.output_data {
+                                    Some(d) => {
+                                        debug!(
+                                            tile_row = tile.row,
+                                            tile_col = tile.col,
+                                            tile_zoom = tile.zoom,
+                                            dsf_tile = %dsf_tile_for_log,
+                                            origin = %origin,
+                                            cache_status = "generated",
+                                            latency_ms = duration.as_millis(),
+                                            data_size = d.len(),
+                                            "DDS request completed"
+                                        );
+                                        d
+                                    }
                                     None => {
-                                        // Job succeeded but cache read failed - possible race condition
+                                        // Job succeeded but no output data - should not happen
+                                        // but fall back to cache read for safety
                                         warn!(
                                             tile_row = tile.row,
                                             tile_col = tile.col,
                                             tile_zoom = tile.zoom,
+                                            dsf_tile = %dsf_tile_for_log,
                                             duration_ms = duration.as_millis(),
-                                            "Job succeeded but cache read returned empty - possible write race"
+                                            "Job succeeded but output_data was None - falling back to cache"
                                         );
-                                        Vec::new()
+                                        memory_cache.get(tile.row, tile.col, tile.zoom).await.unwrap_or_default()
                                     }
                                 }
                             } else {
@@ -442,6 +480,8 @@ where
                                     tile_row = tile.row,
                                     tile_col = tile.col,
                                     tile_zoom = tile.zoom,
+                                    dsf_tile = %dsf_tile_for_log,
+                                    latency_ms = duration.as_millis(),
                                     "Job failed - returning empty data"
                                 );
                                 Vec::new()
@@ -457,7 +497,14 @@ where
                             }
                         }
                         _ = cancellation.cancelled() => {
-                            debug!(tile = ?tile, "Job cancelled");
+                            debug!(
+                                tile_row = tile.row,
+                                tile_col = tile.col,
+                                tile_zoom = tile.zoom,
+                                dsf_tile = %dsf_tile_for_log,
+                                latency_ms = start.elapsed().as_millis(),
+                                "DDS request cancelled"
+                            );
                             handle.kill();
 
                             if let Some(tx) = request.response_tx {

@@ -115,8 +115,12 @@ pub fn init_logging_full(
 
     // Create env filter
     // Priority: debug_mode flag > RUST_LOG env var > default (info)
+    //
+    // When debug_mode is enabled, we only enable DEBUG for xearthlayer crate.
+    // Third-party crates (especially fuse3) produce extremely verbose DEBUG output
+    // that can flood the log and cause performance issues.
     let env_filter = if debug_mode {
-        EnvFilter::new("debug")
+        EnvFilter::new("info,xearthlayer=debug")
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };

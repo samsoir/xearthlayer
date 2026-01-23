@@ -14,12 +14,13 @@
 //!
 //! # Output
 //!
-//! No output - the DDS data is written directly to memory cache.
+//! Returns the DDS data via `TaskOutput` key "dds_data" (`Vec<u8>`).
+//! Cache write is fire-and-forget (spawned async task).
 
 use crate::coord::TileCoord;
 use crate::executor::{
     BlockingExecutor, ChunkResults, MemoryCache, ResourceType, Task, TaskContext, TaskError,
-    TaskResult, TextureEncoderAsync,
+    TaskOutput, TaskResult, TextureEncoderAsync,
 };
 use crate::metrics::OptionalMetrics;
 use image::{Rgba, RgbaImage};
@@ -42,7 +43,7 @@ const MAGENTA: Rgba<u8> = Rgba([255, 0, 255, 255]);
 /// This task combines three sequential operations:
 /// 1. Assemble chunks into a 4096×4096 RGBA image
 /// 2. Encode the image to DDS format with BC1/BC3 compression
-/// 3. Write the DDS data to memory cache
+/// 3. Spawn fire-and-forget cache write (non-blocking)
 ///
 /// # Inputs
 ///
@@ -51,7 +52,11 @@ const MAGENTA: Rgba<u8> = Rgba([255, 0, 255, 255]);
 ///
 /// # Outputs
 ///
-/// None - the DDS data is written to memory cache.
+/// - Key: "dds_data"
+/// - Type: `Vec<u8>` - The encoded DDS data
+///
+/// The DDS data is returned directly to avoid cache read race conditions
+/// with eventual consistency caches like moka.
 pub struct BuildAndCacheDdsTask<E, M, X>
 where
     E: TextureEncoderAsync,
@@ -216,27 +221,43 @@ where
                 job_id = %job_id,
                 tile = ?self.tile,
                 size_bytes = dds_size,
-                "DDS encoding complete, writing to cache"
+                "DDS encoding complete, spawning cache write"
             );
 
-            // Step 4: Write to memory cache (async)
-            self.memory_cache
-                .put(self.tile.row, self.tile.col, self.tile.zoom, dds_data)
-                .await;
+            // Step 4: Spawn fire-and-forget cache write
+            // This avoids blocking the job completion on cache write,
+            // and avoids race conditions with eventual consistency caches.
+            let cache = Arc::clone(&self.memory_cache);
+            let tile = self.tile;
+            let dds_data_for_cache = dds_data.clone();
+            let metrics_for_cache = metrics.clone();
+            tokio::spawn(async move {
+                cache
+                    .put(tile.row, tile.col, tile.zoom, dds_data_for_cache)
+                    .await;
 
-            // Emit updated cache size to metrics
-            let total_cache_size = self.memory_cache.size_bytes();
-            metrics.memory_cache_size(total_cache_size as u64);
+                // Emit updated cache size to metrics
+                let total_cache_size = cache.size_bytes();
+                metrics_for_cache.memory_cache_size(total_cache_size as u64);
+
+                debug!(
+                    tile = ?tile,
+                    cache_size_bytes = total_cache_size,
+                    "Cache write complete (async)"
+                );
+            });
 
             info!(
                 job_id = %job_id,
                 tile = ?self.tile,
                 size_bytes = dds_size,
-                cache_size_bytes = total_cache_size,
-                "DDS tile complete and cached"
+                "DDS tile complete"
             );
 
-            TaskResult::Success
+            // Return DDS data directly to avoid cache read race conditions
+            let mut output = TaskOutput::new();
+            output.set("dds_data", dds_data);
+            TaskResult::SuccessWithOutput(output)
         })
     }
 }

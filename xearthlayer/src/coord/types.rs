@@ -38,6 +38,53 @@ impl TileCoord {
             current: 0,
         }
     }
+
+    /// Converts this tile to geographic coordinates (center of tile).
+    ///
+    /// Returns (latitude, longitude) in degrees.
+    #[inline]
+    pub fn to_lat_lon(&self) -> (f64, f64) {
+        use std::f64::consts::PI;
+
+        let n = 2.0_f64.powi(self.zoom as i32);
+
+        // Convert tile X coordinate to longitude (add 0.5 for center)
+        let lon = (self.col as f64 + 0.5) / n * 360.0 - 180.0;
+
+        // Convert tile Y coordinate to latitude using inverse Web Mercator (add 0.5 for center)
+        let y = (self.row as f64 + 0.5) / n;
+        let lat_rad = (PI * (1.0 - 2.0 * y)).sinh().atan();
+        let lat = lat_rad * 180.0 / PI;
+
+        (lat, lon)
+    }
+
+    /// Returns the DSF tile (1°×1°) that contains this DDS tile.
+    ///
+    /// X-Plane's scenery is organized into 1°×1° DSF tiles. This method
+    /// converts the DDS tile coordinates to the containing DSF tile name.
+    ///
+    /// # Returns
+    ///
+    /// A string in X-Plane's DSF naming format, e.g., "+53+009" for
+    /// a tile at 53°N, 9°E.
+    #[inline]
+    pub fn to_dsf_tile_name(&self) -> String {
+        let (lat, lon) = self.to_lat_lon();
+        let dsf_lat = lat.floor() as i32;
+        let dsf_lon = lon.floor() as i32;
+
+        let lat_sign = if dsf_lat >= 0 { '+' } else { '-' };
+        let lon_sign = if dsf_lon >= 0 { '+' } else { '-' };
+
+        format!(
+            "{}{:02}{}{:03}",
+            lat_sign,
+            dsf_lat.abs(),
+            lon_sign,
+            dsf_lon.abs()
+        )
+    }
 }
 
 /// Iterator over all chunks in a tile.

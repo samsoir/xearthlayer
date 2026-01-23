@@ -360,6 +360,7 @@ mod tests {
             failed_children,
             cancelled_children: vec![],
             duration: std::time::Duration::from_secs(0),
+            output_data: None,
         }
     }
 

@@ -63,6 +63,7 @@
 
 mod aggregator;
 mod inference;
+mod logger;
 mod model;
 mod provider;
 mod state;
@@ -76,3 +77,6 @@ pub use state::{
     AircraftPositionStatus, AircraftState, PositionAccuracy, PositionSource, TelemetryStatus,
 };
 pub use telemetry::{TelemetryError, TelemetryReceiver, TelemetryReceiverConfig};
+
+// Position logger for flight analysis (DEBUG level only)
+pub use logger::{spawn_position_logger, DEFAULT_LOG_INTERVAL};
