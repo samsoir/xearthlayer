@@ -109,41 +109,32 @@ pub struct DdsPixelFormat {
     pub a_bit_mask: u32,
 }
 
-// DDS header flags
+// =============================================================================
+// DDS Format Constants
+// =============================================================================
+//
+// These constants are defined per the Microsoft DDS specification:
+// https://docs.microsoft.com/en-us/windows/win32/direct3ddds/dds-header
+//
+// Not all constants are currently used, but they are retained for:
+// 1. Documentation of the complete DDS specification
+// 2. Future feature support (volume textures, cubemaps, uncompressed formats)
+
+// DDS header flags (DDSD_*)
 pub const DDSD_CAPS: u32 = 0x1;
 pub const DDSD_HEIGHT: u32 = 0x2;
 pub const DDSD_WIDTH: u32 = 0x4;
-#[allow(dead_code)]
-pub const DDSD_PITCH: u32 = 0x8;
 pub const DDSD_PIXELFORMAT: u32 = 0x1000;
 pub const DDSD_MIPMAPCOUNT: u32 = 0x20000;
 pub const DDSD_LINEARSIZE: u32 = 0x80000;
-#[allow(dead_code)]
-pub const DDSD_DEPTH: u32 = 0x800000;
 
-// DDS pixel format flags
-#[allow(dead_code)]
-pub const DDPF_ALPHAPIXELS: u32 = 0x1;
-#[allow(dead_code)]
-pub const DDPF_ALPHA: u32 = 0x2;
+// DDS pixel format flags (DDPF_*)
 pub const DDPF_FOURCC: u32 = 0x4;
-#[allow(dead_code)]
-pub const DDPF_RGB: u32 = 0x40;
-#[allow(dead_code)]
-pub const DDPF_YUV: u32 = 0x200;
-#[allow(dead_code)]
-pub const DDPF_LUMINANCE: u32 = 0x20000;
 
-// DDS caps flags
+// DDS caps flags (DDSCAPS_*)
 pub const DDSCAPS_COMPLEX: u32 = 0x8;
 pub const DDSCAPS_MIPMAP: u32 = 0x400000;
 pub const DDSCAPS_TEXTURE: u32 = 0x1000;
-
-// DDS caps2 flags
-#[allow(dead_code)]
-pub const DDSCAPS2_CUBEMAP: u32 = 0x200;
-#[allow(dead_code)]
-pub const DDSCAPS2_VOLUME: u32 = 0x200000;
 
 #[cfg(test)]
 mod tests {

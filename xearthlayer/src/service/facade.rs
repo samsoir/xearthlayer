@@ -69,32 +69,42 @@ pub struct XEarthLayerService {
     generator: Arc<dyn TileGenerator>,
     /// Logger for diagnostic output
     logger: Arc<dyn Logger>,
+    // -------------------------------------------------------------------------
+    // RAII Fields: Kept alive for ownership semantics, not read after construction.
+    // Dropping these would stop background threads/resources.
+    // -------------------------------------------------------------------------
     /// Network stats logger (keeps logger thread alive)
     #[allow(dead_code)]
     network_stats_logger: Option<NetworkStatsLogger>,
     /// Owned Tokio runtime (when created via `new()`)
     #[allow(dead_code)]
     owned_runtime: Option<Runtime>,
+
     /// Handle to the Tokio runtime
     runtime_handle: Handle,
-    /// Sync provider (retained for future use)
+
+    // -------------------------------------------------------------------------
+    // Construction-time fields: Used during build(), stored for debugging/future use.
+    // -------------------------------------------------------------------------
+    /// Sync provider (legacy, retained for potential future sync operations)
     #[allow(dead_code)]
     provider: Arc<dyn Provider>,
-    /// Async provider for tile generation
+    /// Async provider (used during runtime construction)
     #[allow(dead_code)]
     async_provider: Option<Arc<AsyncProviderType>>,
+    /// Cache directory (used during initial cache scan)
+    #[allow(dead_code)]
+    cache_dir: Option<PathBuf>,
+    /// Executor cache adapter (legacy, superseded by CacheBridges)
+    #[allow(dead_code)]
+    executor_cache_adapter: Option<Arc<ExecutorCacheAdapter>>,
+
     /// Texture encoder for DDS generation
     dds_encoder: Arc<DdsTextureEncoder>,
     /// Shared memory cache for tile-level caching
     memory_cache: Option<Arc<MemoryCache>>,
     /// Shared memory cache adapter (implements executor::MemoryCache trait)
     memory_cache_adapter: Option<Arc<MemoryCacheAdapter>>,
-    /// Executor cache adapter (implements DaemonMemoryCache trait)
-    #[allow(dead_code)]
-    executor_cache_adapter: Option<Arc<ExecutorCacheAdapter>>,
-    /// Cache directory for disk cache
-    #[allow(dead_code)]
-    cache_dir: Option<PathBuf>,
     /// Metrics system for event-based telemetry
     metrics_system: Option<MetricsSystem>,
     /// XEarthLayer runtime (job executor daemon)
