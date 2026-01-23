@@ -1,22 +1,10 @@
-//! Network throughput widget with sparkline.
+//! Network throughput history tracking.
 //!
-//! TODO: Refactor NetworkHistory to use primitives::SparklineHistory instead of
-//! the inline sparkline implementation. This will consolidate sparkline logic
-//! and ensure consistent visualization across all widgets.
+//! Provides `NetworkHistory` for tracking instantaneous throughput over time.
+//! Used by `InputOutputWidget` for sparkline visualization.
 //!
-//! Note: NetworkWidget is deprecated in v0.3.0 - use InputOutputWidget instead.
-//! NetworkHistory is still used by InputOutputWidget.
-
-#![allow(dead_code)] // NetworkWidget deprecated, NetworkHistory methods kept for API
-
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Color, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget},
-};
-use xearthlayer::metrics::TelemetrySnapshot;
+//! TODO: Refactor to use primitives::SparklineHistory instead of the inline
+//! sparkline implementation.
 
 /// Rolling history for sparkline display.
 ///
@@ -27,8 +15,6 @@ pub struct NetworkHistory {
     samples: Vec<f64>,
     /// Maximum samples to keep.
     max_samples: usize,
-    /// Peak instantaneous throughput observed.
-    peak_bps: f64,
     /// Last total bytes downloaded (for delta calculation).
     last_bytes_downloaded: u64,
     /// Current instantaneous throughput.
@@ -40,7 +26,6 @@ impl NetworkHistory {
         Self {
             samples: Vec::with_capacity(max_samples),
             max_samples,
-            peak_bps: 0.0,
             last_bytes_downloaded: 0,
             current_bps: 0.0,
         }
@@ -69,21 +54,11 @@ impl NetworkHistory {
             self.samples.remove(0);
         }
         self.samples.push(instant_bps);
-
-        // Update peak
-        if instant_bps > self.peak_bps {
-            self.peak_bps = instant_bps;
-        }
     }
 
     /// Get the current instantaneous throughput.
     pub fn current(&self) -> f64 {
         self.current_bps
-    }
-
-    /// Get the peak throughput.
-    pub fn peak(&self) -> f64 {
-        self.peak_bps
     }
 
     /// Generate sparkline characters.
@@ -113,83 +88,5 @@ impl NetworkHistory {
         }
 
         result
-    }
-}
-
-/// Widget displaying network throughput.
-pub struct NetworkWidget<'a> {
-    snapshot: &'a TelemetrySnapshot,
-    history: &'a NetworkHistory,
-}
-
-impl<'a> NetworkWidget<'a> {
-    pub fn new(snapshot: &'a TelemetrySnapshot, history: &'a NetworkHistory) -> Self {
-        Self { snapshot, history }
-    }
-
-    fn format_throughput(bps: f64) -> String {
-        if bps >= 1_000_000_000.0 {
-            format!("{:.1} GB/s", bps / 1_000_000_000.0)
-        } else if bps >= 1_000_000.0 {
-            format!("{:.1} MB/s", bps / 1_000_000.0)
-        } else if bps >= 1_000.0 {
-            format!("{:.1} KB/s", bps / 1_000.0)
-        } else {
-            format!("{:.0} B/s", bps)
-        }
-    }
-
-    fn format_bytes(bytes: u64) -> String {
-        if bytes >= 1_000_000_000_000 {
-            format!("{:.2} TB", bytes as f64 / 1_000_000_000_000.0)
-        } else if bytes >= 1_000_000_000 {
-            format!("{:.2} GB", bytes as f64 / 1_000_000_000.0)
-        } else if bytes >= 1_000_000 {
-            format!("{:.1} MB", bytes as f64 / 1_000_000.0)
-        } else if bytes >= 1_000 {
-            format!("{:.1} KB", bytes as f64 / 1_000.0)
-        } else {
-            format!("{} B", bytes)
-        }
-    }
-}
-
-impl Widget for NetworkWidget<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default().borders(Borders::NONE);
-
-        let sparkline = self.history.sparkline(12);
-        // Use instantaneous throughput from history, not average from snapshot
-        let current_bps = self.history.current();
-        let current = Self::format_throughput(current_bps);
-        let peak = Self::format_throughput(self.history.peak());
-        let total = Self::format_bytes(self.snapshot.bytes_downloaded);
-
-        // Color based on activity level
-        let throughput_color = if current_bps > 0.0 {
-            Color::Green
-        } else {
-            Color::DarkGray
-        };
-
-        let line = Line::from(vec![
-            Span::styled("  Activity:  ", Style::default().fg(Color::White)),
-            Span::styled(sparkline, Style::default().fg(throughput_color)),
-            Span::raw("  "),
-            Span::styled(
-                format!("{:>10}", current),
-                Style::default().fg(throughput_color),
-            ),
-            Span::styled(
-                format!(" (peak: {})", peak),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::raw("   "),
-            Span::styled("Downloaded: ", Style::default().fg(Color::White)),
-            Span::styled(total, Style::default().fg(Color::Cyan)),
-        ]);
-
-        let paragraph = Paragraph::new(vec![line]).block(block);
-        paragraph.render(area, buf);
     }
 }

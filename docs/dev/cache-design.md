@@ -332,12 +332,13 @@ struct DiskWriteRequest {
 
 ### Design Decision
 
-**Decision**: Memory cache uses moka's automatic LRU eviction; disk cache uses an async tokio daemon.
+**Decision**: Memory cache uses moka's automatic LRU eviction; disk cache uses a self-contained service with internal GC daemon.
 
 **Rationale**:
 - Memory cache: `moka::future::Cache` provides efficient, lock-free LRU eviction
 - Disk eviction is slow (filesystem I/O) - must not block tile delivery
-- Uses tokio async tasks instead of OS threads for better integration with the job executor daemon
+- **Self-contained GC**: `DiskCacheProvider` owns its GC daemon internally, spawned during `CacheService::start()`
+- This ensures GC runs regardless of application mode (CLI, TUI, etc.)
 - Clean shutdown via `CancellationToken` for graceful termination
 
 ### FUSE Async Operations
@@ -346,9 +347,28 @@ struct DiskWriteRequest {
 - Triggers disk reads via async I/O with concurrency limiting
 - Writes to disk asynchronously (write-through strategy)
 
-### Disk Cache Eviction Daemon
-- Spawned as tokio async task via `runtime_handle.spawn()`
-- Runs eviction check every 60 seconds (configurable via `daemon_interval_secs`)
+### Self-Contained Cache Service Architecture
+
+The cache system uses a self-contained service architecture (implemented in `xearthlayer/src/cache/`):
+
+```
+XEarthLayerApp
+├── CacheService (memory)
+│   └── MemoryCacheProvider (moka-based LRU)
+└── CacheService (disk)
+    └── DiskCacheProvider
+        └── GC Daemon (spawned internally on start())
+```
+
+**Key Components**:
+- `Cache` trait: Generic cache interface with async set/get/delete/gc methods
+- `CacheService`: Lifecycle wrapper with start/shutdown management
+- `DiskCacheProvider`: Implements `Cache` trait, owns its GC daemon internally
+- `MemoryCacheProvider`: Implements `Cache` trait using moka
+
+### Disk Cache GC Daemon
+- Spawned internally by `DiskCacheProvider::start()` - not wired externally
+- Runs eviction check every 60 seconds (configurable via `DEFAULT_GC_INTERVAL_SECS`)
 - Uses `CancellationToken` for clean shutdown signaling
 - Filesystem operations wrapped in `spawn_blocking` to avoid blocking the async runtime
 - LRU eviction based on file modification time (mtime)
@@ -357,44 +377,49 @@ struct DiskWriteRequest {
 ### Implementation
 
 ```rust
-/// Disk cache eviction daemon configuration.
-pub struct DiskCacheConfig {
-    pub cache_dir: PathBuf,
-    pub max_size_bytes: usize,
-    pub daemon_interval_secs: u64,  // Default: 60
-    pub max_age_days: Option<u32>,
+/// Application bootstrap with self-contained cache services.
+impl XEarthLayerApp {
+    pub async fn start(config: AppConfig) -> Result<Self, AppError> {
+        // 1. Start memory cache service
+        let memory_cache_service = CacheService::start(memory_config).await?;
+
+        // 2. Start disk cache service (spawns internal GC daemon!)
+        let disk_cache_service = CacheService::start(disk_config).await?;
+
+        // 3. Create bridge adapters for executor integration
+        let memory_bridge = MemoryCacheBridge::new(memory_cache_service.cache());
+        let disk_bridge = DiskCacheBridge::new(disk_cache_service.cache());
+
+        Ok(Self { memory_cache_service, disk_cache_service, ... })
+    }
 }
 
-/// Run the disk cache eviction daemon.
-pub async fn run_eviction_daemon(
-    config: DiskCacheConfig,
-    cancellation: CancellationToken,
-) {
-    // Initial eviction check on startup
-    if let Some(result) = evict_if_over_limit(&config).await {
-        log_eviction_result(&result);
-    }
+/// DiskCacheProvider owns its GC daemon internally.
+impl DiskCacheProvider {
+    pub async fn start(config: DiskCacheConfig) -> Result<Self, CacheError> {
+        let shutdown = CancellationToken::new();
 
-    // Periodic eviction loop
-    loop {
-        tokio::select! {
-            _ = cancellation.cancelled() => break,
-            _ = tokio::time::sleep(Duration::from_secs(config.daemon_interval_secs)) => {
-                if let Some(result) = evict_if_over_limit(&config).await {
-                    log_eviction_result(&result);
-                }
-            }
-        }
+        // Spawn internal GC daemon immediately
+        let gc_handle = tokio::spawn(Self::run_gc_daemon(
+            config.clone(),
+            shutdown.clone(),
+        ));
+
+        Ok(Self { gc_handle, shutdown, ... })
     }
 }
 ```
 
 ### Lifecycle
 
-1. **Startup**: `run.rs` spawns eviction daemon with `runtime_handle.spawn()`
-2. **Initial Check**: Immediately evicts if over limit on startup
+1. **Startup**: `XEarthLayerApp::start()` creates cache services; `DiskCacheProvider` spawns its own GC daemon
+2. **Initial Check**: GC daemon immediately evicts if over limit on startup
 3. **Running**: Daemon wakes every 60s, checks disk size, evicts if needed
-4. **Shutdown**: `CancellationToken` signals daemon to stop gracefully
+4. **Shutdown**: `XEarthLayerApp::shutdown()` signals `CancellationToken`, daemon stops gracefully
+
+### Benefits of Self-Contained Architecture
+
+The previous architecture wired the GC daemon externally in CLI code (`run.rs`), which had a critical bug: GC never ran in TUI mode because `get_service()` returned `None` before mounting. By having `DiskCacheProvider` own its GC daemon internally, GC **always** runs regardless of application mode.
 
 ## Cache Statistics
 
@@ -651,7 +676,16 @@ rm -rf ~/.cache/xearthlayer/bing/
 - ✅ Clean daemon shutdown via CancellationToken
 - ✅ Eviction to 90% of limit (10% headroom)
 
-### Phase 4: Advanced Features (Partial)
+### Phase 4: Self-Contained Cache Service Architecture ✅
+- ✅ Generic `Cache` trait for cache backend abstraction
+- ✅ `CacheService` lifecycle wrapper with start/shutdown
+- ✅ `DiskCacheProvider` with internal GC daemon (fixes TUI mode GC bug)
+- ✅ `MemoryCacheProvider` wrapping moka
+- ✅ Bridge adapters (`MemoryCacheBridge`, `DiskCacheBridge`) for executor integration
+- ✅ `XEarthLayerApp` bootstrap pattern ensuring proper initialization order
+- ✅ GC runs in all modes (CLI, TUI) - no more external wiring dependency
+
+### Phase 5: Advanced Features (Partial)
 - ❌ Virtual `/stats` file (planned)
 - ✅ Configurable cache sizes via config.ini
 - ❌ Age-based eviction (config exists, not implemented)
@@ -718,10 +752,11 @@ du -sh ~/.cache/xearthlayer/*/* | sort -h
 
 ### Automated Cleanup
 
-The disk cache eviction daemon (`cache/disk_eviction.rs`) runs automatically:
+The disk cache GC daemon runs automatically as part of the self-contained cache service:
 
 **On Startup**:
-- Daemon spawned via `runtime_handle.spawn()` in `run.rs`
+- `XEarthLayerApp::start()` initializes cache services
+- `DiskCacheProvider` spawns its internal GC daemon during `start()`
 - Immediate eviction check before the 60-second loop begins
 - Evicts to 90% of limit if over, leaving headroom for new writes
 - Logs scan results: files collected, collectable size, target size
@@ -735,8 +770,8 @@ The disk cache eviction daemon (`cache/disk_eviction.rs`) runs automatically:
 - Uses minimal CPU when cache is under limit (just stat calls)
 
 **On Shutdown**:
-- `CancellationToken` signals daemon to stop
-- Daemon completes current operation and exits cleanly
+- `XEarthLayerApp` drop or explicit `shutdown()` signals `CancellationToken`
+- GC daemon completes current operation and exits cleanly
 - No orphaned tasks or resources
 
 ## Future Enhancements
