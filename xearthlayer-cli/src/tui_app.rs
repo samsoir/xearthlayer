@@ -100,21 +100,25 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
 
     // Channel for progress updates from initialization
     let (progress_tx, progress_rx) = std::sync::mpsc::channel();
-    let (result_tx, result_rx) = std::sync::mpsc::channel();
 
     // Run initialization in a scoped thread so we can update dashboard
+    // Use a Mutex to store the result for thread-safe access
+    let init_result: std::sync::Mutex<Option<Result<_, xearthlayer::service::ServiceError>>> =
+        std::sync::Mutex::new(None);
+
     std::thread::scope(|s| {
-        // Spawn initialization thread - uses scoped borrow, not move
+        // Spawn initialization thread - borrows from outer scope (scoped threads allow this)
         let progress_tx_clone = progress_tx.clone();
+        let init_result_ref = &init_result;
         s.spawn(|| {
-            // Progress callback sends updates to main thread
+            // Progress callback needs move to own progress_tx_clone
             let progress_callback = move |progress: StartupProgress| {
                 let _ = progress_tx_clone.send(progress);
             };
 
             let result =
                 orchestrator.initialize_services(store, &ortho_packages, Some(progress_callback));
-            let _ = result_tx.send(result);
+            *init_result_ref.lock().unwrap() = Some(result);
         });
 
         // Update dashboard while initialization is in progress
@@ -125,26 +129,25 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
                 update_loading_progress(&mut dashboard, &progress);
             }
 
-            // Check for result (non-blocking)
-            match result_rx.try_recv() {
-                Ok(_) => break,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // Not ready yet - draw dashboard and wait
-                    if let Err(e) = dashboard.draw_loading() {
-                        tracing::warn!(error = %e, "Dashboard draw error during init");
-                    }
-                    std::thread::sleep(tick_rate);
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            // Check if initialization is complete
+            if init_result.lock().unwrap().is_some() {
+                break;
             }
+
+            // Not ready yet - draw dashboard and wait
+            if let Err(e) = dashboard.draw_loading() {
+                tracing::warn!(error = %e, "Dashboard draw error during init");
+            }
+            std::thread::sleep(tick_rate);
         }
     });
 
-    // Check initialization result (receive from channel after scope completes)
-    let init_result = result_rx
-        .recv()
-        .map_err(|_| CliError::Config("Initialization thread failed".to_string()))?;
-    let _startup_result = init_result.map_err(CliError::Serve)?;
+    // Check initialization result
+    let result = init_result
+        .into_inner()
+        .unwrap()
+        .ok_or_else(|| CliError::Config("Initialization failed".to_string()))?;
+    let _startup_result = result.map_err(CliError::Serve)?;
 
     // Wire in runtime health for TUI display
     if let Some(runtime_health) = orchestrator.runtime_health() {
