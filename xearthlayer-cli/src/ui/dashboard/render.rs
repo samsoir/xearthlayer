@@ -36,11 +36,11 @@ use xearthlayer::prefetch::PrefetchStatusSnapshot;
 use xearthlayer::runtime::HealthSnapshot;
 
 use super::render_sections::inner_rect;
-use super::state::{JobRates, PrewarmProgress};
+use super::state::PrewarmProgress;
 use super::utils::format_duration;
 use crate::ui::widgets::{
     AircraftPositionWidget, CacheConfig, CacheWidgetCompact, DiskHistory, InputOutputWidget,
-    NetworkHistory, PipelineHistory, PrefetchSystemWidget, SceneryHistory, ScenerySystemWidget,
+    NetworkHistory, PrefetchSystemWidget, SceneryHistory, ScenerySystemWidget,
 };
 use xearthlayer::aircraft_position::AircraftPositionStatus;
 
@@ -55,7 +55,6 @@ pub fn render_ui(
     frame: &mut Frame,
     snapshot: &TelemetrySnapshot,
     network_history: &NetworkHistory,
-    #[allow(unused_variables)] pipeline_history: &PipelineHistory, // Legacy, kept for compatibility
     scenery_history: &SceneryHistory,
     disk_history: &DiskHistory,
     provider_name: &str,
@@ -65,7 +64,6 @@ pub fn render_ui(
     aircraft_position_status: &AircraftPositionStatus,
     control_plane_snapshot: Option<&HealthSnapshot>,
     max_concurrent_jobs: usize,
-    #[allow(unused_variables)] job_rates: Option<&JobRates>, // Legacy, kept for compatibility
     confirmation_remaining: Option<Duration>,
     prewarm_status: Option<&PrewarmProgress>,
     prewarm_spinner: Option<char>,

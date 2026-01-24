@@ -153,6 +153,45 @@ impl SparklineHistory {
             })
             .collect()
     }
+
+    /// Generate a sparkline string with fixed width.
+    ///
+    /// Takes the last `width` samples from values and renders them.
+    /// If there are fewer samples than width, pads with spaces on the left.
+    /// If values is empty, returns a string of spaces.
+    ///
+    /// # Arguments
+    ///
+    /// * `values` - The sample values to render
+    /// * `width` - The fixed width of the output string
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let sparkline = SparklineHistory::render_sparkline_fixed_width(&[1.0, 2.0, 3.0], 5);
+    /// // Returns "  ▁▄█" (2 spaces + 3 chars)
+    /// ```
+    pub fn render_sparkline_fixed_width(values: &[f64], width: usize) -> String {
+        if values.is_empty() {
+            return " ".repeat(width);
+        }
+
+        // Take the last `width` samples
+        let start = values.len().saturating_sub(width);
+        let visible = &values[start..];
+
+        // Render the visible portion
+        let sparkline = Self::render_sparkline(visible);
+
+        // Pad with spaces if we don't have enough samples
+        let sparkline_len = sparkline.chars().count();
+        if sparkline_len < width {
+            let padding = width - sparkline_len;
+            format!("{}{}", " ".repeat(padding), sparkline)
+        } else {
+            sparkline
+        }
+    }
 }
 
 /// A sparkline chart widget.
@@ -289,5 +328,38 @@ mod tests {
         history.push(2.0);
         history.push(3.0);
         assert_eq!(history.average(), 2.0);
+    }
+
+    #[test]
+    fn test_sparkline_fixed_width_empty() {
+        let result = SparklineHistory::render_sparkline_fixed_width(&[], 5);
+        assert_eq!(result, "     "); // 5 spaces
+    }
+
+    #[test]
+    fn test_sparkline_fixed_width_padding() {
+        // 3 values with width 5 should pad with 2 spaces
+        let result = SparklineHistory::render_sparkline_fixed_width(&[0.0, 0.5, 1.0], 5);
+        assert_eq!(result.chars().count(), 5);
+        assert!(result.starts_with("  ")); // 2 space padding
+    }
+
+    #[test]
+    fn test_sparkline_fixed_width_exact() {
+        // 3 values with width 3 should have no padding
+        let result = SparklineHistory::render_sparkline_fixed_width(&[0.0, 0.5, 1.0], 3);
+        assert_eq!(result.chars().count(), 3);
+        assert!(!result.starts_with(' ')); // No padding
+    }
+
+    #[test]
+    fn test_sparkline_fixed_width_truncation() {
+        // 5 values with width 3 should take last 3
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let result = SparklineHistory::render_sparkline_fixed_width(&values, 3);
+        assert_eq!(result.chars().count(), 3);
+        // Last 3 values: 3.0, 4.0, 5.0 normalized to max 5.0
+        // 3.0/5.0 = 0.6 -> ~4, 4.0/5.0 = 0.8 -> ~6, 5.0/5.0 = 1.0 -> 7
+        assert!(result.ends_with('█')); // 5.0 should be max
     }
 }

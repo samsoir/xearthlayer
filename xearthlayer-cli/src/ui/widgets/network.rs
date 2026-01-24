@@ -2,14 +2,15 @@
 //!
 //! Provides `NetworkHistory` for tracking instantaneous throughput over time.
 //! Used by `InputOutputWidget` for sparkline visualization.
-//!
-//! TODO: Refactor to use primitives::SparklineHistory instead of the inline
-//! sparkline implementation.
+
+use super::primitives::SparklineHistory;
 
 /// Rolling history for sparkline display.
 ///
 /// Tracks instantaneous throughput by computing the delta between
 /// consecutive samples rather than using average rates.
+///
+/// Uses [`SparklineHistory`] for rendering to avoid code duplication.
 pub struct NetworkHistory {
     /// Instantaneous bytes per second samples (most recent last).
     samples: Vec<f64>,
@@ -61,32 +62,11 @@ impl NetworkHistory {
         self.current_bps
     }
 
-    /// Generate sparkline characters.
+    /// Generate sparkline characters with fixed width.
+    ///
+    /// Delegates to [`SparklineHistory::render_sparkline_fixed_width`] for
+    /// consistent sparkline rendering across all widgets.
     pub fn sparkline(&self, width: usize) -> String {
-        const SPARK_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
-        if self.samples.is_empty() {
-            return " ".repeat(width);
-        }
-
-        let max_val = self.samples.iter().cloned().fold(0.0f64, f64::max).max(1.0);
-
-        // Take the last `width` samples
-        let start = self.samples.len().saturating_sub(width);
-        let visible: Vec<f64> = self.samples[start..].to_vec();
-
-        let mut result = String::with_capacity(width);
-        for &val in &visible {
-            let normalized = (val / max_val * 7.0).round() as usize;
-            let idx = normalized.min(7);
-            result.push(SPARK_CHARS[idx]);
-        }
-
-        // Pad with spaces if we don't have enough samples
-        while result.chars().count() < width {
-            result.insert(0, ' ');
-        }
-
-        result
+        SparklineHistory::render_sparkline_fixed_width(&self.samples, width)
     }
 }

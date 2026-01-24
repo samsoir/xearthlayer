@@ -31,11 +31,9 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use xearthlayer::aircraft_position::{AircraftPositionProvider, SharedAircraftPosition};
 use xearthlayer::metrics::TelemetrySnapshot;
 use xearthlayer::prefetch::SharedPrefetchStatus;
-use xearthlayer::runtime::{HealthSnapshot, SharedRuntimeHealth};
+use xearthlayer::runtime::SharedRuntimeHealth;
 
-use crate::ui::widgets::{
-    CacheConfig, DiskHistory, NetworkHistory, PipelineHistory, SceneryHistory,
-};
+use crate::ui::widgets::{CacheConfig, DiskHistory, NetworkHistory, SceneryHistory};
 
 // Re-export public types from state module
 pub use state::{
@@ -51,7 +49,6 @@ pub struct Dashboard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     config: DashboardConfig,
     network_history: NetworkHistory,
-    pipeline_history: PipelineHistory,
     /// History for scenery system sparklines (new v0.3.0 layout).
     scenery_history: SceneryHistory,
     /// History for disk I/O sparklines (new v0.3.0 layout).
@@ -69,8 +66,6 @@ pub struct Dashboard {
     runtime_health: Option<SharedRuntimeHealth>,
     /// Maximum concurrent jobs for the control plane display.
     max_concurrent_jobs: usize,
-    /// Previous control plane snapshot for rate calculation.
-    prev_control_plane_snapshot: Option<HealthSnapshot>,
     /// Quit confirmation state - Some(timestamp) when awaiting confirmation.
     quit_confirmation: Option<Instant>,
     /// Background prewarm status (None = no prewarm, Some = prewarm in progress or complete).
@@ -103,7 +98,6 @@ impl Dashboard {
             terminal,
             config,
             network_history: NetworkHistory::new(60), // 60 samples for sparkline
-            pipeline_history: PipelineHistory::new(12), // 12 samples for pipeline sparkline
             scenery_history: SceneryHistory::new(12), // 12 samples for scenery sparklines
             disk_history: DiskHistory::new(12),       // 12 samples for disk I/O sparkline
             shutdown,
@@ -114,7 +108,6 @@ impl Dashboard {
             prefetch_status: None,
             runtime_health: None,
             max_concurrent_jobs: 0,
-            prev_control_plane_snapshot: None,
             quit_confirmation: None,
             prewarm_status: None,
             aircraft_position: None,
@@ -211,9 +204,6 @@ impl Dashboard {
         self.network_history
             .update(snapshot.bytes_downloaded, sample_interval);
 
-        // Update pipeline history for sparklines
-        self.pipeline_history.update(snapshot, sample_interval);
-
         // Update scenery history for new layout sparklines
         self.scenery_history.update(snapshot, sample_interval);
 
@@ -241,37 +231,7 @@ impl Dashboard {
         let control_plane_snapshot = self.runtime_health.as_ref().map(|h| h.snapshot());
         let max_concurrent_jobs = self.max_concurrent_jobs;
 
-        // Calculate job rates from control plane snapshots
-        let job_rates = if let Some(ref current) = control_plane_snapshot {
-            if let Some(ref prev) = self.prev_control_plane_snapshot {
-                if sample_interval > 0.0 {
-                    let submitted_delta = current
-                        .total_jobs_submitted
-                        .saturating_sub(prev.total_jobs_submitted);
-                    let completed_delta = current
-                        .total_jobs_completed
-                        .saturating_sub(prev.total_jobs_completed);
-                    let submitted_rate = submitted_delta as f64 / sample_interval;
-                    let completed_rate = completed_delta as f64 / sample_interval;
-                    Some(JobRates {
-                        submitted_per_sec: submitted_rate,
-                        completed_per_sec: completed_rate,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Store current snapshot for next rate calculation
-        self.prev_control_plane_snapshot = control_plane_snapshot.clone();
-
         // Clone histories for use in closure
-        let pipeline_history = self.pipeline_history.clone();
         let scenery_history = self.scenery_history.clone();
         let disk_history = self.disk_history.clone();
         let provider_name = self.config.provider_name.clone();
@@ -300,7 +260,6 @@ impl Dashboard {
                 frame,
                 snapshot,
                 &self.network_history,
-                &pipeline_history,
                 &scenery_history,
                 &disk_history,
                 &provider_name,
@@ -310,7 +269,6 @@ impl Dashboard {
                 &aircraft_position_status,
                 control_plane_snapshot.as_ref(),
                 max_concurrent_jobs,
-                job_rates.as_ref(),
                 confirmation_remaining,
                 prewarm_status.as_ref(),
                 prewarm_spinner,

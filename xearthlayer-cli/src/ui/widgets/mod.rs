@@ -16,7 +16,6 @@ mod cache;
 mod control_plane;
 mod input_output;
 pub mod network;
-mod pipeline;
 mod prefetch_system;
 pub mod primitives;
 mod scenery_system;
@@ -34,4 +33,3 @@ pub use scenery_system::{SceneryHistory, ScenerySystemWidget};
 // Legacy widgets (deprecated in v0.3.0, still used in render_sections.rs)
 #[deprecated(since = "0.3.0", note = "Use ScenerySystemWidget instead")]
 pub use control_plane::ControlPlaneWidget;
-pub use pipeline::PipelineHistory;
