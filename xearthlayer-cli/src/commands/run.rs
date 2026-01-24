@@ -18,6 +18,7 @@ use xearthlayer::app::{AppConfig, XEarthLayerApp};
 use xearthlayer::config::{
     analyze_config, config_file_path, format_size, ConfigFile, DownloadConfig, TextureConfig,
 };
+use xearthlayer::executor::MemoryCache;
 use xearthlayer::log::TracingLogger;
 use xearthlayer::manager::{
     create_consolidated_overlay, InstalledPackage, LocalPackageStore, MountManager, ServiceBuilder,
@@ -1019,6 +1020,7 @@ fn run_with_dashboard(
                     ctx.fuse_analyzer.clone(),
                     &prewarm_cancellation,
                     &runtime_handle,
+                    &ctx.aircraft_position,
                 );
             } else {
                 prefetcher_started = true; // Prevent re-entry
@@ -1107,6 +1109,7 @@ fn run_with_dashboard(
                     ctx.fuse_analyzer.clone(),
                     &ctx.prefetch_cancellation,
                     &runtime_handle,
+                    &ctx.aircraft_position,
                 );
             } else {
                 prefetcher_started = true; // Prevent re-entry
@@ -1138,6 +1141,7 @@ fn run_with_dashboard(
 }
 
 /// Start the prefetcher after scenery index is built.
+#[allow(clippy::too_many_arguments)]
 fn start_prefetcher(
     mount_manager: &mut MountManager,
     config: &ConfigFile,
@@ -1146,14 +1150,10 @@ fn start_prefetcher(
     fuse_analyzer: Option<Arc<FuseRequestAnalyzer>>,
     cancellation: &CancellationToken,
     runtime_handle: &Handle,
+    aircraft_position: &SharedAircraftPosition,
 ) -> bool {
     let Some(service) = mount_manager.get_service() else {
         tracing::warn!("No services available for prefetch");
-        return false;
-    };
-
-    let Some(memory_cache) = service.memory_cache_adapter() else {
-        tracing::warn!("Memory cache not available, prefetch disabled");
         return false;
     };
 
@@ -1161,24 +1161,114 @@ fn start_prefetcher(
         .dds_client()
         .expect("DDS client should be available");
 
-    // Create channels for telemetry data
+    // Try legacy adapter first, then new cache bridge architecture
+    if let Some(memory_cache) = service.memory_cache_adapter() {
+        return start_prefetcher_with_cache(
+            mount_manager,
+            config,
+            prefetch_status,
+            scenery_index,
+            fuse_analyzer,
+            cancellation,
+            runtime_handle,
+            dds_client,
+            memory_cache,
+            aircraft_position,
+        );
+    }
+
+    if let Some(memory_cache) = service.memory_cache_bridge() {
+        return start_prefetcher_with_cache(
+            mount_manager,
+            config,
+            prefetch_status,
+            scenery_index,
+            fuse_analyzer,
+            cancellation,
+            runtime_handle,
+            dds_client,
+            memory_cache,
+            aircraft_position,
+        );
+    }
+
+    tracing::warn!("Memory cache not available, prefetch disabled");
+    false
+}
+
+/// Internal helper to start prefetcher with a specific memory cache type.
+///
+/// This is generic over `M: MemoryCache` to support both:
+/// - `MemoryCacheAdapter` (legacy cache system)
+/// - `MemoryCacheBridge` (new cache service architecture)
+///
+/// NOTE: This function subscribes to the APT module's telemetry broadcast
+/// instead of starting its own UDP listener. This avoids port conflicts
+/// since APT already binds to the telemetry port.
+#[allow(clippy::too_many_arguments)]
+fn start_prefetcher_with_cache<M: MemoryCache + 'static>(
+    mount_manager: &mut MountManager,
+    config: &ConfigFile,
+    prefetch_status: &Arc<SharedPrefetchStatus>,
+    scenery_index: &Arc<SceneryIndex>,
+    fuse_analyzer: Option<Arc<FuseRequestAnalyzer>>,
+    cancellation: &CancellationToken,
+    runtime_handle: &Handle,
+    dds_client: Arc<dyn xearthlayer::executor::DdsClient>,
+    memory_cache: Arc<M>,
+    aircraft_position: &SharedAircraftPosition,
+) -> bool {
+    // Create channel for prefetch telemetry data
     let (state_tx, state_rx) = mpsc::channel(32);
 
-    // Start the telemetry listener
-    let listener = TelemetryListener::new(config.prefetch.udp_port);
-    let listener_cancel = cancellation.clone();
+    // Bridge APT telemetry to prefetch channel
+    // Subscribe to APT's broadcast instead of starting a duplicate UDP listener
+    use xearthlayer::aircraft_position::AircraftPositionBroadcaster;
+    use xearthlayer::prefetch::AircraftState as PrefetchAircraftState;
+
+    let mut apt_rx = aircraft_position.subscribe();
+    let bridge_cancel = cancellation.clone();
     runtime_handle.spawn(async move {
-        tokio::select! {
-            result = listener.run(state_tx) => {
-                if let Err(e) = result {
-                    tracing::warn!("Telemetry listener error: {}", e);
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = bridge_cancel.cancelled() => {
+                    tracing::debug!("APT-to-prefetch telemetry bridge cancelled");
+                    break;
                 }
-            }
-            _ = listener_cancel.cancelled() => {
-                tracing::debug!("Telemetry listener cancelled");
+
+                result = apt_rx.recv() => {
+                    match result {
+                        Ok(apt_state) => {
+                            // Convert APT AircraftState to prefetch AircraftState
+                            let prefetch_state = PrefetchAircraftState::new(
+                                apt_state.latitude,
+                                apt_state.longitude,
+                                apt_state.heading,
+                                apt_state.ground_speed,
+                                apt_state.altitude,
+                            );
+                            if state_tx.send(prefetch_state).await.is_err() {
+                                tracing::debug!("Prefetch channel closed");
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            tracing::debug!("APT broadcast channel closed");
+                            break;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::trace!("APT-to-prefetch bridge lagged by {} messages", n);
+                            // Continue - we'll get the next message
+                        }
+                    }
+                }
             }
         }
     });
+
+    tracing::debug!("APT-to-prefetch telemetry bridge started");
 
     // Build prefetcher
     let mut builder = PrefetcherBuilder::new()

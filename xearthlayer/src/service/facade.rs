@@ -116,6 +116,9 @@ pub struct XEarthLayerService {
     /// Load monitor for circuit breaker integration.
     /// When set, records FUSE-originated requests for aggregate load tracking.
     load_monitor: Option<Arc<dyn FuseLoadMonitor>>,
+    /// Memory cache bridge from new cache service architecture.
+    /// Used by prefetch system when cache bridges are enabled.
+    memory_cache_bridge: Option<Arc<MemoryCacheBridge>>,
 }
 
 impl XEarthLayerService {
@@ -414,6 +417,7 @@ impl XEarthLayerService {
             dds_client,
             tile_request_callback: None,
             load_monitor: None,
+            memory_cache_bridge: None,
         })
     }
 
@@ -503,6 +507,8 @@ impl XEarthLayerService {
             dds_client,
             tile_request_callback: None,
             load_monitor: None,
+            // Store bridge for prefetch system access
+            memory_cache_bridge: Some(memory_bridge),
         })
     }
 
@@ -622,6 +628,17 @@ impl XEarthLayerService {
     /// Returns `None` if caching is disabled.
     pub fn memory_cache_adapter(&self) -> Option<Arc<MemoryCacheAdapter>> {
         self.memory_cache_adapter.clone()
+    }
+
+    /// Get the memory cache bridge from the new cache service architecture.
+    ///
+    /// Returns the `MemoryCacheBridge` that implements `executor::MemoryCache` trait.
+    /// This is available when the service is created with cache bridges
+    /// (via `with_cache_bridges()` constructor).
+    ///
+    /// Returns `None` if using legacy cache system.
+    pub fn memory_cache_bridge(&self) -> Option<Arc<MemoryCacheBridge>> {
+        self.memory_cache_bridge.clone()
     }
 
     /// Get the DDS client for requesting tile generation.
