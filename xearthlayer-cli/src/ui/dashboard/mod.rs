@@ -138,6 +138,7 @@ impl Dashboard {
     }
 
     /// Get the current state.
+    #[allow(dead_code)]
     pub fn state(&self) -> &DashboardState {
         &self.state
     }
@@ -175,6 +176,7 @@ impl Dashboard {
     }
 
     /// Check if in Loading state.
+    #[allow(dead_code)]
     pub fn is_loading(&self) -> bool {
         matches!(self.state, DashboardState::Loading(_))
     }

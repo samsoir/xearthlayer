@@ -14,23 +14,17 @@
 //! 2. Creates the `ServiceOrchestrator`
 //! 3. Delegates to `run_tui()` or `run_headless()`
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use xearthlayer::aircraft_position::SharedAircraftPosition;
 use xearthlayer::config::ConfigFile;
-use xearthlayer::manager::{create_consolidated_overlay, InstalledPackage, LocalPackageStore};
-use xearthlayer::ortho_union::{IndexBuildPhase, IndexBuildProgress};
-use xearthlayer::prefetch::{
-    load_cache, save_cache, CacheLoadResult, IndexingProgress,
-    PrewarmProgress as LibPrewarmProgress, SceneryIndex, SceneryIndexConfig, SharedPrefetchStatus,
-};
-use xearthlayer::service::{PrewarmOrchestrator, ServiceOrchestrator};
+use xearthlayer::manager::{InstalledPackage, LocalPackageStore};
+use xearthlayer::prefetch::{PrewarmProgress as LibPrewarmProgress, SharedPrefetchStatus};
+use xearthlayer::service::{PrewarmOrchestrator, ServiceOrchestrator, StartupProgress};
 use xearthlayer::xplane::XPlaneEnvironment;
 
 use crate::error::CliError;
@@ -55,30 +49,22 @@ pub struct TuiAppConfig<'a> {
     pub aircraft_position: SharedAircraftPosition,
     /// Ortho packages to mount.
     pub ortho_packages: Vec<&'a InstalledPackage>,
-    /// Whether prefetch is enabled.
-    pub prefetch_enabled: bool,
     /// Airport ICAO code for prewarm (if specified).
     pub airport_icao: Option<String>,
     /// X-Plane environment for apt.dat lookup and resource paths.
     pub xplane_env: Option<XPlaneEnvironment>,
-    /// Custom Scenery path for overlay symlinks.
-    pub custom_scenery_path: &'a Path,
 }
 
 /// Run the TUI application with dashboard.
 ///
 /// This function:
-/// 1. Starts the TUI immediately in Loading state for OrthoUnionIndex building
-/// 2. Mounts consolidated ortho with progress updates
-/// 3. Creates overlay symlinks
-/// 4. Builds SceneryIndex for prefetching
-/// 5. When indexing completes, optionally prewarm cache around airport
-/// 6. Starts the prefetcher and transitions to Running
+/// 1. Starts the TUI immediately in Loading state
+/// 2. Initializes all services via ServiceOrchestrator with progress updates
+/// 3. When complete, optionally prewarm cache around airport
+/// 4. Enters main event loop for Running state
 ///
 /// Returns the cancellation token for cleanup coordination.
 pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
-    use std::sync::Mutex;
-
     let TuiAppConfig {
         orchestrator,
         store,
@@ -87,10 +73,8 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         prefetch_status,
         aircraft_position,
         ortho_packages,
-        prefetch_enabled,
         airport_icao,
         xplane_env,
-        custom_scenery_path,
     } = config;
 
     let dashboard_config = DashboardConfig {
@@ -99,7 +83,7 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         provider_name: cfg.provider.provider_type.clone(),
     };
 
-    // Create initial loading progress for OrthoUnionIndex building
+    // Create initial loading progress
     let loading_progress = LoadingProgress::new(ortho_packages.len());
 
     // Start dashboard in Loading state
@@ -114,214 +98,107 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         .draw_loading()
         .map_err(|e| CliError::Config(format!("Dashboard draw error: {}", e)))?;
 
-    // Phase 1: Mount consolidated ortho with progress callback
-    let progress_state = Arc::new(Mutex::new(LoadingProgress::new(ortho_packages.len())));
-    let progress_state_clone = Arc::clone(&progress_state);
-
-    // Progress callback - plain closure, orchestrator wraps it in Arc internally
-    let progress_callback = move |progress: IndexBuildProgress| {
-        let mut state = progress_state_clone.lock().unwrap();
-        state.phase = match progress.phase {
-            IndexBuildPhase::Discovering => LoadingPhase::Discovering,
-            IndexBuildPhase::CheckingCache => LoadingPhase::CheckingCache,
-            IndexBuildPhase::Scanning => LoadingPhase::Scanning,
-            IndexBuildPhase::Merging => LoadingPhase::Merging,
-            IndexBuildPhase::SavingCache => LoadingPhase::SavingCache,
-            IndexBuildPhase::Complete => LoadingPhase::Complete,
-        };
-        state.current_package = progress.current_source.clone().unwrap_or_default();
-        state.packages_scanned = progress.sources_complete;
-        state.total_packages = progress.sources_total;
-        state.tiles_indexed = progress.files_scanned;
-        state.using_cache = progress.using_cache;
-    };
-
-    // Mount with progress - run in a separate thread so we can update dashboard
+    // Channel for progress updates from initialization
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
-    let progress_state_for_draw = Arc::clone(&progress_state);
 
-    let mount_result = std::thread::scope(|s| {
-        // Spawn mount thread within scope
-        let _mount_handle = s.spawn(|| {
+    // Run initialization in a scoped thread so we can update dashboard
+    std::thread::scope(|s| {
+        // Spawn initialization thread - uses scoped borrow, not move
+        let progress_tx_clone = progress_tx.clone();
+        s.spawn(|| {
+            // Progress callback sends updates to main thread
+            let progress_callback = move |progress: StartupProgress| {
+                let _ = progress_tx_clone.send(progress);
+            };
+
             let result =
-                orchestrator.mount_consolidated_ortho_with_progress(store, Some(progress_callback));
+                orchestrator.initialize_services(store, &ortho_packages, Some(progress_callback));
             let _ = result_tx.send(result);
         });
 
-        // Update dashboard while mount is in progress
+        // Update dashboard while initialization is in progress
         let tick_rate = Duration::from_millis(50);
         loop {
+            // Process progress updates
+            while let Ok(progress) = progress_rx.try_recv() {
+                update_loading_progress(&mut dashboard, &progress);
+            }
+
             // Check for result (non-blocking)
             match result_rx.try_recv() {
-                Ok(result) => break result,
+                Ok(_) => break,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // Not ready yet - update dashboard and wait
-                    let current_progress = progress_state_for_draw.lock().unwrap().clone();
-                    dashboard.update_loading_progress(current_progress);
+                    // Not ready yet - draw dashboard and wait
                     if let Err(e) = dashboard.draw_loading() {
-                        tracing::warn!(error = %e, "Dashboard draw error during mount");
+                        tracing::warn!(error = %e, "Dashboard draw error during init");
                     }
                     std::thread::sleep(tick_rate);
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // Thread finished without sending result - unexpected
-                    tracing::error!("Mount thread disconnected without sending result");
-                    break xearthlayer::service::MountResult {
-                        success: false,
-                        error: Some("Mount thread disconnected unexpectedly".to_string()),
-                        source_count: 0,
-                        file_count: 0,
-                        patch_names: vec![],
-                        package_regions: vec![],
-                        mountpoint: std::path::PathBuf::new(),
-                    };
-                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             }
         }
     });
 
-    if !mount_result.success {
-        let error_msg = mount_result.error.as_deref().unwrap_or("Unknown error");
-        return Err(CliError::Serve(
-            xearthlayer::service::ServiceError::IoError(std::io::Error::other(format!(
-                "Failed to mount consolidated ortho: {}",
-                error_msg
-            ))),
-        ));
-    }
+    // Check initialization result (receive from channel after scope completes)
+    let init_result = result_rx
+        .recv()
+        .map_err(|_| CliError::Config("Initialization thread failed".to_string()))?;
+    let _startup_result = init_result.map_err(CliError::Serve)?;
 
-    // Phase 2: Create overlay symlinks
-    let overlay_result = create_consolidated_overlay(store, custom_scenery_path);
-    if let Some(ref error) = overlay_result.error {
-        tracing::warn!(error = %error, "Failed to create consolidated overlay");
-    }
-
-    // Wire in runtime health for TUI display (job queue depth, etc.)
+    // Wire in runtime health for TUI display
     if let Some(runtime_health) = orchestrator.runtime_health() {
         let max_concurrent_jobs = orchestrator.max_concurrent_jobs();
         dashboard = dashboard.with_runtime_health(runtime_health, max_concurrent_jobs);
     }
 
-    // Start APT TelemetryReceiver using orchestrator
-    if let Err(e) = orchestrator.start_apt_telemetry() {
-        tracing::warn!(error = %e, "Failed to start APT telemetry receiver");
-    }
+    // Transition to Running state
+    dashboard.transition_to_running();
 
-    // Phase 3: Build SceneryIndex for prefetching
-    // Collect packages for indexing
-    let packages_for_index: Vec<_> = ortho_packages
-        .iter()
-        .map(|p| (p.region().to_string(), p.path.clone()))
-        .collect();
+    // Get runtime handle for prewarm
+    let runtime_handle = tokio::runtime::Handle::current();
 
-    // Try to load scenery index from cache first
-    let (scenery_index, cache_loaded) = match load_cache(&packages_for_index) {
-        CacheLoadResult::Loaded {
-            tiles,
-            total_tiles,
-            sea_tiles,
-        } => {
-            tracing::info!(
-                tiles = total_tiles,
-                sea = sea_tiles,
-                "Loaded scenery index from cache"
-            );
-
-            // Update loading progress to show cache was used
-            let mut loading = LoadingProgress::new(packages_for_index.len());
-            loading.tiles_indexed = total_tiles;
-            loading.packages_scanned = packages_for_index.len();
-            loading.current_package = "Cache loaded".to_string();
-            dashboard.update_loading_progress(loading);
-
-            // Create index from cached tiles
-            let index = Arc::new(SceneryIndex::from_tiles(
-                tiles,
-                SceneryIndexConfig::default(),
-            ));
-            (index, true)
-        }
-        CacheLoadResult::Stale { reason } => {
-            tracing::info!(reason = %reason, "Scenery cache is stale, rebuilding");
-            (Arc::new(SceneryIndex::with_defaults()), false)
-        }
-        CacheLoadResult::NotFound => {
-            tracing::info!("No scenery cache found, building index");
-            (Arc::new(SceneryIndex::with_defaults()), false)
-        }
-        CacheLoadResult::Invalid { error } => {
-            tracing::warn!(error = %error, "Scenery cache invalid, rebuilding");
-            (Arc::new(SceneryIndex::with_defaults()), false)
-        }
-    };
-
-    // If cache wasn't loaded, build index from scratch
-    let (progress_tx, mut progress_rx) = mpsc::channel::<IndexingProgress>(32);
-    if !cache_loaded {
-        let index_for_build = Arc::clone(&scenery_index);
-        let packages_for_cache = packages_for_index.clone();
-
-        // Spawn indexing task
-        std::thread::spawn(move || {
-            let mut total_indexed = 0usize;
-            let total_packages = packages_for_cache.len();
-
-            for (idx, (region, path)) in packages_for_cache.iter().enumerate() {
-                let _ = progress_tx.blocking_send(IndexingProgress::PackageStarted {
-                    name: region.clone(),
-                    index: idx,
-                    total: total_packages,
-                });
-
-                match index_for_build.build_from_package(path) {
-                    Ok(count) => {
-                        total_indexed += count;
-                        let _ = progress_tx.blocking_send(IndexingProgress::PackageCompleted {
-                            name: region.clone(),
-                            tiles: count,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            region = %region,
-                            error = %e,
-                            "Failed to index scenery package"
-                        );
-                    }
-                }
-            }
-
-            // Send completion
-            let _ = progress_tx.blocking_send(IndexingProgress::Complete {
-                total: total_indexed,
-                land: index_for_build.land_tile_count(),
-                sea: index_for_build.sea_tile_count(),
-            });
-
-            // Save cache after indexing
-            if let Err(e) = save_cache(&index_for_build, &packages_for_cache) {
-                tracing::warn!(error = %e, "Failed to save scenery cache");
-            }
-        });
-    } else {
-        // Send immediate completion for cache-loaded case
-        let total = scenery_index.tile_count();
-        let land = scenery_index.land_tile_count();
-        let sea = scenery_index.sea_tile_count();
-        let _ = progress_tx.blocking_send(IndexingProgress::Complete { total, land, sea });
-    }
-
-    // Track state transitions
-    let mut indexing_complete = cache_loaded;
+    // Track prewarm state
+    let mut prewarm_handle: Option<xearthlayer::service::PrewarmHandle> = None;
     let mut prewarm_active = false;
     let mut prewarm_complete = false;
-    let mut prefetcher_started = false;
-    let mut prewarm_handle: Option<xearthlayer::service::PrewarmHandle> = None;
+
+    // Start prewarm if airport specified
+    if let Some(ref icao) = airport_icao {
+        let prewarm_config = orchestrator.config().prewarm.clone();
+        match PrewarmOrchestrator::start(
+            orchestrator,
+            icao,
+            xplane_env.as_ref(),
+            &aircraft_position,
+            &prewarm_config,
+            &runtime_handle,
+        ) {
+            Ok(result) => {
+                tracing::info!(
+                    icao = %icao,
+                    airport = %result.airport_name,
+                    tiles = result.estimated_tiles,
+                    "Starting prewarm in background"
+                );
+                prewarm_handle = Some(result.handle);
+                prewarm_active = true;
+
+                let prewarm_progress = PrewarmProgress::new(icao, result.estimated_tiles);
+                dashboard.update_prewarm_progress(prewarm_progress);
+            }
+            Err(e) => {
+                tracing::warn!("Prewarm skipped: {}", e);
+                prewarm_complete = true;
+            }
+        }
+    } else {
+        prewarm_complete = true;
+    }
 
     // Main event loop
     let tick_rate = Duration::from_millis(100);
     let mut last_tick = Instant::now();
-    let runtime_handle = tokio::runtime::Handle::current();
 
     loop {
         // Poll for events
@@ -340,88 +217,6 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
             }
             Ok(None) => {}
             Err(e) => return Err(CliError::Config(format!("Dashboard error: {}", e))),
-        }
-
-        // Check for index progress updates (non-blocking)
-        while let Ok(progress) = progress_rx.try_recv() {
-            match progress {
-                IndexingProgress::PackageStarted { name, index, total } => {
-                    let mut loading = LoadingProgress::new(total);
-                    loading.packages_scanned = index;
-                    loading.scanning(&name);
-                    dashboard.update_loading_progress(loading);
-                }
-                IndexingProgress::PackageCompleted { tiles, .. } => {
-                    if let DashboardState::Loading(ref progress) = dashboard.state().clone() {
-                        let mut updated = progress.clone();
-                        updated.package_completed(tiles);
-                        dashboard.update_loading_progress(updated);
-                    }
-                }
-                IndexingProgress::TileProgress { tiles_indexed } => {
-                    if let DashboardState::Loading(ref progress) = dashboard.state().clone() {
-                        let mut updated = progress.clone();
-                        updated.tiles_indexed = tiles_indexed;
-                        dashboard.update_loading_progress(updated);
-                    }
-                }
-                IndexingProgress::Complete { total, land, sea } => {
-                    tracing::info!(total, land, sea, "Scenery index complete");
-                    indexing_complete = true;
-                }
-            }
-        }
-
-        // After indexing, transition to Running state and start prewarm in background
-        if indexing_complete && !prewarm_active && !prewarm_complete && !prefetcher_started {
-            dashboard.transition_to_running();
-
-            // Start prewarm in background if airport specified
-            if let Some(ref icao) = airport_icao {
-                let prewarm_config = orchestrator.config().prewarm.clone();
-                match PrewarmOrchestrator::start(
-                    orchestrator,
-                    icao,
-                    xplane_env.as_ref(),
-                    &aircraft_position,
-                    &prewarm_config,
-                    &runtime_handle,
-                ) {
-                    Ok(result) => {
-                        tracing::info!(
-                            icao = %icao,
-                            airport = %result.airport_name,
-                            tiles = result.estimated_tiles,
-                            "Starting prewarm in background"
-                        );
-                        prewarm_handle = Some(result.handle);
-                        prewarm_active = true;
-
-                        let prewarm_progress = PrewarmProgress::new(icao, result.estimated_tiles);
-                        dashboard.update_prewarm_progress(prewarm_progress);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Prewarm skipped: {}", e);
-                        prewarm_complete = true;
-                    }
-                }
-            } else {
-                prewarm_complete = true;
-            }
-
-            // Start prefetcher immediately (doesn't wait for prewarm)
-            if prefetch_enabled {
-                if scenery_index.tile_count() > 0 {
-                    orchestrator.set_scenery_index(Arc::clone(&scenery_index));
-                }
-                if let Err(e) = orchestrator.start_prefetch() {
-                    tracing::warn!(error = %e, "Failed to start prefetch system");
-                } else {
-                    prefetcher_started = true;
-                }
-            } else {
-                prefetcher_started = true;
-            }
         }
 
         // Handle prewarm progress updates
@@ -483,35 +278,12 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
             }
         }
 
-        // Legacy prefetcher start block - fallback path
-        if indexing_complete && prewarm_complete && !prefetcher_started {
-            if prefetch_enabled {
-                if scenery_index.tile_count() > 0 {
-                    orchestrator.set_scenery_index(Arc::clone(&scenery_index));
-                }
-                if let Err(e) = orchestrator.start_prefetch() {
-                    tracing::warn!(error = %e, "Failed to start prefetch system");
-                } else {
-                    prefetcher_started = true;
-                }
-            } else {
-                prefetcher_started = true;
-            }
-            dashboard.transition_to_running();
-        }
-
         // Update dashboard at tick rate
         if last_tick.elapsed() >= tick_rate {
-            if dashboard.is_loading() {
-                dashboard
-                    .draw_loading()
-                    .map_err(|e| CliError::Config(format!("Dashboard draw error: {}", e)))?;
-            } else {
-                let snapshot = orchestrator.telemetry_snapshot();
-                dashboard
-                    .draw(&snapshot)
-                    .map_err(|e| CliError::Config(format!("Dashboard draw error: {}", e)))?;
-            }
+            let snapshot = orchestrator.telemetry_snapshot();
+            dashboard
+                .draw(&snapshot)
+                .map_err(|e| CliError::Config(format!("Dashboard draw error: {}", e)))?;
             last_tick = Instant::now();
         }
 
@@ -520,6 +292,76 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
     }
 
     Ok(orchestrator.cancellation())
+}
+
+/// Update dashboard loading progress based on StartupProgress.
+fn update_loading_progress(dashboard: &mut Dashboard, progress: &StartupProgress) {
+    match progress {
+        StartupProgress::Mounting {
+            phase,
+            current_source,
+            sources_complete,
+            sources_total,
+            files_scanned,
+            using_cache,
+        } => {
+            let mut loading = LoadingProgress::new(*sources_total);
+            loading.phase = match phase {
+                xearthlayer::ortho_union::IndexBuildPhase::Discovering => LoadingPhase::Discovering,
+                xearthlayer::ortho_union::IndexBuildPhase::CheckingCache => {
+                    LoadingPhase::CheckingCache
+                }
+                xearthlayer::ortho_union::IndexBuildPhase::Scanning => LoadingPhase::Scanning,
+                xearthlayer::ortho_union::IndexBuildPhase::Merging => LoadingPhase::Merging,
+                xearthlayer::ortho_union::IndexBuildPhase::SavingCache => LoadingPhase::SavingCache,
+                xearthlayer::ortho_union::IndexBuildPhase::Complete => LoadingPhase::Complete,
+            };
+            loading.current_package = current_source.clone().unwrap_or_default();
+            loading.packages_scanned = *sources_complete;
+            loading.tiles_indexed = *files_scanned;
+            loading.using_cache = *using_cache;
+            dashboard.update_loading_progress(loading);
+        }
+        StartupProgress::CreatingOverlay => {
+            // Keep current progress, just log
+            tracing::debug!("Creating overlay symlinks");
+        }
+        StartupProgress::StartingTelemetry => {
+            tracing::debug!("Starting APT telemetry");
+        }
+        StartupProgress::BuildingSceneryIndex {
+            package_name,
+            package_index,
+            total_packages,
+            tiles_indexed,
+            ..
+        } => {
+            let mut loading = LoadingProgress::new(*total_packages);
+            loading.phase = LoadingPhase::Scanning;
+            loading.current_package = format!("Indexing: {}", package_name);
+            loading.packages_scanned = *package_index;
+            loading.tiles_indexed = *tiles_indexed;
+            dashboard.update_loading_progress(loading);
+        }
+        StartupProgress::SceneryIndexComplete {
+            total_tiles,
+            land_tiles,
+            sea_tiles,
+        } => {
+            tracing::info!(
+                total = total_tiles,
+                land = land_tiles,
+                sea = sea_tiles,
+                "Scenery index complete"
+            );
+        }
+        StartupProgress::StartingPrefetch => {
+            tracing::debug!("Starting prefetch system");
+        }
+        StartupProgress::Complete => {
+            tracing::info!("All services initialized");
+        }
+    }
 }
 
 /// Run in headless mode (non-TTY environments).

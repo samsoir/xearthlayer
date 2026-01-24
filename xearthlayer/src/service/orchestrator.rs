@@ -50,11 +50,14 @@ use crate::aircraft_position::{
 use crate::app::XEarthLayerApp;
 use crate::executor::{DdsClient, MemoryCache};
 use crate::log::TracingLogger;
-use crate::manager::{LocalPackageStore, MountManager, ServiceBuilder};
+use crate::manager::{
+    create_consolidated_overlay, InstalledPackage, LocalPackageStore, MountManager, ServiceBuilder,
+};
 use crate::metrics::TelemetrySnapshot;
 use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::{
-    FuseRequestAnalyzer, PrefetchStrategy, PrefetcherBuilder, SceneryIndex, SharedPrefetchStatus,
+    load_cache, save_cache, CacheLoadResult, FuseRequestAnalyzer, PrefetchStrategy,
+    PrefetcherBuilder, SceneryIndex, SceneryIndexConfig, SharedPrefetchStatus,
 };
 use crate::runtime::SharedRuntimeHealth;
 
@@ -85,6 +88,70 @@ pub struct MountResult {
     pub package_regions: Vec<String>,
     /// Mountpoint path.
     pub mountpoint: std::path::PathBuf,
+}
+
+/// Progress updates during service initialization.
+#[derive(Debug, Clone)]
+pub enum StartupProgress {
+    /// Mounting FUSE filesystem.
+    Mounting {
+        /// Current phase of index building.
+        phase: crate::ortho_union::IndexBuildPhase,
+        /// Source being processed.
+        current_source: Option<String>,
+        /// Number of sources completed.
+        sources_complete: usize,
+        /// Total sources to process.
+        sources_total: usize,
+        /// Files scanned so far.
+        files_scanned: usize,
+        /// Whether using cached index.
+        using_cache: bool,
+    },
+    /// Creating overlay symlinks.
+    CreatingOverlay,
+    /// Starting APT telemetry receiver.
+    StartingTelemetry,
+    /// Building scenery index.
+    BuildingSceneryIndex {
+        /// Package being indexed.
+        package_name: String,
+        /// Package index (0-based).
+        package_index: usize,
+        /// Total packages to index.
+        total_packages: usize,
+        /// Tiles indexed so far.
+        tiles_indexed: usize,
+        /// Whether loaded from cache.
+        from_cache: bool,
+    },
+    /// Scenery index complete.
+    SceneryIndexComplete {
+        /// Total tiles indexed.
+        total_tiles: usize,
+        /// Land tiles.
+        land_tiles: usize,
+        /// Sea tiles.
+        sea_tiles: usize,
+    },
+    /// Starting prefetch system.
+    StartingPrefetch,
+    /// All services initialized.
+    Complete,
+}
+
+/// Result of service initialization.
+pub struct StartupResult {
+    /// Mount result details.
+    pub mount: MountResult,
+    /// Overlay creation succeeded.
+    pub overlay_success: bool,
+    /// Overlay error message if failed.
+    pub overlay_error: Option<String>,
+    /// Scenery index tile count.
+    pub scenery_tiles: usize,
+    /// Whether scenery index was loaded from cache.
+    pub scenery_from_cache: bool,
 }
 
 /// Coordinates startup and operation of all XEarthLayer backend services.
@@ -227,6 +294,223 @@ impl ServiceOrchestrator {
             cancellation,
             config,
         })
+    }
+
+    /// Initialize all services with a single call.
+    ///
+    /// This is the recommended way to start XEarthLayer. It performs the complete
+    /// startup sequence in order:
+    ///
+    /// 1. Mount consolidated ortho (FUSE filesystem)
+    /// 2. Create overlay symlinks
+    /// 3. Start APT telemetry receiver
+    /// 4. Build scenery index (with cache support)
+    /// 5. Start prefetch system
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - Local package store for discovering packages
+    /// * `ortho_packages` - List of ortho packages to mount
+    /// * `progress_callback` - Optional callback for progress updates (for TUI)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let result = orchestrator.initialize_services(
+    ///     &store,
+    ///     &ortho_packages,
+    ///     Some(|progress| println!("{:?}", progress)),
+    /// )?;
+    /// ```
+    pub fn initialize_services<F>(
+        &mut self,
+        store: &LocalPackageStore,
+        ortho_packages: &[&InstalledPackage],
+        progress_callback: Option<F>,
+    ) -> Result<StartupResult, ServiceError>
+    where
+        F: Fn(StartupProgress) + Send + Sync + 'static,
+    {
+        // Wrap callback in Arc for sharing across phases
+        let callback: Option<Arc<dyn Fn(StartupProgress) + Send + Sync>> =
+            progress_callback.map(|f| Arc::new(f) as Arc<dyn Fn(StartupProgress) + Send + Sync>);
+
+        // Phase 1: Mount consolidated ortho with progress
+        let mount_result = if let Some(ref cb) = callback {
+            // Convert our StartupProgress to the ortho_union IndexBuildProgress
+            let cb_clone = Arc::clone(cb);
+            let mount_progress = move |p: crate::ortho_union::IndexBuildProgress| {
+                cb_clone(StartupProgress::Mounting {
+                    phase: p.phase,
+                    current_source: p.current_source,
+                    sources_complete: p.sources_complete,
+                    sources_total: p.sources_total,
+                    files_scanned: p.files_scanned,
+                    using_cache: p.using_cache,
+                });
+            };
+            self.mount_consolidated_ortho_with_progress(store, Some(mount_progress))
+        } else {
+            self.mount_consolidated_ortho(store)
+        };
+
+        if !mount_result.success {
+            return Err(ServiceError::IoError(std::io::Error::other(
+                mount_result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Mount failed".to_string()),
+            )));
+        }
+
+        // Phase 2: Create overlay symlinks
+        if let Some(ref cb) = callback {
+            cb(StartupProgress::CreatingOverlay);
+        }
+        let overlay_result = create_consolidated_overlay(store, &self.config.custom_scenery_path);
+        let overlay_success = overlay_result.success;
+        let overlay_error = overlay_result.error.clone();
+        if let Some(ref error) = overlay_result.error {
+            tracing::warn!(error = %error, "Failed to create consolidated overlay");
+        }
+
+        // Phase 3: Start APT telemetry
+        if let Some(ref cb) = callback {
+            cb(StartupProgress::StartingTelemetry);
+        }
+        if let Err(e) = self.start_apt_telemetry() {
+            tracing::warn!(error = %e, "Failed to start APT telemetry");
+        }
+
+        // Phase 4: Build scenery index (with cache support)
+        let packages_for_index: Vec<(String, std::path::PathBuf)> = ortho_packages
+            .iter()
+            .map(|p| (p.region().to_string(), p.path.clone()))
+            .collect();
+
+        let (scenery_tiles, scenery_from_cache) =
+            self.build_scenery_index(&packages_for_index, callback.as_ref())?;
+
+        // Phase 5: Start prefetch
+        if self.config.prefetch_enabled() {
+            if let Some(ref cb) = callback {
+                cb(StartupProgress::StartingPrefetch);
+            }
+            if let Err(e) = self.start_prefetch() {
+                tracing::warn!(error = %e, "Failed to start prefetch system");
+            }
+        }
+
+        // Signal completion
+        if let Some(ref cb) = callback {
+            cb(StartupProgress::Complete);
+        }
+
+        Ok(StartupResult {
+            mount: mount_result,
+            overlay_success,
+            overlay_error,
+            scenery_tiles,
+            scenery_from_cache,
+        })
+    }
+
+    /// Build the scenery index from packages, with cache support.
+    fn build_scenery_index(
+        &mut self,
+        packages: &[(String, std::path::PathBuf)],
+        callback: Option<&Arc<dyn Fn(StartupProgress) + Send + Sync>>,
+    ) -> Result<(usize, bool), ServiceError> {
+        // Try to load from cache first
+        match load_cache(packages) {
+            CacheLoadResult::Loaded {
+                tiles,
+                total_tiles,
+                sea_tiles,
+            } => {
+                tracing::info!(
+                    tiles = total_tiles,
+                    sea = sea_tiles,
+                    "Loaded scenery index from cache"
+                );
+
+                if let Some(cb) = callback {
+                    cb(StartupProgress::SceneryIndexComplete {
+                        total_tiles,
+                        land_tiles: total_tiles - sea_tiles,
+                        sea_tiles,
+                    });
+                }
+
+                let index = Arc::new(SceneryIndex::from_tiles(
+                    tiles,
+                    SceneryIndexConfig::default(),
+                ));
+                self.scenery_index = index;
+                return Ok((total_tiles, true));
+            }
+            CacheLoadResult::Stale { reason } => {
+                tracing::info!(reason = %reason, "Scenery cache is stale, rebuilding");
+            }
+            CacheLoadResult::NotFound => {
+                tracing::info!("No scenery cache found, building index");
+            }
+            CacheLoadResult::Invalid { error } => {
+                tracing::warn!(error = %error, "Scenery cache invalid, rebuilding");
+            }
+        }
+
+        // Build from scratch
+        let index = Arc::new(SceneryIndex::with_defaults());
+        let mut total_tiles = 0usize;
+
+        for (idx, (region, path)) in packages.iter().enumerate() {
+            if let Some(cb) = callback {
+                cb(StartupProgress::BuildingSceneryIndex {
+                    package_name: region.clone(),
+                    package_index: idx,
+                    total_packages: packages.len(),
+                    tiles_indexed: total_tiles,
+                    from_cache: false,
+                });
+            }
+
+            match index.build_from_package(path) {
+                Ok(count) => {
+                    total_tiles += count;
+                    tracing::debug!(
+                        region = %region,
+                        tiles = count,
+                        "Indexed scenery package"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        region = %region,
+                        error = %e,
+                        "Failed to index scenery package"
+                    );
+                }
+            }
+        }
+
+        // Save cache for next launch
+        if total_tiles > 0 {
+            if let Err(e) = save_cache(&index, packages) {
+                tracing::warn!(error = %e, "Failed to save scenery cache");
+            }
+        }
+
+        if let Some(cb) = callback {
+            cb(StartupProgress::SceneryIndexComplete {
+                total_tiles,
+                land_tiles: index.land_tile_count(),
+                sea_tiles: index.sea_tile_count(),
+            });
+        }
+
+        self.scenery_index = index;
+        Ok((total_tiles, false))
     }
 
     /// Mount consolidated ortho scenery.

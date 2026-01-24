@@ -7,11 +7,12 @@ use std::sync::Arc;
 use xearthlayer::config::{
     analyze_config, config_file_path, format_size, DownloadConfig, TextureConfig,
 };
-use xearthlayer::manager::{create_consolidated_overlay, LocalPackageStore};
+use xearthlayer::manager::LocalPackageStore;
 use xearthlayer::package::PackageType;
 use xearthlayer::panic as panic_handler;
-use xearthlayer::prefetch::SceneryIndex;
-use xearthlayer::service::{OrchestratorConfig, ServiceConfig, ServiceOrchestrator};
+use xearthlayer::service::{
+    OrchestratorConfig, ServiceConfig, ServiceOrchestrator, StartupProgress,
+};
 use xearthlayer::xplane::XPlaneEnvironment;
 
 use super::common::{resolve_dds_format, resolve_provider, DdsCompression, ProviderType};
@@ -216,136 +217,58 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     let shared_prefetch_status = orchestrator.prefetch_status();
     let aircraft_position = orchestrator.aircraft_position();
 
-    // For TUI mode, mounting happens inside run_with_dashboard() with progress callback
-    // For non-TUI mode, mount here before continuing
+    // For non-TUI mode, initialize all services with text progress output
     if !use_tui {
-        println!("Mounting consolidated ortho scenery...");
+        println!("Initializing services...");
 
-        // Use orchestrator to mount consolidated ortho
-        let consolidated_result = orchestrator.mount_consolidated_ortho(&store);
-
-        if !consolidated_result.success {
-            let error_msg = consolidated_result
-                .error
-                .as_deref()
-                .unwrap_or("Unknown error");
-            return Err(CliError::Serve(
-                xearthlayer::service::ServiceError::IoError(std::io::Error::other(format!(
-                    "Failed to mount consolidated ortho: {}",
-                    error_msg
-                ))),
-            ));
-        }
-
-        // Report consolidated mount results
-        println!(
-            "  ✓ zzXEL_ortho → {}",
-            consolidated_result.mountpoint.display()
-        );
-        println!(
-            "    Sources: {} ({} patches, {} packages)",
-            consolidated_result.source_count,
-            consolidated_result.patch_names.len(),
-            consolidated_result.package_regions.len()
-        );
-        println!("    Files: {}", consolidated_result.file_count);
-
-        // List patches if present
-        if !consolidated_result.patch_names.is_empty() {
-            println!("    Patches:");
-            for name in &consolidated_result.patch_names {
-                println!("      • {}", name);
-            }
-        }
-
-        // List packages
-        if !consolidated_result.package_regions.is_empty() {
-            println!("    Packages:");
-            for region in &consolidated_result.package_regions {
-                println!("      • {}", region.to_uppercase());
-            }
-        }
-        println!();
-
-        // Create consolidated overlay symlinks
-        let overlay_result = create_consolidated_overlay(&store, &custom_scenery_path);
-        if overlay_result.success && overlay_result.package_count > 0 {
-            println!(
-                "  ✓ yzXEL_overlay → {} ({} DSF files from {} packages)",
-                overlay_result.path.display(),
-                overlay_result.file_count,
-                overlay_result.package_count
-            );
-            println!();
-        } else if let Some(ref error) = overlay_result.error {
-            tracing::warn!(error = %error, "Failed to create consolidated overlay");
-            println!("Warning: Failed to create consolidated overlay: {}", error);
-            println!();
-        }
-
-        println!(
-            "Ready! Consolidated ortho mount active ({} sources)",
-            consolidated_result.source_count
-        );
-        println!();
-    }
-
-    // Non-TUI path: Start APT telemetry and prefetch using orchestrator
-    if !use_tui && prefetch_enabled {
-        // Start APT telemetry receiver
-        if let Err(e) = orchestrator.start_apt_telemetry() {
-            tracing::warn!(error = %e, "Failed to start APT telemetry");
-        }
-
-        // Build scenery index for scenery-aware prefetching
-        {
-            let index = Arc::new(SceneryIndex::with_defaults());
-            let mut total_tiles = 0usize;
-            for pkg in &ortho_packages {
-                match index.build_from_package(&pkg.path) {
-                    Ok(count) => {
-                        total_tiles += count;
-                        tracing::debug!(
-                            region = %pkg.region(),
-                            tiles = count,
-                            "Indexed scenery package"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            region = %pkg.region(),
-                            error = %e,
-                            "Failed to index scenery package"
-                        );
-                    }
+        // Progress callback that prints to stdout
+        let progress_callback = |progress: StartupProgress| match progress {
+            StartupProgress::Mounting { current_source, .. } => {
+                if let Some(source) = current_source {
+                    println!("  Scanning: {}", source);
                 }
             }
-            if total_tiles > 0 {
+            StartupProgress::CreatingOverlay => {
+                println!("  Creating overlay symlinks...");
+            }
+            StartupProgress::StartingTelemetry => {
+                println!("  Starting APT telemetry receiver...");
+            }
+            StartupProgress::BuildingSceneryIndex { package_name, .. } => {
+                println!("  Indexing: {}", package_name);
+            }
+            StartupProgress::SceneryIndexComplete {
+                total_tiles,
+                land_tiles,
+                sea_tiles,
+            } => {
                 println!(
-                    "Scenery index: {} tiles ({} land, {} sea)",
-                    total_tiles,
-                    index.land_tile_count(),
-                    index.sea_tile_count()
-                );
-                orchestrator.set_scenery_index(index);
-            } else {
-                tracing::warn!(
-                    "No scenery tiles indexed, falling back to coordinate-based prefetch"
+                    "  Scenery index: {} tiles ({} land, {} sea)",
+                    total_tiles, land_tiles, sea_tiles
                 );
             }
-        }
+            StartupProgress::StartingPrefetch => {
+                println!("  Starting prefetch system...");
+            }
+            StartupProgress::Complete => {
+                println!("  ✓ All services initialized");
+            }
+        };
 
-        // Start prefetch system using orchestrator
-        if let Err(e) = orchestrator.start_prefetch() {
-            tracing::warn!(error = %e, "Failed to start prefetch system");
-        } else {
-            println!(
-                "Prefetch system started (UDP port {})",
-                config.prefetch.udp_port
-            );
-        }
-    }
-    if !use_tui {
+        // Initialize all services in one call
+        let result = orchestrator
+            .initialize_services(&store, &ortho_packages, Some(progress_callback))
+            .map_err(CliError::Serve)?;
+
+        // Report mount results
+        println!();
+        println!("  ✓ zzXEL_ortho → {}", result.mount.mountpoint.display());
+        println!(
+            "    Sources: {} ({} patches, {} packages)",
+            result.mount.source_count,
+            result.mount.patch_names.len(),
+            result.mount.package_regions.len()
+        );
         println!();
     }
 
@@ -370,7 +293,6 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
             prefetch_status: Arc::clone(&shared_prefetch_status),
             aircraft_position: aircraft_position.clone(),
             ortho_packages: ortho_packages.clone(),
-            prefetch_enabled,
             airport_icao: args.airport.clone(),
             // Derive X-Plane environment from Custom Scenery path
             xplane_env: config
@@ -379,7 +301,6 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
                 .as_ref()
                 .or(config.xplane.scenery_dir.as_ref())
                 .and_then(|p| XPlaneEnvironment::from_custom_scenery_path(p).ok()),
-            custom_scenery_path: &custom_scenery_path,
         };
         run_tui(tui_config)?
     } else {

@@ -114,11 +114,13 @@ impl LoadingProgress {
     }
 
     /// Update with a new package being scanned.
+    #[allow(dead_code)]
     pub fn scanning(&mut self, package_name: &str) {
         self.current_package = package_name.to_string();
     }
 
     /// Mark a package as completed.
+    #[allow(dead_code)]
     pub fn package_completed(&mut self, tiles_added: usize) {
         self.packages_scanned += 1;
         self.tiles_indexed += tiles_added;
