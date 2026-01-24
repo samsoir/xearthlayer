@@ -143,11 +143,13 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
     });
 
     // Check initialization result
+    tracing::info!("Checking initialization result");
     let result = init_result
         .into_inner()
         .unwrap()
         .ok_or_else(|| CliError::Config("Initialization failed".to_string()))?;
     let _startup_result = result.map_err(CliError::Serve)?;
+    tracing::info!("Initialization completed successfully");
 
     // Wire in runtime health for TUI display
     if let Some(runtime_health) = orchestrator.runtime_health() {
@@ -156,10 +158,16 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
     }
 
     // Transition to Running state
+    tracing::info!("Transitioning to Running state");
     dashboard.transition_to_running();
 
-    // Get runtime handle for prewarm
-    let runtime_handle = tokio::runtime::Handle::current();
+    // Debug: Check shutdown flag
+    tracing::info!(shutdown = %shutdown.load(Ordering::SeqCst), "Shutdown flag status before event loop");
+
+    // Get runtime handle for prewarm (from the orchestrator's service, not Handle::current())
+    let runtime_handle = orchestrator
+        .runtime_handle()
+        .expect("Runtime handle should be available after initialization");
 
     // Track prewarm state
     let mut prewarm_handle: Option<xearthlayer::service::PrewarmHandle> = None;
@@ -202,11 +210,29 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
     // Main event loop
     let tick_rate = Duration::from_millis(100);
     let mut last_tick = Instant::now();
+    tracing::info!("Entering main event loop");
+
+    // Drain any stale terminal events before entering the loop
+    // (prevents buffered input from causing immediate exit)
+    while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
+        let _ = crossterm::event::read();
+        tracing::debug!("Drained stale terminal event");
+    }
+
+    let mut loop_iteration = 0u32;
 
     loop {
+        loop_iteration += 1;
+        if loop_iteration <= 3 {
+            tracing::info!(iteration = loop_iteration, "Event loop iteration");
+        }
+
         // Poll for events
         match dashboard.poll_event() {
-            Ok(Some(DashboardEvent::Quit)) => break,
+            Ok(Some(DashboardEvent::Quit)) => {
+                tracing::info!("Received Quit event - exiting loop");
+                break;
+            }
             Ok(Some(DashboardEvent::Cancel)) => {
                 // Cancel prewarm if active
                 if prewarm_active && !prewarm_complete {
@@ -284,9 +310,20 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         // Update dashboard at tick rate
         if last_tick.elapsed() >= tick_rate {
             let snapshot = orchestrator.telemetry_snapshot();
-            dashboard
-                .draw(&snapshot)
-                .map_err(|e| CliError::Config(format!("Dashboard draw error: {}", e)))?;
+            if loop_iteration <= 3 {
+                tracing::info!(iteration = loop_iteration, "About to draw dashboard");
+            }
+            match dashboard.draw(&snapshot) {
+                Ok(()) => {
+                    if loop_iteration <= 3 {
+                        tracing::info!(iteration = loop_iteration, "Dashboard drawn successfully");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Dashboard draw error");
+                    return Err(CliError::Config(format!("Dashboard draw error: {}", e)));
+                }
+            }
             last_tick = Instant::now();
         }
 

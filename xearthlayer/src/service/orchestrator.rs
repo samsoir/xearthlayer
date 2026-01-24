@@ -868,6 +868,15 @@ impl ServiceOrchestrator {
         &self.config
     }
 
+    /// Get the Tokio runtime handle from the underlying service.
+    ///
+    /// Returns None if no service is mounted yet.
+    pub fn runtime_handle(&self) -> Option<Handle> {
+        self.mount_manager
+            .get_service()
+            .map(|s| s.runtime_handle().clone())
+    }
+
     /// Get the scenery index.
     pub fn scenery_index(&self) -> &Arc<SceneryIndex> {
         &self.scenery_index

@@ -289,7 +289,9 @@ impl Dashboard {
     /// - Timeout: auto-cancels after 5 seconds
     pub fn poll_event(&mut self) -> io::Result<Option<DashboardEvent>> {
         // Check shutdown flag first (e.g., Ctrl+C signal)
-        if self.shutdown.load(Ordering::SeqCst) {
+        let shutdown_flag = self.shutdown.load(Ordering::SeqCst);
+        if shutdown_flag {
+            tracing::info!("poll_event: shutdown flag is TRUE, returning Quit");
             return Ok(Some(DashboardEvent::Quit));
         }
 
