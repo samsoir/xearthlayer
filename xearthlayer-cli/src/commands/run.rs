@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use xearthlayer::airport::validate_airport_icao;
 use xearthlayer::config::{
     analyze_config, config_file_path, format_size, DownloadConfig, TextureConfig,
 };
@@ -97,6 +98,11 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
              Check your configuration or run 'xearthlayer init'",
             custom_scenery_path.display()
         )));
+    }
+
+    // Validate airport code early (before heavy initialization)
+    if let Some(ref icao) = args.airport {
+        validate_airport_icao(&custom_scenery_path, icao).map_err(|e| CliError::Config(e.to_string()))?;
     }
 
     // Discover installed packages from install_location
