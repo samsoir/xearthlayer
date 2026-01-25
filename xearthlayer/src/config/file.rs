@@ -365,7 +365,7 @@ impl Default for ConfigFile {
                 health_check_interval_secs: DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
                 semaphore_timeout_secs: DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
             },
-            prewarm: PrewarmSettings { grid_size: 8 },
+            prewarm: PrewarmSettings { grid_size: 4 },
             patches: PatchesSettings {
                 enabled: true,
                 directory: Some(config_dir.join("patches")),

@@ -84,7 +84,7 @@ pub fn generate_dsf_grid(lat: f64, lon: f64, grid_size: u32) -> Vec<DsfTileCoord
     let mut tiles = Vec::with_capacity((grid_size * grid_size) as usize);
 
     // Generate grid centered on center tile
-    // For grid_size=8: offsets from -4 to +3 (8 tiles)
+    // For grid_size=4: offsets from -2 to +1 (4 tiles per axis)
     for lat_offset in -half..=(half - 1) {
         for lon_offset in -half..=(half - 1) {
             tiles.push(center.offset(lat_offset, lon_offset));
