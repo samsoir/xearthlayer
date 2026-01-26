@@ -8,31 +8,39 @@
 //! ```ignore
 //! use xearthlayer::service::PrewarmOrchestrator;
 //!
-//! let handle = PrewarmOrchestrator::start(
+//! let result = PrewarmOrchestrator::start(
 //!     orchestrator,
 //!     "KSFO",
 //!     xplane_env,
+//!     aircraft_position,
+//!     config,
+//!     runtime_handle,
 //! )?;
 //!
-//! // Receive progress updates
-//! while let Some(progress) = handle.try_recv_progress() {
-//!     println!("Progress: {:?}", progress);
+//! // Query status in UI loop
+//! let status = result.handle.status();
+//! if status.is_complete {
+//!     println!("Done: {}/{}", status.completed, status.total);
 //! }
 //!
 //! // Cancel if needed
-//! handle.cancel();
+//! result.handle.cancel();
 //! ```
 
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
+
+use std::sync::Arc;
 
 use crate::aircraft_position::SharedAircraftPosition;
 use crate::airport::AirportIndex;
-use crate::prefetch::{PrewarmConfig as PrefetchPrewarmConfig, PrewarmPrefetcher, PrewarmProgress};
+use crate::executor::{DdsClient, MemoryCache};
+use crate::prefetch::{
+    generate_dsf_grid, start_prewarm, DsfGridBounds, FileTerrainScanner, PrewarmHandle,
+    TerrainScanner,
+};
 use crate::xplane::XPlaneEnvironment;
 
-use super::orchestrator_config::PrewarmConfig;
+use super::orchestrator_config::PrewarmConfig as OrchestratorPrewarmConfig;
 use super::ServiceOrchestrator;
 
 /// Error returned when prewarm fails to start.
@@ -63,62 +71,18 @@ pub struct PrewarmStartResult {
     pub handle: PrewarmHandle,
     /// Name of the airport being prewarmed.
     pub airport_name: String,
-    /// Estimated number of tiles to prewarm.
-    pub estimated_tiles: usize,
-}
-
-/// Handle to a running prewarm task.
-pub struct PrewarmHandle {
-    /// Progress receiver for UI updates.
-    progress_rx: mpsc::Receiver<PrewarmProgress>,
-    /// Cancellation token to stop the prewarm.
-    cancellation: CancellationToken,
-}
-
-impl PrewarmHandle {
-    /// Create a new prewarm handle.
-    fn new(progress_rx: mpsc::Receiver<PrewarmProgress>, cancellation: CancellationToken) -> Self {
-        Self {
-            progress_rx,
-            cancellation,
-        }
-    }
-
-    /// Try to receive progress (non-blocking).
-    pub fn try_recv_progress(&mut self) -> Result<PrewarmProgress, mpsc::error::TryRecvError> {
-        self.progress_rx.try_recv()
-    }
-
-    /// Get mutable access to the progress receiver.
-    pub fn progress_receiver(&mut self) -> &mut mpsc::Receiver<PrewarmProgress> {
-        &mut self.progress_rx
-    }
-
-    /// Cancel the prewarm task.
-    pub fn cancel(&self) {
-        self.cancellation.cancel();
-    }
-
-    /// Check if the prewarm has been cancelled.
-    pub fn is_cancelled(&self) -> bool {
-        self.cancellation.is_cancelled()
-    }
-
-    /// Get the cancellation token.
-    pub fn cancellation(&self) -> CancellationToken {
-        self.cancellation.clone()
-    }
+    /// Number of tiles to prewarm (actual count after scanning).
+    pub tile_count: usize,
 }
 
 /// Orchestrates background cache pre-warming around airports.
 ///
-/// This struct provides a clean API for starting prewarm operations, which
-/// was previously scattered in the CLI layer. It handles:
+/// This struct provides a clean API for starting prewarm operations:
 ///
 /// 1. Airport lookup from X-Plane's apt.dat database
 /// 2. APT position seeding with airport coordinates
-/// 3. OrthoUnionIndex and DDS client/cache wiring
-/// 4. Spawning the prewarm task with progress channel
+/// 3. DSF grid generation and terrain scanning
+/// 4. Starting the prewarm context with authoritative job tracking
 pub struct PrewarmOrchestrator;
 
 impl PrewarmOrchestrator {
@@ -139,15 +103,15 @@ impl PrewarmOrchestrator {
     /// # Returns
     ///
     /// Returns a `PrewarmStartResult` containing:
-    /// - `handle` - Handle to manage and receive progress from the prewarm task
+    /// - `handle` - Handle to query status and cancel the prewarm
     /// - `airport_name` - Name of the airport being prewarmed
-    /// - `estimated_tiles` - Rough estimate of tiles to be prewarmed
+    /// - `tile_count` - Actual number of tiles found to prewarm
     pub fn start(
         orchestrator: &mut ServiceOrchestrator,
         icao: &str,
         xplane_env: Option<&XPlaneEnvironment>,
         aircraft_position: &SharedAircraftPosition,
-        config: &PrewarmConfig,
+        config: &OrchestratorPrewarmConfig,
         runtime_handle: &Handle,
     ) -> Result<PrewarmStartResult, PrewarmStartError> {
         // Get X-Plane environment for apt.dat lookup
@@ -188,61 +152,83 @@ impl PrewarmOrchestrator {
             );
         }
 
-        // Log airport coordinates and grid info for debugging
+        // Generate DSF grid and scan for tiles
+        let dsf_tiles = generate_dsf_grid(airport.latitude, airport.longitude, config.grid_size);
+        let bounds = DsfGridBounds::from_tiles(&dsf_tiles);
+
         tracing::debug!(
             airport_lat = airport.latitude,
             airport_lon = airport.longitude,
             airport_name = %airport.name,
             grid_size = config.grid_size,
+            dsf_tiles = dsf_tiles.len(),
+            bounds = ?bounds,
             "Starting tile-based prewarm"
         );
 
-        // Get service for DDS handler and memory cache
+        // Scan terrain files to find DDS tiles
+        let scanner = FileTerrainScanner::new(Arc::clone(&ortho_index));
+        let tiles = scanner.scan(&bounds);
+
+        tracing::info!(
+            icao = %icao,
+            airport = %airport.name,
+            tiles = tiles.len(),
+            "Found tiles for prewarm"
+        );
+
+        if tiles.is_empty() {
+            return Err(PrewarmStartError::new(format!(
+                "No tiles found in prewarm area for {}",
+                icao
+            )));
+        }
+
+        // Get service for DDS client and memory cache
         let service = orchestrator
             .service()
             .ok_or_else(|| PrewarmStartError::new("No services available for prewarm"))?;
 
-        let memory_cache = service
-            .memory_cache_adapter()
-            .ok_or_else(|| PrewarmStartError::new("Memory cache not available for prewarm"))?;
-
         let dds_client = service
             .dds_client()
-            .expect("DDS client should be available");
+            .ok_or_else(|| PrewarmStartError::new("DDS client not available for prewarm"))?;
 
-        // Create prefetch layer prewarm config
-        let prewarm_config = PrefetchPrewarmConfig {
-            grid_size: config.grid_size,
-            batch_size: config.batch_size,
-        };
-
-        // Estimate tile count for UI progress (actual count determined at runtime)
-        // Rough estimate: grid_size² DSF tiles × ~50 DDS tiles per DSF tile on average
-        let estimated_tiles = (config.grid_size * config.grid_size * 50) as usize;
-
-        // Create the prewarm prefetcher
-        let prewarm = PrewarmPrefetcher::new(ortho_index, dds_client, memory_cache, prewarm_config);
-
-        // Create progress channel and cancellation token
-        let (progress_tx, progress_rx) = mpsc::channel(32);
-        let cancellation = CancellationToken::new();
-        let cancel_token = cancellation.clone();
-        let airport_lat = airport.latitude;
-        let airport_lon = airport.longitude;
+        let tile_count = tiles.len();
         let airport_name = airport.name.clone();
 
-        // Spawn the prewarm task
-        runtime_handle.spawn(async move {
-            prewarm
-                .run(airport_lat, airport_lon, progress_tx, cancel_token)
-                .await;
-        });
+        // Start prewarm with appropriate cache type
+        let handle = if let Some(memory_cache) = service.memory_cache_adapter() {
+            Self::start_prewarm_with_cache(icao, tiles, dds_client, memory_cache, runtime_handle)
+        } else if let Some(memory_cache) = service.memory_cache_bridge() {
+            Self::start_prewarm_with_cache(icao, tiles, dds_client, memory_cache, runtime_handle)
+        } else {
+            return Err(PrewarmStartError::new(
+                "Memory cache not available for prewarm",
+            ));
+        };
 
         Ok(PrewarmStartResult {
-            handle: PrewarmHandle::new(progress_rx, cancellation),
+            handle,
             airport_name,
-            estimated_tiles,
+            tile_count,
         })
+    }
+
+    /// Helper to start prewarm with a generic memory cache type.
+    fn start_prewarm_with_cache<M: MemoryCache + Send + Sync + 'static>(
+        icao: &str,
+        tiles: Vec<crate::coord::TileCoord>,
+        dds_client: Arc<dyn DdsClient>,
+        memory_cache: Arc<M>,
+        runtime_handle: &Handle,
+    ) -> PrewarmHandle {
+        start_prewarm(
+            icao.to_string(),
+            tiles,
+            dds_client,
+            memory_cache,
+            runtime_handle,
+        )
     }
 }
 
@@ -254,16 +240,5 @@ mod tests {
     fn test_prewarm_start_error_display() {
         let error = PrewarmStartError::new("test error");
         assert!(error.to_string().contains("test error"));
-    }
-
-    #[test]
-    fn test_prewarm_handle_cancellation() {
-        let (_, rx) = mpsc::channel(1);
-        let cancellation = CancellationToken::new();
-        let handle = PrewarmHandle::new(rx, cancellation);
-
-        assert!(!handle.is_cancelled());
-        handle.cancel();
-        assert!(handle.is_cancelled());
     }
 }

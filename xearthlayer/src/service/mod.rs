@@ -43,5 +43,6 @@ pub use orchestrator::{
     MountResult, PrefetchHandle, ServiceOrchestrator, StartupProgress, StartupResult,
 };
 pub use orchestrator_config::{OrchestratorConfig, PrefetchConfig, PrewarmConfig};
-pub use prewarm::{PrewarmHandle, PrewarmOrchestrator, PrewarmStartError, PrewarmStartResult};
+pub use prewarm::{PrewarmOrchestrator, PrewarmStartError, PrewarmStartResult};
+// PrewarmHandle and PrewarmStatus are exported from prefetch module
 pub use runtime_builder::RuntimeBuilder;

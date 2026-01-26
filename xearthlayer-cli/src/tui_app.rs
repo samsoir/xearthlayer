@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use xearthlayer::aircraft_position::SharedAircraftPosition;
 use xearthlayer::config::ConfigFile;
 use xearthlayer::manager::{InstalledPackage, LocalPackageStore};
-use xearthlayer::prefetch::{PrewarmProgress as LibPrewarmProgress, SharedPrefetchStatus};
+use xearthlayer::prefetch::{PrewarmHandle, SharedPrefetchStatus};
 use xearthlayer::service::{PrewarmOrchestrator, ServiceOrchestrator, StartupProgress};
 use xearthlayer::xplane::XPlaneEnvironment;
 
@@ -169,10 +169,8 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         .runtime_handle()
         .expect("Runtime handle should be available after initialization");
 
-    // Track prewarm state
-    let mut prewarm_handle: Option<xearthlayer::service::PrewarmHandle> = None;
-    let mut prewarm_active = false;
-    let mut prewarm_complete = false;
+    // Track prewarm handle (None when not active or complete)
+    let mut prewarm_handle: Option<PrewarmHandle> = None;
 
     // Start prewarm if airport specified
     if let Some(ref icao) = airport_icao {
@@ -189,22 +187,19 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
                 tracing::info!(
                     icao = %icao,
                     airport = %result.airport_name,
-                    tiles = result.estimated_tiles,
+                    tiles = result.tile_count,
                     "Starting prewarm in background"
                 );
                 prewarm_handle = Some(result.handle);
-                prewarm_active = true;
 
-                let prewarm_progress = PrewarmProgress::new(icao, result.estimated_tiles);
+                // Initialize dashboard prewarm display with actual tile count
+                let prewarm_progress = PrewarmProgress::new(icao, result.tile_count);
                 dashboard.update_prewarm_progress(prewarm_progress);
             }
             Err(e) => {
                 tracing::warn!("Prewarm skipped: {}", e);
-                prewarm_complete = true;
             }
         }
-    } else {
-        prewarm_complete = true;
     }
 
     // Main event loop
@@ -219,15 +214,8 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         tracing::debug!("Drained stale terminal event");
     }
 
-    let mut loop_iteration = 0u32;
-
     loop {
-        loop_iteration += 1;
-        if loop_iteration <= 3 {
-            tracing::info!(iteration = loop_iteration, "Event loop iteration");
-        }
-
-        // Poll for events
+        // Poll for keyboard events
         match dashboard.poll_event() {
             Ok(Some(DashboardEvent::Quit)) => {
                 tracing::info!("Received Quit event - exiting loop");
@@ -235,74 +223,59 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
             }
             Ok(Some(DashboardEvent::Cancel)) => {
                 // Cancel prewarm if active
-                if prewarm_active && !prewarm_complete {
-                    tracing::info!("Prewarm cancelled by user");
-                    if let Some(ref handle) = prewarm_handle {
+                if let Some(ref handle) = prewarm_handle {
+                    if !handle.is_cancelled() {
+                        tracing::info!("Prewarm cancelled by user");
                         handle.cancel();
                     }
-                    prewarm_complete = true;
-                    prewarm_active = false;
                 }
             }
             Ok(None) => {}
             Err(e) => return Err(CliError::Config(format!("Dashboard error: {}", e))),
         }
 
-        // Handle prewarm progress updates
-        if let Some(ref mut handle) = prewarm_handle {
-            while let Ok(progress) = handle.try_recv_progress() {
-                match progress {
-                    LibPrewarmProgress::Starting { total_tiles } => {
-                        if let Some(prewarm) = dashboard.prewarm_status().cloned() {
-                            let mut updated = prewarm;
-                            updated.total_tiles = total_tiles;
-                            dashboard.update_prewarm_progress(updated);
-                        }
-                    }
-                    LibPrewarmProgress::TileCompleted => {
-                        if let Some(prewarm) = dashboard.prewarm_status().cloned() {
-                            let mut updated = prewarm;
-                            updated.tile_loaded(false);
-                            dashboard.update_prewarm_progress(updated);
-                        }
-                    }
-                    LibPrewarmProgress::TileCached => {
-                        if let Some(prewarm) = dashboard.prewarm_status().cloned() {
-                            let mut updated = prewarm;
-                            updated.tile_loaded(true);
-                            dashboard.update_prewarm_progress(updated);
-                        }
-                    }
-                    LibPrewarmProgress::BatchProgress {
-                        completed,
-                        cached,
-                        failed: _,
-                    } => {
-                        if let Some(prewarm) = dashboard.prewarm_status().cloned() {
-                            let mut updated = prewarm;
-                            updated.tiles_loaded_batch(completed, cached);
-                            dashboard.update_prewarm_progress(updated);
-                        }
-                    }
-                    LibPrewarmProgress::Complete {
-                        tiles_completed,
-                        cache_hits,
-                        failed,
-                    } => {
-                        tracing::info!(tiles_completed, cache_hits, failed, "Prewarm complete");
-                        prewarm_complete = true;
-                        prewarm_active = false;
-                        dashboard.clear_prewarm_status();
-                    }
-                    LibPrewarmProgress::Cancelled {
-                        tiles_completed,
-                        tiles_pending,
-                    } => {
-                        tracing::info!(tiles_completed, tiles_pending, "Prewarm cancelled");
-                        prewarm_complete = true;
-                        prewarm_active = false;
-                        dashboard.clear_prewarm_status();
-                    }
+        // Update prewarm status from handle (authoritative source)
+        if let Some(ref handle) = prewarm_handle {
+            let status = handle.status();
+
+            // Update dashboard with current status
+            let mut prewarm_progress = dashboard
+                .prewarm_status()
+                .cloned()
+                .unwrap_or_else(|| PrewarmProgress::new(&status.icao, status.total));
+
+            prewarm_progress.tiles_loaded = status.completed + status.cache_hits;
+            prewarm_progress.total_tiles = status.total;
+            prewarm_progress.cache_hits = status.cache_hits;
+
+            // Check if prewarm just completed (transition to complete state)
+            if status.is_complete && !prewarm_progress.is_complete() {
+                prewarm_progress.mark_complete(status.was_cancelled);
+                if status.was_cancelled {
+                    tracing::info!(
+                        completed = status.completed,
+                        failed = status.failed,
+                        "Prewarm cancelled"
+                    );
+                } else {
+                    tracing::info!(
+                        completed = status.completed,
+                        cache_hits = status.cache_hits,
+                        failed = status.failed,
+                        "Prewarm complete"
+                    );
+                }
+                prewarm_handle = None; // Drop handle, stop polling
+            }
+
+            dashboard.update_prewarm_progress(prewarm_progress);
+        }
+
+        // Clear prewarm status 5 seconds after completion
+        if let Some(prewarm) = dashboard.prewarm_status() {
+            if let Some(elapsed) = prewarm.time_since_completion() {
+                if elapsed >= Duration::from_secs(5) {
+                    dashboard.clear_prewarm_status();
                 }
             }
         }
@@ -310,15 +283,8 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         // Update dashboard at tick rate
         if last_tick.elapsed() >= tick_rate {
             let snapshot = orchestrator.telemetry_snapshot();
-            if loop_iteration <= 3 {
-                tracing::info!(iteration = loop_iteration, "About to draw dashboard");
-            }
             match dashboard.draw(&snapshot) {
-                Ok(()) => {
-                    if loop_iteration <= 3 {
-                        tracing::info!(iteration = loop_iteration, "Dashboard drawn successfully");
-                    }
-                }
+                Ok(()) => {}
                 Err(e) => {
                     tracing::error!(error = %e, "Dashboard draw error");
                     return Err(CliError::Config(format!("Dashboard draw error: {}", e)));

@@ -290,33 +290,64 @@ pub fn render_header(
 
     // Build content based on whether prewarm is active
     let content = if let Some(prewarm) = prewarm_status {
-        let percent = (prewarm.progress_fraction() * 100.0) as u8;
-        let spinner = prewarm_spinner.unwrap_or('⠋');
-        Line::from(vec![
-            Span::styled(format!("{} ", spinner), Style::default().fg(Color::Yellow)),
-            Span::styled("Pre-warming ", Style::default().fg(Color::Yellow)),
-            Span::styled(
-                &prewarm.icao,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    " {}/{} ({}%)",
-                    prewarm.tiles_loaded, prewarm.total_tiles, percent
+        if prewarm.is_complete() {
+            // Show completion message
+            let (message, color) = if prewarm.was_cancelled {
+                ("Pre-warming cancelled", Color::Red)
+            } else {
+                ("Pre-warming complete!", Color::Green)
+            };
+            Line::from(vec![
+                Span::styled("✓ ", Style::default().fg(color)),
+                Span::styled(message, Style::default().fg(color)),
+                Span::styled(" (", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    &prewarm.icao,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Uptime: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&uptime_str, Style::default().fg(Color::White)),
-            Span::styled("  │  Press ", Style::default().fg(Color::DarkGray)),
-            Span::styled("q", Style::default().fg(Color::Yellow)),
-            Span::styled(" to quit, ", Style::default().fg(Color::DarkGray)),
-            Span::styled("c", Style::default().fg(Color::Yellow)),
-            Span::styled(" to cancel prewarm", Style::default().fg(Color::DarkGray)),
-        ])
+                Span::styled(
+                    format!(" - {} tiles)", prewarm.tiles_loaded),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Uptime: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(&uptime_str, Style::default().fg(Color::White)),
+                Span::styled("  │  Press ", Style::default().fg(Color::DarkGray)),
+                Span::styled("q", Style::default().fg(Color::Yellow)),
+                Span::styled(" to quit", Style::default().fg(Color::DarkGray)),
+            ])
+        } else {
+            // Show progress
+            let percent = (prewarm.progress_fraction() * 100.0) as u8;
+            let spinner = prewarm_spinner.unwrap_or('⠋');
+            Line::from(vec![
+                Span::styled(format!("{} ", spinner), Style::default().fg(Color::Yellow)),
+                Span::styled("Pre-warming ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    &prewarm.icao,
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        " {}/{} ({}%)",
+                        prewarm.tiles_loaded, prewarm.total_tiles, percent
+                    ),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Uptime: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(&uptime_str, Style::default().fg(Color::White)),
+                Span::styled("  │  Press ", Style::default().fg(Color::DarkGray)),
+                Span::styled("q", Style::default().fg(Color::Yellow)),
+                Span::styled(" to quit, ", Style::default().fg(Color::DarkGray)),
+                Span::styled("c", Style::default().fg(Color::Yellow)),
+                Span::styled(" to cancel prewarm", Style::default().fg(Color::DarkGray)),
+            ])
+        }
     } else {
         Line::from(vec![
             Span::styled("Uptime: ", Style::default().fg(Color::DarkGray)),

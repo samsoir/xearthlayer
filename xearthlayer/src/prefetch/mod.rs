@@ -105,7 +105,10 @@ pub use scenery_index::{
 };
 
 // Cold-start prewarm
-pub use prewarm::{PrewarmConfig, PrewarmPrefetcher, PrewarmProgress};
+pub use prewarm::{
+    generate_dsf_grid, start_prewarm, DsfGridBounds, FileTerrainScanner, PrewarmConfig,
+    PrewarmHandle, PrewarmStatus, TerrainScanner,
+};
 
 // Scenery index cache
 pub use scenery_cache::{

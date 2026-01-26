@@ -3764,6 +3764,7 @@ dependencies = [
  "image",
  "libc",
  "moka",
+ "parking_lot",
  "proptest",
  "rand",
  "rayon",
