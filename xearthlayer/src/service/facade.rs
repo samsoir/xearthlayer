@@ -86,7 +86,6 @@ pub struct XEarthLayerService {
     /// Handle to the Tokio runtime
     runtime_handle: Handle,
 
-
     /// Texture encoder for DDS generation
     dds_encoder: Arc<DdsTextureEncoder>,
     /// Shared memory cache for tile-level caching
@@ -226,23 +225,27 @@ impl XEarthLayerService {
     /// * `provider_config` - Provider-specific configuration
     /// * `logger` - Logger implementation
     /// * `runtime_handle` - Handle to an existing Tokio runtime
-    /// * `memory_bridge` - Memory cache bridge from `XEarthLayerApp`
-    /// * `disk_bridge` - Disk cache bridge from `XEarthLayerApp`
+    /// * `memory_bridge` - Memory cache bridge from `CacheLayer`
+    /// * `disk_bridge` - Disk cache bridge from `CacheLayer`
+    ///
+    /// # Note
+    ///
+    /// This method is primarily for internal use. Prefer using
+    /// [`XEarthLayerService::start()`] which handles cache lifecycle automatically.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// use xearthlayer::app::XEarthLayerApp;
     /// use xearthlayer::service::XEarthLayerService;
+    /// use xearthlayer::cache::adapters::{MemoryCacheBridge, DiskCacheBridge};
     ///
-    /// let app = XEarthLayerApp::start(config).await?;
     /// let service = XEarthLayerService::with_cache_bridges(
     ///     service_config,
     ///     provider_config,
     ///     logger,
     ///     runtime_handle,
-    ///     app.memory_bridge(),
-    ///     app.disk_bridge(),
+    ///     memory_bridge,
+    ///     disk_bridge,
     /// )?;
     /// ```
     pub fn with_cache_bridges(
@@ -351,10 +354,7 @@ impl XEarthLayerService {
             .with_async_provider(Arc::clone(async_prov))
             .with_runtime_handle(runtime_handle.clone())
             .with_metrics_client(metrics_client)
-            .build_with_cache_service(
-                cache_layer.memory_bridge(),
-                cache_layer.disk_bridge(),
-            );
+            .build_with_cache_service(cache_layer.memory_bridge(), cache_layer.disk_bridge());
 
             let client = xel_runtime.dds_client();
             (Some(xel_runtime), Some(client))

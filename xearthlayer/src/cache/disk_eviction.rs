@@ -68,16 +68,16 @@ pub struct EvictionResult {
 ///
 /// # Deprecation Notice
 ///
-/// This external daemon is being replaced by the new `CacheService` architecture
+/// This external daemon is being replaced by the `CacheService` architecture
 /// where `DiskCacheProvider` owns its GC daemon internally. This ensures GC always
 /// runs regardless of how the application is started (TUI vs non-TUI modes).
 ///
 /// **New Architecture:**
 /// ```ignore
-/// use xearthlayer::app::{XEarthLayerApp, AppConfig};
+/// use xearthlayer::service::XEarthLayerService;
 ///
-/// // XEarthLayerApp::start() spawns internal GC daemon automatically
-/// let app = XEarthLayerApp::start(config).await?;
+/// // XEarthLayerService::start() spawns internal GC daemon automatically
+/// let service = XEarthLayerService::start(config, provider_config, logger).await?;
 /// ```
 ///
 /// See `xearthlayer::cache::providers::DiskCacheProvider` for the self-contained

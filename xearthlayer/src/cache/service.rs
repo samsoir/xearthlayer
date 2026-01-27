@@ -114,6 +114,7 @@ impl CacheService {
                     max_size_bytes: config.max_size_bytes,
                     gc_interval,
                     provider_name: provider_name.clone(),
+                    metrics_client: config.metrics_client,
                 };
 
                 let provider = DiskCacheProvider::start(disk_config).await?;

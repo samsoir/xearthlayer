@@ -18,7 +18,6 @@
 
 pub mod aircraft_position;
 pub mod airport;
-pub mod app;
 pub mod cache;
 pub mod config;
 pub mod coord;

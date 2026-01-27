@@ -7,6 +7,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::config::DEFAULT_MEMORY_CACHE_SIZE;
+use crate::metrics::MetricsClient;
+
 /// Configuration for creating a cache service.
 #[derive(Debug, Clone)]
 pub struct ServiceCacheConfig {
@@ -15,6 +18,10 @@ pub struct ServiceCacheConfig {
 
     /// Provider-specific settings.
     pub provider: ProviderConfig,
+
+    /// Optional metrics client for reporting cache stats.
+    /// For disk caches, this enables GC eviction reporting.
+    pub metrics_client: Option<MetricsClient>,
 }
 
 /// Provider-specific configuration.
@@ -59,6 +66,7 @@ impl ServiceCacheConfig {
         Self {
             max_size_bytes,
             provider: ProviderConfig::Memory { ttl },
+            metrics_client: None,
         }
     }
 
@@ -94,14 +102,23 @@ impl ServiceCacheConfig {
                 gc_interval,
                 provider_name,
             },
+            metrics_client: None,
         }
+    }
+
+    /// Set the metrics client for reporting cache stats.
+    ///
+    /// For disk caches, this enables GC eviction reporting to the metrics system.
+    pub fn with_metrics(mut self, metrics: MetricsClient) -> Self {
+        self.metrics_client = Some(metrics);
+        self
     }
 }
 
 impl Default for ServiceCacheConfig {
     /// Default configuration: 2 GB memory cache with no TTL.
     fn default() -> Self {
-        Self::memory(2 * 1024 * 1024 * 1024, None)
+        Self::memory(DEFAULT_MEMORY_CACHE_SIZE as u64, None)
     }
 }
 
@@ -122,6 +139,9 @@ pub struct DiskProviderConfig {
 
     /// Provider name for subdirectory structure.
     pub provider_name: String,
+
+    /// Optional metrics client for reporting GC eviction stats.
+    pub metrics_client: Option<MetricsClient>,
 }
 
 impl DiskProviderConfig {
@@ -131,6 +151,8 @@ impl DiskProviderConfig {
     ///
     /// `Some(DiskProviderConfig)` if the config is for a disk provider,
     /// `None` otherwise.
+    ///
+    /// Note: The metrics_client is set to None. Use `with_metrics()` to add one.
     pub fn from_service_config(config: &ServiceCacheConfig) -> Option<Self> {
         match &config.provider {
             ProviderConfig::Disk {
@@ -142,9 +164,16 @@ impl DiskProviderConfig {
                 max_size_bytes: config.max_size_bytes,
                 gc_interval: *gc_interval,
                 provider_name: provider_name.clone(),
+                metrics_client: None,
             }),
             ProviderConfig::Memory { .. } => None,
         }
+    }
+
+    /// Set the metrics client for GC eviction reporting.
+    pub fn with_metrics(mut self, metrics: MetricsClient) -> Self {
+        self.metrics_client = Some(metrics);
+        self
     }
 }
 

@@ -393,13 +393,40 @@ impl MountManager {
         }
 
         // Create the service (owns the Tokio runtime for DDS generation)
-        let service = match service_builder.build_patches_service() {
-            Ok(s) => s,
-            Err(e) => {
-                return ConsolidatedOrthoMountResult::failure(
-                    mountpoint,
-                    format!("Failed to create service: {}", e),
-                );
+        // Use async service creation if no cache bridges are set (new architecture)
+        // Fall back to sync creation when cache bridges are pre-configured (legacy)
+        let service = if service_builder.cache_bridges().is_some() {
+            // Legacy path: use pre-configured cache bridges from CacheLayer
+            match service_builder.build_patches_service() {
+                Ok(s) => s,
+                Err(e) => {
+                    return ConsolidatedOrthoMountResult::failure(
+                        mountpoint,
+                        format!("Failed to create service: {}", e),
+                    );
+                }
+            }
+        } else {
+            // New path: use XEarthLayerService::start() with integrated cache and metrics
+            // We need a runtime to run the async service creation
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(r) => r,
+                Err(e) => {
+                    return ConsolidatedOrthoMountResult::failure(
+                        mountpoint,
+                        format!("Failed to create runtime for service: {}", e),
+                    );
+                }
+            };
+
+            match runtime.block_on(service_builder.build_service_async()) {
+                Ok(s) => s,
+                Err(e) => {
+                    return ConsolidatedOrthoMountResult::failure(
+                        mountpoint,
+                        format!("Failed to create service: {}", e),
+                    );
+                }
             }
         };
 
@@ -947,25 +974,26 @@ impl ServiceBuilder {
         }
     }
 
-    /// Set the cache bridges from the new CacheService architecture.
+    /// Set the cache bridges from the CacheService architecture.
     ///
-    /// When cache bridges are set, services will use the new cache infrastructure
+    /// When cache bridges are set, services will use the cache infrastructure
     /// with internal GC daemons instead of the legacy external GC daemon.
     ///
     /// # Arguments
     ///
-    /// * `bridges` - Cache bridges from `XEarthLayerApp`
+    /// * `bridges` - Cache bridges from `CacheLayer`
     ///
     /// # Example
     ///
     /// ```ignore
-    /// use xearthlayer::app::XEarthLayerApp;
+    /// use xearthlayer::service::CacheLayer;
     /// use xearthlayer::manager::{ServiceBuilder, CacheBridges};
     ///
-    /// let app = XEarthLayerApp::start(config).await?;
+    /// let cache_layer = CacheLayer::start(cache_config).await?;
     /// let bridges = CacheBridges {
-    ///     memory: app.memory_bridge(),
-    ///     disk: app.disk_bridge(),
+    ///     memory: cache_layer.memory_bridge(),
+    ///     disk: cache_layer.disk_bridge(),
+    ///     runtime_handle: cache_layer.runtime_handle(),
     /// };
     ///
     /// let builder = ServiceBuilder::new(service_config, provider_config, logger)
@@ -1050,7 +1078,7 @@ impl ServiceBuilder {
     fn build_service_internal(&self) -> Result<XEarthLayerService, ServiceError> {
         // Use cache bridges if available (new architecture with internal GC)
         if let Some(ref bridges) = self.cache_bridges {
-            // Use the runtime handle from cache bridges - this was provided by XEarthLayerApp
+            // Use the runtime handle from cache bridges - this was provided by CacheLayer
             // and ensures we have a valid Tokio runtime even from non-async contexts
             let runtime_handle = bridges.runtime_handle.clone();
             let service = XEarthLayerService::with_cache_bridges(
@@ -1084,6 +1112,57 @@ impl ServiceBuilder {
 
         tracing::debug!("Built service with legacy cache (external GC required)");
         Ok(service)
+    }
+
+    /// Build a service using `XEarthLayerService::start()` (recommended).
+    ///
+    /// This async method creates a service with integrated metrics and cache,
+    /// using the new architecture where:
+    /// - MetricsSystem is created first
+    /// - CacheLayer is created with MetricsClient (enables GC reporting)
+    /// - All components are properly wired
+    ///
+    /// This is the recommended way to create services as it ensures the GC
+    /// daemon has access to metrics for reporting cache evictions.
+    ///
+    /// # Returns
+    ///
+    /// A fully initialized `XEarthLayerService` with integrated cache and metrics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any component fails to initialize.
+    pub async fn build_service_async(&self) -> Result<XEarthLayerService, ServiceError> {
+        let mut service = XEarthLayerService::start(
+            self.service_config.clone(),
+            self.provider_config.clone(),
+            self.logger.clone(),
+            self.disk_io_profile(),
+        )
+        .await?;
+
+        // Wire tile request callback for FUSE-based position inference
+        if let Some(ref callback) = self.tile_request_callback {
+            service.set_tile_request_callback(callback.clone());
+        }
+
+        // Wire load monitor for circuit breaker integration
+        service.set_load_monitor(Arc::clone(&self.load_monitor));
+
+        tracing::info!(
+            "Built service with integrated cache and metrics (XEarthLayerService::start)"
+        );
+        Ok(service)
+    }
+
+    /// Get the disk I/O profile.
+    fn disk_io_profile(&self) -> DiskIoProfile {
+        // Resolve Auto profile based on cache directory (or current dir if not set)
+        if let Some(cache_dir) = self.service_config.cache_directory() {
+            DiskIoProfile::Auto.resolve_for_path(cache_dir)
+        } else {
+            DiskIoProfile::Ssd // Default to SSD if no cache directory
+        }
     }
 }
 

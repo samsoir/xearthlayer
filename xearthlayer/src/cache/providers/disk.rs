@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 
 use crate::cache::config::DiskProviderConfig;
 use crate::cache::traits::{BoxFuture, Cache, GcResult, ServiceCacheError};
+use crate::metrics::MetricsClient;
 
 /// Target percentage of limit after eviction (0.9 = 90%).
 /// This leaves 10% headroom for new writes before the next eviction cycle.
@@ -73,6 +74,9 @@ pub struct DiskCacheProvider {
 
     /// Cancellation token for graceful shutdown.
     shutdown: CancellationToken,
+
+    /// Optional metrics client for reporting GC eviction stats.
+    metrics_client: Option<MetricsClient>,
 }
 
 impl DiskCacheProvider {
@@ -108,6 +112,7 @@ impl DiskCacheProvider {
             cached_count: AtomicU64::new(0),
             gc_handle: RwLock::new(None),
             shutdown: shutdown.clone(),
+            metrics_client: config.metrics_client,
         });
 
         // Spawn internal GC daemon
@@ -235,6 +240,11 @@ impl DiskCacheProvider {
                 duration_ms = result.duration_ms,
                 "Disk cache GC complete"
             );
+
+            // Report eviction to metrics system
+            if let Some(ref metrics) = self.metrics_client {
+                metrics.disk_cache_evicted(result.bytes_freed);
+            }
         }
 
         Ok(GcResult {
@@ -494,6 +504,7 @@ mod tests {
             max_size_bytes: max_size,
             gc_interval: Duration::from_secs(3600), // Long interval for tests
             provider_name: "test".to_string(),
+            metrics_client: None,
         };
 
         let provider = DiskCacheProvider::start(config).await.unwrap();

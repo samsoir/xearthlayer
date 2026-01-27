@@ -284,16 +284,16 @@ impl RuntimeBuilder {
         ))
     }
 
-    /// Builds the XEarthLayerRuntime using the new cache service architecture.
+    /// Builds the XEarthLayerRuntime using the cache service architecture.
     ///
     /// This method creates the runtime using `MemoryCacheBridge` and `DiskCacheBridge`
-    /// from the new cache service infrastructure. The bridges wrap `CacheService` instances
-    /// that manage their own lifecycle, including internal GC daemons.
+    /// from the cache layer. The bridges wrap `CacheService` instances that manage
+    /// their own lifecycle, including internal GC daemons.
     ///
     /// # Arguments
     ///
-    /// * `memory_bridge` - Memory cache bridge from `XEarthLayerApp`
-    /// * `disk_bridge` - Disk cache bridge from `XEarthLayerApp` (has internal GC!)
+    /// * `memory_bridge` - Memory cache bridge from `CacheLayer`
+    /// * `disk_bridge` - Disk cache bridge from `CacheLayer` (has internal GC!)
     ///
     /// # Panics
     ///
@@ -304,14 +304,13 @@ impl RuntimeBuilder {
     /// # Example
     ///
     /// ```ignore
-    /// use xearthlayer::app::XEarthLayerApp;
     /// use xearthlayer::service::RuntimeBuilder;
+    /// use xearthlayer::cache::adapters::{MemoryCacheBridge, DiskCacheBridge};
     ///
-    /// let app = XEarthLayerApp::start(config).await?;
     /// let runtime = RuntimeBuilder::new(provider_name, format, encoder)
     ///     .with_async_provider(provider)
     ///     .with_runtime_handle(handle)
-    ///     .build_with_cache_service(app.memory_bridge(), app.disk_bridge());
+    ///     .build_with_cache_service(memory_bridge, disk_bridge);
     /// ```
     pub fn build_with_cache_service(
         self,

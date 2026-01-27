@@ -212,7 +212,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     );
 
     // Start ServiceOrchestrator - this initializes:
-    // - Cache services (XEarthLayerApp with internal GC daemon)
+    // - Cache services (CacheLayer with internal GC daemon)
     // - ServiceBuilder with cache bridges
     // - MountManager with load monitor
     // - FUSE request analyzer (if prefetch enabled)

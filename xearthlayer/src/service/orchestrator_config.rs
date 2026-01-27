@@ -6,7 +6,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::app::AppConfig;
 use crate::config::{ConfigFile, DiskIoProfile};
 use crate::prefetch::CircuitBreakerConfig;
 use crate::provider::ProviderConfig;
@@ -34,9 +33,6 @@ use crate::service::ServiceConfig;
 /// ```
 #[derive(Clone, Debug)]
 pub struct OrchestratorConfig {
-    /// Application configuration (cache, provider, service settings).
-    pub app_config: AppConfig,
-
     /// Provider configuration (Bing, Go2, Google, etc.).
     pub provider: ProviderConfig,
 
@@ -137,9 +133,6 @@ impl OrchestratorConfig {
         packages_install_location: PathBuf,
         tui_mode: bool,
     ) -> Self {
-        // Build AppConfig for cache services
-        let app_config = AppConfig::from_config_file(config, provider.clone(), service.clone());
-
         // Determine patches directory
         let patches_dir = if config.patches.enabled {
             config.patches.directory.clone().unwrap_or_else(|| {
@@ -181,7 +174,6 @@ impl OrchestratorConfig {
         };
 
         Self {
-            app_config,
             provider,
             service,
             custom_scenery_path,

@@ -42,9 +42,7 @@ use std::time::Duration;
 
 use tracing::info;
 
-use crate::cache::{
-    Cache, CacheService, DiskCacheBridge, MemoryCacheBridge, ServiceCacheConfig,
-};
+use crate::cache::{Cache, CacheService, DiskCacheBridge, MemoryCacheBridge, ServiceCacheConfig};
 use crate::config::{DEFAULT_DISK_CACHE_SIZE, DEFAULT_MEMORY_CACHE_SIZE};
 use crate::metrics::MetricsClient;
 use crate::service::config::ServiceConfig;
@@ -94,9 +92,7 @@ impl CacheLayer {
         let memory_size = config
             .cache_memory_size()
             .unwrap_or(DEFAULT_MEMORY_CACHE_SIZE) as u64;
-        let disk_size = config
-            .cache_disk_size()
-            .unwrap_or(DEFAULT_DISK_CACHE_SIZE) as u64;
+        let disk_size = config.cache_disk_size().unwrap_or(DEFAULT_DISK_CACHE_SIZE) as u64;
 
         // Get cache directory with default
         let disk_dir = config.cache_directory().cloned().unwrap_or_else(|| {
@@ -145,10 +141,7 @@ impl CacheLayer {
             metrics.clone(),
         ));
 
-        let disk_bridge = Arc::new(DiskCacheBridge::with_metrics(
-            disk_service.cache(),
-            metrics,
-        ));
+        let disk_bridge = Arc::new(DiskCacheBridge::with_metrics(disk_service.cache(), metrics));
 
         info!("CacheLayer initialized with memory and disk cache bridges");
 

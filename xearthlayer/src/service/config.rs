@@ -285,7 +285,9 @@ impl ServiceConfigBuilder {
             cache_directory: self.cache_directory,
             cache_memory_size: self.cache_memory_size,
             cache_disk_size: self.cache_disk_size,
-            disk_gc_interval_secs: self.disk_gc_interval_secs.unwrap_or(DEFAULT_GC_INTERVAL_SECS),
+            disk_gc_interval_secs: self
+                .disk_gc_interval_secs
+                .unwrap_or(DEFAULT_GC_INTERVAL_SECS),
             generation_threads: self.generation_threads,
             generation_timeout: self.generation_timeout,
             quiet_mode: self.quiet_mode.unwrap_or(false),

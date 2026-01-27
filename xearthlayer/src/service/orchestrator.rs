@@ -6,16 +6,23 @@
 //! # Architecture
 //!
 //! The orchestrator owns and manages:
-//! - **Cache services** (via `XEarthLayerApp`) - memory and disk caches with GC
 //! - **Aircraft Position & Telemetry (APT)** - unified position aggregation
 //! - **Prefetch system** - predictive tile caching
 //! - **Scene tracker** - FUSE load monitoring
 //! - **FUSE mounts** (via `MountManager`) - virtual filesystem
 //!
+//! Cache services are now managed internally by `XEarthLayerService` via `CacheLayer`,
+//! which is created during `XEarthLayerService::start()`. This ensures proper metrics
+//! integration: MetricsSystem is created first, then CacheLayer with metrics client,
+//! so the GC daemon can report cache evictions.
+//!
 //! # Startup Sequence
 //!
-//! 1. Cache services start first (GC daemons auto-start)
-//! 2. Service builder creates XEarthLayerService with cache bridges
+//! 1. ServiceBuilder is created (deferred service creation)
+//! 2. FUSE mount triggers `XEarthLayerService::start()`:
+//!    - MetricsSystem created first
+//!    - CacheLayer created with metrics (GC daemon starts)
+//!    - Service fully initialized
 //! 3. APT module starts telemetry reception
 //! 4. Prefetch system subscribes to APT telemetry
 //! 5. FUSE mounts become active
@@ -26,13 +33,13 @@
 //! use xearthlayer::service::{ServiceOrchestrator, OrchestratorConfig};
 //!
 //! let config = OrchestratorConfig::from_config_file(...);
-//! let orchestrator = ServiceOrchestrator::start(config).await?;
+//! let orchestrator = ServiceOrchestrator::start(config)?;
 //!
 //! // Access telemetry for UI
 //! let snapshot = orchestrator.telemetry_snapshot();
 //!
 //! // Graceful shutdown
-//! orchestrator.shutdown().await;
+//! orchestrator.shutdown();
 //! ```
 
 use std::sync::Arc;
@@ -47,7 +54,6 @@ use crate::aircraft_position::{
     spawn_position_logger, AircraftPositionBroadcaster, SharedAircraftPosition, StateAggregator,
     TelemetryReceiver, TelemetryReceiverConfig, DEFAULT_LOG_INTERVAL,
 };
-use crate::app::XEarthLayerApp;
 use crate::executor::{DdsClient, MemoryCache};
 use crate::log::TracingLogger;
 use crate::manager::{
@@ -161,10 +167,14 @@ pub struct StartupResult {
 /// This is the main entry point for the backend daemon. It encapsulates all
 /// service orchestration that was previously scattered in `run.rs`, providing
 /// a clean API for the CLI/TUI layer.
+///
+/// # Cache Architecture
+///
+/// The orchestrator no longer owns cache infrastructure directly. Instead,
+/// `XEarthLayerService::start()` creates the `CacheLayer` with proper metrics
+/// integration. This ensures the GC daemon has access to metrics for reporting
+/// cache evictions.
 pub struct ServiceOrchestrator {
-    /// Cache infrastructure (owns GC daemons).
-    cache_app: Option<XEarthLayerApp>,
-
     /// Aircraft position provider (APT module).
     aircraft_position: SharedAircraftPosition,
 
@@ -225,28 +235,10 @@ impl ServiceOrchestrator {
             None
         };
 
-        // 1. Start cache services (GC daemons auto-start)
-        let cache_app = if config.cache_enabled() {
-            match XEarthLayerApp::start_sync(config.app_config.clone()) {
-                Ok(app) => {
-                    info!(
-                        memory_size = config.app_config.memory_cache.max_size_bytes,
-                        disk_size = config.app_config.disk_cache.max_size_bytes,
-                        cache_dir = %config.app_config.disk_cache.directory.display(),
-                        "Cache services started with internal GC daemon"
-                    );
-                    Some(app)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to start cache services");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // 2. Create service builder with cache bridges and disk I/O profile
+        // Create service builder with disk I/O profile
+        // Note: Cache is now created inside XEarthLayerService::start() via CacheLayer,
+        // which ensures MetricsSystem is created FIRST, then CacheLayer with metrics.
+        // This fixes the GC daemon not having metrics client for eviction reporting.
         let logger: Arc<dyn crate::log::Logger> = Arc::new(TracingLogger);
         let mut service_builder = ServiceBuilder::with_disk_io_profile(
             config.service.clone(),
@@ -255,12 +247,7 @@ impl ServiceOrchestrator {
             config.disk_io_profile,
         );
 
-        // Wire cache bridges from XEarthLayerApp
-        if let Some(ref app) = cache_app {
-            service_builder = service_builder.with_cache_bridges(app.cache_bridges());
-        }
-
-        // 3. Create mount manager with Custom Scenery path
+        // Create mount manager with Custom Scenery path
         let mount_manager = MountManager::with_scenery_path(&config.custom_scenery_path);
 
         // Wire load monitor for circuit breaker integration
@@ -272,7 +259,7 @@ impl ServiceOrchestrator {
             service_builder = service_builder.with_tile_request_callback(analyzer.callback());
         }
 
-        // 4. Create APT module (starts later with mount)
+        // Create APT module (starts later with mount)
         let (apt_broadcast_tx, _apt_broadcast_rx) = broadcast::channel(16);
         let apt_aggregator = StateAggregator::new(apt_broadcast_tx);
         let aircraft_position = SharedAircraftPosition::new(apt_aggregator);
@@ -283,7 +270,6 @@ impl ServiceOrchestrator {
         info!("ServiceOrchestrator initialized (mount pending)");
 
         Ok(Self {
-            cache_app,
             aircraft_position,
             prefetch_status,
             prefetch_handle: None,
@@ -337,19 +323,16 @@ impl ServiceOrchestrator {
         let callback: Option<Arc<dyn Fn(StartupProgress) + Send + Sync>> =
             progress_callback.map(|f| Arc::new(f) as Arc<dyn Fn(StartupProgress) + Send + Sync>);
 
-        // Phase 0: Scan disk cache size (for accurate metrics display)
-        // We scan early for UI feedback, but defer metrics reporting until after mount
-        // (when the service with its metrics system exists)
-        let initial_disk_cache_bytes = if let Some(ref app) = self.cache_app {
-            if let Some(ref cb) = callback {
-                cb(StartupProgress::ScanningDiskCache);
-            }
-            app.scan_disk_cache_size_sync()
-        } else {
-            0
-        };
+        // Note: Disk cache scanning is now handled internally by XEarthLayerService::start()
+        // via CacheLayer, which scans and reports to metrics during service creation.
+        // This ensures proper metrics integration without needing external coordination.
 
         // Phase 1: Mount consolidated ortho with progress
+        // This now uses XEarthLayerService::start() which creates CacheLayer with metrics
+        if let Some(ref cb) = callback {
+            cb(StartupProgress::ScanningDiskCache);
+        }
+
         let mount_result = if let Some(ref cb) = callback {
             // Convert our StartupProgress to the ortho_union IndexBuildProgress
             let cb_clone = Arc::clone(cb);
@@ -375,19 +358,6 @@ impl ServiceOrchestrator {
                     .clone()
                     .unwrap_or_else(|| "Mount failed".to_string()),
             )));
-        }
-
-        // Report initial disk cache size to metrics (now that service exists)
-        if initial_disk_cache_bytes > 0 {
-            if let Some(service) = self.mount_manager.get_service() {
-                if let Some(metrics) = service.metrics_client() {
-                    metrics.disk_cache_initial_size(initial_disk_cache_bytes);
-                    tracing::debug!(
-                        bytes = initial_disk_cache_bytes,
-                        "Reported initial disk cache size to metrics"
-                    );
-                }
-            }
         }
 
         // Phase 2: Create overlay symlinks
@@ -922,9 +892,12 @@ impl ServiceOrchestrator {
     /// Gracefully shutdown all services.
     ///
     /// This shuts down services in reverse order of startup:
-    /// 1. Cancel prefetch
-    /// 2. Unmount FUSE
-    /// 3. Shutdown cache services
+    /// 1. Cancel prefetch and other async tasks
+    /// 2. Unmount FUSE (which drops the service and its cache layer)
+    ///
+    /// Note: Cache services (with GC daemons) are now owned by `XEarthLayerService`
+    /// via `CacheLayer`, so they are automatically shut down when the service is dropped
+    /// during FUSE unmount.
     pub fn shutdown(mut self) {
         info!("Shutting down ServiceOrchestrator");
 
@@ -932,15 +905,9 @@ impl ServiceOrchestrator {
         self.cancellation.cancel();
 
         // 2. Unmount all FUSE filesystems
+        // This drops the XEarthLayerService, which owns the CacheLayer with GC daemon
         self.mount_manager.unmount_all();
-        info!("FUSE mounts unmounted");
-
-        // 3. Shutdown cache services (GC daemons stop)
-        if let Some(app) = self.cache_app.take() {
-            // Note: XEarthLayerApp's Drop impl handles async shutdown
-            drop(app);
-            info!("Cache services shut down");
-        }
+        info!("FUSE mounts unmounted (cache services shutdown via service drop)");
 
         info!("ServiceOrchestrator shutdown complete");
     }
