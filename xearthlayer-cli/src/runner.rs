@@ -1,16 +1,12 @@
 //! CLI runner for common setup and operations.
 //!
-//! Encapsulates logging initialization, service creation, and file operations
+//! Encapsulates logging initialization and configuration loading
 //! to reduce duplication across command handlers.
 
 use crate::error::CliError;
-use std::sync::Arc;
 use tracing::info;
-use xearthlayer::config::{ConfigFile, TextureConfig};
-use xearthlayer::log::TracingLogger;
+use xearthlayer::config::ConfigFile;
 use xearthlayer::logging::{init_logging_full, LoggingGuard};
-use xearthlayer::provider::ProviderConfig;
-use xearthlayer::service::{ServiceConfig, XEarthLayerService};
 
 /// Runner that manages CLI lifecycle and common operations.
 pub struct CliRunner {
@@ -75,57 +71,5 @@ impl CliRunner {
     pub fn log_startup(&self, command: &str) {
         info!("XEarthLayer v{}", xearthlayer::VERSION);
         info!("XEarthLayer CLI: {} command", command);
-    }
-
-    /// Create a service with the given configuration.
-    pub fn create_service(
-        &self,
-        config: ServiceConfig,
-        provider_config: &ProviderConfig,
-    ) -> Result<XEarthLayerService, CliError> {
-        if provider_config.requires_api_key() {
-            info!("Creating {} session...", provider_config.name());
-            println!("Creating {} session...", provider_config.name());
-        }
-
-        // Use TracingLogger to delegate library logging to tracing crate
-        let logger = Arc::new(TracingLogger);
-
-        XEarthLayerService::new(config, provider_config.clone(), logger)
-            .map_err(CliError::ServiceCreation)
-            .inspect(|_| info!("Service created successfully"))
-    }
-
-    /// Save DDS data to a file.
-    pub fn save_dds(
-        &self,
-        path: &str,
-        data: &[u8],
-        texture_config: &TextureConfig,
-    ) -> Result<(), CliError> {
-        let format = texture_config.format();
-        let mipmap_count = texture_config.mipmap_count();
-
-        info!(
-            "Saving DDS ({:?} compression, {} mipmap levels)",
-            format, mipmap_count
-        );
-        println!(
-            "Saving DDS ({:?} compression, {} mipmap levels)...",
-            format, mipmap_count
-        );
-
-        std::fs::write(path, data).map_err(|e| CliError::FileWrite {
-            path: path.to_string(),
-            error: e,
-        })?;
-
-        let size_mb = data.len() as f64 / 1_048_576.0;
-        info!("DDS saved successfully: {} ({:.2} MB)", path, size_mb);
-        println!("✓ Saved successfully: {} ({:.2} MB)", path, size_mb);
-        println!("  Format: {:?}", format);
-        println!("  Mipmaps: {}", mipmap_count);
-
-        Ok(())
     }
 }

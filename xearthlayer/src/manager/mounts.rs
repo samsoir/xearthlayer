@@ -419,7 +419,7 @@ impl MountManager {
                 }
             };
 
-            match runtime.block_on(service_builder.build_service_async()) {
+            let mut service = match runtime.block_on(service_builder.build_service_async()) {
                 Ok(s) => s,
                 Err(e) => {
                     return ConsolidatedOrthoMountResult::failure(
@@ -427,7 +427,11 @@ impl MountManager {
                         format!("Failed to create service: {}", e),
                     );
                 }
-            }
+            };
+
+            // Transfer runtime ownership to the service so it stays alive
+            service.set_owned_runtime(runtime);
+            service
         };
 
         // Get DdsClient and runtime from the service
@@ -1137,7 +1141,6 @@ impl ServiceBuilder {
             self.service_config.clone(),
             self.provider_config.clone(),
             self.logger.clone(),
-            self.disk_io_profile(),
         )
         .await?;
 
@@ -1153,16 +1156,6 @@ impl ServiceBuilder {
             "Built service with integrated cache and metrics (XEarthLayerService::start)"
         );
         Ok(service)
-    }
-
-    /// Get the disk I/O profile.
-    fn disk_io_profile(&self) -> DiskIoProfile {
-        // Resolve Auto profile based on cache directory (or current dir if not set)
-        if let Some(cache_dir) = self.service_config.cache_directory() {
-            DiskIoProfile::Auto.resolve_for_path(cache_dir)
-        } else {
-            DiskIoProfile::Ssd // Default to SSD if no cache directory
-        }
     }
 }
 

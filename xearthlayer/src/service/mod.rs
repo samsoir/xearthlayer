@@ -20,8 +20,8 @@
 //! // Create service
 //! let service = XEarthLayerService::new(config, ProviderConfig::bing())?;
 //!
-//! // Download a tile
-//! let data = service.download_tile(37.7749, -122.4194, 15)?;
+//! // Mount FUSE filesystem
+//! let handle = service.mount_package_async(package_path).await?;
 //! ```
 
 mod builder;
@@ -30,7 +30,6 @@ mod config;
 mod error;
 mod facade;
 mod fuse_mount;
-mod network_logger;
 mod orchestrator;
 mod orchestrator_config;
 mod prewarm;

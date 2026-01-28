@@ -5,24 +5,20 @@
 
 use super::config::ServiceConfig;
 use super::error::ServiceError;
-use super::network_logger::NetworkStatsLogger;
 use crate::cache::{DiskCacheConfig, MemoryCache, MemoryCacheConfig};
-use crate::log::Logger;
-use crate::log_info;
-use crate::orchestrator::{NetworkStats, TileOrchestrator};
 use crate::provider::{
     AsyncProviderFactory, AsyncProviderType, AsyncReqwestClient, Provider, ProviderConfig,
     ProviderFactory, ReqwestClient,
 };
-use crate::texture::{DdsTextureEncoder, TextureEncoder};
-use crate::tile::{DefaultTileGenerator, ParallelConfig, ParallelTileGenerator, TileGenerator};
+use crate::texture::DdsTextureEncoder;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 
-/// Result of provider initialization.
+/// Result of provider initialization (sync constructors).
 pub struct ProviderComponents {
-    /// Sync provider for legacy pipeline
+    /// Sync provider (unused - kept for API compatibility, will be removed)
+    #[allow(dead_code)]
     pub sync_provider: Arc<dyn Provider>,
     /// Async provider for async pipeline (optional)
     pub async_provider: Option<Arc<AsyncProviderType>>,
@@ -38,14 +34,6 @@ pub struct CacheComponents {
     pub memory_cache: Option<Arc<MemoryCache>>,
     /// Cache directory path for disk cache (chunks stored via ParallelDiskCache).
     pub cache_dir: Option<PathBuf>,
-}
-
-/// Result of generator initialization.
-pub struct GeneratorComponents {
-    /// Tile generator (parallel wrapper around base generator)
-    pub generator: Arc<dyn TileGenerator>,
-    /// Network stats tracker
-    pub network_stats: Arc<NetworkStats>,
 }
 
 /// Create sync and async providers from configuration.
@@ -80,64 +68,55 @@ pub fn create_providers(
     })
 }
 
+/// Result of async-only provider initialization.
+///
+/// This struct is returned by `create_async_provider()` which only creates
+/// the async provider without the legacy sync provider. This is used by
+/// `XEarthLayerService::start()` where the sync provider is dead code.
+pub struct AsyncProviderComponents {
+    /// Async provider for the modern pipeline
+    pub async_provider: Arc<AsyncProviderType>,
+    /// Provider name for cache directories
+    pub name: String,
+    /// Maximum zoom level supported
+    pub max_zoom: u8,
+}
+
+/// Create only the async provider from configuration.
+///
+/// This version is safe to call from within an async context and doesn't
+/// create the sync provider (which would create its own internal Tokio runtime
+/// via reqwest::blocking::Client).
+///
+/// Use this for `XEarthLayerService::start()` where the legacy sync pipeline
+/// is not needed.
+pub async fn create_async_provider(
+    config: &ProviderConfig,
+) -> Result<AsyncProviderComponents, ServiceError> {
+    // Create async HTTP client
+    let async_http_client =
+        AsyncReqwestClient::new().map_err(|e| ServiceError::HttpClientError(e.to_string()))?;
+
+    // Create async provider
+    let async_factory = AsyncProviderFactory::new(async_http_client);
+    let (async_provider, name, max_zoom) = async_factory
+        .create(config)
+        .await
+        .map_err(ServiceError::ProviderError)?;
+
+    Ok(AsyncProviderComponents {
+        async_provider: Arc::new(async_provider),
+        name,
+        max_zoom,
+    })
+}
+
 /// Create texture encoder from configuration.
 pub fn create_encoder(config: &ServiceConfig) -> Arc<DdsTextureEncoder> {
     Arc::new(
         DdsTextureEncoder::new(config.texture().format())
             .with_mipmap_count(config.texture().mipmap_count()),
     )
-}
-
-/// Create tile generator pipeline (orchestrator -> base generator -> parallel wrapper).
-pub fn create_generator(
-    config: &ServiceConfig,
-    provider: Arc<dyn Provider>,
-    encoder: Arc<dyn TextureEncoder>,
-    logger: Arc<dyn Logger>,
-) -> GeneratorComponents {
-    // Create network stats tracker
-    let network_stats = Arc::new(NetworkStats::new());
-
-    // Create orchestrator with download config and network stats
-    let orchestrator = TileOrchestrator::with_config(Arc::clone(&provider), *config.download())
-        .with_network_stats(Arc::clone(&network_stats));
-
-    // Create base tile generator
-    let base_generator: Arc<dyn TileGenerator> = Arc::new(DefaultTileGenerator::new(
-        orchestrator,
-        encoder,
-        logger.clone(),
-    ));
-
-    // Configure parallel wrapper
-    let parallel_config = ParallelConfig::default()
-        .with_threads(config.generation_threads().unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-        }))
-        .with_timeout_secs(config.generation_timeout().unwrap_or(10))
-        .with_dds_format(config.texture().format())
-        .with_mipmap_count(config.texture().mipmap_count());
-
-    log_info!(
-        logger,
-        "Tile generation: {} threads, {}s timeout",
-        parallel_config.threads,
-        parallel_config.timeout_secs
-    );
-
-    // Wrap with parallel generator
-    let generator: Arc<dyn TileGenerator> = Arc::new(ParallelTileGenerator::new(
-        base_generator,
-        parallel_config,
-        logger,
-    ));
-
-    GeneratorComponents {
-        generator,
-        network_stats,
-    }
 }
 
 /// Create cache components from configuration.
@@ -148,7 +127,6 @@ pub fn create_generator(
 pub fn create_cache(
     config: &ServiceConfig,
     _provider_name: &str,
-    _logger: Arc<dyn Logger>,
 ) -> Result<CacheComponents, ServiceError> {
     if !config.cache_enabled() {
         return Ok(CacheComponents {
@@ -181,23 +159,6 @@ pub fn create_cache(
     })
 }
 
-/// Create network stats logger (if not in quiet mode).
-pub fn create_network_logger(
-    config: &ServiceConfig,
-    network_stats: Arc<NetworkStats>,
-    logger: Arc<dyn Logger>,
-) -> Option<NetworkStatsLogger> {
-    if config.quiet_mode() {
-        None
-    } else {
-        Some(NetworkStatsLogger::start(
-            network_stats,
-            logger,
-            60, // Log every 60 seconds
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,8 +174,7 @@ mod tests {
     #[test]
     fn test_cache_disabled_returns_noop() {
         let config = ServiceConfig::builder().cache_enabled(false).build();
-        let logger = Arc::new(crate::log::NoOpLogger);
-        let result = create_cache(&config, "test", logger).unwrap();
+        let result = create_cache(&config, "test").unwrap();
         assert!(result.memory_cache.is_none());
         assert!(result.cache_dir.is_none());
     }

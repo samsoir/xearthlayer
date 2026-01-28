@@ -144,41 +144,6 @@ enum Commands {
         #[arg(long)]
         airport: Option<String>,
     },
-
-    /// Download a single tile to a file (for testing)
-    Download {
-        /// Latitude in decimal degrees
-        #[arg(long)]
-        lat: f64,
-
-        /// Longitude in decimal degrees
-        #[arg(long)]
-        lon: f64,
-
-        /// Zoom level (12-19 for Bing, 12-22 for Google)
-        #[arg(long, default_value = "16")]
-        zoom: u8,
-
-        /// Output file path (.dds extension)
-        #[arg(long)]
-        output: String,
-
-        /// DDS compression format (default: from config)
-        #[arg(long, value_enum)]
-        dds_format: Option<DdsCompression>,
-
-        /// Imagery provider (default: from config)
-        #[arg(long, value_enum)]
-        provider: Option<ProviderType>,
-
-        /// Google Maps API key (default: from config)
-        #[arg(long)]
-        google_api_key: Option<String>,
-
-        /// MapBox access token (default: from config)
-        #[arg(long)]
-        mapbox_token: Option<String>,
-    },
 }
 
 // ============================================================================
@@ -201,25 +166,6 @@ fn main() {
         Some(Commands::Publish { command }) => commands::publish::run(command),
         Some(Commands::Packages { command }) => commands::packages::run(command),
         Some(Commands::Patches { command }) => commands::patches::run(command),
-        Some(Commands::Download {
-            lat,
-            lon,
-            zoom,
-            output,
-            dds_format,
-            provider,
-            google_api_key,
-            mapbox_token,
-        }) => commands::download::run(commands::download::DownloadArgs {
-            lat,
-            lon,
-            zoom,
-            output,
-            dds_format,
-            provider,
-            google_api_key,
-            mapbox_token,
-        }),
         Some(Commands::Run {
             provider,
             google_api_key,

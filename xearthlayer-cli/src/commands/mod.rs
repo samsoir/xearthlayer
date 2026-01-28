@@ -7,7 +7,6 @@
 //! - [`cache`] - Cache management (clear, stats)
 //! - [`config`] - Configuration management (get, set, list, path)
 //! - [`diagnostics`] - System diagnostics for bug reports
-//! - [`download`] - Single tile download
 //! - [`init`] - Configuration initialization
 //! - [`packages`] - Package management (install, remove, update)
 //! - [`patches`] - Tile patches management (list, validate, path)
@@ -20,7 +19,6 @@ pub mod cache;
 pub mod common;
 pub mod config;
 pub mod diagnostics;
-pub mod download;
 pub mod init;
 pub mod packages;
 pub mod patches;
