@@ -4,7 +4,7 @@
 
 **Project**: XEarthLayer
 **Date**: January 2026
-**Version**: 1.0
+**Version**: 1.1
 **Status**: Design Phase
 
 ---
@@ -144,10 +144,12 @@ xearthlayer/src/prefetch/
 ├── strategy/
 │   ├── mod.rs               # PrefetchStrategy trait
 │   ├── ground.rs            # GroundStrategy
-│   ├── cruise.rs            # CruiseStrategy
-│   └── flight_plan.rs       # FlightPlanStrategy (future)
+│   └── cruise.rs            # CruiseStrategy
 ├── band_calculator.rs        # Calculate tiles in a band
 └── phase_detector.rs         # Detect ground/cruise/approach phases
+
+# Future (not in initial implementation):
+# └── strategy/flight_plan.rs  # FlightPlanStrategy
 ```
 
 ---
@@ -177,6 +179,9 @@ pub struct PerformanceCalibration {
 
     /// Timestamp of calibration
     pub calibrated_at: Instant,
+
+    /// Baseline throughput from initial calibration (for degradation detection)
+    pub baseline_throughput: f64,
 }
 
 pub enum StrategyMode {
@@ -213,6 +218,30 @@ Else if band_completion_time < time_available:
     → OPPORTUNISTIC (start early, should complete)
 Else:
     → DISABLED (won't complete, skip prefetch)
+```
+
+### Rolling Recalibration
+
+Initial calibration happens during X-Plane's 12° load, but flight conditions change (e.g., flying from sparse oceanic tiles into photogrammetry-heavy metro areas). The system performs **rolling recalibration** to adapt:
+
+```
+ROLLING RECALIBRATION
+┌─────────────────────────────────────────────────────────────────┐
+│ Periodic Recalibration:                                         │
+│   • Every 15 minutes: Update throughput metrics                 │
+│   • Uses sliding window of last 5 minutes of tile generation    │
+│                                                                 │
+│ Degradation Detection:                                          │
+│   • If observed throughput < 70% of baseline → downgrade mode   │
+│   • AGGRESSIVE → OPPORTUNISTIC → DISABLED                       │
+│   • Prevents over-aggressive prefetch when flying into          │
+│     complex scenery areas                                       │
+│                                                                 │
+│ Recovery:                                                       │
+│   • If throughput recovers to > 90% of baseline → upgrade mode  │
+│   • DISABLED → OPPORTUNISTIC → AGGRESSIVE                       │
+│   • Allows system to adapt when flying back to simpler areas    │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -370,16 +399,16 @@ FLIGHT PLAN STRATEGY (Future Implementation)
 │  GROUND  │ ─────────────────────────────────► │  CRUISE  │
 │          │                                    │          │
 └──────────┘ ◄───────────────────────────────── └──────────┘
-              on ground (GS<40 AND AGL<20)
+              on ground (GS<40 AND AGL<20)           │
                                                      │
-                      FPL available                  │
-                           │                         │
-                           ▼                         ▼
-                   ┌──────────────┐           ┌───────────┐
-                   │ FLIGHT_PLAN  │           │ DISABLED  │
-                   │              │           │ (too slow)│
-                   └──────────────┘           └───────────┘
+                                                     ▼
+                                              ┌───────────┐
+                                              │ DISABLED  │
+                                              │ (too slow)│
+                                              └───────────┘
 ```
+
+**Note**: Flight Plan strategy is a future enhancement and is not included in the initial implementation. When implemented, it will integrate as a higher-priority strategy that overrides Cruise when a valid flight plan is loaded.
 
 ---
 
@@ -493,7 +522,17 @@ self.dds_client.request_tile(
 ).await;
 ```
 
-Priority ordering ensures FUSE requests (X-Plane) always take precedence.
+#### Priority-Based Backpressure
+
+The `JobExecutor` uses priority ordering (`ON_DEMAND > PREFETCH > HOUSEKEEPING`) which provides natural backpressure:
+
+- When X-Plane requests tiles (ON_DEMAND), they jump the queue ahead of pending prefetch jobs
+- Prefetch jobs effectively "pause" while ON_DEMAND requests are being served
+- No explicit cancellation needed—priority inversion handles contention naturally
+- When circuit breaker opens (X-Plane actively loading), new prefetch submissions pause
+- Pending prefetch jobs remain queued but stay behind any ON_DEMAND requests
+
+This design avoids complex job cancellation logic while ensuring X-Plane's requests are never delayed by prefetch work.
 
 ### Scenery Index Integration
 
@@ -775,6 +814,31 @@ impl Default for CalibrationConfig {
 
 ---
 
+## Design Considerations
+
+### Memory Pressure
+
+Large prefetch batches (default 3,000 tiles) could theoretically cause memory pressure. However, the existing architecture provides adequate protection:
+
+1. **Memory cache is configurable**: Users can set `cache.memory_size` based on available RAM (e.g., 2GB default, up to 16GB+ on high-end systems)
+2. **LRU eviction is always active**: The `CacheLayer`'s memory provider uses moka-based LRU eviction, preventing unbounded growth
+3. **Disk cache is primary target**: Prefetched tiles are written to disk cache, which is the main goal—disk retrieval is still much faster than network download
+4. **Tiles flow through, not accumulate**: Generated tiles are served and evicted based on access patterns, not queued indefinitely
+
+On modern systems (32GB+ RAM), running X-Plane alongside XEarthLayer with aggressive prefetch has not caused OOM issues in testing. For constrained systems, the `max_tiles_per_cycle` tuning option can reduce batch sizes.
+
+### Network Limitations
+
+The prefetch system has limited control over low-level network behavior:
+
+1. **Application-level prioritization works**: ON_DEMAND requests jump the queue ahead of prefetch requests
+2. **Connection limiting is enforced**: HTTP concurrency capped at `min(cpus*16, 256)` connections
+3. **Timeouts prevent stalls**: 10-second timeout per tile request
+
+**Known limitation**: The system cannot set TCP-level priority flags from userspace Rust. On extremely slow or congested connections, prefetch traffic may contribute to buffer bloat, potentially adding latency to other network traffic. The `low_performance_killswitch` option automatically disables prefetch when throughput is too low to be effective, which also addresses this concern.
+
+---
+
 ## Implementation Plan
 
 ### Phase 1: Performance Calibration
@@ -892,3 +956,4 @@ impl Default for CalibrationConfig {
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | January 2026 | Initial design based on flight test research |
+| 1.1 | January 2026 | Added rolling recalibration, priority-based backpressure, design considerations |
