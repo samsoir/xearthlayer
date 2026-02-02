@@ -721,7 +721,10 @@ impl JobExecutor {
             "Job started"
         );
 
-        if let Some(first_task) = active.pending_tasks.drain(..1).next() {
+        // Handle first task if present. Use is_empty() check instead of drain(..1)
+        // to avoid panic when job has 0 tasks (e.g., CacheGcJob with no eviction candidates).
+        if !active.pending_tasks.is_empty() {
+            let first_task = active.pending_tasks.remove(0);
             let task_name = first_task.name().to_string();
             let queued = QueuedTask::new(first_task, job_id.clone(), priority);
 
@@ -1453,5 +1456,49 @@ mod tests {
         let config = ExecutorConfig::default();
         assert_eq!(config.job_channel_capacity, DEFAULT_JOB_CHANNEL_CAPACITY);
         assert_eq!(config.max_concurrent_tasks, DEFAULT_MAX_CONCURRENT_TASKS);
+    }
+
+    /// Regression test for panic when job has 0 tasks.
+    ///
+    /// This bug occurred when CacheGcJob returned 0 eviction candidates,
+    /// causing `drain(..1)` to panic on an empty vector.
+    #[tokio::test]
+    async fn test_job_with_zero_tasks_does_not_panic() {
+        let config = ExecutorConfig::default();
+        let (executor, submitter) = JobExecutor::new(config);
+
+        let shutdown = CancellationToken::new();
+        let shutdown_clone = shutdown.clone();
+
+        // Spawn executor
+        let executor_handle = tokio::spawn(async move {
+            executor.run(shutdown_clone).await;
+        });
+
+        // Submit a job with ZERO tasks (reproduces GC bug)
+        let job = SimpleJob {
+            id: "zero-tasks-test".to_string(),
+            tasks: vec![], // Empty!
+        };
+
+        let mut handle = submitter.submit(job);
+
+        // Wait for completion with timeout - should NOT panic
+        tokio::select! {
+            _result = handle.wait() => {
+                // Job completed (with 0 tasks, should complete immediately)
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                panic!("Job timed out - executor may have panicked");
+            }
+        }
+
+        // Verify job succeeded (0 tasks = success)
+        assert!(handle.status().is_terminal());
+        assert_eq!(handle.status(), JobStatus::Succeeded);
+
+        // Shutdown executor
+        shutdown.cancel();
+        let _ = executor_handle.await;
     }
 }
