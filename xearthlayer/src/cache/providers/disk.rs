@@ -1,58 +1,52 @@
-//! On-disk cache provider with internal garbage collection.
+//! On-disk cache provider with LRU index tracking.
 //!
-//! This provider stores cache entries as files on disk and runs a background
-//! GC daemon that periodically evicts the oldest files when the cache exceeds
-//! its size limit.
+//! This provider stores cache entries as files on disk and uses an in-memory
+//! LRU index for efficient garbage collection without filesystem scanning.
 //!
-//! # Key Feature: Self-Contained GC
+//! # Key Changes (v0.4)
 //!
-//! The GC daemon is **owned by the provider** and spawned during construction.
-//! This fixes a critical bug where the GC daemon was previously wired externally
-//! in the CLI and never started in TUI mode (because mounting happened later).
-//!
-//! # Eviction Strategy
-//!
-//! Uses LRU approximation based on file modification time (mtime):
-//! - When cache exceeds limit, oldest files are deleted first
-//! - Eviction targets 90% of limit (leaving 10% headroom for new writes)
-//! - Empty directories are cleaned up after eviction
+//! - **LRU Index**: Uses in-memory index for O(1) cache tracking
+//! - **Reversible Filenames**: Keys encoded as `key.replace(':', '_')` instead of hashing
+//! - **External GC**: GC is managed externally via [`CacheGcJob`], not an internal daemon
 //!
 //! # File Layout
 //!
-//! Files are stored in a flat structure within the cache directory:
+//! Files are stored in a flat structure with reversible names:
 //! ```text
-//! {cache_dir}/{key_hash}.cache
+//! {cache_dir}/{key_with_underscores}.cache
 //! ```
 //!
-//! The key is hashed to create a safe filename that works across all platforms.
+//! Example: `tile:15:12754:5279` → `tile_15_12754_5279.cache`
+//!
+//! # Migration Note
+//!
+//! Caches created with older versions (which used hashed filenames) are not
+//! automatically migrated. Run `xearthlayer cache clear` to start fresh.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
 
-use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::cache::config::DiskProviderConfig;
+use crate::cache::lru_index::LruIndex;
 use crate::cache::traits::{BoxFuture, Cache, GcResult, ServiceCacheError};
 use crate::metrics::MetricsClient;
 
-/// Target percentage of limit after eviction (0.9 = 90%).
-/// This leaves 10% headroom for new writes before the next eviction cycle.
-const EVICTION_TARGET_PERCENTAGE: f64 = 0.9;
-
-/// On-disk cache provider with internal garbage collection.
+/// On-disk cache provider with LRU index tracking.
 ///
-/// This provider spawns a background GC daemon during construction that
-/// periodically evicts old files when the cache exceeds its size limit.
+/// This provider stores cache entries as files and maintains an in-memory
+/// LRU index for efficient garbage collection. GC is handled externally
+/// via `CacheGcJob` rather than an internal daemon.
 ///
-/// # Shutdown
+/// # Lifecycle
 ///
-/// Call `shutdown()` to gracefully stop the GC daemon. The daemon will
-/// finish any in-progress eviction before stopping.
+/// 1. Create via `start()` or `start_with_index()`
+/// 2. Index is populated from disk on startup
+/// 3. External GC scheduler submits `CacheGcJob` when needed
+/// 4. Call `shutdown()` for graceful cleanup
 pub struct DiskCacheProvider {
     /// Cache directory path.
     directory: PathBuf,
@@ -60,30 +54,23 @@ pub struct DiskCacheProvider {
     /// Maximum size in bytes.
     max_size_bytes: AtomicU64,
 
-    /// GC interval.
-    gc_interval: Duration,
-
-    /// Current cached size (approximate, updated during GC).
-    cached_size: AtomicU64,
-
-    /// Current entry count (approximate, updated during GC).
-    cached_count: AtomicU64,
-
-    /// Handle to the GC daemon task.
-    gc_handle: RwLock<Option<JoinHandle<()>>>,
+    /// In-memory LRU index for cache tracking.
+    lru_index: Arc<LruIndex>,
 
     /// Cancellation token for graceful shutdown.
     shutdown: CancellationToken,
 
-    /// Optional metrics client for reporting GC eviction stats.
+    /// Optional metrics client for reporting cache stats.
+    /// Currently unused - reserved for future cache statistics reporting.
+    #[allow(dead_code)]
     metrics_client: Option<MetricsClient>,
 }
 
 impl DiskCacheProvider {
-    /// Start a new disk cache provider with GC daemon.
+    /// Start a new disk cache provider.
     ///
-    /// This creates the cache directory if needed and spawns a background
-    /// task for periodic garbage collection.
+    /// This creates the cache directory if needed and populates the LRU index
+    /// from existing cache files on disk.
     ///
     /// # Arguments
     ///
@@ -91,7 +78,7 @@ impl DiskCacheProvider {
     ///
     /// # Returns
     ///
-    /// A new `DiskCacheProvider` with an active GC daemon.
+    /// A new `DiskCacheProvider` ready for use.
     ///
     /// # Errors
     ///
@@ -104,315 +91,155 @@ impl DiskCacheProvider {
 
         let shutdown = CancellationToken::new();
 
+        // Create LRU index
+        let lru_index = Arc::new(LruIndex::new(config.directory.clone()));
+
         let provider = Arc::new(Self {
             directory: config.directory.clone(),
             max_size_bytes: AtomicU64::new(config.max_size_bytes),
-            gc_interval: config.gc_interval,
-            cached_size: AtomicU64::new(0), // Will be populated by scan_initial_size() or first GC
-            cached_count: AtomicU64::new(0),
-            gc_handle: RwLock::new(None),
-            shutdown: shutdown.clone(),
+            lru_index,
+            shutdown,
             metrics_client: config.metrics_client,
         });
 
-        // Spawn internal GC daemon
-        let gc_provider = Arc::clone(&provider);
-        let gc_handle = tokio::spawn(async move {
-            gc_provider.run_gc_daemon().await;
-        });
-
-        // Store the handle
-        {
-            let mut handle_guard = provider.gc_handle.write().await;
-            *handle_guard = Some(gc_handle);
+        // Populate LRU index from disk
+        match provider.lru_index.populate_from_disk().await {
+            Ok(stats) => {
+                info!(
+                    dir = %config.directory.display(),
+                    files = stats.files_indexed,
+                    size_mb = stats.total_bytes / 1_000_000,
+                    max_mb = config.max_size_bytes / 1_000_000,
+                    "Disk cache provider started"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    dir = %config.directory.display(),
+                    error = %e,
+                    "Failed to populate LRU index from disk, starting empty"
+                );
+            }
         }
+
+        Ok(provider)
+    }
+
+    /// Start a new disk cache provider with an existing LRU index.
+    ///
+    /// Use this when you want to share the LRU index with other components
+    /// (e.g., the GC scheduler).
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Disk cache configuration
+    /// * `lru_index` - Pre-existing LRU index
+    pub async fn start_with_index(
+        config: DiskProviderConfig,
+        lru_index: Arc<LruIndex>,
+    ) -> Result<Arc<Self>, ServiceCacheError> {
+        // Create cache directory if it doesn't exist
+        tokio::fs::create_dir_all(&config.directory)
+            .await
+            .map_err(ServiceCacheError::Io)?;
+
+        let shutdown = CancellationToken::new();
+
+        let provider = Arc::new(Self {
+            directory: config.directory.clone(),
+            max_size_bytes: AtomicU64::new(config.max_size_bytes),
+            lru_index,
+            shutdown,
+            metrics_client: config.metrics_client,
+        });
 
         info!(
             dir = %config.directory.display(),
-            max_bytes = config.max_size_bytes,
-            interval_secs = config.gc_interval.as_secs(),
-            "Disk cache provider started with GC daemon"
+            max_mb = config.max_size_bytes / 1_000_000,
+            "Disk cache provider started with shared LRU index"
         );
 
         Ok(provider)
     }
 
-    /// Scan existing cache size and update cached_size.
+    /// Returns a reference to the LRU index.
     ///
-    /// This should be called after start() to get an accurate initial size
-    /// for metrics display. The scan is done in a blocking task to avoid
-    /// blocking the async runtime.
-    ///
-    /// Returns the total size in bytes.
-    pub async fn scan_initial_size(&self) -> Result<u64, ServiceCacheError> {
-        let directory = self.directory.clone();
-        let initial_size = tokio::task::spawn_blocking(move || {
-            let files = Self::collect_cache_files(&directory);
-            files.iter().map(|(_, _, size)| size).sum::<u64>()
-        })
-        .await
-        .map_err(|e| ServiceCacheError::SpawnError(e.to_string()))?;
-
-        self.cached_size.store(initial_size, Ordering::Relaxed);
-
-        info!(
-            initial_size = initial_size,
-            "Disk cache initial size scanned"
-        );
-
-        Ok(initial_size)
+    /// This can be used by external GC schedulers to query cache state
+    /// and create `CacheGcJob` instances.
+    pub fn lru_index(&self) -> Arc<LruIndex> {
+        Arc::clone(&self.lru_index)
     }
 
-    /// Shutdown the provider, stopping the GC daemon.
+    /// Returns the cache directory path.
+    pub fn directory(&self) -> &PathBuf {
+        &self.directory
+    }
+
+    /// Returns the maximum cache size in bytes.
+    pub fn max_size_bytes(&self) -> u64 {
+        self.max_size_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Shutdown the provider.
     ///
-    /// This method waits for the GC daemon to finish any in-progress work
-    /// before returning.
+    /// This signals any pending operations to stop and cleans up resources.
     pub async fn shutdown(&self) {
         info!("Disk cache provider shutting down");
-
-        // Signal shutdown
         self.shutdown.cancel();
-
-        // Wait for GC daemon to finish
-        let handle = {
-            let mut guard = self.gc_handle.write().await;
-            guard.take()
-        };
-
-        if let Some(handle) = handle {
-            let _ = handle.await;
-        }
-
         info!("Disk cache provider shutdown complete");
     }
 
-    /// Internal GC daemon - runs until shutdown.
-    async fn run_gc_daemon(&self) {
-        info!(
-            dir = %self.directory.display(),
-            max_bytes = self.max_size_bytes.load(Ordering::Relaxed),
-            interval_secs = self.gc_interval.as_secs(),
-            "Disk cache GC daemon started"
-        );
-
-        // Initial GC check on startup
-        if let Err(e) = self.run_gc_cycle().await {
-            warn!(error = %e, "Initial GC cycle failed");
-        }
-
-        // Periodic GC loop
-        loop {
-            tokio::select! {
-                _ = self.shutdown.cancelled() => {
-                    info!("Disk cache GC daemon shutting down");
-                    break;
-                }
-                _ = tokio::time::sleep(self.gc_interval) => {
-                    if let Err(e) = self.run_gc_cycle().await {
-                        warn!(error = %e, "GC cycle failed");
-                    }
-                }
-            }
-        }
-    }
-
-    /// Run a single GC cycle.
-    async fn run_gc_cycle(&self) -> Result<GcResult, ServiceCacheError> {
-        let max_bytes = self.max_size_bytes.load(Ordering::Relaxed);
-        let directory = self.directory.clone();
-
-        // Run in spawn_blocking since we're doing filesystem operations
-        let result =
-            tokio::task::spawn_blocking(move || Self::gc_cycle_blocking(&directory, max_bytes))
-                .await
-                .map_err(|e| ServiceCacheError::SpawnError(e.to_string()))??;
-
-        // Update cached stats
-        self.cached_size.store(
-            result.size_before.saturating_sub(result.bytes_freed),
-            Ordering::Relaxed,
-        );
-
-        if result.entries_removed > 0 {
-            info!(
-                entries_removed = result.entries_removed,
-                bytes_freed = result.bytes_freed,
-                duration_ms = result.duration_ms,
-                "Disk cache GC complete"
-            );
-
-            // Report eviction to metrics system
-            if let Some(ref metrics) = self.metrics_client {
-                metrics.disk_cache_evicted(result.bytes_freed);
-            }
-        }
-
-        Ok(GcResult {
-            entries_removed: result.entries_removed,
-            bytes_freed: result.bytes_freed,
-            duration_ms: result.duration_ms,
-        })
-    }
-
-    /// Blocking GC implementation.
-    fn gc_cycle_blocking(
-        directory: &PathBuf,
-        max_bytes: u64,
-    ) -> Result<GcCycleResult, ServiceCacheError> {
-        let start = Instant::now();
-
-        // Collect all cache files with mtime and size
-        let mut files = Self::collect_cache_files(directory);
-        let total_size: u64 = files.iter().map(|(_, _, size)| size).sum();
-        let file_count = files.len();
-
-        debug!(
-            file_count = file_count,
-            total_size = total_size,
-            limit = max_bytes,
-            "GC cycle scan complete"
-        );
-
-        // Check if eviction is needed
-        if total_size <= max_bytes {
-            return Ok(GcCycleResult {
-                entries_removed: 0,
-                bytes_freed: 0,
-                size_before: total_size,
-                duration_ms: start.elapsed().as_millis() as u64,
-            });
-        }
-
-        // Calculate eviction target (90% of limit)
-        let target_size = (max_bytes as f64 * EVICTION_TARGET_PERCENTAGE) as u64;
+    /// Scan existing cache size and update internal tracking.
+    ///
+    /// This is called automatically during `start()`. Only needed if you
+    /// used `start_with_index()` with an empty index.
+    ///
+    /// Returns the total size in bytes.
+    pub async fn scan_initial_size(&self) -> Result<u64, ServiceCacheError> {
+        let stats =
+            self.lru_index.populate_from_disk().await.map_err(|e| {
+                ServiceCacheError::SpawnError(format!("Failed to scan cache: {}", e))
+            })?;
 
         info!(
-            current_size = total_size,
-            limit = max_bytes,
-            target = target_size,
-            "Disk cache over limit, starting eviction"
+            files = stats.files_indexed,
+            size_mb = stats.total_bytes / 1_000_000,
+            "Disk cache size scanned"
         );
 
-        // Sort by mtime (oldest first) for LRU eviction
-        files.sort_by_key(|(_, mtime, _)| *mtime);
-
-        // Delete oldest files until under target
-        let mut bytes_freed = 0u64;
-        let mut files_deleted = 0usize;
-        let mut remaining_size = total_size;
-
-        for (path, _mtime, size) in files {
-            if remaining_size <= target_size {
-                break;
-            }
-
-            match std::fs::remove_file(&path) {
-                Ok(()) => {
-                    bytes_freed += size;
-                    remaining_size = remaining_size.saturating_sub(size);
-                    files_deleted += 1;
-                }
-                Err(e) => {
-                    debug!(
-                        path = %path.display(),
-                        error = %e,
-                        "Failed to delete cache file during eviction"
-                    );
-                }
-            }
-        }
-
-        // Clean up empty directories
-        Self::cleanup_empty_dirs(directory);
-
-        Ok(GcCycleResult {
-            entries_removed: files_deleted,
-            bytes_freed,
-            size_before: total_size,
-            duration_ms: start.elapsed().as_millis() as u64,
-        })
+        Ok(stats.total_bytes)
     }
 
-    /// Collect all cache files with their mtime and size.
-    fn collect_cache_files(dir: &PathBuf) -> Vec<(PathBuf, SystemTime, u64)> {
-        let mut files = Vec::new();
-        Self::collect_files_recursive(dir, &mut files);
-        files
+    /// Check if garbage collection is needed.
+    ///
+    /// Returns `true` if the cache is over 95% of the maximum size.
+    pub fn needs_gc(&self) -> bool {
+        let current = self.lru_index.total_size();
+        let max = self.max_size_bytes.load(Ordering::Relaxed);
+        let threshold = (max as f64 * 0.95) as u64;
+        current > threshold
     }
 
-    /// Recursively collect files from a directory.
-    fn collect_files_recursive(dir: &PathBuf, files: &mut Vec<(PathBuf, SystemTime, u64)>) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                debug!(
-                    dir = %dir.display(),
-                    error = %e,
-                    "Failed to read directory during GC scan"
-                );
-                return;
-            }
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-
-            if path.is_dir() {
-                Self::collect_files_recursive(&path, files);
-            } else if let Ok(metadata) = entry.metadata() {
-                let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                let size = metadata.len();
-                files.push((path, mtime, size));
-            }
-        }
-    }
-
-    /// Remove empty directories after eviction.
-    fn cleanup_empty_dirs(dir: &PathBuf) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(_) => return,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                // Recurse first to clean up nested empty directories
-                Self::cleanup_empty_dirs(&path);
-                // Try to remove if empty (will fail silently if not empty)
-                let _ = std::fs::remove_dir(&path);
-            }
-        }
-    }
-
-    /// Generate a safe filename from a cache key.
-    fn key_to_filename(key: &str) -> String {
-        // Use a simple hash for safe filenames
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        format!("{:016x}.cache", hasher.finish())
+    /// Returns the target size for GC (80% of max).
+    pub fn gc_target_size(&self) -> u64 {
+        let max = self.max_size_bytes.load(Ordering::Relaxed);
+        (max as f64 * 0.80) as u64
     }
 
     /// Get the file path for a cache key.
+    ///
+    /// Uses reversible encoding: colons replaced with underscores.
     fn key_path(&self, key: &str) -> PathBuf {
-        self.directory.join(Self::key_to_filename(key))
+        self.directory.join(LruIndex::key_to_filename(key))
     }
-}
-
-/// Result of a GC cycle with internal details.
-struct GcCycleResult {
-    entries_removed: usize,
-    bytes_freed: u64,
-    size_before: u64,
-    duration_ms: u64,
 }
 
 impl Cache for DiskCacheProvider {
     fn set(&self, key: &str, value: Vec<u8>) -> BoxFuture<'_, Result<(), ServiceCacheError>> {
         let path = self.key_path(key);
+        let size = value.len() as u64;
+        let key_owned = key.to_string();
+
         Box::pin(async move {
             // Write atomically via temp file
             let temp_path = path.with_extension("tmp");
@@ -422,20 +249,35 @@ impl Cache for DiskCacheProvider {
             tokio::fs::rename(&temp_path, &path)
                 .await
                 .map_err(ServiceCacheError::Io)?;
+
+            // Update LRU index after successful write
+            self.lru_index.record(&key_owned, size);
+
+            debug!(key = %key_owned, size, "Cache set");
             Ok(())
         })
     }
 
     fn get(&self, key: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, ServiceCacheError>> {
         let path = self.key_path(key);
+        let key_owned = key.to_string();
+
         Box::pin(async move {
             match tokio::fs::read(&path).await {
                 Ok(data) => {
-                    // Update mtime to mark as recently used
-                    let _ = tokio::fs::File::open(&path).await;
+                    // Update LRU index access time
+                    self.lru_index.touch(&key_owned);
+                    debug!(key = %key_owned, size = data.len(), "Cache hit");
                     Ok(Some(data))
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // File not on disk - ensure index is clean
+                    if self.lru_index.contains(&key_owned) {
+                        self.lru_index.remove(&key_owned);
+                        debug!(key = %key_owned, "Removed stale index entry");
+                    }
+                    Ok(None)
+                }
                 Err(e) => Err(ServiceCacheError::Io(e)),
             }
         })
@@ -443,9 +285,18 @@ impl Cache for DiskCacheProvider {
 
     fn delete(&self, key: &str) -> BoxFuture<'_, Result<bool, ServiceCacheError>> {
         let path = self.key_path(key);
+        let key_owned = key.to_string();
+
         Box::pin(async move {
+            // Remove from index first
+            self.lru_index.remove(&key_owned);
+
+            // Then delete file
             match tokio::fs::remove_file(&path).await {
-                Ok(()) => Ok(true),
+                Ok(()) => {
+                    debug!(key = %key_owned, "Cache delete");
+                    Ok(true)
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
                 Err(e) => Err(ServiceCacheError::Io(e)),
             }
@@ -453,16 +304,33 @@ impl Cache for DiskCacheProvider {
     }
 
     fn contains(&self, key: &str) -> BoxFuture<'_, Result<bool, ServiceCacheError>> {
+        // Check index first (faster than filesystem)
+        let in_index = self.lru_index.contains(key);
+        if !in_index {
+            return Box::pin(async move { Ok(false) });
+        }
+
+        // Verify file exists (index might be stale)
         let path = self.key_path(key);
-        Box::pin(async move { Ok(path.exists()) })
+        let key_owned = key.to_string();
+
+        Box::pin(async move {
+            if tokio::fs::metadata(&path).await.is_ok() {
+                Ok(true)
+            } else {
+                // File doesn't exist - clean up stale index entry
+                self.lru_index.remove(&key_owned);
+                Ok(false)
+            }
+        })
     }
 
     fn size_bytes(&self) -> u64 {
-        self.cached_size.load(Ordering::Relaxed)
+        self.lru_index.total_size()
     }
 
     fn entry_count(&self) -> u64 {
-        self.cached_count.load(Ordering::Relaxed)
+        self.lru_index.entry_count()
     }
 
     fn max_size_bytes(&self) -> u64 {
@@ -472,16 +340,20 @@ impl Cache for DiskCacheProvider {
     fn set_max_size(&self, size_bytes: u64) -> BoxFuture<'_, Result<(), ServiceCacheError>> {
         Box::pin(async move {
             self.max_size_bytes.store(size_bytes, Ordering::Relaxed);
-
-            // Trigger GC if we might be over the new limit
-            self.run_gc_cycle().await?;
-
             Ok(())
         })
     }
 
     fn gc(&self) -> BoxFuture<'_, Result<GcResult, ServiceCacheError>> {
-        Box::pin(async move { self.run_gc_cycle().await })
+        // GC is now handled externally via CacheGcJob.
+        // This method returns a no-op result.
+        Box::pin(async move {
+            Ok(GcResult {
+                entries_removed: 0,
+                bytes_freed: 0,
+                duration_ms: 0,
+            })
+        })
     }
 }
 
@@ -495,6 +367,7 @@ impl Drop for DiskCacheProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     async fn create_test_provider(max_size: u64) -> (TempDir, Arc<DiskCacheProvider>) {
@@ -502,15 +375,12 @@ mod tests {
         let config = DiskProviderConfig {
             directory: temp_dir.path().to_path_buf(),
             max_size_bytes: max_size,
-            gc_interval: Duration::from_secs(3600), // Long interval for tests
+            gc_interval: Duration::from_secs(3600), // Not used anymore
             provider_name: "test".to_string(),
             metrics_client: None,
         };
 
         let provider = DiskCacheProvider::start(config).await.unwrap();
-
-        // Give GC daemon time to start
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         (temp_dir, provider)
     }
@@ -583,48 +453,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_disk_provider_gc() {
+    async fn test_disk_provider_size_tracking() {
         let (_temp_dir, provider) = create_test_provider(1_000_000).await;
+
+        assert_eq!(provider.size_bytes(), 0);
+        assert_eq!(provider.entry_count(), 0);
 
         provider.set("key1", vec![0u8; 1000]).await.unwrap();
 
-        let result = provider.gc().await.unwrap();
+        assert_eq!(provider.size_bytes(), 1000);
+        assert_eq!(provider.entry_count(), 1);
 
-        // GC should complete without error
-        assert!(result.duration_ms < 5000);
+        provider.set("key2", vec![0u8; 2000]).await.unwrap();
+
+        assert_eq!(provider.size_bytes(), 3000);
+        assert_eq!(provider.entry_count(), 2);
 
         provider.shutdown().await;
     }
 
     #[tokio::test]
-    async fn test_disk_provider_eviction() {
-        // Small cache that will need eviction
-        let (_temp_dir, provider) = create_test_provider(2500).await;
+    async fn test_disk_provider_needs_gc() {
+        let (_temp_dir, provider) = create_test_provider(1000).await;
 
-        // Add files exceeding limit
-        provider.set("key1", vec![0u8; 1000]).await.unwrap();
-        provider.set("key2", vec![0u8; 1000]).await.unwrap();
-        provider.set("key3", vec![0u8; 1000]).await.unwrap();
+        assert!(!provider.needs_gc());
 
-        // Trigger GC
-        let result = provider.gc().await.unwrap();
+        // Add data to exceed 95% threshold (950 bytes)
+        provider.set("key1", vec![0u8; 960]).await.unwrap();
 
-        // Should have evicted some files
-        // (may vary based on timing)
-        assert!(result.entries_removed > 0 || provider.size_bytes() <= 2500);
+        assert!(provider.needs_gc());
+
+        provider.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_disk_provider_lru_index_access() {
+        let (_temp_dir, provider) = create_test_provider(1_000_000).await;
+
+        provider.set("key1", vec![1, 2, 3]).await.unwrap();
+
+        let lru_index = provider.lru_index();
+        assert!(lru_index.contains("key1"));
 
         provider.shutdown().await;
     }
 
     #[tokio::test]
     async fn test_disk_provider_atomic_write() {
-        let (_temp_dir, provider) = create_test_provider(1_000_000).await;
+        let (temp_dir, provider) = create_test_provider(1_000_000).await;
 
         // Write should be atomic (temp file + rename)
         provider.set("key1", vec![1, 2, 3]).await.unwrap();
 
         // No temp files should remain
-        let files: Vec<_> = std::fs::read_dir(provider.directory.as_path())
+        let files: Vec<_> = std::fs::read_dir(temp_dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "tmp"))
@@ -635,21 +517,85 @@ mod tests {
         provider.shutdown().await;
     }
 
-    #[test]
-    fn test_key_to_filename() {
-        let filename = DiskCacheProvider::key_to_filename("tile:15:12754:5279");
-        assert!(filename.ends_with(".cache"));
-        assert!(!filename.contains('/'));
-        assert!(!filename.contains(':'));
+    #[tokio::test]
+    async fn test_disk_provider_stale_index_cleanup_on_get() {
+        let (temp_dir, provider) = create_test_provider(1_000_000).await;
+
+        // Set a value
+        provider.set("key1", vec![1, 2, 3]).await.unwrap();
+        assert!(provider.lru_index().contains("key1"));
+
+        // Manually delete the file (simulating external deletion)
+        let path = temp_dir.path().join("key1.cache");
+        std::fs::remove_file(path).unwrap();
+
+        // Get should return None and clean up index
+        let value = provider.get("key1").await.unwrap();
+        assert!(value.is_none());
+        assert!(!provider.lru_index().contains("key1"));
+
+        provider.shutdown().await;
     }
 
-    #[test]
-    fn test_key_to_filename_deterministic() {
-        let f1 = DiskCacheProvider::key_to_filename("same_key");
-        let f2 = DiskCacheProvider::key_to_filename("same_key");
-        assert_eq!(f1, f2);
+    #[tokio::test]
+    async fn test_disk_provider_stale_index_cleanup_on_contains() {
+        let (temp_dir, provider) = create_test_provider(1_000_000).await;
 
-        let f3 = DiskCacheProvider::key_to_filename("different_key");
-        assert_ne!(f1, f3);
+        // Set a value
+        provider.set("key1", vec![1, 2, 3]).await.unwrap();
+
+        // Manually delete the file
+        let path = temp_dir.path().join("key1.cache");
+        std::fs::remove_file(path).unwrap();
+
+        // Contains should return false and clean up index
+        assert!(!provider.contains("key1").await.unwrap());
+        assert!(!provider.lru_index().contains("key1"));
+
+        provider.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_disk_provider_persistence() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create provider, add data, shutdown
+        {
+            let config = DiskProviderConfig {
+                directory: temp_dir.path().to_path_buf(),
+                max_size_bytes: 1_000_000,
+                gc_interval: Duration::from_secs(3600),
+                provider_name: "test".to_string(),
+                metrics_client: None,
+            };
+            let provider = DiskCacheProvider::start(config).await.unwrap();
+
+            provider
+                .set("persistent", vec![1, 2, 3, 4, 5])
+                .await
+                .unwrap();
+            provider.shutdown().await;
+        }
+
+        // Create new provider, verify data persists
+        {
+            let config = DiskProviderConfig {
+                directory: temp_dir.path().to_path_buf(),
+                max_size_bytes: 1_000_000,
+                gc_interval: Duration::from_secs(3600),
+                provider_name: "test".to_string(),
+                metrics_client: None,
+            };
+            let provider = DiskCacheProvider::start(config).await.unwrap();
+
+            // Index should be populated from disk
+            assert!(provider.lru_index().contains("persistent"));
+            assert_eq!(provider.entry_count(), 1);
+
+            let value = provider.get("persistent").await.unwrap();
+            assert_eq!(value, Some(vec![1, 2, 3, 4, 5]));
+
+            provider.shutdown().await;
+        }
     }
 }

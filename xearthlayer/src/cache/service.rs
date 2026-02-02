@@ -177,6 +177,16 @@ impl CacheService {
         matches!(self.provider_type, ProviderType::Disk)
     }
 
+    /// Get the underlying disk cache provider if this is a disk cache.
+    ///
+    /// Returns `None` for memory caches.
+    ///
+    /// This is useful for accessing disk-specific functionality like
+    /// the LRU index for garbage collection scheduling.
+    pub fn disk_provider(&self) -> Option<Arc<DiskCacheProvider>> {
+        self.disk_provider.clone()
+    }
+
     /// Scan the initial disk cache size.
     ///
     /// For disk caches, this scans the cache directory to get an accurate

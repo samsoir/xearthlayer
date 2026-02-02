@@ -45,7 +45,7 @@ use tracing::info;
 
 use crate::executor::{
     ChannelDdsClient, DaemonMemoryCache, DdsClient, ExecutorDaemon, ExecutorDaemonConfig,
-    TelemetrySink, TracingTelemetrySink,
+    JobSubmitter, TelemetrySink, TracingTelemetrySink,
 };
 use crate::jobs::DdsJobFactory;
 use crate::metrics::MetricsClient;
@@ -87,6 +87,9 @@ impl RuntimeConfig {
 pub struct XEarthLayerRuntime {
     /// DDS client for producers to submit requests.
     dds_client: Arc<ChannelDdsClient>,
+
+    /// Job submitter for generic job submission (e.g., GC jobs).
+    job_submitter: JobSubmitter,
 
     /// Handle to the daemon background task.
     daemon_handle: Option<JoinHandle<()>>,
@@ -180,6 +183,10 @@ impl XEarthLayerRuntime {
         // Create the DDS client for producers
         let dds_client = Arc::new(ChannelDdsClient::new(job_tx));
 
+        // Extract the job submitter before spawning the daemon
+        // This allows external components (like the GC scheduler) to submit jobs
+        let job_submitter = daemon.job_submitter();
+
         // Create shutdown token for coordinating shutdown
         let shutdown_token = CancellationToken::new();
 
@@ -195,6 +202,7 @@ impl XEarthLayerRuntime {
 
         Self {
             dds_client,
+            job_submitter,
             daemon_handle,
             shutdown_token,
         }
@@ -218,6 +226,18 @@ impl XEarthLayerRuntime {
     /// the trait object.
     pub fn channel_dds_client(&self) -> Arc<ChannelDdsClient> {
         Arc::clone(&self.dds_client)
+    }
+
+    /// Get a job submitter for submitting arbitrary jobs to the executor.
+    ///
+    /// This is used by the GC scheduler to submit garbage collection jobs.
+    /// The submitter is cloneable and can be passed to background tasks.
+    ///
+    /// # Returns
+    ///
+    /// A clone of the internal `JobSubmitter` that can submit any `Job` to the executor.
+    pub fn job_submitter(&self) -> JobSubmitter {
+        self.job_submitter.clone()
     }
 
     /// Check if the runtime is still running.

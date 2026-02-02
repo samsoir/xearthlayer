@@ -45,6 +45,7 @@
 
 mod assemble_image;
 mod build_and_cache_dds;
+mod cache_gc_batch;
 mod cache_write;
 mod download_chunks;
 mod encode_dds;
@@ -52,6 +53,10 @@ mod generate_tile_list;
 
 // Primary task types
 pub use build_and_cache_dds::BuildAndCacheDdsTask;
+pub use cache_gc_batch::{
+    get_deleted_count_from_output, get_freed_bytes_from_output, CacheGcBatchTask,
+    OUTPUT_KEY_DELETED_COUNT, OUTPUT_KEY_FREED_BYTES,
+};
 pub use download_chunks::DownloadChunksTask;
 pub use generate_tile_list::GenerateTileListTask;
 

@@ -45,6 +45,7 @@ pub mod service;
 pub mod system;
 pub mod tasks;
 pub mod texture;
+pub mod time;
 pub mod xplane;
 
 /// Version of the XEarthLayer library and CLI.

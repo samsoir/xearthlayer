@@ -43,6 +43,8 @@
 
 // New cache service architecture (Phase 1)
 mod config;
+pub mod gc_scheduler;
+pub mod lru_index;
 pub mod providers;
 mod service;
 mod traits;
@@ -64,6 +66,10 @@ pub use service::CacheService;
 pub use traits::{Cache, GcResult, ServiceCacheError};
 
 // Provider exports (for advanced use cases)
+pub use gc_scheduler::{
+    GcSchedulerDaemon, DEFAULT_CHECK_INTERVAL_SECS, DEFAULT_TARGET_RATIO, DEFAULT_TRIGGER_THRESHOLD,
+};
+pub use lru_index::{CacheEntryMetadata, EvictionCandidate, LruIndex, PopulateStats};
 pub use providers::{DiskCacheProvider, MemoryCacheProvider};
 
 // Domain decorator exports (Phase 2)

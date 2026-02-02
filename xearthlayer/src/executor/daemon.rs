@@ -55,6 +55,7 @@
 //! let response = response_rx.await?;
 //! ```
 
+use crate::coord::TileCoord;
 use crate::executor::{
     ExecutorConfig, JobExecutor, JobStatus, JobSubmitter as ExecutorSubmitter, TelemetrySink,
     TracingTelemetrySink,
@@ -62,9 +63,10 @@ use crate::executor::{
 use crate::jobs::DdsJobFactory;
 use crate::metrics::MetricsClient;
 use crate::runtime::{DdsResponse, JobRequest};
+use dashmap::DashMap;
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::mpsc;
+use std::time::{Duration, Instant};
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -119,6 +121,19 @@ pub trait DaemonMemoryCache: Send + Sync + 'static {
         col: u32,
         zoom: u8,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>;
+
+    /// Checks if a tile exists in the cache without loading data.
+    ///
+    /// This is more efficient than `get` when you only need to know if a tile
+    /// is cached. Default implementation calls `get` and checks for Some.
+    fn contains(
+        &self,
+        row: u32,
+        col: u32,
+        zoom: u8,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async move { self.get(row, col, zoom).await.is_some() })
+    }
 }
 
 /// Blanket implementation for any type implementing the executor's MemoryCache trait.
@@ -137,6 +152,123 @@ where
 }
 
 // =============================================================================
+// Request Coalescing
+// =============================================================================
+
+/// Result broadcast for coalesced requests.
+///
+/// Contains the DDS data and metadata shared between coalesced requests.
+#[derive(Clone, Debug)]
+struct CoalescedDdsResult {
+    /// The DDS data.
+    data: Vec<u8>,
+    /// How long the request took.
+    duration: Duration,
+    /// Whether the job succeeded.
+    job_succeeded: bool,
+}
+
+impl CoalescedDdsResult {
+    fn new(data: Vec<u8>, duration: Duration, job_succeeded: bool) -> Self {
+        Self {
+            data,
+            duration,
+            job_succeeded,
+        }
+    }
+
+    fn into_response(self, cache_hit: bool) -> DdsResponse {
+        DdsResponse::new(self.data, cache_hit, self.duration, self.job_succeeded)
+    }
+}
+
+/// Daemon-level request coalescer.
+///
+/// Tracks in-flight jobs to prevent duplicate work when multiple requests
+/// arrive for the same tile. When a job is already in-flight, new requests
+/// subscribe to the same result instead of creating another job.
+///
+/// This coalescer operates at the daemon level, meaning it coalesces requests
+/// from ALL consumers (FUSE, Prefetch, Prewarm) - not just within a single
+/// consumer like the FUSE-level coalescer.
+struct DaemonCoalescer {
+    /// In-flight jobs: tile -> broadcast sender for result
+    in_flight: DashMap<TileCoord, broadcast::Sender<CoalescedDdsResult>>,
+}
+
+impl DaemonCoalescer {
+    fn new() -> Self {
+        Self {
+            in_flight: DashMap::new(),
+        }
+    }
+
+    /// Attempts to register a request for the given tile.
+    ///
+    /// Returns `Ok(receiver)` if an in-flight job exists (caller should wait).
+    /// Returns `Err(sender)` if this is a new request (caller should process).
+    fn register(
+        &self,
+        tile: TileCoord,
+    ) -> Result<broadcast::Receiver<CoalescedDdsResult>, broadcast::Sender<CoalescedDdsResult>>
+    {
+        match self.in_flight.entry(tile) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                // Job already in-flight, subscribe to result
+                let rx = entry.get().subscribe();
+                debug!(
+                    tile = ?tile,
+                    waiters = entry.get().receiver_count(),
+                    "Request coalesced - waiting for in-flight job"
+                );
+                Ok(rx)
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                // New request, create broadcast channel
+                let (tx, _rx) = broadcast::channel(16);
+                entry.insert(tx.clone());
+                debug!(
+                    tile = ?tile,
+                    in_flight_count = self.in_flight.len(),
+                    "New request - starting job"
+                );
+                Err(tx)
+            }
+        }
+    }
+
+    /// Completes a job, broadcasting the result to all waiters.
+    fn complete(&self, tile: TileCoord, result: CoalescedDdsResult) {
+        if let Some((_, tx)) = self.in_flight.remove(&tile) {
+            let subscriber_count = tx.receiver_count();
+            let _ = tx.send(result);
+
+            if subscriber_count > 0 {
+                debug!(
+                    tile = ?tile,
+                    waiters = subscriber_count,
+                    "Broadcast result to coalesced waiters"
+                );
+            }
+        }
+    }
+
+    /// Cancels a job, removing it from in-flight.
+    #[allow(dead_code)]
+    fn cancel(&self, tile: TileCoord) {
+        if let Some((_, _tx)) = self.in_flight.remove(&tile) {
+            debug!(tile = ?tile, "Cancelled in-flight job");
+        }
+    }
+
+    /// Returns the number of currently in-flight jobs.
+    #[allow(dead_code)]
+    fn in_flight_count(&self) -> usize {
+        self.in_flight.len()
+    }
+}
+
+// =============================================================================
 // Executor Daemon
 // =============================================================================
 
@@ -145,8 +277,8 @@ where
 /// Owns the job executor and receives requests from producers via channel.
 /// Runs as a long-lived background task.
 ///
-/// Request coalescing is handled by the FUSE layer (see `fuse::RequestCoalescer`),
-/// not by this daemon. This daemon receives already-deduplicated requests.
+/// Uses daemon-level request coalescing to prevent duplicate job creation
+/// when multiple consumers (FUSE, Prefetch) request the same tile concurrently.
 ///
 /// # Type Parameters
 ///
@@ -275,16 +407,27 @@ where
         (daemon, request_tx)
     }
 
+    /// Returns a clone of the internal job submitter.
+    ///
+    /// This allows external components (like the GC scheduler) to submit
+    /// arbitrary jobs to the executor. The submitter is cloneable and
+    /// can be passed to background tasks.
+    ///
+    /// # Note
+    ///
+    /// This must be called before `run()` consumes the daemon.
+    pub fn job_submitter(&self) -> ExecutorSubmitter {
+        self.submitter.clone()
+    }
+
     /// Runs the daemon until shutdown is signalled.
     ///
     /// This is the main event loop that:
     /// - Receives new job requests
     /// - Checks cache for hits
+    /// - Uses daemon-level coalescing to prevent duplicate jobs
     /// - Runs jobs via the executor
     /// - Returns results to callers
-    ///
-    /// Note: Request coalescing is handled by the FUSE layer before requests
-    /// reach this daemon. Each request received here is unique.
     pub async fn run(self, shutdown: CancellationToken) {
         info!("Executor daemon starting");
 
@@ -296,6 +439,9 @@ where
             mut request_rx,
             metrics_client,
         } = self;
+
+        // Create shared coalescer for daemon-level request deduplication
+        let coalescer = Arc::new(DaemonCoalescer::new());
 
         // Spawn the executor in a separate task
         let executor_shutdown = shutdown.clone();
@@ -321,6 +467,7 @@ where
                         &submitter,
                         &factory,
                         &memory_cache,
+                        &coalescer,
                         metrics_client.as_ref(),
                     ).await;
                 }
@@ -337,6 +484,7 @@ where
         submitter: &ExecutorSubmitter,
         factory: &Arc<F>,
         memory_cache: &Arc<M>,
+        coalescer: &Arc<DaemonCoalescer>,
         metrics_client: Option<&MetricsClient>,
     ) {
         let start = Instant::now();
@@ -395,6 +543,43 @@ where
             return;
         }
 
+        // Check coalescer for in-flight job
+        match coalescer.register(tile) {
+            Ok(mut receiver) => {
+                // Job already in-flight, wait for result
+                debug!(
+                    tile_row = tile.row,
+                    tile_col = tile.col,
+                    tile_zoom = tile.zoom,
+                    dsf_tile = %dsf_tile,
+                    origin = %origin,
+                    "Coalesced with in-flight job"
+                );
+
+                // Spawn task to wait for coalesced result
+                tokio::spawn(async move {
+                    match receiver.recv().await {
+                        Ok(result) => {
+                            if let Some(tx) = request.response_tx {
+                                let _ = tx.send(result.into_response(false));
+                            }
+                        }
+                        Err(_) => {
+                            // Channel closed without result - job was cancelled or failed
+                            if let Some(tx) = request.response_tx {
+                                let _ = tx.send(DdsResponse::empty(start.elapsed()));
+                            }
+                        }
+                    }
+                });
+                return;
+            }
+            Err(_sender) => {
+                // New request, proceed with job creation
+                // (sender is kept in coalescer's DashMap)
+            }
+        }
+
         // Track cache miss
         debug!(
             tile_row = tile.row,
@@ -409,7 +594,7 @@ where
             client.memory_cache_miss();
         }
 
-        // Create and submit job (coalescing is handled by FUSE layer)
+        // Create and submit job
         let job = factory.create_job(tile, priority);
         let job_id = job.id();
         debug!(job_id = %job_id, tile = ?tile, "Created DDS generation job");
@@ -427,6 +612,7 @@ where
                 }
 
                 let memory_cache = Arc::clone(memory_cache);
+                let coalescer = Arc::clone(coalescer);
                 let cancellation = request.cancellation.clone();
                 let metrics_for_completion = metrics_client.cloned();
                 let dsf_tile_for_log = dsf_tile.clone();
@@ -487,8 +673,15 @@ where
                                 Vec::new()
                             };
 
+                            // Broadcast result to coalesced waiters
+                            let coalesced_result = CoalescedDdsResult::new(
+                                data.clone(),
+                                duration,
+                                success,
+                            );
+                            coalescer.complete(tile, coalesced_result);
+
                             // Create response with job_succeeded flag set correctly
-                            // Even if cache read failed (returned empty), job may have succeeded
                             let response = DdsResponse::new(data, false, duration, success);
 
                             // Send response if requested
@@ -507,6 +700,9 @@ where
                             );
                             handle.kill();
 
+                            // Remove from coalescer so other waiters know job was cancelled
+                            coalescer.cancel(tile);
+
                             if let Some(tx) = request.response_tx {
                                 let _ = tx.send(DdsResponse::empty(start.elapsed()));
                             }
@@ -516,6 +712,9 @@ where
             }
             None => {
                 warn!(tile = ?tile, "Failed to submit job - executor may be shutdown");
+
+                // Remove from coalescer
+                coalescer.cancel(tile);
 
                 if let Some(tx) = request.response_tx {
                     let _ = tx.send(DdsResponse::empty(start.elapsed()));
@@ -533,8 +732,9 @@ where
 mod tests {
     use super::*;
     use crate::coord::TileCoord;
-    use crate::executor::{ErrorPolicy, Job, JobId, JobResult, Priority, Task};
+    use crate::executor::{ErrorPolicy, Job, JobId, JobResult, Priority, Task, TaskContext};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -576,13 +776,40 @@ mod tests {
         }
     }
 
-    /// Mock job factory
-    struct MockJobFactory;
+    /// Mock job factory that tracks job creation count
+    struct MockJobFactory {
+        jobs_created: AtomicUsize,
+    }
 
-    /// Mock job that does nothing
+    impl MockJobFactory {
+        fn new() -> Self {
+            Self {
+                jobs_created: AtomicUsize::new(0),
+            }
+        }
+
+        fn jobs_created(&self) -> usize {
+            self.jobs_created.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Mock job that simulates work with configurable delay and output
     struct MockJob {
         id: JobId,
         priority: Priority,
+        tile: TileCoord,
+        delay: Duration,
+    }
+
+    impl MockJob {
+        fn new(tile: TileCoord, priority: Priority, delay: Duration) -> Self {
+            Self {
+                id: JobId::new(format!("mock-{}_{}_ZL{}", tile.row, tile.col, tile.zoom)),
+                priority,
+                tile,
+                delay,
+            }
+        }
     }
 
     impl Job for MockJob {
@@ -603,7 +830,11 @@ mod tests {
         }
 
         fn create_tasks(&self) -> Vec<Box<dyn Task>> {
-            vec![] // No tasks - completes immediately
+            // Create a task that simulates work and produces output
+            vec![Box::new(MockDdsTask {
+                tile: self.tile,
+                delay: self.delay,
+            })]
         }
 
         fn on_complete(&self, result: &JobResult) -> JobStatus {
@@ -615,12 +846,47 @@ mod tests {
         }
     }
 
+    /// Mock task that simulates DDS generation with delay
+    struct MockDdsTask {
+        tile: TileCoord,
+        delay: Duration,
+    }
+
+    impl Task for MockDdsTask {
+        fn name(&self) -> &str {
+            // Must match the name used in executor.rs:348 to extract output_data
+            "BuildAndCacheDds"
+        }
+
+        fn resource_type(&self) -> crate::executor::ResourceType {
+            crate::executor::ResourceType::CPU
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a mut TaskContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::executor::TaskResult> + Send + 'a>,
+        > {
+            let delay = self.delay;
+            let tile = self.tile;
+            Box::pin(async move {
+                // Simulate work
+                tokio::time::sleep(delay).await;
+                // Return DDS data
+                let mut output = crate::executor::TaskOutput::new();
+                let data = format!("DDS-{}-{}-{}", tile.row, tile.col, tile.zoom).into_bytes();
+                output.set("dds_data", data);
+                crate::executor::TaskResult::SuccessWithOutput(output)
+            })
+        }
+    }
+
     impl DdsJobFactory for MockJobFactory {
         fn create_job(&self, tile: TileCoord, priority: Priority) -> Box<dyn Job> {
-            Box::new(MockJob {
-                id: JobId::new(format!("mock-{}_{}_ZL{}", tile.row, tile.col, tile.zoom)),
-                priority,
-            })
+            self.jobs_created.fetch_add(1, Ordering::SeqCst);
+            // Use 50ms delay to simulate real job timing
+            Box::new(MockJob::new(tile, priority, Duration::from_millis(50)))
         }
     }
 
@@ -632,7 +898,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_daemon_creation() {
-        let factory = Arc::new(MockJobFactory);
+        let factory = Arc::new(MockJobFactory::new());
         let cache = Arc::new(MockMemoryCache::new());
 
         let (daemon, tx) = ExecutorDaemon::new(ExecutorDaemonConfig::default(), factory, cache);
@@ -647,7 +913,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_hit_fast_path() {
-        let factory = Arc::new(MockJobFactory);
+        let factory = Arc::new(MockJobFactory::new());
         let cache = Arc::new(MockMemoryCache::new());
 
         // Pre-populate cache
@@ -685,7 +951,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prefetch_request_no_response() {
-        let factory = Arc::new(MockJobFactory);
+        let factory = Arc::new(MockJobFactory::new());
         let cache = Arc::new(MockMemoryCache::new());
 
         let config = ExecutorDaemonConfig::default();
@@ -712,7 +978,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancelled_request_returns_empty() {
-        let factory = Arc::new(MockJobFactory);
+        let factory = Arc::new(MockJobFactory::new());
         let cache = Arc::new(MockMemoryCache::new());
 
         let config = ExecutorDaemonConfig::default();
@@ -738,6 +1004,209 @@ mod tests {
             .unwrap();
 
         assert!(!response.has_data());
+
+        shutdown.cancel();
+        let _ = daemon_handle.await;
+    }
+
+    // =========================================================================
+    // Request Coalescing Tests (Bug 4)
+    // =========================================================================
+    //
+    // These tests verify that concurrent requests for the same tile are
+    // coalesced into a single job execution.
+
+    #[tokio::test]
+    async fn test_concurrent_requests_same_tile_create_one_job() {
+        // GIVEN: A daemon with a factory that tracks job creation count
+        let factory = Arc::new(MockJobFactory::new());
+        let cache = Arc::new(MockMemoryCache::new());
+
+        let config = ExecutorDaemonConfig::default();
+        let (daemon, tx) = ExecutorDaemon::new(config, Arc::clone(&factory), cache);
+
+        let shutdown = CancellationToken::new();
+        let shutdown_clone = shutdown.clone();
+
+        let daemon_handle = tokio::spawn(async move {
+            daemon.run(shutdown_clone).await;
+        });
+
+        // WHEN: We send 5 concurrent requests for the same tile
+        let tile = test_tile();
+        let mut receivers = Vec::new();
+
+        for _ in 0..5 {
+            let (request, rx) = JobRequest::fuse(tile, CancellationToken::new());
+            tx.send(request).await.unwrap();
+            receivers.push(rx);
+        }
+
+        // Wait for all responses
+        for rx in receivers {
+            let response = tokio::time::timeout(Duration::from_secs(2), rx)
+                .await
+                .expect("Response timeout")
+                .expect("Response channel closed");
+
+            // All should get valid data
+            assert!(response.has_data(), "All waiters should receive data");
+        }
+
+        // THEN: Only ONE job should have been created (coalescing worked)
+        assert_eq!(
+            factory.jobs_created(),
+            1,
+            "Concurrent requests for same tile should create only one job"
+        );
+
+        shutdown.cancel();
+        let _ = daemon_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_different_tiles_create_separate_jobs() {
+        // GIVEN: A daemon with a factory that tracks job creation count
+        let factory = Arc::new(MockJobFactory::new());
+        let cache = Arc::new(MockMemoryCache::new());
+
+        let config = ExecutorDaemonConfig::default();
+        let (daemon, tx) = ExecutorDaemon::new(config, Arc::clone(&factory), cache);
+
+        let shutdown = CancellationToken::new();
+        let shutdown_clone = shutdown.clone();
+
+        let daemon_handle = tokio::spawn(async move {
+            daemon.run(shutdown_clone).await;
+        });
+
+        // WHEN: We send requests for 3 different tiles
+        let mut receivers = Vec::new();
+
+        for i in 0..3 {
+            let tile = TileCoord {
+                row: 100 + i,
+                col: 200,
+                zoom: 14,
+            };
+            let (request, rx) = JobRequest::fuse(tile, CancellationToken::new());
+            tx.send(request).await.unwrap();
+            receivers.push(rx);
+        }
+
+        // Wait for all responses
+        for rx in receivers {
+            let _ = tokio::time::timeout(Duration::from_secs(2), rx)
+                .await
+                .expect("Response timeout")
+                .expect("Response channel closed");
+        }
+
+        // THEN: 3 separate jobs should have been created
+        assert_eq!(
+            factory.jobs_created(),
+            3,
+            "Different tiles should each create their own job"
+        );
+
+        shutdown.cancel();
+        let _ = daemon_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_coalesced_requests_all_receive_same_result() {
+        // GIVEN: A daemon
+        let factory = Arc::new(MockJobFactory::new());
+        let cache = Arc::new(MockMemoryCache::new());
+
+        let config = ExecutorDaemonConfig::default();
+        let (daemon, tx) = ExecutorDaemon::new(config, Arc::clone(&factory), cache);
+
+        let shutdown = CancellationToken::new();
+        let shutdown_clone = shutdown.clone();
+
+        let daemon_handle = tokio::spawn(async move {
+            daemon.run(shutdown_clone).await;
+        });
+
+        // WHEN: We send concurrent requests for the same tile
+        let tile = test_tile();
+        let mut receivers = Vec::new();
+
+        for _ in 0..3 {
+            let (request, rx) = JobRequest::fuse(tile, CancellationToken::new());
+            tx.send(request).await.unwrap();
+            receivers.push(rx);
+        }
+
+        // Collect all responses
+        let mut responses = Vec::new();
+        for rx in receivers {
+            let response = tokio::time::timeout(Duration::from_secs(2), rx)
+                .await
+                .expect("Response timeout")
+                .expect("Response channel closed");
+            responses.push(response);
+        }
+
+        // THEN: All responses should have the same data
+        let first_data = &responses[0].data;
+        for response in &responses[1..] {
+            assert_eq!(
+                &response.data, first_data,
+                "All coalesced requests should receive identical data"
+            );
+        }
+
+        shutdown.cancel();
+        let _ = daemon_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_sequential_requests_after_completion_create_new_jobs() {
+        // GIVEN: A daemon
+        let factory = Arc::new(MockJobFactory::new());
+        let cache = Arc::new(MockMemoryCache::new());
+
+        let config = ExecutorDaemonConfig::default();
+        let (daemon, tx) = ExecutorDaemon::new(config, Arc::clone(&factory), cache);
+
+        let shutdown = CancellationToken::new();
+        let shutdown_clone = shutdown.clone();
+
+        let daemon_handle = tokio::spawn(async move {
+            daemon.run(shutdown_clone).await;
+        });
+
+        let tile = test_tile();
+
+        // WHEN: We send a request, wait for it to complete, then send another
+        let (request1, rx1) = JobRequest::fuse(tile, CancellationToken::new());
+        tx.send(request1).await.unwrap();
+
+        let response1 = tokio::time::timeout(Duration::from_secs(2), rx1)
+            .await
+            .expect("Response 1 timeout")
+            .expect("Response 1 channel closed");
+        assert!(response1.has_data());
+
+        // First job completed, now send second request
+        let (request2, rx2) = JobRequest::fuse(tile, CancellationToken::new());
+        tx.send(request2).await.unwrap();
+
+        let response2 = tokio::time::timeout(Duration::from_secs(2), rx2)
+            .await
+            .expect("Response 2 timeout")
+            .expect("Response 2 channel closed");
+        assert!(response2.has_data());
+
+        // THEN: Two separate jobs should have been created
+        // (unless cache hit on second - but our mock cache is empty)
+        assert_eq!(
+            factory.jobs_created(),
+            2,
+            "Sequential requests after completion should create new jobs"
+        );
 
         shutdown.cancel();
         let _ = daemon_handle.await;

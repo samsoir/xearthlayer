@@ -182,6 +182,18 @@ impl CacheLayer {
         self.disk_service.cache()
     }
 
+    /// Get the disk cache provider for GC scheduler integration.
+    ///
+    /// Returns the underlying `DiskCacheProvider` which provides access to:
+    /// - LRU index for cache size tracking
+    /// - GC configuration (needs_gc, gc_target_size)
+    /// - Cache directory path
+    ///
+    /// Returns `None` if the disk service is not a disk cache (shouldn't happen).
+    pub fn disk_provider(&self) -> Option<Arc<crate::cache::DiskCacheProvider>> {
+        self.disk_service.disk_provider()
+    }
+
     /// Scan and report the initial disk cache size.
     ///
     /// This scans the disk cache directory to count existing cached data.
