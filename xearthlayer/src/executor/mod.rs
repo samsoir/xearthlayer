@@ -112,8 +112,6 @@ mod concurrency;
 mod context;
 mod daemon;
 mod download_config;
-#[allow(clippy::module_inception)]
-mod executor;
 mod handle;
 mod job;
 mod policy;
@@ -123,6 +121,16 @@ mod storage_limiter;
 mod task;
 mod telemetry;
 mod traits;
+
+// Executor core - split into focused modules
+mod active_job;
+mod config;
+mod core;
+mod dispatch;
+mod lifecycle;
+mod signals;
+mod submitter;
+mod watchdog;
 
 // Re-export public types
 
@@ -162,11 +170,13 @@ pub use queue::{PriorityQueue, QueuedTask};
 // Job concurrency limits
 pub use concurrency::{JobConcurrencyLimits, DEFAULT_TILE_GENERATION_LIMIT, TILE_GENERATION_GROUP};
 
-// Executor
-pub use executor::{
-    ExecutorConfig, JobExecutor, JobSubmitter, DEFAULT_JOB_CHANNEL_CAPACITY,
-    DEFAULT_MAX_CONCURRENT_TASKS, DEFAULT_SIGNAL_CHANNEL_CAPACITY,
+// Executor (split into focused modules)
+pub use config::{
+    ExecutorConfig, DEFAULT_JOB_CHANNEL_CAPACITY, DEFAULT_MAX_CONCURRENT_TASKS,
+    DEFAULT_SIGNAL_CHANNEL_CAPACITY,
 };
+pub use core::JobExecutor;
+pub use submitter::JobSubmitter;
 
 // Client (for daemon architecture)
 pub use client::{ChannelDdsClient, DdsClient, DdsClientError};
