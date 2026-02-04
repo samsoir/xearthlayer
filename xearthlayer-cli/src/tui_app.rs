@@ -153,8 +153,7 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
 
     // Wire in runtime health for TUI display
     if let Some(runtime_health) = orchestrator.runtime_health() {
-        let max_concurrent_jobs = orchestrator.max_concurrent_jobs();
-        dashboard = dashboard.with_runtime_health(runtime_health, max_concurrent_jobs);
+        dashboard = dashboard.with_runtime_health(runtime_health);
     }
 
     // Wire in tile progress tracker for active tile display

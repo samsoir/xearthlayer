@@ -4,10 +4,10 @@
 //! - **Primitives**: Reusable low-level UI components (sparklines, progress bars, formatters)
 //! - **Panel Widgets**: Higher-level widgets that compose primitives
 //!
-//! ## Layout Widgets (v0.3.0)
+//! ## Layout Widgets (v0.3.1)
 //!
-//! - `PrefetchSystemWidget` - Prefetch status (status, mode, loading tiles)
-//! - `ScenerySystemWidget` - 2-column tile requests/processing
+//! - `PrefetchSystemWidget` - Prefetch status (status and mode)
+//! - `ScenerySystemWidget` - 3-column: REQUESTS | QUEUE | PROCESSING
 //! - `InputOutputWidget` - 2-column network/disk I/O
 //! - `CacheWidgetCompact` - Cache display with hit rates and sizes
 
@@ -19,7 +19,6 @@ pub mod network;
 mod prefetch_system;
 pub mod primitives;
 mod scenery_system;
-mod tile_progress;
 
 // Core widget exports
 pub use cache::{CacheConfig, CacheWidgetCompact};
@@ -30,7 +29,6 @@ pub use aircraft_position::AircraftPositionWidget;
 pub use input_output::{DiskHistory, InputOutputWidget};
 pub use prefetch_system::PrefetchSystemWidget;
 pub use scenery_system::{SceneryHistory, ScenerySystemWidget};
-pub use tile_progress::TileProgressWidget;
 
 // Legacy widgets (deprecated in v0.3.0, still used in render_sections.rs)
 #[deprecated(since = "0.3.0", note = "Use ScenerySystemWidget instead")]

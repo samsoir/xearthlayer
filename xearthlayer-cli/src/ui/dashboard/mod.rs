@@ -64,8 +64,6 @@ pub struct Dashboard {
     prefetch_status: Option<Arc<SharedPrefetchStatus>>,
     /// Optional runtime health for display.
     runtime_health: Option<SharedRuntimeHealth>,
-    /// Maximum concurrent jobs for the control plane display.
-    max_concurrent_jobs: usize,
     /// Quit confirmation state - Some(timestamp) when awaiting confirmation.
     quit_confirmation: Option<Instant>,
     /// Background prewarm status (None = no prewarm, Some = prewarm in progress or complete).
@@ -109,7 +107,6 @@ impl Dashboard {
             spinner_frame: 0,
             prefetch_status: None,
             runtime_health: None,
-            max_concurrent_jobs: 0,
             quit_confirmation: None,
             prewarm_status: None,
             aircraft_position: None,
@@ -124,13 +121,8 @@ impl Dashboard {
     }
 
     /// Set the runtime health source for display.
-    pub fn with_runtime_health(
-        mut self,
-        health: SharedRuntimeHealth,
-        max_concurrent_jobs: usize,
-    ) -> Self {
+    pub fn with_runtime_health(mut self, health: SharedRuntimeHealth) -> Self {
         self.runtime_health = Some(health);
-        self.max_concurrent_jobs = max_concurrent_jobs;
         self
     }
 
@@ -240,7 +232,6 @@ impl Dashboard {
 
         // Get control plane health if available
         let control_plane_snapshot = self.runtime_health.as_ref().map(|h| h.snapshot());
-        let max_concurrent_jobs = self.max_concurrent_jobs;
 
         // Clone histories for use in closure
         let scenery_history = self.scenery_history.clone();
@@ -286,7 +277,6 @@ impl Dashboard {
                 &prefetch_snapshot,
                 &aircraft_position_status,
                 control_plane_snapshot.as_ref(),
-                max_concurrent_jobs,
                 confirmation_remaining,
                 prewarm_status.as_ref(),
                 prewarm_spinner,

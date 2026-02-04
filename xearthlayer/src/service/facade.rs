@@ -318,6 +318,9 @@ impl XEarthLayerService {
         let dds_encoder = builder::create_encoder(&config);
 
         // 6. Create XEarthLayer runtime with cache bridges
+        // Clone metrics_client before passing to RuntimeBuilder (we need it for GC daemon)
+        let gc_metrics_client = metrics_client.clone();
+
         let xel_runtime = RuntimeBuilder::new(
             &provider_name,
             config.texture().format(),
@@ -340,7 +343,8 @@ impl XEarthLayerService {
             let cache_dir = disk_provider.directory().to_path_buf();
             let max_size = disk_provider.max_size_bytes();
 
-            let gc_daemon = GcSchedulerDaemon::new(lru_index, cache_dir, max_size, job_submitter);
+            let gc_daemon = GcSchedulerDaemon::new(lru_index, cache_dir, max_size, job_submitter)
+                .with_metrics(gc_metrics_client);
 
             let gc_shutdown_clone = gc_shutdown.clone();
             let gc_handle = runtime_handle.spawn(async move {

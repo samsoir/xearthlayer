@@ -26,13 +26,6 @@ impl<'a> PrefetchSystemWidget<'a> {
         Self { mode, stats }
     }
 
-    /// Format tile coordinate as compact string (e.g., "+102+40").
-    fn format_tile_coord(lat: i32, lon: i32) -> String {
-        let lat_sign = if lat >= 0 { "+" } else { "" };
-        let lon_sign = if lon >= 0 { "+" } else { "" };
-        format!("{}{}{}{}", lat_sign, lat, lon_sign, lon)
-    }
-
     /// Get the status text and color based on current state.
     fn status_info(&self) -> (&'static str, Color) {
         if let Some(stats) = self.stats {
@@ -91,76 +84,21 @@ impl Widget for PrefetchSystemWidget<'_> {
         let mode_text = self.mode_text();
         let mode_color = self.mode_color();
 
-        // Row 1: Status with indicator
+        // Row 1: Status with indicator (3-char indent for alignment)
         let status_line = Line::from(vec![
-            Span::styled("Status:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Status:  ", Style::default().fg(Color::DarkGray)),
             Span::styled("● ", Style::default().fg(status_color)),
             Span::styled(status_text, Style::default().fg(status_color)),
         ]);
 
-        // Row 2: Mode
+        // Row 2: Mode (3-char indent for alignment)
         let mode_line = Line::from(vec![
-            Span::styled("Mode:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Mode:    ", Style::default().fg(Color::DarkGray)),
             Span::styled(mode_text, Style::default().fg(mode_color)),
         ]);
 
-        // Row 3: Loading tiles (or stats summary if no loading tiles)
-        let loading_line = if let Some(stats) = self.stats {
-            if !stats.loading_tiles.is_empty() {
-                // Show loading tiles
-                let tiles_str: Vec<String> = stats
-                    .loading_tiles
-                    .iter()
-                    .take(10) // Limit to 10 for display
-                    .map(|(lat, lon)| Self::format_tile_coord(*lat, *lon))
-                    .collect();
-                let tiles_display = tiles_str.join(", ");
-                let more = if stats.loading_tiles.len() > 10 {
-                    format!(" +{} more", stats.loading_tiles.len() - 10)
-                } else {
-                    String::new()
-                };
-
-                Line::from(vec![
-                    Span::styled("Loading: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(tiles_display, Style::default().fg(Color::Yellow)),
-                    Span::styled(more, Style::default().fg(Color::DarkGray)),
-                ])
-            } else {
-                // Show stats summary when no tiles loading
-                Line::from(vec![
-                    Span::styled("Stats:   ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{}/cyc", stats.tiles_submitted_last_cycle),
-                        Style::default().fg(Color::White),
-                    ),
-                    Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("↑", Style::default().fg(Color::Green)),
-                    Span::styled(
-                        format!("{}", stats.cache_hits),
-                        Style::default().fg(Color::Green),
-                    ),
-                    Span::styled(" hits", Style::default().fg(Color::DarkGray)),
-                    Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("⊘", Style::default().fg(Color::Yellow)),
-                    Span::styled(
-                        format!("{}", stats.ttl_skipped),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::styled(" skipped", Style::default().fg(Color::DarkGray)),
-                ])
-            }
-        } else {
-            Line::from(vec![
-                Span::styled("Loading: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "Waiting for prefetch data...",
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])
-        };
-
-        let text = vec![status_line, mode_line, loading_line];
+        // Only show Status and Mode (removed Loading/Stats line per user feedback)
+        let text = vec![status_line, mode_line];
         let paragraph = Paragraph::new(text);
         paragraph.render(area, buf);
     }

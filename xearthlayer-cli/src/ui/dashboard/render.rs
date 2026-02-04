@@ -2,18 +2,18 @@
 //!
 //! This module contains the top-level layout orchestration and header rendering.
 //!
-//! ## Layout v0.3.0
+//! ## Layout v0.3.1
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────┐
 //! │ Header (3 lines)                                        │
 //! ├─────────────────────────────────────────────────────────┤
-//! │ Aircraft Position (4 lines)                             │
+//! │ Aircraft Position (5 lines)                             │
 //! ├─────────────────────────────────────────────────────────┤
-//! │ Prefetch System (4 lines)                               │
+//! │ Prefetch System (5 lines)                               │
 //! ├─────────────────────────────────────────────────────────┤
-//! │ Scenery System (8 lines) - 2-column                     │
-//! │ TILE REQUESTS        │ TILE PROCESSING                  │
+//! │ Scenery System (8 lines) - 3-column                     │
+//! │ TILE REQUESTS   │   QUEUE (3/12)   │  TILE PROCESSING   │
 //! ├─────────────────────────────────────────────────────────┤
 //! │ Input/Output (8 lines) - 2-column                       │
 //! │ NETWORK              │ DISK                             │
@@ -40,7 +40,7 @@ use super::state::PrewarmProgress;
 use super::utils::format_duration;
 use crate::ui::widgets::{
     AircraftPositionWidget, CacheConfig, CacheWidgetCompact, DiskHistory, InputOutputWidget,
-    NetworkHistory, PrefetchSystemWidget, SceneryHistory, ScenerySystemWidget, TileProgressWidget,
+    NetworkHistory, PrefetchSystemWidget, SceneryHistory, ScenerySystemWidget,
 };
 use xearthlayer::aircraft_position::AircraftPositionStatus;
 
@@ -63,7 +63,6 @@ pub fn render_ui(
     prefetch_snapshot: &PrefetchStatusSnapshot,
     aircraft_position_status: &AircraftPositionStatus,
     control_plane_snapshot: Option<&HealthSnapshot>,
-    max_concurrent_jobs: usize,
     confirmation_remaining: Option<Duration>,
     prewarm_status: Option<&PrewarmProgress>,
     prewarm_spinner: Option<char>,
@@ -71,16 +70,15 @@ pub fn render_ui(
 ) {
     let size = frame.area();
 
-    // New v0.3.0 layout: 7 sections (added Active Tiles)
+    // Layout v0.3.1: 6 sections (Active Tiles moved into Scenery System)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(0)
         .constraints([
             Constraint::Length(3), // Header
-            Constraint::Length(5), // Aircraft Position (3 content lines + border + margin)
-            Constraint::Length(4), // Prefetch System
-            Constraint::Length(6), // Active Tiles (progress bars)
-            Constraint::Length(8), // Scenery System (2-column)
+            Constraint::Length(5), // Aircraft Position (3 content lines + border + padding)
+            Constraint::Length(4), // Prefetch System (2 content lines + border + padding)
+            Constraint::Length(8), // Scenery System (3-column: REQUESTS | QUEUE | PROCESSING)
             Constraint::Length(8), // Input/Output (2-column)
             Constraint::Length(6), // Caches
             Constraint::Min(0),    // Padding
@@ -93,13 +91,10 @@ pub fn render_ui(
     // 2. Aircraft Position (now using APT module)
     render_aircraft_position(frame, chunks[1], aircraft_position_status);
 
-    // 3. Prefetch System (new panel)
+    // 3. Prefetch System (with restored padding)
     render_prefetch_system(frame, chunks[2], prefetch_snapshot);
 
-    // 4. Active Tiles (progress bars for tiles being generated)
-    render_active_tiles(frame, chunks[3], tile_progress_entries);
-
-    // 5. Scenery System (replaces Control Plane + Pipeline)
+    // 4. Scenery System (3-column: REQUESTS | QUEUE | PROCESSING)
     let scenery_block = Block::default()
         .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -107,16 +102,17 @@ pub fn render_ui(
             " Scenery System ",
             Style::default().fg(Color::Blue),
         ));
-    frame.render_widget(scenery_block, chunks[4]);
-    let scenery_inner = inner_rect(chunks[4], 1, 1);
+    frame.render_widget(scenery_block, chunks[3]);
+    let scenery_inner = inner_rect(chunks[3], 1, 1);
     frame.render_widget(
-        ScenerySystemWidget::new(snapshot, max_concurrent_jobs)
+        ScenerySystemWidget::new(snapshot)
             .with_health(control_plane_snapshot)
-            .with_history(scenery_history),
+            .with_history(scenery_history)
+            .with_tile_progress(tile_progress_entries),
         scenery_inner,
     );
 
-    // 6. Input/Output (replaces Network + Chunk Tasks)
+    // 5. Input/Output (replaces Network + Chunk Tasks)
     let io_block = Block::default()
         .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -124,21 +120,21 @@ pub fn render_ui(
             " Input / Output ",
             Style::default().fg(Color::Blue),
         ));
-    frame.render_widget(io_block, chunks[5]);
-    let io_inner = inner_rect(chunks[5], 1, 1);
+    frame.render_widget(io_block, chunks[4]);
+    let io_inner = inner_rect(chunks[4], 1, 1);
     frame.render_widget(
         InputOutputWidget::new(snapshot, network_history, provider_name)
             .with_disk_history(disk_history),
         io_inner,
     );
 
-    // 7. Caches (compact format)
+    // 6. Caches (compact format)
     let cache_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(" Caches ", Style::default().fg(Color::Blue)));
-    frame.render_widget(cache_block, chunks[6]);
-    let cache_inner = inner_rect(chunks[6], 1, 1);
+    frame.render_widget(cache_block, chunks[5]);
+    let cache_inner = inner_rect(chunks[5], 1, 1);
     frame.render_widget(
         CacheWidgetCompact::new(snapshot).with_config(cache_config.clone()),
         cache_inner,
@@ -191,22 +187,6 @@ fn render_prefetch_system(frame: &mut Frame, area: Rect, prefetch: &PrefetchStat
         PrefetchSystemWidget::new(prefetch.prefetch_mode, prefetch.detailed_stats.as_ref()),
         inner,
     );
-}
-
-/// Render the active tiles panel showing progress bars for tiles being generated.
-fn render_active_tiles(frame: &mut Frame, area: Rect, entries: &[TileProgressEntry]) {
-    let block = Block::default()
-        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            " Active Tiles ",
-            Style::default().fg(Color::Cyan),
-        ));
-
-    frame.render_widget(block, area);
-    let inner = inner_rect(area, 1, 1);
-
-    frame.render_widget(TileProgressWidget::new(entries).with_max_entries(4), inner);
 }
 
 /// Render the quit confirmation overlay banner.
