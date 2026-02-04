@@ -83,7 +83,7 @@ See [Getting Started](docs/getting-started.md) for the complete guide.
 
 XEarthLayer provides a real-time terminal dashboard showing cache status, download activity, and prefetch progress:
 
-![XEarthLayer CLI Dashboard](docs/images/xearthlayer-v0.2.8.png)
+![XEarthLayer CLI Dashboard](docs/images/xearthlayer-v0.3.0.png)
 
 ## XEarthLayer Regional Scenery Package Project
 
