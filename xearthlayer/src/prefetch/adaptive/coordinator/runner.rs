@@ -67,7 +67,7 @@ impl Prefetcher for AdaptivePrefetchCoordinator {
                             continue;
                         }
 
-                        self.process_telemetry(&state);
+                        self.process_telemetry(&state).await;
                         last_cycle = Instant::now();
                     }
 

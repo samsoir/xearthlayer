@@ -793,7 +793,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         offset: u64,
         _lock_owner: u64,
     ) -> Fuse3InternalResult<ReplyDirectoryPlus<Self::DirEntryPlusStream<'_>>> {
-        tracing::info!(ino = ino, offset = offset, "FUSE readdirplus called");
+        tracing::debug!(ino = ino, offset = offset, "FUSE readdirplus called");
 
         // Get virtual path for this directory
         let virtual_path = if ino == 1 {
@@ -902,7 +902,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         ino: u64,
         _flags: u32,
     ) -> Fuse3InternalResult<ReplyOpen> {
-        tracing::info!(ino = ino, "FUSE opendir called");
+        tracing::debug!(ino = ino, "FUSE opendir called");
         // Return success with fh=0 for stateless directory I/O
         Ok(ReplyOpen { fh: 0, flags: 0 })
     }

@@ -318,10 +318,18 @@ impl LruIndex {
             }
         }
 
-        tracing::info!(
+        // Calculate average file size for diagnostics
+        let avg_size_kb = if stats.files_indexed > 0 {
+            (stats.total_bytes / stats.files_indexed) / 1_000
+        } else {
+            0
+        };
+
+        tracing::debug!(
             files = stats.files_indexed,
             skipped = stats.skipped_unparseable,
             total_size_mb = stats.total_bytes / 1_000_000,
+            avg_size_kb = avg_size_kb,
             "LRU index populated from disk"
         );
 

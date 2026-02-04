@@ -46,6 +46,7 @@
 //! let result = handle.wait().await;
 //! ```
 
+use super::concurrency::JobConcurrencyLimits;
 use super::context::{SharedTaskOutputs, SpawnedChildJob, TaskContext};
 use super::handle::{JobHandle, JobStatus, Signal};
 use super::job::{Job, JobId, JobResult};
@@ -59,6 +60,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -100,6 +102,13 @@ pub struct ExecutorConfig {
 
     /// Maximum concurrent tasks the executor will dispatch.
     pub max_concurrent_tasks: usize,
+
+    /// Job concurrency limits by group.
+    ///
+    /// Jobs can declare a concurrency group via `Job::concurrency_group()`.
+    /// This limits how many jobs in that group can run simultaneously,
+    /// creating back-pressure for balanced pipeline flow.
+    pub job_concurrency_limits: JobConcurrencyLimits,
 }
 
 impl Default for ExecutorConfig {
@@ -108,6 +117,7 @@ impl Default for ExecutorConfig {
             resource_pools: ResourcePoolConfig::default(),
             job_channel_capacity: DEFAULT_JOB_CHANNEL_CAPACITY,
             max_concurrent_tasks: DEFAULT_MAX_CONCURRENT_TASKS,
+            job_concurrency_limits: JobConcurrencyLimits::new(),
         }
     }
 }
@@ -118,6 +128,7 @@ impl From<&crate::config::ExecutorSettings> for ExecutorConfig {
             resource_pools: ResourcePoolConfig::from(settings),
             job_channel_capacity: settings.job_channel_capacity,
             max_concurrent_tasks: settings.max_concurrent_tasks,
+            job_concurrency_limits: JobConcurrencyLimits::new(),
         }
     }
 }
@@ -272,6 +283,12 @@ struct ActiveJob {
 
     /// Result holder shared with the JobHandle for returning job output.
     result_holder: std::sync::Arc<tokio::sync::Mutex<Option<JobResult>>>,
+
+    /// Concurrency group permit (RAII - auto-releases when job completes).
+    /// Jobs with a concurrency group hold this permit for their entire duration,
+    /// limiting how many jobs in that group can run simultaneously.
+    #[allow(dead_code)]
+    concurrency_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl ActiveJob {
@@ -303,6 +320,7 @@ impl ActiveJob {
             retry_counts: HashMap::new(),
             parent_job_id: None,
             result_holder,
+            concurrency_permit: None,
         }
     }
 
@@ -487,6 +505,13 @@ pub struct JobExecutor {
 
     /// Loop iteration counter for periodic yield.
     loop_count: u64,
+
+    /// Jobs waiting for concurrency group permits.
+    ///
+    /// When a job declares a concurrency group and no permit is available,
+    /// it's queued here instead of blocking. Jobs are started from this queue
+    /// when permits become available (after job completion).
+    waiting_for_permit: std::collections::VecDeque<SubmittedJob>,
 }
 
 impl JobExecutor {
@@ -538,6 +563,7 @@ impl JobExecutor {
             last_activity_ms: Arc::new(AtomicU64::new(now_ms)),
             pending_work_count: Arc::new(AtomicU64::new(0)),
             loop_count: 0,
+            waiting_for_permit: std::collections::VecDeque::new(),
         };
 
         let submitter = JobSubmitter { sender: job_tx };
@@ -699,52 +725,39 @@ impl JobExecutor {
             priority,
         });
 
-        // Create active job state
-        let mut active = ActiveJob::new(submitted);
+        // Acquire concurrency group permit if job has a concurrency group.
+        // This creates back-pressure, limiting how many jobs in the group run at once.
+        // IMPORTANT: We use try_acquire() only - never block waiting for a permit!
+        // Blocking would deadlock the executor (can't process completions while waiting).
+        let concurrency_permit = if let Some(group) = submitted.job.concurrency_group() {
+            match self.config.job_concurrency_limits.try_acquire(group) {
+                Some(permit) => {
+                    debug!(
+                        job_id = %job_id,
+                        group = %group,
+                        "Acquired concurrency permit"
+                    );
+                    Some(permit)
+                }
+                None => {
+                    // No permit available - queue the job for later
+                    debug!(
+                        job_id = %job_id,
+                        group = %group,
+                        waiting_count = self.waiting_for_permit.len(),
+                        "No concurrency permit available, queueing job"
+                    );
+                    self.waiting_for_permit.push_back(submitted);
+                    return; // Don't start the job now
+                }
+            }
+        } else {
+            None
+        };
 
-        // Create tasks from the job
-        active.pending_tasks = active.job.create_tasks();
-
-        // Update status to running
-        active.update_status(JobStatus::Running);
-        self.telemetry.emit(TelemetryEvent::JobStarted {
-            job_id: job_id.clone(),
-        });
-
-        // Enqueue ONLY the first task - tasks run sequentially within a job
-        // to ensure proper data flow between dependent tasks
-        let total_tasks = active.pending_tasks.len();
-
-        info!(
-            job_id = %job_id,
-            task_count = total_tasks,
-            "Job started"
-        );
-
-        // Handle first task if present. Use is_empty() check instead of drain(..1)
-        // to avoid panic when job has 0 tasks (e.g., CacheGcJob with no eviction candidates).
-        if !active.pending_tasks.is_empty() {
-            let first_task = active.pending_tasks.remove(0);
-            let task_name = first_task.name().to_string();
-            let queued = QueuedTask::new(first_task, job_id.clone(), priority);
-
-            self.telemetry.emit(TelemetryEvent::TaskEnqueued {
-                job_id: job_id.clone(),
-                task_name,
-                priority,
-                queue_depth: 0,
-            });
-
-            let mut queue = self.task_queue.lock().await;
-            queue.push(queued);
-        }
-
-        // Store active job
-        let mut jobs = self.active_jobs.lock().await;
-        jobs.insert(job_id, active);
-
-        // Notify that work is available
-        self.work_notify.notify_one();
+        // Start the job with the acquired permit
+        self.start_job_with_permit(submitted, concurrency_permit)
+            .await;
     }
 
     async fn dispatch_tasks(&mut self) {
@@ -841,7 +854,7 @@ impl JobExecutor {
             self.dispatched_count += 1;
             let task_name = task.name().to_string();
 
-            info!(
+            debug!(
                 job_id = %job_id,
                 task_name = %task_name,
                 resource_type = ?resource_type,
@@ -899,7 +912,7 @@ impl JobExecutor {
 
         match &completion.result {
             TaskResult::Success | TaskResult::SuccessWithOutput(_) => {
-                info!(
+                debug!(
                     job_id = %completion.job_id,
                     task_name = %completion.task_name,
                     duration_ms = completion.duration.as_millis(),
@@ -1021,7 +1034,7 @@ impl JobExecutor {
             let task_name = task.name().to_string();
             let queued = QueuedTask::new(task, job_id_for_enqueue.clone(), priority);
 
-            info!(
+            debug!(
                 job_id = %job_id_for_enqueue,
                 task_name = %task_name,
                 "Enqueuing next sequential task"
@@ -1248,10 +1261,118 @@ impl JobExecutor {
                 }
             }
 
-            // Remove completed job
+            // Remove completed job (this drops the concurrency permit, freeing it)
             let mut jobs = self.active_jobs.lock().await;
             jobs.remove(&job_id);
         }
+
+        // After jobs complete (releasing permits), start any waiting jobs
+        self.start_waiting_jobs().await;
+    }
+
+    /// Start jobs that were waiting for concurrency permits.
+    ///
+    /// Called after job completion to check if any waiting jobs can now start.
+    /// This avoids the deadlock that would occur if we blocked in handle_job_submission.
+    async fn start_waiting_jobs(&mut self) {
+        // Process waiting jobs until none can start
+        loop {
+            // Check if there's a waiting job and extract its concurrency group
+            // We need to extract the group name to a String to avoid borrow conflicts
+            let group_name: Option<String> = self
+                .waiting_for_permit
+                .front()
+                .and_then(|job| job.job.concurrency_group().map(String::from));
+
+            let Some(group) = group_name else {
+                // No waiting jobs or job doesn't need a permit
+                if self.waiting_for_permit.front().is_some() {
+                    // Job doesn't need a permit (shouldn't happen, but handle it)
+                    let job = self.waiting_for_permit.pop_front().unwrap();
+                    self.start_job_with_permit(job, None).await;
+                    continue;
+                }
+                break;
+            };
+
+            // Try to acquire a permit for this job's concurrency group
+            match self.config.job_concurrency_limits.try_acquire(&group) {
+                Some(permit) => {
+                    // Got a permit! Start the job
+                    let job = self.waiting_for_permit.pop_front().unwrap();
+                    let job_id = job.job_id.clone();
+                    debug!(
+                        job_id = %job_id,
+                        group = %group,
+                        remaining_waiting = self.waiting_for_permit.len(),
+                        "Starting waiting job (acquired permit)"
+                    );
+                    self.start_job_with_permit(job, Some(permit)).await;
+                }
+                None => {
+                    // Still no permits available, stop checking
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Start a job that already has (or doesn't need) a concurrency permit.
+    ///
+    /// This is the common path for both immediate starts and deferred starts.
+    async fn start_job_with_permit(
+        &mut self,
+        submitted: SubmittedJob,
+        permit: Option<OwnedSemaphorePermit>,
+    ) {
+        let job_id = submitted.job_id.clone();
+
+        // Create active job state
+        let mut active = ActiveJob::new(submitted);
+        active.concurrency_permit = permit;
+
+        // Create tasks from the job
+        active.pending_tasks = active.job.create_tasks();
+
+        // Update status to running
+        active.update_status(JobStatus::Running);
+        self.telemetry.emit(TelemetryEvent::JobStarted {
+            job_id: job_id.clone(),
+        });
+
+        // Enqueue ONLY the first task - tasks run sequentially within a job
+        let total_tasks = active.pending_tasks.len();
+
+        info!(
+            job_id = %job_id,
+            task_count = total_tasks,
+            "Job started"
+        );
+
+        // Handle first task if present
+        if !active.pending_tasks.is_empty() {
+            let first_task = active.pending_tasks.remove(0);
+            let task_name = first_task.name().to_string();
+            let priority = active.priority;
+            let queued = QueuedTask::new(first_task, job_id.clone(), priority);
+
+            self.telemetry.emit(TelemetryEvent::TaskEnqueued {
+                job_id: job_id.clone(),
+                task_name,
+                priority,
+                queue_depth: 0,
+            });
+
+            let mut queue = self.task_queue.lock().await;
+            queue.push(queued);
+        }
+
+        // Store active job
+        let mut jobs = self.active_jobs.lock().await;
+        jobs.insert(job_id, active);
+
+        // Notify that work is available
+        self.work_notify.notify_one();
     }
 
     async fn shutdown(&mut self) {

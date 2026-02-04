@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::coord::TileCoord;
-use crate::executor::DdsClient;
+use crate::executor::{DaemonMemoryCache, DdsClient};
 use crate::prefetch::state::{AircraftState, DetailedPrefetchStats, SharedPrefetchStatus};
 use crate::prefetch::throttler::{PrefetchThrottler, ThrottleState};
 use crate::prefetch::CircuitState;
@@ -81,7 +81,17 @@ pub struct AdaptivePrefetchCoordinator {
     /// DDS client for submitting prefetch requests.
     pub(super) dds_client: Option<Arc<dyn DdsClient>>,
 
+    /// Memory cache for checking tile existence before submitting.
+    ///
+    /// When set, the coordinator queries this cache to filter out tiles
+    /// that are already cached, avoiding unnecessary job submissions.
+    pub(super) memory_cache: Option<Arc<dyn DaemonMemoryCache>>,
+
     /// Tiles currently in cache (for filtering).
+    ///
+    /// Note: This is a fallback for when memory_cache is not available.
+    /// When memory_cache is set, this set is only used for tiles we've
+    /// submitted in the current session (as a fast local cache).
     pub(super) cached_tiles: HashSet<TileCoord>,
 
     /// Current status.
@@ -127,6 +137,7 @@ impl AdaptivePrefetchCoordinator {
             cruise_strategy,
             throttler: None,
             dds_client: None,
+            memory_cache: None,
             cached_tiles: HashSet::new(),
             status: CoordinatorStatus::default(),
             shared_status: None,
@@ -157,6 +168,15 @@ impl AdaptivePrefetchCoordinator {
     /// Set the DDS client for submitting prefetch requests.
     pub fn with_dds_client(mut self, client: Arc<dyn DdsClient>) -> Self {
         self.dds_client = Some(client);
+        self
+    }
+
+    /// Set the memory cache for checking tile existence.
+    ///
+    /// When set, the coordinator queries this cache before submitting tiles,
+    /// avoiding unnecessary job submissions for tiles that are already cached.
+    pub fn with_memory_cache(mut self, cache: Arc<dyn DaemonMemoryCache>) -> Self {
+        self.memory_cache = Some(cache);
         self
     }
 
@@ -438,8 +458,11 @@ impl AdaptivePrefetchCoordinator {
 
     /// Process a single telemetry update and execute prefetch if appropriate.
     ///
+    /// This is now async to allow querying the memory cache for tile existence,
+    /// avoiding unnecessary job submissions for tiles that are already cached.
+    ///
     /// Returns the number of tiles submitted, or None if no prefetch was performed.
-    pub fn process_telemetry(&mut self, state: &AircraftState) -> Option<usize> {
+    pub async fn process_telemetry(&mut self, state: &AircraftState) -> Option<usize> {
         let track = extract_track(state);
         let position = (state.latitude, state.longitude);
 
@@ -448,7 +471,44 @@ impl AdaptivePrefetchCoordinator {
         // Pass 0 for AGL so the phase detector uses ground speed only.
         let agl_ft = 0.0;
 
-        let plan = self.update(position, track, state.ground_speed, agl_ft)?;
+        let mut plan = self.update(position, track, state.ground_speed, agl_ft)?;
+
+        // Filter out tiles already in cache (Bug 5 fix)
+        let cache_filtered = if let Some(ref cache) = self.memory_cache {
+            let mut filtered_tiles = Vec::with_capacity(plan.tiles.len());
+            let mut cache_hits = 0usize;
+
+            for tile in &plan.tiles {
+                // Check local tracking first (fast path)
+                if self.cached_tiles.contains(tile) {
+                    cache_hits += 1;
+                    continue;
+                }
+
+                // Query the actual memory cache
+                if cache.contains(tile.row, tile.col, tile.zoom).await {
+                    cache_hits += 1;
+                    // Add to local tracking to avoid re-querying
+                    self.cached_tiles.insert(*tile);
+                    continue;
+                }
+
+                filtered_tiles.push(*tile);
+            }
+
+            if cache_hits > 0 {
+                tracing::debug!(
+                    cache_hits = cache_hits,
+                    remaining = filtered_tiles.len(),
+                    "Filtered cached tiles from prefetch plan"
+                );
+            }
+
+            plan.tiles = filtered_tiles;
+            cache_hits
+        } else {
+            0
+        };
 
         let submitted = if plan.is_empty() {
             0
@@ -465,7 +525,7 @@ impl AdaptivePrefetchCoordinator {
         // Update statistics
         self.total_cycles += 1;
         self.total_tiles_submitted += submitted as u64;
-        self.total_cache_hits += plan.skipped_cached as u64;
+        self.total_cache_hits += (plan.skipped_cached as usize + cache_filtered) as u64;
 
         // Update shared status for TUI
         self.update_shared_status(position, &plan, submitted);
@@ -778,8 +838,8 @@ mod tests {
     // Telemetry processing tests
     // ─────────────────────────────────────────────────────────────────────────
 
-    #[test]
-    fn test_process_telemetry_disabled() {
+    #[tokio::test]
+    async fn test_process_telemetry_disabled() {
         let config = AdaptivePrefetchConfig {
             enabled: false,
             ..Default::default()
@@ -788,18 +848,18 @@ mod tests {
         let state = AircraftState::new(53.5, 9.5, 90.0, 250.0, 35000.0);
 
         // Disabled coordinator returns None
-        let result = coord.process_telemetry(&state);
+        let result = coord.process_telemetry(&state).await;
         assert!(result.is_none());
     }
 
-    #[test]
-    fn test_process_telemetry_no_dds_client() {
+    #[tokio::test]
+    async fn test_process_telemetry_no_dds_client() {
         let mut coord =
             AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
         let state = AircraftState::new(53.5, 9.5, 90.0, 10.0, 5.0); // Ground conditions
 
         // No DDS client - returns Some(0) because plan is generated but not executed
-        let result = coord.process_telemetry(&state);
+        let result = coord.process_telemetry(&state).await;
         // The plan may be empty (no scenery index), so result could be Some(0) or None
         assert!(result.is_none() || result == Some(0));
     }

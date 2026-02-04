@@ -108,6 +108,7 @@ pub mod adapters;
 mod cache_adapter;
 mod chunk_results;
 mod client;
+mod concurrency;
 mod context;
 mod daemon;
 mod download_config;
@@ -157,6 +158,9 @@ pub use telemetry::{
 
 // Queue
 pub use queue::{PriorityQueue, QueuedTask};
+
+// Job concurrency limits
+pub use concurrency::{JobConcurrencyLimits, DEFAULT_TILE_GENERATION_LIMIT, TILE_GENERATION_GROUP};
 
 // Executor
 pub use executor::{

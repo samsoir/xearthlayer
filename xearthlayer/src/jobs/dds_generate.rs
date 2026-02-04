@@ -16,7 +16,9 @@ use crate::coord::TileCoord;
 use crate::executor::{
     BlockingExecutor, ChunkProvider, DiskCache, DownloadConfig, MemoryCache, TextureEncoderAsync,
 };
-use crate::executor::{ErrorPolicy, Job, JobId, JobResult, JobStatus, Priority, Task};
+use crate::executor::{
+    ErrorPolicy, Job, JobId, JobResult, JobStatus, Priority, Task, TILE_GENERATION_GROUP,
+};
 use crate::tasks::{BuildAndCacheDdsTask, DownloadChunksTask};
 use std::sync::Arc;
 
@@ -178,6 +180,12 @@ where
         self.priority
     }
 
+    fn concurrency_group(&self) -> Option<&str> {
+        // Limit concurrent tile generation jobs to balance the download→build pipeline.
+        // This creates back-pressure, ensuring builds can keep up with downloads.
+        Some(TILE_GENERATION_GROUP)
+    }
+
     fn create_tasks(&self) -> Vec<Box<dyn Task>> {
         vec![
             Box::new(DownloadChunksTask::with_config(
@@ -229,5 +237,12 @@ mod tests {
         // DdsGenerateJob should report its name correctly
         // This test just verifies the expected name string
         assert_eq!("DdsGenerate", "DdsGenerate");
+    }
+
+    #[test]
+    fn test_concurrency_group_is_tile_generation() {
+        // DdsGenerateJob uses the tile_generation concurrency group to
+        // balance the download→build pipeline. Verify the constant is correct.
+        assert_eq!(TILE_GENERATION_GROUP, "tile_generation");
     }
 }

@@ -688,7 +688,7 @@ impl ServiceOrchestrator {
         &mut self,
         runtime_handle: &Handle,
         dds_client: Arc<dyn DdsClient>,
-        _memory_cache: Arc<M>, // Reserved for future use
+        memory_cache: Arc<M>,
     ) -> Result<(), ServiceError> {
         use crate::prefetch::AircraftState as PrefetchAircraftState;
 
@@ -754,6 +754,9 @@ impl ServiceOrchestrator {
 
         // Wire DDS client
         coordinator = coordinator.with_dds_client(dds_client_for_adaptive);
+
+        // Wire memory cache for tile existence checks (Bug 5 fix)
+        coordinator = coordinator.with_memory_cache(memory_cache);
 
         // Wire circuit breaker as throttler
         let circuit_breaker = CircuitBreaker::new(

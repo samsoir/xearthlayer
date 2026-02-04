@@ -154,6 +154,23 @@ pub trait Job: Send + Sync + 'static {
         Priority::PREFETCH
     }
 
+    /// Returns the concurrency group for this job, if any.
+    ///
+    /// Jobs in the same concurrency group share a limited number of execution
+    /// slots. This creates back-pressure to prevent resource exhaustion when
+    /// many jobs of the same type are submitted.
+    ///
+    /// For example, `DdsGenerateJob` uses group `"tile_generation"` with a
+    /// default limit of 40 concurrent jobs, ensuring that tiles flow through
+    /// the download→build pipeline smoothly instead of all downloads running
+    /// before any builds.
+    ///
+    /// The default is `None`, meaning no concurrency limit beyond the task
+    /// resource pools.
+    fn concurrency_group(&self) -> Option<&str> {
+        None
+    }
+
     /// Creates the tasks for this job.
     ///
     /// This is called when the job is ready to execute (dependencies satisfied).

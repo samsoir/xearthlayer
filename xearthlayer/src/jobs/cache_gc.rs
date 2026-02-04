@@ -193,6 +193,25 @@ impl Job for CacheGcJob {
             "Creating GC tasks"
         );
 
+        // Log sample of candidate sizes to diagnose selection issues
+        if !candidates.is_empty() {
+            let sample_size = candidates.len().min(5);
+            let sample_sizes: Vec<_> = candidates[..sample_size]
+                .iter()
+                .map(|c| c.metadata.size_bytes)
+                .collect();
+            let zero_count = candidates
+                .iter()
+                .filter(|c| c.metadata.size_bytes == 0)
+                .count();
+            tracing::debug!(
+                sample_sizes = ?sample_sizes,
+                zero_size_count = zero_count,
+                total_candidates = candidates.len(),
+                "GC candidate size diagnostics"
+            );
+        }
+
         // Collect enough bytes to free
         let mut selected_keys = Vec::new();
         let mut selected_bytes = 0u64;
@@ -215,8 +234,9 @@ impl Job for CacheGcJob {
 
         tracing::debug!(
             batches = batches.len(),
-            files = selected_keys.len(),
+            files_selected = selected_keys.len(),
             selected_bytes_mb = selected_bytes / 1_000_000,
+            bytes_to_free_mb = bytes_to_free / 1_000_000,
             "GC batches created"
         );
 
