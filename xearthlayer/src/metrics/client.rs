@@ -150,6 +150,19 @@ impl MetricsClient {
         self.send(MetricEvent::DiskCacheEvicted { bytes_freed });
     }
 
+    /// Updates the current disk cache size (absolute value from LRU index).
+    ///
+    /// This should be called after writes and evictions to report the
+    /// authoritative cache size directly from the LRU index.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - Current total cache size in bytes
+    #[inline]
+    pub fn disk_cache_size(&self, bytes: u64) {
+        self.send(MetricEvent::DiskCacheSizeUpdate { bytes });
+    }
+
     // =========================================================================
     // Memory Cache Events
     // =========================================================================
@@ -341,6 +354,7 @@ mod tests {
         client.disk_cache_hit(2048);
         client.disk_cache_miss();
         client.disk_write_completed(2048, 1000);
+        client.disk_cache_size(9_000_000_000);
         client.memory_cache_hit();
         client.memory_cache_miss();
         client.memory_cache_size(1_000_000);
@@ -355,6 +369,12 @@ mod tests {
             Some(MetricEvent::DiskWriteCompleted {
                 bytes: 2048,
                 duration_us: 1000
+            })
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(MetricEvent::DiskCacheSizeUpdate {
+                bytes: 9_000_000_000
             })
         ));
         assert!(matches!(rx.recv().await, Some(MetricEvent::MemoryCacheHit)));

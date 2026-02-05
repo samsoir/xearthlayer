@@ -299,7 +299,7 @@ impl LruIndex {
 
             let size = metadata.len();
 
-            self.entries.insert(
+            let old = self.entries.insert(
                 key,
                 CacheEntryMetadata {
                     size_bytes: size,
@@ -307,8 +307,20 @@ impl LruIndex {
                 },
             );
 
-            self.total_size.fetch_add(size, Ordering::Relaxed);
-            self.entry_count.fetch_add(1, Ordering::Relaxed);
+            if let Some(old_entry) = old {
+                // Entry already exists (e.g. populate called twice) - adjust delta
+                if size > old_entry.size_bytes {
+                    self.total_size
+                        .fetch_add(size - old_entry.size_bytes, Ordering::Relaxed);
+                } else {
+                    self.total_size
+                        .fetch_sub(old_entry.size_bytes - size, Ordering::Relaxed);
+                }
+            } else {
+                // New entry
+                self.total_size.fetch_add(size, Ordering::Relaxed);
+                self.entry_count.fetch_add(1, Ordering::Relaxed);
+            }
             stats.files_indexed += 1;
             stats.total_bytes += size;
 
@@ -641,5 +653,80 @@ mod tests {
 
         assert_eq!(stats.files_indexed, 0);
         assert_eq!(index.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn populate_from_disk_is_idempotent() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create some cache files
+        std::fs::write(
+            temp_dir.path().join("chunk_15_100_200_8_12.cache"),
+            vec![0u8; 1000],
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.path().join("chunk_15_100_201_0_0.cache"),
+            vec![0u8; 2000],
+        )
+        .unwrap();
+
+        let index = LruIndex::new(temp_dir.path().to_path_buf());
+
+        // First call
+        let stats1 = index.populate_from_disk().await.unwrap();
+        assert_eq!(stats1.files_indexed, 2);
+        assert_eq!(stats1.total_bytes, 3000);
+        assert_eq!(index.total_size(), 3000);
+        assert_eq!(index.entry_count(), 2);
+
+        // Second call should NOT double-count
+        let stats2 = index.populate_from_disk().await.unwrap();
+        assert_eq!(stats2.files_indexed, 2);
+        assert_eq!(stats2.total_bytes, 3000);
+        assert_eq!(
+            index.total_size(),
+            3000,
+            "total_size must not double after second populate_from_disk call"
+        );
+        assert_eq!(
+            index.entry_count(),
+            2,
+            "entry_count must not double after second populate_from_disk call"
+        );
+    }
+
+    #[tokio::test]
+    async fn populate_from_disk_after_record_does_not_double_count() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a cache file
+        std::fs::write(
+            temp_dir.path().join("chunk_15_100_200_8_12.cache"),
+            vec![0u8; 1000],
+        )
+        .unwrap();
+
+        let index = LruIndex::new(temp_dir.path().to_path_buf());
+
+        // Populate from disk
+        index.populate_from_disk().await.unwrap();
+        assert_eq!(index.total_size(), 1000);
+
+        // Simulate a write to an existing key via record() (same size)
+        index.record("chunk:15:100:200:8:12", 1000);
+        assert_eq!(
+            index.total_size(),
+            1000,
+            "record() of same key with same size should not change total"
+        );
+
+        // Re-populate should still show 1000
+        index.populate_from_disk().await.unwrap();
+        assert_eq!(
+            index.total_size(),
+            1000,
+            "re-populate after record should not double-count"
+        );
     }
 }
