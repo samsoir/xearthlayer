@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-02-XX (Draft)
+## [0.3.0] - 2026-02-04
 
 > **Note**: This is a major release introducing the Adaptive Prefetch System and a complete rewrite of the execution core.
 
@@ -62,6 +62,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Implemented `opendir` and `readdirplus` operations
   - Proper directory handle management
 
+- **Skip Installed Ortho Tiles (#39)**: Prefetch no longer downloads tiles already on disk
+  - Checks `OrthoUnionIndex` before submitting tiles for download
+  - Covers both user-installed ortho packages and patches
+
+- **Disk Cache Size Reporting**: Fixed metrics showing inflated cache size
+  - Root cause: `populate_from_disk()` double-counted when called twice during startup
+  - Root cause: Reporter formula `initial + written - evicted` accumulated drift
+  - Replaced with authoritative absolute value from LRU index via `DiskCacheSizeUpdate` events
+  - Cache size now matches OS-reported disk usage across restarts
+
 - **Request Coalescing**: Prevents duplicate work for same tile
   - Concurrent requests for the same tile share a single generation job
 
@@ -86,7 +96,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Metrics Architecture**: 3-layer event-based telemetry
   - Fire-and-forget emission pattern
   - Disk read tracking for cache diagnostics
+  - Disk cache size tracked via authoritative `DiskCacheSizeUpdate` events from LRU index
   - Sparkline consolidation across widgets
+
+- **TUI Dashboard**: Improved queue display and layout
+  - Active Tiles consolidated into Scenery System as QUEUE column
+  - Tiles coalesced by 1-degree coordinate with progress averaging
+  - Queue sorted by progress descending (tiles about to complete shown first)
+  - Consistent 3-char padding across all panels
 
 - **Service Initialization**: Consolidated startup via `ServiceOrchestrator`
   - Eliminated duplicate initialization paths
@@ -108,6 +125,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Deprecated UI Widgets**: Removed obsolete dashboard components
 
 - **Dead Code**: Removed unused `retry_counts` field from ActiveJob
+
+- **Legacy Disk Eviction Daemon**: Superseded by job-based GC via `CacheGcJob`
 
 ### Deprecated
 
@@ -143,6 +162,17 @@ tile_generation_limit = 40
 - `run_eviction_daemon` deprecated (GC now internal to `DiskCacheProvider`)
 
 Run `xearthlayer config upgrade` to automatically migrate configuration.
+
+### Notes for Testers
+
+The new Job Executor Framework is aggressive with system resources by design — it
+maximizes CPU, network, and disk I/O utilization to minimize scene loading times.
+If you experience instability in X-Plane or XEarthLayer:
+
+1. Run `xearthlayer diagnostics` and include the system report
+2. Collect the X-Plane `Log.txt` and the XEarthLayer log output
+3. Report the issue at https://github.com/samsoir/xearthlayer/issues
+4. Running with `xearthlayer run --debug` provides additional diagnostic output
 
 ## [0.2.12] - 2026-01-10
 

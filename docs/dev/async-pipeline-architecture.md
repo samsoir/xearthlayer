@@ -1102,7 +1102,9 @@ pub struct PipelineMetrics {
     pub memory_cache_misses: AtomicU64,
     pub memory_cache_size_bytes: AtomicUsize,
     pub memory_cache_entries: AtomicUsize,
-    pub disk_cache_size_bytes: AtomicU64,
+    // Note: disk_cache_size_bytes is now updated via absolute DiskCacheSizeUpdate
+    // events from the LRU index, not computed from initial + written - evicted.
+    pub disk_cache_size_bytes: u64,
     pub disk_cache_entries: AtomicU64,
 
     // FUSE metrics
