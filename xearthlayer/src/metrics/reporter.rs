@@ -145,10 +145,7 @@ impl MetricsReporter for TuiReporter {
             disk_cache_hits: state.disk_cache_hits,
             disk_cache_misses: state.disk_cache_misses,
             disk_cache_hit_rate: disk_hit_rate,
-            disk_cache_size_bytes: state
-                .initial_disk_cache_bytes
-                .saturating_add(state.disk_bytes_written)
-                .saturating_sub(state.disk_bytes_evicted),
+            disk_cache_size_bytes: state.disk_cache_size_bytes,
             disk_bytes_written: state.disk_bytes_written,
             disk_bytes_read: state.disk_bytes_read,
 
@@ -306,5 +303,28 @@ mod tests {
 
         let snapshot = reporter.report(&state, &history);
         assert!(snapshot.uptime >= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_disk_cache_size_uses_absolute_value() {
+        let mut state = AggregatedState::new();
+        let history = TimeSeriesHistory::default();
+        let reporter = TuiReporter::new();
+
+        // Set the authoritative disk cache size (from LRU index)
+        state.disk_cache_size_bytes = 5_000_000_000;
+
+        // These legacy fields should NOT affect the reported size
+        state.initial_disk_cache_bytes = 1_000_000_000;
+        state.disk_bytes_written = 10_000_000_000;
+        state.disk_bytes_evicted = 500_000_000;
+
+        let snapshot = reporter.report(&state, &history);
+
+        // Should use the absolute value, not the formula
+        assert_eq!(
+            snapshot.disk_cache_size_bytes, 5_000_000_000,
+            "Reporter should use disk_cache_size_bytes directly, not initial+written-evicted"
+        );
     }
 }

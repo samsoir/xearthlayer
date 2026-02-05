@@ -7,9 +7,10 @@
 //! ┌─────────────────────┬─────────────────────┐
 //! │      NETWORK        │        DISK         │
 //! │   [sparkline]       │   [sparkline]       │
-//! │   Data Rate: 5.2MB/s│   Throughput: 12MB/s│
-//! │   Downloaded: 1.2GB │   Written: 800MB    │
-//! │   Error Rate: 0.1%  │   Provider: Bing    │
+//! │   Data Rate: 5.2MB/s│   I/O Rate: R:1MB/s │
+//! │   Downloaded: 1.2GB │   Total: R:500MB    │
+//! │   Provider: Bing    │                     │
+//! │   Error Rate: 0.1%  │                     │
 //! └─────────────────────┴─────────────────────┘
 //! ```
 
@@ -270,6 +271,7 @@ impl Widget for InputOutputWidget<'_> {
                     },
                 ),
                 ("Downloaded", format_bytes(total_downloaded), Color::Cyan),
+                ("Provider", self.provider_name.to_string(), Color::Yellow),
                 (
                     "Error Rate",
                     format!("{:.1}%", network_error_rate),
@@ -308,7 +310,6 @@ impl Widget for InputOutputWidget<'_> {
             &[
                 ("I/O Rate", io_rate_str, io_rate_color),
                 ("Total", io_total_str, Color::Cyan),
-                ("Provider", self.provider_name.to_string(), Color::Yellow),
             ],
         );
     }

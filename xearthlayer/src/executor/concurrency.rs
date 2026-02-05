@@ -10,8 +10,8 @@
 //! ```ignore
 //! use xearthlayer::executor::JobConcurrencyLimits;
 //!
-//! let limits = JobConcurrencyLimits::new()
-//!     .with_group("tile_generation", 40);
+//! // Default limits scale with CPU count
+//! let limits = JobConcurrencyLimits::new();
 //!
 //! // Acquire a slot for a tile generation job
 //! let permit = limits.try_acquire("tile_generation");
@@ -26,15 +26,50 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Default concurrency limit for tile generation jobs.
+// =============================================================================
+// Configuration Constants
+// =============================================================================
+
+/// Multiplier for CPU count to compute tile generation limit.
 ///
-/// This value balances parallelism with pipeline flow:
-/// - High enough to utilize available resources
-/// - Low enough to prevent all downloads completing before builds start
-pub const DEFAULT_TILE_GENERATION_LIMIT: usize = 40;
+/// Higher values allow more jobs in flight, improving pipeline utilization
+/// but increasing memory usage from buffered downloads.
+pub const TILE_GENERATION_CPU_MULTIPLIER: usize = 16;
+
+/// Minimum tile generation limit regardless of CPU count.
+///
+/// Ensures adequate parallelism even on low-core systems.
+pub const TILE_GENERATION_MIN_LIMIT: usize = 80;
+
+/// Fallback CPU count when detection fails.
+pub const FALLBACK_CPU_COUNT: usize = 8;
 
 /// Concurrency group name for tile generation jobs.
 pub const TILE_GENERATION_GROUP: &str = "tile_generation";
+
+// =============================================================================
+// Default Limit Calculation
+// =============================================================================
+
+/// Computes the default concurrency limit for tile generation jobs.
+///
+/// This value scales with the system's capability to keep the multi-stage
+/// pipeline (download → assemble → encode → cache) fully utilized.
+///
+/// Formula: `max(num_cpus * TILE_GENERATION_CPU_MULTIPLIER, TILE_GENERATION_MIN_LIMIT)`
+/// - 8 cores:  128 concurrent jobs
+/// - 16 cores: 256 concurrent jobs
+/// - 32 cores: 512 concurrent jobs
+///
+/// Note: Per-stage resource pools (Network, CPU, DiskIO) already limit
+/// concurrent operations at each stage. This limit prevents unbounded
+/// job queueing while ensuring enough work in flight.
+pub fn default_tile_generation_limit() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(FALLBACK_CPU_COUNT);
+    (cpus * TILE_GENERATION_CPU_MULTIPLIER).max(TILE_GENERATION_MIN_LIMIT)
+}
 
 /// Manages concurrent execution limits for job groups.
 ///
@@ -56,12 +91,14 @@ impl Default for JobConcurrencyLimits {
 impl JobConcurrencyLimits {
     /// Creates a new instance with default limits.
     ///
-    /// By default, includes a limit for the "tile_generation" group.
+    /// By default, includes a limit for the "tile_generation" group
+    /// that scales with the number of CPUs.
     pub fn new() -> Self {
         let mut groups = HashMap::new();
+        let tile_limit = default_tile_generation_limit();
         groups.insert(
             TILE_GENERATION_GROUP.to_string(),
-            Arc::new(Semaphore::new(DEFAULT_TILE_GENERATION_LIMIT)),
+            Arc::new(Semaphore::new(tile_limit)),
         );
         Self {
             groups: Arc::new(groups),
@@ -143,7 +180,7 @@ impl JobConcurrencyLimits {
         self.groups.get(group).map(|_| {
             // For now, return the default. In production, we'd track this separately.
             match group {
-                TILE_GENERATION_GROUP => DEFAULT_TILE_GENERATION_LIMIT,
+                TILE_GENERATION_GROUP => default_tile_generation_limit(),
                 _ => 0,
             }
         })
@@ -168,10 +205,24 @@ mod tests {
     fn test_default_has_tile_generation_group() {
         let limits = JobConcurrencyLimits::new();
         assert!(limits.available(TILE_GENERATION_GROUP).is_some());
+        // Limit scales with CPU count: max(cpus * 8, 80)
         assert_eq!(
             limits.available(TILE_GENERATION_GROUP),
-            Some(DEFAULT_TILE_GENERATION_LIMIT)
+            Some(default_tile_generation_limit())
         );
+    }
+
+    #[test]
+    fn test_default_tile_generation_limit_formula() {
+        let limit = default_tile_generation_limit();
+        // Should be at least the minimum
+        assert!(limit >= TILE_GENERATION_MIN_LIMIT);
+        // Should be a multiple of CPU count (if above minimum)
+        let cpus = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(FALLBACK_CPU_COUNT);
+        let expected = (cpus * TILE_GENERATION_CPU_MULTIPLIER).max(TILE_GENERATION_MIN_LIMIT);
+        assert_eq!(limit, expected);
     }
 
     #[test]

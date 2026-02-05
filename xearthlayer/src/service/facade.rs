@@ -15,7 +15,7 @@ use crate::log::Logger;
 use crate::metrics::{MetricsSystem, TelemetrySnapshot, TuiReporter};
 use crate::prefetch::{FuseLoadMonitor, TileRequestCallback};
 use crate::provider::ProviderConfig;
-use crate::runtime::{SharedRuntimeHealth, XEarthLayerRuntime};
+use crate::runtime::{SharedRuntimeHealth, SharedTileProgressTracker, XEarthLayerRuntime};
 use crate::texture::{DdsTextureEncoder, TextureEncoder};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -318,6 +318,9 @@ impl XEarthLayerService {
         let dds_encoder = builder::create_encoder(&config);
 
         // 6. Create XEarthLayer runtime with cache bridges
+        // Clone metrics_client before passing to RuntimeBuilder (we need it for GC daemon)
+        let gc_metrics_client = metrics_client.clone();
+
         let xel_runtime = RuntimeBuilder::new(
             &provider_name,
             config.texture().format(),
@@ -340,7 +343,8 @@ impl XEarthLayerService {
             let cache_dir = disk_provider.directory().to_path_buf();
             let max_size = disk_provider.max_size_bytes();
 
-            let gc_daemon = GcSchedulerDaemon::new(lru_index, cache_dir, max_size, job_submitter);
+            let gc_daemon = GcSchedulerDaemon::new(lru_index, cache_dir, max_size, job_submitter)
+                .with_metrics(gc_metrics_client);
 
             let gc_shutdown_clone = gc_shutdown.clone();
             let gc_handle = runtime_handle.spawn(async move {
@@ -665,6 +669,18 @@ impl XEarthLayerService {
     pub fn runtime_health(&self) -> Option<SharedRuntimeHealth> {
         // Not yet implemented - will be connected during TUI update
         None
+    }
+
+    /// Get the tile progress tracker for TUI display.
+    ///
+    /// Returns the shared tile progress tracker from the runtime,
+    /// which tracks active tile generation with task completion counts.
+    ///
+    /// Returns `None` if the runtime is not yet started.
+    pub fn tile_progress_tracker(&self) -> Option<SharedTileProgressTracker> {
+        self.xearthlayer_runtime
+            .as_ref()
+            .map(|r| r.tile_progress_tracker())
     }
 
     /// Get the DDS format used by this service.

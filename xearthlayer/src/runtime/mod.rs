@@ -100,7 +100,12 @@
 mod health;
 mod orchestrator;
 mod request;
+mod tile_progress;
 
 pub use health::{HealthSnapshot, HealthStatus, RuntimeHealth, SharedRuntimeHealth};
 pub use orchestrator::{RuntimeConfig, XEarthLayerRuntime};
 pub use request::{DdsResponse, JobRequest, RequestOrigin};
+pub use tile_progress::{
+    SharedTileProgressTracker, TileProgressEntry, TileProgressSink, TileProgressTracker,
+    MAX_DISPLAY_ENTRIES,
+};

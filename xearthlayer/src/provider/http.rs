@@ -2,7 +2,28 @@
 
 use super::types::ProviderError;
 use std::future::Future;
+use std::time::Duration;
 use tracing::{debug, trace, warn};
+
+// =============================================================================
+// HTTP Client Configuration Constants
+// =============================================================================
+
+/// Default HTTP request timeout in seconds.
+pub const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum idle connections to keep per host in the connection pool.
+///
+/// Higher values improve throughput by reusing connections, but consume
+/// more memory and file descriptors. Should match or exceed the HTTP
+/// semaphore capacity for optimal connection reuse.
+pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 512;
+
+/// How long to keep idle connections alive in seconds.
+pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+
+/// TCP keepalive interval in seconds.
+pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 
 /// Trait for synchronous HTTP client operations.
 ///
@@ -128,7 +149,7 @@ impl ReqwestClient {
     /// Creates a new ReqwestClient with default configuration.
     pub fn new() -> Result<Self, ProviderError> {
         let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
             .user_agent(DEFAULT_USER_AGENT)
             .build()
             .map_err(|e| {
@@ -251,13 +272,13 @@ impl AsyncReqwestClient {
     /// - TCP nodelay for reduced latency
     pub fn new() -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
             .user_agent(DEFAULT_USER_AGENT)
             // Connection pooling - keep many connections alive for parallel requests
-            .pool_max_idle_per_host(128)
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(DEFAULT_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS))
             // TCP optimizations
-            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS))
             .tcp_nodelay(true)
             .build()
             .map_err(|e| {
@@ -270,13 +291,13 @@ impl AsyncReqwestClient {
     /// Creates a new AsyncReqwestClient with custom timeout.
     pub fn with_timeout(timeout_secs: u64) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .timeout(Duration::from_secs(timeout_secs))
             .user_agent(DEFAULT_USER_AGENT)
             // Connection pooling - keep many connections alive for parallel requests
-            .pool_max_idle_per_host(128)
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(DEFAULT_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS))
             // TCP optimizations
-            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS))
             .tcp_nodelay(true)
             .build()
             .map_err(|e| {

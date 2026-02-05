@@ -31,7 +31,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use xearthlayer::aircraft_position::{AircraftPositionProvider, SharedAircraftPosition};
 use xearthlayer::metrics::TelemetrySnapshot;
 use xearthlayer::prefetch::SharedPrefetchStatus;
-use xearthlayer::runtime::SharedRuntimeHealth;
+use xearthlayer::runtime::{SharedRuntimeHealth, SharedTileProgressTracker};
 
 use crate::ui::widgets::{CacheConfig, DiskHistory, NetworkHistory, SceneryHistory};
 
@@ -64,14 +64,14 @@ pub struct Dashboard {
     prefetch_status: Option<Arc<SharedPrefetchStatus>>,
     /// Optional runtime health for display.
     runtime_health: Option<SharedRuntimeHealth>,
-    /// Maximum concurrent jobs for the control plane display.
-    max_concurrent_jobs: usize,
     /// Quit confirmation state - Some(timestamp) when awaiting confirmation.
     quit_confirmation: Option<Instant>,
     /// Background prewarm status (None = no prewarm, Some = prewarm in progress or complete).
     prewarm_status: Option<PrewarmProgress>,
     /// Aircraft position provider from APT module.
     aircraft_position: Option<SharedAircraftPosition>,
+    /// Tile progress tracker for active tile generation display.
+    tile_progress_tracker: Option<SharedTileProgressTracker>,
 }
 
 impl Dashboard {
@@ -107,10 +107,10 @@ impl Dashboard {
             spinner_frame: 0,
             prefetch_status: None,
             runtime_health: None,
-            max_concurrent_jobs: 0,
             quit_confirmation: None,
             prewarm_status: None,
             aircraft_position: None,
+            tile_progress_tracker: None,
         })
     }
 
@@ -121,19 +121,20 @@ impl Dashboard {
     }
 
     /// Set the runtime health source for display.
-    pub fn with_runtime_health(
-        mut self,
-        health: SharedRuntimeHealth,
-        max_concurrent_jobs: usize,
-    ) -> Self {
+    pub fn with_runtime_health(mut self, health: SharedRuntimeHealth) -> Self {
         self.runtime_health = Some(health);
-        self.max_concurrent_jobs = max_concurrent_jobs;
         self
     }
 
     /// Set the aircraft position provider from APT module.
     pub fn with_aircraft_position(mut self, apt: SharedAircraftPosition) -> Self {
         self.aircraft_position = Some(apt);
+        self
+    }
+
+    /// Set the tile progress tracker for active tile display.
+    pub fn with_tile_progress_tracker(mut self, tracker: SharedTileProgressTracker) -> Self {
+        self.tile_progress_tracker = Some(tracker);
         self
     }
 
@@ -231,7 +232,6 @@ impl Dashboard {
 
         // Get control plane health if available
         let control_plane_snapshot = self.runtime_health.as_ref().map(|h| h.snapshot());
-        let max_concurrent_jobs = self.max_concurrent_jobs;
 
         // Clone histories for use in closure
         let scenery_history = self.scenery_history.clone();
@@ -257,6 +257,13 @@ impl Dashboard {
             .map(|apt| apt.status())
             .unwrap_or_default();
 
+        // Get tile progress snapshot for active tile display
+        let tile_progress_entries = self
+            .tile_progress_tracker
+            .as_ref()
+            .map(|t| t.snapshot())
+            .unwrap_or_default();
+
         self.terminal.draw(|frame| {
             render::render_ui(
                 frame,
@@ -270,10 +277,10 @@ impl Dashboard {
                 &prefetch_snapshot,
                 &aircraft_position_status,
                 control_plane_snapshot.as_ref(),
-                max_concurrent_jobs,
                 confirmation_remaining,
                 prewarm_status.as_ref(),
                 prewarm_spinner,
+                &tile_progress_entries,
             );
         })?;
 

@@ -4,10 +4,10 @@
 //! - **Primitives**: Reusable low-level UI components (sparklines, progress bars, formatters)
 //! - **Panel Widgets**: Higher-level widgets that compose primitives
 //!
-//! ## Layout Widgets (v0.3.0)
+//! ## Layout Widgets (v0.3.1)
 //!
-//! - `PrefetchSystemWidget` - Prefetch status (status, mode, loading tiles)
-//! - `ScenerySystemWidget` - 2-column tile requests/processing
+//! - `PrefetchSystemWidget` - Prefetch status (status and mode)
+//! - `ScenerySystemWidget` - 3-column: REQUESTS | QUEUE | PROCESSING
 //! - `InputOutputWidget` - 2-column network/disk I/O
 //! - `CacheWidgetCompact` - Cache display with hit rates and sizes
 

@@ -182,6 +182,9 @@ impl MetricsDaemon {
             MetricEvent::DiskCacheEvicted { bytes_freed } => {
                 self.state.disk_bytes_evicted += bytes_freed;
             }
+            MetricEvent::DiskCacheSizeUpdate { bytes } => {
+                self.state.disk_cache_size_bytes = bytes;
+            }
 
             // Memory cache events
             MetricEvent::MemoryCacheHit => {
@@ -391,6 +394,31 @@ mod tests {
         assert_eq!(daemon.state.memory_cache_hits, 1);
         assert_eq!(daemon.state.memory_cache_misses, 1);
         assert_eq!(daemon.state.memory_cache_size_bytes, 1_000_000);
+    }
+
+    #[test]
+    fn test_process_disk_cache_size_update() {
+        let (mut daemon, _tx) = create_daemon();
+
+        assert_eq!(daemon.state.disk_cache_size_bytes, 0);
+
+        // Initial size report
+        daemon.process_event(MetricEvent::DiskCacheSizeUpdate {
+            bytes: 5_000_000_000,
+        });
+        assert_eq!(daemon.state.disk_cache_size_bytes, 5_000_000_000);
+
+        // Size increases after write
+        daemon.process_event(MetricEvent::DiskCacheSizeUpdate {
+            bytes: 5_001_000_000,
+        });
+        assert_eq!(daemon.state.disk_cache_size_bytes, 5_001_000_000);
+
+        // Size decreases after eviction
+        daemon.process_event(MetricEvent::DiskCacheSizeUpdate {
+            bytes: 4_000_000_000,
+        });
+        assert_eq!(daemon.state.disk_cache_size_bytes, 4_000_000_000);
     }
 
     #[test]

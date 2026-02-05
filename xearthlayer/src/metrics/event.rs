@@ -74,6 +74,15 @@ pub enum MetricEvent {
         bytes_freed: u64,
     },
 
+    /// Update the current disk cache size (absolute value from LRU index).
+    ///
+    /// Emitted after writes and evictions to track the authoritative cache size
+    /// directly, replacing the fragile `initial + written - evicted` formula.
+    DiskCacheSizeUpdate {
+        /// Current total size in bytes (from LRU index).
+        bytes: u64,
+    },
+
     // =========================================================================
     // Memory Cache Events (tile-level, tracked in daemon)
     // =========================================================================
@@ -168,6 +177,7 @@ impl MetricEvent {
             Self::DiskWriteCompleted { .. } => "disk_write_completed",
             Self::DiskCacheInitialSize { .. } => "disk_cache_initial_size",
             Self::DiskCacheEvicted { .. } => "disk_cache_evicted",
+            Self::DiskCacheSizeUpdate { .. } => "disk_cache_size_update",
             Self::MemoryCacheHit => "memory_cache_hit",
             Self::MemoryCacheMiss => "memory_cache_miss",
             Self::MemoryCacheSizeUpdate { .. } => "memory_cache_size_update",

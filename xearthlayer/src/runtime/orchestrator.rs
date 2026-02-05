@@ -45,10 +45,11 @@ use tracing::info;
 
 use crate::executor::{
     ChannelDdsClient, DaemonMemoryCache, DdsClient, ExecutorDaemon, ExecutorDaemonConfig,
-    JobSubmitter, TelemetrySink, TracingTelemetrySink,
+    JobSubmitter, MultiplexTelemetrySink, TelemetrySink, TracingTelemetrySink,
 };
 use crate::jobs::DdsJobFactory;
 use crate::metrics::MetricsClient;
+use crate::runtime::{SharedTileProgressTracker, TileProgressSink, TileProgressTracker};
 
 /// Configuration for the XEarthLayer runtime.
 #[derive(Debug, Clone, Default)]
@@ -96,6 +97,9 @@ pub struct XEarthLayerRuntime {
 
     /// Shutdown token for graceful termination.
     shutdown_token: CancellationToken,
+
+    /// Tile progress tracker for TUI display.
+    tile_progress_tracker: SharedTileProgressTracker,
 }
 
 impl XEarthLayerRuntime {
@@ -160,8 +164,15 @@ impl XEarthLayerRuntime {
     {
         info!("Starting XEarthLayer runtime");
 
-        // Use tracing for logging
-        let telemetry: Arc<dyn TelemetrySink> = Arc::new(TracingTelemetrySink);
+        // Create tile progress tracker for TUI display
+        let tile_progress_tracker = TileProgressTracker::new();
+        let tile_progress_sink = TileProgressSink::new(Arc::clone(&tile_progress_tracker));
+
+        // Combine tracing sink with tile progress sink
+        let telemetry: Arc<dyn TelemetrySink> = Arc::new(MultiplexTelemetrySink::new(vec![
+            Arc::new(TracingTelemetrySink) as Arc<dyn TelemetrySink>,
+            tile_progress_sink as Arc<dyn TelemetrySink>,
+        ]));
 
         // Create the daemon with or without metrics
         let (daemon, job_tx) = match metrics_client {
@@ -205,6 +216,7 @@ impl XEarthLayerRuntime {
             job_submitter,
             daemon_handle,
             shutdown_token,
+            tile_progress_tracker,
         }
     }
 
@@ -253,6 +265,14 @@ impl XEarthLayerRuntime {
     /// the runtime is shutting down.
     pub fn shutdown_token(&self) -> CancellationToken {
         self.shutdown_token.clone()
+    }
+
+    /// Get the tile progress tracker for TUI display.
+    ///
+    /// The tracker provides a snapshot of active tile generation
+    /// progress for rendering in the dashboard.
+    pub fn tile_progress_tracker(&self) -> SharedTileProgressTracker {
+        Arc::clone(&self.tile_progress_tracker)
     }
 
     /// Shutdown the runtime gracefully.

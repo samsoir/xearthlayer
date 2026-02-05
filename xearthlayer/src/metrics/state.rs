@@ -152,6 +152,13 @@ pub struct AggregatedState {
     pub initial_disk_cache_bytes: u64,
     /// Total bytes evicted from disk cache by the GC daemon.
     pub disk_bytes_evicted: u64,
+    /// Current disk cache size in bytes (absolute value from LRU index).
+    ///
+    /// Updated directly via `DiskCacheSizeUpdate` events from the
+    /// `DiskCacheProvider` after writes and evictions. This is the
+    /// authoritative value, replacing the fragile formula
+    /// `initial + written - evicted`.
+    pub disk_cache_size_bytes: u64,
 
     // =========================================================================
     // Memory Cache Metrics
@@ -239,6 +246,7 @@ impl AggregatedState {
             disk_write_time_us: 0,
             initial_disk_cache_bytes: 0,
             disk_bytes_evicted: 0,
+            disk_cache_size_bytes: 0,
             memory_cache_hits: 0,
             memory_cache_misses: 0,
             memory_cache_size_bytes: 0,

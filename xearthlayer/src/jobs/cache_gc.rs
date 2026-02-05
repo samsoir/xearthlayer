@@ -23,11 +23,13 @@
 //! cancellation check.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cache::LruIndex;
 use crate::executor::{ErrorPolicy, Job, JobId, JobResult, JobStatus, Priority, Task};
+use crate::metrics::MetricsClient;
 use crate::tasks::CacheGcBatchTask;
 
 /// Default batch size for GC operations.
@@ -66,6 +68,12 @@ pub struct CacheGcJob {
 
     /// Minimum age for eviction candidates.
     min_age: Duration,
+
+    /// Optional metrics client for reporting evicted bytes.
+    metrics: Option<MetricsClient>,
+
+    /// Cache size at job creation (used to calculate bytes freed).
+    initial_size_bytes: AtomicU64,
 }
 
 impl CacheGcJob {
@@ -77,6 +85,7 @@ impl CacheGcJob {
     /// * `cache_path` - Base cache directory
     /// * `target_size_bytes` - Target size to reduce cache to
     pub fn new(lru_index: Arc<LruIndex>, cache_path: PathBuf, target_size_bytes: u64) -> Self {
+        let initial_size = lru_index.total_size();
         Self {
             id: JobId::auto(),
             lru_index,
@@ -84,6 +93,8 @@ impl CacheGcJob {
             target_size_bytes,
             batch_size: DEFAULT_BATCH_SIZE,
             min_age: Duration::from_secs(DEFAULT_MIN_AGE_SECS),
+            metrics: None,
+            initial_size_bytes: AtomicU64::new(initial_size),
         }
     }
 
@@ -94,6 +105,7 @@ impl CacheGcJob {
         cache_path: PathBuf,
         target_size_bytes: u64,
     ) -> Self {
+        let initial_size = lru_index.total_size();
         Self {
             id,
             lru_index,
@@ -101,7 +113,18 @@ impl CacheGcJob {
             target_size_bytes,
             batch_size: DEFAULT_BATCH_SIZE,
             min_age: Duration::from_secs(DEFAULT_MIN_AGE_SECS),
+            metrics: None,
+            initial_size_bytes: AtomicU64::new(initial_size),
         }
+    }
+
+    /// Sets the metrics client for eviction reporting.
+    ///
+    /// When set, the job will report bytes freed to the metrics system
+    /// via `disk_cache_evicted()` when GC completes.
+    pub fn with_metrics(mut self, metrics: MetricsClient) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Sets the batch size for deletion tasks.
@@ -259,18 +282,36 @@ impl Job for CacheGcJob {
         let succeeded = result.succeeded_tasks.len();
         let failed = result.failed_tasks.len();
 
+        // Calculate bytes freed (initial size - current size)
+        let initial_size = self.initial_size_bytes.load(Ordering::Relaxed);
+        let final_size = self.lru_index.total_size();
+        let bytes_freed = initial_size.saturating_sub(final_size);
+
         if failed > 0 {
             tracing::warn!(
                 succeeded_batches = succeeded,
                 failed_batches = failed,
+                bytes_freed_mb = bytes_freed / 1_000_000,
                 "GC completed with some batch failures"
             );
         } else if succeeded > 0 {
             tracing::info!(
                 batches = succeeded,
-                final_size_mb = self.lru_index.total_size() / 1_000_000,
+                final_size_mb = final_size / 1_000_000,
+                bytes_freed_mb = bytes_freed / 1_000_000,
                 "GC completed successfully"
             );
+        }
+
+        // Report evicted bytes to metrics system
+        if bytes_freed > 0 {
+            if let Some(ref metrics) = self.metrics {
+                metrics.disk_cache_evicted(bytes_freed);
+                tracing::debug!(
+                    bytes_freed = bytes_freed,
+                    "Reported disk cache eviction to metrics"
+                );
+            }
         }
 
         // Always report success - partial cleanup is fine

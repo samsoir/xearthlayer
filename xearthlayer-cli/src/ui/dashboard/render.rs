@@ -2,18 +2,18 @@
 //!
 //! This module contains the top-level layout orchestration and header rendering.
 //!
-//! ## Layout v0.3.0
+//! ## Layout v0.3.1
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────┐
 //! │ Header (3 lines)                                        │
 //! ├─────────────────────────────────────────────────────────┤
-//! │ Aircraft Position (4 lines)                             │
+//! │ Aircraft Position (5 lines)                             │
 //! ├─────────────────────────────────────────────────────────┤
-//! │ Prefetch System (4 lines)                               │
+//! │ Prefetch System (5 lines)                               │
 //! ├─────────────────────────────────────────────────────────┤
-//! │ Scenery System (8 lines) - 2-column                     │
-//! │ TILE REQUESTS        │ TILE PROCESSING                  │
+//! │ Scenery System (8 lines) - 3-column                     │
+//! │ TILE REQUESTS   │   QUEUE (3/12)   │  TILE PROCESSING   │
 //! ├─────────────────────────────────────────────────────────┤
 //! │ Input/Output (8 lines) - 2-column                       │
 //! │ NETWORK              │ DISK                             │
@@ -33,7 +33,7 @@ use ratatui::{
 };
 use xearthlayer::metrics::TelemetrySnapshot;
 use xearthlayer::prefetch::PrefetchStatusSnapshot;
-use xearthlayer::runtime::HealthSnapshot;
+use xearthlayer::runtime::{HealthSnapshot, TileProgressEntry};
 
 use super::render_sections::inner_rect;
 use super::state::PrewarmProgress;
@@ -63,22 +63,22 @@ pub fn render_ui(
     prefetch_snapshot: &PrefetchStatusSnapshot,
     aircraft_position_status: &AircraftPositionStatus,
     control_plane_snapshot: Option<&HealthSnapshot>,
-    max_concurrent_jobs: usize,
     confirmation_remaining: Option<Duration>,
     prewarm_status: Option<&PrewarmProgress>,
     prewarm_spinner: Option<char>,
+    tile_progress_entries: &[TileProgressEntry],
 ) {
     let size = frame.area();
 
-    // New v0.3.0 layout: 6 sections
+    // Layout v0.3.1: 6 sections (Active Tiles moved into Scenery System)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(0)
         .constraints([
             Constraint::Length(3), // Header
-            Constraint::Length(5), // Aircraft Position (3 content lines + border + margin)
-            Constraint::Length(4), // Prefetch System
-            Constraint::Length(8), // Scenery System (2-column)
+            Constraint::Length(5), // Aircraft Position (3 content lines + border + padding)
+            Constraint::Length(4), // Prefetch System (2 content lines + border + padding)
+            Constraint::Length(8), // Scenery System (3-column: REQUESTS | QUEUE | PROCESSING)
             Constraint::Length(8), // Input/Output (2-column)
             Constraint::Length(6), // Caches
             Constraint::Min(0),    // Padding
@@ -91,10 +91,10 @@ pub fn render_ui(
     // 2. Aircraft Position (now using APT module)
     render_aircraft_position(frame, chunks[1], aircraft_position_status);
 
-    // 3. Prefetch System (new panel)
+    // 3. Prefetch System (with restored padding)
     render_prefetch_system(frame, chunks[2], prefetch_snapshot);
 
-    // 4. Scenery System (replaces Control Plane + Pipeline)
+    // 4. Scenery System (3-column: REQUESTS | QUEUE | PROCESSING)
     let scenery_block = Block::default()
         .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -105,9 +105,10 @@ pub fn render_ui(
     frame.render_widget(scenery_block, chunks[3]);
     let scenery_inner = inner_rect(chunks[3], 1, 1);
     frame.render_widget(
-        ScenerySystemWidget::new(snapshot, max_concurrent_jobs)
+        ScenerySystemWidget::new(snapshot)
             .with_health(control_plane_snapshot)
-            .with_history(scenery_history),
+            .with_history(scenery_history)
+            .with_tile_progress(tile_progress_entries),
         scenery_inner,
     );
 

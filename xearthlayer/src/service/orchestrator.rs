@@ -66,7 +66,7 @@ use crate::prefetch::{
     CacheLoadResult, CircuitBreaker, FuseRequestAnalyzer, Prefetcher, SceneryIndex,
     SceneryIndexConfig, SharedPrefetchStatus,
 };
-use crate::runtime::SharedRuntimeHealth;
+use crate::runtime::{SharedRuntimeHealth, SharedTileProgressTracker};
 
 use super::error::ServiceError;
 use super::orchestrator_config::OrchestratorConfig;
@@ -194,6 +194,9 @@ pub struct ServiceOrchestrator {
     /// Runtime health for control plane monitoring.
     runtime_health: Option<SharedRuntimeHealth>,
 
+    /// Tile progress tracker for active tile display.
+    tile_progress_tracker: Option<SharedTileProgressTracker>,
+
     /// Maximum concurrent jobs (for UI display).
     max_concurrent_jobs: usize,
 
@@ -277,6 +280,7 @@ impl ServiceOrchestrator {
             mount_manager,
             service_builder: Some(service_builder),
             runtime_health: None,
+            tile_progress_tracker: None,
             max_concurrent_jobs: 0,
             fuse_analyzer,
             scenery_index,
@@ -581,10 +585,11 @@ impl ServiceOrchestrator {
         }
     }
 
-    /// Wire runtime health from mounted service.
+    /// Wire runtime health and tile progress from mounted service.
     fn wire_runtime_health(&mut self) {
         if let Some(service) = self.mount_manager.get_service() {
             self.runtime_health = service.runtime_health();
+            self.tile_progress_tracker = service.tile_progress_tracker();
             self.max_concurrent_jobs = service.max_concurrent_jobs();
         }
     }
@@ -815,6 +820,11 @@ impl ServiceOrchestrator {
     /// Get runtime health for control plane display.
     pub fn runtime_health(&self) -> Option<SharedRuntimeHealth> {
         self.runtime_health.clone()
+    }
+
+    /// Get tile progress tracker for active tile display in TUI.
+    pub fn tile_progress_tracker(&self) -> Option<SharedTileProgressTracker> {
+        self.tile_progress_tracker.clone()
     }
 
     /// Get maximum concurrent jobs for UI display.

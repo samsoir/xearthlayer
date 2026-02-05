@@ -37,6 +37,7 @@ use tracing::{debug, info, warn};
 use crate::cache::LruIndex;
 use crate::executor::JobSubmitter;
 use crate::jobs::CacheGcJob;
+use crate::metrics::MetricsClient;
 
 /// Default interval between GC checks (60 seconds).
 pub const DEFAULT_CHECK_INTERVAL_SECS: u64 = 60;
@@ -72,6 +73,9 @@ pub struct GcSchedulerDaemon {
 
     /// Target ratio after GC (0.0-1.0).
     target_ratio: f64,
+
+    /// Optional metrics client for eviction reporting.
+    metrics: Option<MetricsClient>,
 }
 
 impl GcSchedulerDaemon {
@@ -97,7 +101,17 @@ impl GcSchedulerDaemon {
             check_interval: Duration::from_secs(DEFAULT_CHECK_INTERVAL_SECS),
             trigger_threshold: DEFAULT_TRIGGER_THRESHOLD,
             target_ratio: DEFAULT_TARGET_RATIO,
+            metrics: None,
         }
+    }
+
+    /// Sets the metrics client for eviction reporting.
+    ///
+    /// When set, GC jobs will report bytes freed to the metrics system
+    /// via `disk_cache_evicted()`.
+    pub fn with_metrics(mut self, metrics: MetricsClient) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Sets a custom check interval.
@@ -151,11 +165,16 @@ impl GcSchedulerDaemon {
             "Submitting GC job"
         );
 
-        let job = CacheGcJob::new(
+        let mut job = CacheGcJob::new(
             Arc::clone(&self.lru_index),
             self.cache_dir.clone(),
             target_size,
         );
+
+        // Pass metrics to job for eviction reporting
+        if let Some(ref metrics) = self.metrics {
+            job = job.with_metrics(metrics.clone());
+        }
 
         match self.job_submitter.try_submit(job) {
             Some(handle) => {

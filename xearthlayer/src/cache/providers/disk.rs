@@ -33,7 +33,7 @@ use tracing::{debug, info, warn};
 use crate::cache::config::DiskProviderConfig;
 use crate::cache::lru_index::LruIndex;
 use crate::cache::traits::{BoxFuture, Cache, GcResult, ServiceCacheError};
-use crate::metrics::MetricsClient;
+use crate::metrics::{MetricsClient, OptionalMetrics};
 
 /// On-disk cache provider with LRU index tracking.
 ///
@@ -60,9 +60,7 @@ pub struct DiskCacheProvider {
     /// Cancellation token for graceful shutdown.
     shutdown: CancellationToken,
 
-    /// Optional metrics client for reporting cache stats.
-    /// Currently unused - reserved for future cache statistics reporting.
-    #[allow(dead_code)]
+    /// Optional metrics client for reporting cache size updates.
     metrics_client: Option<MetricsClient>,
 }
 
@@ -189,25 +187,28 @@ impl DiskCacheProvider {
         info!("Disk cache provider shutdown complete");
     }
 
-    /// Scan existing cache size and update internal tracking.
+    /// Returns the current cache size from the LRU index.
     ///
-    /// This is called automatically during `start()`. Only needed if you
-    /// used `start_with_index()` with an empty index.
+    /// The LRU index is populated from disk during `start()`, so this
+    /// returns an accurate size without re-scanning. This avoids the
+    /// double-counting bug that occurred when `populate_from_disk()` was
+    /// called twice (once in `start()` and again here).
     ///
     /// Returns the total size in bytes.
     pub async fn scan_initial_size(&self) -> Result<u64, ServiceCacheError> {
-        let stats =
-            self.lru_index.populate_from_disk().await.map_err(|e| {
-                ServiceCacheError::SpawnError(format!("Failed to scan cache: {}", e))
-            })?;
+        let size = self.lru_index.total_size();
+        let count = self.lru_index.entry_count();
+
+        // Seed the absolute disk cache size metric
+        self.metrics_client.disk_cache_size(size);
 
         info!(
-            files = stats.files_indexed,
-            size_mb = stats.total_bytes / 1_000_000,
-            "Disk cache size scanned"
+            files = count,
+            size_mb = size / 1_000_000,
+            "Disk cache initial size from LRU index"
         );
 
-        Ok(stats.total_bytes)
+        Ok(size)
     }
 
     /// Check if garbage collection is needed.
@@ -253,6 +254,10 @@ impl Cache for DiskCacheProvider {
             // Update LRU index after successful write
             self.lru_index.record(&key_owned, size);
 
+            // Report authoritative cache size to metrics
+            self.metrics_client
+                .disk_cache_size(self.lru_index.total_size());
+
             debug!(key = %key_owned, size, "Cache set");
             Ok(())
         })
@@ -294,6 +299,9 @@ impl Cache for DiskCacheProvider {
             // Then delete file
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => {
+                    // Report authoritative cache size to metrics
+                    self.metrics_client
+                        .disk_cache_size(self.lru_index.total_size());
                     debug!(key = %key_owned, "Cache delete");
                     Ok(true)
                 }
@@ -551,6 +559,55 @@ mod tests {
         // Contains should return false and clean up index
         assert!(!provider.contains("key1").await.unwrap());
         assert!(!provider.lru_index().contains("key1"));
+
+        provider.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_scan_initial_size_does_not_double_count() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Pre-populate disk with cache files before starting provider
+        std::fs::write(
+            temp_dir.path().join("chunk_15_100_200_8_12.cache"),
+            vec![0u8; 1000],
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.path().join("chunk_15_100_201_0_0.cache"),
+            vec![0u8; 2000],
+        )
+        .unwrap();
+
+        let config = DiskProviderConfig {
+            directory: temp_dir.path().to_path_buf(),
+            max_size_bytes: 1_000_000,
+            gc_interval: Duration::from_secs(3600),
+            provider_name: "test".to_string(),
+            metrics_client: None,
+        };
+
+        // start() internally calls populate_from_disk()
+        let provider = DiskCacheProvider::start(config).await.unwrap();
+
+        // Verify initial state is correct
+        assert_eq!(provider.size_bytes(), 3000);
+        assert_eq!(provider.entry_count(), 2);
+
+        // scan_initial_size() must return the same value, NOT double it
+        let scanned_size = provider.scan_initial_size().await.unwrap();
+        assert_eq!(
+            scanned_size, 3000,
+            "scan_initial_size() must not double-count after start()"
+        );
+
+        // And the internal state must remain consistent
+        assert_eq!(
+            provider.size_bytes(),
+            3000,
+            "size_bytes() must remain consistent after scan_initial_size()"
+        );
+        assert_eq!(provider.entry_count(), 2);
 
         provider.shutdown().await;
     }

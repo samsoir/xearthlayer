@@ -87,7 +87,7 @@ impl<'a> AircraftPositionWidget<'a> {
         match &self.status.state {
             Some(state) => {
                 let mut spans = vec![
-                    Span::styled("Position : ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("   Position : ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         format!(
                             "{}, {}",
@@ -148,7 +148,7 @@ impl<'a> AircraftPositionWidget<'a> {
             None => {
                 // No data available
                 Line::from(vec![
-                    Span::styled("Position : ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("   Position : ", Style::default().fg(Color::DarkGray)),
                     Span::styled("NO DATA AVAILABLE", Style::default().fg(Color::DarkGray)),
                 ])
             }
@@ -164,7 +164,7 @@ impl<'a> AircraftPositionWidget<'a> {
                 let color = Self::accuracy_color(&state.accuracy);
 
                 Line::from(vec![
-                    Span::styled("Accuracy : ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("   Accuracy : ", Style::default().fg(Color::DarkGray)),
                     Span::styled(accuracy_str, Style::default().fg(color)),
                     Span::styled(
                         format!(" ({})", source_str),
@@ -175,7 +175,7 @@ impl<'a> AircraftPositionWidget<'a> {
             None => {
                 // No accuracy when no data
                 Line::from(vec![
-                    Span::styled("Accuracy : ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("   Accuracy : ", Style::default().fg(Color::DarkGray)),
                     Span::styled("-", Style::default().fg(Color::DarkGray)),
                 ])
             }
@@ -194,7 +194,7 @@ impl<'a> AircraftPositionWidget<'a> {
         // Currently only GPS is implemented
         // Future: Add VATSIM, PILOTEDGE status here
         Line::from(vec![
-            Span::styled("GPS: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("   GPS: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("{} ", gps_indicator),
                 Style::default().fg(gps_color),

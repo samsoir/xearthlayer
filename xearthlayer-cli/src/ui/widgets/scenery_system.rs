@@ -1,17 +1,17 @@
-//! Scenery system widget with 2-column layout.
+//! Scenery system widget with 3-column layout.
 //!
-//! Consolidates FUSE request rates (X-Plane requests) and job executor
-//! throughput into a unified "Scenery System" panel.
+//! Consolidates FUSE request rates (X-Plane requests), active tile queue,
+//! and job executor throughput into a unified "Scenery System" panel.
 //!
 //! Layout:
 //! ```text
-//! ┌─────────────────────┬─────────────────────┐
-//! │   TILE REQUESTS     │   TILE PROCESSING   │
-//! │   [sparkline]       │   [sparkline]       │
-//! │   Req/s: 12.5       │   Done/s: 10.2      │
-//! │   Pressure: Δ+2/s   │   Active: 8/32      │
-//! │   Error Rate: 0.1%  │   Error Rate: 0.2%  │
-//! └─────────────────────┴─────────────────────┘
+//! ┌────────────────┬────────────────────────────┬────────────────┐
+//! │ TILE REQUESTS  │        QUEUE (3/12)        │ TILE PROCESSING│
+//! │ [sparkline]    │ 140E,35S ████████░░ 50%    │ [sparkline]    │
+//! │ Req/s: 12.5    │ 140E,36S ████░░░░░░ 25%    │ Done/s: 10.2   │
+//! │ Pressure: Δ+2/s│ 140E,37S ░░░░░░░░░░  0%    │ Active: 8/32   │
+//! │ Error Rate: 0% │                            │ Error Rate: 0% │
+//! └────────────────┴────────────────────────────┴────────────────┘
 //! ```
 
 use ratatui::{
@@ -22,9 +22,16 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 use xearthlayer::metrics::TelemetrySnapshot;
-use xearthlayer::runtime::HealthSnapshot;
+use xearthlayer::runtime::{HealthSnapshot, TileProgressEntry};
 
 use super::primitives::{Sparkline, SparklineHistory};
+
+/// Characters for progress bar rendering (used in QUEUE column).
+const PROGRESS_FULL: char = '█';
+const PROGRESS_EMPTY: char = '░';
+
+/// Width of the progress bar in characters.
+const PROGRESS_BAR_WIDTH: usize = 10;
 
 /// History tracking for scenery system metrics.
 ///
@@ -108,25 +115,26 @@ impl SceneryHistory {
     }
 }
 
-/// Widget displaying scenery system status with 2 columns.
+/// Widget displaying scenery system status with 3 columns.
 ///
 /// Left column shows TILE REQUESTS (FUSE interface activity).
+/// Middle column shows QUEUE (active tile progress).
 /// Right column shows TILE PROCESSING (job executor throughput).
 pub struct ScenerySystemWidget<'a> {
     snapshot: &'a TelemetrySnapshot,
     health: Option<&'a HealthSnapshot>,
     history: Option<&'a SceneryHistory>,
-    max_concurrent_jobs: usize,
+    tile_progress: &'a [TileProgressEntry],
 }
 
 impl<'a> ScenerySystemWidget<'a> {
     /// Create a new scenery system widget.
-    pub fn new(snapshot: &'a TelemetrySnapshot, max_concurrent_jobs: usize) -> Self {
+    pub fn new(snapshot: &'a TelemetrySnapshot) -> Self {
         Self {
             snapshot,
             health: None,
             history: None,
-            max_concurrent_jobs,
+            tile_progress: &[],
         }
     }
 
@@ -139,6 +147,12 @@ impl<'a> ScenerySystemWidget<'a> {
     /// Set history for sparkline display.
     pub fn with_history(mut self, history: &'a SceneryHistory) -> Self {
         self.history = Some(history);
+        self
+    }
+
+    /// Set tile progress entries for QUEUE column.
+    pub fn with_tile_progress(mut self, entries: &'a [TileProgressEntry]) -> Self {
+        self.tile_progress = entries;
         self
     }
 
@@ -224,9 +238,6 @@ impl Widget for ScenerySystemWidget<'_> {
                 )
             };
 
-        // Get job metrics
-        let jobs_active = self.health.map(|h| h.jobs_in_progress).unwrap_or(0);
-
         // Calculate error rates
         let request_error_rate = if self.snapshot.fuse_jobs_submitted > 0 {
             (self.snapshot.chunks_failed as f64 / self.snapshot.fuse_jobs_submitted as f64) * 100.0
@@ -240,9 +251,13 @@ impl Widget for ScenerySystemWidget<'_> {
             0.0
         };
 
-        // Split into 2 columns
-        let columns =
-            Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(area);
+        // Split into 3 columns: TILE REQUESTS | QUEUE | TILE PROCESSING
+        let columns = Layout::horizontal([
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+        ])
+        .split(area);
 
         // Determine colors based on activity and thresholds
         let pressure_color = if pressure > 10.0 {
@@ -284,9 +299,12 @@ impl Widget for ScenerySystemWidget<'_> {
             ],
         );
 
+        // Middle column: QUEUE (active tile progress)
+        Self::render_queue_column(columns[1], buf, self.tile_progress);
+
         // Right column: TILE PROCESSING
         Self::render_column(
-            columns[1],
+            columns[2],
             buf,
             "TILE PROCESSING",
             Color::Green,
@@ -294,11 +312,6 @@ impl Widget for ScenerySystemWidget<'_> {
             completion_sparkline_color,
             &[
                 ("Done/s", format!("{:.1}", completion_rate), Color::Green),
-                (
-                    "Active",
-                    format!("{}/{}", jobs_active, self.max_concurrent_jobs),
-                    Color::Cyan,
-                ),
                 (
                     "Error Rate",
                     format!("{:.1}%", job_error_rate),
@@ -318,6 +331,138 @@ impl ScenerySystemWidget<'_> {
             Color::Yellow
         } else {
             Color::Green
+        }
+    }
+
+    /// Render the QUEUE column showing active tile progress.
+    ///
+    /// Coalesces tiles by 1-degree coordinate and sorts by progress (highest first).
+    fn render_queue_column(area: Rect, buf: &mut Buffer, entries: &[TileProgressEntry]) {
+        // Coalesce entries by formatted coordinate (1-degree buckets)
+        let coalesced = Self::coalesce_entries(entries);
+
+        // Row 1: Title (centered, no depth indicator needed with coalesced feedback)
+        if area.height >= 1 {
+            let title_line = Line::from(Span::styled(
+                format!("{:^width$}", "QUEUE", width = area.width as usize),
+                Style::default().fg(Color::Yellow),
+            ));
+            Paragraph::new(title_line).render(Rect { height: 1, ..area }, buf);
+        }
+
+        // Row 2: Empty line for spacing between header and content
+        // Row 3+: Tile progress entries
+        if coalesced.is_empty() {
+            // Show placeholder when no tiles are being processed (with spacing)
+            if area.height >= 3 {
+                let placeholder = Line::from(Span::styled(
+                    format!(
+                        "{:^width$}",
+                        "No tiles in progress",
+                        width = area.width as usize
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                Paragraph::new(placeholder).render(
+                    Rect {
+                        x: area.x,
+                        y: area.y + 2, // Skip row 1 (header) and row 2 (spacing)
+                        width: area.width,
+                        height: 1,
+                    },
+                    buf,
+                );
+            }
+            return;
+        }
+
+        // Show up to 4 coalesced entries, sorted by progress (highest first = about to complete)
+        for (i, (coord, count, avg_percent)) in coalesced.iter().take(4).enumerate() {
+            let row = 2 + i as u16; // Start at row 2 (after header + spacing)
+            if area.height <= row {
+                break;
+            }
+
+            let progress_bar = Self::render_progress_bar(*avg_percent);
+            let color = Self::progress_color(*avg_percent);
+
+            // Format: "140E,35S ████░░ 50%" or "140E,35S(3) ██░░ 25%" if multiple tiles
+            let coord_display = if *count > 1 {
+                format!("{}({})", coord, count)
+            } else {
+                coord.clone()
+            };
+
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" {:<11}", coord_display),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(progress_bar, Style::default().fg(color)),
+                Span::styled(format!(" {:>3}%", avg_percent), Style::default().fg(color)),
+            ]);
+
+            Paragraph::new(line).render(
+                Rect {
+                    x: area.x,
+                    y: area.y + row,
+                    width: area.width,
+                    height: 1,
+                },
+                buf,
+            );
+        }
+    }
+
+    /// Coalesce tile entries by 1-degree coordinate.
+    ///
+    /// Groups tiles that share the same formatted coordinate (e.g., "140E,35S")
+    /// and returns (coord, count, avg_progress) sorted by progress descending.
+    fn coalesce_entries(entries: &[TileProgressEntry]) -> Vec<(String, usize, u8)> {
+        use std::collections::HashMap;
+
+        // Group by formatted coordinate
+        let mut groups: HashMap<String, Vec<u8>> = HashMap::new();
+        for entry in entries {
+            let coord = entry.format_coordinate();
+            let percent = entry.progress_percent();
+            groups.entry(coord).or_default().push(percent);
+        }
+
+        // Convert to (coord, count, avg_percent) and sort by progress descending
+        let mut result: Vec<_> = groups
+            .into_iter()
+            .map(|(coord, percents)| {
+                let count = percents.len();
+                let avg = percents.iter().map(|&p| p as u32).sum::<u32>() / count as u32;
+                (coord, count, avg as u8)
+            })
+            .collect();
+
+        // Sort by progress descending (highest progress = about to complete = at top)
+        result.sort_by(|a, b| b.2.cmp(&a.2));
+
+        result
+    }
+
+    /// Render a progress bar string.
+    fn render_progress_bar(percent: u8) -> String {
+        let filled = ((percent as usize * PROGRESS_BAR_WIDTH) / 100).min(PROGRESS_BAR_WIDTH);
+        let empty = PROGRESS_BAR_WIDTH - filled;
+
+        format!(
+            "{}{}",
+            PROGRESS_FULL.to_string().repeat(filled),
+            PROGRESS_EMPTY.to_string().repeat(empty)
+        )
+    }
+
+    /// Get color based on progress percentage.
+    fn progress_color(percent: u8) -> Color {
+        match percent {
+            0..=25 => Color::Yellow,
+            26..=75 => Color::Cyan,
+            _ => Color::Green,
         }
     }
 }

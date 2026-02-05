@@ -499,7 +499,18 @@ impl AdaptivePrefetchCoordinator {
         // Pass 0 for AGL so the phase detector uses ground speed only.
         let agl_ft = 0.0;
 
-        let mut plan = self.update(position, track, state.ground_speed, agl_ft)?;
+        // Always update shared status with current position to show TUI we're receiving telemetry
+        // This fixes the bug where prefetch status stayed "Idle" when no plan was generated
+        self.update_shared_status_position(position);
+
+        let mut plan = match self.update(position, track, state.ground_speed, agl_ft) {
+            Some(p) => p,
+            None => {
+                // No plan generated - still update status with why (disabled, throttled, etc.)
+                self.update_shared_status_no_plan();
+                return None;
+            }
+        };
 
         // Filter out tiles already in cache (Bug 5 fix)
         let cache_filtered = if let Some(ref cache) = self.memory_cache {
@@ -633,6 +644,65 @@ impl AdaptivePrefetchCoordinator {
             is_active: submitted > 0,
             circuit_state,
             loading_tiles,
+        };
+        status.update_detailed_stats(detailed);
+    }
+
+    /// Update shared status with position only.
+    ///
+    /// Called early in `process_telemetry` to show the TUI we're receiving telemetry,
+    /// even if no prefetch plan is generated (e.g., due to throttling).
+    fn update_shared_status_position(&self, position: (f64, f64)) {
+        let Some(ref status) = self.shared_status else {
+            return;
+        };
+
+        // Update position - this also sets GPS status to Inferred
+        status.update_inferred_position(position.0, position.1);
+    }
+
+    /// Update shared status when no plan was generated.
+    ///
+    /// This ensures the TUI shows the correct mode (throttled, idle, etc.)
+    /// even when no prefetch tiles are submitted.
+    fn update_shared_status_no_plan(&self) {
+        let Some(ref status) = self.shared_status else {
+            return;
+        };
+
+        // Determine prefetch mode based on current state
+        let prefetch_mode = if !self.status.enabled {
+            crate::prefetch::state::PrefetchMode::Idle
+        } else if self.status.throttled {
+            crate::prefetch::state::PrefetchMode::CircuitOpen
+        } else if self.status.mode == StrategyMode::Disabled {
+            crate::prefetch::state::PrefetchMode::Idle
+        } else {
+            // Have a plan but it was empty or filtered - show the active mode
+            match self.status.phase {
+                FlightPhase::Ground => crate::prefetch::state::PrefetchMode::Radial,
+                FlightPhase::Cruise => crate::prefetch::state::PrefetchMode::TileBased,
+            }
+        };
+        status.update_prefetch_mode(prefetch_mode);
+
+        // Update detailed stats with no activity
+        let circuit_state = self.throttler.as_ref().map(|t| match t.state() {
+            ThrottleState::Active => CircuitState::Closed,
+            ThrottleState::Paused => CircuitState::Open,
+            ThrottleState::Resuming => CircuitState::HalfOpen,
+        });
+
+        let detailed = DetailedPrefetchStats {
+            cycles: self.total_cycles,
+            tiles_submitted_last_cycle: 0,
+            tiles_submitted_total: self.total_tiles_submitted,
+            cache_hits: self.total_cache_hits,
+            ttl_skipped: 0,
+            active_zoom_levels: vec![14],
+            is_active: false,
+            circuit_state,
+            loading_tiles: vec![],
         };
         status.update_detailed_stats(detailed);
     }
@@ -969,5 +1039,71 @@ mod tests {
 
         // Verify the index is set
         assert!(coord.ortho_union_index.is_some());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Status update tests (TUI bug fix)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_process_telemetry_updates_status_when_disabled() {
+        use crate::prefetch::state::PrefetchMode as StatePrefetchMode;
+
+        let config = AdaptivePrefetchConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let shared_status = SharedPrefetchStatus::new();
+        let mut coord =
+            AdaptivePrefetchCoordinator::new(config).with_shared_status(Arc::clone(&shared_status));
+
+        let state = AircraftState::new(53.5, 9.5, 90.0, 250.0, 35000.0);
+
+        // Process telemetry - should return None but still update status
+        let result = coord.process_telemetry(&state).await;
+        assert!(result.is_none());
+
+        // Status should be updated to show Idle (since disabled)
+        let snapshot = shared_status.snapshot();
+        assert_eq!(snapshot.prefetch_mode, StatePrefetchMode::Idle);
+
+        // Position should be updated
+        assert!(snapshot.aircraft.is_some());
+        let ac = snapshot.aircraft.unwrap();
+        assert!((ac.latitude - 53.5).abs() < 0.001);
+        assert!((ac.longitude - 9.5).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn test_process_telemetry_updates_status_when_throttled() {
+        use crate::prefetch::state::PrefetchMode as StatePrefetchMode;
+        use crate::prefetch::throttler::ThrottleState;
+
+        // Create a mock throttler that always says to throttle
+        struct AlwaysThrottle;
+        impl PrefetchThrottler for AlwaysThrottle {
+            fn should_throttle(&self) -> bool {
+                true
+            }
+            fn state(&self) -> ThrottleState {
+                ThrottleState::Paused
+            }
+        }
+
+        let shared_status = SharedPrefetchStatus::new();
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_calibration(test_calibration())
+            .with_throttler(Arc::new(AlwaysThrottle))
+            .with_shared_status(Arc::clone(&shared_status));
+
+        let state = AircraftState::new(53.5, 9.5, 90.0, 250.0, 35000.0);
+
+        // Process telemetry - should return None due to throttling
+        let result = coord.process_telemetry(&state).await;
+        assert!(result.is_none());
+
+        // Status should show CircuitOpen (throttled)
+        let snapshot = shared_status.snapshot();
+        assert_eq!(snapshot.prefetch_mode, StatePrefetchMode::CircuitOpen);
     }
 }

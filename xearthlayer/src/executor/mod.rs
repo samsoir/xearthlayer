@@ -168,7 +168,10 @@ pub use telemetry::{
 pub use queue::{PriorityQueue, QueuedTask};
 
 // Job concurrency limits
-pub use concurrency::{JobConcurrencyLimits, DEFAULT_TILE_GENERATION_LIMIT, TILE_GENERATION_GROUP};
+pub use concurrency::{
+    default_tile_generation_limit, JobConcurrencyLimits, FALLBACK_CPU_COUNT,
+    TILE_GENERATION_CPU_MULTIPLIER, TILE_GENERATION_GROUP, TILE_GENERATION_MIN_LIMIT,
+};
 
 // Executor (split into focused modules)
 pub use config::{

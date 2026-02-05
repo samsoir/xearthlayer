@@ -34,12 +34,10 @@
 //!
 //! The following types are still available for backward compatibility:
 //! - [`MemoryCache`] - Original moka wrapper (domain-specific CacheKey)
-//! - [`run_eviction_daemon`] - External GC daemon (prefer DiskCacheProvider)
 //!
 //! The async pipeline uses:
 //! - `MemoryCache` for DDS tiles (LRU eviction, thread-safe)
-//! - `ParallelDiskCache` (in `pipeline/disk_cache.rs`) for chunks
-//! - `DiskCacheDaemon` for periodic disk cache eviction (legacy)
+//! - `DiskCacheProvider` for chunks with `GcSchedulerDaemon` for periodic eviction
 
 // New cache service architecture (Phase 1)
 mod config;
@@ -54,7 +52,6 @@ pub mod adapters;
 pub mod clients;
 
 // Legacy cache implementation
-mod disk_eviction;
 mod memory;
 mod path;
 mod stats;
@@ -77,7 +74,6 @@ pub use adapters::{DiskCacheBridge, MemoryCacheBridge};
 pub use clients::{ChunkCacheClient, TileCacheClient};
 
 // Legacy exports (backward compatibility)
-pub use disk_eviction::{run_eviction_daemon, EvictionResult};
 pub use memory::MemoryCache;
 pub use stats::{CacheStatistics, CacheStats};
 pub use types::{CacheError, CacheKey, DiskCacheConfig, MemoryCacheConfig};
