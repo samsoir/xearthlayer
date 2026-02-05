@@ -506,7 +506,8 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
 
 ## References
 
-- Current eviction daemon: `xearthlayer/src/cache/disk_eviction.rs`
+- Disk cache provider with internal GC: `xearthlayer/src/cache/providers/disk.rs`
+- GC scheduler daemon: `xearthlayer/src/cache/gc_scheduler.rs`
 - Current memory cache: `xearthlayer/src/cache/memory.rs`
 - Current adapters: `xearthlayer/src/executor/adapters/`
 - Moka documentation: https://docs.rs/moka/
