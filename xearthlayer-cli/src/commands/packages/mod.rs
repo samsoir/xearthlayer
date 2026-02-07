@@ -172,6 +172,7 @@ pub fn run(command: PackagesCommands) -> Result<(), CliError> {
                 install_dir: install_dir.unwrap_or_else(|| default_install_dir(&config)),
                 temp_dir: temp_dir.unwrap_or_else(|| default_temp_dir(&config)),
                 all,
+                custom_scenery_path: default_custom_scenery_dir(&config),
             },
             &ctx,
         ),

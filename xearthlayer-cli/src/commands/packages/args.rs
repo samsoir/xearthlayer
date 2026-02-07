@@ -170,6 +170,8 @@ pub struct UpdateArgs {
     pub install_dir: PathBuf,
     pub temp_dir: PathBuf,
     pub all: bool,
+    /// Path to X-Plane Custom Scenery directory for overlay symlinks.
+    pub custom_scenery_path: Option<PathBuf>,
 }
 
 /// Arguments for the remove command.

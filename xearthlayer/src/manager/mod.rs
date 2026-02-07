@@ -63,8 +63,7 @@ pub use mounts::{
     ActiveMount, CacheBridges, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder,
 };
 pub use symlinks::{
-    consolidated_overlay_exists, create_consolidated_overlay, create_overlay_symlink,
-    overlay_symlink_exists, overlay_symlink_path, remove_consolidated_overlay,
+    consolidated_overlay_exists, create_consolidated_overlay, remove_consolidated_overlay,
     remove_overlay_symlink, ConsolidatedOverlayResult, CONSOLIDATED_OVERLAY_NAME,
 };
 pub use traits::{ArchiveExtractor, LibraryClient, PackageDownloader, ProgressCallback};

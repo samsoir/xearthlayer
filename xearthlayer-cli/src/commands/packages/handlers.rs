@@ -5,7 +5,7 @@
 
 use xearthlayer::config::format_size;
 use xearthlayer::manager::{
-    create_overlay_symlink, remove_overlay_symlink, MountStatus, PackageStatus,
+    create_consolidated_overlay, remove_overlay_symlink, MountStatus, PackageStatus,
 };
 use xearthlayer::package::PackageType;
 
@@ -177,6 +177,44 @@ impl CommandHandler for CheckHandler {
 }
 
 // ============================================================================
+// Shared Helpers
+// ============================================================================
+
+/// Rebuild the consolidated overlay folder after an overlay install/remove/update.
+///
+/// This creates a single `yzXEL_overlay/` folder in Custom Scenery containing
+/// symlinks to all DSF files from installed overlay packages. Any stale per-region
+/// symlinks (e.g. `yzXEL_na_overlay`) are automatically cleaned up.
+fn rebuild_consolidated_overlay(
+    install_dir: &std::path::Path,
+    custom_scenery_path: &Option<std::path::PathBuf>,
+    ctx: &CommandContext<'_>,
+) {
+    let Some(ref scenery_path) = custom_scenery_path else {
+        ctx.output
+            .println("Note: No Custom Scenery path configured. Overlay symlink not created.");
+        ctx.output
+            .println("Set 'custom_scenery_path' in config to enable automatic overlay creation.");
+        return;
+    };
+
+    ctx.output.println("Rebuilding consolidated overlay...");
+    let store = ctx.manager.create_store(install_dir);
+    let result = create_consolidated_overlay(&store, scenery_path);
+    if result.success {
+        ctx.output.success(&format!(
+            "Consolidated overlay updated: {} regions, {} files",
+            result.package_count, result.file_count
+        ));
+    } else if let Some(error) = result.error {
+        ctx.output.error(&format!(
+            "Warning: Failed to create consolidated overlay: {}",
+            error
+        ));
+    }
+}
+
+// ============================================================================
 // Install Handler
 // ============================================================================
 
@@ -184,37 +222,6 @@ impl CommandHandler for CheckHandler {
 pub struct InstallHandler;
 
 impl InstallHandler {
-    /// Create overlay symlink if custom_scenery_path is configured.
-    fn create_symlink_if_configured(
-        install_path: &std::path::Path,
-        custom_scenery_path: &Option<std::path::PathBuf>,
-        ctx: &CommandContext<'_>,
-    ) {
-        let Some(ref scenery_path) = custom_scenery_path else {
-            ctx.output
-                .println("Note: No Custom Scenery path configured. Symlink not created.");
-            ctx.output.println(
-                "Set 'custom_scenery_path' in config to enable automatic symlink creation.",
-            );
-            return;
-        };
-
-        ctx.output.println("Creating symlink in Custom Scenery...");
-        match create_overlay_symlink(install_path, scenery_path) {
-            Ok(symlink_path) => {
-                ctx.output
-                    .success(&format!("Created symlink: {}", symlink_path.display()));
-            }
-            Err(e) => {
-                ctx.output
-                    .error(&format!("Warning: Failed to create symlink: {}", e));
-                ctx.output.println(
-                    "You may need to manually create a symlink in your Custom Scenery folder.",
-                );
-            }
-        }
-    }
-
     /// Install an overlay package for auto_install_overlays feature.
     fn install_overlay_for_region(
         region: &str,
@@ -283,8 +290,8 @@ impl InstallHandler {
             result.install_path.display()
         ));
 
-        // Create symlink for the overlay
-        Self::create_symlink_if_configured(&result.install_path, &args.custom_scenery_path, ctx);
+        // Rebuild consolidated overlay to include the newly installed overlay
+        rebuild_consolidated_overlay(&args.install_dir, &args.custom_scenery_path, ctx);
     }
 }
 
@@ -361,14 +368,10 @@ impl CommandHandler for InstallHandler {
             result.files_extracted
         ));
 
-        // Create symlink for overlay packages
+        // Rebuild consolidated overlay for overlay packages
         if args.package_type == PackageType::Overlay {
             ctx.output.newline();
-            Self::create_symlink_if_configured(
-                &result.install_path,
-                &args.custom_scenery_path,
-                ctx,
-            );
+            rebuild_consolidated_overlay(&args.install_dir, &args.custom_scenery_path, ctx);
         }
 
         // Auto-install overlay when installing ortho (if enabled)
@@ -465,6 +468,7 @@ impl CommandHandler for UpdateHandler {
         // Perform updates
         let mut success_count = 0;
         let mut error_count = 0;
+        let mut overlay_updated = false;
 
         for (info, _) in updates {
             ctx.output.println(&format!(
@@ -514,6 +518,9 @@ impl CommandHandler for UpdateHandler {
                         "Updated {} ({}) to v{}",
                         result.region, result.package_type, result.version
                     ));
+                    if result.package_type == PackageType::Overlay {
+                        overlay_updated = true;
+                    }
                     success_count += 1;
                 }
                 Err(e) => {
@@ -529,6 +536,12 @@ impl CommandHandler for UpdateHandler {
             "Update complete: {} succeeded, {} failed",
             success_count, error_count
         ));
+
+        // Rebuild consolidated overlay if any overlay packages were updated
+        if overlay_updated {
+            ctx.output.newline();
+            rebuild_consolidated_overlay(&args.install_dir, &args.custom_scenery_path, ctx);
+        }
 
         Ok(())
     }
@@ -586,24 +599,16 @@ impl CommandHandler for RemoveHandler {
             return Ok(());
         }
 
-        // Remove symlink for overlay packages first
+        // Clean up stale per-region overlay symlink if one exists
         if args.package_type == PackageType::Overlay {
             if let Some(ref custom_scenery_path) = args.custom_scenery_path {
-                ctx.output
-                    .println("Removing symlink from Custom Scenery...");
                 match remove_overlay_symlink(&args.region, custom_scenery_path) {
                     Ok(true) => {
-                        ctx.output.success("Symlink removed.");
+                        tracing::info!(region = %args.region, "Removed stale per-region overlay symlink");
                     }
-                    Ok(false) => {
-                        ctx.output.println("No symlink found to remove.");
-                    }
+                    Ok(false) => {}
                     Err(e) => {
-                        ctx.output
-                            .error(&format!("Warning: Failed to remove symlink: {}", e));
-                        ctx.output.println(
-                            "You may need to manually remove the symlink from your Custom Scenery folder.",
-                        );
+                        tracing::warn!(region = %args.region, error = %e, "Failed to remove per-region overlay symlink");
                     }
                 }
             }
@@ -617,6 +622,11 @@ impl CommandHandler for RemoveHandler {
 
         ctx.output
             .success(&format!("Removed {} ({})", args.region, args.package_type));
+
+        // Rebuild consolidated overlay after removing an overlay package
+        if args.package_type == PackageType::Overlay {
+            rebuild_consolidated_overlay(&args.install_dir, &args.custom_scenery_path, ctx);
+        }
 
         Ok(())
     }

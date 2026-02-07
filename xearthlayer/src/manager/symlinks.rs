@@ -25,25 +25,12 @@ use super::{ManagerError, ManagerResult};
 /// Marker file name used to identify XEarthLayer symlinks.
 const SYMLINK_MARKER: &str = ".xearthlayer_symlink";
 
-/// Create a symlink for an overlay package in the Custom Scenery directory.
+/// Create a per-region symlink for an overlay package in the Custom Scenery directory.
 ///
-/// # Arguments
-///
-/// * `package_path` - Path to the installed overlay package
-/// * `custom_scenery_path` - Path to X-Plane's Custom Scenery directory
-///
-/// # Returns
-///
-/// The path to the created symlink.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The package doesn't exist
-/// - The Custom Scenery directory doesn't exist
-/// - A non-symlink file/directory already exists at the target
-/// - Symlink creation fails
-pub fn create_overlay_symlink(
+/// This approach is superseded by the consolidated overlay (`yzXEL_overlay/`).
+/// Kept for test setup only.
+#[cfg(test)]
+fn create_overlay_symlink(
     package_path: &Path,
     custom_scenery_path: &Path,
 ) -> ManagerResult<PathBuf> {
@@ -121,12 +108,14 @@ pub fn create_overlay_symlink(
     Ok(symlink_path)
 }
 
-/// Remove an overlay symlink from the Custom Scenery directory.
+/// Remove a per-region overlay symlink from the Custom Scenery directory.
 ///
-/// # Arguments
+/// # Deprecation
 ///
-/// * `region` - The region code (e.g., "na", "eu")
-/// * `custom_scenery_path` - Path to X-Plane's Custom Scenery directory
+/// Per-region overlay symlinks are superseded by the consolidated overlay
+/// (`yzXEL_overlay/`). This function is retained only for cleaning up stale
+/// per-region symlinks from prior versions. Remove in v0.4.0 once all users
+/// have migrated.
 ///
 /// # Returns
 ///
@@ -166,6 +155,8 @@ pub fn remove_overlay_symlink(region: &str, custom_scenery_path: &Path) -> Manag
 /// Check if a path is an XEarthLayer-managed symlink.
 ///
 /// This checks if the symlink points to a directory containing our marker file.
+/// Only used by `create_overlay_symlink` which is test-only.
+#[cfg(test)]
 fn is_xearthlayer_symlink(path: &Path) -> ManagerResult<bool> {
     if !path.is_symlink() {
         return Ok(false);
@@ -182,19 +173,16 @@ fn is_xearthlayer_symlink(path: &Path) -> ManagerResult<bool> {
     Ok(marker_path.exists())
 }
 
-/// Get the symlink path for an overlay package.
-///
-/// # Arguments
-///
-/// * `region` - The region code
-/// * `custom_scenery_path` - Path to X-Plane's Custom Scenery directory
-pub fn overlay_symlink_path(region: &str, custom_scenery_path: &Path) -> PathBuf {
+/// Get the symlink path for a per-region overlay package.
+#[cfg(test)]
+fn overlay_symlink_path(region: &str, custom_scenery_path: &Path) -> PathBuf {
     let folder_name = package::package_mountpoint(region, PackageType::Overlay);
     custom_scenery_path.join(folder_name)
 }
 
-/// Check if an overlay symlink exists for a region.
-pub fn overlay_symlink_exists(region: &str, custom_scenery_path: &Path) -> bool {
+/// Check if a per-region overlay symlink exists.
+#[cfg(test)]
+fn overlay_symlink_exists(region: &str, custom_scenery_path: &Path) -> bool {
     let symlink_path = overlay_symlink_path(region, custom_scenery_path);
     symlink_path.is_symlink()
 }
@@ -262,6 +250,44 @@ impl ConsolidatedOverlayResult {
     }
 }
 
+/// Scan Custom Scenery for any per-region overlay symlinks and remove them.
+///
+/// Scans the directory for symlinks matching the `yzXEL_<region>_overlay` pattern
+/// (but not `yzXEL_overlay` which is the consolidated folder). This catches symlinks
+/// for regions that are no longer installed — not just currently known regions.
+fn cleanup_all_per_region_overlay_symlinks(custom_scenery_path: &Path) {
+    let prefix = "yzXEL_";
+    let suffix = "_overlay";
+
+    let entries = match fs::read_dir(custom_scenery_path) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Match yzXEL_<region>_overlay pattern (but not yzXEL_overlay which is the consolidated folder)
+        if name_str.starts_with(prefix)
+            && name_str.ends_with(suffix)
+            && name_str != CONSOLIDATED_OVERLAY_NAME
+        {
+            let path = entry.path();
+            if path.is_symlink() {
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        tracing::info!(name = %name_str, "Removed stale per-region overlay symlink")
+                    }
+                    Err(e) => {
+                        tracing::warn!(name = %name_str, error = %e, "Failed to remove stale per-region overlay symlink")
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Create a consolidated overlay folder merging all installed overlay packages.
 ///
 /// This creates a single `yzXEL_overlay` folder in Custom Scenery containing
@@ -323,7 +349,13 @@ pub fn create_consolidated_overlay(
     overlay_packages.sort_by_key(|a| a.region().to_lowercase());
 
     if overlay_packages.is_empty() {
-        tracing::debug!("No overlay packages found, skipping consolidated overlay");
+        tracing::debug!("No overlay packages found, cleaning up overlay artifacts");
+        // Remove consolidated overlay folder if it exists
+        if let Err(e) = remove_consolidated_overlay(custom_scenery_path) {
+            tracing::warn!(error = %e, "Failed to remove consolidated overlay during cleanup");
+        }
+        // Clean up any stale per-region overlay symlinks
+        cleanup_all_per_region_overlay_symlinks(custom_scenery_path);
         return ConsolidatedOverlayResult::no_packages();
     }
 
@@ -472,6 +504,9 @@ pub fn create_consolidated_overlay(
         files = file_count,
         "Created consolidated overlay folder"
     );
+
+    // Clean up all stale per-region overlay symlinks (including regions no longer installed).
+    cleanup_all_per_region_overlay_symlinks(custom_scenery_path);
 
     ConsolidatedOverlayResult::success(
         consolidated_path,
@@ -693,6 +728,51 @@ mod tests {
     }
 
     #[test]
+    fn test_consolidated_overlay_no_packages_cleans_up_artifacts() {
+        let packages_dir = TempDir::new().unwrap();
+        let scenery_dir = TempDir::new().unwrap();
+
+        // Create a stale consolidated overlay folder with marker
+        let consolidated = scenery_dir.path().join(CONSOLIDATED_OVERLAY_NAME);
+        fs::create_dir_all(&consolidated).unwrap();
+        fs::write(consolidated.join(SYMLINK_MARKER), "consolidated overlay").unwrap();
+
+        // Create stale per-region symlinks
+        let fake_target = packages_dir.path().join("fake_na");
+        fs::create_dir(&fake_target).unwrap();
+        symlink(&fake_target, scenery_dir.path().join("yzXEL_na_overlay")).unwrap();
+
+        let fake_target_eu = packages_dir.path().join("fake_eu");
+        fs::create_dir(&fake_target_eu).unwrap();
+        symlink(&fake_target_eu, scenery_dir.path().join("yzXEL_eu_overlay")).unwrap();
+
+        assert!(consolidated.exists());
+        assert!(scenery_dir.path().join("yzXEL_na_overlay").is_symlink());
+        assert!(scenery_dir.path().join("yzXEL_eu_overlay").is_symlink());
+
+        // Rebuild with empty store — should clean up everything
+        let store = LocalPackageStore::new(packages_dir.path());
+        let result = create_consolidated_overlay(&store, scenery_dir.path());
+
+        assert!(result.success);
+        assert_eq!(result.package_count, 0);
+
+        // All artifacts should be removed
+        assert!(
+            !consolidated.exists(),
+            "Consolidated overlay folder should have been removed"
+        );
+        assert!(
+            !scenery_dir.path().join("yzXEL_na_overlay").exists(),
+            "Stale na per-region symlink should have been removed"
+        );
+        assert!(
+            !scenery_dir.path().join("yzXEL_eu_overlay").exists(),
+            "Stale eu per-region symlink should have been removed"
+        );
+    }
+
+    #[test]
     fn test_consolidated_overlay_single_package() {
         let packages_dir = TempDir::new().unwrap();
         let scenery_dir = TempDir::new().unwrap();
@@ -790,6 +870,42 @@ mod tests {
 
         // Should still exist
         assert!(fake_overlay.exists());
+    }
+
+    #[test]
+    fn test_consolidated_overlay_cleans_up_per_region_symlinks() {
+        let packages_dir = TempDir::new().unwrap();
+        let scenery_dir = TempDir::new().unwrap();
+
+        // Create overlay packages
+        create_mock_overlay_with_dsf(packages_dir.path(), "na");
+        create_mock_overlay_with_dsf(packages_dir.path(), "eu");
+
+        // Create stale per-region symlinks (simulating old behavior)
+        let na_package = create_mock_overlay_package(packages_dir.path(), "na");
+        create_overlay_symlink(&na_package, scenery_dir.path()).unwrap();
+        assert!(overlay_symlink_exists("na", scenery_dir.path()));
+
+        let eu_package = create_mock_overlay_package(packages_dir.path(), "eu");
+        create_overlay_symlink(&eu_package, scenery_dir.path()).unwrap();
+        assert!(overlay_symlink_exists("eu", scenery_dir.path()));
+
+        // Build consolidated overlay — should clean up per-region symlinks
+        let store = LocalPackageStore::new(packages_dir.path());
+        let result = create_consolidated_overlay(&store, scenery_dir.path());
+
+        assert!(result.success, "Error: {:?}", result.error);
+        assert!(consolidated_overlay_exists(scenery_dir.path()));
+
+        // Per-region symlinks should be removed
+        assert!(
+            !overlay_symlink_exists("na", scenery_dir.path()),
+            "Stale na per-region symlink should have been removed"
+        );
+        assert!(
+            !overlay_symlink_exists("eu", scenery_dir.path()),
+            "Stale eu per-region symlink should have been removed"
+        );
     }
 
     #[test]
