@@ -73,17 +73,7 @@ impl TileCoord {
         let (lat, lon) = self.to_lat_lon();
         let dsf_lat = lat.floor() as i32;
         let dsf_lon = lon.floor() as i32;
-
-        let lat_sign = if dsf_lat >= 0 { '+' } else { '-' };
-        let lon_sign = if dsf_lon >= 0 { '+' } else { '-' };
-
-        format!(
-            "{}{:02}{}{:03}",
-            lat_sign,
-            dsf_lat.abs(),
-            lon_sign,
-            dsf_lon.abs()
-        )
+        super::format_dsf_name(dsf_lat, dsf_lon)
     }
 }
 

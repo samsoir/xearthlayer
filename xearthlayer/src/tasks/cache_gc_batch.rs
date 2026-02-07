@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::cache::key_to_full_path;
 use crate::cache::LruIndex;
 use crate::executor::{ResourceType, Task, TaskContext, TaskOutput, TaskResult};
 
@@ -105,8 +106,8 @@ impl Task for CacheGcBatchTask {
                     break;
                 }
 
-                // Compute file path from key
-                let path = self.cache_path.join(LruIndex::key_to_filename(key));
+                // Compute file path from key (includes region subdirectory)
+                let path = key_to_full_path(&self.cache_path, key);
 
                 // Get file size before deletion (for tracking freed bytes)
                 let file_size = match tokio::fs::metadata(&path).await {
@@ -193,8 +194,10 @@ mod tests {
     }
 
     fn write_cache_file(dir: &TempDir, key: &str, size: usize) {
-        let filename = LruIndex::key_to_filename(key);
-        let path = dir.path().join(&filename);
+        let path = key_to_full_path(dir.path(), key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
         std::fs::write(&path, vec![0u8; size]).unwrap();
     }
 
@@ -263,8 +266,8 @@ mod tests {
         assert!(result.is_success());
 
         // Verify files deleted
-        assert!(!temp_dir.path().join("tile_15_100_200.cache").exists());
-        assert!(!temp_dir.path().join("tile_15_100_201.cache").exists());
+        assert!(!key_to_full_path(temp_dir.path(), "tile:15:100:200").exists());
+        assert!(!key_to_full_path(temp_dir.path(), "tile:15:100:201").exists());
 
         // Verify index updated
         assert_eq!(index.entry_count(), 0);
@@ -360,7 +363,7 @@ mod tests {
         }
 
         // Files should still exist
-        assert!(temp_dir.path().join("tile_15_100_0.cache").exists());
+        assert!(key_to_full_path(temp_dir.path(), "tile:15:100:0").exists());
     }
 
     #[tokio::test]

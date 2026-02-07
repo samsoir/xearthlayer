@@ -10,6 +10,17 @@ pub use types::{
     MIN_ZOOM,
 };
 
+/// Format a DSF-style directory name from integer lat/lon.
+///
+/// Produces names like `+33-119`, `-12+005`, `+00+000` following
+/// X-Plane's DSF naming convention (southwest corner of 1°×1° tile).
+#[inline]
+pub fn format_dsf_name(lat: i32, lon: i32) -> String {
+    let lat_sign = if lat >= 0 { '+' } else { '-' };
+    let lon_sign = if lon >= 0 { '+' } else { '-' };
+    format!("{}{:02}{}{:03}", lat_sign, lat.abs(), lon_sign, lon.abs())
+}
+
 use std::f64::consts::PI;
 
 /// Converts geographic coordinates to tile coordinates.

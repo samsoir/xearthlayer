@@ -20,12 +20,15 @@
 //! - Kept in sync via `record()`, `touch()`, `remove()` during operations
 //! - Uses filesystem mtime as initial `last_accessed` during startup
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use dashmap::DashMap;
+use rayon::prelude::*;
 
+use crate::coord::{format_dsf_name, tile_to_lat_lon_center, TileCoord};
 use crate::time::system_time_to_instant;
 
 /// Minimal metadata for cache entry tracking.
@@ -59,16 +62,57 @@ pub struct EvictionCandidate {
     pub metadata: CacheEntryMetadata,
 }
 
+/// Derive the DSF region directory name from a cache key.
+///
+/// Parses the tile coordinates from the key, converts to the tile's
+/// geographic center, then floors to the 1°×1° DSF tile boundary.
+///
+/// Returns `None` for unrecognized key formats.
+///
+/// # Examples
+///
+/// - `"tile:15:12754:5279"` → region based on tile center lat/lon
+/// - `"chunk:15:12754:5279:8:12"` → same region as parent tile
+pub fn key_to_region(key: &str) -> Option<String> {
+    let parts: Vec<&str> = key.split(':').collect();
+    let (zoom, row, col) = match parts.as_slice() {
+        ["tile", zoom, row, col] => (*zoom, *row, *col),
+        ["chunk", zoom, tile_row, tile_col, _, _] => (*zoom, *tile_row, *tile_col),
+        _ => return None,
+    };
+    let zoom: u8 = zoom.parse().ok()?;
+    let row: u32 = row.parse().ok()?;
+    let col: u32 = col.parse().ok()?;
+
+    let tile = TileCoord { row, col, zoom };
+    let (lat, lon) = tile_to_lat_lon_center(&tile);
+    let dsf_lat = lat.floor() as i32;
+    let dsf_lon = lon.floor() as i32;
+
+    Some(format_dsf_name(dsf_lat, dsf_lon))
+}
+
+/// Compute the full file path for a cache key given a base cache directory.
+///
+/// This is a standalone function that doesn't require an `LruIndex` instance,
+/// useful for components that only need path resolution (e.g., GC batch tasks).
+pub fn key_to_full_path(cache_path: &Path, key: &str) -> PathBuf {
+    match key_to_region(key) {
+        Some(region) => cache_path.join(region).join(LruIndex::key_to_filename(key)),
+        None => cache_path.join(LruIndex::key_to_filename(key)),
+    }
+}
+
 /// Thread-safe in-memory LRU index for cache entries.
 ///
 /// Uses `DashMap` for concurrent access and `AtomicU64` for size tracking.
 pub struct LruIndex {
     /// Map from cache key to entry metadata.
-    entries: DashMap<String, CacheEntryMetadata>,
+    entries: Arc<DashMap<String, CacheEntryMetadata>>,
     /// Total size of all tracked entries.
-    total_size: AtomicU64,
+    total_size: Arc<AtomicU64>,
     /// Total entry count.
-    entry_count: AtomicU64,
+    entry_count: Arc<AtomicU64>,
     /// Base cache directory for path computation.
     cache_path: PathBuf,
 }
@@ -81,9 +125,9 @@ impl LruIndex {
     /// * `cache_path` - Base directory for the cache files
     pub fn new(cache_path: PathBuf) -> Self {
         Self {
-            entries: DashMap::new(),
-            total_size: AtomicU64::new(0),
-            entry_count: AtomicU64::new(0),
+            entries: Arc::new(DashMap::new()),
+            total_size: Arc::new(AtomicU64::new(0)),
+            entry_count: Arc::new(AtomicU64::new(0)),
             cache_path,
         }
     }
@@ -197,7 +241,9 @@ impl LruIndex {
 
     /// Compute the file path for a cache key.
     ///
-    /// Uses a safe filename encoding that is reversible.
+    /// Routes recognized keys (tile/chunk) through a region subdirectory
+    /// derived from the tile's geographic center. Unrecognized keys fall
+    /// back to the flat cache directory.
     ///
     /// # Arguments
     ///
@@ -207,7 +253,7 @@ impl LruIndex {
     ///
     /// Full path to the cache file.
     pub fn key_to_path(&self, key: &str) -> PathBuf {
-        self.cache_path.join(Self::key_to_filename(key))
+        key_to_full_path(&self.cache_path, key)
     }
 
     /// Convert a cache key to a safe filename.
@@ -246,8 +292,9 @@ impl LruIndex {
 
     /// Populate the index from existing cache files on disk.
     ///
-    /// Scans the cache directory and adds entries for each valid cache file.
-    /// Uses file mtime as initial `last_accessed` approximation.
+    /// Scans region subdirectories in parallel using rayon, then aggregates
+    /// results. Each region directory is scanned sequentially (manageable
+    /// file counts), but regions are processed concurrently.
     ///
     /// This should be called once at startup.
     ///
@@ -255,80 +302,114 @@ impl LruIndex {
     ///
     /// Statistics about the population process.
     pub async fn populate_from_disk(&self) -> std::io::Result<PopulateStats> {
-        let mut stats = PopulateStats::default();
-
-        // Check if directory exists
         if !self.cache_path.exists() {
-            return Ok(stats);
+            return Ok(PopulateStats::default());
         }
 
-        let mut dir = tokio::fs::read_dir(&self.cache_path).await?;
-
-        while let Some(entry) = dir.next_entry().await? {
-            let path = entry.path();
-
-            // Skip non-files
-            let metadata = match tokio::fs::metadata(&path).await {
-                Ok(m) if m.is_file() => m,
-                _ => continue,
-            };
-
-            // Parse filename to get key
-            let filename = match path.file_name().and_then(|n| n.to_str()) {
-                Some(f) => f,
-                None => {
-                    stats.skipped_unparseable += 1;
-                    continue;
-                }
-            };
-
-            let key = match Self::filename_to_key(filename) {
-                Some(k) => k,
-                None => {
-                    stats.skipped_unparseable += 1;
-                    continue;
-                }
-            };
-
-            // Use file mtime as initial last_accessed approximation
-            let last_accessed = metadata
-                .modified()
-                .ok()
-                .and_then(system_time_to_instant)
-                .unwrap_or_else(Instant::now);
-
-            let size = metadata.len();
-
-            let old = self.entries.insert(
-                key,
-                CacheEntryMetadata {
-                    size_bytes: size,
-                    last_accessed,
-                },
-            );
-
-            if let Some(old_entry) = old {
-                // Entry already exists (e.g. populate called twice) - adjust delta
-                if size > old_entry.size_bytes {
-                    self.total_size
-                        .fetch_add(size - old_entry.size_bytes, Ordering::Relaxed);
-                } else {
-                    self.total_size
-                        .fetch_sub(old_entry.size_bytes - size, Ordering::Relaxed);
-                }
-            } else {
-                // New entry
-                self.total_size.fetch_add(size, Ordering::Relaxed);
-                self.entry_count.fetch_add(1, Ordering::Relaxed);
-            }
-            stats.files_indexed += 1;
-            stats.total_bytes += size;
-
-            // Yield periodically to avoid blocking (every 100 files)
-            if stats.files_indexed % 100 == 0 {
-                tokio::task::yield_now().await;
+        // Collect region subdirectories (fast — just a directory listing)
+        let mut region_dirs = Vec::new();
+        let dir = std::fs::read_dir(&self.cache_path)?;
+        for entry in dir {
+            let entry = entry?;
+            if entry.path().is_dir() {
+                region_dirs.push(entry.path());
             }
         }
+
+        if region_dirs.is_empty() {
+            return Ok(PopulateStats::default());
+        }
+
+        // Clone Arc handles for the spawn_blocking closure
+        let entries = Arc::clone(&self.entries);
+        let total_size = Arc::clone(&self.total_size);
+        let entry_count = Arc::clone(&self.entry_count);
+
+        let stats = tokio::task::spawn_blocking(move || {
+            // Shared atomics for aggregating stats across parallel tasks
+            let files_indexed = AtomicU64::new(0);
+            let skipped_unparseable = AtomicU64::new(0);
+            let total_bytes = AtomicU64::new(0);
+
+            region_dirs.par_iter().for_each(|region_dir| {
+                let dir = match std::fs::read_dir(region_dir) {
+                    Ok(d) => d,
+                    Err(_) => return,
+                };
+
+                for entry in dir {
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+
+                    let path = entry.path();
+
+                    // Skip non-files
+                    let metadata = match std::fs::metadata(&path) {
+                        Ok(m) if m.is_file() => m,
+                        _ => continue,
+                    };
+
+                    // Parse filename to get key
+                    let filename = match path.file_name().and_then(|n| n.to_str()) {
+                        Some(f) => f,
+                        None => {
+                            skipped_unparseable.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+
+                    let key = match LruIndex::filename_to_key(filename) {
+                        Some(k) => k,
+                        None => {
+                            skipped_unparseable.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+
+                    // Use file mtime as initial last_accessed approximation
+                    let last_accessed = metadata
+                        .modified()
+                        .ok()
+                        .and_then(system_time_to_instant)
+                        .unwrap_or_else(Instant::now);
+
+                    let size = metadata.len();
+
+                    let old = entries.insert(
+                        key,
+                        CacheEntryMetadata {
+                            size_bytes: size,
+                            last_accessed,
+                        },
+                    );
+
+                    if let Some(old_entry) = old {
+                        // Entry already exists (e.g. populate called twice) - adjust delta
+                        if size > old_entry.size_bytes {
+                            total_size.fetch_add(size - old_entry.size_bytes, Ordering::Relaxed);
+                        } else {
+                            total_size.fetch_sub(old_entry.size_bytes - size, Ordering::Relaxed);
+                        }
+                    } else {
+                        // New entry
+                        total_size.fetch_add(size, Ordering::Relaxed);
+                        entry_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    files_indexed.fetch_add(1, Ordering::Relaxed);
+                    total_bytes.fetch_add(size, Ordering::Relaxed);
+                }
+            });
+
+            PopulateStats {
+                files_indexed: files_indexed.load(Ordering::Relaxed),
+                skipped_unparseable: skipped_unparseable.load(Ordering::Relaxed),
+                total_bytes: total_bytes.load(Ordering::Relaxed),
+            }
+        })
+        .await
+        .map_err(std::io::Error::other)?;
 
         // Calculate average file size for diagnostics
         let avg_size_kb = if stats.files_indexed > 0 {
@@ -342,7 +423,7 @@ impl LruIndex {
             skipped = stats.skipped_unparseable,
             total_size_mb = stats.total_bytes / 1_000_000,
             avg_size_kb = avg_size_kb,
-            "LRU index populated from disk"
+            "LRU index populated from disk (parallel scan)"
         );
 
         Ok(stats)
@@ -567,16 +648,32 @@ mod tests {
     }
 
     #[test]
-    fn key_to_path_uses_cache_directory() {
+    fn key_to_path_includes_region_subdir() {
         let temp_dir = TempDir::new().unwrap();
         let index = LruIndex::new(temp_dir.path().to_path_buf());
 
         let path = index.key_to_path("tile:15:100:200");
 
-        assert_eq!(path.parent().unwrap(), temp_dir.path());
+        // Path should include a region subdirectory between cache dir and filename
+        let region = key_to_region("tile:15:100:200").unwrap();
+        assert_eq!(path.parent().unwrap(), temp_dir.path().join(&region));
         assert_eq!(
             path.file_name().unwrap().to_str().unwrap(),
             "tile_15_100_200.cache"
+        );
+    }
+
+    #[test]
+    fn key_to_path_fallback_for_unknown_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let index = LruIndex::new(temp_dir.path().to_path_buf());
+
+        // Unrecognized key format falls back to flat path
+        let path = index.key_to_path("unknown:key:format");
+        assert_eq!(path.parent().unwrap(), temp_dir.path());
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            "unknown_key_format.cache"
         );
     }
 
@@ -584,21 +681,22 @@ mod tests {
     // Disk population
     // ─────────────────────────────────────────────────────────────────────────
 
+    /// Helper to create a cache file in the correct region subdirectory.
+    fn write_region_cache_file(base: &Path, key: &str, size: usize) {
+        let path = key_to_full_path(base, key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, vec![0u8; size]).unwrap();
+    }
+
     #[tokio::test]
     async fn populate_from_disk_indexes_all_files() {
         let temp_dir = TempDir::new().unwrap();
 
-        // Create some cache files
-        std::fs::write(
-            temp_dir.path().join("tile_15_100_200.cache"),
-            vec![0u8; 1000],
-        )
-        .unwrap();
-        std::fs::write(
-            temp_dir.path().join("tile_15_100_201.cache"),
-            vec![0u8; 2000],
-        )
-        .unwrap();
+        // Create cache files in region subdirectories
+        write_region_cache_file(temp_dir.path(), "tile:15:100:200", 1000);
+        write_region_cache_file(temp_dir.path(), "tile:15:100:201", 2000);
 
         let index = LruIndex::new(temp_dir.path().to_path_buf());
         let stats = index.populate_from_disk().await.unwrap();
@@ -616,16 +714,14 @@ mod tests {
     async fn populate_from_disk_skips_non_cache_files() {
         let temp_dir = TempDir::new().unwrap();
 
-        // Valid cache file
-        std::fs::write(
-            temp_dir.path().join("tile_15_100_200.cache"),
-            vec![0u8; 1000],
-        )
-        .unwrap();
+        // Valid cache file in region subdir
+        write_region_cache_file(temp_dir.path(), "tile:15:100:200", 1000);
 
-        // Non-cache files
-        std::fs::write(temp_dir.path().join("readme.txt"), "hello").unwrap();
-        std::fs::write(temp_dir.path().join("data.json"), "{}").unwrap();
+        // Non-cache files in the same region dir
+        let region = key_to_region("tile:15:100:200").unwrap();
+        let region_dir = temp_dir.path().join(&region);
+        std::fs::write(region_dir.join("readme.txt"), "hello").unwrap();
+        std::fs::write(region_dir.join("data.json"), "{}").unwrap();
 
         let index = LruIndex::new(temp_dir.path().to_path_buf());
         let stats = index.populate_from_disk().await.unwrap();
@@ -659,17 +755,9 @@ mod tests {
     async fn populate_from_disk_is_idempotent() {
         let temp_dir = TempDir::new().unwrap();
 
-        // Create some cache files
-        std::fs::write(
-            temp_dir.path().join("chunk_15_100_200_8_12.cache"),
-            vec![0u8; 1000],
-        )
-        .unwrap();
-        std::fs::write(
-            temp_dir.path().join("chunk_15_100_201_0_0.cache"),
-            vec![0u8; 2000],
-        )
-        .unwrap();
+        // Create cache files in region subdirectories
+        write_region_cache_file(temp_dir.path(), "chunk:15:100:200:8:12", 1000);
+        write_region_cache_file(temp_dir.path(), "chunk:15:100:201:0:0", 2000);
 
         let index = LruIndex::new(temp_dir.path().to_path_buf());
 
@@ -700,12 +788,8 @@ mod tests {
     async fn populate_from_disk_after_record_does_not_double_count() {
         let temp_dir = TempDir::new().unwrap();
 
-        // Create a cache file
-        std::fs::write(
-            temp_dir.path().join("chunk_15_100_200_8_12.cache"),
-            vec![0u8; 1000],
-        )
-        .unwrap();
+        // Create a cache file in region subdirectory
+        write_region_cache_file(temp_dir.path(), "chunk:15:100:200:8:12", 1000);
 
         let index = LruIndex::new(temp_dir.path().to_path_buf());
 
@@ -728,5 +812,67 @@ mod tests {
             1000,
             "re-populate after record should not double-count"
         );
+    }
+
+    #[tokio::test]
+    async fn populate_from_disk_ignores_flat_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Flat files at root (old layout) should be ignored
+        std::fs::write(
+            temp_dir.path().join("tile_15_100_200.cache"),
+            vec![0u8; 1000],
+        )
+        .unwrap();
+
+        let index = LruIndex::new(temp_dir.path().to_path_buf());
+        let stats = index.populate_from_disk().await.unwrap();
+
+        assert_eq!(stats.files_indexed, 0);
+        assert_eq!(index.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn populate_from_disk_handles_empty_region_dirs() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create empty region directories
+        std::fs::create_dir_all(temp_dir.path().join("+33-119")).unwrap();
+        std::fs::create_dir_all(temp_dir.path().join("+40-074")).unwrap();
+
+        let index = LruIndex::new(temp_dir.path().to_path_buf());
+        let stats = index.populate_from_disk().await.unwrap();
+
+        assert_eq!(stats.files_indexed, 0);
+        assert_eq!(index.entry_count(), 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Region derivation
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_key_to_region_tile_key() {
+        let region = key_to_region("tile:15:12754:5279");
+        assert!(region.is_some());
+        let region = region.unwrap();
+        // Should be a valid DSF name format (+NN-NNN or similar)
+        assert!(region.len() >= 5);
+        assert!(region.starts_with('+') || region.starts_with('-'));
+    }
+
+    #[test]
+    fn test_key_to_region_chunk_key() {
+        // Chunk key should map to same region as its parent tile
+        let tile_region = key_to_region("tile:15:12754:5279").unwrap();
+        let chunk_region = key_to_region("chunk:15:12754:5279:8:12").unwrap();
+        assert_eq!(tile_region, chunk_region);
+    }
+
+    #[test]
+    fn test_key_to_region_unknown_key() {
+        assert!(key_to_region("unknown:format").is_none());
+        assert!(key_to_region("").is_none());
+        assert!(key_to_region("just_a_string").is_none());
     }
 }

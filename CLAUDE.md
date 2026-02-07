@@ -52,6 +52,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `CacheService` - Self-contained cache with internal GC daemons
    - `MemoryCacheProvider`: moka-based LRU eviction (default 2GB)
    - `DiskCacheProvider`: Owns GC daemon internally (default 20GB)
+   - Region-based disk layout: files in 1°×1° DSF subdirs (e.g., `+33-119/tile_15_12754_5279.cache`)
+   - Parallel startup scanning via rayon over region directories
+   - `migrate_cache()` for migrating flat-layout caches to region layout
    - Bridge adapters for executor integration (MemoryCacheBridge, DiskCacheBridge)
    - Per-provider cache directories
    - `XEarthLayerService::start()` creates `CacheLayer` with proper metrics ordering
@@ -194,7 +197,7 @@ xearthlayer setup                   # Interactive setup wizard (first-time confi
 xearthlayer init                    # Create config file with defaults
 xearthlayer run                     # Mount all packages and start streaming (primary command)
 xearthlayer download --lat --lon    # Download single tile
-xearthlayer cache clear|stats       # Cache management
+xearthlayer cache clear|stats|migrate # Cache management
 
 # Scenery index cache
 xearthlayer scenery-index status    # Show cache status and tile counts

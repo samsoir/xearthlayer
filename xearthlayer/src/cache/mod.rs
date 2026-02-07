@@ -43,6 +43,7 @@
 mod config;
 pub mod gc_scheduler;
 pub mod lru_index;
+pub mod migrate;
 pub mod providers;
 mod service;
 mod traits;
@@ -66,7 +67,9 @@ pub use traits::{Cache, GcResult, ServiceCacheError};
 pub use gc_scheduler::{
     GcSchedulerDaemon, DEFAULT_CHECK_INTERVAL_SECS, DEFAULT_TARGET_RATIO, DEFAULT_TRIGGER_THRESHOLD,
 };
-pub use lru_index::{CacheEntryMetadata, EvictionCandidate, LruIndex, PopulateStats};
+pub use lru_index::{
+    key_to_full_path, key_to_region, CacheEntryMetadata, EvictionCandidate, LruIndex, PopulateStats,
+};
 pub use providers::{DiskCacheProvider, MemoryCacheProvider};
 
 // Domain decorator exports (Phase 2)

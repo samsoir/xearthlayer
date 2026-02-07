@@ -11,17 +11,21 @@
 //!
 //! # File Layout
 //!
-//! Files are stored in a flat structure with reversible names:
+//! Files are stored in 1°×1° DSF region subdirectories with reversible names:
 //! ```text
-//! {cache_dir}/{key_with_underscores}.cache
+//! {cache_dir}/{region}/{key_with_underscores}.cache
 //! ```
 //!
-//! Example: `tile:15:12754:5279` → `tile_15_12754_5279.cache`
+//! The region is derived from the tile's geographic center (e.g., `+33-119`).
+//! This enables parallel scanning on startup via rayon.
+//!
+//! Example: `tile:15:12754:5279` → `+33-119/tile_15_12754_5279.cache`
 //!
 //! # Migration Note
 //!
-//! Caches created with older versions (which used hashed filenames) are not
-//! automatically migrated. Run `xearthlayer cache clear` to start fresh.
+//! Caches from versions prior to v0.3 (flat layout or hashed filenames) are
+//! not automatically migrated. Run `xearthlayer cache migrate` to move flat
+//! files into region subdirectories, or `xearthlayer cache clear` to start fresh.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -229,9 +233,10 @@ impl DiskCacheProvider {
 
     /// Get the file path for a cache key.
     ///
-    /// Uses reversible encoding: colons replaced with underscores.
+    /// Delegates to `LruIndex::key_to_path()` as the single source of truth
+    /// for path resolution, ensuring region subdirectories are used.
     fn key_path(&self, key: &str) -> PathBuf {
-        self.directory.join(LruIndex::key_to_filename(key))
+        self.lru_index.key_to_path(key)
     }
 }
 
@@ -242,6 +247,13 @@ impl Cache for DiskCacheProvider {
         let key_owned = key.to_string();
 
         Box::pin(async move {
+            // Ensure parent directory exists (creates region dir on first write)
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(ServiceCacheError::Io)?;
+            }
+
             // Write atomically via temp file
             let temp_path = path.with_extension("tmp");
             tokio::fs::write(&temp_path, &value)
@@ -508,13 +520,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_disk_provider_atomic_write() {
-        let (temp_dir, provider) = create_test_provider(1_000_000).await;
+        let (_temp_dir, provider) = create_test_provider(1_000_000).await;
 
         // Write should be atomic (temp file + rename)
         provider.set("key1", vec![1, 2, 3]).await.unwrap();
 
-        // No temp files should remain
-        let files: Vec<_> = std::fs::read_dir(temp_dir.path())
+        // No temp files should remain (check in the region directory)
+        let cache_path = provider.lru_index().key_to_path("key1");
+        let parent = cache_path.parent().unwrap();
+        let files: Vec<_> = std::fs::read_dir(parent)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "tmp"))
@@ -527,14 +541,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_disk_provider_stale_index_cleanup_on_get() {
-        let (temp_dir, provider) = create_test_provider(1_000_000).await;
+        let (_temp_dir, provider) = create_test_provider(1_000_000).await;
 
         // Set a value
         provider.set("key1", vec![1, 2, 3]).await.unwrap();
         assert!(provider.lru_index().contains("key1"));
 
-        // Manually delete the file (simulating external deletion)
-        let path = temp_dir.path().join("key1.cache");
+        // Manually delete the file using the provider's path resolution
+        let path = provider.lru_index().key_to_path("key1");
         std::fs::remove_file(path).unwrap();
 
         // Get should return None and clean up index
@@ -547,13 +561,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_disk_provider_stale_index_cleanup_on_contains() {
-        let (temp_dir, provider) = create_test_provider(1_000_000).await;
+        let (_temp_dir, provider) = create_test_provider(1_000_000).await;
 
         // Set a value
         provider.set("key1", vec![1, 2, 3]).await.unwrap();
 
-        // Manually delete the file
-        let path = temp_dir.path().join("key1.cache");
+        // Manually delete the file using the provider's path resolution
+        let path = provider.lru_index().key_to_path("key1");
         std::fs::remove_file(path).unwrap();
 
         // Contains should return false and clean up index
@@ -567,17 +581,13 @@ mod tests {
     async fn test_scan_initial_size_does_not_double_count() {
         let temp_dir = TempDir::new().unwrap();
 
-        // Pre-populate disk with cache files before starting provider
-        std::fs::write(
-            temp_dir.path().join("chunk_15_100_200_8_12.cache"),
-            vec![0u8; 1000],
-        )
-        .unwrap();
-        std::fs::write(
-            temp_dir.path().join("chunk_15_100_201_0_0.cache"),
-            vec![0u8; 2000],
-        )
-        .unwrap();
+        // Pre-populate disk with cache files in region subdirectories
+        let path1 = crate::cache::key_to_full_path(temp_dir.path(), "chunk:15:100:200:8:12");
+        let path2 = crate::cache::key_to_full_path(temp_dir.path(), "chunk:15:100:201:0:0");
+        std::fs::create_dir_all(path1.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(path2.parent().unwrap()).unwrap();
+        std::fs::write(&path1, vec![0u8; 1000]).unwrap();
+        std::fs::write(&path2, vec![0u8; 2000]).unwrap();
 
         let config = DiskProviderConfig {
             directory: temp_dir.path().to_path_buf(),
@@ -615,6 +625,7 @@ mod tests {
     #[tokio::test]
     async fn test_disk_provider_persistence() {
         let temp_dir = TempDir::new().unwrap();
+        let key = "tile:15:100:200";
 
         // Create provider, add data, shutdown
         {
@@ -627,10 +638,7 @@ mod tests {
             };
             let provider = DiskCacheProvider::start(config).await.unwrap();
 
-            provider
-                .set("persistent", vec![1, 2, 3, 4, 5])
-                .await
-                .unwrap();
+            provider.set(key, vec![1, 2, 3, 4, 5]).await.unwrap();
             provider.shutdown().await;
         }
 
@@ -646,10 +654,10 @@ mod tests {
             let provider = DiskCacheProvider::start(config).await.unwrap();
 
             // Index should be populated from disk
-            assert!(provider.lru_index().contains("persistent"));
+            assert!(provider.lru_index().contains(key));
             assert_eq!(provider.entry_count(), 1);
 
-            let value = provider.get("persistent").await.unwrap();
+            let value = provider.get(key).await.unwrap();
             assert_eq!(value, Some(vec![1, 2, 3, 4, 5]));
 
             provider.shutdown().await;
