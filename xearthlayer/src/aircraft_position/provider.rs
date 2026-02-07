@@ -99,6 +99,11 @@ impl SharedAircraftPosition {
     pub fn receive_inference(&self, state: AircraftState) {
         self.inner.receive_inference(state);
     }
+
+    /// Receive a position update from an online network (VATSIM/IVAO/PilotEdge).
+    pub fn receive_network_position(&self, state: AircraftState) {
+        self.inner.receive_network_position(state);
+    }
 }
 
 impl AircraftPositionProvider for SharedAircraftPosition {
@@ -241,6 +246,31 @@ mod tests {
 
         let received = rx.try_recv().expect("Should receive broadcast");
         assert_eq!(received.latitude, 53.5);
+    }
+
+    #[test]
+    fn test_shared_with_network_position() {
+        let shared = create_shared();
+
+        let state = AircraftState::from_network_position(
+            33.9425,
+            -118.408,
+            270.0,
+            150.0,
+            35000.0,
+            std::time::Instant::now(),
+        );
+        shared.receive_network_position(state);
+
+        assert!(shared.has_position());
+        assert_eq!(shared.position(), Some((33.9425, -118.408)));
+        assert_eq!(
+            shared.position_source(),
+            Some(PositionSource::OnlineNetwork)
+        );
+        assert!(shared.has_vectors());
+        // Network position does not set telemetry status
+        assert_eq!(shared.telemetry_status(), TelemetryStatus::Disconnected);
     }
 
     #[test]
