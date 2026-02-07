@@ -702,10 +702,11 @@ impl ServiceOrchestrator {
             crate::aircraft_position::NetworkAdapter::new(client, network_tx, adapter_config);
 
         // Start the adapter with cancellation
-        // adapter.start() spawns its own task, so we abort it on cancellation
-        let adapter_handle = adapter.start();
+        // adapter.start() calls tokio::spawn() internally, so it must run
+        // inside the Tokio runtime context (not from the synchronous caller)
         let adapter_cancellation = self.cancellation.clone();
         runtime_handle.spawn(async move {
+            let adapter_handle = adapter.start();
             adapter_cancellation.cancelled().await;
             adapter_handle.abort();
             tracing::debug!("Network position adapter cancelled");
