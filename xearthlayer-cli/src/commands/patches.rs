@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use clap::Subcommand;
 
 use xearthlayer::config::ConfigFile;
-use xearthlayer::patches::{PatchDiscovery, PatchInfo, PatchUnionIndex};
+use xearthlayer::patches::{PatchDiscovery, PatchInfo};
 
 use crate::error::CliError;
 use crate::runner::CliRunner;
@@ -118,18 +118,6 @@ fn list_patches() -> Result<(), CliError> {
             }
         }
         println!();
-    }
-
-    // Build union index and show summary
-    if !valid_patches.is_empty() {
-        let valid_infos: Vec<_> = valid_patches.iter().cloned().cloned().collect();
-        if let Ok(index) = PatchUnionIndex::build(&valid_infos) {
-            println!(
-                "Union index: {} files across {} directories",
-                index.file_count(),
-                index.directory_count()
-            );
-        }
     }
 
     Ok(())
