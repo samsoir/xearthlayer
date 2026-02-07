@@ -34,6 +34,12 @@ impl PositionAccuracy {
     /// Used for position data from X-Plane's XGPS2/ForeFlight UDP broadcast.
     pub const TELEMETRY: Self = Self(10.0);
 
+    /// Online network (VATSIM/IVAO/PilotEdge) - meter-level precision.
+    ///
+    /// Position data from online ATC network APIs (updated every ~15 seconds).
+    /// Same accuracy as telemetry, but confidence decays with timestamp age.
+    pub const ONLINE_NETWORK: Self = Self(10.0);
+
     /// Manual reference point - user-provided position.
     ///
     /// Used for positions from airport ICAO, manual coordinates, flight plans, etc.
@@ -96,6 +102,8 @@ impl std::fmt::Display for TelemetryStatus {
 pub enum PositionSource {
     /// From GPS telemetry (XGPS2/ForeFlight UDP).
     Telemetry,
+    /// From an online ATC network (VATSIM, IVAO, PilotEdge).
+    OnlineNetwork,
     /// User-provided reference point (airport ICAO, manual coordinates, flight plan, etc.).
     ManualReference,
     /// Inferred from Scene Tracker loaded bounds.
@@ -130,6 +138,7 @@ impl std::fmt::Display for PositionSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Telemetry => write!(f, "Telemetry"),
+            Self::OnlineNetwork => write!(f, "Network"),
             Self::ManualReference => write!(f, "Manual"),
             Self::SceneInference => write!(f, "Inferred"),
         }
@@ -272,6 +281,41 @@ impl AircraftState {
         }
     }
 
+    /// Create a new aircraft state from an online network position (VATSIM/IVAO/PilotEdge).
+    ///
+    /// Online networks provide heading and ground speed but not GPS track.
+    /// Track is set to `None` (derived later by the aggregator from position history).
+    ///
+    /// # Arguments
+    ///
+    /// * `latitude` - Latitude in degrees
+    /// * `longitude` - Longitude in degrees
+    /// * `heading` - Heading in degrees (from network data)
+    /// * `ground_speed` - Ground speed in knots
+    /// * `altitude` - Altitude MSL in feet
+    /// * `timestamp` - When the network reported this position
+    pub fn from_network_position(
+        latitude: f64,
+        longitude: f64,
+        heading: f32,
+        ground_speed: f32,
+        altitude: f32,
+        timestamp: Instant,
+    ) -> Self {
+        Self {
+            latitude,
+            longitude,
+            track: None,
+            track_source: TrackSource::Unavailable,
+            heading,
+            ground_speed,
+            altitude,
+            timestamp,
+            source: PositionSource::OnlineNetwork,
+            accuracy: PositionAccuracy::ONLINE_NETWORK,
+        }
+    }
+
     /// Get the effective track for prefetch calculations.
     ///
     /// Returns the ground track if available, otherwise falls back to heading.
@@ -307,9 +351,13 @@ impl AircraftState {
 
     /// Check if vector data (heading, speed, altitude) is meaningful.
     ///
-    /// Returns true only for telemetry sources where we have actual data.
+    /// Returns true for sources that provide actual flight vector data:
+    /// telemetry (XGPS2) and online networks (VATSIM/IVAO/PilotEdge).
     pub fn has_vectors(&self) -> bool {
-        matches!(self.source, PositionSource::Telemetry)
+        matches!(
+            self.source,
+            PositionSource::Telemetry | PositionSource::OnlineNetwork
+        )
     }
 }
 
@@ -546,5 +594,72 @@ mod tests {
         assert_eq!(TrackSource::Telemetry.to_string(), "Telemetry");
         assert_eq!(TrackSource::Derived.to_string(), "Derived");
         assert_eq!(TrackSource::Unavailable.to_string(), "Unavailable");
+    }
+
+    #[test]
+    fn test_online_network_accuracy_constant() {
+        // Same accuracy as telemetry (10m)
+        assert_eq!(PositionAccuracy::ONLINE_NETWORK.meters(), 10.0);
+        assert_eq!(
+            PositionAccuracy::ONLINE_NETWORK,
+            PositionAccuracy::TELEMETRY
+        );
+    }
+
+    #[test]
+    fn test_aircraft_state_from_network_position() {
+        let timestamp = Instant::now();
+        let state = AircraftState::from_network_position(
+            33.9425, -118.408, 270.0, 150.0, 35000.0, timestamp,
+        );
+
+        assert_eq!(state.latitude, 33.9425);
+        assert_eq!(state.longitude, -118.408);
+        assert_eq!(state.heading, 270.0);
+        assert_eq!(state.ground_speed, 150.0);
+        assert_eq!(state.altitude, 35000.0);
+        assert_eq!(state.source, PositionSource::OnlineNetwork);
+        assert_eq!(state.accuracy, PositionAccuracy::ONLINE_NETWORK);
+        assert_eq!(state.track, None); // No track from network
+        assert_eq!(state.track_source, TrackSource::Unavailable);
+        assert!(state.has_vectors());
+    }
+
+    #[test]
+    fn test_network_position_effective_track_falls_back_to_heading() {
+        let state = AircraftState::from_network_position(
+            33.9425,
+            -118.408,
+            270.0,
+            150.0,
+            35000.0,
+            Instant::now(),
+        );
+
+        // has_vectors() is true for OnlineNetwork, so effective_track() should
+        // fall back to heading when track is None
+        assert_eq!(state.effective_track(), Some(270.0));
+    }
+
+    #[test]
+    fn test_position_source_display_network() {
+        assert_eq!(PositionSource::OnlineNetwork.to_string(), "Network");
+    }
+
+    #[test]
+    fn test_online_network_has_vectors() {
+        let state = AircraftState::from_network_position(
+            33.9425,
+            -118.408,
+            270.0,
+            150.0,
+            35000.0,
+            Instant::now(),
+        );
+        assert!(state.has_vectors());
+
+        // Contrast with non-vector sources
+        assert!(!AircraftState::from_manual_reference(43.6, 1.4).has_vectors());
+        assert!(!AircraftState::from_inference(53.5, 10.0).has_vectors());
     }
 }

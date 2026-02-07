@@ -111,6 +111,14 @@ pub enum ConfigKey {
     ExecutorRequestTimeoutSecs,
     ExecutorMaxRetries,
     ExecutorRetryBaseDelayMs,
+
+    // Online network settings
+    OnlineNetworkEnabled,
+    OnlineNetworkType,
+    OnlineNetworkPilotId,
+    OnlineNetworkApiUrl,
+    OnlineNetworkPollIntervalSecs,
+    OnlineNetworkMaxStaleSecs,
 }
 
 impl FromStr for ConfigKey {
@@ -200,6 +208,14 @@ impl FromStr for ConfigKey {
             "executor.max_retries" => Ok(ConfigKey::ExecutorMaxRetries),
             "executor.retry_base_delay_ms" => Ok(ConfigKey::ExecutorRetryBaseDelayMs),
 
+            // Online network settings
+            "online_network.enabled" => Ok(ConfigKey::OnlineNetworkEnabled),
+            "online_network.network_type" => Ok(ConfigKey::OnlineNetworkType),
+            "online_network.pilot_id" => Ok(ConfigKey::OnlineNetworkPilotId),
+            "online_network.api_url" => Ok(ConfigKey::OnlineNetworkApiUrl),
+            "online_network.poll_interval_secs" => Ok(ConfigKey::OnlineNetworkPollIntervalSecs),
+            "online_network.max_stale_secs" => Ok(ConfigKey::OnlineNetworkMaxStaleSecs),
+
             _ => Err(ConfigKeyError::UnknownKey(s.to_string())),
         }
     }
@@ -276,6 +292,14 @@ impl ConfigKey {
             ConfigKey::ExecutorRequestTimeoutSecs => "executor.request_timeout_secs",
             ConfigKey::ExecutorMaxRetries => "executor.max_retries",
             ConfigKey::ExecutorRetryBaseDelayMs => "executor.retry_base_delay_ms",
+
+            // Online network settings
+            ConfigKey::OnlineNetworkEnabled => "online_network.enabled",
+            ConfigKey::OnlineNetworkType => "online_network.network_type",
+            ConfigKey::OnlineNetworkPilotId => "online_network.pilot_id",
+            ConfigKey::OnlineNetworkApiUrl => "online_network.api_url",
+            ConfigKey::OnlineNetworkPollIntervalSecs => "online_network.poll_interval_secs",
+            ConfigKey::OnlineNetworkMaxStaleSecs => "online_network.max_stale_secs",
         }
     }
 
@@ -421,6 +445,18 @@ impl ConfigKey {
             }
             ConfigKey::ExecutorMaxRetries => config.executor.max_retries.to_string(),
             ConfigKey::ExecutorRetryBaseDelayMs => config.executor.retry_base_delay_ms.to_string(),
+
+            // Online network settings
+            ConfigKey::OnlineNetworkEnabled => config.online_network.enabled.to_string(),
+            ConfigKey::OnlineNetworkType => config.online_network.network_type.clone(),
+            ConfigKey::OnlineNetworkPilotId => config.online_network.pilot_id.to_string(),
+            ConfigKey::OnlineNetworkApiUrl => config.online_network.api_url.clone(),
+            ConfigKey::OnlineNetworkPollIntervalSecs => {
+                config.online_network.poll_interval_secs.to_string()
+            }
+            ConfigKey::OnlineNetworkMaxStaleSecs => {
+                config.online_network.max_stale_secs.to_string()
+            }
         }
     }
 
@@ -610,6 +646,27 @@ impl ConfigKey {
             ConfigKey::ExecutorRetryBaseDelayMs => {
                 config.executor.retry_base_delay_ms = value.parse().unwrap();
             }
+
+            // Online network settings
+            ConfigKey::OnlineNetworkEnabled => {
+                let v = value.to_lowercase();
+                config.online_network.enabled = v == "true" || v == "1" || v == "yes" || v == "on";
+            }
+            ConfigKey::OnlineNetworkType => {
+                config.online_network.network_type = value.to_lowercase();
+            }
+            ConfigKey::OnlineNetworkPilotId => {
+                config.online_network.pilot_id = value.parse().unwrap();
+            }
+            ConfigKey::OnlineNetworkApiUrl => {
+                config.online_network.api_url = value.to_string();
+            }
+            ConfigKey::OnlineNetworkPollIntervalSecs => {
+                config.online_network.poll_interval_secs = value.parse().unwrap();
+            }
+            ConfigKey::OnlineNetworkMaxStaleSecs => {
+                config.online_network.max_stale_secs = value.parse().unwrap();
+            }
         }
     }
 
@@ -694,6 +751,16 @@ impl ConfigKey {
             ConfigKey::ExecutorRequestTimeoutSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ExecutorMaxRetries => Box::new(PositiveIntegerSpec),
             ConfigKey::ExecutorRetryBaseDelayMs => Box::new(PositiveIntegerSpec),
+
+            // Online network settings
+            ConfigKey::OnlineNetworkEnabled => Box::new(BooleanSpec),
+            ConfigKey::OnlineNetworkType => {
+                Box::new(OneOfSpec::new(&["vatsim", "ivao", "pilotedge"]))
+            }
+            ConfigKey::OnlineNetworkPilotId => Box::new(PositiveIntegerSpec),
+            ConfigKey::OnlineNetworkApiUrl => Box::new(OptionalUrlSpec),
+            ConfigKey::OnlineNetworkPollIntervalSecs => Box::new(PositiveIntegerSpec),
+            ConfigKey::OnlineNetworkMaxStaleSecs => Box::new(PositiveIntegerSpec),
         }
     }
 
@@ -754,6 +821,13 @@ impl ConfigKey {
             ConfigKey::ExecutorRequestTimeoutSecs,
             ConfigKey::ExecutorMaxRetries,
             ConfigKey::ExecutorRetryBaseDelayMs,
+            // Online network settings
+            ConfigKey::OnlineNetworkEnabled,
+            ConfigKey::OnlineNetworkType,
+            ConfigKey::OnlineNetworkPilotId,
+            ConfigKey::OnlineNetworkApiUrl,
+            ConfigKey::OnlineNetworkPollIntervalSecs,
+            ConfigKey::OnlineNetworkMaxStaleSecs,
         ]
     }
 }

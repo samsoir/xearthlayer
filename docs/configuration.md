@@ -516,6 +516,47 @@ directory = ~/.xearthlayer/patches
 - Patches are merged using a union filesystem; alphabetically-first folder wins on collision
 - See [docs/patches.md](patches.md) for detailed usage instructions
 
+### [online_network]
+
+Controls online ATC network position fetching (VATSIM, IVAO, PilotEdge). When enabled, XEarthLayer fetches your pilot position from the network's REST API and feeds it into the Aircraft Position & Telemetry (APT) system as an additional position source.
+
+This provides ~10m accuracy position data with ~15-second updates, useful when X-Plane telemetry (ForeFlight/XGPS2 UDP) is not available or as a supplementary source.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable/disable online network position fetching |
+| `network_type` | string | `vatsim` | Network type: `vatsim`, `ivao`, or `pilotedge` |
+| `pilot_id` | integer | `0` | Pilot identifier (CID for VATSIM). 0 = disabled. |
+| `api_url` | URL | `https://status.vatsim.net/status.json` | API status endpoint URL |
+| `poll_interval_secs` | integer | `15` | How often to poll the API (seconds) |
+| `max_stale_secs` | integer | `60` | Maximum data age before considered stale (seconds) |
+
+**Example:**
+```ini
+[online_network]
+enabled = true
+network_type = vatsim
+pilot_id = 1234567       ; Your VATSIM CID
+; api_url defaults to https://status.vatsim.net/status.json
+; poll_interval_secs = 15
+; max_stale_secs = 60
+```
+
+**How it works:**
+- The adapter polls the VATSIM V3 API every `poll_interval_secs` seconds
+- Your pilot is found by CID in the pilot list; if not connected, the adapter silently skips
+- Position data includes latitude, longitude, heading, ground speed, and altitude
+- The `last_updated` timestamp is used to compute data age for staleness checking
+- If X-Plane telemetry (GPS) is also available, it takes precedence due to equal accuracy but higher update rate
+- Exponential backoff on API errors (2^n seconds, capped at 5 minutes)
+
+**Position Source Priority:**
+When multiple sources provide position data simultaneously, the APT system selects based on accuracy and freshness:
+1. **GPS/Telemetry** (10m, ~1Hz updates) — wins when available
+2. **Online Network** (10m, ~15s updates) — used when telemetry is stale or unavailable
+3. **Scene Inference** (100km) — fallback from FUSE file access patterns
+4. **Manual Reference** (100m) — airport prewarm seed
+
 ## Complete Example
 
 ```ini
@@ -604,6 +645,16 @@ file = ~/.xearthlayer/xearthlayer.log
 ; Tile patches for custom mesh/elevation from airport addons
 enabled = true
 ; directory = ~/.xearthlayer/patches
+
+[online_network]
+; Online ATC network position (VATSIM/IVAO/PilotEdge)
+; Set enabled = true and pilot_id to your VATSIM CID to enable
+enabled = false
+network_type = vatsim
+pilot_id = 0
+; api_url = https://status.vatsim.net/status.json
+; poll_interval_secs = 15
+; max_stale_secs = 60
 ```
 
 ## Config CLI Commands
@@ -723,6 +774,12 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `packages.auto_install_overlays` | `true`, `false` | Auto-install matching overlays |
 | `packages.temp_dir` | path | Temporary download directory |
 | `logging.file` | path | Log file location |
+| `online_network.enabled` | `true`, `false` | Enable online network position |
+| `online_network.network_type` | `vatsim`, `ivao`, `pilotedge` | Network type |
+| `online_network.pilot_id` | positive integer | Pilot CID (0 = disabled) |
+| `online_network.api_url` | URL | API status endpoint |
+| `online_network.poll_interval_secs` | positive integer | API poll interval (seconds) |
+| `online_network.max_stale_secs` | positive integer | Max data age (seconds) |
 
 ## CLI Overrides
 

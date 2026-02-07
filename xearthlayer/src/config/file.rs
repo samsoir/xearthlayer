@@ -65,6 +65,8 @@ pub struct ConfigFile {
     pub patches: PatchesSettings,
     /// Executor daemon settings for job/task framework
     pub executor: ExecutorSettings,
+    /// Online network settings for VATSIM/IVAO/PilotEdge position
+    pub online_network: OnlineNetworkSettings,
 }
 
 /// Provider configuration.
@@ -302,6 +304,42 @@ pub struct ExecutorSettings {
     pub retry_base_delay_ms: u64,
 }
 
+/// Online network settings for position from ATC networks (VATSIM, IVAO, PilotEdge).
+#[derive(Debug, Clone)]
+pub struct OnlineNetworkSettings {
+    /// Enable/disable online network position fetching.
+    /// Default: false
+    pub enabled: bool,
+    /// Network type: "vatsim", "ivao", or "pilotedge".
+    /// Default: "vatsim"
+    pub network_type: String,
+    /// Pilot identifier (CID for VATSIM).
+    /// Default: 0 (disabled)
+    pub pilot_id: u64,
+    /// API URL (for VATSIM, the status endpoint).
+    /// Default: "https://status.vatsim.net/status.json"
+    pub api_url: String,
+    /// Poll interval in seconds.
+    /// Default: 15
+    pub poll_interval_secs: u64,
+    /// Maximum age in seconds before data is considered stale.
+    /// Default: 60
+    pub max_stale_secs: u64,
+}
+
+impl Default for OnlineNetworkSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            network_type: "vatsim".to_string(),
+            pilot_id: 0,
+            api_url: crate::aircraft_position::network::DEFAULT_VATSIM_API_URL.to_string(),
+            poll_interval_secs: crate::aircraft_position::network::DEFAULT_POLL_INTERVAL_SECS,
+            max_stale_secs: crate::aircraft_position::network::DEFAULT_MAX_STALE_SECS,
+        }
+    }
+}
+
 impl Default for ConfigFile {
     fn default() -> Self {
         let config_dir = config_directory();
@@ -387,6 +425,7 @@ impl Default for ConfigFile {
                 max_retries: DEFAULT_MAX_RETRIES,
                 retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
             },
+            online_network: OnlineNetworkSettings::default(),
         }
     }
 }
@@ -1176,6 +1215,62 @@ impl ConfigFile {
             }
         }
 
+        // [online_network] section
+        if let Some(section) = ini.section(Some("online_network")) {
+            if let Some(v) = section.get("enabled") {
+                config.online_network.enabled = parse_bool(v);
+            }
+            if let Some(v) = section.get("network_type") {
+                let v = v.trim().to_lowercase();
+                match v.as_str() {
+                    "vatsim" | "ivao" | "pilotedge" => {
+                        config.online_network.network_type = v;
+                    }
+                    _ => {
+                        return Err(ConfigFileError::InvalidValue {
+                            section: "online_network".to_string(),
+                            key: "network_type".to_string(),
+                            value: v.to_string(),
+                            reason: "must be 'vatsim', 'ivao', or 'pilotedge'".to_string(),
+                        });
+                    }
+                }
+            }
+            if let Some(v) = section.get("pilot_id") {
+                config.online_network.pilot_id =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "online_network".to_string(),
+                        key: "pilot_id".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (VATSIM CID)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("api_url") {
+                let v = v.trim();
+                if !v.is_empty() {
+                    config.online_network.api_url = v.to_string();
+                }
+            }
+            if let Some(v) = section.get("poll_interval_secs") {
+                config.online_network.poll_interval_secs =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "online_network".to_string(),
+                        key: "poll_interval_secs".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (seconds)".to_string(),
+                    })?;
+            }
+            if let Some(v) = section.get("max_stale_secs") {
+                config.online_network.max_stale_secs =
+                    v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                        section: "online_network".to_string(),
+                        key: "max_stale_secs".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a positive integer (seconds)".to_string(),
+                    })?;
+            }
+        }
+
         Ok(config)
     }
 
@@ -1408,6 +1503,23 @@ enabled = {}
 ;   - textures/ (optional - XEL generates these on-demand)
 ; Priority is determined by alphabetical folder naming (A < B < Z)
 directory = {}
+
+[online_network]
+; Online ATC network position (VATSIM, IVAO, PilotEdge).
+; Provides pilot position from network APIs as a position source for the APT system.
+
+; Enable/disable online network position fetching (default: false)
+enabled = {}
+; Network type: vatsim, ivao, or pilotedge (default: vatsim)
+network_type = {}
+; Pilot identifier (CID for VATSIM, default: 0 = disabled)
+pilot_id = {}
+; API URL (for VATSIM, the status endpoint)
+api_url = {}
+; Poll interval in seconds (default: 15)
+poll_interval_secs = {}
+; Maximum age in seconds before data is considered stale (default: 60)
+max_stale_secs = {}
 "#,
             self.provider.provider_type,
             google_api_key,
@@ -1460,6 +1572,12 @@ directory = {}
                 .as_ref()
                 .map(|p| path_to_string(p))
                 .unwrap_or_default(),
+            self.online_network.enabled,
+            self.online_network.network_type,
+            self.online_network.pilot_id,
+            self.online_network.api_url,
+            self.online_network.poll_interval_secs,
+            self.online_network.max_stale_secs,
         )
     }
 
