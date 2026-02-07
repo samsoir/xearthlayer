@@ -228,7 +228,7 @@ impl TelemetrySink for TracingTelemetrySink {
                 name,
                 priority,
             } => {
-                tracing::info!(
+                tracing::debug!(
                     job_id = %job_id,
                     name = %name,
                     priority = %priority,
@@ -246,7 +246,7 @@ impl TelemetrySink for TracingTelemetrySink {
                 tasks_failed,
                 ..
             } => {
-                tracing::info!(
+                tracing::debug!(
                     job_id = %job_id,
                     status = %status,
                     duration_ms = duration.as_millis(),
@@ -256,7 +256,7 @@ impl TelemetrySink for TracingTelemetrySink {
                 );
             }
             TelemetryEvent::JobSignalled { job_id, signal } => {
-                tracing::info!(
+                tracing::debug!(
                     job_id = %job_id,
                     signal = %signal,
                     "Job signalled"

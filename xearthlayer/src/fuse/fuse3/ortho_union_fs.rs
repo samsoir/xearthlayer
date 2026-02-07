@@ -710,7 +710,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         _fh: u64,
         offset: i64,
     ) -> Fuse3InternalResult<ReplyDirectory<Self::DirEntryStream<'_>>> {
-        tracing::info!(ino = ino, offset = offset, "FUSE readdir called");
+        tracing::debug!(ino = ino, offset = offset, "FUSE readdir called");
 
         // Get virtual path for this directory
         let virtual_path = if ino == 1 {
