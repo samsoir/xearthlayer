@@ -42,19 +42,18 @@
 //! orchestrator.shutdown();
 //! ```
 
+mod apt;
+mod prefetch;
+
 use std::sync::Arc;
 
 use tokio::runtime::Handle;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::aircraft_position::{
-    spawn_position_logger, AircraftPositionBroadcaster, SharedAircraftPosition, StateAggregator,
-    TelemetryReceiver, TelemetryReceiverConfig, DEFAULT_LOG_INTERVAL,
-};
-use crate::executor::{DdsClient, MemoryCache};
+use crate::aircraft_position::{SharedAircraftPosition, StateAggregator};
 use crate::log::TracingLogger;
 use crate::manager::{
     create_consolidated_overlay, InstalledPackage, LocalPackageStore, MountManager, ServiceBuilder,
@@ -62,9 +61,8 @@ use crate::manager::{
 use crate::metrics::TelemetrySnapshot;
 use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::{
-    load_cache, save_cache, warn_if_legacy, AdaptivePrefetchConfig, AdaptivePrefetchCoordinator,
-    CacheLoadResult, CircuitBreaker, FuseRequestAnalyzer, Prefetcher, SceneryIndex,
-    SceneryIndexConfig, SharedPrefetchStatus,
+    load_cache, save_cache, CacheLoadResult, FuseRequestAnalyzer, SceneryIndex, SceneryIndexConfig,
+    SharedPrefetchStatus,
 };
 use crate::runtime::{SharedRuntimeHealth, SharedTileProgressTracker};
 
@@ -597,280 +595,6 @@ impl ServiceOrchestrator {
             self.tile_progress_tracker = service.tile_progress_tracker();
             self.max_concurrent_jobs = service.max_concurrent_jobs();
         }
-    }
-
-    /// Start the APT telemetry receiver.
-    ///
-    /// This starts listening for X-Plane UDP telemetry on the configured port.
-    /// Must be called after mounting to have a runtime handle available.
-    pub fn start_apt_telemetry(&self) -> Result<(), ServiceError> {
-        let service = self
-            .mount_manager
-            .get_service()
-            .ok_or_else(|| ServiceError::NotStarted("No service available for APT".into()))?;
-
-        let runtime_handle = service.runtime_handle().clone();
-        let telemetry_port = self.config.prefetch.udp_port;
-        let (telemetry_tx, mut telemetry_rx) = mpsc::channel(32);
-
-        let telemetry_config = TelemetryReceiverConfig {
-            port: telemetry_port,
-            ..Default::default()
-        };
-        let receiver = TelemetryReceiver::new(telemetry_config, telemetry_tx);
-        let apt_cancellation = self.cancellation.clone();
-        let logger_cancellation = apt_cancellation.clone();
-
-        // Start the UDP receiver
-        runtime_handle.spawn(async move {
-            tokio::select! {
-                result = receiver.start() => {
-                    match result {
-                        Ok(Ok(())) => tracing::debug!("APT telemetry receiver stopped"),
-                        Ok(Err(e)) => tracing::warn!("APT telemetry receiver error: {}", e),
-                        Err(e) => tracing::warn!("APT telemetry receiver task failed: {}", e),
-                    }
-                }
-                _ = apt_cancellation.cancelled() => {
-                    tracing::debug!("APT telemetry receiver cancelled");
-                }
-            }
-        });
-
-        // Bridge task: forward telemetry states to APT aggregator
-        let aircraft_position = self.aircraft_position.clone();
-        runtime_handle.spawn(async move {
-            while let Some(state) = telemetry_rx.recv().await {
-                aircraft_position.receive_telemetry(state);
-            }
-        });
-
-        // Periodic position logger for flight analysis (DEBUG level only)
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            spawn_position_logger(
-                &runtime_handle,
-                self.aircraft_position.clone(),
-                logger_cancellation,
-                DEFAULT_LOG_INTERVAL,
-            );
-        }
-
-        info!(port = telemetry_port, "APT telemetry receiver started");
-        Ok(())
-    }
-
-    /// Start the online network position adapter (VATSIM/IVAO/PilotEdge).
-    ///
-    /// This starts a poll loop daemon that fetches pilot position from an online
-    /// ATC network's REST API and feeds it into the APT aggregator.
-    ///
-    /// The adapter only starts if:
-    /// - `online_network.enabled` is true in the config
-    /// - `online_network.pilot_id` is non-zero (a valid pilot CID)
-    pub fn start_network_position(&self) -> Result<(), ServiceError> {
-        let net_config = &self.config.online_network;
-
-        if !net_config.enabled {
-            tracing::debug!("Online network position disabled by configuration");
-            return Ok(());
-        }
-
-        if net_config.pilot_id == 0 {
-            tracing::warn!(
-                "Online network position enabled but pilot_id is 0 (not configured), skipping"
-            );
-            return Ok(());
-        }
-
-        let service = self.mount_manager.get_service().ok_or_else(|| {
-            ServiceError::NotStarted("No service available for network position".into())
-        })?;
-
-        let runtime_handle = service.runtime_handle().clone();
-
-        // Create the network client and adapter
-        let adapter_config = crate::aircraft_position::NetworkAdapterConfig::from_config(
-            net_config.network_type.clone(),
-            net_config.pilot_id,
-            net_config.poll_interval_secs,
-            net_config.max_stale_secs,
-        );
-
-        let client = crate::aircraft_position::VatsimClient::new(net_config.pilot_id);
-        let (network_tx, mut network_rx) = mpsc::channel(16);
-        let adapter =
-            crate::aircraft_position::NetworkAdapter::new(client, network_tx, adapter_config);
-
-        // Start the adapter with cancellation
-        // adapter.start() calls tokio::spawn() internally, so it must run
-        // inside the Tokio runtime context (not from the synchronous caller)
-        let adapter_cancellation = self.cancellation.clone();
-        runtime_handle.spawn(async move {
-            let adapter_handle = adapter.start();
-            adapter_cancellation.cancelled().await;
-            adapter_handle.abort();
-            tracing::debug!("Network position adapter cancelled");
-        });
-
-        // Bridge task: forward network states to APT aggregator
-        let aircraft_position = self.aircraft_position.clone();
-        runtime_handle.spawn(async move {
-            while let Some(state) = network_rx.recv().await {
-                aircraft_position.receive_network_position(state);
-            }
-        });
-
-        info!(
-            network = %net_config.network_type,
-            pilot_id = net_config.pilot_id,
-            poll_interval_secs = net_config.poll_interval_secs,
-            "Online network position adapter started"
-        );
-        Ok(())
-    }
-
-    /// Start the prefetch system.
-    ///
-    /// This starts the prefetch daemon that predictively caches tiles
-    /// based on aircraft position and heading.
-    pub fn start_prefetch(&mut self) -> Result<(), ServiceError> {
-        if !self.config.prefetch_enabled() {
-            info!("Prefetch disabled by configuration");
-            return Ok(());
-        }
-
-        let service = self
-            .mount_manager
-            .get_service()
-            .ok_or_else(|| ServiceError::NotStarted("No service available for prefetch".into()))?;
-
-        let dds_client = service
-            .dds_client()
-            .ok_or_else(|| ServiceError::NotStarted("DDS client not available".into()))?;
-
-        let runtime_handle = service.runtime_handle().clone();
-
-        // Try legacy adapter first, then new cache bridge architecture
-        if let Some(memory_cache) = service.memory_cache_adapter() {
-            self.start_prefetch_with_cache(&runtime_handle, dds_client, memory_cache)?;
-        } else if let Some(memory_cache) = service.memory_cache_bridge() {
-            self.start_prefetch_with_cache(&runtime_handle, dds_client, memory_cache)?;
-        } else {
-            tracing::warn!("Memory cache not available, prefetch disabled");
-            return Ok(());
-        }
-
-        Ok(())
-    }
-
-    /// Internal helper to start prefetch with a specific memory cache type.
-    fn start_prefetch_with_cache<M: MemoryCache + 'static>(
-        &mut self,
-        runtime_handle: &Handle,
-        dds_client: Arc<dyn DdsClient>,
-        memory_cache: Arc<M>,
-    ) -> Result<(), ServiceError> {
-        use crate::prefetch::AircraftState as PrefetchAircraftState;
-
-        // Create channel for prefetch telemetry data
-        let (state_tx, state_rx) = mpsc::channel(32);
-
-        // Bridge APT telemetry to prefetch channel
-        let mut apt_rx = self.aircraft_position.subscribe();
-        let bridge_cancel = self.cancellation.clone();
-        runtime_handle.spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-
-                    _ = bridge_cancel.cancelled() => {
-                        tracing::debug!("APT-to-prefetch telemetry bridge cancelled");
-                        break;
-                    }
-
-                    result = apt_rx.recv() => {
-                        match result {
-                            Ok(apt_state) => {
-                                let prefetch_state = PrefetchAircraftState::new(
-                                    apt_state.latitude,
-                                    apt_state.longitude,
-                                    apt_state.heading,
-                                    apt_state.ground_speed,
-                                    apt_state.altitude,
-                                );
-                                if state_tx.send(prefetch_state).await.is_err() {
-                                    tracing::debug!("Prefetch channel closed");
-                                    break;
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                tracing::debug!("APT broadcast channel closed");
-                                break;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::trace!("APT-to-prefetch bridge lagged by {} messages", n);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        // Build prefetcher
-        let config = &self.config.prefetch;
-
-        // Keep a reference to DDS client for adaptive strategy
-        let dds_client_for_adaptive = Arc::clone(&dds_client);
-
-        // Warn if a legacy strategy is configured (all now use adaptive)
-        warn_if_legacy(&config.strategy);
-
-        // Build and start the prefetcher
-        let prefetcher_cancel = self.cancellation.clone();
-
-        // Build adaptive prefetch coordinator
-        let adaptive_config = AdaptivePrefetchConfig::from_prefetch_config(config);
-        let mut coordinator = AdaptivePrefetchCoordinator::new(adaptive_config);
-
-        // Wire DDS client
-        coordinator = coordinator.with_dds_client(dds_client_for_adaptive);
-
-        // Wire memory cache for tile existence checks (Bug 5 fix)
-        coordinator = coordinator.with_memory_cache(memory_cache);
-
-        // Wire circuit breaker as throttler
-        let circuit_breaker = CircuitBreaker::new(
-            config.circuit_breaker.clone(),
-            self.mount_manager.load_monitor(),
-        );
-        coordinator = coordinator.with_throttler(Arc::new(circuit_breaker));
-
-        // Wire scenery index if available
-        if self.scenery_index.tile_count() > 0 {
-            coordinator = coordinator.with_scenery_index(Arc::clone(&self.scenery_index));
-        }
-
-        // Wire ortho union index for disk-based tile filtering (Issue #39)
-        // This prevents prefetch from downloading tiles that already exist on disk
-        if let Some(ortho_index) = self.mount_manager.ortho_union_index() {
-            coordinator = coordinator.with_ortho_union_index(ortho_index);
-            tracing::info!(
-                "Ortho union index wired to prefetch (disk-based tile filtering enabled)"
-            );
-        }
-
-        // Wire shared status for TUI display
-        coordinator = coordinator.with_shared_status(Arc::clone(&self.prefetch_status));
-
-        let prefetcher: Box<dyn Prefetcher> = Box::new(coordinator);
-        let handle = runtime_handle.spawn(async move {
-            prefetcher.run(state_rx, prefetcher_cancel).await;
-        });
-
-        self.prefetch_handle = Some(PrefetchHandle { handle });
-        info!(strategy = "adaptive", "Prefetch system started");
-
-        Ok(())
     }
 
     /// Update the scenery index (called after building).

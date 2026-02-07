@@ -30,13 +30,17 @@
 //! let download_config = DownloadConfig::default();
 //! ```
 
+mod defaults;
 mod download;
 mod file;
 mod keys;
+mod parser;
+mod settings;
 mod size;
 mod storage;
 mod texture;
 mod upgrade;
+mod writer;
 pub use download::DownloadConfig;
 pub use file::{
     config_directory,
