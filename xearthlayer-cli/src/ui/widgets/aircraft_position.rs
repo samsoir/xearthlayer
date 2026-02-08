@@ -77,6 +77,7 @@ impl<'a> AircraftPositionWidget<'a> {
     fn source_label(source: &PositionSource) -> &'static str {
         match source {
             PositionSource::Telemetry => "GPS",
+            PositionSource::OnlineNetwork => "Network",
             PositionSource::ManualReference => "Airport",
             PositionSource::SceneInference => "Inferred",
         }

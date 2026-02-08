@@ -60,6 +60,9 @@ pub struct OrchestratorConfig {
     /// Prewarm configuration.
     pub prewarm: PrewarmConfig,
 
+    /// Online network position configuration.
+    pub online_network: OnlineNetworkConfig,
+
     /// Whether TUI mode is active (affects logging behavior).
     pub tui_mode: bool,
 }
@@ -106,6 +109,28 @@ pub struct PrewarmConfig {
 
     /// Batch size for concurrent tile generation.
     pub batch_size: usize,
+}
+
+/// Online network position configuration extracted from ConfigFile.
+#[derive(Clone, Debug)]
+pub struct OnlineNetworkConfig {
+    /// Whether online network position fetching is enabled.
+    pub enabled: bool,
+
+    /// Network type: "vatsim", "ivao", or "pilotedge".
+    pub network_type: String,
+
+    /// Pilot identifier (CID for VATSIM).
+    pub pilot_id: u64,
+
+    /// API URL (for VATSIM, the status endpoint).
+    pub api_url: String,
+
+    /// Poll interval in seconds.
+    pub poll_interval_secs: u64,
+
+    /// Maximum age in seconds before data is considered stale.
+    pub max_stale_secs: u64,
 }
 
 impl OrchestratorConfig {
@@ -171,6 +196,16 @@ impl OrchestratorConfig {
             batch_size: 50, // Fixed batch size for now
         };
 
+        // Extract online network configuration
+        let online_network = OnlineNetworkConfig {
+            enabled: config.online_network.enabled,
+            network_type: config.online_network.network_type.clone(),
+            pilot_id: config.online_network.pilot_id,
+            api_url: config.online_network.api_url.clone(),
+            poll_interval_secs: config.online_network.poll_interval_secs,
+            max_stale_secs: config.online_network.max_stale_secs,
+        };
+
         Self {
             provider,
             service,
@@ -181,6 +216,7 @@ impl OrchestratorConfig {
             disk_io_profile: config.cache.disk_io_profile,
             prefetch,
             prewarm,
+            online_network,
             tui_mode,
         }
     }

@@ -9,6 +9,7 @@
 //! the best available data source. This mirrors how real aircraft navigation works:
 //!
 //! - **GPS/Telemetry** → Primary, recalibrates the model when available (~10m accuracy)
+//! - **Online Network** → VATSIM/IVAO/PilotEdge position via REST API (~10m, ~15s updates)
 //! - **Prewarm** → Seeds the model at startup from airport ICAO (~100m accuracy)
 //! - **Scene Inference** → Maintains the model when telemetry unavailable (~100km accuracy)
 //!
@@ -61,12 +62,14 @@
 //! - [`aggregator`] - `StateAggregator` that combines all sources and broadcasts updates
 //! - [`provider`] - `AircraftPositionProvider` and `AircraftPositionBroadcaster` traits
 //! - [`flight_path`] - `FlightPathHistory` for position history and track derivation
+//! - [`network`] - `NetworkAdapter` for online ATC network position (VATSIM/IVAO/PilotEdge)
 
 mod aggregator;
 mod flight_path;
 mod inference;
 mod logger;
 mod model;
+pub mod network;
 mod provider;
 mod state;
 mod telemetry;
@@ -75,6 +78,7 @@ pub use aggregator::{StateAggregator, StateAggregatorConfig};
 pub use flight_path::{FlightPathConfig, FlightPathHistory, PositionSample};
 pub use inference::{InferenceAdapter, InferenceAdapterConfig};
 pub use model::PositionModel;
+pub use network::{NetworkAdapter, NetworkAdapterConfig, VatsimClient};
 pub use provider::{AircraftPositionBroadcaster, AircraftPositionProvider, SharedAircraftPosition};
 pub use state::{
     AircraftPositionStatus, AircraftState, PositionAccuracy, PositionSource, TelemetryStatus,
