@@ -107,11 +107,15 @@ impl ServiceOrchestrator {
         let adapter_config = crate::aircraft_position::NetworkAdapterConfig::from_config(
             net_config.network_type.clone(),
             net_config.pilot_id,
+            net_config.api_url.clone(),
             net_config.poll_interval_secs,
             net_config.max_stale_secs,
         );
 
-        let client = crate::aircraft_position::VatsimClient::new(net_config.pilot_id);
+        let client = crate::aircraft_position::VatsimClient::new(
+            net_config.pilot_id,
+            net_config.api_url.clone(),
+        );
         let (network_tx, mut network_rx) = mpsc::channel(16);
         let adapter =
             crate::aircraft_position::NetworkAdapter::new(client, network_tx, adapter_config);

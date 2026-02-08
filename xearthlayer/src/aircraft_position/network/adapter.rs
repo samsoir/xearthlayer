@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use super::client::NetworkClient;
+use super::client::{NetworkClient, PilotPosition};
 use super::config::NetworkAdapterConfig;
 use super::error::NetworkError;
 use crate::aircraft_position::state::AircraftState;
@@ -68,11 +68,11 @@ impl<C: NetworkClient + 'static> NetworkAdapter<C> {
 
     /// Run the poll loop.
     async fn run(self) {
-        tracing::info!(
+        tracing::debug!(
             network = %self.config.network_type,
             pilot_id = self.config.pilot_id,
             poll_interval_secs = self.config.poll_interval.as_secs(),
-            "Online network position adapter started"
+            "Network adapter poll loop running"
         );
 
         let mut interval = tokio::time::interval(self.config.poll_interval);
@@ -142,7 +142,7 @@ impl<C: NetworkClient + 'static> NetworkAdapter<C> {
 /// then creates an `Instant` offset from `now()` so the aggregator's
 /// staleness logic works correctly.
 fn convert_to_aircraft_state(
-    pilot: &vatsim_utils::models::Pilot,
+    pilot: &PilotPosition,
     max_stale_secs: u64,
 ) -> Result<AircraftState, NetworkError> {
     // Parse the last_updated timestamp (ISO 8601: "2026-02-07T21:51:24.829965Z")
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn test_convert_to_aircraft_state_fresh() {
         let now = chrono::Utc::now();
-        let pilot = vatsim_utils::models::Pilot {
+        let pilot = PilotPosition {
             cid: 1234567,
             latitude: 33.9425,
             longitude: -118.408,
@@ -206,7 +206,6 @@ mod tests {
             groundspeed: 450,
             heading: 270,
             last_updated: now.to_rfc3339(),
-            ..Default::default()
         };
 
         let state = convert_to_aircraft_state(&pilot, 60).unwrap();
@@ -224,7 +223,7 @@ mod tests {
     #[test]
     fn test_convert_to_aircraft_state_stale() {
         let old = chrono::Utc::now() - chrono::Duration::seconds(120);
-        let pilot = vatsim_utils::models::Pilot {
+        let pilot = PilotPosition {
             cid: 1234567,
             latitude: 33.9425,
             longitude: -118.408,
@@ -232,7 +231,6 @@ mod tests {
             groundspeed: 450,
             heading: 270,
             last_updated: old.to_rfc3339(),
-            ..Default::default()
         };
 
         let result = convert_to_aircraft_state(&pilot, 60);
@@ -241,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_convert_to_aircraft_state_invalid_timestamp() {
-        let pilot = vatsim_utils::models::Pilot {
+        let pilot = PilotPosition {
             cid: 1234567,
             latitude: 33.9425,
             longitude: -118.408,
@@ -249,7 +247,6 @@ mod tests {
             groundspeed: 450,
             heading: 270,
             last_updated: "not-a-timestamp".to_string(),
-            ..Default::default()
         };
 
         let result = convert_to_aircraft_state(&pilot, 60);
@@ -258,11 +255,11 @@ mod tests {
 
     /// Mock client for testing the adapter.
     struct MockNetworkClient {
-        result: std::sync::Mutex<Option<Result<vatsim_utils::models::Pilot, NetworkError>>>,
+        result: std::sync::Mutex<Option<Result<PilotPosition, NetworkError>>>,
     }
 
     impl MockNetworkClient {
-        fn with_pilot(pilot: vatsim_utils::models::Pilot) -> Self {
+        fn with_pilot(pilot: PilotPosition) -> Self {
             Self {
                 result: std::sync::Mutex::new(Some(Ok(pilot))),
             }
@@ -276,7 +273,7 @@ mod tests {
     }
 
     impl NetworkClient for MockNetworkClient {
-        async fn fetch_pilot_position(&self) -> Result<vatsim_utils::models::Pilot, NetworkError> {
+        async fn fetch_pilot_position(&self) -> Result<PilotPosition, NetworkError> {
             self.result
                 .lock()
                 .unwrap()
@@ -288,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn test_adapter_sends_state_on_success() {
         let now = chrono::Utc::now();
-        let pilot = vatsim_utils::models::Pilot {
+        let pilot = PilotPosition {
             cid: 1234567,
             latitude: 33.9425,
             longitude: -118.408,
@@ -296,7 +293,6 @@ mod tests {
             groundspeed: 450,
             heading: 270,
             last_updated: now.to_rfc3339(),
-            ..Default::default()
         };
 
         let client = MockNetworkClient::with_pilot(pilot);

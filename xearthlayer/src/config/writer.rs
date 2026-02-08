@@ -248,7 +248,7 @@ enabled = {}
 network_type = {}
 ; Pilot identifier (CID for VATSIM, default: 0 = disabled)
 pilot_id = {}
-; API URL (for VATSIM, the status endpoint)
+; API URL (for VATSIM, the V3 JSON data feed)
 api_url = {}
 ; Poll interval in seconds (default: 15)
 poll_interval_secs = {}

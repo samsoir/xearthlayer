@@ -5,7 +5,7 @@
 //!
 //! # Supported Networks
 //!
-//! - **VATSIM** — via `vatsim_utils` crate (V3 API, ~15s update interval)
+//! - **VATSIM** — direct HTTP client against V3 JSON data feed (~15s update interval)
 //! - IVAO and PilotEdge — planned, same adapter pattern
 //!
 //! # Architecture
@@ -13,7 +13,7 @@
 //! ```text
 //! NetworkAdapter (poll loop)
 //!     │
-//!     ├── NetworkClient trait → VatsimClient (vatsim_utils)
+//!     ├── NetworkClient trait → VatsimClient (direct reqwest)
 //!     │
 //!     └── mpsc::Sender<AircraftState>
 //!             │
@@ -30,9 +30,9 @@ mod config;
 mod error;
 
 pub use adapter::NetworkAdapter;
-pub use client::{NetworkClient, VatsimClient};
+pub use client::{NetworkClient, PilotPosition, VatsimClient};
 pub use config::{
     NetworkAdapterConfig, DEFAULT_MAX_STALE_SECS, DEFAULT_POLL_INTERVAL_SECS,
-    DEFAULT_VATSIM_API_URL,
+    DEFAULT_VATSIM_DATA_URL,
 };
 pub use error::NetworkError;

@@ -289,7 +289,7 @@ pub struct OnlineNetworkSettings {
     /// Pilot identifier (CID for VATSIM).
     /// Default: 0 (disabled)
     pub pilot_id: u64,
-    /// API URL (for VATSIM, the status endpoint).
+    /// API URL (for VATSIM, the V3 JSON data feed).
     /// Default: "https://status.vatsim.net/status.json"
     pub api_url: String,
     /// Poll interval in seconds.
@@ -306,7 +306,7 @@ impl Default for OnlineNetworkSettings {
             enabled: false,
             network_type: "vatsim".to_string(),
             pilot_id: 0,
-            api_url: crate::aircraft_position::network::DEFAULT_VATSIM_API_URL.to_string(),
+            api_url: crate::aircraft_position::network::DEFAULT_VATSIM_DATA_URL.to_string(),
             poll_interval_secs: crate::aircraft_position::network::DEFAULT_POLL_INTERVAL_SECS,
             max_stale_secs: crate::aircraft_position::network::DEFAULT_MAX_STALE_SECS,
         }

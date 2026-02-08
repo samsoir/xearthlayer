@@ -29,9 +29,3 @@ pub enum NetworkError {
     #[error("Channel closed")]
     ChannelClosed,
 }
-
-impl From<vatsim_utils::errors::VatsimUtilError> for NetworkError {
-    fn from(e: vatsim_utils::errors::VatsimUtilError) -> Self {
-        NetworkError::HttpError(e.to_string())
-    }
-}

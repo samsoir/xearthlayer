@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-/// Default VATSIM V3 API status URL (discovers actual data endpoint).
-pub const DEFAULT_VATSIM_API_URL: &str = "https://status.vatsim.net/status.json";
+/// Default VATSIM V3 JSON data feed URL.
+pub const DEFAULT_VATSIM_DATA_URL: &str = "https://data.vatsim.net/v3/vatsim-data.json";
 
 /// Default poll interval (VATSIM updates every ~15 seconds).
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 15;
@@ -23,7 +23,7 @@ pub struct NetworkAdapterConfig {
     /// Pilot identifier (CID for VATSIM).
     pub pilot_id: u64,
 
-    /// API URL (for VATSIM, the status endpoint that discovers data URLs).
+    /// API URL (for VATSIM, the V3 JSON data feed).
     pub api_url: String,
 
     /// How often to poll the API.
@@ -38,6 +38,7 @@ impl NetworkAdapterConfig {
     pub fn from_config(
         network_type: String,
         pilot_id: u64,
+        api_url: String,
         poll_interval_secs: u64,
         max_stale_secs: u64,
     ) -> Self {
@@ -45,7 +46,7 @@ impl NetworkAdapterConfig {
             enabled: true,
             network_type,
             pilot_id,
-            api_url: DEFAULT_VATSIM_API_URL.to_string(),
+            api_url,
             poll_interval: Duration::from_secs(poll_interval_secs),
             max_stale_secs,
         }
@@ -58,7 +59,7 @@ impl Default for NetworkAdapterConfig {
             enabled: false,
             network_type: "vatsim".to_string(),
             pilot_id: 0,
-            api_url: DEFAULT_VATSIM_API_URL.to_string(),
+            api_url: DEFAULT_VATSIM_DATA_URL.to_string(),
             poll_interval: Duration::from_secs(DEFAULT_POLL_INTERVAL_SECS),
             max_stale_secs: DEFAULT_MAX_STALE_SECS,
         }

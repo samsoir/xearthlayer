@@ -3263,21 +3263,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "vatsim_utils"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2132d96c5b8069d0565f7e552d9b9b115b7994a87a9b93795697af694a5eb67"
-dependencies = [
- "http",
- "log",
- "rand",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.17",
-]
-
-[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3799,7 +3784,6 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "vatsim_utils",
 ]
 
 [[package]]
