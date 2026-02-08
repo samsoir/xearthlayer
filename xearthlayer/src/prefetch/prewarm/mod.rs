@@ -27,7 +27,7 @@
 //!
 //! 1. Compute an N×N grid of DSF (1°×1°) tiles centered on the target airport
 //! 2. Scan `terrain/` folders to find tiles within the grid bounds
-//! 3. Start prewarm context (filters cache, submits jobs, tracks completion)
+//! 3. Start prewarm context (filters memory cache + disk tiles, submits jobs, tracks completion)
 //! 4. Query status via PrewarmHandle
 //!
 //! # Example
@@ -45,6 +45,7 @@
 //!     tiles,
 //!     dds_client,
 //!     memory_cache,
+//!     ortho_index,
 //!     &runtime,
 //! );
 //!

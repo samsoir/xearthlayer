@@ -198,9 +198,23 @@ impl PrewarmOrchestrator {
 
         // Start prewarm with appropriate cache type
         let handle = if let Some(memory_cache) = service.memory_cache_adapter() {
-            Self::start_prewarm_with_cache(icao, tiles, dds_client, memory_cache, runtime_handle)
+            Self::start_prewarm_with_cache(
+                icao,
+                tiles,
+                dds_client,
+                memory_cache,
+                Arc::clone(&ortho_index),
+                runtime_handle,
+            )
         } else if let Some(memory_cache) = service.memory_cache_bridge() {
-            Self::start_prewarm_with_cache(icao, tiles, dds_client, memory_cache, runtime_handle)
+            Self::start_prewarm_with_cache(
+                icao,
+                tiles,
+                dds_client,
+                memory_cache,
+                Arc::clone(&ortho_index),
+                runtime_handle,
+            )
         } else {
             return Err(PrewarmStartError::new(
                 "Memory cache not available for prewarm",
@@ -220,6 +234,7 @@ impl PrewarmOrchestrator {
         tiles: Vec<crate::coord::TileCoord>,
         dds_client: Arc<dyn DdsClient>,
         memory_cache: Arc<M>,
+        ortho_index: Arc<crate::ortho_union::OrthoUnionIndex>,
         runtime_handle: &Handle,
     ) -> PrewarmHandle {
         start_prewarm(
@@ -227,6 +242,7 @@ impl PrewarmOrchestrator {
             tiles,
             dds_client,
             memory_cache,
+            ortho_index,
             runtime_handle,
         )
     }

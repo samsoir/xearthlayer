@@ -17,6 +17,7 @@
 //!     tiles,
 //!     dds_client,
 //!     memory_cache,
+//!     ortho_index,
 //!     &runtime_handle,
 //! );
 //!
@@ -41,6 +42,7 @@ use tracing::{debug, info, warn};
 
 use crate::coord::TileCoord;
 use crate::executor::{DdsClient, MemoryCache, Priority};
+use crate::ortho_union::OrthoUnionIndex;
 use crate::runtime::{JobRequest, RequestOrigin};
 
 /// Maximum concurrent tile requests in flight.
@@ -64,8 +66,10 @@ pub struct PrewarmStatus {
     pub completed: usize,
     /// Tiles that failed to generate.
     pub failed: usize,
-    /// Tiles that were already in cache.
+    /// Tiles that were already in memory cache.
     pub cache_hits: usize,
+    /// Tiles that already exist on disk (patches, disk cache, etc.).
+    pub disk_hits: usize,
     /// Whether prewarm has finished (success or failure).
     pub is_complete: bool,
     /// Whether prewarm was cancelled by user.
@@ -81,6 +85,7 @@ impl PrewarmStatus {
             completed: 0,
             failed: 0,
             cache_hits: 0,
+            disk_hits: 0,
             is_complete: false,
             was_cancelled: false,
         }
@@ -89,7 +94,7 @@ impl PrewarmStatus {
     /// Number of tiles currently in flight (submitted but not yet complete).
     pub fn in_flight(&self) -> usize {
         self.total
-            .saturating_sub(self.completed + self.failed + self.cache_hits)
+            .saturating_sub(self.completed + self.failed + self.cache_hits + self.disk_hits)
     }
 
     /// Progress as a fraction from 0.0 to 1.0.
@@ -97,12 +102,12 @@ impl PrewarmStatus {
         if self.total == 0 {
             return 1.0; // Empty prewarm is "complete"
         }
-        (self.completed + self.cache_hits) as f64 / self.total as f64
+        (self.completed + self.cache_hits + self.disk_hits) as f64 / self.total as f64
     }
 
-    /// Total tiles that have been processed (completed + failed + cache_hits).
+    /// Total tiles that have been processed (completed + failed + cache_hits + disk_hits).
     pub fn processed(&self) -> usize {
-        self.completed + self.failed + self.cache_hits
+        self.completed + self.failed + self.cache_hits + self.disk_hits
     }
 }
 
@@ -151,6 +156,7 @@ struct PrewarmContext<M: MemoryCache> {
     tiles: Vec<TileCoord>,
     dds_client: Arc<dyn DdsClient>,
     memory_cache: Arc<M>,
+    ortho_index: Arc<OrthoUnionIndex>,
     status: Arc<Mutex<PrewarmStatus>>,
     cancellation: CancellationToken,
 }
@@ -170,12 +176,14 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
     /// * `tiles` - Tiles to prewarm
     /// * `dds_client` - Client for submitting DDS generation jobs
     /// * `memory_cache` - Cache to check for already-cached tiles
+    /// * `ortho_index` - Index for checking disk-resident tiles (patches, cache)
     /// * `runtime` - Tokio runtime handle to spawn the task on
     pub fn start(
         icao: String,
         tiles: Vec<TileCoord>,
         dds_client: Arc<dyn DdsClient>,
         memory_cache: Arc<M>,
+        ortho_index: Arc<OrthoUnionIndex>,
         runtime: &Handle,
     ) -> PrewarmHandle {
         let total = tiles.len();
@@ -199,6 +207,7 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
             tiles,
             dds_client,
             memory_cache,
+            ortho_index,
             status,
             cancellation,
         };
@@ -227,6 +236,19 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
             }
         }
 
+        // Step 1b: Filter out tiles already on disk (patches, disk cache, etc.)
+        let before_disk = to_generate.len();
+        to_generate.retain(|tile| {
+            !self
+                .ortho_index
+                .dds_tile_exists(tile.row, tile.col, tile.zoom)
+        });
+        let disk_hits = before_disk - to_generate.len();
+        if disk_hits > 0 {
+            let mut s = self.status.lock();
+            s.disk_hits = disk_hits;
+        }
+
         let cache_hits = {
             let s = self.status.lock();
             s.cache_hits
@@ -235,12 +257,13 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
         info!(
             total = self.tiles.len(),
             cache_hits,
+            disk_hits,
             to_generate = to_generate.len(),
-            "Cache check complete"
+            "Prewarm filter complete"
         );
 
         if to_generate.is_empty() {
-            // All tiles were cached
+            // All tiles were cached or already on disk
             self.mark_complete();
             return;
         }
@@ -380,6 +403,7 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
             completed = s.completed,
             failed = s.failed,
             cache_hits = s.cache_hits,
+            disk_hits = s.disk_hits,
             total = s.total,
             "Prewarm complete"
         );
@@ -416,15 +440,17 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
 /// * `tiles` - Tiles to prewarm
 /// * `dds_client` - Client for submitting DDS generation jobs
 /// * `memory_cache` - Cache to check for already-cached tiles
+/// * `ortho_index` - Index for checking disk-resident tiles (patches, cache)
 /// * `runtime` - Tokio runtime handle
 pub fn start_prewarm<M: MemoryCache + Send + Sync + 'static>(
     icao: String,
     tiles: Vec<TileCoord>,
     dds_client: Arc<dyn DdsClient>,
     memory_cache: Arc<M>,
+    ortho_index: Arc<OrthoUnionIndex>,
     runtime: &Handle,
 ) -> PrewarmHandle {
-    PrewarmContext::start(icao, tiles, dds_client, memory_cache, runtime)
+    PrewarmContext::start(icao, tiles, dds_client, memory_cache, ortho_index, runtime)
 }
 
 #[cfg(test)]
@@ -439,6 +465,7 @@ mod tests {
         assert_eq!(status.completed, 0);
         assert_eq!(status.failed, 0);
         assert_eq!(status.cache_hits, 0);
+        assert_eq!(status.disk_hits, 0);
         assert!(!status.is_complete);
         assert!(!status.was_cancelled);
     }
@@ -450,8 +477,9 @@ mod tests {
 
         status.completed = 30;
         status.failed = 5;
-        status.cache_hits = 15;
-        assert_eq!(status.in_flight(), 50); // 100 - 30 - 5 - 15
+        status.cache_hits = 10;
+        status.disk_hits = 5;
+        assert_eq!(status.in_flight(), 50); // 100 - 30 - 5 - 10 - 5
     }
 
     #[test]
@@ -459,8 +487,9 @@ mod tests {
         let mut status = PrewarmStatus::new("TEST".to_string(), 100);
         assert_eq!(status.progress_fraction(), 0.0);
 
-        status.completed = 40;
+        status.completed = 30;
         status.cache_hits = 10;
+        status.disk_hits = 10;
         assert!((status.progress_fraction() - 0.5).abs() < 0.001);
 
         // Empty prewarm should show as complete
@@ -473,9 +502,10 @@ mod tests {
         let mut status = PrewarmStatus::new("TEST".to_string(), 100);
         assert_eq!(status.processed(), 0);
 
-        status.completed = 30;
+        status.completed = 25;
         status.failed = 5;
-        status.cache_hits = 15;
+        status.cache_hits = 10;
+        status.disk_hits = 10;
         assert_eq!(status.processed(), 50);
     }
 
@@ -514,5 +544,220 @@ mod tests {
         let snapshot = handle.status();
         assert_eq!(snapshot.completed, 25);
         assert_eq!(snapshot.icao, "KJFK");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Integration tests: disk-existence filtering via OrthoUnionIndex
+    // ─────────────────────────────────────────────────────────────────────────
+
+    use crate::ortho_union::{OrthoSource, OrthoUnionIndex};
+    use crate::runtime::DdsResponse;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    /// Mock DdsClient that provides a sender for async job submission.
+    struct TestDdsClient {
+        sender: mpsc::Sender<JobRequest>,
+    }
+
+    impl TestDdsClient {
+        fn new() -> (Arc<Self>, mpsc::Receiver<JobRequest>) {
+            let (tx, rx) = mpsc::channel(256);
+            (Arc::new(Self { sender: tx }), rx)
+        }
+    }
+
+    impl DdsClient for TestDdsClient {
+        fn submit(&self, request: JobRequest) -> Result<(), crate::executor::DdsClientError> {
+            self.sender
+                .try_send(request)
+                .map_err(|_| crate::executor::DdsClientError::ChannelFull)
+        }
+
+        fn request_dds(
+            &self,
+            tile: TileCoord,
+            _cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            let (tx, rx) = oneshot::channel();
+            drop(tx);
+            let _ = self.sender.try_send(JobRequest::prefetch(tile));
+            rx
+        }
+
+        fn request_dds_with_options(
+            &self,
+            tile: TileCoord,
+            _priority: crate::executor::Priority,
+            _origin: RequestOrigin,
+            cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            self.request_dds(tile, cancellation)
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn sender(&self) -> Option<mpsc::Sender<JobRequest>> {
+            Some(self.sender.clone())
+        }
+    }
+
+    /// Mock MemoryCache that always returns None (empty cache).
+    struct EmptyMemoryCache;
+
+    impl MemoryCache for EmptyMemoryCache {
+        fn get(
+            &self,
+            _row: u32,
+            _col: u32,
+            _zoom: u8,
+        ) -> impl std::future::Future<Output = Option<Vec<u8>>> + Send {
+            async { None }
+        }
+
+        fn put(
+            &self,
+            _row: u32,
+            _col: u32,
+            _zoom: u8,
+            _data: Vec<u8>,
+        ) -> impl std::future::Future<Output = ()> + Send {
+            async {}
+        }
+
+        fn size_bytes(&self) -> usize {
+            0
+        }
+
+        fn entry_count(&self) -> usize {
+            0
+        }
+    }
+
+    /// Create an OrthoUnionIndex with DDS files for specific tiles.
+    fn create_index_with_dds(temp: &TempDir, dds_files: &[&str]) -> Arc<OrthoUnionIndex> {
+        let pkg_dir = temp.path().join("test_ortho");
+        std::fs::create_dir_all(pkg_dir.join("textures")).unwrap();
+
+        for filename in dds_files {
+            std::fs::write(pkg_dir.join("textures").join(filename), b"dds content").unwrap();
+        }
+
+        let source = OrthoSource::new_package("test", &pkg_dir);
+        Arc::new(OrthoUnionIndex::with_sources(vec![source]))
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_skips_tiles_on_disk() {
+        let temp = TempDir::new().unwrap();
+
+        // Create index with DDS files for tiles (100, 200, 16) and (100, 201, 16)
+        let index = create_index_with_dds(&temp, &["100_200_BI16.dds", "100_201_BI16.dds"]);
+
+        // Verify the index finds these tiles
+        assert!(index.dds_tile_exists(100, 200, 16));
+        assert!(index.dds_tile_exists(100, 201, 16));
+        assert!(!index.dds_tile_exists(100, 202, 16));
+
+        // Create tiles: 2 on disk + 1 not on disk
+        let tiles = vec![
+            TileCoord {
+                row: 100,
+                col: 200,
+                zoom: 16,
+            },
+            TileCoord {
+                row: 100,
+                col: 201,
+                zoom: 16,
+            },
+            TileCoord {
+                row: 100,
+                col: 202,
+                zoom: 16,
+            }, // NOT on disk
+        ];
+
+        let (client, mut rx) = TestDdsClient::new();
+        let memory_cache = Arc::new(EmptyMemoryCache);
+
+        let handle = start_prewarm(
+            "TEST".to_string(),
+            tiles,
+            client,
+            memory_cache,
+            index,
+            &tokio::runtime::Handle::current(),
+        );
+
+        // Respond to the ONE job that should be submitted (tile 202)
+        if let Some(request) = rx.recv().await {
+            assert_eq!(
+                request.tile.col, 202,
+                "Only non-disk tile should be submitted"
+            );
+            if let Some(tx) = request.response_tx {
+                let _ = tx.send(DdsResponse::success(
+                    vec![0u8; 10],
+                    std::time::Duration::from_millis(1),
+                ));
+            }
+        }
+
+        // Wait for completion
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let status = handle.status();
+        assert!(status.is_complete);
+        assert_eq!(status.disk_hits, 2, "Two tiles should be disk hits");
+        assert_eq!(status.completed, 1, "One tile should be generated");
+        assert_eq!(status.cache_hits, 0, "No memory cache hits");
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_all_tiles_on_disk() {
+        let temp = TempDir::new().unwrap();
+
+        // Create index with DDS files for all requested tiles
+        let index = create_index_with_dds(&temp, &["50_60_BI16.dds", "50_61_BI16.dds"]);
+
+        let tiles = vec![
+            TileCoord {
+                row: 50,
+                col: 60,
+                zoom: 16,
+            },
+            TileCoord {
+                row: 50,
+                col: 61,
+                zoom: 16,
+            },
+        ];
+
+        let (client, _rx) = TestDdsClient::new();
+        let memory_cache = Arc::new(EmptyMemoryCache);
+
+        let handle = start_prewarm(
+            "DISK".to_string(),
+            tiles,
+            client,
+            memory_cache,
+            index,
+            &tokio::runtime::Handle::current(),
+        );
+
+        // Wait briefly for the async task to complete
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let status = handle.status();
+        assert!(
+            status.is_complete,
+            "Should complete immediately when all tiles on disk"
+        );
+        assert_eq!(status.disk_hits, 2);
+        assert_eq!(status.completed, 0, "No tiles should need generation");
+        assert_eq!(status.total, 2);
     }
 }
