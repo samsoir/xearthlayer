@@ -1,12 +1,19 @@
-# Tile Patches Feature Design
+# Airport Scenery Integration (Dynamic Patch Textures)
 
-**Status**: Phase 1 In Progress
+**Status**: Planned (0.3.x) — temporarily removed, will return with GeoIndex integration
 **Created**: 2026-01-07
-**Last Updated**: 2026-01-07
+**Last Updated**: 2026-02-17
+
+> **Note**: This feature was previously implemented and functional (v0.2.x). It has been
+> temporarily removed in favor of the simpler [Scenery Patches](scenery-patches.md)
+> (bring-your-own-scenery) model introduced with [GeoIndex](geo-index-design.md) in
+> issue #51. When this feature returns in a later 0.3.x release, it will use GeoIndex
+> as its region ownership layer, replacing the previous `patched_regions` HashSet
+> approach. See [Scenery Patches](scenery-patches.md) for the current patch behavior.
 
 ## Overview
 
-The Tile Patches feature enables XEarthLayer to serve pre-built Ortho4XP tiles containing custom mesh/elevation data from third-party airport addons, while generating textures dynamically using XEL's configured imagery provider.
+The Airport Scenery Integration feature enables XEarthLayer to serve pre-built Ortho4XP tiles containing custom mesh/elevation data from third-party airport addons, while generating textures dynamically using XEL's configured imagery provider.
 
 ### Goals
 
@@ -507,19 +514,25 @@ This ensures patches override regional ortho tiles, while overlays remain on top
 
 ---
 
+## Re-implementation with GeoIndex
+
+When this feature returns, it will build on the infrastructure introduced in #51:
+
+- **GeoIndex** (`PatchCoverage` layer) provides region ownership — replaces the removed `patched_regions` HashSet
+- **`resolve_lazy_filtered()`** on `OrthoUnionIndex` enables source-aware file resolution
+- **FUSE composition** (`is_geo_filtered()` + `resolve_lazy_geo()`) already handles the geospatial filtering
+
+The main new work will be:
+
+1. **DDS generation for patched regions** — Currently FUSE operates in pure passthrough mode for patched regions (no DDS generation). This feature re-enables generation using XEL's configured imagery provider when a `.dds` file is requested but doesn't exist on disk.
+2. **A new GeoIndex layer** (e.g., `DynamicTextureCoverage`) to distinguish regions where XEL should generate textures from regions where it should only pass through.
+3. **Texture seam handling** — Ensuring generated textures match adjacent XEL tiles.
+
 ## Future Considerations
-
-### Consolidated FUSE Mounting (v0.2.11 follow-up)
-
-The union filesystem pattern developed for patches will be extended to consolidate all regional scenery packages into a single FUSE mount. This provides:
-
-- Single scenery.ini entry instead of one per region
-- Foundation for selective package enable/disable
-- Simplified mount management
 
 ### Hot Reload
 
-Currently patches require restart to detect. Future enhancement could monitor patches directory for changes and rebuild index dynamically.
+Currently patches require restart to detect. Future enhancement could monitor patches directory for changes and rebuild the GeoIndex dynamically.
 
 ### Patch Validation Tool
 
@@ -537,3 +550,4 @@ A more comprehensive validation tool could:
 |------|--------|
 | 2026-01-07 | Initial design document |
 | 2026-02-08 | Add region-level ownership: patches with DSF files own the 1x1 region, FUSE/prewarm/prefetch skip generation (#51) |
+| 2026-02-17 | Renamed from `tile-patches.md`. Marked as planned — feature temporarily removed in favor of BYOS model with GeoIndex. Added re-implementation notes. |

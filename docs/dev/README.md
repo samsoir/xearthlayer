@@ -18,6 +18,7 @@ Technical documentation for XEarthLayer developers and contributors.
 | [FUSE Filesystem](fuse-filesystem.md) | Virtual filesystem, consolidated mounting, passthrough implementation |
 | [Coordinate System](coordinate-system.md) | Web Mercator projection, tile math, zoom levels |
 | [DDS Implementation](dds-implementation.md) | BC1/BC3 texture compression, mipmap generation |
+| [GeoIndex Design](geo-index-design.md) | Geospatial reference database, patch region ownership |
 | [Cache Design](cache-design.md) | Two-tier caching (memory + disk), LRU eviction |
 | [Parallel Processing](parallel-processing.md) | Thread pools, legacy coalescing |
 | [Network Stats](network-stats.md) | Download metrics, bandwidth tracking |
@@ -38,7 +39,8 @@ Technical documentation for XEarthLayer developers and contributors.
 
 | Document | Description |
 |----------|-------------|
-| [Tile Patches](tile-patches.md) | Custom mesh/elevation from airport addons |
+| [Scenery Patches](scenery-patches.md) | Bring-your-own-scenery patches with GeoIndex region ownership (current) |
+| [Airport Scenery Integration](airport-scenery-integration.md) | **Planned (0.3.x)**: Dynamic texture generation for patches (previously implemented, temporarily removed) |
 | [Adaptive Prefetch Design](adaptive-prefetch-design.md) | **Primary design doc**: Self-calibrating prefetch with flight phase detection (v0.3.0+) |
 | [X-Plane Scenery Loading Whitepaper](xplane-scenery-loading-whitepaper.md) | Research on X-Plane 12's scenery loading behavior |
 | [Prefetch Flight Test Plan](prefetch-flight-test-plan.md) | Flight test data informing prefetch design |
@@ -85,6 +87,7 @@ xearthlayer-cli
             │       ├── union_fs (multi-source patches)
             │       ├── ortho_union_fs (consolidated mount)
             │       └── coalesce (request coalescing)
+            ├── geo_index (geospatial reference database)
             ├── ortho_union (tile → source mapping)
             ├── patches (patch discovery, validation)
             ├── prefetch (adaptive prefetch, flight phase detection)
