@@ -140,14 +140,15 @@ impl DsfTileCoord {
         let chunk_row: u32 = parts[0].parse().ok()?;
         let chunk_col: u32 = parts[1].parse().ok()?;
 
-        // Extract zoom from the third part (e.g., "BI16" -> 16)
+        // Extract zoom from the last 2 digits of the third part.
+        // Examples: "BI16" → 16, "GO218" → 18, "GO216" → 16
+        // The map type prefix may include a trailing digit (GO2), so we
+        // cannot simply skip alphabetic chars — we must take the last 2 digits.
         let zoom_part = parts[2];
-        let zoom: u8 = zoom_part
-            .chars()
-            .skip_while(|c| c.is_alphabetic())
-            .collect::<String>()
-            .parse()
-            .ok()?;
+        if zoom_part.len() < 3 {
+            return None;
+        }
+        let zoom: u8 = zoom_part[zoom_part.len() - 2..].parse().ok()?;
 
         // Convert chunk coordinates to geographic coordinates
         let (lat, lon) = chunk_to_lat_lon(chunk_row, chunk_col, zoom);
@@ -483,6 +484,109 @@ mod tests {
         let dds_result = DsfTileCoord::from_dds_filename("10000_5000_BI16.dds");
         let scenery_result = DsfTileCoord::from_scenery_filename("10000_5000_BI16.dds");
         assert_eq!(dds_result, scenery_result);
+    }
+
+    /// GO2 naming convention: `GO218` → map type "GO2", zoom 18.
+    /// The trailing digit in "GO2" must not be consumed as part of the zoom.
+    #[test]
+    fn test_from_scenery_filename_go2_convention() {
+        let bi = DsfTileCoord::from_scenery_filename("10000_5000_BI16.dds");
+        let go2 = DsfTileCoord::from_scenery_filename("10000_5000_GO216.dds");
+        // Both are the same chunk coordinates, so they should produce
+        // the same DSF region regardless of map type prefix.
+        assert_eq!(bi, go2, "BI16 and GO216 should resolve to same DSF region");
+    }
+
+    /// GO2 at zoom 18 should parse correctly.
+    #[test]
+    fn test_from_scenery_filename_go218() {
+        use crate::coord::TileCoord;
+
+        // Coordinates at zoom 18 for a known region
+        let tc = crate::coord::to_tile_coords(33.5, -118.5, 18).unwrap();
+        let filename = format!("{}_{}_GO218.dds", tc.row, tc.col);
+        let dsf = DsfTileCoord::from_scenery_filename(&filename).unwrap();
+
+        // Should map to region (33, -119) — same as TileCoord center
+        let tile = TileCoord {
+            row: tc.row,
+            col: tc.col,
+            zoom: 18,
+        };
+        let (lat, _lon) = tile.to_lat_lon();
+        assert_eq!(
+            dsf.lat,
+            lat.floor() as i32,
+            "GO218 should parse zoom as 18, not 218"
+        );
+    }
+
+    /// Property-based test: all zoom levels and map type conventions must parse
+    /// to the same DSF region for the same geographic point.
+    ///
+    /// Patches can use any zoom level (12-19) and any map type (BI, GO2, etc.).
+    /// The zoom parser must handle all combinations correctly.
+    #[test]
+    fn test_scenery_filename_zoom_parsing_all_levels_and_types() {
+        // Test coordinates at several geographic locations
+        let test_points: &[(f64, f64)] = &[
+            (33.5, -118.5), // Los Angeles
+            (43.5, 6.5),    // Nice/LFMN
+            (-33.9, 151.2), // Sydney
+            (51.5, -0.1),   // London
+        ];
+
+        // Realistic zoom levels for ortho scenery
+        let zoom_levels: &[u8] = &[12, 14, 16, 17, 18];
+
+        // Map type prefixes: BI (Bing), GO2 (Google), USA (US-specific)
+        let map_types: &[&str] = &["BI", "GO2", "USA"];
+
+        for &(lat, lon) in test_points {
+            let expected_lat = lat.floor() as i32;
+            let expected_lon = lon.floor() as i32;
+
+            for &zoom in zoom_levels {
+                let tc = crate::coord::to_tile_coords(lat, lon, zoom).unwrap();
+
+                for &map_type in map_types {
+                    let filename = format!("{}_{}_{}{}", tc.row, tc.col, map_type, zoom);
+
+                    // DDS extension
+                    let dds_file = format!("{filename}.dds");
+                    let dsf = DsfTileCoord::from_scenery_filename(&dds_file)
+                        .unwrap_or_else(|| panic!("Failed to parse: {dds_file}"));
+                    assert_eq!(
+                        dsf.lat, expected_lat,
+                        "Wrong lat for {dds_file}: got {}, expected {}",
+                        dsf.lat, expected_lat
+                    );
+                    assert_eq!(
+                        dsf.lon, expected_lon,
+                        "Wrong lon for {dds_file}: got {}, expected {}",
+                        dsf.lon, expected_lon
+                    );
+
+                    // TER extension (same coordinates)
+                    let ter_file = format!("{filename}.ter");
+                    let dsf_ter = DsfTileCoord::from_scenery_filename(&ter_file)
+                        .unwrap_or_else(|| panic!("Failed to parse: {ter_file}"));
+                    assert_eq!(
+                        dsf, dsf_ter,
+                        "DDS and TER should resolve same region: {dds_file} vs {ter_file}"
+                    );
+
+                    // _sea.ter suffix
+                    let sea_file = format!("{filename}_sea.ter");
+                    let dsf_sea = DsfTileCoord::from_scenery_filename(&sea_file)
+                        .unwrap_or_else(|| panic!("Failed to parse: {sea_file}"));
+                    assert_eq!(
+                        dsf, dsf_sea,
+                        "DDS and _sea.ter should resolve same region: {dds_file} vs {sea_file}"
+                    );
+                }
+            }
+        }
     }
 
     // =========================================================================
