@@ -42,6 +42,7 @@ use tracing::{debug, info, warn};
 
 use crate::coord::TileCoord;
 use crate::executor::{DdsClient, MemoryCache, Priority};
+use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage};
 use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::tile_based::DsfTileCoord;
 use crate::runtime::{JobRequest, RequestOrigin};
@@ -163,6 +164,7 @@ struct PrewarmContext<M: MemoryCache> {
     dds_client: Arc<dyn DdsClient>,
     memory_cache: Arc<M>,
     ortho_index: Arc<OrthoUnionIndex>,
+    geo_index: Option<Arc<GeoIndex>>,
     status: Arc<Mutex<PrewarmStatus>>,
     cancellation: CancellationToken,
 }
@@ -183,6 +185,7 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
     /// * `dds_client` - Client for submitting DDS generation jobs
     /// * `memory_cache` - Cache to check for already-cached tiles
     /// * `ortho_index` - Index for checking disk-resident tiles (patches, cache)
+    /// * `geo_index` - Geospatial index for patched region filtering
     /// * `runtime` - Tokio runtime handle to spawn the task on
     pub fn start(
         icao: String,
@@ -190,6 +193,7 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
         dds_client: Arc<dyn DdsClient>,
         memory_cache: Arc<M>,
         ortho_index: Arc<OrthoUnionIndex>,
+        geo_index: Option<Arc<GeoIndex>>,
         runtime: &Handle,
     ) -> PrewarmHandle {
         let total = tiles.len();
@@ -214,6 +218,7 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
             dds_client,
             memory_cache,
             ortho_index,
+            geo_index,
             status,
             cancellation,
         };
@@ -244,11 +249,14 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
 
         // Step 1b: Filter out tiles in patched regions (region-level ownership)
         let before_patch = to_generate.len();
-        to_generate.retain(|tile| {
-            let (lat, lon) = tile.to_lat_lon();
-            let dsf = DsfTileCoord::from_lat_lon(lat, lon);
-            !self.ortho_index.is_patched_region(dsf.lat, dsf.lon)
-        });
+        if let Some(ref geo_index) = self.geo_index {
+            let gi = Arc::clone(geo_index);
+            to_generate.retain(|tile| {
+                let (lat, lon) = tile.to_lat_lon();
+                let dsf = DsfTileCoord::from_lat_lon(lat, lon);
+                !gi.contains::<PatchCoverage>(&DsfRegion::new(dsf.lat, dsf.lon))
+            });
+        }
         let patch_skipped = before_patch - to_generate.len();
         if patch_skipped > 0 {
             let mut s = self.status.lock();
@@ -464,6 +472,7 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
 /// * `dds_client` - Client for submitting DDS generation jobs
 /// * `memory_cache` - Cache to check for already-cached tiles
 /// * `ortho_index` - Index for checking disk-resident tiles (patches, cache)
+/// * `geo_index` - Geospatial index for patched region filtering
 /// * `runtime` - Tokio runtime handle
 pub fn start_prewarm<M: MemoryCache + Send + Sync + 'static>(
     icao: String,
@@ -471,9 +480,18 @@ pub fn start_prewarm<M: MemoryCache + Send + Sync + 'static>(
     dds_client: Arc<dyn DdsClient>,
     memory_cache: Arc<M>,
     ortho_index: Arc<OrthoUnionIndex>,
+    geo_index: Option<Arc<GeoIndex>>,
     runtime: &Handle,
 ) -> PrewarmHandle {
-    PrewarmContext::start(icao, tiles, dds_client, memory_cache, ortho_index, runtime)
+    PrewarmContext::start(
+        icao,
+        tiles,
+        dds_client,
+        memory_cache,
+        ortho_index,
+        geo_index,
+        runtime,
+    )
 }
 
 #[cfg(test)]
@@ -717,6 +735,7 @@ mod tests {
             client,
             memory_cache,
             index,
+            None,
             &tokio::runtime::Handle::current(),
         );
 
@@ -744,18 +763,31 @@ mod tests {
         assert_eq!(status.cache_hits, 0, "No memory cache hits");
     }
 
-    /// Build a test OrthoUnionIndex fixture with specific patched regions.
-    fn build_test_index_with_patched_regions(
-        temp: &TempDir,
-        regions: &[(i32, i32)],
-    ) -> Arc<OrthoUnionIndex> {
+    /// Build a test GeoIndex with patched regions for the given coordinates.
+    fn build_test_geo_index(regions: &[(i32, i32)]) -> Arc<GeoIndex> {
+        let geo_index = Arc::new(GeoIndex::new());
+        let entries: Vec<_> = regions
+            .iter()
+            .map(|&(lat, lon)| {
+                (
+                    DsfRegion::new(lat, lon),
+                    PatchCoverage {
+                        patch_name: "test_patch".to_string(),
+                    },
+                )
+            })
+            .collect();
+        geo_index.populate(entries);
+        geo_index
+    }
+
+    /// Build a test OrthoUnionIndex fixture (no patched regions — use GeoIndex).
+    fn build_test_index(temp: &TempDir) -> Arc<OrthoUnionIndex> {
         let pkg_dir = temp.path().join("test_ortho");
         std::fs::create_dir_all(pkg_dir.join("textures")).unwrap();
 
         let source = OrthoSource::new_package("test", &pkg_dir);
-        let mut index = OrthoUnionIndex::with_sources(vec![source]);
-        let region_set: std::collections::HashSet<(i32, i32)> = regions.iter().cloned().collect();
-        index.set_patched_regions(region_set);
+        let index = OrthoUnionIndex::with_sources(vec![source]);
         Arc::new(index)
     }
 
@@ -765,8 +797,11 @@ mod tests {
 
         let temp = TempDir::new().unwrap();
 
-        // Build test index with patched region (33, -119)
-        let index = build_test_index_with_patched_regions(&temp, &[(33, -119)]);
+        // Build test index (no patched regions on the index itself)
+        let index = build_test_index(&temp);
+
+        // Build GeoIndex with patched region (33, -119)
+        let geo_index = build_test_geo_index(&[(33, -119)]);
 
         // Create tiles: 2 in patched region + 1 outside
         // Use to_tile_coords to get valid chunk coords in DSF region (33, -119)
@@ -795,6 +830,7 @@ mod tests {
             client,
             memory_cache,
             index,
+            Some(geo_index),
             &tokio::runtime::Handle::current(),
         );
 
@@ -849,6 +885,7 @@ mod tests {
             client,
             memory_cache,
             index,
+            None,
             &tokio::runtime::Handle::current(),
         );
 

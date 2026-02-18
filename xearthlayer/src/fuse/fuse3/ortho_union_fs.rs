@@ -42,6 +42,7 @@ use super::types::{Fuse3Error, Fuse3Result};
 use crate::executor::{DdsClient, StorageConcurrencyLimiter};
 use crate::fuse::coalesce::RequestCoalescer;
 use crate::fuse::{get_default_placeholder, parse_dds_filename};
+use crate::geo_index::GeoIndex;
 use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::{DdsAccessEvent, DsfTileCoord, FuseLoadMonitor, TileRequestCallback};
 use crate::scene_tracker::{DdsTileCoord, FuseAccessEvent};
@@ -92,6 +93,12 @@ use tracing::{debug, trace};
 pub struct Fuse3OrthoUnionFS {
     /// Union index mapping virtual paths to real file locations
     index: Arc<OrthoUnionIndex>,
+    /// Geospatial reference database for region-level ownership queries.
+    ///
+    /// Used to determine if a scenery file falls within a patch-owned region.
+    /// When set, FUSE filters lazy resolution to only serve patch sources in
+    /// those regions, hiding package files that would cause X-Plane conflicts.
+    geo_index: Option<Arc<GeoIndex>>,
     /// Client for DDS generation requests (new daemon architecture)
     dds_client: Arc<dyn DdsClient>,
     /// Inode manager for path mappings
@@ -168,6 +175,7 @@ impl Fuse3OrthoUnionFS {
 
         Self {
             index: Arc::new(index),
+            geo_index: None,
             dds_client,
             inode_manager: InodeManager::new(virtual_root),
             virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
@@ -197,6 +205,7 @@ impl Fuse3OrthoUnionFS {
 
         Self {
             index: Arc::new(index),
+            geo_index: None,
             dds_client,
             inode_manager: InodeManager::new(virtual_root),
             virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
@@ -309,9 +318,57 @@ impl Fuse3OrthoUnionFS {
         self
     }
 
+    /// Set the geospatial reference index for region-level ownership queries.
+    ///
+    /// When set, FUSE uses the GeoIndex to determine if a scenery file falls
+    /// within a patch-owned DSF region. Files in patched regions are resolved
+    /// only from patch sources, hiding package files that could conflict.
+    pub fn with_geo_index(mut self, geo_index: Arc<GeoIndex>) -> Self {
+        self.geo_index = Some(geo_index);
+        self
+    }
+
     /// Returns the disk I/O limiter for monitoring/metrics.
     pub fn disk_io_limiter(&self) -> &Arc<StorageConcurrencyLimiter> {
         &self.disk_io_limiter
+    }
+
+    /// Check if a scenery filename falls in a geo-filtered (patch-owned) region.
+    ///
+    /// Returns true when the file's DSF region has [`PatchCoverage`] in the
+    /// GeoIndex, meaning only patch sources should serve files for this region.
+    fn is_geo_filtered(&self, filename: &str) -> bool {
+        let geo_index = match self.geo_index {
+            Some(ref gi) => gi,
+            None => return false,
+        };
+
+        use crate::geo_index::{DsfRegion, PatchCoverage};
+        use crate::prefetch::tile_based::DsfTileCoord;
+
+        DsfTileCoord::from_scenery_filename(filename)
+            .map(|dsf| {
+                let region = DsfRegion::new(dsf.lat, dsf.lon);
+                geo_index.contains::<PatchCoverage>(&region)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Resolve a lazy path with geospatial awareness.
+    ///
+    /// If the file is in a patch-owned region (per GeoIndex), only patch sources
+    /// are searched. Otherwise, all sources are searched (normal behavior).
+    ///
+    /// This is the composition point: GeoIndex (geography) + OrthoUnionIndex (files).
+    fn resolve_lazy_geo(&self, virtual_path: &std::path::Path, filename: &str) -> Option<PathBuf> {
+        if self.is_geo_filtered(filename) {
+            // Patched region: only patch sources
+            self.index
+                .resolve_lazy_filtered(virtual_path, |s| s.is_patch())
+        } else {
+            // Normal: all sources
+            self.index.resolve_lazy(virtual_path)
+        }
     }
 
     /// Get the ortho union index.
@@ -518,7 +575,11 @@ impl Filesystem for Fuse3OrthoUnionFS {
         // Try lazy resolution for terrain/textures directories
         // These directories are not fully scanned at startup for performance,
         // so we resolve files on-demand by checking the real filesystem.
-        if let Some(real_path) = self.index.resolve_lazy(&child_path) {
+        //
+        // Geospatial filtering: In patch-owned regions, only patch sources are
+        // searched — package files are invisible. This prevents X-Plane from
+        // discovering package terrain that references DDS files we won't generate.
+        if let Some(real_path) = self.resolve_lazy_geo(&child_path, &name_str) {
             if let Ok(metadata) = fs::metadata(&real_path).await {
                 let inode = self.inode_manager.get_or_create_inode(&child_path);
                 let attr = self.metadata_to_attr(inode, &metadata);
@@ -530,10 +591,10 @@ impl Filesystem for Fuse3OrthoUnionFS {
             }
         }
 
-        // Patched region passthrough gate
+        // Patched region passthrough gate for DDS generation
         // If this resource is in a region owned by a patch, the patch is responsible
         // for providing it. Serve only what exists on disk — no generation.
-        if self.index.is_resource_in_patched_region(&child_path) {
+        if self.is_geo_filtered(&name_str) {
             return Err(Errno::from(libc::ENOENT));
         }
 
@@ -600,8 +661,12 @@ impl Filesystem for Fuse3OrthoUnionFS {
             return Ok(ReplyAttr { ttl: TTL, attr });
         }
 
-        // Try lazy resolution for terrain/textures directories
-        if let Some(real_path) = self.index.resolve_lazy(&virtual_path) {
+        // Try lazy resolution for terrain/textures directories (geospatial-aware)
+        let filename = virtual_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+        if let Some(real_path) = self.resolve_lazy_geo(&virtual_path, filename) {
             let metadata = fs::metadata(&real_path)
                 .await
                 .map_err(|_| Errno::from(libc::ENOENT))?;
@@ -682,10 +747,14 @@ impl Filesystem for Fuse3OrthoUnionFS {
             .get_path(ino)
             .ok_or(Errno::from(libc::ENOENT))?;
 
-        // Try to resolve the real path - first from index, then lazy
+        // Try to resolve the real path - first from index, then lazy (geospatial-aware)
+        let filename = virtual_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
         let real_path = if let Some(source) = self.index.resolve(&virtual_path) {
             source.real_path.clone()
-        } else if let Some(lazy_path) = self.index.resolve_lazy(&virtual_path) {
+        } else if let Some(lazy_path) = self.resolve_lazy_geo(&virtual_path, filename) {
             lazy_path
         } else {
             return Err(Errno::from(libc::ENOENT));
@@ -1260,11 +1329,13 @@ mod tests {
 
     /// Test that lookup returns ENOENT for DDS files in patched regions.
     ///
-    /// When a patch owns a region (provides the DSF), FUSE should never generate
+    /// When a patch owns a region (per GeoIndex), FUSE should never generate
     /// DDS textures for that region — it should return ENOENT for missing files.
     #[tokio::test]
     async fn test_lookup_patched_region_returns_enoent_for_missing_dds() {
         use fuse3::raw::Filesystem;
+
+        use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage};
 
         let temp = TempDir::new().unwrap();
 
@@ -1285,14 +1356,17 @@ mod tests {
             .build()
             .unwrap();
 
-        // Verify the region is marked as patched
-        assert!(
-            index.is_patched_region(33, -119),
-            "Region (33, -119) should be patched"
-        );
+        // Build GeoIndex with PatchCoverage for region (33, -119)
+        let geo_index = Arc::new(GeoIndex::new());
+        geo_index.populate(vec![(
+            DsfRegion::new(33, -119),
+            PatchCoverage {
+                patch_name: "LIPX_Mesh".to_string(),
+            },
+        )]);
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024).with_geo_index(Arc::clone(&geo_index));
 
         // Get inode for "textures" directory
         let textures_inode = fs
@@ -1307,11 +1381,6 @@ mod tests {
         };
 
         // Look up a DDS filename whose coordinates fall in the patched region (33, -119).
-        // We need a filename that resolves to DsfTileCoord(33, -119).
-        // Use from_lat_lon to find chunk coordinates for that region.
-        // At zoom 16, tiles near 33.5°N -118.5°W are roughly row ~6250, col ~7167
-        // But we need to construct a valid DDS filename. Let's use a known coordinate
-        // mapping: a chunk at zoom 16 in the (33, -119) DSF region.
         use crate::coord::to_tile_coords;
         let tc = to_tile_coords(33.5, -118.5, 16).unwrap();
         let dds_name = format!("{}_{}_BI16.dds", tc.row, tc.col);
@@ -1324,7 +1393,7 @@ mod tests {
 
         // Lookup should return ENOENT because:
         // 1. The DDS file doesn't exist on disk
-        // 2. The region is owned by a patch → no generation
+        // 2. GeoIndex marks this region as patch-owned → no generation
         let result = fs
             .lookup(req, textures_inode, std::ffi::OsStr::new(&dds_name))
             .await;
@@ -1350,12 +1419,6 @@ mod tests {
             .add_package(na_pkg)
             .build()
             .unwrap();
-
-        assert_eq!(
-            index.patched_region_count(),
-            0,
-            "No patches = no patched regions"
-        );
 
         let client = create_test_client();
         let fs = Fuse3OrthoUnionFS::new(index, client, 1024);

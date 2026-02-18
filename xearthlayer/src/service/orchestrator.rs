@@ -55,6 +55,7 @@ use crate::aircraft_position::{
     TelemetryReceiver, TelemetryReceiverConfig, DEFAULT_LOG_INTERVAL,
 };
 use crate::executor::{DdsClient, MemoryCache};
+use crate::geo_index::GeoIndex;
 use crate::log::TracingLogger;
 use crate::manager::{
     create_consolidated_overlay, InstalledPackage, LocalPackageStore, MountManager, ServiceBuilder,
@@ -784,6 +785,12 @@ impl ServiceOrchestrator {
             );
         }
 
+        // Wire GeoIndex for patched region filtering (Issue #51)
+        if let Some(geo_index) = self.geo_index() {
+            coordinator = coordinator.with_geo_index(geo_index);
+            tracing::info!("GeoIndex wired to prefetch (patched region filtering enabled)");
+        }
+
         // Wire shared status for TUI display
         coordinator = coordinator.with_shared_status(Arc::clone(&self.prefetch_status));
 
@@ -845,6 +852,11 @@ impl ServiceOrchestrator {
     /// Get the OrthoUnionIndex if available.
     pub fn ortho_union_index(&self) -> Option<Arc<OrthoUnionIndex>> {
         self.mount_manager.ortho_union_index()
+    }
+
+    /// Get the GeoIndex if available.
+    pub fn geo_index(&self) -> Option<Arc<GeoIndex>> {
+        self.mount_manager.geo_index()
     }
 
     /// Get mutable access to the mount manager.

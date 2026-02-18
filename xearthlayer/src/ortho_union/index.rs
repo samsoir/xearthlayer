@@ -4,7 +4,7 @@
 //! and regional packages). It is constructed by [`OrthoUnionIndexBuilder`] and
 //! is immutable after construction.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -166,13 +166,6 @@ pub struct OrthoUnionIndex {
 
     /// Total file count across all sources.
     total_files: usize,
-
-    /// 1°×1° DSF regions owned by patches.
-    ///
-    /// When a patch provides the DSF for a region, it owns all resources in
-    /// that region. FUSE, prewarm, and prefetch skip generation for these areas.
-    #[serde(default)]
-    patched_regions: HashSet<(i32, i32)>,
 }
 
 impl OrthoUnionIndex {
@@ -186,7 +179,6 @@ impl OrthoUnionIndex {
             files: HashMap::new(),
             directories: HashMap::new(),
             total_files: 0,
-            patched_regions: HashSet::new(),
         }
     }
 
@@ -199,7 +191,6 @@ impl OrthoUnionIndex {
             files: HashMap::new(),
             directories: HashMap::new(),
             total_files: 0,
-            patched_regions: HashSet::new(),
         }
     }
 
@@ -336,6 +327,53 @@ impl OrthoUnionIndex {
         None
     }
 
+    /// Resolve a lazy path, filtering sources by a predicate.
+    ///
+    /// Same as [`resolve_lazy()`](Self::resolve_lazy) but only considers sources
+    /// where `source_filter` returns `true`. The index has no knowledge of WHY
+    /// sources are filtered — the caller provides the domain-specific predicate.
+    ///
+    /// For non-lazy (indexed) paths, the filter is NOT applied because indexed
+    /// files were already resolved by priority during index building.
+    ///
+    /// Used by FUSE to compose file resolution with geospatial queries.
+    pub fn resolve_lazy_filtered<F>(&self, virtual_path: &Path, source_filter: F) -> Option<PathBuf>
+    where
+        F: Fn(&OrthoSource) -> bool,
+    {
+        // For indexed (non-lazy) files, use normal resolution without filtering.
+        // These were already priority-resolved during index building.
+        if let Some(source) = self.resolve(virtual_path) {
+            return Some(source.real_path.clone());
+        }
+
+        // Check if this path is inside a lazy directory
+        let mut components = virtual_path.components();
+        let first_component = components.next()?;
+        let first_str = first_component.as_os_str().to_string_lossy();
+
+        if !Self::LAZY_DIRECTORIES.contains(&first_str.as_ref()) {
+            return None;
+        }
+
+        // Get the remaining path after the lazy directory
+        let remaining: PathBuf = components.collect();
+
+        // Search sources in priority order, applying the filter
+        for source in &self.sources {
+            if !source_filter(source) {
+                continue;
+            }
+
+            let real_path = source.source_path.join(&*first_str).join(&remaining);
+            if real_path.exists() {
+                return Some(real_path);
+            }
+        }
+
+        None
+    }
+
     /// Check if a virtual path exists, including lazy directories.
     ///
     /// This is similar to `contains()` but also checks lazy directories
@@ -401,45 +439,6 @@ impl OrthoUnionIndex {
     /// Check if the index is empty (no sources).
     pub fn is_empty(&self) -> bool {
         self.sources.is_empty()
-    }
-
-    /// Set the patched regions (used by builder after index construction).
-    pub(crate) fn set_patched_regions(&mut self, regions: HashSet<(i32, i32)>) {
-        self.patched_regions = regions;
-    }
-
-    /// Check if a 1°×1° DSF region is owned by a patch.
-    pub fn is_patched_region(&self, lat: i32, lon: i32) -> bool {
-        self.patched_regions.contains(&(lat, lon))
-    }
-
-    /// Get the set of patched regions (for logging).
-    pub fn patched_regions(&self) -> &HashSet<(i32, i32)> {
-        &self.patched_regions
-    }
-
-    /// Get the number of patched regions.
-    pub fn patched_region_count(&self) -> usize {
-        self.patched_regions.len()
-    }
-
-    /// Check if a virtual path refers to a resource in a patch-owned region.
-    ///
-    /// Returns true if the resource's geographic region is covered by a patch DSF.
-    /// When true, FUSE should operate in pure passthrough mode — serve only what
-    /// exists on disk, never generate resources. The patch owns this area.
-    pub fn is_resource_in_patched_region(&self, virtual_path: &Path) -> bool {
-        if self.patched_regions.is_empty() {
-            return false; // Fast path: no patches installed
-        }
-        let filename = match virtual_path.file_name().and_then(|f| f.to_str()) {
-            Some(f) => f,
-            None => return false,
-        };
-        match DsfTileCoord::from_scenery_filename(filename) {
-            Some(dsf) => self.patched_regions.contains(&(dsf.lat, dsf.lon)),
-            None => false, // Can't determine region → not considered patched
-        }
     }
 
     /// Iterate over all files in the index.
@@ -1177,106 +1176,142 @@ mod tests {
     }
 
     // ========================================================================
-    // Patched region tests (Issue #51)
+    // resolve_lazy_filtered tests (Issue #51, Phase B)
     // ========================================================================
 
-    #[test]
-    fn test_patched_region_empty() {
-        let index = OrthoUnionIndex::new();
-        assert!(!index.is_patched_region(45, 11));
-        assert_eq!(index.patched_region_count(), 0);
+    /// Create a test index with both a patch and package that have terrain files
+    /// in the same lazy directory, to test source filtering.
+    fn create_filtered_index(temp: &TempDir) -> OrthoUnionIndex {
+        // Patch source (priority: sorts first due to _patches/ prefix)
+        let patch_dir = temp.path().join("_patches").join("nice_mesh");
+        std::fs::create_dir_all(patch_dir.join("terrain")).unwrap();
+        std::fs::write(
+            patch_dir.join("terrain/10000_5000_GO218.ter"),
+            b"patch terrain",
+        )
+        .unwrap();
+        // A file ONLY the patch has
+        std::fs::write(
+            patch_dir.join("terrain/10000_5001_GO218.ter"),
+            b"patch only terrain",
+        )
+        .unwrap();
+
+        // Package source
+        let pkg_dir = temp.path().join("eu_ortho");
+        std::fs::create_dir_all(pkg_dir.join("terrain")).unwrap();
+        std::fs::write(
+            pkg_dir.join("terrain/10000_5000_BI16.ter"),
+            b"package terrain",
+        )
+        .unwrap();
+        // A file ONLY the package has
+        std::fs::write(
+            pkg_dir.join("terrain/20000_6000_BI16.ter"),
+            b"package only terrain",
+        )
+        .unwrap();
+
+        let patch = OrthoSource::new_patch("nice_mesh", &patch_dir);
+        let package = OrthoSource::new_package("eu", &pkg_dir);
+
+        OrthoUnionIndex::with_sources(vec![patch, package])
     }
 
     #[test]
-    fn test_patched_region_match() {
-        let mut index = OrthoUnionIndex::new();
-        let mut regions = std::collections::HashSet::new();
-        regions.insert((45, 11));
-        regions.insert((45, 12));
-        index.set_patched_regions(regions);
+    fn test_resolve_lazy_filtered_accept_all() {
+        let temp = TempDir::new().unwrap();
+        let index = create_filtered_index(&temp);
 
-        assert!(index.is_patched_region(45, 11));
-        assert!(index.is_patched_region(45, 12));
-        assert_eq!(index.patched_region_count(), 2);
+        // Accept all → should behave like resolve_lazy()
+        let patch_file = Path::new("terrain/10000_5000_GO218.ter");
+        let result = index.resolve_lazy_filtered(patch_file, |_| true);
+        assert!(result.is_some(), "Accept-all should find patch file");
+
+        let pkg_file = Path::new("terrain/20000_6000_BI16.ter");
+        let result = index.resolve_lazy_filtered(pkg_file, |_| true);
+        assert!(result.is_some(), "Accept-all should find package file");
     }
 
     #[test]
-    fn test_patched_region_no_match() {
-        let mut index = OrthoUnionIndex::new();
-        let mut regions = std::collections::HashSet::new();
-        regions.insert((45, 11));
-        index.set_patched_regions(regions);
+    fn test_resolve_lazy_filtered_reject_all() {
+        let temp = TempDir::new().unwrap();
+        let index = create_filtered_index(&temp);
 
-        assert!(!index.is_patched_region(45, 12));
-        assert!(!index.is_patched_region(33, -119));
+        // Reject all → should return None even for existing files
+        let patch_file = Path::new("terrain/10000_5000_GO218.ter");
+        let result = index.resolve_lazy_filtered(patch_file, |_| false);
+        assert!(result.is_none(), "Reject-all should find nothing");
     }
 
     #[test]
-    fn test_patched_regions_accessor() {
-        let mut index = OrthoUnionIndex::new();
-        let mut regions = std::collections::HashSet::new();
-        regions.insert((45, 11));
-        index.set_patched_regions(regions);
+    fn test_resolve_lazy_filtered_patches_only() {
+        let temp = TempDir::new().unwrap();
+        let index = create_filtered_index(&temp);
 
-        let accessor = index.patched_regions();
-        assert!(accessor.contains(&(45, 11)));
-        assert_eq!(accessor.len(), 1);
+        // Only accept patch sources
+        let filter = |source: &OrthoSource| source.is_patch();
+
+        // Patch file → found
+        let patch_file = Path::new("terrain/10000_5001_GO218.ter");
+        let result = index.resolve_lazy_filtered(patch_file, filter);
+        assert!(result.is_some(), "Should find patch-only file");
+
+        // Package-only file → NOT found (filtered out)
+        let pkg_file = Path::new("terrain/20000_6000_BI16.ter");
+        let result = index.resolve_lazy_filtered(pkg_file, filter);
+        assert!(
+            result.is_none(),
+            "Patches-only filter should hide package files"
+        );
     }
 
     #[test]
-    fn test_is_resource_in_patched_region_dds() {
-        let mut index = OrthoUnionIndex::new();
-        let mut regions = std::collections::HashSet::new();
-        // Use DsfTileCoord::from_dds_filename to find the actual region for "10000_5000_BI16.dds"
-        let dsf = DsfTileCoord::from_dds_filename("10000_5000_BI16.dds").unwrap();
-        regions.insert((dsf.lat, dsf.lon));
-        index.set_patched_regions(regions);
+    fn test_resolve_lazy_filtered_packages_only() {
+        let temp = TempDir::new().unwrap();
+        let index = create_filtered_index(&temp);
 
-        let path = std::path::Path::new("textures/10000_5000_BI16.dds");
-        assert!(index.is_resource_in_patched_region(path));
+        // Only accept package sources
+        let filter = |source: &OrthoSource| source.is_regional_package();
+
+        // Package file → found
+        let pkg_file = Path::new("terrain/20000_6000_BI16.ter");
+        let result = index.resolve_lazy_filtered(pkg_file, filter);
+        assert!(result.is_some(), "Should find package-only file");
+
+        // Patch-only file → NOT found
+        let patch_file = Path::new("terrain/10000_5001_GO218.ter");
+        let result = index.resolve_lazy_filtered(patch_file, filter);
+        assert!(
+            result.is_none(),
+            "Packages-only filter should hide patch files"
+        );
     }
 
     #[test]
-    fn test_is_resource_in_patched_region_ter() {
-        let mut index = OrthoUnionIndex::new();
-        let mut regions = std::collections::HashSet::new();
-        let dsf = DsfTileCoord::from_scenery_filename("10000_5000_BI16.ter").unwrap();
-        regions.insert((dsf.lat, dsf.lon));
-        index.set_patched_regions(regions);
+    fn test_resolve_lazy_filtered_non_lazy_directory() {
+        let temp = TempDir::new().unwrap();
+        let index = create_filtered_index(&temp);
 
-        let path = std::path::Path::new("terrain/10000_5000_BI16.ter");
-        assert!(index.is_resource_in_patched_region(path));
+        // Non-lazy directory (Earth nav data) → should return None
+        let dsf_path = Path::new("Earth nav data/+30-120/+33-119.dsf");
+        let result = index.resolve_lazy_filtered(dsf_path, |_| true);
+        // This may be Some if indexed, or None if not — the key point is
+        // that the filter is only relevant for lazy dirs. For non-lazy paths,
+        // resolve_lazy_filtered falls back to the indexed resolve() which
+        // does not filter by source. This is intentional — non-lazy files
+        // are already resolved by priority during index building.
+        // We just verify it doesn't panic.
+        let _ = result;
     }
 
     #[test]
-    fn test_is_resource_in_patched_region_non_patched() {
-        let mut index = OrthoUnionIndex::new();
-        let mut regions = std::collections::HashSet::new();
-        regions.insert((45, 11)); // some unrelated region
-        index.set_patched_regions(regions);
+    fn test_resolve_lazy_filtered_nonexistent_file() {
+        let temp = TempDir::new().unwrap();
+        let index = create_filtered_index(&temp);
 
-        // This DDS is NOT in the (45, 11) region
-        let path = std::path::Path::new("textures/10000_5000_BI16.dds");
-        assert!(!index.is_resource_in_patched_region(path));
-    }
-
-    #[test]
-    fn test_is_resource_in_patched_region_no_patches() {
-        let index = OrthoUnionIndex::new();
-        // Fast path: no patches installed, should return false immediately
-        let path = std::path::Path::new("textures/10000_5000_BI16.dds");
-        assert!(!index.is_resource_in_patched_region(path));
-    }
-
-    #[test]
-    fn test_is_resource_in_patched_region_non_scenery_file() {
-        let mut index = OrthoUnionIndex::new();
-        let mut regions = std::collections::HashSet::new();
-        regions.insert((45, 11));
-        index.set_patched_regions(regions);
-
-        // Non-scenery files (like DSF files) should return false
-        let path = std::path::Path::new("Earth nav data/+45+011.dsf");
-        assert!(!index.is_resource_in_patched_region(path));
+        let missing = Path::new("terrain/99999_99999_BI16.ter");
+        let result = index.resolve_lazy_filtered(missing, |_| true);
+        assert!(result.is_none(), "Nonexistent file should return None");
     }
 }

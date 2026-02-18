@@ -17,6 +17,7 @@ use crate::config::DiskIoProfile;
 use crate::executor::{MemoryCacheAdapter, StorageConcurrencyLimiter};
 use crate::fuse::fuse3::Fuse3OrthoUnionFS;
 use crate::fuse::SpawnedMountHandle;
+use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage};
 use crate::metrics::TelemetrySnapshot;
 use crate::ortho_union::{
     default_cache_path, IndexBuildProgressCallback, OrthoUnionIndex, OrthoUnionIndexBuilder,
@@ -25,7 +26,7 @@ use crate::package::{
     InstalledPackage as PackageInstalledPackage, Package as PackageCore, PackageType,
 };
 use crate::panic as panic_handler;
-use crate::patches::PatchDiscovery;
+use crate::patches::{extract_dsf_regions, PatchDiscovery};
 use crate::prefetch::tile_based::DdsAccessEvent;
 use crate::prefetch::{FuseLoadMonitor, TileRequestCallback};
 use crate::scene_tracker::{DefaultSceneTracker, FuseAccessEvent};
@@ -164,6 +165,9 @@ pub struct MountManager {
     /// OrthoUnionIndex for DSF tile enumeration (tile-based prefetch).
     /// This is populated when mounting consolidated ortho.
     ortho_union_index: Option<Arc<OrthoUnionIndex>>,
+    /// Geospatial reference index for region-level ownership queries.
+    /// Populated with PatchCoverage data when mounting consolidated ortho.
+    geo_index: Option<Arc<GeoIndex>>,
 }
 
 impl MountManager {
@@ -184,6 +188,7 @@ impl MountManager {
             dds_access_rx: None,
             scene_tracker_rx: None,
             ortho_union_index: None,
+            geo_index: None,
         }
     }
 
@@ -207,6 +212,7 @@ impl MountManager {
             dds_access_rx: None,
             scene_tracker_rx: None,
             ortho_union_index: None,
+            geo_index: None,
         }
     }
 
@@ -374,6 +380,29 @@ impl MountManager {
         let source_count = index.source_count();
         let file_count = index.file_count();
 
+        // Build GeoIndex by extracting DSF regions from patch sources
+        let geo_index = Arc::new(GeoIndex::new());
+        let mut patched_entries = Vec::new();
+        for source in index.sources() {
+            if source.is_patch() {
+                for (lat, lon) in extract_dsf_regions(&source.source_path) {
+                    patched_entries.push((
+                        DsfRegion::new(lat, lon),
+                        PatchCoverage {
+                            patch_name: source.display_name.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+        if !patched_entries.is_empty() {
+            geo_index.populate(patched_entries);
+            tracing::info!(
+                regions = geo_index.count::<PatchCoverage>(),
+                "GeoIndex populated with patch coverage"
+            );
+        }
+
         tracing::info!(
             sources = source_count,
             files = file_count,
@@ -463,6 +492,7 @@ impl MountManager {
         // Wire Scene Tracker channel for empirical scenery tracking
         let mut ortho_union_fs =
             Fuse3OrthoUnionFS::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
+                .with_geo_index(Arc::clone(&geo_index))
                 .with_dds_access_channel(dds_access_tx)
                 .with_scene_tracker_channel(scene_tracker_tx)
                 .with_load_monitor(Arc::clone(&self.scene_tracker) as Arc<dyn FuseLoadMonitor>);
@@ -491,9 +521,10 @@ impl MountManager {
                 self.consolidated_session = Some(session);
                 self.consolidated_mount = Some(mount_info);
 
-                // Store DDS access channel receiver and index for tile-based prefetcher
+                // Store DDS access channel receiver, indexes for tile-based prefetcher
                 self.dds_access_rx = Some(dds_access_rx);
                 self.ortho_union_index = Some(index_for_prefetch);
+                self.geo_index = Some(geo_index);
 
                 // Store Scene Tracker receiver for empirical scenery tracking
                 self.scene_tracker_rx = Some(scene_tracker_rx);
@@ -571,6 +602,14 @@ impl MountManager {
         self.ortho_union_index.clone()
     }
 
+    /// Get the GeoIndex for geospatial ownership queries.
+    ///
+    /// The index is created when mounting consolidated ortho and populated
+    /// with PatchCoverage data from patch sources.
+    pub fn geo_index(&self) -> Option<Arc<GeoIndex>> {
+        self.geo_index.clone()
+    }
+
     /// Unmount a specific region.
     ///
     /// # Arguments
@@ -640,6 +679,7 @@ impl MountManager {
         // Clear tile-based prefetch resources
         self.dds_access_rx = None;
         self.ortho_union_index = None;
+        self.geo_index = None;
 
         // Clear Scene Tracker resources
         self.scene_tracker_rx = None;

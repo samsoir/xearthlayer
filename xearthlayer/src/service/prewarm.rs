@@ -34,6 +34,7 @@ use std::sync::Arc;
 use crate::aircraft_position::SharedAircraftPosition;
 use crate::airport::AirportIndex;
 use crate::executor::{DdsClient, MemoryCache};
+use crate::geo_index::GeoIndex;
 use crate::prefetch::{
     generate_dsf_grid, start_prewarm, DsfGridBounds, FileTerrainScanner, PrewarmHandle,
     TerrainScanner,
@@ -196,6 +197,9 @@ impl PrewarmOrchestrator {
         let tile_count = tiles.len();
         let airport_name = airport.name.clone();
 
+        // Get GeoIndex for patch-region filtering
+        let geo_index = orchestrator.geo_index();
+
         // Start prewarm with appropriate cache type
         let handle = if let Some(memory_cache) = service.memory_cache_adapter() {
             Self::start_prewarm_with_cache(
@@ -204,6 +208,7 @@ impl PrewarmOrchestrator {
                 dds_client,
                 memory_cache,
                 Arc::clone(&ortho_index),
+                geo_index.clone(),
                 runtime_handle,
             )
         } else if let Some(memory_cache) = service.memory_cache_bridge() {
@@ -213,6 +218,7 @@ impl PrewarmOrchestrator {
                 dds_client,
                 memory_cache,
                 Arc::clone(&ortho_index),
+                geo_index,
                 runtime_handle,
             )
         } else {
@@ -235,6 +241,7 @@ impl PrewarmOrchestrator {
         dds_client: Arc<dyn DdsClient>,
         memory_cache: Arc<M>,
         ortho_index: Arc<crate::ortho_union::OrthoUnionIndex>,
+        geo_index: Option<Arc<GeoIndex>>,
         runtime_handle: &Handle,
     ) -> PrewarmHandle {
         start_prewarm(
@@ -243,6 +250,7 @@ impl PrewarmOrchestrator {
             dds_client,
             memory_cache,
             ortho_index,
+            geo_index,
             runtime_handle,
         )
     }

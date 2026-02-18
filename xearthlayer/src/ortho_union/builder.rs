@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::package::{InstalledPackage, PackageType};
-use crate::patches::{extract_dsf_regions, PatchDiscovery};
+use crate::patches::PatchDiscovery;
 
 use super::cache::{save_index_cache, try_load_cached_index, IndexCacheKey};
 use super::index::OrthoUnionIndex;
@@ -241,27 +241,7 @@ impl OrthoUnionIndexBuilder {
         let partial_indexes = scan_sources_parallel(&sources, progress.as_ref());
 
         // Phase 4: Merge results
-        let mut index = merge_partial_indexes(partial_indexes, sources, progress.as_ref());
-
-        // Phase 4b: Extract patched regions from patch sources
-        let mut patched_regions = std::collections::HashSet::new();
-        for source in index.sources() {
-            if source.is_patch() {
-                for (lat, lon) in extract_dsf_regions(&source.source_path) {
-                    patched_regions.insert((lat, lon));
-                }
-            }
-        }
-        if !patched_regions.is_empty() {
-            tracing::info!(
-                patched_regions = patched_regions.len(),
-                "Patch coverage loaded"
-            );
-            for &(lat, lon) in &patched_regions {
-                tracing::debug!(lat, lon, region = %format!("{:+03}{:+04}", lat, lon), "Patched region");
-            }
-        }
-        index.set_patched_regions(patched_regions);
+        let index = merge_partial_indexes(partial_indexes, sources, progress.as_ref());
 
         tracing::info!(
             files = index.file_count(),
@@ -533,58 +513,5 @@ mod tests {
         // Check that files were indexed
         assert!(index.file_count() > 0);
         assert!(index.contains(Path::new("Earth nav data/+40-080/+40-074.dsf")));
-    }
-
-    // ========================================================================
-    // Patched region population tests (Issue #51)
-    // ========================================================================
-
-    #[test]
-    fn test_builder_populates_patched_regions_from_patches() {
-        let temp = TempDir::new().unwrap();
-        // create_test_patch creates a patch with +33-119.dsf
-        create_test_patch(&temp, "LIPX_Mesh");
-
-        let index = OrthoUnionIndexBuilder::new()
-            .with_patches_dir(temp.path())
-            .build()
-            .unwrap();
-
-        assert!(
-            index.is_patched_region(33, -119),
-            "Patch DSF region should be marked as patched"
-        );
-        assert_eq!(index.patched_region_count(), 1);
-    }
-
-    #[test]
-    fn test_builder_no_patched_regions_for_packages_only() {
-        let temp = TempDir::new().unwrap();
-        let na = create_test_package(&temp, "na");
-
-        let index = OrthoUnionIndexBuilder::new()
-            .add_package(na)
-            .build()
-            .unwrap();
-
-        // Packages don't contribute patched regions
-        assert_eq!(index.patched_region_count(), 0);
-    }
-
-    #[test]
-    fn test_builder_patched_regions_from_multiple_patches() {
-        let temp = TempDir::new().unwrap();
-        // Create two patches with different DSF files
-        create_test_patch(&temp, "A_KDEN");
-        create_test_patch(&temp, "B_KLAX");
-
-        let index = OrthoUnionIndexBuilder::new()
-            .with_patches_dir(temp.path())
-            .build()
-            .unwrap();
-
-        // Both patches have +33-119.dsf, so only 1 unique region
-        assert_eq!(index.patched_region_count(), 1);
-        assert!(index.is_patched_region(33, -119));
     }
 }

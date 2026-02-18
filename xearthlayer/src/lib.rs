@@ -27,6 +27,7 @@ pub mod dds;
 pub mod diagnostics;
 pub mod executor;
 pub mod fuse;
+pub mod geo_index;
 pub mod jobs;
 pub mod log;
 pub mod logging;
