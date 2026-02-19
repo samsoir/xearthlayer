@@ -420,6 +420,14 @@ where
         self.submitter.clone()
     }
 
+    /// Returns a shared reference to the executor's resource pools.
+    ///
+    /// Used by the circuit breaker to monitor pool utilization and trip
+    /// when any pool is near saturation.
+    pub fn resource_pools(&self) -> Arc<super::resource_pool::ResourcePools> {
+        Arc::clone(&self.executor.resource_pools)
+    }
+
     /// Runs the daemon until shutdown is signalled.
     ///
     /// This is the main event loop that:

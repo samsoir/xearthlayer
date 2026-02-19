@@ -53,7 +53,9 @@ mod throttler;
 pub mod tile_based;
 pub mod types;
 
-pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
+pub use circuit_breaker::{
+    CircuitBreaker, CircuitBreakerConfig, CircuitState, RESOURCE_SATURATION_THRESHOLD,
+};
 pub use condition::{
     AlwaysActiveCondition, MinimumSpeedCondition, NeverActiveCondition, PrefetchCondition,
 };

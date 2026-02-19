@@ -31,6 +31,28 @@ use super::status::CoordinatorStatus;
 use super::telemetry::extract_track;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Backpressure constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Channel pressure threshold above which prefetch cycles are deferred entirely.
+///
+/// When the executor channel is over 80% full, the prefetch coordinator skips
+/// the current cycle to avoid starving on-demand FUSE requests.
+pub const BACKPRESSURE_DEFER_THRESHOLD: f64 = 0.8;
+
+/// Channel pressure threshold above which prefetch submission is reduced.
+///
+/// When the executor channel is over 50% full, the coordinator submits only
+/// half the planned tiles to give on-demand requests more headroom.
+pub const BACKPRESSURE_REDUCE_THRESHOLD: f64 = 0.5;
+
+/// Fraction of the prefetch plan to submit under moderate backpressure.
+///
+/// When channel pressure is between [`BACKPRESSURE_REDUCE_THRESHOLD`] and
+/// [`BACKPRESSURE_DEFER_THRESHOLD`], only this fraction of tiles is submitted.
+pub const BACKPRESSURE_REDUCED_FRACTION: f64 = 0.5;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Coordinator
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -107,6 +129,7 @@ pub struct AdaptivePrefetchCoordinator {
     pub(super) total_cycles: u64,
     pub(super) total_tiles_submitted: u64,
     pub(super) total_cache_hits: u64,
+    pub(super) total_deferred_cycles: u64,
 
     /// Ortho union index for checking if tiles already exist on disk.
     /// When set, prefetch will skip tiles that are already installed
@@ -155,6 +178,7 @@ impl AdaptivePrefetchCoordinator {
             total_cycles: 0,
             total_tiles_submitted: 0,
             total_cache_hits: 0,
+            total_deferred_cycles: 0,
             ortho_union_index: None,
             geo_index: None,
         }
@@ -358,6 +382,11 @@ impl AdaptivePrefetchCoordinator {
 
     /// Execute a prefetch plan by submitting tiles to the DDS client.
     ///
+    /// Applies backpressure-aware submission:
+    /// - Pressure > [`BACKPRESSURE_DEFER_THRESHOLD`]: skips this cycle (deferred)
+    /// - Pressure > [`BACKPRESSURE_REDUCE_THRESHOLD`]: submits reduced fraction
+    /// - Stops immediately on `ChannelFull` error
+    ///
     /// # Arguments
     ///
     /// * `plan` - The prefetch plan to execute
@@ -365,17 +394,59 @@ impl AdaptivePrefetchCoordinator {
     ///
     /// # Returns
     ///
-    /// Number of tiles submitted.
-    pub fn execute(&self, plan: &PrefetchPlan, cancellation: CancellationToken) -> usize {
+    /// Number of tiles submitted. Returns 0 if deferred due to backpressure.
+    pub fn execute(&mut self, plan: &PrefetchPlan, cancellation: CancellationToken) -> usize {
         let Some(ref client) = self.dds_client else {
             tracing::warn!("No DDS client configured - cannot execute prefetch");
             return 0;
         };
 
+        // Check channel pressure before submitting
+        let pressure = client.channel_pressure();
+        if pressure > BACKPRESSURE_DEFER_THRESHOLD {
+            self.total_deferred_cycles += 1;
+            tracing::info!(
+                pressure = format!("{:.1}%", pressure * 100.0),
+                tiles_planned = plan.tiles.len(),
+                "Executor backpressure — deferring prefetch cycle"
+            );
+            return 0;
+        }
+
+        // Determine how many tiles to submit based on pressure
+        let max_tiles = if pressure > BACKPRESSURE_REDUCE_THRESHOLD {
+            let reduced =
+                ((plan.tiles.len() as f64) * BACKPRESSURE_REDUCED_FRACTION).ceil() as usize;
+            tracing::debug!(
+                pressure = format!("{:.1}%", pressure * 100.0),
+                full_plan = plan.tiles.len(),
+                reduced_to = reduced,
+                "Moderate backpressure — reducing prefetch submission"
+            );
+            reduced
+        } else {
+            plan.tiles.len()
+        };
+
         let mut submitted = 0;
-        for tile in &plan.tiles {
-            client.prefetch_with_cancellation(*tile, cancellation.clone());
-            submitted += 1;
+        for tile in plan.tiles.iter().take(max_tiles) {
+            let request =
+                crate::runtime::JobRequest::prefetch_with_cancellation(*tile, cancellation.clone());
+            match client.submit(request) {
+                Ok(()) => submitted += 1,
+                Err(crate::executor::DdsClientError::ChannelFull) => {
+                    tracing::debug!(
+                        submitted,
+                        dropped = max_tiles - submitted,
+                        "Channel full — stopping prefetch submission"
+                    );
+                    break;
+                }
+                Err(crate::executor::DdsClientError::ChannelClosed) => {
+                    tracing::warn!("Executor channel closed — stopping prefetch");
+                    break;
+                }
+            }
         }
 
         if submitted > 0 {
@@ -680,6 +751,7 @@ impl AdaptivePrefetchCoordinator {
             is_active: submitted > 0,
             circuit_state,
             loading_tiles,
+            deferred_cycles: self.total_deferred_cycles,
         };
         status.update_detailed_stats(detailed);
     }
@@ -739,6 +811,7 @@ impl AdaptivePrefetchCoordinator {
             is_active: false,
             circuit_state,
             loading_tiles: vec![],
+            deferred_cycles: self.total_deferred_cycles,
         };
         status.update_detailed_stats(detailed);
     }
@@ -1251,5 +1324,151 @@ mod tests {
         // Status should show CircuitOpen (throttled)
         let snapshot = shared_status.snapshot();
         assert_eq!(snapshot.prefetch_mode, StatePrefetchMode::CircuitOpen);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Backpressure tests (Phase 5)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Mock DDS client with configurable channel pressure and submission tracking.
+    struct BackpressureMockClient {
+        pressure: f64,
+        submitted: std::sync::atomic::AtomicUsize,
+        /// If Some, return ChannelFull after this many successful submits.
+        fail_after: Option<usize>,
+    }
+
+    impl BackpressureMockClient {
+        fn new(pressure: f64) -> Self {
+            Self {
+                pressure,
+                submitted: std::sync::atomic::AtomicUsize::new(0),
+                fail_after: None,
+            }
+        }
+
+        fn with_fail_after(mut self, n: usize) -> Self {
+            self.fail_after = Some(n);
+            self
+        }
+
+        fn submitted_count(&self) -> usize {
+            self.submitted.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl crate::executor::DdsClient for BackpressureMockClient {
+        fn submit(
+            &self,
+            _request: crate::runtime::JobRequest,
+        ) -> Result<(), crate::executor::DdsClientError> {
+            let count = self.submitted.load(std::sync::atomic::Ordering::Relaxed);
+            if let Some(limit) = self.fail_after {
+                if count >= limit {
+                    return Err(crate::executor::DdsClientError::ChannelFull);
+                }
+            }
+            self.submitted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn request_dds(
+            &self,
+            _tile: TileCoord,
+            _cancellation: CancellationToken,
+        ) -> tokio::sync::oneshot::Receiver<crate::runtime::DdsResponse> {
+            let (_, rx) = tokio::sync::oneshot::channel();
+            rx
+        }
+
+        fn request_dds_with_options(
+            &self,
+            _tile: TileCoord,
+            _priority: crate::executor::Priority,
+            _origin: crate::runtime::RequestOrigin,
+            _cancellation: CancellationToken,
+        ) -> tokio::sync::oneshot::Receiver<crate::runtime::DdsResponse> {
+            let (_, rx) = tokio::sync::oneshot::channel();
+            rx
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn channel_pressure(&self) -> f64 {
+            self.pressure
+        }
+    }
+
+    fn test_plan(tile_count: usize) -> PrefetchPlan {
+        let tiles: Vec<TileCoord> = (0..tile_count)
+            .map(|i| TileCoord {
+                row: 100 + i as u32,
+                col: 200,
+                zoom: 14,
+            })
+            .collect();
+        let cal = test_calibration();
+        PrefetchPlan::with_tiles(tiles, &cal, "test", 0, tile_count)
+    }
+
+    #[test]
+    fn test_prefetch_defers_under_high_backpressure() {
+        let client = Arc::new(BackpressureMockClient::new(0.85));
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_dds_client(client.clone() as Arc<dyn crate::executor::DdsClient>);
+
+        let plan = test_plan(10);
+        let submitted = coord.execute(&plan, CancellationToken::new());
+
+        assert_eq!(submitted, 0, "Should defer all tiles under high pressure");
+        assert_eq!(coord.total_deferred_cycles, 1);
+        assert_eq!(client.submitted_count(), 0);
+    }
+
+    #[test]
+    fn test_prefetch_reduces_under_moderate_backpressure() {
+        let client = Arc::new(BackpressureMockClient::new(0.6));
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_dds_client(client.clone() as Arc<dyn crate::executor::DdsClient>);
+
+        let plan = test_plan(10);
+        let submitted = coord.execute(&plan, CancellationToken::new());
+
+        // 50% of 10 = 5
+        assert_eq!(
+            submitted, 5,
+            "Should submit ~50% of tiles under moderate pressure"
+        );
+        assert_eq!(coord.total_deferred_cycles, 0);
+        assert_eq!(client.submitted_count(), 5);
+    }
+
+    #[test]
+    fn test_prefetch_full_submission_under_low_pressure() {
+        let client = Arc::new(BackpressureMockClient::new(0.2));
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_dds_client(client.clone() as Arc<dyn crate::executor::DdsClient>);
+
+        let plan = test_plan(10);
+        let submitted = coord.execute(&plan, CancellationToken::new());
+
+        assert_eq!(submitted, 10, "Should submit all tiles under low pressure");
+        assert_eq!(client.submitted_count(), 10);
+    }
+
+    #[test]
+    fn test_prefetch_stops_on_channel_full() {
+        let client = Arc::new(BackpressureMockClient::new(0.0).with_fail_after(3));
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_dds_client(client.clone() as Arc<dyn crate::executor::DdsClient>);
+
+        let plan = test_plan(10);
+        let submitted = coord.execute(&plan, CancellationToken::new());
+
+        assert_eq!(submitted, 3, "Should stop at first ChannelFull error");
+        assert_eq!(client.submitted_count(), 3);
     }
 }

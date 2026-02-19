@@ -12,7 +12,7 @@ use super::core::JobExecutor;
 use super::handle::JobStatus;
 use super::job::JobId;
 use super::queue::QueuedTask;
-use super::submitter::SubmittedJob;
+use super::submitter::{SubmittedJob, WaitingJob};
 use super::task::TaskResult;
 use super::telemetry::TelemetryEvent;
 use std::time::Duration;
@@ -49,13 +49,20 @@ impl JobExecutor {
                     Some(permit)
                 }
                 None => {
+                    let seq = self.waiting_sequence;
+                    self.waiting_sequence += 1;
                     debug!(
                         job_id = %job_id,
                         group = %group,
+                        priority = ?priority,
+                        sequence = seq,
                         waiting_count = self.waiting_for_permit.len(),
                         "No concurrency permit available, queueing job"
                     );
-                    self.waiting_for_permit.push_back(submitted);
+                    self.waiting_for_permit.push(WaitingJob {
+                        submitted,
+                        sequence: seq,
+                    });
                     return;
                 }
             }
@@ -333,36 +340,46 @@ impl JobExecutor {
     }
 
     /// Starts jobs that were waiting for concurrency permits.
+    ///
+    /// Iterates the priority-ordered heap (highest priority first) and tries
+    /// each job's concurrency group. Jobs whose group is full are set aside
+    /// and re-added after the pass. This ensures:
+    /// 1. ON_DEMAND jobs are tried before PREFETCH (priority ordering)
+    /// 2. A full group doesn't block jobs in OTHER groups (skip-and-continue)
     pub(crate) async fn start_waiting_jobs(&mut self) {
-        loop {
-            let group_name: Option<String> = self
-                .waiting_for_permit
-                .front()
-                .and_then(|job| job.job.concurrency_group().map(String::from));
+        let mut blocked = Vec::new();
+
+        while let Some(waiting) = self.waiting_for_permit.pop() {
+            let group_name = waiting.submitted.job.concurrency_group().map(String::from);
 
             let Some(group) = group_name else {
-                if self.waiting_for_permit.front().is_some() {
-                    let job = self.waiting_for_permit.pop_front().unwrap();
-                    self.start_job_with_permit(job, None).await;
-                    continue;
-                }
-                break;
+                // No concurrency group — start immediately
+                self.start_job_with_permit(waiting.submitted, None).await;
+                continue;
             };
 
             match self.config.job_concurrency_limits.try_acquire(&group) {
                 Some(permit) => {
-                    let job = self.waiting_for_permit.pop_front().unwrap();
-                    let job_id = job.job_id.clone();
+                    let job_id = waiting.submitted.job_id.clone();
                     debug!(
                         job_id = %job_id,
                         group = %group,
-                        remaining_waiting = self.waiting_for_permit.len(),
+                        remaining_waiting = self.waiting_for_permit.len() + blocked.len(),
                         "Starting waiting job (acquired permit)"
                     );
-                    self.start_job_with_permit(job, Some(permit)).await;
+                    self.start_job_with_permit(waiting.submitted, Some(permit))
+                        .await;
                 }
-                None => break,
+                None => {
+                    // Group is full — set aside and try the next job
+                    blocked.push(waiting);
+                }
             }
+        }
+
+        // Re-add blocked jobs back to the heap
+        for waiting in blocked {
+            self.waiting_for_permit.push(waiting);
         }
     }
 

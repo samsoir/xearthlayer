@@ -37,8 +37,12 @@ use crate::coord::TileCoord;
 use crate::executor::Priority;
 use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
 use std::fmt;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+
+/// Timeout for background send when the channel is full for ON_DEMAND requests.
+const ON_DEMAND_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 
 // =============================================================================
 // Error Types
@@ -195,6 +199,19 @@ pub trait DdsClient: Send + Sync + 'static {
     /// Returns `false` if the executor has been shut down.
     fn is_connected(&self) -> bool;
 
+    /// Returns the current channel pressure as a value between 0.0 and 1.0.
+    ///
+    /// - 0.0: Channel is empty (no backpressure)
+    /// - 1.0: Channel is full (maximum backpressure)
+    ///
+    /// Producers can use this to throttle submission rate. For example,
+    /// the prefetch coordinator defers cycles when pressure exceeds 0.8.
+    ///
+    /// Default implementation returns 0.0 (no pressure) for mock clients.
+    fn channel_pressure(&self) -> f64 {
+        0.0
+    }
+
     /// Returns a clone of the underlying sender for async operations.
     ///
     /// This allows callers to use `send().await` for backpressure-aware
@@ -281,17 +298,50 @@ impl DdsClient for ChannelDdsClient {
             origin,
         };
 
-        // Best effort send - if channel is full, response will never arrive
-        // The receiver will get an error when the sender is dropped
+        // Try non-blocking send first (fast path)
         if let Err(e) = self.tx.try_send(request) {
-            // Channel full or closed - need to send something on the response channel
-            // The tx was moved into the request, so we need to extract and respond
             let req = match e {
                 mpsc::error::TrySendError::Full(req) => req,
-                mpsc::error::TrySendError::Closed(req) => req,
+                mpsc::error::TrySendError::Closed(req) => {
+                    // Channel closed — immediate empty response
+                    if let Some(response_tx) = req.response_tx {
+                        let _ = response_tx.send(DdsResponse::empty(Duration::ZERO));
+                    }
+                    return rx;
+                }
             };
-            if let Some(response_tx) = req.response_tx {
-                let _ = response_tx.send(DdsResponse::empty(std::time::Duration::ZERO));
+
+            if priority >= Priority::ON_DEMAND {
+                // ON_DEMAND: spawn background task to wait for channel capacity.
+                // The FUSE caller is already waiting on the oneshot rx, so this
+                // is transparent. The 500ms timeout prevents indefinite blocking.
+                let sender = self.tx.clone();
+                let tile_debug = format!("{:?}", req.tile);
+                tokio::spawn(async move {
+                    match tokio::time::timeout(ON_DEMAND_SEND_TIMEOUT, sender.send(req)).await {
+                        Ok(Ok(())) => {} // Successfully queued
+                        Ok(Err(send_err)) => {
+                            // Channel closed during wait
+                            if let Some(response_tx) = send_err.0.response_tx {
+                                let _ = response_tx.send(DdsResponse::empty(Duration::ZERO));
+                            }
+                        }
+                        Err(_timeout) => {
+                            // Timed out — req was consumed by send() and dropped with
+                            // the future. The response_tx drop causes RecvError on the
+                            // oneshot receiver; FUSE handles this as a timeout.
+                            tracing::warn!(
+                                tile = %tile_debug,
+                                "ON_DEMAND request timed out waiting for executor channel"
+                            );
+                        }
+                    }
+                });
+            } else {
+                // PREFETCH / HOUSEKEEPING: fire-and-forget, immediate empty response
+                if let Some(response_tx) = req.response_tx {
+                    let _ = response_tx.send(DdsResponse::empty(Duration::ZERO));
+                }
             }
         }
 
@@ -300,6 +350,15 @@ impl DdsClient for ChannelDdsClient {
 
     fn is_connected(&self) -> bool {
         !self.tx.is_closed()
+    }
+
+    fn channel_pressure(&self) -> f64 {
+        let max = self.tx.max_capacity();
+        if max == 0 {
+            return 1.0;
+        }
+        let available = self.tx.capacity();
+        1.0 - (available as f64 / max as f64)
     }
 
     fn sender(&self) -> Option<mpsc::Sender<JobRequest>> {
@@ -426,19 +485,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_channel_client_request_dds_channel_full() {
+    async fn test_channel_client_request_dds_channel_full_on_demand_waits() {
         let (tx, _rx) = mpsc::channel(1);
         let client = ChannelDdsClient::new(tx);
 
         // Fill the channel with a prefetch request
         client.prefetch(test_tile());
 
-        // Request with response should get empty response
+        // ON_DEMAND request on full channel spawns background task that waits
+        // up to 500ms. Since we never drain the channel, the background task
+        // times out and drops the request (including response_tx). The oneshot
+        // receiver then gets RecvError.
         let response_rx = client.request_dds(test_tile(), CancellationToken::new());
 
-        // Should receive an empty response (not hang)
-        let response = response_rx.await.unwrap();
-        assert!(!response.has_data());
+        // Wait for the background send to time out (500ms + margin)
+        let result = tokio::time::timeout(Duration::from_secs(2), response_rx).await;
+        match result {
+            Ok(Err(_recv_error)) => {} // Expected: response_tx dropped on timeout
+            Ok(Ok(response)) => {
+                // Also acceptable if somehow an empty response arrives
+                assert!(!response.has_data());
+            }
+            Err(_timeout) => panic!("Test timed out waiting for background send to complete"),
+        }
     }
 
     #[tokio::test]
@@ -490,5 +559,136 @@ mod tests {
         let debug = format!("{:?}", client);
         assert!(debug.contains("ChannelDdsClient"));
         assert!(debug.contains("is_connected"));
+    }
+
+    #[tokio::test]
+    async fn test_fuse_request_retries_on_channel_full() {
+        // Channel capacity of 1
+        let (tx, mut rx) = mpsc::channel(1);
+        let client = ChannelDdsClient::new(tx);
+
+        // Fill the channel
+        client.prefetch(test_tile());
+
+        // ON_DEMAND request with full channel — should NOT immediately fail.
+        // Instead it spawns a background task that waits for capacity.
+        let response_rx = client.request_dds(test_tile(), CancellationToken::new());
+
+        // Drain the channel to make room for the background send
+        let _first = rx.recv().await.unwrap();
+
+        // The background send should now succeed
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.priority, Priority::ON_DEMAND);
+        assert!(received.response_tx.is_some());
+
+        // Send a response back
+        let response = DdsResponse::cache_hit(vec![42], Duration::from_millis(5));
+        received.response_tx.unwrap().send(response).unwrap();
+
+        // FUSE caller receives the response
+        let result = response_rx.await.unwrap();
+        assert_eq!(result.data, vec![42]);
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_still_uses_try_send() {
+        // Channel capacity of 1
+        let (tx, _rx) = mpsc::channel(1);
+        let client = ChannelDdsClient::new(tx);
+
+        // Fill the channel
+        client.prefetch(test_tile());
+
+        // Prefetch request should fail silently (fire-and-forget)
+        let result = client.submit(JobRequest::prefetch(test_tile()));
+        assert_eq!(result, Err(DdsClientError::ChannelFull));
+    }
+
+    #[test]
+    fn test_channel_pressure_empty() {
+        let (tx, _rx) = mpsc::channel::<JobRequest>(10);
+        let client = ChannelDdsClient::new(tx);
+
+        let pressure = client.channel_pressure();
+        assert!(
+            (pressure - 0.0).abs() < f64::EPSILON,
+            "Empty channel should have 0.0 pressure, got {}",
+            pressure
+        );
+    }
+
+    #[test]
+    fn test_channel_pressure_full() {
+        let (tx, _rx) = mpsc::channel::<JobRequest>(2);
+        let client = ChannelDdsClient::new(tx);
+
+        // Fill the channel
+        let req1 = JobRequest::prefetch(test_tile());
+        let req2 = JobRequest::prefetch(test_tile());
+        client.submit(req1).unwrap();
+        client.submit(req2).unwrap();
+
+        let pressure = client.channel_pressure();
+        assert!(
+            (pressure - 1.0).abs() < f64::EPSILON,
+            "Full channel should have 1.0 pressure, got {}",
+            pressure
+        );
+    }
+
+    #[test]
+    fn test_channel_pressure_partial() {
+        let (tx, _rx) = mpsc::channel::<JobRequest>(4);
+        let client = ChannelDdsClient::new(tx);
+
+        // Fill half the channel
+        client.submit(JobRequest::prefetch(test_tile())).unwrap();
+        client.submit(JobRequest::prefetch(test_tile())).unwrap();
+
+        let pressure = client.channel_pressure();
+        assert!(
+            (pressure - 0.5).abs() < f64::EPSILON,
+            "Half-full channel should have 0.5 pressure, got {}",
+            pressure
+        );
+    }
+
+    #[test]
+    fn test_channel_pressure_default_trait_impl() {
+        // Mock client using default trait impl should return 0.0
+        struct MockClient;
+        impl DdsClient for MockClient {
+            fn submit(&self, _: JobRequest) -> Result<(), DdsClientError> {
+                Ok(())
+            }
+            fn request_dds(
+                &self,
+                _: TileCoord,
+                _: CancellationToken,
+            ) -> oneshot::Receiver<DdsResponse> {
+                let (_, rx) = oneshot::channel();
+                rx
+            }
+            fn request_dds_with_options(
+                &self,
+                _: TileCoord,
+                _: Priority,
+                _: RequestOrigin,
+                _: CancellationToken,
+            ) -> oneshot::Receiver<DdsResponse> {
+                let (_, rx) = oneshot::channel();
+                rx
+            }
+            fn is_connected(&self) -> bool {
+                true
+            }
+        }
+
+        let client = MockClient;
+        assert!(
+            (client.channel_pressure() - 0.0).abs() < f64::EPSILON,
+            "Default trait impl should return 0.0"
+        );
     }
 }

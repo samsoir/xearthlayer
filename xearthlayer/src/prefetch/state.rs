@@ -86,6 +86,8 @@ pub struct DetailedPrefetchStats {
     /// Tile coordinates currently being prefetched (limited to 10 for display).
     /// Each tuple is (latitude, longitude) of the tile's southwest corner.
     pub loading_tiles: Vec<(i32, i32)>,
+    /// Number of prefetch cycles deferred due to executor backpressure.
+    pub deferred_cycles: u64,
 }
 
 impl std::fmt::Display for PrefetchMode {

@@ -41,6 +41,10 @@ mod time_budget;
 
 // Re-export primary types
 pub use core::AdaptivePrefetchCoordinator;
+#[allow(unused_imports)]
+pub use core::{
+    BACKPRESSURE_DEFER_THRESHOLD, BACKPRESSURE_REDUCED_FRACTION, BACKPRESSURE_REDUCE_THRESHOLD,
+};
 pub use status::CoordinatorStatus;
 
 // Re-export constants (allow unused since they're public API)

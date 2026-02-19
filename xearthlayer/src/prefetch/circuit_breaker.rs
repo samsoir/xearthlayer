@@ -27,8 +27,15 @@
 
 use super::load_monitor::FuseLoadMonitor;
 use super::throttler::{PrefetchThrottler, ThrottleState};
+use crate::executor::ResourcePools;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Resource pool utilization threshold that triggers the circuit breaker.
+///
+/// When any resource pool exceeds this utilization fraction, the circuit breaker
+/// counts it as high load — the same as high FUSE request rate.
+pub const RESOURCE_SATURATION_THRESHOLD: f64 = 0.9;
 
 /// Configuration for the circuit breaker.
 #[derive(Debug, Clone)]
@@ -132,6 +139,8 @@ impl CircuitBreakerInner {
 pub struct CircuitBreaker {
     config: CircuitBreakerConfig,
     load_monitor: Arc<dyn FuseLoadMonitor>,
+    /// Optional resource pools for utilization-based trip condition.
+    resource_pools: Option<Arc<ResourcePools>>,
     inner: Mutex<CircuitBreakerInner>,
 }
 
@@ -150,8 +159,20 @@ impl CircuitBreaker {
         Self {
             config,
             load_monitor,
+            resource_pools: None,
             inner: Mutex::new(CircuitBreakerInner::new()),
         }
+    }
+
+    /// Add resource pool monitoring for utilization-based trip condition.
+    ///
+    /// When set, the circuit breaker also trips if any resource pool exceeds
+    /// [`RESOURCE_SATURATION_THRESHOLD`] utilization — even if the FUSE request
+    /// rate is below threshold. This catches situations where prefetch saturates
+    /// the executor without generating FUSE requests.
+    pub fn with_resource_pools(mut self, pools: Arc<ResourcePools>) -> Self {
+        self.resource_pools = Some(pools);
+        self
     }
 
     /// Update circuit state based on current load and return whether throttling is active.
@@ -179,7 +200,18 @@ impl CircuitBreaker {
         inner.last_fuse_jobs = fuse_jobs_total;
         inner.last_check_time = now;
 
-        let is_high_load = fuse_jobs_per_second > self.config.threshold_jobs_per_sec;
+        let fuse_high = fuse_jobs_per_second > self.config.threshold_jobs_per_sec;
+
+        // Check resource pool saturation (secondary trigger)
+        let (resource_saturated, max_utilization) = match &self.resource_pools {
+            Some(pools) => {
+                let util = pools.max_utilization();
+                (util > RESOURCE_SATURATION_THRESHOLD, util)
+            }
+            None => (false, 0.0),
+        };
+
+        let is_high_load = fuse_high || resource_saturated;
 
         // Log rate calculation at debug level (high volume - every update)
         tracing::debug!(
@@ -188,6 +220,7 @@ impl CircuitBreaker {
             elapsed_ms = elapsed.as_millis(),
             rate = format!("{:.1}", fuse_jobs_per_second),
             threshold = self.config.threshold_jobs_per_sec,
+            resource_utilization = format!("{:.1}%", max_utilization * 100.0),
             is_high_load = is_high_load,
             state = ?inner.state,
             "Circuit breaker rate check"
@@ -553,6 +586,117 @@ mod tests {
         let throttler: Arc<dyn PrefetchThrottler> = Arc::new(cb);
         assert!(!throttler.should_throttle());
         assert_eq!(throttler.state(), ThrottleState::Active);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Resource saturation tests (Phase 6)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_circuit_breaker_trips_on_resource_saturation() {
+        use crate::executor::{ResourcePoolConfig, ResourcePools, ResourceType};
+
+        // Create resource pools with small capacity so we can saturate them
+        let pool_config = ResourcePoolConfig {
+            network: 4,
+            disk_io: 4,
+            cpu: 4,
+            ..Default::default()
+        };
+        let pools = Arc::new(ResourcePools::new(pool_config));
+
+        // Acquire all network permits to push utilization to 100%
+        let mut permits = Vec::new();
+        for _ in 0..4 {
+            if let Some(p) = pools.try_acquire(ResourceType::Network) {
+                permits.push(p);
+            }
+        }
+        assert!(
+            pools.max_utilization() > RESOURCE_SATURATION_THRESHOLD,
+            "Pools should be saturated"
+        );
+
+        // Create circuit breaker with resource pools and impossibly high FUSE
+        // threshold so ONLY the resource saturation path can trip it
+        let load_monitor = Arc::new(SharedFuseLoadMonitor::new());
+        let cb = CircuitBreaker::new(
+            CircuitBreakerConfig {
+                threshold_jobs_per_sec: 5000.0, // Impossibly high FUSE threshold
+                open_duration: Duration::from_millis(30),
+                half_open_duration: Duration::from_millis(50),
+            },
+            Arc::clone(&load_monitor) as Arc<dyn FuseLoadMonitor>,
+        )
+        .with_resource_pools(Arc::clone(&pools));
+
+        // First check establishes baseline
+        cb.should_throttle();
+
+        // Sustained resource saturation should trip the circuit
+        thread::sleep(Duration::from_millis(40));
+        let is_throttling = cb.should_throttle();
+        assert!(
+            is_throttling,
+            "Should throttle when resource pools are saturated"
+        );
+        assert_eq!(cb.circuit_state(), CircuitState::Open);
+
+        // Drop permits — pools drain
+        drop(permits);
+
+        // Load drops, should transition to half-open
+        thread::sleep(Duration::from_millis(50));
+        cb.should_throttle();
+        assert_eq!(
+            cb.circuit_state(),
+            CircuitState::HalfOpen,
+            "Should transition to half-open when pools drain"
+        );
+
+        // Wait for half-open to close
+        thread::sleep(Duration::from_millis(60));
+        cb.should_throttle();
+        assert_eq!(
+            cb.circuit_state(),
+            CircuitState::Closed,
+            "Should close after half-open duration"
+        );
+
+        // Suppress unused variable warning
+        drop(cb);
+    }
+
+    #[test]
+    fn test_circuit_breaker_still_trips_on_fuse_rate() {
+        // Verify the existing FUSE rate behavior is unchanged
+        let config = CircuitBreakerConfig {
+            threshold_jobs_per_sec: 5.0,
+            open_duration: Duration::from_millis(30),
+            half_open_duration: Duration::from_millis(50),
+        };
+        let load_monitor = Arc::new(SharedFuseLoadMonitor::new());
+        let cb = CircuitBreaker::new(
+            config,
+            Arc::clone(&load_monitor) as Arc<dyn FuseLoadMonitor>,
+        );
+        // No resource pools set — only FUSE rate matters
+
+        cb.should_throttle();
+
+        thread::sleep(Duration::from_millis(20));
+        simulate_high_load(&load_monitor, 10);
+        cb.should_throttle();
+
+        thread::sleep(Duration::from_millis(40));
+        simulate_high_load(&load_monitor, 10);
+        cb.should_throttle();
+
+        assert_eq!(
+            cb.circuit_state(),
+            CircuitState::Open,
+            "Should still trip on FUSE rate without resource pools"
+        );
     }
 
     #[test]

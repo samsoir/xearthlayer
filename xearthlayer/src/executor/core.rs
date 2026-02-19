@@ -11,11 +11,11 @@ use super::config::ExecutorConfig;
 use super::job::JobId;
 use super::queue::PriorityQueue;
 use super::resource_pool::ResourcePools;
-use super::submitter::{JobSubmitter, SubmittedJob};
+use super::submitter::{JobSubmitter, SubmittedJob, WaitingJob};
 use super::telemetry::{NullTelemetrySink, TelemetrySink};
 use super::watchdog::{StallWatchdog, STALL_DETECTION_THRESHOLD_MS, STALL_WATCHDOG_INTERVAL_SECS};
 use crate::metrics::MetricsClient;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -83,7 +83,13 @@ pub struct JobExecutor {
     pub(crate) loop_count: u64,
 
     /// Jobs waiting for concurrency group permits.
-    pub(crate) waiting_for_permit: VecDeque<SubmittedJob>,
+    ///
+    /// Uses a priority-ordered heap so ON_DEMAND jobs are tried before PREFETCH,
+    /// preventing priority inversion at the job level.
+    pub(crate) waiting_for_permit: BinaryHeap<WaitingJob>,
+
+    /// Monotonic sequence counter for FIFO ordering within same priority.
+    pub(crate) waiting_sequence: u64,
 }
 
 impl JobExecutor {
@@ -129,7 +135,8 @@ impl JobExecutor {
             last_activity_ms: Arc::new(AtomicU64::new(now_ms)),
             pending_work_count: Arc::new(AtomicU64::new(0)),
             loop_count: 0,
-            waiting_for_permit: VecDeque::new(),
+            waiting_for_permit: BinaryHeap::new(),
+            waiting_sequence: 0,
         };
 
         let submitter = JobSubmitter::new(job_tx);

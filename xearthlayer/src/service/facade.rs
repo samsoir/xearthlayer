@@ -763,6 +763,16 @@ impl XEarthLayerService {
         self.dds_client.clone()
     }
 
+    /// Get the executor's resource pools for utilization monitoring.
+    ///
+    /// Returns `None` if the runtime has not been started yet.
+    /// Used by the circuit breaker to trip on pool saturation.
+    pub fn resource_pools(&self) -> Option<Arc<crate::executor::ResourcePools>> {
+        self.xearthlayer_runtime
+            .as_ref()
+            .map(|r| r.resource_pools())
+    }
+
     /// Set the tile request callback for FUSE-based position inference.
     ///
     /// When set, this callback is invoked for each DDS tile request received

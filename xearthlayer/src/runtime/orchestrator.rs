@@ -45,7 +45,7 @@ use tracing::info;
 
 use crate::executor::{
     ChannelDdsClient, DaemonMemoryCache, DdsClient, ExecutorDaemon, ExecutorDaemonConfig,
-    JobSubmitter, MultiplexTelemetrySink, TelemetrySink, TracingTelemetrySink,
+    JobSubmitter, MultiplexTelemetrySink, ResourcePools, TelemetrySink, TracingTelemetrySink,
 };
 use crate::jobs::DdsJobFactory;
 use crate::metrics::MetricsClient;
@@ -100,6 +100,12 @@ pub struct XEarthLayerRuntime {
 
     /// Tile progress tracker for TUI display.
     tile_progress_tracker: SharedTileProgressTracker,
+
+    /// Executor resource pools for utilization monitoring.
+    ///
+    /// Shared with the circuit breaker so it can trip on pool saturation,
+    /// not just FUSE request rate.
+    resource_pools: Arc<ResourcePools>,
 }
 
 impl XEarthLayerRuntime {
@@ -194,9 +200,10 @@ impl XEarthLayerRuntime {
         // Create the DDS client for producers
         let dds_client = Arc::new(ChannelDdsClient::new(job_tx));
 
-        // Extract the job submitter before spawning the daemon
-        // This allows external components (like the GC scheduler) to submit jobs
+        // Extract the job submitter and resource pools before spawning the daemon
+        // (daemon is moved into the spawned task)
         let job_submitter = daemon.job_submitter();
+        let resource_pools = daemon.resource_pools();
 
         // Create shutdown token for coordinating shutdown
         let shutdown_token = CancellationToken::new();
@@ -217,6 +224,7 @@ impl XEarthLayerRuntime {
             daemon_handle,
             shutdown_token,
             tile_progress_tracker,
+            resource_pools,
         }
     }
 
@@ -250,6 +258,15 @@ impl XEarthLayerRuntime {
     /// A clone of the internal `JobSubmitter` that can submit any `Job` to the executor.
     pub fn job_submitter(&self) -> JobSubmitter {
         self.job_submitter.clone()
+    }
+
+    /// Get a shared reference to the executor's resource pools.
+    ///
+    /// Used by the circuit breaker to monitor pool utilization and trip
+    /// when any pool is near saturation, preventing prefetch from starving
+    /// on-demand requests.
+    pub fn resource_pools(&self) -> Arc<ResourcePools> {
+        Arc::clone(&self.resource_pools)
     }
 
     /// Check if the runtime is still running.

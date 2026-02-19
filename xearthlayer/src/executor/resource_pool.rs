@@ -43,9 +43,17 @@
 //! ```
 
 use crate::config::DiskIoProfile;
+use crate::executor::policy::Priority;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// Default maximum fraction of pool capacity available to prefetch tasks.
+///
+/// ON_DEMAND tasks always have access to the full pool. Prefetch and
+/// housekeeping tasks are capped at this fraction, reserving the remainder
+/// exclusively for on-demand work.
+pub const DEFAULT_MAX_PREFETCH_FRACTION: f64 = 0.75;
 
 // =============================================================================
 // Resource Pool Configuration Constants
@@ -122,25 +130,48 @@ pub struct ResourcePool {
     resource_type: ResourceType,
     semaphore: Arc<Semaphore>,
     capacity: usize,
-    in_flight: AtomicUsize,
+    in_flight: Arc<AtomicUsize>,
+    /// Number of in-flight operations from prefetch/housekeeping tasks.
+    prefetch_in_flight: Arc<AtomicUsize>,
+    /// Maximum number of permits available to prefetch tasks.
+    max_prefetch_capacity: usize,
     peak_in_flight: AtomicUsize,
 }
 
 impl ResourcePool {
     /// Creates a new resource pool with the given capacity.
     pub fn new(resource_type: ResourceType, capacity: usize) -> Self {
+        Self::with_prefetch_fraction(resource_type, capacity, DEFAULT_MAX_PREFETCH_FRACTION)
+    }
+
+    /// Creates a new resource pool with a custom prefetch fraction.
+    pub fn with_prefetch_fraction(
+        resource_type: ResourceType,
+        capacity: usize,
+        prefetch_fraction: f64,
+    ) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
+        assert!(
+            (0.0..=1.0).contains(&prefetch_fraction),
+            "prefetch_fraction must be between 0.0 and 1.0"
+        );
+        let max_prefetch = (capacity as f64 * prefetch_fraction).ceil() as usize;
         Self {
             resource_type,
             semaphore: Arc::new(Semaphore::new(capacity)),
             capacity,
-            in_flight: AtomicUsize::new(0),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            prefetch_in_flight: Arc::new(AtomicUsize::new(0)),
+            max_prefetch_capacity: max_prefetch,
             peak_in_flight: AtomicUsize::new(0),
         }
     }
 
     /// Acquires a permit, waiting if none available.
-    pub async fn acquire(&self) -> ResourcePermit<'_> {
+    ///
+    /// This does NOT enforce prefetch quotas. Use `try_acquire_for_priority()`
+    /// for priority-aware acquisition.
+    pub async fn acquire(&self) -> ResourcePermit {
         let permit = self
             .semaphore
             .clone()
@@ -153,7 +184,8 @@ impl ResourcePool {
 
         ResourcePermit {
             _permit: permit,
-            in_flight: &self.in_flight,
+            in_flight: Arc::clone(&self.in_flight),
+            prefetch_in_flight: None,
             resource_type: self.resource_type,
         }
     }
@@ -161,7 +193,9 @@ impl ResourcePool {
     /// Tries to acquire a permit without waiting.
     ///
     /// Returns `None` if no permits are available.
-    pub fn try_acquire(&self) -> Option<ResourcePermit<'_>> {
+    /// This does NOT enforce prefetch quotas. Use `try_acquire_for_priority()`
+    /// for priority-aware acquisition.
+    pub fn try_acquire(&self) -> Option<ResourcePermit> {
         let permit = self.semaphore.clone().try_acquire_owned().ok()?;
 
         let current = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
@@ -169,9 +203,57 @@ impl ResourcePool {
 
         Some(ResourcePermit {
             _permit: permit,
-            in_flight: &self.in_flight,
+            in_flight: Arc::clone(&self.in_flight),
+            prefetch_in_flight: None,
             resource_type: self.resource_type,
         })
+    }
+
+    /// Tries to acquire a permit with priority-aware quota enforcement.
+    ///
+    /// - ON_DEMAND: uses full pool capacity (no quota)
+    /// - PREFETCH / HOUSEKEEPING: capped at `max_prefetch_capacity`
+    ///
+    /// Returns `None` if no permits available or prefetch quota is exhausted.
+    pub fn try_acquire_for_priority(&self, priority: Priority) -> Option<ResourcePermit> {
+        let is_prefetch = priority < Priority::ON_DEMAND;
+
+        if is_prefetch {
+            let current = self.prefetch_in_flight.load(Ordering::Relaxed);
+            if current >= self.max_prefetch_capacity {
+                return None;
+            }
+        }
+
+        let permit = self.semaphore.clone().try_acquire_owned().ok()?;
+
+        let current = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.update_peak(current);
+
+        if is_prefetch {
+            self.prefetch_in_flight.fetch_add(1, Ordering::Relaxed);
+        }
+
+        Some(ResourcePermit {
+            _permit: permit,
+            in_flight: Arc::clone(&self.in_flight),
+            prefetch_in_flight: if is_prefetch {
+                Some(Arc::clone(&self.prefetch_in_flight))
+            } else {
+                None
+            },
+            resource_type: self.resource_type,
+        })
+    }
+
+    /// Returns the maximum number of permits available to prefetch tasks.
+    pub fn max_prefetch_capacity(&self) -> usize {
+        self.max_prefetch_capacity
+    }
+
+    /// Returns the current number of in-flight prefetch operations.
+    pub fn prefetch_in_flight(&self) -> usize {
+        self.prefetch_in_flight.load(Ordering::Relaxed)
     }
 
     /// Updates the peak counter if current exceeds it.
@@ -219,6 +301,16 @@ impl ResourcePool {
     pub fn reset_peak(&self) {
         self.peak_in_flight.store(0, Ordering::Relaxed);
     }
+
+    /// Returns the current utilization as a fraction from 0.0 to 1.0.
+    ///
+    /// A value of 1.0 means the pool is fully saturated (all permits in use).
+    pub fn utilization(&self) -> f64 {
+        if self.capacity == 0 {
+            return 0.0;
+        }
+        self.in_flight() as f64 / self.capacity as f64
+    }
 }
 
 // =============================================================================
@@ -229,26 +321,36 @@ impl ResourcePool {
 ///
 /// While this permit is held, it counts against the pool's capacity.
 /// The permit is automatically released when dropped.
-pub struct ResourcePermit<'a> {
+///
+/// The permit is owned (no lifetime parameter) so it can be moved across
+/// function boundaries and into spawned futures. This prevents the double
+/// permit acquisition bug where `find_dispatchable_task()` consumed a permit
+/// that was dropped on return, then `spawn_task()` acquired a second one.
+pub struct ResourcePermit {
     _permit: OwnedSemaphorePermit,
-    in_flight: &'a AtomicUsize,
+    in_flight: Arc<AtomicUsize>,
+    /// If Some, this is a prefetch permit and this counter tracks prefetch usage.
+    prefetch_in_flight: Option<Arc<AtomicUsize>>,
     resource_type: ResourceType,
 }
 
-impl<'a> ResourcePermit<'a> {
+impl ResourcePermit {
     /// Returns the resource type this permit is for.
     pub fn resource_type(&self) -> ResourceType {
         self.resource_type
     }
 }
 
-impl Drop for ResourcePermit<'_> {
+impl Drop for ResourcePermit {
     fn drop(&mut self) {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        if let Some(ref prefetch) = self.prefetch_in_flight {
+            prefetch.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
-impl std::fmt::Debug for ResourcePermit<'_> {
+impl std::fmt::Debug for ResourcePermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResourcePermit")
             .field("resource_type", &self.resource_type)
@@ -271,6 +373,15 @@ pub struct ResourcePoolConfig {
 
     /// CPU pool capacity.
     pub cpu: usize,
+
+    /// Maximum fraction of each pool available to prefetch/housekeeping tasks.
+    ///
+    /// ON_DEMAND tasks always have access to the full pool. Lower-priority
+    /// tasks are capped at `capacity * max_prefetch_fraction`, reserving
+    /// the rest exclusively for on-demand work.
+    ///
+    /// Default: 0.75 (prefetch uses at most 75% of each pool).
+    pub max_prefetch_fraction: f64,
 }
 
 impl Default for ResourcePoolConfig {
@@ -284,6 +395,7 @@ impl Default for ResourcePoolConfig {
             disk_io: DEFAULT_DISK_IO_CAPACITY,
             cpu: ((cpus as f64 * DEFAULT_CPU_CAPACITY_MULTIPLIER).ceil() as usize)
                 .max(cpus + MIN_CPU_CAPACITY_ADDITION),
+            max_prefetch_fraction: DEFAULT_MAX_PREFETCH_FRACTION,
         }
     }
 }
@@ -295,6 +407,7 @@ impl ResourcePoolConfig {
             network,
             disk_io,
             cpu,
+            max_prefetch_fraction: DEFAULT_MAX_PREFETCH_FRACTION,
         }
     }
 
@@ -316,6 +429,7 @@ impl From<&crate::config::ExecutorSettings> for ResourcePoolConfig {
             network: settings.network_concurrent,
             disk_io: settings.disk_io_concurrent,
             cpu: settings.cpu_concurrent,
+            max_prefetch_fraction: DEFAULT_MAX_PREFETCH_FRACTION,
         }
     }
 }
@@ -338,10 +452,19 @@ pub struct ResourcePools {
 impl ResourcePools {
     /// Creates new resource pools with the given configuration.
     pub fn new(config: ResourcePoolConfig) -> Self {
+        let fraction = config.max_prefetch_fraction;
         Self {
-            network: ResourcePool::new(ResourceType::Network, config.network),
-            disk_io: ResourcePool::new(ResourceType::DiskIO, config.disk_io),
-            cpu: ResourcePool::new(ResourceType::CPU, config.cpu),
+            network: ResourcePool::with_prefetch_fraction(
+                ResourceType::Network,
+                config.network,
+                fraction,
+            ),
+            disk_io: ResourcePool::with_prefetch_fraction(
+                ResourceType::DiskIO,
+                config.disk_io,
+                fraction,
+            ),
+            cpu: ResourcePool::with_prefetch_fraction(ResourceType::CPU, config.cpu, fraction),
         }
     }
 
@@ -362,15 +485,27 @@ impl ResourcePools {
     /// Acquires a permit from the specified resource pool.
     ///
     /// This will wait if the pool is at capacity.
-    pub async fn acquire(&self, resource_type: ResourceType) -> ResourcePermit<'_> {
+    pub async fn acquire(&self, resource_type: ResourceType) -> ResourcePermit {
         self.get(resource_type).acquire().await
     }
 
     /// Tries to acquire a permit without waiting.
     ///
     /// Returns `None` if no permits are available.
-    pub fn try_acquire(&self, resource_type: ResourceType) -> Option<ResourcePermit<'_>> {
+    pub fn try_acquire(&self, resource_type: ResourceType) -> Option<ResourcePermit> {
         self.get(resource_type).try_acquire()
+    }
+
+    /// Tries to acquire a permit with priority-aware quota enforcement.
+    ///
+    /// ON_DEMAND tasks use full pool capacity. Prefetch/housekeeping tasks
+    /// are capped at the configured fraction of each pool.
+    pub fn try_acquire_for_priority(
+        &self,
+        resource_type: ResourceType,
+        priority: Priority,
+    ) -> Option<ResourcePermit> {
+        self.get(resource_type).try_acquire_for_priority(priority)
     }
 
     /// Returns the available permits for the given resource type.
@@ -401,6 +536,17 @@ impl ResourcePools {
     /// Returns the CPU pool.
     pub fn cpu(&self) -> &ResourcePool {
         &self.cpu
+    }
+
+    /// Returns the maximum utilization across all pools (0.0 to 1.0).
+    ///
+    /// Useful for circuit breaker decisions — if any single pool is near
+    /// saturation, the system is under stress.
+    pub fn max_utilization(&self) -> f64 {
+        self.network
+            .utilization()
+            .max(self.disk_io.utilization())
+            .max(self.cpu.utilization())
     }
 }
 
@@ -628,5 +774,169 @@ mod tests {
         let debug = format!("{:?}", permit);
         assert!(debug.contains("ResourcePermit"));
         assert!(debug.contains("Network"));
+    }
+
+    #[test]
+    fn test_resource_permit_is_owned() {
+        // Permits can be moved across function boundaries (no lifetime tie to pool).
+        fn acquire_and_return(pool: &ResourcePool) -> ResourcePermit {
+            pool.try_acquire().unwrap()
+        }
+
+        let pool = ResourcePool::new(ResourceType::Network, 2);
+        let permit = acquire_and_return(&pool);
+
+        // Permit is alive — pool shows 1 in-flight
+        assert_eq!(pool.in_flight(), 1);
+        assert_eq!(pool.available(), 1);
+
+        drop(permit);
+
+        // Permit released — pool shows 0 in-flight
+        assert_eq!(pool.in_flight(), 0);
+        assert_eq!(pool.available(), 2);
+    }
+
+    #[test]
+    fn test_prefetch_quota_limits_pool_usage() {
+        // Pool with capacity 4 and 75% prefetch fraction → max 3 prefetch permits
+        let pool = ResourcePool::with_prefetch_fraction(ResourceType::Network, 4, 0.75);
+
+        let p1 = pool.try_acquire_for_priority(Priority::PREFETCH);
+        assert!(p1.is_some());
+        let p2 = pool.try_acquire_for_priority(Priority::PREFETCH);
+        assert!(p2.is_some());
+        let p3 = pool.try_acquire_for_priority(Priority::PREFETCH);
+        assert!(p3.is_some());
+
+        // 4th prefetch should be denied (3 >= ceil(4 * 0.75) = 3)
+        let p4 = pool.try_acquire_for_priority(Priority::PREFETCH);
+        assert!(p4.is_none(), "Prefetch should be capped at 75% of pool");
+
+        assert_eq!(pool.in_flight(), 3);
+        assert_eq!(pool.prefetch_in_flight(), 3);
+        assert_eq!(pool.available(), 1); // 1 slot reserved for on-demand
+    }
+
+    #[test]
+    fn test_on_demand_ignores_prefetch_quota() {
+        let pool = ResourcePool::with_prefetch_fraction(ResourceType::Network, 4, 0.75);
+
+        // Fill prefetch quota
+        let _p1 = pool.try_acquire_for_priority(Priority::PREFETCH);
+        let _p2 = pool.try_acquire_for_priority(Priority::PREFETCH);
+        let _p3 = pool.try_acquire_for_priority(Priority::PREFETCH);
+
+        // Prefetch is blocked
+        assert!(pool.try_acquire_for_priority(Priority::PREFETCH).is_none());
+
+        // ON_DEMAND still works — it ignores the prefetch quota
+        let on_demand = pool.try_acquire_for_priority(Priority::ON_DEMAND);
+        assert!(
+            on_demand.is_some(),
+            "ON_DEMAND should use full pool capacity"
+        );
+
+        assert_eq!(pool.in_flight(), 4);
+        assert_eq!(pool.prefetch_in_flight(), 3);
+    }
+
+    #[test]
+    fn test_prefetch_quota_releases_on_drop() {
+        let pool = ResourcePool::with_prefetch_fraction(ResourceType::CPU, 4, 0.75);
+
+        let p1 = pool.try_acquire_for_priority(Priority::PREFETCH).unwrap();
+        let p2 = pool.try_acquire_for_priority(Priority::PREFETCH).unwrap();
+        let _p3 = pool.try_acquire_for_priority(Priority::PREFETCH).unwrap();
+
+        assert_eq!(pool.prefetch_in_flight(), 3);
+
+        // Drop one prefetch permit
+        drop(p1);
+        assert_eq!(pool.prefetch_in_flight(), 2);
+        assert_eq!(pool.in_flight(), 2);
+
+        // Now another prefetch can be acquired
+        let p4 = pool.try_acquire_for_priority(Priority::PREFETCH);
+        assert!(p4.is_some());
+        assert_eq!(pool.prefetch_in_flight(), 3);
+
+        drop(p2);
+        assert_eq!(pool.prefetch_in_flight(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_uses_single_permit() {
+        // Simulate the dispatch pattern: try_acquire in one scope, use in another.
+        let pool = ResourcePool::new(ResourceType::CPU, 2);
+
+        // Phase 1: find_dispatchable_task acquires the permit
+        let permit = pool.try_acquire().unwrap();
+        assert_eq!(pool.in_flight(), 1);
+
+        // Phase 2: spawn_task holds the same permit (no second acquire)
+        let handle = tokio::spawn(async move {
+            let _permit = permit; // Moved into spawned future
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            // permit drops here
+        });
+
+        // While task is running, only 1 permit consumed (not 2)
+        assert_eq!(pool.in_flight(), 1);
+
+        handle.await.unwrap();
+
+        // After task completes, permit is released
+        assert_eq!(pool.in_flight(), 0);
+        assert_eq!(pool.available(), 2);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Utilization tests (Phase 6)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pool_utilization_empty() {
+        let pool = ResourcePool::new(ResourceType::CPU, 4);
+        assert!((pool.utilization() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pool_utilization_partial() {
+        let pool = ResourcePool::new(ResourceType::CPU, 4);
+        let _p1 = pool.try_acquire().unwrap();
+        let _p2 = pool.try_acquire().unwrap();
+        assert!((pool.utilization() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pool_utilization_full() {
+        let pool = ResourcePool::new(ResourceType::CPU, 2);
+        let _p1 = pool.try_acquire().unwrap();
+        let _p2 = pool.try_acquire().unwrap();
+        assert!((pool.utilization() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pools_max_utilization() {
+        let config = ResourcePoolConfig {
+            network: 10,
+            disk_io: 10,
+            cpu: 4,
+            ..Default::default()
+        };
+        let pools = ResourcePools::new(config);
+
+        // Saturate CPU pool (smallest) to 75%
+        let _p1 = pools.try_acquire(ResourceType::CPU).unwrap();
+        let _p2 = pools.try_acquire(ResourceType::CPU).unwrap();
+        let _p3 = pools.try_acquire(ResourceType::CPU).unwrap();
+        // 3/4 = 0.75
+
+        assert!((pools.max_utilization() - 0.75).abs() < f64::EPSILON);
+
+        // Network and DiskIO are at 0% — CPU is the max
+        assert!((pools.network().utilization() - 0.0).abs() < f64::EPSILON);
+        assert!((pools.disk_io().utilization() - 0.0).abs() < f64::EPSILON);
     }
 }

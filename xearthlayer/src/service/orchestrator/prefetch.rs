@@ -39,12 +39,23 @@ impl ServiceOrchestrator {
             .ok_or_else(|| ServiceError::NotStarted("DDS client not available".into()))?;
 
         let runtime_handle = service.runtime_handle().clone();
+        let resource_pools = service.resource_pools();
 
         // Try legacy adapter first, then new cache bridge architecture
         if let Some(memory_cache) = service.memory_cache_adapter() {
-            self.start_prefetch_with_cache(&runtime_handle, dds_client, memory_cache)?;
+            self.start_prefetch_with_cache(
+                &runtime_handle,
+                dds_client,
+                memory_cache,
+                resource_pools,
+            )?;
         } else if let Some(memory_cache) = service.memory_cache_bridge() {
-            self.start_prefetch_with_cache(&runtime_handle, dds_client, memory_cache)?;
+            self.start_prefetch_with_cache(
+                &runtime_handle,
+                dds_client,
+                memory_cache,
+                resource_pools,
+            )?;
         } else {
             tracing::warn!("Memory cache not available, prefetch disabled");
             return Ok(());
@@ -59,6 +70,7 @@ impl ServiceOrchestrator {
         runtime_handle: &Handle,
         dds_client: Arc<dyn DdsClient>,
         memory_cache: Arc<M>,
+        resource_pools: Option<Arc<crate::executor::ResourcePools>>,
     ) -> Result<(), ServiceError> {
         use crate::prefetch::AircraftState as PrefetchAircraftState;
 
@@ -128,11 +140,15 @@ impl ServiceOrchestrator {
         // Wire memory cache for tile existence checks (Bug 5 fix)
         coordinator = coordinator.with_memory_cache(memory_cache);
 
-        // Wire circuit breaker as throttler
-        let circuit_breaker = CircuitBreaker::new(
+        // Wire circuit breaker as throttler (with optional resource pool monitoring)
+        let mut circuit_breaker = CircuitBreaker::new(
             config.circuit_breaker.clone(),
             self.mount_manager.load_monitor(),
         );
+        if let Some(ref pools) = resource_pools {
+            circuit_breaker = circuit_breaker.with_resource_pools(Arc::clone(pools));
+            tracing::info!("Resource pool utilization monitoring wired to circuit breaker");
+        }
         coordinator = coordinator.with_throttler(Arc::new(circuit_breaker));
 
         // Wire scenery index if available
