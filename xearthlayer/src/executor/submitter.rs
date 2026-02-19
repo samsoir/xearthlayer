@@ -109,9 +109,155 @@ pub(crate) struct SubmittedJob {
     pub result_holder: std::sync::Arc<tokio::sync::Mutex<Option<JobResult>>>,
 }
 
+// =============================================================================
+// Waiting Job (priority-ordered queue wrapper)
+// =============================================================================
+
+/// A job waiting for a concurrency group permit.
+///
+/// Wraps a `SubmittedJob` with ordering support for the priority-aware
+/// waiting queue. Jobs are ordered by priority (higher first), then by
+/// sequence number (FIFO within same priority).
+///
+/// This replaces the previous `VecDeque<SubmittedJob>` which was FIFO-only,
+/// causing ON_DEMAND jobs to queue behind PREFETCH jobs (priority inversion).
+pub(crate) struct WaitingJob {
+    /// The submitted job awaiting a concurrency permit.
+    pub submitted: SubmittedJob,
+    /// Sequence number for FIFO ordering within the same priority level.
+    pub sequence: u64,
+}
+
+impl PartialEq for WaitingJob {
+    fn eq(&self, other: &Self) -> bool {
+        self.submitted.priority == other.submitted.priority && self.sequence == other.sequence
+    }
+}
+
+impl Eq for WaitingJob {}
+
+impl PartialOrd for WaitingJob {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WaitingJob {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Higher priority first, then lower sequence (older) first
+        match self.submitted.priority.cmp(&other.submitted.priority) {
+            std::cmp::Ordering::Equal => other.sequence.cmp(&self.sequence),
+            other_ordering => other_ordering,
+        }
+    }
+}
+
+impl std::fmt::Debug for WaitingJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaitingJob")
+            .field("job_id", &self.submitted.job_id)
+            .field("priority", &self.submitted.priority)
+            .field("sequence", &self.sequence)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_waiting_queue_prioritizes_on_demand_over_prefetch() {
+        use std::collections::BinaryHeap;
+
+        // Create mock submitted jobs at different priorities
+        let prefetch = create_test_submitted_job("prefetch-1", Priority::PREFETCH);
+        let on_demand = create_test_submitted_job("on-demand-1", Priority::ON_DEMAND);
+
+        let mut heap = BinaryHeap::new();
+
+        // Submit prefetch first, then on_demand
+        heap.push(WaitingJob {
+            submitted: prefetch,
+            sequence: 0,
+        });
+        heap.push(WaitingJob {
+            submitted: on_demand,
+            sequence: 1,
+        });
+
+        // ON_DEMAND should come out first despite being submitted second
+        let first = heap.pop().unwrap();
+        assert_eq!(first.submitted.priority, Priority::ON_DEMAND);
+
+        let second = heap.pop().unwrap();
+        assert_eq!(second.submitted.priority, Priority::PREFETCH);
+    }
+
+    #[test]
+    fn test_waiting_queue_fifo_within_same_priority() {
+        use std::collections::BinaryHeap;
+
+        let job1 = create_test_submitted_job("prefetch-1", Priority::PREFETCH);
+        let job2 = create_test_submitted_job("prefetch-2", Priority::PREFETCH);
+
+        let mut heap = BinaryHeap::new();
+        heap.push(WaitingJob {
+            submitted: job1,
+            sequence: 0,
+        });
+        heap.push(WaitingJob {
+            submitted: job2,
+            sequence: 1,
+        });
+
+        // Same priority — FIFO (lower sequence first)
+        let first = heap.pop().unwrap();
+        assert_eq!(first.submitted.name, "prefetch-1");
+        assert_eq!(first.sequence, 0);
+
+        let second = heap.pop().unwrap();
+        assert_eq!(second.submitted.name, "prefetch-2");
+        assert_eq!(second.sequence, 1);
+    }
+
+    /// Helper to create a test SubmittedJob.
+    fn create_test_submitted_job(name: &str, priority: Priority) -> SubmittedJob {
+        struct TestJob {
+            name: String,
+        }
+        impl Job for TestJob {
+            fn id(&self) -> JobId {
+                JobId::new(&self.name)
+            }
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn create_tasks(&self) -> Vec<Box<dyn super::super::task::Task>> {
+                vec![]
+            }
+            fn priority(&self) -> Priority {
+                // Not used directly — priority is on SubmittedJob
+                Priority::PREFETCH
+            }
+        }
+
+        let (status_tx, _status_rx) = watch::channel(JobStatus::Pending);
+        let (_signal_tx, signal_rx) = mpsc::channel(16);
+        let result_holder = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+
+        SubmittedJob {
+            job: Box::new(TestJob {
+                name: name.to_string(),
+            }),
+            job_id: JobId::new(name),
+            name: name.to_string(),
+            priority,
+            status_tx,
+            signal_rx,
+            result_holder,
+        }
+    }
 
     #[tokio::test]
     async fn test_submitter_try_submit_closed_channel() {

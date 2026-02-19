@@ -195,6 +195,19 @@ pub trait DdsClient: Send + Sync + 'static {
     /// Returns `false` if the executor has been shut down.
     fn is_connected(&self) -> bool;
 
+    /// Returns the current channel pressure as a value between 0.0 and 1.0.
+    ///
+    /// - 0.0: Channel is empty (no backpressure)
+    /// - 1.0: Channel is full (maximum backpressure)
+    ///
+    /// Producers can use this to throttle submission rate. For example,
+    /// the prefetch coordinator defers cycles when pressure exceeds 0.8.
+    ///
+    /// Default implementation returns 0.0 (no pressure) for mock clients.
+    fn channel_pressure(&self) -> f64 {
+        0.0
+    }
+
     /// Returns a clone of the underlying sender for async operations.
     ///
     /// This allows callers to use `send().await` for backpressure-aware
@@ -300,6 +313,15 @@ impl DdsClient for ChannelDdsClient {
 
     fn is_connected(&self) -> bool {
         !self.tx.is_closed()
+    }
+
+    fn channel_pressure(&self) -> f64 {
+        let max = self.tx.max_capacity();
+        if max == 0 {
+            return 1.0;
+        }
+        let available = self.tx.capacity();
+        1.0 - (available as f64 / max as f64)
     }
 
     fn sender(&self) -> Option<mpsc::Sender<JobRequest>> {
@@ -490,5 +512,92 @@ mod tests {
         let debug = format!("{:?}", client);
         assert!(debug.contains("ChannelDdsClient"));
         assert!(debug.contains("is_connected"));
+    }
+
+    #[test]
+    fn test_channel_pressure_empty() {
+        let (tx, _rx) = mpsc::channel::<JobRequest>(10);
+        let client = ChannelDdsClient::new(tx);
+
+        let pressure = client.channel_pressure();
+        assert!(
+            (pressure - 0.0).abs() < f64::EPSILON,
+            "Empty channel should have 0.0 pressure, got {}",
+            pressure
+        );
+    }
+
+    #[test]
+    fn test_channel_pressure_full() {
+        let (tx, _rx) = mpsc::channel::<JobRequest>(2);
+        let client = ChannelDdsClient::new(tx);
+
+        // Fill the channel
+        let req1 = JobRequest::prefetch(test_tile());
+        let req2 = JobRequest::prefetch(test_tile());
+        client.submit(req1).unwrap();
+        client.submit(req2).unwrap();
+
+        let pressure = client.channel_pressure();
+        assert!(
+            (pressure - 1.0).abs() < f64::EPSILON,
+            "Full channel should have 1.0 pressure, got {}",
+            pressure
+        );
+    }
+
+    #[test]
+    fn test_channel_pressure_partial() {
+        let (tx, _rx) = mpsc::channel::<JobRequest>(4);
+        let client = ChannelDdsClient::new(tx);
+
+        // Fill half the channel
+        client.submit(JobRequest::prefetch(test_tile())).unwrap();
+        client.submit(JobRequest::prefetch(test_tile())).unwrap();
+
+        let pressure = client.channel_pressure();
+        assert!(
+            (pressure - 0.5).abs() < f64::EPSILON,
+            "Half-full channel should have 0.5 pressure, got {}",
+            pressure
+        );
+    }
+
+    #[test]
+    fn test_channel_pressure_default_trait_impl() {
+        // Mock client using default trait impl should return 0.0
+        struct MockClient;
+        impl DdsClient for MockClient {
+            fn submit(&self, _: JobRequest) -> Result<(), DdsClientError> {
+                Ok(())
+            }
+            fn request_dds(
+                &self,
+                _: TileCoord,
+                _: CancellationToken,
+            ) -> oneshot::Receiver<DdsResponse> {
+                let (_, rx) = oneshot::channel();
+                rx
+            }
+            fn request_dds_with_options(
+                &self,
+                _: TileCoord,
+                _: Priority,
+                _: RequestOrigin,
+                _: CancellationToken,
+            ) -> oneshot::Receiver<DdsResponse> {
+                let (_, rx) = oneshot::channel();
+                rx
+            }
+            fn is_connected(&self) -> bool {
+                true
+            }
+        }
+
+        let client = MockClient;
+        assert!(
+            (client.channel_pressure() - 0.0).abs() < f64::EPSILON,
+            "Default trait impl should return 0.0"
+        );
     }
 }

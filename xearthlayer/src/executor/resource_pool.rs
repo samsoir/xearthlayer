@@ -122,7 +122,7 @@ pub struct ResourcePool {
     resource_type: ResourceType,
     semaphore: Arc<Semaphore>,
     capacity: usize,
-    in_flight: AtomicUsize,
+    in_flight: Arc<AtomicUsize>,
     peak_in_flight: AtomicUsize,
 }
 
@@ -134,13 +134,13 @@ impl ResourcePool {
             resource_type,
             semaphore: Arc::new(Semaphore::new(capacity)),
             capacity,
-            in_flight: AtomicUsize::new(0),
+            in_flight: Arc::new(AtomicUsize::new(0)),
             peak_in_flight: AtomicUsize::new(0),
         }
     }
 
     /// Acquires a permit, waiting if none available.
-    pub async fn acquire(&self) -> ResourcePermit<'_> {
+    pub async fn acquire(&self) -> ResourcePermit {
         let permit = self
             .semaphore
             .clone()
@@ -153,7 +153,7 @@ impl ResourcePool {
 
         ResourcePermit {
             _permit: permit,
-            in_flight: &self.in_flight,
+            in_flight: Arc::clone(&self.in_flight),
             resource_type: self.resource_type,
         }
     }
@@ -161,7 +161,7 @@ impl ResourcePool {
     /// Tries to acquire a permit without waiting.
     ///
     /// Returns `None` if no permits are available.
-    pub fn try_acquire(&self) -> Option<ResourcePermit<'_>> {
+    pub fn try_acquire(&self) -> Option<ResourcePermit> {
         let permit = self.semaphore.clone().try_acquire_owned().ok()?;
 
         let current = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
@@ -169,7 +169,7 @@ impl ResourcePool {
 
         Some(ResourcePermit {
             _permit: permit,
-            in_flight: &self.in_flight,
+            in_flight: Arc::clone(&self.in_flight),
             resource_type: self.resource_type,
         })
     }
@@ -229,26 +229,31 @@ impl ResourcePool {
 ///
 /// While this permit is held, it counts against the pool's capacity.
 /// The permit is automatically released when dropped.
-pub struct ResourcePermit<'a> {
+///
+/// The permit is owned (no lifetime parameter) so it can be moved across
+/// function boundaries and into spawned futures. This prevents the double
+/// permit acquisition bug where `find_dispatchable_task()` consumed a permit
+/// that was dropped on return, then `spawn_task()` acquired a second one.
+pub struct ResourcePermit {
     _permit: OwnedSemaphorePermit,
-    in_flight: &'a AtomicUsize,
+    in_flight: Arc<AtomicUsize>,
     resource_type: ResourceType,
 }
 
-impl<'a> ResourcePermit<'a> {
+impl ResourcePermit {
     /// Returns the resource type this permit is for.
     pub fn resource_type(&self) -> ResourceType {
         self.resource_type
     }
 }
 
-impl Drop for ResourcePermit<'_> {
+impl Drop for ResourcePermit {
     fn drop(&mut self) {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-impl std::fmt::Debug for ResourcePermit<'_> {
+impl std::fmt::Debug for ResourcePermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResourcePermit")
             .field("resource_type", &self.resource_type)
@@ -362,14 +367,14 @@ impl ResourcePools {
     /// Acquires a permit from the specified resource pool.
     ///
     /// This will wait if the pool is at capacity.
-    pub async fn acquire(&self, resource_type: ResourceType) -> ResourcePermit<'_> {
+    pub async fn acquire(&self, resource_type: ResourceType) -> ResourcePermit {
         self.get(resource_type).acquire().await
     }
 
     /// Tries to acquire a permit without waiting.
     ///
     /// Returns `None` if no permits are available.
-    pub fn try_acquire(&self, resource_type: ResourceType) -> Option<ResourcePermit<'_>> {
+    pub fn try_acquire(&self, resource_type: ResourceType) -> Option<ResourcePermit> {
         self.get(resource_type).try_acquire()
     }
 
@@ -628,5 +633,52 @@ mod tests {
         let debug = format!("{:?}", permit);
         assert!(debug.contains("ResourcePermit"));
         assert!(debug.contains("Network"));
+    }
+
+    #[test]
+    fn test_resource_permit_is_owned() {
+        // Permits can be moved across function boundaries (no lifetime tie to pool).
+        fn acquire_and_return(pool: &ResourcePool) -> ResourcePermit {
+            pool.try_acquire().unwrap()
+        }
+
+        let pool = ResourcePool::new(ResourceType::Network, 2);
+        let permit = acquire_and_return(&pool);
+
+        // Permit is alive — pool shows 1 in-flight
+        assert_eq!(pool.in_flight(), 1);
+        assert_eq!(pool.available(), 1);
+
+        drop(permit);
+
+        // Permit released — pool shows 0 in-flight
+        assert_eq!(pool.in_flight(), 0);
+        assert_eq!(pool.available(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_uses_single_permit() {
+        // Simulate the dispatch pattern: try_acquire in one scope, use in another.
+        let pool = ResourcePool::new(ResourceType::CPU, 2);
+
+        // Phase 1: find_dispatchable_task acquires the permit
+        let permit = pool.try_acquire().unwrap();
+        assert_eq!(pool.in_flight(), 1);
+
+        // Phase 2: spawn_task holds the same permit (no second acquire)
+        let handle = tokio::spawn(async move {
+            let _permit = permit; // Moved into spawned future
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            // permit drops here
+        });
+
+        // While task is running, only 1 permit consumed (not 2)
+        assert_eq!(pool.in_flight(), 1);
+
+        handle.await.unwrap();
+
+        // After task completes, permit is released
+        assert_eq!(pool.in_flight(), 0);
+        assert_eq!(pool.available(), 2);
     }
 }
