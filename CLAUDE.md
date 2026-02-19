@@ -112,7 +112,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - **Four-tier filtering**: Local tracking → Memory cache → Patched region exclusion (via `GeoIndex`) → Disk existence (via `OrthoUnionIndex`)
     - See `docs/dev/adaptive-prefetch-design.md` for design details
 
-12. **Ortho Union Index** (`xearthlayer/src/ortho_union/`)
+12. **Aircraft Position & Telemetry** (`xearthlayer/src/aircraft_position/`)
+    - `StateAggregator` - Combines multiple position sources with accuracy-based selection
+    - `PositionModel` - Persistent position model refined by best available data
+    - `TelemetryReceiver` - X-Plane UDP telemetry (XGPS2/ForeFlight protocol)
+    - `InferenceAdapter` - Position inference from FUSE file access patterns
+    - `NetworkAdapter` - Online ATC network position (VATSIM/IVAO/PilotEdge via REST API)
+    - `FlightPathHistory` - Position history for track derivation
+    - Position sources: GPS/Telemetry (10m), OnlineNetwork (10m), ManualReference (100m), SceneInference (100km)
+    - Higher accuracy wins; stale high-accuracy can be beaten by fresh lower-accuracy
+
+13. **Ortho Union Index** (`xearthlayer/src/ortho_union/`)
     - `OrthoUnionIndex` - Merged index of all ortho sources (patches + packages)
     - `OrthoUnionIndexBuilder` - Builder pattern for index construction
     - Parallel scanning via rayon for performance
@@ -298,6 +308,7 @@ Key sections:
 - `[cache]` - Memory/disk sizes, directory, disk I/O profile (auto/hdd/ssd/nvme)
 - `[generation]` - Thread count, timeout
 - `[texture]` - DDS format (bc1/bc3)
+- `[online_network]` - VATSIM/IVAO/PilotEdge position (enabled, pilot_id, poll interval)
 
 See `docs/configuration.md` for full reference.
 

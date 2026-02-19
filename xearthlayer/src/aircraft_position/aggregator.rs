@@ -159,6 +159,33 @@ impl StateAggregator {
         }
     }
 
+    /// Receive a position update from an online network (VATSIM/IVAO/PilotEdge).
+    ///
+    /// Similar to `receive_telemetry()` but does NOT set TelemetryStatus::Connected,
+    /// since telemetry status tracks XGPS2 UDP connectivity specifically.
+    /// Records position in flight path history for track derivation.
+    pub fn receive_network_position(&self, mut aircraft_state: AircraftState) {
+        let mut state = self.state.write().unwrap();
+
+        // Record position in flight path history (for track derivation)
+        state
+            .flight_path
+            .record_position(aircraft_state.latitude, aircraft_state.longitude);
+
+        // Enrich with derived track if unavailable
+        if aircraft_state.track.is_none() {
+            if let Some(derived_track) = state.flight_path.calculate_track() {
+                aircraft_state.track = Some(derived_track);
+                aircraft_state.track_source = TrackSource::Derived;
+            }
+        }
+
+        // Apply update (competes on accuracy like any other source)
+        if state.model.apply_update(aircraft_state) {
+            self.maybe_broadcast(&mut state);
+        }
+    }
+
     /// Receive a position update from inference.
     pub fn receive_inference(&self, aircraft_state: AircraftState) {
         let mut state = self.state.write().unwrap();
@@ -435,6 +462,99 @@ mod tests {
                 track
             );
         }
+    }
+
+    #[test]
+    fn test_receive_network_position() {
+        let (tx, _rx) = broadcast::channel(16);
+        let aggregator = StateAggregator::new(tx);
+
+        let state = AircraftState::from_network_position(
+            33.9425,
+            -118.408,
+            270.0,
+            150.0,
+            35000.0,
+            std::time::Instant::now(),
+        );
+        aggregator.receive_network_position(state);
+
+        assert!(aggregator.has_position());
+        assert_eq!(aggregator.position(), Some((33.9425, -118.408)));
+        assert!(aggregator.has_vectors());
+    }
+
+    #[test]
+    fn test_network_position_does_not_set_telemetry_connected() {
+        let (tx, _rx) = broadcast::channel(16);
+        let aggregator = StateAggregator::new(tx);
+
+        let state = AircraftState::from_network_position(
+            33.9425,
+            -118.408,
+            270.0,
+            150.0,
+            35000.0,
+            std::time::Instant::now(),
+        );
+        aggregator.receive_network_position(state);
+
+        // TelemetryStatus should remain Disconnected (network != XGPS2)
+        assert_eq!(aggregator.telemetry_status(), TelemetryStatus::Disconnected);
+    }
+
+    #[test]
+    fn test_network_position_beats_inference() {
+        let (tx, _rx) = broadcast::channel(16);
+        let aggregator = StateAggregator::new(tx);
+
+        // Start with inference (100km accuracy)
+        let inference = AircraftState::from_inference(40.0, 5.0);
+        aggregator.receive_inference(inference);
+        assert_eq!(
+            aggregator.status().state.unwrap().source,
+            PositionSource::SceneInference
+        );
+
+        // Network (10m accuracy) should replace inference
+        let network = AircraftState::from_network_position(
+            33.9425,
+            -118.408,
+            270.0,
+            150.0,
+            35000.0,
+            std::time::Instant::now(),
+        );
+        aggregator.receive_network_position(network);
+        assert_eq!(
+            aggregator.status().state.unwrap().source,
+            PositionSource::OnlineNetwork
+        );
+    }
+
+    #[test]
+    fn test_fresh_telemetry_beats_network() {
+        let (tx, _rx) = broadcast::channel(16);
+        let aggregator = StateAggregator::new(tx);
+
+        // Start with network position
+        let network = AircraftState::from_network_position(
+            33.9425,
+            -118.408,
+            270.0,
+            150.0,
+            35000.0,
+            std::time::Instant::now(),
+        );
+        aggregator.receive_network_position(network);
+
+        // Fresh telemetry (same accuracy, but fresher) should replace
+        let telemetry = make_telemetry_state(53.5, 10.0, 90.0);
+        aggregator.receive_telemetry(telemetry);
+        assert_eq!(
+            aggregator.status().state.unwrap().source,
+            PositionSource::Telemetry
+        );
     }
 
     #[test]
