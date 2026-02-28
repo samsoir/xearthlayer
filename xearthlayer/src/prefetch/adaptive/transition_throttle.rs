@@ -83,17 +83,18 @@ impl TransitionThrottle {
         }
 
         match (from, to) {
-            (FlightPhase::Ground, FlightPhase::Cruise) => {
+            (FlightPhase::Ground, FlightPhase::Cruise)
+            | (FlightPhase::Ground, FlightPhase::Transition) => {
                 tracing::info!(
-                    "TransitionThrottle: Ground->Cruise, entering grace period ({:.0}s)",
+                    "TransitionThrottle: {from}->{to}, entering grace period ({:.0}s)",
                     GRACE_PERIOD_DURATION.as_secs_f64()
                 );
                 self.state = ThrottleState::GracePeriod {
                     started_at: Instant::now(),
                 };
             }
-            (FlightPhase::Cruise, FlightPhase::Ground) => {
-                tracing::info!("TransitionThrottle: Cruise->Ground, resetting to idle");
+            (_, FlightPhase::Ground) => {
+                tracing::info!("TransitionThrottle: {from}->Ground, resetting to idle");
                 self.state = ThrottleState::Idle;
             }
             _ => {}
