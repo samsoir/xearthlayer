@@ -14,13 +14,13 @@
 //! # Detection Logic
 //!
 //! ```text
-//! Ground:     GS < 40kt AND AGL < 20ft
-//! Transition: GS ≥ 40kt (or AGL ≥ 20ft), awaiting climb confirmation
+//! Ground:     GS < 40kt
+//! Transition: GS ≥ 40kt, awaiting climb confirmation
 //! Cruise:     MSL ≥ takeoff_msl + climb_ft, or timeout elapsed
 //! ```
 //!
-//! The OR condition for airborne detection supports rotorcraft and slow
-//! experimental aircraft that may fly slowly but are clearly airborne.
+//! Ground speed is the sole phase trigger. AGL is not available from
+//! the current telemetry sources (X-Plane UDP / ForeFlight protocol).
 
 use std::time::{Duration, Instant};
 
@@ -36,7 +36,7 @@ use super::config::AdaptivePrefetchConfig;
 pub enum FlightPhase {
     /// Aircraft is on the ground (taxi, parking, runway).
     ///
-    /// Condition: Ground speed < 40kt AND AGL < 20ft
+    /// Condition: Ground speed < 40kt
     #[default]
     Ground,
 
@@ -73,7 +73,7 @@ impl std::fmt::Display for FlightPhase {
 
 /// Detects flight phase transitions.
 ///
-/// Monitors ground speed, AGL, and MSL to determine whether the aircraft
+/// Monitors ground speed and MSL altitude to determine whether the aircraft
 /// is on the ground, in a takeoff transition, or in cruise flight.
 ///
 /// # Hysteresis
@@ -95,9 +95,6 @@ pub struct PhaseDetector {
 
     /// Ground speed threshold (knots).
     ground_speed_threshold_kt: f32,
-
-    /// AGL threshold (feet).
-    agl_threshold_ft: f32,
 
     /// When the current phase was entered.
     phase_entered_at: Instant,
@@ -127,7 +124,6 @@ impl PhaseDetector {
         Self {
             current_phase: FlightPhase::Ground,
             ground_speed_threshold_kt: config.ground_speed_threshold_kt,
-            agl_threshold_ft: config.agl_threshold_ft,
             phase_entered_at: Instant::now(),
             pending_transition: None,
             hysteresis_duration: Duration::from_secs(2),
@@ -160,19 +156,18 @@ impl PhaseDetector {
     /// # Arguments
     ///
     /// * `ground_speed_kt` - Current ground speed in knots
-    /// * `agl_ft` - Current altitude above ground level in feet
     /// * `msl_ft` - Current altitude above mean sea level in feet
     ///
     /// # Returns
     ///
     /// `true` if the phase changed, `false` otherwise.
-    pub fn update(&mut self, ground_speed_kt: f32, agl_ft: f32, msl_ft: f32) -> bool {
+    pub fn update(&mut self, ground_speed_kt: f32, msl_ft: f32) -> bool {
         // If currently in Transition, check for immediate release (no hysteresis)
         if self.current_phase == FlightPhase::Transition {
-            return self.check_transition_release(ground_speed_kt, agl_ft, msl_ft);
+            return self.check_transition_release(ground_speed_kt, msl_ft);
         }
 
-        let detected_phase = self.detect_phase(ground_speed_kt, agl_ft);
+        let detected_phase = self.detect_phase(ground_speed_kt);
 
         if detected_phase == self.current_phase {
             // Same phase, clear any pending transition
@@ -203,7 +198,7 @@ impl PhaseDetector {
             if pending_phase == target_phase {
                 // Same pending phase, check if hysteresis duration passed
                 if now.duration_since(started_at) >= required_hysteresis {
-                    return self.commit_transition(target_phase, ground_speed_kt, agl_ft, msl_ft);
+                    return self.commit_transition(target_phase, ground_speed_kt, msl_ft);
                 }
                 // Still waiting for hysteresis
                 return false;
@@ -218,21 +213,21 @@ impl PhaseDetector {
     /// Check if Transition phase should release to Cruise or revert to Ground.
     ///
     /// This bypasses normal hysteresis — release is immediate when conditions are met.
-    fn check_transition_release(&mut self, ground_speed_kt: f32, agl_ft: f32, msl_ft: f32) -> bool {
+    fn check_transition_release(&mut self, ground_speed_kt: f32, msl_ft: f32) -> bool {
         // Check if we've climbed enough above takeoff MSL
         if let Some(takeoff_msl) = self.transition_msl {
             if msl_ft - takeoff_msl >= self.takeoff_climb_ft {
-                return self.commit_transition(FlightPhase::Cruise, ground_speed_kt, agl_ft, msl_ft);
+                return self.commit_transition(FlightPhase::Cruise, ground_speed_kt, msl_ft);
             }
         }
 
         // Check if timeout has elapsed
         if self.phase_entered_at.elapsed() >= self.takeoff_timeout {
-            return self.commit_transition(FlightPhase::Cruise, ground_speed_kt, agl_ft, msl_ft);
+            return self.commit_transition(FlightPhase::Cruise, ground_speed_kt, msl_ft);
         }
 
         // Check if we've returned to ground conditions (aborted takeoff)
-        let detected = self.detect_phase(ground_speed_kt, agl_ft);
+        let detected = self.detect_phase(ground_speed_kt);
         if detected == FlightPhase::Ground {
             // Use standard hysteresis for reverting to ground
             let now = Instant::now();
@@ -242,7 +237,6 @@ impl PhaseDetector {
                         return self.commit_transition(
                             FlightPhase::Ground,
                             ground_speed_kt,
-                            agl_ft,
                             msl_ft,
                         );
                     }
@@ -263,7 +257,6 @@ impl PhaseDetector {
         &mut self,
         new_phase: FlightPhase,
         ground_speed_kt: f32,
-        agl_ft: f32,
         msl_ft: f32,
     ) -> bool {
         let old_phase = self.current_phase;
@@ -282,7 +275,6 @@ impl PhaseDetector {
             from = %old_phase,
             to = %new_phase,
             ground_speed_kt = ground_speed_kt,
-            agl_ft = agl_ft,
             msl_ft = msl_ft,
             "Flight phase transition"
         );
@@ -290,17 +282,12 @@ impl PhaseDetector {
         true
     }
 
-    /// Detect phase based on current telemetry (without hysteresis).
+    /// Detect phase based on ground speed (without hysteresis).
     ///
-    /// Returns Ground or Cruise based on raw conditions. The `update()` method
-    /// interprets Cruise as Transition when coming from Ground.
-    fn detect_phase(&self, ground_speed_kt: f32, agl_ft: f32) -> FlightPhase {
-        // Ground: GS < threshold AND AGL < threshold
-        // Cruise: GS > threshold OR AGL > threshold
-        let is_slow = ground_speed_kt < self.ground_speed_threshold_kt;
-        let is_low = agl_ft < self.agl_threshold_ft;
-
-        if is_slow && is_low {
+    /// Returns Ground or Cruise based on raw ground speed condition. The
+    /// `update()` method interprets Cruise as Transition when coming from Ground.
+    fn detect_phase(&self, ground_speed_kt: f32) -> FlightPhase {
+        if ground_speed_kt < self.ground_speed_threshold_kt {
             FlightPhase::Ground
         } else {
             FlightPhase::Cruise
@@ -356,31 +343,20 @@ mod tests {
     fn test_phase_detector_ground_conditions() {
         let detector = PhaseDetector::with_defaults();
 
-        // Slow and low = ground
-        assert_eq!(detector.detect_phase(20.0, 10.0), FlightPhase::Ground);
-        assert_eq!(detector.detect_phase(0.0, 0.0), FlightPhase::Ground);
-        assert_eq!(detector.detect_phase(39.0, 19.0), FlightPhase::Ground);
+        // Below GS threshold = ground
+        assert_eq!(detector.detect_phase(20.0), FlightPhase::Ground);
+        assert_eq!(detector.detect_phase(0.0), FlightPhase::Ground);
+        assert_eq!(detector.detect_phase(39.0), FlightPhase::Ground);
     }
 
     #[test]
-    fn test_phase_detector_cruise_conditions() {
+    fn test_phase_detector_airborne_conditions() {
         let detector = PhaseDetector::with_defaults();
 
-        // Fast OR high = cruise (raw detection)
-        assert_eq!(detector.detect_phase(100.0, 10.0), FlightPhase::Cruise); // Fast, low
-        assert_eq!(detector.detect_phase(20.0, 100.0), FlightPhase::Cruise); // Slow, high
-        assert_eq!(detector.detect_phase(100.0, 1000.0), FlightPhase::Cruise); // Fast, high
-        assert_eq!(detector.detect_phase(41.0, 10.0), FlightPhase::Cruise); // Just above GS threshold
-        assert_eq!(detector.detect_phase(10.0, 21.0), FlightPhase::Cruise); // Just above AGL threshold
-    }
-
-    #[test]
-    fn test_phase_detector_rotorcraft_hover() {
-        let detector = PhaseDetector::with_defaults();
-
-        // Helicopter hovering: slow but clearly airborne
-        assert_eq!(detector.detect_phase(5.0, 50.0), FlightPhase::Cruise);
-        assert_eq!(detector.detect_phase(0.0, 100.0), FlightPhase::Cruise);
+        // Above GS threshold = airborne (raw detection returns Cruise)
+        assert_eq!(detector.detect_phase(100.0), FlightPhase::Cruise);
+        assert_eq!(detector.detect_phase(41.0), FlightPhase::Cruise); // Just above threshold
+        assert_eq!(detector.detect_phase(40.0), FlightPhase::Cruise); // At threshold
     }
 
     #[test]
@@ -391,8 +367,8 @@ mod tests {
         // Start on ground
         assert_eq!(detector.current_phase(), FlightPhase::Ground);
 
-        // First update with cruise conditions - should NOT transition yet
-        let changed = detector.update(100.0, 1000.0, 0.0);
+        // First update with airborne conditions - should NOT transition yet
+        let changed = detector.update(100.0, 0.0);
         assert!(!changed);
         assert_eq!(detector.current_phase(), FlightPhase::Ground);
 
@@ -400,7 +376,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(15));
 
         // Second update - should transition to Transition (not directly to Cruise)
-        let changed = detector.update(100.0, 1000.0, 0.0);
+        let changed = detector.update(100.0, 0.0);
         assert!(changed);
         assert_eq!(detector.current_phase(), FlightPhase::Transition);
     }
@@ -413,17 +389,17 @@ mod tests {
         // Start on ground
         assert_eq!(detector.current_phase(), FlightPhase::Ground);
 
-        // Start transition to cruise
-        detector.update(100.0, 1000.0, 0.0);
+        // Start transition to airborne
+        detector.update(100.0, 0.0);
         assert_eq!(detector.current_phase(), FlightPhase::Ground);
 
         // Before hysteresis completes, go back to ground conditions
-        detector.update(10.0, 5.0, 0.0);
+        detector.update(10.0, 0.0);
         assert_eq!(detector.current_phase(), FlightPhase::Ground);
 
         // Wait and update with ground conditions - should stay ground
         std::thread::sleep(std::time::Duration::from_millis(60));
-        let changed = detector.update(10.0, 5.0, 0.0);
+        let changed = detector.update(10.0, 0.0);
         assert!(!changed);
         assert_eq!(detector.current_phase(), FlightPhase::Ground);
     }
@@ -439,9 +415,9 @@ mod tests {
 
         assert_eq!(detector.current_phase(), FlightPhase::Ground);
 
-        detector.update(100.0, 0.0, 500.0);
+        detector.update(100.0, 500.0);
         std::thread::sleep(std::time::Duration::from_millis(15));
-        let changed = detector.update(100.0, 0.0, 500.0);
+        let changed = detector.update(100.0, 500.0);
 
         assert!(changed);
         assert_eq!(detector.current_phase(), FlightPhase::Transition);
@@ -452,9 +428,9 @@ mod tests {
         let mut detector = PhaseDetector::with_defaults();
         detector.hysteresis_duration = std::time::Duration::from_millis(10);
 
-        detector.update(100.0, 0.0, 500.0);
+        detector.update(100.0, 500.0);
         std::thread::sleep(std::time::Duration::from_millis(15));
-        detector.update(100.0, 0.0, 500.0);
+        detector.update(100.0, 500.0);
 
         assert_eq!(detector.current_phase(), FlightPhase::Transition);
         assert_eq!(detector.transition_msl(), Some(500.0));
@@ -469,12 +445,12 @@ mod tests {
         let mut detector = PhaseDetector::new(&config);
         detector.hysteresis_duration = std::time::Duration::from_millis(10);
 
-        detector.update(100.0, 0.0, 500.0);
+        detector.update(100.0, 500.0);
         std::thread::sleep(std::time::Duration::from_millis(15));
-        detector.update(100.0, 0.0, 500.0);
+        detector.update(100.0, 500.0);
         assert_eq!(detector.current_phase(), FlightPhase::Transition);
 
-        let changed = detector.update(200.0, 0.0, 1500.0);
+        let changed = detector.update(200.0, 1500.0);
         assert!(changed);
         assert_eq!(detector.current_phase(), FlightPhase::Cruise);
     }
@@ -489,13 +465,13 @@ mod tests {
         let mut detector = PhaseDetector::new(&config);
         detector.hysteresis_duration = std::time::Duration::from_millis(10);
 
-        detector.update(50.0, 0.0, 6000.0);
+        detector.update(50.0, 6000.0);
         std::thread::sleep(std::time::Duration::from_millis(15));
-        detector.update(50.0, 0.0, 6000.0);
+        detector.update(50.0, 6000.0);
         assert_eq!(detector.current_phase(), FlightPhase::Transition);
 
         std::thread::sleep(std::time::Duration::from_millis(60));
-        let changed = detector.update(80.0, 0.0, 6200.0);
+        let changed = detector.update(80.0, 6200.0);
         assert!(changed);
         assert_eq!(detector.current_phase(), FlightPhase::Cruise);
     }
@@ -505,16 +481,16 @@ mod tests {
         let mut detector = PhaseDetector::with_defaults();
         detector.hysteresis_duration = std::time::Duration::from_millis(10);
 
-        detector.update(100.0, 0.0, 500.0);
+        detector.update(100.0, 500.0);
         std::thread::sleep(std::time::Duration::from_millis(15));
-        detector.update(100.0, 0.0, 500.0);
+        detector.update(100.0, 500.0);
 
         assert_eq!(detector.current_phase(), FlightPhase::Transition);
         assert_ne!(detector.current_phase(), FlightPhase::Cruise);
     }
 
     #[test]
-    fn test_cruise_to_ground_sustained_15s() {
+    fn test_cruise_to_ground_sustained() {
         let config = AdaptivePrefetchConfig {
             landing_hysteresis: Duration::from_millis(50),
             ..Default::default()
@@ -522,9 +498,9 @@ mod tests {
         let mut detector = PhaseDetector::new(&config);
         detector.set_phase(FlightPhase::Cruise);
 
-        detector.update(10.0, 0.0, 500.0);
+        detector.update(10.0, 500.0);
         std::thread::sleep(std::time::Duration::from_millis(60));
-        let changed = detector.update(10.0, 0.0, 500.0);
+        let changed = detector.update(10.0, 500.0);
 
         assert!(changed);
         assert_eq!(detector.current_phase(), FlightPhase::Ground);
@@ -539,13 +515,13 @@ mod tests {
         let mut detector = PhaseDetector::new(&config);
         detector.hysteresis_duration = std::time::Duration::from_millis(10);
 
-        detector.update(50.0, 0.0, 1600.0);
+        detector.update(50.0, 1600.0);
         std::thread::sleep(std::time::Duration::from_millis(15));
-        detector.update(50.0, 0.0, 1600.0);
+        detector.update(50.0, 1600.0);
 
         assert_eq!(detector.current_phase(), FlightPhase::Transition);
 
-        let changed = detector.update(55.0, 0.0, 2700.0);
+        let changed = detector.update(55.0, 2700.0);
         assert!(changed);
         assert_eq!(detector.current_phase(), FlightPhase::Cruise);
     }

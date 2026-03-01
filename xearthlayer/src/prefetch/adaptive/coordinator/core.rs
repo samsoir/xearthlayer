@@ -294,7 +294,6 @@ impl AdaptivePrefetchCoordinator {
     /// * `position` - Aircraft position (lat, lon) in degrees
     /// * `track` - Ground track in degrees (0-360)
     /// * `ground_speed_kt` - Ground speed in knots
-    /// * `agl_ft` - Altitude above ground level in feet
     /// * `msl_ft` - Altitude above mean sea level in feet
     ///
     /// # Returns
@@ -305,7 +304,6 @@ impl AdaptivePrefetchCoordinator {
         position: (f64, f64),
         track: f64,
         ground_speed_kt: f32,
-        agl_ft: f32,
         msl_ft: f32,
     ) -> Option<PrefetchPlan> {
         // Check if enabled
@@ -325,7 +323,7 @@ impl AdaptivePrefetchCoordinator {
 
         // Update phase detector and notify transition throttle on phase change
         let previous_phase = self.phase_detector.current_phase();
-        let phase_changed = self.phase_detector.update(ground_speed_kt, agl_ft, msl_ft);
+        let phase_changed = self.phase_detector.update(ground_speed_kt, msl_ft);
         let phase = self.phase_detector.current_phase();
         self.status.phase = phase;
 
@@ -616,17 +614,13 @@ impl AdaptivePrefetchCoordinator {
         let track = extract_track(state);
         let position = (state.latitude, state.longitude);
 
-        // Note: We don't have true AGL from telemetry, only MSL altitude.
-        // Phase detection now uses ground speed as the primary indicator.
-        // Pass 0 for AGL so the phase detector uses ground speed only.
-        let agl_ft = 0.0;
         let msl_ft = state.altitude;
 
         // Always update shared status with current position to show TUI we're receiving telemetry
         // This fixes the bug where prefetch status stayed "Idle" when no plan was generated
         self.update_shared_status_position(position);
 
-        let mut plan = match self.update(position, track, state.ground_speed, agl_ft, msl_ft) {
+        let mut plan = match self.update(position, track, state.ground_speed, msl_ft) {
             Some(p) => p,
             None => {
                 // No plan generated - still update status with why (disabled, throttled, etc.)
@@ -957,7 +951,7 @@ mod tests {
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config);
 
-        let plan = coord.update((53.5, 9.5), 45.0, 100.0, 1000.0, 0.0);
+        let plan = coord.update((53.5, 9.5), 45.0, 100.0, 0.0);
         assert!(plan.is_none());
         assert!(!coord.status.enabled);
     }
@@ -970,7 +964,7 @@ mod tests {
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config);
 
-        let plan = coord.update((53.5, 9.5), 45.0, 100.0, 1000.0, 0.0);
+        let plan = coord.update((53.5, 9.5), 45.0, 100.0, 0.0);
         assert!(plan.is_none());
     }
 
@@ -980,7 +974,7 @@ mod tests {
             AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
 
         // Ground conditions: low speed, low AGL
-        let _plan = coord.update((53.5, 9.5), 45.0, 10.0, 5.0, 0.0);
+        let _plan = coord.update((53.5, 9.5), 45.0, 10.0, 0.0);
         assert_eq!(coord.status.phase, FlightPhase::Ground);
         assert_eq!(coord.status.active_strategy, "ground");
     }
@@ -991,7 +985,7 @@ mod tests {
             AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
 
         // Cruise conditions: high speed
-        coord.update((53.5, 9.5), 45.0, 200.0, 10000.0, 0.0);
+        coord.update((53.5, 9.5), 45.0, 200.0, 0.0);
         // Phase detector has hysteresis, so first update may not transition.
         // With three-phase model, Ground → Transition → Cruise.
         assert!(
@@ -1010,7 +1004,7 @@ mod tests {
         let mut coord =
             AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
 
-        coord.update((53.5, 9.5), 45.0, 200.0, 10000.0, 0.0);
+        coord.update((53.5, 9.5), 45.0, 200.0, 0.0);
         // Initially not stable
         assert_ne!(coord.status.turn_state, TurnState::Stable);
     }
@@ -1065,7 +1059,7 @@ mod tests {
             AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
 
         // Update to set state
-        coord.update((53.5, 9.5), 45.0, 200.0, 10000.0, 0.0);
+        coord.update((53.5, 9.5), 45.0, 200.0, 0.0);
         coord.mark_cached(vec![TileCoord {
             row: 100,
             col: 200,
@@ -1542,13 +1536,13 @@ mod tests {
         coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
 
         // Start on ground
-        coord.update((47.5, 10.5), 270.0, 10.0, 0.0, 0.0);
+        coord.update((47.5, 10.5), 270.0, 10.0, 0.0);
         assert!(!coord.transition_throttle.is_active());
 
         // Trigger cruise (high speed, wait for hysteresis)
-        coord.update((47.5, 10.5), 270.0, 100.0, 0.0, 0.0);
+        coord.update((47.5, 10.5), 270.0, 100.0, 0.0);
         std::thread::sleep(std::time::Duration::from_millis(5));
-        coord.update((47.5, 10.5), 270.0, 100.0, 0.0, 0.0);
+        coord.update((47.5, 10.5), 270.0, 100.0, 0.0);
 
         // Throttle should now be active (grace period)
         assert!(coord.transition_throttle.is_active());
@@ -1561,15 +1555,15 @@ mod tests {
         coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
 
         // Transition to cruise
-        coord.update((47.5, 10.5), 270.0, 100.0, 0.0, 0.0);
+        coord.update((47.5, 10.5), 270.0, 100.0, 0.0);
         std::thread::sleep(std::time::Duration::from_millis(5));
-        coord.update((47.5, 10.5), 270.0, 100.0, 0.0, 0.0);
+        coord.update((47.5, 10.5), 270.0, 100.0, 0.0);
         assert!(coord.transition_throttle.is_active());
 
         // Transition back to ground
-        coord.update((47.5, 10.5), 270.0, 10.0, 0.0, 0.0);
+        coord.update((47.5, 10.5), 270.0, 10.0, 0.0);
         std::thread::sleep(std::time::Duration::from_millis(5));
-        coord.update((47.5, 10.5), 270.0, 10.0, 0.0, 0.0);
+        coord.update((47.5, 10.5), 270.0, 10.0, 0.0);
         assert!(!coord.transition_throttle.is_active());
     }
 }

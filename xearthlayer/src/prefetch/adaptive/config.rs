@@ -97,15 +97,8 @@ pub struct AdaptivePrefetchConfig {
 
     /// Ground speed threshold for ground vs cruise detection (knots).
     ///
-    /// Aircraft with ground speed below this AND AGL below `agl_threshold_ft`
-    /// are considered on the ground.
+    /// Aircraft with ground speed below this are considered on the ground.
     pub ground_speed_threshold_kt: f32,
-
-    /// AGL threshold for ground vs cruise detection (feet).
-    ///
-    /// Aircraft with AGL below this AND ground speed below `ground_speed_threshold_kt`
-    /// are considered on the ground.
-    pub agl_threshold_ft: f32,
 
     /// Track stability threshold (degrees).
     ///
@@ -151,7 +144,6 @@ impl Default for AdaptivePrefetchConfig {
             time_budget_margin: 0.7,
             calibration: CalibrationConfig::default(),
             ground_speed_threshold_kt: 40.0,
-            agl_threshold_ft: 20.0,
             track_stability_threshold: 5.0,
             turn_threshold: 15.0,
             track_stability_duration: Duration::from_secs(10),
@@ -463,8 +455,6 @@ mod tests {
         let config = AdaptivePrefetchConfig::default();
         // Ground speed threshold (40kt is reasonable for taxi)
         assert_eq!(config.ground_speed_threshold_kt, 40.0);
-        // AGL threshold (20ft catches all ground operations)
-        assert_eq!(config.agl_threshold_ft, 20.0);
     }
 
     #[test]

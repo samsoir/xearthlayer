@@ -91,12 +91,12 @@ The `PhaseDetector` gains:
 
 3. **Climb-based release**: Checks MSL delta on each update while in Transition.
 
-4. **Extended method signature**: `update()` gains an `msl_ft` parameter.
+4. **Simplified method signature**: `update()` takes ground speed and MSL only (AGL removed — not available from telemetry).
 
 **Updated `update()` signature:**
 
 ```rust
-pub fn update(&mut self, ground_speed_kt: f32, agl_ft: f32, msl_ft: f32) -> bool
+pub fn update(&mut self, ground_speed_kt: f32, msl_ft: f32) -> bool
 ```
 
 **Transition→Cruise release logic:**
@@ -160,13 +160,11 @@ Changes to `process_telemetry()`:
 
 ```rust
 // Current:
-let agl_ft = 0.0;
 let phase_changed = self.phase_detector.update(ground_speed_kt, agl_ft);
 
 // New:
 let msl_ft = state.altitude; // MSL from XGPS2/ForeFlight telemetry
-let agl_ft = 0.0;            // Still no AGL data available
-let phase_changed = self.phase_detector.update(ground_speed_kt, agl_ft, msl_ft);
+let phase_changed = self.phase_detector.update(ground_speed_kt, msl_ft);
 ```
 
 The rest of the coordinator logic (strategy selection, throttle application, backpressure) remains the same. The three-phase model naturally slots into the existing `match phase {}` arms with `Transition` returning `None` (no prefetch plan).
