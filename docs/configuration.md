@@ -338,6 +338,11 @@ The system uses flight phase detection and performance calibration:
 | `calibration_aggressive_threshold` | float | `30.0` | Tiles/sec threshold for aggressive mode |
 | `calibration_opportunistic_threshold` | float | `10.0` | Tiles/sec threshold for opportunistic mode |
 | `calibration_sample_duration` | integer | `60` | Duration (secs) to measure throughput during calibration |
+| `takeoff_climb_ft` | float | `1000` | Altitude climb (ft) above takeoff MSL to release transition hold (200-5000) |
+| `takeoff_timeout_secs` | integer | `90` | Maximum seconds before timeout release (30-300) |
+| `landing_hysteresis_secs` | integer | `15` | Sustained seconds at GS < 40kt before landing detection (5-60) |
+| `ramp_duration_secs` | integer | `30` | Duration of linear ramp to full prefetch rate (10-120) |
+| `ramp_start_fraction` | float | `0.25` | Starting prefetch fraction when ramp begins (0.1-0.5) |
 
 **Mode Options:**
 
@@ -377,7 +382,24 @@ circuit_breaker_half_open_secs = 2    ; Cooloff before resuming
 calibration_aggressive_threshold = 30.0      ; Above = aggressive mode
 calibration_opportunistic_threshold = 10.0   ; Above = opportunistic, below = disabled
 calibration_sample_duration = 60             ; Calibration period (seconds)
+
+; Transition ramp (takeoff phase management)
+takeoff_climb_ft = 1000                      ; Feet above takeoff MSL to release hold
+takeoff_timeout_secs = 90                    ; Max seconds before timeout release
+landing_hysteresis_secs = 15                 ; Sustained GS < 40kt for landing detection
+ramp_duration_secs = 30                      ; Linear ramp duration after hold release
+ramp_start_fraction = 0.25                   ; Starting prefetch fraction (25%)
 ```
+
+**Transition Ramp:**
+
+The prefetch system uses a three-phase flight model to manage system resources during critical flight phases:
+
+- **Ground** (GS < 40kt): Full-rate prefetch using ring strategy around current position
+- **Transition** (GS >= 40kt, climbing): Prefetch fully suppressed while X-Plane loads takeoff scenery
+- **Cruise** (climb confirmed): Prefetch ramps from `ramp_start_fraction` to full rate over `ramp_duration_secs`
+
+The transition hold releases when the aircraft climbs `takeoff_climb_ft` feet above the MSL altitude recorded at takeoff, or when `takeoff_timeout_secs` elapses (whichever comes first). This adapts to all aircraft types: a jet releases in ~25s, a slow GA aircraft may use the full timeout.
 
 **X-Plane Setup:**
 To enable prefetching, configure X-Plane to send ForeFlight telemetry:
@@ -624,6 +646,13 @@ mode = auto                    ; auto, aggressive, opportunistic, disabled
 ; calibration_opportunistic_threshold = 10.0 ; above = opportunistic, below = disabled
 ; calibration_sample_duration = 60           ; calibration period (seconds)
 
+; Transition ramp (takeoff phase management)
+; takeoff_climb_ft = 1000                    ; feet above takeoff MSL to release
+; takeoff_timeout_secs = 90                  ; max seconds before timeout release
+; landing_hysteresis_secs = 15               ; sustained GS < 40kt for landing
+; ramp_duration_secs = 30                    ; linear ramp duration after release
+; ramp_start_fraction = 0.25                 ; starting prefetch fraction
+
 [prewarm]
 ; Cold-start cache pre-warming (use with --airport ICAO)
 ; radius_nm = 100              ; Pre-warm radius (100nm covers standard DSF loading)
@@ -766,6 +795,11 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `prefetch.calibration_aggressive_threshold` | positive number | Tiles/sec for aggressive mode |
 | `prefetch.calibration_opportunistic_threshold` | positive number | Tiles/sec for opportunistic mode |
 | `prefetch.calibration_sample_duration` | positive integer | Calibration period (seconds) |
+| `prefetch.takeoff_climb_ft` | 200-5000 | Feet above takeoff MSL to release hold |
+| `prefetch.takeoff_timeout_secs` | 30-300 | Max seconds before timeout release |
+| `prefetch.landing_hysteresis_secs` | 5-60 | Sustained GS < 40kt for landing detection |
+| `prefetch.ramp_duration_secs` | 10-120 | Linear ramp duration (seconds) |
+| `prefetch.ramp_start_fraction` | 0.1-0.5 | Starting prefetch fraction |
 | `prewarm.radius_nm` | positive number | Pre-warm radius around airport (nm) |
 | `xplane.scenery_dir` | path | X-Plane Custom Scenery directory |
 | `packages.library_url` | URL | Package library index URL |
