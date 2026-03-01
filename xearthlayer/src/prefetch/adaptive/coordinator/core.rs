@@ -165,10 +165,8 @@ impl AdaptivePrefetchCoordinator {
     pub fn new(config: AdaptivePrefetchConfig) -> Self {
         let phase_detector = PhaseDetector::new(&config);
         let turn_detector = TurnDetector::new(&config);
-        let transition_throttle = TransitionThrottle::with_config(
-            config.ramp_duration,
-            config.ramp_start_fraction,
-        );
+        let transition_throttle =
+            TransitionThrottle::with_config(config.ramp_duration, config.ramp_start_fraction);
         let ground_strategy = GroundStrategy::new(&config);
         let cruise_strategy = CruiseStrategy::new(&config);
 

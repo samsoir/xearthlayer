@@ -175,15 +175,15 @@ mod tests {
 
     #[test]
     fn test_cruise_after_transition_starts_ramp() {
-        let mut throttle = TransitionThrottle::with_config(
-            Duration::from_secs(30),
-            0.25,
-        );
+        let mut throttle = TransitionThrottle::with_config(Duration::from_secs(30), 0.25);
         throttle.on_phase_change(FlightPhase::Ground, FlightPhase::Transition);
         throttle.on_phase_change(FlightPhase::Transition, FlightPhase::Cruise);
 
         let frac = throttle.fraction();
-        assert!(frac >= 0.25 && frac < 0.35, "Expected ~0.25 at ramp start, got {frac}");
+        assert!(
+            frac >= 0.25 && frac < 0.35,
+            "Expected ~0.25 at ramp start, got {frac}"
+        );
         assert!(throttle.is_active());
     }
 
@@ -198,10 +198,7 @@ mod tests {
 
     #[test]
     fn test_ramp_completes_to_full() {
-        let mut throttle = TransitionThrottle::with_config(
-            Duration::from_millis(50),
-            0.25,
-        );
+        let mut throttle = TransitionThrottle::with_config(Duration::from_millis(50), 0.25);
         throttle.on_phase_change(FlightPhase::Ground, FlightPhase::Transition);
         throttle.on_phase_change(FlightPhase::Transition, FlightPhase::Cruise);
 
@@ -212,10 +209,7 @@ mod tests {
 
     #[test]
     fn test_ramp_resets_on_re_transition() {
-        let mut throttle = TransitionThrottle::with_config(
-            Duration::from_millis(100),
-            0.25,
-        );
+        let mut throttle = TransitionThrottle::with_config(Duration::from_millis(100), 0.25);
 
         // First cycle: Transition → Cruise (start ramp)
         throttle.on_phase_change(FlightPhase::Ground, FlightPhase::Transition);
@@ -233,15 +227,15 @@ mod tests {
 
         throttle.on_phase_change(FlightPhase::Transition, FlightPhase::Cruise);
         let restart = throttle.fraction();
-        assert!(restart >= 0.25 && restart < 0.35, "Ramp should restart from 0.25, got {restart}");
+        assert!(
+            restart >= 0.25 && restart < 0.35,
+            "Ramp should restart from 0.25, got {restart}"
+        );
     }
 
     #[test]
     fn test_ramp_linear_at_midpoint() {
-        let mut throttle = TransitionThrottle::with_config(
-            Duration::from_millis(100),
-            0.25,
-        );
+        let mut throttle = TransitionThrottle::with_config(Duration::from_millis(100), 0.25);
         throttle.on_phase_change(FlightPhase::Ground, FlightPhase::Transition);
         throttle.on_phase_change(FlightPhase::Transition, FlightPhase::Cruise);
 
@@ -273,10 +267,7 @@ mod tests {
 
     #[test]
     fn test_cruise_to_ground_during_ramp_resets() {
-        let mut throttle = TransitionThrottle::with_config(
-            Duration::from_millis(100),
-            0.25,
-        );
+        let mut throttle = TransitionThrottle::with_config(Duration::from_millis(100), 0.25);
         throttle.on_phase_change(FlightPhase::Ground, FlightPhase::Transition);
         throttle.on_phase_change(FlightPhase::Transition, FlightPhase::Cruise);
         assert!(throttle.is_active());

@@ -421,9 +421,7 @@ impl ConfigKey {
                 config.prefetch.landing_hysteresis_secs.to_string()
             }
             ConfigKey::PrefetchRampDurationSecs => config.prefetch.ramp_duration_secs.to_string(),
-            ConfigKey::PrefetchRampStartFraction => {
-                config.prefetch.ramp_start_fraction.to_string()
-            }
+            ConfigKey::PrefetchRampStartFraction => config.prefetch.ramp_start_fraction.to_string(),
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs.to_string()
             }
