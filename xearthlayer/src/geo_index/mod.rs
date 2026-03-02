@@ -43,5 +43,5 @@ mod layers;
 mod region;
 
 pub use index::GeoIndex;
-pub use layers::{GeoLayer, PatchCoverage};
+pub use layers::{GeoLayer, PatchCoverage, PrefetchedRegion, RegionState};
 pub use region::DsfRegion;
