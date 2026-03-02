@@ -49,9 +49,36 @@ pub struct PatchCoverage {
 
 impl GeoLayer for PatchCoverage {}
 
+/// Marks a DSF region as retained by X-Plane (inferred from SceneTracker
+/// observations and the sliding window + buffer model).
+///
+/// Inserted/removed by `SceneryWindow` each coordinator cycle.
+#[derive(Debug, Clone, Copy)]
+pub struct RetainedRegion;
+
+impl GeoLayer for RetainedRegion {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geo_index::{DsfRegion, GeoIndex};
+
+    #[test]
+    fn test_retained_region_is_geo_layer() {
+        let index = GeoIndex::new();
+        let region = DsfRegion::new(50, 9);
+        index.insert::<RetainedRegion>(region, RetainedRegion);
+        assert!(index.contains::<RetainedRegion>(&region));
+    }
+
+    #[test]
+    fn test_retained_region_removal() {
+        let index = GeoIndex::new();
+        let region = DsfRegion::new(50, 9);
+        index.insert::<RetainedRegion>(region, RetainedRegion);
+        index.remove::<RetainedRegion>(&region);
+        assert!(!index.contains::<RetainedRegion>(&region));
+    }
 
     #[test]
     fn test_patch_coverage_clone() {
