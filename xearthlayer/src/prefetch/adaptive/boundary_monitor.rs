@@ -25,6 +25,8 @@ pub struct BoundaryCrossing {
     pub urgency: f64,
     /// How many DSF tiles deep to load (typically 3).
     pub depth: u8,
+    /// Expansion direction for depth: +1 (north/east) or -1 (south/west).
+    pub direction: i8,
 }
 
 /// Default load depth matching X-Plane's observed 3-deep strip loading.
@@ -93,6 +95,7 @@ impl BoundaryMonitor {
                 dsf_coord,
                 urgency: urgency.clamp(0.0, 1.0),
                 depth: self.load_depth,
+                direction: 1,
             });
         }
 
@@ -105,6 +108,7 @@ impl BoundaryMonitor {
                 dsf_coord,
                 urgency: urgency.clamp(0.0, 1.0),
                 depth: self.load_depth,
+                direction: -1,
             });
         }
 

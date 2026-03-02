@@ -42,6 +42,7 @@
 //! ├── strategy.rs             # AdaptivePrefetchStrategy trait
 //! ├── band_calculator.rs      # DSF-aligned band geometry
 //! ├── boundary_prioritizer.rs # DSF boundary-aware tile ordering (#58)
+//! ├── boundary_strategy.rs    # Boundary crossing → DSF region generation (#58)
 //! ├── cruise_strategy.rs      # Cruise flight prefetch
 //! ├── ground_strategy.rs      # Ground operations prefetch
 //! ├── phase_detector.rs       # Ground/cruise detection
@@ -78,6 +79,7 @@
 mod band_calculator;
 mod boundary_monitor;
 mod boundary_prioritizer;
+mod boundary_strategy;
 mod calibration;
 mod config;
 mod coordinator;
@@ -93,6 +95,7 @@ mod turn_detector;
 pub use band_calculator::{BandCalculator, DsfTileCoord};
 pub use boundary_monitor::{BoundaryAxis, BoundaryCrossing, BoundaryMonitor};
 pub use boundary_prioritizer::prioritize as prioritize_by_boundary;
+pub use boundary_strategy::{BoundaryStrategy, TargetRegion};
 pub use calibration::{
     create_throughput_observer, create_throughput_observer_with_config, PerformanceCalibration,
     PerformanceCalibrator, RecalibrationResult, RollingCalibrator, SharedThroughputObserver,
