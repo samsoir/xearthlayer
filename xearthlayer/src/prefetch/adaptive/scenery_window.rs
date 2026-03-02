@@ -21,6 +21,7 @@
 
 use tracing::debug;
 
+use super::boundary_monitor::{BoundaryAxis, BoundaryCrossing, BoundaryMonitor};
 use crate::scene_tracker::SceneTracker;
 
 /// Configuration for the SceneryWindow.
@@ -73,12 +74,17 @@ pub enum WindowState {
 /// Central model that derives X-Plane's scenery loading window.
 ///
 /// Observes the `SceneTracker` to determine window dimensions, then
-/// provides boundary crossing predictions via dual monitors (integrated
-/// in later tasks).
+/// provides boundary crossing predictions via dual `BoundaryMonitor`s
+/// (one per axis). Monitors are initialized when the window enters
+/// `Ready` state (from real bounds) or lazily on first position check
+/// when in `Assumed` state.
 pub struct SceneryWindow {
     state: WindowState,
     window_size: Option<(usize, usize)>,
     config: SceneryWindowConfig,
+    lat_monitor: Option<BoundaryMonitor>,
+    lon_monitor: Option<BoundaryMonitor>,
+    last_bounds: Option<(f64, f64, f64, f64)>,
 }
 
 impl SceneryWindow {
@@ -88,6 +94,9 @@ impl SceneryWindow {
             state: WindowState::Uninitialized,
             window_size: None,
             config,
+            lat_monitor: None,
+            lon_monitor: None,
+            last_bounds: None,
         }
     }
 
@@ -137,6 +146,7 @@ impl SceneryWindow {
                         debug!(rows, cols, "scenery window: bounds stable, ready");
                         self.state = WindowState::Ready;
                         self.window_size = Some((rows, cols));
+                        self.init_monitors_from_bounds(&bounds);
                     } else {
                         self.state = WindowState::Measuring {
                             last_rows: rows,
@@ -184,11 +194,117 @@ impl SceneryWindow {
     pub fn config(&self) -> &SceneryWindowConfig {
         &self.config
     }
+
+    /// Check aircraft position against window boundaries.
+    ///
+    /// Returns boundary crossing predictions sorted by urgency (most urgent first).
+    /// Returns empty if the window is not in `Ready` or `Assumed` state.
+    ///
+    /// For `Assumed` state, monitors are lazily initialized on the first call
+    /// using default dimensions centered on the provided position.
+    pub fn check_boundaries(&mut self, lat: f64, lon: f64) -> Vec<BoundaryCrossing> {
+        if !self.is_ready() {
+            return Vec::new();
+        }
+
+        // Lazy initialization for Assumed state (no real bounds available yet).
+        if self.lat_monitor.is_none() {
+            if let Some((rows, cols)) = self.window_size {
+                let half_rows = rows as f64 / 2.0;
+                let half_cols = cols as f64 / 2.0;
+                self.lat_monitor = Some(
+                    BoundaryMonitor::new(
+                        BoundaryAxis::Latitude,
+                        lat - half_rows,
+                        lat + half_rows,
+                        self.config.trigger_distance,
+                    )
+                    .with_load_depth(self.config.load_depth),
+                );
+                self.lon_monitor = Some(
+                    BoundaryMonitor::new(
+                        BoundaryAxis::Longitude,
+                        lon - half_cols,
+                        lon + half_cols,
+                        self.config.trigger_distance,
+                    )
+                    .with_load_depth(self.config.load_depth),
+                );
+                self.last_bounds = Some((
+                    lat - half_rows,
+                    lat + half_rows,
+                    lon - half_cols,
+                    lon + half_cols,
+                ));
+                debug!(
+                    lat,
+                    lon,
+                    rows,
+                    cols,
+                    "scenery window: lazy-initialized monitors for assumed state"
+                );
+            }
+        }
+
+        let mut predictions = Vec::new();
+
+        if let Some(ref monitor) = self.lat_monitor {
+            predictions.extend(monitor.check(lat));
+        }
+        if let Some(ref monitor) = self.lon_monitor {
+            predictions.extend(monitor.check(lon));
+        }
+
+        // Sort by urgency descending (most urgent first).
+        predictions.sort_by(|a, b| {
+            b.urgency
+                .partial_cmp(&a.urgency)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        predictions
+    }
+
+    /// Initialize boundary monitors from real geographic bounds.
+    fn init_monitors_from_bounds(&mut self, bounds: &crate::scene_tracker::GeoBounds) {
+        self.lat_monitor = Some(
+            BoundaryMonitor::new(
+                BoundaryAxis::Latitude,
+                bounds.min_lat,
+                bounds.max_lat,
+                self.config.trigger_distance,
+            )
+            .with_load_depth(self.config.load_depth),
+        );
+        self.lon_monitor = Some(
+            BoundaryMonitor::new(
+                BoundaryAxis::Longitude,
+                bounds.min_lon,
+                bounds.max_lon,
+                self.config.trigger_distance,
+            )
+            .with_load_depth(self.config.load_depth),
+        );
+        self.last_bounds = Some((
+            bounds.min_lat,
+            bounds.max_lat,
+            bounds.min_lon,
+            bounds.max_lon,
+        ));
+        debug!(
+            min_lat = bounds.min_lat,
+            max_lat = bounds.max_lat,
+            min_lon = bounds.min_lon,
+            max_lon = bounds.max_lon,
+            "scenery window: boundary monitors initialized"
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prefetch::adaptive::boundary_monitor::BoundaryAxis;
     use crate::scene_tracker::{DdsTileCoord, GeoBounds, GeoRegion, SceneTracker};
     use std::collections::HashSet;
 
@@ -346,5 +462,90 @@ mod tests {
         assert_eq!(config.default_rows, 6);
         assert_eq!(config.default_cols, 8);
         assert_eq!(config.buffer, 1);
+    }
+
+    #[test]
+    fn test_check_boundaries_returns_predictions_when_near_edge() {
+        let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
+
+        let mut window = SceneryWindow::new(SceneryWindowConfig::default());
+        window.update_from_tracker(tracker.as_ref()); // → Measuring
+        window.update_from_tracker(tracker.as_ref()); // → Ready
+
+        // Aircraft near north edge (52.0 is 1.0° from 53.0 max lat)
+        let predictions = window.check_boundaries(52.0, 7.0);
+        assert_eq!(predictions.len(), 1);
+        assert_eq!(predictions[0].axis, BoundaryAxis::Latitude);
+        assert_eq!(predictions[0].dsf_coord, 53);
+    }
+
+    #[test]
+    fn test_check_boundaries_returns_empty_when_centered() {
+        let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
+
+        let mut window = SceneryWindow::new(SceneryWindowConfig::default());
+        window.update_from_tracker(tracker.as_ref());
+        window.update_from_tracker(tracker.as_ref());
+
+        // Aircraft in the middle — far from all edges
+        let predictions = window.check_boundaries(50.0, 7.0);
+        assert!(predictions.is_empty());
+    }
+
+    #[test]
+    fn test_check_boundaries_both_axes() {
+        let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
+
+        let mut window = SceneryWindow::new(SceneryWindowConfig::default());
+        window.update_from_tracker(tracker.as_ref());
+        window.update_from_tracker(tracker.as_ref());
+
+        // Aircraft near both north and east edges
+        let predictions = window.check_boundaries(52.0, 10.0);
+        assert_eq!(predictions.len(), 2);
+        // Should be sorted by urgency descending
+        assert!(predictions[0].urgency >= predictions[1].urgency);
+    }
+
+    #[test]
+    fn test_check_boundaries_sorted_by_urgency_descending() {
+        let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
+
+        let mut window = SceneryWindow::new(SceneryWindowConfig::default());
+        window.update_from_tracker(tracker.as_ref());
+        window.update_from_tracker(tracker.as_ref());
+
+        // Closer to east (0.5° away) than north (1.0° away)
+        let predictions = window.check_boundaries(52.0, 10.5);
+        assert!(predictions.len() >= 2);
+        // Most urgent first
+        for i in 1..predictions.len() {
+            assert!(predictions[i - 1].urgency >= predictions[i].urgency);
+        }
+    }
+
+    #[test]
+    fn test_check_boundaries_empty_before_ready() {
+        let mut window = SceneryWindow::new(SceneryWindowConfig::default());
+        // Uninitialized — should return empty
+        let predictions = window.check_boundaries(50.0, 7.0);
+        assert!(predictions.is_empty());
+    }
+
+    #[test]
+    fn test_check_boundaries_works_in_assumed_state() {
+        let mut window = SceneryWindow::new(SceneryWindowConfig::default());
+        window.set_assumed_dimensions(6, 8);
+        // Assumed state should allow boundary checks
+        // But we need edges set — assumed state should initialize monitors
+        // with default edges centered on... well, we haven't given a position yet.
+        // In assumed state, monitors should be initialized when first position is given.
+        // For now, check_boundaries on assumed state without prior position → empty
+        // This test verifies that assumed state doesn't panic
+        let _predictions = window.check_boundaries(50.0, 7.0);
     }
 }
