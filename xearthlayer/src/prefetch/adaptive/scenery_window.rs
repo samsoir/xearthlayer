@@ -22,6 +22,7 @@
 use tracing::debug;
 
 use super::boundary_monitor::{BoundaryAxis, BoundaryCrossing, BoundaryMonitor};
+use crate::geo_index::{DsfRegion, RetainedRegion};
 use crate::scene_tracker::SceneTracker;
 
 /// Configuration for the SceneryWindow.
@@ -263,6 +264,55 @@ impl SceneryWindow {
         });
 
         predictions
+    }
+
+    /// Update the retained regions in the GeoIndex based on the current window position.
+    ///
+    /// Computes the retained area as window + buffer centered on the aircraft,
+    /// then adds/removes `RetainedRegion` entries. All changes logged at DEBUG.
+    pub fn update_retention(&self, lat: f64, lon: f64, geo_index: &crate::geo_index::GeoIndex) {
+        if !self.is_ready() {
+            return;
+        }
+
+        let (rows, cols) = match self.window_size {
+            Some(size) => size,
+            None => return,
+        };
+
+        let buffer = self.config.buffer as i32;
+        let half_rows = (rows as i32) / 2;
+        let half_cols = (cols as i32) / 2;
+
+        let center_lat = lat.floor() as i32;
+        let center_lon = lon.floor() as i32;
+
+        let min_lat = center_lat - half_rows - buffer;
+        let max_lat = center_lat + half_rows + buffer;
+        let min_lon = center_lon - half_cols - buffer;
+        let max_lon = center_lon + half_cols + buffer;
+
+        // Add all regions in the retained area
+        for lat_i in min_lat..=max_lat {
+            for lon_i in min_lon..=max_lon {
+                let region = DsfRegion::new(lat_i, lon_i);
+                if !geo_index.contains::<RetainedRegion>(&region) {
+                    debug!(lat = lat_i, lon = lon_i, "retention: adding region");
+                    geo_index.insert::<RetainedRegion>(region, RetainedRegion);
+                }
+            }
+        }
+
+        // Evict regions outside the retained area
+        let retained_regions = geo_index.regions::<RetainedRegion>();
+        for region in retained_regions {
+            let r_lat = region.lat;
+            let r_lon = region.lon;
+            if r_lat < min_lat || r_lat > max_lat || r_lon < min_lon || r_lon > max_lon {
+                debug!(lat = r_lat, lon = r_lon, "retention: evicting region");
+                geo_index.remove::<RetainedRegion>(&region);
+            }
+        }
     }
 
     /// Initialize boundary monitors from real geographic bounds.
@@ -534,6 +584,96 @@ mod tests {
         // Uninitialized — should return empty
         let predictions = window.check_boundaries(50.0, 7.0);
         assert!(predictions.is_empty());
+    }
+
+    #[test]
+    fn test_retention_adds_regions_within_window_plus_buffer() {
+        use crate::geo_index::{DsfRegion, GeoIndex, RetainedRegion};
+
+        let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0)); // 6×8 window
+
+        let mut window = SceneryWindow::new(SceneryWindowConfig::default()); // buffer=1
+        window.update_from_tracker(tracker.as_ref()); // → Measuring
+        window.update_from_tracker(tracker.as_ref()); // → Ready, size=(6,8)
+
+        let geo_index = GeoIndex::new();
+        window.update_retention(50.0, 7.0, &geo_index);
+
+        // Window: 6 rows × 8 cols centered on (50.0, 7.0)
+        // Half-window: 3 lat, 4 lon
+        // Retained area: lat (50-3-1)..(50+3+1) = 46..54, lon (7-4-1)..(7+4+1) = 2..12
+        // That's 8 lat × 10 lon = 80 regions
+        let count = geo_index.count::<RetainedRegion>();
+        assert!(count > 0, "should have retained regions");
+
+        // Check a region that should be in the retained area
+        assert!(geo_index.contains::<RetainedRegion>(&DsfRegion::new(50, 7)));
+        // Check edges
+        assert!(geo_index.contains::<RetainedRegion>(&DsfRegion::new(46, 2)));
+        assert!(geo_index.contains::<RetainedRegion>(&DsfRegion::new(53, 11)));
+    }
+
+    #[test]
+    fn test_retention_evicts_regions_outside_buffer() {
+        use crate::geo_index::{DsfRegion, GeoIndex, RetainedRegion};
+
+        let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
+
+        let mut window = SceneryWindow::new(SceneryWindowConfig::default());
+        window.update_from_tracker(tracker.as_ref());
+        window.update_from_tracker(tracker.as_ref());
+
+        let geo_index = GeoIndex::new();
+
+        // Pre-insert a region far from the aircraft
+        let far_region = DsfRegion::new(40, 0);
+        geo_index.insert::<RetainedRegion>(far_region, RetainedRegion);
+
+        window.update_retention(50.0, 7.0, &geo_index);
+
+        // Far region should be evicted
+        assert!(!geo_index.contains::<RetainedRegion>(&far_region));
+    }
+
+    #[test]
+    fn test_retention_preserves_regions_inside_buffer() {
+        use crate::geo_index::{DsfRegion, GeoIndex, RetainedRegion};
+
+        let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
+
+        let mut window = SceneryWindow::new(SceneryWindowConfig::default());
+        window.update_from_tracker(tracker.as_ref());
+        window.update_from_tracker(tracker.as_ref());
+
+        let geo_index = GeoIndex::new();
+
+        // Pre-insert a region at the edge of the buffer
+        let edge_region = DsfRegion::new(46, 2); // Should be inside retained area
+        geo_index.insert::<RetainedRegion>(edge_region, RetainedRegion);
+
+        window.update_retention(50.0, 7.0, &geo_index);
+
+        // Edge region should still be there
+        assert!(geo_index.contains::<RetainedRegion>(&edge_region));
+    }
+
+    #[test]
+    fn test_retention_noop_when_not_ready() {
+        use crate::geo_index::{DsfRegion, GeoIndex, RetainedRegion};
+
+        let window = SceneryWindow::new(SceneryWindowConfig::default());
+        let geo_index = GeoIndex::new();
+
+        // Pre-insert a region
+        geo_index.insert::<RetainedRegion>(DsfRegion::new(50, 7), RetainedRegion);
+
+        window.update_retention(50.0, 7.0, &geo_index);
+
+        // Should not evict anything — window not ready
+        assert!(geo_index.contains::<RetainedRegion>(&DsfRegion::new(50, 7)));
     }
 
     #[test]
