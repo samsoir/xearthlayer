@@ -207,6 +207,21 @@ ramp_duration_secs = {}
 ; Starting prefetch fraction when ramp begins (default: 0.25, range: 0.1-0.5)
 ramp_start_fraction = {}
 
+; Boundary-driven prefetch settings
+; Boundary trigger distance in degrees (default: 1.5, range: 0.5-3.0)
+; How close to a DSF boundary to trigger prefetch
+trigger_distance = {}
+; DSF tiles deep per crossing (default: 3, range: 1-5)
+load_depth = {}
+; Buffer tiles for retention beyond visible window (default: 1, range: 0-3)
+window_buffer = {}
+; InProgress staleness timeout in seconds (default: 120, range: 30-600)
+stale_region_timeout = {}
+; Assumed window height in DSF tiles (default: 6, range: 3-12)
+default_window_rows = {}
+; Assumed window width in DSF tiles (default: 8, range: 4-16)
+default_window_cols = {}
+
 [control_plane]
 ; Advanced settings for job management and health monitoring.
 ; Defaults are tuned for most systems. Only modify if you understand the implications.
@@ -309,6 +324,12 @@ max_stale_secs = {}
         config.prefetch.landing_hysteresis_secs,
         config.prefetch.ramp_duration_secs,
         config.prefetch.ramp_start_fraction,
+        config.prefetch.trigger_distance,
+        config.prefetch.load_depth,
+        config.prefetch.window_buffer,
+        config.prefetch.stale_region_timeout,
+        config.prefetch.default_window_rows,
+        config.prefetch.default_window_cols,
         config.control_plane.max_concurrent_jobs,
         config.control_plane.stall_threshold_secs,
         config.control_plane.health_check_interval_secs,

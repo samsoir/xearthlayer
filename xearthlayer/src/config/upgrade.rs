@@ -82,6 +82,14 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "prefetch.outer_radius_nm",
     // Removed in #59 - circuit breaker now uses resource pool utilization, not FUSE rate
     "prefetch.circuit_breaker_threshold",
+    // Removed in #58 - boundary-driven prefetch replaces band-based cruise strategy
+    "prefetch.trigger_position",
+    "prefetch.lead_distance",
+    "prefetch.band_width",
+    "prefetch.track_stability_threshold",
+    "prefetch.turn_threshold",
+    "prefetch.track_stability_duration",
+    "prefetch.time_budget_margin",
 ];
 
 /// Result of analyzing a configuration file for upgrade needs.
@@ -552,6 +560,17 @@ type = bing
         let summary = analysis.summary();
         assert!(summary.contains("2 new setting(s)"));
         assert!(summary.contains("1 deprecated setting(s)"));
+    }
+
+    #[test]
+    fn test_deprecated_boundary_prefetch_keys() {
+        assert!(DEPRECATED_KEYS.contains(&"prefetch.trigger_position"));
+        assert!(DEPRECATED_KEYS.contains(&"prefetch.lead_distance"));
+        assert!(DEPRECATED_KEYS.contains(&"prefetch.band_width"));
+        assert!(DEPRECATED_KEYS.contains(&"prefetch.track_stability_threshold"));
+        assert!(DEPRECATED_KEYS.contains(&"prefetch.turn_threshold"));
+        assert!(DEPRECATED_KEYS.contains(&"prefetch.track_stability_duration"));
+        assert!(DEPRECATED_KEYS.contains(&"prefetch.time_budget_margin"));
     }
 
     #[test]

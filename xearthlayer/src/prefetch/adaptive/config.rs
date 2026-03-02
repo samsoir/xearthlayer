@@ -128,6 +128,43 @@ pub struct AdaptivePrefetchConfig {
 
     /// Starting prefetch fraction when ramp begins.
     pub ramp_start_fraction: f64,
+
+    // Boundary-driven prefetch settings
+
+    /// Boundary trigger distance in degrees.
+    ///
+    /// How close to a DSF boundary the aircraft must be to trigger prefetch.
+    /// Range: 0.5 - 3.0
+    pub trigger_distance: f64,
+
+    /// DSF tiles deep per crossing.
+    ///
+    /// How many DSF tiles deep to prefetch when crossing a boundary.
+    /// Range: 1 - 5
+    pub load_depth: u8,
+
+    /// Buffer tiles for retention.
+    ///
+    /// Extra tiles to retain beyond the visible window.
+    /// Range: 0 - 3
+    pub window_buffer: u8,
+
+    /// InProgress staleness timeout.
+    ///
+    /// How long a region can stay InProgress before being considered stale.
+    pub stale_region_timeout: Duration,
+
+    /// Assumed window height in DSF tiles.
+    ///
+    /// Used when the actual window size is unknown.
+    /// Range: 3 - 12
+    pub default_window_rows: usize,
+
+    /// Assumed window width in DSF tiles.
+    ///
+    /// Used when the actual window size is unknown.
+    /// Range: 4 - 16
+    pub default_window_cols: usize,
 }
 
 impl Default for AdaptivePrefetchConfig {
@@ -152,6 +189,12 @@ impl Default for AdaptivePrefetchConfig {
             landing_hysteresis: Duration::from_secs(15),
             ramp_duration: Duration::from_secs(30),
             ramp_start_fraction: 0.25,
+            trigger_distance: 1.5,
+            load_depth: 3,
+            window_buffer: 1,
+            stale_region_timeout: Duration::from_secs(120),
+            default_window_rows: 6,
+            default_window_cols: 8,
         }
     }
 }
@@ -180,6 +223,12 @@ impl AdaptivePrefetchConfig {
             landing_hysteresis: Duration::from_secs(settings.landing_hysteresis_secs),
             ramp_duration: Duration::from_secs(settings.ramp_duration_secs),
             ramp_start_fraction: settings.ramp_start_fraction,
+            trigger_distance: settings.trigger_distance,
+            load_depth: settings.load_depth,
+            window_buffer: settings.window_buffer,
+            stale_region_timeout: Duration::from_secs(settings.stale_region_timeout),
+            default_window_rows: settings.default_window_rows,
+            default_window_cols: settings.default_window_cols,
             ..Default::default()
         }
     }
@@ -205,6 +254,12 @@ impl AdaptivePrefetchConfig {
             landing_hysteresis: Duration::from_secs(config.landing_hysteresis_secs),
             ramp_duration: Duration::from_secs(config.ramp_duration_secs),
             ramp_start_fraction: config.ramp_start_fraction,
+            trigger_distance: config.trigger_distance,
+            load_depth: config.load_depth,
+            window_buffer: config.window_buffer,
+            stale_region_timeout: Duration::from_secs(config.stale_region_timeout),
+            default_window_rows: config.default_window_rows,
+            default_window_cols: config.default_window_cols,
             ..Default::default()
         }
     }
@@ -465,6 +520,53 @@ mod tests {
         // Reasonable values
         assert_eq!(config.track_stability_threshold, 5.0);
         assert_eq!(config.turn_threshold, 15.0);
+    }
+
+    #[test]
+    fn test_default_config_boundary_prefetch() {
+        let config = AdaptivePrefetchConfig::default();
+        assert_eq!(config.trigger_distance, 1.5);
+        assert_eq!(config.load_depth, 3);
+        assert_eq!(config.window_buffer, 1);
+        assert_eq!(config.stale_region_timeout, Duration::from_secs(120));
+        assert_eq!(config.default_window_rows, 6);
+        assert_eq!(config.default_window_cols, 8);
+    }
+
+    #[test]
+    fn test_from_prefetch_settings_boundary_fields() {
+        let settings = PrefetchSettings {
+            enabled: true,
+            strategy: "adaptive".to_string(),
+            mode: "auto".to_string(),
+            udp_port: 49002,
+            max_tiles_per_cycle: 200,
+            cycle_interval_ms: 2000,
+            circuit_breaker_open_ms: 500,
+            circuit_breaker_half_open_secs: 2,
+            calibration_aggressive_threshold: 30.0,
+            calibration_opportunistic_threshold: 10.0,
+            calibration_sample_duration: 60,
+            takeoff_climb_ft: 1000.0,
+            takeoff_timeout_secs: 90,
+            landing_hysteresis_secs: 15,
+            ramp_duration_secs: 30,
+            ramp_start_fraction: 0.25,
+            trigger_distance: 2.0,
+            load_depth: 4,
+            window_buffer: 2,
+            stale_region_timeout: 300,
+            default_window_rows: 8,
+            default_window_cols: 12,
+        };
+
+        let config = AdaptivePrefetchConfig::from_prefetch_settings(&settings);
+        assert_eq!(config.trigger_distance, 2.0);
+        assert_eq!(config.load_depth, 4);
+        assert_eq!(config.window_buffer, 2);
+        assert_eq!(config.stale_region_timeout, Duration::from_secs(300));
+        assert_eq!(config.default_window_rows, 8);
+        assert_eq!(config.default_window_cols, 12);
     }
 
     #[test]

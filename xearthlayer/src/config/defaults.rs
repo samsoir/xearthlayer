@@ -192,6 +192,28 @@ pub const DEFAULT_RAMP_DURATION_SECS: u64 = 30;
 pub const DEFAULT_RAMP_START_FRACTION: f64 = 0.25;
 
 // =============================================================================
+// Boundary-driven prefetch defaults
+// =============================================================================
+
+/// Default boundary trigger distance in degrees.
+pub const DEFAULT_PREFETCH_TRIGGER_DISTANCE: f64 = 1.5;
+
+/// Default DSF tiles deep per crossing.
+pub const DEFAULT_PREFETCH_LOAD_DEPTH: u8 = 3;
+
+/// Default buffer tiles for retention.
+pub const DEFAULT_PREFETCH_WINDOW_BUFFER: u8 = 1;
+
+/// Default InProgress staleness timeout in seconds.
+pub const DEFAULT_PREFETCH_STALE_REGION_TIMEOUT: u64 = 120;
+
+/// Default assumed window height in DSF tiles.
+pub const DEFAULT_PREFETCH_DEFAULT_WINDOW_ROWS: usize = 6;
+
+/// Default assumed window width in DSF tiles.
+pub const DEFAULT_PREFETCH_DEFAULT_WINDOW_COLS: usize = 8;
+
+// =============================================================================
 // Control plane defaults
 // =============================================================================
 
@@ -319,6 +341,12 @@ impl Default for ConfigFile {
                 landing_hysteresis_secs: DEFAULT_LANDING_HYSTERESIS_SECS,
                 ramp_duration_secs: DEFAULT_RAMP_DURATION_SECS,
                 ramp_start_fraction: DEFAULT_RAMP_START_FRACTION,
+                trigger_distance: DEFAULT_PREFETCH_TRIGGER_DISTANCE,
+                load_depth: DEFAULT_PREFETCH_LOAD_DEPTH,
+                window_buffer: DEFAULT_PREFETCH_WINDOW_BUFFER,
+                stale_region_timeout: DEFAULT_PREFETCH_STALE_REGION_TIMEOUT,
+                default_window_rows: DEFAULT_PREFETCH_DEFAULT_WINDOW_ROWS,
+                default_window_cols: DEFAULT_PREFETCH_DEFAULT_WINDOW_COLS,
             },
             control_plane: ControlPlaneSettings {
                 max_concurrent_jobs: default_max_concurrent_jobs(),

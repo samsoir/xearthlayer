@@ -217,6 +217,30 @@ pub struct PrefetchSettings {
     /// Starting prefetch fraction when ramp begins.
     /// Default: 0.25, Range: 0.1-0.5
     pub ramp_start_fraction: f64,
+
+    // Boundary-driven prefetch settings
+    /// Boundary trigger distance in degrees.
+    /// How close to a DSF boundary the aircraft must be to trigger prefetch.
+    /// Default: 1.5, Range: 0.5-3.0
+    pub trigger_distance: f64,
+    /// DSF tiles deep per crossing.
+    /// How many DSF tiles deep to prefetch when crossing a boundary.
+    /// Default: 3, Range: 1-5
+    pub load_depth: u8,
+    /// Buffer tiles for retention.
+    /// Extra tiles to retain beyond the visible window.
+    /// Default: 1, Range: 0-3
+    pub window_buffer: u8,
+    /// InProgress staleness timeout in seconds.
+    /// How long a region can stay InProgress before being considered stale.
+    /// Default: 120, Range: 30-600
+    pub stale_region_timeout: u64,
+    /// Assumed window height in DSF tiles.
+    /// Default: 6, Range: 3-12
+    pub default_window_rows: usize,
+    /// Assumed window width in DSF tiles.
+    /// Default: 8, Range: 4-16
+    pub default_window_cols: usize,
 }
 
 /// Control plane configuration for job management and health monitoring.

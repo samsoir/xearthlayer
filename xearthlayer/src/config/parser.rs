@@ -422,6 +422,61 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
                     reason: "must be a number between 0.1 and 0.5".to_string(),
                 })?;
         }
+        // Boundary-driven prefetch settings
+        if let Some(v) = section.get("trigger_distance") {
+            config.prefetch.trigger_distance =
+                v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                    section: "prefetch".to_string(),
+                    key: "trigger_distance".to_string(),
+                    value: v.to_string(),
+                    reason: "must be a number between 0.5 and 3.0".to_string(),
+                })?;
+        }
+        if let Some(v) = section.get("load_depth") {
+            config.prefetch.load_depth =
+                v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                    section: "prefetch".to_string(),
+                    key: "load_depth".to_string(),
+                    value: v.to_string(),
+                    reason: "must be an integer between 1 and 5".to_string(),
+                })?;
+        }
+        if let Some(v) = section.get("window_buffer") {
+            config.prefetch.window_buffer =
+                v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                    section: "prefetch".to_string(),
+                    key: "window_buffer".to_string(),
+                    value: v.to_string(),
+                    reason: "must be an integer between 0 and 3".to_string(),
+                })?;
+        }
+        if let Some(v) = section.get("stale_region_timeout") {
+            config.prefetch.stale_region_timeout =
+                v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                    section: "prefetch".to_string(),
+                    key: "stale_region_timeout".to_string(),
+                    value: v.to_string(),
+                    reason: "must be an integer between 30 and 600".to_string(),
+                })?;
+        }
+        if let Some(v) = section.get("default_window_rows") {
+            config.prefetch.default_window_rows =
+                v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                    section: "prefetch".to_string(),
+                    key: "default_window_rows".to_string(),
+                    value: v.to_string(),
+                    reason: "must be an integer between 3 and 12".to_string(),
+                })?;
+        }
+        if let Some(v) = section.get("default_window_cols") {
+            config.prefetch.default_window_cols =
+                v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                    section: "prefetch".to_string(),
+                    key: "default_window_cols".to_string(),
+                    value: v.to_string(),
+                    reason: "must be an integer between 4 and 16".to_string(),
+                })?;
+        }
     }
 
     // [control_plane] section

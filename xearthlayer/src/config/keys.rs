@@ -94,6 +94,14 @@ pub enum ConfigKey {
     PrefetchRampDurationSecs,
     PrefetchRampStartFraction,
 
+    // Boundary-driven prefetch settings
+    PrefetchTriggerDistance,
+    PrefetchLoadDepth,
+    PrefetchWindowBuffer,
+    PrefetchStaleRegionTimeout,
+    PrefetchDefaultWindowRows,
+    PrefetchDefaultWindowCols,
+
     // Control plane settings
     ControlPlaneMaxConcurrentJobs,
     ControlPlaneStallThresholdSecs,
@@ -190,6 +198,12 @@ impl FromStr for ConfigKey {
             "prefetch.landing_hysteresis_secs" => Ok(ConfigKey::PrefetchLandingHysteresisSecs),
             "prefetch.ramp_duration_secs" => Ok(ConfigKey::PrefetchRampDurationSecs),
             "prefetch.ramp_start_fraction" => Ok(ConfigKey::PrefetchRampStartFraction),
+            "prefetch.trigger_distance" => Ok(ConfigKey::PrefetchTriggerDistance),
+            "prefetch.load_depth" => Ok(ConfigKey::PrefetchLoadDepth),
+            "prefetch.window_buffer" => Ok(ConfigKey::PrefetchWindowBuffer),
+            "prefetch.stale_region_timeout" => Ok(ConfigKey::PrefetchStaleRegionTimeout),
+            "prefetch.default_window_rows" => Ok(ConfigKey::PrefetchDefaultWindowRows),
+            "prefetch.default_window_cols" => Ok(ConfigKey::PrefetchDefaultWindowCols),
 
             "control_plane.max_concurrent_jobs" => Ok(ConfigKey::ControlPlaneMaxConcurrentJobs),
             "control_plane.stall_threshold_secs" => Ok(ConfigKey::ControlPlaneStallThresholdSecs),
@@ -282,6 +296,12 @@ impl ConfigKey {
             ConfigKey::PrefetchLandingHysteresisSecs => "prefetch.landing_hysteresis_secs",
             ConfigKey::PrefetchRampDurationSecs => "prefetch.ramp_duration_secs",
             ConfigKey::PrefetchRampStartFraction => "prefetch.ramp_start_fraction",
+            ConfigKey::PrefetchTriggerDistance => "prefetch.trigger_distance",
+            ConfigKey::PrefetchLoadDepth => "prefetch.load_depth",
+            ConfigKey::PrefetchWindowBuffer => "prefetch.window_buffer",
+            ConfigKey::PrefetchStaleRegionTimeout => "prefetch.stale_region_timeout",
+            ConfigKey::PrefetchDefaultWindowRows => "prefetch.default_window_rows",
+            ConfigKey::PrefetchDefaultWindowCols => "prefetch.default_window_cols",
             ConfigKey::ControlPlaneMaxConcurrentJobs => "control_plane.max_concurrent_jobs",
             ConfigKey::ControlPlaneStallThresholdSecs => "control_plane.stall_threshold_secs",
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => {
@@ -422,6 +442,18 @@ impl ConfigKey {
             }
             ConfigKey::PrefetchRampDurationSecs => config.prefetch.ramp_duration_secs.to_string(),
             ConfigKey::PrefetchRampStartFraction => config.prefetch.ramp_start_fraction.to_string(),
+            ConfigKey::PrefetchTriggerDistance => config.prefetch.trigger_distance.to_string(),
+            ConfigKey::PrefetchLoadDepth => config.prefetch.load_depth.to_string(),
+            ConfigKey::PrefetchWindowBuffer => config.prefetch.window_buffer.to_string(),
+            ConfigKey::PrefetchStaleRegionTimeout => {
+                config.prefetch.stale_region_timeout.to_string()
+            }
+            ConfigKey::PrefetchDefaultWindowRows => {
+                config.prefetch.default_window_rows.to_string()
+            }
+            ConfigKey::PrefetchDefaultWindowCols => {
+                config.prefetch.default_window_cols.to_string()
+            }
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs.to_string()
             }
@@ -623,6 +655,24 @@ impl ConfigKey {
             ConfigKey::PrefetchRampStartFraction => {
                 config.prefetch.ramp_start_fraction = value.parse().unwrap();
             }
+            ConfigKey::PrefetchTriggerDistance => {
+                config.prefetch.trigger_distance = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchLoadDepth => {
+                config.prefetch.load_depth = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchWindowBuffer => {
+                config.prefetch.window_buffer = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchStaleRegionTimeout => {
+                config.prefetch.stale_region_timeout = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchDefaultWindowRows => {
+                config.prefetch.default_window_rows = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchDefaultWindowCols => {
+                config.prefetch.default_window_cols = value.parse().unwrap();
+            }
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs = value.parse().unwrap();
             }
@@ -765,6 +815,12 @@ impl ConfigKey {
             ConfigKey::PrefetchLandingHysteresisSecs => Box::new(IntegerRangeSpec::new(5, 60)),
             ConfigKey::PrefetchRampDurationSecs => Box::new(IntegerRangeSpec::new(10, 120)),
             ConfigKey::PrefetchRampStartFraction => Box::new(FloatRangeSpec::new(0.1, 0.5)),
+            ConfigKey::PrefetchTriggerDistance => Box::new(FloatRangeSpec::new(0.5, 3.0)),
+            ConfigKey::PrefetchLoadDepth => Box::new(IntegerRangeSpec::new(1, 5)),
+            ConfigKey::PrefetchWindowBuffer => Box::new(IntegerRangeSpec::new(0, 3)),
+            ConfigKey::PrefetchStaleRegionTimeout => Box::new(IntegerRangeSpec::new(30, 600)),
+            ConfigKey::PrefetchDefaultWindowRows => Box::new(IntegerRangeSpec::new(3, 12)),
+            ConfigKey::PrefetchDefaultWindowCols => Box::new(IntegerRangeSpec::new(4, 16)),
             ConfigKey::ControlPlaneMaxConcurrentJobs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneStallThresholdSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => Box::new(PositiveIntegerSpec),
@@ -842,6 +898,12 @@ impl ConfigKey {
             ConfigKey::PrefetchLandingHysteresisSecs,
             ConfigKey::PrefetchRampDurationSecs,
             ConfigKey::PrefetchRampStartFraction,
+            ConfigKey::PrefetchTriggerDistance,
+            ConfigKey::PrefetchLoadDepth,
+            ConfigKey::PrefetchWindowBuffer,
+            ConfigKey::PrefetchStaleRegionTimeout,
+            ConfigKey::PrefetchDefaultWindowRows,
+            ConfigKey::PrefetchDefaultWindowCols,
             ConfigKey::ControlPlaneMaxConcurrentJobs,
             ConfigKey::ControlPlaneStallThresholdSecs,
             ConfigKey::ControlPlaneHealthCheckIntervalSecs,
@@ -1286,6 +1348,117 @@ mod tests {
         assert_eq!(key.get(&config), "1000"); // default
         key.set(&mut config, "2000").unwrap();
         assert_eq!(key.get(&config), "2000");
+    }
+
+    #[test]
+    fn test_trigger_distance_config_key() {
+        let key = ConfigKey::from_str("prefetch.trigger_distance").unwrap();
+        assert_eq!(key.name(), "prefetch.trigger_distance");
+        assert!(key.validate("1.5").is_ok());
+        assert!(key.validate("0.5").is_ok());
+        assert!(key.validate("3.0").is_ok());
+        assert!(key.validate("0.3").is_err()); // below 0.5 minimum
+        assert!(key.validate("4.0").is_err()); // above 3.0 maximum
+    }
+
+    #[test]
+    fn test_load_depth_config_key() {
+        let key = ConfigKey::from_str("prefetch.load_depth").unwrap();
+        assert_eq!(key.name(), "prefetch.load_depth");
+        assert!(key.validate("3").is_ok());
+        assert!(key.validate("1").is_ok());
+        assert!(key.validate("5").is_ok());
+        assert!(key.validate("0").is_err());
+        assert!(key.validate("6").is_err());
+    }
+
+    #[test]
+    fn test_window_buffer_config_key() {
+        let key = ConfigKey::from_str("prefetch.window_buffer").unwrap();
+        assert_eq!(key.name(), "prefetch.window_buffer");
+        assert!(key.validate("1").is_ok());
+        assert!(key.validate("0").is_ok());
+        assert!(key.validate("3").is_ok());
+        assert!(key.validate("4").is_err());
+    }
+
+    #[test]
+    fn test_stale_region_timeout_config_key() {
+        let key = ConfigKey::from_str("prefetch.stale_region_timeout").unwrap();
+        assert_eq!(key.name(), "prefetch.stale_region_timeout");
+        assert!(key.validate("120").is_ok());
+        assert!(key.validate("30").is_ok());
+        assert!(key.validate("600").is_ok());
+        assert!(key.validate("29").is_err());
+        assert!(key.validate("601").is_err());
+    }
+
+    #[test]
+    fn test_default_window_rows_config_key() {
+        let key = ConfigKey::from_str("prefetch.default_window_rows").unwrap();
+        assert_eq!(key.name(), "prefetch.default_window_rows");
+        assert!(key.validate("6").is_ok());
+        assert!(key.validate("3").is_ok());
+        assert!(key.validate("12").is_ok());
+        assert!(key.validate("2").is_err());
+        assert!(key.validate("13").is_err());
+    }
+
+    #[test]
+    fn test_default_window_cols_config_key() {
+        let key = ConfigKey::from_str("prefetch.default_window_cols").unwrap();
+        assert_eq!(key.name(), "prefetch.default_window_cols");
+        assert!(key.validate("8").is_ok());
+        assert!(key.validate("4").is_ok());
+        assert!(key.validate("16").is_ok());
+        assert!(key.validate("3").is_err());
+        assert!(key.validate("17").is_err());
+    }
+
+    #[test]
+    fn test_new_prefetch_keys_in_all() {
+        let all = ConfigKey::all();
+        assert!(all.contains(&ConfigKey::PrefetchTriggerDistance));
+        assert!(all.contains(&ConfigKey::PrefetchLoadDepth));
+        assert!(all.contains(&ConfigKey::PrefetchWindowBuffer));
+        assert!(all.contains(&ConfigKey::PrefetchStaleRegionTimeout));
+        assert!(all.contains(&ConfigKey::PrefetchDefaultWindowRows));
+        assert!(all.contains(&ConfigKey::PrefetchDefaultWindowCols));
+    }
+
+    #[test]
+    fn test_boundary_prefetch_keys_round_trip() {
+        let mut config = ConfigFile::default();
+
+        ConfigKey::PrefetchTriggerDistance
+            .set(&mut config, "2.0")
+            .unwrap();
+        assert_eq!(ConfigKey::PrefetchTriggerDistance.get(&config), "2");
+
+        ConfigKey::PrefetchLoadDepth
+            .set(&mut config, "4")
+            .unwrap();
+        assert_eq!(ConfigKey::PrefetchLoadDepth.get(&config), "4");
+
+        ConfigKey::PrefetchWindowBuffer
+            .set(&mut config, "2")
+            .unwrap();
+        assert_eq!(ConfigKey::PrefetchWindowBuffer.get(&config), "2");
+
+        ConfigKey::PrefetchStaleRegionTimeout
+            .set(&mut config, "300")
+            .unwrap();
+        assert_eq!(ConfigKey::PrefetchStaleRegionTimeout.get(&config), "300");
+
+        ConfigKey::PrefetchDefaultWindowRows
+            .set(&mut config, "8")
+            .unwrap();
+        assert_eq!(ConfigKey::PrefetchDefaultWindowRows.get(&config), "8");
+
+        ConfigKey::PrefetchDefaultWindowCols
+            .set(&mut config, "12")
+            .unwrap();
+        assert_eq!(ConfigKey::PrefetchDefaultWindowCols.get(&config), "12");
     }
 
     #[test]
