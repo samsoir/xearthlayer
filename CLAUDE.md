@@ -101,15 +101,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 11. **Predictive Tile Caching** (`xearthlayer/src/prefetch/`)
     - `AdaptivePrefetchCoordinator` - Self-calibrating prefetch with flight phase detection
     - `GroundStrategy` - Ring-based prefetching for ground operations (GS < 40kt)
-    - `CruiseStrategy` - Track-based band prefetching for cruise (band ahead of aircraft)
+    - `SceneryWindow` - Three-window model (XP Window, XEL Window, Retained) with dual boundary monitors
+    - `BoundaryMonitor` - Position-based DSF boundary edge detection (row and column axes)
+    - `BoundaryStrategy` - Converts boundary crossings to target DSF region lists for prefetch
     - `PhaseDetector` - Ground/Cruise flight phase state machine
     - `PerformanceCalibrator` - Measures throughput during initial load for mode selection
     - `TelemetryListener` - Receives X-Plane/ForeFlight UDP telemetry (position, heading, speed)
     - `FuseLoadMonitor` trait - Abstraction for FUSE request tracking (ISP)
     - `CircuitBreaker` - Pauses prefetch during X-Plane scene loading
+    - `TransitionThrottle` - Grace period + ramp-up after Ground-to-Cruise transition
     - Submits jobs to shared job executor daemon via `DdsClient` trait
     - Mode selection: Aggressive (>30 tiles/sec), Opportunistic (10-30), or Disabled
     - **Four-tier filtering**: Local tracking → Memory cache → Patched region exclusion (via `GeoIndex`) → Disk existence (via `OrthoUnionIndex`)
+    - **Two-phase region commit**: Regions marked `InProgress` in GeoIndex during prefetch, promoted to `Prefetched` on completion
     - See `docs/dev/adaptive-prefetch-design.md` for design details
 
 12. **Aircraft Position & Telemetry** (`xearthlayer/src/aircraft_position/`)
@@ -138,9 +142,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `DsfRegion` - 1°×1° DSF region coordinate type
     - `GeoLayer` trait - Marker trait for storable layer types (`Clone + Send + Sync + 'static`)
     - `PatchCoverage` - Layer type indicating a region is owned by a scenery patch
+    - `RetainedRegion` - Layer type tracking regions in the SceneryWindow's retained set
+    - `PrefetchedRegion` - Layer type tracking prefetch state per region (InProgress, Prefetched, NoCoverage)
     - Locking: `RwLock<HashMap<TypeId, DashMap>>` — rare write locks, concurrent reads via DashMap shards
     - `populate()` provides atomic bulk loading (builds outside lock, swaps in)
-    - Used by FUSE (`is_geo_filtered`), prewarm, and prefetch for patch region exclusion
+    - Used by FUSE (`is_geo_filtered`), prewarm, and prefetch for patch region exclusion and prefetch state tracking
     - See `docs/dev/geo-index-design.md` for design details
 
 ### Module Dependencies
@@ -292,7 +298,9 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/publisher/dedupe/` | Zoom level overlap detection and gap analysis |
 | `xearthlayer/src/prefetch/strategy.rs` | Prefetcher trait (strategy pattern) |
 | `xearthlayer/src/prefetch/adaptive/coordinator.rs` | AdaptivePrefetchCoordinator (self-calibrating prefetch) |
-| `xearthlayer/src/prefetch/adaptive/cruise_strategy.rs` | CruiseStrategy (track-based band prefetch) |
+| `xearthlayer/src/prefetch/adaptive/scenery_window.rs` | SceneryWindow (three-window model with boundary monitors) |
+| `xearthlayer/src/prefetch/adaptive/boundary_monitor.rs` | BoundaryMonitor (position-based DSF edge detection) |
+| `xearthlayer/src/prefetch/adaptive/boundary_strategy.rs` | BoundaryStrategy (boundary crossings to DSF region lists) |
 | `xearthlayer/src/prefetch/adaptive/ground_strategy.rs` | GroundStrategy (ring-based for ground ops) |
 | `xearthlayer/src/prefetch/load_monitor.rs` | FuseLoadMonitor trait + SharedFuseLoadMonitor |
 | `xearthlayer/src/prefetch/circuit_breaker.rs` | CircuitBreaker for X-Plane load detection |

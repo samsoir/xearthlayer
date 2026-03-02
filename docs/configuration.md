@@ -317,7 +317,7 @@ The system uses flight phase detection and performance calibration:
 
 2. **Flight Phase Strategies**:
    - **Ground Strategy**: Ring-based prefetch around position (GS < 40kt, AGL < 20ft)
-   - **Cruise Strategy**: Track-based band prefetch ahead of flight path (GS > 40kt)
+   - **Cruise Strategy**: Boundary-driven row/column prefetch using SceneryWindow and BoundaryMonitor (GS > 40kt)
 
 3. **Mode Selection**: Based on calibration throughput:
    - **Aggressive**: >30 tiles/sec - Position-based trigger (0.3° into DSF tile)
@@ -343,6 +343,12 @@ The system uses flight phase detection and performance calibration:
 | `landing_hysteresis_secs` | integer | `15` | Sustained seconds at GS < 40kt before landing detection (5-60) |
 | `ramp_duration_secs` | integer | `30` | Duration of linear ramp to full prefetch rate (10-120) |
 | `ramp_start_fraction` | float | `0.25` | Starting prefetch fraction when ramp begins (0.1-0.5) |
+| `trigger_distance` | float | `1.5` | DSF boundary distance (degrees) to trigger prefetch (0.5-3.0) |
+| `load_depth` | integer | `3` | Number of DSF rows/columns to prefetch ahead (1-5) |
+| `window_buffer` | integer | `1` | Extra DSF tiles around window edges to retain (0-3) |
+| `stale_region_timeout` | integer | `120` | Seconds before an InProgress region is considered stale (30-600) |
+| `default_window_rows` | integer | `6` | Default scenery window height in DSF rows (3-12) |
+| `default_window_cols` | integer | `8` | Default scenery window width in DSF columns (4-16) |
 
 **Mode Options:**
 
@@ -389,6 +395,14 @@ takeoff_timeout_secs = 90                    ; Max seconds before timeout releas
 landing_hysteresis_secs = 15                 ; Sustained GS < 40kt for landing detection
 ramp_duration_secs = 30                      ; Linear ramp duration after hold release
 ramp_start_fraction = 0.25                   ; Starting prefetch fraction (25%)
+
+; Boundary-driven prefetch (cruise mode)
+; trigger_distance = 1.5                     ; DSF boundary distance (degrees) to trigger
+; load_depth = 3                             ; DSF rows/columns to prefetch ahead
+; window_buffer = 1                          ; Extra DSF tiles around window edges
+; stale_region_timeout = 120                 ; Seconds before InProgress region is stale
+; default_window_rows = 6                    ; Scenery window height (DSF rows)
+; default_window_cols = 8                    ; Scenery window width (DSF columns)
 ```
 
 **Transition Ramp:**
@@ -407,7 +421,7 @@ To enable prefetching, configure X-Plane to send ForeFlight telemetry:
 2. Enable **Send to ForeFlight**
 3. XEarthLayer will receive position/heading updates on UDP port 49002
 
-**Note:** Prefetch works best with telemetry for heading-aware band calculation, but the system remains functional without it by using FUSE file access patterns to infer aircraft position
+**Note:** Prefetch works best with telemetry for boundary-driven region prefetching, but the system remains functional without it by using FUSE file access patterns to infer aircraft position
 
 ### [prewarm]
 
@@ -653,6 +667,14 @@ mode = auto                    ; auto, aggressive, opportunistic, disabled
 ; ramp_duration_secs = 30                    ; linear ramp duration after release
 ; ramp_start_fraction = 0.25                 ; starting prefetch fraction
 
+; Boundary-driven prefetch (cruise mode)
+; trigger_distance = 1.5                     ; DSF boundary distance (degrees) to trigger
+; load_depth = 3                             ; DSF rows/columns to prefetch ahead
+; window_buffer = 1                          ; extra DSF tiles around window edges
+; stale_region_timeout = 120                 ; seconds before InProgress region is stale
+; default_window_rows = 6                    ; scenery window height (DSF rows)
+; default_window_cols = 8                    ; scenery window width (DSF columns)
+
 [prewarm]
 ; Cold-start cache pre-warming (use with --airport ICAO)
 ; radius_nm = 100              ; Pre-warm radius (100nm covers standard DSF loading)
@@ -800,6 +822,12 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `prefetch.landing_hysteresis_secs` | 5-60 | Sustained GS < 40kt for landing detection |
 | `prefetch.ramp_duration_secs` | 10-120 | Linear ramp duration (seconds) |
 | `prefetch.ramp_start_fraction` | 0.1-0.5 | Starting prefetch fraction |
+| `prefetch.trigger_distance` | 0.5-3.0 | DSF boundary distance (degrees) to trigger prefetch |
+| `prefetch.load_depth` | 1-5 | DSF rows/columns to prefetch ahead |
+| `prefetch.window_buffer` | 0-3 | Extra DSF tiles around window edges |
+| `prefetch.stale_region_timeout` | 30-600 | Seconds before InProgress region is stale |
+| `prefetch.default_window_rows` | 3-12 | Scenery window height (DSF rows) |
+| `prefetch.default_window_cols` | 4-16 | Scenery window width (DSF columns) |
 | `prewarm.radius_nm` | positive number | Pre-warm radius around airport (nm) |
 | `xplane.scenery_dir` | path | X-Plane Custom Scenery directory |
 | `packages.library_url` | URL | Package library index URL |
