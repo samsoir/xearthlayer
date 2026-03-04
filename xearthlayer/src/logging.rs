@@ -124,12 +124,19 @@ pub fn init_logging_full(
     let (non_blocking_file, file_guard) = tracing_appender::non_blocking(file_appender);
 
     // Create env filter
-    // Priority: debug_mode flag > RUST_LOG env var > default (info)
+    // Priority: profile_mode > debug_mode flag > RUST_LOG env var > default (info)
     //
     // When debug_mode is enabled, we only enable DEBUG for xearthlayer crate.
     // Third-party crates (especially fuse3) produce extremely verbose DEBUG output
     // that can flood the log and cause performance issues.
-    let env_filter = if debug_mode {
+    //
+    // When profile_mode is enabled, we enable DEBUG for xearthlayer so that
+    // profiling spans (debug_span!) fire, and suppress fuse3 to WARN level.
+    // fuse3 internal spans contributed 70% of trace events (1.1M of 1.6M) in
+    // testing, causing a 14x slowdown from mutex contention on the trace writer.
+    let env_filter = if profile_mode {
+        EnvFilter::new("info,xearthlayer=debug,fuse3=warn")
+    } else if debug_mode {
         EnvFilter::new("info,xearthlayer=debug")
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
