@@ -133,8 +133,8 @@ pub fn init_logging_full(
     // When profile_mode is enabled, we enable DEBUG for the "profiling" target —
     // our spans use `target: "profiling"` to isolate them from ambient events.
     let env_filter = match (profile_mode, debug_mode) {
-        (true, true) => EnvFilter::new("info,profiling=debug,xearthlayer=debug"),
-        (true, false) => EnvFilter::new("info,profiling=debug"),
+        (true, true) => EnvFilter::new("info,fuse3=warn,profiling=debug,xearthlayer=debug"),
+        (true, false) => EnvFilter::new("info,fuse3=warn,profiling=debug"),
         (false, true) => EnvFilter::new("info,xearthlayer=debug"),
         (false, false) => {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
