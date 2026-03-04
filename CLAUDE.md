@@ -137,7 +137,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `dds_tile_exists(row, col, zoom)` - Checks if DDS tile exists on disk (used by prefetch)
     - `resolve_lazy_filtered(path, predicate)` - Source-filtered lazy resolution (used by FUSE with GeoIndex)
 
-13. **GeoIndex** (`xearthlayer/src/geo_index/`)
+14. **GeoIndex** (`xearthlayer/src/geo_index/`)
     - `GeoIndex` - Type-keyed, region-indexed geospatial reference database (thread-safe, ACID)
     - `DsfRegion` - 1°×1° DSF region coordinate type
     - `GeoLayer` trait - Marker trait for storable layer types (`Clone + Send + Sync + 'static`)
@@ -161,7 +161,7 @@ xearthlayer-cli
             ├─→ runtime (XEarthLayerRuntime orchestrator) ──────────────┤
             │       └─→ executor (ExecutorDaemon, DdsClient)            │
             │               └─→ jobs (DdsGenerateJob, TilePrefetchJob)  │
-            │                       └─→ tasks (Download, Assemble, ...)  │
+            │                       └─→ tasks (DownloadChunks, BuildAndCacheDds) │
             │                                                            │
             ├─→ fuse/fuse3 (async multi-threaded FUSE) ─────────────────┤
             │       ├─→ uses DdsClient for tile requests                │
@@ -204,7 +204,7 @@ limiting to prevent resource exhaustion under heavy load. Each resource type has
 tuned concurrency limits:
 
 - **Network pool (download tasks)**: `clamp(ceil(cpu_capacity * 1.5), 8, 48)` — pipeline-balanced with CPU pool
-- **HTTP semaphore (chunk connections)**: 256 shared across all download tasks
+- **HTTP semaphore (chunk connections)**: 1024 shared across all download tasks
 - **CPU-bound work** (assemble + encode): `max(num_cpus * 1.25, num_cpus + 2)` shared limiter
 - **Disk I/O concurrency**: Profile-based, auto-detected from storage type:
   - HDD: `min(num_cpus * 1, 4)` - seek-bound, low concurrency
@@ -228,7 +228,12 @@ xearthlayer                         # Defaults to 'run' (mount all packages)
 xearthlayer setup                   # Interactive setup wizard (first-time configuration)
 xearthlayer init                    # Create config file with defaults
 xearthlayer run                     # Mount all packages and start streaming (primary command)
+xearthlayer run --debug             # Enable debug-level logging for xearthlayer crate
+xearthlayer run --profile           # Enable Chrome Trace profiling (requires --features profiling)
+xearthlayer run --no-prefetch       # Disable prefetch system
+xearthlayer run --airport ICAO      # Pre-warm tiles around airport before starting
 xearthlayer download --lat --lon    # Download single tile
+xearthlayer diagnostics             # Show system info, config, and health status
 xearthlayer cache clear|stats|migrate # Cache management
 
 # Scenery index cache
@@ -283,7 +288,7 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/executor/task.rs` | Task trait and TaskContext, TaskOutput |
 | `xearthlayer/src/jobs/dds_generate.rs` | DdsGenerateJob - tile generation job |
 | `xearthlayer/src/jobs/factory.rs` | DdsJobFactory trait for job creation |
-| `xearthlayer/src/tasks/` | Task implementations (download, assemble, encode, cache) |
+| `xearthlayer/src/tasks/` | Task implementations (DownloadChunks, BuildAndCacheDds; legacy: assemble, encode, cache) |
 | `xearthlayer/src/provider/factory.rs` | Provider factories (sync + async) |
 | `xearthlayer/src/fuse/fuse3/` | Fuse3 async multi-threaded filesystem |
 | `xearthlayer/src/fuse/fuse3/shared.rs` | Shared FUSE traits (FileAttrBuilder, DdsRequestor) |
@@ -297,7 +302,7 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/publisher/` | Package publisher library |
 | `xearthlayer/src/publisher/dedupe/` | Zoom level overlap detection and gap analysis |
 | `xearthlayer/src/prefetch/strategy.rs` | Prefetcher trait (strategy pattern) |
-| `xearthlayer/src/prefetch/adaptive/coordinator.rs` | AdaptivePrefetchCoordinator (self-calibrating prefetch) |
+| `xearthlayer/src/prefetch/adaptive/coordinator/core.rs` | AdaptivePrefetchCoordinator (boundary-driven prefetch) |
 | `xearthlayer/src/prefetch/adaptive/scenery_window.rs` | SceneryWindow (three-window model with boundary monitors) |
 | `xearthlayer/src/prefetch/adaptive/boundary_monitor.rs` | BoundaryMonitor (position-based DSF edge detection) |
 | `xearthlayer/src/prefetch/adaptive/boundary_strategy.rs` | BoundaryStrategy (boundary crossings to DSF region lists) |
@@ -317,6 +322,9 @@ Key sections:
 - `[cache]` - Memory/disk sizes, directory, disk I/O profile (auto/hdd/ssd/nvme)
 - `[generation]` - Thread count, timeout
 - `[texture]` - DDS format (bc1/bc3)
+- `[prefetch]` - Boundary-driven prefetch, circuit breaker, calibration, transition ramp
+- `[prewarm]` - Cold-start cache warming (grid_size for DSF tile grid around airport)
+- `[pipeline]` - HTTP/CPU/prefetch concurrency limits
 - `[online_network]` - VATSIM/IVAO/PilotEdge position (enabled, pilot_id, poll interval)
 
 See `docs/configuration.md` for full reference.
@@ -365,7 +373,9 @@ CI will fail if pre-commit checks were not run.
 - `clap` - CLI argument parsing
 - `ini` - Configuration file parsing
 - `tracing` - Structured logging
+- `tracing-chrome` - Chrome Trace profiling (optional, `profiling` feature)
 - `tokio` - Async runtime
+- `rlimit` - File descriptor limit management (raises soft limit at startup)
 
 ## Performance Notes
 

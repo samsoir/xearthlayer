@@ -75,8 +75,8 @@ pub const MIN_NETWORK_CAPACITY: usize = 8;
 /// Maximum network pool capacity.
 ///
 /// Caps concurrent download tasks to prevent bandwidth starvation. With an
-/// HTTP semaphore of 256 shared across all downloads, 48 concurrent tiles
-/// each get ~5 HTTP connections — enough for ~2s per-tile latency.
+/// HTTP semaphore of 1024 shared across all downloads, 48 concurrent tiles
+/// each get ~21 HTTP connections — enough for sub-second per-tile latency.
 pub const MAX_NETWORK_CAPACITY: usize = 48;
 
 /// Default disk I/O pool capacity (SSD profile).

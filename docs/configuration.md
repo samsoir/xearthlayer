@@ -332,7 +332,6 @@ The system uses flight phase detection and performance calibration:
 | `udp_port` | integer | `49002` | UDP port for X-Plane telemetry (ForeFlight protocol) |
 | `max_tiles_per_cycle` | integer | `3000` | Maximum tiles to submit per prefetch cycle |
 | `cycle_interval_ms` | integer | `2000` | Interval between prefetch cycles (milliseconds) |
-| `circuit_breaker_threshold` | float | `50.0` | FUSE jobs/sec threshold to pause prefetching |
 | `circuit_breaker_open_ms` | integer | `500` | Duration (ms) high load must be sustained to pause |
 | `circuit_breaker_half_open_secs` | integer | `2` | Cooloff time (secs) before resuming prefetch |
 | `calibration_aggressive_threshold` | float | `30.0` | Tiles/sec threshold for aggressive mode |
@@ -361,11 +360,11 @@ The system uses flight phase detection and performance calibration:
 
 **Circuit Breaker:**
 
-The circuit breaker automatically pauses prefetching when X-Plane is loading scenery (detected by high FUSE request rate). This prevents prefetch from competing with X-Plane's direct tile requests:
+The circuit breaker automatically pauses prefetching when the executor is under heavy load (detected by resource pool utilization). This prevents prefetch from competing with X-Plane's direct tile requests:
 
-- **Closed (Active)**: Normal prefetching, FUSE rate below threshold
-- **Open (Paused)**: Prefetching paused, FUSE rate exceeded threshold
-- **Half-Open (Resuming)**: Testing if safe to resume after cooloff
+- **Closed (Active)**: Normal prefetching, executor load below threshold
+- **Open (Paused)**: Prefetching paused, executor load exceeded threshold for `circuit_breaker_open_ms`
+- **Half-Open (Resuming)**: Testing if safe to resume after `circuit_breaker_half_open_secs` cooloff
 
 **Example:**
 ```ini
@@ -380,7 +379,7 @@ max_tiles_per_cycle = 3000     ; Tiles per cycle
 cycle_interval_ms = 2000       ; Cycle interval (ms)
 
 ; Circuit breaker (pause prefetch during scene loading)
-circuit_breaker_threshold = 50.0      ; FUSE jobs/sec to trigger pause
+; Uses resource pool utilization (not FUSE rate) since v0.3.1
 circuit_breaker_open_ms = 500         ; Sustained load duration to open
 circuit_breaker_half_open_secs = 2    ; Cooloff before resuming
 
@@ -429,48 +428,27 @@ Controls cold-start cache pre-warming. Use with `xearthlayer run --airport ICAO`
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `radius_nm` | float | `100` | Radius in nautical miles around the airport to prewarm |
+| `grid_size` | integer | `8` | DSF grid dimension (N×N tiles) around the airport to prewarm |
 
-**Understanding X-Plane's DSF Loading:**
+**DSF Grid-Based Pre-warming:**
 
-X-Plane loads terrain in DSF (Digital Scenery File) tiles, each covering 1° × 1° of lat/lon. The number of tiles loaded depends on the "Extended DSFs" setting:
+Prewarm uses X-Plane's native DSF tile grid (1° × 1° tiles) to determine which tiles to prepare. The `grid_size` setting defines an N×N grid centered on the departure airport:
 
-| Setting | Tiles Loaded | Approximate Area |
-|---------|--------------|------------------|
-| Standard | 3×2 = 6 tiles | ~180nm × 120nm (equator) |
-| Extended DSFs | 4×3 = 12 tiles | ~240nm × 180nm (equator) |
+| Grid Size | Tiles | Approximate Coverage (mid-latitudes) |
+|-----------|-------|--------------------------------------|
+| 4 | 16 tiles (4×4) | ~240nm × 240nm |
+| 6 | 36 tiles (6×6) | ~360nm × 360nm |
+| 8 (default) | 64 tiles (8×8) | ~480nm × 480nm |
+| 10 | 100 tiles (10×10) | ~600nm × 600nm |
 
-At mid-latitudes (~47°N, typical for Europe), this translates to roughly:
-- **Standard**: ~90nm radius equivalent
-- **Extended**: ~120nm radius equivalent
-
-The default 100nm prewarm radius is optimized for standard DSF loading—it covers the initial scenery load without wasting bandwidth on tiles X-Plane won't request until you fly further.
-
-**Dynamic Resolution via LOAD_CENTER:**
-
-X-Plane's orthophoto textures use `LOAD_CENTER` directives that enable dynamic resolution loading. As you approach a tile, X-Plane progressively loads higher resolution versions. This means:
-
-1. Distant tiles load at low resolution (fast, small)
-2. Nearby tiles load at full resolution (slower, larger)
-3. XEarthLayer's prewarm prepares the full-resolution versions for immediate use
+The default grid size of 8 covers X-Plane's extended DSF loading region plus a generous buffer for initial flight. Larger grids increase pre-warm time proportionally (area scales with grid_size²).
 
 **Example:**
 ```ini
 [prewarm]
-; Pre-warm tiles within 100nm of departure airport
-; This covers X-Plane's standard 3×2 DSF loading region
-radius_nm = 100
+; Pre-warm an 8×8 DSF grid around departure airport
+grid_size = 8
 ```
-
-**Increasing the Radius:**
-
-If you use Extended DSFs or want more aggressive pre-warming:
-```ini
-[prewarm]
-radius_nm = 150  ; Cover extended DSF region
-```
-
-Note: Larger radii increase pre-warm time and bandwidth usage proportionally (area scales with radius²).
 
 ### [xplane]
 
@@ -651,7 +629,6 @@ mode = auto                    ; auto, aggressive, opportunistic, disabled
 ; cycle_interval_ms = 2000     ; cycle interval (ms)
 
 ; Circuit breaker (pause prefetch during scene loading)
-; circuit_breaker_threshold = 50.0      ; FUSE jobs/sec to trigger
 ; circuit_breaker_open_ms = 500         ; duration to sustain before pause
 ; circuit_breaker_half_open_secs = 2    ; cooloff before resuming
 
@@ -677,7 +654,7 @@ mode = auto                    ; auto, aggressive, opportunistic, disabled
 
 [prewarm]
 ; Cold-start cache pre-warming (use with --airport ICAO)
-; radius_nm = 100              ; Pre-warm radius (100nm covers standard DSF loading)
+; grid_size = 8                ; N×N DSF grid around airport (default: 8×8 = 64 tiles)
 
 [xplane]
 ; scenery_dir = /path/to/X-Plane 12/Custom Scenery
@@ -811,7 +788,6 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `prefetch.udp_port` | positive integer | X-Plane telemetry UDP port |
 | `prefetch.max_tiles_per_cycle` | positive integer | Max tiles per prefetch cycle |
 | `prefetch.cycle_interval_ms` | positive integer | Prefetch cycle interval (ms) |
-| `prefetch.circuit_breaker_threshold` | positive number | FUSE jobs/sec to pause prefetch |
 | `prefetch.circuit_breaker_open_ms` | positive integer | Sustained load duration (ms) |
 | `prefetch.circuit_breaker_half_open_secs` | positive integer | Cooloff time (secs) |
 | `prefetch.calibration_aggressive_threshold` | positive number | Tiles/sec for aggressive mode |
@@ -828,7 +804,7 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `prefetch.stale_region_timeout` | 30-600 | Seconds before InProgress region is stale |
 | `prefetch.default_window_rows` | 3-12 | Scenery window height (DSF rows) |
 | `prefetch.default_window_cols` | 4-16 | Scenery window width (DSF columns) |
-| `prewarm.radius_nm` | positive number | Pre-warm radius around airport (nm) |
+| `prewarm.grid_size` | positive integer | DSF grid dimension (N×N) for airport prewarm |
 | `xplane.scenery_dir` | path | X-Plane Custom Scenery directory |
 | `packages.library_url` | URL | Package library index URL |
 | `packages.install_location` | path | Package installation directory |
