@@ -130,12 +130,11 @@ pub fn init_logging_full(
     // Third-party crates (especially fuse3) produce extremely verbose DEBUG output
     // that can flood the log and cause performance issues.
     //
-    // When profile_mode is enabled, we enable DEBUG for xearthlayer so that
-    // profiling spans (debug_span!) fire, and suppress fuse3 to WARN level.
-    // fuse3 internal spans contributed 70% of trace events (1.1M of 1.6M) in
-    // testing, causing a 14x slowdown from mutex contention on the trace writer.
+    // When profile_mode is enabled, we enable DEBUG only for the "profiling"
+    // target — our spans use `target: "profiling"` to isolate them from the
+    // thousands of ambient debug/info events in xearthlayer and fuse3.
     let env_filter = if profile_mode {
-        EnvFilter::new("info,xearthlayer=debug,fuse3=warn")
+        EnvFilter::new("info,profiling=debug")
     } else if debug_mode {
         EnvFilter::new("info,xearthlayer=debug")
     } else {

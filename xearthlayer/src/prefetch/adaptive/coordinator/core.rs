@@ -491,6 +491,7 @@ impl AdaptivePrefetchCoordinator {
     /// Number of tiles submitted. Returns 0 if deferred due to backpressure.
     pub fn execute(&mut self, plan: &PrefetchPlan, cancellation: CancellationToken) -> usize {
         let _span = tracing::debug_span!(
+            target: "profiling",
             "prefetch_execute",
             tile_count = plan.tiles.len(),
             strategy = plan.strategy,

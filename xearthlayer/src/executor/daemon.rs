@@ -532,7 +532,7 @@ where
         // Fast path: check memory cache first
         let cache_result = memory_cache
             .get(tile.row, tile.col, tile.zoom)
-            .instrument(tracing::trace_span!("cache_check"))
+            .instrument(tracing::trace_span!(target: "profiling", "cache_check"))
             .await;
         if let Some(data) = cache_result {
             let duration = start.elapsed();
@@ -616,7 +616,7 @@ where
         debug!(job_id = %job_id, tile = ?tile, "Created DDS generation job");
 
         let handle = {
-            let _span = tracing::trace_span!("job_submit").entered();
+            let _span = tracing::trace_span!(target: "profiling", "job_submit").entered();
             submitter.try_submit_boxed(job)
         };
 

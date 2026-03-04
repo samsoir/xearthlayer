@@ -696,8 +696,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
             // Build filename for request_dds (use Display impl which includes correct zoom)
             let filename = format!("{}.dds", coords);
 
-            let fuse_read_span =
-                tracing::debug_span!("fuse_read", ino = ino, offset = offset, size = size,);
+            let fuse_read_span = tracing::debug_span!(target: "profiling", "fuse_read", ino = ino, offset = offset, size = size,);
             let data = self
                 .request_dds(&filename)
                 .instrument(fuse_read_span)

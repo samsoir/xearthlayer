@@ -440,8 +440,7 @@ pub trait DdsRequestor: FileAttrBuilder {
         let rx = client.request_dds(tile, cancellation_token.clone());
 
         // Await response with timeout (instrumented for profiling)
-        let dds_await_span =
-            tracing::debug_span!("dds_await", tile_row = tile.row, tile_col = tile.col,);
+        let dds_await_span = tracing::debug_span!(target: "profiling", "dds_await", tile_row = tile.row, tile_col = tile.col,);
         match tokio::time::timeout(timeout, rx)
             .instrument(dds_await_span)
             .await

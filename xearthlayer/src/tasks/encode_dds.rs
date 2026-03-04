@@ -93,7 +93,7 @@ where
         &'a self,
         ctx: &'a mut TaskContext,
     ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
-        let span = tracing::debug_span!("task_encode");
+        let span = tracing::debug_span!(target: "profiling", "task_encode");
         Box::pin(
             async move {
                 // Check for cancellation before starting
