@@ -23,11 +23,14 @@ use crate::config::{DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SECS};
 /// provider. A reasonable value prevents overwhelming the provider while
 /// maintaining good throughput.
 ///
-/// 1024 provides high throughput on fast connections (tested with Apple CDN
-/// on multi-gigabit links) while staying within safe file descriptor limits.
+/// 512 provides 2x throughput over the original 256 while staying within
+/// safe file descriptor limits. At 1024 permits, FD exhaustion (EMFILE)
+/// was observed when the process inherits a low ulimit — HTTP sockets +
+/// disk cache reads + FUSE handles can exceed 1024 total FDs.
+///
 /// Reqwest/hyper has no built-in connection cap — this semaphore is the
 /// sole concurrency limiter for HTTP requests.
-pub const DEFAULT_MAX_CONCURRENT_HTTP: usize = 1024;
+pub const DEFAULT_MAX_CONCURRENT_HTTP: usize = 512;
 
 /// Configuration for chunk downloads.
 ///
@@ -60,7 +63,7 @@ pub struct DownloadConfig {
     /// total concurrent requests stay within bounds regardless of how many
     /// tiles are being processed.
     ///
-    /// Default capacity: 1024 permits
+    /// Default capacity: 512 permits
     pub http_semaphore: Arc<Semaphore>,
 }
 
