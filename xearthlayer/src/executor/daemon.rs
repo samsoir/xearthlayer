@@ -448,12 +448,6 @@ where
             metrics_client,
         } = self;
 
-        // Wrap shared state in Arc for concurrent handler spawning.
-        // This allows the daemon loop to drain the channel without
-        // blocking on each request — handlers run concurrently.
-        let submitter = Arc::new(submitter);
-        let metrics_client = Arc::new(metrics_client);
-
         // Create shared coalescer for daemon-level request deduplication
         let coalescer = Arc::new(DaemonCoalescer::new());
 
@@ -463,11 +457,11 @@ where
             executor.run(executor_shutdown).await;
         });
 
-        // Main request loop — each request is spawned as an independent task
-        // so the loop can immediately process the next request. This eliminates
-        // head-of-line blocking where a slow cache lookup or job submission
-        // delays processing of subsequent requests (critical during X-Plane
-        // scene loads that burst 100+ concurrent FUSE reads).
+        // Main request loop — requests are processed inline (cache check +
+        // coalescer + job submission are all <10µs). Long-running work (waiting
+        // for job completion) is already spawned inside handle_request. This
+        // keeps the executor pipeline fed without deferring job submission to
+        // the Tokio scheduler, which can starve the pipeline under load.
         loop {
             tokio::select! {
                 biased;
@@ -480,14 +474,14 @@ where
 
                 // Receive new job requests
                 Some(request) = request_rx.recv() => {
-                    tokio::spawn(Self::handle_request(
+                    Self::handle_request(
                         request,
-                        Arc::clone(&submitter),
-                        Arc::clone(&factory),
-                        Arc::clone(&memory_cache),
-                        Arc::clone(&coalescer),
-                        Arc::clone(&metrics_client),
-                    ));
+                        &submitter,
+                        &factory,
+                        &memory_cache,
+                        &coalescer,
+                        &metrics_client,
+                    ).await;
                 }
             }
         }
@@ -499,11 +493,11 @@ where
 
     async fn handle_request(
         request: JobRequest,
-        submitter: Arc<ExecutorSubmitter>,
-        factory: Arc<F>,
-        memory_cache: Arc<M>,
-        coalescer: Arc<DaemonCoalescer>,
-        metrics_client: Arc<Option<MetricsClient>>,
+        submitter: &ExecutorSubmitter,
+        factory: &Arc<F>,
+        memory_cache: &Arc<M>,
+        coalescer: &Arc<DaemonCoalescer>,
+        metrics_client: &Option<MetricsClient>,
     ) {
         let start = Instant::now();
         let tile = request.tile;
@@ -551,7 +545,7 @@ where
             );
 
             // Track cache hit
-            if let Some(ref client) = *metrics_client {
+            if let Some(client) = metrics_client {
                 client.memory_cache_hit();
             }
 
@@ -608,7 +602,7 @@ where
             cache_status = "miss",
             "Cache miss - submitting job"
         );
-        if let Some(ref client) = *metrics_client {
+        if let Some(client) = metrics_client {
             client.memory_cache_miss();
         }
 
@@ -625,14 +619,14 @@ where
 
                 // Track job submitted (FUSE requests are from RequestOrigin::Fuse)
                 let is_fuse = origin.is_fuse();
-                if let Some(ref client) = *metrics_client {
+                if let Some(client) = metrics_client {
                     client.job_submitted(is_fuse);
                 }
 
-                let memory_cache = Arc::clone(&memory_cache);
-                let coalescer = Arc::clone(&coalescer);
+                let memory_cache = Arc::clone(memory_cache);
+                let coalescer = Arc::clone(coalescer);
                 let cancellation = request.cancellation.clone();
-                let metrics_for_completion = metrics_client.as_ref().clone();
+                let metrics_for_completion = metrics_client.clone();
                 let dsf_tile_for_log = dsf_tile.clone();
 
                 tokio::spawn(async move {
