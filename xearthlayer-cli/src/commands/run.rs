@@ -40,6 +40,11 @@ pub struct RunArgs {
 
 /// Run the run command.
 pub fn run(args: RunArgs) -> Result<(), CliError> {
+    // Raise file descriptor limit to the hard maximum before opening any files.
+    // XEL's FUSE mount + HTTP connections + disk cache can exceed the default
+    // soft limit (often 1024) inherited from the desktop environment.
+    raise_fd_limit();
+
     // Initialize panic handler early for crash cleanup
     panic_handler::init();
 
@@ -338,6 +343,35 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     println!("All packages unmounted. Goodbye!");
 
     Ok(())
+}
+
+/// Raise the file descriptor soft limit to the hard maximum.
+///
+/// Linux processes inherit a soft FD limit (often 1024) that can be lower
+/// than the hard limit. XEL needs many FDs simultaneously: HTTP connections
+/// to the imagery CDN, disk cache file handles, and FUSE file descriptors
+/// for X-Plane's open textures. This raises the soft limit to the hard
+/// limit (no root required), matching what the system administrator allows.
+fn raise_fd_limit() {
+    match rlimit::Resource::NOFILE.get() {
+        Ok((soft, hard)) if soft < hard => {
+            if let Err(e) = rlimit::Resource::NOFILE.set(hard, hard) {
+                tracing::warn!(soft, hard, error = %e, "Failed to raise FD limit");
+            } else {
+                tracing::info!(
+                    old_soft = soft,
+                    new_soft = hard,
+                    "Raised file descriptor limit"
+                );
+            }
+        }
+        Ok((soft, _)) => {
+            tracing::debug!(soft, "FD limit already at maximum");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to query FD limit");
+        }
+    }
 }
 
 /// Display warning if configuration file needs upgrade.
