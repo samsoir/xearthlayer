@@ -40,11 +40,6 @@ pub struct RunArgs {
 
 /// Run the run command.
 pub fn run(args: RunArgs) -> Result<(), CliError> {
-    // Raise file descriptor limit to the hard maximum before opening any files.
-    // XEL's FUSE mount + HTTP connections + disk cache can exceed the default
-    // soft limit (often 1024) inherited from the desktop environment.
-    raise_fd_limit();
-
     // Initialize panic handler early for crash cleanup
     panic_handler::init();
 
@@ -65,6 +60,13 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
 
     let runner = CliRunner::with_options(args.debug, args.profile)?;
     runner.log_startup("run");
+
+    // Raise file descriptor limit to the hard maximum. XEL's FUSE mount +
+    // HTTP connections + disk cache can exceed the default soft limit (often
+    // 1024) inherited from the desktop environment. Safe to call at any time;
+    // takes effect immediately for all subsequent open() calls.
+    raise_fd_limit();
+
     let config = runner.config();
 
     // Check for config upgrade needs
@@ -353,22 +355,23 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
 /// for X-Plane's open textures. This raises the soft limit to the hard
 /// limit (no root required), matching what the system administrator allows.
 fn raise_fd_limit() {
-    // Note: this runs before logging is initialized, so use eprintln
-    // for diagnostics. tracing calls would be silently dropped.
     match rlimit::Resource::NOFILE.get() {
         Ok((soft, hard)) if soft < hard => {
             if let Err(e) = rlimit::Resource::NOFILE.set(hard, hard) {
-                eprintln!(
-                    "Warning: failed to raise FD limit from {} to {}: {}",
-                    soft, hard, e
-                );
+                tracing::warn!(soft, hard, error = %e, "Failed to raise FD limit");
             } else {
-                eprintln!("FD limit: {} → {}", soft, hard);
+                tracing::info!(
+                    old_soft = soft,
+                    new_soft = hard,
+                    "Raised file descriptor limit"
+                );
             }
         }
-        Ok(_) => {} // Already at maximum, nothing to do
+        Ok((soft, _)) => {
+            tracing::debug!(soft, "FD limit already at maximum");
+        }
         Err(e) => {
-            eprintln!("Warning: failed to query FD limit: {}", e);
+            tracing::warn!(error = %e, "Failed to query FD limit");
         }
     }
 }
