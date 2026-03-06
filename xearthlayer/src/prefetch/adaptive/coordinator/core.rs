@@ -153,6 +153,13 @@ pub struct AdaptivePrefetchCoordinator {
 
     /// Scene tracker for observing X-Plane tile requests.
     scene_tracker: Option<Arc<dyn SceneTracker>>,
+
+    /// Scenery index for tile lookup (actual installed zoom levels).
+    ///
+    /// Used by the boundary prefetch path to discover which zoom levels
+    /// are actually installed in each DSF region, rather than hardcoding
+    /// a single zoom level. Also forwarded to [`GroundStrategy`].
+    scenery_index: Option<Arc<SceneryIndex>>,
 }
 
 impl std::fmt::Debug for AdaptivePrefetchCoordinator {
@@ -211,6 +218,7 @@ impl AdaptivePrefetchCoordinator {
             scenery_window,
             boundary_strategy,
             scene_tracker: None,
+            scenery_index: None,
         }
     }
 
@@ -248,8 +256,13 @@ impl AdaptivePrefetchCoordinator {
     }
 
     /// Set the scenery index for tile lookup.
+    ///
+    /// The index is used by both the ground strategy (ring-based prefetch)
+    /// and the boundary strategy (cruise prefetch) to discover actual
+    /// installed zoom levels rather than assuming zoom 14.
     pub fn with_scenery_index(mut self, index: Arc<SceneryIndex>) -> Self {
-        self.ground_strategy = self.ground_strategy.with_scenery_index(index);
+        self.ground_strategy = self.ground_strategy.with_scenery_index(Arc::clone(&index));
+        self.scenery_index = Some(index);
         self
     }
 
@@ -290,6 +303,33 @@ impl AdaptivePrefetchCoordinator {
     pub fn with_scene_tracker(mut self, tracker: Arc<dyn SceneTracker>) -> Self {
         self.scene_tracker = Some(tracker);
         self
+    }
+
+    /// Get DDS tiles for a DSF region from the scenery index or geometric fallback.
+    ///
+    /// If a scenery index is available, queries it for tiles in the region.
+    /// This returns tiles at whatever zoom levels are actually installed in the
+    /// X-Plane scenery (e.g., ZL12 at cruise altitude), rather than assuming
+    /// a fixed zoom level.
+    ///
+    /// Falls back to the boundary strategy's geometric 4x4 grid expansion at
+    /// zoom 14 when no scenery index is available or has no tiles for the region.
+    fn get_tiles_for_region(&self, region: &DsfRegion) -> Vec<TileCoord> {
+        if let Some(ref index) = self.scenery_index {
+            let center_lat = region.lat as f64 + 0.5;
+            let center_lon = region.lon as f64 + 0.5;
+            // 1° DSF region ≈ 60nm at equator, 45nm radius covers the region
+            let tiles = index.tiles_near(center_lat, center_lon, 45.0);
+            let result: Vec<TileCoord> = tiles.iter().map(|t| t.to_tile_coord()).collect();
+
+            if !result.is_empty() {
+                return result;
+            }
+            // Fall through to geometric expansion if index had no tiles
+        }
+
+        // Fallback: geometric grid at zoom 14
+        self.boundary_strategy.expand_to_tiles(region, 14)
     }
 
     /// Get the scenery window for external monitoring.
@@ -437,19 +477,22 @@ impl AdaptivePrefetchCoordinator {
                             let filtered = self
                                 .boundary_strategy
                                 .filter_already_handled(&targets, geo_index);
-                            let filtered_owned: Vec<_> = filtered.into_iter().cloned().collect();
-                            let tiles = self.boundary_strategy.expand_targets_to_tiles(
-                                &filtered_owned,
-                                geo_index,
-                                14,
-                            );
-                            all_tiles.extend(tiles);
+                            for target in filtered {
+                                let tiles = self.get_tiles_for_region(&target.region);
+                                if tiles.is_empty() {
+                                    self.boundary_strategy
+                                        .mark_no_coverage(&target.region, geo_index);
+                                } else {
+                                    self.boundary_strategy
+                                        .mark_in_progress(&target.region, geo_index);
+                                    all_tiles.extend(tiles);
+                                }
+                            }
                         } else {
                             // No GeoIndex -- expand all targets without filtering
                             for target in &targets {
-                                all_tiles.extend(
-                                    self.boundary_strategy.expand_to_tiles(&target.region, 14),
-                                );
+                                all_tiles
+                                    .extend(self.get_tiles_for_region(&target.region));
                             }
                         }
                     }
@@ -817,7 +860,11 @@ impl AdaptivePrefetchCoordinator {
         // Periodic region maintenance: sweep stale InProgress and promote completed
         if let Some(ref geo_index) = self.geo_index {
             BoundaryStrategy::sweep_stale_regions(geo_index, self.config.stale_region_timeout);
-            BoundaryStrategy::promote_completed_regions(geo_index, &self.cached_tiles, 14);
+            BoundaryStrategy::promote_completed_regions(
+                geo_index,
+                &self.cached_tiles,
+                self.scenery_index.as_ref(),
+            );
         }
 
         Some(submitted)
@@ -863,8 +910,13 @@ impl AdaptivePrefetchCoordinator {
             tiles_submitted_last_cycle: submitted as u64,
             tiles_submitted_total: self.total_tiles_submitted,
             cache_hits: self.total_cache_hits,
-            ttl_skipped: 0,               // Not tracked in adaptive
-            active_zoom_levels: vec![14], // Fallback uses zoom 14
+            ttl_skipped: 0, // Not tracked in adaptive
+            active_zoom_levels: {
+                let mut zooms: Vec<u8> = plan.tiles.iter().map(|t| t.zoom).collect();
+                zooms.sort_unstable();
+                zooms.dedup();
+                zooms
+            },
             is_active: submitted > 0,
             circuit_state,
             loading_tiles,
@@ -925,7 +977,7 @@ impl AdaptivePrefetchCoordinator {
             tiles_submitted_total: self.total_tiles_submitted,
             cache_hits: self.total_cache_hits,
             ttl_skipped: 0,
-            active_zoom_levels: vec![14],
+            active_zoom_levels: vec![],
             is_active: false,
             circuit_state,
             loading_tiles: vec![],
@@ -1915,5 +1967,110 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         coord.update((47.5, 10.5), 270.0, 10.0, 0.0);
         assert!(!coord.transition_throttle.is_active());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scenery index zoom level tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Helper to create a SceneryIndex with tiles at a specific chunk zoom level.
+    fn make_scenery_index(lat: i32, lon: i32, chunk_zoom: u8) -> Arc<SceneryIndex> {
+        use crate::coord::{to_tile_coords, CHUNKS_PER_TILE_SIDE, CHUNK_ZOOM_OFFSET};
+        use crate::prefetch::scenery_index::{SceneryIndexConfig, SceneryTile};
+
+        let index = SceneryIndex::new(SceneryIndexConfig::default());
+        let tile_zoom = chunk_zoom - CHUNK_ZOOM_OFFSET;
+
+        for lat_step in 0..4u32 {
+            for lon_step in 0..4u32 {
+                let sample_lat = lat as f64 + (lat_step as f64 * 0.25) + 0.125;
+                let sample_lon = lon as f64 + (lon_step as f64 * 0.25) + 0.125;
+                if let Ok(coord) = to_tile_coords(sample_lat, sample_lon, tile_zoom) {
+                    index.add_tile(SceneryTile {
+                        row: coord.row * CHUNKS_PER_TILE_SIDE,
+                        col: coord.col * CHUNKS_PER_TILE_SIDE,
+                        chunk_zoom,
+                        lat: sample_lat as f32,
+                        lon: sample_lon as f32,
+                        is_sea: false,
+                    });
+                }
+            }
+        }
+
+        Arc::new(index)
+    }
+
+    #[test]
+    fn test_get_tiles_for_region_without_index_uses_zoom_14() {
+        let coord = AdaptivePrefetchCoordinator::with_defaults();
+        let region = DsfRegion::new(50, 9);
+
+        let tiles = coord.get_tiles_for_region(&region);
+        assert!(!tiles.is_empty());
+        for tile in &tiles {
+            assert_eq!(tile.zoom, 14, "Without scenery index, should use zoom 14");
+        }
+    }
+
+    #[test]
+    fn test_get_tiles_for_region_with_index_uses_actual_zoom() {
+        // chunk_zoom 16 → tile zoom 12
+        let index = make_scenery_index(50, 9, 16);
+        let coord = AdaptivePrefetchCoordinator::with_defaults().with_scenery_index(index);
+        let region = DsfRegion::new(50, 9);
+
+        let tiles = coord.get_tiles_for_region(&region);
+        assert!(!tiles.is_empty());
+        for tile in &tiles {
+            assert_eq!(
+                tile.zoom, 12,
+                "With scenery index at chunk_zoom 16, should use tile zoom 12"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_tiles_for_region_with_index_at_zoom_18() {
+        // chunk_zoom 18 → tile zoom 14
+        let index = make_scenery_index(50, 9, 18);
+        let coord = AdaptivePrefetchCoordinator::with_defaults().with_scenery_index(index);
+        let region = DsfRegion::new(50, 9);
+
+        let tiles = coord.get_tiles_for_region(&region);
+        assert!(!tiles.is_empty());
+        for tile in &tiles {
+            assert_eq!(
+                tile.zoom, 14,
+                "With scenery index at chunk_zoom 18, should use tile zoom 14"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_tiles_for_region_falls_back_when_no_coverage() {
+        // Index has tiles at (60, 20) but we query (50, 9)
+        let index = make_scenery_index(60, 20, 16);
+        let coord = AdaptivePrefetchCoordinator::with_defaults().with_scenery_index(index);
+        let region = DsfRegion::new(50, 9);
+
+        let tiles = coord.get_tiles_for_region(&region);
+        assert!(!tiles.is_empty());
+        for tile in &tiles {
+            assert_eq!(
+                tile.zoom, 14,
+                "Should fall back to zoom 14 when scenery index has no coverage"
+            );
+        }
+    }
+
+    #[test]
+    fn test_with_scenery_index_stores_on_coordinator() {
+        let index = make_scenery_index(50, 9, 16);
+        let coord = AdaptivePrefetchCoordinator::with_defaults().with_scenery_index(index);
+        assert!(
+            coord.scenery_index.is_some(),
+            "with_scenery_index should store index on coordinator"
+        );
     }
 }

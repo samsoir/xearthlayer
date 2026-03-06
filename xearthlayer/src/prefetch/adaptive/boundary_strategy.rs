@@ -10,9 +10,12 @@
 //! - [`BoundaryStrategy::promote_completed_regions`] — promotes `InProgress`
 //!   regions to `Prefetched` once all their tiles are confirmed in cache.
 
+use std::sync::Arc;
+
 use super::boundary_monitor::{BoundaryAxis, BoundaryCrossing};
 use crate::coord::{to_tile_coords, TileCoord};
 use crate::geo_index::{DsfRegion, GeoIndex, PrefetchedRegion};
+use crate::prefetch::SceneryIndex;
 
 /// A DSF region targeted for prefetch, with ordering metadata.
 #[derive(Debug, Clone)]
@@ -172,7 +175,7 @@ impl BoundaryStrategy {
     pub fn promote_completed_regions(
         geo_index: &GeoIndex,
         cached_tiles: &std::collections::HashSet<TileCoord>,
-        zoom: u8,
+        scenery_index: Option<&Arc<SceneryIndex>>,
     ) -> usize {
         let strategy = BoundaryStrategy::new();
         let in_progress: Vec<DsfRegion> = geo_index
@@ -184,7 +187,7 @@ impl BoundaryStrategy {
 
         let mut promoted = 0;
         for region in &in_progress {
-            let tiles = strategy.expand_to_tiles(region, zoom);
+            let tiles = Self::tiles_for_region(&strategy, region, scenery_index);
             if !tiles.is_empty() && tiles.iter().all(|t| cached_tiles.contains(t)) {
                 geo_index.insert::<PrefetchedRegion>(*region, PrefetchedRegion::prefetched());
                 promoted += 1;
@@ -195,6 +198,27 @@ impl BoundaryStrategy {
             tracing::debug!(promoted, "Promoted InProgress regions to Prefetched");
         }
         promoted
+    }
+
+    /// Get tiles for a DSF region using scenery index when available.
+    ///
+    /// Queries the scenery index for actual installed tiles (at correct zoom
+    /// levels), falling back to geometric 4x4 grid at zoom 14.
+    fn tiles_for_region(
+        strategy: &BoundaryStrategy,
+        region: &DsfRegion,
+        scenery_index: Option<&Arc<SceneryIndex>>,
+    ) -> Vec<TileCoord> {
+        if let Some(index) = scenery_index {
+            let center_lat = region.lat as f64 + 0.5;
+            let center_lon = region.lon as f64 + 0.5;
+            let tiles = index.tiles_near(center_lat, center_lon, 45.0);
+            let result: Vec<TileCoord> = tiles.iter().map(|t| t.to_tile_coord()).collect();
+            if !result.is_empty() {
+                return result;
+            }
+        }
+        strategy.expand_to_tiles(region, 14)
     }
 
     /// Expand target regions into DDS tiles, marking each region as InProgress.
@@ -545,7 +569,9 @@ mod tests {
         // Put all tiles into the cached set
         let cached_tiles: std::collections::HashSet<TileCoord> = tiles.into_iter().collect();
 
-        let promoted = BoundaryStrategy::promote_completed_regions(&geo_index, &cached_tiles, 14);
+        // No scenery index — uses geometric fallback
+        let promoted =
+            BoundaryStrategy::promote_completed_regions(&geo_index, &cached_tiles, None);
         assert_eq!(promoted, 1);
 
         let state = geo_index.get::<PrefetchedRegion>(&region).unwrap();
@@ -568,7 +594,8 @@ mod tests {
         let mut cached_tiles = std::collections::HashSet::new();
         cached_tiles.insert(tiles[0]);
 
-        let promoted = BoundaryStrategy::promote_completed_regions(&geo_index, &cached_tiles, 14);
+        let promoted =
+            BoundaryStrategy::promote_completed_regions(&geo_index, &cached_tiles, None);
         assert_eq!(promoted, 0);
 
         let state = geo_index.get::<PrefetchedRegion>(&region).unwrap();
@@ -608,5 +635,138 @@ mod tests {
             .get::<PrefetchedRegion>(&DsfRegion::new(54, 5))
             .unwrap()
             .is_in_progress());
+    }
+
+    // =========================================================================
+    // tiles_for_region + SceneryIndex integration
+    // =========================================================================
+
+    /// Create a SceneryIndex populated with tiles for a specific DSF region.
+    fn make_scenery_index_for_region(lat: i32, lon: i32, chunk_zoom: u8) -> Arc<SceneryIndex> {
+        use crate::coord::{to_tile_coords, CHUNKS_PER_TILE_SIDE, CHUNK_ZOOM_OFFSET};
+        use crate::prefetch::scenery_index::{SceneryIndexConfig, SceneryTile};
+
+        let index = SceneryIndex::new(SceneryIndexConfig::default());
+
+        // Sample a 4x4 grid within the 1° DSF region and add tiles
+        for lat_step in 0..4u32 {
+            for lon_step in 0..4u32 {
+                let sample_lat = lat as f64 + (lat_step as f64 * 0.25) + 0.125;
+                let sample_lon = lon as f64 + (lon_step as f64 * 0.25) + 0.125;
+                let tile_zoom = chunk_zoom - CHUNK_ZOOM_OFFSET;
+                if let Ok(coord) = to_tile_coords(sample_lat, sample_lon, tile_zoom) {
+                    index.add_tile(SceneryTile {
+                        row: coord.row * CHUNKS_PER_TILE_SIDE,
+                        col: coord.col * CHUNKS_PER_TILE_SIDE,
+                        chunk_zoom,
+                        lat: sample_lat as f32,
+                        lon: sample_lon as f32,
+                        is_sea: false,
+                    });
+                }
+            }
+        }
+
+        Arc::new(index)
+    }
+
+    #[test]
+    fn test_tiles_for_region_without_scenery_index_uses_zoom_14() {
+        let strategy = BoundaryStrategy::new();
+        let region = DsfRegion::new(50, 9);
+
+        // No scenery index → falls back to geometric expansion at zoom 14
+        let tiles = BoundaryStrategy::tiles_for_region(&strategy, &region, None);
+
+        assert!(!tiles.is_empty());
+        for tile in &tiles {
+            assert_eq!(tile.zoom, 14, "Fallback should use zoom 14");
+        }
+    }
+
+    #[test]
+    fn test_tiles_for_region_with_scenery_index_uses_actual_zoom() {
+        let strategy = BoundaryStrategy::new();
+        let region = DsfRegion::new(50, 9);
+
+        // SceneryIndex populated at chunk_zoom 16 → tile zoom 12
+        let index = make_scenery_index_for_region(50, 9, 16);
+        let tiles = BoundaryStrategy::tiles_for_region(&strategy, &region, Some(&index));
+
+        assert!(!tiles.is_empty());
+        for tile in &tiles {
+            assert_eq!(tile.zoom, 12, "Should use zoom 12 from scenery index (chunk_zoom 16)");
+        }
+    }
+
+    #[test]
+    fn test_tiles_for_region_falls_back_when_index_empty_for_region() {
+        let strategy = BoundaryStrategy::new();
+        let region = DsfRegion::new(50, 9);
+
+        // SceneryIndex exists but has tiles only at different region (60, 20)
+        let index = make_scenery_index_for_region(60, 20, 16);
+        let tiles = BoundaryStrategy::tiles_for_region(&strategy, &region, Some(&index));
+
+        assert!(!tiles.is_empty());
+        for tile in &tiles {
+            assert_eq!(tile.zoom, 14, "Should fall back to zoom 14 when no index tiles nearby");
+        }
+    }
+
+    #[test]
+    fn test_promote_completed_regions_with_scenery_index() {
+        let geo_index = GeoIndex::new();
+        let region = DsfRegion::new(50, 9);
+
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+
+        // SceneryIndex at chunk_zoom 16 → tile zoom 12
+        let index = make_scenery_index_for_region(50, 9, 16);
+
+        // Get tiles via SceneryIndex — these are zoom 12 tiles
+        let strategy = BoundaryStrategy::new();
+        let tiles = BoundaryStrategy::tiles_for_region(&strategy, &region, Some(&index));
+        assert!(!tiles.is_empty());
+        assert!(tiles.iter().all(|t| t.zoom == 12));
+
+        // Cache all the zoom 12 tiles
+        let cached_tiles: std::collections::HashSet<TileCoord> = tiles.into_iter().collect();
+
+        // Promote should work with SceneryIndex (not hardcoded zoom 14)
+        let promoted =
+            BoundaryStrategy::promote_completed_regions(&geo_index, &cached_tiles, Some(&index));
+        assert_eq!(promoted, 1, "Should promote when all scenery index tiles are cached");
+
+        let state = geo_index.get::<PrefetchedRegion>(&region).unwrap();
+        assert!(state.is_prefetched());
+    }
+
+    #[test]
+    fn test_promote_fails_with_wrong_zoom_cached() {
+        let geo_index = GeoIndex::new();
+        let region = DsfRegion::new(50, 9);
+
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+
+        // SceneryIndex at chunk_zoom 16 → tile zoom 12
+        let index = make_scenery_index_for_region(50, 9, 16);
+
+        // Cache zoom 14 tiles (the OLD wrong behavior) instead of zoom 12
+        let strategy = BoundaryStrategy::new();
+        let wrong_tiles = strategy.expand_to_tiles(&region, 14);
+        let cached_tiles: std::collections::HashSet<TileCoord> =
+            wrong_tiles.into_iter().collect();
+
+        // Promote should NOT succeed — cached zoom 14, but index expects zoom 12
+        let promoted =
+            BoundaryStrategy::promote_completed_regions(&geo_index, &cached_tiles, Some(&index));
+        assert_eq!(
+            promoted, 0,
+            "Should not promote when cached tiles are at wrong zoom level"
+        );
+
+        let state = geo_index.get::<PrefetchedRegion>(&region).unwrap();
+        assert!(state.is_in_progress());
     }
 }
