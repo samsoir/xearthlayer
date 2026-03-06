@@ -141,9 +141,9 @@ pub const DEFAULT_GENERATION_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_PREFETCH_UDP_PORT: u16 = 49002;
 
 /// Default maximum tiles to submit per prefetch cycle.
-/// Kept low (30) to avoid starving X-Plane of system resources during
-/// ground operations and departure. Prewarm is not affected by this limit.
-pub const DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE: usize = 30;
+/// This controls queue depth, not processing rate — actual CPU consumption
+/// is governed by the prefetch fraction in `ResourcePool`.
+pub const DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE: usize = 200;
 
 /// Default interval between prefetch cycles in milliseconds.
 pub const DEFAULT_PREFETCH_CYCLE_INTERVAL_MS: u64 = 2000;

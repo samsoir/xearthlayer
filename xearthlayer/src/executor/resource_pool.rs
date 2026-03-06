@@ -53,7 +53,12 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// ON_DEMAND tasks always have access to the full pool. Prefetch and
 /// housekeeping tasks are capped at this fraction, reserving the remainder
 /// exclusively for on-demand work.
-pub const DEFAULT_MAX_PREFETCH_FRACTION: f64 = 0.75;
+///
+/// Set to 0.30 to keep prefetch CPU usage at ~30-40% of available cores.
+/// On a 32-core system (CPU pool = 40), this allows 12 concurrent prefetch
+/// tasks — enough for steady throughput without starving X-Plane of shared
+/// resources (memory bandwidth, L3 cache).
+pub const DEFAULT_MAX_PREFETCH_FRACTION: f64 = 0.30;
 
 // =============================================================================
 // Resource Pool Configuration Constants
@@ -975,5 +980,59 @@ mod tests {
         // Network and DiskIO are at 0% — CPU is the max
         assert!((pools.network().utilization() - 0.0).abs() < f64::EPSILON);
         assert!((pools.disk_io().utilization() - 0.0).abs() < f64::EPSILON);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Prefetch capacity budget tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_default_prefetch_fraction_limits_to_thirty_percent() {
+        // The default prefetch fraction must cap prefetch at ~30% of pool capacity.
+        // On a 32-core system (CPU pool = 40), this gives ~12 concurrent prefetch
+        // CPU tasks — enough for steady throughput without starving X-Plane of
+        // shared resources (memory bandwidth, L3 cache).
+        assert!(
+            (DEFAULT_MAX_PREFETCH_FRACTION - 0.30).abs() < f64::EPSILON,
+            "Default prefetch fraction should be 0.30, got {}",
+            DEFAULT_MAX_PREFETCH_FRACTION
+        );
+    }
+
+    #[test]
+    fn test_prefetch_cpu_budget_on_32_core_system() {
+        // Simulate a 32-core system: CPU pool = max(32 * 1.25, 32 + 2) = 40
+        // With 0.30 fraction, prefetch gets ceil(40 * 0.30) = 12 concurrent tasks.
+        // This uses ~12/32 = ~38% of CPU cores — within the 30-50% target.
+        let cpu_capacity = 40;
+        let pool = ResourcePool::with_prefetch_fraction(
+            ResourceType::CPU,
+            cpu_capacity,
+            DEFAULT_MAX_PREFETCH_FRACTION,
+        );
+
+        assert_eq!(
+            pool.max_prefetch_capacity(),
+            12,
+            "On a 40-capacity CPU pool, prefetch should get 12 permits"
+        );
+
+        // Acquire all 12 prefetch permits
+        let mut permits = Vec::new();
+        for _ in 0..12 {
+            let p = pool.try_acquire_for_priority(Priority::PREFETCH);
+            assert!(p.is_some(), "Should be able to acquire 12 prefetch permits");
+            permits.push(p);
+        }
+
+        // 13th prefetch must be denied — budget exhausted
+        let denied = pool.try_acquire_for_priority(Priority::PREFETCH);
+        assert!(
+            denied.is_none(),
+            "13th prefetch permit should be denied (budget is 12)"
+        );
+
+        // ON_DEMAND still has 28 slots available
+        assert_eq!(pool.available(), cpu_capacity - 12);
     }
 }
