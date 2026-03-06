@@ -196,7 +196,7 @@ pub const DEFAULT_RAMP_START_FRACTION: f64 = 0.25;
 // =============================================================================
 
 /// Default boundary trigger distance in degrees.
-pub const DEFAULT_PREFETCH_TRIGGER_DISTANCE: f64 = 1.5;
+pub const DEFAULT_PREFETCH_TRIGGER_DISTANCE: f64 = 3.0;
 
 /// Default DSF tiles deep per crossing.
 pub const DEFAULT_PREFETCH_LOAD_DEPTH: u8 = 3;

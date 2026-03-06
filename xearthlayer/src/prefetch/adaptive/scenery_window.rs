@@ -46,7 +46,7 @@ impl Default for SceneryWindowConfig {
             default_rows: 6,
             default_cols: 8,
             buffer: 1,
-            trigger_distance: 1.5,
+            trigger_distance: 3.0,
             load_depth: 3,
         }
     }
@@ -183,8 +183,12 @@ impl SceneryWindow {
                 if let Some(ref mut lon_mon) = self.lon_monitor {
                     lon_mon.update_edges(bounds.min_lon, bounds.max_lon);
                 }
-                self.last_bounds =
-                    Some((bounds.min_lat, bounds.max_lat, bounds.min_lon, bounds.max_lon));
+                self.last_bounds = Some((
+                    bounds.min_lat,
+                    bounds.max_lat,
+                    bounds.min_lon,
+                    bounds.max_lon,
+                ));
             }
         }
     }
@@ -611,13 +615,14 @@ mod tests {
     #[test]
     fn test_check_boundaries_returns_empty_when_centered() {
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
-        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
+        // Use a wider window (10° lat, 14° lon) so center is >3.0° from all edges
+        tracker.set_bounds(make_bounds(45.0, 55.0, 0.0, 14.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
         window.update_from_tracker(tracker.as_ref());
         window.update_from_tracker(tracker.as_ref());
 
-        // Aircraft in the middle — far from all edges
+        // Aircraft in the middle — 5.0° from lat edges, 7.0° from lon edges
         let predictions = window.check_boundaries(50.0, 7.0);
         assert!(predictions.is_empty());
     }

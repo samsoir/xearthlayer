@@ -208,7 +208,7 @@ ramp_duration_secs = {}
 ramp_start_fraction = {}
 
 ; Boundary-driven prefetch settings
-; Boundary trigger distance in degrees (default: 1.5, range: 0.5-3.0)
+; Boundary trigger distance in degrees (default: 3.0, range: 0.5-3.0)
 ; How close to a DSF boundary to trigger prefetch
 trigger_distance = {}
 ; DSF tiles deep per crossing (default: 3, range: 1-5)

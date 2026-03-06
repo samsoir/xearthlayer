@@ -335,7 +335,7 @@ pub struct BoundaryMonitor {
     axis: BoundaryAxis,        // Latitude or Longitude
     window_min: f64,           // e.g., lat 47.0 (south edge)
     window_max: f64,           // e.g., lat 53.0 (north edge)
-    trigger_distance: f64,     // e.g., 1.5° from edge
+    trigger_distance: f64,     // e.g., 3.0° from edge
 }
 ```
 
@@ -347,7 +347,7 @@ LatitudeMonitor:
     window north edge = 53.0
     distance to north edge = 0.45°
 
-    0.45° < trigger_distance (1.5°)? YES
+    0.45° < trigger_distance (3.0°)? YES
     → Predict: ROW load at lat 53, 54, 55 (3 deep north)
 
 LongitudeMonitor:
@@ -355,7 +355,7 @@ LongitudeMonitor:
     window east edge = 11.0
     distance to east edge = 3.8°
 
-    3.8° < trigger_distance (1.5°)? NO
+    3.8° < trigger_distance (3.0°)? NO
     → No prediction this cycle
 ```
 
@@ -689,8 +689,8 @@ ground_ring_radius = 1.0
 # When the aircraft is within this distance of the X-Plane window edge,
 # the boundary monitor triggers prefetch for the next row/column.
 # Range: 0.5 - 3.0
-# Default: 1.5
-trigger_distance = 1.5
+# Default: 3.0
+trigger_distance = 3.0
 
 # DSF tiles deep per row/column load
 # Matches X-Plane's observed 3-deep strip loading pattern.

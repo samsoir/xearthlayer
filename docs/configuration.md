@@ -342,7 +342,7 @@ The system uses flight phase detection and performance calibration:
 | `landing_hysteresis_secs` | integer | `15` | Sustained seconds at GS < 40kt before landing detection (5-60) |
 | `ramp_duration_secs` | integer | `30` | Duration of linear ramp to full prefetch rate (10-120) |
 | `ramp_start_fraction` | float | `0.25` | Starting prefetch fraction when ramp begins (0.1-0.5) |
-| `trigger_distance` | float | `1.5` | DSF boundary distance (degrees) to trigger prefetch (0.5-3.0) |
+| `trigger_distance` | float | `3.0` | DSF boundary distance (degrees) to trigger prefetch (0.5-3.0) |
 | `load_depth` | integer | `3` | Number of DSF rows/columns to prefetch ahead (1-5) |
 | `window_buffer` | integer | `1` | Extra DSF tiles around window edges to retain (0-3) |
 | `stale_region_timeout` | integer | `120` | Seconds before an InProgress region is considered stale (30-600) |
@@ -396,7 +396,7 @@ ramp_duration_secs = 30                      ; Linear ramp duration after hold r
 ramp_start_fraction = 0.25                   ; Starting prefetch fraction (25%)
 
 ; Boundary-driven prefetch (cruise mode)
-; trigger_distance = 1.5                     ; DSF boundary distance (degrees) to trigger
+; trigger_distance = 3.0                     ; DSF boundary distance (degrees) to trigger
 ; load_depth = 3                             ; DSF rows/columns to prefetch ahead
 ; window_buffer = 1                          ; Extra DSF tiles around window edges
 ; stale_region_timeout = 120                 ; Seconds before InProgress region is stale
@@ -645,7 +645,7 @@ mode = auto                    ; auto, aggressive, opportunistic, disabled
 ; ramp_start_fraction = 0.25                 ; starting prefetch fraction
 
 ; Boundary-driven prefetch (cruise mode)
-; trigger_distance = 1.5                     ; DSF boundary distance (degrees) to trigger
+; trigger_distance = 3.0                     ; DSF boundary distance (degrees) to trigger
 ; load_depth = 3                             ; DSF rows/columns to prefetch ahead
 ; window_buffer = 1                          ; extra DSF tiles around window edges
 ; stale_region_timeout = 120                 ; seconds before InProgress region is stale

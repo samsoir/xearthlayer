@@ -1781,7 +1781,7 @@ mod tests {
         let plan = coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
 
         // Aircraft at lat=52.0, near north edge of window (max_lat=53.0),
-        // trigger_distance=1.5° → should trigger a boundary crossing.
+        // trigger_distance=3.0° → should trigger a boundary crossing.
         // If plan is Some, it should have tiles and strategy "boundary".
         if coord.status.phase == FlightPhase::Cruise {
             assert!(
