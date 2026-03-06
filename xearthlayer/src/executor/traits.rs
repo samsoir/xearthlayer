@@ -297,6 +297,16 @@ impl TokioExecutor {
     }
 }
 
+/// Nice increment applied to blocking worker threads.
+///
+/// Positive values lower the OS scheduling priority, allowing other processes
+/// (like X-Plane) to get preferential CPU access. The value is additive:
+/// nice(10) on a thread at nice 0 results in nice 10.
+///
+/// Range: 0 (no change) to 19 (lowest priority). 10 is a moderate reduction
+/// that still allows good throughput when the system is otherwise idle.
+const BLOCKING_THREAD_NICE_INCREMENT: i32 = 10;
+
 impl BlockingExecutor for TokioExecutor {
     fn execute_blocking<F, R>(
         &self,
@@ -307,9 +317,19 @@ impl BlockingExecutor for TokioExecutor {
         R: Send + 'static,
     {
         Box::pin(async move {
-            tokio::task::spawn_blocking(f)
-                .await
-                .map_err(|e| ExecutorError::TaskPanicked(e.to_string()))
+            tokio::task::spawn_blocking(move || {
+                // Lower this thread's OS scheduling priority so CPU-bound work
+                // (DDS encoding, image assembly) yields to X-Plane and other
+                // foreground processes. nice() is per-thread on Linux and sticky,
+                // but safe to call repeatedly (Tokio reuses blocking threads).
+                #[cfg(unix)]
+                unsafe {
+                    libc::nice(BLOCKING_THREAD_NICE_INCREMENT);
+                }
+                f()
+            })
+            .await
+            .map_err(|e| ExecutorError::TaskPanicked(e.to_string()))
         })
     }
 }
@@ -534,5 +554,27 @@ mod tests {
         // Use futures::executor for a simple sync test
         let result = futures::executor::block_on(future);
         assert_eq!(result.unwrap(), 42);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_blocking_tasks_run_at_reduced_priority() {
+        let executor = TokioExecutor::new();
+
+        // Get the nice level inside a spawn_blocking task
+        let nice_level = executor
+            .execute_blocking(|| {
+                // getpriority returns the nice value for the calling thread
+                unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }
+            })
+            .await
+            .unwrap();
+
+        // Should be elevated (positive = lower priority)
+        assert!(
+            nice_level > 0,
+            "Blocking tasks should run at reduced OS priority (nice > 0), got {}",
+            nice_level
+        );
     }
 }
