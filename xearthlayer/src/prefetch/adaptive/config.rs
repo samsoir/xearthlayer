@@ -57,7 +57,7 @@ pub struct AdaptivePrefetchConfig {
     /// Maximum tiles per prefetch cycle.
     ///
     /// Caps tiles submitted in a single prefetch operation.
-    /// Range: 500 - 10000
+    /// Range: 10 - 200
     pub max_tiles_per_cycle: u32,
 
     /// Ground strategy ring radius (degrees).
@@ -132,7 +132,7 @@ impl Default for AdaptivePrefetchConfig {
             enabled: true,
             mode: PrefetchMode::Auto,
             low_performance_killswitch: KillswitchMode::Auto,
-            max_tiles_per_cycle: 3000,
+            max_tiles_per_cycle: 30,
             ground_ring_radius: 1.0,
             calibration: CalibrationConfig::default(),
             ground_speed_threshold_kt: 40.0,
@@ -391,7 +391,7 @@ mod tests {
         let config = AdaptivePrefetchConfig::default();
         assert!(config.enabled);
         assert_eq!(config.mode, PrefetchMode::Auto);
-        assert_eq!(config.max_tiles_per_cycle, 3000);
+        assert_eq!(config.max_tiles_per_cycle, 30);
     }
 
     #[test]

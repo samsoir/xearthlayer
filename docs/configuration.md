@@ -330,7 +330,7 @@ The system uses flight phase detection and performance calibration:
 | `strategy` | string | `auto` | Strategy selection: `auto` (recommended) or `adaptive` |
 | `mode` | string | `auto` | Mode selection: `auto`, `aggressive`, `opportunistic`, `disabled` |
 | `udp_port` | integer | `49002` | UDP port for X-Plane telemetry (ForeFlight protocol) |
-| `max_tiles_per_cycle` | integer | `3000` | Maximum tiles to submit per prefetch cycle |
+| `max_tiles_per_cycle` | integer | `30` | Maximum tiles to submit per prefetch cycle |
 | `cycle_interval_ms` | integer | `2000` | Interval between prefetch cycles (milliseconds) |
 | `circuit_breaker_open_ms` | integer | `500` | Duration (ms) high load must be sustained to pause |
 | `circuit_breaker_half_open_secs` | integer | `2` | Cooloff time (secs) before resuming prefetch |

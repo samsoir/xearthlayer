@@ -170,7 +170,7 @@ mode = {}
 udp_port = {}
 
 ; Cycle limits
-; Maximum tiles to submit per prefetch cycle (default: 200)
+; Maximum tiles to submit per prefetch cycle (default: 30)
 ; Lower values leave more bandwidth for on-demand requests
 max_tiles_per_cycle = {}
 ; Interval between prefetch cycles in milliseconds (default: 2000)
