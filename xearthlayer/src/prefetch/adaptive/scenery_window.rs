@@ -43,8 +43,8 @@ pub struct SceneryWindowConfig {
 impl Default for SceneryWindowConfig {
     fn default() -> Self {
         Self {
-            default_rows: 6,
-            default_cols: 8,
+            default_rows: 9,
+            default_cols: 9,
             buffer: 1,
             trigger_distance: 3.0,
             load_depth: 3,
@@ -115,63 +115,46 @@ impl SceneryWindow {
     /// Update the window model from `SceneTracker` observations.
     ///
     /// Drives the state machine:
-    /// - `Uninitialized`/`Assumed` + bounds -> `Measuring`
-    /// - `Measuring` + stable bounds -> `Ready`
-    /// - `Measuring` + changed bounds -> reset stability counter
+    /// - `Uninitialized`/`Assumed` + bounds -> `Ready` (using configured window size)
+    /// - `Ready` + bounds -> slide monitors to track X-Plane's loaded area
+    ///
+    /// The tracker bounds tell us *where* X-Plane is loading (center position).
+    /// The configured window size (default 9×9) determines *how wide* the
+    /// boundary monitors span. This avoids the problem where early tracker
+    /// measurements undercount X-Plane's actual window (e.g. 3×4 during
+    /// initial load vs 9×9 at steady state).
     pub fn update_from_tracker(&mut self, tracker: &dyn SceneTracker) {
         let bounds = match tracker.loaded_bounds() {
             Some(b) => b,
             None => return, // No data yet
         };
 
-        let rows = bounds.height().round() as usize;
-        let cols = bounds.width().round() as usize;
-
         match &self.state {
-            WindowState::Uninitialized | WindowState::Assumed => {
+            WindowState::Uninitialized | WindowState::Assumed | WindowState::Measuring { .. } => {
+                // Use configured window size, centered on tracker's reported center.
+                let (rows, cols) = self
+                    .window_size
+                    .unwrap_or((self.config.default_rows, self.config.default_cols));
+                let center_lat = (bounds.min_lat + bounds.max_lat) / 2.0;
+                let center_lon = (bounds.min_lon + bounds.max_lon) / 2.0;
+                let half_rows = rows as f64 / 2.0;
+                let half_cols = cols as f64 / 2.0;
+                let expanded = GeoBounds {
+                    min_lat: center_lat - half_rows,
+                    max_lat: center_lat + half_rows,
+                    min_lon: center_lon - half_cols,
+                    max_lon: center_lon + half_cols,
+                };
                 debug!(
                     rows,
-                    cols, "scenery window: first bounds observed, measuring"
+                    cols,
+                    center_lat = format!("{:.2}", center_lat),
+                    center_lon = format!("{:.2}", center_lon),
+                    "scenery window: ready with configured dimensions"
                 );
-                self.state = WindowState::Measuring {
-                    last_rows: rows,
-                    last_cols: cols,
-                    stable_checks: 1,
-                };
-            }
-            WindowState::Measuring {
-                last_rows,
-                last_cols,
-                stable_checks,
-            } => {
-                if rows == *last_rows && cols == *last_cols {
-                    let new_count = stable_checks + 1;
-                    if new_count >= 2 {
-                        debug!(rows, cols, "scenery window: bounds stable, ready");
-                        self.state = WindowState::Ready;
-                        self.window_size = Some((rows, cols));
-                        self.init_monitors_from_bounds(&bounds);
-                    } else {
-                        self.state = WindowState::Measuring {
-                            last_rows: rows,
-                            last_cols: cols,
-                            stable_checks: new_count,
-                        };
-                    }
-                } else {
-                    debug!(
-                        old_rows = *last_rows,
-                        old_cols = *last_cols,
-                        new_rows = rows,
-                        new_cols = cols,
-                        "scenery window: bounds changed, resetting stability"
-                    );
-                    self.state = WindowState::Measuring {
-                        last_rows: rows,
-                        last_cols: cols,
-                        stable_checks: 1,
-                    };
-                }
+                self.state = WindowState::Ready;
+                self.window_size = Some((rows, cols));
+                self.init_monitors_from_bounds(&expanded);
             }
             WindowState::Ready => {
                 // Slide the monitors to track X-Plane's evolving loaded area.
@@ -519,50 +502,52 @@ mod tests {
     }
 
     #[test]
-    fn test_transition_to_measuring_on_first_bounds() {
+    fn test_transition_to_ready_on_first_bounds() {
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
         tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
         window.update_from_tracker(tracker.as_ref());
 
-        assert!(matches!(window.state(), WindowState::Measuring { .. }));
-        assert!(window.window_size().is_none()); // Not ready yet
-    }
-
-    #[test]
-    fn test_transition_to_ready_after_stable_bounds() {
-        let tracker = std::sync::Arc::new(MockSceneTracker::new());
-        // Same bounds (6x8 degrees) for two consecutive checks
-        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
-
-        let mut window = SceneryWindow::new(SceneryWindowConfig::default());
-        window.update_from_tracker(tracker.as_ref()); // -> Measuring
-        window.update_from_tracker(tracker.as_ref()); // -> Ready (stable)
-
+        // Immediately ready with config dimensions (9×9), not measured (6×8)
         assert!(matches!(window.state(), WindowState::Ready));
-        assert_eq!(window.window_size(), Some((6, 8))); // 53-47=6 rows, 11-3=8 cols
+        assert_eq!(window.window_size(), Some((9, 9)));
         assert!(window.is_ready());
     }
 
     #[test]
-    fn test_measuring_resets_on_changed_bounds() {
+    fn test_ready_uses_config_dimensions_not_measured() {
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        // Tracker reports small bounds (3×4) — early measurement
+        tracker.set_bounds(make_bounds(49.0, 52.0, 8.0, 12.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
+        window.update_from_tracker(tracker.as_ref());
 
-        // First bounds
-        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
-        window.update_from_tracker(tracker.as_ref()); // -> Measuring
-
-        // Different bounds (window expanded)
-        tracker.set_bounds(make_bounds(46.0, 53.0, 3.0, 12.0));
-        window.update_from_tracker(tracker.as_ref()); // -> still Measuring (reset counter)
-
-        // Same as last check
-        window.update_from_tracker(tracker.as_ref()); // -> Ready
+        // Should use config defaults (9×9), not the measured 3×4
         assert!(matches!(window.state(), WindowState::Ready));
-        assert_eq!(window.window_size(), Some((7, 9))); // 53-46=7, 12-3=9
+        assert_eq!(window.window_size(), Some((9, 9)));
+    }
+
+    #[test]
+    fn test_ready_monitors_centered_on_tracker_bounds() {
+        let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        // Center at (50.0, 7.0)
+        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
+
+        let mut window = SceneryWindow::new(SceneryWindowConfig::default());
+        window.update_from_tracker(tracker.as_ref());
+
+        // Monitors should span 9° centered on (50.0, 7.0):
+        // lat: 50.0 - 4.5 = 45.5 to 50.0 + 4.5 = 54.5
+        // lon: 7.0 - 4.5 = 2.5 to 7.0 + 4.5 = 11.5
+        let bounds = window.window_bounds();
+        assert!(bounds.is_some());
+        let (min_lat, max_lat, min_lon, max_lon) = bounds.unwrap();
+        assert!((min_lat - 45.5).abs() < 0.01);
+        assert!((max_lat - 54.5).abs() < 0.01);
+        assert!((min_lon - 2.5).abs() < 0.01);
+        assert!((max_lon - 11.5).abs() < 0.01);
     }
 
     #[test]
@@ -577,22 +562,24 @@ mod tests {
     }
 
     #[test]
-    fn test_assumed_transitions_to_measuring_on_real_bounds() {
+    fn test_assumed_transitions_to_ready_on_real_bounds() {
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
         tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
-        window.set_assumed_dimensions(6, 8); // -> Assumed
-        window.update_from_tracker(tracker.as_ref()); // -> Measuring (real data available)
+        window.set_assumed_dimensions(9, 9); // -> Assumed
+        window.update_from_tracker(tracker.as_ref()); // -> Ready (real data positions monitors)
 
-        assert!(matches!(window.state(), WindowState::Measuring { .. }));
+        assert!(matches!(window.state(), WindowState::Ready));
+        // Keeps the assumed window size
+        assert_eq!(window.window_size(), Some((9, 9)));
     }
 
     #[test]
     fn test_default_config() {
         let config = SceneryWindowConfig::default();
-        assert_eq!(config.default_rows, 6);
-        assert_eq!(config.default_cols, 8);
+        assert_eq!(config.default_rows, 9);
+        assert_eq!(config.default_cols, 9);
         assert_eq!(config.buffer, 1);
     }
 
@@ -762,16 +749,15 @@ mod tests {
     #[test]
     fn test_world_rebuild_detected_when_burst_covers_most_of_window() {
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
-        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0)); // 6×8 window
+        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
-        window.update_from_tracker(tracker.as_ref()); // → Measuring
-        window.update_from_tracker(tracker.as_ref()); // → Ready
+        window.update_from_tracker(tracker.as_ref()); // → Ready (9×9 configured)
 
         assert!(matches!(window.state(), WindowState::Ready));
 
-        // Simulate a burst covering most of the window (5×7 = 35 out of 6×8 = 48 = 73%)
-        let burst_bounds = make_bounds(47.5, 52.5, 3.5, 10.5);
+        // Simulate a burst covering most of the 9×9=81 window (7×7 = 49/81 = 60%)
+        let burst_bounds = make_bounds(46.5, 53.5, 3.5, 10.5);
         let is_rebuild = window.check_for_rebuild(&burst_bounds, 50.0, 7.0);
 
         assert!(is_rebuild);
@@ -785,10 +771,9 @@ mod tests {
         tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
-        window.update_from_tracker(tracker.as_ref());
-        window.update_from_tracker(tracker.as_ref()); // → Ready
+        window.update_from_tracker(tracker.as_ref()); // → Ready (9×9 configured)
 
-        // Simulate a burst adding a single row at the north edge (1×8 = 8 out of 48 = 17%)
+        // Simulate a burst adding a single row at the north edge (1×8 = 8 out of 81 = 10%)
         let burst_bounds = make_bounds(53.0, 54.0, 3.0, 11.0);
         let is_rebuild = window.check_for_rebuild(&burst_bounds, 50.0, 7.0);
 
@@ -811,18 +796,17 @@ mod tests {
         tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
-        window.update_from_tracker(tracker.as_ref());
-        window.update_from_tracker(tracker.as_ref()); // → Ready
+        window.update_from_tracker(tracker.as_ref()); // → Ready (9×9 configured)
 
         // Verify monitors are initialized
         let predictions = window.check_boundaries(52.0, 7.0);
         assert!(!predictions.is_empty());
 
-        // Trigger rebuild
-        let burst_bounds = make_bounds(47.5, 52.5, 3.5, 10.5);
+        // Trigger rebuild — burst must cover >50% of 9×9=81 window
+        let burst_bounds = make_bounds(46.5, 53.5, 3.5, 10.5);
         window.check_for_rebuild(&burst_bounds, 50.0, 7.0);
 
-        // After rebuild, monitors should be cleared
+        // After rebuild, monitors should be cleared (state is Measuring)
         let predictions = window.check_boundaries(52.0, 7.0);
         assert!(predictions.is_empty()); // Not ready anymore
     }
