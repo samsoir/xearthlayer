@@ -253,15 +253,21 @@ This follows a **two-phase commit** pattern:
 The X-Plane Window is inferred, not observed directly. We use a buffer zone to handle uncertainty:
 
 ```
-Window (derived from initial load): 6 tall × 8 wide
+Window (configured default): 9 tall × 9 wide
 Buffer: 1° on each side
 
-Total retained area: 8 rows × 10 columns (window + buffer)
+Total retained area: 11 rows × 11 columns (window + buffer)
 Centered on: aircraft position (sliding forward with flight)
 
 Regions inside retained area → RetainedRegion in GeoIndex
 Regions previously retained but now outside → evicted from GeoIndex
 ```
+
+When a region leaves the retained area, the coordinator also evicts:
+- Its `PrefetchedRegion` entry (making it eligible for re-prefetch if the aircraft returns)
+- Any `cached_tiles` entries for tiles in that region (allowing fresh memory cache queries)
+
+`InProgress` regions are never evicted — they represent actively running prefetch jobs.
 
 All retention decisions are logged at `DEBUG` level for flight test analysis.
 
@@ -275,34 +281,27 @@ The `SceneryWindow` is the core computational model. It derives window dimension
 
 ```
 
-  Uninitialized ──▶ Assumed ──▶ Measuring ──▶ Ready
-       │               │            │            │
-  (no telemetry)  (telemetry     (bounds       (window derived
-                   but no FUSE    growing,      from observation,
-                   activity,      waiting for   normal operation)
-                   using          stability)         │
-                   defaults)                    ◀────┘
-                                              (re-derive on
-                                               world rebuild)
+  Uninitialized ──▶ Assumed ──▶ Ready
+       │               │          │
+  (no telemetry)  (telemetry   (first tracker bounds
+                   but no FUSE  → config dimensions
+                   activity,    centered on tracker,
+                   using        normal operation)
+                   defaults)         │
+                                ◀────┘
+                               (re-derive on
+                                world rebuild)
 ```
 
 | State | Condition | Window Source |
 |-------|-----------|--------------|
 | `Uninitialized` | No telemetry, no FUSE data | No predictions |
-| `Assumed` | Telemetry present, no FUSE activity (ocean/sparse start) | Default dimensions (configurable, default 6×8) |
-| `Measuring` | FUSE activity detected, bounds still growing | No predictions (initial load in progress) |
-| `Ready` | Bounds stable for 2+ seconds (consecutive quiet checks) | Derived from observed `loaded_bounds()` |
+| `Assumed` | Telemetry present, no FUSE activity (ocean/sparse start) | Default dimensions (configurable, default 9×9) |
+| `Ready` | First tracker bounds observed | Configured dimensions (default 9×9) centered on tracker center |
 
 ### Window Derivation
 
-During X-Plane's initial scene load, the SceneTracker accumulates all requested tiles. When the bounds stop growing (stable for 2 consecutive checks ~1s apart):
-
-```rust
-window_rows = loaded_bounds.height().ceil() as usize  // e.g., 6
-window_cols = loaded_bounds.width().ceil() as usize    // e.g., 8
-```
-
-The aircraft is at the center of this initial load, giving us the complete window dimensions.
+When SceneTracker first reports `loaded_bounds()`, the window transitions directly to `Ready` using configured dimensions (default 9×9) centered on the tracker's reported center. The configured dimensions are used instead of measured SceneTracker bounds because X-Plane's initial partial load typically reports fewer regions than the actual window size.
 
 ### World Rebuild Detection
 
@@ -598,7 +597,7 @@ The `GeoIndex` stores spatial state via type-keyed layers:
 |-------|-----|-------|------------|
 | `PatchCoverage` (existing) | DSF region | patch name | OrthoUnionIndex (startup) |
 | `RetainedRegion` (new) | DSF region | `()` | SceneryWindow (each cycle) |
-| `PrefetchedRegion` (new) | DSF region | `RegionState` | BoundaryStrategy (on submit/complete) |
+| `PrefetchedRegion` (new) | DSF region | `RegionState` | BoundaryStrategy (on submit/complete/eviction) |
 
 ### DdsClient Integration
 
@@ -809,9 +808,9 @@ If some tiles in a submitted region fail:
 | Component | Test Focus |
 |-----------|-----------|
 | `BoundaryMonitor` | Trigger at correct distance; no trigger when far; urgency calculation; both edges (north/south or east/west) |
-| `SceneryWindow` | Window derivation from mock bounds; stability check; retention inference with buffer; world rebuild detection; `Assumed` → `Measuring` → `Ready` transitions |
-| `BoundaryStrategy` | Row generation for lat crossing; column generation for lon crossing; diagonal (both monitors); set difference with XEL Window; depth ordering; `NoCoverage` handling |
-| `RegionState` | Two-phase commit: absent → InProgress → Prefetched; timeout revert; NoCoverage |
+| `SceneryWindow` | Window derivation from tracker bounds (config-locked dimensions); retention inference with buffer; world rebuild detection; `Assumed` → `Ready` transition |
+| `BoundaryStrategy` | Row generation for lat crossing; column generation for lon crossing; diagonal (both monitors); set difference with XEL Window; depth ordering; `NoCoverage` handling; eviction of non-retained regions and cached tiles |
+| `RegionState` | Two-phase commit: absent → InProgress → Prefetched; timeout revert; NoCoverage; eviction on window departure |
 | `GeoIndex layers` | RetainedRegion add/remove; PrefetchedRegion state transitions |
 
 ### Integration Tests
@@ -821,7 +820,7 @@ If some tiles in a submitted region fail:
 | Straight flight north through 3 DSF boundaries | Rows prefetched in correct order, XEL Window grows |
 | Diagonal flight (NE) | Both monitors trigger, interleaved by urgency |
 | Turn from north to east | Lat monitor stops, lon monitor starts, no pause |
-| Scene start → initial load → first prefetch | Window derivation, `Measuring` → `Ready` |
+| Scene start → initial load → first prefetch | Window derivation, `Assumed` → `Ready` |
 | Ocean → land transition | `NoCoverage` regions skipped, covered regions prefetched ahead |
 | Start over ocean with telemetry | `Assumed` state, default dimensions, transition on coverage |
 | Partial failure + timeout | Region reverts, re-evaluated, only failed tiles re-submitted |
