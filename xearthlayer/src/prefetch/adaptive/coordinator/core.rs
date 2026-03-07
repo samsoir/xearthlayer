@@ -559,10 +559,12 @@ impl AdaptivePrefetchCoordinator {
         let load = client.executor_load();
         if load > BACKPRESSURE_DEFER_THRESHOLD {
             self.total_deferred_cycles += 1;
+            // Store all tiles as pending so they're retried when load drops
+            self.pending_tiles = plan.tiles.clone();
             tracing::info!(
                 load = format!("{:.1}%", load * 100.0),
                 tiles_planned = plan.tiles.len(),
-                "Executor backpressure — deferring prefetch cycle"
+                "Executor backpressure — deferring prefetch cycle, tiles stored as pending"
             );
             return 0;
         }
@@ -586,7 +588,12 @@ impl AdaptivePrefetchCoordinator {
         let max_tiles = if self.transition_throttle.is_active() {
             let fraction = self.transition_throttle.fraction();
             if fraction == 0.0 {
-                tracing::debug!("Transition throttle — grace period, deferring");
+                // Store all tiles as pending so they're submitted once ramp begins
+                self.pending_tiles = plan.tiles.clone();
+                tracing::debug!(
+                    tiles_deferred = plan.tiles.len(),
+                    "Transition throttle — grace period, tiles stored as pending"
+                );
                 return 0;
             }
             let throttled = ((max_tiles as f64) * fraction).ceil() as usize;
@@ -601,23 +608,29 @@ impl AdaptivePrefetchCoordinator {
             max_tiles
         };
 
+        // Store tiles beyond the throttle/backpressure cutoff as pending
+        // so they're drained in subsequent cycles rather than lost.
+        let throttle_overflow: Vec<TileCoord> = if max_tiles < plan.tiles.len() {
+            plan.tiles[max_tiles..].to_vec()
+        } else {
+            Vec::new()
+        };
+
         let mut submitted = 0;
         let tiles_to_submit: Vec<TileCoord> = plan.tiles.iter().take(max_tiles).copied().collect();
+        let mut channel_remainder = Vec::new();
         for (idx, tile) in tiles_to_submit.iter().enumerate() {
             let request =
                 crate::runtime::JobRequest::prefetch_with_cancellation(*tile, cancellation.clone());
             match client.submit(request) {
                 Ok(()) => submitted += 1,
                 Err(crate::executor::DdsClientError::ChannelFull) => {
-                    // Store remaining tiles for the next cycle
-                    let remaining: Vec<TileCoord> = tiles_to_submit[idx..].to_vec();
+                    channel_remainder = tiles_to_submit[idx..].to_vec();
                     tracing::debug!(
                         submitted,
-                        remaining = remaining.len(),
-                        "Channel full — storing {} tiles for next cycle",
-                        remaining.len()
+                        channel_remaining = channel_remainder.len(),
+                        "Channel full — storing remainder for next cycle"
                     );
-                    self.pending_tiles = remaining;
                     break;
                 }
                 Err(crate::executor::DdsClientError::ChannelClosed) => {
@@ -625,6 +638,19 @@ impl AdaptivePrefetchCoordinator {
                     break;
                 }
             }
+        }
+
+        // Merge channel remainder + throttle overflow into pending_tiles
+        if !channel_remainder.is_empty() || !throttle_overflow.is_empty() {
+            let mut pending = channel_remainder;
+            pending.extend(throttle_overflow);
+            tracing::debug!(
+                submitted,
+                pending = pending.len(),
+                "Storing {} tiles for subsequent cycles",
+                pending.len()
+            );
+            self.pending_tiles = pending;
         }
 
         if submitted > 0 {
@@ -2451,6 +2477,141 @@ mod tests {
         assert!(
             coord.pending_tiles.is_empty(),
             "Pending tiles should be empty after full drain"
+        );
+    }
+
+    #[test]
+    fn test_throttle_truncated_tiles_stored_as_pending() {
+        // When the transition throttle reduces max_tiles, tiles beyond the
+        // throttle cutoff must also be stored as pending — not silently dropped.
+        //
+        // Scenario: 100-tile plan, throttle at 20%, channel accepts all.
+        // Expected: 20 submitted, 80 stored as pending for next cycle.
+
+        let client = Arc::new(CapLimitedDdsClient::new(1000)); // no channel limit
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            // 5-second ramp so throttle is definitely active
+            ramp_duration: std::time::Duration::from_secs(5),
+            ramp_start_fraction: 0.20,
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+
+        // Fast-forward phase to cruise so transition throttle activates
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+        coord.phase_detector.takeoff_timeout = std::time::Duration::from_millis(1);
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+
+        assert_eq!(
+            coord.phase_detector.current_phase(),
+            FlightPhase::Cruise,
+            "Should be in Cruise"
+        );
+        assert!(
+            coord.transition_throttle.is_active(),
+            "Transition throttle should be active after entering cruise"
+        );
+
+        // Build a 100-tile plan
+        let tiles: Vec<TileCoord> = (0..100)
+            .map(|i| TileCoord {
+                row: 5000 + i,
+                col: 8000,
+                zoom: 14,
+            })
+            .collect();
+        let calibration = test_calibration();
+        let plan = PrefetchPlan::with_tiles(tiles, &calibration, "boundary", 0, 100);
+
+        let cancellation = CancellationToken::new();
+        let submitted = coord.execute(&plan, cancellation);
+
+        // Throttle at ~20% of 100 = ~20 tiles submitted
+        assert!(
+            submitted > 0 && submitted < 100,
+            "Throttle should limit submission (submitted {})",
+            submitted
+        );
+
+        // KEY ASSERTION: the remaining ~80 tiles must be in pending_tiles
+        let total_accounted = submitted + coord.pending_tiles.len();
+        assert_eq!(
+            total_accounted,
+            100,
+            "All 100 tiles must be accounted for: {} submitted + {} pending = {} (expected 100)",
+            submitted,
+            coord.pending_tiles.len(),
+            total_accounted
+        );
+    }
+
+    #[test]
+    fn test_throttle_and_channel_full_both_store_pending() {
+        // When BOTH throttle and channel capacity limit submission,
+        // ALL unsubmitted tiles must be stored as pending.
+        //
+        // Scenario: 100-tile plan, throttle at 20% (→ 20 tiles), channel cap at 10.
+        // Expected: 10 submitted, 90 stored as pending (10 from throttled batch + 80 beyond throttle).
+
+        let client = Arc::new(CapLimitedDdsClient::new(10)); // channel cap at 10
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ramp_duration: std::time::Duration::from_secs(5),
+            ramp_start_fraction: 0.20,
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+
+        // Fast-forward to cruise
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+        coord.phase_detector.takeoff_timeout = std::time::Duration::from_millis(1);
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+
+        assert!(coord.transition_throttle.is_active());
+
+        // Build a 100-tile plan
+        let tiles: Vec<TileCoord> = (0..100)
+            .map(|i| TileCoord {
+                row: 5000 + i,
+                col: 8000,
+                zoom: 14,
+            })
+            .collect();
+        let calibration = test_calibration();
+        let plan = PrefetchPlan::with_tiles(tiles, &calibration, "boundary", 0, 100);
+
+        let cancellation = CancellationToken::new();
+        let submitted = coord.execute(&plan, cancellation);
+
+        assert_eq!(
+            submitted, 10,
+            "Should submit exactly 10 tiles (channel cap)"
+        );
+
+        // ALL remaining tiles must be pending (channel-full remainder + throttle-truncated)
+        let total_accounted = submitted + coord.pending_tiles.len();
+        assert_eq!(
+            total_accounted,
+            100,
+            "All 100 tiles must be accounted for: {} submitted + {} pending = {} (expected 100)",
+            submitted,
+            coord.pending_tiles.len(),
+            total_accounted
         );
     }
 }
