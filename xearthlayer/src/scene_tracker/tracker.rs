@@ -185,6 +185,25 @@ impl DefaultSceneTracker {
         })
     }
 
+    /// Start the scene tracker on a specific runtime handle.
+    ///
+    /// Like [`start`], but uses the provided runtime handle instead of
+    /// `tokio::spawn()`, which requires an active tokio runtime context.
+    pub fn start_on(
+        self: Arc<Self>,
+        mut rx: mpsc::UnboundedReceiver<FuseAccessEvent>,
+        handle: &tokio::runtime::Handle,
+    ) -> tokio::task::JoinHandle<()> {
+        let tracker = self;
+        handle.spawn(async move {
+            debug!("Scene tracker started, waiting for FUSE events");
+            while let Some(event) = rx.recv().await {
+                tracker.process_event(event);
+            }
+            debug!("Scene tracker stopped (channel closed)");
+        })
+    }
+
     /// Process a single FUSE access event.
     fn process_event(&self, event: FuseAccessEvent) {
         trace!(

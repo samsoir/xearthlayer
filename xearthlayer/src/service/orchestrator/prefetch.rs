@@ -186,7 +186,7 @@ impl ServiceOrchestrator {
         // requested_tiles and loaded_bounds() returns real X-Plane window data.
         let scene_tracker = self.mount_manager.scene_tracker();
         if let Some(rx) = self.mount_manager.take_scene_tracker_receiver() {
-            scene_tracker.clone().start(rx);
+            scene_tracker.clone().start_on(rx, runtime_handle);
             tracing::info!("Scene tracker started for boundary-driven prefetch");
         } else {
             tracing::warn!(
