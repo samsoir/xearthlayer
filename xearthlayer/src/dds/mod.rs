@@ -45,12 +45,14 @@
 //!
 //! # Performance
 //!
-//! Encoding a 4096×4096 image with 5 mipmap levels typically takes ~1 second
-//! on modern hardware. The implementation uses:
+//! The default ISPC SIMD encoder compresses a 4096×4096 image with 5 mipmap
+//! levels significantly faster than the pure-Rust fallback, using AVX2/SSE4
+//! SIMD instructions to process multiple blocks simultaneously.
 //!
-//! - Simple bounding box color quantization (fast, good quality)
-//! - Box filter for mipmap generation (fast, acceptable quality)
-//! - Sequential block processing (parallel processing possible)
+//! A [`BlockCompressor`] trait allows swapping backends:
+//! - [`IspcCompressor`] — SIMD-optimized (default, recommended)
+//! - [`SoftwareCompressor`] — Pure-Rust fallback
+//! - GPU compressor via `wgpu` (planned)
 //!
 //! # Compatibility
 //!
@@ -62,6 +64,7 @@
 
 mod bc1;
 mod bc3;
+mod compressor;
 mod conversion;
 mod encoder;
 mod header;
@@ -69,6 +72,7 @@ mod mipmap;
 mod types;
 
 // Public API
+pub use compressor::{default_compressor, BlockCompressor, IspcCompressor, SoftwareCompressor};
 pub use encoder::DdsEncoder;
 pub use types::{DdsError, DdsFormat, DdsHeader};
 
