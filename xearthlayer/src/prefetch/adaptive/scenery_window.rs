@@ -30,24 +30,35 @@ use crate::scene_tracker::{GeoBounds, SceneTracker};
 pub struct SceneryWindowConfig {
     /// Default window rows (latitude) for assumed state.
     pub default_rows: usize,
-    /// Default window columns (longitude) for assumed state.
-    pub default_cols: usize,
+    /// Longitude extent in degrees for dynamic column computation.
+    /// Columns computed as `ceil(lon_extent / cos(latitude))`.
+    pub lon_extent: f64,
     /// Buffer in DSF tiles around the window for retention.
     pub buffer: u8,
     /// Trigger distance for boundary monitors (degrees).
     pub trigger_distance: f64,
-    /// Number of DSF tiles deep to load per boundary crossing.
-    pub load_depth: u8,
+    /// Load depth for latitude boundary crossings (ROW loads).
+    pub load_depth_lat: u8,
+    /// Load depth for longitude boundary crossings (COLUMN loads).
+    pub load_depth_lon: u8,
+}
+
+impl SceneryWindowConfig {
+    /// Compute window columns for a given latitude using the cosine formula.
+    pub fn compute_cols(&self, latitude: f64) -> usize {
+        crate::coord::lon_tiles_for_latitude(latitude, self.lon_extent)
+    }
 }
 
 impl Default for SceneryWindowConfig {
     fn default() -> Self {
         Self {
-            default_rows: 9,
-            default_cols: 9,
+            default_rows: 3,
+            lon_extent: 3.0,
             buffer: 1,
-            trigger_distance: 3.0,
-            load_depth: 3,
+            trigger_distance: 1.5,
+            load_depth_lat: 3,
+            load_depth_lon: 2,
         }
     }
 }
@@ -103,13 +114,17 @@ impl SceneryWindow {
 
     /// Set assumed window dimensions for ocean/sparse starts.
     ///
-    /// Transitions to `Assumed` state with default dimensions. This allows
-    /// prefetch to begin immediately with reasonable defaults while waiting
-    /// for real data from the `SceneTracker`.
-    pub fn set_assumed_dimensions(&mut self, rows: usize, cols: usize) {
+    /// Transitions to `Assumed` state with default rows and latitude-dependent
+    /// columns. This allows prefetch to begin immediately with reasonable
+    /// defaults while waiting for real data from the `SceneTracker`.
+    pub fn set_assumed_dimensions(&mut self, rows: usize, latitude: f64) {
+        let cols = self.config.compute_cols(latitude);
         self.state = WindowState::Assumed;
         self.window_size = Some((rows, cols));
-        debug!(rows, cols, "scenery window: assumed dimensions set");
+        debug!(
+            rows,
+            cols, latitude, "scenery window: assumed dimensions set"
+        );
     }
 
     /// Update the window model from `SceneTracker` observations.
@@ -119,10 +134,9 @@ impl SceneryWindow {
     /// - `Ready` + bounds -> slide monitors to track X-Plane's loaded area
     ///
     /// The tracker bounds tell us *where* X-Plane is loading (center position).
-    /// The configured window size (default 9×9) determines *how wide* the
-    /// boundary monitors span. This avoids the problem where early tracker
-    /// measurements undercount X-Plane's actual window (e.g. 3×4 during
-    /// initial load vs 9×9 at steady state).
+    /// The configured window size (default 3 rows × dynamic cols) determines
+    /// *how wide* the boundary monitors span. This avoids the problem where
+    /// early tracker measurements undercount X-Plane's actual window.
     pub fn update_from_tracker(&mut self, tracker: &dyn SceneTracker) {
         let bounds = match tracker.loaded_bounds() {
             Some(b) => b,
@@ -132,11 +146,12 @@ impl SceneryWindow {
         match &self.state {
             WindowState::Uninitialized | WindowState::Assumed | WindowState::Measuring { .. } => {
                 // Use configured window size, centered on tracker's reported center.
-                let (rows, cols) = self
-                    .window_size
-                    .unwrap_or((self.config.default_rows, self.config.default_cols));
                 let center_lat = (bounds.min_lat + bounds.max_lat) / 2.0;
                 let center_lon = (bounds.min_lon + bounds.max_lon) / 2.0;
+                let default_cols = self.config.compute_cols(center_lat);
+                let (rows, cols) = self
+                    .window_size
+                    .unwrap_or((self.config.default_rows, default_cols));
                 let half_rows = rows as f64 / 2.0;
                 let half_cols = cols as f64 / 2.0;
                 let expanded = GeoBounds {
@@ -235,7 +250,7 @@ impl SceneryWindow {
                         lat + half_rows,
                         self.config.trigger_distance,
                     )
-                    .with_load_depth(self.config.load_depth),
+                    .with_load_depth(self.config.load_depth_lat),
                 );
                 self.lon_monitor = Some(
                     BoundaryMonitor::new(
@@ -244,7 +259,7 @@ impl SceneryWindow {
                         lon + half_cols,
                         self.config.trigger_distance,
                     )
-                    .with_load_depth(self.config.load_depth),
+                    .with_load_depth(self.config.load_depth_lon),
                 );
                 self.last_bounds = Some((
                     lat - half_rows,
@@ -390,7 +405,7 @@ impl SceneryWindow {
                 bounds.max_lat,
                 self.config.trigger_distance,
             )
-            .with_load_depth(self.config.load_depth),
+            .with_load_depth(self.config.load_depth_lat),
         );
         self.lon_monitor = Some(
             BoundaryMonitor::new(
@@ -399,7 +414,7 @@ impl SceneryWindow {
                 bounds.max_lon,
                 self.config.trigger_distance,
             )
-            .with_load_depth(self.config.load_depth),
+            .with_load_depth(self.config.load_depth_lon),
         );
         self.last_bounds = Some((
             bounds.min_lat,
@@ -495,38 +510,42 @@ mod tests {
     #[test]
     fn test_set_assumed_dimensions() {
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
-        window.set_assumed_dimensions(6, 8);
+        // At equator (0°), lon_extent=3.0 → cols = ceil(3.0/cos(0)) = 3
+        window.set_assumed_dimensions(6, 0.0);
         assert!(matches!(window.state(), WindowState::Assumed));
-        assert_eq!(window.window_size(), Some((6, 8)));
+        assert_eq!(window.window_size(), Some((6, 3)));
         assert!(window.is_ready()); // Assumed counts as ready for prefetch
     }
 
     #[test]
     fn test_transition_to_ready_on_first_bounds() {
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        // Center at (50.0, 7.0)
         tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
         window.update_from_tracker(tracker.as_ref());
 
-        // Immediately ready with config dimensions (9×9), not measured (6×8)
+        // Immediately ready with config dimensions (3 rows × dynamic cols)
+        // At lat 50°: cols = ceil(3.0/cos(50°)) = ceil(4.67) = 5
         assert!(matches!(window.state(), WindowState::Ready));
-        assert_eq!(window.window_size(), Some((9, 9)));
+        assert_eq!(window.window_size(), Some((3, 5)));
         assert!(window.is_ready());
     }
 
     #[test]
     fn test_ready_uses_config_dimensions_not_measured() {
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
-        // Tracker reports small bounds (3×4) — early measurement
+        // Tracker reports small bounds (3×4) — early measurement. Center at (50.5, 10.0)
         tracker.set_bounds(make_bounds(49.0, 52.0, 8.0, 12.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
         window.update_from_tracker(tracker.as_ref());
 
-        // Should use config defaults (9×9), not the measured 3×4
+        // Should use config defaults (3 rows × dynamic cols), not the measured 3×4
+        // At lat 50.5°: cols = ceil(3.0/cos(50.5°)) = ceil(4.72) = 5
         assert!(matches!(window.state(), WindowState::Ready));
-        assert_eq!(window.window_size(), Some((9, 9)));
+        assert_eq!(window.window_size(), Some((3, 5)));
     }
 
     #[test]
@@ -538,16 +557,16 @@ mod tests {
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
         window.update_from_tracker(tracker.as_ref());
 
-        // Monitors should span 9° centered on (50.0, 7.0):
-        // lat: 50.0 - 4.5 = 45.5 to 50.0 + 4.5 = 54.5
-        // lon: 7.0 - 4.5 = 2.5 to 7.0 + 4.5 = 11.5
+        // Monitors should span 3 rows × 5 cols centered on (50.0, 7.0):
+        // lat: 50.0 - 1.5 = 48.5 to 50.0 + 1.5 = 51.5
+        // lon: 7.0 - 2.5 = 4.5 to 7.0 + 2.5 = 9.5
         let bounds = window.window_bounds();
         assert!(bounds.is_some());
         let (min_lat, max_lat, min_lon, max_lon) = bounds.unwrap();
-        assert!((min_lat - 45.5).abs() < 0.01);
-        assert!((max_lat - 54.5).abs() < 0.01);
-        assert!((min_lon - 2.5).abs() < 0.01);
-        assert!((max_lon - 11.5).abs() < 0.01);
+        assert!((min_lat - 48.5).abs() < 0.01);
+        assert!((max_lat - 51.5).abs() < 0.01);
+        assert!((min_lon - 4.5).abs() < 0.01);
+        assert!((max_lon - 9.5).abs() < 0.01);
     }
 
     #[test]
@@ -564,52 +583,63 @@ mod tests {
     #[test]
     fn test_assumed_transitions_to_ready_on_real_bounds() {
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        // Center at (50.0, 7.0)
         tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
-        window.set_assumed_dimensions(9, 9); // -> Assumed
+        // Assume at lat 50.0 → cols = ceil(3.0/cos(50°)) = 5
+        window.set_assumed_dimensions(3, 50.0); // -> Assumed
         window.update_from_tracker(tracker.as_ref()); // -> Ready (real data positions monitors)
 
         assert!(matches!(window.state(), WindowState::Ready));
         // Keeps the assumed window size
-        assert_eq!(window.window_size(), Some((9, 9)));
+        assert_eq!(window.window_size(), Some((3, 5)));
     }
 
     #[test]
     fn test_default_config() {
         let config = SceneryWindowConfig::default();
-        assert_eq!(config.default_rows, 9);
-        assert_eq!(config.default_cols, 9);
+        assert_eq!(config.default_rows, 3);
+        assert!((config.lon_extent - 3.0).abs() < f64::EPSILON);
         assert_eq!(config.buffer, 1);
+        assert_eq!(config.load_depth_lat, 3);
+        assert_eq!(config.load_depth_lon, 2);
     }
 
     #[test]
     fn test_check_boundaries_returns_predictions_when_near_edge() {
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        // Center at (50.0, 7.0). Default config: 3 rows × 5 cols (at 50°)
+        // Window: lat 48.5-51.5, lon 4.5-9.5. Trigger distance: 1.5°
         tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
-        window.update_from_tracker(tracker.as_ref()); // → Measuring
         window.update_from_tracker(tracker.as_ref()); // → Ready
 
-        // Aircraft near north edge (52.0 is 1.0° from 53.0 max lat)
-        let predictions = window.check_boundaries(52.0, 7.0);
+        // Aircraft near north edge: 51.0 is 0.5° from 51.5 max lat (within 1.5° trigger)
+        let predictions = window.check_boundaries(51.0, 7.0);
         assert_eq!(predictions.len(), 1);
         assert_eq!(predictions[0].axis, BoundaryAxis::Latitude);
-        assert_eq!(predictions[0].dsf_coord, 53);
     }
 
     #[test]
     fn test_check_boundaries_returns_empty_when_centered() {
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
-        // Use a wider window (10° lat, 14° lon) so center is >3.0° from all edges
-        tracker.set_bounds(make_bounds(45.0, 55.0, 0.0, 14.0));
+        // Use a wider window (6 rows, lon_extent=6.0) and small trigger (0.5°)
+        // so center is well outside trigger distance.
+        let config = SceneryWindowConfig {
+            default_rows: 6,
+            lon_extent: 6.0,
+            trigger_distance: 0.5,
+            ..SceneryWindowConfig::default()
+        };
+        // Center at (50.0, 7.0). 6 rows × ~10 cols at 50°.
+        // Window: lat 47.0-53.0. Aircraft at center → 3.0° from edges > 0.5° trigger.
+        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
-        let mut window = SceneryWindow::new(SceneryWindowConfig::default());
-        window.update_from_tracker(tracker.as_ref());
+        let mut window = SceneryWindow::new(config);
         window.update_from_tracker(tracker.as_ref());
 
-        // Aircraft in the middle — 5.0° from lat edges, 7.0° from lon edges
         let predictions = window.check_boundaries(50.0, 7.0);
         assert!(predictions.is_empty());
     }
@@ -617,14 +647,14 @@ mod tests {
     #[test]
     fn test_check_boundaries_both_axes() {
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        // Center at (50.0, 7.0). Window: lat 48.5-51.5, lon 4.5-9.5. Trigger=1.5°
         tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
         window.update_from_tracker(tracker.as_ref());
-        window.update_from_tracker(tracker.as_ref());
 
-        // Aircraft near both north and east edges
-        let predictions = window.check_boundaries(52.0, 10.0);
+        // Aircraft near both north edge (51.0, 0.5° away) and east edge (9.0, 0.5° away)
+        let predictions = window.check_boundaries(51.0, 9.0);
         assert_eq!(predictions.len(), 2);
         // Should be sorted by urgency descending
         assert!(predictions[0].urgency >= predictions[1].urgency);
@@ -633,14 +663,14 @@ mod tests {
     #[test]
     fn test_check_boundaries_sorted_by_urgency_descending() {
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        // Center at (50.0, 7.0). Window: lat 48.5-51.5, lon 4.5-9.5. Trigger=1.5°
         tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
         window.update_from_tracker(tracker.as_ref());
-        window.update_from_tracker(tracker.as_ref());
 
-        // Closer to east (0.5° away) than north (1.0° away)
-        let predictions = window.check_boundaries(52.0, 10.5);
+        // Closer to east (9.2, 0.3° from edge) than north (51.0, 0.5° from edge)
+        let predictions = window.check_boundaries(51.0, 9.2);
         assert!(predictions.len() >= 2);
         // Most urgent first
         for i in 1..predictions.len() {
@@ -661,27 +691,26 @@ mod tests {
         use crate::geo_index::{DsfRegion, GeoIndex, RetainedRegion};
 
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
-        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0)); // 6×8 window
+        // Center at (50.0, 7.0). Default: 3 rows × 5 cols, buffer=1
+        tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
-        let mut window = SceneryWindow::new(SceneryWindowConfig::default()); // buffer=1
-        window.update_from_tracker(tracker.as_ref()); // → Measuring
-        window.update_from_tracker(tracker.as_ref()); // → Ready, size=(6,8)
+        let mut window = SceneryWindow::new(SceneryWindowConfig::default());
+        window.update_from_tracker(tracker.as_ref()); // → Ready, size=(3, 5)
 
         let geo_index = GeoIndex::new();
         window.update_retention(50.0, 7.0, &geo_index);
 
-        // Window: 6 rows × 8 cols centered on (50.0, 7.0)
-        // Half-window: 3 lat, 4 lon
-        // Retained area: lat (50-3-1)..(50+3+1) = 46..54, lon (7-4-1)..(7+4+1) = 2..12
-        // That's 8 lat × 10 lon = 80 regions
+        // Window: 3 rows × 5 cols. Half-window: 1 lat, 2 lon
+        // Retained area: lat (50-1-1)..(50+1+1) = 48..52, lon (7-2-1)..(7+2+1) = 4..10
+        // That's 5 lat × 7 lon = 35 regions
         let count = geo_index.count::<RetainedRegion>();
         assert!(count > 0, "should have retained regions");
 
         // Check a region that should be in the retained area
         assert!(geo_index.contains::<RetainedRegion>(&DsfRegion::new(50, 7)));
         // Check edges
-        assert!(geo_index.contains::<RetainedRegion>(&DsfRegion::new(46, 2)));
-        assert!(geo_index.contains::<RetainedRegion>(&DsfRegion::new(53, 11)));
+        assert!(geo_index.contains::<RetainedRegion>(&DsfRegion::new(48, 4)));
+        assert!(geo_index.contains::<RetainedRegion>(&DsfRegion::new(52, 10)));
     }
 
     #[test]
@@ -692,7 +721,6 @@ mod tests {
         tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
-        window.update_from_tracker(tracker.as_ref());
         window.update_from_tracker(tracker.as_ref());
 
         let geo_index = GeoIndex::new();
@@ -716,12 +744,11 @@ mod tests {
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
         window.update_from_tracker(tracker.as_ref());
-        window.update_from_tracker(tracker.as_ref());
 
         let geo_index = GeoIndex::new();
 
-        // Pre-insert a region at the edge of the buffer
-        let edge_region = DsfRegion::new(46, 2); // Should be inside retained area
+        // Pre-insert a region at the edge of the buffer (retained: 48..52 lat, 4..10 lon)
+        let edge_region = DsfRegion::new(48, 4);
         geo_index.insert::<RetainedRegion>(edge_region, RetainedRegion);
 
         window.update_retention(50.0, 7.0, &geo_index);
@@ -749,15 +776,16 @@ mod tests {
     #[test]
     fn test_world_rebuild_detected_when_burst_covers_most_of_window() {
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        // Center at (50.0, 7.0). Default: 3 rows × 5 cols = 15 area
         tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
-        window.update_from_tracker(tracker.as_ref()); // → Ready (9×9 configured)
+        window.update_from_tracker(tracker.as_ref()); // → Ready (3×5 configured)
 
         assert!(matches!(window.state(), WindowState::Ready));
 
-        // Simulate a burst covering most of the 9×9=81 window (7×7 = 49/81 = 60%)
-        let burst_bounds = make_bounds(46.5, 53.5, 3.5, 10.5);
+        // Simulate a burst covering >50% of window: 3×3 = 9/15 = 60%
+        let burst_bounds = make_bounds(48.5, 51.5, 5.5, 8.5);
         let is_rebuild = window.check_for_rebuild(&burst_bounds, 50.0, 7.0);
 
         assert!(is_rebuild);
@@ -768,13 +796,14 @@ mod tests {
     #[test]
     fn test_normal_extension_not_detected_as_rebuild() {
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        // Center at (50.0, 7.0). Default: 3 rows × 5 cols = 15 area
         tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
-        window.update_from_tracker(tracker.as_ref()); // → Ready (9×9 configured)
+        window.update_from_tracker(tracker.as_ref()); // → Ready (3×5 configured)
 
-        // Simulate a burst adding a single row at the north edge (1×8 = 8 out of 81 = 10%)
-        let burst_bounds = make_bounds(53.0, 54.0, 3.0, 11.0);
+        // Simulate a small burst: 1×2 = 2/15 = 13% — not a rebuild
+        let burst_bounds = make_bounds(51.0, 52.0, 6.0, 8.0);
         let is_rebuild = window.check_for_rebuild(&burst_bounds, 50.0, 7.0);
 
         assert!(!is_rebuild);
@@ -793,34 +822,34 @@ mod tests {
     #[test]
     fn test_rebuild_resets_monitors() {
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
+        // Center at (50.0, 7.0). Default: 3 rows × 5 cols
+        // Window: lat 48.5-51.5, lon 4.5-9.5. Trigger=1.5°
         tracker.set_bounds(make_bounds(47.0, 53.0, 3.0, 11.0));
 
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
-        window.update_from_tracker(tracker.as_ref()); // → Ready (9×9 configured)
+        window.update_from_tracker(tracker.as_ref()); // → Ready (3×5)
 
-        // Verify monitors are initialized
-        let predictions = window.check_boundaries(52.0, 7.0);
+        // Verify monitors are initialized: 51.0 is 0.5° from 51.5 edge, within trigger
+        let predictions = window.check_boundaries(51.0, 7.0);
         assert!(!predictions.is_empty());
 
-        // Trigger rebuild — burst must cover >50% of 9×9=81 window
-        let burst_bounds = make_bounds(46.5, 53.5, 3.5, 10.5);
+        // Trigger rebuild — burst must cover >50% of 3×5=15 window
+        let burst_bounds = make_bounds(48.5, 51.5, 5.5, 8.5); // 3×3=9/15=60%
         window.check_for_rebuild(&burst_bounds, 50.0, 7.0);
 
         // After rebuild, monitors should be cleared (state is Measuring)
-        let predictions = window.check_boundaries(52.0, 7.0);
+        let predictions = window.check_boundaries(51.0, 7.0);
         assert!(predictions.is_empty()); // Not ready anymore
     }
 
     #[test]
     fn test_check_boundaries_works_in_assumed_state() {
         let mut window = SceneryWindow::new(SceneryWindowConfig::default());
-        window.set_assumed_dimensions(6, 8);
-        // Assumed state should allow boundary checks
-        // But we need edges set — assumed state should initialize monitors
-        // with default edges centered on... well, we haven't given a position yet.
-        // In assumed state, monitors should be initialized when first position is given.
-        // For now, check_boundaries on assumed state without prior position → empty
-        // This test verifies that assumed state doesn't panic
+        // At equator: cols = ceil(3.0/cos(0)) = 3
+        window.set_assumed_dimensions(6, 0.0);
+        // Assumed state should allow boundary checks.
+        // Monitors are lazily initialized on first position check.
+        // This test verifies that assumed state doesn't panic.
         let _predictions = window.check_boundaries(50.0, 7.0);
     }
 
@@ -835,13 +864,12 @@ mod tests {
         // After update, the south boundary should have moved from 51 to 50.
         let config = SceneryWindowConfig {
             trigger_distance: 0.3,
-            load_depth: 3,
             ..SceneryWindowConfig::default()
         };
         let mut window = SceneryWindow::new(config);
         let tracker = std::sync::Arc::new(MockSceneTracker::new());
 
-        // Transition to Ready: set bounds twice for stability
+        // Transition to Ready
         tracker.set_bounds(make_bounds(51.0, 54.0, 8.0, 12.0));
         window.update_from_tracker(tracker.as_ref());
         window.update_from_tracker(tracker.as_ref());
@@ -870,7 +898,6 @@ mod tests {
         // Each tracker update should slide the window, enabling new crossings.
         let config = SceneryWindowConfig {
             trigger_distance: 0.3,
-            load_depth: 3,
             ..SceneryWindowConfig::default()
         };
         let mut window = SceneryWindow::new(config);

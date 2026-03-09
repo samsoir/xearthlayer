@@ -21,6 +21,25 @@ pub fn format_dsf_name(lat: i32, lon: i32) -> String {
     format!("{}{:02}{}{:03}", lat_sign, lat.abs(), lon_sign, lon.abs())
 }
 
+/// Compute longitude span in DSF tiles for a given latitude.
+///
+/// X-Plane's scenery window is ~330km × 330km physical extent. Since
+/// longitude degrees shrink with cos(latitude), we need more tiles at
+/// higher latitudes to cover the same physical distance.
+///
+/// # Arguments
+///
+/// * `lat_deg` - Latitude in degrees (-90 to 90)
+/// * `lon_extent_deg` - Longitude extent in degrees at the equator (typically 3.0)
+///
+/// # Returns
+///
+/// Number of 1° DSF tile columns needed. Minimum 1, clamped near poles.
+pub fn lon_tiles_for_latitude(lat_deg: f64, lon_extent_deg: f64) -> usize {
+    let cos_lat = lat_deg.to_radians().cos().abs().max(0.1); // clamp near poles
+    (lon_extent_deg / cos_lat).ceil() as usize
+}
+
 use std::f64::consts::PI;
 
 /// Converts geographic coordinates to tile coordinates.
@@ -285,6 +304,52 @@ pub fn quadkey_to_tile(quadkey: &str) -> Result<TileCoord, CoordError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // lon_tiles_for_latitude tests
+    #[test]
+    fn test_lon_tiles_at_equator() {
+        // cos(0°) = 1.0 → ceil(3.0/1.0) = 3
+        assert_eq!(lon_tiles_for_latitude(0.0, 3.0), 3);
+    }
+
+    #[test]
+    fn test_lon_tiles_at_mid_latitude() {
+        // cos(45°) ≈ 0.707 → ceil(3.0/0.707) = ceil(4.24) = 5
+        assert_eq!(lon_tiles_for_latitude(45.0, 3.0), 5);
+    }
+
+    #[test]
+    fn test_lon_tiles_at_high_latitude() {
+        // cos(60°) = 0.5 → ceil(3.0/0.5) = 6
+        assert_eq!(lon_tiles_for_latitude(60.0, 3.0), 6);
+    }
+
+    #[test]
+    fn test_lon_tiles_near_pole() {
+        // cos(85°) ≈ 0.087, clamped to 0.1 → ceil(3.0/0.1) = 30
+        let result = lon_tiles_for_latitude(85.0, 3.0);
+        assert!(result <= 30, "Should be clamped near poles, got {}", result);
+        assert!(result >= 1, "Should be at least 1");
+    }
+
+    #[test]
+    fn test_lon_tiles_negative_latitude() {
+        // Symmetric: -45° should give same result as +45°
+        assert_eq!(
+            lon_tiles_for_latitude(-45.0, 3.0),
+            lon_tiles_for_latitude(45.0, 3.0)
+        );
+    }
+
+    #[test]
+    fn test_lon_tiles_at_typical_airports() {
+        // EDDF (50°N): cos(50°) ≈ 0.643 → ceil(3.0/0.643) = ceil(4.67) = 5
+        assert_eq!(lon_tiles_for_latitude(50.0, 3.0), 5);
+        // WSSS (1°N): cos(1°) ≈ 0.9998 → ceil(3.0/0.9998) = ceil(3.0005) = 4
+        assert_eq!(lon_tiles_for_latitude(1.0, 3.0), 4);
+        // YPAD (35°S): cos(35°) ≈ 0.819 → ceil(3.0/0.819) = ceil(3.66) = 4
+        assert_eq!(lon_tiles_for_latitude(-35.0, 3.0), 4);
+    }
 
     #[test]
     fn test_new_york_city_at_zoom_16() {

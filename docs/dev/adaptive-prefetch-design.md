@@ -80,15 +80,19 @@ This design is based on empirical research documented in:
 | X-Plane uses position-only loading (no heading/speed/track) | Use position-based boundary monitors, not track projection |
 | Two independent boundary monitors (lat and lon) | Mirror with dual `BoundaryMonitor` structs |
 | ROW loads on latitude crossings, COLUMN loads on longitude crossings | Generate rows/columns, not rectangular bands |
-| 3 DSF tiles deep per loading event | `load_depth = 3` default |
-| 4-6 DSF tiles wide per loading event | Derive from observed window dimensions |
+| Scenery window: ~3° lat × ~3°/cos(lat) lon (~330km × 330km) | Fixed lat rows, latitude-dependent lon columns |
+| ROW loads: 3 DSF rows deep (73% of events), 3-4 cols wide | `load_depth = 3` for latitude crossings |
+| COL loads: 2 DSF cols deep (64% of events), 3-4 rows wide | `load_depth = 2` for longitude crossings |
+| Loading depth is asymmetric (rows deeper than columns) | Axis-specific depth defaults, not a single value |
 | Trigger at ~0.6° into DSF toward boundary | Prefetch when aircraft within `trigger_distance` of window edge |
+| Aircraft typically 1-1.5° from nearest edge | Tight prefetch timing — trigger early |
 | Speed doesn't affect trigger position | Position-based monitors, not time-based |
 | No turn detection — purely position vs. loaded area | No TurnDetector needed; monitors handle turns naturally |
-| Scenery window: 2 behind + aircraft + 3 ahead | Window dimensions derived empirically |
+| Window biased toward departure/heading direction | AC not always centered; bias affects which edge is closest |
 | Post-turn radius fill over 10-20 minutes | Low-priority lateral gap filling |
 | Initial load reveals window dimensions | Derive window size from SceneTracker during initial load |
 | Diagonal flight fires both monitors independently | Both monitors check independently each cycle |
+| Map grid squares are ~0.5°, NOT 1° DSF tiles | Don't confuse X-Plane map grid with DSF boundaries |
 
 ### Test Flight Data
 
@@ -253,11 +257,17 @@ This follows a **two-phase commit** pattern:
 The X-Plane Window is inferred, not observed directly. We use a buffer zone to handle uncertainty:
 
 ```
-Window (configured default): 9 tall × 9 wide
+Window dimensions (empirically measured):
+  Latitude:  ~3° (constant worldwide)
+  Longitude: ~3° / cos(aircraft_latitude) — varies by latitude
+    At equator:  ~4° lon (3 DSF cols)
+    At 35° lat:  ~4° lon (4 DSF cols)
+    At 50° lat:  ~4-5° lon (5 DSF cols)
+
 Buffer: 1° on each side
 
-Total retained area: 11 rows × 11 columns (window + buffer)
-Centered on: aircraft position (sliding forward with flight)
+Total retained area: 5 rows × (lon_cols + 2) columns (window + buffer)
+Centered on: aircraft position (may be biased toward heading)
 
 Regions inside retained area → RetainedRegion in GeoIndex
 Regions previously retained but now outside → evicted from GeoIndex
@@ -296,12 +306,12 @@ The `SceneryWindow` is the core computational model. It derives window dimension
 | State | Condition | Window Source |
 |-------|-----------|--------------|
 | `Uninitialized` | No telemetry, no FUSE data | No predictions |
-| `Assumed` | Telemetry present, no FUSE activity (ocean/sparse start) | Default dimensions (configurable, default 9×9) |
-| `Ready` | First tracker bounds observed | Configured dimensions (default 9×9) centered on tracker center |
+| `Assumed` | Telemetry present, no FUSE activity (ocean/sparse start) | Default dimensions (3 lat × dynamic lon based on latitude) |
+| `Ready` | First tracker bounds observed | Empirical dimensions (3 lat × 3/cos(lat) lon) centered on tracker center |
 
 ### Window Derivation
 
-When SceneTracker first reports `loaded_bounds()`, the window transitions directly to `Ready` using configured dimensions (default 9×9) centered on the tracker's reported center. The configured dimensions are used instead of measured SceneTracker bounds because X-Plane's initial partial load typically reports fewer regions than the actual window size.
+When SceneTracker first reports `loaded_bounds()`, the window transitions directly to `Ready` using empirical dimensions (~3° lat × ~3°/cos(lat) lon) centered on the tracker's reported center. These dimensions are based on direct measurement of X-Plane's in-sim map at three airports across different latitudes (see whitepaper v1.2). The empirical dimensions are used instead of measured SceneTracker bounds because X-Plane's initial partial load typically reports fewer regions than the actual window size.
 
 ### World Rebuild Detection
 
@@ -332,29 +342,29 @@ SceneryWindow
 ```rust
 pub struct BoundaryMonitor {
     axis: BoundaryAxis,        // Latitude or Longitude
-    window_min: f64,           // e.g., lat 47.0 (south edge)
-    window_max: f64,           // e.g., lat 53.0 (north edge)
-    trigger_distance: f64,     // e.g., 3.0° from edge
+    window_min: f64,           // e.g., lat 49.0 (south edge)
+    window_max: f64,           // e.g., lat 52.0 (north edge)
+    trigger_distance: f64,     // e.g., 1.0° from edge
 }
 ```
 
 Per-cycle check (position-only, no track dependency):
 
 ```
-LatitudeMonitor:
-    aircraft_lat = 52.55
-    window north edge = 53.0
+LatitudeMonitor (window ~3° tall, edges at 49.0 and 52.0):
+    aircraft_lat = 51.55
+    window north edge = 52.0
     distance to north edge = 0.45°
 
-    0.45° < trigger_distance (3.0°)? YES
-    → Predict: ROW load at lat 53, 54, 55 (3 deep north)
+    0.45° < trigger_distance (1.0°)? YES
+    → Predict: ROW load at lat 52 (1 deep north)
 
-LongitudeMonitor:
-    aircraft_lon = 7.2
+LongitudeMonitor (window ~4° wide at 50°N, edges at 7.0 and 11.0):
+    aircraft_lon = 8.5
     window east edge = 11.0
-    distance to east edge = 3.8°
+    distance to east edge = 2.5°
 
-    3.8° < trigger_distance (3.0°)? NO
+    2.5° < trigger_distance (1.0°)? NO
     → No prediction this cycle
 ```
 
@@ -363,9 +373,9 @@ LongitudeMonitor:
 ```
 urgency = 1.0 - (distance_to_edge / trigger_distance)
 
-distance = 0.45°, threshold = 1.5° → urgency = 0.70 (getting close)
-distance = 0.15°, threshold = 1.5° → urgency = 0.90 (imminent)
-distance = 3.80°, threshold = 1.5° → urgency < 0   (not triggered)
+distance = 0.45°, threshold = 1.0° → urgency = 0.55 (approaching)
+distance = 0.15°, threshold = 1.0° → urgency = 0.85 (imminent)
+distance = 2.50°, threshold = 1.0° → urgency < 0   (not triggered)
 ```
 
 #### Window Edge Updates
@@ -448,13 +458,13 @@ pub struct BoundaryCrossing {
     pub dsf_coord: i16,            // e.g., lat 50 or lon 5
     /// How urgent (0.0 = distant, 1.0 = imminent)
     pub urgency: f64,
-    /// How many DSF tiles deep to load (typically 3)
+    /// How many DSF tiles deep to load (3 for rows, 2 for columns)
     pub depth: u8,
 }
 
 pub enum BoundaryAxis {
-    Latitude,   // crossing triggers a ROW load
-    Longitude,  // crossing triggers a COLUMN load
+    Latitude,   // crossing triggers a ROW load (3 deep × 3-4 wide)
+    Longitude,  // crossing triggers a COLUMN load (2 deep × 3-4 wide)
 }
 ```
 
@@ -468,17 +478,21 @@ Output: PrefetchPlan { tiles: Vec<TileCoord>, estimated_time }
 For each BoundaryCrossing:
     1. Determine DSF regions in the row/column
 
-       ROW (lat crossing at lat 50, window width lon 3..10):
-         Depth 0: [(50,3), (50,4), (50,5), ..., (50,10)]  ← most urgent
-         Depth 1: [(51,3), (51,4), (51,5), ..., (51,10)]
-         Depth 2: [(52,3), (52,4), (52,5), ..., (52,10)]
-         = 24 DSF regions
+       ROW (lat crossing at lat 52, window width lon 7..11 at 50°N):
+         Depth 0: [(52,7), (52,8), (52,9), (52,10)]    ← most urgent (3-4 cols wide)
+         Depth 1: [(53,7), (53,8), (53,9), (53,10)]
+         Depth 2: [(54,7), (54,8), (54,9), (54,10)]    ← 3 rows deep total
+         = 9-12 DSF regions
 
-       COLUMN (lon crossing at lon 11, window height lat 47..52):
-         Depth 0: [(47,11), (48,11), (49,11), ..., (52,11)]  ← most urgent
-         Depth 1: [(47,12), (48,12), (49,12), ..., (52,12)]
-         Depth 2: [(47,13), (48,13), (49,13), ..., (52,13)]
-         = 18 DSF regions
+       COLUMN (lon crossing at lon 11, window height lat 49..52):
+         Depth 0: [(49,11), (50,11), (51,11)]           ← most urgent (3-4 rows wide)
+         Depth 1: [(49,12), (50,12), (51,12)]            ← 2 cols deep total
+         = 6-8 DSF regions
+
+       Loading depth is asymmetric:
+         ROW loads: 3 rows deep (73% of observed events)
+         COL loads: 2 cols deep (64% of observed events)
+         Width: 3-4 tiles perpendicular (matches window dimensions)
 
     2. Check SceneryIndex coverage for each region
        Regions with no scenery → mark NoCoverage in GeoIndex, skip
@@ -687,20 +701,25 @@ ground_ring_radius = 1.0
 # Distance from window edge to start prefetching (degrees)
 # When the aircraft is within this distance of the X-Plane window edge,
 # the boundary monitor triggers prefetch for the next row/column.
-# Range: 0.5 - 3.0
-# Default: 3.0
-trigger_distance = 3.0
+# With the window only ~3° tall, the aircraft is typically 1-1.5° from
+# the nearest edge, so this should be set conservatively.
+# Range: 0.5 - 2.0
+# Default: 1.0
+trigger_distance = 1.0
 
 # DSF tiles deep per row/column load
-# Matches X-Plane's observed 3-deep strip loading pattern.
-# Range: 1 - 5
-# Default: 3
-load_depth = 3
+# ROW loads (latitude crossings): 3 rows deep (empirically observed)
+# COLUMN loads (longitude crossings): 2 cols deep (empirically observed)
+# This setting provides a base override. The system uses axis-specific
+# defaults if set to 0 (auto).
+# Range: 0 (auto), 1 - 5
+# Default: 0 (auto: 3 for rows, 2 for columns)
+load_depth = 0
 
 # Buffer around inferred X-Plane window (degrees)
 # Adds hysteresis to retention inference. Regions outside window + buffer
 # are considered evicted by X-Plane.
-# Range: 0 - 3
+# Range: 0 - 2
 # Default: 1
 window_buffer = 1
 
@@ -711,12 +730,18 @@ window_buffer = 1
 # Default: 120
 stale_region_timeout = 120
 
-# Fallback window dimensions when no FUSE data available
-# Used when starting in uncovered area (ocean, polar regions).
-# Once X-Plane loads scenery, these are replaced by observed dimensions.
-# Default: 9 rows, 9 columns (based on observed X-Plane 12 loading patterns)
-default_window_rows = 9
-default_window_cols = 9
+# Window latitude height (DSF rows)
+# X-Plane's scenery window is ~3° latitude at all latitudes.
+# Range: 2 - 5
+# Default: 3
+default_window_rows = 3
+
+# Window longitude width mode
+# "auto" computes longitude width dynamically: ceil(3 / cos(latitude))
+# This matches X-Plane's constant-physical-distance window (~330km).
+# A fixed integer value can be used as override.
+# Default: auto
+default_window_cols = auto
 ```
 
 ### Deprecated Settings
@@ -852,3 +877,4 @@ Replay flight 5 (LFLL diagonal orbit) log data through the new system and verify
 | 1.0 | January 2026 | Initial design based on flight test research |
 | 1.1 | January 2026 | Added rolling recalibration, priority-based backpressure, design considerations |
 | 2.0 | March 2026 | Major revision: replaced band-based cruise strategy with boundary-driven model. Three-window architecture (X-Plane / XEL / Target). Dual boundary monitors (lat/lon). Removed CruiseStrategy, BandCalculator, BoundaryPrioritizer, TurnDetector. Added SceneryWindow with window derivation, retention inference, and `Assumed` state for no-coverage starts. Two-phase commit for region tracking. GeoIndex extended with RetainedRegion and PrefetchedRegion layers. Updated configuration (deprecated 7 settings, added 6 new). Based on whitepaper v1.1 findings from 5 flights / 10.5+ hours of data. |
+| 2.1 | March 2026 | **Window dimension and loading depth correction.** Empirical map-based measurement at EDDF/YPAD/WSSS revealed window is ~3° lat × ~3°/cos(lat) lon, not 9×9°. FUSE burst analysis (65 classified events with telemetry) confirmed asymmetric loading depth: ROW loads 3 deep (73%), COL loads 2 deep (64%), both 3-4 wide. Trigger distance ~1° from window edge. Updated defaults: `default_window_rows` 9→3, `default_window_cols` 9→auto, `trigger_distance` 3.0→1.0, `load_depth` 3→0 (auto: 3 rows, 2 cols). See whitepaper v1.2 for methodology. |

@@ -97,11 +97,13 @@ pub struct AdaptivePrefetchConfig {
     /// Range: 0.5 - 3.0
     pub trigger_distance: f64,
 
-    /// DSF tiles deep per crossing.
-    ///
-    /// How many DSF tiles deep to prefetch when crossing a boundary.
+    /// Load depth for latitude boundary crossings (ROW loads).
     /// Range: 1 - 5
-    pub load_depth: u8,
+    pub load_depth_lat: u8,
+
+    /// Load depth for longitude boundary crossings (COLUMN loads).
+    /// Range: 1 - 5
+    pub load_depth_lon: u8,
 
     /// Buffer tiles for retention.
     ///
@@ -117,14 +119,14 @@ pub struct AdaptivePrefetchConfig {
     /// Assumed window height in DSF tiles.
     ///
     /// Used when the actual window size is unknown.
-    /// Range: 3 - 12
+    /// Range: 2 - 12
     pub default_window_rows: usize,
 
-    /// Assumed window width in DSF tiles.
+    /// Longitude extent in degrees for dynamic column computation.
     ///
-    /// Used when the actual window size is unknown.
-    /// Range: 4 - 16
-    pub default_window_cols: usize,
+    /// Columns computed as `ceil(lon_extent / cos(latitude))`.
+    /// Range: 1.0 - 10.0
+    pub window_lon_extent: f64,
 }
 
 impl Default for AdaptivePrefetchConfig {
@@ -142,12 +144,13 @@ impl Default for AdaptivePrefetchConfig {
             landing_hysteresis: Duration::from_secs(15),
             ramp_duration: Duration::from_secs(30),
             ramp_start_fraction: 0.25,
-            trigger_distance: 3.0,
-            load_depth: 3,
+            trigger_distance: 1.5,
+            load_depth_lat: 3,
+            load_depth_lon: 2,
             window_buffer: 1,
             stale_region_timeout: Duration::from_secs(120),
-            default_window_rows: 9,
-            default_window_cols: 9,
+            default_window_rows: 3,
+            window_lon_extent: 3.0,
         }
     }
 }
@@ -177,11 +180,12 @@ impl AdaptivePrefetchConfig {
             ramp_duration: Duration::from_secs(settings.ramp_duration_secs),
             ramp_start_fraction: settings.ramp_start_fraction,
             trigger_distance: settings.trigger_distance,
-            load_depth: settings.load_depth,
+            load_depth_lat: settings.load_depth_lat,
+            load_depth_lon: settings.load_depth_lon,
             window_buffer: settings.window_buffer,
             stale_region_timeout: Duration::from_secs(settings.stale_region_timeout),
             default_window_rows: settings.default_window_rows,
-            default_window_cols: settings.default_window_cols,
+            window_lon_extent: settings.window_lon_extent,
             ..Default::default()
         }
     }
@@ -208,11 +212,12 @@ impl AdaptivePrefetchConfig {
             ramp_duration: Duration::from_secs(config.ramp_duration_secs),
             ramp_start_fraction: config.ramp_start_fraction,
             trigger_distance: config.trigger_distance,
-            load_depth: config.load_depth,
+            load_depth_lat: config.load_depth_lat,
+            load_depth_lon: config.load_depth_lon,
             window_buffer: config.window_buffer,
             stale_region_timeout: Duration::from_secs(config.stale_region_timeout),
             default_window_rows: config.default_window_rows,
-            default_window_cols: config.default_window_cols,
+            window_lon_extent: config.window_lon_extent,
             ..Default::default()
         }
     }
@@ -460,12 +465,13 @@ mod tests {
     #[test]
     fn test_default_config_boundary_prefetch() {
         let config = AdaptivePrefetchConfig::default();
-        assert_eq!(config.trigger_distance, 3.0);
-        assert_eq!(config.load_depth, 3);
+        assert_eq!(config.trigger_distance, 1.5);
+        assert_eq!(config.load_depth_lat, 3);
+        assert_eq!(config.load_depth_lon, 2);
         assert_eq!(config.window_buffer, 1);
         assert_eq!(config.stale_region_timeout, Duration::from_secs(120));
-        assert_eq!(config.default_window_rows, 9);
-        assert_eq!(config.default_window_cols, 9);
+        assert_eq!(config.default_window_rows, 3);
+        assert_eq!(config.window_lon_extent, 3.0);
     }
 
     #[test]
@@ -488,20 +494,22 @@ mod tests {
             ramp_duration_secs: 30,
             ramp_start_fraction: 0.25,
             trigger_distance: 2.0,
-            load_depth: 4,
+            load_depth_lat: 4,
+            load_depth_lon: 3,
             window_buffer: 2,
             stale_region_timeout: 300,
-            default_window_rows: 8,
-            default_window_cols: 12,
+            default_window_rows: 4,
+            window_lon_extent: 4.0,
         };
 
         let config = AdaptivePrefetchConfig::from_prefetch_settings(&settings);
         assert_eq!(config.trigger_distance, 2.0);
-        assert_eq!(config.load_depth, 4);
+        assert_eq!(config.load_depth_lat, 4);
+        assert_eq!(config.load_depth_lon, 3);
         assert_eq!(config.window_buffer, 2);
         assert_eq!(config.stale_region_timeout, Duration::from_secs(300));
-        assert_eq!(config.default_window_rows, 8);
-        assert_eq!(config.default_window_cols, 12);
+        assert_eq!(config.default_window_rows, 4);
+        assert_eq!(config.window_lon_extent, 4.0);
     }
 
     #[test]

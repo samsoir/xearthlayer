@@ -208,19 +208,22 @@ ramp_duration_secs = {}
 ramp_start_fraction = {}
 
 ; Boundary-driven prefetch settings
-; Boundary trigger distance in degrees (default: 3.0, range: 0.5-3.0)
-; How close to a DSF boundary to trigger prefetch
+; Boundary trigger distance in degrees (default: 1.5, range: 0.5-3.0)
+; Must be > X-Plane's 1.0° trigger to prefetch before X-Plane requests tiles
 trigger_distance = {}
-; DSF tiles deep per crossing (default: 3, range: 1-5)
-load_depth = {}
+; Load depth for latitude boundary crossings in DSF tiles (default: 3, range: 1-5)
+load_depth_lat = {}
+; Load depth for longitude boundary crossings in DSF tiles (default: 2, range: 1-5)
+load_depth_lon = {}
 ; Buffer tiles for retention beyond visible window (default: 1, range: 0-3)
 window_buffer = {}
 ; InProgress staleness timeout in seconds (default: 120, range: 30-600)
 stale_region_timeout = {}
-; Assumed window height in DSF tiles (default: 9, range: 3-12)
+; Assumed window height in DSF tiles (default: 3, range: 2-12)
 default_window_rows = {}
-; Assumed window width in DSF tiles (default: 9, range: 4-16)
-default_window_cols = {}
+; Longitude extent in degrees for window column computation (default: 3.0, range: 1.0-10.0)
+; Columns computed dynamically: ceil(lon_extent / cos(latitude))
+window_lon_extent = {}
 
 [control_plane]
 ; Advanced settings for job management and health monitoring.
@@ -243,10 +246,10 @@ semaphore_timeout_secs = {}
 ; Settings for cold-start cache pre-warming.
 ; Use with --airport ICAO to pre-load tiles around an airport before flight.
 
-; Grid size in DSF tiles (N = N×N grid) around the airport to prewarm.
-; 8 = 8×8 grid = 64 DSF tiles, approximately 480nm × 480nm at mid-latitudes.
-; Each DSF tile is 1° × 1° (roughly 60nm × 60nm at equator).
-grid_size = {}
+; Grid rows (latitude extent) in DSF tiles around the airport to prewarm (default: 3)
+grid_rows = {}
+; Grid columns (longitude extent) in DSF tiles around the airport to prewarm (default: 4)
+grid_cols = {}
 
 [patches]
 ; Settings for custom Ortho4XP tile patches (airport addon mesh/elevation support).
@@ -279,6 +282,18 @@ api_url = {}
 poll_interval_secs = {}
 ; Maximum age in seconds before data is considered stale (default: 60)
 max_stale_secs = {}
+
+[fuse]
+; FUSE kernel settings for concurrent background request limits.
+; Higher values allow more concurrent X-Plane scenery reads, preventing
+; freezes at DSF boundaries. Only modify if you understand FUSE internals.
+
+; Maximum pending background FUSE requests before the kernel queues (default: 256, range: 1-1024)
+; The Linux kernel default of 12 severely limits X-Plane's concurrent scenery reads.
+max_background = {}
+; Congestion threshold for background FUSE requests (default: 192, range: 1-1024)
+; Kernel starts throttling when pending requests exceed this. Convention: 75% of max_background.
+congestion_threshold = {}
 "#,
         config.provider.provider_type,
         google_api_key,
@@ -325,16 +340,18 @@ max_stale_secs = {}
         config.prefetch.ramp_duration_secs,
         config.prefetch.ramp_start_fraction,
         config.prefetch.trigger_distance,
-        config.prefetch.load_depth,
+        config.prefetch.load_depth_lat,
+        config.prefetch.load_depth_lon,
         config.prefetch.window_buffer,
         config.prefetch.stale_region_timeout,
         config.prefetch.default_window_rows,
-        config.prefetch.default_window_cols,
+        config.prefetch.window_lon_extent,
         config.control_plane.max_concurrent_jobs,
         config.control_plane.stall_threshold_secs,
         config.control_plane.health_check_interval_secs,
         config.control_plane.semaphore_timeout_secs,
-        config.prewarm.grid_size,
+        config.prewarm.grid_rows,
+        config.prewarm.grid_cols,
         config.patches.enabled,
         config
             .patches
@@ -348,6 +365,9 @@ max_stale_secs = {}
         config.online_network.api_url,
         config.online_network.poll_interval_secs,
         config.online_network.max_stale_secs,
+        // FUSE settings
+        config.fuse.max_background,
+        config.fuse.congestion_threshold,
     )
 }
 

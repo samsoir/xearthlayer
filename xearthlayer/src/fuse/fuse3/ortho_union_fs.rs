@@ -54,7 +54,7 @@ use fuse3::raw::reply::{
 };
 use fuse3::raw::Filesystem;
 use fuse3::{Errno, MountOptions, Result as Fuse3InternalResult};
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::stream::{self, Stream, StreamExt};
 use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -133,6 +133,12 @@ pub struct Fuse3OrthoUnionFS {
     ///
     /// When set, reports coalesced requests and other FUSE-specific metrics.
     metrics_client: Option<crate::metrics::MetricsClient>,
+    /// Maximum pending background FUSE requests (kernel limit).
+    /// When set, overrides the kernel default (12) in the FUSE init handshake.
+    fuse_max_background: Option<u16>,
+    /// Congestion threshold for background FUSE requests (kernel limit).
+    /// When set, overrides the kernel default (9) in the FUSE init handshake.
+    fuse_congestion_threshold: Option<u16>,
 }
 
 impl Fuse3OrthoUnionFS {
@@ -181,6 +187,8 @@ impl Fuse3OrthoUnionFS {
             dds_access_tx: None,
             scene_tracker_tx: None,
             metrics_client: None,
+            fuse_max_background: None,
+            fuse_congestion_threshold: None,
         }
     }
 
@@ -210,6 +218,8 @@ impl Fuse3OrthoUnionFS {
             dds_access_tx: None,
             scene_tracker_tx: None,
             metrics_client: None,
+            fuse_max_background: None,
+            fuse_congestion_threshold: None,
         }
     }
 
@@ -299,6 +309,18 @@ impl Fuse3OrthoUnionFS {
     /// only from patch sources, hiding package files that could conflict.
     pub fn with_geo_index(mut self, geo_index: Arc<GeoIndex>) -> Self {
         self.geo_index = Some(geo_index);
+        self
+    }
+
+    /// Set the FUSE kernel background request limits.
+    ///
+    /// These values are sent to the kernel during the FUSE init handshake to
+    /// control how many concurrent background requests (readahead, async reads)
+    /// are allowed before throttling. The kernel defaults (12/9) are too low
+    /// for X-Plane's concurrent scenery reads.
+    pub fn with_fuse_limits(mut self, max_background: u16, congestion_threshold: u16) -> Self {
+        self.fuse_max_background = Some(max_background);
+        self.fuse_congestion_threshold = Some(congestion_threshold);
         self
     }
 
@@ -483,23 +505,18 @@ impl DdsRequestor for Fuse3OrthoUnionFS {
 }
 
 impl Filesystem for Fuse3OrthoUnionFS {
-    type DirEntryStream<'a>
-        = BoxStream<'a, Fuse3InternalResult<DirectoryEntry>>
-    where
-        Self: 'a;
-    type DirEntryPlusStream<'a>
-        = BoxStream<'a, Fuse3InternalResult<DirectoryEntryPlus>>
-    where
-        Self: 'a;
-
     async fn init(&self, _req: Request) -> Fuse3InternalResult<ReplyInit> {
         debug!(
             sources = self.index.source_count(),
             files = self.index.file_count(),
+            fuse_max_background = ?self.fuse_max_background,
+            fuse_congestion_threshold = ?self.fuse_congestion_threshold,
             "fuse3 ortho union: init"
         );
         Ok(ReplyInit {
             max_write: NonZeroU32::new(1024 * 1024).unwrap(),
+            max_background: self.fuse_max_background,
+            congestion_threshold: self.fuse_congestion_threshold,
         })
     }
 
@@ -760,7 +777,9 @@ impl Filesystem for Fuse3OrthoUnionFS {
         ino: u64,
         _fh: u64,
         offset: i64,
-    ) -> Fuse3InternalResult<ReplyDirectory<Self::DirEntryStream<'_>>> {
+    ) -> Fuse3InternalResult<
+        ReplyDirectory<impl Stream<Item = Fuse3InternalResult<DirectoryEntry>> + Send + '_>,
+    > {
         tracing::debug!(ino = ino, offset = offset, "FUSE readdir called");
 
         // Get virtual path for this directory
@@ -843,7 +862,9 @@ impl Filesystem for Fuse3OrthoUnionFS {
         _fh: u64,
         offset: u64,
         _lock_owner: u64,
-    ) -> Fuse3InternalResult<ReplyDirectoryPlus<Self::DirEntryPlusStream<'_>>> {
+    ) -> Fuse3InternalResult<
+        ReplyDirectoryPlus<impl Stream<Item = Fuse3InternalResult<DirectoryEntryPlus>> + Send + '_>,
+    > {
         tracing::debug!(ino = ino, offset = offset, "FUSE readdirplus called");
 
         // Get virtual path for this directory

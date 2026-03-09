@@ -250,8 +250,9 @@ impl ServiceOrchestrator {
             config.disk_io_profile,
         );
 
-        // Create mount manager with Custom Scenery path
-        let mount_manager = MountManager::with_scenery_path(&config.custom_scenery_path);
+        // Create mount manager with Custom Scenery path and FUSE kernel limits
+        let mut mount_manager = MountManager::with_scenery_path(&config.custom_scenery_path);
+        mount_manager.set_fuse_limits(config.fuse.max_background, config.fuse.congestion_threshold);
 
         // Wire load monitor for circuit breaker integration
         let load_monitor = mount_manager.load_monitor();

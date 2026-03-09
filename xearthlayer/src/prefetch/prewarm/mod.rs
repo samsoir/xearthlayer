@@ -35,7 +35,7 @@
 //! ```ignore
 //! // Find tiles to prewarm
 //! let scanner = FileTerrainScanner::new(ortho_index);
-//! let dsf_tiles = generate_dsf_grid(lat, lon, 4);
+//! let dsf_tiles = generate_dsf_grid(lat, lon, 3, 4);
 //! let bounds = DsfGridBounds::from_tiles(&dsf_tiles);
 //! let tiles = scanner.scan(&bounds);
 //!
@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn test_generate_dsf_grid_exported() {
-        let tiles = generate_dsf_grid(43.0, 1.0, 4);
+        let tiles = generate_dsf_grid(43.0, 1.0, 4, 4);
         assert_eq!(tiles.len(), 16);
     }
 }

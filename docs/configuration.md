@@ -342,12 +342,13 @@ The system uses flight phase detection and performance calibration:
 | `landing_hysteresis_secs` | integer | `15` | Sustained seconds at GS < 40kt before landing detection (5-60) |
 | `ramp_duration_secs` | integer | `30` | Duration of linear ramp to full prefetch rate (10-120) |
 | `ramp_start_fraction` | float | `0.25` | Starting prefetch fraction when ramp begins (0.1-0.5) |
-| `trigger_distance` | float | `3.0` | DSF boundary distance (degrees) to trigger prefetch (0.5-3.0) |
-| `load_depth` | integer | `3` | Number of DSF rows/columns to prefetch ahead (1-5) |
+| `trigger_distance` | float | `1.5` | Distance from window edge (degrees) to trigger prefetch (0.5-3.0) |
+| `load_depth_lat` | integer | `3` | DSF rows to prefetch for latitude boundary crossings (1-5) |
+| `load_depth_lon` | integer | `2` | DSF columns to prefetch for longitude boundary crossings (1-5) |
 | `window_buffer` | integer | `1` | Extra DSF tiles around window edges to retain (0-3) |
 | `stale_region_timeout` | integer | `120` | Seconds before an InProgress region is considered stale (30-600) |
-| `default_window_rows` | integer | `9` | Default scenery window height in DSF rows (3-12) |
-| `default_window_cols` | integer | `9` | Default scenery window width in DSF columns (4-16) |
+| `default_window_rows` | integer | `3` | Scenery window height in DSF rows — ~3° at all latitudes (2-12) |
+| `window_lon_extent` | float | `3.0` | Longitude extent in degrees for window column computation (1.0-10.0) |
 
 **Mode Options:**
 
@@ -396,12 +397,13 @@ ramp_duration_secs = 30                      ; Linear ramp duration after hold r
 ramp_start_fraction = 0.25                   ; Starting prefetch fraction (25%)
 
 ; Boundary-driven prefetch (cruise mode)
-; trigger_distance = 3.0                     ; DSF boundary distance (degrees) to trigger
-; load_depth = 3                             ; DSF rows/columns to prefetch ahead
+; trigger_distance = 1.5                     ; Distance from edge (degrees) to trigger
+; load_depth_lat = 3                         ; DSF rows for latitude boundary crossings
+; load_depth_lon = 2                         ; DSF columns for longitude boundary crossings
 ; window_buffer = 1                          ; Extra DSF tiles around window edges
 ; stale_region_timeout = 120                 ; Seconds before InProgress region is stale
-; default_window_rows = 9                    ; Scenery window height (DSF rows)
-; default_window_cols = 9                    ; Scenery window width (DSF columns)
+; default_window_rows = 3                    ; Scenery window height (DSF rows, ~3° worldwide)
+; window_lon_extent = 3.0                    ; Longitude extent (degrees) for column computation
 ```
 
 **Transition Ramp:**
@@ -428,26 +430,25 @@ Controls cold-start cache pre-warming. Use with `xearthlayer run --airport ICAO`
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `grid_size` | integer | `8` | DSF grid dimension (N×N tiles) around the airport to prewarm |
+| `grid_rows` | integer | `3` | Latitude extent in DSF tiles around the airport to prewarm |
+| `grid_cols` | integer | `4` | Longitude extent in DSF tiles around the airport to prewarm |
 
 **DSF Grid-Based Pre-warming:**
 
-Prewarm uses X-Plane's native DSF tile grid (1° × 1° tiles) to determine which tiles to prepare. The `grid_size` setting defines an N×N grid centered on the departure airport:
+Prewarm uses X-Plane's native DSF tile grid (1° × 1° tiles) to determine which tiles to prepare. The `grid_rows` and `grid_cols` settings define the rectangular grid centered on the departure airport. The default 3×4 grid (12 tiles) matches X-Plane's empirically measured ~3° lat × ~4° lon scenery window at mid-latitudes.
 
-| Grid Size | Tiles | Approximate Coverage (mid-latitudes) |
-|-----------|-------|--------------------------------------|
-| 4 | 16 tiles (4×4) | ~240nm × 240nm |
-| 6 | 36 tiles (6×6) | ~360nm × 360nm |
-| 8 (default) | 64 tiles (8×8) | ~480nm × 480nm |
-| 10 | 100 tiles (10×10) | ~600nm × 600nm |
-
-The default grid size of 8 covers X-Plane's extended DSF loading region plus a generous buffer for initial flight. Larger grids increase pre-warm time proportionally (area scales with grid_size²).
+| Rows × Cols | Tiles | Approximate Coverage (mid-latitudes) |
+|-------------|-------|--------------------------------------|
+| 3 × 4 (default) | 12 tiles | ~180nm × 240nm |
+| 4 × 6 | 24 tiles | ~240nm × 360nm |
+| 6 × 8 | 48 tiles | ~360nm × 480nm |
 
 **Example:**
 ```ini
 [prewarm]
-; Pre-warm an 8×8 DSF grid around departure airport
-grid_size = 8
+; Pre-warm a 3×4 DSF grid around departure airport
+grid_rows = 3
+grid_cols = 4
 ```
 
 ### [xplane]
@@ -571,6 +572,27 @@ When multiple sources provide position data simultaneously, the APT system selec
 3. **Scene Inference** (100km) — fallback from FUSE file access patterns
 4. **Manual Reference** (100m) — airport prewarm seed
 
+### [fuse]
+
+Controls Linux FUSE kernel parameters for concurrent background request limits. The Linux kernel's default limits (12 max background / 9 congestion threshold) are far too low for X-Plane's concurrent scenery reads, causing sim freezes at DSF boundaries.
+
+| Setting | Default | Range | Description |
+|---------|---------|-------|-------------|
+| `max_background` | 256 | 1-1024 | Maximum pending background FUSE requests before the kernel queues them |
+| `congestion_threshold` | 192 | 1-1024 | Kernel starts throttling when pending requests exceed this (convention: 75% of max_background) |
+
+**When to modify:**
+- If you experience sim freezes at DSF boundaries, try increasing both values
+- If system memory is very limited, you might reduce them (but the defaults are recommended)
+- `congestion_threshold` should always be less than `max_background`
+
+**Example:**
+```ini
+[fuse]
+max_background = 256
+congestion_threshold = 192
+```
+
 ## Complete Example
 
 ```ini
@@ -645,16 +667,18 @@ mode = auto                    ; auto, aggressive, opportunistic, disabled
 ; ramp_start_fraction = 0.25                 ; starting prefetch fraction
 
 ; Boundary-driven prefetch (cruise mode)
-; trigger_distance = 3.0                     ; DSF boundary distance (degrees) to trigger
-; load_depth = 3                             ; DSF rows/columns to prefetch ahead
+; trigger_distance = 1.5                     ; distance from edge (degrees) to trigger
+; load_depth_lat = 3                         ; DSF rows for latitude boundary crossings
+; load_depth_lon = 2                         ; DSF columns for longitude boundary crossings
 ; window_buffer = 1                          ; extra DSF tiles around window edges
 ; stale_region_timeout = 120                 ; seconds before InProgress region is stale
-; default_window_rows = 6                    ; scenery window height (DSF rows)
-; default_window_cols = 8                    ; scenery window width (DSF columns)
+; default_window_rows = 3                    ; scenery window height (DSF rows)
+; window_lon_extent = 3.0                    ; longitude extent for column computation
 
 [prewarm]
 ; Cold-start cache pre-warming (use with --airport ICAO)
-; grid_size = 8                ; N×N DSF grid around airport (default: 8×8 = 64 tiles)
+; grid_rows = 3               ; latitude extent in DSF tiles (default: 3)
+; grid_cols = 4               ; longitude extent in DSF tiles (default: 4)
 
 [xplane]
 ; scenery_dir = /path/to/X-Plane 12/Custom Scenery
@@ -683,6 +707,12 @@ pilot_id = 0
 ; api_url = https://status.vatsim.net/status.json
 ; poll_interval_secs = 15
 ; max_stale_secs = 60
+
+[fuse]
+; FUSE kernel limits for concurrent background requests (advanced)
+; The Linux kernel default of 12/9 causes X-Plane freezes at DSF boundaries
+max_background = 256
+congestion_threshold = 192
 ```
 
 ## Config CLI Commands
@@ -798,13 +828,15 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `prefetch.landing_hysteresis_secs` | 5-60 | Sustained GS < 40kt for landing detection |
 | `prefetch.ramp_duration_secs` | 10-120 | Linear ramp duration (seconds) |
 | `prefetch.ramp_start_fraction` | 0.1-0.5 | Starting prefetch fraction |
-| `prefetch.trigger_distance` | 0.5-3.0 | DSF boundary distance (degrees) to trigger prefetch |
-| `prefetch.load_depth` | 1-5 | DSF rows/columns to prefetch ahead |
+| `prefetch.trigger_distance` | 0.5-3.0 | Distance from window edge (degrees) to trigger prefetch |
+| `prefetch.load_depth_lat` | 1-5 | DSF rows for latitude boundary crossings |
+| `prefetch.load_depth_lon` | 1-5 | DSF columns for longitude boundary crossings |
 | `prefetch.window_buffer` | 0-3 | Extra DSF tiles around window edges |
 | `prefetch.stale_region_timeout` | 30-600 | Seconds before InProgress region is stale |
-| `prefetch.default_window_rows` | 3-12 | Scenery window height (DSF rows) |
-| `prefetch.default_window_cols` | 4-16 | Scenery window width (DSF columns) |
-| `prewarm.grid_size` | positive integer | DSF grid dimension (N×N) for airport prewarm |
+| `prefetch.default_window_rows` | 2-12 | Scenery window height (DSF rows) |
+| `prefetch.window_lon_extent` | 1.0-10.0 | Longitude extent (degrees) for column computation |
+| `prewarm.grid_rows` | positive integer | Latitude extent in DSF tiles for prewarm |
+| `prewarm.grid_cols` | positive integer | Longitude extent in DSF tiles for prewarm |
 | `xplane.scenery_dir` | path | X-Plane Custom Scenery directory |
 | `packages.library_url` | URL | Package library index URL |
 | `packages.install_location` | path | Package installation directory |

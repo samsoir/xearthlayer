@@ -96,11 +96,12 @@ pub enum ConfigKey {
 
     // Boundary-driven prefetch settings
     PrefetchTriggerDistance,
-    PrefetchLoadDepth,
+    PrefetchLoadDepthLat,
+    PrefetchLoadDepthLon,
     PrefetchWindowBuffer,
     PrefetchStaleRegionTimeout,
     PrefetchDefaultWindowRows,
-    PrefetchDefaultWindowCols,
+    PrefetchWindowLonExtent,
 
     // Control plane settings
     ControlPlaneMaxConcurrentJobs,
@@ -109,7 +110,8 @@ pub enum ConfigKey {
     ControlPlaneSemaphoreTimeoutSecs,
 
     // Prewarm settings
-    PrewarmGridSize,
+    PrewarmGridRows,
+    PrewarmGridCols,
 
     // Patches settings
     PatchesEnabled,
@@ -133,6 +135,10 @@ pub enum ConfigKey {
     OnlineNetworkApiUrl,
     OnlineNetworkPollIntervalSecs,
     OnlineNetworkMaxStaleSecs,
+
+    // FUSE settings
+    FuseMaxBackground,
+    FuseCongestionThreshold,
 }
 
 impl FromStr for ConfigKey {
@@ -199,11 +205,12 @@ impl FromStr for ConfigKey {
             "prefetch.ramp_duration_secs" => Ok(ConfigKey::PrefetchRampDurationSecs),
             "prefetch.ramp_start_fraction" => Ok(ConfigKey::PrefetchRampStartFraction),
             "prefetch.trigger_distance" => Ok(ConfigKey::PrefetchTriggerDistance),
-            "prefetch.load_depth" => Ok(ConfigKey::PrefetchLoadDepth),
+            "prefetch.load_depth_lat" => Ok(ConfigKey::PrefetchLoadDepthLat),
+            "prefetch.load_depth_lon" => Ok(ConfigKey::PrefetchLoadDepthLon),
             "prefetch.window_buffer" => Ok(ConfigKey::PrefetchWindowBuffer),
             "prefetch.stale_region_timeout" => Ok(ConfigKey::PrefetchStaleRegionTimeout),
             "prefetch.default_window_rows" => Ok(ConfigKey::PrefetchDefaultWindowRows),
-            "prefetch.default_window_cols" => Ok(ConfigKey::PrefetchDefaultWindowCols),
+            "prefetch.window_lon_extent" => Ok(ConfigKey::PrefetchWindowLonExtent),
 
             "control_plane.max_concurrent_jobs" => Ok(ConfigKey::ControlPlaneMaxConcurrentJobs),
             "control_plane.stall_threshold_secs" => Ok(ConfigKey::ControlPlaneStallThresholdSecs),
@@ -215,7 +222,8 @@ impl FromStr for ConfigKey {
             }
 
             // Prewarm settings
-            "prewarm.grid_size" => Ok(ConfigKey::PrewarmGridSize),
+            "prewarm.grid_rows" => Ok(ConfigKey::PrewarmGridRows),
+            "prewarm.grid_cols" => Ok(ConfigKey::PrewarmGridCols),
 
             // Patches settings
             "patches.enabled" => Ok(ConfigKey::PatchesEnabled),
@@ -239,6 +247,10 @@ impl FromStr for ConfigKey {
             "online_network.api_url" => Ok(ConfigKey::OnlineNetworkApiUrl),
             "online_network.poll_interval_secs" => Ok(ConfigKey::OnlineNetworkPollIntervalSecs),
             "online_network.max_stale_secs" => Ok(ConfigKey::OnlineNetworkMaxStaleSecs),
+
+            // FUSE settings
+            "fuse.max_background" => Ok(ConfigKey::FuseMaxBackground),
+            "fuse.congestion_threshold" => Ok(ConfigKey::FuseCongestionThreshold),
 
             _ => Err(ConfigKeyError::UnknownKey(s.to_string())),
         }
@@ -297,11 +309,12 @@ impl ConfigKey {
             ConfigKey::PrefetchRampDurationSecs => "prefetch.ramp_duration_secs",
             ConfigKey::PrefetchRampStartFraction => "prefetch.ramp_start_fraction",
             ConfigKey::PrefetchTriggerDistance => "prefetch.trigger_distance",
-            ConfigKey::PrefetchLoadDepth => "prefetch.load_depth",
+            ConfigKey::PrefetchLoadDepthLat => "prefetch.load_depth_lat",
+            ConfigKey::PrefetchLoadDepthLon => "prefetch.load_depth_lon",
             ConfigKey::PrefetchWindowBuffer => "prefetch.window_buffer",
             ConfigKey::PrefetchStaleRegionTimeout => "prefetch.stale_region_timeout",
             ConfigKey::PrefetchDefaultWindowRows => "prefetch.default_window_rows",
-            ConfigKey::PrefetchDefaultWindowCols => "prefetch.default_window_cols",
+            ConfigKey::PrefetchWindowLonExtent => "prefetch.window_lon_extent",
             ConfigKey::ControlPlaneMaxConcurrentJobs => "control_plane.max_concurrent_jobs",
             ConfigKey::ControlPlaneStallThresholdSecs => "control_plane.stall_threshold_secs",
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => {
@@ -310,7 +323,8 @@ impl ConfigKey {
             ConfigKey::ControlPlaneSemaphoreTimeoutSecs => "control_plane.semaphore_timeout_secs",
 
             // Prewarm settings
-            ConfigKey::PrewarmGridSize => "prewarm.grid_size",
+            ConfigKey::PrewarmGridRows => "prewarm.grid_rows",
+            ConfigKey::PrewarmGridCols => "prewarm.grid_cols",
 
             // Patches settings
             ConfigKey::PatchesEnabled => "patches.enabled",
@@ -334,6 +348,10 @@ impl ConfigKey {
             ConfigKey::OnlineNetworkApiUrl => "online_network.api_url",
             ConfigKey::OnlineNetworkPollIntervalSecs => "online_network.poll_interval_secs",
             ConfigKey::OnlineNetworkMaxStaleSecs => "online_network.max_stale_secs",
+
+            // FUSE settings
+            ConfigKey::FuseMaxBackground => "fuse.max_background",
+            ConfigKey::FuseCongestionThreshold => "fuse.congestion_threshold",
         }
     }
 
@@ -443,13 +461,14 @@ impl ConfigKey {
             ConfigKey::PrefetchRampDurationSecs => config.prefetch.ramp_duration_secs.to_string(),
             ConfigKey::PrefetchRampStartFraction => config.prefetch.ramp_start_fraction.to_string(),
             ConfigKey::PrefetchTriggerDistance => config.prefetch.trigger_distance.to_string(),
-            ConfigKey::PrefetchLoadDepth => config.prefetch.load_depth.to_string(),
+            ConfigKey::PrefetchLoadDepthLat => config.prefetch.load_depth_lat.to_string(),
+            ConfigKey::PrefetchLoadDepthLon => config.prefetch.load_depth_lon.to_string(),
             ConfigKey::PrefetchWindowBuffer => config.prefetch.window_buffer.to_string(),
             ConfigKey::PrefetchStaleRegionTimeout => {
                 config.prefetch.stale_region_timeout.to_string()
             }
             ConfigKey::PrefetchDefaultWindowRows => config.prefetch.default_window_rows.to_string(),
-            ConfigKey::PrefetchDefaultWindowCols => config.prefetch.default_window_cols.to_string(),
+            ConfigKey::PrefetchWindowLonExtent => config.prefetch.window_lon_extent.to_string(),
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs.to_string()
             }
@@ -464,7 +483,8 @@ impl ConfigKey {
             }
 
             // Prewarm settings
-            ConfigKey::PrewarmGridSize => config.prewarm.grid_size.to_string(),
+            ConfigKey::PrewarmGridRows => config.prewarm.grid_rows.to_string(),
+            ConfigKey::PrewarmGridCols => config.prewarm.grid_cols.to_string(),
 
             // Patches settings
             ConfigKey::PatchesEnabled => config.patches.enabled.to_string(),
@@ -505,6 +525,10 @@ impl ConfigKey {
             ConfigKey::OnlineNetworkMaxStaleSecs => {
                 config.online_network.max_stale_secs.to_string()
             }
+
+            // FUSE settings
+            ConfigKey::FuseMaxBackground => config.fuse.max_background.to_string(),
+            ConfigKey::FuseCongestionThreshold => config.fuse.congestion_threshold.to_string(),
         }
     }
 
@@ -654,8 +678,11 @@ impl ConfigKey {
             ConfigKey::PrefetchTriggerDistance => {
                 config.prefetch.trigger_distance = value.parse().unwrap();
             }
-            ConfigKey::PrefetchLoadDepth => {
-                config.prefetch.load_depth = value.parse().unwrap();
+            ConfigKey::PrefetchLoadDepthLat => {
+                config.prefetch.load_depth_lat = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchLoadDepthLon => {
+                config.prefetch.load_depth_lon = value.parse().unwrap();
             }
             ConfigKey::PrefetchWindowBuffer => {
                 config.prefetch.window_buffer = value.parse().unwrap();
@@ -666,8 +693,8 @@ impl ConfigKey {
             ConfigKey::PrefetchDefaultWindowRows => {
                 config.prefetch.default_window_rows = value.parse().unwrap();
             }
-            ConfigKey::PrefetchDefaultWindowCols => {
-                config.prefetch.default_window_cols = value.parse().unwrap();
+            ConfigKey::PrefetchWindowLonExtent => {
+                config.prefetch.window_lon_extent = value.parse().unwrap();
             }
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs = value.parse().unwrap();
@@ -683,8 +710,11 @@ impl ConfigKey {
             }
 
             // Prewarm settings
-            ConfigKey::PrewarmGridSize => {
-                config.prewarm.grid_size = value.parse().unwrap();
+            ConfigKey::PrewarmGridRows => {
+                config.prewarm.grid_rows = value.parse().unwrap();
+            }
+            ConfigKey::PrewarmGridCols => {
+                config.prewarm.grid_cols = value.parse().unwrap();
             }
 
             // Patches settings
@@ -744,6 +774,14 @@ impl ConfigKey {
             }
             ConfigKey::OnlineNetworkMaxStaleSecs => {
                 config.online_network.max_stale_secs = value.parse().unwrap();
+            }
+
+            // FUSE settings
+            ConfigKey::FuseMaxBackground => {
+                config.fuse.max_background = value.parse().unwrap();
+            }
+            ConfigKey::FuseCongestionThreshold => {
+                config.fuse.congestion_threshold = value.parse().unwrap();
             }
         }
     }
@@ -812,18 +850,20 @@ impl ConfigKey {
             ConfigKey::PrefetchRampDurationSecs => Box::new(IntegerRangeSpec::new(10, 120)),
             ConfigKey::PrefetchRampStartFraction => Box::new(FloatRangeSpec::new(0.1, 0.5)),
             ConfigKey::PrefetchTriggerDistance => Box::new(FloatRangeSpec::new(0.5, 3.0)),
-            ConfigKey::PrefetchLoadDepth => Box::new(IntegerRangeSpec::new(1, 5)),
+            ConfigKey::PrefetchLoadDepthLat => Box::new(IntegerRangeSpec::new(1, 5)),
+            ConfigKey::PrefetchLoadDepthLon => Box::new(IntegerRangeSpec::new(1, 5)),
             ConfigKey::PrefetchWindowBuffer => Box::new(IntegerRangeSpec::new(0, 3)),
             ConfigKey::PrefetchStaleRegionTimeout => Box::new(IntegerRangeSpec::new(30, 600)),
-            ConfigKey::PrefetchDefaultWindowRows => Box::new(IntegerRangeSpec::new(3, 12)),
-            ConfigKey::PrefetchDefaultWindowCols => Box::new(IntegerRangeSpec::new(4, 16)),
+            ConfigKey::PrefetchDefaultWindowRows => Box::new(IntegerRangeSpec::new(2, 12)),
+            ConfigKey::PrefetchWindowLonExtent => Box::new(FloatRangeSpec::new(1.0, 10.0)),
             ConfigKey::ControlPlaneMaxConcurrentJobs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneStallThresholdSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneSemaphoreTimeoutSecs => Box::new(PositiveIntegerSpec),
 
             // Prewarm settings
-            ConfigKey::PrewarmGridSize => Box::new(PositiveIntegerSpec),
+            ConfigKey::PrewarmGridRows => Box::new(PositiveIntegerSpec),
+            ConfigKey::PrewarmGridCols => Box::new(PositiveIntegerSpec),
 
             // Patches settings
             ConfigKey::PatchesEnabled => Box::new(BooleanSpec),
@@ -849,6 +889,10 @@ impl ConfigKey {
             ConfigKey::OnlineNetworkApiUrl => Box::new(OptionalUrlSpec),
             ConfigKey::OnlineNetworkPollIntervalSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::OnlineNetworkMaxStaleSecs => Box::new(PositiveIntegerSpec),
+
+            // FUSE settings — range: 1-1024 for both
+            ConfigKey::FuseMaxBackground => Box::new(IntegerRangeSpec::new(1, 1024)),
+            ConfigKey::FuseCongestionThreshold => Box::new(IntegerRangeSpec::new(1, 1024)),
         }
     }
 
@@ -895,17 +939,19 @@ impl ConfigKey {
             ConfigKey::PrefetchRampDurationSecs,
             ConfigKey::PrefetchRampStartFraction,
             ConfigKey::PrefetchTriggerDistance,
-            ConfigKey::PrefetchLoadDepth,
+            ConfigKey::PrefetchLoadDepthLat,
+            ConfigKey::PrefetchLoadDepthLon,
             ConfigKey::PrefetchWindowBuffer,
             ConfigKey::PrefetchStaleRegionTimeout,
             ConfigKey::PrefetchDefaultWindowRows,
-            ConfigKey::PrefetchDefaultWindowCols,
+            ConfigKey::PrefetchWindowLonExtent,
             ConfigKey::ControlPlaneMaxConcurrentJobs,
             ConfigKey::ControlPlaneStallThresholdSecs,
             ConfigKey::ControlPlaneHealthCheckIntervalSecs,
             ConfigKey::ControlPlaneSemaphoreTimeoutSecs,
             // Prewarm settings
-            ConfigKey::PrewarmGridSize,
+            ConfigKey::PrewarmGridRows,
+            ConfigKey::PrewarmGridCols,
             // Patches settings
             ConfigKey::PatchesEnabled,
             ConfigKey::PatchesDirectory,
@@ -926,6 +972,9 @@ impl ConfigKey {
             ConfigKey::OnlineNetworkApiUrl,
             ConfigKey::OnlineNetworkPollIntervalSecs,
             ConfigKey::OnlineNetworkMaxStaleSecs,
+            // FUSE settings
+            ConfigKey::FuseMaxBackground,
+            ConfigKey::FuseCongestionThreshold,
         ]
     }
 }
@@ -1358,10 +1407,21 @@ mod tests {
     }
 
     #[test]
-    fn test_load_depth_config_key() {
-        let key = ConfigKey::from_str("prefetch.load_depth").unwrap();
-        assert_eq!(key.name(), "prefetch.load_depth");
+    fn test_load_depth_lat_config_key() {
+        let key = ConfigKey::from_str("prefetch.load_depth_lat").unwrap();
+        assert_eq!(key.name(), "prefetch.load_depth_lat");
         assert!(key.validate("3").is_ok());
+        assert!(key.validate("1").is_ok());
+        assert!(key.validate("5").is_ok());
+        assert!(key.validate("0").is_err());
+        assert!(key.validate("6").is_err());
+    }
+
+    #[test]
+    fn test_load_depth_lon_config_key() {
+        let key = ConfigKey::from_str("prefetch.load_depth_lon").unwrap();
+        assert_eq!(key.name(), "prefetch.load_depth_lon");
+        assert!(key.validate("2").is_ok());
         assert!(key.validate("1").is_ok());
         assert!(key.validate("5").is_ok());
         assert!(key.validate("0").is_err());
@@ -1393,33 +1453,34 @@ mod tests {
     fn test_default_window_rows_config_key() {
         let key = ConfigKey::from_str("prefetch.default_window_rows").unwrap();
         assert_eq!(key.name(), "prefetch.default_window_rows");
-        assert!(key.validate("6").is_ok());
         assert!(key.validate("3").is_ok());
         assert!(key.validate("12").is_ok());
-        assert!(key.validate("2").is_err());
+        assert!(key.validate("2").is_ok());
+        assert!(key.validate("1").is_err());
         assert!(key.validate("13").is_err());
     }
 
     #[test]
-    fn test_default_window_cols_config_key() {
-        let key = ConfigKey::from_str("prefetch.default_window_cols").unwrap();
-        assert_eq!(key.name(), "prefetch.default_window_cols");
-        assert!(key.validate("8").is_ok());
-        assert!(key.validate("4").is_ok());
-        assert!(key.validate("16").is_ok());
-        assert!(key.validate("3").is_err());
-        assert!(key.validate("17").is_err());
+    fn test_window_lon_extent_config_key() {
+        let key = ConfigKey::from_str("prefetch.window_lon_extent").unwrap();
+        assert_eq!(key.name(), "prefetch.window_lon_extent");
+        assert!(key.validate("3.0").is_ok());
+        assert!(key.validate("1.0").is_ok());
+        assert!(key.validate("10.0").is_ok());
+        assert!(key.validate("0.5").is_err());
+        assert!(key.validate("11.0").is_err());
     }
 
     #[test]
     fn test_new_prefetch_keys_in_all() {
         let all = ConfigKey::all();
         assert!(all.contains(&ConfigKey::PrefetchTriggerDistance));
-        assert!(all.contains(&ConfigKey::PrefetchLoadDepth));
+        assert!(all.contains(&ConfigKey::PrefetchLoadDepthLat));
+        assert!(all.contains(&ConfigKey::PrefetchLoadDepthLon));
         assert!(all.contains(&ConfigKey::PrefetchWindowBuffer));
         assert!(all.contains(&ConfigKey::PrefetchStaleRegionTimeout));
         assert!(all.contains(&ConfigKey::PrefetchDefaultWindowRows));
-        assert!(all.contains(&ConfigKey::PrefetchDefaultWindowCols));
+        assert!(all.contains(&ConfigKey::PrefetchWindowLonExtent));
     }
 
     #[test]
@@ -1431,8 +1492,15 @@ mod tests {
             .unwrap();
         assert_eq!(ConfigKey::PrefetchTriggerDistance.get(&config), "2");
 
-        ConfigKey::PrefetchLoadDepth.set(&mut config, "4").unwrap();
-        assert_eq!(ConfigKey::PrefetchLoadDepth.get(&config), "4");
+        ConfigKey::PrefetchLoadDepthLat
+            .set(&mut config, "4")
+            .unwrap();
+        assert_eq!(ConfigKey::PrefetchLoadDepthLat.get(&config), "4");
+
+        ConfigKey::PrefetchLoadDepthLon
+            .set(&mut config, "3")
+            .unwrap();
+        assert_eq!(ConfigKey::PrefetchLoadDepthLon.get(&config), "3");
 
         ConfigKey::PrefetchWindowBuffer
             .set(&mut config, "2")
@@ -1449,10 +1517,10 @@ mod tests {
             .unwrap();
         assert_eq!(ConfigKey::PrefetchDefaultWindowRows.get(&config), "8");
 
-        ConfigKey::PrefetchDefaultWindowCols
-            .set(&mut config, "12")
+        ConfigKey::PrefetchWindowLonExtent
+            .set(&mut config, "4.0")
             .unwrap();
-        assert_eq!(ConfigKey::PrefetchDefaultWindowCols.get(&config), "12");
+        assert_eq!(ConfigKey::PrefetchWindowLonExtent.get(&config), "4");
     }
 
     #[test]

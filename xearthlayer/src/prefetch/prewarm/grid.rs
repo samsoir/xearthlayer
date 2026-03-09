@@ -55,16 +55,17 @@ impl DsfGridBounds {
     }
 }
 
-/// Generate an N×N grid of DSF tiles centered on the given coordinates.
+/// Generate a grid of DSF tiles centered on the given coordinates.
 ///
 /// The grid is centered on the DSF tile containing (lat, lon), with
-/// tiles extending (grid_size / 2) in each direction.
+/// tiles extending `grid_rows / 2` in latitude and `grid_cols / 2` in longitude.
 ///
 /// # Arguments
 ///
 /// * `lat` - Latitude of center point
 /// * `lon` - Longitude of center point
-/// * `grid_size` - Number of tiles per side (e.g., 8 for 8×8 grid)
+/// * `grid_rows` - Number of tiles in latitude (e.g., 3 for 3 rows)
+/// * `grid_cols` - Number of tiles in longitude (e.g., 4 for 4 columns)
 ///
 /// # Returns
 ///
@@ -73,20 +74,24 @@ impl DsfGridBounds {
 /// # Example
 ///
 /// ```ignore
-/// // 8×8 grid around Toulouse (LFBO)
-/// let tiles = generate_dsf_grid(43.6294, 1.3678, 8);
-/// assert_eq!(tiles.len(), 64); // 8 × 8 = 64 tiles
+/// // 3×4 grid around Toulouse (LFBO)
+/// let tiles = generate_dsf_grid(43.6294, 1.3678, 3, 4);
+/// assert_eq!(tiles.len(), 12); // 3 × 4 = 12 tiles
 /// ```
-pub fn generate_dsf_grid(lat: f64, lon: f64, grid_size: u32) -> Vec<DsfTileCoord> {
+pub fn generate_dsf_grid(lat: f64, lon: f64, grid_rows: u32, grid_cols: u32) -> Vec<DsfTileCoord> {
     let center = DsfTileCoord::from_lat_lon(lat, lon);
-    let half = (grid_size / 2) as i32;
+    let half_rows = (grid_rows / 2) as i32;
+    let half_cols = (grid_cols / 2) as i32;
 
-    let mut tiles = Vec::with_capacity((grid_size * grid_size) as usize);
+    let mut tiles = Vec::with_capacity((grid_rows * grid_cols) as usize);
 
     // Generate grid centered on center tile
-    // For grid_size=4: offsets from -2 to +1 (4 tiles per axis)
-    for lat_offset in -half..=(half - 1) {
-        for lon_offset in -half..=(half - 1) {
+    // Even sizes: grid_rows=4, half=2 → range -2..=1 (4 tiles)
+    // Odd sizes:  grid_rows=3, half=1 → range -1..=1 (3 tiles)
+    let max_lat_offset = grid_rows as i32 - 1 - half_rows;
+    let max_lon_offset = grid_cols as i32 - 1 - half_cols;
+    for lat_offset in -half_rows..=max_lat_offset {
+        for lon_offset in -half_cols..=max_lon_offset {
             tiles.push(center.offset(lat_offset, lon_offset));
         }
     }
@@ -101,7 +106,7 @@ mod tests {
     #[test]
     fn test_generate_dsf_grid_8x8() {
         // LFBO airport: 43.6294, 1.3678
-        let tiles = generate_dsf_grid(43.6294, 1.3678, 8);
+        let tiles = generate_dsf_grid(43.6294, 1.3678, 8, 8);
 
         // Should be 8×8 = 64 tiles
         assert_eq!(tiles.len(), 64);
@@ -127,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_generate_dsf_grid_4x4() {
-        let tiles = generate_dsf_grid(0.0, 0.0, 4);
+        let tiles = generate_dsf_grid(0.0, 0.0, 4, 4);
 
         // Should be 4×4 = 16 tiles
         assert_eq!(tiles.len(), 16);
@@ -141,9 +146,18 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_dsf_grid_3x4_asymmetric() {
+        // Matches the empirically measured X-Plane window: 3 rows × 4 cols
+        let tiles = generate_dsf_grid(50.0, 8.0, 3, 4);
+
+        // Should be 3×4 = 12 tiles (not 16!)
+        assert_eq!(tiles.len(), 12);
+    }
+
+    #[test]
     fn test_generate_dsf_grid_near_pole() {
         // Test near north pole - should clamp to valid range
-        let tiles = generate_dsf_grid(88.5, 0.0, 4);
+        let tiles = generate_dsf_grid(88.5, 0.0, 4, 4);
 
         // All tiles should have valid lat (clamped to 89 max)
         for tile in &tiles {
@@ -155,7 +169,7 @@ mod tests {
     #[test]
     fn test_generate_dsf_grid_near_antimeridian() {
         // Test near antimeridian - should wrap correctly
-        let tiles = generate_dsf_grid(0.0, 178.0, 8);
+        let tiles = generate_dsf_grid(0.0, 178.0, 8, 8);
 
         // Should have tiles that wrap from positive to negative longitude
         let has_positive = tiles.iter().any(|t| t.lon > 0);
@@ -167,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_dsf_grid_bounds() {
-        let tiles = generate_dsf_grid(43.6294, 1.3678, 8);
+        let tiles = generate_dsf_grid(43.6294, 1.3678, 8, 8);
         let bounds = DsfGridBounds::from_tiles(&tiles);
 
         // Bounds should cover lat 39-47 (8 tiles starting at 39) and lon -3 to 5

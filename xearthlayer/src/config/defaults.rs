@@ -197,10 +197,17 @@ pub const DEFAULT_RAMP_START_FRACTION: f64 = 0.25;
 // =============================================================================
 
 /// Default boundary trigger distance in degrees.
-pub const DEFAULT_PREFETCH_TRIGGER_DISTANCE: f64 = 3.0;
+/// Must be > X-Plane's 1.0° trigger to allow prefetch to complete before
+/// X-Plane requests tiles. 1.5° gives 50% lead over X-Plane's trigger.
+pub const DEFAULT_PREFETCH_TRIGGER_DISTANCE: f64 = 1.5;
 
-/// Default DSF tiles deep per crossing.
-pub const DEFAULT_PREFETCH_LOAD_DEPTH: u8 = 3;
+/// Default load depth for latitude boundary crossings (ROW loads).
+/// Empirically measured: 3 rows deep × 3-4 cols wide (73% of FUSE burst events).
+pub const DEFAULT_PREFETCH_LOAD_DEPTH_LAT: u8 = 3;
+
+/// Default load depth for longitude boundary crossings (COLUMN loads).
+/// Empirically measured: 2 cols deep × 3-4 rows wide (64% of FUSE burst events).
+pub const DEFAULT_PREFETCH_LOAD_DEPTH_LON: u8 = 2;
 
 /// Default buffer tiles for retention.
 pub const DEFAULT_PREFETCH_WINDOW_BUFFER: u8 = 1;
@@ -209,12 +216,31 @@ pub const DEFAULT_PREFETCH_WINDOW_BUFFER: u8 = 1;
 pub const DEFAULT_PREFETCH_STALE_REGION_TIMEOUT: u64 = 120;
 
 /// Default assumed window height in DSF tiles.
-/// Based on observed X-Plane 12 loading patterns: 9 rows (50°-58° from EDDH).
-pub const DEFAULT_PREFETCH_DEFAULT_WINDOW_ROWS: usize = 9;
+/// Empirically measured at EDDF, YPAD, WSSS: ~3° latitude (constant worldwide).
+pub const DEFAULT_PREFETCH_DEFAULT_WINDOW_ROWS: usize = 3;
 
-/// Default assumed window width in DSF tiles.
-/// Based on observed X-Plane 12 loading patterns: 9 columns (5°-13° from EDDH).
-pub const DEFAULT_PREFETCH_DEFAULT_WINDOW_COLS: usize = 9;
+/// Default longitude extent in degrees for scenery window computation.
+/// X-Plane loads ~330km × 330km; cols = ceil(this / cos(lat)).
+/// Actual column count varies by latitude via `lon_tiles_for_latitude()`.
+pub const DEFAULT_PREFETCH_WINDOW_LON_EXTENT: f64 = 3.0;
+
+// =============================================================================
+// FUSE defaults
+// =============================================================================
+
+/// Default maximum pending background FUSE requests.
+///
+/// The Linux kernel queues background requests (readahead, async reads) and
+/// throttles when `congestion_threshold` is exceeded. The kernel default of
+/// 12/9 severely limits X-Plane's concurrent scenery reads, causing freezes
+/// at DSF boundaries. 256 allows the full tile pipeline to stay saturated.
+pub const DEFAULT_FUSE_MAX_BACKGROUND: u16 = 256;
+
+/// Default congestion threshold for background FUSE requests.
+///
+/// When pending background requests exceed this, the kernel starts throttling.
+/// Set to 75% of `max_background` as per kernel convention.
+pub const DEFAULT_FUSE_CONGESTION_THRESHOLD: u16 = DEFAULT_FUSE_MAX_BACKGROUND * 3 / 4; // 192
 
 // =============================================================================
 // Control plane defaults
@@ -345,11 +371,12 @@ impl Default for ConfigFile {
                 ramp_duration_secs: DEFAULT_RAMP_DURATION_SECS,
                 ramp_start_fraction: DEFAULT_RAMP_START_FRACTION,
                 trigger_distance: DEFAULT_PREFETCH_TRIGGER_DISTANCE,
-                load_depth: DEFAULT_PREFETCH_LOAD_DEPTH,
+                load_depth_lat: DEFAULT_PREFETCH_LOAD_DEPTH_LAT,
+                load_depth_lon: DEFAULT_PREFETCH_LOAD_DEPTH_LON,
                 window_buffer: DEFAULT_PREFETCH_WINDOW_BUFFER,
                 stale_region_timeout: DEFAULT_PREFETCH_STALE_REGION_TIMEOUT,
-                default_window_rows: DEFAULT_PREFETCH_DEFAULT_WINDOW_ROWS, // 9
-                default_window_cols: DEFAULT_PREFETCH_DEFAULT_WINDOW_COLS, // 9
+                default_window_rows: DEFAULT_PREFETCH_DEFAULT_WINDOW_ROWS,
+                window_lon_extent: DEFAULT_PREFETCH_WINDOW_LON_EXTENT,
             },
             control_plane: ControlPlaneSettings {
                 max_concurrent_jobs: default_max_concurrent_jobs(),
@@ -357,7 +384,10 @@ impl Default for ConfigFile {
                 health_check_interval_secs: DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
                 semaphore_timeout_secs: DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
             },
-            prewarm: PrewarmSettings { grid_size: 4 },
+            prewarm: PrewarmSettings {
+                grid_rows: 3,
+                grid_cols: 4,
+            },
             patches: PatchesSettings {
                 enabled: true,
                 directory: Some(config_dir.join("patches")),
@@ -374,6 +404,10 @@ impl Default for ConfigFile {
                 retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
             },
             online_network: OnlineNetworkSettings::default(),
+            fuse: FuseSettings {
+                max_background: DEFAULT_FUSE_MAX_BACKGROUND,
+                congestion_threshold: DEFAULT_FUSE_CONGESTION_THRESHOLD,
+            },
         }
     }
 }

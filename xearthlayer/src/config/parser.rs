@@ -432,13 +432,32 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
                     reason: "must be a number between 0.5 and 3.0".to_string(),
                 })?;
         }
+        if let Some(v) = section.get("load_depth_lat") {
+            config.prefetch.load_depth_lat =
+                v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                    section: "prefetch".to_string(),
+                    key: "load_depth_lat".to_string(),
+                    value: v.to_string(),
+                    reason: "must be an integer between 1 and 5".to_string(),
+                })?;
+        }
+        if let Some(v) = section.get("load_depth_lon") {
+            config.prefetch.load_depth_lon =
+                v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                    section: "prefetch".to_string(),
+                    key: "load_depth_lon".to_string(),
+                    value: v.to_string(),
+                    reason: "must be an integer between 1 and 5".to_string(),
+                })?;
+        }
+        // Legacy fallback: if old "load_depth" is present, use for both axes
         if let Some(v) = section.get("load_depth") {
-            config.prefetch.load_depth = v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                section: "prefetch".to_string(),
-                key: "load_depth".to_string(),
-                value: v.to_string(),
-                reason: "must be an integer between 1 and 5".to_string(),
-            })?;
+            if section.get("load_depth_lat").is_none() && section.get("load_depth_lon").is_none() {
+                if let Ok(depth) = v.parse::<u8>() {
+                    config.prefetch.load_depth_lat = depth;
+                    config.prefetch.load_depth_lon = depth;
+                }
+            }
         }
         if let Some(v) = section.get("window_buffer") {
             config.prefetch.window_buffer =
@@ -467,13 +486,13 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
                     reason: "must be an integer between 3 and 12".to_string(),
                 })?;
         }
-        if let Some(v) = section.get("default_window_cols") {
-            config.prefetch.default_window_cols =
+        if let Some(v) = section.get("window_lon_extent") {
+            config.prefetch.window_lon_extent =
                 v.parse().map_err(|_| ConfigFileError::InvalidValue {
                     section: "prefetch".to_string(),
-                    key: "default_window_cols".to_string(),
+                    key: "window_lon_extent".to_string(),
                     value: v.to_string(),
-                    reason: "must be an integer between 4 and 16".to_string(),
+                    reason: "must be a number between 1.0 and 10.0".to_string(),
                 })?;
         }
     }
@@ -520,13 +539,30 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
 
     // [prewarm] section
     if let Some(section) = ini.section(Some("prewarm")) {
-        if let Some(v) = section.get("grid_size") {
-            config.prewarm.grid_size = v.parse().map_err(|_| ConfigFileError::InvalidValue {
+        if let Some(v) = section.get("grid_rows") {
+            config.prewarm.grid_rows = v.parse().map_err(|_| ConfigFileError::InvalidValue {
                 section: "prewarm".to_string(),
-                key: "grid_size".to_string(),
+                key: "grid_rows".to_string(),
                 value: v.to_string(),
-                reason: "must be a positive integer (DSF tiles per side)".to_string(),
+                reason: "must be a positive integer (DSF tiles)".to_string(),
             })?;
+        }
+        if let Some(v) = section.get("grid_cols") {
+            config.prewarm.grid_cols = v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                section: "prewarm".to_string(),
+                key: "grid_cols".to_string(),
+                value: v.to_string(),
+                reason: "must be a positive integer (DSF tiles)".to_string(),
+            })?;
+        }
+        // Legacy fallback: if old "grid_size" is present, use for both
+        if let Some(v) = section.get("grid_size") {
+            if section.get("grid_rows").is_none() && section.get("grid_cols").is_none() {
+                if let Ok(size) = v.parse::<u32>() {
+                    config.prewarm.grid_rows = size;
+                    config.prewarm.grid_cols = size;
+                }
+            }
         }
     }
 
@@ -682,6 +718,27 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
                     key: "max_stale_secs".to_string(),
                     value: v.to_string(),
                     reason: "must be a positive integer (seconds)".to_string(),
+                })?;
+        }
+    }
+
+    // [fuse] section
+    if let Some(section) = ini.section(Some("fuse")) {
+        if let Some(v) = section.get("max_background") {
+            config.fuse.max_background = v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                section: "fuse".to_string(),
+                key: "max_background".to_string(),
+                value: v.to_string(),
+                reason: "must be a positive integer (1-1024)".to_string(),
+            })?;
+        }
+        if let Some(v) = section.get("congestion_threshold") {
+            config.fuse.congestion_threshold =
+                v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                    section: "fuse".to_string(),
+                    key: "congestion_threshold".to_string(),
+                    value: v.to_string(),
+                    reason: "must be a positive integer (1-1024)".to_string(),
                 })?;
         }
     }

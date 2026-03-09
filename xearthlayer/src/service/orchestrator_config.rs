@@ -63,6 +63,9 @@ pub struct OrchestratorConfig {
     /// Online network position configuration.
     pub online_network: OnlineNetworkConfig,
 
+    /// FUSE kernel configuration.
+    pub fuse: FuseConfig,
+
     /// Whether TUI mode is active (affects logging behavior).
     pub tui_mode: bool,
 }
@@ -118,8 +121,11 @@ pub struct PrefetchConfig {
     /// Boundary trigger distance in degrees.
     pub trigger_distance: f64,
 
-    /// DSF tiles deep per crossing.
-    pub load_depth: u8,
+    /// Load depth for latitude boundary crossings (ROW loads).
+    pub load_depth_lat: u8,
+
+    /// Load depth for longitude boundary crossings (COLUMN loads).
+    pub load_depth_lon: u8,
 
     /// Buffer tiles for retention.
     pub window_buffer: u8,
@@ -130,18 +136,31 @@ pub struct PrefetchConfig {
     /// Assumed window height in DSF tiles.
     pub default_window_rows: usize,
 
-    /// Assumed window width in DSF tiles.
-    pub default_window_cols: usize,
+    /// Longitude extent in degrees for dynamic column computation.
+    pub window_lon_extent: f64,
 }
 
 /// Prewarm-specific configuration extracted from ConfigFile.
 #[derive(Clone, Debug)]
 pub struct PrewarmConfig {
-    /// Grid size (N×N DSF tiles centered on airport).
-    pub grid_size: u32,
+    /// Grid rows (latitude extent in DSF tiles centered on airport).
+    pub grid_rows: u32,
+
+    /// Grid columns (longitude extent in DSF tiles centered on airport).
+    pub grid_cols: u32,
 
     /// Batch size for concurrent tile generation.
     pub batch_size: usize,
+}
+
+/// FUSE kernel configuration extracted from ConfigFile.
+#[derive(Clone, Debug)]
+pub struct FuseConfig {
+    /// Maximum pending background FUSE requests.
+    pub max_background: u16,
+
+    /// Congestion threshold for background FUSE requests.
+    pub congestion_threshold: u16,
 }
 
 /// Online network position configuration extracted from ConfigFile.
@@ -226,16 +245,18 @@ impl OrchestratorConfig {
             ramp_duration_secs: config.prefetch.ramp_duration_secs,
             ramp_start_fraction: config.prefetch.ramp_start_fraction,
             trigger_distance: config.prefetch.trigger_distance,
-            load_depth: config.prefetch.load_depth,
+            load_depth_lat: config.prefetch.load_depth_lat,
+            load_depth_lon: config.prefetch.load_depth_lon,
             window_buffer: config.prefetch.window_buffer,
             stale_region_timeout: config.prefetch.stale_region_timeout,
             default_window_rows: config.prefetch.default_window_rows,
-            default_window_cols: config.prefetch.default_window_cols,
+            window_lon_extent: config.prefetch.window_lon_extent,
         };
 
         // Extract prewarm configuration
         let prewarm = PrewarmConfig {
-            grid_size: config.prewarm.grid_size,
+            grid_rows: config.prewarm.grid_rows,
+            grid_cols: config.prewarm.grid_cols,
             batch_size: 50, // Fixed batch size for now
         };
 
@@ -249,6 +270,12 @@ impl OrchestratorConfig {
             max_stale_secs: config.online_network.max_stale_secs,
         };
 
+        // Extract FUSE configuration
+        let fuse = FuseConfig {
+            max_background: config.fuse.max_background,
+            congestion_threshold: config.fuse.congestion_threshold,
+        };
+
         Self {
             provider,
             service,
@@ -260,6 +287,7 @@ impl OrchestratorConfig {
             prefetch,
             prewarm,
             online_network,
+            fuse,
             tui_mode,
         }
     }

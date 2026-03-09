@@ -329,31 +329,85 @@ Newfoundland       1,262/min       ~85%
 
 **Interpretation**: X-Plane continues requesting tiles over ocean (likely water textures), but the tiles are simpler and highly cached, data is reduced due to the water masks. This creates an opportunity for prefetch systems to prepare upcoming coastal tiles.
 
-### 8. Scenery Window Depth
+### 8. Scenery Window Dimensions (Empirically Measured)
 
-X-Plane's in-sim map shows a grid (believed to be 1°×1° DSF tiles) where the loaded scenery area extends approximately **2 grid squares behind** and **3 grid squares ahead** of the aircraft along the heading axis, for a total depth of **6 DSF tiles**.
+**Methodology**: X-Plane 12's in-sim map displays the loaded scenery area as a grid. By identifying reference airfields at the edges of the displayed loaded area, we measured the actual geographic extent of the scenery window at three airports spanning different latitudes.
 
-Our FUSE data is consistent with this model but cannot directly confirm it. FUSE only captures tiles X-Plane **actively reads from disk** — tiles already loaded into GPU/RAM are held in memory and not re-read. Therefore:
+**NOTE**: The grid squares visible on X-Plane's map are NOT 1°×1° DSF tiles. They are approximately 0.5° each (e.g., 8 squares × 0.5° ≈ 4° longitude). This was a significant correction from earlier assumptions.
 
-- **Cache miss bursts** (new loads) span 4-5 DSF rows: 1-2 behind + AC + 2 ahead
-- **Total FUSE reads** (hits + misses) during bursts span 4 DSF rows of activity
-- **Fringe reads** occasionally extend 1 row further, potentially the outer edge of the maintained window
+#### Measurements
 
-The outer 1-2 rows of the 6-deep window are tiles loaded by previous bursts that X-Plane holds in memory — invisible to FUSE instrumentation.
+| Airport | Lat | Window Lat | Window Lon | AC Position |
+|---------|-----|-----------|-----------|-------------|
+| EDDF (Frankfurt) | 50.0°N | ~3.0° (49.0–52.0) | ~4.1° (6.9–11.0) | Offset west (westbound ops) |
+| YPAD (Adelaide) | 34.9°S | ~3.0° (33.0–36.0) | ~3.9° (137.1–141.0) | Offset SW (SW runway ops) |
+| WSSS (Singapore) | 1.35°N | ~2.94° (0.02–2.96) | ~3.96° (102.0–105.9) | Near center |
 
-**Implication for prefetch**: For each boundary monitor (latitude and longitude), target the **3 DSF rows or columns ahead** of the aircraft in the crossing direction, spanning 4-6 tiles wide perpendicular to it. This covers the forward portion of X-Plane's maintained window and ensures tiles are cached before each boundary-triggered burst.
+**Reference airfields used**:
+
+*EDDF*: EDVW (51.97°N, near N edge), EDRO (49.03°N, on S edge), EDPH (49.27°N/11.01°E, on E edge), EDLE (51.40°N/6.94°E, near W edge)
+
+*YPAD*: YWHA (-33.06°, near N edge), YVOB (-35.96°, on S edge), YPNN (-35.25°/140.94°, near E edge), YTKL (~-35.90°/~137.27°, near W edge)
+
+*WSSS*: WIDL (2.96°N/105.76°E, near N/E corner), island coastline (0.02°N, S edge), WIBS (1.37°N/102.14°E, near W edge)
+
+#### Key Findings
+
+1. **Latitude span is constant at ~3°** regardless of position on the globe.
+
+2. **Longitude span scales with latitude** to maintain roughly constant physical distance:
+   - At equator (1°N): ~4.0° lon × cos(1°) ≈ 4.0° physical
+   - At 35°S: ~3.9° lon × cos(35°) ≈ 3.2° physical
+   - At 50°N: ~4.1° lon × cos(50°) ≈ 2.6° physical
+   - Formula: lon_span ≈ 3° / cos(latitude), targeting a roughly square physical area (~330km × 330km)
+
+3. **Window positioning is directional** — biased toward the active runway/departure heading:
+   - EDDF (westbound ops): 1.7° to west edge, 2.4° to east edge
+   - YPAD (SW ops): 1.05° to south, 1.43° to west (biased south-west)
+   - WSSS (near center): ~2.0° in all directions
+
+4. **Boundary buffer is ~1–1.5°** from the nearest edge, not 3–4° as previously assumed. At jet cruise speeds (~450kt), this gives approximately 8–12 minutes of prefetch time before a boundary crossing.
+
+#### Correction from FUSE-based Analysis
+
+Our earlier FUSE data analysis (sections below) suggested a larger window (6 DSF tiles deep, 4-6 wide). The FUSE analysis measured **request activity** (tiles X-Plane reads from disk), which includes fringe reads and re-reads beyond the visible loaded area. The X-Plane map measurement captures the **actually loaded and rendered** scenery area, which is the relevant metric for prefetch targeting.
+
+The FUSE burst analysis remains valid for understanding **loading event** patterns (trigger positions, burst sizes, row vs column loads), but the overall window dimensions should use the map-based measurements.
+
+### 8a. FUSE-Based Loading Event Depth (Supplementary)
+
+FUSE cache miss burst analysis (LFLL diagonal orbit flight, 65 classified loading events with telemetry) reveals **asymmetric loading depth** between latitude and longitude crossings:
+
+**ROW loads (latitude boundary crossings, 51 events):**
+- **Depth: 3 rows** (73%), 2 rows (25%), 1 row (2%)
+- **Width: 3-4 columns** (avg 3.5)
+- Total: ~9-12 DSF regions per ROW event
+
+**COLUMN loads (longitude boundary crossings, 14 events):**
+- **Depth: 2 columns** (64%), 1 column (29%), 3 columns (7%)
+- **Width: 3-4 rows** (avg 3.4)
+- Total: ~6-8 DSF regions per COL event
+
+**Trigger distance**: Approximately **1°** from the window edge (based on telemetry-correlated burst analysis at 45-52°N). ROW triggers averaged 0.87° from the DSF boundary, COL triggers averaged 0.97°, consistent with a ~1° degree-based trigger model.
+
+**The depth asymmetry** likely reflects the window shape: the window is ~3° tall (latitude) but ~4-5° wide (longitude at these latitudes). X-Plane loads proportionally more rows (3 of 3 = full window depth) than columns (2 of 4-5 = partial window width) per crossing event.
+
+**Implication for prefetch**: ROW crossings (latitude) are the larger events (~9-12 regions) and should be prioritised. Use axis-specific load depths: 3 rows for latitude crossings, 2 columns for longitude crossings. The ~1° trigger distance means the aircraft is always close to an edge — prefetch must complete quickly.
 
 ### 9. Initial Load Area
 
-When a flight begins, X-Plane loads approximately **12° × 12°** (144 square degrees) of scenery around the aircraft position.
+When a flight begins, X-Plane loads the full scenery window (~3° lat × ~4° lon at mid-latitudes) around the aircraft position. The window may be directionally biased based on the active runway orientation.
 
-**Evidence (All Flights)**:
+**Evidence (Map-based, March 2026)**:
 ```
-Flight 1 (EDDH): Initial load observed spanning 51°-57°N, 6°-14°E
-Flight 4 (KJFK): Initial load observed spanning 37°-45°N, 77°-69°W
+EDDF (50°N): 49.0–52.0°N, 6.9–11.0°E (~3° × 4.1°, biased west)
+YPAD (35°S): 33.0–36.0°S, 137.1–141.0°E (~3° × 3.9°, biased SW)
+WSSS (1°N):  0.02–2.96°N, 102.0–105.9°E (~3° × 4°, centered)
 ```
 
-This initial load takes **4-5 minutes** from a cold cache on a fast internet connection and provides a baseline for system performance calibration.
+**Earlier FUSE-based observations** suggested a larger initial load (~12° × 12°), but this likely captured the sum of multiple progressive loading events during simulator startup rather than a single loading area. The map-based measurement provides the accurate window extent.
+
+This initial load takes **30 seconds to 5 minutes** depending on cache state, connection speed, and the number of scenery tiles in the region.
 
 ---
 
@@ -367,22 +421,27 @@ Based on our empirical research, X-Plane 12's scenery loading follows this model
 X-PLANE SCENERY LOADING ALGORITHM (Inferred)
 ┌───────────────────────────────────────────────────────────────┐
 │ 1. INITIAL LOAD                                               │
-│    - Load ~12° × 12° circular area around starting position   │
+│    - Load scenery window around starting position             │
+│    - Window: ~3° latitude × ~3°/cos(lat) longitude            │
+│    - Directionally biased toward active runway heading        │
 │    - Complete before flight begins                            │
 │                                                               │
 │ 2. SCENERY WINDOW (maintained area)                           │
-│    - 6 DSF tiles deep: 2 behind + aircraft tile + 3 ahead    │
-│    - 4-6 DSF tiles wide perpendicular to heading              │
-│    - Slides forward as aircraft advances                      │
+│    - ~3° latitude (constant worldwide)                        │
+│    - ~3°/cos(lat) longitude (constant physical distance)      │
+│    - ~330km × 330km physical area                             │
+│    - Slides as aircraft advances; directionally biased        │
+│    - Aircraft typically 1–1.5° from nearest edge              │
 │                                                               │
 │ 3. BOUNDARY-TRIGGERED LOADING (position-only, no vectors)     │
 │    - Two independent boundary monitors (latitude + longitude) │
 │    - Based ONLY on aircraft position vs. loaded area edge     │
 │    - Does NOT use heading, ground speed, or track prediction  │
 │    - Latitude monitor: aircraft near lat edge → ROW load      │
+│      → 3 rows deep × 3-4 cols wide (73% of observed events)  │
 │    - Longitude monitor: aircraft near lon edge → COLUMN load  │
-│    - Each load: 3 DSF tiles deep, 4-6 wide                   │
-│    - Trigger at ~0.6° into DSF tile in crossing direction     │
+│      → 2 cols deep × 3-4 rows wide (64% of observed events)  │
+│    - Trigger distance: ~1° from window edge                   │
 │                                                               │
 │ 4. DIAGONAL HANDLING                                          │
 │    - Both monitors fire independently on diagonal headings    │
@@ -400,17 +459,19 @@ X-PLANE SCENERY LOADING ALGORITHM (Inferred)
 
 ### Implications for Developers
 
-1. **Prefetch Systems**: Predict which DSF boundary (latitude or longitude) the aircraft will cross next, and pre-load the corresponding row or column. Trigger prefetch at 0.3-0.5° into the DSF tile to complete before X-Plane's 0.6° threshold.
+1. **Prefetch Systems**: Predict which DSF boundary (latitude or longitude) the aircraft will cross next, and pre-load the corresponding row or column. With the aircraft typically only 1–1.5° from the nearest edge, prefetch must trigger early and complete quickly. Trigger at 0.3–0.5° into the DSF tile to complete before X-Plane's 0.6° threshold.
 
 2. **Caching Systems**: Cache complete DSF rows or columns, not individual tiles. X-Plane will request entire rows on latitude crossings and entire columns on longitude crossings.
 
-3. **Performance Optimization**: The maintained scenery window (2 behind + 3 ahead) means prefetch systems have the duration of 1 DSF tile traversal (2-5 minutes depending on speed) to prepare the next row or column.
+3. **Performance Optimization**: The small scenery window (~3° × 4°) means the aircraft is always close to an edge. Prefetch systems have approximately 8–12 minutes at jet cruise speed before a boundary crossing — less in diagonal flight where both axes may trigger in quick succession.
 
 4. **Diagonal Flight**: Monitor both latitude and longitude boundaries independently. On diagonal headings, both crossings occur frequently and may overlap — prefetch must handle concurrent row and column loads.
 
 5. **Speed Considerations**: Faster aircraft reduce the time window but don't change the trigger position.
 
-6. **Post-Turn Handling**: After heading changes, expect 10-20 minutes of lateral gap filling as X-Plane populates tiles that were outside the loaded area during the turn. These tiles were lateral to the old heading and appear as "behind" tiles on the new heading.
+6. **Post-Turn Handling**: After heading changes, expect 10-20 minutes of lateral gap filling as X-Plane populates tiles that were outside the loaded area during the turn.
+
+7. **Latitude-Dependent Longitude Width**: The scenery window longitude span increases at higher latitudes (4.1° at 50°N vs 4.0° at equator). Prefetch systems should compute column width dynamically using the aircraft's latitude.
 
 ---
 
@@ -448,3 +509,4 @@ Log analysis performed using `scripts/analyze_flight_logs.py` which extracts:
 |---------|------|---------|
 | 1.0 | January 2026 | Initial release based on 4 test flights |
 | 1.1 | March 2026 | Added Flight 5 (LFLL diagonal orbit). Major model revision: X-Plane uses position-only boundary detection (no heading/speed/track). Separate row/column jobs triggered by independent lat/lon boundary monitors. Updated lead distance (1-2° primary, not 2-3°). Added 3-deep strip pattern, post-turn radius fill, scenery window depth (2 behind + 3 ahead). Turn "adaptation" reframed as position effect. Updated burst size to distinguish cache misses from total FUSE requests. |
+| 1.2 | March 2026 | **Major window dimension correction.** Empirical measurement via X-Plane in-sim map at three airports (EDDF 50°N, YPAD 35°S, WSSS 1°N) revealed scenery window is ~3° lat × ~3°/cos(lat) lon (~330km × 330km), NOT 9×9° or 6×8°. Map grid squares are ~0.5°, not 1° DSF tiles. Window directionally biased toward departure heading. Corrected initial load area from 12×12° to actual window dimensions. Updated loading event depth from "3 deep" to "1-2 deep". Previous FUSE-based analysis retained as supplementary data. |

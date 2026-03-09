@@ -40,6 +40,8 @@ pub struct ConfigFile {
     pub executor: ExecutorSettings,
     /// Online network settings for VATSIM/IVAO/PilotEdge position
     pub online_network: OnlineNetworkSettings,
+    /// FUSE filesystem settings
+    pub fuse: FuseSettings,
 }
 
 /// Provider configuration.
@@ -223,10 +225,12 @@ pub struct PrefetchSettings {
     /// How close to a DSF boundary the aircraft must be to trigger prefetch.
     /// Default: 1.5, Range: 0.5-3.0
     pub trigger_distance: f64,
-    /// DSF tiles deep per crossing.
-    /// How many DSF tiles deep to prefetch when crossing a boundary.
+    /// Load depth for latitude boundary crossings (ROW loads).
     /// Default: 3, Range: 1-5
-    pub load_depth: u8,
+    pub load_depth_lat: u8,
+    /// Load depth for longitude boundary crossings (COLUMN loads).
+    /// Default: 2, Range: 1-5
+    pub load_depth_lon: u8,
     /// Buffer tiles for retention.
     /// Extra tiles to retain beyond the visible window.
     /// Default: 1, Range: 0-3
@@ -236,11 +240,12 @@ pub struct PrefetchSettings {
     /// Default: 120, Range: 30-600
     pub stale_region_timeout: u64,
     /// Assumed window height in DSF tiles.
-    /// Default: 6, Range: 3-12
+    /// Default: 3, Range: 2-12
     pub default_window_rows: usize,
-    /// Assumed window width in DSF tiles.
-    /// Default: 8, Range: 4-16
-    pub default_window_cols: usize,
+    /// Longitude extent in degrees for scenery window computation.
+    /// Columns are computed dynamically: ceil(lon_extent / cos(lat)).
+    /// Default: 3.0, Range: 1.0-10.0
+    pub window_lon_extent: f64,
 }
 
 /// Control plane configuration for job management and health monitoring.
@@ -265,9 +270,12 @@ pub struct ControlPlaneSettings {
 /// Prewarm configuration for cold-start cache warming.
 #[derive(Debug, Clone)]
 pub struct PrewarmSettings {
-    /// Grid size in DSF tiles (N = N×N grid) around an airport to prewarm.
-    /// Default: 8 (8×8 grid = 64 DSF tiles, ~480nm × 480nm at mid-latitudes)
-    pub grid_size: u32,
+    /// Grid rows in DSF tiles (latitude extent).
+    /// Default: 3 (matches ~3° latitude window)
+    pub grid_rows: u32,
+    /// Grid columns in DSF tiles (longitude extent).
+    /// Default: 4 (matches ~3°/cos(lat) longitude window at mid-latitudes)
+    pub grid_cols: u32,
 }
 
 /// Patches configuration for custom Ortho4XP tile patches.
@@ -336,6 +344,19 @@ pub struct OnlineNetworkSettings {
     /// Maximum age in seconds before data is considered stale.
     /// Default: 60
     pub max_stale_secs: u64,
+}
+
+/// FUSE filesystem settings for kernel background request limits.
+#[derive(Debug, Clone)]
+pub struct FuseSettings {
+    /// Maximum pending background FUSE requests before the kernel queues.
+    /// Higher values allow more concurrent X-Plane scenery reads.
+    /// Default: 256
+    pub max_background: u16,
+    /// Congestion threshold for background FUSE requests.
+    /// Kernel starts throttling when pending requests exceed this.
+    /// Default: 192 (75% of max_background)
+    pub congestion_threshold: u16,
 }
 
 impl Default for OnlineNetworkSettings {

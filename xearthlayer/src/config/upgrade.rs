@@ -90,6 +90,11 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "prefetch.turn_threshold",
     "prefetch.track_stability_duration",
     "prefetch.time_budget_margin",
+    // Removed in #58 - per-axis load depth and dynamic window columns
+    "prefetch.load_depth",
+    "prefetch.default_window_cols",
+    // Removed in #58 - prewarm uses separate grid_rows/grid_cols
+    "prewarm.grid_size",
 ];
 
 /// Result of analyzing a configuration file for upgrade needs.

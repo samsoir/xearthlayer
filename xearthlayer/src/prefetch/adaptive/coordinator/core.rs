@@ -201,16 +201,18 @@ impl AdaptivePrefetchCoordinator {
         let ground_strategy = GroundStrategy::new(&config);
         let mut scenery_window = SceneryWindow::new(SceneryWindowConfig {
             default_rows: config.default_window_rows,
-            default_cols: config.default_window_cols,
+            lon_extent: config.window_lon_extent,
             buffer: config.window_buffer,
             trigger_distance: config.trigger_distance,
-            load_depth: config.load_depth,
+            load_depth_lat: config.load_depth_lat,
+            load_depth_lon: config.load_depth_lon,
         });
         // Start in Assumed state so boundary checks work immediately
         // with default dimensions. Real dimensions from SceneTracker will
         // upgrade the window to Ready when available.
-        scenery_window
-            .set_assumed_dimensions(config.default_window_rows, config.default_window_cols);
+        // Use 0.0 latitude for initial assumed dimensions (equator baseline);
+        // cols will be recomputed from real latitude on first tracker update.
+        scenery_window.set_assumed_dimensions(config.default_window_rows, 0.0);
         let boundary_strategy = BoundaryStrategy::new();
 
         Self {
@@ -2400,9 +2402,10 @@ mod tests {
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
             trigger_distance: 1.0,
-            load_depth: 1,
+            load_depth_lat: 1,
+            load_depth_lon: 1,
             default_window_rows: 6,
-            default_window_cols: 6,
+            window_lon_extent: 6.0,
             // Zero ramp so transition throttle doesn't reduce tile count
             ramp_duration: std::time::Duration::from_secs(0),
             ..Default::default()
@@ -2487,7 +2490,8 @@ mod tests {
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
             trigger_distance: 3.0,
-            load_depth: 1,
+            load_depth_lat: 1,
+            load_depth_lon: 1,
             // Zero ramp so transition throttle doesn't reduce tile count
             ramp_duration: std::time::Duration::from_secs(0),
             ..Default::default()

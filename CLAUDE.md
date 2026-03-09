@@ -323,9 +323,10 @@ Key sections:
 - `[generation]` - Thread count, timeout
 - `[texture]` - DDS format (bc1/bc3)
 - `[prefetch]` - Boundary-driven prefetch, circuit breaker, calibration, transition ramp
-- `[prewarm]` - Cold-start cache warming (grid_size for DSF tile grid around airport)
+- `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
 - `[pipeline]` - HTTP/CPU/prefetch concurrency limits
 - `[online_network]` - VATSIM/IVAO/PilotEdge position (enabled, pilot_id, poll interval)
+- `[fuse]` - FUSE kernel limits (max_background, congestion_threshold)
 
 See `docs/configuration.md` for full reference.
 

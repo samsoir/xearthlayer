@@ -21,7 +21,7 @@ tracing-appender = "0.2"
 # FUSE libraries - fuse3 is the active implementation (async multi-threaded)
 # fuser is retained for legacy type definitions but not used at runtime
 fuser = "0.14"
-fuse3 = { version = "0.8", features = ["tokio-runtime", "unprivileged"] }
+fuse3 = { git = "https://github.com/samsoir/fuse3", branch = "configurable-background", features = ["tokio-runtime", "unprivileged"] }
 libc = "0.2"
 regex = "1.10"
 thiserror = "1.0"

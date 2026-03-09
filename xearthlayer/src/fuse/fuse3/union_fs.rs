@@ -37,12 +37,12 @@ use crate::prefetch::TileRequestCallback;
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
-    DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyInit, ReplyOpen, ReplyStatFs,
+    DirectoryEntry, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyInit, ReplyOpen,
+    ReplyStatFs,
 };
 use fuse3::raw::Filesystem;
 use fuse3::{Errno, MountOptions, Result as Fuse3InternalResult};
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::stream::{self, Stream, StreamExt};
 use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -260,15 +260,6 @@ impl DdsRequestor for Fuse3UnionFS {
 }
 
 impl Filesystem for Fuse3UnionFS {
-    type DirEntryStream<'a>
-        = BoxStream<'a, Fuse3InternalResult<DirectoryEntry>>
-    where
-        Self: 'a;
-    type DirEntryPlusStream<'a>
-        = BoxStream<'a, Fuse3InternalResult<DirectoryEntryPlus>>
-    where
-        Self: 'a;
-
     async fn init(&self, _req: Request) -> Fuse3InternalResult<ReplyInit> {
         debug!(
             patches = self.index.patch_names().len(),
@@ -276,6 +267,8 @@ impl Filesystem for Fuse3UnionFS {
         );
         Ok(ReplyInit {
             max_write: NonZeroU32::new(1024 * 1024).unwrap(),
+            max_background: None,
+            congestion_threshold: None,
         })
     }
 
@@ -468,7 +461,9 @@ impl Filesystem for Fuse3UnionFS {
         ino: u64,
         _fh: u64,
         offset: i64,
-    ) -> Fuse3InternalResult<ReplyDirectory<Self::DirEntryStream<'_>>> {
+    ) -> Fuse3InternalResult<
+        ReplyDirectory<impl Stream<Item = Fuse3InternalResult<DirectoryEntry>> + Send + '_>,
+    > {
         trace!(ino = ino, offset = offset, "fuse3 union: readdir");
 
         // Get virtual path for this directory
