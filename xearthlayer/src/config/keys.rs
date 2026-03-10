@@ -825,9 +825,7 @@ impl ConfigKey {
                 Box::new(OneOfSpec::new(&["auto", "hdd", "ssd", "nvme"]))
             }
             ConfigKey::TextureFormat => Box::new(OneOfSpec::new(&["bc1", "bc3"])),
-            ConfigKey::TextureCompressor => {
-                Box::new(OneOfSpec::new(&["software", "ispc", "gpu"]))
-            }
+            ConfigKey::TextureCompressor => Box::new(OneOfSpec::new(&["software", "ispc", "gpu"])),
             ConfigKey::TextureGpuDevice => Box::new(NonEmptyStringSpec),
             ConfigKey::DownloadTimeout => Box::new(PositiveIntegerSpec),
             ConfigKey::GenerationThreads => Box::new(PositiveIntegerSpec),
@@ -1596,5 +1594,7 @@ mod tests {
         assert!(key.validate("discrete").is_ok());
         assert!(key.validate("Radeon").is_ok());
         assert!(key.validate("RTX 5090").is_ok());
+        assert!(key.validate("").is_err());
+        assert!(key.validate("   ").is_err());
     }
 }
