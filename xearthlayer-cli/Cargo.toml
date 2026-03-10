@@ -53,6 +53,7 @@ rlimit = "0.10"
 
 [features]
 profiling = ["xearthlayer/profiling"]
+gpu-encode = ["xearthlayer/gpu-encode"]
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

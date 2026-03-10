@@ -88,6 +88,21 @@ install-profiling: release-profiling ## Install binary with profiling support to
 	@echo "$(GREEN)Installed: $(BINDIR)/xearthlayer (with profiling)$(NC)"
 	@echo "$(BLUE)Usage: xearthlayer run --profile$(NC)"
 
+.PHONY: release-gpu
+release-gpu: verify ## Build release version with GPU encoding support
+	@echo "$(BLUE)Building release version with GPU encoding...$(NC)"
+	$(CARGO) build --release --features gpu-encode $(CARGO_FLAGS)
+	@echo "$(GREEN)Release build with GPU encoding complete!$(NC)"
+
+.PHONY: install-gpu
+install-gpu: release-gpu ## Install binary with GPU encoding support to $(BINDIR)
+	@echo "$(BLUE)Installing xearthlayer (GPU encoding) to $(BINDIR)...$(NC)"
+	@mkdir -p "$(BINDIR)"
+	@cp target/release/xearthlayer "$(BINDIR)/"
+	@chmod 755 "$(BINDIR)/xearthlayer"
+	@echo "$(GREEN)Installed: $(BINDIR)/xearthlayer (with GPU encoding)$(NC)"
+	@echo "$(BLUE)Usage: Set texture.compressor = gpu in config.ini$(NC)"
+
 .PHONY: clean
 clean: ## Remove build artifacts
 	@echo "$(BLUE)Cleaning build artifacts...$(NC)"

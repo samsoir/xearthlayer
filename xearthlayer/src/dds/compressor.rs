@@ -240,17 +240,17 @@ mod gpu {
 
             let adapter = select_adapter(&adapters, gpu_device)?;
             let info = adapter.get_info();
-            let adapter_name = format!("{} ({:?}, {:?})", info.name, info.device_type, info.backend);
+            let adapter_name =
+                format!("{} ({:?}, {:?})", info.name, info.device_type, info.backend);
 
-            let (device, queue) = pollster::block_on(adapter.request_device(
-                &wgpu::DeviceDescriptor {
+            let (device, queue) =
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                     label: Some("xearthlayer-dds"),
                     ..Default::default()
-                },
-            ))
-            .map_err(|e| {
-                DdsError::CompressionFailed(format!("Failed to create wgpu device: {e}"))
-            })?;
+                }))
+                .map_err(|e| {
+                    DdsError::CompressionFailed(format!("Failed to create wgpu device: {e}"))
+                })?;
 
             let compressor = GpuBlockCompressor::new(device.clone(), queue.clone());
 
@@ -299,7 +299,10 @@ mod gpu {
             .iter()
             .map(|a| {
                 let info = a.get_info();
-                format!("  - {} ({:?}, {:?})", info.name, info.device_type, info.backend)
+                format!(
+                    "  - {} ({:?}, {:?})",
+                    info.name, info.device_type, info.backend
+                )
             })
             .collect();
 

@@ -45,7 +45,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 4. **DDS Compression** (`xearthlayer/src/dds/`)
    - BC1/BC3 (DXT1/DXT5) compression
    - 5-level mipmap chain generation
-   - ~0.2s encoding for 4096×4096 tiles
+   - `BlockCompressor` trait for swappable backends:
+     - `SoftwareCompressor` — Pure-Rust fallback
+     - `IspcCompressor` — SIMD-optimized via Intel ISPC (default)
+     - `WgpuCompressor` — GPU compute shaders (optional `gpu-encode` feature)
+   - `block_compression` crate for GPU encoding (ISPC kernels ported to WGSL)
 
 5. **Cache System** (`xearthlayer/src/cache/`, `xearthlayer/src/service/cache_layer.rs`)
    - `CacheLayer` - Service-owned cache lifecycle (encapsulates memory + disk)
@@ -321,7 +325,7 @@ Key sections:
 - `[provider]` - Imagery source (bing/google)
 - `[cache]` - Memory/disk sizes, directory, disk I/O profile (auto/hdd/ssd/nvme)
 - `[generation]` - Thread count, timeout
-- `[texture]` - DDS format (bc1/bc3)
+- `[texture]` - DDS format (bc1/bc3), compressor backend (software/ispc/gpu), GPU device selection
 - `[prefetch]` - Boundary-driven prefetch, circuit breaker, calibration, transition ramp
 - `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
 - `[pipeline]` - HTTP/CPU/prefetch concurrency limits
@@ -377,6 +381,8 @@ CI will fail if pre-commit checks were not run.
 - `tracing-chrome` - Chrome Trace profiling (optional, `profiling` feature)
 - `tokio` - Async runtime
 - `rlimit` - File descriptor limit management (raises soft limit at startup)
+- `wgpu` - GPU compute shaders for DDS encoding (optional, `gpu-encode` feature)
+- `block_compression` - BCn GPU compression via WGSL (optional, `gpu-encode` feature)
 
 ## Performance Notes
 

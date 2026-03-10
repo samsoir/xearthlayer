@@ -149,23 +149,40 @@ disk_io_profile = auto
 
 ### [texture]
 
-Controls DDS texture output format.
+Controls DDS texture output format and compression backend.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `format` | string | `bc1` | DDS compression: `bc1` (smaller, opaque) or `bc3` (larger, with alpha) |
 | `mipmaps` | integer | `5` | Number of mipmap levels (1-10) |
+| `compressor` | string | `ispc` | Compression backend: `software`, `ispc` (SIMD), or `gpu` (wgpu compute) |
+| `gpu_device` | string | `integrated` | GPU adapter: `integrated`, `discrete`, or adapter name substring |
 
 **Example:**
 ```ini
 [texture]
 format = bc1
-mipmaps = 5
+compressor = gpu
+gpu_device = integrated
 ```
 
 **Format Comparison:**
 - **BC1 (DXT1)**: 4:1 compression, ~11MB per 4096x4096 tile. Best for satellite imagery.
 - **BC3 (DXT5)**: 4:1 compression with alpha, ~22MB per tile. Use if transparency is needed.
+
+**Compressor Backends:**
+- **software**: Pure-Rust block compression. Slowest, no external dependencies.
+- **ispc** (default): Intel ISPC SIMD compression via `intel_tex_2`. 5-10x faster than software.
+- **gpu**: wgpu compute shader compression. Requires `--features gpu-encode` at build time.
+  Offloads encoding to GPU, freeing CPU for X-Plane. Best when an idle integrated GPU is available.
+
+**GPU Device Selection:**
+- `integrated` — Use the integrated GPU (e.g., AMD Radeon on Ryzen). Recommended when
+  a discrete GPU is handling X-Plane display.
+- `discrete` — Use the discrete GPU. Only recommended if no integrated GPU is available.
+- `<name>` — Match by adapter name substring (e.g., `Radeon`, `RTX 5090`).
+
+Run `xearthlayer diagnostics` to see available GPU adapters.
 
 ### [download]
 
