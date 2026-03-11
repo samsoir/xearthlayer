@@ -12,9 +12,6 @@ mod inner {
     use crate::dds::compressor::BlockCompressor;
     use crate::dds::{DdsError, DdsFormat};
 
-    /// Maximum number of tiles to batch per GPU pass.
-    pub const MAX_BATCH: usize = 4;
-
     /// Bounded channel capacity for GPU encode requests.
     pub const CHANNEL_CAPACITY: usize = 32;
 
@@ -50,6 +47,11 @@ mod inner {
     }
 
     impl BlockCompressor for GpuEncoderChannel {
+        /// Note: The image is cloned to transfer ownership through the channel.
+        /// For 4096×4096 RGBA images this is ~64MB per mip level. This is an
+        /// inherent cost of the `BlockCompressor` trait contract (which takes
+        /// `&RgbaImage`). Future `TextureEncoder`-level integration could avoid
+        /// this by transferring ownership directly.
         fn compress(&self, image: &RgbaImage, format: DdsFormat) -> Result<Vec<u8>, DdsError> {
             let (resp_tx, resp_rx) = oneshot::channel();
             let request = GpuEncodeRequest {
@@ -126,11 +128,6 @@ mod tests {
     use image::RgbaImage;
     use std::sync::Arc;
     use tokio::sync::{mpsc, oneshot};
-
-    #[test]
-    fn test_max_batch_constant() {
-        assert_eq!(MAX_BATCH, 4);
-    }
 
     #[test]
     fn test_channel_capacity_constant() {
@@ -286,6 +283,28 @@ mod tests {
 
             let data = result.unwrap_or_else(|e| panic!("request {i} should succeed: {e}"));
             assert_eq!(data.len(), 8);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_worker_handles_concurrent_submissions() {
+        let compressor: Arc<dyn BlockCompressor> = Arc::new(SoftwareCompressor);
+        let (channel, _worker_handle) = create_gpu_encoder_channel(compressor);
+        let channel = Arc::new(channel);
+
+        let mut handles = vec![];
+        for _ in 0..6 {
+            let ch = Arc::clone(&channel);
+            handles.push(tokio::task::spawn_blocking(move || {
+                let image = RgbaImage::new(4, 4);
+                ch.compress(&image, DdsFormat::BC1)
+            }));
+        }
+
+        for handle in handles {
+            let result = handle.await.unwrap();
+            let data = result.expect("concurrent compress should succeed");
+            assert_eq!(data.len(), 8); // 1 BC1 block = 8 bytes
         }
     }
 
