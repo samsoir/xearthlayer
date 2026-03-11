@@ -85,6 +85,17 @@ mod inner {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Some(request) = rx.recv().await {
+                let queue_len = CHANNEL_CAPACITY - rx.capacity();
+                if queue_len > 0 {
+                    tracing::debug!(
+                        queue_depth = queue_len,
+                        format = ?request.format,
+                        width = request.image.width(),
+                        height = request.image.height(),
+                        "GPU worker processing (queued requests waiting)"
+                    );
+                }
+
                 let comp = Arc::clone(&compressor);
                 let result = tokio::task::spawn_blocking(move || {
                     comp.compress(&request.image, request.format)
