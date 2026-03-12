@@ -595,6 +595,17 @@ impl Filesystem for Fuse3OrthoUnionFS {
         // on disk — generate it. This handles boundary cases where package `.ter` files
         // reference DDS textures the patch doesn't provide (different naming convention).
         if name_str.ends_with(".dds") {
+            // Water mask guard (#68): X-Plane requests BORDER_TEX as .dds first,
+            // but the actual water mask is a .png on disk. If we generate a virtual
+            // DDS, X-Plane gets satellite imagery instead of the alpha mask. Return
+            // ENOENT so X-Plane falls back to the .png via lazy resolution.
+            let png_name = name_str.replace(".dds", ".png");
+            let png_path = parent_path.join(&*png_name);
+            if self.resolve_lazy_geo(&png_path, &png_name).is_some() {
+                trace!(file = %name_str, "Water mask PNG exists, skipping DDS generation");
+                return Err(Errno::from(libc::ENOENT));
+            }
+
             if let Ok(coords) = parse_dds_filename(&name_str) {
                 let inode = self.inode_manager.create_virtual_inode(coords);
                 let attr = self.virtual_dds_attr(inode);
