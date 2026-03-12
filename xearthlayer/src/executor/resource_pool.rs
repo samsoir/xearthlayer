@@ -53,7 +53,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// ON_DEMAND tasks always have access to the full pool. Prefetch and
 /// housekeeping tasks are capped at this fraction, reserving the remainder
 /// exclusively for on-demand work.
-pub const DEFAULT_MAX_PREFETCH_FRACTION: f64 = 0.75;
+///
+/// Set to 0.15 to keep total prefetch CPU impact at ~20-25% of system.
+/// Both CPU tasks (DDS encode) and Network tasks (TLS + JPEG decode)
+/// consume CPU cores, so the fraction must account for both pools.
+/// On a 32-core system: 6 encodes + 9 downloads ≈ 15 concurrent tasks
+/// using ~20-25% of total compute capacity.
+pub const DEFAULT_MAX_PREFETCH_FRACTION: f64 = 0.15;
 
 // =============================================================================
 // Resource Pool Configuration Constants
@@ -75,9 +81,9 @@ pub const MIN_NETWORK_CAPACITY: usize = 8;
 /// Maximum network pool capacity.
 ///
 /// Caps concurrent download tasks to prevent bandwidth starvation. With an
-/// HTTP semaphore of 256 shared across all downloads, 48 concurrent tiles
-/// each get ~5 HTTP connections — enough for ~2s per-tile latency.
-pub const MAX_NETWORK_CAPACITY: usize = 48;
+/// HTTP semaphore of 1024 shared across all downloads, 64 concurrent tiles
+/// each get ~16 HTTP connections — enough for sub-second per-tile latency.
+pub const MAX_NETWORK_CAPACITY: usize = 64;
 
 /// Default disk I/O pool capacity (SSD profile).
 pub const DEFAULT_DISK_IO_CAPACITY: usize = 64;
@@ -692,7 +698,7 @@ mod tests {
     fn test_network_pool_balanced_with_cpu() {
         let config = ResourcePoolConfig::default();
 
-        // Network pool should be approximately 1.5x CPU pool, clamped to [8, 48]
+        // Network pool should be approximately 1.5x CPU pool, clamped to [8, 64]
         let expected = ((config.cpu as f64 * DEFAULT_NETWORK_CAPACITY_MULTIPLIER).ceil() as usize)
             .clamp(MIN_NETWORK_CAPACITY, MAX_NETWORK_CAPACITY);
         assert_eq!(
@@ -975,5 +981,78 @@ mod tests {
         // Network and DiskIO are at 0% — CPU is the max
         assert!((pools.network().utilization() - 0.0).abs() < f64::EPSILON);
         assert!((pools.disk_io().utilization() - 0.0).abs() < f64::EPSILON);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Prefetch capacity budget tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_default_prefetch_fraction_limits_cpu_impact() {
+        // The default prefetch fraction must keep total prefetch CPU impact low.
+        // Both CPU tasks (DDS encode) and Network tasks (TLS + JPEG decode)
+        // consume CPU, so the fraction must be conservative enough that the
+        // combined load stays under ~25% of system capacity.
+        assert!(
+            (DEFAULT_MAX_PREFETCH_FRACTION - 0.15).abs() < f64::EPSILON,
+            "Default prefetch fraction should be 0.15, got {}",
+            DEFAULT_MAX_PREFETCH_FRACTION
+        );
+    }
+
+    #[test]
+    fn test_prefetch_cpu_budget_on_32_core_system() {
+        // Simulate a 32-core system: CPU pool = max(32 * 1.25, 32 + 2) = 40
+        // With 0.15 fraction, prefetch gets ceil(40 * 0.15) = 6 concurrent tasks.
+        // Network pool (~60) gets ceil(60 * 0.15) = 9 concurrent downloads.
+        // Total ~15 CPU-consuming tasks on 32 cores ≈ 20-25% system CPU.
+        let cpu_capacity = 40;
+        let pool = ResourcePool::with_prefetch_fraction(
+            ResourceType::CPU,
+            cpu_capacity,
+            DEFAULT_MAX_PREFETCH_FRACTION,
+        );
+
+        assert_eq!(
+            pool.max_prefetch_capacity(),
+            6,
+            "On a 40-capacity CPU pool, prefetch should get 6 permits"
+        );
+
+        // Acquire all 6 prefetch permits
+        let mut permits = Vec::new();
+        for _ in 0..6 {
+            let p = pool.try_acquire_for_priority(Priority::PREFETCH);
+            assert!(p.is_some(), "Should be able to acquire 6 prefetch permits");
+            permits.push(p);
+        }
+
+        // 7th prefetch must be denied — budget exhausted
+        let denied = pool.try_acquire_for_priority(Priority::PREFETCH);
+        assert!(
+            denied.is_none(),
+            "7th prefetch permit should be denied (budget is 6)"
+        );
+
+        // ON_DEMAND still has 34 slots available
+        assert_eq!(pool.available(), cpu_capacity - 6);
+    }
+
+    #[test]
+    fn test_prefetch_network_budget_on_32_core_system() {
+        // Network pool on a 32-core system: clamp(ceil(40 * 1.5), 8, 64) = 60
+        // With 0.15 fraction, prefetch gets ceil(60 * 0.15) = 9 concurrent downloads.
+        let net_capacity = 60;
+        let pool = ResourcePool::with_prefetch_fraction(
+            ResourceType::Network,
+            net_capacity,
+            DEFAULT_MAX_PREFETCH_FRACTION,
+        );
+
+        assert_eq!(
+            pool.max_prefetch_capacity(),
+            9,
+            "On a 60-capacity Network pool, prefetch should get 9 permits"
+        );
     }
 }

@@ -163,10 +163,14 @@ pub struct AggregatedState {
     // =========================================================================
     // Memory Cache Metrics
     // =========================================================================
-    /// Memory cache hits.
+    /// Memory cache hits (all origins).
     pub memory_cache_hits: u64,
-    /// Memory cache misses.
+    /// Memory cache misses (all origins).
     pub memory_cache_misses: u64,
+    /// Memory cache hits from FUSE (X-Plane) requests only.
+    pub fuse_memory_cache_hits: u64,
+    /// Memory cache misses from FUSE (X-Plane) requests only.
+    pub fuse_memory_cache_misses: u64,
     /// Current memory cache size in bytes.
     pub memory_cache_size_bytes: u64,
 
@@ -249,6 +253,8 @@ impl AggregatedState {
             disk_cache_size_bytes: 0,
             memory_cache_hits: 0,
             memory_cache_misses: 0,
+            fuse_memory_cache_hits: 0,
+            fuse_memory_cache_misses: 0,
             memory_cache_size_bytes: 0,
             jobs_submitted: 0,
             fuse_jobs_submitted: 0,
@@ -290,6 +296,8 @@ impl AggregatedState {
         self.disk_write_time_us = 0;
         self.memory_cache_hits = 0;
         self.memory_cache_misses = 0;
+        self.fuse_memory_cache_hits = 0;
+        self.fuse_memory_cache_misses = 0;
         self.memory_cache_size_bytes = 0;
         self.jobs_submitted = 0;
         self.fuse_jobs_submitted = 0;

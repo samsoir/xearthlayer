@@ -6,7 +6,6 @@
 
 use super::super::calibration::StrategyMode;
 use super::super::phase_detector::FlightPhase;
-use super::super::turn_detector::TurnState;
 
 /// Current coordinator state for status reporting.
 ///
@@ -19,9 +18,7 @@ use super::super::turn_detector::TurnState;
 /// - `enabled` - Whether prefetch is currently active
 /// - `mode` - Current strategy mode (Aggressive/Opportunistic/Disabled)
 /// - `phase` - Current flight phase (Ground/Cruise)
-/// - `turn_state` - Turn detection state
 /// - `active_strategy` - Name of the currently active strategy
-/// - `stable_track` - Last stable ground track if known
 /// - `last_prefetch_count` - Tiles prefetched in the last cycle
 /// - `throttled` - Whether circuit breaker is throttling prefetch
 #[derive(Debug, Clone)]
@@ -35,14 +32,8 @@ pub struct CoordinatorStatus {
     /// Current flight phase.
     pub phase: FlightPhase,
 
-    /// Current turn state.
-    pub turn_state: TurnState,
-
     /// Name of active strategy.
     pub active_strategy: &'static str,
-
-    /// Last stable track (if known).
-    pub stable_track: Option<f64>,
 
     /// Tiles prefetched in the last cycle.
     pub last_prefetch_count: usize,
@@ -57,9 +48,7 @@ impl Default for CoordinatorStatus {
             enabled: true,
             mode: StrategyMode::Opportunistic,
             phase: FlightPhase::Ground,
-            turn_state: TurnState::Initializing,
             active_strategy: "none",
-            stable_track: None,
             last_prefetch_count: 0,
             throttled: false,
         }
@@ -76,9 +65,7 @@ mod tests {
         assert!(status.enabled);
         assert_eq!(status.mode, StrategyMode::Opportunistic);
         assert_eq!(status.phase, FlightPhase::Ground);
-        assert_eq!(status.turn_state, TurnState::Initializing);
         assert_eq!(status.active_strategy, "none");
-        assert!(status.stable_track.is_none());
         assert_eq!(status.last_prefetch_count, 0);
         assert!(!status.throttled);
     }
@@ -89,9 +76,7 @@ mod tests {
             enabled: false,
             mode: StrategyMode::Aggressive,
             phase: FlightPhase::Cruise,
-            turn_state: TurnState::Stable,
             active_strategy: "cruise",
-            stable_track: Some(45.0),
             last_prefetch_count: 10,
             throttled: true,
         };
@@ -100,7 +85,6 @@ mod tests {
         assert_eq!(cloned.enabled, status.enabled);
         assert_eq!(cloned.mode, status.mode);
         assert_eq!(cloned.phase, status.phase);
-        assert_eq!(cloned.stable_track, status.stable_track);
     }
 
     #[test]

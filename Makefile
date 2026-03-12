@@ -29,13 +29,18 @@ help: ## Show this help message
 ##@ Development
 
 .PHONY: init
-init: ## Initialize development environment
+init: setup-hooks ## Initialize development environment
 	@echo "$(BLUE)Initializing development environment...$(NC)"
 	@command -v cargo >/dev/null 2>&1 || { echo "$(RED)Error: cargo not found. Install Rust from https://rustup.rs/$(NC)"; exit 1; }
 	@command -v rustup >/dev/null 2>&1 || { echo "$(RED)Error: rustup not found. Install Rust via rustup from https://rustup.rs/$(NC)"; exit 1; }
 	@command -v rustfmt >/dev/null 2>&1 || rustup component add rustfmt
 	@command -v cargo-clippy >/dev/null 2>&1 || rustup component add clippy
 	@echo "$(GREEN)Development environment ready!$(NC)"
+
+.PHONY: setup-hooks
+setup-hooks: ## Install git pre-commit hook (symlinks scripts/hooks/pre-commit)
+	@ln -sf ../../scripts/hooks/pre-commit .git/hooks/pre-commit
+	@echo "$(GREEN)Git hooks installed.$(NC)"
 
 .PHONY: dev
 dev: ## Run in development mode
@@ -67,6 +72,36 @@ release: verify ## Build optimized release version
 	@echo "$(BLUE)Building release version...$(NC)"
 	$(CARGO) build --release $(CARGO_FLAGS)
 	@echo "$(GREEN)Release build complete!$(NC)"
+
+.PHONY: release-profiling
+release-profiling: verify ## Build release version with profiling support
+	@echo "$(BLUE)Building release version with profiling...$(NC)"
+	$(CARGO) build --release --features profiling $(CARGO_FLAGS)
+	@echo "$(GREEN)Release build with profiling complete!$(NC)"
+
+.PHONY: install-profiling
+install-profiling: release-profiling ## Install binary with profiling support to $(BINDIR)
+	@echo "$(BLUE)Installing xearthlayer (profiling) to $(BINDIR)...$(NC)"
+	@mkdir -p "$(BINDIR)"
+	@cp target/release/xearthlayer "$(BINDIR)/"
+	@chmod 755 "$(BINDIR)/xearthlayer"
+	@echo "$(GREEN)Installed: $(BINDIR)/xearthlayer (with profiling)$(NC)"
+	@echo "$(BLUE)Usage: xearthlayer run --profile$(NC)"
+
+.PHONY: release-gpu
+release-gpu: verify ## Build release version with GPU encoding support
+	@echo "$(BLUE)Building release version with GPU encoding...$(NC)"
+	$(CARGO) build --release --features gpu-encode $(CARGO_FLAGS)
+	@echo "$(GREEN)Release build with GPU encoding complete!$(NC)"
+
+.PHONY: install-gpu
+install-gpu: release-gpu ## Install binary with GPU encoding support to $(BINDIR)
+	@echo "$(BLUE)Installing xearthlayer (GPU encoding) to $(BINDIR)...$(NC)"
+	@mkdir -p "$(BINDIR)"
+	@cp target/release/xearthlayer "$(BINDIR)/"
+	@chmod 755 "$(BINDIR)/xearthlayer"
+	@echo "$(GREEN)Installed: $(BINDIR)/xearthlayer (with GPU encoding)$(NC)"
+	@echo "$(BLUE)Usage: Set texture.compressor = gpu in config.ini$(NC)"
 
 .PHONY: clean
 clean: ## Remove build artifacts

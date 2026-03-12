@@ -21,6 +21,42 @@ pub fn format_dsf_name(lat: i32, lon: i32) -> String {
     format!("{}{:02}{}{:03}", lat_sign, lat.abs(), lon_sign, lon.abs())
 }
 
+/// Compute longitude span in DSF tiles for a given latitude.
+///
+/// X-Plane's scenery window is ~330km × 330km physical extent. Since
+/// longitude degrees shrink with cos(latitude), we need more tiles at
+/// higher latitudes to cover the same physical distance.
+///
+/// # Arguments
+///
+/// * `lat_deg` - Latitude in degrees (-90 to 90)
+/// * `lon_extent_deg` - Longitude extent in degrees at the equator (typically 3.0)
+///
+/// # Returns
+///
+/// Number of 1° DSF tile columns needed. Minimum 1, clamped near poles.
+pub fn lon_tiles_for_latitude(lat_deg: f64, lon_extent_deg: f64) -> usize {
+    let cos_lat = lat_deg.to_radians().cos().abs().max(0.1); // clamp near poles
+    (lon_extent_deg / cos_lat).ceil() as usize
+}
+
+/// Sort tiles by squared Euclidean distance from a reference position.
+///
+/// Tiles closest to `(lat, lon)` appear first. Uses squared distance
+/// (no sqrt) since only relative ordering matters. This is used by
+/// prefetch strategies to prioritize near-boundary tiles.
+pub fn sort_tiles_by_distance(tiles: &mut [TileCoord], lat: f64, lon: f64) {
+    tiles.sort_by(|a, b| {
+        let (lat_a, lon_a) = a.to_lat_lon();
+        let (lat_b, lon_b) = b.to_lat_lon();
+        let dist_a = (lat_a - lat).powi(2) + (lon_a - lon).powi(2);
+        let dist_b = (lat_b - lat).powi(2) + (lon_b - lon).powi(2);
+        dist_a
+            .partial_cmp(&dist_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
 use std::f64::consts::PI;
 
 /// Converts geographic coordinates to tile coordinates.
@@ -285,6 +321,102 @@ pub fn quadkey_to_tile(quadkey: &str) -> Result<TileCoord, CoordError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // lon_tiles_for_latitude tests
+    #[test]
+    fn test_lon_tiles_at_equator() {
+        // cos(0°) = 1.0 → ceil(3.0/1.0) = 3
+        assert_eq!(lon_tiles_for_latitude(0.0, 3.0), 3);
+    }
+
+    #[test]
+    fn test_lon_tiles_at_mid_latitude() {
+        // cos(45°) ≈ 0.707 → ceil(3.0/0.707) = ceil(4.24) = 5
+        assert_eq!(lon_tiles_for_latitude(45.0, 3.0), 5);
+    }
+
+    #[test]
+    fn test_lon_tiles_at_high_latitude() {
+        // cos(60°) = 0.5 → ceil(3.0/0.5) = 6
+        assert_eq!(lon_tiles_for_latitude(60.0, 3.0), 6);
+    }
+
+    #[test]
+    fn test_lon_tiles_near_pole() {
+        // cos(85°) ≈ 0.087, clamped to 0.1 → ceil(3.0/0.1) = 30
+        let result = lon_tiles_for_latitude(85.0, 3.0);
+        assert!(result <= 30, "Should be clamped near poles, got {}", result);
+        assert!(result >= 1, "Should be at least 1");
+    }
+
+    #[test]
+    fn test_lon_tiles_negative_latitude() {
+        // Symmetric: -45° should give same result as +45°
+        assert_eq!(
+            lon_tiles_for_latitude(-45.0, 3.0),
+            lon_tiles_for_latitude(45.0, 3.0)
+        );
+    }
+
+    #[test]
+    fn test_lon_tiles_at_typical_airports() {
+        // EDDF (50°N): cos(50°) ≈ 0.643 → ceil(3.0/0.643) = ceil(4.67) = 5
+        assert_eq!(lon_tiles_for_latitude(50.0, 3.0), 5);
+        // WSSS (1°N): cos(1°) ≈ 0.9998 → ceil(3.0/0.9998) = ceil(3.0005) = 4
+        assert_eq!(lon_tiles_for_latitude(1.0, 3.0), 4);
+        // YPAD (35°S): cos(35°) ≈ 0.819 → ceil(3.0/0.819) = ceil(3.66) = 4
+        assert_eq!(lon_tiles_for_latitude(-35.0, 3.0), 4);
+    }
+
+    #[test]
+    fn test_sort_tiles_by_distance_orders_nearest_first() {
+        // Create tiles at known positions spread across a region
+        let t1 = TileCoord {
+            row: 10,
+            col: 10,
+            zoom: 14,
+        };
+        let t2 = TileCoord {
+            row: 100,
+            col: 100,
+            zoom: 14,
+        };
+        let t3 = TileCoord {
+            row: 1000,
+            col: 1000,
+            zoom: 14,
+        };
+
+        let mut tiles = vec![t3, t1, t2]; // deliberately unsorted
+        sort_tiles_by_distance(&mut tiles, 52.0, 7.0);
+
+        // Verify monotonically increasing distance
+        let mut prev_dist = 0.0_f64;
+        for tile in &tiles {
+            let (lat, lon) = tile.to_lat_lon();
+            let dist = (lat - 52.0).powi(2) + (lon - 7.0).powi(2);
+            assert!(
+                dist >= prev_dist - 0.001,
+                "Tiles not sorted by distance: {dist:.4} < {prev_dist:.4}"
+            );
+            prev_dist = dist;
+        }
+    }
+
+    #[test]
+    fn test_sort_tiles_by_distance_empty_and_single() {
+        let mut empty: Vec<TileCoord> = vec![];
+        sort_tiles_by_distance(&mut empty, 0.0, 0.0);
+        assert!(empty.is_empty());
+
+        let mut single = vec![TileCoord {
+            row: 10,
+            col: 10,
+            zoom: 14,
+        }];
+        sort_tiles_by_distance(&mut single, 0.0, 0.0);
+        assert_eq!(single.len(), 1);
+    }
 
     #[test]
     fn test_new_york_city_at_zoom_16() {

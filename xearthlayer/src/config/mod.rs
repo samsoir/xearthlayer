@@ -30,7 +30,7 @@
 //! let download_config = DownloadConfig::default();
 //! ```
 
-mod defaults;
+pub(crate) mod defaults;
 mod download;
 mod file;
 mod keys;

@@ -6,6 +6,8 @@
 //! - Performance calibration for mode selection
 //! - Flight phase detection (ground/cruise)
 //! - Turn detection for prefetch pausing
+//! - Transition throttle for takeoff ramp-up (#62)
+//! - DSF boundary-aware tile prioritization (#58)
 //! - Strategy selection and execution
 //!
 //! # Module Structure

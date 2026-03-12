@@ -141,7 +141,8 @@ pub const DEFAULT_GENERATION_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_PREFETCH_UDP_PORT: u16 = 49002;
 
 /// Default maximum tiles to submit per prefetch cycle.
-/// Increased to 200 for faster cache warming.
+/// This controls queue depth, not processing rate — actual CPU consumption
+/// is governed by the prefetch fraction in `ResourcePool`.
 pub const DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE: usize = 200;
 
 /// Default interval between prefetch cycles in milliseconds.
@@ -173,6 +174,75 @@ pub const DEFAULT_CALIBRATION_OPPORTUNISTIC_THRESHOLD: f64 = 10.0;
 pub const DEFAULT_CALIBRATION_SAMPLE_DURATION: u64 = 60;
 
 // =============================================================================
+// Transition ramp defaults
+// =============================================================================
+
+/// Default altitude climb (feet) above takeoff MSL to release transition hold.
+pub const DEFAULT_TAKEOFF_CLIMB_FT: f32 = 1000.0;
+
+/// Default maximum seconds before timeout release if climb threshold not reached.
+pub const DEFAULT_TAKEOFF_TIMEOUT_SECS: u64 = 90;
+
+/// Default sustained seconds at GS < 40kt before Cruise→Ground transition.
+pub const DEFAULT_LANDING_HYSTERESIS_SECS: u64 = 15;
+
+/// Default duration (seconds) of linear ramp from start fraction to full rate.
+pub const DEFAULT_RAMP_DURATION_SECS: u64 = 30;
+
+/// Default starting prefetch fraction when ramp begins.
+pub const DEFAULT_RAMP_START_FRACTION: f64 = 0.25;
+
+// =============================================================================
+// Boundary-driven prefetch defaults
+// =============================================================================
+
+/// Default boundary trigger distance in degrees.
+/// Must be > X-Plane's 1.0° trigger to allow prefetch to complete before
+/// X-Plane requests tiles. 1.5° gives 50% lead over X-Plane's trigger.
+pub const DEFAULT_PREFETCH_TRIGGER_DISTANCE: f64 = 1.5;
+
+/// Default load depth for latitude boundary crossings (ROW loads).
+/// Empirically measured: 3 rows deep × 3-4 cols wide (73% of FUSE burst events).
+pub const DEFAULT_PREFETCH_LOAD_DEPTH_LAT: u8 = 3;
+
+/// Default load depth for longitude boundary crossings (COLUMN loads).
+/// Empirically measured: 2 cols deep × 3-4 rows wide (64% of FUSE burst events).
+pub const DEFAULT_PREFETCH_LOAD_DEPTH_LON: u8 = 2;
+
+/// Default buffer tiles for retention.
+pub const DEFAULT_PREFETCH_WINDOW_BUFFER: u8 = 1;
+
+/// Default InProgress staleness timeout in seconds.
+pub const DEFAULT_PREFETCH_STALE_REGION_TIMEOUT: u64 = 120;
+
+/// Default assumed window height in DSF tiles.
+/// Empirically measured at EDDF, YPAD, WSSS: ~3° latitude (constant worldwide).
+pub const DEFAULT_PREFETCH_DEFAULT_WINDOW_ROWS: usize = 3;
+
+/// Default longitude extent in degrees for scenery window computation.
+/// X-Plane loads ~330km × 330km; cols = ceil(this / cos(lat)).
+/// Actual column count varies by latitude via `lon_tiles_for_latitude()`.
+pub const DEFAULT_PREFETCH_WINDOW_LON_EXTENT: f64 = 3.0;
+
+// =============================================================================
+// FUSE defaults
+// =============================================================================
+
+/// Default maximum pending background FUSE requests.
+///
+/// The Linux kernel queues background requests (readahead, async reads) and
+/// throttles when `congestion_threshold` is exceeded. The kernel default of
+/// 12/9 severely limits X-Plane's concurrent scenery reads, causing freezes
+/// at DSF boundaries. 256 allows the full tile pipeline to stay saturated.
+pub const DEFAULT_FUSE_MAX_BACKGROUND: u16 = 256;
+
+/// Default congestion threshold for background FUSE requests.
+///
+/// When pending background requests exceed this, the kernel starts throttling.
+/// Set to 75% of `max_background` as per kernel convention.
+pub const DEFAULT_FUSE_CONGESTION_THRESHOLD: u16 = DEFAULT_FUSE_MAX_BACKGROUND * 3 / 4; // 192
+
+// =============================================================================
 // Control plane defaults
 // =============================================================================
 
@@ -194,6 +264,12 @@ pub const DEFAULT_CONTROL_PLANE_JOB_SCALING_FACTOR: usize = 2;
 
 /// Default mipmap count (5 levels: 4096 → 2048 → 1024 → 512 → 256).
 pub const DEFAULT_MIPMAP_COUNT: usize = 5;
+
+/// Default texture compressor backend: ISPC SIMD.
+pub const DEFAULT_COMPRESSOR: &str = "ispc";
+
+/// Default GPU device selector: prefer integrated GPU.
+pub const DEFAULT_GPU_DEVICE: &str = "integrated";
 
 // =============================================================================
 // Executor defaults
@@ -255,6 +331,8 @@ impl Default for ConfigFile {
             },
             texture: TextureSettings {
                 format: DdsFormat::BC1,
+                compressor: DEFAULT_COMPRESSOR.to_string(),
+                gpu_device: DEFAULT_GPU_DEVICE.to_string(),
             },
             download: DownloadSettings {
                 timeout: DEFAULT_DOWNLOAD_TIMEOUT_SECS,
@@ -295,6 +373,18 @@ impl Default for ConfigFile {
                 calibration_aggressive_threshold: DEFAULT_CALIBRATION_AGGRESSIVE_THRESHOLD,
                 calibration_opportunistic_threshold: DEFAULT_CALIBRATION_OPPORTUNISTIC_THRESHOLD,
                 calibration_sample_duration: DEFAULT_CALIBRATION_SAMPLE_DURATION,
+                takeoff_climb_ft: DEFAULT_TAKEOFF_CLIMB_FT,
+                takeoff_timeout_secs: DEFAULT_TAKEOFF_TIMEOUT_SECS,
+                landing_hysteresis_secs: DEFAULT_LANDING_HYSTERESIS_SECS,
+                ramp_duration_secs: DEFAULT_RAMP_DURATION_SECS,
+                ramp_start_fraction: DEFAULT_RAMP_START_FRACTION,
+                trigger_distance: DEFAULT_PREFETCH_TRIGGER_DISTANCE,
+                load_depth_lat: DEFAULT_PREFETCH_LOAD_DEPTH_LAT,
+                load_depth_lon: DEFAULT_PREFETCH_LOAD_DEPTH_LON,
+                window_buffer: DEFAULT_PREFETCH_WINDOW_BUFFER,
+                stale_region_timeout: DEFAULT_PREFETCH_STALE_REGION_TIMEOUT,
+                default_window_rows: DEFAULT_PREFETCH_DEFAULT_WINDOW_ROWS,
+                window_lon_extent: DEFAULT_PREFETCH_WINDOW_LON_EXTENT,
             },
             control_plane: ControlPlaneSettings {
                 max_concurrent_jobs: default_max_concurrent_jobs(),
@@ -302,7 +392,10 @@ impl Default for ConfigFile {
                 health_check_interval_secs: DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
                 semaphore_timeout_secs: DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
             },
-            prewarm: PrewarmSettings { grid_size: 4 },
+            prewarm: PrewarmSettings {
+                grid_rows: 3,
+                grid_cols: 4,
+            },
             patches: PatchesSettings {
                 enabled: true,
                 directory: Some(config_dir.join("patches")),
@@ -319,6 +412,10 @@ impl Default for ConfigFile {
                 retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
             },
             online_network: OnlineNetworkSettings::default(),
+            fuse: FuseSettings {
+                max_background: DEFAULT_FUSE_MAX_BACKGROUND,
+                congestion_threshold: DEFAULT_FUSE_CONGESTION_THRESHOLD,
+            },
         }
     }
 }

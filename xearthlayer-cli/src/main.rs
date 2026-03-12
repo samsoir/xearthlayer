@@ -133,6 +133,10 @@ enum Commands {
         #[arg(long)]
         debug: bool,
 
+        /// Enable Chrome Trace profiling (writes trace to logs/)
+        #[arg(long)]
+        profile: bool,
+
         /// Disable predictive tile prefetching
         #[arg(long)]
         no_prefetch: bool,
@@ -175,6 +179,7 @@ fn main() {
             parallel,
             no_cache,
             debug,
+            profile,
             no_prefetch,
             airport,
         }) => commands::run::run(commands::run::RunArgs {
@@ -186,6 +191,7 @@ fn main() {
             parallel,
             no_cache,
             debug,
+            profile,
             no_prefetch,
             airport,
         }),

@@ -23,9 +23,14 @@ use crate::config::{DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SECS};
 /// provider. A reasonable value prevents overwhelming the provider while
 /// maintaining good throughput.
 ///
-/// 256 balances throughput with system stability — tested stable with
-/// all providers and avoids overwhelming the host during heavy scene loads.
-pub const DEFAULT_MAX_CONCURRENT_HTTP: usize = 256;
+/// 1024 provides 4x throughput over the original 256 on fast connections.
+/// Reqwest/hyper has no built-in connection cap — this semaphore is the
+/// sole concurrency limiter for HTTP requests.
+///
+/// Requires the process FD soft limit to be raised at startup (via
+/// `rlimit::Resource::NOFILE`) to avoid EMFILE errors. The CLI's run
+/// command calls `raise_fd_limit()` before opening any connections.
+pub const DEFAULT_MAX_CONCURRENT_HTTP: usize = 1024;
 
 /// Configuration for chunk downloads.
 ///
@@ -58,7 +63,7 @@ pub struct DownloadConfig {
     /// total concurrent requests stay within bounds regardless of how many
     /// tiles are being processed.
     ///
-    /// Default capacity: 256 permits
+    /// Default capacity: 1024 permits
     pub http_semaphore: Arc<Semaphore>,
 }
 

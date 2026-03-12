@@ -23,7 +23,7 @@ use image::{Rgba, RgbaImage};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, warn, Instrument};
 
 /// Tile dimensions
 const TILE_SIZE: u32 = 4096;
@@ -85,62 +85,68 @@ where
         &'a self,
         ctx: &'a mut TaskContext,
     ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
-        Box::pin(async move {
-            // Check for cancellation before starting
-            if ctx.is_cancelled() {
-                return TaskResult::Cancelled;
-            }
-
-            let job_id = ctx.job_id();
-
-            // Get chunks from previous task
-            let chunks: Option<&ChunkResults> = ctx.get_output("DownloadChunks", "chunks");
-            let chunks = match chunks {
-                Some(c) => c.clone(),
-                None => {
-                    return TaskResult::Failed(TaskError::missing_input("chunks"));
+        let span = tracing::debug_span!(target: "profiling", "task_assemble");
+        Box::pin(
+            async move {
+                // Check for cancellation before starting
+                if ctx.is_cancelled() {
+                    return TaskResult::Cancelled;
                 }
-            };
 
-            debug!(
-                job_id = %job_id,
-                success_count = chunks.success_count(),
-                failure_count = chunks.failure_count(),
-                "Starting image assembly"
-            );
+                let job_id = ctx.job_id();
 
-            // Move the CPU-intensive work to a blocking task via the executor
-            let image_result = self
-                .executor
-                .execute_blocking(move || assemble_chunks(chunks))
-                .await;
+                // Get chunks from previous task
+                let chunks: Option<&ChunkResults> = ctx.get_output("DownloadChunks", "chunks");
+                let chunks = match chunks {
+                    Some(c) => c.clone(),
+                    None => {
+                        return TaskResult::Failed(TaskError::missing_input("chunks"));
+                    }
+                };
 
-            // Check for cancellation after assembly
-            if ctx.is_cancelled() {
-                return TaskResult::Cancelled;
-            }
+                debug!(
+                    job_id = %job_id,
+                    success_count = chunks.success_count(),
+                    failure_count = chunks.failure_count(),
+                    "Starting image assembly"
+                );
 
-            match image_result {
-                Ok(Ok(image)) => {
-                    debug!(
-                        job_id = %job_id,
-                        width = image.width(),
-                        height = image.height(),
-                        "Image assembly complete"
-                    );
+                // Move the CPU-intensive work to a blocking task via the executor
+                let image_result = self
+                    .executor
+                    .execute_blocking(move || assemble_chunks(chunks))
+                    .await;
 
-                    // Store image in task output for next task
-                    let mut output = TaskOutput::new();
-                    output.set("image", image);
-
-                    TaskResult::SuccessWithOutput(output)
+                // Check for cancellation after assembly
+                if ctx.is_cancelled() {
+                    return TaskResult::Cancelled;
                 }
-                Ok(Err(e)) => TaskResult::Failed(TaskError::new(format!("Assembly failed: {}", e))),
-                Err(e) => {
-                    TaskResult::Failed(TaskError::new(format!("Assembly task failed: {}", e)))
+
+                match image_result {
+                    Ok(Ok(image)) => {
+                        debug!(
+                            job_id = %job_id,
+                            width = image.width(),
+                            height = image.height(),
+                            "Image assembly complete"
+                        );
+
+                        // Store image in task output for next task
+                        let mut output = TaskOutput::new();
+                        output.set("image", image);
+
+                        TaskResult::SuccessWithOutput(output)
+                    }
+                    Ok(Err(e)) => {
+                        TaskResult::Failed(TaskError::new(format!("Assembly failed: {}", e)))
+                    }
+                    Err(e) => {
+                        TaskResult::Failed(TaskError::new(format!("Assembly task failed: {}", e)))
+                    }
                 }
             }
-        })
+            .instrument(span),
+        )
     }
 }
 

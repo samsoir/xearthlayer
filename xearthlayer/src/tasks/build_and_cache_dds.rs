@@ -28,6 +28,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
+use tracing::Instrument;
 use tracing::{debug, info, warn};
 
 /// Tile dimensions
@@ -118,147 +119,160 @@ where
         &'a self,
         ctx: &'a mut TaskContext,
     ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
-        Box::pin(async move {
-            // Check for cancellation before starting
-            if ctx.is_cancelled() {
-                return TaskResult::Cancelled;
-            }
-
-            let job_id = ctx.job_id();
-            let metrics = ctx.metrics_clone();
-
-            // Step 1: Get chunks from previous task (returns owned clone)
-            let chunks: ChunkResults = match ctx.get_output("DownloadChunks", "chunks") {
-                Some(c) => c,
-                None => {
-                    return TaskResult::Failed(TaskError::missing_input("chunks"));
+        let span = tracing::debug_span!(
+            target: "profiling",
+            "build_and_cache_dds",
+            tile_row = self.tile.row,
+            tile_col = self.tile.col,
+            tile_zoom = self.tile.zoom,
+        );
+        Box::pin(
+            async move {
+                // Check for cancellation before starting
+                if ctx.is_cancelled() {
+                    return TaskResult::Cancelled;
                 }
-            };
 
-            debug!(
-                job_id = %job_id,
-                tile = ?self.tile,
-                success_count = chunks.success_count(),
-                failure_count = chunks.failure_count(),
-                "Starting image assembly"
-            );
+                let job_id = ctx.job_id();
+                let metrics = ctx.metrics_clone();
 
-            // Step 2: Assemble image (CPU-bound)
-            let assembly_start = Instant::now();
-
-            let image_result = self
-                .executor
-                .execute_blocking(move || assemble_chunks(chunks))
-                .await;
-
-            if ctx.is_cancelled() {
-                return TaskResult::Cancelled;
-            }
-
-            let image = match image_result {
-                Ok(Ok(img)) => {
-                    let duration_us = assembly_start.elapsed().as_micros() as u64;
-                    metrics.assembly_completed(duration_us);
-                    img
-                }
-                Ok(Err(e)) => {
-                    return TaskResult::Failed(TaskError::new(format!("Assembly failed: {}", e)));
-                }
-                Err(e) => {
-                    return TaskResult::Failed(TaskError::new(format!(
-                        "Assembly task failed: {}",
-                        e
-                    )));
-                }
-            };
-
-            debug!(
-                job_id = %job_id,
-                tile = ?self.tile,
-                width = image.width(),
-                height = image.height(),
-                "Image assembly complete, starting DDS encoding"
-            );
-
-            // Step 3: Encode to DDS (CPU-bound)
-            metrics.encode_started();
-            let encode_start = Instant::now();
-
-            let encoder = Arc::clone(&self.encoder);
-            let encode_result = self
-                .executor
-                .execute_blocking(move || encoder.encode(&image))
-                .await;
-
-            if ctx.is_cancelled() {
-                return TaskResult::Cancelled;
-            }
-
-            let dds_data = match encode_result {
-                Ok(Ok(data)) => {
-                    let duration_us = encode_start.elapsed().as_micros() as u64;
-                    let bytes = data.len() as u64;
-                    metrics.encode_completed(bytes, duration_us);
-                    data
-                }
-                Ok(Err(e)) => {
-                    return TaskResult::Failed(TaskError::new(format!(
-                        "Encoding failed: {}",
-                        e.message
-                    )));
-                }
-                Err(e) => {
-                    return TaskResult::Failed(TaskError::new(format!(
-                        "Encode task failed: {}",
-                        e
-                    )));
-                }
-            };
-
-            let dds_size = dds_data.len();
-
-            debug!(
-                job_id = %job_id,
-                tile = ?self.tile,
-                size_bytes = dds_size,
-                "DDS encoding complete, spawning cache write"
-            );
-
-            // Step 4: Spawn fire-and-forget cache write
-            // This avoids blocking the job completion on cache write,
-            // and avoids race conditions with eventual consistency caches.
-            let cache = Arc::clone(&self.memory_cache);
-            let tile = self.tile;
-            let dds_data_for_cache = dds_data.clone();
-            let metrics_for_cache = metrics.clone();
-            tokio::spawn(async move {
-                cache
-                    .put(tile.row, tile.col, tile.zoom, dds_data_for_cache)
-                    .await;
-
-                // Emit updated cache size to metrics
-                let total_cache_size = cache.size_bytes();
-                metrics_for_cache.memory_cache_size(total_cache_size as u64);
+                // Step 1: Get chunks from previous task (returns owned clone)
+                let chunks: ChunkResults = match ctx.get_output("DownloadChunks", "chunks") {
+                    Some(c) => c,
+                    None => {
+                        return TaskResult::Failed(TaskError::missing_input("chunks"));
+                    }
+                };
 
                 debug!(
-                    tile = ?tile,
-                    cache_size_bytes = total_cache_size,
-                    "Cache write complete (async)"
+                    job_id = %job_id,
+                    tile = ?self.tile,
+                    success_count = chunks.success_count(),
+                    failure_count = chunks.failure_count(),
+                    "Starting image assembly"
                 );
-            });
 
-            info!(
-                job_id = %job_id,
-                tile = ?self.tile,
-                size_bytes = dds_size,
-                "DDS tile complete"
-            );
+                // Step 2: Assemble image (CPU-bound)
+                let assembly_start = Instant::now();
 
-            // Return DDS data directly to avoid cache read race conditions
-            let mut output = TaskOutput::new();
-            output.set("dds_data", dds_data);
-            TaskResult::SuccessWithOutput(output)
-        })
+                let image_result = self
+                    .executor
+                    .execute_blocking(move || assemble_chunks(chunks))
+                    .await;
+
+                if ctx.is_cancelled() {
+                    return TaskResult::Cancelled;
+                }
+
+                let image = match image_result {
+                    Ok(Ok(img)) => {
+                        let duration_us = assembly_start.elapsed().as_micros() as u64;
+                        metrics.assembly_completed(duration_us);
+                        img
+                    }
+                    Ok(Err(e)) => {
+                        return TaskResult::Failed(TaskError::new(format!(
+                            "Assembly failed: {}",
+                            e
+                        )));
+                    }
+                    Err(e) => {
+                        return TaskResult::Failed(TaskError::new(format!(
+                            "Assembly task failed: {}",
+                            e
+                        )));
+                    }
+                };
+
+                debug!(
+                    job_id = %job_id,
+                    tile = ?self.tile,
+                    width = image.width(),
+                    height = image.height(),
+                    "Image assembly complete, starting DDS encoding"
+                );
+
+                // Step 3: Encode to DDS (CPU-bound)
+                metrics.encode_started();
+                let encode_start = Instant::now();
+
+                let encoder = Arc::clone(&self.encoder);
+                let encode_result = self
+                    .executor
+                    .execute_blocking(move || encoder.encode(&image))
+                    .await;
+
+                if ctx.is_cancelled() {
+                    return TaskResult::Cancelled;
+                }
+
+                let dds_data = match encode_result {
+                    Ok(Ok(data)) => {
+                        let duration_us = encode_start.elapsed().as_micros() as u64;
+                        let bytes = data.len() as u64;
+                        metrics.encode_completed(bytes, duration_us);
+                        data
+                    }
+                    Ok(Err(e)) => {
+                        return TaskResult::Failed(TaskError::new(format!(
+                            "Encoding failed: {}",
+                            e.message
+                        )));
+                    }
+                    Err(e) => {
+                        return TaskResult::Failed(TaskError::new(format!(
+                            "Encode task failed: {}",
+                            e
+                        )));
+                    }
+                };
+
+                let dds_size = dds_data.len();
+
+                debug!(
+                    job_id = %job_id,
+                    tile = ?self.tile,
+                    size_bytes = dds_size,
+                    "DDS encoding complete, spawning cache write"
+                );
+
+                // Step 4: Spawn fire-and-forget cache write
+                // This avoids blocking the job completion on cache write,
+                // and avoids race conditions with eventual consistency caches.
+                let cache = Arc::clone(&self.memory_cache);
+                let tile = self.tile;
+                let dds_data_for_cache = dds_data.clone();
+                let metrics_for_cache = metrics.clone();
+                tokio::spawn(async move {
+                    cache
+                        .put(tile.row, tile.col, tile.zoom, dds_data_for_cache)
+                        .await;
+
+                    // Emit updated cache size to metrics
+                    let total_cache_size = cache.size_bytes();
+                    metrics_for_cache.memory_cache_size(total_cache_size as u64);
+
+                    debug!(
+                        tile = ?tile,
+                        cache_size_bytes = total_cache_size,
+                        "Cache write complete (async)"
+                    );
+                });
+
+                info!(
+                    job_id = %job_id,
+                    tile = ?self.tile,
+                    size_bytes = dds_size,
+                    "DDS tile complete"
+                );
+
+                // Return DDS data directly to avoid cache read race conditions
+                let mut output = TaskOutput::new();
+                output.set("dds_data", dds_data);
+                TaskResult::SuccessWithOutput(output)
+            }
+            .instrument(span),
+        )
     }
 }
 

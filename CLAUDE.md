@@ -45,7 +45,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 4. **DDS Compression** (`xearthlayer/src/dds/`)
    - BC1/BC3 (DXT1/DXT5) compression
    - 5-level mipmap chain generation
-   - ~0.2s encoding for 4096×4096 tiles
+   - `BlockCompressor` trait for swappable backends:
+     - `SoftwareCompressor` — Pure-Rust fallback
+     - `IspcCompressor` — SIMD-optimized via Intel ISPC (default)
+     - `GpuEncoderChannel` — Channel-based GPU encoding (optional `gpu-encode` feature)
+   - GPU encoding architecture: `mpsc` channel → dedicated worker task → `WgpuCompressor`
+   - `WgpuCompressor` wraps `block_compression` crate (ISPC kernels ported to WGSL compute shaders)
+   - Channel eliminates Mutex contention; worker can be evolved to batch multiple tiles per GPU pass
 
 5. **Cache System** (`xearthlayer/src/cache/`, `xearthlayer/src/service/cache_layer.rs`)
    - `CacheLayer` - Service-owned cache lifecycle (encapsulates memory + disk)
@@ -101,15 +107,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 11. **Predictive Tile Caching** (`xearthlayer/src/prefetch/`)
     - `AdaptivePrefetchCoordinator` - Self-calibrating prefetch with flight phase detection
     - `GroundStrategy` - Ring-based prefetching for ground operations (GS < 40kt)
-    - `CruiseStrategy` - Track-based band prefetching for cruise (band ahead of aircraft)
+    - `SceneryWindow` - Three-window model (XP Window, XEL Window, Retained) with dual boundary monitors
+    - `BoundaryMonitor` - Position-based DSF boundary edge detection (row and column axes)
+    - `BoundaryStrategy` - Converts boundary crossings to target DSF region lists for prefetch
     - `PhaseDetector` - Ground/Cruise flight phase state machine
     - `PerformanceCalibrator` - Measures throughput during initial load for mode selection
     - `TelemetryListener` - Receives X-Plane/ForeFlight UDP telemetry (position, heading, speed)
     - `FuseLoadMonitor` trait - Abstraction for FUSE request tracking (ISP)
     - `CircuitBreaker` - Pauses prefetch during X-Plane scene loading
+    - `TransitionThrottle` - Grace period + ramp-up after Ground-to-Cruise transition
     - Submits jobs to shared job executor daemon via `DdsClient` trait
     - Mode selection: Aggressive (>30 tiles/sec), Opportunistic (10-30), or Disabled
     - **Four-tier filtering**: Local tracking → Memory cache → Patched region exclusion (via `GeoIndex`) → Disk existence (via `OrthoUnionIndex`)
+    - **Two-phase region commit**: Regions marked `InProgress` in GeoIndex during prefetch, promoted to `Prefetched` on completion
     - See `docs/dev/adaptive-prefetch-design.md` for design details
 
 12. **Aircraft Position & Telemetry** (`xearthlayer/src/aircraft_position/`)
@@ -133,14 +143,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `dds_tile_exists(row, col, zoom)` - Checks if DDS tile exists on disk (used by prefetch)
     - `resolve_lazy_filtered(path, predicate)` - Source-filtered lazy resolution (used by FUSE with GeoIndex)
 
-13. **GeoIndex** (`xearthlayer/src/geo_index/`)
+14. **GeoIndex** (`xearthlayer/src/geo_index/`)
     - `GeoIndex` - Type-keyed, region-indexed geospatial reference database (thread-safe, ACID)
     - `DsfRegion` - 1°×1° DSF region coordinate type
     - `GeoLayer` trait - Marker trait for storable layer types (`Clone + Send + Sync + 'static`)
     - `PatchCoverage` - Layer type indicating a region is owned by a scenery patch
+    - `RetainedRegion` - Layer type tracking regions in the SceneryWindow's retained set
+    - `PrefetchedRegion` - Layer type tracking prefetch state per region (InProgress, Prefetched, NoCoverage)
     - Locking: `RwLock<HashMap<TypeId, DashMap>>` — rare write locks, concurrent reads via DashMap shards
     - `populate()` provides atomic bulk loading (builds outside lock, swaps in)
-    - Used by FUSE (`is_geo_filtered`), prewarm, and prefetch for patch region exclusion
+    - Used by FUSE (`is_geo_filtered`), prewarm, and prefetch for patch region exclusion and prefetch state tracking
     - See `docs/dev/geo-index-design.md` for design details
 
 ### Module Dependencies
@@ -155,7 +167,7 @@ xearthlayer-cli
             ├─→ runtime (XEarthLayerRuntime orchestrator) ──────────────┤
             │       └─→ executor (ExecutorDaemon, DdsClient)            │
             │               └─→ jobs (DdsGenerateJob, TilePrefetchJob)  │
-            │                       └─→ tasks (Download, Assemble, ...)  │
+            │                       └─→ tasks (DownloadChunks, BuildAndCacheDds) │
             │                                                            │
             ├─→ fuse/fuse3 (async multi-threaded FUSE) ─────────────────┤
             │       ├─→ uses DdsClient for tile requests                │
@@ -197,8 +209,8 @@ All job executor operations are protected by resource pools with semaphore-based
 limiting to prevent resource exhaustion under heavy load. Each resource type has
 tuned concurrency limits:
 
-- **Network pool (download tasks)**: `clamp(ceil(cpu_capacity * 1.5), 8, 48)` — pipeline-balanced with CPU pool
-- **HTTP semaphore (chunk connections)**: 256 shared across all download tasks
+- **Network pool (download tasks)**: `clamp(ceil(cpu_capacity * 1.5), 8, 64)` — pipeline-balanced with CPU pool
+- **HTTP semaphore (chunk connections)**: 1024 shared across all download tasks
 - **CPU-bound work** (assemble + encode): `max(num_cpus * 1.25, num_cpus + 2)` shared limiter
 - **Disk I/O concurrency**: Profile-based, auto-detected from storage type:
   - HDD: `min(num_cpus * 1, 4)` - seek-bound, low concurrency
@@ -222,7 +234,12 @@ xearthlayer                         # Defaults to 'run' (mount all packages)
 xearthlayer setup                   # Interactive setup wizard (first-time configuration)
 xearthlayer init                    # Create config file with defaults
 xearthlayer run                     # Mount all packages and start streaming (primary command)
+xearthlayer run --debug             # Enable debug-level logging for xearthlayer crate
+xearthlayer run --profile           # Enable Chrome Trace profiling (requires --features profiling)
+xearthlayer run --no-prefetch       # Disable prefetch system
+xearthlayer run --airport ICAO      # Pre-warm tiles around airport before starting
 xearthlayer download --lat --lon    # Download single tile
+xearthlayer diagnostics             # Show system info, config, and health status
 xearthlayer cache clear|stats|migrate # Cache management
 
 # Scenery index cache
@@ -277,7 +294,7 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/executor/task.rs` | Task trait and TaskContext, TaskOutput |
 | `xearthlayer/src/jobs/dds_generate.rs` | DdsGenerateJob - tile generation job |
 | `xearthlayer/src/jobs/factory.rs` | DdsJobFactory trait for job creation |
-| `xearthlayer/src/tasks/` | Task implementations (download, assemble, encode, cache) |
+| `xearthlayer/src/tasks/` | Task implementations (DownloadChunks, BuildAndCacheDds; legacy: assemble, encode, cache) |
 | `xearthlayer/src/provider/factory.rs` | Provider factories (sync + async) |
 | `xearthlayer/src/fuse/fuse3/` | Fuse3 async multi-threaded filesystem |
 | `xearthlayer/src/fuse/fuse3/shared.rs` | Shared FUSE traits (FileAttrBuilder, DdsRequestor) |
@@ -291,8 +308,10 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/publisher/` | Package publisher library |
 | `xearthlayer/src/publisher/dedupe/` | Zoom level overlap detection and gap analysis |
 | `xearthlayer/src/prefetch/strategy.rs` | Prefetcher trait (strategy pattern) |
-| `xearthlayer/src/prefetch/adaptive/coordinator.rs` | AdaptivePrefetchCoordinator (self-calibrating prefetch) |
-| `xearthlayer/src/prefetch/adaptive/cruise_strategy.rs` | CruiseStrategy (track-based band prefetch) |
+| `xearthlayer/src/prefetch/adaptive/coordinator/core.rs` | AdaptivePrefetchCoordinator (boundary-driven prefetch) |
+| `xearthlayer/src/prefetch/adaptive/scenery_window.rs` | SceneryWindow (three-window model with boundary monitors) |
+| `xearthlayer/src/prefetch/adaptive/boundary_monitor.rs` | BoundaryMonitor (position-based DSF edge detection) |
+| `xearthlayer/src/prefetch/adaptive/boundary_strategy.rs` | BoundaryStrategy (boundary crossings to DSF region lists) |
 | `xearthlayer/src/prefetch/adaptive/ground_strategy.rs` | GroundStrategy (ring-based for ground ops) |
 | `xearthlayer/src/prefetch/load_monitor.rs` | FuseLoadMonitor trait + SharedFuseLoadMonitor |
 | `xearthlayer/src/prefetch/circuit_breaker.rs` | CircuitBreaker for X-Plane load detection |
@@ -308,8 +327,12 @@ Key sections:
 - `[provider]` - Imagery source (bing/google)
 - `[cache]` - Memory/disk sizes, directory, disk I/O profile (auto/hdd/ssd/nvme)
 - `[generation]` - Thread count, timeout
-- `[texture]` - DDS format (bc1/bc3)
+- `[texture]` - DDS format (bc1/bc3), compressor backend (software/ispc/gpu), GPU device selection
+- `[prefetch]` - Boundary-driven prefetch, circuit breaker, calibration, transition ramp
+- `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
+- `[pipeline]` - HTTP/CPU/prefetch concurrency limits
 - `[online_network]` - VATSIM/IVAO/PilotEdge position (enabled, pilot_id, poll interval)
+- `[fuse]` - FUSE kernel limits (max_background, congestion_threshold)
 
 See `docs/configuration.md` for full reference.
 
@@ -357,7 +380,11 @@ CI will fail if pre-commit checks were not run.
 - `clap` - CLI argument parsing
 - `ini` - Configuration file parsing
 - `tracing` - Structured logging
+- `tracing-chrome` - Chrome Trace profiling (optional, `profiling` feature)
 - `tokio` - Async runtime
+- `rlimit` - File descriptor limit management (raises soft limit at startup)
+- `wgpu` - GPU compute shaders for DDS encoding (optional, `gpu-encode` feature)
+- `block_compression` - BCn GPU compression via WGSL (optional, `gpu-encode` feature)
 
 ## Performance Notes
 

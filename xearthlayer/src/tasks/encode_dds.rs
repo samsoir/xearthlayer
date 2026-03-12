@@ -24,7 +24,7 @@ use image::RgbaImage;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, Instrument};
 
 /// Task that encodes an assembled image to DDS format.
 ///
@@ -93,64 +93,71 @@ where
         &'a self,
         ctx: &'a mut TaskContext,
     ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
-        Box::pin(async move {
-            // Check for cancellation before starting
-            if ctx.is_cancelled() {
-                return TaskResult::Cancelled;
-            }
-
-            let job_id = ctx.job_id();
-
-            // Get image from previous task
-            let image: Option<&RgbaImage> = ctx.get_output("AssembleImage", "image");
-            let image = match image {
-                Some(img) => img.clone(),
-                None => {
-                    return TaskResult::Failed(TaskError::missing_input("image"));
+        let span = tracing::debug_span!(target: "profiling", "task_encode");
+        Box::pin(
+            async move {
+                // Check for cancellation before starting
+                if ctx.is_cancelled() {
+                    return TaskResult::Cancelled;
                 }
-            };
 
-            debug!(
-                job_id = %job_id,
-                tile = ?self.tile,
-                width = image.width(),
-                height = image.height(),
-                "Starting DDS encoding"
-            );
+                let job_id = ctx.job_id();
 
-            // Move the CPU-intensive encoding to a blocking task via the executor
-            let encoder = Arc::clone(&self.encoder);
-            let encode_result = self
-                .executor
-                .execute_blocking(move || encoder.encode(&image))
-                .await;
+                // Get image from previous task
+                let image: Option<&RgbaImage> = ctx.get_output("AssembleImage", "image");
+                let image = match image {
+                    Some(img) => img.clone(),
+                    None => {
+                        return TaskResult::Failed(TaskError::missing_input("image"));
+                    }
+                };
 
-            // Check for cancellation after encoding
-            if ctx.is_cancelled() {
-                return TaskResult::Cancelled;
-            }
+                debug!(
+                    job_id = %job_id,
+                    tile = ?self.tile,
+                    width = image.width(),
+                    height = image.height(),
+                    "Starting DDS encoding"
+                );
 
-            match encode_result {
-                Ok(Ok(dds_data)) => {
-                    debug!(
-                        job_id = %job_id,
-                        tile = ?self.tile,
-                        size_bytes = dds_data.len(),
-                        "DDS encoding complete"
-                    );
+                // Move the CPU-intensive encoding to a blocking task via the executor
+                let encoder = Arc::clone(&self.encoder);
+                let encode_result = self
+                    .executor
+                    .execute_blocking(move || encoder.encode(&image))
+                    .await;
 
-                    // Store DDS data in task output for next task
-                    let mut output = TaskOutput::new();
-                    output.set("dds_data", dds_data);
-
-                    TaskResult::SuccessWithOutput(output)
+                // Check for cancellation after encoding
+                if ctx.is_cancelled() {
+                    return TaskResult::Cancelled;
                 }
-                Ok(Err(e)) => {
-                    TaskResult::Failed(TaskError::new(format!("Encoding failed: {}", e.message)))
+
+                match encode_result {
+                    Ok(Ok(dds_data)) => {
+                        debug!(
+                            job_id = %job_id,
+                            tile = ?self.tile,
+                            size_bytes = dds_data.len(),
+                            "DDS encoding complete"
+                        );
+
+                        // Store DDS data in task output for next task
+                        let mut output = TaskOutput::new();
+                        output.set("dds_data", dds_data);
+
+                        TaskResult::SuccessWithOutput(output)
+                    }
+                    Ok(Err(e)) => TaskResult::Failed(TaskError::new(format!(
+                        "Encoding failed: {}",
+                        e.message
+                    ))),
+                    Err(e) => {
+                        TaskResult::Failed(TaskError::new(format!("Encode task failed: {}", e)))
+                    }
                 }
-                Err(e) => TaskResult::Failed(TaskError::new(format!("Encode task failed: {}", e))),
             }
-        })
+            .instrument(span),
+        )
     }
 }
 

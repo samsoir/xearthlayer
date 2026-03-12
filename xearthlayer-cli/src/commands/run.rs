@@ -33,6 +33,7 @@ pub struct RunArgs {
     pub parallel: Option<usize>,
     pub no_cache: bool,
     pub debug: bool,
+    pub profile: bool,
     pub no_prefetch: bool,
     pub airport: Option<String>,
 }
@@ -57,8 +58,15 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         }
     }
 
-    let runner = CliRunner::with_debug(args.debug)?;
+    let runner = CliRunner::with_options(args.debug, args.profile)?;
     runner.log_startup("run");
+
+    // Raise file descriptor limit to the hard maximum. XEL's FUSE mount +
+    // HTTP connections + disk cache can exceed the default soft limit (often
+    // 1024) inherited from the desktop environment. Safe to call at any time;
+    // takes effect immediately for all subsequent open() calls.
+    raise_fd_limit();
+
     let config = runner.config();
 
     // Check for config upgrade needs
@@ -137,7 +145,11 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     let parallel_downloads = args.parallel.unwrap_or(32);
 
     // Build configurations
-    let texture_config = TextureConfig::new(format).with_mipmap_count(5);
+    let texture_config = TextureConfig::new(format)
+        .with_mipmap_count(5)
+        .with_compressor(config.texture.compressor.clone())
+        .with_gpu_device(config.texture.gpu_device.clone());
+    let dds_format = texture_config.format();
 
     let download_config = DownloadConfig::new()
         .with_timeout_secs(timeout_secs)
@@ -167,7 +179,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         println!();
         println!("Packages:       {}", install_location.display());
         println!("Custom Scenery: {}", custom_scenery_path.display());
-        println!("DDS Format:     {:?}", texture_config.format());
+        println!("DDS Format:     {:?}", dds_format);
         println!("Provider:       {}", provider_config.name());
         println!("FUSE Backend:   fuse3 (async multi-threaded)");
         println!();
@@ -337,6 +349,35 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     println!("All packages unmounted. Goodbye!");
 
     Ok(())
+}
+
+/// Raise the file descriptor soft limit to the hard maximum.
+///
+/// Linux processes inherit a soft FD limit (often 1024) that can be lower
+/// than the hard limit. XEL needs many FDs simultaneously: HTTP connections
+/// to the imagery CDN, disk cache file handles, and FUSE file descriptors
+/// for X-Plane's open textures. This raises the soft limit to the hard
+/// limit (no root required), matching what the system administrator allows.
+fn raise_fd_limit() {
+    match rlimit::Resource::NOFILE.get() {
+        Ok((soft, hard)) if soft < hard => {
+            if let Err(e) = rlimit::Resource::NOFILE.set(hard, hard) {
+                tracing::warn!(soft, hard, error = %e, "Failed to raise FD limit");
+            } else {
+                tracing::info!(
+                    old_soft = soft,
+                    new_soft = hard,
+                    "Raised file descriptor limit"
+                );
+            }
+        }
+        Ok((soft, _)) => {
+            tracing::debug!(soft, "FD limit already at maximum");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to query FD limit");
+        }
+    }
 }
 
 /// Display warning if configuration file needs upgrade.

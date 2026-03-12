@@ -166,6 +166,27 @@ impl GeoIndex {
         }
     }
 
+    /// Iterate over all entries in a layer.
+    ///
+    /// Returns `(DsfRegion, T)` pairs for all entries in the specified layer.
+    /// Returns an empty vec if the layer doesn't exist.
+    pub fn iter<T: GeoLayer>(&self) -> Vec<(DsfRegion, T)> {
+        let layers = self.layers.read().expect("GeoIndex lock poisoned");
+        match layers.get(&TypeId::of::<T>()) {
+            Some(boxed) => {
+                let store = boxed
+                    .downcast_ref::<LayerStore<T>>()
+                    .expect("type mismatch");
+                store
+                    .data
+                    .iter()
+                    .map(|entry| (*entry.key(), entry.value().clone()))
+                    .collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// Get all regions in a layer (copied).
     ///
     /// Returns an empty vec if the layer doesn't exist.
@@ -593,5 +614,62 @@ mod tests {
             index.get::<PatchCoverage>(&region).unwrap().patch_name,
             "New"
         );
+    }
+
+    // =========================================================================
+    // Iter
+    // =========================================================================
+
+    #[test]
+    fn test_iter_returns_all_entries() {
+        let index = GeoIndex::new();
+
+        index.insert::<PatchCoverage>(
+            DsfRegion::new(43, 6),
+            PatchCoverage {
+                patch_name: "A".to_string(),
+            },
+        );
+        index.insert::<PatchCoverage>(
+            DsfRegion::new(44, 7),
+            PatchCoverage {
+                patch_name: "B".to_string(),
+            },
+        );
+
+        let entries = index.iter::<PatchCoverage>();
+        assert_eq!(entries.len(), 2);
+
+        let mut names: Vec<String> = entries
+            .iter()
+            .map(|(_, pc)| pc.patch_name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn test_iter_empty_layer() {
+        let index = GeoIndex::new();
+        let entries = index.iter::<PatchCoverage>();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_iter_returns_regions_and_values() {
+        let index = GeoIndex::new();
+        let region = DsfRegion::new(50, 9);
+
+        index.insert::<PatchCoverage>(
+            region,
+            PatchCoverage {
+                patch_name: "Test".to_string(),
+            },
+        );
+
+        let entries = index.iter::<PatchCoverage>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, region);
+        assert_eq!(entries[0].1.patch_name, "Test");
     }
 }

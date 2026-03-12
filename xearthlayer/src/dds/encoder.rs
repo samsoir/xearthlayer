@@ -1,28 +1,52 @@
 //! DDS encoder - main API for encoding images to DDS format.
+//!
+//! The encoder delegates block compression to a [`BlockCompressor`] backend,
+//! handling mipmap generation and DDS header assembly itself. This separation
+//! allows swapping compression backends (ISPC SIMD, GPU compute, pure Rust)
+//! without changing the encoding pipeline.
 
-use crate::dds::bc1::Bc1Encoder;
-use crate::dds::bc3::Bc3Encoder;
+use crate::dds::compressor::{default_compressor, BlockCompressor};
 use crate::dds::mipmap::MipmapGenerator;
 use crate::dds::types::{DdsError, DdsFormat, DdsHeader};
 use image::RgbaImage;
+use std::sync::Arc;
 
 /// DDS encoder configuration.
 pub struct DdsEncoder {
     format: DdsFormat,
     generate_mipmaps: bool,
     mipmap_count: Option<usize>,
+    compressor: Arc<dyn BlockCompressor>,
 }
 
 impl DdsEncoder {
     /// Create a new DDS encoder with the specified format.
     ///
+    /// Uses the default ISPC SIMD compressor for block compression.
     /// By default, generates full mipmap chain down to 1×1.
     pub fn new(format: DdsFormat) -> Self {
         Self {
             format,
             generate_mipmaps: true,
             mipmap_count: None,
+            compressor: default_compressor(),
         }
+    }
+
+    /// Use a specific block compressor backend.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use xearthlayer::dds::{DdsEncoder, DdsFormat, SoftwareCompressor};
+    /// use std::sync::Arc;
+    ///
+    /// let encoder = DdsEncoder::new(DdsFormat::BC1)
+    ///     .with_compressor(Arc::new(SoftwareCompressor));
+    /// ```
+    pub fn with_compressor(mut self, compressor: Arc<dyn BlockCompressor>) -> Self {
+        self.compressor = compressor;
+        self
     }
 
     /// Disable mipmap generation.
@@ -104,66 +128,9 @@ impl DdsEncoder {
         Ok(output)
     }
 
-    /// Compress a single image to BC1/BC3 format.
+    /// Compress a single image to BC1/BC3 format using the configured compressor.
     fn compress_image(&self, image: &RgbaImage) -> Result<Vec<u8>, DdsError> {
-        let width = image.width();
-        let height = image.height();
-
-        // Calculate block dimensions (round up to multiple of 4)
-        let blocks_wide = width.div_ceil(4);
-        let blocks_high = height.div_ceil(4);
-
-        let block_size = match self.format {
-            DdsFormat::BC1 => 8,
-            DdsFormat::BC3 => 16,
-        };
-
-        let mut output = Vec::with_capacity((blocks_wide * blocks_high * block_size) as usize);
-
-        // Process each 4×4 block
-        for block_y in 0..blocks_high {
-            for block_x in 0..blocks_wide {
-                let block = self.extract_block(image, block_x, block_y);
-                let compressed = match self.format {
-                    DdsFormat::BC1 => {
-                        let bc1 = Bc1Encoder::compress_block(&block);
-                        bc1.to_vec()
-                    }
-                    DdsFormat::BC3 => {
-                        let bc3 = Bc3Encoder::compress_block(&block);
-                        bc3.to_vec()
-                    }
-                };
-                output.extend_from_slice(&compressed);
-            }
-        }
-
-        Ok(output)
-    }
-
-    /// Extract a 4×4 pixel block from the image.
-    ///
-    /// Pads with black pixels if block extends beyond image bounds.
-    fn extract_block(&self, image: &RgbaImage, block_x: u32, block_y: u32) -> [[u8; 4]; 16] {
-        let mut block = [[0u8; 4]; 16];
-
-        for y in 0..4 {
-            for x in 0..4 {
-                let pixel_x = block_x * 4 + x;
-                let pixel_y = block_y * 4 + y;
-
-                let pixel = if pixel_x < image.width() && pixel_y < image.height() {
-                    let p = image.get_pixel(pixel_x, pixel_y);
-                    [p[0], p[1], p[2], p[3]]
-                } else {
-                    [0, 0, 0, 0] // Pad with transparent black
-                };
-
-                block[(y * 4 + x) as usize] = pixel;
-            }
-        }
-
-        block
+        self.compressor.compress(image, self.format)
     }
 }
 
@@ -282,53 +249,38 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_block_full() {
-        let mut image = RgbaImage::new(4, 4);
-        // Fill with distinct colors
-        for y in 0..4 {
-            for x in 0..4 {
-                image.put_pixel(
-                    x,
-                    y,
-                    image::Rgba([(x * 64) as u8, (y * 64) as u8, 128, 255]),
-                );
-            }
-        }
+    fn test_compress_with_software_compressor() {
+        use crate::dds::SoftwareCompressor;
+        use std::sync::Arc;
 
-        let encoder = DdsEncoder::new(DdsFormat::BC1);
-        let block = encoder.extract_block(&image, 0, 0);
+        let image = RgbaImage::new(256, 256);
+        let encoder = DdsEncoder::new(DdsFormat::BC1)
+            .without_mipmaps()
+            .with_compressor(Arc::new(SoftwareCompressor));
 
-        // Verify pixels match
-        assert_eq!(block[0], [0, 0, 128, 255]); // (0,0)
-        assert_eq!(block[1], [64, 0, 128, 255]); // (1,0)
-        assert_eq!(block[4], [0, 64, 128, 255]); // (0,1)
-        assert_eq!(block[15], [192, 192, 128, 255]); // (3,3)
+        let result = encoder.encode(&image);
+        assert!(result.is_ok());
+
+        let dds = result.unwrap();
+        // Header (128) + 64×64 blocks × 8 bytes = 32896
+        assert_eq!(dds.len(), 128 + 32768);
     }
 
     #[test]
-    fn test_extract_block_partial() {
-        // Image smaller than 4×4
-        let mut image = RgbaImage::new(3, 3);
-        for y in 0..3 {
-            for x in 0..3 {
-                image.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
-            }
-        }
+    fn test_compress_with_ispc_compressor() {
+        use crate::dds::IspcCompressor;
+        use std::sync::Arc;
 
-        let encoder = DdsEncoder::new(DdsFormat::BC1);
-        let block = encoder.extract_block(&image, 0, 0);
+        let image = RgbaImage::new(256, 256);
+        let encoder = DdsEncoder::new(DdsFormat::BC1)
+            .without_mipmaps()
+            .with_compressor(Arc::new(IspcCompressor));
 
-        // First 3×3 should be white
-        for y in 0..3 {
-            for x in 0..3 {
-                assert_eq!(block[(y * 4 + x) as usize], [255, 255, 255, 255]);
-            }
-        }
+        let result = encoder.encode(&image);
+        assert!(result.is_ok());
 
-        // Padding pixels should be black
-        assert_eq!(block[3], [0, 0, 0, 0]); // (3,0) - out of bounds
-        assert_eq!(block[12], [0, 0, 0, 0]); // (0,3) - out of bounds
-        assert_eq!(block[15], [0, 0, 0, 0]); // (3,3) - out of bounds
+        let dds = result.unwrap();
+        assert_eq!(dds.len(), 128 + 32768);
     }
 
     #[test]

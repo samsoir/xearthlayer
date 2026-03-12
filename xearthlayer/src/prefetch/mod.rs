@@ -16,7 +16,7 @@
 //!                                    AdaptivePrefetchCoordinator
 //!                                      ├─ PhaseDetector (ground/cruise)
 //!                                      ├─ GroundStrategy (ring prefetch)
-//!                                      ├─ CruiseStrategy (band prefetch)
+//!                                      ├─ BoundaryStrategy (DSF region prefetch)
 //!                                      └─ CircuitBreaker (load detection)
 //!                                              ↓
 //!                                       DdsClient → Executor

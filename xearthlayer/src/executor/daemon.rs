@@ -68,7 +68,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Instrument};
 
 // =============================================================================
 // Configuration
@@ -457,7 +457,11 @@ where
             executor.run(executor_shutdown).await;
         });
 
-        // Main request loop
+        // Main request loop — requests are processed inline (cache check +
+        // coalescer + job submission are all <10µs). Long-running work (waiting
+        // for job completion) is already spawned inside handle_request. This
+        // keeps the executor pipeline fed without deferring job submission to
+        // the Tokio scheduler, which can starve the pipeline under load.
         loop {
             tokio::select! {
                 biased;
@@ -476,7 +480,7 @@ where
                         &factory,
                         &memory_cache,
                         &coalescer,
-                        metrics_client.as_ref(),
+                        &metrics_client,
                     ).await;
                 }
             }
@@ -493,7 +497,7 @@ where
         factory: &Arc<F>,
         memory_cache: &Arc<M>,
         coalescer: &Arc<DaemonCoalescer>,
-        metrics_client: Option<&MetricsClient>,
+        metrics_client: &Option<MetricsClient>,
     ) {
         let start = Instant::now();
         let tile = request.tile;
@@ -526,7 +530,11 @@ where
         }
 
         // Fast path: check memory cache first
-        if let Some(data) = memory_cache.get(tile.row, tile.col, tile.zoom).await {
+        let cache_result = memory_cache
+            .get(tile.row, tile.col, tile.zoom)
+            .instrument(tracing::trace_span!(target: "profiling", "cache_check"))
+            .await;
+        if let Some(data) = cache_result {
             let duration = start.elapsed();
             debug!(
                 tile_row = tile.row,
@@ -542,7 +550,7 @@ where
 
             // Track cache hit
             if let Some(client) = metrics_client {
-                client.memory_cache_hit();
+                client.memory_cache_hit(origin.is_fuse());
             }
 
             if let Some(tx) = request.response_tx {
@@ -599,7 +607,7 @@ where
             "Cache miss - submitting job"
         );
         if let Some(client) = metrics_client {
-            client.memory_cache_miss();
+            client.memory_cache_miss(origin.is_fuse());
         }
 
         // Create and submit job
@@ -607,7 +615,10 @@ where
         let job_id = job.id();
         debug!(job_id = %job_id, tile = ?tile, "Created DDS generation job");
 
-        let handle = submitter.try_submit_boxed(job);
+        let handle = {
+            let _span = tracing::trace_span!(target: "profiling", "job_submit").entered();
+            submitter.try_submit_boxed(job)
+        };
 
         match handle {
             Some(mut handle) => {
@@ -622,7 +633,7 @@ where
                 let memory_cache = Arc::clone(memory_cache);
                 let coalescer = Arc::clone(coalescer);
                 let cancellation = request.cancellation.clone();
-                let metrics_for_completion = metrics_client.cloned();
+                let metrics_for_completion = metrics_client.clone();
                 let dsf_tile_for_log = dsf_tile.clone();
 
                 tokio::spawn(async move {

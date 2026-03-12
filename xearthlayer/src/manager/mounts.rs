@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 
 use crate::cache::adapters::{DiskCacheBridge, MemoryCacheBridge};
 use crate::cache::MemoryCache;
+use crate::config::defaults::{DEFAULT_FUSE_CONGESTION_THRESHOLD, DEFAULT_FUSE_MAX_BACKGROUND};
 use crate::config::DiskIoProfile;
 use crate::executor::{MemoryCacheAdapter, StorageConcurrencyLimiter};
 use crate::fuse::fuse3::Fuse3OrthoUnionFS;
@@ -168,6 +169,10 @@ pub struct MountManager {
     /// Geospatial reference index for region-level ownership queries.
     /// Populated with PatchCoverage data when mounting consolidated ortho.
     geo_index: Option<Arc<GeoIndex>>,
+    /// Maximum pending background FUSE requests (kernel limit).
+    fuse_max_background: u16,
+    /// Congestion threshold for background FUSE requests (kernel limit).
+    fuse_congestion_threshold: u16,
 }
 
 impl MountManager {
@@ -189,6 +194,8 @@ impl MountManager {
             scene_tracker_rx: None,
             ortho_union_index: None,
             geo_index: None,
+            fuse_max_background: DEFAULT_FUSE_MAX_BACKGROUND,
+            fuse_congestion_threshold: DEFAULT_FUSE_CONGESTION_THRESHOLD,
         }
     }
 
@@ -197,23 +204,19 @@ impl MountManager {
     /// When a scenery path is set, packages from `install_location` are mounted
     /// as directories in the scenery path (e.g., Custom Scenery).
     pub fn with_scenery_path(scenery_path: &std::path::Path) -> Self {
-        Self {
-            sessions: HashMap::new(),
-            services: HashMap::new(),
-            mounts: HashMap::new(),
-            scenery_path: Some(scenery_path.to_path_buf()),
-            scene_tracker: Arc::new(DefaultSceneTracker::with_defaults()),
-            patches_session: None,
-            patches_mount: None,
-            patches_service: None,
-            consolidated_session: None,
-            consolidated_mount: None,
-            consolidated_service: None,
-            dds_access_rx: None,
-            scene_tracker_rx: None,
-            ortho_union_index: None,
-            geo_index: None,
-        }
+        let mut manager = Self::new();
+        manager.scenery_path = Some(scenery_path.to_path_buf());
+        manager
+    }
+
+    /// Set the FUSE kernel background request limits.
+    ///
+    /// These control how many concurrent background requests the Linux kernel
+    /// allows before throttling FUSE operations. Higher values prevent X-Plane
+    /// sim freezes at DSF boundaries.
+    pub fn set_fuse_limits(&mut self, max_background: u16, congestion_threshold: u16) {
+        self.fuse_max_background = max_background;
+        self.fuse_congestion_threshold = congestion_threshold;
     }
 
     /// Get the number of active mounts.
@@ -489,11 +492,13 @@ impl MountManager {
 
         // Create and mount the consolidated ortho union filesystem with DDS access channel
         // Wire Scene Tracker channel for empirical scenery tracking
+        // Wire FUSE kernel limits for concurrent background request control
         let mut ortho_union_fs =
             Fuse3OrthoUnionFS::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
                 .with_geo_index(Arc::clone(&geo_index))
                 .with_dds_access_channel(dds_access_tx)
-                .with_scene_tracker_channel(scene_tracker_tx);
+                .with_scene_tracker_channel(scene_tracker_tx)
+                .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold);
 
         // Wire metrics client for coalesced request tracking
         if let Some(metrics) = service.metrics_client() {
@@ -750,6 +755,7 @@ impl MountManager {
             memory_cache_hits: 0,
             memory_cache_misses: 0,
             memory_cache_hit_rate: 0.0,
+            fuse_memory_cache_hit_rate: 0.0,
             memory_cache_size_bytes: 0,
             disk_cache_hits: 0,
             disk_cache_misses: 0,

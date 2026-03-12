@@ -15,9 +15,10 @@ pub const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
 /// Maximum idle connections to keep per host in the connection pool.
 ///
 /// Higher values improve throughput by reusing connections, but consume
-/// more memory and file descriptors. Should match or exceed the HTTP
-/// semaphore capacity for optimal connection reuse.
-pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 512;
+/// more memory and file descriptors. Matched to the HTTP semaphore
+/// capacity (1024) for optimal connection reuse — idle connections
+/// are recycled rather than churned on each request batch.
+pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 1024;
 
 /// How long to keep idle connections alive in seconds.
 pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;

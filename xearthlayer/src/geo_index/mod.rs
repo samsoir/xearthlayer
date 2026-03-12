@@ -12,7 +12,12 @@
 //! ├── Layer: PatchCoverage
 //! │   ├── (+43+006) → PatchCoverage { patch_name: "XEL Nice" }
 //! │   └── (+43+007) → PatchCoverage { patch_name: "XEL Nice" }
-//! └── Layer: (future types...)
+//! ├── Layer: RetainedRegion
+//! │   ├── (+50+009) → RetainedRegion (X-Plane holds this in memory)
+//! │   └── (+50+010) → RetainedRegion
+//! └── Layer: PrefetchedRegion
+//!     ├── (+51+009) → PrefetchedRegion { state: InProgress }
+//!     └── (+51+010) → PrefetchedRegion { state: Prefetched }
 //! ```
 //!
 //! # Thread Safety
@@ -43,5 +48,5 @@ mod layers;
 mod region;
 
 pub use index::GeoIndex;
-pub use layers::{GeoLayer, PatchCoverage};
+pub use layers::{GeoLayer, PatchCoverage, PrefetchedRegion, RegionState, RetainedRegion};
 pub use region::DsfRegion;

@@ -49,9 +49,8 @@ Thumbs.db
 # Notes
 notes*
 
-# Local tools/scripts (temporary, will be replaced with proper benchmarks)
+# Local tools (temporary, will be replaced with proper benchmarks)
 /tools/
-/scripts/
 
 .gemini/
 gha-creds-*.json

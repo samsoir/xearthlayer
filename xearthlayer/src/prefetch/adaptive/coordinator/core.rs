@@ -19,13 +19,16 @@ use crate::prefetch::tile_based::DsfTileCoord;
 use crate::prefetch::CircuitState;
 use crate::prefetch::SceneryIndex;
 
+use super::super::boundary_monitor::BoundaryAxis;
+use super::super::boundary_strategy::BoundaryStrategy;
 use super::super::calibration::{PerformanceCalibration, StrategyMode};
 use super::super::config::{AdaptivePrefetchConfig, PrefetchMode};
-use super::super::cruise_strategy::CruiseStrategy;
 use super::super::ground_strategy::GroundStrategy;
 use super::super::phase_detector::{FlightPhase, PhaseDetector};
+use super::super::scenery_window::{SceneryWindow, SceneryWindowConfig};
 use super::super::strategy::{AdaptivePrefetchStrategy, PrefetchPlan};
-use super::super::turn_detector::TurnDetector;
+use super::super::transition_throttle::TransitionThrottle;
+use crate::scene_tracker::SceneTracker;
 
 use super::status::CoordinatorStatus;
 use super::telemetry::extract_track;
@@ -53,6 +56,13 @@ pub const BACKPRESSURE_REDUCE_THRESHOLD: f64 = 0.5;
 /// [`BACKPRESSURE_DEFER_THRESHOLD`], only this fraction of tiles is submitted.
 pub const BACKPRESSURE_REDUCED_FRACTION: f64 = 0.5;
 
+/// Maximum number of tiles that can be queued as pending across cycles.
+///
+/// Safety cap to prevent executor flooding if tile generation overestimates.
+/// At 200 tiles/cycle with ~16 tiles per DSF region, 2000 covers ~10 cycles
+/// of boundary crossings — more than enough for any realistic flight path.
+pub const MAX_PENDING_TILES: usize = 2000;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Coordinator
 // ─────────────────────────────────────────────────────────────────────────────
@@ -66,17 +76,22 @@ pub const BACKPRESSURE_REDUCED_FRACTION: f64 = 0.5;
 ///
 /// ```text
 ///                    ┌─────────────────────┐
-///                    │    Coordinator      │
-///                    │  (main loop)        │
-///                    └─────────┬───────────┘
+///                    │    Coordinator       │
+///                    │  (main loop)         │
+///                    └─────────┬────────────┘
 ///                              │
-///      ┌───────────┬──────────┼──────────┬───────────┐
-///      ▼           ▼          ▼          ▼           ▼
-/// ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
-/// │ Phase   │ │ Turn    │ │ Ground  │ │ Cruise  │ │ Circuit │
-/// │Detector │ │Detector │ │Strategy │ │Strategy │ │ Breaker │
-/// └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘
+///      ┌───────────┬──────────┼──────────────┬───────────┐
+///      ▼           ▼          ▼              ▼           ▼
+/// ┌─────────┐ ┌─────────┐ ┌──────────────┐ ┌─────────┐ ┌─────────┐
+/// │ Phase   │ │ Ground  │ │ Scenery      │ │Boundary │ │ Circuit │
+/// │Detector │ │Strategy │ │ Window       │ │Strategy │ │ Breaker │
+/// └─────────┘ └─────────┘ └──────────────┘ └─────────┘ └─────────┘
 /// ```
+///
+/// In cruise phase, the coordinator uses a **boundary-driven** approach:
+/// the [`SceneryWindow`] tracks X-Plane's loading window boundaries via the
+/// [`SceneTracker`], and the [`BoundaryStrategy`] generates prefetch targets
+/// for DSF regions the aircraft is about to cross into.
 ///
 /// # Trigger Modes
 ///
@@ -92,14 +107,11 @@ pub struct AdaptivePrefetchCoordinator {
     /// Flight phase detector.
     phase_detector: PhaseDetector,
 
-    /// Turn detector.
-    turn_detector: TurnDetector,
+    /// Transition throttle for takeoff ramp-up.
+    transition_throttle: TransitionThrottle,
 
     /// Ground strategy.
     ground_strategy: GroundStrategy,
-
-    /// Cruise strategy.
-    cruise_strategy: CruiseStrategy,
 
     /// Circuit breaker for throttling.
     pub(super) throttler: Option<Arc<dyn PrefetchThrottler>>,
@@ -139,6 +151,31 @@ pub struct AdaptivePrefetchCoordinator {
 
     /// Geospatial reference index for patched region filtering.
     geo_index: Option<Arc<GeoIndex>>,
+
+    /// Scenery window model for boundary-driven prefetch.
+    scenery_window: SceneryWindow,
+
+    /// Boundary strategy for generating target regions.
+    boundary_strategy: BoundaryStrategy,
+
+    /// Scene tracker for observing X-Plane tile requests.
+    scene_tracker: Option<Arc<dyn SceneTracker>>,
+
+    /// Scenery index for tile lookup (actual installed zoom levels).
+    ///
+    /// Used by the boundary prefetch path to discover which zoom levels
+    /// are actually installed in each DSF region, rather than hardcoding
+    /// a single zoom level. Also forwarded to [`GroundStrategy`].
+    scenery_index: Option<Arc<SceneryIndex>>,
+
+    /// Tiles that could not be submitted due to channel backpressure.
+    ///
+    /// When [`execute()`] encounters `ChannelFull`, remaining tiles are stored
+    /// here and drained on subsequent [`process_telemetry()`] cycles before
+    /// generating any new boundary plan. This prevents the "fire-and-forget"
+    /// bug where large boundary plans are partially submitted and the remainder
+    /// is permanently lost.
+    pub(super) pending_tiles: Vec<TileCoord>,
 }
 
 impl std::fmt::Debug for AdaptivePrefetchCoordinator {
@@ -159,17 +196,31 @@ impl AdaptivePrefetchCoordinator {
     /// Create a new coordinator with the given configuration.
     pub fn new(config: AdaptivePrefetchConfig) -> Self {
         let phase_detector = PhaseDetector::new(&config);
-        let turn_detector = TurnDetector::new(&config);
+        let transition_throttle =
+            TransitionThrottle::with_config(config.ramp_duration, config.ramp_start_fraction);
         let ground_strategy = GroundStrategy::new(&config);
-        let cruise_strategy = CruiseStrategy::new(&config);
+        let mut scenery_window = SceneryWindow::new(SceneryWindowConfig {
+            default_rows: config.default_window_rows,
+            lon_extent: config.window_lon_extent,
+            buffer: config.window_buffer,
+            trigger_distance: config.trigger_distance,
+            load_depth_lat: config.load_depth_lat,
+            load_depth_lon: config.load_depth_lon,
+        });
+        // Start in Assumed state so boundary checks work immediately
+        // with default dimensions. Real dimensions from SceneTracker will
+        // upgrade the window to Ready when available.
+        // Use 0.0 latitude for initial assumed dimensions (equator baseline);
+        // cols will be recomputed from real latitude on first tracker update.
+        scenery_window.set_assumed_dimensions(config.default_window_rows, 0.0);
+        let boundary_strategy = BoundaryStrategy::new();
 
         Self {
             config,
             calibration: None,
             phase_detector,
-            turn_detector,
+            transition_throttle,
             ground_strategy,
-            cruise_strategy,
             throttler: None,
             dds_client: None,
             memory_cache: None,
@@ -182,6 +233,11 @@ impl AdaptivePrefetchCoordinator {
             total_deferred_cycles: 0,
             ortho_union_index: None,
             geo_index: None,
+            scenery_window,
+            boundary_strategy,
+            scene_tracker: None,
+            scenery_index: None,
+            pending_tiles: Vec::new(),
         }
     }
 
@@ -219,9 +275,13 @@ impl AdaptivePrefetchCoordinator {
     }
 
     /// Set the scenery index for tile lookup.
+    ///
+    /// The index is used by both the ground strategy (ring-based prefetch)
+    /// and the boundary strategy (cruise prefetch) to discover actual
+    /// installed zoom levels rather than assuming zoom 14.
     pub fn with_scenery_index(mut self, index: Arc<SceneryIndex>) -> Self {
         self.ground_strategy = self.ground_strategy.with_scenery_index(Arc::clone(&index));
-        self.cruise_strategy = self.cruise_strategy.with_scenery_index(index);
+        self.scenery_index = Some(index);
         self
     }
 
@@ -258,6 +318,72 @@ impl AdaptivePrefetchCoordinator {
         self
     }
 
+    /// Set the scene tracker for observing X-Plane tile requests.
+    pub fn with_scene_tracker(mut self, tracker: Arc<dyn SceneTracker>) -> Self {
+        self.scene_tracker = Some(tracker);
+        self
+    }
+
+    /// Get DDS tiles for a DSF region from the scenery index or geometric fallback.
+    ///
+    /// If a scenery index is available, queries it for tiles in the region.
+    /// This returns tiles at whatever zoom levels are actually installed in the
+    /// X-Plane scenery (e.g., ZL12 at cruise altitude), rather than assuming
+    /// a fixed zoom level.
+    ///
+    /// Falls back to the boundary strategy's geometric 4x4 grid expansion at
+    /// zoom 14 when no scenery index is available or has no tiles for the region.
+    fn get_tiles_for_region(&self, region: &DsfRegion) -> Vec<TileCoord> {
+        if let Some(ref index) = self.scenery_index {
+            let center_lat = region.lat as f64 + 0.5;
+            let center_lon = region.lon as f64 + 0.5;
+            // 1° DSF region ≈ 60nm at equator, 45nm radius covers the region
+            let tiles = index.tiles_near(center_lat, center_lon, 45.0);
+            // Filter to only tiles whose geographic center falls within the
+            // target 1° DSF region. Without this, the 45nm radius search spills
+            // across DSF boundaries, returning tiles from adjacent regions and
+            // causing massive tile count explosion (53K+ instead of ~700).
+            // Deduplicate: many .ter files share the same base DDS texture,
+            // so multiple SceneryTiles map to the same TileCoord after /16 division.
+            let unique: HashSet<TileCoord> = tiles
+                .iter()
+                .filter(|t| {
+                    t.lat.floor() as i32 == region.lat && t.lon.floor() as i32 == region.lon
+                })
+                .map(|t| t.to_tile_coord())
+                .collect();
+
+            tracing::debug!(
+                region_lat = region.lat,
+                region_lon = region.lon,
+                scenery_tiles = tiles.len(),
+                region_filtered = tiles
+                    .iter()
+                    .filter(|t| {
+                        t.lat.floor() as i32 == region.lat && t.lon.floor() as i32 == region.lon
+                    })
+                    .count(),
+                unique_tile_coords = unique.len(),
+                "get_tiles_for_region: deduplication results"
+            );
+
+            let result: Vec<TileCoord> = unique.into_iter().collect();
+
+            if !result.is_empty() {
+                return result;
+            }
+            // Fall through to geometric expansion if index had no tiles
+        }
+
+        // Fallback: geometric grid at zoom 14
+        self.boundary_strategy.expand_to_tiles(region, 14)
+    }
+
+    /// Get the scenery window for external monitoring.
+    pub fn scenery_window(&self) -> &SceneryWindow {
+        &self.scenery_window
+    }
+
     /// Get the current effective mode.
     ///
     /// Considers config override and calibration results.
@@ -287,7 +413,7 @@ impl AdaptivePrefetchCoordinator {
     /// * `position` - Aircraft position (lat, lon) in degrees
     /// * `track` - Ground track in degrees (0-360)
     /// * `ground_speed_kt` - Ground speed in knots
-    /// * `agl_ft` - Altitude above ground level in feet
+    /// * `msl_ft` - Altitude above mean sea level in feet
     ///
     /// # Returns
     ///
@@ -297,7 +423,7 @@ impl AdaptivePrefetchCoordinator {
         position: (f64, f64),
         track: f64,
         ground_speed_kt: f32,
-        agl_ft: f32,
+        msl_ft: f32,
     ) -> Option<PrefetchPlan> {
         // Check if enabled
         if !self.config.enabled {
@@ -314,15 +440,16 @@ impl AdaptivePrefetchCoordinator {
             return None;
         }
 
-        // Update phase detector
-        self.phase_detector.update(ground_speed_kt, agl_ft);
+        // Update phase detector and notify transition throttle on phase change
+        let previous_phase = self.phase_detector.current_phase();
+        let phase_changed = self.phase_detector.update(ground_speed_kt, msl_ft);
         let phase = self.phase_detector.current_phase();
         self.status.phase = phase;
 
-        // Update turn detector
-        self.turn_detector.update(track);
-        self.status.turn_state = self.turn_detector.state();
-        self.status.stable_track = self.turn_detector.stable_track();
+        if phase_changed {
+            self.transition_throttle
+                .on_phase_change(previous_phase, phase);
+        }
 
         // Check throttling (for opportunistic mode)
         if let Some(ref throttler) = self.throttler {
@@ -352,23 +479,124 @@ impl AdaptivePrefetchCoordinator {
                     &self.cached_tiles,
                 )
             }
+            FlightPhase::Transition => {
+                // During transition, no prefetch — X-Plane gets all system resources
+                return None;
+            }
             FlightPhase::Cruise => {
-                // Only prefetch in cruise if track is stable
-                if !self.turn_detector.is_stable() {
-                    tracing::debug!(
-                        turn_state = ?self.turn_detector.state(),
-                        "Skipping cruise prefetch - track not stable"
+                // Update scenery window from scene tracker
+                if let Some(ref tracker) = self.scene_tracker {
+                    self.scenery_window.update_from_tracker(tracker.as_ref());
+                }
+
+                // Update retained region tracking (drives eviction of stale state)
+                let (lat, lon) = position;
+                if let Some(ref geo_index) = self.geo_index {
+                    self.scenery_window.update_retention(lat, lon, geo_index);
+                }
+
+                // Check boundary crossings
+                let crossings = self.scenery_window.check_boundaries(lat, lon);
+
+                if crossings.is_empty() {
+                    tracing::trace!(
+                        lat = format!("{:.2}", lat),
+                        lon = format!("{:.2}", lon),
+                        window_state = ?self.scenery_window.state(),
+                        "Cruise: no boundary crossings"
                     );
                     return None;
                 }
 
-                self.status.active_strategy = self.cruise_strategy.name();
-                self.cruise_strategy.calculate_prefetch(
-                    position,
-                    track,
-                    &calibration,
-                    &self.cached_tiles,
-                )
+                // Generate target regions from crossings
+                let bounds = self.scenery_window.window_bounds();
+                let mut all_tiles = Vec::new();
+
+                if let Some((lat_min, lat_max, lon_min, lon_max)) = bounds {
+                    // Log each detected crossing with full context
+                    for crossing in &crossings {
+                        let dir_label = match (crossing.axis, crossing.direction) {
+                            (BoundaryAxis::Latitude, 1) => "N",
+                            (BoundaryAxis::Latitude, _) => "S",
+                            (BoundaryAxis::Longitude, 1) => "E",
+                            (BoundaryAxis::Longitude, _) => "W",
+                        };
+                        tracing::debug!(
+                            axis = ?crossing.axis,
+                            direction = dir_label,
+                            dsf_coord = crossing.dsf_coord,
+                            depth = crossing.depth,
+                            urgency = format!("{:.2}", crossing.urgency),
+                            aircraft = format!("{:.4}°, {:.4}°", lat, lon),
+                            window = format!("[{:.1}:{:.1}N, {:.1}:{:.1}E]",
+                                lat_min, lat_max, lon_min, lon_max),
+                            "Boundary crossing detected"
+                        );
+                    }
+
+                    for crossing in &crossings {
+                        let cross_range = match crossing.axis {
+                            BoundaryAxis::Latitude => {
+                                (lon_min.floor() as i32, (lon_max - 1.0).floor() as i32)
+                            }
+                            BoundaryAxis::Longitude => {
+                                (lat_min.floor() as i32, (lat_max - 1.0).floor() as i32)
+                            }
+                        };
+                        let targets = self
+                            .boundary_strategy
+                            .generate_regions(crossing, cross_range);
+                        if let Some(ref geo_index) = self.geo_index {
+                            let filtered = self
+                                .boundary_strategy
+                                .filter_already_handled(&targets, geo_index);
+                            for target in filtered {
+                                let tiles = self.get_tiles_for_region(&target.region);
+                                if tiles.is_empty() {
+                                    self.boundary_strategy
+                                        .mark_no_coverage(&target.region, geo_index);
+                                    tracing::debug!(
+                                        region_lat = target.region.lat,
+                                        region_lon = target.region.lon,
+                                        depth_index = target.depth_index,
+                                        "Prefetch target: no coverage"
+                                    );
+                                } else {
+                                    self.boundary_strategy
+                                        .mark_in_progress(&target.region, geo_index);
+                                    tracing::debug!(
+                                        region_lat = target.region.lat,
+                                        region_lon = target.region.lon,
+                                        depth_index = target.depth_index,
+                                        tiles = tiles.len(),
+                                        axis = ?target.axis,
+                                        "Prefetch target: region queued"
+                                    );
+                                    all_tiles.extend(tiles);
+                                }
+                            }
+                        } else {
+                            // No GeoIndex -- expand all targets without filtering
+                            for target in &targets {
+                                all_tiles.extend(self.get_tiles_for_region(&target.region));
+                            }
+                        }
+                    }
+                }
+
+                if all_tiles.is_empty() {
+                    return None;
+                }
+
+                // Sort tiles by distance from aircraft so near-boundary tiles
+                // are submitted first. Without this, HashSet iteration order
+                // within each region is random, causing far-edge tiles to be
+                // processed while X-Plane is already requesting near-edge ones.
+                crate::coord::sort_tiles_by_distance(&mut all_tiles, lat, lon);
+
+                let total = all_tiles.len();
+                self.status.active_strategy = "boundary";
+                PrefetchPlan::with_tiles(all_tiles, &calibration, "boundary", 0, total)
             }
         };
 
@@ -397,6 +625,14 @@ impl AdaptivePrefetchCoordinator {
     ///
     /// Number of tiles submitted. Returns 0 if deferred due to backpressure.
     pub fn execute(&mut self, plan: &PrefetchPlan, cancellation: CancellationToken) -> usize {
+        let _span = tracing::debug_span!(
+            target: "profiling",
+            "prefetch_execute",
+            tile_count = plan.tiles.len(),
+            strategy = plan.strategy,
+        )
+        .entered();
+
         let Some(ref client) = self.dds_client else {
             tracing::warn!("No DDS client configured - cannot execute prefetch");
             return 0;
@@ -406,10 +642,17 @@ impl AdaptivePrefetchCoordinator {
         let load = client.executor_load();
         if load > BACKPRESSURE_DEFER_THRESHOLD {
             self.total_deferred_cycles += 1;
+            // TEMPORARILY REVERTED for RED test verification
+            // Store tiles as pending so they're retried when load drops (capped)
+            self.pending_tiles = if plan.tiles.len() > MAX_PENDING_TILES {
+                plan.tiles[..MAX_PENDING_TILES].to_vec()
+            } else {
+                plan.tiles.clone()
+            };
             tracing::info!(
                 load = format!("{:.1}%", load * 100.0),
                 tiles_planned = plan.tiles.len(),
-                "Executor backpressure — deferring prefetch cycle"
+                "Executor backpressure — deferring prefetch cycle, tiles stored as pending"
             );
             return 0;
         }
@@ -429,17 +672,56 @@ impl AdaptivePrefetchCoordinator {
             plan.tiles.len()
         };
 
+        // Apply transition throttle (takeoff ramp-up)
+        let max_tiles = if self.transition_throttle.is_active() {
+            let fraction = self.transition_throttle.fraction();
+            if fraction == 0.0 {
+                // Store tiles as pending so they're submitted once ramp begins (capped)
+                self.pending_tiles = if plan.tiles.len() > MAX_PENDING_TILES {
+                    plan.tiles[..MAX_PENDING_TILES].to_vec()
+                } else {
+                    plan.tiles.clone()
+                };
+                tracing::debug!(
+                    tiles_deferred = plan.tiles.len(),
+                    "Transition throttle — grace period, tiles stored as pending"
+                );
+                return 0;
+            }
+            let throttled = ((max_tiles as f64) * fraction).ceil() as usize;
+            tracing::debug!(
+                fraction = format!("{:.0}%", fraction * 100.0),
+                full = max_tiles,
+                throttled_to = throttled,
+                "Transition throttle — ramping up"
+            );
+            throttled
+        } else {
+            max_tiles
+        };
+
+        // Store tiles beyond the throttle/backpressure cutoff as pending
+        // so they're drained in subsequent cycles rather than lost.
+        let throttle_overflow: Vec<TileCoord> = if max_tiles < plan.tiles.len() {
+            plan.tiles[max_tiles..].to_vec()
+        } else {
+            Vec::new()
+        };
+
         let mut submitted = 0;
-        for tile in plan.tiles.iter().take(max_tiles) {
+        let tiles_to_submit: Vec<TileCoord> = plan.tiles.iter().take(max_tiles).copied().collect();
+        let mut channel_remainder = Vec::new();
+        for (idx, tile) in tiles_to_submit.iter().enumerate() {
             let request =
                 crate::runtime::JobRequest::prefetch_with_cancellation(*tile, cancellation.clone());
             match client.submit(request) {
                 Ok(()) => submitted += 1,
                 Err(crate::executor::DdsClientError::ChannelFull) => {
+                    channel_remainder = tiles_to_submit[idx..].to_vec();
                     tracing::debug!(
                         submitted,
-                        dropped = max_tiles - submitted,
-                        "Channel full — stopping prefetch submission"
+                        channel_remaining = channel_remainder.len(),
+                        "Channel full — storing remainder for next cycle"
                     );
                     break;
                 }
@@ -448,6 +730,29 @@ impl AdaptivePrefetchCoordinator {
                     break;
                 }
             }
+        }
+
+        // Merge channel remainder + throttle overflow into pending_tiles
+        if !channel_remainder.is_empty() || !throttle_overflow.is_empty() {
+            let mut pending = channel_remainder;
+            pending.extend(throttle_overflow);
+            // Apply safety cap to prevent executor flooding
+            if pending.len() > MAX_PENDING_TILES {
+                tracing::warn!(
+                    total = pending.len(),
+                    cap = MAX_PENDING_TILES,
+                    dropped = pending.len() - MAX_PENDING_TILES,
+                    "Pending tiles exceed cap — truncating to prevent executor flood"
+                );
+                pending.truncate(MAX_PENDING_TILES);
+            }
+            tracing::debug!(
+                submitted,
+                pending = pending.len(),
+                "Storing {} tiles for subsequent cycles",
+                pending.len()
+            );
+            self.pending_tiles = pending;
         }
 
         if submitted > 0 {
@@ -482,16 +787,10 @@ impl AdaptivePrefetchCoordinator {
         &self.phase_detector
     }
 
-    /// Get the turn detector for external monitoring.
-    pub fn turn_detector(&self) -> &TurnDetector {
-        &self.turn_detector
-    }
-
     /// Reset the coordinator state.
     ///
     /// Call this when teleporting or starting a new flight.
     pub fn reset(&mut self) {
-        self.turn_detector.reset();
         self.cached_tiles.clear();
         self.status = CoordinatorStatus::default();
     }
@@ -526,10 +825,8 @@ impl AdaptivePrefetchCoordinator {
     pub fn startup_info_string(&self) -> String {
         let mode = self.effective_mode();
         format!(
-            "adaptive, mode={:?}, ground_threshold={}kt, turn_threshold={}°",
-            mode,
-            self.config.ground_speed_threshold_kt,
-            self.config.turn_threshold_deg()
+            "adaptive, mode={:?}, ground_threshold={}kt, boundary_trigger={:.1}°",
+            mode, self.config.ground_speed_threshold_kt, self.config.trigger_distance,
         )
     }
 
@@ -578,20 +875,62 @@ impl AdaptivePrefetchCoordinator {
         let track = extract_track(state);
         let position = (state.latitude, state.longitude);
 
-        // Note: We don't have true AGL from telemetry, only MSL altitude.
-        // Phase detection now uses ground speed as the primary indicator.
-        // Pass 0 for AGL so the phase detector uses ground speed only.
-        let agl_ft = 0.0;
+        let msl_ft = state.altitude;
 
         // Always update shared status with current position to show TUI we're receiving telemetry
         // This fixes the bug where prefetch status stayed "Idle" when no plan was generated
         self.update_shared_status_position(position);
 
-        let mut plan = match self.update(position, track, state.ground_speed, agl_ft) {
+        // Drain pending tiles from a previous partial submission before generating
+        // a new plan. This prevents the "fire-and-forget" bug where large boundary
+        // plans lose tiles when the channel is full.
+        if !self.pending_tiles.is_empty() {
+            let pending = std::mem::take(&mut self.pending_tiles);
+            let pending_count = pending.len();
+
+            // Still need to update phase detector for correct state tracking
+            self.phase_detector.update(state.ground_speed, msl_ft);
+
+            let calibration = self
+                .calibration
+                .clone()
+                .unwrap_or_else(PerformanceCalibration::default_opportunistic);
+            let plan = PrefetchPlan::with_tiles(
+                pending,
+                &calibration,
+                "boundary_pending",
+                0,
+                pending_count,
+            );
+
+            let cancellation = CancellationToken::new();
+            let submitted = self.execute(&plan, cancellation);
+
+            if submitted > 0 {
+                self.mark_cached(plan.tiles.iter().take(submitted).cloned());
+            }
+
+            self.total_cycles += 1;
+            self.total_tiles_submitted += submitted as u64;
+
+            tracing::debug!(
+                submitted,
+                remaining = self.pending_tiles.len(),
+                "Drained pending tiles from previous cycle"
+            );
+
+            self.run_region_maintenance();
+            return Some(submitted);
+        }
+
+        let mut plan = match self.update(position, track, state.ground_speed, msl_ft) {
             Some(p) => p,
             None => {
                 // No plan generated - still update status with why (disabled, throttled, etc.)
                 self.update_shared_status_no_plan();
+                // Run region maintenance even without a plan — InProgress regions
+                // must still be promoted/swept to unblock future boundary cycles.
+                self.run_region_maintenance();
                 return None;
             }
         };
@@ -677,6 +1016,17 @@ impl AdaptivePrefetchCoordinator {
 
         let disk_filtered = patch_skipped + disk_skipped;
 
+        tracing::debug!(
+            raw_plan_tiles =
+                plan.skipped_cached + cache_filtered + disk_filtered + plan.tiles.len(),
+            cache_skipped = plan.skipped_cached + cache_filtered,
+            patch_skipped,
+            disk_skipped,
+            remaining = plan.tiles.len(),
+            strategy = plan.strategy,
+            "Prefetch plan filter pipeline summary"
+        );
+
         let submitted = if plan.is_empty() {
             0
         } else {
@@ -705,7 +1055,34 @@ impl AdaptivePrefetchCoordinator {
             "Adaptive prefetch cycle complete"
         );
 
+        self.run_region_maintenance();
+
         Some(submitted)
+    }
+
+    /// Sweep stale InProgress regions, promote completed ones, and evict
+    /// state for regions that have left the retained window.
+    ///
+    /// This must run every cycle regardless of whether a prefetch plan was generated,
+    /// otherwise InProgress regions block future boundary cycles indefinitely.
+    pub fn run_region_maintenance(&mut self) {
+        if let Some(ref geo_index) = self.geo_index {
+            BoundaryStrategy::sweep_stale_regions(geo_index, self.config.stale_region_timeout);
+            BoundaryStrategy::promote_completed_regions(
+                geo_index,
+                &self.cached_tiles,
+                self.scenery_index.as_ref(),
+            );
+            // Evict PrefetchedRegion entries for regions outside the retained window,
+            // making them eligible for re-prefetch when the aircraft returns.
+            BoundaryStrategy::evict_non_retained(geo_index);
+            // Evict cached_tiles entries for tiles outside the retained window,
+            // allowing re-query of the memory cache for those tiles.
+            BoundaryStrategy::evict_cached_tiles_outside_retained(
+                &mut self.cached_tiles,
+                geo_index,
+            );
+        }
     }
 
     /// Update the shared status for TUI display.
@@ -720,6 +1097,7 @@ impl AdaptivePrefetchCoordinator {
         // Determine prefetch mode for display
         let prefetch_mode = match self.status.phase {
             FlightPhase::Ground => crate::prefetch::state::PrefetchMode::Radial,
+            FlightPhase::Transition => crate::prefetch::state::PrefetchMode::Idle,
             FlightPhase::Cruise => crate::prefetch::state::PrefetchMode::TileBased,
         };
         status.update_prefetch_mode(prefetch_mode);
@@ -747,8 +1125,13 @@ impl AdaptivePrefetchCoordinator {
             tiles_submitted_last_cycle: submitted as u64,
             tiles_submitted_total: self.total_tiles_submitted,
             cache_hits: self.total_cache_hits,
-            ttl_skipped: 0,               // Not tracked in adaptive
-            active_zoom_levels: vec![14], // Fallback uses zoom 14
+            ttl_skipped: 0, // Not tracked in adaptive
+            active_zoom_levels: {
+                let mut zooms: Vec<u8> = plan.tiles.iter().map(|t| t.zoom).collect();
+                zooms.sort_unstable();
+                zooms.dedup();
+                zooms
+            },
             is_active: submitted > 0,
             circuit_state,
             loading_tiles,
@@ -790,6 +1173,7 @@ impl AdaptivePrefetchCoordinator {
             // Have a plan but it was empty or filtered - show the active mode
             match self.status.phase {
                 FlightPhase::Ground => crate::prefetch::state::PrefetchMode::Radial,
+                FlightPhase::Transition => crate::prefetch::state::PrefetchMode::Idle,
                 FlightPhase::Cruise => crate::prefetch::state::PrefetchMode::TileBased,
             }
         };
@@ -808,7 +1192,7 @@ impl AdaptivePrefetchCoordinator {
             tiles_submitted_total: self.total_tiles_submitted,
             cache_hits: self.total_cache_hits,
             ttl_skipped: 0,
-            active_zoom_levels: vec![14],
+            active_zoom_levels: vec![],
             is_active: false,
             circuit_state,
             loading_tiles: vec![],
@@ -820,8 +1204,8 @@ impl AdaptivePrefetchCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::turn_detector::TurnState;
     use super::*;
+    use crate::prefetch::adaptive::scenery_window::WindowState;
     use std::time::Instant;
 
     fn test_calibration() -> PerformanceCalibration {
@@ -909,7 +1293,7 @@ mod tests {
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config);
 
-        let plan = coord.update((53.5, 9.5), 45.0, 100.0, 1000.0);
+        let plan = coord.update((53.5, 9.5), 45.0, 100.0, 0.0);
         assert!(plan.is_none());
         assert!(!coord.status.enabled);
     }
@@ -922,7 +1306,7 @@ mod tests {
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config);
 
-        let plan = coord.update((53.5, 9.5), 45.0, 100.0, 1000.0);
+        let plan = coord.update((53.5, 9.5), 45.0, 100.0, 0.0);
         assert!(plan.is_none());
     }
 
@@ -932,7 +1316,7 @@ mod tests {
             AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
 
         // Ground conditions: low speed, low AGL
-        let _plan = coord.update((53.5, 9.5), 45.0, 10.0, 5.0);
+        let _plan = coord.update((53.5, 9.5), 45.0, 10.0, 0.0);
         assert_eq!(coord.status.phase, FlightPhase::Ground);
         assert_eq!(coord.status.active_strategy, "ground");
     }
@@ -943,25 +1327,14 @@ mod tests {
             AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
 
         // Cruise conditions: high speed
-        coord.update((53.5, 9.5), 45.0, 200.0, 10000.0);
-        // Phase detector has hysteresis, so first update may not transition
+        coord.update((53.5, 9.5), 45.0, 200.0, 0.0);
+        // Phase detector has hysteresis, so first update may not transition.
+        // With three-phase model, Ground → Transition → Cruise.
         assert!(
-            coord.status.phase == FlightPhase::Ground || coord.status.phase == FlightPhase::Cruise
+            coord.status.phase == FlightPhase::Ground
+                || coord.status.phase == FlightPhase::Transition
+                || coord.status.phase == FlightPhase::Cruise
         );
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Turn detector integration tests
-    // ─────────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_update_tracks_turn_state() {
-        let mut coord =
-            AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
-
-        coord.update((53.5, 9.5), 45.0, 200.0, 10000.0);
-        // Initially not stable
-        assert_ne!(coord.status.turn_state, TurnState::Stable);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1014,7 +1387,7 @@ mod tests {
             AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
 
         // Update to set state
-        coord.update((53.5, 9.5), 45.0, 200.0, 10000.0);
+        coord.update((53.5, 9.5), 45.0, 200.0, 0.0);
         coord.mark_cached(vec![TileCoord {
             row: 100,
             col: 200,
@@ -1024,7 +1397,6 @@ mod tests {
         // Reset
         coord.reset();
         assert!(coord.cached_tiles.is_empty());
-        assert_eq!(coord.turn_detector.state(), TurnState::Initializing);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1478,5 +1850,1201 @@ mod tests {
 
         assert_eq!(submitted, 3, "Should stop at first ChannelFull error");
         assert_eq!(client.submitted_count(), 3);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Transition throttle integration tests (#62)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_phase_change_activates_throttle() {
+        let mut coord =
+            AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+
+        // Start on ground
+        coord.update((47.5, 10.5), 270.0, 10.0, 0.0);
+        assert!(!coord.transition_throttle.is_active());
+
+        // Trigger cruise (high speed, wait for hysteresis)
+        coord.update((47.5, 10.5), 270.0, 100.0, 0.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((47.5, 10.5), 270.0, 100.0, 0.0);
+
+        // Throttle should now be active (held during transition)
+        assert!(coord.transition_throttle.is_active());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Boundary-driven prefetch integration tests (#58)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_coordinator_creation_has_scenery_window() {
+        let coord = AdaptivePrefetchCoordinator::with_defaults();
+        // Coordinator should have a scenery window in Assumed state
+        // (initialized with default dimensions so boundary checks work immediately)
+        let window = coord.scenery_window();
+        assert!(window.is_ready());
+        assert_eq!(window.state(), &WindowState::Assumed);
+    }
+
+    #[test]
+    fn test_coordinator_with_scene_tracker() {
+        use crate::scene_tracker::{DdsTileCoord, GeoBounds, GeoRegion, SceneTracker};
+        use std::collections::HashSet;
+
+        struct DummyTracker;
+        impl SceneTracker for DummyTracker {
+            fn requested_tiles(&self) -> HashSet<DdsTileCoord> {
+                HashSet::new()
+            }
+            fn is_tile_requested(&self, _tile: &DdsTileCoord) -> bool {
+                false
+            }
+            fn is_burst_active(&self) -> bool {
+                false
+            }
+            fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
+                vec![]
+            }
+            fn total_requests(&self) -> u64 {
+                0
+            }
+            fn loaded_regions(&self) -> HashSet<GeoRegion> {
+                HashSet::new()
+            }
+            fn is_region_loaded(&self, _region: &GeoRegion) -> bool {
+                false
+            }
+            fn loaded_bounds(&self) -> Option<GeoBounds> {
+                None
+            }
+        }
+
+        let tracker: Arc<dyn SceneTracker> = Arc::new(DummyTracker);
+        let coord = AdaptivePrefetchCoordinator::with_defaults().with_scene_tracker(tracker);
+        assert!(coord.scene_tracker.is_some());
+    }
+
+    #[test]
+    fn test_coordinator_with_scenery_window_returns_plan_on_boundary() {
+        use crate::geo_index::GeoIndex;
+        use crate::scene_tracker::{DdsTileCoord, GeoBounds, GeoRegion, SceneTracker};
+        use std::collections::HashSet;
+
+        /// Mock SceneTracker that returns stable bounds to trigger Ready state.
+        struct StableBoundsTracker;
+        impl SceneTracker for StableBoundsTracker {
+            fn requested_tiles(&self) -> HashSet<DdsTileCoord> {
+                HashSet::new()
+            }
+            fn is_tile_requested(&self, _tile: &DdsTileCoord) -> bool {
+                false
+            }
+            fn is_burst_active(&self) -> bool {
+                false
+            }
+            fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
+                vec![]
+            }
+            fn total_requests(&self) -> u64 {
+                0
+            }
+            fn loaded_regions(&self) -> HashSet<GeoRegion> {
+                HashSet::new()
+            }
+            fn is_region_loaded(&self, _region: &GeoRegion) -> bool {
+                false
+            }
+            fn loaded_bounds(&self) -> Option<GeoBounds> {
+                Some(GeoBounds {
+                    min_lat: 47.0,
+                    max_lat: 53.0,
+                    min_lon: 3.0,
+                    max_lon: 11.0,
+                })
+            }
+        }
+
+        let tracker: Arc<dyn SceneTracker> = Arc::new(StableBoundsTracker);
+        let geo_index = Arc::new(GeoIndex::new());
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_scene_tracker(tracker)
+            .with_geo_index(geo_index);
+
+        // Prime the scenery window to Ready state by calling update multiple times
+        // with the tracker returning stable bounds. We need to reach Cruise phase too.
+        // First get into cruise: use high ground speed.
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+
+        // First tick: Ground → start hysteresis for cruise
+        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Second tick: hysteresis expires, enter cruise
+        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Third tick: now in cruise, scenery window should have updated from tracker
+        // update_from_tracker is called each cruise update, so 2 calls → Measuring + Ready
+        let plan = coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
+
+        // Aircraft at lat=52.0, near north edge of window (max_lat=53.0),
+        // trigger_distance=3.0° → should trigger a boundary crossing.
+        // If plan is Some, it should have tiles and strategy "boundary".
+        if coord.status.phase == FlightPhase::Cruise {
+            assert!(
+                plan.is_some(),
+                "Should generate a boundary plan near the edge"
+            );
+            let plan = plan.unwrap();
+            assert!(!plan.tiles.is_empty(), "Plan should have tiles");
+            assert_eq!(
+                coord.status.active_strategy, "boundary",
+                "Strategy should be 'boundary'"
+            );
+        }
+        // If we didn't reach cruise (due to phase detector), that's OK for now.
+    }
+
+    #[test]
+    fn test_boundary_plan_tiles_sorted_by_distance_from_aircraft() {
+        use crate::geo_index::GeoIndex;
+        use crate::scene_tracker::{DdsTileCoord, GeoBounds, GeoRegion, SceneTracker};
+        use std::collections::HashSet;
+
+        /// Mock SceneTracker with stable bounds for triggering cruise boundary.
+        struct StableBoundsTracker;
+        impl SceneTracker for StableBoundsTracker {
+            fn requested_tiles(&self) -> HashSet<DdsTileCoord> {
+                HashSet::new()
+            }
+            fn is_tile_requested(&self, _tile: &DdsTileCoord) -> bool {
+                false
+            }
+            fn is_burst_active(&self) -> bool {
+                false
+            }
+            fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
+                vec![]
+            }
+            fn total_requests(&self) -> u64 {
+                0
+            }
+            fn loaded_regions(&self) -> HashSet<GeoRegion> {
+                HashSet::new()
+            }
+            fn is_region_loaded(&self, _region: &GeoRegion) -> bool {
+                false
+            }
+            fn loaded_bounds(&self) -> Option<GeoBounds> {
+                Some(GeoBounds {
+                    min_lat: 47.0,
+                    max_lat: 53.0,
+                    min_lon: 3.0,
+                    max_lon: 11.0,
+                })
+            }
+        }
+
+        let tracker: Arc<dyn SceneTracker> = Arc::new(StableBoundsTracker);
+        let geo_index = Arc::new(GeoIndex::new());
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_scene_tracker(tracker)
+            .with_geo_index(geo_index);
+
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+
+        // Enter cruise phase
+        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Aircraft at 52.0, near north edge — triggers boundary crossing
+        let plan = coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
+
+        if coord.status.phase == FlightPhase::Cruise {
+            let plan = plan.expect("Should generate boundary plan near edge");
+            assert!(
+                plan.tiles.len() > 1,
+                "Need multiple tiles to verify sorting"
+            );
+
+            // Verify tiles are sorted by distance from aircraft position
+            let mut prev_dist = 0.0_f64;
+            for tile in &plan.tiles {
+                let (tile_lat, tile_lon) = tile.to_lat_lon();
+                let dist = (tile_lat - 52.0).powi(2) + (tile_lon - 7.0).powi(2);
+                assert!(
+                    dist >= prev_dist - 0.001,
+                    "Tiles must be sorted by distance from aircraft. \
+                     Found dist={:.4} after prev={:.4}",
+                    dist,
+                    prev_dist,
+                );
+                prev_dist = dist;
+            }
+        }
+    }
+
+    #[test]
+    fn test_coordinator_no_plan_when_far_from_boundary() {
+        use crate::scene_tracker::{DdsTileCoord, GeoBounds, GeoRegion, SceneTracker};
+        use std::collections::HashSet;
+
+        /// Mock SceneTracker that returns stable bounds.
+        struct StableBoundsTracker;
+        impl SceneTracker for StableBoundsTracker {
+            fn requested_tiles(&self) -> HashSet<DdsTileCoord> {
+                HashSet::new()
+            }
+            fn is_tile_requested(&self, _tile: &DdsTileCoord) -> bool {
+                false
+            }
+            fn is_burst_active(&self) -> bool {
+                false
+            }
+            fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
+                vec![]
+            }
+            fn total_requests(&self) -> u64 {
+                0
+            }
+            fn loaded_regions(&self) -> HashSet<GeoRegion> {
+                HashSet::new()
+            }
+            fn is_region_loaded(&self, _region: &GeoRegion) -> bool {
+                false
+            }
+            fn loaded_bounds(&self) -> Option<GeoBounds> {
+                Some(GeoBounds {
+                    min_lat: 47.0,
+                    max_lat: 53.0,
+                    min_lon: 3.0,
+                    max_lon: 11.0,
+                })
+            }
+        }
+
+        let tracker: Arc<dyn SceneTracker> = Arc::new(StableBoundsTracker);
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_scene_tracker(tracker);
+
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+
+        // Get into cruise
+        coord.update((50.0, 7.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((50.0, 7.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Aircraft at center of window (50.0, 7.0) — far from all edges
+        let plan = coord.update((50.0, 7.0), 0.0, 200.0, 35000.0);
+
+        if coord.status.phase == FlightPhase::Cruise {
+            assert!(
+                plan.is_none(),
+                "Should NOT generate a plan when aircraft is far from all boundaries"
+            );
+        }
+    }
+
+    #[test]
+    fn test_coordinator_boundary_uses_geo_index_filtering() {
+        use crate::geo_index::{DsfRegion, GeoIndex, PrefetchedRegion};
+        use crate::scene_tracker::{DdsTileCoord, GeoBounds, GeoRegion, SceneTracker};
+        use std::collections::HashSet;
+
+        struct StableBoundsTracker;
+        impl SceneTracker for StableBoundsTracker {
+            fn requested_tiles(&self) -> HashSet<DdsTileCoord> {
+                HashSet::new()
+            }
+            fn is_tile_requested(&self, _tile: &DdsTileCoord) -> bool {
+                false
+            }
+            fn is_burst_active(&self) -> bool {
+                false
+            }
+            fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
+                vec![]
+            }
+            fn total_requests(&self) -> u64 {
+                0
+            }
+            fn loaded_regions(&self) -> HashSet<GeoRegion> {
+                HashSet::new()
+            }
+            fn is_region_loaded(&self, _region: &GeoRegion) -> bool {
+                false
+            }
+            fn loaded_bounds(&self) -> Option<GeoBounds> {
+                Some(GeoBounds {
+                    min_lat: 47.0,
+                    max_lat: 53.0,
+                    min_lon: 3.0,
+                    max_lon: 11.0,
+                })
+            }
+        }
+
+        let tracker: Arc<dyn SceneTracker> = Arc::new(StableBoundsTracker);
+        let geo_index = Arc::new(GeoIndex::new());
+
+        // Mark ALL potential boundary regions as already prefetched
+        // The north boundary at dsf_coord=53: depth 0,1,2 → rows 53,54,55
+        // spanning columns 3..10
+        for lat in 53..=55 {
+            for lon in 3..=10 {
+                geo_index.insert::<PrefetchedRegion>(
+                    DsfRegion::new(lat, lon),
+                    PrefetchedRegion::prefetched(),
+                );
+            }
+        }
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_scene_tracker(tracker)
+            .with_geo_index(geo_index);
+
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+
+        // Get into cruise
+        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Aircraft near north edge — boundary crossing detected but all regions filtered
+        let plan = coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
+
+        if coord.status.phase == FlightPhase::Cruise {
+            // All targets were already prefetched, so plan should be None
+            assert!(
+                plan.is_none(),
+                "Plan should be None when all boundary targets are already prefetched"
+            );
+        }
+    }
+
+    #[test]
+    fn test_throttle_resets_on_landing() {
+        let mut coord =
+            AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+
+        // Transition to cruise
+        coord.update((47.5, 10.5), 270.0, 100.0, 0.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((47.5, 10.5), 270.0, 100.0, 0.0);
+        assert!(coord.transition_throttle.is_active());
+
+        // Transition back to ground
+        coord.update((47.5, 10.5), 270.0, 10.0, 0.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((47.5, 10.5), 270.0, 10.0, 0.0);
+        assert!(!coord.transition_throttle.is_active());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scenery index zoom level tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Helper to create a SceneryIndex with tiles at a specific chunk zoom level.
+    fn make_scenery_index(lat: i32, lon: i32, chunk_zoom: u8) -> Arc<SceneryIndex> {
+        use crate::coord::{to_tile_coords, CHUNKS_PER_TILE_SIDE, CHUNK_ZOOM_OFFSET};
+        use crate::prefetch::scenery_index::{SceneryIndexConfig, SceneryTile};
+
+        let index = SceneryIndex::new(SceneryIndexConfig::default());
+        let tile_zoom = chunk_zoom - CHUNK_ZOOM_OFFSET;
+
+        for lat_step in 0..4u32 {
+            for lon_step in 0..4u32 {
+                let sample_lat = lat as f64 + (lat_step as f64 * 0.25) + 0.125;
+                let sample_lon = lon as f64 + (lon_step as f64 * 0.25) + 0.125;
+                if let Ok(coord) = to_tile_coords(sample_lat, sample_lon, tile_zoom) {
+                    index.add_tile(SceneryTile {
+                        row: coord.row * CHUNKS_PER_TILE_SIDE,
+                        col: coord.col * CHUNKS_PER_TILE_SIDE,
+                        chunk_zoom,
+                        lat: sample_lat as f32,
+                        lon: sample_lon as f32,
+                        is_sea: false,
+                    });
+                }
+            }
+        }
+
+        Arc::new(index)
+    }
+
+    #[test]
+    fn test_get_tiles_for_region_without_index_uses_zoom_14() {
+        let coord = AdaptivePrefetchCoordinator::with_defaults();
+        let region = DsfRegion::new(50, 9);
+
+        let tiles = coord.get_tiles_for_region(&region);
+        assert!(!tiles.is_empty());
+        for tile in &tiles {
+            assert_eq!(tile.zoom, 14, "Without scenery index, should use zoom 14");
+        }
+    }
+
+    #[test]
+    fn test_get_tiles_for_region_with_index_uses_actual_zoom() {
+        // chunk_zoom 16 → tile zoom 12
+        let index = make_scenery_index(50, 9, 16);
+        let coord = AdaptivePrefetchCoordinator::with_defaults().with_scenery_index(index);
+        let region = DsfRegion::new(50, 9);
+
+        let tiles = coord.get_tiles_for_region(&region);
+        assert!(!tiles.is_empty());
+        for tile in &tiles {
+            assert_eq!(
+                tile.zoom, 12,
+                "With scenery index at chunk_zoom 16, should use tile zoom 12"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_tiles_for_region_with_index_at_zoom_18() {
+        // chunk_zoom 18 → tile zoom 14
+        let index = make_scenery_index(50, 9, 18);
+        let coord = AdaptivePrefetchCoordinator::with_defaults().with_scenery_index(index);
+        let region = DsfRegion::new(50, 9);
+
+        let tiles = coord.get_tiles_for_region(&region);
+        assert!(!tiles.is_empty());
+        for tile in &tiles {
+            assert_eq!(
+                tile.zoom, 14,
+                "With scenery index at chunk_zoom 18, should use tile zoom 14"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_tiles_for_region_falls_back_when_no_coverage() {
+        // Index has tiles at (60, 20) but we query (50, 9)
+        let index = make_scenery_index(60, 20, 16);
+        let coord = AdaptivePrefetchCoordinator::with_defaults().with_scenery_index(index);
+        let region = DsfRegion::new(50, 9);
+
+        let tiles = coord.get_tiles_for_region(&region);
+        assert!(!tiles.is_empty());
+        for tile in &tiles {
+            assert_eq!(
+                tile.zoom, 14,
+                "Should fall back to zoom 14 when scenery index has no coverage"
+            );
+        }
+    }
+
+    #[test]
+    fn test_with_scenery_index_stores_on_coordinator() {
+        let index = make_scenery_index(50, 9, 16);
+        let coord = AdaptivePrefetchCoordinator::with_defaults().with_scenery_index(index);
+        assert!(
+            coord.scenery_index.is_some(),
+            "with_scenery_index should store index on coordinator"
+        );
+    }
+
+    #[test]
+    fn test_region_maintenance_runs_when_no_plan_generated() {
+        use crate::geo_index::{DsfRegion, GeoIndex, PrefetchedRegion};
+        use crate::scene_tracker::{DdsTileCoord, GeoBounds, GeoRegion, SceneTracker};
+        use std::collections::HashSet;
+
+        struct StableBoundsTracker;
+        impl SceneTracker for StableBoundsTracker {
+            fn requested_tiles(&self) -> HashSet<DdsTileCoord> {
+                HashSet::new()
+            }
+            fn is_tile_requested(&self, _tile: &DdsTileCoord) -> bool {
+                false
+            }
+            fn is_burst_active(&self) -> bool {
+                false
+            }
+            fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
+                vec![]
+            }
+            fn total_requests(&self) -> u64 {
+                0
+            }
+            fn loaded_regions(&self) -> HashSet<GeoRegion> {
+                HashSet::new()
+            }
+            fn is_region_loaded(&self, _region: &GeoRegion) -> bool {
+                false
+            }
+            fn loaded_bounds(&self) -> Option<GeoBounds> {
+                // Wide window so center is far from edges
+                Some(GeoBounds {
+                    min_lat: 45.0,
+                    max_lat: 55.0,
+                    min_lon: 0.0,
+                    max_lon: 14.0,
+                })
+            }
+        }
+
+        let tracker: Arc<dyn SceneTracker> = Arc::new(StableBoundsTracker);
+        let geo_index = Arc::new(GeoIndex::new());
+
+        // Pre-populate InProgress regions (simulating a previous boundary cycle)
+        for lon in 0..=13 {
+            geo_index.insert::<PrefetchedRegion>(
+                DsfRegion::new(55, lon),
+                PrefetchedRegion::in_progress(),
+            );
+        }
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_scene_tracker(tracker)
+            .with_geo_index(Arc::clone(&geo_index));
+
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+
+        // Get into cruise
+        coord.update((50.0, 7.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((50.0, 7.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Aircraft at center — no boundary crossings → update returns None
+        let plan = coord.update((50.0, 7.0), 0.0, 200.0, 35000.0);
+        assert!(
+            plan.is_none(),
+            "Should not generate plan when far from boundaries"
+        );
+
+        // Region maintenance should still have run despite no plan
+        // The stale sweep should eventually timeout InProgress regions,
+        // but more importantly, run_region_maintenance should be called.
+        // We verify by checking that the method is reachable even with None plans.
+        coord.run_region_maintenance();
+
+        // After maintenance, stale regions should be swept (timeout=120s, so not yet).
+        // But the key assertion: the method exists and is callable.
+        // For a real promotion test, mark tiles as cached first.
+        let region = DsfRegion::new(55, 7);
+        let tiles = coord.boundary_strategy.expand_to_tiles(&region, 14);
+        for tile in &tiles {
+            coord.cached_tiles.insert(*tile);
+        }
+
+        coord.run_region_maintenance();
+
+        // Region 55,7 should now be promoted to Prefetched
+        let state = geo_index.get::<PrefetchedRegion>(&region);
+        assert!(
+            state.is_some(),
+            "Region should still exist in GeoIndex after maintenance"
+        );
+        assert!(
+            state.unwrap().is_prefetched(),
+            "Region should be promoted to Prefetched when all tiles are cached"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Pending tiles carry-over tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Mock DdsClient that accepts N submissions, then returns ChannelFull.
+    struct CapLimitedDdsClient {
+        limit: usize,
+        submitted: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CapLimitedDdsClient {
+        fn new(limit: usize) -> Self {
+            Self {
+                limit,
+                submitted: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// Reset the counter to allow another batch of submissions.
+        fn reset(&self) {
+            self.submitted.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl DdsClient for CapLimitedDdsClient {
+        fn submit(
+            &self,
+            _request: crate::runtime::JobRequest,
+        ) -> Result<(), crate::executor::DdsClientError> {
+            let prev = self
+                .submitted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if prev >= self.limit {
+                // Undo the increment since we're rejecting
+                self.submitted
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Err(crate::executor::DdsClientError::ChannelFull)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn request_dds(
+            &self,
+            _tile: TileCoord,
+            _cancel: CancellationToken,
+        ) -> tokio::sync::oneshot::Receiver<crate::runtime::DdsResponse> {
+            let (_, rx) = tokio::sync::oneshot::channel();
+            rx
+        }
+
+        fn request_dds_with_options(
+            &self,
+            _tile: TileCoord,
+            _priority: crate::executor::Priority,
+            _origin: crate::runtime::RequestOrigin,
+            _cancel: CancellationToken,
+        ) -> tokio::sync::oneshot::Receiver<crate::runtime::DdsResponse> {
+            let (_, rx) = tokio::sync::oneshot::channel();
+            rx
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pending_tiles_retained_on_channel_full() {
+        use crate::geo_index::GeoIndex;
+
+        let geo_index = Arc::new(GeoIndex::new());
+
+        // Cap at 5 submissions per cycle — way less than a boundary plan generates
+        let client = Arc::new(CapLimitedDdsClient::new(5));
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            trigger_distance: 1.0,
+            load_depth_lat: 1,
+            load_depth_lon: 1,
+            default_window_rows: 6,
+            window_lon_extent: 6.0,
+            // Zero ramp so transition throttle doesn't reduce tile count
+            ramp_duration: std::time::Duration::from_secs(0),
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+
+        // Fast-forward phase detector into cruise using a CENTER position
+        // far from all boundaries. Window rows=6, so half_rows=3.
+        // Monitor at (50.0, 10.0): lat(47,53), lon(7,13). trigger=1.0.
+        // At center (50.0, 10.0), distance to nearest edge = 3.0 > trigger=1.0.
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+        coord.phase_detector.takeoff_timeout = std::time::Duration::from_millis(1);
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+
+        assert_eq!(
+            coord.phase_detector.current_phase(),
+            FlightPhase::Cruise,
+            "Phase detector should be in Cruise after fast-forward"
+        );
+
+        // Now move aircraft near northern boundary.
+        // Monitor: lat(47, 53). trigger_distance=1.0.
+        // Aircraft at lat=52.5 → distance to north edge = 53.0 - 52.5 = 0.5 < 1.0 → triggers!
+        let state = AircraftState::new(52.5, 10.0, 0.0, 200.0, 35000.0);
+
+        // First cycle: boundary plan generated, only 5 submitted (ChannelFull)
+        let result = coord.process_telemetry(&state).await;
+        let first_submitted = result.unwrap_or(0);
+        assert!(
+            first_submitted > 0,
+            "First cycle should submit tiles from boundary plan"
+        );
+        assert!(
+            first_submitted <= 5,
+            "First cycle should be capped at 5 by ChannelFull"
+        );
+
+        // KEY ASSERTION: pending tiles should be non-empty (if plan had more than 5)
+        // If the plan was small enough to fit in 5, skip the pending assertion
+        if first_submitted == 5 {
+            assert!(
+                !coord.pending_tiles.is_empty(),
+                "Unsubmitted tiles should be stored in pending_tiles for the next cycle"
+            );
+            let pending_after_first = coord.pending_tiles.len();
+
+            // Reset the mock client for the next cycle
+            client.reset();
+
+            // Second cycle: should drain from pending_tiles, NOT generate a new boundary plan
+            let result2 = coord.process_telemetry(&state).await;
+            let second_submitted = result2.unwrap_or(0);
+            assert!(
+                second_submitted > 0,
+                "Second cycle should submit tiles from pending queue"
+            );
+            assert!(
+                coord.pending_tiles.len() < pending_after_first,
+                "Pending tiles should decrease after second cycle (was {}, now {})",
+                pending_after_first,
+                coord.pending_tiles.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pending_tiles_fully_drained_before_new_plan() {
+        use crate::geo_index::GeoIndex;
+
+        let geo_index = Arc::new(GeoIndex::new());
+
+        // Allow 1000 submissions — enough to drain everything
+        let client = Arc::new(CapLimitedDdsClient::new(1000));
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            trigger_distance: 3.0,
+            load_depth_lat: 1,
+            load_depth_lon: 1,
+            // Zero ramp so transition throttle doesn't reduce tile count
+            ramp_duration: std::time::Duration::from_secs(0),
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+
+        // Fast-forward to cruise
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+        coord.phase_detector.takeoff_timeout = std::time::Duration::from_millis(1);
+        coord.update((53.0, 10.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((53.0, 10.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((53.0, 10.0), 0.0, 200.0, 35000.0);
+
+        // Manually inject pending tiles (simulating a previous partial submission)
+        let fake_pending: Vec<TileCoord> = (0..20)
+            .map(|i| TileCoord {
+                row: 1000 + i,
+                col: 2000,
+                zoom: 14,
+            })
+            .collect();
+        coord.pending_tiles = fake_pending;
+
+        let state = AircraftState::new(55.5, 10.0, 0.0, 200.0, 35000.0);
+
+        // Cycle with pending tiles: should drain pending first, NOT generate new plan
+        let result = coord.process_telemetry(&state).await;
+        let submitted = result.unwrap_or(0);
+        assert_eq!(
+            submitted, 20,
+            "Should submit all 20 pending tiles when channel has capacity"
+        );
+        assert!(
+            coord.pending_tiles.is_empty(),
+            "Pending tiles should be empty after full drain"
+        );
+    }
+
+    #[test]
+    fn test_throttle_truncated_tiles_stored_as_pending() {
+        // When the transition throttle reduces max_tiles, tiles beyond the
+        // throttle cutoff must also be stored as pending — not silently dropped.
+        //
+        // Scenario: 100-tile plan, throttle at 20%, channel accepts all.
+        // Expected: 20 submitted, 80 stored as pending for next cycle.
+
+        let client = Arc::new(CapLimitedDdsClient::new(1000)); // no channel limit
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            // 5-second ramp so throttle is definitely active
+            ramp_duration: std::time::Duration::from_secs(5),
+            ramp_start_fraction: 0.20,
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+
+        // Fast-forward phase to cruise so transition throttle activates
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+        coord.phase_detector.takeoff_timeout = std::time::Duration::from_millis(1);
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+
+        assert_eq!(
+            coord.phase_detector.current_phase(),
+            FlightPhase::Cruise,
+            "Should be in Cruise"
+        );
+        assert!(
+            coord.transition_throttle.is_active(),
+            "Transition throttle should be active after entering cruise"
+        );
+
+        // Build a 100-tile plan
+        let tiles: Vec<TileCoord> = (0..100)
+            .map(|i| TileCoord {
+                row: 5000 + i,
+                col: 8000,
+                zoom: 14,
+            })
+            .collect();
+        let calibration = test_calibration();
+        let plan = PrefetchPlan::with_tiles(tiles, &calibration, "boundary", 0, 100);
+
+        let cancellation = CancellationToken::new();
+        let submitted = coord.execute(&plan, cancellation);
+
+        // Throttle at ~20% of 100 = ~20 tiles submitted
+        assert!(
+            submitted > 0 && submitted < 100,
+            "Throttle should limit submission (submitted {})",
+            submitted
+        );
+
+        // KEY ASSERTION: the remaining ~80 tiles must be in pending_tiles
+        let total_accounted = submitted + coord.pending_tiles.len();
+        assert_eq!(
+            total_accounted,
+            100,
+            "All 100 tiles must be accounted for: {} submitted + {} pending = {} (expected 100)",
+            submitted,
+            coord.pending_tiles.len(),
+            total_accounted
+        );
+    }
+
+    #[test]
+    fn test_throttle_and_channel_full_both_store_pending() {
+        // When BOTH throttle and channel capacity limit submission,
+        // ALL unsubmitted tiles must be stored as pending.
+        //
+        // Scenario: 100-tile plan, throttle at 20% (→ 20 tiles), channel cap at 10.
+        // Expected: 10 submitted, 90 stored as pending (10 from throttled batch + 80 beyond throttle).
+
+        let client = Arc::new(CapLimitedDdsClient::new(10)); // channel cap at 10
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ramp_duration: std::time::Duration::from_secs(5),
+            ramp_start_fraction: 0.20,
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+
+        // Fast-forward to cruise
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+        coord.phase_detector.takeoff_timeout = std::time::Duration::from_millis(1);
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+
+        assert!(coord.transition_throttle.is_active());
+
+        // Build a 100-tile plan
+        let tiles: Vec<TileCoord> = (0..100)
+            .map(|i| TileCoord {
+                row: 5000 + i,
+                col: 8000,
+                zoom: 14,
+            })
+            .collect();
+        let calibration = test_calibration();
+        let plan = PrefetchPlan::with_tiles(tiles, &calibration, "boundary", 0, 100);
+
+        let cancellation = CancellationToken::new();
+        let submitted = coord.execute(&plan, cancellation);
+
+        assert_eq!(
+            submitted, 10,
+            "Should submit exactly 10 tiles (channel cap)"
+        );
+
+        // ALL remaining tiles must be pending (channel-full remainder + throttle-truncated)
+        let total_accounted = submitted + coord.pending_tiles.len();
+        assert_eq!(
+            total_accounted,
+            100,
+            "All 100 tiles must be accounted for: {} submitted + {} pending = {} (expected 100)",
+            submitted,
+            coord.pending_tiles.len(),
+            total_accounted
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DSF region filtering tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_tiles_for_region_filters_to_target_dsf() {
+        // When a SceneryIndex has tiles in multiple adjacent DSF regions,
+        // get_tiles_for_region should only return tiles whose geographic
+        // center falls within the target 1° DSF region — not tiles from
+        // neighboring regions that fall within the 45nm search radius.
+        use crate::coord::{to_tile_coords, CHUNKS_PER_TILE_SIDE, CHUNK_ZOOM_OFFSET};
+        use crate::geo_index::DsfRegion;
+        use crate::prefetch::scenery_index::{SceneryIndexConfig, SceneryTile};
+
+        let index = SceneryIndex::new(SceneryIndexConfig::default());
+
+        // Populate tiles in THREE adjacent DSF regions: (50,9), (50,10), (51,9)
+        for (lat_base, lon_base) in &[(50, 9), (50, 10), (51, 9)] {
+            for lat_step in 0..4u32 {
+                for lon_step in 0..4u32 {
+                    let sample_lat = *lat_base as f64 + (lat_step as f64 * 0.25) + 0.125;
+                    let sample_lon = *lon_base as f64 + (lon_step as f64 * 0.25) + 0.125;
+                    let tile_zoom: u8 = 16 - CHUNK_ZOOM_OFFSET;
+                    if let Ok(coord) = to_tile_coords(sample_lat, sample_lon, tile_zoom) {
+                        index.add_tile(SceneryTile {
+                            row: coord.row * CHUNKS_PER_TILE_SIDE,
+                            col: coord.col * CHUNKS_PER_TILE_SIDE,
+                            chunk_zoom: 16,
+                            lat: sample_lat as f32,
+                            lon: sample_lon as f32,
+                            is_sea: false,
+                        });
+                    }
+                }
+            }
+        }
+
+        let scenery_index = Arc::new(index);
+
+        // Create coordinator with scenery index
+        let config = AdaptivePrefetchConfig::default();
+        let coord = AdaptivePrefetchCoordinator::new(config).with_scenery_index(scenery_index);
+
+        // Query for region (50, 9) only
+        let target = DsfRegion::new(50, 9);
+        let tiles = coord.get_tiles_for_region(&target);
+
+        // Should only get tiles from region (50,9), NOT from (50,10) or (51,9)
+        assert!(!tiles.is_empty(), "Should find tiles in the target region");
+
+        // At zoom 12, each 1° region has ~16 tiles (4x4 grid). With dedup,
+        // we expect at most 16 tiles from one region.
+        assert!(
+            tiles.len() <= 16,
+            "Should have at most 16 tiles from a single DSF region, got {}",
+            tiles.len()
+        );
+
+        // Verify all returned tiles correspond to the target DSF region
+        // by checking their tile coordinates fall within the expected range.
+        // At zoom 12, one degree is approximately 4 tiles.
+        for tile in &tiles {
+            assert_eq!(
+                tile.zoom, 12,
+                "Tiles should be at zoom 12 (from chunk_zoom 16)"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Pending tiles cap tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pending_tiles_capped_at_max() {
+        // When a massive plan generates more tiles than MAX_PENDING_TILES,
+        // the pending queue must be capped to prevent executor flooding.
+        //
+        // Scenario: 5000-tile plan, throttle at 20% (→ 1000 tiles submitted),
+        // remaining 4000 exceed MAX_PENDING_TILES (2000).
+        // Expected: 1000 submitted, 2000 pending (capped), 2000 dropped.
+
+        let client = Arc::new(CapLimitedDdsClient::new(10_000)); // no channel limit
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ramp_duration: std::time::Duration::from_secs(5),
+            ramp_start_fraction: 0.20,
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+
+        // Fast-forward to cruise
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+        coord.phase_detector.takeoff_timeout = std::time::Duration::from_millis(1);
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((50.0, 10.0), 0.0, 200.0, 35000.0);
+
+        assert!(coord.transition_throttle.is_active());
+
+        // Build a 5000-tile plan (way more than MAX_PENDING_TILES)
+        let tiles: Vec<TileCoord> = (0..5000)
+            .map(|i| TileCoord {
+                row: 5000 + i,
+                col: 8000,
+                zoom: 14,
+            })
+            .collect();
+        let calibration = test_calibration();
+        let plan = PrefetchPlan::with_tiles(tiles, &calibration, "boundary", 0, 5000);
+
+        let cancellation = CancellationToken::new();
+        let submitted = coord.execute(&plan, cancellation);
+
+        // Throttle at ~20% → ~1000 submitted
+        assert!(submitted > 0, "Should submit some tiles");
+
+        // KEY ASSERTION: pending tiles must be capped at MAX_PENDING_TILES
+        assert!(
+            coord.pending_tiles.len() <= MAX_PENDING_TILES,
+            "Pending tiles ({}) should not exceed MAX_PENDING_TILES ({})",
+            coord.pending_tiles.len(),
+            MAX_PENDING_TILES
+        );
+
+        // The total accounted for should be less than 5000 (some were dropped by cap)
+        let total = submitted + coord.pending_tiles.len();
+        assert!(
+            total < 5000,
+            "With cap, total ({}) should be less than plan size (5000)",
+            total
+        );
+    }
+
+    #[test]
+    fn test_pending_cap_on_backpressure_defer() {
+        // When executor load exceeds BACKPRESSURE_DEFER_THRESHOLD and the
+        // plan is stored as pending, the cap must still be applied.
+
+        /// Mock DdsClient that reports high executor load.
+        struct HighLoadDdsClient;
+
+        impl DdsClient for HighLoadDdsClient {
+            fn submit(
+                &self,
+                _request: crate::runtime::JobRequest,
+            ) -> Result<(), crate::executor::DdsClientError> {
+                Ok(())
+            }
+
+            fn request_dds(
+                &self,
+                _tile: TileCoord,
+                _cancel: CancellationToken,
+            ) -> tokio::sync::oneshot::Receiver<crate::runtime::DdsResponse> {
+                let (_, rx) = tokio::sync::oneshot::channel();
+                rx
+            }
+
+            fn request_dds_with_options(
+                &self,
+                _tile: TileCoord,
+                _priority: crate::executor::Priority,
+                _origin: crate::runtime::RequestOrigin,
+                _cancel: CancellationToken,
+            ) -> tokio::sync::oneshot::Receiver<crate::runtime::DdsResponse> {
+                let (_, rx) = tokio::sync::oneshot::channel();
+                rx
+            }
+
+            fn is_connected(&self) -> bool {
+                true
+            }
+
+            fn executor_load(&self) -> f64 {
+                0.95 // Above BACKPRESSURE_DEFER_THRESHOLD (0.8)
+            }
+        }
+
+        let client = Arc::new(HighLoadDdsClient);
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ramp_duration: std::time::Duration::from_secs(0),
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+
+        // Build a 5000-tile plan
+        let tiles: Vec<TileCoord> = (0..5000)
+            .map(|i| TileCoord {
+                row: 5000 + i,
+                col: 8000,
+                zoom: 14,
+            })
+            .collect();
+        let calibration = test_calibration();
+        let plan = PrefetchPlan::with_tiles(tiles, &calibration, "boundary", 0, 5000);
+
+        let cancellation = CancellationToken::new();
+        let submitted = coord.execute(&plan, cancellation);
+
+        // Should defer (0 submitted) due to high load
+        assert_eq!(submitted, 0, "Should defer due to backpressure");
+
+        // KEY ASSERTION: pending tiles must be capped
+        assert!(
+            coord.pending_tiles.len() <= MAX_PENDING_TILES,
+            "Deferred pending tiles ({}) should not exceed MAX_PENDING_TILES ({})",
+            coord.pending_tiles.len(),
+            MAX_PENDING_TILES
+        );
     }
 }

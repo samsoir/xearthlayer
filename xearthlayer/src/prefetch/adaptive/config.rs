@@ -54,30 +54,11 @@ pub struct AdaptivePrefetchConfig {
     /// `calibration.opportunistic_threshold` during calibration.
     pub low_performance_killswitch: KillswitchMode,
 
-    /// Position trigger threshold (degrees into DSF tile).
-    ///
-    /// When mode is Aggressive, prefetch triggers at this position.
-    /// Must be less than X-Plane's 0.6° trigger point.
-    /// Range: 0.1 - 0.5
-    pub trigger_position: f64,
-
-    /// Lead distance (degrees ahead to prefetch).
-    ///
-    /// How far ahead of the aircraft to prefetch tiles.
-    /// Range: 1 - 4
-    pub lead_distance: u8,
-
-    /// Band width (DSF tiles perpendicular to travel).
-    ///
-    /// Width of prefetch band on each side of flight path.
-    /// A value of 2 means ±2 DSF tiles = 5 tiles wide total.
-    /// Range: 1 - 4
-    pub band_width: u8,
-
     /// Maximum tiles per prefetch cycle.
     ///
     /// Caps tiles submitted in a single prefetch operation.
-    /// Range: 500 - 10000
+    /// Controls queue depth, not processing rate (see `ResourcePool` prefetch fraction).
+    /// Range: 50 - 500
     pub max_tiles_per_cycle: u32,
 
     /// Ground strategy ring radius (degrees).
@@ -86,40 +67,66 @@ pub struct AdaptivePrefetchConfig {
     /// Range: 0.5 - 2.0
     pub ground_ring_radius: f64,
 
-    /// Time budget safety margin (percentage as decimal).
-    ///
-    /// Only prefetch if estimated time < available time × margin.
-    /// Range: 0.5 - 0.9
-    pub time_budget_margin: f64,
-
     /// Calibration thresholds and parameters.
     pub calibration: CalibrationConfig,
 
     /// Ground speed threshold for ground vs cruise detection (knots).
     ///
-    /// Aircraft with ground speed below this AND AGL below `agl_threshold_ft`
-    /// are considered on the ground.
+    /// Aircraft with ground speed below this are considered on the ground.
     pub ground_speed_threshold_kt: f32,
 
-    /// AGL threshold for ground vs cruise detection (feet).
-    ///
-    /// Aircraft with AGL below this AND ground speed below `ground_speed_threshold_kt`
-    /// are considered on the ground.
-    pub agl_threshold_ft: f32,
+    /// Altitude climb (feet) above takeoff MSL to release transition hold.
+    pub takeoff_climb_ft: f32,
 
-    /// Track stability threshold (degrees).
-    ///
-    /// Track deviation must be less than this for the track to be
-    /// considered stable after a turn.
-    pub track_stability_threshold: f64,
+    /// Maximum time before timeout release if climb threshold not reached.
+    pub takeoff_timeout: Duration,
 
-    /// Turn detection threshold (degrees).
-    ///
-    /// Track change greater than this triggers turn detection.
-    pub turn_threshold: f64,
+    /// Sustained duration at GS < 40kt before Cruise→Ground transition.
+    pub landing_hysteresis: Duration,
 
-    /// Duration track must be stable to consider it "stabilized".
-    pub track_stability_duration: Duration,
+    /// Duration of linear ramp from start fraction to full rate.
+    pub ramp_duration: Duration,
+
+    /// Starting prefetch fraction when ramp begins.
+    pub ramp_start_fraction: f64,
+
+    // Boundary-driven prefetch settings
+    /// Boundary trigger distance in degrees.
+    ///
+    /// How close to a DSF boundary the aircraft must be to trigger prefetch.
+    /// Range: 0.5 - 3.0
+    pub trigger_distance: f64,
+
+    /// Load depth for latitude boundary crossings (ROW loads).
+    /// Range: 1 - 5
+    pub load_depth_lat: u8,
+
+    /// Load depth for longitude boundary crossings (COLUMN loads).
+    /// Range: 1 - 5
+    pub load_depth_lon: u8,
+
+    /// Buffer tiles for retention.
+    ///
+    /// Extra tiles to retain beyond the visible window.
+    /// Range: 0 - 3
+    pub window_buffer: u8,
+
+    /// InProgress staleness timeout.
+    ///
+    /// How long a region can stay InProgress before being considered stale.
+    pub stale_region_timeout: Duration,
+
+    /// Assumed window height in DSF tiles.
+    ///
+    /// Used when the actual window size is unknown.
+    /// Range: 2 - 12
+    pub default_window_rows: usize,
+
+    /// Longitude extent in degrees for dynamic column computation.
+    ///
+    /// Columns computed as `ceil(lon_extent / cos(latitude))`.
+    /// Range: 1.0 - 10.0
+    pub window_lon_extent: f64,
 }
 
 impl Default for AdaptivePrefetchConfig {
@@ -128,18 +135,22 @@ impl Default for AdaptivePrefetchConfig {
             enabled: true,
             mode: PrefetchMode::Auto,
             low_performance_killswitch: KillswitchMode::Auto,
-            trigger_position: 0.35,
-            lead_distance: 2,
-            band_width: 2,
-            max_tiles_per_cycle: 3000,
+            max_tiles_per_cycle: 200,
             ground_ring_radius: 1.0,
-            time_budget_margin: 0.7,
             calibration: CalibrationConfig::default(),
             ground_speed_threshold_kt: 40.0,
-            agl_threshold_ft: 20.0,
-            track_stability_threshold: 5.0,
-            turn_threshold: 15.0,
-            track_stability_duration: Duration::from_secs(10),
+            takeoff_climb_ft: 1000.0,
+            takeoff_timeout: Duration::from_secs(90),
+            landing_hysteresis: Duration::from_secs(15),
+            ramp_duration: Duration::from_secs(30),
+            ramp_start_fraction: 0.25,
+            trigger_distance: 1.5,
+            load_depth_lat: 3,
+            load_depth_lon: 2,
+            window_buffer: 1,
+            stale_region_timeout: Duration::from_secs(120),
+            default_window_rows: 3,
+            window_lon_extent: 3.0,
         }
     }
 }
@@ -163,6 +174,18 @@ impl AdaptivePrefetchConfig {
                 sample_duration: Duration::from_secs(settings.calibration_sample_duration),
                 ..Default::default()
             },
+            takeoff_climb_ft: settings.takeoff_climb_ft,
+            takeoff_timeout: Duration::from_secs(settings.takeoff_timeout_secs),
+            landing_hysteresis: Duration::from_secs(settings.landing_hysteresis_secs),
+            ramp_duration: Duration::from_secs(settings.ramp_duration_secs),
+            ramp_start_fraction: settings.ramp_start_fraction,
+            trigger_distance: settings.trigger_distance,
+            load_depth_lat: settings.load_depth_lat,
+            load_depth_lon: settings.load_depth_lon,
+            window_buffer: settings.window_buffer,
+            stale_region_timeout: Duration::from_secs(settings.stale_region_timeout),
+            default_window_rows: settings.default_window_rows,
+            window_lon_extent: settings.window_lon_extent,
             ..Default::default()
         }
     }
@@ -183,13 +206,20 @@ impl AdaptivePrefetchConfig {
                 sample_duration: Duration::from_secs(config.calibration_sample_duration),
                 ..Default::default()
             },
+            takeoff_climb_ft: config.takeoff_climb_ft,
+            takeoff_timeout: Duration::from_secs(config.takeoff_timeout_secs),
+            landing_hysteresis: Duration::from_secs(config.landing_hysteresis_secs),
+            ramp_duration: Duration::from_secs(config.ramp_duration_secs),
+            ramp_start_fraction: config.ramp_start_fraction,
+            trigger_distance: config.trigger_distance,
+            load_depth_lat: config.load_depth_lat,
+            load_depth_lon: config.load_depth_lon,
+            window_buffer: config.window_buffer,
+            stale_region_timeout: Duration::from_secs(config.stale_region_timeout),
+            default_window_rows: config.default_window_rows,
+            window_lon_extent: config.window_lon_extent,
             ..Default::default()
         }
-    }
-
-    /// Get the turn detection threshold in degrees.
-    pub fn turn_threshold_deg(&self) -> f64 {
-        self.turn_threshold
     }
 }
 
@@ -367,10 +397,7 @@ mod tests {
         let config = AdaptivePrefetchConfig::default();
         assert!(config.enabled);
         assert_eq!(config.mode, PrefetchMode::Auto);
-        assert_eq!(config.trigger_position, 0.35);
-        assert_eq!(config.lead_distance, 2);
-        assert_eq!(config.band_width, 2);
-        assert_eq!(config.max_tiles_per_cycle, 3000);
+        assert_eq!(config.max_tiles_per_cycle, 200);
     }
 
     #[test]
@@ -433,17 +460,65 @@ mod tests {
         let config = AdaptivePrefetchConfig::default();
         // Ground speed threshold (40kt is reasonable for taxi)
         assert_eq!(config.ground_speed_threshold_kt, 40.0);
-        // AGL threshold (20ft catches all ground operations)
-        assert_eq!(config.agl_threshold_ft, 20.0);
     }
 
     #[test]
-    fn test_turn_detection_thresholds() {
+    fn test_default_config_boundary_prefetch() {
         let config = AdaptivePrefetchConfig::default();
-        // Stability threshold should be smaller than turn threshold
-        assert!(config.track_stability_threshold < config.turn_threshold);
-        // Reasonable values
-        assert_eq!(config.track_stability_threshold, 5.0);
-        assert_eq!(config.turn_threshold, 15.0);
+        assert_eq!(config.trigger_distance, 1.5);
+        assert_eq!(config.load_depth_lat, 3);
+        assert_eq!(config.load_depth_lon, 2);
+        assert_eq!(config.window_buffer, 1);
+        assert_eq!(config.stale_region_timeout, Duration::from_secs(120));
+        assert_eq!(config.default_window_rows, 3);
+        assert_eq!(config.window_lon_extent, 3.0);
+    }
+
+    #[test]
+    fn test_from_prefetch_settings_boundary_fields() {
+        let settings = PrefetchSettings {
+            enabled: true,
+            strategy: "adaptive".to_string(),
+            mode: "auto".to_string(),
+            udp_port: 49002,
+            max_tiles_per_cycle: 200,
+            cycle_interval_ms: 2000,
+            circuit_breaker_open_ms: 500,
+            circuit_breaker_half_open_secs: 2,
+            calibration_aggressive_threshold: 30.0,
+            calibration_opportunistic_threshold: 10.0,
+            calibration_sample_duration: 60,
+            takeoff_climb_ft: 1000.0,
+            takeoff_timeout_secs: 90,
+            landing_hysteresis_secs: 15,
+            ramp_duration_secs: 30,
+            ramp_start_fraction: 0.25,
+            trigger_distance: 2.0,
+            load_depth_lat: 4,
+            load_depth_lon: 3,
+            window_buffer: 2,
+            stale_region_timeout: 300,
+            default_window_rows: 4,
+            window_lon_extent: 4.0,
+        };
+
+        let config = AdaptivePrefetchConfig::from_prefetch_settings(&settings);
+        assert_eq!(config.trigger_distance, 2.0);
+        assert_eq!(config.load_depth_lat, 4);
+        assert_eq!(config.load_depth_lon, 3);
+        assert_eq!(config.window_buffer, 2);
+        assert_eq!(config.stale_region_timeout, Duration::from_secs(300));
+        assert_eq!(config.default_window_rows, 4);
+        assert_eq!(config.window_lon_extent, 4.0);
+    }
+
+    #[test]
+    fn test_default_config_transition_ramp() {
+        let config = AdaptivePrefetchConfig::default();
+        assert_eq!(config.takeoff_climb_ft, 1000.0);
+        assert_eq!(config.takeoff_timeout, Duration::from_secs(90));
+        assert_eq!(config.landing_hysteresis, Duration::from_secs(15));
+        assert_eq!(config.ramp_duration, Duration::from_secs(30));
+        assert_eq!(config.ramp_start_fraction, 0.25);
     }
 }

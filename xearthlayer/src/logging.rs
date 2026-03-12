@@ -25,7 +25,15 @@ use tracing_subscriber::fmt::time::OffsetTime;
 /// Guard that must be kept alive for the duration of logging.
 ///
 /// Dropping this guard will flush and close the log file writer.
+/// Field order matters: Rust drops struct fields in declaration order.
+/// Chrome flush guard must drop before the writer guard to ensure
+/// buffered trace events are flushed to the non-blocking writer
+/// before it shuts down.
 pub struct LoggingGuard {
+    #[cfg(feature = "profiling")]
+    _chrome_flush_guard: Option<tracing_chrome::FlushGuard>,
+    #[cfg(feature = "profiling")]
+    _chrome_writer_guard: Option<WorkerGuard>,
     _file_guard: WorkerGuard,
 }
 
@@ -73,10 +81,10 @@ pub fn init_logging_with_options(
     log_file: &str,
     stdout_enabled: bool,
 ) -> Result<LoggingGuard, io::Error> {
-    init_logging_full(log_dir, log_file, stdout_enabled, false)
+    init_logging_full(log_dir, log_file, stdout_enabled, false, false)
 }
 
-/// Initialize logging system with full options including debug mode.
+/// Initialize logging system with full options including debug and profile modes.
 ///
 /// Creates logs directory if needed, clears previous log file,
 /// and sets up output to file and optionally stdout.
@@ -87,6 +95,7 @@ pub fn init_logging_with_options(
 /// * `log_file` - Log filename (e.g., "xearthlayer.log")
 /// * `stdout_enabled` - Whether to also output to stdout (disable for TUI mode)
 /// * `debug_mode` - Whether to enable debug-level logging (overrides RUST_LOG)
+/// * `profile_mode` - Whether to enable Chrome Trace profiling (requires `profiling` feature)
 ///
 /// # Returns
 ///
@@ -100,6 +109,7 @@ pub fn init_logging_full(
     log_file: &str,
     stdout_enabled: bool,
     debug_mode: bool,
+    profile_mode: bool,
 ) -> Result<LoggingGuard, io::Error> {
     // Create logs directory if it doesn't exist
     fs::create_dir_all(log_dir)?;
@@ -114,16 +124,51 @@ pub fn init_logging_full(
     let (non_blocking_file, file_guard) = tracing_appender::non_blocking(file_appender);
 
     // Create env filter
-    // Priority: debug_mode flag > RUST_LOG env var > default (info)
+    // Flags are combinable: --debug + --profile enables both debug logs and profiling spans.
     //
     // When debug_mode is enabled, we only enable DEBUG for xearthlayer crate.
     // Third-party crates (especially fuse3) produce extremely verbose DEBUG output
     // that can flood the log and cause performance issues.
-    let env_filter = if debug_mode {
-        EnvFilter::new("info,xearthlayer=debug")
-    } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    //
+    // When profile_mode is enabled, we enable DEBUG for the "profiling" target —
+    // our spans use `target: "profiling"` to isolate them from ambient events.
+    let env_filter = match (profile_mode, debug_mode) {
+        (true, true) => EnvFilter::new("info,fuse3=warn,profiling=debug,xearthlayer=debug"),
+        (true, false) => EnvFilter::new("info,fuse3=warn,profiling=debug"),
+        (false, true) => EnvFilter::new("info,xearthlayer=debug"),
+        (false, false) => {
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+        }
     };
+
+    // Chrome tracing layer for --profile mode (requires `profiling` feature)
+    //
+    // Uses a non-blocking writer to avoid mutex contention: tracing-chrome
+    // holds an internal Mutex for every span/event write. With dozens of
+    // concurrent tokio tasks, synchronous file I/O under that lock causes
+    // severe contention. The non-blocking wrapper sends writes to a
+    // background thread via a channel, keeping the critical section fast.
+    #[cfg(feature = "profiling")]
+    let (chrome_layer, chrome_flush_guard, chrome_writer_guard) = if profile_mode {
+        let trace_path = Path::new(log_dir).join(format!(
+            "xearthlayer-trace-{}.json",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        ));
+        eprintln!("Profile trace: {}", trace_path.display());
+        let trace_file = fs::File::create(&trace_path)?;
+        let (non_blocking_trace, writer_guard) = tracing_appender::non_blocking(trace_file);
+        let (layer, flush_guard) = tracing_chrome::ChromeLayerBuilder::new()
+            .writer(non_blocking_trace)
+            .build();
+        (Some(layer), Some(flush_guard), Some(writer_guard))
+    } else {
+        (None, None, None)
+    };
+
+    #[cfg(not(feature = "profiling"))]
+    if profile_mode {
+        eprintln!("Warning: --profile requires the 'profiling' feature. Rebuild with: cargo build --features profiling");
+    }
 
     // Use different formats for debug vs release builds
     #[cfg(debug_assertions)]
@@ -144,6 +189,15 @@ pub fn init_logging_full(
                 .pretty()
         });
 
+        #[cfg(feature = "profiling")]
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(file_layer)
+            .with(stdout_layer)
+            .with(chrome_layer)
+            .init();
+
+        #[cfg(not(feature = "profiling"))]
         tracing_subscriber::registry()
             .with(env_filter)
             .with(file_layer)
@@ -179,6 +233,15 @@ pub fn init_logging_full(
                 .with_timer(timer)
         });
 
+        #[cfg(feature = "profiling")]
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(file_layer)
+            .with(stdout_layer)
+            .with(chrome_layer)
+            .init();
+
+        #[cfg(not(feature = "profiling"))]
         tracing_subscriber::registry()
             .with(env_filter)
             .with(file_layer)
@@ -187,6 +250,10 @@ pub fn init_logging_full(
     }
 
     Ok(LoggingGuard {
+        #[cfg(feature = "profiling")]
+        _chrome_flush_guard: chrome_flush_guard,
+        #[cfg(feature = "profiling")]
+        _chrome_writer_guard: chrome_writer_guard,
         _file_guard: file_guard,
     })
 }
@@ -326,7 +393,13 @@ mod tests {
         let (non_blocking, guard) = NonBlocking::new(std::io::sink());
         drop(non_blocking); // Simulate using the writer
 
-        let _logging_guard = LoggingGuard { _file_guard: guard };
+        let _logging_guard = LoggingGuard {
+            #[cfg(feature = "profiling")]
+            _chrome_flush_guard: None,
+            #[cfg(feature = "profiling")]
+            _chrome_writer_guard: None,
+            _file_guard: guard,
+        };
 
         // Guard is alive and will be dropped at end of scope
     }

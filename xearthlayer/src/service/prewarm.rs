@@ -154,14 +154,20 @@ impl PrewarmOrchestrator {
         }
 
         // Generate DSF grid and scan for tiles
-        let dsf_tiles = generate_dsf_grid(airport.latitude, airport.longitude, config.grid_size);
+        let dsf_tiles = generate_dsf_grid(
+            airport.latitude,
+            airport.longitude,
+            config.grid_rows,
+            config.grid_cols,
+        );
         let bounds = DsfGridBounds::from_tiles(&dsf_tiles);
 
         tracing::debug!(
             airport_lat = airport.latitude,
             airport_lon = airport.longitude,
             airport_name = %airport.name,
-            grid_size = config.grid_size,
+            grid_rows = config.grid_rows,
+            grid_cols = config.grid_cols,
             dsf_tiles = dsf_tiles.len(),
             bounds = ?bounds,
             "Starting tile-based prewarm"

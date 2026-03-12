@@ -187,11 +187,17 @@ impl MetricsDaemon {
             }
 
             // Memory cache events
-            MetricEvent::MemoryCacheHit => {
+            MetricEvent::MemoryCacheHit { is_fuse } => {
                 self.state.memory_cache_hits += 1;
+                if is_fuse {
+                    self.state.fuse_memory_cache_hits += 1;
+                }
             }
-            MetricEvent::MemoryCacheMiss => {
+            MetricEvent::MemoryCacheMiss { is_fuse } => {
                 self.state.memory_cache_misses += 1;
+                if is_fuse {
+                    self.state.fuse_memory_cache_misses += 1;
+                }
             }
             MetricEvent::MemoryCacheSizeUpdate { bytes } => {
                 self.state.memory_cache_size_bytes = bytes;
@@ -387,8 +393,8 @@ mod tests {
         assert_eq!(daemon.state.disk_cache_hits, 1);
         assert_eq!(daemon.state.disk_cache_misses, 2);
 
-        daemon.process_event(MetricEvent::MemoryCacheHit);
-        daemon.process_event(MetricEvent::MemoryCacheMiss);
+        daemon.process_event(MetricEvent::MemoryCacheHit { is_fuse: true });
+        daemon.process_event(MetricEvent::MemoryCacheMiss { is_fuse: false });
         daemon.process_event(MetricEvent::MemoryCacheSizeUpdate { bytes: 1_000_000 });
 
         assert_eq!(daemon.state.memory_cache_hits, 1);

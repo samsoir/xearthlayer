@@ -168,15 +168,19 @@ impl MetricsClient {
     // =========================================================================
 
     /// Records a memory cache hit.
+    ///
+    /// * `is_fuse` - `true` if from a FUSE (X-Plane) request
     #[inline]
-    pub fn memory_cache_hit(&self) {
-        self.send(MetricEvent::MemoryCacheHit);
+    pub fn memory_cache_hit(&self, is_fuse: bool) {
+        self.send(MetricEvent::MemoryCacheHit { is_fuse });
     }
 
     /// Records a memory cache miss.
+    ///
+    /// * `is_fuse` - `true` if from a FUSE (X-Plane) request
     #[inline]
-    pub fn memory_cache_miss(&self) {
-        self.send(MetricEvent::MemoryCacheMiss);
+    pub fn memory_cache_miss(&self, is_fuse: bool) {
+        self.send(MetricEvent::MemoryCacheMiss { is_fuse });
     }
 
     /// Updates the current memory cache size.
@@ -355,8 +359,8 @@ mod tests {
         client.disk_cache_miss();
         client.disk_write_completed(2048, 1000);
         client.disk_cache_size(9_000_000_000);
-        client.memory_cache_hit();
-        client.memory_cache_miss();
+        client.memory_cache_hit(true);
+        client.memory_cache_miss(false);
         client.memory_cache_size(1_000_000);
 
         assert!(matches!(
@@ -377,10 +381,13 @@ mod tests {
                 bytes: 9_000_000_000
             })
         ));
-        assert!(matches!(rx.recv().await, Some(MetricEvent::MemoryCacheHit)));
         assert!(matches!(
             rx.recv().await,
-            Some(MetricEvent::MemoryCacheMiss)
+            Some(MetricEvent::MemoryCacheHit { is_fuse: true })
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(MetricEvent::MemoryCacheMiss { is_fuse: false })
         ));
         assert!(matches!(
             rx.recv().await,

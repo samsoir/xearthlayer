@@ -231,8 +231,8 @@ pub trait OptionalMetrics {
     fn disk_write_completed(&self, bytes: u64, duration_us: u64);
     fn disk_cache_initial_size(&self, bytes: u64);
     fn disk_cache_size(&self, bytes: u64);
-    fn memory_cache_hit(&self);
-    fn memory_cache_miss(&self);
+    fn memory_cache_hit(&self, is_fuse: bool);
+    fn memory_cache_miss(&self, is_fuse: bool);
     fn memory_cache_size(&self, bytes: u64);
     fn job_submitted(&self, is_fuse: bool);
     fn job_started(&self);
@@ -318,16 +318,16 @@ impl OptionalMetrics for Option<MetricsClient> {
     }
 
     #[inline]
-    fn memory_cache_hit(&self) {
+    fn memory_cache_hit(&self, is_fuse: bool) {
         if let Some(client) = self {
-            client.memory_cache_hit();
+            client.memory_cache_hit(is_fuse);
         }
     }
 
     #[inline]
-    fn memory_cache_miss(&self) {
+    fn memory_cache_miss(&self, is_fuse: bool) {
         if let Some(client) = self {
-            client.memory_cache_miss();
+            client.memory_cache_miss(is_fuse);
         }
     }
 

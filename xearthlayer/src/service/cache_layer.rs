@@ -135,11 +135,8 @@ impl CacheLayer {
             "Disk cache service started in CacheLayer with internal GC daemon"
         );
 
-        // 3. Create bridge adapters with metrics
-        let memory_bridge = Arc::new(MemoryCacheBridge::with_metrics(
-            memory_service.cache(),
-            metrics.clone(),
-        ));
+        // 3. Create bridge adapters (metrics tracked by executor daemon, not bridge)
+        let memory_bridge = Arc::new(MemoryCacheBridge::new(memory_service.cache()));
 
         let disk_bridge = Arc::new(DiskCacheBridge::with_metrics(disk_service.cache(), metrics));
 

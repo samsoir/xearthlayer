@@ -149,23 +149,40 @@ disk_io_profile = auto
 
 ### [texture]
 
-Controls DDS texture output format.
+Controls DDS texture output format and compression backend.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `format` | string | `bc1` | DDS compression: `bc1` (smaller, opaque) or `bc3` (larger, with alpha) |
 | `mipmaps` | integer | `5` | Number of mipmap levels (1-10) |
+| `compressor` | string | `ispc` | Compression backend: `software`, `ispc` (SIMD), or `gpu` (wgpu compute) |
+| `gpu_device` | string | `integrated` | GPU adapter: `integrated`, `discrete`, or adapter name substring |
 
 **Example:**
 ```ini
 [texture]
 format = bc1
-mipmaps = 5
+compressor = gpu
+gpu_device = integrated
 ```
 
 **Format Comparison:**
 - **BC1 (DXT1)**: 4:1 compression, ~11MB per 4096x4096 tile. Best for satellite imagery.
 - **BC3 (DXT5)**: 4:1 compression with alpha, ~22MB per tile. Use if transparency is needed.
+
+**Compressor Backends:**
+- **software**: Pure-Rust block compression. Slowest, no external dependencies.
+- **ispc** (default): Intel ISPC SIMD compression via `intel_tex_2`. 5-10x faster than software.
+- **gpu**: wgpu compute shader compression. Requires `--features gpu-encode` at build time.
+  Offloads encoding to GPU, freeing CPU for X-Plane. Best when an idle integrated GPU is available.
+
+**GPU Device Selection:**
+- `integrated` — Use the integrated GPU (e.g., AMD Radeon on Ryzen). Recommended when
+  a discrete GPU is handling X-Plane display.
+- `discrete` — Use the discrete GPU. Only recommended if no integrated GPU is available.
+- `<name>` — Match by adapter name substring (e.g., `Radeon`, `RTX 5090`).
+
+Run `xearthlayer diagnostics` to see available GPU adapters.
 
 ### [download]
 
@@ -317,7 +334,7 @@ The system uses flight phase detection and performance calibration:
 
 2. **Flight Phase Strategies**:
    - **Ground Strategy**: Ring-based prefetch around position (GS < 40kt, AGL < 20ft)
-   - **Cruise Strategy**: Track-based band prefetch ahead of flight path (GS > 40kt)
+   - **Cruise Strategy**: Boundary-driven row/column prefetch using SceneryWindow and BoundaryMonitor (GS > 40kt)
 
 3. **Mode Selection**: Based on calibration throughput:
    - **Aggressive**: >30 tiles/sec - Position-based trigger (0.3° into DSF tile)
@@ -330,14 +347,25 @@ The system uses flight phase detection and performance calibration:
 | `strategy` | string | `auto` | Strategy selection: `auto` (recommended) or `adaptive` |
 | `mode` | string | `auto` | Mode selection: `auto`, `aggressive`, `opportunistic`, `disabled` |
 | `udp_port` | integer | `49002` | UDP port for X-Plane telemetry (ForeFlight protocol) |
-| `max_tiles_per_cycle` | integer | `3000` | Maximum tiles to submit per prefetch cycle |
+| `max_tiles_per_cycle` | integer | `200` | Maximum tiles to submit per prefetch cycle |
 | `cycle_interval_ms` | integer | `2000` | Interval between prefetch cycles (milliseconds) |
-| `circuit_breaker_threshold` | float | `50.0` | FUSE jobs/sec threshold to pause prefetching |
 | `circuit_breaker_open_ms` | integer | `500` | Duration (ms) high load must be sustained to pause |
 | `circuit_breaker_half_open_secs` | integer | `2` | Cooloff time (secs) before resuming prefetch |
 | `calibration_aggressive_threshold` | float | `30.0` | Tiles/sec threshold for aggressive mode |
 | `calibration_opportunistic_threshold` | float | `10.0` | Tiles/sec threshold for opportunistic mode |
 | `calibration_sample_duration` | integer | `60` | Duration (secs) to measure throughput during calibration |
+| `takeoff_climb_ft` | float | `1000` | Altitude climb (ft) above takeoff MSL to release transition hold (200-5000) |
+| `takeoff_timeout_secs` | integer | `90` | Maximum seconds before timeout release (30-300) |
+| `landing_hysteresis_secs` | integer | `15` | Sustained seconds at GS < 40kt before landing detection (5-60) |
+| `ramp_duration_secs` | integer | `30` | Duration of linear ramp to full prefetch rate (10-120) |
+| `ramp_start_fraction` | float | `0.25` | Starting prefetch fraction when ramp begins (0.1-0.5) |
+| `trigger_distance` | float | `1.5` | Distance from window edge (degrees) to trigger prefetch (0.5-3.0) |
+| `load_depth_lat` | integer | `3` | DSF rows to prefetch for latitude boundary crossings (1-5) |
+| `load_depth_lon` | integer | `2` | DSF columns to prefetch for longitude boundary crossings (1-5) |
+| `window_buffer` | integer | `1` | Extra DSF tiles around window edges to retain (0-3) |
+| `stale_region_timeout` | integer | `120` | Seconds before an InProgress region is considered stale (30-600) |
+| `default_window_rows` | integer | `3` | Scenery window height in DSF rows — ~3° at all latitudes (2-12) |
+| `window_lon_extent` | float | `3.0` | Longitude extent in degrees for window column computation (1.0-10.0) |
 
 **Mode Options:**
 
@@ -350,11 +378,11 @@ The system uses flight phase detection and performance calibration:
 
 **Circuit Breaker:**
 
-The circuit breaker automatically pauses prefetching when X-Plane is loading scenery (detected by high FUSE request rate). This prevents prefetch from competing with X-Plane's direct tile requests:
+The circuit breaker automatically pauses prefetching when the executor is under heavy load (detected by resource pool utilization). This prevents prefetch from competing with X-Plane's direct tile requests:
 
-- **Closed (Active)**: Normal prefetching, FUSE rate below threshold
-- **Open (Paused)**: Prefetching paused, FUSE rate exceeded threshold
-- **Half-Open (Resuming)**: Testing if safe to resume after cooloff
+- **Closed (Active)**: Normal prefetching, executor load below threshold
+- **Open (Paused)**: Prefetching paused, executor load exceeded threshold for `circuit_breaker_open_ms`
+- **Half-Open (Resuming)**: Testing if safe to resume after `circuit_breaker_half_open_secs` cooloff
 
 **Example:**
 ```ini
@@ -369,7 +397,7 @@ max_tiles_per_cycle = 3000     ; Tiles per cycle
 cycle_interval_ms = 2000       ; Cycle interval (ms)
 
 ; Circuit breaker (pause prefetch during scene loading)
-circuit_breaker_threshold = 50.0      ; FUSE jobs/sec to trigger pause
+; Uses resource pool utilization (not FUSE rate) since v0.3.1
 circuit_breaker_open_ms = 500         ; Sustained load duration to open
 circuit_breaker_half_open_secs = 2    ; Cooloff before resuming
 
@@ -377,7 +405,33 @@ circuit_breaker_half_open_secs = 2    ; Cooloff before resuming
 calibration_aggressive_threshold = 30.0      ; Above = aggressive mode
 calibration_opportunistic_threshold = 10.0   ; Above = opportunistic, below = disabled
 calibration_sample_duration = 60             ; Calibration period (seconds)
+
+; Transition ramp (takeoff phase management)
+takeoff_climb_ft = 1000                      ; Feet above takeoff MSL to release hold
+takeoff_timeout_secs = 90                    ; Max seconds before timeout release
+landing_hysteresis_secs = 15                 ; Sustained GS < 40kt for landing detection
+ramp_duration_secs = 30                      ; Linear ramp duration after hold release
+ramp_start_fraction = 0.25                   ; Starting prefetch fraction (25%)
+
+; Boundary-driven prefetch (cruise mode)
+; trigger_distance = 1.5                     ; Distance from edge (degrees) to trigger
+; load_depth_lat = 3                         ; DSF rows for latitude boundary crossings
+; load_depth_lon = 2                         ; DSF columns for longitude boundary crossings
+; window_buffer = 1                          ; Extra DSF tiles around window edges
+; stale_region_timeout = 120                 ; Seconds before InProgress region is stale
+; default_window_rows = 3                    ; Scenery window height (DSF rows, ~3° worldwide)
+; window_lon_extent = 3.0                    ; Longitude extent (degrees) for column computation
 ```
+
+**Transition Ramp:**
+
+The prefetch system uses a three-phase flight model to manage system resources during critical flight phases:
+
+- **Ground** (GS < 40kt): Full-rate prefetch using ring strategy around current position
+- **Transition** (GS >= 40kt, climbing): Prefetch fully suppressed while X-Plane loads takeoff scenery
+- **Cruise** (climb confirmed): Prefetch ramps from `ramp_start_fraction` to full rate over `ramp_duration_secs`
+
+The transition hold releases when the aircraft climbs `takeoff_climb_ft` feet above the MSL altitude recorded at takeoff, or when `takeoff_timeout_secs` elapses (whichever comes first). This adapts to all aircraft types: a jet releases in ~25s, a slow GA aircraft may use the full timeout.
 
 **X-Plane Setup:**
 To enable prefetching, configure X-Plane to send ForeFlight telemetry:
@@ -385,7 +439,7 @@ To enable prefetching, configure X-Plane to send ForeFlight telemetry:
 2. Enable **Send to ForeFlight**
 3. XEarthLayer will receive position/heading updates on UDP port 49002
 
-**Note:** Prefetch works best with telemetry for heading-aware band calculation, but the system remains functional without it by using FUSE file access patterns to infer aircraft position
+**Note:** Prefetch works best with telemetry for boundary-driven region prefetching, but the system remains functional without it by using FUSE file access patterns to infer aircraft position
 
 ### [prewarm]
 
@@ -393,48 +447,26 @@ Controls cold-start cache pre-warming. Use with `xearthlayer run --airport ICAO`
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `radius_nm` | float | `100` | Radius in nautical miles around the airport to prewarm |
+| `grid_rows` | integer | `3` | Latitude extent in DSF tiles around the airport to prewarm |
+| `grid_cols` | integer | `4` | Longitude extent in DSF tiles around the airport to prewarm |
 
-**Understanding X-Plane's DSF Loading:**
+**DSF Grid-Based Pre-warming:**
 
-X-Plane loads terrain in DSF (Digital Scenery File) tiles, each covering 1° × 1° of lat/lon. The number of tiles loaded depends on the "Extended DSFs" setting:
+Prewarm uses X-Plane's native DSF tile grid (1° × 1° tiles) to determine which tiles to prepare. The `grid_rows` and `grid_cols` settings define the rectangular grid centered on the departure airport. The default 3×4 grid (12 tiles) matches X-Plane's empirically measured ~3° lat × ~4° lon scenery window at mid-latitudes.
 
-| Setting | Tiles Loaded | Approximate Area |
-|---------|--------------|------------------|
-| Standard | 3×2 = 6 tiles | ~180nm × 120nm (equator) |
-| Extended DSFs | 4×3 = 12 tiles | ~240nm × 180nm (equator) |
-
-At mid-latitudes (~47°N, typical for Europe), this translates to roughly:
-- **Standard**: ~90nm radius equivalent
-- **Extended**: ~120nm radius equivalent
-
-The default 100nm prewarm radius is optimized for standard DSF loading—it covers the initial scenery load without wasting bandwidth on tiles X-Plane won't request until you fly further.
-
-**Dynamic Resolution via LOAD_CENTER:**
-
-X-Plane's orthophoto textures use `LOAD_CENTER` directives that enable dynamic resolution loading. As you approach a tile, X-Plane progressively loads higher resolution versions. This means:
-
-1. Distant tiles load at low resolution (fast, small)
-2. Nearby tiles load at full resolution (slower, larger)
-3. XEarthLayer's prewarm prepares the full-resolution versions for immediate use
+| Rows × Cols | Tiles | Approximate Coverage (mid-latitudes) |
+|-------------|-------|--------------------------------------|
+| 3 × 4 (default) | 12 tiles | ~180nm × 240nm |
+| 4 × 6 | 24 tiles | ~240nm × 360nm |
+| 6 × 8 | 48 tiles | ~360nm × 480nm |
 
 **Example:**
 ```ini
 [prewarm]
-; Pre-warm tiles within 100nm of departure airport
-; This covers X-Plane's standard 3×2 DSF loading region
-radius_nm = 100
+; Pre-warm a 3×4 DSF grid around departure airport
+grid_rows = 3
+grid_cols = 4
 ```
-
-**Increasing the Radius:**
-
-If you use Extended DSFs or want more aggressive pre-warming:
-```ini
-[prewarm]
-radius_nm = 150  ; Cover extended DSF region
-```
-
-Note: Larger radii increase pre-warm time and bandwidth usage proportionally (area scales with radius²).
 
 ### [xplane]
 
@@ -557,6 +589,27 @@ When multiple sources provide position data simultaneously, the APT system selec
 3. **Scene Inference** (100km) — fallback from FUSE file access patterns
 4. **Manual Reference** (100m) — airport prewarm seed
 
+### [fuse]
+
+Controls Linux FUSE kernel parameters for concurrent background request limits. The Linux kernel's default limits (12 max background / 9 congestion threshold) are far too low for X-Plane's concurrent scenery reads, causing sim freezes at DSF boundaries.
+
+| Setting | Default | Range | Description |
+|---------|---------|-------|-------------|
+| `max_background` | 256 | 1-1024 | Maximum pending background FUSE requests before the kernel queues them |
+| `congestion_threshold` | 192 | 1-1024 | Kernel starts throttling when pending requests exceed this (convention: 75% of max_background) |
+
+**When to modify:**
+- If you experience sim freezes at DSF boundaries, try increasing both values
+- If system memory is very limited, you might reduce them (but the defaults are recommended)
+- `congestion_threshold` should always be less than `max_background`
+
+**Example:**
+```ini
+[fuse]
+max_background = 256
+congestion_threshold = 192
+```
+
 ## Complete Example
 
 ```ini
@@ -571,7 +624,8 @@ disk_size = 50GB
 
 [texture]
 format = bc1
-mipmaps = 5
+; compressor = ispc       ; software, ispc (default), or gpu (requires --features gpu-encode)
+; gpu_device = integrated  ; integrated, discrete, or adapter name substring
 
 [download]
 timeout = 30
@@ -615,7 +669,6 @@ mode = auto                    ; auto, aggressive, opportunistic, disabled
 ; cycle_interval_ms = 2000     ; cycle interval (ms)
 
 ; Circuit breaker (pause prefetch during scene loading)
-; circuit_breaker_threshold = 50.0      ; FUSE jobs/sec to trigger
 ; circuit_breaker_open_ms = 500         ; duration to sustain before pause
 ; circuit_breaker_half_open_secs = 2    ; cooloff before resuming
 
@@ -624,9 +677,26 @@ mode = auto                    ; auto, aggressive, opportunistic, disabled
 ; calibration_opportunistic_threshold = 10.0 ; above = opportunistic, below = disabled
 ; calibration_sample_duration = 60           ; calibration period (seconds)
 
+; Transition ramp (takeoff phase management)
+; takeoff_climb_ft = 1000                    ; feet above takeoff MSL to release
+; takeoff_timeout_secs = 90                  ; max seconds before timeout release
+; landing_hysteresis_secs = 15               ; sustained GS < 40kt for landing
+; ramp_duration_secs = 30                    ; linear ramp duration after release
+; ramp_start_fraction = 0.25                 ; starting prefetch fraction
+
+; Boundary-driven prefetch (cruise mode)
+; trigger_distance = 1.5                     ; distance from edge (degrees) to trigger
+; load_depth_lat = 3                         ; DSF rows for latitude boundary crossings
+; load_depth_lon = 2                         ; DSF columns for longitude boundary crossings
+; window_buffer = 1                          ; extra DSF tiles around window edges
+; stale_region_timeout = 120                 ; seconds before InProgress region is stale
+; default_window_rows = 3                    ; scenery window height (DSF rows)
+; window_lon_extent = 3.0                    ; longitude extent for column computation
+
 [prewarm]
 ; Cold-start cache pre-warming (use with --airport ICAO)
-; radius_nm = 100              ; Pre-warm radius (100nm covers standard DSF loading)
+; grid_rows = 3               ; latitude extent in DSF tiles (default: 3)
+; grid_cols = 4               ; longitude extent in DSF tiles (default: 4)
 
 [xplane]
 ; scenery_dir = /path/to/X-Plane 12/Custom Scenery
@@ -655,6 +725,12 @@ pilot_id = 0
 ; api_url = https://status.vatsim.net/status.json
 ; poll_interval_secs = 15
 ; max_stale_secs = 60
+
+[fuse]
+; FUSE kernel limits for concurrent background requests (advanced)
+; The Linux kernel default of 12/9 causes X-Plane freezes at DSF boundaries
+max_background = 256
+congestion_threshold = 192
 ```
 
 ## Config CLI Commands
@@ -737,6 +813,8 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `cache.disk_size` | size (e.g., `20GB`) | Disk cache size |
 | `cache.disk_io_profile` | `auto`, `hdd`, `ssd`, `nvme` | Disk I/O concurrency profile |
 | `texture.format` | `bc1`, `bc3` | DDS compression format |
+| `texture.compressor` | `software`, `ispc`, `gpu` | Compression backend (`gpu` requires `gpu-encode` feature) |
+| `texture.gpu_device` | `integrated`, `discrete`, or name | GPU adapter selection (used when compressor = gpu) |
 | `download.timeout` | positive integer | Chunk download timeout (seconds) |
 | `generation.threads` | positive integer | Worker threads |
 | `generation.timeout` | positive integer | Tile generation timeout (seconds) |
@@ -760,13 +838,25 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `prefetch.udp_port` | positive integer | X-Plane telemetry UDP port |
 | `prefetch.max_tiles_per_cycle` | positive integer | Max tiles per prefetch cycle |
 | `prefetch.cycle_interval_ms` | positive integer | Prefetch cycle interval (ms) |
-| `prefetch.circuit_breaker_threshold` | positive number | FUSE jobs/sec to pause prefetch |
 | `prefetch.circuit_breaker_open_ms` | positive integer | Sustained load duration (ms) |
 | `prefetch.circuit_breaker_half_open_secs` | positive integer | Cooloff time (secs) |
 | `prefetch.calibration_aggressive_threshold` | positive number | Tiles/sec for aggressive mode |
 | `prefetch.calibration_opportunistic_threshold` | positive number | Tiles/sec for opportunistic mode |
 | `prefetch.calibration_sample_duration` | positive integer | Calibration period (seconds) |
-| `prewarm.radius_nm` | positive number | Pre-warm radius around airport (nm) |
+| `prefetch.takeoff_climb_ft` | 200-5000 | Feet above takeoff MSL to release hold |
+| `prefetch.takeoff_timeout_secs` | 30-300 | Max seconds before timeout release |
+| `prefetch.landing_hysteresis_secs` | 5-60 | Sustained GS < 40kt for landing detection |
+| `prefetch.ramp_duration_secs` | 10-120 | Linear ramp duration (seconds) |
+| `prefetch.ramp_start_fraction` | 0.1-0.5 | Starting prefetch fraction |
+| `prefetch.trigger_distance` | 0.5-3.0 | Distance from window edge (degrees) to trigger prefetch |
+| `prefetch.load_depth_lat` | 1-5 | DSF rows for latitude boundary crossings |
+| `prefetch.load_depth_lon` | 1-5 | DSF columns for longitude boundary crossings |
+| `prefetch.window_buffer` | 0-3 | Extra DSF tiles around window edges |
+| `prefetch.stale_region_timeout` | 30-600 | Seconds before InProgress region is stale |
+| `prefetch.default_window_rows` | 2-12 | Scenery window height (DSF rows) |
+| `prefetch.window_lon_extent` | 1.0-10.0 | Longitude extent (degrees) for column computation |
+| `prewarm.grid_rows` | positive integer | Latitude extent in DSF tiles for prewarm |
+| `prewarm.grid_cols` | positive integer | Longitude extent in DSF tiles for prewarm |
 | `xplane.scenery_dir` | path | X-Plane Custom Scenery directory |
 | `packages.library_url` | URL | Package library index URL |
 | `packages.install_location` | path | Package installation directory |

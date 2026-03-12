@@ -40,6 +40,8 @@ pub struct ConfigFile {
     pub executor: ExecutorSettings,
     /// Online network settings for VATSIM/IVAO/PilotEdge position
     pub online_network: OnlineNetworkSettings,
+    /// FUSE filesystem settings
+    pub fuse: FuseSettings,
 }
 
 /// Provider configuration.
@@ -71,6 +73,10 @@ pub struct CacheSettings {
 pub struct TextureSettings {
     /// DDS format: BC1 or BC3
     pub format: DdsFormat,
+    /// Compressor backend: "software", "ispc", or "gpu"
+    pub compressor: String,
+    /// GPU device selector: "integrated", "discrete", or adapter name substring
+    pub gpu_device: String,
 }
 
 /// Download configuration.
@@ -200,6 +206,50 @@ pub struct PrefetchSettings {
     /// How long to measure throughput during initial calibration (seconds).
     /// Default: 60
     pub calibration_sample_duration: u64,
+
+    // Transition ramp settings
+    /// Altitude climb (feet) above takeoff MSL to release transition hold.
+    /// Default: 1000.0, Range: 200-5000
+    pub takeoff_climb_ft: f32,
+    /// Maximum seconds before timeout release if climb threshold not reached.
+    /// Default: 90, Range: 30-300
+    pub takeoff_timeout_secs: u64,
+    /// Sustained seconds at GS < 40kt before Cruise→Ground transition.
+    /// Default: 15, Range: 5-60
+    pub landing_hysteresis_secs: u64,
+    /// Duration (seconds) of linear ramp from start fraction to full rate.
+    /// Default: 30, Range: 10-120
+    pub ramp_duration_secs: u64,
+    /// Starting prefetch fraction when ramp begins.
+    /// Default: 0.25, Range: 0.1-0.5
+    pub ramp_start_fraction: f64,
+
+    // Boundary-driven prefetch settings
+    /// Boundary trigger distance in degrees.
+    /// How close to a DSF boundary the aircraft must be to trigger prefetch.
+    /// Default: 1.5, Range: 0.5-3.0
+    pub trigger_distance: f64,
+    /// Load depth for latitude boundary crossings (ROW loads).
+    /// Default: 3, Range: 1-5
+    pub load_depth_lat: u8,
+    /// Load depth for longitude boundary crossings (COLUMN loads).
+    /// Default: 2, Range: 1-5
+    pub load_depth_lon: u8,
+    /// Buffer tiles for retention.
+    /// Extra tiles to retain beyond the visible window.
+    /// Default: 1, Range: 0-3
+    pub window_buffer: u8,
+    /// InProgress staleness timeout in seconds.
+    /// How long a region can stay InProgress before being considered stale.
+    /// Default: 120, Range: 30-600
+    pub stale_region_timeout: u64,
+    /// Assumed window height in DSF tiles.
+    /// Default: 3, Range: 2-12
+    pub default_window_rows: usize,
+    /// Longitude extent in degrees for scenery window computation.
+    /// Columns are computed dynamically: ceil(lon_extent / cos(lat)).
+    /// Default: 3.0, Range: 1.0-10.0
+    pub window_lon_extent: f64,
 }
 
 /// Control plane configuration for job management and health monitoring.
@@ -224,9 +274,12 @@ pub struct ControlPlaneSettings {
 /// Prewarm configuration for cold-start cache warming.
 #[derive(Debug, Clone)]
 pub struct PrewarmSettings {
-    /// Grid size in DSF tiles (N = N×N grid) around an airport to prewarm.
-    /// Default: 8 (8×8 grid = 64 DSF tiles, ~480nm × 480nm at mid-latitudes)
-    pub grid_size: u32,
+    /// Grid rows in DSF tiles (latitude extent).
+    /// Default: 3 (matches ~3° latitude window)
+    pub grid_rows: u32,
+    /// Grid columns in DSF tiles (longitude extent).
+    /// Default: 4 (matches ~3°/cos(lat) longitude window at mid-latitudes)
+    pub grid_cols: u32,
 }
 
 /// Patches configuration for custom Ortho4XP tile patches.
@@ -295,6 +348,19 @@ pub struct OnlineNetworkSettings {
     /// Maximum age in seconds before data is considered stale.
     /// Default: 60
     pub max_stale_secs: u64,
+}
+
+/// FUSE filesystem settings for kernel background request limits.
+#[derive(Debug, Clone)]
+pub struct FuseSettings {
+    /// Maximum pending background FUSE requests before the kernel queues.
+    /// Higher values allow more concurrent X-Plane scenery reads.
+    /// Default: 256
+    pub max_background: u16,
+    /// Congestion threshold for background FUSE requests.
+    /// Kernel starts throttling when pending requests exceed this.
+    /// Default: 192 (75% of max_background)
+    pub congestion_threshold: u16,
 }
 
 impl Default for OnlineNetworkSettings {

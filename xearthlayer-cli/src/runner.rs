@@ -35,6 +35,19 @@ impl CliRunner {
     ///
     /// * `debug_mode` - When true, enables debug-level logging regardless of RUST_LOG
     pub fn with_debug(debug_mode: bool) -> Result<Self, CliError> {
+        Self::with_options(debug_mode, false)
+    }
+
+    /// Create a new CLI runner with debug and profile options.
+    ///
+    /// When stdout is a TTY, stdout logging is disabled to prevent
+    /// interference with the TUI dashboard.
+    ///
+    /// # Arguments
+    ///
+    /// * `debug_mode` - When true, enables debug-level logging regardless of RUST_LOG
+    /// * `profile_mode` - When true, enables Chrome Trace profiling output
+    pub fn with_options(debug_mode: bool, profile_mode: bool) -> Result<Self, CliError> {
         // Load config file (or use defaults if not present)
         let config = ConfigFile::load()?;
 
@@ -53,8 +66,14 @@ impl CliRunner {
         // This prevents log messages from corrupting the TUI display
         let stdout_enabled = !atty::is(atty::Stream::Stdout);
 
-        let logging_guard = init_logging_full(&log_dir, &log_file, stdout_enabled, debug_mode)
-            .map_err(|e| CliError::LoggingInit(e.to_string()))?;
+        let logging_guard = init_logging_full(
+            &log_dir,
+            &log_file,
+            stdout_enabled,
+            debug_mode,
+            profile_mode,
+        )
+        .map_err(|e| CliError::LoggingInit(e.to_string()))?;
 
         Ok(Self {
             logging_guard,

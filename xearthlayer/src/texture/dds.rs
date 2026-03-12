@@ -3,14 +3,16 @@
 //! Provides a `TextureEncoder` implementation that encodes RGBA images
 //! to DirectDraw Surface (DDS) format with BC1/BC3 compression.
 
-use crate::dds::{DdsEncoder, DdsFormat, DdsHeader};
+use crate::dds::{default_compressor, BlockCompressor, DdsEncoder, DdsFormat, DdsHeader};
 use crate::texture::{TextureEncoder, TextureError};
 use image::RgbaImage;
+use std::sync::Arc;
 
 /// DDS texture encoder.
 ///
 /// Encodes RGBA images to DDS format with configurable compression
-/// and mipmap generation.
+/// and mipmap generation. The compressor backend is shared via `Arc`
+/// across clones, allowing efficient reuse in the concurrent pipeline.
 ///
 /// # Example
 ///
@@ -24,10 +26,30 @@ use image::RgbaImage;
 /// assert_eq!(encoder.extension(), "dds");
 /// assert_eq!(encoder.name(), "DDS BC1");
 /// ```
-#[derive(Debug, Clone)]
 pub struct DdsTextureEncoder {
     format: DdsFormat,
     mipmap_count: usize,
+    compressor: Arc<dyn BlockCompressor>,
+}
+
+impl Clone for DdsTextureEncoder {
+    fn clone(&self) -> Self {
+        Self {
+            format: self.format,
+            mipmap_count: self.mipmap_count,
+            compressor: Arc::clone(&self.compressor),
+        }
+    }
+}
+
+impl std::fmt::Debug for DdsTextureEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DdsTextureEncoder")
+            .field("format", &self.format)
+            .field("mipmap_count", &self.mipmap_count)
+            .field("compressor", &self.compressor.name())
+            .finish()
+    }
 }
 
 impl DdsTextureEncoder {
@@ -42,6 +64,7 @@ impl DdsTextureEncoder {
         Self {
             format,
             mipmap_count: 5,
+            compressor: default_compressor(),
         }
     }
 
@@ -63,6 +86,16 @@ impl DdsTextureEncoder {
     /// ```
     pub fn with_mipmap_count(mut self, count: usize) -> Self {
         self.mipmap_count = count;
+        self
+    }
+
+    /// Set the block compressor backend.
+    ///
+    /// # Arguments
+    ///
+    /// * `compressor` - A shared block compressor implementation
+    pub fn with_compressor(mut self, compressor: Arc<dyn BlockCompressor>) -> Self {
+        self.compressor = compressor;
         self
     }
 
@@ -116,7 +149,9 @@ impl DdsTextureEncoder {
 
 impl TextureEncoder for DdsTextureEncoder {
     fn encode(&self, image: &RgbaImage) -> Result<Vec<u8>, TextureError> {
-        let encoder = DdsEncoder::new(self.format).with_mipmap_count(self.mipmap_count);
+        let encoder = DdsEncoder::new(self.format)
+            .with_mipmap_count(self.mipmap_count)
+            .with_compressor(Arc::clone(&self.compressor));
         encoder.encode(image).map_err(TextureError::from)
     }
 
@@ -329,5 +364,44 @@ mod tests {
     fn test_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DdsTextureEncoder>();
+    }
+
+    #[test]
+    fn test_with_compressor_software() {
+        use crate::dds::SoftwareCompressor;
+
+        let encoder =
+            DdsTextureEncoder::new(DdsFormat::BC1).with_compressor(Arc::new(SoftwareCompressor));
+
+        // Should encode successfully with software compressor
+        let image = RgbaImage::new(4, 4);
+        let result = encoder.encode(&image);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_with_compressor_clone() {
+        use crate::dds::SoftwareCompressor;
+
+        let encoder1 =
+            DdsTextureEncoder::new(DdsFormat::BC1).with_compressor(Arc::new(SoftwareCompressor));
+        let encoder2 = encoder1.clone();
+
+        // Both clones should encode successfully
+        let image = RgbaImage::new(4, 4);
+        assert!(encoder1.encode(&image).is_ok());
+        assert!(encoder2.encode(&image).is_ok());
+    }
+
+    #[test]
+    fn test_with_compressor_debug() {
+        use crate::dds::SoftwareCompressor;
+
+        let encoder =
+            DdsTextureEncoder::new(DdsFormat::BC1).with_compressor(Arc::new(SoftwareCompressor));
+
+        let debug_str = format!("{:?}", encoder);
+        assert!(debug_str.contains("DdsTextureEncoder"));
+        assert!(debug_str.contains("software"));
     }
 }

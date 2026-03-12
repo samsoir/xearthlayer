@@ -84,6 +84,13 @@ impl MetricsReporter for TuiReporter {
             0.0
         };
 
+        let fuse_memory_total = state.fuse_memory_cache_hits + state.fuse_memory_cache_misses;
+        let fuse_memory_hit_rate = if fuse_memory_total > 0 {
+            state.fuse_memory_cache_hits as f64 / fuse_memory_total as f64
+        } else {
+            0.0
+        };
+
         let disk_total = state.disk_cache_hits + state.disk_cache_misses;
         let disk_hit_rate = if disk_total > 0 {
             state.disk_cache_hits as f64 / disk_total as f64
@@ -141,6 +148,7 @@ impl MetricsReporter for TuiReporter {
             memory_cache_hits: state.memory_cache_hits,
             memory_cache_misses: state.memory_cache_misses,
             memory_cache_hit_rate: memory_hit_rate,
+            fuse_memory_cache_hit_rate: fuse_memory_hit_rate,
             memory_cache_size_bytes: state.memory_cache_size_bytes,
             disk_cache_hits: state.disk_cache_hits,
             disk_cache_misses: state.disk_cache_misses,

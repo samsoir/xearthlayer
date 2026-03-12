@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuse3::raw::reply::FileAttr;
 use fuse3::FileType;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, warn, Instrument};
 
 use std::sync::Arc;
 
@@ -439,8 +439,12 @@ pub trait DdsRequestor: FileAttrBuilder {
         // Submit request via DdsClient
         let rx = client.request_dds(tile, cancellation_token.clone());
 
-        // Await response with timeout
-        match tokio::time::timeout(timeout, rx).await {
+        // Await response with timeout (instrumented for profiling)
+        let dds_await_span = tracing::debug_span!(target: "profiling", "dds_await", tile_row = tile.row, tile_col = tile.col,);
+        match tokio::time::timeout(timeout, rx)
+            .instrument(dds_await_span)
+            .await
+        {
             Ok(Ok(response)) => {
                 debug!(
                     tile_row = tile.row,

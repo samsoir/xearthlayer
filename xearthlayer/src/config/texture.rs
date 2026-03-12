@@ -25,12 +25,16 @@ use crate::dds::DdsFormat;
 /// assert_eq!(config.format(), DdsFormat::BC3);
 /// assert_eq!(config.mipmap_count(), 3);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextureConfig {
     /// DDS compression format (BC1 or BC3)
     format: DdsFormat,
     /// Number of mipmap levels (1-10, default: 5 for 4096→256)
     mipmap_count: usize,
+    /// Compressor backend: "software", "ispc", or "gpu"
+    compressor: String,
+    /// GPU device selector: "integrated", "discrete", or adapter name substring
+    gpu_device: String,
 }
 
 impl TextureConfig {
@@ -41,6 +45,8 @@ impl TextureConfig {
         Self {
             format,
             mipmap_count: DEFAULT_MIPMAP_COUNT,
+            compressor: crate::config::defaults::DEFAULT_COMPRESSOR.to_string(),
+            gpu_device: crate::config::defaults::DEFAULT_GPU_DEVICE.to_string(),
         }
     }
 
@@ -64,6 +70,28 @@ impl TextureConfig {
     pub fn mipmap_count(&self) -> usize {
         self.mipmap_count
     }
+
+    /// Set the compressor backend.
+    pub fn with_compressor(mut self, compressor: String) -> Self {
+        self.compressor = compressor;
+        self
+    }
+
+    /// Set the GPU device selector.
+    pub fn with_gpu_device(mut self, gpu_device: String) -> Self {
+        self.gpu_device = gpu_device;
+        self
+    }
+
+    /// Get the compressor backend.
+    pub fn compressor(&self) -> &str {
+        &self.compressor
+    }
+
+    /// Get the GPU device selector.
+    pub fn gpu_device(&self) -> &str {
+        &self.gpu_device
+    }
 }
 
 impl Default for TextureConfig {
@@ -71,6 +99,8 @@ impl Default for TextureConfig {
         Self {
             format: DdsFormat::BC1,
             mipmap_count: DEFAULT_MIPMAP_COUNT,
+            compressor: crate::config::defaults::DEFAULT_COMPRESSOR.to_string(),
+            gpu_device: crate::config::defaults::DEFAULT_GPU_DEVICE.to_string(),
         }
     }
 }
@@ -108,9 +138,9 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_semantics() {
+    fn test_clone_semantics() {
         let config1 = TextureConfig::new(DdsFormat::BC1);
-        let config2 = config1; // Copy, not move
+        let config2 = config1.clone();
         assert_eq!(config1.format(), config2.format());
     }
 
@@ -130,5 +160,21 @@ mod tests {
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("TextureConfig"));
         assert!(debug_str.contains("BC1"));
+    }
+
+    #[test]
+    fn test_texture_config_compressor_default() {
+        let config = TextureConfig::default();
+        assert_eq!(config.compressor(), "ispc");
+        assert_eq!(config.gpu_device(), "integrated");
+    }
+
+    #[test]
+    fn test_texture_config_with_compressor() {
+        let config = TextureConfig::default()
+            .with_compressor("gpu".to_string())
+            .with_gpu_device("Radeon".to_string());
+        assert_eq!(config.compressor(), "gpu");
+        assert_eq!(config.gpu_device(), "Radeon");
     }
 }

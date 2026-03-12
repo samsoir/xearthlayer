@@ -315,7 +315,7 @@ impl XEarthLayerService {
         );
 
         // 5. Create texture encoder
-        let dds_encoder = builder::create_encoder(&config);
+        let dds_encoder = builder::create_encoder(&config)?;
 
         // 6. Create XEarthLayer runtime with cache bridges
         // Clone metrics_client before passing to RuntimeBuilder (we need it for GC daemon)
@@ -405,7 +405,7 @@ impl XEarthLayerService {
         } = builder::create_providers(&provider_config, &runtime_handle)?;
 
         // 2. Create texture encoder
-        let dds_encoder = builder::create_encoder(&config);
+        let dds_encoder = builder::create_encoder(&config)?;
 
         // 3. Create cache components
         let CacheComponents {
@@ -531,7 +531,7 @@ impl XEarthLayerService {
         } = builder::create_providers(&provider_config, &runtime_handle)?;
 
         // 2. Create texture encoder
-        let dds_encoder = builder::create_encoder(&config);
+        let dds_encoder = builder::create_encoder(&config)?;
 
         // 3. Create metrics system
         let metrics_system = MetricsSystem::new(&runtime_handle);

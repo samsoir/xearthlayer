@@ -28,7 +28,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace, warn, Instrument};
 
 /// Task that downloads all chunks for a tile.
 ///
@@ -111,48 +111,57 @@ where
         &'a self,
         ctx: &'a mut TaskContext,
     ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
-        Box::pin(async move {
-            // Check for cancellation before starting
-            if ctx.is_cancelled() {
-                return TaskResult::Cancelled;
+        let span = tracing::debug_span!(
+            target: "profiling",
+            "task_download",
+            tile_row = self.tile.row,
+            tile_col = self.tile.col,
+        );
+        Box::pin(
+            async move {
+                // Check for cancellation before starting
+                if ctx.is_cancelled() {
+                    return TaskResult::Cancelled;
+                }
+
+                let job_id = ctx.job_id();
+                let metrics = ctx.metrics_clone();
+                debug!(
+                    job_id = %job_id,
+                    tile = ?self.tile,
+                    "Starting chunk downloads"
+                );
+
+                // Download all chunks with metrics tracking
+                let chunks = download_all_chunks(
+                    self.tile,
+                    Arc::clone(&self.provider),
+                    Arc::clone(&self.disk_cache),
+                    &self.config,
+                    metrics,
+                )
+                .await;
+
+                // Check for cancellation after downloads
+                if ctx.is_cancelled() {
+                    return TaskResult::Cancelled;
+                }
+
+                debug!(
+                    job_id = %job_id,
+                    success_count = chunks.success_count(),
+                    failure_count = chunks.failure_count(),
+                    "Chunk downloads complete"
+                );
+
+                // Store chunks in task output for next task
+                let mut output = TaskOutput::new();
+                output.set("chunks", chunks);
+
+                TaskResult::SuccessWithOutput(output)
             }
-
-            let job_id = ctx.job_id();
-            let metrics = ctx.metrics_clone();
-            debug!(
-                job_id = %job_id,
-                tile = ?self.tile,
-                "Starting chunk downloads"
-            );
-
-            // Download all chunks with metrics tracking
-            let chunks = download_all_chunks(
-                self.tile,
-                Arc::clone(&self.provider),
-                Arc::clone(&self.disk_cache),
-                &self.config,
-                metrics,
-            )
-            .await;
-
-            // Check for cancellation after downloads
-            if ctx.is_cancelled() {
-                return TaskResult::Cancelled;
-            }
-
-            debug!(
-                job_id = %job_id,
-                success_count = chunks.success_count(),
-                failure_count = chunks.failure_count(),
-                "Chunk downloads complete"
-            );
-
-            // Store chunks in task output for next task
-            let mut output = TaskOutput::new();
-            output.set("chunks", chunks);
-
-            TaskResult::SuccessWithOutput(output)
-        })
+            .instrument(span),
+        )
     }
 }
 

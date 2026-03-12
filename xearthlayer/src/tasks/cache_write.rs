@@ -22,7 +22,7 @@ use crate::metrics::OptionalMetrics;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, Instrument};
 
 /// Task that writes DDS data to the memory cache.
 ///
@@ -80,50 +80,54 @@ where
         &'a self,
         ctx: &'a mut TaskContext,
     ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
-        Box::pin(async move {
-            // Check for cancellation before starting
-            if ctx.is_cancelled() {
-                return TaskResult::Cancelled;
-            }
-
-            let job_id = ctx.job_id();
-
-            // Get DDS data from previous task
-            let dds_data: Option<&Vec<u8>> = ctx.get_output("EncodeDds", "dds_data");
-            let dds_data = match dds_data {
-                Some(data) => data.clone(),
-                None => {
-                    return TaskResult::Failed(TaskError::missing_input("dds_data"));
+        let span = tracing::debug_span!(target: "profiling", "task_cache_write");
+        Box::pin(
+            async move {
+                // Check for cancellation before starting
+                if ctx.is_cancelled() {
+                    return TaskResult::Cancelled;
                 }
-            };
 
-            let size = dds_data.len();
+                let job_id = ctx.job_id();
 
-            debug!(
-                job_id = %job_id,
-                tile = ?self.tile,
-                size_bytes = size,
-                "Writing to memory cache"
-            );
+                // Get DDS data from previous task
+                let dds_data: Option<&Vec<u8>> = ctx.get_output("EncodeDds", "dds_data");
+                let dds_data = match dds_data {
+                    Some(data) => data.clone(),
+                    None => {
+                        return TaskResult::Failed(TaskError::missing_input("dds_data"));
+                    }
+                };
 
-            // Memory cache is async-safe (uses moka internally)
-            self.memory_cache
-                .put(self.tile.row, self.tile.col, self.tile.zoom, dds_data)
-                .await;
+                let size = dds_data.len();
 
-            // Emit updated cache size to metrics
-            let total_size = self.memory_cache.size_bytes();
-            ctx.metrics_clone().memory_cache_size(total_size as u64);
+                debug!(
+                    job_id = %job_id,
+                    tile = ?self.tile,
+                    size_bytes = size,
+                    "Writing to memory cache"
+                );
 
-            debug!(
-                job_id = %job_id,
-                tile = ?self.tile,
-                cache_size_bytes = total_size,
-                "Cache write complete"
-            );
+                // Memory cache is async-safe (uses moka internally)
+                self.memory_cache
+                    .put(self.tile.row, self.tile.col, self.tile.zoom, dds_data)
+                    .await;
 
-            TaskResult::Success
-        })
+                // Emit updated cache size to metrics
+                let total_size = self.memory_cache.size_bytes();
+                ctx.metrics_clone().memory_cache_size(total_size as u64);
+
+                debug!(
+                    job_id = %job_id,
+                    tile = ?self.tile,
+                    cache_size_bytes = total_size,
+                    "Cache write complete"
+                );
+
+                TaskResult::Success
+            }
+            .instrument(span),
+        )
     }
 }
 

@@ -12,12 +12,12 @@ use crate::prefetch::TileRequestCallback;
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
-    DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyInit, ReplyOpen, ReplyStatFs,
+    DirectoryEntry, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyInit, ReplyOpen,
+    ReplyStatFs,
 };
 use fuse3::raw::Filesystem;
 use fuse3::{Errno, MountOptions, Result as Fuse3InternalResult};
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::stream::{self, Stream, StreamExt};
 use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -264,20 +264,13 @@ impl DdsRequestor for Fuse3PassthroughFS {
 
 impl Filesystem for Fuse3PassthroughFS {
     // Required: Associated types for directory streams
-    type DirEntryStream<'a>
-        = BoxStream<'a, Fuse3InternalResult<DirectoryEntry>>
-    where
-        Self: 'a;
-    type DirEntryPlusStream<'a>
-        = BoxStream<'a, Fuse3InternalResult<DirectoryEntryPlus>>
-    where
-        Self: 'a;
-
     /// Initialize filesystem.
     async fn init(&self, _req: Request) -> Fuse3InternalResult<ReplyInit> {
         debug!("fuse3: init");
         Ok(ReplyInit {
             max_write: NonZeroU32::new(1024 * 1024).unwrap(), // 1MB max write
+            max_background: None,
+            congestion_threshold: None,
         })
     }
 
@@ -427,7 +420,9 @@ impl Filesystem for Fuse3PassthroughFS {
         ino: u64,
         _fh: u64,
         offset: i64,
-    ) -> Fuse3InternalResult<ReplyDirectory<Self::DirEntryStream<'_>>> {
+    ) -> Fuse3InternalResult<
+        ReplyDirectory<impl Stream<Item = Fuse3InternalResult<DirectoryEntry>> + Send + '_>,
+    > {
         trace!(ino = ino, offset = offset, "fuse3: readdir");
 
         let path = self

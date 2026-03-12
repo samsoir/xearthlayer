@@ -20,6 +20,9 @@ Technical documentation for XEarthLayer developers and contributors.
 | [DDS Implementation](dds-implementation.md) | BC1/BC3 texture compression, mipmap generation |
 | [GeoIndex Design](geo-index-design.md) | Geospatial reference database, patch region ownership |
 | [Cache Design](cache-design.md) | Two-tier caching (memory + disk), LRU eviction |
+| [Cache Service Design](cache-service-design.md) | CacheLayer lifecycle, GC daemons, bridge adapters |
+| [Cache Load Transition Ramp](cache-load-transition-ramp-design.md) | TransitionThrottle design for takeoff phase management |
+| [Index Building Optimization](index-building-optimization.md) | OrthoUnionIndex caching and parallel scanning |
 | [Parallel Processing](parallel-processing.md) | Thread pools, legacy coalescing |
 | [Network Stats](network-stats.md) | Download metrics, bandwidth tracking |
 | ~~[Async Pipeline Architecture](async-pipeline-architecture.md)~~ | **(DEPRECATED)** Superseded by Job Executor Framework in v0.3.0 |
@@ -41,13 +44,19 @@ Technical documentation for XEarthLayer developers and contributors.
 |----------|-------------|
 | [Scenery Patches](scenery-patches.md) | Bring-your-own-scenery patches with GeoIndex region ownership (current) |
 | [Airport Scenery Integration](airport-scenery-integration.md) | **Planned (0.3.x)**: Dynamic texture generation for patches (previously implemented, temporarily removed) |
-| [Adaptive Prefetch Design](adaptive-prefetch-design.md) | **Primary design doc**: Self-calibrating prefetch with flight phase detection (v0.3.0+) |
+| [Adaptive Prefetch Design](adaptive-prefetch-design.md) | **Primary design doc**: Boundary-driven prefetch with SceneryWindow, dual BoundaryMonitors, and flight phase detection (v0.3.0+) |
 | [X-Plane Scenery Loading Whitepaper](xplane-scenery-loading-whitepaper.md) | Research on X-Plane 12's scenery loading behavior |
 | [Prefetch Flight Test Plan](prefetch-flight-test-plan.md) | Flight test data informing prefetch design |
 | [Aircraft Telemetry Architecture](aircraft-telemetry-architecture.md) | ForeFlight UDP telemetry integration |
 | ~~[Predictive Caching](predictive-caching.md)~~ | **(SUPERSEDED)** Original radial prefetcher design |
 | ~~[Heading-Aware Prefetch](heading-aware-prefetch-design.md)~~ | **(SUPERSEDED)** Cone-based prefetch algorithm |
 | ~~[Tile-Based Prefetch Design](tile-based-prefetch-design.md)~~ | **(SUPERSEDED)** DSF tile-based approach |
+
+## Operations
+
+| Document | Description |
+|----------|-------------|
+| [Application Release Runbook](app-release-runbook.md) | Release workflow, versioning, and troubleshooting |
 
 ## Root Cause Analysis
 
@@ -79,7 +88,7 @@ xearthlayer-cli
             │       └── adapters (cache, provider bridges)
             ├── runtime (orchestration, health monitoring)
             ├── jobs (DdsGenerateJob, TilePrefetchJob)
-            ├── tasks (download, assemble, encode, cache)
+            ├── tasks (DownloadChunks, BuildAndCacheDds)
             ├── texture (DDS encoding)
             ├── cache (memory + disk)
             ├── fuse/fuse3 (async multi-threaded filesystem)
@@ -90,7 +99,7 @@ xearthlayer-cli
             ├── geo_index (geospatial reference database)
             ├── ortho_union (tile → source mapping)
             ├── patches (patch discovery, validation)
-            ├── prefetch (adaptive prefetch, flight phase detection)
+            ├── prefetch (boundary-driven adaptive prefetch, flight phase detection)
             ├── package (metadata, library parsing)
             ├── manager (mounts, symlinks, install/update/remove)
             └── publisher (scan, build, release)
@@ -102,7 +111,7 @@ xearthlayer-cli
 # Clone and build
 git clone https://github.com/samsoir/xearthlayer.git
 cd xearthlayer
-make init
+make init      # Installs toolchain components + git hooks
 make verify
 
 # Run tests
@@ -119,4 +128,4 @@ make doc-open
 - **Coverage**: Maintain 80%+ test coverage
 - **Formatting**: Run `cargo fmt` before committing
 - **Linting**: Run `cargo clippy` with no warnings
-- **Pre-commit**: Run `make pre-commit` before pushing
+- **Pre-commit hook**: Installed by `make init` (or `make setup-hooks`), runs `make pre-commit` automatically before each commit. Skips doc-only changes. Bypass with `git commit --no-verify`.

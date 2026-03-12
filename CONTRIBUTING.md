@@ -15,10 +15,12 @@ Thanks for your interest in contributing to XEarthLayer! This guide covers every
 ```bash
 git clone https://github.com/samsoir/xearthlayer.git
 cd xearthlayer
-make init    # Installs rustfmt + clippy components
+make init    # Installs rustfmt + clippy + git hooks
 make build   # Debug build
 make test    # Run all tests
 ```
+
+`make init` automatically installs the pre-commit hook (via `make setup-hooks`) which runs `make pre-commit` before every commit. You can re-run `make setup-hooks` at any time to reinstall the hook.
 
 ## Development Workflow
 
@@ -29,7 +31,7 @@ make test    # Run all tests
 
 ### Before Submitting a PR
 
-**Always run pre-commit checks:**
+**Pre-commit checks run automatically** via the git hook installed by `make init`. They also run manually:
 
 ```bash
 make pre-commit   # fmt + clippy + tests (required)
@@ -39,6 +41,8 @@ This runs:
 1. `cargo fmt` — code formatting
 2. `cargo clippy -- -D warnings` — lint with warnings as errors
 3. `cargo test` — full test suite with strict mode
+
+The hook skips checks for documentation-only commits (no `.rs`, `.toml`, or `Makefile` changes). To bypass the hook in exceptional cases: `git commit --no-verify`.
 
 CI will reject PRs that haven't passed these checks.
 

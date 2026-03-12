@@ -15,44 +15,26 @@ use tracing::warn;
 
 use crate::cache::traits::Cache;
 use crate::coord::TileCoord;
-use crate::metrics::MetricsClient;
 
 /// Cache client for DDS tile storage.
 ///
-/// Translates `TileCoord` to cache keys and optionally reports metrics
-/// on cache hits and misses.
+/// Translates `TileCoord` to cache keys.
+///
+/// Memory cache hit/miss metrics are tracked by the executor daemon
+/// (which knows the request origin) rather than here.
 pub struct TileCacheClient {
     /// The underlying generic cache.
     cache: Arc<dyn Cache>,
-
-    /// Optional metrics client for hit/miss reporting.
-    metrics: Option<MetricsClient>,
 }
 
 impl TileCacheClient {
-    /// Create a new tile cache client without metrics.
+    /// Create a new tile cache client.
     ///
     /// # Arguments
     ///
     /// * `cache` - The underlying cache implementation
     pub fn new(cache: Arc<dyn Cache>) -> Self {
-        Self {
-            cache,
-            metrics: None,
-        }
-    }
-
-    /// Create a new tile cache client with metrics.
-    ///
-    /// # Arguments
-    ///
-    /// * `cache` - The underlying cache implementation
-    /// * `metrics` - Metrics client for reporting
-    pub fn with_metrics(cache: Arc<dyn Cache>, metrics: MetricsClient) -> Self {
-        Self {
-            cache,
-            metrics: Some(metrics),
-        }
+        Self { cache }
     }
 
     /// Get a tile from the cache.
@@ -69,23 +51,10 @@ impl TileCacheClient {
     pub async fn get(&self, tile: &TileCoord) -> Option<Vec<u8>> {
         let key = Self::tile_to_key(tile);
         match self.cache.get(&key).await {
-            Ok(Some(data)) => {
-                if let Some(ref m) = self.metrics {
-                    m.memory_cache_hit();
-                }
-                Some(data)
-            }
-            Ok(None) => {
-                if let Some(ref m) = self.metrics {
-                    m.memory_cache_miss();
-                }
-                None
-            }
+            Ok(Some(data)) => Some(data),
+            Ok(None) => None,
             Err(e) => {
                 warn!(error = %e, key = %key, "Tile cache get failed");
-                if let Some(ref m) = self.metrics {
-                    m.memory_cache_miss();
-                }
                 None
             }
         }

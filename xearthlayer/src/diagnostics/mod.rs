@@ -389,6 +389,36 @@ impl fmt::Display for SystemReport {
         }
         writeln!(f)?;
 
+        // GPU Compute Adapters (wgpu)
+        #[cfg(feature = "gpu-encode")]
+        {
+            writeln!(f, "## GPU Compute Adapters")?;
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::all(),
+                ..Default::default()
+            });
+            let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+            if adapters.is_empty() {
+                writeln!(f, "  (none found)")?;
+            } else {
+                for (i, adapter) in adapters.iter().enumerate() {
+                    let info = adapter.get_info();
+                    writeln!(
+                        f,
+                        "  [{}] {} ({:?}, {:?})",
+                        i, info.name, info.device_type, info.backend
+                    )?;
+                }
+            }
+            writeln!(f)?;
+        }
+        #[cfg(not(feature = "gpu-encode"))]
+        {
+            writeln!(f, "## GPU Encoding")?;
+            writeln!(f, "  Not available (build with --features gpu-encode)")?;
+            writeln!(f)?;
+        }
+
         // Disk
         writeln!(f, "## Disk Space")?;
         if let (Some(ref used), Some(ref total), Some(ref percent)) = (

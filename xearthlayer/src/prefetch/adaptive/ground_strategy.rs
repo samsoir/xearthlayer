@@ -34,26 +34,26 @@ use std::sync::Arc;
 use crate::coord::TileCoord;
 use crate::prefetch::SceneryIndex;
 
-use super::band_calculator::DsfTileCoord;
 use super::calibration::PerformanceCalibration;
 use super::config::AdaptivePrefetchConfig;
 use super::phase_detector::FlightPhase;
 use super::strategy::{AdaptivePrefetchStrategy, PrefetchPlan, PrefetchPlanMetadata};
+use crate::prefetch::tile_based::DsfTileCoord;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Width of the prefetch ring in degrees (1° = 1 DSF tile).
-const RING_WIDTH_DEG: i16 = 1;
+const RING_WIDTH_DEG: i32 = 1;
 
 /// Default loaded area latitude extent (degrees) when bounds not provided.
 /// This is an estimate; actual bounds should be derived from loaded tiles.
-const DEFAULT_LOADED_LAT_EXTENT: i16 = 3;
+const DEFAULT_LOADED_LAT_EXTENT: i32 = 3;
 
 /// Default loaded area longitude extent (degrees) when bounds not provided.
 /// This is an estimate; actual bounds should be derived from loaded tiles.
-const DEFAULT_LOADED_LON_EXTENT: i16 = 4;
+const DEFAULT_LOADED_LON_EXTENT: i32 = 4;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LoadedAreaBounds
@@ -66,18 +66,18 @@ const DEFAULT_LOADED_LON_EXTENT: i16 = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoadedAreaBounds {
     /// Minimum (southernmost) DSF latitude.
-    pub lat_min: i16,
+    pub lat_min: i32,
     /// Maximum (northernmost) DSF latitude.
-    pub lat_max: i16,
+    pub lat_max: i32,
     /// Minimum (westernmost) DSF longitude.
-    pub lon_min: i16,
+    pub lon_min: i32,
     /// Maximum (easternmost) DSF longitude.
-    pub lon_max: i16,
+    pub lon_max: i32,
 }
 
 impl LoadedAreaBounds {
     /// Create bounds from explicit values.
-    pub fn new(lat_min: i16, lat_max: i16, lon_min: i16, lon_max: i16) -> Self {
+    pub fn new(lat_min: i32, lat_max: i32, lon_min: i32, lon_max: i32) -> Self {
         Self {
             lat_min,
             lat_max,
@@ -91,8 +91,8 @@ impl LoadedAreaBounds {
     /// Uses default extent estimates. For accurate bounds, derive from
     /// actual loaded tiles using `from_dsf_tiles()`.
     pub fn default_centered_on(lat: f64, lon: f64) -> Self {
-        let center_lat = lat.floor() as i16;
-        let center_lon = lon.floor() as i16;
+        let center_lat = lat.floor() as i32;
+        let center_lon = lon.floor() as i32;
 
         // For extent N, we need exactly N tiles: max - min = N - 1
         // To center: bias toward positive for even extents
@@ -118,10 +118,10 @@ impl LoadedAreaBounds {
             return None;
         }
 
-        let mut lat_min = i16::MAX;
-        let mut lat_max = i16::MIN;
-        let mut lon_min = i16::MAX;
-        let mut lon_max = i16::MIN;
+        let mut lat_min = i32::MAX;
+        let mut lat_max = i32::MIN;
+        let mut lon_min = i32::MAX;
+        let mut lon_max = i32::MIN;
 
         for tile in tiles {
             lat_min = lat_min.min(tile.lat);
@@ -148,7 +148,7 @@ impl LoadedAreaBounds {
             .iter()
             .map(|t| {
                 let (lat, lon) = t.to_lat_lon();
-                DsfTileCoord::from_position(lat, lon)
+                DsfTileCoord::from_lat_lon(lat, lon)
             })
             .collect();
 
@@ -156,12 +156,12 @@ impl LoadedAreaBounds {
     }
 
     /// Get the width in degrees (longitude extent).
-    pub fn width(&self) -> i16 {
+    pub fn width(&self) -> i32 {
         self.lon_max - self.lon_min + 1
     }
 
     /// Get the height in degrees (latitude extent).
-    pub fn height(&self) -> i16 {
+    pub fn height(&self) -> i32 {
         self.lat_max - self.lat_min + 1
     }
 
@@ -289,8 +289,10 @@ impl GroundStrategy {
 
         // Sort by distance from aircraft
         ring_tiles.sort_by(|a, b| {
-            let dist_a = a.distance_from(lat, lon);
-            let dist_b = b.distance_from(lat, lon);
+            let (ca_lat, ca_lon) = a.center();
+            let (cb_lat, cb_lon) = b.center();
+            let dist_a = (ca_lat - lat).powi(2) + (ca_lon - lon).powi(2);
+            let dist_b = (cb_lat - lat).powi(2) + (cb_lon - lon).powi(2);
             dist_a
                 .partial_cmp(&dist_b)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -397,15 +399,7 @@ impl AdaptivePrefetchStrategy for GroundStrategy {
 
         // Sort by distance from aircraft position
         let (lat, lon) = position;
-        all_tiles.sort_by(|a, b| {
-            let (lat_a, lon_a) = a.to_lat_lon();
-            let (lat_b, lon_b) = b.to_lat_lon();
-            let dist_a = (lat_a - lat).powi(2) + (lon_a - lon).powi(2);
-            let dist_b = (lat_b - lat).powi(2) + (lon_b - lon).powi(2);
-            dist_a
-                .partial_cmp(&dist_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        crate::coord::sort_tiles_by_distance(&mut all_tiles, lat, lon);
 
         // Limit to max tiles
         if all_tiles.len() > self.max_tiles as usize {
@@ -590,7 +584,8 @@ mod tests {
 
         let mut prev_dist = 0.0;
         for tile in &ring {
-            let dist = tile.distance_from(53.5, 9.5);
+            let (clat, clon) = tile.center();
+            let dist = (clat - 53.5_f64).powi(2) + (clon - 9.5_f64).powi(2);
             assert!(
                 dist >= prev_dist - 0.001,
                 "Ring tiles should be sorted by distance"

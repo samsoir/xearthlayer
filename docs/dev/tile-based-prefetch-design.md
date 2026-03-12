@@ -2,7 +2,7 @@
 
 ## Status
 
-**Proposed** - Design document for review
+**Superseded** — The observation-based concepts from this document (burst detection, tile prediction from loaded set, heading inference) have been realised in the [Adaptive Prefetch Design v2.0](adaptive-prefetch-design.md) as the boundary-driven model with `SceneryWindow`, dual boundary monitors, and the three-window architecture. This document is retained for historical reference.
 
 ## Problem Statement
 

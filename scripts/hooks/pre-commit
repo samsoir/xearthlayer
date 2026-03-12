@@ -1,0 +1,30 @@
+#!/bin/sh
+# Pre-commit hook: runs `make pre-commit` (fmt + clippy + tests)
+# Prevents committing code that doesn't pass verification.
+#
+# Install with: make setup-hooks
+# Skip with:    git commit --no-verify (use sparingly!)
+
+# Ensure we run from the repo root
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+# Check if only non-code files changed (docs-only commits skip checks)
+CHANGED_FILES=$(git diff --cached --name-only --diff-filter=ACMR)
+CODE_CHANGED=false
+for f in $CHANGED_FILES; do
+    case "$f" in
+        *.rs|*.toml|Cargo.lock|Makefile)
+            CODE_CHANGED=true
+            break
+            ;;
+    esac
+done
+
+if [ "$CODE_CHANGED" = "false" ]; then
+    echo "Only non-code files changed, skipping pre-commit checks."
+    exit 0
+fi
+
+echo "Running pre-commit checks (fmt + clippy + tests)..."
+make pre-commit
+exit $?

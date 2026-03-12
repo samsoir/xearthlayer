@@ -83,6 +83,11 @@ disk_io_profile = {}
 ; DDS compression format: bc1 (smaller, opaque) or bc3 (larger, with alpha)
 ; bc1 recommended for satellite imagery
 format = {}
+; Texture compressor backend: software, ispc (SIMD), or gpu (wgpu)
+; ispc is recommended for best CPU performance
+compressor = {}
+; GPU device selector for gpu compressor: integrated, discrete, or adapter name substring
+gpu_device = {}
 
 [download]
 ; Timeout in seconds for HTTP requests (default: 30)
@@ -195,6 +200,36 @@ calibration_opportunistic_threshold = {}
 ; How long to measure throughput during initial calibration (seconds, default: 60)
 calibration_sample_duration = {}
 
+; Transition ramp settings (takeoff phase management)
+; Altitude climb (feet) above takeoff MSL to release transition hold (default: 1000, range: 200-5000)
+takeoff_climb_ft = {}
+; Maximum seconds before timeout release if climb not reached (default: 90, range: 30-300)
+takeoff_timeout_secs = {}
+; Sustained seconds at GS < 40kt before landing detection (default: 15, range: 5-60)
+landing_hysteresis_secs = {}
+; Duration (secs) of linear ramp from start fraction to full rate (default: 30, range: 10-120)
+ramp_duration_secs = {}
+; Starting prefetch fraction when ramp begins (default: 0.25, range: 0.1-0.5)
+ramp_start_fraction = {}
+
+; Boundary-driven prefetch settings
+; Boundary trigger distance in degrees (default: 1.5, range: 0.5-3.0)
+; Must be > X-Plane's 1.0° trigger to prefetch before X-Plane requests tiles
+trigger_distance = {}
+; Load depth for latitude boundary crossings in DSF tiles (default: 3, range: 1-5)
+load_depth_lat = {}
+; Load depth for longitude boundary crossings in DSF tiles (default: 2, range: 1-5)
+load_depth_lon = {}
+; Buffer tiles for retention beyond visible window (default: 1, range: 0-3)
+window_buffer = {}
+; InProgress staleness timeout in seconds (default: 120, range: 30-600)
+stale_region_timeout = {}
+; Assumed window height in DSF tiles (default: 3, range: 2-12)
+default_window_rows = {}
+; Longitude extent in degrees for window column computation (default: 3.0, range: 1.0-10.0)
+; Columns computed dynamically: ceil(lon_extent / cos(latitude))
+window_lon_extent = {}
+
 [control_plane]
 ; Advanced settings for job management and health monitoring.
 ; Defaults are tuned for most systems. Only modify if you understand the implications.
@@ -216,10 +251,10 @@ semaphore_timeout_secs = {}
 ; Settings for cold-start cache pre-warming.
 ; Use with --airport ICAO to pre-load tiles around an airport before flight.
 
-; Grid size in DSF tiles (N = N×N grid) around the airport to prewarm.
-; 8 = 8×8 grid = 64 DSF tiles, approximately 480nm × 480nm at mid-latitudes.
-; Each DSF tile is 1° × 1° (roughly 60nm × 60nm at equator).
-grid_size = {}
+; Grid rows (latitude extent) in DSF tiles around the airport to prewarm (default: 3)
+grid_rows = {}
+; Grid columns (longitude extent) in DSF tiles around the airport to prewarm (default: 4)
+grid_cols = {}
 
 [patches]
 ; Settings for custom Ortho4XP tile patches (airport addon mesh/elevation support).
@@ -252,6 +287,18 @@ api_url = {}
 poll_interval_secs = {}
 ; Maximum age in seconds before data is considered stale (default: 60)
 max_stale_secs = {}
+
+[fuse]
+; FUSE kernel settings for concurrent background request limits.
+; Higher values allow more concurrent X-Plane scenery reads, preventing
+; freezes at DSF boundaries. Only modify if you understand FUSE internals.
+
+; Maximum pending background FUSE requests before the kernel queues (default: 256, range: 1-1024)
+; The Linux kernel default of 12 severely limits X-Plane's concurrent scenery reads.
+max_background = {}
+; Congestion threshold for background FUSE requests (default: 192, range: 1-1024)
+; Kernel starts throttling when pending requests exceed this. Convention: 75% of max_background.
+congestion_threshold = {}
 "#,
         config.provider.provider_type,
         google_api_key,
@@ -261,6 +308,8 @@ max_stale_secs = {}
         format_size(config.cache.disk_size),
         config.cache.disk_io_profile.as_str(),
         config.texture.format.to_string().to_lowercase(),
+        config.texture.compressor,
+        config.texture.gpu_device,
         config.download.timeout,
         config.generation.threads,
         config.generation.timeout,
@@ -292,11 +341,24 @@ max_stale_secs = {}
         config.prefetch.calibration_aggressive_threshold,
         config.prefetch.calibration_opportunistic_threshold,
         config.prefetch.calibration_sample_duration,
+        config.prefetch.takeoff_climb_ft,
+        config.prefetch.takeoff_timeout_secs,
+        config.prefetch.landing_hysteresis_secs,
+        config.prefetch.ramp_duration_secs,
+        config.prefetch.ramp_start_fraction,
+        config.prefetch.trigger_distance,
+        config.prefetch.load_depth_lat,
+        config.prefetch.load_depth_lon,
+        config.prefetch.window_buffer,
+        config.prefetch.stale_region_timeout,
+        config.prefetch.default_window_rows,
+        config.prefetch.window_lon_extent,
         config.control_plane.max_concurrent_jobs,
         config.control_plane.stall_threshold_secs,
         config.control_plane.health_check_interval_secs,
         config.control_plane.semaphore_timeout_secs,
-        config.prewarm.grid_size,
+        config.prewarm.grid_rows,
+        config.prewarm.grid_cols,
         config.patches.enabled,
         config
             .patches
@@ -310,6 +372,9 @@ max_stale_secs = {}
         config.online_network.api_url,
         config.online_network.poll_interval_secs,
         config.online_network.max_stale_secs,
+        // FUSE settings
+        config.fuse.max_background,
+        config.fuse.congestion_threshold,
     )
 }
 

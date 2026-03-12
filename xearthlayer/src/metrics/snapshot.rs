@@ -51,12 +51,14 @@ pub struct TelemetrySnapshot {
     pub downloads_active: usize,
 
     // === Cache metrics ===
-    /// Memory cache hits
+    /// Memory cache hits (all origins)
     pub memory_cache_hits: u64,
-    /// Memory cache misses
+    /// Memory cache misses (all origins)
     pub memory_cache_misses: u64,
-    /// Memory cache hit rate (0.0 - 1.0)
+    /// Memory cache hit rate — all origins (0.0 - 1.0)
     pub memory_cache_hit_rate: f64,
+    /// Memory cache hit rate — FUSE (X-Plane) requests only (0.0 - 1.0)
+    pub fuse_memory_cache_hit_rate: f64,
     /// Memory cache current size in bytes
     pub memory_cache_size_bytes: u64,
     /// Disk cache hits
@@ -123,6 +125,7 @@ impl Default for TelemetrySnapshot {
             memory_cache_hits: 0,
             memory_cache_misses: 0,
             memory_cache_hit_rate: 0.0,
+            fuse_memory_cache_hit_rate: 0.0,
             memory_cache_size_bytes: 0,
             disk_cache_hits: 0,
             disk_cache_misses: 0,
@@ -223,15 +226,16 @@ impl fmt::Display for TelemetrySnapshot {
         writeln!(
             f,
             "  Completed: {} ({:.1}/s)",
-            self.jobs_completed, self.jobs_per_second
+            format_number(self.jobs_completed),
+            self.jobs_per_second
         )?;
-        writeln!(f, "  Active: {}", self.jobs_active)?;
-        writeln!(f, "  Timed out: {}", self.jobs_timed_out)?;
-        writeln!(f, "  Errors: {}", self.jobs_failed)?;
+        writeln!(f, "  Active: {}", format_number(self.jobs_active))?;
+        writeln!(f, "  Timed out: {}", format_number(self.jobs_timed_out))?;
+        writeln!(f, "  Errors: {}", format_number(self.jobs_failed))?;
         writeln!(
             f,
             "  Coalesced: {} ({:.1}%)",
-            self.jobs_coalesced,
+            format_number(self.jobs_coalesced),
             self.coalescing_rate() * 100.0
         )?;
         writeln!(f)?;
@@ -241,33 +245,35 @@ impl fmt::Display for TelemetrySnapshot {
         writeln!(
             f,
             "  Chunks: {} ({:.0}/s)",
-            self.chunks_downloaded, self.chunks_per_second
+            format_number(self.chunks_downloaded),
+            self.chunks_per_second
         )?;
         writeln!(f, "  Throughput: {}", self.throughput_human())?;
         writeln!(
             f,
             "  Failed: {} ({:.2}%)",
-            self.chunks_failed,
+            format_number(self.chunks_failed),
             self.chunk_failure_rate() * 100.0
         )?;
-        writeln!(f, "  Retries: {}", self.chunks_retried)?;
+        writeln!(f, "  Retries: {}", format_number(self.chunks_retried))?;
         writeln!(f)?;
 
         // Cache
         writeln!(f, "Cache:")?;
         writeln!(
             f,
-            "  Memory: {:.1}% hit rate ({} hits, {} misses)",
+            "  Memory: {:.1}% hit rate ({} hits, {} misses) | FUSE: {:.1}%",
             self.memory_cache_hit_rate * 100.0,
-            self.memory_cache_hits,
-            self.memory_cache_misses
+            format_number(self.memory_cache_hits),
+            format_number(self.memory_cache_misses),
+            self.fuse_memory_cache_hit_rate * 100.0,
         )?;
         writeln!(
             f,
             "  Disk: {:.1}% hit rate ({} hits, {} misses)",
             self.disk_cache_hit_rate * 100.0,
-            self.disk_cache_hits,
-            self.disk_cache_misses
+            format_number(self.disk_cache_hits),
+            format_number(self.disk_cache_misses)
         )?;
 
         Ok(())
@@ -298,6 +304,19 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{} B", bytes)
     }
+}
+
+/// Format an integer with thousand separators (e.g., 23040 → "23,040").
+fn format_number(n: impl fmt::Display) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result
 }
 
 /// Format duration in human-readable form.
@@ -338,6 +357,7 @@ mod tests {
             memory_cache_hits: 30,
             memory_cache_misses: 60,
             memory_cache_hit_rate: 0.333,
+            fuse_memory_cache_hit_rate: 0.6,
             memory_cache_size_bytes: 500_000_000,
             disk_cache_hits: 5000,
             disk_cache_misses: 18040,
@@ -423,6 +443,16 @@ mod tests {
     }
 
     #[test]
+    fn test_format_number() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1_000), "1,000");
+        assert_eq!(format_number(23_040), "23,040");
+        assert_eq!(format_number(1_000_000), "1,000,000");
+        assert_eq!(format_number(5_000_000_000_u64), "5,000,000,000");
+    }
+
+    #[test]
     fn test_display() {
         let snapshot = test_snapshot();
         let output = format!("{}", snapshot);
@@ -431,6 +461,10 @@ mod tests {
         assert!(output.contains("Jobs:"));
         assert!(output.contains("Downloads:"));
         assert!(output.contains("Cache:"));
+        // Verify thousand separators
+        assert!(output.contains("23,040")); // chunks_downloaded
+        assert!(output.contains("5,000 hits")); // disk_cache_hits
+        assert!(output.contains("18,040 misses")); // disk_cache_misses
     }
 
     #[test]

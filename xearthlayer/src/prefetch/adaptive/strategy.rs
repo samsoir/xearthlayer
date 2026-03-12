@@ -10,16 +10,16 @@
 //! different prefetch algorithms for different flight phases:
 //!
 //! - **GroundStrategy**: Ring around current position for taxi/parking
-//! - **CruiseStrategy**: Bands ahead of track for cruise flight
+//! - **BoundaryStrategy**: Boundary-driven DSF region generation for cruise flight
 //!
 //! # Example
 //!
 //! ```ignore
 //! use xearthlayer::prefetch::adaptive::{
-//!     AdaptivePrefetchStrategy, CruiseStrategy, PrefetchPlan,
+//!     AdaptivePrefetchStrategy, GroundStrategy, PrefetchPlan,
 //! };
 //!
-//! let strategy = CruiseStrategy::new(config);
+//! let strategy = GroundStrategy::new(&config);
 //! let plan = strategy.calculate_prefetch(
 //!     (lat, lon),
 //!     track,
@@ -110,7 +110,7 @@ pub struct PrefetchPlanMetadata {
     pub dsf_tile_count: usize,
 
     /// Bounding box used for calculation (lat_min, lat_max, lon_min, lon_max).
-    pub bounds: Option<(i16, i16, i16, i16)>,
+    pub bounds: Option<(i32, i32, i32, i32)>,
 
     /// Track quadrant used (for cruise strategy).
     pub track_quadrant: Option<&'static str>,
@@ -184,7 +184,7 @@ impl PrefetchPlanMetadata {
     pub fn ground(
         bounds_source: &'static str,
         dsf_tile_count: usize,
-        bounds: (i16, i16, i16, i16),
+        bounds: (i32, i32, i32, i32),
     ) -> Self {
         Self {
             bounds_source,
