@@ -40,6 +40,23 @@ pub fn lon_tiles_for_latitude(lat_deg: f64, lon_extent_deg: f64) -> usize {
     (lon_extent_deg / cos_lat).ceil() as usize
 }
 
+/// Sort tiles by squared Euclidean distance from a reference position.
+///
+/// Tiles closest to `(lat, lon)` appear first. Uses squared distance
+/// (no sqrt) since only relative ordering matters. This is used by
+/// prefetch strategies to prioritize near-boundary tiles.
+pub fn sort_tiles_by_distance(tiles: &mut [TileCoord], lat: f64, lon: f64) {
+    tiles.sort_by(|a, b| {
+        let (lat_a, lon_a) = a.to_lat_lon();
+        let (lat_b, lon_b) = b.to_lat_lon();
+        let dist_a = (lat_a - lat).powi(2) + (lon_a - lon).powi(2);
+        let dist_b = (lat_b - lat).powi(2) + (lon_b - lon).powi(2);
+        dist_a
+            .partial_cmp(&dist_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
 use std::f64::consts::PI;
 
 /// Converts geographic coordinates to tile coordinates.
@@ -349,6 +366,56 @@ mod tests {
         assert_eq!(lon_tiles_for_latitude(1.0, 3.0), 4);
         // YPAD (35°S): cos(35°) ≈ 0.819 → ceil(3.0/0.819) = ceil(3.66) = 4
         assert_eq!(lon_tiles_for_latitude(-35.0, 3.0), 4);
+    }
+
+    #[test]
+    fn test_sort_tiles_by_distance_orders_nearest_first() {
+        // Create tiles at known positions spread across a region
+        let t1 = TileCoord {
+            row: 10,
+            col: 10,
+            zoom: 14,
+        };
+        let t2 = TileCoord {
+            row: 100,
+            col: 100,
+            zoom: 14,
+        };
+        let t3 = TileCoord {
+            row: 1000,
+            col: 1000,
+            zoom: 14,
+        };
+
+        let mut tiles = vec![t3, t1, t2]; // deliberately unsorted
+        sort_tiles_by_distance(&mut tiles, 52.0, 7.0);
+
+        // Verify monotonically increasing distance
+        let mut prev_dist = 0.0_f64;
+        for tile in &tiles {
+            let (lat, lon) = tile.to_lat_lon();
+            let dist = (lat - 52.0).powi(2) + (lon - 7.0).powi(2);
+            assert!(
+                dist >= prev_dist - 0.001,
+                "Tiles not sorted by distance: {dist:.4} < {prev_dist:.4}"
+            );
+            prev_dist = dist;
+        }
+    }
+
+    #[test]
+    fn test_sort_tiles_by_distance_empty_and_single() {
+        let mut empty: Vec<TileCoord> = vec![];
+        sort_tiles_by_distance(&mut empty, 0.0, 0.0);
+        assert!(empty.is_empty());
+
+        let mut single = vec![TileCoord {
+            row: 10,
+            col: 10,
+            zoom: 14,
+        }];
+        sort_tiles_by_distance(&mut single, 0.0, 0.0);
+        assert_eq!(single.len(), 1);
     }
 
     #[test]

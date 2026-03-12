@@ -588,6 +588,12 @@ impl AdaptivePrefetchCoordinator {
                     return None;
                 }
 
+                // Sort tiles by distance from aircraft so near-boundary tiles
+                // are submitted first. Without this, HashSet iteration order
+                // within each region is random, causing far-edge tiles to be
+                // processed while X-Plane is already requesting near-edge ones.
+                crate::coord::sort_tiles_by_distance(&mut all_tiles, lat, lon);
+
                 let total = all_tiles.len();
                 self.status.active_strategy = "boundary";
                 PrefetchPlan::with_tiles(all_tiles, &calibration, "boundary", 0, total)
@@ -2006,6 +2012,93 @@ mod tests {
             );
         }
         // If we didn't reach cruise (due to phase detector), that's OK for now.
+    }
+
+    #[test]
+    fn test_boundary_plan_tiles_sorted_by_distance_from_aircraft() {
+        use crate::geo_index::GeoIndex;
+        use crate::scene_tracker::{DdsTileCoord, GeoBounds, GeoRegion, SceneTracker};
+        use std::collections::HashSet;
+
+        /// Mock SceneTracker with stable bounds for triggering cruise boundary.
+        struct StableBoundsTracker;
+        impl SceneTracker for StableBoundsTracker {
+            fn requested_tiles(&self) -> HashSet<DdsTileCoord> {
+                HashSet::new()
+            }
+            fn is_tile_requested(&self, _tile: &DdsTileCoord) -> bool {
+                false
+            }
+            fn is_burst_active(&self) -> bool {
+                false
+            }
+            fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
+                vec![]
+            }
+            fn total_requests(&self) -> u64 {
+                0
+            }
+            fn loaded_regions(&self) -> HashSet<GeoRegion> {
+                HashSet::new()
+            }
+            fn is_region_loaded(&self, _region: &GeoRegion) -> bool {
+                false
+            }
+            fn loaded_bounds(&self) -> Option<GeoBounds> {
+                Some(GeoBounds {
+                    min_lat: 47.0,
+                    max_lat: 53.0,
+                    min_lon: 3.0,
+                    max_lon: 11.0,
+                })
+            }
+        }
+
+        let tracker: Arc<dyn SceneTracker> = Arc::new(StableBoundsTracker);
+        let geo_index = Arc::new(GeoIndex::new());
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_scene_tracker(tracker)
+            .with_geo_index(geo_index);
+
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+
+        // Enter cruise phase
+        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Aircraft at 52.0, near north edge — triggers boundary crossing
+        let plan = coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
+
+        if coord.status.phase == FlightPhase::Cruise {
+            let plan = plan.expect("Should generate boundary plan near edge");
+            assert!(
+                plan.tiles.len() > 1,
+                "Need multiple tiles to verify sorting"
+            );
+
+            // Verify tiles are sorted by distance from aircraft position
+            let mut prev_dist = 0.0_f64;
+            for tile in &plan.tiles {
+                let (tile_lat, tile_lon) = tile.to_lat_lon();
+                let dist = (tile_lat - 52.0).powi(2) + (tile_lon - 7.0).powi(2);
+                assert!(
+                    dist >= prev_dist - 0.001,
+                    "Tiles must be sorted by distance from aircraft. \
+                     Found dist={:.4} after prev={:.4}",
+                    dist,
+                    prev_dist,
+                );
+                prev_dist = dist;
+            }
+        }
     }
 
     #[test]

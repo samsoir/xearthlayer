@@ -399,15 +399,7 @@ impl AdaptivePrefetchStrategy for GroundStrategy {
 
         // Sort by distance from aircraft position
         let (lat, lon) = position;
-        all_tiles.sort_by(|a, b| {
-            let (lat_a, lon_a) = a.to_lat_lon();
-            let (lat_b, lon_b) = b.to_lat_lon();
-            let dist_a = (lat_a - lat).powi(2) + (lon_a - lon).powi(2);
-            let dist_b = (lat_b - lat).powi(2) + (lon_b - lon).powi(2);
-            dist_a
-                .partial_cmp(&dist_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        crate::coord::sort_tiles_by_distance(&mut all_tiles, lat, lon);
 
         // Limit to max tiles
         if all_tiles.len() > self.max_tiles as usize {
