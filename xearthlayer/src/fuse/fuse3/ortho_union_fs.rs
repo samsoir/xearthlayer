@@ -595,6 +595,17 @@ impl Filesystem for Fuse3OrthoUnionFS {
         // on disk — generate it. This handles boundary cases where package `.ter` files
         // reference DDS textures the patch doesn't provide (different naming convention).
         if name_str.ends_with(".dds") {
+            // Water mask guard (#68): X-Plane requests BORDER_TEX as .dds first,
+            // but the actual water mask is a .png on disk. If we generate a virtual
+            // DDS, X-Plane gets satellite imagery instead of the alpha mask. Return
+            // ENOENT so X-Plane falls back to the .png via lazy resolution.
+            let png_name = name_str.replace(".dds", ".png");
+            let png_path = parent_path.join(&*png_name);
+            if self.resolve_lazy_geo(&png_path, &png_name).is_some() {
+                trace!(file = %name_str, "Water mask PNG exists, skipping DDS generation");
+                return Err(Errno::from(libc::ENOENT));
+            }
+
             if let Ok(coords) = parse_dds_filename(&name_str) {
                 let inode = self.inode_manager.create_virtual_inode(coords);
                 let attr = self.virtual_dds_attr(inode);
@@ -1637,6 +1648,138 @@ mod tests {
         assert!(
             result.is_ok(),
             "DDS at ZL14 in patched region should allow generation, got: {:?}",
+            result
+        );
+    }
+
+    // ========================================================================
+    // Water mask guard tests (Issue #68)
+    // ========================================================================
+
+    /// Test that lookup returns ENOENT for DDS when a PNG water mask exists.
+    ///
+    /// X-Plane requests BORDER_TEX water masks as `.dds` first. If a `.png`
+    /// with the same stem exists on disk, we must return ENOENT so X-Plane
+    /// falls back to the real PNG water mask instead of getting satellite imagery.
+    #[tokio::test]
+    async fn test_lookup_returns_enoent_for_dds_when_png_water_mask_exists() {
+        use fuse3::raw::Filesystem;
+
+        let temp = TempDir::new().unwrap();
+
+        // Create a package with a PNG water mask in textures/
+        let pkg_dir = temp.path().join("eu_ortho");
+        std::fs::create_dir_all(pkg_dir.join("Earth nav data/+40-080")).unwrap();
+        std::fs::write(
+            pkg_dir.join("Earth nav data/+40-080/+40-074.dsf"),
+            b"pkg dsf",
+        )
+        .unwrap();
+        std::fs::create_dir_all(pkg_dir.join("textures")).unwrap();
+        std::fs::create_dir_all(pkg_dir.join("terrain")).unwrap();
+
+        // Place a PNG water mask (the kind referenced by _sea_overlay.ter BORDER_TEX)
+        let png_name = "24496_33152_ZL16.png";
+        std::fs::write(
+            pkg_dir.join("textures").join(png_name),
+            b"fake png water mask",
+        )
+        .unwrap();
+
+        let pkg = InstalledPackage::new(
+            Package::new("eu", PackageType::Ortho, Version::new(1, 0, 0)),
+            &pkg_dir,
+        );
+
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(pkg)
+            .build()
+            .unwrap();
+
+        let client = create_test_client();
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+
+        let textures_inode = fs
+            .inode_manager
+            .get_or_create_inode(std::path::Path::new("textures"));
+
+        let req = fuse3::raw::Request {
+            unique: 1,
+            uid: 1000,
+            gid: 1000,
+            pid: 1000,
+        };
+
+        // Request the DDS version — should fail because the PNG water mask exists
+        let dds_name = "24496_33152_ZL16.dds";
+        let result = fs
+            .lookup(req, textures_inode, std::ffi::OsStr::new(dds_name))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Lookup for DDS should return ENOENT when PNG water mask exists, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that DDS generation still works when no PNG water mask exists.
+    ///
+    /// This verifies the water mask guard doesn't block normal DDS generation
+    /// for ortho tile textures (which have no corresponding PNG on disk).
+    #[tokio::test]
+    async fn test_lookup_allows_dds_generation_when_no_png_exists() {
+        use fuse3::raw::Filesystem;
+
+        let temp = TempDir::new().unwrap();
+
+        // Create a package with textures/ but no PNG for this tile
+        let pkg_dir = temp.path().join("eu_ortho");
+        std::fs::create_dir_all(pkg_dir.join("Earth nav data/+40-080")).unwrap();
+        std::fs::write(
+            pkg_dir.join("Earth nav data/+40-080/+40-074.dsf"),
+            b"pkg dsf",
+        )
+        .unwrap();
+        std::fs::create_dir_all(pkg_dir.join("textures")).unwrap();
+        std::fs::create_dir_all(pkg_dir.join("terrain")).unwrap();
+
+        let pkg = InstalledPackage::new(
+            Package::new("eu", PackageType::Ortho, Version::new(1, 0, 0)),
+            &pkg_dir,
+        );
+
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(pkg)
+            .build()
+            .unwrap();
+
+        let client = create_test_client();
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+
+        let textures_inode = fs
+            .inode_manager
+            .get_or_create_inode(std::path::Path::new("textures"));
+
+        let req = fuse3::raw::Request {
+            unique: 1,
+            uid: 1000,
+            gid: 1000,
+            pid: 1000,
+        };
+
+        // Request a DDS with no corresponding PNG — should succeed (virtual inode)
+        let result = fs
+            .lookup(
+                req,
+                textures_inode,
+                std::ffi::OsStr::new("10000_5000_BI16.dds"),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Lookup for DDS without PNG water mask should succeed for generation, got: {:?}",
             result
         );
     }
