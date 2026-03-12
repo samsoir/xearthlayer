@@ -755,6 +755,7 @@ impl MountManager {
             memory_cache_hits: 0,
             memory_cache_misses: 0,
             memory_cache_hit_rate: 0.0,
+            fuse_memory_cache_hit_rate: 0.0,
             memory_cache_size_bytes: 0,
             disk_cache_hits: 0,
             disk_cache_misses: 0,

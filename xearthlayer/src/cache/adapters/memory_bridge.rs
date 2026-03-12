@@ -10,12 +10,14 @@ use crate::cache::clients::TileCacheClient;
 use crate::cache::traits::Cache;
 use crate::coord::TileCoord;
 use crate::executor::MemoryCache;
-use crate::metrics::MetricsClient;
 
 /// Bridge adapter implementing `executor::MemoryCache` using the new cache service.
 ///
 /// This adapter allows existing executor code to use the new cache infrastructure
 /// without modification.
+///
+/// Memory cache hit/miss metrics are tracked by the executor daemon
+/// (which knows the request origin) rather than the bridge layer.
 pub struct MemoryCacheBridge {
     /// The underlying tile cache client.
     client: TileCacheClient,
@@ -30,18 +32,6 @@ impl MemoryCacheBridge {
     pub fn new(cache: Arc<dyn Cache>) -> Self {
         Self {
             client: TileCacheClient::new(cache),
-        }
-    }
-
-    /// Create a new memory cache bridge with metrics.
-    ///
-    /// # Arguments
-    ///
-    /// * `cache` - The underlying cache implementation
-    /// * `metrics` - Metrics client for reporting
-    pub fn with_metrics(cache: Arc<dyn Cache>, metrics: MetricsClient) -> Self {
-        Self {
-            client: TileCacheClient::with_metrics(cache, metrics),
         }
     }
 }

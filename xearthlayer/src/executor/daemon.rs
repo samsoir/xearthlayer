@@ -550,7 +550,7 @@ where
 
             // Track cache hit
             if let Some(client) = metrics_client {
-                client.memory_cache_hit();
+                client.memory_cache_hit(origin.is_fuse());
             }
 
             if let Some(tx) = request.response_tx {
@@ -607,7 +607,7 @@ where
             "Cache miss - submitting job"
         );
         if let Some(client) = metrics_client {
-            client.memory_cache_miss();
+            client.memory_cache_miss(origin.is_fuse());
         }
 
         // Create and submit job

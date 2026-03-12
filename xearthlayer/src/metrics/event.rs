@@ -87,10 +87,16 @@ pub enum MetricEvent {
     // Memory Cache Events (tile-level, tracked in daemon)
     // =========================================================================
     /// A tile was found in the memory cache.
-    MemoryCacheHit,
+    MemoryCacheHit {
+        /// `true` if this was a FUSE (X-Plane) request, `false` for prefetch/prewarm.
+        is_fuse: bool,
+    },
 
     /// A tile was not found in the memory cache.
-    MemoryCacheMiss,
+    MemoryCacheMiss {
+        /// `true` if this was a FUSE (X-Plane) request, `false` for prefetch/prewarm.
+        is_fuse: bool,
+    },
 
     /// Update the current memory cache size.
     MemoryCacheSizeUpdate {
@@ -178,8 +184,8 @@ impl MetricEvent {
             Self::DiskCacheInitialSize { .. } => "disk_cache_initial_size",
             Self::DiskCacheEvicted { .. } => "disk_cache_evicted",
             Self::DiskCacheSizeUpdate { .. } => "disk_cache_size_update",
-            Self::MemoryCacheHit => "memory_cache_hit",
-            Self::MemoryCacheMiss => "memory_cache_miss",
+            Self::MemoryCacheHit { .. } => "memory_cache_hit",
+            Self::MemoryCacheMiss { .. } => "memory_cache_miss",
             Self::MemoryCacheSizeUpdate { .. } => "memory_cache_size_update",
             Self::JobSubmitted { .. } => "job_submitted",
             Self::JobStarted => "job_started",
