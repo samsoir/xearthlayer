@@ -35,3 +35,21 @@ jobs:
 
       - name: Run make verify
         run: make verify
+
+  check-gpu:
+    name: Check GPU Feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev
+
+      - name: Check GPU feature compiles
+        run: cargo check --features gpu-encode
