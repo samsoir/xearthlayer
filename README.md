@@ -52,6 +52,7 @@ See [How It Works](docs/how-it-works.md) for detailed architecture.
   - Circuit breaker pauses prefetch during X-Plane loading
 - Two-tier caching for instant repeat visits
 - High-quality BC1/BC3 DDS textures with mipmaps
+- **Multiple compression backends**: ISPC SIMD (default), pure-Rust software, or GPU-accelerated via wgpu compute shaders
 - Real-time dashboard showing cache, download, and prefetch status
 - Works with Ortho4XP-generated scenery
 - Linux support
@@ -62,8 +63,12 @@ See [How It Works](docs/how-it-works.md) for detailed architecture.
 # Build and install
 git clone https://github.com/samsoir/xearthlayer.git
 cd xearthlayer
-make release
-make install  # Installs to ~/.local/bin (no sudo required)
+make release       # Standard build (ISPC compression)
+make install       # Installs to ~/.local/bin (no sudo required)
+
+# Or build with GPU-accelerated encoding (optional)
+# make release-gpu
+# make install-gpu
 
 # Run the setup wizard (first-time configuration)
 xearthlayer setup
@@ -179,8 +184,10 @@ Run `xearthlayer --help` for all options.
 
 - **X-Plane 12**
 - **Linux** with FUSE support
-- **Modern GPU** with 8GB VRAM or higher, 16GB+ recommended
+- **Modern GPU** with 8GB VRAM or higher, 16GB+ recommended (for X-Plane rendering)
 - **Fast Internet connection** for streaming imagery, recommended 800Mbps downstream or better
+
+> **Optional:** XEarthLayer can offload DDS encoding to a GPU via the `gpu-encode` build feature. This works with any wgpu-compatible GPU and is separate from the X-Plane GPU requirement above. See [Building with GPU Support](docs/getting-started.md#building-with-gpu-support).
 
 XEarthLayer is not tested with X-Plane 11, but should work in principle. The scenery packages that are provided by this project are designed for X-Plane 12 only. XEarthLayer using regional scenery packages published for X-Plane 11 should work without issue, your mileage may vary.
 
