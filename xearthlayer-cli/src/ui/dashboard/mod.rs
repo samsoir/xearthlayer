@@ -75,12 +75,6 @@ pub struct Dashboard {
 }
 
 impl Dashboard {
-    /// Create a new dashboard in the Running state.
-    #[allow(dead_code)]
-    pub fn new(config: DashboardConfig, shutdown: Arc<AtomicBool>) -> io::Result<Self> {
-        Self::with_state(config, shutdown, DashboardState::Running)
-    }
-
     /// Create a new dashboard with a specific initial state.
     pub fn with_state(
         config: DashboardConfig,
@@ -138,18 +132,6 @@ impl Dashboard {
         self
     }
 
-    /// Get the current state.
-    #[allow(dead_code)]
-    pub fn state(&self) -> &DashboardState {
-        &self.state
-    }
-
-    /// Set the dashboard state.
-    #[allow(dead_code)]
-    pub fn set_state(&mut self, state: DashboardState) {
-        self.state = state;
-    }
-
     /// Transition to the Running state.
     pub fn transition_to_running(&mut self) {
         self.state = DashboardState::Running;
@@ -174,18 +156,6 @@ impl Dashboard {
     /// Get current prewarm status.
     pub fn prewarm_status(&self) -> Option<&PrewarmProgress> {
         self.prewarm_status.as_ref()
-    }
-
-    /// Check if in Loading state.
-    #[allow(dead_code)]
-    pub fn is_loading(&self) -> bool {
-        matches!(self.state, DashboardState::Loading(_))
-    }
-
-    /// Check if in Running state.
-    #[allow(dead_code)]
-    pub fn is_running(&self) -> bool {
-        matches!(self.state, DashboardState::Running)
     }
 
     /// Restore terminal to normal state.

@@ -254,17 +254,10 @@ impl DaemonCoalescer {
     }
 
     /// Cancels a job, removing it from in-flight.
-    #[allow(dead_code)]
     fn cancel(&self, tile: TileCoord) {
         if let Some((_, _tx)) = self.in_flight.remove(&tile) {
             debug!(tile = ?tile, "Cancelled in-flight job");
         }
-    }
-
-    /// Returns the number of currently in-flight jobs.
-    #[allow(dead_code)]
-    fn in_flight_count(&self) -> usize {
-        self.in_flight.len()
     }
 }
 
