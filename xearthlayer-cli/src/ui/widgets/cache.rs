@@ -19,7 +19,9 @@ use ratatui::{
 };
 use xearthlayer::metrics::TelemetrySnapshot;
 
-use super::primitives::{format_bytes, format_bytes_usize, ProgressBar, ProgressBarStyle};
+use super::primitives::{
+    format_bytes, format_bytes_usize, format_count, ProgressBar, ProgressBarStyle,
+};
 
 /// Configuration for cache display.
 #[derive(Clone)]
@@ -218,12 +220,12 @@ impl Widget for CacheWidgetCompact<'_> {
             ),
             Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} hits", memory_hits),
+                format!("{} hits", format_count(memory_hits)),
                 Style::default().fg(Color::Green),
             ),
             Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} miss", memory_misses),
+                format!("{} miss", format_count(memory_misses)),
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -262,12 +264,12 @@ impl Widget for CacheWidgetCompact<'_> {
             ),
             Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} hits", disk_hits),
+                format!("{} hits", format_count(disk_hits)),
                 Style::default().fg(Color::Green),
             ),
             Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} miss", disk_misses),
+                format!("{} miss", format_count(disk_misses)),
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -276,5 +278,108 @@ impl Widget for CacheWidgetCompact<'_> {
 
         let paragraph = Paragraph::new(text).block(block);
         paragraph.render(area, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+
+    /// Helper: render CacheWidgetCompact to a buffer and return all text as a single string.
+    fn render_compact_to_string(snapshot: &TelemetrySnapshot) -> String {
+        let area = Rect::new(0, 0, 80, 4);
+        let mut buf = Buffer::empty(area);
+        CacheWidgetCompact::new(snapshot).render(area, &mut buf);
+
+        let mut output = String::new();
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                let cell = &buf[(x, y)];
+                output.push_str(cell.symbol());
+            }
+            output.push('\n');
+        }
+        output
+    }
+
+    #[test]
+    fn test_memory_cache_hits_formatted_with_thousands_abbreviation() {
+        let snapshot = TelemetrySnapshot {
+            memory_cache_hits: 1_500_000,
+            ..Default::default()
+        };
+        let output = render_compact_to_string(&snapshot);
+        assert!(
+            output.contains("1.5M hits"),
+            "Memory hits should be formatted as '1.5M hits', got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_memory_cache_misses_formatted_with_thousands_abbreviation() {
+        let snapshot = TelemetrySnapshot {
+            memory_cache_misses: 42_300,
+            ..Default::default()
+        };
+        let output = render_compact_to_string(&snapshot);
+        assert!(
+            output.contains("42.3K miss"),
+            "Memory misses should be formatted as '42.3K miss', got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_disk_cache_hits_formatted_with_thousands_abbreviation() {
+        let snapshot = TelemetrySnapshot {
+            disk_cache_hits: 5_000,
+            ..Default::default()
+        };
+        let output = render_compact_to_string(&snapshot);
+        assert!(
+            output.contains("5.0K hits"),
+            "Disk hits should be formatted as '5.0K hits', got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_disk_cache_misses_formatted_with_thousands_abbreviation() {
+        let snapshot = TelemetrySnapshot {
+            disk_cache_misses: 18_040,
+            ..Default::default()
+        };
+        let output = render_compact_to_string(&snapshot);
+        assert!(
+            output.contains("18.0K miss"),
+            "Disk misses should be formatted as '18.0K miss', got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_small_counts_displayed_without_abbreviation() {
+        let snapshot = TelemetrySnapshot {
+            memory_cache_hits: 42,
+            memory_cache_misses: 7,
+            disk_cache_hits: 100,
+            disk_cache_misses: 3,
+            ..Default::default()
+        };
+        let output = render_compact_to_string(&snapshot);
+        assert!(
+            output.contains("42 hits"),
+            "Small memory hits should be unabbreviated, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("7 miss"),
+            "Small memory misses should be unabbreviated, got:\n{}",
+            output
+        );
     }
 }
