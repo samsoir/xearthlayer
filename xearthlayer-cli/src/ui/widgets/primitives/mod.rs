@@ -15,6 +15,6 @@ mod progress_bar;
 mod sparkline;
 
 // Re-export commonly used formatters (others available via primitives::format::*)
-pub use format::{format_bytes, format_bytes_usize, format_throughput};
+pub use format::{format_bytes, format_bytes_usize, format_count, format_throughput};
 pub use progress_bar::{ProgressBar, ProgressBarStyle};
 pub use sparkline::{Sparkline, SparklineHistory};
