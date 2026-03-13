@@ -28,7 +28,6 @@ pub(crate) struct ActiveJob {
     pub job: Box<dyn Job>,
 
     /// Job priority (stored for potential priority boosting).
-    #[allow(dead_code)]
     pub priority: Priority,
 
     /// Channel to update job status.

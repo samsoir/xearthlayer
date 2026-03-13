@@ -248,7 +248,6 @@ impl Default for DashboardConfig {
 /// Job rate metrics for the control plane display.
 ///
 /// Note: Used by legacy ControlPlaneWidget, kept for compatibility.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct JobRates {
     /// Jobs submitted per second (instantaneous rate).
