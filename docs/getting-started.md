@@ -75,6 +75,23 @@ make install PREFIX=/usr/local  # Requires sudo for /usr/local/bin
 
 Download the latest release from the releases page and extract to a location of your choice.
 
+### Building with GPU Support
+
+XEarthLayer supports optional GPU-accelerated DDS encoding, which offloads texture compression to the GPU and frees CPU resources for X-Plane. This requires a separate build:
+
+```bash
+# Build with GPU encoding support
+make release-gpu
+make install-gpu  # Installs to ~/.local/bin
+
+# Verify GPU detection
+xearthlayer diagnostics
+```
+
+The diagnostics output will show detected GPU adapters. Any wgpu-compatible GPU works (most modern GPUs from AMD, NVIDIA, and Intel).
+
+GPU encoding is most beneficial when you have an idle integrated GPU (e.g., AMD Radeon on Ryzen or Intel UHD) while your discrete GPU handles X-Plane. See the [texture configuration](configuration.md#texture) for compressor selection.
+
 ## Initial Setup
 
 ### Run the Setup Wizard (Recommended)

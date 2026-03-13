@@ -172,9 +172,18 @@ gpu_device = integrated
 
 **Compressor Backends:**
 - **software**: Pure-Rust block compression. Slowest, no external dependencies.
-- **ispc** (default): Intel ISPC SIMD compression via `intel_tex_2`. 5-10x faster than software.
-- **gpu**: wgpu compute shader compression. Requires `--features gpu-encode` at build time.
-  Offloads encoding to GPU, freeing CPU for X-Plane. Best when an idle integrated GPU is available.
+- **ispc** (default): Intel ISPC SIMD compression via `intel_tex_2`. 5-10x faster than software. Prebuilt ISPC kernels are included — no special build requirements.
+- **gpu**: wgpu compute shader compression. Requires `--features gpu-encode` at build time (use `make release-gpu`). Offloads encoding to GPU via WGSL compute shaders, freeing CPU for X-Plane.
+
+**Choosing a Compressor:**
+
+| Backend | Speed | CPU Usage | When to Use |
+|---------|-------|-----------|-------------|
+| `software` | Slowest | High | Fallback when ISPC/GPU unavailable |
+| `ispc` | Fast (5-10x) | High | Default — best overall performance for most users |
+| `gpu` | Fast | Low | When an idle GPU is available (e.g., iGPU while dGPU runs X-Plane) |
+
+The `gpu` backend is ideal for systems with both an integrated and discrete GPU. Configure `gpu_device = integrated` to use the iGPU for encoding while the discrete GPU handles X-Plane rendering. This eliminates CPU contention between encoding and the simulator.
 
 **GPU Device Selection:**
 - `integrated` — Use the integrated GPU (e.g., AMD Radeon on Ryzen). Recommended when
