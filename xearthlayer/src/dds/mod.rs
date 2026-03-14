@@ -74,7 +74,7 @@ mod types;
 
 // Public API
 #[cfg(feature = "gpu-encode")]
-pub use compressor::{create_wgpu_compressor, WgpuCompressor};
+pub use compressor::{create_gpu_resources, create_wgpu_compressor, WgpuCompressor};
 pub use compressor::{default_compressor, BlockCompressor, IspcCompressor, SoftwareCompressor};
 pub use encoder::DdsEncoder;
 #[cfg(feature = "gpu-encode")]

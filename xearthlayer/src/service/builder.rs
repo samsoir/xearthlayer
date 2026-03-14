@@ -126,16 +126,13 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<Arc<DdsTextureEncoder>, 
         "ispc" => Arc::new(IspcCompressor),
         #[cfg(feature = "gpu-encode")]
         "gpu" => {
-            use crate::dds::create_wgpu_compressor;
             use crate::dds::gpu_channel::create_gpu_encoder_channel;
 
-            let gpu_compressor = create_wgpu_compressor(config.texture().gpu_device())
-                .map_err(|e| ServiceError::ConfigError(format!("GPU compressor: {}", e)))?;
-
             let (channel, _worker_handle) =
-                create_gpu_encoder_channel(Arc::new(gpu_compressor) as Arc<dyn BlockCompressor>);
+                create_gpu_encoder_channel(config.texture().gpu_device())
+                    .map_err(|e| ServiceError::ConfigError(format!("GPU compressor: {e}")))?;
 
-            tracing::info!("GPU encoder channel created with dedicated worker task");
+            tracing::info!("GPU pipeline encoder created with dedicated worker");
             Arc::new(channel) as Arc<dyn BlockCompressor>
         }
         #[cfg(not(feature = "gpu-encode"))]

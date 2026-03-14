@@ -99,13 +99,20 @@ loop {
 }
 ```
 
-### Design for Approach 3 (Future)
+### Approach 3: Pipeline Overlap (Implemented — #80)
 
-The channel interface is **identical** for Approach 3. Only worker internals change:
-- Approach 2: batch → one compute pass → one submit → poll → readback all
-- Approach 3: pipeline individual tiles — submit A → upload B → readback A → submit B → upload C → etc.
+The channel interface is **identical** for Approach 3. Only worker internals changed:
+- Approach 2 (original): batch → one compute pass → one submit → poll → readback all
+- Approach 3 (current): pipeline individual tiles — submit A → upload B → readback A → submit B → upload C → etc.
 
-The `GpuEncodeRequest` / `oneshot` pattern works for both.
+The worker now takes direct ownership of `wgpu::Device`, `wgpu::Queue`, and `GpuBlockCompressor`
+(instead of going through `WgpuCompressor::compress()`). `create_gpu_resources()` was extracted
+from `WgpuCompressor::try_new()` as a shared factory. The worker runs on a dedicated OS thread
+via `spawn_blocking` and uses an adaptive overlap strategy:
+- When more requests are queued: defer readback to overlap with the next upload (pipeline depth 2)
+- When queue is empty: complete immediately to avoid deadlock on single/last request
+
+VRAM budget: pipeline depth 2 with 4096×4096 tiles ≈ 160MB (BC1) / 176MB (BC3) peak.
 
 ### Performance Impact
 

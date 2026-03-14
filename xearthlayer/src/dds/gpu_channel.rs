@@ -5,8 +5,8 @@
 
 #[cfg(feature = "gpu-encode")]
 mod inner {
+    use block_compression::{CompressionVariant, GpuBlockCompressor};
     use image::RgbaImage;
-    use std::sync::Arc;
     use tokio::sync::{mpsc, oneshot};
 
     use crate::dds::compressor::BlockCompressor;
@@ -74,56 +74,238 @@ mod inner {
         }
     }
 
-    /// Spawn the GPU encoder worker task.
+    // =========================================================================
+    // Pipeline overlap internals
+    // =========================================================================
+
+    /// Tracks a GPU submission whose results have not yet been read back.
+    struct InFlightRequest {
+        readback_buffer: wgpu::Buffer,
+        output_size: u64,
+        submission_index: wgpu::SubmissionIndex,
+        response: oneshot::Sender<Result<Vec<u8>, DdsError>>,
+    }
+
+    /// Convert a [`DdsFormat`] to the corresponding `block_compression` variant
+    /// and compressed block size in bytes.
+    fn format_params(format: DdsFormat) -> (CompressionVariant, u32) {
+        match format {
+            DdsFormat::BC1 => (CompressionVariant::BC1, 8),
+            DdsFormat::BC3 => (CompressionVariant::BC3, 16),
+        }
+    }
+
+    /// Upload an image to the GPU, run a compression compute pass, and submit.
     ///
-    /// The worker receives compression requests and processes them using
-    /// the provided block compressor. Returns a `JoinHandle` that resolves
-    /// when the channel is closed (all senders dropped).
+    /// Returns an [`InFlightRequest`] whose readback buffer will contain the
+    /// compressed data once `device.poll(Wait)` completes.
+    fn upload_and_submit(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        compressor: &mut GpuBlockCompressor,
+        request: GpuEncodeRequest,
+    ) -> InFlightRequest {
+        let width = request.image.width();
+        let height = request.image.height();
+        let (variant, block_size) = format_params(request.format);
+        let blocks_wide = width.div_ceil(4);
+        let blocks_high = height.div_ceil(4);
+        let output_size = (blocks_wide * blocks_high * block_size) as u64;
+
+        // Create GPU texture and upload pixel data
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pipeline-input"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        let bytes_per_row = width * 4;
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            request.image.as_raw(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Create output + readback buffers
+        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pipeline-output"),
+            size: output_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pipeline-readback"),
+            size: output_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        // Run compression compute pass
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("pipeline-compress"),
+        });
+
+        compressor.add_compression_task(
+            variant,
+            &texture_view,
+            width,
+            height,
+            &output_buffer,
+            None,
+            None,
+        );
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("pipeline-compute"),
+                timestamp_writes: None,
+            });
+            compressor.compress(&mut pass);
+        }
+
+        // Copy compressed output to readback buffer
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &readback_buffer, 0, output_size);
+
+        // Submit — non-blocking, GPU starts executing immediately
+        let submission_index = queue.submit(std::iter::once(encoder.finish()));
+
+        // Initiate async buffer mapping (will be ready after device.poll)
+        let buffer_slice = readback_buffer.slice(..);
+        buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
+
+        InFlightRequest {
+            readback_buffer,
+            output_size,
+            submission_index,
+            response: request.response,
+        }
+    }
+
+    /// Wait for a specific GPU submission to complete and send the result.
+    fn complete_readback(device: &wgpu::Device, in_flight: InFlightRequest) {
+        let result = (|| -> Result<Vec<u8>, DdsError> {
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(in_flight.submission_index),
+                    timeout: Some(std::time::Duration::from_secs(10)),
+                })
+                .map_err(|e| DdsError::CompressionFailed(format!("GPU poll failed: {e}")))?;
+
+            let buffer_slice = in_flight.readback_buffer.slice(..in_flight.output_size);
+            let data = buffer_slice.get_mapped_range();
+            let result = data.to_vec();
+            drop(data);
+            in_flight.readback_buffer.unmap();
+
+            Ok(result)
+        })();
+
+        // Send response; ignore error if caller dropped their receiver
+        let _ = in_flight.response.send(result);
+    }
+
+    /// Spawn the GPU pipeline worker on a dedicated OS thread.
+    ///
+    /// The worker receives compression requests via the channel and processes
+    /// them using pipeline overlap: while the GPU compresses tile A, the CPU
+    /// uploads tile B's data. This keeps the GPU constantly busy.
+    ///
+    /// Returns a `JoinHandle` that resolves when the channel is closed.
     pub fn spawn_gpu_worker(
-        compressor: Arc<dyn BlockCompressor>,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        mut compressor: GpuBlockCompressor,
         mut rx: mpsc::Receiver<GpuEncodeRequest>,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            while let Some(request) = rx.recv().await {
-                let queue_len = CHANNEL_CAPACITY - rx.capacity();
-                if queue_len > 0 {
-                    tracing::debug!(
-                        queue_depth = queue_len,
-                        format = ?request.format,
-                        width = request.image.width(),
-                        height = request.image.height(),
-                        "GPU worker processing (queued requests waiting)"
-                    );
+        // Use spawn_blocking for a long-lived dedicated thread.
+        // GpuBlockCompressor is !Send, so it must stay on one thread.
+        tokio::task::spawn_blocking(move || {
+            let mut in_flight: Option<InFlightRequest> = None;
+
+            while let Some(request) = rx.blocking_recv() {
+                let has_more = CHANNEL_CAPACITY - rx.capacity() > 0;
+
+                tracing::trace!(
+                    format = ?request.format,
+                    width = request.image.width(),
+                    height = request.image.height(),
+                    pipeline_depth = if in_flight.is_some() { 2 } else { 1 },
+                    has_more,
+                    "GPU pipeline: uploading + submitting"
+                );
+
+                // Upload and submit the new request (non-blocking GPU submit)
+                let new_in_flight = upload_and_submit(&device, &queue, &mut compressor, request);
+
+                // Complete the previous in-flight request (GPU already has new work queued)
+                if let Some(prev) = in_flight.take() {
+                    complete_readback(&device, prev);
                 }
 
-                let comp = Arc::clone(&compressor);
-                let result = tokio::task::spawn_blocking(move || {
-                    comp.compress(&request.image, request.format)
-                })
-                .await;
-
-                let response = match result {
-                    Ok(r) => r,
-                    Err(e) => Err(DdsError::CompressionFailed(format!(
-                        "worker task panicked: {e}"
-                    ))),
-                };
-
-                // Send response; ignore error if caller dropped their receiver
-                let _ = request.response.send(response);
+                // If no more requests are queued, complete this one immediately.
+                // Otherwise, defer readback to overlap with the next upload.
+                if !has_more {
+                    complete_readback(&device, new_in_flight);
+                    in_flight = None;
+                } else {
+                    in_flight = Some(new_in_flight);
+                }
             }
-            tracing::info!("GPU encoder worker shutting down (channel closed)");
+
+            // Drain any remaining in-flight request
+            if let Some(prev) = in_flight {
+                complete_readback(&device, prev);
+            }
+
+            tracing::info!("GPU pipeline worker shutting down (channel closed)");
         })
     }
 
-    /// Create a [`GpuEncoderChannel`] and spawn the worker, returning
-    /// the channel handle and worker `JoinHandle`.
+    /// Create a [`GpuEncoderChannel`] with a pipeline overlap worker.
+    ///
+    /// Initializes GPU resources and spawns the worker thread. Returns the
+    /// channel handle and worker `JoinHandle`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DdsError` if GPU initialization fails.
     pub fn create_gpu_encoder_channel(
-        compressor: Arc<dyn BlockCompressor>,
-    ) -> (GpuEncoderChannel, tokio::task::JoinHandle<()>) {
+        gpu_device: &str,
+    ) -> Result<(GpuEncoderChannel, tokio::task::JoinHandle<()>), DdsError> {
+        let (device, queue, compressor, adapter_name) =
+            crate::dds::create_gpu_resources(gpu_device)?;
+
+        tracing::info!(adapter = %adapter_name, "GPU pipeline worker starting");
+
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let handle = spawn_gpu_worker(compressor, rx);
-        (GpuEncoderChannel::new(tx), handle)
+        let handle = spawn_gpu_worker(device, queue, compressor, rx);
+        Ok((GpuEncoderChannel::new(tx), handle))
     }
 }
 
@@ -256,13 +438,33 @@ mod tests {
     }
 
     // =========================================================================
-    // Task 3: GPU Worker Task
+    // Mock worker tests (SoftwareCompressor, no GPU required)
     // =========================================================================
 
+    /// Spawn a mock worker using SoftwareCompressor for non-GPU tests.
+    fn spawn_mock_worker(
+        rx: &mut Option<mpsc::Receiver<GpuEncodeRequest>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let rx = rx.take().expect("receiver already consumed");
+        tokio::spawn(async move {
+            let mut rx = rx;
+            while let Some(req) = rx.recv().await {
+                let compressor = SoftwareCompressor;
+                let result = compressor.compress(&req.image, req.format);
+                let _ = req.response.send(result);
+            }
+        })
+    }
+
+    fn mock_channel() -> (GpuEncoderChannel, Option<mpsc::Receiver<GpuEncodeRequest>>) {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        (GpuEncoderChannel::new(tx), Some(rx))
+    }
+
     #[tokio::test]
-    async fn test_worker_processes_single_request() {
-        let compressor: Arc<dyn BlockCompressor> = Arc::new(SoftwareCompressor);
-        let (channel, worker_handle) = create_gpu_encoder_channel(compressor);
+    async fn test_mock_worker_processes_single_request() {
+        let (channel, mut rx) = mock_channel();
+        let _worker = spawn_mock_worker(&mut rx);
 
         let result = tokio::task::spawn_blocking(move || {
             let image = RgbaImage::new(4, 4);
@@ -273,14 +475,12 @@ mod tests {
 
         let data = result.expect("compress should succeed");
         assert_eq!(data.len(), 8); // 1 block × 8 bytes for BC1
-
-        drop(worker_handle);
     }
 
     #[tokio::test]
-    async fn test_worker_processes_multiple_sequential_requests() {
-        let compressor: Arc<dyn BlockCompressor> = Arc::new(SoftwareCompressor);
-        let (channel, _worker_handle) = create_gpu_encoder_channel(compressor);
+    async fn test_mock_worker_processes_multiple_sequential_requests() {
+        let (channel, mut rx) = mock_channel();
+        let _worker = spawn_mock_worker(&mut rx);
         let channel = Arc::new(channel);
 
         for i in 0..3 {
@@ -298,9 +498,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_worker_handles_concurrent_submissions() {
-        let compressor: Arc<dyn BlockCompressor> = Arc::new(SoftwareCompressor);
-        let (channel, _worker_handle) = create_gpu_encoder_channel(compressor);
+    async fn test_mock_worker_handles_concurrent_submissions() {
+        let (channel, mut rx) = mock_channel();
+        let _worker = spawn_mock_worker(&mut rx);
         let channel = Arc::new(channel);
 
         let mut handles = vec![];
@@ -320,24 +520,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_worker_stops_when_channel_closed() {
-        let compressor: Arc<dyn BlockCompressor> = Arc::new(SoftwareCompressor);
-        let (channel, worker_handle) = create_gpu_encoder_channel(compressor);
+    async fn test_mock_worker_stops_when_channel_closed() {
+        let (channel, mut rx) = mock_channel();
+        let worker = spawn_mock_worker(&mut rx);
 
         // Drop the sender side
         drop(channel);
 
         // Worker should complete
-        tokio::time::timeout(std::time::Duration::from_secs(2), worker_handle)
+        tokio::time::timeout(std::time::Duration::from_secs(2), worker)
             .await
             .expect("worker should stop within timeout")
             .expect("worker should not panic");
     }
 
     #[tokio::test]
-    async fn test_worker_handles_mixed_formats() {
-        let compressor: Arc<dyn BlockCompressor> = Arc::new(SoftwareCompressor);
-        let (channel, _worker_handle) = create_gpu_encoder_channel(compressor);
+    async fn test_mock_worker_handles_mixed_formats() {
+        let (channel, mut rx) = mock_channel();
+        let _worker = spawn_mock_worker(&mut rx);
         let channel = Arc::new(channel);
 
         // BC1: 8 bytes per 4×4 block
@@ -362,9 +562,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires GPU hardware
     async fn test_create_gpu_encoder_channel_convenience() {
-        let compressor: Arc<dyn BlockCompressor> = Arc::new(SoftwareCompressor);
-        let (channel, worker_handle) = create_gpu_encoder_channel(compressor);
+        let (channel, worker_handle) = match create_gpu_encoder_channel("integrated") {
+            Ok(r) => r,
+            Err(_) => return,
+        };
 
         // Verify channel is connected
         assert!(channel.is_connected());
@@ -378,20 +581,174 @@ mod tests {
     }
 
     // =========================================================================
-    // Task 6: Integration tests with full GPU pipeline
+    // Pipeline overlap tests (require GPU hardware)
     // =========================================================================
 
-    /// End-to-end: submit a 4096×4096 image through the full GPU channel pipeline.
+    /// Helper to create GPU resources for pipeline tests.
+    fn gpu_resources_or_skip() -> Option<(
+        wgpu::Device,
+        wgpu::Queue,
+        block_compression::GpuBlockCompressor,
+    )> {
+        use crate::dds::create_gpu_resources;
+        match create_gpu_resources("integrated") {
+            Ok((device, queue, compressor, _name)) => Some((device, queue, compressor)),
+            Err(_) => None, // Skip if no GPU
+        }
+    }
+
+    /// Single request through the pipeline worker with overlap loop.
     #[tokio::test]
     #[ignore] // Requires GPU hardware
-    async fn test_full_pipeline_4096x4096() {
-        use crate::dds::create_wgpu_compressor;
+    async fn test_pipeline_single_request() {
+        let (device, queue, compressor) = match gpu_resources_or_skip() {
+            Some(r) => r,
+            None => return,
+        };
 
-        let gpu_compressor =
-            create_wgpu_compressor("integrated").expect("GPU required for this test");
-        let compressor: Arc<dyn BlockCompressor> = Arc::new(gpu_compressor);
-        let (channel, _handle) = create_gpu_encoder_channel(compressor);
+        let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
+        let _worker = spawn_gpu_worker(device, queue, compressor, rx);
 
+        let channel = GpuEncoderChannel::new(tx);
+        let result = tokio::task::spawn_blocking(move || {
+            let image = RgbaImage::new(4, 4);
+            channel.compress(&image, DdsFormat::BC1)
+        })
+        .await
+        .unwrap();
+
+        let data = result.expect("pipeline compress should succeed");
+        // 1 block × 8 bytes for BC1
+        assert_eq!(data.len(), 8);
+    }
+
+    /// Multiple sequential requests exercise the pipeline overlap path.
+    #[tokio::test]
+    #[ignore] // Requires GPU hardware
+    async fn test_pipeline_sequential_requests() {
+        let (device, queue, compressor) = match gpu_resources_or_skip() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
+        let _worker = spawn_gpu_worker(device, queue, compressor, rx);
+
+        let channel = Arc::new(GpuEncoderChannel::new(tx));
+
+        for i in 0..3 {
+            let ch = Arc::clone(&channel);
+            let result = tokio::task::spawn_blocking(move || {
+                let image = RgbaImage::new(4, 4);
+                ch.compress(&image, DdsFormat::BC1)
+            })
+            .await
+            .unwrap();
+
+            let data = result.unwrap_or_else(|e| panic!("request {i} should succeed: {e}"));
+            assert_eq!(data.len(), 8);
+        }
+    }
+
+    /// Concurrent submissions from multiple threads exercise backpressure.
+    #[tokio::test]
+    #[ignore] // Requires GPU hardware
+    async fn test_pipeline_concurrent_submissions() {
+        let (device, queue, compressor) = match gpu_resources_or_skip() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
+        let _worker = spawn_gpu_worker(device, queue, compressor, rx);
+
+        let channel = Arc::new(GpuEncoderChannel::new(tx));
+        let mut handles = vec![];
+
+        for _ in 0..6 {
+            let ch = Arc::clone(&channel);
+            handles.push(tokio::task::spawn_blocking(move || {
+                let image = RgbaImage::new(4, 4);
+                ch.compress(&image, DdsFormat::BC1)
+            }));
+        }
+
+        for handle in handles {
+            let result = handle.await.unwrap();
+            let data = result.expect("concurrent pipeline compress should succeed");
+            assert_eq!(data.len(), 8);
+        }
+    }
+
+    /// Mixed BC1 and BC3 formats through the pipeline.
+    #[tokio::test]
+    #[ignore] // Requires GPU hardware
+    async fn test_pipeline_mixed_formats() {
+        let (device, queue, compressor) = match gpu_resources_or_skip() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
+        let _worker = spawn_gpu_worker(device, queue, compressor, rx);
+
+        let channel = Arc::new(GpuEncoderChannel::new(tx));
+
+        // BC1: 8 bytes per 4×4 block
+        let ch = Arc::clone(&channel);
+        let bc1 = tokio::task::spawn_blocking(move || {
+            let image = RgbaImage::new(4, 4);
+            ch.compress(&image, DdsFormat::BC1)
+        })
+        .await
+        .unwrap();
+        assert_eq!(bc1.unwrap().len(), 8);
+
+        // BC3: 16 bytes per 4×4 block
+        let ch = Arc::clone(&channel);
+        let bc3 = tokio::task::spawn_blocking(move || {
+            let image = RgbaImage::new(4, 4);
+            ch.compress(&image, DdsFormat::BC3)
+        })
+        .await
+        .unwrap();
+        assert_eq!(bc3.unwrap().len(), 16);
+    }
+
+    /// Worker shuts down cleanly when channel is closed.
+    #[tokio::test]
+    #[ignore] // Requires GPU hardware
+    async fn test_pipeline_worker_shutdown() {
+        let (device, queue, compressor) = match gpu_resources_or_skip() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
+        let worker = spawn_gpu_worker(device, queue, compressor, rx);
+
+        // Drop sender to close channel
+        drop(tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+            .await
+            .expect("worker should stop within timeout")
+            .expect("worker should not panic");
+    }
+
+    /// Full pipeline with 4096×4096 tile (realistic workload).
+    #[tokio::test]
+    #[ignore] // Requires GPU hardware
+    async fn test_pipeline_full_tile_4096x4096() {
+        let (device, queue, compressor) = match gpu_resources_or_skip() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
+        let _worker = spawn_gpu_worker(device, queue, compressor, rx);
+
+        let channel = GpuEncoderChannel::new(tx);
         let result = tokio::task::spawn_blocking(move || {
             let image = RgbaImage::new(4096, 4096);
             channel.compress(&image, DdsFormat::BC1)
@@ -402,34 +759,5 @@ mod tests {
         let data = result.expect("GPU compression should succeed");
         // BC1: 1024×1024 blocks × 8 bytes = 8388608 bytes
         assert_eq!(data.len(), 8_388_608);
-    }
-
-    /// Test concurrent submissions through the GPU channel.
-    #[tokio::test]
-    #[ignore] // Requires GPU hardware
-    async fn test_concurrent_gpu_submissions() {
-        use crate::dds::create_wgpu_compressor;
-
-        let gpu_compressor =
-            create_wgpu_compressor("integrated").expect("GPU required for this test");
-        let compressor: Arc<dyn BlockCompressor> = Arc::new(gpu_compressor);
-        let (channel, _handle) = create_gpu_encoder_channel(compressor);
-        let channel = Arc::new(channel);
-
-        let mut handles = vec![];
-        for _ in 0..4 {
-            let ch = Arc::clone(&channel);
-            handles.push(tokio::task::spawn_blocking(move || {
-                let image = RgbaImage::new(256, 256);
-                ch.compress(&image, DdsFormat::BC1)
-            }));
-        }
-
-        for handle in handles {
-            let result = handle.await.unwrap();
-            let data = result.expect("concurrent GPU compress should succeed");
-            // 256×256 BC1: 64×64 blocks × 8 = 32768 bytes
-            assert_eq!(data.len(), 32_768);
-        }
     }
 }

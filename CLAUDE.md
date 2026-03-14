@@ -49,9 +49,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
      - `SoftwareCompressor` — Pure-Rust fallback
      - `IspcCompressor` — SIMD-optimized via Intel ISPC (default)
      - `GpuEncoderChannel` — Channel-based GPU encoding (optional `gpu-encode` feature)
-   - GPU encoding architecture: `mpsc` channel → dedicated worker task → `WgpuCompressor`
+   - GPU encoding architecture: `mpsc` channel → dedicated pipeline worker → `GpuBlockCompressor`
    - `WgpuCompressor` wraps `block_compression` crate (ISPC kernels ported to WGSL compute shaders)
-   - Channel eliminates Mutex contention; worker can be evolved to batch multiple tiles per GPU pass
+   - Pipeline overlap: while GPU compresses tile A, CPU uploads tile B; adaptive depth (1 or 2)
+   - `create_gpu_resources()` — shared factory for device/queue/compressor creation (DRY)
 
 5. **Cache System** (`xearthlayer/src/cache/`, `xearthlayer/src/service/cache_layer.rs`)
    - `CacheLayer` - Service-owned cache lifecycle (encapsulates memory + disk)

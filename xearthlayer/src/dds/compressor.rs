@@ -225,36 +225,7 @@ mod gpu {
         /// Returns `DdsError::CompressionFailed` if no matching adapter is found or
         /// device creation fails.
         pub fn try_new(gpu_device: &str) -> Result<Self, DdsError> {
-            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::all(),
-                ..Default::default()
-            });
-
-            let adapters: Vec<wgpu::Adapter> =
-                pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
-            if adapters.is_empty() {
-                return Err(DdsError::CompressionFailed(
-                    "No GPU adapters available".to_string(),
-                ));
-            }
-
-            let adapter = select_adapter(&adapters, gpu_device)?;
-            let info = adapter.get_info();
-            let adapter_name =
-                format!("{} ({:?}, {:?})", info.name, info.device_type, info.backend);
-
-            let (device, queue) =
-                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                    label: Some("xearthlayer-dds"),
-                    ..Default::default()
-                }))
-                .map_err(|e| {
-                    DdsError::CompressionFailed(format!("Failed to create wgpu device: {e}"))
-                })?;
-
-            let compressor = GpuBlockCompressor::new(device.clone(), queue.clone());
-
-            tracing::info!(adapter = %adapter_name, "GPU block compressor initialized");
+            let (device, queue, compressor, adapter_name) = create_gpu_resources(gpu_device)?;
 
             Ok(Self {
                 device,
@@ -263,6 +234,52 @@ mod gpu {
                 adapter_name,
             })
         }
+    }
+
+    /// Create GPU resources for block compression.
+    ///
+    /// Initializes a wgpu device, queue, and `GpuBlockCompressor` for the
+    /// selected GPU adapter. This is the shared factory used by both
+    /// `WgpuCompressor` (standalone) and the pipeline worker.
+    ///
+    /// # Arguments
+    ///
+    /// * `gpu_device` - Device selector: "integrated", "discrete", or adapter name substring
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(Device, Queue, GpuBlockCompressor, adapter_name)`.
+    pub fn create_gpu_resources(
+        gpu_device: &str,
+    ) -> Result<(wgpu::Device, wgpu::Queue, GpuBlockCompressor, String), DdsError> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+
+        let adapters: Vec<wgpu::Adapter> =
+            pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        if adapters.is_empty() {
+            return Err(DdsError::CompressionFailed(
+                "No GPU adapters available".to_string(),
+            ));
+        }
+
+        let adapter = select_adapter(&adapters, gpu_device)?;
+        let info = adapter.get_info();
+        let adapter_name = format!("{} ({:?}, {:?})", info.name, info.device_type, info.backend);
+
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("xearthlayer-dds"),
+            ..Default::default()
+        }))
+        .map_err(|e| DdsError::CompressionFailed(format!("Failed to create wgpu device: {e}")))?;
+
+        let compressor = GpuBlockCompressor::new(device.clone(), queue.clone());
+
+        tracing::info!(adapter = %adapter_name, "GPU resources initialized");
+
+        Ok((device, queue, compressor, adapter_name))
     }
 
     fn select_adapter<'a>(
@@ -462,7 +479,7 @@ mod gpu {
 }
 
 #[cfg(feature = "gpu-encode")]
-pub use gpu::WgpuCompressor;
+pub use gpu::{create_gpu_resources, WgpuCompressor};
 
 /// Create a GPU-accelerated block compressor using wgpu compute shaders.
 ///
@@ -646,5 +663,20 @@ mod gpu_tests {
         let result = WgpuCompressor::try_new("nonexistent_device_12345");
         // This should either fail with no matching adapter, or on CI with no GPU at all
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_gpu_resources_invalid_device() {
+        let result = create_gpu_resources("nonexistent_device_12345");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_gpu_resources_returns_adapter_name() {
+        // Skip if no GPU available
+        let result = create_gpu_resources("integrated");
+        if let Ok((_, _, _, adapter_name)) = result {
+            assert!(!adapter_name.is_empty());
+        }
     }
 }
