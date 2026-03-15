@@ -142,6 +142,24 @@ test-doc: ## Run documentation tests
 test-all: test test-doc ## Run all tests including doc tests
 	@echo "$(GREEN)All tests complete!$(NC)"
 
+# GPU stress test configuration (override with env vars or make args)
+GPU_STRESS_DURATION_SECS ?= 120
+GPU_STRESS_BURST_SIZE ?= 15
+GPU_STRESS_IDLE_MS ?= 3000
+GPU_STRESS_IMAGE_SIZE ?= 4096
+
+.PHONY: test-gpu-stress
+test-gpu-stress: ## Run GPU pipeline stress test (requires GPU hardware)
+	@echo "$(BLUE)Running GPU pipeline stress test...$(NC)"
+	@echo "$(BLUE)  Duration: $(GPU_STRESS_DURATION_SECS)s | Burst: $(GPU_STRESS_BURST_SIZE) | Idle: $(GPU_STRESS_IDLE_MS)ms | Image: $(GPU_STRESS_IMAGE_SIZE)x$(GPU_STRESS_IMAGE_SIZE)$(NC)"
+	GPU_STRESS_DURATION_SECS=$(GPU_STRESS_DURATION_SECS) \
+	GPU_STRESS_BURST_SIZE=$(GPU_STRESS_BURST_SIZE) \
+	GPU_STRESS_IDLE_MS=$(GPU_STRESS_IDLE_MS) \
+	GPU_STRESS_IMAGE_SIZE=$(GPU_STRESS_IMAGE_SIZE) \
+	RUST_BACKTRACE=$(RUST_BACKTRACE) \
+	$(CARGO) test -p xearthlayer --features gpu-encode --test gpu_pipeline_stress -- --ignored --nocapture
+	@echo "$(GREEN)GPU stress test complete!$(NC)"
+
 .PHONY: coverage
 coverage: ## Generate test coverage report
 	@echo "$(BLUE)Generating test coverage report...$(NC)"

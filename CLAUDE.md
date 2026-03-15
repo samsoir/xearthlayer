@@ -53,6 +53,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `WgpuCompressor` wraps `block_compression` crate (ISPC kernels ported to WGSL compute shaders)
    - Pipeline overlap: while GPU compresses tile A, CPU uploads tile B; adaptive depth (1 or 2)
    - `create_gpu_resources()` — shared factory for device/queue/compressor creation (DRY)
+   - GPU pipeline hardening:
+     - `map_async` errors propagated via `std::sync::mpsc` (not silently ignored)
+     - Worker panic recovery via `catch_unwind` (logs error, sends failure, drains queue, breaks loop)
+     - `device.on_uncaptured_error()` registered for device loss logging
+     - Structured tracing on buffer lifecycle and error paths
 
 5. **Cache System** (`xearthlayer/src/cache/`, `xearthlayer/src/service/cache_layer.rs`)
    - `CacheLayer` - Service-owned cache lifecycle (encapsulates memory + disk)
