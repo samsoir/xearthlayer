@@ -273,30 +273,68 @@ mod inner {
             while let Some(request) = rx.blocking_recv() {
                 let has_more = CHANNEL_CAPACITY - rx.capacity() > 0;
 
-                tracing::trace!(
-                    format = ?request.format,
-                    width = request.image.width(),
-                    height = request.image.height(),
-                    pipeline_depth = if in_flight.is_some() { 2 } else { 1 },
-                    has_more,
-                    "GPU pipeline: uploading + submitting"
-                );
+                // Wrap GPU work in catch_unwind so panics don't silently kill
+                // the worker thread (callers would hang forever on blocking_recv).
+                // AssertUnwindSafe is sound because we break on panic and never
+                // reuse potentially corrupted GPU state.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tracing::trace!(
+                        format = ?request.format,
+                        width = request.image.width(),
+                        height = request.image.height(),
+                        pipeline_depth = if in_flight.is_some() { 2 } else { 1 },
+                        has_more,
+                        "GPU pipeline: uploading + submitting"
+                    );
 
-                // Upload and submit the new request (non-blocking GPU submit)
-                let new_in_flight = upload_and_submit(&device, &queue, &mut compressor, request);
+                    // Upload and submit the new request (non-blocking GPU submit)
+                    let new_in_flight =
+                        upload_and_submit(&device, &queue, &mut compressor, request);
 
-                // Complete the previous in-flight request (GPU already has new work queued)
-                if let Some(prev) = in_flight.take() {
-                    complete_readback(&device, prev);
-                }
+                    // Complete the previous in-flight request (GPU already has new work queued)
+                    if let Some(prev) = in_flight.take() {
+                        complete_readback(&device, prev);
+                    }
 
-                // If no more requests are queued, complete this one immediately.
-                // Otherwise, defer readback to overlap with the next upload.
-                if !has_more {
-                    complete_readback(&device, new_in_flight);
-                    in_flight = None;
-                } else {
-                    in_flight = Some(new_in_flight);
+                    // If no more requests are queued, complete this one immediately.
+                    // Otherwise, defer readback to overlap with the next upload.
+                    if !has_more {
+                        complete_readback(&device, new_in_flight);
+                        in_flight = None;
+                    } else {
+                        in_flight = Some(new_in_flight);
+                    }
+                }));
+
+                if let Err(panic_info) = result {
+                    let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+
+                    tracing::error!(error = %msg, "GPU pipeline worker panicked, shutting down");
+
+                    // The current request's response_tx was moved into the closure
+                    // and dropped on panic — caller gets RecvError which maps to
+                    // "GPU worker dropped response channel". Handle any in-flight
+                    // request from the previous iteration:
+                    if let Some(prev) = in_flight.take() {
+                        let _ = prev.response.send(Err(DdsError::CompressionFailed(format!(
+                            "GPU worker panicked: {msg}"
+                        ))));
+                    }
+
+                    // Drain remaining queued requests so callers don't hang
+                    while let Ok(req) = rx.try_recv() {
+                        let _ = req.response.send(Err(DdsError::CompressionFailed(
+                            "GPU worker terminated after panic".to_string(),
+                        )));
+                    }
+
+                    break;
                 }
             }
 
@@ -756,6 +794,36 @@ mod tests {
             .await
             .expect("worker should stop within timeout")
             .expect("worker should not panic");
+    }
+
+    /// Worker panic sends error to caller instead of hanging forever.
+    #[tokio::test]
+    async fn test_gpu_worker_panic_does_not_hang_caller() {
+        let (tx, mut rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
+        let channel = GpuEncoderChannel::new(tx);
+
+        // Mock worker that panics on first request (simulating GPU internal panic)
+        tokio::task::spawn_blocking(move || {
+            if let Some(req) = rx.blocking_recv() {
+                // Simulate catch_unwind behavior: send error, don't panic the whole thread
+                let _ = req.response.send(Err(DdsError::CompressionFailed(
+                    "GPU worker panicked: simulated panic".to_string(),
+                )));
+            }
+        });
+
+        let result = tokio::task::spawn_blocking(move || {
+            let image = RgbaImage::new(4, 4);
+            channel.compress(&image, DdsFormat::BC1)
+        })
+        .await
+        .expect("spawn_blocking should not panic");
+
+        let err = result.expect_err("should fail with worker panic error");
+        assert!(
+            err.to_string().contains("panic"),
+            "error should mention panic, got: {err}"
+        );
     }
 
     /// Mapping error is propagated through the channel (mock worker, no GPU needed).
