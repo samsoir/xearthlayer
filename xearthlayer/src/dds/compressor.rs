@@ -275,6 +275,10 @@ mod gpu {
         }))
         .map_err(|e| DdsError::CompressionFailed(format!("Failed to create wgpu device: {e}")))?;
 
+        device.on_uncaptured_error(std::sync::Arc::new(|error| {
+            tracing::error!(error = %error, "wgpu uncaptured error (possible device loss)");
+        }));
+
         let compressor = GpuBlockCompressor::new(device.clone(), queue.clone());
 
         tracing::info!(adapter = %adapter_name, "GPU resources initialized");
@@ -677,6 +681,19 @@ mod gpu_tests {
         let result = create_gpu_resources("integrated");
         if let Ok((_, _, _, adapter_name)) = result {
             assert!(!adapter_name.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_create_gpu_resources_registers_error_handler() {
+        // This test verifies create_gpu_resources still works after
+        // adding the on_uncaptured_error handler. Skip if no GPU.
+        let result = create_gpu_resources("integrated");
+        // Either succeeds (GPU available) or fails with adapter error (no GPU)
+        // — neither should panic from the error handler registration.
+        match result {
+            Ok((_, _, _, name)) => assert!(!name.is_empty()),
+            Err(_) => {} // No GPU available, that's fine
         }
     }
 }

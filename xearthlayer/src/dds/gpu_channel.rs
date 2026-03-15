@@ -198,6 +198,13 @@ mod inner {
         // Submit — non-blocking, GPU starts executing immediately
         let submission_index = queue.submit(std::iter::once(encoder.finish()));
 
+        tracing::trace!(
+            width,
+            height,
+            output_size,
+            "GPU pipeline: buffers created, compute pass submitted"
+        );
+
         // Initiate async buffer mapping (will be ready after device.poll).
         // Use a channel to propagate mapping errors instead of silently
         // ignoring them — accessing an unmapped buffer causes SIGBUS.
@@ -224,7 +231,10 @@ mod inner {
                     submission_index: Some(in_flight.submission_index),
                     timeout: Some(std::time::Duration::from_secs(10)),
                 })
-                .map_err(|e| DdsError::CompressionFailed(format!("GPU poll failed: {e}")))?;
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "GPU pipeline: device.poll failed (possible device loss)");
+                    DdsError::CompressionFailed(format!("GPU poll failed: {e}"))
+                })?;
 
             // Check that buffer mapping succeeded (callback fired during poll).
             // wgpu guarantees map_async callback fires during poll(), so recv()
@@ -236,6 +246,7 @@ mod inner {
                     DdsError::CompressionFailed("GPU map_async callback never fired".to_string())
                 })?
                 .map_err(|e| {
+                    tracing::warn!(error = %e, "GPU pipeline: buffer mapping failed");
                     DdsError::CompressionFailed(format!("GPU buffer mapping failed: {e}"))
                 })?;
 
@@ -244,6 +255,8 @@ mod inner {
             let result = data.to_vec();
             drop(data);
             in_flight.readback_buffer.unmap();
+
+            tracing::trace!(bytes = result.len(), "GPU pipeline: readback complete");
 
             Ok(result)
         })();
