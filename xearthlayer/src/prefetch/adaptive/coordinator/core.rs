@@ -592,6 +592,20 @@ impl AdaptivePrefetchCoordinator {
                 // processed while X-Plane is already requesting near-edge ones.
                 crate::coord::sort_tiles_by_distance(&mut all_tiles, lat, lon);
 
+                // Enforce max_tiles_per_cycle limit (same as GroundStrategy).
+                // Without this, boundary crossings near dense regions can submit
+                // 700+ tiles in a single cycle, causing CPU spikes that starve
+                // the X-Plane render thread.
+                let max_tiles = self.config.max_tiles_per_cycle as usize;
+                if all_tiles.len() > max_tiles {
+                    tracing::info!(
+                        total = all_tiles.len(),
+                        limit = max_tiles,
+                        "Boundary prefetch capped at max_tiles_per_cycle"
+                    );
+                    all_tiles.truncate(max_tiles);
+                }
+
                 let total = all_tiles.len();
                 self.status.active_strategy = "boundary";
                 PrefetchPlan::with_tiles(all_tiles, &calibration, "boundary", 0, total)
@@ -1677,6 +1691,46 @@ mod tests {
             assert!(
                 plan.is_none(),
                 "Plan should be None when all boundary targets are already prefetched"
+            );
+        }
+    }
+
+    #[test]
+    fn test_boundary_plan_respects_max_tiles_per_cycle() {
+        use crate::geo_index::GeoIndex;
+
+        let tracker: Arc<dyn crate::scene_tracker::SceneTracker> =
+            Arc::new(StableBoundsTracker::default_bounds());
+        let geo_index = Arc::new(GeoIndex::new());
+
+        // Set a very low max_tiles_per_cycle to force truncation
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            max_tiles_per_cycle: 5,
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_scene_tracker(tracker)
+            .with_geo_index(geo_index);
+
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+
+        // Enter cruise phase
+        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Aircraft near north edge — triggers boundary crossing with many tiles
+        let plan = coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
+
+        if coord.status.phase == FlightPhase::Cruise {
+            let plan = plan.expect("Should generate boundary plan near edge");
+            assert!(
+                plan.tiles.len() <= 5,
+                "Boundary plan must respect max_tiles_per_cycle=5, got {} tiles",
+                plan.tiles.len()
             );
         }
     }
