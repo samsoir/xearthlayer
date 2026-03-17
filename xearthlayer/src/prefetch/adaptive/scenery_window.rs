@@ -1142,4 +1142,70 @@ mod tests {
             "Window should not drift with tracker bounds in Ready state"
         );
     }
+
+    // =========================================================================
+    // Full flight simulation test
+    // =========================================================================
+
+    #[test]
+    fn test_full_flight_simulation_no_drift() {
+        // Simulate LFMN departure, fly 10° NW
+        let config = SceneryWindowConfig {
+            trigger_distance: 1.0,
+            ..SceneryWindowConfig::default()
+        };
+        let mut window = SceneryWindow::new(config);
+        window.set_assumed_dimensions(3, 43.0); // Nice, France
+
+        // Initialize monitors at departure
+        window.check_boundaries(43.7, 7.3);
+
+        let mut total_crossings = 0;
+        let mut last_crossing_lat = 43.7_f64;
+
+        // Fly NW at ~0.1° increments (simulating ~10km steps)
+        for step in 0..100 {
+            let lat = 43.7 + step as f64 * 0.1;
+            let lon = 7.3 - step as f64 * 0.05;
+
+            let crossings = window.check_boundaries(lat, lon);
+            if !crossings.is_empty() {
+                total_crossings += 1;
+                last_crossing_lat = lat;
+
+                // Re-center after crossing (as coordinator would)
+                window.center_on_position(lat, lon);
+            }
+
+            // Verify window stays near aircraft at all times
+            if let Some((min_lat, max_lat, _, _)) = window.window_bounds() {
+                assert!(
+                    lat >= min_lat && lat <= max_lat,
+                    "Aircraft at {:.1}° should be inside window [{:.1}, {:.1}]",
+                    lat,
+                    min_lat,
+                    max_lat
+                );
+                let span = max_lat - min_lat;
+                assert!(
+                    span <= 4.0,
+                    "Window span {:.1}° should not exceed 4° (configured 3° + margin)",
+                    span
+                );
+            }
+        }
+
+        // Should have had multiple crossings over 10° of travel
+        assert!(
+            total_crossings >= 5,
+            "Expected >=5 crossings over 10°, got {}",
+            total_crossings
+        );
+        // Last crossing should be near the aircraft's final position
+        assert!(
+            last_crossing_lat > 50.0,
+            "Last crossing at {:.1}° should be near final position, not departure",
+            last_crossing_lat
+        );
+    }
 }
