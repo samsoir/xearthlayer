@@ -105,6 +105,11 @@ pub struct XEarthLayerService {
     gc_scheduler_handle: Option<JoinHandle<()>>,
     /// GC scheduler shutdown token for graceful shutdown.
     gc_scheduler_shutdown: Option<CancellationToken>,
+    /// GPU pipeline worker handle (when `texture.compressor = gpu`).
+    /// Awaited during shutdown to ensure GPU resources are released cleanly.
+    gpu_worker_handle: Option<JoinHandle<()>>,
+    /// Shutdown token for the GPU pipeline worker.
+    gpu_shutdown: Option<CancellationToken>,
 }
 
 impl XEarthLayerService {
@@ -315,7 +320,10 @@ impl XEarthLayerService {
         );
 
         // 5. Create texture encoder
-        let dds_encoder = builder::create_encoder(&config)?;
+        let encoder_components = builder::create_encoder(&config)?;
+        let dds_encoder = encoder_components.encoder;
+        let gpu_worker_handle = encoder_components.gpu_worker_handle;
+        let gpu_shutdown = encoder_components.gpu_shutdown;
 
         // 6. Create XEarthLayer runtime with cache bridges
         // Clone metrics_client before passing to RuntimeBuilder (we need it for GC daemon)
@@ -382,6 +390,8 @@ impl XEarthLayerService {
             cache_layer: Some(cache_layer),
             gc_scheduler_handle,
             gc_scheduler_shutdown,
+            gpu_worker_handle,
+            gpu_shutdown,
         })
     }
 
@@ -405,7 +415,10 @@ impl XEarthLayerService {
         } = builder::create_providers(&provider_config, &runtime_handle)?;
 
         // 2. Create texture encoder
-        let dds_encoder = builder::create_encoder(&config)?;
+        let encoder_components = builder::create_encoder(&config)?;
+        let dds_encoder = encoder_components.encoder;
+        let gpu_worker_handle = encoder_components.gpu_worker_handle;
+        let gpu_shutdown = encoder_components.gpu_shutdown;
 
         // 3. Create cache components
         let CacheComponents {
@@ -503,6 +516,8 @@ impl XEarthLayerService {
             cache_layer: None,
             gc_scheduler_handle: None,
             gc_scheduler_shutdown: None,
+            gpu_worker_handle,
+            gpu_shutdown,
         })
     }
 
@@ -531,7 +546,10 @@ impl XEarthLayerService {
         } = builder::create_providers(&provider_config, &runtime_handle)?;
 
         // 2. Create texture encoder
-        let dds_encoder = builder::create_encoder(&config)?;
+        let encoder_components = builder::create_encoder(&config)?;
+        let dds_encoder = encoder_components.encoder;
+        let gpu_worker_handle = encoder_components.gpu_worker_handle;
+        let gpu_shutdown = encoder_components.gpu_shutdown;
 
         // 3. Create metrics system
         let metrics_system = MetricsSystem::new(&runtime_handle);
@@ -580,6 +598,8 @@ impl XEarthLayerService {
             cache_layer: None,
             gc_scheduler_handle: None,
             gc_scheduler_shutdown: None,
+            gpu_worker_handle,
+            gpu_shutdown,
         })
     }
 
@@ -743,6 +763,19 @@ impl XEarthLayerService {
                     Ok(()) => tracing::info!("GC scheduler shut down cleanly"),
                     Err(e) => tracing::warn!(error = %e, "GC scheduler task failed"),
                 }
+            }
+        }
+
+        // Shutdown GPU pipeline worker (if running).
+        // The worker exits when all GpuEncoderChannel (mpsc::Sender) references
+        // are dropped. We await the handle to ensure GPU resources (wgpu Device,
+        // Queue) are fully released before the process exits.
+        if let Some(handle) = self.gpu_worker_handle.take() {
+            tracing::info!("Waiting for GPU pipeline worker to shut down");
+            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+                Ok(Ok(())) => tracing::info!("GPU pipeline worker shut down cleanly"),
+                Ok(Err(e)) => tracing::warn!(error = %e, "GPU pipeline worker task failed"),
+                Err(_) => tracing::warn!("GPU pipeline worker did not stop within 5s"),
             }
         }
 
@@ -1068,5 +1101,34 @@ mod tests {
         handle
             .join()
             .expect("test thread panicked - nested runtime issue");
+    }
+}
+
+impl Drop for XEarthLayerService {
+    fn drop(&mut self) {
+        // Signal the GPU worker to stop via its cancellation token.
+        // The worker checks this token between requests and exits promptly.
+        // This is necessary because spawn_blocking threads are not cancelled
+        // by tokio runtime shutdown, and the mpsc channel may not close in
+        // time (other Arc refs to the encoder may still be alive).
+        if let Some(token) = self.gpu_shutdown.take() {
+            token.cancel();
+        }
+
+        // Wait for the GPU worker to finish resource cleanup.
+        if let Some(handle) = self.gpu_worker_handle.take() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+            while std::time::Instant::now() < deadline {
+                if handle.is_finished() {
+                    tracing::info!("GPU pipeline worker shut down cleanly");
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            tracing::warn!("GPU pipeline worker did not stop within 5s, aborting");
+            handle.abort();
+        }
     }
 }

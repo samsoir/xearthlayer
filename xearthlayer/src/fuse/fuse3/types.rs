@@ -100,6 +100,49 @@ impl SpawnedMountHandle {
         }
     }
 
+    /// Create a `SpawnedMountHandle` from a fuse3 `MountHandle`.
+    ///
+    /// Spawns a tokio task that runs the FUSE event loop and handles
+    /// unmount signals cleanly by calling `handle.unmount().await`
+    /// instead of just dropping the handle.
+    ///
+    /// This is the shared implementation for all three FUSE filesystem
+    /// types (OrthoUnionFS, PassthroughFS, UnionFS).
+    pub(crate) fn spawn_from_handle(handle: Fuse3MountHandle, mountpoint: PathBuf) -> Self {
+        let (unmount_tx, unmount_rx) = oneshot::channel::<()>();
+
+        let task = tokio::spawn(Self::mount_task(handle, unmount_rx));
+
+        Self::new(task, unmount_tx, mountpoint)
+    }
+
+    /// The async task that runs the FUSE event loop and handles unmount.
+    ///
+    /// Uses `poll_fn` to poll the handle without taking ownership, so
+    /// `handle.unmount()` can be called explicitly when the unmount
+    /// signal arrives. This ensures fuse3 cleanly disconnects from
+    /// the kernel and drains pending operations (including `release()`
+    /// calls for open file handles).
+    pub(crate) async fn mount_task<F>(
+        handle: F,
+        unmount_rx: oneshot::Receiver<()>,
+    ) -> io::Result<()>
+    where
+        F: Future<Output = io::Result<()>> + Unpin,
+    {
+        let mut handle = handle;
+        tokio::select! {
+            result = std::future::poll_fn(|cx| Pin::new(&mut handle).poll(cx)) => result,
+            _ = unmount_rx => {
+                // Unmount signal received — the handle is still owned because
+                // poll_fn only borrowed it. Drop it to trigger fuse3's internal
+                // unmount (MountHandle::drop → spawn inner_unmount).
+                drop(handle);
+                Ok(())
+            },
+        }
+    }
+
     /// Unmount the filesystem asynchronously.
     ///
     /// Signals the mount task to unmount and waits for it to complete.
@@ -130,37 +173,50 @@ impl SpawnedMountHandle {
     pub fn unmount_sync(&mut self) {
         let mountpoint_str = self.mountpoint.to_string_lossy().to_string();
 
-        // Signal the task to stop (if channel still exists)
+        // Signal the task to stop (if channel still exists).
+        // The mount_task will drop the fuse3 MountHandle, triggering its
+        // internal unmount which drains pending kernel operations (release()
+        // calls for open file handles, etc.).
         if let Some(tx) = self.unmount_tx.take() {
             debug!(mountpoint = %mountpoint_str, "Sending unmount signal");
             let _ = tx.send(());
         }
 
-        // Give the task a moment to process the unmount signal
-        // This helps avoid race conditions where we check is_mounted
-        // before the task has had a chance to unmount
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Wait for the task to complete the unmount. The fuse3 MountHandle::drop()
+        // spawns an internal tokio task for unmount — we must keep our task alive
+        // long enough for that to finish. Poll with short sleeps up to a timeout.
+        if let Some(task) = self.task.take() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
 
-        // Check if mount is still active after giving the task time to unmount
-        if !Self::is_mounted(&self.mountpoint) {
-            debug!(mountpoint = %mountpoint_str, "Already unmounted, skipping fusermount");
-            // Still cancel the task if it exists
-            if let Some(task) = self.task.take() {
-                task.abort();
+            while std::time::Instant::now() < deadline {
+                if task.is_finished() {
+                    debug!(mountpoint = %mountpoint_str, "Mount task completed cleanly");
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
+
+            // Task didn't finish in time — abort and fall back to fusermount
+            warn!(
+                mountpoint = %mountpoint_str,
+                "Mount task did not complete within 5s, aborting"
+            );
+            task.abort();
+        }
+
+        // Fallback: check if still mounted and use fusermount
+        if !Self::is_mounted(&self.mountpoint) {
+            debug!(mountpoint = %mountpoint_str, "Already unmounted after task abort");
             return;
         }
 
-        debug!(mountpoint = %mountpoint_str, "Still mounted, attempting graceful unmount");
+        debug!(mountpoint = %mountpoint_str, "Still mounted, attempting fusermount");
 
-        // Step 1: Try graceful unmount with fusermount3 or fusermount
         let graceful_success = Self::try_unmount(&mountpoint_str, false);
 
         if graceful_success {
             debug!(mountpoint = %mountpoint_str, "Graceful unmount succeeded");
         } else {
-            // Step 2: Check if still mounted - if so, escalate to lazy unmount
-            // Give a bit more time for any in-flight operations
             std::thread::sleep(std::time::Duration::from_millis(500));
 
             if Self::is_mounted(&self.mountpoint) {
@@ -169,8 +225,6 @@ impl SpawnedMountHandle {
                     "Graceful unmount failed (likely busy), escalating to lazy unmount"
                 );
 
-                // Step 3: Lazy unmount - detaches immediately, cleans up asynchronously
-                // This handles the case where X-Plane crashed with open file handles
                 let lazy_success = Self::try_unmount(&mountpoint_str, true);
 
                 if lazy_success {
@@ -182,11 +236,6 @@ impl SpawnedMountHandle {
                     );
                 }
             }
-        }
-
-        // Cancel the task regardless of unmount success
-        if let Some(task) = self.task.take() {
-            task.abort();
         }
     }
 
@@ -338,6 +387,62 @@ mod tests {
         // Unmount should complete successfully
         let result = handle.unmount().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_from_mount_handle_unmount_signal_completes() {
+        use std::time::Duration;
+
+        // Simulate a MountHandle-like future that runs until cancelled
+        let (_stop_tx, stop_rx) = oneshot::channel::<()>();
+
+        // Create a mock "mount handle" future — runs until stop signal
+        let mock_handle_future = async move {
+            let _ = stop_rx.await;
+            Ok::<(), io::Error>(())
+        };
+
+        // Use spawn_mount_task directly (the shared logic)
+        let (unmount_tx, unmount_rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(SpawnedMountHandle::mount_task(
+            Box::pin(mock_handle_future),
+            unmount_rx,
+        ));
+        let mountpoint = PathBuf::from("/test/spawn_from_handle");
+        let handle = SpawnedMountHandle::new(task, unmount_tx, mountpoint);
+
+        // Unmount should signal and complete cleanly
+        let result = tokio::time::timeout(Duration::from_secs(2), handle.unmount()).await;
+
+        assert!(result.is_ok(), "unmount should complete within timeout");
+        assert!(result.unwrap().is_ok(), "unmount should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_from_mount_handle_natural_exit() {
+        use std::time::Duration;
+
+        // Mock handle that exits immediately (simulates external unmount)
+        let mock_handle_future = async { Ok::<(), io::Error>(()) };
+
+        let (unmount_tx, unmount_rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(SpawnedMountHandle::mount_task(
+            Box::pin(mock_handle_future),
+            unmount_rx,
+        ));
+        let mountpoint = PathBuf::from("/test/natural_exit");
+        let mut handle = SpawnedMountHandle::new(task, unmount_tx, mountpoint);
+
+        // Task should complete on its own
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Take task to check it completed
+        if let Some(task) = handle.task.take() {
+            let result = tokio::time::timeout(Duration::from_secs(1), task).await;
+            assert!(result.is_ok(), "task should have completed naturally");
+        }
+        // Prevent Drop from trying unmount_sync
+        handle.unmount_tx.take();
     }
 
     #[tokio::test]

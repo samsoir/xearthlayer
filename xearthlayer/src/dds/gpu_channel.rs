@@ -31,18 +31,33 @@ mod inner {
     /// for direct compressors. Requests are forwarded to the GPU worker via an
     /// mpsc channel; the caller blocks until the worker responds via oneshot.
     pub struct GpuEncoderChannel {
-        sender: mpsc::Sender<GpuEncodeRequest>,
+        sender: Option<mpsc::Sender<GpuEncodeRequest>>,
     }
 
     impl GpuEncoderChannel {
         /// Create a new channel handle wrapping the given sender.
         pub fn new(sender: mpsc::Sender<GpuEncodeRequest>) -> Self {
-            Self { sender }
+            Self {
+                sender: Some(sender),
+            }
         }
 
         /// Returns `true` if the receiver end is still alive.
         pub fn is_connected(&self) -> bool {
-            !self.sender.is_closed()
+            self.sender
+                .as_ref()
+                .map(|s| !s.is_closed())
+                .unwrap_or(false)
+        }
+
+        /// Shut down the GPU pipeline by closing the channel.
+        ///
+        /// This causes the worker's `blocking_recv()` to return `None`,
+        /// triggering clean GPU resource release. Required because
+        /// `spawn_blocking` threads are not cancelled by tokio runtime
+        /// shutdown — the channel must be explicitly closed.
+        pub fn shutdown(&mut self) {
+            self.sender.take();
         }
     }
 
@@ -53,6 +68,10 @@ mod inner {
         /// `&RgbaImage`). Future `TextureEncoder`-level integration could avoid
         /// this by transferring ownership directly.
         fn compress(&self, image: &RgbaImage, format: DdsFormat) -> Result<Vec<u8>, DdsError> {
+            let sender = self.sender.as_ref().ok_or_else(|| {
+                DdsError::CompressionFailed("GPU worker has been shut down".to_string())
+            })?;
+
             let (resp_tx, resp_rx) = oneshot::channel();
             let request = GpuEncodeRequest {
                 image: image.clone(),
@@ -60,7 +79,7 @@ mod inner {
                 response: resp_tx,
             };
 
-            self.sender.blocking_send(request).map_err(|_| {
+            sender.blocking_send(request).map_err(|_| {
                 DdsError::CompressionFailed("GPU worker is not running".to_string())
             })?;
 
@@ -271,19 +290,40 @@ mod inner {
     /// them using pipeline overlap: while the GPU compresses tile A, the CPU
     /// uploads tile B's data. This keeps the GPU constantly busy.
     ///
-    /// Returns a `JoinHandle` that resolves when the channel is closed.
+    /// Returns a `JoinHandle` that resolves when the channel is closed or
+    /// the shutdown token is cancelled.
     pub fn spawn_gpu_worker(
         device: wgpu::Device,
         queue: wgpu::Queue,
         mut compressor: GpuBlockCompressor,
         mut rx: mpsc::Receiver<GpuEncodeRequest>,
+        shutdown: tokio_util::sync::CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         // Use spawn_blocking for a long-lived dedicated thread.
         // GpuBlockCompressor is !Send, so it must stay on one thread.
         tokio::task::spawn_blocking(move || {
             let mut in_flight: Option<InFlightRequest> = None;
 
-            while let Some(request) = rx.blocking_recv() {
+            loop {
+                // Check shutdown before blocking on the channel.
+                // This allows the worker to exit promptly when the service
+                // is shutting down, even if senders haven't all been dropped.
+                if shutdown.is_cancelled() {
+                    tracing::info!("GPU pipeline worker: shutdown signal received");
+                    break;
+                }
+
+                // Use try_recv in a loop with short sleeps to remain responsive
+                // to shutdown. blocking_recv() would block indefinitely since
+                // spawn_blocking threads are not cancelled by runtime shutdown.
+                let request = match rx.try_recv() {
+                    Ok(req) => req,
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                };
                 let has_more = CHANNEL_CAPACITY - rx.capacity() > 0;
 
                 // Wrap GPU work in catch_unwind so panics don't silently kill
@@ -370,6 +410,7 @@ mod inner {
     /// Returns `DdsError` if GPU initialization fails.
     pub fn create_gpu_encoder_channel(
         gpu_device: &str,
+        shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<(GpuEncoderChannel, tokio::task::JoinHandle<()>), DdsError> {
         let (device, queue, compressor, adapter_name) =
             crate::dds::create_gpu_resources(gpu_device)?;
@@ -377,7 +418,7 @@ mod inner {
         tracing::info!(adapter = %adapter_name, "GPU pipeline worker starting");
 
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let handle = spawn_gpu_worker(device, queue, compressor, rx);
+        let handle = spawn_gpu_worker(device, queue, compressor, rx, shutdown);
         Ok((GpuEncoderChannel::new(tx), handle))
     }
 }
@@ -637,7 +678,8 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires GPU hardware
     async fn test_create_gpu_encoder_channel_convenience() {
-        let (channel, worker_handle) = match create_gpu_encoder_channel("integrated") {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (channel, worker_handle) = match create_gpu_encoder_channel("integrated", shutdown) {
             Ok(r) => r,
             Err(_) => return,
         };
@@ -680,7 +722,13 @@ mod tests {
         };
 
         let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
-        let _worker = spawn_gpu_worker(device, queue, compressor, rx);
+        let _worker = spawn_gpu_worker(
+            device,
+            queue,
+            compressor,
+            rx,
+            tokio_util::sync::CancellationToken::new(),
+        );
 
         let channel = GpuEncoderChannel::new(tx);
         let result = tokio::task::spawn_blocking(move || {
@@ -705,7 +753,13 @@ mod tests {
         };
 
         let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
-        let _worker = spawn_gpu_worker(device, queue, compressor, rx);
+        let _worker = spawn_gpu_worker(
+            device,
+            queue,
+            compressor,
+            rx,
+            tokio_util::sync::CancellationToken::new(),
+        );
 
         let channel = Arc::new(GpuEncoderChannel::new(tx));
 
@@ -733,7 +787,13 @@ mod tests {
         };
 
         let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
-        let _worker = spawn_gpu_worker(device, queue, compressor, rx);
+        let _worker = spawn_gpu_worker(
+            device,
+            queue,
+            compressor,
+            rx,
+            tokio_util::sync::CancellationToken::new(),
+        );
 
         let channel = Arc::new(GpuEncoderChannel::new(tx));
         let mut handles = vec![];
@@ -763,7 +823,13 @@ mod tests {
         };
 
         let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
-        let _worker = spawn_gpu_worker(device, queue, compressor, rx);
+        let _worker = spawn_gpu_worker(
+            device,
+            queue,
+            compressor,
+            rx,
+            tokio_util::sync::CancellationToken::new(),
+        );
 
         let channel = Arc::new(GpuEncoderChannel::new(tx));
 
@@ -798,7 +864,13 @@ mod tests {
         };
 
         let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
-        let worker = spawn_gpu_worker(device, queue, compressor, rx);
+        let worker = spawn_gpu_worker(
+            device,
+            queue,
+            compressor,
+            rx,
+            tokio_util::sync::CancellationToken::new(),
+        );
 
         // Drop sender to close channel
         drop(tx);
@@ -878,7 +950,13 @@ mod tests {
         };
 
         let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
-        let _worker = spawn_gpu_worker(device, queue, compressor, rx);
+        let _worker = spawn_gpu_worker(
+            device,
+            queue,
+            compressor,
+            rx,
+            tokio_util::sync::CancellationToken::new(),
+        );
 
         let channel = GpuEncoderChannel::new(tx);
         let result = tokio::task::spawn_blocking(move || {
