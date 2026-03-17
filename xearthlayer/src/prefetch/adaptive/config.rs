@@ -144,7 +144,7 @@ impl Default for AdaptivePrefetchConfig {
             landing_hysteresis: Duration::from_secs(15),
             ramp_duration: Duration::from_secs(30),
             ramp_start_fraction: 0.25,
-            trigger_distance: 1.5,
+            trigger_distance: 1.0,
             load_depth_lat: 3,
             load_depth_lon: 2,
             window_buffer: 1,
@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn test_default_config_boundary_prefetch() {
         let config = AdaptivePrefetchConfig::default();
-        assert_eq!(config.trigger_distance, 1.5);
+        assert_eq!(config.trigger_distance, 1.0);
         assert_eq!(config.load_depth_lat, 3);
         assert_eq!(config.load_depth_lon, 2);
         assert_eq!(config.window_buffer, 1);

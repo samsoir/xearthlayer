@@ -56,7 +56,7 @@ impl Default for SceneryWindowConfig {
             default_rows: 3,
             lon_extent: 3.0,
             buffer: 1,
-            trigger_distance: 1.5,
+            trigger_distance: 1.0,
             load_depth_lat: 3,
             load_depth_lon: 2,
         }
@@ -1067,7 +1067,10 @@ mod tests {
         // Aircraft near north edge — should trigger crossing
         window.check_boundaries(50.0, 7.0); // init monitors
         let crossings = window.check_boundaries(51.2, 7.0);
-        assert!(!crossings.is_empty(), "Should fire crossing near north edge");
+        assert!(
+            !crossings.is_empty(),
+            "Should fire crossing near north edge"
+        );
 
         // Re-center on aircraft position
         window.center_on_position(51.2, 7.0);

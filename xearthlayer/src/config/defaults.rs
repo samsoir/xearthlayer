@@ -197,9 +197,10 @@ pub const DEFAULT_RAMP_START_FRACTION: f64 = 0.25;
 // =============================================================================
 
 /// Default boundary trigger distance in degrees.
-/// Must be > X-Plane's 1.0° trigger to allow prefetch to complete before
-/// X-Plane requests tiles. 1.5° gives 50% lead over X-Plane's trigger.
-pub const DEFAULT_PREFETCH_TRIGGER_DISTANCE: f64 = 1.5;
+/// Must be < half the window height (1.5° for 3° window) to create a dead
+/// zone at center where crossings don't fire. 1.0° gives 0.5° dead zone
+/// on each side after re-centering.
+pub const DEFAULT_PREFETCH_TRIGGER_DISTANCE: f64 = 1.0;
 
 /// Default load depth for latitude boundary crossings (ROW loads).
 /// Empirically measured: 3 rows deep × 3-4 cols wide (73% of FUSE burst events).
