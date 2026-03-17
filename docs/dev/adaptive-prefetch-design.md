@@ -307,11 +307,17 @@ The `SceneryWindow` is the core computational model. It derives window dimension
 |-------|-----------|--------------|
 | `Uninitialized` | No telemetry, no FUSE data | No predictions |
 | `Assumed` | Telemetry present, no FUSE activity (ocean/sparse start) | Default dimensions (3 lat × dynamic lon based on latitude) |
-| `Ready` | First tracker bounds observed | Empirical dimensions (3 lat × 3/cos(lat) lon) centered on tracker center |
+| `Ready` | First tracker bounds observed, or first boundary crossing | Fixed dimensions (3 lat × 3/cos(lat) lon) centered on aircraft position |
 
-### Window Derivation
+### Window Positioning (Position-Based Model)
 
-When SceneTracker first reports `loaded_bounds()`, the window transitions directly to `Ready` using empirical dimensions (~3° lat × ~3°/cos(lat) lon) centered on the tracker's reported center. These dimensions are based on direct measurement of X-Plane's in-sim map at three airports across different latitudes (see whitepaper v1.2). The empirical dimensions are used instead of measured SceneTracker bounds because X-Plane's initial partial load typically reports fewer regions than the actual window size.
+The window uses a **position-based model** rather than tracking SceneTracker bounds. The window is a fixed-size box (3° lat × ~3°/cos(lat) lon) that stays in place until a boundary crossing fires. After crossings are detected and prefetch targets generated, the window **re-centers on the aircraft's current position**. This prevents the window from drifting during long flights — a problem that occurred when `loaded_bounds()` (which only grows) was used for positioning.
+
+**Trigger distance constraint:** The `trigger_distance` (default 1.0°) must be less than half the window height (1.5° for a 3° window). This ensures a dead zone at center where crossings don't fire after re-centering. With 1.0° trigger, the aircraft has 0.5° of margin on each side before the next crossing fires.
+
+**Safety net:** If the aircraft is outside the window entirely (rapid movement, teleport edge case), the window re-centers unconditionally before crossing detection.
+
+**Initial positioning:** On first use, the `Assumed` state lazy-initializes monitors centered on the aircraft position. When SceneTracker first reports bounds, the window transitions to `Ready` using configured dimensions centered on the tracker center. After that, the `Ready` state no longer slides monitors from tracker bounds — positioning is managed exclusively by `center_on_position()` called after boundary crossings.
 
 ### World Rebuild Detection
 

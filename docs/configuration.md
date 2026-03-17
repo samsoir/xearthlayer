@@ -368,7 +368,7 @@ The system uses flight phase detection and performance calibration:
 | `landing_hysteresis_secs` | integer | `15` | Sustained seconds at GS < 40kt before landing detection (5-60) |
 | `ramp_duration_secs` | integer | `30` | Duration of linear ramp to full prefetch rate (10-120) |
 | `ramp_start_fraction` | float | `0.25` | Starting prefetch fraction when ramp begins (0.1-0.5) |
-| `trigger_distance` | float | `1.5` | Distance from window edge (degrees) to trigger prefetch (0.5-3.0) |
+| `trigger_distance` | float | `1.0` | Distance from window edge (degrees) to trigger prefetch (0.5-3.0) |
 | `load_depth_lat` | integer | `3` | DSF rows to prefetch for latitude boundary crossings (1-5) |
 | `load_depth_lon` | integer | `2` | DSF columns to prefetch for longitude boundary crossings (1-5) |
 | `window_buffer` | integer | `1` | Extra DSF tiles around window edges to retain (0-3) |
@@ -423,7 +423,7 @@ ramp_duration_secs = 30                      ; Linear ramp duration after hold r
 ramp_start_fraction = 0.25                   ; Starting prefetch fraction (25%)
 
 ; Boundary-driven prefetch (cruise mode)
-; trigger_distance = 1.5                     ; Distance from edge (degrees) to trigger
+; trigger_distance = 1.0                     ; Distance from edge (degrees) to trigger
 ; load_depth_lat = 3                         ; DSF rows for latitude boundary crossings
 ; load_depth_lon = 2                         ; DSF columns for longitude boundary crossings
 ; window_buffer = 1                          ; Extra DSF tiles around window edges
@@ -694,7 +694,7 @@ mode = auto                    ; auto, aggressive, opportunistic, disabled
 ; ramp_start_fraction = 0.25                 ; starting prefetch fraction
 
 ; Boundary-driven prefetch (cruise mode)
-; trigger_distance = 1.5                     ; distance from edge (degrees) to trigger
+; trigger_distance = 1.0                     ; distance from edge (degrees) to trigger
 ; load_depth_lat = 3                         ; DSF rows for latitude boundary crossings
 ; load_depth_lon = 2                         ; DSF columns for longitude boundary crossings
 ; window_buffer = 1                          ; extra DSF tiles around window edges
