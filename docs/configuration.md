@@ -368,9 +368,11 @@ The system uses flight phase detection and performance calibration:
 | `landing_hysteresis_secs` | integer | `15` | Sustained seconds at GS < 40kt before landing detection (5-60) |
 | `ramp_duration_secs` | integer | `30` | Duration of linear ramp to full prefetch rate (10-120) |
 | `ramp_start_fraction` | float | `0.25` | Starting prefetch fraction when ramp begins (0.1-0.5) |
-| `trigger_distance` | float | `1.0` | Distance from window edge (degrees) to trigger prefetch (0.5-3.0) |
-| `load_depth_lat` | integer | `3` | DSF rows to prefetch for latitude boundary crossings (1-5) |
-| `load_depth_lon` | integer | `2` | DSF columns to prefetch for longitude boundary crossings (1-5) |
+| `forward_margin` | float | `3.0` | Degrees ahead of aircraft in direction of travel per axis (1.0-6.0) |
+| `behind_margin` | float | `1.0` | Degrees behind aircraft per axis (0.5-3.0) |
+| `trigger_distance` | float | `1.0` | *(Legacy, unused in cruise)* Distance from window edge (0.5-3.0) |
+| `load_depth_lat` | integer | `3` | *(Legacy, unused in cruise)* DSF rows for boundary crossings (1-5) |
+| `load_depth_lon` | integer | `2` | *(Legacy, unused in cruise)* DSF columns for boundary crossings (1-5) |
 | `window_buffer` | integer | `1` | Extra DSF tiles around window edges to retain (0-3) |
 | `stale_region_timeout` | integer | `120` | Seconds before an InProgress region is considered stale (30-600) |
 | `default_window_rows` | integer | `3` | Scenery window height in DSF rows — ~3° at all latitudes (2-12) |

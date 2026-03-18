@@ -309,15 +309,20 @@ The `SceneryWindow` is the core computational model. It derives window dimension
 | `Assumed` | Telemetry present, no FUSE activity (ocean/sparse start) | Default dimensions (3 lat × dynamic lon based on latitude) |
 | `Ready` | First tracker bounds observed, or first boundary crossing | Fixed dimensions (3 lat × 3/cos(lat) lon) centered on aircraft position |
 
-### Window Positioning (Position-Based Model)
+### Sliding Prefetch Box (Cruise Phase)
 
-The window uses a **position-based model** rather than tracking SceneTracker bounds. The window is a fixed-size box (3° lat × ~3°/cos(lat) lon) that stays in place until a boundary crossing fires. After crossings are detected and prefetch targets generated, the window **re-centers on the aircraft's current position**. This prevents the window from drifting during long flights — a problem that occurred when `loaded_bounds()` (which only grows) was used for positioning.
+The cruise phase uses a **sliding prefetch box** instead of boundary monitors. The box moves with the aircraft every telemetry tick, biased in the direction of travel:
 
-**Trigger distance constraint:** The `trigger_distance` (default 1.0°) must be less than half the window height (1.5° for a 3° window). This ensures a dead zone at center where crossings don't fire after re-centering. With 1.0° trigger, the aircraft has 0.5° of margin on each side before the next crossing fires.
+- **Per-axis bias:** 3° ahead, 1° behind on any axis with a forward heading component
+- **Symmetric perpendicular:** 2° each side on axes with no heading component (exact cardinal headings)
+- **Region enumeration:** DSF regions (1°×1°) within the box are enumerated via `floor()` arithmetic
+- **Deduplication:** GeoIndex tracks `PrefetchedRegion` state — only new regions trigger tile expansion
 
-**Safety net:** If the aircraft is outside the window entirely (rapid movement, teleport edge case), the window re-centers unconditionally before crossing detection.
+This replaced the boundary-monitor approach which had a fundamental timing problem: X-Plane loads tiles 3.3-3.7° ahead of the aircraft, but boundary monitors only triggered 1° from the window edge, leaving zero lead time for prefetch. The sliding box maintains tiles 3° ahead at all times.
 
-**Initial positioning:** On first use, the `Assumed` state lazy-initializes monitors centered on the aircraft position. When SceneTracker first reports bounds, the window transitions to `Ready` using configured dimensions centered on the tracker center. After that, the `Ready` state no longer slides monitors from tracker bounds — positioning is managed exclusively by `center_on_position()` called after boundary crossings.
+**Empirical basis:** LOWW→LPPT flight testing (2026-03-17) showed X-Plane consistently loads 2 DSF columns/rows beyond its current boundary when the aircraft is ~1° away. A 3° forward margin covers this with a 1° safety buffer.
+
+**SceneryWindow retained for:** retention tracking (`update_retention()`), world rebuild detection (`check_for_rebuild()`). The `center_on_position()` call keeps the window aligned for retention eviction.
 
 ### World Rebuild Detection
 

@@ -113,9 +113,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 11. **Predictive Tile Caching** (`xearthlayer/src/prefetch/`)
     - `AdaptivePrefetchCoordinator` - Self-calibrating prefetch with flight phase detection
     - `GroundStrategy` - Ring-based prefetching for ground operations (GS < 40kt)
-    - `SceneryWindow` - Three-window model (XP Window, XEL Window, Retained) with dual boundary monitors
-    - `BoundaryMonitor` - Position-based DSF boundary edge detection (row and column axes)
-    - `BoundaryStrategy` - Converts boundary crossings to target DSF region lists for prefetch
+    - `PrefetchBox` - Heading-biased sliding box (3° ahead / 1° behind per axis, cruise phase)
+    - `SceneryWindow` - Retention tracking and world rebuild detection
+    - `BoundaryStrategy` - Region lifecycle management (InProgress/Prefetched/NoCoverage)
     - `PhaseDetector` - Ground/Cruise flight phase state machine
     - `PerformanceCalibrator` - Measures throughput during initial load for mode selection
     - `TelemetryListener` - Receives X-Plane/ForeFlight UDP telemetry (position, heading, speed)
@@ -315,8 +315,8 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/publisher/dedupe/` | Zoom level overlap detection and gap analysis |
 | `xearthlayer/src/prefetch/strategy.rs` | Prefetcher trait (strategy pattern) |
 | `xearthlayer/src/prefetch/adaptive/coordinator/core.rs` | AdaptivePrefetchCoordinator (boundary-driven prefetch) |
-| `xearthlayer/src/prefetch/adaptive/scenery_window.rs` | SceneryWindow (three-window model with boundary monitors) |
-| `xearthlayer/src/prefetch/adaptive/boundary_monitor.rs` | BoundaryMonitor (position-based DSF edge detection) |
+| `xearthlayer/src/prefetch/adaptive/prefetch_box.rs` | PrefetchBox (heading-biased sliding prefetch region) |
+| `xearthlayer/src/prefetch/adaptive/scenery_window.rs` | SceneryWindow (retention tracking, world rebuild detection) |
 | `xearthlayer/src/prefetch/adaptive/boundary_strategy.rs` | BoundaryStrategy (boundary crossings to DSF region lists) |
 | `xearthlayer/src/prefetch/adaptive/ground_strategy.rs` | GroundStrategy (ring-based for ground ops) |
 | `xearthlayer/src/prefetch/load_monitor.rs` | FuseLoadMonitor trait + SharedFuseLoadMonitor |
