@@ -559,9 +559,24 @@ impl AdaptivePrefetchCoordinator {
                     return None;
                 }
 
-                // Sort tiles by distance from aircraft so near-boundary tiles
+                // Sort tiles by distance from aircraft so nearest tiles
                 // are submitted first.
                 crate::coord::sort_tiles_by_distance(&mut all_tiles, lat, lon);
+
+                // Enforce max_tiles_per_cycle limit. Without this, the first
+                // cruise tick can submit 1000+ tiles from the full box, saturating
+                // the executor and blocking X-Plane's on-demand FUSE reads.
+                // Remaining tiles will be picked up on subsequent ticks as
+                // regions stay untracked until their tiles are submitted.
+                let max_tiles = self.config.max_tiles_per_cycle as usize;
+                if all_tiles.len() > max_tiles {
+                    tracing::debug!(
+                        total = all_tiles.len(),
+                        limit = max_tiles,
+                        "Sliding box prefetch capped at max_tiles_per_cycle"
+                    );
+                    all_tiles.truncate(max_tiles);
+                }
 
                 let total = all_tiles.len();
                 self.status.active_strategy = "sliding_box";
