@@ -216,7 +216,6 @@ pub const DEFAULT_PREFETCH_WINDOW_BUFFER: u8 = 1;
 /// Default InProgress staleness timeout in seconds.
 pub const DEFAULT_PREFETCH_STALE_REGION_TIMEOUT: u64 = 120;
 
-
 /// Default assumed window height in DSF tiles.
 /// Empirically measured at EDDF, YPAD, WSSS: ~3° latitude (constant worldwide).
 pub const DEFAULT_PREFETCH_DEFAULT_WINDOW_ROWS: usize = 3;
