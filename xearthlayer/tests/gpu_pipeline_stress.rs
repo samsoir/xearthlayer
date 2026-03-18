@@ -50,7 +50,8 @@ mod gpu_stress {
         let idle_ms: u64 = env_or("GPU_STRESS_IDLE_MS", 3000);
         let image_size: u32 = env_or("GPU_STRESS_IMAGE_SIZE", 256);
 
-        let (channel, _worker) = match create_gpu_encoder_channel("integrated") {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (channel, _worker) = match create_gpu_encoder_channel("integrated", shutdown) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Skipping stress test: {e}");

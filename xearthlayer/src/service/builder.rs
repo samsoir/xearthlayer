@@ -5,13 +5,12 @@
 
 use super::config::ServiceConfig;
 use super::error::ServiceError;
-use crate::cache::{DiskCacheConfig, MemoryCache, MemoryCacheConfig};
+use crate::cache::{MemoryCache, MemoryCacheConfig};
 use crate::provider::{
     AsyncProviderFactory, AsyncProviderType, AsyncReqwestClient, Provider, ProviderConfig,
     ProviderFactory, ReqwestClient,
 };
 use crate::texture::DdsTextureEncoder;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 
@@ -32,8 +31,6 @@ pub struct ProviderComponents {
 pub struct CacheComponents {
     /// Shared memory cache for async pipeline (DDS tiles in memory with LRU eviction).
     pub memory_cache: Option<Arc<MemoryCache>>,
-    /// Cache directory path for disk cache (chunks stored via ParallelDiskCache).
-    pub cache_dir: Option<PathBuf>,
 }
 
 /// Create sync and async providers from configuration.
@@ -111,6 +108,20 @@ pub async fn create_async_provider(
     })
 }
 
+/// Result of [`create_encoder`], including optional GPU worker handle.
+pub struct EncoderComponents {
+    /// The texture encoder.
+    pub encoder: Arc<DdsTextureEncoder>,
+    /// GPU worker handle (present when `texture.compressor = gpu`).
+    /// Must be awaited during shutdown to ensure GPU resources are released.
+    pub gpu_worker_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Shutdown token for the GPU worker (present when `texture.compressor = gpu`).
+    /// Cancelling this token causes the worker to exit its loop regardless of
+    /// the channel state. Required because `spawn_blocking` threads are not
+    /// cancelled by tokio runtime shutdown.
+    pub gpu_shutdown: Option<tokio_util::sync::CancellationToken>,
+}
+
 /// Create texture encoder from configuration.
 ///
 /// Selects the block compressor backend based on the `texture.compressor`
@@ -118,45 +129,61 @@ pub async fn create_async_provider(
 /// - `"ispc"` — SIMD-optimized via Intel ISPC (default)
 /// - `"software"` — Pure-Rust fallback
 /// - `"gpu"` — GPU compute via wgpu (requires `gpu-encode` feature)
-pub fn create_encoder(config: &ServiceConfig) -> Result<Arc<DdsTextureEncoder>, ServiceError> {
+pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, ServiceError> {
     use crate::dds::{BlockCompressor, IspcCompressor, SoftwareCompressor};
 
-    let compressor: Arc<dyn BlockCompressor> = match config.texture().compressor() {
-        "software" => Arc::new(SoftwareCompressor),
-        "ispc" => Arc::new(IspcCompressor),
-        #[cfg(feature = "gpu-encode")]
-        "gpu" => {
-            use crate::dds::gpu_channel::create_gpu_encoder_channel;
+    type GpuHandles = (
+        Option<tokio::task::JoinHandle<()>>,
+        Option<tokio_util::sync::CancellationToken>,
+    );
 
-            let (channel, _worker_handle) =
-                create_gpu_encoder_channel(config.texture().gpu_device())
-                    .map_err(|e| ServiceError::ConfigError(format!("GPU compressor: {e}")))?;
+    let (compressor, (gpu_worker_handle, gpu_shutdown)): (Arc<dyn BlockCompressor>, GpuHandles) =
+        match config.texture().compressor() {
+            "software" => (Arc::new(SoftwareCompressor), (None, None)),
+            "ispc" => (Arc::new(IspcCompressor), (None, None)),
+            #[cfg(feature = "gpu-encode")]
+            "gpu" => {
+                use crate::dds::gpu_channel::create_gpu_encoder_channel;
 
-            tracing::info!("GPU pipeline encoder created with dedicated worker");
-            Arc::new(channel) as Arc<dyn BlockCompressor>
-        }
-        #[cfg(not(feature = "gpu-encode"))]
-        "gpu" => {
-            return Err(ServiceError::ConfigError(
-                "GPU compression requires the `gpu-encode` feature. \
-                 Rebuild with `cargo build --features gpu-encode` \
-                 or set texture.compressor = ispc"
-                    .to_string(),
-            ));
-        }
-        other => {
-            return Err(ServiceError::ConfigError(format!(
-                "Unknown texture compressor '{}'. Valid options: software, ispc, gpu",
-                other
-            )));
-        }
-    };
+                let shutdown_token = tokio_util::sync::CancellationToken::new();
+                let (channel, worker_handle) = create_gpu_encoder_channel(
+                    config.texture().gpu_device(),
+                    shutdown_token.clone(),
+                )
+                .map_err(|e| ServiceError::ConfigError(format!("GPU compressor: {e}")))?;
 
-    Ok(Arc::new(
-        DdsTextureEncoder::new(config.texture().format())
-            .with_mipmap_count(config.texture().mipmap_count())
-            .with_compressor(compressor),
-    ))
+                tracing::info!("GPU pipeline encoder created with dedicated worker");
+                (
+                    Arc::new(channel) as Arc<dyn BlockCompressor>,
+                    (Some(worker_handle), Some(shutdown_token)),
+                )
+            }
+            #[cfg(not(feature = "gpu-encode"))]
+            "gpu" => {
+                return Err(ServiceError::ConfigError(
+                    "GPU compression requires the `gpu-encode` feature. \
+                     Rebuild with `cargo build --features gpu-encode` \
+                     or set texture.compressor = ispc"
+                        .to_string(),
+                ));
+            }
+            other => {
+                return Err(ServiceError::ConfigError(format!(
+                    "Unknown texture compressor '{}'. Valid options: software, ispc, gpu",
+                    other
+                )));
+            }
+        };
+
+    Ok(EncoderComponents {
+        encoder: Arc::new(
+            DdsTextureEncoder::new(config.texture().format())
+                .with_mipmap_count(config.texture().mipmap_count())
+                .with_compressor(compressor),
+        ),
+        gpu_worker_handle,
+        gpu_shutdown,
+    })
 }
 
 /// Create cache components from configuration.
@@ -169,23 +196,15 @@ pub fn create_cache(
     _provider_name: &str,
 ) -> Result<CacheComponents, ServiceError> {
     if !config.cache_enabled() {
-        return Ok(CacheComponents {
-            memory_cache: None,
-            cache_dir: None,
-        });
+        return Ok(CacheComponents { memory_cache: None });
     }
 
     // Get defaults from config types
-    let disk_defaults = DiskCacheConfig::default();
     let memory_defaults = MemoryCacheConfig::default();
 
-    let mut cache_dir = disk_defaults.cache_dir;
     let mut mem_size = memory_defaults.max_size_bytes;
 
     // Apply user-configured overrides
-    if let Some(dir) = config.cache_directory() {
-        cache_dir = dir.clone();
-    }
     if let Some(size) = config.cache_memory_size() {
         mem_size = size;
     }
@@ -195,7 +214,6 @@ pub fn create_cache(
 
     Ok(CacheComponents {
         memory_cache: Some(memory_cache),
-        cache_dir: Some(cache_dir),
     })
 }
 
@@ -208,8 +226,8 @@ mod tests {
     #[test]
     fn test_create_encoder_default_is_ispc() {
         let config = ServiceConfig::default();
-        let encoder = create_encoder(&config).unwrap();
-        assert_eq!(encoder.format(), DdsFormat::BC1);
+        let components = create_encoder(&config).unwrap();
+        assert_eq!(components.encoder.format(), DdsFormat::BC1);
     }
 
     #[test]
@@ -217,8 +235,8 @@ mod tests {
         let config = ServiceConfig::builder()
             .texture(TextureConfig::default().with_compressor("software".to_string()))
             .build();
-        let encoder = create_encoder(&config).unwrap();
-        assert_eq!(encoder.format(), DdsFormat::BC1);
+        let components = create_encoder(&config).unwrap();
+        assert_eq!(components.encoder.format(), DdsFormat::BC1);
     }
 
     #[test]
@@ -251,7 +269,7 @@ mod tests {
             .build();
         let result = create_encoder(&config);
         match result {
-            Ok(encoder) => assert_eq!(encoder.extension(), "dds"),
+            Ok(components) => assert_eq!(components.encoder.extension(), "dds"),
             Err(e) => assert!(
                 e.to_string().contains("GPU"),
                 "error should mention GPU, got: {e}"
@@ -259,11 +277,59 @@ mod tests {
         }
     }
 
+    /// GPU worker handle must complete when the encoder (channel sender) is dropped.
+    /// This is the shutdown contract: store the handle, drop the encoder, await the handle.
+    /// If the handle doesn't complete, the process hangs on exit.
+    #[tokio::test]
+    #[cfg(feature = "gpu-encode")]
+    #[ignore] // Requires GPU hardware
+    async fn test_gpu_worker_handle_completes_on_encoder_drop() {
+        let config = ServiceConfig::builder()
+            .texture(TextureConfig::default().with_compressor("gpu".to_string()))
+            .build();
+
+        let components = match create_encoder(&config) {
+            Ok(c) => c,
+            Err(_) => return, // No GPU available
+        };
+
+        let worker_handle = components
+            .gpu_worker_handle
+            .expect("GPU compressor should return a worker handle");
+
+        // Drop the encoder — this drops the GpuEncoderChannel (sender),
+        // closing the mpsc channel and causing the worker to exit.
+        drop(components.encoder);
+
+        // The worker handle must complete within a reasonable timeout.
+        // If it doesn't, GPU resources are leaked and the process will hang.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), worker_handle).await;
+
+        assert!(
+            result.is_ok(),
+            "GPU worker should complete within 5s after channel close"
+        );
+        assert!(
+            result.unwrap().is_ok(),
+            "GPU worker should not panic during shutdown"
+        );
+    }
+
+    /// Non-GPU encoders should not return a worker handle.
+    #[test]
+    fn test_ispc_encoder_has_no_worker_handle() {
+        let config = ServiceConfig::default(); // defaults to ispc
+        let components = create_encoder(&config).unwrap();
+        assert!(
+            components.gpu_worker_handle.is_none(),
+            "ISPC compressor should not have a GPU worker handle"
+        );
+    }
+
     #[test]
     fn test_cache_disabled_returns_noop() {
         let config = ServiceConfig::builder().cache_enabled(false).build();
         let result = create_cache(&config, "test").unwrap();
         assert!(result.memory_cache.is_none());
-        assert!(result.cache_dir.is_none());
     }
 }

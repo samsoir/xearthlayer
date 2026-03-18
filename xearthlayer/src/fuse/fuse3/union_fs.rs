@@ -49,7 +49,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
-use tokio::sync::oneshot;
 use tracing::{debug, trace};
 
 /// Union FUSE filesystem for patch tiles.
@@ -192,33 +191,21 @@ impl Fuse3UnionFS {
         mount_options.no_open_dir_support(true);
 
         let mount_path = PathBuf::from(mountpoint);
-        let mount_path_for_handle = mount_path.clone();
-
-        let (unmount_tx, unmount_rx) = oneshot::channel::<()>();
 
         #[cfg(target_os = "linux")]
         let handle = fuse3::raw::Session::new(mount_options)
-            .mount_with_unprivileged(self, mount_path)
+            .mount_with_unprivileged(self, mount_path.clone())
             .await
             .map_err(|e| Fuse3Error::MountFailed(e.to_string()))?;
 
         #[cfg(not(target_os = "linux"))]
         let handle = fuse3::raw::Session::new(mount_options)
-            .mount(self, mount_path)
+            .mount(self, mount_path.clone())
             .await
             .map_err(|e| Fuse3Error::MountFailed(e.to_string()))?;
 
-        let task = tokio::spawn(async move {
-            tokio::select! {
-                result = handle => result,
-                _ = unmount_rx => Ok(()),
-            }
-        });
-
-        Ok(super::types::SpawnedMountHandle::new(
-            task,
-            unmount_tx,
-            mount_path_for_handle,
+        Ok(super::types::SpawnedMountHandle::spawn_from_handle(
+            handle, mount_path,
         ))
     }
 

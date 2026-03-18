@@ -105,6 +105,11 @@ pub struct XEarthLayerService {
     gc_scheduler_handle: Option<JoinHandle<()>>,
     /// GC scheduler shutdown token for graceful shutdown.
     gc_scheduler_shutdown: Option<CancellationToken>,
+    /// GPU pipeline worker handle (when `texture.compressor = gpu`).
+    /// Awaited during shutdown to ensure GPU resources are released cleanly.
+    gpu_worker_handle: Option<JoinHandle<()>>,
+    /// Shutdown token for the GPU pipeline worker.
+    gpu_shutdown: Option<CancellationToken>,
 }
 
 impl XEarthLayerService {
@@ -181,31 +186,20 @@ impl XEarthLayerService {
 
         let handle = runtime.handle().clone();
 
-        Self::build(config, provider_config, logger, handle, Some(runtime))
+        Self::build(config, provider_config, logger, handle, Some(runtime), None)
     }
 
     /// Create a new XEarthLayer service with a provided runtime handle.
     ///
     /// Use this constructor when you want to control the runtime lifecycle
     /// externally, or for testing with injected runtimes.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Service configuration
-    /// * `provider_config` - Provider-specific configuration
-    /// * `logger` - Logger implementation
-    /// * `runtime_handle` - Handle to an existing Tokio runtime
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any component fails to initialize.
     pub fn with_runtime(
         config: ServiceConfig,
         provider_config: ProviderConfig,
         logger: Arc<dyn Logger>,
         runtime_handle: Handle,
     ) -> Result<Self, ServiceError> {
-        Self::build(config, provider_config, logger, runtime_handle, None)
+        Self::build(config, provider_config, logger, runtime_handle, None, None)
     }
 
     /// Create a new XEarthLayer service with cache bridges from the new cache service.
@@ -255,14 +249,13 @@ impl XEarthLayerService {
         memory_bridge: Arc<MemoryCacheBridge>,
         disk_bridge: Arc<DiskCacheBridge>,
     ) -> Result<Self, ServiceError> {
-        Self::build_with_bridges(
+        Self::build(
             config,
             provider_config,
             logger,
             runtime_handle,
             None,
-            memory_bridge,
-            disk_bridge,
+            Some((memory_bridge, disk_bridge)),
         )
     }
 
@@ -315,7 +308,10 @@ impl XEarthLayerService {
         );
 
         // 5. Create texture encoder
-        let dds_encoder = builder::create_encoder(&config)?;
+        let encoder_components = builder::create_encoder(&config)?;
+        let dds_encoder = encoder_components.encoder;
+        let gpu_worker_handle = encoder_components.gpu_worker_handle;
+        let gpu_shutdown = encoder_components.gpu_shutdown;
 
         // 6. Create XEarthLayer runtime with cache bridges
         // Clone metrics_client before passing to RuntimeBuilder (we need it for GC daemon)
@@ -382,19 +378,24 @@ impl XEarthLayerService {
             cache_layer: Some(cache_layer),
             gc_scheduler_handle,
             gc_scheduler_shutdown,
+            gpu_worker_handle,
+            gpu_shutdown,
         })
     }
 
     /// Internal builder that does the actual construction.
     ///
-    /// This method delegates to focused builder functions in the `builder` module
-    /// for each component, keeping the overall flow clear and each piece testable.
+    /// Unified construction path for both legacy cache and cache bridge modes.
+    /// When `bridges` is `Some`, the runtime uses cache bridges (internal GC).
+    /// When `None`, falls back to legacy memory cache + disk cache directory.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         config: ServiceConfig,
         provider_config: ProviderConfig,
         logger: Arc<dyn Logger>,
         runtime_handle: Handle,
         owned_runtime: Option<Runtime>,
+        bridges: Option<(Arc<MemoryCacheBridge>, Arc<DiskCacheBridge>)>,
     ) -> Result<Self, ServiceError> {
         // 1. Create providers
         let ProviderComponents {
@@ -405,84 +406,120 @@ impl XEarthLayerService {
         } = builder::create_providers(&provider_config, &runtime_handle)?;
 
         // 2. Create texture encoder
-        let dds_encoder = builder::create_encoder(&config)?;
+        let encoder_components = builder::create_encoder(&config)?;
+        let dds_encoder = encoder_components.encoder;
+        let gpu_worker_handle = encoder_components.gpu_worker_handle;
+        let gpu_shutdown = encoder_components.gpu_shutdown;
 
-        // 3. Create cache components
-        let CacheComponents {
-            memory_cache,
-            cache_dir,
-        } = builder::create_cache(&config, &provider_name)?;
-
-        // 4. Create shared memory cache adapter (used by prefetcher for cache checks)
-        let memory_cache_adapter = memory_cache.as_ref().map(|cache| {
-            Arc::new(MemoryCacheAdapter::new(
-                Arc::clone(cache),
-                &provider_name,
-                config.texture().format(),
-            ))
-        });
-
-        // 5. Create metrics system for event-based telemetry
+        // 3. Create metrics system
         let metrics_system = MetricsSystem::new(&runtime_handle);
 
-        // 6. Scan existing disk cache in background to initialize size metrics
-        // This avoids blocking service creation with potentially slow directory walk
-        if let Some(ref cache_dir_path) = cache_dir {
-            let cache_path = cache_dir_path.clone();
-            let metrics_client = metrics_system.client();
-            runtime_handle.spawn(async move {
-                let path = cache_path;
-                let result = tokio::task::spawn_blocking(move || disk_cache_stats(&path)).await;
-                match result {
-                    Ok(Ok((_files, bytes))) => {
-                        metrics_client.disk_cache_initial_size(bytes);
-                        tracing::debug!(
-                            bytes = bytes,
-                            "Disk cache initial size scanned (background)"
-                        );
+        // 4. Cache setup — bridge mode or legacy mode
+        let (memory_cache, memory_cache_adapter, memory_cache_bridge) =
+            if let Some((ref mem_bridge, _)) = bridges {
+                // Bridge mode: no legacy cache, store bridge for prefetch
+                (None, None, Some(Arc::clone(mem_bridge)))
+            } else {
+                // Legacy mode: create memory cache and adapter
+                let CacheComponents { memory_cache } =
+                    builder::create_cache(&config, &provider_name)?;
+
+                let adapter = memory_cache.as_ref().map(|cache| {
+                    Arc::new(MemoryCacheAdapter::new(
+                        Arc::clone(cache),
+                        &provider_name,
+                        config.texture().format(),
+                    ))
+                });
+
+                (memory_cache, adapter, None)
+            };
+
+        // 5. Scan existing disk cache in background (legacy mode only)
+        if bridges.is_none() {
+            if let Some(cache_dir) = config.cache_directory() {
+                let cache_path = cache_dir.clone();
+                let metrics_client = metrics_system.client();
+                runtime_handle.spawn(async move {
+                    let path = cache_path;
+                    let result = tokio::task::spawn_blocking(move || disk_cache_stats(&path)).await;
+                    match result {
+                        Ok(Ok((_files, bytes))) => {
+                            metrics_client.disk_cache_initial_size(bytes);
+                            tracing::debug!(bytes, "Disk cache initial size scanned (background)");
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!(error = %e, "Failed to scan disk cache size");
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "Disk cache scan task panicked");
+                        }
                     }
-                    Ok(Err(e)) => {
-                        tracing::debug!(error = %e, "Failed to scan disk cache size");
-                    }
-                    Err(e) => {
-                        tracing::debug!(error = %e, "Disk cache scan task panicked");
-                    }
-                }
-            });
+                });
+            }
         }
 
-        // 7. Create XEarthLayer runtime with job executor daemon
-        // Note: The runtime is created lazily when needed (when async_provider is available)
+        // 6. Create XEarthLayer runtime with job executor daemon
         let (xearthlayer_runtime, dds_client) = if let Some(ref async_prov) = async_provider {
-            if memory_cache.is_some() {
-                let runtime = RuntimeBuilder::new(
-                    &provider_name,
-                    config.texture().format(),
-                    Arc::clone(&dds_encoder),
-                )
-                .with_async_provider(Arc::clone(async_prov))
-                .with_memory_cache(
+            let rb = RuntimeBuilder::new(
+                &provider_name,
+                config.texture().format(),
+                Arc::clone(&dds_encoder),
+            )
+            .with_async_provider(Arc::clone(async_prov))
+            .with_runtime_handle(runtime_handle.clone())
+            .with_metrics_client(metrics_system.client());
+
+            let runtime = if let Some((mem_bridge, disk_bridge)) = bridges.clone() {
+                rb.build_with_cache_service(mem_bridge, disk_bridge)
+            } else if memory_cache.is_some() {
+                let cache_dir = config
+                    .cache_directory()
+                    .cloned()
+                    .unwrap_or_else(|| PathBuf::from("/tmp/xearthlayer"));
+                rb.with_memory_cache(
                     memory_cache
                         .clone()
                         .unwrap_or_else(|| Arc::new(MemoryCache::new(0))),
                 )
-                .with_cache_dir(
-                    cache_dir
-                        .clone()
-                        .unwrap_or_else(|| PathBuf::from("/tmp/xearthlayer")),
-                )
-                .with_runtime_handle(runtime_handle.clone())
-                .with_metrics_client(metrics_system.client()) // Wire metrics for dashboard UI
-                .build();
-
-                let client = runtime.dds_client();
-                (Some(runtime), Some(client))
+                .with_cache_dir(cache_dir)
+                .build()
             } else {
-                (None, None)
-            }
+                return Ok(Self {
+                    config,
+                    provider_name,
+                    max_zoom,
+                    logger,
+                    _owned_runtime: owned_runtime,
+                    runtime_handle,
+                    dds_encoder,
+                    memory_cache: None,
+                    memory_cache_adapter: None,
+                    metrics_system: Some(metrics_system),
+                    xearthlayer_runtime: None,
+                    dds_client: None,
+                    tile_request_callback: None,
+                    load_monitor: None,
+                    memory_cache_bridge: None,
+                    cache_layer: None,
+                    gc_scheduler_handle: None,
+                    gc_scheduler_shutdown: None,
+                    gpu_worker_handle,
+                    gpu_shutdown,
+                });
+            };
+
+            let client = runtime.dds_client();
+            (Some(runtime), Some(client))
         } else {
             (None, None)
         };
+
+        tracing::info!(
+            provider = %provider_name,
+            bridge_mode = bridges.is_some(),
+            "XEarthLayerService created"
+        );
 
         Ok(Self {
             config,
@@ -499,87 +536,12 @@ impl XEarthLayerService {
             dds_client,
             tile_request_callback: None,
             load_monitor: None,
-            memory_cache_bridge: None,
+            memory_cache_bridge,
             cache_layer: None,
             gc_scheduler_handle: None,
             gc_scheduler_shutdown: None,
-        })
-    }
-
-    /// Build the service using cache bridges from the new cache service architecture.
-    ///
-    /// This method is similar to `build()` but uses `MemoryCacheBridge` and `DiskCacheBridge`
-    /// instead of the legacy cache system. The key difference is that:
-    /// - The runtime is created using `RuntimeBuilder::build_with_cache_service()`
-    /// - No external GC daemon is needed (DiskCacheBridge has internal GC)
-    #[allow(clippy::too_many_arguments)]
-    fn build_with_bridges(
-        config: ServiceConfig,
-        provider_config: ProviderConfig,
-        logger: Arc<dyn Logger>,
-        runtime_handle: Handle,
-        owned_runtime: Option<Runtime>,
-        memory_bridge: Arc<MemoryCacheBridge>,
-        disk_bridge: Arc<DiskCacheBridge>,
-    ) -> Result<Self, ServiceError> {
-        // 1. Create providers
-        let ProviderComponents {
-            sync_provider: _,
-            async_provider,
-            name: provider_name,
-            max_zoom,
-        } = builder::create_providers(&provider_config, &runtime_handle)?;
-
-        // 2. Create texture encoder
-        let dds_encoder = builder::create_encoder(&config)?;
-
-        // 3. Create metrics system
-        let metrics_system = MetricsSystem::new(&runtime_handle);
-
-        // 4. Create XEarthLayer runtime with cache bridges
-        let (xearthlayer_runtime, dds_client) = if let Some(ref async_prov) = async_provider {
-            let runtime = RuntimeBuilder::new(
-                &provider_name,
-                config.texture().format(),
-                Arc::clone(&dds_encoder),
-            )
-            .with_async_provider(Arc::clone(async_prov))
-            .with_runtime_handle(runtime_handle.clone())
-            .with_metrics_client(metrics_system.client())
-            .build_with_cache_service(Arc::clone(&memory_bridge), Arc::clone(&disk_bridge));
-
-            let client = runtime.dds_client();
-            (Some(runtime), Some(client))
-        } else {
-            (None, None)
-        };
-
-        tracing::info!(
-            provider = %provider_name,
-            "XEarthLayerService created with cache bridges (internal GC enabled)"
-        );
-
-        Ok(Self {
-            config,
-            provider_name,
-            max_zoom,
-            logger,
-            _owned_runtime: owned_runtime,
-            runtime_handle,
-            dds_encoder,
-            // Legacy cache fields are None when using bridges
-            memory_cache: None,
-            memory_cache_adapter: None,
-            metrics_system: Some(metrics_system),
-            xearthlayer_runtime,
-            dds_client,
-            tile_request_callback: None,
-            load_monitor: None,
-            // Store bridge for prefetch system access
-            memory_cache_bridge: Some(memory_bridge),
-            cache_layer: None,
-            gc_scheduler_handle: None,
-            gc_scheduler_shutdown: None,
+            gpu_worker_handle,
+            gpu_shutdown,
         })
     }
 
@@ -743,6 +705,19 @@ impl XEarthLayerService {
                     Ok(()) => tracing::info!("GC scheduler shut down cleanly"),
                     Err(e) => tracing::warn!(error = %e, "GC scheduler task failed"),
                 }
+            }
+        }
+
+        // Shutdown GPU pipeline worker (if running).
+        // The worker exits when all GpuEncoderChannel (mpsc::Sender) references
+        // are dropped. We await the handle to ensure GPU resources (wgpu Device,
+        // Queue) are fully released before the process exits.
+        if let Some(handle) = self.gpu_worker_handle.take() {
+            tracing::info!("Waiting for GPU pipeline worker to shut down");
+            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+                Ok(Ok(())) => tracing::info!("GPU pipeline worker shut down cleanly"),
+                Ok(Err(e)) => tracing::warn!(error = %e, "GPU pipeline worker task failed"),
+                Err(_) => tracing::warn!("GPU pipeline worker did not stop within 5s"),
             }
         }
 
@@ -1068,5 +1043,34 @@ mod tests {
         handle
             .join()
             .expect("test thread panicked - nested runtime issue");
+    }
+}
+
+impl Drop for XEarthLayerService {
+    fn drop(&mut self) {
+        // Signal the GPU worker to stop via its cancellation token.
+        // The worker checks this token between requests and exits promptly.
+        // This is necessary because spawn_blocking threads are not cancelled
+        // by tokio runtime shutdown, and the mpsc channel may not close in
+        // time (other Arc refs to the encoder may still be alive).
+        if let Some(token) = self.gpu_shutdown.take() {
+            token.cancel();
+        }
+
+        // Wait for the GPU worker to finish resource cleanup.
+        if let Some(handle) = self.gpu_worker_handle.take() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+            while std::time::Instant::now() < deadline {
+                if handle.is_finished() {
+                    tracing::info!("GPU pipeline worker shut down cleanly");
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            tracing::warn!("GPU pipeline worker did not stop within 5s, aborting");
+            handle.abort();
+        }
     }
 }

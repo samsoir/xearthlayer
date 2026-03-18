@@ -183,8 +183,6 @@ impl Fuse3PassthroughFS {
         self,
         mountpoint: &str,
     ) -> Fuse3Result<super::types::SpawnedMountHandle> {
-        use tokio::sync::oneshot;
-
         let mut mount_options = MountOptions::default();
         mount_options.read_only(true);
         mount_options.force_readdir_plus(false);
@@ -192,44 +190,22 @@ impl Fuse3PassthroughFS {
         mount_options.no_open_dir_support(true);
 
         let mount_path = PathBuf::from(mountpoint);
-        let mount_path_for_handle = mount_path.clone();
-
-        // Create channel for unmount signaling
-        let (unmount_tx, unmount_rx) = oneshot::channel::<()>();
 
         // Mount the filesystem
         #[cfg(target_os = "linux")]
         let handle = fuse3::raw::Session::new(mount_options)
-            .mount_with_unprivileged(self, mount_path)
+            .mount_with_unprivileged(self, mount_path.clone())
             .await
             .map_err(|e| Fuse3Error::MountFailed(e.to_string()))?;
 
         #[cfg(not(target_os = "linux"))]
         let handle = fuse3::raw::Session::new(mount_options)
-            .mount(self, mount_path)
+            .mount(self, mount_path.clone())
             .await
             .map_err(|e| Fuse3Error::MountFailed(e.to_string()))?;
 
-        // Spawn task that keeps the mount alive and handles unmount signal
-        let task = tokio::spawn(async move {
-            tokio::select! {
-                // Wait for the mount to complete (external unmount)
-                result = handle => {
-                    result
-                }
-                // Wait for unmount signal
-                _ = unmount_rx => {
-                    // Signal received, let the mount handle drop naturally
-                    // which will trigger unmount
-                    Ok(())
-                }
-            }
-        });
-
-        Ok(super::types::SpawnedMountHandle::new(
-            task,
-            unmount_tx,
-            mount_path_for_handle,
+        Ok(super::types::SpawnedMountHandle::spawn_from_handle(
+            handle, mount_path,
         ))
     }
 }
