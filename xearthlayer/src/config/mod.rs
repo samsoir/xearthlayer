@@ -68,9 +68,6 @@ pub use file::{
     ProviderSettings,
     TextureSettings,
     XPlaneSettings,
-    // Prefetch defaults
-    DEFAULT_CIRCUIT_BREAKER_HALF_OPEN_SECS,
-    DEFAULT_CIRCUIT_BREAKER_OPEN_MS,
     // Pipeline defaults
     DEFAULT_COALESCE_CHANNEL_CAPACITY,
     // Control plane defaults

@@ -14,7 +14,6 @@ use crate::executor::{DaemonMemoryCache, DdsClient};
 use crate::geo_index::{DsfRegion, GeoIndex};
 use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::state::{AircraftState, SharedPrefetchStatus};
-use crate::prefetch::throttler::PrefetchThrottler;
 use crate::prefetch::SceneryIndex;
 
 use super::super::boundary_strategy::BoundaryStrategy;
@@ -111,9 +110,6 @@ pub struct AdaptivePrefetchCoordinator {
     /// Ground strategy.
     ground_strategy: GroundStrategy,
 
-    /// Circuit breaker for throttling (legacy, being replaced by SimState).
-    pub(super) throttler: Option<Arc<dyn PrefetchThrottler>>,
-
     /// X-Plane sim state from Web API (direct detection, replaces heuristics).
     sim_state: crate::aircraft_position::web_api::sim_state::SimState,
 
@@ -188,7 +184,6 @@ impl std::fmt::Debug for AdaptivePrefetchCoordinator {
             .field("config.enabled", &self.config.enabled)
             .field("config.mode", &self.config.mode)
             .field("has_calibration", &self.calibration.is_some())
-            .field("has_throttler", &self.throttler.is_some())
             .field("has_dds_client", &self.dds_client.is_some())
             .field("cached_tiles_count", &self.cached_tiles.len())
             .field("status", &self.status)
@@ -226,7 +221,6 @@ impl AdaptivePrefetchCoordinator {
             phase_detector,
             transition_throttle,
             ground_strategy,
-            throttler: None,
             sim_state: crate::aircraft_position::web_api::sim_state::SimState::default(),
             dds_client: None,
             memory_cache: None,
@@ -257,12 +251,6 @@ impl AdaptivePrefetchCoordinator {
     pub fn with_calibration(mut self, calibration: PerformanceCalibration) -> Self {
         self.status.mode = calibration.recommended_strategy;
         self.calibration = Some(calibration);
-        self
-    }
-
-    /// Set the circuit breaker for throttling (legacy).
-    pub fn with_throttler(mut self, throttler: Arc<dyn PrefetchThrottler>) -> Self {
-        self.throttler = Some(throttler);
         self
     }
 
@@ -471,11 +459,6 @@ impl AdaptivePrefetchCoordinator {
         if phase_changed {
             self.transition_throttle
                 .on_phase_change(previous_phase, phase);
-        }
-
-        // Check throttling (for opportunistic mode)
-        if let Some(ref throttler) = self.throttler {
-            self.status.throttled = throttler.should_throttle();
         }
 
         // Determine if we should prefetch
@@ -709,13 +692,8 @@ impl AdaptivePrefetchCoordinator {
             }
 
             StrategyMode::Opportunistic => {
-                // Opportunistic mode checks throttler
-                if let Some(ref throttler) = self.throttler {
-                    !throttler.should_throttle()
-                } else {
-                    // No throttler - default to allowing prefetch
-                    true
-                }
+                // Opportunistic mode allows prefetch (SimState handles load detection)
+                true
             }
         }
     }
@@ -928,7 +906,6 @@ impl AdaptivePrefetchCoordinator {
             super::status_updater::update_status_with_plan(
                 status,
                 &self.status,
-                self.throttler.as_ref(),
                 position,
                 plan,
                 submitted,
@@ -948,7 +925,6 @@ impl AdaptivePrefetchCoordinator {
             super::status_updater::update_status_no_plan(
                 status,
                 &self.status,
-                self.throttler.as_ref(),
                 &self.cycle_stats(),
             );
         }
@@ -960,8 +936,8 @@ mod tests {
     use super::*;
     use crate::prefetch::adaptive::coordinator::test_support::{
         ground_state, make_scenery_index, patched_region_area, test_calibration, test_plan,
-        AlwaysThrottle, BackpressureMockClient, CapLimitedDdsClient, DummyTracker,
-        HighLoadDdsClient, StableBoundsTracker,
+        BackpressureMockClient, CapLimitedDdsClient, DummyTracker, HighLoadDdsClient,
+        StableBoundsTracker,
     };
     use crate::prefetch::adaptive::scenery_window::WindowState;
 
@@ -974,7 +950,7 @@ mod tests {
         let coord = AdaptivePrefetchCoordinator::with_defaults();
         assert!(coord.config.enabled);
         assert!(coord.calibration.is_none());
-        assert!(coord.throttler.is_none());
+
         assert!(coord.dds_client.is_none());
     }
 
@@ -1384,26 +1360,8 @@ mod tests {
         assert!((ac.longitude - 9.5).abs() < 0.001);
     }
 
-    #[tokio::test]
-    async fn test_process_telemetry_updates_status_when_throttled() {
-        use crate::prefetch::state::PrefetchMode as StatePrefetchMode;
-
-        let shared_status = SharedPrefetchStatus::new();
-        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
-            .with_calibration(test_calibration())
-            .with_throttler(Arc::new(AlwaysThrottle))
-            .with_shared_status(Arc::clone(&shared_status));
-
-        let state = AircraftState::new(53.5, 9.5, 90.0, 250.0, 35000.0);
-
-        // Process telemetry - should return None due to throttling
-        let result = coord.process_telemetry(&state).await;
-        assert!(result.is_none());
-
-        // Status should show CircuitOpen (throttled)
-        let snapshot = shared_status.snapshot();
-        assert_eq!(snapshot.prefetch_mode, StatePrefetchMode::CircuitOpen);
-    }
+    // test_process_telemetry_updates_status_when_throttled was removed
+    // along with the CircuitBreaker/PrefetchThrottler systems (replaced by SimState).
 
     // ─────────────────────────────────────────────────────────────────────────
     // Backpressure tests (Phase 5)

@@ -499,8 +499,6 @@ mod tests {
             udp_port: 49002,
             max_tiles_per_cycle: 200,
             cycle_interval_ms: 2000,
-            circuit_breaker_open_ms: 500,
-            circuit_breaker_half_open_secs: 2,
             calibration_aggressive_threshold: 30.0,
             calibration_opportunistic_threshold: 10.0,
             calibration_sample_duration: 60,

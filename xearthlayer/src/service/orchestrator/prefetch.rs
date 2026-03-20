@@ -10,10 +10,8 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::aircraft_position::AircraftPositionBroadcaster;
-use crate::executor::{DdsClient, MemoryCache, ResourcePoolConfig, ResourcePools};
-use crate::prefetch::{
-    warn_if_legacy, AdaptivePrefetchConfig, AdaptivePrefetchCoordinator, CircuitBreaker, Prefetcher,
-};
+use crate::executor::{DdsClient, MemoryCache};
+use crate::prefetch::{warn_if_legacy, AdaptivePrefetchConfig, AdaptivePrefetchCoordinator, Prefetcher};
 
 use super::super::error::ServiceError;
 use super::{PrefetchHandle, ServiceOrchestrator};
@@ -39,23 +37,12 @@ impl ServiceOrchestrator {
             .ok_or_else(|| ServiceError::NotStarted("DDS client not available".into()))?;
 
         let runtime_handle = service.runtime_handle().clone();
-        let resource_pools = service.resource_pools();
 
         // Try legacy adapter first, then new cache bridge architecture
         if let Some(memory_cache) = service.memory_cache_adapter() {
-            self.start_prefetch_with_cache(
-                &runtime_handle,
-                dds_client,
-                memory_cache,
-                resource_pools,
-            )?;
+            self.start_prefetch_with_cache(&runtime_handle, dds_client, memory_cache)?;
         } else if let Some(memory_cache) = service.memory_cache_bridge() {
-            self.start_prefetch_with_cache(
-                &runtime_handle,
-                dds_client,
-                memory_cache,
-                resource_pools,
-            )?;
+            self.start_prefetch_with_cache(&runtime_handle, dds_client, memory_cache)?;
         } else {
             tracing::warn!("Memory cache not available, prefetch disabled");
             return Ok(());
@@ -70,7 +57,6 @@ impl ServiceOrchestrator {
         runtime_handle: &Handle,
         dds_client: Arc<dyn DdsClient>,
         memory_cache: Arc<M>,
-        resource_pools: Option<Arc<crate::executor::ResourcePools>>,
     ) -> Result<(), ServiceError> {
         use crate::prefetch::AircraftState as PrefetchAircraftState;
 
@@ -139,27 +125,6 @@ impl ServiceOrchestrator {
 
         // Wire memory cache for tile existence checks (Bug 5 fix)
         coordinator = coordinator.with_memory_cache(memory_cache);
-
-        // Wire circuit breaker as throttler (resource pool utilization based)
-        let circuit_breaker = if let Some(ref pools) = resource_pools {
-            CircuitBreaker::new(
-                config.circuit_breaker.clone(),
-                self.mount_manager.load_monitor(),
-                Arc::clone(pools),
-            )
-        } else {
-            // Fallback: create minimal resource pools for circuit breaker.
-            // This shouldn't happen in production — runtime always provides pools.
-            tracing::warn!("No resource pools available — circuit breaker using default pools");
-            let fallback_pools = Arc::new(ResourcePools::new(ResourcePoolConfig::default()));
-            CircuitBreaker::new(
-                config.circuit_breaker.clone(),
-                self.mount_manager.load_monitor(),
-                fallback_pools,
-            )
-        };
-        tracing::info!("Circuit breaker wired with resource pool utilization monitoring");
-        coordinator = coordinator.with_throttler(Arc::new(circuit_breaker));
 
         // Wire scenery index if available
         if self.scenery_index.tile_count() > 0 {

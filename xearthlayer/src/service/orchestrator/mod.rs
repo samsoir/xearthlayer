@@ -257,10 +257,6 @@ impl ServiceOrchestrator {
         let mut mount_manager = MountManager::with_scenery_path(&config.custom_scenery_path);
         mount_manager.set_fuse_limits(config.fuse.max_background, config.fuse.congestion_threshold);
 
-        // Wire load monitor for circuit breaker integration
-        let load_monitor = mount_manager.load_monitor();
-        service_builder = service_builder.with_load_monitor(Arc::clone(&load_monitor));
-
         // Wire FUSE analyzer callback for position inference
         if let Some(ref analyzer) = fuse_analyzer {
             service_builder = service_builder.with_tile_request_callback(analyzer.callback());

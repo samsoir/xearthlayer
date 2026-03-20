@@ -81,8 +81,6 @@ pub enum ConfigKey {
     PrefetchUdpPort,
     PrefetchMaxTilesPerCycle,
     PrefetchCycleIntervalMs,
-    PrefetchCircuitBreakerOpenMs,
-    PrefetchCircuitBreakerHalfOpenSecs,
 
     // Adaptive prefetch calibration settings
     PrefetchCalibrationAggressiveThreshold,
@@ -182,10 +180,6 @@ impl FromStr for ConfigKey {
             "prefetch.udp_port" => Ok(ConfigKey::PrefetchUdpPort),
             "prefetch.max_tiles_per_cycle" => Ok(ConfigKey::PrefetchMaxTilesPerCycle),
             "prefetch.cycle_interval_ms" => Ok(ConfigKey::PrefetchCycleIntervalMs),
-            "prefetch.circuit_breaker_open_ms" => Ok(ConfigKey::PrefetchCircuitBreakerOpenMs),
-            "prefetch.circuit_breaker_half_open_secs" => {
-                Ok(ConfigKey::PrefetchCircuitBreakerHalfOpenSecs)
-            }
             "prefetch.calibration_aggressive_threshold" => {
                 Ok(ConfigKey::PrefetchCalibrationAggressiveThreshold)
             }
@@ -282,10 +276,6 @@ impl ConfigKey {
             ConfigKey::PrefetchUdpPort => "prefetch.udp_port",
             ConfigKey::PrefetchMaxTilesPerCycle => "prefetch.max_tiles_per_cycle",
             ConfigKey::PrefetchCycleIntervalMs => "prefetch.cycle_interval_ms",
-            ConfigKey::PrefetchCircuitBreakerOpenMs => "prefetch.circuit_breaker_open_ms",
-            ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => {
-                "prefetch.circuit_breaker_half_open_secs"
-            }
             ConfigKey::PrefetchCalibrationAggressiveThreshold => {
                 "prefetch.calibration_aggressive_threshold"
             }
@@ -419,12 +409,6 @@ impl ConfigKey {
             ConfigKey::PrefetchUdpPort => config.prefetch.udp_port.to_string(),
             ConfigKey::PrefetchMaxTilesPerCycle => config.prefetch.max_tiles_per_cycle.to_string(),
             ConfigKey::PrefetchCycleIntervalMs => config.prefetch.cycle_interval_ms.to_string(),
-            ConfigKey::PrefetchCircuitBreakerOpenMs => {
-                config.prefetch.circuit_breaker_open_ms.to_string()
-            }
-            ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => {
-                config.prefetch.circuit_breaker_half_open_secs.to_string()
-            }
             ConfigKey::PrefetchCalibrationAggressiveThreshold => {
                 config.prefetch.calibration_aggressive_threshold.to_string()
             }
@@ -623,12 +607,6 @@ impl ConfigKey {
             ConfigKey::PrefetchCycleIntervalMs => {
                 config.prefetch.cycle_interval_ms = value.parse().unwrap();
             }
-            ConfigKey::PrefetchCircuitBreakerOpenMs => {
-                config.prefetch.circuit_breaker_open_ms = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => {
-                config.prefetch.circuit_breaker_half_open_secs = value.parse().unwrap();
-            }
             ConfigKey::PrefetchCalibrationAggressiveThreshold => {
                 config.prefetch.calibration_aggressive_threshold = value.parse().unwrap();
             }
@@ -798,8 +776,6 @@ impl ConfigKey {
             ConfigKey::PrefetchUdpPort => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchMaxTilesPerCycle => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchCycleIntervalMs => Box::new(PositiveIntegerSpec),
-            ConfigKey::PrefetchCircuitBreakerOpenMs => Box::new(PositiveIntegerSpec),
-            ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchCalibrationAggressiveThreshold => Box::new(PositiveNumberSpec),
             ConfigKey::PrefetchCalibrationOpportunisticThreshold => Box::new(PositiveNumberSpec),
             ConfigKey::PrefetchCalibrationSampleDuration => Box::new(PositiveIntegerSpec),
@@ -879,8 +855,6 @@ impl ConfigKey {
             ConfigKey::PrefetchUdpPort,
             ConfigKey::PrefetchMaxTilesPerCycle,
             ConfigKey::PrefetchCycleIntervalMs,
-            ConfigKey::PrefetchCircuitBreakerOpenMs,
-            ConfigKey::PrefetchCircuitBreakerHalfOpenSecs,
             ConfigKey::PrefetchCalibrationAggressiveThreshold,
             ConfigKey::PrefetchCalibrationOpportunisticThreshold,
             ConfigKey::PrefetchCalibrationSampleDuration,

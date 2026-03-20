@@ -182,13 +182,6 @@ max_tiles_per_cycle = {}
 ; Higher values reduce prefetch aggressiveness
 cycle_interval_ms = {}
 
-; Circuit breaker (pause prefetch during system resource saturation)
-; Uses resource pool utilization (network, CPU, disk I/O) to detect heavy load
-; Duration (milliseconds) resource saturation must be sustained to open circuit (default: 500)
-circuit_breaker_open_ms = {}
-; Cooloff time (seconds) before trying to close the circuit (default: 5)
-circuit_breaker_half_open_secs = {}
-
 ; Adaptive prefetch calibration (for strategy = adaptive)
 ; Minimum throughput for aggressive mode (tiles/sec, default: 30)
 ; Systems exceeding this use position-based prefetch triggers
@@ -319,8 +312,6 @@ congestion_threshold = {}
         config.prefetch.udp_port,
         config.prefetch.max_tiles_per_cycle,
         config.prefetch.cycle_interval_ms,
-        config.prefetch.circuit_breaker_open_ms,
-        config.prefetch.circuit_breaker_half_open_secs,
         config.prefetch.calibration_aggressive_threshold,
         config.prefetch.calibration_opportunistic_threshold,
         config.prefetch.calibration_sample_duration,

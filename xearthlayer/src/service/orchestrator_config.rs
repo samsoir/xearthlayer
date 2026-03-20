@@ -4,10 +4,8 @@
 //! needed to start the complete XEarthLayer backend services stack.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use crate::config::{ConfigFile, DiskIoProfile};
-use crate::prefetch::CircuitBreakerConfig;
 use crate::provider::ProviderConfig;
 use crate::service::ServiceConfig;
 
@@ -87,9 +85,6 @@ pub struct PrefetchConfig {
 
     /// Cycle interval (milliseconds).
     pub cycle_interval_ms: u64,
-
-    /// Circuit breaker configuration.
-    pub circuit_breaker: CircuitBreakerConfig,
 
     /// Calibration: aggressive mode threshold (tiles/sec).
     pub calibration_aggressive_threshold: f64,
@@ -203,12 +198,6 @@ impl OrchestratorConfig {
             udp_port: config.prefetch.udp_port,
             max_tiles_per_cycle: config.prefetch.max_tiles_per_cycle,
             cycle_interval_ms: config.prefetch.cycle_interval_ms,
-            circuit_breaker: CircuitBreakerConfig {
-                open_duration: Duration::from_millis(config.prefetch.circuit_breaker_open_ms),
-                half_open_duration: Duration::from_secs(
-                    config.prefetch.circuit_breaker_half_open_secs,
-                ),
-            },
             calibration_aggressive_threshold: config.prefetch.calibration_aggressive_threshold,
             calibration_opportunistic_threshold: config
                 .prefetch

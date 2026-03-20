@@ -4,7 +4,6 @@
 //! providing both query APIs (pull) and event subscriptions (push).
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -13,7 +12,6 @@ use tracing::{debug, trace};
 
 use super::burst::{BurstConfig, BurstDetector};
 use super::model::{DdsTileCoord, FuseAccessEvent, GeoBounds, GeoRegion, LoadingBurst};
-use crate::prefetch::FuseLoadMonitor;
 
 /// Trait for querying scene loading state (pull API).
 ///
@@ -111,16 +109,6 @@ impl Default for SceneTrackerConfig {
 ///
 /// Receives events from FUSE via an unbounded channel and maintains
 /// the empirical model of X-Plane's requests.
-///
-/// # FuseLoadMonitor Integration
-///
-/// Implements [`FuseLoadMonitor`] to serve as the single source of truth for
-/// X-Plane load detection. The circuit breaker can use this implementation
-/// instead of a separate counter, consolidating all FUSE observation in one place.
-///
-/// The atomic `immediate_request_count` provides synchronous visibility to the
-/// circuit breaker for rate-based throttling, while the async channel processing
-/// handles detailed tile tracking and burst detection.
 pub struct DefaultSceneTracker {
     /// Thread-safe state for detailed tracking.
     state: Arc<RwLock<TrackerState>>,
@@ -131,12 +119,6 @@ pub struct DefaultSceneTracker {
     /// Broadcast channel for tile access events.
     tile_tx: broadcast::Sender<DdsTileCoord>,
 
-    /// Atomic counter for immediate request visibility.
-    ///
-    /// Incremented synchronously via [`FuseLoadMonitor::record_request()`] to give
-    /// the circuit breaker immediate visibility into request rate, independent of
-    /// async event processing latency.
-    immediate_request_count: AtomicU64,
 }
 
 impl DefaultSceneTracker {
@@ -147,7 +129,6 @@ impl DefaultSceneTracker {
 
         Self {
             state: Arc::new(RwLock::new(TrackerState::new(config.burst_config))),
-            immediate_request_count: AtomicU64::new(0),
             burst_tx,
             tile_tx,
         }
@@ -333,40 +314,6 @@ impl SceneTrackerEvents for DefaultSceneTracker {
 
     fn subscribe_tile_access(&self) -> broadcast::Receiver<DdsTileCoord> {
         self.tile_tx.subscribe()
-    }
-}
-
-/// FuseLoadMonitor implementation for circuit breaker integration.
-///
-/// This allows the Scene Tracker to serve as the single source of truth for
-/// X-Plane load detection, eliminating the need for a separate `SharedFuseLoadMonitor`.
-///
-/// # Design Rationale
-///
-/// The atomic counter (`immediate_request_count`) is separate from the async state's
-/// `total_requests` to provide immediate visibility to the circuit breaker. The circuit
-/// breaker calculates request rate by sampling this counter, so latency matters.
-///
-/// FUSE calls both:
-/// - `scene_tracker_tx.send(event)` for detailed async tracking
-/// - `scene_tracker.record_request()` for immediate counter increment
-impl FuseLoadMonitor for DefaultSceneTracker {
-    fn record_request(&self) {
-        self.immediate_request_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn total_requests(&self) -> u64 {
-        self.immediate_request_count.load(Ordering::Relaxed)
-    }
-}
-
-impl FuseLoadMonitor for Arc<DefaultSceneTracker> {
-    fn record_request(&self) {
-        self.immediate_request_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn total_requests(&self) -> u64 {
-        self.immediate_request_count.load(Ordering::Relaxed)
     }
 }
 

@@ -102,6 +102,9 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "online_network.api_url",
     "online_network.poll_interval_secs",
     "online_network.max_stale_secs",
+    // Removed - circuit breaker replaced by SimState from X-Plane Web API
+    "prefetch.circuit_breaker_open_ms",
+    "prefetch.circuit_breaker_half_open_secs",
 ];
 
 /// Result of analyzing a configuration file for upgrade needs.

@@ -347,24 +347,6 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
                     reason: "must be a positive integer (milliseconds)".to_string(),
                 })?;
         }
-        if let Some(v) = section.get("circuit_breaker_open_ms") {
-            config.prefetch.circuit_breaker_open_ms =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "prefetch".to_string(),
-                    key: "circuit_breaker_open_ms".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer (milliseconds)".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("circuit_breaker_half_open_secs") {
-            config.prefetch.circuit_breaker_half_open_secs =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "prefetch".to_string(),
-                    key: "circuit_breaker_half_open_secs".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer (seconds)".to_string(),
-                })?;
-        }
         // Legacy settings radial_radius, tile_based_rows_ahead are deprecated (v0.4.0)
         // They are ignored if present in config file (use 'xearthlayer config upgrade')
         // Adaptive prefetch calibration settings

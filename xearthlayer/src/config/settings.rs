@@ -183,13 +183,6 @@ pub struct PrefetchSettings {
     /// Interval between prefetch cycles in milliseconds. Default: 2000ms.
     /// Higher values reduce prefetch aggressiveness.
     pub cycle_interval_ms: u64,
-    /// How long (milliseconds) resource saturation must be sustained to open circuit.
-    /// Default: 500ms (0.5 seconds) to catch bursty loads.
-    pub circuit_breaker_open_ms: u64,
-    /// Cooloff time (seconds) before trying to close the circuit.
-    /// Default: 5 seconds.
-    pub circuit_breaker_half_open_secs: u64,
-
     // Adaptive prefetch calibration settings
     /// Minimum throughput for aggressive mode (tiles/sec).
     /// If measured throughput exceeds this, aggressive (position-based) prefetch is enabled.
@@ -337,4 +330,3 @@ pub struct FuseSettings {
     /// Default: 192 (75% of max_background)
     pub congestion_threshold: u16,
 }
-
