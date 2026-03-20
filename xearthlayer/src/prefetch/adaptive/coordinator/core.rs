@@ -2528,8 +2528,8 @@ mod tests {
     fn test_coordinator_skips_when_scenery_loading() {
         use crate::aircraft_position::web_api::sim_state::SimState;
 
-        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
-            .with_calibration(test_calibration());
+        let mut coord =
+            AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
 
         let loading = SimState {
             scenery_loading: true,
@@ -2545,8 +2545,8 @@ mod tests {
     fn test_coordinator_skips_during_replay() {
         use crate::aircraft_position::web_api::sim_state::SimState;
 
-        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
-            .with_calibration(test_calibration());
+        let mut coord =
+            AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
 
         let replay = SimState {
             replay: true,

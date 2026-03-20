@@ -1,79 +1,17 @@
 //! APT (Aircraft Position & Telemetry) wiring for the service orchestrator.
 //!
-//! Contains the `start_apt_telemetry()` and `start_network_position()` methods,
+//! Contains the `start_web_api_adapter()` and `start_network_position()` methods,
 //! which are independent of the core startup sequence.
 
 use tokio::sync::mpsc;
 use tracing::info;
 
-use crate::aircraft_position::{
-    spawn_position_logger, TelemetryReceiver, TelemetryReceiverConfig, DEFAULT_LOG_INTERVAL,
-};
+use crate::aircraft_position::{spawn_position_logger, DEFAULT_LOG_INTERVAL};
 
 use super::super::error::ServiceError;
 use super::ServiceOrchestrator;
 
 impl ServiceOrchestrator {
-    /// Start the APT telemetry receiver.
-    ///
-    /// This starts listening for X-Plane UDP telemetry on the configured port.
-    /// Must be called after mounting to have a runtime handle available.
-    pub fn start_apt_telemetry(&self) -> Result<(), ServiceError> {
-        let service = self
-            .mount_manager
-            .get_service()
-            .ok_or_else(|| ServiceError::NotStarted("No service available for APT".into()))?;
-
-        let runtime_handle = service.runtime_handle().clone();
-        let telemetry_port = self.config.prefetch.udp_port;
-        let (telemetry_tx, mut telemetry_rx) = mpsc::channel(32);
-
-        let telemetry_config = TelemetryReceiverConfig {
-            port: telemetry_port,
-            ..Default::default()
-        };
-        let receiver = TelemetryReceiver::new(telemetry_config, telemetry_tx);
-        let apt_cancellation = self.cancellation.clone();
-        let logger_cancellation = apt_cancellation.clone();
-
-        // Start the UDP receiver
-        runtime_handle.spawn(async move {
-            tokio::select! {
-                result = receiver.start() => {
-                    match result {
-                        Ok(Ok(())) => tracing::debug!("APT telemetry receiver stopped"),
-                        Ok(Err(e)) => tracing::warn!("APT telemetry receiver error: {}", e),
-                        Err(e) => tracing::warn!("APT telemetry receiver task failed: {}", e),
-                    }
-                }
-                _ = apt_cancellation.cancelled() => {
-                    tracing::debug!("APT telemetry receiver cancelled");
-                }
-            }
-        });
-
-        // Bridge task: forward telemetry states to APT aggregator
-        let aircraft_position = self.aircraft_position.clone();
-        runtime_handle.spawn(async move {
-            while let Some(state) = telemetry_rx.recv().await {
-                aircraft_position.receive_telemetry(state);
-            }
-        });
-
-        // Periodic position logger for flight analysis (DEBUG level only)
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            spawn_position_logger(
-                &runtime_handle,
-                self.aircraft_position.clone(),
-                logger_cancellation,
-                DEFAULT_LOG_INTERVAL,
-            );
-        }
-
-        info!(port = telemetry_port, "APT telemetry receiver started");
-        Ok(())
-    }
-
     /// Start the X-Plane Web API adapter.
     ///
     /// Connects to X-Plane's built-in Web API via REST + WebSocket for
@@ -111,6 +49,16 @@ impl ServiceOrchestrator {
                 aircraft_position.receive_telemetry(state);
             }
         });
+
+        // Periodic position logger for flight analysis (DEBUG level only)
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            spawn_position_logger(
+                &runtime_handle,
+                self.aircraft_position.clone(),
+                self.cancellation.clone(),
+                DEFAULT_LOG_INTERVAL,
+            );
+        }
 
         info!(
             port = web_api_config.port,

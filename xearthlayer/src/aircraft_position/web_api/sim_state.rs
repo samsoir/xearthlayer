@@ -51,9 +51,7 @@ impl SimState {
     /// Missing values default to the safe state (no inhibit).
     pub fn from_dataref_values(values: &HashMap<String, f64>) -> Self {
         Self {
-            paused: values
-                .get(datarefs::PAUSED)
-                .is_some_and(|v| *v as i32 != 0),
+            paused: values.get(datarefs::PAUSED).is_some_and(|v| *v as i32 != 0),
             on_ground: values
                 .get(datarefs::ON_GROUND)
                 .is_some_and(|v| *v as i32 != 0),

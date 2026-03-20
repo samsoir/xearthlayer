@@ -387,10 +387,6 @@ impl ServiceOrchestrator {
         if let Some(ref cb) = callback {
             cb(StartupProgress::StartingTelemetry);
         }
-        if let Err(e) = self.start_apt_telemetry() {
-            tracing::warn!(error = %e, "Failed to start APT telemetry");
-        }
-
         // Phase 3a: Start X-Plane Web API adapter (position + sim state)
         if let Err(e) = self.start_web_api_adapter() {
             tracing::warn!(error = %e, "Failed to start Web API adapter");

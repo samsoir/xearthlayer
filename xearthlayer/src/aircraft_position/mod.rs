@@ -57,7 +57,7 @@
 //!
 //! - [`state`] - Core types: `AircraftState`, `PositionAccuracy`, `TelemetryStatus`, `PositionSource`, `TrackSource`
 //! - [`model`] - `PositionModel` with accuracy-based selection logic
-//! - [`telemetry`] - `TelemetryReceiver` for X-Plane UDP telemetry (XGPS2/ForeFlight)
+//! - [`web_api`] - `WebApiAdapter` for X-Plane Web API telemetry and sim state
 //! - [`inference`] - `InferenceAdapter` for Scene Tracker-based position inference
 //! - [`aggregator`] - `StateAggregator` that combines all sources and broadcasts updates
 //! - [`provider`] - `AircraftPositionProvider` and `AircraftPositionBroadcaster` traits
@@ -72,7 +72,6 @@ mod model;
 pub mod network;
 mod provider;
 mod state;
-mod telemetry;
 pub mod web_api;
 
 pub use aggregator::{StateAggregator, StateAggregatorConfig};
@@ -85,7 +84,6 @@ pub use state::{
     AircraftPositionStatus, AircraftState, PositionAccuracy, PositionSource, TelemetryStatus,
     TrackSource,
 };
-pub use telemetry::{TelemetryError, TelemetryReceiver, TelemetryReceiverConfig};
 
 // Position logger for flight analysis (DEBUG level only)
 pub use logger::{spawn_position_logger, DEFAULT_LOG_INTERVAL};

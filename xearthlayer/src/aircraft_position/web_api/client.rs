@@ -91,8 +91,7 @@ impl WebApiClient {
         let json: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| WebApiError::Json(e.to_string()))?;
 
-        datarefs::resolve_dataref_ids_checked(&json, names)
-            .map_err(WebApiError::MissingDatarefs)
+        datarefs::resolve_dataref_ids_checked(&json, names).map_err(WebApiError::MissingDatarefs)
     }
 }
 

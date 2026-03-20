@@ -83,10 +83,7 @@ pub fn invert_id_map(id_map: &DatarefIdMap) -> IdToNameMap {
 ///
 /// Returns a map of dataref name → ID for all requested names found
 /// in the response. Names not found are silently skipped.
-pub fn resolve_dataref_ids(
-    json: &serde_json::Value,
-    names: &[&str],
-) -> DatarefIdMap {
+pub fn resolve_dataref_ids(json: &serde_json::Value, names: &[&str]) -> DatarefIdMap {
     let mut result = DatarefIdMap::with_capacity(names.len());
     let name_set: std::collections::HashSet<&str> = names.iter().copied().collect();
 
@@ -165,10 +162,8 @@ pub fn parse_dataref_update(
 ///
 /// Format: `{"req_id": N, "type": "dataref_subscribe_values", "params": {"datarefs": [{"id": X}, ...]}}`
 pub fn build_subscribe_message(req_id: u64, ids: &[u64]) -> String {
-    let datarefs: Vec<serde_json::Value> = ids
-        .iter()
-        .map(|id| serde_json::json!({"id": id}))
-        .collect();
+    let datarefs: Vec<serde_json::Value> =
+        ids.iter().map(|id| serde_json::json!({"id": id})).collect();
 
     serde_json::json!({
         "req_id": req_id,
@@ -235,10 +230,8 @@ mod tests {
             "data": { "100": 48.116, "200": 16.566 }
         });
 
-        let id_to_name: IdToNameMap = HashMap::from([
-            (100, LATITUDE.to_string()),
-            (200, LONGITUDE.to_string()),
-        ]);
+        let id_to_name: IdToNameMap =
+            HashMap::from([(100, LATITUDE.to_string()), (200, LONGITUDE.to_string())]);
         let values = parse_dataref_update(&msg, &id_to_name);
         assert!((values[LATITUDE] - 48.116).abs() < 0.001);
         assert!((values[LONGITUDE] - 16.566).abs() < 0.001);
