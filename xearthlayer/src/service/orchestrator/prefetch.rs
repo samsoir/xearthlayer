@@ -11,7 +11,9 @@ use tracing::info;
 
 use crate::aircraft_position::AircraftPositionBroadcaster;
 use crate::executor::{DdsClient, MemoryCache};
-use crate::prefetch::{warn_if_legacy, AdaptivePrefetchConfig, AdaptivePrefetchCoordinator, Prefetcher};
+use crate::prefetch::{
+    warn_if_legacy, AdaptivePrefetchConfig, AdaptivePrefetchCoordinator, Prefetcher,
+};
 
 use super::super::error::ServiceError;
 use super::{PrefetchHandle, ServiceOrchestrator};

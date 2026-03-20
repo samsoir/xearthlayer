@@ -30,14 +30,10 @@
 //! let bounds = tracker.loaded_bounds();
 //! ```
 
-mod burst;
 mod coords;
 mod model;
 mod tracker;
 
-pub use burst::{BurstConfig, BurstDetector};
 pub use coords::{tile_to_lat_lon, TileCoordConversion};
-pub use model::{
-    DdsTileCoord, FuseAccessEvent, GeoBounds, GeoRegion, LoadingBurst, SceneLoadingState,
-};
-pub use tracker::{DefaultSceneTracker, SceneTracker, SceneTrackerConfig, SceneTrackerEvents};
+pub use model::{DdsTileCoord, FuseAccessEvent, GeoBounds, GeoRegion, SceneLoadingState};
+pub use tracker::{DefaultSceneTracker, SceneTracker, SceneTrackerConfig};

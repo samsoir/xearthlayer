@@ -922,11 +922,7 @@ impl AdaptivePrefetchCoordinator {
 
     fn update_shared_status_no_plan(&self) {
         if let Some(ref status) = self.shared_status {
-            super::status_updater::update_status_no_plan(
-                status,
-                &self.status,
-                &self.cycle_stats(),
-            );
+            super::status_updater::update_status_no_plan(status, &self.status, &self.cycle_stats());
         }
     }
 }

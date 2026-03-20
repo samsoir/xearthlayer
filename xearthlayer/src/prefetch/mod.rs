@@ -54,11 +54,11 @@ pub use condition::{
 };
 pub use error::PrefetchError;
 pub use listener::TelemetryListener;
+pub use state::CircuitState;
 pub use state::{
     AircraftSnapshot, AircraftState, DetailedPrefetchStats, GpsStatus, PrefetchMode,
     PrefetchStatsSnapshot, PrefetchStatusSnapshot, SharedPrefetchStatus,
 };
-pub use state::CircuitState;
 pub use strategy::Prefetcher;
 
 // FUSE inference (still used by FUSE layer for position callbacks)

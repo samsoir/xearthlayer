@@ -9,7 +9,7 @@
 //! Run with: `cargo test --test aircraft_position_integration`
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc};
 
@@ -19,8 +19,7 @@ use xearthlayer::aircraft_position::{
     StateAggregatorConfig, TelemetryStatus, TrackSource,
 };
 use xearthlayer::scene_tracker::{
-    BurstConfig, DdsTileCoord, DefaultSceneTracker, FuseAccessEvent, GeoBounds, GeoRegion,
-    LoadingBurst, SceneTracker, SceneTrackerConfig, SceneTrackerEvents,
+    DdsTileCoord, DefaultSceneTracker, FuseAccessEvent, GeoBounds, GeoRegion, SceneTracker,
 };
 
 // ============================================================================
@@ -63,19 +62,6 @@ fn create_telemetry_state(lat: f64, lon: f64) -> AircraftState {
 /// Create an inference AircraftState from scene bounds center.
 fn create_inference_state(lat: f64, lon: f64) -> AircraftState {
     AircraftState::from_inference(lat, lon)
-}
-
-/// Create a LoadingBurst for testing.
-fn create_test_burst(tile_count: usize) -> LoadingBurst {
-    let start = Instant::now();
-    let tiles: Vec<DdsTileCoord> = (0..tile_count)
-        .map(|i| DdsTileCoord::new(83776 + i as u32, 138240, 18))
-        .collect();
-    LoadingBurst {
-        tiles,
-        started: start,
-        ended: start + Duration::from_secs(2),
-    }
 }
 
 /// Hamburg airport coordinates for testing.
@@ -259,14 +245,6 @@ impl SceneTracker for MockSceneTracker {
         false
     }
 
-    fn is_burst_active(&self) -> bool {
-        false
-    }
-
-    fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
-        Vec::new()
-    }
-
     fn total_requests(&self) -> u64 {
         0
     }
@@ -323,31 +301,24 @@ async fn test_telemetry_overrides_inference() {
     assert_eq!(apt.position_source(), Some(PositionSource::Telemetry));
 }
 
-/// Test the full InferenceAdapter flow with burst events.
+/// Test the InferenceAdapter flow with fallback timer.
 #[tokio::test]
-async fn test_inference_adapter_burst_flow() {
+async fn test_inference_adapter_fallback_flow() {
     // Create mock Scene Tracker with Hamburg bounds
     let tracker = MockSceneTracker::with_bounds(53.0, 54.0, 9.0, 11.0);
-
-    // Create burst channel to simulate Scene Tracker events
-    let (burst_tx, burst_rx) = broadcast::channel(16);
 
     // Create channel for inference states
     let (inference_tx, mut inference_rx) = mpsc::channel(16);
 
-    // Create and start InferenceAdapter with short fallback interval
+    // Create and start InferenceAdapter with short fallback interval for testing
     let config = InferenceAdapterConfig {
-        fallback_interval: Duration::from_secs(60), // Long fallback, we'll trigger via burst
+        fallback_interval: Duration::from_millis(100),
     };
-    let adapter = InferenceAdapter::with_config(tracker, burst_rx, inference_tx, config);
+    let adapter = InferenceAdapter::with_config(tracker, inference_tx, config);
     let handle = adapter.start();
 
-    // Simulate a burst completion
-    let burst = create_test_burst(8);
-    burst_tx.send(burst).expect("Should send burst");
-
-    // Should receive inferred position
-    match tokio::time::timeout(Duration::from_millis(200), inference_rx.recv()).await {
+    // Should receive inferred position from fallback timer
+    match tokio::time::timeout(Duration::from_millis(500), inference_rx.recv()).await {
         Ok(Some(state)) => {
             assert_eq!(state.source, PositionSource::SceneInference);
             // Center of bounds: (53.5, 10.0)
@@ -359,7 +330,7 @@ async fn test_inference_adapter_burst_flow() {
     }
 
     // Clean shutdown
-    drop(burst_tx);
+    handle.abort();
     let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
 }
 
@@ -435,17 +406,9 @@ async fn test_full_pipeline_scene_to_subscriber() {
     // Create the full pipeline:
     // Scene Tracker → InferenceAdapter → APT → Subscriber
 
-    // 1. Create Scene Tracker with short burst quiet threshold
-    let config = SceneTrackerConfig {
-        burst_config: BurstConfig {
-            quiet_threshold: Duration::from_millis(50),
-            min_tiles: 3,
-        },
-        ..Default::default()
-    };
-    let scene_tracker = Arc::new(DefaultSceneTracker::new(config));
+    // 1. Create Scene Tracker
+    let scene_tracker = Arc::new(DefaultSceneTracker::with_defaults());
     let (fuse_tx, fuse_rx) = mpsc::unbounded_channel();
-    let burst_rx = scene_tracker.subscribe_bursts();
 
     // Start Scene Tracker
     let scene_tracker_clone = Arc::clone(&scene_tracker);
@@ -457,11 +420,14 @@ async fn test_full_pipeline_scene_to_subscriber() {
     // 3. Create channel for inference states
     let (inference_tx, mut inference_rx) = mpsc::channel(16);
 
-    // 4. Create InferenceAdapter
-    let adapter = InferenceAdapter::new(
+    // 4. Create InferenceAdapter with short fallback for testing
+    let config = InferenceAdapterConfig {
+        fallback_interval: Duration::from_millis(100),
+    };
+    let adapter = InferenceAdapter::with_config(
         Arc::clone(&scene_tracker) as Arc<dyn SceneTracker>,
-        burst_rx,
         inference_tx,
+        config,
     );
     let adapter_handle = adapter.start();
 
@@ -473,7 +439,7 @@ async fn test_full_pipeline_scene_to_subscriber() {
         }
     });
 
-    // 6. Simulate FUSE tile requests (triggers burst)
+    // 6. Simulate FUSE tile requests
     for (row, col) in HAMBURG_TILES {
         fuse_tx
             .send(FuseAccessEvent::new(DdsTileCoord::new(*row, *col, 18)))
@@ -481,16 +447,10 @@ async fn test_full_pipeline_scene_to_subscriber() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    // 7. Wait for burst detection
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // 7. Wait for inference fallback timer to fire and propagate
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Manually check for burst complete (normally done by scene tracker periodically)
-    scene_tracker.check_burst_complete();
-
-    // 8. Wait for inference to propagate
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // 9. Verify APT received the inference
+    // 8. Verify APT received the inference
     // Note: Position may or may not be set depending on timing, but pipeline should work
     let status = apt.status();
     if status.state.is_some() {
@@ -501,9 +461,10 @@ async fn test_full_pipeline_scene_to_subscriber() {
         );
     }
 
-    // 10. Clean shutdown
+    // 9. Clean shutdown
     drop(fuse_tx);
     let _ = tokio::time::timeout(Duration::from_secs(1), scene_handle).await;
+    adapter_handle.abort();
     let _ = tokio::time::timeout(Duration::from_secs(1), adapter_handle).await;
     drop(apt); // This closes inference_rx
     let _ = tokio::time::timeout(Duration::from_secs(1), bridge_handle).await;

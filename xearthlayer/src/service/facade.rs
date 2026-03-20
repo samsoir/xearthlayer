@@ -496,7 +496,7 @@ impl XEarthLayerService {
                     xearthlayer_runtime: None,
                     dds_client: None,
                     tile_request_callback: None,
-        
+
                     memory_cache_bridge: None,
                     cache_layer: None,
                     gc_scheduler_handle: None,

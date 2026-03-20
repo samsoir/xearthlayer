@@ -119,12 +119,6 @@ impl SceneTracker for DummyTracker {
     fn is_tile_requested(&self, _tile: &DdsTileCoord) -> bool {
         false
     }
-    fn is_burst_active(&self) -> bool {
-        false
-    }
-    fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
-        vec![]
-    }
     fn total_requests(&self) -> u64 {
         0
     }
@@ -179,12 +173,6 @@ impl SceneTracker for StableBoundsTracker {
     fn is_tile_requested(&self, _tile: &DdsTileCoord) -> bool {
         false
     }
-    fn is_burst_active(&self) -> bool {
-        false
-    }
-    fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
-        vec![]
-    }
     fn total_requests(&self) -> u64 {
         0
     }
@@ -195,7 +183,7 @@ impl SceneTracker for StableBoundsTracker {
         false
     }
     fn loaded_bounds(&self) -> Option<GeoBounds> {
-        Some(self.bounds.clone())
+        Some(self.bounds)
     }
 }
 

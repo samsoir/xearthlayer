@@ -5,13 +5,11 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, trace};
 
-use super::burst::{BurstConfig, BurstDetector};
-use super::model::{DdsTileCoord, FuseAccessEvent, GeoBounds, GeoRegion, LoadingBurst};
+use super::model::{DdsTileCoord, FuseAccessEvent, GeoBounds, GeoRegion};
 
 /// Trait for querying scene loading state (pull API).
 ///
@@ -24,23 +22,17 @@ pub trait SceneTracker: Send + Sync {
     /// Check if a specific DDS tile has been requested.
     fn is_tile_requested(&self, tile: &DdsTileCoord) -> bool;
 
-    /// Check if X-Plane is currently in a loading burst.
-    fn is_burst_active(&self) -> bool;
-
-    /// Get tiles from the current/most recent burst.
-    fn current_burst_tiles(&self) -> Vec<DdsTileCoord>;
-
     /// Get total number of tile requests this session.
     fn total_requests(&self) -> u64;
 
     // === Derived queries (calculated from empirical data) ===
 
-    /// Derive which 1°×1° regions have been loaded.
+    /// Derive which 1x1 regions have been loaded.
     ///
     /// This is calculated from the requested tiles, not stored directly.
     fn loaded_regions(&self) -> HashSet<GeoRegion>;
 
-    /// Check if a 1°×1° region has any requested tiles.
+    /// Check if a 1x1 region has any requested tiles.
     fn is_region_loaded(&self, region: &GeoRegion) -> bool;
 
     /// Derive the geographic bounding box of all requested tiles.
@@ -49,34 +41,19 @@ pub trait SceneTracker: Send + Sync {
     fn loaded_bounds(&self) -> Option<GeoBounds>;
 }
 
-/// Trait for subscribing to scene loading events (push API).
-pub trait SceneTrackerEvents: Send + Sync {
-    /// Subscribe to completed loading bursts.
-    fn subscribe_bursts(&self) -> broadcast::Receiver<LoadingBurst>;
-
-    /// Subscribe to individual tile access events.
-    ///
-    /// Note: This is high-volume during scene loading.
-    fn subscribe_tile_access(&self) -> broadcast::Receiver<DdsTileCoord>;
-}
-
 /// Internal state for the scene tracker.
 struct TrackerState {
     /// All tiles requested this session.
     requested_tiles: HashSet<DdsTileCoord>,
-
-    /// Burst detector state.
-    burst_detector: BurstDetector,
 
     /// Total requests counter.
     total_requests: u64,
 }
 
 impl TrackerState {
-    fn new(burst_config: BurstConfig) -> Self {
+    fn new() -> Self {
         Self {
             requested_tiles: HashSet::new(),
-            burst_detector: BurstDetector::new(burst_config),
             total_requests: 0,
         }
     }
@@ -85,12 +62,6 @@ impl TrackerState {
 /// Configuration for the DefaultSceneTracker.
 #[derive(Debug, Clone)]
 pub struct SceneTrackerConfig {
-    /// Burst detection configuration.
-    pub burst_config: BurstConfig,
-
-    /// Channel capacity for burst broadcasts.
-    pub burst_channel_capacity: usize,
-
     /// Channel capacity for tile access broadcasts.
     pub tile_channel_capacity: usize,
 }
@@ -98,8 +69,6 @@ pub struct SceneTrackerConfig {
 impl Default for SceneTrackerConfig {
     fn default() -> Self {
         Self {
-            burst_config: BurstConfig::default(),
-            burst_channel_capacity: 16,
             tile_channel_capacity: 256,
         }
     }
@@ -113,23 +82,17 @@ pub struct DefaultSceneTracker {
     /// Thread-safe state for detailed tracking.
     state: Arc<RwLock<TrackerState>>,
 
-    /// Broadcast channel for burst events.
-    burst_tx: broadcast::Sender<LoadingBurst>,
-
     /// Broadcast channel for tile access events.
     tile_tx: broadcast::Sender<DdsTileCoord>,
-
 }
 
 impl DefaultSceneTracker {
     /// Create a new scene tracker with the given configuration.
     pub fn new(config: SceneTrackerConfig) -> Self {
-        let (burst_tx, _) = broadcast::channel(config.burst_channel_capacity);
         let (tile_tx, _) = broadcast::channel(config.tile_channel_capacity);
 
         Self {
-            state: Arc::new(RwLock::new(TrackerState::new(config.burst_config))),
-            burst_tx,
+            state: Arc::new(RwLock::new(TrackerState::new())),
             tile_tx,
         }
     }
@@ -137,6 +100,13 @@ impl DefaultSceneTracker {
     /// Create a scene tracker with default configuration.
     pub fn with_defaults() -> Self {
         Self::new(SceneTrackerConfig::default())
+    }
+
+    /// Subscribe to individual tile access events.
+    ///
+    /// Note: This is high-volume during scene loading.
+    pub fn subscribe_tile_access(&self) -> broadcast::Receiver<DdsTileCoord> {
+        self.tile_tx.subscribe()
     }
 
     /// Start the scene tracker's event processing loop.
@@ -199,37 +169,6 @@ impl DefaultSceneTracker {
         if let Ok(mut state) = self.state.write() {
             state.requested_tiles.insert(event.tile);
             state.total_requests += 1;
-
-            // Check for burst completion
-            if let Some(burst) = state
-                .burst_detector
-                .record_tile(event.tile, event.timestamp)
-            {
-                debug!(
-                    tiles = burst.tile_count(),
-                    duration_ms = burst.duration().as_millis(),
-                    "Loading burst completed"
-                );
-                // Broadcast burst (ignore errors)
-                let _ = self.burst_tx.send(burst);
-            }
-        }
-    }
-
-    /// Manually check for burst completion.
-    ///
-    /// Call this periodically if you need to detect burst completion
-    /// even when no new events are arriving.
-    pub fn check_burst_complete(&self) {
-        if let Ok(mut state) = self.state.write() {
-            if let Some(burst) = state.burst_detector.check_burst_complete(Instant::now()) {
-                debug!(
-                    tiles = burst.tile_count(),
-                    duration_ms = burst.duration().as_millis(),
-                    "Loading burst completed (check)"
-                );
-                let _ = self.burst_tx.send(burst);
-            }
         }
     }
 }
@@ -247,20 +186,6 @@ impl SceneTracker for DefaultSceneTracker {
             .read()
             .map(|s| s.requested_tiles.contains(tile))
             .unwrap_or(false)
-    }
-
-    fn is_burst_active(&self) -> bool {
-        self.state
-            .read()
-            .map(|s| s.burst_detector.is_burst_active())
-            .unwrap_or(false)
-    }
-
-    fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
-        self.state
-            .read()
-            .map(|s| s.burst_detector.current_burst_tiles().to_vec())
-            .unwrap_or_default()
     }
 
     fn total_requests(&self) -> u64 {
@@ -307,16 +232,6 @@ impl SceneTracker for DefaultSceneTracker {
     }
 }
 
-impl SceneTrackerEvents for DefaultSceneTracker {
-    fn subscribe_bursts(&self) -> broadcast::Receiver<LoadingBurst> {
-        self.burst_tx.subscribe()
-    }
-
-    fn subscribe_tile_access(&self) -> broadcast::Receiver<DdsTileCoord> {
-        self.tile_tx.subscribe()
-    }
-}
-
 // Allow Arc<DefaultSceneTracker> to be used as SceneTracker
 impl SceneTracker for Arc<DefaultSceneTracker> {
     fn requested_tiles(&self) -> HashSet<DdsTileCoord> {
@@ -325,14 +240,6 @@ impl SceneTracker for Arc<DefaultSceneTracker> {
 
     fn is_tile_requested(&self, tile: &DdsTileCoord) -> bool {
         (**self).is_tile_requested(tile)
-    }
-
-    fn is_burst_active(&self) -> bool {
-        (**self).is_burst_active()
-    }
-
-    fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
-        (**self).current_burst_tiles()
     }
 
     fn total_requests(&self) -> u64 {
@@ -352,16 +259,6 @@ impl SceneTracker for Arc<DefaultSceneTracker> {
     }
 }
 
-impl SceneTrackerEvents for Arc<DefaultSceneTracker> {
-    fn subscribe_bursts(&self) -> broadcast::Receiver<LoadingBurst> {
-        (**self).subscribe_bursts()
-    }
-
-    fn subscribe_tile_access(&self) -> broadcast::Receiver<DdsTileCoord> {
-        (**self).subscribe_tile_access()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,7 +275,6 @@ mod tests {
     fn test_default_scene_tracker_creation() {
         let tracker = DefaultSceneTracker::with_defaults();
         assert!(tracker.requested_tiles().is_empty());
-        assert!(!tracker.is_burst_active());
         assert_eq!(SceneTracker::total_requests(&tracker), 0);
     }
 
