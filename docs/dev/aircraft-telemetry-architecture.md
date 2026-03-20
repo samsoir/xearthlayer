@@ -41,7 +41,7 @@ XEarthLayer requires knowledge of the aircraft's position and trajectory to effi
 │  Position Model: Maintains best-known position, refined by multiple sources │
 │                                                                             │
 │  Inputs (via channels):                                                     │
-│  • GPS Telemetry (XGPS2 UDP) - ~10m accuracy, continuous                    │
+│  • X-Plane Web API - ~10m accuracy, continuous                              │
 │  • Prewarm position (airport ICAO) - ~100m accuracy, one-time seed          │
 │  • Scene Tracker inference - ~100km accuracy, on burst completion           │
 │                                                                             │
@@ -81,15 +81,15 @@ This mirrors how real aircraft navigation works:
 - **Initial alignment** → Seeds the model at startup
 
 For XEL:
-- **Telemetry** → Primary, high accuracy, updates model when connected
+- **Web API** → Primary, high accuracy, polls X-Plane sim state directly
 - **Prewarm** → Seeds model at startup (airport ICAO location)
-- **Scene Inference** → Maintains model when telemetry unavailable
+- **Scene Inference** → Maintains model when Web API unavailable
 
 ### Data Sources
 
 | Source | Accuracy | Confidence Decay | Update Pattern | When Available |
 |--------|----------|------------------|----------------|----------------|
-| GPS Telemetry (XGPS2) | ~10m | None (continuous) | 1Hz rate-limited | X-Plane UDP enabled |
+| X-Plane Web API | ~10m | None (continuous) | 1Hz rate-limited | X-Plane running |
 | Prewarm (Airport ICAO) | ~100m | Rapid (static fix) | One-time seed | `--airport` flag used |
 | Scene Tracker Inference | ~100km | Slow (current state) | On burst + 30s fallback | After first tiles loaded |
 
@@ -108,7 +108,7 @@ For XEL:
 pub struct PositionAccuracy(pub f32);
 
 impl PositionAccuracy {
-    /// GPS telemetry - meter-level precision
+    /// X-Plane Web API - meter-level precision
     pub const TELEMETRY: Self = Self(10.0);
 
     /// Airport reference point (ICAO) - precise fix
@@ -118,20 +118,20 @@ impl PositionAccuracy {
     pub const SCENE_INFERENCE: Self = Self(100_000.0);
 }
 
-/// Telemetry connection status (binary - is X-Plane sending XGPS2?)
+/// Telemetry connection status (binary - is X-Plane Web API reachable?)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelemetryStatus {
-    /// Receiving XGPS2 UDP data from X-Plane
+    /// Connected to X-Plane Web API
     Connected,
-    /// Not receiving telemetry data
+    /// Web API not reachable
     Disconnected,
 }
 
 /// Source of the current position data
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PositionSource {
-    /// From GPS telemetry (XGPS2)
-    Telemetry,
+    /// From X-Plane Web API
+    WebApi,
     /// Seeded from prewarm airport location
     Prewarm,
     /// Inferred from scene loading patterns
@@ -166,7 +166,7 @@ pub struct AircraftPositionStatus {
 ```
 
 **Key distinction:**
-- `TelemetryStatus` answers: "Is X-Plane broadcasting XGPS2?"
+- `TelemetryStatus` answers: "Is the X-Plane Web API reachable?"
 - `PositionSource` answers: "Where did this position come from?"
 - `PositionAccuracy` answers: "How precise is this measurement?"
 - `timestamp` answers: "How fresh is this data?" (callers judge staleness)
@@ -241,7 +241,7 @@ pub trait AircraftPositionBroadcaster: Send + Sync {
 
 ### Internal Components
 
-1. **TelemetryReceiver**: Listens for XGPS2 UDP packets, parses aircraft state, sends to aggregator
+1. **WebApiAdapter**: Polls X-Plane Web API for sim state (position, heading, speed, altitude), sends to aggregator
 2. **InferenceAdapter**: Subscribes to Scene Tracker burst events, derives position on burst completion, also runs 30s fallback timer
 3. **PositionModel**: Maintains best-known position, applies selection logic
 4. **StateAggregator**: Receives updates from all sources, applies to model, broadcasts changes at 1Hz
@@ -270,11 +270,11 @@ pub trait AircraftPositionBroadcaster: Send + Sync {
 │  (100km)     │      + no telemetry             │  (100km)     │
 └──────┬───────┘                                 └──────┬───────┘
        │                                                │
-       │ telemetry connects                             │ telemetry
+       │ Web API connects                               │ Web API
        │ (10m > 100km)                                  │ connects
        ▼                                                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│                      Telemetry (10m)                          │
+│                     Web API (10m)                              │
 │              Always wins - highest accuracy                   │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -299,14 +299,11 @@ Predict and preload scenery tiles of 1x1 deg web mercator based on aircraft posi
 pub struct PrefetchStatus {
     pub mode: PrefetchMode,
     pub stats: PrefetchStats,
-    pub circuit_state: CircuitState,
 }
 
 pub enum PrefetchMode {
     /// Actively prefetching based on position/heading
     Active,
-    /// Paused due to heavy X-Plane loading (circuit breaker open)
-    Paused,
     /// Idle - no position data or nothing to prefetch
     Idle,
     /// Disabled by configuration
@@ -336,7 +333,7 @@ pub trait PrefetchStatusProvider: Send + Sync {
 - Observes APT for position updates
 - Uses Scene Tracker to understand what X-Plane has loaded
 - During quiet periods (no active X-Plane loading), predicts and prefetches
-- Circuit breaker pauses prefetch during heavy X-Plane activity
+- Respects executor backpressure to avoid overloading the pipeline
 - Operates independently - can be disabled without affecting APT
 - Tracks state of the prefetch jobs allowing for progress and state display in UI and interactions (pause/resume/cancel)
 
@@ -642,12 +639,12 @@ async fn handle_dds_read(&self, path: &str) -> Result<DdsData> {
 ```
                                     X-Plane
                                        │
-                                       │ UDP (XGPS2)
+                                       │ HTTP (Web API)
                                        ▼
                               ┌─────────────────┐
-                              │ TelemetryReceiver│
+                              │  WebApiAdapter   │
                               └────────┬────────┘
-                                       │ AircraftState (10m accuracy)
+                                       │ SimState → AircraftState (10m accuracy)
         ┌──────────────────────────────┼──────────────────────────────┐
         │                              │                              │
         │   Prewarm ───────────────────┤                              │
@@ -692,7 +689,7 @@ async fn handle_dds_read(&self, path: &str) -> Result<DdsData> {
 └──────────────────────────┘
 ```
 
-**Key principle**: Data flows up from empirical observations (FUSE) through the Scene Tracker. APT maintains a Position Model that is refined by three sources: Telemetry (primary), Prewarm (seed), and Scene Inference (fallback). The Prefetch System observes APT for position and queries Scene Tracker for loaded regions.
+**Key principle**: Data flows up from empirical observations (FUSE) through the Scene Tracker. APT maintains a Position Model that is refined by three sources: Web API (primary), Prewarm (seed), and Scene Inference (fallback). The Prefetch System observes APT for position and queries Scene Tracker for loaded regions.
 
 ---
 
@@ -702,7 +699,7 @@ async fn handle_dds_read(&self, path: &str) -> Result<DdsData> {
 
 | Current Code | New Location | Changes Needed |
 |--------------|--------------|----------------|
-| `TelemetryListener` | APT Module | Rename to TelemetryReceiver, send to aggregator channel |
+| `TelemetryListener` | APT Module | Replaced by WebApiAdapter, send to aggregator channel |
 | `SharedPrefetchStatus` | Split | APT state + Prefetch stats become separate |
 | `TileBasedPrefetcher.BurstTracker` | Scene Tracker | Extract to standalone module |
 | `DdsAccessEvent` | Scene Tracker | Change `dsf_tile` to `DdsTileCoord` |
@@ -717,7 +714,7 @@ xearthlayer/src/
 ├── aircraft_position/          # New APT module
 │   ├── mod.rs                  # Module exports
 │   ├── provider.rs             # AircraftPositionProvider trait + impl
-│   ├── telemetry.rs            # TelemetryReceiver (from listener.rs)
+│   ├── web_api.rs              # WebApiAdapter (polls X-Plane Web API)
 │   ├── state.rs                # AircraftState, TelemetryStatus, PositionSource, PositionAccuracy
 │   ├── model.rs                # PositionModel (selection logic)
 │   ├── inference.rs            # InferenceAdapter (Scene Tracker -> position)
@@ -764,17 +761,15 @@ xearthlayer/src/
 **Goal**: Extract X-Plane request tracking into standalone module
 
 1. Create `scene_tracker/` module structure
-2. Extract `BurstTracker` from tile-based prefetcher
-3. Create `SceneTracker` trait and implementation
-4. Wire FUSE -> Scene Tracker unbounded channel
-5. Scene Tracker implements `FuseLoadMonitor` (single source of truth)
-6. Tests for burst detection and loaded regions
+2. Create `SceneTracker` trait and implementation
+3. Wire FUSE -> Scene Tracker unbounded channel
+4. Tests for loaded regions
 
 ### Phase 2: Aircraft Position & Telemetry Module
 **Goal**: Create unified position provider with Position Model
 
 1. Create `aircraft_position/` module structure
-2. Move `TelemetryListener` -> `TelemetryReceiver`
+2. Replace `TelemetryListener` with `WebApiAdapter`
 3. Create `AircraftPositionProvider` trait
 4. Implement Position Model (accuracy-based selection)
 5. Implement InferenceAdapter (burst subscription + 30s fallback)
@@ -817,22 +812,23 @@ xearthlayer/src/
 
 - **APT**: Position Model selection (accuracy + staleness), broadcast behavior
 - **Scene Tracker**: Burst detection, tile tracking, loaded bounds
-- **Prefetch**: Observer integration, circuit breaker with new APIs
+- **Prefetch**: Observer integration, backpressure with new APIs
 
 ### Integration Tests
 
 - **FUSE -> Scene Tracker -> APT**: Position inference flow
-- **Telemetry -> APT -> Dashboard**: GPS status display
+- **Web API -> APT -> Dashboard**: Connection status display
 - **Prewarm -> APT**: Seed position flow
 - **APT -> Prefetch**: Observer notification
 
 ### Manual Testing
 
-- Start with GPS disabled, verify "Inferred" status and position
-- Enable GPS, verify "Connected" status and precise position
+- Start without X-Plane running, verify "Inferred" status and position
+- Start X-Plane, verify "Connected" status and precise position via Web API
 - Use `--airport` flag, verify prewarm seeds position
 - Disable prefetch, verify position still displays
 - Heavy scene loading, verify burst detection
+- Verify Web API auto-reconnects when X-Plane restarts
 
 ---
 
@@ -890,7 +886,7 @@ This section documents key design decisions made during implementation.
 |------------|--------------|-----------|
 | FUSE -> Scene Tracker | `mpsc::unbounded` | Critical events, must not drop |
 | Scene Tracker -> APT | `broadcast` (burst events) | APT subscribes to burst completion |
-| Telemetry -> APT | `mpsc` | Single receiver (aggregator) |
+| Web API -> APT | `mpsc` | Single receiver (aggregator) |
 | Prewarm -> APT | `mpsc` | Single receiver (aggregator), one-time send |
 | APT -> Consumers | `broadcast` | Multiple subscribers, ok to lag |
 | APT query | Direct method call | Synchronous current-state queries |

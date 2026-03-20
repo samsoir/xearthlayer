@@ -315,7 +315,10 @@ mod tests {
         );
 
         // Verify prefetch config was extracted
-        assert_eq!(orch_config.prefetch.web_api_port, config.prefetch.web_api_port);
+        assert_eq!(
+            orch_config.prefetch.web_api_port,
+            config.prefetch.web_api_port
+        );
         assert_eq!(orch_config.prefetch.strategy, config.prefetch.strategy);
     }
 }

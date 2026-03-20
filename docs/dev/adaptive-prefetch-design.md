@@ -162,8 +162,6 @@ This design is based on empirical research documented in:
 xearthlayer/src/prefetch/
 ├── mod.rs                       # Module exports
 ├── strategy.rs                  # Prefetcher trait (run loop interface)
-├── load_monitor.rs              # FuseLoadMonitor trait
-├── circuit_breaker.rs           # CircuitBreaker (pause on X-Plane load)
 ├── adaptive/
 │   ├── mod.rs                   # Adaptive module exports
 │   ├── coordinator/

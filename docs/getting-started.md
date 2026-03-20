@@ -20,34 +20,18 @@ See [How It Works](how-it-works.md) for a detailed architectural explanation.
 - **Internet connection** for streaming imagery
 - Basic familiarity with the command line
 
-## Recommended: Enable X-Plane Telemetry
+## Automatic Telemetry
 
-For the **best experience**, enable X-Plane's telemetry output. This allows XEarthLayer to predict where you're flying and pre-download textures before you need them, resulting in smoother scenery loading with fewer pop-ins.
+XEarthLayer connects to X-Plane automatically via the **Web API** -- no configuration required. When X-Plane is running, XEarthLayer reads aircraft position, heading, and speed directly from the simulator.
 
-### How to Enable (Strongly Recommended)
+This enables:
 
-1. In X-Plane, go to **Settings** → **Network**
-2. Find the **"XAVION, FOREFLIGHT OR OTHER EFB (GDL-90)"** section
-3. In the "Enter IP address" field, type `127.0.0.1`
-4. Click **"Add Connection to Xavion or other EFB"**
-
-That's it! XEarthLayer will automatically receive your aircraft position and heading on UDP port 49002.
-
-### What This Enables
-
-- **Adaptive prefetching**: XEarthLayer automatically calibrates prefetch based on your network speed
-- **Track-based band loading**: Tiles ahead of your flight path are prioritized based on your ground track
+- **Adaptive prefetching**: Tiles ahead of your flight path are pre-downloaded before you need them
+- **Track-based band loading**: Tiles are prioritized based on your ground track
 - **Flight phase detection**: Different strategies for ground ops vs cruise flight
 - **Smoother scenery loading**: Tiles are often ready before X-Plane requests them
 
-### Without Telemetry
-
-XEarthLayer still works without telemetry! It will:
-- Generate textures on-demand as X-Plane requests them
-- Infer position from FUSE file access patterns
-- Cache textures for subsequent visits
-
-However, you may notice more tile pop-ins when flying into new areas, as the system can't predict your heading without telemetry.
+If X-Plane is not yet running when XEarthLayer starts, it will fall back to inferring position from FUSE file access patterns until the Web API connection is established.
 
 ## Installation
 

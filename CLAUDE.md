@@ -118,9 +118,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `BoundaryStrategy` - Region lifecycle management (InProgress/Prefetched/NoCoverage)
     - `PhaseDetector` - Ground/Cruise flight phase state machine
     - `PerformanceCalibrator` - Measures throughput during initial load for mode selection
-    - `TelemetryListener` - Receives X-Plane/ForeFlight UDP telemetry (position, heading, speed)
-    - `FuseLoadMonitor` trait - Abstraction for FUSE request tracking (ISP)
-    - `CircuitBreaker` - Pauses prefetch during X-Plane scene loading
+    - `SimState` - Direct sim state detection via X-Plane Web API (paused, on_ground, scenery_loading, replay)
     - `TransitionThrottle` - Grace period + ramp-up after Ground-to-Cruise transition
     - Submits jobs to shared job executor daemon via `DdsClient` trait
     - Mode selection: Aggressive (>30 tiles/sec), Opportunistic (10-30), or Disabled
@@ -131,11 +129,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 12. **Aircraft Position & Telemetry** (`xearthlayer/src/aircraft_position/`)
     - `StateAggregator` - Combines multiple position sources with accuracy-based selection
     - `PositionModel` - Persistent position model refined by best available data
-    - `TelemetryReceiver` - X-Plane UDP telemetry (XGPS2/ForeFlight protocol)
+    - `WebApiAdapter` - Connects to X-Plane Web API (REST + WebSocket) for position and sim state
     - `InferenceAdapter` - Position inference from FUSE file access patterns
-    - `NetworkAdapter` - Online ATC network position (VATSIM/IVAO/PilotEdge via REST API)
     - `FlightPathHistory` - Position history for track derivation
-    - Position sources: GPS/Telemetry (10m), OnlineNetwork (10m), ManualReference (100m), SceneInference (100km)
+    - Position sources: Web API (10m), ManualReference (100m), SceneInference (100km)
     - Higher accuracy wins; stale high-accuracy can be beaten by fresh lower-accuracy
 
 13. **Ortho Union Index** (`xearthlayer/src/ortho_union/`)
@@ -319,8 +316,11 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/prefetch/adaptive/scenery_window.rs` | SceneryWindow (retention tracking, world rebuild detection) |
 | `xearthlayer/src/prefetch/adaptive/boundary_strategy.rs` | BoundaryStrategy (boundary crossings to DSF region lists) |
 | `xearthlayer/src/prefetch/adaptive/ground_strategy.rs` | GroundStrategy (ring-based for ground ops) |
-| `xearthlayer/src/prefetch/load_monitor.rs` | FuseLoadMonitor trait + SharedFuseLoadMonitor |
-| `xearthlayer/src/prefetch/circuit_breaker.rs` | CircuitBreaker for X-Plane load detection |
+| `xearthlayer/src/aircraft_position/web_api/adapter.rs` | WebApiAdapter - X-Plane Web API position source |
+| `xearthlayer/src/aircraft_position/web_api/client.rs` | Web API HTTP/WebSocket client |
+| `xearthlayer/src/aircraft_position/web_api/datarefs.rs` | X-Plane dataref definitions |
+| `xearthlayer/src/aircraft_position/web_api/sim_state.rs` | SimState - sim state detection (paused, loading, etc.) |
+| `xearthlayer/src/aircraft_position/web_api/config.rs` | Web API connection configuration |
 | `xearthlayer/src/service/cache_layer.rs` | CacheLayer - service-owned cache lifecycle (memory + disk) |
 | `xearthlayer/src/cache/providers/disk.rs` | DiskCacheProvider with internal GC daemon |
 | `xearthlayer/src/cache/adapters/` | Bridge adapters for backward compatibility |
@@ -334,10 +334,9 @@ Key sections:
 - `[cache]` - Memory/disk sizes, directory, disk I/O profile (auto/hdd/ssd/nvme)
 - `[generation]` - Thread count, timeout
 - `[texture]` - DDS format (bc1/bc3), compressor backend (software/ispc/gpu), GPU device selection
-- `[prefetch]` - Boundary-driven prefetch, circuit breaker, calibration, transition ramp
+- `[prefetch]` - Boundary-driven prefetch, web_api_port (default 8086), calibration, transition ramp
 - `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
 - `[pipeline]` - HTTP/CPU/prefetch concurrency limits
-- `[online_network]` - VATSIM/IVAO/PilotEdge position (enabled, pilot_id, poll interval)
 - `[fuse]` - FUSE kernel limits (max_background, congestion_threshold)
 
 See `docs/configuration.md` for full reference.
