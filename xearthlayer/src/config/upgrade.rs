@@ -95,6 +95,13 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "prefetch.default_window_cols",
     // Removed in #58 - prewarm uses separate grid_rows/grid_cols
     "prewarm.grid_size",
+    // Removed - online network module deleted from aircraft_position
+    "online_network.enabled",
+    "online_network.network_type",
+    "online_network.pilot_id",
+    "online_network.api_url",
+    "online_network.poll_interval_secs",
+    "online_network.max_stale_secs",
 ];
 
 /// Result of analyzing a configuration file for upgrade needs.

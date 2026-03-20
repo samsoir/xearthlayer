@@ -69,7 +69,6 @@ mod flight_path;
 mod inference;
 mod logger;
 mod model;
-pub mod network;
 mod provider;
 mod state;
 pub mod web_api;
@@ -78,7 +77,6 @@ pub use aggregator::{StateAggregator, StateAggregatorConfig};
 pub use flight_path::{FlightPathConfig, FlightPathHistory, PositionSample};
 pub use inference::{InferenceAdapter, InferenceAdapterConfig};
 pub use model::PositionModel;
-pub use network::{NetworkAdapter, NetworkAdapterConfig, VatsimClient};
 pub use provider::{AircraftPositionBroadcaster, AircraftPositionProvider, SharedAircraftPosition};
 pub use state::{
     AircraftPositionStatus, AircraftState, PositionAccuracy, PositionSource, TelemetryStatus,

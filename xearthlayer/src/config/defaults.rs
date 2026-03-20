@@ -412,7 +412,6 @@ impl Default for ConfigFile {
                 max_retries: DEFAULT_MAX_RETRIES,
                 retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
             },
-            online_network: OnlineNetworkSettings::default(),
             fuse: FuseSettings {
                 max_background: DEFAULT_FUSE_MAX_BACKGROUND,
                 congestion_threshold: DEFAULT_FUSE_CONGESTION_THRESHOLD,

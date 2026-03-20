@@ -38,8 +38,6 @@ pub struct ConfigFile {
     pub patches: PatchesSettings,
     /// Executor daemon settings for job/task framework
     pub executor: ExecutorSettings,
-    /// Online network settings for VATSIM/IVAO/PilotEdge position
-    pub online_network: OnlineNetworkSettings,
     /// FUSE filesystem settings
     pub fuse: FuseSettings,
 }
@@ -327,29 +325,6 @@ pub struct ExecutorSettings {
     pub retry_base_delay_ms: u64,
 }
 
-/// Online network settings for position from ATC networks (VATSIM, IVAO, PilotEdge).
-#[derive(Debug, Clone)]
-pub struct OnlineNetworkSettings {
-    /// Enable/disable online network position fetching.
-    /// Default: false
-    pub enabled: bool,
-    /// Network type: "vatsim", "ivao", or "pilotedge".
-    /// Default: "vatsim"
-    pub network_type: String,
-    /// Pilot identifier (CID for VATSIM).
-    /// Default: 0 (disabled)
-    pub pilot_id: u64,
-    /// API URL (for VATSIM, the V3 JSON data feed).
-    /// Default: "https://status.vatsim.net/status.json"
-    pub api_url: String,
-    /// Poll interval in seconds.
-    /// Default: 15
-    pub poll_interval_secs: u64,
-    /// Maximum age in seconds before data is considered stale.
-    /// Default: 60
-    pub max_stale_secs: u64,
-}
-
 /// FUSE filesystem settings for kernel background request limits.
 #[derive(Debug, Clone)]
 pub struct FuseSettings {
@@ -363,15 +338,3 @@ pub struct FuseSettings {
     pub congestion_threshold: u16,
 }
 
-impl Default for OnlineNetworkSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            network_type: "vatsim".to_string(),
-            pilot_id: 0,
-            api_url: crate::aircraft_position::network::DEFAULT_VATSIM_DATA_URL.to_string(),
-            poll_interval_secs: crate::aircraft_position::network::DEFAULT_POLL_INTERVAL_SECS,
-            max_stale_secs: crate::aircraft_position::network::DEFAULT_MAX_STALE_SECS,
-        }
-    }
-}

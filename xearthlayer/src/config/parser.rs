@@ -685,62 +685,6 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
         }
     }
 
-    // [online_network] section
-    if let Some(section) = ini.section(Some("online_network")) {
-        if let Some(v) = section.get("enabled") {
-            config.online_network.enabled = parse_bool(v);
-        }
-        if let Some(v) = section.get("network_type") {
-            let v = v.trim().to_lowercase();
-            match v.as_str() {
-                "vatsim" | "ivao" | "pilotedge" => {
-                    config.online_network.network_type = v;
-                }
-                _ => {
-                    return Err(ConfigFileError::InvalidValue {
-                        section: "online_network".to_string(),
-                        key: "network_type".to_string(),
-                        value: v.to_string(),
-                        reason: "must be 'vatsim', 'ivao', or 'pilotedge'".to_string(),
-                    });
-                }
-            }
-        }
-        if let Some(v) = section.get("pilot_id") {
-            config.online_network.pilot_id =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "online_network".to_string(),
-                    key: "pilot_id".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer (VATSIM CID)".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("api_url") {
-            let v = v.trim();
-            if !v.is_empty() {
-                config.online_network.api_url = v.to_string();
-            }
-        }
-        if let Some(v) = section.get("poll_interval_secs") {
-            config.online_network.poll_interval_secs =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "online_network".to_string(),
-                    key: "poll_interval_secs".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer (seconds)".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("max_stale_secs") {
-            config.online_network.max_stale_secs =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "online_network".to_string(),
-                    key: "max_stale_secs".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer (seconds)".to_string(),
-                })?;
-        }
-    }
-
     // [fuse] section
     if let Some(section) = ini.section(Some("fuse")) {
         if let Some(v) = section.get("max_background") {

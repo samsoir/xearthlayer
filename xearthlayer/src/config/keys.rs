@@ -130,14 +130,6 @@ pub enum ConfigKey {
     ExecutorMaxRetries,
     ExecutorRetryBaseDelayMs,
 
-    // Online network settings
-    OnlineNetworkEnabled,
-    OnlineNetworkType,
-    OnlineNetworkPilotId,
-    OnlineNetworkApiUrl,
-    OnlineNetworkPollIntervalSecs,
-    OnlineNetworkMaxStaleSecs,
-
     // FUSE settings
     FuseMaxBackground,
     FuseCongestionThreshold,
@@ -244,14 +236,6 @@ impl FromStr for ConfigKey {
             "executor.max_retries" => Ok(ConfigKey::ExecutorMaxRetries),
             "executor.retry_base_delay_ms" => Ok(ConfigKey::ExecutorRetryBaseDelayMs),
 
-            // Online network settings
-            "online_network.enabled" => Ok(ConfigKey::OnlineNetworkEnabled),
-            "online_network.network_type" => Ok(ConfigKey::OnlineNetworkType),
-            "online_network.pilot_id" => Ok(ConfigKey::OnlineNetworkPilotId),
-            "online_network.api_url" => Ok(ConfigKey::OnlineNetworkApiUrl),
-            "online_network.poll_interval_secs" => Ok(ConfigKey::OnlineNetworkPollIntervalSecs),
-            "online_network.max_stale_secs" => Ok(ConfigKey::OnlineNetworkMaxStaleSecs),
-
             // FUSE settings
             "fuse.max_background" => Ok(ConfigKey::FuseMaxBackground),
             "fuse.congestion_threshold" => Ok(ConfigKey::FuseCongestionThreshold),
@@ -346,14 +330,6 @@ impl ConfigKey {
             ConfigKey::ExecutorRequestTimeoutSecs => "executor.request_timeout_secs",
             ConfigKey::ExecutorMaxRetries => "executor.max_retries",
             ConfigKey::ExecutorRetryBaseDelayMs => "executor.retry_base_delay_ms",
-
-            // Online network settings
-            ConfigKey::OnlineNetworkEnabled => "online_network.enabled",
-            ConfigKey::OnlineNetworkType => "online_network.network_type",
-            ConfigKey::OnlineNetworkPilotId => "online_network.pilot_id",
-            ConfigKey::OnlineNetworkApiUrl => "online_network.api_url",
-            ConfigKey::OnlineNetworkPollIntervalSecs => "online_network.poll_interval_secs",
-            ConfigKey::OnlineNetworkMaxStaleSecs => "online_network.max_stale_secs",
 
             // FUSE settings
             ConfigKey::FuseMaxBackground => "fuse.max_background",
@@ -521,18 +497,6 @@ impl ConfigKey {
             }
             ConfigKey::ExecutorMaxRetries => config.executor.max_retries.to_string(),
             ConfigKey::ExecutorRetryBaseDelayMs => config.executor.retry_base_delay_ms.to_string(),
-
-            // Online network settings
-            ConfigKey::OnlineNetworkEnabled => config.online_network.enabled.to_string(),
-            ConfigKey::OnlineNetworkType => config.online_network.network_type.clone(),
-            ConfigKey::OnlineNetworkPilotId => config.online_network.pilot_id.to_string(),
-            ConfigKey::OnlineNetworkApiUrl => config.online_network.api_url.clone(),
-            ConfigKey::OnlineNetworkPollIntervalSecs => {
-                config.online_network.poll_interval_secs.to_string()
-            }
-            ConfigKey::OnlineNetworkMaxStaleSecs => {
-                config.online_network.max_stale_secs.to_string()
-            }
 
             // FUSE settings
             ConfigKey::FuseMaxBackground => config.fuse.max_background.to_string(),
@@ -769,27 +733,6 @@ impl ConfigKey {
                 config.executor.retry_base_delay_ms = value.parse().unwrap();
             }
 
-            // Online network settings
-            ConfigKey::OnlineNetworkEnabled => {
-                let v = value.to_lowercase();
-                config.online_network.enabled = v == "true" || v == "1" || v == "yes" || v == "on";
-            }
-            ConfigKey::OnlineNetworkType => {
-                config.online_network.network_type = value.to_lowercase();
-            }
-            ConfigKey::OnlineNetworkPilotId => {
-                config.online_network.pilot_id = value.parse().unwrap();
-            }
-            ConfigKey::OnlineNetworkApiUrl => {
-                config.online_network.api_url = value.to_string();
-            }
-            ConfigKey::OnlineNetworkPollIntervalSecs => {
-                config.online_network.poll_interval_secs = value.parse().unwrap();
-            }
-            ConfigKey::OnlineNetworkMaxStaleSecs => {
-                config.online_network.max_stale_secs = value.parse().unwrap();
-            }
-
             // FUSE settings
             ConfigKey::FuseMaxBackground => {
                 config.fuse.max_background = value.parse().unwrap();
@@ -896,16 +839,6 @@ impl ConfigKey {
             ConfigKey::ExecutorMaxRetries => Box::new(PositiveIntegerSpec),
             ConfigKey::ExecutorRetryBaseDelayMs => Box::new(PositiveIntegerSpec),
 
-            // Online network settings
-            ConfigKey::OnlineNetworkEnabled => Box::new(BooleanSpec),
-            ConfigKey::OnlineNetworkType => {
-                Box::new(OneOfSpec::new(&["vatsim", "ivao", "pilotedge"]))
-            }
-            ConfigKey::OnlineNetworkPilotId => Box::new(PositiveIntegerSpec),
-            ConfigKey::OnlineNetworkApiUrl => Box::new(OptionalUrlSpec),
-            ConfigKey::OnlineNetworkPollIntervalSecs => Box::new(PositiveIntegerSpec),
-            ConfigKey::OnlineNetworkMaxStaleSecs => Box::new(PositiveIntegerSpec),
-
             // FUSE settings — range: 1-1024 for both
             ConfigKey::FuseMaxBackground => Box::new(IntegerRangeSpec::new(1, 1024)),
             ConfigKey::FuseCongestionThreshold => Box::new(IntegerRangeSpec::new(1, 1024)),
@@ -983,13 +916,6 @@ impl ConfigKey {
             ConfigKey::ExecutorRequestTimeoutSecs,
             ConfigKey::ExecutorMaxRetries,
             ConfigKey::ExecutorRetryBaseDelayMs,
-            // Online network settings
-            ConfigKey::OnlineNetworkEnabled,
-            ConfigKey::OnlineNetworkType,
-            ConfigKey::OnlineNetworkPilotId,
-            ConfigKey::OnlineNetworkApiUrl,
-            ConfigKey::OnlineNetworkPollIntervalSecs,
-            ConfigKey::OnlineNetworkMaxStaleSecs,
             // FUSE settings
             ConfigKey::FuseMaxBackground,
             ConfigKey::FuseCongestionThreshold,

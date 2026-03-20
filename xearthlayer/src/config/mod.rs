@@ -60,7 +60,6 @@ pub use file::{
     ExecutorSettings,
     GenerationSettings,
     LoggingSettings,
-    OnlineNetworkSettings,
     PackagesSettings,
     PatchesSettings,
     PipelineSettings,

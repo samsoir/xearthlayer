@@ -392,11 +392,6 @@ impl ServiceOrchestrator {
             tracing::warn!(error = %e, "Failed to start Web API adapter");
         }
 
-        // Phase 3b: Start online network position (VATSIM/IVAO/PilotEdge)
-        if let Err(e) = self.start_network_position() {
-            tracing::warn!(error = %e, "Failed to start online network position");
-        }
-
         // Phase 4: Build scenery index (with cache support)
         let packages_for_index: Vec<(String, std::path::PathBuf)> = ortho_packages
             .iter()
