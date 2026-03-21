@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::aircraft_position::AircraftPositionProvider;
 use crate::geo_index::{PatchCoverage, PrefetchedRegion, RetainedRegion};
-use crate::prefetch::adaptive::PrefetchBox;
+use crate::prefetch::adaptive::{AdaptivePrefetchConfig, PrefetchBox};
 
 use super::state::DebugMapState;
 
@@ -85,6 +85,19 @@ pub struct RegionInfo {
     pub prefetch_generated: u32,
 }
 
+impl RegionInfo {
+    fn new(lat: i32, lon: i32, state: RegionState) -> Self {
+        Self {
+            lat,
+            lon,
+            state,
+            fuse_hits: 0,
+            fuse_misses: 0,
+            prefetch_generated: 0,
+        }
+    }
+}
+
 fn is_zero(v: &u32) -> bool {
     *v == 0
 }
@@ -122,10 +135,6 @@ pub struct StatsInfo {
 // ─────────────────────────────────────────────────────────────────────────────
 // State collection
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Default forward/behind margins for prefetch box visualisation.
-const DEFAULT_FORWARD_MARGIN: f64 = 3.0;
-const DEFAULT_BEHIND_MARGIN: f64 = 1.0;
 
 /// Collect current state from all sources into a JSON-serialisable snapshot.
 pub fn collect_snapshot(state: &DebugMapState) -> DebugStateSnapshot {
@@ -177,7 +186,8 @@ fn compute_prefetch_box(aircraft: &Option<AircraftInfo>) -> Option<BoxBounds> {
     let aircraft = aircraft.as_ref()?;
     let track = aircraft.track.unwrap_or(aircraft.heading) as f64;
 
-    let pbox = PrefetchBox::new(DEFAULT_FORWARD_MARGIN, DEFAULT_BEHIND_MARGIN);
+    let config = AdaptivePrefetchConfig::default();
+    let pbox = PrefetchBox::new(config.forward_margin, config.behind_margin);
     let (lat_min, lat_max, lon_min, lon_max) =
         pbox.bounds(aircraft.latitude, aircraft.longitude, track);
 
@@ -210,17 +220,11 @@ fn collect_regions(state: &DebugMapState) -> Vec<RegionInfo> {
             continue;
         };
 
-        region_map.insert(
-            (region.lat, region.lon),
-            RegionInfo {
-                lat: region.lat,
-                lon: region.lon,
-                state: region_state,
-                fuse_hits: act.fuse_cache_hits,
-                fuse_misses: act.fuse_generated,
-                prefetch_generated: act.prefetch_generated,
-            },
-        );
+        let mut info = RegionInfo::new(region.lat, region.lon, region_state);
+        info.fuse_hits = act.fuse_cache_hits;
+        info.fuse_misses = act.fuse_generated;
+        info.prefetch_generated = act.prefetch_generated;
+        region_map.insert((region.lat, region.lon), info);
     }
 
     // Layer 2: GeoIndex prefetch state (overlay on top of activity)
@@ -235,17 +239,7 @@ fn collect_regions(state: &DebugMapState) -> Vec<RegionInfo> {
                 } else {
                     RegionState::NoCoverage
                 };
-                region_map.insert(
-                    key,
-                    RegionInfo {
-                        lat: region.lat,
-                        lon: region.lon,
-                        state: geo_state,
-                        fuse_hits: 0,
-                        fuse_misses: 0,
-                        prefetch_generated: 0,
-                    },
-                );
+                region_map.insert(key, RegionInfo::new(region.lat, region.lon, geo_state));
             }
         }
 
@@ -255,14 +249,7 @@ fn collect_regions(state: &DebugMapState) -> Vec<RegionInfo> {
             if !region_map.contains_key(&key) {
                 region_map.insert(
                     key,
-                    RegionInfo {
-                        lat: region.lat,
-                        lon: region.lon,
-                        state: RegionState::Patched,
-                        fuse_hits: 0,
-                        fuse_misses: 0,
-                        prefetch_generated: 0,
-                    },
+                    RegionInfo::new(region.lat, region.lon, RegionState::Patched),
                 );
             }
         }
@@ -273,14 +260,7 @@ fn collect_regions(state: &DebugMapState) -> Vec<RegionInfo> {
             if !region_map.contains_key(&key) {
                 region_map.insert(
                     key,
-                    RegionInfo {
-                        lat: region.lat,
-                        lon: region.lon,
-                        state: RegionState::Retained,
-                        fuse_hits: 0,
-                        fuse_misses: 0,
-                        prefetch_generated: 0,
-                    },
+                    RegionInfo::new(region.lat, region.lon, RegionState::Retained),
                 );
             }
         }
@@ -290,8 +270,8 @@ fn collect_regions(state: &DebugMapState) -> Vec<RegionInfo> {
 }
 
 fn collect_tiles(state: &DebugMapState) -> Vec<TileInfo> {
-    use super::activity::TileOrigin;
     use super::activity::TileCacheResult;
+    use super::activity::TileOrigin;
 
     state
         .tile_activity
@@ -362,22 +342,14 @@ mod tests {
 
     #[test]
     fn test_region_info_serialises_state() {
-        let region = RegionInfo {
-            lat: 48,
-            lon: 15,
-            state: RegionState::Prefetched,
-        };
+        let region = RegionInfo::new(48, 15, RegionState::Prefetched);
         let json = serde_json::to_string(&region).unwrap();
         assert!(json.contains("\"prefetched\""));
     }
 
     #[test]
     fn test_region_info_serialises_in_progress() {
-        let region = RegionInfo {
-            lat: 48,
-            lon: 15,
-            state: RegionState::InProgress,
-        };
+        let region = RegionInfo::new(48, 15, RegionState::InProgress);
         let json = serde_json::to_string(&region).unwrap();
         assert!(json.contains("\"in_progress\""));
     }

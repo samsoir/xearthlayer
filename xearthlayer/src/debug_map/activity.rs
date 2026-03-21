@@ -246,12 +246,21 @@ mod tests {
     fn test_tile_level_tracking() {
         let tracker = TileActivityTracker::new();
         tracker.record_with_tile(
-            48.5, 15.3, 1500, 2200, 12,
-            TileOrigin::Fuse, TileCacheResult::Generated,
+            48.5,
+            15.3,
+            1500,
+            2200,
+            12,
+            TileOrigin::Fuse,
+            TileCacheResult::Generated,
         );
 
         let tiles = tracker.tile_snapshot();
-        let key = TileKey { row: 1500, col: 2200, zoom: 12 };
+        let key = TileKey {
+            row: 1500,
+            col: 2200,
+            zoom: 12,
+        };
         let tile = tiles.get(&key).unwrap();
         assert_eq!(tile.origin, TileOrigin::Fuse);
         assert_eq!(tile.result, TileCacheResult::Generated);

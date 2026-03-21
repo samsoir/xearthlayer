@@ -71,6 +71,31 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn, Instrument};
 
 // =============================================================================
+// Debug map helpers
+// =============================================================================
+
+/// Record a tile activity event for the debug map overlay.
+#[cfg(feature = "debug-map")]
+fn record_debug_tile_activity(
+    tile_lat: f64,
+    tile_lon: f64,
+    row: u32,
+    col: u32,
+    zoom: u8,
+    is_fuse: bool,
+    result: crate::debug_map::activity::TileCacheResult,
+) {
+    use crate::debug_map::activity::{TileActivityTracker, TileOrigin};
+
+    let origin = if is_fuse {
+        TileOrigin::Fuse
+    } else {
+        TileOrigin::Prefetch
+    };
+    TileActivityTracker::global().record_with_tile(tile_lat, tile_lon, row, col, zoom, origin, result);
+}
+
+// =============================================================================
 // Configuration
 // =============================================================================
 
@@ -547,25 +572,11 @@ where
             }
 
             #[cfg(feature = "debug-map")]
-            {
-                use crate::debug_map::activity::{
-                    TileActivityTracker, TileCacheResult, TileOrigin,
-                };
-                let dbg_origin = if origin.is_fuse() {
-                    TileOrigin::Fuse
-                } else {
-                    TileOrigin::Prefetch
-                };
-                TileActivityTracker::global().record_with_tile(
-                    tile_lat,
-                    tile_lon,
-                    tile.row,
-                    tile.col,
-                    tile.zoom,
-                    dbg_origin,
-                    TileCacheResult::CacheHit,
-                );
-            }
+            record_debug_tile_activity(
+                tile_lat, tile_lon, tile.row, tile.col, tile.zoom,
+                origin.is_fuse(),
+                crate::debug_map::activity::TileCacheResult::CacheHit,
+            );
 
             if let Some(tx) = request.response_tx {
                 let _ = tx.send(DdsResponse::cache_hit(data, duration));
@@ -680,14 +691,11 @@ where
                                         );
 
                                         #[cfg(feature = "debug-map")]
-                                        {
-                                            use crate::debug_map::activity::{TileActivityTracker, TileCacheResult, TileOrigin};
-                                            let dbg_origin = if origin.is_fuse() { TileOrigin::Fuse } else { TileOrigin::Prefetch };
-                                            TileActivityTracker::global().record_with_tile(
-                                                tile_lat, tile_lon, tile.row, tile.col, tile.zoom,
-                                                dbg_origin, TileCacheResult::Generated,
-                                            );
-                                        }
+                                        record_debug_tile_activity(
+                                            tile_lat, tile_lon, tile.row, tile.col, tile.zoom,
+                                            origin.is_fuse(),
+                                            crate::debug_map::activity::TileCacheResult::Generated,
+                                        );
 
                                         d
                                     }

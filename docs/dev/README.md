@@ -49,6 +49,12 @@ Technical documentation for XEarthLayer developers and contributors.
 | [Prefetch Flight Test Plan](prefetch-flight-test-plan.md) | Flight test data informing prefetch design |
 | [Aircraft Telemetry Architecture](aircraft-telemetry-architecture.md) | X-Plane Web API telemetry integration (replaced ForeFlight/XGPS2 UDP in v0.4.0) |
 
+## Debugging Tools
+
+| Document | Description |
+|----------|-------------|
+| [Debug Map](debug-map.md) | Live browser map for prefetch observability (`--features debug-map`) |
+
 ## Operations
 
 | Document | Description |

@@ -57,6 +57,9 @@ let tileLayers = L.layerGroup().addTo(map);
 let firstUpdate = true;
 let followAircraft = true;
 
+// Format DSF coordinate with sign prefix (+48, -34)
+function dsfSign(n) { return n >= 0 ? '+' + n : String(n); }
+
 // Convert slippy map tile coords to lat/lon bounds
 function tileBounds(row, col, zoom) {
   const n = Math.pow(2, zoom);
@@ -187,8 +190,7 @@ function updateMap(data) {
     const bounds = [[r.lat, r.lon], [r.lat + 1, r.lon + 1]];
     const style = REGION_COLORS[r.state] || REGION_COLORS.no_coverage;
     const rect = L.rectangle(bounds, style);
-    const sign = (n) => n >= 0 ? '+' + n : String(n);
-    let tip = 'DSF ' + sign(r.lat) + sign(r.lon) + ': ' + r.state;
+    let tip = 'DSF ' + dsfSign(r.lat) + dsfSign(r.lon) + ': ' + r.state;
     if (r.fuse_hits || r.fuse_misses || r.prefetch_generated) {
       tip += '\nFUSE hits: ' + (r.fuse_hits || 0) + ', misses: ' + (r.fuse_misses || 0);
       tip += '\nPrefetch: ' + (r.prefetch_generated || 0);
@@ -213,7 +215,6 @@ function updateMap(data) {
         fillOpacity: isGenerated ? 0.4 : 0.2,
         weight: 0.5
       });
-      const sign = (n) => n >= 0 ? '+' + n : String(n);
       rect.bindTooltip('ZL' + t.zoom + ' (' + t.row + ',' + t.col + ')' +
         '\nOrigin: ' + t.origin + ', Result: ' + t.result +
         '\nPos: ' + t.lat.toFixed(3) + ', ' + t.lon.toFixed(3));
