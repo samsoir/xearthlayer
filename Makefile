@@ -79,6 +79,16 @@ release-profiling: verify ## Build release version with profiling support
 	$(CARGO) build --release --features profiling $(CARGO_FLAGS)
 	@echo "$(GREEN)Release build with profiling complete!$(NC)"
 
+.PHONY: debug-build
+debug-build: ## Build with debug map server (http://localhost:8087)
+	@echo "$(BLUE)Building with debug map...$(NC)"
+	$(CARGO) build --features debug-map $(CARGO_FLAGS)
+	@echo "$(GREEN)Debug map build complete!$(NC)"
+
+.PHONY: debug-run
+debug-run: ## Run with debug map server and debug logging
+	$(CARGO) run --features debug-map $(CARGO_FLAGS) -- run --debug
+
 .PHONY: install-profiling
 install-profiling: release-profiling ## Install binary with profiling support to $(BINDIR)
 	@echo "$(BLUE)Installing xearthlayer (profiling) to $(BINDIR)...$(NC)"
