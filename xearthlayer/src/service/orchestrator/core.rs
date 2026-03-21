@@ -1,0 +1,584 @@
+//! Core `ServiceOrchestrator` struct and implementation.
+
+use std::sync::Arc;
+
+use tokio::runtime::Handle;
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+use tracing::info;
+
+use crate::aircraft_position::{SharedAircraftPosition, StateAggregator};
+use crate::geo_index::GeoIndex;
+use crate::log::TracingLogger;
+use crate::manager::{
+    create_consolidated_overlay, InstalledPackage, LocalPackageStore, MountManager, ServiceBuilder,
+};
+use crate::metrics::TelemetrySnapshot;
+use crate::ortho_union::OrthoUnionIndex;
+use crate::prefetch::{
+    load_cache, save_cache, CacheLoadResult, FuseRequestAnalyzer, SceneryIndex, SceneryIndexConfig,
+    SharedPrefetchStatus,
+};
+use crate::runtime::{SharedRuntimeHealth, SharedTileProgressTracker};
+
+use super::super::error::ServiceError;
+use super::super::orchestrator_config::OrchestratorConfig;
+use super::super::XEarthLayerService;
+use super::types::{MountResult, PrefetchHandle, StartupProgress, StartupResult};
+
+/// Coordinates startup and operation of all XEarthLayer backend services.
+///
+/// This is the main entry point for the backend daemon. It encapsulates all
+/// service orchestration that was previously scattered in `run.rs`, providing
+/// a clean API for the CLI/TUI layer.
+///
+/// # Cache Architecture
+///
+/// The orchestrator no longer owns cache infrastructure directly. Instead,
+/// `XEarthLayerService::start()` creates the `CacheLayer` with proper metrics
+/// integration. This ensures the GC daemon has access to metrics for reporting
+/// cache evictions.
+pub struct ServiceOrchestrator {
+    /// Aircraft position provider (APT module).
+    pub(super) aircraft_position: SharedAircraftPosition,
+
+    /// Prefetch status for UI display.
+    pub(super) prefetch_status: Arc<SharedPrefetchStatus>,
+
+    /// Prefetch system handle.
+    pub(super) prefetch_handle: Option<PrefetchHandle>,
+
+    /// Mount manager (owns FUSE mounts).
+    pub(super) mount_manager: MountManager,
+
+    /// Service builder for creating services (consumed on mount).
+    pub(super) service_builder: Option<ServiceBuilder>,
+
+    /// Runtime health for control plane monitoring.
+    pub(super) runtime_health: Option<SharedRuntimeHealth>,
+
+    /// Tile progress tracker for active tile display.
+    pub(super) tile_progress_tracker: Option<SharedTileProgressTracker>,
+
+    /// Maximum concurrent jobs (for UI display).
+    pub(super) max_concurrent_jobs: usize,
+
+    /// FUSE request analyzer for position inference.
+    pub(super) fuse_analyzer: Option<Arc<FuseRequestAnalyzer>>,
+
+    /// Scenery index for prefetching.
+    pub(super) scenery_index: Arc<SceneryIndex>,
+
+    /// Master cancellation token.
+    pub(super) cancellation: CancellationToken,
+
+    /// X-Plane sim state from Web API (shared with prefetch coordinator).
+    pub(super) sim_state: crate::aircraft_position::web_api::SharedSimState,
+
+    /// Configuration (retained for accessors).
+    pub(super) config: OrchestratorConfig,
+}
+
+impl ServiceOrchestrator {
+    /// Start all backend services with the given configuration.
+    ///
+    /// This performs the complete startup sequence:
+    /// 1. Starts cache services (GC daemons auto-start)
+    /// 2. Creates service builder with cache bridges
+    /// 3. Creates mount manager
+    /// 4. Returns orchestrator ready for mounting
+    ///
+    /// Note: FUSE mounting is done separately via `mount_consolidated_ortho()`
+    /// to allow progress callbacks for the TUI loading screen.
+    pub fn start(config: OrchestratorConfig) -> Result<Self, ServiceError> {
+        info!("Starting ServiceOrchestrator");
+
+        let cancellation = CancellationToken::new();
+        let prefetch_status = SharedPrefetchStatus::new();
+
+        // Create FUSE request analyzer for position inference (if prefetch enabled)
+        let fuse_analyzer = if config.prefetch_enabled() {
+            Some(Arc::new(FuseRequestAnalyzer::new(
+                crate::prefetch::FuseInferenceConfig::default(),
+            )))
+        } else {
+            None
+        };
+
+        // Create service builder with disk I/O profile
+        // Note: Cache is now created inside XEarthLayerService::start() via CacheLayer,
+        // which ensures MetricsSystem is created FIRST, then CacheLayer with metrics.
+        // This fixes the GC daemon not having metrics client for eviction reporting.
+        let logger: Arc<dyn crate::log::Logger> = Arc::new(TracingLogger);
+        let mut service_builder = ServiceBuilder::with_disk_io_profile(
+            config.service.clone(),
+            config.provider.clone(),
+            logger,
+            config.disk_io_profile,
+        );
+
+        // Create mount manager with Custom Scenery path and FUSE kernel limits
+        let mut mount_manager = MountManager::with_scenery_path(&config.custom_scenery_path);
+        mount_manager.set_fuse_limits(config.fuse.max_background, config.fuse.congestion_threshold);
+
+        // Wire FUSE analyzer callback for position inference
+        if let Some(ref analyzer) = fuse_analyzer {
+            service_builder = service_builder.with_tile_request_callback(analyzer.callback());
+        }
+
+        // Create APT module (starts later with mount)
+        let (apt_broadcast_tx, _apt_broadcast_rx) = broadcast::channel(16);
+        let apt_aggregator = StateAggregator::new(apt_broadcast_tx);
+        let aircraft_position = SharedAircraftPosition::new(apt_aggregator);
+
+        // Create shared sim state for Web API adapter → prefetch coordinator
+        let sim_state = crate::aircraft_position::web_api::shared_sim_state();
+
+        // Create empty scenery index (populated during mount)
+        let scenery_index = Arc::new(SceneryIndex::with_defaults());
+
+        info!("ServiceOrchestrator initialized (mount pending)");
+
+        Ok(Self {
+            aircraft_position,
+            prefetch_status,
+            prefetch_handle: None,
+            mount_manager,
+            service_builder: Some(service_builder),
+            runtime_health: None,
+            tile_progress_tracker: None,
+            max_concurrent_jobs: 0,
+            fuse_analyzer,
+            scenery_index,
+            sim_state,
+            cancellation,
+            config,
+        })
+    }
+
+    /// Initialize all services with a single call.
+    ///
+    /// This is the recommended way to start XEarthLayer. It performs the complete
+    /// startup sequence in order:
+    ///
+    /// 1. Mount consolidated ortho (FUSE filesystem)
+    /// 2. Create overlay symlinks
+    /// 3. Start APT telemetry receiver
+    /// 4. Build scenery index (with cache support)
+    /// 5. Start prefetch system
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - Local package store for discovering packages
+    /// * `ortho_packages` - List of ortho packages to mount
+    /// * `progress_callback` - Optional callback for progress updates (for TUI)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let result = orchestrator.initialize_services(
+    ///     &store,
+    ///     &ortho_packages,
+    ///     Some(|progress| println!("{:?}", progress)),
+    /// )?;
+    /// ```
+    pub fn initialize_services<F>(
+        &mut self,
+        store: &LocalPackageStore,
+        ortho_packages: &[&InstalledPackage],
+        progress_callback: Option<F>,
+    ) -> Result<StartupResult, ServiceError>
+    where
+        F: Fn(StartupProgress) + Send + Sync + 'static,
+    {
+        // Wrap callback in Arc for sharing across phases
+        let callback: Option<Arc<dyn Fn(StartupProgress) + Send + Sync>> =
+            progress_callback.map(|f| Arc::new(f) as Arc<dyn Fn(StartupProgress) + Send + Sync>);
+
+        // Note: Disk cache scanning is now handled internally by XEarthLayerService::start()
+        // via CacheLayer, which scans and reports to metrics during service creation.
+        // This ensures proper metrics integration without needing external coordination.
+
+        // Phase 1: Mount consolidated ortho with progress
+        // This now uses XEarthLayerService::start() which creates CacheLayer with metrics
+        if let Some(ref cb) = callback {
+            cb(StartupProgress::ScanningDiskCache);
+        }
+
+        let mount_result = if let Some(ref cb) = callback {
+            // Convert our StartupProgress to the ortho_union IndexBuildProgress
+            let cb_clone = Arc::clone(cb);
+            let mount_progress = move |p: crate::ortho_union::IndexBuildProgress| {
+                cb_clone(StartupProgress::Mounting {
+                    phase: p.phase,
+                    current_source: p.current_source,
+                    sources_complete: p.sources_complete,
+                    sources_total: p.sources_total,
+                    files_scanned: p.files_scanned,
+                    using_cache: p.using_cache,
+                });
+            };
+            self.mount_consolidated_ortho_with_progress(store, Some(mount_progress))
+        } else {
+            self.mount_consolidated_ortho(store)
+        };
+
+        if !mount_result.success {
+            return Err(ServiceError::IoError(std::io::Error::other(
+                mount_result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Mount failed".to_string()),
+            )));
+        }
+
+        // Phase 2: Create overlay symlinks
+        if let Some(ref cb) = callback {
+            cb(StartupProgress::CreatingOverlay);
+        }
+        let overlay_result = create_consolidated_overlay(store, &self.config.custom_scenery_path);
+        let overlay_success = overlay_result.success;
+        let overlay_error = overlay_result.error.clone();
+        if let Some(ref error) = overlay_result.error {
+            tracing::warn!(error = %error, "Failed to create consolidated overlay");
+        }
+
+        // Phase 3: Start APT telemetry
+        if let Some(ref cb) = callback {
+            cb(StartupProgress::StartingTelemetry);
+        }
+        // Phase 3a: Start X-Plane Web API adapter (position + sim state)
+        if let Err(e) = self.start_web_api_adapter() {
+            tracing::warn!(error = %e, "Failed to start Web API adapter");
+        }
+
+        // Phase 4: Build scenery index (with cache support)
+        let packages_for_index: Vec<(String, std::path::PathBuf)> = ortho_packages
+            .iter()
+            .map(|p| (p.region().to_string(), p.path.clone()))
+            .collect();
+
+        let (scenery_tiles, scenery_from_cache) =
+            self.build_scenery_index(&packages_for_index, callback.as_ref())?;
+
+        // Phase 5: Start prefetch
+        if self.config.prefetch_enabled() {
+            if let Some(ref cb) = callback {
+                cb(StartupProgress::StartingPrefetch);
+            }
+            if let Err(e) = self.start_prefetch() {
+                tracing::warn!(error = %e, "Failed to start prefetch system");
+            }
+        }
+
+        // Signal completion
+        if let Some(ref cb) = callback {
+            cb(StartupProgress::Complete);
+        }
+
+        Ok(StartupResult {
+            mount: mount_result,
+            overlay_success,
+            overlay_error,
+            scenery_tiles,
+            scenery_from_cache,
+        })
+    }
+
+    /// Build the scenery index from packages, with cache support.
+    fn build_scenery_index(
+        &mut self,
+        packages: &[(String, std::path::PathBuf)],
+        callback: Option<&Arc<dyn Fn(StartupProgress) + Send + Sync>>,
+    ) -> Result<(usize, bool), ServiceError> {
+        // Try to load from cache first
+        match load_cache(packages) {
+            CacheLoadResult::Loaded {
+                tiles,
+                total_tiles,
+                sea_tiles,
+            } => {
+                tracing::info!(
+                    tiles = total_tiles,
+                    sea = sea_tiles,
+                    "Loaded scenery index from cache"
+                );
+
+                if let Some(cb) = callback {
+                    cb(StartupProgress::SceneryIndexComplete {
+                        total_tiles,
+                        land_tiles: total_tiles - sea_tiles,
+                        sea_tiles,
+                    });
+                }
+
+                let index = Arc::new(SceneryIndex::from_tiles(
+                    tiles,
+                    SceneryIndexConfig::default(),
+                ));
+                self.scenery_index = index;
+                return Ok((total_tiles, true));
+            }
+            CacheLoadResult::Stale { reason } => {
+                tracing::info!(reason = %reason, "Scenery cache is stale, rebuilding");
+            }
+            CacheLoadResult::NotFound => {
+                tracing::info!("No scenery cache found, building index");
+            }
+            CacheLoadResult::Invalid { error } => {
+                tracing::warn!(error = %error, "Scenery cache invalid, rebuilding");
+            }
+        }
+
+        // Build from scratch
+        let index = Arc::new(SceneryIndex::with_defaults());
+        let mut total_tiles = 0usize;
+
+        for (idx, (region, path)) in packages.iter().enumerate() {
+            if let Some(cb) = callback {
+                cb(StartupProgress::BuildingSceneryIndex {
+                    package_name: region.clone(),
+                    package_index: idx,
+                    total_packages: packages.len(),
+                    tiles_indexed: total_tiles,
+                    from_cache: false,
+                });
+            }
+
+            match index.build_from_package(path) {
+                Ok(count) => {
+                    total_tiles += count;
+                    tracing::debug!(
+                        region = %region,
+                        tiles = count,
+                        "Indexed scenery package"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        region = %region,
+                        error = %e,
+                        "Failed to index scenery package"
+                    );
+                }
+            }
+        }
+
+        // Save cache for next launch
+        if total_tiles > 0 {
+            if let Err(e) = save_cache(&index, packages) {
+                tracing::warn!(error = %e, "Failed to save scenery cache");
+            }
+        }
+
+        if let Some(cb) = callback {
+            cb(StartupProgress::SceneryIndexComplete {
+                total_tiles,
+                land_tiles: index.land_tile_count(),
+                sea_tiles: index.sea_tile_count(),
+            });
+        }
+
+        self.scenery_index = index;
+        Ok((total_tiles, false))
+    }
+
+    /// Mount consolidated ortho scenery.
+    ///
+    /// This mounts all ortho sources (patches + packages) into a single FUSE mount.
+    /// Call this after `start()` to activate the FUSE filesystem.
+    ///
+    /// For TUI mode, use `mount_consolidated_ortho_with_progress()` instead.
+    pub fn mount_consolidated_ortho(&mut self, store: &LocalPackageStore) -> MountResult {
+        let service_builder = self
+            .service_builder
+            .take()
+            .expect("Service builder should be set - was mount_consolidated_ortho called twice?");
+
+        let result = self.mount_manager.mount_consolidated_ortho(
+            &self.config.patches_dir,
+            store,
+            &service_builder,
+        );
+
+        // Wire runtime health after mount
+        self.wire_runtime_health();
+
+        MountResult {
+            success: result.success,
+            error: result.error,
+            source_count: result.source_count,
+            file_count: result.file_count,
+            patch_names: result.patch_names,
+            package_regions: result.package_regions,
+            mountpoint: result.mountpoint,
+        }
+    }
+
+    /// Mount with progress callback for TUI loading screen.
+    pub fn mount_consolidated_ortho_with_progress<F>(
+        &mut self,
+        store: &LocalPackageStore,
+        progress_callback: Option<F>,
+    ) -> MountResult
+    where
+        F: Fn(crate::ortho_union::IndexBuildProgress) + Send + Sync + 'static,
+    {
+        let service_builder = self
+            .service_builder
+            .take()
+            .expect("Service builder should be set - was mount_consolidated_ortho called twice?");
+
+        let callback = progress_callback
+            .map(|f| Arc::new(f) as crate::ortho_union::IndexBuildProgressCallback);
+
+        let result = self.mount_manager.mount_consolidated_ortho_with_progress(
+            &self.config.patches_dir,
+            store,
+            &service_builder,
+            callback,
+        );
+
+        // Wire runtime health after mount
+        self.wire_runtime_health();
+
+        MountResult {
+            success: result.success,
+            error: result.error,
+            source_count: result.source_count,
+            file_count: result.file_count,
+            patch_names: result.patch_names,
+            package_regions: result.package_regions,
+            mountpoint: result.mountpoint,
+        }
+    }
+
+    /// Wire runtime health and tile progress from mounted service.
+    fn wire_runtime_health(&mut self) {
+        if let Some(service) = self.mount_manager.get_service() {
+            self.runtime_health = service.runtime_health();
+            self.tile_progress_tracker = service.tile_progress_tracker();
+            self.max_concurrent_jobs = service.max_concurrent_jobs();
+        }
+    }
+
+    /// Update the scenery index (called after building).
+    pub fn set_scenery_index(&mut self, index: Arc<SceneryIndex>) {
+        self.scenery_index = index;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Accessors for TUI integration
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Get the aircraft position provider for TUI display.
+    pub fn aircraft_position(&self) -> SharedAircraftPosition {
+        self.aircraft_position.clone()
+    }
+
+    /// Get the shared sim state from the X-Plane Web API adapter.
+    pub fn sim_state(&self) -> crate::aircraft_position::web_api::SharedSimState {
+        self.sim_state.clone()
+    }
+
+    /// Get the prefetch status for TUI display.
+    pub fn prefetch_status(&self) -> Arc<SharedPrefetchStatus> {
+        Arc::clone(&self.prefetch_status)
+    }
+
+    /// Get runtime health for control plane display.
+    pub fn runtime_health(&self) -> Option<SharedRuntimeHealth> {
+        self.runtime_health.clone()
+    }
+
+    /// Get tile progress tracker for active tile display in TUI.
+    pub fn tile_progress_tracker(&self) -> Option<SharedTileProgressTracker> {
+        self.tile_progress_tracker.clone()
+    }
+
+    /// Get maximum concurrent jobs for UI display.
+    pub fn max_concurrent_jobs(&self) -> usize {
+        self.max_concurrent_jobs
+    }
+
+    /// Get aggregated telemetry snapshot for UI display.
+    pub fn telemetry_snapshot(&self) -> TelemetrySnapshot {
+        self.mount_manager.aggregated_telemetry()
+    }
+
+    /// Get the cancellation token (for coordinating shutdown).
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    /// Get the OrthoUnionIndex if available.
+    pub fn ortho_union_index(&self) -> Option<Arc<OrthoUnionIndex>> {
+        self.mount_manager.ortho_union_index()
+    }
+
+    /// Get the GeoIndex if available.
+    pub fn geo_index(&self) -> Option<Arc<GeoIndex>> {
+        self.mount_manager.geo_index()
+    }
+
+    /// Get mutable access to the mount manager.
+    pub fn mount_manager(&mut self) -> &mut MountManager {
+        &mut self.mount_manager
+    }
+
+    /// Get the underlying service if mounted.
+    pub fn service(&self) -> Option<&XEarthLayerService> {
+        self.mount_manager.get_service()
+    }
+
+    /// Get the configuration.
+    pub fn config(&self) -> &OrchestratorConfig {
+        &self.config
+    }
+
+    /// Get the Tokio runtime handle from the underlying service.
+    ///
+    /// Returns None if no service is mounted yet.
+    pub fn runtime_handle(&self) -> Option<Handle> {
+        self.mount_manager
+            .get_service()
+            .map(|s| s.runtime_handle().clone())
+    }
+
+    /// Get the scenery index.
+    pub fn scenery_index(&self) -> &Arc<SceneryIndex> {
+        &self.scenery_index
+    }
+
+    /// Get the FUSE analyzer for position inference.
+    pub fn fuse_analyzer(&self) -> Option<Arc<FuseRequestAnalyzer>> {
+        self.fuse_analyzer.clone()
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Shutdown
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Gracefully shutdown all services.
+    ///
+    /// This shuts down services in reverse order of startup:
+    /// 1. Cancel prefetch and other async tasks
+    /// 2. Unmount FUSE (which drops the service and its cache layer)
+    ///
+    /// Note: Cache services (with GC daemons) are now owned by `XEarthLayerService`
+    /// via `CacheLayer`, so they are automatically shut down when the service is dropped
+    /// during FUSE unmount.
+    pub fn shutdown(mut self) {
+        info!("Shutting down ServiceOrchestrator");
+
+        // 1. Cancel all async tasks
+        self.cancellation.cancel();
+
+        // 2. Unmount all FUSE filesystems
+        // This drops the XEarthLayerService, which owns the CacheLayer with GC daemon
+        self.mount_manager.unmount_all();
+        info!("FUSE mounts unmounted (cache services shutdown via service drop)");
+
+        info!("ServiceOrchestrator shutdown complete");
+    }
+}

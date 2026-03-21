@@ -20,7 +20,7 @@ The `TransitionThrottle` fires at Ground→Cruise (GS ≥ 40kt) with a fixed 45-
 
 3. **Cold start gap**: When the grace period ends and the ramp begins, the aircraft is already in cruise needing tiles that were never prefetched. The 45s + 30s = 75 seconds of reduced/zero prefetch creates a cache gap that takes minutes to recover from.
 
-4. **No AGL data**: The `PhaseDetector` receives `agl_ft = 0.0` because XGPS2/ForeFlight telemetry provides MSL altitude, not AGL. The phase detector effectively only uses ground speed for phase detection.
+4. **No AGL data**: The `PhaseDetector` receives `agl_ft = 0.0` because telemetry provides MSL altitude, not AGL. The phase detector effectively only uses ground speed for phase detection. *(Note: v0.4.0 replaced XGPS2/ForeFlight UDP with the X-Plane Web API, which also provides MSL.)*
 
 ### Observed Impact
 
@@ -163,7 +163,7 @@ Changes to `process_telemetry()`:
 let phase_changed = self.phase_detector.update(ground_speed_kt, agl_ft);
 
 // New:
-let msl_ft = state.altitude; // MSL from XGPS2/ForeFlight telemetry
+let msl_ft = state.altitude; // MSL from X-Plane Web API telemetry
 let phase_changed = self.phase_detector.update(ground_speed_kt, msl_ft);
 ```
 
@@ -245,7 +245,7 @@ pub struct AdaptivePrefetchConfig {
 
 Three throttling mechanisms operate independently and stack multiplicatively:
 
-1. **Circuit breaker** (resource pools > 90%): Blocks prefetch entirely when system is saturated. Unchanged.
+1. **SimState detection** (X-Plane scene loading): Blocks prefetch entirely when X-Plane is loading scenery. *(Replaced the CircuitBreaker in v0.4.0 — SimState is obtained via the X-Plane Web API.)*
 2. **Executor backpressure** (50%/80% load): Reduces/defers submission. Unchanged.
 3. **TransitionThrottle** (phase-driven): Holds during Transition, ramps on Cruise entry.
 
@@ -371,7 +371,7 @@ At worst during ramp-up with moderate load: `0.25 × 0.5 = 12.5%` effective subm
 
 ### What Does NOT Change
 
-- **Circuit breaker** — still monitors resource pool utilization
+- **SimState detection** — still pauses prefetch during scene loading *(replaced CircuitBreaker in v0.4.0)*
 - **Executor backpressure** — still checks `executor_load()`
 - **Band calculator / strategies** — geometry unchanged
 - **BoundaryPrioritizer** — tile ordering unchanged
@@ -390,7 +390,7 @@ At worst during ramp-up with moderate load: `0.25 × 0.5 = 12.5%` effective subm
 
 ### Explicitly Deferred
 - **Landing/approach detection** — Deferred to scenery prefetch redesign. Landing is a warm-state problem (tiles should be pre-cached from cruise prefetch). The geospatially-aware prefetch system will naturally handle the edge case of landing near a DSF boundary.
-- **Startup ramp** — Not needed. Ground strategy starts at full rate, and the circuit breaker handles resource contention during X-Plane's initial scene load.
+- **Startup ramp** — Not needed. Ground strategy starts at full rate, and SimState detection handles resource contention during X-Plane's initial scene load.
 - **Band geometry changes** — Separate concern addressed in the scenery prefetch redesign.
 
 ---

@@ -4,10 +4,8 @@
 //! needed to start the complete XEarthLayer backend services stack.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use crate::config::{ConfigFile, DiskIoProfile};
-use crate::prefetch::CircuitBreakerConfig;
 use crate::provider::ProviderConfig;
 use crate::service::ServiceConfig;
 
@@ -60,9 +58,6 @@ pub struct OrchestratorConfig {
     /// Prewarm configuration.
     pub prewarm: PrewarmConfig,
 
-    /// Online network position configuration.
-    pub online_network: OnlineNetworkConfig,
-
     /// FUSE kernel configuration.
     pub fuse: FuseConfig,
 
@@ -82,17 +77,14 @@ pub struct PrefetchConfig {
     /// Adaptive prefetch mode: "auto", "aggressive", "opportunistic", or "disabled".
     pub mode: String,
 
-    /// UDP port for telemetry reception.
-    pub udp_port: u16,
+    /// Web API port for X-Plane SimState polling.
+    pub web_api_port: u16,
 
     /// Maximum tiles to prefetch per cycle.
     pub max_tiles_per_cycle: usize,
 
     /// Cycle interval (milliseconds).
     pub cycle_interval_ms: u64,
-
-    /// Circuit breaker configuration.
-    pub circuit_breaker: CircuitBreakerConfig,
 
     /// Calibration: aggressive mode threshold (tiles/sec).
     pub calibration_aggressive_threshold: f64,
@@ -163,28 +155,6 @@ pub struct FuseConfig {
     pub congestion_threshold: u16,
 }
 
-/// Online network position configuration extracted from ConfigFile.
-#[derive(Clone, Debug)]
-pub struct OnlineNetworkConfig {
-    /// Whether online network position fetching is enabled.
-    pub enabled: bool,
-
-    /// Network type: "vatsim", "ivao", or "pilotedge".
-    pub network_type: String,
-
-    /// Pilot identifier (CID for VATSIM).
-    pub pilot_id: u64,
-
-    /// API URL (for VATSIM, the status endpoint).
-    pub api_url: String,
-
-    /// Poll interval in seconds.
-    pub poll_interval_secs: u64,
-
-    /// Maximum age in seconds before data is considered stale.
-    pub max_stale_secs: u64,
-}
-
 impl OrchestratorConfig {
     /// Create orchestrator configuration from CLI config file.
     ///
@@ -225,15 +195,9 @@ impl OrchestratorConfig {
             enabled: config.prefetch.enabled,
             strategy: config.prefetch.strategy.clone(),
             mode: config.prefetch.mode.clone(),
-            udp_port: config.prefetch.udp_port,
+            web_api_port: config.prefetch.web_api_port,
             max_tiles_per_cycle: config.prefetch.max_tiles_per_cycle,
             cycle_interval_ms: config.prefetch.cycle_interval_ms,
-            circuit_breaker: CircuitBreakerConfig {
-                open_duration: Duration::from_millis(config.prefetch.circuit_breaker_open_ms),
-                half_open_duration: Duration::from_secs(
-                    config.prefetch.circuit_breaker_half_open_secs,
-                ),
-            },
             calibration_aggressive_threshold: config.prefetch.calibration_aggressive_threshold,
             calibration_opportunistic_threshold: config
                 .prefetch
@@ -260,16 +224,6 @@ impl OrchestratorConfig {
             batch_size: 50, // Fixed batch size for now
         };
 
-        // Extract online network configuration
-        let online_network = OnlineNetworkConfig {
-            enabled: config.online_network.enabled,
-            network_type: config.online_network.network_type.clone(),
-            pilot_id: config.online_network.pilot_id,
-            api_url: config.online_network.api_url.clone(),
-            poll_interval_secs: config.online_network.poll_interval_secs,
-            max_stale_secs: config.online_network.max_stale_secs,
-        };
-
         // Extract FUSE configuration
         let fuse = FuseConfig {
             max_background: config.fuse.max_background,
@@ -286,7 +240,6 @@ impl OrchestratorConfig {
             disk_io_profile: config.cache.disk_io_profile,
             prefetch,
             prewarm,
-            online_network,
             fuse,
             tui_mode,
         }
@@ -362,7 +315,10 @@ mod tests {
         );
 
         // Verify prefetch config was extracted
-        assert_eq!(orch_config.prefetch.udp_port, config.prefetch.udp_port);
+        assert_eq!(
+            orch_config.prefetch.web_api_port,
+            config.prefetch.web_api_port
+        );
         assert_eq!(orch_config.prefetch.strategy, config.prefetch.strategy);
     }
 }

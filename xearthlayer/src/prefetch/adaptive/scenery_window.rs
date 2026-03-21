@@ -488,14 +488,12 @@ mod tests {
     /// Mock SceneTracker that returns controlled bounds.
     struct MockSceneTracker {
         bounds: std::sync::Mutex<Option<GeoBounds>>,
-        burst_active: std::sync::atomic::AtomicBool,
     }
 
     impl MockSceneTracker {
         fn new() -> Self {
             Self {
                 bounds: std::sync::Mutex::new(None),
-                burst_active: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -515,12 +513,6 @@ mod tests {
         }
         fn is_tile_requested(&self, _tile: &DdsTileCoord) -> bool {
             false
-        }
-        fn is_burst_active(&self) -> bool {
-            self.burst_active.load(std::sync::atomic::Ordering::Relaxed)
-        }
-        fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
-            vec![]
         }
         fn total_requests(&self) -> u64 {
             0

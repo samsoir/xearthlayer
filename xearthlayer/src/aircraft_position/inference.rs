@@ -2,14 +2,12 @@
 //!
 //! When telemetry is unavailable, the APT module can infer approximate
 //! aircraft position from the Scene Tracker's loaded bounds. This adapter
-//! subscribes to Scene Tracker burst events and periodically queries
-//! the loaded bounds to derive position.
+//! periodically queries the loaded bounds to derive position.
 //!
 //! # Triggers
 //!
-//! Position inference occurs on:
-//! 1. **Burst completion** - When Scene Tracker detects a loading burst has ended
-//! 2. **Fallback timer** - Every 30 seconds for steady-state flying
+//! Position inference occurs on a periodic timer (every 30 seconds by default)
+//! for steady-state flying.
 //!
 //! # Accuracy
 //!
@@ -20,19 +18,18 @@
 //!
 //! ```ignore
 //! let scene_tracker: Arc<dyn SceneTracker> = /* ... */;
-//! let burst_rx = scene_tracker.subscribe_bursts();
 //! let (tx, rx) = mpsc::channel(16);
 //!
-//! let adapter = InferenceAdapter::new(scene_tracker, burst_rx, tx);
+//! let adapter = InferenceAdapter::new(scene_tracker, tx);
 //! let handle = adapter.start();
 //! ```
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
-use crate::scene_tracker::{LoadingBurst, SceneTracker};
+use crate::scene_tracker::SceneTracker;
 
 use super::state::AircraftState;
 
@@ -53,14 +50,10 @@ impl Default for InferenceAdapterConfig {
 
 /// Inference adapter - derives position from Scene Tracker.
 ///
-/// Subscribes to burst completion events and periodically queries
-/// loaded bounds to infer aircraft position.
+/// Periodically queries loaded bounds to infer aircraft position.
 pub struct InferenceAdapter {
     /// Scene Tracker for querying loaded bounds.
     scene_tracker: Arc<dyn SceneTracker>,
-
-    /// Receiver for burst completion events.
-    burst_rx: broadcast::Receiver<LoadingBurst>,
 
     /// Channel to send inferred position updates.
     state_tx: mpsc::Sender<AircraftState>,
@@ -73,12 +66,10 @@ impl InferenceAdapter {
     /// Create a new inference adapter.
     pub fn new(
         scene_tracker: Arc<dyn SceneTracker>,
-        burst_rx: broadcast::Receiver<LoadingBurst>,
         state_tx: mpsc::Sender<AircraftState>,
     ) -> Self {
         Self {
             scene_tracker,
-            burst_rx,
             state_tx,
             config: InferenceAdapterConfig::default(),
         }
@@ -87,13 +78,11 @@ impl InferenceAdapter {
     /// Create with custom configuration.
     pub fn with_config(
         scene_tracker: Arc<dyn SceneTracker>,
-        burst_rx: broadcast::Receiver<LoadingBurst>,
         state_tx: mpsc::Sender<AircraftState>,
         config: InferenceAdapterConfig,
     ) -> Self {
         Self {
             scene_tracker,
-            burst_rx,
             state_tx,
             config,
         }
@@ -101,8 +90,7 @@ impl InferenceAdapter {
 
     /// Start the inference adapter.
     ///
-    /// Spawns an async task that listens for burst events and
-    /// periodically infers position.
+    /// Spawns an async task that periodically infers position.
     pub fn start(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             self.run().await;
@@ -110,7 +98,7 @@ impl InferenceAdapter {
     }
 
     /// Run the inference loop.
-    async fn run(mut self) {
+    async fn run(self) {
         tracing::debug!("Inference adapter started");
 
         let mut fallback_interval = tokio::time::interval(self.config.fallback_interval);
@@ -118,35 +106,10 @@ impl InferenceAdapter {
         fallback_interval.tick().await;
 
         loop {
-            tokio::select! {
-                // Trigger 1: Burst completed
-                result = self.burst_rx.recv() => {
-                    match result {
-                        Ok(_burst) => {
-                            tracing::trace!("Burst completed, inferring position");
-                            self.infer_and_send().await;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            tracing::debug!("Burst channel closed, stopping inference adapter");
-                            break;
-                        }
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(skipped = n, "Inference adapter lagged behind burst events");
-                            // Still try to infer from current state
-                            self.infer_and_send().await;
-                        }
-                    }
-                }
-
-                // Trigger 2: Fallback timer (for steady-state flying)
-                _ = fallback_interval.tick() => {
-                    tracing::trace!("Fallback timer, inferring position");
-                    self.infer_and_send().await;
-                }
-            }
+            fallback_interval.tick().await;
+            tracing::trace!("Fallback timer, inferring position");
+            self.infer_and_send().await;
         }
-
-        tracing::debug!("Inference adapter stopped");
     }
 
     /// Infer position from Scene Tracker and send to aggregator.
@@ -202,14 +165,6 @@ mod tests {
             false
         }
 
-        fn is_burst_active(&self) -> bool {
-            false
-        }
-
-        fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
-            Vec::new()
-        }
-
         fn total_requests(&self) -> u64 {
             0
         }
@@ -223,7 +178,7 @@ mod tests {
         }
 
         fn loaded_bounds(&self) -> Option<GeoBounds> {
-            self.bounds.clone()
+            self.bounds
         }
     }
 
@@ -237,10 +192,9 @@ mod tests {
         };
         let tracker = Arc::new(MockSceneTracker::with_bounds(bounds));
 
-        let (burst_tx, burst_rx) = broadcast::channel(16);
         let (state_tx, mut state_rx) = mpsc::channel(16);
 
-        let adapter = InferenceAdapter::new(tracker, burst_rx, state_tx);
+        let adapter = InferenceAdapter::new(tracker, state_tx);
 
         // Manually trigger inference
         adapter.infer_and_send().await;
@@ -253,25 +207,20 @@ mod tests {
             state.source,
             super::super::state::PositionSource::SceneInference
         );
-
-        drop(burst_tx); // Clean up
     }
 
     #[tokio::test]
     async fn test_no_inference_without_bounds() {
         let tracker = Arc::new(MockSceneTracker::empty());
 
-        let (burst_tx, burst_rx) = broadcast::channel(16);
         let (state_tx, mut state_rx) = mpsc::channel(16);
 
-        let adapter = InferenceAdapter::new(tracker, burst_rx, state_tx);
+        let adapter = InferenceAdapter::new(tracker, state_tx);
 
         // Manually trigger inference
         adapter.infer_and_send().await;
 
         // Should not receive any state
         assert!(state_rx.try_recv().is_err());
-
-        drop(burst_tx); // Clean up
     }
 }

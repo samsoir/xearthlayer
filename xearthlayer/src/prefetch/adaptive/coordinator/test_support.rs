@@ -16,7 +16,6 @@ use crate::executor::{DdsClient, DdsClientError, Priority};
 use crate::prefetch::adaptive::calibration::{PerformanceCalibration, StrategyMode};
 use crate::prefetch::adaptive::strategy::PrefetchPlan;
 use crate::prefetch::state::AircraftState;
-use crate::prefetch::throttler::{PrefetchThrottler, ThrottleState};
 use crate::prefetch::SceneryIndex;
 use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
 use crate::scene_tracker::{DdsTileCoord, GeoBounds, GeoRegion, SceneTracker};
@@ -120,12 +119,6 @@ impl SceneTracker for DummyTracker {
     fn is_tile_requested(&self, _tile: &DdsTileCoord) -> bool {
         false
     }
-    fn is_burst_active(&self) -> bool {
-        false
-    }
-    fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
-        vec![]
-    }
     fn total_requests(&self) -> u64 {
         0
     }
@@ -180,12 +173,6 @@ impl SceneTracker for StableBoundsTracker {
     fn is_tile_requested(&self, _tile: &DdsTileCoord) -> bool {
         false
     }
-    fn is_burst_active(&self) -> bool {
-        false
-    }
-    fn current_burst_tiles(&self) -> Vec<DdsTileCoord> {
-        vec![]
-    }
     fn total_requests(&self) -> u64 {
         0
     }
@@ -196,23 +183,7 @@ impl SceneTracker for StableBoundsTracker {
         false
     }
     fn loaded_bounds(&self) -> Option<GeoBounds> {
-        Some(self.bounds.clone())
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PrefetchThrottler mocks
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Mock throttler that always signals to throttle.
-pub(crate) struct AlwaysThrottle;
-
-impl PrefetchThrottler for AlwaysThrottle {
-    fn should_throttle(&self) -> bool {
-        true
-    }
-    fn state(&self) -> ThrottleState {
-        ThrottleState::Paused
+        Some(self.bounds)
     }
 }
 

@@ -137,8 +137,8 @@ pub const DEFAULT_GENERATION_TIMEOUT_SECS: u64 = 10;
 // Prefetch defaults
 // =============================================================================
 
-/// Default UDP port for X-Plane telemetry (ForeFlight protocol).
-pub const DEFAULT_PREFETCH_UDP_PORT: u16 = 49002;
+/// Default Web API port for X-Plane SimState polling.
+pub const DEFAULT_WEB_API_PORT: u16 = 8086;
 
 /// Default maximum tiles to submit per prefetch cycle.
 /// This controls queue depth, not processing rate — actual CPU consumption
@@ -147,14 +147,6 @@ pub const DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE: usize = 200;
 
 /// Default interval between prefetch cycles in milliseconds.
 pub const DEFAULT_PREFETCH_CYCLE_INTERVAL_MS: u64 = 2000;
-
-/// Default duration (milliseconds) resource saturation must be sustained to open circuit.
-/// Set low (500ms) to catch bursty scene loading patterns quickly.
-pub const DEFAULT_CIRCUIT_BREAKER_OPEN_MS: u64 = 500;
-
-/// Default cooloff time (seconds) before trying to close the circuit.
-/// Set to 2 seconds for faster recovery after load drops.
-pub const DEFAULT_CIRCUIT_BREAKER_HALF_OPEN_SECS: u64 = 2;
 
 // =============================================================================
 // Adaptive prefetch calibration defaults
@@ -366,11 +358,9 @@ impl Default for ConfigFile {
                 enabled: true,
                 strategy: "adaptive".to_string(),
                 mode: "auto".to_string(),
-                udp_port: DEFAULT_PREFETCH_UDP_PORT,
+                web_api_port: DEFAULT_WEB_API_PORT,
                 max_tiles_per_cycle: DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE,
                 cycle_interval_ms: DEFAULT_PREFETCH_CYCLE_INTERVAL_MS,
-                circuit_breaker_open_ms: DEFAULT_CIRCUIT_BREAKER_OPEN_MS,
-                circuit_breaker_half_open_secs: DEFAULT_CIRCUIT_BREAKER_HALF_OPEN_SECS,
                 calibration_aggressive_threshold: DEFAULT_CALIBRATION_AGGRESSIVE_THRESHOLD,
                 calibration_opportunistic_threshold: DEFAULT_CALIBRATION_OPPORTUNISTIC_THRESHOLD,
                 calibration_sample_duration: DEFAULT_CALIBRATION_SAMPLE_DURATION,
@@ -412,7 +402,6 @@ impl Default for ConfigFile {
                 max_retries: DEFAULT_MAX_RETRIES,
                 retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
             },
-            online_network: OnlineNetworkSettings::default(),
             fuse: FuseSettings {
                 max_background: DEFAULT_FUSE_MAX_BACKGROUND,
                 congestion_threshold: DEFAULT_FUSE_CONGESTION_THRESHOLD,

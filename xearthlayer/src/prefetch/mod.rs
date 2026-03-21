@@ -16,8 +16,7 @@
 //!                                    AdaptivePrefetchCoordinator
 //!                                      ├─ PhaseDetector (ground/cruise)
 //!                                      ├─ GroundStrategy (ring prefetch)
-//!                                      ├─ BoundaryStrategy (DSF region prefetch)
-//!                                      └─ CircuitBreaker (load detection)
+//!                                      └─ BoundaryStrategy (DSF region prefetch)
 //!                                              ↓
 //!                                       DdsClient → Executor
 //! ```
@@ -36,38 +35,31 @@
 
 pub mod adaptive;
 mod builder;
-mod circuit_breaker;
 mod condition;
 pub mod config;
 pub mod coordinates;
 mod error;
 pub mod inference;
 mod listener;
-mod load_monitor;
 mod prewarm;
 pub mod scenery_cache;
 mod scenery_index;
 mod state;
 mod strategy;
-mod throttler;
 pub mod tile_based;
 pub mod types;
 
-pub use circuit_breaker::{
-    CircuitBreaker, CircuitBreakerConfig, CircuitState, RESOURCE_SATURATION_THRESHOLD,
-};
 pub use condition::{
     AlwaysActiveCondition, MinimumSpeedCondition, NeverActiveCondition, PrefetchCondition,
 };
 pub use error::PrefetchError;
 pub use listener::TelemetryListener;
-pub use load_monitor::{FuseLoadMonitor, SharedFuseLoadMonitor};
+pub use state::CircuitState;
 pub use state::{
     AircraftSnapshot, AircraftState, DetailedPrefetchStats, GpsStatus, PrefetchMode,
     PrefetchStatsSnapshot, PrefetchStatusSnapshot, SharedPrefetchStatus,
 };
 pub use strategy::Prefetcher;
-pub use throttler::{AlwaysThrottle, NeverThrottle, PrefetchThrottler, ThrottleState};
 
 // FUSE inference (still used by FUSE layer for position callbacks)
 pub use config::FuseInferenceConfig;

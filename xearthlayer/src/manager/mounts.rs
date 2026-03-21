@@ -29,7 +29,7 @@ use crate::package::{
 use crate::panic as panic_handler;
 use crate::patches::{extract_dsf_regions, PatchDiscovery};
 use crate::prefetch::tile_based::DdsAccessEvent;
-use crate::prefetch::{FuseLoadMonitor, TileRequestCallback};
+use crate::prefetch::TileRequestCallback;
 use crate::scene_tracker::{DefaultSceneTracker, FuseAccessEvent};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
 
@@ -136,12 +136,8 @@ pub struct MountManager {
     /// Scene Tracker for empirical X-Plane request tracking.
     ///
     /// This serves as the single source of truth for:
-    /// - Load monitoring (implements [`FuseLoadMonitor`] for circuit breaker)
     /// - Tile tracking (which DDS tiles X-Plane has requested)
     /// - Burst detection (identifying loading patterns)
-    ///
-    /// FUSE calls `scene_tracker.record_request()` for immediate visibility
-    /// and sends detailed events via channel for async processing.
     scene_tracker: Arc<DefaultSceneTracker>,
     /// Active patches union filesystem mount (if any).
     patches_session: Option<SpawnedMountHandle>,
@@ -700,19 +696,6 @@ impl MountManager {
             .or_else(|| self.services.values().next())
     }
 
-    /// Get the load monitor for circuit breaker integration.
-    ///
-    /// Returns the Scene Tracker as a [`FuseLoadMonitor`], which serves as the
-    /// single source of truth for X-Plane load detection. The circuit breaker
-    /// uses this to detect when X-Plane is actively loading scenery.
-    ///
-    /// Note: This returns the Scene Tracker cast to `FuseLoadMonitor`. For full
-    /// Scene Tracker functionality (tile tracking, burst detection), use
-    /// [`scene_tracker()`] instead.
-    pub fn load_monitor(&self) -> Arc<dyn FuseLoadMonitor> {
-        Arc::clone(&self.scene_tracker) as Arc<dyn FuseLoadMonitor>
-    }
-
     /// Get the Scene Tracker for empirical X-Plane request tracking.
     ///
     /// The Scene Tracker maintains an empirical model of what X-Plane has
@@ -721,14 +704,8 @@ impl MountManager {
     /// - Burst detection for loading patterns
     /// - Geographic region tracking
     ///
-    /// It also implements [`FuseLoadMonitor`] for circuit breaker integration.
     pub fn scene_tracker(&self) -> Arc<DefaultSceneTracker> {
         Arc::clone(&self.scene_tracker)
-    }
-
-    /// Get the current count of FUSE-originated requests across all services.
-    pub fn fuse_jobs_submitted(&self) -> u64 {
-        FuseLoadMonitor::total_requests(&*self.scene_tracker)
     }
 
     /// Get aggregated telemetry from all mounted services.
@@ -880,7 +857,6 @@ impl Drop for MountManager {
 /// When multiple packages are mounted, all services share:
 /// - A single disk I/O concurrency limiter to prevent I/O exhaustion
 /// - A single memory cache to respect the configured memory limit globally
-/// - A single FUSE jobs counter for circuit breaker
 pub struct ServiceBuilder {
     service_config: ServiceConfig,
     provider_config: crate::provider::ProviderConfig,
@@ -903,9 +879,6 @@ pub struct ServiceBuilder {
     /// Shared tile request callback for FUSE-based position inference.
     /// When set, all services forward tile requests to this callback.
     tile_request_callback: Option<TileRequestCallback>,
-    /// Shared load monitor for circuit breaker integration.
-    /// All services call `record_request()` for FUSE-originated requests.
-    load_monitor: Arc<dyn FuseLoadMonitor>,
 }
 
 /// Cache bridges from the new CacheService architecture.
@@ -1018,7 +991,6 @@ impl ServiceBuilder {
             shared_memory_cache_adapter,
             cache_bridges: None,
             tile_request_callback: None,
-            load_monitor: Arc::new(DefaultSceneTracker::with_defaults()), // Default, can be overridden
         }
     }
 
@@ -1057,16 +1029,6 @@ impl ServiceBuilder {
         self.cache_bridges.as_ref()
     }
 
-    /// Set the shared load monitor for circuit breaker integration.
-    ///
-    /// When set, all services built by this builder will call `record_request()`
-    /// on this monitor for FUSE-originated requests. This enables the circuit
-    /// breaker to track aggregate load across all mounted packages.
-    pub fn with_load_monitor(mut self, monitor: Arc<dyn FuseLoadMonitor>) -> Self {
-        self.load_monitor = monitor;
-        self
-    }
-
     /// Set the tile request callback for FUSE-based position inference.
     ///
     /// When set, all services built by this builder will forward tile requests
@@ -1097,9 +1059,6 @@ impl ServiceBuilder {
             service.set_tile_request_callback(callback.clone());
         }
 
-        // Wire load monitor for circuit breaker integration
-        service.set_load_monitor(Arc::clone(&self.load_monitor));
-
         Ok(service)
     }
 
@@ -1115,9 +1074,6 @@ impl ServiceBuilder {
         if let Some(ref callback) = self.tile_request_callback {
             service.set_tile_request_callback(callback.clone());
         }
-
-        // Wire load monitor for circuit breaker integration
-        service.set_load_monitor(Arc::clone(&self.load_monitor));
 
         Ok(service)
     }
@@ -1192,9 +1148,6 @@ impl ServiceBuilder {
         if let Some(ref callback) = self.tile_request_callback {
             service.set_tile_request_callback(callback.clone());
         }
-
-        // Wire load monitor for circuit breaker integration
-        service.set_load_monitor(Arc::clone(&self.load_monitor));
 
         tracing::info!(
             "Built service with integrated cache and metrics (XEarthLayerService::start)"

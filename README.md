@@ -49,7 +49,6 @@ See [How It Works](docs/how-it-works.md) for detailed architecture.
   - Flight phase detection: Ground (ring pattern) vs Cruise (track-based bands)
   - Performance calibration during X-Plane's initial scenery load
   - Automatic mode selection: Aggressive, Opportunistic, or Disabled
-  - Circuit breaker pauses prefetch during X-Plane loading
 - Two-tier caching for instant repeat visits
 - High-quality BC1/BC3 DDS textures with mipmaps
 - **Multiple compression backends**: ISPC SIMD (default), pure-Rust software, or GPU-accelerated via wgpu compute shaders
@@ -108,21 +107,17 @@ XEarthLayer reduces scenery loading stutters by prefetching tiles ahead of your 
    - **Ground Strategy**: Ring-based prefetch around your position (GS < 40kt)
    - **Cruise Strategy**: Track-based band prefetch ahead of your flight path (GS > 40kt)
 
-3. **Circuit Breaker**: When X-Plane is actively loading scenery (>50 requests/sec), prefetch pauses to avoid interfering with on-demand requests.
-
 ### Prefetch Modes
 
 | Mode | Trigger | When Used |
 |------|---------|-----------|
 | **Aggressive** | Position-based (0.3° into DSF tile) | Throughput > 30 tiles/sec |
-| **Opportunistic** | Circuit breaker close | Throughput 10-30 tiles/sec |
+| **Opportunistic** | Executor load below threshold | Throughput 10-30 tiles/sec |
 | **Disabled** | Never | Throughput < 10 tiles/sec |
 
-### Configuration
+### Telemetry
 
-Enable ForeFlight telemetry in X-Plane for best results:
-- Settings → Network → Enable "Send to ForeFlight"
-- XEarthLayer receives position/heading on UDP port 49002
+XEarthLayer connects to X-Plane automatically via the Web API -- no configuration required. Position, heading, and speed are read directly from the simulator.
 
 See [Configuration](docs/configuration.md#prefetch) and [Adaptive Prefetch Design](docs/dev/adaptive-prefetch-design.md) for tuning options.
 

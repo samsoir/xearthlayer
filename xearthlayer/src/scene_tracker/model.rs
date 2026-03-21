@@ -250,17 +250,8 @@ pub struct SceneLoadingState {
     /// DDS tiles X-Plane has requested this session (empirical data).
     pub requested_tiles: HashSet<DdsTileCoord>,
 
-    /// Tiles requested in the current/most recent burst.
-    pub current_burst_tiles: Vec<DdsTileCoord>,
-
-    /// Is a loading burst currently in progress?
-    pub burst_active: bool,
-
     /// Timestamp of last tile access.
     pub last_activity: Instant,
-
-    /// Timestamp when current burst started (if active).
-    pub burst_started: Option<Instant>,
 
     /// Total tile requests this session.
     pub total_requests: u64,
@@ -270,10 +261,7 @@ impl Default for SceneLoadingState {
     fn default() -> Self {
         Self {
             requested_tiles: HashSet::new(),
-            current_burst_tiles: Vec::new(),
-            burst_active: false,
             last_activity: Instant::now(),
-            burst_started: None,
             total_requests: 0,
         }
     }
@@ -283,32 +271,6 @@ impl SceneLoadingState {
     /// Create a new empty scene loading state.
     pub fn new() -> Self {
         Self::default()
-    }
-}
-
-/// A completed loading burst event.
-///
-/// Emitted when a burst of tile requests ends (quiet period detected).
-/// Consumers can use this to classify burst types (session init, boundary crossing, etc.)
-#[derive(Debug, Clone)]
-pub struct LoadingBurst {
-    /// Tiles requested during this burst.
-    pub tiles: Vec<DdsTileCoord>,
-    /// When the burst started.
-    pub started: Instant,
-    /// When the burst ended.
-    pub ended: Instant,
-}
-
-impl LoadingBurst {
-    /// Get the duration of the burst.
-    pub fn duration(&self) -> std::time::Duration {
-        self.ended.duration_since(self.started)
-    }
-
-    /// Get the number of tiles in the burst.
-    pub fn tile_count(&self) -> usize {
-        self.tiles.len()
     }
 }
 
@@ -547,41 +509,6 @@ mod tests {
             let bounds = GeoBounds::new(53.0, 54.0, 9.0, 11.0);
             assert!((bounds.width() - 2.0).abs() < 0.0001);
             assert!((bounds.height() - 1.0).abs() < 0.0001);
-        }
-    }
-
-    mod loading_burst {
-        use super::*;
-        use std::time::Duration;
-
-        #[test]
-        fn test_tile_count() {
-            let burst = LoadingBurst {
-                tiles: vec![
-                    DdsTileCoord::new(1, 1, 14),
-                    DdsTileCoord::new(1, 2, 14),
-                    DdsTileCoord::new(2, 1, 14),
-                ],
-                started: Instant::now(),
-                ended: Instant::now(),
-            };
-            assert_eq!(burst.tile_count(), 3);
-        }
-
-        #[test]
-        fn test_duration() {
-            let start = Instant::now();
-            // Small delay to ensure non-zero duration
-            std::thread::sleep(Duration::from_millis(1));
-            let end = Instant::now();
-
-            let burst = LoadingBurst {
-                tiles: vec![],
-                started: start,
-                ended: end,
-            };
-
-            assert!(burst.duration() >= Duration::from_millis(1));
         }
     }
 }

@@ -347,7 +347,7 @@ The system uses flight phase detection and performance calibration:
 
 3. **Mode Selection**: Based on calibration throughput:
    - **Aggressive**: >30 tiles/sec - Position-based trigger (0.3° into DSF tile)
-   - **Opportunistic**: 10-30 tiles/sec - Circuit breaker trigger (when X-Plane finishes loading)
+   - **Opportunistic**: 10-30 tiles/sec - Executor backpressure-based trigger
    - **Disabled**: <10 tiles/sec - Prefetch skipped (won't complete in time)
 
 | Setting | Type | Default | Description |
@@ -355,11 +355,9 @@ The system uses flight phase detection and performance calibration:
 | `enabled` | bool | `true` | Enable/disable predictive tile prefetching |
 | `strategy` | string | `auto` | Strategy selection: `auto` (recommended) or `adaptive` |
 | `mode` | string | `auto` | Mode selection: `auto`, `aggressive`, `opportunistic`, `disabled` |
-| `udp_port` | integer | `49002` | UDP port for X-Plane telemetry (ForeFlight protocol) |
+| `web_api_port` | integer | `8086` | X-Plane Web API port for telemetry and sim state (1024-65535) |
 | `max_tiles_per_cycle` | integer | `200` | Maximum tiles to submit per prefetch cycle |
 | `cycle_interval_ms` | integer | `2000` | Interval between prefetch cycles (milliseconds) |
-| `circuit_breaker_open_ms` | integer | `500` | Duration (ms) high load must be sustained to pause |
-| `circuit_breaker_half_open_secs` | integer | `2` | Cooloff time (secs) before resuming prefetch |
 | `calibration_aggressive_threshold` | float | `30.0` | Tiles/sec threshold for aggressive mode |
 | `calibration_opportunistic_threshold` | float | `10.0` | Tiles/sec threshold for opportunistic mode |
 | `calibration_sample_duration` | integer | `60` | Duration (secs) to measure throughput during calibration |
@@ -384,16 +382,8 @@ The system uses flight phase detection and performance calibration:
 |------|---------|-----------|
 | `auto` | Based on calibration (recommended) | Most users |
 | `aggressive` | Position-based (0.3° into DSF tile) | Fast connections (>30 tiles/sec) |
-| `opportunistic` | Circuit breaker close | Moderate connections (10-30 tiles/sec) |
+| `opportunistic` | Executor backpressure | Moderate connections (10-30 tiles/sec) |
 | `disabled` | Never | Slow connections or debugging |
-
-**Circuit Breaker:**
-
-The circuit breaker automatically pauses prefetching when the executor is under heavy load (detected by resource pool utilization). This prevents prefetch from competing with X-Plane's direct tile requests:
-
-- **Closed (Active)**: Normal prefetching, executor load below threshold
-- **Open (Paused)**: Prefetching paused, executor load exceeded threshold for `circuit_breaker_open_ms`
-- **Half-Open (Resuming)**: Testing if safe to resume after `circuit_breaker_half_open_secs` cooloff
 
 **Example:**
 ```ini
@@ -401,16 +391,11 @@ The circuit breaker automatically pauses prefetching when the executor is under 
 enabled = true
 strategy = auto
 mode = auto                    ; Let calibration determine mode
-udp_port = 49002
+; web_api_port = 8086
 
 ; Rate limiting
 max_tiles_per_cycle = 3000     ; Tiles per cycle
 cycle_interval_ms = 2000       ; Cycle interval (ms)
-
-; Circuit breaker (pause prefetch during scene loading)
-; Uses resource pool utilization (not FUSE rate) since v0.3.1
-circuit_breaker_open_ms = 500         ; Sustained load duration to open
-circuit_breaker_half_open_secs = 2    ; Cooloff before resuming
 
 ; Calibration thresholds (tiles/sec)
 calibration_aggressive_threshold = 30.0      ; Above = aggressive mode
@@ -445,12 +430,9 @@ The prefetch system uses a three-phase flight model to manage system resources d
 The transition hold releases when the aircraft climbs `takeoff_climb_ft` feet above the MSL altitude recorded at takeoff, or when `takeoff_timeout_secs` elapses (whichever comes first). This adapts to all aircraft types: a jet releases in ~25s, a slow GA aircraft may use the full timeout.
 
 **X-Plane Setup:**
-To enable prefetching, configure X-Plane to send ForeFlight telemetry:
-1. Go to **Settings → Network**
-2. Enable **Send to ForeFlight**
-3. XEarthLayer will receive position/heading updates on UDP port 49002
+XEarthLayer connects to X-Plane automatically via its built-in Web API (port 8086). No configuration needed. The Web API provides position, heading, speed, and altitude telemetry at high update rates.
 
-**Note:** Prefetch works best with telemetry for boundary-driven region prefetching, but the system remains functional without it by using FUSE file access patterns to infer aircraft position
+**Note:** If X-Plane uses a non-default Web API port, set `web_api_port` to match. The system remains functional without the Web API by using FUSE file access patterns to infer aircraft position.
 
 ### [prewarm]
 
@@ -559,46 +541,6 @@ directory = ~/.xearthlayer/patches
 - Patches are merged using a union filesystem; alphabetically-first folder wins on collision
 - See [docs/patches.md](patches.md) for detailed usage instructions
 
-### [online_network]
-
-Controls online ATC network position fetching (VATSIM, IVAO, PilotEdge). When enabled, XEarthLayer fetches your pilot position from the network's REST API and feeds it into the Aircraft Position & Telemetry (APT) system as an additional position source.
-
-This provides ~10m accuracy position data with ~15-second updates, useful when X-Plane telemetry (ForeFlight/XGPS2 UDP) is not available or as a supplementary source.
-
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `enabled` | bool | `false` | Enable/disable online network position fetching |
-| `network_type` | string | `vatsim` | Network type: `vatsim`, `ivao`, or `pilotedge` |
-| `pilot_id` | integer | `0` | Pilot identifier (CID for VATSIM). 0 = disabled. |
-| `api_url` | URL | `https://status.vatsim.net/status.json` | API status endpoint URL |
-| `poll_interval_secs` | integer | `15` | How often to poll the API (seconds) |
-| `max_stale_secs` | integer | `60` | Maximum data age before considered stale (seconds) |
-
-**Example:**
-```ini
-[online_network]
-enabled = true
-network_type = vatsim
-pilot_id = 1234567       ; Your VATSIM CID
-; api_url defaults to https://status.vatsim.net/status.json
-; poll_interval_secs = 15
-; max_stale_secs = 60
-```
-
-**How it works:**
-- The adapter polls the VATSIM V3 API every `poll_interval_secs` seconds
-- Your pilot is found by CID in the pilot list; if not connected, the adapter silently skips
-- Position data includes latitude, longitude, heading, ground speed, and altitude
-- The `last_updated` timestamp is used to compute data age for staleness checking
-- If X-Plane telemetry (GPS) is also available, it takes precedence due to equal accuracy but higher update rate
-- Exponential backoff on API errors (2^n seconds, capped at 5 minutes)
-
-**Position Source Priority:**
-When multiple sources provide position data simultaneously, the APT system selects based on accuracy and freshness:
-1. **GPS/Telemetry** (10m, ~1Hz updates) — wins when available
-2. **Online Network** (10m, ~15s updates) — used when telemetry is stale or unavailable
-3. **Scene Inference** (100km) — fallback from FUSE file access patterns
-4. **Manual Reference** (100m) — airport prewarm seed
 
 ### [fuse]
 
@@ -673,15 +615,11 @@ timeout = 10
 enabled = true
 strategy = auto                ; auto or adaptive
 mode = auto                    ; auto, aggressive, opportunistic, disabled
-; udp_port = 49002
+; web_api_port = 8086
 
 ; Rate limiting
 ; max_tiles_per_cycle = 3000   ; tiles per cycle
 ; cycle_interval_ms = 2000     ; cycle interval (ms)
-
-; Circuit breaker (pause prefetch during scene loading)
-; circuit_breaker_open_ms = 500         ; duration to sustain before pause
-; circuit_breaker_half_open_secs = 2    ; cooloff before resuming
 
 ; Performance calibration thresholds (tiles/sec)
 ; calibration_aggressive_threshold = 30.0    ; above = aggressive mode
@@ -726,16 +664,6 @@ file = ~/.xearthlayer/xearthlayer.log
 ; Tile patches for custom mesh/elevation from airport addons
 enabled = true
 ; directory = ~/.xearthlayer/patches
-
-[online_network]
-; Online ATC network position (VATSIM/IVAO/PilotEdge)
-; Set enabled = true and pilot_id to your VATSIM CID to enable
-enabled = false
-network_type = vatsim
-pilot_id = 0
-; api_url = https://status.vatsim.net/status.json
-; poll_interval_secs = 15
-; max_stale_secs = 60
 
 [fuse]
 ; FUSE kernel limits for concurrent background requests (advanced)
@@ -846,11 +774,9 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `prefetch.enabled` | `true`, `false` | Enable predictive prefetching |
 | `prefetch.strategy` | `auto`, `adaptive` | Prefetch strategy selection |
 | `prefetch.mode` | `auto`, `aggressive`, `opportunistic`, `disabled` | Prefetch mode (auto uses calibration) |
-| `prefetch.udp_port` | positive integer | X-Plane telemetry UDP port |
+| `prefetch.web_api_port` | 1024-65535 | X-Plane Web API port for telemetry and sim state |
 | `prefetch.max_tiles_per_cycle` | positive integer | Max tiles per prefetch cycle |
 | `prefetch.cycle_interval_ms` | positive integer | Prefetch cycle interval (ms) |
-| `prefetch.circuit_breaker_open_ms` | positive integer | Sustained load duration (ms) |
-| `prefetch.circuit_breaker_half_open_secs` | positive integer | Cooloff time (secs) |
 | `prefetch.calibration_aggressive_threshold` | positive number | Tiles/sec for aggressive mode |
 | `prefetch.calibration_opportunistic_threshold` | positive number | Tiles/sec for opportunistic mode |
 | `prefetch.calibration_sample_duration` | positive integer | Calibration period (seconds) |
@@ -875,12 +801,6 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `packages.auto_install_overlays` | `true`, `false` | Auto-install matching overlays |
 | `packages.temp_dir` | path | Temporary download directory |
 | `logging.file` | path | Log file location |
-| `online_network.enabled` | `true`, `false` | Enable online network position |
-| `online_network.network_type` | `vatsim`, `ivao`, `pilotedge` | Network type |
-| `online_network.pilot_id` | positive integer | Pilot CID (0 = disabled) |
-| `online_network.api_url` | URL | API status endpoint |
-| `online_network.poll_interval_secs` | positive integer | API poll interval (seconds) |
-| `online_network.max_stale_secs` | positive integer | Max data age (seconds) |
 
 ## CLI Overrides
 

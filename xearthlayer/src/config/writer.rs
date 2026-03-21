@@ -171,8 +171,8 @@ strategy = {}
 ;   opportunistic - Circuit breaker triggers (moderate connections)
 ;   disabled     - Disable prefetch entirely
 mode = {}
-; UDP port for telemetry (default: 49002 for ForeFlight protocol)
-udp_port = {}
+; Web API port for X-Plane SimState polling (default: 8086, range: 1024-65535)
+web_api_port = {}
 
 ; Cycle limits
 ; Maximum tiles to submit per prefetch cycle (default: 200)
@@ -181,13 +181,6 @@ max_tiles_per_cycle = {}
 ; Interval between prefetch cycles in milliseconds (default: 2000)
 ; Higher values reduce prefetch aggressiveness
 cycle_interval_ms = {}
-
-; Circuit breaker (pause prefetch during system resource saturation)
-; Uses resource pool utilization (network, CPU, disk I/O) to detect heavy load
-; Duration (milliseconds) resource saturation must be sustained to open circuit (default: 500)
-circuit_breaker_open_ms = {}
-; Cooloff time (seconds) before trying to close the circuit (default: 5)
-circuit_breaker_half_open_secs = {}
 
 ; Adaptive prefetch calibration (for strategy = adaptive)
 ; Minimum throughput for aggressive mode (tiles/sec, default: 30)
@@ -271,23 +264,6 @@ enabled = {}
 ; Priority is determined by alphabetical folder naming (A < B < Z)
 directory = {}
 
-[online_network]
-; Online ATC network position (VATSIM, IVAO, PilotEdge).
-; Provides pilot position from network APIs as a position source for the APT system.
-
-; Enable/disable online network position fetching (default: false)
-enabled = {}
-; Network type: vatsim, ivao, or pilotedge (default: vatsim)
-network_type = {}
-; Pilot identifier (CID for VATSIM, default: 0 = disabled)
-pilot_id = {}
-; API URL (for VATSIM, the V3 JSON data feed)
-api_url = {}
-; Poll interval in seconds (default: 15)
-poll_interval_secs = {}
-; Maximum age in seconds before data is considered stale (default: 60)
-max_stale_secs = {}
-
 [fuse]
 ; FUSE kernel settings for concurrent background request limits.
 ; Higher values allow more concurrent X-Plane scenery reads, preventing
@@ -333,11 +309,9 @@ congestion_threshold = {}
         config.prefetch.enabled,
         config.prefetch.strategy,
         config.prefetch.mode,
-        config.prefetch.udp_port,
+        config.prefetch.web_api_port,
         config.prefetch.max_tiles_per_cycle,
         config.prefetch.cycle_interval_ms,
-        config.prefetch.circuit_breaker_open_ms,
-        config.prefetch.circuit_breaker_half_open_secs,
         config.prefetch.calibration_aggressive_threshold,
         config.prefetch.calibration_opportunistic_threshold,
         config.prefetch.calibration_sample_duration,
@@ -366,12 +340,6 @@ congestion_threshold = {}
             .as_ref()
             .map(|p| path_to_string(p))
             .unwrap_or_default(),
-        config.online_network.enabled,
-        config.online_network.network_type,
-        config.online_network.pilot_id,
-        config.online_network.api_url,
-        config.online_network.poll_interval_secs,
-        config.online_network.max_stale_secs,
         // FUSE settings
         config.fuse.max_background,
         config.fuse.congestion_threshold,

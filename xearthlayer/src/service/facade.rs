@@ -13,7 +13,7 @@ use crate::executor::{DdsClient, MemoryCacheAdapter};
 use crate::fuse::{MountHandle, SpawnedMountHandle};
 use crate::log::Logger;
 use crate::metrics::{MetricsSystem, TelemetrySnapshot, TuiReporter};
-use crate::prefetch::{FuseLoadMonitor, TileRequestCallback};
+use crate::prefetch::TileRequestCallback;
 use crate::provider::ProviderConfig;
 use crate::runtime::{SharedRuntimeHealth, SharedTileProgressTracker, XEarthLayerRuntime};
 use crate::texture::{DdsTextureEncoder, TextureEncoder};
@@ -94,9 +94,6 @@ pub struct XEarthLayerService {
     dds_client: Option<Arc<dyn DdsClient>>,
     /// Tile request callback for FUSE-based position inference
     tile_request_callback: Option<TileRequestCallback>,
-    /// Load monitor for circuit breaker integration.
-    /// When set, records FUSE-originated requests for aggregate load tracking.
-    load_monitor: Option<Arc<dyn FuseLoadMonitor>>,
     /// Memory cache bridge from new cache service architecture.
     /// Used by prefetch system when cache bridges are enabled.
     memory_cache_bridge: Option<Arc<MemoryCacheBridge>>,
@@ -373,7 +370,7 @@ impl XEarthLayerService {
             xearthlayer_runtime: Some(xel_runtime),
             dds_client: Some(dds_client),
             tile_request_callback: None,
-            load_monitor: None,
+
             memory_cache_bridge: Some(cache_layer.memory_bridge()),
             cache_layer: Some(cache_layer),
             gc_scheduler_handle,
@@ -499,7 +496,7 @@ impl XEarthLayerService {
                     xearthlayer_runtime: None,
                     dds_client: None,
                     tile_request_callback: None,
-                    load_monitor: None,
+
                     memory_cache_bridge: None,
                     cache_layer: None,
                     gc_scheduler_handle: None,
@@ -535,7 +532,7 @@ impl XEarthLayerService {
             xearthlayer_runtime,
             dds_client,
             tile_request_callback: None,
-            load_monitor: None,
+
             memory_cache_bridge,
             cache_layer: None,
             gc_scheduler_handle: None,
@@ -761,15 +758,6 @@ impl XEarthLayerService {
     /// * `callback` - The callback to invoke for each tile request
     pub fn set_tile_request_callback(&mut self, callback: TileRequestCallback) {
         self.tile_request_callback = Some(callback);
-    }
-
-    /// Set the load monitor for circuit breaker integration.
-    ///
-    /// When set, the load monitor's `record_request()` is called for each
-    /// FUSE-originated request. This enables the circuit breaker to track
-    /// aggregate load across all mounted packages.
-    pub fn set_load_monitor(&mut self, monitor: Arc<dyn FuseLoadMonitor>) {
-        self.load_monitor = Some(monitor);
     }
 
     /// Set the owned Tokio runtime.

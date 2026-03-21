@@ -78,11 +78,9 @@ pub enum ConfigKey {
     PrefetchEnabled,
     PrefetchStrategy,
     PrefetchMode,
-    PrefetchUdpPort,
+    PrefetchWebApiPort,
     PrefetchMaxTilesPerCycle,
     PrefetchCycleIntervalMs,
-    PrefetchCircuitBreakerOpenMs,
-    PrefetchCircuitBreakerHalfOpenSecs,
 
     // Adaptive prefetch calibration settings
     PrefetchCalibrationAggressiveThreshold,
@@ -129,14 +127,6 @@ pub enum ConfigKey {
     ExecutorRequestTimeoutSecs,
     ExecutorMaxRetries,
     ExecutorRetryBaseDelayMs,
-
-    // Online network settings
-    OnlineNetworkEnabled,
-    OnlineNetworkType,
-    OnlineNetworkPilotId,
-    OnlineNetworkApiUrl,
-    OnlineNetworkPollIntervalSecs,
-    OnlineNetworkMaxStaleSecs,
 
     // FUSE settings
     FuseMaxBackground,
@@ -187,13 +177,9 @@ impl FromStr for ConfigKey {
             "prefetch.enabled" => Ok(ConfigKey::PrefetchEnabled),
             "prefetch.strategy" => Ok(ConfigKey::PrefetchStrategy),
             "prefetch.mode" => Ok(ConfigKey::PrefetchMode),
-            "prefetch.udp_port" => Ok(ConfigKey::PrefetchUdpPort),
+            "prefetch.web_api_port" => Ok(ConfigKey::PrefetchWebApiPort),
             "prefetch.max_tiles_per_cycle" => Ok(ConfigKey::PrefetchMaxTilesPerCycle),
             "prefetch.cycle_interval_ms" => Ok(ConfigKey::PrefetchCycleIntervalMs),
-            "prefetch.circuit_breaker_open_ms" => Ok(ConfigKey::PrefetchCircuitBreakerOpenMs),
-            "prefetch.circuit_breaker_half_open_secs" => {
-                Ok(ConfigKey::PrefetchCircuitBreakerHalfOpenSecs)
-            }
             "prefetch.calibration_aggressive_threshold" => {
                 Ok(ConfigKey::PrefetchCalibrationAggressiveThreshold)
             }
@@ -244,14 +230,6 @@ impl FromStr for ConfigKey {
             "executor.max_retries" => Ok(ConfigKey::ExecutorMaxRetries),
             "executor.retry_base_delay_ms" => Ok(ConfigKey::ExecutorRetryBaseDelayMs),
 
-            // Online network settings
-            "online_network.enabled" => Ok(ConfigKey::OnlineNetworkEnabled),
-            "online_network.network_type" => Ok(ConfigKey::OnlineNetworkType),
-            "online_network.pilot_id" => Ok(ConfigKey::OnlineNetworkPilotId),
-            "online_network.api_url" => Ok(ConfigKey::OnlineNetworkApiUrl),
-            "online_network.poll_interval_secs" => Ok(ConfigKey::OnlineNetworkPollIntervalSecs),
-            "online_network.max_stale_secs" => Ok(ConfigKey::OnlineNetworkMaxStaleSecs),
-
             // FUSE settings
             "fuse.max_background" => Ok(ConfigKey::FuseMaxBackground),
             "fuse.congestion_threshold" => Ok(ConfigKey::FuseCongestionThreshold),
@@ -295,13 +273,9 @@ impl ConfigKey {
             ConfigKey::PrefetchEnabled => "prefetch.enabled",
             ConfigKey::PrefetchStrategy => "prefetch.strategy",
             ConfigKey::PrefetchMode => "prefetch.mode",
-            ConfigKey::PrefetchUdpPort => "prefetch.udp_port",
+            ConfigKey::PrefetchWebApiPort => "prefetch.web_api_port",
             ConfigKey::PrefetchMaxTilesPerCycle => "prefetch.max_tiles_per_cycle",
             ConfigKey::PrefetchCycleIntervalMs => "prefetch.cycle_interval_ms",
-            ConfigKey::PrefetchCircuitBreakerOpenMs => "prefetch.circuit_breaker_open_ms",
-            ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => {
-                "prefetch.circuit_breaker_half_open_secs"
-            }
             ConfigKey::PrefetchCalibrationAggressiveThreshold => {
                 "prefetch.calibration_aggressive_threshold"
             }
@@ -346,14 +320,6 @@ impl ConfigKey {
             ConfigKey::ExecutorRequestTimeoutSecs => "executor.request_timeout_secs",
             ConfigKey::ExecutorMaxRetries => "executor.max_retries",
             ConfigKey::ExecutorRetryBaseDelayMs => "executor.retry_base_delay_ms",
-
-            // Online network settings
-            ConfigKey::OnlineNetworkEnabled => "online_network.enabled",
-            ConfigKey::OnlineNetworkType => "online_network.network_type",
-            ConfigKey::OnlineNetworkPilotId => "online_network.pilot_id",
-            ConfigKey::OnlineNetworkApiUrl => "online_network.api_url",
-            ConfigKey::OnlineNetworkPollIntervalSecs => "online_network.poll_interval_secs",
-            ConfigKey::OnlineNetworkMaxStaleSecs => "online_network.max_stale_secs",
 
             // FUSE settings
             ConfigKey::FuseMaxBackground => "fuse.max_background",
@@ -440,15 +406,9 @@ impl ConfigKey {
             ConfigKey::PrefetchEnabled => config.prefetch.enabled.to_string(),
             ConfigKey::PrefetchStrategy => config.prefetch.strategy.clone(),
             ConfigKey::PrefetchMode => config.prefetch.mode.clone(),
-            ConfigKey::PrefetchUdpPort => config.prefetch.udp_port.to_string(),
+            ConfigKey::PrefetchWebApiPort => config.prefetch.web_api_port.to_string(),
             ConfigKey::PrefetchMaxTilesPerCycle => config.prefetch.max_tiles_per_cycle.to_string(),
             ConfigKey::PrefetchCycleIntervalMs => config.prefetch.cycle_interval_ms.to_string(),
-            ConfigKey::PrefetchCircuitBreakerOpenMs => {
-                config.prefetch.circuit_breaker_open_ms.to_string()
-            }
-            ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => {
-                config.prefetch.circuit_breaker_half_open_secs.to_string()
-            }
             ConfigKey::PrefetchCalibrationAggressiveThreshold => {
                 config.prefetch.calibration_aggressive_threshold.to_string()
             }
@@ -521,18 +481,6 @@ impl ConfigKey {
             }
             ConfigKey::ExecutorMaxRetries => config.executor.max_retries.to_string(),
             ConfigKey::ExecutorRetryBaseDelayMs => config.executor.retry_base_delay_ms.to_string(),
-
-            // Online network settings
-            ConfigKey::OnlineNetworkEnabled => config.online_network.enabled.to_string(),
-            ConfigKey::OnlineNetworkType => config.online_network.network_type.clone(),
-            ConfigKey::OnlineNetworkPilotId => config.online_network.pilot_id.to_string(),
-            ConfigKey::OnlineNetworkApiUrl => config.online_network.api_url.clone(),
-            ConfigKey::OnlineNetworkPollIntervalSecs => {
-                config.online_network.poll_interval_secs.to_string()
-            }
-            ConfigKey::OnlineNetworkMaxStaleSecs => {
-                config.online_network.max_stale_secs.to_string()
-            }
 
             // FUSE settings
             ConfigKey::FuseMaxBackground => config.fuse.max_background.to_string(),
@@ -650,20 +598,14 @@ impl ConfigKey {
             ConfigKey::PrefetchMode => {
                 config.prefetch.mode = value.to_lowercase();
             }
-            ConfigKey::PrefetchUdpPort => {
-                config.prefetch.udp_port = value.parse().unwrap();
+            ConfigKey::PrefetchWebApiPort => {
+                config.prefetch.web_api_port = value.parse().unwrap();
             }
             ConfigKey::PrefetchMaxTilesPerCycle => {
                 config.prefetch.max_tiles_per_cycle = value.parse().unwrap();
             }
             ConfigKey::PrefetchCycleIntervalMs => {
                 config.prefetch.cycle_interval_ms = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchCircuitBreakerOpenMs => {
-                config.prefetch.circuit_breaker_open_ms = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => {
-                config.prefetch.circuit_breaker_half_open_secs = value.parse().unwrap();
             }
             ConfigKey::PrefetchCalibrationAggressiveThreshold => {
                 config.prefetch.calibration_aggressive_threshold = value.parse().unwrap();
@@ -769,27 +711,6 @@ impl ConfigKey {
                 config.executor.retry_base_delay_ms = value.parse().unwrap();
             }
 
-            // Online network settings
-            ConfigKey::OnlineNetworkEnabled => {
-                let v = value.to_lowercase();
-                config.online_network.enabled = v == "true" || v == "1" || v == "yes" || v == "on";
-            }
-            ConfigKey::OnlineNetworkType => {
-                config.online_network.network_type = value.to_lowercase();
-            }
-            ConfigKey::OnlineNetworkPilotId => {
-                config.online_network.pilot_id = value.parse().unwrap();
-            }
-            ConfigKey::OnlineNetworkApiUrl => {
-                config.online_network.api_url = value.to_string();
-            }
-            ConfigKey::OnlineNetworkPollIntervalSecs => {
-                config.online_network.poll_interval_secs = value.parse().unwrap();
-            }
-            ConfigKey::OnlineNetworkMaxStaleSecs => {
-                config.online_network.max_stale_secs = value.parse().unwrap();
-            }
-
             // FUSE settings
             ConfigKey::FuseMaxBackground => {
                 config.fuse.max_background = value.parse().unwrap();
@@ -852,11 +773,9 @@ impl ConfigKey {
                 "opportunistic",
                 "disabled",
             ])),
-            ConfigKey::PrefetchUdpPort => Box::new(PositiveIntegerSpec),
+            ConfigKey::PrefetchWebApiPort => Box::new(IntegerRangeSpec::new(1024, 65535)),
             ConfigKey::PrefetchMaxTilesPerCycle => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchCycleIntervalMs => Box::new(PositiveIntegerSpec),
-            ConfigKey::PrefetchCircuitBreakerOpenMs => Box::new(PositiveIntegerSpec),
-            ConfigKey::PrefetchCircuitBreakerHalfOpenSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchCalibrationAggressiveThreshold => Box::new(PositiveNumberSpec),
             ConfigKey::PrefetchCalibrationOpportunisticThreshold => Box::new(PositiveNumberSpec),
             ConfigKey::PrefetchCalibrationSampleDuration => Box::new(PositiveIntegerSpec),
@@ -896,16 +815,6 @@ impl ConfigKey {
             ConfigKey::ExecutorMaxRetries => Box::new(PositiveIntegerSpec),
             ConfigKey::ExecutorRetryBaseDelayMs => Box::new(PositiveIntegerSpec),
 
-            // Online network settings
-            ConfigKey::OnlineNetworkEnabled => Box::new(BooleanSpec),
-            ConfigKey::OnlineNetworkType => {
-                Box::new(OneOfSpec::new(&["vatsim", "ivao", "pilotedge"]))
-            }
-            ConfigKey::OnlineNetworkPilotId => Box::new(PositiveIntegerSpec),
-            ConfigKey::OnlineNetworkApiUrl => Box::new(OptionalUrlSpec),
-            ConfigKey::OnlineNetworkPollIntervalSecs => Box::new(PositiveIntegerSpec),
-            ConfigKey::OnlineNetworkMaxStaleSecs => Box::new(PositiveIntegerSpec),
-
             // FUSE settings — range: 1-1024 for both
             ConfigKey::FuseMaxBackground => Box::new(IntegerRangeSpec::new(1, 1024)),
             ConfigKey::FuseCongestionThreshold => Box::new(IntegerRangeSpec::new(1, 1024)),
@@ -943,11 +852,9 @@ impl ConfigKey {
             ConfigKey::PrefetchEnabled,
             ConfigKey::PrefetchStrategy,
             ConfigKey::PrefetchMode,
-            ConfigKey::PrefetchUdpPort,
+            ConfigKey::PrefetchWebApiPort,
             ConfigKey::PrefetchMaxTilesPerCycle,
             ConfigKey::PrefetchCycleIntervalMs,
-            ConfigKey::PrefetchCircuitBreakerOpenMs,
-            ConfigKey::PrefetchCircuitBreakerHalfOpenSecs,
             ConfigKey::PrefetchCalibrationAggressiveThreshold,
             ConfigKey::PrefetchCalibrationOpportunisticThreshold,
             ConfigKey::PrefetchCalibrationSampleDuration,
@@ -983,13 +890,6 @@ impl ConfigKey {
             ConfigKey::ExecutorRequestTimeoutSecs,
             ConfigKey::ExecutorMaxRetries,
             ConfigKey::ExecutorRetryBaseDelayMs,
-            // Online network settings
-            ConfigKey::OnlineNetworkEnabled,
-            ConfigKey::OnlineNetworkType,
-            ConfigKey::OnlineNetworkPilotId,
-            ConfigKey::OnlineNetworkApiUrl,
-            ConfigKey::OnlineNetworkPollIntervalSecs,
-            ConfigKey::OnlineNetworkMaxStaleSecs,
             // FUSE settings
             ConfigKey::FuseMaxBackground,
             ConfigKey::FuseCongestionThreshold,

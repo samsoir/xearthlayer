@@ -76,7 +76,7 @@ All scenery requests from X-Plane were captured via a FUSE virtual filesystem th
 - Cache hit/miss status
 - Request latency
 
-Aircraft position was logged every 20 seconds via UDP telemetry:
+Aircraft position was logged every 20 seconds via telemetry (XGPS2/ForeFlight UDP in original tests; replaced by X-Plane Web API in v0.4.0):
 - Latitude, longitude, altitude
 - Heading, ground speed
 - DSF tile containing aircraft

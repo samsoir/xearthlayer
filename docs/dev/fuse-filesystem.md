@@ -416,7 +416,7 @@ xearthlayer/src/
 │   ├── mod.rs              # Module exports
 │   ├── strategy.rs         # Prefetcher trait
 │   ├── radial.rs           # RadialPrefetcher (recommended)
-│   └── telemetry.rs        # X-Plane UDP telemetry
+│   └── web_api/            # X-Plane Web API telemetry
 ├── config/                 # Configuration system
 ├── cache/                  # Two-tier caching
 ├── provider/               # Imagery providers

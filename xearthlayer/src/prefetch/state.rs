@@ -3,6 +3,30 @@
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+/// Circuit breaker state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    /// Circuit is closed - prefetch is active (normal operation).
+    Closed,
+    /// Circuit is open - prefetch is blocked (high X-Plane load detected).
+    Open,
+    /// Circuit is half-open - testing if safe to resume prefetch.
+    HalfOpen,
+}
+
+impl CircuitState {
+    /// User-friendly display string (NOT circuit breaker jargon).
+    ///
+    /// Returns terminology suitable for end-user TUI display.
+    pub fn display_status(&self) -> &'static str {
+        match self {
+            CircuitState::Closed => "Active",
+            CircuitState::Open => "Paused",
+            CircuitState::HalfOpen => "Resuming...",
+        }
+    }
+}
+
 /// Snapshot of prefetch statistics for UI display.
 ///
 /// This struct tracks cumulative prefetch activity metrics that are
@@ -82,7 +106,7 @@ pub struct DetailedPrefetchStats {
     pub is_active: bool,
     /// Circuit breaker state (None if circuit breaker is disabled).
     /// Used by TUI to show prefetch pause status.
-    pub circuit_state: Option<super::circuit_breaker::CircuitState>,
+    pub circuit_state: Option<CircuitState>,
     /// Tile coordinates currently being prefetched (limited to 10 for display).
     /// Each tuple is (latitude, longitude) of the tile's southwest corner.
     pub loading_tiles: Vec<(i32, i32)>,

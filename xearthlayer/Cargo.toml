@@ -46,8 +46,10 @@ intel_tex_2 = "0.5"
 wgpu = { version = "28", optional = true }
 block_compression = { version = "0.8", optional = true, default-features = false, features = ["bc15", "wgpu"] }
 pollster = { version = "0.4", optional = true }
+futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tokio-tungstenite = { version = "0.24", features = ["connect"] }
 tracing-chrome = { version = "0.7", optional = true }
 
 [features]

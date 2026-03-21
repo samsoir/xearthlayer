@@ -13,8 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use xearthlayer::scene_tracker::{
-    BurstConfig, DdsTileCoord, DefaultSceneTracker, FuseAccessEvent, SceneTracker,
-    SceneTrackerConfig, SceneTrackerEvents,
+    DdsTileCoord, DefaultSceneTracker, FuseAccessEvent, SceneTracker,
 };
 
 // ============================================================================
@@ -121,83 +120,6 @@ async fn test_fuse_to_scene_tracker_flow() {
     handle
         .await
         .expect("Scene tracker task should complete cleanly");
-}
-
-/// Test burst detection with realistic X-Plane loading patterns.
-///
-/// X-Plane typically loads many tiles in quick succession when:
-/// - Entering a new area (teleport/scenery load)
-/// - Flying into uncached regions
-///
-/// The burst detector should identify these loading bursts.
-#[tokio::test]
-async fn test_burst_detection_realistic_timing() {
-    // Configure burst detection with shorter timeouts for testing
-    let config = SceneTrackerConfig {
-        burst_config: BurstConfig {
-            quiet_threshold: Duration::from_millis(100),
-            min_tiles: 5,
-        },
-        burst_channel_capacity: 16,
-        tile_channel_capacity: 256,
-    };
-
-    let tracker = Arc::new(DefaultSceneTracker::new(config));
-    let (tx, rx) = mpsc::unbounded_channel();
-
-    // Subscribe to burst events BEFORE starting
-    let mut burst_rx = tracker.subscribe_bursts();
-
-    // Start the Scene Tracker
-    let tracker_clone = Arc::clone(&tracker);
-    let handle = tracker_clone.start(rx);
-
-    // Simulate rapid tile loading (typical X-Plane behavior)
-    // Send many tiles in quick succession
-    for (row, col) in HAMBURG_TILES {
-        tx.send(make_event(*row, *col, 18)).unwrap();
-        // Small delay between tiles (X-Plane doesn't send all at once)
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-
-    // Burst should be active during loading
-    assert!(
-        tracker.is_burst_active(),
-        "Burst should be active during rapid loading"
-    );
-
-    // Wait for idle timeout to trigger burst completion
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    // Manually check for burst completion
-    tracker.check_burst_complete();
-
-    // Burst should now be complete
-    assert!(
-        !tracker.is_burst_active(),
-        "Burst should be complete after idle timeout"
-    );
-
-    // Verify burst event was broadcast
-    match tokio::time::timeout(Duration::from_millis(100), burst_rx.recv()).await {
-        Ok(Ok(burst)) => {
-            assert_eq!(
-                burst.tile_count(),
-                HAMBURG_TILES.len(),
-                "Burst should contain all tiles"
-            );
-            assert!(
-                burst.duration() >= Duration::from_millis(30),
-                "Burst duration should reflect loading time"
-            );
-        }
-        Ok(Err(_)) => panic!("Burst receiver was closed"),
-        Err(_) => panic!("Timeout waiting for burst event"),
-    }
-
-    // Clean shutdown
-    drop(tx);
-    handle.await.unwrap();
 }
 
 /// Test tile access subscription for real-time tracking.

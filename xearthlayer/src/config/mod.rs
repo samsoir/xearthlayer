@@ -60,7 +60,6 @@ pub use file::{
     ExecutorSettings,
     GenerationSettings,
     LoggingSettings,
-    OnlineNetworkSettings,
     PackagesSettings,
     PatchesSettings,
     PipelineSettings,
@@ -69,9 +68,6 @@ pub use file::{
     ProviderSettings,
     TextureSettings,
     XPlaneSettings,
-    // Prefetch defaults
-    DEFAULT_CIRCUIT_BREAKER_HALF_OPEN_SECS,
-    DEFAULT_CIRCUIT_BREAKER_OPEN_MS,
     // Pipeline defaults
     DEFAULT_COALESCE_CHANNEL_CAPACITY,
     // Control plane defaults
@@ -101,9 +97,9 @@ pub use file::{
     DEFAULT_PARALLEL_DOWNLOADS,
     DEFAULT_PREFETCH_CYCLE_INTERVAL_MS,
     DEFAULT_PREFETCH_MAX_TILES_PER_CYCLE,
-    DEFAULT_PREFETCH_UDP_PORT,
     DEFAULT_REQUEST_TIMEOUT_SECS,
     DEFAULT_RETRY_BASE_DELAY_MS,
+    DEFAULT_WEB_API_PORT,
 };
 pub use keys::{ConfigKey, ConfigKeyError};
 pub use size::{format_size, parse_size, Size, SizeParseError};

@@ -3,12 +3,8 @@
 //! Extracted from `core.rs` to isolate the logic that maps coordinator
 //! internal state to the [`SharedPrefetchStatus`] consumed by the dashboard.
 
-use std::sync::Arc;
-
 use crate::coord::TileCoord;
 use crate::prefetch::state::{DetailedPrefetchStats, SharedPrefetchStatus};
-use crate::prefetch::throttler::{PrefetchThrottler, ThrottleState};
-use crate::prefetch::CircuitState;
 
 use super::super::calibration::StrategyMode;
 use super::super::phase_detector::FlightPhase;
@@ -35,7 +31,6 @@ pub(crate) struct CycleStats {
 pub(crate) fn update_status_with_plan(
     shared_status: &SharedPrefetchStatus,
     coordinator_status: &CoordinatorStatus,
-    throttler: Option<&Arc<dyn PrefetchThrottler>>,
     position: (f64, f64),
     plan: &PrefetchPlan,
     submitted: usize,
@@ -46,7 +41,7 @@ pub(crate) fn update_status_with_plan(
     let prefetch_mode = phase_to_prefetch_mode(coordinator_status.phase);
     shared_status.update_prefetch_mode(prefetch_mode);
 
-    let circuit_state = throttler_to_circuit_state(throttler);
+    let circuit_state = None;
 
     let loading_tiles: Vec<(i32, i32)> = plan
         .tiles
@@ -87,7 +82,6 @@ pub(crate) fn update_status_position(shared_status: &SharedPrefetchStatus, posit
 pub(crate) fn update_status_no_plan(
     shared_status: &SharedPrefetchStatus,
     coordinator_status: &CoordinatorStatus,
-    throttler: Option<&Arc<dyn PrefetchThrottler>>,
     stats: &CycleStats,
 ) {
     let prefetch_mode = if !coordinator_status.enabled {
@@ -101,7 +95,7 @@ pub(crate) fn update_status_no_plan(
     };
     shared_status.update_prefetch_mode(prefetch_mode);
 
-    let circuit_state = throttler_to_circuit_state(throttler);
+    let circuit_state = None;
 
     let detailed = DetailedPrefetchStats {
         cycles: stats.total_cycles,
@@ -128,16 +122,6 @@ fn phase_to_prefetch_mode(phase: FlightPhase) -> crate::prefetch::state::Prefetc
         FlightPhase::Transition => crate::prefetch::state::PrefetchMode::Idle,
         FlightPhase::Cruise => crate::prefetch::state::PrefetchMode::TileBased,
     }
-}
-
-fn throttler_to_circuit_state(
-    throttler: Option<&Arc<dyn PrefetchThrottler>>,
-) -> Option<CircuitState> {
-    throttler.map(|t| match t.state() {
-        ThrottleState::Active => CircuitState::Closed,
-        ThrottleState::Paused => CircuitState::Open,
-        ThrottleState::Resuming => CircuitState::HalfOpen,
-    })
 }
 
 #[cfg(test)]
@@ -188,7 +172,7 @@ mod tests {
         let mut coord_status = CoordinatorStatus::default();
         coord_status.enabled = false;
 
-        update_status_no_plan(&status, &coord_status, None, &test_stats(0, 0, 0, 0));
+        update_status_no_plan(&status, &coord_status, &test_stats(0, 0, 0, 0));
 
         let snapshot = status.snapshot();
         assert_eq!(
@@ -198,19 +182,15 @@ mod tests {
     }
 
     #[test]
-    fn test_update_status_no_plan_circuit_open_when_throttled() {
+    fn test_update_status_no_plan_throttled() {
         let status = SharedPrefetchStatus::new();
         let mut coord_status = CoordinatorStatus::default();
         coord_status.enabled = true;
         coord_status.throttled = true;
 
-        update_status_no_plan(&status, &coord_status, None, &test_stats(5, 100, 50, 2));
+        update_status_no_plan(&status, &coord_status, &test_stats(5, 100, 50, 2));
 
         let snapshot = status.snapshot();
-        assert_eq!(
-            snapshot.prefetch_mode,
-            crate::prefetch::state::PrefetchMode::CircuitOpen
-        );
         let detailed = snapshot.detailed_stats.unwrap();
         assert_eq!(detailed.cycles, 5);
         assert_eq!(detailed.tiles_submitted_total, 100);
@@ -243,7 +223,6 @@ mod tests {
         update_status_with_plan(
             &status,
             &coord_status,
-            None,
             (50.0, 8.0),
             &plan,
             2,

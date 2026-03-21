@@ -47,10 +47,7 @@ Technical documentation for XEarthLayer developers and contributors.
 | [Adaptive Prefetch Design](adaptive-prefetch-design.md) | **Primary design doc**: Boundary-driven prefetch with SceneryWindow, dual BoundaryMonitors, and flight phase detection (v0.3.0+) |
 | [X-Plane Scenery Loading Whitepaper](xplane-scenery-loading-whitepaper.md) | Research on X-Plane 12's scenery loading behavior |
 | [Prefetch Flight Test Plan](prefetch-flight-test-plan.md) | Flight test data informing prefetch design |
-| [Aircraft Telemetry Architecture](aircraft-telemetry-architecture.md) | ForeFlight UDP telemetry integration |
-| ~~[Predictive Caching](predictive-caching.md)~~ | **(SUPERSEDED)** Original radial prefetcher design |
-| ~~[Heading-Aware Prefetch](heading-aware-prefetch-design.md)~~ | **(SUPERSEDED)** Cone-based prefetch algorithm |
-| ~~[Tile-Based Prefetch Design](tile-based-prefetch-design.md)~~ | **(SUPERSEDED)** DSF tile-based approach |
+| [Aircraft Telemetry Architecture](aircraft-telemetry-architecture.md) | X-Plane Web API telemetry integration (replaced ForeFlight/XGPS2 UDP in v0.4.0) |
 
 ## Operations
 

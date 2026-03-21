@@ -4,6 +4,8 @@
 
 **Date Created**: 2025-01-25
 
+> **Note (v0.4.0):** XGPS2/ForeFlight UDP telemetry has been replaced by the X-Plane Web API. Telemetry is now automatic — no setup required. References to ForeFlight, XGPS2, and circuit breaker in this document reflect the original test environment and methodology.
+
 ---
 
 ## Prerequisites
@@ -39,10 +41,12 @@ mkdir -p ~/.xearthlayer/flight_logs
   ```
 - Consider clearing disk cache for first flight only to see full loading patterns
 
-### 4. ForeFlight/Telemetry
+### 4. Telemetry
 
-- Ensure X-Plane is configured to send UDP telemetry
-- Verify XEarthLayer shows "GPS: Connected" in dashboard before takeoff
+> **v0.4.0+:** Telemetry is automatic via the X-Plane Web API — no manual setup needed. The instructions below applied to the original XGPS2/ForeFlight UDP setup used during these test flights.
+
+- ~~Ensure X-Plane is configured to send UDP telemetry~~
+- ~~Verify XEarthLayer shows "GPS: Connected" in dashboard before takeoff~~
 
 ---
 
@@ -246,11 +250,13 @@ DEBUG Requesting DDS generation: tile_row=1314, tile_col=2161, tile_zoom=12
 DEBUG DDS request completed: tile_row=1314, tile_col=2161, cache_hit=false, duration_ms=1234
 ```
 
-### Circuit Breaker (loading detection)
+### Sim State (loading detection, v0.4.0+)
 ```
-INFO Circuit breaker OPEN - prefetch paused (high FUSE load)
-INFO Circuit breaker CLOSED - prefetch resumed
+INFO SimState: scene loading detected - prefetch paused
+INFO SimState: scene loading complete - prefetch resumed
 ```
+
+> **Historical note:** Prior to v0.4.0, this role was filled by the CircuitBreaker (monitoring FUSE request rates). It has been replaced by SimState detection via the X-Plane Web API.
 
 ### Burst Detection
 ```
@@ -296,8 +302,8 @@ grep "Requesting DDS generation" flight_1_south.log | wc -l
 # Position updates
 grep "APT position update" flight_1_south.log
 
-# Circuit breaker state changes
-grep "Circuit breaker" flight_1_south.log
+# Sim state changes (v0.4.0+) / Circuit breaker state changes (pre-v0.4.0)
+grep -E "SimState|Circuit breaker" flight_1_south.log
 ```
 
 ---

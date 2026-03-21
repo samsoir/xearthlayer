@@ -38,8 +38,6 @@ pub struct ConfigFile {
     pub patches: PatchesSettings,
     /// Executor daemon settings for job/task framework
     pub executor: ExecutorSettings,
-    /// Online network settings for VATSIM/IVAO/PilotEdge position
-    pub online_network: OnlineNetworkSettings,
     /// FUSE filesystem settings
     pub fuse: FuseSettings,
 }
@@ -177,21 +175,14 @@ pub struct PrefetchSettings {
     /// - "opportunistic": Circuit breaker triggers (moderate connections)
     /// - "disabled": Disable prefetch
     pub mode: String,
-    /// UDP port for X-Plane telemetry (default: 49002 for ForeFlight protocol)
-    pub udp_port: u16,
+    /// Web API port for X-Plane SimState polling (default: 8086)
+    pub web_api_port: u16,
     /// Maximum tiles to submit per prefetch cycle. Default: 200.
     /// Lower values reduce bandwidth competition with on-demand requests.
     pub max_tiles_per_cycle: usize,
     /// Interval between prefetch cycles in milliseconds. Default: 2000ms.
     /// Higher values reduce prefetch aggressiveness.
     pub cycle_interval_ms: u64,
-    /// How long (milliseconds) resource saturation must be sustained to open circuit.
-    /// Default: 500ms (0.5 seconds) to catch bursty loads.
-    pub circuit_breaker_open_ms: u64,
-    /// Cooloff time (seconds) before trying to close the circuit.
-    /// Default: 5 seconds.
-    pub circuit_breaker_half_open_secs: u64,
-
     // Adaptive prefetch calibration settings
     /// Minimum throughput for aggressive mode (tiles/sec).
     /// If measured throughput exceeds this, aggressive (position-based) prefetch is enabled.
@@ -327,29 +318,6 @@ pub struct ExecutorSettings {
     pub retry_base_delay_ms: u64,
 }
 
-/// Online network settings for position from ATC networks (VATSIM, IVAO, PilotEdge).
-#[derive(Debug, Clone)]
-pub struct OnlineNetworkSettings {
-    /// Enable/disable online network position fetching.
-    /// Default: false
-    pub enabled: bool,
-    /// Network type: "vatsim", "ivao", or "pilotedge".
-    /// Default: "vatsim"
-    pub network_type: String,
-    /// Pilot identifier (CID for VATSIM).
-    /// Default: 0 (disabled)
-    pub pilot_id: u64,
-    /// API URL (for VATSIM, the V3 JSON data feed).
-    /// Default: "https://status.vatsim.net/status.json"
-    pub api_url: String,
-    /// Poll interval in seconds.
-    /// Default: 15
-    pub poll_interval_secs: u64,
-    /// Maximum age in seconds before data is considered stale.
-    /// Default: 60
-    pub max_stale_secs: u64,
-}
-
 /// FUSE filesystem settings for kernel background request limits.
 #[derive(Debug, Clone)]
 pub struct FuseSettings {
@@ -361,17 +329,4 @@ pub struct FuseSettings {
     /// Kernel starts throttling when pending requests exceed this.
     /// Default: 192 (75% of max_background)
     pub congestion_threshold: u16,
-}
-
-impl Default for OnlineNetworkSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            network_type: "vatsim".to_string(),
-            pilot_id: 0,
-            api_url: crate::aircraft_position::network::DEFAULT_VATSIM_DATA_URL.to_string(),
-            poll_interval_secs: crate::aircraft_position::network::DEFAULT_POLL_INTERVAL_SECS,
-            max_stale_secs: crate::aircraft_position::network::DEFAULT_MAX_STALE_SECS,
-        }
-    }
 }
