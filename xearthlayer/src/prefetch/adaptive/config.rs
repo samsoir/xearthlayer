@@ -205,6 +205,8 @@ impl AdaptivePrefetchConfig {
             stale_region_timeout: Duration::from_secs(settings.stale_region_timeout),
             default_window_rows: settings.default_window_rows,
             window_lon_extent: settings.window_lon_extent,
+            box_extent: settings.box_extent,
+            box_max_bias: settings.box_max_bias,
             ..Default::default()
         }
     }
@@ -237,6 +239,8 @@ impl AdaptivePrefetchConfig {
             stale_region_timeout: Duration::from_secs(config.stale_region_timeout),
             default_window_rows: config.default_window_rows,
             window_lon_extent: config.window_lon_extent,
+            box_extent: config.box_extent,
+            box_max_bias: config.box_max_bias,
             ..Default::default()
         }
     }
@@ -517,6 +521,8 @@ mod tests {
             stale_region_timeout: 300,
             default_window_rows: 4,
             window_lon_extent: 4.0,
+            box_extent: 11.0,
+            box_max_bias: 0.7,
         };
 
         let config = AdaptivePrefetchConfig::from_prefetch_settings(&settings);

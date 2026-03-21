@@ -366,8 +366,8 @@ The system uses flight phase detection and performance calibration:
 | `landing_hysteresis_secs` | integer | `15` | Sustained seconds at GS < 40kt before landing detection (5-60) |
 | `ramp_duration_secs` | integer | `30` | Duration of linear ramp to full prefetch rate (10-120) |
 | `ramp_start_fraction` | float | `0.25` | Starting prefetch fraction when ramp begins (0.1-0.5) |
-| `forward_margin` | float | `3.0` | Degrees ahead of aircraft in direction of travel per axis (1.0-6.0) |
-| `behind_margin` | float | `1.0` | Degrees behind aircraft per axis (0.5-3.0) |
+| `box_extent` | float | `9.0` | Prefetch box extent per axis in degrees (7.0-15.0). X-Plane loads ~6×6 DSF; 9° covers with 1.5° overlap |
+| `box_max_bias` | float | `0.8` | Maximum forward bias fraction (0.5-0.9). 0.5 = symmetric, 0.8 = 80/20 at cardinal headings |
 | `trigger_distance` | float | `1.0` | *(Legacy, unused in cruise)* Distance from window edge (0.5-3.0) |
 | `load_depth_lat` | integer | `3` | *(Legacy, unused in cruise)* DSF rows for boundary crossings (1-5) |
 | `load_depth_lon` | integer | `2` | *(Legacy, unused in cruise)* DSF columns for boundary crossings (1-5) |

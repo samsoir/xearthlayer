@@ -223,6 +223,15 @@ default_window_rows = {}
 ; Columns computed dynamically: ceil(lon_extent / cos(latitude))
 window_lon_extent = {}
 
+; Sliding prefetch box settings
+; Total prefetch box extent per axis in degrees (default: 9.0, range: 7.0-15.0)
+; X-Plane loads ~6x6 DSF area; 9 degrees covers this with 1.5 degree overlap on all sides
+box_extent = {}
+; Maximum forward bias fraction (default: 0.8, range: 0.5-0.9)
+; Controls how much the prefetch box shifts forward in the direction of travel
+; 0.5 = symmetric, 0.8 = 80% ahead / 20% behind on the primary axis
+box_max_bias = {}
+
 [control_plane]
 ; Advanced settings for job management and health monitoring.
 ; Defaults are tuned for most systems. Only modify if you understand the implications.
@@ -327,6 +336,8 @@ congestion_threshold = {}
         config.prefetch.stale_region_timeout,
         config.prefetch.default_window_rows,
         config.prefetch.window_lon_extent,
+        config.prefetch.box_extent,
+        config.prefetch.box_max_bias,
         config.control_plane.max_concurrent_jobs,
         config.control_plane.stall_threshold_secs,
         config.control_plane.health_check_interval_secs,

@@ -113,7 +113,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 11. **Predictive Tile Caching** (`xearthlayer/src/prefetch/`)
     - `AdaptivePrefetchCoordinator` - Self-calibrating prefetch with flight phase detection
     - `GroundStrategy` - Ring-based prefetching for ground operations (GS < 40kt)
-    - `PrefetchBox` - Heading-biased sliding box (3° ahead / 1° behind per axis, cruise phase)
+    - `PrefetchBox` - Heading-biased sliding box (9° extent, proportional 80/20 bias, cruise phase)
     - `SceneryWindow` - Retention tracking and world rebuild detection
     - `BoundaryStrategy` - Region lifecycle management (InProgress/Prefetched/NoCoverage)
     - `PhaseDetector` - Ground/Cruise flight phase state machine

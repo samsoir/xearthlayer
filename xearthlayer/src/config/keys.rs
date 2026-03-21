@@ -102,6 +102,8 @@ pub enum ConfigKey {
     PrefetchStaleRegionTimeout,
     PrefetchDefaultWindowRows,
     PrefetchWindowLonExtent,
+    PrefetchBoxExtent,
+    PrefetchBoxMaxBias,
 
     // Control plane settings
     ControlPlaneMaxConcurrentJobs,
@@ -201,6 +203,8 @@ impl FromStr for ConfigKey {
             "prefetch.stale_region_timeout" => Ok(ConfigKey::PrefetchStaleRegionTimeout),
             "prefetch.default_window_rows" => Ok(ConfigKey::PrefetchDefaultWindowRows),
             "prefetch.window_lon_extent" => Ok(ConfigKey::PrefetchWindowLonExtent),
+            "prefetch.box_extent" => Ok(ConfigKey::PrefetchBoxExtent),
+            "prefetch.box_max_bias" => Ok(ConfigKey::PrefetchBoxMaxBias),
 
             "control_plane.max_concurrent_jobs" => Ok(ConfigKey::ControlPlaneMaxConcurrentJobs),
             "control_plane.stall_threshold_secs" => Ok(ConfigKey::ControlPlaneStallThresholdSecs),
@@ -295,6 +299,8 @@ impl ConfigKey {
             ConfigKey::PrefetchStaleRegionTimeout => "prefetch.stale_region_timeout",
             ConfigKey::PrefetchDefaultWindowRows => "prefetch.default_window_rows",
             ConfigKey::PrefetchWindowLonExtent => "prefetch.window_lon_extent",
+            ConfigKey::PrefetchBoxExtent => "prefetch.box_extent",
+            ConfigKey::PrefetchBoxMaxBias => "prefetch.box_max_bias",
             ConfigKey::ControlPlaneMaxConcurrentJobs => "control_plane.max_concurrent_jobs",
             ConfigKey::ControlPlaneStallThresholdSecs => "control_plane.stall_threshold_secs",
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => {
@@ -437,6 +443,8 @@ impl ConfigKey {
             }
             ConfigKey::PrefetchDefaultWindowRows => config.prefetch.default_window_rows.to_string(),
             ConfigKey::PrefetchWindowLonExtent => config.prefetch.window_lon_extent.to_string(),
+            ConfigKey::PrefetchBoxExtent => config.prefetch.box_extent.to_string(),
+            ConfigKey::PrefetchBoxMaxBias => config.prefetch.box_max_bias.to_string(),
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs.to_string()
             }
@@ -652,6 +660,12 @@ impl ConfigKey {
             ConfigKey::PrefetchWindowLonExtent => {
                 config.prefetch.window_lon_extent = value.parse().unwrap();
             }
+            ConfigKey::PrefetchBoxExtent => {
+                config.prefetch.box_extent = value.parse().unwrap();
+            }
+            ConfigKey::PrefetchBoxMaxBias => {
+                config.prefetch.box_max_bias = value.parse().unwrap();
+            }
             ConfigKey::ControlPlaneMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs = value.parse().unwrap();
             }
@@ -791,6 +805,8 @@ impl ConfigKey {
             ConfigKey::PrefetchStaleRegionTimeout => Box::new(IntegerRangeSpec::new(30, 600)),
             ConfigKey::PrefetchDefaultWindowRows => Box::new(IntegerRangeSpec::new(2, 12)),
             ConfigKey::PrefetchWindowLonExtent => Box::new(FloatRangeSpec::new(1.0, 10.0)),
+            ConfigKey::PrefetchBoxExtent => Box::new(FloatRangeSpec::new(7.0, 15.0)),
+            ConfigKey::PrefetchBoxMaxBias => Box::new(FloatRangeSpec::new(0.5, 0.9)),
             ConfigKey::ControlPlaneMaxConcurrentJobs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneStallThresholdSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ControlPlaneHealthCheckIntervalSecs => Box::new(PositiveIntegerSpec),
@@ -870,6 +886,8 @@ impl ConfigKey {
             ConfigKey::PrefetchStaleRegionTimeout,
             ConfigKey::PrefetchDefaultWindowRows,
             ConfigKey::PrefetchWindowLonExtent,
+            ConfigKey::PrefetchBoxExtent,
+            ConfigKey::PrefetchBoxMaxBias,
             ConfigKey::ControlPlaneMaxConcurrentJobs,
             ConfigKey::ControlPlaneStallThresholdSecs,
             ConfigKey::ControlPlaneHealthCheckIntervalSecs,

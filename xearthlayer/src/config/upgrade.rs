@@ -107,6 +107,9 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "prefetch.circuit_breaker_half_open_secs",
     // Removed - UDP telemetry replaced by X-Plane Web API polling
     "prefetch.udp_port",
+    // Removed - replaced by box_extent and box_max_bias (sliding prefetch box)
+    "prefetch.forward_margin",
+    "prefetch.behind_margin",
 ];
 
 /// Result of analyzing a configuration file for upgrade needs.

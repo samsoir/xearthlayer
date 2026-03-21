@@ -130,6 +130,12 @@ pub struct PrefetchConfig {
 
     /// Longitude extent in degrees for dynamic column computation.
     pub window_lon_extent: f64,
+
+    /// Total prefetch box extent per axis in degrees.
+    pub box_extent: f64,
+
+    /// Maximum forward bias fraction (0.5 = symmetric, 0.8 = 80/20).
+    pub box_max_bias: f64,
 }
 
 /// Prewarm-specific configuration extracted from ConfigFile.
@@ -215,6 +221,8 @@ impl OrchestratorConfig {
             stale_region_timeout: config.prefetch.stale_region_timeout,
             default_window_rows: config.prefetch.default_window_rows,
             window_lon_extent: config.prefetch.window_lon_extent,
+            box_extent: config.prefetch.box_extent,
+            box_max_bias: config.prefetch.box_max_bias,
         };
 
         // Extract prewarm configuration
