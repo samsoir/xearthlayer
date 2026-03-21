@@ -113,8 +113,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 11. **Predictive Tile Caching** (`xearthlayer/src/prefetch/`)
     - `AdaptivePrefetchCoordinator` - Self-calibrating prefetch with flight phase detection
     - `GroundStrategy` - Ring-based prefetching for ground operations (GS < 40kt)
-    - `PrefetchBox` - Heading-biased sliding box (9° extent, proportional 80/20 bias, cruise phase)
-    - `SceneryWindow` - Retention tracking and world rebuild detection
+    - `PrefetchBox` - Heading-biased sliding box (6.5° extent, proportional 80/20 bias, cruise phase)
+    - `SceneryWindow` - Window config and dimensions holder
     - `BoundaryStrategy` - Region lifecycle management (InProgress/Prefetched/NoCoverage)
     - `PhaseDetector` - Ground/Cruise flight phase state machine
     - `PerformanceCalibrator` - Measures throughput during initial load for mode selection
@@ -311,10 +311,10 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/publisher/` | Package publisher library |
 | `xearthlayer/src/publisher/dedupe/` | Zoom level overlap detection and gap analysis |
 | `xearthlayer/src/prefetch/strategy.rs` | Prefetcher trait (strategy pattern) |
-| `xearthlayer/src/prefetch/adaptive/coordinator/core.rs` | AdaptivePrefetchCoordinator (boundary-driven prefetch) |
+| `xearthlayer/src/prefetch/adaptive/coordinator/core.rs` | AdaptivePrefetchCoordinator (sliding box prefetch) |
 | `xearthlayer/src/prefetch/adaptive/prefetch_box.rs` | PrefetchBox (heading-biased sliding prefetch region) |
-| `xearthlayer/src/prefetch/adaptive/scenery_window.rs` | SceneryWindow (retention tracking, world rebuild detection) |
-| `xearthlayer/src/prefetch/adaptive/boundary_strategy.rs` | BoundaryStrategy (boundary crossings to DSF region lists) |
+| `xearthlayer/src/prefetch/adaptive/scenery_window.rs` | SceneryWindow (window config and dimensions) |
+| `xearthlayer/src/prefetch/adaptive/boundary_strategy.rs` | BoundaryStrategy (region lifecycle management) |
 | `xearthlayer/src/prefetch/adaptive/ground_strategy.rs` | GroundStrategy (ring-based for ground ops) |
 | `xearthlayer/src/aircraft_position/web_api/adapter.rs` | WebApiAdapter - X-Plane Web API position source |
 | `xearthlayer/src/aircraft_position/web_api/client.rs` | Web API HTTP/WebSocket client |
