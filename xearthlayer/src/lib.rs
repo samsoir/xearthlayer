@@ -24,6 +24,8 @@ pub mod cache;
 pub mod config;
 pub mod coord;
 pub mod dds;
+#[cfg(feature = "debug-map")]
+pub mod debug_map;
 pub mod diagnostics;
 pub mod executor;
 pub mod fuse;

@@ -54,6 +54,7 @@ rlimit = "0.10"
 [features]
 profiling = ["xearthlayer/profiling"]
 gpu-encode = ["xearthlayer/gpu-encode"]
+debug-map = ["xearthlayer/debug-map"]
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
