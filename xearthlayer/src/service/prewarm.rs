@@ -206,18 +206,8 @@ impl PrewarmOrchestrator {
         // Get GeoIndex for patch-region filtering
         let geo_index = orchestrator.geo_index();
 
-        // Start prewarm with appropriate cache type
-        let handle = if let Some(memory_cache) = service.memory_cache_adapter() {
-            Self::start_prewarm_with_cache(
-                icao,
-                tiles,
-                dds_client,
-                memory_cache,
-                Arc::clone(&ortho_index),
-                geo_index.clone(),
-                runtime_handle,
-            )
-        } else if let Some(memory_cache) = service.memory_cache_bridge() {
+        // Start prewarm with memory cache for tile existence checks
+        let handle = if let Some(memory_cache) = service.memory_cache_bridge() {
             Self::start_prewarm_with_cache(
                 icao,
                 tiles,

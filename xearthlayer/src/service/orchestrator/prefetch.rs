@@ -40,10 +40,7 @@ impl ServiceOrchestrator {
 
         let runtime_handle = service.runtime_handle().clone();
 
-        // Try legacy adapter first, then new cache bridge architecture
-        if let Some(memory_cache) = service.memory_cache_adapter() {
-            self.start_prefetch_with_cache(&runtime_handle, dds_client, memory_cache)?;
-        } else if let Some(memory_cache) = service.memory_cache_bridge() {
+        if let Some(memory_cache) = service.memory_cache_bridge() {
             self.start_prefetch_with_cache(&runtime_handle, dds_client, memory_cache)?;
         } else {
             tracing::warn!("Memory cache not available, prefetch disabled");

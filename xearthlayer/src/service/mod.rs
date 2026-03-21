@@ -18,7 +18,7 @@
 //!     .build();
 //!
 //! // Create service
-//! let service = XEarthLayerService::new(config, ProviderConfig::bing())?;
+//! let service = XEarthLayerService::start(config, ProviderConfig::bing(), logger).await?;
 //!
 //! // Mount FUSE filesystem
 //! let handle = service.mount_package_async(package_path).await?;

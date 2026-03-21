@@ -12,7 +12,7 @@
 //! use xearthlayer::provider::ProviderConfig;
 //!
 //! let config = ServiceConfig::default();
-//! let service = XEarthLayerService::new(config, ProviderConfig::bing())?;
+//! let service = XEarthLayerService::start(config, ProviderConfig::bing(), logger).await?;
 //!
 //! // Mount FUSE filesystem for a scenery package
 //! let handle = service.mount_package_async(package_path).await?;

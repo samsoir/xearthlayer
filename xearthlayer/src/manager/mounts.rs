@@ -11,11 +11,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::cache::adapters::{DiskCacheBridge, MemoryCacheBridge};
-use crate::cache::MemoryCache;
 use crate::config::defaults::{DEFAULT_FUSE_CONGESTION_THRESHOLD, DEFAULT_FUSE_MAX_BACKGROUND};
 use crate::config::DiskIoProfile;
-use crate::executor::{MemoryCacheAdapter, StorageConcurrencyLimiter};
+use crate::executor::StorageConcurrencyLimiter;
 use crate::fuse::fuse3::Fuse3OrthoUnionFS;
 use crate::fuse::SpawnedMountHandle;
 use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage};
@@ -33,7 +31,7 @@ use crate::prefetch::TileRequestCallback;
 use crate::scene_tracker::{DefaultSceneTracker, FuseAccessEvent};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
 
-use super::local::{InstalledPackage, LocalPackageStore};
+use super::local::LocalPackageStore;
 use super::{ManagerError, ManagerResult};
 
 /// Information about an active mount.
@@ -421,46 +419,29 @@ impl MountManager {
         }
 
         // Create the service (owns the Tokio runtime for DDS generation)
-        // Use async service creation if no cache bridges are set (new architecture)
-        // Fall back to sync creation when cache bridges are pre-configured (legacy)
-        let service = if service_builder.cache_bridges().is_some() {
-            // Legacy path: use pre-configured cache bridges from CacheLayer
-            match service_builder.build_patches_service() {
-                Ok(s) => s,
-                Err(e) => {
-                    return ConsolidatedOrthoMountResult::failure(
-                        mountpoint,
-                        format!("Failed to create service: {}", e),
-                    );
-                }
+        // Use XEarthLayerService::start() with integrated cache and metrics
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(r) => r,
+            Err(e) => {
+                return ConsolidatedOrthoMountResult::failure(
+                    mountpoint,
+                    format!("Failed to create runtime for service: {}", e),
+                );
             }
-        } else {
-            // New path: use XEarthLayerService::start() with integrated cache and metrics
-            // We need a runtime to run the async service creation
-            let runtime = match tokio::runtime::Runtime::new() {
-                Ok(r) => r,
-                Err(e) => {
-                    return ConsolidatedOrthoMountResult::failure(
-                        mountpoint,
-                        format!("Failed to create runtime for service: {}", e),
-                    );
-                }
-            };
-
-            let mut service = match runtime.block_on(service_builder.build_service_async()) {
-                Ok(s) => s,
-                Err(e) => {
-                    return ConsolidatedOrthoMountResult::failure(
-                        mountpoint,
-                        format!("Failed to create service: {}", e),
-                    );
-                }
-            };
-
-            // Transfer runtime ownership to the service so it stays alive
-            service.set_owned_runtime(runtime);
-            service
         };
+
+        let mut service = match runtime.block_on(service_builder.build_service_async()) {
+            Ok(s) => s,
+            Err(e) => {
+                return ConsolidatedOrthoMountResult::failure(
+                    mountpoint,
+                    format!("Failed to create service: {}", e),
+                );
+            }
+        };
+
+        // Transfer runtime ownership to the service so it stays alive
+        service.set_owned_runtime(runtime);
 
         // Get DdsClient and runtime from the service
         let dds_client = match service.dds_client() {
@@ -854,9 +835,8 @@ impl Drop for MountManager {
 /// Builder for creating services for each package.
 ///
 /// This helper creates properly configured service instances for mounting.
-/// When multiple packages are mounted, all services share:
-/// - A single disk I/O concurrency limiter to prevent I/O exhaustion
-/// - A single memory cache to respect the configured memory limit globally
+/// Uses [`XEarthLayerService::start()`] to create services with integrated
+/// cache and metrics.
 pub struct ServiceBuilder {
     service_config: ServiceConfig,
     provider_config: crate::provider::ProviderConfig,
@@ -866,38 +846,9 @@ pub struct ServiceBuilder {
     /// Kept for potential future use with shared I/O limiting.
     #[allow(dead_code)]
     disk_io_limiter: Arc<StorageConcurrencyLimiter>,
-    /// Shared memory cache across all service instances (legacy).
-    /// Without this, each package would have its own cache with the full
-    /// configured limit, potentially using N times the expected memory.
-    shared_memory_cache: Option<Arc<MemoryCache>>,
-    /// Shared memory cache adapter (wraps cache with provider/format context).
-    shared_memory_cache_adapter: Option<Arc<MemoryCacheAdapter>>,
-    /// Cache bridges from the new CacheService architecture.
-    /// When set, these are used instead of the legacy cache system.
-    /// The DiskCacheBridge includes internal GC daemon (no external GC needed!).
-    cache_bridges: Option<CacheBridges>,
     /// Shared tile request callback for FUSE-based position inference.
     /// When set, all services forward tile requests to this callback.
     tile_request_callback: Option<TileRequestCallback>,
-}
-
-/// Cache bridges from the new CacheService architecture.
-///
-/// These bridges wrap `CacheService` instances that own their own lifecycle,
-/// including internal GC daemons. This eliminates the need for external
-/// GC daemon management.
-///
-/// The `runtime_handle` provides access to the Tokio runtime that manages
-/// the cache services, ensuring async operations can be executed even from
-/// non-async contexts.
-#[derive(Clone)]
-pub struct CacheBridges {
-    /// Memory cache bridge (implements executor::MemoryCache).
-    pub memory: Arc<MemoryCacheBridge>,
-    /// Disk cache bridge (implements executor::DiskCache, has internal GC!).
-    pub disk: Arc<DiskCacheBridge>,
-    /// Handle to the runtime managing the cache services.
-    pub runtime_handle: tokio::runtime::Handle,
 }
 
 impl ServiceBuilder {
@@ -957,76 +908,13 @@ impl ServiceBuilder {
             "Created shared disk I/O limiter for multi-package mounting"
         );
 
-        // Create shared memory cache if caching is enabled
-        // This ensures the configured memory limit is respected globally across all packages
-        let (shared_memory_cache, shared_memory_cache_adapter) = if service_config.cache_enabled() {
-            // Get memory cache size from config (or use default)
-            let mem_size = service_config
-                .cache_memory_size()
-                .unwrap_or(2 * 1024 * 1024 * 1024); // 2GB default
-
-            let cache = Arc::new(MemoryCache::new(mem_size));
-            let adapter = Arc::new(MemoryCacheAdapter::new(
-                Arc::clone(&cache),
-                provider_config.name(),
-                service_config.texture().format(),
-            ));
-
-            tracing::info!(
-                max_size_mb = mem_size / (1024 * 1024),
-                "Created shared memory cache for multi-package mounting"
-            );
-
-            (Some(cache), Some(adapter))
-        } else {
-            (None, None)
-        };
-
         Self {
             service_config,
             provider_config,
             logger,
             disk_io_limiter,
-            shared_memory_cache,
-            shared_memory_cache_adapter,
-            cache_bridges: None,
             tile_request_callback: None,
         }
-    }
-
-    /// Set the cache bridges from the CacheService architecture.
-    ///
-    /// When cache bridges are set, services will use the cache infrastructure
-    /// with internal GC daemons instead of the legacy external GC daemon.
-    ///
-    /// # Arguments
-    ///
-    /// * `bridges` - Cache bridges from `CacheLayer`
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use xearthlayer::service::CacheLayer;
-    /// use xearthlayer::manager::{ServiceBuilder, CacheBridges};
-    ///
-    /// let cache_layer = CacheLayer::start(cache_config).await?;
-    /// let bridges = CacheBridges {
-    ///     memory: cache_layer.memory_bridge(),
-    ///     disk: cache_layer.disk_bridge(),
-    ///     runtime_handle: cache_layer.runtime_handle(),
-    /// };
-    ///
-    /// let builder = ServiceBuilder::new(service_config, provider_config, logger)
-    ///     .with_cache_bridges(bridges);
-    /// ```
-    pub fn with_cache_bridges(mut self, bridges: CacheBridges) -> Self {
-        self.cache_bridges = Some(bridges);
-        self
-    }
-
-    /// Get the cache bridges if set.
-    pub fn cache_bridges(&self) -> Option<&CacheBridges> {
-        self.cache_bridges.as_ref()
     }
 
     /// Set the tile request callback for FUSE-based position inference.
@@ -1043,95 +931,10 @@ impl ServiceBuilder {
         self
     }
 
-    /// Build a service for the given package.
+    /// Build a service using `XEarthLayerService::start()`.
     ///
-    /// The service will share the disk I/O concurrency limiter and memory cache
-    /// with all other services built by this builder.
-    ///
-    /// If cache bridges are set (via `with_cache_bridges()`), the service uses
-    /// the new cache service architecture with internal GC. Otherwise, it uses
-    /// the legacy cache system.
-    pub fn build(&self, _package: &InstalledPackage) -> Result<XEarthLayerService, ServiceError> {
-        let mut service = self.build_service_internal()?;
-
-        // Wire tile request callback for FUSE-based position inference
-        if let Some(ref callback) = self.tile_request_callback {
-            service.set_tile_request_callback(callback.clone());
-        }
-
-        Ok(service)
-    }
-
-    /// Build a service for patches (no package required).
-    ///
-    /// This creates a service that can generate DDS textures for the patches
-    /// union filesystem. The service shares the same resources (disk I/O limiter,
-    /// memory cache, etc.) as services built for regional packages.
-    pub fn build_patches_service(&self) -> Result<XEarthLayerService, ServiceError> {
-        let mut service = self.build_service_internal()?;
-
-        // Wire tile request callback for FUSE-based position inference
-        if let Some(ref callback) = self.tile_request_callback {
-            service.set_tile_request_callback(callback.clone());
-        }
-
-        Ok(service)
-    }
-
-    /// Internal helper to build a service with either cache bridges or legacy cache.
-    fn build_service_internal(&self) -> Result<XEarthLayerService, ServiceError> {
-        // Use cache bridges if available (new architecture with internal GC)
-        if let Some(ref bridges) = self.cache_bridges {
-            // Use the runtime handle from cache bridges - this was provided by CacheLayer
-            // and ensures we have a valid Tokio runtime even from non-async contexts
-            let runtime_handle = bridges.runtime_handle.clone();
-            let service = XEarthLayerService::with_cache_bridges(
-                self.service_config.clone(),
-                self.provider_config.clone(),
-                self.logger.clone(),
-                runtime_handle,
-                Arc::clone(&bridges.memory),
-                Arc::clone(&bridges.disk),
-            )?;
-
-            tracing::debug!("Built service with cache bridges (internal GC)");
-            return Ok(service);
-        }
-
-        // Fall back to legacy cache system
-        let mut service = XEarthLayerService::new(
-            self.service_config.clone(),
-            self.provider_config.clone(),
-            self.logger.clone(),
-        )?;
-
-        // Set shared memory cache to ensure global memory limit is respected
-        // Without this, each package would have its own cache potentially using
-        // N times the configured memory limit
-        if let (Some(ref cache), Some(ref adapter)) =
-            (&self.shared_memory_cache, &self.shared_memory_cache_adapter)
-        {
-            service.set_shared_memory_cache(Arc::clone(cache), Arc::clone(adapter));
-        }
-
-        tracing::debug!("Built service with legacy cache (external GC required)");
-        Ok(service)
-    }
-
-    /// Build a service using `XEarthLayerService::start()` (recommended).
-    ///
-    /// This async method creates a service with integrated metrics and cache,
-    /// using the new architecture where:
-    /// - MetricsSystem is created first
-    /// - CacheLayer is created with MetricsClient (enables GC reporting)
-    /// - All components are properly wired
-    ///
-    /// This is the recommended way to create services as it ensures the GC
-    /// daemon has access to metrics for reporting cache evictions.
-    ///
-    /// # Returns
-    ///
-    /// A fully initialized `XEarthLayerService` with integrated cache and metrics.
+    /// Creates a service with integrated metrics and cache, ensuring
+    /// MetricsSystem, CacheLayer, and GC daemon are properly wired.
     ///
     /// # Errors
     ///

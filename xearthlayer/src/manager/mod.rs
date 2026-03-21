@@ -59,9 +59,7 @@ pub use error::{ManagerError, ManagerResult};
 pub use extractor::{check_required_tools, ShellExtractor};
 pub use installer::{InstallProgressCallback, InstallResult, InstallStage, PackageInstaller};
 pub use local::{InstalledPackage, LocalPackageStore, MountStatus};
-pub use mounts::{
-    ActiveMount, CacheBridges, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder,
-};
+pub use mounts::{ActiveMount, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder};
 pub use symlinks::{
     consolidated_overlay_exists, create_consolidated_overlay, remove_consolidated_overlay,
     remove_overlay_symlink, ConsolidatedOverlayResult, CONSOLIDATED_OVERLAY_NAME,

@@ -5,65 +5,11 @@
 
 use super::config::ServiceConfig;
 use super::error::ServiceError;
-use crate::cache::{MemoryCache, MemoryCacheConfig};
 use crate::provider::{
-    AsyncProviderFactory, AsyncProviderType, AsyncReqwestClient, Provider, ProviderConfig,
-    ProviderFactory, ReqwestClient,
+    AsyncProviderFactory, AsyncProviderType, AsyncReqwestClient, ProviderConfig,
 };
 use crate::texture::DdsTextureEncoder;
 use std::sync::Arc;
-use tokio::runtime::Handle;
-
-/// Result of provider initialization (sync constructors).
-pub struct ProviderComponents {
-    /// Sync provider (unused - kept for API compatibility, will be removed)
-    #[allow(dead_code)]
-    pub sync_provider: Arc<dyn Provider>,
-    /// Async provider for async pipeline (optional)
-    pub async_provider: Option<Arc<AsyncProviderType>>,
-    /// Provider name for cache directories
-    pub name: String,
-    /// Maximum zoom level supported
-    pub max_zoom: u8,
-}
-
-/// Result of cache initialization.
-pub struct CacheComponents {
-    /// Shared memory cache for async pipeline (DDS tiles in memory with LRU eviction).
-    pub memory_cache: Option<Arc<MemoryCache>>,
-}
-
-/// Create sync and async providers from configuration.
-pub fn create_providers(
-    config: &ProviderConfig,
-    runtime_handle: &Handle,
-) -> Result<ProviderComponents, ServiceError> {
-    // Create sync HTTP client for legacy pipeline
-    let http_client =
-        ReqwestClient::new().map_err(|e| ServiceError::HttpClientError(e.to_string()))?;
-
-    // Create sync provider using factory
-    let factory = ProviderFactory::new(http_client);
-    let (sync_provider, name, max_zoom) = factory.create(config)?;
-
-    // Create async HTTP client for async pipeline
-    let async_http_client =
-        AsyncReqwestClient::new().map_err(|e| ServiceError::HttpClientError(e.to_string()))?;
-
-    // Create async provider (optional - gracefully handle failures)
-    let async_factory = AsyncProviderFactory::new(async_http_client);
-    let async_provider = runtime_handle
-        .block_on(async_factory.create(config))
-        .map(|(provider, _, _)| Arc::new(provider))
-        .ok();
-
-    Ok(ProviderComponents {
-        sync_provider,
-        async_provider,
-        name,
-        max_zoom,
-    })
-}
 
 /// Result of async-only provider initialization.
 ///
@@ -186,37 +132,6 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
     })
 }
 
-/// Create cache components from configuration.
-///
-/// The async pipeline uses:
-/// - `MemoryCache` for DDS tiles (LRU eviction, shared across requests)
-/// - `ParallelDiskCache` for chunks (configured via `DdsHandlerBuilder::with_disk_cache`)
-pub fn create_cache(
-    config: &ServiceConfig,
-    _provider_name: &str,
-) -> Result<CacheComponents, ServiceError> {
-    if !config.cache_enabled() {
-        return Ok(CacheComponents { memory_cache: None });
-    }
-
-    // Get defaults from config types
-    let memory_defaults = MemoryCacheConfig::default();
-
-    let mut mem_size = memory_defaults.max_size_bytes;
-
-    // Apply user-configured overrides
-    if let Some(size) = config.cache_memory_size() {
-        mem_size = size;
-    }
-
-    // Create shared memory cache for async pipeline
-    let memory_cache = Arc::new(MemoryCache::new(mem_size));
-
-    Ok(CacheComponents {
-        memory_cache: Some(memory_cache),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,12 +239,5 @@ mod tests {
             components.gpu_worker_handle.is_none(),
             "ISPC compressor should not have a GPU worker handle"
         );
-    }
-
-    #[test]
-    fn test_cache_disabled_returns_noop() {
-        let config = ServiceConfig::builder().cache_enabled(false).build();
-        let result = create_cache(&config, "test").unwrap();
-        assert!(result.memory_cache.is_none());
     }
 }
