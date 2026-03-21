@@ -216,16 +216,6 @@ pub struct PrefetchSettings {
     pub ramp_start_fraction: f64,
 
     // Boundary-driven prefetch settings
-    /// Boundary trigger distance in degrees.
-    /// How close to a DSF boundary the aircraft must be to trigger prefetch.
-    /// Default: 1.5, Range: 0.5-3.0
-    pub trigger_distance: f64,
-    /// Load depth for latitude boundary crossings (ROW loads).
-    /// Default: 3, Range: 1-5
-    pub load_depth_lat: u8,
-    /// Load depth for longitude boundary crossings (COLUMN loads).
-    /// Default: 2, Range: 1-5
-    pub load_depth_lon: u8,
     /// Buffer tiles for retention.
     /// Extra tiles to retain beyond the visible window.
     /// Default: 1, Range: 0-3

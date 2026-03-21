@@ -110,15 +110,6 @@ pub struct PrefetchConfig {
     /// Starting prefetch fraction when ramp begins.
     pub ramp_start_fraction: f64,
 
-    /// Boundary trigger distance in degrees.
-    pub trigger_distance: f64,
-
-    /// Load depth for latitude boundary crossings (ROW loads).
-    pub load_depth_lat: u8,
-
-    /// Load depth for longitude boundary crossings (COLUMN loads).
-    pub load_depth_lon: u8,
-
     /// Buffer tiles for retention.
     pub window_buffer: u8,
 
@@ -214,9 +205,6 @@ impl OrchestratorConfig {
             landing_hysteresis_secs: config.prefetch.landing_hysteresis_secs,
             ramp_duration_secs: config.prefetch.ramp_duration_secs,
             ramp_start_fraction: config.prefetch.ramp_start_fraction,
-            trigger_distance: config.prefetch.trigger_distance,
-            load_depth_lat: config.prefetch.load_depth_lat,
-            load_depth_lon: config.prefetch.load_depth_lon,
             window_buffer: config.prefetch.window_buffer,
             stale_region_timeout: config.prefetch.stale_region_timeout,
             default_window_rows: config.prefetch.default_window_rows,

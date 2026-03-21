@@ -95,9 +95,6 @@ pub enum ConfigKey {
     PrefetchRampStartFraction,
 
     // Boundary-driven prefetch settings
-    PrefetchTriggerDistance,
-    PrefetchLoadDepthLat,
-    PrefetchLoadDepthLon,
     PrefetchWindowBuffer,
     PrefetchStaleRegionTimeout,
     PrefetchDefaultWindowRows,
@@ -196,9 +193,6 @@ impl FromStr for ConfigKey {
             "prefetch.landing_hysteresis_secs" => Ok(ConfigKey::PrefetchLandingHysteresisSecs),
             "prefetch.ramp_duration_secs" => Ok(ConfigKey::PrefetchRampDurationSecs),
             "prefetch.ramp_start_fraction" => Ok(ConfigKey::PrefetchRampStartFraction),
-            "prefetch.trigger_distance" => Ok(ConfigKey::PrefetchTriggerDistance),
-            "prefetch.load_depth_lat" => Ok(ConfigKey::PrefetchLoadDepthLat),
-            "prefetch.load_depth_lon" => Ok(ConfigKey::PrefetchLoadDepthLon),
             "prefetch.window_buffer" => Ok(ConfigKey::PrefetchWindowBuffer),
             "prefetch.stale_region_timeout" => Ok(ConfigKey::PrefetchStaleRegionTimeout),
             "prefetch.default_window_rows" => Ok(ConfigKey::PrefetchDefaultWindowRows),
@@ -292,9 +286,6 @@ impl ConfigKey {
             ConfigKey::PrefetchLandingHysteresisSecs => "prefetch.landing_hysteresis_secs",
             ConfigKey::PrefetchRampDurationSecs => "prefetch.ramp_duration_secs",
             ConfigKey::PrefetchRampStartFraction => "prefetch.ramp_start_fraction",
-            ConfigKey::PrefetchTriggerDistance => "prefetch.trigger_distance",
-            ConfigKey::PrefetchLoadDepthLat => "prefetch.load_depth_lat",
-            ConfigKey::PrefetchLoadDepthLon => "prefetch.load_depth_lon",
             ConfigKey::PrefetchWindowBuffer => "prefetch.window_buffer",
             ConfigKey::PrefetchStaleRegionTimeout => "prefetch.stale_region_timeout",
             ConfigKey::PrefetchDefaultWindowRows => "prefetch.default_window_rows",
@@ -434,9 +425,6 @@ impl ConfigKey {
             }
             ConfigKey::PrefetchRampDurationSecs => config.prefetch.ramp_duration_secs.to_string(),
             ConfigKey::PrefetchRampStartFraction => config.prefetch.ramp_start_fraction.to_string(),
-            ConfigKey::PrefetchTriggerDistance => config.prefetch.trigger_distance.to_string(),
-            ConfigKey::PrefetchLoadDepthLat => config.prefetch.load_depth_lat.to_string(),
-            ConfigKey::PrefetchLoadDepthLon => config.prefetch.load_depth_lon.to_string(),
             ConfigKey::PrefetchWindowBuffer => config.prefetch.window_buffer.to_string(),
             ConfigKey::PrefetchStaleRegionTimeout => {
                 config.prefetch.stale_region_timeout.to_string()
@@ -639,15 +627,6 @@ impl ConfigKey {
             ConfigKey::PrefetchRampStartFraction => {
                 config.prefetch.ramp_start_fraction = value.parse().unwrap();
             }
-            ConfigKey::PrefetchTriggerDistance => {
-                config.prefetch.trigger_distance = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchLoadDepthLat => {
-                config.prefetch.load_depth_lat = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchLoadDepthLon => {
-                config.prefetch.load_depth_lon = value.parse().unwrap();
-            }
             ConfigKey::PrefetchWindowBuffer => {
                 config.prefetch.window_buffer = value.parse().unwrap();
             }
@@ -798,9 +777,6 @@ impl ConfigKey {
             ConfigKey::PrefetchLandingHysteresisSecs => Box::new(IntegerRangeSpec::new(5, 60)),
             ConfigKey::PrefetchRampDurationSecs => Box::new(IntegerRangeSpec::new(10, 120)),
             ConfigKey::PrefetchRampStartFraction => Box::new(FloatRangeSpec::new(0.1, 0.5)),
-            ConfigKey::PrefetchTriggerDistance => Box::new(FloatRangeSpec::new(0.5, 3.0)),
-            ConfigKey::PrefetchLoadDepthLat => Box::new(IntegerRangeSpec::new(1, 5)),
-            ConfigKey::PrefetchLoadDepthLon => Box::new(IntegerRangeSpec::new(1, 5)),
             ConfigKey::PrefetchWindowBuffer => Box::new(IntegerRangeSpec::new(0, 3)),
             ConfigKey::PrefetchStaleRegionTimeout => Box::new(IntegerRangeSpec::new(30, 600)),
             ConfigKey::PrefetchDefaultWindowRows => Box::new(IntegerRangeSpec::new(2, 12)),
@@ -879,9 +855,6 @@ impl ConfigKey {
             ConfigKey::PrefetchLandingHysteresisSecs,
             ConfigKey::PrefetchRampDurationSecs,
             ConfigKey::PrefetchRampStartFraction,
-            ConfigKey::PrefetchTriggerDistance,
-            ConfigKey::PrefetchLoadDepthLat,
-            ConfigKey::PrefetchLoadDepthLon,
             ConfigKey::PrefetchWindowBuffer,
             ConfigKey::PrefetchStaleRegionTimeout,
             ConfigKey::PrefetchDefaultWindowRows,
@@ -1345,39 +1318,6 @@ mod tests {
     }
 
     #[test]
-    fn test_trigger_distance_config_key() {
-        let key = ConfigKey::from_str("prefetch.trigger_distance").unwrap();
-        assert_eq!(key.name(), "prefetch.trigger_distance");
-        assert!(key.validate("1.5").is_ok());
-        assert!(key.validate("0.5").is_ok());
-        assert!(key.validate("3.0").is_ok());
-        assert!(key.validate("0.3").is_err()); // below 0.5 minimum
-        assert!(key.validate("4.0").is_err()); // above 3.0 maximum
-    }
-
-    #[test]
-    fn test_load_depth_lat_config_key() {
-        let key = ConfigKey::from_str("prefetch.load_depth_lat").unwrap();
-        assert_eq!(key.name(), "prefetch.load_depth_lat");
-        assert!(key.validate("3").is_ok());
-        assert!(key.validate("1").is_ok());
-        assert!(key.validate("5").is_ok());
-        assert!(key.validate("0").is_err());
-        assert!(key.validate("6").is_err());
-    }
-
-    #[test]
-    fn test_load_depth_lon_config_key() {
-        let key = ConfigKey::from_str("prefetch.load_depth_lon").unwrap();
-        assert_eq!(key.name(), "prefetch.load_depth_lon");
-        assert!(key.validate("2").is_ok());
-        assert!(key.validate("1").is_ok());
-        assert!(key.validate("5").is_ok());
-        assert!(key.validate("0").is_err());
-        assert!(key.validate("6").is_err());
-    }
-
-    #[test]
     fn test_window_buffer_config_key() {
         let key = ConfigKey::from_str("prefetch.window_buffer").unwrap();
         assert_eq!(key.name(), "prefetch.window_buffer");
@@ -1423,9 +1363,6 @@ mod tests {
     #[test]
     fn test_new_prefetch_keys_in_all() {
         let all = ConfigKey::all();
-        assert!(all.contains(&ConfigKey::PrefetchTriggerDistance));
-        assert!(all.contains(&ConfigKey::PrefetchLoadDepthLat));
-        assert!(all.contains(&ConfigKey::PrefetchLoadDepthLon));
         assert!(all.contains(&ConfigKey::PrefetchWindowBuffer));
         assert!(all.contains(&ConfigKey::PrefetchStaleRegionTimeout));
         assert!(all.contains(&ConfigKey::PrefetchDefaultWindowRows));
@@ -1435,21 +1372,6 @@ mod tests {
     #[test]
     fn test_boundary_prefetch_keys_round_trip() {
         let mut config = ConfigFile::default();
-
-        ConfigKey::PrefetchTriggerDistance
-            .set(&mut config, "2.0")
-            .unwrap();
-        assert_eq!(ConfigKey::PrefetchTriggerDistance.get(&config), "2");
-
-        ConfigKey::PrefetchLoadDepthLat
-            .set(&mut config, "4")
-            .unwrap();
-        assert_eq!(ConfigKey::PrefetchLoadDepthLat.get(&config), "4");
-
-        ConfigKey::PrefetchLoadDepthLon
-            .set(&mut config, "3")
-            .unwrap();
-        assert_eq!(ConfigKey::PrefetchLoadDepthLon.get(&config), "3");
 
         ConfigKey::PrefetchWindowBuffer
             .set(&mut config, "2")

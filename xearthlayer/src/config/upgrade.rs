@@ -110,6 +110,10 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     // Removed - replaced by box_extent and box_max_bias (sliding prefetch box)
     "prefetch.forward_margin",
     "prefetch.behind_margin",
+    // Removed in #94 — boundary monitors replaced by sliding prefetch box
+    "prefetch.trigger_distance",
+    "prefetch.load_depth_lat",
+    "prefetch.load_depth_lon",
 ];
 
 /// Result of analyzing a configuration file for upgrade needs.

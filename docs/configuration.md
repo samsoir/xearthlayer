@@ -368,9 +368,6 @@ The system uses flight phase detection and performance calibration:
 | `ramp_start_fraction` | float | `0.25` | Starting prefetch fraction when ramp begins (0.1-0.5) |
 | `box_extent` | float | `9.0` | Prefetch box extent per axis in degrees (7.0-15.0). X-Plane loads ~6×6 DSF; 9° covers with 1.5° overlap |
 | `box_max_bias` | float | `0.8` | Maximum forward bias fraction (0.5-0.9). 0.5 = symmetric, 0.8 = 80/20 at cardinal headings |
-| `trigger_distance` | float | `1.0` | *(Legacy, unused in cruise)* Distance from window edge (0.5-3.0) |
-| `load_depth_lat` | integer | `3` | *(Legacy, unused in cruise)* DSF rows for boundary crossings (1-5) |
-| `load_depth_lon` | integer | `2` | *(Legacy, unused in cruise)* DSF columns for boundary crossings (1-5) |
 | `window_buffer` | integer | `1` | Extra DSF tiles around window edges to retain (0-3) |
 | `stale_region_timeout` | integer | `120` | Seconds before an InProgress region is considered stale (30-600) |
 | `default_window_rows` | integer | `3` | Scenery window height in DSF rows — ~3° at all latitudes (2-12) |
@@ -410,9 +407,6 @@ ramp_duration_secs = 30                      ; Linear ramp duration after hold r
 ramp_start_fraction = 0.25                   ; Starting prefetch fraction (25%)
 
 ; Boundary-driven prefetch (cruise mode)
-; trigger_distance = 1.0                     ; Distance from edge (degrees) to trigger
-; load_depth_lat = 3                         ; DSF rows for latitude boundary crossings
-; load_depth_lon = 2                         ; DSF columns for longitude boundary crossings
 ; window_buffer = 1                          ; Extra DSF tiles around window edges
 ; stale_region_timeout = 120                 ; Seconds before InProgress region is stale
 ; default_window_rows = 3                    ; Scenery window height (DSF rows, ~3° worldwide)
@@ -634,9 +628,6 @@ mode = auto                    ; auto, aggressive, opportunistic, disabled
 ; ramp_start_fraction = 0.25                 ; starting prefetch fraction
 
 ; Boundary-driven prefetch (cruise mode)
-; trigger_distance = 1.0                     ; distance from edge (degrees) to trigger
-; load_depth_lat = 3                         ; DSF rows for latitude boundary crossings
-; load_depth_lon = 2                         ; DSF columns for longitude boundary crossings
 ; window_buffer = 1                          ; extra DSF tiles around window edges
 ; stale_region_timeout = 120                 ; seconds before InProgress region is stale
 ; default_window_rows = 3                    ; scenery window height (DSF rows)
@@ -785,9 +776,6 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `prefetch.landing_hysteresis_secs` | 5-60 | Sustained GS < 40kt for landing detection |
 | `prefetch.ramp_duration_secs` | 10-120 | Linear ramp duration (seconds) |
 | `prefetch.ramp_start_fraction` | 0.1-0.5 | Starting prefetch fraction |
-| `prefetch.trigger_distance` | 0.5-3.0 | Distance from window edge (degrees) to trigger prefetch |
-| `prefetch.load_depth_lat` | 1-5 | DSF rows for latitude boundary crossings |
-| `prefetch.load_depth_lon` | 1-5 | DSF columns for longitude boundary crossings |
 | `prefetch.window_buffer` | 0-3 | Extra DSF tiles around window edges |
 | `prefetch.stale_region_timeout` | 30-600 | Seconds before InProgress region is stale |
 | `prefetch.default_window_rows` | 2-12 | Scenery window height (DSF rows) |

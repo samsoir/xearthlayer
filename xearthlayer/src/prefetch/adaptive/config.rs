@@ -91,20 +91,6 @@ pub struct AdaptivePrefetchConfig {
     pub ramp_start_fraction: f64,
 
     // Boundary-driven prefetch settings
-    /// Boundary trigger distance in degrees.
-    ///
-    /// How close to a DSF boundary the aircraft must be to trigger prefetch.
-    /// Range: 0.5 - 3.0
-    pub trigger_distance: f64,
-
-    /// Load depth for latitude boundary crossings (ROW loads).
-    /// Range: 1 - 5
-    pub load_depth_lat: u8,
-
-    /// Load depth for longitude boundary crossings (COLUMN loads).
-    /// Range: 1 - 5
-    pub load_depth_lon: u8,
-
     /// Buffer tiles for retention.
     ///
     /// Extra tiles to retain beyond the visible window.
@@ -161,9 +147,6 @@ impl Default for AdaptivePrefetchConfig {
             landing_hysteresis: Duration::from_secs(15),
             ramp_duration: Duration::from_secs(30),
             ramp_start_fraction: 0.25,
-            trigger_distance: 1.0,
-            load_depth_lat: 3,
-            load_depth_lon: 2,
             window_buffer: 1,
             stale_region_timeout: Duration::from_secs(120),
             default_window_rows: 3,
@@ -198,9 +181,6 @@ impl AdaptivePrefetchConfig {
             landing_hysteresis: Duration::from_secs(settings.landing_hysteresis_secs),
             ramp_duration: Duration::from_secs(settings.ramp_duration_secs),
             ramp_start_fraction: settings.ramp_start_fraction,
-            trigger_distance: settings.trigger_distance,
-            load_depth_lat: settings.load_depth_lat,
-            load_depth_lon: settings.load_depth_lon,
             window_buffer: settings.window_buffer,
             stale_region_timeout: Duration::from_secs(settings.stale_region_timeout),
             default_window_rows: settings.default_window_rows,
@@ -232,9 +212,6 @@ impl AdaptivePrefetchConfig {
             landing_hysteresis: Duration::from_secs(config.landing_hysteresis_secs),
             ramp_duration: Duration::from_secs(config.ramp_duration_secs),
             ramp_start_fraction: config.ramp_start_fraction,
-            trigger_distance: config.trigger_distance,
-            load_depth_lat: config.load_depth_lat,
-            load_depth_lon: config.load_depth_lon,
             window_buffer: config.window_buffer,
             stale_region_timeout: Duration::from_secs(config.stale_region_timeout),
             default_window_rows: config.default_window_rows,
@@ -488,9 +465,6 @@ mod tests {
     #[test]
     fn test_default_config_boundary_prefetch() {
         let config = AdaptivePrefetchConfig::default();
-        assert_eq!(config.trigger_distance, 1.0);
-        assert_eq!(config.load_depth_lat, 3);
-        assert_eq!(config.load_depth_lon, 2);
         assert_eq!(config.window_buffer, 1);
         assert_eq!(config.stale_region_timeout, Duration::from_secs(120));
         assert_eq!(config.default_window_rows, 3);
@@ -514,9 +488,6 @@ mod tests {
             landing_hysteresis_secs: 15,
             ramp_duration_secs: 30,
             ramp_start_fraction: 0.25,
-            trigger_distance: 2.0,
-            load_depth_lat: 4,
-            load_depth_lon: 3,
             window_buffer: 2,
             stale_region_timeout: 300,
             default_window_rows: 4,
@@ -526,9 +497,6 @@ mod tests {
         };
 
         let config = AdaptivePrefetchConfig::from_prefetch_settings(&settings);
-        assert_eq!(config.trigger_distance, 2.0);
-        assert_eq!(config.load_depth_lat, 4);
-        assert_eq!(config.load_depth_lon, 3);
         assert_eq!(config.window_buffer, 2);
         assert_eq!(config.stale_region_timeout, Duration::from_secs(300));
         assert_eq!(config.default_window_rows, 4);

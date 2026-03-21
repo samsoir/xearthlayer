@@ -424,43 +424,6 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
                     reason: "must be a number between 0.1 and 0.5".to_string(),
                 })?;
         }
-        // Boundary-driven prefetch settings
-        if let Some(v) = section.get("trigger_distance") {
-            config.prefetch.trigger_distance =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "prefetch".to_string(),
-                    key: "trigger_distance".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a number between 0.5 and 3.0".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("load_depth_lat") {
-            config.prefetch.load_depth_lat =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "prefetch".to_string(),
-                    key: "load_depth_lat".to_string(),
-                    value: v.to_string(),
-                    reason: "must be an integer between 1 and 5".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("load_depth_lon") {
-            config.prefetch.load_depth_lon =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "prefetch".to_string(),
-                    key: "load_depth_lon".to_string(),
-                    value: v.to_string(),
-                    reason: "must be an integer between 1 and 5".to_string(),
-                })?;
-        }
-        // Legacy fallback: if old "load_depth" is present, use for both axes
-        if let Some(v) = section.get("load_depth") {
-            if section.get("load_depth_lat").is_none() && section.get("load_depth_lon").is_none() {
-                if let Ok(depth) = v.parse::<u8>() {
-                    config.prefetch.load_depth_lat = depth;
-                    config.prefetch.load_depth_lon = depth;
-                }
-            }
-        }
         if let Some(v) = section.get("window_buffer") {
             config.prefetch.window_buffer =
                 v.parse().map_err(|_| ConfigFileError::InvalidValue {

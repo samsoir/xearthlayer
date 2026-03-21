@@ -188,20 +188,6 @@ pub const DEFAULT_RAMP_START_FRACTION: f64 = 0.25;
 // Boundary-driven prefetch defaults
 // =============================================================================
 
-/// Default boundary trigger distance in degrees.
-/// Must be < half the window height (1.5° for 3° window) to create a dead
-/// zone at center where crossings don't fire. 1.0° gives 0.5° dead zone
-/// on each side after re-centering.
-pub const DEFAULT_PREFETCH_TRIGGER_DISTANCE: f64 = 1.0;
-
-/// Default load depth for latitude boundary crossings (ROW loads).
-/// Empirically measured: 3 rows deep × 3-4 cols wide (73% of FUSE burst events).
-pub const DEFAULT_PREFETCH_LOAD_DEPTH_LAT: u8 = 3;
-
-/// Default load depth for longitude boundary crossings (COLUMN loads).
-/// Empirically measured: 2 cols deep × 3-4 rows wide (64% of FUSE burst events).
-pub const DEFAULT_PREFETCH_LOAD_DEPTH_LON: u8 = 2;
-
 /// Default buffer tiles for retention.
 pub const DEFAULT_PREFETCH_WINDOW_BUFFER: u8 = 1;
 
@@ -377,9 +363,6 @@ impl Default for ConfigFile {
                 landing_hysteresis_secs: DEFAULT_LANDING_HYSTERESIS_SECS,
                 ramp_duration_secs: DEFAULT_RAMP_DURATION_SECS,
                 ramp_start_fraction: DEFAULT_RAMP_START_FRACTION,
-                trigger_distance: DEFAULT_PREFETCH_TRIGGER_DISTANCE,
-                load_depth_lat: DEFAULT_PREFETCH_LOAD_DEPTH_LAT,
-                load_depth_lon: DEFAULT_PREFETCH_LOAD_DEPTH_LON,
                 window_buffer: DEFAULT_PREFETCH_WINDOW_BUFFER,
                 stale_region_timeout: DEFAULT_PREFETCH_STALE_REGION_TIMEOUT,
                 default_window_rows: DEFAULT_PREFETCH_DEFAULT_WINDOW_ROWS,

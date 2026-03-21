@@ -206,13 +206,6 @@ ramp_duration_secs = {}
 ramp_start_fraction = {}
 
 ; Boundary-driven prefetch settings
-; Boundary trigger distance in degrees (default: 1.5, range: 0.5-3.0)
-; Must be > X-Plane's 1.0° trigger to prefetch before X-Plane requests tiles
-trigger_distance = {}
-; Load depth for latitude boundary crossings in DSF tiles (default: 3, range: 1-5)
-load_depth_lat = {}
-; Load depth for longitude boundary crossings in DSF tiles (default: 2, range: 1-5)
-load_depth_lon = {}
 ; Buffer tiles for retention beyond visible window (default: 1, range: 0-3)
 window_buffer = {}
 ; InProgress staleness timeout in seconds (default: 120, range: 30-600)
@@ -329,9 +322,6 @@ congestion_threshold = {}
         config.prefetch.landing_hysteresis_secs,
         config.prefetch.ramp_duration_secs,
         config.prefetch.ramp_start_fraction,
-        config.prefetch.trigger_distance,
-        config.prefetch.load_depth_lat,
-        config.prefetch.load_depth_lon,
         config.prefetch.window_buffer,
         config.prefetch.stale_region_timeout,
         config.prefetch.default_window_rows,

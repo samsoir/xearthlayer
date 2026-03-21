@@ -1615,9 +1615,6 @@ mod tests {
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
-            trigger_distance: 1.0,
-            load_depth_lat: 1,
-            load_depth_lon: 1,
             default_window_rows: 6,
             window_lon_extent: 6.0,
             // Zero ramp so transition throttle doesn't reduce tile count
@@ -1648,8 +1645,7 @@ mod tests {
         );
 
         // Now move aircraft near northern boundary.
-        // Monitor: lat(47, 53). trigger_distance=1.0.
-        // Aircraft at lat=52.5 → distance to north edge = 53.0 - 52.5 = 0.5 < 1.0 → triggers!
+        // Aircraft at lat=52.5 → near edge of window.
         let state = AircraftState::new(52.5, 10.0, 0.0, 200.0, 35000.0);
 
         // First cycle: boundary plan generated, only 5 submitted (ChannelFull)
@@ -1703,9 +1699,6 @@ mod tests {
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
-            trigger_distance: 3.0,
-            load_depth_lat: 1,
-            load_depth_lon: 1,
             // Zero ramp so transition throttle doesn't reduce tile count
             ramp_duration: std::time::Duration::from_secs(0),
             ..Default::default()
