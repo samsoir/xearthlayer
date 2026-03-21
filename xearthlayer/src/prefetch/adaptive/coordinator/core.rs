@@ -2299,8 +2299,6 @@ mod tests {
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
-            box_extent: 9.0,
-            box_max_bias: 0.8,
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
@@ -2337,8 +2335,6 @@ mod tests {
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
-            box_extent: 9.0,
-            box_max_bias: 0.8,
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
@@ -2376,8 +2372,6 @@ mod tests {
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
-            box_extent: 9.0,
-            box_max_bias: 0.8,
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
@@ -2422,8 +2416,6 @@ mod tests {
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
             max_tiles_per_cycle: 5,
-            box_extent: 9.0,
-            box_max_bias: 0.8,
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
@@ -2521,8 +2513,6 @@ mod tests {
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
-            box_extent: 9.0,
-            box_max_bias: 0.8,
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)

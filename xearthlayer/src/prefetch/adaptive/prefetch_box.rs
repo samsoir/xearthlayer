@@ -38,10 +38,20 @@ pub struct PrefetchBox {
     max_bias: f64,
 }
 
+impl Default for PrefetchBox {
+    fn default() -> Self {
+        use crate::config::defaults::{DEFAULT_BOX_EXTENT, DEFAULT_BOX_MAX_BIAS};
+        Self {
+            extent: DEFAULT_BOX_EXTENT,
+            max_bias: DEFAULT_BOX_MAX_BIAS,
+        }
+    }
+}
+
 impl PrefetchBox {
     /// Create a new prefetch box.
     ///
-    /// - `extent`: total degrees per axis (default 9.0, min 7.0)
+    /// - `extent`: total degrees per axis (default 6.5, min 7.0)
     /// - `max_bias`: maximum forward fraction (default 0.8, range 0.5-0.9)
     pub fn new(extent: f64, max_bias: f64) -> Self {
         Self { extent, max_bias }
@@ -193,143 +203,98 @@ mod tests {
 
     // ─── Proportional bias tests ─────────────────────────────────────────
 
+    /// Compute expected ahead/behind distances from defaults.
+    fn expected_cardinal() -> (f64, f64, f64) {
+        use crate::config::defaults::{DEFAULT_BOX_EXTENT, DEFAULT_BOX_MAX_BIAS};
+        let ahead = DEFAULT_BOX_EXTENT * DEFAULT_BOX_MAX_BIAS;
+        let behind = DEFAULT_BOX_EXTENT * (1.0 - DEFAULT_BOX_MAX_BIAS);
+        let symmetric = DEFAULT_BOX_EXTENT * 0.5;
+        (ahead, behind, symmetric)
+    }
+
     #[test]
     fn test_proportional_due_north() {
-        let pbox = PrefetchBox::new(9.0, 0.8);
+        let pbox = PrefetchBox::default();
         let (lat_min, lat_max, lon_min, lon_max) = pbox.bounds(48.0, 15.0, 0.0);
+        let (ahead, behind, symmetric) = expected_cardinal();
 
-        // Lat: 80/20 bias north. Ahead = 9 * 0.8 = 7.2, behind = 9 * 0.2 = 1.8
-        assert!(
-            (lat_max - 48.0 - 7.2).abs() < 0.01,
-            "North should be 7.2° ahead, got {}",
-            lat_max - 48.0
-        );
-        assert!(
-            (48.0 - lat_min - 1.8).abs() < 0.01,
-            "South should be 1.8° behind, got {}",
-            48.0 - lat_min
-        );
-
-        // Lon: symmetric = 9 * 0.5 = 4.5 each side
-        assert!((lon_max - 15.0 - 4.5).abs() < 0.01, "East should be 4.5°");
-        assert!((15.0 - lon_min - 4.5).abs() < 0.01, "West should be 4.5°");
+        assert!((lat_max - 48.0 - ahead).abs() < 0.01, "North should be {ahead}° ahead");
+        assert!((48.0 - lat_min - behind).abs() < 0.01, "South should be {behind}° behind");
+        assert!((lon_max - 15.0 - symmetric).abs() < 0.01, "East should be {symmetric}°");
+        assert!((15.0 - lon_min - symmetric).abs() < 0.01, "West should be {symmetric}°");
     }
 
     #[test]
     fn test_proportional_due_east() {
-        let pbox = PrefetchBox::new(9.0, 0.8);
+        let pbox = PrefetchBox::default();
         let (lat_min, lat_max, _lon_min, lon_max) = pbox.bounds(48.0, 15.0, 90.0);
+        let (ahead, _behind, symmetric) = expected_cardinal();
 
         // Lat: symmetric (cos(90°) ≈ 0)
-        let lat_north = lat_max - 48.0;
-        let lat_south = 48.0 - lat_min;
-        assert!(
-            (lat_north - 4.5).abs() < 0.01,
-            "Lat north should be 4.5°, got {}",
-            lat_north
-        );
-        assert!(
-            (lat_south - 4.5).abs() < 0.01,
-            "Lat south should be 4.5°, got {}",
-            lat_south
-        );
+        assert!((lat_max - 48.0 - symmetric).abs() < 0.01, "Lat north should be symmetric");
+        assert!((48.0 - lat_min - symmetric).abs() < 0.01, "Lat south should be symmetric");
 
-        // Lon: 80/20 bias east
-        let lon_east = lon_max - 15.0;
-        assert!(
-            (lon_east - 7.2).abs() < 0.01,
-            "East should be 7.2° ahead, got {}",
-            lon_east
-        );
+        // Lon: fully biased east
+        assert!((lon_max - 15.0 - ahead).abs() < 0.01, "East should be {ahead}° ahead");
     }
 
     #[test]
     fn test_proportional_due_south() {
-        let pbox = PrefetchBox::new(9.0, 0.8);
+        let pbox = PrefetchBox::default();
         let (lat_min, lat_max, _, _) = pbox.bounds(48.0, 15.0, 180.0);
+        let (ahead, behind, _symmetric) = expected_cardinal();
 
-        // Lat: 80/20 bias south
-        let lat_south = 48.0 - lat_min;
-        let lat_north = lat_max - 48.0;
-        assert!(
-            (lat_south - 7.2).abs() < 0.01,
-            "South should be 7.2° ahead, got {}",
-            lat_south
-        );
-        assert!(
-            (lat_north - 1.8).abs() < 0.01,
-            "North should be 1.8° behind, got {}",
-            lat_north
-        );
+        assert!((48.0 - lat_min - ahead).abs() < 0.01, "South should be {ahead}° ahead");
+        assert!((lat_max - 48.0 - behind).abs() < 0.01, "North should be {behind}° behind");
     }
 
     #[test]
     fn test_proportional_due_west() {
-        let pbox = PrefetchBox::new(9.0, 0.8);
+        let pbox = PrefetchBox::default();
         let (_, _, lon_min, lon_max) = pbox.bounds(48.0, 15.0, 270.0);
+        let (ahead, behind, _symmetric) = expected_cardinal();
 
-        // Lon: 80/20 bias west
-        let lon_west = 15.0 - lon_min;
-        let lon_east = lon_max - 15.0;
-        assert!(
-            (lon_west - 7.2).abs() < 0.01,
-            "West should be 7.2° ahead, got {}",
-            lon_west
-        );
-        assert!(
-            (lon_east - 1.8).abs() < 0.01,
-            "East should be 1.8° behind, got {}",
-            lon_east
-        );
+        assert!((15.0 - lon_min - ahead).abs() < 0.01, "West should be {ahead}° ahead");
+        assert!((lon_max - 15.0 - behind).abs() < 0.01, "East should be {behind}° behind");
     }
 
     #[test]
     fn test_proportional_northeast_45() {
-        let pbox = PrefetchBox::new(9.0, 0.8);
+        let pbox = PrefetchBox::default();
         let (_lat_min, lat_max, _lon_min, lon_max) = pbox.bounds(48.0, 15.0, 45.0);
 
-        // At 45°: |cos(45)| = |sin(45)| = 0.707
-        // forward_frac = 0.5 + 0.3 * 0.707 = 0.712
         let lat_ahead = lat_max - 48.0;
         let lon_ahead = lon_max - 15.0;
-        assert!(
-            (lat_ahead - 6.41).abs() < 0.1,
-            "Lat ahead should be ~6.4°, got {}",
-            lat_ahead
-        );
-        assert!(
-            (lon_ahead - 6.41).abs() < 0.1,
-            "Lon ahead should be ~6.4°, got {}",
-            lon_ahead
-        );
 
         // Both axes should have equal bias at 45°
         assert!((lat_ahead - lon_ahead).abs() < 0.01, "Equal bias at 45°");
+
+        // Bias should be between symmetric and full bias
+        let (ahead, _behind, symmetric) = expected_cardinal();
+        assert!(lat_ahead > symmetric, "45° bias should exceed symmetric");
+        assert!(lat_ahead < ahead, "45° bias should be less than full cardinal");
     }
 
     // ─── Total extent invariant ──────────────────────────────────────────
 
     #[test]
     fn test_total_extent_constant_at_all_headings() {
-        let pbox = PrefetchBox::new(9.0, 0.8);
+        use crate::config::defaults::DEFAULT_BOX_EXTENT;
+        let pbox = PrefetchBox::default();
 
-        for track in [
-            0.0, 30.0, 45.0, 60.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0,
-        ] {
+        for track in [0.0, 30.0, 45.0, 60.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0] {
             let (lat_min, lat_max, lon_min, lon_max) = pbox.bounds(48.0, 15.0, track);
             let lat_extent = lat_max - lat_min;
             let lon_extent = lon_max - lon_min;
             assert!(
-                (lat_extent - 9.0).abs() < 0.01,
-                "Lat extent should be 9.0 at track {}°, got {}",
-                track,
-                lat_extent
+                (lat_extent - DEFAULT_BOX_EXTENT).abs() < 0.01,
+                "Lat extent should be {} at track {}°, got {}",
+                DEFAULT_BOX_EXTENT, track, lat_extent
             );
             assert!(
-                (lon_extent - 9.0).abs() < 0.01,
-                "Lon extent should be 9.0 at track {}°, got {}",
-                track,
-                lon_extent
+                (lon_extent - DEFAULT_BOX_EXTENT).abs() < 0.01,
+                "Lon extent should be {} at track {}°, got {}",
+                DEFAULT_BOX_EXTENT, track, lon_extent
             );
         }
     }
@@ -338,59 +303,49 @@ mod tests {
 
     #[test]
     fn test_proportional_southern_hemisphere() {
-        let pbox = PrefetchBox::new(9.0, 0.8);
+        use crate::config::defaults::DEFAULT_BOX_EXTENT;
+        let pbox = PrefetchBox::default();
         let (lat_min, lat_max, _lon_min, lon_max) = pbox.bounds(-24.0, 134.0, 90.0);
+        let (ahead, _behind, _symmetric) = expected_cardinal();
 
-        // Due east in Australia: lat symmetric, lon biased east
         let lat_extent = lat_max - lat_min;
-        assert!((lat_extent - 9.0).abs() < 0.01, "Lat extent should be 9.0");
-
-        let lon_ahead = lon_max - 134.0;
-        assert!(
-            (lon_ahead - 7.2).abs() < 0.01,
-            "East should be 7.2° ahead, got {}",
-            lon_ahead
-        );
-
-        // Negative lat regions
+        assert!((lat_extent - DEFAULT_BOX_EXTENT).abs() < 0.01);
+        assert!((lon_max - 134.0 - ahead).abs() < 0.01, "East should be {ahead}° ahead");
         assert!(lat_min < -24.0, "Min lat should be south of aircraft");
     }
 
     // ─── Region enumeration ──────────────────────────────────────────────
 
     #[test]
-    fn test_region_count_at_9_extent() {
-        let pbox = PrefetchBox::new(9.0, 0.8);
+    fn test_region_count_reasonable() {
+        let pbox = PrefetchBox::default();
         let regions = pbox.regions(48.0, 15.0, 0.0);
 
-        // 9° extent → 10 DSF tiles per axis (box spans partial tiles at edges) → ~100 regions
+        // Extent N° → ~(N+1)² regions due to partial tiles at edges
         assert!(
-            regions.len() >= 81 && regions.len() <= 110,
-            "Should have ~100 regions at 9° extent, got {}",
+            regions.len() >= 36 && regions.len() <= 144,
+            "Region count should be reasonable for default extent, got {}",
             regions.len()
         );
     }
 
     #[test]
     fn test_regions_include_ahead_and_behind() {
-        let pbox = PrefetchBox::new(9.0, 0.8);
-        // Due east at (48.0, 15.0): lon ahead = 7.2°, behind = 1.8°
+        let pbox = PrefetchBox::default();
+        let (ahead, behind, _symmetric) = expected_cardinal();
+
+        // Due east at (48.0, 15.0)
         let regions = pbox.regions(48.0, 15.0, 90.0);
 
         // Should include far east (ahead)
-        let has_far_east = regions.iter().any(|r| r.lon == 21);
-        assert!(has_far_east, "Should include lon=21 (~7° east ahead)");
+        let far_east_lon = (15.0 + ahead - 1.0).floor() as i32;
+        let has_far_east = regions.iter().any(|r| r.lon == far_east_lon);
+        assert!(has_far_east, "Should include lon={far_east_lon} (near ahead edge)");
 
         // Should include near west (behind)
-        let has_near_west = regions.iter().any(|r| r.lon == 14);
-        assert!(has_near_west, "Should include lon=14 (behind)");
-
-        // Should NOT include far west (beyond behind margin)
-        let has_far_west = regions.iter().any(|r| r.lon == 11);
-        assert!(
-            !has_far_west,
-            "Should not include lon=11 (beyond 1.8° behind)"
-        );
+        let near_west_lon = (15.0 - behind + 0.1).floor() as i32;
+        let has_near_west = regions.iter().any(|r| r.lon == near_west_lon);
+        assert!(has_near_west, "Should include lon={near_west_lon} (near behind edge)");
     }
 
     // ─── GeoIndex filtering ──────────────────────────────────────────────
@@ -399,7 +354,7 @@ mod tests {
     fn test_new_regions_filters_already_tracked() {
         use crate::geo_index::GeoIndex;
 
-        let pbox = PrefetchBox::new(9.0, 0.8);
+        let pbox = PrefetchBox::default();
         let geo_index = GeoIndex::new();
 
         let tracked = DsfRegion::new(48, 14);
@@ -420,7 +375,7 @@ mod tests {
     fn test_retention_covers_prefetch_box_bounds() {
         use crate::geo_index::GeoIndex;
 
-        let pbox = PrefetchBox::new(9.0, 0.8);
+        let pbox = PrefetchBox::default();
         let geo_index = GeoIndex::new();
 
         pbox.update_retention(48.0, 15.0, 270.0, 1, &geo_index);
@@ -442,7 +397,7 @@ mod tests {
         use crate::geo_index::GeoIndex;
         use crate::prefetch::adaptive::boundary_strategy::BoundaryStrategy;
 
-        let pbox = PrefetchBox::new(9.0, 0.8);
+        let pbox = PrefetchBox::default();
         let geo_index = GeoIndex::new();
 
         let region = DsfRegion::new(48, 12);

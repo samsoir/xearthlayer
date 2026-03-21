@@ -168,7 +168,7 @@ impl Default for AdaptivePrefetchConfig {
             stale_region_timeout: Duration::from_secs(120),
             default_window_rows: 3,
             window_lon_extent: 3.0,
-            box_extent: 9.0,
+            box_extent: 6.5,
             box_max_bias: 0.8,
         }
     }

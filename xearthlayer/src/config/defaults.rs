@@ -218,8 +218,8 @@ pub const DEFAULT_PREFETCH_DEFAULT_WINDOW_ROWS: usize = 3;
 pub const DEFAULT_PREFETCH_WINDOW_LON_EXTENT: f64 = 3.0;
 
 /// Default prefetch box extent per axis in degrees.
-/// X-Plane loads a ~6×6 DSF area; 9° covers this with 1.5° overlap on all sides.
-pub const DEFAULT_BOX_EXTENT: f64 = 9.0;
+/// X-Plane loads a ~6×6 DSF area; 6.5° covers this with 0.5° overlap.
+pub const DEFAULT_BOX_EXTENT: f64 = 6.5;
 
 /// Default maximum forward bias fraction for the sliding prefetch box.
 /// 0.8 means 80% ahead / 20% behind on the primary axis.
