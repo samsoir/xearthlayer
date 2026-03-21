@@ -213,7 +213,7 @@ impl AdaptivePrefetchCoordinator {
         // cols will be recomputed from real latitude on first tracker update.
         scenery_window.set_assumed_dimensions(config.default_window_rows, 0.0);
         let boundary_strategy = BoundaryStrategy::new();
-        let prefetch_box = PrefetchBox::new(config.forward_margin, config.behind_margin);
+        let prefetch_box = PrefetchBox::new(config.box_extent, config.box_max_bias);
 
         Self {
             config,
@@ -2299,8 +2299,6 @@ mod tests {
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
-            forward_margin: 3.0,
-            behind_margin: 1.0,
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
@@ -2337,8 +2335,6 @@ mod tests {
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
-            forward_margin: 3.0,
-            behind_margin: 1.0,
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
@@ -2376,8 +2372,6 @@ mod tests {
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
-            forward_margin: 3.0,
-            behind_margin: 1.0,
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
@@ -2422,8 +2416,6 @@ mod tests {
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
             max_tiles_per_cycle: 5,
-            forward_margin: 3.0,
-            behind_margin: 1.0,
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
@@ -2521,8 +2513,6 @@ mod tests {
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
-            forward_margin: 3.0,
-            behind_margin: 1.0,
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)

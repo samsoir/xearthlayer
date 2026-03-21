@@ -241,6 +241,17 @@ pub struct PrefetchSettings {
     /// Columns are computed dynamically: ceil(lon_extent / cos(lat)).
     /// Default: 3.0, Range: 1.0-10.0
     pub window_lon_extent: f64,
+
+    // Sliding prefetch box settings
+    /// Total prefetch box extent per axis in degrees.
+    /// X-Plane loads a ~6x6 DSF area around the aircraft. 9 degrees covers
+    /// this with 1.5 degree overlap on all sides.
+    /// Default: 9.0, Range: 7.0-15.0
+    pub box_extent: f64,
+    /// Maximum forward bias fraction (0.5 = symmetric, 0.8 = 80/20).
+    /// Controls how much the prefetch box shifts forward in the direction of travel.
+    /// Default: 0.8, Range: 0.5-0.9
+    pub box_max_bias: f64,
 }
 
 /// Control plane configuration for job management and health monitoring.

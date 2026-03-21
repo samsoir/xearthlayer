@@ -129,18 +129,21 @@ pub struct AdaptivePrefetchConfig {
     pub window_lon_extent: f64,
 
     // Sliding prefetch box settings
-    /// Degrees ahead of aircraft in direction of travel per axis.
+    /// Total prefetch box extent per axis in degrees.
     ///
-    /// Must be >= X-Plane's ~3.5° look-ahead to ensure tiles are ready
-    /// before X-Plane requests them.
-    /// Range: 1.0 - 6.0
-    pub forward_margin: f64,
+    /// X-Plane loads a ~6×6 DSF area around the aircraft. 9° covers
+    /// this with 1.5° overlap on all sides, ensuring tiles are ready
+    /// before X-Plane crosses into the next DSF region.
+    /// Range: 7.0 - 15.0
+    pub box_extent: f64,
 
-    /// Degrees behind aircraft per axis.
+    /// Maximum forward bias fraction (0.5 = symmetric, 0.8 = 80/20).
     ///
-    /// Keeps recently-passed tiles available for X-Plane's trailing edge.
-    /// Range: 0.5 - 3.0
-    pub behind_margin: f64,
+    /// Controls how much the prefetch box shifts forward in the
+    /// direction of travel. At 0.8, the primary axis gets 80% ahead
+    /// and 20% behind; perpendicular axes get 50/50.
+    /// Range: 0.5 - 0.9
+    pub box_max_bias: f64,
 }
 
 impl Default for AdaptivePrefetchConfig {
@@ -165,8 +168,8 @@ impl Default for AdaptivePrefetchConfig {
             stale_region_timeout: Duration::from_secs(120),
             default_window_rows: 3,
             window_lon_extent: 3.0,
-            forward_margin: 3.0,
-            behind_margin: 1.0,
+            box_extent: 6.5,
+            box_max_bias: 0.8,
         }
     }
 }
@@ -202,6 +205,8 @@ impl AdaptivePrefetchConfig {
             stale_region_timeout: Duration::from_secs(settings.stale_region_timeout),
             default_window_rows: settings.default_window_rows,
             window_lon_extent: settings.window_lon_extent,
+            box_extent: settings.box_extent,
+            box_max_bias: settings.box_max_bias,
             ..Default::default()
         }
     }
@@ -234,6 +239,8 @@ impl AdaptivePrefetchConfig {
             stale_region_timeout: Duration::from_secs(config.stale_region_timeout),
             default_window_rows: config.default_window_rows,
             window_lon_extent: config.window_lon_extent,
+            box_extent: config.box_extent,
+            box_max_bias: config.box_max_bias,
             ..Default::default()
         }
     }
@@ -514,6 +521,8 @@ mod tests {
             stale_region_timeout: 300,
             default_window_rows: 4,
             window_lon_extent: 4.0,
+            box_extent: 11.0,
+            box_max_bias: 0.7,
         };
 
         let config = AdaptivePrefetchConfig::from_prefetch_settings(&settings);

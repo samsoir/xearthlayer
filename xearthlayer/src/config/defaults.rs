@@ -217,6 +217,14 @@ pub const DEFAULT_PREFETCH_DEFAULT_WINDOW_ROWS: usize = 3;
 /// Actual column count varies by latitude via `lon_tiles_for_latitude()`.
 pub const DEFAULT_PREFETCH_WINDOW_LON_EXTENT: f64 = 3.0;
 
+/// Default prefetch box extent per axis in degrees.
+/// X-Plane loads a ~6×6 DSF area; 6.5° covers this with 0.5° overlap.
+pub const DEFAULT_BOX_EXTENT: f64 = 6.5;
+
+/// Default maximum forward bias fraction for the sliding prefetch box.
+/// 0.8 means 80% ahead / 20% behind on the primary axis.
+pub const DEFAULT_BOX_MAX_BIAS: f64 = 0.8;
+
 // =============================================================================
 // FUSE defaults
 // =============================================================================
@@ -376,6 +384,8 @@ impl Default for ConfigFile {
                 stale_region_timeout: DEFAULT_PREFETCH_STALE_REGION_TIMEOUT,
                 default_window_rows: DEFAULT_PREFETCH_DEFAULT_WINDOW_ROWS,
                 window_lon_extent: DEFAULT_PREFETCH_WINDOW_LON_EXTENT,
+                box_extent: DEFAULT_BOX_EXTENT,
+                box_max_bias: DEFAULT_BOX_MAX_BIAS,
             },
             control_plane: ControlPlaneSettings {
                 max_concurrent_jobs: default_max_concurrent_jobs(),

@@ -187,7 +187,7 @@ fn compute_prefetch_box(aircraft: &Option<AircraftInfo>) -> Option<BoxBounds> {
     let track = aircraft.track.unwrap_or(aircraft.heading) as f64;
 
     let config = AdaptivePrefetchConfig::default();
-    let pbox = PrefetchBox::new(config.forward_margin, config.behind_margin);
+    let pbox = PrefetchBox::new(config.box_extent, config.box_max_bias);
     let (lat_min, lat_max, lon_min, lon_max) =
         pbox.bounds(aircraft.latitude, aircraft.longitude, track);
 

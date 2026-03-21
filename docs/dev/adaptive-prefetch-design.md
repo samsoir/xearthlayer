@@ -309,18 +309,16 @@ The `SceneryWindow` is the core computational model. It derives window dimension
 
 ### Sliding Prefetch Box (Cruise Phase)
 
-The cruise phase uses a **sliding prefetch box** instead of boundary monitors. The box moves with the aircraft every telemetry tick, biased in the direction of travel:
+The cruise phase uses a **sliding prefetch box** instead of boundary monitors. The box moves with the aircraft every telemetry tick, with **proportional heading bias**:
 
-- **Per-axis bias:** 3° ahead, 1° behind on any axis with a forward heading component
-- **Symmetric perpendicular:** 2° each side on axes with no heading component (exact cardinal headings)
+- **Total extent:** 9° per axis (configurable, min 7°). Covers X-Plane's observed 6×6 DSF loading area with 1.5° overlap.
+- **Proportional bias:** `forward_fraction = 0.5 + (max_bias - 0.5) × |component|`. At cardinal headings the primary axis gets 80/20 (at `max_bias=0.8`), perpendicular axes get 50/50. At diagonals both axes share ~71/29. The bias slides smoothly — no binary thresholds.
 - **Region enumeration:** DSF regions (1°×1°) within the box are enumerated via `floor()` arithmetic
 - **Deduplication:** GeoIndex tracks `PrefetchedRegion` state — only new regions trigger tile expansion
 
-This replaced the boundary-monitor approach which had a fundamental timing problem: X-Plane loads tiles 3.3-3.7° ahead of the aircraft, but boundary monitors only triggered 1° from the window edge, leaving zero lead time for prefetch. The sliding box maintains tiles 3° ahead at all times.
+**Empirical basis:** Debug map flight testing at YBAS (2026-03-21) revealed X-Plane loads a 6×6 DSF area, not the 3×3 previously assumed. The proportional bias model was designed to match X-Plane's directional loading pattern without binary bias switching artefacts.
 
-**Empirical basis:** LOWW→LPPT flight testing (2026-03-17) showed X-Plane consistently loads 2 DSF columns/rows beyond its current boundary when the aircraft is ~1° away. A 3° forward margin covers this with a 1° safety buffer.
-
-**SceneryWindow retained for:** retention tracking (`update_retention()`), world rebuild detection (`check_for_rebuild()`). The `center_on_position()` call keeps the window aligned for retention eviction.
+**SceneryWindow retained for:** world rebuild detection (`check_for_rebuild()`). Retention tracking now uses `PrefetchBox::update_retention()` with box-derived bounds.
 
 ### World Rebuild Detection
 
