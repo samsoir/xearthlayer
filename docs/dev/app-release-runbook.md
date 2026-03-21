@@ -31,7 +31,7 @@ git pull origin main
 make pre-commit
 ```
 
-### Step 2: Update Version and Changelog
+### Step 2: Update Version, Changelog, and version.json
 
 ```bash
 # Update workspace version in Cargo.toml
@@ -41,6 +41,11 @@ make pre-commit
 # - Add new version header: ## [X.Y.Z] - YYYY-MM-DD
 # - Document all changes under Added/Changed/Fixed/Removed
 # - Update comparison links at bottom
+
+# Update version.json
+# - version, tag, release_date
+# - Asset filenames (replace old version with X.Y.Z)
+# - download_base_url
 ```
 
 ### Step 3: Create Release Branch and PR
@@ -50,7 +55,7 @@ make pre-commit
 git checkout -b release/X.Y.Z
 
 # Commit changes
-git add Cargo.toml Cargo.lock CHANGELOG.md
+git add Cargo.toml Cargo.lock CHANGELOG.md version.json
 git commit -m "Release vX.Y.Z"
 
 # Push and create PR
@@ -99,10 +104,9 @@ gh pr merge --merge --delete-branch
 ### Step 7: Verify Website Updated
 
 ```bash
-# Check version.json was updated
+# version.json is now on main (merged with the release PR)
+# Verify it shows the correct version:
 gh api repos/samsoir/xearthlayer/contents/version.json --jq '.content' | base64 -d | jq .version
-
-# If still showing old version, update manually (see Troubleshooting)
 
 # Verify website shows new version (may take 1-2 minutes for CDN)
 curl -s https://xearthlayer.app | grep -o 'v[0-9]\+\.[0-9]\+\.[0-9]\+'
@@ -199,33 +203,31 @@ gh api repos/samsoir/xearthlayer/rulesets
 ### Issue: version.json Not Updated
 
 **Symptoms:**
-After the release workflow completes, `version.json` on main still shows the old version.
+After merging the release PR, `version.json` on main still shows the old version.
 
 **Cause:**
-The GitHub API call to update `version.json` failed (e.g., permissions issue, API outage).
+`version.json` was not updated on the release branch before the PR was created.
 
-**Note:** As of v0.3.1, the publish step uses the GitHub Contents API for atomic updates,
-eliminating the previous race condition with `git push` from a detached HEAD.
+**Note:** As of v0.4.0, `version.json` is updated on the release branch alongside
+`Cargo.toml` and `CHANGELOG.md`. It merges to main with the release PR — no
+post-release automation needed.
 
 **Solution:**
-Update `version.json` manually via the GitHub API or locally:
+Update `version.json` on main via a PR:
 
 ```bash
-# Check current version.json
-gh api repos/samsoir/xearthlayer/contents/version.json --jq '.content' | base64 -d | jq .version
-
-# If stale, update locally
 git checkout main && git pull
+git checkout -b chore/version-json-X.Y.Z
 # Edit version.json with correct version, release_date, and asset filenames
 git add version.json
 git commit -m "chore: update version.json to X.Y.Z"
-git push
+git push -u origin chore/version-json-X.Y.Z
+gh pr create --title "chore: update version.json to X.Y.Z"
 ```
 
 **Prevention:**
-- The workflow now uses the GitHub Contents API (`gh api repos/.../contents/version.json -X PUT`)
-  which is atomic and doesn't require a clean merge base
-- Asset filenames are collected from actual build artifacts, not predicted
+- Include `version.json` in Step 2 of the release process (alongside Cargo.toml and CHANGELOG.md)
+- Asset filenames follow a predictable pattern: `xearthlayer[-gpu]-vX.Y.Z-...`
 
 ---
 
@@ -327,12 +329,12 @@ Update the comparison links at the bottom of CHANGELOG.md:
 - [ ] `make pre-commit` passes
 - [ ] Version updated in `Cargo.toml`
 - [ ] CHANGELOG.md updated with all changes
+- [ ] `version.json` updated with new version, date, and asset filenames
 - [ ] Release branch created and PR opened
 - [ ] CI passes on PR
 - [ ] Tag created and pushed (BEFORE merging PR)
 - [ ] Release workflow completes successfully
-- [ ] PR merged (AFTER workflow completes)
-- [ ] `version.json` updated (auto or manual)
+- [ ] PR merged (AFTER workflow completes) — `version.json` lands on main with merge
 - [ ] Website shows new version
 
 ### Key Commands
