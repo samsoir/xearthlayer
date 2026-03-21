@@ -53,8 +53,19 @@ let aircraftMarker = null;
 let headingLine = null;
 let prefetchBox = null;
 let regionLayers = L.layerGroup().addTo(map);
+let tileLayers = L.layerGroup().addTo(map);
 let firstUpdate = true;
 let followAircraft = true;
+
+// Convert slippy map tile coords to lat/lon bounds
+function tileBounds(row, col, zoom) {
+  const n = Math.pow(2, zoom);
+  const lonMin = col / n * 360 - 180;
+  const lonMax = (col + 1) / n * 360 - 180;
+  const latMaxRad = Math.atan(Math.sinh(Math.PI * (1 - 2 * row / n)));
+  const latMinRad = Math.atan(Math.sinh(Math.PI * (1 - 2 * (row + 1) / n)));
+  return [[latMinRad * 180 / Math.PI, lonMin], [latMaxRad * 180 / Math.PI, lonMax]];
+}
 
 const REGION_COLORS = {
   prefetched:  { color: '#4CAF50', fillColor: '#4CAF50', fillOpacity: 0.25, weight: 1 },
@@ -184,6 +195,30 @@ function updateMap(data) {
     }
     rect.bindTooltip(tip);
     regionLayers.addLayer(rect);
+  }
+
+  // Individual DDS tiles (shown at higher zoom levels)
+  tileLayers.clearLayers();
+  if (map.getZoom() >= 8 && data.tiles) {
+    for (const t of data.tiles) {
+      if (t.zoom === 0) continue;
+      const bounds = tileBounds(t.row, t.col, t.zoom);
+      const isFuse = t.origin === 'fuse';
+      const isGenerated = t.result === 'generated';
+      const tileColor = isFuse && isGenerated ? '#f44336' :
+                         isFuse ? '#81C784' :
+                         isGenerated ? '#4CAF50' : '#66BB6A';
+      const rect = L.rectangle(bounds, {
+        color: tileColor, fillColor: tileColor,
+        fillOpacity: isGenerated ? 0.4 : 0.2,
+        weight: 0.5
+      });
+      const sign = (n) => n >= 0 ? '+' + n : String(n);
+      rect.bindTooltip('ZL' + t.zoom + ' (' + t.row + ',' + t.col + ')' +
+        '\nOrigin: ' + t.origin + ', Result: ' + t.result +
+        '\nPos: ' + t.lat.toFixed(3) + ', ' + t.lon.toFixed(3));
+      tileLayers.addLayer(rect);
+    }
   }
 
   // Stats panel

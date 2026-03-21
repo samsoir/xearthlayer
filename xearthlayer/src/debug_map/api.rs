@@ -22,7 +22,20 @@ pub struct DebugStateSnapshot {
     pub sim_state: SimStateInfo,
     pub prefetch_box: Option<BoxBounds>,
     pub regions: Vec<RegionInfo>,
+    pub tiles: Vec<TileInfo>,
     pub stats: StatsInfo,
+}
+
+/// A single DDS tile with its origin and cache result.
+#[derive(Serialize)]
+pub struct TileInfo {
+    pub row: u32,
+    pub col: u32,
+    pub zoom: u8,
+    pub lat: f64,
+    pub lon: f64,
+    pub origin: String,
+    pub result: String,
 }
 
 /// Aircraft position and vectors.
@@ -120,6 +133,7 @@ pub fn collect_snapshot(state: &DebugMapState) -> DebugStateSnapshot {
     let sim_state = collect_sim_state(state);
     let prefetch_box = compute_prefetch_box(&aircraft);
     let regions = collect_regions(state);
+    let tiles = collect_tiles(state);
     let stats = collect_stats(state);
 
     DebugStateSnapshot {
@@ -127,6 +141,7 @@ pub fn collect_snapshot(state: &DebugMapState) -> DebugStateSnapshot {
         sim_state,
         prefetch_box,
         regions,
+        tiles,
         stats,
     }
 }
@@ -272,6 +287,32 @@ fn collect_regions(state: &DebugMapState) -> Vec<RegionInfo> {
     }
 
     region_map.into_values().collect()
+}
+
+fn collect_tiles(state: &DebugMapState) -> Vec<TileInfo> {
+    use super::activity::TileOrigin;
+    use super::activity::TileCacheResult;
+
+    state
+        .tile_activity
+        .tile_snapshot()
+        .into_iter()
+        .map(|(key, act)| TileInfo {
+            row: key.row,
+            col: key.col,
+            zoom: key.zoom,
+            lat: act.lat,
+            lon: act.lon,
+            origin: match act.origin {
+                TileOrigin::Fuse => "fuse".to_string(),
+                TileOrigin::Prefetch => "prefetch".to_string(),
+            },
+            result: match act.result {
+                TileCacheResult::CacheHit => "cache_hit".to_string(),
+                TileCacheResult::Generated => "generated".to_string(),
+            },
+        })
+        .collect()
 }
 
 fn collect_stats(state: &DebugMapState) -> StatsInfo {

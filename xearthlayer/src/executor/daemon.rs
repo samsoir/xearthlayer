@@ -548,9 +548,23 @@ where
 
             #[cfg(feature = "debug-map")]
             {
-                use crate::debug_map::activity::{TileActivityTracker, TileCacheResult, TileOrigin};
-                let dbg_origin = if origin.is_fuse() { TileOrigin::Fuse } else { TileOrigin::Prefetch };
-                TileActivityTracker::global().record(tile_lat, tile_lon, dbg_origin, TileCacheResult::CacheHit);
+                use crate::debug_map::activity::{
+                    TileActivityTracker, TileCacheResult, TileOrigin,
+                };
+                let dbg_origin = if origin.is_fuse() {
+                    TileOrigin::Fuse
+                } else {
+                    TileOrigin::Prefetch
+                };
+                TileActivityTracker::global().record_with_tile(
+                    tile_lat,
+                    tile_lon,
+                    tile.row,
+                    tile.col,
+                    tile.zoom,
+                    dbg_origin,
+                    TileCacheResult::CacheHit,
+                );
             }
 
             if let Some(tx) = request.response_tx {
@@ -669,7 +683,10 @@ where
                                         {
                                             use crate::debug_map::activity::{TileActivityTracker, TileCacheResult, TileOrigin};
                                             let dbg_origin = if origin.is_fuse() { TileOrigin::Fuse } else { TileOrigin::Prefetch };
-                                            TileActivityTracker::global().record(tile_lat, tile_lon, dbg_origin, TileCacheResult::Generated);
+                                            TileActivityTracker::global().record_with_tile(
+                                                tile_lat, tile_lon, tile.row, tile.col, tile.zoom,
+                                                dbg_origin, TileCacheResult::Generated,
+                                            );
                                         }
 
                                         d

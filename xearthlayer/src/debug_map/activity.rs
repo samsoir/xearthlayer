@@ -1,8 +1,8 @@
 //! Tile activity tracker for the debug map.
 //!
-//! Records per-DSF-region tile activity (cache hits, misses, generation)
-//! with origin tracking (FUSE on-demand vs prefetch). The executor daemon
-//! writes to this tracker; the debug map API reads from it.
+//! Records per-DSF-region and per-DDS-tile activity (cache hits, misses,
+//! generation) with origin tracking (FUSE on-demand vs prefetch). The
+//! executor daemon writes to this tracker; the debug map API reads from it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -46,7 +46,10 @@ pub struct RegionActivity {
 impl RegionActivity {
     /// Total tiles served in this region.
     pub fn total(&self) -> u32 {
-        self.fuse_cache_hits + self.fuse_generated + self.prefetch_cache_hits + self.prefetch_generated
+        self.fuse_cache_hits
+            + self.fuse_generated
+            + self.prefetch_cache_hits
+            + self.prefetch_generated
     }
 
     /// Whether X-Plane had to wait for any tiles in this region.
@@ -55,16 +58,42 @@ impl RegionActivity {
     }
 }
 
+/// Identifies a single DDS tile by its grid coordinates and zoom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TileKey {
+    pub row: u32,
+    pub col: u32,
+    pub zoom: u8,
+}
+
+/// Activity record for a single DDS tile.
+#[derive(Debug, Clone)]
+pub struct TileActivity {
+    /// Geographic position (northwest corner of tile).
+    pub lat: f64,
+    pub lon: f64,
+    /// How this tile was served.
+    pub origin: TileOrigin,
+    pub result: TileCacheResult,
+    pub timestamp: Instant,
+}
+
+/// Internal state holding both region-level and tile-level data.
+struct TrackerState {
+    regions: HashMap<DsfRegion, RegionActivity>,
+    tiles: HashMap<TileKey, TileActivity>,
+}
+
 /// Thread-safe tile activity tracker.
 ///
-/// The executor daemon records tile activity here; the debug map API
-/// reads it to visualise which regions had cache hits vs misses.
+/// Records both per-DSF-region aggregates and per-DDS-tile events.
+/// The executor daemon writes here; the debug map API reads snapshots.
 ///
 /// Uses a global instance so the executor can record events without
 /// changing any function signatures.
 #[derive(Clone)]
 pub struct TileActivityTracker {
-    inner: Arc<RwLock<HashMap<DsfRegion, RegionActivity>>>,
+    inner: Arc<RwLock<TrackerState>>,
 }
 
 /// Global instance — accessed by executor and debug map via `global()`.
@@ -73,7 +102,10 @@ static GLOBAL_TRACKER: std::sync::OnceLock<TileActivityTracker> = std::sync::Onc
 impl TileActivityTracker {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(HashMap::new())),
+            inner: Arc::new(RwLock::new(TrackerState {
+                regions: HashMap::new(),
+                tiles: HashMap::new(),
+            })),
         }
     }
 
@@ -82,7 +114,7 @@ impl TileActivityTracker {
         GLOBAL_TRACKER.get_or_init(TileActivityTracker::new)
     }
 
-    /// Record a tile event.
+    /// Record a tile event (region aggregate only, no tile coordinates).
     pub fn record(
         &self,
         tile_lat: f64,
@@ -90,10 +122,26 @@ impl TileActivityTracker {
         origin: TileOrigin,
         result: TileCacheResult,
     ) {
-        let region = DsfRegion::new(tile_lat.floor() as i32, tile_lon.floor() as i32);
+        self.record_with_tile(tile_lat, tile_lon, 0, 0, 0, origin, result);
+    }
 
-        if let Ok(mut map) = self.inner.write() {
-            let activity = map.entry(region).or_default();
+    /// Record a tile event with full DDS tile coordinates.
+    pub fn record_with_tile(
+        &self,
+        tile_lat: f64,
+        tile_lon: f64,
+        row: u32,
+        col: u32,
+        zoom: u8,
+        origin: TileOrigin,
+        result: TileCacheResult,
+    ) {
+        let region = DsfRegion::new(tile_lat.floor() as i32, tile_lon.floor() as i32);
+        let now = Instant::now();
+
+        if let Ok(mut state) = self.inner.write() {
+            // Region aggregate
+            let activity = state.regions.entry(region).or_default();
             match (origin, result) {
                 (TileOrigin::Fuse, TileCacheResult::CacheHit) => activity.fuse_cache_hits += 1,
                 (TileOrigin::Fuse, TileCacheResult::Generated) => activity.fuse_generated += 1,
@@ -104,7 +152,21 @@ impl TileActivityTracker {
                     activity.prefetch_generated += 1
                 }
             }
-            activity.last_activity = Some(Instant::now());
+            activity.last_activity = Some(now);
+
+            // Individual DDS tile (only if we have real coordinates)
+            if zoom > 0 {
+                state.tiles.insert(
+                    TileKey { row, col, zoom },
+                    TileActivity {
+                        lat: tile_lat,
+                        lon: tile_lon,
+                        origin,
+                        result,
+                        timestamp: now,
+                    },
+                );
+            }
         }
     }
 
@@ -112,7 +174,15 @@ impl TileActivityTracker {
     pub fn snapshot(&self) -> HashMap<DsfRegion, RegionActivity> {
         self.inner
             .read()
-            .map(|map| map.clone())
+            .map(|state| state.regions.clone())
+            .unwrap_or_default()
+    }
+
+    /// Get a snapshot of all individual DDS tile activity.
+    pub fn tile_snapshot(&self) -> HashMap<TileKey, TileActivity> {
+        self.inner
+            .read()
+            .map(|state| state.tiles.clone())
             .unwrap_or_default()
     }
 }
@@ -170,5 +240,26 @@ mod tests {
         let region = DsfRegion::new(-35, 151);
         let activity = snapshot.get(&region).unwrap();
         assert_eq!(activity.fuse_generated, 1);
+    }
+
+    #[test]
+    fn test_tile_level_tracking() {
+        let tracker = TileActivityTracker::new();
+        tracker.record_with_tile(
+            48.5, 15.3, 1500, 2200, 12,
+            TileOrigin::Fuse, TileCacheResult::Generated,
+        );
+
+        let tiles = tracker.tile_snapshot();
+        let key = TileKey { row: 1500, col: 2200, zoom: 12 };
+        let tile = tiles.get(&key).unwrap();
+        assert_eq!(tile.origin, TileOrigin::Fuse);
+        assert_eq!(tile.result, TileCacheResult::Generated);
+        assert!((tile.lat - 48.5).abs() < 0.001);
+
+        // Also recorded at region level
+        let regions = tracker.snapshot();
+        let region = DsfRegion::new(48, 15);
+        assert_eq!(regions.get(&region).unwrap().fuse_generated, 1);
     }
 }
