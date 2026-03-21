@@ -92,7 +92,8 @@ fn record_debug_tile_activity(
     } else {
         TileOrigin::Prefetch
     };
-    TileActivityTracker::global().record_with_tile(tile_lat, tile_lon, row, col, zoom, origin, result);
+    TileActivityTracker::global()
+        .record_with_tile(tile_lat, tile_lon, row, col, zoom, origin, result);
 }
 
 // =============================================================================
@@ -573,7 +574,11 @@ where
 
             #[cfg(feature = "debug-map")]
             record_debug_tile_activity(
-                tile_lat, tile_lon, tile.row, tile.col, tile.zoom,
+                tile_lat,
+                tile_lon,
+                tile.row,
+                tile.col,
+                tile.zoom,
                 origin.is_fuse(),
                 crate::debug_map::activity::TileCacheResult::CacheHit,
             );
