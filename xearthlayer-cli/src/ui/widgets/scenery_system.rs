@@ -22,7 +22,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 use xearthlayer::metrics::TelemetrySnapshot;
-use xearthlayer::runtime::{HealthSnapshot, TileProgressEntry};
+use xearthlayer::runtime::{HealthSnapshot, RegionProgressEntry};
 
 use super::primitives::{Sparkline, SparklineHistory};
 
@@ -124,7 +124,7 @@ pub struct ScenerySystemWidget<'a> {
     snapshot: &'a TelemetrySnapshot,
     health: Option<&'a HealthSnapshot>,
     history: Option<&'a SceneryHistory>,
-    tile_progress: &'a [TileProgressEntry],
+    tile_progress: &'a [RegionProgressEntry],
 }
 
 impl<'a> ScenerySystemWidget<'a> {
@@ -151,7 +151,7 @@ impl<'a> ScenerySystemWidget<'a> {
     }
 
     /// Set tile progress entries for QUEUE column.
-    pub fn with_tile_progress(mut self, entries: &'a [TileProgressEntry]) -> Self {
+    pub fn with_tile_progress(mut self, entries: &'a [RegionProgressEntry]) -> Self {
         self.tile_progress = entries;
         self
     }
@@ -334,14 +334,9 @@ impl ScenerySystemWidget<'_> {
         }
     }
 
-    /// Render the QUEUE column showing active tile progress.
-    ///
-    /// Coalesces tiles by 1-degree coordinate and sorts by progress (highest first).
-    fn render_queue_column(area: Rect, buf: &mut Buffer, entries: &[TileProgressEntry]) {
-        // Coalesce entries by formatted coordinate (1-degree buckets)
-        let coalesced = Self::coalesce_entries(entries);
-
-        // Row 1: Title (centered, no depth indicator needed with coalesced feedback)
+    /// Render the QUEUE column showing active tile progress by DSF region.
+    fn render_queue_column(area: Rect, buf: &mut Buffer, entries: &[RegionProgressEntry]) {
+        // Row 1: Title
         if area.height >= 1 {
             let title_line = Line::from(Span::styled(
                 format!("{:^width$}", "QUEUE", width = area.width as usize),
@@ -350,10 +345,9 @@ impl ScenerySystemWidget<'_> {
             Paragraph::new(title_line).render(Rect { height: 1, ..area }, buf);
         }
 
-        // Row 2: Empty line for spacing between header and content
-        // Row 3+: Tile progress entries
-        if coalesced.is_empty() {
-            // Show placeholder when no tiles are being processed (with spacing)
+        // Row 2: Empty line for spacing
+        // Row 3+: Region progress entries
+        if entries.is_empty() {
             if area.height >= 3 {
                 let placeholder = Line::from(Span::styled(
                     format!(
@@ -366,7 +360,7 @@ impl ScenerySystemWidget<'_> {
                 Paragraph::new(placeholder).render(
                     Rect {
                         x: area.x,
-                        y: area.y + 2, // Skip row 1 (header) and row 2 (spacing)
+                        y: area.y + 2,
                         width: area.width,
                         height: 1,
                     },
@@ -376,30 +370,29 @@ impl ScenerySystemWidget<'_> {
             return;
         }
 
-        // Show up to 4 coalesced entries, sorted by progress (highest first = about to complete)
-        for (i, (coord, count, avg_percent)) in coalesced.iter().take(4).enumerate() {
-            let row = 2 + i as u16; // Start at row 2 (after header + spacing)
+        for (i, entry) in entries.iter().take(4).enumerate() {
+            let row = 2 + i as u16;
             if area.height <= row {
                 break;
             }
 
-            let progress_bar = Self::render_progress_bar(*avg_percent);
-            let color = Self::progress_color(*avg_percent);
+            let percent = entry.progress_percent();
+            let progress_bar = Self::render_progress_bar(percent);
+            let color = Self::progress_color(percent);
 
-            // Format: "140E,35S ████░░ 50%" or "140E,35S(3) ██░░ 25%" if multiple tiles
-            let coord_display = if *count > 1 {
-                format!("{}({})", coord, count)
-            } else {
-                coord.clone()
-            };
+            // Format: "15E,48N  ████░░ 12/45  27%"
+            let fraction = format!("{}/{}", entry.tiles_completed, entry.tiles_total);
 
             let line = Line::from(vec![
                 Span::styled(
-                    format!(" {:<11}", coord_display),
+                    format!(" {:<9}", entry.format_coordinate()),
                     Style::default().fg(Color::White),
                 ),
                 Span::styled(progress_bar, Style::default().fg(color)),
-                Span::styled(format!(" {:>3}%", avg_percent), Style::default().fg(color)),
+                Span::styled(
+                    format!(" {:>5} {:>3}%", fraction, percent),
+                    Style::default().fg(color),
+                ),
             ]);
 
             Paragraph::new(line).render(
@@ -412,37 +405,6 @@ impl ScenerySystemWidget<'_> {
                 buf,
             );
         }
-    }
-
-    /// Coalesce tile entries by 1-degree coordinate.
-    ///
-    /// Groups tiles that share the same formatted coordinate (e.g., "140E,35S")
-    /// and returns (coord, count, avg_progress) sorted by progress descending.
-    fn coalesce_entries(entries: &[TileProgressEntry]) -> Vec<(String, usize, u8)> {
-        use std::collections::HashMap;
-
-        // Group by formatted coordinate
-        let mut groups: HashMap<String, Vec<u8>> = HashMap::new();
-        for entry in entries {
-            let coord = entry.format_coordinate();
-            let percent = entry.progress_percent();
-            groups.entry(coord).or_default().push(percent);
-        }
-
-        // Convert to (coord, count, avg_percent) and sort by progress descending
-        let mut result: Vec<_> = groups
-            .into_iter()
-            .map(|(coord, percents)| {
-                let count = percents.len();
-                let avg = percents.iter().map(|&p| p as u32).sum::<u32>() / count as u32;
-                (coord, count, avg as u8)
-            })
-            .collect();
-
-        // Sort by progress descending (highest progress = about to complete = at top)
-        result.sort_by(|a, b| b.2.cmp(&a.2));
-
-        result
     }
 
     /// Render a progress bar string.

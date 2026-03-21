@@ -106,6 +106,6 @@ pub use health::{HealthSnapshot, HealthStatus, RuntimeHealth, SharedRuntimeHealt
 pub use orchestrator::{RuntimeConfig, XEarthLayerRuntime};
 pub use request::{DdsResponse, JobRequest, RequestOrigin};
 pub use tile_progress::{
-    SharedTileProgressTracker, TileProgressEntry, TileProgressSink, TileProgressTracker,
-    MAX_DISPLAY_ENTRIES,
+    RegionProgressEntry, SharedTileProgressTracker, TileProgressSink, TileProgressTracker,
+    MAX_DISPLAY_REGIONS,
 };

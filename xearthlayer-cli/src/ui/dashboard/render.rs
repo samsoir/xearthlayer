@@ -33,7 +33,7 @@ use ratatui::{
 };
 use xearthlayer::metrics::TelemetrySnapshot;
 use xearthlayer::prefetch::PrefetchStatusSnapshot;
-use xearthlayer::runtime::{HealthSnapshot, TileProgressEntry};
+use xearthlayer::runtime::{HealthSnapshot, RegionProgressEntry};
 
 use super::render_sections::inner_rect;
 use super::state::PrewarmProgress;
@@ -66,7 +66,7 @@ pub fn render_ui(
     confirmation_remaining: Option<Duration>,
     prewarm_status: Option<&PrewarmProgress>,
     prewarm_spinner: Option<char>,
-    tile_progress_entries: &[TileProgressEntry],
+    tile_progress_entries: &[RegionProgressEntry],
 ) {
     let size = frame.area();
 
