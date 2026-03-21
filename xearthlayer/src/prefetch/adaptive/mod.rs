@@ -10,8 +10,8 @@
 //!   12° load to determine prefetch capability
 //! - **Flight Phase Strategies**: Different algorithms for ground (ring) and
 //!   cruise (boundary-driven) operations
-//! - **Boundary-Driven Prefetch**: SceneryWindow tracks X-Plane's loading
-//!   boundaries and BoundaryStrategy generates target DSF regions (#58)
+//! - **Sliding Prefetch Box**: PrefetchBox provides heading-biased region
+//!   detection for cruise-phase prefetch (#93)
 //! - **Takeoff Transition Throttle**: Grace period + ramp-up after Ground→Cruise
 //!   to avoid resource contention during takeoff (#62)
 //! - **Rolling Recalibration**: Adjusts mode if throughput degrades during flight
@@ -37,8 +37,7 @@
 //! │   ├── calibrator.rs       # Initial calibration
 //! │   └── rolling.rs          # Rolling recalibration
 //! ├── strategy.rs             # AdaptivePrefetchStrategy trait
-//! ├── boundary_monitor.rs     # DSF boundary distance tracking
-//! ├── boundary_strategy.rs    # Boundary crossing → DSF region generation (#58)
+//! ├── boundary_strategy.rs    # Region lifecycle management (#58)
 //! ├── ground_strategy.rs      # Ground operations prefetch
 //! ├── phase_detector.rs       # Ground/cruise detection
 //! ├── scenery_window.rs       # X-Plane scenery window model
@@ -71,7 +70,6 @@
 //! - Design document: `docs/dev/adaptive-prefetch-design.md`
 //! - Research basis: `docs/dev/xplane-scenery-loading-whitepaper.md`
 
-mod boundary_monitor;
 mod boundary_strategy;
 mod calibration;
 mod config;
@@ -84,8 +82,7 @@ mod strategy;
 mod transition_throttle;
 
 // Re-export public types
-pub use boundary_monitor::{BoundaryAxis, BoundaryCrossing, BoundaryMonitor};
-pub use boundary_strategy::{BoundaryStrategy, TargetRegion};
+pub use boundary_strategy::BoundaryStrategy;
 pub use calibration::{
     create_throughput_observer, create_throughput_observer_with_config, PerformanceCalibration,
     PerformanceCalibrator, RecalibrationResult, RollingCalibrator, SharedThroughputObserver,
@@ -96,6 +93,6 @@ pub use coordinator::{AdaptivePrefetchCoordinator, CoordinatorStatus};
 pub use ground_strategy::{GroundStrategy, LoadedAreaBounds};
 pub use phase_detector::{FlightPhase, PhaseDetector};
 pub use prefetch_box::PrefetchBox;
-pub use scenery_window::{SceneryWindow, SceneryWindowConfig, WindowState};
+pub use scenery_window::{SceneryWindow, SceneryWindowConfig};
 pub use strategy::{AdaptivePrefetchStrategy, PrefetchPlan, PrefetchPlanMetadata, TrackQuadrant};
 pub use transition_throttle::TransitionThrottle;

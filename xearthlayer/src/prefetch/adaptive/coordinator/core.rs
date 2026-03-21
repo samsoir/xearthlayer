@@ -22,7 +22,6 @@ use super::super::config::{AdaptivePrefetchConfig, PrefetchMode};
 use super::super::ground_strategy::GroundStrategy;
 use super::super::phase_detector::{FlightPhase, PhaseDetector};
 use super::super::prefetch_box::PrefetchBox;
-use super::super::scenery_window::{SceneryWindow, SceneryWindowConfig};
 use super::super::strategy::{AdaptivePrefetchStrategy, PrefetchPlan};
 use super::super::transition_throttle::TransitionThrottle;
 use crate::scene_tracker::SceneTracker;
@@ -80,15 +79,14 @@ pub const MAX_PENDING_TILES: usize = 2000;
 ///      ┌───────────┬──────────┼──────────────┬───────────┐
 ///      ▼           ▼          ▼              ▼           ▼
 /// ┌─────────┐ ┌─────────┐ ┌──────────────┐ ┌─────────┐ ┌─────────┐
-/// │ Phase   │ │ Ground  │ │ Scenery      │ │Boundary │ │ Circuit │
-/// │Detector │ │Strategy │ │ Window       │ │Strategy │ │ Breaker │
+/// │ Phase   │ │ Ground  │ │ Prefetch     │ │Boundary │ │  Sim    │
+/// │Detector │ │Strategy │ │ Box          │ │Strategy │ │  State  │
 /// └─────────┘ └─────────┘ └──────────────┘ └─────────┘ └─────────┘
 /// ```
 ///
-/// In cruise phase, the coordinator uses a **boundary-driven** approach:
-/// the [`SceneryWindow`] tracks X-Plane's loading window boundaries via the
-/// [`SceneTracker`], and the [`BoundaryStrategy`] generates prefetch targets
-/// for DSF regions the aircraft is about to cross into.
+/// In cruise phase, the coordinator uses a **sliding prefetch box** approach:
+/// the [`PrefetchBox`] computes a heading-biased region around the aircraft,
+/// and the [`BoundaryStrategy`] manages region lifecycle (InProgress/Prefetched).
 ///
 /// # Trigger Modes
 ///
@@ -149,9 +147,6 @@ pub struct AdaptivePrefetchCoordinator {
     /// Geospatial reference index for patched region filtering.
     geo_index: Option<Arc<GeoIndex>>,
 
-    /// Scenery window model for boundary-driven prefetch.
-    scenery_window: SceneryWindow,
-
     /// Boundary strategy for region lifecycle management.
     boundary_strategy: BoundaryStrategy,
 
@@ -198,20 +193,6 @@ impl AdaptivePrefetchCoordinator {
         let transition_throttle =
             TransitionThrottle::with_config(config.ramp_duration, config.ramp_start_fraction);
         let ground_strategy = GroundStrategy::new(&config);
-        let mut scenery_window = SceneryWindow::new(SceneryWindowConfig {
-            default_rows: config.default_window_rows,
-            lon_extent: config.window_lon_extent,
-            buffer: config.window_buffer,
-            trigger_distance: config.trigger_distance,
-            load_depth_lat: config.load_depth_lat,
-            load_depth_lon: config.load_depth_lon,
-        });
-        // Start in Assumed state so boundary checks work immediately
-        // with default dimensions. Real dimensions from SceneTracker will
-        // upgrade the window to Ready when available.
-        // Use 0.0 latitude for initial assumed dimensions (equator baseline);
-        // cols will be recomputed from real latitude on first tracker update.
-        scenery_window.set_assumed_dimensions(config.default_window_rows, 0.0);
         let boundary_strategy = BoundaryStrategy::new();
         let prefetch_box = PrefetchBox::new(config.box_extent, config.box_max_bias);
 
@@ -233,7 +214,6 @@ impl AdaptivePrefetchCoordinator {
             total_deferred_cycles: 0,
             ortho_union_index: None,
             geo_index: None,
-            scenery_window,
             boundary_strategy,
             prefetch_box,
             scene_tracker: None,
@@ -377,11 +357,6 @@ impl AdaptivePrefetchCoordinator {
 
         // Fallback: geometric grid at zoom 14
         self.boundary_strategy.expand_to_tiles(region, 14)
-    }
-
-    /// Get the scenery window for external monitoring.
-    pub fn scenery_window(&self) -> &SceneryWindow {
-        &self.scenery_window
     }
 
     /// Get the current effective mode.
@@ -702,8 +677,8 @@ impl AdaptivePrefetchCoordinator {
     pub fn startup_info_string(&self) -> String {
         let mode = self.effective_mode();
         format!(
-            "adaptive, mode={:?}, ground_threshold={}kt, boundary_trigger={:.1}°",
-            mode, self.config.ground_speed_threshold_kt, self.config.trigger_distance,
+            "adaptive, mode={:?}, ground_threshold={}kt, box_extent={:.1}°",
+            mode, self.config.ground_speed_threshold_kt, self.config.box_extent,
         )
     }
 
@@ -935,8 +910,6 @@ mod tests {
         BackpressureMockClient, CapLimitedDdsClient, DummyTracker, HighLoadDdsClient,
         StableBoundsTracker,
     };
-    use crate::prefetch::adaptive::scenery_window::WindowState;
-
     // ─────────────────────────────────────────────────────────────────────────
     // Creation tests
     // ─────────────────────────────────────────────────────────────────────────
@@ -1455,205 +1428,10 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_coordinator_creation_has_scenery_window() {
-        let coord = AdaptivePrefetchCoordinator::with_defaults();
-        // Coordinator should have a scenery window in Assumed state
-        // (initialized with default dimensions so boundary checks work immediately)
-        let window = coord.scenery_window();
-        assert!(window.is_ready());
-        assert_eq!(window.state(), &WindowState::Assumed);
-    }
-
-    #[test]
     fn test_coordinator_with_scene_tracker() {
         let tracker: Arc<dyn crate::scene_tracker::SceneTracker> = Arc::new(DummyTracker);
         let coord = AdaptivePrefetchCoordinator::with_defaults().with_scene_tracker(tracker);
         assert!(coord.scene_tracker.is_some());
-    }
-
-    #[test]
-    fn test_coordinator_with_scenery_window_returns_plan_on_boundary() {
-        use crate::geo_index::GeoIndex;
-
-        let tracker: Arc<dyn crate::scene_tracker::SceneTracker> =
-            Arc::new(StableBoundsTracker::default_bounds());
-        let geo_index = Arc::new(GeoIndex::new());
-
-        let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
-            ..Default::default()
-        };
-        let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
-            .with_scene_tracker(tracker)
-            .with_geo_index(geo_index);
-
-        // Prime the scenery window to Ready state by calling update multiple times
-        // with the tracker returning stable bounds. We need to reach Cruise phase too.
-        // First get into cruise: use high ground speed.
-        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
-
-        // First tick: Ground → start hysteresis for cruise
-        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
-        std::thread::sleep(std::time::Duration::from_millis(5));
-
-        // Second tick: hysteresis expires, enter cruise
-        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
-        std::thread::sleep(std::time::Duration::from_millis(5));
-
-        // Third tick: now in cruise, scenery window should have updated from tracker
-        // update_from_tracker is called each cruise update, so 2 calls → Measuring + Ready
-        let plan = coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
-
-        // Aircraft at lat=52.0, near north edge of window (max_lat=53.0),
-        // trigger_distance=3.0° → should trigger a boundary crossing.
-        // If plan is Some, it should have tiles and strategy "boundary".
-        if coord.status.phase == FlightPhase::Cruise {
-            assert!(
-                plan.is_some(),
-                "Should generate a boundary plan near the edge"
-            );
-            let plan = plan.unwrap();
-            assert!(!plan.tiles.is_empty(), "Plan should have tiles");
-            assert_eq!(
-                coord.status.active_strategy, "boundary",
-                "Strategy should be 'boundary'"
-            );
-        }
-        // If we didn't reach cruise (due to phase detector), that's OK for now.
-    }
-
-    #[test]
-    fn test_boundary_plan_tiles_sorted_by_distance_from_aircraft() {
-        use crate::geo_index::GeoIndex;
-
-        let tracker: Arc<dyn crate::scene_tracker::SceneTracker> =
-            Arc::new(StableBoundsTracker::default_bounds());
-        let geo_index = Arc::new(GeoIndex::new());
-
-        let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
-            ..Default::default()
-        };
-        let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
-            .with_scene_tracker(tracker)
-            .with_geo_index(geo_index);
-
-        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
-
-        // Enter cruise phase
-        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
-        std::thread::sleep(std::time::Duration::from_millis(5));
-
-        // Aircraft at 52.0, near north edge — triggers boundary crossing
-        let plan = coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
-
-        if coord.status.phase == FlightPhase::Cruise {
-            let plan = plan.expect("Should generate boundary plan near edge");
-            assert!(
-                plan.tiles.len() > 1,
-                "Need multiple tiles to verify sorting"
-            );
-
-            // Verify tiles are sorted by distance from aircraft position
-            let mut prev_dist = 0.0_f64;
-            for tile in &plan.tiles {
-                let (tile_lat, tile_lon) = tile.to_lat_lon();
-                let dist = (tile_lat - 52.0).powi(2) + (tile_lon - 7.0).powi(2);
-                assert!(
-                    dist >= prev_dist - 0.001,
-                    "Tiles must be sorted by distance from aircraft. \
-                     Found dist={:.4} after prev={:.4}",
-                    dist,
-                    prev_dist,
-                );
-                prev_dist = dist;
-            }
-        }
-    }
-
-    #[test]
-    fn test_coordinator_no_plan_when_far_from_boundary() {
-        let tracker: Arc<dyn crate::scene_tracker::SceneTracker> =
-            Arc::new(StableBoundsTracker::default_bounds());
-
-        let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
-            ..Default::default()
-        };
-        let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
-            .with_scene_tracker(tracker);
-
-        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
-
-        // Get into cruise
-        coord.update((50.0, 7.0), 0.0, 200.0, 35000.0);
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        coord.update((50.0, 7.0), 0.0, 200.0, 35000.0);
-        std::thread::sleep(std::time::Duration::from_millis(5));
-
-        // Aircraft at center of window (50.0, 7.0) — far from all edges
-        let plan = coord.update((50.0, 7.0), 0.0, 200.0, 35000.0);
-
-        if coord.status.phase == FlightPhase::Cruise {
-            assert!(
-                plan.is_none(),
-                "Should NOT generate a plan when aircraft is far from all boundaries"
-            );
-        }
-    }
-
-    #[test]
-    fn test_coordinator_boundary_uses_geo_index_filtering() {
-        use crate::geo_index::{DsfRegion, GeoIndex, PrefetchedRegion};
-
-        let tracker: Arc<dyn crate::scene_tracker::SceneTracker> =
-            Arc::new(StableBoundsTracker::default_bounds());
-        let geo_index = Arc::new(GeoIndex::new());
-
-        // Mark ALL potential boundary regions as already prefetched
-        // The north boundary at dsf_coord=53: depth 0,1,2 → rows 53,54,55
-        // spanning columns 3..10
-        for lat in 53..=55 {
-            for lon in 3..=10 {
-                geo_index.insert::<PrefetchedRegion>(
-                    DsfRegion::new(lat, lon),
-                    PrefetchedRegion::prefetched(),
-                );
-            }
-        }
-
-        let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
-            ..Default::default()
-        };
-        let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
-            .with_scene_tracker(tracker)
-            .with_geo_index(geo_index);
-
-        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
-
-        // Get into cruise
-        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
-        std::thread::sleep(std::time::Duration::from_millis(5));
-
-        // Aircraft near north edge — boundary crossing detected but all regions filtered
-        let plan = coord.update((52.0, 7.0), 0.0, 200.0, 35000.0);
-
-        if coord.status.phase == FlightPhase::Cruise {
-            // All targets were already prefetched, so plan should be None
-            assert!(
-                plan.is_none(),
-                "Plan should be None when all boundary targets are already prefetched"
-            );
-        }
     }
 
     #[test]

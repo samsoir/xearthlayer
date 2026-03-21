@@ -135,24 +135,12 @@ impl SceneTracker for DummyTracker {
 
 /// Mock SceneTracker that returns configurable stable bounds.
 ///
-/// Used to drive the SceneryWindow into Ready state for boundary tests.
+/// A SceneTracker with fixed bounds, used by coordinator tests.
 pub(crate) struct StableBoundsTracker {
     bounds: GeoBounds,
 }
 
 impl StableBoundsTracker {
-    /// Create a tracker with the default bounds used by most coordinator tests.
-    pub(crate) fn default_bounds() -> Self {
-        Self {
-            bounds: GeoBounds {
-                min_lat: 47.0,
-                max_lat: 53.0,
-                min_lon: 3.0,
-                max_lon: 11.0,
-            },
-        }
-    }
-
     /// Create a tracker with custom bounds.
     pub(crate) fn with_bounds(min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64) -> Self {
         Self {
