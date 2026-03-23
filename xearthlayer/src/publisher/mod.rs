@@ -43,6 +43,7 @@ mod archive;
 mod config;
 pub mod coverage;
 pub mod dedupe;
+pub mod dsf;
 mod error;
 mod library;
 mod metadata;
@@ -60,6 +61,7 @@ pub use config::{
     parse_size, read_config, write_config, RepoConfig, DEFAULT_PART_SIZE, MAX_PART_SIZE,
     MIN_PART_SIZE,
 };
+pub use dsf::{DsfError, RemoveZlReport};
 pub use error::{PublishError, PublishResult};
 pub use library::{LibraryManager, DEFAULT_SCOPE, LIBRARY_FILENAME, SPEC_VERSION};
 pub use metadata::{
