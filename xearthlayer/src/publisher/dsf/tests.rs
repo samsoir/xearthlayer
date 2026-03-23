@@ -1,7 +1,13 @@
 use super::filter::DsfZoomFilter;
 use super::parser::parse_terrain_def_zoom;
 use super::parser::DsfTextParser;
+use super::processor::DsfProcessor;
+use super::tool::DsfTool;
+use super::types::DsfError;
 use std::io::BufReader;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use tempfile::TempDir;
 
 fn make_dsf_text(terrain_defs: &[&str], patches: &[(usize, &str)]) -> String {
     let mut lines = vec![
@@ -256,4 +262,118 @@ fn test_filter_consecutive_removals() {
     let output_str = String::from_utf8(output).unwrap();
     // Index 3 (terrain/e_f_BI16.ter) should be remapped to index 1
     assert!(output_str.contains("BEGIN_PATCH 1 "));
+}
+
+// ─── DsfProcessor tests ──────────────────────────────────────────────────────
+
+struct MockDsfTool {
+    decode_content: String,
+    encode_calls: Mutex<Vec<(PathBuf, PathBuf)>>,
+}
+
+impl MockDsfTool {
+    fn new(content: &str) -> Self {
+        Self {
+            decode_content: content.to_string(),
+            encode_calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl DsfTool for MockDsfTool {
+    fn check_available(&self) -> Result<(), DsfError> {
+        Ok(())
+    }
+
+    fn decode(&self, _dsf_path: &Path, text_path: &Path) -> Result<(), DsfError> {
+        std::fs::write(text_path, &self.decode_content)?;
+        Ok(())
+    }
+
+    fn encode(&self, text_path: &Path, dsf_path: &Path) -> Result<(), DsfError> {
+        std::fs::copy(text_path, dsf_path).map_err(|e| DsfError::EncodeFailed {
+            path: dsf_path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+        self.encode_calls
+            .lock()
+            .unwrap()
+            .push((text_path.to_path_buf(), dsf_path.to_path_buf()));
+        Ok(())
+    }
+}
+
+#[test]
+fn test_processor_modifies_dsf_with_target_zl() {
+    let tmp = TempDir::new().unwrap();
+    let dsf_path = tmp.path().join("test.dsf");
+    std::fs::write(&dsf_path, b"fake dsf binary").unwrap();
+
+    let vertex = "PATCH_VERTEX 8.5 50.5 100.0 0.0 0.0 1.0 0.5";
+    let dsf_text = make_dsf_text(
+        &[
+            "terrain_Water",
+            "terrain/100_200_BI16.ter",
+            "terrain/400_800_BI18.ter",
+        ],
+        &[(1, vertex), (2, vertex)],
+    );
+
+    let tool = MockDsfTool::new(&dsf_text);
+    let processor = DsfProcessor::new(&tool);
+    let result = processor.process_dsf_file(&dsf_path, 18, false).unwrap();
+
+    assert!(result.is_some());
+    let filter_result = result.unwrap();
+    assert_eq!(filter_result.terrain_defs_removed, 1);
+    assert_eq!(filter_result.patches_removed, 1);
+    assert_eq!(tool.encode_calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn test_processor_skips_dsf_without_target_zl() {
+    let tmp = TempDir::new().unwrap();
+    let dsf_path = tmp.path().join("test.dsf");
+    std::fs::write(&dsf_path, b"fake dsf binary").unwrap();
+
+    let vertex = "PATCH_VERTEX 8.5 50.5 100.0 0.0 0.0 1.0 0.5";
+    let dsf_text = make_dsf_text(
+        &["terrain_Water", "terrain/100_200_BI16.ter"],
+        &[(1, vertex)],
+    );
+
+    let tool = MockDsfTool::new(&dsf_text);
+    let processor = DsfProcessor::new(&tool);
+    let result = processor.process_dsf_file(&dsf_path, 18, false).unwrap();
+
+    assert!(result.is_none());
+    assert_eq!(tool.encode_calls.lock().unwrap().len(), 0);
+}
+
+#[test]
+fn test_processor_dry_run_does_not_modify() {
+    let tmp = TempDir::new().unwrap();
+    let dsf_path = tmp.path().join("test.dsf");
+    std::fs::write(&dsf_path, b"fake dsf binary").unwrap();
+
+    let vertex = "PATCH_VERTEX 8.5 50.5 100.0 0.0 0.0 1.0 0.5";
+    let dsf_text = make_dsf_text(
+        &[
+            "terrain_Water",
+            "terrain/100_200_BI16.ter",
+            "terrain/400_800_BI18.ter",
+        ],
+        &[(1, vertex), (2, vertex)],
+    );
+
+    let tool = MockDsfTool::new(&dsf_text);
+    let processor = DsfProcessor::new(&tool);
+    let result = processor.process_dsf_file(&dsf_path, 18, true).unwrap();
+
+    assert!(result.is_some());
+    assert_eq!(tool.encode_calls.lock().unwrap().len(), 0);
+    assert_eq!(
+        std::fs::read_to_string(&dsf_path).unwrap(),
+        "fake dsf binary"
+    );
 }
