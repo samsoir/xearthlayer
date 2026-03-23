@@ -1,3 +1,4 @@
+use super::filter::DsfZoomFilter;
 use super::parser::parse_terrain_def_zoom;
 use super::parser::DsfTextParser;
 use std::io::BufReader;
@@ -149,4 +150,110 @@ fn test_parse_no_zoom() {
 fn test_parse_bare_filename_matches() {
     let full = format!("terrain/{}", "88416_136896_BI18_sea.ter");
     assert_eq!(parse_terrain_def_zoom(&full), Some(18));
+}
+
+#[test]
+fn test_filter_removes_zl18_terrain_defs() {
+    let vertex = "PATCH_VERTEX 8.5 50.5 100.0 0.0 0.0 1.0 0.5";
+    let text = make_dsf_text(
+        &[
+            "terrain_Water",
+            "terrain/100_200_BI16.ter",
+            "terrain/400_800_BI18.ter",
+        ],
+        &[(1, vertex), (2, vertex)],
+    );
+
+    let reader = BufReader::new(text.as_bytes());
+    let mut output = Vec::new();
+    let result = DsfZoomFilter::filter(reader, &mut output, 18).unwrap();
+
+    assert_eq!(result.terrain_defs_removed, 1);
+    assert_eq!(result.patches_removed, 1);
+
+    let output_str = String::from_utf8(output).unwrap();
+    assert!(output_str.contains("TERRAIN_DEF terrain_Water"));
+    assert!(output_str.contains("TERRAIN_DEF terrain/100_200_BI16.ter"));
+    assert!(!output_str.contains("BI18"));
+}
+
+#[test]
+fn test_filter_remaps_patch_indices() {
+    let vertex = "PATCH_VERTEX 8.5 50.5 100.0 0.0 0.0 1.0 0.5";
+    let text = make_dsf_text(
+        &[
+            "terrain_Water",
+            "terrain/100_200_BI18.ter",
+            "terrain/100_200_BI16.ter",
+        ],
+        &[(2, vertex)],
+    );
+
+    let reader = BufReader::new(text.as_bytes());
+    let mut output = Vec::new();
+    DsfZoomFilter::filter(reader, &mut output, 18).unwrap();
+
+    let output_str = String::from_utf8(output).unwrap();
+    assert!(output_str.contains("BEGIN_PATCH 1 "));
+    assert!(!output_str.contains("BEGIN_PATCH 2 "));
+}
+
+#[test]
+fn test_filter_preserves_non_target_patches() {
+    let vertex = "PATCH_VERTEX 8.5 50.5 100.0 0.0 0.0 1.0 0.5";
+    let text = make_dsf_text(
+        &[
+            "terrain_Water",
+            "terrain/100_200_BI16.ter",
+            "terrain/400_800_BI18.ter",
+        ],
+        &[(0, vertex), (1, vertex), (2, vertex)],
+    );
+
+    let reader = BufReader::new(text.as_bytes());
+    let mut output = Vec::new();
+    let result = DsfZoomFilter::filter(reader, &mut output, 18).unwrap();
+
+    assert_eq!(result.patches_removed, 1);
+    let output_str = String::from_utf8(output).unwrap();
+    assert_eq!(output_str.matches("BEGIN_PATCH").count(), 2);
+}
+
+#[test]
+fn test_filter_no_target_zl_is_noop() {
+    let vertex = "PATCH_VERTEX 8.5 50.5 100.0 0.0 0.0 1.0 0.5";
+    let text = make_dsf_text(
+        &["terrain_Water", "terrain/100_200_BI16.ter"],
+        &[(0, vertex), (1, vertex)],
+    );
+
+    let reader = BufReader::new(text.as_bytes());
+    let mut output = Vec::new();
+    let result = DsfZoomFilter::filter(reader, &mut output, 18).unwrap();
+
+    assert_eq!(result.terrain_defs_removed, 0);
+    assert_eq!(result.patches_removed, 0);
+}
+
+#[test]
+fn test_filter_consecutive_removals() {
+    let vertex = "PATCH_VERTEX 8.5 50.5 100.0 0.0 0.0 1.0 0.5";
+    let text = make_dsf_text(
+        &[
+            "terrain_Water",
+            "terrain/a_b_BI18.ter",
+            "terrain/c_d_BI18_sea.ter",
+            "terrain/e_f_BI16.ter",
+        ],
+        &[(3, vertex)],
+    );
+
+    let reader = BufReader::new(text.as_bytes());
+    let mut output = Vec::new();
+    let result = DsfZoomFilter::filter(reader, &mut output, 18).unwrap();
+
+    assert_eq!(result.terrain_defs_removed, 2);
+    let output_str = String::from_utf8(output).unwrap();
+    // Index 3 (terrain/e_f_BI16.ter) should be remapped to index 1
+    assert!(output_str.contains("BEGIN_PATCH 1 "));
 }
