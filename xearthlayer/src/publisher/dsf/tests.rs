@@ -2,7 +2,7 @@ use super::filter::DsfZoomFilter;
 use super::parser::parse_terrain_def_zoom;
 use super::parser::DsfTextParser;
 use super::processor::DsfProcessor;
-use super::tool::DsfTool;
+use super::tool::{DsfTool, DsfToolRunner};
 use super::types::DsfError;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -376,4 +376,71 @@ fn test_processor_dry_run_does_not_modify() {
         std::fs::read_to_string(&dsf_path).unwrap(),
         "fake dsf binary"
     );
+}
+
+/// Integration test using real DSFTool binary.
+/// Run with: cargo test -p xearthlayer test_real_dsftool -- --ignored --nocapture
+#[test]
+#[ignore] // Requires DSFTool on PATH
+fn test_real_dsftool_roundtrip() {
+    let tool = DsfToolRunner;
+    if tool.check_available().is_err() {
+        eprintln!("DSFTool not available, skipping integration test");
+        return;
+    }
+
+    // Use a known DSF from the NA package for testing
+    let test_dsf = Path::new(
+        "/media/FlightSim/XEarthLayer Packages/zzXEL_na_ortho/Earth nav data/+30-100/+30-096.dsf",
+    );
+    if !test_dsf.exists() {
+        eprintln!("Test DSF not found, skipping");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let work_dsf = tmp.path().join("test.dsf");
+    std::fs::copy(test_dsf, &work_dsf).unwrap();
+
+    let processor = DsfProcessor::new(&tool);
+
+    // Dry run first — verify analysis
+    let result = processor.process_dsf_file(&work_dsf, 18, true).unwrap();
+    if let Some(ref filter_result) = result {
+        assert!(
+            filter_result.terrain_defs_removed > 0,
+            "Expected ZL18 terrain defs"
+        );
+        assert!(filter_result.patches_removed > 0, "Expected ZL18 patches");
+        eprintln!(
+            "Dry run: would remove {} terrain defs, {} patches",
+            filter_result.terrain_defs_removed, filter_result.patches_removed
+        );
+    } else {
+        eprintln!("No ZL18 found in this DSF — test inconclusive");
+        return;
+    }
+
+    // Actual run — verify DSF is modified and still valid
+    let result = processor.process_dsf_file(&work_dsf, 18, false).unwrap();
+    assert!(result.is_some());
+
+    // Verify the modified DSF can be decoded again (valid binary)
+    let verify_text = tmp.path().join("verify.txt");
+    tool.decode(&work_dsf, &verify_text).unwrap();
+
+    let content = std::fs::read_to_string(&verify_text).unwrap();
+    assert!(
+        !content.contains("BI18"),
+        "ZL18 terrain should be removed from output"
+    );
+    assert!(
+        content.contains("BI16") || content.contains("GO216"),
+        "ZL16 terrain should be preserved"
+    );
+    assert!(
+        content.contains("TERRAIN_DEF"),
+        "Should still have terrain definitions"
+    );
+    eprintln!("Integration test passed: DSF roundtrip successful");
 }
