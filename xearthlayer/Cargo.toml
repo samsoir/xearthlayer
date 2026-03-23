@@ -52,6 +52,7 @@ serde_json = "1.0"
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 tracing-chrome = { version = "0.7", optional = true }
 axum = { version = "0.7", optional = true }
+tempfile = "3.8"
 
 [features]
 profiling = ["tracing-chrome"]
@@ -61,6 +62,5 @@ debug-map = ["dep:axum"]
 [dev-dependencies]
 proptest = "1.4"
 rand = "0.9"
-tempfile = "3.8"
 futures = "0.3"
 filetime = "0.2"
