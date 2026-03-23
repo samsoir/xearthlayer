@@ -109,6 +109,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - Archive building with configurable part sizes
    - Library index management for package discovery
    - `Ortho4XPProcessor` for ortho tiles, `OverlayProcessor` for overlays
+   - `publisher::dsf` module: DSF text parsing, zoom level filtering, and DSFTool integration
 
 11. **Predictive Tile Caching** (`xearthlayer/src/prefetch/`)
     - `AdaptivePrefetchCoordinator` - Self-calibrating prefetch with flight phase detection
@@ -278,6 +279,7 @@ xearthlayer publish validate                # Validate repository
 xearthlayer publish coverage [--dark] [--geojson] [-o <file>]  # Generate coverage map
 xearthlayer publish dedupe --region <code> [--priority <mode>] [--tile <lat,lon>] [--dry-run]  # Remove overlapping ZL tiles
 xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o <file>]  # Analyze coverage gaps
+xearthlayer publish remove-zl --region <code> --zoom <level> [--tile <lat,lon>] [--dry-run]  # Remove zoom level from package DSFs
 ```
 
 ## Key Files
@@ -310,6 +312,7 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/config/keys.rs` | ConfigKey enum with validation (Specification Pattern) |
 | `xearthlayer/src/publisher/` | Package publisher library |
 | `xearthlayer/src/publisher/dedupe/` | Zoom level overlap detection and gap analysis |
+| `xearthlayer/src/publisher/dsf/` | DSF text manipulation for zoom level removal |
 | `xearthlayer/src/prefetch/strategy.rs` | Prefetcher trait (strategy pattern) |
 | `xearthlayer/src/prefetch/adaptive/coordinator/core.rs` | AdaptivePrefetchCoordinator (sliding box prefetch) |
 | `xearthlayer/src/prefetch/adaptive/prefetch_box.rs` | PrefetchBox (heading-biased sliding prefetch region) |
