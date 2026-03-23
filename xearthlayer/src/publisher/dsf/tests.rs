@@ -1,4 +1,83 @@
 use super::parser::parse_terrain_def_zoom;
+use super::parser::DsfTextParser;
+use std::io::BufReader;
+
+fn make_dsf_text(terrain_defs: &[&str], patches: &[(usize, &str)]) -> String {
+    let mut lines = vec![
+        "I".to_string(),
+        "800 written by DSFTool 2.4.0-b1".to_string(),
+        "DSF2TEXT".to_string(),
+        "".to_string(),
+        "PROPERTY sim/west 8".to_string(),
+        "PROPERTY sim/east 9".to_string(),
+        "PROPERTY sim/south 50".to_string(),
+        "PROPERTY sim/north 51".to_string(),
+    ];
+
+    for def in terrain_defs {
+        lines.push(format!("TERRAIN_DEF {}", def));
+    }
+
+    for (index, vertex_block) in patches {
+        lines.push(format!("BEGIN_PATCH {} 0.000000 -1.000000 1 7", index));
+        lines.push("BEGIN_PRIMITIVE 0".to_string());
+        lines.push(vertex_block.to_string());
+        lines.push("END_PRIMITIVE".to_string());
+        lines.push("END_PATCH".to_string());
+    }
+
+    lines.join("\n")
+}
+
+#[test]
+fn test_analyze_counts_terrain_defs() {
+    let text = make_dsf_text(
+        &[
+            "terrain_Water",
+            "terrain/100_200_BI16.ter",
+            "terrain/400_800_BI18.ter",
+        ],
+        &[],
+    );
+    let reader = BufReader::new(text.as_bytes());
+    let analysis = DsfTextParser::analyze(reader).unwrap();
+
+    assert_eq!(analysis.terrain_defs.len(), 3);
+    assert_eq!(analysis.terrain_defs[0].name, "terrain_Water");
+    assert_eq!(analysis.terrain_defs[0].zoom_level, None);
+    assert_eq!(analysis.terrain_defs[1].zoom_level, Some(16));
+    assert_eq!(analysis.terrain_defs[2].zoom_level, Some(18));
+}
+
+#[test]
+fn test_analyze_counts_patches_by_zoom() {
+    let vertex = "PATCH_VERTEX 8.5 50.5 100.0 0.0 0.0 1.0 0.5";
+    let text = make_dsf_text(
+        &[
+            "terrain_Water",
+            "terrain/100_200_BI16.ter",
+            "terrain/400_800_BI18.ter",
+        ],
+        &[(1, vertex), (1, vertex), (2, vertex)],
+    );
+    let reader = BufReader::new(text.as_bytes());
+    let analysis = DsfTextParser::analyze(reader).unwrap();
+
+    assert_eq!(analysis.total_patches, 3);
+    assert_eq!(analysis.patches_by_zoom[&16], 2);
+    assert_eq!(analysis.patches_by_zoom[&18], 1);
+}
+
+#[test]
+fn test_analyze_empty_dsf() {
+    let text = make_dsf_text(&["terrain_Water"], &[]);
+    let reader = BufReader::new(text.as_bytes());
+    let analysis = DsfTextParser::analyze(reader).unwrap();
+
+    assert_eq!(analysis.terrain_defs.len(), 1);
+    assert_eq!(analysis.total_patches, 0);
+    assert!(analysis.patches_by_zoom.is_empty());
+}
 
 #[test]
 fn test_parse_bing_zl16() {
