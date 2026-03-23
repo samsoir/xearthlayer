@@ -12,8 +12,9 @@ use semver::Version;
 use crate::error::CliError;
 use xearthlayer::package::{PackageMetadata, PackageType};
 use xearthlayer::publisher::dedupe::{
-    DedupeFilter, GapAnalysisResult, TileReference, ZoomPriority,
+    DedupeFilter, GapAnalysisResult, TileCoord, TileReference, ZoomPriority,
 };
+use xearthlayer::publisher::dsf::RemoveZlReport;
 use xearthlayer::publisher::{
     BuildResult, ProcessSummary, RegionSuggestion, ReleaseResult, ReleaseStatus, RepoConfig,
     SceneryScanResult, UrlConfigResult, VersionBump,
@@ -273,6 +274,16 @@ pub trait PublisherService: Send + Sync {
         package_type: PackageType,
         filter: Option<DedupeFilter>,
     ) -> Result<GapAnalysisResult, CliError>;
+
+    /// Remove a specific zoom level from a scenery package.
+    fn remove_zoom_level(
+        &self,
+        repo: &dyn RepositoryOperations,
+        region: &str,
+        target_zoom: u8,
+        tile: Option<TileCoord>,
+        dry_run: bool,
+    ) -> Result<RemoveZlReport, CliError>;
 }
 
 // ============================================================================

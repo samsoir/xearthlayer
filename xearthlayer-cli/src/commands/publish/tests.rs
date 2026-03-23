@@ -13,7 +13,8 @@ use super::handlers::*;
 use super::traits::*;
 use crate::error::CliError;
 use xearthlayer::package::{ArchivePart, PackageMetadata, PackageType};
-use xearthlayer::publisher::dedupe::{DedupeFilter, GapAnalysisResult, ZoomPriority};
+use xearthlayer::publisher::dedupe::{DedupeFilter, GapAnalysisResult, TileCoord, ZoomPriority};
+use xearthlayer::publisher::dsf::RemoveZlReport;
 use xearthlayer::publisher::{
     ArchiveBuildResult, BuildResult, ProcessSummary, RegionSuggestion, ReleaseResult,
     ReleaseStatus, RepoConfig, SceneryScanResult, SuggestedRegion, TileInfo, UrlConfigResult,
@@ -480,6 +481,28 @@ impl PublisherService for MockPublisherService {
     ) -> Result<GapAnalysisResult, CliError> {
         // Return an empty gap analysis result
         Ok(GapAnalysisResult::default())
+    }
+
+    fn remove_zoom_level(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        _region: &str,
+        _target_zoom: u8,
+        _tile: Option<TileCoord>,
+        dry_run: bool,
+    ) -> Result<RemoveZlReport, CliError> {
+        Ok(RemoveZlReport {
+            region: String::new(),
+            target_zoom: 18,
+            dsf_files_scanned: 0,
+            dsf_files_modified: 0,
+            dsf_files_failed: vec![],
+            terrain_defs_removed: 0,
+            patches_removed: 0,
+            ter_files_removed: 0,
+            png_files_removed: 0,
+            dry_run,
+        })
     }
 }
 

@@ -46,15 +46,15 @@ mod tests;
 pub use args::PublishCommands;
 pub use handlers::{
     AddHandler, BuildHandler, CoverageHandler, DedupeHandler, GapsHandler, InitHandler,
-    ListHandler, ReleaseHandler, ScanHandler, StatusHandler, UrlsHandler, ValidateHandler,
-    VersionHandler,
+    ListHandler, ReleaseHandler, RemoveZlHandler, ScanHandler, StatusHandler, UrlsHandler,
+    ValidateHandler, VersionHandler,
 };
 pub use services::{ConsoleOutput, DefaultPublisherService};
 pub use traits::CommandHandler;
 
 use args::{
     AddArgs, BuildArgs, CoverageArgs, DedupeArgs, GapsArgs, InitArgs, ListArgs, ReleaseArgs,
-    ScanArgs, StatusArgs, UrlsArgs, ValidateArgs, VersionArgs,
+    RemoveZlArgs, ScanArgs, StatusArgs, UrlsArgs, ValidateArgs, VersionArgs,
 };
 use traits::CommandContext;
 
@@ -245,6 +245,27 @@ pub fn run(command: PublishCommands) -> Result<(), CliError> {
                 region,
                 package_type: r#type,
                 tile,
+                report,
+                report_format,
+                repo,
+            },
+            &ctx,
+        ),
+
+        PublishCommands::RemoveZl {
+            region,
+            zoom,
+            tile,
+            dry_run,
+            report,
+            report_format,
+            repo,
+        } => RemoveZlHandler::execute(
+            RemoveZlArgs {
+                region,
+                zoom,
+                tile,
+                dry_run,
                 report,
                 report_format,
                 repo,

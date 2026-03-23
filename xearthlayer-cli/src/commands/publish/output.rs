@@ -6,6 +6,7 @@
 use super::traits::{DedupeReport, Output, OverlapSummary};
 use xearthlayer::config::format_size;
 use xearthlayer::publisher::dedupe::GapAnalysisResult;
+use xearthlayer::publisher::dsf::RemoveZlReport;
 use xearthlayer::publisher::{ProcessSummary, RegionSuggestion, ReleaseStatus, SceneryScanResult};
 
 /// Print scan results to the output.
@@ -197,6 +198,38 @@ pub fn print_gap_result(out: &dyn Output, result: &GapAnalysisResult) {
             if result.gaps.len() > 5 {
                 out.println(&format!("  ... and {} more gaps", result.gaps.len() - 5));
             }
+        }
+    }
+}
+
+/// Print remove-zl results to the output.
+pub fn print_remove_zl_result(out: &dyn Output, report: &RemoveZlReport) {
+    out.header("Remove Zoom Level Results");
+    out.newline();
+    out.println(&format!("Scanned {} DSF files", report.dsf_files_scanned));
+    out.indented(&format!(
+        "Files containing ZL{}: {}",
+        report.target_zoom, report.dsf_files_modified
+    ));
+    out.indented(&format!(
+        "Terrain definitions removed: {}",
+        report.terrain_defs_removed
+    ));
+    out.indented(&format!("Patches removed: {}", report.patches_removed));
+    out.indented(&format!(".ter files removed: {}", report.ter_files_removed));
+    out.indented(&format!(".png files removed: {}", report.png_files_removed));
+
+    if !report.dsf_files_failed.is_empty() {
+        out.newline();
+        out.println(&format!("Failures: {}", report.dsf_files_failed.len()));
+        for (path, error) in &report.dsf_files_failed {
+            out.indented(&format!(
+                "{}: {}",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                error
+            ));
         }
     }
 }

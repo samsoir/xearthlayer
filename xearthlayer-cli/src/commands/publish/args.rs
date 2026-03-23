@@ -359,6 +359,41 @@ pub enum PublishCommands {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
+
+    /// Remove a specific zoom level from a scenery package
+    ///
+    /// Modifies DSF files to strip terrain definitions and patches at the
+    /// target zoom level, then removes orphaned .ter and .png files.
+    /// Requires DSFTool on PATH.
+    RemoveZl {
+        /// Region code (e.g., "na", "eur", "asia")
+        #[arg(long)]
+        region: String,
+
+        /// Zoom level to remove (12-19)
+        #[arg(long, value_parser = clap::value_parser!(u8).range(12..=19))]
+        zoom: u8,
+
+        /// Limit operation to a specific 1°×1° tile (format: "lat,lon", e.g., "50,8")
+        #[arg(long)]
+        tile: Option<String>,
+
+        /// Preview changes without modifying files
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output a report file with details of changes
+        #[arg(long)]
+        report: Option<PathBuf>,
+
+        /// Format for the report file (text or json)
+        #[arg(long, value_enum, default_value = "text")]
+        report_format: ReportFormatArg,
+
+        /// Repository path (default: current directory)
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
 }
 
 /// Report format options for gap analysis.
@@ -483,5 +518,16 @@ pub struct GapsArgs {
     pub tile: Option<String>,
     pub report: Option<PathBuf>,
     pub report_format: GapReportFormatArg,
+    pub repo: PathBuf,
+}
+
+/// Arguments for the remove-zl command.
+pub struct RemoveZlArgs {
+    pub region: String,
+    pub zoom: u8,
+    pub tile: Option<String>,
+    pub dry_run: bool,
+    pub report: Option<PathBuf>,
+    pub report_format: ReportFormatArg,
     pub repo: PathBuf,
 }

@@ -13,7 +13,10 @@ use super::traits::{
 use crate::error::CliError;
 use xearthlayer::package::{PackageMetadata, PackageType};
 use xearthlayer::publisher::dedupe::{
-    resolve_overlaps, DedupeFilter, GapAnalysisResult, OverlapDetector, ZoomPriority,
+    resolve_overlaps, DedupeFilter, GapAnalysisResult, OverlapDetector, TileCoord, ZoomPriority,
+};
+use xearthlayer::publisher::dsf::{
+    parse_terrain_def_zoom, DsfProcessor, DsfTool, DsfToolRunner, RemoveZlReport,
 };
 use xearthlayer::publisher::{
     coverage::{CoverageConfig, CoverageMapGenerator},
@@ -477,5 +480,163 @@ impl PublisherService for DefaultPublisherService {
         let result = detector.analyze_gaps(&tiles);
 
         Ok(result)
+    }
+
+    fn remove_zoom_level(
+        &self,
+        repo: &dyn RepositoryOperations,
+        region: &str,
+        target_zoom: u8,
+        tile: Option<TileCoord>,
+        dry_run: bool,
+    ) -> Result<RemoveZlReport, CliError> {
+        let package_dir = repo.package_dir(region, PackageType::Ortho);
+        if !package_dir.exists() {
+            return Err(CliError::Publish(format!(
+                "Package not found: {} ortho",
+                region.to_uppercase()
+            )));
+        }
+
+        let tool = DsfToolRunner;
+        tool.check_available()
+            .map_err(|e| CliError::Publish(e.to_string()))?;
+
+        let earth_nav = package_dir.join("Earth nav data");
+        if !earth_nav.exists() {
+            return Err(CliError::Publish(format!(
+                "Earth nav data directory not found in {}",
+                package_dir.display()
+            )));
+        }
+
+        let dsf_files = Self::find_dsf_files(&earth_nav, tile.as_ref())?;
+        let dsf_files_scanned = dsf_files.len();
+
+        let mut dsf_files_modified = 0usize;
+        let mut terrain_defs_removed = 0usize;
+        let mut patches_removed = 0usize;
+        let mut dsf_files_failed: Vec<(PathBuf, String)> = Vec::new();
+
+        for dsf_path in &dsf_files {
+            let processor = DsfProcessor::new(&tool);
+            match processor.process_dsf_file(dsf_path, target_zoom, dry_run) {
+                Ok(Some(result)) => {
+                    dsf_files_modified += 1;
+                    terrain_defs_removed += result.terrain_defs_removed;
+                    patches_removed += result.patches_removed;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    dsf_files_failed.push((dsf_path.clone(), e.to_string()));
+                }
+            }
+        }
+
+        let (ter_removed, png_removed) =
+            Self::process_orphan_files(&package_dir, target_zoom, dry_run)?;
+
+        Ok(RemoveZlReport {
+            region: region.to_string(),
+            target_zoom,
+            dsf_files_scanned,
+            dsf_files_modified,
+            dsf_files_failed,
+            terrain_defs_removed,
+            patches_removed,
+            ter_files_removed: ter_removed,
+            png_files_removed: png_removed,
+            dry_run,
+        })
+    }
+}
+
+impl DefaultPublisherService {
+    fn find_dsf_files(
+        earth_nav: &Path,
+        tile: Option<&TileCoord>,
+    ) -> Result<Vec<PathBuf>, CliError> {
+        let mut dsf_files = Vec::new();
+        for region_entry in std::fs::read_dir(earth_nav)
+            .map_err(|e| CliError::Publish(format!("Failed to read Earth nav data: {}", e)))?
+        {
+            let region_dir = region_entry
+                .map_err(|e| CliError::Publish(e.to_string()))?
+                .path();
+            if !region_dir.is_dir() {
+                continue;
+            }
+            for dsf_entry in
+                std::fs::read_dir(&region_dir).map_err(|e| CliError::Publish(e.to_string()))?
+            {
+                let dsf_path = dsf_entry
+                    .map_err(|e| CliError::Publish(e.to_string()))?
+                    .path();
+                if dsf_path.extension().is_some_and(|e| e == "dsf") {
+                    if let Some(tile_coord) = tile {
+                        if let Some(name) = dsf_path.file_stem().and_then(|n| n.to_str()) {
+                            if name != tile_coord.to_xplane_name() {
+                                continue;
+                            }
+                        }
+                    }
+                    dsf_files.push(dsf_path);
+                }
+            }
+        }
+        Ok(dsf_files)
+    }
+
+    fn process_orphan_files(
+        package_dir: &Path,
+        target_zoom: u8,
+        dry_run: bool,
+    ) -> Result<(usize, usize), CliError> {
+        let terrain_dir = package_dir.join("terrain");
+        let textures_dir = package_dir.join("textures");
+
+        let mut ter_count = 0;
+        if terrain_dir.exists() {
+            for entry in
+                std::fs::read_dir(&terrain_dir).map_err(|e| CliError::Publish(e.to_string()))?
+            {
+                let path = entry.map_err(|e| CliError::Publish(e.to_string()))?.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with(".ter") && Self::ter_matches_zoom(name, target_zoom) {
+                        if !dry_run {
+                            std::fs::remove_file(&path)
+                                .map_err(|e| CliError::Publish(e.to_string()))?;
+                        }
+                        ter_count += 1;
+                    }
+                }
+            }
+        }
+
+        let mut png_count = 0;
+        if textures_dir.exists() {
+            let zl_pattern = format!("_ZL{}.png", target_zoom);
+            for entry in
+                std::fs::read_dir(&textures_dir).map_err(|e| CliError::Publish(e.to_string()))?
+            {
+                let path = entry.map_err(|e| CliError::Publish(e.to_string()))?.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with(&zl_pattern) {
+                        if !dry_run {
+                            std::fs::remove_file(&path)
+                                .map_err(|e| CliError::Publish(e.to_string()))?;
+                        }
+                        png_count += 1;
+                    }
+                }
+            }
+        }
+
+        Ok((ter_count, png_count))
+    }
+
+    fn ter_matches_zoom(filename: &str, target_zoom: u8) -> bool {
+        let full_name = format!("terrain/{}", filename);
+        parse_terrain_def_zoom(&full_name) == Some(target_zoom)
     }
 }

@@ -8,12 +8,13 @@ use semver::Version;
 
 use super::args::{
     AddArgs, BuildArgs, CoverageArgs, DedupeArgs, GapReportFormatArg, GapsArgs, InitArgs, ListArgs,
-    ReleaseArgs, ReportFormatArg, ScanArgs, StatusArgs, UrlsArgs, ValidateArgs, VersionArgs,
+    ReleaseArgs, RemoveZlArgs, ReportFormatArg, ScanArgs, StatusArgs, UrlsArgs, ValidateArgs,
+    VersionArgs,
 };
 use super::output::{
     format_size_display, format_status, print_dedupe_result, print_gap_result,
-    print_overlap_summary, print_process_summary, print_region_suggestion, print_scan_result,
-    print_status_short,
+    print_overlap_summary, print_process_summary, print_region_suggestion, print_remove_zl_result,
+    print_scan_result, print_status_short,
 };
 use super::traits::{CommandContext, CommandHandler};
 use crate::error::CliError;
@@ -954,6 +955,79 @@ impl CommandHandler for GapsHandler {
                 .indented("2. Generate missing tiles in Ortho4XP using the coordinate list");
             ctx.output
                 .indented("3. Run 'publish add' to import the new tiles");
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// RemoveZl Handler
+// ============================================================================
+
+/// Handler for the `publish remove-zl` command.
+pub struct RemoveZlHandler;
+
+impl CommandHandler for RemoveZlHandler {
+    type Args = RemoveZlArgs;
+
+    fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
+        let tile = if let Some(ref tile_str) = args.tile {
+            Some(
+                TileCoord::parse(tile_str)
+                    .map_err(|e| CliError::Publish(format!("Invalid tile coordinate: {}", e)))?,
+            )
+        } else {
+            None
+        };
+
+        let repo = ctx.publisher.open_repository(&args.repo)?;
+
+        ctx.output.println(&format!(
+            "Removing ZL{} from {} ortho package",
+            args.zoom,
+            args.region.to_uppercase()
+        ));
+        if args.dry_run {
+            ctx.output.indented("(dry run - no files will be modified)");
+        }
+        if let Some(ref tile_str) = args.tile {
+            ctx.output
+                .indented(&format!("Targeting tile: {}", tile_str));
+        }
+        ctx.output.newline();
+
+        let report = ctx.publisher.remove_zoom_level(
+            repo.as_ref(),
+            &args.region,
+            args.zoom,
+            tile,
+            args.dry_run,
+        )?;
+
+        print_remove_zl_result(ctx.output, &report);
+
+        if let Some(ref report_path) = args.report {
+            ctx.output.newline();
+            ctx.output
+                .println(&format!("Writing report to: {}", report_path.display()));
+            let content = match args.report_format {
+                ReportFormatArg::Json => report.to_json(),
+                ReportFormatArg::Text => report.to_text(),
+            };
+            std::fs::write(report_path, content)
+                .map_err(|e| CliError::Publish(format!("Failed to write report: {}", e)))?;
+        }
+
+        ctx.output.newline();
+        if report.dsf_files_modified > 0 && report.dry_run {
+            ctx.output.println("Next steps:");
+            ctx.output
+                .indented("Run without --dry-run to apply changes");
+        } else if report.dsf_files_modified > 0 && !report.dry_run {
+            ctx.output.println("Note:");
+            ctx.output
+                .indented("Run 'publish build' to recreate archives with updated tiles");
         }
 
         Ok(())
