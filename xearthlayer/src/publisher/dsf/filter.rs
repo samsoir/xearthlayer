@@ -14,14 +14,16 @@ impl DsfZoomFilter {
     ) -> Result<FilterResult, DsfError> {
         let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
 
-        // Pass 1: identify terrain def indices to remove
+        // Pass 1: identify terrain def indices to remove and collect their names
         let mut remove_indices = Vec::new();
+        let mut removed_terrain_names = Vec::new();
         let mut terrain_index: usize = 0;
         for line in &lines {
             let trimmed = line.trim();
             if let Some(name) = trimmed.strip_prefix("TERRAIN_DEF ") {
                 if parse_terrain_def_zoom(name) == Some(target_zoom) {
                     remove_indices.push(terrain_index);
+                    removed_terrain_names.push(name.to_string());
                 }
                 terrain_index += 1;
             }
@@ -34,6 +36,7 @@ impl DsfZoomFilter {
             return Ok(FilterResult {
                 terrain_defs_removed: 0,
                 patches_removed: 0,
+                removed_terrain_names: Vec::new(),
             });
         }
 
@@ -101,6 +104,7 @@ impl DsfZoomFilter {
         Ok(FilterResult {
             terrain_defs_removed: remove_indices.len(),
             patches_removed,
+            removed_terrain_names,
         })
     }
 }

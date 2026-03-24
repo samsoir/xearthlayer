@@ -444,3 +444,50 @@ fn test_real_dsftool_roundtrip() {
     );
     eprintln!("Integration test passed: DSF roundtrip successful");
 }
+
+/// Regression test: FilterResult must return the names of removed TERRAIN_DEFs.
+/// This is used by the service layer to scope .ter/.png cleanup to only the
+/// files referenced by processed DSFs (critical for --tile mode).
+#[test]
+fn test_filter_returns_removed_terrain_names() {
+    let vertex = "PATCH_VERTEX 8.5 50.5 100.0 0.0 0.0 1.0 0.5";
+    let text = make_dsf_text(
+        &[
+            "terrain_Water",
+            "terrain/100_200_BI16.ter",
+            "terrain/400_800_BI18.ter",
+            "terrain/500_900_BI18_sea.ter",
+        ],
+        &[(1, vertex), (2, vertex), (3, vertex)],
+    );
+
+    let reader = BufReader::new(text.as_bytes());
+    let mut output = Vec::new();
+    let result = DsfZoomFilter::filter(reader, &mut output, 18).unwrap();
+
+    assert_eq!(result.terrain_defs_removed, 2);
+    assert_eq!(result.removed_terrain_names.len(), 2);
+    assert!(result
+        .removed_terrain_names
+        .contains(&"terrain/400_800_BI18.ter".to_string()));
+    assert!(result
+        .removed_terrain_names
+        .contains(&"terrain/500_900_BI18_sea.ter".to_string()));
+}
+
+/// Regression test: when no target ZL is found, removed_terrain_names must be empty.
+#[test]
+fn test_filter_noop_returns_empty_terrain_names() {
+    let vertex = "PATCH_VERTEX 8.5 50.5 100.0 0.0 0.0 1.0 0.5";
+    let text = make_dsf_text(
+        &["terrain_Water", "terrain/100_200_BI16.ter"],
+        &[(1, vertex)],
+    );
+
+    let reader = BufReader::new(text.as_bytes());
+    let mut output = Vec::new();
+    let result = DsfZoomFilter::filter(reader, &mut output, 18).unwrap();
+
+    assert_eq!(result.terrain_defs_removed, 0);
+    assert!(result.removed_terrain_names.is_empty());
+}

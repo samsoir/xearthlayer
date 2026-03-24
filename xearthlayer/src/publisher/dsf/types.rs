@@ -49,6 +49,8 @@ pub struct FilterResult {
     pub terrain_defs_removed: usize,
     /// Number of BEGIN_PATCH...END_PATCH blocks removed.
     pub patches_removed: usize,
+    /// Names of TERRAIN_DEF entries that were removed (e.g., "terrain/88416_136896_BI18_sea.ter").
+    pub removed_terrain_names: Vec<String>,
 }
 
 /// Report from a remove-zl operation across a package.

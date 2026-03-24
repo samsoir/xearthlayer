@@ -517,6 +517,7 @@ impl PublisherService for DefaultPublisherService {
         let mut terrain_defs_removed = 0usize;
         let mut patches_removed = 0usize;
         let mut dsf_files_failed: Vec<(PathBuf, String)> = Vec::new();
+        let mut all_removed_terrain_names: Vec<String> = Vec::new();
 
         for dsf_path in &dsf_files {
             let processor = DsfProcessor::new(&tool);
@@ -525,6 +526,7 @@ impl PublisherService for DefaultPublisherService {
                     dsf_files_modified += 1;
                     terrain_defs_removed += result.terrain_defs_removed;
                     patches_removed += result.patches_removed;
+                    all_removed_terrain_names.extend(result.removed_terrain_names);
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -533,8 +535,12 @@ impl PublisherService for DefaultPublisherService {
             }
         }
 
-        let (ter_removed, png_removed) =
-            Self::process_orphan_files(&package_dir, target_zoom, dry_run)?;
+        let (ter_removed, png_removed) = Self::process_orphan_files(
+            &package_dir,
+            target_zoom,
+            dry_run,
+            &all_removed_terrain_names,
+        )?;
 
         Ok(RemoveZlReport {
             region: region.to_string(),
@@ -587,13 +593,54 @@ impl DefaultPublisherService {
         Ok(dsf_files)
     }
 
+    /// Remove or count orphaned .ter and .png files.
+    ///
+    /// When `removed_terrain_names` is non-empty, only files matching those names
+    /// are processed (scoped cleanup for --tile mode). When empty, all files
+    /// matching the target zoom level are processed (full package mode).
     fn process_orphan_files(
         package_dir: &Path,
         target_zoom: u8,
         dry_run: bool,
+        removed_terrain_names: &[String],
     ) -> Result<(usize, usize), CliError> {
         let terrain_dir = package_dir.join("terrain");
         let textures_dir = package_dir.join("textures");
+
+        // Build a set of .ter filenames to remove from the terrain def names.
+        // TERRAIN_DEF names look like "terrain/88416_136896_BI18_sea.ter"
+        // We need just the filename: "88416_136896_BI18_sea.ter"
+        let scoped = !removed_terrain_names.is_empty();
+        let ter_filenames: std::collections::HashSet<&str> = if scoped {
+            removed_terrain_names
+                .iter()
+                .filter_map(|name| name.rsplit('/').next())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        // Derive .png filenames from .ter filenames.
+        // .ter: "88416_136896_BI18_sea.ter" → texture base: "88416_136896"
+        // .png: "88416_136896_ZL18.png"
+        let png_filenames: std::collections::HashSet<String> = if scoped {
+            let zl_suffix = format!("_ZL{}.png", target_zoom);
+            removed_terrain_names
+                .iter()
+                .filter_map(|name| {
+                    let filename = name.rsplit('/').next()?;
+                    // Extract row_col prefix: everything before the 3rd underscore-delimited part
+                    let parts: Vec<&str> = filename.split('_').collect();
+                    if parts.len() >= 3 {
+                        Some(format!("{}_{}{}", parts[0], parts[1], zl_suffix))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
 
         let mut ter_count = 0;
         if terrain_dir.exists() {
@@ -602,7 +649,12 @@ impl DefaultPublisherService {
             {
                 let path = entry.map_err(|e| CliError::Publish(e.to_string()))?.path();
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(".ter") && Self::ter_matches_zoom(name, target_zoom) {
+                    let matches = if scoped {
+                        ter_filenames.contains(name)
+                    } else {
+                        name.ends_with(".ter") && Self::ter_matches_zoom(name, target_zoom)
+                    };
+                    if matches {
                         if !dry_run {
                             std::fs::remove_file(&path)
                                 .map_err(|e| CliError::Publish(e.to_string()))?;
@@ -621,7 +673,12 @@ impl DefaultPublisherService {
             {
                 let path = entry.map_err(|e| CliError::Publish(e.to_string()))?.path();
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(&zl_pattern) {
+                    let matches = if scoped {
+                        png_filenames.contains(name)
+                    } else {
+                        name.ends_with(&zl_pattern)
+                    };
+                    if matches {
                         if !dry_run {
                             std::fs::remove_file(&path)
                                 .map_err(|e| CliError::Publish(e.to_string()))?;
