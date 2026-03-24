@@ -36,7 +36,7 @@ Technical documentation for XEarthLayer developers and contributors.
 | [Package Publisher Design](package-publisher-design.md) | Build, archive, release pipeline |
 | [GitHub Releases Publishing](github-releases-publishing.md) | Multi-part upload workflow |
 | [Implementation Plan](scenery-package-plan.md) | Development roadmap and phase tracking |
-| [Zoom Level Overlap](zoom-level-overlap-design.md) | Dedupe and gap analysis tools |
+| [Zoom Level Overlap](deprecated/zoom-level-overlap-design.md) | **Deprecated** — see `specs/2026-03-22-remove-zl-command.md` |
 
 ## Patches & Prefetch
 

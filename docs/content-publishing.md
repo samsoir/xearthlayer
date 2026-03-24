@@ -223,6 +223,84 @@ Options:
 
 **Note:** Deduplication only removes tiles when ALL higher-resolution children exist. This prevents creating visible gaps in scenery.
 
+## Step 4b: Remove Unwanted Zoom Levels (Optional)
+
+If your packages include zoom levels that are unnecessary for XEarthLayer's on-demand streaming (e.g., ZL18 airport detail tiles), you can strip them entirely from the package. This differs from deduplication — `remove-zl` removes **all** tiles at a given zoom level, modifying the DSF files themselves so X-Plane doesn't expect them.
+
+**Why remove zoom levels?** When XEarthLayer streams tiles on-demand, pre-baked high-zoom tiles around airports are redundant. They consume download bandwidth at runtime and can introduce visual seam artifacts at zoom level boundaries. Removing them reduces package size and improves visual consistency.
+
+**Requires:** DSFTool on PATH (from [Laminar Research developer tools](https://developer.x-plane.com/tools/))
+
+### Preview Removal
+
+Always preview first to see what would change:
+
+```bash
+xearthlayer publish remove-zl --region eu --zoom 18 --dry-run
+```
+
+Output:
+```
+Removing ZL18 from EU ortho package
+  (dry run - no files will be modified)
+
+Remove Zoom Level Results
+=========================
+Scanned 847 DSF files
+  Files containing ZL18: 312
+  Terrain definitions removed: 4,821
+  Patches removed: 6,142
+  .ter files removed: 21,280
+  .png files removed: 11,706
+
+Next steps:
+  Run without --dry-run to apply changes
+```
+
+### Test on a Single Tile
+
+Before processing the entire package, test on a single 1°×1° DSF tile:
+
+```bash
+# Process only the tile at latitude 50, longitude 8 (e.g., Frankfurt area)
+xearthlayer publish remove-zl --region eu --zoom 18 --tile 50,8
+```
+
+Load X-Plane and fly in that area to verify the scenery renders correctly without the removed zoom level. If satisfied, proceed with the full package.
+
+### Remove from Full Package
+
+```bash
+xearthlayer publish remove-zl --region eu --zoom 18
+```
+
+This modifies the package in place:
+
+1. **DSF files** are decoded to text, ZL18 terrain definitions and patches are stripped, terrain indices are remapped, and the DSF is re-encoded
+2. **`.ter` files** matching the zoom level are deleted from `terrain/`
+3. **`.png` files** matching the zoom level are deleted from `textures/`
+
+Original DSF files are backed up during processing and restored if encoding fails.
+
+### Generate a Report
+
+For audit purposes, generate a detailed report:
+
+```bash
+xearthlayer publish remove-zl --region eu --zoom 18 \
+  --report removal-report.txt --report-format text
+```
+
+Supported formats: `text` (human-readable) and `json` (machine-readable).
+
+### Rebuilding After Removal
+
+After removing zoom levels, rebuild the archives before distributing:
+
+```bash
+xearthlayer publish build --region eu --type ortho
+```
+
 ## Step 5: Build Archives
 
 Create distributable archive files:

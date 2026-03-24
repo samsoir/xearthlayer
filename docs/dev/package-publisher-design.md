@@ -659,4 +659,4 @@ Benefits:
 
 ## Related Documentation
 
-- **Zoom Level Overlap Management**: See `docs/dev/zoom-level-overlap-design.md` for detailed design of the dedupe module, gap analysis algorithm, and gap protection mechanisms.
+- **Zoom Level Management**: See `docs/dev/specs/2026-03-22-remove-zl-command.md` for the `remove-zl` command design (DSF modification, zoom level stripping). The original overlap/dedupe design doc has been archived to `docs/dev/deprecated/zoom-level-overlap-design.md`.

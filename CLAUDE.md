@@ -417,7 +417,7 @@ CI will fail if pre-commit checks were not run.
 - **Fuse3 implementation**: `xearthlayer/src/fuse/fuse3/mod.rs` (async multi-threaded FUSE)
 - Parallel processing: `docs/dev/parallel-processing.md`
 - Package publisher design: `docs/dev/package-publisher-design.md`
-- Zoom level overlap management: `docs/dev/zoom-level-overlap-design.md` (dedupe, gap analysis)
+- Zoom level management: `docs/dev/specs/2026-03-22-remove-zl-command.md` (remove-zl design spec)
 - Scenery package plan: `docs/dev/scenery-package-plan.md`
 - **Consolidated FUSE mounting**: Plan file describes single ortho mount architecture (patches + packages)
 - **GeoIndex design**: `docs/dev/geo-index-design.md` (geospatial reference database, patch region ownership)
