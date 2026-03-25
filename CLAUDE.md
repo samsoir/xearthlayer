@@ -338,6 +338,7 @@ Key sections:
 - `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
 - `[pipeline]` - HTTP/CPU/prefetch concurrency limits
 - `[fuse]` - FUSE kernel limits (max_background, congestion_threshold)
+- `[packages]` - Package manager settings (concurrent_downloads: parallel part downloads 1-10)
 
 See `docs/configuration.md` for full reference.
 
@@ -390,6 +391,7 @@ CI will fail if pre-commit checks were not run.
 - `rlimit` - File descriptor limit management (raises soft limit at startup)
 - `wgpu` - GPU compute shaders for DDS encoding (optional, `gpu-encode` feature)
 - `block_compression` - BCn GPU compression via WGSL (optional, `gpu-encode` feature)
+- `indicatif` - Progress bar rendering for package downloads
 
 ## Performance Notes
 

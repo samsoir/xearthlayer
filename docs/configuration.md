@@ -494,6 +494,7 @@ Controls package manager behavior.
 | `custom_scenery_path` | path | (auto-detect) | X-Plane Custom Scenery directory for overlay symlinks |
 | `auto_install_overlays` | bool | `false` | Automatically install matching overlay when installing ortho |
 | `temp_dir` | path | system temp | Temporary directory for package downloads |
+| `concurrent_downloads` | Integer | `5` | Number of concurrent part downloads (1-10) |
 
 **Example:**
 ```ini
