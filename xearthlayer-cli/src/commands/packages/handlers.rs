@@ -272,6 +272,7 @@ impl InstallHandler {
             &metadata,
             &args.install_dir,
             &args.temp_dir,
+            args.concurrent_downloads,
             Some(progress_callback),
         ) {
             Ok(r) => r,
@@ -351,6 +352,7 @@ impl CommandHandler for InstallHandler {
             &metadata,
             &args.install_dir,
             &args.temp_dir,
+            args.concurrent_downloads,
             Some(progress_callback),
         )?;
 
@@ -510,6 +512,7 @@ impl CommandHandler for UpdateHandler {
                 &metadata,
                 &args.install_dir,
                 &args.temp_dir,
+                args.concurrent_downloads,
                 Some(progress_callback),
             ) {
                 Ok(result) => {

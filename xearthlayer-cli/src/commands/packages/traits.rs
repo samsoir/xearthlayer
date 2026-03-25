@@ -113,6 +113,7 @@ pub trait PackageManagerService: Send + Sync {
         metadata: &PackageMetadata,
         install_dir: &Path,
         temp_dir: &Path,
+        concurrent_downloads: usize,
         on_progress: Option<ProgressCallback>,
     ) -> Result<InstallResult, CliError>;
 

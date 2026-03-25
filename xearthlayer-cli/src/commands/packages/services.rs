@@ -5,6 +5,9 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use indicatif::{ProgressBar, ProgressStyle};
 
 use super::traits::{Output, PackageManagerService, ProgressCallback, UserInteraction};
 use crate::error::CliError;
@@ -45,19 +48,48 @@ impl Output for ConsoleOutput {
     }
 
     fn create_progress_callback(&self) -> ProgressCallback {
+        let bar = Arc::new(Mutex::new(ProgressBar::new(100)));
+
+        // Configure the initial bar style (progress bar for determinate stages)
+        {
+            let b = bar.lock().unwrap();
+            b.set_style(
+                ProgressStyle::with_template(
+                    "{spinner:.cyan} {prefix:.bold} [{bar:30.cyan/dim}] {percent:>3}% {msg}",
+                )
+                .unwrap()
+                .progress_chars("##-"),
+            );
+        }
+
         Box::new(move |stage, progress, message| {
-            let stage_name = stage.name();
+            let b = bar.lock().unwrap();
+
+            if stage == xearthlayer::manager::InstallStage::Complete {
+                b.finish_and_clear();
+                return;
+            }
 
             if stage.is_indeterminate() {
-                // Show simple indicator for indeterminate stages
-                // (these operations are blocking and only report at start/end)
-                print!("\r{stage_name}... {message:<60}");
+                b.set_style(
+                    ProgressStyle::with_template("{spinner:.cyan} {prefix:.bold} {msg}").unwrap(),
+                );
+                b.set_prefix(stage.name().to_string());
+                b.set_message(message.to_string());
+                b.tick();
             } else {
-                // Show percentage for determinate stages (Downloading, Complete)
-                let percent = (progress * 100.0).min(100.0) as u8;
-                print!("\r{stage_name}... {percent}% {message:<50}");
+                b.set_style(
+                    ProgressStyle::with_template(
+                        "{spinner:.cyan} {prefix:.bold} [{bar:30.cyan/dim}] {percent:>3}% {msg}",
+                    )
+                    .unwrap()
+                    .progress_chars("##-"),
+                );
+                b.set_length(100);
+                b.set_position((progress * 100.0).min(100.0) as u64);
+                b.set_prefix(stage.name().to_string());
+                b.set_message(message.to_string());
             }
-            io::stdout().flush().ok();
         })
     }
 }
@@ -155,10 +187,12 @@ impl PackageManagerService for DefaultPackageManagerService {
         metadata: &PackageMetadata,
         install_dir: &Path,
         temp_dir: &Path,
+        concurrent_downloads: usize,
         on_progress: Option<ProgressCallback>,
     ) -> Result<InstallResult, CliError> {
         let store = LocalPackageStore::new(install_dir);
-        let installer = PackageInstaller::new(self.client.clone(), store, temp_dir);
+        let installer = PackageInstaller::new(self.client.clone(), store, temp_dir)
+            .with_parallel_downloads(concurrent_downloads);
 
         installer
             .install_from_metadata(metadata, on_progress)

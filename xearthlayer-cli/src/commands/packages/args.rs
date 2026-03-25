@@ -160,6 +160,8 @@ pub struct InstallArgs {
     pub custom_scenery_path: Option<PathBuf>,
     /// Automatically install overlay package when installing ortho for the same region.
     pub auto_install_overlays: bool,
+    /// Number of concurrent part downloads.
+    pub concurrent_downloads: usize,
 }
 
 /// Arguments for the update command.
@@ -172,6 +174,8 @@ pub struct UpdateArgs {
     pub all: bool,
     /// Path to X-Plane Custom Scenery directory for overlay symlinks.
     pub custom_scenery_path: Option<PathBuf>,
+    /// Number of concurrent part downloads.
+    pub concurrent_downloads: usize,
 }
 
 /// Arguments for the remove command.
