@@ -850,6 +850,7 @@ impl ConfigKey {
             ConfigKey::PackagesCustomSceneryPath,
             ConfigKey::PackagesAutoInstallOverlays,
             ConfigKey::PackagesTempDir,
+            ConfigKey::PackagesConcurrentDownloads,
             ConfigKey::LoggingFile,
             ConfigKey::PrefetchEnabled,
             ConfigKey::PrefetchStrategy,

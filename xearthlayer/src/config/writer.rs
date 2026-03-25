@@ -150,6 +150,8 @@ auto_install_overlays = {}
 ; Temporary directory for package downloads (default: system temp dir)
 ; Large packages are downloaded here before extraction
 temp_dir = {}
+; Number of concurrent part downloads (1-10, default: 5)
+concurrent_downloads = {}
 
 [logging]
 ; Log file path (default: ~/.xearthlayer/xearthlayer.log)
@@ -307,6 +309,7 @@ congestion_threshold = {}
         custom_scenery_path,
         auto_install_overlays,
         temp_dir,
+        config.packages.concurrent_downloads,
         path_to_string(&config.logging.file),
         config.prefetch.enabled,
         config.prefetch.strategy,
