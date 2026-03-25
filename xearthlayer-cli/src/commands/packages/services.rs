@@ -200,7 +200,6 @@ impl PackageManagerService for DefaultPackageManagerService {
         )
         .unwrap()
         .progress_chars("##-");
-        let queued_style = ProgressStyle::with_template("  {prefix:.dim} {msg:.dim}").unwrap();
         let done_style = ProgressStyle::with_template("  {prefix:.green} {msg:.green}").unwrap();
         let fail_style = ProgressStyle::with_template("  {prefix:.red} {msg:.red}").unwrap();
         let retry_style = ProgressStyle::with_template("  {prefix:.yellow} {msg:.yellow}").unwrap();
@@ -209,10 +208,10 @@ impl PackageManagerService for DefaultPackageManagerService {
             .parts
             .iter()
             .map(|part| {
-                let bar = mp.add(ProgressBar::new(0));
-                bar.set_style(queued_style.clone());
+                // Start hidden — bars become visible when they transition to Downloading.
+                // This avoids ghost "(queued)" lines for parts that complete instantly.
+                let bar = mp.add(ProgressBar::hidden());
                 bar.set_prefix(part.filename.clone());
-                bar.set_message("(queued)");
                 bar
             })
             .collect();
@@ -257,6 +256,11 @@ impl PackageManagerService for DefaultPackageManagerService {
                             bar.set_position(part.bytes_downloaded);
                         }
                         PartState::Done => {
+                            // Ensure bar is visible and shows final size
+                            if let Some(total) = part.total_bytes {
+                                bar.set_length(total);
+                                bar.set_position(total);
+                            }
                             bar.set_style((*done_style).clone());
                             bar.finish_with_message("[done]");
                         }
