@@ -194,6 +194,17 @@ impl PackageManagerService for DefaultPackageManagerService {
     ) -> Result<InstallResult, CliError> {
         let store = LocalPackageStore::new(install_dir);
 
+        // Wrap the aggregate callback to skip Downloading stage — per-part bars handle it
+        let on_progress: Option<ProgressCallback> = on_progress.map(|cb| {
+            let wrapped: ProgressCallback = Box::new(move |stage, progress, message| {
+                if stage == xearthlayer::manager::InstallStage::Downloading {
+                    return; // Per-part bars handle this
+                }
+                cb(stage, progress, message);
+            });
+            wrapped
+        });
+
         // Create per-part progress bars
         let mp = MultiProgress::new();
         let part_style = ProgressStyle::with_template(
