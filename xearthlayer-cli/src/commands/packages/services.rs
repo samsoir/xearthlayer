@@ -208,7 +208,7 @@ impl PackageManagerService for DefaultPackageManagerService {
         // Create per-part progress bars
         let mp = MultiProgress::new();
         let part_style = ProgressStyle::with_template(
-            "  {prefix:.dim} [{bar:25.cyan/dim}] {percent:>3}% {binary_bytes_per_sec:>12}",
+            "  {prefix:.dim} [{bar:25.cyan/dim}] {percent:>3}% {bytes:>10}/{total_bytes:<10} {binary_bytes_per_sec:>12}",
         )
         .unwrap()
         .progress_chars("##-");
@@ -233,7 +233,7 @@ impl PackageManagerService for DefaultPackageManagerService {
         let footer = mp.add(ProgressBar::new(0));
         footer.set_style(
             ProgressStyle::with_template(
-                "\n  Total [{bar:25.green/dim}] {percent:>3}% {binary_bytes_per_sec:>12}",
+                "\n  Total [{bar:25.green/dim}] {percent:>3}% {bytes:>10}/{total_bytes:<10} {binary_bytes_per_sec:>12}",
             )
             .unwrap()
             .progress_chars("##-"),
