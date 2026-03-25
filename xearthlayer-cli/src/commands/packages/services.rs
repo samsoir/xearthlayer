@@ -7,13 +7,14 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use super::traits::{Output, PackageManagerService, ProgressCallback, UserInteraction};
 use crate::error::CliError;
 use xearthlayer::manager::{
-    HttpLibraryClient, InstallResult, InstalledPackage, LibraryClient, LocalPackageStore,
-    ManagerResult, PackageInfo, PackageInstaller, PackageStatus, UpdateChecker,
+    DownloadProgress, DownloadProgressCallback, HttpLibraryClient, InstallResult, InstalledPackage,
+    LibraryClient, LocalPackageStore, ManagerResult, PackageInfo, PackageInstaller, PackageStatus,
+    PartState, UpdateChecker,
 };
 use xearthlayer::package::{PackageLibrary, PackageMetadata, PackageType};
 
@@ -191,12 +192,106 @@ impl PackageManagerService for DefaultPackageManagerService {
         on_progress: Option<ProgressCallback>,
     ) -> Result<InstallResult, CliError> {
         let store = LocalPackageStore::new(install_dir);
-        let installer = PackageInstaller::new(self.client.clone(), store, temp_dir)
-            .with_parallel_downloads(concurrent_downloads);
 
-        installer
+        // Create per-part progress bars
+        let mp = MultiProgress::new();
+        let part_style = ProgressStyle::with_template(
+            "  {prefix:.dim} [{bar:25.cyan/dim}] {percent:>3}% {binary_bytes_per_sec:>12}",
+        )
+        .unwrap()
+        .progress_chars("##-");
+        let queued_style = ProgressStyle::with_template("  {prefix:.dim} {msg:.dim}").unwrap();
+        let done_style = ProgressStyle::with_template("  {prefix:.green} {msg:.green}").unwrap();
+        let fail_style = ProgressStyle::with_template("  {prefix:.red} {msg:.red}").unwrap();
+        let retry_style = ProgressStyle::with_template("  {prefix:.yellow} {msg:.yellow}").unwrap();
+
+        let bars: Vec<ProgressBar> = metadata
+            .parts
+            .iter()
+            .map(|part| {
+                let bar = mp.add(ProgressBar::new(0));
+                bar.set_style(queued_style.clone());
+                bar.set_prefix(part.filename.clone());
+                bar.set_message("(queued)");
+                bar
+            })
+            .collect();
+
+        // Footer bar for aggregate progress
+        let footer = mp.add(ProgressBar::new(0));
+        footer.set_style(
+            ProgressStyle::with_template(
+                "\n  Total [{bar:25.green/dim}] {percent:>3}% {binary_bytes_per_sec:>12}",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+        );
+
+        let bars = Arc::new(bars);
+        let footer = Arc::new(footer);
+        let part_style = Arc::new(part_style);
+        let done_style_arc = Arc::new(done_style);
+        let fail_style_arc = Arc::new(fail_style);
+        let retry_style_arc = Arc::new(retry_style);
+
+        let download_cb: DownloadProgressCallback = Box::new({
+            let bars = Arc::clone(&bars);
+            let footer = Arc::clone(&footer);
+            let part_style = Arc::clone(&part_style);
+            let done_style = Arc::clone(&done_style_arc);
+            let fail_style = Arc::clone(&fail_style_arc);
+            let retry_style = Arc::clone(&retry_style_arc);
+            move |progress: &DownloadProgress| {
+                for part in &progress.parts {
+                    if part.index >= bars.len() {
+                        continue;
+                    }
+                    let bar = &bars[part.index];
+                    match &part.state {
+                        PartState::Queued => {}
+                        PartState::Downloading => {
+                            if let Some(total) = part.total_bytes {
+                                bar.set_length(total);
+                            }
+                            bar.set_style((*part_style).clone());
+                            bar.set_position(part.bytes_downloaded);
+                        }
+                        PartState::Done => {
+                            bar.set_style((*done_style).clone());
+                            bar.finish_with_message("[done]");
+                        }
+                        PartState::Failed { reason, .. } => {
+                            bar.set_style((*fail_style).clone());
+                            bar.abandon_with_message(format!("(failed: {})", reason));
+                        }
+                        PartState::Retrying { attempt } => {
+                            bar.set_style((*retry_style).clone());
+                            bar.set_message(format!("(retry {}/3)", attempt));
+                        }
+                    }
+                }
+                if let Some(total) = progress.total_bytes {
+                    footer.set_length(total);
+                }
+                footer.set_position(progress.total_bytes_downloaded);
+            }
+        });
+
+        let installer = PackageInstaller::new(self.client.clone(), store, temp_dir)
+            .with_parallel_downloads(concurrent_downloads)
+            .with_download_progress(download_cb);
+
+        let result = installer
             .install_from_metadata(metadata, on_progress)
-            .map_err(|e| CliError::Packages(e.to_string()))
+            .map_err(|e| CliError::Packages(e.to_string()));
+
+        // Clean up progress bars
+        footer.finish_and_clear();
+        for bar in bars.iter() {
+            bar.finish_and_clear();
+        }
+
+        result
     }
 
     fn remove_package(

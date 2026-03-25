@@ -114,6 +114,9 @@ pub struct PackageInstaller<C: LibraryClient> {
     temp_dir: PathBuf,
     /// Number of parallel downloads.
     parallel_downloads: usize,
+    /// Optional per-part download progress callback.
+    /// When set, bypasses the aggregate InstallProgressCallback bridge.
+    on_download_progress: Option<Arc<DownloadProgressCallback>>,
 }
 
 impl<C: LibraryClient> PackageInstaller<C> {
@@ -130,12 +133,23 @@ impl<C: LibraryClient> PackageInstaller<C> {
             store,
             temp_dir: temp_dir.into(),
             parallel_downloads: 4,
+            on_download_progress: None,
         }
     }
 
     /// Set the number of parallel downloads.
     pub fn with_parallel_downloads(mut self, count: usize) -> Self {
         self.parallel_downloads = count.max(1);
+        self
+    }
+
+    /// Set a per-part download progress callback.
+    ///
+    /// When set, this callback receives `DownloadProgress` snapshots with
+    /// per-part state, bypassing the aggregate `InstallProgressCallback`
+    /// bridge for the download stage. Use this for multi-bar UIs.
+    pub fn with_download_progress(mut self, cb: DownloadProgressCallback) -> Self {
+        self.on_download_progress = Some(Arc::new(cb));
         self
     }
 
@@ -256,36 +270,45 @@ impl<C: LibraryClient> PackageInstaller<C> {
         );
         downloader.query_sizes(&mut download_state);
 
-        // Create download progress callback that bridges to InstallProgressCallback
-        let download_progress: Option<DownloadProgressCallback> = on_progress.as_ref().map(|cb| {
-            let cb = Arc::clone(cb);
-            let boxed: DownloadProgressCallback = Box::new(move |progress: &DownloadProgress| {
-                let ratio = match progress.total_bytes {
-                    Some(total) if total > 0 => {
-                        (progress.total_bytes_downloaded as f64 / total as f64).min(1.0)
-                    }
-                    _ => {
-                        let done = progress
-                            .parts
-                            .iter()
-                            .filter(|p| matches!(p.state, PartState::Done))
-                            .count();
-                        if progress.parts.is_empty() {
-                            0.0
-                        } else {
-                            done as f64 / progress.parts.len() as f64
-                        }
-                    }
-                };
-                let message = format!(
-                    "{:.1} / {:.1} MB",
-                    progress.total_bytes_downloaded as f64 / 1_048_576.0,
-                    progress.total_bytes.unwrap_or(0) as f64 / 1_048_576.0,
-                );
-                cb(InstallStage::Downloading, ratio, &message);
-            });
-            boxed
-        });
+        // Use per-part callback if set, otherwise bridge to aggregate InstallProgressCallback
+        let download_progress: Option<DownloadProgressCallback> =
+            if let Some(ref dp) = self.on_download_progress {
+                Some(Box::new({
+                    let dp = Arc::clone(dp);
+                    move |progress: &DownloadProgress| dp(progress)
+                }))
+            } else {
+                on_progress.as_ref().map(|cb| {
+                    let cb = Arc::clone(cb);
+                    let boxed: DownloadProgressCallback =
+                        Box::new(move |progress: &DownloadProgress| {
+                            let ratio = match progress.total_bytes {
+                                Some(total) if total > 0 => {
+                                    (progress.total_bytes_downloaded as f64 / total as f64).min(1.0)
+                                }
+                                _ => {
+                                    let done = progress
+                                        .parts
+                                        .iter()
+                                        .filter(|p| matches!(p.state, PartState::Done))
+                                        .count();
+                                    if progress.parts.is_empty() {
+                                        0.0
+                                    } else {
+                                        done as f64 / progress.parts.len() as f64
+                                    }
+                                }
+                            };
+                            let message = format!(
+                                "{:.1} / {:.1} MB",
+                                progress.total_bytes_downloaded as f64 / 1_048_576.0,
+                                progress.total_bytes.unwrap_or(0) as f64 / 1_048_576.0,
+                            );
+                            cb(InstallStage::Downloading, ratio, &message);
+                        });
+                    boxed
+                })
+            };
 
         downloader.download_all(&mut download_state, download_progress)?;
 
