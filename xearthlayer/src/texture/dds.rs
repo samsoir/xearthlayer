@@ -152,7 +152,7 @@ impl TextureEncoder for DdsTextureEncoder {
         let encoder = DdsEncoder::new(self.format)
             .with_mipmap_count(self.mipmap_count)
             .with_compressor(Arc::clone(&self.compressor));
-        encoder.encode(image).map_err(TextureError::from)
+        encoder.encode(image.clone()).map_err(TextureError::from)
     }
 
     fn expected_size(&self, width: u32, height: u32) -> usize {

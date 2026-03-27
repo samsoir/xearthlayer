@@ -6,7 +6,7 @@
 //! without changing the encoding pipeline.
 
 use crate::dds::compressor::{default_compressor, BlockCompressor};
-use crate::dds::mipmap::MipmapGenerator;
+use crate::dds::mipmap::{MipmapGenerator, MipmapStream};
 use crate::dds::types::{DdsError, DdsFormat, DdsHeader};
 use image::RgbaImage;
 use std::sync::Arc;
@@ -64,9 +64,13 @@ impl DdsEncoder {
 
     /// Encode RGBA image to DDS format.
     ///
+    /// Takes ownership of the source image to avoid cloning. Mipmap levels
+    /// are generated and compressed incrementally — only one uncompressed
+    /// level is held in memory at a time.
+    ///
     /// # Arguments
     ///
-    /// * `image` - Source RGBA image
+    /// * `image` - Source RGBA image (ownership transferred)
     ///
     /// # Returns
     ///
@@ -75,19 +79,20 @@ impl DdsEncoder {
     /// # Errors
     ///
     /// Returns error if image dimensions are invalid or compression fails.
-    pub fn encode(&self, image: &RgbaImage) -> Result<Vec<u8>, DdsError> {
-        // Generate mipmaps
-        let mipmaps = if self.generate_mipmaps {
-            if let Some(count) = self.mipmap_count {
-                MipmapGenerator::generate_chain_with_count(image, count)
-            } else {
-                MipmapGenerator::generate_chain(image)
-            }
-        } else {
-            vec![image.clone()]
-        };
+    pub fn encode(&self, image: RgbaImage) -> Result<Vec<u8>, DdsError> {
+        let width = image.width();
+        let height = image.height();
 
-        self.encode_with_mipmaps(&mipmaps)
+        if width == 0 || height == 0 {
+            return Err(DdsError::InvalidDimensions(width, height));
+        }
+
+        if self.generate_mipmaps {
+            let count = self.resolve_mipmap_count(width, height);
+            self.encode_mipmap_stream(image, width, height, count)
+        } else {
+            self.encode_single_level(image, width, height)
+        }
     }
 
     /// Encode with pre-generated mipmap chain.
@@ -128,6 +133,52 @@ impl DdsEncoder {
         Ok(output)
     }
 
+    /// Compress a single image (no mipmaps) into a DDS file.
+    fn encode_single_level(
+        &self,
+        image: RgbaImage,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, DdsError> {
+        let header = DdsHeader::new(width, height, 1, self.format);
+        let mut output = header.to_bytes();
+        let compressed = self.compress_image(&image)?;
+        output.extend_from_slice(&compressed);
+        Ok(output)
+    }
+
+    /// Compress an image with its mipmap chain using a streaming pipeline.
+    ///
+    /// Each mipmap level is generated, compressed, and dropped before the
+    /// next is produced — only one uncompressed level lives in memory at a time.
+    fn encode_mipmap_stream(
+        &self,
+        image: RgbaImage,
+        width: u32,
+        height: u32,
+        count: usize,
+    ) -> Result<Vec<u8>, DdsError> {
+        let header = DdsHeader::new(width, height, count as u32, self.format);
+        let mut output = header.to_bytes();
+
+        for level in MipmapStream::new(image, count) {
+            let compressed = self.compress_image(&level)?;
+            output.extend_from_slice(&compressed);
+            // `level` dropped here — memory reclaimed before next iteration
+        }
+
+        Ok(output)
+    }
+
+    /// Resolve the number of mipmap levels to generate for an image of the
+    /// given dimensions, respecting any explicit `mipmap_count` override.
+    ///
+    /// When no explicit count is set, counts levels from full size down to 1×1.
+    fn resolve_mipmap_count(&self, width: u32, height: u32) -> usize {
+        self.mipmap_count
+            .unwrap_or_else(|| MipmapGenerator::full_chain_count(width, height))
+    }
+
     /// Compress a single image to BC1/BC3 format using the configured compressor.
     fn compress_image(&self, image: &RgbaImage) -> Result<Vec<u8>, DdsError> {
         self.compressor.compress(image, self.format)
@@ -163,7 +214,7 @@ mod tests {
         let image = RgbaImage::new(4, 4);
         let encoder = DdsEncoder::new(DdsFormat::BC1).without_mipmaps();
 
-        let result = encoder.encode(&image);
+        let result = encoder.encode(image);
         assert!(result.is_ok());
 
         let dds = result.unwrap();
@@ -180,7 +231,7 @@ mod tests {
         let image = RgbaImage::new(4, 4);
         let encoder = DdsEncoder::new(DdsFormat::BC3).without_mipmaps();
 
-        let result = encoder.encode(&image);
+        let result = encoder.encode(image);
         assert!(result.is_ok());
 
         let dds = result.unwrap();
@@ -194,7 +245,7 @@ mod tests {
         let image = RgbaImage::new(256, 256);
         let encoder = DdsEncoder::new(DdsFormat::BC1).without_mipmaps();
 
-        let result = encoder.encode(&image);
+        let result = encoder.encode(image);
         assert!(result.is_ok());
 
         let dds = result.unwrap();
@@ -209,7 +260,7 @@ mod tests {
         let image = RgbaImage::new(256, 256);
         let encoder = DdsEncoder::new(DdsFormat::BC1).with_mipmap_count(5);
 
-        let result = encoder.encode(&image);
+        let result = encoder.encode(image);
         assert!(result.is_ok());
 
         let dds = result.unwrap();
@@ -239,7 +290,7 @@ mod tests {
         let image = RgbaImage::new(0, 0);
         let encoder = DdsEncoder::new(DdsFormat::BC1);
 
-        let result = encoder.encode(&image);
+        let result = encoder.encode(image);
         assert!(result.is_err());
 
         match result {
@@ -258,7 +309,7 @@ mod tests {
             .without_mipmaps()
             .with_compressor(Arc::new(SoftwareCompressor));
 
-        let result = encoder.encode(&image);
+        let result = encoder.encode(image);
         assert!(result.is_ok());
 
         let dds = result.unwrap();
@@ -276,7 +327,7 @@ mod tests {
             .without_mipmaps()
             .with_compressor(Arc::new(IspcCompressor));
 
-        let result = encoder.encode(&image);
+        let result = encoder.encode(image);
         assert!(result.is_ok());
 
         let dds = result.unwrap();
@@ -322,7 +373,7 @@ mod tests {
         let image = RgbaImage::new(100, 100);
         let encoder = DdsEncoder::new(DdsFormat::BC1).without_mipmaps();
 
-        let result = encoder.encode(&image);
+        let result = encoder.encode(image);
         assert!(result.is_ok());
 
         // 100×100 requires 25×25 blocks (round up)
@@ -336,7 +387,7 @@ mod tests {
         let image = RgbaImage::new(4096, 4096);
         let encoder = DdsEncoder::new(DdsFormat::BC1).with_mipmap_count(5);
 
-        let result = encoder.encode(&image);
+        let result = encoder.encode(image);
         assert!(result.is_ok());
 
         let dds = result.unwrap();
@@ -354,5 +405,19 @@ mod tests {
 
         // Verify magic
         assert_eq!(&dds[0..4], b"DDS ");
+    }
+
+    #[test]
+    fn test_fused_encode_matches_pregenerated() {
+        let image = RgbaImage::new(256, 256);
+        let encoder = DdsEncoder::new(DdsFormat::BC1).with_mipmap_count(5);
+
+        // Generate expected output via the pre-generated path
+        let mipmaps = MipmapGenerator::generate_chain_with_count(&image, 5);
+        let expected = encoder.encode_with_mipmaps(&mipmaps).unwrap();
+
+        // Fused pipeline should produce identical bytes
+        let result = encoder.encode(image).unwrap();
+        assert_eq!(result, expected);
     }
 }

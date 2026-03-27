@@ -54,6 +54,22 @@ impl MipmapGenerator {
         mipmaps
     }
 
+    /// Count the total number of mipmap levels from full size down to 1×1.
+    ///
+    /// Equivalent to `floor(log2(max(width, height))) + 1`, computed by
+    /// halving until both dimensions reach 1.
+    pub fn full_chain_count(width: u32, height: u32) -> usize {
+        let mut count = 1usize;
+        let mut w = width;
+        let mut h = height;
+        while w > 1 && h > 1 {
+            w /= 2;
+            h /= 2;
+            count += 1;
+        }
+        count
+    }
+
     /// Downsample image by 2× using box filter (simple average).
     ///
     /// Each output pixel is the average of a 2×2 block of input pixels.

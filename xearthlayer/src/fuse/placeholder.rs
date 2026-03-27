@@ -60,7 +60,7 @@ pub fn generate_magenta_placeholder(
 
     // Encode to DDS
     let encoder = DdsEncoder::new(format).with_mipmap_count(mipmap_count);
-    encoder.encode(&image)
+    encoder.encode(image)
 }
 
 /// Generate a default magenta placeholder for X-Plane tiles.
