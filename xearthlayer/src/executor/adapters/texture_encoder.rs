@@ -74,7 +74,7 @@ mod tests {
     }
 
     impl TextureEncoder for MockTextureEncoder {
-        fn encode(&self, _image: &image::RgbaImage) -> Result<Vec<u8>, TextureError> {
+        fn encode(&self, _image: image::RgbaImage) -> Result<Vec<u8>, TextureError> {
             if self.should_fail {
                 Err(TextureError::EncodingFailed("mock failure".to_string()))
             } else {

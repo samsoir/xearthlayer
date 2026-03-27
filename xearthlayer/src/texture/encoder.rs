@@ -56,7 +56,7 @@ pub trait TextureEncoder: Send + Sync {
     /// Returns `TextureError` if:
     /// - Image dimensions are invalid for the format
     /// - Encoding/compression fails
-    fn encode(&self, image: &RgbaImage) -> Result<Vec<u8>, TextureError>;
+    fn encode(&self, image: RgbaImage) -> Result<Vec<u8>, TextureError>;
 
     /// Return the expected file size for a given image dimension.
     ///
@@ -95,7 +95,7 @@ pub trait TextureEncoder: Send + Sync {
 /// `Arc<DdsTextureEncoder>` automatically implements `TextureEncoder` by delegating
 /// to the inner encoder.
 impl<T: TextureEncoder + ?Sized> TextureEncoder for Arc<T> {
-    fn encode(&self, image: &RgbaImage) -> Result<Vec<u8>, TextureError> {
+    fn encode(&self, image: RgbaImage) -> Result<Vec<u8>, TextureError> {
         (**self).encode(image)
     }
 
@@ -135,7 +135,7 @@ mod tests {
     }
 
     impl TextureEncoder for MockTextureEncoder {
-        fn encode(&self, _image: &RgbaImage) -> Result<Vec<u8>, TextureError> {
+        fn encode(&self, _image: RgbaImage) -> Result<Vec<u8>, TextureError> {
             Ok(vec![0xDE, 0xAD, 0xBE, 0xEF])
         }
 
@@ -164,7 +164,7 @@ mod tests {
         let encoder: Arc<dyn TextureEncoder> = Arc::new(MockTextureEncoder::new());
         let image = RgbaImage::new(4, 4);
 
-        let result = encoder.encode(&image);
+        let result = encoder.encode(image);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }

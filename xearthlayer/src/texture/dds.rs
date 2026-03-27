@@ -148,11 +148,11 @@ impl DdsTextureEncoder {
 }
 
 impl TextureEncoder for DdsTextureEncoder {
-    fn encode(&self, image: &RgbaImage) -> Result<Vec<u8>, TextureError> {
+    fn encode(&self, image: RgbaImage) -> Result<Vec<u8>, TextureError> {
         let encoder = DdsEncoder::new(self.format)
             .with_mipmap_count(self.mipmap_count)
             .with_compressor(Arc::clone(&self.compressor));
-        encoder.encode(image.clone()).map_err(TextureError::from)
+        encoder.encode(image).map_err(TextureError::from)
     }
 
     fn expected_size(&self, width: u32, height: u32) -> usize {
@@ -266,7 +266,7 @@ mod tests {
         let encoder = DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(1);
         let image = RgbaImage::new(4, 4);
 
-        let result = encoder.encode(&image);
+        let result = encoder.encode(image);
         assert!(result.is_ok());
 
         let data = result.unwrap();
@@ -282,7 +282,7 @@ mod tests {
         let encoder = DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(1);
         let image = RgbaImage::new(256, 256);
 
-        let result = encoder.encode(&image);
+        let result = encoder.encode(image);
         assert!(result.is_ok());
 
         let data = result.unwrap();
@@ -294,7 +294,7 @@ mod tests {
         let encoder = DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(5);
         let image = RgbaImage::new(256, 256);
 
-        let result = encoder.encode(&image);
+        let result = encoder.encode(image);
         assert!(result.is_ok());
 
         let data = result.unwrap();
@@ -307,7 +307,7 @@ mod tests {
         let encoder = DdsTextureEncoder::new(DdsFormat::BC1);
         let image = RgbaImage::new(0, 0);
 
-        let result = encoder.encode(&image);
+        let result = encoder.encode(image);
         assert!(result.is_err());
 
         match result {
@@ -375,7 +375,7 @@ mod tests {
 
         // Should encode successfully with software compressor
         let image = RgbaImage::new(4, 4);
-        let result = encoder.encode(&image);
+        let result = encoder.encode(image);
         assert!(result.is_ok());
     }
 
@@ -389,8 +389,8 @@ mod tests {
 
         // Both clones should encode successfully
         let image = RgbaImage::new(4, 4);
-        assert!(encoder1.encode(&image).is_ok());
-        assert!(encoder2.encode(&image).is_ok());
+        assert!(encoder1.encode(image.clone()).is_ok());
+        assert!(encoder2.encode(image).is_ok());
     }
 
     #[test]
