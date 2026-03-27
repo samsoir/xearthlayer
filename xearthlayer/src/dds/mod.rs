@@ -21,7 +21,7 @@
 //!
 //! // Encode to BC1 with mipmaps
 //! let encoder = DdsEncoder::new(DdsFormat::BC1);
-//! let dds_data = encoder.encode(&image).unwrap();
+//! let dds_data = encoder.encode(image).unwrap();
 //!
 //! // Save to file
 //! std::fs::write("output.dds", dds_data).unwrap();

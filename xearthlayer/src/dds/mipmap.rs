@@ -113,8 +113,6 @@ impl MipmapGenerator {
 ///
 /// Peak memory is the size of the current level plus the downsampled
 /// output — roughly 1.25× the current level, not the entire chain.
-// NOTE: Will be wired into the encoder in subsequent tasks (#117).
-#[allow(dead_code)]
 pub struct MipmapStream {
     /// The next image to yield (or downsample from).
     current: Option<RgbaImage>,
@@ -124,8 +122,6 @@ pub struct MipmapStream {
     yielded_first: bool,
 }
 
-// NOTE: Will be wired into the encoder in subsequent tasks (#117).
-#[allow(dead_code)]
 impl MipmapStream {
     /// Create a new mipmap stream from an owned source image.
     ///
