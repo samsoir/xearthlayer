@@ -199,7 +199,7 @@ where
                 let encoder = Arc::clone(&self.encoder);
                 let encode_result = self
                     .executor
-                    .execute_blocking(move || encoder.encode(&image))
+                    .execute_blocking(move || encoder.encode(image))
                     .await;
 
                 if ctx.is_cancelled() {

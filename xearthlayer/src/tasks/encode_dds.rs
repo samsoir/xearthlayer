@@ -124,7 +124,7 @@ where
                 let encoder = Arc::clone(&self.encoder);
                 let encode_result = self
                     .executor
-                    .execute_blocking(move || encoder.encode(&image))
+                    .execute_blocking(move || encoder.encode(image))
                     .await;
 
                 // Check for cancellation after encoding
