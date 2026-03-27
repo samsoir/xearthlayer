@@ -10,6 +10,7 @@ use crate::dds::mipmap::{MipmapGenerator, MipmapStream};
 use crate::dds::types::{DdsError, DdsFormat, DdsHeader};
 use image::RgbaImage;
 use std::sync::Arc;
+use tracing::debug;
 
 /// DDS encoder configuration.
 pub struct DdsEncoder {
@@ -142,7 +143,20 @@ impl DdsEncoder {
     ) -> Result<Vec<u8>, DdsError> {
         let header = DdsHeader::new(width, height, 1, self.format);
         let mut output = header.to_bytes();
+
+        let uncompressed_bytes = (width * height * 4) as usize;
         let compressed = self.compress_image(&image)?;
+
+        debug!(
+            width,
+            height,
+            format = ?self.format,
+            uncompressed_bytes,
+            compressed_bytes = compressed.len(),
+            total_dds_bytes = output.len() + compressed.len(),
+            "Single-level encode complete (no mipmaps)"
+        );
+
         output.extend_from_slice(&compressed);
         Ok(output)
     }
@@ -161,11 +175,35 @@ impl DdsEncoder {
         let header = DdsHeader::new(width, height, count as u32, self.format);
         let mut output = header.to_bytes();
 
-        for level in MipmapStream::new(image, count) {
+        debug!(
+            width,
+            height,
+            mipmap_count = count,
+            format = ?self.format,
+            "Starting fused mipmap encode pipeline"
+        );
+
+        for (level_idx, level) in MipmapStream::new(image, count).enumerate() {
+            let level_bytes = (level.width() * level.height() * 4) as usize;
             let compressed = self.compress_image(&level)?;
+
+            debug!(
+                level = level_idx,
+                level_width = level.width(),
+                level_height = level.height(),
+                uncompressed_bytes = level_bytes,
+                compressed_bytes = compressed.len(),
+                "Compressed mipmap level"
+            );
+
             output.extend_from_slice(&compressed);
             // `level` dropped here — memory reclaimed before next iteration
         }
+
+        debug!(
+            total_dds_bytes = output.len(),
+            "Fused mipmap encode complete"
+        );
 
         Ok(output)
     }
