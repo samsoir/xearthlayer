@@ -9,7 +9,7 @@ mod inner {
     use image::RgbaImage;
     use tokio::sync::{mpsc, oneshot};
 
-    use crate::dds::compressor::BlockCompressor;
+    use crate::dds::compressor::ImageCompressor;
     use crate::dds::{DdsError, DdsFormat};
 
     /// Bounded channel capacity for GPU encode requests.
@@ -27,7 +27,7 @@ mod inner {
 
     /// Sender-side handle for submitting GPU encode requests.
     ///
-    /// Implements [`BlockCompressor`] so it can be used as a drop-in replacement
+    /// Implements [`ImageCompressor`] so it can be used as a drop-in replacement
     /// for direct compressors. Requests are forwarded to the GPU worker via an
     /// mpsc channel; the caller blocks until the worker responds via oneshot.
     pub struct GpuEncoderChannel {
@@ -61,10 +61,10 @@ mod inner {
         }
     }
 
-    impl BlockCompressor for GpuEncoderChannel {
+    impl ImageCompressor for GpuEncoderChannel {
         /// Note: The image is cloned to transfer ownership through the channel.
         /// For 4096×4096 RGBA images this is ~64MB per mip level. This is an
-        /// inherent cost of the `BlockCompressor` trait contract (which takes
+        /// inherent cost of the `ImageCompressor` trait contract (which takes
         /// `&RgbaImage`). Future `TextureEncoder`-level integration could avoid
         /// this by transferring ownership directly.
         fn compress(&self, image: &RgbaImage, format: DdsFormat) -> Result<Vec<u8>, DdsError> {
@@ -430,7 +430,7 @@ pub use inner::*;
 #[cfg(feature = "gpu-encode")]
 mod tests {
     use super::*;
-    use crate::dds::compressor::BlockCompressor;
+    use crate::dds::compressor::ImageCompressor;
     use crate::dds::{DdsError, DdsFormat, SoftwareCompressor};
     use image::RgbaImage;
     use std::sync::Arc;
@@ -486,7 +486,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Task 2: BlockCompressor for GpuEncoderChannel
+    // Task 2: ImageCompressor for GpuEncoderChannel
     // =========================================================================
 
     #[test]

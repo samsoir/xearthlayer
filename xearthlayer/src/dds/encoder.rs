@@ -1,11 +1,11 @@
 //! DDS encoder - main API for encoding images to DDS format.
 //!
-//! The encoder delegates block compression to a [`BlockCompressor`] backend,
+//! The encoder delegates block compression to a [`ImageCompressor`] backend,
 //! handling mipmap generation and DDS header assembly itself. This separation
 //! allows swapping compression backends (ISPC SIMD, GPU compute, pure Rust)
 //! without changing the encoding pipeline.
 
-use crate::dds::compressor::{default_compressor, BlockCompressor};
+use crate::dds::compressor::{default_compressor, ImageCompressor};
 use crate::dds::mipmap::{MipmapGenerator, MipmapStream};
 use crate::dds::types::{DdsError, DdsFormat, DdsHeader};
 use image::RgbaImage;
@@ -17,7 +17,7 @@ pub struct DdsEncoder {
     format: DdsFormat,
     generate_mipmaps: bool,
     mipmap_count: Option<usize>,
-    compressor: Arc<dyn BlockCompressor>,
+    compressor: Arc<dyn ImageCompressor>,
 }
 
 impl DdsEncoder {
@@ -45,7 +45,7 @@ impl DdsEncoder {
     /// let encoder = DdsEncoder::new(DdsFormat::BC1)
     ///     .with_compressor(Arc::new(SoftwareCompressor));
     /// ```
-    pub fn with_compressor(mut self, compressor: Arc<dyn BlockCompressor>) -> Self {
+    pub fn with_compressor(mut self, compressor: Arc<dyn ImageCompressor>) -> Self {
         self.compressor = compressor;
         self
     }

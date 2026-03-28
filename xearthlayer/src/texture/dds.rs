@@ -3,7 +3,7 @@
 //! Provides a `TextureEncoder` implementation that encodes RGBA images
 //! to DirectDraw Surface (DDS) format with BC1/BC3 compression.
 
-use crate::dds::{default_compressor, BlockCompressor, DdsEncoder, DdsFormat, DdsHeader};
+use crate::dds::{default_compressor, DdsEncoder, DdsFormat, DdsHeader, ImageCompressor};
 use crate::texture::{TextureEncoder, TextureError};
 use image::RgbaImage;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use std::sync::Arc;
 pub struct DdsTextureEncoder {
     format: DdsFormat,
     mipmap_count: usize,
-    compressor: Arc<dyn BlockCompressor>,
+    compressor: Arc<dyn ImageCompressor>,
 }
 
 impl Clone for DdsTextureEncoder {
@@ -94,7 +94,7 @@ impl DdsTextureEncoder {
     /// # Arguments
     ///
     /// * `compressor` - A shared block compressor implementation
-    pub fn with_compressor(mut self, compressor: Arc<dyn BlockCompressor>) -> Self {
+    pub fn with_compressor(mut self, compressor: Arc<dyn ImageCompressor>) -> Self {
         self.compressor = compressor;
         self
     }

@@ -19,7 +19,7 @@ mod gpu_stress {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use xearthlayer::dds::gpu_channel::*;
-    use xearthlayer::dds::{BlockCompressor, DdsFormat};
+    use xearthlayer::dds::{DdsFormat, ImageCompressor};
 
     /// Read current process RSS from /proc/self/status (Linux only).
     fn rss_mb() -> f64 {

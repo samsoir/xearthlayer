@@ -49,7 +49,7 @@
 //! levels significantly faster than the pure-Rust fallback, using AVX2/SSE4
 //! SIMD instructions to process multiple blocks simultaneously.
 //!
-//! A [`BlockCompressor`] trait allows swapping backends:
+//! A [`ImageCompressor`] trait allows swapping backends:
 //! - [`IspcCompressor`] — SIMD-optimized (default, recommended)
 //! - [`SoftwareCompressor`] — Pure-Rust fallback
 //! - [`GpuEncoderChannel`] — GPU compute via `wgpu` (`gpu-encode` feature)
@@ -75,7 +75,7 @@ mod types;
 // Public API
 #[cfg(feature = "gpu-encode")]
 pub use compressor::{create_gpu_resources, create_wgpu_compressor, WgpuCompressor};
-pub use compressor::{default_compressor, BlockCompressor, IspcCompressor, SoftwareCompressor};
+pub use compressor::{default_compressor, ImageCompressor, IspcCompressor, SoftwareCompressor};
 pub use encoder::DdsEncoder;
 #[cfg(feature = "gpu-encode")]
 pub use gpu_channel::create_gpu_encoder_channel;

@@ -76,14 +76,14 @@ pub struct EncoderComponents {
 /// - `"software"` — Pure-Rust fallback
 /// - `"gpu"` — GPU compute via wgpu (requires `gpu-encode` feature)
 pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, ServiceError> {
-    use crate::dds::{BlockCompressor, IspcCompressor, SoftwareCompressor};
+    use crate::dds::{ImageCompressor, IspcCompressor, SoftwareCompressor};
 
     type GpuHandles = (
         Option<tokio::task::JoinHandle<()>>,
         Option<tokio_util::sync::CancellationToken>,
     );
 
-    let (compressor, (gpu_worker_handle, gpu_shutdown)): (Arc<dyn BlockCompressor>, GpuHandles) =
+    let (compressor, (gpu_worker_handle, gpu_shutdown)): (Arc<dyn ImageCompressor>, GpuHandles) =
         match config.texture().compressor() {
             "software" => (Arc::new(SoftwareCompressor), (None, None)),
             "ispc" => (Arc::new(IspcCompressor), (None, None)),
@@ -100,7 +100,7 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
 
                 tracing::info!("GPU pipeline encoder created with dedicated worker");
                 (
-                    Arc::new(channel) as Arc<dyn BlockCompressor>,
+                    Arc::new(channel) as Arc<dyn ImageCompressor>,
                     (Some(worker_handle), Some(shutdown_token)),
                 )
             }

@@ -1,6 +1,6 @@
 //! Block compressor trait and implementations for DDS texture encoding.
 //!
-//! This module provides the [`BlockCompressor`] trait that abstracts BCn block
+//! This module provides the [`ImageCompressor`] trait that abstracts BCn block
 //! compression, allowing different backends to be swapped in without changing
 //! the DDS encoding pipeline.
 //!
@@ -31,7 +31,7 @@ use std::sync::Arc;
 ///
 /// Implementations must be `Send + Sync` for use in the concurrent tile
 /// generation pipeline.
-pub trait BlockCompressor: Send + Sync {
+pub trait ImageCompressor: Send + Sync {
     /// Compress an RGBA image to BCn block format.
     ///
     /// # Arguments
@@ -62,7 +62,7 @@ pub trait BlockCompressor: Send + Sync {
 /// aarch64), and Windows (x86_64) — no ISPC compiler needed at build time.
 pub struct IspcCompressor;
 
-impl BlockCompressor for IspcCompressor {
+impl ImageCompressor for IspcCompressor {
     fn compress(&self, image: &RgbaImage, format: DdsFormat) -> Result<Vec<u8>, DdsError> {
         let width = image.width();
         let height = image.height();
@@ -105,7 +105,7 @@ impl BlockCompressor for IspcCompressor {
 /// available, and for testing/comparison purposes.
 pub struct SoftwareCompressor;
 
-impl BlockCompressor for SoftwareCompressor {
+impl ImageCompressor for SoftwareCompressor {
     fn compress(&self, image: &RgbaImage, format: DdsFormat) -> Result<Vec<u8>, DdsError> {
         let width = image.width();
         let height = image.height();
@@ -171,7 +171,7 @@ fn extract_block(image: &RgbaImage, block_x: u32, block_y: u32) -> [[u8; 4]; 16]
 /// Returns the ISPC compressor, which uses SIMD-optimized encoding.
 /// In the future, this may auto-detect GPU availability and return
 /// a wgpu-based compressor when a suitable GPU is present.
-pub fn default_compressor() -> Arc<dyn BlockCompressor> {
+pub fn default_compressor() -> Arc<dyn ImageCompressor> {
     Arc::new(IspcCompressor)
 }
 
@@ -334,7 +334,7 @@ mod gpu {
         )))
     }
 
-    impl BlockCompressor for WgpuCompressor {
+    impl ImageCompressor for WgpuCompressor {
         fn compress(&self, image: &RgbaImage, format: DdsFormat) -> Result<Vec<u8>, DdsError> {
             let width = image.width();
             let height = image.height();
