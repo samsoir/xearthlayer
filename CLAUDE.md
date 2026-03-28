@@ -45,14 +45,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 4. **DDS Compression** (`xearthlayer/src/dds/`)
    - BC1/BC3 (DXT1/DXT5) compression
    - 5-level mipmap chain generation
-   - `BlockCompressor` trait for swappable backends:
+   - `ImageCompressor` trait for single-level backends:
      - `SoftwareCompressor` — Pure-Rust fallback
      - `IspcCompressor` — SIMD-optimized via Intel ISPC (default)
-     - `GpuEncoderChannel` — Channel-based GPU encoding (optional `gpu-encode` feature)
+   - `MipmapCompressor` trait for full-pipeline backends (feature-gated `gpu-encode`):
+     - `GpuEncoderChannel` — Worker-side mipmap streaming, zero-clone channel transfer
    - `MipmapStream` — Memory-efficient iterator yielding one mipmap level at a time (no clones)
    - GPU encoding architecture: `mpsc` channel → dedicated pipeline worker → `GpuBlockCompressor`
    - `WgpuCompressor` wraps `block_compression` crate (ISPC kernels ported to WGSL compute shaders)
-   - Pipeline overlap: while GPU compresses tile A, CPU uploads tile B; adaptive depth (1 or 2)
+   - Worker-side tile processing: one channel round-trip per tile, GPU buffer reuse across mipmap levels
    - `create_gpu_resources()` — shared factory for device/queue/compressor creation (DRY)
    - GPU pipeline hardening:
      - `map_async` errors propagated via `std::sync::mpsc` (not silently ignored)
