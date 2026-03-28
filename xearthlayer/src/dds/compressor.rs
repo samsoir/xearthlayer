@@ -49,6 +49,44 @@ pub trait ImageCompressor: Send + Sync {
 }
 
 // =============================================================================
+// Mipmap compressor trait (GPU pipeline)
+// =============================================================================
+
+/// Trait for compressing an entire mipmap chain from a source image.
+///
+/// Unlike [`ImageCompressor`] which compresses a single level (caller manages
+/// mipmap iteration), `MipmapCompressor` owns the full pipeline: it receives
+/// the source image, generates mipmap levels internally, and returns all
+/// compressed levels concatenated.
+///
+/// This is designed for backends like GPU compute where owning the iteration
+/// reduces cross-thread round-trips and enables buffer reuse.
+///
+/// # Returns
+///
+/// Concatenated compressed data for all mipmap levels (without DDS header).
+/// Level 0 (full resolution) first, then each successively halved level.
+#[cfg(feature = "gpu-encode")]
+pub trait MipmapCompressor: Send + Sync {
+    /// Compress a full mipmap chain from the source image.
+    ///
+    /// # Arguments
+    ///
+    /// * `image` - Source RGBA image (ownership transferred, no clones)
+    /// * `format` - Target compression format (BC1 or BC3)
+    /// * `mipmap_count` - Number of mipmap levels to generate (including original)
+    fn compress_mipmap_chain(
+        &self,
+        image: RgbaImage,
+        format: DdsFormat,
+        mipmap_count: usize,
+    ) -> Result<Vec<u8>, DdsError>;
+
+    /// Human-readable name for logging and diagnostics.
+    fn name(&self) -> &str;
+}
+
+// =============================================================================
 // ISPC compressor (intel_tex_2)
 // =============================================================================
 
@@ -695,5 +733,46 @@ mod gpu_tests {
             Ok((_, _, _, name)) => assert!(!name.is_empty()),
             Err(_) => {} // No GPU available, that's fine
         }
+    }
+
+    // =========================================================================
+    // MipmapCompressor trait tests
+    // =========================================================================
+
+    struct MockMipmapCompressor;
+
+    impl MipmapCompressor for MockMipmapCompressor {
+        fn compress_mipmap_chain(
+            &self,
+            _image: RgbaImage,
+            _format: DdsFormat,
+            _mipmap_count: usize,
+        ) -> Result<Vec<u8>, DdsError> {
+            Ok(vec![0xAA, 0xBB])
+        }
+
+        fn name(&self) -> &str {
+            "mock-mipmap"
+        }
+    }
+
+    #[test]
+    fn test_mipmap_compressor_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<MockMipmapCompressor>();
+    }
+
+    #[test]
+    fn test_mipmap_compressor_returns_data() {
+        let compressor = MockMipmapCompressor;
+        let image = RgbaImage::new(256, 256);
+        let result = compressor.compress_mipmap_chain(image, DdsFormat::BC1, 5);
+        assert_eq!(result.unwrap(), vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn test_mipmap_compressor_name() {
+        let compressor = MockMipmapCompressor;
+        assert_eq!(compressor.name(), "mock-mipmap");
     }
 }
