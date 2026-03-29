@@ -9,8 +9,7 @@ Releases are automated via GitHub Actions when a version tag is pushed. The work
 2. Builds the release binary once
 3. Packages for multiple platforms (Linux tarball, Debian, RPM, AUR)
 4. Creates a GitHub Release with all assets
-5. Updates `version.json` for website sync
-6. Notifies the website to update download links
+5. When the release PR is merged to main, `website-sync.yml` reads `version.json` and notifies the website
 
 ## Prerequisites
 
@@ -368,7 +367,8 @@ gh release delete vX.Y.Z --yes
 
 | File | Purpose |
 |------|---------|
-| `.github/workflows/release.yml` | Main release workflow |
+| `.github/workflows/release.yml` | Main release workflow (build, package, publish) |
+| `.github/workflows/website-sync.yml` | Website notification (triggers on release/* merge to main) |
 | `.github/workflows/ci.yml` | PR/push CI checks |
 | `version.json` | Current version metadata for website |
 | `CHANGELOG.md` | Release notes history |

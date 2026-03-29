@@ -1,0 +1,37 @@
+name: Website Sync
+
+# Trigger when a release branch is merged to main and version.json has changed.
+# This ensures the website reads the correct version from main, rather than
+# racing with the release workflow (which runs before the PR is merged).
+on:
+  push:
+    branches: [main]
+    paths: [version.json]
+
+jobs:
+  notify-website:
+    name: Notify Website
+    runs-on: ubuntu-latest
+    # Only run when the merge commit message indicates a release branch merge
+    if: startsWith(github.event.head_commit.message, 'Merge pull request') && contains(github.event.head_commit.message, 'release/')
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read version from version.json
+        id: version
+        run: echo "version=$(jq -r .version version.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Notify website of new release
+        env:
+          WEBSITE_DISPATCH_TOKEN: ${{ secrets.WEBSITE_DISPATCH_TOKEN }}
+        run: |
+          if [ -n "$WEBSITE_DISPATCH_TOKEN" ]; then
+            curl -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${WEBSITE_DISPATCH_TOKEN}" \
+              https://api.github.com/repos/samsoir/xearthlayer-website/dispatches \
+              -d '{"event_type":"app-version-updated","client_payload":{"version":"'"${{ steps.version.outputs.version }}"'"}}'
+            echo "Website notified of release ${{ steps.version.outputs.version }}"
+          else
+            echo "WEBSITE_DISPATCH_TOKEN not set - website notification skipped"
+          fi
