@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-03-29
+
+### Added
+
+- **DDS Encoder Memory Optimization** ([#117](https://github.com/samsoir/xearthlayer/issues/117), [#120](https://github.com/samsoir/xearthlayer/issues/120)): Streaming mipmap architecture reduces peak memory across both CPU and GPU encoding paths
+  - `MipmapStream` iterator yields one mipmap level at a time, eliminating intermediate clones
+  - `DdsEncoder::encode()` fused pipeline — compress and drop each level incrementally
+  - Owned `RgbaImage` signatures propagated through full trait chain
+  - `ImageCompressor` trait (renamed from `BlockCompressor`) for single-level backends
+  - `MipmapCompressor` trait for full-pipeline GPU backend — source image moved (not cloned), one channel round-trip per tile instead of 5
+  - GPU worker-side mipmap iteration with buffer reuse across levels
+  - ISPC path: peak heap -29% (8.55 GB → 6.06 GB), peak RSS -21%
+  - GPU path: peak heap -21% (7.06 GB → 5.61 GB), peak RSS -44%, memory leaked -71%
+  - Profiling and flight testing by [@mmaechtel](https://github.com/mmaechtel)
+
+- **Parallel Package Downloads** ([#115](https://github.com/samsoir/xearthlayer/issues/115)): Configurable concurrent part downloads with per-part progress UI
+  - `packages.concurrent_downloads` config setting (1-10, default 5)
+  - Sliding-window execution model replacing batch-based parallelism
+  - Per-part progress bars via `indicatif::MultiProgress` (queued, downloading, done, failed, retrying)
+  - `RetryDownloader` with exponential backoff (3 retries, 2s/4s/8s)
+  - Animated spinner for indeterminate stages (reassembling, extracting, installing)
+
+- **Memory Profiling Guide** — `docs/dev/memory-profiling.md` for heaptrack installation, profiling, and A/B comparison
+
+### Changed
+
+- **Documentation restructured** ([#123](https://github.com/samsoir/xearthlayer/pull/123)): Consolidated planning artifacts into proper design docs
+  - New `docs/dev/gpu-encoding-design.md` (from 6 scattered files)
+  - Enriched adaptive-prefetch, FUSE, and package manager design docs with spec content
+  - Archived 19 completed plans, implemented specs, and superseded docs to `docs/dev/archive/`
+  - Removed `docs/plans/`, `docs/dev/plans/`, `docs/dev/specs/` directories
+
+### Fixed
+
+- **Default temp directory** now uses `~/.xearthlayer/tmp` instead of system `/tmp` ([#118](https://github.com/samsoir/xearthlayer/issues/118)). On Linux distros where `/tmp` is a `tmpfs` (RAM-backed), downloading multi-GB scenery packages caused OOM errors — reported by [@r0adrunner](https://github.com/r0adrunner)
+- **CI**: GitHub Actions upgraded to Node.js 24-compatible versions ([#107](https://github.com/samsoir/xearthlayer/issues/107))
+- **Release workflow**: `version.json` now updated on release branch instead of post-release push ([#109](https://github.com/samsoir/xearthlayer/pull/109))
+
 ## [0.4.0] - 2026-03-21
 
 > **Breaking**: Replaces XGPS2/ForeFlight UDP telemetry with X-Plane's built-in Web API. The `[online_network]` config section and `udp_port` setting are removed. X-Plane 12.1+ is required for position telemetry.
@@ -891,6 +929,7 @@ Run `xearthlayer config upgrade` to automatically add new settings with defaults
 - Requires FUSE3 for filesystem mounting
 
 [Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.3.1...HEAD
+[0.4.1]: https://github.com/samsoir/xearthlayer/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/samsoir/xearthlayer/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/samsoir/xearthlayer/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/samsoir/xearthlayer/compare/v0.2.12...v0.3.0
