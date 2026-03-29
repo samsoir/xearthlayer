@@ -131,10 +131,13 @@ User is notified of available updates on first run of XEarthLayer (not repeatedl
 
 ### Features
 
-- **Resumable downloads**: Track progress, resume interrupted downloads
-- **Parallel parts**: Download multiple parts simultaneously
+- **Resumable downloads**: Track progress, resume interrupted downloads via HTTP Range headers
+- **Parallel parts**: Sliding-window concurrency with semaphore-gated execution
+- **Configurable concurrency**: `packages.concurrent_downloads` (1-10, default 5)
+- **Per-part retry**: 3 retries with exponential backoff (2s, 4s, 8s) via `RetryDownloader` decorator
+- **Per-part progress**: `DownloadProgress` snapshot with per-part `PartState` (Queued, Downloading, Done, Failed, Retrying)
 - **Verification**: SHA-256 checksum each part before proceeding
-- **Progress reporting**: Callback for UI progress updates
+- **Progress UI**: `indicatif::MultiProgress` bars in CLI (library layer is UI-agnostic)
 
 ### Download State
 
@@ -167,6 +170,32 @@ Range: bytes=524288000-
 ```
 
 Most CDNs support this. Fall back to full re-download if not supported.
+
+### Sliding Window Execution
+
+`ParallelStrategy` uses a semaphore-based sliding window instead of batch-based parallelism. All download threads are spawned immediately; each acquires a semaphore permit before downloading. When a fast part completes, the next queued part starts immediately -- no waiting for the slowest part in a batch.
+
+### Per-Part Progress Architecture
+
+```
+ParallelStrategy (semaphore-gated threads)
+  --> ProgressCounters (atomic per-part bytes + state)
+      --> ProgressReporter (100ms poll interval)
+          --> DownloadProgressCallback(&DownloadProgress)
+              --> CLI: indicatif MultiProgress bars
+```
+
+`ProgressCounters` uses `AtomicU8` for per-part state (lock-free hot path) and `Mutex<Option<String>>` for error reasons (cold path, only written on failure). Per-part sizes are populated from HEAD requests at construction time so the UI shows accurate totals from the start.
+
+### Retry Policy
+
+Per-part retry via `RetryDownloader` decorator wrapping `HttpDownloader`:
+- **Max retries:** 3 (hardcoded)
+- **Backoff:** Exponential -- 2s, 4s, 8s
+- **Resume on retry:** Existing `download_with_resume()` handles Range-based resume
+- **HTTP 416:** Delete partial file before retrying to avoid infinite loop
+- **Checksum mismatch:** Delete partial file and retry from scratch
+- **Scope:** Per-part only. A failing part does not affect other downloads
 
 ## Installation Process
 

@@ -738,4 +738,4 @@ gh workflow run sync-version.yml --repo samsoir/xearthlayer-website
 
 - [Content Publishing Guide](../content-publishing.md) - General publishing concepts
 - [Package Publisher Design](package-publisher-design.md) - Architecture details
-- [Scenery Package Plan](scenery-package-plan.md) - Implementation history
+- [Scenery Package Plan](archive/scenery-package-plan.md) - Implementation history (archived)

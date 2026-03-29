@@ -416,11 +416,10 @@ CI will fail if pre-commit checks were not run.
 - Developer documentation: `docs/dev/`
 - **Job Executor Framework**: `docs/dev/job-executor-design.md` (daemon architecture, job/task traits)
 - **Fuse3 implementation**: `xearthlayer/src/fuse/fuse3/mod.rs` (async multi-threaded FUSE)
-- Parallel processing: `docs/dev/parallel-processing.md`
+- **GPU Encoding**: `docs/dev/gpu-encoding-design.md` (wgpu compute shaders, channel worker, memory optimization)
 - Package publisher design: `docs/dev/package-publisher-design.md`
 - Zoom level overlap management: `docs/dev/zoom-level-overlap-design.md` (dedupe, gap analysis)
-- Scenery package plan: `docs/dev/scenery-package-plan.md`
-- **Consolidated FUSE mounting**: Plan file describes single ortho mount architecture (patches + packages)
+- **Consolidated FUSE mounting**: `docs/dev/consolidated-mounting-design.md` (single ortho mount, patches + packages)
 - **GeoIndex design**: `docs/dev/geo-index-design.md` (geospatial reference database, patch region ownership)
 - memorize review allow(dead_code) macros at major checkpoints. Refactor aggresively to remove them when appropriate.
 - memorize ensure to update the projects documentation to reflect the current state of the project before committing changes

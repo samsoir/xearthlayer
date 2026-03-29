@@ -247,9 +247,18 @@ The regex pattern for recognition:
 
 | Operation | Behavior |
 |-----------|----------|
-| `open` | For DDS: trigger async pipeline; For others: open from source |
+| `open` | Virtual DDS inodes: `FOPEN_DIRECT_IO`; Real passthrough files: default flags |
 | `read` | For DDS: serve from cache/generated; For others: read from source |
 | `release` | Clean up handles |
+
+### Direct I/O for Virtual DDS Files
+
+`Fuse3OrthoUnionFS` implements `open()` to set `FOPEN_DIRECT_IO` on virtual DDS inodes. This bypasses the kernel page cache for generated textures:
+
+- **Full observability** -- every X-Plane DDS read goes through the FUSE handler, visible to `FuseLoadMonitor`, `SceneTracker`, and `DdsAccessEvent`
+- **No stale data** -- page cache cannot serve outdated DDS data after provider changes or cache clears
+- **Reduced kernel memory** -- no page cache duplication of data already in the moka memory cache
+- Real passthrough files use default kernel caching (unchanged)
 
 ### Synthesized DDS Attributes
 
