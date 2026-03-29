@@ -7,7 +7,7 @@ This document provides a high-level overview of the XEarthLayer Scenery Package 
 - [Scenery Package Specification](scenery-packages.md) - Package formats and conventions
 - [Package Manager Design](package-manager-design.md) - Consuming and installing packages
 - [Package Publisher Design](package-publisher-design.md) - Creating and publishing packages
-- [Implementation Plan](scenery-package-plan.md) - Development roadmap and progress
+- [Implementation Plan](archive/scenery-package-plan.md) - Development roadmap and progress (archived)
 
 ## System Overview
 
@@ -190,4 +190,4 @@ See [Configuration Reference](../configuration.md) for all available settings an
 - See [Scenery Package Specification](scenery-packages.md) for detailed file formats
 - See [Package Manager Design](package-manager-design.md) for installation workflow
 - See [Package Publisher Design](package-publisher-design.md) for creating packages
-- See [Implementation Plan](scenery-package-plan.md) for development status
+- See [Implementation Plan](archive/scenery-package-plan.md) for development status (archived)

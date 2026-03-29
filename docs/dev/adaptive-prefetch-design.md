@@ -309,14 +309,70 @@ The `SceneryWindow` is the core computational model. It derives window dimension
 
 ### Sliding Prefetch Box (Cruise Phase)
 
-The cruise phase uses a **sliding prefetch box** instead of boundary monitors. The box moves with the aircraft every telemetry tick, with **proportional heading bias**:
+The cruise phase uses a **sliding prefetch box** instead of boundary monitors. The box moves with the aircraft every telemetry tick, biased in the direction of travel. This replaced the boundary-monitor approach after flight testing revealed fundamental timing issues (issue #86).
 
-- **Total extent:** 9° per axis (configurable, min 7°). Covers X-Plane's observed 6×6 DSF loading area with 1.5° overlap.
-- **Proportional bias:** `forward_fraction = 0.5 + (max_bias - 0.5) × |component|`. At cardinal headings the primary axis gets 80/20 (at `max_bias=0.8`), perpendicular axes get 50/50. At diagonals both axes share ~71/29. The bias slides smoothly — no binary thresholds.
-- **Region enumeration:** DSF regions (1°×1°) within the box are enumerated via `floor()` arithmetic
-- **Deduplication:** GeoIndex tracks `PrefetchedRegion` state — only new regions trigger tile expansion
+#### Problem with Boundary Monitors
 
-**Empirical basis:** Debug map flight testing at YBAS (2026-03-21) revealed X-Plane loads a 6×6 DSF area, not the 3×3 previously assumed. The proportional bias model was designed to match X-Plane's directional loading pattern without binary bias switching artefacts.
+Flight testing over dense European coverage (LOWW->LPPT, heading ~260° WSW) showed that X-Plane loads tiles **3.3-3.7° ahead** of the aircraft. The boundary crossing fires when the aircraft is ~1° from the window edge, but by then X-Plane has already requested tiles 2° beyond the edge -- prefetch is too late. Result: 20-second freeze at DSF boundaries.
+
+**Key finding:** X-Plane loads 2° of new tiles beyond its current boundary when the aircraft is ~1° from that boundary. Maintaining tiles prefetched 3° ahead always covers this:
+
+```
+Aircraft --1°--> XP edge --2°--> XP new load limit
+Aircraft --------3°-------------> Prefetch box edge
+                                  Covered
+```
+
+#### Box Shape and Proportional Heading Bias
+
+The box is a rectangle in lat/lon space with **proportional heading bias**:
+
+- **Total extent:** 9° per axis (configurable, min 7°). Covers X-Plane's observed 6x6 DSF loading area with 1.5° overlap.
+- **Proportional bias formula:** `forward_fraction = 0.5 + (max_bias - 0.5) * |component|`
+  - At cardinal headings: primary axis gets 80/20 (at `max_bias=0.8`), perpendicular axes get 50/50
+  - At diagonals: both axes share ~71/29
+  - The bias slides smoothly -- no binary thresholds
+
+The forward/behind determination uses the track heading decomposed into lat/lon:
+
+```
+lon_forward = -sin(track)   // positive = moving east
+lat_forward = -cos(track)   // positive = moving north
+```
+
+**Examples:**
+
+| Heading | Lon bias | Lat bias | Box shape |
+|---------|----------|----------|-----------|
+| 270° (due west) | 3° west, 1° east | 2° each side | Biased west |
+| 225° (southwest) | 3° west, 1° east | 3° south, 1° north | Biased SW |
+| 260° (WSW, LOWW->LPPT) | 3° west, 1° east | 3° south, 1° north | Biased WSW |
+
+#### Per-Tick Operation
+
+Each telemetry tick (~0.5s):
+
+1. Compute box from `(aircraft_lat, aircraft_lon, track_heading)`
+2. Enumerate DSF regions that intersect the box (via `floor()` arithmetic)
+3. Filter out regions already prefetched or in-progress (via GeoIndex)
+4. Filter out regions with no scenery coverage (patches, packages)
+5. For new regions: expand to DDS tiles, submit to executor
+
+#### Throttling
+
+- **Backpressure:** Same executor load check -- skip cycle if >80% utilisation
+- **Rate limiting:** `max_tiles_per_cycle` cap prevents flooding
+- **Deduplication:** GeoIndex tracks `PrefetchedRegion` state (InProgress, Prefetched, NoCoverage)
+- **Eviction:** Regions that leave the box are marked for GeoIndex cleanup
+
+#### Design Decisions
+
+1. **DSF-native math:** Box margins are in degrees, region enumeration uses integer DSF coordinates (`floor()`). No cos(lat) correction -- raw degrees match X-Plane's loading model.
+2. **No component threshold:** Any non-zero heading component biases that axis. Only exact cardinal headings produce symmetric distribution on the perpendicular axis. Rationale: even a slight component means the aircraft will eventually need those tiles. Simplicity over cleverness.
+3. **Ground phase separation:** `GroundStrategy` ring-based approach for ground operations. The sliding box applies in cruise only. The phase detector manages this transition.
+4. **Transition phase:** The box applies immediately at full size on entering cruise. The `TransitionThrottle` ramp independently controls submission rate (25% -> 100% over 30s).
+
+**Empirical basis:** Debug map flight testing at YBAS (2026-03-21) revealed X-Plane loads a 6x6 DSF area, not the 3x3 previously assumed. The proportional bias model was designed to match X-Plane's directional loading pattern without binary bias switching artefacts.
 
 **SceneryWindow retained for:** world rebuild detection (`check_for_rebuild()`). Retention tracking now uses `PrefetchBox::update_retention()` with box-derived bounds.
 

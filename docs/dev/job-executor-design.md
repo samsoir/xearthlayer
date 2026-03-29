@@ -1707,5 +1707,5 @@ xearthlayer/src/
 ## References
 
 - [Tile-Based Prefetch Design](tile-based-prefetch-design.md) - Consumer of this framework
-- [Async Pipeline Architecture](async-pipeline-architecture.md) - Current pipeline (to be migrated)
+- [Async Pipeline Architecture](archive/async-pipeline-architecture.md) - Legacy pipeline (superseded by this framework)
 - [Predictive Caching](predictive-caching.md) - Prefetcher integration

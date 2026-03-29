@@ -10,6 +10,7 @@
 | [Package Management](package-management.md) | Installing, updating, and removing scenery packages |
 | [Running the Service](running-service.md) | Streaming service options and management |
 | [Content Publishing](content-publishing.md) | Creating and distributing packages from Ortho4XP |
+| [Tile Patches](patches.md) | Using custom mesh/elevation from airport addons |
 
 ## Developer Documentation
 

@@ -14,69 +14,56 @@ Technical documentation for XEarthLayer developers and contributors.
 
 | Document | Description |
 |----------|-------------|
-| [Job Executor Design](job-executor-design.md) | **Primary design doc**: job/task framework, daemon architecture, resource pools (v0.3.0+) |
-| [FUSE Filesystem](fuse-filesystem.md) | Virtual filesystem, consolidated mounting, passthrough implementation |
+| [Job Executor Design](job-executor-design.md) | Job/task framework, daemon architecture, resource pools (v0.3.0+) |
+| [FUSE Filesystem](fuse-filesystem.md) | Virtual filesystem, consolidated mounting, Direct I/O for DDS |
 | [Coordinate System](coordinate-system.md) | Web Mercator projection, tile math, zoom levels |
 | [DDS Implementation](dds-implementation.md) | BC1/BC3 texture compression, mipmap generation |
+| [GPU Encoding](gpu-encoding-design.md) | wgpu compute shader encoding, channel worker, memory optimization |
 | [GeoIndex Design](geo-index-design.md) | Geospatial reference database, patch region ownership |
 | [Cache Design](cache-design.md) | Two-tier caching (memory + disk), LRU eviction |
 | [Cache Service Design](cache-service-design.md) | CacheLayer lifecycle, GC daemons, bridge adapters |
 | [Cache Load Transition Ramp](cache-load-transition-ramp-design.md) | TransitionThrottle design for takeoff phase management |
 | [Index Building Optimization](index-building-optimization.md) | OrthoUnionIndex caching and parallel scanning |
-| [Parallel Processing](parallel-processing.md) | Thread pools, legacy coalescing |
 | [Network Stats](network-stats.md) | Download metrics, bandwidth tracking |
-| ~~[Async Pipeline Architecture](async-pipeline-architecture.md)~~ | **(DEPRECATED)** Superseded by Job Executor Framework in v0.3.0 |
 
 ## Package System
 
 | Document | Description |
 |----------|-------------|
 | [Scenery Packages](scenery-packages.md) | File formats, naming conventions, metadata specs |
-| [Package Manager Design](package-manager-design.md) | Download, install, update architecture |
+| [Package Manager Design](package-manager-design.md) | Download, install, update architecture (parallel downloads, retry) |
 | [Package Publisher Design](package-publisher-design.md) | Build, archive, release pipeline |
 | [GitHub Releases Publishing](github-releases-publishing.md) | Multi-part upload workflow |
-| [Implementation Plan](scenery-package-plan.md) | Development roadmap and phase tracking |
 | [Zoom Level Overlap](zoom-level-overlap-design.md) | Dedupe and gap analysis tools |
 
 ## Patches & Prefetch
 
 | Document | Description |
 |----------|-------------|
-| [Scenery Patches](scenery-patches.md) | Bring-your-own-scenery patches with GeoIndex region ownership (current) |
-| [Airport Scenery Integration](airport-scenery-integration.md) | **Planned (0.3.x)**: Dynamic texture generation for patches (previously implemented, temporarily removed) |
-| [Adaptive Prefetch Design](adaptive-prefetch-design.md) | **Primary design doc**: Boundary-driven prefetch with SceneryWindow, dual BoundaryMonitors, and flight phase detection (v0.3.0+) |
-| [X-Plane Scenery Loading Whitepaper](xplane-scenery-loading-whitepaper.md) | Research on X-Plane 12's scenery loading behavior |
-| [Prefetch Flight Test Plan](prefetch-flight-test-plan.md) | Flight test data informing prefetch design |
-| [Aircraft Telemetry Architecture](aircraft-telemetry-architecture.md) | X-Plane Web API telemetry integration (replaced ForeFlight/XGPS2 UDP in v0.4.0) |
+| [Scenery Patches](scenery-patches.md) | Bring-your-own-scenery patches with GeoIndex region ownership |
+| [Airport Scenery Integration](airport-scenery-integration.md) | **Planned (0.3.x)**: Dynamic texture generation for patches |
+| [Adaptive Prefetch Design](adaptive-prefetch-design.md) | Sliding prefetch box, boundary monitors, flight phase detection |
+| [X-Plane Scenery Loading Whitepaper](xplane-scenery-loading-whitepaper.md) | Research on X-Plane 12's scenery loading behaviour |
+| [Prefetch Flight Test Plan](prefetch-flight-test-plan.md) | Flight test data and empirical findings |
+| [Aircraft Telemetry Architecture](aircraft-telemetry-architecture.md) | X-Plane Web API telemetry integration (v0.4.0) |
 
-## Debugging Tools
+## Debugging & Operations
 
 | Document | Description |
 |----------|-------------|
 | [Debug Map](debug-map.md) | Live browser map for prefetch observability (`--features debug-map`) |
-
-## Operations
-
-| Document | Description |
-|----------|-------------|
+| [Memory Profiling](memory-profiling.md) | Heaptrack profiling guide for memory optimization |
 | [Application Release Runbook](app-release-runbook.md) | Release workflow, versioning, and troubleshooting |
 
 ## Root Cause Analysis
 
 | Document | Description |
 |----------|-------------|
-| [Memory Cache Deadlock](rca-memory-cache-deadlock.md) | Investigation of cache deadlock issue |
+| [Memory Cache Deadlock](rca-memory-cache-deadlock.md) | Investigation of async Mutex cache deadlock (2025-12-25) |
 
-## Deprecated Documents
+## Archive
 
-Historical documents that describe superseded designs or completed implementations are archived in [deprecated/](deprecated/).
-
-| Document | Description |
-|----------|-------------|
-| [Concurrency Hardening](deprecated/concurrency-hardening.md) | Historical: semaphore-based limiting proposal |
-| [Multithreaded FUSE Proposal](deprecated/multithreaded-fuse-proposal.md) | Historical: led to fuse3 implementation |
-| [Setup Wizard Plan](deprecated/plan-setup-wizard.md) | Historical: now implemented |
-| [Refactoring Strategy](deprecated/refactoring-strategy.md) | Historical: async migration strategy |
+Historical documents including superseded designs, completed implementation plans, and implemented specs are archived in [archive/](archive/).
 
 ## Module Dependencies
 
