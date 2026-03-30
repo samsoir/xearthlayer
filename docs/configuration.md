@@ -26,6 +26,14 @@ For best results, set the cache directory to a fast NVMe or SSD that you can fil
 
 ## Sections
 
+### [general]
+
+General application settings.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `update_check` | boolean | `true` | Check for new versions on startup. Performs a single HTTP request once per day (cached locally). No telemetry is sent. |
+
 ### [provider]
 
 Controls which satellite imagery provider to use.

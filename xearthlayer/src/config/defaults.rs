@@ -10,6 +10,13 @@ use super::DiskIoProfile;
 use crate::dds::DdsFormat;
 
 // =============================================================================
+// General settings
+// =============================================================================
+
+/// Default: check for updates on startup (once per day).
+pub const DEFAULT_UPDATE_CHECK: bool = true;
+
+// =============================================================================
 // CPU helpers
 // =============================================================================
 
@@ -305,6 +312,9 @@ impl Default for ConfigFile {
             .join("xearthlayer");
 
         Self {
+            general: GeneralSettings {
+                update_check: DEFAULT_UPDATE_CHECK,
+            },
             provider: ProviderSettings {
                 provider_type: "bing".to_string(),
                 google_api_key: None,

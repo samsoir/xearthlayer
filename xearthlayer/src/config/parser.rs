@@ -18,6 +18,14 @@ use crate::dds::DdsFormat;
 pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
     let mut config = ConfigFile::default();
 
+    // [general] section
+    if let Some(section) = ini.section(Some("general")) {
+        if let Some(v) = section.get("update_check") {
+            let v = v.to_lowercase();
+            config.general.update_check = v == "true" || v == "1" || v == "yes" || v == "on";
+        }
+    }
+
     // [provider] section
     if let Some(section) = ini.section(Some("provider")) {
         if let Some(v) = section.get("type") {

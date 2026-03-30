@@ -10,6 +10,8 @@ use std::path::PathBuf;
 /// Complete application configuration loaded from config.ini.
 #[derive(Debug, Clone)]
 pub struct ConfigFile {
+    /// General application settings
+    pub general: GeneralSettings,
     /// Provider settings
     pub provider: ProviderSettings,
     /// Cache settings
@@ -40,6 +42,14 @@ pub struct ConfigFile {
     pub executor: ExecutorSettings,
     /// FUSE filesystem settings
     pub fuse: FuseSettings,
+}
+
+/// General application settings.
+#[derive(Debug, Clone)]
+pub struct GeneralSettings {
+    /// Enable automatic version update checking on startup (default: true).
+    /// When enabled, checks for new versions once per day via a cached HTTP request.
+    pub update_check: bool,
 }
 
 /// Provider configuration.

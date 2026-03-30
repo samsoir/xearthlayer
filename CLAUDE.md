@@ -148,7 +148,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `dds_tile_exists(row, col, zoom)` - Checks if DDS tile exists on disk (used by prefetch)
     - `resolve_lazy_filtered(path, predicate)` - Source-filtered lazy resolution (used by FUSE with GeoIndex)
 
-14. **GeoIndex** (`xearthlayer/src/geo_index/`)
+15. **Version Update Checker** (`xearthlayer/src/update/`)
+    - `VersionManifest` - Serde model for remote `version.json`
+    - `UpdateInfo` - Update notification data (current version, latest version, homepage)
+    - `UpdateChecker` trait - Abstraction for version checking (dependency injection)
+    - `RemoteUpdateChecker` - Production implementation with HTTP fetch and 24h disk cache
+    - Non-blocking: spawned on Tokio runtime, never delays startup
+    - Cache at `~/.xearthlayer/version_check.json` (mtime-based 24h expiry)
+    - TUI dashboard shows persistent footer when update available
+    - Configurable via `general.update_check` (default: true)
+
+16. **GeoIndex** (`xearthlayer/src/geo_index/`)
     - `GeoIndex` - Type-keyed, region-indexed geospatial reference database (thread-safe, ACID)
     - `DsfRegion` - 1°×1° DSF region coordinate type
     - `GeoLayer` trait - Marker trait for storable layer types (`Clone + Send + Sync + 'static`)
@@ -308,6 +318,8 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/ortho_union/` | Ortho union index module |
 | `xearthlayer/src/ortho_union/index.rs` | OrthoUnionIndex implementation |
 | `xearthlayer/src/ortho_union/builder.rs` | OrthoUnionIndexBuilder (with progress + caching) |
+| `xearthlayer/src/update/mod.rs` | Version update checking (VersionManifest, UpdateInfo) |
+| `xearthlayer/src/update/checker.rs` | UpdateChecker trait and RemoteUpdateChecker |
 | `xearthlayer/src/config/file.rs` | Configuration loading |
 | `xearthlayer/src/config/keys.rs` | ConfigKey enum with validation (Specification Pattern) |
 | `xearthlayer/src/publisher/` | Package publisher library |
@@ -332,6 +344,7 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 Default config location: `~/.xearthlayer/config.ini`
 
 Key sections:
+- `[general]` - General settings (update_check)
 - `[provider]` - Imagery source (bing/google)
 - `[cache]` - Memory/disk sizes, directory, disk I/O profile (auto/hdd/ssd/nvme)
 - `[generation]` - Thread count, timeout

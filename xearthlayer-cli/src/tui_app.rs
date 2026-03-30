@@ -25,6 +25,7 @@ use xearthlayer::config::ConfigFile;
 use xearthlayer::manager::{InstalledPackage, LocalPackageStore};
 use xearthlayer::prefetch::{PrewarmHandle, SharedPrefetchStatus};
 use xearthlayer::service::{PrewarmOrchestrator, ServiceOrchestrator, StartupProgress};
+use xearthlayer::update::{RemoteUpdateChecker, UpdateChecker, UpdateInfo};
 use xearthlayer::xplane::XPlaneEnvironment;
 
 use crate::error::CliError;
@@ -173,6 +174,27 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         .runtime_handle()
         .expect("Runtime handle should be available after initialization");
 
+    // Spawn background update check (non-blocking, once per day via disk cache)
+    let update_rx = if cfg.general.update_check {
+        let (tx, rx) = std::sync::mpsc::channel::<Option<UpdateInfo>>();
+        let current_version = xearthlayer::VERSION.to_string();
+        runtime_handle.spawn_blocking(move || {
+            let checker = RemoteUpdateChecker::new();
+            match checker.check(&current_version) {
+                Ok(info) => {
+                    let _ = tx.send(info);
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "Update check failed (non-fatal)");
+                    let _ = tx.send(None);
+                }
+            }
+        });
+        Some(rx)
+    } else {
+        None
+    };
+
     // Track prewarm handle (None when not active or complete)
     let mut prewarm_handle: Option<PrewarmHandle> = None;
 
@@ -286,6 +308,14 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
             }
         }
 
+        // Check for update check result (non-blocking)
+        if let Some(ref rx) = update_rx {
+            if let Ok(Some(info)) = rx.try_recv() {
+                tracing::info!(%info, "Update available");
+                dashboard.set_update_info(info);
+            }
+        }
+
         // Update dashboard at tick rate
         if last_tick.elapsed() >= tick_rate {
             let snapshot = orchestrator.telemetry_snapshot();
@@ -392,7 +422,26 @@ fn update_loading_progress(dashboard: &mut Dashboard, progress: &StartupProgress
 pub fn run_headless(
     orchestrator: &mut ServiceOrchestrator,
     shutdown: Arc<AtomicBool>,
+    update_check: bool,
 ) -> Result<(), CliError> {
+    // Background update check for headless mode
+    if update_check {
+        let current_version = xearthlayer::VERSION.to_string();
+        std::thread::spawn(move || {
+            let checker = RemoteUpdateChecker::new();
+            match checker.check(&current_version) {
+                Ok(Some(info)) => {
+                    tracing::info!(%info, "Update available");
+                    eprintln!("{}", info);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "Update check failed (non-fatal)");
+                }
+            }
+        });
+    }
+
     println!("Start X-Plane to use XEarthLayer scenery.");
     println!("Press Ctrl+C to stop.");
     println!();

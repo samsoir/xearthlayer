@@ -32,6 +32,7 @@ use xearthlayer::aircraft_position::{AircraftPositionProvider, SharedAircraftPos
 use xearthlayer::metrics::TelemetrySnapshot;
 use xearthlayer::prefetch::SharedPrefetchStatus;
 use xearthlayer::runtime::{SharedRuntimeHealth, SharedTileProgressTracker};
+use xearthlayer::update::UpdateInfo;
 
 use crate::ui::widgets::{CacheConfig, DiskHistory, NetworkHistory, SceneryHistory};
 
@@ -72,6 +73,8 @@ pub struct Dashboard {
     aircraft_position: Option<SharedAircraftPosition>,
     /// Tile progress tracker for active tile generation display.
     tile_progress_tracker: Option<SharedTileProgressTracker>,
+    /// Update information when a newer version is available.
+    update_info: Option<UpdateInfo>,
 }
 
 impl Dashboard {
@@ -105,6 +108,7 @@ impl Dashboard {
             prewarm_status: None,
             aircraft_position: None,
             tile_progress_tracker: None,
+            update_info: None,
         })
     }
 
@@ -130,6 +134,11 @@ impl Dashboard {
     pub fn with_tile_progress_tracker(mut self, tracker: SharedTileProgressTracker) -> Self {
         self.tile_progress_tracker = Some(tracker);
         self
+    }
+
+    /// Set update information for footer display.
+    pub fn set_update_info(&mut self, info: UpdateInfo) {
+        self.update_info = Some(info);
     }
 
     /// Transition to the Running state.
@@ -211,6 +220,9 @@ impl Dashboard {
         // Calculate confirmation remaining time for display
         let confirmation_remaining = self.confirmation_remaining();
 
+        // Clone update info for rendering
+        let update_info = self.update_info.as_ref();
+
         // Clone prewarm status for rendering and advance spinner if active
         let prewarm_status = self.prewarm_status.clone();
         let prewarm_spinner = if prewarm_status.is_some() {
@@ -251,6 +263,7 @@ impl Dashboard {
                 prewarm_status.as_ref(),
                 prewarm_spinner,
                 &tile_progress_entries,
+                update_info,
             );
         })?;
 

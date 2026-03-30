@@ -34,6 +34,7 @@ use ratatui::{
 use xearthlayer::metrics::TelemetrySnapshot;
 use xearthlayer::prefetch::PrefetchStatusSnapshot;
 use xearthlayer::runtime::{HealthSnapshot, RegionProgressEntry};
+use xearthlayer::update::UpdateInfo;
 
 use super::render_sections::inner_rect;
 use super::state::PrewarmProgress;
@@ -67,22 +68,28 @@ pub fn render_ui(
     prewarm_status: Option<&PrewarmProgress>,
     prewarm_spinner: Option<char>,
     tile_progress_entries: &[RegionProgressEntry],
+    update_info: Option<&UpdateInfo>,
 ) {
     let size = frame.area();
 
-    // Layout v0.3.1: 6 sections (Active Tiles moved into Scenery System)
+    // Build constraints dynamically — add a 1-line footer when an update is available
+    let mut constraints = vec![
+        Constraint::Length(3), // Header
+        Constraint::Length(5), // Aircraft Position (3 content lines + border + padding)
+        Constraint::Length(4), // Prefetch System (2 content lines + border + padding)
+        Constraint::Length(8), // Scenery System (3-column: REQUESTS | QUEUE | PROCESSING)
+        Constraint::Length(8), // Input/Output (2-column)
+        Constraint::Length(6), // Caches
+    ];
+    if update_info.is_some() {
+        constraints.push(Constraint::Length(1)); // Update footer
+    }
+    constraints.push(Constraint::Min(0)); // Padding
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(0)
-        .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Length(5), // Aircraft Position (3 content lines + border + padding)
-            Constraint::Length(4), // Prefetch System (2 content lines + border + padding)
-            Constraint::Length(8), // Scenery System (3-column: REQUESTS | QUEUE | PROCESSING)
-            Constraint::Length(8), // Input/Output (2-column)
-            Constraint::Length(6), // Caches
-            Constraint::Min(0),    // Padding
-        ])
+        .constraints(constraints)
         .split(size);
 
     // 1. Header
@@ -139,6 +146,11 @@ pub fn render_ui(
         CacheWidgetCompact::new(snapshot).with_config(cache_config.clone()),
         cache_inner,
     );
+
+    // 7. Update available footer (conditional)
+    if let Some(info) = update_info {
+        render_update_footer(frame, chunks[6], info);
+    }
 
     // Quit confirmation overlay (if active)
     if let Some(remaining) = confirmation_remaining {
@@ -266,6 +278,30 @@ pub fn render_quit_confirmation(frame: &mut Frame, area: Rect, remaining: Durati
         .alignment(ratatui::layout::Alignment::Center);
 
     frame.render_widget(paragraph, banner_area);
+}
+
+/// Render the update available footer line.
+fn render_update_footer(frame: &mut Frame, area: Rect, info: &UpdateInfo) {
+    let line = Line::from(vec![
+        Span::styled(" Update available: ", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!("v{}", info.current),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(" \u{2192} ", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!("v{}", info.latest),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" \u{2014} see {}", info.homepage),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// Render the header bar with uptime and prewarm status.

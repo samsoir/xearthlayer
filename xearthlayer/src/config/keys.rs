@@ -29,6 +29,9 @@ pub enum ConfigKeyError {
 /// get and set its value with proper validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigKey {
+    // General settings
+    GeneralUpdateCheck,
+
     // Provider settings
     ProviderType,
     ProviderGoogleApiKey,
@@ -138,6 +141,8 @@ impl FromStr for ConfigKey {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "general.update_check" => Ok(ConfigKey::GeneralUpdateCheck),
+
             "provider.type" => Ok(ConfigKey::ProviderType),
             "provider.google_api_key" => Ok(ConfigKey::ProviderGoogleApiKey),
             "provider.mapbox_access_token" => Ok(ConfigKey::ProviderMapboxAccessToken),
@@ -243,6 +248,7 @@ impl ConfigKey {
     /// Get the canonical key name (e.g., "packages.library_url").
     pub fn name(&self) -> &'static str {
         match self {
+            ConfigKey::GeneralUpdateCheck => "general.update_check",
             ConfigKey::ProviderType => "provider.type",
             ConfigKey::ProviderGoogleApiKey => "provider.google_api_key",
             ConfigKey::ProviderMapboxAccessToken => "provider.mapbox_access_token",
@@ -340,6 +346,7 @@ impl ConfigKey {
     /// Get the value from a config file as a string.
     pub fn get(&self, config: &ConfigFile) -> String {
         match self {
+            ConfigKey::GeneralUpdateCheck => config.general.update_check.to_string(),
             ConfigKey::ProviderType => config.provider.provider_type.clone(),
             ConfigKey::ProviderGoogleApiKey => {
                 config.provider.google_api_key.clone().unwrap_or_default()
@@ -502,6 +509,10 @@ impl ConfigKey {
     /// Set the value without validation. Use `set()` for validated setting.
     fn set_unchecked(&self, config: &mut ConfigFile, value: &str) {
         match self {
+            ConfigKey::GeneralUpdateCheck => {
+                let v = value.to_lowercase();
+                config.general.update_check = v == "true" || v == "1" || v == "yes" || v == "on";
+            }
             ConfigKey::ProviderType => {
                 config.provider.provider_type = value.to_lowercase();
             }
@@ -736,6 +747,7 @@ impl ConfigKey {
     /// Get the validation specification for this key.
     fn specification(&self) -> Box<dyn ValueSpecification> {
         match self {
+            ConfigKey::GeneralUpdateCheck => Box::new(BooleanSpec),
             ConfigKey::ProviderType => Box::new(OneOfSpec::new(&[
                 "apple", "arcgis", "bing", "go2", "google", "mapbox", "usgs",
             ])),
@@ -830,6 +842,7 @@ impl ConfigKey {
     /// expected in new configs. See upgrade.rs DEPRECATED_KEYS for the list.
     pub fn all() -> &'static [ConfigKey] {
         &[
+            ConfigKey::GeneralUpdateCheck,
             ConfigKey::ProviderType,
             ConfigKey::ProviderGoogleApiKey,
             ConfigKey::ProviderMapboxAccessToken,
