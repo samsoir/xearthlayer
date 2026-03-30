@@ -43,8 +43,19 @@ pub(super) fn to_config_string(config: &ConfigFile) -> String {
         .map(|p| path_to_string(p))
         .unwrap_or_default();
 
+    let update_check = if config.general.update_check {
+        "true"
+    } else {
+        "false"
+    };
+
     format!(
-        r#"[provider]
+        r#"[general]
+; Check for new versions on startup (default: true)
+; When enabled, performs a single HTTP request once per day (no telemetry)
+update_check = {}
+
+[provider]
 ; Imagery provider:
 ;   apple  - Apple Maps (free, tokens auto-acquired via DuckDuckGo)
 ;   arcgis - ArcGIS World Imagery (free, global coverage)
@@ -280,6 +291,7 @@ max_background = {}
 ; Kernel starts throttling when pending requests exceed this. Convention: 75% of max_background.
 congestion_threshold = {}
 "#,
+        update_check,
         config.provider.provider_type,
         google_api_key,
         mapbox_access_token,

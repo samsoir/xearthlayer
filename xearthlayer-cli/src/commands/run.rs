@@ -327,7 +327,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         run_tui(tui_config)?
     } else {
         // Fallback to simple text output for non-TTY
-        run_headless(&mut orchestrator, shutdown)?;
+        run_headless(&mut orchestrator, shutdown, config.general.update_check)?;
         orchestrator.cancellation()
     };
 
