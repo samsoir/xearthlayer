@@ -153,6 +153,7 @@ impl CacheLayer {
             gc_interval,
             "dds".to_string(),
         )
+        .as_dds_tier()
         .with_metrics(metrics.clone());
 
         let dds_disk_service = CacheService::start(dds_disk_config)

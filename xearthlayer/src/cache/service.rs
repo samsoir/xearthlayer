@@ -115,6 +115,7 @@ impl CacheService {
                     gc_interval,
                     provider_name: provider_name.clone(),
                     metrics_client: config.metrics_client,
+                    is_dds_tier: config.is_dds_tier,
                 };
 
                 let provider = DiskCacheProvider::start(disk_config).await?;

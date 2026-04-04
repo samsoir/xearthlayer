@@ -37,7 +37,7 @@ use tracing::{debug, info, warn};
 use crate::cache::config::DiskProviderConfig;
 use crate::cache::lru_index::LruIndex;
 use crate::cache::traits::{BoxFuture, Cache, GcResult, ServiceCacheError};
-use crate::metrics::{MetricsClient, OptionalMetrics};
+use crate::metrics::MetricsClient;
 
 /// On-disk cache provider with LRU index tracking.
 ///
@@ -66,6 +66,10 @@ pub struct DiskCacheProvider {
 
     /// Optional metrics client for reporting cache size updates.
     metrics_client: Option<MetricsClient>,
+
+    /// Whether this provider serves the DDS tile tier (vs chunk tier).
+    /// Controls which metric event is emitted for size updates.
+    is_dds_tier: bool,
 }
 
 impl DiskCacheProvider {
@@ -102,6 +106,7 @@ impl DiskCacheProvider {
             lru_index,
             shutdown,
             metrics_client: config.metrics_client,
+            is_dds_tier: config.is_dds_tier,
         });
 
         // Populate LRU index from disk
@@ -153,6 +158,7 @@ impl DiskCacheProvider {
             lru_index,
             shutdown,
             metrics_client: config.metrics_client,
+            is_dds_tier: config.is_dds_tier,
         });
 
         info!(
@@ -204,7 +210,7 @@ impl DiskCacheProvider {
         let count = self.lru_index.entry_count();
 
         // Seed the absolute disk cache size metric
-        self.metrics_client.disk_cache_size(size);
+        self.report_size_to_metrics();
 
         info!(
             files = count,
@@ -229,6 +235,27 @@ impl DiskCacheProvider {
     pub fn gc_target_size(&self) -> u64 {
         let max = self.max_size_bytes.load(Ordering::Relaxed);
         (max as f64 * 0.80) as u64
+    }
+
+    /// Mark this provider as serving the DDS tile cache tier.
+    ///
+    /// When set, size updates emit `dds_disk_cache_size` metrics instead of
+    /// `disk_cache_size`, allowing the TUI to correctly aggregate both tiers.
+    pub fn set_dds_tier(&mut self) {
+        self.is_dds_tier = true;
+    }
+
+    /// Report current cache size to metrics, using the appropriate event
+    /// based on whether this is the DDS or chunk tier.
+    fn report_size_to_metrics(&self) {
+        let size = self.lru_index.total_size();
+        if let Some(ref client) = self.metrics_client {
+            if self.is_dds_tier {
+                client.dds_disk_cache_size(size);
+            } else {
+                client.disk_cache_size(size);
+            }
+        }
     }
 
     /// Get the file path for a cache key.
@@ -267,8 +294,7 @@ impl Cache for DiskCacheProvider {
             self.lru_index.record(&key_owned, size);
 
             // Report authoritative cache size to metrics
-            self.metrics_client
-                .disk_cache_size(self.lru_index.total_size());
+            self.report_size_to_metrics();
 
             debug!(key = %key_owned, size, "Cache set");
             Ok(())
@@ -312,8 +338,7 @@ impl Cache for DiskCacheProvider {
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => {
                     // Report authoritative cache size to metrics
-                    self.metrics_client
-                        .disk_cache_size(self.lru_index.total_size());
+                    self.report_size_to_metrics();
                     debug!(key = %key_owned, "Cache delete");
                     Ok(true)
                 }
@@ -398,6 +423,7 @@ mod tests {
             gc_interval: Duration::from_secs(3600), // Not used anymore
             provider_name: "test".to_string(),
             metrics_client: None,
+            is_dds_tier: false,
         };
 
         let provider = DiskCacheProvider::start(config).await.unwrap();
@@ -595,6 +621,7 @@ mod tests {
             gc_interval: Duration::from_secs(3600),
             provider_name: "test".to_string(),
             metrics_client: None,
+            is_dds_tier: false,
         };
 
         // start() internally calls populate_from_disk()
@@ -635,6 +662,7 @@ mod tests {
                 gc_interval: Duration::from_secs(3600),
                 provider_name: "test".to_string(),
                 metrics_client: None,
+                is_dds_tier: false,
             };
             let provider = DiskCacheProvider::start(config).await.unwrap();
 
@@ -650,6 +678,7 @@ mod tests {
                 gc_interval: Duration::from_secs(3600),
                 provider_name: "test".to_string(),
                 metrics_client: None,
+                is_dds_tier: false,
             };
             let provider = DiskCacheProvider::start(config).await.unwrap();
 

@@ -17,6 +17,7 @@ pub trait OptionalMetrics {
     fn disk_write_completed(&self, bytes: u64, duration_us: u64);
     fn disk_cache_initial_size(&self, bytes: u64);
     fn disk_cache_size(&self, bytes: u64);
+    fn dds_disk_cache_size(&self, bytes: u64);
     fn memory_cache_hit(&self, is_fuse: bool);
     fn memory_cache_miss(&self, is_fuse: bool);
     fn memory_cache_size(&self, bytes: u64);
@@ -100,6 +101,13 @@ impl OptionalMetrics for Option<MetricsClient> {
     fn disk_cache_size(&self, bytes: u64) {
         if let Some(client) = self {
             client.disk_cache_size(bytes);
+        }
+    }
+
+    #[inline]
+    fn dds_disk_cache_size(&self, bytes: u64) {
+        if let Some(client) = self {
+            client.dds_disk_cache_size(bytes);
         }
     }
 

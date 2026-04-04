@@ -163,6 +163,12 @@ impl MetricsClient {
         self.send(MetricEvent::DiskCacheSizeUpdate { bytes });
     }
 
+    /// Reports the current DDS disk cache size (absolute value from LRU index).
+    #[inline]
+    pub fn dds_disk_cache_size(&self, bytes: u64) {
+        self.send(MetricEvent::DdsDiskCacheSizeUpdate { bytes });
+    }
+
     // =========================================================================
     // Memory Cache Events
     // =========================================================================

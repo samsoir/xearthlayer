@@ -183,7 +183,14 @@ impl MetricsDaemon {
                 self.state.disk_bytes_evicted += bytes_freed;
             }
             MetricEvent::DiskCacheSizeUpdate { bytes } => {
-                self.state.disk_cache_size_bytes = bytes;
+                self.state.chunk_disk_cache_size_bytes = bytes;
+                self.state.disk_cache_size_bytes =
+                    self.state.chunk_disk_cache_size_bytes + self.state.dds_disk_cache_size_bytes;
+            }
+            MetricEvent::DdsDiskCacheSizeUpdate { bytes } => {
+                self.state.dds_disk_cache_size_bytes = bytes;
+                self.state.disk_cache_size_bytes =
+                    self.state.chunk_disk_cache_size_bytes + self.state.dds_disk_cache_size_bytes;
             }
 
             // Memory cache events
