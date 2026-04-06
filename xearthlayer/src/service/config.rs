@@ -41,6 +41,8 @@ pub struct ServiceConfig {
     cache_memory_size: Option<usize>,
     /// Disk cache size in bytes
     cache_disk_size: Option<usize>,
+    /// Fraction of disk cache allocated to DDS tiles (0.0-1.0)
+    cache_dds_disk_ratio: Option<f64>,
     /// Disk GC interval in seconds
     disk_gc_interval_secs: u64,
     /// Number of threads for parallel tile generation
@@ -96,6 +98,11 @@ impl ServiceConfig {
         self.cache_disk_size
     }
 
+    /// Get the DDS disk ratio (fraction of disk allocated to DDS), if configured.
+    pub fn cache_dds_disk_ratio(&self) -> Option<f64> {
+        self.cache_dds_disk_ratio
+    }
+
     /// Get the disk GC interval in seconds.
     pub fn disk_gc_interval_secs(&self) -> u64 {
         self.disk_gc_interval_secs
@@ -145,6 +152,7 @@ impl Default for ServiceConfig {
             cache_directory: None,
             cache_memory_size: None,
             cache_disk_size: None,
+            cache_dds_disk_ratio: None,
             disk_gc_interval_secs: DEFAULT_GC_INTERVAL_SECS,
             generation_threads: None,
             generation_timeout: None,
@@ -180,6 +188,7 @@ pub struct ServiceConfigBuilder {
     cache_directory: Option<PathBuf>,
     cache_memory_size: Option<usize>,
     cache_disk_size: Option<usize>,
+    cache_dds_disk_ratio: Option<f64>,
     disk_gc_interval_secs: Option<u64>,
     generation_threads: Option<usize>,
     generation_timeout: Option<u64>,
@@ -228,6 +237,12 @@ impl ServiceConfigBuilder {
     /// Set the disk cache size in bytes.
     pub fn cache_disk_size(mut self, size: usize) -> Self {
         self.cache_disk_size = Some(size);
+        self
+    }
+
+    /// Set the DDS disk ratio (fraction of disk allocated to DDS tiles).
+    pub fn cache_dds_disk_ratio(mut self, ratio: f64) -> Self {
+        self.cache_dds_disk_ratio = Some(ratio);
         self
     }
 
@@ -285,6 +300,7 @@ impl ServiceConfigBuilder {
             cache_directory: self.cache_directory,
             cache_memory_size: self.cache_memory_size,
             cache_disk_size: self.cache_disk_size,
+            cache_dds_disk_ratio: self.cache_dds_disk_ratio,
             disk_gc_interval_secs: self
                 .disk_gc_interval_secs
                 .unwrap_or(DEFAULT_GC_INTERVAL_SECS),

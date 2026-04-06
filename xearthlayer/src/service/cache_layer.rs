@@ -1,24 +1,28 @@
 //! Cache layer for service-owned caches.
 //!
-//! `CacheLayer` encapsulates both memory and disk cache services with metrics
+//! `CacheLayer` encapsulates the three-tier cache hierarchy with metrics
 //! integration, providing a clean interface for service-level cache management.
 //!
 //! # Architecture
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                     XEarthLayerService                       │
-//! │                                                              │
-//! │  ┌─────────────────────────────────────────────────────┐    │
-//! │  │                    CacheLayer                        │    │
-//! │  │                                                      │    │
-//! │  │  memory_service ──────► MemoryCacheBridge ──┐       │    │
-//! │  │                                             │       │    │
-//! │  │  disk_service ────────► DiskCacheBridge ────┼──► Executor
-//! │  │       │                                     │       │    │
-//! │  │       └──► GC daemon (internal)            │       │    │
-//! │  └─────────────────────────────────────────────────────┘    │
-//! └─────────────────────────────────────────────────────────────┘
+//! ┌──────────────────────────────────────────────────────────────────┐
+//! │                      XEarthLayerService                          │
+//! │                                                                   │
+//! │  ┌────────────────────────────────────────────────────────┐      │
+//! │  │                      CacheLayer                         │      │
+//! │  │                                                         │      │
+//! │  │  memory_service ──────► MemoryCacheBridge ──────┐      │      │
+//! │  │                                                  │      │      │
+//! │  │  dds_disk_service ────► DdsDiskCacheBridge ─────┼──► Executor │
+//! │  │       │                                          │      │      │
+//! │  │       └──► GC daemon (DDS budget)               │      │      │
+//! │  │                                                  │      │      │
+//! │  │  chunk_disk_service ──► DiskCacheBridge ────────┘      │      │
+//! │  │       │                                                 │      │
+//! │  │       └──► GC daemon (chunk budget)                    │      │
+//! │  └────────────────────────────────────────────────────────┘      │
+//! └──────────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! # Example
@@ -31,6 +35,7 @@
 //!
 //! // Get bridges for executor integration
 //! let memory_bridge = cache_layer.memory_bridge();
+//! let dds_disk_bridge = cache_layer.dds_disk_bridge();
 //! let disk_bridge = cache_layer.disk_bridge();
 //!
 //! // Later: graceful shutdown
@@ -42,27 +47,40 @@ use std::time::Duration;
 
 use tracing::info;
 
-use crate::cache::{Cache, CacheService, DiskCacheBridge, MemoryCacheBridge, ServiceCacheConfig};
-use crate::config::{DEFAULT_DISK_CACHE_SIZE, DEFAULT_MEMORY_CACHE_SIZE};
+use crate::cache::{
+    Cache, CacheService, DdsDiskCacheBridge, DiskCacheBridge, MemoryCacheBridge, ServiceCacheConfig,
+};
+use crate::config::{DEFAULT_DDS_DISK_RATIO, DEFAULT_DISK_CACHE_SIZE, DEFAULT_MEMORY_CACHE_SIZE};
 use crate::metrics::MetricsClient;
 use crate::service::config::ServiceConfig;
 use crate::service::error::ServiceError;
 
-/// Cache layer encapsulating memory and disk cache services.
+/// Cache layer encapsulating the three-tier cache hierarchy.
 ///
-/// This struct owns both cache services and their bridge adapters,
+/// This struct owns all cache services and their bridge adapters,
 /// providing a unified interface for cache management within the service.
+///
+/// The three tiers are:
+/// - **Memory** (moka LRU): Fastest, serves active FUSE reads
+/// - **DDS Disk** (LRU + GC): Persistent DDS tiles, avoids re-encoding
+/// - **Chunk Disk** (LRU + GC): Raw imagery chunks, requires assembly + encoding
 pub struct CacheLayer {
     /// Memory cache service (owns LRU eviction).
     memory_service: CacheService,
 
-    /// Disk cache service (owns GC daemon).
-    disk_service: CacheService,
+    /// DDS disk cache service (encoded DDS tiles on disk).
+    dds_disk_service: CacheService,
+
+    /// Chunk disk cache service (raw imagery chunks on disk).
+    chunk_disk_service: CacheService,
 
     /// Memory cache bridge (implements executor::MemoryCache).
     memory_bridge: Arc<MemoryCacheBridge>,
 
-    /// Disk cache bridge (implements executor::DiskCache).
+    /// DDS disk cache bridge (implements executor::DdsDiskCache).
+    dds_disk_bridge: Arc<DdsDiskCacheBridge>,
+
+    /// Chunk disk cache bridge (implements executor::DiskCache).
     disk_bridge: Arc<DiskCacheBridge>,
 }
 
@@ -70,9 +88,11 @@ impl CacheLayer {
     /// Create a new cache layer with the given configuration.
     ///
     /// This method:
-    /// 1. Creates memory cache service using `ServiceCacheConfig::memory()`
-    /// 2. Creates disk cache service using `ServiceCacheConfig::disk()` with metrics
-    /// 3. Creates bridge adapters with metrics for executor integration
+    /// 1. Creates memory cache service
+    /// 2. Computes DDS/chunk disk budgets from `disk_size * dds_disk_ratio`
+    /// 3. Creates DDS disk cache service at `{disk_dir}/{provider}/dds/`
+    /// 4. Creates chunk disk cache service at `{disk_dir}/{provider}/`
+    /// 5. Creates bridge adapters for executor integration
     ///
     /// # Arguments
     ///
@@ -93,6 +113,13 @@ impl CacheLayer {
             .cache_memory_size()
             .unwrap_or(DEFAULT_MEMORY_CACHE_SIZE) as u64;
         let disk_size = config.cache_disk_size().unwrap_or(DEFAULT_DISK_CACHE_SIZE) as u64;
+        let dds_ratio = config
+            .cache_dds_disk_ratio()
+            .unwrap_or(DEFAULT_DDS_DISK_RATIO);
+
+        // Compute per-tier disk budgets
+        let dds_disk_budget = (disk_size as f64 * dds_ratio) as u64;
+        let chunk_disk_budget = disk_size - dds_disk_budget;
 
         // Get cache directory with default
         let disk_dir = config.cache_directory().cloned().unwrap_or_else(|| {
@@ -102,6 +129,11 @@ impl CacheLayer {
         });
 
         let gc_interval = Duration::from_secs(config.disk_gc_interval_secs());
+
+        // DDS disk goes into a dedicated subdirectory
+        let dds_disk_dir = disk_dir.join(provider_name).join("dds");
+        // Chunks keep the existing provider directory layout
+        let chunk_disk_dir = disk_dir.clone();
 
         // 1. Start memory cache service
         let memory_config = ServiceCacheConfig::memory(memory_size, None);
@@ -114,38 +146,63 @@ impl CacheLayer {
             "Memory cache service started in CacheLayer"
         );
 
-        // 2. Start disk cache service with metrics
-        let disk_config = ServiceCacheConfig::disk(
-            disk_size,
-            disk_dir.clone(),
+        // 2. Start DDS disk cache service
+        let dds_disk_config = ServiceCacheConfig::disk(
+            dds_disk_budget,
+            dds_disk_dir.clone(),
+            gc_interval,
+            "dds".to_string(),
+        )
+        .as_dds_tier()
+        .with_metrics(metrics.clone());
+
+        let dds_disk_service = CacheService::start(dds_disk_config)
+            .await
+            .map_err(|e| ServiceError::CacheError(format!("DDS disk cache start failed: {}", e)))?;
+
+        info!(
+            max_size_bytes = dds_disk_budget,
+            directory = %dds_disk_dir.display(),
+            "DDS disk cache service started (ratio={dds_ratio})"
+        );
+
+        // 3. Start chunk disk cache service with metrics
+        let chunk_disk_config = ServiceCacheConfig::disk(
+            chunk_disk_budget,
+            chunk_disk_dir.clone(),
             gc_interval,
             provider_name.to_string(),
         )
         .with_metrics(metrics.clone());
 
-        let disk_service = CacheService::start(disk_config)
-            .await
-            .map_err(|e| ServiceError::CacheError(format!("Disk cache start failed: {}", e)))?;
+        let chunk_disk_service = CacheService::start(chunk_disk_config).await.map_err(|e| {
+            ServiceError::CacheError(format!("Chunk disk cache start failed: {}", e))
+        })?;
 
         info!(
-            max_size_bytes = disk_size,
-            directory = %disk_dir.display(),
+            max_size_bytes = chunk_disk_budget,
+            directory = %chunk_disk_dir.display(),
             gc_interval_secs = gc_interval.as_secs(),
             provider = %provider_name,
-            "Disk cache service started in CacheLayer with internal GC daemon"
+            "Chunk disk cache service started in CacheLayer"
         );
 
-        // 3. Create bridge adapters (metrics tracked by executor daemon, not bridge)
+        // 4. Create bridge adapters
         let memory_bridge = Arc::new(MemoryCacheBridge::new(memory_service.cache()));
+        let dds_disk_bridge = Arc::new(DdsDiskCacheBridge::new(dds_disk_service.cache()));
+        let disk_bridge = Arc::new(DiskCacheBridge::with_metrics(
+            chunk_disk_service.cache(),
+            metrics,
+        ));
 
-        let disk_bridge = Arc::new(DiskCacheBridge::with_metrics(disk_service.cache(), metrics));
-
-        info!("CacheLayer initialized with memory and disk cache bridges");
+        info!("CacheLayer initialized with three-tier cache bridges");
 
         Ok(Self {
             memory_service,
-            disk_service,
+            dds_disk_service,
+            chunk_disk_service,
             memory_bridge,
+            dds_disk_bridge,
             disk_bridge,
         })
     }
@@ -158,10 +215,18 @@ impl CacheLayer {
         Arc::clone(&self.memory_bridge)
     }
 
-    /// Get the disk cache bridge for executor integration.
+    /// Get the DDS disk cache bridge for executor integration.
+    ///
+    /// This bridge implements `executor::DdsDiskCache` and can be passed
+    /// to the executor daemon for the read path and to the build task for writes.
+    pub fn dds_disk_bridge(&self) -> Arc<DdsDiskCacheBridge> {
+        Arc::clone(&self.dds_disk_bridge)
+    }
+
+    /// Get the chunk disk cache bridge for executor integration.
     ///
     /// This bridge implements `executor::DiskCache` and can be passed
-    /// to the job factory and executor daemon.
+    /// to the job factory for chunk download caching.
     pub fn disk_bridge(&self) -> Arc<DiskCacheBridge> {
         Arc::clone(&self.disk_bridge)
     }
@@ -174,12 +239,17 @@ impl CacheLayer {
         self.memory_service.cache()
     }
 
-    /// Get the raw disk cache for direct access.
+    /// Get the raw chunk disk cache for direct access.
     pub fn raw_disk_cache(&self) -> Arc<dyn Cache> {
-        self.disk_service.cache()
+        self.chunk_disk_service.cache()
     }
 
-    /// Get the disk cache provider for GC scheduler integration.
+    /// Get the raw DDS disk cache for direct access.
+    pub fn raw_dds_disk_cache(&self) -> Arc<dyn Cache> {
+        self.dds_disk_service.cache()
+    }
+
+    /// Get the chunk disk cache provider for GC scheduler integration.
     ///
     /// Returns the underlying `DiskCacheProvider` which provides access to:
     /// - LRU index for cache size tracking
@@ -188,27 +258,53 @@ impl CacheLayer {
     ///
     /// Returns `None` if the disk service is not a disk cache (shouldn't happen).
     pub fn disk_provider(&self) -> Option<Arc<crate::cache::DiskCacheProvider>> {
-        self.disk_service.disk_provider()
+        self.chunk_disk_service.disk_provider()
     }
 
-    /// Scan and report the initial disk cache size.
+    /// Get the DDS disk cache provider for GC scheduler integration.
     ///
-    /// This scans the disk cache directory to count existing cached data.
+    /// Returns the underlying `DiskCacheProvider` for the DDS tier.
+    pub fn dds_disk_provider(&self) -> Option<Arc<crate::cache::DiskCacheProvider>> {
+        self.dds_disk_service.disk_provider()
+    }
+
+    /// Scan and report the initial disk cache sizes.
+    ///
+    /// Scans both DDS and chunk disk cache directories to count existing data.
     /// Call this during service initialization when the UI can display
     /// progress feedback.
     ///
-    /// Returns the scanned size in bytes.
+    /// Returns the combined scanned size in bytes.
     pub async fn scan_disk_cache_size(&self) -> u64 {
-        match self.disk_service.scan_initial_size().await {
+        let mut total = 0u64;
+
+        match self.dds_disk_service.scan_initial_size().await {
             Ok(size) => {
-                info!(initial_size_bytes = size, "Disk cache initial size scanned");
-                size
+                info!(
+                    initial_size_bytes = size,
+                    "DDS disk cache initial size scanned"
+                );
+                total += size;
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to scan disk cache size");
-                0
+                tracing::warn!(error = %e, "Failed to scan DDS disk cache size");
             }
         }
+
+        match self.chunk_disk_service.scan_initial_size().await {
+            Ok(size) => {
+                info!(
+                    initial_size_bytes = size,
+                    "Chunk disk cache initial size scanned"
+                );
+                total += size;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to scan chunk disk cache size");
+            }
+        }
+
+        total
     }
 
     /// Shutdown the cache layer gracefully.
@@ -219,8 +315,11 @@ impl CacheLayer {
         info!("Shutting down CacheLayer");
 
         // Shutdown in reverse order
-        self.disk_service.shutdown().await;
-        info!("Disk cache service shut down");
+        self.chunk_disk_service.shutdown().await;
+        info!("Chunk disk cache service shut down");
+
+        self.dds_disk_service.shutdown().await;
+        info!("DDS disk cache service shut down");
 
         self.memory_service.shutdown().await;
         info!("Memory cache service shut down");
@@ -232,7 +331,7 @@ impl CacheLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::{DiskCache, MemoryCache};
+    use crate::executor::{DdsDiskCache, DiskCache, MemoryCache};
     use tempfile::tempdir;
 
     fn create_test_config(cache_dir: std::path::PathBuf) -> ServiceConfig {
@@ -240,6 +339,7 @@ mod tests {
             .cache_directory(cache_dir)
             .cache_memory_size(1_000_000)
             .cache_disk_size(10_000_000)
+            .cache_dds_disk_ratio(0.6)
             .disk_gc_interval(3600)
             .build()
     }
@@ -265,6 +365,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cache_layer_budget_calculation() {
+        let temp_dir = tempdir().unwrap();
+        let config = ServiceConfig::builder()
+            .cache_directory(temp_dir.path().to_path_buf())
+            .cache_memory_size(1_000_000)
+            .cache_disk_size(10_000_000)
+            .cache_dds_disk_ratio(0.6)
+            .disk_gc_interval(3600)
+            .build();
+        let metrics = create_test_metrics();
+
+        let cache_layer = CacheLayer::new(&config, "test", metrics).await.unwrap();
+
+        // DDS disk: 60% of 10MB = 6MB
+        let dds_provider = cache_layer.dds_disk_provider().unwrap();
+        assert_eq!(dds_provider.max_size_bytes(), 6_000_000);
+
+        // Chunk disk: 40% of 10MB = 4MB
+        let chunk_provider = cache_layer.disk_provider().unwrap();
+        assert_eq!(chunk_provider.max_size_bytes(), 4_000_000);
+
+        cache_layer.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cache_layer_dds_disk_directory() {
+        let temp_dir = tempdir().unwrap();
+        let config = create_test_config(temp_dir.path().to_path_buf());
+        let metrics = create_test_metrics();
+
+        let cache_layer = CacheLayer::new(&config, "bing", metrics).await.unwrap();
+
+        // DDS disk should be under {cache_dir}/bing/dds/
+        let dds_provider = cache_layer.dds_disk_provider().unwrap();
+        let expected_dds_dir = temp_dir.path().join("bing").join("dds");
+        assert_eq!(dds_provider.directory(), &expected_dds_dir);
+
+        cache_layer.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn test_cache_layer_memory_bridge() {
         let temp_dir = tempdir().unwrap();
         let config = create_test_config(temp_dir.path().to_path_buf());
@@ -273,10 +414,28 @@ mod tests {
         let cache_layer = CacheLayer::new(&config, "test", metrics).await.unwrap();
         let bridge = cache_layer.memory_bridge();
 
-        // Use the bridge
         bridge.put(100, 200, 15, vec![1, 2, 3]).await;
         let result = bridge.get(100, 200, 15).await;
         assert_eq!(result, Some(vec![1, 2, 3]));
+
+        cache_layer.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cache_layer_dds_disk_bridge() {
+        let temp_dir = tempdir().unwrap();
+        let config = create_test_config(temp_dir.path().to_path_buf());
+        let metrics = create_test_metrics();
+
+        let cache_layer = CacheLayer::new(&config, "test", metrics).await.unwrap();
+        let bridge = cache_layer.dds_disk_bridge();
+
+        bridge.put(100, 200, 15, vec![1, 2, 3]).await;
+        let result = bridge.get(100, 200, 15).await;
+        assert_eq!(result, Some(vec![1, 2, 3]));
+
+        assert!(bridge.contains(100, 200, 15).await);
+        assert!(!bridge.contains(999, 999, 15).await);
 
         cache_layer.shutdown().await;
     }
@@ -290,7 +449,6 @@ mod tests {
         let cache_layer = CacheLayer::new(&config, "test", metrics).await.unwrap();
         let bridge = cache_layer.disk_bridge();
 
-        // Use the bridge
         bridge.put(100, 200, 15, 0, 0, vec![1, 2, 3]).await.unwrap();
         let result = bridge.get(100, 200, 15, 0, 0).await;
         assert_eq!(result, Some(vec![1, 2, 3]));
@@ -306,7 +464,7 @@ mod tests {
 
         let cache_layer = CacheLayer::new(&config, "test", metrics).await.unwrap();
 
-        // Should return 0 for empty cache
+        // Should return 0 for empty caches
         let size = cache_layer.scan_disk_cache_size().await;
         assert_eq!(size, 0);
 

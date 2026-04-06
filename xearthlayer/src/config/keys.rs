@@ -41,6 +41,7 @@ pub enum ConfigKey {
     CacheDirectory,
     CacheMemorySize,
     CacheDiskSize,
+    CacheDdsDiskRatio,
     CacheDiskIoProfile,
 
     // Texture settings
@@ -150,6 +151,7 @@ impl FromStr for ConfigKey {
             "cache.directory" => Ok(ConfigKey::CacheDirectory),
             "cache.memory_size" => Ok(ConfigKey::CacheMemorySize),
             "cache.disk_size" => Ok(ConfigKey::CacheDiskSize),
+            "cache.dds_disk_ratio" => Ok(ConfigKey::CacheDdsDiskRatio),
             "cache.disk_io_profile" => Ok(ConfigKey::CacheDiskIoProfile),
 
             "texture.format" => Ok(ConfigKey::TextureFormat),
@@ -255,6 +257,7 @@ impl ConfigKey {
             ConfigKey::CacheDirectory => "cache.directory",
             ConfigKey::CacheMemorySize => "cache.memory_size",
             ConfigKey::CacheDiskSize => "cache.disk_size",
+            ConfigKey::CacheDdsDiskRatio => "cache.dds_disk_ratio",
             ConfigKey::CacheDiskIoProfile => "cache.disk_io_profile",
             ConfigKey::TextureFormat => "texture.format",
             ConfigKey::TextureCompressor => "texture.compressor",
@@ -359,6 +362,7 @@ impl ConfigKey {
             ConfigKey::CacheDirectory => path_to_display(&config.cache.directory),
             ConfigKey::CacheMemorySize => format_size(config.cache.memory_size),
             ConfigKey::CacheDiskSize => format_size(config.cache.disk_size),
+            ConfigKey::CacheDdsDiskRatio => config.cache.dds_disk_ratio.to_string(),
             ConfigKey::CacheDiskIoProfile => config.cache.disk_io_profile.as_str().to_string(),
             ConfigKey::TextureFormat => config.texture.format.to_string().to_lowercase(),
             ConfigKey::TextureCompressor => config.texture.compressor.clone(),
@@ -531,6 +535,9 @@ impl ConfigKey {
             }
             ConfigKey::CacheDiskSize => {
                 config.cache.disk_size = parse_size(value).unwrap();
+            }
+            ConfigKey::CacheDdsDiskRatio => {
+                config.cache.dds_disk_ratio = value.parse().unwrap();
             }
             ConfigKey::CacheDiskIoProfile => {
                 config.cache.disk_io_profile = value.parse().unwrap();
@@ -756,6 +763,7 @@ impl ConfigKey {
             ConfigKey::CacheDirectory => Box::new(PathSpec),
             ConfigKey::CacheMemorySize => Box::new(SizeSpec),
             ConfigKey::CacheDiskSize => Box::new(SizeSpec),
+            ConfigKey::CacheDdsDiskRatio => Box::new(FloatRangeSpec::new(0.0, 1.0)),
             ConfigKey::CacheDiskIoProfile => {
                 Box::new(OneOfSpec::new(&["auto", "hdd", "ssd", "nvme"]))
             }
@@ -849,6 +857,7 @@ impl ConfigKey {
             ConfigKey::CacheDirectory,
             ConfigKey::CacheMemorySize,
             ConfigKey::CacheDiskSize,
+            ConfigKey::CacheDdsDiskRatio,
             ConfigKey::CacheDiskIoProfile,
             ConfigKey::TextureFormat,
             ConfigKey::TextureCompressor,
@@ -1426,6 +1435,41 @@ mod tests {
         assert!(key.validate("0.5").is_ok());
         assert!(key.validate("0.05").is_err());
         assert!(key.validate("0.6").is_err());
+    }
+
+    #[test]
+    fn test_dds_disk_ratio_config_key_parse() {
+        let key: ConfigKey = "cache.dds_disk_ratio".parse().unwrap();
+        assert_eq!(key, ConfigKey::CacheDdsDiskRatio);
+        assert_eq!(key.name(), "cache.dds_disk_ratio");
+    }
+
+    #[test]
+    fn test_dds_disk_ratio_validation() {
+        let key = ConfigKey::CacheDdsDiskRatio;
+        assert!(key.validate("0.0").is_ok());
+        assert!(key.validate("0.6").is_ok());
+        assert!(key.validate("1.0").is_ok());
+        assert!(key.validate("0.75").is_ok());
+        assert!(key.validate("-0.1").is_err());
+        assert!(key.validate("1.1").is_err());
+        assert!(key.validate("abc").is_err());
+    }
+
+    #[test]
+    fn test_dds_disk_ratio_round_trip() {
+        let mut config = ConfigFile::default();
+        let key = ConfigKey::CacheDdsDiskRatio;
+        assert_eq!(key.get(&config), "0.6"); // default
+        key.set(&mut config, "0.75").unwrap();
+        assert_eq!(key.get(&config), "0.75");
+        assert!((config.cache.dds_disk_ratio - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_dds_disk_ratio_in_all_keys() {
+        let all = ConfigKey::all();
+        assert!(all.contains(&ConfigKey::CacheDdsDiskRatio));
     }
 
     #[test]

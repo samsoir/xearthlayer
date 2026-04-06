@@ -81,6 +81,16 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
                 reason: "expected format like '20GB', '500MB', or '1024KB'".to_string(),
             })?;
         }
+        if let Some(v) = section.get("dds_disk_ratio") {
+            config.cache.dds_disk_ratio =
+                v.parse::<f64>()
+                    .map_err(|_| ConfigFileError::InvalidValue {
+                        section: "cache".to_string(),
+                        key: "dds_disk_ratio".to_string(),
+                        value: v.to_string(),
+                        reason: "expected a number between 0.0 and 1.0".to_string(),
+                    })?;
+        }
         if let Some(v) = section.get("disk_io_profile") {
             config.cache.disk_io_profile =
                 v.parse().map_err(|_| ConfigFileError::InvalidValue {

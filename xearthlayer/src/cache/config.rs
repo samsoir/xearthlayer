@@ -22,6 +22,9 @@ pub struct ServiceCacheConfig {
     /// Optional metrics client for reporting cache stats.
     /// For disk caches, this enables GC eviction reporting.
     pub metrics_client: Option<MetricsClient>,
+
+    /// Whether this is a DDS tile cache tier (affects metric event routing).
+    pub is_dds_tier: bool,
 }
 
 /// Provider-specific configuration.
@@ -67,6 +70,7 @@ impl ServiceCacheConfig {
             max_size_bytes,
             provider: ProviderConfig::Memory { ttl },
             metrics_client: None,
+            is_dds_tier: false,
         }
     }
 
@@ -103,7 +107,17 @@ impl ServiceCacheConfig {
                 provider_name,
             },
             metrics_client: None,
+            is_dds_tier: false,
         }
+    }
+
+    /// Mark this config as a DDS tile cache tier.
+    ///
+    /// DDS tier providers emit `dds_disk_cache_size` metrics instead of
+    /// `disk_cache_size`, allowing the TUI to correctly aggregate both tiers.
+    pub fn as_dds_tier(mut self) -> Self {
+        self.is_dds_tier = true;
+        self
     }
 
     /// Set the metrics client for reporting cache stats.
@@ -142,6 +156,9 @@ pub struct DiskProviderConfig {
 
     /// Optional metrics client for reporting GC eviction stats.
     pub metrics_client: Option<MetricsClient>,
+
+    /// Whether this is a DDS tile cache tier (affects which metric event is emitted).
+    pub is_dds_tier: bool,
 }
 
 impl DiskProviderConfig {
@@ -165,6 +182,7 @@ impl DiskProviderConfig {
                 gc_interval: *gc_interval,
                 provider_name: provider_name.clone(),
                 metrics_client: None,
+                is_dds_tier: false,
             }),
             ProviderConfig::Memory { .. } => None,
         }
@@ -228,7 +246,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = ServiceCacheConfig::default();
-        assert_eq!(config.max_size_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(config.max_size_bytes, DEFAULT_MEMORY_CACHE_SIZE as u64);
         assert!(matches!(
             config.provider,
             ProviderConfig::Memory { ttl: None }

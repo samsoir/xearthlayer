@@ -229,6 +229,38 @@ pub trait DiskCache: Send + Sync + 'static {
 }
 
 // ============================================================================
+// DDS Disk Cache Trait
+// ============================================================================
+
+/// Trait for DDS disk cache (tile-level, persistent).
+///
+/// DDS disk cache stores complete encoded DDS tiles on disk for fast re-serving
+/// when evicted from memory. Sits between memory and chunk disk in the cache
+/// hierarchy: memory → DDS disk → chunk disk → network.
+///
+/// Uses the same tile-level key space as [`MemoryCache`] but backed by disk
+/// storage with LRU eviction.
+pub trait DdsDiskCache: Send + Sync + 'static {
+    /// Gets a DDS tile from the disk cache.
+    ///
+    /// Returns `Some(data)` if the tile is cached on disk, `None` otherwise.
+    /// On hit, performs a disk read (~3.5ms NVMe, ~21ms SATA SSD).
+    fn get(&self, row: u32, col: u32, zoom: u8) -> impl Future<Output = Option<Vec<u8>>> + Send;
+
+    /// Stores a DDS tile in the disk cache.
+    ///
+    /// Writes the encoded DDS data to disk. Eviction of old entries is
+    /// handled by the GC scheduler daemon.
+    fn put(&self, row: u32, col: u32, zoom: u8, data: Vec<u8>) -> impl Future<Output = ()> + Send;
+
+    /// Checks if a tile exists in the disk cache index.
+    ///
+    /// This is an O(1) in-memory check against the LRU index (DashMap lookup).
+    /// Does NOT perform any disk I/O.
+    fn contains(&self, row: u32, col: u32, zoom: u8) -> impl Future<Output = bool> + Send;
+}
+
+// ============================================================================
 // Blocking Executor Trait
 // ============================================================================
 

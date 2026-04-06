@@ -72,6 +72,9 @@ pub struct CacheSettings {
     pub memory_size: usize,
     /// Disk cache size in bytes
     pub disk_size: usize,
+    /// Fraction of disk_size allocated to DDS tile cache (0.0-1.0, default: 0.6).
+    /// Remainder goes to chunk cache.
+    pub dds_disk_ratio: f64,
     /// Disk I/O profile for tuning concurrency based on storage type
     pub disk_io_profile: DiskIoProfile,
 }

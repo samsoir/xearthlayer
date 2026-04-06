@@ -115,6 +115,7 @@ impl CacheService {
                     gc_interval,
                     provider_name: provider_name.clone(),
                     metrics_client: config.metrics_client,
+                    is_dds_tier: config.is_dds_tier,
                 };
 
                 let provider = DiskCacheProvider::start(disk_config).await?;
@@ -346,7 +347,10 @@ mod tests {
         let service = CacheService::start(config).await.unwrap();
 
         assert!(service.is_memory());
-        assert_eq!(service.cache().max_size_bytes(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            service.cache().max_size_bytes(),
+            crate::config::DEFAULT_MEMORY_CACHE_SIZE as u64
+        );
 
         service.shutdown().await;
     }

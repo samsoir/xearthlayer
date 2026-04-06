@@ -159,6 +159,23 @@ impl crate::executor::DiskCache for NullDiskCache {
     }
 }
 
+/// A no-op DDS disk cache that never caches anything.
+///
+/// Useful for testing or when DDS disk caching is disabled.
+pub struct NullDdsDiskCache;
+
+impl crate::executor::DdsDiskCache for NullDdsDiskCache {
+    async fn get(&self, _row: u32, _col: u32, _zoom: u8) -> Option<Vec<u8>> {
+        None
+    }
+
+    async fn put(&self, _row: u32, _col: u32, _zoom: u8, _data: Vec<u8>) {}
+
+    async fn contains(&self, _row: u32, _col: u32, _zoom: u8) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

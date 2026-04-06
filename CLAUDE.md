@@ -62,14 +62,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
      - Structured tracing on buffer lifecycle and error paths
 
 5. **Cache System** (`xearthlayer/src/cache/`, `xearthlayer/src/service/cache_layer.rs`)
-   - `CacheLayer` - Service-owned cache lifecycle (encapsulates memory + disk)
+   - Three-tier cache hierarchy: Memory → DDS Disk → Chunk Disk → Network
+   - `CacheLayer` - Service-owned three-tier cache lifecycle with budget management
    - `CacheService` - Self-contained cache with internal GC daemons
-   - `MemoryCacheProvider`: moka-based LRU eviction (default 2GB)
-   - `DiskCacheProvider`: Owns GC daemon internally (default 20GB)
+   - `MemoryCacheProvider`: moka-based LRU eviction (default 512MB, staging buffer)
+   - `DiskCacheProvider`: Two instances — DDS tiles and raw chunks, each with own GC
+   - DDS disk cache: Encoded DDS tiles on disk, avoids re-encoding on memory eviction (~3.5ms NVMe read vs ~50-200ms re-encode)
+   - Shared disk budget: `cache.disk_size` split by `cache.dds_disk_ratio` (default 0.6 = 60% DDS, 40% chunks)
+   - DDS disk directory: `{cache_dir}/{provider}/dds/`, chunks keep existing provider directory
    - Region-based disk layout: files in 1°×1° DSF subdirs (e.g., `+33-119/tile_15_12754_5279.cache`)
+   - Read path: memory hit → DDS disk hit (+ promote to memory) → chunk disk (assemble+encode) → network
+   - Write path: After encode, fire-and-forget to both memory AND DDS disk
    - Parallel startup scanning via rayon over region directories
    - `migrate_cache()` for migrating flat-layout caches to region layout
-   - Bridge adapters for executor integration (MemoryCacheBridge, DiskCacheBridge)
+   - Bridge adapters for executor integration (MemoryCacheBridge, DdsDiskCacheBridge, DiskCacheBridge)
    - Per-provider cache directories
    - `XEarthLayerService::start()` creates `CacheLayer` with proper metrics ordering
 
@@ -335,7 +341,7 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/aircraft_position/web_api/datarefs.rs` | X-Plane dataref definitions |
 | `xearthlayer/src/aircraft_position/web_api/sim_state.rs` | SimState - sim state detection (paused, loading, etc.) |
 | `xearthlayer/src/aircraft_position/web_api/config.rs` | Web API connection configuration |
-| `xearthlayer/src/service/cache_layer.rs` | CacheLayer - service-owned cache lifecycle (memory + disk) |
+| `xearthlayer/src/service/cache_layer.rs` | CacheLayer - three-tier cache lifecycle (memory + DDS disk + chunk disk) |
 | `xearthlayer/src/cache/providers/disk.rs` | DiskCacheProvider with internal GC daemon |
 | `xearthlayer/src/cache/adapters/` | Bridge adapters for backward compatibility |
 
@@ -346,7 +352,7 @@ Default config location: `~/.xearthlayer/config.ini`
 Key sections:
 - `[general]` - General settings (update_check)
 - `[provider]` - Imagery source (bing/google)
-- `[cache]` - Memory/disk sizes, directory, disk I/O profile (auto/hdd/ssd/nvme)
+- `[cache]` - Memory/disk sizes, directory, DDS disk ratio, disk I/O profile (auto/hdd/ssd/nvme)
 - `[generation]` - Thread count, timeout
 - `[texture]` - DDS format (bc1/bc3), compressor backend (software/ispc/gpu), GPU device selection
 - `[prefetch]` - Boundary-driven prefetch, web_api_port (default 8086), calibration, transition ramp

@@ -19,8 +19,8 @@
 
 use crate::coord::TileCoord;
 use crate::executor::{
-    BlockingExecutor, ChunkResults, MemoryCache, ResourceType, Task, TaskContext, TaskError,
-    TaskOutput, TaskResult, TextureEncoderAsync,
+    BlockingExecutor, ChunkResults, DdsDiskCache, MemoryCache, ResourceType, Task, TaskContext,
+    TaskError, TaskOutput, TaskResult, TextureEncoderAsync,
 };
 use crate::metrics::OptionalMetrics;
 use image::{Rgba, RgbaImage};
@@ -58,10 +58,11 @@ const MAGENTA: Rgba<u8> = Rgba([255, 0, 255, 255]);
 ///
 /// The DDS data is returned directly to avoid cache read race conditions
 /// with eventual consistency caches like moka.
-pub struct BuildAndCacheDdsTask<E, M, X>
+pub struct BuildAndCacheDdsTask<E, M, DD, X>
 where
     E: TextureEncoderAsync,
     M: MemoryCache,
+    DD: DdsDiskCache,
     X: BlockingExecutor,
 {
     /// Tile coordinates
@@ -73,14 +74,18 @@ where
     /// Memory cache for storing completed DDS tiles
     memory_cache: Arc<M>,
 
+    /// DDS disk cache for persistent tile storage
+    dds_disk_cache: Arc<DD>,
+
     /// Executor for CPU-bound blocking operations
     executor: Arc<X>,
 }
 
-impl<E, M, X> BuildAndCacheDdsTask<E, M, X>
+impl<E, M, DD, X> BuildAndCacheDdsTask<E, M, DD, X>
 where
     E: TextureEncoderAsync,
     M: MemoryCache,
+    DD: DdsDiskCache,
     X: BlockingExecutor,
 {
     /// Creates a new build and cache DDS task.
@@ -90,21 +95,30 @@ where
     /// * `tile` - Tile coordinates
     /// * `encoder` - Texture encoder for DDS compression
     /// * `memory_cache` - Memory cache to write completed tiles
+    /// * `dds_disk_cache` - DDS disk cache for persistent storage
     /// * `executor` - Executor for blocking operations (spawn_blocking)
-    pub fn new(tile: TileCoord, encoder: Arc<E>, memory_cache: Arc<M>, executor: Arc<X>) -> Self {
+    pub fn new(
+        tile: TileCoord,
+        encoder: Arc<E>,
+        memory_cache: Arc<M>,
+        dds_disk_cache: Arc<DD>,
+        executor: Arc<X>,
+    ) -> Self {
         Self {
             tile,
             encoder,
             memory_cache,
+            dds_disk_cache,
             executor,
         }
     }
 }
 
-impl<E, M, X> Task for BuildAndCacheDdsTask<E, M, X>
+impl<E, M, DD, X> Task for BuildAndCacheDdsTask<E, M, DD, X>
 where
     E: TextureEncoderAsync,
     M: MemoryCache,
+    DD: DdsDiskCache,
     X: BlockingExecutor,
 {
     fn name(&self) -> &str {
@@ -236,7 +250,7 @@ where
                     "DDS encoding complete, spawning cache write"
                 );
 
-                // Step 4: Spawn fire-and-forget cache write
+                // Step 4: Spawn fire-and-forget memory cache write
                 // This avoids blocking the job completion on cache write,
                 // and avoids race conditions with eventual consistency caches.
                 let cache = Arc::clone(&self.memory_cache);
@@ -255,7 +269,37 @@ where
                     debug!(
                         tile = ?tile,
                         cache_size_bytes = total_cache_size,
-                        "Cache write complete (async)"
+                        "Memory cache write complete (async)"
+                    );
+                });
+
+                // Step 5: Spawn fire-and-forget DDS disk cache write
+                // Persists the encoded DDS tile to disk so it can be served
+                // without re-encoding after memory eviction.
+                let dds_disk = Arc::clone(&self.dds_disk_cache);
+                let tile_for_disk = self.tile;
+                let dds_data_for_disk = dds_data.clone();
+                let dds_bytes = dds_data_for_disk.len() as u64;
+                let metrics_for_dds = metrics.clone();
+                tokio::spawn(async move {
+                    metrics_for_dds.disk_write_started();
+                    let write_start = Instant::now();
+
+                    dds_disk
+                        .put(
+                            tile_for_disk.row,
+                            tile_for_disk.col,
+                            tile_for_disk.zoom,
+                            dds_data_for_disk,
+                        )
+                        .await;
+
+                    let duration_us = write_start.elapsed().as_micros() as u64;
+                    metrics_for_dds.disk_write_completed(dds_bytes, duration_us);
+
+                    debug!(
+                        tile = ?tile_for_disk,
+                        "DDS disk cache write complete (async)"
                     );
                 });
 

@@ -196,8 +196,8 @@ pub use cache_adapter::ExecutorCacheAdapter;
 // Core traits (decoupled from pipeline module)
 pub use traits::{
     BlockingExecutor, ChunkDownloadError, ChunkProvider, ConcurrentResults, ConcurrentRunner,
-    DiskCache, ExecutorError, MemoryCache, TextureEncodeError, TextureEncoderAsync, Timer,
-    TokioExecutor,
+    DdsDiskCache, DiskCache, ExecutorError, MemoryCache, TextureEncodeError, TextureEncoderAsync,
+    Timer, TokioExecutor,
 };
 
 // Chunk results (for download/assemble stages)
@@ -208,8 +208,8 @@ pub use download_config::{DownloadConfig, DEFAULT_MAX_CONCURRENT_HTTP};
 
 // Adapters (bridge external implementations to executor traits)
 pub use adapters::{
-    AsyncProviderAdapter, DiskCacheAdapter, MemoryCacheAdapter, NullDiskCache, ProviderAdapter,
-    TextureEncoderAdapter,
+    AsyncProviderAdapter, DiskCacheAdapter, MemoryCacheAdapter, NullDdsDiskCache, NullDiskCache,
+    ProviderAdapter, TextureEncoderAdapter,
 };
 
 // Storage concurrency limiter (semaphore-based I/O limiting)

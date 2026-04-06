@@ -27,7 +27,8 @@
 
 use crate::coord::TileCoord;
 use crate::executor::{
-    BlockingExecutor, ChunkProvider, DiskCache, DownloadConfig, MemoryCache, TextureEncoderAsync,
+    BlockingExecutor, ChunkProvider, DdsDiskCache, DiskCache, DownloadConfig, MemoryCache,
+    TextureEncoderAsync,
 };
 use crate::executor::{Job, Priority};
 use crate::jobs::DdsGenerateJob;
@@ -80,11 +81,12 @@ pub trait DdsJobFactory: Send + Sync + 'static {
 /// * `M` - Memory cache for storing completed tiles
 /// * `D` - Disk cache for storing individual chunks
 /// * `X` - Blocking executor for CPU-bound operations
-pub struct DefaultDdsJobFactory<P, E, M, D, X>
+pub struct DefaultDdsJobFactory<P, E, M, DD, D, X>
 where
     P: ChunkProvider,
     E: TextureEncoderAsync,
     M: MemoryCache,
+    DD: DdsDiskCache,
     D: DiskCache,
     X: BlockingExecutor,
 {
@@ -97,6 +99,9 @@ where
     /// Memory cache for storing completed DDS tiles
     memory_cache: Arc<M>,
 
+    /// DDS disk cache for persistent tile storage
+    dds_disk_cache: Arc<DD>,
+
     /// Disk cache for storing individual chunks
     disk_cache: Arc<D>,
 
@@ -107,11 +112,12 @@ where
     download_config: DownloadConfig,
 }
 
-impl<P, E, M, D, X> DefaultDdsJobFactory<P, E, M, D, X>
+impl<P, E, M, DD, D, X> DefaultDdsJobFactory<P, E, M, DD, D, X>
 where
     P: ChunkProvider,
     E: TextureEncoderAsync,
     M: MemoryCache,
+    DD: DdsDiskCache,
     D: DiskCache,
     X: BlockingExecutor,
 {
@@ -125,12 +131,14 @@ where
     /// * `provider` - Chunk provider for downloading satellite imagery
     /// * `encoder` - Texture encoder for DDS compression
     /// * `memory_cache` - Memory cache for storing completed tiles
+    /// * `dds_disk_cache` - DDS disk cache for persistent tiles
     /// * `disk_cache` - Disk cache for storing chunks
     /// * `executor` - Executor for blocking operations
     pub fn new(
         provider: Arc<P>,
         encoder: Arc<E>,
         memory_cache: Arc<M>,
+        dds_disk_cache: Arc<DD>,
         disk_cache: Arc<D>,
         executor: Arc<X>,
     ) -> Self {
@@ -138,6 +146,7 @@ where
             provider,
             encoder,
             memory_cache,
+            dds_disk_cache,
             disk_cache,
             executor,
             download_config: DownloadConfig::default(),
@@ -147,19 +156,12 @@ where
     /// Creates a new factory with custom download configuration.
     ///
     /// Use this to configure custom timeout, retries, or HTTP concurrency.
-    ///
-    /// # Arguments
-    ///
-    /// * `provider` - Chunk provider for downloading satellite imagery
-    /// * `encoder` - Texture encoder for DDS compression
-    /// * `memory_cache` - Memory cache for storing completed tiles
-    /// * `disk_cache` - Disk cache for storing chunks
-    /// * `executor` - Executor for blocking operations
-    /// * `download_config` - Custom download configuration
+    #[allow(clippy::too_many_arguments)]
     pub fn with_config(
         provider: Arc<P>,
         encoder: Arc<E>,
         memory_cache: Arc<M>,
+        dds_disk_cache: Arc<DD>,
         disk_cache: Arc<D>,
         executor: Arc<X>,
         download_config: DownloadConfig,
@@ -168,6 +170,7 @@ where
             provider,
             encoder,
             memory_cache,
+            dds_disk_cache,
             disk_cache,
             executor,
             download_config,
@@ -175,11 +178,12 @@ where
     }
 }
 
-impl<P, E, M, D, X> DdsJobFactory for DefaultDdsJobFactory<P, E, M, D, X>
+impl<P, E, M, DD, D, X> DdsJobFactory for DefaultDdsJobFactory<P, E, M, DD, D, X>
 where
     P: ChunkProvider,
     E: TextureEncoderAsync,
     M: MemoryCache,
+    DD: DdsDiskCache,
     D: DiskCache,
     X: BlockingExecutor,
 {
@@ -190,6 +194,7 @@ where
             Arc::clone(&self.provider),
             Arc::clone(&self.encoder),
             Arc::clone(&self.memory_cache),
+            Arc::clone(&self.dds_disk_cache),
             Arc::clone(&self.disk_cache),
             Arc::clone(&self.executor),
             self.download_config.clone(), // Clone shares the Arc<Semaphore>

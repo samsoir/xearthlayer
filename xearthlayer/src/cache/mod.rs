@@ -73,7 +73,7 @@ pub use lru_index::{
 pub use providers::{DiskCacheProvider, MemoryCacheProvider};
 
 // Domain decorator exports (Phase 2)
-pub use adapters::{DiskCacheBridge, MemoryCacheBridge};
+pub use adapters::{DdsDiskCacheBridge, DiskCacheBridge, MemoryCacheBridge};
 pub use clients::{ChunkCacheClient, TileCacheClient};
 
 // Legacy exports (backward compatibility)

@@ -119,8 +119,9 @@ Controls tile caching behavior.
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `directory` | path | `~/.cache/xearthlayer` | Directory for storing cached tiles. Supports `~` expansion. |
-| `memory_size` | size | `2GB` | Maximum RAM for in-memory cache. Supports KB, MB, GB suffixes. |
-| `disk_size` | size | `20GB` | Maximum disk space for persistent cache. Supports KB, MB, GB suffixes. |
+| `memory_size` | size | `512MB` | Maximum RAM for in-memory cache. Supports KB, MB, GB suffixes. Memory cache is a staging buffer; DDS disk cache is the retention layer. |
+| `disk_size` | size | `20GB` | Maximum disk space for persistent cache (shared between DDS tiles and raw chunks). Supports KB, MB, GB suffixes. |
+| `dds_disk_ratio` | float | `0.6` | Fraction of `disk_size` allocated to DDS tile cache (0.0-1.0). Remainder goes to raw chunk cache. |
 | `disk_io_profile` | string | `auto` | Disk I/O concurrency profile based on storage type (see below) |
 
 **Disk I/O Profile:**
@@ -748,8 +749,9 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `provider.google_api_key` | string | Google Maps API key |
 | `provider.mapbox_access_token` | string | MapBox access token |
 | `cache.directory` | path | Cache directory |
-| `cache.memory_size` | size (e.g., `2GB`) | Memory cache size |
-| `cache.disk_size` | size (e.g., `20GB`) | Disk cache size |
+| `cache.memory_size` | size (e.g., `512MB`) | Memory cache size (staging buffer) |
+| `cache.disk_size` | size (e.g., `20GB`) | Total disk cache size (DDS + chunks) |
+| `cache.dds_disk_ratio` | float (e.g., `0.6`) | Fraction of disk for DDS tiles (0.0-1.0) |
 | `cache.disk_io_profile` | `auto`, `hdd`, `ssd`, `nvme` | Disk I/O concurrency profile |
 | `texture.format` | `bc1`, `bc3` | DDS compression format |
 | `texture.compressor` | `software`, `ispc`, `gpu` | Compression backend (`gpu` requires `gpu-encode` feature) |

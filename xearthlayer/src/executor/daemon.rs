@@ -43,7 +43,7 @@
 //! use xearthlayer::executor::{ExecutorDaemon, ExecutorDaemonConfig};
 //!
 //! let config = ExecutorDaemonConfig::default();
-//! let (daemon, request_tx) = ExecutorDaemon::new(config, factory, memory_cache);
+//! let (daemon, request_tx) = ExecutorDaemon::new(config, factory, memory_cache, dds_disk_cache);
 //!
 //! // Start daemon
 //! let shutdown = CancellationToken::new();
@@ -148,6 +148,17 @@ pub trait DaemonMemoryCache: Send + Sync + 'static {
         zoom: u8,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>;
 
+    /// Stores a tile in the memory cache.
+    ///
+    /// Used by the daemon to promote DDS disk cache hits back to memory.
+    fn put(
+        &self,
+        row: u32,
+        col: u32,
+        zoom: u8,
+        data: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+
     /// Checks if a tile exists in the cache without loading data.
     ///
     /// This is more efficient than `get` when you only need to know if a tile
@@ -174,6 +185,16 @@ where
         zoom: u8,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
         Box::pin(async move { crate::executor::MemoryCache::get(self, row, col, zoom).await })
+    }
+
+    fn put(
+        &self,
+        row: u32,
+        col: u32,
+        zoom: u8,
+        data: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move { crate::executor::MemoryCache::put(self, row, col, zoom, data).await })
     }
 }
 
@@ -303,10 +324,12 @@ impl DaemonCoalescer {
 ///
 /// * `F` - Factory type for creating DDS generation jobs
 /// * `M` - Memory cache type for cache lookups
-pub struct ExecutorDaemon<F, M>
+/// * `DD` - DDS disk cache type for persistent tile lookups
+pub struct ExecutorDaemon<F, M, DD>
 where
     F: DdsJobFactory,
     M: DaemonMemoryCache,
+    DD: super::DdsDiskCache,
 {
     /// The job executor.
     executor: JobExecutor,
@@ -320,6 +343,9 @@ where
     /// Memory cache for fast-path cache hits.
     memory_cache: Arc<M>,
 
+    /// DDS disk cache for medium-path cache hits (avoids re-encoding).
+    dds_disk_cache: Arc<DD>,
+
     /// Channel receiver for requests.
     request_rx: mpsc::Receiver<JobRequest>,
 
@@ -327,10 +353,11 @@ where
     metrics_client: Option<MetricsClient>,
 }
 
-impl<F, M> ExecutorDaemon<F, M>
+impl<F, M, DD> ExecutorDaemon<F, M, DD>
 where
     F: DdsJobFactory,
     M: DaemonMemoryCache,
+    DD: super::DdsDiskCache,
 {
     /// Creates a new daemon with its channel.
     ///
@@ -346,11 +373,13 @@ where
         config: ExecutorDaemonConfig,
         factory: Arc<F>,
         memory_cache: Arc<M>,
+        dds_disk_cache: Arc<DD>,
     ) -> (Self, mpsc::Sender<JobRequest>) {
         Self::with_telemetry(
             config,
             factory,
             memory_cache,
+            dds_disk_cache,
             Arc::new(TracingTelemetrySink),
         )
     }
@@ -369,6 +398,7 @@ where
         config: ExecutorDaemonConfig,
         factory: Arc<F>,
         memory_cache: Arc<M>,
+        dds_disk_cache: Arc<DD>,
         telemetry: Arc<dyn TelemetrySink>,
     ) -> (Self, mpsc::Sender<JobRequest>) {
         let (request_tx, request_rx) = mpsc::channel(config.channel_capacity);
@@ -379,6 +409,7 @@ where
             submitter,
             factory,
             memory_cache,
+            dds_disk_cache,
             request_rx,
             metrics_client: None,
         };
@@ -403,6 +434,7 @@ where
         config: ExecutorDaemonConfig,
         factory: Arc<F>,
         memory_cache: Arc<M>,
+        dds_disk_cache: Arc<DD>,
         telemetry: Arc<dyn TelemetrySink>,
         metrics_client: MetricsClient,
     ) -> (Self, mpsc::Sender<JobRequest>) {
@@ -419,6 +451,7 @@ where
             submitter,
             factory,
             memory_cache,
+            dds_disk_cache,
             request_rx,
             metrics_client: Some(metrics_client),
         };
@@ -463,6 +496,7 @@ where
             submitter,
             factory,
             memory_cache,
+            dds_disk_cache,
             mut request_rx,
             metrics_client,
         } = self;
@@ -498,6 +532,7 @@ where
                         &submitter,
                         &factory,
                         &memory_cache,
+                        &dds_disk_cache,
                         &coalescer,
                         &metrics_client,
                     ).await;
@@ -515,6 +550,7 @@ where
         submitter: &ExecutorSubmitter,
         factory: &Arc<F>,
         memory_cache: &Arc<M>,
+        dds_disk_cache: &Arc<DD>,
         coalescer: &Arc<DaemonCoalescer>,
         metrics_client: &Option<MetricsClient>,
     ) {
@@ -582,6 +618,46 @@ where
                 origin.is_fuse(),
                 crate::debug_map::activity::TileCacheResult::CacheHit,
             );
+
+            if let Some(tx) = request.response_tx {
+                let _ = tx.send(DdsResponse::cache_hit(data, duration));
+            }
+            return;
+        }
+
+        // Medium path: check DDS disk cache (avoids re-encoding)
+        let dds_disk_result = dds_disk_cache
+            .get(tile.row, tile.col, tile.zoom)
+            .instrument(tracing::trace_span!(target: "profiling", "dds_disk_cache_check"))
+            .await;
+        if let Some(data) = dds_disk_result {
+            let duration = start.elapsed();
+            debug!(
+                tile_row = tile.row,
+                tile_col = tile.col,
+                tile_zoom = tile.zoom,
+                dsf_tile = %dsf_tile,
+                origin = %origin,
+                cache_status = "dds_disk_hit",
+                latency_ms = duration.as_millis(),
+                data_size = data.len(),
+                "DDS disk cache hit — serving without re-encode"
+            );
+
+            // Promote back to memory cache (fire-and-forget)
+            let cache = Arc::clone(memory_cache);
+            let data_for_promote = data.clone();
+            let tile_for_promote = tile;
+            tokio::spawn(async move {
+                cache
+                    .put(
+                        tile_for_promote.row,
+                        tile_for_promote.col,
+                        tile_for_promote.zoom,
+                        data_for_promote,
+                    )
+                    .await;
+            });
 
             if let Some(tx) = request.response_tx {
                 let _ = tx.send(DdsResponse::cache_hit(data, duration));
@@ -831,6 +907,17 @@ mod tests {
             let data = self.data.lock().unwrap().get(&(row, col, zoom)).cloned();
             Box::pin(async move { data })
         }
+
+        fn put(
+            &self,
+            row: u32,
+            col: u32,
+            zoom: u8,
+            data: Vec<u8>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            self.data.lock().unwrap().insert((row, col, zoom), data);
+            Box::pin(async {})
+        }
     }
 
     /// Mock job factory that tracks job creation count
@@ -958,7 +1045,12 @@ mod tests {
         let factory = Arc::new(MockJobFactory::new());
         let cache = Arc::new(MockMemoryCache::new());
 
-        let (daemon, tx) = ExecutorDaemon::new(ExecutorDaemonConfig::default(), factory, cache);
+        let (daemon, tx) = ExecutorDaemon::new(
+            ExecutorDaemonConfig::default(),
+            factory,
+            cache,
+            Arc::new(super::super::NullDdsDiskCache),
+        );
 
         // Verify channel is open
         assert!(!tx.is_closed());
@@ -978,7 +1070,12 @@ mod tests {
         cache.insert(tile.row, tile.col, tile.zoom, vec![1, 2, 3]);
 
         let config = ExecutorDaemonConfig::default();
-        let (daemon, tx) = ExecutorDaemon::new(config, factory, cache);
+        let (daemon, tx) = ExecutorDaemon::new(
+            config,
+            factory,
+            cache,
+            Arc::new(super::super::NullDdsDiskCache),
+        );
 
         let shutdown = CancellationToken::new();
         let shutdown_clone = shutdown.clone();
@@ -1012,7 +1109,12 @@ mod tests {
         let cache = Arc::new(MockMemoryCache::new());
 
         let config = ExecutorDaemonConfig::default();
-        let (daemon, tx) = ExecutorDaemon::new(config, factory, cache);
+        let (daemon, tx) = ExecutorDaemon::new(
+            config,
+            factory,
+            cache,
+            Arc::new(super::super::NullDdsDiskCache),
+        );
 
         let shutdown = CancellationToken::new();
         let shutdown_clone = shutdown.clone();
@@ -1039,7 +1141,12 @@ mod tests {
         let cache = Arc::new(MockMemoryCache::new());
 
         let config = ExecutorDaemonConfig::default();
-        let (daemon, tx) = ExecutorDaemon::new(config, factory, cache);
+        let (daemon, tx) = ExecutorDaemon::new(
+            config,
+            factory,
+            cache,
+            Arc::new(super::super::NullDdsDiskCache),
+        );
 
         let shutdown = CancellationToken::new();
         let shutdown_clone = shutdown.clone();
@@ -1080,7 +1187,12 @@ mod tests {
         let cache = Arc::new(MockMemoryCache::new());
 
         let config = ExecutorDaemonConfig::default();
-        let (daemon, tx) = ExecutorDaemon::new(config, Arc::clone(&factory), cache);
+        let (daemon, tx) = ExecutorDaemon::new(
+            config,
+            Arc::clone(&factory),
+            cache,
+            Arc::new(super::super::NullDdsDiskCache),
+        );
 
         let shutdown = CancellationToken::new();
         let shutdown_clone = shutdown.clone();
@@ -1128,7 +1240,12 @@ mod tests {
         let cache = Arc::new(MockMemoryCache::new());
 
         let config = ExecutorDaemonConfig::default();
-        let (daemon, tx) = ExecutorDaemon::new(config, Arc::clone(&factory), cache);
+        let (daemon, tx) = ExecutorDaemon::new(
+            config,
+            Arc::clone(&factory),
+            cache,
+            Arc::new(super::super::NullDdsDiskCache),
+        );
 
         let shutdown = CancellationToken::new();
         let shutdown_clone = shutdown.clone();
@@ -1177,7 +1294,12 @@ mod tests {
         let cache = Arc::new(MockMemoryCache::new());
 
         let config = ExecutorDaemonConfig::default();
-        let (daemon, tx) = ExecutorDaemon::new(config, Arc::clone(&factory), cache);
+        let (daemon, tx) = ExecutorDaemon::new(
+            config,
+            Arc::clone(&factory),
+            cache,
+            Arc::new(super::super::NullDdsDiskCache),
+        );
 
         let shutdown = CancellationToken::new();
         let shutdown_clone = shutdown.clone();
@@ -1226,7 +1348,12 @@ mod tests {
         let cache = Arc::new(MockMemoryCache::new());
 
         let config = ExecutorDaemonConfig::default();
-        let (daemon, tx) = ExecutorDaemon::new(config, Arc::clone(&factory), cache);
+        let (daemon, tx) = ExecutorDaemon::new(
+            config,
+            Arc::clone(&factory),
+            cache,
+            Arc::new(super::super::NullDdsDiskCache),
+        );
 
         let shutdown = CancellationToken::new();
         let shutdown_clone = shutdown.clone();

@@ -21,11 +21,11 @@
 //!                         DdsClient
 //! ```
 
-use crate::cache::adapters::{DiskCacheBridge, MemoryCacheBridge};
+use crate::cache::adapters::{DdsDiskCacheBridge, DiskCacheBridge, MemoryCacheBridge};
 use crate::cache::MemoryCache;
 use crate::dds::DdsFormat;
 use crate::executor::{
-    AsyncProviderAdapter, DiskCacheAdapter, ExecutorCacheAdapter, NullDiskCache,
+    AsyncProviderAdapter, DiskCacheAdapter, ExecutorCacheAdapter, NullDdsDiskCache, NullDiskCache,
     TextureEncoderAdapter, TokioExecutor,
 };
 use crate::jobs::DefaultDdsJobFactory;
@@ -176,9 +176,11 @@ impl RuntimeBuilder {
             disk_cache,
         );
 
+        let null_dds_disk = Arc::new(NullDdsDiskCache);
         XEarthLayerRuntime::with_metrics_client(
             factory,
             cache_adapter,
+            null_dds_disk,
             self.config,
             runtime_handle,
             self.metrics_client,
@@ -219,16 +221,18 @@ impl RuntimeBuilder {
             Arc::clone(&cache_adapter),
         );
 
+        let null_dds_disk = Arc::new(NullDdsDiskCache);
         XEarthLayerRuntime::with_metrics_client(
             factory,
             cache_adapter,
+            null_dds_disk,
             self.config,
             runtime_handle,
             self.metrics_client,
         )
     }
 
-    /// Creates a factory with DiskCacheAdapter.
+    /// Creates a factory with DiskCacheAdapter (no DDS disk cache).
     fn create_factory_with_disk_cache(
         async_provider: Arc<AsyncProviderType>,
         encoder: Arc<DdsTextureEncoder>,
@@ -239,24 +243,27 @@ impl RuntimeBuilder {
             ProviderAdapter,
             EncoderAdapter,
             ExecutorCacheAdapter,
+            NullDdsDiskCache,
             DiskCacheAdapter,
             TokioExecutor,
         >,
     > {
         let provider_adapter = Arc::new(AsyncProviderAdapter::from_arc(async_provider));
         let encoder_adapter = Arc::new(TextureEncoderAdapter::new(encoder));
+        let dds_disk_cache = Arc::new(NullDdsDiskCache);
         let executor = Arc::new(TokioExecutor::new());
 
         Arc::new(DefaultDdsJobFactory::new(
             provider_adapter,
             encoder_adapter,
             cache_adapter,
+            dds_disk_cache,
             disk_cache,
             executor,
         ))
     }
 
-    /// Creates a factory with NullDiskCache.
+    /// Creates a factory with NullDiskCache and NullDdsDiskCache.
     fn create_factory_without_disk_cache(
         async_provider: Arc<AsyncProviderType>,
         encoder: Arc<DdsTextureEncoder>,
@@ -266,12 +273,14 @@ impl RuntimeBuilder {
             ProviderAdapter,
             EncoderAdapter,
             ExecutorCacheAdapter,
+            NullDdsDiskCache,
             NullDiskCache,
             TokioExecutor,
         >,
     > {
         let provider_adapter = Arc::new(AsyncProviderAdapter::from_arc(async_provider));
         let encoder_adapter = Arc::new(TextureEncoderAdapter::new(encoder));
+        let dds_disk_cache = Arc::new(NullDdsDiskCache);
         let disk_cache = Arc::new(NullDiskCache);
         let executor = Arc::new(TokioExecutor::new());
 
@@ -279,6 +288,7 @@ impl RuntimeBuilder {
             provider_adapter,
             encoder_adapter,
             cache_adapter,
+            dds_disk_cache,
             disk_cache,
             executor,
         ))
@@ -310,11 +320,12 @@ impl RuntimeBuilder {
     /// let runtime = RuntimeBuilder::new(provider_name, format, encoder)
     ///     .with_async_provider(provider)
     ///     .with_runtime_handle(handle)
-    ///     .build_with_cache_service(memory_bridge, disk_bridge);
+    ///     .build_with_cache_service(memory_bridge, dds_disk_bridge, disk_bridge);
     /// ```
     pub fn build_with_cache_service(
         self,
         memory_bridge: Arc<MemoryCacheBridge>,
+        dds_disk_bridge: Arc<DdsDiskCacheBridge>,
         disk_bridge: Arc<DiskCacheBridge>,
     ) -> XEarthLayerRuntime {
         let async_provider = self
@@ -324,33 +335,39 @@ impl RuntimeBuilder {
             .runtime_handle
             .expect("RuntimeBuilder: runtime_handle is required");
 
+        let dds_disk_for_daemon = Arc::clone(&dds_disk_bridge);
+
         let factory = Self::create_factory_with_bridges(
             async_provider,
             Arc::clone(&self.encoder),
             Arc::clone(&memory_bridge),
+            dds_disk_bridge,
             disk_bridge,
         );
 
         XEarthLayerRuntime::with_metrics_client(
             factory,
             memory_bridge,
+            dds_disk_for_daemon,
             self.config,
             runtime_handle,
             self.metrics_client,
         )
     }
 
-    /// Creates a factory with bridge adapters from the new cache service.
+    /// Creates a factory with bridge adapters from the cache service.
     fn create_factory_with_bridges(
         async_provider: Arc<AsyncProviderType>,
         encoder: Arc<DdsTextureEncoder>,
         memory_bridge: Arc<MemoryCacheBridge>,
+        dds_disk_bridge: Arc<DdsDiskCacheBridge>,
         disk_bridge: Arc<DiskCacheBridge>,
     ) -> Arc<
         DefaultDdsJobFactory<
             ProviderAdapter,
             EncoderAdapter,
             MemoryCacheBridge,
+            DdsDiskCacheBridge,
             DiskCacheBridge,
             TokioExecutor,
         >,
@@ -363,6 +380,7 @@ impl RuntimeBuilder {
             provider_adapter,
             encoder_adapter,
             memory_bridge,
+            dds_disk_bridge,
             disk_bridge,
             executor,
         ))

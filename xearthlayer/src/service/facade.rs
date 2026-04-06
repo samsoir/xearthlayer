@@ -81,10 +81,10 @@ pub struct XEarthLayerService {
     /// Memory cache bridge from new cache service architecture.
     /// Used by prefetch system when cache bridges are enabled.
     memory_cache_bridge: Option<Arc<MemoryCacheBridge>>,
-    /// GC scheduler daemon handle (when started via `start()`).
-    /// Kept alive for ownership - dropping would stop the scheduler.
-    gc_scheduler_handle: Option<JoinHandle<()>>,
-    /// GC scheduler shutdown token for graceful shutdown.
+    /// GC scheduler daemon handles (chunk + DDS disk).
+    /// Kept alive for ownership - dropping would stop the schedulers.
+    gc_scheduler_handles: Vec<JoinHandle<()>>,
+    /// GC scheduler shutdown token for graceful shutdown (shared by all daemons).
     gc_scheduler_shutdown: Option<CancellationToken>,
     /// GPU pipeline worker handle (when `texture.compressor = gpu`).
     /// Awaited during shutdown to ensure GPU resources are released cleanly.
@@ -160,33 +160,59 @@ impl XEarthLayerService {
         .with_async_provider(Arc::clone(&async_provider))
         .with_runtime_handle(runtime_handle.clone())
         .with_metrics_client(metrics_client)
-        .build_with_cache_service(cache_layer.memory_bridge(), cache_layer.disk_bridge());
+        .build_with_cache_service(
+            cache_layer.memory_bridge(),
+            cache_layer.dds_disk_bridge(),
+            cache_layer.disk_bridge(),
+        );
 
         let dds_client = xel_runtime.dds_client();
 
-        // 7. Create and spawn GC scheduler daemon
-        let (gc_scheduler_handle, gc_scheduler_shutdown) = if let Some(disk_provider) =
-            cache_layer.disk_provider()
-        {
-            let gc_shutdown = CancellationToken::new();
+        // 7. Create and spawn GC scheduler daemons (one per disk tier)
+        let gc_shutdown = CancellationToken::new();
+        let mut gc_scheduler_handles = Vec::new();
+
+        // Chunk disk GC daemon
+        if let Some(chunk_provider) = cache_layer.disk_provider() {
             let job_submitter = xel_runtime.job_submitter();
-            let lru_index = disk_provider.lru_index();
-            let cache_dir = disk_provider.directory().to_path_buf();
-            let max_size = disk_provider.max_size_bytes();
+            let lru_index = chunk_provider.lru_index();
+            let cache_dir = chunk_provider.directory().to_path_buf();
+            let max_size = chunk_provider.max_size_bytes();
+
+            let gc_daemon = GcSchedulerDaemon::new(lru_index, cache_dir, max_size, job_submitter)
+                .with_metrics(gc_metrics_client.clone());
+
+            let gc_shutdown_clone = gc_shutdown.clone();
+            gc_scheduler_handles.push(runtime_handle.spawn(async move {
+                gc_daemon.run(gc_shutdown_clone).await;
+            }));
+
+            tracing::info!("Chunk disk GC scheduler daemon started");
+        }
+
+        // DDS disk GC daemon
+        if let Some(dds_provider) = cache_layer.dds_disk_provider() {
+            let job_submitter = xel_runtime.job_submitter();
+            let lru_index = dds_provider.lru_index();
+            let cache_dir = dds_provider.directory().to_path_buf();
+            let max_size = dds_provider.max_size_bytes();
 
             let gc_daemon = GcSchedulerDaemon::new(lru_index, cache_dir, max_size, job_submitter)
                 .with_metrics(gc_metrics_client);
 
             let gc_shutdown_clone = gc_shutdown.clone();
-            let gc_handle = runtime_handle.spawn(async move {
+            gc_scheduler_handles.push(runtime_handle.spawn(async move {
                 gc_daemon.run(gc_shutdown_clone).await;
-            });
+            }));
 
-            tracing::info!("GC scheduler daemon started");
-            (Some(gc_handle), Some(gc_shutdown))
+            tracing::info!("DDS disk GC scheduler daemon started");
+        }
+
+        let gc_scheduler_shutdown = if gc_scheduler_handles.is_empty() {
+            tracing::warn!("No disk providers available, GC schedulers not started");
+            None
         } else {
-            tracing::warn!("No disk provider available, GC scheduler not started");
-            (None, None)
+            Some(gc_shutdown)
         };
 
         tracing::info!(
@@ -209,7 +235,7 @@ impl XEarthLayerService {
 
             memory_cache_bridge: Some(cache_layer.memory_bridge()),
             cache_layer: Some(cache_layer),
-            gc_scheduler_handle,
+            gc_scheduler_handles,
             gc_scheduler_shutdown,
             gpu_worker_handle,
             gpu_shutdown,
@@ -344,13 +370,13 @@ impl XEarthLayerService {
     /// service.shutdown_cache().await;
     /// ```
     pub async fn shutdown_cache(&mut self) {
-        // Shutdown GC scheduler first (before shutting down cache)
+        // Shutdown GC schedulers first (before shutting down cache)
         if let Some(shutdown_token) = self.gc_scheduler_shutdown.take() {
-            tracing::info!("Shutting down GC scheduler");
+            tracing::info!("Shutting down GC schedulers");
             shutdown_token.cancel();
 
-            // Wait for GC scheduler task to complete
-            if let Some(handle) = self.gc_scheduler_handle.take() {
+            // Wait for all GC scheduler tasks to complete
+            for handle in self.gc_scheduler_handles.drain(..) {
                 match handle.await {
                     Ok(()) => tracing::info!("GC scheduler shut down cleanly"),
                     Err(e) => tracing::warn!(error = %e, "GC scheduler task failed"),

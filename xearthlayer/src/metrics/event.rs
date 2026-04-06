@@ -74,11 +74,18 @@ pub enum MetricEvent {
         bytes_freed: u64,
     },
 
-    /// Update the current disk cache size (absolute value from LRU index).
+    /// Update the current chunk disk cache size (absolute value from LRU index).
     ///
-    /// Emitted after writes and evictions to track the authoritative cache size
-    /// directly, replacing the fragile `initial + written - evicted` formula.
+    /// Emitted by the chunk `DiskCacheProvider` after writes and evictions.
     DiskCacheSizeUpdate {
+        /// Current total size in bytes (from LRU index).
+        bytes: u64,
+    },
+
+    /// Update the current DDS disk cache size (absolute value from LRU index).
+    ///
+    /// Emitted by the DDS `DiskCacheProvider` after writes and evictions.
+    DdsDiskCacheSizeUpdate {
         /// Current total size in bytes (from LRU index).
         bytes: u64,
     },
@@ -184,6 +191,7 @@ impl MetricEvent {
             Self::DiskCacheInitialSize { .. } => "disk_cache_initial_size",
             Self::DiskCacheEvicted { .. } => "disk_cache_evicted",
             Self::DiskCacheSizeUpdate { .. } => "disk_cache_size_update",
+            Self::DdsDiskCacheSizeUpdate { .. } => "dds_disk_cache_size_update",
             Self::MemoryCacheHit { .. } => "memory_cache_hit",
             Self::MemoryCacheMiss { .. } => "memory_cache_miss",
             Self::MemoryCacheSizeUpdate { .. } => "memory_cache_size_update",

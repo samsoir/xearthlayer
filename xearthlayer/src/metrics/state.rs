@@ -152,12 +152,19 @@ pub struct AggregatedState {
     pub initial_disk_cache_bytes: u64,
     /// Total bytes evicted from disk cache by the GC daemon.
     pub disk_bytes_evicted: u64,
-    /// Current disk cache size in bytes (absolute value from LRU index).
+    /// Current chunk disk cache size in bytes (absolute value from LRU index).
     ///
-    /// Updated directly via `DiskCacheSizeUpdate` events from the
-    /// `DiskCacheProvider` after writes and evictions. This is the
-    /// authoritative value, replacing the fragile formula
-    /// `initial + written - evicted`.
+    /// Updated directly via `DiskCacheSizeUpdate` events from the chunk
+    /// `DiskCacheProvider` after writes and evictions.
+    pub chunk_disk_cache_size_bytes: u64,
+    /// Current DDS disk cache size in bytes (absolute value from LRU index).
+    ///
+    /// Updated directly via `DdsDiskCacheSizeUpdate` events from the DDS
+    /// `DiskCacheProvider` after writes and evictions.
+    pub dds_disk_cache_size_bytes: u64,
+    /// Combined disk cache size in bytes (chunk + DDS).
+    ///
+    /// Computed as `chunk_disk_cache_size_bytes + dds_disk_cache_size_bytes`.
     pub disk_cache_size_bytes: u64,
 
     // =========================================================================
@@ -250,6 +257,8 @@ impl AggregatedState {
             disk_write_time_us: 0,
             initial_disk_cache_bytes: 0,
             disk_bytes_evicted: 0,
+            chunk_disk_cache_size_bytes: 0,
+            dds_disk_cache_size_bytes: 0,
             disk_cache_size_bytes: 0,
             memory_cache_hits: 0,
             memory_cache_misses: 0,

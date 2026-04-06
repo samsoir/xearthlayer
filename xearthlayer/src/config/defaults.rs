@@ -16,6 +16,10 @@ use crate::dds::DdsFormat;
 /// Default: check for updates on startup (once per day).
 pub const DEFAULT_UPDATE_CHECK: bool = true;
 
+/// Default fraction of disk cache allocated to DDS tiles (60%).
+/// The remainder (40%) is allocated to raw imagery chunks.
+pub const DEFAULT_DDS_DISK_RATIO: f64 = 0.6;
+
 // =============================================================================
 // CPU helpers
 // =============================================================================
@@ -120,8 +124,12 @@ pub const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 256;
 // Cache defaults
 // =============================================================================
 
-/// Default memory cache size (2GB).
-pub const DEFAULT_MEMORY_CACHE_SIZE: usize = 2 * 1024 * 1024 * 1024;
+/// Default memory cache size (512MB).
+///
+/// With the DDS disk cache tier as the retention layer, the memory cache
+/// serves as a staging buffer for active FUSE reads. 512MB holds ~90
+/// DDS tiles at ZL16, sufficient for the active scenery window.
+pub const DEFAULT_MEMORY_CACHE_SIZE: usize = 512 * 1024 * 1024;
 
 /// Default disk cache size (20GB).
 pub const DEFAULT_DISK_CACHE_SIZE: usize = 20 * 1024 * 1024 * 1024;
@@ -324,6 +332,7 @@ impl Default for ConfigFile {
                 directory: cache_dir,
                 memory_size: DEFAULT_MEMORY_CACHE_SIZE,
                 disk_size: DEFAULT_DISK_CACHE_SIZE,
+                dds_disk_ratio: DEFAULT_DDS_DISK_RATIO,
                 disk_io_profile: DiskIoProfile::Auto,
             },
             texture: TextureSettings {

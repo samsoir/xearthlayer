@@ -83,6 +83,9 @@ memory_size = {}
 ; Disk cache size (default: 20GB) - persistent storage for tiles
 ; Supports: KB, MB, GB suffixes (e.g., 10GB, 20GB, 50GB)
 disk_size = {}
+; Fraction of disk cache allocated to DDS tiles (default: 0.6)
+; Remainder goes to raw imagery chunk cache. Range: 0.0 - 1.0
+dds_disk_ratio = {}
 ; Disk I/O concurrency profile based on storage type (default: auto)
 ;   auto - Auto-detect storage type (recommended)
 ;   hdd  - Spinning disk (conservative: 1-4 concurrent ops)
@@ -298,6 +301,7 @@ congestion_threshold = {}
         path_to_string(&config.cache.directory),
         format_size(config.cache.memory_size),
         format_size(config.cache.disk_size),
+        config.cache.dds_disk_ratio,
         config.cache.disk_io_profile.as_str(),
         config.texture.format.to_string().to_lowercase(),
         config.texture.compressor,

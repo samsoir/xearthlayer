@@ -14,7 +14,8 @@
 
 use crate::coord::TileCoord;
 use crate::executor::{
-    BlockingExecutor, ChunkProvider, DiskCache, DownloadConfig, MemoryCache, TextureEncoderAsync,
+    BlockingExecutor, ChunkProvider, DdsDiskCache, DiskCache, DownloadConfig, MemoryCache,
+    TextureEncoderAsync,
 };
 use crate::executor::{
     ErrorPolicy, Job, JobId, JobResult, JobStatus, Priority, Task, TILE_GENERATION_GROUP,
@@ -42,11 +43,12 @@ use std::sync::Arc;
 ///
 /// Uses `FailFast` - any task failure immediately fails the job.
 /// This is appropriate since a DDS file requires all stages to succeed.
-pub struct DdsGenerateJob<P, E, M, D, X>
+pub struct DdsGenerateJob<P, E, M, DD, D, X>
 where
     P: ChunkProvider,
     E: TextureEncoderAsync,
     M: MemoryCache,
+    DD: DdsDiskCache,
     D: DiskCache,
     X: BlockingExecutor,
 {
@@ -68,6 +70,9 @@ where
     /// Memory cache for storing completed DDS tiles
     memory_cache: Arc<M>,
 
+    /// DDS disk cache for persistent tile storage
+    dds_disk_cache: Arc<DD>,
+
     /// Disk cache for storing individual chunks
     disk_cache: Arc<D>,
 
@@ -78,11 +83,12 @@ where
     download_config: DownloadConfig,
 }
 
-impl<P, E, M, D, X> DdsGenerateJob<P, E, M, D, X>
+impl<P, E, M, DD, D, X> DdsGenerateJob<P, E, M, DD, D, X>
 where
     P: ChunkProvider,
     E: TextureEncoderAsync,
     M: MemoryCache,
+    DD: DdsDiskCache,
     D: DiskCache,
     X: BlockingExecutor,
 {
@@ -95,6 +101,7 @@ where
     /// * `provider` - Chunk provider for downloads
     /// * `encoder` - Texture encoder
     /// * `memory_cache` - Memory cache for tiles
+    /// * `dds_disk_cache` - DDS disk cache for persistent tiles
     /// * `disk_cache` - Disk cache for chunks
     /// * `executor` - Blocking executor
     /// * `download_config` - Download configuration with shared HTTP semaphore
@@ -105,6 +112,7 @@ where
         provider: Arc<P>,
         encoder: Arc<E>,
         memory_cache: Arc<M>,
+        dds_disk_cache: Arc<DD>,
         disk_cache: Arc<D>,
         executor: Arc<X>,
         download_config: DownloadConfig,
@@ -117,32 +125,7 @@ where
             provider,
             encoder,
             memory_cache,
-            disk_cache,
-            executor,
-            download_config,
-        }
-    }
-
-    /// Creates a new DDS generation job with a custom job ID.
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_id(
-        id: JobId,
-        tile: TileCoord,
-        priority: Priority,
-        provider: Arc<P>,
-        encoder: Arc<E>,
-        memory_cache: Arc<M>,
-        disk_cache: Arc<D>,
-        executor: Arc<X>,
-        download_config: DownloadConfig,
-    ) -> Self {
-        Self {
-            id,
-            tile,
-            priority,
-            provider,
-            encoder,
-            memory_cache,
+            dds_disk_cache,
             disk_cache,
             executor,
             download_config,
@@ -155,11 +138,12 @@ where
     }
 }
 
-impl<P, E, M, D, X> Job for DdsGenerateJob<P, E, M, D, X>
+impl<P, E, M, DD, D, X> Job for DdsGenerateJob<P, E, M, DD, D, X>
 where
     P: ChunkProvider,
     E: TextureEncoderAsync,
     M: MemoryCache,
+    DD: DdsDiskCache,
     D: DiskCache,
     X: BlockingExecutor,
 {
@@ -198,6 +182,7 @@ where
                 self.tile,
                 Arc::clone(&self.encoder),
                 Arc::clone(&self.memory_cache),
+                Arc::clone(&self.dds_disk_cache),
                 Arc::clone(&self.executor),
             )),
         ]

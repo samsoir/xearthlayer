@@ -44,8 +44,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::executor::{
-    ChannelDdsClient, DaemonMemoryCache, DdsClient, ExecutorDaemon, ExecutorDaemonConfig,
-    JobSubmitter, MultiplexTelemetrySink, ResourcePools, TelemetrySink, TracingTelemetrySink,
+    ChannelDdsClient, DaemonMemoryCache, DdsClient, DdsDiskCache, ExecutorDaemon,
+    ExecutorDaemonConfig, JobSubmitter, MultiplexTelemetrySink, ResourcePools, TelemetrySink,
+    TracingTelemetrySink,
 };
 use crate::jobs::DdsJobFactory;
 use crate::metrics::MetricsClient;
@@ -125,18 +126,20 @@ impl XEarthLayerRuntime {
     ///
     /// * `F` - DDS job factory type
     /// * `M` - Memory cache type
-    pub fn new<F, M>(
+    pub fn new<F, M, DD>(
         factory: Arc<F>,
         memory_cache: Arc<M>,
+        dds_disk_cache: Arc<DD>,
         config: RuntimeConfig,
         handle: tokio::runtime::Handle,
     ) -> Self
     where
         F: DdsJobFactory + 'static,
         M: DaemonMemoryCache + 'static,
+        DD: DdsDiskCache + 'static,
     {
         // Default to tracing-only telemetry, no metrics
-        Self::with_metrics_client(factory, memory_cache, config, handle, None)
+        Self::with_metrics_client(factory, memory_cache, dds_disk_cache, config, handle, None)
     }
 
     /// Create a new runtime with the event-based metrics client.
@@ -157,9 +160,10 @@ impl XEarthLayerRuntime {
     ///
     /// * `F` - DDS job factory type
     /// * `M` - Memory cache type
-    pub fn with_metrics_client<F, M>(
+    pub fn with_metrics_client<F, M, DD>(
         factory: Arc<F>,
         memory_cache: Arc<M>,
+        dds_disk_cache: Arc<DD>,
         config: RuntimeConfig,
         handle: tokio::runtime::Handle,
         metrics_client: Option<MetricsClient>,
@@ -167,6 +171,7 @@ impl XEarthLayerRuntime {
     where
         F: DdsJobFactory + 'static,
         M: DaemonMemoryCache + 'static,
+        DD: DdsDiskCache + 'static,
     {
         info!("Starting XEarthLayer runtime");
 
@@ -186,6 +191,7 @@ impl XEarthLayerRuntime {
                 config.daemon_config,
                 factory,
                 memory_cache,
+                dds_disk_cache,
                 telemetry,
                 client,
             ),
@@ -193,6 +199,7 @@ impl XEarthLayerRuntime {
                 config.daemon_config,
                 factory,
                 memory_cache,
+                dds_disk_cache,
                 telemetry,
             ),
         };
@@ -321,7 +328,7 @@ impl XEarthLayerRuntime {
 mod tests {
     use super::*;
     use crate::coord::TileCoord;
-    use crate::executor::{Job, JobId, Priority, Task};
+    use crate::executor::{Job, JobId, NullDdsDiskCache, Priority, Task};
     use std::time::Duration;
 
     /// Mock job factory for testing.
@@ -369,6 +376,16 @@ mod tests {
         {
             Box::pin(async { None }) // Always miss for testing
         }
+
+        fn put(
+            &self,
+            _row: u32,
+            _col: u32,
+            _zoom: u8,
+            _data: Vec<u8>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async {}) // No-op for testing
+        }
     }
 
     #[tokio::test]
@@ -379,7 +396,13 @@ mod tests {
         let handle = tokio::runtime::Handle::current();
 
         // Use new() which creates its own coalescer
-        let runtime = XEarthLayerRuntime::new(factory, memory_cache, config, handle);
+        let runtime = XEarthLayerRuntime::new(
+            factory,
+            memory_cache,
+            Arc::new(NullDdsDiskCache),
+            config,
+            handle,
+        );
 
         // Runtime should be running
         assert!(runtime.is_running());
@@ -398,12 +421,24 @@ mod tests {
         let factory1 = Arc::new(MockJobFactory);
         let memory_cache1 = Arc::new(MockMemoryCache);
         let config1 = RuntimeConfig::default();
-        let runtime1 = XEarthLayerRuntime::new(factory1, memory_cache1, config1, handle.clone());
+        let runtime1 = XEarthLayerRuntime::new(
+            factory1,
+            memory_cache1,
+            Arc::new(NullDdsDiskCache),
+            config1,
+            handle.clone(),
+        );
 
         let factory2 = Arc::new(MockJobFactory);
         let memory_cache2 = Arc::new(MockMemoryCache);
         let config2 = RuntimeConfig::default();
-        let runtime2 = XEarthLayerRuntime::new(factory2, memory_cache2, config2, handle);
+        let runtime2 = XEarthLayerRuntime::new(
+            factory2,
+            memory_cache2,
+            Arc::new(NullDdsDiskCache),
+            config2,
+            handle,
+        );
 
         // Both should be running
         assert!(runtime1.is_running());
@@ -421,7 +456,13 @@ mod tests {
         let config = RuntimeConfig::default();
         let handle = tokio::runtime::Handle::current();
 
-        let runtime = XEarthLayerRuntime::new(factory, memory_cache, config, handle);
+        let runtime = XEarthLayerRuntime::new(
+            factory,
+            memory_cache,
+            Arc::new(NullDdsDiskCache),
+            config,
+            handle,
+        );
 
         // Client should be connected initially
         let client = runtime.dds_client();

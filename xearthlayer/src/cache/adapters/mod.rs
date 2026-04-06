@@ -29,8 +29,10 @@
 //! └───────────────────────────────────────────────────────┘
 //! ```
 
+mod dds_disk_bridge;
 mod disk_bridge;
 mod memory_bridge;
 
+pub use dds_disk_bridge::DdsDiskCacheBridge;
 pub use disk_bridge::DiskCacheBridge;
 pub use memory_bridge::MemoryCacheBridge;

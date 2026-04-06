@@ -18,7 +18,7 @@ mod memory_cache;
 mod provider;
 mod texture_encoder;
 
-pub use disk_cache::{DiskCacheAdapter, NullDiskCache};
+pub use disk_cache::{DiskCacheAdapter, NullDdsDiskCache, NullDiskCache};
 pub use memory_cache::MemoryCacheAdapter;
 pub use provider::{AsyncProviderAdapter, ProviderAdapter};
 pub use texture_encoder::TextureEncoderAdapter;
