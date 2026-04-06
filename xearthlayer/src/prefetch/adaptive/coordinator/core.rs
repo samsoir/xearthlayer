@@ -466,24 +466,37 @@ impl AdaptivePrefetchCoordinator {
             FlightPhase::Cruise => {
                 let (lat, lon) = position;
 
+                // Compute speed-proportional box extent for this cycle.
+                let extent = crate::prefetch::adaptive::compute_extent(
+                    ground_speed_kt,
+                    self.config.box_min_speed,
+                    self.config.box_max_speed,
+                    self.config.box_min_extent,
+                    self.config.box_extent, // max extent
+                );
+                self.status.box_extent = extent;
+
                 // Update retained region tracking from prefetch box bounds.
                 // This must cover the full prefetch box + buffer so that
                 // evict_non_retained() doesn't remove regions we just prefetched.
                 if let Some(ref geo_index) = self.geo_index {
-                    self.prefetch_box.update_retention(
+                    self.prefetch_box.update_retention_with_extent(
                         lat,
                         lon,
                         track,
                         self.config.window_buffer as i32,
                         geo_index,
+                        extent,
                     );
                 }
 
                 // Compute sliding prefetch box regions
                 let new_regions = if let Some(ref geo_index) = self.geo_index {
-                    self.prefetch_box.new_regions(lat, lon, track, geo_index)
+                    self.prefetch_box
+                        .new_regions_with_extent(lat, lon, track, geo_index, extent)
                 } else {
-                    self.prefetch_box.regions(lat, lon, track)
+                    self.prefetch_box
+                        .regions_with_extent(lat, lon, track, extent)
                 };
 
                 if new_regions.is_empty() {
@@ -497,11 +510,14 @@ impl AdaptivePrefetchCoordinator {
                 }
 
                 // Log the box bounds for debugging
-                let (box_lat_min, box_lat_max, box_lon_min, box_lon_max) =
-                    self.prefetch_box.bounds(lat, lon, track);
+                let (box_lat_min, box_lat_max, box_lon_min, box_lon_max) = self
+                    .prefetch_box
+                    .bounds_with_extent(lat, lon, track, extent);
                 tracing::debug!(
-                    aircraft = format!("{:.4}°, {:.4}°", lat, lon),
-                    track = format!("{:.1}°", track),
+                    aircraft = format!("{:.4}, {:.4}", lat, lon),
+                    track = format!("{:.1}", track),
+                    ground_speed_kt = format!("{:.0}", ground_speed_kt),
+                    extent = format!("{:.2}", extent),
                     box_bounds = format!(
                         "[{:.1}:{:.1}N, {:.1}:{:.1}E]",
                         box_lat_min, box_lat_max, box_lon_min, box_lon_max
@@ -1023,6 +1039,45 @@ mod tests {
             coord.status.phase == FlightPhase::Ground
                 || coord.status.phase == FlightPhase::Transition
                 || coord.status.phase == FlightPhase::Cruise
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Speed-proportional extent tests (#125)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cruise_extent_scales_with_ground_speed() {
+        let cal = test_calibration();
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults().with_calibration(cal);
+
+        // Fast-forward phase detector into Cruise using short hysteresis + takeoff timeout.
+        coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
+        coord.phase_detector.takeoff_timeout = std::time::Duration::from_millis(1);
+
+        // Prime into Cruise at low speed (just above ground threshold: default 40 kt)
+        coord.update((47.0, 8.0), 0.0, 50.0, 10000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        coord.update((47.0, 8.0), 0.0, 50.0, 10000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let _ = coord.update((47.0, 8.0), 0.0, 50.0, 10000.0);
+
+        assert_eq!(
+            coord.status.phase,
+            FlightPhase::Cruise,
+            "Should be in Cruise phase"
+        );
+        let low_extent = coord.status.box_extent;
+
+        // Now update at high speed
+        let _ = coord.update((47.0, 8.0), 0.0, 400.0, 35000.0);
+        let high_extent = coord.status.box_extent;
+
+        assert!(
+            high_extent > low_extent,
+            "High speed extent ({}) should be larger than low speed extent ({})",
+            high_extent,
+            low_extent
         );
     }
 
