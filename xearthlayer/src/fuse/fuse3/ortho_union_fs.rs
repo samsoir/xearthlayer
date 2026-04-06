@@ -510,11 +510,10 @@ impl Filesystem for Fuse3OrthoUnionFS {
             fuse_congestion_threshold = ?self.fuse_congestion_threshold,
             "fuse3 ortho union: init"
         );
-        Ok(ReplyInit {
-            max_write: NonZeroU32::new(1024 * 1024).unwrap(),
-            max_background: self.fuse_max_background,
-            congestion_threshold: self.fuse_congestion_threshold,
-        })
+        let mut reply = ReplyInit::new(NonZeroU32::new(1024 * 1024).unwrap());
+        reply.max_background = self.fuse_max_background;
+        reply.congestion_threshold = self.fuse_congestion_threshold;
+        Ok(reply)
     }
 
     async fn destroy(&self, _req: Request) {

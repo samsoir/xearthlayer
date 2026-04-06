@@ -252,11 +252,7 @@ impl Filesystem for Fuse3UnionFS {
             patches = self.index.patch_names().len(),
             "fuse3 union: init"
         );
-        Ok(ReplyInit {
-            max_write: NonZeroU32::new(1024 * 1024).unwrap(),
-            max_background: None,
-            congestion_threshold: None,
-        })
+        Ok(ReplyInit::new(NonZeroU32::new(1024 * 1024).unwrap()))
     }
 
     async fn destroy(&self, _req: Request) {

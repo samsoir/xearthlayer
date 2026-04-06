@@ -243,11 +243,9 @@ impl Filesystem for Fuse3PassthroughFS {
     /// Initialize filesystem.
     async fn init(&self, _req: Request) -> Fuse3InternalResult<ReplyInit> {
         debug!("fuse3: init");
-        Ok(ReplyInit {
-            max_write: NonZeroU32::new(1024 * 1024).unwrap(), // 1MB max write
-            max_background: None,
-            congestion_threshold: None,
-        })
+        Ok(ReplyInit::new(
+            NonZeroU32::new(1024 * 1024).unwrap(), // 1MB max write
+        ))
     }
 
     /// Cleanup filesystem.
