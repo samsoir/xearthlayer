@@ -59,7 +59,119 @@ impl PrefetchBox {
 
     /// Compute all DSF regions within the heading-biased box.
     pub fn regions(&self, lat: f64, lon: f64, track: f64) -> Vec<DsfRegion> {
-        let (lat_min, lat_max, lon_min, lon_max) = self.bounds(lat, lon, track);
+        self.regions_with_extent(lat, lon, track, self.extent)
+    }
+
+    /// Compute DSF regions in the box that are NOT already tracked in GeoIndex.
+    ///
+    /// Filters out regions with any `PrefetchedRegion` state (InProgress,
+    /// Prefetched, or NoCoverage).
+    pub fn new_regions(
+        &self,
+        lat: f64,
+        lon: f64,
+        track: f64,
+        geo_index: &GeoIndex,
+    ) -> Vec<DsfRegion> {
+        self.new_regions_with_extent(lat, lon, track, geo_index, self.extent)
+    }
+
+    /// Update retained regions in GeoIndex based on the prefetch box bounds.
+    ///
+    /// All DSF regions within the box (+ buffer) are marked as retained.
+    /// Regions outside are evicted. This ensures the retention area covers
+    /// the full prefetch box, preventing `evict_non_retained()` from removing
+    /// regions that were just prefetched.
+    pub fn update_retention(
+        &self,
+        lat: f64,
+        lon: f64,
+        track: f64,
+        buffer: i32,
+        geo_index: &GeoIndex,
+    ) {
+        self.update_retention_with_extent(lat, lon, track, buffer, geo_index, self.extent);
+    }
+
+    /// Compute the geographic bounds of the box.
+    ///
+    /// Returns `(lat_min, lat_max, lon_min, lon_max)`.
+    ///
+    /// The bias slides proportionally with heading:
+    /// - `forward_fraction = 0.5 + (max_bias - 0.5) × |component|`
+    /// - At cardinal headings: primary axis 80/20, perpendicular 50/50
+    /// - At diagonals: both axes ~71/29
+    /// - Total extent per axis is always constant
+    pub fn bounds(&self, lat: f64, lon: f64, track: f64) -> (f64, f64, f64, f64) {
+        self.bounds_with_extent(lat, lon, track, self.extent)
+    }
+
+    /// Compute the geographic bounds of the box with a custom extent override.
+    ///
+    /// Returns `(lat_min, lat_max, lon_min, lon_max)`.
+    ///
+    /// Identical to `bounds()` but accepts an explicit `extent` parameter
+    /// instead of using `self.extent`. Allows the coordinator to pass a
+    /// speed-proportional extent each cycle without mutating the box.
+    pub fn bounds_with_extent(
+        &self,
+        lat: f64,
+        lon: f64,
+        track: f64,
+        extent: f64,
+    ) -> (f64, f64, f64, f64) {
+        let track_rad = track.to_radians();
+        let lat_component = track_rad.cos(); // positive = north
+        let lon_component = track_rad.sin(); // positive = east
+
+        // Proportional forward fraction: 0.5 (symmetric) to max_bias (fully biased)
+        let lat_fwd_frac = 0.5 + (self.max_bias - 0.5) * lat_component.abs();
+        let lon_fwd_frac = 0.5 + (self.max_bias - 0.5) * lon_component.abs();
+
+        // Apply direction: forward fraction goes in the direction of travel
+        let (lat_min, lat_max) = if lat_component >= 0.0 {
+            // Moving north (or due east/west): bias north
+            (
+                lat - extent * (1.0 - lat_fwd_frac),
+                lat + extent * lat_fwd_frac,
+            )
+        } else {
+            // Moving south: bias south
+            (
+                lat - extent * lat_fwd_frac,
+                lat + extent * (1.0 - lat_fwd_frac),
+            )
+        };
+
+        let (lon_min, lon_max) = if lon_component >= 0.0 {
+            // Moving east (or due north/south): bias east
+            (
+                lon - extent * (1.0 - lon_fwd_frac),
+                lon + extent * lon_fwd_frac,
+            )
+        } else {
+            // Moving west: bias west
+            (
+                lon - extent * lon_fwd_frac,
+                lon + extent * (1.0 - lon_fwd_frac),
+            )
+        };
+
+        (lat_min, lat_max, lon_min, lon_max)
+    }
+
+    /// Compute all DSF regions within the heading-biased box with a custom extent override.
+    ///
+    /// Identical to `regions()` but accepts an explicit `extent` parameter
+    /// instead of using `self.extent`.
+    pub fn regions_with_extent(
+        &self,
+        lat: f64,
+        lon: f64,
+        track: f64,
+        extent: f64,
+    ) -> Vec<DsfRegion> {
+        let (lat_min, lat_max, lon_min, lon_max) = self.bounds_with_extent(lat, lon, track, extent);
 
         let dsf_lat_min = lat_min.floor() as i32;
         let dsf_lat_max = (lat_max - 1e-9).floor() as i32;
@@ -79,38 +191,38 @@ impl PrefetchBox {
         result
     }
 
-    /// Compute DSF regions in the box that are NOT already tracked in GeoIndex.
+    /// Compute DSF regions in the box with a custom extent that are NOT already tracked in GeoIndex.
     ///
-    /// Filters out regions with any `PrefetchedRegion` state (InProgress,
-    /// Prefetched, or NoCoverage).
-    pub fn new_regions(
+    /// Identical to `new_regions()` but accepts an explicit `extent` parameter
+    /// instead of using `self.extent`.
+    pub fn new_regions_with_extent(
         &self,
         lat: f64,
         lon: f64,
         track: f64,
         geo_index: &GeoIndex,
+        extent: f64,
     ) -> Vec<DsfRegion> {
-        self.regions(lat, lon, track)
+        self.regions_with_extent(lat, lon, track, extent)
             .into_iter()
             .filter(|r| PrefetchedRegion::should_prefetch(geo_index, r))
             .collect()
     }
 
-    /// Update retained regions in GeoIndex based on the prefetch box bounds.
+    /// Update retained regions in GeoIndex based on the prefetch box bounds with a custom extent.
     ///
-    /// All DSF regions within the box (+ buffer) are marked as retained.
-    /// Regions outside are evicted. This ensures the retention area covers
-    /// the full prefetch box, preventing `evict_non_retained()` from removing
-    /// regions that were just prefetched.
-    pub fn update_retention(
+    /// Identical to `update_retention()` but accepts an explicit `extent` parameter
+    /// instead of using `self.extent`.
+    pub fn update_retention_with_extent(
         &self,
         lat: f64,
         lon: f64,
         track: f64,
         buffer: i32,
         geo_index: &GeoIndex,
+        extent: f64,
     ) {
-        let (lat_min, lat_max, lon_min, lon_max) = self.bounds(lat, lon, track);
+        let (lat_min, lat_max, lon_min, lon_max) = self.bounds_with_extent(lat, lon, track, extent);
 
         let dsf_lat_min = lat_min.floor() as i32 - buffer;
         let dsf_lat_max = (lat_max - 1e-9).floor() as i32 + buffer;
@@ -144,56 +256,6 @@ impl PrefetchBox {
                 geo_index.remove::<RetainedRegion>(&region);
             }
         }
-    }
-
-    /// Compute the geographic bounds of the box.
-    ///
-    /// Returns `(lat_min, lat_max, lon_min, lon_max)`.
-    ///
-    /// The bias slides proportionally with heading:
-    /// - `forward_fraction = 0.5 + (max_bias - 0.5) × |component|`
-    /// - At cardinal headings: primary axis 80/20, perpendicular 50/50
-    /// - At diagonals: both axes ~71/29
-    /// - Total extent per axis is always constant
-    pub fn bounds(&self, lat: f64, lon: f64, track: f64) -> (f64, f64, f64, f64) {
-        let track_rad = track.to_radians();
-        let lat_component = track_rad.cos(); // positive = north
-        let lon_component = track_rad.sin(); // positive = east
-
-        // Proportional forward fraction: 0.5 (symmetric) to max_bias (fully biased)
-        let lat_fwd_frac = 0.5 + (self.max_bias - 0.5) * lat_component.abs();
-        let lon_fwd_frac = 0.5 + (self.max_bias - 0.5) * lon_component.abs();
-
-        // Apply direction: forward fraction goes in the direction of travel
-        let (lat_min, lat_max) = if lat_component >= 0.0 {
-            // Moving north (or due east/west): bias north
-            (
-                lat - self.extent * (1.0 - lat_fwd_frac),
-                lat + self.extent * lat_fwd_frac,
-            )
-        } else {
-            // Moving south: bias south
-            (
-                lat - self.extent * lat_fwd_frac,
-                lat + self.extent * (1.0 - lat_fwd_frac),
-            )
-        };
-
-        let (lon_min, lon_max) = if lon_component >= 0.0 {
-            // Moving east (or due north/south): bias east
-            (
-                lon - self.extent * (1.0 - lon_fwd_frac),
-                lon + self.extent * lon_fwd_frac,
-            )
-        } else {
-            // Moving west: bias west
-            (
-                lon - self.extent * lon_fwd_frac,
-                lon + self.extent * (1.0 - lon_fwd_frac),
-            )
-        };
-
-        (lat_min, lat_max, lon_min, lon_max)
     }
 }
 
@@ -467,6 +529,194 @@ mod tests {
         assert!(
             geo_index.contains::<PrefetchedRegion>(&region),
             "InProgress region should survive eviction when retention covers the box"
+        );
+    }
+
+    // ─── bounds_with_extent ──────────────────────────────────────────────
+
+    #[test]
+    fn test_bounds_with_custom_extent() {
+        let pbox = PrefetchBox::new(6.5, 0.8);
+        // Call with override extent of 3.5 (min extent at low speed)
+        let (lat_min, lat_max, _, _) = pbox.bounds_with_extent(47.0, 8.0, 0.0, 3.5);
+        let lat_range = lat_max - lat_min;
+        assert!(
+            (lat_range - 3.5).abs() < 1e-6,
+            "Total extent should be 3.5, got {}",
+            lat_range
+        );
+    }
+
+    #[test]
+    fn test_bounds_with_extent_lon_axis() {
+        let pbox = PrefetchBox::new(6.5, 0.8);
+        // Due east: lon axis gets full bias, lat axis symmetric
+        let (lat_min, lat_max, lon_min, lon_max) = pbox.bounds_with_extent(47.0, 8.0, 90.0, 4.0);
+        let lat_range = lat_max - lat_min;
+        let lon_range = lon_max - lon_min;
+        assert!(
+            (lat_range - 4.0).abs() < 1e-6,
+            "Lat extent should be 4.0, got {}",
+            lat_range
+        );
+        assert!(
+            (lon_range - 4.0).abs() < 1e-6,
+            "Lon extent should be 4.0, got {}",
+            lon_range
+        );
+    }
+
+    #[test]
+    fn test_bounds_delegates_to_bounds_with_extent() {
+        let pbox = PrefetchBox::new(6.5, 0.8);
+        let original = pbox.bounds(47.0, 8.0, 90.0);
+        let parameterised = pbox.bounds_with_extent(47.0, 8.0, 90.0, 6.5);
+        assert_eq!(original, parameterised);
+    }
+
+    // ─── regions_with_extent ─────────────────────────────────────────────
+
+    #[test]
+    fn test_regions_with_extent_smaller_than_default() {
+        let pbox = PrefetchBox::new(6.5, 0.8);
+        // A 2° extent should yield far fewer regions than the default
+        let small = pbox.regions_with_extent(48.0, 15.0, 0.0, 2.0);
+        let full = pbox.regions(48.0, 15.0, 0.0);
+        assert!(
+            small.len() < full.len(),
+            "Smaller extent should yield fewer regions ({} vs {})",
+            small.len(),
+            full.len()
+        );
+        // 2° extent spans at most a 3×3 = 9 region grid
+        assert!(
+            small.len() <= 9,
+            "2° extent should cover at most 9 regions, got {}",
+            small.len()
+        );
+    }
+
+    #[test]
+    fn test_regions_delegates_to_regions_with_extent() {
+        let pbox = PrefetchBox::new(6.5, 0.8);
+        let via_original = pbox.regions(48.0, 15.0, 45.0);
+        let via_parameterised = pbox.regions_with_extent(48.0, 15.0, 45.0, 6.5);
+        assert_eq!(
+            via_original, via_parameterised,
+            "regions() and regions_with_extent(self.extent) must return identical results"
+        );
+    }
+
+    // ─── new_regions_with_extent ──────────────────────────────────────────
+
+    #[test]
+    fn test_new_regions_with_extent_filters_tracked() {
+        use crate::geo_index::GeoIndex;
+
+        let pbox = PrefetchBox::new(6.5, 0.8);
+        let geo_index = GeoIndex::new();
+
+        // Pre-track a region that falls inside a 2° box heading east from (48, 15)
+        let tracked = DsfRegion::new(48, 15);
+        geo_index.insert::<PrefetchedRegion>(tracked, PrefetchedRegion::in_progress());
+
+        let new = pbox.new_regions_with_extent(48.0, 15.0, 90.0, &geo_index, 2.0);
+
+        assert!(
+            !new.contains(&tracked),
+            "new_regions_with_extent should exclude already-tracked region"
+        );
+    }
+
+    #[test]
+    fn test_new_regions_delegates_to_new_regions_with_extent() {
+        use crate::geo_index::GeoIndex;
+
+        let pbox = PrefetchBox::new(6.5, 0.8);
+        let geo_index = GeoIndex::new();
+
+        let via_original = pbox.new_regions(48.0, 15.0, 270.0, &geo_index);
+        let via_parameterised = pbox.new_regions_with_extent(48.0, 15.0, 270.0, &geo_index, 6.5);
+        assert_eq!(
+            via_original, via_parameterised,
+            "new_regions() and new_regions_with_extent(self.extent) must return identical results"
+        );
+    }
+
+    // ─── update_retention_with_extent ────────────────────────────────────
+
+    #[test]
+    fn test_update_retention_with_extent_marks_regions_in_custom_box() {
+        use crate::geo_index::GeoIndex;
+
+        let pbox = PrefetchBox::new(6.5, 0.8);
+        let geo_index = GeoIndex::new();
+
+        // Use a small 2° box heading north from (48, 15)
+        pbox.update_retention_with_extent(48.0, 15.0, 0.0, 0, &geo_index, 2.0);
+
+        // All regions inside the 2° box must be retained
+        let box_regions = pbox.regions_with_extent(48.0, 15.0, 0.0, 2.0);
+        for region in &box_regions {
+            assert!(
+                geo_index.contains::<RetainedRegion>(region),
+                "Region ({}, {}) inside 2° box should be retained",
+                region.lat,
+                region.lon
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_retention_with_extent_evicts_outside_custom_box() {
+        use crate::geo_index::GeoIndex;
+
+        let pbox = PrefetchBox::new(6.5, 0.8);
+        let geo_index = GeoIndex::new();
+
+        // First mark a wide area as retained using the default extent
+        pbox.update_retention(48.0, 15.0, 0.0, 0, &geo_index);
+        let wide_region_count = geo_index.regions::<RetainedRegion>().len();
+
+        // Now shrink to a 2° box — should evict the outer regions
+        pbox.update_retention_with_extent(48.0, 15.0, 0.0, 0, &geo_index, 2.0);
+        let narrow_region_count = geo_index.regions::<RetainedRegion>().len();
+
+        assert!(
+            narrow_region_count < wide_region_count,
+            "Shrinking extent should evict outer retained regions ({} → {})",
+            wide_region_count,
+            narrow_region_count
+        );
+    }
+
+    #[test]
+    fn test_update_retention_delegates_to_update_retention_with_extent() {
+        use crate::geo_index::GeoIndex;
+
+        let pbox = PrefetchBox::new(6.5, 0.8);
+
+        // Both paths applied to separate GeoIndex instances should yield the same retained set
+        let geo_a = GeoIndex::new();
+        let geo_b = GeoIndex::new();
+
+        pbox.update_retention(48.0, 15.0, 135.0, 1, &geo_a);
+        pbox.update_retention_with_extent(48.0, 15.0, 135.0, 1, &geo_b, 6.5);
+
+        let regions_a = {
+            let mut v = geo_a.regions::<RetainedRegion>();
+            v.sort_by_key(|r| (r.lat, r.lon));
+            v
+        };
+        let regions_b = {
+            let mut v = geo_b.regions::<RetainedRegion>();
+            v.sort_by_key(|r| (r.lat, r.lon));
+            v
+        };
+
+        assert_eq!(
+            regions_a, regions_b,
+            "update_retention() and update_retention_with_extent(self.extent) must retain identical regions"
         );
     }
 
