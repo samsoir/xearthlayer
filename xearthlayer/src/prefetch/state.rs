@@ -213,6 +213,16 @@ impl SharedPrefetchStatus {
         }
     }
 
+    /// Update the current prefetch box extent.
+    ///
+    /// Called by the coordinator after each cruise-phase cycle with the
+    /// speed-proportional extent so the debug map can render it accurately.
+    pub fn update_box_extent(&self, extent: f64) {
+        if let Ok(mut inner) = self.inner.write() {
+            inner.box_extent = extent;
+        }
+    }
+
     /// Get a snapshot of the current status.
     pub fn snapshot(&self) -> PrefetchStatusSnapshot {
         self.inner.read().map(|r| r.clone()).unwrap_or_default()
@@ -232,6 +242,8 @@ pub struct PrefetchStatusSnapshot {
     pub prefetch_mode: PrefetchMode,
     /// Detailed prefetch statistics for dashboard display.
     pub detailed_stats: Option<DetailedPrefetchStats>,
+    /// Current prefetch box extent in degrees (speed-proportional; 0.0 when unknown).
+    pub box_extent: f64,
 }
 
 /// Aircraft state snapshot for display (without Instant which can't be cloned easily).
