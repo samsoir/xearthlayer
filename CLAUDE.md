@@ -121,17 +121,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 11. **Predictive Tile Caching** (`xearthlayer/src/prefetch/`)
     - `AdaptivePrefetchCoordinator` - Self-calibrating prefetch with flight phase detection
     - `GroundStrategy` - Ring-based prefetching for ground operations (GS < 40kt)
-    - `PrefetchBox` - Heading-biased sliding box (6.5° extent, proportional 80/20 bias, cruise phase)
+    - `PrefetchBox` - Heading-biased sliding box (speed-proportional extent, proportional 80/20 bias, cruise phase)
+    - `ExtentCalculator` - Speed-proportional box extent: clamped linear ramp 3.5° at 40kt to 6.5° at 450kt
     - `SceneryWindow` - Window config and dimensions holder
     - `BoundaryStrategy` - Region lifecycle management (InProgress/Prefetched/NoCoverage)
-    - `PhaseDetector` - Ground/Cruise flight phase state machine
+    - `PhaseDetector` - Ground/Cruise flight phase state machine; reset via `on_ground` from AircraftState on telemetry resume
     - `PerformanceCalibrator` - Measures throughput during initial load for mode selection
     - `SimState` - Direct sim state detection via X-Plane Web API (paused, on_ground, scenery_loading, replay)
     - `TransitionThrottle` - Grace period + ramp-up after Ground-to-Cruise transition
+    - `LoopState` - Per-cycle runner state including `telemetry_paused` flag for stale telemetry safe mode
     - Submits jobs to shared job executor daemon via `DdsClient` trait
     - Mode selection: Aggressive (>30 tiles/sec), Opportunistic (10-30), or Disabled
     - **Four-tier filtering**: Local tracking → Memory cache → Patched region exclusion (via `GeoIndex`) → Disk existence (via `OrthoUnionIndex`)
     - **Two-phase region commit**: Regions marked `InProgress` in GeoIndex during prefetch, promoted to `Prefetched` on completion
+    - **Stale telemetry safe mode**: pauses tile submissions when telemetry stale >5s; on resume, reads `on_ground` from AircraftState to reset PhaseDetector before next cycle
     - See `docs/dev/adaptive-prefetch-design.md` for design details
 
 12. **Aircraft Position & Telemetry** (`xearthlayer/src/aircraft_position/`)
@@ -142,6 +145,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `FlightPathHistory` - Position history for track derivation
     - Position sources: Web API (10m), ManualReference (100m), SceneInference (100km)
     - Higher accuracy wins; stale high-accuracy can be beaten by fresh lower-accuracy
+    - `AircraftState` includes `on_ground: bool` propagated from SimState → WebApiAdapter → aircraft_position → prefetch
 
 13. **Ortho Union Index** (`xearthlayer/src/ortho_union/`)
     - `OrthoUnionIndex` - Merged index of all ortho sources (patches + packages)
