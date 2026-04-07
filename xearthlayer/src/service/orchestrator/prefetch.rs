@@ -82,6 +82,7 @@ impl ServiceOrchestrator {
                                     apt_state.heading,
                                     apt_state.ground_speed,
                                     apt_state.altitude,
+                                    apt_state.on_ground,
                                 );
                                 if state_tx.send(prefetch_state).await.is_err() {
                                     tracing::debug!("Prefetch channel closed");

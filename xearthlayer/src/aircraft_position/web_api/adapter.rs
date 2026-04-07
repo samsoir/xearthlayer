@@ -183,6 +183,11 @@ impl WebApiAdapter {
 
         // Build position from accumulated values
         if let Some(state) = parse_position(accumulated) {
+            // Apply on_ground from SimState before sending.
+            // SimState is updated after this block, so the first message will have
+            // on_ground: false. The correct value propagates within 100ms (10Hz updates).
+            let on_ground = self.sim_state.read().is_ok_and(|s| s.on_ground);
+            let state = state.with_on_ground(on_ground);
             if self.position_tx.send(state).await.is_err() {
                 debug!("Position channel closed");
             }
@@ -316,6 +321,49 @@ mod tests {
             .try_recv()
             .expect("Should have position after accumulation");
         assert!((state.latitude - 48.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn test_process_message_propagates_on_ground_from_sim_state() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let sim_state = super::super::shared_sim_state();
+
+        // Pre-seed the sim_state with on_ground = true
+        {
+            let mut s = sim_state.write().unwrap();
+            s.on_ground = true;
+        }
+
+        let config = WebApiConfig::default();
+        let adapter = WebApiAdapter::new(config, tx, Arc::clone(&sim_state));
+
+        let id_to_name: IdToNameMap = HashMap::from([
+            (100, datarefs::LATITUDE.to_string()),
+            (200, datarefs::LONGITUDE.to_string()),
+            (300, datarefs::TRUE_HEADING.to_string()),
+            (400, datarefs::GROUND_SPEED.to_string()),
+            (500, datarefs::ELEVATION.to_string()),
+            (600, datarefs::TRACK.to_string()),
+        ]);
+
+        let msg = serde_json::json!({
+            "type": "dataref_update_values",
+            "data": {
+                "100": 48.116, "200": 16.566, "300": 205.6,
+                "400": 100.0, "500": 10000.0, "600": 210.0
+            }
+        });
+
+        let mut accumulated = HashMap::new();
+        adapter
+            .process_message(&msg.to_string(), &id_to_name, &mut accumulated)
+            .await;
+
+        let state = rx.try_recv().expect("Should receive position update");
+        assert!(
+            state.on_ground,
+            "on_ground should be propagated from SimState"
+        );
     }
 
     #[tokio::test]

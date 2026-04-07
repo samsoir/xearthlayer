@@ -644,6 +644,17 @@ where
                 "DDS disk cache hit — serving without re-encode"
             );
 
+            #[cfg(feature = "debug-map")]
+            record_debug_tile_activity(
+                tile_lat,
+                tile_lon,
+                tile.row,
+                tile.col,
+                tile.zoom,
+                origin.is_fuse(),
+                crate::debug_map::activity::TileCacheResult::CacheHit,
+            );
+
             // Promote back to memory cache (fire-and-forget)
             let cache = Arc::clone(memory_cache);
             let data_for_promote = data.clone();

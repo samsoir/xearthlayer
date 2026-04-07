@@ -74,6 +74,7 @@ mod boundary_strategy;
 mod calibration;
 mod config;
 mod coordinator;
+pub mod extent;
 mod ground_strategy;
 mod phase_detector;
 mod prefetch_box;
@@ -90,6 +91,7 @@ pub use calibration::{
 };
 pub use config::{AdaptivePrefetchConfig, CalibrationConfig, KillswitchMode, PrefetchMode};
 pub use coordinator::{AdaptivePrefetchCoordinator, CoordinatorStatus};
+pub use extent::compute_extent;
 pub use ground_strategy::{GroundStrategy, LoadedAreaBounds};
 pub use phase_detector::{FlightPhase, PhaseDetector};
 pub use prefetch_box::PrefetchBox;

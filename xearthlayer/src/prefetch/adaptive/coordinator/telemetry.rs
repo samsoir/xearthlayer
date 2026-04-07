@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn test_extract_track() {
-        let state = AircraftState::new(53.5, 9.5, 90.0, 250.0, 35000.0);
+        let state = AircraftState::new(53.5, 9.5, 90.0, 250.0, 35000.0, false);
 
         let track = extract_track(&state);
 
@@ -78,13 +78,13 @@ mod tests {
 
     #[test]
     fn test_extract_track_north() {
-        let state = AircraftState::new(53.5, 9.5, 0.0, 250.0, 35000.0);
+        let state = AircraftState::new(53.5, 9.5, 0.0, 250.0, 35000.0, false);
         assert!((extract_track(&state) - 0.0).abs() < 0.001);
     }
 
     #[test]
     fn test_extract_track_south() {
-        let state = AircraftState::new(53.5, 9.5, 180.0, 250.0, 35000.0);
+        let state = AircraftState::new(53.5, 9.5, 180.0, 250.0, 35000.0, false);
         assert!((extract_track(&state) - 180.0).abs() < 0.001);
     }
 

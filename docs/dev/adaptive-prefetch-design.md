@@ -323,11 +323,32 @@ Aircraft --------3°-------------> Prefetch box edge
                                   Covered
 ```
 
+#### Speed-Proportional Box Extent
+
+The box extent scales linearly with ground speed via `ExtentCalculator::compute_extent()`:
+
+```
+t = clamp((ground_speed_kt - 40.0) / (450.0 - 40.0), 0.0, 1.0)
+extent = 3.5 + t * 3.0   // degrees
+```
+
+| Ground Speed | Extent |
+|-------------|--------|
+| ≤ 40 kt (ground) | 3.5° |
+| 140 kt (approach) | ~4.2° |
+| 250 kt (climb/descent) | ~5.3° |
+| 450 kt (cruise) | 6.5° |
+| > 450 kt (supersonic) | 6.5° (clamped) |
+
+**Rationale:** At approach speeds (~140 kt), the original fixed 6.5° extent prefetched tiles 25+ minutes ahead of the aircraft, wasting resources and contributing to swap-in storms when those tiles eventually entered memory. Scaling extent to speed ensures prefetch depth stays proportional to how far ahead the aircraft will travel in the next few minutes.
+
+The coordinator computes extent each cycle from live ground speed and passes it to `PrefetchBox` via the `_with_extent` factory methods. `PrefetchBox` itself remains a pure geometry calculator — extent is an input parameter, not internal state.
+
 #### Box Shape and Proportional Heading Bias
 
 The box is a rectangle in lat/lon space with **proportional heading bias**:
 
-- **Total extent:** 9° per axis (configurable, min 7°). Covers X-Plane's observed 6x6 DSF loading area with 1.5° overlap.
+- **Total extent:** Speed-proportional (3.5°-6.5°, see above). Covers X-Plane's observed loading area with overlap scaled to approach speed.
 - **Proportional bias formula:** `forward_fraction = 0.5 + (max_bias - 0.5) * |component|`
   - At cardinal headings: primary axis gets 80/20 (at `max_bias=0.8`), perpendicular axes get 50/50
   - At diagonals: both axes share ~71/29
@@ -875,9 +896,33 @@ Response:
 
 Orbiting or circling: aircraft doesn't approach any edge → monitors don't trigger → idle. This is correct — no prefetch needed, the area is already covered.
 
-### Loss of Telemetry
+### Stale Telemetry Safe Mode
 
-Existing staleness check (10s threshold). Monitors hold last known state. No special handling.
+When position telemetry goes stale (no update for **5 seconds**), the prefetch runner enters **safe mode**:
+
+1. The `LoopState.telemetry_paused` flag is set to `true`
+2. Tile submissions are paused — the coordinator loop skips prefetch evaluation
+3. In-progress regions remain `InProgress` in GeoIndex (not evicted)
+
+**On telemetry resume** (next position update arrives):
+
+1. `telemetry_paused` is cleared
+2. `AircraftState.on_ground` is read to determine the correct flight phase:
+   - `on_ground = true` → PhaseDetector reset to `Ground`
+   - `on_ground = false` → PhaseDetector reset to `Cruise`
+3. The first live telemetry update immediately refines phase via real ground speed
+4. `TransitionThrottle` applies normally after a Ground→Cruise transition
+
+This avoids submitting speculative tiles based on an extrapolated stale position that may be wrong by minutes of flight time. It also handles paused sim gracefully — the sim pauses telemetry, safe mode activates, and on resume the coordinator picks up exactly where the aircraft is.
+
+**`on_ground` propagation chain:**
+```
+SimState (X-Plane Web API)
+  └─→ WebApiAdapter
+        └─→ aircraft_position::AircraftState.on_ground
+              └─→ prefetch::AircraftState.on_ground
+                    └─→ PhaseDetector reset on telemetry resume
+```
 
 ### Partial Tile Failure
 

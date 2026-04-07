@@ -140,7 +140,15 @@ pub struct StatsInfo {
 pub fn collect_snapshot(state: &DebugMapState) -> DebugStateSnapshot {
     let aircraft = collect_aircraft(state);
     let sim_state = collect_sim_state(state);
-    let prefetch_box = compute_prefetch_box(&aircraft);
+    let live_extent = {
+        let snapshot = state.prefetch_status.snapshot();
+        if snapshot.box_extent > 0.0 {
+            Some(snapshot.box_extent)
+        } else {
+            None
+        }
+    };
+    let prefetch_box = compute_prefetch_box(&aircraft, live_extent);
     let regions = collect_regions(state);
     let tiles = collect_tiles(state);
     let stats = collect_stats(state);
@@ -182,14 +190,18 @@ fn collect_sim_state(state: &DebugMapState) -> SimStateInfo {
     }
 }
 
-fn compute_prefetch_box(aircraft: &Option<AircraftInfo>) -> Option<BoxBounds> {
+fn compute_prefetch_box(
+    aircraft: &Option<AircraftInfo>,
+    live_extent: Option<f64>,
+) -> Option<BoxBounds> {
     let aircraft = aircraft.as_ref()?;
     let track = aircraft.track.unwrap_or(aircraft.heading) as f64;
 
     let config = AdaptivePrefetchConfig::default();
     let pbox = PrefetchBox::new(config.box_extent, config.box_max_bias);
+    let extent = live_extent.unwrap_or(config.box_extent);
     let (lat_min, lat_max, lon_min, lon_max) =
-        pbox.bounds(aircraft.latitude, aircraft.longitude, track);
+        pbox.bounds_with_extent(aircraft.latitude, aircraft.longitude, track, extent);
 
     Some(BoxBounds {
         lat_min,
@@ -377,7 +389,7 @@ mod tests {
             ground_speed: 450.0,
             altitude: 35000.0,
         });
-        let bounds = compute_prefetch_box(&aircraft).unwrap();
+        let bounds = compute_prefetch_box(&aircraft, None).unwrap();
         // Heading west: lon biased west (3° ahead), east (1° behind)
         assert!(bounds.lon_min < 13.0, "West edge should be ~12°");
         assert!(bounds.lon_max < 17.0, "East edge should be ~16°");
@@ -385,8 +397,27 @@ mod tests {
 
     #[test]
     fn test_compute_prefetch_box_none_without_aircraft() {
-        let bounds = compute_prefetch_box(&None);
+        let bounds = compute_prefetch_box(&None, None);
         assert!(bounds.is_none());
+    }
+
+    #[test]
+    fn test_compute_prefetch_box_with_custom_extent() {
+        let aircraft = Some(AircraftInfo {
+            latitude: 47.0,
+            longitude: 8.0,
+            heading: 270.0,
+            track: Some(270.0),
+            ground_speed: 140.0,
+            altitude: 10000.0,
+        });
+        let bounds = compute_prefetch_box(&aircraft, Some(4.0)).unwrap();
+        let lon_range = bounds.lon_max - bounds.lon_min;
+        assert!(
+            (lon_range - 4.0).abs() < 0.01,
+            "Should use provided extent 4.0, got range {}",
+            lon_range
+        );
     }
 
     #[test]

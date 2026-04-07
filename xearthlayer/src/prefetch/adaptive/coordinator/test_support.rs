@@ -56,7 +56,7 @@ pub(crate) fn ground_state(lat: f64, lon: f64) -> AircraftState {
     const HEADING_DEG: f32 = 90.0;
     const GROUND_SPEED_KT: f32 = 10.0;
     const AGL_FT: f32 = 5.0;
-    AircraftState::new(lat, lon, HEADING_DEG, GROUND_SPEED_KT, AGL_FT)
+    AircraftState::new(lat, lon, HEADING_DEG, GROUND_SPEED_KT, AGL_FT, false)
 }
 
 /// Build patched regions covering a radius around a DSF tile.

@@ -21,6 +21,7 @@ use super::super::phase_detector::FlightPhase;
 /// - `active_strategy` - Name of the currently active strategy
 /// - `last_prefetch_count` - Tiles prefetched in the last cycle
 /// - `throttled` - Whether circuit breaker is throttling prefetch
+/// - `box_extent` - Current prefetch box extent in degrees (Cruise phase only)
 #[derive(Debug, Clone)]
 pub struct CoordinatorStatus {
     /// Whether prefetch is currently enabled.
@@ -40,6 +41,9 @@ pub struct CoordinatorStatus {
 
     /// Whether throttled by circuit breaker.
     pub throttled: bool,
+
+    /// Current prefetch box extent in degrees (Cruise phase only; 0.0 otherwise).
+    pub box_extent: f64,
 }
 
 impl Default for CoordinatorStatus {
@@ -51,6 +55,7 @@ impl Default for CoordinatorStatus {
             active_strategy: "none",
             last_prefetch_count: 0,
             throttled: false,
+            box_extent: 0.0,
         }
     }
 }
@@ -68,6 +73,7 @@ mod tests {
         assert_eq!(status.active_strategy, "none");
         assert_eq!(status.last_prefetch_count, 0);
         assert!(!status.throttled);
+        assert_eq!(status.box_extent, 0.0);
     }
 
     #[test]
@@ -79,6 +85,7 @@ mod tests {
             active_strategy: "cruise",
             last_prefetch_count: 10,
             throttled: true,
+            box_extent: 5.5,
         };
 
         let cloned = status.clone();

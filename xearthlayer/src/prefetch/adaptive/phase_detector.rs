@@ -299,6 +299,28 @@ impl PhaseDetector {
         self.phase_entered_at.elapsed()
     }
 
+    /// Reset to Ground phase, clearing all transition state.
+    ///
+    /// Used when telemetry resumes and SimState indicates on_ground.
+    pub fn reset_to_ground(&mut self) {
+        self.current_phase = FlightPhase::Ground;
+        self.pending_transition = None;
+        self.phase_entered_at = Instant::now();
+        self.transition_msl = None;
+        tracing::info!("PhaseDetector reset to Ground (telemetry resumed, on_ground=true)");
+    }
+
+    /// Reset to Cruise phase, clearing all transition state.
+    ///
+    /// Used when telemetry resumes and SimState indicates airborne.
+    pub fn reset_to_cruise(&mut self) {
+        self.current_phase = FlightPhase::Cruise;
+        self.pending_transition = None;
+        self.phase_entered_at = Instant::now();
+        self.transition_msl = None;
+        tracing::info!("PhaseDetector reset to Cruise (telemetry resumed, on_ground=false)");
+    }
+
     /// Force a specific phase (for testing).
     #[cfg(test)]
     pub fn set_phase(&mut self, phase: FlightPhase) {
@@ -503,6 +525,45 @@ mod tests {
         let changed = detector.update(10.0, 500.0);
 
         assert!(changed);
+        assert_eq!(detector.current_phase(), FlightPhase::Ground);
+    }
+
+    #[test]
+    fn test_reset_to_ground_from_cruise() {
+        // Create a config with 0-second timeout for testing
+        let config = AdaptivePrefetchConfig {
+            takeoff_timeout: std::time::Duration::from_millis(0),
+            ..Default::default()
+        };
+        let mut detector = PhaseDetector::new(&config);
+        detector.hysteresis_duration = std::time::Duration::from_millis(0);
+        detector.update(200.0, 10000.0); // Ground→pending Transition
+        detector.update(200.0, 10000.0); // commits to Transition (hysteresis=0)
+        assert_eq!(detector.current_phase(), FlightPhase::Transition);
+        detector.update(200.0, 10000.0); // Transition→Cruise (timeout=0)
+        assert_eq!(detector.current_phase(), FlightPhase::Cruise);
+
+        detector.reset_to_ground();
+        assert_eq!(detector.current_phase(), FlightPhase::Ground);
+    }
+
+    #[test]
+    fn test_reset_to_cruise_from_ground() {
+        let config = AdaptivePrefetchConfig::default();
+        let mut detector = PhaseDetector::new(&config);
+        assert_eq!(detector.current_phase(), FlightPhase::Ground);
+
+        detector.reset_to_cruise();
+        assert_eq!(detector.current_phase(), FlightPhase::Cruise);
+    }
+
+    #[test]
+    fn test_reset_clears_pending_transition() {
+        let config = AdaptivePrefetchConfig::default();
+        let mut detector = PhaseDetector::new(&config);
+        detector.update(200.0, 500.0); // Start pending transition
+
+        detector.reset_to_ground();
         assert_eq!(detector.current_phase(), FlightPhase::Ground);
     }
 

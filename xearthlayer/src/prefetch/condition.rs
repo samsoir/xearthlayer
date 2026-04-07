@@ -10,7 +10,7 @@
 //! use xearthlayer::prefetch::{PrefetchCondition, MinimumSpeedCondition, AircraftState};
 //!
 //! let condition = MinimumSpeedCondition::new(30.0); // 30 knots minimum
-//! let state = AircraftState::new(45.0, -122.0, 90.0, 150.0, 10000.0);
+//! let state = AircraftState::new(45.0, -122.0, 90.0, 150.0, 10000.0, false);
 //!
 //! if condition.should_prefetch(&state) {
 //!     // Aircraft is moving fast enough, proceed with prefetch
@@ -122,7 +122,7 @@ mod tests {
     #[test]
     fn test_minimum_speed_condition_below_threshold() {
         let condition = MinimumSpeedCondition::new(30.0);
-        let state = AircraftState::new(45.0, -122.0, 90.0, 20.0, 1000.0);
+        let state = AircraftState::new(45.0, -122.0, 90.0, 20.0, 1000.0, false);
 
         assert!(!condition.should_prefetch(&state));
     }
@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn test_minimum_speed_condition_at_threshold() {
         let condition = MinimumSpeedCondition::new(30.0);
-        let state = AircraftState::new(45.0, -122.0, 90.0, 30.0, 1000.0);
+        let state = AircraftState::new(45.0, -122.0, 90.0, 30.0, 1000.0, false);
 
         assert!(condition.should_prefetch(&state));
     }
@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn test_minimum_speed_condition_above_threshold() {
         let condition = MinimumSpeedCondition::new(30.0);
-        let state = AircraftState::new(45.0, -122.0, 90.0, 150.0, 10000.0);
+        let state = AircraftState::new(45.0, -122.0, 90.0, 150.0, 10000.0, false);
 
         assert!(condition.should_prefetch(&state));
     }
@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn test_always_active_condition() {
         let condition = AlwaysActiveCondition;
-        let state = AircraftState::new(45.0, -122.0, 90.0, 0.0, 0.0);
+        let state = AircraftState::new(45.0, -122.0, 90.0, 0.0, 0.0, false);
 
         assert!(condition.should_prefetch(&state));
     }
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn test_never_active_condition() {
         let condition = NeverActiveCondition;
-        let state = AircraftState::new(45.0, -122.0, 90.0, 500.0, 35000.0);
+        let state = AircraftState::new(45.0, -122.0, 90.0, 500.0, 35000.0, false);
 
         assert!(!condition.should_prefetch(&state));
     }

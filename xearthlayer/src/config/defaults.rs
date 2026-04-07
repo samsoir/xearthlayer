@@ -226,6 +226,24 @@ pub const DEFAULT_BOX_EXTENT: f64 = 6.5;
 /// 0.8 means 80% ahead / 20% behind on the primary axis.
 pub const DEFAULT_BOX_MAX_BIAS: f64 = 0.8;
 
+/// Default minimum prefetch box extent (degrees) at low speed.
+///
+/// Applied when aircraft ground speed is at or below `DEFAULT_BOX_MIN_SPEED`.
+/// Shrinks the box during approach and taxi to avoid prefetching unreachable tiles.
+pub const DEFAULT_BOX_MIN_EXTENT: f64 = 3.5;
+
+/// Ground speed (knots) at which the prefetch box is at minimum extent.
+///
+/// Matches the ground/cruise phase threshold: below this speed the aircraft is
+/// considered on the ground, so the box does not need to look far ahead.
+pub const DEFAULT_BOX_MIN_SPEED: f32 = 40.0;
+
+/// Ground speed (knots) at which the prefetch box reaches maximum extent.
+///
+/// Representative cruise speed for fast jets. At or above this speed the box
+/// uses `DEFAULT_BOX_EXTENT` to cover the full lookahead region.
+pub const DEFAULT_BOX_MAX_SPEED: f32 = 450.0;
+
 // =============================================================================
 // FUSE defaults
 // =============================================================================

@@ -445,6 +445,7 @@ impl PartialState {
             self.heading?,
             self.ground_speed?,
             self.altitude.unwrap_or(0.0),
+            false,
         ))
     }
 }

@@ -27,6 +27,9 @@
 
 use std::time::Duration;
 
+use crate::config::defaults::{
+    DEFAULT_BOX_MAX_SPEED, DEFAULT_BOX_MIN_EXTENT, DEFAULT_BOX_MIN_SPEED,
+};
 use crate::config::PrefetchSettings;
 use crate::service::PrefetchConfig;
 
@@ -130,6 +133,22 @@ pub struct AdaptivePrefetchConfig {
     /// and 20% behind; perpendicular axes get 50/50.
     /// Range: 0.5 - 0.9
     pub box_max_bias: f64,
+
+    /// Minimum prefetch box extent (degrees) at low ground speed.
+    ///
+    /// When the aircraft is at or below `box_min_speed`, the box uses this
+    /// extent. Shrinks the prefetch region during approach and taxi.
+    pub box_min_extent: f64,
+
+    /// Ground speed (knots) at which the box uses `box_min_extent`.
+    ///
+    /// Speeds at or below this value produce the minimum extent.
+    pub box_min_speed: f32,
+
+    /// Ground speed (knots) at which the box uses `box_extent` (maximum).
+    ///
+    /// Speeds at or above this value produce the full `box_extent`.
+    pub box_max_speed: f32,
 }
 
 impl Default for AdaptivePrefetchConfig {
@@ -153,6 +172,9 @@ impl Default for AdaptivePrefetchConfig {
             window_lon_extent: 3.0,
             box_extent: 6.5,
             box_max_bias: 0.8,
+            box_min_extent: DEFAULT_BOX_MIN_EXTENT,
+            box_min_speed: DEFAULT_BOX_MIN_SPEED,
+            box_max_speed: DEFAULT_BOX_MAX_SPEED,
         }
     }
 }

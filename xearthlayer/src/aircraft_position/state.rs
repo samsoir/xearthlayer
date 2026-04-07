@@ -209,6 +209,9 @@ pub struct AircraftState {
 
     /// Accuracy of this position in meters.
     pub accuracy: PositionAccuracy,
+
+    /// Whether the aircraft is on the ground (from X-Plane Web API SimState).
+    pub on_ground: bool,
 }
 
 impl AircraftState {
@@ -243,6 +246,7 @@ impl AircraftState {
             timestamp: Instant::now(),
             source: PositionSource::Telemetry,
             accuracy: PositionAccuracy::TELEMETRY,
+            on_ground: false,
         }
     }
 
@@ -262,6 +266,7 @@ impl AircraftState {
             timestamp: Instant::now(),
             source: PositionSource::ManualReference,
             accuracy: PositionAccuracy::MANUAL_REFERENCE,
+            on_ground: false,
         }
     }
 
@@ -278,6 +283,7 @@ impl AircraftState {
             timestamp: Instant::now(),
             source: PositionSource::SceneInference,
             accuracy: PositionAccuracy::SCENE_INFERENCE,
+            on_ground: false,
         }
     }
 
@@ -313,6 +319,7 @@ impl AircraftState {
             timestamp,
             source: PositionSource::OnlineNetwork,
             accuracy: PositionAccuracy::ONLINE_NETWORK,
+            on_ground: false,
         }
     }
 
@@ -358,6 +365,12 @@ impl AircraftState {
             self.source,
             PositionSource::Telemetry | PositionSource::OnlineNetwork
         )
+    }
+
+    /// Set the on_ground flag from X-Plane Web API SimState.
+    pub fn with_on_ground(mut self, on_ground: bool) -> Self {
+        self.on_ground = on_ground;
+        self
     }
 }
 
@@ -661,5 +674,55 @@ mod tests {
         // Contrast with non-vector sources
         assert!(!AircraftState::from_manual_reference(43.6, 1.4).has_vectors());
         assert!(!AircraftState::from_inference(53.5, 10.0).has_vectors());
+    }
+
+    #[test]
+    fn test_aircraft_state_on_ground_default_false() {
+        let state = AircraftState::from_telemetry(
+            53.5,
+            10.0,
+            Some(88.0),
+            TrackSource::Telemetry,
+            90.0,
+            120.0,
+            10000.0,
+        );
+        assert!(!state.on_ground);
+
+        // All constructors should default to false
+        assert!(!AircraftState::from_manual_reference(43.6, 1.4).on_ground);
+        assert!(!AircraftState::from_inference(53.5, 10.0).on_ground);
+        assert!(
+            !AircraftState::from_network_position(
+                33.9425,
+                -118.408,
+                270.0,
+                150.0,
+                35000.0,
+                Instant::now()
+            )
+            .on_ground
+        );
+    }
+
+    #[test]
+    fn test_with_on_ground_sets_value() {
+        let state = AircraftState::from_telemetry(
+            53.5,
+            10.0,
+            Some(88.0),
+            TrackSource::Telemetry,
+            90.0,
+            120.0,
+            10000.0,
+        );
+
+        assert!(!state.on_ground);
+        let grounded = state.with_on_ground(true);
+        assert!(grounded.on_ground);
+
+        // Verify builder does not mutate the original (moved, but verify false→true)
+        let airborne = AircraftState::from_inference(53.5, 10.0).with_on_ground(false);
+        assert!(!airborne.on_ground);
     }
 }

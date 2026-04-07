@@ -330,7 +330,7 @@ mod tests {
     use super::*;
 
     fn create_state(lat: f64, lon: f64, heading: f32, ground_speed: f32) -> AircraftState {
-        AircraftState::new(lat, lon, heading, ground_speed, 10000.0)
+        AircraftState::new(lat, lon, heading, ground_speed, 10000.0, false)
     }
 
     #[test]
@@ -521,7 +521,7 @@ mod tests {
     fn test_predict_invalid_position() {
         let predictor = TilePredictor::new(45.0, 100.0, 60.0);
         // Create state with invalid coordinates (beyond limits)
-        let state = AircraftState::new(90.0, 0.0, 0.0, 300.0, 10000.0);
+        let state = AircraftState::new(90.0, 0.0, 0.0, 300.0, 10000.0, false);
 
         // Should return empty, not panic
         let predictions = predictor.predict(&state, 14);
