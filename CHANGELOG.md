@@ -9,9 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.2] - 2026-04-06
 
+### Added
+
+- **DDS disk cache tier** ([#132](https://github.com/samsoir/xearthlayer/issues/132)): Three-tier cache hierarchy (memory → DDS disk → chunk disk → network). Encoded DDS tiles persist to disk, avoiding re-encoding on memory eviction (~3.5ms NVMe read vs ~50-200ms re-encode). Configurable disk budget split via `cache.dds_disk_ratio` (default 60% DDS, 40% chunks).
+
+- **Speed-proportional prefetch box** ([#125](https://github.com/samsoir/xearthlayer/issues/125)): Prefetch box extent scales linearly with ground speed — 3.5° at 40kt to 6.5° at 450kt+. Reduces over-fetching during approach by ~45%, cutting burst sizes that contributed to swap-in storms on memory-constrained systems.
+
+- **Stale telemetry safe mode** ([#125](https://github.com/samsoir/xearthlayer/issues/125)): When X-Plane position telemetry goes stale (5s), prefetch pauses entirely. On resume, `on_ground` from SimState determines phase reset (Ground or Cruise) before normal cycling restarts.
+
+- **Version update check** ([#128](https://github.com/samsoir/xearthlayer/issues/128)): Non-blocking startup check against remote `version.json` with 24h disk cache. TUI dashboard shows persistent footer when an update is available. Configurable via `general.update_check` (default: true).
+
 ### Changed
 
-- **GPU encoding is now built-in** ([#139](https://github.com/samsoir/xearthlayer/pull/139)): The `gpu-encode` Cargo feature flag has been removed. GPU encoding via wgpu compute shaders is compiled unconditionally into every binary. Select it at runtime via `texture.compressor = gpu` in config — no special build flags required.
+- **GPU encoding is now built-in** ([#139](https://github.com/samsoir/xearthlayer/issues/139)): The `gpu-encode` Cargo feature flag has been removed. GPU encoding via wgpu compute shaders is compiled unconditionally into every binary. Select it at runtime via `texture.compressor = gpu` in config — no special build flags required. CI/CD pipeline simplified to a single binary variant.
+
+- **fuse3 updated to 0.9.0** ([#134](https://github.com/samsoir/xearthlayer/issues/134)): Upstream switched serialization from bincode to zerocopy. `ReplyInit` adapted to new `#[non_exhaustive]` constructor pattern. Contributed by [@mmaechtel](https://github.com/mmaechtel).
+
+- **Removed `prefetch.strategy` config setting** ([#136](https://github.com/samsoir/xearthlayer/issues/136)): Only the adaptive strategy exists; setting was redundant. Added to deprecated keys for automatic removal via `config upgrade`.
+
+### Fixed
+
+- **Debug map**: DDS disk cache hits now recorded in tile activity tracker — boundary tile loads were previously invisible to the debug map ([#125](https://github.com/samsoir/xearthlayer/issues/125))
+- **Debug map**: Prefetch box extent propagated in no-plan status updates — live speed-proportional box now renders correctly during steady cruise ([#125](https://github.com/samsoir/xearthlayer/issues/125))
+- **Download progress**: Completed download bars now clear so progress scrolls correctly for large packages ([#129](https://github.com/samsoir/xearthlayer/issues/129))
+- **CI**: Website sync now triggers on release branch merge instead of during release workflow ([#127](https://github.com/samsoir/xearthlayer/pull/127))
 
 ## [0.4.1] - 2026-03-29
 
@@ -934,7 +955,8 @@ Run `xearthlayer config upgrade` to automatically add new settings with defaults
 - Linux support only (Windows and macOS planned for future releases)
 - Requires FUSE3 for filesystem mounting
 
-[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/samsoir/xearthlayer/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/samsoir/xearthlayer/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/samsoir/xearthlayer/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/samsoir/xearthlayer/compare/v0.3.0...v0.3.1
