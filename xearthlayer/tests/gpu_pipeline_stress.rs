@@ -4,7 +4,7 @@
 //! requests separated by idle periods, mimicking flight sim behavior
 //! (active tile generation at DSF boundaries, idle during cruise).
 //!
-//! Run with: cargo test -p xearthlayer --features gpu-encode
+//! Run with: cargo test -p xearthlayer
 //!           --test gpu_pipeline_stress -- --ignored --nocapture
 //!
 //! Environment variables:
@@ -13,7 +13,6 @@
 //!   GPU_STRESS_IDLE_MS        — idle gap between bursts in ms (default: 3000)
 //!   GPU_STRESS_IMAGE_SIZE     — image width/height (default: 256, use 4096 for realistic)
 
-#[cfg(feature = "gpu-encode")]
 mod gpu_stress {
     use image::RgbaImage;
     use std::sync::Arc;

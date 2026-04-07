@@ -55,7 +55,7 @@
 //! - [`IspcCompressor`] — SIMD-optimized (default, recommended)
 //! - [`SoftwareCompressor`] — Pure-Rust fallback
 //!
-//! [`MipmapCompressor`] — full-pipeline compression (`gpu-encode` feature):
+//! [`MipmapCompressor`] — full-pipeline compression:
 //! - [`GpuEncoderChannel`] — Worker-side mipmap streaming via GPU compute
 //!
 //! # Compatibility
@@ -77,13 +77,11 @@ mod mipmap;
 mod types;
 
 // Public API
-#[cfg(feature = "gpu-encode")]
 pub use compressor::{
-    create_gpu_resources, create_wgpu_compressor, MipmapCompressor, WgpuCompressor,
+    create_gpu_resources, create_wgpu_compressor, default_compressor, ImageCompressor,
+    IspcCompressor, MipmapCompressor, SoftwareCompressor, WgpuCompressor,
 };
-pub use compressor::{default_compressor, ImageCompressor, IspcCompressor, SoftwareCompressor};
 pub use encoder::DdsEncoder;
-#[cfg(feature = "gpu-encode")]
 pub use gpu_channel::create_gpu_encoder_channel;
 pub use types::{DdsError, DdsFormat, DdsHeader};
 

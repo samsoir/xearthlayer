@@ -36,7 +36,6 @@ pub struct DdsTextureEncoder {
     compressor: Arc<dyn ImageCompressor>,
     /// When set, `encode()` delegates the full mipmap chain to this backend
     /// instead of iterating levels via `MipmapStream` + `compressor`.
-    #[cfg(feature = "gpu-encode")]
     mipmap_compressor: Option<Arc<dyn crate::dds::MipmapCompressor>>,
 }
 
@@ -46,7 +45,6 @@ impl Clone for DdsTextureEncoder {
             format: self.format,
             mipmap_count: self.mipmap_count,
             compressor: Arc::clone(&self.compressor),
-            #[cfg(feature = "gpu-encode")]
             mipmap_compressor: self.mipmap_compressor.as_ref().map(Arc::clone),
         }
     }
@@ -58,15 +56,11 @@ impl std::fmt::Debug for DdsTextureEncoder {
         s.field("format", &self.format)
             .field("mipmap_count", &self.mipmap_count);
 
-        #[cfg(feature = "gpu-encode")]
         if let Some(ref mc) = self.mipmap_compressor {
             s.field("compressor", &mc.name());
         } else {
             s.field("compressor", &self.compressor.name());
         }
-
-        #[cfg(not(feature = "gpu-encode"))]
-        s.field("compressor", &self.compressor.name());
 
         s.finish()
     }
@@ -85,7 +79,6 @@ impl DdsTextureEncoder {
             format,
             mipmap_count: 5,
             compressor: default_compressor(),
-            #[cfg(feature = "gpu-encode")]
             mipmap_compressor: None,
         }
     }
@@ -125,7 +118,6 @@ impl DdsTextureEncoder {
     ///
     /// When set, the encoder delegates the full mipmap chain to this backend
     /// instead of using the image compressor per level.
-    #[cfg(feature = "gpu-encode")]
     pub fn with_mipmap_compressor(
         mut self,
         compressor: Arc<dyn crate::dds::MipmapCompressor>,
@@ -186,15 +178,9 @@ impl TextureEncoder for DdsTextureEncoder {
     fn encode(&self, image: RgbaImage) -> Result<Vec<u8>, TextureError> {
         let mut encoder = DdsEncoder::new(self.format).with_mipmap_count(self.mipmap_count);
 
-        #[cfg(feature = "gpu-encode")]
         if let Some(ref mc) = self.mipmap_compressor {
             encoder = encoder.with_mipmap_compressor(Arc::clone(mc));
         } else {
-            encoder = encoder.with_compressor(Arc::clone(&self.compressor));
-        }
-
-        #[cfg(not(feature = "gpu-encode"))]
-        {
             encoder = encoder.with_compressor(Arc::clone(&self.compressor));
         }
 

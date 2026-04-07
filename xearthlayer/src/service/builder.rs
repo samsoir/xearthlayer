@@ -74,12 +74,11 @@ pub struct EncoderComponents {
 /// config setting:
 /// - `"ispc"` — SIMD-optimized via Intel ISPC (default)
 /// - `"software"` — Pure-Rust fallback
-/// - `"gpu"` — GPU compute via wgpu (requires `gpu-encode` feature)
+/// - `"gpu"` — GPU compute via wgpu
 pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, ServiceError> {
     use crate::dds::{IspcCompressor, SoftwareCompressor};
 
     match config.texture().compressor() {
-        #[cfg(feature = "gpu-encode")]
         "gpu" => {
             use crate::dds::gpu_channel::create_gpu_encoder_channel;
 
@@ -100,13 +99,6 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
                 gpu_shutdown: Some(shutdown_token),
             })
         }
-        #[cfg(not(feature = "gpu-encode"))]
-        "gpu" => Err(ServiceError::ConfigError(
-            "GPU compression requires the `gpu-encode` feature. \
-             Rebuild with `cargo build --features gpu-encode` \
-             or set texture.compressor = ispc"
-                .to_string(),
-        )),
         compressor_name => {
             let compressor: Arc<dyn crate::dds::ImageCompressor> = match compressor_name {
                 "software" => Arc::new(SoftwareCompressor),
@@ -162,17 +154,7 @@ mod tests {
         assert!(create_encoder(&config).is_err());
     }
 
-    #[test]
-    #[cfg(not(feature = "gpu-encode"))]
-    fn test_create_encoder_gpu_without_feature_fails() {
-        let config = ServiceConfig::builder()
-            .texture(TextureConfig::default().with_compressor("gpu".to_string()))
-            .build();
-        assert!(create_encoder(&config).is_err());
-    }
-
     #[tokio::test]
-    #[cfg(feature = "gpu-encode")]
     async fn test_create_encoder_gpu_compiles() {
         use crate::texture::TextureEncoder;
 
@@ -196,7 +178,6 @@ mod tests {
     /// This is the shutdown contract: store the handle, drop the encoder, await the handle.
     /// If the handle doesn't complete, the process hangs on exit.
     #[tokio::test]
-    #[cfg(feature = "gpu-encode")]
     #[ignore] // Requires GPU hardware
     async fn test_gpu_worker_handle_completes_on_encoder_drop() {
         let config = ServiceConfig::builder()

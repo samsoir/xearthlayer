@@ -378,7 +378,6 @@ impl fmt::Display for SystemReport {
         writeln!(f)?;
 
         // GPU Compute Adapters (wgpu)
-        #[cfg(feature = "gpu-encode")]
         {
             writeln!(f, "## GPU Compute Adapters")?;
             let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -398,12 +397,6 @@ impl fmt::Display for SystemReport {
                     )?;
                 }
             }
-            writeln!(f)?;
-        }
-        #[cfg(not(feature = "gpu-encode"))]
-        {
-            writeln!(f, "## GPU Encoding")?;
-            writeln!(f, "  Not available (build with --features gpu-encode)")?;
             writeln!(f)?;
         }
 

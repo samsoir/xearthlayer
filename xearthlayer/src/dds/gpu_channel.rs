@@ -4,7 +4,6 @@
 //! full tile requests to a dedicated GPU worker thread. The worker
 //! owns mipmap iteration internally, reducing cross-thread round-trips.
 
-#[cfg(feature = "gpu-encode")]
 mod inner {
     use block_compression::{CompressionVariant, GpuBlockCompressor};
     use image::RgbaImage;
@@ -386,11 +385,9 @@ mod inner {
     }
 }
 
-#[cfg(feature = "gpu-encode")]
 pub use inner::*;
 
 #[cfg(test)]
-#[cfg(feature = "gpu-encode")]
 mod tests {
     use super::*;
     use crate::dds::compressor::{ImageCompressor, MipmapCompressor};
