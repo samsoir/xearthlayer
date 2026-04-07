@@ -48,7 +48,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `ImageCompressor` trait for single-level backends:
      - `SoftwareCompressor` — Pure-Rust fallback
      - `IspcCompressor` — SIMD-optimized via Intel ISPC (default)
-   - `MipmapCompressor` trait for full-pipeline backends (feature-gated `gpu-encode`):
+   - `MipmapCompressor` trait for full-pipeline backends (GPU):
      - `GpuEncoderChannel` — Worker-side mipmap streaming, zero-clone channel transfer
    - `MipmapStream` — Memory-efficient iterator yielding one mipmap level at a time (no clones)
    - GPU encoding architecture: `mpsc` channel → dedicated pipeline worker → `GpuBlockCompressor`
@@ -414,8 +414,8 @@ CI will fail if pre-commit checks were not run.
 - `tracing-chrome` - Chrome Trace profiling (optional, `profiling` feature)
 - `tokio` - Async runtime
 - `rlimit` - File descriptor limit management (raises soft limit at startup)
-- `wgpu` - GPU compute shaders for DDS encoding (optional, `gpu-encode` feature)
-- `block_compression` - BCn GPU compression via WGSL (optional, `gpu-encode` feature)
+- `wgpu` - GPU compute shaders for DDS encoding
+- `block_compression` - BCn GPU compression via WGSL
 - `indicatif` - Progress bar rendering for package downloads
 
 ## Performance Notes

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-04-06
+
+### Changed
+
+- **GPU encoding is now built-in** ([#139](https://github.com/samsoir/xearthlayer/pull/139)): The `gpu-encode` Cargo feature flag has been removed. GPU encoding via wgpu compute shaders is compiled unconditionally into every binary. Select it at runtime via `texture.compressor = gpu` in config — no special build flags required.
+
 ## [0.4.1] - 2026-03-29
 
 ### Added

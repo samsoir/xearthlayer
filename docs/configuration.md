@@ -182,7 +182,7 @@ gpu_device = integrated
 **Compressor Backends:**
 - **software**: Pure-Rust block compression. Slowest, no external dependencies.
 - **ispc** (default): Intel ISPC SIMD compression via `intel_tex_2`. 5-10x faster than software. Prebuilt ISPC kernels are included — no special build requirements.
-- **gpu**: wgpu compute shader compression. Requires `--features gpu-encode` at build time (use `make release-gpu`). Offloads encoding to GPU via WGSL compute shaders, freeing CPU for X-Plane.
+- **gpu**: wgpu compute shader compression. Built-in — no special build requirements. Offloads encoding to GPU via WGSL compute shaders, freeing CPU for X-Plane.
 
 **Choosing a Compressor:**
 
@@ -579,7 +579,7 @@ disk_size = 50GB
 
 [texture]
 format = bc1
-; compressor = ispc       ; software, ispc (default), or gpu (requires --features gpu-encode)
+; compressor = ispc       ; software, ispc (default), or gpu
 ; gpu_device = integrated  ; integrated, discrete, or adapter name substring
 
 [download]
@@ -751,7 +751,7 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `cache.dds_disk_ratio` | float (e.g., `0.6`) | Fraction of disk for DDS tiles (0.0-1.0) |
 | `cache.disk_io_profile` | `auto`, `hdd`, `ssd`, `nvme` | Disk I/O concurrency profile |
 | `texture.format` | `bc1`, `bc3` | DDS compression format |
-| `texture.compressor` | `software`, `ispc`, `gpu` | Compression backend (`gpu` requires `gpu-encode` feature) |
+| `texture.compressor` | `software`, `ispc`, `gpu` | Compression backend |
 | `texture.gpu_device` | `integrated`, `discrete`, or name | GPU adapter selection (used when compressor = gpu) |
 | `download.timeout` | positive integer | Chunk download timeout (seconds) |
 | `generation.threads` | positive integer | Worker threads |

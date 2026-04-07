@@ -66,7 +66,6 @@ pub trait ImageCompressor: Send + Sync {
 ///
 /// Concatenated compressed data for all mipmap levels (without DDS header).
 /// Level 0 (full resolution) first, then each successively halved level.
-#[cfg(feature = "gpu-encode")]
 pub trait MipmapCompressor: Send + Sync {
     /// Compress a full mipmap chain from the source image.
     ///
@@ -217,7 +216,6 @@ pub fn default_compressor() -> Arc<dyn ImageCompressor> {
 // GPU compressor (wgpu compute shaders)
 // =============================================================================
 
-#[cfg(feature = "gpu-encode")]
 mod gpu {
     use super::*;
     use block_compression::{CompressionVariant, GpuBlockCompressor};
@@ -520,7 +518,6 @@ mod gpu {
     }
 }
 
-#[cfg(feature = "gpu-encode")]
 pub use gpu::{create_gpu_resources, WgpuCompressor};
 
 /// Create a GPU-accelerated block compressor using wgpu compute shaders.
@@ -532,7 +529,6 @@ pub use gpu::{create_gpu_resources, WgpuCompressor};
 /// # Errors
 ///
 /// Returns `DdsError::CompressionFailed` if no matching adapter is found.
-#[cfg(feature = "gpu-encode")]
 pub fn create_wgpu_compressor(gpu_device: &str) -> Result<WgpuCompressor, DdsError> {
     WgpuCompressor::try_new(gpu_device)
 }
@@ -630,7 +626,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[cfg(feature = "gpu-encode")]
 mod gpu_tests {
     use super::*;
 

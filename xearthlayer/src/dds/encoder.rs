@@ -6,9 +6,7 @@
 //! - [`MipmapCompressor`] backends (GPU channel) own the full mipmap pipeline;
 //!   the encoder only handles DDS header assembly.
 
-#[cfg(feature = "gpu-encode")]
-use crate::dds::compressor::MipmapCompressor;
-use crate::dds::compressor::{default_compressor, ImageCompressor};
+use crate::dds::compressor::{default_compressor, ImageCompressor, MipmapCompressor};
 use crate::dds::mipmap::{MipmapGenerator, MipmapStream};
 use crate::dds::types::{DdsError, DdsFormat, DdsHeader};
 use image::RgbaImage;
@@ -20,7 +18,6 @@ enum CompressorBackend {
     /// Single-level compressor — encoder manages mipmap iteration.
     Image(Arc<dyn ImageCompressor>),
     /// Full-pipeline compressor — backend owns mipmap iteration.
-    #[cfg(feature = "gpu-encode")]
     Mipmap(Arc<dyn MipmapCompressor>),
 }
 
@@ -69,7 +66,6 @@ impl DdsEncoder {
     /// The backend receives the source image and returns compressed data
     /// for all mipmap levels. This avoids per-level channel round-trips
     /// for GPU-based compression.
-    #[cfg(feature = "gpu-encode")]
     pub fn with_mipmap_compressor(mut self, compressor: Arc<dyn MipmapCompressor>) -> Self {
         self.backend = CompressorBackend::Mipmap(compressor);
         self
@@ -114,7 +110,6 @@ impl DdsEncoder {
         }
 
         match &self.backend {
-            #[cfg(feature = "gpu-encode")]
             CompressorBackend::Mipmap(compressor) => {
                 let count = if self.generate_mipmaps {
                     self.resolve_mipmap_count(width, height)
@@ -259,7 +254,6 @@ impl DdsEncoder {
     ///
     /// The backend owns mipmap generation and compression. This method
     /// only handles DDS header assembly.
-    #[cfg(feature = "gpu-encode")]
     fn encode_with_mipmap_compressor(
         &self,
         compressor: &Arc<dyn MipmapCompressor>,
@@ -296,7 +290,6 @@ impl DdsEncoder {
     fn compress_image(&self, image: &RgbaImage) -> Result<Vec<u8>, DdsError> {
         match &self.backend {
             CompressorBackend::Image(compressor) => compressor.compress(image, self.format),
-            #[cfg(feature = "gpu-encode")]
             CompressorBackend::Mipmap(_) => {
                 unreachable!("compress_image called with MipmapCompressor backend")
             }
@@ -540,7 +533,6 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    #[cfg(feature = "gpu-encode")]
     #[test]
     fn test_encode_dispatches_to_mipmap_compressor() {
         use crate::dds::compressor::MipmapCompressor;
@@ -592,7 +584,6 @@ mod tests {
         assert_eq!(&result[128..], &mock_data[..]);
     }
 
-    #[cfg(feature = "gpu-encode")]
     #[test]
     fn test_mipmap_compressor_output_matches_image_compressor() {
         use crate::dds::compressor::{ImageCompressor, MipmapCompressor, SoftwareCompressor};

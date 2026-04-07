@@ -12,8 +12,8 @@ make debug-build
 make debug-run
 
 # Or manually:
-cargo build --release --features debug-map,gpu-encode
-cargo run --release --features debug-map,gpu-encode -- run
+cargo build --release --features debug-map
+cargo run --release --features debug-map -- run
 ```
 
 Open `http://localhost:8087` in a browser.

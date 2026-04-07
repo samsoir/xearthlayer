@@ -78,32 +78,6 @@ jobs:
           name: release-binary
           path: target/release/xearthlayer
 
-  # Build the GPU-enabled release binary
-  build-binary-gpu:
-    name: Build Release Binary (GPU)
-    runs-on: ubuntu-latest
-    needs: [verify]
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfuse3-dev
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build release binary with GPU encoding
-        run: cargo build --release --features gpu-encode
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-binary-gpu
-          path: target/release/xearthlayer
-
   # Package Linux binary tarball (uses pre-built binary)
   package-linux:
     name: Package Linux Binary
@@ -168,78 +142,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: debian-package
-          path: dist/*.deb
-
-  # Package GPU-enabled Linux binary tarball
-  package-linux-gpu:
-    name: Package Linux Binary (GPU)
-    runs-on: ubuntu-latest
-    needs: [verify, build-binary-gpu]
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Download GPU release binary
-        uses: actions/download-artifact@v8
-        with:
-          name: release-binary-gpu
-          path: target/release
-
-      - name: Package binary
-        env:
-          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
-        run: |
-          chmod +x target/release/xearthlayer
-          mkdir -p dist
-          cp target/release/xearthlayer dist/
-          cp README.md LICENSE dist/
-          cd dist
-          tar czvf xearthlayer-gpu-${RELEASE_TAG}-x86_64-linux.tar.gz xearthlayer README.md LICENSE
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: linux-binary-gpu
-          path: dist/*.tar.gz
-
-  # Build GPU-enabled .deb package
-  package-deb-gpu:
-    name: Package Debian Package (GPU)
-    runs-on: ubuntu-latest
-    needs: [verify, build-binary-gpu]
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Download GPU release binary
-        uses: actions/download-artifact@v8
-        with:
-          name: release-binary-gpu
-          path: target/release
-
-      - name: Make binary executable
-        run: chmod +x target/release/xearthlayer
-
-      - name: Install cargo-deb
-        run: cargo install cargo-deb
-
-      - name: Build .deb package
-        env:
-          VERSION: ${{ needs.verify.outputs.version }}
-        run: |
-          cd xearthlayer-cli
-          cargo deb --no-build
-          mkdir -p ../dist
-          # Rename to include -gpu suffix
-          for f in ../target/debian/*.deb; do
-            basename=$(basename "$f" .deb)
-            cp "$f" "../dist/${basename}-gpu.deb"
-          done
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: debian-package-gpu
           path: dist/*.deb
 
   # Build .rpm package for Fedora/RHEL/openSUSE
@@ -369,7 +271,7 @@ jobs:
   publish:
     name: Publish Release
     runs-on: ubuntu-latest
-    needs: [verify, package-linux, package-deb, build-rpm, prepare-aur, package-linux-gpu, package-deb-gpu]
+    needs: [verify, package-linux, package-deb, build-rpm, prepare-aur]
     permissions:
       contents: write
     steps:
@@ -450,20 +352,6 @@ jobs:
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
         run: |
           gh release upload "${RELEASE_TAG}" artifacts/rpm-package/*.rpm
-
-      - name: Upload Linux GPU binary
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
-        run: |
-          gh release upload "${RELEASE_TAG}" artifacts/linux-binary-gpu/*.tar.gz
-
-      - name: Upload Debian GPU package
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
-        run: |
-          gh release upload "${RELEASE_TAG}" artifacts/debian-package-gpu/*.deb
 
       - name: Upload AUR package files
         env:

@@ -25,7 +25,7 @@ cmake .. && make -j$(nproc) && sudo make install
 Build a release binary first (debug builds are too slow for realistic workloads):
 
 ```bash
-cargo build --release --features gpu-encode
+cargo build --release
 ```
 
 Run XEarthLayer under heaptrack:
@@ -112,5 +112,5 @@ Heaptrack adds ~2-3x slowdown on allocation-heavy code. Tile generation will be 
 
 - **Reproducible workloads:** Use `xearthlayer run --airport ICAO` for pre-warm, then fly a consistent route
 - **Short sessions:** 3-5 minutes of active tile generation is sufficient for peak analysis
-- **Feature gating:** Profile with `--features gpu-encode` only when testing the GPU path; omit it for ISPC-only profiling
+- **Backend selection:** Set `texture.compressor = gpu` in config when testing the GPU path; use `ispc` (default) for ISPC-only profiling
 - **Debug logging:** Add `RUST_LOG=info,xearthlayer=debug` to see encode pipeline tracing alongside the profile

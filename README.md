@@ -182,7 +182,7 @@ Run `xearthlayer --help` for all options.
 - **Modern GPU** with 8GB VRAM or higher, 16GB+ recommended (for X-Plane rendering)
 - **Fast Internet connection** for streaming imagery, recommended 800Mbps downstream or better
 
-> **Optional:** XEarthLayer can offload DDS encoding to a GPU via the `gpu-encode` build feature. This works with any wgpu-compatible GPU and is separate from the X-Plane GPU requirement above. See [Building with GPU Support](docs/getting-started.md#building-with-gpu-support).
+> **GPU Encoding:** XEarthLayer includes built-in GPU-accelerated DDS encoding via wgpu compute shaders. This works with any wgpu-compatible GPU and is separate from the X-Plane GPU requirement above. Select it at runtime via `texture.compressor = gpu` in your config.
 
 XEarthLayer is not tested with X-Plane 11, but should work in principle. The scenery packages that are provided by this project are designed for X-Plane 12 only. XEarthLayer using regional scenery packages published for X-Plane 11 should work without issue, your mileage may vary.
 

@@ -80,14 +80,14 @@ release-profiling: verify ## Build release version with profiling support
 	@echo "$(GREEN)Release build with profiling complete!$(NC)"
 
 .PHONY: debug-build
-debug-build: ## Build release with debug map + GPU encoding (http://localhost:8087)
-	@echo "$(BLUE)Building release with debug map + GPU...$(NC)"
-	$(CARGO) build --release --features debug-map,gpu-encode $(CARGO_FLAGS)
+debug-build: ## Build release with debug map (http://localhost:8087)
+	@echo "$(BLUE)Building release with debug map...$(NC)"
+	$(CARGO) build --release --features debug-map $(CARGO_FLAGS)
 	@echo "$(GREEN)Debug map build complete!$(NC)"
 
 .PHONY: debug-run
 debug-run: debug-build ## Run release with debug map server
-	$(CARGO) run --release --features debug-map,gpu-encode $(CARGO_FLAGS) -- run
+	$(CARGO) run --release --features debug-map $(CARGO_FLAGS) -- run
 
 .PHONY: install-profiling
 install-profiling: release-profiling ## Install binary with profiling support to $(BINDIR)
@@ -97,21 +97,6 @@ install-profiling: release-profiling ## Install binary with profiling support to
 	@chmod 755 "$(BINDIR)/xearthlayer"
 	@echo "$(GREEN)Installed: $(BINDIR)/xearthlayer (with profiling)$(NC)"
 	@echo "$(BLUE)Usage: xearthlayer run --profile$(NC)"
-
-.PHONY: release-gpu
-release-gpu: verify ## Build release version with GPU encoding support
-	@echo "$(BLUE)Building release version with GPU encoding...$(NC)"
-	$(CARGO) build --release --features gpu-encode $(CARGO_FLAGS)
-	@echo "$(GREEN)Release build with GPU encoding complete!$(NC)"
-
-.PHONY: install-gpu
-install-gpu: release-gpu ## Install binary with GPU encoding support to $(BINDIR)
-	@echo "$(BLUE)Installing xearthlayer (GPU encoding) to $(BINDIR)...$(NC)"
-	@mkdir -p "$(BINDIR)"
-	@cp target/release/xearthlayer "$(BINDIR)/"
-	@chmod 755 "$(BINDIR)/xearthlayer"
-	@echo "$(GREEN)Installed: $(BINDIR)/xearthlayer (with GPU encoding)$(NC)"
-	@echo "$(BLUE)Usage: Set texture.compressor = gpu in config.ini$(NC)"
 
 .PHONY: clean
 clean: ## Remove build artifacts
@@ -167,7 +152,7 @@ test-gpu-stress: ## Run GPU pipeline stress test (requires GPU hardware)
 	GPU_STRESS_IDLE_MS=$(GPU_STRESS_IDLE_MS) \
 	GPU_STRESS_IMAGE_SIZE=$(GPU_STRESS_IMAGE_SIZE) \
 	RUST_BACKTRACE=$(RUST_BACKTRACE) \
-	$(CARGO) test -p xearthlayer --features gpu-encode --test gpu_pipeline_stress -- --ignored --nocapture
+	$(CARGO) test -p xearthlayer --test gpu_pipeline_stress -- --ignored --nocapture
 	@echo "$(GREEN)GPU stress test complete!$(NC)"
 
 .PHONY: coverage

@@ -54,7 +54,6 @@ rlimit = "0.10"
 
 [features]
 profiling = ["xearthlayer/profiling"]
-gpu-encode = ["xearthlayer/gpu-encode"]
 debug-map = ["xearthlayer/debug-map"]
 
 [dev-dependencies]

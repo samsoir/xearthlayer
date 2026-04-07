@@ -10,16 +10,7 @@ Many systems have an idle integrated GPU (e.g., AMD Radeon on Ryzen processors) 
 
 ## Feature Gate
 
-GPU encoding is opt-in via a cargo feature to avoid wgpu compile-time and binary-size costs:
-
-```toml
-[features]
-gpu-encode = ["dep:wgpu", "dep:block_compression"]
-
-[dependencies]
-wgpu = { version = "24", optional = true }
-block_compression = { version = "0.8", optional = true, default-features = false, features = ["bc15"] }
-```
+> **Note:** The `gpu-encode` feature flag was removed in v0.4.2. GPU encoding is now compiled unconditionally into every XEarthLayer binary. Select it at runtime via `texture.compressor = gpu` — no special build flags required.
 
 The `block_compression` crate provides ISPC compression kernels ported to WGSL compute shaders, tested on Vulkan/Metal/DX12.
 
@@ -43,9 +34,8 @@ gpu_device = integrated     # integrated | discrete | <name substring>
 ### Error Behaviour
 
 All GPU configuration errors are fatal at startup (exit non-zero with actionable message):
-1. `compressor = gpu` without `gpu-encode` feature compiled
-2. `gpu_device` matches no adapter (lists all available adapters)
-3. No Vulkan/Metal/DX12 runtime available
+1. `gpu_device` matches no adapter (lists all available adapters)
+2. No Vulkan/Metal/DX12 runtime available
 
 ## Architecture
 
@@ -59,8 +49,7 @@ pub trait ImageCompressor: Send + Sync {
     fn compress(&self, image: &RgbaImage, format: DdsFormat) -> Result<Vec<u8>, DdsError>;
 }
 
-/// Full-pipeline compression (GPU backend, feature-gated)
-#[cfg(feature = "gpu-encode")]
+/// Full-pipeline compression (GPU backend)
 pub trait MipmapCompressor: Send + Sync {
     fn compress_mipmap_chain(
         &self,
@@ -79,7 +68,6 @@ pub trait MipmapCompressor: Send + Sync {
 ```rust
 pub enum CompressorBackend {
     Image(Arc<dyn ImageCompressor>),
-    #[cfg(feature = "gpu-encode")]
     Mipmap(Arc<dyn MipmapCompressor>),
 }
 ```
@@ -199,7 +187,7 @@ On integrated GPUs with shared memory, texture upload and readback are near-free
 
 ## Diagnostics
 
-`xearthlayer diagnostics` output (when `gpu-encode` feature compiled):
+`xearthlayer diagnostics` output:
 
 ```
 GPU Adapters:
