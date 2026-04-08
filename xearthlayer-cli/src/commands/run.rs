@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use xearthlayer::airport::validate_airport_icao;
 use xearthlayer::config::{
-    analyze_config, config_file_path, format_size, DownloadConfig, TextureConfig,
+    analyze_config, config_file_path, format_size, ControlPlaneSettings, DownloadConfig,
+    PipelineSettings, TextureConfig,
 };
 use xearthlayer::manager::LocalPackageStore;
 use xearthlayer::package::PackageType;
@@ -159,6 +160,24 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     // Check if we'll use TUI (need to know before creating services)
     let use_tui = atty::is(atty::Stream::Stdout);
 
+    // Build pipeline settings from executor config (executor replaced the deprecated pipeline section)
+    let pipeline_settings = PipelineSettings {
+        max_http_concurrent: config.executor.network_concurrent,
+        max_cpu_concurrent: config.executor.cpu_concurrent,
+        max_prefetch_in_flight: config.pipeline.max_prefetch_in_flight,
+        request_timeout_secs: config.executor.request_timeout_secs,
+        max_retries: config.executor.max_retries,
+        retry_base_delay_ms: config.executor.retry_base_delay_ms,
+        coalesce_channel_capacity: config.pipeline.coalesce_channel_capacity,
+    };
+
+    let control_plane_settings = ControlPlaneSettings {
+        max_concurrent_jobs: config.control_plane.max_concurrent_jobs,
+        stall_threshold_secs: config.control_plane.stall_threshold_secs,
+        health_check_interval_secs: config.control_plane.health_check_interval_secs,
+        semaphore_timeout_secs: config.control_plane.semaphore_timeout_secs,
+    };
+
     let service_config = ServiceConfig::builder()
         .texture(texture_config)
         .download(download_config)
@@ -168,7 +187,8 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         .cache_disk_size(config.cache.disk_size)
         .generation_threads(config.generation.threads)
         .generation_timeout(config.generation.timeout)
-        .pipeline(config.pipeline.clone())
+        .pipeline(pipeline_settings)
+        .control_plane(control_plane_settings)
         .quiet_mode(use_tui) // Disable stats logging when TUI is active
         .build();
 

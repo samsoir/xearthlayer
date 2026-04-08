@@ -49,21 +49,9 @@ pub enum ConfigKey {
     TextureCompressor,
     TextureGpuDevice,
 
-    // Download settings
-    DownloadTimeout,
-
     // Generation settings
     GenerationThreads,
     GenerationTimeout,
-
-    // Pipeline settings
-    PipelineMaxHttpConcurrent,
-    PipelineMaxCpuConcurrent,
-    PipelineMaxPrefetchInFlight,
-    PipelineRequestTimeoutSecs,
-    PipelineMaxRetries,
-    PipelineRetryBaseDelayMs,
-    PipelineCoalesceChannelCapacity,
 
     // X-Plane settings
     XplaneSceneryDir,
@@ -106,12 +94,6 @@ pub enum ConfigKey {
     PrefetchBoxExtent,
     PrefetchBoxMaxBias,
 
-    // Control plane settings
-    ControlPlaneMaxConcurrentJobs,
-    ControlPlaneStallThresholdSecs,
-    ControlPlaneHealthCheckIntervalSecs,
-    ControlPlaneSemaphoreTimeoutSecs,
-
     // Prewarm settings
     PrewarmGridRows,
     PrewarmGridCols,
@@ -124,9 +106,7 @@ pub enum ConfigKey {
     ExecutorNetworkConcurrent,
     ExecutorCpuConcurrent,
     ExecutorDiskIoConcurrent,
-    ExecutorMaxConcurrentTasks,
-    ExecutorJobChannelCapacity,
-    ExecutorRequestChannelCapacity,
+    ExecutorMaxConcurrentJobs,
     ExecutorRequestTimeoutSecs,
     ExecutorMaxRetries,
     ExecutorRetryBaseDelayMs,
@@ -157,18 +137,8 @@ impl FromStr for ConfigKey {
             "texture.compressor" => Ok(ConfigKey::TextureCompressor),
             "texture.gpu_device" => Ok(ConfigKey::TextureGpuDevice),
 
-            "download.timeout" => Ok(ConfigKey::DownloadTimeout),
-
             "generation.threads" => Ok(ConfigKey::GenerationThreads),
             "generation.timeout" => Ok(ConfigKey::GenerationTimeout),
-
-            "pipeline.max_http_concurrent" => Ok(ConfigKey::PipelineMaxHttpConcurrent),
-            "pipeline.max_cpu_concurrent" => Ok(ConfigKey::PipelineMaxCpuConcurrent),
-            "pipeline.max_prefetch_in_flight" => Ok(ConfigKey::PipelineMaxPrefetchInFlight),
-            "pipeline.request_timeout_secs" => Ok(ConfigKey::PipelineRequestTimeoutSecs),
-            "pipeline.max_retries" => Ok(ConfigKey::PipelineMaxRetries),
-            "pipeline.retry_base_delay_ms" => Ok(ConfigKey::PipelineRetryBaseDelayMs),
-            "pipeline.coalesce_channel_capacity" => Ok(ConfigKey::PipelineCoalesceChannelCapacity),
 
             "xplane.scenery_dir" => Ok(ConfigKey::XplaneSceneryDir),
 
@@ -207,15 +177,6 @@ impl FromStr for ConfigKey {
             "prefetch.box_extent" => Ok(ConfigKey::PrefetchBoxExtent),
             "prefetch.box_max_bias" => Ok(ConfigKey::PrefetchBoxMaxBias),
 
-            "control_plane.max_concurrent_jobs" => Ok(ConfigKey::ControlPlaneMaxConcurrentJobs),
-            "control_plane.stall_threshold_secs" => Ok(ConfigKey::ControlPlaneStallThresholdSecs),
-            "control_plane.health_check_interval_secs" => {
-                Ok(ConfigKey::ControlPlaneHealthCheckIntervalSecs)
-            }
-            "control_plane.semaphore_timeout_secs" => {
-                Ok(ConfigKey::ControlPlaneSemaphoreTimeoutSecs)
-            }
-
             // Prewarm settings
             "prewarm.grid_rows" => Ok(ConfigKey::PrewarmGridRows),
             "prewarm.grid_cols" => Ok(ConfigKey::PrewarmGridCols),
@@ -228,9 +189,7 @@ impl FromStr for ConfigKey {
             "executor.network_concurrent" => Ok(ConfigKey::ExecutorNetworkConcurrent),
             "executor.cpu_concurrent" => Ok(ConfigKey::ExecutorCpuConcurrent),
             "executor.disk_io_concurrent" => Ok(ConfigKey::ExecutorDiskIoConcurrent),
-            "executor.max_concurrent_tasks" => Ok(ConfigKey::ExecutorMaxConcurrentTasks),
-            "executor.job_channel_capacity" => Ok(ConfigKey::ExecutorJobChannelCapacity),
-            "executor.request_channel_capacity" => Ok(ConfigKey::ExecutorRequestChannelCapacity),
+            "executor.max_concurrent_jobs" => Ok(ConfigKey::ExecutorMaxConcurrentJobs),
             "executor.request_timeout_secs" => Ok(ConfigKey::ExecutorRequestTimeoutSecs),
             "executor.max_retries" => Ok(ConfigKey::ExecutorMaxRetries),
             "executor.retry_base_delay_ms" => Ok(ConfigKey::ExecutorRetryBaseDelayMs),
@@ -260,16 +219,8 @@ impl ConfigKey {
             ConfigKey::TextureFormat => "texture.format",
             ConfigKey::TextureCompressor => "texture.compressor",
             ConfigKey::TextureGpuDevice => "texture.gpu_device",
-            ConfigKey::DownloadTimeout => "download.timeout",
             ConfigKey::GenerationThreads => "generation.threads",
             ConfigKey::GenerationTimeout => "generation.timeout",
-            ConfigKey::PipelineMaxHttpConcurrent => "pipeline.max_http_concurrent",
-            ConfigKey::PipelineMaxCpuConcurrent => "pipeline.max_cpu_concurrent",
-            ConfigKey::PipelineMaxPrefetchInFlight => "pipeline.max_prefetch_in_flight",
-            ConfigKey::PipelineRequestTimeoutSecs => "pipeline.request_timeout_secs",
-            ConfigKey::PipelineMaxRetries => "pipeline.max_retries",
-            ConfigKey::PipelineRetryBaseDelayMs => "pipeline.retry_base_delay_ms",
-            ConfigKey::PipelineCoalesceChannelCapacity => "pipeline.coalesce_channel_capacity",
             ConfigKey::XplaneSceneryDir => "xplane.scenery_dir",
             ConfigKey::PackagesLibraryUrl => "packages.library_url",
             ConfigKey::PackagesInstallLocation => "packages.install_location",
@@ -301,13 +252,6 @@ impl ConfigKey {
             ConfigKey::PrefetchWindowLonExtent => "prefetch.window_lon_extent",
             ConfigKey::PrefetchBoxExtent => "prefetch.box_extent",
             ConfigKey::PrefetchBoxMaxBias => "prefetch.box_max_bias",
-            ConfigKey::ControlPlaneMaxConcurrentJobs => "control_plane.max_concurrent_jobs",
-            ConfigKey::ControlPlaneStallThresholdSecs => "control_plane.stall_threshold_secs",
-            ConfigKey::ControlPlaneHealthCheckIntervalSecs => {
-                "control_plane.health_check_interval_secs"
-            }
-            ConfigKey::ControlPlaneSemaphoreTimeoutSecs => "control_plane.semaphore_timeout_secs",
-
             // Prewarm settings
             ConfigKey::PrewarmGridRows => "prewarm.grid_rows",
             ConfigKey::PrewarmGridCols => "prewarm.grid_cols",
@@ -320,9 +264,7 @@ impl ConfigKey {
             ConfigKey::ExecutorNetworkConcurrent => "executor.network_concurrent",
             ConfigKey::ExecutorCpuConcurrent => "executor.cpu_concurrent",
             ConfigKey::ExecutorDiskIoConcurrent => "executor.disk_io_concurrent",
-            ConfigKey::ExecutorMaxConcurrentTasks => "executor.max_concurrent_tasks",
-            ConfigKey::ExecutorJobChannelCapacity => "executor.job_channel_capacity",
-            ConfigKey::ExecutorRequestChannelCapacity => "executor.request_channel_capacity",
+            ConfigKey::ExecutorMaxConcurrentJobs => "executor.max_concurrent_jobs",
             ConfigKey::ExecutorRequestTimeoutSecs => "executor.request_timeout_secs",
             ConfigKey::ExecutorMaxRetries => "executor.max_retries",
             ConfigKey::ExecutorRetryBaseDelayMs => "executor.retry_base_delay_ms",
@@ -364,22 +306,8 @@ impl ConfigKey {
             ConfigKey::TextureFormat => config.texture.format.to_string().to_lowercase(),
             ConfigKey::TextureCompressor => config.texture.compressor.clone(),
             ConfigKey::TextureGpuDevice => config.texture.gpu_device.clone(),
-            ConfigKey::DownloadTimeout => config.download.timeout.to_string(),
             ConfigKey::GenerationThreads => config.generation.threads.to_string(),
             ConfigKey::GenerationTimeout => config.generation.timeout.to_string(),
-            ConfigKey::PipelineMaxHttpConcurrent => config.pipeline.max_http_concurrent.to_string(),
-            ConfigKey::PipelineMaxCpuConcurrent => config.pipeline.max_cpu_concurrent.to_string(),
-            ConfigKey::PipelineMaxPrefetchInFlight => {
-                config.pipeline.max_prefetch_in_flight.to_string()
-            }
-            ConfigKey::PipelineRequestTimeoutSecs => {
-                config.pipeline.request_timeout_secs.to_string()
-            }
-            ConfigKey::PipelineMaxRetries => config.pipeline.max_retries.to_string(),
-            ConfigKey::PipelineRetryBaseDelayMs => config.pipeline.retry_base_delay_ms.to_string(),
-            ConfigKey::PipelineCoalesceChannelCapacity => {
-                config.pipeline.coalesce_channel_capacity.to_string()
-            }
             ConfigKey::XplaneSceneryDir => config
                 .xplane
                 .scenery_dir
@@ -446,19 +374,6 @@ impl ConfigKey {
             ConfigKey::PrefetchWindowLonExtent => config.prefetch.window_lon_extent.to_string(),
             ConfigKey::PrefetchBoxExtent => config.prefetch.box_extent.to_string(),
             ConfigKey::PrefetchBoxMaxBias => config.prefetch.box_max_bias.to_string(),
-            ConfigKey::ControlPlaneMaxConcurrentJobs => {
-                config.control_plane.max_concurrent_jobs.to_string()
-            }
-            ConfigKey::ControlPlaneStallThresholdSecs => {
-                config.control_plane.stall_threshold_secs.to_string()
-            }
-            ConfigKey::ControlPlaneHealthCheckIntervalSecs => {
-                config.control_plane.health_check_interval_secs.to_string()
-            }
-            ConfigKey::ControlPlaneSemaphoreTimeoutSecs => {
-                config.control_plane.semaphore_timeout_secs.to_string()
-            }
-
             // Prewarm settings
             ConfigKey::PrewarmGridRows => config.prewarm.grid_rows.to_string(),
             ConfigKey::PrewarmGridCols => config.prewarm.grid_cols.to_string(),
@@ -476,14 +391,8 @@ impl ConfigKey {
             ConfigKey::ExecutorNetworkConcurrent => config.executor.network_concurrent.to_string(),
             ConfigKey::ExecutorCpuConcurrent => config.executor.cpu_concurrent.to_string(),
             ConfigKey::ExecutorDiskIoConcurrent => config.executor.disk_io_concurrent.to_string(),
-            ConfigKey::ExecutorMaxConcurrentTasks => {
-                config.executor.max_concurrent_tasks.to_string()
-            }
-            ConfigKey::ExecutorJobChannelCapacity => {
-                config.executor.job_channel_capacity.to_string()
-            }
-            ConfigKey::ExecutorRequestChannelCapacity => {
-                config.executor.request_channel_capacity.to_string()
+            ConfigKey::ExecutorMaxConcurrentJobs => {
+                config.control_plane.max_concurrent_jobs.to_string()
             }
             ConfigKey::ExecutorRequestTimeoutSecs => {
                 config.executor.request_timeout_secs.to_string()
@@ -551,35 +460,11 @@ impl ConfigKey {
             ConfigKey::TextureGpuDevice => {
                 config.texture.gpu_device = value.to_string();
             }
-            ConfigKey::DownloadTimeout => {
-                config.download.timeout = value.parse().unwrap();
-            }
             ConfigKey::GenerationThreads => {
                 config.generation.threads = value.parse().unwrap();
             }
             ConfigKey::GenerationTimeout => {
                 config.generation.timeout = value.parse().unwrap();
-            }
-            ConfigKey::PipelineMaxHttpConcurrent => {
-                config.pipeline.max_http_concurrent = value.parse().unwrap();
-            }
-            ConfigKey::PipelineMaxCpuConcurrent => {
-                config.pipeline.max_cpu_concurrent = value.parse().unwrap();
-            }
-            ConfigKey::PipelineMaxPrefetchInFlight => {
-                config.pipeline.max_prefetch_in_flight = value.parse().unwrap();
-            }
-            ConfigKey::PipelineRequestTimeoutSecs => {
-                config.pipeline.request_timeout_secs = value.parse().unwrap();
-            }
-            ConfigKey::PipelineMaxRetries => {
-                config.pipeline.max_retries = value.parse().unwrap();
-            }
-            ConfigKey::PipelineRetryBaseDelayMs => {
-                config.pipeline.retry_base_delay_ms = value.parse().unwrap();
-            }
-            ConfigKey::PipelineCoalesceChannelCapacity => {
-                config.pipeline.coalesce_channel_capacity = value.parse().unwrap();
             }
             ConfigKey::XplaneSceneryDir => {
                 config.xplane.scenery_dir = optional_path(value);
@@ -665,19 +550,6 @@ impl ConfigKey {
             ConfigKey::PrefetchBoxMaxBias => {
                 config.prefetch.box_max_bias = value.parse().unwrap();
             }
-            ConfigKey::ControlPlaneMaxConcurrentJobs => {
-                config.control_plane.max_concurrent_jobs = value.parse().unwrap();
-            }
-            ConfigKey::ControlPlaneStallThresholdSecs => {
-                config.control_plane.stall_threshold_secs = value.parse().unwrap();
-            }
-            ConfigKey::ControlPlaneHealthCheckIntervalSecs => {
-                config.control_plane.health_check_interval_secs = value.parse().unwrap();
-            }
-            ConfigKey::ControlPlaneSemaphoreTimeoutSecs => {
-                config.control_plane.semaphore_timeout_secs = value.parse().unwrap();
-            }
-
             // Prewarm settings
             ConfigKey::PrewarmGridRows => {
                 config.prewarm.grid_rows = value.parse().unwrap();
@@ -705,14 +577,8 @@ impl ConfigKey {
             ConfigKey::ExecutorDiskIoConcurrent => {
                 config.executor.disk_io_concurrent = value.parse().unwrap();
             }
-            ConfigKey::ExecutorMaxConcurrentTasks => {
-                config.executor.max_concurrent_tasks = value.parse().unwrap();
-            }
-            ConfigKey::ExecutorJobChannelCapacity => {
-                config.executor.job_channel_capacity = value.parse().unwrap();
-            }
-            ConfigKey::ExecutorRequestChannelCapacity => {
-                config.executor.request_channel_capacity = value.parse().unwrap();
+            ConfigKey::ExecutorMaxConcurrentJobs => {
+                config.control_plane.max_concurrent_jobs = value.parse().unwrap();
             }
             ConfigKey::ExecutorRequestTimeoutSecs => {
                 config.executor.request_timeout_secs = value.parse().unwrap();
@@ -763,16 +629,8 @@ impl ConfigKey {
             ConfigKey::TextureFormat => Box::new(OneOfSpec::new(&["bc1", "bc3"])),
             ConfigKey::TextureCompressor => Box::new(OneOfSpec::new(&["software", "ispc", "gpu"])),
             ConfigKey::TextureGpuDevice => Box::new(NonEmptyStringSpec),
-            ConfigKey::DownloadTimeout => Box::new(PositiveIntegerSpec),
             ConfigKey::GenerationThreads => Box::new(PositiveIntegerSpec),
             ConfigKey::GenerationTimeout => Box::new(PositiveIntegerSpec),
-            ConfigKey::PipelineMaxHttpConcurrent => Box::new(PositiveIntegerSpec),
-            ConfigKey::PipelineMaxCpuConcurrent => Box::new(PositiveIntegerSpec),
-            ConfigKey::PipelineMaxPrefetchInFlight => Box::new(PositiveIntegerSpec),
-            ConfigKey::PipelineRequestTimeoutSecs => Box::new(PositiveIntegerSpec),
-            ConfigKey::PipelineMaxRetries => Box::new(PositiveIntegerSpec),
-            ConfigKey::PipelineRetryBaseDelayMs => Box::new(PositiveIntegerSpec),
-            ConfigKey::PipelineCoalesceChannelCapacity => Box::new(PositiveIntegerSpec),
             ConfigKey::XplaneSceneryDir => Box::new(OptionalPathSpec),
             ConfigKey::PackagesLibraryUrl => Box::new(OptionalUrlSpec),
             ConfigKey::PackagesInstallLocation => Box::new(OptionalPathSpec),
@@ -805,11 +663,6 @@ impl ConfigKey {
             ConfigKey::PrefetchWindowLonExtent => Box::new(FloatRangeSpec::new(1.0, 10.0)),
             ConfigKey::PrefetchBoxExtent => Box::new(FloatRangeSpec::new(7.0, 15.0)),
             ConfigKey::PrefetchBoxMaxBias => Box::new(FloatRangeSpec::new(0.5, 0.9)),
-            ConfigKey::ControlPlaneMaxConcurrentJobs => Box::new(PositiveIntegerSpec),
-            ConfigKey::ControlPlaneStallThresholdSecs => Box::new(PositiveIntegerSpec),
-            ConfigKey::ControlPlaneHealthCheckIntervalSecs => Box::new(PositiveIntegerSpec),
-            ConfigKey::ControlPlaneSemaphoreTimeoutSecs => Box::new(PositiveIntegerSpec),
-
             // Prewarm settings
             ConfigKey::PrewarmGridRows => Box::new(PositiveIntegerSpec),
             ConfigKey::PrewarmGridCols => Box::new(PositiveIntegerSpec),
@@ -822,9 +675,7 @@ impl ConfigKey {
             ConfigKey::ExecutorNetworkConcurrent => Box::new(PositiveIntegerSpec),
             ConfigKey::ExecutorCpuConcurrent => Box::new(PositiveIntegerSpec),
             ConfigKey::ExecutorDiskIoConcurrent => Box::new(PositiveIntegerSpec),
-            ConfigKey::ExecutorMaxConcurrentTasks => Box::new(PositiveIntegerSpec),
-            ConfigKey::ExecutorJobChannelCapacity => Box::new(PositiveIntegerSpec),
-            ConfigKey::ExecutorRequestChannelCapacity => Box::new(PositiveIntegerSpec),
+            ConfigKey::ExecutorMaxConcurrentJobs => Box::new(IntegerRangeSpec::new(1, 256)),
             ConfigKey::ExecutorRequestTimeoutSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ExecutorMaxRetries => Box::new(PositiveIntegerSpec),
             ConfigKey::ExecutorRetryBaseDelayMs => Box::new(PositiveIntegerSpec),
@@ -854,10 +705,8 @@ impl ConfigKey {
             ConfigKey::TextureFormat,
             ConfigKey::TextureCompressor,
             ConfigKey::TextureGpuDevice,
-            ConfigKey::DownloadTimeout,
             ConfigKey::GenerationThreads,
             ConfigKey::GenerationTimeout,
-            // Note: pipeline.* keys are deprecated - use executor.* instead
             ConfigKey::XplaneSceneryDir,
             ConfigKey::PackagesLibraryUrl,
             ConfigKey::PackagesInstallLocation,
@@ -885,10 +734,6 @@ impl ConfigKey {
             ConfigKey::PrefetchWindowLonExtent,
             ConfigKey::PrefetchBoxExtent,
             ConfigKey::PrefetchBoxMaxBias,
-            ConfigKey::ControlPlaneMaxConcurrentJobs,
-            ConfigKey::ControlPlaneStallThresholdSecs,
-            ConfigKey::ControlPlaneHealthCheckIntervalSecs,
-            ConfigKey::ControlPlaneSemaphoreTimeoutSecs,
             // Prewarm settings
             ConfigKey::PrewarmGridRows,
             ConfigKey::PrewarmGridCols,
@@ -899,9 +744,7 @@ impl ConfigKey {
             ConfigKey::ExecutorNetworkConcurrent,
             ConfigKey::ExecutorCpuConcurrent,
             ConfigKey::ExecutorDiskIoConcurrent,
-            ConfigKey::ExecutorMaxConcurrentTasks,
-            ConfigKey::ExecutorJobChannelCapacity,
-            ConfigKey::ExecutorRequestChannelCapacity,
+            ConfigKey::ExecutorMaxConcurrentJobs,
             ConfigKey::ExecutorRequestTimeoutSecs,
             ConfigKey::ExecutorMaxRetries,
             ConfigKey::ExecutorRetryBaseDelayMs,
@@ -1199,7 +1042,7 @@ mod tests {
         let config = ConfigFile::default();
 
         assert_eq!(ConfigKey::ProviderType.get(&config), "bing");
-        assert_eq!(ConfigKey::DownloadTimeout.get(&config), "30");
+        assert_eq!(ConfigKey::GenerationTimeout.get(&config), "10");
         assert_eq!(ConfigKey::PackagesAutoInstallOverlays.get(&config), "false");
     }
 
@@ -1210,8 +1053,8 @@ mod tests {
         ConfigKey::ProviderType.set(&mut config, "google").unwrap();
         assert_eq!(config.provider.provider_type, "google");
 
-        ConfigKey::DownloadTimeout.set(&mut config, "60").unwrap();
-        assert_eq!(config.download.timeout, 60);
+        ConfigKey::GenerationTimeout.set(&mut config, "60").unwrap();
+        assert_eq!(config.generation.timeout, 60);
 
         ConfigKey::PackagesAutoInstallOverlays
             .set(&mut config, "true")
@@ -1270,10 +1113,10 @@ mod tests {
 
     #[test]
     fn test_validate_positive_integer() {
-        assert!(ConfigKey::DownloadTimeout.validate("30").is_ok());
-        assert!(ConfigKey::DownloadTimeout.validate("0").is_ok());
-        assert!(ConfigKey::DownloadTimeout.validate("-1").is_err());
-        assert!(ConfigKey::DownloadTimeout.validate("abc").is_err());
+        assert!(ConfigKey::GenerationTimeout.validate("30").is_ok());
+        assert!(ConfigKey::GenerationTimeout.validate("0").is_ok());
+        assert!(ConfigKey::GenerationTimeout.validate("-1").is_err());
+        assert!(ConfigKey::GenerationTimeout.validate("abc").is_err());
     }
 
     #[test]
