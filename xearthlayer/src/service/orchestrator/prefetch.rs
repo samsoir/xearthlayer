@@ -38,8 +38,15 @@ impl ServiceOrchestrator {
 
         let runtime_handle = service.runtime_handle().clone();
 
+        let dds_disk_checker = service.dds_disk_checker();
+
         if let Some(memory_cache) = service.memory_cache_bridge() {
-            self.start_prefetch_with_cache(&runtime_handle, dds_client, memory_cache)?;
+            self.start_prefetch_with_cache(
+                &runtime_handle,
+                dds_client,
+                memory_cache,
+                dds_disk_checker,
+            )?;
         } else {
             tracing::warn!("Memory cache not available, prefetch disabled");
             return Ok(());
@@ -54,6 +61,7 @@ impl ServiceOrchestrator {
         runtime_handle: &Handle,
         dds_client: Arc<dyn DdsClient>,
         memory_cache: Arc<M>,
+        dds_disk_checker: Option<Arc<dyn crate::executor::DdsDiskCacheChecker>>,
     ) -> Result<(), ServiceError> {
         use crate::prefetch::AircraftState as PrefetchAircraftState;
 
@@ -120,6 +128,14 @@ impl ServiceOrchestrator {
 
         // Wire memory cache for tile existence checks (Bug 5 fix)
         coordinator = coordinator.with_memory_cache(memory_cache);
+
+        // Wire DDS disk cache checker for stale InProgress region evaluation (#157)
+        if let Some(checker) = dds_disk_checker {
+            coordinator = coordinator.with_dds_disk_checker(checker);
+            tracing::info!(
+                "DDS disk cache checker wired to prefetch (stale region evaluation enabled)"
+            );
+        }
 
         // Wire scenery index if available
         if self.scenery_index.tile_count() > 0 {

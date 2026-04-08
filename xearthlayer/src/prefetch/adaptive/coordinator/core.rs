@@ -10,8 +10,11 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::coord::TileCoord;
-use crate::executor::{DaemonMemoryCache, DdsClient};
-use crate::geo_index::{DsfRegion, GeoIndex};
+use crate::executor::{DaemonMemoryCache, DdsClient, DdsDiskCacheChecker};
+
+/// Maximum demotion attempts before marking a region as NoCoverage.
+const MAX_REGION_ATTEMPTS: u8 = 3;
+use crate::geo_index::{DsfRegion, GeoIndex, PrefetchedRegion};
 use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::state::{AircraftState, SharedPrefetchStatus};
 use crate::prefetch::SceneryIndex;
@@ -171,6 +174,19 @@ pub struct AdaptivePrefetchCoordinator {
     /// bug where large boundary plans are partially submitted and the remainder
     /// is permanently lost.
     pub(super) pending_tiles: Vec<TileCoord>,
+
+    /// DDS disk cache checker for verifying tile existence during stale region evaluation.
+    ///
+    /// When an InProgress region becomes stale, we check if its tiles exist on DDS disk
+    /// before deciding to promote (tiles exist) or demote (tiles missing) the region.
+    dds_disk_checker: Option<Arc<dyn DdsDiskCacheChecker>>,
+
+    /// Tracks demotion attempts per region to prevent infinite retry loops.
+    ///
+    /// Incremented each time an InProgress region is demoted (tiles not on disk after
+    /// stale timeout). After [`MAX_REGION_ATTEMPTS`] demotions, the region is marked
+    /// NoCoverage and permanently excluded for this session.
+    region_attempts: std::collections::HashMap<DsfRegion, u8>,
 }
 
 impl std::fmt::Debug for AdaptivePrefetchCoordinator {
@@ -219,6 +235,8 @@ impl AdaptivePrefetchCoordinator {
             scene_tracker: None,
             scenery_index: None,
             pending_tiles: Vec::new(),
+            dds_disk_checker: None,
+            region_attempts: std::collections::HashMap::new(),
         }
     }
 
@@ -295,6 +313,15 @@ impl AdaptivePrefetchCoordinator {
     /// Set the geospatial reference index for patched region filtering.
     pub fn with_geo_index(mut self, geo_index: Arc<GeoIndex>) -> Self {
         self.geo_index = Some(geo_index);
+        self
+    }
+
+    /// Set the DDS disk cache checker for stale region evaluation.
+    ///
+    /// When set, stale InProgress regions are checked against the DDS disk cache.
+    /// Tiles found on disk trigger promotion; tiles not found trigger demotion.
+    pub fn with_dds_disk_checker(mut self, checker: Arc<dyn DdsDiskCacheChecker>) -> Self {
+        self.dds_disk_checker = Some(checker);
         self
     }
 
@@ -864,22 +891,111 @@ impl AdaptivePrefetchCoordinator {
     /// This must run every cycle regardless of whether a prefetch plan was generated,
     /// otherwise InProgress regions block future boundary cycles indefinitely.
     pub fn run_region_maintenance(&mut self) {
-        if let Some(ref geo_index) = self.geo_index {
-            BoundaryStrategy::sweep_stale_regions(geo_index, self.config.stale_region_timeout);
-            BoundaryStrategy::promote_completed_regions(
-                geo_index,
-                &self.cached_tiles,
-                self.scenery_index.as_ref(),
-            );
-            // Evict PrefetchedRegion entries for regions outside the retained window,
-            // making them eligible for re-prefetch when the aircraft returns.
-            BoundaryStrategy::evict_non_retained(geo_index);
-            // Evict cached_tiles entries for tiles outside the retained window,
-            // allowing re-query of the memory cache for those tiles.
-            BoundaryStrategy::evict_cached_tiles_outside_retained(
-                &mut self.cached_tiles,
-                geo_index,
-            );
+        let geo_index = match self.geo_index {
+            Some(ref gi) => Arc::clone(gi),
+            None => return,
+        };
+
+        // Evaluate stale InProgress regions: promote if tiles on disk, demote if not.
+        // This replaces the old sweep_stale_regions which blindly removed stale regions
+        // without checking whether tiles had actually been generated.
+        self.evaluate_stale_regions(&geo_index);
+
+        BoundaryStrategy::promote_completed_regions(
+            &geo_index,
+            &self.cached_tiles,
+            self.scenery_index.as_ref(),
+        );
+        // Evict PrefetchedRegion entries for regions outside the retained window,
+        // making them eligible for re-prefetch when the aircraft returns.
+        BoundaryStrategy::evict_non_retained(&geo_index);
+        // Evict cached_tiles entries for tiles outside the retained window,
+        // allowing re-query of the memory cache for those tiles.
+        BoundaryStrategy::evict_cached_tiles_outside_retained(&mut self.cached_tiles, &geo_index);
+    }
+
+    /// Evaluate stale InProgress regions and decide: promote, demote, or NoCoverage.
+    ///
+    /// For each InProgress region that has exceeded the stale timeout:
+    /// 1. Check if tiles exist on DDS disk cache → promote to Prefetched
+    /// 2. If tiles not on disk, check attempt counter:
+    ///    - Under limit → remove from GeoIndex (allows retry on next cycle)
+    ///    - At limit → mark NoCoverage (permanently excluded this session)
+    fn evaluate_stale_regions(&mut self, geo_index: &GeoIndex) {
+        let stale: Vec<DsfRegion> = geo_index
+            .iter::<PrefetchedRegion>()
+            .into_iter()
+            .filter(|(_, region)| region.is_stale(self.config.stale_region_timeout))
+            .map(|(dsf, _)| dsf)
+            .collect();
+
+        if stale.is_empty() {
+            return;
+        }
+
+        let strategy = BoundaryStrategy::new();
+
+        for region in stale {
+            let tiles =
+                BoundaryStrategy::tiles_for_region(&strategy, &region, self.scenery_index.as_ref());
+
+            // Check if tiles exist on DDS disk cache
+            let tiles_on_disk = if let Some(ref checker) = self.dds_disk_checker {
+                // Use a synchronous block_on since we're in an async context
+                // but evaluate_stale_regions is called from the sync maintenance path.
+                // The DdsDiskCacheChecker::tile_exists is backed by an O(1) in-memory
+                // DashMap lookup, so blocking is negligible.
+                let checker = Arc::clone(checker);
+                let tiles_clone = tiles.clone();
+                tokio::task::block_in_place(|| {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(async {
+                        if tiles_clone.is_empty() {
+                            return false;
+                        }
+                        // Check a sample — if the first tile exists, assume the region is covered
+                        let t = &tiles_clone[0];
+                        checker.tile_exists(t.row, t.col, t.zoom).await
+                    })
+                })
+            } else {
+                false
+            };
+
+            if tiles_on_disk {
+                // Tiles generated successfully — promote despite lost cached_tiles tracking
+                geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
+                tracing::info!(
+                    lat = region.lat,
+                    lon = region.lon,
+                    "Stale InProgress region promoted — tiles found on DDS disk"
+                );
+            } else {
+                let attempts = self.region_attempts.entry(region).or_insert(0);
+                *attempts += 1;
+
+                if *attempts >= MAX_REGION_ATTEMPTS {
+                    // Exhausted retries — mark permanently excluded
+                    geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::no_coverage());
+                    tracing::warn!(
+                        lat = region.lat,
+                        lon = region.lon,
+                        attempts = *attempts,
+                        "Region marked NoCoverage after {} failed attempts",
+                        MAX_REGION_ATTEMPTS
+                    );
+                } else {
+                    // Remove from GeoIndex to allow retry on next cycle
+                    geo_index.remove::<PrefetchedRegion>(&region);
+                    tracing::info!(
+                        lat = region.lat,
+                        lon = region.lon,
+                        attempt = *attempts,
+                        max = MAX_REGION_ATTEMPTS,
+                        "Stale InProgress region demoted for retry"
+                    );
+                }
+            }
         }
     }
 

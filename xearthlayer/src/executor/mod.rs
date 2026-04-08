@@ -196,8 +196,8 @@ pub use cache_adapter::ExecutorCacheAdapter;
 // Core traits (decoupled from pipeline module)
 pub use traits::{
     BlockingExecutor, ChunkDownloadError, ChunkProvider, ConcurrentResults, ConcurrentRunner,
-    DdsDiskCache, DiskCache, ExecutorError, MemoryCache, TextureEncodeError, TextureEncoderAsync,
-    Timer, TokioExecutor,
+    DdsDiskCache, DdsDiskCacheChecker, DiskCache, ExecutorError, MemoryCache, TextureEncodeError,
+    TextureEncoderAsync, Timer, TokioExecutor,
 };
 
 // Chunk results (for download/assemble stages)
