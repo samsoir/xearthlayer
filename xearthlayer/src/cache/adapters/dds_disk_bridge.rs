@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::cache::clients::TileCacheClient;
 use crate::cache::traits::Cache;
 use crate::coord::TileCoord;
-use crate::executor::DdsDiskCache;
+use crate::executor::{DdsDiskCache, DdsDiskCacheChecker};
 
 /// Bridge adapter implementing `executor::DdsDiskCache` using the cache service.
 ///
@@ -58,6 +58,20 @@ impl DdsDiskCache for DdsDiskCacheBridge {
             let tile = TileCoord { row, col, zoom };
             self.client.contains(&tile).await
         }
+    }
+}
+
+impl DdsDiskCacheChecker for DdsDiskCacheBridge {
+    fn tile_exists(
+        &self,
+        row: u32,
+        col: u32,
+        zoom: u8,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async move {
+            let tile = TileCoord { row, col, zoom };
+            self.client.contains(&tile).await
+        })
     }
 }
 

@@ -357,6 +357,19 @@ impl XEarthLayerService {
         self.memory_cache_bridge.clone()
     }
 
+    /// Get the DDS disk cache checker for tile existence verification.
+    ///
+    /// Returns the `DdsDiskCacheBridge` as a `DdsDiskCacheChecker` trait object.
+    /// Used by the prefetch system to verify whether tiles were generated when
+    /// evaluating stale InProgress regions.
+    ///
+    /// Returns `None` if caching is disabled.
+    pub fn dds_disk_checker(&self) -> Option<Arc<dyn crate::executor::DdsDiskCacheChecker>> {
+        self.cache_layer.as_ref().map(|cl| {
+            Arc::clone(&cl.dds_disk_bridge()) as Arc<dyn crate::executor::DdsDiskCacheChecker>
+        })
+    }
+
     /// Shutdown the cache layer gracefully.
     ///
     /// This stops the GC daemon and flushes pending operations.

@@ -133,7 +133,7 @@ impl BoundaryStrategy {
     ///
     /// Queries the scenery index for actual installed tiles (at correct zoom
     /// levels), falling back to geometric 4x4 grid at zoom 14.
-    fn tiles_for_region(
+    pub fn tiles_for_region(
         strategy: &BoundaryStrategy,
         region: &DsfRegion,
         scenery_index: Option<&Arc<SceneryIndex>>,

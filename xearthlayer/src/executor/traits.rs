@@ -261,6 +261,28 @@ pub trait DdsDiskCache: Send + Sync + 'static {
 }
 
 // ============================================================================
+// DDS Disk Cache Checker (object-safe)
+// ============================================================================
+
+/// Object-safe trait for checking DDS tile existence on disk.
+///
+/// This is a subset of [`DdsDiskCache`] using `Pin<Box<dyn Future>>` returns
+/// so it can be used as `Arc<dyn DdsDiskCacheChecker>`. Used by the prefetch
+/// coordinator to verify whether tiles were generated before demoting stale
+/// InProgress regions.
+pub trait DdsDiskCacheChecker: Send + Sync + 'static {
+    /// Checks if a tile exists in the disk cache index.
+    ///
+    /// O(1) in-memory check against the LRU index (no disk I/O).
+    fn tile_exists(
+        &self,
+        row: u32,
+        col: u32,
+        zoom: u8,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>;
+}
+
+// ============================================================================
 // Blocking Executor Trait
 // ============================================================================
 
