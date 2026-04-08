@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-04-07
+
+### Changed
+
+- **Memory cache size reporting moved to provider** ([#156](https://github.com/samsoir/xearthlayer/issues/156)): `MemoryCacheProvider` now self-reports its size to metrics internally after each write/delete/GC, replacing the push-based pattern where callers emitted size after each operation. Eliminates cache domain logic leaking into tasks and adapters.
+
+- **Configuration audit and consolidation** ([#159](https://github.com/samsoir/xearthlayer/issues/159), [#160](https://github.com/samsoir/xearthlayer/issues/160)): Removed 15 unused or redundant config keys (`[pipeline]`, `[download]`, `[control_plane]` sections and executor internals). Wired previously ignored executor settings (`cpu_concurrent`, `max_concurrent_jobs`, `request_timeout_secs`, `max_retries`). Default CPU concurrency reduced to 50% of logical cores for X-Plane coexistence.
+
+### Fixed
+
+- **Prefetch InProgress dead state** ([#157](https://github.com/samsoir/xearthlayer/issues/157)): Regions marked `InProgress` by the prefetch boundary strategy could enter a permanent dead state — never promoted to `Prefetched` and never retried. Added three-layer protection: DDS disk cache verification (promotes regions with tiles on disk), retry with attempt counter (up to 3 attempts), and `NoCoverage` fallback for persistently failing regions.
+
+- **DDS disk cache metrics not displayed in TUI** ([#156](https://github.com/samsoir/xearthlayer/issues/156)): DDS disk cache hits were not emitting `disk_cache_hit` or `fuse_tile_served` metric events, causing the TUI to show 0% disk hit rate despite the cache working correctly. Added metric emissions on the DDS disk → memory promotion path.
+
+- **Memory cache size showing 0 bytes in TUI** ([#156](https://github.com/samsoir/xearthlayer/issues/156)): Memory cache size metric was only emitted from external callers, missing the DDS disk → memory promotion path. Provider self-reporting ensures the metric is always current.
+
+- **Session summary not printed on shutdown** ([#156](https://github.com/samsoir/xearthlayer/issues/156)): The session summary at exit was gated on `jobs_completed > 0`, which skipped it when all tiles were served from cache. Gate removed.
+
 ## [0.4.2] - 2026-04-06
 
 ### Added
@@ -955,7 +973,8 @@ Run `xearthlayer config upgrade` to automatically add new settings with defaults
 - Linux support only (Windows and macOS planned for future releases)
 - Requires FUSE3 for filesystem mounting
 
-[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/samsoir/xearthlayer/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/samsoir/xearthlayer/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/samsoir/xearthlayer/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/samsoir/xearthlayer/compare/v0.3.1...v0.4.0
