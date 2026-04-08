@@ -37,10 +37,12 @@ pub fn default_http_concurrent() -> usize {
     DEFAULT_HTTP_CONCURRENT
 }
 
-/// Default CPU concurrency limit: num_cpus * 1.25, minimum num_cpus + 2
+/// Default CPU concurrency limit: num_cpus / 2, minimum 2.
+///
+/// Leaves headroom for X-Plane's render thread. 50% of cores provides
+/// good tile throughput without starving the simulator.
 pub fn default_cpu_concurrent() -> usize {
-    let cpus = num_cpus();
-    ((cpus as f64 * 1.25).ceil() as usize).max(cpus + 2)
+    (num_cpus() / 2).max(2)
 }
 
 /// Default prefetch in-flight limit: max(num_cpus / 4, 2)
@@ -48,15 +50,19 @@ pub fn default_prefetch_in_flight() -> usize {
     (num_cpus() / 4).max(2)
 }
 
-/// Default max concurrent jobs: num_cpus × scaling factor
+/// Default max concurrent jobs: ceil(num_cpus × 0.75), minimum 4.
+///
+/// Limits total in-flight jobs (download + encode pipeline) to prevent
+/// over-admission while keeping the executor fed.
 pub fn default_max_concurrent_jobs() -> usize {
-    num_cpus() * DEFAULT_CONTROL_PLANE_JOB_SCALING_FACTOR
+    ((num_cpus() as f64 * 0.75).ceil() as usize).max(4)
 }
 
-/// Default executor CPU concurrent: num_cpus * 1.25, minimum num_cpus + 2
+/// Default executor CPU concurrent: num_cpus / 2, minimum 2.
+///
+/// Matches the pipeline CPU concurrent default — leaves headroom for X-Plane.
 pub fn default_executor_cpu_concurrent() -> usize {
-    let cpus = num_cpus();
-    ((cpus as f64 * 1.25).ceil() as usize).max(cpus + 2)
+    (num_cpus() / 2).max(2)
 }
 
 /// Clamps HTTP concurrency to valid range and logs a warning if clamped.
@@ -275,8 +281,8 @@ pub const DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
 /// Default semaphore timeout in seconds for acquiring a job slot.
 pub const DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS: u64 = 30;
 
-/// Scaling factor for max concurrent jobs relative to CPU count.
-pub const DEFAULT_CONTROL_PLANE_JOB_SCALING_FACTOR: usize = 2;
+// Note: DEFAULT_CONTROL_PLANE_JOB_SCALING_FACTOR removed — default_max_concurrent_jobs()
+// now uses ceil(num_cpus * 0.75) directly.
 
 // =============================================================================
 // Texture defaults
@@ -362,7 +368,7 @@ impl Default for ConfigFile {
                 timeout: DEFAULT_DOWNLOAD_TIMEOUT_SECS,
             },
             generation: GenerationSettings {
-                threads: num_cpus(),
+                threads: (num_cpus() / 2).max(2),
                 timeout: DEFAULT_GENERATION_TIMEOUT_SECS,
             },
             pipeline: PipelineSettings {

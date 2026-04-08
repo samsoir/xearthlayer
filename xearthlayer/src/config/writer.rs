@@ -103,12 +103,8 @@ compressor = {}
 ; GPU device selector for gpu compressor: integrated, discrete, or adapter name substring
 gpu_device = {}
 
-[download]
-; Timeout in seconds for HTTP requests (default: 30)
-timeout = {}
-
 [generation]
-; Number of threads for parallel tile generation (default: number of CPU cores)
+; Number of threads for parallel tile generation (default: num_cpus / 2)
 ; WARNING: Do not set this higher than your CPU core count
 threads = {}
 ; Timeout in seconds for generating a single tile (default: 10)
@@ -122,18 +118,12 @@ timeout = {}
 ; Resource pool capacities (concurrent operations by type)
 ; Network: HTTP connections for chunk downloads (default: 128, clamped to 64-256)
 network_concurrent = {}
-; CPU: Assemble + encode operations (default: num_cpus * 1.25)
+; CPU: Assemble + encode operations (default: num_cpus / 2)
 cpu_concurrent = {}
 ; Disk I/O: Cache read/write operations (default: 64 for SSD)
 disk_io_concurrent = {}
-
-; Job processing limits
-; Maximum concurrent tasks the executor can run (default: 128)
-max_concurrent_tasks = {}
-; Internal job queue capacity (default: 256)
-job_channel_capacity = {}
-; External request queue from FUSE/prefetch (default: 1000)
-request_channel_capacity = {}
+; Maximum concurrent DDS tile jobs (default: ceil(num_cpus × 0.75))
+max_concurrent_jobs = {}
 
 ; Download behavior
 ; HTTP request timeout in seconds for individual chunk downloads (default: 10)
@@ -235,23 +225,6 @@ box_extent = {}
 ; 0.5 = symmetric, 0.8 = 80% ahead / 20% behind on the primary axis
 box_max_bias = {}
 
-[control_plane]
-; Advanced settings for job management and health monitoring.
-; Defaults are tuned for most systems. Only modify if you understand the implications.
-
-; Maximum concurrent DDS requests (jobs) allowed (default: num_cpus × 2)
-; Higher values increase parallelism but may cause resource contention
-max_concurrent_jobs = {}
-; Time threshold in seconds for considering a job stalled (default: 60)
-; Jobs in the same stage longer than this are automatically recovered
-stall_threshold_secs = {}
-; Interval in seconds for health monitoring checks (default: 5)
-; More frequent checks detect issues faster but add overhead
-health_check_interval_secs = {}
-; Timeout in seconds for acquiring a job slot (default: 30)
-; On-demand requests wait up to this long before timing out
-semaphore_timeout_secs = {}
-
 [prewarm]
 ; Settings for cold-start cache pre-warming.
 ; Use with --airport ICAO to pre-load tiles around an airport before flight.
@@ -300,16 +273,13 @@ congestion_threshold = {}
         config.texture.format.to_string().to_lowercase(),
         config.texture.compressor,
         config.texture.gpu_device,
-        config.download.timeout,
         config.generation.threads,
         config.generation.timeout,
         // Executor settings
         config.executor.network_concurrent,
         config.executor.cpu_concurrent,
         config.executor.disk_io_concurrent,
-        config.executor.max_concurrent_tasks,
-        config.executor.job_channel_capacity,
-        config.executor.request_channel_capacity,
+        config.control_plane.max_concurrent_jobs,
         config.executor.request_timeout_secs,
         config.executor.max_retries,
         config.executor.retry_base_delay_ms,
@@ -340,10 +310,6 @@ congestion_threshold = {}
         config.prefetch.window_lon_extent,
         config.prefetch.box_extent,
         config.prefetch.box_max_bias,
-        config.control_plane.max_concurrent_jobs,
-        config.control_plane.stall_threshold_secs,
-        config.control_plane.health_check_interval_secs,
-        config.control_plane.semaphore_timeout_secs,
         config.prewarm.grid_rows,
         config.prewarm.grid_cols,
         config.patches.enabled,
@@ -384,7 +350,7 @@ mod tests {
         config.provider.provider_type = "google".to_string();
         config.provider.google_api_key = Some("test-api-key".to_string());
         config.cache.memory_size = 4 * 1024 * 1024 * 1024; // 4GB
-        config.download.timeout = 60;
+        config.executor.request_timeout_secs = 60;
 
         config.save_to(&config_path).unwrap();
 
@@ -396,7 +362,7 @@ mod tests {
             Some("test-api-key".to_string())
         );
         assert_eq!(loaded.cache.memory_size, 4 * 1024 * 1024 * 1024); // 4GB from config
-        assert_eq!(loaded.download.timeout, 60);
+        assert_eq!(loaded.executor.request_timeout_secs, 60);
     }
 
     #[test]

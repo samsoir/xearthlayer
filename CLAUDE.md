@@ -361,7 +361,7 @@ Key sections:
 - `[texture]` - DDS format (bc1/bc3), compressor backend (software/ispc/gpu), GPU device selection
 - `[prefetch]` - Boundary-driven prefetch, web_api_port (default 8086), calibration, transition ramp
 - `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
-- `[pipeline]` - HTTP/CPU/prefetch concurrency limits
+- `[executor]` - Resource pool capacities (network, CPU, disk I/O), job limits, retry behavior
 - `[fuse]` - FUSE kernel limits (max_background, congestion_threshold)
 - `[packages]` - Package manager settings (concurrent_downloads: parallel part downloads 1-10)
 

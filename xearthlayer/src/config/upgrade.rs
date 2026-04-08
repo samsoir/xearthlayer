@@ -116,6 +116,20 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "prefetch.trigger_distance",
     "prefetch.load_depth_lat",
     "prefetch.load_depth_lon",
+    // Removed in #160 — [download] section consolidated into [executor]
+    // Use executor.request_timeout_secs instead
+    "download.timeout",
+    // Removed in #160 — [control_plane] section deprecated
+    // max_concurrent_jobs moved to [executor]; stall/health settings are
+    // hardcoded in the executor watchdog and not configurable
+    "control_plane.max_concurrent_jobs",
+    "control_plane.stall_threshold_secs",
+    "control_plane.health_check_interval_secs",
+    "control_plane.semaphore_timeout_secs",
+    // Removed in #160 — internal executor implementation details not useful as config
+    "executor.max_concurrent_tasks",
+    "executor.job_channel_capacity",
+    "executor.request_channel_capacity",
 ];
 
 /// Result of analyzing a configuration file for upgrade needs.

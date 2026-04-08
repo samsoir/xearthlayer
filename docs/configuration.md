@@ -202,31 +202,13 @@ The `gpu` backend is ideal for systems with both an integrated and discrete GPU.
 
 Run `xearthlayer diagnostics` to see available GPU adapters.
 
-### [download]
-
-Controls network download behavior.
-
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `timeout` | integer | `30` | Download timeout in seconds for a single chunk |
-| `retries` | integer | `3` | Number of retry attempts for failed downloads |
-
-**Example:**
-```ini
-[download]
-timeout = 30
-retries = 3
-```
-
-**Note:** Each 4096x4096 tile requires downloading 256 chunks (16x16 grid of 256x256 tiles). HTTP concurrency is automatically tuned based on your system's CPU count to prevent network stack exhaustion while maintaining good throughput.
-
 ### [generation]
 
 Controls parallel tile generation.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `threads` | integer | (num CPUs) | Number of worker threads for parallel tile generation |
+| `threads` | integer | `num_cpus / 2` | Number of worker threads for parallel tile generation — leaves headroom for X-Plane |
 | `timeout` | integer | `10` | Timeout in seconds for generating a single tile. If exceeded, returns a magenta placeholder. |
 
 **Example:**
@@ -237,59 +219,10 @@ timeout = 10
 ```
 
 **Performance Notes:**
-- `threads` defaults to the number of CPU cores
+- `threads` defaults to half the number of CPU cores, leaving headroom for X-Plane
 - Do not set `threads` higher than your CPU core count
 - The timeout prevents X-Plane from hanging if a tile download stalls
 - Magenta placeholder tiles indicate timeouts or download failures
-
-### [pipeline] (DEPRECATED)
-
-> **Deprecated in v0.3.0**: The `[pipeline]` section is deprecated and will be removed in a future release. The pipeline module has been replaced by the new job executor daemon architecture, which uses internal defaults via `ResourcePoolConfig`. These settings are parsed but no longer have any effect.
->
-> Run `xearthlayer config upgrade` to remove deprecated settings from your configuration file.
-
-| Setting | Status | Notes |
-|---------|--------|-------|
-| `max_http_concurrent` | Deprecated | Executor uses internal HTTP concurrency limits |
-| `max_cpu_concurrent` | Deprecated | Executor uses `ResourcePoolConfig` defaults |
-| `max_prefetch_in_flight` | Deprecated | Prefetch concurrency is now automatic |
-| `request_timeout_secs` | Deprecated | Timeout configured via `control_plane` settings |
-| `max_retries` | Deprecated | Retry logic built into executor tasks |
-| `retry_base_delay_ms` | Deprecated | Built into executor retry policy |
-| `coalesce_channel_capacity` | Deprecated | Request coalescing uses dynamic buffering |
-
-### [control_plane]
-
-Controls the job executor daemon for concurrent tile processing and health monitoring.
-
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `max_concurrent_jobs` | integer | `num_cpus × 2` | Maximum concurrent tile processing jobs |
-| `stall_threshold_secs` | integer | `60` | Time in seconds before a job is considered stalled |
-| `health_check_interval_secs` | integer | `5` | Interval between health checks (seconds) |
-| `semaphore_timeout_secs` | integer | `30` | Timeout for job slot acquisition (seconds) |
-
-**Example:**
-```ini
-[control_plane]
-; Increase concurrent jobs for high-core-count systems
-max_concurrent_jobs = 32
-; Increase stall threshold for slow networks
-stall_threshold_secs = 120
-```
-
-**How it works:**
-- **Job limiting**: Prevents unbounded tile starts that would overwhelm downstream resources. With 8 CPUs, defaults to 16 concurrent tiles.
-- **Stall detection**: Jobs exceeding `stall_threshold_secs` are cancelled and recovered automatically.
-- **Prefetch behavior**: Prefetch jobs use non-blocking slot acquisition - if no slots are available, they're skipped rather than waiting.
-- **On-demand behavior**: On-demand requests (from X-Plane) block up to `semaphore_timeout_secs` waiting for a slot.
-
-**Dashboard display:**
-The TUI dashboard shows control plane health including:
-- Jobs in progress / max concurrent
-- Jobs recovered (stall detection)
-- Semaphore timeouts
-- Health status (Healthy, Degraded, Critical)
 
 ### [executor]
 
@@ -297,12 +230,10 @@ Controls the job executor daemon's resource pools and concurrency limits. The ex
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
+| `max_concurrent_jobs` | integer | `ceil(num_cpus × 0.75)` | Maximum concurrent DDS tile jobs (1-256). Previously in `[control_plane]`. |
 | `network_concurrent` | integer | `128` | Concurrent HTTP connections (clamped to 64-256) |
-| `cpu_concurrent` | integer | `num_cpus × 1.25` | Concurrent CPU-bound operations (assemble + encode) |
+| `cpu_concurrent` | integer | `num_cpus / 2` | Concurrent CPU-bound operations (assemble + encode) — leaves headroom for X-Plane |
 | `disk_io_concurrent` | integer | `64` | Concurrent disk I/O operations (auto-detected from storage type) |
-| `max_concurrent_tasks` | integer | `128` | Maximum concurrent tasks the executor can run |
-| `job_channel_capacity` | integer | `256` | Internal job queue size |
-| `request_channel_capacity` | integer | `1000` | External request queue (from FUSE/prefetch) |
 | `request_timeout_secs` | integer | `10` | HTTP request timeout per chunk (seconds) |
 | `max_retries` | integer | `3` | Maximum retry attempts per failed chunk |
 | `retry_base_delay_ms` | integer | `100` | Base delay for exponential backoff (ms) |
@@ -310,15 +241,13 @@ Controls the job executor daemon's resource pools and concurrency limits. The ex
 **Example:**
 ```ini
 [executor]
-; Resource pool sizing (defaults are tuned for most systems)
-network_concurrent = 128         ; HTTP connections (64-256 range)
-cpu_concurrent = 10              ; CPU-bound ops (defaults to ~num_cpus * 1.25)
-disk_io_concurrent = 64          ; Disk I/O (auto-detected from storage type)
+; Job concurrency (defaults are tuned for most systems)
+; max_concurrent_jobs = 12       ; Max concurrent tile jobs (ceil(num_cpus * 0.75))
 
-; Task scheduling
-max_concurrent_tasks = 128       ; Max tasks in flight
-job_channel_capacity = 256       ; Internal job queue
-request_channel_capacity = 1000  ; External request queue
+; Resource pool sizing
+network_concurrent = 128         ; HTTP connections (64-256 range)
+cpu_concurrent = 8               ; CPU-bound ops (defaults to num_cpus / 2)
+disk_io_concurrent = 64          ; Disk I/O (auto-detected from storage type)
 
 ; Download behavior
 request_timeout_secs = 10        ; Per-chunk timeout
@@ -329,7 +258,7 @@ retry_base_delay_ms = 100        ; Exponential backoff base (100ms, 200ms, 400ms
 **Resource Pool Details:**
 
 - **Network pool**: Limits concurrent HTTP connections to prevent overwhelming imagery providers. Values outside 64-256 are automatically clamped.
-- **CPU pool**: Limits concurrent encoding operations. Default formula: `max(num_cpus × 1.25, num_cpus + 2)`.
+- **CPU pool**: Limits concurrent encoding operations. Default: `num_cpus / 2` — leaves headroom for X-Plane.
 - **Disk I/O pool**: Limits concurrent disk operations. Auto-detected from storage type (HDD: 4, SSD: 64, NVMe: 256).
 
 **Retry Behavior:**
@@ -582,32 +511,16 @@ format = bc1
 ; compressor = ispc       ; software, ispc (default), or gpu
 ; gpu_device = integrated  ; integrated, discrete, or adapter name substring
 
-[download]
-timeout = 30
-retries = 3
-
 [generation]
 threads = 8
 timeout = 10
 
-; [pipeline] section is DEPRECATED in v0.3.0 - settings are no longer used
-; Run 'xearthlayer config upgrade' to remove deprecated settings
-
-[control_plane]
-; Job management and health monitoring (defaults are tuned for most systems)
-; max_concurrent_jobs = 16  ; num_cpus × 2
-; stall_threshold_secs = 60
-; health_check_interval_secs = 5
-; semaphore_timeout_secs = 30
-
 [executor]
-; Resource pools for job executor daemon (defaults are auto-tuned)
+; Job executor daemon (defaults are auto-tuned)
+; max_concurrent_jobs = 12         ; Max concurrent tile jobs (ceil(num_cpus * 0.75))
 ; network_concurrent = 128         ; HTTP connections (64-256 range)
-; cpu_concurrent = 10              ; CPU-bound ops (~num_cpus * 1.25)
+; cpu_concurrent = 8               ; CPU-bound ops (num_cpus / 2)
 ; disk_io_concurrent = 64          ; Disk I/O (auto-detected)
-; max_concurrent_tasks = 128       ; Max tasks in flight
-; job_channel_capacity = 256       ; Internal job queue
-; request_channel_capacity = 1000  ; External request queue
 ; request_timeout_secs = 10        ; Per-chunk HTTP timeout
 ; max_retries = 3                  ; Download retry attempts
 ; retry_base_delay_ms = 100        ; Backoff base delay
@@ -753,20 +666,12 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `texture.format` | `bc1`, `bc3` | DDS compression format |
 | `texture.compressor` | `software`, `ispc`, `gpu` | Compression backend |
 | `texture.gpu_device` | `integrated`, `discrete`, or name | GPU adapter selection (used when compressor = gpu) |
-| `download.timeout` | positive integer | Chunk download timeout (seconds) |
 | `generation.threads` | positive integer | Worker threads |
 | `generation.timeout` | positive integer | Tile generation timeout (seconds) |
-| `pipeline.*` | *(deprecated)* | All pipeline settings deprecated in v0.3.0 |
-| `control_plane.max_concurrent_jobs` | positive integer | Max concurrent tile jobs |
-| `control_plane.stall_threshold_secs` | positive integer | Job stall timeout (seconds) |
-| `control_plane.health_check_interval_secs` | positive integer | Health check interval (seconds) |
-| `control_plane.semaphore_timeout_secs` | positive integer | Slot acquisition timeout (seconds) |
+| `executor.max_concurrent_jobs` | 1-256 | Max concurrent DDS tile jobs |
 | `executor.network_concurrent` | positive integer | Concurrent HTTP connections (64-256) |
 | `executor.cpu_concurrent` | positive integer | Concurrent CPU-bound operations |
 | `executor.disk_io_concurrent` | positive integer | Concurrent disk I/O operations |
-| `executor.max_concurrent_tasks` | positive integer | Max concurrent tasks |
-| `executor.job_channel_capacity` | positive integer | Internal job queue size |
-| `executor.request_channel_capacity` | positive integer | External request queue size |
 | `executor.request_timeout_secs` | positive integer | Per-chunk HTTP timeout (seconds) |
 | `executor.max_retries` | positive integer | Max retry attempts per chunk |
 | `executor.retry_base_delay_ms` | positive integer | Exponential backoff base (ms) |
