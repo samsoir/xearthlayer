@@ -16,6 +16,8 @@ pub struct TelemetrySnapshot {
     pub uptime: Duration,
 
     // === FUSE metrics ===
+    /// Total FUSE tiles served (from any source: memory, DDS disk, or job)
+    pub fuse_tiles_served: u64,
     /// Currently active FUSE requests
     pub fuse_requests_active: usize,
     /// FUSE requests waiting in queue
@@ -108,6 +110,7 @@ impl Default for TelemetrySnapshot {
     fn default() -> Self {
         Self {
             uptime: Duration::ZERO,
+            fuse_tiles_served: 0,
             fuse_requests_active: 0,
             fuse_requests_waiting: 0,
             jobs_submitted: 0,
@@ -340,6 +343,7 @@ mod tests {
     fn test_snapshot() -> TelemetrySnapshot {
         TelemetrySnapshot {
             uptime: Duration::from_secs(3661), // 1:01:01
+            fuse_tiles_served: 5000,
             fuse_requests_active: 8,
             fuse_requests_waiting: 12,
             jobs_submitted: 100,

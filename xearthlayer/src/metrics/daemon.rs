@@ -256,6 +256,9 @@ impl MetricsDaemon {
             }
 
             // FUSE events
+            MetricEvent::FuseTileServed => {
+                self.state.fuse_tiles_served += 1;
+            }
             MetricEvent::FuseRequestStarted => {
                 self.state.fuse_requests_active += 1;
             }

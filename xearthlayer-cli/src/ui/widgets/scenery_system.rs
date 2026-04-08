@@ -67,7 +67,7 @@ impl SceneryHistory {
 
         // Calculate deltas
         let fuse_delta = snapshot
-            .fuse_jobs_submitted
+            .fuse_tiles_served
             .saturating_sub(self.prev_fuse_requests);
         let jobs_delta = snapshot
             .jobs_completed
@@ -78,7 +78,7 @@ impl SceneryHistory {
         let completion_rate = jobs_delta as f64 / sample_interval;
 
         // Store current values for next delta
-        self.prev_fuse_requests = snapshot.fuse_jobs_submitted;
+        self.prev_fuse_requests = snapshot.fuse_tiles_served;
         self.prev_jobs_completed = snapshot.jobs_completed;
 
         // Push to histories
@@ -239,8 +239,8 @@ impl Widget for ScenerySystemWidget<'_> {
             };
 
         // Calculate error rates
-        let request_error_rate = if self.snapshot.fuse_jobs_submitted > 0 {
-            (self.snapshot.chunks_failed as f64 / self.snapshot.fuse_jobs_submitted as f64) * 100.0
+        let request_error_rate = if self.snapshot.fuse_tiles_served > 0 {
+            (self.snapshot.chunks_failed as f64 / self.snapshot.fuse_tiles_served as f64) * 100.0
         } else {
             0.0
         };

@@ -606,6 +606,9 @@ where
             // Track cache hit
             if let Some(client) = metrics_client {
                 client.memory_cache_hit(origin.is_fuse());
+                if origin.is_fuse() {
+                    client.fuse_tile_served();
+                }
             }
 
             #[cfg(feature = "debug-map")]
@@ -630,6 +633,16 @@ where
             .get(tile.row, tile.col, tile.zoom)
             .instrument(tracing::trace_span!(target: "profiling", "dds_disk_cache_check"))
             .await;
+        if dds_disk_result.is_none() {
+            debug!(
+                tile_row = tile.row,
+                tile_col = tile.col,
+                tile_zoom = tile.zoom,
+                dsf_tile = %dsf_tile,
+                origin = %origin,
+                "DDS disk cache miss"
+            );
+        }
         if let Some(data) = dds_disk_result {
             let duration = start.elapsed();
             debug!(
@@ -643,6 +656,14 @@ where
                 data_size = data.len(),
                 "DDS disk cache hit — serving without re-encode"
             );
+
+            // Track DDS disk cache hit in metrics
+            if let Some(client) = metrics_client {
+                client.disk_cache_hit(data.len() as u64);
+                if origin.is_fuse() {
+                    client.fuse_tile_served();
+                }
+            }
 
             #[cfg(feature = "debug-map")]
             record_debug_tile_activity(
@@ -764,6 +785,9 @@ where
                             let success = status == JobStatus::Succeeded;
                             if let Some(ref client) = metrics_for_completion {
                                 client.job_completed(success, duration.as_micros() as u64);
+                                if origin.is_fuse() {
+                                    client.fuse_tile_served();
+                                }
                             }
 
                             // Get DDS data directly from job result (avoids cache race conditions)

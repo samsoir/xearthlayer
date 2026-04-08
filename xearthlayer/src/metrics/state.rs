@@ -220,6 +220,8 @@ pub struct AggregatedState {
     // =========================================================================
     // FUSE Metrics
     // =========================================================================
+    /// Total FUSE tiles served (from any source: memory, DDS disk, or job).
+    pub fuse_tiles_served: u64,
     /// Currently active FUSE requests.
     pub fuse_requests_active: u64,
     /// FUSE requests waiting in queue.
@@ -277,6 +279,7 @@ impl AggregatedState {
             bytes_encoded: 0,
             encode_time_us: 0,
             assembly_time_us: 0,
+            fuse_tiles_served: 0,
             fuse_requests_active: 0,
             fuse_requests_waiting: 0,
             peak_bytes_per_second: 0.0,
@@ -320,6 +323,7 @@ impl AggregatedState {
         self.bytes_encoded = 0;
         self.encode_time_us = 0;
         self.assembly_time_us = 0;
+        self.fuse_tiles_served = 0;
         self.fuse_requests_active = 0;
         self.fuse_requests_waiting = 0;
         self.peak_bytes_per_second = 0.0;

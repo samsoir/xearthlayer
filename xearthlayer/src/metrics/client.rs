@@ -213,6 +213,12 @@ impl MetricsClient {
         self.send(MetricEvent::JobSubmitted { is_fuse });
     }
 
+    /// Records a FUSE tile being served (from any cache tier or job).
+    #[inline]
+    pub fn fuse_tile_served(&self) {
+        self.send(MetricEvent::FuseTileServed);
+    }
+
     /// Records a job starting execution.
     #[inline]
     pub fn job_started(&self) {

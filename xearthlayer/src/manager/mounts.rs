@@ -696,6 +696,7 @@ impl MountManager {
     pub fn aggregated_telemetry(&self) -> TelemetrySnapshot {
         let mut total = TelemetrySnapshot {
             uptime: Duration::ZERO,
+            fuse_tiles_served: 0,
             fuse_requests_active: 0,
             fuse_requests_waiting: 0,
             jobs_submitted: 0,
@@ -751,6 +752,7 @@ impl MountManager {
             }
 
             // Sum all counters
+            total.fuse_tiles_served += snapshot.fuse_tiles_served;
             total.fuse_requests_active += snapshot.fuse_requests_active;
             total.fuse_requests_waiting += snapshot.fuse_requests_waiting;
             total.jobs_submitted += snapshot.jobs_submitted;

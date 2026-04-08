@@ -163,6 +163,12 @@ pub enum MetricEvent {
     // =========================================================================
     // FUSE Request Events
     // =========================================================================
+    /// A FUSE tile was served (from any source: memory, DDS disk, or job).
+    ///
+    /// This counts total FUSE tile responses, not just job submissions.
+    /// Used by the TUI to show actual tile request throughput.
+    FuseTileServed,
+
     /// A FUSE request started being handled.
     FuseRequestStarted,
 
@@ -203,6 +209,7 @@ impl MetricEvent {
             Self::EncodeStarted => "encode_started",
             Self::EncodeCompleted { .. } => "encode_completed",
             Self::AssemblyCompleted { .. } => "assembly_completed",
+            Self::FuseTileServed => "fuse_tile_served",
             Self::FuseRequestStarted => "fuse_request_started",
             Self::FuseRequestCompleted => "fuse_request_completed",
             Self::FuseRequestQueued => "fuse_request_queued",

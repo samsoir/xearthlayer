@@ -125,6 +125,7 @@ impl MetricsReporter for TuiReporter {
             uptime,
 
             // FUSE metrics
+            fuse_tiles_served: state.fuse_tiles_served,
             fuse_requests_active: state.fuse_requests_active as usize,
             fuse_requests_waiting: state.fuse_requests_waiting as usize,
 

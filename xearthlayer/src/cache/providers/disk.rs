@@ -296,7 +296,11 @@ impl Cache for DiskCacheProvider {
             // Report authoritative cache size to metrics
             self.report_size_to_metrics();
 
-            debug!(key = %key_owned, size, "Cache set");
+            if self.is_dds_tier {
+                debug!(key = %key_owned, size, path = %path.display(), "DDS disk cache write complete");
+            } else {
+                debug!(key = %key_owned, size, "Cache set");
+            }
             Ok(())
         })
     }
@@ -304,13 +308,14 @@ impl Cache for DiskCacheProvider {
     fn get(&self, key: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, ServiceCacheError>> {
         let path = self.key_path(key);
         let key_owned = key.to_string();
+        let is_dds = self.is_dds_tier;
 
         Box::pin(async move {
             match tokio::fs::read(&path).await {
                 Ok(data) => {
                     // Update LRU index access time
                     self.lru_index.touch(&key_owned);
-                    debug!(key = %key_owned, size = data.len(), "Cache hit");
+                    debug!(key = %key_owned, size = data.len(), is_dds, "Cache hit");
                     Ok(Some(data))
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -319,9 +324,26 @@ impl Cache for DiskCacheProvider {
                         self.lru_index.remove(&key_owned);
                         debug!(key = %key_owned, "Removed stale index entry");
                     }
+                    if is_dds {
+                        debug!(
+                            key = %key_owned,
+                            path = %path.display(),
+                            "DDS disk cache miss — file not found at computed path"
+                        );
+                    }
                     Ok(None)
                 }
-                Err(e) => Err(ServiceCacheError::Io(e)),
+                Err(e) => {
+                    if is_dds {
+                        warn!(
+                            key = %key_owned,
+                            path = %path.display(),
+                            error = %e,
+                            "DDS disk cache read error (not NotFound)"
+                        );
+                    }
+                    Err(ServiceCacheError::Io(e))
+                }
             }
         })
     }
