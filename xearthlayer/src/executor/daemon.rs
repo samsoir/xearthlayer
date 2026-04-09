@@ -659,7 +659,7 @@ where
 
             // Track DDS disk cache hit in metrics
             if let Some(client) = metrics_client {
-                client.disk_cache_hit(data.len() as u64);
+                client.dds_disk_cache_hit(data.len() as u64);
                 if origin.is_fuse() {
                     client.fuse_tile_served();
                 }
