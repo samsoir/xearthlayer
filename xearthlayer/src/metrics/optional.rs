@@ -11,8 +11,10 @@ pub trait OptionalMetrics {
     fn download_completed(&self, bytes: u64, duration_us: u64);
     fn download_failed(&self);
     fn download_retried(&self);
-    fn disk_cache_hit(&self, bytes: u64);
-    fn disk_cache_miss(&self);
+    fn chunk_disk_cache_hit(&self, bytes: u64);
+    fn chunk_disk_cache_miss(&self);
+    fn dds_disk_cache_hit(&self, bytes: u64);
+    fn dds_disk_cache_miss(&self);
     fn disk_write_started(&self);
     fn disk_write_completed(&self, bytes: u64, duration_us: u64);
     fn disk_cache_initial_size(&self, bytes: u64);
@@ -63,16 +65,30 @@ impl OptionalMetrics for Option<MetricsClient> {
     }
 
     #[inline]
-    fn disk_cache_hit(&self, bytes: u64) {
+    fn chunk_disk_cache_hit(&self, bytes: u64) {
         if let Some(client) = self {
-            client.disk_cache_hit(bytes);
+            client.chunk_disk_cache_hit(bytes);
         }
     }
 
     #[inline]
-    fn disk_cache_miss(&self) {
+    fn chunk_disk_cache_miss(&self) {
         if let Some(client) = self {
-            client.disk_cache_miss();
+            client.chunk_disk_cache_miss();
+        }
+    }
+
+    #[inline]
+    fn dds_disk_cache_hit(&self, bytes: u64) {
+        if let Some(client) = self {
+            client.dds_disk_cache_hit(bytes);
+        }
+    }
+
+    #[inline]
+    fn dds_disk_cache_miss(&self) {
+        if let Some(client) = self {
+            client.dds_disk_cache_miss();
         }
     }
 

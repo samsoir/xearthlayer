@@ -18,7 +18,7 @@
 //! client.download_completed(30_000, 5_000);
 //!
 //! // Record a cache hit
-//! client.disk_cache_hit(30_000);
+//! client.chunk_disk_cache_hit(30_000);
 //! ```
 
 use super::event::MetricEvent;
@@ -92,23 +92,39 @@ impl MetricsClient {
     }
 
     // =========================================================================
-    // Disk Cache Events
+    // Chunk Disk Cache Events
     // =========================================================================
 
-    /// Records a disk cache hit.
+    /// Records a chunk disk cache hit.
     ///
     /// # Arguments
     ///
     /// * `bytes` - Size of the cached chunk
     #[inline]
-    pub fn disk_cache_hit(&self, bytes: u64) {
-        self.send(MetricEvent::DiskCacheHit { bytes });
+    pub fn chunk_disk_cache_hit(&self, bytes: u64) {
+        self.send(MetricEvent::ChunkDiskCacheHit { bytes });
     }
 
-    /// Records a disk cache miss.
+    /// Records a chunk disk cache miss.
     #[inline]
-    pub fn disk_cache_miss(&self) {
-        self.send(MetricEvent::DiskCacheMiss);
+    pub fn chunk_disk_cache_miss(&self) {
+        self.send(MetricEvent::ChunkDiskCacheMiss);
+    }
+
+    // =========================================================================
+    // DDS Disk Cache Events
+    // =========================================================================
+
+    /// Records a DDS disk cache hit (tile-level granularity).
+    #[inline]
+    pub fn dds_disk_cache_hit(&self, bytes: u64) {
+        self.send(MetricEvent::DdsDiskCacheHit { bytes });
+    }
+
+    /// Records a DDS disk cache miss.
+    #[inline]
+    pub fn dds_disk_cache_miss(&self) {
+        self.send(MetricEvent::DdsDiskCacheMiss);
     }
 
     /// Records a disk write starting.
@@ -367,8 +383,8 @@ mod tests {
     async fn test_client_cache_events() {
         let (client, mut rx) = create_client();
 
-        client.disk_cache_hit(2048);
-        client.disk_cache_miss();
+        client.chunk_disk_cache_hit(2048);
+        client.chunk_disk_cache_miss();
         client.disk_write_completed(2048, 1000);
         client.disk_cache_size(9_000_000_000);
         client.memory_cache_hit(true);
@@ -377,9 +393,12 @@ mod tests {
 
         assert!(matches!(
             rx.recv().await,
-            Some(MetricEvent::DiskCacheHit { bytes: 2048 })
+            Some(MetricEvent::ChunkDiskCacheHit { bytes: 2048 })
         ));
-        assert!(matches!(rx.recv().await, Some(MetricEvent::DiskCacheMiss)));
+        assert!(matches!(
+            rx.recv().await,
+            Some(MetricEvent::ChunkDiskCacheMiss)
+        ));
         assert!(matches!(
             rx.recv().await,
             Some(MetricEvent::DiskWriteCompleted {
@@ -404,6 +423,36 @@ mod tests {
         assert!(matches!(
             rx.recv().await,
             Some(MetricEvent::MemoryCacheSizeUpdate { bytes: 1_000_000 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_client_dds_disk_cache_events() {
+        let (client, mut rx) = create_client();
+        client.dds_disk_cache_hit(11_000_000);
+        client.dds_disk_cache_miss();
+        assert!(matches!(
+            rx.recv().await,
+            Some(MetricEvent::DdsDiskCacheHit { bytes: 11_000_000 })
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(MetricEvent::DdsDiskCacheMiss)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_client_chunk_disk_cache_events() {
+        let (client, mut rx) = create_client();
+        client.chunk_disk_cache_hit(2048);
+        client.chunk_disk_cache_miss();
+        assert!(matches!(
+            rx.recv().await,
+            Some(MetricEvent::ChunkDiskCacheHit { bytes: 2048 })
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(MetricEvent::ChunkDiskCacheMiss)
         ));
     }
 

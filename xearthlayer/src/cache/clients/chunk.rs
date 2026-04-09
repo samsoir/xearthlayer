@@ -81,20 +81,20 @@ impl ChunkCacheClient {
         match self.cache.get(&key).await {
             Ok(Some(data)) => {
                 if let Some(ref m) = self.metrics {
-                    m.disk_cache_hit(data.len() as u64);
+                    m.chunk_disk_cache_hit(data.len() as u64);
                 }
                 Some(data)
             }
             Ok(None) => {
                 if let Some(ref m) = self.metrics {
-                    m.disk_cache_miss();
+                    m.chunk_disk_cache_miss();
                 }
                 None
             }
             Err(e) => {
                 warn!(error = %e, key = %key, "Chunk cache get failed");
                 if let Some(ref m) = self.metrics {
-                    m.disk_cache_miss();
+                    m.chunk_disk_cache_miss();
                 }
                 None
             }

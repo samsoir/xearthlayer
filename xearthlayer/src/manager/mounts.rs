@@ -716,12 +716,17 @@ impl MountManager {
             memory_cache_hit_rate: 0.0,
             fuse_memory_cache_hit_rate: 0.0,
             memory_cache_size_bytes: 0,
-            disk_cache_hits: 0,
-            disk_cache_misses: 0,
-            disk_cache_hit_rate: 0.0,
-            disk_cache_size_bytes: 0,
-            disk_bytes_written: 0,
-            disk_bytes_read: 0,
+            dds_disk_cache_hits: 0,
+            dds_disk_cache_misses: 0,
+            dds_disk_cache_hit_rate: 0.0,
+            dds_disk_cache_size_bytes: 0,
+            dds_disk_bytes_read: 0,
+            chunk_disk_cache_hits: 0,
+            chunk_disk_cache_misses: 0,
+            chunk_disk_cache_hit_rate: 0.0,
+            chunk_disk_cache_size_bytes: 0,
+            chunk_disk_bytes_written: 0,
+            chunk_disk_bytes_read: 0,
             encodes_completed: 0,
             encodes_active: 0,
             bytes_encoded: 0,
@@ -774,14 +779,24 @@ impl MountManager {
             total.memory_cache_size_bytes = total
                 .memory_cache_size_bytes
                 .max(snapshot.memory_cache_size_bytes);
-            total.disk_cache_hits += snapshot.disk_cache_hits;
-            total.disk_cache_misses += snapshot.disk_cache_misses;
-            // Disk cache is also shared across services, so use max()
-            total.disk_cache_size_bytes = total
-                .disk_cache_size_bytes
-                .max(snapshot.disk_cache_size_bytes);
-            total.disk_bytes_written = total.disk_bytes_written.max(snapshot.disk_bytes_written);
-            total.disk_bytes_read = total.disk_bytes_read.max(snapshot.disk_bytes_read);
+            total.dds_disk_cache_hits += snapshot.dds_disk_cache_hits;
+            total.dds_disk_cache_misses += snapshot.dds_disk_cache_misses;
+            total.chunk_disk_cache_hits += snapshot.chunk_disk_cache_hits;
+            total.chunk_disk_cache_misses += snapshot.chunk_disk_cache_misses;
+            // Disk caches are also shared across services, so use max()
+            total.dds_disk_cache_size_bytes = total
+                .dds_disk_cache_size_bytes
+                .max(snapshot.dds_disk_cache_size_bytes);
+            total.chunk_disk_cache_size_bytes = total
+                .chunk_disk_cache_size_bytes
+                .max(snapshot.chunk_disk_cache_size_bytes);
+            total.chunk_disk_bytes_written = total
+                .chunk_disk_bytes_written
+                .max(snapshot.chunk_disk_bytes_written);
+            total.dds_disk_bytes_read = total.dds_disk_bytes_read.max(snapshot.dds_disk_bytes_read);
+            total.chunk_disk_bytes_read = total
+                .chunk_disk_bytes_read
+                .max(snapshot.chunk_disk_bytes_read);
             total.encodes_completed += snapshot.encodes_completed;
             total.encodes_active += snapshot.encodes_active;
             total.bytes_encoded += snapshot.bytes_encoded;
@@ -810,9 +825,16 @@ impl MountManager {
             0.0
         };
 
-        let disk_total = total.disk_cache_hits + total.disk_cache_misses;
-        total.disk_cache_hit_rate = if disk_total > 0 {
-            total.disk_cache_hits as f64 / disk_total as f64
+        let dds_disk_total = total.dds_disk_cache_hits + total.dds_disk_cache_misses;
+        total.dds_disk_cache_hit_rate = if dds_disk_total > 0 {
+            total.dds_disk_cache_hits as f64 / dds_disk_total as f64
+        } else {
+            0.0
+        };
+
+        let chunk_disk_total = total.chunk_disk_cache_hits + total.chunk_disk_cache_misses;
+        total.chunk_disk_cache_hit_rate = if chunk_disk_total > 0 {
+            total.chunk_disk_cache_hits as f64 / chunk_disk_total as f64
         } else {
             0.0
         };

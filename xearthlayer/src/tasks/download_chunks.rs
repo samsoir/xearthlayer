@@ -304,8 +304,8 @@ where
             chunk_col = chunk_col,
             "Chunk cache hit"
         );
-        // Emit disk cache hit metric
-        metrics.disk_cache_hit(cached.len() as u64);
+        // Emit chunk disk cache hit metric
+        metrics.chunk_disk_cache_hit(cached.len() as u64);
         return Ok(ChunkData {
             row: chunk_row,
             col: chunk_col,
@@ -313,8 +313,8 @@ where
         });
     }
 
-    // Emit disk cache miss metric
-    metrics.disk_cache_miss();
+    // Emit chunk disk cache miss metric
+    metrics.chunk_disk_cache_miss();
 
     // Calculate global coordinates for the provider
     let global_row = tile.row * crate::coord::CHUNKS_PER_TILE_SIDE + chunk_row as u32;

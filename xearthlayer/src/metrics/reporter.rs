@@ -91,9 +91,16 @@ impl MetricsReporter for TuiReporter {
             0.0
         };
 
-        let disk_total = state.disk_cache_hits + state.disk_cache_misses;
-        let disk_hit_rate = if disk_total > 0 {
-            state.disk_cache_hits as f64 / disk_total as f64
+        let dds_disk_total = state.dds_disk_cache_hits + state.dds_disk_cache_misses;
+        let dds_disk_hit_rate = if dds_disk_total > 0 {
+            state.dds_disk_cache_hits as f64 / dds_disk_total as f64
+        } else {
+            0.0
+        };
+
+        let chunk_disk_total = state.chunk_disk_cache_hits + state.chunk_disk_cache_misses;
+        let chunk_disk_hit_rate = if chunk_disk_total > 0 {
+            state.chunk_disk_cache_hits as f64 / chunk_disk_total as f64
         } else {
             0.0
         };
@@ -151,12 +158,17 @@ impl MetricsReporter for TuiReporter {
             memory_cache_hit_rate: memory_hit_rate,
             fuse_memory_cache_hit_rate: fuse_memory_hit_rate,
             memory_cache_size_bytes: state.memory_cache_size_bytes,
-            disk_cache_hits: state.disk_cache_hits,
-            disk_cache_misses: state.disk_cache_misses,
-            disk_cache_hit_rate: disk_hit_rate,
-            disk_cache_size_bytes: state.disk_cache_size_bytes,
-            disk_bytes_written: state.disk_bytes_written,
-            disk_bytes_read: state.disk_bytes_read,
+            dds_disk_cache_hits: state.dds_disk_cache_hits,
+            dds_disk_cache_misses: state.dds_disk_cache_misses,
+            dds_disk_cache_hit_rate: dds_disk_hit_rate,
+            dds_disk_cache_size_bytes: state.dds_disk_cache_size_bytes,
+            dds_disk_bytes_read: state.dds_disk_bytes_read,
+            chunk_disk_cache_hits: state.chunk_disk_cache_hits,
+            chunk_disk_cache_misses: state.chunk_disk_cache_misses,
+            chunk_disk_cache_hit_rate: chunk_disk_hit_rate,
+            chunk_disk_cache_size_bytes: state.chunk_disk_cache_size_bytes,
+            chunk_disk_bytes_written: state.chunk_disk_bytes_written,
+            chunk_disk_bytes_read: state.chunk_disk_bytes_read,
 
             // Encode metrics
             encodes_completed: state.encodes_completed,
@@ -196,8 +208,8 @@ mod tests {
 
         state.memory_cache_hits = 30;
         state.memory_cache_misses = 70;
-        state.disk_cache_hits = 200;
-        state.disk_cache_misses = 800;
+        state.dds_disk_cache_hits = 200;
+        state.dds_disk_cache_misses = 800;
 
         state.jobs_submitted = 100;
         state.fuse_jobs_submitted = 80;
@@ -242,8 +254,8 @@ mod tests {
         // Memory: 30 / (30 + 70) = 0.3
         assert!((snapshot.memory_cache_hit_rate - 0.3).abs() < 0.001);
 
-        // Disk: 200 / (200 + 800) = 0.2
-        assert!((snapshot.disk_cache_hit_rate - 0.2).abs() < 0.001);
+        // DDS Disk: 200 / (200 + 800) = 0.2
+        assert!((snapshot.dds_disk_cache_hit_rate - 0.2).abs() < 0.001);
     }
 
     #[test]
@@ -256,7 +268,8 @@ mod tests {
 
         // Should be 0.0, not NaN
         assert_eq!(snapshot.memory_cache_hit_rate, 0.0);
-        assert_eq!(snapshot.disk_cache_hit_rate, 0.0);
+        assert_eq!(snapshot.dds_disk_cache_hit_rate, 0.0);
+        assert_eq!(snapshot.chunk_disk_cache_hit_rate, 0.0);
     }
 
     #[test]
@@ -315,25 +328,25 @@ mod tests {
     }
 
     #[test]
-    fn test_disk_cache_size_uses_absolute_value() {
+    fn test_chunk_disk_cache_size_uses_absolute_value() {
         let mut state = AggregatedState::new();
         let history = TimeSeriesHistory::default();
         let reporter = TuiReporter::new();
 
-        // Set the authoritative disk cache size (from LRU index)
-        state.disk_cache_size_bytes = 5_000_000_000;
+        // Set the authoritative chunk disk cache size (from LRU index)
+        state.chunk_disk_cache_size_bytes = 5_000_000_000;
 
         // These legacy fields should NOT affect the reported size
         state.initial_disk_cache_bytes = 1_000_000_000;
-        state.disk_bytes_written = 10_000_000_000;
+        state.chunk_disk_bytes_written = 10_000_000_000;
         state.disk_bytes_evicted = 500_000_000;
 
         let snapshot = reporter.report(&state, &history);
 
         // Should use the absolute value, not the formula
         assert_eq!(
-            snapshot.disk_cache_size_bytes, 5_000_000_000,
-            "Reporter should use disk_cache_size_bytes directly, not initial+written-evicted"
+            snapshot.chunk_disk_cache_size_bytes, 5_000_000_000,
+            "Reporter should use chunk_disk_cache_size_bytes directly, not initial+written-evicted"
         );
     }
 }

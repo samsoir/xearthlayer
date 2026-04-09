@@ -8,7 +8,8 @@
 //!
 //! Events are designed at the appropriate granularity for each component:
 //! - Download events: per-chunk (256 per tile)
-//! - Disk cache events: per-chunk
+//! - Chunk disk cache events: per-chunk (256 per tile)
+//! - DDS disk cache events: per-tile
 //! - Memory cache events: tile-level (checked in daemon)
 //! - Job events: per-job (one per tile request)
 //! - FUSE events: per-request
@@ -40,16 +41,28 @@ pub enum MetricEvent {
     DownloadRetried,
 
     // =========================================================================
-    // Disk Cache Events (per-chunk granularity)
+    // Chunk Disk Cache Events (per-chunk granularity)
     // =========================================================================
-    /// A chunk was found in the disk cache.
-    DiskCacheHit {
+    /// A chunk was found in the chunk disk cache.
+    ChunkDiskCacheHit {
         /// Size of the cached chunk in bytes.
         bytes: u64,
     },
 
-    /// A chunk was not found in the disk cache.
-    DiskCacheMiss,
+    /// A chunk was not found in the chunk disk cache.
+    ChunkDiskCacheMiss,
+
+    // =========================================================================
+    // DDS Disk Cache Events (per-tile granularity)
+    // =========================================================================
+    /// A DDS tile was found in the DDS disk cache.
+    DdsDiskCacheHit {
+        /// Size of the cached DDS tile in bytes.
+        bytes: u64,
+    },
+
+    /// A DDS tile was not found in the DDS disk cache.
+    DdsDiskCacheMiss,
 
     /// A disk cache write operation started.
     DiskWriteStarted,
@@ -190,8 +203,10 @@ impl MetricEvent {
             Self::DownloadCompleted { .. } => "download_completed",
             Self::DownloadFailed => "download_failed",
             Self::DownloadRetried => "download_retried",
-            Self::DiskCacheHit { .. } => "disk_cache_hit",
-            Self::DiskCacheMiss => "disk_cache_miss",
+            Self::ChunkDiskCacheHit { .. } => "chunk_disk_cache_hit",
+            Self::ChunkDiskCacheMiss => "chunk_disk_cache_miss",
+            Self::DdsDiskCacheHit { .. } => "dds_disk_cache_hit",
+            Self::DdsDiskCacheMiss => "dds_disk_cache_miss",
             Self::DiskWriteStarted => "disk_write_started",
             Self::DiskWriteCompleted { .. } => "disk_write_completed",
             Self::DiskCacheInitialSize { .. } => "disk_cache_initial_size",
@@ -258,5 +273,29 @@ mod tests {
         let event = MetricEvent::JobSubmitted { is_fuse: true };
         let cloned = event.clone();
         assert_eq!(event.event_type(), cloned.event_type());
+    }
+
+    #[test]
+    fn test_dds_disk_cache_event_types() {
+        assert_eq!(
+            MetricEvent::DdsDiskCacheHit { bytes: 1024 }.event_type(),
+            "dds_disk_cache_hit"
+        );
+        assert_eq!(
+            MetricEvent::DdsDiskCacheMiss.event_type(),
+            "dds_disk_cache_miss"
+        );
+    }
+
+    #[test]
+    fn test_chunk_disk_cache_event_types() {
+        assert_eq!(
+            MetricEvent::ChunkDiskCacheHit { bytes: 1024 }.event_type(),
+            "chunk_disk_cache_hit"
+        );
+        assert_eq!(
+            MetricEvent::ChunkDiskCacheMiss.event_type(),
+            "chunk_disk_cache_miss"
+        );
     }
 }

@@ -158,8 +158,13 @@ fn handle_panic(info: &PanicHookInfo<'_>) {
                 );
                 let _ = writeln!(
                     stderr,
-                    "Disk cache:       {} bytes",
-                    snapshot.disk_cache_size_bytes
+                    "DDS disk cache:   {} bytes",
+                    snapshot.dds_disk_cache_size_bytes
+                );
+                let _ = writeln!(
+                    stderr,
+                    "Chunk disk cache: {} bytes",
+                    snapshot.chunk_disk_cache_size_bytes
                 );
                 let _ = writeln!(stderr);
             }

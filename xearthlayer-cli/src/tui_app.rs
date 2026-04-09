@@ -78,9 +78,12 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         xplane_env,
     } = config;
 
+    let dds_disk_max = (cfg.cache.disk_size as f64 * cfg.cache.dds_disk_ratio) as usize;
+    let chunk_disk_max = cfg.cache.disk_size.saturating_sub(dds_disk_max);
     let dashboard_config = DashboardConfig {
         memory_cache_max: cfg.cache.memory_size,
-        disk_cache_max: cfg.cache.disk_size,
+        dds_disk_cache_max: dds_disk_max,
+        chunk_disk_cache_max: chunk_disk_max,
         provider_name: cfg.provider.provider_type.clone(),
     };
 

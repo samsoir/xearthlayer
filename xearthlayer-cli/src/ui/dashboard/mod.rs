@@ -191,15 +191,16 @@ impl Dashboard {
 
         // Update disk history (both reads and writes for I/O tracking)
         self.disk_history.update(
-            snapshot.disk_bytes_written,
-            snapshot.disk_bytes_read,
+            snapshot.chunk_disk_bytes_written,
+            snapshot.chunk_disk_bytes_read + snapshot.dds_disk_bytes_read,
             sample_interval,
         );
 
         let uptime = self.start_time.elapsed();
         let cache_config = CacheConfig {
             memory_max_bytes: self.config.memory_cache_max,
-            disk_max_bytes: self.config.disk_cache_max,
+            dds_disk_max_bytes: self.config.dds_disk_cache_max,
+            chunk_disk_max_bytes: self.config.chunk_disk_cache_max,
         };
 
         // Get prefetch status if available

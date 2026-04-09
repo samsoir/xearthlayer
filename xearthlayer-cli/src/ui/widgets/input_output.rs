@@ -232,8 +232,9 @@ impl Widget for InputOutputWidget<'_> {
             };
 
         // Total disk I/O this session
-        let total_disk_writes = self.snapshot.disk_bytes_written;
-        let total_disk_reads = self.snapshot.disk_bytes_read;
+        let total_disk_writes = self.snapshot.chunk_disk_bytes_written;
+        let total_disk_reads =
+            self.snapshot.chunk_disk_bytes_read + self.snapshot.dds_disk_bytes_read;
 
         // Split into 2 columns
         let columns =

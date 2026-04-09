@@ -63,18 +63,32 @@ pub struct TelemetrySnapshot {
     pub fuse_memory_cache_hit_rate: f64,
     /// Memory cache current size in bytes
     pub memory_cache_size_bytes: u64,
-    /// Disk cache hits
-    pub disk_cache_hits: u64,
-    /// Disk cache misses
-    pub disk_cache_misses: u64,
-    /// Disk cache hit rate (0.0 - 1.0)
-    pub disk_cache_hit_rate: f64,
-    /// Disk cache current size in bytes (initial + session writes)
-    pub disk_cache_size_bytes: u64,
-    /// Disk bytes written this session only (for "Written" display)
-    pub disk_bytes_written: u64,
-    /// Disk bytes read this session (from cache hits)
-    pub disk_bytes_read: u64,
+
+    // === DDS Disk Cache metrics ===
+    /// DDS disk cache hits
+    pub dds_disk_cache_hits: u64,
+    /// DDS disk cache misses
+    pub dds_disk_cache_misses: u64,
+    /// DDS disk cache hit rate (0.0 - 1.0)
+    pub dds_disk_cache_hit_rate: f64,
+    /// DDS disk cache current size in bytes
+    pub dds_disk_cache_size_bytes: u64,
+    /// DDS disk bytes read this session (from cache hits)
+    pub dds_disk_bytes_read: u64,
+
+    // === Chunk Disk Cache metrics ===
+    /// Chunk disk cache hits
+    pub chunk_disk_cache_hits: u64,
+    /// Chunk disk cache misses
+    pub chunk_disk_cache_misses: u64,
+    /// Chunk disk cache hit rate (0.0 - 1.0)
+    pub chunk_disk_cache_hit_rate: f64,
+    /// Chunk disk cache current size in bytes
+    pub chunk_disk_cache_size_bytes: u64,
+    /// Chunk disk bytes written this session
+    pub chunk_disk_bytes_written: u64,
+    /// Chunk disk bytes read this session (from cache hits)
+    pub chunk_disk_bytes_read: u64,
 
     // === Encode metrics ===
     /// Encode operations completed
@@ -130,12 +144,17 @@ impl Default for TelemetrySnapshot {
             memory_cache_hit_rate: 0.0,
             fuse_memory_cache_hit_rate: 0.0,
             memory_cache_size_bytes: 0,
-            disk_cache_hits: 0,
-            disk_cache_misses: 0,
-            disk_cache_hit_rate: 0.0,
-            disk_cache_size_bytes: 0,
-            disk_bytes_written: 0,
-            disk_bytes_read: 0,
+            dds_disk_cache_hits: 0,
+            dds_disk_cache_misses: 0,
+            dds_disk_cache_hit_rate: 0.0,
+            dds_disk_cache_size_bytes: 0,
+            dds_disk_bytes_read: 0,
+            chunk_disk_cache_hits: 0,
+            chunk_disk_cache_misses: 0,
+            chunk_disk_cache_hit_rate: 0.0,
+            chunk_disk_cache_size_bytes: 0,
+            chunk_disk_bytes_written: 0,
+            chunk_disk_bytes_read: 0,
             encodes_completed: 0,
             encodes_active: 0,
             bytes_encoded: 0,
@@ -273,10 +292,17 @@ impl fmt::Display for TelemetrySnapshot {
         )?;
         writeln!(
             f,
-            "  Disk: {:.1}% hit rate ({} hits, {} misses)",
-            self.disk_cache_hit_rate * 100.0,
-            format_number(self.disk_cache_hits),
-            format_number(self.disk_cache_misses)
+            "  DDS Disk: {:.1}% hit rate ({} hits, {} misses)",
+            self.dds_disk_cache_hit_rate * 100.0,
+            format_number(self.dds_disk_cache_hits),
+            format_number(self.dds_disk_cache_misses)
+        )?;
+        writeln!(
+            f,
+            "  Chunks: {:.1}% hit rate ({} hits, {} misses)",
+            self.chunk_disk_cache_hit_rate * 100.0,
+            format_number(self.chunk_disk_cache_hits),
+            format_number(self.chunk_disk_cache_misses)
         )?;
 
         Ok(())
@@ -363,12 +389,17 @@ mod tests {
             memory_cache_hit_rate: 0.333,
             fuse_memory_cache_hit_rate: 0.6,
             memory_cache_size_bytes: 500_000_000,
-            disk_cache_hits: 5000,
-            disk_cache_misses: 18040,
-            disk_cache_hit_rate: 0.217,
-            disk_cache_size_bytes: 5_000_000_000,
-            disk_bytes_written: 500_000_000, // Session writes only
-            disk_bytes_read: 750_000_000,    // Session reads (from cache hits)
+            dds_disk_cache_hits: 17300,
+            dds_disk_cache_misses: 1200,
+            dds_disk_cache_hit_rate: 17300.0 / 18500.0,
+            dds_disk_cache_size_bytes: 289_000_000_000,
+            dds_disk_bytes_read: 190_000_000_000,
+            chunk_disk_cache_hits: 5000,
+            chunk_disk_cache_misses: 18040,
+            chunk_disk_cache_hit_rate: 5000.0 / 23040.0,
+            chunk_disk_cache_size_bytes: 5_000_000_000,
+            chunk_disk_bytes_written: 500_000_000,
+            chunk_disk_bytes_read: 750_000_000,
             encodes_completed: 90,
             encodes_active: 2,
             bytes_encoded: 1_000_000_000, // ~1 GB
@@ -467,8 +498,13 @@ mod tests {
         assert!(output.contains("Cache:"));
         // Verify thousand separators
         assert!(output.contains("23,040")); // chunks_downloaded
-        assert!(output.contains("5,000 hits")); // disk_cache_hits
-        assert!(output.contains("18,040 misses")); // disk_cache_misses
+                                            // Verify per-tier disk cache lines
+        assert!(output.contains("DDS Disk"));
+        assert!(output.contains("Chunks"));
+        assert!(output.contains("17,300 hits")); // dds_disk_cache_hits
+        assert!(output.contains("1,200 misses")); // dds_disk_cache_misses
+        assert!(output.contains("5,000 hits")); // chunk_disk_cache_hits
+        assert!(output.contains("18,040 misses")); // chunk_disk_cache_misses
     }
 
     #[test]
@@ -481,5 +517,27 @@ mod tests {
     fn test_throughput_human() {
         let snapshot = test_snapshot();
         assert_eq!(snapshot.throughput_human(), "19.1 KB/s");
+    }
+
+    #[test]
+    fn test_dds_disk_cache_hit_rate() {
+        let snapshot = TelemetrySnapshot {
+            dds_disk_cache_hits: 93,
+            dds_disk_cache_misses: 7,
+            dds_disk_cache_hit_rate: 0.93,
+            ..Default::default()
+        };
+        assert!((snapshot.dds_disk_cache_hit_rate - 0.93).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_chunk_disk_cache_hit_rate() {
+        let snapshot = TelemetrySnapshot {
+            chunk_disk_cache_hits: 5000,
+            chunk_disk_cache_misses: 18000,
+            chunk_disk_cache_hit_rate: 5000.0 / 23000.0,
+            ..Default::default()
+        };
+        assert!((snapshot.chunk_disk_cache_hit_rate - 0.2174).abs() < 0.001);
     }
 }

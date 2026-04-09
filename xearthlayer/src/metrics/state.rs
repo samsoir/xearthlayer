@@ -134,18 +134,18 @@ pub struct AggregatedState {
     pub download_time_us: u64,
 
     // =========================================================================
-    // Disk Cache Metrics
+    // Chunk Disk Cache Metrics
     // =========================================================================
-    /// Disk cache hits.
-    pub disk_cache_hits: u64,
-    /// Disk cache misses.
-    pub disk_cache_misses: u64,
-    /// Active disk writes.
+    /// Chunk disk cache hits.
+    pub chunk_disk_cache_hits: u64,
+    /// Chunk disk cache misses.
+    pub chunk_disk_cache_misses: u64,
+    /// Active disk writes (chunks only — DDS writes don't emit write events).
     pub disk_writes_active: u64,
-    /// Total bytes written to disk cache.
-    pub disk_bytes_written: u64,
-    /// Total bytes read from disk cache (cache hits).
-    pub disk_bytes_read: u64,
+    /// Total bytes written to chunk disk cache.
+    pub chunk_disk_bytes_written: u64,
+    /// Total bytes read from chunk disk cache (cache hits).
+    pub chunk_disk_bytes_read: u64,
     /// Total disk write time in microseconds.
     pub disk_write_time_us: u64,
     /// Initial disk cache size (scanned on startup, not reset).
@@ -153,19 +153,19 @@ pub struct AggregatedState {
     /// Total bytes evicted from disk cache by the GC daemon.
     pub disk_bytes_evicted: u64,
     /// Current chunk disk cache size in bytes (absolute value from LRU index).
-    ///
-    /// Updated directly via `DiskCacheSizeUpdate` events from the chunk
-    /// `DiskCacheProvider` after writes and evictions.
     pub chunk_disk_cache_size_bytes: u64,
+
+    // =========================================================================
+    // DDS Disk Cache Metrics
+    // =========================================================================
+    /// DDS disk cache hits.
+    pub dds_disk_cache_hits: u64,
+    /// DDS disk cache misses.
+    pub dds_disk_cache_misses: u64,
+    /// Total bytes read from DDS disk cache (cache hits).
+    pub dds_disk_bytes_read: u64,
     /// Current DDS disk cache size in bytes (absolute value from LRU index).
-    ///
-    /// Updated directly via `DdsDiskCacheSizeUpdate` events from the DDS
-    /// `DiskCacheProvider` after writes and evictions.
     pub dds_disk_cache_size_bytes: u64,
-    /// Combined disk cache size in bytes (chunk + DDS).
-    ///
-    /// Computed as `chunk_disk_cache_size_bytes + dds_disk_cache_size_bytes`.
-    pub disk_cache_size_bytes: u64,
 
     // =========================================================================
     // Memory Cache Metrics
@@ -251,17 +251,19 @@ impl AggregatedState {
             chunks_retried: 0,
             bytes_downloaded: 0,
             download_time_us: 0,
-            disk_cache_hits: 0,
-            disk_cache_misses: 0,
+            chunk_disk_cache_hits: 0,
+            chunk_disk_cache_misses: 0,
             disk_writes_active: 0,
-            disk_bytes_written: 0,
-            disk_bytes_read: 0,
+            chunk_disk_bytes_written: 0,
+            chunk_disk_bytes_read: 0,
             disk_write_time_us: 0,
             initial_disk_cache_bytes: 0,
             disk_bytes_evicted: 0,
             chunk_disk_cache_size_bytes: 0,
+            dds_disk_cache_hits: 0,
+            dds_disk_cache_misses: 0,
+            dds_disk_bytes_read: 0,
             dds_disk_cache_size_bytes: 0,
-            disk_cache_size_bytes: 0,
             memory_cache_hits: 0,
             memory_cache_misses: 0,
             fuse_memory_cache_hits: 0,
@@ -300,12 +302,15 @@ impl AggregatedState {
         self.chunks_retried = 0;
         self.bytes_downloaded = 0;
         self.download_time_us = 0;
-        self.disk_cache_hits = 0;
-        self.disk_cache_misses = 0;
+        self.chunk_disk_cache_hits = 0;
+        self.chunk_disk_cache_misses = 0;
         self.disk_writes_active = 0;
-        self.disk_bytes_written = 0;
-        self.disk_bytes_read = 0;
+        self.chunk_disk_bytes_written = 0;
+        self.chunk_disk_bytes_read = 0;
         self.disk_write_time_us = 0;
+        self.dds_disk_cache_hits = 0;
+        self.dds_disk_cache_misses = 0;
+        self.dds_disk_bytes_read = 0;
         self.memory_cache_hits = 0;
         self.memory_cache_misses = 0;
         self.fuse_memory_cache_hits = 0;

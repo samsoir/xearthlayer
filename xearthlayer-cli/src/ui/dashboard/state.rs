@@ -229,8 +229,10 @@ impl PrewarmProgress {
 pub struct DashboardConfig {
     /// Memory cache max size.
     pub memory_cache_max: usize,
-    /// Disk cache max size.
-    pub disk_cache_max: usize,
+    /// DDS disk cache max size.
+    pub dds_disk_cache_max: usize,
+    /// Chunk disk cache max size.
+    pub chunk_disk_cache_max: usize,
     /// Provider name for display (e.g., "Bing", "Google", "Go2").
     pub provider_name: String,
 }
@@ -239,7 +241,8 @@ impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
             memory_cache_max: 2 * 1024 * 1024 * 1024,
-            disk_cache_max: 20 * 1024 * 1024 * 1024,
+            dds_disk_cache_max: 12 * 1024 * 1024 * 1024,
+            chunk_disk_cache_max: 8 * 1024 * 1024 * 1024,
             provider_name: "Unknown".to_string(),
         }
     }

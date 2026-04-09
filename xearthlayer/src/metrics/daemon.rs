@@ -160,20 +160,20 @@ impl MetricsDaemon {
                 self.state.chunks_retried += 1;
             }
 
-            // Disk cache events
-            MetricEvent::DiskCacheHit { bytes } => {
-                self.state.disk_cache_hits += 1;
-                self.state.disk_bytes_read += bytes;
+            // Chunk disk cache events
+            MetricEvent::ChunkDiskCacheHit { bytes } => {
+                self.state.chunk_disk_cache_hits += 1;
+                self.state.chunk_disk_bytes_read += bytes;
             }
-            MetricEvent::DiskCacheMiss => {
-                self.state.disk_cache_misses += 1;
+            MetricEvent::ChunkDiskCacheMiss => {
+                self.state.chunk_disk_cache_misses += 1;
             }
             MetricEvent::DiskWriteStarted => {
                 self.state.disk_writes_active += 1;
             }
             MetricEvent::DiskWriteCompleted { bytes, duration_us } => {
                 self.state.disk_writes_active = self.state.disk_writes_active.saturating_sub(1);
-                self.state.disk_bytes_written += bytes;
+                self.state.chunk_disk_bytes_written += bytes;
                 self.state.disk_write_time_us += duration_us;
             }
             MetricEvent::DiskCacheInitialSize { bytes } => {
@@ -184,13 +184,16 @@ impl MetricsDaemon {
             }
             MetricEvent::DiskCacheSizeUpdate { bytes } => {
                 self.state.chunk_disk_cache_size_bytes = bytes;
-                self.state.disk_cache_size_bytes =
-                    self.state.chunk_disk_cache_size_bytes + self.state.dds_disk_cache_size_bytes;
             }
             MetricEvent::DdsDiskCacheSizeUpdate { bytes } => {
                 self.state.dds_disk_cache_size_bytes = bytes;
-                self.state.disk_cache_size_bytes =
-                    self.state.chunk_disk_cache_size_bytes + self.state.dds_disk_cache_size_bytes;
+            }
+            MetricEvent::DdsDiskCacheHit { bytes } => {
+                self.state.dds_disk_cache_hits += 1;
+                self.state.dds_disk_bytes_read += bytes;
+            }
+            MetricEvent::DdsDiskCacheMiss => {
+                self.state.dds_disk_cache_misses += 1;
             }
 
             // Memory cache events
@@ -299,12 +302,12 @@ impl MetricsDaemon {
             // Disk throughput (bytes/sec)
             let disk_delta = self
                 .state
-                .disk_bytes_written
+                .chunk_disk_bytes_written
                 .saturating_sub(self.last_disk_bytes_written);
             self.history
                 .disk_throughput
                 .push(disk_delta as f64 / elapsed);
-            self.last_disk_bytes_written = self.state.disk_bytes_written;
+            self.last_disk_bytes_written = self.state.chunk_disk_bytes_written;
 
             // Job rate (jobs/sec)
             let jobs_delta = self
@@ -396,12 +399,12 @@ mod tests {
     fn test_process_cache_events() {
         let (mut daemon, _tx) = create_daemon();
 
-        daemon.process_event(MetricEvent::DiskCacheHit { bytes: 1024 });
-        daemon.process_event(MetricEvent::DiskCacheMiss);
-        daemon.process_event(MetricEvent::DiskCacheMiss);
+        daemon.process_event(MetricEvent::ChunkDiskCacheHit { bytes: 1024 });
+        daemon.process_event(MetricEvent::ChunkDiskCacheMiss);
+        daemon.process_event(MetricEvent::ChunkDiskCacheMiss);
 
-        assert_eq!(daemon.state.disk_cache_hits, 1);
-        assert_eq!(daemon.state.disk_cache_misses, 2);
+        assert_eq!(daemon.state.chunk_disk_cache_hits, 1);
+        assert_eq!(daemon.state.chunk_disk_cache_misses, 2);
 
         daemon.process_event(MetricEvent::MemoryCacheHit { is_fuse: true });
         daemon.process_event(MetricEvent::MemoryCacheMiss { is_fuse: false });
@@ -416,25 +419,47 @@ mod tests {
     fn test_process_disk_cache_size_update() {
         let (mut daemon, _tx) = create_daemon();
 
-        assert_eq!(daemon.state.disk_cache_size_bytes, 0);
+        assert_eq!(daemon.state.chunk_disk_cache_size_bytes, 0);
 
         // Initial size report
         daemon.process_event(MetricEvent::DiskCacheSizeUpdate {
             bytes: 5_000_000_000,
         });
-        assert_eq!(daemon.state.disk_cache_size_bytes, 5_000_000_000);
+        assert_eq!(daemon.state.chunk_disk_cache_size_bytes, 5_000_000_000);
 
         // Size increases after write
         daemon.process_event(MetricEvent::DiskCacheSizeUpdate {
             bytes: 5_001_000_000,
         });
-        assert_eq!(daemon.state.disk_cache_size_bytes, 5_001_000_000);
+        assert_eq!(daemon.state.chunk_disk_cache_size_bytes, 5_001_000_000);
 
         // Size decreases after eviction
         daemon.process_event(MetricEvent::DiskCacheSizeUpdate {
             bytes: 4_000_000_000,
         });
-        assert_eq!(daemon.state.disk_cache_size_bytes, 4_000_000_000);
+        assert_eq!(daemon.state.chunk_disk_cache_size_bytes, 4_000_000_000);
+    }
+
+    #[test]
+    fn test_process_dds_disk_cache_events() {
+        let (mut daemon, _tx) = create_daemon();
+        daemon.process_event(MetricEvent::DdsDiskCacheHit { bytes: 11_000_000 });
+        daemon.process_event(MetricEvent::DdsDiskCacheHit { bytes: 11_000_000 });
+        daemon.process_event(MetricEvent::DdsDiskCacheMiss);
+        assert_eq!(daemon.state.dds_disk_cache_hits, 2);
+        assert_eq!(daemon.state.dds_disk_cache_misses, 1);
+        assert_eq!(daemon.state.dds_disk_bytes_read, 22_000_000);
+    }
+
+    #[test]
+    fn test_process_chunk_disk_cache_events() {
+        let (mut daemon, _tx) = create_daemon();
+        daemon.process_event(MetricEvent::ChunkDiskCacheHit { bytes: 1024 });
+        daemon.process_event(MetricEvent::ChunkDiskCacheMiss);
+        daemon.process_event(MetricEvent::ChunkDiskCacheMiss);
+        assert_eq!(daemon.state.chunk_disk_cache_hits, 1);
+        assert_eq!(daemon.state.chunk_disk_cache_misses, 2);
+        assert_eq!(daemon.state.chunk_disk_bytes_read, 1024);
     }
 
     #[test]
@@ -513,7 +538,7 @@ mod tests {
 
         // Simulate some activity
         daemon.state.bytes_downloaded = 10_000;
-        daemon.state.disk_bytes_written = 5_000;
+        daemon.state.chunk_disk_bytes_written = 5_000;
         daemon.state.jobs_completed = 2;
 
         // Wait a bit and sample
