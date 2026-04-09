@@ -634,6 +634,10 @@ where
             .instrument(tracing::trace_span!(target: "profiling", "dds_disk_cache_check"))
             .await;
         if dds_disk_result.is_none() {
+            // Track DDS disk cache miss in metrics
+            if let Some(client) = metrics_client {
+                client.dds_disk_cache_miss();
+            }
             debug!(
                 tile_row = tile.row,
                 tile_col = tile.col,
