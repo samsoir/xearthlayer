@@ -172,7 +172,7 @@ impl TileProgressTracker {
     /// Get a snapshot of current region progress for display.
     ///
     /// Returns up to [`MAX_DISPLAY_REGIONS`] entries, sorted by
-    /// most recently started first.
+    /// oldest started first (oldest at top of the TUI queue).
     pub fn snapshot(&self) -> Vec<RegionProgressEntry> {
         let regions = self.regions.read().unwrap();
         let mut entries: Vec<RegionProgressEntry> = regions
@@ -185,8 +185,8 @@ impl TileProgressTracker {
             })
             .collect();
 
-        // Sort by most recently started first
-        entries.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        // Sort by oldest started first (completed jobs age off the top)
+        entries.sort_by(|a, b| a.started_at.cmp(&b.started_at));
         entries.truncate(MAX_DISPLAY_REGIONS);
         entries
     }
@@ -619,6 +619,47 @@ mod tests {
         });
 
         assert_eq!(tracker.active_count(), 0);
+    }
+
+    #[test]
+    fn test_snapshot_sorted_oldest_first() {
+        let tracker = TileProgressTracker::new();
+
+        // Add tiles in different DSF regions with staggered start times.
+        // Widely separated rows map to different 1° latitude bands.
+        let tile_a = test_tile(1000, 2000); // region A
+        let tile_b = test_tile(1500, 2000); // region B (different lat band)
+        let tile_c = test_tile(2000, 2000); // region C (different lat band)
+
+        let region_a = {
+            let (lat, lon) = tile_a.to_lat_lon();
+            DsfRegion::from_lat_lon(lat, lon)
+        };
+        let region_b = {
+            let (lat, lon) = tile_b.to_lat_lon();
+            DsfRegion::from_lat_lon(lat, lon)
+        };
+        let region_c = {
+            let (lat, lon) = tile_c.to_lat_lon();
+            DsfRegion::from_lat_lon(lat, lon)
+        };
+
+        // Ensure they're in different regions
+        assert_ne!(region_a, region_b);
+        assert_ne!(region_b, region_c);
+
+        tracker.tile_started(tile_a);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        tracker.tile_started(tile_b);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        tracker.tile_started(tile_c);
+
+        let entries = tracker.snapshot();
+        assert_eq!(entries.len(), 3);
+        // Oldest first (tile_a started earliest)
+        assert_eq!(entries[0].region, region_a);
+        assert_eq!(entries[1].region, region_b);
+        assert_eq!(entries[2].region, region_c);
     }
 
     #[test]
