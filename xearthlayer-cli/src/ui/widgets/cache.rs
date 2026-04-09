@@ -49,21 +49,31 @@ fn hit_rate_color(rate: f64) -> Color {
     }
 }
 
-/// Render a single cache tier in its column (2 lines).
-///
-/// Line 1: `Label [████░░░░] size/max`
-/// Line 2: `hit% │ Nhits │ Nmiss`
-fn render_cache_tier(
-    buf: &mut Buffer,
-    area: Rect,
-    label: &str,
+/// Data for rendering a single cache tier column.
+struct CacheTierData<'a> {
+    label: &'a str,
     color: Color,
     current_bytes: u64,
     max_bytes: u64,
     hit_rate: f64,
     hits: u64,
     misses: u64,
-) {
+}
+
+/// Render a single cache tier in its column (2 lines).
+///
+/// Line 1: `Label [████░░░░] size/max`
+/// Line 2: `hit% │ Nhits │ Nmiss`
+fn render_cache_tier(buf: &mut Buffer, area: Rect, data: &CacheTierData<'_>) {
+    let CacheTierData {
+        label,
+        color,
+        current_bytes,
+        max_bytes,
+        hit_rate,
+        hits,
+        misses,
+    } = *data;
     if area.height < 2 || area.width < 10 {
         return;
     }
@@ -78,7 +88,11 @@ fn render_cache_tier(
         Span::styled(format!("[{}]", progress_bar), Style::default().fg(color)),
         Span::raw(" "),
         Span::styled(
-            format!("{}/{}", format_bytes(current_bytes), format_bytes(max_bytes)),
+            format!(
+                "{}/{}",
+                format_bytes(current_bytes),
+                format_bytes(max_bytes)
+            ),
             Style::default().fg(color),
         ),
     ]);
@@ -146,39 +160,45 @@ impl Widget for CacheWidgetCompact<'_> {
         render_cache_tier(
             buf,
             columns[0],
-            "Memory",
-            Color::Magenta,
-            self.snapshot.memory_cache_size_bytes,
-            self.config.memory_max_bytes as u64,
-            self.snapshot.memory_cache_hit_rate * 100.0,
-            self.snapshot.memory_cache_hits,
-            self.snapshot.memory_cache_misses,
+            &CacheTierData {
+                label: "Memory",
+                color: Color::Magenta,
+                current_bytes: self.snapshot.memory_cache_size_bytes,
+                max_bytes: self.config.memory_max_bytes as u64,
+                hit_rate: self.snapshot.memory_cache_hit_rate * 100.0,
+                hits: self.snapshot.memory_cache_hits,
+                misses: self.snapshot.memory_cache_misses,
+            },
         );
 
         // DDS Disk tier
         render_cache_tier(
             buf,
             columns[1],
-            "DDS Disk",
-            Color::Blue,
-            self.snapshot.dds_disk_cache_size_bytes,
-            self.config.dds_disk_max_bytes as u64,
-            self.snapshot.dds_disk_cache_hit_rate * 100.0,
-            self.snapshot.dds_disk_cache_hits,
-            self.snapshot.dds_disk_cache_misses,
+            &CacheTierData {
+                label: "DDS Disk",
+                color: Color::Blue,
+                current_bytes: self.snapshot.dds_disk_cache_size_bytes,
+                max_bytes: self.config.dds_disk_max_bytes as u64,
+                hit_rate: self.snapshot.dds_disk_cache_hit_rate * 100.0,
+                hits: self.snapshot.dds_disk_cache_hits,
+                misses: self.snapshot.dds_disk_cache_misses,
+            },
         );
 
         // Chunks tier
         render_cache_tier(
             buf,
             columns[2],
-            "Chunks",
-            Color::Cyan,
-            self.snapshot.chunk_disk_cache_size_bytes,
-            self.config.chunk_disk_max_bytes as u64,
-            self.snapshot.chunk_disk_cache_hit_rate * 100.0,
-            self.snapshot.chunk_disk_cache_hits,
-            self.snapshot.chunk_disk_cache_misses,
+            &CacheTierData {
+                label: "Chunks",
+                color: Color::Cyan,
+                current_bytes: self.snapshot.chunk_disk_cache_size_bytes,
+                max_bytes: self.config.chunk_disk_max_bytes as u64,
+                hit_rate: self.snapshot.chunk_disk_cache_hit_rate * 100.0,
+                hits: self.snapshot.chunk_disk_cache_hits,
+                misses: self.snapshot.chunk_disk_cache_misses,
+            },
         );
     }
 }

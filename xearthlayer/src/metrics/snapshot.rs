@@ -498,7 +498,7 @@ mod tests {
         assert!(output.contains("Cache:"));
         // Verify thousand separators
         assert!(output.contains("23,040")); // chunks_downloaded
-        // Verify per-tier disk cache lines
+                                            // Verify per-tier disk cache lines
         assert!(output.contains("DDS Disk"));
         assert!(output.contains("Chunks"));
         assert!(output.contains("17,300 hits")); // dds_disk_cache_hits

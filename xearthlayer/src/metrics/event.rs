@@ -8,7 +8,8 @@
 //!
 //! Events are designed at the appropriate granularity for each component:
 //! - Download events: per-chunk (256 per tile)
-//! - Disk cache events: per-chunk
+//! - Chunk disk cache events: per-chunk (256 per tile)
+//! - DDS disk cache events: per-tile
 //! - Memory cache events: tile-level (checked in daemon)
 //! - Job events: per-job (one per tile request)
 //! - FUSE events: per-request

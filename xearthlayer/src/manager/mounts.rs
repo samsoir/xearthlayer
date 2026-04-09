@@ -793,9 +793,7 @@ impl MountManager {
             total.chunk_disk_bytes_written = total
                 .chunk_disk_bytes_written
                 .max(snapshot.chunk_disk_bytes_written);
-            total.dds_disk_bytes_read = total
-                .dds_disk_bytes_read
-                .max(snapshot.dds_disk_bytes_read);
+            total.dds_disk_bytes_read = total.dds_disk_bytes_read.max(snapshot.dds_disk_bytes_read);
             total.chunk_disk_bytes_read = total
                 .chunk_disk_bytes_read
                 .max(snapshot.chunk_disk_bytes_read);

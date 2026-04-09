@@ -435,7 +435,10 @@ mod tests {
             rx.recv().await,
             Some(MetricEvent::DdsDiskCacheHit { bytes: 11_000_000 })
         ));
-        assert!(matches!(rx.recv().await, Some(MetricEvent::DdsDiskCacheMiss)));
+        assert!(matches!(
+            rx.recv().await,
+            Some(MetricEvent::DdsDiskCacheMiss)
+        ));
     }
 
     #[tokio::test]

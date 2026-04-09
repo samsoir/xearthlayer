@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Three-tier cache metrics in TUI** ([#166](https://github.com/samsoir/xearthlayer/issues/166)): Split the combined "Disk" cache display into separate DDS Disk and Chunks tiers with independent hit rates. The TUI now shows a 3-column layout (Memory, DDS Disk, Chunks) with per-tier progress bars and hit/miss counters. DDS disk hit rate (93%+ in flight tests) is no longer hidden by chunk-level event volume.
+
 ## [0.4.3] - 2026-04-07
 
 ### Changed
