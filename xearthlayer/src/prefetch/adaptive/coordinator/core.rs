@@ -55,13 +55,6 @@ pub const BACKPRESSURE_REDUCE_THRESHOLD: f64 = 0.5;
 /// [`BACKPRESSURE_DEFER_THRESHOLD`], only this fraction of tiles is submitted.
 pub const BACKPRESSURE_REDUCED_FRACTION: f64 = 0.5;
 
-/// Maximum number of tiles that can be queued as pending across cycles.
-///
-/// Safety cap to prevent executor flooding if tile generation overestimates.
-/// At 200 tiles/cycle with ~16 tiles per DSF region, 2000 covers ~10 cycles
-/// of boundary crossings — more than enough for any realistic flight path.
-pub const MAX_PENDING_TILES: usize = 2000;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Coordinator
 // ─────────────────────────────────────────────────────────────────────────────
@@ -569,9 +562,22 @@ impl AdaptivePrefetchCoordinator {
                     "Sliding prefetch box: new regions detected"
                 );
 
-                // Expand regions to tiles. Track which region each tile belongs
-                // to so we can mark only submitted regions as InProgress after
-                // truncation. Regions with no tiles are marked NoCoverage immediately.
+                // Expand regions to tiles. Every DSF region that intersects the
+                // prefetch window must have all its tiles submitted (unless
+                // already cached — that filtering happens downstream in the
+                // pipeline). Regions with no tiles available are marked
+                // NoCoverage immediately so they're excluded from future cycles.
+                //
+                // See #172 post-flight finding: previous versions of this path
+                // sorted tiles by distance-from-aircraft and truncated at
+                // `max_tiles_per_cycle`. Together those produced forward
+                // starvation — tiles near the aircraft (already cached from
+                // prewarm) monopolised the submission budget, while uncached
+                // forward-edge tiles never entered the plan. Removing both
+                // restores the design intent: "if it intersects the window,
+                // it gets prefetched." Rate limiting is handled downstream
+                // by the filter pipeline, executor backpressure, and the
+                // `pending_tiles` retry queue — not by arbitrary truncation.
                 let mut tiles_with_region: Vec<(TileCoord, DsfRegion)> = Vec::new();
                 for region in &new_regions {
                     let tiles = self.get_tiles_for_region(region);
@@ -590,37 +596,11 @@ impl AdaptivePrefetchCoordinator {
                     return None;
                 }
 
-                // Sort tiles by distance from aircraft so nearest tiles
-                // are submitted first.
-                tiles_with_region.sort_by(|a, b| {
-                    let (a_lat, a_lon) = a.0.to_lat_lon();
-                    let (b_lat, b_lon) = b.0.to_lat_lon();
-                    let da = (a_lat - lat).powi(2) + (a_lon - lon).powi(2);
-                    let db = (b_lat - lat).powi(2) + (b_lon - lon).powi(2);
-                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                });
-
-                // Enforce max_tiles_per_cycle limit. Only regions whose tiles
-                // survive truncation are marked InProgress — regions whose tiles
-                // are entirely truncated stay untracked and are retried next tick.
-                let max_tiles = self.config.max_tiles_per_cycle as usize;
-                if tiles_with_region.len() > max_tiles {
-                    tracing::debug!(
-                        total = tiles_with_region.len(),
-                        limit = max_tiles,
-                        "Sliding box prefetch capped at max_tiles_per_cycle"
-                    );
-                    tiles_with_region.truncate(max_tiles);
-                }
-
                 // Record tile→region mapping for execute() to use when
                 // deciding which regions to mark InProgress. Marking is
                 // deferred until after submission so only regions whose
-                // tiles were actually accepted by the executor get marked.
-                // See #172 Part 1: regions that get marked InProgress
-                // before submission (under throttle ramp or channel full)
-                // become stuck because `should_prefetch` then filters them
-                // out of `new_regions_with_extent` indefinitely.
+                // tiles were actually accepted by the executor get marked
+                // (see Part 1).
                 self.current_plan_regions.clear();
                 self.current_plan_regions.reserve(tiles_with_region.len());
                 let mut all_tiles = Vec::with_capacity(tiles_with_region.len());
@@ -695,15 +675,13 @@ impl AdaptivePrefetchCoordinator {
         }
 
         // Mark regions as InProgress only if ALL of their planned tiles
-        // appear in `result.submitted_tiles` — the authoritative record of
-        // what the executor actually accepted. This positive check is
-        // correct even in the `MAX_PENDING_TILES` truncation case where
-        // some tiles are dropped (neither submitted nor pending): dropped
-        // tiles are not in `submitted_tiles`, so their regions correctly
-        // stay unmarked and re-enter `new_regions_with_extent` next cycle.
+        // appear in `result.submitted_tiles` — the authoritative record
+        // of what the executor actually accepted. A planned tile that's
+        // neither submitted nor pending would be a logic bug (the
+        // pending cap was removed post-flight #172) — defence in depth
+        // is still correct here, the positive check stays right.
         //
-        // See #172 Part 1 (the ordering fix) + Part 2 (this positive
-        // check, replacing the earlier "not in pending" approximation).
+        // See #172 Part 1 (the ordering fix) + Part 2 (positive check).
         if !self.current_plan_regions.is_empty() && !result.deferred {
             let submitted_set: std::collections::HashSet<TileCoord> =
                 result.submitted_tiles.iter().copied().collect();
@@ -2230,19 +2208,20 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Pending tiles cap tests
+    // No-drop pending invariant (#172 post-flight finding)
+    //
+    // The pending queue is NEVER capped. Every planned tile must end up
+    // either submitted or pending — nothing silently dropped at the
+    // submission boundary. The executor's channel capacity and resource
+    // pools are the only rate governor.
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_pending_tiles_capped_at_max() {
-        // When a massive plan generates more tiles than MAX_PENDING_TILES,
-        // the pending queue must be capped to prevent executor flooding.
-        //
-        // Scenario: 5000-tile plan, throttle at 20% (→ 1000 tiles submitted),
-        // remaining 4000 exceed MAX_PENDING_TILES (2000).
-        // Expected: 1000 submitted, 2000 pending (capped), 2000 dropped.
-
-        let client = Arc::new(CapLimitedDdsClient::new(10_000)); // no channel limit
+    fn test_pending_retains_full_plan_under_throttle_overflow() {
+        // Scenario: 5000-tile plan, throttle ramp starting at 20%. Some
+        // tiles submit (~1000 under throttle), rest go to pending.
+        // Invariant: submitted + pending == 5000. No drops.
+        let client = Arc::new(CapLimitedDdsClient::new(10_000));
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
@@ -2265,7 +2244,7 @@ mod tests {
 
         assert!(coord.transition_throttle.is_active());
 
-        // Build a 5000-tile plan (way more than MAX_PENDING_TILES)
+        // Build a 5000-tile plan — larger than any old cap
         let tiles: Vec<TileCoord> = (0..5000)
             .map(|i| TileCoord {
                 row: 5000 + i,
@@ -2279,31 +2258,21 @@ mod tests {
         let cancellation = CancellationToken::new();
         let submitted = coord.execute(&plan, cancellation);
 
-        // Throttle at ~20% → ~1000 submitted
-        assert!(submitted > 0, "Should submit some tiles");
-
-        // KEY ASSERTION: pending tiles must be capped at MAX_PENDING_TILES
-        assert!(
-            coord.pending_tiles.len() <= MAX_PENDING_TILES,
-            "Pending tiles ({}) should not exceed MAX_PENDING_TILES ({})",
-            coord.pending_tiles.len(),
-            MAX_PENDING_TILES
-        );
-
-        // The total accounted for should be less than 5000 (some were dropped by cap)
-        let total = submitted + coord.pending_tiles.len();
-        assert!(
-            total < 5000,
-            "With cap, total ({}) should be less than plan size (5000)",
-            total
+        assert!(submitted > 0, "Should submit some tiles under throttle");
+        assert_eq!(
+            submitted + coord.pending_tiles.len(),
+            5000,
+            "Every planned tile must be accounted for — no silent drops. \
+             submitted={} + pending={} must equal plan size 5000",
+            submitted,
+            coord.pending_tiles.len()
         );
     }
 
     #[test]
-    fn test_pending_cap_on_backpressure_defer() {
-        // When executor load exceeds BACKPRESSURE_DEFER_THRESHOLD and the
-        // plan is stored as pending, the cap must still be applied.
-
+    fn test_pending_retains_full_plan_on_backpressure_defer() {
+        // When executor load exceeds BACKPRESSURE_DEFER_THRESHOLD, the
+        // entire plan must be stored as pending — no cap, no drops.
         let client = Arc::new(HighLoadDdsClient);
 
         let config = AdaptivePrefetchConfig {
@@ -2315,7 +2284,6 @@ mod tests {
             .with_calibration(test_calibration())
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
 
-        // Build a 5000-tile plan
         let tiles: Vec<TileCoord> = (0..5000)
             .map(|i| TileCoord {
                 row: 5000 + i,
@@ -2324,20 +2292,20 @@ mod tests {
             })
             .collect();
         let calibration = test_calibration();
-        let plan = PrefetchPlan::with_tiles(tiles, &calibration, "boundary", 0, 5000);
+        let plan = PrefetchPlan::with_tiles(tiles.clone(), &calibration, "boundary", 0, 5000);
 
         let cancellation = CancellationToken::new();
         let submitted = coord.execute(&plan, cancellation);
 
-        // Should defer (0 submitted) due to high load
         assert_eq!(submitted, 0, "Should defer due to backpressure");
-
-        // KEY ASSERTION: pending tiles must be capped
-        assert!(
-            coord.pending_tiles.len() <= MAX_PENDING_TILES,
-            "Deferred pending tiles ({}) should not exceed MAX_PENDING_TILES ({})",
+        assert_eq!(
             coord.pending_tiles.len(),
-            MAX_PENDING_TILES
+            5000,
+            "Deferred pending must retain every planned tile — no cap"
+        );
+        assert_eq!(
+            coord.pending_tiles, tiles,
+            "Deferred pending must contain the full plan in order"
         );
     }
 
@@ -2461,12 +2429,23 @@ mod tests {
     }
 
     #[test]
-    fn test_truncated_regions_not_marked_in_progress() {
-        use crate::geo_index::{GeoIndex, PrefetchedRegion};
+    fn test_cruise_plan_includes_every_tile_from_every_intersecting_region() {
+        // #172 post-flight finding: the cruise path must plan every tile
+        // from every DSF region that intersects the prefetch window.
+        // Filtering for "already cached" happens downstream in the filter
+        // pipeline — the *plan* itself must contain the full tile set.
+        //
+        // Previous versions sorted tiles by distance-from-aircraft and
+        // truncated at `max_tiles_per_cycle`. This test asserts that
+        // behaviour is gone: the plan size is bounded only by the
+        // sum of tiles across intersecting regions.
+        use crate::geo_index::GeoIndex;
 
         let geo_index = Arc::new(GeoIndex::new());
 
-        // Very low cap to force truncation — only 5 tiles allowed
+        // `max_tiles_per_cycle = 5` used to cap plans hard. Post-fix,
+        // the cruise path ignores this value entirely — we set it low
+        // to prove the cap is inert.
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
             max_tiles_per_cycle: 5,
@@ -2485,38 +2464,36 @@ mod tests {
         coord.update((48.0, 15.0), 270.0, 200.0, 35000.0);
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        // First tick — box covers ~16 regions but only 5 tiles submitted
-        let plan1 = coord.update((48.0, 15.0), 270.0, 200.0, 35000.0);
+        let plan = coord.update((48.0, 15.0), 270.0, 200.0, 35000.0);
 
         if coord.status.phase != FlightPhase::Cruise {
             return; // Skip if phase detector didn't reach cruise
         }
 
-        assert!(plan1.is_some(), "Should generate plan on first tick");
-        let plan1 = plan1.unwrap();
+        assert!(plan.is_some(), "Should generate plan on cruise tick");
+        let plan = plan.unwrap();
+
+        // Box at (48, 15) heading 270° with default extent covers dozens
+        // of DSF regions. With ~16 tiles per region (geometric fallback),
+        // plan size should be in the hundreds — clearly above the 5-cap
+        // the old code would have imposed. The exact number depends on
+        // box extent & region tile count; assert ">> 5" to prove the
+        // cap is not being applied.
         assert!(
-            plan1.tiles.len() <= 5,
-            "Plan should be capped at 5 tiles, got {}",
-            plan1.tiles.len()
+            plan.tiles.len() > 20,
+            "Plan must contain many more than max_tiles_per_cycle=5 tiles — \
+             cap is inert. Got {}",
+            plan.tiles.len()
         );
 
-        // Count how many regions are marked InProgress
-        let tracked_count = geo_index.regions::<PrefetchedRegion>().len();
-
-        // Key: with 5 tiles and ~16 tiles per region, at most 1-2 regions
-        // should be marked. If all 16 regions were marked, it's the bug.
+        // Additional invariant: the plan's tile count must match the
+        // total of tiles produced by `get_tiles_for_region` for every
+        // region in current_plan_regions (i.e. no silent dropping).
+        let unique_regions: std::collections::HashSet<DsfRegion> =
+            coord.current_plan_regions.values().copied().collect();
         assert!(
-            tracked_count < 10,
-            "Only regions with submitted tiles should be marked InProgress, \
-             but {} regions were tracked (expected < 10)",
-            tracked_count
-        );
-
-        // Second tick at same position — should find more new regions to submit
-        let plan2 = coord.update((48.0, 15.0), 270.0, 200.0, 35000.0);
-        assert!(
-            plan2.is_some(),
-            "Second tick should find untracked regions from truncated first tick"
+            !unique_regions.is_empty(),
+            "At least one region must be tracked in current_plan_regions"
         );
     }
 

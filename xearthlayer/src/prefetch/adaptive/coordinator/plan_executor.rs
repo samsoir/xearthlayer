@@ -11,7 +11,6 @@ use super::super::strategy::PrefetchPlan;
 use super::super::transition_throttle::TransitionThrottle;
 use super::core::{
     BACKPRESSURE_DEFER_THRESHOLD, BACKPRESSURE_REDUCED_FRACTION, BACKPRESSURE_REDUCE_THRESHOLD,
-    MAX_PENDING_TILES,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,12 +78,12 @@ pub(crate) fn execute_plan(
     // Check executor resource utilization before submitting
     let load = client.executor_load();
     if load > BACKPRESSURE_DEFER_THRESHOLD {
-        // Store tiles as pending so they're retried when load drops (capped)
-        let pending = if plan.tiles.len() > MAX_PENDING_TILES {
-            plan.tiles[..MAX_PENDING_TILES].to_vec()
-        } else {
-            plan.tiles.clone()
-        };
+        // Store every planned tile as pending so they're retried when load
+        // drops. No cap — the executor controls throughput via its channel
+        // capacity and resource pools, not us. See #172 post-flight finding:
+        // silent drops at submission boundaries create forward-starvation
+        // because discarded tiles never get re-planned on subsequent cycles
+        // once their regions get marked or cached by some other path.
         tracing::info!(
             load = format!("{:.1}%", load * 100.0),
             tiles_planned = plan.tiles.len(),
@@ -92,7 +91,7 @@ pub(crate) fn execute_plan(
         );
         return ExecutionResult {
             submitted_tiles: Vec::new(),
-            pending,
+            pending: plan.tiles.clone(),
             deferred: true,
         };
     }
@@ -115,19 +114,16 @@ pub(crate) fn execute_plan(
     let max_tiles = if transition_throttle.is_active() {
         let fraction = transition_throttle.fraction();
         if fraction == 0.0 {
-            // Store tiles as pending so they're submitted once ramp begins (capped)
-            let pending = if plan.tiles.len() > MAX_PENDING_TILES {
-                plan.tiles[..MAX_PENDING_TILES].to_vec()
-            } else {
-                plan.tiles.clone()
-            };
+            // Store every planned tile as pending so they're submitted once
+            // the ramp begins. No cap (see BACKPRESSURE_DEFER_THRESHOLD branch
+            // above).
             tracing::debug!(
                 tiles_deferred = plan.tiles.len(),
                 "Transition throttle — grace period, tiles stored as pending"
             );
             return ExecutionResult {
                 submitted_tiles: Vec::new(),
-                pending,
+                pending: plan.tiles.clone(),
                 deferred: false,
             };
         }
@@ -174,20 +170,16 @@ pub(crate) fn execute_plan(
         }
     }
 
-    // Merge channel remainder + throttle overflow into pending
+    // Merge channel remainder + throttle overflow into pending.
+    // No cap: the executor's channel capacity and resource pools are the
+    // rate governor — silent drops here would violate the "every tile
+    // that intersects the prefetch window gets prefetched" invariant
+    // (see cruise branch in core.rs). Pending drains via subsequent
+    // cycles; memory cost is ~12 bytes per tile which is trivial even
+    // at tens of thousands of entries.
     let pending = if !channel_remainder.is_empty() || !throttle_overflow.is_empty() {
         let mut combined = channel_remainder;
         combined.extend(throttle_overflow);
-        // Apply safety cap to prevent executor flooding
-        if combined.len() > MAX_PENDING_TILES {
-            tracing::warn!(
-                total = combined.len(),
-                cap = MAX_PENDING_TILES,
-                dropped = combined.len() - MAX_PENDING_TILES,
-                "Pending tiles exceed cap — truncating to prevent executor flood"
-            );
-            combined.truncate(MAX_PENDING_TILES);
-        }
         tracing::debug!(
             submitted = submitted_tiles.len(),
             pending = combined.len(),
@@ -299,7 +291,12 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_capped_at_max() {
+    fn test_pending_retains_entire_plan_on_full_defer() {
+        // Regression guard for #172 post-flight finding: pending must retain
+        // EVERY planned tile when the entire plan is deferred. No cap, no
+        // silent drops. The executor's natural backpressure is the only
+        // rate governor; the coordinator must not discard work at the
+        // submission boundary.
         let client = Arc::new(HighLoadDdsClient);
         let mut throttle = default_throttle();
 
@@ -311,7 +308,7 @@ mod tests {
             })
             .collect();
         let cal = test_calibration();
-        let plan = PrefetchPlan::with_tiles(tiles, &cal, "boundary", 0, 5000);
+        let plan = PrefetchPlan::with_tiles(tiles.clone(), &cal, "boundary", 0, 5000);
 
         let result = execute_plan(
             &plan,
@@ -321,7 +318,13 @@ mod tests {
         );
 
         assert_eq!(result.submitted_count(), 0);
-        assert!(result.pending.len() <= MAX_PENDING_TILES);
+        assert!(result.deferred);
+        assert_eq!(
+            result.pending.len(),
+            5000,
+            "Pending must retain every planned tile — no cap"
+        );
+        assert_eq!(result.pending, tiles, "Pending must contain the full plan");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -329,8 +332,7 @@ mod tests {
     //
     // `submitted_tiles` is the authoritative record of what the executor
     // accepted. Callers deciding per-region completion must rely on this
-    // positive signal, not on "not in pending" — tiles dropped by the
-    // `MAX_PENDING_TILES` truncation appear in NEITHER list.
+    // positive signal, not on "not in pending".
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -396,14 +398,15 @@ mod tests {
     }
 
     #[test]
-    fn test_dropped_tiles_missing_from_both_sets_under_pending_cap() {
-        // When a plan exceeds MAX_PENDING_TILES AND is fully deferred,
-        // pending gets truncated to the cap. Tiles beyond the cap appear
-        // in NEITHER submitted_tiles nor pending — they are silently
-        // dropped. This test documents and guards that invariant so a
-        // correct-by-construction marking check (Part 1) can rely on
-        // submitted_tiles as the positive signal.
-        let tile_count = MAX_PENDING_TILES + 5;
+    fn test_no_tile_dropped_from_large_deferred_plan() {
+        // Regression guard for #172 post-flight finding: the old
+        // `MAX_PENDING_TILES` cap silently dropped tiles beyond the cap.
+        // That's been removed — every tile in a deferred plan must
+        // appear in `pending`, no matter how large.
+        //
+        // This test uses a plan far larger than the old cap (2000) to
+        // prove the cap is gone.
+        let tile_count = 10_000;
         let tiles: Vec<TileCoord> = (0..tile_count as u32)
             .map(|i| TileCoord {
                 row: 10_000 + i,
@@ -426,21 +429,20 @@ mod tests {
         assert!(result.submitted_tiles.is_empty(), "High load defers all");
         assert_eq!(
             result.pending.len(),
-            MAX_PENDING_TILES,
-            "Pending truncated to cap"
+            tile_count,
+            "Pending must retain every tile — no cap, no silent drops"
+        );
+        assert_eq!(
+            result.pending, tiles,
+            "Pending must contain every planned tile in order"
         );
 
-        // The last 5 tiles of the plan are in NEITHER set — dropped
-        let tail = &tiles[tile_count - 5..];
-        for t in tail {
+        // The last few tiles of the plan (which the old cap would have
+        // dropped) must all be in pending.
+        for t in tiles.iter().rev().take(10) {
             assert!(
-                !result.submitted_tiles.contains(t),
-                "Dropped tile {:?} must not appear in submitted_tiles",
-                t
-            );
-            assert!(
-                !result.pending.contains(t),
-                "Dropped tile {:?} must not appear in pending",
+                result.pending.contains(t),
+                "Tile past old cap boundary must still be in pending: {:?}",
                 t
             );
         }
