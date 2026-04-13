@@ -833,19 +833,62 @@ impl AdaptivePrefetchCoordinator {
         // Drain pending tiles from a previous partial submission before generating
         // a new plan. This prevents the "fire-and-forget" bug where large boundary
         // plans lose tiles when the channel is full.
+        //
+        // Re-filter pending tiles first — tiles may have been cached by other
+        // means since they were first submitted (memory cache by FUSE on-demand
+        // promotion, DDS disk by prior cycles, installed packages, etc.).
+        // Without re-filtering, the executor walks cache tiers for each
+        // already-cached tile and reads the ~10MB DDS payload to return a hit,
+        // producing constant disk reads AND starving genuinely-uncached work
+        // behind a queue of redundant cache-hit submissions. See #172
+        // post-flight finding.
         if !self.pending_tiles.is_empty() {
             let pending = std::mem::take(&mut self.pending_tiles);
-            let pending_count = pending.len();
+            let pending_before_filter = pending.len();
 
             // Still need to update phase detector for correct state tracking
             self.phase_detector.update(state.ground_speed, msl_ft);
 
+            let (filtered_pending, filter_counts) = super::filtering::run_filter_pipeline(
+                pending,
+                self.memory_cache.as_deref(),
+                &mut self.cached_tiles,
+                self.geo_index.as_ref(),
+                self.ortho_union_index.as_ref(),
+                self.dds_disk_checker.as_ref(),
+            )
+            .await;
+            let filtered_total = filter_counts.total();
+
+            tracing::debug!(
+                pending_before = pending_before_filter,
+                cache_skipped = filter_counts.cache_hits,
+                patch_skipped = filter_counts.patch_skipped,
+                disk_skipped = filter_counts.disk_skipped,
+                dds_disk_hits = filter_counts.dds_disk_hits,
+                remaining = filtered_pending.len(),
+                "Pending drain filter pipeline summary"
+            );
+
+            if filtered_pending.is_empty() {
+                tracing::debug!(
+                    pending_before = pending_before_filter,
+                    filtered = filtered_total,
+                    "All pending tiles already cached — nothing to drain"
+                );
+                self.total_cycles += 1;
+                self.total_cache_hits += filtered_total as u64;
+                self.run_region_maintenance();
+                return Some(0);
+            }
+
+            let pending_count = filtered_pending.len();
             let calibration = self
                 .calibration
                 .clone()
                 .unwrap_or_else(PerformanceCalibration::default_opportunistic);
             let plan = PrefetchPlan::with_tiles(
-                pending,
+                filtered_pending,
                 &calibration,
                 "boundary_pending",
                 0,
@@ -861,6 +904,7 @@ impl AdaptivePrefetchCoordinator {
 
             self.total_cycles += 1;
             self.total_tiles_submitted += submitted as u64;
+            self.total_cache_hits += filtered_total as u64;
 
             tracing::debug!(
                 submitted,
@@ -884,13 +928,14 @@ impl AdaptivePrefetchCoordinator {
             }
         };
 
-        // Run the filtering pipeline (cache → patches → disk)
+        // Run the filtering pipeline: memory → patches → packages → DDS disk
         let (filtered_tiles, filter_counts) = super::filtering::run_filter_pipeline(
             std::mem::take(&mut plan.tiles),
             self.memory_cache.as_deref(),
             &mut self.cached_tiles,
             self.geo_index.as_ref(),
             self.ortho_union_index.as_ref(),
+            self.dds_disk_checker.as_ref(),
         )
         .await;
         plan.tiles = filtered_tiles;
@@ -902,6 +947,7 @@ impl AdaptivePrefetchCoordinator {
             cache_skipped = plan.skipped_cached + filter_counts.cache_hits,
             patch_skipped = filter_counts.patch_skipped,
             disk_skipped = filter_counts.disk_skipped,
+            dds_disk_hits = filter_counts.dds_disk_hits,
             remaining = plan.tiles.len(),
             strategy = plan.strategy,
             "Prefetch plan filter pipeline summary"

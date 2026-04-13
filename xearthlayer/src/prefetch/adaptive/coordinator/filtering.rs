@@ -1,17 +1,21 @@
 //! Tile filtering pipeline for prefetch plans.
 //!
-//! Three sequential filtering stages remove tiles that don't need prefetching:
+//! Four sequential filtering stages remove tiles that don't need prefetching:
 //! 1. **Memory cache** — tiles already in the volatile memory cache
 //! 2. **Patch regions** — tiles in DSF regions owned by scenery patches
-//! 3. **Disk existence** — tiles already present as DDS files on disk
+//! 3. **Package disk** — tiles present as DDS files in installed Ortho4XP
+//!    packages (served via FUSE passthrough, no XEL work needed)
+//! 4. **DDS disk cache** — tiles already in XEL's own DDS disk cache from
+//!    prior prefetch or FUSE-on-demand generation
 //!
 //! Each stage returns the filtered list and a count of skipped tiles.
+//! Stages are ordered cheapest-first to minimise per-tile filter cost.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::coord::TileCoord;
-use crate::executor::DaemonMemoryCache;
+use crate::executor::{DaemonMemoryCache, DdsDiskCacheChecker};
 use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage};
 use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::tile_based::DsfTileCoord;
@@ -27,14 +31,16 @@ pub(crate) struct FilterCounts {
     pub cache_hits: usize,
     /// Tiles skipped because they are in patch-owned DSF regions.
     pub patch_skipped: usize,
-    /// Tiles skipped because a DDS file already exists on disk.
+    /// Tiles skipped because a DDS file already exists in an installed package.
     pub disk_skipped: usize,
+    /// Tiles skipped because they are already in the XEL DDS disk cache.
+    pub dds_disk_hits: usize,
 }
 
 impl FilterCounts {
     /// Total tiles filtered across all stages.
     pub fn total(&self) -> usize {
-        self.cache_hits + self.patch_skipped + self.disk_skipped
+        self.cache_hits + self.patch_skipped + self.disk_skipped + self.dds_disk_hits
     }
 }
 
@@ -144,7 +150,48 @@ pub(crate) fn filter_disk_tiles(
     (filtered, skipped)
 }
 
+/// Filter tiles already present in XEL's DDS disk cache.
+///
+/// Without this stage, previously-prefetched tiles that have been evicted
+/// from memory cache but still live on DDS disk would be re-submitted to
+/// the executor, which then walks cache tiers and reads the ~10MB DDS
+/// payload to return a hit. At 100+ tiles/cycle of such redundant reads,
+/// this produces constant disk activity AND starves actual new work
+/// behind a long queue of redundant cache-hit submissions. See #172
+/// post-flight finding: the pending drain path was the primary source
+/// of "constant disk reads never stopping" in the TUI.
+pub(crate) fn filter_dds_disk_cache(
+    tiles: Vec<TileCoord>,
+    checker: &Arc<dyn DdsDiskCacheChecker>,
+) -> (Vec<TileCoord>, usize) {
+    let before = tiles.len();
+    let filtered: Vec<TileCoord> = tiles
+        .into_iter()
+        .filter(|tile| {
+            let (chunk_row, chunk_col, chunk_zoom) = tile.chunk_origin();
+            !checker.tile_exists_blocking(chunk_row, chunk_col, chunk_zoom)
+        })
+        .collect();
+    let hits = before - filtered.len();
+
+    if hits > 0 {
+        tracing::debug!(
+            dds_disk_hits = hits,
+            remaining = filtered.len(),
+            "Filtered tiles already in XEL DDS disk cache"
+        );
+    }
+
+    (filtered, hits)
+}
+
 /// Run all filtering stages in sequence.
+///
+/// Stages run cheapest-first:
+/// 1. Memory cache (moka in-memory lookup)
+/// 2. Patch regions (GeoIndex DashMap lookup)
+/// 3. Installed packages (OrthoUnionIndex in-memory lookup)
+/// 4. DDS disk cache (LRU index lookup + stat — most expensive, runs last)
 ///
 /// Returns the surviving tiles and aggregate filter counts.
 pub(crate) async fn run_filter_pipeline(
@@ -153,6 +200,7 @@ pub(crate) async fn run_filter_pipeline(
     cached_tiles: &mut HashSet<TileCoord>,
     geo_index: Option<&Arc<GeoIndex>>,
     ortho_union_index: Option<&Arc<OrthoUnionIndex>>,
+    dds_disk_checker: Option<&Arc<dyn DdsDiskCacheChecker>>,
 ) -> (Vec<TileCoord>, FilterCounts) {
     let mut counts = FilterCounts::default();
 
@@ -170,10 +218,17 @@ pub(crate) async fn run_filter_pipeline(
         tiles = filtered;
     }
 
-    // Stage 3: Disk existence filter
+    // Stage 3: Installed package filter
     if let Some(index) = ortho_union_index {
         let (filtered, skipped) = filter_disk_tiles(tiles, index);
         counts.disk_skipped = skipped;
+        tiles = filtered;
+    }
+
+    // Stage 4: DDS disk cache filter
+    if let Some(checker) = dds_disk_checker {
+        let (filtered, hits) = filter_dds_disk_cache(tiles, checker);
+        counts.dds_disk_hits = hits;
         tiles = filtered;
     }
 
@@ -276,8 +331,9 @@ mod tests {
             cache_hits: 3,
             patch_skipped: 2,
             disk_skipped: 1,
+            dds_disk_hits: 4,
         };
-        assert_eq!(counts.total(), 6);
+        assert_eq!(counts.total(), 10);
     }
 
     #[tokio::test]
@@ -285,7 +341,8 @@ mod tests {
         let tiles = test_tiles(5);
         let mut tracked = HashSet::new();
 
-        let (result, counts) = run_filter_pipeline(tiles, None, &mut tracked, None, None).await;
+        let (result, counts) =
+            run_filter_pipeline(tiles, None, &mut tracked, None, None, None).await;
         assert_eq!(result.len(), 5);
         assert_eq!(counts.total(), 0);
     }
@@ -406,6 +463,97 @@ mod tests {
             shadow.is_empty(),
             "Filter must not write to the shadow — avoid accumulating stale entries"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DDS disk cache filter stage (#172 post-flight, "constant disk reads")
+    //
+    // Tiles in XEL's DDS disk cache must not be re-submitted to the executor.
+    // Without this stage, pending-drain cycles re-submit cached tiles, the
+    // executor walks cache tiers, reads the DDS payload off disk to return
+    // as a hit, and produces constant disk activity while starving genuine
+    // work. These tests guard the filter stage.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    struct ChunkSetDiskChecker(HashSet<(u32, u32, u8)>);
+
+    impl crate::executor::DdsDiskCacheChecker for ChunkSetDiskChecker {
+        fn tile_exists(
+            &self,
+            row: u32,
+            col: u32,
+            zoom: u8,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            let present = self.0.contains(&(row, col, zoom));
+            Box::pin(async move { present })
+        }
+
+        fn tile_exists_blocking(&self, row: u32, col: u32, zoom: u8) -> bool {
+            self.0.contains(&(row, col, zoom))
+        }
+    }
+
+    #[test]
+    fn test_filter_dds_disk_cache_removes_tiles_in_cache() {
+        // Populate checker with 5 of 10 tiles' chunk-origin coords.
+        // Filter should strip exactly those 5.
+        let tiles = test_tiles(10);
+        let mut in_cache = HashSet::new();
+        for tile in tiles.iter().take(5) {
+            let (r, c, z) = tile.chunk_origin();
+            in_cache.insert((r, c, z));
+        }
+        let checker: Arc<dyn crate::executor::DdsDiskCacheChecker> =
+            Arc::new(ChunkSetDiskChecker(in_cache));
+
+        let (filtered, hits) = filter_dds_disk_cache(tiles.clone(), &checker);
+        assert_eq!(hits, 5);
+        assert_eq!(filtered.len(), 5);
+        // Survivors should be the last 5 tiles (which weren't in the cache)
+        assert_eq!(filtered, tiles[5..]);
+    }
+
+    #[test]
+    fn test_filter_dds_disk_cache_empty_checker_passes_all() {
+        let tiles = test_tiles(10);
+        let checker: Arc<dyn crate::executor::DdsDiskCacheChecker> =
+            Arc::new(ChunkSetDiskChecker(HashSet::new()));
+
+        let (filtered, hits) = filter_dds_disk_cache(tiles.clone(), &checker);
+        assert_eq!(hits, 0);
+        assert_eq!(filtered, tiles);
+    }
+
+    #[tokio::test]
+    async fn test_run_filter_pipeline_includes_dds_disk_stage() {
+        // End-to-end: pipeline with all filters OFF except DDS disk.
+        // Tiles in the DDS disk mock should be stripped; the rest survive.
+        let tiles = test_tiles(8);
+        let mut tracked = HashSet::new();
+        let mut in_cache = HashSet::new();
+        for tile in tiles.iter().take(3) {
+            let (r, c, z) = tile.chunk_origin();
+            in_cache.insert((r, c, z));
+        }
+        let checker: Arc<dyn crate::executor::DdsDiskCacheChecker> =
+            Arc::new(ChunkSetDiskChecker(in_cache));
+
+        let (result, counts) = run_filter_pipeline(
+            tiles.clone(),
+            None,
+            &mut tracked,
+            None,
+            None,
+            Some(&checker),
+        )
+        .await;
+
+        assert_eq!(counts.dds_disk_hits, 3);
+        assert_eq!(counts.cache_hits, 0);
+        assert_eq!(counts.patch_skipped, 0);
+        assert_eq!(counts.disk_skipped, 0);
+        assert_eq!(result.len(), 5);
+        assert_eq!(result, tiles[3..]);
     }
 
     #[tokio::test]
