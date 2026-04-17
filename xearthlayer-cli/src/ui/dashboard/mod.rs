@@ -325,11 +325,11 @@ impl Dashboard {
                                 // Esc also triggers confirmation
                                 self.quit_confirmation = Some(Instant::now());
                             }
-                            KeyCode::Char('c') | KeyCode::Char('C') => {
+                            KeyCode::Char('c') | KeyCode::Char('C')
+                                if self.prewarm_status.is_some() =>
+                            {
                                 // Cancel current operation (e.g., pre-warm)
-                                if self.prewarm_status.is_some() {
-                                    return Ok(Some(DashboardEvent::Cancel));
-                                }
+                                return Ok(Some(DashboardEvent::Cancel));
                             }
                             _ => {}
                         }

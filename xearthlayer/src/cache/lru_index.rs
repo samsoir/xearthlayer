@@ -412,11 +412,11 @@ impl LruIndex {
         .map_err(std::io::Error::other)?;
 
         // Calculate average file size for diagnostics
-        let avg_size_kb = if stats.files_indexed > 0 {
-            (stats.total_bytes / stats.files_indexed) / 1_000
-        } else {
-            0
-        };
+        let avg_size_kb = (stats
+            .total_bytes
+            .checked_div(stats.files_indexed)
+            .unwrap_or(0))
+            / 1_000;
 
         tracing::debug!(
             files = stats.files_indexed,

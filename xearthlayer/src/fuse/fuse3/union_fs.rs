@@ -494,8 +494,7 @@ impl Filesystem for Fuse3UnionFS {
         });
 
         // Get entries from union index
-        let mut entry_offset = 3i64;
-        for dir_entry in self.index.list_directory(&virtual_path) {
+        for (entry_offset, dir_entry) in (3i64..).zip(self.index.list_directory(&virtual_path)) {
             let child_path = virtual_path.join(&dir_entry.name);
             let entry_inode = self.inode_manager.get_or_create_inode(&child_path);
 
@@ -511,7 +510,6 @@ impl Filesystem for Fuse3UnionFS {
                 name: dir_entry.name.clone(),
                 offset: entry_offset,
             });
-            entry_offset += 1;
         }
 
         // Skip entries based on offset

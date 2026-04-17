@@ -186,7 +186,7 @@ impl TileProgressTracker {
             .collect();
 
         // Sort by oldest started first (completed jobs age off the top)
-        entries.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+        entries.sort_by_key(|a| a.started_at);
         entries.truncate(MAX_DISPLAY_REGIONS);
         entries
     }

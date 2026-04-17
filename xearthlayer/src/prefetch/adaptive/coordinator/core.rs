@@ -969,7 +969,7 @@ impl AdaptivePrefetchCoordinator {
         // Update statistics
         self.total_cycles += 1;
         self.total_tiles_submitted += submitted as u64;
-        self.total_cache_hits += (plan.skipped_cached as usize + total_filtered) as u64;
+        self.total_cache_hits += (plan.skipped_cached + total_filtered) as u64;
 
         // Update shared status for TUI
         self.update_shared_status(position, &plan, submitted);
