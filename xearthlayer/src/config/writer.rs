@@ -122,7 +122,7 @@ network_concurrent = {}
 cpu_concurrent = {}
 ; Disk I/O: Cache read/write operations (default: 64 for SSD)
 disk_io_concurrent = {}
-; Maximum concurrent DDS tile jobs (default: ceil(num_cpus × 0.75))
+; Maximum concurrent DDS tile jobs (default: num_cpus / 2)
 max_concurrent_jobs = {}
 
 ; Download behavior

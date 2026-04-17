@@ -50,12 +50,14 @@ pub fn default_prefetch_in_flight() -> usize {
     (num_cpus() / 4).max(2)
 }
 
-/// Default max concurrent jobs: ceil(num_cpus × 0.75), minimum 4.
+/// Default max concurrent jobs: num_cpus / 2, minimum 2.
 ///
-/// Limits total in-flight jobs (download + encode pipeline) to prevent
-/// over-admission while keeping the executor fed.
+/// Limits total in-flight jobs (download + encode pipeline) to balance
+/// XEarthLayer throughput against X-Plane frame overhead. Empirically
+/// tuned — higher values starve X-Plane's render thread, lower values
+/// under-feed the executor on high-core systems.
 pub fn default_max_concurrent_jobs() -> usize {
-    ((num_cpus() as f64 * 0.75).ceil() as usize).max(4)
+    (num_cpus() / 2).max(2)
 }
 
 /// Default executor CPU concurrent: num_cpus / 2, minimum 2.
