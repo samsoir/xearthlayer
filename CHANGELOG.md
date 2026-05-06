@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Tiles assembled from failed chunk downloads are no longer cached** ([#180](https://github.com/samsoir/xearthlayer/issues/180)): Network failures during tile generation produced magenta-filled DDS tiles that were structurally valid (correct size + DDS magic) and persisted indefinitely in the memory and DDS disk caches, surviving even X-Plane's "Reload Scenery". On reconnect, re-requests would short-circuit to the poisoned cache instead of re-fetching. Cache writes are now gated on `ChunkResults::is_complete()`: tiles with any failed chunks are still served to X-Plane (so the sim doesn't stall during outages) but never persisted to memory or DDS disk. The chunk-disk tier was already correct (only successful HTTP downloads were cached), so it now functions as a natural retry-resume buffer on re-request — only the chunks that previously failed get re-fetched. Users who saw magenta tiles persist across an outage on v0.4.4 or earlier should run `xearthlayer cache clear` to purge any poisoned tiles.
+
 ## [0.4.4] - 2026-04-16
 
 ### Changed

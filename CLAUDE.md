@@ -40,7 +40,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 3. **Download Orchestrator** (`xearthlayer/src/orchestrator/`)
    - Parallel download of 256 chunks (16×16) per tile
    - Configurable concurrency, timeout, and retry logic
-   - 80% minimum success rate requirement
+   - Failed chunks are not cached (retry on next request); see Cache System for tile-level rules
 
 4. **DDS Compression** (`xearthlayer/src/dds/`)
    - BC1/BC3 (DXT1/DXT5) compression
@@ -72,7 +72,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - DDS disk directory: `{cache_dir}/{provider}/dds/`, chunks keep existing provider directory
    - Region-based disk layout: files in 1°×1° DSF subdirs (e.g., `+33-119/tile_15_12754_5279.cache`)
    - Read path: memory hit → DDS disk hit (+ promote to memory) → chunk disk (assemble+encode) → network
-   - Write path: After encode, fire-and-forget to both memory AND DDS disk
+   - Write path (per-tier completeness rules):
+     - Chunk disk: per-chunk, only successful HTTP downloads (failed/magenta chunks never written)
+     - Memory + DDS disk: per-tile, fire-and-forget after encode, **only when all 256 chunks succeeded** (`ChunkResults::is_complete()`). Tiles with any failed chunks are served to X-Plane (so the sim doesn't stall) but never persisted; see issue #180
    - Parallel startup scanning via rayon over region directories
    - `migrate_cache()` for migrating flat-layout caches to region layout
    - Bridge adapters for executor integration (MemoryCacheBridge, DdsDiskCacheBridge, DiskCacheBridge)
