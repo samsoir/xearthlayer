@@ -9,7 +9,7 @@
       "description": "Debian/Ubuntu package"
     },
     "rpm": {
-      "filename": "xearthlayer-0.4.5-1.fc43.x86_64.rpm",
+      "filename": "xearthlayer-0.4.5-1.fc44.x86_64.rpm",
       "description": "Fedora/RHEL package"
     },
     "tarball": {
