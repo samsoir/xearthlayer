@@ -47,6 +47,24 @@ make pre-commit
 # - download_base_url
 ```
 
+> **⚠ RPM filename drift:** The RPM asset name embeds the Fedora base image
+> version that the CI workflow uses (e.g. `fc43`, `fc44`). When CI's Fedora
+> base image upgrades, the actual RPM that gets published won't match what
+> `version.json` declares — the website then resolves a 404 for the RPM
+> download URL.
+>
+> Catch this **after** the release workflow publishes (Step 5) but
+> **before** merging the release PR (Step 6). Compare:
+>
+> ```bash
+> gh release view vX.Y.Z --json assets --jq '.assets[].name'
+> ```
+>
+> against the filenames in your `version.json`. If the RPM filename differs,
+> update `version.json` on the release branch and push the fix before
+> merging — that way the corrected `version.json` lands on main in the same
+> merge that the website-sync workflow consumes.
+
 ### Step 3: Create Release Branch and PR
 
 ```bash
@@ -88,14 +106,34 @@ gh run watch --repo samsoir/xearthlayer
 # ✓ Publish Release (~15 sec)
 ```
 
-### Step 6: Merge PR After Release Completes
+### Step 6: Reconcile Asset Filenames, Then Merge PR
 
 **CRITICAL**: Only merge the PR AFTER the release workflow completes successfully.
 
 ```bash
-# Verify release was published
-gh release view vX.Y.Z
+# Verify release was published, capture asset names
+gh release view vX.Y.Z --json assets --jq '.assets[].name'
+```
 
+**Compare the published asset names against `version.json` filenames.** The
+RPM in particular can drift when CI's Fedora base image upgrades (e.g.
+`fc43` → `fc44`). If anything is mismatched:
+
+```bash
+# On the release branch, fix version.json to match the actual filenames
+git checkout release/X.Y.Z
+# edit version.json
+git add version.json
+git commit -m "Release vX.Y.Z: align version.json asset filenames with built artifacts"
+git push
+# wait for CI green on the new commit
+```
+
+This must happen **before merge** so the corrected `version.json` lands on
+main with the merge SHA the website-sync workflow consumes. If you discover
+the drift after merge, you'll need a follow-up PR.
+
+```bash
 # Merge the PR
 gh pr merge --merge --delete-branch
 ```
@@ -302,6 +340,45 @@ gh run view <run-id> --log-failed
 
 ---
 
+### Issue: RPM Download Returns 404 from Website
+
+**Symptoms:**
+- Website's RPM download link 404s while DEB / tarball / AUR work fine
+- `version.json` declares `xearthlayer-X.Y.Z-1.fcNN.x86_64.rpm` but the
+  published asset is named with a different `fcNN`
+
+**Cause:**
+The release workflow's RPM job runs in a Fedora container, and the asset
+filename embeds whichever `fcNN` that container resolves to at build time.
+When Fedora releases a new version, the container upgrades automatically
+(typically once or twice a year), and the RPM filename advances. If
+`version.json` was authored against the previous Fedora version, the
+declared filename diverges from the published artifact.
+
+**Fix (post-release):**
+
+```bash
+# Find the actual RPM filename
+gh release view vX.Y.Z --json assets --jq '.assets[] | select(.name | endswith(".rpm")) | .name'
+
+# Update version.json on main via a fix-up PR
+git checkout main && git pull
+git checkout -b fix/version-json-rpm-fcNN
+# edit version.json -> assets.rpm.filename
+git add version.json
+git commit -m "fix(version.json): align RPM filename with built fcNN"
+git push -u origin fix/version-json-rpm-fcNN
+gh pr create --title "fix(version.json): align RPM filename with built fcNN"
+```
+
+**Prevention:**
+Reconcile asset filenames against `version.json` *after the release workflow
+publishes* but *before merging the release PR* (Step 6). Catching it on the
+release branch means the corrected `version.json` lands with the same merge
+SHA the website-sync workflow consumes.
+
+---
+
 ### Issue: Skipped Version Number
 
 If you had to skip a version (e.g., v0.2.11 was blocked), document it properly:
@@ -333,6 +410,7 @@ Update the comparison links at the bottom of CHANGELOG.md:
 - [ ] CI passes on PR
 - [ ] Tag created and pushed (BEFORE merging PR)
 - [ ] Release workflow completes successfully
+- [ ] **Asset filenames reconciled against `version.json`** (RPM `fcNN` drift) — fix on release branch before merge if mismatched
 - [ ] PR merged (AFTER workflow completes) — `version.json` lands on main with merge
 - [ ] Website shows new version
 
