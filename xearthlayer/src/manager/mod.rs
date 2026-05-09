@@ -41,6 +41,7 @@
 mod cache;
 mod client;
 mod config;
+mod disk_check;
 mod download;
 mod error;
 mod extractor;
@@ -54,6 +55,9 @@ mod updates;
 pub use cache::{CacheStats, CachedLibraryClient};
 pub use client::HttpLibraryClient;
 pub use config::ManagerConfig;
+pub use disk_check::{
+    check_disk_space, FsInfoProvider, RealFsInfoProvider, SPACE_BUFFER_MULTIPLIER,
+};
 pub use download::{
     DownloadProgress, DownloadProgressCallback, DownloadState, MultiPartDownloader, PartState,
 };

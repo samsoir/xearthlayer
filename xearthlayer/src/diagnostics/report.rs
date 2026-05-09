@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// A comprehensive system diagnostics report.
@@ -49,12 +50,34 @@ pub struct GpuInfo {
 }
 
 /// Disk space information.
+///
+/// Reports both the root filesystem (annotated when running on an
+/// ostree-based atomic distro where 100% rootfs is the steady state)
+/// and the writable paths XEarthLayer actually uses (cache directory,
+/// package install location). See issue #188 for context.
 #[derive(Debug, Clone, Default)]
 pub struct DiskInfo {
+    /// Root filesystem total size as displayed by `df -h /`.
     pub root_total: Option<String>,
+    /// Root filesystem used as displayed by `df -h /`.
     pub root_used: Option<String>,
+    /// Root filesystem use% as displayed by `df -h /`.
     pub root_percent: Option<String>,
-    pub cache_size: Option<String>,
+    /// True if the host appears to be an ostree-based atomic distro
+    /// where the rootfs is intentionally sized to its content.
+    pub is_immutable_os: bool,
+    /// Resolved cache directory path (`cache.directory` from config).
+    pub cache_dir_path: Option<String>,
+    /// Disk usage of the cache directory (e.g. "12.3G"), via `du -sh`.
+    pub cache_dir_size: Option<String>,
+    /// Bytes available on the filesystem holding the cache directory.
+    pub cache_dir_available: Option<String>,
+    /// Resolved package install location (`packages.install_location`
+    /// from config, or the default `~/.xearthlayer/packages`).
+    pub install_location_path: Option<String>,
+    /// Bytes available on the filesystem holding the install location.
+    pub install_location_available: Option<String>,
+    /// Whether the config directory (`~/.xearthlayer`) exists.
     pub config_exists: bool,
 }
 
@@ -221,10 +244,21 @@ impl GpuInfo {
 }
 
 impl DiskInfo {
+    /// Collect disk info from the user's environment, loading config from
+    /// the default path. Falls back to default config if loading fails.
     fn collect() -> Self {
+        let config = crate::config::ConfigFile::load().unwrap_or_default();
+        Self::from_config(&config)
+    }
+
+    /// Collect disk info using the provided config. The cache directory
+    /// and package install location are read from the config (with the
+    /// install location falling back to `~/.xearthlayer/packages` when
+    /// unset, matching the rest of the CLI).
+    fn from_config(config: &crate::config::ConfigFile) -> Self {
         let mut info = Self::default();
 
-        // Root filesystem
+        // Root filesystem (raw; annotation handled by Display).
         if let Ok(output) = Command::new("df").args(["-h", "/"]).output() {
             if output.status.success() {
                 let df = String::from_utf8_lossy(&output.stdout);
@@ -239,11 +273,11 @@ impl DiskInfo {
             }
         }
 
-        // Cache directory
-        let home = dirs::home_dir().unwrap_or_default();
-        let cache_dir = home.join(".cache/xearthlayer");
-        let config_dir = home.join(".xearthlayer");
+        info.is_immutable_os = crate::system::is_immutable_os();
 
+        // Cache directory: read from config (already tilde-expanded by parser).
+        let cache_dir = &config.cache.directory;
+        info.cache_dir_path = Some(cache_dir.display().to_string());
         if cache_dir.exists() {
             if let Ok(output) = Command::new("du")
                 .args(["-sh", &cache_dir.to_string_lossy()])
@@ -252,16 +286,60 @@ impl DiskInfo {
                 if output.status.success() {
                     let du = String::from_utf8_lossy(&output.stdout);
                     if let Some(size) = du.split_whitespace().next() {
-                        info.cache_size = Some(size.to_string());
+                        info.cache_dir_size = Some(size.to_string());
                     }
                 }
             }
         }
+        if let Ok(fs) = crate::system::fs_info(cache_dir_for_statvfs(cache_dir)) {
+            info.cache_dir_available =
+                Some(crate::config::format_size(fs.available_bytes as usize));
+        }
 
+        // Package install location: same priority as the CLI
+        // (config value > ~/.xearthlayer/packages).
+        let install_location = config
+            .packages
+            .install_location
+            .clone()
+            .unwrap_or_else(default_install_location);
+        info.install_location_path = Some(install_location.display().to_string());
+        if let Ok(fs) = crate::system::fs_info(cache_dir_for_statvfs(&install_location)) {
+            info.install_location_available =
+                Some(crate::config::format_size(fs.available_bytes as usize));
+        }
+
+        // Config directory existence (independent of cache/install paths).
+        let config_dir = dirs::home_dir().unwrap_or_default().join(".xearthlayer");
         info.config_exists = config_dir.exists();
 
         info
     }
+}
+
+/// Walk up the path until we find an ancestor that exists, so `statvfs`
+/// can succeed even when the cache or install directory hasn't been
+/// created yet (fresh installs hit this on first diagnostics run).
+fn cache_dir_for_statvfs(path: &Path) -> &Path {
+    let mut current = path;
+    loop {
+        if current.exists() {
+            return current;
+        }
+        match current.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => current = parent,
+            _ => return Path::new("/"),
+        }
+    }
+}
+
+/// Default package install location when `packages.install_location`
+/// is unset, mirroring the priority used by the packages CLI subcommands.
+fn default_install_location() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".xearthlayer")
+        .join("packages")
 }
 
 impl NetworkInfo {
@@ -402,22 +480,58 @@ impl fmt::Display for SystemReport {
 
         // Disk
         writeln!(f, "## Disk Space")?;
+
+        // Cache directory: writable path XEL actually uses, comes first
+        // so users see the relevant signal at the top.
+        if let Some(ref path) = self.disk.cache_dir_path {
+            let used = self
+                .disk
+                .cache_dir_size
+                .as_deref()
+                .unwrap_or("(not created)");
+            let avail = self
+                .disk
+                .cache_dir_available
+                .as_deref()
+                .unwrap_or("unknown");
+            writeln!(
+                f,
+                "Cache directory: {} ({} used, {} available)",
+                path, used, avail
+            )?;
+        }
+
+        if let Some(ref path) = self.disk.install_location_path {
+            let avail = self
+                .disk
+                .install_location_available
+                .as_deref()
+                .unwrap_or("unknown");
+            writeln!(f, "Packages location: {} ({} available)", path, avail)?;
+        }
+
+        // Root filesystem: annotated when the host is an atomic distro
+        // because 100% rootfs is the steady state, not a problem.
         if let (Some(ref used), Some(ref total), Some(ref percent)) = (
             &self.disk.root_used,
             &self.disk.root_total,
             &self.disk.root_percent,
         ) {
-            writeln!(
-                f,
-                "Root filesystem: {} used of {} ({})",
-                used, total, percent
-            )?;
+            if self.disk.is_immutable_os {
+                writeln!(
+                    f,
+                    "Root filesystem: {} used of {} ({}) — normal on atomic distro",
+                    used, total, percent
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    "Root filesystem: {} used of {} ({})",
+                    used, total, percent
+                )?;
+            }
         }
-        if let Some(ref cache) = self.disk.cache_size {
-            writeln!(f, "Cache directory: {}", cache)?;
-        } else {
-            writeln!(f, "Cache directory: (not created)")?;
-        }
+
         writeln!(
             f,
             "Config directory: {}",
@@ -455,5 +569,122 @@ impl fmt::Display for SystemReport {
         writeln!(f, "Copy the above output into your GitHub issue.")?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ConfigFile;
+    use tempfile::TempDir;
+
+    /// Build a ConfigFile pointing cache and install location at the
+    /// given temp directory subpaths. Used to test that `from_config`
+    /// reads from the config rather than hardcoded paths.
+    fn config_with_paths(cache_dir: PathBuf, install_location: PathBuf) -> ConfigFile {
+        let mut config = ConfigFile::default();
+        config.cache.directory = cache_dir;
+        config.packages.install_location = Some(install_location);
+        config
+    }
+
+    #[test]
+    fn from_config_reports_cache_directory_from_config() {
+        let temp = TempDir::new().unwrap();
+        let cache_dir = temp.path().join("xel-cache");
+        let install = temp.path().join("xel-packages");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::create_dir_all(&install).unwrap();
+
+        let config = config_with_paths(cache_dir.clone(), install.clone());
+        let info = DiskInfo::from_config(&config);
+
+        assert_eq!(
+            info.cache_dir_path.as_deref(),
+            Some(cache_dir.display().to_string().as_str()),
+            "cache_dir_path must reflect config.cache.directory"
+        );
+        assert_eq!(
+            info.install_location_path.as_deref(),
+            Some(install.display().to_string().as_str()),
+            "install_location_path must reflect config.packages.install_location"
+        );
+    }
+
+    #[test]
+    fn from_config_reports_available_bytes_for_existing_paths() {
+        let temp = TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let install = temp.path().join("packages");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::create_dir_all(&install).unwrap();
+
+        let config = config_with_paths(cache_dir, install);
+        let info = DiskInfo::from_config(&config);
+
+        assert!(
+            info.cache_dir_available.is_some(),
+            "cache_dir_available must be populated when the path exists"
+        );
+        assert!(
+            info.install_location_available.is_some(),
+            "install_location_available must be populated when the path exists"
+        );
+    }
+
+    #[test]
+    fn from_config_handles_nonexistent_cache_dir_via_ancestor_walk() {
+        // Cache directory doesn't exist yet (fresh install scenario);
+        // statvfs should still succeed by walking up to an existing
+        // ancestor (the temp dir itself).
+        let temp = TempDir::new().unwrap();
+        let nonexistent_cache = temp.path().join("not/yet/created/cache");
+        let install = temp.path().to_path_buf();
+
+        let config = config_with_paths(nonexistent_cache.clone(), install);
+        let info = DiskInfo::from_config(&config);
+
+        assert_eq!(
+            info.cache_dir_path.as_deref(),
+            Some(nonexistent_cache.display().to_string().as_str()),
+            "path is reported as configured even when not yet created"
+        );
+        assert!(
+            info.cache_dir_available.is_some(),
+            "available bytes must still be reported via ancestor-walk"
+        );
+        // The cache dir doesn't exist, so du-based size is None.
+        assert!(
+            info.cache_dir_size.is_none(),
+            "cache_dir_size should be None when path doesn't exist"
+        );
+    }
+
+    #[test]
+    fn from_config_falls_back_to_default_install_location_when_unset() {
+        let mut config = ConfigFile::default();
+        config.packages.install_location = None;
+
+        let info = DiskInfo::from_config(&config);
+
+        let expected = default_install_location();
+        assert_eq!(
+            info.install_location_path.as_deref(),
+            Some(expected.display().to_string().as_str()),
+            "must fall back to ~/.xearthlayer/packages when install_location is unset"
+        );
+    }
+
+    #[test]
+    fn cache_dir_for_statvfs_walks_up_to_existing_ancestor() {
+        let temp = TempDir::new().unwrap();
+        let nested = temp.path().join("a/b/c/d");
+        // None of a/b/c/d exists; ancestor walk should land on temp.path().
+        let resolved = cache_dir_for_statvfs(&nested);
+        assert!(
+            resolved.exists(),
+            "resolved path must exist; got {}",
+            resolved.display()
+        );
     }
 }

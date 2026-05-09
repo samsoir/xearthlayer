@@ -26,9 +26,11 @@
 //! - GTK4 desktop application (future)
 //! - Any other UI that needs hardware detection
 
+pub mod filesystem;
 mod hardware;
 mod recommendations;
 
+pub use filesystem::{fs_info, is_immutable_os, FilesystemInfo};
 pub use hardware::{detect_cpu_cores, detect_total_memory, StorageType, SystemInfo};
 pub use recommendations::{
     recommended_disk_cache, recommended_disk_io_profile, recommended_memory_cache,

@@ -14,6 +14,9 @@ use std::sync::Arc;
 
 use crate::package::{PackageMetadata, PackageType};
 
+use super::disk_check::{
+    check_disk_space, FsInfoProvider, RealFsInfoProvider, SPACE_BUFFER_MULTIPLIER,
+};
 use super::download::{
     DownloadProgress, DownloadProgressCallback, DownloadState, MultiPartDownloader, PartState,
 };
@@ -117,6 +120,10 @@ pub struct PackageInstaller<C: LibraryClient> {
     /// Optional per-part download progress callback.
     /// When set, bypasses the aggregate InstallProgressCallback bridge.
     on_download_progress: Option<Arc<DownloadProgressCallback>>,
+    /// Filesystem info provider for the pre-flight disk-space check.
+    /// Defaults to `RealFsInfoProvider`; tests can substitute a stub
+    /// via `with_fs_info_provider`.
+    fs_info_provider: Box<dyn FsInfoProvider>,
 }
 
 impl<C: LibraryClient> PackageInstaller<C> {
@@ -134,7 +141,17 @@ impl<C: LibraryClient> PackageInstaller<C> {
             temp_dir: temp_dir.into(),
             parallel_downloads: 4,
             on_download_progress: None,
+            fs_info_provider: Box::new(RealFsInfoProvider),
         }
+    }
+
+    /// Override the filesystem-info provider used by the pre-flight
+    /// disk-space check. Production callers don't need this; tests use
+    /// it to inject low-available stubs.
+    #[cfg(test)]
+    pub fn with_fs_info_provider(mut self, provider: Box<dyn FsInfoProvider>) -> Self {
+        self.fs_info_provider = provider;
+        self
     }
 
     /// Set the number of parallel downloads.
@@ -269,6 +286,19 @@ impl<C: LibraryClient> PackageInstaller<C> {
             &format!("Preparing {} parts...", metadata.parts.len()),
         );
         downloader.query_sizes(&mut download_state);
+
+        // Pre-flight disk-space check (issue #188): fail fast with a
+        // clear message if the temp directory's filesystem can't hold
+        // the download plus the extracted contents. We check the temp
+        // dir because that's where peak usage lives during install
+        // (downloaded archive parts + reassembled archive + extracted
+        // tree, all coexisting briefly before cleanup).
+        if download_state.total_size > 0 {
+            let required = download_state
+                .total_size
+                .saturating_mul(SPACE_BUFFER_MULTIPLIER);
+            check_disk_space(self.fs_info_provider.as_ref(), &install_temp, required)?;
+        }
 
         // Use per-part callback if set, otherwise bridge to aggregate InstallProgressCallback
         let download_progress: Option<DownloadProgressCallback> =
