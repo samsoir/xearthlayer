@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Consolidated multi-part download path on a single strategy** ([#187](https://github.com/samsoir/xearthlayer/issues/187)): Removed `SequentialStrategy` and the `DownloadStrategy` trait. Every install now flows through a single semaphore-bounded path; `packages.concurrent_downloads = 1` reduces it to one active download at a time while keeping the same retry, progress, and cancellation semantics. Users on `concurrent_downloads = 1` previously got a code path with no per-part retry and no detailed progress; they now get both.
+
 ### Fixed
+
+- **Package install no longer hangs after part failures; first failure aborts the install** ([#187](https://github.com/samsoir/xearthlayer/issues/187)): When any part exhausts its retries, the orchestrator sets a shared abort flag and other workers exit at their next abort check (between attempts and during backoff). Workers are collected via an `mpsc` channel for first-failure-wins detection rather than a sequential join loop. The temp directory holding partial downloads is wrapped in an RAII guard that wipes it on every exit path (Err return, panic, or success), eliminating leaked partial files. The user-facing error now identifies the first part that hard-failed by filename, the underlying error message, and a count of any other parts that failed before the abort cascade finished. Replaces the previous "stuck, need Ctrl-C" outcome with a clean non-zero exit and an actionable error message.
 
 - **Disk-space awareness for diagnostics and package installs** ([#188](https://github.com/samsoir/xearthlayer/issues/188)): Three related defects on immutable-OS and small-disk installs:
   - Diagnostics now reports cache directory and packages location with available bytes alongside used (where it actually matters), instead of only `df /` of the rootfs (which on Bazzite, Silverblue, Kinoite, SteamOS and other ostree-based atomic distros is intentionally sized to its content and reads `100%` as the steady state). The rootfs line is now annotated `— normal on atomic distro` when XEL detects an ostree-deployed root via `/run/ostree-booted`.

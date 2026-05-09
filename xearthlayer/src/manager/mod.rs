@@ -45,6 +45,7 @@ mod disk_check;
 mod download;
 mod error;
 mod extractor;
+mod install_guard;
 mod installer;
 mod local;
 mod mounts;
