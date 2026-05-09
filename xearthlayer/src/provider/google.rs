@@ -26,7 +26,56 @@
 //! This differs from Bing's quadkey system but maps directly to our
 //! tile coordinates.
 
+use serde::Deserialize;
+
 use crate::provider::{AsyncHttpClient, AsyncProvider, HttpClient, Provider, ProviderError};
+
+/// Subset of the `createSession` response we care about.
+///
+/// Google returns additional fields (e.g. `expiry`, `tileWidth`); we ignore
+/// them and rely on serde to fail loudly if `session` is missing or non-string.
+#[derive(Deserialize)]
+struct SessionResponse {
+    session: String,
+}
+
+/// JSON body sent to `createSession` (satellite map type, en-US, US region).
+const SESSION_REQUEST_BODY: &str = r#"{
+  "mapType": "satellite",
+  "language": "en-US",
+  "region": "US"
+}"#;
+
+/// Build the URL used to mint a session token for the given API key.
+fn build_session_url(api_key: &str) -> String {
+    format!(
+        "https://tile.googleapis.com/v1/createSession?key={}",
+        api_key
+    )
+}
+
+/// Build the tile URL for the given coordinates and authenticated session.
+fn build_tile_url(api_key: &str, session_token: &str, row: u32, col: u32, zoom: u8) -> String {
+    format!(
+        "https://tile.googleapis.com/v1/2dtiles/{}/{}/{}?session={}&key={}",
+        zoom, col, row, session_token, api_key
+    )
+}
+
+/// Parse a `createSession` response body and extract the session token.
+///
+/// Returns [`ProviderError::InvalidResponse`] if the body is not valid UTF-8
+/// or if the JSON is missing/malformed (e.g. `session` is absent or non-string).
+fn parse_session_response(body: &[u8]) -> Result<String, ProviderError> {
+    let parsed: SessionResponse = serde_json::from_slice(body).map_err(|e| {
+        let preview = String::from_utf8_lossy(body);
+        ProviderError::InvalidResponse(format!(
+            "Failed to parse session response ({}): {}",
+            e, preview
+        ))
+    })?;
+    Ok(parsed.session)
+}
 
 /// Google Maps satellite imagery provider.
 ///
@@ -88,37 +137,9 @@ impl<C: HttpClient> GoogleMapsProvider<C> {
     /// Makes a POST request to https://tile.googleapis.com/v1/createSession
     /// with satellite map type configuration.
     fn create_session(http_client: &C, api_key: &str) -> Result<String, ProviderError> {
-        let url = format!(
-            "https://tile.googleapis.com/v1/createSession?key={}",
-            api_key
-        );
-
-        let json_body = r#"{
-  "mapType": "satellite",
-  "language": "en-US",
-  "region": "US"
-}"#;
-
-        let response = http_client.post_json(&url, json_body)?;
-
-        // Parse JSON response to extract session token
-        let response_str = String::from_utf8(response)
-            .map_err(|e| ProviderError::InvalidResponse(format!("Invalid UTF-8: {}", e)))?;
-
-        // Simple JSON parsing to extract session field
-        // Format: {"session":"SESSION_TOKEN_HERE",...}
-        let session = response_str
-            .split("\"session\":")
-            .nth(1)
-            .and_then(|s| s.split('"').nth(1))
-            .ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Failed to parse session token from response: {}",
-                    response_str
-                ))
-            })?;
-
-        Ok(session.to_string())
+        let url = build_session_url(api_key);
+        let response = http_client.post_json(&url, SESSION_REQUEST_BODY)?;
+        parse_session_response(&response)
     }
 
     /// Builds the tile URL for the given coordinates.
@@ -126,10 +147,7 @@ impl<C: HttpClient> GoogleMapsProvider<C> {
     /// Google Maps uses standard XYZ coordinates (not quadkeys like Bing).
     /// The row/col from our coordinate system map directly to y/x in Google's API.
     fn build_url(&self, row: u32, col: u32, zoom: u8) -> String {
-        format!(
-            "https://tile.googleapis.com/v1/2dtiles/{}/{}/{}?session={}&key={}",
-            zoom, col, row, self.session_token, self.api_key
-        )
+        build_tile_url(&self.api_key, &self.session_token, row, col, zoom)
     }
 }
 
@@ -198,44 +216,14 @@ impl<C: AsyncHttpClient> AsyncGoogleMapsProvider<C> {
 
     /// Creates a session token for the Map Tiles API.
     async fn create_session(http_client: &C, api_key: &str) -> Result<String, ProviderError> {
-        let url = format!(
-            "https://tile.googleapis.com/v1/createSession?key={}",
-            api_key
-        );
-
-        let json_body = r#"{
-  "mapType": "satellite",
-  "language": "en-US",
-  "region": "US"
-}"#;
-
-        let response = http_client.post_json(&url, json_body).await?;
-
-        // Parse JSON response to extract session token
-        let response_str = String::from_utf8(response)
-            .map_err(|e| ProviderError::InvalidResponse(format!("Invalid UTF-8: {}", e)))?;
-
-        // Simple JSON parsing to extract session field
-        let session = response_str
-            .split("\"session\":")
-            .nth(1)
-            .and_then(|s| s.split('"').nth(1))
-            .ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Failed to parse session token from response: {}",
-                    response_str
-                ))
-            })?;
-
-        Ok(session.to_string())
+        let url = build_session_url(api_key);
+        let response = http_client.post_json(&url, SESSION_REQUEST_BODY).await?;
+        parse_session_response(&response)
     }
 
     /// Builds the tile URL for the given coordinates.
     fn build_url(&self, row: u32, col: u32, zoom: u8) -> String {
-        format!(
-            "https://tile.googleapis.com/v1/2dtiles/{}/{}/{}?session={}&key={}",
-            zoom, col, row, self.session_token, self.api_key
-        )
+        build_tile_url(&self.api_key, &self.session_token, row, col, zoom)
     }
 }
 
@@ -428,5 +416,51 @@ mod tests {
             Err(ProviderError::UnsupportedZoom(zoom)) => assert_eq!(zoom, 23),
             _ => panic!("Expected UnsupportedZoom error"),
         }
+    }
+
+    // parse_session_response — pure helper tests
+
+    #[test]
+    fn parse_session_response_extracts_token() {
+        let body = br#"{"session":"abc-123","expiry":"2025-01-01T00:00:00Z"}"#;
+        let token = parse_session_response(body).expect("parse should succeed");
+        assert_eq!(token, "abc-123");
+    }
+
+    #[test]
+    fn parse_session_response_tolerates_field_order() {
+        let body = br#"{"expiry":"2025-01-01T00:00:00Z","session":"reordered"}"#;
+        let token = parse_session_response(body).expect("parse should succeed");
+        assert_eq!(token, "reordered");
+    }
+
+    #[test]
+    fn parse_session_response_rejects_non_string_session() {
+        // The old split-based parser would silently misinterpret this and
+        // pull the next quoted string ("expiry") as the session token.
+        let body = br#"{"session": 12345, "expiry":"2025-01-01T00:00:00Z"}"#;
+        let result = parse_session_response(body);
+        assert!(result.is_err(), "non-string session must be rejected");
+    }
+
+    #[test]
+    fn parse_session_response_rejects_missing_session_field() {
+        let body = br#"{"expiry":"2025-01-01T00:00:00Z"}"#;
+        let result = parse_session_response(body);
+        assert!(result.is_err(), "missing session field must be rejected");
+    }
+
+    #[test]
+    fn parse_session_response_rejects_invalid_json() {
+        let body = b"not json at all";
+        let result = parse_session_response(body);
+        assert!(result.is_err(), "non-JSON input must be rejected");
+    }
+
+    #[test]
+    fn parse_session_response_rejects_invalid_utf8() {
+        let body: &[u8] = &[0xff, 0xfe, 0xfd];
+        let result = parse_session_response(body);
+        assert!(result.is_err(), "invalid UTF-8 must be rejected");
     }
 }
