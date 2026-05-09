@@ -6,15 +6,14 @@
 //! - SHA-256 checksum verification (`checksum`)
 //! - Multi-part download state tracking (`state`)
 //! - Real-time progress reporting (`progress`)
-//! - Multi-part download strategy with bounded concurrency (`strategy`)
-//! - High-level download orchestration (`orchestrator`)
+//! - High-level download orchestration with bounded concurrency (`orchestrator`)
 //!
 //! # Architecture
 //!
 //! ```text
 //! MultiPartDownloader (orchestrator)
-//!         │
-//!         ├── ParallelStrategy (semaphore-bounded; concurrency=1 → sequential)
+//!         │   semaphore-bounded sliding window;
+//!         │   concurrency=1 → strictly sequential
 //!         │
 //!         ├── HttpDownloader (single file downloads)
 //!         │
@@ -53,7 +52,6 @@ mod progress;
 pub(crate) mod retry;
 pub(crate) mod semaphore;
 mod state;
-mod strategy;
 
 // Public API - types used by installer and other modules
 pub use orchestrator::MultiPartDownloader;
