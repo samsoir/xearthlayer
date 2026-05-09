@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Disk-space awareness for diagnostics and package installs** ([#188](https://github.com/samsoir/xearthlayer/issues/188)): Three related defects on immutable-OS and small-disk installs:
+  - Diagnostics now reports cache directory and packages location with available bytes alongside used (where it actually matters), instead of only `df /` of the rootfs (which on Bazzite, Silverblue, Kinoite, SteamOS and other ostree-based atomic distros is intentionally sized to its content and reads `100%` as the steady state). The rootfs line is now annotated `— normal on atomic distro` when XEL detects an ostree-deployed root via `/run/ostree-booted`.
+  - Diagnostics now reads `cache.directory` from config rather than checking a hardcoded `~/.cache/xearthlayer` (which never matched the default `~/.xearthlayer/cache`), so the "Cache directory: (not created)" line was wrong for default-config users with a populated cache.
+  - Package installs (`xearthlayer packages install <region>`) now run a pre-flight disk-space check after sizing parts via HEAD requests but before any bytes hit the network. Insufficient space fails fast with `insufficient disk space at <path>: required X GB, available Y GB` instead of mid-stream I/O errors during the download.
+
 ## [0.4.5] - 2026-05-05
 
 ### Fixed

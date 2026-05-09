@@ -83,6 +83,16 @@ pub enum ManagerError {
         target: PathBuf,
         reason: String,
     },
+
+    /// Insufficient disk space at the install location for a package
+    /// install. Surfaced by the pre-flight check before any download
+    /// starts, so users get a clear message instead of mid-stream I/O
+    /// failures. See issue #188.
+    InsufficientDiskSpace {
+        path: PathBuf,
+        required_bytes: u64,
+        available_bytes: u64,
+    },
 }
 
 impl std::fmt::Display for ManagerError {
@@ -184,6 +194,19 @@ impl std::fmt::Display for ManagerError {
                     source.display(),
                     target.display(),
                     reason
+                )
+            }
+            Self::InsufficientDiskSpace {
+                path,
+                required_bytes,
+                available_bytes,
+            } => {
+                write!(
+                    f,
+                    "insufficient disk space at {}: required {}, available {}",
+                    path.display(),
+                    crate::config::format_size(*required_bytes as usize),
+                    crate::config::format_size(*available_bytes as usize),
                 )
             }
         }
