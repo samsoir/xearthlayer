@@ -22,6 +22,7 @@ use super::download::{
 };
 use super::error::{ManagerError, ManagerResult};
 use super::extractor::ShellExtractor;
+use super::install_guard::InstallTempGuard;
 use super::local::LocalPackageStore;
 use super::traits::{ArchiveExtractor, LibraryClient};
 
@@ -263,6 +264,13 @@ impl<C: LibraryClient> PackageInstaller<C> {
             source: e,
         })?;
 
+        // Wrap the temp directory in a RAII guard so any subsequent
+        // error path (download failure, extraction failure, mid-install
+        // panic) cleans the partial work. The success path also drops
+        // the guard, replacing the explicit Stage 7 cleanup that used
+        // to live below. See issue #187.
+        let _temp_guard = InstallTempGuard::new(install_temp.clone());
+
         // Prepare download state
         let urls: Vec<String> = metadata.parts.iter().map(|p| p.url.clone()).collect();
         let checksums: Vec<String> = metadata.parts.iter().map(|p| p.checksum.clone()).collect();
@@ -390,9 +398,8 @@ impl<C: LibraryClient> PackageInstaller<C> {
         self.move_extracted_contents(&extract_dir, &install_path)?;
         report(InstallStage::Installing, 1.0, "Package installed");
 
-        // Stage 7: Cleanup
-        report(InstallStage::Cleanup, 0.0, "Cleaning up temporary files...");
-        fs::remove_dir_all(&install_temp).ok(); // Best effort cleanup
+        // Stage 7: Cleanup is handled by `_temp_guard` dropping when this
+        // scope exits (whether via Ok return, ? on Err, or panic).
         report(InstallStage::Cleanup, 1.0, "Cleanup complete");
 
         report(InstallStage::Complete, 1.0, "Installation complete");
