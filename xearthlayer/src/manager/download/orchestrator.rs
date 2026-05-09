@@ -10,7 +10,7 @@ use std::time::Duration;
 use super::http::HttpDownloader;
 use super::progress::DownloadProgressCallback;
 use super::state::DownloadState;
-use super::strategy::{DownloadStrategy, ParallelStrategy, SequentialStrategy};
+use super::strategy::ParallelStrategy;
 use crate::manager::error::{ManagerError, ManagerResult};
 use crate::manager::traits::PackageDownloader;
 
@@ -93,8 +93,10 @@ impl MultiPartDownloader {
 
     /// Download all parts of a package.
     ///
-    /// Uses sequential or parallel strategy based on configuration.
-    /// Returns Ok(()) on success, or an error if downloads failed.
+    /// Always uses [`ParallelStrategy`]; for sequential behaviour, set
+    /// `parallel_downloads = 1` and the strategy's internal semaphore
+    /// gates work to one at a time. Returns `Ok(())` on success, or an
+    /// error if any part failed to download.
     pub fn download_all(
         &self,
         state: &mut DownloadState,
@@ -102,14 +104,8 @@ impl MultiPartDownloader {
     ) -> ManagerResult<()> {
         let on_progress = on_progress.map(Arc::new);
 
-        // Choose strategy based on parallel downloads setting
-        if self.parallel_downloads <= 1 {
-            let strategy = SequentialStrategy::new();
-            strategy.execute(state, on_progress)?;
-        } else {
-            let strategy = ParallelStrategy::new(self.parallel_downloads, self.downloader.timeout);
-            strategy.execute(state, on_progress)?;
-        }
+        let strategy = ParallelStrategy::new(self.parallel_downloads, self.downloader.timeout);
+        strategy.execute(state, on_progress)?;
 
         // Check for failures
         if state.has_failures() {

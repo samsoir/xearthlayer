@@ -1,129 +1,21 @@
-//! Download strategies for multi-part downloads.
+//! Multi-part download strategy.
 //!
-//! This module implements the Strategy pattern for sequential vs parallel
-//! downloading of package parts.
+//! Downloads multiple parts concurrently using a semaphore-bounded
+//! sliding window. There is intentionally no separate sequential
+//! strategy: setting `concurrency = 1` reduces this strategy to one
+//! active download at a time while keeping the same retry, progress,
+//! and (in subsequent phases) cancellation semantics.
 
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use super::http::HttpDownloader;
-use super::progress::{
-    DownloadProgress, DownloadProgressCallback, PartState, ProgressCounters, ProgressReporter,
-};
+use super::progress::{DownloadProgressCallback, ProgressCounters, ProgressReporter};
 use super::semaphore::CountingSemaphore;
 use super::state::DownloadState;
 use crate::manager::error::ManagerResult;
 use crate::manager::traits::{PackageDownloader, ProgressCallback};
-
-/// Strategy for downloading multiple parts.
-pub trait DownloadStrategy: Send + Sync {
-    /// Execute the download strategy.
-    ///
-    /// # Arguments
-    ///
-    /// * `state` - Download state to update
-    /// * `on_progress` - Optional progress callback
-    ///
-    /// # Returns
-    ///
-    /// Ok(()) on success, or an error if downloads failed.
-    fn execute(
-        &self,
-        state: &mut DownloadState,
-        on_progress: Option<Arc<DownloadProgressCallback>>,
-    ) -> ManagerResult<()>;
-}
-
-/// Sequential download strategy.
-///
-/// Downloads parts one at a time, suitable for low-bandwidth connections
-/// or when parallel downloads are not needed.
-#[derive(Debug, Default)]
-pub struct SequentialStrategy;
-
-impl SequentialStrategy {
-    /// Create a new sequential strategy.
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl DownloadStrategy for SequentialStrategy {
-    fn execute(
-        &self,
-        state: &mut DownloadState,
-        on_progress: Option<Arc<DownloadProgressCallback>>,
-    ) -> ManagerResult<()> {
-        let total_parts = state.total_parts;
-        let downloader = HttpDownloader::new();
-
-        for i in 0..total_parts {
-            let url = &state.urls[i];
-            let checksum = &state.checksums[i];
-            let dest = &state.destinations[i];
-
-            // Create per-download progress callback for real-time updates
-            let base_bytes = state.bytes_downloaded;
-            let completed_parts = state.downloaded_parts;
-
-            let result = if let Some(ref cb) = on_progress {
-                let cb = Arc::clone(cb);
-                let part_sizes = state.part_sizes.clone();
-                let total_bytes_so_far = base_bytes;
-                let total_size: Option<u64> = if part_sizes.iter().all(|s| s.is_some()) {
-                    Some(part_sizes.iter().map(|s| s.unwrap_or(0)).sum())
-                } else {
-                    None
-                };
-
-                let progress_cb: ProgressCallback =
-                    Box::new(move |downloaded: u64, _total: u64| {
-                        let parts: Vec<_> = (0..total_parts)
-                            .map(|idx| {
-                                let (part_state, part_bytes) = if idx < completed_parts {
-                                    (PartState::Done, part_sizes[idx].unwrap_or(0))
-                                } else if idx == i {
-                                    (PartState::Downloading, downloaded)
-                                } else {
-                                    (PartState::Queued, 0)
-                                };
-                                super::progress::PartProgress {
-                                    index: idx,
-                                    filename: format!("part_{}", idx),
-                                    bytes_downloaded: part_bytes,
-                                    total_bytes: part_sizes[idx],
-                                    state: part_state,
-                                }
-                            })
-                            .collect();
-
-                        let total_downloaded = total_bytes_so_far + downloaded;
-                        let snapshot = DownloadProgress {
-                            parts,
-                            total_bytes_downloaded: total_downloaded,
-                            total_bytes: total_size,
-                        };
-                        cb(&snapshot);
-                    });
-                downloader.download_with_progress(url, dest, Some(checksum), progress_cb)
-            } else {
-                downloader.download(url, dest, Some(checksum))
-            };
-
-            match result {
-                Ok(bytes) => {
-                    state.record_success(bytes);
-                }
-                Err(_) => {
-                    state.record_failure(i);
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
 
 /// Parallel download strategy.
 ///
@@ -164,8 +56,13 @@ const MAX_RETRIES: u8 = 3;
 /// Base delay for exponential backoff (2 seconds).
 const BASE_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-impl DownloadStrategy for ParallelStrategy {
-    fn execute(
+impl ParallelStrategy {
+    /// Execute the multi-part download.
+    ///
+    /// Returns `Ok(())` on completion (successful or partially failed —
+    /// inspect `state.failed` for per-part outcomes). Returns `Err` only
+    /// for non-recoverable errors that prevent any part from running.
+    pub fn execute(
         &self,
         state: &mut DownloadState,
         on_progress: Option<Arc<DownloadProgressCallback>>,
@@ -315,13 +212,6 @@ impl DownloadStrategy for ParallelStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_sequential_strategy_new() {
-        let strategy = SequentialStrategy::new();
-        // Just verify it creates without panic
-        let _ = strategy;
-    }
 
     #[test]
     fn test_parallel_strategy_new() {

@@ -6,19 +6,15 @@
 //! - SHA-256 checksum verification (`checksum`)
 //! - Multi-part download state tracking (`state`)
 //! - Real-time progress reporting (`progress`)
-//! - Sequential and parallel download strategies (`strategy`)
+//! - Multi-part download strategy with bounded concurrency (`strategy`)
 //! - High-level download orchestration (`orchestrator`)
 //!
 //! # Architecture
 //!
-//! The download system is organized using the Strategy pattern:
-//!
 //! ```text
 //! MultiPartDownloader (orchestrator)
 //!         │
-//!         ├── DownloadStrategy (trait)
-//!         │       ├── SequentialStrategy
-//!         │       └── ParallelStrategy
+//!         ├── ParallelStrategy (semaphore-bounded; concurrency=1 → sequential)
 //!         │
 //!         ├── HttpDownloader (single file downloads)
 //!         │
