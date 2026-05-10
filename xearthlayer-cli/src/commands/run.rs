@@ -24,6 +24,10 @@ use crate::tui_app::{run_headless, run_tui, TuiAppConfig};
 use crate::ui;
 
 /// Arguments for the run command.
+///
+/// `--debug` and `--profile` are promoted to top-level CLI flags (see
+/// `main.rs`) so they apply to every subcommand and reach the logging
+/// initializer before dispatch. They are no longer carried per-command.
 #[derive(Default)]
 pub struct RunArgs {
     pub provider: Option<ProviderType>,
@@ -33,8 +37,6 @@ pub struct RunArgs {
     pub timeout: Option<u64>,
     pub parallel: Option<usize>,
     pub no_cache: bool,
-    pub debug: bool,
-    pub profile: bool,
     pub no_prefetch: bool,
     pub airport: Option<String>,
 }
@@ -59,7 +61,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         }
     }
 
-    let runner = CliRunner::with_options(args.debug, args.profile)?;
+    let runner = CliRunner::new()?;
     runner.log_startup("run");
 
     // Raise file descriptor limit to the hard maximum. XEL's FUSE mount +
