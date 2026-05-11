@@ -27,12 +27,17 @@
 //! - Any other UI that needs hardware detection
 
 pub mod filesystem;
+pub mod gpu;
 mod hardware;
 mod recommendations;
 
 pub use filesystem::{fs_info, is_immutable_os, FilesystemInfo};
+pub use gpu::{
+    enumerate as enumerate_gpus, enumerate_raw as enumerate_gpus_raw, find_adapter as find_gpu,
+    GpuAdapter, GpuKind, GpuSelectError,
+};
 pub use hardware::{detect_cpu_cores, detect_total_memory, StorageType, SystemInfo};
 pub use recommendations::{
     recommended_disk_cache, recommended_disk_io_profile, recommended_memory_cache,
-    RecommendedSettings,
+    RecommendedSettings, MIN_DISK_CACHE_BYTES, MIN_MEMORY_CACHE_BYTES,
 };

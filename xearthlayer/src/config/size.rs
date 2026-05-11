@@ -3,6 +3,13 @@
 use std::fmt;
 use thiserror::Error;
 
+/// 1 kibibyte in bytes (1024).
+pub const KB: usize = 1024;
+/// 1 mebibyte in bytes (1024²).
+pub const MB: usize = KB * 1024;
+/// 1 gibibyte in bytes (1024³).
+pub const GB: usize = MB * 1024;
+
 /// Error parsing a size string.
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("Invalid size '{input}' - expected format like '2GB', '500MB', or '1024KB'")]
@@ -90,10 +97,6 @@ pub fn parse_size(s: &str) -> Result<usize, SizeParseError> {
 /// assert_eq!(format_size(1536 * 1024 * 1024), "1.5 GB");
 /// ```
 pub fn format_size(bytes: usize) -> String {
-    const GB: usize = 1024 * 1024 * 1024;
-    const MB: usize = 1024 * 1024;
-    const KB: usize = 1024;
-
     if bytes >= GB {
         let value = bytes as f64 / GB as f64;
         if value.fract() == 0.0 {
@@ -130,11 +133,11 @@ impl Size {
     }
 
     pub fn from_gb(gb: usize) -> Self {
-        Self(gb * 1024 * 1024 * 1024)
+        Self(gb * GB)
     }
 
     pub fn from_mb(mb: usize) -> Self {
-        Self(mb * 1024 * 1024)
+        Self(mb * MB)
     }
 }
 

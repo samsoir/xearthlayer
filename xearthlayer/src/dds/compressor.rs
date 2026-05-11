@@ -288,20 +288,12 @@ mod gpu {
     pub fn create_gpu_resources(
         gpu_device: &str,
     ) -> Result<(wgpu::Device, wgpu::Queue, GpuBlockCompressor, String), DdsError> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
-
-        let adapters: Vec<wgpu::Adapter> =
-            pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
-        if adapters.is_empty() {
-            return Err(DdsError::CompressionFailed(
-                "No GPU adapters available".to_string(),
-            ));
-        }
-
-        let adapter = select_adapter(&adapters, gpu_device)?;
+        // Enumeration + selection live in `system::gpu` so the wizard's
+        // adapter→config-string mapping (`GpuAdapter::config_value`) stays
+        // in lockstep with this module's config-string→adapter mapping.
+        let adapters = crate::system::enumerate_gpus_raw();
+        let adapter = crate::system::find_gpu(&adapters, gpu_device)
+            .map_err(|e| DdsError::CompressionFailed(e.to_string()))?;
         let info = adapter.get_info();
         let adapter_name = format!("{} ({:?}, {:?})", info.name, info.device_type, info.backend);
 
@@ -320,54 +312,6 @@ mod gpu {
         tracing::info!(adapter = %adapter_name, "GPU resources initialized");
 
         Ok((device, queue, compressor, adapter_name))
-    }
-
-    fn select_adapter<'a>(
-        adapters: &'a [wgpu::Adapter],
-        gpu_device: &str,
-    ) -> Result<&'a wgpu::Adapter, DdsError> {
-        // Try device type match first
-        let target_type = match gpu_device.to_lowercase().as_str() {
-            "integrated" => Some(wgpu::DeviceType::IntegratedGpu),
-            "discrete" => Some(wgpu::DeviceType::DiscreteGpu),
-            _ => None,
-        };
-
-        if let Some(device_type) = target_type {
-            if let Some(adapter) = adapters
-                .iter()
-                .find(|a| a.get_info().device_type == device_type)
-            {
-                return Ok(adapter);
-            }
-        } else {
-            // Name substring match (case-insensitive)
-            let needle = gpu_device.to_lowercase();
-            if let Some(adapter) = adapters
-                .iter()
-                .find(|a| a.get_info().name.to_lowercase().contains(&needle))
-            {
-                return Ok(adapter);
-            }
-        }
-
-        // Build error with available adapters list
-        let available: Vec<String> = adapters
-            .iter()
-            .map(|a| {
-                let info = a.get_info();
-                format!(
-                    "  - {} ({:?}, {:?})",
-                    info.name, info.device_type, info.backend
-                )
-            })
-            .collect();
-
-        Err(DdsError::CompressionFailed(format!(
-            "No GPU adapter matching '{}'. Available adapters:\n{}",
-            gpu_device,
-            available.join("\n"),
-        )))
     }
 
     impl ImageCompressor for WgpuCompressor {

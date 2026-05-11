@@ -507,24 +507,16 @@ impl fmt::Display for SystemReport {
         }
         writeln!(f)?;
 
-        // GPU Compute Adapters (wgpu)
+        // GPU Compute Adapters (wgpu) — uses the shared enumerate to
+        // keep this surface in lockstep with the wizard's GPU step.
         {
             writeln!(f, "## GPU Compute Adapters")?;
-            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::all(),
-                ..Default::default()
-            });
-            let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+            let adapters = crate::system::enumerate_gpus();
             if adapters.is_empty() {
                 writeln!(f, "  (none found)")?;
             } else {
                 for (i, adapter) in adapters.iter().enumerate() {
-                    let info = adapter.get_info();
-                    writeln!(
-                        f,
-                        "  [{}] {} ({:?}, {:?})",
-                        i, info.name, info.device_type, info.backend
-                    )?;
+                    writeln!(f, "  [{}] {}", i, adapter)?;
                 }
             }
             writeln!(f)?;
