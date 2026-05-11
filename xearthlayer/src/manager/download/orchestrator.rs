@@ -26,6 +26,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tracing::{debug, error, warn};
+
 use super::http::HttpDownloader;
 use super::progress::{DownloadProgressCallback, ProgressCounters, ProgressReporter};
 use super::semaphore::CountingSemaphore;
@@ -267,10 +269,18 @@ impl MultiPartDownloader {
         while let Ok((index, outcome)) = result_rx.recv() {
             match outcome {
                 WorkerOutcome::Success { bytes } => {
+                    debug!(part_index = index, bytes, "part download completed");
                     total_bytes += bytes;
                     completed += 1;
                 }
                 WorkerOutcome::Failed { error, filename } => {
+                    error!(
+                        part_index = index,
+                        filename = %filename,
+                        attempts = MAX_RETRIES,
+                        error = %error,
+                        "part download failed (retries exhausted)"
+                    );
                     failed_parts.push(index);
                     if first_failure.is_none() {
                         first_failure = Some((filename, error));
@@ -278,6 +288,10 @@ impl MultiPartDownloader {
                     }
                 }
                 WorkerOutcome::Aborted => {
+                    debug!(
+                        part_index = index,
+                        "part download aborted (sibling failed first)"
+                    );
                     failed_parts.push(index);
                 }
             }
@@ -378,10 +392,19 @@ fn run_part_worker(
     counters.set_part_state(i, 1); // Downloading
     counters.set_part_attempt(i, 1);
 
+    debug!(part_index = i, filename = %filename, url = %url, "part download started");
+
     let mut last_error = String::new();
 
     for attempt in 1..=MAX_RETRIES {
         if attempt > 1 {
+            warn!(
+                part_index = i,
+                filename = %filename,
+                attempt,
+                error = %last_error,
+                "part download retry"
+            );
             counters.set_part_state(i, 4); // Retrying
             counters.set_part_attempt(i, attempt);
             counters.update_part(i, 0); // Reset byte counter for retry

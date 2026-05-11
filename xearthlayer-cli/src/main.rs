@@ -22,6 +22,8 @@ mod runner;
 mod tui_app;
 mod ui;
 
+use std::process::ExitCode;
+
 use clap::{Parser, Subcommand};
 use commands::cache::CacheAction;
 use commands::common::{DdsCompression, ProviderType};
@@ -163,7 +165,7 @@ enum Commands {
 // Main Entry Point
 // ============================================================================
 
-fn main() {
+fn main() -> ExitCode {
     let cli = Cli::parse();
 
     // Initialize logging once for every subcommand. Falls back to default
@@ -218,7 +220,14 @@ fn main() {
         }),
     };
 
-    if let Err(e) = result {
-        e.exit();
-    }
+    // Returning ExitCode (rather than calling process::exit) lets the
+    // _logging_guard drop normally, which forces tracing-appender's
+    // background writer to flush. Calling process::exit here would
+    // truncate the log on every failed run — exactly the symptom #194
+    // was filed to prevent. See CliError::report.
+    let exit_code = match result {
+        Ok(()) => 0u8,
+        Err(e) => e.report(),
+    };
+    ExitCode::from(exit_code)
 }

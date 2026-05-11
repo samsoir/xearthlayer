@@ -5,7 +5,6 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::process;
 use xearthlayer::config::ConfigFileError;
 use xearthlayer::service::ServiceError;
 
@@ -37,8 +36,15 @@ pub enum CliError {
 }
 
 impl CliError {
-    /// Exit the process with an appropriate error message and code.
-    pub fn exit(&self) -> ! {
+    /// Print the user-facing error message and return the intended
+    /// process exit code.
+    ///
+    /// Caller (typically `main`) is responsible for actually exiting,
+    /// so local destructors — most importantly the [`tracing_appender`]
+    /// `LoggingGuard` — get a chance to run. Calling [`std::process::exit`]
+    /// from inside this function would skip them and silently truncate
+    /// the on-disk log; see issue #194.
+    pub fn report(&self) -> u8 {
         eprintln!("Error: {}", self);
 
         // Print additional help for specific errors
@@ -86,7 +92,7 @@ impl CliError {
                 eprintln!("Run 'xearthlayer scenery-index --help' for usage information.");
             }
             CliError::NeedsSetup => {
-                // NeedsSetup is informational, not an error - print welcome message
+                // NeedsSetup is informational, not an error — print welcome message
                 println!();
                 println!("Welcome to XEarthLayer!");
                 println!();
@@ -98,13 +104,13 @@ impl CliError {
                 println!("  2. xearthlayer packages list     # View available packages");
                 println!("  3. xearthlayer packages install <region>");
                 println!();
-                // Exit with code 0 since this is not an error
-                process::exit(0);
+                // Treated as success since this is informational, not an error.
+                return 0;
             }
             _ => {}
         }
 
-        process::exit(1)
+        1
     }
 }
 
