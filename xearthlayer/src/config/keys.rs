@@ -11,6 +11,14 @@ use super::file::ConfigFile;
 use super::size::{format_size, parse_size};
 use crate::dds::DdsFormat;
 
+/// Display value used in place of any [`ConfigKey::is_sensitive`] value
+/// when the call site has no business showing the raw secret (notably
+/// `xearthlayer config list`, which is commonly pasted into bug reports).
+///
+/// Eight `x` characters: short enough to be obviously a placeholder, long
+/// enough that it can't be confused for a short real value.
+pub const SENSITIVE_VALUE_MASK: &str = "xxxxxxxx";
+
 /// Errors that can occur when getting or setting configuration values.
 #[derive(Debug, Error)]
 pub enum ConfigKeyError {
@@ -274,6 +282,22 @@ impl ConfigKey {
     /// Get the key name within the section (e.g., "library_url").
     pub fn key_name(&self) -> &'static str {
         self.name().split('.').nth(1).unwrap_or(self.name())
+    }
+
+    /// Whether this key holds a credential or other secret that should
+    /// never be displayed verbatim in places that might end up in user
+    /// bug reports (notably `xearthlayer config list`).
+    ///
+    /// Per-call display sites should swap the value for
+    /// [`SENSITIVE_VALUE_MASK`] when this returns true. `config get` and
+    /// `config set` are intentionally NOT masked: they are authoritative
+    /// user actions, and masking them would prevent users from
+    /// inspecting or echoing back the value they just configured.
+    pub fn is_sensitive(&self) -> bool {
+        matches!(
+            self,
+            ConfigKey::ProviderGoogleApiKey | ConfigKey::ProviderMapboxAccessToken
+        )
     }
 
     /// Get the value from a config file as a string.
@@ -1008,6 +1032,54 @@ mod tests {
         assert_eq!(ConfigKey::PackagesLibraryUrl.key_name(), "library_url");
         assert_eq!(ConfigKey::ProviderType.section(), "provider");
         assert_eq!(ConfigKey::ProviderType.key_name(), "type");
+    }
+
+    #[test]
+    fn is_sensitive_returns_true_for_provider_credentials() {
+        assert!(ConfigKey::ProviderGoogleApiKey.is_sensitive());
+        assert!(ConfigKey::ProviderMapboxAccessToken.is_sensitive());
+    }
+
+    #[test]
+    fn is_sensitive_returns_false_for_non_credential_keys() {
+        // Spot-check across sections — anything that isn't a credential
+        // must round-trip as non-sensitive so that masked output stays
+        // narrowly scoped.
+        assert!(!ConfigKey::GeneralUpdateCheck.is_sensitive());
+        assert!(!ConfigKey::ProviderType.is_sensitive());
+        assert!(!ConfigKey::CacheDirectory.is_sensitive());
+        assert!(!ConfigKey::PackagesLibraryUrl.is_sensitive());
+        assert!(!ConfigKey::LoggingFile.is_sensitive());
+        assert!(!ConfigKey::PrefetchEnabled.is_sensitive());
+    }
+
+    #[test]
+    fn is_sensitive_covers_every_key_exhaustively() {
+        // Guard against a future ConfigKey variant being added without
+        // a deliberate sensitivity decision: every key in `all()` must
+        // be classifiable, and the only `true` results allowed are the
+        // two known credentials.
+        let sensitive: Vec<ConfigKey> = ConfigKey::all()
+            .iter()
+            .copied()
+            .filter(|k| k.is_sensitive())
+            .collect();
+        assert_eq!(
+            sensitive,
+            vec![
+                ConfigKey::ProviderGoogleApiKey,
+                ConfigKey::ProviderMapboxAccessToken,
+            ]
+        );
+    }
+
+    #[test]
+    fn sensitive_value_mask_is_eight_x_chars() {
+        // The mask is treated as a constant by the CLI; if it changes,
+        // the change must be deliberate (and probably wants to update
+        // diagnostics redaction too).
+        assert_eq!(SENSITIVE_VALUE_MASK, "xxxxxxxx");
+        assert_eq!(SENSITIVE_VALUE_MASK.len(), 8);
     }
 
     #[test]

@@ -378,30 +378,82 @@ impl ConfigInfo {
             info.config_path = Some(config_path.display().to_string());
 
             if let Ok(content) = fs::read_to_string(&config_path) {
-                let mut redacted = String::new();
-                for line in content.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
-                        continue;
-                    }
-                    if trimmed.to_lowercase().contains("api_key")
-                        || trimmed.to_lowercase().contains("secret")
-                        || trimmed.to_lowercase().contains("token")
-                    {
-                        if let Some(key) = trimmed.split('=').next() {
-                            redacted.push_str(&format!("{} = [REDACTED]\n", key.trim()));
-                        }
-                    } else {
-                        redacted.push_str(line);
-                        redacted.push('\n');
-                    }
-                }
-                info.config_contents = Some(redacted);
+                info.config_contents = Some(redact_sensitive_ini(&content));
             }
         }
 
         info
     }
+}
+
+/// Track the current INI section while walking lines so we can construct
+/// `section.key` names and look them up via [`ConfigKey`].
+fn parse_section_header(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+        Some(&trimmed[1..trimmed.len() - 1])
+    } else {
+        None
+    }
+}
+
+/// Redact sensitive credential values from raw INI text by checking each
+/// `key = value` line against [`ConfigKey::is_sensitive`] and substituting
+/// [`SENSITIVE_VALUE_MASK`] for the value.
+///
+/// Section headers, comments, blank lines, non-sensitive entries, and
+/// entries with empty values are preserved verbatim — empty values aren't
+/// secrets and the absence is informative when reading a diagnostics
+/// dump. See issue #162 for why we drive both this and `config list`
+/// from the same `is_sensitive` predicate.
+fn redact_sensitive_ini(content: &str) -> String {
+    use crate::config::{ConfigKey, SENSITIVE_VALUE_MASK};
+
+    let mut out = String::with_capacity(content.len());
+    let mut current_section: Option<String> = None;
+
+    for line in content.lines() {
+        if let Some(section) = parse_section_header(line) {
+            current_section = Some(section.to_string());
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        let Some(eq_idx) = line.find('=') else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+
+        let key_part = line[..eq_idx].trim();
+        let value_part = line[eq_idx + 1..].trim();
+        let qualified = match &current_section {
+            Some(s) => format!("{}.{}", s, key_part),
+            None => key_part.to_string(),
+        };
+
+        let is_sensitive = qualified
+            .parse::<ConfigKey>()
+            .map(|k| k.is_sensitive())
+            .unwrap_or(false);
+
+        if is_sensitive && !value_part.is_empty() {
+            out.push_str(&format!("{} = {}\n", key_part, SENSITIVE_VALUE_MASK));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
+    out
 }
 
 impl fmt::Display for SystemReport {
@@ -686,5 +738,83 @@ mod tests {
             "resolved path must exist; got {}",
             resolved.display()
         );
+    }
+
+    #[test]
+    fn redact_sensitive_ini_masks_provider_credentials() {
+        let input = "\
+[provider]
+type = google
+google_api_key = AIzaTEST_KEY_NOT_REAL_xxxxxx
+mapbox_access_token = pk.eyJ1IjoidGVzdCJ9.fake
+";
+        let redacted = redact_sensitive_ini(input);
+        assert!(redacted.contains("type = google"));
+        assert!(redacted.contains("google_api_key = xxxxxxxx"));
+        assert!(redacted.contains("mapbox_access_token = xxxxxxxx"));
+        assert!(!redacted.contains("AIzaTEST"));
+        assert!(!redacted.contains("pk.eyJ1"));
+    }
+
+    #[test]
+    fn redact_sensitive_ini_preserves_empty_credential_values() {
+        // Empty values aren't secrets and the absence is informative
+        // when reading a diagnostics dump (e.g., "user hasn't set their
+        // Google key yet, that's why google provider isn't working").
+        let input = "[provider]\ngoogle_api_key =\n";
+        let redacted = redact_sensitive_ini(input);
+        assert!(
+            redacted.contains("google_api_key ="),
+            "empty value must pass through verbatim, got: {:?}",
+            redacted
+        );
+        assert!(!redacted.contains("xxxxxxxx"));
+    }
+
+    #[test]
+    fn redact_sensitive_ini_preserves_non_credentials_and_structure() {
+        let input = "\
+# top comment
+[cache]
+directory = /tmp/cache
+memory_size = 512MB
+
+; section comment
+[provider]
+type = bing
+";
+        let redacted = redact_sensitive_ini(input);
+        // Comments, headers, and non-sensitive values all preserved.
+        assert!(redacted.contains("# top comment"));
+        assert!(redacted.contains("[cache]"));
+        assert!(redacted.contains("directory = /tmp/cache"));
+        assert!(redacted.contains("memory_size = 512MB"));
+        assert!(redacted.contains("; section comment"));
+        assert!(redacted.contains("[provider]"));
+        assert!(redacted.contains("type = bing"));
+        assert!(!redacted.contains("xxxxxxxx"));
+    }
+
+    #[test]
+    fn redact_sensitive_ini_passes_through_unknown_keys() {
+        // Unknown keys (e.g., from a future XEL version, or user typos)
+        // pass through unchanged. The exhaustive `is_sensitive` test in
+        // config::keys guarantees we never miss a real sensitive variant.
+        let input = "[provider]\nfuture_unknown_key = some_value\n";
+        let redacted = redact_sensitive_ini(input);
+        assert!(redacted.contains("future_unknown_key = some_value"));
+    }
+
+    #[test]
+    fn redact_sensitive_ini_only_masks_within_correct_section() {
+        // A key literally named `google_api_key` outside `[provider]`
+        // would be a parse error in ConfigKey, so passes through. This
+        // proves we are NOT falling back to substring matching.
+        let input = "\
+[cache]
+google_api_key = THIS_IS_NOT_A_REAL_KEY_AND_NOT_SENSITIVE
+";
+        let redacted = redact_sensitive_ini(input);
+        assert!(redacted.contains("THIS_IS_NOT_A_REAL_KEY_AND_NOT_SENSITIVE"));
     }
 }

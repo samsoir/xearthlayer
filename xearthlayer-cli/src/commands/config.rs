@@ -6,7 +6,7 @@
 
 use clap::Subcommand;
 use xearthlayer::config::{
-    analyze_config, config_file_path, upgrade_config, ConfigFile, ConfigKey,
+    analyze_config, config_file_path, upgrade_config, ConfigFile, ConfigKey, SENSITIVE_VALUE_MASK,
 };
 
 use crate::error::CliError;
@@ -120,14 +120,22 @@ fn run_list() -> Result<(), CliError> {
             current_section = section;
         }
 
-        let value = key.get(&config);
+        let raw_value = key.get(&config);
         let key_name = key.key_name();
 
-        if value.is_empty() {
-            println!("  {} = (not set)", key_name);
+        // Mask credentials so the output is safe to paste into bug
+        // reports. `(not set)` shows through unmasked because absence
+        // isn't a leak and is informative for users debugging
+        // "why isn't my Google provider working." See issue #162.
+        let display_value = if raw_value.is_empty() {
+            "(not set)".to_string()
+        } else if key.is_sensitive() {
+            SENSITIVE_VALUE_MASK.to_string()
         } else {
-            println!("  {} = {}", key_name, value);
-        }
+            raw_value
+        };
+
+        println!("  {} = {}", key_name, display_value);
     }
 
     Ok(())

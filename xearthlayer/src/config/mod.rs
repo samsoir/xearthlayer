@@ -100,7 +100,7 @@ pub use file::{
     DEFAULT_RETRY_BASE_DELAY_MS,
     DEFAULT_WEB_API_PORT,
 };
-pub use keys::{ConfigKey, ConfigKeyError};
+pub use keys::{ConfigKey, ConfigKeyError, SENSITIVE_VALUE_MASK};
 pub use size::{format_size, parse_size, Size, SizeParseError};
 pub use storage::{
     DiskIoProfile, DEFAULT_CPU_FALLBACK, HDD_BLOCKING_CEILING, HDD_BLOCKING_SCALING_FACTOR,
