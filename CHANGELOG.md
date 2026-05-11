@@ -7,11 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-05-10
+
+### Added
+
+- **Setup wizard: expanded cache configuration step** ([#154](https://github.com/samsoir/xearthlayer/issues/154)): The wizard's cache step now prompts for cache directory, disk cache size (default 25% of free space, floored to 10 GB), DDS-to-chunks disk ratio (default 0.6), memory cache size (default RAM ÷ 12, clamped to 500 MB – RAM ÷ 4), and the I/O profile in one place. Replaces the previous separate "system config" step. The disk cache default now reflects actual free space rather than a fixed 40 GB recommendation that ignored the user's storage situation, and the memory cache default treats the cache as a request absorber rather than a working-set holder (the on-disk DDS cache holds the working set).
+
+- **Setup wizard: GPU encoding step** ([#153](https://github.com/samsoir/xearthlayer/issues/153)): When two or more GPU adapters are detected, the wizard now offers to offload DDS encoding to a secondary GPU, with a warning against picking the GPU X-Plane renders on. Single-GPU systems silently keep ISPC (CPU). Adapter enumeration runs behind a spinner since it can take 10–30 seconds while drivers are probed. Selection round-trips to `texture.compressor` and `texture.gpu_device` config values that the encoder reselects at runtime — verified by a property test pairing the wizard's adapter→config-string mapping with the encoder's config-string→adapter mapping.
+
+- **Runtime control to disable XEL overlays** ([#152](https://github.com/samsoir/xearthlayer/issues/152)): New `packages.disable_overlays` config setting suppresses the consolidated `yzXEL_overlay/` symlink folder in Custom Scenery on `xearthlayer run` startup, so X-Plane does not load XEL overlays for the session. Overlay packages remain downloaded and cached locally — flipping the flag back to `false` and restarting reinstates them with no re-download. Use when running third-party overlay scenery (SimHeaven, Prefab Objects) that conflicts with XEL overlays. Distinct from `auto_install_overlays`, which controls whether overlays are *downloaded* alongside ortho packages.
+
+- **Structured tracing across the package install pipeline** ([#194](https://github.com/samsoir/xearthlayer/issues/194)): INFO events at every stage transition (metadata fetch, download phase, reassembly, extraction, completion) and DEBUG/WARN/ERROR around per-part download attempts, retries, and failures. Makes flight-test bug triage actionable from the log file alone instead of requiring the user to reproduce in real time.
+
 ### Changed
+
+- **Setup wizard restructure** ([#153](https://github.com/samsoir/xearthlayer/issues/153), [#154](https://github.com/samsoir/xearthlayer/issues/154)): Wizard is now four steps: X-Plane Custom Scenery → Package Location → Cache Configuration (consolidated) → DDS Encoding. The previous Step 4 "System Configuration" is folded into the cache step since its budgets derive from the same hardware detection.
+
+- **Sensitive credentials masked in `xearthlayer config list`** ([#162](https://github.com/samsoir/xearthlayer/issues/162)): `provider.google_api_key` and `provider.mapbox_access_token` now display as `xxxxxxxx` in `config list` output so the command is safe to paste into bug reports. `config get` and `config set` are intentionally unmasked since they are authoritative user actions. Diagnostics report redaction now shares the same `ConfigKey::is_sensitive` predicate, so adding a new sensitive key in one place automatically propagates to both surfaces.
+
+- **GPU adapter enumeration consolidated into `system::gpu`** ([#198](https://github.com/samsoir/xearthlayer/pull/198)): The wizard, encoder, and diagnostics report now share a single wgpu enumeration and selection module. Removed three duplicate copies of the wgpu instance setup and the encoder's `select_adapter` helper. The new module exposes `enumerate()` (metadata records), `enumerate_raw()` (live `wgpu::Adapter` handles), and `find_adapter()` (config-string → adapter selection) — paired with `GpuAdapter::config_value()` (adapter → config string) and locked together by a round-trip test.
 
 - **Consolidated multi-part download path on a single strategy** ([#187](https://github.com/samsoir/xearthlayer/issues/187)): Removed `SequentialStrategy` and the `DownloadStrategy` trait. Every install now flows through a single semaphore-bounded path; `packages.concurrent_downloads = 1` reduces it to one active download at a time while keeping the same retry, progress, and cancellation semantics. Users on `concurrent_downloads = 1` previously got a code path with no per-part retry and no detailed progress; they now get both.
 
+- **Google provider tile session parsing now uses serde** ([#163](https://github.com/samsoir/xearthlayer/issues/163)): Replaced manual `split("\"session\":")` JSON parsing with `#[derive(Deserialize)]`. The new path correctly rejects non-string `session` fields and malformed JSON that the previous string-search parser would silently misinterpret.
+
+- **EU2 region colour for coverage maps** ([#189](https://github.com/samsoir/xearthlayer/pull/189)): Publisher coverage maps now distinguish EU2 from neighbouring regions.
+
 ### Fixed
+
+- **CLI logging now initialises for every subcommand** ([#194](https://github.com/samsoir/xearthlayer/issues/194)): `xearthlayer.log` was previously written only by the `run` subcommand. `packages install`, `packages update`, `diagnostics`, and other subcommands ran with no file-level logging, so failures during install left no diagnostic trail. Logging is now initialised at top-level `main()` before subcommand dispatch, so every command writes to the configured log file. Includes a related fix where `process::exit()` skipped `LoggingGuard::drop()` and lost buffered log data on error exit — `main()` now returns `ExitCode` so the guard flushes correctly.
 
 - **Package install no longer hangs after part failures; first failure aborts the install** ([#187](https://github.com/samsoir/xearthlayer/issues/187)): When any part exhausts its retries, the orchestrator sets a shared abort flag and other workers exit at their next abort check (between attempts and during backoff). Workers are collected via an `mpsc` channel for first-failure-wins detection rather than a sequential join loop. The temp directory holding partial downloads is wrapped in an RAII guard that wipes it on every exit path (Err return, panic, or success), eliminating leaked partial files. The user-facing error now identifies the first part that hard-failed by filename, the underlying error message, and a count of any other parts that failed before the abort cascade finished. Replaces the previous "stuck, need Ctrl-C" outcome with a clean non-zero exit and an actionable error message.
 
@@ -1012,7 +1036,8 @@ Run `xearthlayer config upgrade` to automatically add new settings with defaults
 - Linux support only (Windows and macOS planned for future releases)
 - Requires FUSE3 for filesystem mounting
 
-[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.4.5...HEAD
+[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.4.6...HEAD
+[0.4.6]: https://github.com/samsoir/xearthlayer/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/samsoir/xearthlayer/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/samsoir/xearthlayer/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/samsoir/xearthlayer/compare/v0.4.2...v0.4.3
