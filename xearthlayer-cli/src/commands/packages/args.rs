@@ -160,6 +160,11 @@ pub struct InstallArgs {
     pub custom_scenery_path: Option<PathBuf>,
     /// Automatically install overlay package when installing ortho for the same region.
     pub auto_install_overlays: bool,
+    /// Skip rebuild of the consolidated `yzXEL_overlay/` symlink folder when
+    /// true. The package is still downloaded and installed; only the symlink
+    /// folder X-Plane reads is left alone. The next `xearthlayer run` will
+    /// remove any stale folder. See `packages.disable_overlays` config key.
+    pub disable_overlays: bool,
     /// Number of concurrent part downloads.
     pub concurrent_downloads: usize,
 }
@@ -174,6 +179,8 @@ pub struct UpdateArgs {
     pub all: bool,
     /// Path to X-Plane Custom Scenery directory for overlay symlinks.
     pub custom_scenery_path: Option<PathBuf>,
+    /// See `InstallArgs::disable_overlays`.
+    pub disable_overlays: bool,
     /// Number of concurrent part downloads.
     pub concurrent_downloads: usize,
 }
@@ -186,6 +193,8 @@ pub struct RemoveArgs {
     pub force: bool,
     /// Path to X-Plane Custom Scenery directory for overlay symlinks.
     pub custom_scenery_path: Option<PathBuf>,
+    /// See `InstallArgs::disable_overlays`.
+    pub disable_overlays: bool,
 }
 
 /// Arguments for the info command.

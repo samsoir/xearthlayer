@@ -429,6 +429,7 @@ Controls package manager behavior.
 | `install_location` | path | `~/.xearthlayer/packages` | Directory for storing installed packages |
 | `custom_scenery_path` | path | (auto-detect) | X-Plane Custom Scenery directory for overlay symlinks |
 | `auto_install_overlays` | bool | `false` | Automatically install matching overlay when installing ortho |
+| `disable_overlays` | bool | `false` | Suppress XEL overlays at runtime (see notes below) |
 | `temp_dir` | path | `~/.xearthlayer/tmp` | Temporary directory for package downloads |
 | `concurrent_downloads` | Integer | `5` | Number of concurrent part downloads (1-10) |
 
@@ -439,6 +440,7 @@ Controls package manager behavior.
 install_location = ~/.xearthlayer/packages
 custom_scenery_path = /home/user/X-Plane 12/Custom Scenery
 auto_install_overlays = true
+disable_overlays = false
 temp_dir = ~/Downloads/xearthlayer-temp
 ```
 
@@ -446,6 +448,7 @@ temp_dir = ~/Downloads/xearthlayer-temp
 - The default `library_url` points to the official XEarthLayer package library; override only if using a custom package source
 - The `temp_dir` is used for downloading archives before extraction; files are cleaned up after installation. The default avoids the system temp directory which is often RAM-backed (tmpfs) on Linux
 - When `auto_install_overlays` is enabled, installing an ortho package will automatically install the matching overlay package for the same region (if available)
+- `disable_overlays` is a **runtime** control. When set to `true`, `xearthlayer run` removes the consolidated `yzXEL_overlay/` symlink folder from Custom Scenery on startup so X-Plane does not load XEarthLayer overlays. Overlay packages remain downloaded and stored locally — flipping the setting back to `false` and restarting reinstates them with no re-download. Use this when running third-party overlay scenery (e.g. SimHeaven, Prefab Objects) that conflicts with XEL overlays. Distinct from `auto_install_overlays`, which controls whether overlays are *downloaded* alongside ortho packages.
 - If `custom_scenery_path` is not set, it falls back to `[xplane] scenery_dir` or auto-detects from X-Plane installation
 
 ---
@@ -569,6 +572,7 @@ file = ~/.xearthlayer/xearthlayer.log
 ; install_location = ~/.xearthlayer/packages
 ; custom_scenery_path = /path/to/X-Plane 12/Custom Scenery
 ; auto_install_overlays = true
+; disable_overlays = false
 ; temp_dir = ~/Downloads/xearthlayer-temp
 
 [patches]
@@ -699,6 +703,7 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `packages.install_location` | path | Package installation directory |
 | `packages.custom_scenery_path` | path | Custom Scenery for overlays |
 | `packages.auto_install_overlays` | `true`, `false` | Auto-install matching overlays |
+| `packages.disable_overlays` | `true`, `false` | Suppress XEL overlays at runtime |
 | `packages.temp_dir` | path | Temporary download directory |
 | `logging.file` | path | Log file location |
 

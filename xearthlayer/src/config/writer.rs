@@ -36,6 +36,11 @@ pub(super) fn to_config_string(config: &ConfigFile) -> String {
     } else {
         "false"
     };
+    let disable_overlays = if config.packages.disable_overlays {
+        "true"
+    } else {
+        "false"
+    };
     let temp_dir = config
         .packages
         .temp_dir
@@ -151,6 +156,12 @@ install_location = {}
 custom_scenery_path = {}
 ; Automatically install overlay packages when installing ortho for same region
 auto_install_overlays = {}
+; Suppress XEL overlays at runtime by removing the consolidated yzXEL_overlay/
+; symlink folder from Custom Scenery on `xearthlayer run` startup. Overlay
+; packages are still downloaded and stored locally — only the symlink that
+; X-Plane reads is suppressed. Use this when running third-party overlay
+; scenery (e.g., SimHeaven) that conflicts with XEL overlays. (default: false)
+disable_overlays = {}
 ; Temporary directory for package downloads (default: ~/.xearthlayer/tmp)
 ; Large packages are downloaded here before extraction
 temp_dir = {}
@@ -280,6 +291,7 @@ congestion_threshold = {}
         install_location,
         custom_scenery_path,
         auto_install_overlays,
+        disable_overlays,
         temp_dir,
         config.packages.concurrent_downloads,
         path_to_string(&config.logging.file),

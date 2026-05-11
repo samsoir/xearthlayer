@@ -160,6 +160,12 @@ pub struct PackagesSettings {
     pub custom_scenery_path: Option<PathBuf>,
     /// Automatically install overlay packages when installing ortho for same region.
     pub auto_install_overlays: bool,
+    /// Suppress the consolidated `yzXEL_overlay/` symlink folder in Custom Scenery
+    /// at runtime. Overlay packages are still downloaded and stored locally; this
+    /// only controls whether X-Plane sees the consolidated overlay folder when
+    /// `xearthlayer run` starts. Useful when running third-party overlay scenery
+    /// (e.g., SimHeaven) that would otherwise conflict with XEL overlays.
+    pub disable_overlays: bool,
     /// Temporary directory for downloads (default: ~/.xearthlayer/tmp).
     pub temp_dir: Option<PathBuf>,
     /// Number of concurrent part downloads (1-10, default: 5).
