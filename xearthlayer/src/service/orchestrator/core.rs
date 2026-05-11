@@ -11,7 +11,8 @@ use crate::aircraft_position::{SharedAircraftPosition, StateAggregator};
 use crate::geo_index::GeoIndex;
 use crate::log::TracingLogger;
 use crate::manager::{
-    create_consolidated_overlay, InstalledPackage, LocalPackageStore, MountManager, ServiceBuilder,
+    create_consolidated_overlay, remove_consolidated_overlay, InstalledPackage, LocalPackageStore,
+    MountManager, ServiceBuilder,
 };
 use crate::metrics::TelemetrySnapshot;
 use crate::ortho_union::OrthoUnionIndex;
@@ -232,16 +233,33 @@ impl ServiceOrchestrator {
             )));
         }
 
-        // Phase 2: Create overlay symlinks
+        // Phase 2: Create overlay symlinks (or remove them if disabled)
         if let Some(ref cb) = callback {
             cb(StartupProgress::CreatingOverlay);
         }
-        let overlay_result = create_consolidated_overlay(store, &self.config.custom_scenery_path);
-        let overlay_success = overlay_result.success;
-        let overlay_error = overlay_result.error.clone();
-        if let Some(ref error) = overlay_result.error {
-            tracing::warn!(error = %error, "Failed to create consolidated overlay");
-        }
+        let (overlay_success, overlay_error) = if self.config.disable_overlays {
+            match remove_consolidated_overlay(&self.config.custom_scenery_path) {
+                Ok(true) => {
+                    tracing::info!(
+                        "Removed consolidated overlay folder (packages.disable_overlays = true); \
+                         X-Plane will not load XEarthLayer overlays this session"
+                    );
+                    (true, None)
+                }
+                Ok(false) => (true, None),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to remove consolidated overlay");
+                    (false, Some(e.to_string()))
+                }
+            }
+        } else {
+            let overlay_result =
+                create_consolidated_overlay(store, &self.config.custom_scenery_path);
+            if let Some(ref error) = overlay_result.error {
+                tracing::warn!(error = %error, "Failed to create consolidated overlay");
+            }
+            (overlay_result.success, overlay_result.error.clone())
+        };
 
         // Phase 3: Start APT telemetry
         if let Some(ref cb) = callback {

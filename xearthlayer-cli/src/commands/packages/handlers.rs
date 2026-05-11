@@ -188,8 +188,19 @@ impl CommandHandler for CheckHandler {
 fn rebuild_consolidated_overlay(
     install_dir: &std::path::Path,
     custom_scenery_path: &Option<std::path::PathBuf>,
+    disable_overlays: bool,
     ctx: &CommandContext<'_>,
 ) {
+    if disable_overlays {
+        // Per `packages.disable_overlays` the consolidated overlay is suppressed
+        // at runtime. We deliberately leave any existing folder alone here; the
+        // next `xearthlayer run` removes it during startup. Issue #152.
+        ctx.output.println(
+            "Note: packages.disable_overlays = true; skipping consolidated overlay rebuild. \
+             The folder will be removed on next 'xearthlayer run'.",
+        );
+        return;
+    }
     let Some(ref scenery_path) = custom_scenery_path else {
         ctx.output
             .println("Note: No Custom Scenery path configured. Overlay symlink not created.");
@@ -292,7 +303,12 @@ impl InstallHandler {
         ));
 
         // Rebuild consolidated overlay to include the newly installed overlay
-        rebuild_consolidated_overlay(&args.install_dir, &args.custom_scenery_path, ctx);
+        rebuild_consolidated_overlay(
+            &args.install_dir,
+            &args.custom_scenery_path,
+            args.disable_overlays,
+            ctx,
+        );
     }
 }
 
@@ -373,7 +389,12 @@ impl CommandHandler for InstallHandler {
         // Rebuild consolidated overlay for overlay packages
         if args.package_type == PackageType::Overlay {
             ctx.output.newline();
-            rebuild_consolidated_overlay(&args.install_dir, &args.custom_scenery_path, ctx);
+            rebuild_consolidated_overlay(
+                &args.install_dir,
+                &args.custom_scenery_path,
+                args.disable_overlays,
+                ctx,
+            );
         }
 
         // Auto-install overlay when installing ortho (if enabled)
@@ -543,7 +564,12 @@ impl CommandHandler for UpdateHandler {
         // Rebuild consolidated overlay if any overlay packages were updated
         if overlay_updated {
             ctx.output.newline();
-            rebuild_consolidated_overlay(&args.install_dir, &args.custom_scenery_path, ctx);
+            rebuild_consolidated_overlay(
+                &args.install_dir,
+                &args.custom_scenery_path,
+                args.disable_overlays,
+                ctx,
+            );
         }
 
         Ok(())
@@ -628,7 +654,12 @@ impl CommandHandler for RemoveHandler {
 
         // Rebuild consolidated overlay after removing an overlay package
         if args.package_type == PackageType::Overlay {
-            rebuild_consolidated_overlay(&args.install_dir, &args.custom_scenery_path, ctx);
+            rebuild_consolidated_overlay(
+                &args.install_dir,
+                &args.custom_scenery_path,
+                args.disable_overlays,
+                ctx,
+            );
         }
 
         Ok(())

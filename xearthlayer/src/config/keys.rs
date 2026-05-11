@@ -69,6 +69,7 @@ pub enum ConfigKey {
     PackagesInstallLocation,
     PackagesCustomSceneryPath,
     PackagesAutoInstallOverlays,
+    PackagesDisableOverlays,
     PackagesTempDir,
     PackagesConcurrentDownloads,
 
@@ -151,6 +152,7 @@ impl FromStr for ConfigKey {
             "packages.install_location" => Ok(ConfigKey::PackagesInstallLocation),
             "packages.custom_scenery_path" => Ok(ConfigKey::PackagesCustomSceneryPath),
             "packages.auto_install_overlays" => Ok(ConfigKey::PackagesAutoInstallOverlays),
+            "packages.disable_overlays" => Ok(ConfigKey::PackagesDisableOverlays),
             "packages.temp_dir" => Ok(ConfigKey::PackagesTempDir),
             "packages.concurrent_downloads" => Ok(ConfigKey::PackagesConcurrentDownloads),
 
@@ -228,6 +230,7 @@ impl ConfigKey {
             ConfigKey::PackagesInstallLocation => "packages.install_location",
             ConfigKey::PackagesCustomSceneryPath => "packages.custom_scenery_path",
             ConfigKey::PackagesAutoInstallOverlays => "packages.auto_install_overlays",
+            ConfigKey::PackagesDisableOverlays => "packages.disable_overlays",
             ConfigKey::PackagesTempDir => "packages.temp_dir",
             ConfigKey::PackagesConcurrentDownloads => "packages.concurrent_downloads",
             ConfigKey::LoggingFile => "logging.file",
@@ -347,6 +350,7 @@ impl ConfigKey {
             ConfigKey::PackagesAutoInstallOverlays => {
                 config.packages.auto_install_overlays.to_string()
             }
+            ConfigKey::PackagesDisableOverlays => config.packages.disable_overlays.to_string(),
             ConfigKey::PackagesTempDir => config
                 .packages
                 .temp_dir
@@ -495,6 +499,11 @@ impl ConfigKey {
                 config.packages.auto_install_overlays =
                     v == "true" || v == "1" || v == "yes" || v == "on";
             }
+            ConfigKey::PackagesDisableOverlays => {
+                let v = value.to_lowercase();
+                config.packages.disable_overlays =
+                    v == "true" || v == "1" || v == "yes" || v == "on";
+            }
             ConfigKey::PackagesTempDir => {
                 config.packages.temp_dir = optional_path(value);
             }
@@ -639,6 +648,7 @@ impl ConfigKey {
             ConfigKey::PackagesInstallLocation => Box::new(OptionalPathSpec),
             ConfigKey::PackagesCustomSceneryPath => Box::new(OptionalPathSpec),
             ConfigKey::PackagesAutoInstallOverlays => Box::new(BooleanSpec),
+            ConfigKey::PackagesDisableOverlays => Box::new(BooleanSpec),
             ConfigKey::PackagesTempDir => Box::new(OptionalPathSpec),
             ConfigKey::PackagesConcurrentDownloads => Box::new(IntegerRangeSpec::new(1, 10)),
             ConfigKey::LoggingFile => Box::new(PathSpec),
@@ -712,6 +722,7 @@ impl ConfigKey {
             ConfigKey::PackagesInstallLocation,
             ConfigKey::PackagesCustomSceneryPath,
             ConfigKey::PackagesAutoInstallOverlays,
+            ConfigKey::PackagesDisableOverlays,
             ConfigKey::PackagesTempDir,
             ConfigKey::PackagesConcurrentDownloads,
             ConfigKey::LoggingFile,
@@ -1248,6 +1259,38 @@ mod tests {
         assert!(key.validate("600").is_ok());
         assert!(key.validate("29").is_err());
         assert!(key.validate("601").is_err());
+    }
+
+    #[test]
+    fn test_packages_disable_overlays_round_trip() {
+        let key = ConfigKey::from_str("packages.disable_overlays").unwrap();
+        assert_eq!(key.name(), "packages.disable_overlays");
+        assert_eq!(key.section(), "packages");
+        assert!(!key.is_sensitive());
+
+        let mut config = ConfigFile::default();
+        // Default
+        assert_eq!(key.get(&config), "false");
+        assert!(!config.packages.disable_overlays);
+
+        // Accepts every truthy form the BooleanSpec allows
+        for truthy in &["true", "1", "yes", "on", "TRUE", "YES"] {
+            key.set(&mut config, truthy).unwrap();
+            assert!(
+                config.packages.disable_overlays,
+                "Expected '{}' to set true",
+                truthy
+            );
+        }
+        // And falsy
+        key.set(&mut config, "false").unwrap();
+        assert!(!config.packages.disable_overlays);
+
+        // Validation rejects garbage
+        assert!(key.validate("maybe").is_err());
+
+        // Listed in all()
+        assert!(ConfigKey::all().contains(&ConfigKey::PackagesDisableOverlays));
     }
 
     #[test]

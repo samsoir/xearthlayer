@@ -376,6 +376,7 @@ impl Default for ConfigFile {
                 install_location: None,
                 custom_scenery_path: None,
                 auto_install_overlays: false,
+                disable_overlays: false,
                 temp_dir: None,
                 concurrent_downloads: 5,
             },

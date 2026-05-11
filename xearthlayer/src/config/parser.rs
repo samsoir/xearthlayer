@@ -272,6 +272,9 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
         if let Some(v) = section.get("auto_install_overlays") {
             config.packages.auto_install_overlays = parse_bool(v);
         }
+        if let Some(v) = section.get("disable_overlays") {
+            config.packages.disable_overlays = parse_bool(v);
+        }
         if let Some(v) = section.get("temp_dir") {
             let v = v.trim();
             if !v.is_empty() {

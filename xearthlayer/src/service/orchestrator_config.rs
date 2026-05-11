@@ -49,6 +49,12 @@ pub struct OrchestratorConfig {
     /// Install location for packages.
     pub packages_install_location: PathBuf,
 
+    /// Suppress the consolidated `yzXEL_overlay/` symlink folder at runtime.
+    /// When true, startup removes the folder instead of creating it. Overlay
+    /// packages remain installed and cached locally; only the symlink that
+    /// X-Plane reads is suppressed. See `packages.disable_overlays` config key.
+    pub disable_overlays: bool,
+
     /// Disk I/O profile for storage-specific tuning.
     pub disk_io_profile: DiskIoProfile,
 
@@ -217,6 +223,7 @@ impl OrchestratorConfig {
             patches_dir,
             patches_enabled: config.patches.enabled,
             packages_install_location,
+            disable_overlays: config.packages.disable_overlays,
             disk_io_profile: config.cache.disk_io_profile,
             prefetch,
             prewarm,
