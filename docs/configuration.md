@@ -10,7 +10,14 @@ The easiest way to configure XEarthLayer is with the interactive setup wizard:
 xearthlayer setup
 ```
 
-The wizard auto-detects your X-Plane installation, system hardware (CPU, memory, storage type), and recommends optimal settings. It handles all the configuration below automatically.
+The wizard auto-detects your X-Plane installation, system hardware (CPU, memory, storage type), free disk space, and GPU adapters, then recommends optimal settings. The wizard runs four steps:
+
+1. **X-Plane Custom Scenery** — auto-detected from your X-Plane install, with fallback to manual entry.
+2. **Package Location** — where regional scenery packages live on disk.
+3. **Cache Configuration** — cache directory, disk cache size (defaults to 25% of free space, floored to 10 GB), DDS-to-chunk disk ratio, memory cache size (defaults to RAM ÷ 12, clamped to 500 MB – RAM ÷ 4), and disk I/O profile (NVMe / SSD / HDD / auto).
+4. **DDS Encoding** — picks ISPC (CPU) by default, or offers to offload encoding to a secondary GPU when **two or more GPU adapters** are detected. The wizard warns against picking the GPU X-Plane renders on. Single-GPU systems skip the choice and stay on ISPC.
+
+GPU enumeration can take 10–30 seconds on multi-adapter systems while drivers are probed; a spinner shows progress.
 
 ## Manual Configuration
 

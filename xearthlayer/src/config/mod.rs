@@ -101,7 +101,7 @@ pub use file::{
     DEFAULT_WEB_API_PORT,
 };
 pub use keys::{ConfigKey, ConfigKeyError, SENSITIVE_VALUE_MASK};
-pub use size::{format_size, parse_size, Size, SizeParseError};
+pub use size::{format_size, parse_size, Size, SizeParseError, GB, KB, MB};
 pub use storage::{
     DiskIoProfile, DEFAULT_CPU_FALLBACK, HDD_BLOCKING_CEILING, HDD_BLOCKING_SCALING_FACTOR,
     HDD_IO_CEILING, HDD_IO_SCALING_FACTOR, NVME_BLOCKING_CEILING, NVME_BLOCKING_SCALING_FACTOR,

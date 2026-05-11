@@ -63,6 +63,10 @@ pub struct SystemInfo {
     pub storage_type: StorageType,
     /// The underlying DiskIoProfile for configuration
     pub disk_io_profile: DiskIoProfile,
+    /// Bytes available to a non-privileged user at the cache path's
+    /// filesystem. Used to size the recommended disk cache. Zero if
+    /// detection failed (e.g., path does not exist yet).
+    pub cache_path_available_bytes: u64,
 }
 
 impl SystemInfo {
@@ -86,18 +90,31 @@ impl SystemInfo {
         let total_memory = detect_total_memory();
         let disk_io_profile = DiskIoProfile::Auto.resolve_for_path(cache_path);
         let storage_type = StorageType::from_disk_io_profile(disk_io_profile);
+        let cache_path_available_bytes = available_bytes_for(cache_path);
 
         Self {
             cpu_cores,
             total_memory,
             storage_type,
             disk_io_profile,
+            cache_path_available_bytes,
         }
     }
 
     /// Create SystemInfo with specific values (for testing).
     #[cfg(test)]
     pub fn new(cpu_cores: usize, total_memory: usize, storage_type: StorageType) -> Self {
+        Self::new_with_disk(cpu_cores, total_memory, storage_type, 0)
+    }
+
+    /// Create SystemInfo with specific values including available disk (for testing).
+    #[cfg(test)]
+    pub fn new_with_disk(
+        cpu_cores: usize,
+        total_memory: usize,
+        storage_type: StorageType,
+        cache_path_available_bytes: u64,
+    ) -> Self {
         let disk_io_profile = match storage_type {
             StorageType::Nvme => DiskIoProfile::Nvme,
             StorageType::Ssd => DiskIoProfile::Ssd,
@@ -110,6 +127,7 @@ impl SystemInfo {
             total_memory,
             storage_type,
             disk_io_profile,
+            cache_path_available_bytes,
         }
     }
 
@@ -119,20 +137,19 @@ impl SystemInfo {
 
     /// Get recommended memory cache size in bytes.
     ///
-    /// Based on total system memory:
-    /// - < 8GB RAM: 2GB cache
-    /// - 8-31GB RAM: 8GB cache
-    /// - 32-63GB RAM: 12GB cache
-    /// - 64+ GB RAM: 16GB cache
+    /// Computed as `RAM / 12`, clamped to a 500 MB floor and a `RAM / 4`
+    /// ceiling. The cache is intentionally a small request absorber, not a
+    /// working set holder; the on-disk DDS cache holds the working set.
     pub fn recommended_memory_cache(&self) -> usize {
         recommended_memory_cache(self.total_memory)
     }
 
     /// Get recommended disk cache size in bytes.
     ///
-    /// Currently returns a fixed 40GB recommendation.
+    /// Computed as 25% of available space at the cache path's filesystem,
+    /// floored to the nearest 10 GB. Minimum 10 GB to avoid thrashing.
     pub fn recommended_disk_cache(&self) -> usize {
-        recommended_disk_cache()
+        recommended_disk_cache(self.cache_path_available_bytes)
     }
 
     /// Get recommended disk I/O profile string for configuration.
@@ -165,6 +182,23 @@ impl SystemInfo {
     pub fn storage_display(&self) -> &'static str {
         self.storage_type.display()
     }
+}
+
+/// Return the bytes available at the filesystem holding `path`.
+///
+/// Walks up the path until it finds an existing ancestor — this matters
+/// during setup, when the cache directory may not exist yet but its
+/// parent chain does. Returns 0 if no ancestor can be statted.
+fn available_bytes_for(path: &Path) -> u64 {
+    use crate::system::filesystem::fs_info;
+    let mut probe: Option<&Path> = Some(path);
+    while let Some(p) = probe {
+        if p.exists() {
+            return fs_info(p).map(|i| i.available_bytes).unwrap_or(0);
+        }
+        probe = p.parent();
+    }
+    0
 }
 
 /// Detect the number of logical CPU cores.
@@ -219,8 +253,7 @@ const fn fallback_memory() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const GB: usize = 1024 * 1024 * 1024;
+    use crate::config::GB;
 
     #[test]
     fn test_detect_cpu_cores_returns_positive() {
@@ -247,10 +280,11 @@ mod tests {
 
     #[test]
     fn test_system_info_recommendations() {
-        // 16GB system with SSD
-        let info = SystemInfo::new(8, 16 * GB, StorageType::Ssd);
-        assert_eq!(info.recommended_memory_cache(), 8 * GB);
-        assert_eq!(info.recommended_disk_cache(), 40 * GB);
+        // 16GB system with SSD, 230GB available disk
+        let info = SystemInfo::new_with_disk(8, 16 * GB, StorageType::Ssd, 230 * GB as u64);
+        // 16GB / 12 = ~1.33GB, well above 500MB floor and well below 4GB ceiling
+        assert_eq!(info.recommended_memory_cache(), 16 * GB / 12);
+        assert_eq!(info.recommended_disk_cache(), 50 * GB);
         assert_eq!(info.recommended_disk_io_profile(), "auto");
     }
 
@@ -264,7 +298,18 @@ mod tests {
     fn test_system_info_display_formatting() {
         let info = SystemInfo::new(8, 16 * GB, StorageType::Ssd);
         assert_eq!(info.memory_display(), "16 GB");
-        assert_eq!(info.recommended_memory_cache_display(), "8 GB");
+        // 16GB / 12 = 1.333... GB → format_size renders as "1.3 GB"
+        assert_eq!(info.recommended_memory_cache_display(), "1.3 GB");
         assert_eq!(info.storage_display(), "SATA SSD");
+    }
+
+    #[test]
+    fn available_bytes_for_walks_up_to_existing_ancestor() {
+        // /tmp definitely exists; a child path under it does not. The
+        // helper should still return a non-zero number by falling back
+        // to the existing ancestor.
+        let phantom = Path::new("/tmp/xearthlayer-test-nonexistent-child-path-12345/cache");
+        let bytes = available_bytes_for(phantom);
+        assert!(bytes > 0, "Should report bytes from existing ancestor /tmp");
     }
 }
