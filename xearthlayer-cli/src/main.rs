@@ -17,14 +17,19 @@
 
 mod commands;
 mod error;
+mod logging_init;
 mod runner;
 mod tui_app;
 mod ui;
+
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use commands::cache::CacheAction;
 use commands::common::{DdsCompression, ProviderType};
 use commands::scenery_index::SceneryIndexAction;
+use logging_init::init_cli_logging;
+use xearthlayer::config::ConfigFile;
 
 // ============================================================================
 // CLI Argument Definitions
@@ -35,6 +40,20 @@ use commands::scenery_index::SceneryIndexAction;
 #[command(version = xearthlayer::VERSION)]
 #[command(about = "Satellite imagery streaming for X-Plane", long_about = None)]
 struct Cli {
+    /// Enable debug-level logging for the xearthlayer crate.
+    ///
+    /// Applies to every subcommand. Equivalent to setting
+    /// `RUST_LOG=info,xearthlayer=debug`. Use this when filing bug reports
+    /// or debugging download / cache issues.
+    #[arg(long, global = true)]
+    debug: bool,
+
+    /// Enable Chrome Trace profiling output (writes trace to logs/).
+    ///
+    /// Applies to every subcommand. Requires the `profiling` feature.
+    #[arg(long, global = true)]
+    profile: bool,
+
     /// Subcommand to run. If omitted, defaults to 'run'.
     #[command(subcommand)]
     command: Option<Commands>,
@@ -129,14 +148,6 @@ enum Commands {
         #[arg(long)]
         no_cache: bool,
 
-        /// Enable debug-level logging for troubleshooting
-        #[arg(long)]
-        debug: bool,
-
-        /// Enable Chrome Trace profiling (writes trace to logs/)
-        #[arg(long)]
-        profile: bool,
-
         /// Disable predictive tile prefetching
         #[arg(long)]
         no_prefetch: bool,
@@ -154,8 +165,24 @@ enum Commands {
 // Main Entry Point
 // ============================================================================
 
-fn main() {
+fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Initialize logging once for every subcommand. Falls back to default
+    // config (and therefore the default log path) if the user's config
+    // file is missing or unparseable; that keeps first-run scenarios and
+    // misconfigured installs from running with no diagnostic output. (#194)
+    let config_for_logging = ConfigFile::load().unwrap_or_default();
+    let _logging_guard = match init_cli_logging(&config_for_logging, cli.debug, cli.profile) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            eprintln!(
+                "warning: failed to initialize logging ({}); continuing without log file",
+                e
+            );
+            None
+        }
+    };
 
     let result = match cli.command {
         // Default to 'run' when no subcommand is provided
@@ -178,8 +205,6 @@ fn main() {
             timeout,
             parallel,
             no_cache,
-            debug,
-            profile,
             no_prefetch,
             airport,
         }) => commands::run::run(commands::run::RunArgs {
@@ -190,14 +215,19 @@ fn main() {
             timeout,
             parallel,
             no_cache,
-            debug,
-            profile,
             no_prefetch,
             airport,
         }),
     };
 
-    if let Err(e) = result {
-        e.exit();
-    }
+    // Returning ExitCode (rather than calling process::exit) lets the
+    // _logging_guard drop normally, which forces tracing-appender's
+    // background writer to flush. Calling process::exit here would
+    // truncate the log on every failed run — exactly the symptom #194
+    // was filed to prevent. See CliError::report.
+    let exit_code = match result {
+        Ok(()) => 0u8,
+        Err(e) => e.report(),
+    };
+    ExitCode::from(exit_code)
 }

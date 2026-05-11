@@ -11,6 +11,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
+
+use tracing::info;
 
 use crate::package::{PackageMetadata, PackageType};
 
@@ -205,6 +208,13 @@ impl<C: LibraryClient> PackageInstaller<C> {
             "Fetching package metadata...",
         );
         let metadata = self.client.fetch_metadata(metadata_url)?;
+        info!(
+            region = %metadata.title,
+            package_type = %metadata.package_type,
+            version = %metadata.package_version,
+            parts = metadata.parts.len(),
+            "package metadata fetched"
+        );
         report(InstallStage::FetchingMetadata, 1.0, "Metadata fetched");
 
         // Install using the fetched metadata
@@ -229,6 +239,14 @@ impl<C: LibraryClient> PackageInstaller<C> {
         let region = &metadata.title;
         let package_type = metadata.package_type;
         let version = metadata.package_version.clone();
+
+        info!(
+            region = %region,
+            package_type = %package_type,
+            version = %version,
+            parts = metadata.parts.len(),
+            "package install started"
+        );
 
         // Wrap callback in Arc for sharing with download progress
         let on_progress = on_progress.map(Arc::new);
@@ -295,6 +313,15 @@ impl<C: LibraryClient> PackageInstaller<C> {
         );
         downloader.query_sizes(&mut download_state);
 
+        info!(
+            region = %region,
+            parts = metadata.parts.len(),
+            parallel_downloads = self.parallel_downloads,
+            total_bytes = download_state.total_size,
+            "download phase started"
+        );
+        let download_started = Instant::now();
+
         // Pre-flight disk-space check (issue #188): fail fast with a
         // clear message if the temp directory's filesystem can't hold
         // the download plus the extracted contents. We check the temp
@@ -351,6 +378,12 @@ impl<C: LibraryClient> PackageInstaller<C> {
         downloader.download_all(&mut download_state, download_progress)?;
 
         let bytes_downloaded = download_state.bytes_downloaded;
+        info!(
+            region = %region,
+            bytes_downloaded,
+            elapsed_secs = download_started.elapsed().as_secs_f64(),
+            "download phase completed"
+        );
         report(
             InstallStage::Downloading,
             1.0,
@@ -365,16 +398,24 @@ impl<C: LibraryClient> PackageInstaller<C> {
         );
 
         // Stage 4: Reassemble archive
+        info!(
+            parts = destinations.len(),
+            archive = %metadata.filename,
+            "reassembly started"
+        );
         report(InstallStage::Reassembling, 0.0, "Reassembling archive...");
         let archive_path = install_temp.join(&metadata.filename);
         let extractor = ShellExtractor::new();
         extractor.reassemble(&destinations, &archive_path)?;
+        info!(archive = %metadata.filename, "reassembly completed");
         report(InstallStage::Reassembling, 1.0, "Archive reassembled");
 
         // Stage 5: Extract archive
+        info!(archive = %metadata.filename, "extraction started");
         report(InstallStage::Extracting, 0.0, "Extracting archive...");
         let extract_dir = install_temp.join("extracted");
         let files_extracted = extractor.extract(&archive_path, &extract_dir)?;
+        info!(files_extracted, "extraction completed");
         report(
             InstallStage::Extracting,
             1.0,
@@ -403,6 +444,16 @@ impl<C: LibraryClient> PackageInstaller<C> {
         report(InstallStage::Cleanup, 1.0, "Cleanup complete");
 
         report(InstallStage::Complete, 1.0, "Installation complete");
+
+        info!(
+            region = %region,
+            package_type = %package_type,
+            version = %version,
+            install_path = %install_path.display(),
+            bytes_downloaded,
+            files_extracted,
+            "package install completed"
+        );
 
         Ok(InstallResult {
             region: region.to_string(),
