@@ -78,22 +78,28 @@ impl RecommendedSettings {
 /// | System RAM | Recommended cache |
 /// |------------|------------------|
 /// | 4 GB       | 500 MB (floor)   |
-/// | 8 GB       | ~683 MB          |
-/// | 16 GB      | ~1.3 GB          |
-/// | 32 GB      | ~2.7 GB          |
-/// | 64 GB      | ~5.3 GB          |
-/// | 128 GB     | ~10.7 GB         |
+/// | 8 GB       | 1 GB             |
+/// | 16 GB      | 1 GB             |
+/// | 32 GB      | 3 GB             |
+/// | 64 GB      | 5 GB             |
+/// | 128 GB     | 11 GB            |
 ///
 /// ```
 /// use xearthlayer::system::recommended_memory_cache;
 ///
 /// let cache = recommended_memory_cache(16 * 1024 * 1024 * 1024); // 16 GB RAM
-/// assert!(cache >= 1_300_000_000 && cache <= 1_500_000_000); // ~1.3 GB
+/// assert_eq!(cache, 1024 * 1024 * 1024); // 1 GB, rounded to a whole GB
 /// ```
 pub fn recommended_memory_cache(total_memory: usize) -> usize {
     let raw = total_memory / 12;
+    // Round to the nearest whole GB so the wizard writes a tidy config value,
+    // matching recommended_disk_cache which already uses a round step. Nearest
+    // rather than floor: flooring would drop an 8 GB machine from ~683 MB to
+    // the 500 MB minimum, whereas rounding lifts it to a clean 1 GB. Values
+    // that round to zero are caught by the MIN clamp below.
+    let rounded = ((raw as f64 / GB as f64).round() as usize) * GB;
     let ceiling = total_memory / 4;
-    raw.clamp(MIN_MEMORY_CACHE_BYTES, ceiling.max(MIN_MEMORY_CACHE_BYTES))
+    rounded.clamp(MIN_MEMORY_CACHE_BYTES, ceiling.max(MIN_MEMORY_CACHE_BYTES))
 }
 
 /// Calculate recommended disk cache size from available disk space.
@@ -156,16 +162,26 @@ mod tests {
         assert_eq!(recommended_memory_cache(1 * GB), MIN_MEMORY_CACHE_BYTES);
     }
 
+    // Issue #218: the wizard wrote "2.6 GB" on a 32 GB machine and the app
+    // rejected it. Recommendations are now whole GB above the floor, matching
+    // recommended_disk_cache's existing round-step behaviour.
     #[test]
-    fn memory_cache_uses_ram_div_12_in_normal_range() {
-        // 16GB / 12 = 1.333... GB
-        assert_eq!(recommended_memory_cache(16 * GB), 16 * GB / 12);
-        // 32GB / 12 = 2.666... GB
-        assert_eq!(recommended_memory_cache(32 * GB), 32 * GB / 12);
-        // 64GB / 12 = 5.333... GB
-        assert_eq!(recommended_memory_cache(64 * GB), 64 * GB / 12);
-        // 128GB / 12 = 10.666... GB
-        assert_eq!(recommended_memory_cache(128 * GB), 128 * GB / 12);
+    fn memory_cache_rounds_ram_div_12_to_whole_gb() {
+        let cases = [
+            (4 * GB, MIN_MEMORY_CACHE_BYTES), // rounds to 0, caught by the floor
+            (8 * GB, GB),
+            (16 * GB, GB),
+            (32 * GB, 3 * GB),
+            (64 * GB, 5 * GB),
+            (128 * GB, 11 * GB),
+        ];
+        for (ram, expected) in cases {
+            assert_eq!(
+                recommended_memory_cache(ram),
+                expected,
+                "RAM {ram} should recommend {expected}"
+            );
+        }
     }
 
     #[test]
@@ -216,7 +232,8 @@ mod tests {
     fn recommended_settings_combines_inputs() {
         let settings =
             RecommendedSettings::for_system(32 * GB, 230 * GB as u64, DiskIoProfile::Nvme);
-        assert_eq!(settings.memory_cache, 32 * GB / 12);
+        // 32GB / 12 = 2.666... GB, rounded to a whole 3 GB.
+        assert_eq!(settings.memory_cache, 3 * GB);
         assert_eq!(settings.disk_cache, 50 * GB);
         assert_eq!(settings.disk_io_profile, DiskIoProfile::Nvme);
         assert_eq!(settings.disk_io_profile_str(), "nvme");
