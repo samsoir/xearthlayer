@@ -14,7 +14,7 @@ The wizard auto-detects your X-Plane installation, system hardware (CPU, memory,
 
 1. **X-Plane Custom Scenery** — auto-detected from your X-Plane install, with fallback to manual entry.
 2. **Package Location** — where regional scenery packages live on disk.
-3. **Cache Configuration** — cache directory, disk cache size (defaults to 25% of free space, floored to 10 GB), DDS-to-chunk disk ratio, memory cache size (defaults to RAM ÷ 12, clamped to 500 MB – RAM ÷ 4), and disk I/O profile (NVMe / SSD / HDD / auto).
+3. **Cache Configuration** — cache directory, disk cache size (defaults to 25% of free space, floored to 10 GB), DDS-to-chunk disk ratio, memory cache size (defaults to RAM ÷ 12, rounded to the nearest whole GB, clamped to 500 MB – RAM ÷ 4), and disk I/O profile (NVMe / SSD / HDD / auto).
 4. **DDS Encoding** — picks ISPC (CPU) by default, or offers to offload encoding to a secondary GPU when **two or more GPU adapters** are detected. The wizard warns against picking the GPU X-Plane renders on. Single-GPU systems skip the choice and stay on ISPC.
 
 GPU enumeration can take 10–30 seconds on multi-adapter systems while drivers are probed; a spinner shows progress.
@@ -126,8 +126,8 @@ Controls tile caching behavior.
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `directory` | path | `~/.cache/xearthlayer` | Directory for storing cached tiles. Supports `~` expansion. |
-| `memory_size` | size | `512MB` | Maximum RAM for in-memory cache. Supports KB, MB, GB suffixes. Memory cache is a staging buffer; DDS disk cache is the retention layer. |
-| `disk_size` | size | `20GB` | Maximum disk space for persistent cache (shared between DDS tiles and raw chunks). Supports KB, MB, GB suffixes. |
+| `memory_size` | size | `512MB` | Maximum RAM for in-memory cache. Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. Memory cache is a staging buffer; DDS disk cache is the retention layer. |
+| `disk_size` | size | `20GB` | Maximum disk space for persistent cache (shared between DDS tiles and raw chunks). Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. |
 | `dds_disk_ratio` | float | `0.6` | Fraction of `disk_size` allocated to DDS tile cache (0.0-1.0). Remainder goes to raw chunk cache. |
 | `disk_io_profile` | string | `auto` | Disk I/O concurrency profile based on storage type (see below) |
 

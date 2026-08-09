@@ -137,9 +137,10 @@ impl SystemInfo {
 
     /// Get recommended memory cache size in bytes.
     ///
-    /// Computed as `RAM / 12`, clamped to a 500 MB floor and a `RAM / 4`
-    /// ceiling. The cache is intentionally a small request absorber, not a
-    /// working set holder; the on-disk DDS cache holds the working set.
+    /// Computed as `RAM / 12`, rounded to the nearest whole GB, then clamped
+    /// to a 500 MB floor and a `RAM / 4` ceiling. The cache is intentionally
+    /// a small request absorber, not a working set holder; the on-disk DDS
+    /// cache holds the working set.
     pub fn recommended_memory_cache(&self) -> usize {
         recommended_memory_cache(self.total_memory)
     }
@@ -282,8 +283,8 @@ mod tests {
     fn test_system_info_recommendations() {
         // 16GB system with SSD, 230GB available disk
         let info = SystemInfo::new_with_disk(8, 16 * GB, StorageType::Ssd, 230 * GB as u64);
-        // 16GB / 12 = ~1.33GB, well above 500MB floor and well below 4GB ceiling
-        assert_eq!(info.recommended_memory_cache(), 16 * GB / 12);
+        // 16GB / 12 = ~1.33GB, rounded to the nearest whole GB
+        assert_eq!(info.recommended_memory_cache(), GB);
         assert_eq!(info.recommended_disk_cache(), 50 * GB);
         assert_eq!(info.recommended_disk_io_profile(), "auto");
     }
@@ -298,8 +299,8 @@ mod tests {
     fn test_system_info_display_formatting() {
         let info = SystemInfo::new(8, 16 * GB, StorageType::Ssd);
         assert_eq!(info.memory_display(), "16 GB");
-        // 16GB / 12 = 1.333... GB → format_size renders as "1.3 GB"
-        assert_eq!(info.recommended_memory_cache_display(), "1.3 GB");
+        // 16GB / 12 = 1.333... GB, rounded to a whole GB for a tidy config value
+        assert_eq!(info.recommended_memory_cache_display(), "1 GB");
         assert_eq!(info.storage_display(), "SATA SSD");
     }
 
