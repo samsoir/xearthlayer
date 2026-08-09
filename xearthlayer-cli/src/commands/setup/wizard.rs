@@ -493,7 +493,7 @@ fn prompt_memory_cache_size(
     println!();
     println!("{}", style("Memory cache size:").bold());
     println!(
-        "  ℹ  System RAM: {} MB — default is RAM ÷ 12 ({} MB)",
+        "  ℹ  System RAM: {} MB — default is RAM ÷ 12, rounded to the nearest GB ({} MB)",
         total_mb, recommended_mb
     );
     println!(

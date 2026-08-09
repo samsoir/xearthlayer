@@ -137,9 +137,10 @@ impl SystemInfo {
 
     /// Get recommended memory cache size in bytes.
     ///
-    /// Computed as `RAM / 12`, clamped to a 500 MB floor and a `RAM / 4`
-    /// ceiling. The cache is intentionally a small request absorber, not a
-    /// working set holder; the on-disk DDS cache holds the working set.
+    /// Computed as `RAM / 12`, rounded to the nearest whole GB, then clamped
+    /// to a 500 MB floor and a `RAM / 4` ceiling. The cache is intentionally
+    /// a small request absorber, not a working set holder; the on-disk DDS
+    /// cache holds the working set.
     pub fn recommended_memory_cache(&self) -> usize {
         recommended_memory_cache(self.total_memory)
     }

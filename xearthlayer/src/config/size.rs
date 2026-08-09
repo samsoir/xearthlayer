@@ -95,6 +95,11 @@ pub fn parse_size(s: &str) -> Result<usize, SizeParseError> {
     }
 
     let bytes = (num * multiplier as f64).round();
+    // Deliberately `>`, not `>=`: `usize::MAX as f64` rounds up to 2^64 (a
+    // value usize can't hold), and `format_size(usize::MAX)` emits
+    // "17179869184 GB", which parses back to exactly 2^64 here. Tightening
+    // this to `>=` would reject the formatter's own output and break the
+    // round-trip property at the top of the range.
     if bytes > usize::MAX as f64 {
         return Err(SizeParseError::new(s));
     }
@@ -257,7 +262,7 @@ mod tests {
     // format_size and parse_size are inverses and must round-trip. This is the
     // property whose absence caused issue #218.
     #[test]
-    fn test_size_round_trip() {
+    fn test_format_parse_round_trip() {
         for bytes in [
             512_usize,
             2048,
@@ -302,7 +307,10 @@ mod tests {
 
     #[test]
     fn test_size_roundtrip() {
-        // Note: roundtrip only works for exact multiples due to space in format
+        // Note: parse_size accepts decimals (see #218), so parsing is no
+        // longer the limiting factor here. format_size still rounds to one
+        // decimal place, so this test sticks to exact multiples where the
+        // string representation itself round-trips unchanged.
         let test_cases = vec![
             ("1KB", "1 KB"),
             ("500MB", "500 MB"),

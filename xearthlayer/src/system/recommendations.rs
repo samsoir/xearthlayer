@@ -71,7 +71,8 @@ impl RecommendedSettings {
 ///
 /// The memory cache is intentionally a small request absorber, not a working
 /// set holder — the on-disk DDS cache is the working set. The formula is
-/// `RAM / 12`, clamped to `[MIN_MEMORY_CACHE_BYTES, RAM / 4]`.
+/// `RAM / 12`, rounded to the nearest whole GB, then clamped to
+/// `[MIN_MEMORY_CACHE_BYTES, RAM / 4]`.
 ///
 /// # Examples
 ///
