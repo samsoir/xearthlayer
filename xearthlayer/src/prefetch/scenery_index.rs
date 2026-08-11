@@ -26,7 +26,7 @@
 //! - **Efficient**: Only prefetch tiles that actually exist in scenery
 //! - **Skip sea tiles**: Can deprioritize simple water textures
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -36,6 +36,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, trace};
 
 use crate::coord::TileCoord;
+use crate::geo_index::DsfRegion;
 
 /// A tile entry in the scenery index.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -291,6 +292,67 @@ impl SceneryIndex {
             .into_iter()
             .filter(|t| t.chunk_zoom == chunk_zoom)
             .collect()
+    }
+
+    /// Get the deduplicated set of DDS tiles belonging to a DSF region.
+    ///
+    /// A tile belongs to the region containing its geographic centre, which
+    /// is the `LOAD_CENTER` of its `.ter` file. This is the single definition
+    /// of a region's tile set — the submit, promote and rescue paths all
+    /// consult it, so they cannot disagree about whether a region is complete.
+    ///
+    /// # Why this is cheap
+    ///
+    /// A `DsfRegion` is 1°×1° and `cell_key` floors by `cell_size`, which
+    /// defaults to 1.0 — so in the default configuration a region *is* a grid
+    /// cell and this is a single `HashMap` lookup. The predicate is still
+    /// applied per tile because `grid_cell_size` is configurable.
+    ///
+    /// See #176: the previous implementations reconstructed this answer from a
+    /// 45nm radius query, which returns a circle overlapping the neighbouring
+    /// regions rather than the region itself.
+    pub fn tiles_in_region(&self, region: DsfRegion) -> Vec<TileCoord> {
+        let grid = self.grid.read().unwrap();
+        let mut unique: HashSet<TileCoord> = HashSet::new();
+
+        for key in self.cells_covering_region(region) {
+            let Some(cell) = grid.get(&key) else {
+                continue;
+            };
+            for tile in &cell.tiles {
+                if tile.lat.floor() as i32 == region.lat && tile.lon.floor() as i32 == region.lon {
+                    unique.insert(tile.to_tile_coord());
+                }
+            }
+        }
+
+        unique.into_iter().collect()
+    }
+
+    /// Grid cell keys that overlap a DSF region.
+    ///
+    /// Derives the corners through `cell_key` rather than recomputing the
+    /// floor division, so there is one mapping from position to cell. With
+    /// the default 1.0 cell size this yields exactly one key.
+    fn cells_covering_region(&self, region: DsfRegion) -> Vec<(i16, i16)> {
+        // Nudge inside the region's far edge: the region is the half-open
+        // box [lat, lat+1) x [lon, lon+1), so lat+1.0 belongs to the *next*
+        // region and must not pull in an extra row of cells.
+        const INSIDE_EDGE: f32 = 1.0 - 1e-4;
+
+        let (lat_min, lon_min) = self.cell_key(region.lat as f32, region.lon as f32);
+        let (lat_max, lon_max) = self.cell_key(
+            region.lat as f32 + INSIDE_EDGE,
+            region.lon as f32 + INSIDE_EDGE,
+        );
+
+        let mut keys = Vec::new();
+        for lat_cell in lat_min..=lat_max {
+            for lon_cell in lon_min..=lon_max {
+                keys.push((lat_cell, lon_cell));
+            }
+        }
+        keys
     }
 
     /// Get the total number of indexed tiles.
@@ -673,6 +735,7 @@ impl std::error::Error for SceneryIndexError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geo_index::DsfRegion;
 
     #[test]
     fn test_parse_dds_filename_bing() {
@@ -792,6 +855,107 @@ mod tests {
         // 1 degree east at 45° lat (should be ~42nm due to cosine)
         let dist = approximate_distance_nm(45.0, -120.0, 45.0, -119.0);
         assert!((dist - 42.4).abs() < 2.0);
+    }
+
+    /// Helper: a land tile at a given position. Row/col are irrelevant to the
+    /// region predicate but must be distinct so dedup tests are meaningful.
+    fn tile_at(row: u32, col: u32, lat: f32, lon: f32) -> SceneryTile {
+        SceneryTile {
+            row,
+            col,
+            chunk_zoom: 16,
+            lat,
+            lon,
+            is_sea: false,
+        }
+    }
+
+    #[test]
+    fn test_tiles_in_region_includes_only_tiles_centred_inside() {
+        let index = SceneryIndex::with_defaults();
+        // Inside the +33-119 region.
+        index.add_tile(tile_at(1000, 2000, 33.01, -118.99));
+        index.add_tile(tile_at(1016, 2016, 33.99, -118.01));
+        // Just outside each edge.
+        index.add_tile(tile_at(2000, 2000, 32.99, -118.5)); // south
+        index.add_tile(tile_at(2016, 2016, 34.01, -118.5)); // north
+        index.add_tile(tile_at(2032, 2032, 33.5, -119.01)); // west
+        index.add_tile(tile_at(2048, 2048, 33.5, -117.99)); // east
+
+        let tiles = index.tiles_in_region(DsfRegion::new(33, -119));
+
+        assert_eq!(
+            tiles.len(),
+            2,
+            "only the two tiles centred inside +33-119 belong to it, got {:?}",
+            tiles
+        );
+    }
+
+    #[test]
+    fn test_tiles_in_region_deduplicates_shared_textures() {
+        let index = SceneryIndex::with_defaults();
+        // Many .ter files share one base DDS texture. After the /16 division in
+        // to_tile_coord these collapse to the same TileCoord.
+        index.add_tile(tile_at(1000, 2000, 33.1, -118.9));
+        index.add_tile(tile_at(1001, 2001, 33.2, -118.8));
+        index.add_tile(tile_at(1007, 2015, 33.3, -118.7));
+
+        let tiles = index.tiles_in_region(DsfRegion::new(33, -119));
+
+        assert_eq!(
+            tiles.len(),
+            1,
+            "1000, 1001, 1007 all fall in chunk-row block [992, 1008), one tile coord"
+        );
+        assert_eq!(tiles[0].row, 1000 / 16);
+        assert_eq!(tiles[0].col, 2000 / 16);
+    }
+
+    #[test]
+    fn test_tiles_in_region_southern_western_hemisphere() {
+        // floor() on negatives is where an off-by-one hides: floor(-33.5) is -34,
+        // so the region containing -33.5 is DsfRegion { lat: -34 }.
+        let index = SceneryIndex::with_defaults();
+        index.add_tile(tile_at(1000, 2000, -33.5, -70.5));
+        index.add_tile(tile_at(3000, 4000, -32.5, -70.5)); // region -33, not -34
+
+        let tiles = index.tiles_in_region(DsfRegion::new(-34, -71));
+
+        assert_eq!(tiles.len(), 1, "only the -33.5 tile is in +-34-071");
+        assert_eq!(tiles[0].row, 1000 / 16);
+    }
+
+    #[test]
+    fn test_tiles_in_region_honours_non_default_cell_size() {
+        // A 0.5 degree grid splits one DSF region across four cells. All four
+        // must be visited or the result silently loses three quarters of them.
+        let config = SceneryIndexConfig {
+            grid_cell_size: 0.5,
+            include_sea_tiles: true,
+        };
+        let index = SceneryIndex::new(config);
+        index.add_tile(tile_at(1000, 2000, 33.2, -118.8)); // cell (66, -238)
+        index.add_tile(tile_at(2000, 3000, 33.7, -118.8)); // cell (67, -238)
+        index.add_tile(tile_at(3000, 4000, 33.2, -118.3)); // cell (66, -237)
+        index.add_tile(tile_at(4000, 5000, 33.7, -118.3)); // cell (67, -237)
+
+        let tiles = index.tiles_in_region(DsfRegion::new(33, -119));
+
+        assert_eq!(
+            tiles.len(),
+            4,
+            "all four sub-cells must be visited, got {:?}",
+            tiles
+        );
+    }
+
+    #[test]
+    fn test_tiles_in_region_empty_for_uncovered_region() {
+        let index = SceneryIndex::with_defaults();
+        index.add_tile(tile_at(1000, 2000, 33.5, -118.5));
+
+        assert!(index.tiles_in_region(DsfRegion::new(50, 10)).is_empty());
     }
 
     /// Integration test with real scenery package.
