@@ -958,6 +958,51 @@ mod tests {
         assert!(index.tiles_in_region(DsfRegion::new(50, 10)).is_empty());
     }
 
+    #[test]
+    fn test_tiles_in_region_predicate_filters_within_shared_cell() {
+        // At cell_size 2.0, one grid cell spans two DSF regions along the lat
+        // axis: floor(33.5 / 2.0) == floor(32.5 / 2.0) == 16, so both tiles
+        // land in the same cell, but floor(33.5) == 33 and floor(32.5) == 32
+        // put them in different regions. Only the predicate -- not cell
+        // visitation -- can tell them apart.
+        let config = SceneryIndexConfig {
+            grid_cell_size: 2.0,
+            include_sea_tiles: true,
+        };
+        let index = SceneryIndex::new(config);
+        index.add_tile(tile_at(1000, 2000, 33.5, -119.5)); // region 33,-120
+        index.add_tile(tile_at(2000, 3000, 32.5, -119.5)); // region 32,-120, same cell
+
+        let tiles = index.tiles_in_region(DsfRegion::new(33, -120));
+
+        assert_eq!(
+            tiles.len(),
+            1,
+            "the same-cell tile from region 32,-120 must be excluded, got {:?}",
+            tiles
+        );
+        assert_eq!(tiles[0].row, 1000 / 16);
+    }
+
+    #[test]
+    fn test_tiles_in_region_includes_sea_tiles() {
+        // The spec requires sea tiles stay in scope: no is_sea filter here,
+        // unlike the adjacent land_tiles_near.
+        let index = SceneryIndex::with_defaults();
+        let mut tile = tile_at(1000, 2000, 33.5, -118.5);
+        tile.is_sea = true;
+        index.add_tile(tile);
+
+        let tiles = index.tiles_in_region(DsfRegion::new(33, -119));
+
+        assert_eq!(
+            tiles.len(),
+            1,
+            "sea tiles must remain in scope, got {:?}",
+            tiles
+        );
+    }
+
     /// Integration test with real scenery package.
     /// Run with: cargo test scenery_index --features integration -- --ignored
     #[test]
