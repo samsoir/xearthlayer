@@ -342,49 +342,14 @@ impl AdaptivePrefetchCoordinator {
     /// Falls back to the boundary strategy's geometric 4x4 grid expansion at
     /// zoom 14 when no scenery index is available or has no tiles for the region.
     fn get_tiles_for_region(&self, region: &DsfRegion) -> Vec<TileCoord> {
-        if let Some(ref index) = self.scenery_index {
-            let center_lat = region.lat as f64 + 0.5;
-            let center_lon = region.lon as f64 + 0.5;
-            // 1° DSF region ≈ 60nm at equator, 45nm radius covers the region
-            let tiles = index.tiles_near(center_lat, center_lon, 45.0);
-            // Filter to only tiles whose geographic center falls within the
-            // target 1° DSF region. Without this, the 45nm radius search spills
-            // across DSF boundaries, returning tiles from adjacent regions and
-            // causing massive tile count explosion (53K+ instead of ~700).
-            // Deduplicate: many .ter files share the same base DDS texture,
-            // so multiple SceneryTiles map to the same TileCoord after /16 division.
-            let unique: HashSet<TileCoord> = tiles
-                .iter()
-                .filter(|t| {
-                    t.lat.floor() as i32 == region.lat && t.lon.floor() as i32 == region.lon
-                })
-                .map(|t| t.to_tile_coord())
-                .collect();
-
-            tracing::debug!(
-                region_lat = region.lat,
-                region_lon = region.lon,
-                scenery_tiles = tiles.len(),
-                region_filtered = tiles
-                    .iter()
-                    .filter(|t| {
-                        t.lat.floor() as i32 == region.lat && t.lon.floor() as i32 == region.lon
-                    })
-                    .count(),
-                unique_tile_coords = unique.len(),
-                "get_tiles_for_region: deduplication results"
-            );
-
-            let result: Vec<TileCoord> = unique.into_iter().collect();
-
-            if !result.is_empty() {
-                return result;
-            }
-            // Fall through to geometric expansion if index had no tiles
+        match self.scenery_index {
+            // An empty result means the index knows of no ortho scenery
+            // here. The caller marks the region NoCoverage. There is no
+            // geometric fallback: a 4x4 sample of a region holding ~2,500
+            // tiles at zoom 14 made "all tiles cached" meaningless. See #176.
+            Some(ref index) => index.tiles_in_region(*region),
+            None => Vec::new(),
         }
-
-        // Fallback: geometric grid at zoom 14
-        self.boundary_strategy.expand_to_tiles(region, 14)
     }
 
     /// Get the current effective mode.
@@ -1064,21 +1029,19 @@ impl AdaptivePrefetchCoordinator {
             return;
         }
 
-        let strategy = BoundaryStrategy::new();
-
         for region in stale {
-            let tiles =
-                BoundaryStrategy::tiles_for_region(&strategy, &region, self.scenery_index.as_ref());
+            let tiles = match self.scenery_index {
+                Some(ref index) => index.tiles_in_region(region),
+                None => Vec::new(),
+            };
 
-            // Check if tiles exist on DDS disk cache.
-            // Uses the sync `tile_exists_blocking` method — see #172
-            // Part 3: the prior `block_in_place` + `block_on` dance has
-            // been pushed into the trait impl (`DdsDiskCacheBridge`).
-            // Keep the rescue-path "sample the first tile" heuristic;
-            // full coverage is checked by `promote_completed_regions`
-            // on the fast path.
-            let tiles_on_disk = match (self.dds_disk_checker.as_ref(), tiles.first()) {
-                (Some(checker), Some(t)) => checker.tile_exists_blocking(t.row, t.col, t.zoom),
+            // Full coverage, same predicate as the fast path. The previous
+            // version sampled `tiles.first()` and promoted the region on a
+            // single hit — see #176 defect 2. Short-circuits on first miss.
+            let tiles_on_disk = match self.dds_disk_checker.as_ref() {
+                Some(checker) if !tiles.is_empty() => tiles
+                    .iter()
+                    .all(|t| checker.tile_exists_blocking(t.row, t.col, t.zoom)),
                 _ => false,
             };
 
@@ -1173,9 +1136,9 @@ impl AdaptivePrefetchCoordinator {
 mod tests {
     use super::*;
     use crate::prefetch::adaptive::coordinator::test_support::{
-        ground_state, make_scenery_index, patched_region_area, test_calibration, test_plan,
-        AlwaysMissMemoryCache, BackpressureMockClient, CapLimitedDdsClient, DummyTracker,
-        HighLoadDdsClient, MockDiskChecker, StableBoundsTracker,
+        ground_state, make_scenery_index, make_scenery_index_covering, patched_region_area,
+        test_calibration, test_plan, AlwaysMissMemoryCache, BackpressureMockClient,
+        CapLimitedDdsClient, DummyTracker, HighLoadDdsClient, MockDiskChecker, StableBoundsTracker,
     };
     // ─────────────────────────────────────────────────────────────────────────
     // Creation tests
@@ -1550,9 +1513,20 @@ mod tests {
             .collect();
         geo_index.populate(entries);
 
+        // Post-#176, get_tiles_for_region has no geometric fallback — the
+        // ground box needs real scenery coverage to produce candidate tiles
+        // in the first place, before the patched-region filter can remove
+        // them. Cover the same area the patched regions cover.
+        let scenery_index = make_scenery_index_covering(
+            (aircraft_dsf.lat - coverage_radius)..=(aircraft_dsf.lat + coverage_radius),
+            (aircraft_dsf.lon - coverage_radius)..=(aircraft_dsf.lon + coverage_radius),
+            16,
+        );
+
         let mut coord = AdaptivePrefetchCoordinator::with_defaults()
             .with_calibration(test_calibration())
-            .with_geo_index(geo_index);
+            .with_geo_index(geo_index)
+            .with_scenery_index(scenery_index);
 
         let state = ground_state(aircraft_lat, aircraft_lon);
 
@@ -1764,15 +1738,18 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_get_tiles_for_region_without_index_uses_zoom_14() {
+    fn test_get_tiles_for_region_without_index_returns_empty() {
+        // #176: without a scenery index there is no geometric fallback —
+        // the coordinator has no way to know what tiles the region should
+        // contain, so it must yield nothing rather than guess zoom 14.
         let coord = AdaptivePrefetchCoordinator::with_defaults();
         let region = DsfRegion::new(50, 9);
 
         let tiles = coord.get_tiles_for_region(&region);
-        assert!(!tiles.is_empty());
-        for tile in &tiles {
-            assert_eq!(tile.zoom, 14, "Without scenery index, should use zoom 14");
-        }
+        assert!(
+            tiles.is_empty(),
+            "Without a scenery index, get_tiles_for_region must return nothing"
+        );
     }
 
     #[test]
@@ -1810,20 +1787,112 @@ mod tests {
     }
 
     #[test]
-    fn test_get_tiles_for_region_falls_back_when_no_coverage() {
+    fn test_get_tiles_for_region_returns_empty_when_no_coverage() {
+        // #176: an index with no tiles for the target region is a
+        // statement — "no ortho scenery here" — not a cue to fall back to
+        // a geometric zoom-14 guess.
         // Index has tiles at (60, 20) but we query (50, 9)
         let index = make_scenery_index(60, 20, 16);
         let coord = AdaptivePrefetchCoordinator::with_defaults().with_scenery_index(index);
         let region = DsfRegion::new(50, 9);
 
         let tiles = coord.get_tiles_for_region(&region);
-        assert!(!tiles.is_empty());
-        for tile in &tiles {
-            assert_eq!(
-                tile.zoom, 14,
-                "Should fall back to zoom 14 when scenery index has no coverage"
-            );
-        }
+        assert!(
+            tiles.is_empty(),
+            "Should return empty when scenery index has no coverage for the region"
+        );
+    }
+
+    /// Build a [`DdsDiskCacheChecker`] that reports only the listed tiles as
+    /// present on disk.
+    fn test_checker(tiles: &[TileCoord]) -> Arc<dyn DdsDiskCacheChecker> {
+        MockDiskChecker::with_tile_coords(tiles.iter().copied())
+    }
+
+    #[test]
+    fn test_region_with_no_indexed_tiles_is_marked_no_coverage() {
+        // Removing the geometric fallback means an empty index result is a
+        // statement — "no ortho scenery here" — rather than a cue to guess 16
+        // tiles at zoom 14. The submit loop must mark the region NoCoverage and
+        // submit nothing.
+        use crate::prefetch::scenery_index::SceneryTile;
+
+        let index = Arc::new(SceneryIndex::with_defaults());
+        index.add_tile(SceneryTile {
+            row: 1000,
+            col: 2000,
+            chunk_zoom: 16,
+            lat: 33.5,
+            lon: -118.5,
+            is_sea: false,
+        });
+
+        let coord =
+            AdaptivePrefetchCoordinator::with_defaults().with_scenery_index(Arc::clone(&index));
+
+        // A region the index knows nothing about — mid-Pacific.
+        assert!(
+            coord
+                .get_tiles_for_region(&DsfRegion::new(10, -150))
+                .is_empty(),
+            "an uncovered region must yield no tiles, not a geometric guess"
+        );
+        // And the covered one still yields its tile.
+        assert_eq!(
+            coord.get_tiles_for_region(&DsfRegion::new(33, -119)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_stale_rescue_requires_full_coverage_not_one_tile() {
+        // Regression for #176 defect 2. The rescue path sampled tiles.first()
+        // and promoted the whole region on that single hit, which is how 61 of
+        // 65 promotions were decided in the #172 LOWW log.
+        use crate::prefetch::scenery_index::SceneryTile;
+
+        let index = Arc::new(SceneryIndex::with_defaults());
+        index.add_tile(SceneryTile {
+            row: 1000,
+            col: 2000,
+            chunk_zoom: 16,
+            lat: 33.5,
+            lon: -118.5,
+            is_sea: false,
+        });
+        index.add_tile(SceneryTile {
+            row: 5000,
+            col: 6000,
+            chunk_zoom: 16,
+            lat: 33.7,
+            lon: -118.2,
+            is_sea: false,
+        });
+
+        let region = DsfRegion::new(33, -119);
+        let geo_index = Arc::new(GeoIndex::new());
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+
+        // Only one of the two tiles is on disk.
+        let checker = test_checker(&[TileCoord {
+            row: 1000 / 16,
+            col: 2000 / 16,
+            zoom: 12,
+        }]);
+
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_scenery_index(Arc::clone(&index))
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_disk_checker(checker);
+        coord.config.stale_region_timeout = std::time::Duration::ZERO; // everything is stale
+
+        coord.run_region_maintenance();
+
+        let state = geo_index.get::<PrefetchedRegion>(&region);
+        assert!(
+            state.is_none_or(|s| !s.is_prefetched()),
+            "partial coverage must not be promoted by the rescue path"
+        );
     }
 
     #[test]
@@ -1853,6 +1922,11 @@ mod tests {
             );
         }
 
+        // Post-#176, promotion needs a scenery index to know the region's
+        // tile set — there is no more geometric fallback. Cover region
+        // (55, 7), the one this test promotes below.
+        let scenery_index = make_scenery_index(55, 7, 16);
+
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
             ..Default::default()
@@ -1860,7 +1934,8 @@ mod tests {
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_calibration(test_calibration())
             .with_scene_tracker(tracker)
-            .with_geo_index(Arc::clone(&geo_index));
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_scenery_index(Arc::clone(&scenery_index));
 
         coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
 
@@ -1889,7 +1964,11 @@ mod tests {
         // disk checker with the region's tiles so the authoritative
         // check sees them as present.
         let region = DsfRegion::new(55, 7);
-        let tiles = coord.boundary_strategy.expand_to_tiles(&region, 14);
+        let tiles = scenery_index.tiles_in_region(region);
+        assert!(
+            !tiles.is_empty(),
+            "Precondition: index covers region (55,7)"
+        );
         let checker: Arc<dyn crate::executor::DdsDiskCacheChecker> =
             MockDiskChecker::with_tile_coords(tiles.iter().copied());
         coord.dds_disk_checker = Some(checker);
@@ -1930,7 +2009,8 @@ mod tests {
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_scenery_index(wide_scenery_index_at_50_10());
 
         // Fast-forward phase detector into cruise using a CENTER position
         // far from all boundaries. Window rows=6, so half_rows=3.
@@ -2441,9 +2521,15 @@ mod tests {
             mode: PrefetchMode::Aggressive,
             ..Default::default()
         };
+        // Post-#176, get_tiles_for_region has no geometric fallback. Cover
+        // the full westward flight path (lon 15 down to -5) plus box-extent
+        // margin in every direction.
+        let scenery_index = make_scenery_index_covering(40..=60, -15..=25, 16);
+
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_calibration(test_calibration())
-            .with_geo_index(geo_index);
+            .with_geo_index(geo_index)
+            .with_scenery_index(scenery_index);
 
         coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
 
@@ -2499,7 +2585,8 @@ mod tests {
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_calibration(test_calibration())
-            .with_geo_index(Arc::clone(&geo_index));
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_scenery_index(wide_scenery_index_at_48_15());
 
         coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
         coord.phase_detector.takeoff_timeout = std::time::Duration::from_millis(1);
@@ -2594,7 +2681,8 @@ mod tests {
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_calibration(test_calibration())
-            .with_geo_index(geo_index);
+            .with_geo_index(geo_index)
+            .with_scenery_index(wide_scenery_index_at_48_15());
 
         // Paused state — should still prefetch
         let paused = SimState {
@@ -2664,6 +2752,24 @@ mod tests {
     // tiles were never submitted.
     // ─────────────────────────────────────────────────────────────────────────
 
+    /// SceneryIndex covering the area used by `fast_forward_to_cruise` and
+    /// the tests built on it: centred on (50, 10), wide enough (±10°) for
+    /// the box's maximum extent (7°) plus retention margin in every
+    /// direction, including the (52.5, 10) position used by
+    /// `test_pending_tiles_retained_on_channel_full`. Post-#176,
+    /// `get_tiles_for_region` has no geometric fallback, so these tests
+    /// need real coverage to produce a non-empty plan.
+    fn wide_scenery_index_at_50_10() -> Arc<SceneryIndex> {
+        make_scenery_index_covering(40..=60, 0..=20, 16)
+    }
+
+    /// SceneryIndex covering the area used by the (48, 15) heading-270
+    /// cruise tests: wide enough for the box's maximum extent (7°) in
+    /// every direction from the aircraft's starting position.
+    fn wide_scenery_index_at_48_15() -> Arc<SceneryIndex> {
+        make_scenery_index_covering(38..=58, 5..=25, 16)
+    }
+
     /// Helper: fast-forward a coordinator into Cruise phase at (50.0, 10.0)
     /// heading 0° (north). Uses the existing hysteresis/timeout shortcut
     /// pattern from `test_pending_tiles_retained_on_channel_full`.
@@ -2706,7 +2812,8 @@ mod tests {
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_scenery_index(wide_scenery_index_at_50_10());
 
         fast_forward_to_cruise(&mut coord);
         assert_eq!(
@@ -2735,7 +2842,8 @@ mod tests {
 
         let geo_index = Arc::new(GeoIndex::new());
         // Cap of 1 guarantees no region can be 100% submitted — every
-        // region in a geometric-fallback plan has multiple tiles.
+        // region in the plan has multiple tiles (4x4 sample grid per
+        // region from the scenery index).
         let client = Arc::new(CapLimitedDdsClient::new(1));
 
         let config = AdaptivePrefetchConfig {
@@ -2746,7 +2854,8 @@ mod tests {
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_scenery_index(wide_scenery_index_at_50_10());
 
         fast_forward_to_cruise(&mut coord);
         assert_eq!(coord.phase_detector.current_phase(), FlightPhase::Cruise);
@@ -2808,7 +2917,8 @@ mod tests {
             .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
-            .with_memory_cache(always_miss);
+            .with_memory_cache(always_miss)
+            .with_scenery_index(wide_scenery_index_at_50_10());
 
         // Pre-populate the shadow as if it had accumulated entries across
         // many prior cycles before the memory cache evicted them. In
@@ -2858,7 +2968,8 @@ mod tests {
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_scenery_index(wide_scenery_index_at_50_10());
 
         fast_forward_to_cruise(&mut coord);
         assert_eq!(coord.phase_detector.current_phase(), FlightPhase::Cruise);

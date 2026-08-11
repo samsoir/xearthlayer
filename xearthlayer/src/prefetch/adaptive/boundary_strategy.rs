@@ -120,15 +120,14 @@ impl BoundaryStrategy {
         dds_disk_checker: Option<&Arc<dyn DdsDiskCacheChecker>>,
         scenery_index: Option<&Arc<SceneryIndex>>,
     ) -> usize {
-        let Some(checker) = dds_disk_checker else {
-            // Without an authoritative checker there is nothing to
-            // consult — skip promotion and let the rescue path handle
-            // stale regions. This preserves behaviour for tests that
-            // don't wire a checker.
+        let (Some(checker), Some(index)) = (dds_disk_checker, scenery_index) else {
+            // Without an authoritative checker there is nothing to consult,
+            // and without the scenery index there is no way to know which
+            // tiles the region should contain. Skip promotion; the rescue
+            // path handles stale regions.
             return 0;
         };
 
-        let strategy = BoundaryStrategy::new();
         let in_progress: Vec<DsfRegion> = geo_index
             .iter::<PrefetchedRegion>()
             .into_iter()
@@ -138,7 +137,7 @@ impl BoundaryStrategy {
 
         let mut promoted = 0;
         for region in &in_progress {
-            let tiles = Self::tiles_for_region(&strategy, region, scenery_index);
+            let tiles = index.tiles_in_region(*region);
             if tiles.is_empty() {
                 continue;
             }
@@ -410,23 +409,32 @@ mod tests {
 
     #[test]
     fn test_promote_completed_regions() {
+        // #176: promotion has no geometric fallback — it needs a
+        // SceneryIndex to know the region's tile set. Wire a minimal
+        // single-tile index rather than relying on `expand_to_tiles`.
         let geo_index = GeoIndex::new();
         let region = DsfRegion::new(50, 9);
 
         geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
 
-        // Get the tiles for this region at zoom 14
-        let strategy = BoundaryStrategy::new();
-        let tiles = strategy.expand_to_tiles(&region, 14);
-        assert!(!tiles.is_empty());
+        let index = Arc::new(SceneryIndex::with_defaults());
+        index.add_tile(SceneryTile {
+            row: 25000,
+            col: 10000,
+            chunk_zoom: 16,
+            lat: 50.5,
+            lon: 9.5,
+            is_sea: false,
+        });
+        let tiles = index.tiles_in_region(region);
+        assert_eq!(tiles.len(), 1);
 
         // Populate the mock disk checker with every tile's chunk coords.
         let checker: Arc<dyn DdsDiskCacheChecker> =
             MockDiskChecker::with_tile_coords(tiles.iter().copied());
 
-        // No scenery index — uses geometric fallback
         let promoted =
-            BoundaryStrategy::promote_completed_regions(&geo_index, Some(&checker), None);
+            BoundaryStrategy::promote_completed_regions(&geo_index, Some(&checker), Some(&index));
         assert_eq!(promoted, 1);
 
         let state = geo_index.get::<PrefetchedRegion>(&region).unwrap();
@@ -440,17 +448,32 @@ mod tests {
 
         geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
 
-        // Get the tiles for this region at zoom 14
-        let strategy = BoundaryStrategy::new();
-        let tiles = strategy.expand_to_tiles(&region, 14);
-        assert!(tiles.len() > 1);
+        let index = Arc::new(SceneryIndex::with_defaults());
+        index.add_tile(SceneryTile {
+            row: 25000,
+            col: 10000,
+            chunk_zoom: 16,
+            lat: 50.2,
+            lon: 9.2,
+            is_sea: false,
+        });
+        index.add_tile(SceneryTile {
+            row: 26000,
+            col: 11000,
+            chunk_zoom: 16,
+            lat: 50.8,
+            lon: 9.8,
+            is_sea: false,
+        });
+        let tiles = index.tiles_in_region(region);
+        assert_eq!(tiles.len(), 2);
 
         // Mock checker knows only one tile → region is incomplete
         let checker: Arc<dyn DdsDiskCacheChecker> =
             MockDiskChecker::with_tile_coords(std::iter::once(tiles[0]));
 
         let promoted =
-            BoundaryStrategy::promote_completed_regions(&geo_index, Some(&checker), None);
+            BoundaryStrategy::promote_completed_regions(&geo_index, Some(&checker), Some(&index));
         assert_eq!(promoted, 0);
 
         let state = geo_index.get::<PrefetchedRegion>(&region).unwrap();
@@ -617,6 +640,114 @@ mod tests {
 
         let state = geo_index.get::<PrefetchedRegion>(&region).unwrap();
         assert!(state.is_in_progress());
+    }
+
+    // =========================================================================
+    // Region tile-set SSOT regression tests (#176)
+    // =========================================================================
+
+    use crate::prefetch::scenery_index::SceneryTile;
+
+    /// Build a [`DdsDiskCacheChecker`] that reports only the listed tiles as
+    /// present on disk.
+    fn test_checker(tiles: &[TileCoord]) -> Arc<dyn DdsDiskCacheChecker> {
+        MockDiskChecker::with_tile_coords(tiles.iter().copied())
+    }
+
+    #[test]
+    fn test_promotion_not_blocked_by_missing_tile_in_adjacent_region() {
+        // Regression for #176 defect 1. The old implementation queried a 45nm
+        // radius around the region centre, which reaches ~15nm into the regions
+        // north and south. Promotion then demanded tiles that were never
+        // submitted for this region, so under a moving prefetch box the fast
+        // path could effectively never fire.
+        let index = Arc::new(SceneryIndex::with_defaults());
+        let region = DsfRegion::new(33, -119);
+
+        // One tile inside the region, cached.
+        index.add_tile(SceneryTile {
+            row: 1000,
+            col: 2000,
+            chunk_zoom: 16,
+            lat: 33.5,
+            lon: -118.5,
+            is_sea: false,
+        });
+        // One tile in the region immediately north, NOT cached. Well within
+        // 45nm of the +33-119 centre, so the old code demanded it.
+        index.add_tile(SceneryTile {
+            row: 3000,
+            col: 4000,
+            chunk_zoom: 16,
+            lat: 34.2,
+            lon: -118.5,
+            is_sea: false,
+        });
+
+        let geo_index = GeoIndex::new();
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+
+        // Checker knows only the in-region tile.
+        let checker = test_checker(&[TileCoord {
+            row: 1000 / 16,
+            col: 2000 / 16,
+            zoom: 12,
+        }]);
+
+        let promoted =
+            BoundaryStrategy::promote_completed_regions(&geo_index, Some(&checker), Some(&index));
+
+        assert_eq!(
+            promoted, 1,
+            "the adjacent region's missing tile must not block promotion"
+        );
+        assert!(geo_index
+            .get::<PrefetchedRegion>(&region)
+            .unwrap()
+            .is_prefetched());
+    }
+
+    #[test]
+    fn test_promotion_blocked_by_missing_tile_inside_region() {
+        // The other half of the contract: a genuinely incomplete region must
+        // not be promoted.
+        let index = Arc::new(SceneryIndex::with_defaults());
+        let region = DsfRegion::new(33, -119);
+
+        index.add_tile(SceneryTile {
+            row: 1000,
+            col: 2000,
+            chunk_zoom: 16,
+            lat: 33.5,
+            lon: -118.5,
+            is_sea: false,
+        });
+        index.add_tile(SceneryTile {
+            row: 5000,
+            col: 6000,
+            chunk_zoom: 16,
+            lat: 33.7,
+            lon: -118.2,
+            is_sea: false,
+        });
+
+        let geo_index = GeoIndex::new();
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+
+        let checker = test_checker(&[TileCoord {
+            row: 1000 / 16,
+            col: 2000 / 16,
+            zoom: 12,
+        }]);
+
+        let promoted =
+            BoundaryStrategy::promote_completed_regions(&geo_index, Some(&checker), Some(&index));
+
+        assert_eq!(promoted, 0, "a missing in-region tile must block promotion");
+        assert!(geo_index
+            .get::<PrefetchedRegion>(&region)
+            .unwrap()
+            .is_in_progress());
     }
 
     // -------------------------------------------------------------------------

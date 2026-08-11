@@ -105,6 +105,50 @@ pub(crate) fn make_scenery_index(lat: i32, lon: i32, chunk_zoom: u8) -> Arc<Scen
     Arc::new(index)
 }
 
+/// Helper to create a SceneryIndex covering every DSF region in a lat/lon
+/// rectangle, one tile per region (4x4 sample grid, same as
+/// [`make_scenery_index`]).
+///
+/// Post-#176, `get_tiles_for_region` has no geometric fallback — a region
+/// the index doesn't know about now yields zero tiles rather than a guessed
+/// 4x4 grid at zoom 14. Tests that exercise a prefetch box/ground ring
+/// spanning multiple regions must wire real coverage instead of relying on
+/// the removed fallback; this builds it in one call.
+pub(crate) fn make_scenery_index_covering(
+    lat_range: std::ops::RangeInclusive<i32>,
+    lon_range: std::ops::RangeInclusive<i32>,
+    chunk_zoom: u8,
+) -> Arc<SceneryIndex> {
+    use crate::coord::{to_tile_coords, CHUNKS_PER_TILE_SIDE, CHUNK_ZOOM_OFFSET};
+    use crate::prefetch::scenery_index::{SceneryIndexConfig, SceneryTile};
+
+    let index = SceneryIndex::new(SceneryIndexConfig::default());
+    let tile_zoom = chunk_zoom - CHUNK_ZOOM_OFFSET;
+
+    for lat in lat_range {
+        for lon in lon_range.clone() {
+            for lat_step in 0..4u32 {
+                for lon_step in 0..4u32 {
+                    let sample_lat = lat as f64 + (lat_step as f64 * 0.25) + 0.125;
+                    let sample_lon = lon as f64 + (lon_step as f64 * 0.25) + 0.125;
+                    if let Ok(coord) = to_tile_coords(sample_lat, sample_lon, tile_zoom) {
+                        index.add_tile(SceneryTile {
+                            row: coord.row * CHUNKS_PER_TILE_SIDE,
+                            col: coord.col * CHUNKS_PER_TILE_SIDE,
+                            chunk_zoom,
+                            lat: sample_lat as f32,
+                            lon: sample_lon as f32,
+                            is_sea: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Arc::new(index)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SceneTracker mocks
 // ─────────────────────────────────────────────────────────────────────────────
