@@ -44,6 +44,7 @@ mod prewarm;
 pub mod scenery_cache;
 mod scenery_index;
 mod state;
+mod state_observer;
 mod strategy;
 pub mod tile_based;
 pub mod types;
@@ -88,3 +89,6 @@ pub use tile_based::{DdsAccessEvent, DsfTileCoord};
 
 // Adaptive prefetch (self-calibrating DSF-aligned)
 pub use adaptive::{AdaptivePrefetchConfig, AdaptivePrefetchCoordinator};
+
+// Prefetch state divergence detection (FUSE-side, #176)
+pub use state_observer::PrefetchStateObserver;

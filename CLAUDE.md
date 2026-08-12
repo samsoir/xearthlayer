@@ -132,6 +132,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `SimState` - Direct sim state detection via X-Plane Web API (paused, on_ground, scenery_loading, replay)
     - `TransitionThrottle` - Grace period + ramp-up after Ground-to-Cruise transition
     - `LoopState` - Per-cycle runner state including `telemetry_paused` flag for stale telemetry safe mode
+    - `PrefetchStateObserver` - FUSE-side divergence detector; demotes a `Prefetched`/`NoCoverage` region back to *absent* when FUSE has to generate a tile on demand there, rate-limited to one demotion per region per 120s window
     - Submits jobs to shared job executor daemon via `DdsClient` trait
     - Mode selection: Aggressive (>30 tiles/sec), Opportunistic (10-30), or Disabled
     - **Four-tier filtering**: Local tracking → Memory cache → Patched region exclusion (via `GeoIndex`) → Disk existence (via `OrthoUnionIndex`)

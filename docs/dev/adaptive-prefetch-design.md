@@ -250,6 +250,59 @@ This follows a **two-phase commit** pattern:
 2. **Confirm**: Region marked `Prefetched` when tiles are confirmed in cache
 3. **Timeout**: If `InProgress` exceeds `stale_region_timeout`, reverts to *absent* for re-evaluation
 
+### Region Tile-Set SSOT
+
+`SceneryIndex::tiles_in_region(region)` is the single definition of "which DDS
+tiles belong to this DSF region": a tile belongs to the region containing its
+geographic centre (the `LOAD_CENTER` of its `.ter` file). The submit, promote,
+and rescue paths all consult this one method, so they cannot disagree about
+whether a region is complete. Earlier code reconstructed the tile set from a
+45nm radius query per path, which returns a circle overlapping neighbouring
+regions rather than the region itself — the source of several promotion bugs
+fixed under #176.
+
+### Demotion: Closing the Loop on Wrong Claims
+
+`Prefetched` and `NoCoverage` are claims, not guarantees. If FUSE has to
+*generate* a tile on demand inside a region carrying either state, the claim
+was wrong — whether from a scenery-index gap, a premature promotion, or
+eviction of the tile after promotion. `PrefetchStateObserver`
+(`xearthlayer/src/prefetch/state_observer.rs`) sits on the one FUSE code path
+every implementation shares (`DdsRequestor::on_dds_response`, defaulted to a
+no-op, overridden by `Fuse3OrthoUnionFS`) and reacts to exactly this:
+
+```
+Prefetched ──┐
+             ├──▶ on-demand FUSE generation observed ──▶ demoted to *absent*
+NoCoverage ──┘        (region re-enters the prefetch cycle)
+```
+
+`InProgress` regions are exempt — they are expected to miss while prefetch is
+still running — and cache hits are exempt, since serving from cache is the
+system working, not a divergence.
+
+Every divergence is counted and reported via
+`MetricsClient::prefetch_state_diverged()`, but the region is only cleared
+(and `MetricsClient::prefetch_region_demoted()` fired) at most once per region
+per 120s window. Eviction inside the retained window can recur, so an
+unbounded demote → re-prefetch → evict loop would churn on a long flight; the
+rate limit exists so the diagnostic doesn't become the noise it's meant to
+surface.
+
+The daemon aggregates both counters as cumulative totals since process start
+and logs them on the same 60s cadence as the memory sample:
+
+```
+INFO Prefetch sample uptime_s=... regions_in_progress=... regions_prefetched=...
+     regions_nocoverage=... state_diverged=... regions_demoted=...
+```
+
+`state_diverged` and `regions_demoted` are expected to stay at (or near) zero
+on a healthy flight; a climbing `state_diverged` with a flat `regions_demoted`
+means the rate limit is suppressing repeat divergences in the same region —
+worth investigating even though no region is currently stuck in a wrong
+state.
+
 ### Retention Inference
 
 The X-Plane Window is inferred, not observed directly. We use a buffer zone to handle uncertainty:

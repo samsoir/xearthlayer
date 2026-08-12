@@ -39,12 +39,13 @@
 use super::inode::InodeManager;
 use super::shared::{DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
 use super::types::{Fuse3Error, Fuse3Result};
+use crate::coord::TileCoord;
 use crate::executor::{DdsClient, StorageConcurrencyLimiter};
 use crate::fuse::coalesce::RequestCoalescer;
 use crate::fuse::{get_default_placeholder, parse_dds_filename};
 use crate::geo_index::GeoIndex;
 use crate::ortho_union::OrthoUnionIndex;
-use crate::prefetch::{DdsAccessEvent, DsfTileCoord, TileRequestCallback};
+use crate::prefetch::{DdsAccessEvent, DsfTileCoord, PrefetchStateObserver, TileRequestCallback};
 use crate::scene_tracker::{DdsTileCoord, FuseAccessEvent};
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
@@ -108,6 +109,8 @@ pub struct Fuse3OrthoUnionFS {
     /// When set, FUSE filters lazy resolution to only serve patch sources in
     /// those regions, hiding package files that would cause X-Plane conflicts.
     geo_index: Option<Arc<GeoIndex>>,
+    /// Observer for prefetch state divergence (#176).
+    state_observer: Option<Arc<PrefetchStateObserver>>,
     /// Client for DDS generation requests (new daemon architecture)
     dds_client: Arc<dyn DdsClient>,
     /// Inode manager for path mappings
@@ -186,6 +189,7 @@ impl Fuse3OrthoUnionFS {
         Self {
             index: Arc::new(index),
             geo_index: None,
+            state_observer: None,
             dds_client,
             inode_manager: InodeManager::new(virtual_root),
             virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
@@ -217,6 +221,7 @@ impl Fuse3OrthoUnionFS {
         Self {
             index: Arc::new(index),
             geo_index: None,
+            state_observer: None,
             dds_client,
             inode_manager: InodeManager::new(virtual_root),
             virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
@@ -318,6 +323,15 @@ impl Fuse3OrthoUnionFS {
     /// only from patch sources, hiding package files that could conflict.
     pub fn with_geo_index(mut self, geo_index: Arc<GeoIndex>) -> Self {
         self.geo_index = Some(geo_index);
+        self
+    }
+
+    /// Set the prefetch state observer.
+    ///
+    /// When set, an on-demand generation in a region prefetch marked
+    /// `Prefetched` or `NoCoverage` demotes that region.
+    pub fn with_state_observer(mut self, observer: Arc<PrefetchStateObserver>) -> Self {
+        self.state_observer = Some(observer);
         self
     }
 
@@ -498,6 +512,12 @@ impl DdsRequestor for Fuse3OrthoUnionFS {
 
     fn metrics_client(&self) -> Option<&crate::metrics::MetricsClient> {
         self.metrics_client.as_ref()
+    }
+
+    fn on_dds_response(&self, tile: TileCoord, cache_hit: bool) {
+        if let Some(ref observer) = self.state_observer {
+            observer.observe(tile, cache_hit);
+        }
     }
 }
 
