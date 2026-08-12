@@ -7,7 +7,6 @@
 //! clear the state so the region is re-prefetched. See #176.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,8 +30,6 @@ pub struct PrefetchStateObserver {
     /// ever diverged, which is small enough not to need eviction.
     last_demotion: Mutex<HashMap<DsfRegion, Instant>>,
     demotion_interval: Duration,
-    divergences: AtomicU64,
-    demotions: AtomicU64,
 }
 
 impl PrefetchStateObserver {
@@ -42,8 +39,6 @@ impl PrefetchStateObserver {
             metrics_client: None,
             last_demotion: Mutex::new(HashMap::new()),
             demotion_interval: DEFAULT_DEMOTION_INTERVAL,
-            divergences: AtomicU64::new(0),
-            demotions: AtomicU64::new(0),
         }
     }
 
@@ -56,27 +51,6 @@ impl PrefetchStateObserver {
     pub fn with_demotion_interval(mut self, interval: Duration) -> Self {
         self.demotion_interval = interval;
         self
-    }
-
-    /// Total divergences observed since this observer was created.
-    ///
-    /// Mirrors the `PrefetchStateDiverged` metric emitted on the same path.
-    /// It exists because `MetricsClient` is fire-and-forget over an
-    /// unbounded channel — a test cannot synchronously assert that a metric
-    /// was emitted, so this counter gives the rate-limiting behaviour
-    /// something observable to check.
-    pub fn divergences(&self) -> u64 {
-        self.divergences.load(Ordering::Relaxed)
-    }
-
-    /// Total demotions performed since this observer was created.
-    ///
-    /// Mirrors the `PrefetchRegionDemoted` metric emitted on the same path.
-    /// It exists for the same reason as [`Self::divergences`]: the metrics
-    /// path cannot be observed synchronously, so tests need a direct way to
-    /// confirm the rate limit actually suppressed a demotion.
-    pub fn demotions(&self) -> u64 {
-        self.demotions.load(Ordering::Relaxed)
     }
 
     /// Evaluate a completed DDS response.
@@ -99,7 +73,6 @@ impl PrefetchStateObserver {
             return;
         }
 
-        self.divergences.fetch_add(1, Ordering::Relaxed);
         if let Some(ref metrics) = self.metrics_client {
             metrics.prefetch_state_diverged();
         }
@@ -109,7 +82,6 @@ impl PrefetchStateObserver {
         }
 
         self.geo_index.remove::<PrefetchedRegion>(&region);
-        self.demotions.fetch_add(1, Ordering::Relaxed);
         if let Some(ref metrics) = self.metrics_client {
             metrics.prefetch_region_demoted();
         }
@@ -129,6 +101,13 @@ impl PrefetchStateObserver {
     ///
     /// The lock is only reached on the divergence path, after both early
     /// returns, so contention is not a concern.
+    ///
+    /// `.unwrap()` on the lock panics on poisoning, matching the existing
+    /// convention for `Mutex` state elsewhere in prefetch (e.g.
+    /// `boundary_strategy.rs`, `calibrator.rs`) — this is not a novel risk.
+    /// It also cannot corrupt the DDS bytes served to X-Plane: the caller
+    /// (`do_request()` in `fuse3/shared.rs`) reads `response.data` *after*
+    /// invoking this hook, so this call sits off the texture-response path.
     fn claim_demotion(&self, region: DsfRegion) -> bool {
         let now = Instant::now();
         let mut log = self.last_demotion.lock().unwrap();
@@ -146,6 +125,7 @@ impl PrefetchStateObserver {
 mod tests {
     use super::*;
     use crate::geo_index::PrefetchedRegion;
+    use crate::metrics::MetricEvent;
 
     /// A tile whose centre lies inside DsfRegion { lat: 33, lon: -119 }.
     fn tile_in_33_119() -> TileCoord {
@@ -155,6 +135,18 @@ mod tests {
     fn region_of(tile: TileCoord) -> DsfRegion {
         let (lat, lon) = tile.to_lat_lon();
         DsfRegion::from_lat_lon(lat, lon)
+    }
+
+    /// Build a `MetricsClient` over a fresh channel, returning it alongside
+    /// the receiver so a test can drain and assert exactly which events were
+    /// emitted. `MetricsClient` is otherwise fire-and-forget with no way to
+    /// observe emission synchronously — this is that seam.
+    fn test_metrics_client() -> (
+        MetricsClient,
+        tokio::sync::mpsc::UnboundedReceiver<MetricEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (MetricsClient::new(tx), rx)
     }
 
     #[test]
@@ -195,7 +187,9 @@ mod tests {
         let region = region_of(tile);
         geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
 
-        let observer = PrefetchStateObserver::new(Arc::clone(&geo_index));
+        let (metrics, mut rx) = test_metrics_client();
+        let observer =
+            PrefetchStateObserver::new(Arc::clone(&geo_index)).with_metrics_client(metrics);
         observer.observe(tile, true);
 
         assert!(
@@ -204,6 +198,10 @@ mod tests {
                 .unwrap()
                 .is_prefetched(),
             "serving a prefetched tile from cache is the system working"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a cache hit must not emit any metric — it never reaches the lookup"
         );
     }
 
@@ -238,22 +236,42 @@ mod tests {
         let tile = tile_in_33_119();
         let region = region_of(tile);
 
-        let observer = PrefetchStateObserver::new(Arc::clone(&geo_index));
+        let (metrics, mut rx) = test_metrics_client();
+        let observer =
+            PrefetchStateObserver::new(Arc::clone(&geo_index)).with_metrics_client(metrics);
 
         geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
         observer.observe(tile, false);
-        assert_eq!(observer.divergences(), 1);
-        assert_eq!(observer.demotions(), 1);
+
+        // First divergence demotes: both events fire, diverged before demoted.
+        assert!(
+            matches!(rx.try_recv(), Ok(MetricEvent::PrefetchStateDiverged)),
+            "a demoted divergence must emit PrefetchStateDiverged"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(MetricEvent::PrefetchRegionDemoted)),
+            "a demoted divergence must emit PrefetchRegionDemoted"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly two events for a demoted divergence"
+        );
 
         // Region re-promoted, then diverges again inside the window.
         geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
         observer.observe(tile, false);
 
-        assert_eq!(observer.divergences(), 2, "every divergence is counted");
-        assert_eq!(
-            observer.demotions(),
-            1,
-            "the second demotion is rate limited"
+        // Second divergence is still counted (diverged fires)...
+        assert!(
+            matches!(rx.try_recv(), Ok(MetricEvent::PrefetchStateDiverged)),
+            "every divergence is counted, even when the demotion is rate limited"
+        );
+        // ...but the demotion itself is rate limited: no PrefetchRegionDemoted.
+        // This is the assertion that would catch the two emission calls being
+        // swapped: a swap would emit PrefetchRegionDemoted here instead.
+        assert!(
+            rx.try_recv().is_err(),
+            "the second demotion is rate limited — no PrefetchRegionDemoted"
         );
         assert!(
             geo_index
@@ -270,7 +288,9 @@ mod tests {
         let tile = tile_in_33_119();
         let region = region_of(tile);
 
+        let (metrics, mut rx) = test_metrics_client();
         let observer = PrefetchStateObserver::new(Arc::clone(&geo_index))
+            .with_metrics_client(metrics)
             .with_demotion_interval(Duration::ZERO);
 
         geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
@@ -278,10 +298,12 @@ mod tests {
         geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
         observer.observe(tile, false);
 
+        let demoted_count = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| matches!(event, MetricEvent::PrefetchRegionDemoted))
+            .count();
         assert_eq!(
-            observer.demotions(),
-            2,
-            "a zero window permits every demotion"
+            demoted_count, 2,
+            "a zero window permits every demotion to emit PrefetchRegionDemoted"
         );
     }
 }
