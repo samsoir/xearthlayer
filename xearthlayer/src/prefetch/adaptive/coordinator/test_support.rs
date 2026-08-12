@@ -235,6 +235,29 @@ impl DdsDiskCacheChecker for MockDiskChecker {
     }
 }
 
+/// Mock [`DdsDiskCacheChecker`] that reports every tile as present on disk.
+///
+/// Models a DSF region whose tiles are all already in the DDS disk cache —
+/// the state in which the filter pipeline removes the region's entire
+/// planned tile set, so nothing is submitted and `execute()` is skipped
+/// (#176).
+pub(crate) struct AlwaysHitDiskChecker;
+
+impl DdsDiskCacheChecker for AlwaysHitDiskChecker {
+    fn tile_exists(
+        &self,
+        _row: u32,
+        _col: u32,
+        _zoom: u8,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async { true })
+    }
+
+    fn tile_exists_blocking(&self, _row: u32, _col: u32, _zoom: u8) -> bool {
+        true
+    }
+}
+
 /// Mock SceneTracker that returns no data for all queries.
 pub(crate) struct DummyTracker;
 

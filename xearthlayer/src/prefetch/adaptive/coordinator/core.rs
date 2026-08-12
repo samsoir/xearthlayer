@@ -15,7 +15,7 @@ use crate::metrics::MetricsClient;
 
 /// Maximum demotion attempts before marking a region as NoCoverage.
 const MAX_REGION_ATTEMPTS: u8 = 3;
-use crate::geo_index::{DsfRegion, GeoIndex, PrefetchedRegion};
+use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage, PrefetchedRegion};
 use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::state::{AircraftState, SharedPrefetchStatus};
 use crate::prefetch::SceneryIndex;
@@ -703,6 +703,76 @@ impl AdaptivePrefetchCoordinator {
         tiles_submitted
     }
 
+    /// Mark every region whose planned tiles were *all* removed by the
+    /// filter pipeline as `InProgress`.
+    ///
+    /// `surviving` is the plan's tile list after filtering. A region with no
+    /// surviving tile contributes nothing to submission, so [`execute()`]'s
+    /// mark-after-submit never sees it; and if that is true of every region,
+    /// the plan is empty and [`execute()`] is not called at all. Either way
+    /// the region would stay unmarked and be re-planned on every cycle.
+    ///
+    /// `InProgress` rather than `Prefetched` is deliberate. The filter says
+    /// the tiles looked cached at plan time; that is not proof they are on
+    /// the DDS disk. `BoundaryStrategy::promote_completed_regions` re-checks
+    /// every tile in the region against the authoritative disk cache during
+    /// the maintenance pass at the end of this same cycle, and only then
+    /// confirms `Prefetched`. If the check fails the region simply stays
+    /// `InProgress` until `evaluate_stale_regions` retires or retries it.
+    ///
+    /// Patch-owned regions are excluded. Their tiles filter out in full at
+    /// the `PatchCoverage` stage, but prefetch will never put those tiles on
+    /// the DDS disk — X-Plane is served them by the patch through FUSE
+    /// passthrough. Marking one `InProgress` would be a claim prefetch is
+    /// working on it, which `promote_completed_regions` could never confirm;
+    /// the region would go stale and be retired to `NoCoverage` with a
+    /// misleading "failed attempts" warning in the flight log. Patch
+    /// ownership is a whole-region property in the `GeoIndex`, so this
+    /// exclusion is exact rather than a heuristic. Such regions keep being
+    /// re-planned and filtered each cycle, as they were before this change.
+    ///
+    /// Marked regions are dropped from `current_plan_regions` so
+    /// [`execute()`] only reasons about regions that had tiles to submit.
+    ///
+    /// Returns the number of regions marked.
+    fn mark_fully_filtered_regions(&mut self, surviving: &[TileCoord]) -> usize {
+        if self.current_plan_regions.is_empty() {
+            return 0;
+        }
+        let Some(geo_index) = self.geo_index.clone() else {
+            return 0;
+        };
+
+        let surviving_regions: HashSet<DsfRegion> = surviving
+            .iter()
+            .filter_map(|tile| self.current_plan_regions.get(tile).copied())
+            .collect();
+
+        let fully_filtered: HashSet<DsfRegion> = self
+            .current_plan_regions
+            .values()
+            .copied()
+            .filter(|region| !surviving_regions.contains(region))
+            .filter(|region| !geo_index.contains::<PatchCoverage>(region))
+            .collect();
+
+        if fully_filtered.is_empty() {
+            return 0;
+        }
+
+        for region in &fully_filtered {
+            self.boundary_strategy.mark_in_progress(region, &geo_index);
+        }
+        self.current_plan_regions
+            .retain(|_, region| !fully_filtered.contains(region));
+
+        tracing::debug!(
+            regions_marked = fully_filtered.len(),
+            "Prefetch: marked fully-filtered regions InProgress for disk-verified promotion"
+        );
+        fully_filtered.len()
+    }
+
     /// Mark tiles as cached (to avoid re-prefetching).
     pub fn mark_cached(&mut self, tiles: impl IntoIterator<Item = TileCoord>) {
         self.cached_tiles.extend(tiles);
@@ -935,6 +1005,15 @@ impl AdaptivePrefetchCoordinator {
             "Prefetch plan filter pipeline summary"
         );
 
+        // Regions whose entire planned tile set was filtered out submit
+        // nothing, so `execute()`'s mark-after-submit can never fire for
+        // them — and when *every* region is in that state the plan is empty
+        // and `execute()` is skipped outright. Left unmarked, the region
+        // stays absent from `PrefetchedRegion`, re-enters
+        // `new_regions_with_shape` on the next 2s cycle, and repeats forever
+        // while `regions_prefetched` under-reports. See #176.
+        self.mark_fully_filtered_regions(&plan.tiles);
+
         let submitted = if plan.is_empty() {
             0
         } else {
@@ -1157,8 +1236,9 @@ mod tests {
     use super::*;
     use crate::prefetch::adaptive::coordinator::test_support::{
         ground_state, make_scenery_index, make_scenery_index_covering, patched_region_area,
-        test_calibration, test_plan, AlwaysMissMemoryCache, BackpressureMockClient,
-        CapLimitedDdsClient, DummyTracker, HighLoadDdsClient, MockDiskChecker, StableBoundsTracker,
+        test_calibration, test_plan, AlwaysHitDiskChecker, AlwaysMissMemoryCache,
+        BackpressureMockClient, CapLimitedDdsClient, DummyTracker, HighLoadDdsClient,
+        MockDiskChecker, StableBoundsTracker,
     };
     // ─────────────────────────────────────────────────────────────────────────
     // Creation tests
@@ -3098,6 +3178,78 @@ mod tests {
         assert!(
             count_in_progress_regions(&geo_index) > 0,
             "Regions with all tiles submitted must be marked InProgress",
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Fully-filtered regions must still reach Prefetched (#176)
+    //
+    // `execute()` is skipped when the filtered plan is empty, and
+    // `mark_in_progress` only ever fired inside `execute()`. A region whose
+    // planned tiles all filter out as already-cached was therefore marked
+    // nothing at all: absent from PrefetchedRegion, so it re-entered
+    // `new_regions_with_shape` every 2s cycle and could never return to
+    // `Prefetched`.
+    //
+    // This branch is routine on this branch, not exotic: the #176 observer
+    // demotes a settled region on one on-demand FUSE generation, FUSE then
+    // re-caches that tile, and the next cycle re-plans a region in which
+    // every tile is cached. `regions_prefetched` — one of the numbers the
+    // flight test reads off the 60s Prefetch sample — would permanently
+    // under-report.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn count_prefetched_regions(geo_index: &crate::geo_index::GeoIndex) -> usize {
+        use crate::geo_index::PrefetchedRegion;
+        geo_index
+            .iter::<PrefetchedRegion>()
+            .into_iter()
+            .filter(|(_, r)| r.is_prefetched())
+            .count()
+    }
+
+    #[tokio::test]
+    async fn test_fully_cached_region_reaches_prefetched() {
+        use crate::geo_index::GeoIndex;
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let client = Arc::new(CapLimitedDdsClient::new(100_000));
+        // Every tile is already on the DDS disk. The filter pipeline empties
+        // the plan, so nothing is submitted — and the same checker is what
+        // `promote_completed_regions` consults, so the promotion is a real
+        // disk-verified full-coverage check, not the filter's say-so.
+        let checker: Arc<dyn DdsDiskCacheChecker> = Arc::new(AlwaysHitDiskChecker);
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ramp_duration: std::time::Duration::from_secs(0),
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_dds_disk_checker(Arc::clone(&checker))
+            .with_scenery_index(wide_scenery_index_at_50_10());
+
+        fast_forward_to_cruise(&mut coord);
+        assert_eq!(coord.phase_detector.current_phase(), FlightPhase::Cruise);
+
+        let state = AircraftState::new(50.0, 10.0, 0.0, 200.0, 35000.0, false);
+
+        // Two cycles: the fix marks InProgress in the first and
+        // `promote_completed_regions` confirms it on a maintenance pass.
+        let submitted = coord.process_telemetry(&state).await.unwrap_or(0);
+        assert_eq!(
+            submitted, 0,
+            "Precondition: with every tile on disk the whole plan must filter out",
+        );
+        coord.process_telemetry(&state).await;
+
+        assert!(
+            count_prefetched_regions(&geo_index) > 0,
+            "A region whose tiles are all already cached must reach Prefetched, \
+             not sit unmarked and be re-planned forever",
         );
     }
 }
