@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::coord::{to_tile_coords, TileCoord};
+use crate::coord::TileCoord;
 use crate::executor::DdsDiskCacheChecker;
 use crate::geo_index::{DsfRegion, GeoIndex, PrefetchedRegion, RetainedRegion};
 use crate::prefetch::tile_based::DsfTileCoord;
@@ -17,40 +17,14 @@ use crate::prefetch::SceneryIndex;
 
 /// Region lifecycle management for the prefetch system.
 ///
-/// Handles tile expansion, region state transitions (InProgress → Prefetched),
-/// staleness sweeps, and retention-based eviction.
+/// Handles region state transitions (InProgress → Prefetched), staleness
+/// sweeps, and retention-based eviction.
 pub struct BoundaryStrategy;
 
 impl BoundaryStrategy {
     /// Creates a new `BoundaryStrategy`.
     pub fn new() -> Self {
         Self
-    }
-
-    /// Expand a DSF region into DDS tiles using a 4x4 sample grid.
-    ///
-    /// Samples 16 points within the 1x1 degree region and converts each to
-    /// a DDS tile coordinate at the given zoom level. Duplicates are removed
-    /// (nearby sample points may map to the same tile at lower zoom levels).
-    pub fn expand_to_tiles(&self, region: &DsfRegion, zoom: u8) -> Vec<TileCoord> {
-        let lat_min = region.lat as f64;
-        let lon_min = region.lon as f64;
-        let mut tiles = Vec::with_capacity(16);
-        let mut seen = std::collections::HashSet::with_capacity(16);
-
-        for lat_step in 0..4u32 {
-            for lon_step in 0..4u32 {
-                let sample_lat = lat_min + (lat_step as f64 * 0.25) + 0.125;
-                let sample_lon = lon_min + (lon_step as f64 * 0.25) + 0.125;
-                if let Ok(coord) = to_tile_coords(sample_lat, sample_lon, zoom) {
-                    if seen.insert((coord.row, coord.col)) {
-                        tiles.push(coord);
-                    }
-                }
-            }
-        }
-
-        tiles
     }
 
     /// Mark a region as having no scenery coverage.
@@ -164,27 +138,6 @@ impl BoundaryStrategy {
         promoted
     }
 
-    /// Get tiles for a DSF region using scenery index when available.
-    ///
-    /// Queries the scenery index for actual installed tiles (at correct zoom
-    /// levels), falling back to geometric 4x4 grid at zoom 14.
-    pub fn tiles_for_region(
-        strategy: &BoundaryStrategy,
-        region: &DsfRegion,
-        scenery_index: Option<&Arc<SceneryIndex>>,
-    ) -> Vec<TileCoord> {
-        if let Some(index) = scenery_index {
-            let center_lat = region.lat as f64 + 0.5;
-            let center_lon = region.lon as f64 + 0.5;
-            let tiles = index.tiles_near(center_lat, center_lon, 45.0);
-            let result: Vec<TileCoord> = tiles.iter().map(|t| t.to_tile_coord()).collect();
-            if !result.is_empty() {
-                return result;
-            }
-        }
-        strategy.expand_to_tiles(region, 14)
-    }
-
     /// Evict `PrefetchedRegion` entries for regions no longer in the retained window.
     ///
     /// Removes `Prefetched` and `NoCoverage` entries whose DSF region is not
@@ -263,30 +216,6 @@ impl Default for BoundaryStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_expand_region_to_dds_tiles() {
-        let strategy = BoundaryStrategy::new();
-        let region = DsfRegion::new(50, 9);
-        let tiles = strategy.expand_to_tiles(&region, 14);
-        // 4x4 grid = up to 16 tiles (dedup may reduce slightly)
-        assert!(!tiles.is_empty());
-        assert!(tiles.len() <= 16);
-        // All tiles should be at the requested zoom
-        for tile in &tiles {
-            assert_eq!(tile.zoom, 14);
-        }
-    }
-
-    #[test]
-    fn test_expand_region_tiles_within_dsf_bounds() {
-        let strategy = BoundaryStrategy::new();
-        let region = DsfRegion::new(50, 9);
-        let tiles = strategy.expand_to_tiles(&region, 14);
-        // Tiles should be within the DSF region's geographic bounds
-        // (can't easily check lat/lon from TileCoord, just verify non-empty)
-        assert!(!tiles.is_empty());
-    }
 
     #[test]
     fn test_mark_no_coverage() {
@@ -502,7 +431,7 @@ mod tests {
     }
 
     // =========================================================================
-    // tiles_for_region + SceneryIndex integration
+    // promote_completed_regions + SceneryIndex zoom integration
     // =========================================================================
 
     /// Create a SceneryIndex populated with tiles for a specific DSF region.
@@ -535,56 +464,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tiles_for_region_without_scenery_index_uses_zoom_14() {
-        let strategy = BoundaryStrategy::new();
-        let region = DsfRegion::new(50, 9);
-
-        // No scenery index -> falls back to geometric expansion at zoom 14
-        let tiles = BoundaryStrategy::tiles_for_region(&strategy, &region, None);
-
-        assert!(!tiles.is_empty());
-        for tile in &tiles {
-            assert_eq!(tile.zoom, 14, "Fallback should use zoom 14");
-        }
-    }
-
-    #[test]
-    fn test_tiles_for_region_with_scenery_index_uses_actual_zoom() {
-        let strategy = BoundaryStrategy::new();
-        let region = DsfRegion::new(50, 9);
-
-        // SceneryIndex populated at chunk_zoom 16 -> tile zoom 12
-        let index = make_scenery_index_for_region(50, 9, 16);
-        let tiles = BoundaryStrategy::tiles_for_region(&strategy, &region, Some(&index));
-
-        assert!(!tiles.is_empty());
-        for tile in &tiles {
-            assert_eq!(
-                tile.zoom, 12,
-                "Should use zoom 12 from scenery index (chunk_zoom 16)"
-            );
-        }
-    }
-
-    #[test]
-    fn test_tiles_for_region_falls_back_when_index_empty_for_region() {
-        let strategy = BoundaryStrategy::new();
-        let region = DsfRegion::new(50, 9);
-
-        // SceneryIndex exists but has tiles only at different region (60, 20)
-        let index = make_scenery_index_for_region(60, 20, 16);
-        let tiles = BoundaryStrategy::tiles_for_region(&strategy, &region, Some(&index));
-
-        assert!(!tiles.is_empty());
-        for tile in &tiles {
-            assert_eq!(
-                tile.zoom, 14,
-                "Should fall back to zoom 14 when no index tiles nearby"
-            );
-        }
-    }
-
-    #[test]
     fn test_promote_completed_regions_with_scenery_index() {
         let geo_index = GeoIndex::new();
         let region = DsfRegion::new(50, 9);
@@ -595,8 +474,7 @@ mod tests {
         let index = make_scenery_index_for_region(50, 9, 16);
 
         // Get tiles via SceneryIndex — these are zoom 12 tiles
-        let strategy = BoundaryStrategy::new();
-        let tiles = BoundaryStrategy::tiles_for_region(&strategy, &region, Some(&index));
+        let tiles = index.tiles_in_region(region);
         assert!(!tiles.is_empty());
         assert!(tiles.iter().all(|t| t.zoom == 12));
 
@@ -626,9 +504,14 @@ mod tests {
         // SceneryIndex at chunk_zoom 16 -> tile zoom 12
         let index = make_scenery_index_for_region(50, 9, 16);
 
-        // Cache zoom 14 tiles (the OLD wrong behavior) instead of zoom 12
-        let strategy = BoundaryStrategy::new();
-        let wrong_tiles = strategy.expand_to_tiles(&region, 14);
+        // Cache zoom 14 tiles (the OLD wrong behavior) instead of zoom 12.
+        // Built explicitly rather than via the removed geometric expansion —
+        // only the zoom mismatch matters here, not real geographic tiles.
+        let wrong_tiles = vec![TileCoord {
+            row: 999,
+            col: 999,
+            zoom: 14,
+        }];
         let checker: Arc<dyn DdsDiskCacheChecker> =
             MockDiskChecker::with_tile_coords(wrong_tiles.into_iter());
 

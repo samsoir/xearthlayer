@@ -272,28 +272,6 @@ impl SceneryIndex {
         result
     }
 
-    /// Query tiles within a radius, excluding sea tiles.
-    pub fn land_tiles_near(&self, lat: f64, lon: f64, radius_nm: f32) -> Vec<SceneryTile> {
-        self.tiles_near(lat, lon, radius_nm)
-            .into_iter()
-            .filter(|t| !t.is_sea)
-            .collect()
-    }
-
-    /// Query tiles within a radius at a specific zoom level.
-    pub fn tiles_near_at_zoom(
-        &self,
-        lat: f64,
-        lon: f64,
-        radius_nm: f32,
-        chunk_zoom: u8,
-    ) -> Vec<SceneryTile> {
-        self.tiles_near(lat, lon, radius_nm)
-            .into_iter()
-            .filter(|t| t.chunk_zoom == chunk_zoom)
-            .collect()
-    }
-
     /// Get the deduplicated set of DDS tiles belonging to a DSF region.
     ///
     /// A tile belongs to the region containing its geographic centre, which
@@ -806,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scenery_index_land_tiles_filter() {
+    fn test_scenery_index_sea_and_land_counts() {
         let index = SceneryIndex::with_defaults();
 
         // Add a land tile
@@ -836,11 +814,6 @@ mod tests {
         // Query all tiles
         let all = index.tiles_near(45.0, -120.0, 10.0);
         assert_eq!(all.len(), 2);
-
-        // Query land tiles only
-        let land = index.land_tiles_near(45.0, -120.0, 10.0);
-        assert_eq!(land.len(), 1);
-        assert!(!land[0].is_sea);
     }
 
     #[test]
@@ -986,8 +959,7 @@ mod tests {
 
     #[test]
     fn test_tiles_in_region_includes_sea_tiles() {
-        // The spec requires sea tiles stay in scope: no is_sea filter here,
-        // unlike the adjacent land_tiles_near.
+        // The spec requires sea tiles stay in scope: no is_sea filter here.
         let index = SceneryIndex::with_defaults();
         let mut tile = tile_at(1000, 2000, 33.5, -118.5);
         tile.is_sea = true;
