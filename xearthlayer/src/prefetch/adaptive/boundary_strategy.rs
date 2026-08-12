@@ -1,8 +1,6 @@
 //! Region lifecycle management for the prefetch system.
 //!
 //! Provides region lifecycle management:
-//! - [`BoundaryStrategy::sweep_stale_regions`] — removes `InProgress` regions
-//!   that have exceeded the staleness timeout (eligible for re-prefetch).
 //! - [`BoundaryStrategy::promote_completed_regions`] — promotes `InProgress`
 //!   regions to `Prefetched` once all their tiles are confirmed in cache.
 
@@ -17,8 +15,10 @@ use crate::prefetch::SceneryIndex;
 
 /// Region lifecycle management for the prefetch system.
 ///
-/// Handles region state transitions (InProgress → Prefetched), staleness
-/// sweeps, and retention-based eviction.
+/// Handles region state transitions (InProgress → Prefetched) and
+/// retention-based eviction. Staleness is handled by the coordinator's
+/// `evaluate_stale_regions`, which checks the DDS disk before deciding
+/// whether a stale region should be promoted or retried.
 pub struct BoundaryStrategy;
 
 impl BoundaryStrategy {
@@ -45,30 +45,6 @@ impl BoundaryStrategy {
             lon = region.lon,
             "boundary: marked InProgress"
         );
-    }
-
-    /// Sweep the GeoIndex for stale `InProgress` regions and remove them.
-    ///
-    /// Stale regions have been `InProgress` for longer than the specified timeout,
-    /// indicating the prefetch job either failed or was never completed. Removing
-    /// them makes them eligible for re-prefetch.
-    pub fn sweep_stale_regions(geo_index: &GeoIndex, timeout: std::time::Duration) -> usize {
-        let stale: Vec<DsfRegion> = geo_index
-            .iter::<PrefetchedRegion>()
-            .into_iter()
-            .filter(|(_, region)| region.is_stale(timeout))
-            .map(|(dsf, _)| dsf)
-            .collect();
-
-        let removed = stale.len();
-        for region in &stale {
-            geo_index.remove::<PrefetchedRegion>(region);
-        }
-
-        if removed > 0 {
-            tracing::debug!(removed, "Swept stale InProgress regions");
-        }
-        removed
     }
 
     /// Check InProgress regions and promote to Prefetched if all tiles are
@@ -242,56 +218,6 @@ mod tests {
     }
 
     // =========================================================================
-    // Staleness sweep
-    // =========================================================================
-
-    #[test]
-    fn test_sweep_stale_regions() {
-        use std::time::Duration;
-
-        let geo_index = GeoIndex::new();
-        let region = DsfRegion::new(50, 9);
-
-        // Insert InProgress with a timestamp that will be stale immediately
-        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
-
-        // Use a zero timeout so that any InProgress region is immediately stale
-        let removed = BoundaryStrategy::sweep_stale_regions(&geo_index, Duration::ZERO);
-        assert_eq!(removed, 1);
-        assert!(!geo_index.contains::<PrefetchedRegion>(&region));
-    }
-
-    #[test]
-    fn test_sweep_keeps_fresh_regions() {
-        use std::time::Duration;
-
-        let geo_index = GeoIndex::new();
-        let region = DsfRegion::new(50, 9);
-
-        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
-
-        // Use a very long timeout — region should not be stale
-        let removed = BoundaryStrategy::sweep_stale_regions(&geo_index, Duration::from_secs(3600));
-        assert_eq!(removed, 0);
-        assert!(geo_index.contains::<PrefetchedRegion>(&region));
-    }
-
-    #[test]
-    fn test_sweep_keeps_prefetched_regions() {
-        use std::time::Duration;
-
-        let geo_index = GeoIndex::new();
-        let region = DsfRegion::new(50, 9);
-
-        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
-
-        // Even with zero timeout, Prefetched regions are never stale
-        let removed = BoundaryStrategy::sweep_stale_regions(&geo_index, Duration::ZERO);
-        assert_eq!(removed, 0);
-        assert!(geo_index.contains::<PrefetchedRegion>(&region));
-    }
-
-    // =========================================================================
     // Region promotion
     // =========================================================================
 
@@ -341,8 +267,8 @@ mod tests {
     #[test]
     fn test_promote_completed_regions() {
         // #176: promotion has no geometric fallback — it needs a
-        // SceneryIndex to know the region's tile set. Wire a minimal
-        // single-tile index rather than relying on `expand_to_tiles`.
+        // SceneryIndex to know the region's tile set, so wire a minimal
+        // single-tile index.
         let geo_index = GeoIndex::new();
         let region = DsfRegion::new(50, 9);
 

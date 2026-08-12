@@ -218,9 +218,14 @@ mod tests {
     #[test]
     fn test_prefetched_region_staleness_timeout() {
         use std::time::Duration;
-        let state = PrefetchedRegion::in_progress();
         // Fresh InProgress should not be stale
-        assert!(!state.is_stale(Duration::from_secs(120)));
+        assert!(!PrefetchedRegion::in_progress().is_stale(Duration::from_secs(120)));
+        // ...but an elapsed timeout makes it stale. A zero timeout is
+        // immediately elapsed.
+        assert!(PrefetchedRegion::in_progress().is_stale(Duration::ZERO));
+        // Terminal states never expire, however long the wait.
+        assert!(!PrefetchedRegion::prefetched().is_stale(Duration::ZERO));
+        assert!(!PrefetchedRegion::no_coverage().is_stale(Duration::ZERO));
     }
 
     #[test]

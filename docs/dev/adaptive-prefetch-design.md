@@ -250,6 +250,18 @@ This follows a **two-phase commit** pattern:
 2. **Confirm**: Region marked `Prefetched` when tiles are confirmed in cache
 3. **Timeout**: If `InProgress` exceeds `stale_region_timeout`, reverts to *absent* for re-evaluation
 
+A region can reach step 1 without submitting anything. When the filter
+pipeline removes a region's *entire* planned tile set as already cached, there
+is no submission for the mark-after-submit rule to hang off — and if that is
+true of every region in the plan, the plan is empty and the submit path is
+skipped outright. Such regions are marked `InProgress` at the end of
+filtering, so step 2's disk-verified check confirms them on the maintenance
+pass. Without this they stayed *absent*, re-entered the target diff every 2s
+cycle, and could never return to `Prefetched` — which under-reported
+`regions_prefetched` in the 60s sample. Patch-owned regions are excluded:
+their tiles filter out in full too, but prefetch never places them on the DDS
+disk, so `InProgress` would be a claim nothing could confirm.
+
 ### Region Tile-Set SSOT
 
 `SceneryIndex::tiles_in_region(region)` is the single definition of "which DDS
@@ -281,6 +293,13 @@ NoCoverage ──┘        (region re-enters the prefetch cycle)
 still running — and cache hits are exempt, since serving from cache is the
 system working, not a divergence.
 
+Re-entering the prefetch cycle only *repairs* two of the three causes. The
+scenery index is immutable for the life of the process, so where the cause is
+an index gap the next cycle re-derives the same empty tile set and re-marks
+the region `NoCoverage`. The loop is bounded and safe, but for that cause the
+observer flags the gap and nothing more — do not read a repeating
+`state_diverged` in one region as a repair in progress.
+
 Every divergence is counted and reported via
 `MetricsClient::prefetch_state_diverged()`, but the region is only cleared
 (and `MetricsClient::prefetch_region_demoted()` fired) at most once per region
@@ -289,8 +308,10 @@ unbounded demote → re-prefetch → evict loop would churn on a long flight; th
 rate limit exists so the diagnostic doesn't become the noise it's meant to
 surface.
 
-The daemon aggregates both counters as cumulative totals since process start
-and logs them on the same 60s cadence as the memory sample:
+The daemon aggregates both counters and logs them on the same 60s cadence as
+the memory sample. They are cumulative totals since process start, because
+`AggregatedState::reset()` — which does zero them — has no production caller;
+wire it up and these become totals since the last reset:
 
 ```
 INFO Prefetch sample uptime_s=... regions_in_progress=... regions_prefetched=...
@@ -605,7 +626,15 @@ pub enum BoundaryAxis {
 }
 ```
 
-### Algorithm
+### Algorithm (historical — superseded)
+
+> **This block describes the boundary-monitor design and no longer matches the
+> code.** `BoundaryCrossing` and its monitors were deleted in PR #102, which
+> replaced them with the sliding `PrefetchBox` described above; step 4a's
+> SceneTracker history is a write-only field; and step 4c's geometric fallback
+> was removed in #176 — see *Region Tile-Set SSOT*, which is now the only
+> definition of a region's tile set. It is kept for the reasoning about
+> asymmetric load depth in step 1, which the measurements still support.
 
 ```
 Input:  Vec<BoundaryCrossing> from SceneryWindow (sorted by urgency)
@@ -640,9 +669,8 @@ For each BoundaryCrossing:
        Absent → include
 
     4. For each remaining DSF region, get DDS tiles:
-       a. SceneTracker history (most accurate — matches X-Plane's zoom/coverage)
-       b. SceneryIndex query (for unseen regions)
-       c. Fallback 4×4 grid at zoom 14 (last resort)
+       SceneryIndex::tiles_in_region — the only source; a region the index
+       knows nothing about yields no tiles and is marked NoCoverage
 
     5. Apply four-tier filter:
        Local tracking → Memory cache → Patch exclusion → Disk existence

@@ -208,6 +208,7 @@ impl std::fmt::Debug for AdaptivePrefetchCoordinator {
             .field("config.mode", &self.config.mode)
             .field("has_calibration", &self.calibration.is_some())
             .field("has_dds_client", &self.dds_client.is_some())
+            .field("has_metrics_client", &self.metrics_client.is_some())
             .field("cached_tiles_count", &self.cached_tiles.len())
             .field("status", &self.status)
             .finish()

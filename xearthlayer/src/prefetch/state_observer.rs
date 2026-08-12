@@ -5,6 +5,12 @@
 //! this — a gap in the scenery index, a premature promotion, or eviction of
 //! the tile after promotion — and the response is the same for all three:
 //! clear the state so the region is re-prefetched. See #176.
+//!
+//! Re-prefetching only *repairs* the last two. The scenery index is immutable
+//! for the life of the process, so for an index gap the next cycle re-derives
+//! the same empty tile set and re-marks the region `NoCoverage`. The loop is
+//! bounded and safe, but for that cause the observer can only flag the gap in
+//! the log and metrics — never fix it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
