@@ -67,7 +67,8 @@ pub use types::{InputMode, PrefetchTile, PrefetchZone, TurnDirection, TurnState}
 
 // Scenery-aware prefetch
 pub use scenery_index::{
-    IndexingProgress, SceneryIndex, SceneryIndexConfig, SceneryIndexError, SceneryTile,
+    IndexingProgress, PackageIndexStats, SceneryIndex, SceneryIndexConfig, SceneryIndexError,
+    SceneryTile,
 };
 
 // Cold-start prewarm

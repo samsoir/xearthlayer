@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
-use tracing::{debug, info, trace};
+use tracing::{debug, info};
 
 use crate::coord::TileCoord;
 use crate::geo_index::DsfRegion;
@@ -139,7 +139,10 @@ impl SceneryIndex {
     /// Build the index by scanning a scenery package directory.
     ///
     /// Parses all `.ter` files in the `terrain` subdirectory.
-    pub fn build_from_package(&self, package_path: &Path) -> Result<usize, SceneryIndexError> {
+    pub fn build_from_package(
+        &self,
+        package_path: &Path,
+    ) -> Result<PackageIndexStats, SceneryIndexError> {
         debug!(
             package = %package_path.display(),
             "Building scenery index from package"
@@ -161,7 +164,10 @@ impl SceneryIndex {
             "Found terrain directory"
         );
 
-        let mut count = 0;
+        let mut stats = PackageIndexStats::default();
+        let mut failure_samples: Vec<String> = Vec::new();
+        const MAX_FAILURE_SAMPLES: usize = 5;
+
         let entries =
             fs::read_dir(&terrain_path).map_err(|e| SceneryIndexError::IoError(e.to_string()))?;
 
@@ -169,21 +175,39 @@ impl SceneryIndex {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "ter") {
                 match self.parse_and_add_ter_file(&path) {
-                    Ok(()) => count += 1,
+                    Ok(()) => stats.parsed += 1,
                     Err(e) => {
-                        trace!(path = %path.display(), error = %e, "Failed to parse .ter file");
+                        stats.failed += 1;
+                        // Per-file stays at debug: a wholesale-malformed
+                        // package would emit millions of lines at warn.
+                        // The aggregate below is the visible signal.
+                        debug!(path = %path.display(), error = %e, "Failed to parse .ter file");
+                        if failure_samples.len() < MAX_FAILURE_SAMPLES {
+                            failure_samples.push(path.display().to_string());
+                        }
                     }
                 }
             }
         }
 
+        if stats.failed > 0 {
+            tracing::warn!(
+                package = %package_path.display(),
+                failed = stats.failed,
+                parsed = stats.parsed,
+                samples = ?failure_samples,
+                "Scenery index: .ter files failed to parse — prefetch may under-cover this package"
+            );
+        }
+
         info!(
             package = %package_path.display(),
-            tiles = count,
+            tiles = stats.parsed,
+            failed = stats.failed,
             "Built scenery index"
         );
 
-        Ok(count)
+        Ok(stats)
     }
 
     /// Parse a single .ter file and add it to the index.
@@ -435,6 +459,7 @@ impl SceneryIndex {
         use tokio::time::interval;
 
         let total_packages = packages.len();
+        let mut total_failed = 0usize;
 
         for (i, (name, path)) in packages.into_iter().enumerate() {
             // Send PackageStarted notification
@@ -484,7 +509,10 @@ impl SceneryIndex {
 
             // Get the tile count from the result
             let tiles = match result {
-                Ok(Ok(count)) => count,
+                Ok(Ok(stats)) => {
+                    total_failed += stats.failed;
+                    stats.parsed
+                }
                 Ok(Err(e)) => {
                     tracing::warn!(
                         package = %name_clone,
@@ -522,6 +550,7 @@ impl SceneryIndex {
             total = total,
             land = land,
             sea = sea,
+            failed = total_failed,
             "Scenery index build complete"
         );
     }
@@ -645,6 +674,32 @@ fn approximate_distance_nm(lat1: f32, lon1: f32, lat2: f32, lon2: f32) -> f32 {
     let lat_diff = (lat2 - lat1) * 60.0; // 1 degree = 60nm
     let lon_diff = (lon2 - lon1) * 60.0 * (lat1.to_radians().cos());
     (lat_diff * lat_diff + lon_diff * lon_diff).sqrt()
+}
+
+/// Parse outcome for one scenery package.
+///
+/// `failed` is the count of `.ter` files present on disk that did not yield a
+/// tile. The measured baseline across 4.45M files on a full 11-package install
+/// is zero, so any non-zero value is anomalous — see #176.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PackageIndexStats {
+    /// Files that parsed into an indexed tile.
+    ///
+    /// Note: this counts files that parsed successfully, not tiles added.
+    /// `parse_and_add_ter_file` returns `Ok(())` for a sea tile that was
+    /// skipped because `include_sea_tiles` is false, so `parsed` can exceed
+    /// `SceneryIndex::tile_count()`. That is still the correct denominator
+    /// for a parse-health metric: it counts files on disk, not tiles kept.
+    pub parsed: usize,
+    /// Files that failed to parse.
+    pub failed: usize,
+}
+
+impl PackageIndexStats {
+    /// Total `.ter` files seen.
+    pub fn total(&self) -> usize {
+        self.parsed + self.failed
+    }
 }
 
 /// Errors that can occur when building the scenery index.
@@ -975,6 +1030,53 @@ mod tests {
         );
     }
 
+    /// Write a minimal valid .ter file that parses into one tile.
+    fn write_valid_ter(dir: &std::path::Path, name: &str) {
+        let body = "A\n800\nTERRAIN\n\n\
+                    LOAD_CENTER 33.50000 -118.50000 1744 4096\n\
+                    BASE_TEX_NOWRAP ../textures/25328_49904_BI16.dds\n";
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn test_build_from_package_counts_parse_failures() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let terrain = tmp.path().join("terrain");
+        std::fs::create_dir_all(&terrain).unwrap();
+
+        write_valid_ter(&terrain, "good_a.ter");
+        write_valid_ter(&terrain, "good_b.ter");
+        // No LOAD_CENTER and no BASE_TEX: parse must fail.
+        std::fs::write(terrain.join("bad.ter"), "A\n800\nTERRAIN\n").unwrap();
+        // Not a .ter file: must not be counted at all.
+        std::fs::write(terrain.join("notes.txt"), "ignored").unwrap();
+
+        let index = SceneryIndex::with_defaults();
+        let stats = index.build_from_package(tmp.path()).unwrap();
+
+        assert_eq!(stats.parsed, 2);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(index.tile_count(), 2);
+    }
+
+    #[test]
+    fn test_build_from_package_reports_zero_failures_when_all_parse() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let terrain = tmp.path().join("terrain");
+        std::fs::create_dir_all(&terrain).unwrap();
+        write_valid_ter(&terrain, "a.ter");
+        write_valid_ter(&terrain, "b.ter");
+
+        let index = SceneryIndex::with_defaults();
+        let stats = index.build_from_package(tmp.path()).unwrap();
+
+        assert_eq!(
+            stats.failed, 0,
+            "the measured baseline across 4.45M real files is zero"
+        );
+        assert_eq!(stats.parsed, 2);
+    }
+
     /// Integration test with real scenery package.
     /// Run with: cargo test scenery_index --features integration -- --ignored
     #[test]
@@ -990,15 +1092,16 @@ mod tests {
         }
 
         let index = SceneryIndex::with_defaults();
-        let count = index
+        let stats = index
             .build_from_package(path)
             .expect("Failed to build index");
+        let count = stats.parsed;
 
         // Should find many tiles
         assert!(count > 1000, "Expected > 1000 tiles, found {}", count);
 
         // Print some statistics
-        eprintln!("Indexed {} tiles", count);
+        eprintln!("Indexed {} tiles ({} failed)", count, stats.failed);
         eprintln!("  Land tiles: {}", index.land_tile_count());
         eprintln!("  Sea tiles: {}", index.sea_tile_count());
 

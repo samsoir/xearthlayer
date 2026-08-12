@@ -384,11 +384,12 @@ impl ServiceOrchestrator {
             }
 
             match index.build_from_package(path) {
-                Ok(count) => {
-                    total_tiles += count;
+                Ok(stats) => {
+                    total_tiles += stats.parsed;
                     tracing::debug!(
                         region = %region,
-                        tiles = count,
+                        tiles = stats.parsed,
+                        failed = stats.failed,
                         "Indexed scenery package"
                     );
                 }
