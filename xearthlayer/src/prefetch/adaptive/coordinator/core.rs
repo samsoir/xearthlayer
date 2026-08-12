@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::coord::TileCoord;
 use crate::executor::{DaemonMemoryCache, DdsClient, DdsDiskCacheChecker};
+use crate::metrics::MetricsClient;
 
 /// Maximum demotion attempts before marking a region as NoCoverage.
 const MAX_REGION_ATTEMPTS: u8 = 3;
@@ -191,6 +192,13 @@ pub struct AdaptivePrefetchCoordinator {
     ///
     /// Cleared after each [`execute()`] call (per-plan transient state).
     pub(super) current_plan_regions: std::collections::HashMap<TileCoord, DsfRegion>,
+
+    /// Metrics client for prefetch telemetry (#176).
+    ///
+    /// When set, `run_region_maintenance` reports the region-state
+    /// distribution each cycle so a default-level flight log carries the
+    /// 60s "Prefetch sample" line without needing `--debug`.
+    metrics_client: Option<MetricsClient>,
 }
 
 impl std::fmt::Debug for AdaptivePrefetchCoordinator {
@@ -240,6 +248,7 @@ impl AdaptivePrefetchCoordinator {
             dds_disk_checker: None,
             region_attempts: std::collections::HashMap::new(),
             current_plan_regions: std::collections::HashMap::new(),
+            metrics_client: None,
         }
     }
 
@@ -281,6 +290,12 @@ impl AdaptivePrefetchCoordinator {
     /// to discover actual installed zoom levels rather than assuming zoom 14.
     pub fn with_scenery_index(mut self, index: Arc<SceneryIndex>) -> Self {
         self.scenery_index = Some(index);
+        self
+    }
+
+    /// Attach a metrics client for prefetch telemetry.
+    pub fn with_metrics_client(mut self, client: MetricsClient) -> Self {
+        self.metrics_client = Some(client);
         self
     }
 
@@ -1009,6 +1024,10 @@ impl AdaptivePrefetchCoordinator {
             regions_nocoverage = no_coverage,
             "Region maintenance: state distribution"
         );
+
+        if let Some(ref metrics) = self.metrics_client {
+            metrics.prefetch_region_state(in_progress, prefetched, no_coverage);
+        }
     }
 
     /// Evaluate stale InProgress regions and decide: promote, demote, or NoCoverage.

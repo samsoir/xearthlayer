@@ -363,6 +363,32 @@ impl MetricsClient {
     pub fn fuse_request_dequeued(&self) {
         self.send(MetricEvent::FuseRequestDequeued);
     }
+
+    // =========================================================================
+    // Prefetch Region State Events
+    // =========================================================================
+
+    /// Reports the current region-state distribution (gauge).
+    #[inline]
+    pub fn prefetch_region_state(&self, in_progress: usize, prefetched: usize, no_coverage: usize) {
+        self.send(MetricEvent::PrefetchRegionState {
+            in_progress,
+            prefetched,
+            no_coverage,
+        });
+    }
+
+    /// Records an observed divergence between prefetch state and reality.
+    #[inline]
+    pub fn prefetch_state_diverged(&self) {
+        self.send(MetricEvent::PrefetchStateDiverged);
+    }
+
+    /// Records a region demoted in response to divergence.
+    #[inline]
+    pub fn prefetch_region_demoted(&self) {
+        self.send(MetricEvent::PrefetchRegionDemoted);
+    }
 }
 
 impl std::fmt::Debug for MetricsClient {

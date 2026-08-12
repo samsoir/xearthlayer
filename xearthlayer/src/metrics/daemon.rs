@@ -163,6 +163,7 @@ impl MetricsDaemon {
                 // Sample process memory
                 _ = memory_interval.tick() => {
                     self.log_memory_sample();
+                    self.log_prefetch_sample();
                 }
             }
         }
@@ -326,6 +327,26 @@ impl MetricsDaemon {
                 self.state.fuse_requests_waiting =
                     self.state.fuse_requests_waiting.saturating_sub(1);
             }
+
+            // Prefetch region state events (#176)
+            MetricEvent::PrefetchRegionState {
+                in_progress,
+                prefetched,
+                no_coverage,
+            } => {
+                // Gauge: assigns, does not increment. The coordinator reports
+                // the full distribution each maintenance cycle, so the latest
+                // event is always the authoritative value.
+                self.state.prefetch_regions_in_progress = in_progress;
+                self.state.prefetch_regions_prefetched = prefetched;
+                self.state.prefetch_regions_nocoverage = no_coverage;
+            }
+            MetricEvent::PrefetchStateDiverged => {
+                self.state.prefetch_state_diverged += 1;
+            }
+            MetricEvent::PrefetchRegionDemoted => {
+                self.state.prefetch_regions_demoted += 1;
+            }
         }
     }
 
@@ -383,6 +404,25 @@ impl MetricsDaemon {
             // doc comment in metrics/event.rs for why that was a diagnosis hole).
             mem_cache_writes_active = state.mem_cache_writes_active,
             "Memory sample"
+        );
+    }
+
+    /// Emit the periodic prefetch-state line.
+    ///
+    /// Runs on the same 60s cadence as the memory sample. The per-cycle
+    /// distribution stays at `debug!` in the coordinator; this exists so a
+    /// default-level flight log is enough to judge the #176 acceptance
+    /// criteria without running an entire flight at `--debug`.
+    fn log_prefetch_sample(&self) {
+        let state = &self.state;
+        tracing::info!(
+            uptime_s = state.uptime().as_secs(),
+            regions_in_progress = state.prefetch_regions_in_progress,
+            regions_prefetched = state.prefetch_regions_prefetched,
+            regions_nocoverage = state.prefetch_regions_nocoverage,
+            state_diverged = state.prefetch_state_diverged,
+            regions_demoted = state.prefetch_regions_demoted,
+            "Prefetch sample"
         );
     }
 
@@ -454,6 +494,7 @@ impl std::fmt::Debug for MetricsDaemon {
 
 #[cfg(test)]
 mod tests {
+    use super::super::client::MetricsClient;
     use super::*;
 
     fn create_daemon() -> (MetricsDaemon, mpsc::UnboundedSender<MetricEvent>) {
@@ -1061,6 +1102,87 @@ mod tests {
             daemon.state.disk_writes_active, 0,
             "dds completion must decrement too"
         );
+    }
+
+    // =========================================================================
+    // Prefetch sample tests (#176)
+    //
+    // Region-state counters are a gauge (assigned wholesale each maintenance
+    // cycle); divergence/demotion counters accumulate. Mixing up assign vs.
+    // increment for the gauge would produce a plausible-looking but
+    // monotonically-growing region count.
+    // =========================================================================
+
+    /// Finds the first captured event whose message is "Prefetch sample".
+    fn find_prefetch_sample(
+        events: &[std::collections::HashMap<String, String>],
+    ) -> Option<&std::collections::HashMap<String, String>> {
+        events
+            .iter()
+            .find(|fields| fields.get("message").map(String::as_str) == Some("Prefetch sample"))
+    }
+
+    #[test]
+    fn test_prefetch_sample_reports_divergence_and_region_state() {
+        let (mut daemon, tx) = create_daemon();
+        let client = MetricsClient::new(tx);
+
+        client.prefetch_region_state(3, 7, 2);
+        client.prefetch_state_diverged();
+        client.prefetch_state_diverged();
+        client.prefetch_region_demoted();
+
+        // The daemon's event loop isn't running in this unit test, so drain
+        // the channel into the daemon's state directly before sampling.
+        while let Ok(event) = daemon.rx.try_recv() {
+            daemon.process_event(event);
+        }
+
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        let sample =
+            find_prefetch_sample(&events).expect("log_prefetch_sample must emit a sample line");
+
+        assert_eq!(
+            sample.get("regions_in_progress").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            sample.get("regions_prefetched").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            sample.get("regions_nocoverage").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(sample.get("state_diverged").map(String::as_str), Some("2"));
+        assert_eq!(sample.get("regions_demoted").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn test_prefetch_region_state_is_a_gauge_not_a_counter() {
+        // Regression guard: a second PrefetchRegionState event must replace
+        // the previous values, not add to them. If this were mistakenly
+        // implemented as an increment, region counts would grow without
+        // bound across maintenance cycles.
+        let (mut daemon, _tx) = create_daemon();
+
+        daemon.process_event(MetricEvent::PrefetchRegionState {
+            in_progress: 5,
+            prefetched: 10,
+            no_coverage: 1,
+        });
+        assert_eq!(daemon.state.prefetch_regions_in_progress, 5);
+        assert_eq!(daemon.state.prefetch_regions_prefetched, 10);
+        assert_eq!(daemon.state.prefetch_regions_nocoverage, 1);
+
+        daemon.process_event(MetricEvent::PrefetchRegionState {
+            in_progress: 2,
+            prefetched: 3,
+            no_coverage: 0,
+        });
+        assert_eq!(daemon.state.prefetch_regions_in_progress, 2);
+        assert_eq!(daemon.state.prefetch_regions_prefetched, 3);
+        assert_eq!(daemon.state.prefetch_regions_nocoverage, 0);
     }
 
     #[tokio::test]

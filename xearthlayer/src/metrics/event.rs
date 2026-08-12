@@ -225,6 +225,31 @@ pub enum MetricEvent {
 
     /// A FUSE request was removed from the wait queue.
     FuseRequestDequeued,
+
+    // =========================================================================
+    // Prefetch Region State Events (#176)
+    // =========================================================================
+    /// Current region-state distribution, reported each maintenance cycle.
+    ///
+    /// This is a gauge, not a counter: each event replaces the previous values.
+    PrefetchRegionState {
+        /// Regions with tiles submitted, awaiting confirmation.
+        in_progress: usize,
+        /// Regions confirmed fully cached.
+        prefetched: usize,
+        /// Regions with no ortho scenery.
+        no_coverage: usize,
+    },
+
+    /// FUSE generated a tile in a region prefetch claimed was handled.
+    ///
+    /// Counted on every occurrence, including those where the rate limit
+    /// suppressed the demotion — so the metric shows the true divergence
+    /// rate rather than the demotion rate.
+    PrefetchStateDiverged,
+
+    /// A region's state was cleared in response to observed divergence.
+    PrefetchRegionDemoted,
 }
 
 impl MetricEvent {
@@ -264,6 +289,9 @@ impl MetricEvent {
             Self::FuseRequestCompleted => "fuse_request_completed",
             Self::FuseRequestQueued => "fuse_request_queued",
             Self::FuseRequestDequeued => "fuse_request_dequeued",
+            Self::PrefetchRegionState { .. } => "prefetch_region_state",
+            Self::PrefetchStateDiverged => "prefetch_state_diverged",
+            Self::PrefetchRegionDemoted => "prefetch_region_demoted",
         }
     }
 }
