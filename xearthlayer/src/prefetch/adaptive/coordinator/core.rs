@@ -332,15 +332,16 @@ impl AdaptivePrefetchCoordinator {
         self
     }
 
-    /// Get DDS tiles for a DSF region from the scenery index or geometric fallback.
+    /// Get DDS tiles for a DSF region from the scenery index.
     ///
     /// If a scenery index is available, queries it for tiles in the region.
     /// This returns tiles at whatever zoom levels are actually installed in the
     /// X-Plane scenery (e.g., ZL12 at cruise altitude), rather than assuming
     /// a fixed zoom level.
     ///
-    /// Falls back to the boundary strategy's geometric 4x4 grid expansion at
-    /// zoom 14 when no scenery index is available or has no tiles for the region.
+    /// There is no geometric fallback (#176): when no scenery index is
+    /// configured, or the index has no tiles for the region, this returns
+    /// empty and the caller marks the region NoCoverage.
     fn get_tiles_for_region(&self, region: &DsfRegion) -> Vec<TileCoord> {
         match self.scenery_index {
             // An empty result means the index knows of no ortho scenery
@@ -1849,6 +1850,11 @@ mod tests {
         // Regression for #176 defect 2. The rescue path sampled tiles.first()
         // and promoted the whole region on that single hit, which is how 61 of
         // 65 promotions were decided in the #172 LOWW log.
+        //
+        // Note: the `row`/`col` values in the `SceneryTile` fixtures in this
+        // test (and its positive counterpart below) are arbitrary and not
+        // geographically consistent with their `lat`/`lon` — only `lat`/`lon`
+        // drive region membership in `tiles_in_region`.
         use crate::prefetch::scenery_index::SceneryTile;
 
         let index = Arc::new(SceneryIndex::with_defaults());
@@ -1880,6 +1886,19 @@ mod tests {
             zoom: 12,
         }]);
 
+        // Precondition: the rescue path must actually be looking at the
+        // region's real tile set (2 tiles), not silently falling through to
+        // an empty result. Without this guard, gutting the rescue path's
+        // tile lookup to `Vec::new()` would make `tiles_on_disk` fall
+        // through to the `_ => false` arm, the region would demote instead
+        // of promote, and the assertion below would still pass — proving
+        // nothing about whether the real tile set was consulted.
+        assert_eq!(
+            index.tiles_in_region(region).len(),
+            2,
+            "Precondition: index must expose both region tiles for this test to be meaningful"
+        );
+
         let mut coord = AdaptivePrefetchCoordinator::with_defaults()
             .with_scenery_index(Arc::clone(&index))
             .with_geo_index(Arc::clone(&geo_index))
@@ -1892,6 +1911,71 @@ mod tests {
         assert!(
             state.is_none_or(|s| !s.is_prefetched()),
             "partial coverage must not be promoted by the rescue path"
+        );
+    }
+
+    #[test]
+    fn test_stale_rescue_promotes_when_full_coverage_on_disk() {
+        // Positive counterpart to `test_stale_rescue_requires_full_coverage_not_one_tile`.
+        // The rescue promote branch (evaluate_stale_regions, tiles_on_disk == true)
+        // had no positive test anywhere in the suite — only the demotion path was
+        // covered. Same fixture, but both tiles are present in the checker this time.
+        use crate::prefetch::scenery_index::SceneryTile;
+
+        let index = Arc::new(SceneryIndex::with_defaults());
+        index.add_tile(SceneryTile {
+            row: 1000,
+            col: 2000,
+            chunk_zoom: 16,
+            lat: 33.5,
+            lon: -118.5,
+            is_sea: false,
+        });
+        index.add_tile(SceneryTile {
+            row: 5000,
+            col: 6000,
+            chunk_zoom: 16,
+            lat: 33.7,
+            lon: -118.2,
+            is_sea: false,
+        });
+
+        let region = DsfRegion::new(33, -119);
+        let geo_index = Arc::new(GeoIndex::new());
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+
+        // Both tiles are on disk this time.
+        let checker = test_checker(&[
+            TileCoord {
+                row: 1000 / 16,
+                col: 2000 / 16,
+                zoom: 12,
+            },
+            TileCoord {
+                row: 5000 / 16,
+                col: 6000 / 16,
+                zoom: 12,
+            },
+        ]);
+
+        assert_eq!(
+            index.tiles_in_region(region).len(),
+            2,
+            "Precondition: index must expose both region tiles for this test to be meaningful"
+        );
+
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_scenery_index(Arc::clone(&index))
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_disk_checker(checker);
+        coord.config.stale_region_timeout = std::time::Duration::ZERO; // everything is stale
+
+        coord.run_region_maintenance();
+
+        let state = geo_index.get::<PrefetchedRegion>(&region);
+        assert!(
+            state.is_some_and(|s| s.is_prefetched()),
+            "full coverage on disk must be promoted by the rescue path"
         );
     }
 
@@ -2607,11 +2691,12 @@ mod tests {
         let plan = plan.unwrap();
 
         // Box at (48, 15) heading 270° with default extent covers dozens
-        // of DSF regions. With ~16 tiles per region (geometric fallback),
-        // plan size should be in the hundreds — clearly above the 5-cap
-        // the old code would have imposed. The exact number depends on
-        // box extent & region tile count; assert ">> 5" to prove the
-        // cap is not being applied.
+        // of DSF regions. With ~16 tiles per region (the 4x4 sample density
+        // of the wired `wide_scenery_index_at_48_15` fixture), plan size
+        // should be in the hundreds — clearly above the 5-cap the old code
+        // would have imposed. The exact number depends on box extent &
+        // region tile count; assert ">> 5" to prove the cap is not being
+        // applied.
         assert!(
             plan.tiles.len() > 20,
             "Plan must contain many more than max_tiles_per_cycle=5 tiles — \
@@ -2833,6 +2918,15 @@ mod tests {
             count_in_progress_regions(&geo_index),
             0,
             "No regions should be marked InProgress when the entire plan is deferred",
+        );
+        // Prove a real plan existed rather than `submitted == 0` and
+        // `in_progress == 0` both being trivially true of an empty plan
+        // (e.g. if the scenery index wiring silently broke). HighLoadDdsClient
+        // stores the whole deferred plan as pending, so a non-empty
+        // `pending_tiles` is direct evidence tiles were actually planned.
+        assert!(
+            !coord.pending_tiles.is_empty(),
+            "A real plan must have been generated and deferred, not an empty one"
         );
     }
 

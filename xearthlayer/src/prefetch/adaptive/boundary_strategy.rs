@@ -100,14 +100,16 @@ impl BoundaryStrategy {
     /// Check InProgress regions and promote to Prefetched if all tiles are
     /// present in the authoritative DDS disk cache.
     ///
-    /// For each InProgress region, expands it to DDS tiles via
-    /// `tiles_for_region` (using the scenery index when available) and
-    /// queries the `DdsDiskCacheChecker` for each tile. A region is
-    /// promoted to `Prefetched` only when **every** one of its tiles
-    /// is present on disk (check-all with short-circuit on first miss).
+    /// For each InProgress region, looks up its tile set via
+    /// `SceneryIndex::tiles_in_region` — the single definition of "what
+    /// tiles belong to this region" shared with the submit and rescue
+    /// paths (#176) — and queries the `DdsDiskCacheChecker` for each tile.
+    /// A region is promoted to `Prefetched` only when **every** one of its
+    /// tiles is present on disk (check-all with short-circuit on first miss).
     ///
-    /// If `dds_disk_checker` is `None`, promotion is skipped — there is
-    /// no source of truth to consult. The rescue path
+    /// If either `dds_disk_checker` or `scenery_index` is `None`, promotion
+    /// is skipped — there is no authoritative source to consult, or no way
+    /// to know which tiles the region should contain. The rescue path
     /// (`evaluate_stale_regions`) will still fire for stale regions.
     ///
     /// See #172 Part 3: the prior version consulted a `cached_tiles`
@@ -645,6 +647,12 @@ mod tests {
     // =========================================================================
     // Region tile-set SSOT regression tests (#176)
     // =========================================================================
+    //
+    // Note: the `row`/`col` values in the `SceneryTile` fixtures below are
+    // arbitrary and not geographically consistent with their `lat`/`lon` —
+    // only `lat`/`lon` drive region membership in `tiles_in_region`. `row`/`col`
+    // just need to be distinct per tile so dedup/coverage assertions are
+    // meaningful.
 
     use crate::prefetch::scenery_index::SceneryTile;
 
