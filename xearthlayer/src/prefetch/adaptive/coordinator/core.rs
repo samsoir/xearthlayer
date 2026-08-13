@@ -1155,6 +1155,19 @@ impl AdaptivePrefetchCoordinator {
                             "Region marked NoCoverage after {} failed attempts",
                             MAX_REGION_ATTEMPTS
                         );
+                        // Clear the strike count for the retired episode,
+                        // mirroring both promotion arms above. Without this,
+                        // a region the observer later demotes out of
+                        // NoCoverage (see `state_observer.rs::observe`) would
+                        // re-enter the prefetch cycle still carrying the old
+                        // count, so one single fresh failure would re-hit
+                        // `>= MAX_REGION_ATTEMPTS` and re-retire it instantly
+                        // — zero real retries. Clearing here gives a demoted
+                        // region a fresh set of `MAX_REGION_ATTEMPTS` strikes
+                        // each time it's demoted; the observer's per-region
+                        // demotion rate limit (one per `demotion_interval`)
+                        // is what bounds that loop, not this counter.
+                        self.region_attempts.remove(&region);
                     } else {
                         // Remove from GeoIndex to allow retry on next cycle.
                         //
@@ -2200,6 +2213,69 @@ mod tests {
                 .map(|s| !s.is_no_coverage())
                 .unwrap_or(true),
             "one fresh failure after a successful promotion must not retire the region"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_demoted_no_coverage_region_gets_fresh_strikes_after_retirement() {
+        // Regression for #223 Finding B: strike counts were cleared on both
+        // promotion paths but never on retirement to NoCoverage. A region
+        // demoted out of NoCoverage by `PrefetchStateObserver` (simulated
+        // here by removing its GeoIndex entry, exactly as the observer
+        // does — see `state_observer.rs::observe`) re-entered the prefetch
+        // cycle still carrying its old strike count, so a single fresh
+        // failure retired it again immediately: zero real retries.
+        let index = make_scenery_index(50, 9, 16);
+        let region = DsfRegion::new(50, 9);
+        assert!(
+            !index.tiles_in_region(region).is_empty(),
+            "Precondition: region has indexed tiles (land, not ocean) so the \
+             strike path is reachable — ocean regions take tiles.is_empty() \
+             and never touch region_attempts"
+        );
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let empty_checker: Arc<dyn DdsDiskCacheChecker> =
+            MockDiskChecker::with_tile_coords(std::iter::empty::<TileCoord>());
+
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_scenery_index(Arc::clone(&index))
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_disk_checker(Arc::clone(&empty_checker));
+        coord.config.stale_region_timeout = std::time::Duration::ZERO;
+
+        // Retire the region by strikes: MAX_REGION_ATTEMPTS consecutive
+        // stale failures (Incomplete: indexed tiles exist, none on disk).
+        for _ in 0..MAX_REGION_ATTEMPTS {
+            geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+            coord.evaluate_stale_regions(&geo_index);
+        }
+        assert!(
+            geo_index
+                .get::<PrefetchedRegion>(&region)
+                .is_some_and(|s| s.is_no_coverage()),
+            "Precondition: region retired to NoCoverage by strikes"
+        );
+
+        // The observer demotes a NoCoverage region it sees contradicted by
+        // an on-demand FUSE generation — it clears the GeoIndex claim only
+        // (`PrefetchStateObserver::observe` -> `geo_index.remove`).
+        geo_index.remove::<PrefetchedRegion>(&region);
+
+        // The region is re-planned and marked InProgress again.
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+
+        // One single fresh stale failure.
+        coord.evaluate_stale_regions(&geo_index);
+
+        assert!(
+            geo_index
+                .get::<PrefetchedRegion>(&region)
+                .map(|s| !s.is_no_coverage())
+                .unwrap_or(true),
+            "one fresh failure after an observer-driven demotion must not \
+             immediately re-retire the region — it should get a fresh set \
+             of MAX_REGION_ATTEMPTS strikes"
         );
     }
 
