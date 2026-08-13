@@ -2369,6 +2369,79 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_run_region_maintenance_emits_region_state_gauge() {
+        use crate::metrics::MetricEvent;
+
+        let geo_index = Arc::new(GeoIndex::new());
+
+        // Seed 1 InProgress, 2 Prefetched, 3 NoCoverage — deliberately
+        // distinct counts. With equal counts an argument swap at the
+        // `metrics.prefetch_region_state(...)` call site, or a swap of the
+        // `is_in_progress`/`is_prefetched` fold arms, would be undetectable.
+        geo_index
+            .insert::<PrefetchedRegion>(DsfRegion::new(10, 10), PrefetchedRegion::in_progress());
+        geo_index
+            .insert::<PrefetchedRegion>(DsfRegion::new(20, 20), PrefetchedRegion::prefetched());
+        geo_index
+            .insert::<PrefetchedRegion>(DsfRegion::new(21, 20), PrefetchedRegion::prefetched());
+        geo_index
+            .insert::<PrefetchedRegion>(DsfRegion::new(30, 30), PrefetchedRegion::no_coverage());
+        geo_index
+            .insert::<PrefetchedRegion>(DsfRegion::new(31, 30), PrefetchedRegion::no_coverage());
+        geo_index
+            .insert::<PrefetchedRegion>(DsfRegion::new(32, 30), PrefetchedRegion::no_coverage());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let metrics = MetricsClient::new(tx);
+
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_metrics_client(metrics);
+
+        // No scenery_index/dds_disk_checker is wired, so `region_disk_state`
+        // returns `Unknown` for the InProgress region and neither
+        // `evaluate_stale_regions` nor `promote_completed_regions` promotes
+        // it. No `RetainedRegion` entries exist, so `evict_non_retained` is
+        // a no-op. The seeded distribution therefore survives untouched to
+        // the point the gauge samples it.
+        coord.run_region_maintenance();
+
+        // Guard the precondition: if maintenance had promoted or evicted
+        // anything, the assertion below would be measuring a different
+        // distribution than the one seeded.
+        assert!(
+            geo_index
+                .get::<PrefetchedRegion>(&DsfRegion::new(10, 10))
+                .is_some_and(|s| s.is_in_progress()),
+            "Precondition: seeded InProgress region must remain InProgress"
+        );
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let region_state_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, MetricEvent::PrefetchRegionState { .. }))
+            .collect();
+        assert_eq!(
+            region_state_events.len(),
+            1,
+            "expected exactly one PrefetchRegionState event, got {:?}",
+            region_state_events
+        );
+        assert!(
+            matches!(
+                region_state_events[0],
+                MetricEvent::PrefetchRegionState {
+                    in_progress: 1,
+                    prefetched: 2,
+                    no_coverage: 3,
+                }
+            ),
+            "expected PrefetchRegionState {{ in_progress: 1, prefetched: 2, no_coverage: 3 }}, got {:?}",
+            region_state_events[0]
+        );
+    }
+
     #[test]
     fn test_with_scenery_index_stores_on_coordinator() {
         let index = make_scenery_index(50, 9, 16);

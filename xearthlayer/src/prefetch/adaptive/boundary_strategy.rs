@@ -516,14 +516,20 @@ mod tests {
         // SceneryIndex at chunk_zoom 16 -> tile zoom 12
         let index = make_scenery_index_for_region(50, 9, 16);
 
-        // Cache zoom 14 tiles (the OLD wrong behavior) instead of zoom 12.
-        // Built explicitly rather than via the removed geometric expansion —
-        // only the zoom mismatch matters here, not real geographic tiles.
-        let wrong_tiles = vec![TileCoord {
-            row: 999,
-            col: 999,
-            zoom: 14,
-        }];
+        // Cache the region's real tiles but at zoom 14 (the OLD wrong
+        // behavior) instead of zoom 12. Row and col are taken from the
+        // region's actual tile set so zoom is the only differing
+        // component — otherwise a zoom-insensitive presence check could
+        // pass this test for the wrong reason (row/col mismatch alone).
+        let region_tiles = index.tiles_in_region(region);
+        assert!(
+            !region_tiles.is_empty(),
+            "Precondition: index covers region (50, 9)"
+        );
+        let wrong_tiles: Vec<TileCoord> = region_tiles
+            .iter()
+            .map(|t| TileCoord { zoom: 14, ..*t })
+            .collect();
         let checker: Arc<dyn DdsDiskCacheChecker> =
             MockDiskChecker::with_tile_coords(wrong_tiles.into_iter());
 
