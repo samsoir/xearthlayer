@@ -21,10 +21,60 @@ use crate::prefetch::SceneryIndex;
 /// whether a stale region should be promoted or retried.
 pub struct BoundaryStrategy;
 
+/// What the authoritative DDS disk cache can tell us about a region.
+///
+/// Deliberately not a `bool`: the answer feeds a decision whose terminal
+/// outcome is permanent exclusion (`NoCoverage`), so "we cannot tell" must
+/// be distinguishable from "we checked and it is absent".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionDiskState {
+    /// Every tile the scenery index attributes to this region is present.
+    Complete,
+    /// At least one attributed tile is absent.
+    Incomplete,
+    /// The scenery index attributes no tiles to this region.
+    NoTiles,
+    /// No authoritative source to consult — no checker and/or no index.
+    Unknown,
+}
+
 impl BoundaryStrategy {
     /// Creates a new `BoundaryStrategy`.
     pub fn new() -> Self {
         Self
+    }
+
+    /// The single definition of "is this region fully covered?".
+    ///
+    /// Consumed by both the fast path (`promote_completed_regions`) and the
+    /// rescue path (`AdaptivePrefetchCoordinator::evaluate_stale_regions`).
+    /// Prior to #223's review these were two copies that already disagreed
+    /// on the empty and unanswerable cases — the same copy-drift shape #176
+    /// was filed to remove.
+    pub fn region_disk_state(
+        region: DsfRegion,
+        scenery_index: Option<&Arc<SceneryIndex>>,
+        dds_disk_checker: Option<&Arc<dyn DdsDiskCacheChecker>>,
+    ) -> RegionDiskState {
+        let (Some(index), Some(checker)) = (scenery_index, dds_disk_checker) else {
+            return RegionDiskState::Unknown;
+        };
+        let tiles = index.tiles_in_region(region);
+        if tiles.is_empty() {
+            return RegionDiskState::NoTiles;
+        }
+        // Short-circuits on first miss.
+        // Pass tile coords (not chunk_origin) — the DDS disk cache is keyed
+        // by `tile:{tile_zoom}:{tile_row}:{tile_col}`. Using chunk coords
+        // here silently returned false for every tile, preventing promotion.
+        if tiles
+            .iter()
+            .all(|t| checker.tile_exists_blocking(t.row, t.col, t.zoom))
+        {
+            RegionDiskState::Complete
+        } else {
+            RegionDiskState::Incomplete
+        }
     }
 
     /// Mark a region as having no scenery coverage.
@@ -72,14 +122,6 @@ impl BoundaryStrategy {
         dds_disk_checker: Option<&Arc<dyn DdsDiskCacheChecker>>,
         scenery_index: Option<&Arc<SceneryIndex>>,
     ) -> usize {
-        let (Some(checker), Some(index)) = (dds_disk_checker, scenery_index) else {
-            // Without an authoritative checker there is nothing to consult,
-            // and without the scenery index there is no way to know which
-            // tiles the region should contain. Skip promotion; the rescue
-            // path handles stale regions.
-            return 0;
-        };
-
         let in_progress: Vec<DsfRegion> = geo_index
             .iter::<PrefetchedRegion>()
             .into_iter()
@@ -89,22 +131,16 @@ impl BoundaryStrategy {
 
         let mut promoted = 0;
         for region in &in_progress {
-            let tiles = index.tiles_in_region(*region);
-            if tiles.is_empty() {
-                continue;
-            }
-            // Check-all with short-circuit on first miss. Each lookup is
-            // an O(1) in-memory index check.
-            // Pass tile coords (not chunk_origin) — the DDS disk cache is
-            // keyed by tile coords `tile:{tile_zoom}:{tile_row}:{tile_col}`.
-            // Using chunk coords here silently returned false for every
-            // tile, preventing promotion.
-            let all_present = tiles
-                .iter()
-                .all(|t| checker.tile_exists_blocking(t.row, t.col, t.zoom));
-            if all_present {
-                geo_index.insert::<PrefetchedRegion>(*region, PrefetchedRegion::prefetched());
-                promoted += 1;
+            match Self::region_disk_state(*region, scenery_index, dds_disk_checker) {
+                RegionDiskState::Complete => {
+                    geo_index.insert::<PrefetchedRegion>(*region, PrefetchedRegion::prefetched());
+                    promoted += 1;
+                }
+                RegionDiskState::Incomplete
+                | RegionDiskState::NoTiles
+                | RegionDiskState::Unknown => {
+                    continue;
+                }
             }
         }
 
@@ -565,6 +601,60 @@ mod tests {
             .get::<PrefetchedRegion>(&region)
             .unwrap()
             .is_in_progress());
+    }
+
+    // =========================================================================
+    // region_disk_state tests (#176 Task 1 — single completeness predicate)
+    // =========================================================================
+
+    #[test]
+    fn test_region_disk_state_unknown_without_checker() {
+        let index = make_scenery_index_for_region(50, 9, 16);
+        let region = DsfRegion { lat: 50, lon: 9 };
+        assert_eq!(
+            BoundaryStrategy::region_disk_state(region, Some(&index), None),
+            RegionDiskState::Unknown,
+            "no checker means we cannot tell — must not be reported as Incomplete"
+        );
+    }
+
+    #[test]
+    fn test_region_disk_state_no_tiles_for_unindexed_region() {
+        let index = make_scenery_index_for_region(50, 9, 16);
+        let checker = test_checker(&[]);
+        // A region the index knows nothing about.
+        let region = DsfRegion { lat: -40, lon: 170 };
+        assert_eq!(
+            BoundaryStrategy::region_disk_state(region, Some(&index), Some(&checker)),
+            RegionDiskState::NoTiles
+        );
+    }
+
+    #[test]
+    fn test_region_disk_state_complete_and_incomplete() {
+        let index = make_scenery_index_for_region(50, 9, 16);
+        let region = DsfRegion { lat: 50, lon: 9 };
+        let tiles = index.tiles_in_region(region);
+        assert!(
+            tiles.len() >= 2,
+            "fixture must expose >=2 tiles for this test to discriminate"
+        );
+
+        let all: Vec<TileCoord> = tiles.clone();
+        assert_eq!(
+            BoundaryStrategy::region_disk_state(region, Some(&index), Some(&test_checker(&all))),
+            RegionDiskState::Complete
+        );
+
+        let all_but_one: Vec<TileCoord> = tiles.iter().skip(1).cloned().collect();
+        assert_eq!(
+            BoundaryStrategy::region_disk_state(
+                region,
+                Some(&index),
+                Some(&test_checker(&all_but_one))
+            ),
+            RegionDiskState::Incomplete
+        );
     }
 
     // -------------------------------------------------------------------------

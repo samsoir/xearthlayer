@@ -20,7 +20,7 @@ use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::state::{AircraftState, SharedPrefetchStatus};
 use crate::prefetch::SceneryIndex;
 
-use super::super::boundary_strategy::BoundaryStrategy;
+use super::super::boundary_strategy::{BoundaryStrategy, RegionDiskState};
 use super::super::calibration::{PerformanceCalibration, StrategyMode};
 use super::super::config::{AdaptivePrefetchConfig, PrefetchMode};
 use super::super::phase_detector::{FlightPhase, PhaseDetector};
@@ -1130,54 +1130,57 @@ impl AdaptivePrefetchCoordinator {
         }
 
         for region in stale {
-            let tiles = match self.scenery_index {
-                Some(ref index) => index.tiles_in_region(region),
-                None => Vec::new(),
-            };
-
-            // Full coverage, same predicate as the fast path. The previous
-            // version sampled `tiles.first()` and promoted the region on a
-            // single hit — see #176 defect 2. Short-circuits on first miss.
-            let tiles_on_disk = match self.dds_disk_checker.as_ref() {
-                Some(checker) if !tiles.is_empty() => tiles
-                    .iter()
-                    .all(|t| checker.tile_exists_blocking(t.row, t.col, t.zoom)),
-                _ => false,
-            };
-
-            if tiles_on_disk {
-                // Tiles generated successfully — promote despite lost cached_tiles tracking
-                geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
-                tracing::info!(
-                    lat = region.lat,
-                    lon = region.lon,
-                    "Stale InProgress region promoted — tiles found on DDS disk"
-                );
-            } else {
-                let attempts = self.region_attempts.entry(region).or_insert(0);
-                *attempts += 1;
-
-                if *attempts >= MAX_REGION_ATTEMPTS {
-                    // Exhausted retries — mark permanently excluded
-                    geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::no_coverage());
-                    tracing::warn!(
-                        lat = region.lat,
-                        lon = region.lon,
-                        attempts = *attempts,
-                        "Region marked NoCoverage after {} failed attempts",
-                        MAX_REGION_ATTEMPTS
-                    );
-                } else {
-                    // Remove from GeoIndex to allow retry on next cycle
-                    geo_index.remove::<PrefetchedRegion>(&region);
+            // Single definition of "is this region fully covered?", shared
+            // with the fast path (`BoundaryStrategy::promote_completed_regions`).
+            // Prior to #223's review these were two copies that already
+            // disagreed on the empty and unanswerable cases.
+            match BoundaryStrategy::region_disk_state(
+                region,
+                self.scenery_index.as_ref(),
+                self.dds_disk_checker.as_ref(),
+            ) {
+                RegionDiskState::Complete => {
+                    // Tiles generated successfully — promote despite lost cached_tiles tracking
+                    geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
                     tracing::info!(
                         lat = region.lat,
                         lon = region.lon,
-                        attempt = *attempts,
-                        max = MAX_REGION_ATTEMPTS,
-                        "Stale InProgress region demoted for retry"
+                        "Stale InProgress region promoted — tiles found on DDS disk"
                     );
                 }
+                // No tiles indexed: the region can never be confirmed, so
+                // retiring it after repeated attempts is correct — this
+                // preserves pre-#223 behavior.
+                RegionDiskState::Incomplete | RegionDiskState::NoTiles => {
+                    let attempts = self.region_attempts.entry(region).or_insert(0);
+                    *attempts += 1;
+
+                    if *attempts >= MAX_REGION_ATTEMPTS {
+                        // Exhausted retries — mark permanently excluded
+                        geo_index
+                            .insert::<PrefetchedRegion>(region, PrefetchedRegion::no_coverage());
+                        tracing::warn!(
+                            lat = region.lat,
+                            lon = region.lon,
+                            attempts = *attempts,
+                            "Region marked NoCoverage after {} failed attempts",
+                            MAX_REGION_ATTEMPTS
+                        );
+                    } else {
+                        // Remove from GeoIndex to allow retry on next cycle
+                        geo_index.remove::<PrefetchedRegion>(&region);
+                        tracing::info!(
+                            lat = region.lat,
+                            lon = region.lon,
+                            attempt = *attempts,
+                            max = MAX_REGION_ATTEMPTS,
+                            "Stale InProgress region demoted for retry"
+                        );
+                    }
+                }
+                // Unanswerable. Leave the claim standing and do not consume
+                // a retry; the next cycle may have a checker.
+                RegionDiskState::Unknown => continue,
             }
         }
     }
@@ -2076,6 +2079,39 @@ mod tests {
         assert!(
             state.is_some_and(|s| s.is_prefetched()),
             "full coverage on disk must be promoted by the rescue path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stale_region_not_struck_when_disk_state_unknown() {
+        // A stale InProgress region with a scenery index but NO dds_disk_checker.
+        // Before: `_ => false` counted a failed attempt, and three of these
+        // retired the region to NoCoverage permanently. After: Unknown is not
+        // evidence of absence, so the region keeps its InProgress claim and no
+        // attempt is recorded.
+        let index = make_scenery_index_covering(50..=50, 9..=9, 16);
+        let geo_index = Arc::new(GeoIndex::new());
+        let region = DsfRegion { lat: 50, lon: 9 };
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_scenery_index(Arc::clone(&index))
+            .with_geo_index(Arc::clone(&geo_index));
+        // deliberately no .with_dds_disk_checker(...)
+        coord.config.stale_region_timeout = std::time::Duration::ZERO; // force staleness
+
+        for _ in 0..MAX_REGION_ATTEMPTS + 1 {
+            coord.evaluate_stale_regions(&geo_index);
+        }
+
+        let state = geo_index.get::<PrefetchedRegion>(&region);
+        assert!(
+            state.map(|s| s.is_in_progress()).unwrap_or(false),
+            "region must remain InProgress; Unknown is not evidence of absence"
+        );
+        assert!(
+            !coord.region_attempts.contains_key(&region),
+            "an unanswerable check must not consume a retry"
         );
     }
 
