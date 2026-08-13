@@ -1270,9 +1270,9 @@ mod tests {
     use super::*;
     use crate::prefetch::adaptive::coordinator::test_support::{
         ground_state, make_scenery_index, make_scenery_index_covering, patched_region_area,
-        test_calibration, test_plan, AlwaysHitDiskChecker, AlwaysMissMemoryCache,
-        BackpressureMockClient, CapLimitedDdsClient, DummyTracker, HighLoadDdsClient,
-        MockDiskChecker, StableBoundsTracker,
+        test_calibration, test_plan, AlwaysHitDiskChecker, AlwaysHitMemoryCache,
+        AlwaysMissMemoryCache, BackpressureMockClient, CapLimitedDdsClient, DummyTracker,
+        HighLoadDdsClient, MockDiskChecker, StableBoundsTracker,
     };
     // ─────────────────────────────────────────────────────────────────────────
     // Creation tests
@@ -1944,11 +1944,18 @@ mod tests {
     }
 
     #[test]
-    fn test_region_with_no_indexed_tiles_is_marked_no_coverage() {
+    fn test_get_tiles_for_region_empty_for_unindexed_region() {
         // Removing the geometric fallback means an empty index result is a
         // statement — "no ortho scenery here" — rather than a cue to guess 16
-        // tiles at zoom 14. The submit loop must mark the region NoCoverage and
-        // submit nothing.
+        // tiles at zoom 14.
+        //
+        // NOTE: despite this test's prior name
+        // (`test_region_with_no_indexed_tiles_is_marked_no_coverage`), it only
+        // ever exercised `get_tiles_for_region` directly — no `GeoIndex` is
+        // wired, no planning cycle runs, and no `PrefetchedRegion` state is
+        // ever read. It does not, and never did, verify the NoCoverage
+        // marking. See `test_no_coverage_region_marked_and_nothing_submitted`
+        // below for a real test of that behaviour.
         use crate::prefetch::scenery_index::SceneryTile;
 
         let index = Arc::new(SceneryIndex::with_defaults());
@@ -1975,6 +1982,73 @@ mod tests {
         assert_eq!(
             coord.get_tiles_for_region(&DsfRegion::new(33, -119)).len(),
             1
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // NoCoverage marking on the planning path (#223 remediation, F5)
+    //
+    // `test_get_tiles_for_region_empty_for_unindexed_region` above only
+    // proves `get_tiles_for_region` returns empty for an unindexed region —
+    // it never runs a planning cycle and never reads `PrefetchedRegion`
+    // state, so the production marking at the `if tiles.is_empty()` branch
+    // in `update()` (which calls `BoundaryStrategy::mark_no_coverage`) was
+    // unverified: deleting that branch left the whole suite green.
+    //
+    // This test wires a real `GeoIndex` and a scenery index with zero
+    // coverage anywhere in the prefetch box, runs a full planning cycle via
+    // `process_telemetry`, and asserts both halves of the contract: the
+    // touched regions carry `PrefetchedRegion::no_coverage()`, and nothing
+    // reached the DDS client.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_no_coverage_region_marked_and_nothing_submitted() {
+        use crate::geo_index::{GeoIndex, PrefetchedRegion};
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let client = Arc::new(CapLimitedDdsClient::new(100_000));
+        // Zero tiles anywhere — every region the prefetch box touches must
+        // report no coverage.
+        let empty_index = Arc::new(SceneryIndex::with_defaults());
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ramp_duration: std::time::Duration::from_secs(0),
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_scenery_index(empty_index);
+
+        fast_forward_to_cruise(&mut coord);
+        assert_eq!(coord.phase_detector.current_phase(), FlightPhase::Cruise);
+
+        let state = AircraftState::new(50.0, 10.0, 0.0, 200.0, 35000.0, false);
+        let submitted = coord.process_telemetry(&state).await;
+
+        assert_eq!(
+            submitted.unwrap_or(0),
+            0,
+            "A scenery index with no coverage anywhere must yield no submissions",
+        );
+        assert_eq!(
+            client.submitted_count(),
+            0,
+            "No tiles should ever reach the DDS client when there is no coverage",
+        );
+
+        let no_coverage_regions: Vec<_> = geo_index
+            .iter::<PrefetchedRegion>()
+            .into_iter()
+            .filter(|(_, r)| r.is_no_coverage())
+            .collect();
+        assert!(
+            !no_coverage_regions.is_empty(),
+            "Regions the prefetch box touched with zero scenery coverage must be \
+             marked NoCoverage, not left unmarked to be re-planned every cycle",
         );
     }
 
@@ -3467,6 +3541,93 @@ mod tests {
             count_prefetched_regions(&geo_index) > 0,
             "A region whose tiles are all already cached must reach Prefetched, \
              not sit unmarked and be re-planned forever",
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Two-phase commit boundary (#223 remediation, F6)
+    //
+    // `test_fully_cached_region_reaches_prefetched` above uses
+    // `AlwaysHitDiskChecker` as BOTH the filter authority (stage 4 of the
+    // filter pipeline, which empties the plan and triggers
+    // `mark_fully_filtered_regions`) AND the promotion authority
+    // (`promote_completed_regions`, consulted by `run_region_maintenance`).
+    // With one mock playing both roles, that test cannot distinguish a
+    // disk-verified promotion from the filter's say-so — replacing
+    // `mark_in_progress` in `mark_fully_filtered_regions` with a direct
+    // `PrefetchedRegion::prefetched()` insert leaves it green.
+    //
+    // This test empties the plan via the MEMORY CACHE filter stage (stage 1)
+    // instead, using `AlwaysHitMemoryCache`, while wiring a DDS disk checker
+    // that reports every tile ABSENT. If promotion were driven by the
+    // filter's say-so rather than a real disk check, the region would reach
+    // Prefetched here too. It must not: the region should land in
+    // InProgress and stay there, including across a subsequent maintenance
+    // pass with no new telemetry.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_filtered_region_stays_in_progress_without_disk_confirmation() {
+        use crate::executor::DaemonMemoryCache;
+        use crate::geo_index::GeoIndex;
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let client = Arc::new(CapLimitedDdsClient::new(100_000));
+        // Memory cache reports every tile as already cached — this is what
+        // empties the plan and fires `mark_fully_filtered_regions`. It is
+        // NOT the disk checker, so this test is independent of the disk
+        // check's answer.
+        let always_hit_memory: Arc<dyn DaemonMemoryCache> = Arc::new(AlwaysHitMemoryCache);
+        // Disk checker (the promotion authority) reports every tile absent.
+        let checker: Arc<dyn DdsDiskCacheChecker> =
+            MockDiskChecker::with_tile_coords(std::iter::empty::<TileCoord>());
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ramp_duration: std::time::Duration::from_secs(0),
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_memory_cache(always_hit_memory)
+            .with_dds_disk_checker(Arc::clone(&checker))
+            .with_scenery_index(wide_scenery_index_at_50_10());
+
+        fast_forward_to_cruise(&mut coord);
+        assert_eq!(coord.phase_detector.current_phase(), FlightPhase::Cruise);
+
+        let state = AircraftState::new(50.0, 10.0, 0.0, 200.0, 35000.0, false);
+
+        let submitted = coord.process_telemetry(&state).await.unwrap_or(0);
+        assert_eq!(
+            submitted, 0,
+            "Precondition: the memory-cache filter must empty the whole plan",
+        );
+        assert!(
+            count_in_progress_regions(&geo_index) > 0,
+            "A fully-filtered region must still be marked InProgress",
+        );
+        assert_eq!(
+            count_prefetched_regions(&geo_index),
+            0,
+            "Without a disk-verified full-coverage check, the region must NOT \
+             reach Prefetched — reaching it here would mean promotion trusts \
+             the filter's say-so instead of the authoritative disk checker",
+        );
+
+        // A subsequent maintenance pass (another cycle, no new coverage on
+        // disk) must not promote it either.
+        coord.process_telemetry(&state).await;
+        assert_eq!(
+            count_prefetched_regions(&geo_index),
+            0,
+            "Region must still not be Prefetched after a subsequent maintenance pass",
+        );
+        assert!(
+            count_in_progress_regions(&geo_index) > 0,
+            "Region should remain InProgress, not be silently dropped",
         );
     }
 }

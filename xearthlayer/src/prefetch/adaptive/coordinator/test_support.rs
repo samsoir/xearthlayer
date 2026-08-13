@@ -184,6 +184,34 @@ impl crate::executor::DaemonMemoryCache for AlwaysMissMemoryCache {
     }
 }
 
+/// Mock [`DaemonMemoryCache`] that always reports "hit". Used to empty a
+/// prefetch plan via the memory-cache filter stage specifically — as
+/// distinct from emptying it via the DDS disk cache checker — so tests can
+/// tell apart the two-phase commit's filter-driven `InProgress` marking from
+/// its disk-verified `Prefetched` promotion.
+pub(crate) struct AlwaysHitMemoryCache;
+
+impl crate::executor::DaemonMemoryCache for AlwaysHitMemoryCache {
+    fn get(
+        &self,
+        _row: u32,
+        _col: u32,
+        _zoom: u8,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
+        Box::pin(async { Some(vec![0u8; 16]) })
+    }
+
+    fn put(
+        &self,
+        _row: u32,
+        _col: u32,
+        _zoom: u8,
+        _data: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DDS disk cache checker mock
 // ─────────────────────────────────────────────────────────────────────────────
@@ -414,6 +442,11 @@ impl CapLimitedDdsClient {
     /// Reset the counter to allow another batch of submissions.
     pub(crate) fn reset(&self) {
         self.submitted.store(0, Ordering::SeqCst);
+    }
+
+    /// Number of tiles accepted so far.
+    pub(crate) fn submitted_count(&self) -> usize {
+        self.submitted.load(Ordering::SeqCst)
     }
 }
 
