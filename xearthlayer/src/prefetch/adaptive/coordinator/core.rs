@@ -1068,12 +1068,24 @@ impl AdaptivePrefetchCoordinator {
         // failed to track ~94% of actually-cached tiles in production,
         // leaving the rescue path (evaluate_stale_regions) to carry
         // the work.
-        BoundaryStrategy::promote_completed_regions(
+        let promoted = BoundaryStrategy::promote_completed_regions(
             &geo_index,
             self.dds_disk_checker.as_ref(),
             self.scenery_index.as_ref(),
             self.ortho_union_index.as_ref(),
         );
+        if !promoted.is_empty() {
+            // A promoted region's failure history belongs to the episode that
+            // failed, not to the region. Without this, a region that recovers and
+            // is later demoted by the FUSE observer can be retired to NoCoverage
+            // after a single fresh failure.
+            for region in &promoted {
+                self.region_attempts.remove(region);
+            }
+            if let Some(ref metrics) = self.metrics_client {
+                metrics.prefetch_regions_promoted_normal(promoted.len());
+            }
+        }
         // Evict PrefetchedRegion entries for regions outside the retained window,
         // making them eligible for re-prefetch when the aircraft returns.
         BoundaryStrategy::evict_non_retained(&geo_index);
@@ -1144,6 +1156,12 @@ impl AdaptivePrefetchCoordinator {
                 RegionDiskState::Complete => {
                     // Tiles generated successfully — promote despite lost cached_tiles tracking
                     geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
+                    // See the fast-path promotion comment in `run_region_maintenance`:
+                    // the strike count belongs to the failed episode, not the region.
+                    self.region_attempts.remove(&region);
+                    if let Some(ref metrics) = self.metrics_client {
+                        metrics.prefetch_region_promoted_rescue();
+                    }
                     tracing::info!(
                         lat = region.lat,
                         lon = region.lon,
@@ -1169,7 +1187,17 @@ impl AdaptivePrefetchCoordinator {
                             MAX_REGION_ATTEMPTS
                         );
                     } else {
-                        // Remove from GeoIndex to allow retry on next cycle
+                        // Remove from GeoIndex to allow retry on next cycle.
+                        //
+                        // Do NOT clear `region_attempts` here. This removal is
+                        // deliberate — it makes the region eligible for
+                        // re-prefetching — and `region_attempts` is the only
+                        // thing that remembers the strike across it. Clearing
+                        // on this branch (by symmetry with the promote branch
+                        // above) would make `MAX_REGION_ATTEMPTS` unreachable:
+                        // every retry would start the count over, and a region
+                        // that never succeeds would retry forever instead of
+                        // eventually being retired to `NoCoverage`.
                         geo_index.remove::<PrefetchedRegion>(&region);
                         tracing::info!(
                             lat = region.lat,
@@ -2114,6 +2142,156 @@ mod tests {
         assert!(
             !coord.region_attempts.contains_key(&region),
             "an unanswerable check must not consume a retry"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Strike count lifecycle + promotion metrics (#176 Task 4 / F1 + F17)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_promotion_clears_stale_attempt_count() {
+        // Two early failures, then a successful promotion, then one fresh
+        // failure must NOT retire the region: the strike count belongs to the
+        // failed episode, not to the region forever.
+        let index = make_scenery_index(50, 9, 16);
+        let region = DsfRegion::new(50, 9);
+        let tiles = index.tiles_in_region(region);
+        assert!(
+            !tiles.is_empty(),
+            "Precondition: index covers region (50,9)"
+        );
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let empty_checker: Arc<dyn DdsDiskCacheChecker> =
+            MockDiskChecker::with_tile_coords(std::iter::empty::<TileCoord>());
+
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_scenery_index(Arc::clone(&index))
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_disk_checker(Arc::clone(&empty_checker));
+
+        // Phase 1: checker empty, region InProgress, stale -> 2 strikes.
+        coord.config.stale_region_timeout = std::time::Duration::ZERO;
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+        coord.evaluate_stale_regions(&geo_index);
+        assert_eq!(
+            coord.region_attempts.get(&region),
+            Some(&1),
+            "Precondition: first stale failure recorded"
+        );
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+        coord.evaluate_stale_regions(&geo_index);
+        assert_eq!(
+            coord.region_attempts.get(&region),
+            Some(&2),
+            "Precondition: second stale failure recorded (below MAX_REGION_ATTEMPTS)"
+        );
+
+        // Phase 2: checker seeded with the region's tiles -> promote via the
+        // fast path (large timeout so the region is not picked up as stale).
+        let full_checker: Arc<dyn DdsDiskCacheChecker> =
+            MockDiskChecker::with_tile_coords(tiles.iter().copied());
+        coord.dds_disk_checker = Some(full_checker);
+        coord.config.stale_region_timeout = std::time::Duration::from_secs(600);
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+        coord.run_region_maintenance();
+        assert!(
+            geo_index
+                .get::<PrefetchedRegion>(&region)
+                .is_some_and(|s| s.is_prefetched()),
+            "Precondition: region promoted via the fast path"
+        );
+        assert!(
+            !coord.region_attempts.contains_key(&region),
+            "Promotion must clear the strike count from the failed episode"
+        );
+
+        // Phase 3: checker emptied, region re-marked InProgress, stale once.
+        coord.dds_disk_checker = Some(empty_checker);
+        coord.config.stale_region_timeout = std::time::Duration::ZERO;
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+        coord.evaluate_stale_regions(&geo_index);
+
+        assert!(
+            geo_index
+                .get::<PrefetchedRegion>(&region)
+                .map(|s| !s.is_no_coverage())
+                .unwrap_or(true),
+            "one fresh failure after a successful promotion must not retire the region"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_normal_and_rescue_promotions_are_counted_separately() {
+        use crate::metrics::MetricEvent;
+
+        let index = make_scenery_index_covering(49..=50, 9..=9, 16);
+        let region_rescue = DsfRegion::new(49, 9);
+        let region_normal = DsfRegion::new(50, 9);
+        let tiles_rescue = index.tiles_in_region(region_rescue);
+        let tiles_normal = index.tiles_in_region(region_normal);
+        assert!(
+            !tiles_rescue.is_empty(),
+            "Precondition: rescue region covered"
+        );
+        assert!(
+            !tiles_normal.is_empty(),
+            "Precondition: normal region covered"
+        );
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let checker: Arc<dyn DdsDiskCacheChecker> = MockDiskChecker::with_tile_coords(
+            tiles_rescue.iter().chain(tiles_normal.iter()).copied(),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let metrics = MetricsClient::new(tx);
+
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_scenery_index(Arc::clone(&index))
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_disk_checker(checker)
+            .with_metrics_client(metrics);
+
+        // Drive one rescue-path promotion: the region is stale, and the
+        // rescue path (`evaluate_stale_regions`) finds full coverage.
+        coord.config.stale_region_timeout = std::time::Duration::ZERO;
+        geo_index.insert::<PrefetchedRegion>(region_rescue, PrefetchedRegion::in_progress());
+        coord.evaluate_stale_regions(&geo_index);
+        assert!(
+            geo_index
+                .get::<PrefetchedRegion>(&region_rescue)
+                .is_some_and(|s| s.is_prefetched()),
+            "Precondition: rescue path promoted the region"
+        );
+
+        // Drive one fast-path promotion: large timeout so the region is not
+        // stale, and `promote_completed_regions` (run unconditionally by
+        // `run_region_maintenance`) finds full coverage.
+        coord.config.stale_region_timeout = std::time::Duration::from_secs(600);
+        geo_index.insert::<PrefetchedRegion>(region_normal, PrefetchedRegion::in_progress());
+        coord.run_region_maintenance();
+        assert!(
+            geo_index
+                .get::<PrefetchedRegion>(&region_normal)
+                .is_some_and(|s| s.is_prefetched()),
+            "Precondition: fast path promoted the region"
+        );
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                MetricEvent::PrefetchRegionsPromotedNormal { count } if *count >= 1
+            )),
+            "fast-path promotion must emit a normal-path count"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::PrefetchRegionPromotedRescue)),
+            "rescue-path promotion must emit a rescue count"
         );
     }
 

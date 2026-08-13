@@ -150,7 +150,7 @@ impl BoundaryStrategy {
         dds_disk_checker: Option<&Arc<dyn DdsDiskCacheChecker>>,
         scenery_index: Option<&Arc<SceneryIndex>>,
         ortho_union_index: Option<&Arc<OrthoUnionIndex>>,
-    ) -> usize {
+    ) -> Vec<DsfRegion> {
         let in_progress: Vec<DsfRegion> = geo_index
             .iter::<PrefetchedRegion>()
             .into_iter()
@@ -158,7 +158,7 @@ impl BoundaryStrategy {
             .map(|(dsf, _)| dsf)
             .collect();
 
-        let mut promoted = 0;
+        let mut promoted: Vec<DsfRegion> = Vec::new();
         for region in &in_progress {
             match Self::region_disk_state(
                 *region,
@@ -168,7 +168,7 @@ impl BoundaryStrategy {
             ) {
                 RegionDiskState::Complete => {
                     geo_index.insert::<PrefetchedRegion>(*region, PrefetchedRegion::prefetched());
-                    promoted += 1;
+                    promoted.push(*region);
                 }
                 RegionDiskState::Incomplete
                 | RegionDiskState::NoTiles
@@ -178,8 +178,11 @@ impl BoundaryStrategy {
             }
         }
 
-        if promoted > 0 {
-            tracing::debug!(promoted, "Promoted InProgress regions to Prefetched");
+        if !promoted.is_empty() {
+            tracing::debug!(
+                promoted = promoted.len(),
+                "Promoted InProgress regions to Prefetched"
+            );
         }
         promoted
     }
@@ -366,7 +369,7 @@ mod tests {
             Some(&index),
             None,
         );
-        assert_eq!(promoted, 1);
+        assert_eq!(promoted.len(), 1);
 
         let state = geo_index.get::<PrefetchedRegion>(&region).unwrap();
         assert!(state.is_prefetched());
@@ -409,7 +412,7 @@ mod tests {
             Some(&index),
             None,
         );
-        assert_eq!(promoted, 0);
+        assert_eq!(promoted.len(), 0);
 
         let state = geo_index.get::<PrefetchedRegion>(&region).unwrap();
         assert!(state.is_in_progress());
@@ -425,7 +428,7 @@ mod tests {
         geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
 
         let promoted = BoundaryStrategy::promote_completed_regions(&geo_index, None, None, None);
-        assert_eq!(promoted, 0);
+        assert_eq!(promoted.len(), 0);
 
         let state = geo_index.get::<PrefetchedRegion>(&region).unwrap();
         assert!(
@@ -494,7 +497,8 @@ mod tests {
             None,
         );
         assert_eq!(
-            promoted, 1,
+            promoted.len(),
+            1,
             "Should promote when all scenery index tiles are on disk"
         );
 
@@ -531,7 +535,8 @@ mod tests {
             None,
         );
         assert_eq!(
-            promoted, 0,
+            promoted.len(),
+            0,
             "Should not promote when cached tiles are at wrong zoom level"
         );
 
@@ -605,7 +610,8 @@ mod tests {
         );
 
         assert_eq!(
-            promoted, 1,
+            promoted.len(),
+            1,
             "the adjacent region's missing tile must not block promotion"
         );
         assert!(geo_index
@@ -654,7 +660,11 @@ mod tests {
             None,
         );
 
-        assert_eq!(promoted, 0, "a missing in-region tile must block promotion");
+        assert_eq!(
+            promoted.len(),
+            0,
+            "a missing in-region tile must block promotion"
+        );
         assert!(geo_index
             .get::<PrefetchedRegion>(&region)
             .unwrap()
