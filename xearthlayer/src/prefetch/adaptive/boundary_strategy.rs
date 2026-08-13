@@ -735,21 +735,23 @@ mod tests {
     /// named at the given CHUNK coordinates (row, col, zoom) — matching how
     /// `dds_tile_exists` resolves `textures/{row}_{col}_{prefix}{zoom}.dds`.
     ///
-    /// The backing `TempDir` is deliberately leaked so its files remain on
-    /// disk for the rest of the test process: `dds_tile_exists` stats the
-    /// real filesystem on every call (lazy resolution), so dropping the
-    /// directory would make every lookup silently miss.
+    /// Takes the backing `TempDir` by reference — same pattern as
+    /// `create_package_with_dds` in `ortho_union/index.rs` — so the caller
+    /// owns the guard and its files stay on disk for exactly the scope of
+    /// the calling test function. `dds_tile_exists` stats the real
+    /// filesystem on every call (lazy resolution), so the `TempDir` must
+    /// outlive every lookup made against the returned index, but no longer:
+    /// no leaking required.
     fn make_ortho_index_with_chunk_tiles(
+        temp: &tempfile::TempDir,
         chunk_tiles: Vec<(u32, u32, u8)>,
     ) -> Arc<crate::ortho_union::OrthoUnionIndex> {
-        let temp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(temp.path().join("textures")).unwrap();
         for (row, col, zoom) in chunk_tiles {
             let filename = format!("{row}_{col}_ZL{zoom}.dds");
             std::fs::write(temp.path().join("textures").join(filename), b"dds content").unwrap();
         }
         let source = crate::ortho_union::OrthoSource::new_package("test", temp.path());
-        Box::leak(Box::new(temp));
         Arc::new(crate::ortho_union::OrthoUnionIndex::with_sources(vec![
             source,
         ]))
@@ -772,7 +774,9 @@ mod tests {
         // chunk coords while tile_exists_blocking takes tile coords. If the
         // implementation passes tile coords here the lookup silently misses and
         // this test fails, which is the point.
+        let temp = tempfile::TempDir::new().unwrap();
         let ortho = make_ortho_index_with_chunk_tiles(
+            &temp,
             tiles.iter().map(|t| t.chunk_origin()).collect::<Vec<_>>(),
         );
 
@@ -792,7 +796,8 @@ mod tests {
         // Guards the disjunction against becoming a tautology.
         let index = make_scenery_index_for_region(50, 9, 16);
         let region = DsfRegion { lat: 50, lon: 9 };
-        let ortho = make_ortho_index_with_chunk_tiles(vec![]);
+        let temp = tempfile::TempDir::new().unwrap();
+        let ortho = make_ortho_index_with_chunk_tiles(&temp, vec![]);
         assert_eq!(
             BoundaryStrategy::region_disk_state(
                 region,
