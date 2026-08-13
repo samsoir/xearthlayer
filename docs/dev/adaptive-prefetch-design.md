@@ -369,8 +369,15 @@ wire it up and these become totals since the last reset:
 ```
 INFO Prefetch sample uptime_s=... regions_in_progress=... regions_prefetched=...
      regions_nocoverage=... promotions_normal=... promotions_rescue=...
-     state_diverged=... regions_demoted=...
+     state_diverged=... regions_demoted=... fuse_generations=...
 ```
+
+`fuse_generations` mirrors `fuse_jobs_submitted` (aggregated from
+`MetricEvent::JobSubmitted { is_fuse: true }`) — the only default-level
+source for criterion 5 ("on-demand FUSE generations fall during cruise").
+Per-tile FUSE request logging is `debug!`-only (#209), so without this field
+that criterion is unreadable at default log level. It is cumulative since
+process start, the same convention as the other counters on this line.
 
 `promotions_normal` counts fast-path promotions (`promote_completed_regions`,
 per-cycle region maintenance); `promotions_rescue` counts stale-region

@@ -430,6 +430,11 @@ impl MetricsDaemon {
             promotions_rescue = state.prefetch_promotions_rescue,
             state_diverged = state.prefetch_state_diverged,
             regions_demoted = state.prefetch_regions_demoted,
+            // Criterion 5's user-visible outcome (the others above are
+            // mechanism): on-demand FUSE generations should fall during
+            // cruise. Per-tile FUSE logging is debug-only (#209), so this
+            // aggregated counter is the only default-level source.
+            fuse_generations = state.fuse_jobs_submitted,
             "Prefetch sample"
         );
     }
@@ -1164,6 +1169,34 @@ mod tests {
         );
         assert_eq!(sample.get("state_diverged").map(String::as_str), Some("2"));
         assert_eq!(sample.get("regions_demoted").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn test_prefetch_sample_reports_fuse_generations() {
+        // Criterion 5 ("on-demand FUSE generations fall during cruise") has
+        // no field in the sample line unless fuse_jobs_submitted is surfaced
+        // here — per-tile FUSE logging is debug-only (#209), so this counter
+        // is the only default-level source for that criterion.
+        let (mut daemon, tx) = create_daemon();
+        let client = MetricsClient::new(tx);
+
+        client.job_submitted(true);
+        client.job_submitted(true);
+        client.job_submitted(false); // non-FUSE submission must not count
+
+        while let Ok(event) = daemon.rx.try_recv() {
+            daemon.process_event(event);
+        }
+
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        let sample =
+            find_prefetch_sample(&events).expect("log_prefetch_sample must emit a sample line");
+
+        assert_eq!(
+            sample.get("fuse_generations").map(String::as_str),
+            Some("2"),
+            "fuse_generations must carry state.fuse_jobs_submitted"
+        );
     }
 
     #[test]
