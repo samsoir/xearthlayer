@@ -135,7 +135,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `PrefetchStateObserver` - FUSE-side divergence detector; demotes a `Prefetched`/`NoCoverage` region back to *absent* when FUSE has to generate a tile on demand there, rate-limited to one demotion per region per 120s window
     - Submits jobs to shared job executor daemon via `DdsClient` trait
     - Mode selection: Aggressive (>30 tiles/sec), Opportunistic (10-30), or Disabled
-    - **Four-tier filtering**: Local tracking → Memory cache → Patched region exclusion (via `GeoIndex`) → Disk existence (via `OrthoUnionIndex`)
+    - **Four-tier filtering**: Memory cache → Patched region exclusion (via `GeoIndex`) → Installed package disk (via `OrthoUnionIndex`) → XEL DDS disk cache (the write-only `cached_tiles` local-tracking shadow tier was deleted in #176 after it was confirmed to never be read)
     - **Two-phase region commit**: Regions marked `InProgress` in GeoIndex during prefetch, promoted to `Prefetched` on completion
     - **Stale telemetry safe mode**: pauses tile submissions when telemetry stale >5s; on resume, reads `on_ground` from AircraftState to reset PhaseDetector before next cycle
     - See `docs/dev/adaptive-prefetch-design.md` for design details

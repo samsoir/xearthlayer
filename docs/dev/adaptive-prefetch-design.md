@@ -673,7 +673,7 @@ For each BoundaryCrossing:
        knows nothing about yields no tiles and is marked NoCoverage
 
     5. Apply four-tier filter:
-       Local tracking → Memory cache → Patch exclusion → Disk existence
+       Memory cache → Patch exclusion → Installed package disk → XEL DDS disk cache
 
     6. Order tiles:
        Primary: urgency rank (depth 0 before depth 1 before depth 2)

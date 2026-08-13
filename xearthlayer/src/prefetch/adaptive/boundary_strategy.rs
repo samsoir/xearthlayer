@@ -4,14 +4,12 @@
 //! - [`BoundaryStrategy::promote_completed_regions`] — promotes `InProgress`
 //!   regions to `Prefetched` once all their tiles are confirmed in cache.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::coord::TileCoord;
 use crate::executor::DdsDiskCacheChecker;
 use crate::geo_index::{DsfRegion, GeoIndex, PrefetchedRegion, RetainedRegion};
 use crate::ortho_union::OrthoUnionIndex;
-use crate::prefetch::tile_based::DsfTileCoord;
 use crate::prefetch::SceneryIndex;
 
 /// Region lifecycle management for the prefetch system.
@@ -140,11 +138,12 @@ impl BoundaryStrategy {
     /// to know which tiles the region should contain. The rescue path
     /// (`evaluate_stale_regions`) will still fire for stale regions.
     ///
-    /// See #172 Part 3: the prior version consulted a `cached_tiles`
-    /// `HashSet` shadow that failed to track ~94% of actually-cached
-    /// tiles during production flights (4 normal vs. 61 stale-rescue
-    /// promotions in a 9-hour log). Querying the authoritative cache
-    /// directly collapses one source of truth.
+    /// See #172 Part 3: the prior version consulted a local `HashSet`
+    /// shadow of "tiles we believe are cached" that failed to track ~94%
+    /// of actually-cached tiles during production flights (4 normal vs.
+    /// 61 stale-rescue promotions in a 9-hour log). Querying the
+    /// authoritative cache directly collapses one source of truth; the
+    /// shadow itself was deleted in #176 once confirmed write-only.
     pub fn promote_completed_regions(
         geo_index: &GeoIndex,
         dds_disk_checker: Option<&Arc<dyn DdsDiskCacheChecker>>,
@@ -220,40 +219,6 @@ impl BoundaryStrategy {
         }
         evicted
     }
-
-    /// Remove entries from `cached_tiles` whose DSF region is not in the retained window.
-    ///
-    /// Returns 0 (no-op) when the `RetainedRegion` layer is empty, indicating
-    /// retention tracking is not yet active. This prevents stale `cached_tiles`
-    /// entries from blocking re-prefetch of regions the aircraft has moved past.
-    pub fn evict_cached_tiles_outside_retained(
-        cached_tiles: &mut HashSet<TileCoord>,
-        geo_index: &GeoIndex,
-    ) -> usize {
-        let retained = geo_index.regions::<RetainedRegion>();
-        if retained.is_empty() {
-            return 0;
-        }
-
-        let retained_set: std::collections::HashSet<DsfRegion> = retained.into_iter().collect();
-
-        let before = cached_tiles.len();
-        cached_tiles.retain(|tile| {
-            let (lat, lon) = tile.to_lat_lon();
-            let dsf = DsfTileCoord::from_lat_lon(lat, lon);
-            retained_set.contains(&DsfRegion::new(dsf.lat, dsf.lon))
-        });
-        let evicted = before - cached_tiles.len();
-
-        if evicted > 0 {
-            tracing::debug!(
-                evicted,
-                remaining = cached_tiles.len(),
-                "Evicted cached_tiles outside retained window"
-            );
-        }
-        evicted
-    }
 }
 
 impl Default for BoundaryStrategy {
@@ -265,6 +230,7 @@ impl Default for BoundaryStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn test_mark_no_coverage() {
@@ -871,48 +837,6 @@ mod tests {
         assert_eq!(evicted, 1); // Only Prefetched, not InProgress
         assert!(geo_index.contains::<PrefetchedRegion>(&DsfRegion::new(50, 7)));
         assert!(!geo_index.contains::<PrefetchedRegion>(&DsfRegion::new(51, 7)));
-    }
-
-    #[test]
-    fn test_evict_cached_tiles_removes_tiles_outside_retained() {
-        use crate::coord::to_tile_coords;
-
-        let geo_index = GeoIndex::new();
-        geo_index.insert::<RetainedRegion>(DsfRegion::new(50, 7), RetainedRegion);
-
-        let mut cached_tiles = std::collections::HashSet::new();
-
-        // Tile inside retained region (50, 7)
-        let tile_inside = to_tile_coords(50.5, 7.5, 14).unwrap();
-        cached_tiles.insert(tile_inside);
-
-        // Tile outside retained region (48, 5)
-        let tile_outside = to_tile_coords(48.5, 5.5, 14).unwrap();
-        cached_tiles.insert(tile_outside);
-
-        let evicted =
-            BoundaryStrategy::evict_cached_tiles_outside_retained(&mut cached_tiles, &geo_index);
-
-        assert_eq!(evicted, 1);
-        assert!(cached_tiles.contains(&tile_inside));
-        assert!(!cached_tiles.contains(&tile_outside));
-    }
-
-    #[test]
-    fn test_evict_cached_tiles_noop_when_no_retained_regions() {
-        use crate::coord::to_tile_coords;
-
-        let geo_index = GeoIndex::new();
-        let mut cached_tiles = std::collections::HashSet::new();
-
-        let tile = to_tile_coords(50.5, 7.5, 14).unwrap();
-        cached_tiles.insert(tile);
-
-        let evicted =
-            BoundaryStrategy::evict_cached_tiles_outside_retained(&mut cached_tiles, &geo_index);
-
-        assert_eq!(evicted, 0);
-        assert!(cached_tiles.contains(&tile));
     }
 
     #[test]

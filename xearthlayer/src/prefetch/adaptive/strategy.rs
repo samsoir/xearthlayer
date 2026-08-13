@@ -24,7 +24,7 @@
 //!     (lat, lon),
 //!     track,
 //!     &calibration,
-//!     &cached_tiles,
+//!     &already_cached,
 //! );
 //!
 //! for tile in plan.tiles {

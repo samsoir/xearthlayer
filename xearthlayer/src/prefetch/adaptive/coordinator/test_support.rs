@@ -157,33 +157,6 @@ pub(crate) fn make_scenery_index_covering(
 // Memory cache mocks
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Mock [`DaemonMemoryCache`] that always reports "miss". Simulates a
-/// memory cache that has evicted every tile it once held — the exact
-/// condition under which the filter-pipeline shadow-staleness bug
-/// (#172 post-flight finding) manifested in production.
-pub(crate) struct AlwaysMissMemoryCache;
-
-impl crate::executor::DaemonMemoryCache for AlwaysMissMemoryCache {
-    fn get(
-        &self,
-        _row: u32,
-        _col: u32,
-        _zoom: u8,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
-        Box::pin(async { None })
-    }
-
-    fn put(
-        &self,
-        _row: u32,
-        _col: u32,
-        _zoom: u8,
-        _data: Vec<u8>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        Box::pin(async {})
-    }
-}
-
 /// Mock [`DaemonMemoryCache`] that always reports "hit". Used to empty a
 /// prefetch plan via the memory-cache filter stage specifically — as
 /// distinct from emptying it via the DDS disk cache checker — so tests can

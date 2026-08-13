@@ -11,7 +11,6 @@
 //! Each stage returns the filtered list and a count of skipped tiles.
 //! Stages are ordered cheapest-first to minimise per-tile filter cost.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::coord::TileCoord;
@@ -27,7 +26,7 @@ use crate::prefetch::tile_based::DsfTileCoord;
 /// Counts from the filtering pipeline.
 #[derive(Debug, Default)]
 pub(crate) struct FilterCounts {
-    /// Tiles skipped because they were in the local tracking set or memory cache.
+    /// Tiles skipped because they were already in the memory cache.
     pub cache_hits: usize,
     /// Tiles skipped because they are in patch-owned DSF regions.
     pub patch_skipped: usize,
@@ -53,27 +52,22 @@ impl FilterCounts {
 /// Returns the surviving tiles and the number of cache hits.
 ///
 /// Consults the memory cache as the authoritative source on every call.
-/// The `cached_tiles` parameter is retained for compatibility with the
-/// retention machinery (`evict_cached_tiles_outside_retained`) but is no
-/// longer read as a fast-path — the memory cache is intentionally small
-/// (request absorber, not working-set holder), so a HashSet shadow of
-/// prior hits goes stale within seconds, causing the filter to produce
-/// false cache-hit reports and starving the prefetcher of real work.
-/// See #172 Part 5 post-flight finding: the shadow fast-path was the
-/// primary cause of continued FUSE misses on boundary crossings even
-/// after Parts 1-4 were shipped.
-#[allow(clippy::ptr_arg)]
+/// A local `HashSet` shadow of prior hits used to stand in for this query
+/// as a "fast path" — the memory cache is intentionally small (request
+/// absorber, not working-set holder), so the shadow went stale within
+/// seconds, causing the filter to produce false cache-hit reports and
+/// starving the prefetcher of real work. See #172 Part 5 post-flight
+/// finding: the shadow fast-path was the primary cause of continued FUSE
+/// misses on boundary crossings even after Parts 1-4 were shipped. The
+/// shadow itself was deleted in #176 once confirmed write-only.
 pub(crate) async fn filter_memory_cache(
     tiles: Vec<TileCoord>,
     cache: &dyn DaemonMemoryCache,
-    _cached_tiles: &mut HashSet<TileCoord>,
 ) -> (Vec<TileCoord>, usize) {
     let mut filtered = Vec::with_capacity(tiles.len());
     let mut hits = 0usize;
 
     for tile in &tiles {
-        // Always query the authoritative memory cache — the HashSet
-        // shadow is no longer trusted (see doc comment).
         if cache.contains(tile.row, tile.col, tile.zoom).await {
             hits += 1;
             continue;
@@ -204,7 +198,6 @@ pub(crate) fn filter_dds_disk_cache(
 pub(crate) async fn run_filter_pipeline(
     mut tiles: Vec<TileCoord>,
     memory_cache: Option<&dyn DaemonMemoryCache>,
-    cached_tiles: &mut HashSet<TileCoord>,
     geo_index: Option<&Arc<GeoIndex>>,
     ortho_union_index: Option<&Arc<OrthoUnionIndex>>,
     dds_disk_checker: Option<&Arc<dyn DdsDiskCacheChecker>>,
@@ -213,7 +206,7 @@ pub(crate) async fn run_filter_pipeline(
 
     // Stage 1: Memory cache filter
     if let Some(cache) = memory_cache {
-        let (filtered, hits) = filter_memory_cache(tiles, cache, cached_tiles).await;
+        let (filtered, hits) = filter_memory_cache(tiles, cache).await;
         counts.cache_hits = hits;
         tiles = filtered;
     }
@@ -346,28 +339,24 @@ mod tests {
     #[tokio::test]
     async fn test_run_filter_pipeline_no_filters() {
         let tiles = test_tiles(5);
-        let mut tracked = HashSet::new();
 
-        let (result, counts) =
-            run_filter_pipeline(tiles, None, &mut tracked, None, None, None).await;
+        let (result, counts) = run_filter_pipeline(tiles, None, None, None, None).await;
         assert_eq!(result.len(), 5);
         assert_eq!(counts.total(), 0);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Regression guard: #172 post-flight finding — shadow staleness bug
+    // Authoritative memory cache behavior (#172 Part 5 post-flight finding)
     //
-    // The `cached_tiles` HashSet shadow is no longer consulted by
-    // `filter_memory_cache`. It went stale in production (memory cache
-    // evicts tiles under its small LRU budget, but the shadow keeps saying
-    // "cached"), causing the filter to falsely report 100% cache hits and
-    // starving the prefetcher of work for minutes at a time.
-    //
-    // The fix: always query the authoritative memory cache. The shadow is
-    // retained as a function parameter for compatibility with retention
-    // bookkeeping, but is neither read nor written by the filter.
-    //
-    // These tests prove the filter does NOT trust the shadow.
+    // `filter_memory_cache` used to be backed by a local `HashSet` shadow
+    // of "tiles we believe are cached" as a fast path. The shadow went
+    // stale in production (memory cache evicts tiles under its small LRU
+    // budget, but the shadow kept saying "cached"), causing the filter to
+    // falsely report 100% cache hits and starving the prefetcher of work
+    // for minutes at a time. The fix: always query the authoritative
+    // memory cache. The shadow itself was deleted in #176 once confirmed
+    // write-only, so these tests now simply pin the authoritative-query
+    // behavior directly.
     // ─────────────────────────────────────────────────────────────────────────
 
     use crate::executor::DaemonMemoryCache;
@@ -399,11 +388,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_filter_does_not_trust_stale_shadow_over_authoritative_cache() {
-        // Scenario: the caller populated `cached_tiles` (perhaps from a
-        // previous cycle's hits), but the memory cache has since evicted
-        // every one of those tiles. The filter must NOT claim cache hits
-        // based on the shadow — it must query the real cache.
+    async fn test_filter_memory_cache_always_miss_survives_all_tiles() {
+        // Authoritative check: a cache that has evicted every tile it once
+        // held must report zero hits — nothing survives from a stale
+        // local shadow, because there is no shadow to consult.
         let cache = AlwaysMissCache;
         let tiles: Vec<TileCoord> = (0..10)
             .map(|i| TileCoord {
@@ -413,29 +401,14 @@ mod tests {
             })
             .collect();
 
-        // Pre-populate the shadow with every tile — simulating the stale
-        // state seen in production where shadow insertions accumulated
-        // faster than retention eviction could clear them.
-        let mut stale_shadow: HashSet<TileCoord> = tiles.iter().copied().collect();
+        let (filtered, hits) = filter_memory_cache(tiles.clone(), &cache).await;
 
-        let (filtered, hits) = filter_memory_cache(tiles.clone(), &cache, &mut stale_shadow).await;
-
-        assert_eq!(
-            hits, 0,
-            "Stale shadow must not produce fake cache hits (real cache always misses)"
-        );
-        assert_eq!(
-            filtered, tiles,
-            "All uncached tiles must survive the filter regardless of shadow contents"
-        );
+        assert_eq!(hits, 0, "Real cache always misses, so no tiles are hits");
+        assert_eq!(filtered, tiles, "All tiles must survive the filter");
     }
 
     #[tokio::test]
-    async fn test_filter_does_not_write_to_shadow() {
-        // The shadow is now write-through inert — the filter should not
-        // add entries even when tiles ARE truly cached. This decouples
-        // the filter from the shadow's lifecycle (retention cleanup no
-        // longer races with filter population).
+    async fn test_filter_memory_cache_always_hit_filters_all_tiles() {
         struct AlwaysHitCache;
         impl DaemonMemoryCache for AlwaysHitCache {
             fn get(
@@ -460,16 +433,11 @@ mod tests {
 
         let cache = AlwaysHitCache;
         let tiles = test_tiles(5);
-        let mut shadow: HashSet<TileCoord> = HashSet::new();
 
-        let (filtered, hits) = filter_memory_cache(tiles, &cache, &mut shadow).await;
+        let (filtered, hits) = filter_memory_cache(tiles, &cache).await;
 
         assert_eq!(hits, 5, "Real hits should still be counted");
         assert!(filtered.is_empty(), "All hits should be filtered out");
-        assert!(
-            shadow.is_empty(),
-            "Filter must not write to the shadow — avoid accumulating stale entries"
-        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -560,7 +528,6 @@ mod tests {
         // End-to-end: pipeline with all filters OFF except DDS disk.
         // Tiles in the DDS disk mock should be stripped; the rest survive.
         let tiles = test_tiles(8);
-        let mut tracked = HashSet::new();
         let mut in_cache = HashSet::new();
         for tile in tiles.iter().take(3) {
             in_cache.insert((tile.row, tile.col, tile.zoom));
@@ -568,15 +535,8 @@ mod tests {
         let checker: Arc<dyn crate::executor::DdsDiskCacheChecker> =
             Arc::new(ChunkSetDiskChecker(in_cache));
 
-        let (result, counts) = run_filter_pipeline(
-            tiles.clone(),
-            None,
-            &mut tracked,
-            None,
-            None,
-            Some(&checker),
-        )
-        .await;
+        let (result, counts) =
+            run_filter_pipeline(tiles.clone(), None, None, None, Some(&checker)).await;
 
         assert_eq!(counts.dds_disk_hits, 3);
         assert_eq!(counts.cache_hits, 0);
@@ -590,8 +550,7 @@ mod tests {
     async fn test_filter_correctly_splits_partial_real_cache() {
         // Authoritative check: given a cache that hits on even rows and
         // misses on odd rows, the filter should split accordingly. This
-        // confirms the filter actually queries the real cache rather than
-        // rubber-stamping via shadow.
+        // confirms the filter actually queries the real cache per tile.
         struct EvenRowsCache;
         impl DaemonMemoryCache for EvenRowsCache {
             fn get(
@@ -623,9 +582,8 @@ mod tests {
 
         let cache = EvenRowsCache;
         let tiles = test_tiles(10); // rows 100..109 — evens at 100,102,104,106,108
-        let mut shadow = HashSet::new();
 
-        let (filtered, hits) = filter_memory_cache(tiles, &cache, &mut shadow).await;
+        let (filtered, hits) = filter_memory_cache(tiles, &cache).await;
 
         assert_eq!(hits, 5, "5 even-row tiles should hit");
         assert_eq!(filtered.len(), 5, "5 odd-row tiles should survive");

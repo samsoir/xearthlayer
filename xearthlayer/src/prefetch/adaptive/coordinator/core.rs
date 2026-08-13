@@ -113,13 +113,6 @@ pub struct AdaptivePrefetchCoordinator {
     /// that are already cached, avoiding unnecessary job submissions.
     pub(super) memory_cache: Option<Arc<dyn DaemonMemoryCache>>,
 
-    /// Tiles currently in cache (for filtering).
-    ///
-    /// Note: This is a fallback for when memory_cache is not available.
-    /// When memory_cache is set, this set is only used for tiles we've
-    /// submitted in the current session (as a fast local cache).
-    pub(super) cached_tiles: HashSet<TileCoord>,
-
     /// Current status.
     pub(super) status: CoordinatorStatus,
 
@@ -209,7 +202,6 @@ impl std::fmt::Debug for AdaptivePrefetchCoordinator {
             .field("has_calibration", &self.calibration.is_some())
             .field("has_dds_client", &self.dds_client.is_some())
             .field("has_metrics_client", &self.metrics_client.is_some())
-            .field("cached_tiles_count", &self.cached_tiles.len())
             .field("status", &self.status)
             .finish()
     }
@@ -232,7 +224,6 @@ impl AdaptivePrefetchCoordinator {
             sim_state: crate::aircraft_position::web_api::sim_state::SimState::default(),
             dds_client: None,
             memory_cache: None,
-            cached_tiles: HashSet::new(),
             status: CoordinatorStatus::default(),
             shared_status: None,
             total_cycles: 0,
@@ -774,16 +765,6 @@ impl AdaptivePrefetchCoordinator {
         fully_filtered.len()
     }
 
-    /// Mark tiles as cached (to avoid re-prefetching).
-    pub fn mark_cached(&mut self, tiles: impl IntoIterator<Item = TileCoord>) {
-        self.cached_tiles.extend(tiles);
-    }
-
-    /// Clear cached tile tracking.
-    pub fn clear_cache_tracking(&mut self) {
-        self.cached_tiles.clear();
-    }
-
     /// Get current status for UI/logging.
     pub fn status(&self) -> &CoordinatorStatus {
         &self.status
@@ -798,7 +779,6 @@ impl AdaptivePrefetchCoordinator {
     ///
     /// Call this when teleporting or starting a new flight.
     pub fn reset(&mut self) {
-        self.cached_tiles.clear();
         self.status = CoordinatorStatus::default();
     }
 
@@ -905,7 +885,6 @@ impl AdaptivePrefetchCoordinator {
             let (filtered_pending, filter_counts) = super::filtering::run_filter_pipeline(
                 pending,
                 self.memory_cache.as_deref(),
-                &mut self.cached_tiles,
                 self.geo_index.as_ref(),
                 self.ortho_union_index.as_ref(),
                 self.dds_disk_checker.as_ref(),
@@ -951,10 +930,6 @@ impl AdaptivePrefetchCoordinator {
             let cancellation = CancellationToken::new();
             let submitted = self.execute(&plan, cancellation);
 
-            if submitted > 0 {
-                self.mark_cached(plan.tiles.iter().take(submitted).cloned());
-            }
-
             self.total_cycles += 1;
             self.total_tiles_submitted += submitted as u64;
             self.total_cache_hits += filtered_total as u64;
@@ -985,7 +960,6 @@ impl AdaptivePrefetchCoordinator {
         let (filtered_tiles, filter_counts) = super::filtering::run_filter_pipeline(
             std::mem::take(&mut plan.tiles),
             self.memory_cache.as_deref(),
-            &mut self.cached_tiles,
             self.geo_index.as_ref(),
             self.ortho_union_index.as_ref(),
             self.dds_disk_checker.as_ref(),
@@ -1021,11 +995,6 @@ impl AdaptivePrefetchCoordinator {
             let cancellation = CancellationToken::new();
             self.execute(&plan, cancellation)
         };
-
-        // Mark submitted tiles as cached to avoid re-submitting
-        if submitted > 0 {
-            self.mark_cached(plan.tiles.iter().cloned());
-        }
 
         // Update statistics
         self.total_cycles += 1;
@@ -1063,11 +1032,12 @@ impl AdaptivePrefetchCoordinator {
         // without checking whether tiles had actually been generated.
         self.evaluate_stale_regions(&geo_index);
 
-        // Consult the authoritative DDS disk cache rather than the
-        // `cached_tiles` shadow HashSet. See #172 Part 3: the shadow
-        // failed to track ~94% of actually-cached tiles in production,
-        // leaving the rescue path (evaluate_stale_regions) to carry
-        // the work.
+        // Consult the authoritative DDS disk cache rather than a local
+        // shadow of "tiles we believe are cached". See #172 Part 3: a
+        // prior `HashSet` shadow failed to track ~94% of actually-cached
+        // tiles in production, leaving the rescue path
+        // (evaluate_stale_regions) to carry the work. The shadow itself
+        // was deleted in #176 once it was confirmed write-only.
         let promoted = BoundaryStrategy::promote_completed_regions(
             &geo_index,
             self.dds_disk_checker.as_ref(),
@@ -1089,9 +1059,6 @@ impl AdaptivePrefetchCoordinator {
         // Evict PrefetchedRegion entries for regions outside the retained window,
         // making them eligible for re-prefetch when the aircraft returns.
         BoundaryStrategy::evict_non_retained(&geo_index);
-        // Evict cached_tiles entries for tiles outside the retained window,
-        // allowing re-query of the memory cache for those tiles.
-        BoundaryStrategy::evict_cached_tiles_outside_retained(&mut self.cached_tiles, &geo_index);
 
         // Per-maintenance-cycle instrumentation (#172 Part 4): report
         // region-state distribution. A healthy system shows normal-path
@@ -1154,7 +1121,9 @@ impl AdaptivePrefetchCoordinator {
                 self.ortho_union_index.as_ref(),
             ) {
                 RegionDiskState::Complete => {
-                    // Tiles generated successfully — promote despite lost cached_tiles tracking
+                    // Tiles generated successfully — promote based on the
+                    // authoritative disk check (this is the rescue path;
+                    // the fast path never had reliable tracking to lose).
                     geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
                     // See the fast-path promotion comment in `run_region_maintenance`:
                     // the strike count belongs to the failed episode, not the region.
@@ -1271,8 +1240,8 @@ mod tests {
     use crate::prefetch::adaptive::coordinator::test_support::{
         ground_state, make_scenery_index, make_scenery_index_covering, patched_region_area,
         test_calibration, test_plan, AlwaysHitDiskChecker, AlwaysHitMemoryCache,
-        AlwaysMissMemoryCache, BackpressureMockClient, CapLimitedDdsClient, DummyTracker,
-        HighLoadDdsClient, MockDiskChecker, StableBoundsTracker,
+        BackpressureMockClient, CapLimitedDdsClient, DummyTracker, HighLoadDdsClient,
+        MockDiskChecker, StableBoundsTracker,
     };
     // ─────────────────────────────────────────────────────────────────────────
     // Creation tests
@@ -1427,68 +1396,6 @@ mod tests {
             high_extent,
             low_extent
         );
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Cache tracking tests
-    // ─────────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_mark_cached() {
-        let mut coord = AdaptivePrefetchCoordinator::with_defaults();
-
-        let tiles = vec![
-            TileCoord {
-                row: 100,
-                col: 200,
-                zoom: 14,
-            },
-            TileCoord {
-                row: 101,
-                col: 200,
-                zoom: 14,
-            },
-        ];
-
-        coord.mark_cached(tiles);
-        assert_eq!(coord.cached_tiles.len(), 2);
-    }
-
-    #[test]
-    fn test_clear_cache_tracking() {
-        let mut coord = AdaptivePrefetchCoordinator::with_defaults();
-
-        coord.mark_cached(vec![TileCoord {
-            row: 100,
-            col: 200,
-            zoom: 14,
-        }]);
-        assert_eq!(coord.cached_tiles.len(), 1);
-
-        coord.clear_cache_tracking();
-        assert!(coord.cached_tiles.is_empty());
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Reset tests
-    // ─────────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_reset() {
-        let mut coord =
-            AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
-
-        // Update to set state
-        coord.update((53.5, 9.5), 45.0, 200.0, 0.0);
-        coord.mark_cached(vec![TileCoord {
-            row: 100,
-            col: 200,
-            zoom: 14,
-        }]);
-
-        // Reset
-        coord.reset();
-        assert!(coord.cached_tiles.is_empty());
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3433,79 +3340,6 @@ mod tests {
         assert!(
             !coord.pending_tiles.is_empty(),
             "Unsubmitted tiles must be stored as pending for retry",
-        );
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Shadow-staleness integration regression (#172 post-flight finding)
-    //
-    // End-to-end guard: a pre-populated `cached_tiles` shadow combined with
-    // an empty memory cache must NOT cause the filter pipeline to starve
-    // the prefetcher. The coordinator must submit tiles whose reality
-    // differs from the shadow's belief.
-    //
-    // In production, this exact condition produced multiple
-    // `Prefetch plan filter pipeline summary raw_plan_tiles=200
-    // cache_skipped=200 ... remaining=0` lines over ~10 minutes of cruise,
-    // causing FUSE to fault tiles in on-demand at scenery-window boundary
-    // crossings (manifesting as 20-second hard sim freezes).
-    // ─────────────────────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_coordinator_submits_work_despite_stale_shadow_and_empty_cache() {
-        use crate::executor::DaemonMemoryCache;
-        use crate::geo_index::GeoIndex;
-
-        let geo_index = Arc::new(GeoIndex::new());
-        // Large channel cap — we want to see what the plan produces, not
-        // stress-test submission backpressure.
-        let client = Arc::new(CapLimitedDdsClient::new(10_000));
-        // Cache that reports miss for every query — simulates a memory
-        // cache that has evicted every tile it once held (the intentional
-        // "request absorber, not working-set holder" sizing).
-        let always_miss: Arc<dyn DaemonMemoryCache> = Arc::new(AlwaysMissMemoryCache);
-
-        let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
-            ramp_duration: std::time::Duration::from_secs(0),
-            ..Default::default()
-        };
-        let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
-            .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
-            .with_memory_cache(always_miss)
-            .with_scenery_index(wide_scenery_index_at_50_10());
-
-        // Pre-populate the shadow as if it had accumulated entries across
-        // many prior cycles before the memory cache evicted them. In
-        // production, this shadow grew to tens of thousands of entries
-        // that were no longer backed by real cache contents.
-        for row in 0..500u32 {
-            for col in 0..10u32 {
-                coord.cached_tiles.insert(TileCoord { row, col, zoom: 14 });
-            }
-        }
-        assert_eq!(
-            coord.cached_tiles.len(),
-            5000,
-            "Precondition: shadow is heavily populated",
-        );
-
-        fast_forward_to_cruise(&mut coord);
-        assert_eq!(coord.phase_detector.current_phase(), FlightPhase::Cruise);
-
-        let state = AircraftState::new(50.0, 10.0, 0.0, 200.0, 35000.0, false);
-        let submitted = coord.process_telemetry(&state).await.unwrap_or(0);
-
-        // Pre-hotfix behaviour: filter consults the shadow → claims all
-        // tiles are cached → plan empties → submitted == 0.
-        // Post-hotfix behaviour: filter queries the authoritative cache
-        // (always miss) → tiles survive filtering → submitted > 0.
-        assert!(
-            submitted > 0,
-            "Coordinator must submit tiles when the authoritative memory \
-             cache is empty, regardless of how populated the shadow HashSet is"
         );
     }
 
