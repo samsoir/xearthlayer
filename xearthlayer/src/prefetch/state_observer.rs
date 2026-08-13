@@ -16,18 +16,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::config::defaults::DEFAULT_PREFETCH_STALE_REGION_TIMEOUT;
 use crate::coord::TileCoord;
 use crate::geo_index::{DsfRegion, GeoIndex, PrefetchedRegion};
 use crate::metrics::MetricsClient;
 
 /// Minimum interval between demotions of the same region.
 ///
-/// Mirrors the default `prefetch.stale_region_timeout`. It is a constant
-/// rather than plumbed config because FUSE has no reason to depend on the
-/// prefetch config, and this bounds a diagnostic response, not a correctness
-/// decision. Eviction inside the retained window can recur, and an unbounded
-/// demote → re-prefetch → evict loop would churn on a long flight.
-const DEFAULT_DEMOTION_INTERVAL: Duration = Duration::from_secs(120);
+/// Derived from the default `prefetch.stale_region_timeout` canonical constant
+/// to maintain a structural link. It is a constant rather than plumbed config
+/// because FUSE has no reason to depend on the prefetch config, and this bounds
+/// a diagnostic response, not a correctness decision. Eviction inside the
+/// retained window can recur, and an unbounded demote → re-prefetch → evict
+/// loop would churn on a long flight.
+const DEFAULT_DEMOTION_INTERVAL: Duration =
+    Duration::from_secs(DEFAULT_PREFETCH_STALE_REGION_TIMEOUT);
 
 pub struct PrefetchStateObserver {
     geo_index: Arc<GeoIndex>,
