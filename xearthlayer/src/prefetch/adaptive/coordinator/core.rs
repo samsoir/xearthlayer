@@ -1072,6 +1072,7 @@ impl AdaptivePrefetchCoordinator {
             &geo_index,
             self.dds_disk_checker.as_ref(),
             self.scenery_index.as_ref(),
+            self.ortho_union_index.as_ref(),
         );
         // Evict PrefetchedRegion entries for regions outside the retained window,
         // making them eligible for re-prefetch when the aircraft returns.
@@ -1138,6 +1139,7 @@ impl AdaptivePrefetchCoordinator {
                 region,
                 self.scenery_index.as_ref(),
                 self.dds_disk_checker.as_ref(),
+                self.ortho_union_index.as_ref(),
             ) {
                 RegionDiskState::Complete => {
                     // Tiles generated successfully — promote despite lost cached_tiles tracking

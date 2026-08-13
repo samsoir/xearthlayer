@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::coord::TileCoord;
 use crate::executor::DdsDiskCacheChecker;
 use crate::geo_index::{DsfRegion, GeoIndex, PrefetchedRegion, RetainedRegion};
+use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::tile_based::DsfTileCoord;
 use crate::prefetch::SceneryIndex;
 
@@ -55,6 +56,7 @@ impl BoundaryStrategy {
         region: DsfRegion,
         scenery_index: Option<&Arc<SceneryIndex>>,
         dds_disk_checker: Option<&Arc<dyn DdsDiskCacheChecker>>,
+        ortho_union_index: Option<&Arc<OrthoUnionIndex>>,
     ) -> RegionDiskState {
         let (Some(index), Some(checker)) = (scenery_index, dds_disk_checker) else {
             return RegionDiskState::Unknown;
@@ -63,17 +65,43 @@ impl BoundaryStrategy {
         if tiles.is_empty() {
             return RegionDiskState::NoTiles;
         }
-        // Short-circuits on first miss.
-        // Pass tile coords (not chunk_origin) — the DDS disk cache is keyed
-        // by `tile:{tile_zoom}:{tile_row}:{tile_col}`. Using chunk coords
-        // here silently returned false for every tile, preventing promotion.
+        // Short-circuits on first miss. A tile counts as covered if either
+        // the XEL DDS disk cache or an installed package already has it —
+        // see `tile_is_covered`.
         if tiles
             .iter()
-            .all(|t| checker.tile_exists_blocking(t.row, t.col, t.zoom))
+            .all(|t| Self::tile_is_covered(t, checker, ortho_union_index))
         {
             RegionDiskState::Complete
         } else {
             RegionDiskState::Incomplete
+        }
+    }
+
+    /// A tile counts as covered if EITHER source has it.
+    ///
+    /// This is the same disjunction the submit-side filter pipeline applies:
+    /// stage 3 (`filter_disk_tiles`) drops tiles that already exist as real
+    /// `.dds` files in an installed package, so prefetch never writes them to
+    /// the XEL DDS cache. Promotion must use the same definition or regions
+    /// covered by package-shipped imagery can never be confirmed.
+    fn tile_is_covered(
+        tile: &TileCoord,
+        checker: &Arc<dyn DdsDiskCacheChecker>,
+        ortho_union_index: Option<&Arc<OrthoUnionIndex>>,
+    ) -> bool {
+        // XEL DDS disk cache: keyed by TILE coords.
+        if checker.tile_exists_blocking(tile.row, tile.col, tile.zoom) {
+            return true;
+        }
+        // OrthoUnionIndex: keyed by CHUNK coords. Mixing these up silently
+        // returns false for every tile — see the #172 keying bug.
+        match ortho_union_index {
+            Some(ortho) => {
+                let (chunk_row, chunk_col, chunk_zoom) = tile.chunk_origin();
+                ortho.dds_tile_exists(chunk_row, chunk_col, chunk_zoom)
+            }
+            None => false,
         }
     }
 
@@ -121,6 +149,7 @@ impl BoundaryStrategy {
         geo_index: &GeoIndex,
         dds_disk_checker: Option<&Arc<dyn DdsDiskCacheChecker>>,
         scenery_index: Option<&Arc<SceneryIndex>>,
+        ortho_union_index: Option<&Arc<OrthoUnionIndex>>,
     ) -> usize {
         let in_progress: Vec<DsfRegion> = geo_index
             .iter::<PrefetchedRegion>()
@@ -131,7 +160,12 @@ impl BoundaryStrategy {
 
         let mut promoted = 0;
         for region in &in_progress {
-            match Self::region_disk_state(*region, scenery_index, dds_disk_checker) {
+            match Self::region_disk_state(
+                *region,
+                scenery_index,
+                dds_disk_checker,
+                ortho_union_index,
+            ) {
                 RegionDiskState::Complete => {
                     geo_index.insert::<PrefetchedRegion>(*region, PrefetchedRegion::prefetched());
                     promoted += 1;
@@ -326,8 +360,12 @@ mod tests {
         let checker: Arc<dyn DdsDiskCacheChecker> =
             MockDiskChecker::with_tile_coords(tiles.iter().copied());
 
-        let promoted =
-            BoundaryStrategy::promote_completed_regions(&geo_index, Some(&checker), Some(&index));
+        let promoted = BoundaryStrategy::promote_completed_regions(
+            &geo_index,
+            Some(&checker),
+            Some(&index),
+            None,
+        );
         assert_eq!(promoted, 1);
 
         let state = geo_index.get::<PrefetchedRegion>(&region).unwrap();
@@ -365,8 +403,12 @@ mod tests {
         let checker: Arc<dyn DdsDiskCacheChecker> =
             MockDiskChecker::with_tile_coords(std::iter::once(tiles[0]));
 
-        let promoted =
-            BoundaryStrategy::promote_completed_regions(&geo_index, Some(&checker), Some(&index));
+        let promoted = BoundaryStrategy::promote_completed_regions(
+            &geo_index,
+            Some(&checker),
+            Some(&index),
+            None,
+        );
         assert_eq!(promoted, 0);
 
         let state = geo_index.get::<PrefetchedRegion>(&region).unwrap();
@@ -382,7 +424,7 @@ mod tests {
         let region = DsfRegion::new(50, 9);
         geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
 
-        let promoted = BoundaryStrategy::promote_completed_regions(&geo_index, None, None);
+        let promoted = BoundaryStrategy::promote_completed_regions(&geo_index, None, None, None);
         assert_eq!(promoted, 0);
 
         let state = geo_index.get::<PrefetchedRegion>(&region).unwrap();
@@ -445,8 +487,12 @@ mod tests {
             MockDiskChecker::with_tile_coords(tiles.iter().copied());
 
         // Promote should work with SceneryIndex (not hardcoded zoom 14)
-        let promoted =
-            BoundaryStrategy::promote_completed_regions(&geo_index, Some(&checker), Some(&index));
+        let promoted = BoundaryStrategy::promote_completed_regions(
+            &geo_index,
+            Some(&checker),
+            Some(&index),
+            None,
+        );
         assert_eq!(
             promoted, 1,
             "Should promote when all scenery index tiles are on disk"
@@ -478,8 +524,12 @@ mod tests {
             MockDiskChecker::with_tile_coords(wrong_tiles.into_iter());
 
         // Promote should NOT succeed — cached zoom 14, but index expects zoom 12
-        let promoted =
-            BoundaryStrategy::promote_completed_regions(&geo_index, Some(&checker), Some(&index));
+        let promoted = BoundaryStrategy::promote_completed_regions(
+            &geo_index,
+            Some(&checker),
+            Some(&index),
+            None,
+        );
         assert_eq!(
             promoted, 0,
             "Should not promote when cached tiles are at wrong zoom level"
@@ -547,8 +597,12 @@ mod tests {
             zoom: 12,
         }]);
 
-        let promoted =
-            BoundaryStrategy::promote_completed_regions(&geo_index, Some(&checker), Some(&index));
+        let promoted = BoundaryStrategy::promote_completed_regions(
+            &geo_index,
+            Some(&checker),
+            Some(&index),
+            None,
+        );
 
         assert_eq!(
             promoted, 1,
@@ -593,8 +647,12 @@ mod tests {
             zoom: 12,
         }]);
 
-        let promoted =
-            BoundaryStrategy::promote_completed_regions(&geo_index, Some(&checker), Some(&index));
+        let promoted = BoundaryStrategy::promote_completed_regions(
+            &geo_index,
+            Some(&checker),
+            Some(&index),
+            None,
+        );
 
         assert_eq!(promoted, 0, "a missing in-region tile must block promotion");
         assert!(geo_index
@@ -612,7 +670,7 @@ mod tests {
         let index = make_scenery_index_for_region(50, 9, 16);
         let region = DsfRegion { lat: 50, lon: 9 };
         assert_eq!(
-            BoundaryStrategy::region_disk_state(region, Some(&index), None),
+            BoundaryStrategy::region_disk_state(region, Some(&index), None, None),
             RegionDiskState::Unknown,
             "no checker means we cannot tell — must not be reported as Incomplete"
         );
@@ -625,7 +683,7 @@ mod tests {
         // A region the index knows nothing about.
         let region = DsfRegion { lat: -40, lon: 170 };
         assert_eq!(
-            BoundaryStrategy::region_disk_state(region, Some(&index), Some(&checker)),
+            BoundaryStrategy::region_disk_state(region, Some(&index), Some(&checker), None),
             RegionDiskState::NoTiles
         );
     }
@@ -642,7 +700,12 @@ mod tests {
 
         let all: Vec<TileCoord> = tiles.clone();
         assert_eq!(
-            BoundaryStrategy::region_disk_state(region, Some(&index), Some(&test_checker(&all))),
+            BoundaryStrategy::region_disk_state(
+                region,
+                Some(&index),
+                Some(&test_checker(&all)),
+                None
+            ),
             RegionDiskState::Complete
         );
 
@@ -651,7 +714,91 @@ mod tests {
             BoundaryStrategy::region_disk_state(
                 region,
                 Some(&index),
-                Some(&test_checker(&all_but_one))
+                Some(&test_checker(&all_but_one)),
+                None
+            ),
+            RegionDiskState::Incomplete
+        );
+    }
+
+    // =========================================================================
+    // region_disk_state + OrthoUnionIndex coverage (#176 Task 2 / #223 F2)
+    // =========================================================================
+    //
+    // Prefetch deliberately never downloads tiles that already ship as real
+    // `.dds` files in installed scenery packages (stage-3 `filter_disk_tiles`
+    // in the submit-side filter pipeline). Promotion must recognise those
+    // tiles as covered too, or the region can never be confirmed and
+    // ratchets to `NoCoverage` over land — a false alarm.
+
+    /// Build an [`OrthoUnionIndex`] backed by real `.dds` files on disk,
+    /// named at the given CHUNK coordinates (row, col, zoom) — matching how
+    /// `dds_tile_exists` resolves `textures/{row}_{col}_{prefix}{zoom}.dds`.
+    ///
+    /// The backing `TempDir` is deliberately leaked so its files remain on
+    /// disk for the rest of the test process: `dds_tile_exists` stats the
+    /// real filesystem on every call (lazy resolution), so dropping the
+    /// directory would make every lookup silently miss.
+    fn make_ortho_index_with_chunk_tiles(
+        chunk_tiles: Vec<(u32, u32, u8)>,
+    ) -> Arc<crate::ortho_union::OrthoUnionIndex> {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join("textures")).unwrap();
+        for (row, col, zoom) in chunk_tiles {
+            let filename = format!("{row}_{col}_ZL{zoom}.dds");
+            std::fs::write(temp.path().join("textures").join(filename), b"dds content").unwrap();
+        }
+        let source = crate::ortho_union::OrthoSource::new_package("test", temp.path());
+        Box::leak(Box::new(temp));
+        Arc::new(crate::ortho_union::OrthoUnionIndex::with_sources(vec![
+            source,
+        ]))
+    }
+
+    #[test]
+    fn test_region_complete_when_tiles_ship_in_an_installed_package() {
+        // A region whose tiles are NOT in the XEL DDS cache but ARE present as
+        // real .dds files in an installed package. Prefetch correctly never
+        // submitted them (stage-3 disk filter), so promotion must still be able
+        // to confirm the region — otherwise it ratchets to NoCoverage over land.
+        let index = make_scenery_index_for_region(50, 9, 16);
+        let region = DsfRegion { lat: 50, lon: 9 };
+        let tiles = index.tiles_in_region(region);
+        assert!(!tiles.is_empty(), "fixture precondition");
+
+        let empty_xel_cache = test_checker(&[]);
+
+        // Seed the ortho index at CHUNK coordinates — dds_tile_exists takes
+        // chunk coords while tile_exists_blocking takes tile coords. If the
+        // implementation passes tile coords here the lookup silently misses and
+        // this test fails, which is the point.
+        let ortho = make_ortho_index_with_chunk_tiles(
+            tiles.iter().map(|t| t.chunk_origin()).collect::<Vec<_>>(),
+        );
+
+        assert_eq!(
+            BoundaryStrategy::region_disk_state(
+                region,
+                Some(&index),
+                Some(&empty_xel_cache),
+                Some(&ortho),
+            ),
+            RegionDiskState::Complete
+        );
+    }
+
+    #[test]
+    fn test_region_incomplete_when_neither_source_has_the_tile() {
+        // Guards the disjunction against becoming a tautology.
+        let index = make_scenery_index_for_region(50, 9, 16);
+        let region = DsfRegion { lat: 50, lon: 9 };
+        let ortho = make_ortho_index_with_chunk_tiles(vec![]);
+        assert_eq!(
+            BoundaryStrategy::region_disk_state(
+                region,
+                Some(&index),
+                Some(&test_checker(&[])),
+                Some(&ortho)
             ),
             RegionDiskState::Incomplete
         );
