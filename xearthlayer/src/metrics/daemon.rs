@@ -347,6 +347,12 @@ impl MetricsDaemon {
             MetricEvent::PrefetchRegionDemoted => {
                 self.state.prefetch_regions_demoted += 1;
             }
+            MetricEvent::PrefetchRegionsPromotedNormal { count } => {
+                self.state.prefetch_promotions_normal += count as u64;
+            }
+            MetricEvent::PrefetchRegionPromotedRescue => {
+                self.state.prefetch_promotions_rescue += 1;
+            }
         }
     }
 
@@ -420,6 +426,8 @@ impl MetricsDaemon {
             regions_in_progress = state.prefetch_regions_in_progress,
             regions_prefetched = state.prefetch_regions_prefetched,
             regions_nocoverage = state.prefetch_regions_nocoverage,
+            promotions_normal = state.prefetch_promotions_normal,
+            promotions_rescue = state.prefetch_promotions_rescue,
             state_diverged = state.prefetch_state_diverged,
             regions_demoted = state.prefetch_regions_demoted,
             "Prefetch sample"
@@ -1183,6 +1191,36 @@ mod tests {
         assert_eq!(daemon.state.prefetch_regions_in_progress, 2);
         assert_eq!(daemon.state.prefetch_regions_prefetched, 3);
         assert_eq!(daemon.state.prefetch_regions_nocoverage, 0);
+    }
+
+    #[test]
+    fn test_promotion_counters_accumulate_and_are_separate() {
+        let (mut daemon, _tx) = create_daemon();
+
+        // Two events, not one: from a zero start `0 += n` and `0 = n` are
+        // indistinguishable, so a single event cannot prove these are counters.
+        daemon.process_event(MetricEvent::PrefetchRegionsPromotedNormal { count: 3 });
+        daemon.process_event(MetricEvent::PrefetchRegionsPromotedNormal { count: 2 });
+        daemon.process_event(MetricEvent::PrefetchRegionPromotedRescue);
+
+        assert_eq!(
+            daemon.state.prefetch_promotions_normal, 5,
+            "must accumulate, not assign"
+        );
+        assert_eq!(daemon.state.prefetch_promotions_rescue, 1);
+    }
+
+    #[test]
+    fn test_promotion_counters_reset() {
+        let (mut daemon, _tx) = create_daemon();
+        daemon.process_event(MetricEvent::PrefetchRegionsPromotedNormal { count: 4 });
+        daemon.process_event(MetricEvent::PrefetchRegionPromotedRescue);
+        daemon.state.reset();
+        assert_eq!(
+            daemon.state.prefetch_promotions_normal, 0,
+            "counters reset, unlike the region gauges"
+        );
+        assert_eq!(daemon.state.prefetch_promotions_rescue, 0);
     }
 
     #[tokio::test]

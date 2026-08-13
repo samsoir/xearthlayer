@@ -389,6 +389,18 @@ impl MetricsClient {
     pub fn prefetch_region_demoted(&self) {
         self.send(MetricEvent::PrefetchRegionDemoted);
     }
+
+    /// Records regions promoted via the normal completion path.
+    #[inline]
+    pub fn prefetch_regions_promoted_normal(&self, count: usize) {
+        self.send(MetricEvent::PrefetchRegionsPromotedNormal { count });
+    }
+
+    /// Records a region promoted via the rescue path.
+    #[inline]
+    pub fn prefetch_region_promoted_rescue(&self) {
+        self.send(MetricEvent::PrefetchRegionPromotedRescue);
+    }
 }
 
 impl std::fmt::Debug for MetricsClient {
