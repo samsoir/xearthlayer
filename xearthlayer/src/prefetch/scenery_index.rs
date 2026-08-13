@@ -240,62 +240,6 @@ impl SceneryIndex {
         }
     }
 
-    /// Query tiles within a radius of a position.
-    ///
-    /// Returns all tiles whose center is within `radius_nm` nautical miles
-    /// of the given position.
-    pub fn tiles_near(&self, lat: f64, lon: f64, radius_nm: f32) -> Vec<SceneryTile> {
-        let lat = lat as f32;
-        let lon = lon as f32;
-
-        // Convert radius to approximate degrees (1 degree ≈ 60nm at equator)
-        let radius_deg = radius_nm / 60.0;
-
-        // Determine which grid cells to check
-        let min_lat_cell = ((lat - radius_deg) / self.cell_size).floor() as i16;
-        let max_lat_cell = ((lat + radius_deg) / self.cell_size).ceil() as i16;
-        let min_lon_cell = ((lon - radius_deg) / self.cell_size).floor() as i16;
-        let max_lon_cell = ((lon + radius_deg) / self.cell_size).ceil() as i16;
-
-        debug!(
-            lat = lat,
-            lon = lon,
-            radius_nm = radius_nm,
-            lat_cells = format!("{}..={}", min_lat_cell, max_lat_cell),
-            lon_cells = format!("{}..={}", min_lon_cell, max_lon_cell),
-            total_tiles_indexed = *self.tile_count.read().unwrap(),
-            "Searching tiles_near"
-        );
-
-        let grid = self.grid.read().unwrap();
-        let mut result = Vec::new();
-        let mut cells_with_tiles = 0;
-
-        for lat_cell in min_lat_cell..=max_lat_cell {
-            for lon_cell in min_lon_cell..=max_lon_cell {
-                if let Some(cell) = grid.get(&(lat_cell, lon_cell)) {
-                    cells_with_tiles += 1;
-                    for tile in &cell.tiles {
-                        // Check actual distance
-                        let dist = approximate_distance_nm(lat, lon, tile.lat, tile.lon);
-                        if dist <= radius_nm {
-                            result.push(*tile);
-                        }
-                    }
-                }
-            }
-        }
-
-        debug!(
-            cells_searched = (max_lat_cell - min_lat_cell + 1) * (max_lon_cell - min_lon_cell + 1),
-            cells_with_tiles = cells_with_tiles,
-            tiles_found = result.len(),
-            "tiles_near search complete"
-        );
-
-        result
-    }
-
     /// Get the deduplicated set of DDS tiles belonging to a DSF region.
     ///
     /// A tile belongs to the region containing its geographic centre, which
@@ -666,16 +610,6 @@ fn parse_dds_filename(filename: &str) -> Option<(u32, u32, u8)> {
     Some((row, col, zoom))
 }
 
-/// Approximate distance in nautical miles using equirectangular projection.
-///
-/// Accurate enough for spatial queries within ~200nm.
-#[inline]
-fn approximate_distance_nm(lat1: f32, lon1: f32, lat2: f32, lon2: f32) -> f32 {
-    let lat_diff = (lat2 - lat1) * 60.0; // 1 degree = 60nm
-    let lon_diff = (lon2 - lon1) * 60.0 * (lat1.to_radians().cos());
-    (lat_diff * lat_diff + lon_diff * lon_diff).sqrt()
-}
-
 /// Parse outcome for one scenery package.
 ///
 /// `failed` is the count of `.ter` files present on disk that did not yield a
@@ -812,33 +746,6 @@ mod tests {
     }
 
     #[test]
-    fn test_scenery_index_add_and_query() {
-        let index = SceneryIndex::with_defaults();
-
-        // Add a tile at (45.0, -120.0)
-        let tile = SceneryTile {
-            row: 25000,
-            col: 10000,
-            chunk_zoom: 16,
-            lat: 45.0,
-            lon: -120.0,
-            is_sea: false,
-        };
-        index.add_tile(tile);
-
-        assert_eq!(index.tile_count(), 1);
-
-        // Query near the tile
-        let results = index.tiles_near(45.0, -120.0, 10.0);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].row, 25000);
-
-        // Query far from the tile
-        let results = index.tiles_near(50.0, -120.0, 10.0);
-        assert_eq!(results.len(), 0);
-    }
-
-    #[test]
     fn test_scenery_index_sea_and_land_counts() {
         let index = SceneryIndex::with_defaults();
 
@@ -865,24 +772,6 @@ mod tests {
         assert_eq!(index.tile_count(), 2);
         assert_eq!(index.sea_tile_count(), 1);
         assert_eq!(index.land_tile_count(), 1);
-
-        // Query all tiles
-        let all = index.tiles_near(45.0, -120.0, 10.0);
-        assert_eq!(all.len(), 2);
-    }
-
-    #[test]
-    fn test_approximate_distance_nm() {
-        // Same point
-        assert!(approximate_distance_nm(45.0, -120.0, 45.0, -120.0) < 0.01);
-
-        // 1 degree north (should be ~60nm)
-        let dist = approximate_distance_nm(45.0, -120.0, 46.0, -120.0);
-        assert!((dist - 60.0).abs() < 1.0);
-
-        // 1 degree east at 45° lat (should be ~42nm due to cosine)
-        let dist = approximate_distance_nm(45.0, -120.0, 45.0, -119.0);
-        assert!((dist - 42.4).abs() < 2.0);
     }
 
     /// Helper: a land tile at a given position. Row/col are irrelevant to the
@@ -1105,12 +994,17 @@ mod tests {
         eprintln!("  Land tiles: {}", index.land_tile_count());
         eprintln!("  Sea tiles: {}", index.sea_tile_count());
 
-        // Query tiles near a known location (California)
-        let tiles = index.tiles_near(36.28, -119.49, 10.0);
-        assert!(!tiles.is_empty(), "Expected tiles near (36.28, -119.49)");
+        // Spot-check the DSF region containing a known location (California).
+        // floor(36.28) == 36, floor(-119.49) == -120, so the region is (36, -120).
+        let tiles = index.tiles_in_region(DsfRegion::new(36, -120));
+        assert!(!tiles.is_empty(), "Expected tiles in region (36, -120)");
 
-        // Verify we have both ZL16 and ZL18 tiles
-        let has_zl16 = tiles.iter().any(|t| t.chunk_zoom == 16);
+        // Verify we have ZL16 tiles. tiles_in_region returns TileCoord, whose
+        // zoom is the *tile* zoom, not the chunk zoom baked into DDS filenames:
+        // chunk_zoom 16 corresponds to tile_zoom 16 - CHUNK_ZOOM_OFFSET == 12.
+        let has_zl16 = tiles
+            .iter()
+            .any(|t| t.zoom == 16 - crate::coord::CHUNK_ZOOM_OFFSET);
         eprintln!("Has ZL16 tiles: {}", has_zl16);
     }
 }
