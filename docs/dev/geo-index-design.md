@@ -33,11 +33,13 @@ Package `.ter` files reference `.dds` textures that FUSE won't generate in patch
 - Persistent storage (in-memory only; rebuild on startup)
 - Sub-region granularity (1x1 DSF regions are the atomic unit)
 - Runtime modification of the `PatchCoverage` layer during flights (populated
-  once at startup and never rewritten). This does **not** hold for the
-  `PrefetchedRegion` layer — it has two concurrent in-flight writers, the
-  prefetch coordinator and the FUSE-side `PrefetchStateObserver`, and is
-  rewritten continuously for the life of a flight. See
-  `docs/dev/adaptive-prefetch-design.md` for its state machine.
+  once at startup and never rewritten). This does **not** hold for
+  `PrefetchedRegion` or `RetainedRegion` — both are rewritten continuously for
+  the life of a flight: `RetainedRegion` by `SceneryWindow` every coordinator
+  cycle, and `PrefetchedRegion` by two concurrent in-flight writers, the
+  prefetch coordinator and the FUSE-side `PrefetchStateObserver`. See
+  `docs/dev/adaptive-prefetch-design.md` for the `PrefetchedRegion` state
+  machine.
 
 ---
 

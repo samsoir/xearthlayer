@@ -862,18 +862,17 @@ The existing `TransitionThrottle` ramps prefetch from 25% to 100% over 30 second
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        Prefetch Filter Chain                            │
 │                                                                         │
-│  1. LOCAL TRACKING (HashSet) - O(1)                                     │
-│     Skip tiles submitted this session                                   │
+│  1. MEMORY CACHE (async) - moka LRU query                              │
+│     Skip tiles already generated (DaemonMemoryCache)                    │
 │                                                                         │
-│  2. MEMORY CACHE (async) - moka LRU query                              │
-│     Skip tiles already generated                                        │
-│                                                                         │
-│  3. PATCHED REGION EXCLUSION (GeoIndex PatchCoverage)                   │
+│  2. PATCHED REGION EXCLUSION (GeoIndex PatchCoverage)                   │
 │     Skip tiles in DSF regions owned by scenery patches                  │
 │                                                                         │
-│  4. DISK EXISTENCE (filesystem probe) - slow                            │
-│     Skip tiles from installed packages and XEL cache                    │
-│     Checks: ZL, BI, GO2, GO filename patterns                          │
+│  3. INSTALLED PACKAGE DISK (OrthoUnionIndex) - filesystem probe         │
+│     Skip tiles that already ship as real .dds files in a package        │
+│                                                                         │
+│  4. XEL DDS DISK CACHE (DdsDiskCacheChecker) - filesystem probe         │
+│     Skip tiles XEL has already downloaded and cached itself             │
 │                                                                         │
 │  Only tiles passing ALL four filters are submitted for download         │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -1072,9 +1071,11 @@ SimState (X-Plane Web API)
 If some tiles in a submitted region fail:
 - Region stays `InProgress`
 - After `stale_region_timeout` (120s), `region_disk_state` reports `Incomplete` — see
-  [Region States](#region-states-geoindex-prefetchedregion-layer) above — so the region
-  reverts to *absent* for retry, up to `MAX_REGION_ATTEMPTS` (3) times before being
-  retired to `NoCoverage`
+  [Region States](#region-states-geoindex-prefetchedregion-layer) above — and the
+  region's strike count increments. While the count stays under
+  `MAX_REGION_ATTEMPTS` (3) the region reverts to *absent* for retry; the strike that
+  reaches 3 retires it to `NoCoverage` instead of granting another retry — so a region
+  gets at most 2 revert-to-absent retries before retirement, not 3
 - Next evaluation cycle (while retries remain): target diff finds the region, re-submits
 - Four-tier filter handles individual tile dedup (only failed tiles re-submitted)
 
