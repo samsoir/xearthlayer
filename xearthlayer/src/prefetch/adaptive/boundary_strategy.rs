@@ -17,7 +17,12 @@ use crate::prefetch::SceneryIndex;
 /// Handles region state transitions (InProgress → Prefetched) and
 /// retention-based eviction. Staleness is handled by the coordinator's
 /// `evaluate_stale_regions`, which checks the DDS disk before deciding
-/// whether a stale region should be promoted or retried.
+/// whether a stale region should be promoted, retried, or — after
+/// `MAX_REGION_ATTEMPTS` retries — retired to `NoCoverage` permanently
+/// for the session. A fourth outcome exists alongside those three: when
+/// [`RegionDiskState::Unknown`] reports no authoritative source to
+/// consult, the region is left untouched and the attempt does not count
+/// against the retry limit.
 pub struct BoundaryStrategy;
 
 /// What the authoritative DDS disk cache can tell us about a region.

@@ -342,9 +342,12 @@ daemon does not emit a burst of catch-up samples.
 
 If the probe returns `None`, **or returns `Some` with `rss_bytes == 0`**, the
 daemon logs one warning (`"Memory probe unavailable; memory samples
-disabled"`), latches `memory_probe_failed`, and emits nothing further for that
-tick. The warning is not repeated, but the probe is retried every subsequent
-tick — a later tick returning a valid reading resumes normal sampling without
+disabled"`), latches `memory_probe_failed`, and emits no memory sample for
+that tick — the `Prefetch sample` line sharing the same 60s interval still
+fires unconditionally (`log_prefetch_sample` has no dependency on the memory
+probe); see `docs/dev/adaptive-prefetch-design.md` for its field format. The
+warning is not repeated, but the probe is retried every subsequent tick — a
+later tick returning a valid reading resumes normal sampling without
 re-latching anything.
 
 Because `MetricsSystem::new` is constructed unconditionally in

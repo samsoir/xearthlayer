@@ -32,7 +32,12 @@ Package `.ter` files reference `.dds` textures that FUSE won't generate in patch
 
 - Persistent storage (in-memory only; rebuild on startup)
 - Sub-region granularity (1x1 DSF regions are the atomic unit)
-- Runtime modification of layers during flights (populated at startup)
+- Runtime modification of the `PatchCoverage` layer during flights (populated
+  once at startup and never rewritten). This does **not** hold for the
+  `PrefetchedRegion` layer — it has two concurrent in-flight writers, the
+  prefetch coordinator and the FUSE-side `PrefetchStateObserver`, and is
+  rewritten continuously for the life of a flight. See
+  `docs/dev/adaptive-prefetch-design.md` for its state machine.
 
 ---
 
@@ -70,7 +75,7 @@ xearthlayer/src/geo_index/
 ├── mod.rs       # Module definition, re-exports
 ├── region.rs    # DsfRegion type (1x1 coordinate)
 ├── index.rs     # GeoIndex implementation
-└── layers.rs    # GeoLayer trait, PatchCoverage
+└── layers.rs    # GeoLayer trait, PatchCoverage, RetainedRegion, PrefetchedRegion
 ```
 
 ### Data Model
@@ -84,10 +89,23 @@ GeoIndex
 │   ├── DsfRegion(+45, +012) → PatchCoverage { patch_name: "LIPX_Mesh" }
 │   └── DsfRegion(+33, -119) → PatchCoverage { patch_name: "KLAX_Ortho" }
 │
+├── Layer: RetainedRegion
+│   └── DsfRegion(+50, +007) → RetainedRegion   (unit struct — presence is the payload)
+│
+├── Layer: PrefetchedRegion
+│   ├── DsfRegion(+50, +008) → PrefetchedRegion { state: InProgress, since: ... }
+│   └── DsfRegion(+50, +009) → PrefetchedRegion { state: Prefetched, since: ... }
+│
 └── (future layers added here without modifying existing code)
 ```
 
-Each layer type (`PatchCoverage`, etc.) is an independent `DashMap<DsfRegion, T>` accessed via Rust's `TypeId` for type-safe heterogeneous storage.
+Each layer type (`PatchCoverage`, `RetainedRegion`, `PrefetchedRegion`, etc.)
+is an independent `DashMap<DsfRegion, T>` accessed via Rust's `TypeId` for
+type-safe heterogeneous storage. `PatchCoverage` and `RetainedRegion` are
+populated by a single writer (startup population, `SceneryWindow` per cycle
+respectively); `PrefetchedRegion` is written concurrently by the prefetch
+coordinator and the FUSE-side `PrefetchStateObserver` — see
+`docs/dev/adaptive-prefetch-design.md` for its state machine.
 
 ---
 
@@ -181,6 +199,36 @@ Indicates a DSF region is owned by a scenery patch:
 ```rust
 pub struct PatchCoverage {
     pub patch_name: String,  // e.g., "LIPX_Mesh"
+}
+```
+
+#### `RetainedRegion`
+
+Unit struct marking a DSF region as retained by X-Plane's scenery window
+(inferred from `SceneTracker` observations). Inserted/removed by
+`SceneryWindow` each coordinator cycle; presence in the layer is the entire
+payload:
+
+```rust
+pub struct RetainedRegion;
+```
+
+#### `PrefetchedRegion`
+
+Tracks prefetch state per DSF region: `InProgress`, `Prefetched`, or
+`NoCoverage`, plus the `Instant` the state was set (used for staleness
+checks). Regions absent from the layer are "never evaluated" — eligible for
+prefetch. Written by two concurrent sources: the prefetch coordinator
+(`AdaptivePrefetchCoordinator`, via `BoundaryStrategy`) and the FUSE-side
+`PrefetchStateObserver`, which demotes a `Prefetched`/`NoCoverage` region
+when FUSE has to generate a tile on demand there. See
+`docs/dev/adaptive-prefetch-design.md` for the full state machine
+(two-phase commit, stale-region rescue, demotion).
+
+```rust
+pub struct PrefetchedRegion {
+    state: RegionState,   // InProgress | Prefetched | NoCoverage
+    since: Instant,
 }
 ```
 
@@ -322,7 +370,8 @@ Bulk population via `populate()` provides atomicity: readers never see a partial
 | `xearthlayer/src/geo_index/mod.rs` | Module definition, re-exports |
 | `xearthlayer/src/geo_index/region.rs` | `DsfRegion` type |
 | `xearthlayer/src/geo_index/index.rs` | `GeoIndex` implementation |
-| `xearthlayer/src/geo_index/layers.rs` | `GeoLayer` trait, `PatchCoverage` |
+| `xearthlayer/src/geo_index/layers.rs` | `GeoLayer` trait, `PatchCoverage`, `RetainedRegion`, `PrefetchedRegion` |
+| `xearthlayer/src/prefetch/state_observer.rs` | `PrefetchStateObserver` — FUSE-side `PrefetchedRegion` writer (demotion) |
 | `xearthlayer/src/ortho_union/index.rs` | `resolve_lazy_filtered()` |
 | `xearthlayer/src/fuse/fuse3/ortho_union_fs.rs` | FUSE composition (`is_geo_filtered`, `resolve_lazy_geo`) |
 | `xearthlayer/src/manager/mounts.rs` | GeoIndex creation and population |

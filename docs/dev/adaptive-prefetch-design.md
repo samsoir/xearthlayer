@@ -248,7 +248,18 @@ Each DSF region in the XEL Window has one of four states:
 This follows a **two-phase commit** pattern:
 1. **Reserve**: Region marked `InProgress` when tiles are submitted (prevents duplicate bulk submissions)
 2. **Confirm**: Region marked `Prefetched` when tiles are confirmed in cache
-3. **Timeout**: If `InProgress` exceeds `stale_region_timeout`, reverts to *absent* for re-evaluation
+3. **Timeout**: If `InProgress` exceeds `stale_region_timeout`, `evaluate_stale_regions`
+   consults `BoundaryStrategy::region_disk_state` — the same completeness predicate the
+   fast path uses — and picks one of four outcomes:
+   - Disk shows every tile present → promote straight to `Prefetched` (the rescue path;
+     see [Region Tile-Set SSOT](#region-tile-set-ssot) below)
+   - Disk shows tiles missing, under `MAX_REGION_ATTEMPTS` (3) → reverts to *absent* for
+     re-evaluation next cycle, incrementing the region's strike count
+   - Disk shows tiles missing, at `MAX_REGION_ATTEMPTS` → retired to `NoCoverage`
+     **permanently for the session** — this is the event flight-test criterion 4 keys on
+   - No authoritative source to consult (no `DdsDiskCacheChecker` and/or no
+     `SceneryIndex`) → left `InProgress` untouched; this does **not** count as a retry,
+     since "cannot tell" must not be treated the same as "checked and it is absent"
 
 A region can reach step 1 without submitting anything. When the filter
 pipeline removes a region's *entire* planned tile set as already cached, there
@@ -272,6 +283,48 @@ whether a region is complete. Earlier code reconstructed the tile set from a
 45nm radius query per path, which returns a circle overlapping neighbouring
 regions rather than the region itself — the source of several promotion bugs
 fixed under #176.
+
+`BoundaryStrategy::region_disk_state` (`xearthlayer/src/prefetch/adaptive/boundary_strategy.rs`)
+is the single completeness predicate built on top of that tile set, consumed
+by both the fast path (`promote_completed_regions`) and the rescue path
+(`evaluate_stale_regions`). It returns one of four states — `Complete`,
+`Incomplete`, `NoTiles`, or `Unknown` — rather than a `bool`, because the
+answer feeds a decision whose terminal outcome is permanent exclusion
+(`NoCoverage`): "we cannot tell" (`Unknown` — no `DdsDiskCacheChecker` and/or
+no `SceneryIndex` wired) must stay distinguishable from "we checked and it is
+absent" (`Incomplete`/`NoTiles`), or a region could be retired to `NoCoverage`
+on a cycle where it was never actually checked.
+
+**Coverage is a disjunction.** A tile counts as covered if it is present in
+the XEL DDS disk cache (`DdsDiskCacheChecker`) **or** ships inside an
+installed scenery package (`OrthoUnionIndex::dds_tile_exists`) — prefetch
+deliberately never downloads tiles the disk filter (stage 3 of the four-tier
+filter) already excluded as package-shipped, so promotion must recognise
+that same evidence or a region covered entirely by package imagery could
+never be confirmed and would ratchet to `NoCoverage` over land. The two
+lookups use different coordinate systems: the XEL DDS cache is keyed by
+**tile** coordinates (`tile.row, tile.col, tile.zoom`), while
+`OrthoUnionIndex::dds_tile_exists` is keyed by **chunk** coordinates
+(`tile.chunk_origin()`) — mixing them up silently returns "not covered" for
+every tile (the #172 keying bug).
+
+**Strike counts survive the retry branch, not the promote branch.** A
+region's `region_attempts` strike count is cleared on promotion (both the
+fast path and the rescue path) but deliberately left untouched on the retry
+branch of `evaluate_stale_regions`. This looks backwards until you notice
+what the retry branch does: it *removes* the region's `PrefetchedRegion`
+entry from the `GeoIndex` so the region is eligible for re-prefetch — and
+that removal is exactly what makes `region_attempts` (a separate
+`HashMap<DsfRegion, u8>` on the coordinator, not stored in the `GeoIndex`)
+the only thing that still remembers the region failed last time. Clearing it
+on retry, by naive symmetry with the promote branch, would make
+`MAX_REGION_ATTEMPTS` unreachable: every retry would restart the count at
+zero and a region that never succeeds would retry forever instead of
+eventually being retired to `NoCoverage`. Promotion clears it for the
+opposite reason — a promoted region's failure history belongs to the episode
+that failed, not to the region, so a region that recovers and is later
+demoted by `PrefetchStateObserver` should not be retired to `NoCoverage`
+after a single fresh failure.
 
 ### Demotion: Closing the Loop on Wrong Claims
 
@@ -315,8 +368,17 @@ wire it up and these become totals since the last reset:
 
 ```
 INFO Prefetch sample uptime_s=... regions_in_progress=... regions_prefetched=...
-     regions_nocoverage=... state_diverged=... regions_demoted=...
+     regions_nocoverage=... promotions_normal=... promotions_rescue=...
+     state_diverged=... regions_demoted=...
 ```
+
+`promotions_normal` counts fast-path promotions (`promote_completed_regions`,
+per-cycle region maintenance); `promotions_rescue` counts stale-region
+rescue promotions (`evaluate_stale_regions`, the `RegionDiskState::Complete`
+arm above). A healthy flight should show `promotions_normal` dominating; a
+high `promotions_rescue` ratio means the fast path is stalling and the
+rescue path is carrying the work — see [Region Tile-Set
+SSOT](#region-tile-set-ssot).
 
 `state_diverged` and `regions_demoted` are expected to stay at (or near) zero
 on a healthy flight; a climbing `state_diverged` with a flat `regions_demoted`
@@ -1009,8 +1071,11 @@ SimState (X-Plane Web API)
 
 If some tiles in a submitted region fail:
 - Region stays `InProgress`
-- After `stale_region_timeout` (120s), reverts to *absent*
-- Next evaluation cycle: target diff finds the region, re-submits
+- After `stale_region_timeout` (120s), `region_disk_state` reports `Incomplete` — see
+  [Region States](#region-states-geoindex-prefetchedregion-layer) above — so the region
+  reverts to *absent* for retry, up to `MAX_REGION_ATTEMPTS` (3) times before being
+  retired to `NoCoverage`
+- Next evaluation cycle (while retries remain): target diff finds the region, re-submits
 - Four-tier filter handles individual tile dedup (only failed tiles re-submitted)
 
 ---
