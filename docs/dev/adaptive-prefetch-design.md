@@ -416,7 +416,6 @@ Regions previously retained but now outside → evicted from GeoIndex
 
 When a region leaves the retained area, the coordinator also evicts:
 - Its `PrefetchedRegion` entry (making it eligible for re-prefetch if the aircraft returns)
-- Any `cached_tiles` entries for tiles in that region (allowing fresh memory cache queries)
 
 `InProgress` regions are never evicted — they represent actively running prefetch jobs.
 
@@ -770,15 +769,21 @@ If backpressure reduces batch size, the most urgent axis is served first.
 
 ### Interface
 
+> **Stale**, like the algorithm block above: `BoundaryStrategy` does not
+> implement `AdaptivePrefetchStrategy` — it exposes static functions
+> (`promote_completed_regions`, `evict_non_retained`, `region_disk_state`)
+> instead. The trait itself still exists (`xearthlayer/src/prefetch/adaptive/strategy.rs`);
+> its current `calculate_prefetch` signature, for reference:
+
 ```rust
-impl AdaptivePrefetchStrategy for BoundaryStrategy {
+pub trait AdaptivePrefetchStrategy: Send + Sync {
     fn calculate_prefetch(
         &self,
         position: (f64, f64),
-        predictions: &[BoundaryCrossing],
-        xel_window: &XelWindow,
-        cached_tiles: &HashSet<TileCoord>,
-    ) -> Option<PrefetchPlan>;
+        track: f64,
+        calibration: &PerformanceCalibration,
+        already_cached: &HashSet<TileCoord>,
+    ) -> PrefetchPlan;
 }
 ```
 

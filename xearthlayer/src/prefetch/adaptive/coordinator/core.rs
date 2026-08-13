@@ -775,13 +775,6 @@ impl AdaptivePrefetchCoordinator {
         &self.phase_detector
     }
 
-    /// Reset the coordinator state.
-    ///
-    /// Call this when teleporting or starting a new flight.
-    pub fn reset(&mut self) {
-        self.status = CoordinatorStatus::default();
-    }
-
     // ─────────────────────────────────────────────────────────────────────────
     // Internal helpers
     // ─────────────────────────────────────────────────────────────────────────

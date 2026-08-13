@@ -103,7 +103,12 @@ pub struct PrefetchPlan {
 /// Used by the coordinator for logging and UI reporting.
 #[derive(Debug, Clone)]
 pub struct PrefetchPlanMetadata {
-    /// Source of bounds data (e.g., "explicit", "cached_tiles", "default").
+    /// Source of bounds data. The only literal ever assigned to this field
+    /// is `"track"`, in [`PrefetchPlanMetadata::cruise`] — but that
+    /// constructor, [`PrefetchPlanMetadata::ground`], and
+    /// [`PrefetchPlan::with_tiles_and_metadata`] all currently have zero
+    /// callers, so in practice `PrefetchPlan::metadata` is always `None`
+    /// and this field is never observed.
     pub bounds_source: &'static str,
 
     /// Number of DSF tiles in the prefetch region.
