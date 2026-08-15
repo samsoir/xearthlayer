@@ -1051,7 +1051,19 @@ impl AdaptivePrefetchCoordinator {
         }
         // Evict PrefetchedRegion entries for regions outside the retained window,
         // making them eligible for re-prefetch when the aircraft returns.
-        BoundaryStrategy::evict_non_retained(&geo_index);
+        //
+        // Gated to Cruise to match the retention update in `update()`, which is
+        // cruise-only by design. The retained set is only authoritative while it
+        // is being maintained: after landing it freezes at whatever the last
+        // cruise cycle computed, and evicting against a frozen set removes
+        // regions the ground box still covers. Those regions then re-plan, filter
+        // out as already-cached, are marked InProgress, are promoted, and are
+        // evicted again — a silent loop that inflated `promotions_normal` by
+        // ~1170 after landing on acceptance flight 1 (#176). Retention and
+        // eviction must share a phase, or the pair is not a pair.
+        if matches!(self.phase_detector.current_phase(), FlightPhase::Cruise) {
+            BoundaryStrategy::evict_non_retained(&geo_index);
+        }
 
         // Per-maintenance-cycle instrumentation (#172 Part 4): report
         // region-state distribution. A healthy system shows normal-path
