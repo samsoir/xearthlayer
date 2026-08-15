@@ -27,7 +27,7 @@ use crate::package::{
 use crate::panic as panic_handler;
 use crate::patches::{extract_dsf_regions, PatchDiscovery};
 use crate::prefetch::tile_based::DdsAccessEvent;
-use crate::prefetch::TileRequestCallback;
+use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use crate::scene_tracker::{DefaultSceneTracker, FuseAccessEvent};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
 
@@ -467,18 +467,30 @@ impl MountManager {
         // Store the index for tile-based prefetcher to use later
         let index_for_prefetch = Arc::new(index);
 
+        // Build the prefetch state observer (#176): detects when FUSE has to
+        // generate a tile on demand in a region prefetch already marked
+        // Prefetched or NoCoverage, and demotes that region so it is
+        // re-prefetched instead of leaving a stale, contradicted claim.
+        let metrics_client = service.metrics_client();
+        let mut state_observer = PrefetchStateObserver::new(Arc::clone(&geo_index));
+        if let Some(ref metrics) = metrics_client {
+            state_observer = state_observer.with_metrics_client(metrics.clone());
+        }
+        let state_observer = Arc::new(state_observer);
+
         // Create and mount the consolidated ortho union filesystem with DDS access channel
         // Wire Scene Tracker channel for empirical scenery tracking
         // Wire FUSE kernel limits for concurrent background request control
         let mut ortho_union_fs =
             Fuse3OrthoUnionFS::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
                 .with_geo_index(Arc::clone(&geo_index))
+                .with_state_observer(state_observer)
                 .with_dds_access_channel(dds_access_tx)
                 .with_scene_tracker_channel(scene_tracker_tx)
                 .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold);
 
         // Wire metrics client for coalesced request tracking
-        if let Some(metrics) = service.metrics_client() {
+        if let Some(metrics) = metrics_client {
             ortho_union_fs = ortho_union_fs.with_metrics(metrics);
         }
         let mountpoint_str = mountpoint.to_string_lossy();

@@ -39,12 +39,13 @@
 use super::inode::InodeManager;
 use super::shared::{DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
 use super::types::{Fuse3Error, Fuse3Result};
+use crate::coord::TileCoord;
 use crate::executor::{DdsClient, StorageConcurrencyLimiter};
 use crate::fuse::coalesce::RequestCoalescer;
 use crate::fuse::{get_default_placeholder, parse_dds_filename};
 use crate::geo_index::GeoIndex;
 use crate::ortho_union::OrthoUnionIndex;
-use crate::prefetch::{DdsAccessEvent, DsfTileCoord, TileRequestCallback};
+use crate::prefetch::{DdsAccessEvent, DsfTileCoord, PrefetchStateObserver, TileRequestCallback};
 use crate::scene_tracker::{DdsTileCoord, FuseAccessEvent};
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
@@ -108,6 +109,8 @@ pub struct Fuse3OrthoUnionFS {
     /// When set, FUSE filters lazy resolution to only serve patch sources in
     /// those regions, hiding package files that would cause X-Plane conflicts.
     geo_index: Option<Arc<GeoIndex>>,
+    /// Observer for prefetch state divergence (#176).
+    state_observer: Option<Arc<PrefetchStateObserver>>,
     /// Client for DDS generation requests (new daemon architecture)
     dds_client: Arc<dyn DdsClient>,
     /// Inode manager for path mappings
@@ -186,6 +189,7 @@ impl Fuse3OrthoUnionFS {
         Self {
             index: Arc::new(index),
             geo_index: None,
+            state_observer: None,
             dds_client,
             inode_manager: InodeManager::new(virtual_root),
             virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
@@ -217,6 +221,7 @@ impl Fuse3OrthoUnionFS {
         Self {
             index: Arc::new(index),
             geo_index: None,
+            state_observer: None,
             dds_client,
             inode_manager: InodeManager::new(virtual_root),
             virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
@@ -318,6 +323,15 @@ impl Fuse3OrthoUnionFS {
     /// only from patch sources, hiding package files that could conflict.
     pub fn with_geo_index(mut self, geo_index: Arc<GeoIndex>) -> Self {
         self.geo_index = Some(geo_index);
+        self
+    }
+
+    /// Set the prefetch state observer.
+    ///
+    /// When set, an on-demand generation in a region prefetch marked
+    /// `Prefetched` or `NoCoverage` demotes that region.
+    pub fn with_state_observer(mut self, observer: Arc<PrefetchStateObserver>) -> Self {
+        self.state_observer = Some(observer);
         self
     }
 
@@ -498,6 +512,12 @@ impl DdsRequestor for Fuse3OrthoUnionFS {
 
     fn metrics_client(&self) -> Option<&crate::metrics::MetricsClient> {
         self.metrics_client.as_ref()
+    }
+
+    fn on_dds_response(&self, tile: TileCoord, cache_hit: bool) {
+        if let Some(ref observer) = self.state_observer {
+            observer.observe(tile, cache_hit);
+        }
     }
 }
 
@@ -1924,6 +1944,95 @@ mod tests {
         assert_eq!(
             reply.flags, 0,
             "real passthrough files should have default flags (no DIRECT_IO)"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PrefetchStateObserver wiring (#176)
+    //
+    // The observer's own policy is unit-tested in `prefetch::state_observer`.
+    // What those tests cannot see is whether FUSE ever *calls* it: every one
+    // of them invokes `observe()` directly. These two exercise the real
+    // chain — `DdsRequestor::request_dds_impl` → `do_request` →
+    // `on_dds_response` → `observer.observe` → `GeoIndex` — over a real
+    // `Fuse3OrthoUnionFS` and a real `GeoIndex`, so cutting any link in it
+    // fails a test instead of silently disabling the feature.
+    //
+    // The final link (`manager::mounts` attaching the observer at mount
+    // construction) is not covered: reaching it needs a whole
+    // `XEarthLayerService` and a live FUSE mount.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Drive one full FUSE DDS request against a `Prefetched` region and
+    /// return whether that region still carries prefetch state afterwards.
+    ///
+    /// `cache_hit` is what the stand-in executor reports back, so the caller
+    /// controls the single input the observer's policy turns on.
+    async fn run_dds_request_over_prefetched_region(cache_hit: bool) -> bool {
+        use crate::geo_index::{DsfRegion, PrefetchedRegion};
+
+        let temp = TempDir::new().unwrap();
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(create_test_package(&temp, "na"))
+            .build()
+            .unwrap();
+
+        // A region prefetch claims is fully cached.
+        let tile = crate::coord::to_tile_coords(33.5, -118.5, 12).unwrap();
+        let (lat, lon) = tile.to_lat_lon();
+        let region = DsfRegion::from_lat_lon(lat, lon);
+        let geo_index = Arc::new(GeoIndex::new());
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
+
+        let (client, mut rx) = MockDdsClient::new();
+        let fs = Fuse3OrthoUnionFS::new(index, client as Arc<dyn DdsClient>, 1024)
+            .with_state_observer(Arc::new(PrefetchStateObserver::new(Arc::clone(&geo_index))));
+
+        // Stand in for the executor daemon: answer the one request FUSE makes.
+        let responder = tokio::spawn(async move {
+            let request = rx.recv().await.expect("FUSE must submit a DDS request");
+            request
+                .response_tx
+                .expect("FUSE requests carry a response channel")
+                .send(DdsResponse::new(
+                    vec![0u8; 16],
+                    cache_hit,
+                    Duration::from_millis(1),
+                    true,
+                ))
+                .ok();
+        });
+
+        let coords = crate::fuse::DdsFilename {
+            row: tile.row * 16,
+            col: tile.col * 16,
+            zoom: tile.zoom + 4,
+            map_type: "BI".to_string(),
+        };
+        let _ = fs.request_dds_impl(&coords).await;
+        responder.await.unwrap();
+
+        geo_index.get::<PrefetchedRegion>(&region).is_some()
+    }
+
+    #[tokio::test]
+    async fn test_fuse_on_demand_generation_demotes_prefetched_region() {
+        assert!(
+            !run_dds_request_over_prefetched_region(false).await,
+            "a FUSE on-demand generation inside a Prefetched region must reach \
+             the observer and demote it — if this passes only because the \
+             observer was never called, the whole feature is inert"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fuse_cache_hit_leaves_prefetched_region_alone() {
+        // Guards the `cache_hit` argument specifically: a hook that called
+        // the observer but hardcoded `false` would pass the test above.
+        assert!(
+            run_dds_request_over_prefetched_region(true).await,
+            "serving a prefetched tile from cache is the system working — \
+             the region must keep its state"
         );
     }
 }

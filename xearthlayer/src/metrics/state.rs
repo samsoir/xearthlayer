@@ -248,6 +248,26 @@ pub struct AggregatedState {
     // =========================================================================
     /// Peak bytes per second observed.
     pub peak_bytes_per_second: f64,
+
+    // =========================================================================
+    // Prefetch Region State Metrics (#176)
+    // =========================================================================
+    /// Regions with tiles submitted, awaiting confirmation (gauge, from
+    /// `PrefetchRegionState`; externally derived from `GeoIndex`, like the
+    /// disk-cache-size gauges above, so it is excluded from `reset()`).
+    pub prefetch_regions_in_progress: usize,
+    /// Regions confirmed fully cached (gauge).
+    pub prefetch_regions_prefetched: usize,
+    /// Regions with no ortho scenery (gauge).
+    pub prefetch_regions_nocoverage: usize,
+    /// Total observed divergences between prefetch state and reality (counter).
+    pub prefetch_state_diverged: u64,
+    /// Total regions demoted in response to divergence (counter).
+    pub prefetch_regions_demoted: u64,
+    /// Total regions promoted via the normal completion path (counter).
+    pub prefetch_promotions_normal: u64,
+    /// Total regions promoted via the rescue path (counter).
+    pub prefetch_promotions_rescue: u64,
 }
 
 impl Default for AggregatedState {
@@ -305,6 +325,13 @@ impl AggregatedState {
             fuse_requests_active: 0,
             fuse_requests_waiting: 0,
             peak_bytes_per_second: 0.0,
+            prefetch_regions_in_progress: 0,
+            prefetch_regions_prefetched: 0,
+            prefetch_regions_nocoverage: 0,
+            prefetch_state_diverged: 0,
+            prefetch_regions_demoted: 0,
+            prefetch_promotions_normal: 0,
+            prefetch_promotions_rescue: 0,
         }
     }
 
@@ -355,6 +382,16 @@ impl AggregatedState {
         self.fuse_requests_active = 0;
         self.fuse_requests_waiting = 0;
         self.peak_bytes_per_second = 0.0;
+        // prefetch_regions_{in_progress,prefetched,nocoverage} are NOT reset:
+        // like chunk_disk_cache_size_bytes/dds_disk_cache_size_bytes/
+        // chunk_index_entries above, they are externally-derived gauges
+        // (assigned wholesale from GeoIndex each maintenance cycle), not
+        // counters accumulated from this daemon's own event stream. Zeroing
+        // them here would misreport "no regions" until the next cycle.
+        self.prefetch_state_diverged = 0;
+        self.prefetch_regions_demoted = 0;
+        self.prefetch_promotions_normal = 0;
+        self.prefetch_promotions_rescue = 0;
     }
 }
 

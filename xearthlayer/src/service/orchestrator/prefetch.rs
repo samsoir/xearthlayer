@@ -39,6 +39,7 @@ impl ServiceOrchestrator {
         let runtime_handle = service.runtime_handle().clone();
 
         let dds_disk_checker = service.dds_disk_checker();
+        let metrics_client = service.metrics_client();
 
         if let Some(memory_cache) = service.memory_cache_bridge() {
             self.start_prefetch_with_cache(
@@ -46,6 +47,7 @@ impl ServiceOrchestrator {
                 dds_client,
                 memory_cache,
                 dds_disk_checker,
+                metrics_client,
             )?;
         } else {
             tracing::warn!("Memory cache not available, prefetch disabled");
@@ -62,6 +64,7 @@ impl ServiceOrchestrator {
         dds_client: Arc<dyn DdsClient>,
         memory_cache: Arc<M>,
         dds_disk_checker: Option<Arc<dyn crate::executor::DdsDiskCacheChecker>>,
+        metrics_client: Option<crate::metrics::MetricsClient>,
     ) -> Result<(), ServiceError> {
         use crate::prefetch::AircraftState as PrefetchAircraftState;
 
@@ -140,6 +143,16 @@ impl ServiceOrchestrator {
         // Wire scenery index if available
         if self.scenery_index.tile_count() > 0 {
             coordinator = coordinator.with_scenery_index(Arc::clone(&self.scenery_index));
+            tracing::info!("Scenery index wired to prefetch (installed-tile lookup enabled)");
+        } else {
+            tracing::warn!(
+                "Scenery index is empty (no ortho scenery installed) — prefetch will be inert"
+            );
+        }
+
+        // Wire metrics client for prefetch telemetry (#176)
+        if let Some(metrics_client) = metrics_client {
+            coordinator = coordinator.with_metrics_client(metrics_client);
         }
 
         // Wire ortho union index for disk-based tile filtering (Issue #39)

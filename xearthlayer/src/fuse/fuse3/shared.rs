@@ -292,6 +292,13 @@ pub trait DdsRequestor: FileAttrBuilder {
     /// Get the optional tile request callback.
     fn tile_request_callback(&self) -> Option<&crate::prefetch::TileRequestCallback>;
 
+    /// Hook invoked after a DDS response is received.
+    ///
+    /// Default is a no-op; `Fuse3OrthoUnionFS` overrides it to detect
+    /// prefetch state divergence (#176). Kept on the trait so the check sits
+    /// at the one place every FUSE implementation receives a response.
+    fn on_dds_response(&self, _tile: TileCoord, _cache_hit: bool) {}
+
     /// Get the optional request coalescer for deduplicating concurrent requests.
     ///
     /// When this returns `Some`, requests for the same tile are coalesced at the
@@ -455,6 +462,7 @@ pub trait DdsRequestor: FileAttrBuilder {
                     context = context_label,
                     "DDS request completed"
                 );
+                self.on_dds_response(tile, response.cache_hit);
                 response.data
             }
             Ok(Err(_)) => {

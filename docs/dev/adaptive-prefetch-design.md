@@ -248,7 +248,150 @@ Each DSF region in the XEL Window has one of four states:
 This follows a **two-phase commit** pattern:
 1. **Reserve**: Region marked `InProgress` when tiles are submitted (prevents duplicate bulk submissions)
 2. **Confirm**: Region marked `Prefetched` when tiles are confirmed in cache
-3. **Timeout**: If `InProgress` exceeds `stale_region_timeout`, reverts to *absent* for re-evaluation
+3. **Timeout**: If `InProgress` exceeds `stale_region_timeout`, `evaluate_stale_regions`
+   consults `BoundaryStrategy::region_disk_state` — the same completeness predicate the
+   fast path uses — and picks one of four outcomes:
+   - Disk shows every tile present → promote straight to `Prefetched` (the rescue path;
+     see [Region Tile-Set SSOT](#region-tile-set-ssot) below)
+   - Disk shows tiles missing, under `MAX_REGION_ATTEMPTS` (3) → reverts to *absent* for
+     re-evaluation next cycle, incrementing the region's strike count
+   - Disk shows tiles missing, at `MAX_REGION_ATTEMPTS` → retired to `NoCoverage`
+     **permanently for the session** — this is the event flight-test criterion 4 keys on
+   - No authoritative source to consult (no `DdsDiskCacheChecker` and/or no
+     `SceneryIndex`) → left `InProgress` untouched; this does **not** count as a retry,
+     since "cannot tell" must not be treated the same as "checked and it is absent"
+
+A region can reach step 1 without submitting anything. When the filter
+pipeline removes a region's *entire* planned tile set as already cached, there
+is no submission for the mark-after-submit rule to hang off — and if that is
+true of every region in the plan, the plan is empty and the submit path is
+skipped outright. Such regions are marked `InProgress` at the end of
+filtering, so step 2's disk-verified check confirms them on the maintenance
+pass. Without this they stayed *absent*, re-entered the target diff every 2s
+cycle, and could never return to `Prefetched` — which under-reported
+`regions_prefetched` in the 60s sample. Patch-owned regions are excluded:
+their tiles filter out in full too, but prefetch never places them on the DDS
+disk, so `InProgress` would be a claim nothing could confirm.
+
+### Region Tile-Set SSOT
+
+`SceneryIndex::tiles_in_region(region)` is the single definition of "which DDS
+tiles belong to this DSF region": a tile belongs to the region containing its
+geographic centre (the `LOAD_CENTER` of its `.ter` file). The submit, promote,
+and rescue paths all consult this one method, so they cannot disagree about
+whether a region is complete. Earlier code reconstructed the tile set from a
+45nm radius query per path, which returns a circle overlapping neighbouring
+regions rather than the region itself — the source of several promotion bugs
+fixed under #176.
+
+`BoundaryStrategy::region_disk_state` (`xearthlayer/src/prefetch/adaptive/boundary_strategy.rs`)
+is the single completeness predicate built on top of that tile set, consumed
+by both the fast path (`promote_completed_regions`) and the rescue path
+(`evaluate_stale_regions`). It returns one of four states — `Complete`,
+`Incomplete`, `NoTiles`, or `Unknown` — rather than a `bool`, because the
+answer feeds a decision whose terminal outcome is permanent exclusion
+(`NoCoverage`): "we cannot tell" (`Unknown` — no `DdsDiskCacheChecker` and/or
+no `SceneryIndex` wired) must stay distinguishable from "we checked and it is
+absent" (`Incomplete`/`NoTiles`), or a region could be retired to `NoCoverage`
+on a cycle where it was never actually checked.
+
+**Coverage is a disjunction.** A tile counts as covered if it is present in
+the XEL DDS disk cache (`DdsDiskCacheChecker`) **or** ships inside an
+installed scenery package (`OrthoUnionIndex::dds_tile_exists`) — prefetch
+deliberately never downloads tiles the disk filter (stage 3 of the four-tier
+filter) already excluded as package-shipped, so promotion must recognise
+that same evidence or a region covered entirely by package imagery could
+never be confirmed and would ratchet to `NoCoverage` over land. The two
+lookups use different coordinate systems: the XEL DDS cache is keyed by
+**tile** coordinates (`tile.row, tile.col, tile.zoom`), while
+`OrthoUnionIndex::dds_tile_exists` is keyed by **chunk** coordinates
+(`tile.chunk_origin()`) — mixing them up silently returns "not covered" for
+every tile (the #172 keying bug).
+
+**Strike counts survive the retry branch, not the promote branch.** A
+region's `region_attempts` strike count is cleared on promotion (both the
+fast path and the rescue path) but deliberately left untouched on the retry
+branch of `evaluate_stale_regions`. This looks backwards until you notice
+what the retry branch does: it *removes* the region's `PrefetchedRegion`
+entry from the `GeoIndex` so the region is eligible for re-prefetch — and
+that removal is exactly what makes `region_attempts` (a separate
+`HashMap<DsfRegion, u8>` on the coordinator, not stored in the `GeoIndex`)
+the only thing that still remembers the region failed last time. Clearing it
+on retry, by naive symmetry with the promote branch, would make
+`MAX_REGION_ATTEMPTS` unreachable: every retry would restart the count at
+zero and a region that never succeeds would retry forever instead of
+eventually being retired to `NoCoverage`. Promotion clears it for the
+opposite reason — a promoted region's failure history belongs to the episode
+that failed, not to the region, so a region that recovers and is later
+demoted by `PrefetchStateObserver` should not be retired to `NoCoverage`
+after a single fresh failure.
+
+### Demotion: Closing the Loop on Wrong Claims
+
+`Prefetched` and `NoCoverage` are claims, not guarantees. If FUSE has to
+*generate* a tile on demand inside a region carrying either state, the claim
+was wrong — whether from a scenery-index gap, a premature promotion, or
+eviction of the tile after promotion. `PrefetchStateObserver`
+(`xearthlayer/src/prefetch/state_observer.rs`) sits on the one FUSE code path
+every implementation shares (`DdsRequestor::on_dds_response`, defaulted to a
+no-op, overridden by `Fuse3OrthoUnionFS`) and reacts to exactly this:
+
+```
+Prefetched ──┐
+             ├──▶ on-demand FUSE generation observed ──▶ demoted to *absent*
+NoCoverage ──┘        (region re-enters the prefetch cycle)
+```
+
+`InProgress` regions are exempt — they are expected to miss while prefetch is
+still running — and cache hits are exempt, since serving from cache is the
+system working, not a divergence.
+
+Re-entering the prefetch cycle only *repairs* two of the three causes. The
+scenery index is immutable for the life of the process, so where the cause is
+an index gap the next cycle re-derives the same empty tile set and re-marks
+the region `NoCoverage`. The loop is bounded and safe, but for that cause the
+observer flags the gap and nothing more — do not read a repeating
+`state_diverged` in one region as a repair in progress.
+
+Every divergence is counted and reported via
+`MetricsClient::prefetch_state_diverged()`, but the region is only cleared
+(and `MetricsClient::prefetch_region_demoted()` fired) at most once per region
+per 120s window. Eviction inside the retained window can recur, so an
+unbounded demote → re-prefetch → evict loop would churn on a long flight; the
+rate limit exists so the diagnostic doesn't become the noise it's meant to
+surface.
+
+The daemon aggregates both counters and logs them on the same 60s cadence as
+the memory sample. They are cumulative totals since process start, because
+`AggregatedState::reset()` — which does zero them — has no production caller;
+wire it up and these become totals since the last reset:
+
+```
+INFO Prefetch sample uptime_s=... regions_in_progress=... regions_prefetched=...
+     regions_nocoverage=... promotions_normal=... promotions_rescue=...
+     state_diverged=... regions_demoted=... fuse_generations=...
+```
+
+`fuse_generations` mirrors `fuse_jobs_submitted` (aggregated from
+`MetricEvent::JobSubmitted { is_fuse: true }`) — the only default-level
+source for criterion 5 ("on-demand FUSE generations fall during cruise").
+Per-tile FUSE request logging is `debug!`-only (#209), so without this field
+that criterion is unreadable at default log level. It is cumulative since
+process start, the same convention as the other counters on this line.
+
+`promotions_normal` counts fast-path promotions (`promote_completed_regions`,
+per-cycle region maintenance); `promotions_rescue` counts stale-region
+rescue promotions (`evaluate_stale_regions`, the `RegionDiskState::Complete`
+arm above). A healthy flight should show `promotions_normal` dominating; a
+high `promotions_rescue` ratio means the fast path is stalling and the
+rescue path is carrying the work — see [Region Tile-Set
+SSOT](#region-tile-set-ssot).
+
+`state_diverged` and `regions_demoted` are expected to stay at (or near) zero
+on a healthy flight; a climbing `state_diverged` with a flat `regions_demoted`
+means the rate limit is suppressing repeat divergences in the same region —
+worth investigating even though no region is currently stuck in a wrong
+state.
 
 ### Retention Inference
 
@@ -273,7 +416,6 @@ Regions previously retained but now outside → evicted from GeoIndex
 
 When a region leaves the retained area, the coordinator also evicts:
 - Its `PrefetchedRegion` entry (making it eligible for re-prefetch if the aircraft returns)
-- Any `cached_tiles` entries for tiles in that region (allowing fresh memory cache queries)
 
 `InProgress` regions are never evicted — they represent actively running prefetch jobs.
 
@@ -552,7 +694,15 @@ pub enum BoundaryAxis {
 }
 ```
 
-### Algorithm
+### Algorithm (historical — superseded)
+
+> **This block describes the boundary-monitor design and no longer matches the
+> code.** `BoundaryCrossing` and its monitors were deleted in PR #102, which
+> replaced them with the sliding `PrefetchBox` described above; step 4a's
+> SceneTracker history is a write-only field; and step 4c's geometric fallback
+> was removed in #176 — see *Region Tile-Set SSOT*, which is now the only
+> definition of a region's tile set. It is kept for the reasoning about
+> asymmetric load depth in step 1, which the measurements still support.
 
 ```
 Input:  Vec<BoundaryCrossing> from SceneryWindow (sorted by urgency)
@@ -587,12 +737,11 @@ For each BoundaryCrossing:
        Absent → include
 
     4. For each remaining DSF region, get DDS tiles:
-       a. SceneTracker history (most accurate — matches X-Plane's zoom/coverage)
-       b. SceneryIndex query (for unseen regions)
-       c. Fallback 4×4 grid at zoom 14 (last resort)
+       SceneryIndex::tiles_in_region — the only source; a region the index
+       knows nothing about yields no tiles and is marked NoCoverage
 
     5. Apply four-tier filter:
-       Local tracking → Memory cache → Patch exclusion → Disk existence
+       Memory cache → Patch exclusion → Installed package disk → XEL DDS disk cache
 
     6. Order tiles:
        Primary: urgency rank (depth 0 before depth 1 before depth 2)
@@ -620,15 +769,21 @@ If backpressure reduces batch size, the most urgent axis is served first.
 
 ### Interface
 
+> **Stale**, like the algorithm block above: `BoundaryStrategy` does not
+> implement `AdaptivePrefetchStrategy` — it exposes static functions
+> (`promote_completed_regions`, `evict_non_retained`, `region_disk_state`)
+> instead. The trait itself still exists (`xearthlayer/src/prefetch/adaptive/strategy.rs`);
+> its current `calculate_prefetch` signature, for reference:
+
 ```rust
-impl AdaptivePrefetchStrategy for BoundaryStrategy {
+pub trait AdaptivePrefetchStrategy: Send + Sync {
     fn calculate_prefetch(
         &self,
         position: (f64, f64),
-        predictions: &[BoundaryCrossing],
-        xel_window: &XelWindow,
-        cached_tiles: &HashSet<TileCoord>,
-    ) -> Option<PrefetchPlan>;
+        track: f64,
+        calibration: &PerformanceCalibration,
+        already_cached: &HashSet<TileCoord>,
+    ) -> PrefetchPlan;
 }
 ```
 
@@ -719,18 +874,17 @@ The existing `TransitionThrottle` ramps prefetch from 25% to 100% over 30 second
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        Prefetch Filter Chain                            │
 │                                                                         │
-│  1. LOCAL TRACKING (HashSet) - O(1)                                     │
-│     Skip tiles submitted this session                                   │
+│  1. MEMORY CACHE (async) - moka LRU query                              │
+│     Skip tiles already generated (DaemonMemoryCache)                    │
 │                                                                         │
-│  2. MEMORY CACHE (async) - moka LRU query                              │
-│     Skip tiles already generated                                        │
-│                                                                         │
-│  3. PATCHED REGION EXCLUSION (GeoIndex PatchCoverage)                   │
+│  2. PATCHED REGION EXCLUSION (GeoIndex PatchCoverage)                   │
 │     Skip tiles in DSF regions owned by scenery patches                  │
 │                                                                         │
-│  4. DISK EXISTENCE (filesystem probe) - slow                            │
-│     Skip tiles from installed packages and XEL cache                    │
-│     Checks: ZL, BI, GO2, GO filename patterns                          │
+│  3. INSTALLED PACKAGE DISK (OrthoUnionIndex) - filesystem probe         │
+│     Skip tiles that already ship as real .dds files in a package        │
+│                                                                         │
+│  4. XEL DDS DISK CACHE (DdsDiskCacheChecker) - filesystem probe         │
+│     Skip tiles XEL has already downloaded and cached itself             │
 │                                                                         │
 │  Only tiles passing ALL four filters are submitted for download         │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -928,8 +1082,13 @@ SimState (X-Plane Web API)
 
 If some tiles in a submitted region fail:
 - Region stays `InProgress`
-- After `stale_region_timeout` (120s), reverts to *absent*
-- Next evaluation cycle: target diff finds the region, re-submits
+- After `stale_region_timeout` (120s), `region_disk_state` reports `Incomplete` — see
+  [Region States](#region-states-geoindex-prefetchedregion-layer) above — and the
+  region's strike count increments. While the count stays under
+  `MAX_REGION_ATTEMPTS` (3) the region reverts to *absent* for retry; the strike that
+  reaches 3 retires it to `NoCoverage` instead of granting another retry — so a region
+  gets at most 2 revert-to-absent retries before retirement, not 3
+- Next evaluation cycle (while retries remain): target diff finds the region, re-submits
 - Four-tier filter handles individual tile dedup (only failed tiles re-submitted)
 
 ---
