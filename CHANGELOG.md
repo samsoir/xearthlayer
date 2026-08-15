@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Periodic memory and prefetch telemetry** ([#209](https://github.com/samsoir/xearthlayer/issues/209)): A `Memory sample` line every 60 seconds reports RSS, virtual size, swap, thread count, tiles completed, chunk totals, per-tier cache sizes, and in-flight write counts. A companion `Prefetch sample` line reports the region-state distribution, promotion counts by path, divergence and demotion counters, and on-demand FUSE generations. Both emit at INFO, so a long flight produces a usable trace without running the whole session at `--debug` — which is impractical to read and is overwritten on the next launch. Added to diagnose a 12-hour flight that ended in an OOM kill at 64 GB against a configured 4 GB memory cache, with no application error and nothing in the log to distinguish the candidate causes.
+
+- **Prefetch divergence detection** ([#176](https://github.com/samsoir/xearthlayer/issues/176)): When FUSE has to generate a tile on demand inside a region that prefetch has marked complete, the claim was wrong. XEarthLayer now detects that contradiction and clears the region's state so it is prefetched again, rate-limited to one demotion per region per 120 seconds so that ordinary cache eviction cannot cause churn on a long flight. Every divergence is counted even when the demotion is suppressed, so the two figures can be compared.
+
+- **Scenery index completeness reporting** ([#176](https://github.com/samsoir/xearthlayer/issues/176)): `.ter` files that fail to parse are now counted and surfaced as one aggregated warning per package with sample paths, rather than being silently skipped. `xearthlayer scenery-index status` gains a completeness line showing indexed tiles against files found on disk.
+
+### Fixed
+
+- **Prefetch region promotion ran a drifted duplicate** ([#176](https://github.com/samsoir/xearthlayer/issues/176)): Two implementations existed of the question "which tiles belong to this DSF region". One was corrected five months ago to filter by region and deduplicate; the promotion path called the other, uncorrected copy. In practice the fast promotion path demanded tiles belonging to neighbouring regions and so could effectively never fire, leaving a rescue path to promote whole regions on the evidence of a single arbitrary tile. `SceneryIndex::tiles_in_region` is now the single definition consumed by the submit, promote and rescue paths alike, and both paths share one full-coverage predicate that distinguishes "checked and absent" from "no authoritative source to consult" — the latter no longer counts toward permanently excluding a region. A region's tiles now also count as covered when they ship inside an installed scenery package, which prefetch deliberately never downloads; previously such regions could never be confirmed and were retired as having no coverage. Validated over a 6-hour flight: 238 promotions, all on the fast path, against a prior baseline of 4 fast-path promotions to 61 rescue-path.
+
+- **Incomplete mipmap chains caused terrain banding at distance** ([#212](https://github.com/samsoir/xearthlayer/issues/212)): Generated DDS tiles declared a 5-level mipmap chain where a 4096×4096 texture supports 13. X-Plane clamps sampling at the last declared level, so beyond that distance the texture was undersampled rather than filtered — appearing as regular banding along terrain contours at grazing angles, independent of provider and zoom level. Complete chains are now emitted. Thanks to [@mmaechtel](https://github.com/mmaechtel) for the report and fix.
+
+- **Disk write bytes attributed to the wrong cache tier** ([#216](https://github.com/samsoir/xearthlayer/issues/216)): `chunk_disk_bytes_written` accumulated bytes from both cache tiers despite its name. Chunk writes (~14 KB, thousands per second) and DDS tile writes (11.17 MB, a few per second) emitted the same untiered event, so roughly 79% of the chunk-named counter was in fact DDS bytes at measured flight rates. Writes are now attributed per tier, and the tier concept is represented once rather than in several parallel forms.
+
+- **Coverage map colours diverged from the published legend** ([#200](https://github.com/samsoir/xearthlayer/issues/200)): `publish coverage` hardcoded its region colours instead of reading `region_metadata.json`, so a colour change in the metadata repainted the legend but not the map. Metadata is now authoritative, an unknown colour name is a hard error rather than a silent fallback, and the dark-mode variant is derived from the same source.
+
+- **Config sizes with decimal values were rejected or misparsed** ([#218](https://github.com/samsoir/xearthlayer/issues/218)): `format_size` and `parse_size` were nominal inverses that did not round-trip — a written value such as `1.5 GB` could not be read back. The parser now accepts decimals, with guards against the saturating float-to-integer casts that a naive implementation introduces, and the memory recommendation rounds to whole gigabytes so the value it writes is one it can read.
+
+- **CI could not cut a release after a toolchain advance** ([#207](https://github.com/samsoir/xearthlayer/pull/207)): Rust 1.97's clippy promoted two lints to hard errors under `-D warnings`, failing `make verify` — including the release workflow's own gate.
+
+### Changed
+
+- **Reduced per-tile log verbosity** ([#209](https://github.com/samsoir/xearthlayer/issues/209)): Per-chunk and per-tile success lines moved from INFO to DEBUG. A 12-hour flight previously produced a 3.4 GB log competing for the same disk as the cache, which buried exactly the periodic samples added to diagnose it.
+
+- **Removed the unused `fuser` dependency** ([#208](https://github.com/samsoir/xearthlayer/pull/208)): The crate was consumed only by two `#[allow(dead_code)]` legacy modules superseded by the fuse3 implementation. Removed along with 887 lines of dead code and stale documentation references.
+
 ## [0.4.6] - 2026-05-10
 
 ### Added
