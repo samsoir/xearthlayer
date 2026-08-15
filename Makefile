@@ -422,8 +422,16 @@ version: ## Show current version
 	@echo "$(BLUE)Current version:$(NC) $(PKG_VERSION)"
 
 .PHONY: bump-version
-bump-version: ## Bump version across all files (VERSION=x.y.z)
+bump-version: ## Bump version across all files (VERSION=x.y.z, STABLE ONLY)
 	@if [ -z "$(VERSION)" ]; then echo "$(RED)Error: VERSION is required. Usage: make bump-version VERSION=0.3.0$(NC)"; exit 1; fi
+	@# RPM forbids '-' in a Version: field (it separates Version from Release), so a
+	@# pre-release identifier would commit an invalid spec. The RPM job is skipped for
+	@# pre-releases, so this fails later — on the next stable build — not now.
+	@case "$(VERSION)" in *-*) \
+		echo "$(RED)Error: '$(VERSION)' is a pre-release identifier.$(NC)"; \
+		echo "$(YELLOW)This target also rewrites pkg/rpm/xearthlayer.spec, and RPM forbids '-' in Version:.$(NC)"; \
+		echo "$(YELLOW)Edit the version in Cargo.toml directly, then run: cargo update -w$(NC)"; \
+		exit 1;; esac
 	@echo "$(BLUE)Bumping version to $(VERSION)...$(NC)"
 	@# Update workspace Cargo.toml
 	@sed -i 's/^version = ".*"/version = "$(VERSION)"/' Cargo.toml
@@ -443,7 +451,8 @@ release-checklist: ## Show release checklist
 	@echo ""
 	@echo "  1. [ ] Ensure all tests pass: make verify"
 	@echo "  2. [ ] Update version: make bump-version VERSION=x.y.z"
-	@echo "  3. [ ] Update CHANGELOG.md with release notes"
+	@echo "         (PRE-RELEASE: edit Cargo.toml by hand instead — see below)"
+	@echo "  3. [ ] Compile CHANGELOG.md Unreleased from PRs since the last tag"
 	@echo "  4. [ ] Commit version bump"
 	@echo "  5. [ ] Push to release branch and verify CI passes"
 	@echo "  6. [ ] Create and push tag: git tag vx.y.z && git push origin vx.y.z"

@@ -319,6 +319,27 @@ jobs:
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
+          # A hand-written notes file for this exact tag wins, if present.
+          # Pre-releases need tester-facing guidance — what to look at, what
+          # noise to ignore, how to report — which does not belong in the
+          # product changelog. Stable tags normally have no such file and
+          # fall through to the CHANGELOG extraction below, unchanged.
+          # RELEASE_TAG becomes a path component here, and on workflow_dispatch
+          # it is caller-supplied, so constrain it to the tag grammar before
+          # use — no slashes, no traversal.
+          if ! printf '%s' "${RELEASE_TAG}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-(dev|alpha|beta|rc)\.[0-9]+)?$'; then
+            echo "Tag '${RELEASE_TAG}' is not a recognised release tag; skipping notes-file lookup."
+            NOTES_FILE=""
+          else
+            NOTES_FILE=".github/release-notes/${RELEASE_TAG}.md"
+          fi
+          if [ -n "${NOTES_FILE}" ] && [ -f "${NOTES_FILE}" ]; then
+            echo "Using hand-written notes: ${NOTES_FILE}"
+            cp "${NOTES_FILE}" release_notes.md
+            cat release_notes.md
+            exit 0
+          fi
+
           # Extract release notes from CHANGELOG.md if available
           if [ -f CHANGELOG.md ]; then
             # Try to extract notes for this version

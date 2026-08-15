@@ -213,16 +213,36 @@ curl -s https://xearthlayer.app | grep -o 'v[0-9]\+\.[0-9]\+\.[0-9]\+'
 ## CHANGELOG Convention
 
 `CHANGELOG.md` keeps a single `## [Unreleased]` section at the top ([Keep a
-Changelog](https://keepachangelog.com/) format). **All** merged changes are recorded
-there as they land — on `main` or on `develop/0.4.7` — under the usual
+Changelog](https://keepachangelog.com/) format), under the usual
 Added / Changed / Fixed / Removed groups.
 
-- Entries accumulate under `## [Unreleased]` throughout a development cycle.
-- Cutting a **preview** (`-dev.N`, etc.) does **not** move entries out of Unreleased —
-  previews are snapshots of in-progress work, so the notes stay unreleased.
-- Only a **stable release** (a normal `X.Y.Z`, a hotfix, or a `develop` promotion) moves
-  the accumulated entries under a dated `## [X.Y.Z] - YYYY-MM-DD` heading and starts a
-  fresh, empty `## [Unreleased]`.
+**The changelog is compiled when a release is cut, not per-PR.** A feature PR
+leaves `CHANGELOG.md` alone; an empty `## [Unreleased]` section on a feature
+branch is correct and should not be flagged in review. At release-cut time the
+entries are written in one pass from the PRs merged since the last release
+tag:
+
+```bash
+git log v<last>..HEAD --merges --oneline    # the PRs to describe
+```
+
+Two reasons this beats writing entries as they land: every feature PR would
+otherwise conflict on the same few lines, and — more importantly — the
+changelog describes *the product's* history rather than the repository's. One
+user-visible fix that took two PRs to land (a follow-up carrying commits that
+missed the first merge, say) is **one** changelog entry, and that is only
+visible in hindsight.
+
+- Entries accumulate under `## [Unreleased]` across the development cycle,
+  including across multiple previews.
+- Cutting a **preview** (`-alpha.N`, etc.) does **not** move entries out of
+  Unreleased — previews are snapshots of in-progress work.
+- Only a **stable release** (a normal `X.Y.Z`, a hotfix, or a `develop`
+  promotion) moves the accumulated entries under a dated
+  `## [X.Y.Z] - YYYY-MM-DD` heading and starts a fresh, empty `## [Unreleased]`.
+
+Write entries from the reader's side — what changed for someone running the
+software, and why it matters — not a restatement of the diff.
 
 ## Unstable / Preview Release
 
@@ -248,6 +268,40 @@ in the tag and: (a) marks the GitHub Release `--prerelease --latest=false`, and 
 the `.deb`/`.rpm`/AUR jobs. `website-sync.yml` never fires because it only triggers on a
 `release/*` merge to `main`, which a preview never performs.
 
+### Identifier progression
+
+Increment the trailing number within a stage, then advance the stage as the
+line matures. Never reuse an identifier — a tag is immutable once testers have
+it.
+
+```
+0.4.7-alpha.1 → alpha.2 → … → beta.1 → beta.2 → … → rc.1 → … → 0.4.7
+```
+
+`-dev.N` is for throwaway internal snapshots; use `-alpha.N` onwards for
+anything handed to testers.
+
+### Release notes
+
+The workflow prefers a hand-written notes file for the exact tag:
+
+```
+.github/release-notes/v0.4.7-alpha.1.md
+```
+
+If that file exists it becomes the release body verbatim. Otherwise the
+workflow falls back to extracting the matching `## [VERSION]` section from
+`CHANGELOG.md`, and failing that to the bare string `Release <tag>`.
+
+**Previews should always ship a notes file.** A preview's audience needs
+tester-facing guidance — what to look at, what noise to ignore, how to report,
+which log line carries the evidence — and none of that belongs in the product
+changelog. `## [Unreleased]` will never match a preview version anyway, so
+without a notes file a preview publishes as a one-line body.
+
+Stable releases normally have no notes file and fall through to the CHANGELOG
+extraction, unchanged.
+
 ### Steps
 
 ```bash
@@ -256,25 +310,46 @@ git checkout develop/0.4.7
 git pull origin develop/0.4.7
 
 # 2. Bump the pre-release identifier in Cargo.toml, then sync the lockfile
-#    [workspace.package] version = "0.4.7-dev.N"
-#    (increment N per preview: dev.0, dev.1, …; advance to -alpha/-beta/-rc as the
-#    line matures)
+#    [workspace.package] version = "0.4.7-alpha.N"
 cargo update -w
+```
 
-# 3. Record changes under the CHANGELOG "Unreleased" heading (do NOT date a section)
+> **Do not use `make bump-version` for a preview.** It also rewrites
+> `pkg/rpm/xearthlayer.spec`, and RPM forbids `-` in a `Version:` field (it
+> separates Version from Release), so it would commit an invalid spec. The RPM
+> job is skipped for previews so nothing fails at the time — it fails later, on
+> the next stable release built from the committed spec. Edit `Cargo.toml`
+> directly. (`build-rpm` rewrites the version from the tag at build time, so the
+> spec's committed value is only ever a latent hazard, never the source of
+> truth.)
 
-# 4. Verify, commit, and push on develop
+```bash
+# 3. Compile CHANGELOG "Unreleased" from PRs merged since the last release tag
+#    (see CHANGELOG Convention above). Do NOT date a section for a preview.
+
+# 4. Write the tester-facing notes for this exact tag
+#    .github/release-notes/v0.4.7-alpha.N.md
+
+# 5. Verify, commit, and push on develop
 make pre-commit
-git add Cargo.toml Cargo.lock CHANGELOG.md
-git commit -m "chore(release): 0.4.7-dev.N"
+git add Cargo.toml Cargo.lock CHANGELOG.md .github/release-notes/
+git commit -m "chore(release): 0.4.7-alpha.N"
 git push origin develop/0.4.7
 
-# 5. Tag from develop and push — this triggers the release workflow
-git tag v0.4.7-dev.N
-git push origin v0.4.7-dev.N
+# 6. Tag from develop and push — this triggers the release workflow
+git tag v0.4.7-alpha.N
+git push origin v0.4.7-alpha.N
 ```
 
 There is no release PR and no merge step: the preview lives entirely on `develop/0.4.7`.
+
+Confirm the binary agrees with the tag before announcing it — nothing in CI
+cross-checks them, and the version testers paste into bug reports comes from
+`Cargo.toml`, not from the tag:
+
+```bash
+xearthlayer --version   # must match the tag, e.g. 0.4.7-alpha.1
+```
 
 ### Verify
 
@@ -288,6 +363,9 @@ gh release list --limit 5
 
 # Confirm only the tarball was attached (no .deb/.rpm/AUR)
 gh release view v0.4.7-dev.N --json assets --jq '.assets[].name'
+
+# Confirm the notes file was used, not the one-line fallback
+gh release view v0.4.7-alpha.N --json body --jq '.body' | head -5
 ```
 
 ## Hotfix Release
