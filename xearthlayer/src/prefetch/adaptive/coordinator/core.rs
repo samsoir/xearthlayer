@@ -1051,7 +1051,19 @@ impl AdaptivePrefetchCoordinator {
         }
         // Evict PrefetchedRegion entries for regions outside the retained window,
         // making them eligible for re-prefetch when the aircraft returns.
-        BoundaryStrategy::evict_non_retained(&geo_index);
+        //
+        // Gated to Cruise to match the retention update in `update()`, which is
+        // cruise-only by design. The retained set is only authoritative while it
+        // is being maintained: after landing it freezes at whatever the last
+        // cruise cycle computed, and evicting against a frozen set removes
+        // regions the ground box still covers. Those regions then re-plan, filter
+        // out as already-cached, are marked InProgress, are promoted, and are
+        // evicted again — a silent loop that inflated `promotions_normal` by
+        // ~1170 after landing on acceptance flight 1 (#176). Retention and
+        // eviction must share a phase, or the pair is not a pair.
+        if matches!(self.phase_detector.current_phase(), FlightPhase::Cruise) {
+            BoundaryStrategy::evict_non_retained(&geo_index);
+        }
 
         // Per-maintenance-cycle instrumentation (#172 Part 4): report
         // region-state distribution. A healthy system shows normal-path
@@ -3517,6 +3529,109 @@ mod tests {
             count_prefetched_regions(&geo_index) > 0,
             "A region whose tiles are all already cached must reach Prefetched, \
              not sit unmarked and be re-planned forever",
+        );
+    }
+
+    // Acceptance flight 1 (PANC->PABR, 2026-08-14) found `promotions_normal`
+    // climbing ~165/min for seven minutes after the aircraft parked at the
+    // destination: no prefetch cycles logged, no batches submitted, no rescue
+    // promotions, `tiles_done` frozen, and every region gauge static
+    // (in_progress=0, prefetched=22, nocoverage=20). ~1170 promotions that
+    // moved nothing, inflating the flight's headline figure from 206 to 1376.
+    //
+    // A stationary aircraft over terrain that is already fully cached has
+    // nothing left to promote. Once the region distribution has settled,
+    // further cycles at the same position must not emit promotions — the
+    // counter measures regions promoted, and re-promoting a region that is
+    // already `Prefetched` is not work.
+    #[tokio::test]
+    async fn test_static_position_does_not_inflate_promotion_count() {
+        use crate::geo_index::{GeoIndex, RetainedRegion};
+        use crate::metrics::{MetricEvent, MetricsClient};
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let client = Arc::new(CapLimitedDdsClient::new(100_000));
+        // Every tile already on the DDS disk: the filter pipeline empties every
+        // plan, and the same checker is what promotion consults.
+        let checker: Arc<dyn DdsDiskCacheChecker> = Arc::new(AlwaysHitDiskChecker);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ramp_duration: std::time::Duration::from_secs(0),
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_dds_disk_checker(Arc::clone(&checker))
+            .with_scenery_index(wide_scenery_index_at_50_10())
+            .with_metrics_client(MetricsClient::new(tx));
+
+        // Ground phase, parked. Acceptance flight 1's spike began within 30s of
+        // `Flight phase transition from=cruise to=ground` on landing at PABR, so
+        // the reproduction has to be in Ground, not Cruise.
+        let state = ground_state(50.0, 10.0);
+        assert_eq!(
+            coord.phase_detector.current_phase(),
+            FlightPhase::Ground,
+            "Precondition: the churn was observed in Ground phase",
+        );
+
+        // The aircraft has just landed, so retention carries whatever the last
+        // *cruise* cycle left behind — retention updates are cruise-only
+        // (see the `matches!(phase, FlightPhase::Cruise)` guard in `update`),
+        // but `evict_non_retained` runs every maintenance pass regardless of
+        // phase. Seed a retained set that does not cover the ground box to
+        // reproduce that post-landing state. A cold ground start leaves the
+        // layer empty, `evict_non_retained` no-ops, and the churn cannot occur
+        // — which is why a cold-start reproduction of this test passes.
+        geo_index.insert::<RetainedRegion>(DsfRegion::new(50, 10), RetainedRegion);
+
+        // Settle: let every region in the box reach `Prefetched`.
+        for _ in 0..4 {
+            coord.process_telemetry(&state).await;
+        }
+        assert!(
+            count_prefetched_regions(&geo_index) > 0,
+            "Precondition: the box must have settled into Prefetched regions",
+        );
+
+        let settled_prefetched = count_prefetched_regions(&geo_index);
+        let promoted = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<MetricEvent>| -> usize {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|e| match e {
+                    MetricEvent::PrefetchRegionsPromotedNormal { count } => Some(count),
+                    _ => None,
+                })
+                .sum()
+        };
+        // Discard everything emitted while settling. Asserted non-zero so a
+        // future change that stops promoting entirely cannot make this test
+        // pass vacuously.
+        let settle_promotions = promoted(&mut rx);
+        assert!(
+            settle_promotions > 0,
+            "Precondition: the settle phase must actually exercise promotion",
+        );
+
+        // Aircraft has not moved and nothing has been evicted or invalidated,
+        // so there is no new region to confirm.
+        for _ in 0..6 {
+            coord.process_telemetry(&state).await;
+        }
+
+        let extra = promoted(&mut rx);
+        assert_eq!(
+            extra, 0,
+            "A stationary aircraft over fully-cached terrain must not keep \
+             promoting: {extra} further promotions were counted across 6 cycles \
+             with {settled_prefetched} regions already Prefetched. \
+             `promotions_normal` counts promotion events, so a region that \
+             re-enters InProgress is counted again and the flight-test figure \
+             for acceptance criterion 1 inflates without bound.",
         );
     }
 
