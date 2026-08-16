@@ -203,16 +203,22 @@ impl BoundaryStrategy {
 
     /// Evict `PrefetchedRegion` entries for regions no longer in the retained window.
     ///
-    /// Removes `Prefetched` and `NoCoverage` entries whose DSF region is not
-    /// present in the `RetainedRegion` layer. `InProgress` entries are preserved
-    /// because they represent actively running prefetch jobs.
+    /// Removes `Prefetched`, `Deferred`, and `NoCoverage` entries whose DSF
+    /// region is not present in the `RetainedRegion` layer. `InProgress`
+    /// entries are preserved because they represent actively running
+    /// prefetch jobs.
     ///
-    /// Returns 0 (no-op) when the `RetainedRegion` layer is empty, indicating
-    /// retention tracking is not yet active.
-    pub fn evict_non_retained(geo_index: &GeoIndex) -> usize {
+    /// Returns an empty `Vec` (no-op) when the `RetainedRegion` layer is
+    /// empty, indicating retention tracking is not yet active.
+    ///
+    /// Returns the evicted regions so the caller can prune any per-region
+    /// bookkeeping (e.g. the coordinator's `region_retry` map) it holds
+    /// alongside the index — this function is a static taking only
+    /// `&GeoIndex` and cannot reach that bookkeeping itself.
+    pub fn evict_non_retained(geo_index: &GeoIndex) -> Vec<DsfRegion> {
         let retained = geo_index.regions::<RetainedRegion>();
         if retained.is_empty() {
-            return 0; // Retention not active yet
+            return Vec::new(); // Retention not active yet
         }
 
         let retained_set: std::collections::HashSet<DsfRegion> = retained.into_iter().collect();
@@ -224,15 +230,17 @@ impl BoundaryStrategy {
             .map(|(dsf, _)| dsf)
             .collect();
 
-        let evicted = to_evict.len();
         for region in &to_evict {
             geo_index.remove::<PrefetchedRegion>(region);
         }
 
-        if evicted > 0 {
-            tracing::debug!(evicted, "Evicted non-retained PrefetchedRegion entries");
+        if !to_evict.is_empty() {
+            tracing::debug!(
+                evicted = to_evict.len(),
+                "Evicted non-retained PrefetchedRegion entries"
+            );
         }
-        evicted
+        to_evict
     }
 }
 
@@ -879,7 +887,9 @@ mod tests {
 
         let evicted = BoundaryStrategy::evict_non_retained(&geo_index);
 
-        assert_eq!(evicted, 2);
+        assert_eq!(evicted.len(), 2);
+        assert!(evicted.contains(&DsfRegion::new(48, 7)));
+        assert!(evicted.contains(&DsfRegion::new(52, 5)));
         assert!(geo_index.contains::<PrefetchedRegion>(&DsfRegion::new(50, 7)));
         assert!(geo_index.contains::<PrefetchedRegion>(&DsfRegion::new(51, 7)));
         assert!(!geo_index.contains::<PrefetchedRegion>(&DsfRegion::new(48, 7)));
@@ -901,7 +911,7 @@ mod tests {
 
         let evicted = BoundaryStrategy::evict_non_retained(&geo_index);
 
-        assert_eq!(evicted, 1); // Only Prefetched, not InProgress
+        assert_eq!(evicted, vec![DsfRegion::new(51, 7)]); // Only Prefetched, not InProgress
         assert!(geo_index.contains::<PrefetchedRegion>(&DsfRegion::new(50, 7)));
         assert!(!geo_index.contains::<PrefetchedRegion>(&DsfRegion::new(51, 7)));
     }
@@ -918,7 +928,7 @@ mod tests {
 
         // Should not evict anything — retention not active means we can't determine
         // what's outside the window
-        assert_eq!(evicted, 0);
+        assert!(evicted.is_empty());
         assert!(geo_index.contains::<PrefetchedRegion>(&DsfRegion::new(50, 7)));
         assert!(geo_index.contains::<PrefetchedRegion>(&DsfRegion::new(51, 7)));
     }

@@ -1099,7 +1099,9 @@ impl AdaptivePrefetchCoordinator {
         // ~1170 after landing on acceptance flight 1 (#176). Retention and
         // eviction must share a phase, or the pair is not a pair.
         if matches!(self.phase_detector.current_phase(), FlightPhase::Cruise) {
-            BoundaryStrategy::evict_non_retained(&geo_index);
+            for region in BoundaryStrategy::evict_non_retained(&geo_index) {
+                self.region_retry.remove(&region);
+            }
         }
 
         // Per-maintenance-cycle instrumentation (#172 Part 4): report
@@ -2614,6 +2616,57 @@ mod tests {
                 .unwrap_or(true),
             "one fresh failure after an observer-driven demotion must not \
              re-retire the region"
+        );
+    }
+
+    // `region_retry` is cleared on the three retirement/promotion exits, but
+    // `evict_non_retained` removes `Deferred` (and other terminal) entries
+    // from the GeoIndex without the coordinator's involvement — it is a
+    // static taking only `&GeoIndex`. Left unpruned, a region that leaves the
+    // retained window and later returns resumes at its old `strikes`, so its
+    // first fresh no-progress evaluation defers 40-60s instead of 20s.
+    #[test]
+    fn test_retry_state_is_pruned_when_region_is_evicted() {
+        use crate::geo_index::RetainedRegion;
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let kept = DsfRegion::new(47, 8);
+        let dropped = DsfRegion::new(10, 10);
+
+        // Retention must be non-empty or `evict_non_retained` returns early
+        // and this test passes vacuously. This trap cost three failed
+        // reproductions during #223 — do not remove this line.
+        geo_index.insert::<RetainedRegion>(kept, RetainedRegion);
+
+        geo_index.insert::<PrefetchedRegion>(
+            dropped,
+            PrefetchedRegion::deferred(Instant::now() + Duration::from_secs(60)),
+        );
+
+        let mut coord =
+            AdaptivePrefetchCoordinator::with_defaults().with_geo_index(Arc::clone(&geo_index));
+        // Eviction runs only in Cruise (the guard at core.rs:1101). Set the
+        // phase directly rather than driving `update()` — the detector has
+        // hysteresis, so a single update may not transition and the test
+        // would silently no-op.
+        coord.phase_detector.reset_to_cruise();
+        coord.region_retry.insert(
+            dropped,
+            RegionRetryState {
+                strikes: 2,
+                last_covered: 5,
+            },
+        );
+
+        coord.run_region_maintenance();
+
+        assert!(
+            !coord.region_retry.contains_key(&dropped),
+            "retry bookkeeping must not outlive the region's entry in the index"
+        );
+        assert!(
+            coord.region_retry.is_empty() || !coord.region_retry.contains_key(&dropped),
+            "only the evicted region's state is pruned"
         );
     }
 
