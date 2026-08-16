@@ -370,11 +370,18 @@ impl MetricsClient {
 
     /// Reports the current region-state distribution (gauge).
     #[inline]
-    pub fn prefetch_region_state(&self, in_progress: usize, prefetched: usize, no_coverage: usize) {
+    pub fn prefetch_region_state(
+        &self,
+        in_progress: usize,
+        prefetched: usize,
+        no_coverage: usize,
+        deferred: usize,
+    ) {
         self.send(MetricEvent::PrefetchRegionState {
             in_progress,
             prefetched,
             no_coverage,
+            deferred,
         });
     }
 

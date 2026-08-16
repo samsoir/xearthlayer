@@ -40,7 +40,12 @@ fn deferral_for(strikes: u8) -> Duration {
 /// about whether scenery exists.
 #[derive(Debug, Clone, Copy, Default)]
 struct RegionRetryState {
+    /// Consecutive evaluations that observed no new coverage.
     strikes: u8,
+    /// Coverage seen at the *previous* evaluation — the latest observation,
+    /// deliberately not a high-water mark. Coverage can regress when the DDS
+    /// disk cache's GC daemon evicts tiles; a peak would blind progress
+    /// detection until coverage climbed past it again.
     last_covered: usize,
 }
 
@@ -1103,27 +1108,38 @@ impl AdaptivePrefetchCoordinator {
         // `prefetched` remains low, the fast-path is stalling and the
         // rescue path is carrying the work — the same anti-pattern that
         // produced the 61:4 rescue ratio in the LOWW flight log.
-        let (in_progress, prefetched, no_coverage) = geo_index
-            .iter::<PrefetchedRegion>()
-            .into_iter()
-            .fold((0usize, 0usize, 0usize), |(ip, p, nc), (_, r)| {
-                if r.is_in_progress() {
-                    (ip + 1, p, nc)
-                } else if r.is_prefetched() {
-                    (ip, p + 1, nc)
-                } else {
-                    (ip, p, nc + 1)
-                }
-            });
+        //
+        // `Deferred` gets its own bucket (#226). It is a NON-terminal state —
+        // the region is expected back once `retry_after` expires — so folding
+        // it into `no_coverage` would report land regions as having no
+        // scenery, which is precisely the false alarm this fix removes. It is
+        // also the acceptance criterion's own instrument: `regions_nocoverage`
+        // must be non-zero only over water.
+        let (in_progress, prefetched, no_coverage, deferred) =
+            geo_index.iter::<PrefetchedRegion>().into_iter().fold(
+                (0usize, 0usize, 0usize, 0usize),
+                |(ip, p, nc, d), (_, r)| {
+                    if r.is_in_progress() {
+                        (ip + 1, p, nc, d)
+                    } else if r.is_prefetched() {
+                        (ip, p + 1, nc, d)
+                    } else if r.is_deferred() {
+                        (ip, p, nc, d + 1)
+                    } else {
+                        (ip, p, nc + 1, d)
+                    }
+                },
+            );
         tracing::debug!(
             regions_in_progress = in_progress,
             regions_prefetched = prefetched,
             regions_nocoverage = no_coverage,
+            regions_deferred_active = deferred,
             "Region maintenance: state distribution"
         );
 
         if let Some(ref metrics) = self.metrics_client {
-            metrics.prefetch_region_state(in_progress, prefetched, no_coverage);
+            metrics.prefetch_region_state(in_progress, prefetched, no_coverage, deferred);
         }
     }
 
@@ -1206,6 +1222,12 @@ impl AdaptivePrefetchCoordinator {
                             "Stale InProgress region advancing — retrying"
                         );
                     } else {
+                        // Track the latest observation, not a high-water mark.
+                        // Coverage can regress (the DDS disk cache has a GC
+                        // daemon); leaving `last_covered` at the peak would
+                        // blind progress detection until coverage exceeded it
+                        // again, striking a region that is genuinely advancing.
+                        entry.last_covered = covered;
                         entry.strikes = entry.strikes.saturating_add(1);
                         let strikes = entry.strikes;
                         let deferral = deferral_for(strikes);
@@ -2341,6 +2363,76 @@ mod tests {
         assert_eq!(coord.region_retry.get(&region).unwrap().last_covered, 1);
     }
 
+    /// `last_covered` is the *previous observation*, not a high-water mark.
+    ///
+    /// Coverage can regress: the DDS disk cache has a GC daemon that evicts
+    /// tiles. If the stuck branch left `last_covered` at the best value ever
+    /// seen, progress detection would be blinded until coverage exceeded that
+    /// old peak, and a genuinely advancing region would accrue strikes.
+    #[tokio::test]
+    async fn test_last_covered_tracks_latest_observation_not_high_water_mark() {
+        let index = make_scenery_index(50, 9, 16);
+        let region = DsfRegion::new(50, 9);
+        let tiles = index.tiles_in_region(region);
+        assert!(
+            tiles.len() >= 3,
+            "Precondition: need at least three tiles to model a regression \
+             that still leaves the region Incomplete"
+        );
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let empty_checker: Arc<dyn DdsDiskCacheChecker> =
+            MockDiskChecker::with_tile_coords(std::iter::empty::<TileCoord>());
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_scenery_index(Arc::clone(&index))
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_disk_checker(empty_checker);
+        coord.config.stale_region_timeout = std::time::Duration::ZERO;
+
+        // Helper: re-arm the region and evaluate against a given tile set.
+        let evaluate_with = |coord: &mut AdaptivePrefetchCoordinator, present: &[TileCoord]| {
+            coord.dds_disk_checker =
+                Some(MockDiskChecker::with_tile_coords(present.iter().copied()));
+            geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+            coord.evaluate_stale_regions(&geo_index);
+        };
+
+        // 0 covered -> strike 1.
+        evaluate_with(&mut coord, &[]);
+        assert_eq!(coord.region_retry.get(&region).map(|r| r.strikes), Some(1));
+
+        // Coverage advances to 2 -> progress, strikes cleared.
+        evaluate_with(&mut coord, &[tiles[0], tiles[1]]);
+        assert_eq!(
+            coord.region_retry.get(&region).map(|r| r.last_covered),
+            Some(2),
+            "Precondition: peak coverage of 2 recorded"
+        );
+
+        // GC evicts one tile: coverage regresses to 1. No progress -> strike.
+        evaluate_with(&mut coord, &[tiles[0]]);
+        assert_eq!(
+            coord.region_retry.get(&region).map(|r| r.strikes),
+            Some(1),
+            "a regression is not progress, so it takes a strike"
+        );
+        assert_eq!(
+            coord.region_retry.get(&region).map(|r| r.last_covered),
+            Some(1),
+            "last_covered must follow the latest observation down, not stay at the peak"
+        );
+
+        // The tile comes back: 2 > 1, so this IS progress. Under high-water
+        // semantics the comparison would be 2 > 2 and the region would be
+        // wrongly struck again.
+        evaluate_with(&mut coord, &[tiles[0], tiles[1]]);
+        assert_eq!(
+            coord.region_retry.get(&region).map(|r| r.strikes),
+            Some(0),
+            "recovering to a previously-seen level is still progress"
+        );
+    }
+
     /// The ladder, including that it stops growing at the fourth rung.
     #[test]
     fn test_deferral_ladder() {
@@ -2469,8 +2561,7 @@ mod tests {
         let mut coord = AdaptivePrefetchCoordinator::with_defaults()
             .with_scenery_index(Arc::clone(&covering_index))
             .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_disk_checker(Arc::clone(&empty_checker))
-            .with_ortho_union_index(Arc::new(OrthoUnionIndex::new()));
+            .with_dds_disk_checker(Arc::clone(&empty_checker));
         coord.config.stale_region_timeout = std::time::Duration::ZERO;
 
         // Accumulate strikes: two stale no-progress evaluations.
@@ -2665,10 +2756,83 @@ mod tests {
                     in_progress: 1,
                     prefetched: 2,
                     no_coverage: 3,
+                    deferred: 0,
                 }
             ),
-            "expected PrefetchRegionState {{ in_progress: 1, prefetched: 2, no_coverage: 3 }}, got {:?}",
+            "expected PrefetchRegionState {{ in_progress: 1, prefetched: 2, no_coverage: 3, deferred: 0 }}, got {:?}",
             region_state_events[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deferred_regions_are_not_reported_as_no_coverage() {
+        use crate::metrics::MetricEvent;
+
+        // #226: `regions_nocoverage` non-zero only over water is an acceptance
+        // criterion for this fix. Folding `Deferred` into the NoCoverage
+        // bucket would make the fix falsify its own instrument — a deferred
+        // land region would be reported as having no coverage, which is
+        // exactly the false alarm the fix exists to remove.
+        let geo_index = Arc::new(GeoIndex::new());
+
+        // Distinct counts so an argument swap at the call site, or a swap of
+        // the fold arms, cannot go undetected.
+        geo_index
+            .insert::<PrefetchedRegion>(DsfRegion::new(10, 10), PrefetchedRegion::in_progress());
+        geo_index
+            .insert::<PrefetchedRegion>(DsfRegion::new(20, 20), PrefetchedRegion::prefetched());
+        geo_index
+            .insert::<PrefetchedRegion>(DsfRegion::new(21, 20), PrefetchedRegion::prefetched());
+        for lat in 30..33 {
+            geo_index.insert::<PrefetchedRegion>(
+                DsfRegion::new(lat, 30),
+                PrefetchedRegion::deferred(Instant::now() + Duration::from_secs(20)),
+            );
+        }
+        // Deliberately NO NoCoverage regions: the bucket must stay empty.
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let metrics = MetricsClient::new(tx);
+
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_metrics_client(metrics);
+
+        // No scenery_index/dds_disk_checker, so `region_disk_state` is
+        // Unknown and maintenance leaves the seeded distribution untouched.
+        coord.run_region_maintenance();
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let region_state_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, MetricEvent::PrefetchRegionState { .. }))
+            .collect();
+        assert_eq!(
+            region_state_events.len(),
+            1,
+            "expected exactly one PrefetchRegionState event, got {:?}",
+            region_state_events
+        );
+
+        let MetricEvent::PrefetchRegionState {
+            in_progress,
+            prefetched,
+            no_coverage,
+            deferred,
+        } = region_state_events[0]
+        else {
+            unreachable!("filtered above")
+        };
+        assert_eq!(*in_progress, 1, "in_progress bucket");
+        assert_eq!(*prefetched, 2, "prefetched bucket");
+        assert_eq!(
+            *no_coverage, 0,
+            "a Deferred region is not a NoCoverage region — folding it into \
+             this bucket falsifies the acceptance instrument for #226"
+        );
+        assert_eq!(
+            *deferred, 3,
+            "deferred regions must be visible as their own gauge, not silently uncounted"
         );
     }
 

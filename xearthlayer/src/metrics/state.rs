@@ -260,6 +260,12 @@ pub struct AggregatedState {
     pub prefetch_regions_prefetched: usize,
     /// Regions with no ortho scenery (gauge).
     pub prefetch_regions_nocoverage: usize,
+    /// Regions currently deferred for making no progress (gauge, #226).
+    ///
+    /// Distinct from [`Self::prefetch_regions_deferred`], which is a counter
+    /// of how many deferrals have *occurred* in the interval. This is how
+    /// many regions are deferred *right now*.
+    pub prefetch_regions_deferred_active: usize,
     /// Total observed divergences between prefetch state and reality (counter).
     pub prefetch_state_diverged: u64,
     /// Total regions demoted in response to divergence (counter).
@@ -331,6 +337,7 @@ impl AggregatedState {
             prefetch_regions_in_progress: 0,
             prefetch_regions_prefetched: 0,
             prefetch_regions_nocoverage: 0,
+            prefetch_regions_deferred_active: 0,
             prefetch_state_diverged: 0,
             prefetch_regions_demoted: 0,
             prefetch_regions_deferred: 0,
@@ -386,7 +393,8 @@ impl AggregatedState {
         self.fuse_requests_active = 0;
         self.fuse_requests_waiting = 0;
         self.peak_bytes_per_second = 0.0;
-        // prefetch_regions_{in_progress,prefetched,nocoverage} are NOT reset:
+        // prefetch_regions_{in_progress,prefetched,nocoverage,deferred_active}
+        // are NOT reset:
         // like chunk_disk_cache_size_bytes/dds_disk_cache_size_bytes/
         // chunk_index_entries above, they are externally-derived gauges
         // (assigned wholesale from GeoIndex each maintenance cycle), not

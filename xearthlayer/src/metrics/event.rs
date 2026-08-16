@@ -239,6 +239,13 @@ pub enum MetricEvent {
         prefetched: usize,
         /// Regions with no ortho scenery.
         no_coverage: usize,
+        /// Regions currently deferred for making no progress (#226).
+        ///
+        /// Deliberately its own bucket rather than folded into
+        /// `no_coverage`: `regions_nocoverage` non-zero only over water is an
+        /// acceptance criterion, and a deferred land region counted there
+        /// would be exactly the false alarm #226 exists to remove.
+        deferred: usize,
     },
 
     /// FUSE generated a tile in a region prefetch claimed was handled.
