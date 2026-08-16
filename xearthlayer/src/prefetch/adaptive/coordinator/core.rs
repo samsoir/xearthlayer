@@ -49,7 +49,7 @@ struct RegionRetryState {
     last_covered: usize,
 }
 
-use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage, PrefetchedRegion};
+use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage, PrefetchedRegion, RegionState};
 use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::state::{AircraftState, SharedPrefetchStatus};
 use crate::prefetch::SceneryIndex;
@@ -1117,19 +1117,22 @@ impl AdaptivePrefetchCoordinator {
         // scenery, which is precisely the false alarm this fix removes. It is
         // also the acceptance criterion's own instrument: `regions_nocoverage`
         // must be non-zero only over water.
+        //
+        // An exhaustive `match` rather than an if/else-if chain: the chain's
+        // trailing `else` meant "no_coverage", so a new `RegionState` variant
+        // would be reported as ocean with no compiler error. That is not
+        // hypothetical — `Deferred` landed in exactly that catch-all when it
+        // was introduced on this branch, and corrupted the acceptance
+        // instrument until it was caught. The compiler now refuses to build
+        // a fifth variant into `regions_nocoverage` by default.
         let (in_progress, prefetched, no_coverage, deferred) =
             geo_index.iter::<PrefetchedRegion>().into_iter().fold(
                 (0usize, 0usize, 0usize, 0usize),
-                |(ip, p, nc, d), (_, r)| {
-                    if r.is_in_progress() {
-                        (ip + 1, p, nc, d)
-                    } else if r.is_prefetched() {
-                        (ip, p + 1, nc, d)
-                    } else if r.is_deferred() {
-                        (ip, p, nc, d + 1)
-                    } else {
-                        (ip, p, nc + 1, d)
-                    }
+                |(ip, p, nc, d), (_, r)| match r.state() {
+                    RegionState::InProgress => (ip + 1, p, nc, d),
+                    RegionState::Prefetched => (ip, p + 1, nc, d),
+                    RegionState::NoCoverage => (ip, p, nc + 1, d),
+                    RegionState::Deferred { .. } => (ip, p, nc, d + 1),
                 },
             );
         tracing::debug!(
