@@ -75,26 +75,20 @@ impl DdsDiskCacheChecker for DdsDiskCacheBridge {
     }
 
     fn tile_exists_blocking(&self, row: u32, col: u32, zoom: u8) -> bool {
-        // Delegates to the async `tile_exists` via `block_in_place` so
-        // the sync callsite is free of the runtime-handle dance. Moving
-        // the hack into the trait impl encapsulates it here — callers
-        // (e.g. `promote_completed_regions`) can treat this as a plain
-        // sync method.
-        //
-        // TODO(#175): specialise with a truly sync path by exposing
-        // an index-only check through the `Cache` trait. The DashMap
-        // lookup backing `lru_index` is already sync; the async wrapper
-        // is gratuitous for hot-path existence checks.
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.tile_exists(row, col, zoom))
-        })
+        // Genuinely sync now — no runtime round-trip. This also means the
+        // method is safe to call outside a tokio runtime, which it was not
+        // before (`block_in_place` panics on a current-thread runtime).
+        let tile = TileCoord { row, col, zoom };
+        self.client.contains_sync(&tile)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::{CacheService, ServiceCacheConfig};
+    use crate::cache::config::DiskProviderConfig;
+    use crate::cache::{CacheService, DiskCacheProvider, DiskTier, ServiceCacheConfig};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     async fn create_disk_bridge() -> (DdsDiskCacheBridge, CacheService, TempDir) {
@@ -209,5 +203,32 @@ mod tests {
         );
 
         service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_tile_exists_blocking_matches_async_contains() {
+        // `DdsDiskCacheBridge::new` takes an `Arc<dyn Cache>`; build the disk
+        // provider with the same `DiskProviderConfig` shape used by
+        // `disk.rs::create_test_provider`, but with `tier: DiskTier::Dds`.
+        let temp_dir = TempDir::new().unwrap();
+        let provider = DiskCacheProvider::start(DiskProviderConfig {
+            directory: temp_dir.path().to_path_buf(),
+            max_size_bytes: 10 * 1024 * 1024,
+            gc_interval: Duration::from_secs(3600),
+            provider_name: "test".to_string(),
+            metrics_client: None,
+            tier: DiskTier::Dds,
+        })
+        .await
+        .unwrap();
+        let bridge = DdsDiskCacheBridge::new(provider);
+
+        assert!(!bridge.tile_exists_blocking(12754, 5279, 15));
+        bridge.put(12754, 5279, 15, vec![0u8; 64]).await;
+        assert!(bridge.tile_exists_blocking(12754, 5279, 15));
+        assert_eq!(
+            bridge.contains(12754, 5279, 15).await,
+            bridge.tile_exists_blocking(12754, 5279, 15)
+        );
     }
 }

@@ -83,6 +83,12 @@ impl TileCacheClient {
         self.cache.contains(&key).await.unwrap_or(false)
     }
 
+    /// Check whether a tile exists, synchronously. See `Cache::contains_sync`.
+    pub fn contains_sync(&self, tile: &TileCoord) -> bool {
+        let key = Self::tile_to_key(tile);
+        self.cache.contains_sync(&key)
+    }
+
     /// Delete a tile from the cache.
     ///
     /// # Arguments

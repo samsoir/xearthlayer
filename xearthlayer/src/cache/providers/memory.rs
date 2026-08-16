@@ -138,6 +138,10 @@ impl Cache for MemoryCacheProvider {
         Box::pin(async move { Ok(self.cache.contains_key(&key)) })
     }
 
+    fn contains_sync(&self, key: &str) -> bool {
+        self.cache.contains_key(key)
+    }
+
     fn size_bytes(&self) -> u64 {
         self.cache.weighted_size()
     }
@@ -245,6 +249,20 @@ mod tests {
         provider.set("key1", vec![1]).await.unwrap();
 
         assert!(provider.contains("key1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_memory_contains_sync_agrees_with_contains() {
+        let provider = MemoryCacheProvider::new(1_000_000, None);
+        let key = "tile:15:12754:5279";
+
+        assert!(!provider.contains_sync(key));
+        provider.set(key, vec![0u8; 64]).await.unwrap();
+        assert!(provider.contains_sync(key));
+        assert_eq!(
+            provider.contains(key).await.unwrap(),
+            provider.contains_sync(key)
+        );
     }
 
     #[tokio::test]

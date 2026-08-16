@@ -408,6 +408,12 @@ impl Cache for DiskCacheProvider {
         Box::pin(async move { Ok(in_index) })
     }
 
+    fn contains_sync(&self, key: &str) -> bool {
+        // Index-only, exactly like `contains()` — see the comment there for
+        // why there is no filesystem verify.
+        self.lru_index.contains(key)
+    }
+
     fn size_bytes(&self) -> u64 {
         self.lru_index.total_size()
     }
@@ -519,6 +525,28 @@ mod tests {
         provider.set("key1", vec![1]).await.unwrap();
 
         assert!(provider.contains("key1").await.unwrap());
+
+        provider.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_contains_sync_agrees_with_contains() {
+        let (_dir, provider) = create_test_provider(10 * 1024 * 1024).await;
+        let key = "tile:15:12754:5279";
+
+        assert!(!provider.contains_sync(key), "absent key must be false");
+        assert_eq!(
+            provider.contains(key).await.unwrap(),
+            provider.contains_sync(key)
+        );
+
+        provider.set(key, vec![0u8; 64]).await.unwrap();
+
+        assert!(provider.contains_sync(key), "present key must be true");
+        assert_eq!(
+            provider.contains(key).await.unwrap(),
+            provider.contains_sync(key)
+        );
 
         provider.shutdown().await;
     }

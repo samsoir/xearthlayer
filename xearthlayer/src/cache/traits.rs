@@ -170,6 +170,17 @@ pub trait Cache: Send + Sync {
     /// * `key` - The cache key to check
     fn contains(&self, key: &str) -> BoxFuture<'_, Result<bool, ServiceCacheError>>;
 
+    /// Check if a key exists, synchronously.
+    ///
+    /// Both providers already answer this from an in-memory map — moka's
+    /// `contains_key` and `LruIndex::contains` are each sync — so the
+    /// `BoxFuture` returned by `contains()` is pure overhead for a caller
+    /// that is itself sync. Prefetch's region-completeness scan calls this
+    /// several hundred times per region per cycle; going through the async
+    /// wrapper there cost a `block_in_place` + `block_on` + `Box::pin`
+    /// allocation per tile. Resolves TODO(#175).
+    fn contains_sync(&self, key: &str) -> bool;
+
     /// Get the current size of the cache in bytes.
     ///
     /// For memory caches, this is the weighted size of all entries.
