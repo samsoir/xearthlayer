@@ -83,6 +83,15 @@ pub enum RegionState {
     Prefetched,
     /// No scenery data exists for this region.
     NoCoverage,
+    /// Has coverage, could not be completed yet; skipped until `retry_after`.
+    ///
+    /// Deliberately NOT terminal. A region here is retried once the deadline
+    /// passes, which keeps its tiles available to a future provider-fallback
+    /// feature — see the spec's "Governing constraint" section.
+    Deferred {
+        /// The instant at which this region becomes eligible for prefetch again.
+        retry_after: Instant,
+    },
 }
 
 impl PrefetchedRegion {
@@ -110,6 +119,24 @@ impl PrefetchedRegion {
         }
     }
 
+    /// Create a `Deferred` state that becomes eligible again at `retry_after`.
+    pub fn deferred(retry_after: Instant) -> Self {
+        Self {
+            state: RegionState::Deferred { retry_after },
+            since: Instant::now(),
+        }
+    }
+
+    /// Returns `true` if this region is in the `Deferred` state.
+    pub fn is_deferred(&self) -> bool {
+        matches!(self.state, RegionState::Deferred { .. })
+    }
+
+    /// The raw lifecycle state.
+    pub fn state(&self) -> RegionState {
+        self.state
+    }
+
     /// Returns `true` if this region is in the `InProgress` state.
     pub fn is_in_progress(&self) -> bool {
         self.state == RegionState::InProgress
@@ -135,11 +162,18 @@ impl PrefetchedRegion {
 
     /// Returns `true` if the given region should be prefetched.
     ///
-    /// A region should be prefetched only if it is absent from the index
-    /// (no entry means never evaluated). Any present state (`InProgress`,
-    /// `Prefetched`, or `NoCoverage`) means the region should be skipped.
+    /// Absent means never evaluated — eligible. `InProgress`, `Prefetched` and
+    /// `NoCoverage` are all skipped. `Deferred` is skipped only until its
+    /// deadline passes; this is the one state that expires, which is why this
+    /// can no longer be a bare `!contains()`.
     pub fn should_prefetch(index: &super::GeoIndex, region: &super::DsfRegion) -> bool {
-        !index.contains::<PrefetchedRegion>(region)
+        match index.get::<PrefetchedRegion>(region) {
+            None => true,
+            Some(entry) => match entry.state() {
+                RegionState::Deferred { retry_after } => Instant::now() >= retry_after,
+                _ => false,
+            },
+        }
     }
 }
 
@@ -247,6 +281,44 @@ mod tests {
         // NoCoverage → should NOT prefetch
         index.insert::<PrefetchedRegion>(region, PrefetchedRegion::no_coverage());
         assert!(!PrefetchedRegion::should_prefetch(&index, &region));
+    }
+
+    #[test]
+    fn test_deferred_region_becomes_prefetchable_when_retry_after_passes() {
+        use std::time::Duration;
+
+        let index = GeoIndex::new();
+        let region = DsfRegion::new(47, 8);
+
+        // Still deferred.
+        index.insert::<PrefetchedRegion>(
+            region,
+            PrefetchedRegion::deferred(Instant::now() + Duration::from_secs(60)),
+        );
+        assert!(
+            !PrefetchedRegion::should_prefetch(&index, &region),
+            "a region still inside its deferral window must not be planned"
+        );
+
+        // Deferral elapsed.
+        index.insert::<PrefetchedRegion>(
+            region,
+            PrefetchedRegion::deferred(Instant::now() - Duration::from_secs(1)),
+        );
+        assert!(
+            PrefetchedRegion::should_prefetch(&index, &region),
+            "a region whose deferral has elapsed must become eligible again"
+        );
+    }
+
+    #[test]
+    fn test_deferred_is_never_stale() {
+        use std::time::Duration;
+
+        // `evaluate_stale_regions` must not see Deferred regions — they re-enter
+        // the machine through the planner so the tiles are genuinely re-submitted.
+        let r = PrefetchedRegion::deferred(Instant::now() - Duration::from_secs(600));
+        assert!(!r.is_stale(Duration::from_secs(1)));
     }
 
     // Compile-time assertions for trait bounds
