@@ -1145,7 +1145,7 @@ impl AdaptivePrefetchCoordinator {
                 // No tiles indexed: the region can never be confirmed, so
                 // retiring it after repeated attempts is correct — this
                 // preserves pre-#223 behavior.
-                RegionDiskState::Incomplete | RegionDiskState::NoTiles => {
+                RegionDiskState::Incomplete { .. } | RegionDiskState::NoTiles => {
                     let attempts = self.region_attempts.entry(region).or_insert(0);
                     *attempts += 1;
 

@@ -34,8 +34,10 @@ pub struct BoundaryStrategy;
 pub enum RegionDiskState {
     /// Every tile the scenery index attributes to this region is present.
     Complete,
-    /// At least one attributed tile is absent.
-    Incomplete,
+    /// At least one attributed tile is absent. Carries the counts so callers
+    /// can tell a region that is *advancing* from one that is *stuck* — the
+    /// distinction #226 turned on.
+    Incomplete { covered: usize, total: usize },
     /// The scenery index attributes no tiles to this region.
     NoTiles,
     /// No authoritative source to consult — no checker and/or no index.
@@ -68,16 +70,20 @@ impl BoundaryStrategy {
         if tiles.is_empty() {
             return RegionDiskState::NoTiles;
         }
-        // Short-circuits on first miss. A tile counts as covered if either
-        // the XEL DDS disk cache or an installed package already has it —
-        // see `tile_is_covered`.
-        if tiles
+        // Counts rather than short-circuiting: the caller needs `covered` to
+        // distinguish a slow region from a stuck one. Affordable because
+        // `tile_exists_blocking` is a sync map lookup as of #226 (see
+        // TODO(#175) resolution); it was a runtime round-trip per tile before.
+        let total = tiles.len();
+        let covered = tiles
             .iter()
-            .all(|t| Self::tile_is_covered(t, checker, ortho_union_index))
-        {
+            .filter(|t| Self::tile_is_covered(t, checker, ortho_union_index))
+            .count();
+
+        if covered == total {
             RegionDiskState::Complete
         } else {
-            RegionDiskState::Incomplete
+            RegionDiskState::Incomplete { covered, total }
         }
     }
 
@@ -174,7 +180,7 @@ impl BoundaryStrategy {
                     geo_index.insert::<PrefetchedRegion>(*region, PrefetchedRegion::prefetched());
                     promoted.push(*region);
                 }
-                RegionDiskState::Incomplete
+                RegionDiskState::Incomplete { .. }
                 | RegionDiskState::NoTiles
                 | RegionDiskState::Unknown => {
                     continue;
@@ -676,6 +682,50 @@ mod tests {
     }
 
     #[test]
+    fn test_region_disk_state_reports_covered_and_total() {
+        // Index with 3 tiles in the region; mark 2 of them present on disk.
+        let index = Arc::new(SceneryIndex::with_defaults());
+        let region = DsfRegion::new(47, 8);
+        index.add_tile(SceneryTile {
+            row: 1000,
+            col: 2000,
+            chunk_zoom: 16,
+            lat: 47.1,
+            lon: 8.1,
+            is_sea: false,
+        });
+        index.add_tile(SceneryTile {
+            row: 3000,
+            col: 4000,
+            chunk_zoom: 16,
+            lat: 47.4,
+            lon: 8.4,
+            is_sea: false,
+        });
+        index.add_tile(SceneryTile {
+            row: 5000,
+            col: 6000,
+            chunk_zoom: 16,
+            lat: 47.7,
+            lon: 8.7,
+            is_sea: false,
+        });
+        let tiles = index.tiles_in_region(region);
+        assert_eq!(tiles.len(), 3, "fixture precondition: exactly 3 tiles");
+
+        let checker: Arc<dyn DdsDiskCacheChecker> =
+            MockDiskChecker::with_tile_coords(vec![tiles[0], tiles[1]]);
+
+        let state = BoundaryStrategy::region_disk_state(region, Some(&index), Some(&checker), None);
+
+        assert_eq!(
+            state,
+            RegionDiskState::Incomplete { covered: 2, total: 3 },
+            "must report how many of the region's tiles are present, not just that it is incomplete"
+        );
+    }
+
+    #[test]
     fn test_region_disk_state_complete_and_incomplete() {
         let index = make_scenery_index_for_region(50, 9, 16);
         let region = DsfRegion { lat: 50, lon: 9 };
@@ -704,7 +754,10 @@ mod tests {
                 Some(&test_checker(&all_but_one)),
                 None
             ),
-            RegionDiskState::Incomplete
+            RegionDiskState::Incomplete {
+                covered: tiles.len() - 1,
+                total: tiles.len()
+            }
         );
     }
 
@@ -783,6 +836,8 @@ mod tests {
         // Guards the disjunction against becoming a tautology.
         let index = make_scenery_index_for_region(50, 9, 16);
         let region = DsfRegion { lat: 50, lon: 9 };
+        let tiles = index.tiles_in_region(region);
+        assert!(!tiles.is_empty(), "fixture precondition");
         let temp = tempfile::TempDir::new().unwrap();
         let ortho = make_ortho_index_with_chunk_tiles(&temp, vec![]);
         assert_eq!(
@@ -792,7 +847,10 @@ mod tests {
                 Some(&test_checker(&[])),
                 Some(&ortho)
             ),
-            RegionDiskState::Incomplete
+            RegionDiskState::Incomplete {
+                covered: 0,
+                total: tiles.len()
+            }
         );
     }
 
