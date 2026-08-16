@@ -262,16 +262,17 @@ pub struct AggregatedState {
     pub prefetch_regions_nocoverage: usize,
     /// Regions currently deferred for making no progress (gauge, #226).
     ///
-    /// Distinct from [`Self::prefetch_regions_deferred`], which is a counter
-    /// of how many deferrals have *occurred* in the interval. This is how
-    /// many regions are deferred *right now*.
+    /// Distinct from [`Self::prefetch_regions_deferred`], which is a
+    /// cumulative count of how many deferrals have *occurred* since process
+    /// start. This is how many regions are deferred *right now*.
     pub prefetch_regions_deferred_active: usize,
     /// Total observed divergences between prefetch state and reality (counter).
     pub prefetch_state_diverged: u64,
     /// Total regions demoted in response to divergence (counter).
     pub prefetch_regions_demoted: u64,
-    /// Total regions deferred for making no progress since the last
-    /// evaluation (counter).
+    /// Total regions deferred for making no progress, cumulative since
+    /// process start (counter). `reset()` has no production caller, so this
+    /// is never windowed.
     pub prefetch_regions_deferred: u64,
     /// Total regions promoted via the normal completion path (counter).
     pub prefetch_promotions_normal: u64,

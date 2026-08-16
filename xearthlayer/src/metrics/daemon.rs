@@ -432,18 +432,22 @@ impl MetricsDaemon {
             regions_prefetched = state.prefetch_regions_prefetched,
             regions_nocoverage = state.prefetch_regions_nocoverage,
             // #226: how many regions are deferred RIGHT NOW (gauge). Distinct
-            // from `regions_deferred` below, which counts deferrals that
-            // occurred during the interval. Without this, deferred regions
-            // would be invisible in the sample line — or, worse, counted as
-            // `regions_nocoverage` and read as missing scenery.
+            // from `regions_deferred` below, which is a cumulative count of
+            // every deferral since process start. Without this, deferred
+            // regions would be invisible in the sample line — or, worse,
+            // counted as `regions_nocoverage` and read as missing scenery.
             regions_deferred_active = state.prefetch_regions_deferred_active,
             promotions_normal = state.prefetch_promotions_normal,
             promotions_rescue = state.prefetch_promotions_rescue,
             state_diverged = state.prefetch_state_diverged,
             regions_demoted = state.prefetch_regions_demoted,
             // #226: how often a region was skipped for making no progress.
-            // Non-zero under a cold-cache backlog is expected; climbing
-            // without bound is not.
+            // Cumulative since process start — `AggregatedState::reset()` has
+            // no production caller — so it only ever climbs, and does so on
+            // every maintenance cycle while any region is stuck. Read the rate
+            // of change between samples, not the absolute value: a flat value
+            // across successive lines is the healthy signal. Non-zero under a
+            // cold-cache backlog is expected.
             regions_deferred = state.prefetch_regions_deferred,
             // Criterion 5's user-visible outcome (the others above are
             // mechanism): on-demand FUSE generations should fall during
@@ -1224,7 +1228,11 @@ mod tests {
         // regions_deferred is a COUNTER, unlike the region-state gauges
         // above: it accumulates across the daemon's own event stream rather
         // than being assigned wholesale from GeoIndex each cycle, so it
-        // must reset while the gauges must not.
+        // belongs in `reset()` while the gauges do not.
+        //
+        // `reset()` has no production caller today, so in a running process
+        // the counter is cumulative since start. This asserts the `reset()`
+        // contract for the field, not a per-interval window in the log.
         let (mut daemon, _tx) = create_daemon();
         daemon.state.prefetch_regions_deferred = 7;
         daemon.state.prefetch_regions_nocoverage = 3;
