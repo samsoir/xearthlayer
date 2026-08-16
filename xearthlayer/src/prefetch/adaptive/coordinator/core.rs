@@ -54,7 +54,7 @@ use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::state::{AircraftState, SharedPrefetchStatus};
 use crate::prefetch::SceneryIndex;
 
-use super::super::boundary_strategy::{BoundaryStrategy, RegionDiskState};
+use super::super::boundary_strategy::{BoundaryStrategy, CoverageDetail, RegionDiskState};
 use super::super::calibration::{PerformanceCalibration, StrategyMode};
 use super::super::config::{AdaptivePrefetchConfig, PrefetchMode};
 use super::super::phase_detector::{FlightPhase, PhaseDetector};
@@ -1185,6 +1185,11 @@ impl AdaptivePrefetchCoordinator {
                 self.scenery_index.as_ref(),
                 self.dds_disk_checker.as_ref(),
                 self.ortho_union_index.as_ref(),
+                // The rescue path is the one caller that needs exact counts:
+                // `covered` is what separates an advancing region from a stuck
+                // one. It only pays for them because it runs over regions that
+                // have already been stale for `stale_region_timeout`.
+                CoverageDetail::ExactCounts,
             ) {
                 RegionDiskState::Complete => {
                     // Tiles generated successfully — promote based on the
@@ -1208,7 +1213,21 @@ impl AdaptivePrefetchCoordinator {
                 // NoCoverage: the index saying "there are tiles here" is
                 // positive evidence of coverage, and #226 was caused by
                 // treating this case as if it were NoTiles.
-                RegionDiskState::Incomplete { covered, total } => {
+                RegionDiskState::Incomplete { coverage } => {
+                    // Unreachable: this call site asks for `ExactCounts`. If a
+                    // future edit changes that, degrade to the `Unknown`
+                    // behaviour — leave the region alone and record no strike —
+                    // rather than inventing a count. A fabricated `0` would
+                    // read as "nothing has arrived" and strike a region that
+                    // may be nearly complete.
+                    let Some((covered, total)) = coverage.counts() else {
+                        tracing::warn!(
+                            lat = region.lat,
+                            lon = region.lon,
+                            "Stale region evaluated without tile counts — skipping"
+                        );
+                        continue;
+                    };
                     let entry = self.region_retry.entry(region).or_default();
 
                     if covered > entry.last_covered {

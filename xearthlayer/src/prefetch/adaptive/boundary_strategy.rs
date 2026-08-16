@@ -38,14 +38,70 @@ pub struct BoundaryStrategy;
 pub enum RegionDiskState {
     /// Every tile the scenery index attributes to this region is present.
     Complete,
-    /// At least one attributed tile is absent. Carries the counts so callers
-    /// can tell a region that is *advancing* from one that is *stuck* — the
-    /// distinction #226 turned on.
-    Incomplete { covered: usize, total: usize },
+    /// At least one attributed tile is absent. See [`TileCoverage`] for why
+    /// the counts are not unconditionally present.
+    Incomplete { coverage: TileCoverage },
     /// The scenery index attributes no tiles to this region.
     NoTiles,
     /// No authoritative source to consult — no checker and/or no index.
     Unknown,
+}
+
+/// How much an `Incomplete` answer knows about the region's tile counts.
+///
+/// This is an enum rather than `Option<(usize, usize)>` or a pair of zeroes
+/// because "not counted" must be *unrepresentable as a plausible count*.
+/// `Incomplete { covered: 0, total: 0 }` from a short-circuiting scan would
+/// read as a real observation ("nothing has arrived, and the region is
+/// empty") and would drive `evaluate_stale_regions` straight into a strike —
+/// exactly the class of silently-wrong number #226 exists to remove.
+/// [`TileCoverage::NotCounted`] carries no payload, so there is no number to
+/// misread, and [`TileCoverage::counts`] forces every reader to acknowledge
+/// its absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TileCoverage {
+    /// Every tile was checked. `covered < total` by construction.
+    Exact { covered: usize, total: usize },
+    /// The scan stopped at the first missing tile, so no counts exist.
+    /// Produced only for [`CoverageDetail::FirstMissOnly`] callers, which by
+    /// definition discard the counts.
+    NotCounted,
+}
+
+impl TileCoverage {
+    /// The `(covered, total)` pair, or `None` when the scan short-circuited.
+    pub fn counts(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Exact { covered, total } => Some((*covered, *total)),
+            Self::NotCounted => None,
+        }
+    }
+}
+
+/// How thoroughly [`BoundaryStrategy::region_disk_state`] should scan a
+/// region's tile set.
+///
+/// One function, one behaviour, parameterised — not two functions that can
+/// drift apart, which is the defect #176 was filed to remove.
+///
+/// The parameter exists because the per-tile check is not free. When the XEL
+/// DDS cache misses, `tile_is_covered` falls through to
+/// `OrthoUnionIndex::dds_tile_exists`, which tries 4 filename prefixes and —
+/// because `textures/` is in `LAZY_DIRECTORIES` and is deliberately never
+/// indexed — resolves each by `stat()`ing every installed source. An absent
+/// tile therefore costs ~4 × N_sources syscalls, and
+/// [`BoundaryStrategy::promote_completed_regions`] runs over every
+/// `InProgress` region on a 2-second cycle. Counting tiles it then discards
+/// would steal CPU from the executor under exactly the cold-cache backlog
+/// this code exists to relieve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageDetail {
+    /// Stop at the first missing tile. For callers that only need the
+    /// `Complete` / not-`Complete` distinction.
+    FirstMissOnly,
+    /// Check every tile and report exact counts. For callers that must tell
+    /// an *advancing* region from a *stuck* one.
+    ExactCounts,
 }
 
 impl BoundaryStrategy {
@@ -66,6 +122,7 @@ impl BoundaryStrategy {
         scenery_index: Option<&Arc<SceneryIndex>>,
         dds_disk_checker: Option<&Arc<dyn DdsDiskCacheChecker>>,
         ortho_union_index: Option<&Arc<OrthoUnionIndex>>,
+        detail: CoverageDetail,
     ) -> RegionDiskState {
         let (Some(index), Some(checker)) = (scenery_index, dds_disk_checker) else {
             return RegionDiskState::Unknown;
@@ -74,20 +131,42 @@ impl BoundaryStrategy {
         if tiles.is_empty() {
             return RegionDiskState::NoTiles;
         }
-        // Counts rather than short-circuiting: the caller needs `covered` to
-        // distinguish a slow region from a stuck one. Affordable because
-        // `tile_exists_blocking` is a sync map lookup as of #226 (see
-        // TODO(#175) resolution); it was a runtime round-trip per tile before.
-        let total = tiles.len();
-        let covered = tiles
-            .iter()
-            .filter(|t| Self::tile_is_covered(t, checker, ortho_union_index))
-            .count();
 
-        if covered == total {
-            RegionDiskState::Complete
-        } else {
-            RegionDiskState::Incomplete { covered, total }
+        match detail {
+            // Cheap path. `all` stops at the first missing tile, which is all
+            // `promote_completed_regions` needs — see [`CoverageDetail`] for
+            // why the difference is not academic.
+            CoverageDetail::FirstMissOnly => {
+                if tiles
+                    .iter()
+                    .all(|t| Self::tile_is_covered(t, checker, ortho_union_index))
+                {
+                    RegionDiskState::Complete
+                } else {
+                    RegionDiskState::Incomplete {
+                        coverage: TileCoverage::NotCounted,
+                    }
+                }
+            }
+            // Full scan: `evaluate_stale_regions` needs `covered` to tell a
+            // slow region from a stuck one. It runs only over regions stale
+            // for longer than `stale_region_timeout` (120s), so the cost is
+            // bounded in a way the every-cycle path is not.
+            CoverageDetail::ExactCounts => {
+                let total = tiles.len();
+                let covered = tiles
+                    .iter()
+                    .filter(|t| Self::tile_is_covered(t, checker, ortho_union_index))
+                    .count();
+
+                if covered == total {
+                    RegionDiskState::Complete
+                } else {
+                    RegionDiskState::Incomplete {
+                        coverage: TileCoverage::Exact { covered, total },
+                    }
+                }
+            }
         }
     }
 
@@ -146,7 +225,13 @@ impl BoundaryStrategy {
     /// tiles belong to this region" shared with the submit and rescue
     /// paths (#176) — and queries the `DdsDiskCacheChecker` for each tile.
     /// A region is promoted to `Prefetched` only when **every** one of its
-    /// tiles is present on disk (check-all with short-circuit on first miss).
+    /// tiles is covered.
+    ///
+    /// Scans with [`CoverageDetail::FirstMissOnly`]: this runs on every
+    /// coordinator cycle (2s) over every `InProgress` region, and the
+    /// `covered`/`total` counts are discarded here anyway. Only the rescue
+    /// path pays for exact counts. See [`CoverageDetail`] for the syscall
+    /// arithmetic that makes the difference matter.
     ///
     /// If either `dds_disk_checker` or `scenery_index` is `None`, promotion
     /// is skipped — there is no authoritative source to consult, or no way
@@ -179,6 +264,7 @@ impl BoundaryStrategy {
                 scenery_index,
                 dds_disk_checker,
                 ortho_union_index,
+                CoverageDetail::FirstMissOnly,
             ) {
                 RegionDiskState::Complete => {
                     geo_index.insert::<PrefetchedRegion>(*region, PrefetchedRegion::prefetched());
@@ -675,7 +761,13 @@ mod tests {
         let index = make_scenery_index_for_region(50, 9, 16);
         let region = DsfRegion { lat: 50, lon: 9 };
         assert_eq!(
-            BoundaryStrategy::region_disk_state(region, Some(&index), None, None),
+            BoundaryStrategy::region_disk_state(
+                region,
+                Some(&index),
+                None,
+                None,
+                CoverageDetail::ExactCounts
+            ),
             RegionDiskState::Unknown,
             "no checker means we cannot tell — must not be reported as Incomplete"
         );
@@ -688,7 +780,13 @@ mod tests {
         // A region the index knows nothing about.
         let region = DsfRegion { lat: -40, lon: 170 };
         assert_eq!(
-            BoundaryStrategy::region_disk_state(region, Some(&index), Some(&checker), None),
+            BoundaryStrategy::region_disk_state(
+                region,
+                Some(&index),
+                Some(&checker),
+                None,
+                CoverageDetail::ExactCounts
+            ),
             RegionDiskState::NoTiles
         );
     }
@@ -728,11 +826,22 @@ mod tests {
         let checker: Arc<dyn DdsDiskCacheChecker> =
             MockDiskChecker::with_tile_coords(vec![tiles[0], tiles[1]]);
 
-        let state = BoundaryStrategy::region_disk_state(region, Some(&index), Some(&checker), None);
+        let state = BoundaryStrategy::region_disk_state(
+            region,
+            Some(&index),
+            Some(&checker),
+            None,
+            CoverageDetail::ExactCounts,
+        );
 
         assert_eq!(
             state,
-            RegionDiskState::Incomplete { covered: 2, total: 3 },
+            RegionDiskState::Incomplete {
+                coverage: TileCoverage::Exact {
+                    covered: 2,
+                    total: 3
+                }
+            },
             "must report how many of the region's tiles are present, not just that it is incomplete"
         );
     }
@@ -753,7 +862,8 @@ mod tests {
                 region,
                 Some(&index),
                 Some(&test_checker(&all)),
-                None
+                None,
+                CoverageDetail::ExactCounts
             ),
             RegionDiskState::Complete
         );
@@ -764,12 +874,184 @@ mod tests {
                 region,
                 Some(&index),
                 Some(&test_checker(&all_but_one)),
-                None
+                None,
+                CoverageDetail::ExactCounts
             ),
             RegionDiskState::Incomplete {
-                covered: tiles.len() - 1,
-                total: tiles.len()
+                coverage: TileCoverage::Exact {
+                    covered: tiles.len() - 1,
+                    total: tiles.len()
+                }
             }
+        );
+    }
+
+    // =========================================================================
+    // CoverageDetail short-circuit (#226 review C-1)
+    // =========================================================================
+
+    /// A checker that reports every tile absent and counts how many times it
+    /// was asked. Counting is the only way to observe short-circuiting: both
+    /// details agree on the *verdict*, and it is the syscall count that the
+    /// 2-second promotion cycle cannot afford.
+    struct CountingDiskChecker {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingDiskChecker {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl DdsDiskCacheChecker for CountingDiskChecker {
+        fn tile_exists(
+            &self,
+            _row: u32,
+            _col: u32,
+            _zoom: u8,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { false })
+        }
+
+        fn tile_exists_blocking(&self, _row: u32, _col: u32, _zoom: u8) -> bool {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+    }
+
+    /// Build a scenery index holding exactly three tiles in (47, 8), none of
+    /// which any checker will report as present.
+    fn three_tile_index() -> (Arc<SceneryIndex>, DsfRegion) {
+        let index = Arc::new(SceneryIndex::with_defaults());
+        let region = DsfRegion::new(47, 8);
+        for (row, col, lat, lon) in [
+            (1000u32, 2000u32, 47.1f32, 8.1f32),
+            (3000, 4000, 47.4, 8.4),
+            (5000, 6000, 47.7, 8.7),
+        ] {
+            index.add_tile(SceneryTile {
+                row,
+                col,
+                chunk_zoom: 16,
+                lat,
+                lon,
+                is_sea: false,
+            });
+        }
+        assert_eq!(
+            index.tiles_in_region(region).len(),
+            3,
+            "fixture precondition: exactly 3 tiles"
+        );
+        (index, region)
+    }
+
+    #[test]
+    fn test_first_miss_only_stops_at_the_first_absent_tile() {
+        // The hot path: `promote_completed_regions` runs every 2s over every
+        // InProgress region, and each absent tile costs ~4 x N_sources stats
+        // once it falls through to the OrthoUnionIndex. Counting tiles it then
+        // discards is the amplification C-1 removes.
+        let (index, region) = three_tile_index();
+        let counting = CountingDiskChecker::new();
+        let checker: Arc<dyn DdsDiskCacheChecker> = counting.clone();
+
+        let state = BoundaryStrategy::region_disk_state(
+            region,
+            Some(&index),
+            Some(&checker),
+            None,
+            CoverageDetail::FirstMissOnly,
+        );
+
+        assert_eq!(
+            state,
+            RegionDiskState::Incomplete {
+                coverage: TileCoverage::NotCounted
+            },
+            "a short-circuited scan must not report counts it never computed"
+        );
+        assert_eq!(
+            counting.calls(),
+            1,
+            "must stop at the first missing tile, not scan all 3"
+        );
+    }
+
+    #[test]
+    fn test_exact_counts_scans_every_tile() {
+        // The contrast case: the rescue path genuinely needs `covered`, and
+        // pays a full scan for it.
+        let (index, region) = three_tile_index();
+        let counting = CountingDiskChecker::new();
+        let checker: Arc<dyn DdsDiskCacheChecker> = counting.clone();
+
+        let state = BoundaryStrategy::region_disk_state(
+            region,
+            Some(&index),
+            Some(&checker),
+            None,
+            CoverageDetail::ExactCounts,
+        );
+
+        assert_eq!(
+            state,
+            RegionDiskState::Incomplete {
+                coverage: TileCoverage::Exact {
+                    covered: 0,
+                    total: 3
+                }
+            }
+        );
+        assert_eq!(
+            counting.calls(),
+            3,
+            "exact counts require checking every tile"
+        );
+    }
+
+    #[test]
+    fn test_first_miss_only_still_confirms_a_complete_region() {
+        // Short-circuiting must not weaken the promotion verdict: a complete
+        // region has no first miss, so every tile is checked and the answer is
+        // identical to the exact-count scan.
+        let index = make_scenery_index_for_region(50, 9, 16);
+        let region = DsfRegion { lat: 50, lon: 9 };
+        let tiles = index.tiles_in_region(region);
+        let checker = test_checker(&tiles);
+
+        assert_eq!(
+            BoundaryStrategy::region_disk_state(
+                region,
+                Some(&index),
+                Some(&checker),
+                None,
+                CoverageDetail::FirstMissOnly
+            ),
+            RegionDiskState::Complete
+        );
+    }
+
+    #[test]
+    fn test_not_counted_carries_no_readable_counts() {
+        // The mechanism itself: "not counted" must be impossible to misread as
+        // an observation. `counts()` is the only accessor and it returns None.
+        assert_eq!(TileCoverage::NotCounted.counts(), None);
+        assert_eq!(
+            TileCoverage::Exact {
+                covered: 2,
+                total: 5
+            }
+            .counts(),
+            Some((2, 5))
         );
     }
 
@@ -838,6 +1120,7 @@ mod tests {
                 Some(&index),
                 Some(&empty_xel_cache),
                 Some(&ortho),
+                CoverageDetail::ExactCounts,
             ),
             RegionDiskState::Complete
         );
@@ -857,11 +1140,14 @@ mod tests {
                 region,
                 Some(&index),
                 Some(&test_checker(&[])),
-                Some(&ortho)
+                Some(&ortho),
+                CoverageDetail::ExactCounts
             ),
             RegionDiskState::Incomplete {
-                covered: 0,
-                total: tiles.len()
+                coverage: TileCoverage::Exact {
+                    covered: 0,
+                    total: tiles.len()
+                }
             }
         );
     }
