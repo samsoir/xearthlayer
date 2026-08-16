@@ -256,7 +256,7 @@ This follows a **two-phase commit** pattern:
    | `RegionDiskState` | Outcome |
    |--------------------|---------|
    | `Complete` | Promote straight to `Prefetched` (the rescue path; see [Region Tile-Set SSOT](#region-tile-set-ssot) below); clear the region's strike count |
-   | `Incomplete { covered, total }` | **Progress-based, not time-based.** If `covered` grew since the previous evaluation, the region is advancing: clear strikes, revert to *absent* and retry immediately. If `covered` did not grow, it's a strike: increment the strike count and mark `Deferred { retry_after: now + deferral_for(strikes) }` |
+   | `Incomplete { coverage }` | Exact `covered`/`total` counts on this path — it asks for `CoverageDetail::ExactCounts`. **Progress-based, not time-based.** If `covered` grew since the previous evaluation, the region is advancing: clear strikes, revert to *absent* and retry immediately. If `covered` did not grow, it's a strike: increment the strike count and mark `Deferred { retry_after: now + deferral_for(strikes) }` |
    | `NoTiles` | The *only* path to `NoCoverage` — the scenery index attributes zero tiles to this region, which is definitive on first look (the index is fully built before the coordinator sees it). Retire to `NoCoverage`, clear the region's strike count |
    | `Unknown` | No authoritative source to consult (no `DdsDiskCacheChecker` and/or no `SceneryIndex`) → left `InProgress` untouched; this does **not** count as a strike, since "cannot tell" must not be treated the same as "checked and it is absent" |
 
@@ -321,6 +321,27 @@ answer feeds a decision whose terminal outcome is permanent exclusion
 no `SceneryIndex` wired) must stay distinguishable from "we checked and it is
 absent" (`Incomplete`/`NoTiles`), or a region could be retired to `NoCoverage`
 on a cycle where it was never actually checked.
+
+**How thoroughly it scans is a parameter, not a second function.** Callers pass
+a `CoverageDetail`. The rescue path asks for `ExactCounts` because `covered` is
+what separates an advancing region from a stuck one, and it can afford the full
+scan: it only ever looks at regions already stale for `stale_region_timeout`
+(120s). `promote_completed_regions` asks for `FirstMissOnly` and stops at the
+first absent tile, because it discards the counts and runs on every coordinator
+cycle (2s) over every `InProgress` region. The difference is not academic: when
+the XEL DDS cache misses, the disjunction below falls through to
+`OrthoUnionIndex::dds_tile_exists`, which tries four filename prefixes and —
+because `textures/` is in `LAZY_DIRECTORIES` and is never indexed — resolves
+each by `stat()`ing every installed source, so one absent tile costs roughly
+4 × N_sources syscalls. Counting a cold region's whole tile set every 2s steals
+CPU from the executor in exactly the backlog condition this machinery exists to
+relieve.
+
+A `FirstMissOnly` answer reports `Incomplete { coverage: TileCoverage::NotCounted }`.
+The variant carries no payload, so "not counted" cannot be mistaken for the
+observation `covered: 0` — a fabricated zero would read as "nothing has
+arrived" and drive a strike. `TileCoverage::counts()` returns an `Option`,
+forcing every reader to handle the absence explicitly.
 
 **Coverage is a disjunction.** A tile counts as covered if it is present in
 the XEL DDS disk cache (`DdsDiskCacheChecker`) **or** ships inside an
