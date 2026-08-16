@@ -1270,6 +1270,37 @@ mod tests {
     }
 
     #[test]
+    fn test_prefetch_region_deferred_event_increments_the_counter_only() {
+        // Closes the daemon end of the `regions_deferred` chain (#226 review
+        // I-3). The sample-line test seeds the field directly, so it cannot
+        // tell whether `process_event` routes this variant anywhere at all —
+        // and the most plausible mis-wiring, incrementing the *gauge*
+        // `prefetch_regions_deferred_active`, would leave the counter
+        // permanently zero while the sample line still looked populated.
+        let (mut daemon, _tx) = create_daemon();
+        daemon.state.prefetch_regions_deferred_active = 4;
+
+        daemon.process_event(MetricEvent::PrefetchRegionDeferred);
+        daemon.process_event(MetricEvent::PrefetchRegionDeferred);
+
+        assert_eq!(
+            daemon.state.prefetch_regions_deferred, 2,
+            "each event must increment the counter"
+        );
+        assert_eq!(
+            daemon.state.prefetch_regions_deferred_active, 4,
+            "the event must leave the gauge alone — it is assigned wholesale \
+             from the GeoIndex by PrefetchRegionState"
+        );
+        // The neighbouring prefetch counters share a shape; a copy-paste in
+        // the match arm would land in one of them.
+        assert_eq!(daemon.state.prefetch_regions_demoted, 0);
+        assert_eq!(daemon.state.prefetch_state_diverged, 0);
+        assert_eq!(daemon.state.prefetch_promotions_normal, 0);
+        assert_eq!(daemon.state.prefetch_promotions_rescue, 0);
+    }
+
+    #[test]
     fn test_prefetch_region_state_is_a_gauge_not_a_counter() {
         // Regression guard: a second PrefetchRegionState event must replace
         // the previous values, not add to them. If this were mistakenly

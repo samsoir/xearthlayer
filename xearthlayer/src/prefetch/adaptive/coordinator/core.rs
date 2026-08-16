@@ -2783,6 +2783,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stuck_region_emits_prefetch_region_deferred_event() {
+        use crate::metrics::MetricEvent;
+
+        // Closes the coordinator end of the `regions_deferred` chain (#226
+        // review I-3). The metrics-daemon sample test seeds
+        // `state.prefetch_regions_deferred` directly, so it stays green even
+        // if this event is never constructed anywhere in production — and
+        // `regions_deferred` is the instrument a flight-test criterion is
+        // read off. Nothing else observes this emission.
+        let index = make_scenery_index(50, 9, 16);
+        let region = DsfRegion::new(50, 9);
+        assert!(
+            !index.tiles_in_region(region).is_empty(),
+            "Precondition: the region has indexed tiles, so the strike path \
+             is reachable at all"
+        );
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let empty_checker: Arc<dyn DdsDiskCacheChecker> =
+            MockDiskChecker::with_tile_coords(std::iter::empty::<TileCoord>());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_scenery_index(Arc::clone(&index))
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_disk_checker(Arc::clone(&empty_checker))
+            .with_metrics_client(MetricsClient::new(tx));
+        coord.config.stale_region_timeout = std::time::Duration::ZERO;
+
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+        coord.evaluate_stale_regions(&geo_index);
+
+        assert!(
+            geo_index
+                .get::<PrefetchedRegion>(&region)
+                .is_some_and(|s| s.is_deferred()),
+            "Precondition: the evaluation must actually have deferred the region"
+        );
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, MetricEvent::PrefetchRegionDeferred))
+                .count(),
+            1,
+            "a deferral must emit exactly one PrefetchRegionDeferred; got {events:?}"
+        );
+
+        // Discriminator: the event must be tied to the deferral, not emitted
+        // on every evaluation. Seed full coverage and promote instead.
+        let full_checker: Arc<dyn DdsDiskCacheChecker> =
+            MockDiskChecker::with_tile_coords(index.tiles_in_region(region).into_iter());
+        coord.dds_disk_checker = Some(full_checker);
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+        coord.evaluate_stale_regions(&geo_index);
+        assert!(
+            geo_index
+                .get::<PrefetchedRegion>(&region)
+                .is_some_and(|s| s.is_prefetched()),
+            "Precondition: the second evaluation must have promoted the region"
+        );
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::PrefetchRegionDeferred)),
+            "a promotion must not emit PrefetchRegionDeferred; got {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_run_region_maintenance_emits_region_state_gauge() {
         use crate::metrics::MetricEvent;
 
