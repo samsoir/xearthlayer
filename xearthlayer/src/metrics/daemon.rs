@@ -347,6 +347,9 @@ impl MetricsDaemon {
             MetricEvent::PrefetchRegionDemoted => {
                 self.state.prefetch_regions_demoted += 1;
             }
+            MetricEvent::PrefetchRegionDeferred => {
+                self.state.prefetch_regions_deferred += 1;
+            }
             MetricEvent::PrefetchRegionsPromotedNormal { count } => {
                 self.state.prefetch_promotions_normal += count as u64;
             }
@@ -430,6 +433,10 @@ impl MetricsDaemon {
             promotions_rescue = state.prefetch_promotions_rescue,
             state_diverged = state.prefetch_state_diverged,
             regions_demoted = state.prefetch_regions_demoted,
+            // #226: how often a region was skipped for making no progress.
+            // Non-zero under a cold-cache backlog is expected; climbing
+            // without bound is not.
+            regions_deferred = state.prefetch_regions_deferred,
             // Criterion 5's user-visible outcome (the others above are
             // mechanism): on-demand FUSE generations should fall during
             // cruise. Per-tile FUSE logging is debug-only (#209), so this
@@ -1196,6 +1203,35 @@ mod tests {
             sample.get("fuse_generations").map(String::as_str),
             Some("2"),
             "fuse_generations must carry state.fuse_jobs_submitted"
+        );
+    }
+
+    #[test]
+    fn test_prefetch_sample_reports_regions_deferred() {
+        // regions_deferred is a COUNTER, unlike the region-state gauges
+        // above: it accumulates across the daemon's own event stream rather
+        // than being assigned wholesale from GeoIndex each cycle, so it
+        // must reset while the gauges must not.
+        let (mut daemon, _tx) = create_daemon();
+        daemon.state.prefetch_regions_deferred = 7;
+        daemon.state.prefetch_regions_nocoverage = 3;
+
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        let sample =
+            find_prefetch_sample(&events).expect("log_prefetch_sample must emit a sample line");
+        assert_eq!(
+            sample.get("regions_deferred").map(String::as_str),
+            Some("7")
+        );
+
+        daemon.state.reset();
+        assert_eq!(
+            daemon.state.prefetch_regions_deferred, 0,
+            "counter must reset"
+        );
+        assert_eq!(
+            daemon.state.prefetch_regions_nocoverage, 3,
+            "gauge must NOT reset"
         );
     }
 

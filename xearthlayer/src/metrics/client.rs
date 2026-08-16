@@ -401,6 +401,12 @@ impl MetricsClient {
     pub fn prefetch_region_promoted_rescue(&self) {
         self.send(MetricEvent::PrefetchRegionPromotedRescue);
     }
+
+    /// Record that a region was deferred for making no progress.
+    #[inline]
+    pub fn prefetch_region_deferred(&self) {
+        self.send(MetricEvent::PrefetchRegionDeferred);
+    }
 }
 
 impl std::fmt::Debug for MetricsClient {

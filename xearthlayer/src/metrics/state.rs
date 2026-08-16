@@ -264,6 +264,9 @@ pub struct AggregatedState {
     pub prefetch_state_diverged: u64,
     /// Total regions demoted in response to divergence (counter).
     pub prefetch_regions_demoted: u64,
+    /// Total regions deferred for making no progress since the last
+    /// evaluation (counter).
+    pub prefetch_regions_deferred: u64,
     /// Total regions promoted via the normal completion path (counter).
     pub prefetch_promotions_normal: u64,
     /// Total regions promoted via the rescue path (counter).
@@ -330,6 +333,7 @@ impl AggregatedState {
             prefetch_regions_nocoverage: 0,
             prefetch_state_diverged: 0,
             prefetch_regions_demoted: 0,
+            prefetch_regions_deferred: 0,
             prefetch_promotions_normal: 0,
             prefetch_promotions_rescue: 0,
         }
@@ -390,6 +394,7 @@ impl AggregatedState {
         // them here would misreport "no regions" until the next cycle.
         self.prefetch_state_diverged = 0;
         self.prefetch_regions_demoted = 0;
+        self.prefetch_regions_deferred = 0;
         self.prefetch_promotions_normal = 0;
         self.prefetch_promotions_rescue = 0;
     }

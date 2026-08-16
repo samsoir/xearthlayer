@@ -251,6 +251,9 @@ pub enum MetricEvent {
     /// A region's state was cleared in response to observed divergence.
     PrefetchRegionDemoted,
 
+    /// A region was deferred after making no progress since the last evaluation.
+    PrefetchRegionDeferred,
+
     /// Regions promoted from `InProgress` to `Prefetched` via the normal
     /// completion path (all tiles in the region confirmed present).
     ///
@@ -306,6 +309,7 @@ impl MetricEvent {
             Self::PrefetchRegionState { .. } => "prefetch_region_state",
             Self::PrefetchStateDiverged => "prefetch_state_diverged",
             Self::PrefetchRegionDemoted => "prefetch_region_demoted",
+            Self::PrefetchRegionDeferred => "prefetch_region_deferred",
             Self::PrefetchRegionsPromotedNormal { .. } => "prefetch_regions_promoted_normal",
             Self::PrefetchRegionPromotedRescue => "prefetch_region_promoted_rescue",
         }
