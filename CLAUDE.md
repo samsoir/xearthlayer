@@ -177,7 +177,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `GeoLayer` trait - Marker trait for storable layer types (`Clone + Send + Sync + 'static`)
     - `PatchCoverage` - Layer type indicating a region is owned by a scenery patch
     - `RetainedRegion` - Layer type tracking regions in the SceneryWindow's retained set
-    - `PrefetchedRegion` - Layer type tracking prefetch state per region (InProgress, Prefetched, NoCoverage)
+    - `PrefetchedRegion` - Layer type tracking prefetch state per region (InProgress, Prefetched, NoCoverage, Deferred)
+    - **Region retirement (#226)**: `NoCoverage` is reachable *only* when the scenery index attributes zero tiles to a region. A region with indexed tiles that is merely slow or stuck is `Deferred` — a non-terminal state that expires on a 20/30/40/60s ladder — so its tiles stay retryable
     - Locking: `RwLock<HashMap<TypeId, DashMap>>` — rare write locks, concurrent reads via DashMap shards
     - `populate()` provides atomic bulk loading (builds outside lock, swaps in)
     - Used by FUSE (`is_geo_filtered`), prewarm, and prefetch for patch region exclusion and prefetch state tracking

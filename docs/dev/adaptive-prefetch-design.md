@@ -236,14 +236,15 @@ If non-empty → expand to DDS tiles, filter, submit
 
 ### Region States (GeoIndex PrefetchedRegion layer)
 
-Each DSF region in the XEL Window has one of four states:
+Each DSF region in the XEL Window has one of five states:
 
 | State | Meaning | Prefetch Behaviour |
 |-------|---------|-------------------|
 | *absent* | Never evaluated | Include in target diff → submit |
 | `InProgress` | Tiles submitted, awaiting completion | Skip bulk submission (prevents duplicate work) |
 | `Prefetched` | All tiles confirmed cached | Exclude from target diff entirely |
-| `NoCoverage` | No scenery data in this DSF region | Exclude from target diff, skip silently |
+| `NoCoverage` | Scenery index attributes zero tiles to this region | Exclude from target diff, skip silently |
+| `Deferred { retry_after }` | Has indexed tiles but made no progress; non-terminal | Excluded from target diff until `retry_after`, then eligible again — the one state that *expires* |
 
 This follows a **two-phase commit** pattern:
 1. **Reserve**: Region marked `InProgress` when tiles are submitted (prevents duplicate bulk submissions)
@@ -251,15 +252,41 @@ This follows a **two-phase commit** pattern:
 3. **Timeout**: If `InProgress` exceeds `stale_region_timeout`, `evaluate_stale_regions`
    consults `BoundaryStrategy::region_disk_state` — the same completeness predicate the
    fast path uses — and picks one of four outcomes:
-   - Disk shows every tile present → promote straight to `Prefetched` (the rescue path;
-     see [Region Tile-Set SSOT](#region-tile-set-ssot) below)
-   - Disk shows tiles missing, under `MAX_REGION_ATTEMPTS` (3) → reverts to *absent* for
-     re-evaluation next cycle, incrementing the region's strike count
-   - Disk shows tiles missing, at `MAX_REGION_ATTEMPTS` → retired to `NoCoverage`
-     **permanently for the session** — this is the event flight-test criterion 4 keys on
-   - No authoritative source to consult (no `DdsDiskCacheChecker` and/or no
-     `SceneryIndex`) → left `InProgress` untouched; this does **not** count as a retry,
-     since "cannot tell" must not be treated the same as "checked and it is absent"
+
+   | `RegionDiskState` | Outcome |
+   |--------------------|---------|
+   | `Complete` | Promote straight to `Prefetched` (the rescue path; see [Region Tile-Set SSOT](#region-tile-set-ssot) below); clear the region's strike count |
+   | `Incomplete { covered, total }` | **Progress-based, not time-based.** If `covered` grew since the previous evaluation, the region is advancing: clear strikes, revert to *absent* and retry immediately. If `covered` did not grow, it's a strike: increment the strike count and mark `Deferred { retry_after: now + deferral_for(strikes) }` |
+   | `NoTiles` | The *only* path to `NoCoverage` — the scenery index attributes zero tiles to this region, which is definitive on first look (the index is fully built before the coordinator sees it). Retire to `NoCoverage`, clear the region's strike count |
+   | `Unknown` | No authoritative source to consult (no `DdsDiskCacheChecker` and/or no `SceneryIndex`) → left `InProgress` untouched; this does **not** count as a strike, since "cannot tell" must not be treated the same as "checked and it is absent" |
+
+   `Incomplete` reaches `NoCoverage` by no path — this is the fix for #226. Before it,
+   `Incomplete` and `NoTiles` shared a retirement arm keyed on a fixed count of three
+   timing-based strikes, so three consecutive slow evaluations could permanently retire a
+   region that genuinely had scenery, just slow to complete. Real field evidence: two
+   Baden-Württemberg regions were retired to `NoCoverage` this way, then disproved
+   2m43s later when on-demand FUSE generation served tiles from the very regions
+   prefetch had given up on.
+
+   **The deferral ladder** (`DEFERRAL_LADDER` in
+   `xearthlayer/src/prefetch/adaptive/coordinator/core.rs`) is **20s / 30s / 40s / 60s**,
+   1-based on the strike count; the 60s entry repeats for every strike beyond the
+   fourth — the ladder never grows past it. The 60s ceiling is a hard requirement, not
+   a tuning knob: it comes directly from the 2m43s field evidence above — the window in
+   which a region is skipped with nothing in flight must stay well inside the gap
+   between "prefetch gives up" and "the sim demands it anyway".
+
+   **`Deferred` re-enters through the planner, not through `evaluate_stale_regions`.**
+   A `Deferred` region's `GeoIndex` entry is left in place (unlike the `Incomplete`
+   advancing case, which removes it outright); `PrefetchedRegion::should_prefetch`
+   is the gate that lets it back in once `retry_after` passes, at which point the
+   normal target-diff submission path picks it up like any other absent region.
+   `evaluate_stale_regions` never revisits it directly — a `Deferred` region is not
+   `InProgress`, so `is_stale()` (which is `InProgress`-only; see
+   `test_deferred_is_never_stale`) never matches it. Submission is lossy — a plan can
+   drop regions under backpressure — so relying on `evaluate_stale_regions` to also
+   re-drive `Deferred` regions would risk a region that never actually gets
+   re-submitted.
 
 A region can reach step 1 without submitting anything. When the filter
 pipeline removes a region's *entire* planned tile set as already cached, there
@@ -308,23 +335,40 @@ lookups use different coordinate systems: the XEL DDS cache is keyed by
 (`tile.chunk_origin()`) — mixing them up silently returns "not covered" for
 every tile (the #172 keying bug).
 
-**Strike counts survive the retry branch, not the promote branch.** A
-region's `region_attempts` strike count is cleared on promotion (both the
-fast path and the rescue path) but deliberately left untouched on the retry
-branch of `evaluate_stale_regions`. This looks backwards until you notice
-what the retry branch does: it *removes* the region's `PrefetchedRegion`
-entry from the `GeoIndex` so the region is eligible for re-prefetch — and
-that removal is exactly what makes `region_attempts` (a separate
-`HashMap<DsfRegion, u8>` on the coordinator, not stored in the `GeoIndex`)
-the only thing that still remembers the region failed last time. Clearing it
-on retry, by naive symmetry with the promote branch, would make
-`MAX_REGION_ATTEMPTS` unreachable: every retry would restart the count at
-zero and a region that never succeeds would retry forever instead of
-eventually being retired to `NoCoverage`. Promotion clears it for the
-opposite reason — a promoted region's failure history belongs to the episode
-that failed, not to the region, so a region that recovers and is later
-demoted by `PrefetchStateObserver` should not be retired to `NoCoverage`
-after a single fresh failure.
+**Strikes are progress-based, and the strike count lives on the coordinator,
+not in the `GeoIndex`.** `region_retry: HashMap<DsfRegion, RegionRetryState>`
+(`xearthlayer/src/prefetch/adaptive/coordinator/core.rs`) tracks, per region,
+`strikes: u8` and `last_covered: usize` — the covered-tile count observed at
+the *previous* evaluation, deliberately a latest-observation, not a
+high-water mark, because the DDS disk cache's GC daemon can evict tiles and
+make coverage regress; a peak would blind progress detection until coverage
+climbed back past it. A strike means "the covered count did not increase
+since last time" — not "took too long" — so a region under a large backlog
+that is genuinely, slowly advancing never strikes, and one that is truly
+stuck (0 new tiles landing) strikes every evaluation.
+
+`region_retry` is cleared in exactly three places, and each is a case where
+the strike history stops being relevant to what happens next:
+- **`Complete`** (both the fast path and the rescue path) — a promoted
+  region's failure history belongs to the episode that failed, not to the
+  region, so a region that recovers and is later demoted by
+  `PrefetchStateObserver` should not resume the old episode's strike count.
+- **`NoTiles`** retirement to `NoCoverage` — for the same reason: if the
+  observer later disproves `NoCoverage` (a FUSE generation succeeds there),
+  the region re-enters with a clean slate.
+- **The advancing arm of `Incomplete`** (`covered > last_covered`) — strikes
+  reset to 0 in place, because the region is making progress and the ladder
+  should not carry over from before it started advancing.
+
+It is deliberately **not** cleared on the stuck arm of `Incomplete` (the
+strike increments instead) or when `PrefetchStateObserver` clears a
+`Deferred` region's `GeoIndex` entry after an on-demand FUSE generation (see
+[Demotion](#demotion-closing-the-loop-on-wrong-claims) below) — the observer
+only holds a `GeoIndex` handle and structurally cannot reach
+`region_retry`, and that absence of a reset is intentional: a region
+demand-cleared mid-episode is still the same ongoing episode, not a fresh
+one, so the 20/30/40/60s ladder keeps escalating across repeated
+demand-driven clears rather than flattening back to 20s every time.
 
 ### Demotion: Closing the Loop on Wrong Claims
 
@@ -346,6 +390,22 @@ NoCoverage ──┘        (region re-enters the prefetch cycle)
 still running — and cache hits are exempt, since serving from cache is the
 system working, not a divergence.
 
+`Deferred` gets separate, milder handling (#226): an on-demand FUSE
+generation there clears the region's `GeoIndex` entry immediately — demand
+beats backoff, since a deferred region was never claimed *ready* in the
+first place — but this does **not** count as a divergence: no
+`prefetch_state_diverged` metric, no `prefetch_region_demoted` metric, and no
+`120s` rate limit. It is a repair, not evidence of a wrong claim. This does
+not license a longer deferral ladder: by the time FUSE asks for the tile,
+the miss has already happened. See `test_fuse_miss_clears_deferral_without_counting_divergence`
+in `xearthlayer/src/prefetch/state_observer.rs`.
+
+Note also that this clear does not reset the coordinator's `region_retry`
+strike count — see [Strike counts](#region-tile-set-ssot) above: the
+observer only holds a `GeoIndex` handle and cannot reach `region_retry`,
+and that is intentional, so the ladder keeps escalating across repeated
+demand-driven clears of the same episode.
+
 Re-entering the prefetch cycle only *repairs* two of the three causes. The
 scenery index is immutable for the life of the process, so where the cause is
 an index gap the next cycle re-derives the same empty tile set and re-marks
@@ -361,16 +421,36 @@ unbounded demote → re-prefetch → evict loop would churn on a long flight; th
 rate limit exists so the diagnostic doesn't become the noise it's meant to
 surface.
 
-The daemon aggregates both counters and logs them on the same 60s cadence as
-the memory sample. They are cumulative totals since process start, because
-`AggregatedState::reset()` — which does zero them — has no production caller;
-wire it up and these become totals since the last reset:
+The daemon aggregates these and logs them on the same 60s cadence as the
+memory sample. The counters among them are cumulative totals since process
+start, because `AggregatedState::reset()` — which does zero them — has no
+production caller; wire it up and these become totals since the last reset:
 
 ```
 INFO Prefetch sample uptime_s=... regions_in_progress=... regions_prefetched=...
-     regions_nocoverage=... promotions_normal=... promotions_rescue=...
-     state_diverged=... regions_demoted=... fuse_generations=...
+     regions_nocoverage=... regions_deferred_active=... promotions_normal=...
+     promotions_rescue=... state_diverged=... regions_demoted=...
+     regions_deferred=... fuse_generations=...
 ```
+
+**Two of these fields differ only by suffix and are easy to misread against
+each other — read this before reading a flight log:**
+- `regions_deferred_active` is a **gauge**: how many regions are `Deferred`
+  *right now*, assigned wholesale from the `PrefetchRegionState` event each
+  maintenance cycle, exactly like `regions_in_progress`, `regions_prefetched`,
+  and `regions_nocoverage` above it. It goes up and down.
+- `regions_deferred` is a **counter**: how many deferrals have *occurred*
+  in total since process start, incremented once per stuck-`Incomplete`
+  evaluation (`MetricEvent::PrefetchRegionDeferred`), same convention as
+  `promotions_normal`/`promotions_rescue`/`state_diverged`/`regions_demoted`
+  below it. It only goes up.
+
+Misreading `regions_deferred_active` as the counter (or vice versa) matters
+in practice: `regions_nocoverage` non-zero over land is an acceptance
+criterion for #226, and `regions_deferred`/`regions_deferred_active`
+non-zero but bounded is the expected healthy signal for a region that is
+slow rather than absent. Confusing a climbing counter for a stuck gauge (or
+the reverse) produces a false alarm in either direction.
 
 `fuse_generations` mirrors `fuse_jobs_submitted` (aggregated from
 `MetricEvent::JobSubmitted { is_fuse: true }`) — the only default-level
@@ -1083,12 +1163,14 @@ SimState (X-Plane Web API)
 If some tiles in a submitted region fail:
 - Region stays `InProgress`
 - After `stale_region_timeout` (120s), `region_disk_state` reports `Incomplete` — see
-  [Region States](#region-states-geoindex-prefetchedregion-layer) above — and the
-  region's strike count increments. While the count stays under
-  `MAX_REGION_ATTEMPTS` (3) the region reverts to *absent* for retry; the strike that
-  reaches 3 retires it to `NoCoverage` instead of granting another retry — so a region
-  gets at most 2 revert-to-absent retries before retirement, not 3
-- Next evaluation cycle (while retries remain): target diff finds the region, re-submits
+  [Region States](#region-states-geoindex-prefetchedregion-layer) above. If the covered
+  count grew since the previous evaluation, strikes clear and the region reverts to
+  *absent* for immediate retry. If it did not grow, that's a strike: the region is
+  marked `Deferred` on the 20/30/40/60s ladder (the ceiling repeats indefinitely) and
+  excluded from the target diff until `retry_after` passes — it is **never** retired to
+  `NoCoverage` for this reason, however many consecutive strikes it accumulates
+- Once `retry_after` passes (or immediately, on the advancing-strike path): target diff
+  finds the region again, re-submits
 - Four-tier filter handles individual tile dedup (only failed tiles re-submitted)
 
 ---
@@ -1102,7 +1184,7 @@ If some tiles in a submitted region fail:
 | `BoundaryMonitor` | Trigger at correct distance; no trigger when far; urgency calculation; both edges (north/south or east/west) |
 | `SceneryWindow` | Window derivation from tracker bounds (config-locked dimensions); retention inference with buffer; world rebuild detection; `Assumed` → `Ready` transition |
 | `BoundaryStrategy` | Row generation for lat crossing; column generation for lon crossing; diagonal (both monitors); set difference with XEL Window; depth ordering; `NoCoverage` handling; eviction of non-retained regions and cached tiles |
-| `RegionState` | Two-phase commit: absent → InProgress → Prefetched; timeout revert; NoCoverage; eviction on window departure |
+| `RegionState` | Two-phase commit: absent → InProgress → Prefetched; timeout revert; `NoTiles` → `NoCoverage`; progress-based strikes → `Deferred` on the 20/30/40/60s ladder; `Deferred` expiry via `should_prefetch`; eviction on window departure |
 | `GeoIndex layers` | RetainedRegion add/remove; PrefetchedRegion state transitions |
 
 ### Integration Tests

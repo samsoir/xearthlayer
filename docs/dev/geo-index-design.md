@@ -217,19 +217,33 @@ pub struct RetainedRegion;
 
 #### `PrefetchedRegion`
 
-Tracks prefetch state per DSF region: `InProgress`, `Prefetched`, or
-`NoCoverage`, plus the `Instant` the state was set (used for staleness
-checks). Regions absent from the layer are "never evaluated" — eligible for
-prefetch. Written by two concurrent sources: the prefetch coordinator
+Tracks prefetch state per DSF region: `InProgress`, `Prefetched`,
+`NoCoverage`, or `Deferred { retry_after }`, plus the `Instant` the state was
+set (used for staleness checks). Regions absent from the layer are "never
+evaluated" — eligible for prefetch. `NoCoverage` is reachable *only* when the
+scenery index attributes zero tiles to a region (#226) — a region with
+indexed tiles that is merely slow or stuck goes to `Deferred` instead, a
+non-terminal state that expires on a 20/30/40/60s ladder rather than being
+retired.
+
+Because `Deferred` is the one state that expires on its own, `should_prefetch`
+is no longer a bare `!contains()` check: it returns `true` for an absent
+region as before, but for a present entry it must additionally check whether
+a `Deferred` region's `retry_after` has passed — `InProgress`, `Prefetched`,
+and `NoCoverage` are still an unconditional `false`.
+
+Written by two concurrent sources: the prefetch coordinator
 (`AdaptivePrefetchCoordinator`, via `BoundaryStrategy`) and the FUSE-side
 `PrefetchStateObserver`, which demotes a `Prefetched`/`NoCoverage` region
-when FUSE has to generate a tile on demand there. See
-`docs/dev/adaptive-prefetch-design.md` for the full state machine
-(two-phase commit, stale-region rescue, demotion).
+when FUSE has to generate a tile on demand there, and separately clears a
+`Deferred` region's entry outright on the same trigger (not counted as a
+demotion — see `docs/dev/adaptive-prefetch-design.md`). See that document for
+the full state machine (two-phase commit, progress-based strikes, the
+deferral ladder, stale-region rescue, demotion).
 
 ```rust
 pub struct PrefetchedRegion {
-    state: RegionState,   // InProgress | Prefetched | NoCoverage
+    state: RegionState,   // InProgress | Prefetched | NoCoverage | Deferred { retry_after: Instant }
     since: Instant,
 }
 ```
