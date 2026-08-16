@@ -754,8 +754,10 @@ impl AdaptivePrefetchCoordinator {
     /// the DDS disk — X-Plane is served them by the patch through FUSE
     /// passthrough. Marking one `InProgress` would be a claim prefetch is
     /// working on it, which `promote_completed_regions` could never confirm;
-    /// the region would go stale and be retired to `NoCoverage` with a
-    /// misleading "failed attempts" warning in the flight log. Patch
+    /// the region would go stale, and since #226 an `Incomplete` region is
+    /// never retired, it would cycle in `Deferred` forever — striking and
+    /// re-deferring on an escalating ladder against tiles that were never
+    /// going to arrive. Patch
     /// ownership is a whole-region property in the `GeoIndex`, so this
     /// exclusion is exact rather than a heuristic. Such regions keep being
     /// re-planned and filtered each cycle, as they were before this change.

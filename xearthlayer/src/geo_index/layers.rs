@@ -66,6 +66,10 @@ impl GeoLayer for RetainedRegion {}
 /// - `InProgress`: tiles submitted to executor, awaiting cache confirmation
 /// - `Prefetched`: all tiles confirmed in cache
 /// - `NoCoverage`: no scenery data exists for this region (skip silently)
+/// - `Deferred`: has coverage but did not complete; skipped until `retry_after`
+///
+/// `Prefetched` and `NoCoverage` are terminal; `Deferred` is not — see
+/// [`RegionState::Deferred`].
 ///
 /// Regions not in the index are considered "absent" (eligible for prefetch).
 #[derive(Debug, Clone)]
@@ -154,8 +158,15 @@ impl PrefetchedRegion {
 
     /// Returns `true` if this `InProgress` region has exceeded the staleness timeout.
     ///
-    /// Only `InProgress` regions can be stale; `Prefetched` and `NoCoverage` are
-    /// terminal states and never expire.
+    /// Only `InProgress` regions can be stale. `Prefetched` and `NoCoverage`
+    /// are terminal states and never expire.
+    ///
+    /// `Deferred` is excluded too, and that exclusion is load-bearing rather
+    /// than incidental: a `Deferred` region *does* expire, but on its own
+    /// `retry_after` deadline, consumed by [`Self::should_prefetch`]. If it
+    /// were also reported stale here, `evaluate_stale_regions` would re-judge
+    /// it on every maintenance cycle and add a strike each time, collapsing the
+    /// escalating backoff ladder that deferral exists to provide.
     pub fn is_stale(&self, timeout: std::time::Duration) -> bool {
         self.state == RegionState::InProgress && self.since.elapsed() >= timeout
     }

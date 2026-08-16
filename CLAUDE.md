@@ -126,7 +126,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `PrefetchBox` - Heading-biased sliding box (speed-proportional extent, proportional 80/20 bias, cruise phase)
     - `ExtentCalculator` - Speed-proportional box extent: clamped linear ramp 3.5° at 40kt to 6.5° at 450kt
     - `SceneryWindow` - Window config and dimensions holder
-    - `BoundaryStrategy` - Region lifecycle management (InProgress/Prefetched/NoCoverage)
+    - `BoundaryStrategy` - Region lifecycle management (InProgress/Prefetched/NoCoverage/Deferred)
     - `PhaseDetector` - Ground/Cruise flight phase state machine; reset via `on_ground` from AircraftState on telemetry resume
     - `PerformanceCalibrator` - Measures throughput during initial load for mode selection
     - `SimState` - Direct sim state detection via X-Plane Web API (paused, on_ground, scenery_loading, replay)
