@@ -83,6 +83,14 @@ impl PrefetchStateObserver {
         // reason enough to stop skipping it. Note this does not license a
         // longer ladder: by the time FUSE asks, the miss already happened.
         // This is a repair, not a prefetch.
+        //
+        // This clears only the region's GeoIndex entry — it deliberately does
+        // NOT reset the coordinator's `region_retry` strike count, which this
+        // observer cannot even reach (it holds only an `Arc<GeoIndex>`). That
+        // is intentional, not an oversight: a region cleared here by demand is
+        // the same ongoing episode as before, not a fresh one, so the
+        // 20/30/40/60s deferral ladder must keep escalating across repeated
+        // demand-driven clears rather than flattening back to 20s each time.
         if state.is_deferred() {
             self.geo_index.remove::<PrefetchedRegion>(&region);
             tracing::debug!(

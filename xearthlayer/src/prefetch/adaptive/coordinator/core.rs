@@ -38,7 +38,7 @@ fn deferral_for(strikes: u8) -> Duration {
 /// `last_covered` is what makes a strike mean "made no progress" rather than
 /// "took too long" — under a large prefetch backlog the latter says nothing
 /// about whether scenery exists.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct RegionRetryState {
     /// Consecutive evaluations that observed no new coverage.
     strikes: u8,
@@ -2657,6 +2657,18 @@ mod tests {
                 last_covered: 5,
             },
         );
+        // Seed retry state for the RETAINED region too, so the second
+        // assertion below actually discriminates "only the evicted region's
+        // state is pruned" from "everything got pruned" — without this the
+        // assertion was trivially true (its right-hand disjunct was already
+        // guaranteed by the assertion above it).
+        coord.region_retry.insert(
+            kept,
+            RegionRetryState {
+                strikes: 1,
+                last_covered: 3,
+            },
+        );
 
         coord.run_region_maintenance();
 
@@ -2664,9 +2676,14 @@ mod tests {
             !coord.region_retry.contains_key(&dropped),
             "retry bookkeeping must not outlive the region's entry in the index"
         );
-        assert!(
-            coord.region_retry.is_empty() || !coord.region_retry.contains_key(&dropped),
-            "only the evicted region's state is pruned"
+        assert_eq!(
+            coord.region_retry.get(&kept),
+            Some(&RegionRetryState {
+                strikes: 1,
+                last_covered: 3,
+            }),
+            "only the evicted region's state is pruned — the retained region's \
+             retry state must survive untouched"
         );
     }
 

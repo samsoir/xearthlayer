@@ -77,7 +77,10 @@ impl DdsDiskCacheChecker for DdsDiskCacheBridge {
     fn tile_exists_blocking(&self, row: u32, col: u32, zoom: u8) -> bool {
         // Genuinely sync now — no runtime round-trip. This also means the
         // method is safe to call outside a tokio runtime, which it was not
-        // before (`block_in_place` panics on a current-thread runtime).
+        // before: outside any runtime at all, `Handle::current()` panics;
+        // inside a current-thread runtime, `block_in_place` panics instead.
+        // Either way, the old implementation could not be called safely from
+        // here — this one has no runtime dependency to trip either panic.
         let tile = TileCoord { row, col, zoom };
         self.client.contains_sync(&tile)
     }
