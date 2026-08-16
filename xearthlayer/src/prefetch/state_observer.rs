@@ -77,6 +77,22 @@ impl PrefetchStateObserver {
         let Some(state) = self.geo_index.get::<PrefetchedRegion>(&region) else {
             return;
         };
+
+        // Demand beats backoff. A deferred region was never claimed ready, so
+        // this is not a divergence — but the sim asking for tiles here now is
+        // reason enough to stop skipping it. Note this does not license a
+        // longer ladder: by the time FUSE asks, the miss already happened.
+        // This is a repair, not a prefetch.
+        if state.is_deferred() {
+            self.geo_index.remove::<PrefetchedRegion>(&region);
+            tracing::debug!(
+                lat = region.lat,
+                lon = region.lon,
+                "Deferral cleared by on-demand generation"
+            );
+            return;
+        }
+
         // InProgress regions are expected to miss — prefetch has not finished.
         if !(state.is_prefetched() || state.is_no_coverage()) {
             return;
@@ -313,6 +329,33 @@ mod tests {
         assert_eq!(
             demoted_count, 2,
             "a zero window permits every demotion to emit PrefetchRegionDemoted"
+        );
+    }
+
+    #[test]
+    fn test_fuse_miss_clears_deferral_without_counting_divergence() {
+        let geo_index = Arc::new(GeoIndex::new());
+        let tile = tile_in_33_119();
+        let region = region_of(tile);
+        geo_index.insert::<PrefetchedRegion>(
+            region,
+            PrefetchedRegion::deferred(Instant::now() + Duration::from_secs(60)),
+        );
+
+        let (metrics, mut rx) = test_metrics_client();
+        let observer =
+            PrefetchStateObserver::new(Arc::clone(&geo_index)).with_metrics_client(metrics);
+
+        observer.observe(tile, false);
+
+        assert!(
+            geo_index.get::<PrefetchedRegion>(&region).is_none(),
+            "X-Plane demanding tiles here is the strongest evidence the region matters now"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a deferred region was never claimed ready, so this is not a divergence \
+             and must emit no metric event"
         );
     }
 }
