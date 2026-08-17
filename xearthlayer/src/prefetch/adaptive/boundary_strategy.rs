@@ -1055,6 +1055,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_promote_completed_regions_uses_first_miss_only() {
+        // Regression guard for #226 final review: the final review round
+        // mutated `promote_completed_regions`'s call site from
+        // `CoverageDetail::FirstMissOnly` back to `ExactCounts` and the full
+        // suite passed green — nothing observed that the cheap scan was
+        // actually requested at the call site the C-1 fix depends on. This
+        // test drives `promote_completed_regions` itself (not
+        // `region_disk_state` directly) so a regression at that call site
+        // fails it.
+        let geo_index = GeoIndex::new();
+        let (index, region) = three_tile_index();
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+
+        let counting = CountingDiskChecker::new();
+        let checker: Arc<dyn DdsDiskCacheChecker> = counting.clone();
+
+        let promoted = BoundaryStrategy::promote_completed_regions(
+            &geo_index,
+            Some(&checker),
+            Some(&index),
+            None,
+        );
+
+        assert!(
+            promoted.is_empty(),
+            "region has no tiles on disk, must not promote"
+        );
+        assert_eq!(
+            counting.calls(),
+            1,
+            "promote_completed_regions must scan with FirstMissOnly and stop \
+             at the first absent tile, not ExactCounts over all 3"
+        );
+    }
+
     // =========================================================================
     // region_disk_state + OrthoUnionIndex coverage (#176 Task 2 / #223 F2)
     // =========================================================================
