@@ -757,10 +757,10 @@ impl AdaptivePrefetchCoordinator {
     /// the region would go stale, and since #226 an `Incomplete` region is
     /// never retired, it would cycle in `Deferred` forever — striking and
     /// re-deferring on an escalating ladder against tiles that were never
-    /// going to arrive. Patch
-    /// ownership is a whole-region property in the `GeoIndex`, so this
-    /// exclusion is exact rather than a heuristic. Such regions keep being
-    /// re-planned and filtered each cycle, as they were before this change.
+    /// going to arrive. Patch ownership is a whole-region property in the
+    /// `GeoIndex`, so this exclusion is exact rather than a heuristic. Such
+    /// regions keep being re-planned and filtered each cycle, as they were
+    /// before this change.
     ///
     /// Marked regions are dropped from `current_plan_regions` so
     /// [`execute()`] only reasons about regions that had tiles to submit.
