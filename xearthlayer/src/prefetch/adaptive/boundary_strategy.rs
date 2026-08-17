@@ -200,7 +200,7 @@ impl BoundaryStrategy {
     /// Mark a region as having no scenery coverage.
     pub fn mark_no_coverage(&self, region: &DsfRegion, geo_index: &GeoIndex) {
         geo_index.insert::<PrefetchedRegion>(*region, PrefetchedRegion::no_coverage());
-        tracing::debug!(
+        tracing::info!(
             lat = region.lat,
             lon = region.lon,
             "boundary: marked NoCoverage"
