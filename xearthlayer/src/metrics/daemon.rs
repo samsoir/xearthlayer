@@ -443,11 +443,16 @@ impl MetricsDaemon {
             regions_demoted = state.prefetch_regions_demoted,
             // #226: how often a region was skipped for making no progress.
             // Cumulative since process start — `AggregatedState::reset()` has
-            // no production caller — so it only ever climbs, and does so on
-            // every maintenance cycle while any region is stuck. Read the rate
-            // of change between samples, not the absolute value: a flat value
-            // across successive lines is the healthy signal. Non-zero under a
-            // cold-cache backlog is expected.
+            // no production caller — so it only ever climbs. It does NOT climb
+            // every maintenance cycle: a stuck region is moved to `Deferred`
+            // immediately, and `is_stale()` only re-evaluates `InProgress`
+            // regions, so the region sits off-cycle until its deferral expires
+            // (the 20/30/40/60s ladder), gets re-planned back to `InProgress`,
+            // and ages another `stale_region_timeout` (default 120s) before it
+            // can increment again. Realistic floor is ~140s per region per
+            // increment. Read the rate of change between samples, not the
+            // absolute value: a flat value across successive lines is the
+            // healthy signal. Non-zero under a cold-cache backlog is expected.
             regions_deferred = state.prefetch_regions_deferred,
             // Criterion 5's user-visible outcome (the others above are
             // mechanism): on-demand FUSE generations should fall during
