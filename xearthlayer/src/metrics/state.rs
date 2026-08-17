@@ -274,6 +274,12 @@ pub struct AggregatedState {
     /// process start (counter). `reset()` has no production caller, so this
     /// is never windowed.
     pub prefetch_regions_deferred: u64,
+    /// Total region deferrals cleared by on-demand FUSE generation, cumulative
+    /// since process start (counter, #226). The post-fix analogue of
+    /// `prefetch_regions_demoted`: measures how often the sim outruns the
+    /// deferral ladder rather than how often prefetch's state was simply
+    /// wrong.
+    pub prefetch_deferrals_cleared: u64,
     /// Total regions promoted via the normal completion path (counter).
     pub prefetch_promotions_normal: u64,
     /// Total regions promoted via the rescue path (counter).
@@ -342,6 +348,7 @@ impl AggregatedState {
             prefetch_state_diverged: 0,
             prefetch_regions_demoted: 0,
             prefetch_regions_deferred: 0,
+            prefetch_deferrals_cleared: 0,
             prefetch_promotions_normal: 0,
             prefetch_promotions_rescue: 0,
         }
@@ -404,6 +411,7 @@ impl AggregatedState {
         self.prefetch_state_diverged = 0;
         self.prefetch_regions_demoted = 0;
         self.prefetch_regions_deferred = 0;
+        self.prefetch_deferrals_cleared = 0;
         self.prefetch_promotions_normal = 0;
         self.prefetch_promotions_rescue = 0;
     }

@@ -414,6 +414,12 @@ impl MetricsClient {
     pub fn prefetch_region_deferred(&self) {
         self.send(MetricEvent::PrefetchRegionDeferred);
     }
+
+    /// Record that a region's deferral was cleared by on-demand generation.
+    #[inline]
+    pub fn prefetch_deferral_cleared(&self) {
+        self.send(MetricEvent::PrefetchDeferralCleared);
+    }
 }
 
 impl std::fmt::Debug for MetricsClient {

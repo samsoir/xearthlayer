@@ -93,6 +93,9 @@ impl PrefetchStateObserver {
         // demand-driven clears rather than flattening back to 20s each time.
         if state.is_deferred() {
             self.geo_index.remove::<PrefetchedRegion>(&region);
+            if let Some(ref metrics) = self.metrics_client {
+                metrics.prefetch_deferral_cleared();
+            }
             tracing::debug!(
                 lat = region.lat,
                 lon = region.lon,
@@ -361,9 +364,47 @@ mod tests {
             "X-Plane demanding tiles here is the strongest evidence the region matters now"
         );
         assert!(
+            matches!(rx.try_recv(), Ok(MetricEvent::PrefetchDeferralCleared)),
+            "a deferred region was never claimed ready, so this is not a divergence — \
+             it must emit PrefetchDeferralCleared instead, not the divergence events"
+        );
+        assert!(
             rx.try_recv().is_err(),
-            "a deferred region was never claimed ready, so this is not a divergence \
-             and must emit no metric event"
+            "exactly one event for a cleared deferral"
+        );
+    }
+
+    #[test]
+    fn test_deferral_cleared_emits_no_divergence_events() {
+        // Companion to the test above, read from the other direction: a
+        // cleared deferral must never ALSO look like a divergence. If the
+        // is_deferred() branch's early `return` were ever removed, this
+        // would start seeing PrefetchStateDiverged / PrefetchRegionDemoted
+        // fall through from the code below it.
+        let geo_index = Arc::new(GeoIndex::new());
+        let tile = tile_in_33_119();
+        let region = region_of(tile);
+        geo_index.insert::<PrefetchedRegion>(
+            region,
+            PrefetchedRegion::deferred(Instant::now() + Duration::from_secs(60)),
+        );
+
+        let (metrics, mut rx) = test_metrics_client();
+        let observer =
+            PrefetchStateObserver::new(Arc::clone(&geo_index)).with_metrics_client(metrics);
+
+        observer.observe(tile, false);
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "clearing a deferral must emit exactly one event, \
+             never also the divergence/demotion events"
+        );
+        assert!(
+            matches!(events[0], MetricEvent::PrefetchDeferralCleared),
+            "the one event emitted must be PrefetchDeferralCleared"
         );
     }
 }

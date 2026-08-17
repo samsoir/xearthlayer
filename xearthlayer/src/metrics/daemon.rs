@@ -352,6 +352,9 @@ impl MetricsDaemon {
             MetricEvent::PrefetchRegionDeferred => {
                 self.state.prefetch_regions_deferred += 1;
             }
+            MetricEvent::PrefetchDeferralCleared => {
+                self.state.prefetch_deferrals_cleared += 1;
+            }
             MetricEvent::PrefetchRegionsPromotedNormal { count } => {
                 self.state.prefetch_promotions_normal += count as u64;
             }
@@ -454,6 +457,13 @@ impl MetricsDaemon {
             // absolute value: a flat value across successive lines is the
             // healthy signal. Non-zero under a cold-cache backlog is expected.
             regions_deferred = state.prefetch_regions_deferred,
+            // #226: how often the sim demanded a tile inside a region that
+            // was still Deferred, clearing the deferral early. The post-fix
+            // analogue of `regions_demoted` — measures whether the
+            // 20/30/40/60s ladder is well-tuned, not whether prefetch's state
+            // was wrong. Cumulative since process start, same as
+            // `regions_deferred` above.
+            deferrals_cleared = state.prefetch_deferrals_cleared,
             // Criterion 5's user-visible outcome (the others above are
             // mechanism): on-demand FUSE generations should fall during
             // cruise. Per-tile FUSE logging is debug-only (#209), so this
@@ -1242,6 +1252,7 @@ mod tests {
         daemon.state.prefetch_regions_deferred = 7;
         daemon.state.prefetch_regions_nocoverage = 3;
         daemon.state.prefetch_regions_deferred_active = 4;
+        daemon.state.prefetch_deferrals_cleared = 5;
 
         let events = capture_events(|| daemon.log_prefetch_sample());
         let sample =
@@ -1249,6 +1260,11 @@ mod tests {
         assert_eq!(
             sample.get("regions_deferred").map(String::as_str),
             Some("7")
+        );
+        assert_eq!(
+            sample.get("deferrals_cleared").map(String::as_str),
+            Some("5"),
+            "deferrals_cleared must be its own field, distinct from regions_deferred"
         );
         // Same subject, different semantics — the two must never collapse
         // into one field. Distinct seeded values make a mix-up visible.
@@ -1261,6 +1277,10 @@ mod tests {
         daemon.state.reset();
         assert_eq!(
             daemon.state.prefetch_regions_deferred, 0,
+            "counter must reset"
+        );
+        assert_eq!(
+            daemon.state.prefetch_deferrals_cleared, 0,
             "counter must reset"
         );
         assert_eq!(
@@ -1299,6 +1319,37 @@ mod tests {
         );
         // The neighbouring prefetch counters share a shape; a copy-paste in
         // the match arm would land in one of them.
+        assert_eq!(daemon.state.prefetch_regions_demoted, 0);
+        assert_eq!(daemon.state.prefetch_state_diverged, 0);
+        assert_eq!(daemon.state.prefetch_promotions_normal, 0);
+        assert_eq!(daemon.state.prefetch_promotions_rescue, 0);
+        assert_eq!(daemon.state.prefetch_deferrals_cleared, 0);
+    }
+
+    #[test]
+    fn test_prefetch_deferral_cleared_event_increments_the_counter_only() {
+        // Closes the daemon end of the `deferrals_cleared` chain (#226,
+        // mirroring PrefetchRegionDeferred above end to end). The most
+        // plausible mis-wiring is routing this into the *gauge*
+        // `prefetch_regions_deferred_active`, which would leave the counter
+        // permanently zero while the gauge looked populated.
+        let (mut daemon, _tx) = create_daemon();
+        daemon.state.prefetch_regions_deferred_active = 4;
+
+        daemon.process_event(MetricEvent::PrefetchDeferralCleared);
+        daemon.process_event(MetricEvent::PrefetchDeferralCleared);
+
+        assert_eq!(
+            daemon.state.prefetch_deferrals_cleared, 2,
+            "each event must increment the counter"
+        );
+        assert_eq!(
+            daemon.state.prefetch_regions_deferred_active, 4,
+            "the event must leave the gauge alone"
+        );
+        // The neighbouring prefetch counters share a shape; a copy-paste in
+        // the match arm would land in one of them.
+        assert_eq!(daemon.state.prefetch_regions_deferred, 0);
         assert_eq!(daemon.state.prefetch_regions_demoted, 0);
         assert_eq!(daemon.state.prefetch_state_diverged, 0);
         assert_eq!(daemon.state.prefetch_promotions_normal, 0);
