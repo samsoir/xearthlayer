@@ -6,7 +6,9 @@
 use serde::Serialize;
 
 use crate::aircraft_position::AircraftPositionProvider;
-use crate::geo_index::{PatchCoverage, PrefetchedRegion, RetainedRegion};
+use crate::geo_index::{
+    PatchCoverage, PrefetchedRegion, RegionState as PrefetchLifecycleState, RetainedRegion,
+};
 use crate::prefetch::BoxBoundsSnapshot;
 
 use super::state::DebugMapState;
@@ -114,7 +116,7 @@ fn is_zero(v: &u32) -> bool {
 }
 
 /// Region state for map colour coding.
-#[derive(Serialize, Clone, PartialEq)]
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RegionState {
     /// Prefetch submitted, awaiting completion.
@@ -131,6 +133,10 @@ pub enum RegionState {
     FuseLoaded,
     /// Mix of prefetch and on-demand loading.
     Mixed,
+    /// Has coverage, but prefetch could not complete it and backed off;
+    /// eligible for retry once its deadline passes. See
+    /// `geo_index::RegionState::Deferred` (#226).
+    Deferred,
 }
 
 /// Pipeline statistics.
@@ -216,12 +222,17 @@ fn collect_regions(state: &DebugMapState) -> Vec<RegionInfo> {
     // one tile completed — that distinction is what this layer enforces.
     if let Some(ref geo_index) = state.geo_index {
         for (region, prefetched) in geo_index.iter::<PrefetchedRegion>() {
-            let region_state = if prefetched.is_in_progress() {
-                RegionState::InProgress
-            } else if prefetched.is_prefetched() {
-                RegionState::Prefetched
-            } else {
-                RegionState::NoCoverage
+            // Exhaustive match over the lifecycle enum, not an `is_*()`
+            // if/else chain with a trailing catch-all `else` — that shape is
+            // exactly what let a `Deferred` region silently render as
+            // `NoCoverage` (over land) before #226's fix at the metrics fold
+            // was applied here too. A future fifth variant now fails to
+            // compile instead of falling through.
+            let region_state = match prefetched.state() {
+                PrefetchLifecycleState::InProgress => RegionState::InProgress,
+                PrefetchLifecycleState::Prefetched => RegionState::Prefetched,
+                PrefetchLifecycleState::NoCoverage => RegionState::NoCoverage,
+                PrefetchLifecycleState::Deferred { .. } => RegionState::Deferred,
             };
             region_map.insert(
                 (region.lat, region.lon),
@@ -472,5 +483,55 @@ mod tests {
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(json.contains("\"aircraft\":null"));
         assert!(json.contains("\"regions\":[]"));
+    }
+
+    fn empty_debug_map_state(
+        geo_index: Option<std::sync::Arc<crate::geo_index::GeoIndex>>,
+    ) -> DebugMapState {
+        use crate::aircraft_position::web_api::SharedSimState;
+        use crate::aircraft_position::SharedAircraftPosition;
+        use crate::prefetch::SharedPrefetchStatus;
+        use std::sync::RwLock;
+        use tokio::sync::broadcast;
+
+        let (tx, _rx) = broadcast::channel(16);
+        let aggregator = crate::aircraft_position::StateAggregator::new(tx);
+
+        DebugMapState {
+            aircraft_position: SharedAircraftPosition::new(aggregator),
+            sim_state: SharedSimState::new(RwLock::new(Default::default())),
+            geo_index,
+            prefetch_status: SharedPrefetchStatus::new(),
+            tile_activity: crate::debug_map::activity::TileActivityTracker::new(),
+        }
+    }
+
+    #[test]
+    fn test_deferred_region_renders_as_deferred_not_no_coverage() {
+        // Regression guard for #226's second catch-all site: a Deferred
+        // region has coverage and is only backing off, so rendering it as
+        // NoCoverage on the debug map would read as missing scenery over
+        // land — the exact defect the exhaustive match at collect_regions
+        // exists to prevent (mirrors the fix already made in the metrics
+        // fold).
+        let geo_index = std::sync::Arc::new(crate::geo_index::GeoIndex::new());
+        let region = crate::geo_index::DsfRegion::new(48, 15);
+        geo_index.insert::<PrefetchedRegion>(
+            region,
+            PrefetchedRegion::deferred(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            ),
+        );
+
+        let state = empty_debug_map_state(Some(geo_index));
+        let regions = collect_regions(&state);
+
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].state, RegionState::Deferred);
+        assert_ne!(
+            regions[0].state,
+            RegionState::NoCoverage,
+            "a Deferred region must never render as NoCoverage"
+        );
     }
 }
