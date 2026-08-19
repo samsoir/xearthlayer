@@ -109,7 +109,7 @@ impl MetricsClient {
     /// Records one FUSE `read()` call.
     ///
     /// `returned` is the number of bytes handed back to the kernel;
-    /// `materialised` is the number the handler had to allocate to produce
+    /// `materialised` is the number the handler had to obtain to produce
     /// them. See [`MetricEvent::FuseRead`].
     #[inline]
     pub fn fuse_read(&self, returned: u64, materialised: u64, virtual_dds: bool) {

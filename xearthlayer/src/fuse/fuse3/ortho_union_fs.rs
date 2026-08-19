@@ -57,11 +57,13 @@ use fuse3::raw::Filesystem;
 use fuse3::{Errno, MountOptions, Result as Fuse3InternalResult};
 use futures::stream::{self, Stream, StreamExt};
 use std::ffi::{OsStr, OsString};
+use std::io::SeekFrom;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::mpsc;
 use tracing::{debug, trace, Instrument};
 
@@ -387,7 +389,7 @@ impl Fuse3OrthoUnionFS {
     /// Record one FUSE `read()` call for the amplification metric.
     ///
     /// `returned` is what this call hands back to the kernel; `materialised`
-    /// is what the handler allocated to produce it. The kernel caps each read
+    /// is what the handler had to obtain to produce it. The kernel caps each read
     /// at 1 MiB, so a handler that builds the whole object per call inflates
     /// the second against the first. See #233 and #234.
     fn record_read(&self, returned: u64, materialised: u64, virtual_dds: bool) {
@@ -792,19 +794,33 @@ impl Filesystem for Fuse3OrthoUnionFS {
 
         // Acquire disk I/O permit
         let _permit = self.disk_io_limiter.acquire().await;
-        let data = fs::read(&real_path)
+
+        // Read only the requested window. The kernel caps each FUSE read at
+        // max_pages * PAGE_SIZE (1 MiB on Linux), so reading the whole file
+        // here would move it once per call -- 238x for the largest installed
+        // ortho DSF. See #233.
+        let mut file = fs::File::open(&real_path)
+            .await
+            .map_err(|_| Errno::from(libc::EIO))?;
+        file.seek(SeekFrom::Start(offset))
             .await
             .map_err(|_| Errno::from(libc::EIO))?;
 
-        let offset = offset as usize;
-        let size = size as usize;
+        // `take` bounds the read at `size`; `read_to_end` stops early at EOF,
+        // which is how a range spanning the end becomes a short read.
+        let mut buf = Vec::with_capacity(size as usize);
+        (&mut file)
+            .take(size as u64)
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|_| Errno::from(libc::EIO))?;
 
-        let end = std::cmp::min(offset.saturating_add(size), data.len());
-        let slice = data.get(offset..end).unwrap_or(&[]);
-        self.record_read(slice.len() as u64, data.len() as u64, false);
+        // Seeking past EOF is legal and yields nothing, so this also covers
+        // the at-or-past-EOF case without a separate branch.
+        self.record_read(buf.len() as u64, buf.len() as u64, false);
 
         Ok(ReplyData {
-            data: Bytes::copy_from_slice(slice),
+            data: Bytes::from(buf),
         })
     }
 
@@ -1381,6 +1397,182 @@ mod tests {
             dsf_entry.attr.size, virtual_dds_size,
             "DSF file should NOT have virtual DDS size"
         );
+    }
+
+    // ========================================================================
+    // Passthrough read amplification (#233)
+    // ========================================================================
+
+    /// Build a one-package index containing a single file of `size` bytes and
+    /// return the mounted FS, its inode, and the metrics receiver.
+    fn passthrough_fixture(
+        temp: &TempDir,
+        size: usize,
+    ) -> (
+        Fuse3OrthoUnionFS,
+        u64,
+        tokio::sync::mpsc::UnboundedReceiver<crate::metrics::MetricEvent>,
+    ) {
+        let pkg_dir = temp.path().join("test_ortho");
+        let dsf_dir = pkg_dir.join("Earth nav data/+40-080");
+        std::fs::create_dir_all(&dsf_dir).unwrap();
+        // Byte i = i as u8, so a slice's content proves which range was served.
+        let content: Vec<u8> = (0..size).map(|i| i as u8).collect();
+        std::fs::write(dsf_dir.join("+40-074.dsf"), &content).unwrap();
+
+        let pkg = InstalledPackage::new(
+            Package::new("test", PackageType::Ortho, Version::new(1, 0, 0)),
+            &pkg_dir,
+        );
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(pkg)
+            .build()
+            .unwrap();
+
+        let (metrics_tx, metrics_rx) = tokio::sync::mpsc::unbounded_channel();
+        let fs = Fuse3OrthoUnionFS::new(index, create_test_client(), 1024)
+            .with_metrics(crate::metrics::MetricsClient::new(metrics_tx));
+        let inode = fs
+            .inode_manager
+            .get_or_create_inode(std::path::Path::new("Earth nav data/+40-080/+40-074.dsf"));
+
+        (fs, inode, metrics_rx)
+    }
+
+    fn test_request() -> fuse3::raw::Request {
+        fuse3::raw::Request {
+            unique: 1,
+            uid: 1000,
+            gid: 1000,
+            pid: 1000,
+        }
+    }
+
+    /// Drain the single `FuseRead` event a read is expected to emit.
+    fn drain_one_read(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::metrics::MetricEvent>,
+    ) -> (u64, u64, bool) {
+        match rx
+            .try_recv()
+            .expect("read() must emit exactly one FuseRead")
+        {
+            crate::metrics::MetricEvent::FuseRead {
+                returned,
+                materialised,
+                virtual_dds,
+            } => (returned, materialised, virtual_dds),
+            other => panic!("expected FuseRead, got {other:?}"),
+        }
+    }
+
+    /// A ranged read must not materialise more than it returns.
+    ///
+    /// The kernel caps every FUSE read at 1 MiB, so X-Plane asking for a whole
+    /// 4 MiB file still arrives as several ranged calls. Answering each by
+    /// reading the entire file makes the handler move N times what it delivers
+    /// -- 12-23x at DDS size, up to 238x on the largest installed ortho DSF.
+    ///
+    /// This test fails against the pre-fix handler, which reports
+    /// materialised == 4 MiB for a 64 KiB request.
+    #[tokio::test]
+    async fn test_passthrough_read_materialises_only_the_requested_range() {
+        use fuse3::raw::Filesystem;
+
+        const FILE_SIZE: usize = 4 * 1024 * 1024;
+        const READ_SIZE: u32 = 64 * 1024;
+
+        let temp = TempDir::new().unwrap();
+        let (fs, inode, mut metrics_rx) = passthrough_fixture(&temp, FILE_SIZE);
+
+        let reply = fs
+            .read(test_request(), inode, 0, 0, READ_SIZE)
+            .await
+            .unwrap();
+        assert_eq!(reply.data.len(), READ_SIZE as usize);
+
+        let (returned, materialised, virtual_dds) = drain_one_read(&mut metrics_rx);
+        assert!(
+            !virtual_dds,
+            "a real file on disk is not a virtual DDS tile"
+        );
+        assert_eq!(returned, READ_SIZE as u64);
+        assert_eq!(
+            materialised, returned,
+            "serving {READ_SIZE} bytes must not read {materialised} bytes from a {FILE_SIZE}-byte file"
+        );
+    }
+
+    /// The same guarantee mid-file: seeking must not re-read the prefix.
+    #[tokio::test]
+    async fn test_passthrough_read_mid_file_does_not_read_the_prefix() {
+        use fuse3::raw::Filesystem;
+
+        const FILE_SIZE: usize = 1024 * 1024;
+        const OFFSET: u64 = 768 * 1024;
+        const READ_SIZE: u32 = 128 * 1024;
+
+        let temp = TempDir::new().unwrap();
+        let (fs, inode, mut metrics_rx) = passthrough_fixture(&temp, FILE_SIZE);
+
+        let reply = fs
+            .read(test_request(), inode, 0, OFFSET, READ_SIZE)
+            .await
+            .unwrap();
+
+        // Content proves the right window was served, not just the right length.
+        assert_eq!(reply.data.len(), READ_SIZE as usize);
+        assert_eq!(reply.data[0], (OFFSET as usize % 256) as u8);
+
+        let (returned, materialised, _) = drain_one_read(&mut metrics_rx);
+        assert_eq!(returned, READ_SIZE as u64);
+        assert_eq!(materialised, returned);
+    }
+
+    /// A range that runs off the end returns a short read, not an error.
+    #[tokio::test]
+    async fn test_passthrough_read_spanning_eof_is_clamped() {
+        use fuse3::raw::Filesystem;
+
+        const FILE_SIZE: usize = 100_000;
+        const OFFSET: u64 = 90_000;
+
+        let temp = TempDir::new().unwrap();
+        let (fs, inode, mut metrics_rx) = passthrough_fixture(&temp, FILE_SIZE);
+
+        let reply = fs
+            .read(test_request(), inode, 0, OFFSET, 65536)
+            .await
+            .unwrap();
+
+        let expected = FILE_SIZE as u64 - OFFSET;
+        assert_eq!(reply.data.len() as u64, expected);
+
+        let (returned, materialised, _) = drain_one_read(&mut metrics_rx);
+        assert_eq!(returned, expected);
+        assert_eq!(materialised, returned);
+    }
+
+    /// Reading at or past EOF returns empty rather than erroring.
+    #[tokio::test]
+    async fn test_passthrough_read_at_and_past_eof_returns_empty() {
+        use fuse3::raw::Filesystem;
+
+        const FILE_SIZE: usize = 4096;
+
+        let temp = TempDir::new().unwrap();
+        let (fs, inode, mut metrics_rx) = passthrough_fixture(&temp, FILE_SIZE);
+
+        for offset in [FILE_SIZE as u64, FILE_SIZE as u64 * 4] {
+            let reply = fs
+                .read(test_request(), inode, 0, offset, 4096)
+                .await
+                .unwrap();
+            assert!(reply.data.is_empty(), "offset {offset} is at or past EOF");
+
+            let (returned, materialised, _) = drain_one_read(&mut metrics_rx);
+            assert_eq!(returned, 0);
+            assert_eq!(materialised, 0, "an empty reply must allocate nothing");
+        }
     }
 
     // ========================================================================

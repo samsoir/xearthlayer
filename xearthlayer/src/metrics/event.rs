@@ -220,7 +220,9 @@ pub enum MetricEvent {
     /// Linux), so a file is never handed to the filesystem in a single call:
     /// a whole-file `read(2)` of a 32 MiB file arrives as 32 separate calls.
     /// `returned` is what this call handed back to the kernel; `materialised`
-    /// is how many bytes the handler had to allocate to produce it.
+    /// is how many bytes the handler had to obtain to produce it -- bytes read
+    /// from disk for a real file, or the size of the whole tile for a generated
+    /// DDS, whether or not the tile came from cache.
     ///
     /// The two should be equal. Their ratio is the read amplification tracked
     /// by #233 (real files on disk) and #234 (generated DDS tiles) -- measured
@@ -228,7 +230,7 @@ pub enum MetricEvent {
     FuseRead {
         /// Bytes returned to the kernel for this call.
         returned: u64,
-        /// Bytes the handler allocated in order to serve this call.
+        /// Bytes the handler had to obtain in order to serve this call.
         materialised: u64,
         /// `true` for a generated DDS tile, `false` for a real file on disk.
         virtual_dds: bool,

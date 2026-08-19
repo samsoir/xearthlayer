@@ -245,18 +245,19 @@ pub struct AggregatedState {
 
     // ---- FUSE read amplification (#233 / #234) ----
     // `*_read_bytes` is what was handed to the kernel; `*_alloc_bytes` is what
-    // the handler allocated to produce it. alloc / read is the amplification.
+    // the handler had to obtain to produce it. alloc / read is the amplification:
+    // 1.0 means the handler moved exactly what X-Plane consumed.
     /// `read()` calls served from a real file on disk.
     pub fuse_file_reads: u64,
     /// Bytes returned to the kernel from real files on disk.
     pub fuse_file_read_bytes: u64,
-    /// Bytes allocated to serve those reads.
+    /// Bytes obtained from disk to serve those reads.
     pub fuse_file_alloc_bytes: u64,
     /// `read()` calls served from a generated DDS tile.
     pub fuse_dds_reads: u64,
     /// Bytes returned to the kernel from generated DDS tiles.
     pub fuse_dds_read_bytes: u64,
-    /// Bytes allocated to serve those reads.
+    /// Bytes of whole tiles materialised to serve those reads.
     pub fuse_dds_alloc_bytes: u64,
 
     // =========================================================================
