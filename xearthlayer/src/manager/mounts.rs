@@ -903,7 +903,6 @@ impl Drop for MountManager {
 pub struct ServiceBuilder {
     service_config: ServiceConfig,
     provider_config: crate::provider::ProviderConfig,
-    logger: Arc<dyn crate::log::Logger>,
     /// Shared disk I/O limiter across all service instances.
     /// Note: Currently unused as DiskCacheAdapter handles I/O internally.
     /// Kept for potential future use with shared I/O limiting.
@@ -929,14 +928,8 @@ impl ServiceBuilder {
     pub fn new(
         service_config: ServiceConfig,
         provider_config: crate::provider::ProviderConfig,
-        logger: Arc<dyn crate::log::Logger>,
     ) -> Self {
-        Self::with_disk_io_profile(
-            service_config,
-            provider_config,
-            logger,
-            DiskIoProfile::default(),
-        )
+        Self::with_disk_io_profile(service_config, provider_config, DiskIoProfile::default())
     }
 
     /// Create a new service builder with a specific disk I/O profile.
@@ -947,7 +940,6 @@ impl ServiceBuilder {
     pub fn with_disk_io_profile(
         service_config: ServiceConfig,
         provider_config: crate::provider::ProviderConfig,
-        logger: Arc<dyn crate::log::Logger>,
         disk_io_profile: DiskIoProfile,
     ) -> Self {
         // Resolve Auto profile based on cache directory (or current dir if not set)
@@ -974,7 +966,6 @@ impl ServiceBuilder {
         Self {
             service_config,
             provider_config,
-            logger,
             disk_io_limiter,
             tile_request_callback: None,
         }
@@ -1003,12 +994,9 @@ impl ServiceBuilder {
     ///
     /// Returns an error if any component fails to initialize.
     pub async fn build_service_async(&self) -> Result<XEarthLayerService, ServiceError> {
-        let mut service = XEarthLayerService::start(
-            self.service_config.clone(),
-            self.provider_config.clone(),
-            self.logger.clone(),
-        )
-        .await?;
+        let mut service =
+            XEarthLayerService::start(self.service_config.clone(), self.provider_config.clone())
+                .await?;
 
         // Wire tile request callback for FUSE-based position inference
         if let Some(ref callback) = self.tile_request_callback {

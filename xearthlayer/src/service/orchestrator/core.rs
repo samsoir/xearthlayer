@@ -9,7 +9,6 @@ use tracing::info;
 
 use crate::aircraft_position::{SharedAircraftPosition, StateAggregator};
 use crate::geo_index::GeoIndex;
-use crate::log::TracingLogger;
 use crate::manager::{
     create_consolidated_overlay, remove_consolidated_overlay, InstalledPackage, LocalPackageStore,
     MountManager, ServiceBuilder,
@@ -110,11 +109,9 @@ impl ServiceOrchestrator {
         // Note: Cache is now created inside XEarthLayerService::start() via CacheLayer,
         // which ensures MetricsSystem is created FIRST, then CacheLayer with metrics.
         // This fixes the GC daemon not having metrics client for eviction reporting.
-        let logger: Arc<dyn crate::log::Logger> = Arc::new(TracingLogger);
         let mut service_builder = ServiceBuilder::with_disk_io_profile(
             config.service.clone(),
             config.provider.clone(),
-            logger,
             config.disk_io_profile,
         );
 

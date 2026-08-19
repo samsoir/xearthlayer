@@ -29,7 +29,6 @@ mod cache_layer;
 mod config;
 mod error;
 mod facade;
-mod fuse_mount;
 mod orchestrator;
 mod orchestrator_config;
 mod prewarm;
@@ -39,7 +38,6 @@ pub use cache_layer::CacheLayer;
 pub use config::{ServiceConfig, ServiceConfigBuilder};
 pub use error::ServiceError;
 pub use facade::XEarthLayerService;
-pub use fuse_mount::{FuseMountConfig, FuseMountService};
 pub use orchestrator::{
     MountResult, PrefetchHandle, ServiceOrchestrator, StartupProgress, StartupResult,
 };

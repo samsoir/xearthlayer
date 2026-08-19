@@ -25,9 +25,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Implemented Components
 
 1. **FUSE Layer** (`xearthlayer/src/fuse/fuse3/`)
-   - `Fuse3PassthroughFS` - Async multi-threaded passthrough for single scenery packs
-   - `Fuse3UnionFS` - Union filesystem for patch folders (priority-based merge)
-   - `Fuse3OrthoUnionFS` - Consolidated FUSE mount for all ortho sources (patches + packages)
+   - `Fuse3OrthoUnionFS` - The single FUSE mount: all ortho sources (patches + packages)
+     merged into one union filesystem. The earlier `Fuse3PassthroughFS` and
+     `Fuse3UnionFS` implementations were deleted in #233 once they became unreachable.
    - All FUSE operations run asynchronously on the Tokio runtime
    - Shared traits: `FileAttrBuilder`, `DdsRequestor` (SOLID: Interface Segregation)
    - Pattern matching for DDS files: `{row}_{col}_ZL{zoom}.dds`
@@ -314,7 +314,6 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer-cli/src/commands/publish/` | Publisher CLI (Command Pattern) |
 | `xearthlayer-cli/src/commands/config.rs` | Config CLI commands |
 | `xearthlayer/src/service/facade.rs` | Main service API, wires up runtime |
-| `xearthlayer/src/service/fuse_mount.rs` | FuseMountService for FUSE mounting |
 | `xearthlayer/src/runtime/orchestrator.rs` | XEarthLayerRuntime - daemon orchestrator |
 | `xearthlayer/src/runtime/request.rs` | JobRequest, DdsResponse, RequestOrigin types |
 | `xearthlayer/src/executor/daemon.rs` | ExecutorDaemon - background job processor |
