@@ -85,7 +85,7 @@ pub use scenery_cache::{
 };
 
 // DSF tile types (used by FUSE layer and adaptive prefetch)
-pub use tile_based::{DdsAccessEvent, DsfTileCoord};
+pub use tile_based::DsfTileCoord;
 
 // Adaptive prefetch (self-calibrating DSF-aligned)
 pub use adaptive::{AdaptivePrefetchConfig, AdaptivePrefetchCoordinator};

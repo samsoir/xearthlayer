@@ -42,12 +42,13 @@ use super::types::{Fuse3Error, Fuse3Result};
 use crate::coord::TileCoord;
 use crate::executor::{DdsClient, StorageConcurrencyLimiter};
 use crate::fuse::coalesce::RequestCoalescer;
-use crate::fuse::{get_default_placeholder, parse_dds_filename};
+use crate::fuse::{get_default_placeholder, parse_dds_filename, DdsFilename};
 use crate::geo_index::GeoIndex;
 use crate::ortho_union::OrthoUnionIndex;
-use crate::prefetch::{DdsAccessEvent, DsfTileCoord, PrefetchStateObserver, TileRequestCallback};
+use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use crate::scene_tracker::{DdsTileCoord, FuseAccessEvent};
 use bytes::Bytes;
+use dashmap::DashMap;
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
     DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
@@ -57,13 +58,36 @@ use fuse3::raw::Filesystem;
 use fuse3::{Errno, MountOptions, Result as Fuse3InternalResult};
 use futures::stream::{self, Stream, StreamExt};
 use std::ffi::{OsStr, OsString};
+use std::io::SeekFrom;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::mpsc;
+use tokio::sync::OnceCell;
 use tracing::{debug, trace, Instrument};
+
+/// Ceiling on DDS bytes pinned by open file handles.
+///
+/// Each memoising handle holds one whole tile for as long as X-Plane keeps the
+/// file open, which is new retention in a codebase with an open unbounded-growth
+/// investigation (#227). Past this point `open()` stops handing out memoising
+/// handles and reads fall back to resolving per call, so the bound costs
+/// throughput rather than correctness. `open_dds_handles()` and
+/// `pinned_tile_bytes()` expose the real figures so this can be tuned from
+/// flight data rather than guessed at twice.
+const MAX_PINNED_TILE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Per-open state for one virtual DDS file.
+struct DdsHandle {
+    /// Which tile this handle refers to.
+    coords: DdsFilename,
+    /// The tile, produced on first read and reused by every later read.
+    tile: OnceCell<Arc<Vec<u8>>>,
+}
 
 /// FUSE open flag: bypass kernel page cache for this file.
 ///
@@ -71,7 +95,7 @@ use tracing::{debug, trace, Instrument};
 ///
 /// When set in `ReplyOpen::flags`, the kernel sends every `read()` through
 /// the FUSE handler instead of serving from its page cache. Used for virtual
-/// DDS files so that `FuseLoadMonitor`, `SceneTracker`, and `DdsAccessEvent`
+/// DDS files so that `FuseLoadMonitor` and `SceneTracker`
 /// see every X-Plane read.
 const FOPEN_DIRECT_IO: u32 = 1;
 
@@ -125,21 +149,30 @@ pub struct Fuse3OrthoUnionFS {
     tile_request_callback: Option<TileRequestCallback>,
     /// Request coalescer for deduplicating concurrent requests
     request_coalescer: Arc<RequestCoalescer>,
-    /// Optional channel for notifying prefetcher of DDS accesses.
+    /// Per-open state for virtual DDS files, keyed by file handle.
     ///
-    /// When set, the filesystem sends a [`DdsAccessEvent`] for each DDS
-    /// texture request, enabling the tile-based prefetcher to track
-    /// which DSF tiles X-Plane is loading.
-    dds_access_tx: Option<mpsc::UnboundedSender<DdsAccessEvent>>,
+    /// The kernel caps each FUSE read at 1 MiB, so X-Plane reading one 11.17 MB
+    /// texture arrives as 12-23 ranged calls. Resolving the tile once per open
+    /// and slicing it turns those into a single executor round trip.
+    dds_handles: DashMap<u64, Arc<DdsHandle>>,
+    /// Source of file handles. Starts at 1: 0 means "no handle".
+    next_fh: AtomicU64,
+    /// Bytes of DDS tiles currently pinned by open handles.
+    pinned_tile_bytes: AtomicU64,
+    /// Highest concurrent handle count seen. The current counts drain to near
+    /// zero between bursts, so the peak is what `MAX_PINNED_TILE_BYTES` has to
+    /// be sized against.
+    peak_handles_open: AtomicU64,
+    /// Highest pinned byte total seen.
+    peak_pinned_tile_bytes: AtomicU64,
     /// Optional channel for notifying Scene Tracker of DDS accesses.
     ///
     /// When set, the filesystem sends a [`FuseAccessEvent`] for each DDS
     /// texture request, enabling the Scene Tracker to build an empirical
     /// model of what X-Plane has requested.
     ///
-    /// Unlike `dds_access_tx` which sends derived DSF regions, this channel
-    /// sends raw DDS tile coordinates (row, col, zoom) for Scene Tracker
-    /// to store as empirical data.
+    /// Sends raw DDS tile coordinates (row, col, zoom) for Scene Tracker to
+    /// store as empirical data.
     scene_tracker_tx: Option<mpsc::UnboundedSender<FuseAccessEvent>>,
     /// Optional metrics client for reporting FUSE-level metrics.
     ///
@@ -197,7 +230,11 @@ impl Fuse3OrthoUnionFS {
             disk_io_limiter,
             tile_request_callback: None,
             request_coalescer,
-            dds_access_tx: None,
+            dds_handles: DashMap::new(),
+            next_fh: AtomicU64::new(1),
+            pinned_tile_bytes: AtomicU64::new(0),
+            peak_handles_open: AtomicU64::new(0),
+            peak_pinned_tile_bytes: AtomicU64::new(0),
             scene_tracker_tx: None,
             metrics_client: None,
             fuse_max_background: None,
@@ -229,7 +266,11 @@ impl Fuse3OrthoUnionFS {
             disk_io_limiter,
             tile_request_callback: None,
             request_coalescer,
-            dds_access_tx: None,
+            dds_handles: DashMap::new(),
+            next_fh: AtomicU64::new(1),
+            pinned_tile_bytes: AtomicU64::new(0),
+            peak_handles_open: AtomicU64::new(0),
+            peak_pinned_tile_bytes: AtomicU64::new(0),
             scene_tracker_tx: None,
             metrics_client: None,
             fuse_max_background: None,
@@ -252,28 +293,6 @@ impl Fuse3OrthoUnionFS {
     /// the prefetch system to infer aircraft position from FUSE requests.
     pub fn with_tile_request_callback(mut self, callback: TileRequestCallback) -> Self {
         self.tile_request_callback = Some(callback);
-        self
-    }
-
-    /// Set the channel for DDS access events.
-    ///
-    /// When set, the filesystem sends a [`DdsAccessEvent`] for each DDS
-    /// texture accessed. This enables the tile-based prefetcher to track
-    /// which DSF tiles X-Plane is actively loading.
-    ///
-    /// The channel is fire-and-forget: sending is non-blocking and failures
-    /// are silently ignored to avoid impacting FUSE performance.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let (tx, rx) = mpsc::unbounded_channel();
-    /// let fs = Fuse3OrthoUnionFS::new(index, client, size)
-    ///     .with_dds_access_channel(tx);
-    /// // rx is passed to AdaptivePrefetchCoordinator for DSF tile tracking
-    /// ```
-    pub fn with_dds_access_channel(mut self, tx: mpsc::UnboundedSender<DdsAccessEvent>) -> Self {
-        self.dds_access_tx = Some(tx);
         self
     }
 
@@ -384,6 +403,75 @@ impl Fuse3OrthoUnionFS {
     /// `lookup()`, not here.
     ///
     /// This is the composition point: GeoIndex (geography) + OrthoUnionIndex (files).
+    /// Produce a whole DDS tile, reporting the access to Scene Tracker.
+    ///
+    /// Called once per open when the handle memoises, once per read when it
+    /// does not. Scene Tracker therefore sees one event per texture X-Plane
+    /// opens rather than one per ranged read -- the same access pattern,
+    /// without the 12-23x inflation.
+    async fn resolve_tile(&self, coords: &DdsFilename) -> Vec<u8> {
+        if let Some(ref tx) = self.scene_tracker_tx {
+            let tile = DdsTileCoord::new(coords.row, coords.col, coords.zoom);
+            let _ = tx.send(FuseAccessEvent::new(tile));
+        }
+
+        // request_dds parses a filename; Display carries the correct zoom.
+        self.request_dds(&format!("{}.dds", coords))
+            .await
+            .unwrap_or_else(get_default_placeholder)
+    }
+
+    /// Publish the handle gauge. Called on open and release -- two events per
+    /// texture, against the 12-23 reads it takes to serve one.
+    fn report_handle_gauge(&self) {
+        let open = self.dds_handles.len() as u64;
+        let pinned = self.pinned_tile_bytes.load(Ordering::Relaxed);
+        self.peak_handles_open.fetch_max(open, Ordering::Relaxed);
+        self.peak_pinned_tile_bytes
+            .fetch_max(pinned, Ordering::Relaxed);
+
+        if let Some(metrics) = &self.metrics_client {
+            metrics.fuse_handles(
+                open,
+                pinned,
+                self.peak_handles_open.load(Ordering::Relaxed),
+                self.peak_pinned_tile_bytes.load(Ordering::Relaxed),
+            );
+        }
+    }
+
+    /// Highest concurrent open handle count seen.
+    pub fn peak_dds_handles(&self) -> u64 {
+        self.peak_handles_open.load(Ordering::Relaxed)
+    }
+
+    /// Highest pinned tile byte total seen.
+    pub fn peak_pinned_tile_bytes(&self) -> u64 {
+        self.peak_pinned_tile_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Number of virtual DDS files currently open.
+    pub fn open_dds_handles(&self) -> usize {
+        self.dds_handles.len()
+    }
+
+    /// Bytes of DDS tiles currently pinned by open handles.
+    pub fn pinned_tile_bytes(&self) -> u64 {
+        self.pinned_tile_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Record one FUSE `read()` call for the amplification metric.
+    ///
+    /// `returned` is what this call hands back to the kernel; `materialised`
+    /// is what the handler had to obtain to produce it. The kernel caps each read
+    /// at 1 MiB, so a handler that builds the whole object per call inflates
+    /// the second against the first. See #233 and #234.
+    fn record_read(&self, returned: u64, materialised: u64, virtual_dds: bool) {
+        if let Some(metrics) = &self.metrics_client {
+            metrics.fuse_read(returned, materialised, virtual_dds);
+        }
+    }
+
     fn resolve_lazy_geo(&self, virtual_path: &std::path::Path, filename: &str) -> Option<PathBuf> {
         if self.is_geo_filtered(filename) {
             // Patched region: patches first, packages fill gaps
@@ -703,7 +791,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         &self,
         _req: Request,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: u64,
         size: u32,
     ) -> Fuse3InternalResult<ReplyData> {
@@ -721,42 +809,61 @@ impl Filesystem for Fuse3OrthoUnionFS {
                 .get_virtual_dds(ino)
                 .ok_or(Errno::from(libc::ENOENT))?;
 
-            // Send DDS access event to tile-based prefetcher (fire-and-forget)
-            if let Some(ref tx) = self.dds_access_tx {
-                // Convert DDS tile coordinates to DSF tile (1° × 1°)
-                if let Some(dsf_tile) = DsfTileCoord::from_dds_filename(&format!("{}.dds", coords))
-                {
-                    let _ = tx.send(DdsAccessEvent::new(dsf_tile));
-                }
-            }
-
-            // Send raw tile coordinates to Scene Tracker (fire-and-forget)
-            // Scene Tracker stores empirical data; derives regions via calculation
-            if let Some(ref tx) = self.scene_tracker_tx {
-                let tile = DdsTileCoord::new(coords.row, coords.col, coords.zoom);
-                let _ = tx.send(FuseAccessEvent::new(tile));
-            }
-
-            // Build filename for request_dds (use Display impl which includes correct zoom)
-            let filename = format!("{}.dds", coords);
-
             let fuse_read_span = tracing::debug_span!(target: "profiling", "fuse_read", ino = ino, offset = offset, size = size,);
-            let data = self
-                .request_dds(&filename)
-                .instrument(fuse_read_span)
-                .await
-                .unwrap_or_else(get_default_placeholder);
+
+            // Resolve the tile once per open. The kernel splits one X-Plane
+            // texture read into 12-23 ranged calls (1 MiB ceiling), and this
+            // branch used to re-enter the executor on every one of them.
+            let handle = self.dds_handles.get(&fh).map(|h| Arc::clone(&h));
+
+            // Whether this call had to produce a tile, as opposed to slicing
+            // one an earlier read already produced. Read before `get_or_init`
+            // so it reflects the state on entry. Two concurrent first reads on
+            // one handle both see `false` and both report the tile, which
+            // over-reports amplification rather than hiding it.
+            let is_first_read = handle
+                .as_ref()
+                .map(|h| h.tile.get().is_none())
+                .unwrap_or(true);
+
+            let tile = match handle {
+                Some(handle) => Arc::clone(
+                    handle
+                        .tile
+                        .get_or_init(|| async {
+                            let data = self.resolve_tile(&handle.coords).await;
+                            self.pinned_tile_bytes
+                                .fetch_add(data.len() as u64, Ordering::Relaxed);
+                            // Report here, not at open(): the tile is produced
+                            // on first read, so a gauge sampled only at open
+                            // would never see the bytes it is meant to bound.
+                            self.report_handle_gauge();
+                            Arc::new(data)
+                        })
+                        .instrument(fuse_read_span)
+                        .await,
+                ),
+                // No handle: either the memoisation budget was exhausted at
+                // open() time, or the kernel sent a read we cannot attribute.
+                // Serve it the old way rather than fail -- a missing handle
+                // must never become a black texture.
+                None => Arc::new(self.resolve_tile(&coords).instrument(fuse_read_span).await),
+            };
 
             let offset = offset as usize;
             let size = size as usize;
 
-            if offset >= data.len() {
-                return Ok(ReplyData { data: Bytes::new() });
-            }
+            let end = std::cmp::min(offset.saturating_add(size), tile.len());
+            let slice = tile.get(offset..end).unwrap_or(&[]);
 
-            let end = std::cmp::min(offset + size, data.len());
+            // Slicing a tile an earlier read already produced obtains nothing,
+            // so it materialises nothing. Counting the slice here instead would
+            // leave the ratio near 2 forever and make the fix look ineffective.
+            let materialised = if is_first_read { tile.len() as u64 } else { 0 };
+            self.record_read(slice.len() as u64, materialised, true);
+
             return Ok(ReplyData {
-                data: Bytes::copy_from_slice(&data[offset..end]),
+                data: Bytes::copy_from_slice(slice),
             });
         }
 
@@ -781,20 +888,33 @@ impl Filesystem for Fuse3OrthoUnionFS {
 
         // Acquire disk I/O permit
         let _permit = self.disk_io_limiter.acquire().await;
-        let data = fs::read(&real_path)
+
+        // Read only the requested window. The kernel caps each FUSE read at
+        // max_pages * PAGE_SIZE (1 MiB on Linux), so reading the whole file
+        // here would move it once per call -- 238x for the largest installed
+        // ortho DSF. See #233.
+        let mut file = fs::File::open(&real_path)
+            .await
+            .map_err(|_| Errno::from(libc::EIO))?;
+        file.seek(SeekFrom::Start(offset))
             .await
             .map_err(|_| Errno::from(libc::EIO))?;
 
-        let offset = offset as usize;
-        let size = size as usize;
+        // `take` bounds the read at `size`; `read_to_end` stops early at EOF,
+        // which is how a range spanning the end becomes a short read.
+        let mut buf = Vec::with_capacity(size as usize);
+        (&mut file)
+            .take(size as u64)
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|_| Errno::from(libc::EIO))?;
 
-        if offset >= data.len() {
-            return Ok(ReplyData { data: Bytes::new() });
-        }
+        // Seeking past EOF is legal and yields nothing, so this also covers
+        // the at-or-past-EOF case without a separate branch.
+        self.record_read(buf.len() as u64, buf.len() as u64, false);
 
-        let end = std::cmp::min(offset + size, data.len());
         Ok(ReplyData {
-            data: Bytes::copy_from_slice(&data[offset..end]),
+            data: Bytes::from(buf),
         })
     }
 
@@ -992,33 +1112,80 @@ impl Filesystem for Fuse3OrthoUnionFS {
     }
 
     async fn open(&self, _req: Request, inode: u64, _flags: u32) -> Fuse3InternalResult<ReplyOpen> {
-        if InodeManager::is_virtual_inode(inode) {
-            // Virtual DDS files: bypass kernel page cache so every read()
-            // goes through our FUSE handler. This ensures FuseLoadMonitor,
-            // SceneTracker, and DdsAccessEvent see all X-Plane reads.
-            Ok(ReplyOpen {
+        if !InodeManager::is_virtual_inode(inode) {
+            // Real passthrough files: use default kernel caching, no handle state.
+            return Ok(ReplyOpen { fh: 0, flags: 0 });
+        }
+
+        // Virtual DDS files: bypass the kernel page cache so every read()
+        // reaches this handler and SceneTracker sees the access pattern.
+        //
+        // Allocate a handle so the tile is produced once and every later read
+        // slices it. The tile itself is NOT produced here: generation can take
+        // up to the configured timeout, and X-Plane may open a file it never
+        // reads. First read pays, as it always did.
+        // An inode we cannot map to a tile gets no handle rather than an error:
+        // open() used to succeed for any virtual inode, and read() is where a
+        // genuinely unknown one becomes ENOENT. Failing here instead would turn
+        // any gap in the inode map into a failed open.
+        let Some(coords) = self.inode_manager.get_virtual_dds(inode) else {
+            return Ok(ReplyOpen {
                 fh: 0,
                 flags: FOPEN_DIRECT_IO,
-            })
-        } else {
-            // Real passthrough files: use default kernel caching
-            Ok(ReplyOpen { fh: 0, flags: 0 })
+            });
+        };
+
+        // Refuse to memoise past the pinned-bytes ceiling. fh 0 makes read()
+        // resolve per call, which is slower but correct.
+        let expected = self.virtual_dds_config.size();
+        if self.pinned_tile_bytes.load(Ordering::Relaxed) + expected > MAX_PINNED_TILE_BYTES {
+            debug!(
+                inode = inode,
+                pinned_mb = self.pinned_tile_bytes.load(Ordering::Relaxed) / (1024 * 1024),
+                open_handles = self.dds_handles.len(),
+                "DDS handle budget exhausted - serving this open without memoisation"
+            );
+            return Ok(ReplyOpen {
+                fh: 0,
+                flags: FOPEN_DIRECT_IO,
+            });
         }
+
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.dds_handles.insert(
+            fh,
+            Arc::new(DdsHandle {
+                coords,
+                tile: OnceCell::new(),
+            }),
+        );
+
+        self.report_handle_gauge();
+
+        Ok(ReplyOpen {
+            fh,
+            flags: FOPEN_DIRECT_IO,
+        })
     }
 
     async fn release(
         &self,
         _req: Request,
         _inode: u64,
-        _fh: u64,
+        fh: u64,
         _flags: u32,
         _lock_owner: u64,
         _flush: bool,
     ) -> Fuse3InternalResult<()> {
-        // Stateless I/O — no file handle state to clean up.
-        // Required now that open() is implemented (FOPEN_DIRECT_IO):
-        // the kernel tracks file handles through our handler and sends
-        // release() when files are closed, including during unmount.
+        // Drop the memoised tile. Without this every open file would pin
+        // 11.17 MB for the life of the mount.
+        if let Some((_, handle)) = self.dds_handles.remove(&fh) {
+            if let Some(tile) = handle.tile.get() {
+                self.pinned_tile_bytes
+                    .fetch_sub(tile.len() as u64, Ordering::Relaxed);
+            }
+            self.report_handle_gauge();
+        }
         Ok(())
     }
 
@@ -1371,6 +1538,530 @@ mod tests {
             dsf_entry.attr.size, virtual_dds_size,
             "DSF file should NOT have virtual DDS size"
         );
+    }
+
+    // ========================================================================
+    // Virtual DDS handle reuse (#234)
+    // ========================================================================
+
+    /// A `DdsClient` that answers instantly and counts how many tile requests
+    /// it was asked for. The count is the point: the kernel splits one X-Plane
+    /// texture read into 12-23 ranged calls, and each one used to become a
+    /// separate executor round trip.
+    struct CountingDdsClient {
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingDdsClient {
+        fn new() -> (Arc<Self>, Arc<std::sync::atomic::AtomicUsize>) {
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    requests: Arc::clone(&requests),
+                }),
+                requests,
+            )
+        }
+
+        /// A DDS that passes `validate_dds_or_placeholder`: right magic, right
+        /// length, and a body whose byte at index i is `i as u8` so a slice
+        /// proves which window was served.
+        fn valid_dds() -> Vec<u8> {
+            let mut data: Vec<u8> = (0..crate::fuse::EXPECTED_DDS_SIZE)
+                .map(|i| i as u8)
+                .collect();
+            data[0..4].copy_from_slice(b"DDS ");
+            data
+        }
+    }
+
+    impl DdsClient for CountingDdsClient {
+        fn submit(&self, _request: JobRequest) -> Result<(), DdsClientError> {
+            Ok(())
+        }
+
+        fn request_dds(
+            &self,
+            _tile: TileCoord,
+            _cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(DdsResponse::cache_hit(
+                Self::valid_dds(),
+                Duration::from_millis(1),
+            ));
+            rx
+        }
+
+        fn request_dds_with_options(
+            &self,
+            tile: TileCoord,
+            _priority: Priority,
+            _origin: RequestOrigin,
+            cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            self.request_dds(tile, cancellation)
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
+    fn virtual_dds_fixture() -> (
+        Fuse3OrthoUnionFS,
+        Arc<std::sync::atomic::AtomicUsize>,
+        TempDir,
+    ) {
+        let temp = TempDir::new().unwrap();
+        let pkg_dir = temp.path().join("test_ortho");
+        std::fs::create_dir_all(pkg_dir.join("Earth nav data/+40-080")).unwrap();
+        let pkg = InstalledPackage::new(
+            Package::new("test", PackageType::Ortho, Version::new(1, 0, 0)),
+            &pkg_dir,
+        );
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(pkg)
+            .build()
+            .unwrap();
+
+        let (client, requests) = CountingDdsClient::new();
+        let fs = Fuse3OrthoUnionFS::new(index, client, crate::fuse::EXPECTED_DDS_SIZE);
+        (fs, requests, temp)
+    }
+
+    fn virtual_inode(fs: &Fuse3OrthoUnionFS) -> u64 {
+        fs.inode_manager
+            .create_virtual_inode(crate::fuse::DdsFilename {
+                row: 12754,
+                col: 5279,
+                zoom: 16,
+                map_type: "BI".to_string(),
+            })
+    }
+
+    /// One open, many reads, one tile request.
+    ///
+    /// This is the defect: `read()` re-entered the executor on every ranged
+    /// call, so a single texture cost 12-23 round trips, each of which cloned
+    /// the whole 11.17 MB tile twice. Fails against the pre-fix handler with
+    /// one request per read.
+    #[tokio::test]
+    async fn test_virtual_dds_resolves_once_per_open() {
+        use fuse3::raw::Filesystem;
+
+        let (fs, requests, _temp) = virtual_dds_fixture();
+        let ino = virtual_inode(&fs);
+
+        let opened = fs.open(test_request(), ino, 0).await.unwrap();
+
+        const CHUNK: u32 = 1024 * 1024;
+        for i in 0..5u64 {
+            let reply = fs
+                .read(test_request(), ino, opened.fh, i * CHUNK as u64, CHUNK)
+                .await
+                .unwrap();
+            assert_eq!(reply.data.len(), CHUNK as usize, "read {i} short");
+        }
+
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "five ranged reads of one open file must cost one tile request"
+        );
+    }
+
+    /// Serving from the memoised tile must still return the right window.
+    #[tokio::test]
+    async fn test_virtual_dds_reads_serve_the_requested_window() {
+        use fuse3::raw::Filesystem;
+
+        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let ino = virtual_inode(&fs);
+        let opened = fs.open(test_request(), ino, 0).await.unwrap();
+
+        // Byte i of the tile is `i as u8`, except the four magic bytes.
+        for offset in [4096u64, 1_000_000, 8_000_000] {
+            let reply = fs
+                .read(test_request(), ino, opened.fh, offset, 256)
+                .await
+                .unwrap();
+            assert_eq!(reply.data.len(), 256);
+            assert_eq!(reply.data[0], (offset % 256) as u8, "offset {offset}");
+            assert_eq!(reply.data[255], ((offset + 255) % 256) as u8);
+        }
+    }
+
+    /// The last window is short, and reads past the tile return nothing.
+    #[tokio::test]
+    async fn test_virtual_dds_read_at_and_past_tile_end() {
+        use fuse3::raw::Filesystem;
+
+        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let ino = virtual_inode(&fs);
+        let opened = fs.open(test_request(), ino, 0).await.unwrap();
+        let size = crate::fuse::EXPECTED_DDS_SIZE as u64;
+
+        let tail = fs
+            .read(test_request(), ino, opened.fh, size - 100, 4096)
+            .await
+            .unwrap();
+        assert_eq!(tail.data.len(), 100);
+
+        let past = fs
+            .read(test_request(), ino, opened.fh, size, 4096)
+            .await
+            .unwrap();
+        assert!(past.data.is_empty());
+    }
+
+    /// A registered virtual inode gets a real, non-zero handle.
+    #[tokio::test]
+    async fn test_open_registered_virtual_dds_returns_a_handle() {
+        use fuse3::raw::Filesystem;
+
+        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let ino = virtual_inode(&fs);
+
+        let reply = fs.open(test_request(), ino, 0).await.unwrap();
+
+        assert_ne!(reply.fh, 0, "a known tile must get a memoising handle");
+        assert_eq!(reply.flags, FOPEN_DIRECT_IO);
+        assert_eq!(fs.open_dds_handles(), 1);
+        // open() must not produce the tile: generation can take up to the
+        // configured timeout, and X-Plane may open a file it never reads.
+        assert_eq!(fs.pinned_tile_bytes(), 0);
+    }
+
+    /// Peaks must survive the drain that hides the current gauges.
+    ///
+    /// The live counts are sampled on open, on tile production and on release,
+    /// so a periodic reader almost always catches them just after a release and
+    /// sees zero -- which is exactly what the first KDEN run reported while 31
+    /// files were open. `MAX_PINNED_TILE_BYTES` has to be sized against the
+    /// ceiling, so the ceiling is tracked separately.
+    #[tokio::test]
+    async fn test_virtual_dds_handle_peaks_outlive_the_current_gauges() {
+        use fuse3::raw::Filesystem;
+
+        let (fs, _requests, _temp) = virtual_dds_fixture();
+
+        let mut opened = Vec::new();
+        for col in 0..3u32 {
+            let ino = fs
+                .inode_manager
+                .create_virtual_inode(crate::fuse::DdsFilename {
+                    row: 12754,
+                    col: 5279 + col,
+                    zoom: 16,
+                    map_type: "BI".to_string(),
+                });
+            let reply = fs.open(test_request(), ino, 0).await.unwrap();
+            fs.read(test_request(), ino, reply.fh, 0, 4096)
+                .await
+                .unwrap();
+            opened.push((ino, reply.fh));
+        }
+
+        assert_eq!(fs.open_dds_handles(), 3);
+        let pinned_at_peak = fs.pinned_tile_bytes();
+        assert_eq!(pinned_at_peak, 3 * crate::fuse::EXPECTED_DDS_SIZE as u64);
+
+        for (ino, fh) in opened {
+            fs.release(test_request(), ino, fh, 0, 0, false)
+                .await
+                .unwrap();
+        }
+
+        // Current gauges drain...
+        assert_eq!(fs.open_dds_handles(), 0);
+        assert_eq!(fs.pinned_tile_bytes(), 0);
+        // ...peaks do not.
+        assert_eq!(fs.peak_dds_handles(), 3);
+        assert_eq!(fs.peak_pinned_tile_bytes(), pinned_at_peak);
+    }
+
+    /// The amplification metric must reflect the fix, not the old shape.
+    ///
+    /// Only the read that produces the tile materialises it; later reads slice
+    /// what is already held and obtain nothing. Counting the tile on every
+    /// call would pin `fuse_dds_alloc_mb / fuse_dds_read_mb` near 12-23 and
+    /// report the fix as ineffective.
+    #[tokio::test]
+    async fn test_virtual_dds_metric_charges_the_tile_once() {
+        use fuse3::raw::Filesystem;
+
+        let temp = TempDir::new().unwrap();
+        let pkg_dir = temp.path().join("test_ortho");
+        std::fs::create_dir_all(pkg_dir.join("Earth nav data/+40-080")).unwrap();
+        let pkg = InstalledPackage::new(
+            Package::new("test", PackageType::Ortho, Version::new(1, 0, 0)),
+            &pkg_dir,
+        );
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(pkg)
+            .build()
+            .unwrap();
+        let (client, _requests) = CountingDdsClient::new();
+        let (metrics_tx, mut metrics_rx) = tokio::sync::mpsc::unbounded_channel();
+        let fs = Fuse3OrthoUnionFS::new(index, client, crate::fuse::EXPECTED_DDS_SIZE)
+            .with_metrics(crate::metrics::MetricsClient::new(metrics_tx));
+        let ino = virtual_inode(&fs);
+        let opened = fs.open(test_request(), ino, 0).await.unwrap();
+
+        const CHUNK: u32 = 1024 * 1024;
+        const READS: u64 = 4;
+        for i in 0..READS {
+            fs.read(test_request(), ino, opened.fh, i * CHUNK as u64, CHUNK)
+                .await
+                .unwrap();
+        }
+
+        let mut returned_total = 0u64;
+        let mut materialised_total = 0u64;
+        let mut events = 0;
+        while let Ok(event) = metrics_rx.try_recv() {
+            if let crate::metrics::MetricEvent::FuseRead {
+                returned,
+                materialised,
+                virtual_dds,
+            } = event
+            {
+                assert!(virtual_dds);
+                returned_total += returned;
+                materialised_total += materialised;
+                events += 1;
+            }
+        }
+
+        assert_eq!(events, READS, "one FuseRead per read call");
+        assert_eq!(returned_total, READS * CHUNK as u64);
+        assert_eq!(
+            materialised_total,
+            crate::fuse::EXPECTED_DDS_SIZE as u64,
+            "the tile is charged exactly once across {READS} reads"
+        );
+    }
+
+    /// `release()` must drop the tile, or every open file leaks 11.17 MB.
+    #[tokio::test]
+    async fn test_virtual_dds_release_frees_the_handle() {
+        use fuse3::raw::Filesystem;
+
+        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let ino = virtual_inode(&fs);
+        let opened = fs.open(test_request(), ino, 0).await.unwrap();
+        fs.read(test_request(), ino, opened.fh, 0, 4096)
+            .await
+            .unwrap();
+
+        assert_eq!(fs.open_dds_handles(), 1);
+        assert!(fs.pinned_tile_bytes() > 0);
+
+        fs.release(test_request(), ino, opened.fh, 0, 0, false)
+            .await
+            .unwrap();
+
+        assert_eq!(fs.open_dds_handles(), 0);
+        assert_eq!(fs.pinned_tile_bytes(), 0);
+    }
+
+    /// A read with no handle still works, one request per read.
+    ///
+    /// The kernel always calls `open()` first, but a handler that returns
+    /// ENOENT when it does not recognise a handle would turn any bookkeeping
+    /// slip into a black texture.
+    #[tokio::test]
+    async fn test_virtual_dds_read_without_a_handle_falls_back() {
+        use fuse3::raw::Filesystem;
+
+        let (fs, requests, _temp) = virtual_dds_fixture();
+        let ino = virtual_inode(&fs);
+
+        for _ in 0..3 {
+            let reply = fs.read(test_request(), ino, 0, 0, 4096).await.unwrap();
+            assert_eq!(reply.data.len(), 4096);
+        }
+
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    // ========================================================================
+    // Passthrough read amplification (#233)
+    // ========================================================================
+
+    /// Build a one-package index containing a single file of `size` bytes and
+    /// return the mounted FS, its inode, and the metrics receiver.
+    fn passthrough_fixture(
+        temp: &TempDir,
+        size: usize,
+    ) -> (
+        Fuse3OrthoUnionFS,
+        u64,
+        tokio::sync::mpsc::UnboundedReceiver<crate::metrics::MetricEvent>,
+    ) {
+        let pkg_dir = temp.path().join("test_ortho");
+        let dsf_dir = pkg_dir.join("Earth nav data/+40-080");
+        std::fs::create_dir_all(&dsf_dir).unwrap();
+        // Byte i = i as u8, so a slice's content proves which range was served.
+        let content: Vec<u8> = (0..size).map(|i| i as u8).collect();
+        std::fs::write(dsf_dir.join("+40-074.dsf"), &content).unwrap();
+
+        let pkg = InstalledPackage::new(
+            Package::new("test", PackageType::Ortho, Version::new(1, 0, 0)),
+            &pkg_dir,
+        );
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(pkg)
+            .build()
+            .unwrap();
+
+        let (metrics_tx, metrics_rx) = tokio::sync::mpsc::unbounded_channel();
+        let fs = Fuse3OrthoUnionFS::new(index, create_test_client(), 1024)
+            .with_metrics(crate::metrics::MetricsClient::new(metrics_tx));
+        let inode = fs
+            .inode_manager
+            .get_or_create_inode(std::path::Path::new("Earth nav data/+40-080/+40-074.dsf"));
+
+        (fs, inode, metrics_rx)
+    }
+
+    fn test_request() -> fuse3::raw::Request {
+        fuse3::raw::Request {
+            unique: 1,
+            uid: 1000,
+            gid: 1000,
+            pid: 1000,
+        }
+    }
+
+    /// Drain the single `FuseRead` event a read is expected to emit.
+    fn drain_one_read(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::metrics::MetricEvent>,
+    ) -> (u64, u64, bool) {
+        match rx
+            .try_recv()
+            .expect("read() must emit exactly one FuseRead")
+        {
+            crate::metrics::MetricEvent::FuseRead {
+                returned,
+                materialised,
+                virtual_dds,
+            } => (returned, materialised, virtual_dds),
+            other => panic!("expected FuseRead, got {other:?}"),
+        }
+    }
+
+    /// A ranged read must not materialise more than it returns.
+    ///
+    /// The kernel caps every FUSE read at 1 MiB, so X-Plane asking for a whole
+    /// 4 MiB file still arrives as several ranged calls. Answering each by
+    /// reading the entire file makes the handler move N times what it delivers
+    /// -- 12-23x at DDS size, up to 238x on the largest installed ortho DSF.
+    ///
+    /// This test fails against the pre-fix handler, which reports
+    /// materialised == 4 MiB for a 64 KiB request.
+    #[tokio::test]
+    async fn test_passthrough_read_materialises_only_the_requested_range() {
+        use fuse3::raw::Filesystem;
+
+        const FILE_SIZE: usize = 4 * 1024 * 1024;
+        const READ_SIZE: u32 = 64 * 1024;
+
+        let temp = TempDir::new().unwrap();
+        let (fs, inode, mut metrics_rx) = passthrough_fixture(&temp, FILE_SIZE);
+
+        let reply = fs
+            .read(test_request(), inode, 0, 0, READ_SIZE)
+            .await
+            .unwrap();
+        assert_eq!(reply.data.len(), READ_SIZE as usize);
+
+        let (returned, materialised, virtual_dds) = drain_one_read(&mut metrics_rx);
+        assert!(
+            !virtual_dds,
+            "a real file on disk is not a virtual DDS tile"
+        );
+        assert_eq!(returned, READ_SIZE as u64);
+        assert_eq!(
+            materialised, returned,
+            "serving {READ_SIZE} bytes must not read {materialised} bytes from a {FILE_SIZE}-byte file"
+        );
+    }
+
+    /// The same guarantee mid-file: seeking must not re-read the prefix.
+    #[tokio::test]
+    async fn test_passthrough_read_mid_file_does_not_read_the_prefix() {
+        use fuse3::raw::Filesystem;
+
+        const FILE_SIZE: usize = 1024 * 1024;
+        const OFFSET: u64 = 768 * 1024;
+        const READ_SIZE: u32 = 128 * 1024;
+
+        let temp = TempDir::new().unwrap();
+        let (fs, inode, mut metrics_rx) = passthrough_fixture(&temp, FILE_SIZE);
+
+        let reply = fs
+            .read(test_request(), inode, 0, OFFSET, READ_SIZE)
+            .await
+            .unwrap();
+
+        // Content proves the right window was served, not just the right length.
+        assert_eq!(reply.data.len(), READ_SIZE as usize);
+        assert_eq!(reply.data[0], (OFFSET as usize % 256) as u8);
+
+        let (returned, materialised, _) = drain_one_read(&mut metrics_rx);
+        assert_eq!(returned, READ_SIZE as u64);
+        assert_eq!(materialised, returned);
+    }
+
+    /// A range that runs off the end returns a short read, not an error.
+    #[tokio::test]
+    async fn test_passthrough_read_spanning_eof_is_clamped() {
+        use fuse3::raw::Filesystem;
+
+        const FILE_SIZE: usize = 100_000;
+        const OFFSET: u64 = 90_000;
+
+        let temp = TempDir::new().unwrap();
+        let (fs, inode, mut metrics_rx) = passthrough_fixture(&temp, FILE_SIZE);
+
+        let reply = fs
+            .read(test_request(), inode, 0, OFFSET, 65536)
+            .await
+            .unwrap();
+
+        let expected = FILE_SIZE as u64 - OFFSET;
+        assert_eq!(reply.data.len() as u64, expected);
+
+        let (returned, materialised, _) = drain_one_read(&mut metrics_rx);
+        assert_eq!(returned, expected);
+        assert_eq!(materialised, returned);
+    }
+
+    /// Reading at or past EOF returns empty rather than erroring.
+    #[tokio::test]
+    async fn test_passthrough_read_at_and_past_eof_returns_empty() {
+        use fuse3::raw::Filesystem;
+
+        const FILE_SIZE: usize = 4096;
+
+        let temp = TempDir::new().unwrap();
+        let (fs, inode, mut metrics_rx) = passthrough_fixture(&temp, FILE_SIZE);
+
+        for offset in [FILE_SIZE as u64, FILE_SIZE as u64 * 4] {
+            let reply = fs
+                .read(test_request(), inode, 0, offset, 4096)
+                .await
+                .unwrap();
+            assert!(reply.data.is_empty(), "offset {offset} is at or past EOF");
+
+            let (returned, materialised, _) = drain_one_read(&mut metrics_rx);
+            assert_eq!(returned, 0);
+            assert_eq!(materialised, 0, "an empty reply must allocate nothing");
+        }
     }
 
     // ========================================================================
@@ -1905,10 +2596,15 @@ mod tests {
             fs.open(req, virtual_inode, libc::O_RDONLY as u32).await;
 
         let reply = result.expect("open on virtual DDS inode should succeed");
-        assert_eq!(reply.fh, 0, "file handle should be stateless");
         assert_eq!(
             reply.flags, FOPEN_DIRECT_IO,
             "virtual DDS files should have FOPEN_DIRECT_IO flag"
+        );
+        // This inode was synthesised, not registered by lookup, so there is no
+        // tile to memoise and no handle to hand out. Reads still work (#234).
+        assert_eq!(
+            reply.fh, 0,
+            "an unregistered virtual inode gets no memoising handle"
         );
     }
 

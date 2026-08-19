@@ -214,6 +214,46 @@ pub enum MetricEvent {
     /// Used by the TUI to show actual tile request throughput.
     FuseTileServed,
 
+    /// A FUSE `read()` call was answered.
+    ///
+    /// The kernel caps every FUSE read at `max_pages * PAGE_SIZE` (1 MiB on
+    /// Linux), so a file is never handed to the filesystem in a single call:
+    /// a whole-file `read(2)` of a 32 MiB file arrives as 32 separate calls.
+    /// `returned` is what this call handed back to the kernel; `materialised`
+    /// is how many bytes the handler had to obtain to produce it -- bytes read
+    /// from disk for a real file, or the size of the whole tile for a generated
+    /// DDS, whether or not the tile came from cache.
+    ///
+    /// The two should be equal. Their ratio is the read amplification tracked
+    /// by #233 (real files on disk) and #234 (generated DDS tiles) -- measured
+    /// at 12-23x for an 11.17 MB object before those fixes.
+    FuseRead {
+        /// Bytes returned to the kernel for this call.
+        returned: u64,
+        /// Bytes the handler had to obtain in order to serve this call.
+        materialised: u64,
+        /// `true` for a generated DDS tile, `false` for a real file on disk.
+        virtual_dds: bool,
+    },
+
+    /// Open virtual DDS file handles, and the tile bytes they pin.
+    ///
+    /// A gauge, emitted on open and release. Each open handle holds one whole
+    /// tile so later reads can slice it (#234), so this is the live cost of
+    /// that memoisation -- and the only measurement of how many DDS files
+    /// X-Plane keeps open at once, which is what `MAX_PINNED_TILE_BYTES`
+    /// is guessing at.
+    FuseHandlesUpdate {
+        /// Virtual DDS files currently open.
+        open: u64,
+        /// Tile bytes currently pinned by those handles.
+        pinned_bytes: u64,
+        /// Highest concurrent open count seen this session.
+        peak_open: u64,
+        /// Highest pinned byte total seen this session.
+        peak_pinned_bytes: u64,
+    },
+
     /// A FUSE request started being handled.
     FuseRequestStarted,
 
@@ -319,6 +359,8 @@ impl MetricEvent {
             Self::EncodeCompleted { .. } => "encode_completed",
             Self::AssemblyCompleted { .. } => "assembly_completed",
             Self::FuseTileServed => "fuse_tile_served",
+            Self::FuseRead { .. } => "fuse_read",
+            Self::FuseHandlesUpdate { .. } => "fuse_handles_update",
             Self::FuseRequestStarted => "fuse_request_started",
             Self::FuseRequestCompleted => "fuse_request_completed",
             Self::FuseRequestQueued => "fuse_request_queued",

@@ -4,20 +4,16 @@ use super::builder::{self, AsyncProviderComponents};
 use super::cache_layer::CacheLayer;
 use super::config::ServiceConfig;
 use super::error::ServiceError;
-use super::fuse_mount::{FuseMountConfig, FuseMountService};
 use super::runtime_builder::RuntimeBuilder;
 use crate::cache::adapters::MemoryCacheBridge;
 use crate::cache::GcSchedulerDaemon;
 use crate::executor::DdsClient;
-use crate::fuse::{MountHandle, SpawnedMountHandle};
-use crate::log::Logger;
 use crate::metrics::{MetricsSystem, TelemetrySnapshot, TuiReporter};
 use crate::prefetch::TileRequestCallback;
 use crate::provider::ProviderConfig;
 use crate::runtime::{SharedRuntimeHealth, SharedTileProgressTracker, XEarthLayerRuntime};
 use crate::texture::{DdsTextureEncoder, TextureEncoder};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::runtime::{Handle, Runtime};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -33,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 /// only constructor and must be called from within an async context:
 ///
 /// ```ignore
-/// let service = XEarthLayerService::start(config, provider_config, logger).await?;
+/// let service = XEarthLayerService::start(config, provider_config).await?;
 /// ```
 ///
 /// # Example
@@ -43,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 /// use xearthlayer::provider::ProviderConfig;
 ///
 /// let config = ServiceConfig::default();
-/// let service = XEarthLayerService::start(config, ProviderConfig::bing(), logger).await?;
+/// let service = XEarthLayerService::start(config, ProviderConfig::bing()).await?;
 /// ```
 pub struct XEarthLayerService {
     /// Service configuration
@@ -52,8 +48,6 @@ pub struct XEarthLayerService {
     provider_name: String,
     /// Provider's maximum supported zoom level
     max_zoom: u8,
-    /// Logger for diagnostic output
-    logger: Arc<dyn Logger>,
     // -------------------------------------------------------------------------
     // RAII Fields: Kept alive for ownership semantics, not read after construction.
     // Dropping these would stop background threads/resources.
@@ -112,7 +106,6 @@ impl XEarthLayerService {
     pub async fn start(
         config: ServiceConfig,
         provider_config: ProviderConfig,
-        logger: Arc<dyn Logger>,
     ) -> Result<Self, ServiceError> {
         // Use the current runtime - caller is responsible for keeping it alive
         let runtime_handle = Handle::current();
@@ -224,7 +217,6 @@ impl XEarthLayerService {
             config,
             provider_name,
             max_zoom,
-            logger,
             _owned_runtime: None, // Caller owns the runtime
             runtime_handle,
             dds_encoder,
@@ -378,7 +370,7 @@ impl XEarthLayerService {
     /// # Example
     ///
     /// ```ignore
-    /// let mut service = XEarthLayerService::start(config, provider_config, logger, disk_profile).await?;
+    /// let mut service = XEarthLayerService::start(config, provider_config, disk_profile).await?;
     /// // ... use service ...
     /// service.shutdown_cache().await;
     /// ```
@@ -471,116 +463,6 @@ impl XEarthLayerService {
     pub fn expected_dds_size(&self) -> usize {
         self.dds_encoder.expected_size(4096, 4096)
     }
-
-    /// Create a mount configuration for FUSE filesystem.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the DdsClient is not initialized (requires async provider).
-    fn create_mount_config(&self) -> FuseMountConfig {
-        let client = self
-            .dds_client
-            .as_ref()
-            .expect("DdsClient not initialized - async provider required");
-
-        let mut config = FuseMountConfig::new(Arc::clone(client), self.expected_dds_size())
-            .with_timeout(Duration::from_secs(
-                self.config.generation_timeout().unwrap_or(30),
-            ))
-            .with_logger(Arc::clone(&self.logger));
-
-        // Wire tile request callback for FUSE-based position inference
-        if let Some(ref callback) = self.tile_request_callback {
-            config = config.with_tile_request_callback(callback.clone());
-        }
-
-        config
-    }
-
-    /// Start the passthrough FUSE filesystem server using fuse3 (async multi-threaded).
-    ///
-    /// Uses the fuse3 library which runs all FUSE operations asynchronously on the
-    /// Tokio runtime, enabling true parallel I/O processing. This is optimized for
-    /// high-concurrency scenarios like X-Plane scene loading.
-    ///
-    /// # Arguments
-    ///
-    /// * `source_dir` - Path to the scenery pack directory to overlay
-    /// * `mountpoint` - Path where the virtual filesystem will be mounted
-    ///
-    /// # Returns
-    ///
-    /// A `MountHandle` that keeps the filesystem mounted. When dropped, the
-    /// filesystem is automatically unmounted.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Source directory doesn't exist
-    /// - Mountpoint directory doesn't exist
-    /// - FUSE mount fails
-    pub async fn serve_passthrough_fuse3(
-        &self,
-        source_dir: &str,
-        mountpoint: &str,
-    ) -> Result<MountHandle, ServiceError> {
-        let config = self.create_mount_config();
-        FuseMountService::mount_fuse3(&config, source_dir, mountpoint).await
-    }
-
-    /// Start the passthrough FUSE filesystem server using fuse3 (synchronous wrapper).
-    ///
-    /// This is a convenience wrapper around `serve_passthrough_fuse3` that blocks
-    /// until the filesystem is unmounted. For async code, use `serve_passthrough_fuse3`
-    /// directly.
-    ///
-    /// # Arguments
-    ///
-    /// * `source_dir` - Path to the scenery pack directory to overlay
-    /// * `mountpoint` - Path where the virtual filesystem will be mounted
-    ///
-    /// # Note
-    ///
-    /// This method blocks until the filesystem is unmounted (e.g., via Ctrl+C
-    /// or `fusermount -u`).
-    pub fn serve_passthrough_fuse3_blocking(
-        &self,
-        source_dir: &str,
-        mountpoint: &str,
-    ) -> Result<(), ServiceError> {
-        let config = self.create_mount_config();
-        FuseMountService::mount_fuse3_blocking(
-            &config,
-            source_dir,
-            mountpoint,
-            &self.runtime_handle,
-        )
-    }
-
-    /// Start the passthrough FUSE filesystem server using fuse3 as a background task.
-    ///
-    /// This spawns the fuse3 mount as a background Tokio task, returning a handle
-    /// that can be safely stored and dropped outside of an async context. This is
-    /// the recommended method for use with `MountManager`.
-    ///
-    /// # Arguments
-    ///
-    /// * `source_dir` - Path to the scenery pack directory to overlay
-    /// * `mountpoint` - Path where the virtual filesystem will be mounted
-    ///
-    /// # Returns
-    ///
-    /// A `SpawnedMountHandle` that keeps the filesystem mounted. The handle can be
-    /// dropped safely from any context (async or sync) - it will use `fusermount -u`
-    /// as a fallback for cleanup if needed.
-    pub async fn serve_passthrough_fuse3_spawned(
-        &self,
-        source_dir: &str,
-        mountpoint: &str,
-    ) -> Result<SpawnedMountHandle, ServiceError> {
-        let config = self.create_mount_config();
-        FuseMountService::mount_fuse3_spawned(&config, source_dir, mountpoint).await
-    }
 }
 
 #[cfg(test)]
@@ -658,7 +540,6 @@ mod tests {
     /// isolates the test from the `#[tokio::test]` runtime.
     #[test]
     fn test_start_callable_from_block_on() {
-        use crate::log::TracingLogger;
         use crate::provider::ProviderConfig;
         use std::thread;
         use tempfile::tempdir;
@@ -675,12 +556,7 @@ mod tests {
 
                 // This would panic with "Cannot start a runtime from within a runtime"
                 // if start() tries to create its own runtime internally
-                let result = XEarthLayerService::start(
-                    config,
-                    ProviderConfig::bing(),
-                    Arc::new(TracingLogger),
-                )
-                .await;
+                let result = XEarthLayerService::start(config, ProviderConfig::bing()).await;
 
                 // We expect this to succeed (or fail for other reasons like network)
                 // but NOT panic due to nested runtime

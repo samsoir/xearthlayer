@@ -243,6 +243,36 @@ pub struct AggregatedState {
     /// FUSE requests waiting in queue.
     pub fuse_requests_waiting: u64,
 
+    // ---- FUSE read amplification (#233 / #234) ----
+    // `*_read_bytes` is what was handed to the kernel; `*_alloc_bytes` is what
+    // the handler had to obtain to produce it. alloc / read is the amplification:
+    // 1.0 means the handler moved exactly what X-Plane consumed.
+    /// `read()` calls served from a real file on disk.
+    pub fuse_file_reads: u64,
+    /// Bytes returned to the kernel from real files on disk.
+    pub fuse_file_read_bytes: u64,
+    /// Bytes obtained from disk to serve those reads.
+    pub fuse_file_alloc_bytes: u64,
+    /// `read()` calls served from a generated DDS tile.
+    pub fuse_dds_reads: u64,
+    /// Bytes returned to the kernel from generated DDS tiles.
+    pub fuse_dds_read_bytes: u64,
+    /// Bytes of whole tiles materialised to serve those reads.
+    pub fuse_dds_alloc_bytes: u64,
+    /// Virtual DDS files currently open (gauge).
+    pub fuse_handles_open: u64,
+    /// Tile bytes currently pinned by open handles (gauge).
+    pub fuse_handles_pinned_bytes: u64,
+    /// Highest concurrent open handle count seen this session.
+    ///
+    /// The current gauges are sampled whenever a handle opens, produces a tile
+    /// or releases, so a periodic reader almost always catches them just after
+    /// a release and reads near zero. The ceiling is what has to be sized
+    /// against, so it is tracked separately.
+    pub fuse_handles_peak_open: u64,
+    /// Highest pinned byte total seen this session.
+    pub fuse_handles_peak_pinned_bytes: u64,
+
     // =========================================================================
     // Peak Tracking
     // =========================================================================
@@ -340,6 +370,16 @@ impl AggregatedState {
             fuse_tiles_served: 0,
             fuse_requests_active: 0,
             fuse_requests_waiting: 0,
+            fuse_file_reads: 0,
+            fuse_file_read_bytes: 0,
+            fuse_file_alloc_bytes: 0,
+            fuse_dds_reads: 0,
+            fuse_dds_read_bytes: 0,
+            fuse_dds_alloc_bytes: 0,
+            fuse_handles_open: 0,
+            fuse_handles_pinned_bytes: 0,
+            fuse_handles_peak_open: 0,
+            fuse_handles_peak_pinned_bytes: 0,
             peak_bytes_per_second: 0.0,
             prefetch_regions_in_progress: 0,
             prefetch_regions_prefetched: 0,

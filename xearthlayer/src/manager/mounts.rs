@@ -26,7 +26,6 @@ use crate::package::{
 };
 use crate::panic as panic_handler;
 use crate::patches::{extract_dsf_regions, PatchDiscovery};
-use crate::prefetch::tile_based::DdsAccessEvent;
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use crate::scene_tracker::{DefaultSceneTracker, FuseAccessEvent};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
@@ -149,10 +148,6 @@ pub struct MountManager {
     consolidated_mount: Option<ActiveMount>,
     /// Service for consolidated ortho (owns the runtime for DDS generation).
     consolidated_service: Option<XEarthLayerService>,
-    /// DDS access event receiver for tile-based prefetching.
-    /// This is populated when mounting consolidated ortho and can be retrieved
-    /// by the prefetcher via `take_dds_access_receiver()`.
-    dds_access_rx: Option<mpsc::UnboundedReceiver<DdsAccessEvent>>,
     /// Scene Tracker event receiver for empirical scenery tracking.
     /// This is populated when mounting consolidated ortho and can be retrieved
     /// by the Scene Tracker via `take_scene_tracker_receiver()`.
@@ -184,7 +179,6 @@ impl MountManager {
             consolidated_session: None,
             consolidated_mount: None,
             consolidated_service: None,
-            dds_access_rx: None,
             scene_tracker_rx: None,
             ortho_union_index: None,
             geo_index: None,
@@ -456,10 +450,6 @@ impl MountManager {
         let expected_dds_size = service.expected_dds_size();
         let runtime_handle = service.runtime_handle().clone();
 
-        // Create DDS access event channel for tile-based prefetching
-        // The sender goes to FUSE, the receiver goes to the prefetcher
-        let (dds_access_tx, dds_access_rx) = mpsc::unbounded_channel();
-
         // Create Scene Tracker event channel for empirical scenery tracking
         // The sender goes to FUSE, the receiver goes to the Scene Tracker
         let (scene_tracker_tx, scene_tracker_rx) = mpsc::unbounded_channel();
@@ -485,7 +475,6 @@ impl MountManager {
             Fuse3OrthoUnionFS::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
                 .with_geo_index(Arc::clone(&geo_index))
                 .with_state_observer(state_observer)
-                .with_dds_access_channel(dds_access_tx)
                 .with_scene_tracker_channel(scene_tracker_tx)
                 .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold);
 
@@ -513,8 +502,7 @@ impl MountManager {
                 self.consolidated_session = Some(session);
                 self.consolidated_mount = Some(mount_info);
 
-                // Store DDS access channel receiver, indexes for tile-based prefetcher
-                self.dds_access_rx = Some(dds_access_rx);
+                // Store indexes for tile-based prefetcher
                 self.ortho_union_index = Some(index_for_prefetch);
                 self.geo_index = Some(geo_index);
 
@@ -550,20 +538,6 @@ impl MountManager {
     /// Get consolidated ortho mount info (if mounted).
     pub fn consolidated_mount(&self) -> Option<&ActiveMount> {
         self.consolidated_mount.as_ref()
-    }
-
-    /// Take the DDS access event receiver for tile-based prefetching.
-    ///
-    /// This method takes ownership of the receiver, so it can only be called once.
-    /// The receiver is created when mounting consolidated ortho and is used by
-    /// the tile-based prefetcher to receive DDS access events from FUSE.
-    ///
-    /// # Returns
-    ///
-    /// `Some(receiver)` if consolidated ortho is mounted and receiver hasn't been taken,
-    /// `None` otherwise.
-    pub fn take_dds_access_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<DdsAccessEvent>> {
-        self.dds_access_rx.take()
     }
 
     /// Take the Scene Tracker event receiver for empirical scenery tracking.
@@ -669,7 +643,6 @@ impl MountManager {
         self.consolidated_service = None;
 
         // Clear tile-based prefetch resources
-        self.dds_access_rx = None;
         self.ortho_union_index = None;
         self.geo_index = None;
 
@@ -903,7 +876,6 @@ impl Drop for MountManager {
 pub struct ServiceBuilder {
     service_config: ServiceConfig,
     provider_config: crate::provider::ProviderConfig,
-    logger: Arc<dyn crate::log::Logger>,
     /// Shared disk I/O limiter across all service instances.
     /// Note: Currently unused as DiskCacheAdapter handles I/O internally.
     /// Kept for potential future use with shared I/O limiting.
@@ -929,14 +901,8 @@ impl ServiceBuilder {
     pub fn new(
         service_config: ServiceConfig,
         provider_config: crate::provider::ProviderConfig,
-        logger: Arc<dyn crate::log::Logger>,
     ) -> Self {
-        Self::with_disk_io_profile(
-            service_config,
-            provider_config,
-            logger,
-            DiskIoProfile::default(),
-        )
+        Self::with_disk_io_profile(service_config, provider_config, DiskIoProfile::default())
     }
 
     /// Create a new service builder with a specific disk I/O profile.
@@ -947,7 +913,6 @@ impl ServiceBuilder {
     pub fn with_disk_io_profile(
         service_config: ServiceConfig,
         provider_config: crate::provider::ProviderConfig,
-        logger: Arc<dyn crate::log::Logger>,
         disk_io_profile: DiskIoProfile,
     ) -> Self {
         // Resolve Auto profile based on cache directory (or current dir if not set)
@@ -974,7 +939,6 @@ impl ServiceBuilder {
         Self {
             service_config,
             provider_config,
-            logger,
             disk_io_limiter,
             tile_request_callback: None,
         }
@@ -1003,12 +967,9 @@ impl ServiceBuilder {
     ///
     /// Returns an error if any component fails to initialize.
     pub async fn build_service_async(&self) -> Result<XEarthLayerService, ServiceError> {
-        let mut service = XEarthLayerService::start(
-            self.service_config.clone(),
-            self.provider_config.clone(),
-            self.logger.clone(),
-        )
-        .await?;
+        let mut service =
+            XEarthLayerService::start(self.service_config.clone(), self.provider_config.clone())
+                .await?;
 
         // Wire tile request callback for FUSE-based position inference
         if let Some(ref callback) = self.tile_request_callback {

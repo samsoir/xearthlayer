@@ -106,6 +106,37 @@ impl MetricsClient {
         self.send(MetricEvent::ChunkDiskCacheHit { bytes });
     }
 
+    /// Records one FUSE `read()` call.
+    ///
+    /// `returned` is the number of bytes handed back to the kernel;
+    /// `materialised` is the number the handler had to obtain to produce
+    /// them. See [`MetricEvent::FuseRead`].
+    #[inline]
+    pub fn fuse_read(&self, returned: u64, materialised: u64, virtual_dds: bool) {
+        self.send(MetricEvent::FuseRead {
+            returned,
+            materialised,
+            virtual_dds,
+        });
+    }
+
+    /// Reports the current virtual DDS handle gauge.
+    #[inline]
+    pub fn fuse_handles(
+        &self,
+        open: u64,
+        pinned_bytes: u64,
+        peak_open: u64,
+        peak_pinned_bytes: u64,
+    ) {
+        self.send(MetricEvent::FuseHandlesUpdate {
+            open,
+            pinned_bytes,
+            peak_open,
+            peak_pinned_bytes,
+        });
+    }
+
     /// Records a chunk disk cache miss.
     #[inline]
     pub fn chunk_disk_cache_miss(&self) {
