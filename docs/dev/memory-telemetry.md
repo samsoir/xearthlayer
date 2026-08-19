@@ -76,7 +76,7 @@ mebibyte", not necessarily "nothing".
 | `fuse_file_alloc_mb` | `state.fuse_file_alloc_bytes` | Bytes the handler read from disk to produce them. **Should track `fuse_file_read_mb` almost exactly**; a growing gap means the handler is moving more than it delivers. Before #233 the handler read the whole file per call, so this ran up to 238x ahead on the largest ortho DSF. |
 | `fuse_dds_reads` | `state.fuse_dds_reads` | FUSE `read()` calls answered from a **generated DDS tile**. Because virtual DDS files are opened `FOPEN_DIRECT_IO` (#65) the kernel serves nothing from cache, so this is a complete census of X-Plane's texture reads, not a sample — which makes it the tiles-*served* denominator #227 otherwise lacks. |
 | `fuse_dds_read_mb` | `state.fuse_dds_read_bytes` | Bytes those calls returned to the kernel. |
-| `fuse_dds_alloc_mb` | `state.fuse_dds_alloc_bytes` | Bytes of whole tiles materialised to produce them. **Expected to run 12-23x ahead of `fuse_dds_read_mb` until #234 lands**: `request_dds_impl` returns an owned `Vec<u8>` of the entire tile per call, so an 11.17 MB buffer is produced 12-23 times per texture served, even on a memory-cache hit. |
+| `fuse_dds_alloc_mb` | `state.fuse_dds_alloc_bytes` | Bytes of whole tiles materialised to produce them. Since #234 the tile is charged to the read that produced it and nothing to the reads that slice it, so this should now track `fuse_dds_read_mb` closely. It ran 12-23x ahead before #234, when every ranged call re-entered the executor and cloned the whole tile. |
 
 ### Reading the two amplification ratios
 
@@ -87,6 +87,13 @@ candidate A of #227, and on the same side of glibc's 32 MB adaptive mmap
 threshold. Both ratios are workload-independent: they depend on file size and
 the kernel's read chunk, not on flight length or throughput, so a single sample
 line is enough to read them.
+
+Since #234 a virtual DDS tile is produced once per *open* rather than once per
+ranged read, so `fuse_dds_reads` still counts every read call while
+`fuse_dds_alloc_mb` advances only on the read that produced a tile. Dividing
+`fuse_dds_alloc_mb` by 11.17 MB therefore gives the number of textures X-Plane
+actually opened -- the tiles-*served* figure #227 needs, and a different number
+from `fuse_dds_reads`.
 
 ### Estimating `chunk_index_entries` memory footprint
 

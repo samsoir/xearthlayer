@@ -247,9 +247,9 @@ The regex pattern for recognition:
 
 | Operation | Behavior |
 |-----------|----------|
-| `open` | Virtual DDS inodes: `FOPEN_DIRECT_IO`; Real passthrough files: default flags |
-| `read` | For DDS: serve from cache/generated; For others: read from source |
-| `release` | Clean up handles |
+| `open` | Virtual DDS inodes: `FOPEN_DIRECT_IO` plus a file handle; Real passthrough files: default flags, no handle |
+| `read` | For DDS: slice the handle's tile, producing it on first read; For others: seek and read the requested range |
+| `release` | Drop the handle's tile |
 
 ### Direct I/O for Virtual DDS Files
 
@@ -259,6 +259,32 @@ The regex pattern for recognition:
 - **No stale data** -- page cache cannot serve outdated DDS data after provider changes or cache clears
 - **Reduced kernel memory** -- no page cache duplication of data already in the moka memory cache
 - Real passthrough files use default kernel caching (unchanged)
+
+### Ranged Reads and Handle Reuse (#233, #234)
+
+A FUSE `read()` is always a *ranged* request. Linux caps every one at
+`max_pages * PAGE_SIZE` -- 1 MiB -- regardless of what the application asked
+for, so one X-Plane whole-file read arrives as many calls: 12-23 for an
+11.17 MB DDS, up to 238 for the largest ortho DSF. Direct I/O does not change
+this; it only stops the kernel answering any of them from cache.
+
+Both read paths are built around that:
+
+- **Passthrough files** seek to the offset and read only the requested window.
+  Reading the whole file to serve one window moved it once per call (#233).
+- **Virtual DDS files** get a handle at `open()`. The first read produces the
+  tile, later reads slice it, and `release()` drops it. Each read used to be a
+  separate executor round trip that cloned the whole tile twice (#234).
+
+`open()` deliberately does **not** produce the tile: generation can take up to
+the configured timeout, and X-Plane may open a file it never reads. Handles pin
+memory, so past `MAX_PINNED_TILE_BYTES` `open()` stops handing out memoising
+handles and reads fall back to resolving per call -- a throughput bound, never a
+correctness one. `open_dds_handles()` and `pinned_tile_bytes()` report the live
+figures.
+
+Because a tile is now produced once per open, `FuseAccessEvent` fires once per
+texture rather than once per ranged read.
 
 ### Synthesized DDS Attributes
 
