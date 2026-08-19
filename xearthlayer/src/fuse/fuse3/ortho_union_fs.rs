@@ -45,7 +45,7 @@ use crate::fuse::coalesce::RequestCoalescer;
 use crate::fuse::{get_default_placeholder, parse_dds_filename};
 use crate::geo_index::GeoIndex;
 use crate::ortho_union::OrthoUnionIndex;
-use crate::prefetch::{DdsAccessEvent, DsfTileCoord, PrefetchStateObserver, TileRequestCallback};
+use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use crate::scene_tracker::{DdsTileCoord, FuseAccessEvent};
 use bytes::Bytes;
 use fuse3::raw::prelude::*;
@@ -73,7 +73,7 @@ use tracing::{debug, trace, Instrument};
 ///
 /// When set in `ReplyOpen::flags`, the kernel sends every `read()` through
 /// the FUSE handler instead of serving from its page cache. Used for virtual
-/// DDS files so that `FuseLoadMonitor`, `SceneTracker`, and `DdsAccessEvent`
+/// DDS files so that `FuseLoadMonitor` and `SceneTracker`
 /// see every X-Plane read.
 const FOPEN_DIRECT_IO: u32 = 1;
 
@@ -127,21 +127,14 @@ pub struct Fuse3OrthoUnionFS {
     tile_request_callback: Option<TileRequestCallback>,
     /// Request coalescer for deduplicating concurrent requests
     request_coalescer: Arc<RequestCoalescer>,
-    /// Optional channel for notifying prefetcher of DDS accesses.
-    ///
-    /// When set, the filesystem sends a [`DdsAccessEvent`] for each DDS
-    /// texture request, enabling the tile-based prefetcher to track
-    /// which DSF tiles X-Plane is loading.
-    dds_access_tx: Option<mpsc::UnboundedSender<DdsAccessEvent>>,
     /// Optional channel for notifying Scene Tracker of DDS accesses.
     ///
     /// When set, the filesystem sends a [`FuseAccessEvent`] for each DDS
     /// texture request, enabling the Scene Tracker to build an empirical
     /// model of what X-Plane has requested.
     ///
-    /// Unlike `dds_access_tx` which sends derived DSF regions, this channel
-    /// sends raw DDS tile coordinates (row, col, zoom) for Scene Tracker
-    /// to store as empirical data.
+    /// Sends raw DDS tile coordinates (row, col, zoom) for Scene Tracker to
+    /// store as empirical data.
     scene_tracker_tx: Option<mpsc::UnboundedSender<FuseAccessEvent>>,
     /// Optional metrics client for reporting FUSE-level metrics.
     ///
@@ -199,7 +192,6 @@ impl Fuse3OrthoUnionFS {
             disk_io_limiter,
             tile_request_callback: None,
             request_coalescer,
-            dds_access_tx: None,
             scene_tracker_tx: None,
             metrics_client: None,
             fuse_max_background: None,
@@ -231,7 +223,6 @@ impl Fuse3OrthoUnionFS {
             disk_io_limiter,
             tile_request_callback: None,
             request_coalescer,
-            dds_access_tx: None,
             scene_tracker_tx: None,
             metrics_client: None,
             fuse_max_background: None,
@@ -254,28 +245,6 @@ impl Fuse3OrthoUnionFS {
     /// the prefetch system to infer aircraft position from FUSE requests.
     pub fn with_tile_request_callback(mut self, callback: TileRequestCallback) -> Self {
         self.tile_request_callback = Some(callback);
-        self
-    }
-
-    /// Set the channel for DDS access events.
-    ///
-    /// When set, the filesystem sends a [`DdsAccessEvent`] for each DDS
-    /// texture accessed. This enables the tile-based prefetcher to track
-    /// which DSF tiles X-Plane is actively loading.
-    ///
-    /// The channel is fire-and-forget: sending is non-blocking and failures
-    /// are silently ignored to avoid impacting FUSE performance.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let (tx, rx) = mpsc::unbounded_channel();
-    /// let fs = Fuse3OrthoUnionFS::new(index, client, size)
-    ///     .with_dds_access_channel(tx);
-    /// // rx is passed to AdaptivePrefetchCoordinator for DSF tile tracking
-    /// ```
-    pub fn with_dds_access_channel(mut self, tx: mpsc::UnboundedSender<DdsAccessEvent>) -> Self {
-        self.dds_access_tx = Some(tx);
         self
     }
 
@@ -735,15 +704,6 @@ impl Filesystem for Fuse3OrthoUnionFS {
                 .get_virtual_dds(ino)
                 .ok_or(Errno::from(libc::ENOENT))?;
 
-            // Send DDS access event to tile-based prefetcher (fire-and-forget)
-            if let Some(ref tx) = self.dds_access_tx {
-                // Convert DDS tile coordinates to DSF tile (1° × 1°)
-                if let Some(dsf_tile) = DsfTileCoord::from_dds_filename(&format!("{}.dds", coords))
-                {
-                    let _ = tx.send(DdsAccessEvent::new(dsf_tile));
-                }
-            }
-
             // Send raw tile coordinates to Scene Tracker (fire-and-forget)
             // Scene Tracker stores empirical data; derives regions via calculation
             if let Some(ref tx) = self.scene_tracker_tx {
@@ -1021,7 +981,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         if InodeManager::is_virtual_inode(inode) {
             // Virtual DDS files: bypass kernel page cache so every read()
             // goes through our FUSE handler. This ensures FuseLoadMonitor,
-            // SceneTracker, and DdsAccessEvent see all X-Plane reads.
+            // and SceneTracker see all X-Plane reads.
             Ok(ReplyOpen {
                 fh: 0,
                 flags: FOPEN_DIRECT_IO,

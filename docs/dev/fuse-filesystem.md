@@ -255,7 +255,7 @@ The regex pattern for recognition:
 
 `Fuse3OrthoUnionFS` implements `open()` to set `FOPEN_DIRECT_IO` on virtual DDS inodes. This bypasses the kernel page cache for generated textures:
 
-- **Full observability** -- every X-Plane DDS read goes through the FUSE handler, visible to `FuseLoadMonitor`, `SceneTracker`, and `DdsAccessEvent`
+- **Full observability** -- every X-Plane DDS read goes through the FUSE handler, visible to `FuseLoadMonitor` and `SceneTracker`
 - **No stale data** -- page cache cannot serve outdated DDS data after provider changes or cache clears
 - **Reduced kernel memory** -- no page cache duplication of data already in the moka memory cache
 - Real passthrough files use default kernel caching (unchanged)
