@@ -239,6 +239,13 @@ pub enum MetricEvent {
         prefetched: usize,
         /// Regions with no ortho scenery.
         no_coverage: usize,
+        /// Regions currently deferred for making no progress (#226).
+        ///
+        /// Deliberately its own bucket rather than folded into
+        /// `no_coverage`: `regions_nocoverage` non-zero only over water is an
+        /// acceptance criterion, and a deferred land region counted there
+        /// would be exactly the false alarm #226 exists to remove.
+        deferred: usize,
     },
 
     /// FUSE generated a tile in a region prefetch claimed was handled.
@@ -250,6 +257,19 @@ pub enum MetricEvent {
 
     /// A region's state was cleared in response to observed divergence.
     PrefetchRegionDemoted,
+
+    /// A region was deferred after making no progress since the last evaluation.
+    PrefetchRegionDeferred,
+
+    /// A region's deferral was cleared because X-Plane demanded a tile there.
+    ///
+    /// The post-fix analogue of [`Self::PrefetchRegionDemoted`]: prefetch gave
+    /// up on the region (deferred it), then the sim asked for tiles inside it
+    /// anyway. Counted, not logged above `debug!` — it fires once per
+    /// FUSE-generated tile in the region, which is too frequent for the
+    /// default log level — so this counter is the only default-level signal
+    /// for whether the 20/30/40/60s deferral ladder is well-tuned (#226).
+    PrefetchDeferralCleared,
 
     /// Regions promoted from `InProgress` to `Prefetched` via the normal
     /// completion path (all tiles in the region confirmed present).
@@ -306,6 +326,8 @@ impl MetricEvent {
             Self::PrefetchRegionState { .. } => "prefetch_region_state",
             Self::PrefetchStateDiverged => "prefetch_state_diverged",
             Self::PrefetchRegionDemoted => "prefetch_region_demoted",
+            Self::PrefetchRegionDeferred => "prefetch_region_deferred",
+            Self::PrefetchDeferralCleared => "prefetch_deferral_cleared",
             Self::PrefetchRegionsPromotedNormal { .. } => "prefetch_regions_promoted_normal",
             Self::PrefetchRegionPromotedRescue => "prefetch_region_promoted_rescue",
         }

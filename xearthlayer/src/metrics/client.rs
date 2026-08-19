@@ -370,11 +370,18 @@ impl MetricsClient {
 
     /// Reports the current region-state distribution (gauge).
     #[inline]
-    pub fn prefetch_region_state(&self, in_progress: usize, prefetched: usize, no_coverage: usize) {
+    pub fn prefetch_region_state(
+        &self,
+        in_progress: usize,
+        prefetched: usize,
+        no_coverage: usize,
+        deferred: usize,
+    ) {
         self.send(MetricEvent::PrefetchRegionState {
             in_progress,
             prefetched,
             no_coverage,
+            deferred,
         });
     }
 
@@ -400,6 +407,18 @@ impl MetricsClient {
     #[inline]
     pub fn prefetch_region_promoted_rescue(&self) {
         self.send(MetricEvent::PrefetchRegionPromotedRescue);
+    }
+
+    /// Record that a region was deferred for making no progress.
+    #[inline]
+    pub fn prefetch_region_deferred(&self) {
+        self.send(MetricEvent::PrefetchRegionDeferred);
+    }
+
+    /// Record that a region's deferral was cleared by on-demand generation.
+    #[inline]
+    pub fn prefetch_deferral_cleared(&self) {
+        self.send(MetricEvent::PrefetchDeferralCleared);
     }
 }
 

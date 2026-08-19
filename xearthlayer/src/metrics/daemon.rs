@@ -333,6 +333,7 @@ impl MetricsDaemon {
                 in_progress,
                 prefetched,
                 no_coverage,
+                deferred,
             } => {
                 // Gauge: assigns, does not increment. The coordinator reports
                 // the full distribution each maintenance cycle, so the latest
@@ -340,12 +341,19 @@ impl MetricsDaemon {
                 self.state.prefetch_regions_in_progress = in_progress;
                 self.state.prefetch_regions_prefetched = prefetched;
                 self.state.prefetch_regions_nocoverage = no_coverage;
+                self.state.prefetch_regions_deferred_active = deferred;
             }
             MetricEvent::PrefetchStateDiverged => {
                 self.state.prefetch_state_diverged += 1;
             }
             MetricEvent::PrefetchRegionDemoted => {
                 self.state.prefetch_regions_demoted += 1;
+            }
+            MetricEvent::PrefetchRegionDeferred => {
+                self.state.prefetch_regions_deferred += 1;
+            }
+            MetricEvent::PrefetchDeferralCleared => {
+                self.state.prefetch_deferrals_cleared += 1;
             }
             MetricEvent::PrefetchRegionsPromotedNormal { count } => {
                 self.state.prefetch_promotions_normal += count as u64;
@@ -426,10 +434,36 @@ impl MetricsDaemon {
             regions_in_progress = state.prefetch_regions_in_progress,
             regions_prefetched = state.prefetch_regions_prefetched,
             regions_nocoverage = state.prefetch_regions_nocoverage,
+            // #226: how many regions are deferred RIGHT NOW (gauge). Distinct
+            // from `regions_deferred` below, which is a cumulative count of
+            // every deferral since process start. Without this, deferred
+            // regions would be invisible in the sample line — or, worse,
+            // counted as `regions_nocoverage` and read as missing scenery.
+            regions_deferred_active = state.prefetch_regions_deferred_active,
             promotions_normal = state.prefetch_promotions_normal,
             promotions_rescue = state.prefetch_promotions_rescue,
             state_diverged = state.prefetch_state_diverged,
             regions_demoted = state.prefetch_regions_demoted,
+            // #226: how often a region was skipped for making no progress.
+            // Cumulative since process start — `AggregatedState::reset()` has
+            // no production caller — so it only ever climbs. It does NOT climb
+            // every maintenance cycle: a stuck region is moved to `Deferred`
+            // immediately, and `is_stale()` only re-evaluates `InProgress`
+            // regions, so the region sits off-cycle until its deferral expires
+            // (the 20/30/40/60s ladder), gets re-planned back to `InProgress`,
+            // and ages another `stale_region_timeout` (default 120s) before it
+            // can increment again. Realistic floor is ~140s per region per
+            // increment. Read the rate of change between samples, not the
+            // absolute value: a flat value across successive lines is the
+            // healthy signal. Non-zero under a cold-cache backlog is expected.
+            regions_deferred = state.prefetch_regions_deferred,
+            // #226: how often the sim demanded a tile inside a region that
+            // was still Deferred, clearing the deferral early. The post-fix
+            // analogue of `regions_demoted` — measures whether the
+            // 20/30/40/60s ladder is well-tuned, not whether prefetch's state
+            // was wrong. Cumulative since process start, same as
+            // `regions_deferred` above.
+            deferrals_cleared = state.prefetch_deferrals_cleared,
             // Criterion 5's user-visible outcome (the others above are
             // mechanism): on-demand FUSE generations should fall during
             // cruise. Per-tile FUSE logging is debug-only (#209), so this
@@ -1140,7 +1174,7 @@ mod tests {
         let (mut daemon, tx) = create_daemon();
         let client = MetricsClient::new(tx);
 
-        client.prefetch_region_state(3, 7, 2);
+        client.prefetch_region_state(3, 7, 2, 5);
         client.prefetch_state_diverged();
         client.prefetch_state_diverged();
         client.prefetch_region_demoted();
@@ -1166,6 +1200,11 @@ mod tests {
         assert_eq!(
             sample.get("regions_nocoverage").map(String::as_str),
             Some("2")
+        );
+        assert_eq!(
+            sample.get("regions_deferred_active").map(String::as_str),
+            Some("5"),
+            "the deferred gauge must be its own field, distinct from regions_nocoverage"
         );
         assert_eq!(sample.get("state_diverged").map(String::as_str), Some("2"));
         assert_eq!(sample.get("regions_demoted").map(String::as_str), Some("1"));
@@ -1200,6 +1239,124 @@ mod tests {
     }
 
     #[test]
+    fn test_prefetch_sample_reports_regions_deferred() {
+        // regions_deferred is a COUNTER, unlike the region-state gauges
+        // above: it accumulates across the daemon's own event stream rather
+        // than being assigned wholesale from GeoIndex each cycle, so it
+        // belongs in `reset()` while the gauges do not.
+        //
+        // `reset()` has no production caller today, so in a running process
+        // the counter is cumulative since start. This asserts the `reset()`
+        // contract for the field, not a per-interval window in the log.
+        let (mut daemon, _tx) = create_daemon();
+        daemon.state.prefetch_regions_deferred = 7;
+        daemon.state.prefetch_regions_nocoverage = 3;
+        daemon.state.prefetch_regions_deferred_active = 4;
+        daemon.state.prefetch_deferrals_cleared = 5;
+
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        let sample =
+            find_prefetch_sample(&events).expect("log_prefetch_sample must emit a sample line");
+        assert_eq!(
+            sample.get("regions_deferred").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            sample.get("deferrals_cleared").map(String::as_str),
+            Some("5"),
+            "deferrals_cleared must be its own field, distinct from regions_deferred"
+        );
+        // Same subject, different semantics — the two must never collapse
+        // into one field. Distinct seeded values make a mix-up visible.
+        assert_eq!(
+            sample.get("regions_deferred_active").map(String::as_str),
+            Some("4"),
+            "the gauge is a separate field from the counter"
+        );
+
+        daemon.state.reset();
+        assert_eq!(
+            daemon.state.prefetch_regions_deferred, 0,
+            "counter must reset"
+        );
+        assert_eq!(
+            daemon.state.prefetch_deferrals_cleared, 0,
+            "counter must reset"
+        );
+        assert_eq!(
+            daemon.state.prefetch_regions_nocoverage, 3,
+            "gauge must NOT reset"
+        );
+        assert_eq!(
+            daemon.state.prefetch_regions_deferred_active, 4,
+            "the deferred gauge is externally derived from GeoIndex, so it \
+             must NOT reset either"
+        );
+    }
+
+    #[test]
+    fn test_prefetch_region_deferred_event_increments_the_counter_only() {
+        // Closes the daemon end of the `regions_deferred` chain (#226 review
+        // I-3). The sample-line test seeds the field directly, so it cannot
+        // tell whether `process_event` routes this variant anywhere at all —
+        // and the most plausible mis-wiring, incrementing the *gauge*
+        // `prefetch_regions_deferred_active`, would leave the counter
+        // permanently zero while the sample line still looked populated.
+        let (mut daemon, _tx) = create_daemon();
+        daemon.state.prefetch_regions_deferred_active = 4;
+
+        daemon.process_event(MetricEvent::PrefetchRegionDeferred);
+        daemon.process_event(MetricEvent::PrefetchRegionDeferred);
+
+        assert_eq!(
+            daemon.state.prefetch_regions_deferred, 2,
+            "each event must increment the counter"
+        );
+        assert_eq!(
+            daemon.state.prefetch_regions_deferred_active, 4,
+            "the event must leave the gauge alone — it is assigned wholesale \
+             from the GeoIndex by PrefetchRegionState"
+        );
+        // The neighbouring prefetch counters share a shape; a copy-paste in
+        // the match arm would land in one of them.
+        assert_eq!(daemon.state.prefetch_regions_demoted, 0);
+        assert_eq!(daemon.state.prefetch_state_diverged, 0);
+        assert_eq!(daemon.state.prefetch_promotions_normal, 0);
+        assert_eq!(daemon.state.prefetch_promotions_rescue, 0);
+        assert_eq!(daemon.state.prefetch_deferrals_cleared, 0);
+    }
+
+    #[test]
+    fn test_prefetch_deferral_cleared_event_increments_the_counter_only() {
+        // Closes the daemon end of the `deferrals_cleared` chain (#226,
+        // mirroring PrefetchRegionDeferred above end to end). The most
+        // plausible mis-wiring is routing this into the *gauge*
+        // `prefetch_regions_deferred_active`, which would leave the counter
+        // permanently zero while the gauge looked populated.
+        let (mut daemon, _tx) = create_daemon();
+        daemon.state.prefetch_regions_deferred_active = 4;
+
+        daemon.process_event(MetricEvent::PrefetchDeferralCleared);
+        daemon.process_event(MetricEvent::PrefetchDeferralCleared);
+
+        assert_eq!(
+            daemon.state.prefetch_deferrals_cleared, 2,
+            "each event must increment the counter"
+        );
+        assert_eq!(
+            daemon.state.prefetch_regions_deferred_active, 4,
+            "the event must leave the gauge alone"
+        );
+        // The neighbouring prefetch counters share a shape; a copy-paste in
+        // the match arm would land in one of them.
+        assert_eq!(daemon.state.prefetch_regions_deferred, 0);
+        assert_eq!(daemon.state.prefetch_regions_demoted, 0);
+        assert_eq!(daemon.state.prefetch_state_diverged, 0);
+        assert_eq!(daemon.state.prefetch_promotions_normal, 0);
+        assert_eq!(daemon.state.prefetch_promotions_rescue, 0);
+    }
+
+    #[test]
     fn test_prefetch_region_state_is_a_gauge_not_a_counter() {
         // Regression guard: a second PrefetchRegionState event must replace
         // the previous values, not add to them. If this were mistakenly
@@ -1211,19 +1368,26 @@ mod tests {
             in_progress: 5,
             prefetched: 10,
             no_coverage: 1,
+            deferred: 4,
         });
         assert_eq!(daemon.state.prefetch_regions_in_progress, 5);
         assert_eq!(daemon.state.prefetch_regions_prefetched, 10);
         assert_eq!(daemon.state.prefetch_regions_nocoverage, 1);
+        assert_eq!(daemon.state.prefetch_regions_deferred_active, 4);
 
         daemon.process_event(MetricEvent::PrefetchRegionState {
             in_progress: 2,
             prefetched: 3,
             no_coverage: 0,
+            deferred: 0,
         });
         assert_eq!(daemon.state.prefetch_regions_in_progress, 2);
         assert_eq!(daemon.state.prefetch_regions_prefetched, 3);
         assert_eq!(daemon.state.prefetch_regions_nocoverage, 0);
+        assert_eq!(
+            daemon.state.prefetch_regions_deferred_active, 0,
+            "the deferred gauge must be assigned, not accumulated"
+        );
     }
 
     #[test]

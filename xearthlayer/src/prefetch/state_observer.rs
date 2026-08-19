@@ -77,6 +77,33 @@ impl PrefetchStateObserver {
         let Some(state) = self.geo_index.get::<PrefetchedRegion>(&region) else {
             return;
         };
+
+        // Demand beats backoff. A deferred region was never claimed ready, so
+        // this is not a divergence — but the sim asking for tiles here now is
+        // reason enough to stop skipping it. Note this does not license a
+        // longer ladder: by the time FUSE asks, the miss already happened.
+        // This is a repair, not a prefetch.
+        //
+        // This clears only the region's GeoIndex entry — it deliberately does
+        // NOT reset the coordinator's `region_retry` strike count, which this
+        // observer cannot even reach (it holds only an `Arc<GeoIndex>`). That
+        // is intentional, not an oversight: a region cleared here by demand is
+        // the same ongoing episode as before, not a fresh one, so the
+        // 20/30/40/60s deferral ladder must keep escalating across repeated
+        // demand-driven clears rather than flattening back to 20s each time.
+        if state.is_deferred() {
+            self.geo_index.remove::<PrefetchedRegion>(&region);
+            if let Some(ref metrics) = self.metrics_client {
+                metrics.prefetch_deferral_cleared();
+            }
+            tracing::debug!(
+                lat = region.lat,
+                lon = region.lon,
+                "Deferral cleared by on-demand generation"
+            );
+            return;
+        }
+
         // InProgress regions are expected to miss — prefetch has not finished.
         if !(state.is_prefetched() || state.is_no_coverage()) {
             return;
@@ -313,6 +340,71 @@ mod tests {
         assert_eq!(
             demoted_count, 2,
             "a zero window permits every demotion to emit PrefetchRegionDemoted"
+        );
+    }
+
+    #[test]
+    fn test_fuse_miss_clears_deferral_without_counting_divergence() {
+        let geo_index = Arc::new(GeoIndex::new());
+        let tile = tile_in_33_119();
+        let region = region_of(tile);
+        geo_index.insert::<PrefetchedRegion>(
+            region,
+            PrefetchedRegion::deferred(Instant::now() + Duration::from_secs(60)),
+        );
+
+        let (metrics, mut rx) = test_metrics_client();
+        let observer =
+            PrefetchStateObserver::new(Arc::clone(&geo_index)).with_metrics_client(metrics);
+
+        observer.observe(tile, false);
+
+        assert!(
+            geo_index.get::<PrefetchedRegion>(&region).is_none(),
+            "X-Plane demanding tiles here is the strongest evidence the region matters now"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(MetricEvent::PrefetchDeferralCleared)),
+            "a deferred region was never claimed ready, so this is not a divergence — \
+             it must emit PrefetchDeferralCleared instead, not the divergence events"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one event for a cleared deferral"
+        );
+    }
+
+    #[test]
+    fn test_deferral_cleared_emits_no_divergence_events() {
+        // Companion to the test above, read from the other direction: a
+        // cleared deferral must never ALSO look like a divergence. If the
+        // is_deferred() branch's early `return` were ever removed, this
+        // would start seeing PrefetchStateDiverged / PrefetchRegionDemoted
+        // fall through from the code below it.
+        let geo_index = Arc::new(GeoIndex::new());
+        let tile = tile_in_33_119();
+        let region = region_of(tile);
+        geo_index.insert::<PrefetchedRegion>(
+            region,
+            PrefetchedRegion::deferred(Instant::now() + Duration::from_secs(60)),
+        );
+
+        let (metrics, mut rx) = test_metrics_client();
+        let observer =
+            PrefetchStateObserver::new(Arc::clone(&geo_index)).with_metrics_client(metrics);
+
+        observer.observe(tile, false);
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "clearing a deferral must emit exactly one event, \
+             never also the divergence/demotion events"
+        );
+        assert!(
+            matches!(events[0], MetricEvent::PrefetchDeferralCleared),
+            "the one event emitted must be PrefetchDeferralCleared"
         );
     }
 }

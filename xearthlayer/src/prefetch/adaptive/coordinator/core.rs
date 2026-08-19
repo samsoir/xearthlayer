@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
@@ -13,14 +14,47 @@ use crate::coord::TileCoord;
 use crate::executor::{DaemonMemoryCache, DdsClient, DdsDiskCacheChecker};
 use crate::metrics::MetricsClient;
 
-/// Maximum demotion attempts before marking a region as NoCoverage.
-const MAX_REGION_ATTEMPTS: u8 = 3;
-use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage, PrefetchedRegion};
+/// Deferral applied after each consecutive no-progress evaluation.
+///
+/// The last entry repeats for every further strike. The 60s ceiling is a hard
+/// requirement, not a tuning knob: field evidence (#226) had the sim demanding
+/// tiles from a region 2m43s after prefetch gave up on it, so the window in
+/// which a region is skipped with nothing in flight must stay well inside that.
+const DEFERRAL_LADDER: [Duration; 4] = [
+    Duration::from_secs(20),
+    Duration::from_secs(30),
+    Duration::from_secs(40),
+    Duration::from_secs(60),
+];
+
+/// Deferral for the Nth consecutive no-progress evaluation (`strikes` is 1-based).
+fn deferral_for(strikes: u8) -> Duration {
+    let idx = (strikes.saturating_sub(1) as usize).min(DEFERRAL_LADDER.len() - 1);
+    DEFERRAL_LADDER[idx]
+}
+
+/// Per-region retry bookkeeping for regions that are not yet complete.
+///
+/// `last_covered` is what makes a strike mean "made no progress" rather than
+/// "took too long" — under a large prefetch backlog the latter says nothing
+/// about whether scenery exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct RegionRetryState {
+    /// Consecutive evaluations that observed no new coverage.
+    strikes: u8,
+    /// Coverage seen at the *previous* evaluation — the latest observation,
+    /// deliberately not a high-water mark. Coverage can regress when the DDS
+    /// disk cache's GC daemon evicts tiles; a peak would blind progress
+    /// detection until coverage climbed past it again.
+    last_covered: usize,
+}
+
+use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage, PrefetchedRegion, RegionState};
 use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::state::{AircraftState, SharedPrefetchStatus};
 use crate::prefetch::SceneryIndex;
 
-use super::super::boundary_strategy::{BoundaryStrategy, RegionDiskState};
+use super::super::boundary_strategy::{BoundaryStrategy, CoverageDetail, RegionDiskState};
 use super::super::calibration::{PerformanceCalibration, StrategyMode};
 use super::super::config::{AdaptivePrefetchConfig, PrefetchMode};
 use super::super::phase_detector::{FlightPhase, PhaseDetector};
@@ -164,12 +198,15 @@ pub struct AdaptivePrefetchCoordinator {
     /// before deciding to promote (tiles exist) or demote (tiles missing) the region.
     dds_disk_checker: Option<Arc<dyn DdsDiskCacheChecker>>,
 
-    /// Tracks demotion attempts per region to prevent infinite retry loops.
+    /// Per-region retry bookkeeping for stale regions that are not yet complete.
     ///
-    /// Incremented each time an InProgress region is demoted (tiles not on disk after
-    /// stale timeout). After [`MAX_REGION_ATTEMPTS`] demotions, the region is marked
-    /// NoCoverage and permanently excluded for this session.
-    region_attempts: std::collections::HashMap<DsfRegion, u8>,
+    /// A strike is recorded when a stale `Incomplete` region has gained no new
+    /// tile coverage since the previous look; observing progress clears it.
+    /// Strikes gate an escalating deferral ([`deferral_for`]) — they never
+    /// retire a region. Retirement to `NoCoverage` is reachable only from
+    /// [`RegionDiskState::NoTiles`], which is definitive on the first look
+    /// (#226).
+    region_retry: std::collections::HashMap<DsfRegion, RegionRetryState>,
 
     /// Mapping of planned tiles to their source DSF region for the current
     /// in-flight plan. Populated by the cruise branch of [`update()`] and
@@ -238,7 +275,7 @@ impl AdaptivePrefetchCoordinator {
             scenery_index: None,
             pending_tiles: Vec::new(),
             dds_disk_checker: None,
-            region_attempts: std::collections::HashMap::new(),
+            region_retry: std::collections::HashMap::new(),
             current_plan_regions: std::collections::HashMap::new(),
             metrics_client: None,
         }
@@ -717,11 +754,13 @@ impl AdaptivePrefetchCoordinator {
     /// the DDS disk — X-Plane is served them by the patch through FUSE
     /// passthrough. Marking one `InProgress` would be a claim prefetch is
     /// working on it, which `promote_completed_regions` could never confirm;
-    /// the region would go stale and be retired to `NoCoverage` with a
-    /// misleading "failed attempts" warning in the flight log. Patch
-    /// ownership is a whole-region property in the `GeoIndex`, so this
-    /// exclusion is exact rather than a heuristic. Such regions keep being
-    /// re-planned and filtered each cycle, as they were before this change.
+    /// the region would go stale, and since #226 an `Incomplete` region is
+    /// never retired, it would cycle in `Deferred` forever — striking and
+    /// re-deferring on an escalating ladder against tiles that were never
+    /// going to arrive. Patch ownership is a whole-region property in the
+    /// `GeoIndex`, so this exclusion is exact rather than a heuristic. Such
+    /// regions keep being re-planned and filtered each cycle, as they were
+    /// before this change.
     ///
     /// Marked regions are dropped from `current_plan_regions` so
     /// [`execute()`] only reasons about regions that had tiles to submit.
@@ -1043,7 +1082,7 @@ impl AdaptivePrefetchCoordinator {
             // is later demoted by the FUSE observer can be retired to NoCoverage
             // after a single fresh failure.
             for region in &promoted {
-                self.region_attempts.remove(region);
+                self.region_retry.remove(region);
             }
             if let Some(ref metrics) = self.metrics_client {
                 metrics.prefetch_regions_promoted_normal(promoted.len());
@@ -1062,7 +1101,9 @@ impl AdaptivePrefetchCoordinator {
         // ~1170 after landing on acceptance flight 1 (#176). Retention and
         // eviction must share a phase, or the pair is not a pair.
         if matches!(self.phase_detector.current_phase(), FlightPhase::Cruise) {
-            BoundaryStrategy::evict_non_retained(&geo_index);
+            for region in BoundaryStrategy::evict_non_retained(&geo_index) {
+                self.region_retry.remove(&region);
+            }
         }
 
         // Per-maintenance-cycle instrumentation (#172 Part 4): report
@@ -1071,37 +1112,62 @@ impl AdaptivePrefetchCoordinator {
         // `prefetched` remains low, the fast-path is stalling and the
         // rescue path is carrying the work — the same anti-pattern that
         // produced the 61:4 rescue ratio in the LOWW flight log.
-        let (in_progress, prefetched, no_coverage) = geo_index
-            .iter::<PrefetchedRegion>()
-            .into_iter()
-            .fold((0usize, 0usize, 0usize), |(ip, p, nc), (_, r)| {
-                if r.is_in_progress() {
-                    (ip + 1, p, nc)
-                } else if r.is_prefetched() {
-                    (ip, p + 1, nc)
-                } else {
-                    (ip, p, nc + 1)
-                }
-            });
+        //
+        // `Deferred` gets its own bucket (#226). It is a NON-terminal state —
+        // the region is expected back once `retry_after` expires — so folding
+        // it into `no_coverage` would report land regions as having no
+        // scenery, which is precisely the false alarm this fix removes. It is
+        // also the acceptance criterion's own instrument: `regions_nocoverage`
+        // must be non-zero only over water.
+        //
+        // An exhaustive `match` rather than an if/else-if chain: the chain's
+        // trailing `else` meant "no_coverage", so a new `RegionState` variant
+        // would be reported as ocean with no compiler error. That is not
+        // hypothetical — `Deferred` landed in exactly that catch-all when it
+        // was introduced on this branch, and corrupted the acceptance
+        // instrument until it was caught. The compiler now refuses to build
+        // a fifth variant into `regions_nocoverage` by default.
+        let (in_progress, prefetched, no_coverage, deferred) =
+            geo_index.iter::<PrefetchedRegion>().into_iter().fold(
+                (0usize, 0usize, 0usize, 0usize),
+                |(ip, p, nc, d), (_, r)| match r.state() {
+                    RegionState::InProgress => (ip + 1, p, nc, d),
+                    RegionState::Prefetched => (ip, p + 1, nc, d),
+                    RegionState::NoCoverage => (ip, p, nc + 1, d),
+                    RegionState::Deferred { .. } => (ip, p, nc, d + 1),
+                },
+            );
         tracing::debug!(
             regions_in_progress = in_progress,
             regions_prefetched = prefetched,
             regions_nocoverage = no_coverage,
+            regions_deferred_active = deferred,
             "Region maintenance: state distribution"
         );
 
         if let Some(ref metrics) = self.metrics_client {
-            metrics.prefetch_region_state(in_progress, prefetched, no_coverage);
+            metrics.prefetch_region_state(in_progress, prefetched, no_coverage, deferred);
         }
     }
 
-    /// Evaluate stale InProgress regions and decide: promote, demote, or NoCoverage.
+    /// Evaluate stale InProgress regions against the transition table.
     ///
-    /// For each InProgress region that has exceeded the stale timeout:
-    /// 1. Check if tiles exist on DDS disk cache → promote to Prefetched
-    /// 2. If tiles not on disk, check attempt counter:
-    ///    - Under limit → remove from GeoIndex (allows retry on next cycle)
-    ///    - At limit → mark NoCoverage (permanently excluded this session)
+    /// The outcome is a function of what the authoritative sources say about
+    /// the region ([`RegionDiskState`]), not of how long it has taken:
+    ///
+    /// | Observation  | Outcome                                              |
+    /// |--------------|------------------------------------------------------|
+    /// | `Complete`   | promote to `Prefetched`, clear retry state            |
+    /// | `Incomplete` | advancing → retry now; stuck → strike + `Deferred`    |
+    /// | `NoTiles`    | retire to `NoCoverage`, clear retry state             |
+    /// | `Unknown`    | leave untouched, no strike                            |
+    ///
+    /// `Incomplete` reaches `NoCoverage` by no path. The scenery index
+    /// attributing tiles to a region is positive evidence that scenery exists
+    /// there, and #226 was caused by treating a slow region as if it were an
+    /// empty one: `Incomplete` and `NoTiles` shared a retirement arm, so three
+    /// timing-based strikes permanently retired two Baden-Wurttemberg regions
+    /// that on-demand generation disproved 2m43s later.
     fn evaluate_stale_regions(&mut self, geo_index: &GeoIndex) {
         let stale: Vec<DsfRegion> = geo_index
             .iter::<PrefetchedRegion>()
@@ -1124,6 +1190,11 @@ impl AdaptivePrefetchCoordinator {
                 self.scenery_index.as_ref(),
                 self.dds_disk_checker.as_ref(),
                 self.ortho_union_index.as_ref(),
+                // The rescue path is the one caller that needs exact counts:
+                // `covered` is what separates an advancing region from a stuck
+                // one. It only pays for them because it runs over regions that
+                // have already been stale for `stale_region_timeout`.
+                CoverageDetail::ExactCounts,
             ) {
                 RegionDiskState::Complete => {
                     // Tiles generated successfully — promote based on the
@@ -1132,7 +1203,7 @@ impl AdaptivePrefetchCoordinator {
                     geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
                     // See the fast-path promotion comment in `run_region_maintenance`:
                     // the strike count belongs to the failed episode, not the region.
-                    self.region_attempts.remove(&region);
+                    self.region_retry.remove(&region);
                     if let Some(ref metrics) = self.metrics_client {
                         metrics.prefetch_region_promoted_rescue();
                     }
@@ -1142,61 +1213,107 @@ impl AdaptivePrefetchCoordinator {
                         "Stale InProgress region promoted — tiles found on DDS disk"
                     );
                 }
-                // No tiles indexed: the region can never be confirmed, so
-                // retiring it after repeated attempts is correct — this
-                // preserves pre-#223 behavior.
-                RegionDiskState::Incomplete | RegionDiskState::NoTiles => {
-                    let attempts = self.region_attempts.entry(region).or_insert(0);
-                    *attempts += 1;
 
-                    if *attempts >= MAX_REGION_ATTEMPTS {
-                        // Exhausted retries — mark permanently excluded
-                        geo_index
-                            .insert::<PrefetchedRegion>(region, PrefetchedRegion::no_coverage());
+                // Has indexed tiles but not all of them yet. NEVER retires to
+                // NoCoverage: the index saying "there are tiles here" is
+                // positive evidence of coverage, and #226 was caused by
+                // treating this case as if it were NoTiles.
+                RegionDiskState::Incomplete { coverage } => {
+                    // Unreachable: this call site asks for `ExactCounts`. If a
+                    // future edit changes that, degrade to the `Unknown`
+                    // behaviour — leave the region alone and record no strike —
+                    // rather than inventing a count. A fabricated `0` would
+                    // read as "nothing has arrived" and strike a region that
+                    // may be nearly complete.
+                    let Some((covered, total)) = coverage.counts() else {
                         tracing::warn!(
                             lat = region.lat,
                             lon = region.lon,
-                            attempts = *attempts,
-                            "Region marked NoCoverage after {} failed attempts",
-                            MAX_REGION_ATTEMPTS
+                            "Stale region evaluated without tile counts — skipping"
                         );
-                        // Clear the strike count for the retired episode,
-                        // mirroring both promotion arms above. Without this,
-                        // a region the observer later demotes out of
-                        // NoCoverage (see `state_observer.rs::observe`) would
-                        // re-enter the prefetch cycle still carrying the old
-                        // count, so one single fresh failure would re-hit
-                        // `>= MAX_REGION_ATTEMPTS` and re-retire it instantly
-                        // — zero real retries. Clearing here gives a demoted
-                        // region a fresh set of `MAX_REGION_ATTEMPTS` strikes
-                        // each time it's demoted; the observer's per-region
-                        // demotion rate limit (one per `demotion_interval`)
-                        // is what bounds that loop, not this counter.
-                        self.region_attempts.remove(&region);
-                    } else {
-                        // Remove from GeoIndex to allow retry on next cycle.
-                        //
-                        // Do NOT clear `region_attempts` here. This removal is
-                        // deliberate — it makes the region eligible for
-                        // re-prefetching — and `region_attempts` is the only
-                        // thing that remembers the strike across it. Clearing
-                        // on this branch (by symmetry with the promote branch
-                        // above) would make `MAX_REGION_ATTEMPTS` unreachable:
-                        // every retry would start the count over, and a region
-                        // that never succeeds would retry forever instead of
-                        // eventually being retired to `NoCoverage`.
+                        continue;
+                    };
+                    let entry = self.region_retry.entry(region).or_default();
+
+                    if covered > entry.last_covered {
+                        // Advancing. Not stuck — clear the record and retry now.
+                        entry.strikes = 0;
+                        entry.last_covered = covered;
                         geo_index.remove::<PrefetchedRegion>(&region);
-                        tracing::info!(
+                        tracing::debug!(
                             lat = region.lat,
                             lon = region.lon,
-                            attempt = *attempts,
-                            max = MAX_REGION_ATTEMPTS,
-                            "Stale InProgress region demoted for retry"
+                            covered,
+                            total,
+                            "Stale InProgress region advancing — retrying"
                         );
+                    } else {
+                        // Track the latest observation, not a high-water mark.
+                        // Coverage can regress (the DDS disk cache has a GC
+                        // daemon); leaving `last_covered` at the peak would
+                        // blind progress detection until coverage exceeded it
+                        // again, striking a region that is genuinely advancing.
+                        entry.last_covered = covered;
+                        entry.strikes = entry.strikes.saturating_add(1);
+                        let strikes = entry.strikes;
+                        let deferral = deferral_for(strikes);
+                        geo_index.insert::<PrefetchedRegion>(
+                            region,
+                            PrefetchedRegion::deferred(Instant::now() + deferral),
+                        );
+                        if let Some(ref metrics) = self.metrics_client {
+                            metrics.prefetch_region_deferred();
+                        }
+                        // WARN once, then debug — a permanently holed region
+                        // would otherwise emit this every ~3 minutes forever.
+                        // `covered`/`total` is the diagnostic: "387 of 400"
+                        // means a few tiles are 404ing, "0 of 400" means
+                        // nothing is arriving at all.
+                        if strikes == 1 {
+                            tracing::warn!(
+                                lat = region.lat,
+                                lon = region.lon,
+                                covered,
+                                total,
+                                strikes,
+                                deferral_s = deferral.as_secs(),
+                                "Region making no progress — deferred"
+                            );
+                        } else {
+                            tracing::debug!(
+                                lat = region.lat,
+                                lon = region.lon,
+                                covered,
+                                total,
+                                strikes,
+                                deferral_s = deferral.as_secs(),
+                                "Region still making no progress — deferred"
+                            );
+                        }
                     }
                 }
-                // Unanswerable. Leave the claim standing and do not consume
-                // a retry; the next cycle may have a checker.
+
+                // The only path to NoCoverage. Definitive on the first look:
+                // the scenery index is fully built before the coordinator
+                // receives it, so a second opinion would be identical.
+                //
+                // The retry state is cleared here for the same reason as on
+                // the promotion arms (#223 Finding B): a region the FUSE
+                // observer later demotes out of NoCoverage must re-enter the
+                // cycle with a clean slate, not still carrying the strikes of
+                // the episode that retired it.
+                RegionDiskState::NoTiles => {
+                    geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::no_coverage());
+                    self.region_retry.remove(&region);
+                    tracing::info!(
+                        lat = region.lat,
+                        lon = region.lon,
+                        "Region has no indexed tiles — marked NoCoverage"
+                    );
+                }
+
+                // Unanswerable. Leave the claim standing and do not consume a
+                // strike; the next cycle may have a checker.
                 RegionDiskState::Unknown => continue,
             }
         }
@@ -2117,7 +2234,8 @@ mod tests {
         // Before: `_ => false` counted a failed attempt, and three of these
         // retired the region to NoCoverage permanently. After: Unknown is not
         // evidence of absence, so the region keeps its InProgress claim and no
-        // attempt is recorded.
+        // strike is recorded. Post-#226 this also guards against a refactor
+        // quietly folding Unknown into the Incomplete (strike + defer) arm.
         let index = make_scenery_index_covering(50..=50, 9..=9, 16);
         let geo_index = Arc::new(GeoIndex::new());
         let region = DsfRegion { lat: 50, lon: 9 };
@@ -2129,7 +2247,8 @@ mod tests {
         // deliberately no .with_dds_disk_checker(...)
         coord.config.stale_region_timeout = std::time::Duration::ZERO; // force staleness
 
-        for _ in 0..MAX_REGION_ATTEMPTS + 1 {
+        // Repeat well past the old three-strike retirement limit.
+        for _ in 0..4 {
             coord.evaluate_stale_regions(&geo_index);
         }
 
@@ -2139,8 +2258,219 @@ mod tests {
             "region must remain InProgress; Unknown is not evidence of absence"
         );
         assert!(
-            !coord.region_attempts.contains_key(&region),
-            "an unanswerable check must not consume a retry"
+            !coord.region_retry.contains_key(&region),
+            "an unanswerable observation must not count against the region"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Region retirement transition table (#226)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// #226: a region the scenery index says HAS tiles must never be retired as
+    /// ocean, no matter how long its tiles take. Field evidence: 47N/8E and
+    /// 48N/8E (Baden-Wurttemberg) retired after 3 strikes, then disproved by
+    /// on-demand generation 2m43s later.
+    #[tokio::test]
+    async fn test_incomplete_region_never_becomes_no_coverage() {
+        let index = make_scenery_index(47, 8, 16);
+        let region = DsfRegion::new(47, 8);
+        assert!(
+            !index.tiles_in_region(region).is_empty(),
+            "Precondition: the index attributes tiles to this region, so every \
+             evaluation observes Incomplete rather than NoTiles"
+        );
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let empty_checker: Arc<dyn DdsDiskCacheChecker> =
+            MockDiskChecker::with_tile_coords(std::iter::empty::<TileCoord>());
+
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_scenery_index(Arc::clone(&index))
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_disk_checker(empty_checker);
+        // Force staleness rather than sleeping.
+        coord.config.stale_region_timeout = std::time::Duration::ZERO;
+
+        // Asserted every iteration, not just at the end: the invariant is that
+        // the region is never NoCoverage at ANY point. An end-state-only check
+        // is unsound here because the pre-#226 code retired on a 3-cycle and
+        // cleared its own counter, so the final sample could land on a
+        // non-retired phase of the cycle and hide the defect.
+        for i in 0..10 {
+            geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+            coord.evaluate_stale_regions(&geo_index);
+
+            let state = geo_index.get::<PrefetchedRegion>(&region);
+            assert!(
+                state.map(|s| !s.is_no_coverage()).unwrap_or(true),
+                "a region with indexed tiles must never reach NoCoverage \
+                 (reached it on evaluation {})",
+                i + 1
+            );
+        }
+    }
+
+    /// NoTiles is definitive on the first look — the scenery index is fully
+    /// built before the coordinator receives it, so retrying adds no
+    /// information.
+    #[tokio::test]
+    async fn test_no_tiles_region_retires_on_first_evaluation() {
+        // Index covers (50,9) only; the region under test is elsewhere, so
+        // `tiles_in_region` is empty => NoTiles.
+        let index = make_scenery_index(50, 9, 16);
+        let region = DsfRegion::new(20, 20);
+        assert!(
+            index.tiles_in_region(region).is_empty(),
+            "Precondition: the index attributes no tiles to this region"
+        );
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let checker: Arc<dyn DdsDiskCacheChecker> =
+            MockDiskChecker::with_tile_coords(std::iter::empty::<TileCoord>());
+
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_scenery_index(Arc::clone(&index))
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_disk_checker(checker);
+        coord.config.stale_region_timeout = std::time::Duration::ZERO;
+
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+        coord.evaluate_stale_regions(&geo_index);
+
+        assert!(
+            geo_index
+                .get::<PrefetchedRegion>(&region)
+                .is_some_and(|s| s.is_no_coverage()),
+            "NoTiles must retire immediately, not after three strikes"
+        );
+    }
+
+    /// A slow-but-advancing region must not accumulate strikes. This is the
+    /// direct answer to the reported diagnosis: the counter measured
+    /// throughput, not coverage.
+    #[tokio::test]
+    async fn test_progress_resets_strikes() {
+        let index = make_scenery_index(50, 9, 16);
+        let region = DsfRegion::new(50, 9);
+        let tiles = index.tiles_in_region(region);
+        assert!(
+            tiles.len() >= 2,
+            "Precondition: at least two tiles, so seeding one still leaves the \
+             region Incomplete rather than Complete"
+        );
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let empty_checker: Arc<dyn DdsDiskCacheChecker> =
+            MockDiskChecker::with_tile_coords(std::iter::empty::<TileCoord>());
+
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_scenery_index(Arc::clone(&index))
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_disk_checker(empty_checker);
+        coord.config.stale_region_timeout = std::time::Duration::ZERO;
+
+        // First evaluation: 0 of N -> strike 1.
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+        coord.evaluate_stale_regions(&geo_index);
+        assert_eq!(coord.region_retry.get(&region).unwrap().strikes, 1);
+
+        // A tile lands, then evaluate again: 1 of N -> strikes reset.
+        let partial_checker: Arc<dyn DdsDiskCacheChecker> =
+            MockDiskChecker::with_tile_coords(std::iter::once(tiles[0]));
+        coord.dds_disk_checker = Some(partial_checker);
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+        coord.evaluate_stale_regions(&geo_index);
+        assert_eq!(
+            coord.region_retry.get(&region).unwrap().strikes,
+            0,
+            "a region that gained coverage since the last look is advancing, not stuck"
+        );
+        assert_eq!(coord.region_retry.get(&region).unwrap().last_covered, 1);
+    }
+
+    /// `last_covered` is the *previous observation*, not a high-water mark.
+    ///
+    /// Coverage can regress: the DDS disk cache has a GC daemon that evicts
+    /// tiles. If the stuck branch left `last_covered` at the best value ever
+    /// seen, progress detection would be blinded until coverage exceeded that
+    /// old peak, and a genuinely advancing region would accrue strikes.
+    #[tokio::test]
+    async fn test_last_covered_tracks_latest_observation_not_high_water_mark() {
+        let index = make_scenery_index(50, 9, 16);
+        let region = DsfRegion::new(50, 9);
+        let tiles = index.tiles_in_region(region);
+        assert!(
+            tiles.len() >= 3,
+            "Precondition: need at least three tiles to model a regression \
+             that still leaves the region Incomplete"
+        );
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let empty_checker: Arc<dyn DdsDiskCacheChecker> =
+            MockDiskChecker::with_tile_coords(std::iter::empty::<TileCoord>());
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_scenery_index(Arc::clone(&index))
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_disk_checker(empty_checker);
+        coord.config.stale_region_timeout = std::time::Duration::ZERO;
+
+        // Helper: re-arm the region and evaluate against a given tile set.
+        let evaluate_with = |coord: &mut AdaptivePrefetchCoordinator, present: &[TileCoord]| {
+            coord.dds_disk_checker =
+                Some(MockDiskChecker::with_tile_coords(present.iter().copied()));
+            geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+            coord.evaluate_stale_regions(&geo_index);
+        };
+
+        // 0 covered -> strike 1.
+        evaluate_with(&mut coord, &[]);
+        assert_eq!(coord.region_retry.get(&region).map(|r| r.strikes), Some(1));
+
+        // Coverage advances to 2 -> progress, strikes cleared.
+        evaluate_with(&mut coord, &[tiles[0], tiles[1]]);
+        assert_eq!(
+            coord.region_retry.get(&region).map(|r| r.last_covered),
+            Some(2),
+            "Precondition: peak coverage of 2 recorded"
+        );
+
+        // GC evicts one tile: coverage regresses to 1. No progress -> strike.
+        evaluate_with(&mut coord, &[tiles[0]]);
+        assert_eq!(
+            coord.region_retry.get(&region).map(|r| r.strikes),
+            Some(1),
+            "a regression is not progress, so it takes a strike"
+        );
+        assert_eq!(
+            coord.region_retry.get(&region).map(|r| r.last_covered),
+            Some(1),
+            "last_covered must follow the latest observation down, not stay at the peak"
+        );
+
+        // The tile comes back: 2 > 1, so this IS progress. Under high-water
+        // semantics the comparison would be 2 > 2 and the region would be
+        // wrongly struck again.
+        evaluate_with(&mut coord, &[tiles[0], tiles[1]]);
+        assert_eq!(
+            coord.region_retry.get(&region).map(|r| r.strikes),
+            Some(0),
+            "recovering to a previously-seen level is still progress"
+        );
+    }
+
+    /// The ladder, including that it stops growing at the fourth rung.
+    #[test]
+    fn test_deferral_ladder() {
+        assert_eq!(deferral_for(1), Duration::from_secs(20));
+        assert_eq!(deferral_for(2), Duration::from_secs(30));
+        assert_eq!(deferral_for(3), Duration::from_secs(40));
+        assert_eq!(deferral_for(4), Duration::from_secs(60));
+        assert_eq!(deferral_for(5), Duration::from_secs(60), "caps at 60s");
+        assert_eq!(
+            deferral_for(200),
+            Duration::from_secs(60),
+            "no overflow, still capped"
         );
     }
 
@@ -2175,16 +2505,16 @@ mod tests {
         geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
         coord.evaluate_stale_regions(&geo_index);
         assert_eq!(
-            coord.region_attempts.get(&region),
-            Some(&1),
-            "Precondition: first stale failure recorded"
+            coord.region_retry.get(&region).map(|r| r.strikes),
+            Some(1),
+            "Precondition: first stale no-progress evaluation recorded"
         );
         geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
         coord.evaluate_stale_regions(&geo_index);
         assert_eq!(
-            coord.region_attempts.get(&region),
-            Some(&2),
-            "Precondition: second stale failure recorded (below MAX_REGION_ATTEMPTS)"
+            coord.region_retry.get(&region).map(|r| r.strikes),
+            Some(2),
+            "Precondition: second stale no-progress evaluation recorded"
         );
 
         // Phase 2: checker seeded with the region's tiles -> promote via the
@@ -2202,7 +2532,7 @@ mod tests {
             "Precondition: region promoted via the fast path"
         );
         assert!(
-            !coord.region_attempts.contains_key(&region),
+            !coord.region_retry.contains_key(&region),
             "Promotion must clear the strike count from the failed episode"
         );
 
@@ -2222,21 +2552,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_demoted_no_coverage_region_gets_fresh_strikes_after_retirement() {
-        // Regression for #223 Finding B: strike counts were cleared on both
-        // promotion paths but never on retirement to NoCoverage. A region
-        // demoted out of NoCoverage by `PrefetchStateObserver` (simulated
-        // here by removing its GeoIndex entry, exactly as the observer
-        // does — see `state_observer.rs::observe`) re-entered the prefetch
-        // cycle still carrying its old strike count, so a single fresh
-        // failure retired it again immediately: zero real retries.
-        let index = make_scenery_index(50, 9, 16);
+    async fn test_retirement_clears_retry_state_so_demotion_starts_fresh() {
+        // Regression for #223 Finding B, carried forward to the #226 state
+        // machine. The original defect: strike counts were cleared on both
+        // promotion paths but never on retirement, so a region demoted out of
+        // NoCoverage by `PrefetchStateObserver` re-entered the cycle still
+        // carrying the strikes of the episode that retired it.
+        //
+        // #226 removed retirement-by-strikes, so the old "re-retires
+        // instantly" symptom is now unreachable by construction. The
+        // invariant behind it is not: retirement must still clear the
+        // region's retry bookkeeping, or a demoted region resumes part-way up
+        // the deferral ladder and is skipped for 40-60s instead of 20s on its
+        // first fresh failure. This exercises the surviving retirement arm
+        // (`NoTiles`).
+        let covering_index = make_scenery_index(50, 9, 16);
         let region = DsfRegion::new(50, 9);
         assert!(
-            !index.tiles_in_region(region).is_empty(),
-            "Precondition: region has indexed tiles (land, not ocean) so the \
-             strike path is reachable — ocean regions take tiles.is_empty() \
-             and never touch region_attempts"
+            !covering_index.tiles_in_region(region).is_empty(),
+            "Precondition: the covering index attributes tiles to the region, \
+             so the strike path is reachable"
+        );
+        // An index that knows nothing of this region => RegionDiskState::NoTiles.
+        let empty_index = make_scenery_index(20, 20, 16);
+        assert!(
+            empty_index.tiles_in_region(region).is_empty(),
+            "Precondition: the empty index attributes no tiles to the region"
         );
 
         let geo_index = Arc::new(GeoIndex::new());
@@ -2244,43 +2585,129 @@ mod tests {
             MockDiskChecker::with_tile_coords(std::iter::empty::<TileCoord>());
 
         let mut coord = AdaptivePrefetchCoordinator::with_defaults()
-            .with_scenery_index(Arc::clone(&index))
+            .with_scenery_index(Arc::clone(&covering_index))
             .with_geo_index(Arc::clone(&geo_index))
             .with_dds_disk_checker(Arc::clone(&empty_checker));
         coord.config.stale_region_timeout = std::time::Duration::ZERO;
 
-        // Retire the region by strikes: MAX_REGION_ATTEMPTS consecutive
-        // stale failures (Incomplete: indexed tiles exist, none on disk).
-        for _ in 0..MAX_REGION_ATTEMPTS {
+        // Accumulate strikes: two stale no-progress evaluations.
+        for _ in 0..2 {
             geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
             coord.evaluate_stale_regions(&geo_index);
         }
+        assert_eq!(
+            coord.region_retry.get(&region).map(|r| r.strikes),
+            Some(2),
+            "Precondition: strikes accumulated while the region was Incomplete"
+        );
+
+        // The region is now observed as having no indexed tiles at all, which
+        // is the only path to NoCoverage.
+        coord.scenery_index = Some(Arc::clone(&empty_index));
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+        coord.evaluate_stale_regions(&geo_index);
         assert!(
             geo_index
                 .get::<PrefetchedRegion>(&region)
                 .is_some_and(|s| s.is_no_coverage()),
-            "Precondition: region retired to NoCoverage by strikes"
+            "Precondition: NoTiles retires the region to NoCoverage"
+        );
+        assert!(
+            !coord.region_retry.contains_key(&region),
+            "retirement must clear the retry bookkeeping of the retired episode"
         );
 
-        // The observer demotes a NoCoverage region it sees contradicted by
-        // an on-demand FUSE generation — it clears the GeoIndex claim only
+        // The observer demotes a NoCoverage region it sees contradicted by an
+        // on-demand FUSE generation — it clears the GeoIndex claim only
         // (`PrefetchStateObserver::observe` -> `geo_index.remove`).
         geo_index.remove::<PrefetchedRegion>(&region);
+        coord.scenery_index = Some(Arc::clone(&covering_index));
 
-        // The region is re-planned and marked InProgress again.
+        // The region is re-planned, marked InProgress, and fails once.
         geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
-
-        // One single fresh stale failure.
         coord.evaluate_stale_regions(&geo_index);
 
+        assert_eq!(
+            coord.region_retry.get(&region).map(|r| r.strikes),
+            Some(1),
+            "a demoted region must start the deferral ladder from the bottom, \
+             not resume the retired episode's strike count"
+        );
         assert!(
             geo_index
                 .get::<PrefetchedRegion>(&region)
                 .map(|s| !s.is_no_coverage())
                 .unwrap_or(true),
             "one fresh failure after an observer-driven demotion must not \
-             immediately re-retire the region — it should get a fresh set \
-             of MAX_REGION_ATTEMPTS strikes"
+             re-retire the region"
+        );
+    }
+
+    // `region_retry` is cleared on the three retirement/promotion exits, but
+    // `evict_non_retained` removes `Deferred` (and other terminal) entries
+    // from the GeoIndex without the coordinator's involvement — it is a
+    // static taking only `&GeoIndex`. Left unpruned, a region that leaves the
+    // retained window and later returns resumes at its old `strikes`, so its
+    // first fresh no-progress evaluation defers 40-60s instead of 20s.
+    #[test]
+    fn test_retry_state_is_pruned_when_region_is_evicted() {
+        use crate::geo_index::RetainedRegion;
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let kept = DsfRegion::new(47, 8);
+        let dropped = DsfRegion::new(10, 10);
+
+        // Retention must be non-empty or `evict_non_retained` returns early
+        // and this test passes vacuously. This trap cost three failed
+        // reproductions during #223 — do not remove this line.
+        geo_index.insert::<RetainedRegion>(kept, RetainedRegion);
+
+        geo_index.insert::<PrefetchedRegion>(
+            dropped,
+            PrefetchedRegion::deferred(Instant::now() + Duration::from_secs(60)),
+        );
+
+        let mut coord =
+            AdaptivePrefetchCoordinator::with_defaults().with_geo_index(Arc::clone(&geo_index));
+        // Eviction runs only in Cruise (the guard at core.rs:1101). Set the
+        // phase directly rather than driving `update()` — the detector has
+        // hysteresis, so a single update may not transition and the test
+        // would silently no-op.
+        coord.phase_detector.reset_to_cruise();
+        coord.region_retry.insert(
+            dropped,
+            RegionRetryState {
+                strikes: 2,
+                last_covered: 5,
+            },
+        );
+        // Seed retry state for the RETAINED region too, so the second
+        // assertion below actually discriminates "only the evicted region's
+        // state is pruned" from "everything got pruned" — without this the
+        // assertion was trivially true (its right-hand disjunct was already
+        // guaranteed by the assertion above it).
+        coord.region_retry.insert(
+            kept,
+            RegionRetryState {
+                strikes: 1,
+                last_covered: 3,
+            },
+        );
+
+        coord.run_region_maintenance();
+
+        assert!(
+            !coord.region_retry.contains_key(&dropped),
+            "retry bookkeeping must not outlive the region's entry in the index"
+        );
+        assert_eq!(
+            coord.region_retry.get(&kept),
+            Some(&RegionRetryState {
+                strikes: 1,
+                last_covered: 3,
+            }),
+            "only the evicted region's state is pruned — the retained region's \
+             retry state must survive untouched"
         );
     }
 
@@ -2358,6 +2785,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stuck_region_emits_prefetch_region_deferred_event() {
+        use crate::metrics::MetricEvent;
+
+        // Closes the coordinator end of the `regions_deferred` chain (#226
+        // review I-3). The metrics-daemon sample test seeds
+        // `state.prefetch_regions_deferred` directly, so it stays green even
+        // if this event is never constructed anywhere in production — and
+        // `regions_deferred` is the instrument a flight-test criterion is
+        // read off. Nothing else observes this emission.
+        let index = make_scenery_index(50, 9, 16);
+        let region = DsfRegion::new(50, 9);
+        assert!(
+            !index.tiles_in_region(region).is_empty(),
+            "Precondition: the region has indexed tiles, so the strike path \
+             is reachable at all"
+        );
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let empty_checker: Arc<dyn DdsDiskCacheChecker> =
+            MockDiskChecker::with_tile_coords(std::iter::empty::<TileCoord>());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_scenery_index(Arc::clone(&index))
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_disk_checker(Arc::clone(&empty_checker))
+            .with_metrics_client(MetricsClient::new(tx));
+        coord.config.stale_region_timeout = std::time::Duration::ZERO;
+
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+        coord.evaluate_stale_regions(&geo_index);
+
+        assert!(
+            geo_index
+                .get::<PrefetchedRegion>(&region)
+                .is_some_and(|s| s.is_deferred()),
+            "Precondition: the evaluation must actually have deferred the region"
+        );
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, MetricEvent::PrefetchRegionDeferred))
+                .count(),
+            1,
+            "a deferral must emit exactly one PrefetchRegionDeferred; got {events:?}"
+        );
+
+        // Discriminator: the event must be tied to the deferral, not emitted
+        // on every evaluation. Seed full coverage and promote instead.
+        let full_checker: Arc<dyn DdsDiskCacheChecker> =
+            MockDiskChecker::with_tile_coords(index.tiles_in_region(region).into_iter());
+        coord.dds_disk_checker = Some(full_checker);
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+        coord.evaluate_stale_regions(&geo_index);
+        assert!(
+            geo_index
+                .get::<PrefetchedRegion>(&region)
+                .is_some_and(|s| s.is_prefetched()),
+            "Precondition: the second evaluation must have promoted the region"
+        );
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::PrefetchRegionDeferred)),
+            "a promotion must not emit PrefetchRegionDeferred; got {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_run_region_maintenance_emits_region_state_gauge() {
         use crate::metrics::MetricEvent;
 
@@ -2423,10 +2923,83 @@ mod tests {
                     in_progress: 1,
                     prefetched: 2,
                     no_coverage: 3,
+                    deferred: 0,
                 }
             ),
-            "expected PrefetchRegionState {{ in_progress: 1, prefetched: 2, no_coverage: 3 }}, got {:?}",
+            "expected PrefetchRegionState {{ in_progress: 1, prefetched: 2, no_coverage: 3, deferred: 0 }}, got {:?}",
             region_state_events[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deferred_regions_are_not_reported_as_no_coverage() {
+        use crate::metrics::MetricEvent;
+
+        // #226: `regions_nocoverage` non-zero only over water is an acceptance
+        // criterion for this fix. Folding `Deferred` into the NoCoverage
+        // bucket would make the fix falsify its own instrument — a deferred
+        // land region would be reported as having no coverage, which is
+        // exactly the false alarm the fix exists to remove.
+        let geo_index = Arc::new(GeoIndex::new());
+
+        // Distinct counts so an argument swap at the call site, or a swap of
+        // the fold arms, cannot go undetected.
+        geo_index
+            .insert::<PrefetchedRegion>(DsfRegion::new(10, 10), PrefetchedRegion::in_progress());
+        geo_index
+            .insert::<PrefetchedRegion>(DsfRegion::new(20, 20), PrefetchedRegion::prefetched());
+        geo_index
+            .insert::<PrefetchedRegion>(DsfRegion::new(21, 20), PrefetchedRegion::prefetched());
+        for lat in 30..33 {
+            geo_index.insert::<PrefetchedRegion>(
+                DsfRegion::new(lat, 30),
+                PrefetchedRegion::deferred(Instant::now() + Duration::from_secs(20)),
+            );
+        }
+        // Deliberately NO NoCoverage regions: the bucket must stay empty.
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let metrics = MetricsClient::new(tx);
+
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_metrics_client(metrics);
+
+        // No scenery_index/dds_disk_checker, so `region_disk_state` is
+        // Unknown and maintenance leaves the seeded distribution untouched.
+        coord.run_region_maintenance();
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let region_state_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, MetricEvent::PrefetchRegionState { .. }))
+            .collect();
+        assert_eq!(
+            region_state_events.len(),
+            1,
+            "expected exactly one PrefetchRegionState event, got {:?}",
+            region_state_events
+        );
+
+        let MetricEvent::PrefetchRegionState {
+            in_progress,
+            prefetched,
+            no_coverage,
+            deferred,
+        } = region_state_events[0]
+        else {
+            unreachable!("filtered above")
+        };
+        assert_eq!(*in_progress, 1, "in_progress bucket");
+        assert_eq!(*prefetched, 2, "prefetched bucket");
+        assert_eq!(
+            *no_coverage, 0,
+            "a Deferred region is not a NoCoverage region — folding it into \
+             this bucket falsifies the acceptance instrument for #226"
+        );
+        assert_eq!(
+            *deferred, 3,
+            "deferred regions must be visible as their own gauge, not silently uncounted"
         );
     }
 

@@ -37,6 +37,7 @@
   <div class="legend-item"><span class="legend-swatch" style="background:#f44336"></span> FUSE loaded (X-Plane waited)</div>
   <div class="legend-item"><span class="legend-swatch" style="background:#FF9800"></span> Mixed (prefetch + FUSE)</div>
   <div class="legend-item"><span class="legend-swatch" style="background:#9E9E9E"></span> No Coverage</div>
+  <div class="legend-item"><span class="legend-swatch" style="background:#00BCD4"></span> Deferred (backing off)</div>
   <div class="legend-item"><span class="legend-swatch" style="background:#9C27B0"></span> Patched</div>
   <div class="legend-item"><span class="legend-swatch" style="background:transparent;border:2px solid #2196F3"></span> Retained</div>
   <div class="legend-item"><span class="legend-swatch" style="background:transparent;border:2px dashed #03A9F4"></span> Prefetch Box</div>
@@ -78,6 +79,7 @@ const REGION_COLORS = {
   retained:    { color: '#2196F3', fillColor: 'transparent', fillOpacity: 0, weight: 2 },
   fuse_loaded: { color: '#f44336', fillColor: '#f44336', fillOpacity: 0.35, weight: 1 },
   mixed:       { color: '#FF9800', fillColor: '#FF9800', fillOpacity: 0.3, weight: 1 },
+  deferred:    { color: '#00BCD4', fillColor: '#00BCD4', fillOpacity: 0.25, weight: 1 },
 };
 
 function updateStats(data) {
