@@ -214,6 +214,26 @@ pub enum MetricEvent {
     /// Used by the TUI to show actual tile request throughput.
     FuseTileServed,
 
+    /// A FUSE `read()` call was answered.
+    ///
+    /// The kernel caps every FUSE read at `max_pages * PAGE_SIZE` (1 MiB on
+    /// Linux), so a file is never handed to the filesystem in a single call:
+    /// a whole-file `read(2)` of a 32 MiB file arrives as 32 separate calls.
+    /// `returned` is what this call handed back to the kernel; `materialised`
+    /// is how many bytes the handler had to allocate to produce it.
+    ///
+    /// The two should be equal. Their ratio is the read amplification tracked
+    /// by #233 (real files on disk) and #234 (generated DDS tiles) -- measured
+    /// at 12-23x for an 11.17 MB object before those fixes.
+    FuseRead {
+        /// Bytes returned to the kernel for this call.
+        returned: u64,
+        /// Bytes the handler allocated in order to serve this call.
+        materialised: u64,
+        /// `true` for a generated DDS tile, `false` for a real file on disk.
+        virtual_dds: bool,
+    },
+
     /// A FUSE request started being handled.
     FuseRequestStarted,
 
@@ -319,6 +339,7 @@ impl MetricEvent {
             Self::EncodeCompleted { .. } => "encode_completed",
             Self::AssemblyCompleted { .. } => "assembly_completed",
             Self::FuseTileServed => "fuse_tile_served",
+            Self::FuseRead { .. } => "fuse_read",
             Self::FuseRequestStarted => "fuse_request_started",
             Self::FuseRequestCompleted => "fuse_request_completed",
             Self::FuseRequestQueued => "fuse_request_queued",

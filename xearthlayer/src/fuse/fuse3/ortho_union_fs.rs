@@ -384,6 +384,18 @@ impl Fuse3OrthoUnionFS {
     /// `lookup()`, not here.
     ///
     /// This is the composition point: GeoIndex (geography) + OrthoUnionIndex (files).
+    /// Record one FUSE `read()` call for the amplification metric.
+    ///
+    /// `returned` is what this call hands back to the kernel; `materialised`
+    /// is what the handler allocated to produce it. The kernel caps each read
+    /// at 1 MiB, so a handler that builds the whole object per call inflates
+    /// the second against the first. See #233 and #234.
+    fn record_read(&self, returned: u64, materialised: u64, virtual_dds: bool) {
+        if let Some(metrics) = &self.metrics_client {
+            metrics.fuse_read(returned, materialised, virtual_dds);
+        }
+    }
+
     fn resolve_lazy_geo(&self, virtual_path: &std::path::Path, filename: &str) -> Option<PathBuf> {
         if self.is_geo_filtered(filename) {
             // Patched region: patches first, packages fill gaps
@@ -750,13 +762,12 @@ impl Filesystem for Fuse3OrthoUnionFS {
             let offset = offset as usize;
             let size = size as usize;
 
-            if offset >= data.len() {
-                return Ok(ReplyData { data: Bytes::new() });
-            }
+            let end = std::cmp::min(offset.saturating_add(size), data.len());
+            let slice = data.get(offset..end).unwrap_or(&[]);
+            self.record_read(slice.len() as u64, data.len() as u64, true);
 
-            let end = std::cmp::min(offset + size, data.len());
             return Ok(ReplyData {
-                data: Bytes::copy_from_slice(&data[offset..end]),
+                data: Bytes::copy_from_slice(slice),
             });
         }
 
@@ -788,13 +799,12 @@ impl Filesystem for Fuse3OrthoUnionFS {
         let offset = offset as usize;
         let size = size as usize;
 
-        if offset >= data.len() {
-            return Ok(ReplyData { data: Bytes::new() });
-        }
+        let end = std::cmp::min(offset.saturating_add(size), data.len());
+        let slice = data.get(offset..end).unwrap_or(&[]);
+        self.record_read(slice.len() as u64, data.len() as u64, false);
 
-        let end = std::cmp::min(offset + size, data.len());
         Ok(ReplyData {
-            data: Bytes::copy_from_slice(&data[offset..end]),
+            data: Bytes::copy_from_slice(slice),
         })
     }
 

@@ -314,6 +314,21 @@ impl MetricsDaemon {
             MetricEvent::FuseTileServed => {
                 self.state.fuse_tiles_served += 1;
             }
+            MetricEvent::FuseRead {
+                returned,
+                materialised,
+                virtual_dds,
+            } => {
+                if virtual_dds {
+                    self.state.fuse_dds_reads += 1;
+                    self.state.fuse_dds_read_bytes += returned;
+                    self.state.fuse_dds_alloc_bytes += materialised;
+                } else {
+                    self.state.fuse_file_reads += 1;
+                    self.state.fuse_file_read_bytes += returned;
+                    self.state.fuse_file_alloc_bytes += materialised;
+                }
+            }
             MetricEvent::FuseRequestStarted => {
                 self.state.fuse_requests_active += 1;
             }
@@ -417,6 +432,17 @@ impl MetricsDaemon {
             // previously had no in-flight gauge at all (see MemCacheWriteStarted
             // doc comment in metrics/event.rs for why that was a diagnosis hole).
             mem_cache_writes_active = state.mem_cache_writes_active,
+            // FUSE read amplification (#233 / #234). `*_alloc_mb` is what the
+            // read handler allocated; `*_read_mb` is what reached X-Plane. The
+            // kernel caps each read at 1 MiB, so a handler that materialises the
+            // whole object per call inflates alloc against read -- 12-23x for an
+            // 11.17 MB object before those fixes, ~1x after.
+            fuse_file_reads = state.fuse_file_reads,
+            fuse_file_read_mb = state.fuse_file_read_bytes / MB,
+            fuse_file_alloc_mb = state.fuse_file_alloc_bytes / MB,
+            fuse_dds_reads = state.fuse_dds_reads,
+            fuse_dds_read_mb = state.fuse_dds_read_bytes / MB,
+            fuse_dds_alloc_mb = state.fuse_dds_alloc_bytes / MB,
             "Memory sample"
         );
     }
@@ -599,6 +625,58 @@ mod tests {
         assert_eq!(daemon.state.memory_cache_hits, 1);
         assert_eq!(daemon.state.memory_cache_misses, 1);
         assert_eq!(daemon.state.memory_cache_size_bytes, 1_000_000);
+    }
+
+    #[test]
+    fn test_fuse_read_events_are_split_by_path() {
+        let (mut daemon, _tx) = create_daemon();
+
+        // A real file on disk: two ranged calls out of one 4 MiB file.
+        daemon.process_event(MetricEvent::FuseRead {
+            returned: 1_048_576,
+            materialised: 4_194_304,
+            virtual_dds: false,
+        });
+        daemon.process_event(MetricEvent::FuseRead {
+            returned: 1_048_576,
+            materialised: 4_194_304,
+            virtual_dds: false,
+        });
+        // A generated DDS tile: one ranged call out of an 11.17 MB tile.
+        daemon.process_event(MetricEvent::FuseRead {
+            returned: 1_048_576,
+            materialised: 11_712_512,
+            virtual_dds: true,
+        });
+
+        assert_eq!(daemon.state.fuse_file_reads, 2);
+        assert_eq!(daemon.state.fuse_file_read_bytes, 2_097_152);
+        assert_eq!(daemon.state.fuse_file_alloc_bytes, 8_388_608);
+
+        // The DDS event must not leak into the file counters, and vice versa:
+        // the two issues are verified independently from one flight.
+        assert_eq!(daemon.state.fuse_dds_reads, 1);
+        assert_eq!(daemon.state.fuse_dds_read_bytes, 1_048_576);
+        assert_eq!(daemon.state.fuse_dds_alloc_bytes, 11_712_512);
+    }
+
+    #[test]
+    fn test_fuse_read_counters_accumulate_rather_than_replace() {
+        // These are counters, not gauges. A single event cannot distinguish
+        // `0 += x` from `0 = x`, so send two and assert on the sum.
+        let (mut daemon, _tx) = create_daemon();
+
+        for _ in 0..3 {
+            daemon.process_event(MetricEvent::FuseRead {
+                returned: 100,
+                materialised: 1_000,
+                virtual_dds: false,
+            });
+        }
+
+        assert_eq!(daemon.state.fuse_file_reads, 3);
+        assert_eq!(daemon.state.fuse_file_read_bytes, 300);
+        assert_eq!(daemon.state.fuse_file_alloc_bytes, 3_000);
     }
 
     #[test]
