@@ -78,7 +78,9 @@ mebibyte", not necessarily "nothing".
 | `fuse_dds_read_mb` | `state.fuse_dds_read_bytes` | Bytes those calls returned to the kernel. |
 | `fuse_dds_alloc_mb` | `state.fuse_dds_alloc_bytes` | Bytes of whole tiles materialised to produce them. Since #234 the tile is charged to the read that produced it and nothing to the reads that slice it, so this should now track `fuse_dds_read_mb` closely. It ran 12-23x ahead before #234, when every ranged call re-entered the executor and cloned the whole tile. |
 | `dds_handles_open` | `state.fuse_handles_open` | Virtual DDS files X-Plane currently has open (gauge). Each one may pin a whole tile so later reads can slice it (#234). Nothing measured this before, so `MAX_PINNED_TILE_BYTES` is currently a guess — this is the number that should replace it. |
-| `dds_pinned_mb` | `state.fuse_handles_pinned_bytes` | Tile bytes pinned by those handles (gauge). Bounded by `MAX_PINNED_TILE_BYTES` (512 MiB); on reaching it, `open()` stops memoising and reads fall back to resolving per call. Sustained pinning at the ceiling means the bound is too low for this workload, not that anything is leaking. |
+| `dds_pinned_mb` | `state.fuse_handles_pinned_bytes` | Tile bytes pinned by those handles (gauge). Bounded by `MAX_PINNED_TILE_BYTES` (512 MiB); on reaching it, `open()` stops memoising and reads fall back to resolving per call. |
+| `dds_handles_peak` | `state.fuse_handles_peak_open` | Highest concurrent open count this session. **Read this, not `dds_handles_open`, when sizing the cap.** The current gauges are sampled on open, on tile production and on release, so a 60-second reader almost always catches them just after a release: the first KDEN run reported `dds_pinned_mb=0` throughout while 31 files were open. |
+| `dds_pinned_peak_mb` | `state.fuse_handles_peak_pinned_bytes` | Highest pinned total this session. Compare against `MAX_PINNED_TILE_BYTES`: if it approaches 512, `open()` is close to silently dropping memoisation and the cap wants raising. |
 
 ### Reading the two amplification ratios
 

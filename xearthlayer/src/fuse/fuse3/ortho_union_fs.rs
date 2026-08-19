@@ -159,6 +159,12 @@ pub struct Fuse3OrthoUnionFS {
     next_fh: AtomicU64,
     /// Bytes of DDS tiles currently pinned by open handles.
     pinned_tile_bytes: AtomicU64,
+    /// Highest concurrent handle count seen. The current counts drain to near
+    /// zero between bursts, so the peak is what `MAX_PINNED_TILE_BYTES` has to
+    /// be sized against.
+    peak_handles_open: AtomicU64,
+    /// Highest pinned byte total seen.
+    peak_pinned_tile_bytes: AtomicU64,
     /// Optional channel for notifying Scene Tracker of DDS accesses.
     ///
     /// When set, the filesystem sends a [`FuseAccessEvent`] for each DDS
@@ -227,6 +233,8 @@ impl Fuse3OrthoUnionFS {
             dds_handles: DashMap::new(),
             next_fh: AtomicU64::new(1),
             pinned_tile_bytes: AtomicU64::new(0),
+            peak_handles_open: AtomicU64::new(0),
+            peak_pinned_tile_bytes: AtomicU64::new(0),
             scene_tracker_tx: None,
             metrics_client: None,
             fuse_max_background: None,
@@ -261,6 +269,8 @@ impl Fuse3OrthoUnionFS {
             dds_handles: DashMap::new(),
             next_fh: AtomicU64::new(1),
             pinned_tile_bytes: AtomicU64::new(0),
+            peak_handles_open: AtomicU64::new(0),
+            peak_pinned_tile_bytes: AtomicU64::new(0),
             scene_tracker_tx: None,
             metrics_client: None,
             fuse_max_background: None,
@@ -414,12 +424,30 @@ impl Fuse3OrthoUnionFS {
     /// Publish the handle gauge. Called on open and release -- two events per
     /// texture, against the 12-23 reads it takes to serve one.
     fn report_handle_gauge(&self) {
+        let open = self.dds_handles.len() as u64;
+        let pinned = self.pinned_tile_bytes.load(Ordering::Relaxed);
+        self.peak_handles_open.fetch_max(open, Ordering::Relaxed);
+        self.peak_pinned_tile_bytes
+            .fetch_max(pinned, Ordering::Relaxed);
+
         if let Some(metrics) = &self.metrics_client {
             metrics.fuse_handles(
-                self.dds_handles.len() as u64,
-                self.pinned_tile_bytes.load(Ordering::Relaxed),
+                open,
+                pinned,
+                self.peak_handles_open.load(Ordering::Relaxed),
+                self.peak_pinned_tile_bytes.load(Ordering::Relaxed),
             );
         }
+    }
+
+    /// Highest concurrent open handle count seen.
+    pub fn peak_dds_handles(&self) -> u64 {
+        self.peak_handles_open.load(Ordering::Relaxed)
+    }
+
+    /// Highest pinned tile byte total seen.
+    pub fn peak_pinned_tile_bytes(&self) -> u64 {
+        self.peak_pinned_tile_bytes.load(Ordering::Relaxed)
     }
 
     /// Number of virtual DDS files currently open.
@@ -1705,6 +1733,54 @@ mod tests {
         // open() must not produce the tile: generation can take up to the
         // configured timeout, and X-Plane may open a file it never reads.
         assert_eq!(fs.pinned_tile_bytes(), 0);
+    }
+
+    /// Peaks must survive the drain that hides the current gauges.
+    ///
+    /// The live counts are sampled on open, on tile production and on release,
+    /// so a periodic reader almost always catches them just after a release and
+    /// sees zero -- which is exactly what the first KDEN run reported while 31
+    /// files were open. `MAX_PINNED_TILE_BYTES` has to be sized against the
+    /// ceiling, so the ceiling is tracked separately.
+    #[tokio::test]
+    async fn test_virtual_dds_handle_peaks_outlive_the_current_gauges() {
+        use fuse3::raw::Filesystem;
+
+        let (fs, _requests, _temp) = virtual_dds_fixture();
+
+        let mut opened = Vec::new();
+        for col in 0..3u32 {
+            let ino = fs
+                .inode_manager
+                .create_virtual_inode(crate::fuse::DdsFilename {
+                    row: 12754,
+                    col: 5279 + col,
+                    zoom: 16,
+                    map_type: "BI".to_string(),
+                });
+            let reply = fs.open(test_request(), ino, 0).await.unwrap();
+            fs.read(test_request(), ino, reply.fh, 0, 4096)
+                .await
+                .unwrap();
+            opened.push((ino, reply.fh));
+        }
+
+        assert_eq!(fs.open_dds_handles(), 3);
+        let pinned_at_peak = fs.pinned_tile_bytes();
+        assert_eq!(pinned_at_peak, 3 * crate::fuse::EXPECTED_DDS_SIZE as u64);
+
+        for (ino, fh) in opened {
+            fs.release(test_request(), ino, fh, 0, 0, false)
+                .await
+                .unwrap();
+        }
+
+        // Current gauges drain...
+        assert_eq!(fs.open_dds_handles(), 0);
+        assert_eq!(fs.pinned_tile_bytes(), 0);
+        // ...peaks do not.
+        assert_eq!(fs.peak_dds_handles(), 3);
+        assert_eq!(fs.peak_pinned_tile_bytes(), pinned_at_peak);
     }
 
     /// The amplification metric must reflect the fix, not the old shape.

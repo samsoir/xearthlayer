@@ -248,6 +248,10 @@ pub enum MetricEvent {
         open: u64,
         /// Tile bytes currently pinned by those handles.
         pinned_bytes: u64,
+        /// Highest concurrent open count seen this session.
+        peak_open: u64,
+        /// Highest pinned byte total seen this session.
+        peak_pinned_bytes: u64,
     },
 
     /// A FUSE request started being handled.

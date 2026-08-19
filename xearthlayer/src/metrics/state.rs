@@ -263,6 +263,15 @@ pub struct AggregatedState {
     pub fuse_handles_open: u64,
     /// Tile bytes currently pinned by open handles (gauge).
     pub fuse_handles_pinned_bytes: u64,
+    /// Highest concurrent open handle count seen this session.
+    ///
+    /// The current gauges are sampled whenever a handle opens, produces a tile
+    /// or releases, so a periodic reader almost always catches them just after
+    /// a release and reads near zero. The ceiling is what has to be sized
+    /// against, so it is tracked separately.
+    pub fuse_handles_peak_open: u64,
+    /// Highest pinned byte total seen this session.
+    pub fuse_handles_peak_pinned_bytes: u64,
 
     // =========================================================================
     // Peak Tracking
@@ -369,6 +378,8 @@ impl AggregatedState {
             fuse_dds_alloc_bytes: 0,
             fuse_handles_open: 0,
             fuse_handles_pinned_bytes: 0,
+            fuse_handles_peak_open: 0,
+            fuse_handles_peak_pinned_bytes: 0,
             peak_bytes_per_second: 0.0,
             prefetch_regions_in_progress: 0,
             prefetch_regions_prefetched: 0,

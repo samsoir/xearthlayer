@@ -329,10 +329,20 @@ impl MetricsDaemon {
                     self.state.fuse_file_alloc_bytes += materialised;
                 }
             }
-            MetricEvent::FuseHandlesUpdate { open, pinned_bytes } => {
+            MetricEvent::FuseHandlesUpdate {
+                open,
+                pinned_bytes,
+                peak_open,
+                peak_pinned_bytes,
+            } => {
                 // Gauges: assigned, not accumulated.
                 self.state.fuse_handles_open = open;
                 self.state.fuse_handles_pinned_bytes = pinned_bytes;
+                // Peaks are owned by the filesystem, which sees every
+                // transition; take them as reported rather than deriving a
+                // maximum from the samples that happen to arrive here.
+                self.state.fuse_handles_peak_open = peak_open;
+                self.state.fuse_handles_peak_pinned_bytes = peak_pinned_bytes;
             }
             MetricEvent::FuseRequestStarted => {
                 self.state.fuse_requests_active += 1;
@@ -450,6 +460,8 @@ impl MetricsDaemon {
             fuse_dds_alloc_mb = state.fuse_dds_alloc_bytes / MB,
             dds_handles_open = state.fuse_handles_open,
             dds_pinned_mb = state.fuse_handles_pinned_bytes / MB,
+            dds_handles_peak = state.fuse_handles_peak_open,
+            dds_pinned_peak_mb = state.fuse_handles_peak_pinned_bytes / MB,
             "Memory sample"
         );
     }
