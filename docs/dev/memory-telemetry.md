@@ -46,7 +46,10 @@ so that a single unattended flight discriminates between them:
 2026-08-06 06:20:33Z  INFO Memory sample uptime_s=60 rss_mb=873 vm_mb=1459 swap_mb=0 threads=71 tiles_done=0 encodes_active=0 chunks_ok=0 chunks_failed=0 mem_cache_mb=0 dds_disk_mb=158268 chunk_disk_mb=55301 gc_evicted_mb=0 chunk_index_entries=3803083 disk_writes_active=0 mem_cache_writes_active=0
 ```
 
-Sixteen fields, in emission order. Every `_mb` value is truncating integer
+(Captured before #233; a current line also carries the six `fuse_*` read
+fields described below.)
+
+Twenty-two fields, in emission order. Every `_mb` value is truncating integer
 division by 1 MiB (1 048 576 bytes), so a value of `0` means "under one
 mebibyte", not necessarily "nothing".
 
@@ -68,6 +71,22 @@ mebibyte", not necessarily "nothing".
 | `chunk_index_entries` | `state.chunk_index_entries` | Live entries in the **chunk** tier's `LruIndex`. The DDS tier does not report this. Refreshed on every chunk-tier set/delete and once at startup (`DiskCacheProvider::report_size_to_metrics`), **but the GC batch task (`tasks/cache_gc_batch.rs`) removes entries from the index directly and does not call it**, so this gauge can lag behind the true index size during heavy GC — a burst of evictions may not be reflected until the next unrelated set/delete nudges a report. See the bytes-per-entry estimate below for translating a raw count into an approximate memory footprint. |
 | `disk_writes_active` | `state.disk_writes_active` | Fire-and-forget disk cache writes currently in flight, counting both chunk writes from `DownloadChunksTask` and DDS tile writes from `BuildAndCacheDdsTask`. |
 | `mem_cache_writes_active` | `state.mem_cache_writes_active` | Fire-and-forget **memory**-cache writes currently in flight — the `cache.put()` spawn in `BuildAndCacheDdsTask`, mirroring `disk_writes_active` but for the moka tier. Added specifically because this spawn previously emitted no start/complete pair at all (only `mem_cache_mb`, which only moves after the write completes), which meant a backlog concentrated there was invisible and would misread as candidate 2 (allocator retention). See the decision table below. |
+| `fuse_file_reads` | `state.fuse_file_reads` | FUSE `read()` calls answered from a **real file on disk** — DSF, `.ter`, patch DDS. Not tile requests: the kernel caps every FUSE read at `max_pages * PAGE_SIZE` (1 MiB on Linux), so one X-Plane whole-file read arrives as many calls. |
+| `fuse_file_read_mb` | `state.fuse_file_read_bytes` | Bytes those calls returned to the kernel — what X-Plane actually consumed. |
+| `fuse_file_alloc_mb` | `state.fuse_file_alloc_bytes` | Bytes the handler read from disk to produce them. **Should track `fuse_file_read_mb` almost exactly**; a growing gap means the handler is moving more than it delivers. Before #233 the handler read the whole file per call, so this ran up to 238x ahead on the largest ortho DSF. |
+| `fuse_dds_reads` | `state.fuse_dds_reads` | FUSE `read()` calls answered from a **generated DDS tile**. Because virtual DDS files are opened `FOPEN_DIRECT_IO` (#65) the kernel serves nothing from cache, so this is a complete census of X-Plane's texture reads, not a sample — which makes it the tiles-*served* denominator #227 otherwise lacks. |
+| `fuse_dds_read_mb` | `state.fuse_dds_read_bytes` | Bytes those calls returned to the kernel. |
+| `fuse_dds_alloc_mb` | `state.fuse_dds_alloc_bytes` | Bytes of whole tiles materialised to produce them. **Expected to run 12-23x ahead of `fuse_dds_read_mb` until #234 lands**: `request_dds_impl` returns an owned `Vec<u8>` of the entire tile per call, so an 11.17 MB buffer is produced 12-23 times per texture served, even on a memory-cache hit. |
+
+### Reading the two amplification ratios
+
+`*_alloc_mb / *_read_mb` is the read amplification for each path. 1.0 means the
+handler moved exactly what X-Plane consumed; anything above it is waste, and the
+allocations concerned are 11-17 MB — the same size class as the DDS buffers in
+candidate A of #227, and on the same side of glibc's 32 MB adaptive mmap
+threshold. Both ratios are workload-independent: they depend on file size and
+the kernel's read chunk, not on flight length or throughput, so a single sample
+line is enough to read them.
 
 ### Estimating `chunk_index_entries` memory footprint
 
