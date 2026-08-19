@@ -236,6 +236,20 @@ pub enum MetricEvent {
         virtual_dds: bool,
     },
 
+    /// Open virtual DDS file handles, and the tile bytes they pin.
+    ///
+    /// A gauge, emitted on open and release. Each open handle holds one whole
+    /// tile so later reads can slice it (#234), so this is the live cost of
+    /// that memoisation -- and the only measurement of how many DDS files
+    /// X-Plane keeps open at once, which is what `MAX_PINNED_TILE_BYTES`
+    /// is guessing at.
+    FuseHandlesUpdate {
+        /// Virtual DDS files currently open.
+        open: u64,
+        /// Tile bytes currently pinned by those handles.
+        pinned_bytes: u64,
+    },
+
     /// A FUSE request started being handled.
     FuseRequestStarted,
 
@@ -342,6 +356,7 @@ impl MetricEvent {
             Self::AssemblyCompleted { .. } => "assembly_completed",
             Self::FuseTileServed => "fuse_tile_served",
             Self::FuseRead { .. } => "fuse_read",
+            Self::FuseHandlesUpdate { .. } => "fuse_handles_update",
             Self::FuseRequestStarted => "fuse_request_started",
             Self::FuseRequestCompleted => "fuse_request_completed",
             Self::FuseRequestQueued => "fuse_request_queued",

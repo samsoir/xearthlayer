@@ -259,6 +259,10 @@ pub struct AggregatedState {
     pub fuse_dds_read_bytes: u64,
     /// Bytes of whole tiles materialised to serve those reads.
     pub fuse_dds_alloc_bytes: u64,
+    /// Virtual DDS files currently open (gauge).
+    pub fuse_handles_open: u64,
+    /// Tile bytes currently pinned by open handles (gauge).
+    pub fuse_handles_pinned_bytes: u64,
 
     // =========================================================================
     // Peak Tracking
@@ -363,6 +367,8 @@ impl AggregatedState {
             fuse_dds_reads: 0,
             fuse_dds_read_bytes: 0,
             fuse_dds_alloc_bytes: 0,
+            fuse_handles_open: 0,
+            fuse_handles_pinned_bytes: 0,
             peak_bytes_per_second: 0.0,
             prefetch_regions_in_progress: 0,
             prefetch_regions_prefetched: 0,

@@ -329,6 +329,11 @@ impl MetricsDaemon {
                     self.state.fuse_file_alloc_bytes += materialised;
                 }
             }
+            MetricEvent::FuseHandlesUpdate { open, pinned_bytes } => {
+                // Gauges: assigned, not accumulated.
+                self.state.fuse_handles_open = open;
+                self.state.fuse_handles_pinned_bytes = pinned_bytes;
+            }
             MetricEvent::FuseRequestStarted => {
                 self.state.fuse_requests_active += 1;
             }
@@ -443,6 +448,8 @@ impl MetricsDaemon {
             fuse_dds_reads = state.fuse_dds_reads,
             fuse_dds_read_mb = state.fuse_dds_read_bytes / MB,
             fuse_dds_alloc_mb = state.fuse_dds_alloc_bytes / MB,
+            dds_handles_open = state.fuse_handles_open,
+            dds_pinned_mb = state.fuse_handles_pinned_bytes / MB,
             "Memory sample"
         );
     }

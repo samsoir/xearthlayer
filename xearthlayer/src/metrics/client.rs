@@ -120,6 +120,12 @@ impl MetricsClient {
         });
     }
 
+    /// Reports the current virtual DDS handle gauge.
+    #[inline]
+    pub fn fuse_handles(&self, open: u64, pinned_bytes: u64) {
+        self.send(MetricEvent::FuseHandlesUpdate { open, pinned_bytes });
+    }
+
     /// Records a chunk disk cache miss.
     #[inline]
     pub fn chunk_disk_cache_miss(&self) {

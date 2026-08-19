@@ -411,6 +411,17 @@ impl Fuse3OrthoUnionFS {
             .unwrap_or_else(get_default_placeholder)
     }
 
+    /// Publish the handle gauge. Called on open and release -- two events per
+    /// texture, against the 12-23 reads it takes to serve one.
+    fn report_handle_gauge(&self) {
+        if let Some(metrics) = &self.metrics_client {
+            metrics.fuse_handles(
+                self.dds_handles.len() as u64,
+                self.pinned_tile_bytes.load(Ordering::Relaxed),
+            );
+        }
+    }
+
     /// Number of virtual DDS files currently open.
     pub fn open_dds_handles(&self) -> usize {
         self.dds_handles.len()
@@ -795,6 +806,10 @@ impl Filesystem for Fuse3OrthoUnionFS {
                             let data = self.resolve_tile(&handle.coords).await;
                             self.pinned_tile_bytes
                                 .fetch_add(data.len() as u64, Ordering::Relaxed);
+                            // Report here, not at open(): the tile is produced
+                            // on first read, so a gauge sampled only at open
+                            // would never see the bytes it is meant to bound.
+                            self.report_handle_gauge();
                             Arc::new(data)
                         })
                         .instrument(fuse_read_span)
@@ -1117,6 +1132,8 @@ impl Filesystem for Fuse3OrthoUnionFS {
             }),
         );
 
+        self.report_handle_gauge();
+
         Ok(ReplyOpen {
             fh,
             flags: FOPEN_DIRECT_IO,
@@ -1139,6 +1156,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
                 self.pinned_tile_bytes
                     .fetch_sub(tile.len() as u64, Ordering::Relaxed);
             }
+            self.report_handle_gauge();
         }
         Ok(())
     }

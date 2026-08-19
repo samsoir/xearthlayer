@@ -77,6 +77,8 @@ mebibyte", not necessarily "nothing".
 | `fuse_dds_reads` | `state.fuse_dds_reads` | FUSE `read()` calls answered from a **generated DDS tile**. Because virtual DDS files are opened `FOPEN_DIRECT_IO` (#65) the kernel serves nothing from cache, so this is a complete census of X-Plane's texture reads, not a sample — which makes it the tiles-*served* denominator #227 otherwise lacks. |
 | `fuse_dds_read_mb` | `state.fuse_dds_read_bytes` | Bytes those calls returned to the kernel. |
 | `fuse_dds_alloc_mb` | `state.fuse_dds_alloc_bytes` | Bytes of whole tiles materialised to produce them. Since #234 the tile is charged to the read that produced it and nothing to the reads that slice it, so this should now track `fuse_dds_read_mb` closely. It ran 12-23x ahead before #234, when every ranged call re-entered the executor and cloned the whole tile. |
+| `dds_handles_open` | `state.fuse_handles_open` | Virtual DDS files X-Plane currently has open (gauge). Each one may pin a whole tile so later reads can slice it (#234). Nothing measured this before, so `MAX_PINNED_TILE_BYTES` is currently a guess — this is the number that should replace it. |
+| `dds_pinned_mb` | `state.fuse_handles_pinned_bytes` | Tile bytes pinned by those handles (gauge). Bounded by `MAX_PINNED_TILE_BYTES` (512 MiB); on reaching it, `open()` stops memoising and reads fall back to resolving per call. Sustained pinning at the ceiling means the bound is too low for this workload, not that anything is leaking. |
 
 ### Reading the two amplification ratios
 
