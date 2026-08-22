@@ -268,6 +268,17 @@ in the tag and: (a) marks the GitHub Release `--prerelease --latest=false`, and 
 the `.deb`/`.rpm`/AUR jobs. `website-sync.yml` never fires because it only triggers on a
 `release/*` merge to `main`, which a preview never performs.
 
+### When the identifier is bumped
+
+`develop/0.4.7` always carries the **next** unreleased identifier, not the last
+released one. The bump happens immediately *after* a preview ships, not as part
+of cutting the next one, so a binary built from `develop` never falsely claims
+to be a tag that testers already hold.
+
+Practical consequence: at cut time the version in `Cargo.toml` is normally
+already correct. Verify it rather than bumping it, or the identifier advances
+twice and an increment is silently skipped.
+
 ### Identifier progression
 
 Increment the trailing number within a stage, then advance the stage as the
@@ -309,7 +320,10 @@ extraction, unchanged.
 git checkout develop/0.4.7
 git pull origin develop/0.4.7
 
-# 2. Bump the pre-release identifier in Cargo.toml, then sync the lockfile
+# 2. Confirm the pre-release identifier in Cargo.toml is the one you are cutting.
+#    develop carries the NEXT identifier, bumped when the previous preview
+#    shipped -- so this is usually already correct. Bump only if it is not,
+#    then sync the lockfile.
 #    [workspace.package] version = "0.4.7-alpha.N"
 cargo update -w
 ```
