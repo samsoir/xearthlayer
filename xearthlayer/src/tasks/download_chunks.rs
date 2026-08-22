@@ -23,6 +23,7 @@ use crate::executor::{
     TaskOutput, TaskResult,
 };
 use crate::metrics::{MetricsClient, OptionalMetrics};
+use bytes::Bytes;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -181,7 +182,7 @@ pub fn get_chunks_from_output(output: &TaskOutput) -> Option<&ChunkResults> {
 struct ChunkData {
     row: u8,
     col: u8,
-    data: Vec<u8>,
+    data: Bytes,
 }
 
 /// Result of a failed chunk download.
@@ -453,7 +454,7 @@ fn spawn_cache_write<D>(
     tile: TileCoord,
     chunk_row: u8,
     chunk_col: u8,
-    data: Vec<u8>,
+    data: Bytes,
     metrics: Option<MetricsClient>,
 ) where
     D: DiskCache,

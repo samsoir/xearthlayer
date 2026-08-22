@@ -7,7 +7,11 @@
 //! # Design Principles
 //!
 //! - **String keys**: Human-readable for debugging, flexible for any domain
-//! - **Vec<u8> values**: Raw bytes, no serialization opinions imposed
+//! - **`Bytes` values**: Raw bytes, no serialization opinions imposed.
+//!   `Bytes` rather than `Vec<u8>` so a cache hit is a refcount bump, not a
+//!   copy of the value -- a DDS tile is 10.66 MiB and the FUSE read path wants
+//!   about 4% of it (#237). `Bytes::from(Vec<u8>)` is O(1), so a provider that
+//!   builds an owned buffer (any disk read) converts for free.
 //! - **Minimal interface**: Only essential operations, no domain-specific concerns
 //! - **Self-contained GC**: Providers manage their own garbage collection
 //! - **Dyn-compatible**: Uses `Pin<Box<dyn Future>>` for trait object support
@@ -29,6 +33,7 @@
 //! let value = cache.get("key").await?;
 //! ```
 
+use bytes::Bytes;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -133,7 +138,7 @@ pub trait Cache: Send + Sync {
     /// - I/O fails (disk caches)
     /// - Key or value exceeds size limits
     /// - Cache is shutting down
-    fn set(&self, key: &str, value: Vec<u8>) -> BoxFuture<'_, Result<(), ServiceCacheError>>;
+    fn set(&self, key: &str, value: Bytes) -> BoxFuture<'_, Result<(), ServiceCacheError>>;
 
     /// Retrieve a value by key.
     ///
@@ -146,7 +151,7 @@ pub trait Cache: Send + Sync {
     /// - `Ok(Some(data))` if the key exists
     /// - `Ok(None)` if the key is not found
     /// - `Err(_)` if an error occurs
-    fn get(&self, key: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, ServiceCacheError>>;
+    fn get(&self, key: &str) -> BoxFuture<'_, Result<Option<Bytes>, ServiceCacheError>>;
 
     /// Delete a value by key.
     ///

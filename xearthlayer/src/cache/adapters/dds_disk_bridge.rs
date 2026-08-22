@@ -5,6 +5,7 @@
 //! memory cache bridge (`"tile:{zoom}:{row}:{col}"`), but backed by a
 //! `DiskCacheProvider` for persistent DDS tile storage.
 
+use bytes::Bytes;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -39,14 +40,14 @@ impl DdsDiskCacheBridge {
 
 #[allow(clippy::manual_async_fn)]
 impl DdsDiskCache for DdsDiskCacheBridge {
-    fn get(&self, row: u32, col: u32, zoom: u8) -> impl Future<Output = Option<Vec<u8>>> + Send {
+    fn get(&self, row: u32, col: u32, zoom: u8) -> impl Future<Output = Option<Bytes>> + Send {
         async move {
             let tile = TileCoord { row, col, zoom };
             self.client.get(&tile).await
         }
     }
 
-    fn put(&self, row: u32, col: u32, zoom: u8, data: Vec<u8>) -> impl Future<Output = ()> + Send {
+    fn put(&self, row: u32, col: u32, zoom: u8, data: Bytes) -> impl Future<Output = ()> + Send {
         async move {
             let tile = TileCoord { row, col, zoom };
             self.client.set(&tile, data).await;
@@ -112,10 +113,10 @@ mod tests {
         let (bridge, service, _dir) = create_disk_bridge().await;
 
         let data = vec![1, 2, 3, 4, 5];
-        bridge.put(100, 200, 15, data.clone()).await;
+        bridge.put(100, 200, 15, data.clone().into()).await;
 
         let result = bridge.get(100, 200, 15).await;
-        assert_eq!(result, Some(data));
+        assert_eq!(result, Some(Bytes::from(data)));
 
         service.shutdown().await;
     }
@@ -136,7 +137,7 @@ mod tests {
 
         assert!(!bridge.contains(100, 200, 15).await);
 
-        bridge.put(100, 200, 15, vec![1, 2, 3]).await;
+        bridge.put(100, 200, 15, vec![1, 2, 3].into()).await;
 
         assert!(bridge.contains(100, 200, 15).await);
 
@@ -166,7 +167,7 @@ mod tests {
         let data = vec![42u8; 1024];
         let write_data = data.clone();
         let handle = tokio::spawn(async move {
-            write_bridge.put(1477, 980, 12, write_data).await;
+            write_bridge.put(1477, 980, 12, write_data.into()).await;
         });
 
         // Wait for the fire-and-forget write to complete
@@ -176,7 +177,7 @@ mod tests {
         let result = bridge.get(1477, 980, 12).await;
         assert_eq!(
             result,
-            Some(data),
+            Some(Bytes::from(data)),
             "DDS disk cache should find tile written by fire-and-forget task"
         );
 
@@ -196,12 +197,12 @@ mod tests {
         let reader = Arc::clone(&bridge);
 
         let data = vec![99u8; 2048];
-        writer.put(1530, 950, 12, data.clone()).await;
+        writer.put(1530, 950, 12, data.clone().into()).await;
 
         let result = reader.get(1530, 950, 12).await;
         assert_eq!(
             result,
-            Some(data),
+            Some(Bytes::from(data)),
             "Reader clone should find tile written by writer clone"
         );
 
@@ -227,7 +228,7 @@ mod tests {
         let bridge = DdsDiskCacheBridge::new(provider);
 
         assert!(!bridge.tile_exists_blocking(12754, 5279, 15));
-        bridge.put(12754, 5279, 15, vec![0u8; 64]).await;
+        bridge.put(12754, 5279, 15, vec![0u8; 64].into()).await;
         assert!(bridge.tile_exists_blocking(12754, 5279, 15));
         assert_eq!(
             bridge.contains(12754, 5279, 15).await,

@@ -3,6 +3,7 @@
 //! Implements `executor::MemoryCache` trait using `TileCacheClient` from the
 //! new cache service infrastructure.
 
+use bytes::Bytes;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -40,14 +41,14 @@ impl MemoryCacheBridge {
 // suggests converting to async fn. However, we must match the trait's signature.
 #[allow(clippy::manual_async_fn)]
 impl MemoryCache for MemoryCacheBridge {
-    fn get(&self, row: u32, col: u32, zoom: u8) -> impl Future<Output = Option<Vec<u8>>> + Send {
+    fn get(&self, row: u32, col: u32, zoom: u8) -> impl Future<Output = Option<Bytes>> + Send {
         async move {
             let tile = TileCoord { row, col, zoom };
             self.client.get(&tile).await
         }
     }
 
-    fn put(&self, row: u32, col: u32, zoom: u8, data: Vec<u8>) -> impl Future<Output = ()> + Send {
+    fn put(&self, row: u32, col: u32, zoom: u8, data: Bytes) -> impl Future<Output = ()> + Send {
         async move {
             let tile = TileCoord { row, col, zoom };
             self.client.set(&tile, data).await;
@@ -76,10 +77,10 @@ mod tests {
         let bridge = MemoryCacheBridge::new(service.cache());
 
         let data = vec![1, 2, 3, 4, 5];
-        bridge.put(100, 200, 15, data.clone()).await;
+        bridge.put(100, 200, 15, data.clone().into()).await;
 
         let result = bridge.get(100, 200, 15).await;
-        assert_eq!(result, Some(data));
+        assert_eq!(result, Some(Bytes::from(data)));
 
         service.shutdown().await;
     }
@@ -104,8 +105,8 @@ mod tests {
             .unwrap();
         let bridge = MemoryCacheBridge::new(service.cache());
 
-        bridge.put(100, 200, 15, vec![0u8; 1000]).await;
-        bridge.put(101, 200, 15, vec![0u8; 2000]).await;
+        bridge.put(100, 200, 15, vec![0u8; 1000].into()).await;
+        bridge.put(101, 200, 15, vec![0u8; 2000].into()).await;
 
         // Run gc to sync stats
         let _ = service.cache().gc().await;

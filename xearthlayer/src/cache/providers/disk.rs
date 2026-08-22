@@ -27,6 +27,7 @@
 //! not automatically migrated. Run `xearthlayer cache migrate` to move flat
 //! files into region subdirectories, or `xearthlayer cache clear` to start fresh.
 
+use bytes::Bytes;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -265,7 +266,7 @@ impl DiskCacheProvider {
 }
 
 impl Cache for DiskCacheProvider {
-    fn set(&self, key: &str, value: Vec<u8>) -> BoxFuture<'_, Result<(), ServiceCacheError>> {
+    fn set(&self, key: &str, value: Bytes) -> BoxFuture<'_, Result<(), ServiceCacheError>> {
         let path = self.key_path(key);
         let size = value.len() as u64;
         let key_owned = key.to_string();
@@ -313,7 +314,7 @@ impl Cache for DiskCacheProvider {
         })
     }
 
-    fn get(&self, key: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, ServiceCacheError>> {
+    fn get(&self, key: &str) -> BoxFuture<'_, Result<Option<Bytes>, ServiceCacheError>> {
         let path = self.key_path(key);
         let key_owned = key.to_string();
         let tier = self.tier;
@@ -330,7 +331,7 @@ impl Cache for DiskCacheProvider {
                         tier = %tier,
                         "Disk cache hit"
                     );
-                    Ok(Some(data))
+                    Ok(Some(Bytes::from(data)))
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // File not on disk - ensure index is clean
@@ -479,10 +480,10 @@ mod tests {
     async fn test_disk_provider_set_and_get() {
         let (_temp_dir, provider) = create_test_provider(1_000_000).await;
 
-        provider.set("key1", vec![1, 2, 3]).await.unwrap();
+        provider.set("key1", vec![1, 2, 3].into()).await.unwrap();
 
         let value = provider.get("key1").await.unwrap();
-        assert_eq!(value, Some(vec![1, 2, 3]));
+        assert_eq!(value, Some(Bytes::from(vec![1, 2, 3])));
 
         provider.shutdown().await;
     }
@@ -501,7 +502,7 @@ mod tests {
     async fn test_disk_provider_delete() {
         let (_temp_dir, provider) = create_test_provider(1_000_000).await;
 
-        provider.set("key1", vec![1, 2, 3]).await.unwrap();
+        provider.set("key1", vec![1, 2, 3].into()).await.unwrap();
 
         let deleted = provider.delete("key1").await.unwrap();
         assert!(deleted);
@@ -522,7 +523,7 @@ mod tests {
 
         assert!(!provider.contains("key1").await.unwrap());
 
-        provider.set("key1", vec![1]).await.unwrap();
+        provider.set("key1", vec![1].into()).await.unwrap();
 
         assert!(provider.contains("key1").await.unwrap());
 
@@ -540,7 +541,7 @@ mod tests {
             provider.contains_sync(key)
         );
 
-        provider.set(key, vec![0u8; 64]).await.unwrap();
+        provider.set(key, vec![0u8; 64].into()).await.unwrap();
 
         assert!(provider.contains_sync(key), "present key must be true");
         assert_eq!(
@@ -555,11 +556,11 @@ mod tests {
     async fn test_disk_provider_replace_existing() {
         let (_temp_dir, provider) = create_test_provider(1_000_000).await;
 
-        provider.set("key1", vec![1, 2, 3]).await.unwrap();
-        provider.set("key1", vec![4, 5, 6, 7]).await.unwrap();
+        provider.set("key1", vec![1, 2, 3].into()).await.unwrap();
+        provider.set("key1", vec![4, 5, 6, 7].into()).await.unwrap();
 
         let value = provider.get("key1").await.unwrap();
-        assert_eq!(value, Some(vec![4, 5, 6, 7]));
+        assert_eq!(value, Some(Bytes::from(vec![4, 5, 6, 7])));
 
         provider.shutdown().await;
     }
@@ -571,12 +572,12 @@ mod tests {
         assert_eq!(provider.size_bytes(), 0);
         assert_eq!(provider.entry_count(), 0);
 
-        provider.set("key1", vec![0u8; 1000]).await.unwrap();
+        provider.set("key1", vec![0u8; 1000].into()).await.unwrap();
 
         assert_eq!(provider.size_bytes(), 1000);
         assert_eq!(provider.entry_count(), 1);
 
-        provider.set("key2", vec![0u8; 2000]).await.unwrap();
+        provider.set("key2", vec![0u8; 2000].into()).await.unwrap();
 
         assert_eq!(provider.size_bytes(), 3000);
         assert_eq!(provider.entry_count(), 2);
@@ -591,7 +592,7 @@ mod tests {
         assert!(!provider.needs_gc());
 
         // Add data to exceed 95% threshold (950 bytes)
-        provider.set("key1", vec![0u8; 960]).await.unwrap();
+        provider.set("key1", vec![0u8; 960].into()).await.unwrap();
 
         assert!(provider.needs_gc());
 
@@ -602,7 +603,7 @@ mod tests {
     async fn test_disk_provider_lru_index_access() {
         let (_temp_dir, provider) = create_test_provider(1_000_000).await;
 
-        provider.set("key1", vec![1, 2, 3]).await.unwrap();
+        provider.set("key1", vec![1, 2, 3].into()).await.unwrap();
 
         let lru_index = provider.lru_index();
         assert!(lru_index.contains("key1"));
@@ -615,7 +616,7 @@ mod tests {
         let (_temp_dir, provider) = create_test_provider(1_000_000).await;
 
         // Write should be atomic (temp file + rename)
-        provider.set("key1", vec![1, 2, 3]).await.unwrap();
+        provider.set("key1", vec![1, 2, 3].into()).await.unwrap();
 
         // No temp files should remain (check in the region directory)
         let cache_path = provider.lru_index().key_to_path("key1");
@@ -641,7 +642,7 @@ mod tests {
         // when a get() actually discovers the missing file."
         let (_temp_dir, provider) = create_test_provider(1_000_000).await;
 
-        provider.set("key1", vec![1, 2, 3]).await.unwrap();
+        provider.set("key1", vec![1, 2, 3].into()).await.unwrap();
         assert!(provider.lru_index().contains("key1"));
 
         // External mutation: delete the file behind the cache's back.
@@ -735,7 +736,7 @@ mod tests {
             };
             let provider = DiskCacheProvider::start(config).await.unwrap();
 
-            provider.set(key, vec![1, 2, 3, 4, 5]).await.unwrap();
+            provider.set(key, vec![1, 2, 3, 4, 5].into()).await.unwrap();
             provider.shutdown().await;
         }
 
@@ -756,7 +757,7 @@ mod tests {
             assert_eq!(provider.entry_count(), 1);
 
             let value = provider.get(key).await.unwrap();
-            assert_eq!(value, Some(vec![1, 2, 3, 4, 5]));
+            assert_eq!(value, Some(Bytes::from(vec![1, 2, 3, 4, 5])));
 
             provider.shutdown().await;
         }

@@ -4,6 +4,8 @@
 //! across the coordinator test suite, eliminating duplication of mock structs
 //! like `StableBoundsTracker`, `BackpressureMockClient`, etc.
 
+use bytes::Bytes;
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -170,8 +172,8 @@ impl crate::executor::DaemonMemoryCache for AlwaysHitMemoryCache {
         _row: u32,
         _col: u32,
         _zoom: u8,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
-        Box::pin(async { Some(vec![0u8; 16]) })
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Bytes>> + Send + '_>> {
+        Box::pin(async { Some(Bytes::from(vec![0u8; 16])) })
     }
 
     fn put(
@@ -179,7 +181,7 @@ impl crate::executor::DaemonMemoryCache for AlwaysHitMemoryCache {
         _row: u32,
         _col: u32,
         _zoom: u8,
-        _data: Vec<u8>,
+        _data: Bytes,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
     }

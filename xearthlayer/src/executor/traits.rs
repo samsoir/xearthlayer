@@ -32,6 +32,7 @@
 //! ```
 
 use crate::cache::DiskTier;
+use bytes::Bytes;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -72,7 +73,7 @@ pub trait ChunkProvider: Send + Sync + 'static {
         row: u32,
         col: u32,
         zoom: u8,
-    ) -> impl Future<Output = Result<Vec<u8>, ChunkDownloadError>> + Send;
+    ) -> impl Future<Output = Result<Bytes, ChunkDownloadError>> + Send;
 
     /// Returns the provider name for logging.
     fn name(&self) -> &str;
@@ -177,13 +178,13 @@ pub trait MemoryCache: Send + Sync + 'static {
     /// Gets a tile from the cache.
     ///
     /// Returns `Some(data)` if the tile is cached, `None` otherwise.
-    fn get(&self, row: u32, col: u32, zoom: u8) -> impl Future<Output = Option<Vec<u8>>> + Send;
+    fn get(&self, row: u32, col: u32, zoom: u8) -> impl Future<Output = Option<Bytes>> + Send;
 
     /// Stores a tile in the cache.
     ///
     /// Eviction of old entries happens automatically based on the
     /// cache's eviction policy.
-    fn put(&self, row: u32, col: u32, zoom: u8, data: Vec<u8>) -> impl Future<Output = ()> + Send;
+    fn put(&self, row: u32, col: u32, zoom: u8, data: Bytes) -> impl Future<Output = ()> + Send;
 
     /// Returns current cache size in bytes.
     fn size_bytes(&self) -> usize;
@@ -219,7 +220,7 @@ pub trait DiskCache: Send + Sync + 'static {
         zoom: u8,
         chunk_row: u8,
         chunk_col: u8,
-    ) -> impl Future<Output = Option<Vec<u8>>> + Send;
+    ) -> impl Future<Output = Option<Bytes>> + Send;
 
     /// Stores a chunk in the cache.
     fn put(
@@ -229,7 +230,7 @@ pub trait DiskCache: Send + Sync + 'static {
         zoom: u8,
         chunk_row: u8,
         chunk_col: u8,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> impl Future<Output = Result<(), std::io::Error>> + Send;
 }
 
@@ -254,13 +255,13 @@ pub trait DdsDiskCache: Send + Sync + 'static {
     ///
     /// Returns `Some(data)` if the tile is cached on disk, `None` otherwise.
     /// On hit, performs a disk read (~3.5ms NVMe, ~21ms SATA SSD).
-    fn get(&self, row: u32, col: u32, zoom: u8) -> impl Future<Output = Option<Vec<u8>>> + Send;
+    fn get(&self, row: u32, col: u32, zoom: u8) -> impl Future<Output = Option<Bytes>> + Send;
 
     /// Stores a DDS tile in the disk cache.
     ///
     /// Writes the encoded DDS data to disk. Eviction of old entries is
     /// handled by the GC scheduler daemon.
-    fn put(&self, row: u32, col: u32, zoom: u8, data: Vec<u8>) -> impl Future<Output = ()> + Send;
+    fn put(&self, row: u32, col: u32, zoom: u8, data: Bytes) -> impl Future<Output = ()> + Send;
 
     /// Checks if a tile exists in the disk cache index.
     ///

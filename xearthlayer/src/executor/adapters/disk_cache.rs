@@ -2,6 +2,7 @@
 //!
 //! Adapts disk cache operations to the executor's `DiskCache` trait.
 
+use bytes::Bytes;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -95,11 +96,11 @@ impl crate::executor::DiskCache for DiskCacheAdapter {
         zoom: u8,
         chunk_row: u8,
         chunk_col: u8,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<Bytes> {
         let path = self.chunk_path(tile_row, tile_col, zoom, chunk_row, chunk_col);
 
         // Use tokio's async file I/O
-        tokio::fs::read(&path).await.ok()
+        tokio::fs::read(&path).await.ok().map(Bytes::from)
     }
 
     async fn put(
@@ -109,7 +110,7 @@ impl crate::executor::DiskCache for DiskCacheAdapter {
         zoom: u8,
         chunk_row: u8,
         chunk_col: u8,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), std::io::Error> {
         let path = self.chunk_path(tile_row, tile_col, zoom, chunk_row, chunk_col);
         let data_len = data.len() as u64;
@@ -142,7 +143,7 @@ impl crate::executor::DiskCache for NullDiskCache {
         _zoom: u8,
         _chunk_row: u8,
         _chunk_col: u8,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<Bytes> {
         None
     }
 
@@ -153,7 +154,7 @@ impl crate::executor::DiskCache for NullDiskCache {
         _zoom: u8,
         _chunk_row: u8,
         _chunk_col: u8,
-        _data: Vec<u8>,
+        _data: Bytes,
     ) -> Result<(), std::io::Error> {
         Ok(())
     }
@@ -165,11 +166,11 @@ impl crate::executor::DiskCache for NullDiskCache {
 pub struct NullDdsDiskCache;
 
 impl crate::executor::DdsDiskCache for NullDdsDiskCache {
-    async fn get(&self, _row: u32, _col: u32, _zoom: u8) -> Option<Vec<u8>> {
+    async fn get(&self, _row: u32, _col: u32, _zoom: u8) -> Option<Bytes> {
         None
     }
 
-    async fn put(&self, _row: u32, _col: u32, _zoom: u8, _data: Vec<u8>) {}
+    async fn put(&self, _row: u32, _col: u32, _zoom: u8, _data: Bytes) {}
 
     async fn contains(&self, _row: u32, _col: u32, _zoom: u8) -> bool {
         false
@@ -230,7 +231,7 @@ mod tests {
     async fn test_null_disk_cache_put_succeeds() {
         let cache = NullDiskCache;
 
-        let result = cache.put(100, 200, 16, 0, 0, vec![1, 2, 3]).await;
+        let result = cache.put(100, 200, 16, 0, 0, vec![1, 2, 3].into()).await;
         assert!(result.is_ok());
     }
 
@@ -239,7 +240,10 @@ mod tests {
         let cache = NullDiskCache;
 
         // Put data
-        cache.put(100, 200, 16, 0, 0, vec![1, 2, 3]).await.unwrap();
+        cache
+            .put(100, 200, 16, 0, 0, vec![1, 2, 3].into())
+            .await
+            .unwrap();
 
         // Should still miss
         let result = cache.get(100, 200, 16, 0, 0).await;
@@ -257,7 +261,10 @@ mod tests {
 
         // Put some data
         let data = vec![0xFF, 0xD8, 0xFF, 0xE0]; // JPEG magic bytes
-        adapter.put(100, 200, 16, 0, 0, data.clone()).await.unwrap();
+        adapter
+            .put(100, 200, 16, 0, 0, data.clone().into())
+            .await
+            .unwrap();
 
         // Should now be cached
         let result = adapter.get(100, 200, 16, 0, 0).await;
@@ -275,7 +282,7 @@ mod tests {
             for chunk_col in 0..3u8 {
                 let data = vec![chunk_row, chunk_col];
                 adapter
-                    .put(100, 200, 16, chunk_row, chunk_col, data)
+                    .put(100, 200, 16, chunk_row, chunk_col, data.into())
                     .await
                     .unwrap();
             }
@@ -301,7 +308,7 @@ mod tests {
         let adapter = DiskCacheAdapter::new(temp_dir.path().to_path_buf(), "test");
 
         let data = vec![1, 2, 3];
-        adapter.put(100, 200, 16, 5, 10, data).await.unwrap();
+        adapter.put(100, 200, 16, 5, 10, data.into()).await.unwrap();
 
         // Verify directory structure was created
         let expected_dir = temp_dir.path().join("chunks/test/16/100/200");

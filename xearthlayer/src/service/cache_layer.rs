@@ -333,6 +333,7 @@ impl CacheLayer {
 mod tests {
     use super::*;
     use crate::executor::{DdsDiskCache, DiskCache, MemoryCache};
+    use bytes::Bytes;
     use tempfile::tempdir;
 
     fn create_test_config(cache_dir: std::path::PathBuf) -> ServiceConfig {
@@ -415,9 +416,9 @@ mod tests {
         let cache_layer = CacheLayer::new(&config, "test", metrics).await.unwrap();
         let bridge = cache_layer.memory_bridge();
 
-        bridge.put(100, 200, 15, vec![1, 2, 3]).await;
+        bridge.put(100, 200, 15, vec![1, 2, 3].into()).await;
         let result = bridge.get(100, 200, 15).await;
-        assert_eq!(result, Some(vec![1, 2, 3]));
+        assert_eq!(result, Some(Bytes::from(vec![1, 2, 3])));
 
         cache_layer.shutdown().await;
     }
@@ -431,9 +432,9 @@ mod tests {
         let cache_layer = CacheLayer::new(&config, "test", metrics).await.unwrap();
         let bridge = cache_layer.dds_disk_bridge();
 
-        bridge.put(100, 200, 15, vec![1, 2, 3]).await;
+        bridge.put(100, 200, 15, vec![1, 2, 3].into()).await;
         let result = bridge.get(100, 200, 15).await;
-        assert_eq!(result, Some(vec![1, 2, 3]));
+        assert_eq!(result, Some(Bytes::from(vec![1, 2, 3])));
 
         assert!(bridge.contains(100, 200, 15).await);
         assert!(!bridge.contains(999, 999, 15).await);
@@ -450,9 +451,12 @@ mod tests {
         let cache_layer = CacheLayer::new(&config, "test", metrics).await.unwrap();
         let bridge = cache_layer.disk_bridge();
 
-        bridge.put(100, 200, 15, 0, 0, vec![1, 2, 3]).await.unwrap();
+        bridge
+            .put(100, 200, 15, 0, 0, vec![1, 2, 3].into())
+            .await
+            .unwrap();
         let result = bridge.get(100, 200, 15, 0, 0).await;
-        assert_eq!(result, Some(vec![1, 2, 3]));
+        assert_eq!(result, Some(Bytes::from(vec![1, 2, 3])));
 
         cache_layer.shutdown().await;
     }

@@ -10,11 +10,15 @@
 //! X-Plane, even under memory pressure or when encoding fails.
 
 use crate::dds::{DdsEncoder, DdsError, DdsFormat};
+use bytes::Bytes;
 use image::RgbaImage;
 use std::sync::OnceLock;
 
 /// Static placeholder cache - generated once, never fails after first success.
-static DEFAULT_PLACEHOLDER: OnceLock<Vec<u8>> = OnceLock::new();
+/// `Bytes`, so handing out the placeholder is a refcount bump rather than an
+/// 11 MB copy. It is returned on every timeout, which is exactly when the
+/// process is least able to afford the allocation (#237).
+static DEFAULT_PLACEHOLDER: OnceLock<Bytes> = OnceLock::new();
 
 /// Generate a magenta placeholder DDS texture.
 ///
@@ -110,11 +114,13 @@ pub fn generate_default_placeholder() -> Result<Vec<u8>, DdsError> {
 /// assert!(!placeholder.is_empty());
 /// assert_eq!(&placeholder[0..4], b"DDS ");
 /// ```
-pub fn get_default_placeholder() -> Vec<u8> {
+pub fn get_default_placeholder() -> Bytes {
     DEFAULT_PLACEHOLDER
         .get_or_init(|| {
-            generate_default_placeholder()
-                .expect("Failed to generate default placeholder - this is a critical error")
+            Bytes::from(
+                generate_default_placeholder()
+                    .expect("Failed to generate default placeholder - this is a critical error"),
+            )
         })
         .clone()
 }
@@ -141,8 +147,9 @@ pub fn get_default_placeholder() -> Vec<u8> {
 pub fn init_placeholder_cache() -> Result<(), DdsError> {
     // Force initialization by calling get_or_init with our generator
     // If it fails, the error propagates
-    let _ = DEFAULT_PLACEHOLDER
-        .get_or_init(|| generate_default_placeholder().expect("Failed to generate placeholder"));
+    let _ = DEFAULT_PLACEHOLDER.get_or_init(|| {
+        Bytes::from(generate_default_placeholder().expect("Failed to generate placeholder"))
+    });
     Ok(())
 }
 
@@ -198,7 +205,7 @@ pub const EXPECTED_DDS_SIZE: usize = full_chain_bc1_dds_size(4096, 4096);
 /// # Returns
 ///
 /// The original data if valid, or the default placeholder if invalid.
-pub fn validate_dds_or_placeholder(data: Vec<u8>, context: &str) -> Vec<u8> {
+pub fn validate_dds_or_placeholder(data: Bytes, context: &str) -> Bytes {
     // Check 1: Not empty
     if data.is_empty() {
         tracing::error!(
@@ -456,7 +463,7 @@ mod tests {
     #[test]
     fn test_validate_dds_empty_data() {
         // Empty data should return placeholder
-        let result = validate_dds_or_placeholder(vec![], "test");
+        let result = validate_dds_or_placeholder(vec![].into(), "test");
         assert_eq!(result.len(), EXPECTED_DDS_SIZE);
         assert_eq!(&result[0..4], b"DDS ");
     }
@@ -466,7 +473,7 @@ mod tests {
         // Wrong size should return placeholder
         let mut wrong_size = vec![0u8; 1000];
         wrong_size[0..4].copy_from_slice(b"DDS ");
-        let result = validate_dds_or_placeholder(wrong_size, "test");
+        let result = validate_dds_or_placeholder(wrong_size.into(), "test");
         assert_eq!(result.len(), EXPECTED_DDS_SIZE);
     }
 
@@ -475,7 +482,7 @@ mod tests {
         // Wrong magic bytes should return placeholder
         let mut wrong_magic = vec![0u8; EXPECTED_DDS_SIZE];
         wrong_magic[0..4].copy_from_slice(b"XXXX");
-        let result = validate_dds_or_placeholder(wrong_magic, "test");
+        let result = validate_dds_or_placeholder(wrong_magic.into(), "test");
         assert_eq!(&result[0..4], b"DDS ");
     }
 
