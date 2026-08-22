@@ -61,24 +61,41 @@ use std::ffi::{OsStr, OsString};
 use std::io::SeekFrom;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::mpsc;
 use tokio::sync::OnceCell;
-use tracing::{debug, trace, Instrument};
+use tracing::{debug, trace, warn, Instrument};
 
-/// Ceiling on DDS bytes pinned by open file handles.
+/// Ceiling on DDS bytes pinned by open file handles: 512 MiB, or 48 tiles.
 ///
 /// Each memoising handle holds one whole tile for as long as X-Plane keeps the
 /// file open, which is new retention in a codebase with an open unbounded-growth
 /// investigation (#227). Past this point `open()` stops handing out memoising
 /// handles and reads fall back to resolving per call, so the bound costs
-/// throughput rather than correctness. `open_dds_handles()` and
-/// `pinned_tile_bytes()` expose the real figures so this can be tuned from
-/// flight data rather than guessed at twice.
+/// throughput rather than correctness.
+///
+/// **Sized against measurement, not opens** (#236). Two scene loads on one
+/// machine (KDEN warm, KSLC cold, 2026-08-19) peaked at **31 concurrent opens**
+/// but only **10-21 MiB pinned** -- roughly two tiles, about 24x headroom.
+/// The two figures diverge because `pinned_tile_bytes` counts *materialised*
+/// tiles, and a tile is produced on first read, not on `open()`: X-Plane reads
+/// each texture in two calls and releases promptly, so most open handles hold
+/// nothing. Sizing this from the open count instead would overstate the
+/// requirement by more than an order of magnitude.
+///
+/// The bound is **soft**. Admission tests `pinned + expected` but reserves
+/// nothing, so concurrent opens can all pass against one remaining slot and
+/// then materialise together. Reserving on `open()` would be worse: X-Plane
+/// may open a file it never reads, so reservations would be held for tiles
+/// that never exist and the cap would engage falsely.
+///
+/// If `dds_budget_exhausted` on the `Memory sample` line is ever non-zero, a
+/// real scene has exceeded what this was sized against -- raise it against
+/// `dds_pinned_peak_mb` from that flight rather than by guessing again.
 const MAX_PINNED_TILE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Per-open state for one virtual DDS file.
@@ -165,6 +182,12 @@ pub struct Fuse3OrthoUnionFS {
     peak_handles_open: AtomicU64,
     /// Highest pinned byte total seen.
     peak_pinned_tile_bytes: AtomicU64,
+    /// Whether the budget-exhausted warning has been emitted this session.
+    ///
+    /// Latched, because the cap engages for every open in a burst rather than
+    /// once: an unlatched warn would bury the log it exists to serve. The
+    /// per-occurrence count goes to metrics instead (#236).
+    budget_warning_logged: AtomicBool,
     /// Optional channel for notifying Scene Tracker of DDS accesses.
     ///
     /// When set, the filesystem sends a [`FuseAccessEvent`] for each DDS
@@ -235,6 +258,7 @@ impl Fuse3OrthoUnionFS {
             pinned_tile_bytes: AtomicU64::new(0),
             peak_handles_open: AtomicU64::new(0),
             peak_pinned_tile_bytes: AtomicU64::new(0),
+            budget_warning_logged: AtomicBool::new(false),
             scene_tracker_tx: None,
             metrics_client: None,
             fuse_max_background: None,
@@ -271,6 +295,7 @@ impl Fuse3OrthoUnionFS {
             pinned_tile_bytes: AtomicU64::new(0),
             peak_handles_open: AtomicU64::new(0),
             peak_pinned_tile_bytes: AtomicU64::new(0),
+            budget_warning_logged: AtomicBool::new(false),
             scene_tracker_tx: None,
             metrics_client: None,
             fuse_max_background: None,
@@ -423,6 +448,15 @@ impl Fuse3OrthoUnionFS {
 
     /// Publish the handle gauge. Called on open and release -- two events per
     /// texture, against the 12-23 reads it takes to serve one.
+    /// Claims the one-shot budget warning: true on the first call of the
+    /// session, false ever after.
+    ///
+    /// The cap engages for every open in a burst, not once, so the warning is
+    /// latched and the per-occurrence count goes to metrics instead (#236).
+    fn claim_budget_warning(&self) -> bool {
+        !self.budget_warning_logged.swap(true, Ordering::Relaxed)
+    }
+
     fn report_handle_gauge(&self) {
         let open = self.dds_handles.len() as u64;
         let pinned = self.pinned_tile_bytes.load(Ordering::Relaxed);
@@ -501,6 +535,15 @@ impl Fuse3OrthoUnionFS {
         mount_options.no_open_dir_support(true);
 
         let mount_path = PathBuf::from(mountpoint);
+
+        // State the ceiling once, so a flight log is self-describing: a reader
+        // comparing dds_pinned_peak_mb against it does not have to know the
+        // constant, and does not have to guess which build it came from (#236).
+        tracing::info!(
+            dds_pinned_cap_mb = MAX_PINNED_TILE_BYTES / (1024 * 1024),
+            dds_pinned_cap_tiles = MAX_PINNED_TILE_BYTES / self.virtual_dds_config.size().max(1),
+            "Virtual DDS handle memoisation budget"
+        );
 
         #[cfg(target_os = "linux")]
         let handle = fuse3::raw::Session::new(mount_options)
@@ -1138,13 +1181,26 @@ impl Filesystem for Fuse3OrthoUnionFS {
         // Refuse to memoise past the pinned-bytes ceiling. fh 0 makes read()
         // resolve per call, which is slower but correct.
         let expected = self.virtual_dds_config.size();
-        if self.pinned_tile_bytes.load(Ordering::Relaxed) + expected > MAX_PINNED_TILE_BYTES {
-            debug!(
-                inode = inode,
-                pinned_mb = self.pinned_tile_bytes.load(Ordering::Relaxed) / (1024 * 1024),
-                open_handles = self.dds_handles.len(),
-                "DDS handle budget exhausted - serving this open without memoisation"
-            );
+        let pinned = self.pinned_tile_bytes.load(Ordering::Relaxed);
+        if pinned + expected > MAX_PINNED_TILE_BYTES {
+            // Count every refusal: this is what lets a flight log tell "the
+            // cap engaged" from "the #234 fix stopped working", which look
+            // identical otherwise -- both show fuse_dds_alloc_mb climbing.
+            if let Some(metrics) = &self.metrics_client {
+                metrics.fuse_handle_budget_exhausted();
+            }
+            // Warn once, at default level. Before #236 this was debug-only, so
+            // the degradation was invisible on an ordinary flight.
+            if self.claim_budget_warning() {
+                warn!(
+                    pinned_mb = pinned / (1024 * 1024),
+                    cap_mb = MAX_PINNED_TILE_BYTES / (1024 * 1024),
+                    open_handles = self.dds_handles.len(),
+                    "DDS handle budget exhausted - serving opens without memoisation. \
+                     Reads now resolve their tile once per call. Further occurrences \
+                     are counted in dds_budget_exhausted on the Memory sample line."
+                );
+            }
             return Ok(ReplyOpen {
                 fh: 0,
                 flags: FOPEN_DIRECT_IO,
@@ -1640,6 +1696,121 @@ mod tests {
                 zoom: 16,
                 map_type: "BI".to_string(),
             })
+    }
+
+    /// Fixture wired to an observable metrics channel.
+    fn virtual_dds_fixture_with_metrics() -> (
+        Fuse3OrthoUnionFS,
+        mpsc::UnboundedReceiver<crate::metrics::MetricEvent>,
+        TempDir,
+    ) {
+        let (fs, _requests, temp) = virtual_dds_fixture();
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            fs.with_metrics(crate::metrics::MetricsClient::new(tx)),
+            rx,
+            temp,
+        )
+    }
+
+    fn budget_exhausted_events(
+        rx: &mut mpsc::UnboundedReceiver<crate::metrics::MetricEvent>,
+    ) -> usize {
+        let mut n = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(
+                event,
+                crate::metrics::MetricEvent::FuseHandleBudgetExhausted
+            ) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Past the ceiling `open()` hands back fh 0, so `read()` resolves per
+    /// call. Slower, but correct -- the bound costs throughput, never data.
+    #[tokio::test]
+    async fn test_open_past_budget_refuses_memoisation() {
+        use fuse3::raw::Filesystem;
+
+        let (fs, _rx, _temp) = virtual_dds_fixture_with_metrics();
+        let ino = virtual_inode(&fs);
+
+        // One tile short of the ceiling: pinned + expected must exceed it.
+        fs.pinned_tile_bytes
+            .store(MAX_PINNED_TILE_BYTES, Ordering::Relaxed);
+
+        let opened = fs.open(test_request(), ino, 0).await.unwrap();
+        assert_eq!(opened.fh, 0, "refused opens get no memoising handle");
+        assert_eq!(
+            opened.flags, FOPEN_DIRECT_IO,
+            "the file must still bypass the page cache"
+        );
+        assert!(
+            fs.dds_handles.is_empty(),
+            "a refused open must not leave a handle behind"
+        );
+    }
+
+    /// #236: the fallback was visible only under `--debug`, so a flight could
+    /// not tell "the cap engaged" from "the #234 fix stopped working".
+    #[tokio::test]
+    async fn test_open_past_budget_counts_every_refusal() {
+        use fuse3::raw::Filesystem;
+
+        let (fs, mut rx, _temp) = virtual_dds_fixture_with_metrics();
+        let ino = virtual_inode(&fs);
+        fs.pinned_tile_bytes
+            .store(MAX_PINNED_TILE_BYTES, Ordering::Relaxed);
+
+        for _ in 0..3 {
+            let opened = fs.open(test_request(), ino, 0).await.unwrap();
+            assert_eq!(opened.fh, 0);
+        }
+
+        // Every refusal counts: the counter measures lost memoisations, and
+        // one event could not be told from an assignment.
+        assert_eq!(budget_exhausted_events(&mut rx), 3);
+    }
+
+    /// The warning latches. Once the cap engages it engages for every open in
+    /// the burst, and a per-open warn would bury the log it is meant to serve.
+    #[tokio::test]
+    async fn test_budget_warning_is_latched() {
+        use fuse3::raw::Filesystem;
+
+        let (fs, _rx, _temp) = virtual_dds_fixture_with_metrics();
+        let ino = virtual_inode(&fs);
+        fs.pinned_tile_bytes
+            .store(MAX_PINNED_TILE_BYTES, Ordering::Relaxed);
+
+        // Assert the claim, not the flag. A flag assertion passes even if the
+        // warn is emitted unconditionally, so long as something sets it.
+        fs.open(test_request(), ino, 0).await.unwrap();
+        assert!(
+            !fs.claim_budget_warning(),
+            "the first refusal must have consumed the one-shot claim"
+        );
+
+        for _ in 0..3 {
+            fs.open(test_request(), ino, 0).await.unwrap();
+            assert!(
+                !fs.claim_budget_warning(),
+                "later refusals must not re-arm the warning"
+            );
+        }
+    }
+
+    /// The latch in isolation: true exactly once, whatever the caller does.
+    #[test]
+    fn test_claim_budget_warning_is_one_shot() {
+        let (fs, _requests, _temp) = virtual_dds_fixture();
+
+        assert!(fs.claim_budget_warning(), "first claim must succeed");
+        for _ in 0..5 {
+            assert!(!fs.claim_budget_warning(), "every later claim must fail");
+        }
     }
 
     /// One open, many reads, one tile request.

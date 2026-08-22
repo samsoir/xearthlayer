@@ -120,6 +120,12 @@ impl MetricsClient {
         });
     }
 
+    /// Records an `open()` refused a memoising handle for want of budget.
+    #[inline]
+    pub fn fuse_handle_budget_exhausted(&self) {
+        self.send(MetricEvent::FuseHandleBudgetExhausted);
+    }
+
     /// Reports the current virtual DDS handle gauge.
     #[inline]
     pub fn fuse_handles(
