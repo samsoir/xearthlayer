@@ -329,6 +329,11 @@ impl MetricsDaemon {
                     self.state.fuse_file_alloc_bytes += materialised;
                 }
             }
+            MetricEvent::FuseHandleBudgetExhausted => {
+                // Counter: accumulate. Each event is one open that lost
+                // memoisation, not a level to be assigned.
+                self.state.fuse_handle_budget_exhausted += 1;
+            }
             MetricEvent::FuseHandlesUpdate {
                 open,
                 pinned_bytes,
@@ -462,6 +467,7 @@ impl MetricsDaemon {
             dds_pinned_mb = state.fuse_handles_pinned_bytes / MB,
             dds_handles_peak = state.fuse_handles_peak_open,
             dds_pinned_peak_mb = state.fuse_handles_peak_pinned_bytes / MB,
+            dds_budget_exhausted = state.fuse_handle_budget_exhausted,
             "Memory sample"
         );
     }
@@ -1480,6 +1486,37 @@ mod tests {
             "must accumulate, not assign"
         );
         assert_eq!(daemon.state.prefetch_promotions_rescue, 1);
+    }
+
+    #[test]
+    fn test_handle_budget_exhausted_accumulates() {
+        // A counter, not a gauge. One event and a zero start are
+        // indistinguishable under `+=` and `=`, so send several.
+        let (mut daemon, _tx) = create_daemon();
+        for _ in 0..3 {
+            daemon.process_event(MetricEvent::FuseHandleBudgetExhausted);
+        }
+        assert_eq!(
+            daemon.state.fuse_handle_budget_exhausted, 3,
+            "must accumulate, not assign"
+        );
+    }
+
+    #[test]
+    fn test_memory_sample_reports_budget_exhausted() {
+        // The whole point of #236: a flight log must be able to tell "the cap
+        // engaged" apart from "the #234 fix stopped working", which otherwise
+        // look identical -- both show fuse_dds_alloc_mb climbing.
+        let (mut daemon, _tx) = create_daemon();
+        daemon.state.fuse_handle_budget_exhausted = 9;
+
+        let events = capture_events(|| daemon.log_memory_sample());
+        let sample = find_memory_sample(&events).expect("must emit a memory sample line");
+
+        assert_eq!(
+            sample.get("dds_budget_exhausted").map(String::as_str),
+            Some("9")
+        );
     }
 
     #[tokio::test]

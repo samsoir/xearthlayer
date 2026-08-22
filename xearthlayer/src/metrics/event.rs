@@ -254,6 +254,15 @@ pub enum MetricEvent {
         peak_pinned_bytes: u64,
     },
 
+    /// An `open()` was refused a memoising handle because the pinned-tile
+    /// budget was exhausted.
+    ///
+    /// Counter, not a gauge: each occurrence is one open that fell back to
+    /// resolving its tile per read -- the pre-#234 cost. The cap has roughly
+    /// 24x measured headroom, so any non-zero value means a scene reached a
+    /// density nothing has been sized against. See #236.
+    FuseHandleBudgetExhausted,
+
     /// A FUSE request started being handled.
     FuseRequestStarted,
 
@@ -361,6 +370,7 @@ impl MetricEvent {
             Self::FuseTileServed => "fuse_tile_served",
             Self::FuseRead { .. } => "fuse_read",
             Self::FuseHandlesUpdate { .. } => "fuse_handles_update",
+            Self::FuseHandleBudgetExhausted => "fuse_handle_budget_exhausted",
             Self::FuseRequestStarted => "fuse_request_started",
             Self::FuseRequestCompleted => "fuse_request_completed",
             Self::FuseRequestQueued => "fuse_request_queued",

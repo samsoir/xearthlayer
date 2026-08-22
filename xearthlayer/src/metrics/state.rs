@@ -272,6 +272,14 @@ pub struct AggregatedState {
     pub fuse_handles_peak_open: u64,
     /// Highest pinned byte total seen this session.
     pub fuse_handles_peak_pinned_bytes: u64,
+    /// Opens refused a memoising handle for want of pinned-tile budget
+    /// (counter, cumulative since process start, #236).
+    ///
+    /// Any non-zero value means `MAX_PINNED_TILE_BYTES` engaged and those
+    /// opens fell back to resolving their tile once per read -- the pre-#234
+    /// cost. Read it alongside `dds_pinned_peak_mb`: a climbing
+    /// `fuse_dds_alloc_mb` with this at zero is a different fault entirely.
+    pub fuse_handle_budget_exhausted: u64,
 
     // =========================================================================
     // Peak Tracking
@@ -381,6 +389,7 @@ impl AggregatedState {
             fuse_handles_pinned_bytes: 0,
             fuse_handles_peak_open: 0,
             fuse_handles_peak_pinned_bytes: 0,
+            fuse_handle_budget_exhausted: 0,
             peak_bytes_per_second: 0.0,
             prefetch_regions_in_progress: 0,
             prefetch_regions_prefetched: 0,

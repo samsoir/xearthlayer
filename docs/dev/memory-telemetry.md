@@ -46,10 +46,13 @@ so that a single unattended flight discriminates between them:
 2026-08-06 06:20:33Z  INFO Memory sample uptime_s=60 rss_mb=873 vm_mb=1459 swap_mb=0 threads=71 tiles_done=0 encodes_active=0 chunks_ok=0 chunks_failed=0 mem_cache_mb=0 dds_disk_mb=158268 chunk_disk_mb=55301 gc_evicted_mb=0 chunk_index_entries=3803083 disk_writes_active=0 mem_cache_writes_active=0
 ```
 
-(Captured before #233; a current line also carries the six `fuse_*` read
-fields described below.)
+(Captured before #233. The example above shows 16 fields; a current line
+carries **27** — the six `fuse_*` read fields, the four `dds_handles_*` /
+`dds_pinned_*` fields, and `dds_budget_exhausted`, all described below. If you
+are editing this paragraph, count the fields in `log_memory_sample` rather than
+adjusting the number by hand: it has gone stale twice that way.)
 
-Twenty-two fields, in emission order. Every `_mb` value is truncating integer
+Fields are listed below in emission order. Every `_mb` value is truncating integer
 division by 1 MiB (1 048 576 bytes), so a value of `0` means "under one
 mebibyte", not necessarily "nothing".
 
@@ -80,7 +83,8 @@ mebibyte", not necessarily "nothing".
 | `dds_handles_open` | `state.fuse_handles_open` | Virtual DDS files X-Plane currently has open (gauge). Each one may pin a whole tile so later reads can slice it (#234). Nothing measured this before, so `MAX_PINNED_TILE_BYTES` is currently a guess — this is the number that should replace it. |
 | `dds_pinned_mb` | `state.fuse_handles_pinned_bytes` | Tile bytes pinned by those handles (gauge). Bounded by `MAX_PINNED_TILE_BYTES` (512 MiB); on reaching it, `open()` stops memoising and reads fall back to resolving per call. |
 | `dds_handles_peak` | `state.fuse_handles_peak_open` | Highest concurrent open count this session. **Read this, not `dds_handles_open`, when sizing the cap.** The current gauges are sampled on open, on tile production and on release, so a 60-second reader almost always catches them just after a release: the first KDEN run reported `dds_pinned_mb=0` throughout while 31 files were open. |
-| `dds_pinned_peak_mb` | `state.fuse_handles_peak_pinned_bytes` | Highest pinned total this session. Compare against `MAX_PINNED_TILE_BYTES`: if it approaches 512, `open()` is close to silently dropping memoisation and the cap wants raising. |
+| `dds_pinned_peak_mb` | `state.fuse_handles_peak_pinned_bytes` | Highest pinned total this session. Compare against the `dds_pinned_cap_mb` logged at mount: if it approaches the cap, `open()` is close to dropping memoisation. Two scene loads (KDEN, KSLC) peaked at 10-21 MiB against 512, roughly 24x headroom. |
+| `dds_budget_exhausted` | `state.fuse_handle_budget_exhausted` | Opens refused a memoising handle because the pinned-tile budget was full (counter, #236). **Any non-zero value means the #234 fix stopped applying for those opens** and their reads resolved the tile once per call. Zero while `fuse_dds_alloc_mb` climbs means a different fault — the two are otherwise indistinguishable in a log. |
 
 ### Counters are cumulative; gauges are current-state
 
@@ -102,6 +106,24 @@ This distinction matters when judging an acceptance criterion. "`regions_deferre
 must not climb without bound" is about the *slope* across samples; the raw number
 climbing is not a fault. (`AggregatedState::reset()` used to exist and implied
 otherwise; it had no production caller and was removed in #229.)
+
+### Sizing the DDS handle budget
+
+`dds_handles_open` and `dds_pinned_mb` measure different things and diverge by
+more than an order of magnitude. Handles are counted at `open()`; bytes are
+counted when a tile is **materialised**, which happens on first read. X-Plane
+reads each texture in about two calls and releases promptly, so most open
+handles hold nothing: 31 concurrent opens corresponded to roughly **two**
+resident tiles.
+
+**Size the cap against `dds_pinned_peak_mb`, never against `dds_handles_peak`.**
+Multiplying the open count by the tile size overstates the requirement by
+around 16x — that error is what put the original "1.5x headroom" estimate in
+#236, when the real figure was about 24x.
+
+The cap is soft: admission tests `pinned + expected` without reserving, so
+concurrent opens can pass together and overshoot. With the measured headroom
+this is immaterial; if `dds_budget_exhausted` ever moves, revisit it.
 
 ### Reading the two amplification ratios
 
