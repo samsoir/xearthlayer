@@ -339,26 +339,32 @@ pkg-tarball: release ## Build release tarball
 .PHONY: aur-prepare
 aur-prepare: ## Prepare AUR package for a tagged release (TAG=v0.2.0)
 	@if [ -z "$(TAG)" ]; then echo "$(RED)Error: TAG is required. Usage: make aur-prepare TAG=v0.2.0$(NC)"; exit 1; fi
-	@echo "$(BLUE)Preparing AUR package for $(TAG)...$(NC)"
-	@# Extract version from tag (remove 'v' prefix)
-	$(eval VERSION := $(shell echo $(TAG) | sed 's/^v//'))
-	@# Create AUR working directory
-	@rm -rf $(AUR_DIR)
-	@mkdir -p $(AUR_DIR)
-	@# Download source tarball from GitHub
-	@echo "$(BLUE)Downloading source tarball...$(NC)"
-	@curl -sL "https://github.com/samsoir/xearthlayer/archive/$(TAG).tar.gz" -o "$(AUR_DIR)/$(PKG_NAME)-$(VERSION).tar.gz"
-	@# Calculate SHA256
-	$(eval SHA256 := $(shell sha256sum "$(AUR_DIR)/$(PKG_NAME)-$(VERSION).tar.gz" | cut -d' ' -f1))
-	@echo "$(BLUE)SHA256: $(SHA256)$(NC)"
-	@# Generate PKGBUILD with correct version and checksum
-	@sed -e 's/^pkgver=.*/pkgver=$(VERSION)/' \
-	     -e "s/^sha256sums=.*/sha256sums=('$(SHA256)')/" \
-	     pkg/arch/PKGBUILD > $(AUR_DIR)/PKGBUILD
-	@# Generate .SRCINFO
-	@cd $(AUR_DIR) && makepkg --printsrcinfo > .SRCINFO
-	@# Clean up downloaded tarball (not needed for AUR)
-	@rm "$(AUR_DIR)/$(PKG_NAME)-$(VERSION).tar.gz"
+	@# One shell block on purpose: $(eval $(shell ...)) expands while make
+	@# prepares the recipe, i.e. BEFORE any line runs, so a checksum taken that
+	@# way reads a tarball curl has not downloaded yet. Keep download, checksum
+	@# and substitution in the same shell.
+	@set -eu; \
+	VERSION="$$(echo '$(TAG)' | sed 's/^v//')"; \
+	echo "$(BLUE)Preparing AUR package for $(TAG)...$(NC)"; \
+	case "$$VERSION" in *-*) \
+	    echo "$(RED)Error: pkgver may not contain a hyphen: $$VERSION$(NC)"; \
+	    echo "AUR packages are cut from stable tags only, not previews."; \
+	    exit 1 ;; \
+	esac; \
+	rm -rf $(AUR_DIR); \
+	mkdir -p $(AUR_DIR); \
+	TARBALL="$(AUR_DIR)/$(PKG_NAME)-$$VERSION.tar.gz"; \
+	echo "$(BLUE)Downloading source tarball...$(NC)"; \
+	curl -fsSL "https://github.com/samsoir/xearthlayer/archive/$(TAG).tar.gz" -o "$$TARBALL"; \
+	SHA256="$$(sha256sum "$$TARBALL" | cut -d' ' -f1)"; \
+	echo "$(BLUE)SHA256: $$SHA256$(NC)"; \
+	sed -e "s/^pkgver=.*/pkgver=$$VERSION/" \
+	    -e "s/^sha256sums=.*/sha256sums=('$$SHA256')/" \
+	    pkg/arch/PKGBUILD > $(AUR_DIR)/PKGBUILD; \
+	grep -q '^options=(!lto)' $(AUR_DIR)/PKGBUILD \
+	    || { echo "$(RED)Error: generated PKGBUILD lost options=(!lto)$(NC)"; exit 1; }; \
+	( cd $(AUR_DIR) && makepkg --printsrcinfo > .SRCINFO ); \
+	rm "$$TARBALL"
 	@echo ""
 	@echo "$(GREEN)AUR package prepared in $(AUR_DIR)/$(NC)"
 	@echo "$(BLUE)Contents:$(NC)"

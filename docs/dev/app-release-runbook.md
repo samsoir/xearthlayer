@@ -160,12 +160,23 @@ gh run watch --repo samsoir/xearthlayer
 # Expected jobs (all should succeed):
 # ✓ Verify (~3-4 min)
 # ✓ Build Release Binary (~4 min)
-# ✓ Prepare AUR Package (~5 sec)
+# ✓ Prepare AUR Package (~10-15 min — see note below)
 # ✓ Build RPM Package (~7-8 min)
 # ✓ Package Linux Binary (~10 sec)
 # ✓ Package Debian Package (~1 min)
 # ✓ Publish Release (~15 sec)
 ```
+
+> **Prepare AUR Package is now a real build.** It runs in an `archlinux:base-devel`
+> container and compiles the package with a stock `makepkg.conf`, which has LTO
+> enabled. That is deliberate: it is the only check that proves the shipped
+> PKGBUILD actually links, after `options=(!lto)` went missing and broke every
+> Arch-family build (issue #222). The step also derives `.SRCINFO` from the
+> PKGBUILD via `makepkg --printsrcinfo`, so the two cannot drift.
+>
+> The job is release-blocking — `publish` requires `prepare-aur != failure` — so a
+> transient pacman-mirror failure stops the release. Recover with
+> `gh run rerun <run-id> --failed`; the tag is immutable and safe to re-run.
 
 ### Step 6: Reconcile Asset Filenames, Then Merge PR
 
