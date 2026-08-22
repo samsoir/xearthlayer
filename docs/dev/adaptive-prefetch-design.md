@@ -444,8 +444,9 @@ surface.
 
 The daemon aggregates these and logs them on the same 60s cadence as the
 memory sample. The counters among them are cumulative totals since process
-start, because `AggregatedState::reset()` — which does zero them — has no
-production caller; wire it up and these become totals since the last reset:
+start; nothing windows them, so difference successive samples to get a rate.
+The `regions_*` state fields are gauges, assigned wholesale from the GeoIndex
+each maintenance cycle rather than accumulated:
 
 ```
 INFO Prefetch sample uptime_s=... regions_in_progress=... regions_prefetched=...

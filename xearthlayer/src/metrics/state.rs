@@ -150,7 +150,7 @@ pub struct AggregatedState {
     pub dds_disk_bytes_written: u64,
     /// Total bytes read from chunk disk cache (cache hits).
     pub chunk_disk_bytes_read: u64,
-    /// Initial disk cache size (scanned on startup, not reset).
+    /// Initial disk cache size (scanned on startup).
     pub initial_disk_cache_bytes: u64,
     /// Total bytes evicted from disk cache by the GC daemon.
     pub disk_bytes_evicted: u64,
@@ -284,7 +284,8 @@ pub struct AggregatedState {
     // =========================================================================
     /// Regions with tiles submitted, awaiting confirmation (gauge, from
     /// `PrefetchRegionState`; externally derived from `GeoIndex`, like the
-    /// disk-cache-size gauges above, so it is excluded from `reset()`).
+    /// disk-cache-size gauges above — assigned wholesale each maintenance
+    /// cycle rather than accumulated from this daemon's event stream).
     pub prefetch_regions_in_progress: usize,
     /// Regions confirmed fully cached (gauge).
     pub prefetch_regions_prefetched: usize,
@@ -301,8 +302,8 @@ pub struct AggregatedState {
     /// Total regions demoted in response to divergence (counter).
     pub prefetch_regions_demoted: u64,
     /// Total regions deferred for making no progress, cumulative since
-    /// process start (counter). `reset()` has no production caller, so this
-    /// is never windowed.
+    /// process start (counter). Never windowed — difference successive log
+    /// samples to get a rate.
     pub prefetch_regions_deferred: u64,
     /// Total region deferrals cleared by on-demand FUSE generation, cumulative
     /// since process start (counter, #226). The post-fix analogue of
@@ -397,63 +398,6 @@ impl AggregatedState {
     /// Returns the uptime duration.
     pub fn uptime(&self) -> std::time::Duration {
         self.uptime_start.elapsed()
-    }
-
-    /// Resets all counters to zero.
-    pub fn reset(&mut self) {
-        self.uptime_start = Instant::now();
-        self.downloads_active = 0;
-        self.chunks_downloaded = 0;
-        self.chunks_failed = 0;
-        self.chunks_retried = 0;
-        self.bytes_downloaded = 0;
-        self.download_time_us = 0;
-        self.chunk_disk_cache_hits = 0;
-        self.chunk_disk_cache_misses = 0;
-        self.disk_writes_active = 0;
-        self.chunk_disk_bytes_written = 0;
-        self.dds_disk_bytes_written = 0;
-        self.chunk_disk_bytes_read = 0;
-        self.dds_disk_cache_hits = 0;
-        self.dds_disk_cache_misses = 0;
-        self.fuse_dds_disk_cache_hits = 0;
-        self.fuse_dds_disk_cache_misses = 0;
-        self.dds_disk_bytes_read = 0;
-        self.memory_cache_hits = 0;
-        self.memory_cache_misses = 0;
-        self.fuse_memory_cache_hits = 0;
-        self.fuse_memory_cache_misses = 0;
-        self.memory_cache_size_bytes = 0;
-        self.mem_cache_writes_active = 0;
-        self.jobs_submitted = 0;
-        self.fuse_jobs_submitted = 0;
-        self.jobs_completed = 0;
-        self.jobs_failed = 0;
-        self.jobs_timed_out = 0;
-        self.jobs_active = 0;
-        self.jobs_coalesced = 0;
-        self.encodes_active = 0;
-        self.encodes_completed = 0;
-        self.bytes_encoded = 0;
-        self.encode_time_us = 0;
-        self.assembly_time_us = 0;
-        self.fuse_tiles_served = 0;
-        self.fuse_requests_active = 0;
-        self.fuse_requests_waiting = 0;
-        self.peak_bytes_per_second = 0.0;
-        // prefetch_regions_{in_progress,prefetched,nocoverage,deferred_active}
-        // are NOT reset:
-        // like chunk_disk_cache_size_bytes/dds_disk_cache_size_bytes/
-        // chunk_index_entries above, they are externally-derived gauges
-        // (assigned wholesale from GeoIndex each maintenance cycle), not
-        // counters accumulated from this daemon's own event stream. Zeroing
-        // them here would misreport "no regions" until the next cycle.
-        self.prefetch_state_diverged = 0;
-        self.prefetch_regions_demoted = 0;
-        self.prefetch_regions_deferred = 0;
-        self.prefetch_deferrals_cleared = 0;
-        self.prefetch_promotions_normal = 0;
-        self.prefetch_promotions_rescue = 0;
     }
 }
 
@@ -563,19 +507,6 @@ mod tests {
         assert_eq!(state.chunks_downloaded, 0);
         assert_eq!(state.jobs_submitted, 0);
         assert!(state.uptime().as_secs() < 1);
-    }
-
-    #[test]
-    fn test_aggregated_state_reset() {
-        let mut state = AggregatedState::default();
-        state.chunks_downloaded = 100;
-        state.bytes_downloaded = 1_000_000;
-        state.jobs_completed = 50;
-
-        state.reset();
-        assert_eq!(state.chunks_downloaded, 0);
-        assert_eq!(state.bytes_downloaded, 0);
-        assert_eq!(state.jobs_completed, 0);
     }
 
     #[test]

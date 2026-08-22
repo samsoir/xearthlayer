@@ -82,6 +82,27 @@ mebibyte", not necessarily "nothing".
 | `dds_handles_peak` | `state.fuse_handles_peak_open` | Highest concurrent open count this session. **Read this, not `dds_handles_open`, when sizing the cap.** The current gauges are sampled on open, on tile production and on release, so a 60-second reader almost always catches them just after a release: the first KDEN run reported `dds_pinned_mb=0` throughout while 31 files were open. |
 | `dds_pinned_peak_mb` | `state.fuse_handles_peak_pinned_bytes` | Highest pinned total this session. Compare against `MAX_PINNED_TILE_BYTES`: if it approaches 512, `open()` is close to silently dropping memoisation and the cap wants raising. |
 
+### Counters are cumulative; gauges are current-state
+
+Every counter on this line — `tiles_done`, `chunks_ok`, `chunks_failed`,
+`gc_evicted_mb`, `fuse_*_reads`, and the `Prefetch sample` counters
+(`regions_deferred`, `deferrals_cleared`, `promotions_*`) — is **cumulative
+since process start**. Nothing windows them: there is no per-interval reset, so
+a raw value always climbs and a single line cannot tell you what happened in the
+last minute. **Difference successive samples to get a rate**, or divide by
+`uptime_s` for a session average.
+
+Gauges — `encodes_active`, `disk_writes_active`, `mem_cache_writes_active`,
+`dds_handles_open`, `dds_pinned_mb`, `chunk_index_entries`, the
+`regions_*` state counts, and everything from `MemoryProbe` — are current-state
+and are read directly. Peak fields (`dds_handles_peak`, `dds_pinned_peak_mb`)
+are high-water marks over the session, not current values.
+
+This distinction matters when judging an acceptance criterion. "`regions_deferred`
+must not climb without bound" is about the *slope* across samples; the raw number
+climbing is not a fault. (`AggregatedState::reset()` used to exist and implied
+otherwise; it had no production caller and was removed in #229.)
+
 ### Reading the two amplification ratios
 
 `*_alloc_mb / *_read_mb` is the read amplification for each path. 1.0 means the
