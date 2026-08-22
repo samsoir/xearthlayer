@@ -490,8 +490,8 @@ impl MetricsDaemon {
             state_diverged = state.prefetch_state_diverged,
             regions_demoted = state.prefetch_regions_demoted,
             // #226: how often a region was skipped for making no progress.
-            // Cumulative since process start — `AggregatedState::reset()` has
-            // no production caller — so it only ever climbs. It does NOT climb
+            // Cumulative since process start — difference successive samples
+            // for a rate — so it only ever climbs. It does NOT climb
             // every maintenance cycle: a stuck region is moved to `Deferred`
             // immediately, and `is_stale()` only re-evaluates `InProgress`
             // regions, so the region sits off-cycle until its deferral expires
@@ -1339,12 +1339,9 @@ mod tests {
     fn test_prefetch_sample_reports_regions_deferred() {
         // regions_deferred is a COUNTER, unlike the region-state gauges
         // above: it accumulates across the daemon's own event stream rather
-        // than being assigned wholesale from GeoIndex each cycle, so it
-        // belongs in `reset()` while the gauges do not.
-        //
-        // `reset()` has no production caller today, so in a running process
-        // the counter is cumulative since start. This asserts the `reset()`
-        // contract for the field, not a per-interval window in the log.
+        // than being assigned wholesale from GeoIndex each cycle. Nothing
+        // windows it, so in a running process it is cumulative since start —
+        // difference successive log samples for a rate.
         let (mut daemon, _tx) = create_daemon();
         daemon.state.prefetch_regions_deferred = 7;
         daemon.state.prefetch_regions_nocoverage = 3;
@@ -1369,25 +1366,6 @@ mod tests {
             sample.get("regions_deferred_active").map(String::as_str),
             Some("4"),
             "the gauge is a separate field from the counter"
-        );
-
-        daemon.state.reset();
-        assert_eq!(
-            daemon.state.prefetch_regions_deferred, 0,
-            "counter must reset"
-        );
-        assert_eq!(
-            daemon.state.prefetch_deferrals_cleared, 0,
-            "counter must reset"
-        );
-        assert_eq!(
-            daemon.state.prefetch_regions_nocoverage, 3,
-            "gauge must NOT reset"
-        );
-        assert_eq!(
-            daemon.state.prefetch_regions_deferred_active, 4,
-            "the deferred gauge is externally derived from GeoIndex, so it \
-             must NOT reset either"
         );
     }
 
@@ -1502,19 +1480,6 @@ mod tests {
             "must accumulate, not assign"
         );
         assert_eq!(daemon.state.prefetch_promotions_rescue, 1);
-    }
-
-    #[test]
-    fn test_promotion_counters_reset() {
-        let (mut daemon, _tx) = create_daemon();
-        daemon.process_event(MetricEvent::PrefetchRegionsPromotedNormal { count: 4 });
-        daemon.process_event(MetricEvent::PrefetchRegionPromotedRescue);
-        daemon.state.reset();
-        assert_eq!(
-            daemon.state.prefetch_promotions_normal, 0,
-            "counters reset, unlike the region gauges"
-        );
-        assert_eq!(daemon.state.prefetch_promotions_rescue, 0);
     }
 
     #[tokio::test]
