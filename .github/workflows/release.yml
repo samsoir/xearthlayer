@@ -204,76 +204,82 @@ jobs:
 
   # Prepare AUR package files
   # Stable releases only — AUR `pkgver` forbids the hyphen in pre-release versions.
+  #
+  # Runs in an Arch container for two reasons: `.SRCINFO` is generated from the
+  # PKGBUILD by makepkg rather than hand-written (so the two cannot drift), and
+  # the package is actually built with a stock `makepkg.conf` (LTO on), which is
+  # the only thing that proves the shipped PKGBUILD links. See issue #222.
   prepare-aur:
     name: Prepare AUR Package
     runs-on: ubuntu-latest
     needs: [verify]
     if: ${{ needs.verify.outputs.prerelease != 'true' }}
+    container:
+      image: archlinux:base-devel
     steps:
+      - name: Install prerequisites
+        run: pacman -Syu --noconfirm --needed git
+
       - uses: actions/checkout@v6
 
-      - name: Generate PKGBUILD and .SRCINFO
+      - name: Create unprivileged build user
+        # makepkg refuses to run as root. NOPASSWD sudo lets `makepkg -s`
+        # install the declared depends/makedepends.
+        run: |
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chmod 0440 /etc/sudoers.d/builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Generate PKGBUILD
         env:
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
+          set -euo pipefail
+          case "$VERSION" in
+            *-*) echo "::error::pkgver may not contain a hyphen: $VERSION" && exit 1 ;;
+          esac
+
           mkdir -p pkg/aur
 
-          # Download source tarball to calculate checksum
-          curl -sL "https://github.com/${{ github.repository }}/archive/${RELEASE_TAG}.tar.gz" \
+          # Checksum the release tarball, then discard it so makepkg fetches its
+          # own copy below — that way the build validates the published URL and
+          # the checksum we are about to ship, not a file we already hold.
+          curl -fsSL "https://github.com/${{ github.repository }}/archive/${RELEASE_TAG}.tar.gz" \
             -o "pkg/aur/xearthlayer-${VERSION}.tar.gz"
           SHA256=$(sha256sum "pkg/aur/xearthlayer-${VERSION}.tar.gz" | cut -d' ' -f1)
-
-          # Generate PKGBUILD
-          cat > pkg/aur/PKGBUILD << EOF
-          # Maintainer: XEarthLayer Contributors
-          pkgname=xearthlayer
-          pkgver=${VERSION}
-          pkgrel=1
-          pkgdesc='Virtual Earth imagery layer filesystem for X-Plane using FUSE'
-          arch=('x86_64')
-          url='https://github.com/${{ github.repository }}'
-          license=('MIT')
-          depends=('fuse3')
-          makedepends=('rust' 'cargo')
-          optdepends=('xplane12: X-Plane 12 flight simulator')
-          source=("\${pkgname}-\${pkgver}.tar.gz::https://github.com/${{ github.repository }}/archive/v\${pkgver}.tar.gz")
-          sha256sums=('${SHA256}')
-
-          build() {
-            cd "\${pkgname}-\${pkgver}"
-            cargo build --release --locked
-          }
-
-          package() {
-            cd "\${pkgname}-\${pkgver}"
-            install -Dm755 "target/release/xearthlayer" "\${pkgdir}/usr/bin/xearthlayer"
-            install -Dm644 "LICENSE" "\${pkgdir}/usr/share/licenses/\${pkgname}/LICENSE"
-            install -Dm644 "README.md" "\${pkgdir}/usr/share/doc/\${pkgname}/README.md"
-          }
-          EOF
-
-          # Generate .SRCINFO
-          cat > pkg/aur/.SRCINFO << EOF
-          pkgbase = xearthlayer
-          	pkgdesc = Virtual Earth imagery layer filesystem for X-Plane using FUSE
-          	pkgver = ${VERSION}
-          	pkgrel = 1
-          	url = https://github.com/${{ github.repository }}
-          	arch = x86_64
-          	license = MIT
-          	makedepends = rust
-          	makedepends = cargo
-          	depends = fuse3
-          	optdepends = xplane12: X-Plane 12 flight simulator
-          	source = xearthlayer-\${pkgver}.tar.gz::https://github.com/${{ github.repository }}/archive/v\${pkgver}.tar.gz
-          	sha256sums = ${SHA256}
-
-          pkgname = xearthlayer
-          EOF
-
-          # Clean up tarball
           rm "pkg/aur/xearthlayer-${VERSION}.tar.gz"
+
+          # Template from the single source of truth. Re-authoring the PKGBUILD
+          # here is what dropped `options=(!lto)` and broke every Arch build in
+          # #222; keep this a sed, never a heredoc.
+          sed -e "s/^pkgver=.*/pkgver=${VERSION}/" \
+              -e "s/^sha256sums=.*/sha256sums=('${SHA256}')/" \
+              pkg/arch/PKGBUILD > pkg/aur/PKGBUILD
+
+          grep -q '^options=(!lto)' pkg/aur/PKGBUILD \
+            || { echo "::error::generated PKGBUILD lost options=(!lto)"; exit 1; }
+
+          # pkg/aur is created by this step, as root, after the workspace-wide
+          # chown — so it needs its own. makepkg writes src/ and pkg/ here.
+          chown -R builder:builder pkg/aur
+
+      - name: Generate .SRCINFO
+        working-directory: pkg/aur
+        run: sudo -u builder --set-home makepkg --printsrcinfo > .SRCINFO
+
+      - name: Build with stock makepkg.conf
+        # The regression gate for #222: a default-configured Arch machine has
+        # LTO enabled, and this step fails to link if the flag is ever lost.
+        #
+        # This is release-blocking — `publish` requires prepare-aur != failure —
+        # which is deliberate: shipping a PKGBUILD that cannot build is the very
+        # bug this job exists to prevent. A transient pacman-mirror failure will
+        # also stop a release; recover with `gh run rerun <id> --failed`, since
+        # the tag is immutable and re-runnable.
+        working-directory: pkg/aur
+        run: sudo -u builder --set-home makepkg -Cf -s --noconfirm
 
       - name: Upload AUR package files
         uses: actions/upload-artifact@v7
