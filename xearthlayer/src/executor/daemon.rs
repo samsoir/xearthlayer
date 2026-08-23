@@ -63,6 +63,7 @@ use crate::executor::{
 use crate::jobs::DdsJobFactory;
 use crate::metrics::MetricsClient;
 use crate::runtime::{DdsResponse, JobRequest};
+use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -146,7 +147,7 @@ pub trait DaemonMemoryCache: Send + Sync + 'static {
         row: u32,
         col: u32,
         zoom: u8,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Bytes>> + Send + '_>>;
 
     /// Stores a tile in the memory cache.
     ///
@@ -156,7 +157,7 @@ pub trait DaemonMemoryCache: Send + Sync + 'static {
         row: u32,
         col: u32,
         zoom: u8,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
 
     /// Checks if a tile exists in the cache without loading data.
@@ -183,7 +184,7 @@ where
         row: u32,
         col: u32,
         zoom: u8,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Bytes>> + Send + '_>> {
         Box::pin(async move { crate::executor::MemoryCache::get(self, row, col, zoom).await })
     }
 
@@ -192,7 +193,7 @@ where
         row: u32,
         col: u32,
         zoom: u8,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move { crate::executor::MemoryCache::put(self, row, col, zoom, data).await })
     }
@@ -208,7 +209,7 @@ where
 #[derive(Clone, Debug)]
 struct CoalescedDdsResult {
     /// The DDS data.
-    data: Vec<u8>,
+    data: Bytes,
     /// How long the request took.
     duration: Duration,
     /// Whether the job succeeded.
@@ -216,7 +217,7 @@ struct CoalescedDdsResult {
 }
 
 impl CoalescedDdsResult {
-    fn new(data: Vec<u8>, duration: Duration, job_succeeded: bool) -> Self {
+    fn new(data: Bytes, duration: Duration, job_succeeded: bool) -> Self {
         Self {
             data,
             duration,
@@ -856,7 +857,7 @@ where
                                     latency_ms = duration.as_millis(),
                                     "Job failed - returning empty data"
                                 );
-                                Vec::new()
+                                Bytes::new()
                             };
 
                             // Broadcast result to coalesced waiters
@@ -955,10 +956,10 @@ mod tests {
             row: u32,
             col: u32,
             zoom: u8,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Bytes>> + Send + '_>>
         {
             let data = self.data.lock().unwrap().get(&(row, col, zoom)).cloned();
-            Box::pin(async move { data })
+            Box::pin(async move { data.map(Bytes::from) })
         }
 
         fn put(
@@ -966,9 +967,12 @@ mod tests {
             row: u32,
             col: u32,
             zoom: u8,
-            data: Vec<u8>,
+            data: Bytes,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-            self.data.lock().unwrap().insert((row, col, zoom), data);
+            self.data
+                .lock()
+                .unwrap()
+                .insert((row, col, zoom), data.to_vec());
             Box::pin(async {})
         }
     }
@@ -1072,7 +1076,11 @@ mod tests {
                 tokio::time::sleep(delay).await;
                 // Return DDS data
                 let mut output = crate::executor::TaskOutput::new();
-                let data = format!("DDS-{}-{}-{}", tile.row, tile.col, tile.zoom).into_bytes();
+                // Must be Bytes: `TaskOutput::get` is a typed downcast, so a
+                // mock storing Vec<u8> silently yields None to the real reader.
+                let data = Bytes::from(
+                    format!("DDS-{}-{}-{}", tile.row, tile.col, tile.zoom).into_bytes(),
+                );
                 output.set("dds_data", data);
                 crate::executor::TaskResult::SuccessWithOutput(output)
             })

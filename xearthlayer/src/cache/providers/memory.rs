@@ -20,6 +20,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use bytes::Bytes;
 use moka::future::Cache as MokaCache;
 
 use crate::cache::traits::{BoxFuture, Cache, GcResult, ServiceCacheError};
@@ -32,7 +33,7 @@ use crate::metrics::MetricsClient;
 /// for use across multiple async tasks.
 pub struct MemoryCacheProvider {
     /// The underlying moka cache.
-    cache: MokaCache<String, Vec<u8>>,
+    cache: MokaCache<String, Bytes>,
 
     /// Maximum size in bytes.
     max_size_bytes: AtomicU64,
@@ -51,7 +52,7 @@ impl MemoryCacheProvider {
     pub fn new(max_size_bytes: u64, ttl: Option<Duration>) -> Self {
         let mut builder = MokaCache::builder()
             // Weight each entry by its data size
-            .weigher(|_key: &String, value: &Vec<u8>| -> u32 {
+            .weigher(|_key: &String, value: &Bytes| -> u32 {
                 // moka uses u32 for weights, cap at u32::MAX for very large entries
                 value.len().min(u32::MAX as usize) as u32
             })
@@ -94,7 +95,7 @@ impl MemoryCacheProvider {
 }
 
 impl Cache for MemoryCacheProvider {
-    fn set(&self, key: &str, value: Vec<u8>) -> BoxFuture<'_, Result<(), ServiceCacheError>> {
+    fn set(&self, key: &str, value: Bytes) -> BoxFuture<'_, Result<(), ServiceCacheError>> {
         let key = key.to_string();
         Box::pin(async move {
             self.cache.insert(key, value).await;
@@ -103,7 +104,7 @@ impl Cache for MemoryCacheProvider {
         })
     }
 
-    fn get(&self, key: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, ServiceCacheError>> {
+    fn get(&self, key: &str) -> BoxFuture<'_, Result<Option<Bytes>, ServiceCacheError>> {
         let key = key.to_string();
         Box::pin(async move {
             let result = self.cache.get(&key).await;
@@ -202,14 +203,44 @@ mod tests {
         assert_eq!(provider.size_bytes(), 0);
     }
 
+    /// The point of #237: a memory-cache hit must hand back a handle to the
+    /// stored buffer, not a copy of it. A 10.66 MiB DDS tile copied per hit is
+    /// the dominant remaining allocation on the FUSE read path.
+    ///
+    /// Pointer identity, not the metrics counter: the counter is charged by
+    /// code we also control, so it can read "no copies" while copies happen.
+    /// Two `Bytes` sharing a base pointer cannot.
+    #[tokio::test]
+    async fn test_get_shares_the_stored_allocation() {
+        let provider = MemoryCacheProvider::new(10_000_000, None);
+        let stored = Bytes::from(vec![7u8; 4096]);
+        let stored_ptr = stored.as_ptr();
+
+        provider.set("tile", stored).await.unwrap();
+
+        let first = provider.get("tile").await.unwrap().expect("hit");
+        let second = provider.get("tile").await.unwrap().expect("hit");
+
+        assert_eq!(
+            first.as_ptr(),
+            stored_ptr,
+            "a hit must alias the stored buffer, not copy it"
+        );
+        assert_eq!(
+            second.as_ptr(),
+            stored_ptr,
+            "every hit aliases; the cost of a hit must not scale with tile size"
+        );
+    }
+
     #[tokio::test]
     async fn test_memory_provider_set_and_get() {
         let provider = MemoryCacheProvider::new(1_000_000, None);
 
-        provider.set("key1", vec![1, 2, 3]).await.unwrap();
+        provider.set("key1", vec![1, 2, 3].into()).await.unwrap();
 
         let value = provider.get("key1").await.unwrap();
-        assert_eq!(value, Some(vec![1, 2, 3]));
+        assert_eq!(value, Some(Bytes::from(vec![1, 2, 3])));
     }
 
     #[tokio::test]
@@ -224,7 +255,7 @@ mod tests {
     async fn test_memory_provider_delete_existing() {
         let provider = MemoryCacheProvider::new(1_000_000, None);
 
-        provider.set("key1", vec![1, 2, 3]).await.unwrap();
+        provider.set("key1", vec![1, 2, 3].into()).await.unwrap();
         assert!(provider.contains("key1").await.unwrap());
 
         let deleted = provider.delete("key1").await.unwrap();
@@ -246,7 +277,7 @@ mod tests {
 
         assert!(!provider.contains("key1").await.unwrap());
 
-        provider.set("key1", vec![1]).await.unwrap();
+        provider.set("key1", vec![1].into()).await.unwrap();
 
         assert!(provider.contains("key1").await.unwrap());
     }
@@ -257,7 +288,7 @@ mod tests {
         let key = "tile:15:12754:5279";
 
         assert!(!provider.contains_sync(key));
-        provider.set(key, vec![0u8; 64]).await.unwrap();
+        provider.set(key, vec![0u8; 64].into()).await.unwrap();
         assert!(provider.contains_sync(key));
         assert_eq!(
             provider.contains(key).await.unwrap(),
@@ -269,13 +300,13 @@ mod tests {
     async fn test_memory_provider_size_tracking() {
         let provider = MemoryCacheProvider::new(1_000_000, None);
 
-        provider.set("key1", vec![0u8; 1000]).await.unwrap();
+        provider.set("key1", vec![0u8; 1000].into()).await.unwrap();
         provider.gc().await.unwrap(); // Ensure size is updated
 
         let size = provider.size_bytes();
         assert!(size >= 1000, "Expected size >= 1000, got {}", size);
 
-        provider.set("key2", vec![0u8; 2000]).await.unwrap();
+        provider.set("key2", vec![0u8; 2000].into()).await.unwrap();
         provider.gc().await.unwrap();
 
         let size = provider.size_bytes();
@@ -286,7 +317,7 @@ mod tests {
     async fn test_memory_provider_gc() {
         let provider = MemoryCacheProvider::new(1_000_000, None);
 
-        provider.set("key1", vec![0u8; 1000]).await.unwrap();
+        provider.set("key1", vec![0u8; 1000].into()).await.unwrap();
 
         let result = provider.gc().await.unwrap();
 
@@ -298,12 +329,12 @@ mod tests {
     async fn test_memory_provider_replace_existing() {
         let provider = MemoryCacheProvider::new(1_000_000, None);
 
-        provider.set("key1", vec![1, 2, 3]).await.unwrap();
-        provider.set("key1", vec![4, 5, 6, 7]).await.unwrap();
+        provider.set("key1", vec![1, 2, 3].into()).await.unwrap();
+        provider.set("key1", vec![4, 5, 6, 7].into()).await.unwrap();
         provider.gc().await.unwrap(); // Run pending tasks to sync entry_count
 
         let value = provider.get("key1").await.unwrap();
-        assert_eq!(value, Some(vec![4, 5, 6, 7]));
+        assert_eq!(value, Some(Bytes::from(vec![4, 5, 6, 7])));
         assert_eq!(provider.entry_count(), 1);
     }
 
@@ -311,7 +342,7 @@ mod tests {
     async fn test_memory_provider_with_ttl() {
         let provider = MemoryCacheProvider::new(1_000_000, Some(Duration::from_millis(50)));
 
-        provider.set("key1", vec![1, 2, 3]).await.unwrap();
+        provider.set("key1", vec![1, 2, 3].into()).await.unwrap();
 
         // Value should exist immediately
         assert!(provider.get("key1").await.unwrap().is_some());
@@ -330,9 +361,9 @@ mod tests {
         let provider = MemoryCacheProvider::new(2500, None);
 
         // Add 3 entries (3000 bytes total, exceeds 2500 limit)
-        provider.set("key1", vec![0u8; 1000]).await.unwrap();
-        provider.set("key2", vec![0u8; 1000]).await.unwrap();
-        provider.set("key3", vec![0u8; 1000]).await.unwrap();
+        provider.set("key1", vec![0u8; 1000].into()).await.unwrap();
+        provider.set("key2", vec![0u8; 1000].into()).await.unwrap();
+        provider.set("key3", vec![0u8; 1000].into()).await.unwrap();
 
         // Run GC to trigger eviction
         provider.gc().await.unwrap();
@@ -362,9 +393,9 @@ mod tests {
                 let key = format!("key{}", i);
                 let data = vec![i as u8; 100];
 
-                provider.set(&key, data.clone()).await.unwrap();
+                provider.set(&key, data.clone().into()).await.unwrap();
                 let result = provider.get(&key).await.unwrap();
-                assert_eq!(result, Some(data));
+                assert_eq!(result, Some(Bytes::from(data)));
             }));
         }
 

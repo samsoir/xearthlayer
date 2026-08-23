@@ -107,6 +107,23 @@ must not climb without bound" is about the *slope* across samples; the raw numbe
 climbing is not a fault. (`AggregatedState::reset()` used to exist and implied
 otherwise; it had no production caller and was removed in #229.)
 
+### The amplification ratios after #237
+
+`fuse_dds_alloc_mb / fuse_dds_read_mb` measured **25.6** before #237 and should
+now read **1.0**: the read handler takes a refcount on the tile and returns a
+`Bytes::slice` of it, so it obtains exactly what it delivers. The tile is still
+produced whole by the generation pipeline, which this counter does not — and
+should not — charge to the read path.
+
+**A ratio of 1.0 is not by itself evidence of zero-copy**, because the counter is
+charged by the same code that does the copying. The independent check is the
+pointer-identity test in `ortho_union_fs.rs`
+(`test_virtual_dds_read_aliases_the_memoised_tile`) and its counterpart in
+`cache/providers/memory.rs` (`test_get_shares_the_stored_allocation`): both
+assert that the delivered buffer shares an allocation with the stored one, and
+both fail if the copy is reintroduced. Trust those; read the ratio as a
+regression alarm, not a proof.
+
 ### Sizing the DDS handle budget
 
 `dds_handles_open` and `dds_pinned_mb` measure different things and diverge by

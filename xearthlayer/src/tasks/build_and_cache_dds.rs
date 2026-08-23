@@ -23,6 +23,7 @@ use crate::executor::{
     TaskError, TaskOutput, TaskResult, TextureEncoderAsync,
 };
 use crate::metrics::OptionalMetrics;
+use bytes::Bytes;
 use image::{Rgba, RgbaImage};
 use std::future::Future;
 use std::pin::Pin;
@@ -232,7 +233,10 @@ where
                         let duration_us = encode_start.elapsed().as_micros() as u64;
                         let bytes = data.len() as u64;
                         metrics.encode_completed(bytes, duration_us);
-                        data
+                        // Bytes::from adopts the encoder's allocation (O(1)),
+                        // so the two fire-and-forget cache spawns below clone a
+                        // refcount rather than 10.66 MiB each (#237).
+                        Bytes::from(data)
                     }
                     Ok(Err(e)) => {
                         return TaskResult::Failed(TaskError::new(format!(
@@ -501,7 +505,7 @@ mod tests {
             _row: u32,
             _col: u32,
             _zoom: u8,
-        ) -> impl Future<Output = Option<Vec<u8>>> + Send {
+        ) -> impl Future<Output = Option<Bytes>> + Send {
             async { None }
         }
         fn put(
@@ -509,7 +513,7 @@ mod tests {
             row: u32,
             col: u32,
             zoom: u8,
-            _data: Vec<u8>,
+            _data: Bytes,
         ) -> impl Future<Output = ()> + Send {
             let tx = self.tx.clone();
             async move {
@@ -533,7 +537,7 @@ mod tests {
             _row: u32,
             _col: u32,
             _zoom: u8,
-        ) -> impl Future<Output = Option<Vec<u8>>> + Send {
+        ) -> impl Future<Output = Option<Bytes>> + Send {
             async { None }
         }
         fn put(
@@ -541,7 +545,7 @@ mod tests {
             row: u32,
             col: u32,
             zoom: u8,
-            _data: Vec<u8>,
+            _data: Bytes,
         ) -> impl Future<Output = ()> + Send {
             let tx = self.tx.clone();
             async move {
@@ -621,7 +625,7 @@ mod tests {
         // X-Plane still gets a tile.
         match result {
             TaskResult::SuccessWithOutput(out) => {
-                let dds: Option<Vec<u8>> = out.get::<Vec<u8>>("dds_data").cloned();
+                let dds: Option<Bytes> = out.get::<Bytes>("dds_data").cloned();
                 assert!(
                     dds.is_some(),
                     "task must return DDS data even when incomplete"
@@ -652,7 +656,7 @@ mod tests {
         let mut chunks = ChunkResults::new();
         for row in 0..16u8 {
             for col in 0..16u8 {
-                chunks.add_success(row, col, vec![]);
+                chunks.add_success(row, col, vec![].into());
             }
         }
         assert!(chunks.is_complete());
@@ -693,7 +697,7 @@ mod tests {
         let mut chunks = ChunkResults::new();
         for row in 0..16u8 {
             for col in 0..16u8 {
-                chunks.add_success(row, col, vec![]);
+                chunks.add_success(row, col, vec![].into());
             }
         }
         assert!(chunks.is_complete());

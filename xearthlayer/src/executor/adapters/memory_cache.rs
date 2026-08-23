@@ -5,6 +5,7 @@
 use crate::cache::{self, CacheKey};
 use crate::coord::TileCoord;
 use crate::dds::DdsFormat;
+use bytes::Bytes;
 use std::sync::Arc;
 
 /// Adapts `cache::MemoryCache` to the executor's `MemoryCache` trait.
@@ -73,14 +74,14 @@ impl MemoryCacheAdapter {
 }
 
 impl crate::executor::MemoryCache for MemoryCacheAdapter {
-    async fn get(&self, row: u32, col: u32, zoom: u8) -> Option<Vec<u8>> {
+    async fn get(&self, row: u32, col: u32, zoom: u8) -> Option<Bytes> {
         let key = self.make_key(row, col, zoom);
-        self.cache.get(&key).await
+        self.cache.get(&key).await.map(Bytes::from)
     }
 
-    async fn put(&self, row: u32, col: u32, zoom: u8, data: Vec<u8>) {
+    async fn put(&self, row: u32, col: u32, zoom: u8, data: Bytes) {
         let key = self.make_key(row, col, zoom);
-        self.cache.put(key, data).await;
+        self.cache.put(key, data.to_vec()).await;
     }
 
     fn size_bytes(&self) -> usize {
@@ -102,7 +103,7 @@ mod tests {
         let cache = Arc::new(cache::MemoryCache::new(1024 * 1024));
         let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
 
-        adapter.put(100, 200, 16, vec![1, 2, 3]).await;
+        adapter.put(100, 200, 16, vec![1, 2, 3].into()).await;
         let result = adapter.get(100, 200, 16).await;
 
         assert!(result.is_some());
@@ -126,7 +127,7 @@ mod tests {
         assert_eq!(adapter.size_bytes(), 0);
         assert_eq!(adapter.entry_count(), 0);
 
-        adapter.put(100, 200, 16, vec![0u8; 100]).await;
+        adapter.put(100, 200, 16, vec![0u8; 100].into()).await;
 
         // moka updates size asynchronously, so we just check it's > 0
         tokio::task::yield_now().await;
@@ -139,8 +140,8 @@ mod tests {
         let cache = Arc::new(cache::MemoryCache::new(1024 * 1024));
         let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
 
-        adapter.put(100, 200, 16, vec![1, 2, 3]).await;
-        adapter.put(100, 201, 16, vec![4, 5, 6]).await;
+        adapter.put(100, 200, 16, vec![1, 2, 3].into()).await;
+        adapter.put(100, 201, 16, vec![4, 5, 6].into()).await;
 
         assert_eq!(adapter.get(100, 200, 16).await.unwrap(), vec![1, 2, 3]);
         assert_eq!(adapter.get(100, 201, 16).await.unwrap(), vec![4, 5, 6]);
@@ -152,10 +153,10 @@ mod tests {
         let cache = Arc::new(cache::MemoryCache::new(1024 * 1024));
         let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
 
-        adapter.put(100, 200, 16, vec![1, 2, 3]).await;
+        adapter.put(100, 200, 16, vec![1, 2, 3].into()).await;
         assert_eq!(adapter.get(100, 200, 16).await.unwrap(), vec![1, 2, 3]);
 
-        adapter.put(100, 200, 16, vec![7, 8, 9]).await;
+        adapter.put(100, 200, 16, vec![7, 8, 9].into()).await;
         assert_eq!(adapter.get(100, 200, 16).await.unwrap(), vec![7, 8, 9]);
     }
 
@@ -166,7 +167,7 @@ mod tests {
         let cache = Arc::new(cache::MemoryCache::new(1024 * 1024));
         let adapter = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
 
-        adapter.put(100, 200, 16, vec![1, 2, 3]).await;
+        adapter.put(100, 200, 16, vec![1, 2, 3].into()).await;
 
         // Same coordinates but different provider won't find it
         // (We can't easily test this with a single adapter, but the key includes provider)
@@ -179,7 +180,7 @@ mod tests {
         let cache = Arc::new(cache::MemoryCache::new(1024 * 1024));
         let adapter_bc1 = MemoryCacheAdapter::new(cache, "bing", DdsFormat::BC1);
 
-        adapter_bc1.put(100, 200, 16, vec![1, 2, 3]).await;
+        adapter_bc1.put(100, 200, 16, vec![1, 2, 3].into()).await;
 
         // The key includes format, so BC1 and BC3 are different entries
         assert_eq!(adapter_bc1.format(), DdsFormat::BC1);

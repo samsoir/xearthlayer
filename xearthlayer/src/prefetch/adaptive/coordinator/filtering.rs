@@ -238,6 +238,7 @@ pub(crate) async fn run_filter_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::collections::HashSet;
 
     fn test_tiles(count: usize) -> Vec<TileCoord> {
@@ -371,7 +372,7 @@ mod tests {
             _row: u32,
             _col: u32,
             _zoom: u8,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Bytes>> + Send + '_>>
         {
             Box::pin(async { None })
         }
@@ -381,7 +382,7 @@ mod tests {
             _row: u32,
             _col: u32,
             _zoom: u8,
-            _data: Vec<u8>,
+            _data: Bytes,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             Box::pin(async {})
         }
@@ -416,16 +417,16 @@ mod tests {
                 _row: u32,
                 _col: u32,
                 _zoom: u8,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Bytes>> + Send + '_>>
             {
-                Box::pin(async { Some(vec![0u8; 16]) })
+                Box::pin(async { Some(Bytes::from(vec![0u8; 16])) })
             }
             fn put(
                 &self,
                 _row: u32,
                 _col: u32,
                 _zoom: u8,
-                _data: Vec<u8>,
+                _data: Bytes,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
                 Box::pin(async {})
             }
@@ -558,12 +559,12 @@ mod tests {
                 row: u32,
                 _col: u32,
                 _zoom: u8,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Bytes>> + Send + '_>>
             {
                 let hit = row % 2 == 0;
                 Box::pin(async move {
                     if hit {
-                        Some(vec![0u8; 16])
+                        Some(Bytes::from(vec![0u8; 16]))
                     } else {
                         None
                     }
@@ -574,7 +575,7 @@ mod tests {
                 _row: u32,
                 _col: u32,
                 _zoom: u8,
-                _data: Vec<u8>,
+                _data: Bytes,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
                 Box::pin(async {})
             }

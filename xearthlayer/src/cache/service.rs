@@ -222,6 +222,7 @@ impl CacheService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -271,9 +272,9 @@ mod tests {
         let cache = service.cache();
 
         // Set and get
-        cache.set("key1", vec![1, 2, 3]).await.unwrap();
+        cache.set("key1", vec![1, 2, 3].into()).await.unwrap();
         let value = cache.get("key1").await.unwrap();
-        assert_eq!(value, Some(vec![1, 2, 3]));
+        assert_eq!(value, Some(Bytes::from(vec![1, 2, 3])));
 
         // Contains
         assert!(cache.contains("key1").await.unwrap());
@@ -296,9 +297,9 @@ mod tests {
         let cache2 = service.cache();
 
         // Both references should work on the same cache
-        cache1.set("key1", vec![1]).await.unwrap();
+        cache1.set("key1", vec![1].into()).await.unwrap();
         let value = cache2.get("key1").await.unwrap();
-        assert_eq!(value, Some(vec![1]));
+        assert_eq!(value, Some(Bytes::from(vec![1])));
 
         service.shutdown().await;
     }
@@ -337,9 +338,9 @@ mod tests {
         let cache = service.cache();
 
         // Set and get
-        cache.set("key1", vec![1, 2, 3]).await.unwrap();
+        cache.set("key1", vec![1, 2, 3].into()).await.unwrap();
         let value = cache.get("key1").await.unwrap();
-        assert_eq!(value, Some(vec![1, 2, 3]));
+        assert_eq!(value, Some(Bytes::from(vec![1, 2, 3])));
 
         service.shutdown().await;
     }

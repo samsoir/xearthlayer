@@ -12,6 +12,7 @@
 //! - **Interface Segregation**: Small, focused interfaces
 //! - **Dependency Inversion**: Filesystems depend on abstractions
 
+use bytes::Bytes;
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -342,7 +343,7 @@ pub trait DdsRequestor: FileAttrBuilder {
     /// # Returns
     ///
     /// Generated DDS data, or placeholder on error/timeout
-    async fn request_dds_impl(&self, coords: &DdsFilename) -> Vec<u8> {
+    async fn request_dds_impl(&self, coords: &DdsFilename) -> Bytes {
         let tile = chunk_to_tile_coords(coords);
         let context_label = self.context_label();
         let timeout = self.generation_timeout();
@@ -439,7 +440,7 @@ pub trait DdsRequestor: FileAttrBuilder {
         tile: TileCoord,
         timeout: Duration,
         context_label: &'static str,
-    ) -> Vec<u8> {
+    ) -> Bytes {
         let client = self.dds_client();
         let cancellation_token = CancellationToken::new();
 

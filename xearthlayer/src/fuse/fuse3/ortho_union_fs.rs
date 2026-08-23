@@ -103,7 +103,9 @@ struct DdsHandle {
     /// Which tile this handle refers to.
     coords: DdsFilename,
     /// The tile, produced on first read and reused by every later read.
-    tile: OnceCell<Arc<Vec<u8>>>,
+    /// `Bytes`: the handle shares the cache's allocation rather than owning
+    /// a copy, and `Bytes::slice` serves a ranged read without allocating.
+    tile: OnceCell<Bytes>,
 }
 
 /// FUSE open flag: bypass kernel page cache for this file.
@@ -434,7 +436,7 @@ impl Fuse3OrthoUnionFS {
     /// does not. Scene Tracker therefore sees one event per texture X-Plane
     /// opens rather than one per ranged read -- the same access pattern,
     /// without the 12-23x inflation.
-    async fn resolve_tile(&self, coords: &DdsFilename) -> Vec<u8> {
+    async fn resolve_tile(&self, coords: &DdsFilename) -> Bytes {
         if let Some(ref tx) = self.scene_tracker_tx {
             let tile = DdsTileCoord::new(coords.row, coords.col, coords.zoom);
             let _ = tx.send(FuseAccessEvent::new(tile));
@@ -604,7 +606,7 @@ impl Fuse3OrthoUnionFS {
     /// Request DDS generation by filename string.
     ///
     /// Wrapper around the trait method that parses the filename first.
-    async fn request_dds(&self, name_str: &str) -> Option<Vec<u8>> {
+    async fn request_dds(&self, name_str: &str) -> Option<Bytes> {
         let coords = parse_dds_filename(name_str).ok()?;
         Some(self.request_dds_impl(&coords).await)
     }
@@ -859,55 +861,48 @@ impl Filesystem for Fuse3OrthoUnionFS {
             // branch used to re-enter the executor on every one of them.
             let handle = self.dds_handles.get(&fh).map(|h| Arc::clone(&h));
 
-            // Whether this call had to produce a tile, as opposed to slicing
-            // one an earlier read already produced. Read before `get_or_init`
-            // so it reflects the state on entry. Two concurrent first reads on
-            // one handle both see `false` and both report the tile, which
-            // over-reports amplification rather than hiding it.
-            let is_first_read = handle
-                .as_ref()
-                .map(|h| h.tile.get().is_none())
-                .unwrap_or(true);
-
             let tile = match handle {
-                Some(handle) => Arc::clone(
-                    handle
-                        .tile
-                        .get_or_init(|| async {
-                            let data = self.resolve_tile(&handle.coords).await;
-                            self.pinned_tile_bytes
-                                .fetch_add(data.len() as u64, Ordering::Relaxed);
-                            // Report here, not at open(): the tile is produced
-                            // on first read, so a gauge sampled only at open
-                            // would never see the bytes it is meant to bound.
-                            self.report_handle_gauge();
-                            Arc::new(data)
-                        })
-                        .instrument(fuse_read_span)
-                        .await,
-                ),
+                Some(handle) => handle
+                    .tile
+                    .get_or_init(|| async {
+                        let data = self.resolve_tile(&handle.coords).await;
+                        self.pinned_tile_bytes
+                            .fetch_add(data.len() as u64, Ordering::Relaxed);
+                        // Report here, not at open(): the tile is produced
+                        // on first read, so a gauge sampled only at open
+                        // would never see the bytes it is meant to bound.
+                        self.report_handle_gauge();
+                        data
+                    })
+                    .instrument(fuse_read_span)
+                    .await
+                    .clone(),
                 // No handle: either the memoisation budget was exhausted at
                 // open() time, or the kernel sent a read we cannot attribute.
                 // Serve it the old way rather than fail -- a missing handle
                 // must never become a black texture.
-                None => Arc::new(self.resolve_tile(&coords).instrument(fuse_read_span).await),
+                None => self.resolve_tile(&coords).instrument(fuse_read_span).await,
             };
 
             let offset = offset as usize;
             let size = size as usize;
 
             let end = std::cmp::min(offset.saturating_add(size), tile.len());
-            let slice = tile.get(offset..end).unwrap_or(&[]);
+            // Refcount, not memcpy: the reply borrows the tile's allocation and
+            // the kernel gets its window without one byte being copied (#237).
+            let slice = if offset < end {
+                tile.slice(offset..end)
+            } else {
+                Bytes::new()
+            };
 
-            // Slicing a tile an earlier read already produced obtains nothing,
-            // so it materialises nothing. Counting the slice here instead would
-            // leave the ratio near 2 forever and make the fix look ineffective.
-            let materialised = if is_first_read { tile.len() as u64 } else { 0 };
-            self.record_read(slice.len() as u64, materialised, true);
+            // The handler obtains exactly what it returns. The tile is produced
+            // whole by the generation pipeline, which this counter does not --
+            // and should not -- charge to the read path, so the ratio is 1.0
+            // when delivery is zero-copy and climbs the moment it is not.
+            self.record_read(slice.len() as u64, slice.len() as u64, true);
 
-            return Ok(ReplyData {
-                data: Bytes::copy_from_slice(slice),
-            });
+            return Ok(ReplyData { data: slice });
         }
 
         // Real file from union index
@@ -1645,7 +1640,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(DdsResponse::cache_hit(
-                Self::valid_dds(),
+                Self::valid_dds().into(),
                 Duration::from_millis(1),
             ));
             rx
@@ -1961,7 +1956,7 @@ mod tests {
     /// call would pin `fuse_dds_alloc_mb / fuse_dds_read_mb` near 12-23 and
     /// report the fix as ineffective.
     #[tokio::test]
-    async fn test_virtual_dds_metric_charges_the_tile_once() {
+    async fn test_virtual_dds_metric_charges_only_what_it_delivers() {
         use fuse3::raw::Filesystem;
 
         let temp = TempDir::new().unwrap();
@@ -2009,10 +2004,43 @@ mod tests {
 
         assert_eq!(events, READS, "one FuseRead per read call");
         assert_eq!(returned_total, READS * CHUNK as u64);
+        // #237 changed the contract. The handler now takes a refcount on the
+        // tile and slices it, so it obtains exactly what it returns and the
+        // amplification ratio is 1.0. Charging the tile here instead would
+        // report allocation that no longer happens.
         assert_eq!(
-            materialised_total,
-            crate::fuse::EXPECTED_DDS_SIZE as u64,
-            "the tile is charged exactly once across {READS} reads"
+            materialised_total, returned_total,
+            "a zero-copy handler obtains exactly what it delivers"
+        );
+    }
+
+    /// The ratio is only honest if the delivery really is zero-copy, and the
+    /// counter cannot prove that -- it is charged by code we control. Pointer
+    /// identity can: the reply must alias the memoised tile, not copy it.
+    #[tokio::test]
+    async fn test_virtual_dds_read_aliases_the_memoised_tile() {
+        use fuse3::raw::Filesystem;
+
+        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let ino = virtual_inode(&fs);
+        let opened = fs.open(test_request(), ino, 0).await.unwrap();
+
+        const OFFSET: u64 = 4096;
+        let reply = fs
+            .read(test_request(), ino, opened.fh, OFFSET, 256)
+            .await
+            .unwrap();
+
+        let handle = fs.dds_handles.get(&opened.fh).expect("handle is live");
+        let tile = handle.tile.get().expect("first read produced the tile");
+
+        // The reply's buffer must sit inside the tile's allocation, at the
+        // requested offset -- not be a fresh 256-byte copy of it.
+        let expected = unsafe { tile.as_ptr().add(OFFSET as usize) };
+        assert_eq!(
+            reply.data.as_ptr(),
+            expected,
+            "the reply must alias the tile at the read offset, not copy from it"
         );
     }
 
@@ -2862,7 +2890,7 @@ mod tests {
                 .response_tx
                 .expect("FUSE requests carry a response channel")
                 .send(DdsResponse::new(
-                    vec![0u8; 16],
+                    vec![0u8; 16].into(),
                     cache_hit,
                     Duration::from_millis(1),
                     true,

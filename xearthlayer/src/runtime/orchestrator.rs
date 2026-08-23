@@ -329,6 +329,7 @@ mod tests {
     use super::*;
     use crate::coord::TileCoord;
     use crate::executor::{Job, JobId, NullDdsDiskCache, Priority, Task};
+    use bytes::Bytes;
     use std::time::Duration;
 
     /// Mock job factory for testing.
@@ -372,7 +373,7 @@ mod tests {
             _row: u32,
             _col: u32,
             _zoom: u8,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Bytes>> + Send + '_>>
         {
             Box::pin(async { None }) // Always miss for testing
         }
@@ -382,7 +383,7 @@ mod tests {
             _row: u32,
             _col: u32,
             _zoom: u8,
-            _data: Vec<u8>,
+            _data: Bytes,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             Box::pin(async {}) // No-op for testing
         }
