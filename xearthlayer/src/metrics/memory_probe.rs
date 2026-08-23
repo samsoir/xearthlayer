@@ -390,22 +390,36 @@ mod tests {
         assert_eq!(a.obtained_bytes(), 100_900);
     }
 
-    /// A large allocation must move the accounting, or the probe is reading a
-    /// constant and would report "no retention" whatever happened.
+    /// The probe must report real figures, not a constant or a stale read.
+    ///
+    /// Asserted as a **lower bound while holding** the memory, never as a
+    /// delta. `mallinfo2` is process-global and cargo runs tests in parallel
+    /// threads, so a before/after difference is not the test's to measure --
+    /// a sibling test freeing its buffers in between makes `obtained_bytes`
+    /// fall across an allocation. That version failed 8 runs in 12.
+    ///
+    /// Other tests can only ever *add* to these figures, so a floor holds.
     #[test]
-    fn test_allocator_sample_tracks_a_real_allocation() {
-        // A DDS-sized block. Asserted against `obtained_bytes`, not `in_use`:
-        // at 11 MiB glibc serves this by mmap, which `uordblks` never sees.
-        // Measured on glibc 2.44: hblkhd +11538432, uordblks +1968.
-        let before = AllocatorSample::read().expect("glibc").obtained_bytes();
-        let tile = vec![7u8; 11 * 1024 * 1024];
-        let during = AllocatorSample::read().expect("glibc").obtained_bytes();
+    fn test_allocator_sample_reports_live_allocations() {
+        const MIB: usize = 1024 * 1024;
+        // DDS-sized blocks, which glibc serves by mmap: an 11 MiB allocation
+        // moves hblkhd by 11538432 and uordblks by 1968 on glibc 2.44.
+        let tiles: Vec<Vec<u8>> = (0..12).map(|_| vec![7u8; 11 * MIB]).collect();
+        let held = std::hint::black_box(&tiles).len() * 11 * MIB;
+
+        // Assert on the total, never on which route glibc chose. Its mmap
+        // threshold adapts upward after a single alloc/free of this size, so
+        // an identical allocation lands in `hblkhd` early in a process and in
+        // `arena` later. A test that named the route failed 25 runs in 25.
+        let a = AllocatorSample::read().expect("glibc");
         assert!(
-            during >= before + 8 * 1024 * 1024,
-            "11 MiB allocation moved obtained bytes by only {}",
-            during.saturating_sub(before)
+            a.obtained_bytes() as usize >= held,
+            "obtained {} is below the {held} bytes held live (heap {}, mmapped {})",
+            a.obtained_bytes(),
+            a.heap_bytes,
+            a.mmapped_bytes
         );
-        drop(tile);
+        drop(tiles);
     }
 
     /// `anon_bytes` is what makes committed memory readable without arithmetic.
