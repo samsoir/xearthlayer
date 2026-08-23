@@ -390,6 +390,50 @@ mod tests {
         assert_eq!(a.obtained_bytes(), 100_900);
     }
 
+    /// The whole point of pinning the threshold: after `configure_allocator`,
+    /// DDS-sized allocations must keep going through `mmap` however many
+    /// allocate/free cycles precede them.
+    ///
+    /// Without it, glibc's threshold adapts past 11 MiB after **one** cycle and
+    /// tiles start coming from arenas, where freeing them returns nothing to
+    /// the OS. Measured on glibc 2.44: holding 44 MiB gives hblkhd 44.4 MB on
+    /// the first round, then 0.4 MB with arena 45.6 MB on every round after.
+    ///
+    /// Asserted as a lower bound while holding the memory. `mallinfo2` is
+    /// process-global and cargo runs tests in parallel, so a delta here is not
+    /// this test's to measure -- see `test_allocator_sample_reports_live_allocations`.
+    #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn test_configure_allocator_keeps_large_blocks_off_the_arena() {
+        const MIB: usize = 1024 * 1024;
+
+        // Drive the adaptation the way the tile pipeline does. Without the pin
+        // this alone moves subsequent 11 MiB blocks into the arena.
+        for _ in 0..4 {
+            let churn = vec![3u8; 11 * MIB];
+            std::hint::black_box(&churn);
+            drop(churn);
+        }
+
+        // Environment override wins by design, so this returns false under an
+        // allocator experiment. Either way the threshold ends up pinned.
+        let _ = configure_allocator();
+
+        let tiles: Vec<Vec<u8>> = (0..12).map(|_| vec![9u8; 11 * MIB]).collect();
+        let held = std::hint::black_box(&tiles).len() * 11 * MIB;
+        let a = AllocatorSample::read().expect("glibc");
+
+        assert!(
+            a.mmapped_bytes as usize >= held * 3 / 4,
+            "holding {held} bytes of DDS-sized buffers after four churn cycles, \
+             glibc reports only {} mmapped (arena {}). The threshold adapted, \
+             which is exactly what configure_allocator must prevent.",
+            a.mmapped_bytes,
+            a.heap_bytes
+        );
+        drop(tiles);
+    }
+
     /// The probe must report real figures, not a constant or a stale read.
     ///
     /// Asserted as a **lower bound while holding** the memory, never as a
@@ -486,5 +530,75 @@ mod tests {
             sample.swap_bytes.is_some(),
             "linux should always expose VmSwap, even if the value is 0"
         );
+    }
+}
+
+// =============================================================================
+// Allocator configuration
+// =============================================================================
+
+/// Cap above which glibc must serve an allocation with `mmap` rather than from
+/// an arena: 1 MiB.
+///
+/// A DDS tile is 11.17 MiB. glibc's mmap threshold *starts* at 128 KiB and
+/// adapts **upward** — as far as 32 MiB — each time an mmapped block is freed.
+/// After a single tile allocate/free cycle it has already passed 11 MiB, and
+/// from then on tiles come from arenas instead. Arena memory is returned to the
+/// OS only when the heap top is free or `malloc_trim` runs, so every arena that
+/// ever served a tile keeps that space for the life of the process.
+///
+/// Measured on glibc 2.44, 64 threads allocating and freeing 11 MiB buffers:
+///
+/// | configuration | anonymous resident retained |
+/// |---|---|
+/// | default | 191.5 MB |
+/// | `MALLOC_ARENA_MAX=2` | 70.4 MB |
+/// | threshold pinned to 1 MiB | **4.6 MB** |
+///
+/// The cost is one `mmap`/`munmap` pair per tile, measured at **+0.16 ms** —
+/// about 20 seconds of CPU across an 11-hour flight. See issue #227.
+const MMAP_THRESHOLD_BYTES: usize = 1024 * 1024;
+
+/// Pins glibc's mmap threshold so large allocations are never served from an
+/// arena, and are therefore returned to the OS when freed.
+///
+/// Returns `true` if the threshold was applied. Call once, early, before the
+/// process allocates in earnest.
+///
+/// Setting this parameter through `mallopt` also **disables glibc's dynamic
+/// adjustment** of the threshold, which is the point: a lower starting value
+/// alone would adapt straight back up.
+///
+/// An explicit `MALLOC_MMAP_THRESHOLD_` in the environment wins — glibc has
+/// already applied it at startup, and overriding it here would silently break
+/// anyone measuring an allocator experiment.
+pub fn configure_allocator() -> bool {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        if let Ok(value) = std::env::var("MALLOC_MMAP_THRESHOLD_") {
+            tracing::debug!(
+                env_value = %value,
+                "MALLOC_MMAP_THRESHOLD_ set in the environment; leaving glibc's threshold alone"
+            );
+            return false;
+        }
+
+        // SAFETY: mallopt takes two ints and is thread-safe; glibc locks
+        // internally. M_MMAP_THRESHOLD is a documented parameter.
+        let applied = unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, MMAP_THRESHOLD_BYTES as i32) };
+        if applied == 1 {
+            tracing::debug!(
+                threshold_bytes = MMAP_THRESHOLD_BYTES,
+                "Pinned glibc mmap threshold; large allocations bypass arenas"
+            );
+            true
+        } else {
+            tracing::warn!("mallopt(M_MMAP_THRESHOLD) was rejected; arena retention not bounded");
+            false
+        }
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        false
     }
 }

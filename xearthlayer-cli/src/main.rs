@@ -166,6 +166,14 @@ enum Commands {
 // ============================================================================
 
 fn main() -> ExitCode {
+    // First, before anything allocates in earnest. glibc's mmap threshold
+    // adapts upward past the 11.17 MiB DDS tile size after a single
+    // allocate/free cycle, after which tiles come from arenas and are never
+    // returned to the OS on free. Pinning it costs ~0.16 ms per tile and
+    // bounded arena retention at 4.6 MB against 191.5 MB in a 64-thread
+    // benchmark. Set MALLOC_MMAP_THRESHOLD_ to override. See issue #227.
+    xearthlayer::metrics::configure_allocator();
+
     let cli = Cli::parse();
 
     // Initialize logging once for every subcommand. Falls back to default
