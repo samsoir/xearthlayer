@@ -436,6 +436,25 @@ impl MetricsDaemon {
             // was swapped out. 0 means "not readable on this platform", not
             // "nothing swapped" — same convention as `threads`.
             swap_mb = sample.swap_bytes.unwrap_or(0) / MB,
+            // Anonymous resident memory. `anon_mb + swap_mb` is the committed
+            // footprint -- what the OOM killer scores. Prefer it to vm_mb,
+            // which also counts untouched address space: thread stacks measure
+            // 2.21 MB each over a pool cycling 37..586, so vm_mb carries a ~1 GB
+            // sawtooth that is not memory (#227).
+            anon_mb = sample.anon_bytes.unwrap_or(0) / MB,
+            // glibc accounting (#227). 0 means "not glibc" or "unreadable".
+            //
+            // These are NOT interchangeable. uordblks counts arena chunks only;
+            // an 11 MiB DDS buffer is served by mmap and never appears in it.
+            //   heap_free_mb rising  -> arena retention, candidate 2
+            //   inuse_mb rising      -> we genuinely hold objects, a real leak
+            //   mmap_mb falling while heap_mb rises -> glibc's mmap threshold
+            //     has adapted past the tile size, so tiles now come from arenas
+            //     and stop being returned on free
+            heap_mb = sample.allocator.map_or(0, |a| a.heap_bytes) / MB,
+            mmap_mb = sample.allocator.map_or(0, |a| a.mmapped_bytes) / MB,
+            inuse_mb = sample.allocator.map_or(0, |a| a.in_use_bytes) / MB,
+            heap_free_mb = sample.allocator.map_or(0, |a| a.arena_retained_bytes()) / MB,
             // 0 means "not readable on this platform", not "no threads".
             threads = sample.threads.unwrap_or(0),
             tiles_done = state.encodes_completed,
@@ -1047,6 +1066,51 @@ mod tests {
             .find(|fields| fields.get("message").map(String::as_str) == Some("Memory sample"))
     }
 
+    /// End-to-end against the real allocator: the seeded test above proves the
+    /// wiring, this proves the values are real. A field plumbed correctly but
+    /// reading zero from glibc would pass that test and be useless in flight.
+    #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn memory_sample_carries_live_allocator_figures() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut daemon = MetricsDaemon::with_memory_probe(
+            rx,
+            std::sync::Arc::new(crate::metrics::ProcessMemoryProbe),
+        );
+
+        // Hold DDS-sized allocations across the sample. A bare test process has
+        // arena 1.56 MB and hblkhd 0.38 MB, both of which truncate to 0 in the
+        // MB-scaled log line -- so without this the test asserts against
+        // rounding, not against glibc.
+        let _tiles: Vec<Vec<u8>> = (0..6).map(|_| vec![0u8; 11 * 1024 * 1024]).collect();
+
+        let events = capture_events(|| daemon.log_memory_sample());
+        let sample = find_memory_sample(&events).expect("must emit a memory sample");
+
+        let num = |k: &str| -> u64 {
+            sample
+                .get(k)
+                .unwrap_or_else(|| panic!("{k} missing from the sample line"))
+                .parse()
+                .unwrap_or_else(|_| panic!("{k} is not numeric"))
+        };
+
+        assert!(num("anon_mb") > 0, "RssAnon read as zero");
+        assert!(
+            num("heap_mb") + num("mmap_mb") > 0,
+            "glibc reports nothing obtained from the OS"
+        );
+        assert!(
+            num("mmap_mb") >= 60,
+            "66 MiB of live DDS-sized buffers must show in mmap_mb, got {}",
+            num("mmap_mb")
+        );
+        assert!(
+            num("anon_mb") <= num("rss_mb"),
+            "anonymous resident cannot exceed total resident"
+        );
+    }
+
     #[test]
     fn memory_sample_line_carries_every_field_from_its_correct_source() {
         const MB: u64 = 1024 * 1024;
@@ -1059,7 +1123,14 @@ mod tests {
                     5 * MB + 1, // deliberately not a whole number of MB
                     6 * MB,
                 )
-                .with_swap_bytes(7 * MB),
+                .with_swap_bytes(7 * MB)
+                .with_anon_bytes(4 * MB)
+                .with_allocator(crate::metrics::memory_probe::AllocatorSample {
+                    heap_bytes: 21 * MB,
+                    mmapped_bytes: 22 * MB,
+                    in_use_bytes: 23 * MB,
+                    heap_free_bytes: 24 * MB,
+                }),
             ),
         );
 
@@ -1090,7 +1161,15 @@ mod tests {
         let expected: &[(&str, &str)] = &[
             ("rss_mb", "5"),
             ("vm_mb", "6"),
-            ("swap_mb", "7"),  // StaticMemoryProbe::with_swap_bytes
+            ("swap_mb", "7"), // StaticMemoryProbe::with_swap_bytes
+            ("anon_mb", "4"), // StaticMemoryProbe::with_anon_bytes
+            // Distinct values, so a field wired to the wrong mallinfo2 member
+            // cannot pass. The four are easy to transpose and nothing else
+            // would catch it (#227).
+            ("heap_mb", "21"),
+            ("mmap_mb", "22"),
+            ("inuse_mb", "23"),
+            ("heap_free_mb", "24"),
             ("threads", "42"), // StaticMemoryProbe::new fixes threads at 42
             ("tiles_done", "10"),
             ("encodes_active", "11"),

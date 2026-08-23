@@ -22,6 +22,93 @@ pub struct MemorySample {
     /// `rss_bytes` alone read a healthy 9.3 GB. A trace that only logs
     /// `rss_bytes` cannot see a process swapping itself to death.
     pub swap_bytes: Option<u64>,
+    /// Anonymous resident memory in bytes, from `/proc/self/status` `RssAnon`.
+    /// `None` where not readable.
+    ///
+    /// `anon_bytes + swap_bytes` is the process's **committed** footprint --
+    /// what the OOM killer scores. Prefer it to `vm_bytes`, which also counts
+    /// address space that is mapped but never touched: thread stacks alone
+    /// measured 2.21 MB per thread over a pool cycling 37..586 threads, so
+    /// `vm_bytes` carries a ~1 GB sawtooth that is not memory at all (#227).
+    pub anon_bytes: Option<u64>,
+    /// glibc's own accounting, `None` on non-glibc platforms.
+    pub allocator: Option<AllocatorSample>,
+}
+
+/// glibc allocator accounting, from `mallinfo2`.
+///
+/// **The fields are not interchangeable, and the obvious formula is wrong.**
+/// `in_use_bytes` (`uordblks`) counts *arena* chunks only; a block served by
+/// `mmap` never appears in it. Measured on glibc 2.44, an 11 MiB allocation --
+/// DDS-tile sized -- moves `hblkhd` by 11538432 and `uordblks` by 1968. So
+/// `(heap + mmapped) - in_use` reports every live mmapped tile as retention,
+/// which is both wrong and believable.
+///
+/// What each field actually answers for #227:
+///
+/// - `heap_free_bytes` (`fordblks`) -- free space glibc holds inside arenas.
+///   **This is the retention signal.** Arena memory returns to the OS only via
+///   `malloc_trim` or a free heap top.
+/// - `mmapped_bytes` (`hblkhd`) -- currently mmapped. glibc unmaps these on
+///   free, so this tracks live large allocations, not retention.
+/// - `heap_bytes` (`arena`) rising while `in_use_bytes` stays flat is arena
+///   growth the program is not using.
+///
+/// Watch for a **transition**: glibc's mmap threshold starts at 128 KB and
+/// adapts upward to 32 MB as mmapped blocks are freed. Once it passes 11 MiB,
+/// DDS buffers stop coming from `mmap` and start coming from arenas -- at
+/// which point they are no longer returned to the OS on free. That is
+/// candidate 2 stated precisely, and it would show as `mmapped_bytes` falling
+/// while `heap_bytes` and `heap_free_bytes` climb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocatorSample {
+    /// Bytes obtained from `sbrk` (`mallinfo2.arena`).
+    pub heap_bytes: u64,
+    /// Bytes obtained from `mmap` for large allocations (`mallinfo2.hblkhd`).
+    pub mmapped_bytes: u64,
+    /// Bytes currently allocated to the program (`mallinfo2.uordblks`).
+    pub in_use_bytes: u64,
+    /// Free bytes held inside arenas (`mallinfo2.fordblks`) -- fragmentation.
+    pub heap_free_bytes: u64,
+}
+
+impl AllocatorSample {
+    /// Reads glibc's accounting. `None` where `mallinfo2` is unavailable.
+    ///
+    /// `mallinfo2` takes every arena's lock, so it is not free -- at the 60s
+    /// sample cadence that is immaterial, but do not call it on a hot path.
+    pub fn read() -> Option<Self> {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            // SAFETY: mallinfo2 takes no arguments and returns a plain struct
+            // of integers. It is thread-safe; glibc locks the arenas itself.
+            let mi = unsafe { libc::mallinfo2() };
+            Some(Self {
+                heap_bytes: mi.arena as u64,
+                mmapped_bytes: mi.hblkhd as u64,
+                in_use_bytes: mi.uordblks as u64,
+                heap_free_bytes: mi.fordblks as u64,
+            })
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        {
+            None
+        }
+    }
+
+    /// Bytes glibc holds from the OS inside arenas without handing them to the
+    /// program -- the retention signal for #227.
+    ///
+    /// This is `fordblks` alone. It deliberately excludes `hblkhd`: mmapped
+    /// blocks are unmapped on free, so live ones are not retention.
+    pub fn arena_retained_bytes(&self) -> u64 {
+        self.heap_free_bytes
+    }
+
+    /// Total bytes obtained from the OS, by either route.
+    pub fn obtained_bytes(&self) -> u64 {
+        self.heap_bytes + self.mmapped_bytes
+    }
 }
 
 /// Reads the current process's memory footprint.
@@ -64,13 +151,14 @@ impl ProcessMemoryProbe {
     /// Both fields are read from the same file read so the file is only
     /// opened once per sample.
     #[cfg(target_os = "linux")]
-    fn linux_status_fields() -> (Option<u64>, Option<u64>) {
+    fn linux_status_fields() -> (Option<u64>, Option<u64>, Option<u64>) {
         let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-            return (None, None);
+            return (None, None, None);
         };
 
         let mut threads = None;
         let mut swap_bytes = None;
+        let mut anon_bytes = None;
 
         for line in status.lines() {
             if let Some(value) = line.strip_prefix("Threads:") {
@@ -83,15 +171,21 @@ impl ProcessMemoryProbe {
                     .strip_suffix("kB")
                     .and_then(|kb| kb.trim().parse::<u64>().ok())
                     .map(|kb| kb * 1024);
+            } else if let Some(value) = line.strip_prefix("RssAnon:") {
+                anon_bytes = value
+                    .trim()
+                    .strip_suffix("kB")
+                    .and_then(|kb| kb.trim().parse::<u64>().ok())
+                    .map(|kb| kb * 1024);
             }
         }
 
-        (threads, swap_bytes)
+        (threads, swap_bytes, anon_bytes)
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn linux_status_fields() -> (Option<u64>, Option<u64>) {
-        (None, None)
+    fn linux_status_fields() -> (Option<u64>, Option<u64>, Option<u64>) {
+        (None, None, None)
     }
 }
 
@@ -104,13 +198,58 @@ impl MemoryProbe for ProcessMemoryProbe {
         });
 
         let stats = memory_stats::memory_stats()?;
-        let (threads, swap_bytes) = Self::linux_status_fields();
+        let (threads, swap_bytes, anon_bytes) = Self::linux_status_fields();
         Some(MemorySample {
             rss_bytes: stats.physical_mem as u64,
             vm_bytes: stats.virtual_mem as u64,
             threads,
             swap_bytes,
+            anon_bytes,
+            allocator: AllocatorSample::read(),
         })
+    }
+}
+
+/// Asks glibc to return free arena memory to the OS, and logs what moved.
+///
+/// A pure measurement, called once at shutdown: the answer is how much of the
+/// footprint was glibc holding free memory rather than the process holding
+/// objects. Freed arena memory is normally released only when the heap top is
+/// free, so a large drop here is direct evidence for candidate 2 of #227, and
+/// no drop points at genuine retention.
+///
+/// Not for periodic use -- `malloc_trim` walks every arena taking locks.
+pub fn log_malloc_trim_at_shutdown() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        const MB: u64 = 1024 * 1024;
+        let probe = ProcessMemoryProbe;
+        let (Some(before), Some(before_alloc)) = (probe.sample(), AllocatorSample::read()) else {
+            return;
+        };
+
+        // SAFETY: malloc_trim takes a pad in bytes and is thread-safe; glibc
+        // locks the arenas itself.
+        let released = unsafe { libc::malloc_trim(0) };
+
+        let (Some(after), Some(after_alloc)) = (probe.sample(), AllocatorSample::read()) else {
+            return;
+        };
+
+        let anon_before = before.anon_bytes.unwrap_or(before.rss_bytes);
+        let anon_after = after.anon_bytes.unwrap_or(after.rss_bytes);
+
+        tracing::info!(
+            trim_released_any = released == 1,
+            anon_before_mb = anon_before / MB,
+            anon_after_mb = anon_after / MB,
+            anon_freed_mb = anon_before.saturating_sub(anon_after) / MB,
+            heap_free_before_mb = before_alloc.arena_retained_bytes() / MB,
+            heap_free_after_mb = after_alloc.arena_retained_bytes() / MB,
+            heap_before_mb = before_alloc.heap_bytes / MB,
+            heap_after_mb = after_alloc.heap_bytes / MB,
+            "malloc_trim at shutdown"
+        );
     }
 }
 
@@ -158,8 +297,30 @@ impl StaticMemoryProbe {
                 vm_bytes,
                 threads: Some(42),
                 swap_bytes: Some(0),
+                anon_bytes: Some(rss_bytes),
+                allocator: None,
             }),
         }
+    }
+
+    /// Overrides the configured allocator accounting.
+    ///
+    /// No-op if the probe was built with [`Self::unavailable`].
+    pub(crate) fn with_allocator(mut self, allocator: AllocatorSample) -> Self {
+        if let Some(sample) = self.sample.as_mut() {
+            sample.allocator = Some(allocator);
+        }
+        self
+    }
+
+    /// Overrides the configured anonymous-resident byte count.
+    ///
+    /// No-op if the probe was built with [`Self::unavailable`].
+    pub(crate) fn with_anon_bytes(mut self, anon_bytes: u64) -> Self {
+        if let Some(sample) = self.sample.as_mut() {
+            sample.anon_bytes = Some(anon_bytes);
+        }
+        self
     }
 
     /// Overrides the configured swap byte count.
@@ -188,6 +349,79 @@ impl MemoryProbe for StaticMemoryProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The point of #227's next flight: glibc's own accounting must be
+    /// readable, and the retention gap must be derivable from it.
+    #[test]
+    fn test_allocator_sample_reads_glibc_accounting() {
+        let Some(a) = AllocatorSample::read() else {
+            panic!("mallinfo2 must be available on a glibc Linux build");
+        };
+        // A running test process has allocated *something* from somewhere.
+        assert!(
+            a.heap_bytes + a.mmapped_bytes > 0,
+            "allocator reports no memory obtained from the OS"
+        );
+        assert!(a.in_use_bytes > 0, "allocator reports nothing in use");
+        // glibc's own invariant: an arena is its in-use plus its free space.
+        // If this breaks, the struct is being misread (usually a layout or
+        // signedness mistake), and every other figure is untrustworthy.
+        assert!(
+            a.in_use_bytes + a.heap_free_bytes >= a.heap_bytes,
+            "arena {} exceeds in_use {} + free {}",
+            a.heap_bytes,
+            a.in_use_bytes,
+            a.heap_free_bytes
+        );
+    }
+
+    /// Retention is the gap between what glibc took and what we hold.
+    #[test]
+    fn test_arena_retention_excludes_live_mmapped_blocks() {
+        let a = AllocatorSample {
+            heap_bytes: 900,
+            mmapped_bytes: 100_000,
+            in_use_bytes: 250,
+            heap_free_bytes: 650,
+        };
+        // Not 100_650: a live mmapped block is in use, not retained. The naive
+        // `obtained - in_use` would report 100_650 here.
+        assert_eq!(a.arena_retained_bytes(), 650);
+        assert_eq!(a.obtained_bytes(), 100_900);
+    }
+
+    /// A large allocation must move the accounting, or the probe is reading a
+    /// constant and would report "no retention" whatever happened.
+    #[test]
+    fn test_allocator_sample_tracks_a_real_allocation() {
+        // A DDS-sized block. Asserted against `obtained_bytes`, not `in_use`:
+        // at 11 MiB glibc serves this by mmap, which `uordblks` never sees.
+        // Measured on glibc 2.44: hblkhd +11538432, uordblks +1968.
+        let before = AllocatorSample::read().expect("glibc").obtained_bytes();
+        let tile = vec![7u8; 11 * 1024 * 1024];
+        let during = AllocatorSample::read().expect("glibc").obtained_bytes();
+        assert!(
+            during >= before + 8 * 1024 * 1024,
+            "11 MiB allocation moved obtained bytes by only {}",
+            during.saturating_sub(before)
+        );
+        drop(tile);
+    }
+
+    /// `anon_bytes` is what makes committed memory readable without arithmetic.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_probe_reports_anonymous_resident_memory() {
+        let sample = ProcessMemoryProbe.sample().expect("probe must work here");
+        let anon = sample.anon_bytes.expect("linux always exposes RssAnon");
+        assert!(anon > 0, "process reports no anonymous resident memory");
+        assert!(
+            anon <= sample.rss_bytes,
+            "anonymous {} cannot exceed total resident {}",
+            anon,
+            sample.rss_bytes
+        );
+    }
 
     #[test]
     fn process_probe_reports_nonzero_memory() {
