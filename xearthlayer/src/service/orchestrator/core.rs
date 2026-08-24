@@ -615,6 +615,12 @@ impl ServiceOrchestrator {
         self.mount_manager.unmount_all();
         info!("FUSE mounts unmounted (cache services shutdown via service drop)");
 
+        // Measurement, not housekeeping: how much of the footprint was glibc
+        // holding free arena memory rather than the process holding objects
+        // (#227). Runs after the caches are dropped so their memory is free by
+        // now, and last so it cannot perturb anything above it.
+        crate::metrics::log_malloc_trim_at_shutdown();
+
         info!("ServiceOrchestrator shutdown complete");
     }
 }

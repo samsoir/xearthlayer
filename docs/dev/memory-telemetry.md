@@ -47,7 +47,7 @@ so that a single unattended flight discriminates between them:
 ```
 
 (Captured before #233. The example above shows 16 fields; a current line
-carries **27** — the six `fuse_*` read fields, the four `dds_handles_*` /
+carries **32** — the five committed/allocator fields, the six `fuse_*` read fields, the four `dds_handles_*` /
 `dds_pinned_*` fields, and `dds_budget_exhausted`, all described below. If you
 are editing this paragraph, count the fields in `log_memory_sample` rather than
 adjusting the number by hand: it has gone stale twice that way.)
@@ -62,6 +62,11 @@ mebibyte", not necessarily "nothing".
 | `rss_mb` | `MemoryProbe` → sum of `Rss:` in `/proc/self/smaps` | Physical pages currently held. **Excludes anything the kernel has swapped out.** |
 | `vm_mb` | `MemoryProbe` → sum of `Size:` in `/proc/self/smaps` | Total mapped address space. Counts anonymous mappings whether resident or paged out. |
 | `swap_mb` | `MemoryProbe` → `/proc/self/status` `VmSwap:` | Anonymous memory swapped out to disk. **This is the field that actually caught #209**: at the moment of the kill, `rss_mb` alone read a healthy 9.3 GB while `swap_mb` would have read 54.7 GB. `0` means **not readable on this platform**, not "nothing swapped" — same convention as `threads`. Linux-only; read in the same `/proc/self/status` pass as `threads`, so it costs no extra file open. |
+| `anon_mb` | `/proc/self/status` `RssAnon:` | Anonymous resident memory. **`anon_mb + swap_mb` is the committed footprint — the number to quote.** It is what the OOM killer scores and what a system monitor shows. Prefer it to `vm_mb`; see below. |
+| `heap_mb` | `mallinfo2.arena` | Bytes glibc obtained via `sbrk`. |
+| `mmap_mb` | `mallinfo2.hblkhd` | Bytes glibc obtained via `mmap` for large allocations. Freed on `munmap`, so this tracks *live* large blocks, not retention. |
+| `inuse_mb` | `mallinfo2.uordblks` | Bytes in use **in arenas only** — an mmapped block never appears here. |
+| `heap_free_mb` | `mallinfo2.fordblks` | Free bytes held inside arenas. **This is the retention signal.** |
 | `threads` | `/proc/self/status` `Threads:` | OS thread count. `0` means **not readable on this platform**, not "no threads" — see below. |
 | `tiles_done` | `state.encodes_completed` | Cumulative DDS encodes completed. The load counter: divide by `uptime_s` for tiles/second. |
 | `encodes_active` | `state.encodes_active` | Encodes in flight right now. Each one holds a 4096×4096 RGBA source image (64 MiB) plus its output buffer. |
@@ -85,6 +90,43 @@ mebibyte", not necessarily "nothing".
 | `dds_handles_peak` | `state.fuse_handles_peak_open` | Highest concurrent open count this session. **Read this, not `dds_handles_open`, when sizing the cap.** The current gauges are sampled on open, on tile production and on release, so a 60-second reader almost always catches them just after a release: the first KDEN run reported `dds_pinned_mb=0` throughout while 31 files were open. |
 | `dds_pinned_peak_mb` | `state.fuse_handles_peak_pinned_bytes` | Highest pinned total this session. Compare against the `dds_pinned_cap_mb` logged at mount: if it approaches the cap, `open()` is close to dropping memoisation. Two scene loads (KDEN, KSLC) peaked at 10-21 MiB against 512, roughly 24x headroom. |
 | `dds_budget_exhausted` | `state.fuse_handle_budget_exhausted` | Opens refused a memoising handle because the pinned-tile budget was full (counter, #236). **Any non-zero value means the #234 fix stopped applying for those opens** and their reads resolved the tile once per call. Zero while `fuse_dds_alloc_mb` climbs means a different fault — the two are otherwise indistinguishable in a log. |
+
+### Committed memory, not `vm_mb`
+
+Quote **`anon_mb + swap_mb`**. `vm_mb` is `VmSize`, which also counts address
+space that is mapped but never touched — dominated by thread stacks. Regressed
+over 195 samples of an 11 h flight, `vm_mb` moves **2.21 MB per thread**
+(r = 0.939; Rust's default stack is 2 MiB) and the tokio blocking pool cycles
+between 37 and 586 threads. That is a ~1 GB sawtooth in `vm_mb` that is not
+memory, with swap unmoved because untouched reservations were never resident.
+
+Two people read that artifact as a finding before it was identified: one as
+"grew monotonically, never fell", the other as "15 falls over 1 GB". On the
+committed basis the same flight has 72 falls over 100 MB against `vm_mb`'s 152,
+and only 5 over 300 MB.
+
+### Reading the allocator fields
+
+The obvious formula is wrong. `inuse_mb` counts arena chunks only; measured on
+glibc 2.44, an 11 MiB allocation — DDS-tile sized — moves `hblkhd` by 11538432
+and `uordblks` by 1968. So `(heap + mmap) - inuse` reports every *live* mmapped
+tile as retention, which is wrong and believable.
+
+| observation | reading |
+|---|---|
+| `heap_free_mb` rising | arena retention / fragmentation — candidate 2 of #227 |
+| `inuse_mb` rising | the process genuinely holds more objects — a real leak |
+| `mmap_mb` falling while `heap_mb` rises | glibc's mmap threshold has adapted past the tile size, so tiles now come from arenas and stop being returned on free |
+| all four flat while `anon_mb` climbs | growth is outside malloc — mapped files, kernel buffers, GPU driver |
+
+That last row matters: `mallinfo2` only sees glibc. If it shows nothing while
+committed memory climbs, look at the smaps mapping breakdown, not the allocator.
+
+At shutdown the service logs a `malloc_trim at shutdown` line with `anon_mb`
+and `heap_free_mb` before and after `malloc_trim(0)`. A large `anon_freed_mb`
+is direct evidence that the footprint was glibc holding free memory; no drop
+points at genuine retention. It runs after the caches are dropped and is a
+measurement only.
 
 ### Counters are cumulative; gauges are current-state
 
