@@ -1100,9 +1100,17 @@ mod tests {
             num("heap_mb") + num("mmap_mb") > 0,
             "glibc reports nothing obtained from the OS"
         );
+        // Assert the total, never the route. glibc's mmap threshold adapts
+        // past 11 MiB after one allocate/free cycle, so identical allocations
+        // land in mmap_mb early in a process and heap_mb later -- and whether
+        // `configure_allocator` has run depends on test execution order, which
+        // differs between machines. Naming the route made this pass locally
+        // and fail in CI.
         assert!(
-            num("mmap_mb") >= 60,
-            "66 MiB of live DDS-sized buffers must show in mmap_mb, got {}",
+            num("heap_mb") + num("mmap_mb") >= 60,
+            "66 MiB of live DDS-sized buffers must show in the allocator's \
+             totals, got heap {} + mmap {}",
+            num("heap_mb"),
             num("mmap_mb")
         );
         assert!(
