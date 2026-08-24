@@ -101,6 +101,7 @@ mod health;
 mod orchestrator;
 mod request;
 mod tile_progress;
+mod tokio_runtime;
 
 pub use health::{HealthSnapshot, HealthStatus, RuntimeHealth, SharedRuntimeHealth};
 pub use orchestrator::{RuntimeConfig, XEarthLayerRuntime};
@@ -109,3 +110,4 @@ pub use tile_progress::{
     RegionProgressEntry, SharedTileProgressTracker, TileProgressSink, TileProgressTracker,
     MAX_DISPLAY_REGIONS,
 };
+pub use tokio_runtime::build_service_runtime;

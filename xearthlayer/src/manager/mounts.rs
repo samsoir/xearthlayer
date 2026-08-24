@@ -413,8 +413,13 @@ impl MountManager {
         }
 
         // Create the service (owns the Tokio runtime for DDS generation)
-        // Use XEarthLayerService::start() with integrated cache and metrics
-        let runtime = match tokio::runtime::Runtime::new() {
+        // Use XEarthLayerService::start() with integrated cache and metrics.
+        // The blocking pool is sized from the storage profile rather than
+        // tokio's 512 default: it carries DDS encoding and disk I/O, and at
+        // 512 threads it ratchets glibc's arena high-water mark on every
+        // excursion. See runtime::build_service_runtime and issue #227.
+        let runtime = match crate::runtime::build_service_runtime(service_builder.disk_io_profile())
+        {
             Ok(r) => r,
             Err(e) => {
                 return ConsolidatedOrthoMountResult::failure(
@@ -881,6 +886,9 @@ pub struct ServiceBuilder {
     /// Kept for potential future use with shared I/O limiting.
     #[allow(dead_code)]
     disk_io_limiter: Arc<StorageConcurrencyLimiter>,
+    /// Storage profile after `Auto` resolution, used to size the Tokio
+    /// blocking pool as well as the disk I/O limiter (#227).
+    disk_io_profile: DiskIoProfile,
     /// Shared tile request callback for FUSE-based position inference.
     /// When set, all services forward tile requests to this callback.
     tile_request_callback: Option<TileRequestCallback>,
@@ -940,8 +948,18 @@ impl ServiceBuilder {
             service_config,
             provider_config,
             disk_io_limiter,
+            disk_io_profile: resolved_profile,
             tile_request_callback: None,
         }
+    }
+
+    /// The storage profile this builder resolved, with `Auto` already
+    /// mapped to a concrete profile.
+    ///
+    /// Callers use it to size resources that must agree with the disk I/O
+    /// limiter — notably the Tokio blocking pool (#227).
+    pub fn disk_io_profile(&self) -> DiskIoProfile {
+        self.disk_io_profile
     }
 
     /// Set the tile request callback for FUSE-based position inference.
@@ -1010,6 +1028,38 @@ mod tests {
     fn test_is_mounted_empty() {
         let manager = MountManager::new();
         assert!(!manager.is_mounted("na"));
+    }
+
+    /// The accessor must report the profile after `Auto` resolution, not the
+    /// raw input — the Tokio blocking pool is sized from it, and `Auto` has no
+    /// blocking-thread parameters of its own beyond the SSD fallback (#227).
+    #[test]
+    fn service_builder_exposes_resolved_disk_io_profile() {
+        let builder = ServiceBuilder::with_disk_io_profile(
+            ServiceConfig::default(),
+            crate::provider::ProviderConfig::bing(),
+            DiskIoProfile::Auto,
+        );
+
+        assert_ne!(
+            builder.disk_io_profile(),
+            DiskIoProfile::Auto,
+            "Auto must be resolved to a concrete profile before it is exposed"
+        );
+    }
+
+    /// An explicitly configured profile must survive unchanged, so a user who
+    /// overrides `cache.disk_io_profile` gets the blocking pool they asked for.
+    #[test]
+    fn service_builder_preserves_explicit_disk_io_profile() {
+        for profile in [DiskIoProfile::Hdd, DiskIoProfile::Ssd, DiskIoProfile::Nvme] {
+            let builder = ServiceBuilder::with_disk_io_profile(
+                ServiceConfig::default(),
+                crate::provider::ProviderConfig::bing(),
+                profile,
+            );
+            assert_eq!(builder.disk_io_profile(), profile);
+        }
     }
 
     // Note: Integration tests requiring actual FUSE mounts are in integration tests

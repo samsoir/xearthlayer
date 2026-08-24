@@ -122,6 +122,45 @@ tile as retention, which is wrong and believable.
 That last row matters: `mallinfo2` only sees glibc. If it shows nothing while
 committed memory climbs, look at the smaps mapping breakdown, not the allocator.
 
+### The arena ratchet — read `heap_mb` against `threads`
+
+Confirmed on a 12 h 10 min alpha.3 run (90,308 encodes, 32-core host). With the
+mmap threshold pinned, `mmap_mb` held flat at ~5,655–5,698 MB for 60,000
+encodes and `inuse_mb` held flat at 572–725 MB across an 18× increase in
+work — no leak, and the tile route stable. Committed memory still grew from
+6,473 to 11,876 MB, and **all of it was `heap_free_mb`: 983 → 5,594 MB.**
+
+The arena grows in discrete steps of ~400–470 MB, and every step lands on a
+sample where `threads` is at its ceiling:
+
+```
+ 3.45h  heap 1644 -> 2080  (+436)  threads=581
+ 4.35h  heap 2087 -> 2491  (+404)  threads=581
+ 5.60h  heap 2518 -> 2940  (+422)  threads=581
+ ...
+ 9.75h  heap 5610 -> 6192  (+582)  threads=581
+```
+
+glibc allocates up to 8 arenas per core and binds threads to them under
+contention. Each arena keeps its own top-chunk high-water mark, which is never
+returned to the OS. A large thread excursion recruits arenas, each grows to
+cover its share of the burst, and when the threads retire the arenas stay at
+their peaks. Total arena is the **sum of per-arena peaks**; `inuse_mb` is the
+sum of per-arena live. The first ratchets, the second does not — which is how a
+6 GB arena ends up holding 572 MB.
+
+Diagnostic signature, distinct from every row in the table above:
+
+| observation | reading |
+|---|---|
+| `heap_mb` steps up by a repeatable amount, always at a `threads` peak | arena recruitment. Fix by capping the thread pool, not the allocator. |
+| `heap_mb` and `heap_free_mb` grow in lockstep while `inuse_mb` is flat | every byte of arena growth is free list — a high-water mark, not retained data |
+| `heap_mb` rises while `inuse_mb` rises with it | a genuine leak; the arena is growing to hold live objects |
+
+The lockstep check is what separates the two. Do not read a flat `heap_mb`
+window as a ceiling: the plateaus between steps ran 45 minutes and 7,000
+encodes on this trace, long enough to look like convergence and not be.
+
 At shutdown the service logs a `malloc_trim at shutdown` line with `anon_mb`
 and `heap_free_mb` before and after `malloc_trim(0)`. A large `anon_freed_mb`
 is direct evidence that the footprint was glibc holding free memory; no drop
@@ -310,9 +349,14 @@ Supporting reads:
   buffer. The number should track the CPU resource pool capacity; if it runs
   materially above that, CPU admission control is not bounding the pipeline and
   the peak is unbounded with it.
-- **`threads`** climbing toward 512 points at the tokio blocking pool (default
-  512 threads) filling up, which is one of the mechanisms behind candidate 1
-  (the DDS-disk write path queues onto it via `tokio::fs`).
+- **`threads`** climbing toward 512 points at the tokio blocking pool filling
+  up. It drives memory two ways: each thread carries a 2 MiB stack (2.21
+  MB/thread measured, r = 0.939), and each excursion ratchets the glibc arena
+  high-water mark — see *The arena ratchet* above. It is also one of the
+  mechanisms behind candidate 1, since the DDS-disk write path queues onto the
+  same pool via `tokio::fs`. Since #227 the pool is capped at
+  `DiskIoProfile::max_blocking_threads()` rather than tokio's 512 default, so a
+  trace reaching 512 means the cap is not being applied.
 - **`tiles_done` per hour** is the load normaliser. Two traces at wildly
   different tile rates are not telling you about memory, they are telling you
   about workload.
