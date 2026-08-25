@@ -223,6 +223,10 @@ Uses **Web Mercator** (Slippy Map) projection:
 
 - Main thread: CLI and signal handling
 - Tokio runtime: Multi-threaded async runtime for all I/O
+  - Worker threads: tokio default (one per core)
+  - Blocking pool: capped at `ResourcePoolConfig::blocking_threads_required()`
+    (`cpu + disk_io + BLOCKING_POOL_HEADROOM`), built by
+    `runtime::build_service_runtime()` — **not** tokio's 512 default
   - FUSE operations via fuse3 (native async)
   - HTTP downloads via async reqwest
   - DDS encoding via spawn_blocking (CPU-bound)
@@ -231,6 +235,28 @@ Uses **Web Mercator** (Slippy Map) projection:
 All FUSE operations run asynchronously via fuse3, enabling true parallel
 processing of X-Plane's concurrent DDS requests. CPU utilization improved
 from ~6% to ~45% during scene loading.
+
+### Process Memory Management (#227)
+
+Two process-level settings bound memory growth on long flights. Both are
+applied in code, not by environment variable, and both have flight evidence:
+
+- **`mallopt(M_MMAP_THRESHOLD, 1 MiB)`** — called by `configure_allocator()` as
+  the first statement in `main()`, before anything allocates. glibc's threshold
+  otherwise adapts *upward* past the 10.66 MiB tile size after a single
+  alloc/free cycle, after which tiles come from arenas and are never returned
+  on free. Pinning it cut committed memory 37% at matched work. Override with
+  `MALLOC_MMAP_THRESHOLD_`.
+- **Blocking pool cap** — tokio's 512 default let the pool reach 581 threads,
+  and each excursion ratcheted glibc's arena high-water mark by ~420 MB. The
+  arena reached 6,166 MB while holding 572 MB of live data.
+
+DDS payloads are `bytes::Bytes` end to end (#237): a tile is 10.66 MiB and a
+FUSE read wants ~4% of it, so cloning a payload costs more than delivering it.
+`Bytes` clones are refcount bumps, and the FUSE read path slices rather than
+copies.
+
+Diagnosing memory in the field: `docs/dev/memory-telemetry.md`.
 
 ### Concurrency Limiting
 
@@ -241,15 +267,14 @@ tuned concurrency limits:
 - **Network pool (download tasks)**: `clamp(ceil(cpu_capacity * 1.5), 8, 64)` — pipeline-balanced with CPU pool
 - **HTTP semaphore (chunk connections)**: 1024 shared across all download tasks
 - **CPU-bound work** (assemble + encode): `max(num_cpus * 1.25, num_cpus + 2)` shared limiter
-- **Disk I/O concurrency**: Profile-based, auto-detected from storage type:
-  - HDD: `min(num_cpus * 1, 4)` - seek-bound, low concurrency
-  - SSD: `min(num_cpus * 4, 64)` - moderate concurrency (default)
-  - NVMe: `min(num_cpus * 8, 256)` - aggressive concurrency
+- **Disk I/O pool**: `DEFAULT_DISK_IO_CAPACITY` = 64, flat
+- **Tokio blocking pool**: `cpu + disk_io + BLOCKING_POOL_HEADROOM` — the CPU
+  and disk I/O pools both dispatch through `spawn_blocking`, so their sum is
+  the worst-case demand for blocking threads (#227)
 
 The `ResourcePool` struct (`executor/resource_pool.rs`) manages concurrency by
 resource type. Each task declares its `ResourceType` and the executor acquires
-permits before execution. Storage type detection can be overridden via
-`cache.disk_io_profile` config.
+permits before execution.
 
 **Design rationale**: Tasks declare their resource requirements (Network, CPU, DiskIO)
 and the executor manages permits automatically. This prevents deadlocks that occurred
@@ -359,7 +384,7 @@ Default config location: `~/.xearthlayer/config.ini`
 Key sections:
 - `[general]` - General settings (update_check)
 - `[provider]` - Imagery source (bing/google)
-- `[cache]` - Memory/disk sizes, directory, DDS disk ratio, disk I/O profile (auto/hdd/ssd/nvme)
+- `[cache]` - Memory/disk sizes, directory, DDS disk ratio
 - `[generation]` - Thread count, timeout
 - `[texture]` - DDS format (bc1/bc3), compressor backend (software/ispc/gpu), GPU device selection
 - `[prefetch]` - Boundary-driven prefetch, web_api_port (default 8086), calibration, transition ramp

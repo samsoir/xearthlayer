@@ -6,15 +6,12 @@
 use std::path::Path;
 
 use crate::config::format_size;
-use crate::config::DiskIoProfile;
 
-use super::recommendations::{
-    recommended_disk_cache, recommended_disk_io_profile, recommended_memory_cache,
-};
+use super::recommendations::{recommended_disk_cache, recommended_memory_cache};
 
 /// Detected storage type classification.
 ///
-/// This is a simplified view of [`DiskIoProfile`] for display purposes.
+/// Detected from the cache path; used for the hardware report only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageType {
     /// NVMe SSD with multiple queues
@@ -28,16 +25,6 @@ pub enum StorageType {
 }
 
 impl StorageType {
-    /// Convert from DiskIoProfile.
-    pub fn from_disk_io_profile(profile: DiskIoProfile) -> Self {
-        match profile {
-            DiskIoProfile::Nvme => StorageType::Nvme,
-            DiskIoProfile::Ssd => StorageType::Ssd,
-            DiskIoProfile::Hdd => StorageType::Hdd,
-            DiskIoProfile::Auto => StorageType::Unknown,
-        }
-    }
-
     /// Get human-readable display string.
     pub fn display(&self) -> &'static str {
         match self {
@@ -61,8 +48,6 @@ pub struct SystemInfo {
     pub total_memory: usize,
     /// Detected storage type for the cache path
     pub storage_type: StorageType,
-    /// The underlying DiskIoProfile for configuration
-    pub disk_io_profile: DiskIoProfile,
     /// Bytes available to a non-privileged user at the cache path's
     /// filesystem. Used to size the recommended disk cache. Zero if
     /// detection failed (e.g., path does not exist yet).
@@ -88,15 +73,14 @@ impl SystemInfo {
     pub fn detect(cache_path: &Path) -> Self {
         let cpu_cores = detect_cpu_cores();
         let total_memory = detect_total_memory();
-        let disk_io_profile = DiskIoProfile::Auto.resolve_for_path(cache_path);
-        let storage_type = StorageType::from_disk_io_profile(disk_io_profile);
+        let storage_type =
+            super::storage_detect::detect_storage_type(cache_path).unwrap_or(StorageType::Unknown);
         let cache_path_available_bytes = available_bytes_for(cache_path);
 
         Self {
             cpu_cores,
             total_memory,
             storage_type,
-            disk_io_profile,
             cache_path_available_bytes,
         }
     }
@@ -115,18 +99,10 @@ impl SystemInfo {
         storage_type: StorageType,
         cache_path_available_bytes: u64,
     ) -> Self {
-        let disk_io_profile = match storage_type {
-            StorageType::Nvme => DiskIoProfile::Nvme,
-            StorageType::Ssd => DiskIoProfile::Ssd,
-            StorageType::Hdd => DiskIoProfile::Hdd,
-            StorageType::Unknown => DiskIoProfile::Auto,
-        };
-
         Self {
             cpu_cores,
             total_memory,
             storage_type,
-            disk_io_profile,
             cache_path_available_bytes,
         }
     }
@@ -151,13 +127,6 @@ impl SystemInfo {
     /// floored to the nearest 10 GB. Minimum 10 GB to avoid thrashing.
     pub fn recommended_disk_cache(&self) -> usize {
         recommended_disk_cache(self.cache_path_available_bytes)
-    }
-
-    /// Get recommended disk I/O profile string for configuration.
-    ///
-    /// Returns "nvme" if NVMe detected, otherwise "auto".
-    pub fn recommended_disk_io_profile(&self) -> &'static str {
-        recommended_disk_io_profile(self.disk_io_profile)
     }
 
     // =========================================================================
@@ -286,13 +255,6 @@ mod tests {
         // 16GB / 12 = ~1.33GB, rounded to the nearest whole GB
         assert_eq!(info.recommended_memory_cache(), GB);
         assert_eq!(info.recommended_disk_cache(), 50 * GB);
-        assert_eq!(info.recommended_disk_io_profile(), "auto");
-    }
-
-    #[test]
-    fn test_system_info_nvme_recommendation() {
-        let info = SystemInfo::new(8, 16 * GB, StorageType::Nvme);
-        assert_eq!(info.recommended_disk_io_profile(), "nvme");
     }
 
     #[test]

@@ -129,20 +129,6 @@ Controls tile caching behavior.
 | `memory_size` | size | `512MB` | Maximum RAM for in-memory cache. Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. Memory cache is a staging buffer; DDS disk cache is the retention layer. |
 | `disk_size` | size | `20GB` | Maximum disk space for persistent cache (shared between DDS tiles and raw chunks). Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. |
 | `dds_disk_ratio` | float | `0.6` | Fraction of `disk_size` allocated to DDS tile cache (0.0-1.0). Remainder goes to raw chunk cache. |
-| `disk_io_profile` | string | `auto` | Disk I/O concurrency profile based on storage type (see below) |
-
-**Disk I/O Profile:**
-
-The `disk_io_profile` setting tunes disk I/O concurrency based on your storage type. Different storage devices have vastly different optimal concurrency levels:
-
-| Profile | Description | Concurrent Ops | Best For |
-|---------|-------------|----------------|----------|
-| `auto` | Auto-detect storage type (recommended) | Varies | Most users |
-| `hdd` | Spinning disk, seek-bound | 1-4 | Traditional hard drives |
-| `ssd` | SATA/AHCI SSD | 32-64 | Most SSDs |
-| `nvme` | NVMe SSD, multiple queues | 128-256 | NVMe drives |
-
-**Auto-detection (Linux):** When set to `auto`, XEarthLayer detects the storage type by checking `/sys/block/<device>/queue/rotational`. If detection fails, it defaults to the `ssd` profile as a safe middle-ground.
 
 **Example:**
 ```ini
@@ -151,7 +137,6 @@ The `disk_io_profile` setting tunes disk I/O concurrency based on your storage t
 directory = /mnt/nvme/xearthlayer-cache
 memory_size = 8GB
 disk_size = 50GB
-disk_io_profile = auto
 ```
 
 **Cache Structure:**
@@ -514,7 +499,6 @@ type = bing
 ; directory = /custom/cache/path
 memory_size = 4GB
 disk_size = 50GB
-; disk_io_profile = auto  ; auto-detect storage type (default)
 
 [texture]
 format = bc1
@@ -673,7 +657,6 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `cache.memory_size` | size (e.g., `512MB`) | Memory cache size (staging buffer) |
 | `cache.disk_size` | size (e.g., `20GB`) | Total disk cache size (DDS + chunks) |
 | `cache.dds_disk_ratio` | float (e.g., `0.6`) | Fraction of disk for DDS tiles (0.0-1.0) |
-| `cache.disk_io_profile` | `auto`, `hdd`, `ssd`, `nvme` | Disk I/O concurrency profile |
 | `texture.format` | `bc1`, `bc3` | DDS compression format |
 | `texture.compressor` | `software`, `ispc`, `gpu` | Compression backend |
 | `texture.gpu_device` | `integrated`, `discrete`, or name | GPU adapter selection (used when compressor = gpu) |

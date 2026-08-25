@@ -3,7 +3,6 @@
 //! Each struct represents one `[section]` of the INI config file.
 //! These are pure data types with no parsing or serialization logic.
 
-use super::DiskIoProfile;
 use crate::dds::DdsFormat;
 use std::path::PathBuf;
 
@@ -75,8 +74,6 @@ pub struct CacheSettings {
     /// Fraction of disk_size allocated to DDS tile cache (0.0-1.0, default: 0.6).
     /// Remainder goes to chunk cache.
     pub dds_disk_ratio: f64,
-    /// Disk I/O profile for tuning concurrency based on storage type
-    pub disk_io_profile: DiskIoProfile,
 }
 
 /// Texture configuration.

@@ -34,7 +34,6 @@
 //! }
 //! ```
 
-use crate::config::DiskIoProfile;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -139,81 +138,6 @@ impl StorageConcurrencyLimiter {
 
         let max_concurrent = (cpus * scaling_factor).min(ceiling).max(1);
         Self::new(max_concurrent, label)
-    }
-
-    /// Creates a limiter optimized for disk I/O operations.
-    ///
-    /// Uses more conservative defaults than `with_defaults()` because disk I/O
-    /// has much lower optimal concurrency than network I/O:
-    /// - HDDs: optimal at 1-4 concurrent operations (seek-bound)
-    /// - SSDs: optimal at 32-64 concurrent operations (queue depth)
-    /// - NVMe: optimal at 64-128 concurrent operations (multiple queues)
-    ///
-    /// Formula: `min(num_cpus * 4, 64)`
-    ///
-    /// # Arguments
-    ///
-    /// * `label` - Human-readable label for logging/debugging
-    pub fn with_disk_io_defaults(label: impl Into<String>) -> Self {
-        Self::with_scaling(DISK_IO_SCALING_FACTOR, DISK_IO_CEILING, label)
-    }
-
-    /// Creates a limiter optimized for CPU-bound operations (like DDS encoding).
-    ///
-    /// Limits concurrency to the number of CPU cores since running more
-    /// CPU-bound tasks than cores provides no throughput benefit and can
-    /// exhaust the blocking thread pool, starving disk I/O operations.
-    ///
-    /// Formula: `num_cpus` (no ceiling needed since we scale 1:1)
-    ///
-    /// # Arguments
-    ///
-    /// * `label` - Human-readable label for logging/debugging
-    pub fn with_cpu_defaults(label: impl Into<String>) -> Self {
-        let cpus = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4);
-
-        // For CPU-bound work, limit to exactly num_cpus
-        Self::new(cpus, label)
-    }
-
-    /// Creates a shared limiter for multiple CPU-bound stages with modest over-subscription.
-    ///
-    /// When multiple CPU-bound stages (like assembly and encoding) share a limiter,
-    /// modest over-subscription (~1.25x cores) keeps cores busy during brief I/O waits
-    /// while preventing excessive context switching.
-    ///
-    /// Formula: `max(num_cpus * 1.25, num_cpus + 2)`
-    ///
-    /// # Arguments
-    ///
-    /// * `label` - Human-readable label for logging/debugging
-    pub fn with_cpu_oversubscribe(label: impl Into<String>) -> Self {
-        let cpus = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4);
-
-        // Modest over-subscription: either 1.25x cores or cores+2, whichever is larger
-        // This keeps cores busy during brief I/O waits between encode stages
-        let oversubscribed = ((cpus as f64 * 1.25).ceil() as usize).max(cpus + 2);
-        Self::new(oversubscribed, label)
-    }
-
-    /// Creates a limiter for disk I/O based on the detected/configured storage profile.
-    ///
-    /// Different storage types have vastly different optimal concurrency:
-    /// - HDD: 1-4 concurrent ops (seek-bound)
-    /// - SSD: 32-64 concurrent ops (queue depth ~32)
-    /// - NVMe: 128-256 concurrent ops (multiple queues)
-    ///
-    /// # Arguments
-    ///
-    /// * `profile` - The disk I/O profile (resolved, not Auto)
-    /// * `label` - Human-readable label for logging/debugging
-    pub fn for_disk_io_profile(profile: DiskIoProfile, label: impl Into<String>) -> Self {
-        let (scaling_factor, ceiling) = profile.concurrency_params();
-        Self::with_scaling(scaling_factor, ceiling, label)
     }
 
     /// Acquires a permit for an operation.

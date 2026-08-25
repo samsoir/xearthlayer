@@ -105,6 +105,12 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "prefetch.ground_ring_radius",
     // Removed in #58 - prewarm uses separate grid_rows/grid_cols
     "prewarm.grid_size",
+    // Removed in v0.4.7 - never affected I/O concurrency. The executor's disk
+    // pool took a flat DEFAULT_DISK_IO_CAPACITY, the profile-aware constructor
+    // had no production callers, and the profile-sized StorageConcurrencyLimiter
+    // built from this value sat behind #[allow(dead_code)]. Pool sizing is now
+    // derived from the pool capacities themselves (#227).
+    "cache.disk_io_profile",
     // Removed - online network module deleted from aircraft_position
     "online_network.enabled",
     "online_network.network_type",
@@ -619,6 +625,39 @@ type = bing
         assert!(DEPRECATED_KEYS.contains(&"prefetch.turn_threshold"));
         assert!(DEPRECATED_KEYS.contains(&"prefetch.track_stability_duration"));
         assert!(DEPRECATED_KEYS.contains(&"prefetch.time_budget_margin"));
+    }
+
+    /// `cache.disk_io_profile` never affected I/O concurrency: the pool that
+    /// consumed it had no production callers and the limiter built from it sat
+    /// behind `#[allow(dead_code)]`. Removing the key must take it out of an
+    /// existing user config, not leave it as an unknown setting.
+    #[test]
+    fn upgrade_removes_the_inert_disk_io_profile_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+
+        std::fs::write(
+            &config_path,
+            "[provider]\ntype = bing\n\n[cache]\ndisk_io_profile = nvme\n",
+        )
+        .unwrap();
+
+        let result = upgrade_config(&config_path, false).unwrap();
+
+        assert!(
+            result
+                .removed_keys
+                .iter()
+                .any(|k| k == "cache.disk_io_profile"),
+            "upgrade must report the removal, got {:?}",
+            result.removed_keys
+        );
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !contents.contains("disk_io_profile"),
+            "the key must be gone from the upgraded file"
+        );
     }
 
     #[test]

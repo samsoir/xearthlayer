@@ -6,7 +6,6 @@
 use std::path::PathBuf;
 
 use super::settings::*;
-use super::DiskIoProfile;
 use crate::dds::DdsFormat;
 
 // =============================================================================
@@ -349,7 +348,6 @@ impl Default for ConfigFile {
                 memory_size: DEFAULT_MEMORY_CACHE_SIZE,
                 disk_size: DEFAULT_DISK_CACHE_SIZE,
                 dds_disk_ratio: DEFAULT_DDS_DISK_RATIO,
-                disk_io_profile: DiskIoProfile::Auto,
             },
             texture: TextureSettings {
                 format: DdsFormat::BC1,

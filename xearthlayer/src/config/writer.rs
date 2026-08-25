@@ -91,12 +91,6 @@ disk_size = {}
 ; Fraction of disk cache allocated to DDS tiles (default: 0.6)
 ; Remainder goes to raw imagery chunk cache. Range: 0.0 - 1.0
 dds_disk_ratio = {}
-; Disk I/O concurrency profile based on storage type (default: auto)
-;   auto - Auto-detect storage type (recommended)
-;   hdd  - Spinning disk (conservative: 1-4 concurrent ops)
-;   ssd  - SATA/AHCI SSD (moderate: ~32-64 concurrent ops)
-;   nvme - NVMe SSD (aggressive: ~128-256 concurrent ops)
-disk_io_profile = {}
 
 [texture]
 ; DDS compression format: bc1 (smaller, opaque) or bc3 (larger, with alpha)
@@ -272,7 +266,6 @@ congestion_threshold = {}
         format_size(config.cache.memory_size),
         format_size(config.cache.disk_size),
         config.cache.dds_disk_ratio,
-        config.cache.disk_io_profile.as_str(),
         config.texture.format.to_string().to_lowercase(),
         config.texture.compressor,
         config.texture.gpu_device,

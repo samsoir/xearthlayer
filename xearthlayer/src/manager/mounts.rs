@@ -12,8 +12,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::config::defaults::{DEFAULT_FUSE_CONGESTION_THRESHOLD, DEFAULT_FUSE_MAX_BACKGROUND};
-use crate::config::DiskIoProfile;
-use crate::executor::StorageConcurrencyLimiter;
 use crate::fuse::fuse3::Fuse3OrthoUnionFS;
 use crate::fuse::SpawnedMountHandle;
 use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage};
@@ -413,8 +411,20 @@ impl MountManager {
         }
 
         // Create the service (owns the Tokio runtime for DDS generation)
-        // Use XEarthLayerService::start() with integrated cache and metrics
-        let runtime = match tokio::runtime::Runtime::new() {
+        // Use XEarthLayerService::start() with integrated cache and metrics.
+        //
+        // The blocking pool is sized from the executor's pool capacities
+        // rather than tokio's 512 default: it carries DDS encoding and disk
+        // I/O, and at 512 threads it ratchets glibc's arena high-water mark on
+        // every excursion. See runtime::build_service_runtime and issue #227.
+        //
+        // `ResourcePoolConfig::default()` is what the executor receives here,
+        // via `RuntimeConfig::default()` in `service::RuntimeBuilder`. If that
+        // path ever takes user `[executor]` settings, this must take the same
+        // config or the cap goes stale.
+        let runtime = match crate::runtime::build_service_runtime(
+            &crate::executor::ResourcePoolConfig::default(),
+        ) {
             Ok(r) => r,
             Err(e) => {
                 return ConsolidatedOrthoMountResult::failure(
@@ -876,11 +886,6 @@ impl Drop for MountManager {
 pub struct ServiceBuilder {
     service_config: ServiceConfig,
     provider_config: crate::provider::ProviderConfig,
-    /// Shared disk I/O limiter across all service instances.
-    /// Note: Currently unused as DiskCacheAdapter handles I/O internally.
-    /// Kept for potential future use with shared I/O limiting.
-    #[allow(dead_code)]
-    disk_io_limiter: Arc<StorageConcurrencyLimiter>,
     /// Shared tile request callback for FUSE-based position inference.
     /// When set, all services forward tile requests to this callback.
     tile_request_callback: Option<TileRequestCallback>,
@@ -888,58 +893,13 @@ pub struct ServiceBuilder {
 
 impl ServiceBuilder {
     /// Create a new service builder.
-    ///
-    /// Creates a shared disk I/O concurrency limiter that will be used by
-    /// all services built by this builder. This prevents disk I/O exhaustion
-    /// when multiple packages are mounted simultaneously.
-    ///
-    /// The disk I/O limiter is tuned based on the configured or detected storage profile:
-    /// - HDD: Conservative concurrency (1-4 ops)
-    /// - SSD: Moderate concurrency (~32-64 ops)
-    /// - NVMe: Aggressive concurrency (~128-256 ops)
-    /// - Auto: Detects storage type from cache directory
     pub fn new(
         service_config: ServiceConfig,
         provider_config: crate::provider::ProviderConfig,
     ) -> Self {
-        Self::with_disk_io_profile(service_config, provider_config, DiskIoProfile::default())
-    }
-
-    /// Create a new service builder with a specific disk I/O profile.
-    ///
-    /// # Arguments
-    ///
-    /// * `disk_io_profile` - The disk I/O profile to use for concurrency limiting
-    pub fn with_disk_io_profile(
-        service_config: ServiceConfig,
-        provider_config: crate::provider::ProviderConfig,
-        disk_io_profile: DiskIoProfile,
-    ) -> Self {
-        // Resolve Auto profile based on cache directory (or current dir if not set)
-        let resolved_profile = if let Some(cache_dir) = service_config.cache_directory() {
-            disk_io_profile.resolve_for_path(cache_dir)
-        } else {
-            // If no cache directory is set, just use the profile as-is
-            // (Auto will fall back to SSD in resolve_for_path)
-            disk_io_profile.resolve_for_path(std::path::Path::new("."))
-        };
-
-        // Create limiter based on resolved profile
-        let disk_io_limiter = Arc::new(StorageConcurrencyLimiter::for_disk_io_profile(
-            resolved_profile,
-            "global_disk_io",
-        ));
-
-        tracing::info!(
-            profile = %resolved_profile,
-            max_concurrent = disk_io_limiter.max_concurrent(),
-            "Created shared disk I/O limiter for multi-package mounting"
-        );
-
         Self {
             service_config,
             provider_config,
-            disk_io_limiter,
             tile_request_callback: None,
         }
     }
