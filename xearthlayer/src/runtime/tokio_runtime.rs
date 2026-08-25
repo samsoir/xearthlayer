@@ -12,42 +12,36 @@
 //! excursion to 581 threads ratcheted the arena by ~420 MB, and the arena
 //! reached 6,166 MB while holding only 572 MB of live data. See issue #227.
 //!
-//! Sizing the pool from the storage profile bounds both terms.
+//! Sizing the pool from the executor's pool capacities bounds both terms.
 //!
-//! # Provisioning caveat
+//! # Sizing
 //!
-//! The profile's cap is not currently derived from what the executor's
-//! resource pools can grant. Both the CPU pool and the disk I/O pool dispatch
-//! through `spawn_blocking`, so their combined capacity is the real worst-case
-//! demand. On a 32-core host with the SSD profile:
+//! The cap comes from the executor's own pool capacities, not from the
+//! storage profile. Both the CPU pool and the disk I/O pool dispatch through
+//! `spawn_blocking`, so their sum is the worst-case simultaneous demand; the
+//! network pool is excluded because it gates async HTTP on worker threads.
+//! A reserve covers the `spawn_blocking` calls that take no permit — startup
+//! scans, the GPU worker, and the fire-and-forget cache writes.
 //!
-//! ```text
-//! CPU pool       max(ceil(32 * 1.25), 34)  =  40
-//! disk I/O pool  DEFAULT_DISK_IO_CAPACITY  =  64
-//!                                    total = 104
-//! blocking cap   min(32 * 4, 64)           =  64
-//! ```
+//! On a 32-core host that is `40 + 64 + 32 = 136` against tokio's 512.
 //!
-//! Tasks beyond the cap queue rather than fail, and nothing here blocks on
-//! another blocking task, so this throttles rather than deadlocks. It is still
-//! an under-provision: the pools may grant 104 permits against 64 threads.
-//! Whether to raise the profile ceilings to `cpu + disk_io + headroom` is open
-//! — see issue #227.
+//! Sizing from the storage profile instead would under-provision: the SSD
+//! profile yields 64 against the same 104 of pooled demand.
 
-use crate::config::DiskIoProfile;
+use crate::executor::ResourcePoolConfig;
 use tokio::runtime::Runtime;
 
 /// Build the Tokio runtime that hosts the XEarthLayer daemons.
 ///
-/// Worker threads keep Tokio's default (one per core). The blocking pool is
-/// capped at [`DiskIoProfile::max_blocking_threads`] rather than the default
-/// 512, because the pool's real ceiling is how many concurrent disk
-/// operations the storage can absorb, not how many tasks want to run.
-pub fn build_service_runtime(profile: DiskIoProfile) -> std::io::Result<Runtime> {
-    let max_blocking = profile.max_blocking_threads();
+/// Worker threads keep tokio's default (one per core). The blocking pool is
+/// capped at [`ResourcePoolConfig::blocking_threads_required`] rather than the
+/// default 512.
+pub fn build_service_runtime(pools: &ResourcePoolConfig) -> std::io::Result<Runtime> {
+    let max_blocking = pools.blocking_threads_required();
 
     tracing::info!(
-        profile = %profile,
+        cpu_capacity = pools.cpu,
+        disk_io_capacity = pools.disk_io,
         max_blocking_threads = max_blocking,
         "Building service Tokio runtime"
     );
@@ -68,18 +62,20 @@ mod tests {
 
     /// The cap must actually bind the pool.
     ///
-    /// Spawns more blocking tasks than the profile allows and asserts that the
-    /// number running concurrently settles at exactly the cap. Under Tokio's
+    /// Spawns more blocking tasks than the config allows and asserts that the
+    /// number running concurrently settles at exactly the cap. Under tokio's
     /// default of 512 every task would run, so this fails if the
     /// `max_blocking_threads` call is removed.
     #[test]
-    fn blocking_pool_is_capped_at_the_profile_limit() {
-        let profile = DiskIoProfile::Hdd;
-        let cap = profile.max_blocking_threads();
-        let runtime = build_service_runtime(profile).expect("runtime builds");
+    fn blocking_pool_is_capped_at_the_derived_limit() {
+        // Small explicit capacities keep the test fast and independent of the
+        // host's core count.
+        let pools = ResourcePoolConfig::new(4, 2, 2);
+        let cap = pools.blocking_threads_required();
+        let runtime = build_service_runtime(&pools).expect("runtime builds");
 
         let running = Arc::new(AtomicUsize::new(0));
-        // Held by every blocking task; dropping it at the end releases them.
+        // Held by every blocking task; dropping the sender releases them.
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
 
@@ -88,15 +84,14 @@ mod tests {
             let release_rx = Arc::clone(&release_rx);
             runtime.spawn_blocking(move || {
                 running.fetch_add(1, Ordering::SeqCst);
-                // Park until the sender is dropped. Only the thread holding
-                // the lock actually receives; the rest block on the mutex,
-                // which is what we want — every task occupies its thread.
+                // Park until the sender is dropped. Only the task holding the
+                // lock receives; the rest block on the mutex, which is what we
+                // want — every task occupies its thread.
                 let guard = release_rx.lock().unwrap();
                 let _ = guard.recv();
             });
         }
 
-        // Wait for the pool to fill, then confirm it stops there.
         let deadline = Instant::now() + Duration::from_secs(10);
         while running.load(Ordering::SeqCst) < cap && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -120,37 +115,48 @@ mod tests {
         drop(release_tx);
     }
 
+    /// The cap must cover what the pools can grant.
+    ///
+    /// This is the anti-drift guard: raising `DEFAULT_DISK_IO_CAPACITY` or the
+    /// CPU multiplier without revisiting the blocking pool would let the pools
+    /// issue more permits than there are threads to serve them. It runs against
+    /// the default config, which is what `RuntimeConfig::default()` gives the
+    /// executor in production.
+    #[test]
+    fn derived_cap_covers_what_the_pools_can_grant() {
+        let pools = ResourcePoolConfig::default();
+        let demand = pools.cpu + pools.disk_io;
+
+        assert!(
+            pools.blocking_threads_required() > demand,
+            "blocking cap {} must exceed pooled demand {} (cpu {} + disk_io {})",
+            pools.blocking_threads_required(),
+            demand,
+            pools.cpu,
+            pools.disk_io
+        );
+    }
+
+    /// The cap must stay meaningfully below tokio's default, or the fix does
+    /// nothing. The bound is deliberately loose — it catches a pool config that
+    /// has grown past the point where capping still helps.
+    #[test]
+    fn derived_cap_stays_below_the_tokio_default() {
+        let cap = ResourcePoolConfig::default().blocking_threads_required();
+        assert!(
+            cap < 512,
+            "cap of {} must be below tokio's 512 default, or wiring it is pointless",
+            cap
+        );
+    }
+
     /// `enable_all` must stay on — the daemons need the time and I/O drivers.
     #[test]
     fn runtime_has_time_and_io_drivers_enabled() {
-        let runtime = build_service_runtime(DiskIoProfile::Ssd).expect("runtime builds");
+        let runtime =
+            build_service_runtime(&ResourcePoolConfig::default()).expect("runtime builds");
         runtime.block_on(async {
             tokio::time::sleep(Duration::from_millis(1)).await;
         });
-    }
-
-    /// Every profile must produce a usable, non-zero cap.
-    #[test]
-    fn every_profile_yields_a_bounded_pool() {
-        for profile in [
-            DiskIoProfile::Hdd,
-            DiskIoProfile::Ssd,
-            DiskIoProfile::Nvme,
-            DiskIoProfile::Auto,
-        ] {
-            let cap = profile.max_blocking_threads();
-            assert!(
-                cap >= 1,
-                "{:?} must allow at least one blocking thread",
-                profile
-            );
-            assert!(
-                cap < 512,
-                "{:?} cap of {} must be below tokio's 512 default, or wiring it is pointless",
-                profile,
-                cap
-            );
-            build_service_runtime(profile).expect("runtime builds");
-        }
     }
 }

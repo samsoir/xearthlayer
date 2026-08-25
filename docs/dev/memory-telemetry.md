@@ -355,8 +355,9 @@ Supporting reads:
   high-water mark — see *The arena ratchet* above. It is also one of the
   mechanisms behind candidate 1, since the DDS-disk write path queues onto the
   same pool via `tokio::fs`. Since #227 the pool is capped at
-  `DiskIoProfile::max_blocking_threads()` rather than tokio's 512 default, so a
-  trace reaching 512 means the cap is not being applied.
+  `ResourcePoolConfig::blocking_threads_required()` — the CPU and disk I/O pool
+  capacities plus a reserve, 136 on a 32-core host — rather than tokio's 512
+  default. A trace reaching 512 means the cap is not being applied.
 - **`tiles_done` per hour** is the load normaliser. Two traces at wildly
   different tile rates are not telling you about memory, they are telling you
   about workload.

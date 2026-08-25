@@ -46,25 +46,6 @@ pub const NVME_IO_SCALING_FACTOR: usize = 8;
 /// NVMe: Maximum concurrent I/O operations
 pub const NVME_IO_CEILING: usize = 256;
 
-// =============================================================================
-// Blocking thread pool parameters by storage profile
-// =============================================================================
-
-/// HDD: Limited blocking threads due to seek-bound operations (scaling factor)
-pub const HDD_BLOCKING_SCALING_FACTOR: usize = 2;
-/// HDD: Maximum blocking threads
-pub const HDD_BLOCKING_CEILING: usize = 16;
-
-/// SSD: Moderate blocking threads for SATA/AHCI (scaling factor)
-pub const SSD_BLOCKING_SCALING_FACTOR: usize = 4;
-/// SSD: Maximum blocking threads
-pub const SSD_BLOCKING_CEILING: usize = 64;
-
-/// NVMe: Higher blocking threads for NVMe (scaling factor)
-pub const NVME_BLOCKING_SCALING_FACTOR: usize = 8;
-/// NVMe: Maximum blocking threads
-pub const NVME_BLOCKING_CEILING: usize = 128;
-
 /// Default CPU count fallback when detection fails
 pub const DEFAULT_CPU_FALLBACK: usize = 4;
 
@@ -112,37 +93,6 @@ impl DiskIoProfile {
     /// Calculate the actual concurrency limit for this profile.
     pub fn max_concurrent(&self) -> usize {
         let (scaling_factor, ceiling) = self.concurrency_params();
-        let cpus = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(DEFAULT_CPU_FALLBACK);
-        (cpus * scaling_factor).min(ceiling).max(1)
-    }
-
-    /// Get recommended parameters for Tokio's blocking thread pool.
-    ///
-    /// Returns (scaling_factor, ceiling) where the actual limit is
-    /// `min(num_cpus * scaling_factor, ceiling)`.
-    ///
-    /// The blocking thread pool is used for:
-    /// - CPU-bound DDS encoding (spawn_blocking)
-    /// - Disk I/O operations
-    ///
-    /// Different storage profiles benefit from different pool sizes:
-    /// - HDD: Limited parallelism due to seek latency
-    /// - SSD: Moderate parallelism (queue depth ~32)
-    /// - NVMe: Higher parallelism (multiple queues)
-    pub fn blocking_threads_params(&self) -> (usize, usize) {
-        match self {
-            // Auto uses SSD defaults
-            Self::Auto | Self::Ssd => (SSD_BLOCKING_SCALING_FACTOR, SSD_BLOCKING_CEILING),
-            Self::Hdd => (HDD_BLOCKING_SCALING_FACTOR, HDD_BLOCKING_CEILING),
-            Self::Nvme => (NVME_BLOCKING_SCALING_FACTOR, NVME_BLOCKING_CEILING),
-        }
-    }
-
-    /// Calculate the recommended max blocking threads for Tokio runtime.
-    pub fn max_blocking_threads(&self) -> usize {
-        let (scaling_factor, ceiling) = self.blocking_threads_params();
         let cpus = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(DEFAULT_CPU_FALLBACK);
@@ -428,42 +378,6 @@ mod tests {
     #[test]
     fn test_default_is_ssd() {
         assert_eq!(DiskIoProfile::default(), DiskIoProfile::Ssd);
-    }
-
-    #[test]
-    fn test_blocking_threads_params() {
-        assert_eq!(
-            DiskIoProfile::Hdd.blocking_threads_params(),
-            (HDD_BLOCKING_SCALING_FACTOR, HDD_BLOCKING_CEILING)
-        );
-        assert_eq!(
-            DiskIoProfile::Ssd.blocking_threads_params(),
-            (SSD_BLOCKING_SCALING_FACTOR, SSD_BLOCKING_CEILING)
-        );
-        assert_eq!(
-            DiskIoProfile::Nvme.blocking_threads_params(),
-            (NVME_BLOCKING_SCALING_FACTOR, NVME_BLOCKING_CEILING)
-        );
-        // Auto uses SSD defaults
-        assert_eq!(
-            DiskIoProfile::Auto.blocking_threads_params(),
-            (SSD_BLOCKING_SCALING_FACTOR, SSD_BLOCKING_CEILING)
-        );
-    }
-
-    #[test]
-    fn test_max_blocking_threads_respects_ceiling() {
-        // HDD is bounded by HDD_BLOCKING_CEILING
-        let hdd_max = DiskIoProfile::Hdd.max_blocking_threads();
-        assert!((1..=HDD_BLOCKING_CEILING).contains(&hdd_max));
-
-        // SSD is bounded by SSD_BLOCKING_CEILING
-        let ssd_max = DiskIoProfile::Ssd.max_blocking_threads();
-        assert!((1..=SSD_BLOCKING_CEILING).contains(&ssd_max));
-
-        // NVMe is bounded by NVME_BLOCKING_CEILING
-        let nvme_max = DiskIoProfile::Nvme.max_blocking_threads();
-        assert!((1..=NVME_BLOCKING_CEILING).contains(&nvme_max));
     }
 
     #[cfg(target_os = "linux")]
