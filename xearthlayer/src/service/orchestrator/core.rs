@@ -109,11 +109,8 @@ impl ServiceOrchestrator {
         // Note: Cache is now created inside XEarthLayerService::start() via CacheLayer,
         // which ensures MetricsSystem is created FIRST, then CacheLayer with metrics.
         // This fixes the GC daemon not having metrics client for eviction reporting.
-        let mut service_builder = ServiceBuilder::with_disk_io_profile(
-            config.service.clone(),
-            config.provider.clone(),
-            config.disk_io_profile,
-        );
+        let mut service_builder =
+            ServiceBuilder::new(config.service.clone(), config.provider.clone());
 
         // Create mount manager with Custom Scenery path and FUSE kernel limits
         let mut mount_manager = MountManager::with_scenery_path(&config.custom_scenery_path);

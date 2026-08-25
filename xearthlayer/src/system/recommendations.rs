@@ -3,7 +3,7 @@
 //! Provides functions to calculate optimal XEarthLayer settings based on
 //! detected hardware capabilities.
 
-use crate::config::{format_size, DiskIoProfile, GB, MB};
+use crate::config::{format_size, GB, MB};
 
 /// Floor for the memory-cache recommendation.
 ///
@@ -27,8 +27,6 @@ pub struct RecommendedSettings {
     pub memory_cache: usize,
     /// Recommended disk cache size in bytes
     pub disk_cache: usize,
-    /// Recommended disk I/O profile
-    pub disk_io_profile: DiskIoProfile,
 }
 
 impl RecommendedSettings {
@@ -38,16 +36,10 @@ impl RecommendedSettings {
     ///
     /// * `total_memory` - Total system memory in bytes
     /// * `available_disk` - Bytes available at the cache directory's filesystem
-    /// * `detected_profile` - Storage type detected for cache location
-    pub fn for_system(
-        total_memory: usize,
-        available_disk: u64,
-        detected_profile: DiskIoProfile,
-    ) -> Self {
+    pub fn for_system(total_memory: usize, available_disk: u64) -> Self {
         Self {
             memory_cache: recommended_memory_cache(total_memory),
             disk_cache: recommended_disk_cache(available_disk),
-            disk_io_profile: detected_profile,
         }
     }
 
@@ -59,11 +51,6 @@ impl RecommendedSettings {
     /// Get formatted disk cache size (e.g., "50 GB").
     pub fn disk_cache_display(&self) -> String {
         format_size(self.disk_cache)
-    }
-
-    /// Get disk I/O profile string for configuration.
-    pub fn disk_io_profile_str(&self) -> &'static str {
-        recommended_disk_io_profile(self.disk_io_profile)
     }
 }
 
@@ -131,23 +118,6 @@ pub fn recommended_disk_cache(available_bytes: u64) -> usize {
     let floored = (quarter / floor_step) * floor_step;
     let bytes = floored.max(floor_step);
     usize::try_from(bytes).unwrap_or(usize::MAX)
-}
-
-/// Get recommended disk I/O profile string for configuration.
-///
-/// # Arguments
-///
-/// * `detected_profile` - The detected storage profile
-///
-/// # Returns
-///
-/// - `"nvme"` if NVMe storage detected (enables aggressive concurrency)
-/// - `"auto"` otherwise (safe default that re-detects at runtime)
-pub fn recommended_disk_io_profile(detected_profile: DiskIoProfile) -> &'static str {
-    match detected_profile {
-        DiskIoProfile::Nvme => "nvme",
-        _ => "auto",
-    }
 }
 
 #[cfg(test)]
@@ -218,25 +188,10 @@ mod tests {
     }
 
     #[test]
-    fn io_profile_nvme_is_explicit() {
-        assert_eq!(recommended_disk_io_profile(DiskIoProfile::Nvme), "nvme");
-    }
-
-    #[test]
-    fn io_profile_others_default_to_auto() {
-        assert_eq!(recommended_disk_io_profile(DiskIoProfile::Ssd), "auto");
-        assert_eq!(recommended_disk_io_profile(DiskIoProfile::Hdd), "auto");
-        assert_eq!(recommended_disk_io_profile(DiskIoProfile::Auto), "auto");
-    }
-
-    #[test]
     fn recommended_settings_combines_inputs() {
-        let settings =
-            RecommendedSettings::for_system(32 * GB, 230 * GB as u64, DiskIoProfile::Nvme);
+        let settings = RecommendedSettings::for_system(32 * GB, 230 * GB as u64);
         // 32GB / 12 = 2.666... GB, rounded to a whole 3 GB.
         assert_eq!(settings.memory_cache, 3 * GB);
         assert_eq!(settings.disk_cache, 50 * GB);
-        assert_eq!(settings.disk_io_profile, DiskIoProfile::Nvme);
-        assert_eq!(settings.disk_io_profile_str(), "nvme");
     }
 }

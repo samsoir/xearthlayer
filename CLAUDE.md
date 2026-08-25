@@ -272,15 +272,6 @@ tuned concurrency limits:
   and disk I/O pools both dispatch through `spawn_blocking`, so their sum is
   the worst-case demand for blocking threads (#227)
 
-**KNOWN GAP — `cache.disk_io_profile` does not affect I/O concurrency.**
-`ResourcePoolConfig::with_disk_io_profile()` exists and maps the profile to
-HDD 4 / SSD 64 / NVMe 256, but has no production callers; the executor's pool
-takes the flat default. `ServiceBuilder` builds a profile-sized
-`StorageConcurrencyLimiter` that is stored behind `#[allow(dead_code)]` and
-never consulted, and the FUSE mount builds its own with `with_defaults()`.
-The setting currently only affects the diagnostics display.
-`docs/configuration.md` still describes the intended behaviour.
-
 The `ResourcePool` struct (`executor/resource_pool.rs`) manages concurrency by
 resource type. Each task declares its `ResourceType` and the executor acquires
 permits before execution.
@@ -393,7 +384,7 @@ Default config location: `~/.xearthlayer/config.ini`
 Key sections:
 - `[general]` - General settings (update_check)
 - `[provider]` - Imagery source (bing/google)
-- `[cache]` - Memory/disk sizes, directory, DDS disk ratio, disk I/O profile (auto/hdd/ssd/nvme)
+- `[cache]` - Memory/disk sizes, directory, DDS disk ratio
 - `[generation]` - Thread count, timeout
 - `[texture]` - DDS format (bc1/bc3), compressor backend (software/ispc/gpu), GPU device selection
 - `[prefetch]` - Boundary-driven prefetch, web_api_port (default 8086), calibration, transition ramp

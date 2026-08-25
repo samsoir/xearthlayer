@@ -30,6 +30,7 @@ pub mod filesystem;
 pub mod gpu;
 mod hardware;
 mod recommendations;
+mod storage_detect;
 
 pub use filesystem::{fs_info, is_immutable_os, FilesystemInfo};
 pub use gpu::{
@@ -38,6 +39,6 @@ pub use gpu::{
 };
 pub use hardware::{detect_cpu_cores, detect_total_memory, StorageType, SystemInfo};
 pub use recommendations::{
-    recommended_disk_cache, recommended_disk_io_profile, recommended_memory_cache,
-    RecommendedSettings, MIN_DISK_CACHE_BYTES, MIN_MEMORY_CACHE_BYTES,
+    recommended_disk_cache, recommended_memory_cache, RecommendedSettings, MIN_DISK_CACHE_BYTES,
+    MIN_MEMORY_CACHE_BYTES,
 };

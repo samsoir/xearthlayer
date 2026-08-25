@@ -42,7 +42,6 @@
 //! drop(permit); // Release the permit
 //! ```
 
-use crate::config::DiskIoProfile;
 use crate::executor::policy::Priority;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -107,15 +106,6 @@ pub const DEFAULT_CPU_CAPACITY_MULTIPLIER: f64 = 1.25;
 
 /// Minimum CPU pool capacity addition.
 pub const MIN_CPU_CAPACITY_ADDITION: usize = 2;
-
-/// Disk I/O capacity for HDD profile.
-pub const DISK_IO_CAPACITY_HDD: usize = 4;
-
-/// Disk I/O capacity for SSD profile.
-pub const DISK_IO_CAPACITY_SSD: usize = 64;
-
-/// Disk I/O capacity for NVMe profile.
-pub const DISK_IO_CAPACITY_NVME: usize = 256;
 
 // =============================================================================
 // Resource Type
@@ -467,17 +457,6 @@ impl ResourcePoolConfig {
             max_prefetch_fraction: DEFAULT_MAX_PREFETCH_FRACTION,
         }
     }
-
-    /// Creates a configuration with disk I/O capacity based on storage profile.
-    pub fn with_disk_io_profile(mut self, profile: DiskIoProfile) -> Self {
-        self.disk_io = match profile {
-            DiskIoProfile::Auto => DEFAULT_DISK_IO_CAPACITY, // Assume SSD
-            DiskIoProfile::Hdd => DISK_IO_CAPACITY_HDD,
-            DiskIoProfile::Ssd => DISK_IO_CAPACITY_SSD,
-            DiskIoProfile::Nvme => DISK_IO_CAPACITY_NVME,
-        };
-        self
-    }
 }
 
 impl From<&crate::config::ExecutorSettings> for ResourcePoolConfig {
@@ -744,15 +723,6 @@ mod tests {
         assert_eq!(config.network, 128);
         assert_eq!(config.disk_io, 32);
         assert_eq!(config.cpu, 8);
-    }
-
-    #[test]
-    fn test_resource_pool_config_with_disk_profile() {
-        let config = ResourcePoolConfig::default().with_disk_io_profile(DiskIoProfile::Hdd);
-        assert_eq!(config.disk_io, DISK_IO_CAPACITY_HDD);
-
-        let config = ResourcePoolConfig::default().with_disk_io_profile(DiskIoProfile::Nvme);
-        assert_eq!(config.disk_io, DISK_IO_CAPACITY_NVME);
     }
 
     #[test]

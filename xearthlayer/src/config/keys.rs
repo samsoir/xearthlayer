@@ -50,7 +50,6 @@ pub enum ConfigKey {
     CacheMemorySize,
     CacheDiskSize,
     CacheDdsDiskRatio,
-    CacheDiskIoProfile,
 
     // Texture settings
     TextureFormat,
@@ -137,7 +136,6 @@ impl FromStr for ConfigKey {
             "cache.memory_size" => Ok(ConfigKey::CacheMemorySize),
             "cache.disk_size" => Ok(ConfigKey::CacheDiskSize),
             "cache.dds_disk_ratio" => Ok(ConfigKey::CacheDdsDiskRatio),
-            "cache.disk_io_profile" => Ok(ConfigKey::CacheDiskIoProfile),
 
             "texture.format" => Ok(ConfigKey::TextureFormat),
             "texture.compressor" => Ok(ConfigKey::TextureCompressor),
@@ -219,7 +217,6 @@ impl ConfigKey {
             ConfigKey::CacheMemorySize => "cache.memory_size",
             ConfigKey::CacheDiskSize => "cache.disk_size",
             ConfigKey::CacheDdsDiskRatio => "cache.dds_disk_ratio",
-            ConfigKey::CacheDiskIoProfile => "cache.disk_io_profile",
             ConfigKey::TextureFormat => "texture.format",
             ConfigKey::TextureCompressor => "texture.compressor",
             ConfigKey::TextureGpuDevice => "texture.gpu_device",
@@ -320,7 +317,6 @@ impl ConfigKey {
             ConfigKey::CacheMemorySize => format_size(config.cache.memory_size),
             ConfigKey::CacheDiskSize => format_size(config.cache.disk_size),
             ConfigKey::CacheDdsDiskRatio => config.cache.dds_disk_ratio.to_string(),
-            ConfigKey::CacheDiskIoProfile => config.cache.disk_io_profile.as_str().to_string(),
             ConfigKey::TextureFormat => config.texture.format.to_string().to_lowercase(),
             ConfigKey::TextureCompressor => config.texture.compressor.clone(),
             ConfigKey::TextureGpuDevice => config.texture.gpu_device.clone(),
@@ -459,9 +455,6 @@ impl ConfigKey {
             }
             ConfigKey::CacheDdsDiskRatio => {
                 config.cache.dds_disk_ratio = value.parse().unwrap();
-            }
-            ConfigKey::CacheDiskIoProfile => {
-                config.cache.disk_io_profile = value.parse().unwrap();
             }
             ConfigKey::TextureFormat => {
                 config.texture.format = match value.to_lowercase().as_str() {
@@ -635,9 +628,6 @@ impl ConfigKey {
             ConfigKey::CacheMemorySize => Box::new(SizeSpec),
             ConfigKey::CacheDiskSize => Box::new(SizeSpec),
             ConfigKey::CacheDdsDiskRatio => Box::new(FloatRangeSpec::new(0.0, 1.0)),
-            ConfigKey::CacheDiskIoProfile => {
-                Box::new(OneOfSpec::new(&["auto", "hdd", "ssd", "nvme"]))
-            }
             ConfigKey::TextureFormat => Box::new(OneOfSpec::new(&["bc1", "bc3"])),
             ConfigKey::TextureCompressor => Box::new(OneOfSpec::new(&["software", "ispc", "gpu"])),
             ConfigKey::TextureGpuDevice => Box::new(NonEmptyStringSpec),
@@ -711,7 +701,6 @@ impl ConfigKey {
             ConfigKey::CacheMemorySize,
             ConfigKey::CacheDiskSize,
             ConfigKey::CacheDdsDiskRatio,
-            ConfigKey::CacheDiskIoProfile,
             ConfigKey::TextureFormat,
             ConfigKey::TextureCompressor,
             ConfigKey::TextureGpuDevice,

@@ -172,7 +172,7 @@ impl Default for ResourcePoolConfig {
         let cpus = num_cpus::get();
         Self {
             network: (cpus * 16).min(256),
-            disk_io: 64,  // SSD default, configurable via cache.disk_io_profile
+            disk_io: 64,  // DEFAULT_DISK_IO_CAPACITY
             cpu: cpus + 2,
         }
     }
