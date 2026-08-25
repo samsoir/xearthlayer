@@ -13,7 +13,7 @@ The following features are **implemented and working**:
 | X-Plane Path Detection | ✅ Complete | Auto-detects X-Plane 12 install from reference file |
 | On-demand DDS Generation | ✅ Complete | Downloads satellite imagery and encodes to BC1/BC3 DDS |
 | Multi-provider Support | ✅ Complete | Bing Maps, Google GO2, Google Maps API |
-| Two-tier Caching | ✅ Complete | Memory + disk cache for generated textures |
+| Three-tier Caching | ✅ Complete | Memory, DDS disk, and chunk disk caches for generated textures |
 | Async Pipeline | ✅ Complete | Request coalescing, parallel downloads, async encoding |
 | Graceful Shutdown | ✅ Complete | Auto-unmount on SIGTERM/SIGINT |
 | Package Management | ✅ Complete | Install, update, remove regional packages |
@@ -453,7 +453,7 @@ xearthlayer/src/
 │   ├── radial.rs           # RadialPrefetcher (recommended)
 │   └── web_api/            # X-Plane Web API telemetry
 ├── config/                 # Configuration system
-├── cache/                  # Two-tier caching
+├── cache/                  # Three-tier caching
 ├── provider/               # Imagery providers
 └── texture/                # DDS encoding
 ```

@@ -1639,7 +1639,7 @@ pub struct JobRequest {
 
 /// Response from job completion
 pub struct JobResponse {
-    pub data: Vec<u8>,
+    pub data: Bytes,
     pub cache_hit: bool,
     pub duration: Duration,
 }

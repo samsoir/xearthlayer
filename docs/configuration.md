@@ -144,6 +144,13 @@ The `disk_io_profile` setting tunes disk I/O concurrency based on your storage t
 
 **Auto-detection (Linux):** When set to `auto`, XEarthLayer detects the storage type by checking `/sys/block/<device>/queue/rotational`. If detection fails, it defaults to the `ssd` profile as a safe middle-ground.
 
+> **Known gap (v0.4.7):** this setting does not currently change I/O
+> concurrency. The executor's disk I/O pool uses a flat capacity of 64
+> regardless of profile, and the profile-sized limiter that is built from this
+> value is never consulted. Detection and the table above describe the intended
+> behaviour; today the setting only affects what `xearthlayer diagnostics`
+> reports. Tracked against the concurrency work in issue #227.
+
 **Example:**
 ```ini
 [cache]
