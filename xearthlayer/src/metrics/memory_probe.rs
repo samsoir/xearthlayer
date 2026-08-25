@@ -390,6 +390,58 @@ mod tests {
         assert_eq!(a.obtained_bytes(), 100_900);
     }
 
+    /// An explicit user setting must win over our pin, because `mallopt`
+    /// silently overrides what glibc already read from the environment.
+    /// Measured on glibc 2.44 with 64 threads: `MALLOC_ARENA_MAX=64` alone
+    /// gives a 23 MB arena, but `MALLOC_ARENA_MAX=64` plus `mallopt(4)` gives
+    /// 1 MB — the user's setting vanishes with no diagnostic.
+    #[test]
+    fn an_explicit_env_setting_defers_our_pin() {
+        assert!(user_pinned(Some("8"), None, TUNABLE_ARENA_MAX));
+    }
+
+    /// `GLIBC_TUNABLES` is the second way to set the same parameter, and
+    /// `mallopt` overrides it just as silently.
+    #[test]
+    fn a_tunables_setting_defers_our_pin() {
+        assert!(user_pinned(
+            None,
+            Some("glibc.malloc.arena_max=8"),
+            TUNABLE_ARENA_MAX
+        ));
+    }
+
+    /// A tunables string that names some *other* parameter must not stop us
+    /// pinning this one. A naive `is_some()` on the variable would.
+    #[test]
+    fn unrelated_tunables_do_not_defer_our_pin() {
+        assert!(!user_pinned(
+            None,
+            Some("glibc.malloc.tcache_max=64:glibc.malloc.arena_test=2"),
+            TUNABLE_ARENA_MAX
+        ));
+    }
+
+    /// With nothing set, we pin.
+    #[test]
+    fn an_empty_environment_lets_us_pin() {
+        assert!(!user_pinned(None, None, TUNABLE_ARENA_MAX));
+    }
+
+    /// The cap must be well below glibc's default of `8 x ncores`, or pinning
+    /// it achieves nothing. Four is the value flown on 2026-08-25.
+    #[test]
+    fn arena_max_is_meaningfully_below_the_glibc_default() {
+        let glibc_default = 8 * std::thread::available_parallelism().map_or(4, |p| p.get());
+        assert!(ARENA_MAX >= 2, "at least two arenas, or contention bites");
+        assert!(
+            (ARENA_MAX as usize) < glibc_default,
+            "ARENA_MAX {} must be below glibc's default {}",
+            ARENA_MAX,
+            glibc_default
+        );
+    }
+
     /// The whole point of pinning the threshold: after `configure_allocator`,
     /// DDS-sized allocations must keep going through `mmap` however many
     /// allocate/free cycles precede them.
@@ -559,6 +611,64 @@ mod tests {
 /// about 20 seconds of CPU across an 11-hour flight. See issue #227.
 const MMAP_THRESHOLD_BYTES: usize = 1024 * 1024;
 
+/// Maximum number of glibc malloc arenas: 4.
+///
+/// glibc gives each thread an arena to avoid lock contention, defaulting to
+/// `8 x ncores` — 256 on a 32-core host. A thread keeps its arena, each arena
+/// grows to cover the worst burst *it* ever saw, and glibc returns memory only
+/// by trimming the **top** of a heap, so space stranded below a live
+/// allocation stays committed. Total arena is therefore the sum of every
+/// arena's personal high-water mark, and with 256 available a burst can always
+/// recruit fresh ones — which is why it never converges.
+///
+/// Measured over an 11-hour flight on the default ceiling: the arena reached
+/// 6,091 MB while holding 1,002 MB of live data, growing in 18 discrete steps
+/// that were still occurring at hour 10.75. Capping the count removes the
+/// supply: once every arena has seen its worst burst the sum saturates.
+///
+/// On the same route with this cap, the arena reached 3,916 MB within six
+/// minutes and then held to the byte — 151 consecutive samples, 26,360
+/// encodes, zero drift. That figure is peak concurrent demand (3,093 MB
+/// measured) plus about 27% fragmentation headroom: the arena is now sized by
+/// what the workload needs at once rather than by its history.
+///
+/// Four rather than two keeps a contention margin. The largest and most
+/// frequent allocations already bypass arenas entirely via
+/// [`MMAP_THRESHOLD_BYTES`], so what remains is one dominant size class of
+/// ~256 KiB chunk buffers — close to the best case for a low arena count.
+/// See issue #227.
+const ARENA_MAX: i32 = 4;
+
+/// The `GLIBC_TUNABLES` key that sets the arena ceiling.
+const TUNABLE_ARENA_MAX: &str = "glibc.malloc.arena_max";
+
+/// The `GLIBC_TUNABLES` key that sets the mmap threshold.
+const TUNABLE_MMAP_THRESHOLD: &str = "glibc.malloc.mmap_threshold";
+
+/// Whether the user has already pinned this parameter themselves.
+///
+/// glibc reads both `MALLOC_*` variables and `GLIBC_TUNABLES` before `main`,
+/// but a later `mallopt` silently overrides either. Measured on glibc 2.44:
+/// `MALLOC_ARENA_MAX=64` alone yields a 23 MB arena; the same variable with a
+/// subsequent `mallopt(M_ARENA_MAX, 4)` yields 1 MB. Without this check a user
+/// running an allocator experiment would have their setting discarded with no
+/// diagnostic.
+fn user_pinned(env_value: Option<&str>, tunables: Option<&str>, tunable_key: &str) -> bool {
+    env_value.is_some() || tunables.is_some_and(|t| t.contains(tunable_key))
+}
+
+/// Which allocator parameters [`configure_allocator`] pinned.
+///
+/// A parameter is `false` when the user set it themselves, when `mallopt`
+/// rejected it, or when the target is not linux-gnu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocatorConfig {
+    /// glibc's mmap threshold was pinned to [`MMAP_THRESHOLD_BYTES`].
+    pub mmap_threshold_pinned: bool,
+    /// glibc's arena ceiling was pinned to [`ARENA_MAX`].
+    pub arena_max_pinned: bool,
+}
+
 /// Pins glibc's mmap threshold so large allocations are never served from an
 /// arena, and are therefore returned to the OS when freed.
 ///
@@ -572,33 +682,64 @@ const MMAP_THRESHOLD_BYTES: usize = 1024 * 1024;
 /// An explicit `MALLOC_MMAP_THRESHOLD_` in the environment wins — glibc has
 /// already applied it at startup, and overriding it here would silently break
 /// anyone measuring an allocator experiment.
-pub fn configure_allocator() -> bool {
+pub fn configure_allocator() -> AllocatorConfig {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
-        if let Ok(value) = std::env::var("MALLOC_MMAP_THRESHOLD_") {
-            tracing::debug!(
-                env_value = %value,
-                "MALLOC_MMAP_THRESHOLD_ set in the environment; leaving glibc's threshold alone"
-            );
-            return false;
-        }
+        let tunables = std::env::var("GLIBC_TUNABLES").ok();
+        let mmap_env = std::env::var("MALLOC_MMAP_THRESHOLD_").ok();
+        let arena_env = std::env::var("MALLOC_ARENA_MAX").ok();
 
-        // SAFETY: mallopt takes two ints and is thread-safe; glibc locks
-        // internally. M_MMAP_THRESHOLD is a documented parameter.
-        let applied = unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, MMAP_THRESHOLD_BYTES as i32) };
-        if applied == 1 {
-            tracing::debug!(
-                threshold_bytes = MMAP_THRESHOLD_BYTES,
-                "Pinned glibc mmap threshold; large allocations bypass arenas"
-            );
-            true
-        } else {
-            tracing::warn!("mallopt(M_MMAP_THRESHOLD) was rejected; arena retention not bounded");
-            false
+        AllocatorConfig {
+            mmap_threshold_pinned: pin(
+                libc::M_MMAP_THRESHOLD,
+                MMAP_THRESHOLD_BYTES as i32,
+                "mmap threshold",
+                user_pinned(
+                    mmap_env.as_deref(),
+                    tunables.as_deref(),
+                    TUNABLE_MMAP_THRESHOLD,
+                ),
+            ),
+            arena_max_pinned: pin(
+                libc::M_ARENA_MAX,
+                ARENA_MAX,
+                "arena ceiling",
+                user_pinned(arena_env.as_deref(), tunables.as_deref(), TUNABLE_ARENA_MAX),
+            ),
         }
     }
     #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
     {
+        AllocatorConfig {
+            mmap_threshold_pinned: false,
+            arena_max_pinned: false,
+        }
+    }
+}
+
+/// Apply one `mallopt` parameter unless the user already set it.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn pin(param: libc::c_int, value: i32, label: &str, deferred: bool) -> bool {
+    if deferred {
+        tracing::info!(
+            parameter = label,
+            "Set in the environment; leaving glibc's value alone"
+        );
+        return false;
+    }
+
+    // SAFETY: mallopt takes two ints and is thread-safe; glibc locks
+    // internally. Both parameters used here are documented.
+    let applied = unsafe { libc::mallopt(param, value) };
+    if applied == 1 {
+        tracing::debug!(parameter = label, value, "Pinned glibc allocator parameter");
+        true
+    } else {
+        tracing::warn!(
+            parameter = label,
+            value,
+            "mallopt was rejected; allocator retention is not bounded"
+        );
         false
     }
 }
