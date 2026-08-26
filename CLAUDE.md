@@ -250,6 +250,20 @@ applied in code, not by environment variable, and both have flight evidence:
 - **Blocking pool cap** — tokio's 512 default let the pool reach 581 threads,
   and each excursion ratcheted glibc's arena high-water mark by ~420 MB. The
   arena reached 6,166 MB while holding 572 MB of live data.
+- **`mallopt(M_ARENA_MAX, 4)`** — glibc's default of `8 x ncores` (256 here)
+  lets every burst recruit fresh arenas, each keeping its own high-water mark
+  for the life of the process, so the total is the sum of every peak ever
+  seen and never converges. Capping the count removes the supply: the sum
+  saturates once each arena has seen its worst burst. On the reference leg the
+  arena settled at 3,916 MB within six minutes and held to the byte — peak
+  concurrent demand (3,093 MB) plus ~27% headroom — against 6,091 MB still
+  climbing at hour 10.75 uncapped. Override with `MALLOC_ARENA_MAX`.
+
+Both pins defer to an explicit `MALLOC_*` variable or `GLIBC_TUNABLES` entry:
+`mallopt` silently overrides what glibc read at startup, so without that check
+a user's own setting would vanish with no diagnostic. **Both are `cfg`-gated to
+`linux-gnu`** — macOS uses libmalloc and currently has neither these fixes nor
+the allocator telemetry.
 
 DDS payloads are `bytes::Bytes` end to end (#237): a tile is 10.66 MiB and a
 FUSE read wants ~4% of it, so cloning a payload costs more than delivering it.
