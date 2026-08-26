@@ -3,7 +3,8 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// A comprehensive system diagnostics report.
 #[derive(Debug, Clone)]
@@ -279,17 +280,16 @@ impl DiskInfo {
         let cache_dir = &config.cache.directory;
         info.cache_dir_path = Some(cache_dir.display().to_string());
         if cache_dir.exists() {
-            if let Ok(output) = Command::new("du")
-                .args(["-sh", &cache_dir.to_string_lossy()])
-                .output()
-            {
-                if output.status.success() {
-                    let du = String::from_utf8_lossy(&output.stdout);
-                    if let Some(size) = du.split_whitespace().next() {
-                        info.cache_dir_size = Some(size.to_string());
-                    }
-                }
-            }
+            let mut du = Command::new("du");
+            du.args(["-sh", &cache_dir.to_string_lossy()]);
+            // The directory exists, so a missing size means `du` did not finish
+            // in time (or failed) - not that there is nothing there. Say so
+            // rather than letting it read as "(not created)".
+            info.cache_dir_size = Some(
+                run_bounded(du, COMMAND_TIMEOUT)
+                    .and_then(|out| out.split_whitespace().next().map(str::to_string))
+                    .unwrap_or_else(|| UNMEASURED_SIZE.to_string()),
+            );
         }
         if let Ok(fs) = crate::system::fs_info(cache_dir_for_statvfs(cache_dir)) {
             info.cache_dir_available =
@@ -406,6 +406,61 @@ fn parse_section_header(line: &str) -> Option<&str> {
 /// secrets and the absence is informative when reading a diagnostics
 /// dump. See issue #162 for why we drive both this and `config list`
 /// from the same `is_sensitive` predicate.
+/// Shown in place of the cache size when `du` did not finish within
+/// [`COMMAND_TIMEOUT`]. The directory exists in that case, so reporting it as
+/// missing would be wrong.
+const UNMEASURED_SIZE: &str = "size unmeasured";
+
+/// Upper bound for an external command run by the diagnostics report.
+///
+/// Every collector here is meant to be O(1), but `du` walks the cache tree and
+/// grows with its contents: on a multi-terabyte cache it can run for minutes or
+/// longer. `xearthlayer diagnostics` is what the bug report template asks users
+/// to paste, so it has to finish even when the number it wants is expensive.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often to check whether a bounded child has exited.
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Runs `cmd` and returns its stdout, or `None` if it fails or outlives
+/// `timeout`.
+///
+/// On timeout the child is killed and reaped, so a slow command costs the
+/// caller `timeout` rather than however long the command would have taken.
+/// `None` means "no value to report" for every failure mode — the collectors
+/// here all treat a missing field as a normal outcome.
+fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<String> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let output = child.wait_with_output().ok()?;
+                return Some(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Best effort: if the kill or reap fails the child is
+                    // already gone, which is the outcome we wanted anyway.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(COMMAND_POLL_INTERVAL);
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 fn redact_sensitive_ini(content: &str) -> String {
     use crate::config::{ConfigKey, SENSITIVE_VALUE_MASK};
 
@@ -528,11 +583,13 @@ impl fmt::Display for SystemReport {
         // Cache directory: writable path XEL actually uses, comes first
         // so users see the relevant signal at the top.
         if let Some(ref path) = self.disk.cache_dir_path {
-            let used = self
-                .disk
-                .cache_dir_size
-                .as_deref()
-                .unwrap_or("(not created)");
+            // `du` reports a bare size ("1.5T"); the timeout marker is already
+            // a full phrase. Only the former needs the " used" suffix.
+            let used = match self.disk.cache_dir_size.as_deref() {
+                Some(UNMEASURED_SIZE) => UNMEASURED_SIZE.to_string(),
+                Some(size) => format!("{} used", size),
+                None => "(not created)".to_string(),
+            };
             let avail = self
                 .disk
                 .cache_dir_available
@@ -540,7 +597,7 @@ impl fmt::Display for SystemReport {
                 .unwrap_or("unknown");
             writeln!(
                 f,
-                "Cache directory: {} ({} used, {} available)",
+                "Cache directory: {} ({}, {} available)",
                 path, used, avail
             )?;
         }
@@ -808,5 +865,83 @@ google_api_key = THIS_IS_NOT_A_REAL_KEY_AND_NOT_SENSITIVE
 ";
         let redacted = redact_sensitive_ini(input);
         assert!(redacted.contains("THIS_IS_NOT_A_REAL_KEY_AND_NOT_SENSITIVE"));
+    }
+
+    #[test]
+    fn run_bounded_returns_stdout_when_command_finishes_in_time() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("42");
+        let out = run_bounded(cmd, Duration::from_secs(5));
+        assert_eq!(out.as_deref().map(str::trim), Some("42"));
+    }
+
+    #[test]
+    fn run_bounded_returns_none_when_command_outlives_the_deadline() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let start = std::time::Instant::now();
+        let out = run_bounded(cmd, Duration::from_millis(200));
+        assert!(out.is_none(), "expected the deadline to win, got {:?}", out);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "run_bounded blocked for {:?} - it did not kill the child",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_bounded_returns_none_for_a_command_that_does_not_exist() {
+        let cmd = Command::new("xel-no-such-binary-hopefully");
+        assert!(run_bounded(cmd, Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn run_bounded_returns_none_when_the_command_fails() {
+        let mut cmd = Command::new("false");
+        cmd.arg("");
+        assert!(run_bounded(cmd, Duration::from_secs(5)).is_none());
+    }
+
+    /// Render a report carrying only the given disk section.
+    fn report_with_disk(disk: DiskInfo) -> String {
+        SystemReport {
+            xearthlayer_version: "test".to_string(),
+            os: OsInfo::default(),
+            hardware: HardwareInfo::default(),
+            gpu: GpuInfo::default(),
+            disk,
+            network: NetworkInfo::default(),
+            config: ConfigInfo::default(),
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn disk_section_labels_a_measured_cache_size_as_used() {
+        let mut disk = DiskInfo::default();
+        disk.cache_dir_path = Some("/tmp/xel".to_string());
+        disk.cache_dir_size = Some("1.5T".to_string());
+        disk.cache_dir_available = Some("3.2 TB".to_string());
+        let report = report_with_disk(disk);
+        assert!(
+            report.contains("Cache directory: /tmp/xel (1.5T used, 3.2 TB available)"),
+            "{}",
+            report
+        );
+    }
+
+    #[test]
+    fn disk_section_does_not_append_used_to_the_unmeasured_marker() {
+        let mut disk = DiskInfo::default();
+        disk.cache_dir_path = Some("/tmp/xel".to_string());
+        disk.cache_dir_size = Some(UNMEASURED_SIZE.to_string());
+        disk.cache_dir_available = Some("3.2 TB".to_string());
+        let report = report_with_disk(disk);
+        assert!(
+            report.contains("Cache directory: /tmp/xel (size unmeasured, 3.2 TB available)"),
+            "{}",
+            report
+        );
+        assert!(!report.contains("unmeasured used"), "{}", report);
     }
 }
