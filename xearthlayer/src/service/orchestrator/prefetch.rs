@@ -145,8 +145,13 @@ impl ServiceOrchestrator {
             coordinator = coordinator.with_scenery_index(Arc::clone(&self.scenery_index));
             tracing::info!("Scenery index wired to prefetch (installed-tile lookup enabled)");
         } else {
+            // Not merely "no work to do": with no index wired, the planner
+            // has no evidence about any region, so it marks none NoCoverage.
+            // Before #228 it marked every region in the box on the first
+            // cycle, which made `regions_nocoverage` unreadable.
             tracing::warn!(
-                "Scenery index is empty (no ortho scenery installed) — prefetch will be inert"
+                "Scenery index is empty (no ortho scenery installed) — prefetch will plan no \
+                 tiles and record no region coverage state"
             );
         }
 

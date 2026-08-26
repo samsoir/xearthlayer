@@ -386,15 +386,23 @@ impl AdaptivePrefetchCoordinator {
     /// There is no geometric fallback (#176): when no scenery index is
     /// configured, or the index has no tiles for the region, this returns
     /// empty and the caller marks the region NoCoverage.
-    fn get_tiles_for_region(&self, region: &DsfRegion) -> Vec<TileCoord> {
-        match self.scenery_index {
-            // An empty result means the index knows of no ortho scenery
-            // here. The caller marks the region NoCoverage. There is no
-            // geometric fallback: a 4x4 sample of a region holding ~2,500
-            // tiles at zoom 14 made "all tiles cached" meaningless. See #176.
-            Some(ref index) => index.tiles_in_region(*region),
-            None => Vec::new(),
-        }
+    fn get_tiles_for_region(&self, region: &DsfRegion) -> Option<Vec<TileCoord>> {
+        // `None` means there is no index to consult. That is a different fact
+        // from `Some(vec![])`, which means the index *was* consulted and
+        // genuinely attributes no tiles here — and only the latter is evidence
+        // that the region lacks coverage.
+        //
+        // Returning `Vec::new()` for both conflated them, and the caller
+        // marked NoCoverage on either, so a user with no ortho packages had
+        // every region in the prefetch box marked NoCoverage on the first
+        // cycle without any index being consulted. Same `cannot tell !=
+        // absent` family as #226 and #223's RegionDiskState. See #228.
+        //
+        // There is no geometric fallback: a 4x4 sample of a region holding
+        // ~2,500 tiles at zoom 14 made "all tiles cached" meaningless (#176).
+        self.scenery_index
+            .as_ref()
+            .map(|index| index.tiles_in_region(*region))
     }
 
     /// Get the current effective mode.
@@ -595,7 +603,12 @@ impl AdaptivePrefetchCoordinator {
         // post-flight: distance-sort + cap produced forward starvation.
         let mut tiles_with_region: Vec<(TileCoord, DsfRegion)> = Vec::new();
         for region in &new_regions {
-            let tiles = self.get_tiles_for_region(region);
+            let Some(tiles) = self.get_tiles_for_region(region) else {
+                // No scenery index: no evidence either way, so no verdict.
+                // Marking NoCoverage here would be a permanent claim we have
+                // nothing to support. See #228.
+                continue;
+            };
             if tiles.is_empty() {
                 if let Some(ref geo_index) = self.geo_index {
                     self.boundary_strategy.mark_no_coverage(region, geo_index);
@@ -1914,17 +1927,21 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_get_tiles_for_region_without_index_returns_empty() {
+    fn test_get_tiles_for_region_without_index_returns_none() {
         // #176: without a scenery index there is no geometric fallback —
         // the coordinator has no way to know what tiles the region should
         // contain, so it must yield nothing rather than guess zoom 14.
+        //
+        // #228: and it must say so as `None`, not `Some(vec![])`. The latter
+        // is a claim the index was consulted and found nothing, which would
+        // justify marking the region NoCoverage. There is no index here.
         let coord = AdaptivePrefetchCoordinator::with_defaults();
         let region = DsfRegion::new(50, 9);
 
-        let tiles = coord.get_tiles_for_region(&region);
         assert!(
-            tiles.is_empty(),
-            "Without a scenery index, get_tiles_for_region must return nothing"
+            coord.get_tiles_for_region(&region).is_none(),
+            "Without a scenery index, get_tiles_for_region must report None — \
+             an absent index, not an index that found nothing"
         );
     }
 
@@ -1935,7 +1952,9 @@ mod tests {
         let coord = AdaptivePrefetchCoordinator::with_defaults().with_scenery_index(index);
         let region = DsfRegion::new(50, 9);
 
-        let tiles = coord.get_tiles_for_region(&region);
+        let tiles = coord
+            .get_tiles_for_region(&region)
+            .expect("a scenery index is wired in this test");
         assert!(!tiles.is_empty());
         for tile in &tiles {
             assert_eq!(
@@ -1952,7 +1971,9 @@ mod tests {
         let coord = AdaptivePrefetchCoordinator::with_defaults().with_scenery_index(index);
         let region = DsfRegion::new(50, 9);
 
-        let tiles = coord.get_tiles_for_region(&region);
+        let tiles = coord
+            .get_tiles_for_region(&region)
+            .expect("a scenery index is wired in this test");
         assert!(!tiles.is_empty());
         for tile in &tiles {
             assert_eq!(
@@ -1972,7 +1993,9 @@ mod tests {
         let coord = AdaptivePrefetchCoordinator::with_defaults().with_scenery_index(index);
         let region = DsfRegion::new(50, 9);
 
-        let tiles = coord.get_tiles_for_region(&region);
+        let tiles = coord
+            .get_tiles_for_region(&region)
+            .expect("a scenery index is wired in this test");
         assert!(
             tiles.is_empty(),
             "Should return empty when scenery index has no coverage for the region"
@@ -2017,12 +2040,16 @@ mod tests {
         assert!(
             coord
                 .get_tiles_for_region(&DsfRegion::new(10, -150))
+                .expect("a scenery index is wired in this test")
                 .is_empty(),
             "an uncovered region must yield no tiles, not a geometric guess"
         );
         // And the covered one still yields its tile.
         assert_eq!(
-            coord.get_tiles_for_region(&DsfRegion::new(33, -119)).len(),
+            coord
+                .get_tiles_for_region(&DsfRegion::new(33, -119))
+                .expect("a scenery index is wired in this test")
+                .len(),
             1
         );
     }
@@ -2091,6 +2118,64 @@ mod tests {
             !no_coverage_regions.is_empty(),
             "Regions the prefetch box touched with zero scenery coverage must be \
              marked NoCoverage, not left unmarked to be re-planned every cycle",
+        );
+    }
+
+    /// The mirror of the test above, and the actual defect in #228.
+    ///
+    /// `get_tiles_for_region` used to return `Vec::new()` for two different
+    /// facts: "the index says this region holds no tiles" and "there is no
+    /// index to ask". The caller marked `NoCoverage` for both, so a user with
+    /// no ortho packages installed had **every region in the prefetch box**
+    /// marked NoCoverage on the first cycle — over land, over ocean, without
+    /// any index being consulted — and excluded for the rest of the session.
+    ///
+    /// Same `cannot tell != absent` conflation as #226, in a different
+    /// function. No index means no evidence, and no evidence means no verdict.
+    ///
+    /// This drives a full planning cycle rather than calling
+    /// `get_tiles_for_region` directly: the coverage note above records that
+    /// deleting the marking branch entirely left the whole suite green, so a
+    /// helper-level test proves nothing about the production path.
+    #[tokio::test]
+    async fn test_no_scenery_index_marks_nothing_no_coverage() {
+        use crate::geo_index::{GeoIndex, PrefetchedRegion};
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let client = Arc::new(CapLimitedDdsClient::new(100_000));
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ramp_duration: std::time::Duration::from_secs(0),
+            ..Default::default()
+        };
+        // Deliberately no `.with_scenery_index(...)` — this is the production
+        // shape when `tile_count() == 0` in service/orchestrator/prefetch.rs.
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_calibration(test_calibration())
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+
+        fast_forward_to_cruise(&mut coord);
+        assert_eq!(coord.phase_detector.current_phase(), FlightPhase::Cruise);
+
+        let state = AircraftState::new(50.0, 10.0, 0.0, 200.0, 35000.0, false);
+        let _ = coord.process_telemetry(&state).await;
+
+        let no_coverage_regions: Vec<_> = geo_index
+            .iter::<PrefetchedRegion>()
+            .into_iter()
+            .filter(|(_, r)| r.is_no_coverage())
+            .collect();
+        assert!(
+            no_coverage_regions.is_empty(),
+            "With no scenery index there is no evidence a region lacks coverage, \
+             so none may be marked NoCoverage. Got {} marked: {:?}",
+            no_coverage_regions.len(),
+            no_coverage_regions
+                .iter()
+                .map(|(r, _)| *r)
+                .collect::<Vec<_>>(),
         );
     }
 
@@ -3416,7 +3501,9 @@ mod tests {
 
         // Query for region (50, 9) only
         let target = DsfRegion::new(50, 9);
-        let tiles = coord.get_tiles_for_region(&target);
+        let tiles = coord
+            .get_tiles_for_region(&target)
+            .expect("a scenery index is wired in this test");
 
         // Should only get tiles from region (50,9), NOT from (50,10) or (51,9)
         assert!(!tiles.is_empty(), "Should find tiles in the target region");
