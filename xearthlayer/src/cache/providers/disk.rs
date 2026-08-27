@@ -36,10 +36,23 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::cache::config::DiskProviderConfig;
+use crate::cache::integrity::{dds_tile_validator, raw_chunk_validator, CacheEntryValidator};
 use crate::cache::lru_index::LruIndex;
 use crate::cache::traits::{BoxFuture, Cache, GcResult, ServiceCacheError};
 use crate::cache::DiskTier;
 use crate::metrics::MetricsClient;
+
+/// Choose the tier-appropriate validator.
+///
+/// This is the one place tier maps to a validator, keeping
+/// `DiskCacheProvider` itself ignorant of what it stores — the same struct
+/// backs both the DDS tile tier and the raw chunk tier (#253).
+fn validator_for_tier(tier: DiskTier) -> Arc<dyn CacheEntryValidator> {
+    match tier {
+        DiskTier::Dds => Arc::new(dds_tile_validator()),
+        DiskTier::Chunk => Arc::new(raw_chunk_validator()),
+    }
+}
 
 /// On-disk cache provider with LRU index tracking.
 ///
@@ -72,6 +85,13 @@ pub struct DiskCacheProvider {
     /// Which disk cache tier this provider serves.
     /// Controls which metric event is emitted for size updates.
     tier: DiskTier,
+
+    /// Validates entries read from disk before they are trusted.
+    ///
+    /// Chosen by `tier` at construction (see `validator_for_tier`). A cache
+    /// is never a source of truth: `get()` treats a validator rejection the
+    /// same as a missing file — discard the entry, report a miss (#253).
+    validator: Arc<dyn CacheEntryValidator>,
 }
 
 impl DiskCacheProvider {
@@ -109,6 +129,7 @@ impl DiskCacheProvider {
             shutdown,
             metrics_client: config.metrics_client,
             tier: config.tier,
+            validator: validator_for_tier(config.tier),
         });
 
         // Populate LRU index from disk
@@ -163,6 +184,7 @@ impl DiskCacheProvider {
             shutdown,
             metrics_client: config.metrics_client,
             tier: config.tier,
+            validator: validator_for_tier(config.tier),
         });
 
         info!(
@@ -322,6 +344,17 @@ impl Cache for DiskCacheProvider {
         Box::pin(async move {
             match tokio::fs::read(&path).await {
                 Ok(data) => {
+                    if let Err(reason) = self.validator.validate(&data) {
+                        // A cache is never a source of truth. Delete the bad
+                        // entry so the next request regenerates it — leaving
+                        // it in place would reject it again on every read,
+                        // which is how one corrupt tile became permanently
+                        // magenta (#253).
+                        crate::cache::integrity::discard(&path, &reason);
+                        self.lru_index.remove(&key_owned);
+                        return Ok(None);
+                    }
+
                     // Update LRU index access time
                     self.lru_index.touch(&key_owned);
                     debug!(
@@ -349,14 +382,17 @@ impl Cache for DiskCacheProvider {
                     Ok(None)
                 }
                 Err(e) => {
+                    // A failing disk degrades to a miss rather than an error
+                    // propagated to the caller — the tile regenerates from
+                    // the next tier up instead of failing the request (#253).
                     warn!(
                         key = %key_owned,
                         path = %path.display(),
                         tier = %tier,
                         error = %e,
-                        "Disk cache read error"
+                        "Disk cache read error; treating as a miss"
                     );
-                    Err(ServiceCacheError::Io(e))
+                    Ok(None)
                 }
             }
         })
@@ -457,8 +493,82 @@ impl Drop for DiskCacheProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::integrity::EXPECTED_DDS_SIZE;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    /// A DDS-tier provider built synchronously (no fs scan, no shared
+    /// runtime dependency) so corruption tests can construct it inline.
+    fn dds_provider(temp: &TempDir) -> Arc<DiskCacheProvider> {
+        Arc::new(DiskCacheProvider {
+            directory: temp.path().to_path_buf(),
+            max_size_bytes: AtomicU64::new(1_000_000_000),
+            lru_index: Arc::new(LruIndex::new(temp.path().to_path_buf())),
+            shutdown: CancellationToken::new(),
+            metrics_client: None,
+            tier: DiskTier::Dds,
+            validator: Arc::new(dds_tile_validator()),
+        })
+    }
+
+    /// A chunk-tier provider, built the same way as `dds_provider` above.
+    fn chunk_provider(temp: &TempDir) -> Arc<DiskCacheProvider> {
+        Arc::new(DiskCacheProvider {
+            directory: temp.path().to_path_buf(),
+            max_size_bytes: AtomicU64::new(1_000_000_000),
+            lru_index: Arc::new(LruIndex::new(temp.path().to_path_buf())),
+            shutdown: CancellationToken::new(),
+            metrics_client: None,
+            tier: DiskTier::Chunk,
+            validator: Arc::new(raw_chunk_validator()),
+        })
+    }
+
+    #[tokio::test]
+    async fn corrupt_dds_entry_is_discarded_and_reported_as_a_miss() {
+        let temp = TempDir::new().unwrap();
+        let provider = dds_provider(&temp);
+        let key = "tile:15:12754:5279";
+
+        // Put a file with the right name but wrong content on disk.
+        let path = provider.key_path(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not a dds tile").unwrap();
+
+        assert!(provider.get(key).await.unwrap().is_none(), "must be a miss");
+        assert!(
+            !path.exists(),
+            "a rejected entry must be deleted so it regenerates"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_chunk_entry_is_discarded_and_reported_as_a_miss() {
+        let temp = TempDir::new().unwrap();
+        let provider = chunk_provider(&temp);
+        let key = "chunk:19:204064:84464";
+
+        let path = provider.key_path(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+
+        assert!(provider.get(key).await.unwrap().is_none());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_valid_entry_survives_validation() {
+        let temp = TempDir::new().unwrap();
+        let provider = dds_provider(&temp);
+        let key = "tile:15:12754:5279";
+
+        let mut tile = vec![0u8; EXPECTED_DDS_SIZE];
+        tile[0..4].copy_from_slice(b"DDS ");
+        provider.set(key, Bytes::from(tile.clone())).await.unwrap();
+
+        assert_eq!(provider.get(key).await.unwrap(), Some(Bytes::from(tile)));
+        assert!(provider.key_path(key).exists());
+    }
 
     async fn create_test_provider(max_size: u64) -> (TempDir, Arc<DiskCacheProvider>) {
         let temp_dir = TempDir::new().unwrap();
