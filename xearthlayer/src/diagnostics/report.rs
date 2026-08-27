@@ -397,15 +397,6 @@ fn parse_section_header(line: &str) -> Option<&str> {
     }
 }
 
-/// Redact sensitive credential values from raw INI text by checking each
-/// `key = value` line against [`ConfigKey::is_sensitive`] and substituting
-/// [`SENSITIVE_VALUE_MASK`] for the value.
-///
-/// Section headers, comments, blank lines, non-sensitive entries, and
-/// entries with empty values are preserved verbatim — empty values aren't
-/// secrets and the absence is informative when reading a diagnostics
-/// dump. See issue #162 for why we drive both this and `config list`
-/// from the same `is_sensitive` predicate.
 /// Shown in place of the cache size when `du` did not finish within
 /// [`COMMAND_TIMEOUT`]. The directory exists in that case, so reporting it as
 /// missing would be wrong.
@@ -429,6 +420,18 @@ const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// caller `timeout` rather than however long the command would have taken.
 /// `None` means "no value to report" for every failure mode — the collectors
 /// here all treat a missing field as a normal outcome.
+///
+/// # Output must fit the pipe buffer
+///
+/// stdout is piped but not drained until the child exits, so a command that
+/// writes more than the pipe holds (64 KiB on Linux) blocks on the write and
+/// never exits. That is not a hang — the deadline still fires and the child is
+/// still killed — but the call always costs the full `timeout` and always
+/// returns `None`, which reads like a slow command rather than a full pipe.
+///
+/// Every current caller reports a single line. Draining concurrently would
+/// lift the restriction and is the right change if a chatty command ever needs
+/// this; until one does, the reader thread it costs is not worth carrying.
 fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<String> {
     let mut child = cmd
         .stdout(Stdio::piped())
@@ -461,6 +464,15 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<String> {
     }
 }
 
+/// Redact sensitive credential values from raw INI text by checking each
+/// `key = value` line against [`ConfigKey::is_sensitive`] and substituting
+/// [`SENSITIVE_VALUE_MASK`] for the value.
+///
+/// Section headers, comments, blank lines, non-sensitive entries, and
+/// entries with empty values are preserved verbatim — empty values aren't
+/// secrets and the absence is informative when reading a diagnostics
+/// dump. See issue #162 for why we drive both this and `config list`
+/// from the same `is_sensitive` predicate.
 fn redact_sensitive_ini(content: &str) -> String {
     use crate::config::{ConfigKey, SENSITIVE_VALUE_MASK};
 
