@@ -31,7 +31,7 @@
 //! - Any terrain directory's file count changes
 
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -244,59 +244,59 @@ pub fn save_cache(index: &SceneryIndex, packages: &[(String, PathBuf)]) -> io::R
     let path = cache_path();
     let package_infos = gather_package_info(packages)?;
 
-    // Ensure parent directory exists
+    // Ensure parent directory exists. `write_atomic` writes a sibling temp
+    // file and does not create directories itself.
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let file = File::create(&path)?;
-    let mut writer = BufWriter::new(file);
+    crate::cache::integrity::write_atomic(&path, |writer| {
+        // Header section
+        writeln!(writer, "{}", CACHE_HEADER)?;
+        writeln!(writer, "{}", CACHE_VERSION)?;
+        writeln!(writer, "{}", packages.len())?;
+        writeln!(writer, "{}", index.tile_count())?;
+        writeln!(writer, "{}", index.sea_tile_count())?;
 
-    // Header section
-    writeln!(writer, "{}", CACHE_HEADER)?;
-    writeln!(writer, "{}", CACHE_VERSION)?;
-    writeln!(writer, "{}", packages.len())?;
-    writeln!(writer, "{}", index.tile_count())?;
-    writeln!(writer, "{}", index.sea_tile_count())?;
+        // Package metadata
+        for info in &package_infos {
+            writeln!(
+                writer,
+                "{}{}{}{}{}{}{}",
+                info.name,
+                FIELD_SEPARATOR,
+                info.path.display(),
+                FIELD_SEPARATOR,
+                info.terrain_mtime_secs,
+                FIELD_SEPARATOR,
+                info.terrain_file_count
+            )?;
+        }
 
-    // Package metadata
-    for info in &package_infos {
-        writeln!(
-            writer,
-            "{}{}{}{}{}{}{}",
-            info.name,
-            FIELD_SEPARATOR,
-            info.path.display(),
-            FIELD_SEPARATOR,
-            info.terrain_mtime_secs,
-            FIELD_SEPARATOR,
-            info.terrain_file_count
-        )?;
-    }
+        // Blank line separator
+        writeln!(writer)?;
 
-    // Blank line separator
-    writeln!(writer)?;
+        // Tile data
+        for tile in index.all_tiles() {
+            writeln!(
+                writer,
+                "{}{}{}{}{}{}{}{}{}{}{}",
+                tile.row,
+                FIELD_SEPARATOR,
+                tile.col,
+                FIELD_SEPARATOR,
+                tile.chunk_zoom,
+                FIELD_SEPARATOR,
+                tile.lat,
+                FIELD_SEPARATOR,
+                tile.lon,
+                FIELD_SEPARATOR,
+                if tile.is_sea { 1 } else { 0 }
+            )?;
+        }
 
-    // Tile data
-    for tile in index.all_tiles() {
-        writeln!(
-            writer,
-            "{}{}{}{}{}{}{}{}{}{}{}",
-            tile.row,
-            FIELD_SEPARATOR,
-            tile.col,
-            FIELD_SEPARATOR,
-            tile.chunk_zoom,
-            FIELD_SEPARATOR,
-            tile.lat,
-            FIELD_SEPARATOR,
-            tile.lon,
-            FIELD_SEPARATOR,
-            if tile.is_sea { 1 } else { 0 }
-        )?;
-    }
-
-    writer.flush()?;
+        Ok(())
+    })?;
 
     info!(
         path = %path.display(),
@@ -314,8 +314,15 @@ pub fn save_cache(index: &SceneryIndex, packages: &[(String, PathBuf)]) -> io::R
 /// Returns `Stale` if packages have changed, `NotFound` if cache doesn't exist,
 /// or `Invalid` if the cache is corrupted.
 pub fn load_cache(packages: &[(String, PathBuf)]) -> CacheLoadResult {
-    let path = cache_path();
+    load_cache_from(&cache_path(), packages)
+}
 
+/// Load the scenery index from a specific cache file path.
+///
+/// Split out from [`load_cache`] so tests can point at a temporary file
+/// instead of the live `~/.xearthlayer/scenery_index.cache` — a real,
+/// potentially 180 MB file that must never be read or mutated by a test.
+fn load_cache_from(path: &std::path::Path, packages: &[(String, PathBuf)]) -> CacheLoadResult {
     // Check cache exists
     if !path.exists() {
         debug!(path = %path.display(), "Cache file not found");
@@ -333,11 +340,24 @@ pub fn load_cache(packages: &[(String, PathBuf)]) -> CacheLoadResult {
     };
 
     // Open and parse cache file
-    let file = match File::open(&path) {
+    let file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {
             return CacheLoadResult::Invalid {
                 error: format!("Failed to open cache file: {}", e),
+            }
+        }
+    };
+
+    // A cache cannot hold more tiles than it has bytes: every tile occupies
+    // at least one line. Bounding here is what makes the `Invalid` verdict
+    // below reachable — `Vec::with_capacity` on an implausible count aborts
+    // the process, and no caller can recover from that.
+    let ceiling = match crate::cache::integrity::length_ceiling(&file) {
+        Ok(len) => len,
+        Err(e) => {
+            return CacheLoadResult::Invalid {
+                error: format!("Failed to stat cache file: {}", e),
             }
         }
     };
@@ -416,6 +436,15 @@ pub fn load_cache(packages: &[(String, PathBuf)]) -> CacheLoadResult {
             }
         }
     };
+
+    if total_tiles as u64 > ceiling {
+        return CacheLoadResult::Invalid {
+            error: format!(
+                "Implausible tile count {} for a {}-byte cache",
+                total_tiles, ceiling
+            ),
+        };
+    }
 
     let sea_tiles: usize = match next_line().and_then(|s| s.parse().ok()) {
         Some(c) => c,
@@ -735,6 +764,28 @@ mod tests {
         let result = validate_packages(&[cached], &[current]);
         assert!(result.is_some());
         assert!(result.unwrap().contains("file count"));
+    }
+
+    #[test]
+    fn test_implausible_tile_count_is_invalid_not_fatal() {
+        let temp = TempDir::new().unwrap();
+        let cache_file = temp.path().join("scenery_index.cache");
+
+        // A structurally valid cache whose tile count cannot fit in the file.
+        let mut file = std::fs::File::create(&cache_file).unwrap();
+        writeln!(file, "{}", CACHE_HEADER).unwrap();
+        writeln!(file, "{}", CACHE_VERSION).unwrap();
+        writeln!(file, "0").unwrap(); // package count
+        writeln!(file, "999999999999999999").unwrap(); // total_tiles
+        writeln!(file, "0").unwrap(); // sea_tiles
+        writeln!(file).unwrap();
+        drop(file);
+
+        // Must be a verdict, not a process abort.
+        assert!(matches!(
+            load_cache_from(&cache_file, &[]),
+            CacheLoadResult::Invalid { .. }
+        ));
     }
 
     #[test]
