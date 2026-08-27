@@ -79,6 +79,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `migrate_cache()` for migrating flat-layout caches to region layout
    - Bridge adapters for executor integration (MemoryCacheBridge, DdsDiskCacheBridge, DiskCacheBridge)
    - Per-provider cache directories
+   - `cache/integrity`: canonical corruption-handling model shared by every on-disk cache (index cache, scenery index cache, DDS/chunk disk tiers) — bounded reads (`length_ceiling`), atomic durable writes (`write_atomic`), discard-on-reject (`CacheLoad::or_discard`); see `docs/dev/cache-integrity-design.md`
    - `XEarthLayerService::start()` creates `CacheLayer` with proper metrics ordering
 
 6. **Configuration** (`xearthlayer/src/config/`)
