@@ -79,6 +79,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `migrate_cache()` for migrating flat-layout caches to region layout
    - Bridge adapters for executor integration (MemoryCacheBridge, DdsDiskCacheBridge, DiskCacheBridge)
    - Per-provider cache directories
+   - `cache/integrity`: canonical corruption-handling model shared by every on-disk cache (index cache, scenery index cache, DDS/chunk disk tiers) — bounded reads (`length_ceiling`), atomic durable writes (`write_atomic`, which also creates the parent directory), and invariant-3 satisfied per cache: explicit `discard()` on the disk tiers, unconditional overwrite-on-rebuild for the index caches; see `docs/dev/cache-integrity-design.md`
    - `XEarthLayerService::start()` creates `CacheLayer` with proper metrics ordering
 
 6. **Configuration** (`xearthlayer/src/config/`)
@@ -390,6 +391,7 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/service/cache_layer.rs` | CacheLayer - three-tier cache lifecycle (memory + DDS disk + chunk disk) |
 | `xearthlayer/src/cache/providers/disk.rs` | DiskCacheProvider with internal GC daemon |
 | `xearthlayer/src/cache/adapters/` | Bridge adapters for backward compatibility |
+| `xearthlayer/src/cache/integrity/` | Canonical cache integrity model (`length_ceiling`, `write_atomic`, `discard`, `CacheEntryValidator`) |
 
 ## Configuration
 
@@ -487,5 +489,6 @@ CI will fail if pre-commit checks were not run.
 - **Consolidated FUSE mounting**: `docs/dev/consolidated-mounting-design.md` (single ortho mount, patches + packages)
 - **GeoIndex design**: `docs/dev/geo-index-design.md` (geospatial reference database, patch region ownership)
 - **Memory telemetry**: `docs/dev/memory-telemetry.md` (periodic memory sampling, trace interpretation, confounders)
+- **Cache integrity model**: `docs/dev/cache-integrity-design.md` (bounded reads, atomic durable writes, discard-on-reject, shared by every on-disk cache)
 - memorize review allow(dead_code) macros at major checkpoints. Refactor aggresively to remove them when appropriate.
 - memorize ensure to update the projects documentation to reflect the current state of the project before committing changes

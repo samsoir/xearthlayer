@@ -6,10 +6,11 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufReader, BufWriter};
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 
 use super::index::OrthoUnionIndex;
@@ -114,37 +115,45 @@ impl IndexCache {
     }
 
     /// Load cache from file.
+    ///
+    /// The deserializer is bounded by the file's own length. Nothing
+    /// legitimate can require reading more bytes than the file holds, so this
+    /// rejects a corrupt length prefix with no risk of rejecting a valid
+    /// cache. The bound is not optional: an unbounded reader passes a garbage
+    /// length to `Vec::with_capacity`, which aborts the process — a failure no
+    /// caller can recover from, however carefully it handles `Err`.
     pub fn load(path: &Path) -> io::Result<Self> {
         let file = std::fs::File::open(path)?;
+        let limit = crate::cache::integrity::length_ceiling(&file)?;
         let reader = BufReader::new(file);
 
-        bincode::deserialize_from(reader).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Failed to deserialize index cache: {}", e),
-            )
-        })
+        // These three options reproduce legacy `bincode::deserialize_from`
+        // exactly. They are load-bearing: `bincode::options()` alone defaults
+        // to varint encoding and would fail to read every existing cache.
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(limit)
+            .deserialize_from(reader)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to deserialize index cache: {}", e),
+                )
+            })
     }
 
     /// Save cache to file.
+    ///
+    /// Durability is delegated to `write_atomic`: temp file, flush, fsync,
+    /// rename, and cleanup on failure. Passing the writer by `&mut` is what
+    /// makes the explicit flush possible — `serialize_into` taking it by value
+    /// is how the drop-flush error came to be discarded.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        // Write to temp file first, then rename for atomicity
-        let temp_path = path.with_extension("tmp");
-        let file = std::fs::File::create(&temp_path)?;
-        let writer = BufWriter::new(file);
-
-        bincode::serialize_into(writer, self)
-            .map_err(|e| io::Error::other(format!("Failed to serialize index cache: {}", e)))?;
-
-        // Atomic rename
-        std::fs::rename(&temp_path, path)?;
-
-        Ok(())
+        crate::cache::integrity::write_atomic(path, |writer| {
+            bincode::serialize_into(writer, self)
+                .map_err(|e| io::Error::other(format!("Failed to serialize index cache: {}", e)))
+        })
     }
 
     /// Check if this cache is valid for the given key.
@@ -193,7 +202,17 @@ pub fn try_load_cached_index(
     cache_path: &Path,
     current_key: &IndexCacheKey,
 ) -> Option<OrthoUnionIndex> {
-    let cache = IndexCache::load(cache_path).ok()?;
+    let cache = match IndexCache::load(cache_path) {
+        Ok(cache) => cache,
+        Err(e) => {
+            tracing::warn!(
+                path = %cache_path.display(),
+                error = %e,
+                "Discarding unreadable index cache; rebuilding from sources"
+            );
+            return None;
+        }
+    };
 
     if cache.is_valid(current_key) {
         tracing::info!(
@@ -302,6 +321,79 @@ mod tests {
 
         let loaded = IndexCache::load(&cache_path).unwrap();
         assert!(loaded.is_valid(&key));
+    }
+
+    /// A cache whose serialized form contains realistic path text, so a
+    /// misaligned read lands on a path the way the field crash did.
+    fn realistic_cache() -> IndexCache {
+        let key = IndexCacheKey {
+            version: "0.4.7-beta.1".to_string(),
+            source_paths: vec![
+                PathBuf::from("/home/user/.xearthlayer/packages/xel-region-eu"),
+                PathBuf::from("/home/user/.xearthlayer/packages/xel-region-na"),
+            ],
+            source_mtimes_secs: vec![1_756_000_000, 1_756_000_001],
+            config_hash: 42,
+        };
+        IndexCache::new(key, OrthoUnionIndex::default())
+    }
+
+    #[test]
+    fn test_load_rejects_oversized_length_prefix() {
+        let temp = TempDir::new().unwrap();
+        let cache_path = temp.path().join("test.cache");
+        realistic_cache().save(&cache_path).unwrap();
+
+        // Overwrite the leading version-length prefix with an absurd length.
+        let mut bytes = std::fs::read(&cache_path).unwrap();
+        bytes[0..8].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
+        std::fs::write(&cache_path, &bytes).unwrap();
+
+        assert!(
+            IndexCache::load(&cache_path).is_err(),
+            "an oversized length prefix must be an error, not a process abort"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_misaligned_cache() {
+        let temp = TempDir::new().unwrap();
+        let cache_path = temp.path().join("test.cache");
+        realistic_cache().save(&cache_path).unwrap();
+
+        // Drop one byte from the source-path count, shifting every later read
+        // so a length field lands on path text. This is the field failure.
+        let mut bytes = std::fs::read(&cache_path).unwrap();
+        bytes.remove(20);
+        std::fs::write(&cache_path, &bytes).unwrap();
+
+        assert!(
+            IndexCache::load(&cache_path).is_err(),
+            "a misaligned cache must be an error, not a process abort"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_truncated_cache() {
+        let temp = TempDir::new().unwrap();
+        let cache_path = temp.path().join("test.cache");
+        realistic_cache().save(&cache_path).unwrap();
+
+        let bytes = std::fs::read(&cache_path).unwrap();
+        std::fs::write(&cache_path, &bytes[..bytes.len() / 2]).unwrap();
+
+        assert!(IndexCache::load(&cache_path).is_err());
+    }
+
+    #[test]
+    fn test_save_leaves_no_temp_file_behind() {
+        let temp = TempDir::new().unwrap();
+        let cache_path = temp.path().join("test.cache");
+
+        realistic_cache().save(&cache_path).unwrap();
+
+        assert!(cache_path.exists());
+        assert!(!cache_path.with_extension("tmp").exists());
     }
 
     #[test]

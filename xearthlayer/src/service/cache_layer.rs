@@ -332,6 +332,7 @@ impl CacheLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::integrity::EXPECTED_DDS_SIZE;
     use crate::executor::{DdsDiskCache, DiskCache, MemoryCache};
     use bytes::Bytes;
     use tempfile::tempdir;
@@ -432,9 +433,14 @@ mod tests {
         let cache_layer = CacheLayer::new(&config, "test", metrics).await.unwrap();
         let bridge = cache_layer.dds_disk_bridge();
 
-        bridge.put(100, 200, 15, vec![1, 2, 3].into()).await;
+        // This bridge is backed by the real DDS tier (`.as_dds_tier()`), so
+        // a round trip must satisfy the DDS validator (#253) — arbitrary
+        // bytes would now be discarded as corrupt and reported as a miss.
+        let mut tile = vec![0u8; EXPECTED_DDS_SIZE];
+        tile[0..4].copy_from_slice(b"DDS ");
+        bridge.put(100, 200, 15, Bytes::from(tile.clone())).await;
         let result = bridge.get(100, 200, 15).await;
-        assert_eq!(result, Some(Bytes::from(vec![1, 2, 3])));
+        assert_eq!(result, Some(Bytes::from(tile)));
 
         assert!(bridge.contains(100, 200, 15).await);
         assert!(!bridge.contains(999, 999, 15).await);
