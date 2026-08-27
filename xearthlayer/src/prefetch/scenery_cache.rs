@@ -52,6 +52,14 @@ const FIELD_SEPARATOR: &str = "  ";
 /// Cache filename.
 const CACHE_FILENAME: &str = "scenery_index.cache";
 
+/// Minimum bytes a tile data line can occupy: `row  col  chunk_zoom  lat  lon
+/// is_sea\n` with every field at its shortest (single-digit values, no
+/// fractional part). Used to turn a raw byte ceiling into an element-count
+/// ceiling — `total_tiles` sizes a `Vec<SceneryTile>`, not a byte buffer, so
+/// bounding it by file bytes alone still lets a corrupt count over-reserve by
+/// `size_of::<SceneryTile>()` per byte of file.
+const MIN_TILE_LINE_BYTES: u64 = 11;
+
 /// Metadata about a cached package (for invalidation).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CachedPackageInfo {
@@ -116,8 +124,19 @@ pub fn cache_path() -> PathBuf {
 /// This is useful for CLI commands that need to display cache statistics
 /// without the overhead of loading the full tile data.
 pub fn cache_status() -> io::Result<CacheStatus> {
-    let path = cache_path();
-    let file = File::open(&path)?;
+    cache_status_from(&cache_path())
+}
+
+/// Implementation behind [`cache_status`], parameterized by path for testing.
+fn cache_status_from(path: &std::path::Path) -> io::Result<CacheStatus> {
+    let file = File::open(path)?;
+
+    // A cache cannot hold more packages than it has bytes: every package
+    // occupies at least one line. Captured from the open handle before the
+    // BufReader takes it, mirroring `load_cache_from`'s tile-count bound —
+    // this is the same unbounded-allocation defect (#253) at a second site.
+    let ceiling = crate::cache::integrity::length_ceiling(&file)?;
+
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
 
@@ -146,6 +165,17 @@ pub fn cache_status() -> io::Result<CacheStatus> {
     let package_count: usize = next_line()?
         .parse()
         .map_err(|_| io::Error::other("Failed to parse package count"))?;
+
+    if package_count as u64 > ceiling {
+        let reason = crate::cache::integrity::IntegrityError::ImplausibleLength {
+            claimed: package_count as u64,
+            ceiling,
+        };
+        return Err(io::Error::other(format!(
+            "Implausible package count: {:?}",
+            reason
+        )));
+    }
 
     // Parse tile counts
     let total_tiles: usize = next_line()?
@@ -244,12 +274,7 @@ pub fn save_cache(index: &SceneryIndex, packages: &[(String, PathBuf)]) -> io::R
     let path = cache_path();
     let package_infos = gather_package_info(packages)?;
 
-    // Ensure parent directory exists. `write_atomic` writes a sibling temp
-    // file and does not create directories itself.
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
+    // `write_atomic` creates the parent directory itself.
     crate::cache::integrity::write_atomic(&path, |writer| {
         // Header section
         writeln!(writer, "{}", CACHE_HEADER)?;
@@ -437,11 +462,16 @@ fn load_cache_from(path: &std::path::Path, packages: &[(String, PathBuf)]) -> Ca
         }
     };
 
-    if total_tiles as u64 > ceiling {
+    let max_tiles = ceiling / MIN_TILE_LINE_BYTES;
+    if total_tiles as u64 > max_tiles {
+        let reason = crate::cache::integrity::IntegrityError::ImplausibleLength {
+            claimed: total_tiles as u64,
+            ceiling: max_tiles,
+        };
         return CacheLoadResult::Invalid {
             error: format!(
-                "Implausible tile count {} for a {}-byte cache",
-                total_tiles, ceiling
+                "Implausible tile count for a {}-byte cache: {:?}",
+                ceiling, reason
             ),
         };
     }
@@ -786,6 +816,26 @@ mod tests {
             load_cache_from(&cache_file, &[]),
             CacheLoadResult::Invalid { .. }
         ));
+    }
+
+    #[test]
+    fn test_cache_status_implausible_package_count_is_error_not_fatal() {
+        let temp = TempDir::new().unwrap();
+        let cache_file = temp.path().join("scenery_index.cache");
+
+        // A structurally valid header whose package count cannot fit in the
+        // file — the same defect #253 fixed for `load_cache_from`'s tile
+        // count, reachable here via `xearthlayer scenery-index status`.
+        let mut file = std::fs::File::create(&cache_file).unwrap();
+        writeln!(file, "{}", CACHE_HEADER).unwrap();
+        writeln!(file, "{}", CACHE_VERSION).unwrap();
+        writeln!(file, "999999999999999999").unwrap(); // package count
+        writeln!(file, "0").unwrap(); // total_tiles
+        writeln!(file, "0").unwrap(); // sea_tiles
+        drop(file);
+
+        // Must be an `Err`, not a process abort from `Vec::with_capacity`.
+        assert!(cache_status_from(&cache_file).is_err());
     }
 
     #[test]

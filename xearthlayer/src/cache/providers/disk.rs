@@ -36,7 +36,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::cache::config::DiskProviderConfig;
-use crate::cache::integrity::{dds_tile_validator, raw_chunk_validator, CacheEntryValidator};
+use crate::cache::integrity::{
+    dds_tile_validator, discard, raw_chunk_validator, CacheEntryValidator,
+};
 use crate::cache::lru_index::LruIndex;
 use crate::cache::traits::{BoxFuture, Cache, GcResult, ServiceCacheError};
 use crate::cache::DiskTier;
@@ -350,8 +352,14 @@ impl Cache for DiskCacheProvider {
                         // it in place would reject it again on every read,
                         // which is how one corrupt tile became permanently
                         // magenta (#253).
-                        crate::cache::integrity::discard(&path, &reason);
+                        discard(&path, &reason, self.validator.name());
                         self.lru_index.remove(&key_owned);
+                        // The gauge otherwise self-corrects only on the next
+                        // `set()` for this key, which never arrives for a
+                        // tile that regenerates incomplete (#180) — leaving
+                        // it stale-high until an unrelated write happens to
+                        // touch it.
+                        self.report_size_to_metrics();
                         return Ok(None);
                     }
 

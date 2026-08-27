@@ -35,10 +35,7 @@ corruption must never cost more than a slower rebuild from the real sources
 
 1. **A read has two outcomes: a trusted value, or a miss.** Malformed input
    is a miss — never an error, never an abort, never degraded output served
-   in place of regenerating. There is deliberately no error variant in
-   [`CacheLoad<T>`](#cacheloadt-and-cacheentryvalidator): anything a caller
-   would once have handled as an `Err` is now a `Rejected` that resolves to a
-   miss once the bad entry is discarded.
+   in place of regenerating.
 2. **Every length taken from file content is bounded by evidence from that
    file.** A file's own size is the natural ceiling: nothing legitimate can
    require reading, or allocating for, more bytes than the file holds. See
@@ -50,11 +47,15 @@ corruption must never cost more than a slower rebuild from the real sources
    → rename, with the temp file removed on any failure path. See
    [`write_atomic`](#io-length_ceiling-write_atomic-discard).
 
-These are stated as absolutes because the module enforces them structurally,
-not by convention: invariant 1 is why `CacheLoad` has no `Err(_)` arm at all,
-and invariant 3 is why `or_discard` — the *only* sanctioned way to turn a
-`CacheLoad` into an `Option` — deletes the file itself before it hands back
-`None`.
+Each cache satisfies invariant 3 its own way — there is no single shared type
+that forces it. The disk tiers (`cache/providers/disk.rs`) call
+[`discard`](#io-length_ceiling-write_atomic-discard) explicitly the moment
+[`CacheEntryValidator::validate`](#cacheentryvalidator) rejects an entry. The
+index caches (`ortho_union/cache.rs`, `prefetch/scenery_cache.rs`) have no
+separate validation step to reject from — a bad file there is retired by
+being unconditionally overwritten via `write_atomic` the next time the
+in-memory index rebuilds and saves. Both routes delete-or-overwrite the bad
+file; neither leaves it in place to be rejected again on the next read.
 
 ## Module API
 
@@ -62,7 +63,7 @@ and invariant 3 is why `or_discard` — the *only* sanctioned way to turn a
 
 ```
 cache/integrity/
-├── mod.rs        # IntegrityError, CacheLoad<T>, CacheEntryValidator trait
+├── mod.rs        # IntegrityError, CacheEntryValidator trait
 ├── io.rs         # length_ceiling, write_atomic, discard
 └── validators.rs # MagicAndSize, dds_tile_validator, raw_chunk_validator
 ```
@@ -78,35 +79,26 @@ pub enum IntegrityError {
     BadMagic { expected: &'static [u8] },
     WrongSize { actual: usize, expected: usize },
     ImplausibleLength { claimed: u64, ceiling: u64 },
-    Malformed(String),
 }
 ```
 
 Carried for logs; callers branch on the variant, never on the rendered text.
+`ImplausibleLength` is constructed at both `Vec::with_capacity` bound sites in
+`prefetch/scenery_cache.rs` (`total_tiles` and `package_count`) — the two
+places a garbage count from file content would otherwise reach an allocator.
 
-### `CacheLoad<T>` and `CacheEntryValidator`
+### `CacheEntryValidator`
 
 ```rust
-pub enum CacheLoad<T> {
-    Hit(T),
-    Miss,
-    Rejected(IntegrityError),
-}
-
-impl<T> CacheLoad<T> {
-    pub fn or_discard(self, path: &Path) -> Option<T> { ... }
-}
-
 pub trait CacheEntryValidator: Send + Sync {
     fn name(&self) -> &'static str;
     fn validate(&self, bytes: &[u8]) -> Result<(), IntegrityError>;
 }
 ```
 
-`or_discard` is the collapse point: `Hit` becomes `Some`, `Miss` becomes
-`None`, and `Rejected` calls `discard()` (deleting the file and logging why)
-before also becoming `None`. A caller cannot forget invariant 3 because there
-is no other way to get the `Option` out.
+`name()` identifies which validator rejected an entry; `disk.rs::get()` passes
+it through to `discard()` so the resulting `warn` log line says which check
+failed, not just what the failure was.
 
 ### Validators (`validators.rs`)
 
@@ -135,20 +127,28 @@ bytes for a 4096×4096 BC1 tile with a full 13-level chain.
 pub fn length_ceiling(file: &File) -> io::Result<u64>
 pub fn write_atomic<F>(path: &Path, write: F) -> io::Result<()>
     where F: FnOnce(&mut BufWriter<File>) -> io::Result<()>
-pub fn discard(path: &Path, reason: &IntegrityError)
+pub fn discard(path: &Path, reason: &IntegrityError, validator: &str)
 ```
 
 - `length_ceiling` is invariant 2 in one call: the file's own size, nothing
   more.
-- `write_atomic` writes to a sibling `.tmp` path, flushes, calls
-  `sync_all()`, then renames over the live path; the temp file is removed on
-  any failure in that sequence. It does **not** create parent directories —
-  callers that need that guarantee keep their own `create_dir_all` before
-  calling it.
-- `discard` logs a `warn` with the path and `IntegrityError`, then removes
-  the file; a failure to delete (other than `NotFound`) is itself logged, not
-  propagated — deletion is a best-effort cleanup on a path that has already
-  decided to treat the entry as gone.
+- `write_atomic` creates the destination's parent directory (`create_dir_all`)
+  if it doesn't already exist, then writes to a sibling `.tmp` path, flushes,
+  calls `sync_all()`, and renames over the live path; the temp file is
+  removed on any failure in that sequence. Owning the directory creation here
+  is load-bearing, not a convenience: the only thing that reliably creates
+  `~/.xearthlayer` is `logging.rs`, keyed off the user-settable `logging.file`
+  config value, so a caller that assumed the directory already existed could
+  fail `ENOENT` on a fresh install with a non-default log path. It does
+  **not** `fsync` the parent directory after the rename — that's defensible
+  because the worst crash outcome without it is that the rename itself is
+  lost and the old file survives untouched at the live path, which is
+  invariant 4's "it never happened" branch, not a torn write.
+- `discard` logs a `warn` with the path, `IntegrityError`, and the name of
+  the validator that rejected the entry, then removes the file; a failure to
+  delete (other than `NotFound`) is itself logged, not propagated —
+  deletion is a best-effort cleanup on a path that has already decided to
+  treat the entry as gone.
 
 ## How Each Cache Adopts the Model
 
@@ -185,50 +185,59 @@ from sources on a cache miss and then unconditionally calls
 bad file is retired by being overwritten on the very next successful build,
 not by an explicit delete.
 
-This cache does not use `CacheEntryValidator` / `CacheLoad<T>` — the payload
-is a single bincode-typed struct, and bincode's own deserialization failure
-already distinguishes malformed from well-formed. There is no separate
-"plausible bytes but wrong shape" case for a validator to add value against.
+This cache does not use `CacheEntryValidator` — the payload is a single
+bincode-typed struct, and bincode's own deserialization failure already
+distinguishes malformed from well-formed. There is no separate "plausible
+bytes but wrong shape" case for a validator to add value against.
 
 ### `prefetch/scenery_cache.rs` (`load_cache` / `save_cache`)
 
-The line-based text cache reads a `total_tiles` count from its header before
-allocating `Vec::with_capacity(total_tiles)` for the tile list. That count is
-now bounded by `length_ceiling`:
+The line-based text cache reads a `total_tiles` count and a `package_count`
+from its header before allocating `Vec::with_capacity` for each. Both are
+now bounded, each turned into an `IntegrityError::ImplausibleLength` and an
+`Invalid`/`Err` verdict when they exceed the ceiling:
 
 ```rust
-if total_tiles as u64 > ceiling {
-    return CacheLoadResult::Invalid { error: ... };
+let max_tiles = ceiling / MIN_TILE_LINE_BYTES;
+if total_tiles as u64 > max_tiles {
+    let reason = IntegrityError::ImplausibleLength { claimed: total_tiles as u64, ceiling: max_tiles };
+    return CacheLoadResult::Invalid { error: format!("...{:?}", reason) };
 }
 ```
 
-— a cache cannot hold more tiles than it has bytes, since every tile occupies
-at least one line, so this rejects an implausible count with no risk to a
-genuinely large valid cache.
+— `total_tiles` is divided by `MIN_TILE_LINE_BYTES` (not compared to the raw
+byte ceiling directly) because it sizes a `Vec<SceneryTile>`, not a byte
+buffer: an element-for-element `SceneryTile` costs far more than one file
+byte, so a raw-byte ceiling still let a corrupt count over-reserve by roughly
+`size_of::<SceneryTile>()` per byte of file. `package_count` guards the same
+allocation in `cache_status()` — a second, independent read path added after
+the original tile-count fix, since a CLI status query never goes through
+`load_cache`'s package-count-vs-current-packages cross-check.
 
 `load_cache` is now a thin wrapper over `load_cache_from(path, packages)`,
-split out so tests can point at a temporary file instead of the live
+and `cache_status` over `cache_status_from(path)`, both split out so tests
+can point at a temporary file instead of the live
 `~/.xearthlayer/scenery_index.cache` (potentially ~180 MB) without ever
-reading or mutating it. `save_cache` keeps its own `create_dir_all` (since
-`write_atomic` doesn't create parent directories) and then delegates the
-actual write to `write_atomic`.
+reading or mutating it. `save_cache` delegates its write entirely to
+`write_atomic`, which creates the parent directory itself.
 
-This cache predates the `CacheLoad<T>` type and keeps its own four-variant
-`CacheLoadResult` (`Loaded` / `Stale` / `NotFound` / `Invalid`) rather than
-being rewritten onto it — see [non-decisions](#deliberate-non-decisions)
-below for why `Stale` and `Invalid` are kept distinct. As with the ortho
-union index, the caller (`service/orchestrator/core.rs`) rebuilds from
-sources on `Stale`, `NotFound`, *or* `Invalid` and then unconditionally calls
-`save_cache`, so an invalid file on disk is retired by overwrite on the next
-successful build rather than by explicit deletion.
+This cache keeps its own four-variant `CacheLoadResult` (`Loaded` / `Stale` /
+`NotFound` / `Invalid`) rather than adopting `CacheEntryValidator` — see
+[non-decisions](#deliberate-non-decisions) below for why `Stale` and
+`Invalid` are kept distinct. As with the ortho union index, the caller
+(`service/orchestrator/core.rs`) rebuilds from sources on `Stale`,
+`NotFound`, *or* `Invalid` and then calls `save_cache` **only when
+`total_tiles > 0`** — so an invalid cache whose rebuild happens to find zero
+tiles is never overwritten (or deleted), unlike the ortho union index, which
+saves unconditionally. See [Known Limitations](#known-limitations).
 
 ### `cache/providers/disk.rs` (`DiskCacheProvider`)
 
-This is the one caller that uses the full `CacheEntryValidator` /
-`CacheLoad`-style rejection path (though `get()` inlines the collapse rather
-than constructing a `CacheLoad` value, since it also needs to touch the LRU
-index on the way through). `validator_for_tier` is the single point mapping
-a `DiskTier` to a validator:
+This is the one caller that uses `CacheEntryValidator` for the reject path.
+`get()` calls `validate()` directly and inlines the collapse to `None` itself
+— there is no separate wrapper type — since it also needs to touch the LRU
+index and the size metric on the way through. `validator_for_tier` is the
+single point mapping a `DiskTier` to a validator:
 
 ```rust
 fn validator_for_tier(tier: DiskTier) -> Arc<dyn CacheEntryValidator> {
@@ -245,15 +254,22 @@ DDS tile tier and the raw chunk tier. In `get()`:
 
 ```rust
 if let Err(reason) = self.validator.validate(&data) {
-    crate::cache::integrity::discard(&path, &reason);
+    discard(&path, &reason, self.validator.name());
     self.lru_index.remove(&key_owned);
+    self.report_size_to_metrics();
     return Ok(None);
 }
 ```
 
 a rejected entry is deleted from disk *and* removed from the in-memory LRU
 index in the same branch — the index would otherwise keep pointing at a file
-that no longer exists. A non-`NotFound` I/O error on the read (e.g. a
+that no longer exists. It also reports the (now smaller) cache size to
+metrics immediately, the same as the `set()` and `delete()` paths do; without
+that call the size gauge only self-corrects on the *next* `set()` for that
+key, which never arrives for a tile that regenerates incomplete (#180), so it
+could otherwise hold stale-high indefinitely. `discard()` is passed
+`self.validator.name()` so its `warn` log records which validator rejected
+the entry, not just why. A non-`NotFound` I/O error on the read (e.g. a
 transient disk error) now also degrades to a logged miss rather than
 propagating as `Err` to the caller: the tile regenerates from the next tier
 up instead of failing the request outright.
@@ -307,9 +323,16 @@ identical forever, and so logs say which one actually happened.
   that's checked, a BC3 deployment could see every DDS disk entry rejected
   by `WrongSize`, degrading (safely, but silently) to full re-encoding on
   every read.
-- **`write_atomic` does not create parent directories.** Callers that need
-  the directory to exist keep their own `create_dir_all` before calling it
-  (`prefetch/scenery_cache.rs::save_cache` is the current example).
+- **A scenery cache rebuild that finds zero tiles is neither overwritten nor
+  deleted.** `service/orchestrator/core.rs` only calls `save_cache` when
+  `total_tiles > 0`, so a corrupt-on-disk scenery cache whose rebuild
+  legitimately yields zero tiles (e.g. no packages currently indexed) is left
+  exactly as it was — invariant 3 is not met on this one path. The failed
+  load re-warns on every subsequent startup until either a rebuild finds at
+  least one tile or the file is removed by hand. This is a pre-existing gap,
+  not something this change introduced; fixing it is out of scope here (it
+  would change `service/orchestrator/core.rs` behaviour, which this pass
+  deliberately does not touch).
 - **fsync ordering is not unit-testable** without a fault-injecting
   filesystem — there's no way to assert from a test that the `fsync` happens
   before the `rename` short of intercepting syscalls. It is addressed by
@@ -325,7 +348,7 @@ identical forever, and so logs say which one actually happened.
 
 | File | Purpose |
 |------|---------|
-| `xearthlayer/src/cache/integrity/mod.rs` | `IntegrityError`, `CacheLoad<T>`, `CacheEntryValidator` |
+| `xearthlayer/src/cache/integrity/mod.rs` | `IntegrityError`, `CacheEntryValidator` |
 | `xearthlayer/src/cache/integrity/io.rs` | `length_ceiling`, `write_atomic`, `discard` |
 | `xearthlayer/src/cache/integrity/validators.rs` | `MagicAndSize`, `dds_tile_validator`, `raw_chunk_validator`, `EXPECTED_DDS_SIZE` |
 | `xearthlayer/src/ortho_union/cache.rs` | `IndexCache` — bounded bincode load, `write_atomic` save |
