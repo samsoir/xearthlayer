@@ -153,41 +153,20 @@ pub fn init_placeholder_cache() -> Result<(), DdsError> {
     Ok(())
 }
 
-/// Total byte size of a BC1 DDS with a full mipmap chain, header included.
-///
-/// Walks the chain the same way the encoder does — halving until a dimension
-/// reaches 1, and sizing every level as `blocks_wide * blocks_high * 8`. The
-/// `div_ceil` matters for the tail: 4×4, 2×2 and 1×1 each still occupy one
-/// whole 8-byte block, which the naive `w * h / 2` under-counts.
-const fn full_chain_bc1_dds_size(width: u32, height: u32) -> usize {
-    const HEADER_BYTES: usize = 128;
-    const BLOCK_BYTES: usize = 8;
-
-    let mut total = HEADER_BYTES;
-    let mut w = width;
-    let mut h = height;
-
-    loop {
-        let blocks_wide = w.div_ceil(4) as usize;
-        let blocks_high = h.div_ceil(4) as usize;
-        total += blocks_wide * blocks_high * BLOCK_BYTES;
-
-        if w <= 1 || h <= 1 {
-            return total;
-        }
-
-        w /= 2;
-        h /= 2;
-    }
-}
-
 /// Expected DDS size for a 4096×4096 BC1 tile with a full mipmap chain.
 ///
 /// This is the standard size for X-Plane ortho tiles: 13 levels, 11,184,952
 /// bytes. `validate_dds_or_placeholder` gates every FUSE read against it, so
 /// it must track what the encoder actually emits — a regression test asserts
 /// both agree.
-pub const EXPECTED_DDS_SIZE: usize = full_chain_bc1_dds_size(4096, 4096);
+///
+/// The computation lives in `cache::integrity` (the canonical cache
+/// integrity model shared by all cache tiers) so that DDS disk cache
+/// validation and this FUSE-boundary check can never drift apart. This
+/// re-export exists so existing callers of `fuse::EXPECTED_DDS_SIZE` keep
+/// working. The dependency direction is `fuse -> cache::integrity`, never
+/// the reverse: `cache::integrity` must not import anything from `fuse`.
+pub use crate::cache::integrity::EXPECTED_DDS_SIZE;
 
 /// Validates that DDS data is well-formed and returns it, or substitutes
 /// the default placeholder if validation fails.
