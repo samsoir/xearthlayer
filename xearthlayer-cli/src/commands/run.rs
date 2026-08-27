@@ -189,6 +189,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         .cache_directory(config.cache.directory.clone())
         .cache_memory_size(config.cache.memory_size)
         .cache_disk_size(config.cache.disk_size)
+        .cache_dds_disk_ratio(config.cache.dds_disk_ratio)
         .generation_threads(config.generation.threads)
         .generation_timeout(config.generation.timeout)
         .pipeline(pipeline_settings)

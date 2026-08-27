@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::config::defaults::{DEFAULT_FUSE_CONGESTION_THRESHOLD, DEFAULT_FUSE_MAX_BACKGROUND};
+use crate::config::defaults::{
+    DEFAULT_FUSE_CONGESTION_THRESHOLD, DEFAULT_FUSE_MAX_BACKGROUND, DEFAULT_GENERATION_TIMEOUT_SECS,
+};
 use crate::fuse::fuse3::Fuse3OrthoUnionFS;
 use crate::fuse::SpawnedMountHandle;
 use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage};
@@ -160,6 +162,8 @@ pub struct MountManager {
     fuse_max_background: u16,
     /// Congestion threshold for background FUSE requests (kernel limit).
     fuse_congestion_threshold: u16,
+    /// Upper bound in seconds for a single DDS generation behind a FUSE read.
+    generation_timeout_secs: u64,
 }
 
 impl MountManager {
@@ -182,6 +186,7 @@ impl MountManager {
             geo_index: None,
             fuse_max_background: DEFAULT_FUSE_MAX_BACKGROUND,
             fuse_congestion_threshold: DEFAULT_FUSE_CONGESTION_THRESHOLD,
+            generation_timeout_secs: DEFAULT_GENERATION_TIMEOUT_SECS,
         }
     }
 
@@ -203,6 +208,14 @@ impl MountManager {
     pub fn set_fuse_limits(&mut self, max_background: u16, congestion_threshold: u16) {
         self.fuse_max_background = max_background;
         self.fuse_congestion_threshold = congestion_threshold;
+    }
+
+    /// Set the upper bound for a single DDS generation behind a FUSE read.
+    ///
+    /// This is the only limit on how long a FUSE `read()` on a virtual DDS tile
+    /// can block; on expiry a placeholder texture is returned.
+    pub fn set_generation_timeout(&mut self, timeout_secs: u64) {
+        self.generation_timeout_secs = timeout_secs;
     }
 
     /// Get the number of active mounts.
@@ -486,7 +499,8 @@ impl MountManager {
                 .with_geo_index(Arc::clone(&geo_index))
                 .with_state_observer(state_observer)
                 .with_scene_tracker_channel(scene_tracker_tx)
-                .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold);
+                .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold)
+                .with_timeout(Duration::from_secs(self.generation_timeout_secs));
 
         // Wire metrics client for coalesced request tracking
         if let Some(metrics) = metrics_client {

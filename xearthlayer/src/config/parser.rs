@@ -547,6 +547,17 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
             // Clamp to valid range (same as HTTP concurrent)
             config.executor.network_concurrent = clamp_http_concurrent(parsed);
         }
+        // Moved from the deprecated [control_plane] section in #160. Parsed after
+        // [control_plane] above, so the [executor] value wins when both are present.
+        if let Some(v) = section.get("max_concurrent_jobs") {
+            config.control_plane.max_concurrent_jobs =
+                v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                    section: "executor".to_string(),
+                    key: "max_concurrent_jobs".to_string(),
+                    value: v.to_string(),
+                    reason: "must be a positive integer".to_string(),
+                })?;
+        }
         if let Some(v) = section.get("cpu_concurrent") {
             config.executor.cpu_concurrent =
                 v.parse().map_err(|_| ConfigFileError::InvalidValue {
@@ -667,6 +678,95 @@ mod tests {
     use crate::config::defaults::*;
     use crate::config::settings::ConfigFile;
     use tempfile::TempDir;
+
+    /// Regression: `max_concurrent_jobs` moved from the deprecated [control_plane]
+    /// section to [executor] in #160, but the parser was not updated — a config
+    /// written by XEarthLayer itself could not be read back.
+    #[test]
+    fn test_max_concurrent_jobs_survives_write_read_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+
+        let mut config = ConfigFile::default();
+        let non_default = default_max_concurrent_jobs() + 3;
+        config.control_plane.max_concurrent_jobs = non_default;
+        config.save_to(&config_path).unwrap();
+
+        let loaded = ConfigFile::load_from(&config_path).unwrap();
+        assert_eq!(loaded.control_plane.max_concurrent_jobs, non_default);
+    }
+
+    #[test]
+    fn test_max_concurrent_jobs_read_from_executor_section() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+
+        std::fs::write(
+            &config_path,
+            r#"
+[executor]
+max_concurrent_jobs = 12
+"#,
+        )
+        .unwrap();
+
+        let config = ConfigFile::load_from(&config_path).unwrap();
+        assert_eq!(config.control_plane.max_concurrent_jobs, 12);
+    }
+
+    /// The [executor] value wins over the deprecated [control_plane] one.
+    #[test]
+    fn test_executor_max_concurrent_jobs_overrides_control_plane() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+
+        std::fs::write(
+            &config_path,
+            r#"
+[control_plane]
+max_concurrent_jobs = 4
+
+[executor]
+max_concurrent_jobs = 12
+"#,
+        )
+        .unwrap();
+
+        let config = ConfigFile::load_from(&config_path).unwrap();
+        assert_eq!(config.control_plane.max_concurrent_jobs, 12);
+    }
+
+    /// Guards the whole writer/parser pair: every value below is non-default and
+    /// must survive a save/load cycle. Catches settings the writer emits into a
+    /// section the parser does not read.
+    #[test]
+    fn test_non_default_values_survive_write_read_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+
+        let mut config = ConfigFile::default();
+        config.cache.dds_disk_ratio = 0.75;
+        config.generation.timeout = 42;
+        config.executor.cpu_concurrent = 7;
+        config.executor.disk_io_concurrent = 33;
+        config.control_plane.max_concurrent_jobs = 11;
+        config.fuse.max_background = 512;
+        config.fuse.congestion_threshold = 384;
+        config.prefetch.cycle_interval_ms = 3000;
+        config.packages.concurrent_downloads = 9;
+        config.save_to(&config_path).unwrap();
+
+        let loaded = ConfigFile::load_from(&config_path).unwrap();
+        assert_eq!(loaded.cache.dds_disk_ratio, 0.75);
+        assert_eq!(loaded.generation.timeout, 42);
+        assert_eq!(loaded.executor.cpu_concurrent, 7);
+        assert_eq!(loaded.executor.disk_io_concurrent, 33);
+        assert_eq!(loaded.control_plane.max_concurrent_jobs, 11);
+        assert_eq!(loaded.fuse.max_background, 512);
+        assert_eq!(loaded.fuse.congestion_threshold, 384);
+        assert_eq!(loaded.prefetch.cycle_interval_ms, 3000);
+        assert_eq!(loaded.packages.concurrent_downloads, 9);
+    }
 
     #[test]
     fn test_invalid_provider_type() {
