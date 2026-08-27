@@ -42,6 +42,7 @@
 // New cache service architecture (Phase 1)
 mod config;
 pub mod gc_scheduler;
+pub mod integrity;
 pub mod lru_index;
 pub mod migrate;
 pub mod providers;
