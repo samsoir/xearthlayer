@@ -115,6 +115,9 @@ impl ServiceOrchestrator {
         // Create mount manager with Custom Scenery path and FUSE kernel limits
         let mut mount_manager = MountManager::with_scenery_path(&config.custom_scenery_path);
         mount_manager.set_fuse_limits(config.fuse.max_background, config.fuse.congestion_threshold);
+        if let Some(timeout_secs) = config.service.generation_timeout() {
+            mount_manager.set_generation_timeout(timeout_secs);
+        }
 
         // Wire FUSE analyzer callback for position inference
         if let Some(ref analyzer) = fuse_analyzer {
