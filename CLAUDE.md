@@ -405,7 +405,7 @@ Key sections:
 - `[texture]` - DDS format (bc1/bc3), compressor backend (software/ispc/gpu), GPU device selection
 - `[prefetch]` - Boundary-driven prefetch, web_api_port (default 8086), calibration, transition ramp
 - `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
-- `[executor]` - Resource pool capacities (network, CPU, disk I/O), job limits, retry behavior
+- `[executor]` - Job limits and retry behavior. Resource pool capacities are NOT configurable — they are derived from logical core count by `ResourcePoolConfig::default()` (see #249)
 - `[fuse]` - FUSE kernel limits (max_background, congestion_threshold)
 - `[packages]` - Package manager settings (concurrent_downloads: parallel part downloads 1-10)
 

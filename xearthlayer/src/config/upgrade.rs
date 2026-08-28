@@ -140,6 +140,14 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "control_plane.stall_threshold_secs",
     "control_plane.health_check_interval_secs",
     "control_plane.semaphore_timeout_secs",
+    // Removed in #249 — resource pool sizing is derived from the tuned policy in
+    // ResourcePoolConfig::default() and is not user-overridable. The values these
+    // keys carried never reached the executor, so no value on disk represents a
+    // considered choice; config list even reported a cpu_concurrent computed by a
+    // second, contradictory formula that nothing consumed.
+    "executor.network_concurrent",
+    "executor.cpu_concurrent",
+    "executor.disk_io_concurrent",
     // Removed in #160 — internal executor implementation details not useful as config
     "executor.max_concurrent_tasks",
     "executor.job_channel_capacity",
@@ -614,6 +622,55 @@ type = bing
         let summary = analysis.summary();
         assert!(summary.contains("2 new setting(s)"));
         assert!(summary.contains("1 deprecated setting(s)"));
+    }
+
+    #[test]
+    fn test_deprecated_executor_pool_keys() {
+        // Removed in #249: pool sizing is derived from the tuned policy in
+        // ResourcePoolConfig::default() and is no longer user-overridable.
+        assert!(DEPRECATED_KEYS.contains(&"executor.network_concurrent"));
+        assert!(DEPRECATED_KEYS.contains(&"executor.cpu_concurrent"));
+        assert!(DEPRECATED_KEYS.contains(&"executor.disk_io_concurrent"));
+    }
+
+    #[test]
+    fn test_analyze_flags_executor_pool_keys_as_deprecated() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+
+        std::fs::write(
+            &config_path,
+            r#"
+[executor]
+network_concurrent = 256
+cpu_concurrent = 16
+disk_io_concurrent = 64
+"#,
+        )
+        .unwrap();
+
+        let analysis = analyze_config(&config_path).unwrap();
+
+        for key in [
+            "executor.network_concurrent",
+            "executor.cpu_concurrent",
+            "executor.disk_io_concurrent",
+        ] {
+            assert!(
+                analysis.deprecated_keys.contains(&key.to_string()),
+                "{key} should be reported as deprecated, not silently kept"
+            );
+            assert!(
+                !analysis.unknown_keys.contains(&key.to_string()),
+                "{key} is a known removal, not an unrecognised key"
+            );
+            assert!(
+                !analysis.missing_keys.contains(&key.to_string()),
+                "{key} must not also be reported as missing - that is the \
+                 self-contradiction that made needs_upgrade permanently true \
+                 during the disk_io_profile removal"
+            );
+        }
     }
 
     #[test]

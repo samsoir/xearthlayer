@@ -114,13 +114,6 @@ timeout = {}
 ; Job executor daemon settings for tile generation.
 ; These control resource pools, concurrency, and retry behavior.
 
-; Resource pool capacities (concurrent operations by type)
-; Network: HTTP connections for chunk downloads (default: 128, clamped to 64-256)
-network_concurrent = {}
-; CPU: Assemble + encode operations (default: num_cpus / 2)
-cpu_concurrent = {}
-; Disk I/O: Cache read/write operations (default: 64 for SSD)
-disk_io_concurrent = {}
 ; Maximum concurrent DDS tile jobs (default: num_cpus / 2)
 max_concurrent_jobs = {}
 
@@ -272,9 +265,6 @@ congestion_threshold = {}
         config.generation.threads,
         config.generation.timeout,
         // Executor settings
-        config.executor.network_concurrent,
-        config.executor.cpu_concurrent,
-        config.executor.disk_io_concurrent,
         config.control_plane.max_concurrent_jobs,
         config.executor.request_timeout_secs,
         config.executor.max_retries,

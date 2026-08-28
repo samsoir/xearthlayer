@@ -218,14 +218,13 @@ timeout = 10
 
 ### [executor]
 
-Controls the job executor daemon's resource pools and concurrency limits. The executor is the core tile processing engine that manages parallel downloads, encoding, and caching.
+Controls the job executor daemon's job limits and download behaviour. The executor is the core tile processing engine that manages parallel downloads, encoding, and caching.
+
+**Resource pool capacities are not configurable.** Network, CPU and disk I/O pool sizes are derived from the host's logical core count by `ResourcePoolConfig::default()`, using multipliers tuned by flight testing and load-bearing for the memory behaviour fixed in [#227](https://github.com/samsoir/xearthlayer/issues/227). The `network_concurrent`, `cpu_concurrent` and `disk_io_concurrent` keys were removed in [#249](https://github.com/samsoir/xearthlayer/issues/249): they never reached the executor, so any value on disk described a capacity nothing used. `xearthlayer config upgrade` removes them.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `max_concurrent_jobs` | integer | `ceil(num_cpus × 0.75)` | Maximum concurrent DDS tile jobs (1-256). Previously in `[control_plane]`. |
-| `network_concurrent` | integer | `128` | Concurrent HTTP connections (clamped to 64-256) |
-| `cpu_concurrent` | integer | `num_cpus / 2` | Concurrent CPU-bound operations (assemble + encode) — leaves headroom for X-Plane |
-| `disk_io_concurrent` | integer | `64` | Concurrent disk I/O operations (auto-detected from storage type) |
 | `request_timeout_secs` | integer | `10` | HTTP request timeout per chunk (seconds) |
 | `max_retries` | integer | `3` | Maximum retry attempts per failed chunk |
 | `retry_base_delay_ms` | integer | `100` | Base delay for exponential backoff (ms) |
@@ -235,11 +234,6 @@ Controls the job executor daemon's resource pools and concurrency limits. The ex
 [executor]
 ; Job concurrency (defaults are tuned for most systems)
 ; max_concurrent_jobs = 12       ; Max concurrent tile jobs (ceil(num_cpus * 0.75))
-
-; Resource pool sizing
-network_concurrent = 128         ; HTTP connections (64-256 range)
-cpu_concurrent = 8               ; CPU-bound ops (defaults to num_cpus / 2)
-disk_io_concurrent = 64          ; Disk I/O (auto-detected from storage type)
 
 ; Download behavior
 request_timeout_secs = 10        ; Per-chunk timeout

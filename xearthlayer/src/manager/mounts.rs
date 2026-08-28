@@ -431,10 +431,12 @@ impl MountManager {
         // I/O, and at 512 threads it ratchets glibc's arena high-water mark on
         // every excursion. See runtime::build_service_runtime and issue #227.
         //
-        // `ResourcePoolConfig::default()` is what the executor receives here,
-        // via `RuntimeConfig::default()` in `service::RuntimeBuilder`. If that
-        // path ever takes user `[executor]` settings, this must take the same
-        // config or the cap goes stale.
+        // `ResourcePoolConfig::default()` is the only source of pool sizing,
+        // here and in `RuntimeConfig::default()` for the executor, so the cap
+        // and the pools it bounds cannot diverge. The `[executor]` sizing keys
+        // that could once have forked this were removed in #249 precisely
+        // because they reached neither path — a config carrying them silently
+        // described capacities nothing used.
         let runtime = match crate::runtime::build_service_runtime(
             &crate::executor::ResourcePoolConfig::default(),
         ) {

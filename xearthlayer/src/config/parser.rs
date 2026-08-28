@@ -537,16 +537,6 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
 
     // [executor] section
     if let Some(section) = ini.section(Some("executor")) {
-        if let Some(v) = section.get("network_concurrent") {
-            let parsed: usize = v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                section: "executor".to_string(),
-                key: "network_concurrent".to_string(),
-                value: v.to_string(),
-                reason: "must be a positive integer".to_string(),
-            })?;
-            // Clamp to valid range (same as HTTP concurrent)
-            config.executor.network_concurrent = clamp_http_concurrent(parsed);
-        }
         // Moved from the deprecated [control_plane] section in #160. Parsed after
         // [control_plane] above, so the [executor] value wins when both are present.
         if let Some(v) = section.get("max_concurrent_jobs") {
@@ -554,24 +544,6 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
                 v.parse().map_err(|_| ConfigFileError::InvalidValue {
                     section: "executor".to_string(),
                     key: "max_concurrent_jobs".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("cpu_concurrent") {
-            config.executor.cpu_concurrent =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "executor".to_string(),
-                    key: "cpu_concurrent".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("disk_io_concurrent") {
-            config.executor.disk_io_concurrent =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "executor".to_string(),
-                    key: "disk_io_concurrent".to_string(),
                     value: v.to_string(),
                     reason: "must be a positive integer".to_string(),
                 })?;
@@ -747,8 +719,6 @@ max_concurrent_jobs = 12
         let mut config = ConfigFile::default();
         config.cache.dds_disk_ratio = 0.75;
         config.generation.timeout = 42;
-        config.executor.cpu_concurrent = 7;
-        config.executor.disk_io_concurrent = 33;
         config.control_plane.max_concurrent_jobs = 11;
         config.fuse.max_background = 512;
         config.fuse.congestion_threshold = 384;
@@ -759,8 +729,6 @@ max_concurrent_jobs = 12
         let loaded = ConfigFile::load_from(&config_path).unwrap();
         assert_eq!(loaded.cache.dds_disk_ratio, 0.75);
         assert_eq!(loaded.generation.timeout, 42);
-        assert_eq!(loaded.executor.cpu_concurrent, 7);
-        assert_eq!(loaded.executor.disk_io_concurrent, 33);
         assert_eq!(loaded.control_plane.max_concurrent_jobs, 11);
         assert_eq!(loaded.fuse.max_background, 512);
         assert_eq!(loaded.fuse.congestion_threshold, 384);
@@ -1035,6 +1003,34 @@ temp_dir = /tmp/xearthlayer
         assert_eq!(
             config.packages.temp_dir,
             Some(PathBuf::from("/tmp/xearthlayer"))
+        );
+    }
+
+    #[test]
+    fn config_with_removed_executor_pool_keys_still_loads() {
+        // Every user upgrading to this release has these three keys on disk.
+        // They must be ignored, never rejected -- a hard error here would stop
+        // XEarthLayer starting for the entire existing install base.
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+
+        std::fs::write(
+            &config_path,
+            r#"
+[executor]
+network_concurrent = 256
+cpu_concurrent = 16
+disk_io_concurrent = 64
+max_retries = 5
+"#,
+        )
+        .unwrap();
+
+        let config = ConfigFile::load_from(&config_path)
+            .expect("a config carrying the removed keys must still load");
+        assert_eq!(
+            config.executor.max_retries, 5,
+            "surrounding keys still parse"
         );
     }
 }
