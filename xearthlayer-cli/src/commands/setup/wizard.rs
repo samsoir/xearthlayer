@@ -39,7 +39,6 @@ pub struct SetupConfig {
     pub package_dir: PathBuf,
     /// Cache directory
     pub cache_dir: PathBuf,
-    /// Detected/selected storage profile
     /// Memory cache size in bytes
     pub memory_cache_size: usize,
     /// Disk cache size in bytes
@@ -90,7 +89,7 @@ pub fn run_wizard() -> Result<(), CliError> {
     print_step_header("Step 2: Package Location");
     let package_dir = step_package_location(&theme)?;
 
-    // Step 3: Cache Configuration (directory + budgets + I/O profile)
+    // Step 3: Cache Configuration (directory + budgets)
     print_step_header("Step 3: Cache Configuration");
     let cache_settings = step_cache(&theme)?;
 
@@ -329,7 +328,7 @@ struct CacheSettings {
     dds_disk_ratio: f64,
 }
 
-/// Step 3: Cache directory + disk budget + memory budget + I/O profile.
+/// Step 3: Cache directory + disk budget + memory budget.
 ///
 /// This step absorbs what used to be split between "cache location" and
 /// "system configuration" — the budgets are derived from system info, so
