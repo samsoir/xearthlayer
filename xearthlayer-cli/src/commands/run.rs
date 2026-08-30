@@ -164,10 +164,13 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     // Check if we'll use TUI (need to know before creating services)
     let use_tui = atty::is(atty::Stream::Stdout);
 
-    // Build pipeline settings from executor config (executor replaced the deprecated pipeline section)
+    // Pool sizing is no longer configurable (#249) — it is derived by
+    // ResourcePoolConfig::default(). These two fields keep their own defaults so
+    // PipelineSettings still constructs; nothing reads them today, since
+    // ServiceConfig::pipeline() has no caller.
     let pipeline_settings = PipelineSettings {
-        max_http_concurrent: config.executor.network_concurrent,
-        max_cpu_concurrent: config.executor.cpu_concurrent,
+        max_http_concurrent: xearthlayer::config::default_http_concurrent(),
+        max_cpu_concurrent: xearthlayer::config::default_cpu_concurrent(),
         max_prefetch_in_flight: config.pipeline.max_prefetch_in_flight,
         request_timeout_secs: config.executor.request_timeout_secs,
         max_retries: config.executor.max_retries,

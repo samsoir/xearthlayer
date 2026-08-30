@@ -292,15 +292,6 @@ pub struct PatchesSettings {
 /// Executor daemon configuration for the job/task framework.
 #[derive(Debug, Clone)]
 pub struct ExecutorSettings {
-    /// Network resource pool capacity (concurrent HTTP connections).
-    /// Default: 128 (clamped to 64-256 range)
-    pub network_concurrent: usize,
-    /// CPU resource pool capacity (concurrent assemble/encode operations).
-    /// Default: num_cpus * 1.25, minimum num_cpus + 2
-    pub cpu_concurrent: usize,
-    /// Disk I/O resource pool capacity (concurrent disk operations).
-    /// Default: 64 for SSD, auto-detected from storage type
-    pub disk_io_concurrent: usize,
     /// Maximum concurrent tasks the executor can run.
     /// Default: 128
     pub max_concurrent_tasks: usize,

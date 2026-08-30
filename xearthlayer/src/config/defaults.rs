@@ -59,13 +59,6 @@ pub fn default_max_concurrent_jobs() -> usize {
     (num_cpus() / 2).max(2)
 }
 
-/// Default executor CPU concurrent: num_cpus / 2, minimum 2.
-///
-/// Matches the pipeline CPU concurrent default — leaves headroom for X-Plane.
-pub fn default_executor_cpu_concurrent() -> usize {
-    (num_cpus() / 2).max(2)
-}
-
 /// Clamps HTTP concurrency to valid range and logs a warning if clamped.
 pub(super) fn clamp_http_concurrent(value: usize) -> usize {
     if value < MIN_HTTP_CONCURRENT {
@@ -292,13 +285,6 @@ pub const DEFAULT_GPU_DEVICE: &str = "integrated";
 // Executor defaults
 // =============================================================================
 
-/// Default network resource pool capacity.
-/// Conservative default of 128 prevents provider rate limiting.
-pub const DEFAULT_EXECUTOR_NETWORK_CONCURRENT: usize = 128;
-
-/// Default disk I/O resource pool capacity for SSD storage.
-pub const DEFAULT_EXECUTOR_DISK_IO_CONCURRENT: usize = 64;
-
 /// Default maximum concurrent tasks in the executor.
 pub const DEFAULT_EXECUTOR_MAX_CONCURRENT_TASKS: usize = 128;
 
@@ -416,9 +402,6 @@ impl Default for ConfigFile {
                 directory: Some(config_dir.join("patches")),
             },
             executor: ExecutorSettings {
-                network_concurrent: DEFAULT_EXECUTOR_NETWORK_CONCURRENT,
-                cpu_concurrent: default_executor_cpu_concurrent(),
-                disk_io_concurrent: DEFAULT_EXECUTOR_DISK_IO_CONCURRENT,
                 max_concurrent_tasks: DEFAULT_EXECUTOR_MAX_CONCURRENT_TASKS,
                 job_channel_capacity: DEFAULT_EXECUTOR_JOB_CHANNEL_CAPACITY,
                 request_channel_capacity: DEFAULT_EXECUTOR_REQUEST_CHANNEL_CAPACITY,

@@ -45,8 +45,6 @@ pub use file::{
     config_directory,
     config_file_path,
     default_cpu_concurrent,
-    // Executor defaults
-    default_executor_cpu_concurrent,
     default_http_concurrent,
     default_max_concurrent_jobs,
     default_prefetch_in_flight,
@@ -78,10 +76,8 @@ pub use file::{
     DEFAULT_DISK_CACHE_SIZE,
     // Download defaults
     DEFAULT_DOWNLOAD_TIMEOUT_SECS,
-    DEFAULT_EXECUTOR_DISK_IO_CONCURRENT,
     DEFAULT_EXECUTOR_JOB_CHANNEL_CAPACITY,
     DEFAULT_EXECUTOR_MAX_CONCURRENT_TASKS,
-    DEFAULT_EXECUTOR_NETWORK_CONCURRENT,
     DEFAULT_EXECUTOR_REQUEST_CHANNEL_CAPACITY,
     // Generation defaults
     DEFAULT_GENERATION_TIMEOUT_SECS,

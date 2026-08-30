@@ -108,9 +108,6 @@ pub enum ConfigKey {
     PatchesDirectory,
 
     // Executor settings
-    ExecutorNetworkConcurrent,
-    ExecutorCpuConcurrent,
-    ExecutorDiskIoConcurrent,
     ExecutorMaxConcurrentJobs,
     ExecutorRequestTimeoutSecs,
     ExecutorMaxRetries,
@@ -188,9 +185,6 @@ impl FromStr for ConfigKey {
             "patches.directory" => Ok(ConfigKey::PatchesDirectory),
 
             // Executor settings
-            "executor.network_concurrent" => Ok(ConfigKey::ExecutorNetworkConcurrent),
-            "executor.cpu_concurrent" => Ok(ConfigKey::ExecutorCpuConcurrent),
-            "executor.disk_io_concurrent" => Ok(ConfigKey::ExecutorDiskIoConcurrent),
             "executor.max_concurrent_jobs" => Ok(ConfigKey::ExecutorMaxConcurrentJobs),
             "executor.request_timeout_secs" => Ok(ConfigKey::ExecutorRequestTimeoutSecs),
             "executor.max_retries" => Ok(ConfigKey::ExecutorMaxRetries),
@@ -260,9 +254,6 @@ impl ConfigKey {
             ConfigKey::PatchesDirectory => "patches.directory",
 
             // Executor settings
-            ConfigKey::ExecutorNetworkConcurrent => "executor.network_concurrent",
-            ConfigKey::ExecutorCpuConcurrent => "executor.cpu_concurrent",
-            ConfigKey::ExecutorDiskIoConcurrent => "executor.disk_io_concurrent",
             ConfigKey::ExecutorMaxConcurrentJobs => "executor.max_concurrent_jobs",
             ConfigKey::ExecutorRequestTimeoutSecs => "executor.request_timeout_secs",
             ConfigKey::ExecutorMaxRetries => "executor.max_retries",
@@ -400,9 +391,6 @@ impl ConfigKey {
                 .unwrap_or_default(),
 
             // Executor settings
-            ConfigKey::ExecutorNetworkConcurrent => config.executor.network_concurrent.to_string(),
-            ConfigKey::ExecutorCpuConcurrent => config.executor.cpu_concurrent.to_string(),
-            ConfigKey::ExecutorDiskIoConcurrent => config.executor.disk_io_concurrent.to_string(),
             ConfigKey::ExecutorMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs.to_string()
             }
@@ -573,15 +561,6 @@ impl ConfigKey {
             }
 
             // Executor settings
-            ConfigKey::ExecutorNetworkConcurrent => {
-                config.executor.network_concurrent = value.parse().unwrap();
-            }
-            ConfigKey::ExecutorCpuConcurrent => {
-                config.executor.cpu_concurrent = value.parse().unwrap();
-            }
-            ConfigKey::ExecutorDiskIoConcurrent => {
-                config.executor.disk_io_concurrent = value.parse().unwrap();
-            }
             ConfigKey::ExecutorMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs = value.parse().unwrap();
             }
@@ -672,9 +651,6 @@ impl ConfigKey {
             ConfigKey::PatchesDirectory => Box::new(OptionalPathSpec),
 
             // Executor settings
-            ConfigKey::ExecutorNetworkConcurrent => Box::new(PositiveIntegerSpec),
-            ConfigKey::ExecutorCpuConcurrent => Box::new(PositiveIntegerSpec),
-            ConfigKey::ExecutorDiskIoConcurrent => Box::new(PositiveIntegerSpec),
             ConfigKey::ExecutorMaxConcurrentJobs => Box::new(IntegerRangeSpec::new(1, 256)),
             ConfigKey::ExecutorRequestTimeoutSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ExecutorMaxRetries => Box::new(PositiveIntegerSpec),
@@ -738,9 +714,6 @@ impl ConfigKey {
             ConfigKey::PatchesEnabled,
             ConfigKey::PatchesDirectory,
             // Executor settings
-            ConfigKey::ExecutorNetworkConcurrent,
-            ConfigKey::ExecutorCpuConcurrent,
-            ConfigKey::ExecutorDiskIoConcurrent,
             ConfigKey::ExecutorMaxConcurrentJobs,
             ConfigKey::ExecutorRequestTimeoutSecs,
             ConfigKey::ExecutorMaxRetries,
@@ -1381,5 +1354,22 @@ mod tests {
         assert!(key.validate("RTX 5090").is_ok());
         assert!(key.validate("").is_err());
         assert!(key.validate("   ").is_err());
+    }
+
+    #[test]
+    fn executor_pool_keys_are_no_longer_settable() {
+        // Removed in #249. Pool sizing is derived from the tuned policy in
+        // ResourcePoolConfig::default(); `config set` must not offer a lever
+        // that would silently undo it.
+        for key in [
+            "executor.network_concurrent",
+            "executor.cpu_concurrent",
+            "executor.disk_io_concurrent",
+        ] {
+            assert!(
+                ConfigKey::from_str(key).is_err(),
+                "{key} should no longer resolve to a ConfigKey"
+            );
+        }
     }
 }
