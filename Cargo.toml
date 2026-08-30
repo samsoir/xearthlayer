@@ -8,7 +8,7 @@ members = [
 [workspace.package]
 # Unstable dev cycle on develop/0.4.7 — pre-release per semver, sorts below 0.4.7.
 # Bumped to a dated X.Y.Z only at stable promotion. See docs/dev/app-release-runbook.md.
-version = "0.4.7-beta.2"
+version = "0.4.7-rc.1"
 edition = "2021"
 authors = ["XEarthLayer Contributors"]
 license = "MIT"
