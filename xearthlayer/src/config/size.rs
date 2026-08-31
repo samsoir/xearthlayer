@@ -29,6 +29,8 @@ impl SizeParseError {
 ///
 /// Supports:
 /// - Bare numbers (treated as bytes)
+/// - Decimal values (e.g. "2.6GB")
+/// - B suffix (bytes, e.g. "512B" — what `format_size` emits under 1 KB)
 /// - KB/K suffix (1024 bytes)
 /// - MB/M suffix (1024² bytes)
 /// - GB/G suffix (1024³ bytes)
@@ -45,6 +47,7 @@ impl SizeParseError {
 /// assert_eq!(parse_size("1 KB").unwrap(), 1024);
 /// assert_eq!(parse_size("2GB").unwrap(), 2 * 1024 * 1024 * 1024);
 /// assert_eq!(parse_size("500mb").unwrap(), 500 * 1024 * 1024);
+/// assert_eq!(parse_size("1.5GB").unwrap(), 1536 * 1024 * 1024);
 /// ```
 pub fn parse_size(s: &str) -> Result<usize, SizeParseError> {
     let s = s.trim();
@@ -69,16 +72,39 @@ pub fn parse_size(s: &str) -> Result<usize, SizeParseError> {
         let suffix_len = if s_upper.ends_with("KB") { 2 } else { 1 };
         let num_part = s[..s.len() - suffix_len].trim();
         (num_part, 1024_usize)
+    } else if s_upper.ends_with('B') {
+        // Explicit bytes suffix, e.g. "512 B" — this is what `format_size`
+        // emits for values under 1 KB, so it must round-trip (see #218).
+        let num_part = s[..s.len() - 1].trim();
+        (num_part, 1_usize)
     } else {
         // No suffix, treat as bytes
         (s, 1_usize)
     };
 
-    // Parse the numeric part
-    let num: usize = num_str.parse().map_err(|_| SizeParseError::new(s))?;
+    // Parse the numeric part. Decimals are accepted so that any value
+    // `format_size` can emit reads back through here — see issue #218.
+    let num: f64 = num_str.parse().map_err(|_| SizeParseError::new(s))?;
 
-    num.checked_mul(multiplier)
-        .ok_or_else(|| SizeParseError::new(s))
+    // These guards are load-bearing. Rust's float -> int `as` casts saturate
+    // rather than trapping, so without them "-1GB" would silently yield 0 and
+    // "infGB" would yield usize::MAX — replacing a loud failure with a quiet
+    // wrong answer.
+    if !num.is_finite() || num < 0.0 {
+        return Err(SizeParseError::new(s));
+    }
+
+    let bytes = (num * multiplier as f64).round();
+    // Deliberately `>`, not `>=`: `usize::MAX as f64` rounds up to 2^64 (a
+    // value usize can't hold), and `format_size(usize::MAX)` emits
+    // "17179869184 GB", which parses back to exactly 2^64 here. Tightening
+    // this to `>=` would reject the formatter's own output and break the
+    // round-trip property at the top of the range.
+    if bytes > usize::MAX as f64 {
+        return Err(SizeParseError::new(s));
+    }
+
+    Ok(bytes as usize)
 }
 
 /// Format a byte count as a human-readable string.
@@ -205,7 +231,65 @@ mod tests {
         assert!(parse_size("abc").is_err());
         assert!(parse_size("2TB").is_err()); // Not supported
         assert!(parse_size("-1GB").is_err());
-        assert!(parse_size("1.5GB").is_err()); // Decimals not supported
+    }
+
+    #[test]
+    fn test_parse_decimals() {
+        // The value from issue #218 — a 32 GB machine's RAM/12.
+        assert_eq!(parse_size("2.6 GB").unwrap(), 2_791_728_742);
+        assert_eq!(parse_size("1.5GB").unwrap(), 1536 * 1024 * 1024);
+        assert_eq!(parse_size("1.5MB").unwrap(), 1536 * 1024);
+        assert_eq!(parse_size("2.5KB").unwrap(), 2560);
+    }
+
+    // Rust's float->int `as` casts saturate rather than trapping, so each of
+    // these would silently produce a number instead of an error without
+    // explicit guards: "-1GB" -> 0, "infGB" -> usize::MAX, overflow -> usize::MAX.
+    #[test]
+    fn test_parse_rejects_non_finite_and_negative() {
+        assert!(parse_size("-1GB").is_err());
+        assert!(parse_size("-0.5GB").is_err());
+        assert!(parse_size("infGB").is_err());
+        assert!(parse_size("NaNGB").is_err());
+    }
+
+    #[test]
+    fn test_parse_rejects_overflow() {
+        // Far beyond usize::MAX once multiplied by the GB unit.
+        assert!(parse_size("999999999999GB").is_err());
+    }
+
+    // format_size and parse_size are inverses and must round-trip. This is the
+    // property whose absence caused issue #218.
+    #[test]
+    fn test_format_parse_round_trip() {
+        for bytes in [
+            512_usize,
+            2048,
+            1536 * 1024,
+            500 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            1536 * 1024 * 1024,
+            2_791_728_742,
+            50 * 1024 * 1024 * 1024,
+        ] {
+            let rendered = format_size(bytes);
+            // The primary assertion is simply that it parses at all — that is
+            // the property whose absence caused #218.
+            let parsed = parse_size(&rendered).unwrap_or_else(|e| {
+                panic!("{bytes} rendered as {rendered:?} failed to parse: {e}")
+            });
+            // format_size keeps one decimal place, so the round trip is lossy
+            // by design for values that are not exact unit multiples. 10% is
+            // deliberately generous: a value just above 1.0 of its unit can
+            // lose almost 5%, and a tighter bound would make this flaky at
+            // that boundary without testing anything more useful.
+            let tolerance = (bytes as f64 * 0.10).max(1.0) as usize;
+            assert!(
+                parsed.abs_diff(bytes) <= tolerance,
+                "{bytes} -> {rendered:?} -> {parsed} exceeds tolerance {tolerance}"
+            );
+        }
     }
 
     #[test]
@@ -223,7 +307,10 @@ mod tests {
 
     #[test]
     fn test_size_roundtrip() {
-        // Note: roundtrip only works for exact multiples due to space in format
+        // Note: parse_size accepts decimals (see #218), so parsing is no
+        // longer the limiting factor here. format_size still rounds to one
+        // decimal place, so this test sticks to exact multiples where the
+        // string representation itself round-trips unchanged.
         let test_cases = vec![
             ("1KB", "1 KB"),
             ("500MB", "500 MB"),

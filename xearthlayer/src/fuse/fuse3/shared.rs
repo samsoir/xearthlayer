@@ -12,6 +12,7 @@
 //! - **Interface Segregation**: Small, focused interfaces
 //! - **Dependency Inversion**: Filesystems depend on abstractions
 
+use bytes::Bytes;
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -292,6 +293,13 @@ pub trait DdsRequestor: FileAttrBuilder {
     /// Get the optional tile request callback.
     fn tile_request_callback(&self) -> Option<&crate::prefetch::TileRequestCallback>;
 
+    /// Hook invoked after a DDS response is received.
+    ///
+    /// Default is a no-op; `Fuse3OrthoUnionFS` overrides it to detect
+    /// prefetch state divergence (#176). Kept on the trait so the check sits
+    /// at the one place every FUSE implementation receives a response.
+    fn on_dds_response(&self, _tile: TileCoord, _cache_hit: bool) {}
+
     /// Get the optional request coalescer for deduplicating concurrent requests.
     ///
     /// When this returns `Some`, requests for the same tile are coalesced at the
@@ -335,7 +343,7 @@ pub trait DdsRequestor: FileAttrBuilder {
     /// # Returns
     ///
     /// Generated DDS data, or placeholder on error/timeout
-    async fn request_dds_impl(&self, coords: &DdsFilename) -> Vec<u8> {
+    async fn request_dds_impl(&self, coords: &DdsFilename) -> Bytes {
         let tile = chunk_to_tile_coords(coords);
         let context_label = self.context_label();
         let timeout = self.generation_timeout();
@@ -432,7 +440,7 @@ pub trait DdsRequestor: FileAttrBuilder {
         tile: TileCoord,
         timeout: Duration,
         context_label: &'static str,
-    ) -> Vec<u8> {
+    ) -> Bytes {
         let client = self.dds_client();
         let cancellation_token = CancellationToken::new();
 
@@ -455,6 +463,7 @@ pub trait DdsRequestor: FileAttrBuilder {
                     context = context_label,
                     "DDS request completed"
                 );
+                self.on_dds_response(tile, response.cache_hit);
                 response.data
             }
             Ok(Err(_)) => {

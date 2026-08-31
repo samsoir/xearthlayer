@@ -25,9 +25,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Implemented Components
 
 1. **FUSE Layer** (`xearthlayer/src/fuse/fuse3/`)
-   - `Fuse3PassthroughFS` - Async multi-threaded passthrough for single scenery packs
-   - `Fuse3UnionFS` - Union filesystem for patch folders (priority-based merge)
-   - `Fuse3OrthoUnionFS` - Consolidated FUSE mount for all ortho sources (patches + packages)
+   - `Fuse3OrthoUnionFS` - The single FUSE mount: all ortho sources (patches + packages)
+     merged into one union filesystem. The earlier `Fuse3PassthroughFS` and
+     `Fuse3UnionFS` implementations were deleted in #233 once they became unreachable.
    - All FUSE operations run asynchronously on the Tokio runtime
    - Shared traits: `FileAttrBuilder`, `DdsRequestor` (SOLID: Interface Segregation)
    - Pattern matching for DDS files: `{row}_{col}_ZL{zoom}.dds`
@@ -79,6 +79,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `migrate_cache()` for migrating flat-layout caches to region layout
    - Bridge adapters for executor integration (MemoryCacheBridge, DdsDiskCacheBridge, DiskCacheBridge)
    - Per-provider cache directories
+   - `cache/integrity`: canonical corruption-handling model shared by every on-disk cache (index cache, scenery index cache, DDS/chunk disk tiers) — bounded reads (`length_ceiling`), atomic durable writes (`write_atomic`, which also creates the parent directory), and invariant-3 satisfied per cache: explicit `discard()` on the disk tiers, unconditional overwrite-on-rebuild for the index caches; see `docs/dev/cache-integrity-design.md`
    - `XEarthLayerService::start()` creates `CacheLayer` with proper metrics ordering
 
 6. **Configuration** (`xearthlayer/src/config/`)
@@ -126,15 +127,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `PrefetchBox` - Heading-biased sliding box (speed-proportional extent, proportional 80/20 bias, cruise phase)
     - `ExtentCalculator` - Speed-proportional box extent: clamped linear ramp 3.5° at 40kt to 6.5° at 450kt
     - `SceneryWindow` - Window config and dimensions holder
-    - `BoundaryStrategy` - Region lifecycle management (InProgress/Prefetched/NoCoverage)
+    - `BoundaryStrategy` - Region lifecycle management (InProgress/Prefetched/NoCoverage/Deferred)
     - `PhaseDetector` - Ground/Cruise flight phase state machine; reset via `on_ground` from AircraftState on telemetry resume
     - `PerformanceCalibrator` - Measures throughput during initial load for mode selection
     - `SimState` - Direct sim state detection via X-Plane Web API (paused, on_ground, scenery_loading, replay)
     - `TransitionThrottle` - Grace period + ramp-up after Ground-to-Cruise transition
     - `LoopState` - Per-cycle runner state including `telemetry_paused` flag for stale telemetry safe mode
+    - `PrefetchStateObserver` - FUSE-side divergence detector; demotes a `Prefetched`/`NoCoverage` region back to *absent* when FUSE has to generate a tile on demand there, rate-limited to one demotion per region per 120s window
     - Submits jobs to shared job executor daemon via `DdsClient` trait
     - Mode selection: Aggressive (>30 tiles/sec), Opportunistic (10-30), or Disabled
-    - **Four-tier filtering**: Local tracking → Memory cache → Patched region exclusion (via `GeoIndex`) → Disk existence (via `OrthoUnionIndex`)
+    - **Four-tier filtering**: Memory cache → Patched region exclusion (via `GeoIndex`) → Installed package disk (via `OrthoUnionIndex`) → XEL DDS disk cache (the write-only `cached_tiles` local-tracking shadow tier was deleted in #176 after it was confirmed to never be read)
     - **Two-phase region commit**: Regions marked `InProgress` in GeoIndex during prefetch, promoted to `Prefetched` on completion
     - **Stale telemetry safe mode**: pauses tile submissions when telemetry stale >5s; on resume, reads `on_ground` from AircraftState to reset PhaseDetector before next cycle
     - See `docs/dev/adaptive-prefetch-design.md` for design details
@@ -176,7 +178,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `GeoLayer` trait - Marker trait for storable layer types (`Clone + Send + Sync + 'static`)
     - `PatchCoverage` - Layer type indicating a region is owned by a scenery patch
     - `RetainedRegion` - Layer type tracking regions in the SceneryWindow's retained set
-    - `PrefetchedRegion` - Layer type tracking prefetch state per region (InProgress, Prefetched, NoCoverage)
+    - `PrefetchedRegion` - Layer type tracking prefetch state per region (InProgress, Prefetched, NoCoverage, Deferred)
+    - **Region retirement (#226)**: `NoCoverage` is reachable *only* when the scenery index attributes zero tiles to a region. A region with indexed tiles that is merely slow or stuck is `Deferred` — a non-terminal state that expires on a 20/30/40/60s ladder — so its tiles stay retryable
     - Locking: `RwLock<HashMap<TypeId, DashMap>>` — rare write locks, concurrent reads via DashMap shards
     - `populate()` provides atomic bulk loading (builds outside lock, swaps in)
     - Used by FUSE (`is_geo_filtered`), prewarm, and prefetch for patch region exclusion and prefetch state tracking
@@ -221,6 +224,10 @@ Uses **Web Mercator** (Slippy Map) projection:
 
 - Main thread: CLI and signal handling
 - Tokio runtime: Multi-threaded async runtime for all I/O
+  - Worker threads: tokio default (one per core)
+  - Blocking pool: capped at `ResourcePoolConfig::blocking_threads_required()`
+    (`cpu + disk_io + BLOCKING_POOL_HEADROOM`), built by
+    `runtime::build_service_runtime()` — **not** tokio's 512 default
   - FUSE operations via fuse3 (native async)
   - HTTP downloads via async reqwest
   - DDS encoding via spawn_blocking (CPU-bound)
@@ -229,6 +236,42 @@ Uses **Web Mercator** (Slippy Map) projection:
 All FUSE operations run asynchronously via fuse3, enabling true parallel
 processing of X-Plane's concurrent DDS requests. CPU utilization improved
 from ~6% to ~45% during scene loading.
+
+### Process Memory Management (#227)
+
+Two process-level settings bound memory growth on long flights. Both are
+applied in code, not by environment variable, and both have flight evidence:
+
+- **`mallopt(M_MMAP_THRESHOLD, 1 MiB)`** — called by `configure_allocator()` as
+  the first statement in `main()`, before anything allocates. glibc's threshold
+  otherwise adapts *upward* past the 10.66 MiB tile size after a single
+  alloc/free cycle, after which tiles come from arenas and are never returned
+  on free. Pinning it cut committed memory 37% at matched work. Override with
+  `MALLOC_MMAP_THRESHOLD_`.
+- **Blocking pool cap** — tokio's 512 default let the pool reach 581 threads,
+  and each excursion ratcheted glibc's arena high-water mark by ~420 MB. The
+  arena reached 6,166 MB while holding 572 MB of live data.
+- **`mallopt(M_ARENA_MAX, 4)`** — glibc's default of `8 x ncores` (256 here)
+  lets every burst recruit fresh arenas, each keeping its own high-water mark
+  for the life of the process, so the total is the sum of every peak ever
+  seen and never converges. Capping the count removes the supply: the sum
+  saturates once each arena has seen its worst burst. On the reference leg the
+  arena settled at 3,916 MB within six minutes and held to the byte — peak
+  concurrent demand (3,093 MB) plus ~27% headroom — against 6,091 MB still
+  climbing at hour 10.75 uncapped. Override with `MALLOC_ARENA_MAX`.
+
+Both pins defer to an explicit `MALLOC_*` variable or `GLIBC_TUNABLES` entry:
+`mallopt` silently overrides what glibc read at startup, so without that check
+a user's own setting would vanish with no diagnostic. **Both are `cfg`-gated to
+`linux-gnu`** — macOS uses libmalloc and currently has neither these fixes nor
+the allocator telemetry.
+
+DDS payloads are `bytes::Bytes` end to end (#237): a tile is 10.66 MiB and a
+FUSE read wants ~4% of it, so cloning a payload costs more than delivering it.
+`Bytes` clones are refcount bumps, and the FUSE read path slices rather than
+copies.
+
+Diagnosing memory in the field: `docs/dev/memory-telemetry.md`.
 
 ### Concurrency Limiting
 
@@ -239,15 +282,14 @@ tuned concurrency limits:
 - **Network pool (download tasks)**: `clamp(ceil(cpu_capacity * 1.5), 8, 64)` — pipeline-balanced with CPU pool
 - **HTTP semaphore (chunk connections)**: 1024 shared across all download tasks
 - **CPU-bound work** (assemble + encode): `max(num_cpus * 1.25, num_cpus + 2)` shared limiter
-- **Disk I/O concurrency**: Profile-based, auto-detected from storage type:
-  - HDD: `min(num_cpus * 1, 4)` - seek-bound, low concurrency
-  - SSD: `min(num_cpus * 4, 64)` - moderate concurrency (default)
-  - NVMe: `min(num_cpus * 8, 256)` - aggressive concurrency
+- **Disk I/O pool**: `DEFAULT_DISK_IO_CAPACITY` = 64, flat
+- **Tokio blocking pool**: `cpu + disk_io + BLOCKING_POOL_HEADROOM` — the CPU
+  and disk I/O pools both dispatch through `spawn_blocking`, so their sum is
+  the worst-case demand for blocking threads (#227)
 
 The `ResourcePool` struct (`executor/resource_pool.rs`) manages concurrency by
 resource type. Each task declares its `ResourceType` and the executor acquires
-permits before execution. Storage type detection can be overridden via
-`cache.disk_io_profile` config.
+permits before execution.
 
 **Design rationale**: Tasks declare their resource requirements (Network, CPU, DiskIO)
 and the executor manages permits automatically. This prevents deadlocks that occurred
@@ -299,7 +341,7 @@ xearthlayer publish version --region <code> --bump <type>  # Manage versions
 xearthlayer publish release --region <code> --metadata-url <url>  # Release
 xearthlayer publish status                  # Show release status
 xearthlayer publish validate                # Validate repository
-xearthlayer publish coverage [--dark] [--geojson] [-o <file>]  # Generate coverage map
+xearthlayer publish coverage [--dark] [--geojson] [-o <file>] [--metadata <path>]  # Generate coverage map
 xearthlayer publish dedupe --region <code> [--priority <mode>] [--tile <lat,lon>] [--dry-run]  # Remove overlapping ZL tiles
 xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o <file>]  # Analyze coverage gaps
 ```
@@ -312,7 +354,6 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer-cli/src/commands/publish/` | Publisher CLI (Command Pattern) |
 | `xearthlayer-cli/src/commands/config.rs` | Config CLI commands |
 | `xearthlayer/src/service/facade.rs` | Main service API, wires up runtime |
-| `xearthlayer/src/service/fuse_mount.rs` | FuseMountService for FUSE mounting |
 | `xearthlayer/src/runtime/orchestrator.rs` | XEarthLayerRuntime - daemon orchestrator |
 | `xearthlayer/src/runtime/request.rs` | JobRequest, DdsResponse, RequestOrigin types |
 | `xearthlayer/src/executor/daemon.rs` | ExecutorDaemon - background job processor |
@@ -350,6 +391,7 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/service/cache_layer.rs` | CacheLayer - three-tier cache lifecycle (memory + DDS disk + chunk disk) |
 | `xearthlayer/src/cache/providers/disk.rs` | DiskCacheProvider with internal GC daemon |
 | `xearthlayer/src/cache/adapters/` | Bridge adapters for backward compatibility |
+| `xearthlayer/src/cache/integrity/` | Canonical cache integrity model (`length_ceiling`, `write_atomic`, `discard`, `CacheEntryValidator`) |
 
 ## Configuration
 
@@ -358,12 +400,12 @@ Default config location: `~/.xearthlayer/config.ini`
 Key sections:
 - `[general]` - General settings (update_check)
 - `[provider]` - Imagery source (bing/google)
-- `[cache]` - Memory/disk sizes, directory, DDS disk ratio, disk I/O profile (auto/hdd/ssd/nvme)
+- `[cache]` - Memory/disk sizes, directory, DDS disk ratio
 - `[generation]` - Thread count, timeout
 - `[texture]` - DDS format (bc1/bc3), compressor backend (software/ispc/gpu), GPU device selection
 - `[prefetch]` - Boundary-driven prefetch, web_api_port (default 8086), calibration, transition ramp
 - `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
-- `[executor]` - Resource pool capacities (network, CPU, disk I/O), job limits, retry behavior
+- `[executor]` - Job limits and retry behavior. Resource pool capacities are NOT configurable — they are derived from logical core count by `ResourcePoolConfig::default()` (see #249)
 - `[fuse]` - FUSE kernel limits (max_background, congestion_threshold)
 - `[packages]` - Package manager settings (concurrent_downloads: parallel part downloads 1-10)
 
@@ -446,5 +488,7 @@ CI will fail if pre-commit checks were not run.
 - Zoom level overlap management: `docs/dev/zoom-level-overlap-design.md` (dedupe, gap analysis)
 - **Consolidated FUSE mounting**: `docs/dev/consolidated-mounting-design.md` (single ortho mount, patches + packages)
 - **GeoIndex design**: `docs/dev/geo-index-design.md` (geospatial reference database, patch region ownership)
+- **Memory telemetry**: `docs/dev/memory-telemetry.md` (periodic memory sampling, trace interpretation, confounders)
+- **Cache integrity model**: `docs/dev/cache-integrity-design.md` (bounded reads, atomic durable writes, discard-on-reject, shared by every on-disk cache)
 - memorize review allow(dead_code) macros at major checkpoints. Refactor aggresively to remove them when appropriate.
 - memorize ensure to update the projects documentation to reflect the current state of the project before committing changes

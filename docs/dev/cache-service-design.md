@@ -60,7 +60,7 @@ Result: 105GB cache with 40GB limit - GC never ran in TUI mode (the default).
 │               │  │ [owns GC]     │  │               │
 └───────┬───────┘  └───────┬───────┘  └───────────────┘
         │                  │
-        │  Generic Cache trait (String key, Vec<u8> value)
+        │  Generic Cache trait (String key, Bytes value)
         │
 ┌───────┴──────────────────┴────────────────────────────┐
 │                  Domain Decorators                    │
@@ -83,18 +83,25 @@ Result: 105GB cache with 40GB limit - GC never ran in TUI mode (the default).
 
 The fundamental cache interface. All cache providers implement this.
 
+Values are `bytes::Bytes`, not `Vec<u8>`. A DDS tile is 10.66 MiB and a FUSE
+read wants about 4% of it, so a hop that clones the payload costs more than the
+delivery. `Bytes::from(Vec<u8>)` is O(1) and cloning one is a refcount bump, so
+a cache hit hands out a view rather than a copy (#237).
+
+The trait returns `BoxFuture` rather than using `#[async_trait]`, so callers do
+not pay a `block_in_place` + `block_on` + `Box::pin` round trip on the hot path.
+
 ```rust
 /// Generic cache interface for key-value storage.
 ///
 /// Providers implement this trait to offer caching capabilities.
 /// The interface is intentionally minimal and domain-agnostic.
-#[async_trait]
 pub trait Cache: Send + Sync {
     /// Store a value with the given key.
-    async fn set(&self, key: &str, value: Vec<u8>) -> Result<(), CacheError>;
+    fn set(&self, key: &str, value: Bytes) -> BoxFuture<'_, Result<(), CacheError>>;
 
     /// Retrieve a value by key. Returns None if not found.
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError>;
+    fn get(&self, key: &str) -> BoxFuture<'_, Result<Option<Bytes>, CacheError>>;
 
     /// Delete a value by key. Returns true if key existed.
     async fn delete(&self, key: &str) -> Result<bool, CacheError>;
@@ -205,7 +212,7 @@ impl TileCacheClient {
     }
 
     /// Get a tile from cache.
-    pub async fn get(&self, tile: &TileCoord) -> Option<Vec<u8>> {
+    pub async fn get(&self, tile: &TileCoord) -> Option<Bytes> {
         let key = Self::tile_to_key(tile);
         match self.cache.get(&key).await {
             Ok(Some(data)) => {
@@ -228,7 +235,7 @@ impl TileCacheClient {
     }
 
     /// Store a tile in cache.
-    pub async fn set(&self, tile: &TileCoord, data: Vec<u8>) {
+    pub async fn set(&self, tile: &TileCoord, data: Bytes) {
         let key = Self::tile_to_key(tile);
         let size = data.len() as u64;
         if let Err(e) = self.cache.set(&key, data).await {
@@ -270,13 +277,13 @@ Wraps moka with automatic LRU eviction.
 ///
 /// Moka handles LRU eviction automatically, so gc() is a no-op.
 pub struct MemoryCacheProvider {
-    cache: moka::future::Cache<String, Vec<u8>>,
+    cache: moka::future::Cache<String, Bytes>,
 }
 
 impl MemoryCacheProvider {
     pub fn new(max_size_bytes: u64) -> Self {
         let cache = moka::future::Cache::builder()
-            .weigher(|_key: &String, value: &Vec<u8>| value.len() as u32)
+            .weigher(|_key: &String, value: &Bytes| value.len() as u32)
             .max_capacity(max_size_bytes)
             .build();
         Self { cache }
@@ -285,12 +292,12 @@ impl MemoryCacheProvider {
 
 #[async_trait]
 impl Cache for MemoryCacheProvider {
-    async fn set(&self, key: &str, value: Vec<u8>) -> Result<(), CacheError> {
+    async fn set(&self, key: &str, value: Bytes) -> Result<(), CacheError> {
         self.cache.insert(key.to_string(), value).await;
         Ok(())
     }
 
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError> {
+    async fn get(&self, key: &str) -> Result<Option<Bytes>, CacheError> {
         Ok(self.cache.get(key).await)
     }
 

@@ -48,6 +48,7 @@ mod library;
 mod metadata;
 mod processor;
 mod region;
+mod region_colors;
 mod release;
 mod repository;
 mod urls;
@@ -72,6 +73,7 @@ pub use processor::{
     SceneryScanResult, TileInfo, TileWarning,
 };
 pub use region::{analyze_tiles, suggest_region, RegionSuggestion, SuggestedRegion};
+pub use region_colors::{brighten, resolve, RegionEntry, RegionMetadata};
 pub use release::{
     build_package, configure_urls, get_release_status, release_package, validate_repository,
     BuildResult, ReleaseResult, ReleaseStatus, UrlConfigResult,

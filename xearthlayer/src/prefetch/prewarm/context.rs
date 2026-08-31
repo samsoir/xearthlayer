@@ -511,6 +511,7 @@ pub fn start_prewarm<M: MemoryCache + Send + Sync + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn test_status_new() {
@@ -734,7 +735,7 @@ mod tests {
             _row: u32,
             _col: u32,
             _zoom: u8,
-        ) -> impl std::future::Future<Output = Option<Vec<u8>>> + Send {
+        ) -> impl std::future::Future<Output = Option<Bytes>> + Send {
             async { None }
         }
 
@@ -743,7 +744,7 @@ mod tests {
             _row: u32,
             _col: u32,
             _zoom: u8,
-            _data: Vec<u8>,
+            _data: Bytes,
         ) -> impl std::future::Future<Output = ()> + Send {
             async {}
         }
@@ -827,7 +828,7 @@ mod tests {
             );
             if let Some(tx) = request.response_tx {
                 let _ = tx.send(DdsResponse::success(
-                    vec![0u8; 10],
+                    vec![0u8; 10].into(),
                     std::time::Duration::from_millis(1),
                 ));
             }
@@ -922,7 +923,7 @@ mod tests {
             );
             if let Some(tx) = request.response_tx {
                 let _ = tx.send(DdsResponse::success(
-                    vec![0u8; 10],
+                    vec![0u8; 10].into(),
                     std::time::Duration::from_millis(1),
                 ));
             }

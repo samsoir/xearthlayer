@@ -85,7 +85,13 @@ fn run_update() -> Result<(), CliError> {
         io::stdout().flush().ok();
 
         match index.build_from_package(path) {
-            Ok(count) => println!("{} tiles", count),
+            Ok(stats) if stats.failed > 0 => {
+                println!(
+                    "{} tiles ({} .ter files failed to parse)",
+                    stats.parsed, stats.failed
+                )
+            }
+            Ok(stats) => println!("{} tiles", stats.parsed),
             Err(e) => println!("error: {}", e),
         }
     }
@@ -153,6 +159,21 @@ fn run_status() -> Result<(), CliError> {
             println!("  Land tiles: {}", land_tiles);
             println!("  Sea tiles: {}", status.sea_tiles);
             println!("  File size: {}", format_size(file_size));
+
+            let expected: usize = status.packages.iter().map(|p| p.terrain_file_count).sum();
+            if expected > 0 {
+                let pct = (status.total_tiles as f64 / expected as f64) * 100.0;
+                println!(
+                    "  Indexed:   {} of {} .ter files ({:.1}%)",
+                    status.total_tiles, expected, pct
+                );
+                if status.total_tiles < expected {
+                    println!(
+                        "  WARNING:   {} .ter files did not produce a tile",
+                        expected - status.total_tiles
+                    );
+                }
+            }
         }
         Err(e) => {
             println!("  Status: Invalid");

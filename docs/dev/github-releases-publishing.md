@@ -530,6 +530,7 @@ xearthlayer publish coverage --geojson --output coverage.geojson
 | `--height` | Image height in pixels (PNG only, default: 600) |
 | `--dark` | Use dark theme with CartoDB tiles (PNG only) |
 | `--geojson` | Generate GeoJSON instead of PNG |
+| `--metadata` | Path to region_metadata.json (default: `<repo>/region_metadata.json`) |
 
 ## Website Sync Integration
 
@@ -572,7 +573,9 @@ When you push library index updates to the regional-scenery repository, the publ
 
 ### Region Metadata File
 
-The `region_metadata.json` file in the regional-scenery repo provides region names, coverage descriptions, and colors for the website:
+The `region_metadata.json` file in the regional-scenery repo is a **required input to `xearthlayer publish coverage`**, not just a website artefact — it supplies the region names, coverage descriptions, and colors used both by the coverage map generator and the website:
+
+`publish coverage` reads it from the repository root by default (`<repo>/region_metadata.json`), overridable with `--metadata <path>`. The `color` field for each region accepts either a CSS colour name (e.g. `"orange"`) or a hex string (e.g. `"#ffaa00"`). An unresolvable colour or a missing metadata file is a **hard error**: the command exits non-zero and writes no map. This is deliberate — a silently grey region is how a wrong map shipped once already (issue #200). Dark mode colours are derived automatically by blending toward white, so there is no separate dark palette to maintain.
 
 ```json
 {

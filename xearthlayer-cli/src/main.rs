@@ -166,6 +166,26 @@ enum Commands {
 // ============================================================================
 
 fn main() -> ExitCode {
+    // First, before anything allocates in earnest, and before any thread is
+    // created — the arena ceiling only bounds arenas not yet made.
+    //
+    // Two glibc parameters, both from issue #227:
+    //
+    // - mmap threshold: glibc adapts it upward past the 10.66 MiB DDS tile
+    //   size after a single allocate/free cycle, after which tiles come from
+    //   arenas and are never returned on free. Pinning costs ~0.16 ms per tile
+    //   and bounded arena retention at 4.6 MB against 191.5 MB in a 64-thread
+    //   benchmark.
+    // - arena ceiling: glibc's default of 8 x ncores lets every burst recruit
+    //   fresh arenas, each keeping its own high-water mark forever. An
+    //   11-hour flight reached a 6,091 MB arena holding 1,002 MB of live data,
+    //   still growing at hour 10.75. Capped, the same route settled at
+    //   3,916 MB within six minutes and held to the byte.
+    //
+    // Either can be overridden with MALLOC_MMAP_THRESHOLD_ / MALLOC_ARENA_MAX
+    // or GLIBC_TUNABLES; an explicit user setting always wins.
+    xearthlayer::metrics::configure_allocator();
+
     let cli = Cli::parse();
 
     // Initialize logging once for every subcommand. Falls back to default

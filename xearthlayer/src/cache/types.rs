@@ -2,6 +2,7 @@
 
 use crate::coord::TileCoord;
 use crate::dds::DdsFormat;
+use std::fmt;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -96,6 +97,39 @@ impl Default for DiskCacheConfig {
     }
 }
 
+/// Which disk cache tier a write belongs to.
+///
+/// Chunk-tier writes are small and frequent (~14 KB, thousands per second);
+/// DDS-tier writes are large and rare (11.17 MB, a few per second). Attributing
+/// bytes to a tier keeps `chunk_disk_bytes_written` honest — see issue #216.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskTier {
+    /// The chunk disk cache.
+    Chunk,
+    /// The DDS tile disk cache.
+    Dds,
+}
+
+impl DiskTier {
+    /// Stable label for log fields.
+    ///
+    /// These exact strings already appear in disk cache log output; changing
+    /// them would break existing log greps. Note the asymmetry — the chunk
+    /// label is plural, the DDS label is not.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chunk => "chunks",
+            Self::Dds => "dds",
+        }
+    }
+}
+
+impl fmt::Display for DiskTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +218,16 @@ mod tests {
         assert_eq!(config.daemon_interval_secs, 60);
         assert!(config.max_age_days.is_none());
         assert!(config.cache_dir.ends_with("xearthlayer"));
+    }
+
+    // These exact strings already appear in disk cache log output. Changing
+    // them — including "normalising" the plural — would break existing log
+    // greps and dashboard filters.
+    #[test]
+    fn disk_tier_labels_are_stable() {
+        assert_eq!(DiskTier::Chunk.as_str(), "chunks");
+        assert_eq!(DiskTier::Dds.as_str(), "dds");
+        assert_eq!(format!("{}", DiskTier::Chunk), "chunks");
+        assert_eq!(format!("{}", DiskTier::Dds), "dds");
     }
 }

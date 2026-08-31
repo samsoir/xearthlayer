@@ -103,6 +103,8 @@ pub struct TelemetrySnapshot {
     pub chunk_disk_cache_size_bytes: u64,
     /// Chunk disk bytes written this session
     pub chunk_disk_bytes_written: u64,
+    /// DDS disk bytes written this session
+    pub dds_disk_bytes_written: u64,
     /// Chunk disk bytes read this session (from cache hits)
     pub chunk_disk_bytes_read: u64,
 
@@ -175,6 +177,7 @@ impl Default for TelemetrySnapshot {
             chunk_disk_cache_hit_rate: 0.0,
             chunk_disk_cache_size_bytes: 0,
             chunk_disk_bytes_written: 0,
+            dds_disk_bytes_written: 0,
             chunk_disk_bytes_read: 0,
             encodes_completed: 0,
             encodes_active: 0,
@@ -425,6 +428,7 @@ mod tests {
             chunk_disk_cache_hit_rate: 5000.0 / 23040.0,
             chunk_disk_cache_size_bytes: 5_000_000_000,
             chunk_disk_bytes_written: 500_000_000,
+            dds_disk_bytes_written: 0,
             chunk_disk_bytes_read: 750_000_000,
             encodes_completed: 90,
             encodes_active: 2,

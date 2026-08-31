@@ -148,8 +148,10 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     let parallel_downloads = args.parallel.unwrap_or(32);
 
     // Build configurations
+    // Mipmap levels are left unset so the encoder emits the full chain for the
+    // texture size — a truncated chain makes X-Plane clamp sampling and band
+    // sloped terrain at grazing angles.
     let texture_config = TextureConfig::new(format)
-        .with_mipmap_count(5)
         .with_compressor(config.texture.compressor.clone())
         .with_gpu_device(config.texture.gpu_device.clone());
     let dds_format = texture_config.format();
@@ -162,10 +164,13 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     // Check if we'll use TUI (need to know before creating services)
     let use_tui = atty::is(atty::Stream::Stdout);
 
-    // Build pipeline settings from executor config (executor replaced the deprecated pipeline section)
+    // Pool sizing is no longer configurable (#249) — it is derived by
+    // ResourcePoolConfig::default(). These two fields keep their own defaults so
+    // PipelineSettings still constructs; nothing reads them today, since
+    // ServiceConfig::pipeline() has no caller.
     let pipeline_settings = PipelineSettings {
-        max_http_concurrent: config.executor.network_concurrent,
-        max_cpu_concurrent: config.executor.cpu_concurrent,
+        max_http_concurrent: xearthlayer::config::default_http_concurrent(),
+        max_cpu_concurrent: xearthlayer::config::default_cpu_concurrent(),
         max_prefetch_in_flight: config.pipeline.max_prefetch_in_flight,
         request_timeout_secs: config.executor.request_timeout_secs,
         max_retries: config.executor.max_retries,
@@ -187,6 +192,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         .cache_directory(config.cache.directory.clone())
         .cache_memory_size(config.cache.memory_size)
         .cache_disk_size(config.cache.disk_size)
+        .cache_dds_disk_ratio(config.cache.dds_disk_ratio)
         .generation_threads(config.generation.threads)
         .generation_timeout(config.generation.timeout)
         .pipeline(pipeline_settings)

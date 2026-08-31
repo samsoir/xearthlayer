@@ -23,6 +23,7 @@ jobs:
     outputs:
       release_tag: ${{ steps.tag.outputs.RELEASE_TAG }}
       version: ${{ steps.tag.outputs.VERSION }}
+      prerelease: ${{ steps.tag.outputs.PRERELEASE }}
     steps:
       - uses: actions/checkout@v6
 
@@ -36,6 +37,15 @@ jobs:
           fi
           echo "RELEASE_TAG=${RELEASE_TAG}" >> $GITHUB_OUTPUT
           echo "VERSION=${RELEASE_TAG#v}" >> $GITHUB_OUTPUT
+          # Classify unstable pre-release tags (v0.5.0-dev.N / -alpha.N / -beta.N / -rc.N)
+          # vs stable tags (v0.4.6). Pre-releases are published to GitHub as
+          # prereleases and never marked "Latest"; stable website sync is gated
+          # elsewhere (website-sync.yml only fires on version.json changes).
+          if [[ "${RELEASE_TAG}" == *-dev.* || "${RELEASE_TAG}" == *-alpha.* || "${RELEASE_TAG}" == *-beta.* || "${RELEASE_TAG}" == *-rc.* ]]; then
+            echo "PRERELEASE=true" >> $GITHUB_OUTPUT
+          else
+            echo "PRERELEASE=false" >> $GITHUB_OUTPUT
+          fi
           echo "Release tag: ${RELEASE_TAG}"
 
       - uses: dtolnay/rust-toolchain@stable
@@ -110,10 +120,12 @@ jobs:
           path: dist/*.tar.gz
 
   # Build .deb package for Debian/Ubuntu (uses pre-built binary)
+  # Stable releases only — previews ship the Linux tarball only.
   package-deb:
     name: Package Debian Package
     runs-on: ubuntu-latest
     needs: [verify, build-binary]
+    if: ${{ needs.verify.outputs.prerelease != 'true' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -145,10 +157,12 @@ jobs:
           path: dist/*.deb
 
   # Build .rpm package for Fedora/RHEL/openSUSE
+  # Stable releases only — RPM `Version:` forbids the hyphen in pre-release versions.
   build-rpm:
     name: Build RPM Package
     runs-on: ubuntu-latest
     needs: [verify]
+    if: ${{ needs.verify.outputs.prerelease != 'true' }}
     container:
       image: fedora:latest
     steps:
@@ -189,75 +203,83 @@ jobs:
           path: dist/*.rpm
 
   # Prepare AUR package files
+  # Stable releases only — AUR `pkgver` forbids the hyphen in pre-release versions.
+  #
+  # Runs in an Arch container for two reasons: `.SRCINFO` is generated from the
+  # PKGBUILD by makepkg rather than hand-written (so the two cannot drift), and
+  # the package is actually built with a stock `makepkg.conf` (LTO on), which is
+  # the only thing that proves the shipped PKGBUILD links. See issue #222.
   prepare-aur:
     name: Prepare AUR Package
     runs-on: ubuntu-latest
     needs: [verify]
+    if: ${{ needs.verify.outputs.prerelease != 'true' }}
+    container:
+      image: archlinux:base-devel
     steps:
+      - name: Install prerequisites
+        run: pacman -Syu --noconfirm --needed git
+
       - uses: actions/checkout@v6
 
-      - name: Generate PKGBUILD and .SRCINFO
+      - name: Create unprivileged build user
+        # makepkg refuses to run as root. NOPASSWD sudo lets `makepkg -s`
+        # install the declared depends/makedepends.
+        run: |
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chmod 0440 /etc/sudoers.d/builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Generate PKGBUILD
         env:
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
+          set -euo pipefail
+          case "$VERSION" in
+            *-*) echo "::error::pkgver may not contain a hyphen: $VERSION" && exit 1 ;;
+          esac
+
           mkdir -p pkg/aur
 
-          # Download source tarball to calculate checksum
-          curl -sL "https://github.com/${{ github.repository }}/archive/${RELEASE_TAG}.tar.gz" \
+          # Checksum the release tarball, then discard it so makepkg fetches its
+          # own copy below — that way the build validates the published URL and
+          # the checksum we are about to ship, not a file we already hold.
+          curl -fsSL "https://github.com/${{ github.repository }}/archive/${RELEASE_TAG}.tar.gz" \
             -o "pkg/aur/xearthlayer-${VERSION}.tar.gz"
           SHA256=$(sha256sum "pkg/aur/xearthlayer-${VERSION}.tar.gz" | cut -d' ' -f1)
-
-          # Generate PKGBUILD
-          cat > pkg/aur/PKGBUILD << EOF
-          # Maintainer: XEarthLayer Contributors
-          pkgname=xearthlayer
-          pkgver=${VERSION}
-          pkgrel=1
-          pkgdesc='Virtual Earth imagery layer filesystem for X-Plane using FUSE'
-          arch=('x86_64')
-          url='https://github.com/${{ github.repository }}'
-          license=('MIT')
-          depends=('fuse3')
-          makedepends=('rust' 'cargo')
-          optdepends=('xplane12: X-Plane 12 flight simulator')
-          source=("\${pkgname}-\${pkgver}.tar.gz::https://github.com/${{ github.repository }}/archive/v\${pkgver}.tar.gz")
-          sha256sums=('${SHA256}')
-
-          build() {
-            cd "\${pkgname}-\${pkgver}"
-            cargo build --release --locked
-          }
-
-          package() {
-            cd "\${pkgname}-\${pkgver}"
-            install -Dm755 "target/release/xearthlayer" "\${pkgdir}/usr/bin/xearthlayer"
-            install -Dm644 "LICENSE" "\${pkgdir}/usr/share/licenses/\${pkgname}/LICENSE"
-            install -Dm644 "README.md" "\${pkgdir}/usr/share/doc/\${pkgname}/README.md"
-          }
-          EOF
-
-          # Generate .SRCINFO
-          cat > pkg/aur/.SRCINFO << EOF
-          pkgbase = xearthlayer
-          	pkgdesc = Virtual Earth imagery layer filesystem for X-Plane using FUSE
-          	pkgver = ${VERSION}
-          	pkgrel = 1
-          	url = https://github.com/${{ github.repository }}
-          	arch = x86_64
-          	license = MIT
-          	makedepends = rust
-          	makedepends = cargo
-          	depends = fuse3
-          	optdepends = xplane12: X-Plane 12 flight simulator
-          	source = xearthlayer-\${pkgver}.tar.gz::https://github.com/${{ github.repository }}/archive/v\${pkgver}.tar.gz
-          	sha256sums = ${SHA256}
-
-          pkgname = xearthlayer
-          EOF
-
-          # Clean up tarball
           rm "pkg/aur/xearthlayer-${VERSION}.tar.gz"
+
+          # Template from the single source of truth. Re-authoring the PKGBUILD
+          # here is what dropped `options=(!lto)` and broke every Arch build in
+          # #222; keep this a sed, never a heredoc.
+          sed -e "s/^pkgver=.*/pkgver=${VERSION}/" \
+              -e "s/^sha256sums=.*/sha256sums=('${SHA256}')/" \
+              pkg/arch/PKGBUILD > pkg/aur/PKGBUILD
+
+          grep -q '^options=(!lto)' pkg/aur/PKGBUILD \
+            || { echo "::error::generated PKGBUILD lost options=(!lto)"; exit 1; }
+
+          # pkg/aur is created by this step, as root, after the workspace-wide
+          # chown — so it needs its own. makepkg writes src/ and pkg/ here.
+          chown -R builder:builder pkg/aur
+
+      - name: Generate .SRCINFO
+        working-directory: pkg/aur
+        run: sudo -u builder --set-home makepkg --printsrcinfo > .SRCINFO
+
+      - name: Build with stock makepkg.conf
+        # The regression gate for #222: a default-configured Arch machine has
+        # LTO enabled, and this step fails to link if the flag is ever lost.
+        #
+        # This is release-blocking — `publish` requires prepare-aur != failure —
+        # which is deliberate: shipping a PKGBUILD that cannot build is the very
+        # bug this job exists to prevent. A transient pacman-mirror failure will
+        # also stop a release; recover with `gh run rerun <id> --failed`, since
+        # the tag is immutable and re-runnable.
+        working-directory: pkg/aur
+        run: sudo -u builder --set-home makepkg -Cf -s --noconfirm
 
       - name: Upload AUR package files
         uses: actions/upload-artifact@v7
@@ -267,11 +289,21 @@ jobs:
             pkg/aur/PKGBUILD
             pkg/aur/.SRCINFO
 
-  # Final job: Create release and upload all assets atomically
+  # Final job: Create release and upload all assets atomically.
+  # Uses !cancelled() + explicit result checks so publish still runs when the
+  # stable-only package jobs (deb/rpm/aur) are skipped for a pre-release tag.
+  # A skipped `needs` dependency would otherwise skip this job too.
   publish:
     name: Publish Release
     runs-on: ubuntu-latest
     needs: [verify, package-linux, package-deb, build-rpm, prepare-aur]
+    if: >-
+      ${{ !cancelled()
+      && needs.verify.result == 'success'
+      && needs.package-linux.result == 'success'
+      && needs.package-deb.result != 'failure'
+      && needs.build-rpm.result != 'failure'
+      && needs.prepare-aur.result != 'failure' }}
     permissions:
       contents: write
     steps:
@@ -293,6 +325,27 @@ jobs:
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
+          # A hand-written notes file for this exact tag wins, if present.
+          # Pre-releases need tester-facing guidance — what to look at, what
+          # noise to ignore, how to report — which does not belong in the
+          # product changelog. Stable tags normally have no such file and
+          # fall through to the CHANGELOG extraction below, unchanged.
+          # RELEASE_TAG becomes a path component here, and on workflow_dispatch
+          # it is caller-supplied, so constrain it to the tag grammar before
+          # use — no slashes, no traversal.
+          if ! printf '%s' "${RELEASE_TAG}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-(dev|alpha|beta|rc)\.[0-9]+)?$'; then
+            echo "Tag '${RELEASE_TAG}' is not a recognised release tag; skipping notes-file lookup."
+            NOTES_FILE=""
+          else
+            NOTES_FILE=".github/release-notes/${RELEASE_TAG}.md"
+          fi
+          if [ -n "${NOTES_FILE}" ] && [ -f "${NOTES_FILE}" ]; then
+            echo "Using hand-written notes: ${NOTES_FILE}"
+            cp "${NOTES_FILE}" release_notes.md
+            cat release_notes.md
+            exit 0
+          fi
+
           # Extract release notes from CHANGELOG.md if available
           if [ -f CHANGELOG.md ]; then
             # Try to extract notes for this version
@@ -317,6 +370,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
         run: |
           # Delete any existing release for this tag (handles manual releases or retries)
           if gh release view "${RELEASE_TAG}" &>/dev/null; then
@@ -324,13 +378,23 @@ jobs:
             gh release delete "${RELEASE_TAG}" --yes
           fi
 
+          # Unstable pre-releases are flagged --prerelease and kept off "Latest"
+          # so the stable 0.4.x line remains the repo's latest release.
+          TITLE="XEarthLayer ${RELEASE_TAG}"
+          RELEASE_FLAGS=()
+          if [ "${PRERELEASE}" = "true" ]; then
+            TITLE="XEarthLayer ${RELEASE_TAG} (pre-release)"
+            RELEASE_FLAGS+=(--prerelease --latest=false)
+          fi
+
           # Create draft release (not published yet)
           gh release create "${RELEASE_TAG}" \
             --draft \
-            --title "XEarthLayer ${RELEASE_TAG}" \
+            "${RELEASE_FLAGS[@]}" \
+            --title "${TITLE}" \
             --notes-file release_notes.md
 
-          echo "Draft release created for ${RELEASE_TAG}"
+          echo "Draft release created for ${RELEASE_TAG} (prerelease=${PRERELEASE:-false})"
 
       - name: Upload Linux binary
         env:
@@ -340,6 +404,7 @@ jobs:
           gh release upload "${RELEASE_TAG}" artifacts/linux-binary/*.tar.gz
 
       - name: Upload Debian package
+        if: ${{ needs.verify.outputs.prerelease != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
@@ -347,6 +412,7 @@ jobs:
           gh release upload "${RELEASE_TAG}" artifacts/debian-package/*.deb
 
       - name: Upload RPM package
+        if: ${{ needs.verify.outputs.prerelease != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
@@ -354,6 +420,7 @@ jobs:
           gh release upload "${RELEASE_TAG}" artifacts/rpm-package/*.rpm
 
       - name: Upload AUR package files
+        if: ${{ needs.verify.outputs.prerelease != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
@@ -381,6 +448,7 @@ jobs:
       # Website notification moved to website-sync.yml (triggers on release/* merge to main)
 
       - name: Publish to AUR
+        if: ${{ needs.verify.outputs.prerelease != 'true' }}
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           VERSION: ${{ needs.verify.outputs.version }}

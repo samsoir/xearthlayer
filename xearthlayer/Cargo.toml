@@ -49,8 +49,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 nix = { version = "0.31", default-features = false, features = ["fs"] }
+memory-stats = "1.2"
 tracing-chrome = { version = "0.7", optional = true }
 axum = { version = "0.7", optional = true }
+csscolorparser = "0.8"
 
 [features]
 profiling = ["tracing-chrome"]

@@ -8,8 +8,9 @@ on:
       - 'bugfix/**'
       - 'hotfix/**'
       - 'chore/**'
+      - 'develop/**'
   pull_request:
-    branches: [main]
+    branches: [main, 'develop/**']
 
 env:
   CARGO_TERM_COLOR: always

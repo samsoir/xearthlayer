@@ -9,7 +9,6 @@ use tracing::info;
 
 use crate::aircraft_position::{SharedAircraftPosition, StateAggregator};
 use crate::geo_index::GeoIndex;
-use crate::log::TracingLogger;
 use crate::manager::{
     create_consolidated_overlay, remove_consolidated_overlay, InstalledPackage, LocalPackageStore,
     MountManager, ServiceBuilder,
@@ -110,17 +109,15 @@ impl ServiceOrchestrator {
         // Note: Cache is now created inside XEarthLayerService::start() via CacheLayer,
         // which ensures MetricsSystem is created FIRST, then CacheLayer with metrics.
         // This fixes the GC daemon not having metrics client for eviction reporting.
-        let logger: Arc<dyn crate::log::Logger> = Arc::new(TracingLogger);
-        let mut service_builder = ServiceBuilder::with_disk_io_profile(
-            config.service.clone(),
-            config.provider.clone(),
-            logger,
-            config.disk_io_profile,
-        );
+        let mut service_builder =
+            ServiceBuilder::new(config.service.clone(), config.provider.clone());
 
         // Create mount manager with Custom Scenery path and FUSE kernel limits
         let mut mount_manager = MountManager::with_scenery_path(&config.custom_scenery_path);
         mount_manager.set_fuse_limits(config.fuse.max_background, config.fuse.congestion_threshold);
+        if let Some(timeout_secs) = config.service.generation_timeout() {
+            mount_manager.set_generation_timeout(timeout_secs);
+        }
 
         // Wire FUSE analyzer callback for position inference
         if let Some(ref analyzer) = fuse_analyzer {
@@ -384,11 +381,12 @@ impl ServiceOrchestrator {
             }
 
             match index.build_from_package(path) {
-                Ok(count) => {
-                    total_tiles += count;
+                Ok(stats) => {
+                    total_tiles += stats.parsed;
                     tracing::debug!(
                         region = %region,
-                        tiles = count,
+                        tiles = stats.parsed,
+                        failed = stats.failed,
                         "Indexed scenery package"
                     );
                 }
@@ -616,6 +614,12 @@ impl ServiceOrchestrator {
         // This drops the XEarthLayerService, which owns the CacheLayer with GC daemon
         self.mount_manager.unmount_all();
         info!("FUSE mounts unmounted (cache services shutdown via service drop)");
+
+        // Measurement, not housekeeping: how much of the footprint was glibc
+        // holding free arena memory rather than the process holding objects
+        // (#227). Runs after the caches are dropped so their memory is free by
+        // now, and last so it cannot perturb anything above it.
+        crate::metrics::log_malloc_trim_at_shutdown();
 
         info!("ServiceOrchestrator shutdown complete");
     }

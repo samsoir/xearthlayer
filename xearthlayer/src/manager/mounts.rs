@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::config::defaults::{DEFAULT_FUSE_CONGESTION_THRESHOLD, DEFAULT_FUSE_MAX_BACKGROUND};
-use crate::config::DiskIoProfile;
-use crate::executor::StorageConcurrencyLimiter;
+use crate::config::defaults::{
+    DEFAULT_FUSE_CONGESTION_THRESHOLD, DEFAULT_FUSE_MAX_BACKGROUND, DEFAULT_GENERATION_TIMEOUT_SECS,
+};
 use crate::fuse::fuse3::Fuse3OrthoUnionFS;
 use crate::fuse::SpawnedMountHandle;
 use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage};
@@ -26,8 +26,7 @@ use crate::package::{
 };
 use crate::panic as panic_handler;
 use crate::patches::{extract_dsf_regions, PatchDiscovery};
-use crate::prefetch::tile_based::DdsAccessEvent;
-use crate::prefetch::TileRequestCallback;
+use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use crate::scene_tracker::{DefaultSceneTracker, FuseAccessEvent};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
 
@@ -149,10 +148,6 @@ pub struct MountManager {
     consolidated_mount: Option<ActiveMount>,
     /// Service for consolidated ortho (owns the runtime for DDS generation).
     consolidated_service: Option<XEarthLayerService>,
-    /// DDS access event receiver for tile-based prefetching.
-    /// This is populated when mounting consolidated ortho and can be retrieved
-    /// by the prefetcher via `take_dds_access_receiver()`.
-    dds_access_rx: Option<mpsc::UnboundedReceiver<DdsAccessEvent>>,
     /// Scene Tracker event receiver for empirical scenery tracking.
     /// This is populated when mounting consolidated ortho and can be retrieved
     /// by the Scene Tracker via `take_scene_tracker_receiver()`.
@@ -167,6 +162,8 @@ pub struct MountManager {
     fuse_max_background: u16,
     /// Congestion threshold for background FUSE requests (kernel limit).
     fuse_congestion_threshold: u16,
+    /// Upper bound in seconds for a single DDS generation behind a FUSE read.
+    generation_timeout_secs: u64,
 }
 
 impl MountManager {
@@ -184,12 +181,12 @@ impl MountManager {
             consolidated_session: None,
             consolidated_mount: None,
             consolidated_service: None,
-            dds_access_rx: None,
             scene_tracker_rx: None,
             ortho_union_index: None,
             geo_index: None,
             fuse_max_background: DEFAULT_FUSE_MAX_BACKGROUND,
             fuse_congestion_threshold: DEFAULT_FUSE_CONGESTION_THRESHOLD,
+            generation_timeout_secs: DEFAULT_GENERATION_TIMEOUT_SECS,
         }
     }
 
@@ -211,6 +208,14 @@ impl MountManager {
     pub fn set_fuse_limits(&mut self, max_background: u16, congestion_threshold: u16) {
         self.fuse_max_background = max_background;
         self.fuse_congestion_threshold = congestion_threshold;
+    }
+
+    /// Set the upper bound for a single DDS generation behind a FUSE read.
+    ///
+    /// This is the only limit on how long a FUSE `read()` on a virtual DDS tile
+    /// can block; on expiry a placeholder texture is returned.
+    pub fn set_generation_timeout(&mut self, timeout_secs: u64) {
+        self.generation_timeout_secs = timeout_secs;
     }
 
     /// Get the number of active mounts.
@@ -419,8 +424,22 @@ impl MountManager {
         }
 
         // Create the service (owns the Tokio runtime for DDS generation)
-        // Use XEarthLayerService::start() with integrated cache and metrics
-        let runtime = match tokio::runtime::Runtime::new() {
+        // Use XEarthLayerService::start() with integrated cache and metrics.
+        //
+        // The blocking pool is sized from the executor's pool capacities
+        // rather than tokio's 512 default: it carries DDS encoding and disk
+        // I/O, and at 512 threads it ratchets glibc's arena high-water mark on
+        // every excursion. See runtime::build_service_runtime and issue #227.
+        //
+        // `ResourcePoolConfig::default()` is the only source of pool sizing,
+        // here and in `RuntimeConfig::default()` for the executor, so the cap
+        // and the pools it bounds cannot diverge. The `[executor]` sizing keys
+        // that could once have forked this were removed in #249 precisely
+        // because they reached neither path — a config carrying them silently
+        // described capacities nothing used.
+        let runtime = match crate::runtime::build_service_runtime(
+            &crate::executor::ResourcePoolConfig::default(),
+        ) {
             Ok(r) => r,
             Err(e) => {
                 return ConsolidatedOrthoMountResult::failure(
@@ -456,10 +475,6 @@ impl MountManager {
         let expected_dds_size = service.expected_dds_size();
         let runtime_handle = service.runtime_handle().clone();
 
-        // Create DDS access event channel for tile-based prefetching
-        // The sender goes to FUSE, the receiver goes to the prefetcher
-        let (dds_access_tx, dds_access_rx) = mpsc::unbounded_channel();
-
         // Create Scene Tracker event channel for empirical scenery tracking
         // The sender goes to FUSE, the receiver goes to the Scene Tracker
         let (scene_tracker_tx, scene_tracker_rx) = mpsc::unbounded_channel();
@@ -467,18 +482,30 @@ impl MountManager {
         // Store the index for tile-based prefetcher to use later
         let index_for_prefetch = Arc::new(index);
 
+        // Build the prefetch state observer (#176): detects when FUSE has to
+        // generate a tile on demand in a region prefetch already marked
+        // Prefetched or NoCoverage, and demotes that region so it is
+        // re-prefetched instead of leaving a stale, contradicted claim.
+        let metrics_client = service.metrics_client();
+        let mut state_observer = PrefetchStateObserver::new(Arc::clone(&geo_index));
+        if let Some(ref metrics) = metrics_client {
+            state_observer = state_observer.with_metrics_client(metrics.clone());
+        }
+        let state_observer = Arc::new(state_observer);
+
         // Create and mount the consolidated ortho union filesystem with DDS access channel
         // Wire Scene Tracker channel for empirical scenery tracking
         // Wire FUSE kernel limits for concurrent background request control
         let mut ortho_union_fs =
             Fuse3OrthoUnionFS::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
                 .with_geo_index(Arc::clone(&geo_index))
-                .with_dds_access_channel(dds_access_tx)
+                .with_state_observer(state_observer)
                 .with_scene_tracker_channel(scene_tracker_tx)
-                .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold);
+                .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold)
+                .with_timeout(Duration::from_secs(self.generation_timeout_secs));
 
         // Wire metrics client for coalesced request tracking
-        if let Some(metrics) = service.metrics_client() {
+        if let Some(metrics) = metrics_client {
             ortho_union_fs = ortho_union_fs.with_metrics(metrics);
         }
         let mountpoint_str = mountpoint.to_string_lossy();
@@ -501,8 +528,7 @@ impl MountManager {
                 self.consolidated_session = Some(session);
                 self.consolidated_mount = Some(mount_info);
 
-                // Store DDS access channel receiver, indexes for tile-based prefetcher
-                self.dds_access_rx = Some(dds_access_rx);
+                // Store indexes for tile-based prefetcher
                 self.ortho_union_index = Some(index_for_prefetch);
                 self.geo_index = Some(geo_index);
 
@@ -538,20 +564,6 @@ impl MountManager {
     /// Get consolidated ortho mount info (if mounted).
     pub fn consolidated_mount(&self) -> Option<&ActiveMount> {
         self.consolidated_mount.as_ref()
-    }
-
-    /// Take the DDS access event receiver for tile-based prefetching.
-    ///
-    /// This method takes ownership of the receiver, so it can only be called once.
-    /// The receiver is created when mounting consolidated ortho and is used by
-    /// the tile-based prefetcher to receive DDS access events from FUSE.
-    ///
-    /// # Returns
-    ///
-    /// `Some(receiver)` if consolidated ortho is mounted and receiver hasn't been taken,
-    /// `None` otherwise.
-    pub fn take_dds_access_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<DdsAccessEvent>> {
-        self.dds_access_rx.take()
     }
 
     /// Take the Scene Tracker event receiver for empirical scenery tracking.
@@ -657,7 +669,6 @@ impl MountManager {
         self.consolidated_service = None;
 
         // Clear tile-based prefetch resources
-        self.dds_access_rx = None;
         self.ortho_union_index = None;
         self.geo_index = None;
 
@@ -731,6 +742,7 @@ impl MountManager {
             chunk_disk_cache_hit_rate: 0.0,
             chunk_disk_cache_size_bytes: 0,
             chunk_disk_bytes_written: 0,
+            dds_disk_bytes_written: 0,
             chunk_disk_bytes_read: 0,
             encodes_completed: 0,
             encodes_active: 0,
@@ -802,6 +814,9 @@ impl MountManager {
             total.chunk_disk_bytes_written = total
                 .chunk_disk_bytes_written
                 .max(snapshot.chunk_disk_bytes_written);
+            total.dds_disk_bytes_written = total
+                .dds_disk_bytes_written
+                .max(snapshot.dds_disk_bytes_written);
             total.dds_disk_bytes_read = total.dds_disk_bytes_read.max(snapshot.dds_disk_bytes_read);
             total.chunk_disk_bytes_read = total
                 .chunk_disk_bytes_read
@@ -887,12 +902,6 @@ impl Drop for MountManager {
 pub struct ServiceBuilder {
     service_config: ServiceConfig,
     provider_config: crate::provider::ProviderConfig,
-    logger: Arc<dyn crate::log::Logger>,
-    /// Shared disk I/O limiter across all service instances.
-    /// Note: Currently unused as DiskCacheAdapter handles I/O internally.
-    /// Kept for potential future use with shared I/O limiting.
-    #[allow(dead_code)]
-    disk_io_limiter: Arc<StorageConcurrencyLimiter>,
     /// Shared tile request callback for FUSE-based position inference.
     /// When set, all services forward tile requests to this callback.
     tile_request_callback: Option<TileRequestCallback>,
@@ -900,66 +909,13 @@ pub struct ServiceBuilder {
 
 impl ServiceBuilder {
     /// Create a new service builder.
-    ///
-    /// Creates a shared disk I/O concurrency limiter that will be used by
-    /// all services built by this builder. This prevents disk I/O exhaustion
-    /// when multiple packages are mounted simultaneously.
-    ///
-    /// The disk I/O limiter is tuned based on the configured or detected storage profile:
-    /// - HDD: Conservative concurrency (1-4 ops)
-    /// - SSD: Moderate concurrency (~32-64 ops)
-    /// - NVMe: Aggressive concurrency (~128-256 ops)
-    /// - Auto: Detects storage type from cache directory
     pub fn new(
         service_config: ServiceConfig,
         provider_config: crate::provider::ProviderConfig,
-        logger: Arc<dyn crate::log::Logger>,
     ) -> Self {
-        Self::with_disk_io_profile(
-            service_config,
-            provider_config,
-            logger,
-            DiskIoProfile::default(),
-        )
-    }
-
-    /// Create a new service builder with a specific disk I/O profile.
-    ///
-    /// # Arguments
-    ///
-    /// * `disk_io_profile` - The disk I/O profile to use for concurrency limiting
-    pub fn with_disk_io_profile(
-        service_config: ServiceConfig,
-        provider_config: crate::provider::ProviderConfig,
-        logger: Arc<dyn crate::log::Logger>,
-        disk_io_profile: DiskIoProfile,
-    ) -> Self {
-        // Resolve Auto profile based on cache directory (or current dir if not set)
-        let resolved_profile = if let Some(cache_dir) = service_config.cache_directory() {
-            disk_io_profile.resolve_for_path(cache_dir)
-        } else {
-            // If no cache directory is set, just use the profile as-is
-            // (Auto will fall back to SSD in resolve_for_path)
-            disk_io_profile.resolve_for_path(std::path::Path::new("."))
-        };
-
-        // Create limiter based on resolved profile
-        let disk_io_limiter = Arc::new(StorageConcurrencyLimiter::for_disk_io_profile(
-            resolved_profile,
-            "global_disk_io",
-        ));
-
-        tracing::info!(
-            profile = %resolved_profile,
-            max_concurrent = disk_io_limiter.max_concurrent(),
-            "Created shared disk I/O limiter for multi-package mounting"
-        );
-
         Self {
             service_config,
             provider_config,
-            logger,
-            disk_io_limiter,
             tile_request_callback: None,
         }
     }
@@ -987,12 +943,9 @@ impl ServiceBuilder {
     ///
     /// Returns an error if any component fails to initialize.
     pub async fn build_service_async(&self) -> Result<XEarthLayerService, ServiceError> {
-        let mut service = XEarthLayerService::start(
-            self.service_config.clone(),
-            self.provider_config.clone(),
-            self.logger.clone(),
-        )
-        .await?;
+        let mut service =
+            XEarthLayerService::start(self.service_config.clone(), self.provider_config.clone())
+                .await?;
 
         // Wire tile request callback for FUSE-based position inference
         if let Some(ref callback) = self.tile_request_callback {

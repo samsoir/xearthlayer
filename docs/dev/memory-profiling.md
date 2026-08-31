@@ -2,6 +2,10 @@
 
 This guide covers how to profile XEarthLayer's memory usage using [heaptrack](https://github.com/KDE/heaptrack), a Linux heap memory profiler that tracks allocations, identifies peak consumers, and detects leaks.
 
+> For long unattended flights, or when the process may be killed by the OOM
+> killer, use [Memory Telemetry](memory-telemetry.md) instead — heaptrack loses
+> all data on `kill -9`.
+
 ## Installation
 
 ```bash

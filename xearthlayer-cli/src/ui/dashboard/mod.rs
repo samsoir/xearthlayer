@@ -191,7 +191,7 @@ impl Dashboard {
 
         // Update disk history (both reads and writes for I/O tracking)
         self.disk_history.update(
-            snapshot.chunk_disk_bytes_written,
+            snapshot.chunk_disk_bytes_written + snapshot.dds_disk_bytes_written,
             snapshot.chunk_disk_bytes_read + snapshot.dds_disk_bytes_read,
             sample_interval,
         );

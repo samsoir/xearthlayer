@@ -42,7 +42,6 @@
 //! drop(permit); // Release the permit
 //! ```
 
-use crate::config::DiskIoProfile;
 use crate::executor::policy::Priority;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -88,20 +87,25 @@ pub const MAX_NETWORK_CAPACITY: usize = 64;
 /// Default disk I/O pool capacity (SSD profile).
 pub const DEFAULT_DISK_IO_CAPACITY: usize = 64;
 
+/// Blocking threads reserved beyond the CPU and disk I/O pools.
+///
+/// Not every `spawn_blocking` call takes a resource permit. The startup disk
+/// scans (`cache/lru_index.rs`, `prefetch/scenery_index.rs`), the GPU encoder
+/// worker, storage detection, and — most importantly — the fire-and-forget
+/// cache writes in `tasks/build_and_cache_dds.rs` all queue onto the blocking
+/// pool ungated. The write backlog is the one that moves: it is what
+/// `disk_writes_active` and `mem_cache_writes_active` measure.
+///
+/// This reserve keeps those off the pooled work's threads. It is a floor, not
+/// a bound — an ungated backlog larger than the reserve queues rather than
+/// spawning threads, which is the intended behaviour (see issue #227).
+pub const BLOCKING_POOL_HEADROOM: usize = 32;
+
 /// Default CPU pool capacity multiplier.
 pub const DEFAULT_CPU_CAPACITY_MULTIPLIER: f64 = 1.25;
 
 /// Minimum CPU pool capacity addition.
 pub const MIN_CPU_CAPACITY_ADDITION: usize = 2;
-
-/// Disk I/O capacity for HDD profile.
-pub const DISK_IO_CAPACITY_HDD: usize = 4;
-
-/// Disk I/O capacity for SSD profile.
-pub const DISK_IO_CAPACITY_SSD: usize = 64;
-
-/// Disk I/O capacity for NVMe profile.
-pub const DISK_IO_CAPACITY_NVME: usize = 256;
 
 // =============================================================================
 // Resource Type
@@ -428,34 +432,28 @@ impl Default for ResourcePoolConfig {
 }
 
 impl ResourcePoolConfig {
+    /// Blocking threads needed to service this configuration.
+    ///
+    /// The CPU and disk I/O pools both dispatch through `spawn_blocking`, so
+    /// their combined capacity is the worst-case simultaneous demand for
+    /// blocking threads. The network pool is excluded: it gates async HTTP,
+    /// which runs on worker threads.
+    ///
+    /// Used to size the Tokio blocking pool in
+    /// [`crate::runtime::build_service_runtime`]. Sizing it any smaller lets
+    /// the pools grant more permits than there are threads to serve them;
+    /// leaving it at tokio's 512 default ratchets the glibc arena on every
+    /// thread excursion. See issue #227.
+    pub fn blocking_threads_required(&self) -> usize {
+        self.cpu + self.disk_io + BLOCKING_POOL_HEADROOM
+    }
+
     /// Creates a configuration with the given capacities.
     pub fn new(network: usize, disk_io: usize, cpu: usize) -> Self {
         Self {
             network,
             disk_io,
             cpu,
-            max_prefetch_fraction: DEFAULT_MAX_PREFETCH_FRACTION,
-        }
-    }
-
-    /// Creates a configuration with disk I/O capacity based on storage profile.
-    pub fn with_disk_io_profile(mut self, profile: DiskIoProfile) -> Self {
-        self.disk_io = match profile {
-            DiskIoProfile::Auto => DEFAULT_DISK_IO_CAPACITY, // Assume SSD
-            DiskIoProfile::Hdd => DISK_IO_CAPACITY_HDD,
-            DiskIoProfile::Ssd => DISK_IO_CAPACITY_SSD,
-            DiskIoProfile::Nvme => DISK_IO_CAPACITY_NVME,
-        };
-        self
-    }
-}
-
-impl From<&crate::config::ExecutorSettings> for ResourcePoolConfig {
-    fn from(settings: &crate::config::ExecutorSettings) -> Self {
-        Self {
-            network: settings.network_concurrent,
-            disk_io: settings.disk_io_concurrent,
-            cpu: settings.cpu_concurrent,
             max_prefetch_fraction: DEFAULT_MAX_PREFETCH_FRACTION,
         }
     }
@@ -714,15 +712,6 @@ mod tests {
         assert_eq!(config.network, 128);
         assert_eq!(config.disk_io, 32);
         assert_eq!(config.cpu, 8);
-    }
-
-    #[test]
-    fn test_resource_pool_config_with_disk_profile() {
-        let config = ResourcePoolConfig::default().with_disk_io_profile(DiskIoProfile::Hdd);
-        assert_eq!(config.disk_io, DISK_IO_CAPACITY_HDD);
-
-        let config = ResourcePoolConfig::default().with_disk_io_profile(DiskIoProfile::Nvme);
-        assert_eq!(config.disk_io, DISK_IO_CAPACITY_NVME);
     }
 
     #[test]

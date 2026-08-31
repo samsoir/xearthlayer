@@ -284,6 +284,10 @@ pub enum PublishCommands {
         #[arg(long)]
         geojson: bool,
 
+        /// Path to region_metadata.json (default: <repo>/region_metadata.json)
+        #[arg(long)]
+        metadata: Option<PathBuf>,
+
         /// Repository path (default: current directory)
         #[arg(default_value = ".")]
         repo: PathBuf,
@@ -461,6 +465,7 @@ pub struct CoverageArgs {
     pub height: u32,
     pub dark: bool,
     pub geojson: bool,
+    pub metadata: Option<PathBuf>,
     pub repo: PathBuf,
 }
 

@@ -6,7 +6,6 @@
 use std::path::PathBuf;
 
 use super::settings::*;
-use super::DiskIoProfile;
 use crate::dds::DdsFormat;
 
 // =============================================================================
@@ -57,13 +56,6 @@ pub fn default_prefetch_in_flight() -> usize {
 /// tuned — higher values starve X-Plane's render thread, lower values
 /// under-feed the executor on high-core systems.
 pub fn default_max_concurrent_jobs() -> usize {
-    (num_cpus() / 2).max(2)
-}
-
-/// Default executor CPU concurrent: num_cpus / 2, minimum 2.
-///
-/// Matches the pipeline CPU concurrent default — leaves headroom for X-Plane.
-pub fn default_executor_cpu_concurrent() -> usize {
     (num_cpus() / 2).max(2)
 }
 
@@ -278,8 +270,10 @@ pub const DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS: u64 = 30;
 // Texture defaults
 // =============================================================================
 
-/// Default mipmap count (5 levels: 4096 → 2048 → 1024 → 512 → 256).
-pub const DEFAULT_MIPMAP_COUNT: usize = 5;
+// There is deliberately no default mipmap count: the chain length is derived
+// from the texture dimensions at encode time via
+// `MipmapGenerator::full_chain_count()`. A constant silently produces a wrong
+// chain for any texture size it was not written for.
 
 /// Default texture compressor backend: ISPC SIMD.
 pub const DEFAULT_COMPRESSOR: &str = "ispc";
@@ -290,13 +284,6 @@ pub const DEFAULT_GPU_DEVICE: &str = "integrated";
 // =============================================================================
 // Executor defaults
 // =============================================================================
-
-/// Default network resource pool capacity.
-/// Conservative default of 128 prevents provider rate limiting.
-pub const DEFAULT_EXECUTOR_NETWORK_CONCURRENT: usize = 128;
-
-/// Default disk I/O resource pool capacity for SSD storage.
-pub const DEFAULT_EXECUTOR_DISK_IO_CONCURRENT: usize = 64;
 
 /// Default maximum concurrent tasks in the executor.
 pub const DEFAULT_EXECUTOR_MAX_CONCURRENT_TASKS: usize = 128;
@@ -347,7 +334,6 @@ impl Default for ConfigFile {
                 memory_size: DEFAULT_MEMORY_CACHE_SIZE,
                 disk_size: DEFAULT_DISK_CACHE_SIZE,
                 dds_disk_ratio: DEFAULT_DDS_DISK_RATIO,
-                disk_io_profile: DiskIoProfile::Auto,
             },
             texture: TextureSettings {
                 format: DdsFormat::BC1,
@@ -416,9 +402,6 @@ impl Default for ConfigFile {
                 directory: Some(config_dir.join("patches")),
             },
             executor: ExecutorSettings {
-                network_concurrent: DEFAULT_EXECUTOR_NETWORK_CONCURRENT,
-                cpu_concurrent: default_executor_cpu_concurrent(),
-                disk_io_concurrent: DEFAULT_EXECUTOR_DISK_IO_CONCURRENT,
                 max_concurrent_tasks: DEFAULT_EXECUTOR_MAX_CONCURRENT_TASKS,
                 job_channel_capacity: DEFAULT_EXECUTOR_JOB_CHANNEL_CAPACITY,
                 request_channel_capacity: DEFAULT_EXECUTOR_REQUEST_CHANNEL_CAPACITY,

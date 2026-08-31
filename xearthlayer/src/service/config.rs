@@ -351,7 +351,7 @@ mod tests {
         let config = ServiceConfig::builder().texture(texture).build();
 
         assert_eq!(config.texture().format(), DdsFormat::BC3);
-        assert_eq!(config.texture().mipmap_count(), 3);
+        assert_eq!(config.texture().mipmap_count(), Some(3));
     }
 
     #[test]
@@ -390,7 +390,7 @@ mod tests {
             .build();
 
         assert_eq!(config.texture().format(), DdsFormat::BC1);
-        assert_eq!(config.texture().mipmap_count(), 5);
+        assert_eq!(config.texture().mipmap_count(), Some(5));
         assert_eq!(config.download().timeout_secs(), 45);
         assert!(config.cache_enabled());
         assert_eq!(config.mountpoint(), Some("/mnt/test"));

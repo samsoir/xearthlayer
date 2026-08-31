@@ -23,12 +23,13 @@ use crate::executor::{
     TaskOutput, TaskResult,
 };
 use crate::metrics::{MetricsClient, OptionalMetrics};
+use bytes::Bytes;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
-use tracing::{debug, info, trace, warn, Instrument};
+use tracing::{debug, trace, warn, Instrument};
 
 /// Task that downloads all chunks for a tile.
 ///
@@ -181,7 +182,7 @@ pub fn get_chunks_from_output(output: &TaskOutput) -> Option<&ChunkResults> {
 struct ChunkData {
     row: u8,
     col: u8,
-    data: Vec<u8>,
+    data: Bytes,
 }
 
 /// Result of a failed chunk download.
@@ -358,7 +359,7 @@ where
                 let duration_us = download_start.elapsed().as_micros() as u64;
                 let bytes = data.len() as u64;
 
-                info!(
+                debug!(
                     provider = provider.name(),
                     global_row = global_row,
                     global_col = global_col,
@@ -447,13 +448,13 @@ where
 /// Spawns a fire-and-forget task to write chunk data to disk cache.
 ///
 /// Emits `disk_write_started` when beginning and `disk_write_completed`
-/// with byte count and duration when finished.
+/// with byte count when finished.
 fn spawn_cache_write<D>(
     disk_cache: Arc<D>,
     tile: TileCoord,
     chunk_row: u8,
     chunk_col: u8,
-    data: Vec<u8>,
+    data: Bytes,
     metrics: Option<MetricsClient>,
 ) where
     D: DiskCache,
@@ -462,15 +463,13 @@ fn spawn_cache_write<D>(
     tokio::spawn(async move {
         // Track disk write started
         metrics.disk_write_started();
-        let start = Instant::now();
 
         let _ = disk_cache
             .put(tile.row, tile.col, tile.zoom, chunk_row, chunk_col, data)
             .await;
 
         // Track disk write completed
-        let duration_us = start.elapsed().as_micros() as u64;
-        metrics.disk_write_completed(bytes, duration_us);
+        metrics.disk_write_completed(bytes, D::TIER);
     });
 }
 

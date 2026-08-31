@@ -156,6 +156,11 @@ mod inner {
         let mut result = Vec::new();
 
         for (level_idx, level) in stream.enumerate() {
+            // The GPU kernel asserts both dimensions are multiples of 4, so the
+            // 2×2 and 1×1 tail of a full mipmap chain must be padded up to one
+            // whole block first. Without this the worker panics and shuts down
+            // for the rest of the process lifetime.
+            let level = crate::dds::compressor::pad_to_block_multiple(&level);
             let lw = level.width();
             let lh = level.height();
             let level_output_size = compressed_size(lw, lh, block_size);

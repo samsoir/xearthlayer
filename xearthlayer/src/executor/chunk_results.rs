@@ -4,6 +4,8 @@
 //! during tile generation. A tile consists of 256 chunks (16×16 grid), and each
 //! chunk is downloaded independently with retry logic.
 
+use bytes::Bytes;
+
 /// Result of downloading chunks for a tile.
 ///
 /// Tracks successful and failed chunks separately to enable partial
@@ -25,7 +27,7 @@ pub struct ChunkSuccess {
     /// Chunk column within tile (0-15)
     pub col: u8,
     /// Raw image data (JPEG)
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 /// A chunk that failed to download after all retries.
@@ -51,7 +53,7 @@ impl ChunkResults {
     }
 
     /// Adds a successful chunk download.
-    pub fn add_success(&mut self, row: u8, col: u8, data: Vec<u8>) {
+    pub fn add_success(&mut self, row: u8, col: u8, data: Bytes) {
         self.successes.push(ChunkSuccess { row, col, data });
     }
 
@@ -103,7 +105,7 @@ impl ChunkResults {
         self.successes
             .iter()
             .find(|c| c.row == row && c.col == col)
-            .map(|c| c.data.as_slice())
+            .map(|c| c.data.as_ref())
     }
 
     /// Returns the total bytes downloaded across all successful chunks.
@@ -135,8 +137,8 @@ mod tests {
     #[test]
     fn test_chunk_results_add_success() {
         let mut results = ChunkResults::new();
-        results.add_success(0, 0, vec![1, 2, 3]);
-        results.add_success(0, 1, vec![4, 5, 6]);
+        results.add_success(0, 0, vec![1, 2, 3].into());
+        results.add_success(0, 1, vec![4, 5, 6].into());
 
         assert_eq!(results.success_count(), 2);
         assert_eq!(results.get(0, 0), Some(&[1u8, 2, 3][..]));
@@ -161,7 +163,7 @@ mod tests {
 
         // Add 200 successes
         for i in 0..200 {
-            results.add_success((i / 16) as u8, (i % 16) as u8, vec![0]);
+            results.add_success((i / 16) as u8, (i % 16) as u8, vec![0].into());
         }
 
         // Add 56 failures
@@ -180,7 +182,7 @@ mod tests {
         // Add all 256 chunks as successes
         for row in 0..16u8 {
             for col in 0..16u8 {
-                results.add_success(row, col, vec![0]);
+                results.add_success(row, col, vec![0].into());
             }
         }
 

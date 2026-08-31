@@ -3,7 +3,7 @@
 //! Provides functions to calculate optimal XEarthLayer settings based on
 //! detected hardware capabilities.
 
-use crate::config::{format_size, DiskIoProfile, GB, MB};
+use crate::config::{format_size, GB, MB};
 
 /// Floor for the memory-cache recommendation.
 ///
@@ -27,8 +27,6 @@ pub struct RecommendedSettings {
     pub memory_cache: usize,
     /// Recommended disk cache size in bytes
     pub disk_cache: usize,
-    /// Recommended disk I/O profile
-    pub disk_io_profile: DiskIoProfile,
 }
 
 impl RecommendedSettings {
@@ -38,16 +36,10 @@ impl RecommendedSettings {
     ///
     /// * `total_memory` - Total system memory in bytes
     /// * `available_disk` - Bytes available at the cache directory's filesystem
-    /// * `detected_profile` - Storage type detected for cache location
-    pub fn for_system(
-        total_memory: usize,
-        available_disk: u64,
-        detected_profile: DiskIoProfile,
-    ) -> Self {
+    pub fn for_system(total_memory: usize, available_disk: u64) -> Self {
         Self {
             memory_cache: recommended_memory_cache(total_memory),
             disk_cache: recommended_disk_cache(available_disk),
-            disk_io_profile: detected_profile,
         }
     }
 
@@ -60,40 +52,42 @@ impl RecommendedSettings {
     pub fn disk_cache_display(&self) -> String {
         format_size(self.disk_cache)
     }
-
-    /// Get disk I/O profile string for configuration.
-    pub fn disk_io_profile_str(&self) -> &'static str {
-        recommended_disk_io_profile(self.disk_io_profile)
-    }
 }
 
 /// Calculate recommended memory cache size from total system memory.
 ///
 /// The memory cache is intentionally a small request absorber, not a working
 /// set holder — the on-disk DDS cache is the working set. The formula is
-/// `RAM / 12`, clamped to `[MIN_MEMORY_CACHE_BYTES, RAM / 4]`.
+/// `RAM / 12`, rounded to the nearest whole GB, then clamped to
+/// `[MIN_MEMORY_CACHE_BYTES, RAM / 4]`.
 ///
 /// # Examples
 ///
 /// | System RAM | Recommended cache |
 /// |------------|------------------|
 /// | 4 GB       | 500 MB (floor)   |
-/// | 8 GB       | ~683 MB          |
-/// | 16 GB      | ~1.3 GB          |
-/// | 32 GB      | ~2.7 GB          |
-/// | 64 GB      | ~5.3 GB          |
-/// | 128 GB     | ~10.7 GB         |
+/// | 8 GB       | 1 GB             |
+/// | 16 GB      | 1 GB             |
+/// | 32 GB      | 3 GB             |
+/// | 64 GB      | 5 GB             |
+/// | 128 GB     | 11 GB            |
 ///
 /// ```
 /// use xearthlayer::system::recommended_memory_cache;
 ///
 /// let cache = recommended_memory_cache(16 * 1024 * 1024 * 1024); // 16 GB RAM
-/// assert!(cache >= 1_300_000_000 && cache <= 1_500_000_000); // ~1.3 GB
+/// assert_eq!(cache, 1024 * 1024 * 1024); // 1 GB, rounded to a whole GB
 /// ```
 pub fn recommended_memory_cache(total_memory: usize) -> usize {
     let raw = total_memory / 12;
+    // Round to the nearest whole GB so the wizard writes a tidy config value,
+    // matching recommended_disk_cache which already uses a round step. Nearest
+    // rather than floor: flooring would drop an 8 GB machine from ~683 MB to
+    // the 500 MB minimum, whereas rounding lifts it to a clean 1 GB. Values
+    // that round to zero are caught by the MIN clamp below.
+    let rounded = ((raw as f64 / GB as f64).round() as usize) * GB;
     let ceiling = total_memory / 4;
-    raw.clamp(MIN_MEMORY_CACHE_BYTES, ceiling.max(MIN_MEMORY_CACHE_BYTES))
+    rounded.clamp(MIN_MEMORY_CACHE_BYTES, ceiling.max(MIN_MEMORY_CACHE_BYTES))
 }
 
 /// Calculate recommended disk cache size from available disk space.
@@ -126,23 +120,6 @@ pub fn recommended_disk_cache(available_bytes: u64) -> usize {
     usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
-/// Get recommended disk I/O profile string for configuration.
-///
-/// # Arguments
-///
-/// * `detected_profile` - The detected storage profile
-///
-/// # Returns
-///
-/// - `"nvme"` if NVMe storage detected (enables aggressive concurrency)
-/// - `"auto"` otherwise (safe default that re-detects at runtime)
-pub fn recommended_disk_io_profile(detected_profile: DiskIoProfile) -> &'static str {
-    match detected_profile {
-        DiskIoProfile::Nvme => "nvme",
-        _ => "auto",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,16 +133,26 @@ mod tests {
         assert_eq!(recommended_memory_cache(1 * GB), MIN_MEMORY_CACHE_BYTES);
     }
 
+    // Issue #218: the wizard wrote "2.6 GB" on a 32 GB machine and the app
+    // rejected it. Recommendations are now whole GB above the floor, matching
+    // recommended_disk_cache's existing round-step behaviour.
     #[test]
-    fn memory_cache_uses_ram_div_12_in_normal_range() {
-        // 16GB / 12 = 1.333... GB
-        assert_eq!(recommended_memory_cache(16 * GB), 16 * GB / 12);
-        // 32GB / 12 = 2.666... GB
-        assert_eq!(recommended_memory_cache(32 * GB), 32 * GB / 12);
-        // 64GB / 12 = 5.333... GB
-        assert_eq!(recommended_memory_cache(64 * GB), 64 * GB / 12);
-        // 128GB / 12 = 10.666... GB
-        assert_eq!(recommended_memory_cache(128 * GB), 128 * GB / 12);
+    fn memory_cache_rounds_ram_div_12_to_whole_gb() {
+        let cases = [
+            (4 * GB, MIN_MEMORY_CACHE_BYTES), // rounds to 0, caught by the floor
+            (8 * GB, GB),
+            (16 * GB, GB),
+            (32 * GB, 3 * GB),
+            (64 * GB, 5 * GB),
+            (128 * GB, 11 * GB),
+        ];
+        for (ram, expected) in cases {
+            assert_eq!(
+                recommended_memory_cache(ram),
+                expected,
+                "RAM {ram} should recommend {expected}"
+            );
+        }
     }
 
     #[test]
@@ -201,24 +188,10 @@ mod tests {
     }
 
     #[test]
-    fn io_profile_nvme_is_explicit() {
-        assert_eq!(recommended_disk_io_profile(DiskIoProfile::Nvme), "nvme");
-    }
-
-    #[test]
-    fn io_profile_others_default_to_auto() {
-        assert_eq!(recommended_disk_io_profile(DiskIoProfile::Ssd), "auto");
-        assert_eq!(recommended_disk_io_profile(DiskIoProfile::Hdd), "auto");
-        assert_eq!(recommended_disk_io_profile(DiskIoProfile::Auto), "auto");
-    }
-
-    #[test]
     fn recommended_settings_combines_inputs() {
-        let settings =
-            RecommendedSettings::for_system(32 * GB, 230 * GB as u64, DiskIoProfile::Nvme);
-        assert_eq!(settings.memory_cache, 32 * GB / 12);
+        let settings = RecommendedSettings::for_system(32 * GB, 230 * GB as u64);
+        // 32GB / 12 = 2.666... GB, rounded to a whole 3 GB.
+        assert_eq!(settings.memory_cache, 3 * GB);
         assert_eq!(settings.disk_cache, 50 * GB);
-        assert_eq!(settings.disk_io_profile, DiskIoProfile::Nvme);
-        assert_eq!(settings.disk_io_profile_str(), "nvme");
     }
 }

@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::cache::DiskTier;
 use crate::config::DEFAULT_MEMORY_CACHE_SIZE;
 use crate::metrics::MetricsClient;
 
@@ -23,8 +24,8 @@ pub struct ServiceCacheConfig {
     /// For disk caches, this enables GC eviction reporting.
     pub metrics_client: Option<MetricsClient>,
 
-    /// Whether this is a DDS tile cache tier (affects metric event routing).
-    pub is_dds_tier: bool,
+    /// Which disk cache tier this config describes.
+    pub tier: DiskTier,
 }
 
 /// Provider-specific configuration.
@@ -70,7 +71,7 @@ impl ServiceCacheConfig {
             max_size_bytes,
             provider: ProviderConfig::Memory { ttl },
             metrics_client: None,
-            is_dds_tier: false,
+            tier: DiskTier::Chunk,
         }
     }
 
@@ -107,7 +108,7 @@ impl ServiceCacheConfig {
                 provider_name,
             },
             metrics_client: None,
-            is_dds_tier: false,
+            tier: DiskTier::Chunk,
         }
     }
 
@@ -116,7 +117,7 @@ impl ServiceCacheConfig {
     /// DDS tier providers emit `dds_disk_cache_size` metrics instead of
     /// `disk_cache_size`, allowing the TUI to correctly aggregate both tiers.
     pub fn as_dds_tier(mut self) -> Self {
-        self.is_dds_tier = true;
+        self.tier = DiskTier::Dds;
         self
     }
 
@@ -157,8 +158,8 @@ pub struct DiskProviderConfig {
     /// Optional metrics client for reporting GC eviction stats.
     pub metrics_client: Option<MetricsClient>,
 
-    /// Whether this is a DDS tile cache tier (affects which metric event is emitted).
-    pub is_dds_tier: bool,
+    /// Which disk cache tier this config describes.
+    pub tier: DiskTier,
 }
 
 impl DiskProviderConfig {
@@ -182,7 +183,7 @@ impl DiskProviderConfig {
                 gc_interval: *gc_interval,
                 provider_name: provider_name.clone(),
                 metrics_client: None,
-                is_dds_tier: false,
+                tier: config.tier,
             }),
             ProviderConfig::Memory { .. } => None,
         }
@@ -274,5 +275,39 @@ mod tests {
         let config = ServiceCacheConfig::memory(1_000_000, None);
         let disk_config = DiskProviderConfig::from_service_config(&config);
         assert!(disk_config.is_none());
+    }
+
+    #[test]
+    fn disk_config_defaults_to_chunk_tier_and_builder_sets_dds() {
+        let config = ServiceCacheConfig::disk(
+            1_000_000,
+            PathBuf::from("/tmp/xel-tier-test"),
+            Duration::from_secs(60),
+            "bing".to_string(),
+        );
+        assert_eq!(config.tier, DiskTier::Chunk);
+
+        let dds = ServiceCacheConfig::disk(
+            1_000_000,
+            PathBuf::from("/tmp/xel-tier-test"),
+            Duration::from_secs(60),
+            "bing".to_string(),
+        )
+        .as_dds_tier();
+        assert_eq!(dds.tier, DiskTier::Dds);
+    }
+
+    #[test]
+    fn from_service_config_propagates_dds_tier() {
+        let config = ServiceCacheConfig::disk(
+            1_000_000,
+            PathBuf::from("/tmp/xel-tier-test"),
+            Duration::from_secs(60),
+            "bing".to_string(),
+        )
+        .as_dds_tier();
+
+        let disk_config = DiskProviderConfig::from_service_config(&config).unwrap();
+        assert_eq!(disk_config.tier, DiskTier::Dds);
     }
 }

@@ -3,7 +3,9 @@
 //! Provides a `TextureEncoder` implementation that encodes RGBA images
 //! to DirectDraw Surface (DDS) format with BC1/BC3 compression.
 
-use crate::dds::{default_compressor, DdsEncoder, DdsFormat, DdsHeader, ImageCompressor};
+use crate::dds::{
+    default_compressor, DdsEncoder, DdsFormat, DdsHeader, ImageCompressor, MipmapGenerator,
+};
 use crate::texture::{TextureEncoder, TextureError};
 use image::RgbaImage;
 use std::sync::Arc;
@@ -20,15 +22,15 @@ use std::sync::Arc;
 /// use xearthlayer::texture::{DdsTextureEncoder, TextureEncoder};
 /// use xearthlayer::dds::DdsFormat;
 ///
-/// let encoder = DdsTextureEncoder::new(DdsFormat::BC1)
-///     .with_mipmap_count(5);
+/// let encoder = DdsTextureEncoder::new(DdsFormat::BC1);
 ///
 /// assert_eq!(encoder.extension(), "dds");
 /// assert_eq!(encoder.name(), "DDS BC1");
 /// ```
 pub struct DdsTextureEncoder {
     format: DdsFormat,
-    mipmap_count: usize,
+    /// Mipmap levels to emit; `None` means the full chain for the texture size.
+    mipmap_count: Option<usize>,
     /// Image compressor for per-level encoding (ISPC, Software).
     /// Also used as fallback for `encode_with_mipmaps()` when pre-generated
     /// mipmap chains are supplied directly. Always initialized to the default
@@ -69,7 +71,8 @@ impl std::fmt::Debug for DdsTextureEncoder {
 impl DdsTextureEncoder {
     /// Create a new DDS encoder with the specified compression format.
     ///
-    /// By default, generates 5 mipmap levels (4096, 2048, 1024, 512, 256).
+    /// By default, generates the full mipmap chain for whatever texture size
+    /// is encoded — 13 levels for 4096×4096, down to 1×1.
     ///
     /// # Arguments
     ///
@@ -77,13 +80,17 @@ impl DdsTextureEncoder {
     pub fn new(format: DdsFormat) -> Self {
         Self {
             format,
-            mipmap_count: 5,
+            mipmap_count: None,
             compressor: default_compressor(),
             mipmap_compressor: None,
         }
     }
 
-    /// Set the number of mipmap levels to generate.
+    /// Truncate the mipmap chain to a fixed number of levels.
+    ///
+    /// Intended for tests and special-purpose callers. Production code should
+    /// leave this unset so the chain follows the texture dimensions. The count
+    /// is clamped to the full chain length at encode time.
     ///
     /// # Arguments
     ///
@@ -100,7 +107,7 @@ impl DdsTextureEncoder {
     ///     .with_mipmap_count(3);
     /// ```
     pub fn with_mipmap_count(mut self, count: usize) -> Self {
-        self.mipmap_count = count;
+        self.mipmap_count = Some(count);
         self
     }
 
@@ -131,12 +138,29 @@ impl DdsTextureEncoder {
         self.format
     }
 
-    /// Get the mipmap count.
-    pub fn mipmap_count(&self) -> usize {
+    /// Get the mipmap level override, or `None` for the full chain.
+    pub fn mipmap_count(&self) -> Option<usize> {
         self.mipmap_count
     }
 
+    /// Resolve the mipmap chain length for the given dimensions.
+    ///
+    /// Mirrors `DdsEncoder::resolve_mipmap_count` so that `expected_size()` —
+    /// which becomes the `st_size` FUSE reports to X-Plane — can never
+    /// disagree with the number of levels actually written.
+    fn resolve_mipmap_count(&self, width: u32, height: u32) -> usize {
+        let full = MipmapGenerator::full_chain_count(width, height);
+        match self.mipmap_count {
+            Some(count) => count.clamp(1, full),
+            None => full,
+        }
+    }
+
     /// Calculate total data size for a DDS file with mipmaps.
+    ///
+    /// `mipmap_count` must already be clamped to the chain length that the
+    /// dimensions actually support; this loop does not terminate at 1×1 on its
+    /// own and would otherwise over-count.
     ///
     /// # Arguments
     ///
@@ -176,7 +200,11 @@ impl DdsTextureEncoder {
 
 impl TextureEncoder for DdsTextureEncoder {
     fn encode(&self, image: RgbaImage) -> Result<Vec<u8>, TextureError> {
-        let mut encoder = DdsEncoder::new(self.format).with_mipmap_count(self.mipmap_count);
+        let mut encoder = DdsEncoder::new(self.format);
+
+        if let Some(count) = self.mipmap_count {
+            encoder = encoder.with_mipmap_count(count);
+        }
 
         if let Some(ref mc) = self.mipmap_compressor {
             encoder = encoder.with_mipmap_compressor(Arc::clone(mc));
@@ -189,7 +217,8 @@ impl TextureEncoder for DdsTextureEncoder {
 
     fn expected_size(&self, width: u32, height: u32) -> usize {
         let header_size = std::mem::size_of::<DdsHeader>(); // 128 bytes
-        let data_size = Self::calculate_data_size(width, height, self.format, self.mipmap_count);
+        let count = self.resolve_mipmap_count(width, height);
+        let data_size = Self::calculate_data_size(width, height, self.format, count);
         header_size + data_size
     }
 
@@ -213,14 +242,14 @@ mod tests {
     #[test]
     fn test_new_default_mipmap_count() {
         let encoder = DdsTextureEncoder::new(DdsFormat::BC1);
-        assert_eq!(encoder.mipmap_count(), 5);
+        assert_eq!(encoder.mipmap_count(), None);
         assert_eq!(encoder.format(), DdsFormat::BC1);
     }
 
     #[test]
     fn test_with_mipmap_count() {
         let encoder = DdsTextureEncoder::new(DdsFormat::BC3).with_mipmap_count(3);
-        assert_eq!(encoder.mipmap_count(), 3);
+        assert_eq!(encoder.mipmap_count(), Some(3));
         assert_eq!(encoder.format(), DdsFormat::BC3);
     }
 

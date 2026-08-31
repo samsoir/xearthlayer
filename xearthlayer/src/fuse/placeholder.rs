@@ -10,11 +10,15 @@
 //! X-Plane, even under memory pressure or when encoding fails.
 
 use crate::dds::{DdsEncoder, DdsError, DdsFormat};
+use bytes::Bytes;
 use image::RgbaImage;
 use std::sync::OnceLock;
 
 /// Static placeholder cache - generated once, never fails after first success.
-static DEFAULT_PLACEHOLDER: OnceLock<Vec<u8>> = OnceLock::new();
+/// `Bytes`, so handing out the placeholder is a refcount bump rather than an
+/// 11 MB copy. It is returned on every timeout, which is exactly when the
+/// process is least able to afford the allocation (#237).
+static DEFAULT_PLACEHOLDER: OnceLock<Bytes> = OnceLock::new();
 
 /// Generate a magenta placeholder DDS texture.
 ///
@@ -26,7 +30,8 @@ static DEFAULT_PLACEHOLDER: OnceLock<Vec<u8>> = OnceLock::new();
 /// * `width` - Texture width in pixels (typically 4096)
 /// * `height` - Texture height in pixels (typically 4096)
 /// * `format` - DDS compression format (BC1 or BC3)
-/// * `mipmap_count` - Number of mipmap levels (typically 5 for 4096→256)
+/// * `mipmap_count` - Number of mipmap levels; pass
+///   `MipmapGenerator::full_chain_count(width, height)` for the full chain
 ///
 /// # Returns
 ///
@@ -65,13 +70,22 @@ pub fn generate_magenta_placeholder(
 
 /// Generate a default magenta placeholder for X-Plane tiles.
 ///
-/// Uses standard settings: 4096×4096, BC1 compression, 5 mipmap levels.
+/// Uses standard settings: 4096×4096, BC1 compression, full mipmap chain.
+///
+/// The placeholder must carry the same chain length as a real tile — it is
+/// served through the same FUSE read path and checked against the same
+/// [`EXPECTED_DDS_SIZE`].
 ///
 /// # Returns
 ///
 /// Complete DDS file as bytes
 pub fn generate_default_placeholder() -> Result<Vec<u8>, DdsError> {
-    generate_magenta_placeholder(4096, 4096, DdsFormat::BC1, 5)
+    generate_magenta_placeholder(
+        4096,
+        4096,
+        DdsFormat::BC1,
+        crate::dds::MipmapGenerator::full_chain_count(4096, 4096),
+    )
 }
 
 /// Get the default placeholder, guaranteed to never return empty data.
@@ -82,7 +96,7 @@ pub fn generate_default_placeholder() -> Result<Vec<u8>, DdsError> {
 ///
 /// # Returns
 ///
-/// A clone of the cached placeholder DDS file (4096×4096, BC1, 5 mipmaps).
+/// A clone of the cached placeholder DDS file (4096×4096, BC1, full chain).
 ///
 /// # Panics
 ///
@@ -100,11 +114,13 @@ pub fn generate_default_placeholder() -> Result<Vec<u8>, DdsError> {
 /// assert!(!placeholder.is_empty());
 /// assert_eq!(&placeholder[0..4], b"DDS ");
 /// ```
-pub fn get_default_placeholder() -> Vec<u8> {
+pub fn get_default_placeholder() -> Bytes {
     DEFAULT_PLACEHOLDER
         .get_or_init(|| {
-            generate_default_placeholder()
-                .expect("Failed to generate default placeholder - this is a critical error")
+            Bytes::from(
+                generate_default_placeholder()
+                    .expect("Failed to generate default placeholder - this is a critical error"),
+            )
         })
         .clone()
 }
@@ -131,15 +147,26 @@ pub fn get_default_placeholder() -> Vec<u8> {
 pub fn init_placeholder_cache() -> Result<(), DdsError> {
     // Force initialization by calling get_or_init with our generator
     // If it fails, the error propagates
-    let _ = DEFAULT_PLACEHOLDER
-        .get_or_init(|| generate_default_placeholder().expect("Failed to generate placeholder"));
+    let _ = DEFAULT_PLACEHOLDER.get_or_init(|| {
+        Bytes::from(generate_default_placeholder().expect("Failed to generate placeholder"))
+    });
     Ok(())
 }
 
-/// Expected DDS size for 4096×4096 BC1 with 5 mipmaps.
+/// Expected DDS size for a 4096×4096 BC1 tile with a full mipmap chain.
 ///
-/// This is the standard size for X-Plane ortho tiles.
-pub const EXPECTED_DDS_SIZE: usize = 11_174_016;
+/// This is the standard size for X-Plane ortho tiles: 13 levels, 11,184,952
+/// bytes. `validate_dds_or_placeholder` gates every FUSE read against it, so
+/// it must track what the encoder actually emits — a regression test asserts
+/// both agree.
+///
+/// The computation lives in `cache::integrity` (the canonical cache
+/// integrity model shared by all cache tiers) so that DDS disk cache
+/// validation and this FUSE-boundary check can never drift apart. This
+/// re-export exists so existing callers of `fuse::EXPECTED_DDS_SIZE` keep
+/// working. The dependency direction is `fuse -> cache::integrity`, never
+/// the reverse: `cache::integrity` must not import anything from `fuse`.
+pub use crate::cache::integrity::EXPECTED_DDS_SIZE;
 
 /// Validates that DDS data is well-formed and returns it, or substitutes
 /// the default placeholder if validation fails.
@@ -150,13 +177,14 @@ pub const EXPECTED_DDS_SIZE: usize = 11_174_016;
 /// # Validation checks
 ///
 /// 1. Data is not empty
-/// 2. Data has correct size (11,174,016 bytes for 4096×4096 BC1)
+/// 2. Data has correct size ([`EXPECTED_DDS_SIZE`] — 11,184,952 bytes for a
+///    4096×4096 BC1 tile with its full 13-level mipmap chain)
 /// 3. Data starts with "DDS " magic bytes
 ///
 /// # Returns
 ///
 /// The original data if valid, or the default placeholder if invalid.
-pub fn validate_dds_or_placeholder(data: Vec<u8>, context: &str) -> Vec<u8> {
+pub fn validate_dds_or_placeholder(data: Bytes, context: &str) -> Bytes {
     // Check 1: Not empty
     if data.is_empty() {
         tracing::error!(
@@ -269,8 +297,8 @@ mod tests {
         assert!(result.is_ok());
         let dds = result.unwrap();
 
-        // Should be 4096×4096 BC1 with 5 mipmaps
-        assert_eq!(dds.len(), 11_174_016);
+        // Should be 4096×4096 BC1 with the full 13-level mipmap chain
+        assert_eq!(dds.len(), EXPECTED_DDS_SIZE);
         assert_eq!(&dds[0..4], b"DDS ");
     }
 
@@ -374,10 +402,10 @@ mod tests {
     #[test]
     fn test_get_default_placeholder_correct_size() {
         let placeholder = get_default_placeholder();
-        // Should be 4096×4096 BC1 with 5 mipmaps = 11,174,016 bytes
+        // Should be 4096×4096 BC1 with the full 13-level chain = 11,184,952 bytes
         assert_eq!(
             placeholder.len(),
-            11_174_016,
+            EXPECTED_DDS_SIZE,
             "Placeholder should be the expected size for X-Plane tiles"
         );
     }
@@ -414,7 +442,7 @@ mod tests {
     #[test]
     fn test_validate_dds_empty_data() {
         // Empty data should return placeholder
-        let result = validate_dds_or_placeholder(vec![], "test");
+        let result = validate_dds_or_placeholder(vec![].into(), "test");
         assert_eq!(result.len(), EXPECTED_DDS_SIZE);
         assert_eq!(&result[0..4], b"DDS ");
     }
@@ -424,7 +452,7 @@ mod tests {
         // Wrong size should return placeholder
         let mut wrong_size = vec![0u8; 1000];
         wrong_size[0..4].copy_from_slice(b"DDS ");
-        let result = validate_dds_or_placeholder(wrong_size, "test");
+        let result = validate_dds_or_placeholder(wrong_size.into(), "test");
         assert_eq!(result.len(), EXPECTED_DDS_SIZE);
     }
 
@@ -433,7 +461,7 @@ mod tests {
         // Wrong magic bytes should return placeholder
         let mut wrong_magic = vec![0u8; EXPECTED_DDS_SIZE];
         wrong_magic[0..4].copy_from_slice(b"XXXX");
-        let result = validate_dds_or_placeholder(wrong_magic, "test");
+        let result = validate_dds_or_placeholder(wrong_magic.into(), "test");
         assert_eq!(&result[0..4], b"DDS ");
     }
 

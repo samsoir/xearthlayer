@@ -91,12 +91,6 @@ disk_size = {}
 ; Fraction of disk cache allocated to DDS tiles (default: 0.6)
 ; Remainder goes to raw imagery chunk cache. Range: 0.0 - 1.0
 dds_disk_ratio = {}
-; Disk I/O concurrency profile based on storage type (default: auto)
-;   auto - Auto-detect storage type (recommended)
-;   hdd  - Spinning disk (conservative: 1-4 concurrent ops)
-;   ssd  - SATA/AHCI SSD (moderate: ~32-64 concurrent ops)
-;   nvme - NVMe SSD (aggressive: ~128-256 concurrent ops)
-disk_io_profile = {}
 
 [texture]
 ; DDS compression format: bc1 (smaller, opaque) or bc3 (larger, with alpha)
@@ -120,13 +114,6 @@ timeout = {}
 ; Job executor daemon settings for tile generation.
 ; These control resource pools, concurrency, and retry behavior.
 
-; Resource pool capacities (concurrent operations by type)
-; Network: HTTP connections for chunk downloads (default: 128, clamped to 64-256)
-network_concurrent = {}
-; CPU: Assemble + encode operations (default: num_cpus / 2)
-cpu_concurrent = {}
-; Disk I/O: Cache read/write operations (default: 64 for SSD)
-disk_io_concurrent = {}
 ; Maximum concurrent DDS tile jobs (default: num_cpus / 2)
 max_concurrent_jobs = {}
 
@@ -272,16 +259,12 @@ congestion_threshold = {}
         format_size(config.cache.memory_size),
         format_size(config.cache.disk_size),
         config.cache.dds_disk_ratio,
-        config.cache.disk_io_profile.as_str(),
         config.texture.format.to_string().to_lowercase(),
         config.texture.compressor,
         config.texture.gpu_device,
         config.generation.threads,
         config.generation.timeout,
         // Executor settings
-        config.executor.network_concurrent,
-        config.executor.cpu_concurrent,
-        config.executor.disk_io_concurrent,
         config.control_plane.max_concurrent_jobs,
         config.executor.request_timeout_secs,
         config.executor.max_retries,

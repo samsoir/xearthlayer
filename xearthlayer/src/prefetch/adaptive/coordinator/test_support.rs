@@ -4,6 +4,8 @@
 //! across the coordinator test suite, eliminating duplication of mock structs
 //! like `StableBoundsTracker`, `BackpressureMockClient`, etc.
 
+use bytes::Bytes;
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -105,6 +107,50 @@ pub(crate) fn make_scenery_index(lat: i32, lon: i32, chunk_zoom: u8) -> Arc<Scen
     Arc::new(index)
 }
 
+/// Helper to create a SceneryIndex covering every DSF region in a lat/lon
+/// rectangle, one tile per region (4x4 sample grid, same as
+/// [`make_scenery_index`]).
+///
+/// Post-#176, `get_tiles_for_region` has no geometric fallback — a region
+/// the index doesn't know about now yields zero tiles rather than a guessed
+/// 4x4 grid at zoom 14. Tests that exercise a prefetch box/ground ring
+/// spanning multiple regions must wire real coverage instead of relying on
+/// the removed fallback; this builds it in one call.
+pub(crate) fn make_scenery_index_covering(
+    lat_range: std::ops::RangeInclusive<i32>,
+    lon_range: std::ops::RangeInclusive<i32>,
+    chunk_zoom: u8,
+) -> Arc<SceneryIndex> {
+    use crate::coord::{to_tile_coords, CHUNKS_PER_TILE_SIDE, CHUNK_ZOOM_OFFSET};
+    use crate::prefetch::scenery_index::{SceneryIndexConfig, SceneryTile};
+
+    let index = SceneryIndex::new(SceneryIndexConfig::default());
+    let tile_zoom = chunk_zoom - CHUNK_ZOOM_OFFSET;
+
+    for lat in lat_range {
+        for lon in lon_range.clone() {
+            for lat_step in 0..4u32 {
+                for lon_step in 0..4u32 {
+                    let sample_lat = lat as f64 + (lat_step as f64 * 0.25) + 0.125;
+                    let sample_lon = lon as f64 + (lon_step as f64 * 0.25) + 0.125;
+                    if let Ok(coord) = to_tile_coords(sample_lat, sample_lon, tile_zoom) {
+                        index.add_tile(SceneryTile {
+                            row: coord.row * CHUNKS_PER_TILE_SIDE,
+                            col: coord.col * CHUNKS_PER_TILE_SIDE,
+                            chunk_zoom,
+                            lat: sample_lat as f32,
+                            lon: sample_lon as f32,
+                            is_sea: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Arc::new(index)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SceneTracker mocks
 // ─────────────────────────────────────────────────────────────────────────────
@@ -113,20 +159,21 @@ pub(crate) fn make_scenery_index(lat: i32, lon: i32, chunk_zoom: u8) -> Arc<Scen
 // Memory cache mocks
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Mock [`DaemonMemoryCache`] that always reports "miss". Simulates a
-/// memory cache that has evicted every tile it once held — the exact
-/// condition under which the filter-pipeline shadow-staleness bug
-/// (#172 post-flight finding) manifested in production.
-pub(crate) struct AlwaysMissMemoryCache;
+/// Mock [`DaemonMemoryCache`] that always reports "hit". Used to empty a
+/// prefetch plan via the memory-cache filter stage specifically — as
+/// distinct from emptying it via the DDS disk cache checker — so tests can
+/// tell apart the two-phase commit's filter-driven `InProgress` marking from
+/// its disk-verified `Prefetched` promotion.
+pub(crate) struct AlwaysHitMemoryCache;
 
-impl crate::executor::DaemonMemoryCache for AlwaysMissMemoryCache {
+impl crate::executor::DaemonMemoryCache for AlwaysHitMemoryCache {
     fn get(
         &self,
         _row: u32,
         _col: u32,
         _zoom: u8,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
-        Box::pin(async { None })
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Bytes>> + Send + '_>> {
+        Box::pin(async { Some(Bytes::from(vec![0u8; 16])) })
     }
 
     fn put(
@@ -134,7 +181,7 @@ impl crate::executor::DaemonMemoryCache for AlwaysMissMemoryCache {
         _row: u32,
         _col: u32,
         _zoom: u8,
-        _data: Vec<u8>,
+        _data: Bytes,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
     }
@@ -188,6 +235,29 @@ impl DdsDiskCacheChecker for MockDiskChecker {
 
     fn tile_exists_blocking(&self, row: u32, col: u32, zoom: u8) -> bool {
         self.tiles.lock().unwrap().contains(&(row, col, zoom))
+    }
+}
+
+/// Mock [`DdsDiskCacheChecker`] that reports every tile as present on disk.
+///
+/// Models a DSF region whose tiles are all already in the DDS disk cache —
+/// the state in which the filter pipeline removes the region's entire
+/// planned tile set, so nothing is submitted and `execute()` is skipped
+/// (#176).
+pub(crate) struct AlwaysHitDiskChecker;
+
+impl DdsDiskCacheChecker for AlwaysHitDiskChecker {
+    fn tile_exists(
+        &self,
+        _row: u32,
+        _col: u32,
+        _zoom: u8,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async { true })
+    }
+
+    fn tile_exists_blocking(&self, _row: u32, _col: u32, _zoom: u8) -> bool {
+        true
     }
 }
 
@@ -347,6 +417,11 @@ impl CapLimitedDdsClient {
     /// Reset the counter to allow another batch of submissions.
     pub(crate) fn reset(&self) {
         self.submitted.store(0, Ordering::SeqCst);
+    }
+
+    /// Number of tiles accepted so far.
+    pub(crate) fn submitted_count(&self) -> usize {
+        self.submitted.load(Ordering::SeqCst)
     }
 }
 

@@ -3,6 +3,7 @@
 //! Implements `executor::DiskCache` trait using `ChunkCacheClient` from the
 //! new cache service infrastructure.
 
+use bytes::Bytes;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -56,7 +57,7 @@ impl DiskCache for DiskCacheBridge {
         zoom: u8,
         chunk_row: u8,
         chunk_col: u8,
-    ) -> impl Future<Output = Option<Vec<u8>>> + Send {
+    ) -> impl Future<Output = Option<Bytes>> + Send {
         async move {
             self.client
                 .get(tile_row, tile_col, zoom, chunk_row, chunk_col)
@@ -71,7 +72,7 @@ impl DiskCache for DiskCacheBridge {
         zoom: u8,
         chunk_row: u8,
         chunk_col: u8,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
         async move {
             self.client
@@ -94,10 +95,13 @@ mod tests {
         let bridge = DiskCacheBridge::new(service.cache());
 
         let data = vec![1, 2, 3, 4, 5];
-        bridge.put(100, 200, 15, 8, 12, data.clone()).await.unwrap();
+        bridge
+            .put(100, 200, 15, 8, 12, data.clone().into())
+            .await
+            .unwrap();
 
         let result = bridge.get(100, 200, 15, 8, 12).await;
-        assert_eq!(result, Some(data));
+        assert_eq!(result, Some(Bytes::from(data)));
 
         service.shutdown().await;
     }
@@ -123,14 +127,32 @@ mod tests {
         let bridge = DiskCacheBridge::new(service.cache());
 
         // Store multiple chunks for the same tile
-        bridge.put(100, 200, 15, 0, 0, vec![1, 1]).await.unwrap();
-        bridge.put(100, 200, 15, 0, 1, vec![2, 2]).await.unwrap();
-        bridge.put(100, 200, 15, 15, 15, vec![3, 3]).await.unwrap();
+        bridge
+            .put(100, 200, 15, 0, 0, vec![1, 1].into())
+            .await
+            .unwrap();
+        bridge
+            .put(100, 200, 15, 0, 1, vec![2, 2].into())
+            .await
+            .unwrap();
+        bridge
+            .put(100, 200, 15, 15, 15, vec![3, 3].into())
+            .await
+            .unwrap();
 
         // Verify they're all retrievable
-        assert_eq!(bridge.get(100, 200, 15, 0, 0).await, Some(vec![1, 1]));
-        assert_eq!(bridge.get(100, 200, 15, 0, 1).await, Some(vec![2, 2]));
-        assert_eq!(bridge.get(100, 200, 15, 15, 15).await, Some(vec![3, 3]));
+        assert_eq!(
+            bridge.get(100, 200, 15, 0, 0).await,
+            Some(Bytes::from(vec![1, 1]))
+        );
+        assert_eq!(
+            bridge.get(100, 200, 15, 0, 1).await,
+            Some(Bytes::from(vec![2, 2]))
+        );
+        assert_eq!(
+            bridge.get(100, 200, 15, 15, 15).await,
+            Some(Bytes::from(vec![3, 3]))
+        );
 
         service.shutdown().await;
     }

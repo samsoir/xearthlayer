@@ -20,7 +20,7 @@ Technical documentation for XEarthLayer developers and contributors.
 | [DDS Implementation](dds-implementation.md) | BC1/BC3 texture compression, mipmap generation |
 | [GPU Encoding](gpu-encoding-design.md) | wgpu compute shader encoding, channel worker, memory optimization |
 | [GeoIndex Design](geo-index-design.md) | Geospatial reference database, patch region ownership |
-| [Cache Design](cache-design.md) | Two-tier caching (memory + disk), LRU eviction |
+| [Cache Design](cache-design.md) | Three-tier caching (memory, DDS disk, chunk disk), LRU eviction |
 | [Cache Service Design](cache-service-design.md) | CacheLayer lifecycle, GC daemons, bridge adapters |
 | [Cache Load Transition Ramp](cache-load-transition-ramp-design.md) | TransitionThrottle design for takeoff phase management |
 | [Index Building Optimization](index-building-optimization.md) | OrthoUnionIndex caching and parallel scanning |
@@ -53,6 +53,7 @@ Technical documentation for XEarthLayer developers and contributors.
 |----------|-------------|
 | [Debug Map](debug-map.md) | Live browser map for prefetch observability (`--features debug-map`) |
 | [Memory Profiling](memory-profiling.md) | Heaptrack profiling guide for memory optimization |
+| [Memory Telemetry](memory-telemetry.md) | Periodic in-process memory sampling for long-flight diagnosis (v0.4.7+) |
 | [Application Release Runbook](app-release-runbook.md) | Release workflow, versioning, and troubleshooting |
 
 ## Root Cause Analysis

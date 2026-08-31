@@ -68,6 +68,17 @@ pub struct EncoderComponents {
     pub gpu_shutdown: Option<tokio_util::sync::CancellationToken>,
 }
 
+/// Apply an explicit mipmap level override, if the config carries one.
+///
+/// `None` leaves the encoder on its default: the full chain derived from the
+/// texture dimensions at encode time.
+fn apply_mipmap_count(encoder: DdsTextureEncoder, count: Option<usize>) -> DdsTextureEncoder {
+    match count {
+        Some(count) => encoder.with_mipmap_count(count),
+        None => encoder,
+    }
+}
+
 /// Create texture encoder from configuration.
 ///
 /// Selects the block compressor backend based on the `texture.compressor`
@@ -91,9 +102,11 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
 
             Ok(EncoderComponents {
                 encoder: Arc::new(
-                    DdsTextureEncoder::new(config.texture().format())
-                        .with_mipmap_count(config.texture().mipmap_count())
-                        .with_mipmap_compressor(Arc::new(channel)),
+                    apply_mipmap_count(
+                        DdsTextureEncoder::new(config.texture().format()),
+                        config.texture().mipmap_count(),
+                    )
+                    .with_mipmap_compressor(Arc::new(channel)),
                 ),
                 gpu_worker_handle: Some(worker_handle),
                 gpu_shutdown: Some(shutdown_token),
@@ -113,9 +126,11 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
 
             Ok(EncoderComponents {
                 encoder: Arc::new(
-                    DdsTextureEncoder::new(config.texture().format())
-                        .with_mipmap_count(config.texture().mipmap_count())
-                        .with_compressor(compressor),
+                    apply_mipmap_count(
+                        DdsTextureEncoder::new(config.texture().format()),
+                        config.texture().mipmap_count(),
+                    )
+                    .with_compressor(compressor),
                 ),
                 gpu_worker_handle: None,
                 gpu_shutdown: None,

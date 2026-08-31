@@ -1,0 +1,11 @@
+# Pin the Rust toolchain so local builds and CI use the same compiler and clippy,
+# preventing silent breakage when the `stable` channel advances (e.g. the 1.92 -> 1.97
+# drift that failed CI with no code change).
+#
+# rustup applies this file with higher precedence than the default toolchain, so it
+# also governs CI where the workflow installs `dtolnay/rust-toolchain@stable`.
+#
+# Bump deliberately as a `chore(ci):` change and run `make verify` before merging.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

@@ -1,6 +1,7 @@
 //! OptionalMetrics — extension trait for `Option<MetricsClient>`.
 
 use super::client::MetricsClient;
+use crate::cache::DiskTier;
 
 /// Extension trait for optional metrics client usage.
 ///
@@ -16,13 +17,15 @@ pub trait OptionalMetrics {
     fn dds_disk_cache_hit(&self, bytes: u64, is_fuse: bool);
     fn dds_disk_cache_miss(&self, is_fuse: bool);
     fn disk_write_started(&self);
-    fn disk_write_completed(&self, bytes: u64, duration_us: u64);
+    fn disk_write_completed(&self, bytes: u64, tier: DiskTier);
     fn disk_cache_initial_size(&self, bytes: u64);
     fn disk_cache_size(&self, bytes: u64);
     fn dds_disk_cache_size(&self, bytes: u64);
     fn memory_cache_hit(&self, is_fuse: bool);
     fn memory_cache_miss(&self, is_fuse: bool);
     fn memory_cache_size(&self, bytes: u64);
+    fn mem_cache_write_started(&self);
+    fn mem_cache_write_completed(&self);
     fn job_submitted(&self, is_fuse: bool);
     fn job_started(&self);
     fn job_completed(&self, success: bool, duration_us: u64);
@@ -100,9 +103,9 @@ impl OptionalMetrics for Option<MetricsClient> {
     }
 
     #[inline]
-    fn disk_write_completed(&self, bytes: u64, duration_us: u64) {
+    fn disk_write_completed(&self, bytes: u64, tier: DiskTier) {
         if let Some(client) = self {
-            client.disk_write_completed(bytes, duration_us);
+            client.disk_write_completed(bytes, tier);
         }
     }
 
@@ -145,6 +148,20 @@ impl OptionalMetrics for Option<MetricsClient> {
     fn memory_cache_size(&self, bytes: u64) {
         if let Some(client) = self {
             client.memory_cache_size(bytes);
+        }
+    }
+
+    #[inline]
+    fn mem_cache_write_started(&self) {
+        if let Some(client) = self {
+            client.mem_cache_write_started();
+        }
+    }
+
+    #[inline]
+    fn mem_cache_write_completed(&self) {
+        if let Some(client) = self {
+            client.mem_cache_write_completed();
         }
     }
 
@@ -234,6 +251,8 @@ mod tests {
         optional.download_started();
         optional.download_completed(100, 50);
         optional.job_submitted(true);
+        optional.mem_cache_write_started();
+        optional.mem_cache_write_completed();
     }
 
     #[test]
@@ -244,5 +263,7 @@ mod tests {
         optional.download_started();
         optional.download_completed(100, 50);
         optional.job_submitted(true);
+        optional.mem_cache_write_started();
+        optional.mem_cache_write_completed();
     }
 }

@@ -5,6 +5,7 @@
 //! memory cache bridge (`"tile:{zoom}:{row}:{col}"`), but backed by a
 //! `DiskCacheProvider` for persistent DDS tile storage.
 
+use bytes::Bytes;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -39,14 +40,14 @@ impl DdsDiskCacheBridge {
 
 #[allow(clippy::manual_async_fn)]
 impl DdsDiskCache for DdsDiskCacheBridge {
-    fn get(&self, row: u32, col: u32, zoom: u8) -> impl Future<Output = Option<Vec<u8>>> + Send {
+    fn get(&self, row: u32, col: u32, zoom: u8) -> impl Future<Output = Option<Bytes>> + Send {
         async move {
             let tile = TileCoord { row, col, zoom };
             self.client.get(&tile).await
         }
     }
 
-    fn put(&self, row: u32, col: u32, zoom: u8, data: Vec<u8>) -> impl Future<Output = ()> + Send {
+    fn put(&self, row: u32, col: u32, zoom: u8, data: Bytes) -> impl Future<Output = ()> + Send {
         async move {
             let tile = TileCoord { row, col, zoom };
             self.client.set(&tile, data).await;
@@ -75,26 +76,23 @@ impl DdsDiskCacheChecker for DdsDiskCacheBridge {
     }
 
     fn tile_exists_blocking(&self, row: u32, col: u32, zoom: u8) -> bool {
-        // Delegates to the async `tile_exists` via `block_in_place` so
-        // the sync callsite is free of the runtime-handle dance. Moving
-        // the hack into the trait impl encapsulates it here — callers
-        // (e.g. `promote_completed_regions`) can treat this as a plain
-        // sync method.
-        //
-        // TODO(#175): specialise with a truly sync path by exposing
-        // an index-only check through the `Cache` trait. The DashMap
-        // lookup backing `lru_index` is already sync; the async wrapper
-        // is gratuitous for hot-path existence checks.
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.tile_exists(row, col, zoom))
-        })
+        // Genuinely sync now — no runtime round-trip. This also means the
+        // method is safe to call outside a tokio runtime, which it was not
+        // before: outside any runtime at all, `Handle::current()` panics;
+        // inside a current-thread runtime, `block_in_place` panics instead.
+        // Either way, the old implementation could not be called safely from
+        // here — this one has no runtime dependency to trip either panic.
+        let tile = TileCoord { row, col, zoom };
+        self.client.contains_sync(&tile)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::{CacheService, ServiceCacheConfig};
+    use crate::cache::config::DiskProviderConfig;
+    use crate::cache::{CacheService, DiskCacheProvider, DiskTier, ServiceCacheConfig};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     async fn create_disk_bridge() -> (DdsDiskCacheBridge, CacheService, TempDir) {
@@ -115,10 +113,10 @@ mod tests {
         let (bridge, service, _dir) = create_disk_bridge().await;
 
         let data = vec![1, 2, 3, 4, 5];
-        bridge.put(100, 200, 15, data.clone()).await;
+        bridge.put(100, 200, 15, data.clone().into()).await;
 
         let result = bridge.get(100, 200, 15).await;
-        assert_eq!(result, Some(data));
+        assert_eq!(result, Some(Bytes::from(data)));
 
         service.shutdown().await;
     }
@@ -139,7 +137,7 @@ mod tests {
 
         assert!(!bridge.contains(100, 200, 15).await);
 
-        bridge.put(100, 200, 15, vec![1, 2, 3]).await;
+        bridge.put(100, 200, 15, vec![1, 2, 3].into()).await;
 
         assert!(bridge.contains(100, 200, 15).await);
 
@@ -169,7 +167,7 @@ mod tests {
         let data = vec![42u8; 1024];
         let write_data = data.clone();
         let handle = tokio::spawn(async move {
-            write_bridge.put(1477, 980, 12, write_data).await;
+            write_bridge.put(1477, 980, 12, write_data.into()).await;
         });
 
         // Wait for the fire-and-forget write to complete
@@ -179,7 +177,7 @@ mod tests {
         let result = bridge.get(1477, 980, 12).await;
         assert_eq!(
             result,
-            Some(data),
+            Some(Bytes::from(data)),
             "DDS disk cache should find tile written by fire-and-forget task"
         );
 
@@ -199,15 +197,42 @@ mod tests {
         let reader = Arc::clone(&bridge);
 
         let data = vec![99u8; 2048];
-        writer.put(1530, 950, 12, data.clone()).await;
+        writer.put(1530, 950, 12, data.clone().into()).await;
 
         let result = reader.get(1530, 950, 12).await;
         assert_eq!(
             result,
-            Some(data),
+            Some(Bytes::from(data)),
             "Reader clone should find tile written by writer clone"
         );
 
         service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_tile_exists_blocking_matches_async_contains() {
+        // `DdsDiskCacheBridge::new` takes an `Arc<dyn Cache>`; build the disk
+        // provider with the same `DiskProviderConfig` shape used by
+        // `disk.rs::create_test_provider`, but with `tier: DiskTier::Dds`.
+        let temp_dir = TempDir::new().unwrap();
+        let provider = DiskCacheProvider::start(DiskProviderConfig {
+            directory: temp_dir.path().to_path_buf(),
+            max_size_bytes: 10 * 1024 * 1024,
+            gc_interval: Duration::from_secs(3600),
+            provider_name: "test".to_string(),
+            metrics_client: None,
+            tier: DiskTier::Dds,
+        })
+        .await
+        .unwrap();
+        let bridge = DdsDiskCacheBridge::new(provider);
+
+        assert!(!bridge.tile_exists_blocking(12754, 5279, 15));
+        bridge.put(12754, 5279, 15, vec![0u8; 64].into()).await;
+        assert!(bridge.tile_exists_blocking(12754, 5279, 15));
+        assert_eq!(
+            bridge.contains(12754, 5279, 15).await,
+            bridge.tile_exists_blocking(12754, 5279, 15)
+        );
     }
 }
