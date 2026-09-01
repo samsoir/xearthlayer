@@ -1,6 +1,6 @@
 # Maintainer: Sam de Freyssinet <sam@def.reyssi.net>
 pkgname=xearthlayer
-pkgver=0.4.7
+pkgver=0.4.8
 pkgrel=1
 pkgdesc="High-quality satellite imagery for X-Plane, streamed on demand"
 arch=('x86_64')

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-09-01
+
+Installation fixes. Nothing in the running program changed. This release exists
+because installing it was broken, for prebuilt packages and from source alike.
+
+### Fixed
+
+- **Prebuilt Linux packages would not install on Debian 12 or Ubuntu 22.04 LTS**: The `.deb` and the Linux tarball are both cut from a single build job, so both carried its glibc requirement. That job ran on GitHub's `ubuntu-latest` image, and when GitHub moved that label from Ubuntu 22.04 to 24.04 the requirement rose from glibc 2.34 to 2.39 with no commit on our side. Both artifacts stopped starting on any distribution older than Ubuntu 24.04, reported as a `libc6` version error. Exactly two symbols were responsible, `pidfd_spawnp` and `pidfd_getpid`, which the standard library's process spawn path references when compiled against a glibc that provides them. The release binary is now built inside a pinned `ubuntu:22.04` container rather than on a runner label we do not control, which restores the 2.34 floor and covers Ubuntu 22.04 LTS, Debian 12 and RHEL 9 onwards. A release now fails outright if the binary requires a higher glibc than declared, so the floor cannot rise again unnoticed.
+
+- **Building from source failed with a formatting error instead of a version error**: On a toolchain older than the project supports, `make install` stopped at a `cargo fmt --check` diff about an unrelated function, which reads as though the source in the repository is malformed. The real cause is that several dependencies require a recent compiler, wgpu needing 1.92 and image needing 1.88, so the build could never have succeeded. `rust-toolchain.toml` already pinned the correct version, but only rustup reads that file, so a distribution-installed cargo ignored it silently. The workspace now declares `rust-version`, and cargo refuses up front with the version it requires and the version it found.
+
+- **`make install` ran the full contributor check suite**: Installing from source depended on `make verify`, which runs rustfmt, clippy with warnings denied, and the entire test suite. A user building from a clean clone was therefore blocked from installing by a formatting nit in code they did not write. This also suppressed the fix above, because the formatting check runs first and does not enforce `rust-version`. `release` and `install` now build and install. The check suite is unchanged for the people it is for, and still runs in CI and through `make pre-commit`.
+
+- **Build instructions referenced targets that do not exist**: The README and the getting started guide both documented `make release-gpu` and `make install-gpu`, which have never been targets. The premise was also wrong: GPU encoding requires no special build, since wgpu is an unconditional dependency and the compressor is selected at runtime with `texture.compressor`. Neither document mentioned that Rust is needed at all, and the README linked to no releases page, so every reader was funnelled into building from source whether or not they wanted to. Both now lead with prebuilt packages, state the glibc and Rust requirements, and document GPU encoding as the configuration setting it actually is.
+
 ## [0.4.7] - 2026-08-30
 
 ### Added
@@ -1110,7 +1125,9 @@ Run `xearthlayer config upgrade` to automatically add new settings with defaults
 - Linux support only (Windows and macOS planned for future releases)
 - Requires FUSE3 for filesystem mounting
 
-[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.4.6...HEAD
+[Unreleased]: https://github.com/samsoir/xearthlayer/compare/v0.4.8...HEAD
+[0.4.8]: https://github.com/samsoir/xearthlayer/compare/v0.4.7...v0.4.8
+[0.4.7]: https://github.com/samsoir/xearthlayer/compare/v0.4.6...v0.4.7
 [0.4.6]: https://github.com/samsoir/xearthlayer/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/samsoir/xearthlayer/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/samsoir/xearthlayer/compare/v0.4.3...v0.4.4
