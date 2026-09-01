@@ -450,6 +450,10 @@ bump-version: ## Bump version across all files (VERSION=x.y.z, STABLE ONLY)
 	@sed -i 's/^version = ".*"/version = "$(VERSION)"/' Cargo.toml
 	@# Update RPM spec file
 	@sed -i 's/^Version:.*/Version:        $(VERSION)/' pkg/rpm/xearthlayer.spec
+	@# Update the Arch PKGBUILD. Omitting this shipped an AUR package at the
+	@# previous version; tests/packaging_metadata.rs guards it, but the guard
+	@# should never be what finds it.
+	@sed -i 's/^pkgver=.*/pkgver=$(VERSION)/' pkg/arch/PKGBUILD
 	@echo "$(GREEN)Version bumped to $(VERSION)$(NC)"
 	@echo ""
 	@echo "$(YELLOW)Next steps:$(NC)"
