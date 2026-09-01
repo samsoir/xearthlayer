@@ -35,16 +35,50 @@ If X-Plane is not yet running when XEarthLayer starts, it will fall back to infe
 
 ## Installation
 
-### From Source
+### From a Binary Release
+
+The simplest option. Download the package for your distribution from the
+[latest release](https://github.com/samsoir/xearthlayer/releases/latest):
+
+| Distribution | Asset |
+|---|---|
+| Debian, Ubuntu | `xearthlayer_<version>_amd64.deb` |
+| Fedora, RHEL | `xearthlayer-<version>.x86_64.rpm` |
+| Anything else | `xearthlayer-v<version>-x86_64-linux.tar.gz` |
+| Arch, CachyOS | Build from the AUR |
+
+Prebuilt binaries require **glibc 2.34 or newer**. That covers Ubuntu 22.04 LTS,
+Debian 12 and RHEL 9 onwards. Check yours with `ldd --version`. On anything
+older, build from source.
+
+Verify with:
 
 ```bash
-# Clone the repository
+xearthlayer --version
+```
+
+### From Source
+
+Building needs **Rust 1.97.1 or newer** and the FUSE 3 development headers.
+
+Install Rust through [rustup](https://rustup.rs) rather than your
+distribution's package manager. Several dependencies require a recent
+compiler, and most distributions ship one that is too old to build this
+project at all. rustup also reads the repository's `rust-toolchain.toml` and
+selects the correct version for you.
+
+```bash
+# Rust toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# FUSE 3 headers
+sudo apt install libfuse3-dev      # Debian, Ubuntu
+sudo dnf install fuse3-devel       # Fedora, RHEL
+
+# Clone, build and install
 git clone https://github.com/samsoir/xearthlayer.git
 cd xearthlayer
-
-# Build and install
-make release
-make install  # Installs to ~/.local/bin (no sudo required)
+make install  # Builds, then installs to ~/.local/bin (no sudo required)
 
 # Verify installation
 xearthlayer --version
@@ -55,26 +89,34 @@ xearthlayer --version
 make install PREFIX=/usr/local  # Requires sudo for /usr/local/bin
 ```
 
-### From Binary Release
+If the build stops with `rustc <version> is not supported by the following
+packages`, your Rust is too old. Install rustup as above and start a new
+shell so it takes precedence.
 
-Download the latest release from the releases page and extract to a location of your choice.
+### GPU Encoding
 
-### Building with GPU Support
+GPU-accelerated DDS encoding offloads texture compression from the CPU,
+freeing it for X-Plane. It needs no special build and is included in every
+binary. Select it at runtime:
 
-XEarthLayer supports optional GPU-accelerated DDS encoding, which offloads texture compression to the GPU and frees CPU resources for X-Plane. This requires a separate build:
+```ini
+[texture]
+compressor = gpu
+```
+
+Then confirm your hardware is detected:
 
 ```bash
-# Build with GPU encoding support
-make release-gpu
-make install-gpu  # Installs to ~/.local/bin
-
-# Verify GPU detection
 xearthlayer diagnostics
 ```
 
-The diagnostics output will show detected GPU adapters. Any wgpu-compatible GPU works (most modern GPUs from AMD, NVIDIA, and Intel).
+The output lists the detected GPU adapters. Any wgpu-compatible GPU works,
+which is most modern hardware from AMD, NVIDIA and Intel.
 
-GPU encoding is most beneficial when you have an idle integrated GPU (e.g., AMD Radeon on Ryzen or Intel UHD) while your discrete GPU handles X-Plane. See the [texture configuration](configuration.md#texture) for compressor selection.
+GPU encoding helps most when you have an idle integrated GPU, such as AMD
+Radeon graphics on a Ryzen or Intel UHD, while your discrete card handles
+X-Plane. See the [texture configuration](configuration.md#texture) for the
+full list of compressor backends.
 
 ## Initial Setup
 
