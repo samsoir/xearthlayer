@@ -12,6 +12,11 @@ version = "0.4.7"
 edition = "2021"
 authors = ["XEarthLayer Contributors"]
 license = "MIT"
+# Minimum supported Rust, matching the pin in rust-toolchain.toml. rustup users
+# get that pin automatically and never notice; this field is what gives everyone
+# else a clear "requires rustc 1.97.1, you have X" instead of an inscrutable
+# rustfmt diff or a wall of compile errors. Bump both together.
+rust-version = "1.97.1"
 repository = "https://github.com/samsoir/xearthlayer"
 
 [workspace.dependencies]
