@@ -67,13 +67,30 @@ jobs:
     name: Build Release Binary
     runs-on: ubuntu-latest
     needs: [verify]
+    # Built inside an ubuntu:22.04 container rather than on `ubuntu-latest`.
+    # The runner image is not ours to pin: when GitHub moved `ubuntu-latest`
+    # from 22.04 to 24.04 our glibc floor rose from 2.34 to 2.39 with no
+    # commit, and the .deb and tarball stopped installing on Debian 12 and
+    # Ubuntu 22.04 LTS. A container pins the build environment in this repo,
+    # where a change to it is reviewable. Both Linux artifacts are cut from
+    # this one binary, so this job alone sets the floor for both.
+    container:
+      image: ubuntu:22.04
+    env:
+      # Highest glibc symbol version the released binary may require.
+      # 2.34 covers Ubuntu 22.04 (2.35), Debian 12 (2.36) and RHEL 9 (2.34).
+      GLIBC_FLOOR: "2.34"
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Install dependencies
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libfuse3-dev
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config libfuse3-dev \
+            curl ca-certificates git binutils
+
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -81,6 +98,21 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release
+
+      # Fails the release rather than shipping a binary that cannot start on
+      # a supported distro. Without this the floor regresses silently and the
+      # first report arrives from a user who cannot run the program at all.
+      - name: Verify glibc compatibility floor
+        run: |
+          MAX=$(objdump -T target/release/xearthlayer \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' \
+            | sed 's/GLIBC_//' | sort -V -u | tail -1)
+          echo "Highest required glibc symbol: $MAX (floor: $GLIBC_FLOOR)"
+          if [ "$(printf '%s\n%s\n' "$MAX" "$GLIBC_FLOOR" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
+            echo "::error::Binary requires glibc $MAX, above the supported floor $GLIBC_FLOOR."
+            echo "::error::It will not start on Ubuntu 22.04, Debian 12 or RHEL 9."
+            exit 1
+          fi
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
