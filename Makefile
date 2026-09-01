@@ -67,14 +67,21 @@ build: ## Build debug version
 	@echo "$(BLUE)Building debug version...$(NC)"
 	$(CARGO) build $(CARGO_FLAGS)
 
+# `release` and `install` are the from-source path for people who just want a
+# working binary, so they deliberately do NOT depend on `verify`. That target
+# is the contributor gate (rustfmt + clippy -D warnings + the full suite), and
+# gating an install on it means a user is blocked from installing by a
+# formatting nit in code they did not write. CI runs `make verify` explicitly
+# in ci.yml, release.yml and release-test.yml, and contributors run
+# `make pre-commit`, so nothing loses coverage here.
 .PHONY: release
-release: verify ## Build optimized release version
+release: ## Build optimized release version
 	@echo "$(BLUE)Building release version...$(NC)"
 	$(CARGO) build --release $(CARGO_FLAGS)
 	@echo "$(GREEN)Release build complete!$(NC)"
 
 .PHONY: release-profiling
-release-profiling: verify ## Build release version with profiling support
+release-profiling: ## Build release version with profiling support
 	@echo "$(BLUE)Building release version with profiling...$(NC)"
 	$(CARGO) build --release --features profiling $(CARGO_FLAGS)
 	@echo "$(GREEN)Release build with profiling complete!$(NC)"
@@ -443,6 +450,10 @@ bump-version: ## Bump version across all files (VERSION=x.y.z, STABLE ONLY)
 	@sed -i 's/^version = ".*"/version = "$(VERSION)"/' Cargo.toml
 	@# Update RPM spec file
 	@sed -i 's/^Version:.*/Version:        $(VERSION)/' pkg/rpm/xearthlayer.spec
+	@# Update the Arch PKGBUILD. Omitting this shipped an AUR package at the
+	@# previous version; tests/packaging_metadata.rs guards it, but the guard
+	@# should never be what finds it.
+	@sed -i 's/^pkgver=.*/pkgver=$(VERSION)/' pkg/arch/PKGBUILD
 	@echo "$(GREEN)Version bumped to $(VERSION)$(NC)"
 	@echo ""
 	@echo "$(YELLOW)Next steps:$(NC)"

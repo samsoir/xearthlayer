@@ -6,12 +6,19 @@ members = [
 ]
 
 [workspace.package]
-# Unstable dev cycle on develop/0.4.7 — pre-release per semver, sorts below 0.4.7.
-# Bumped to a dated X.Y.Z only at stable promotion. See docs/dev/app-release-runbook.md.
-version = "0.4.7"
+# On `main` and `release/*` this is the released stable version. On a
+# `develop/X.Y.Z` line it instead carries a pre-release identifier, which sorts
+# below the target release per semver, and is bumped to the dated X.Y.Z only at
+# stable promotion. See docs/dev/app-release-runbook.md.
+version = "0.4.8"
 edition = "2021"
 authors = ["XEarthLayer Contributors"]
 license = "MIT"
+# Minimum supported Rust, matching the pin in rust-toolchain.toml. rustup users
+# get that pin automatically and never notice; this field is what gives everyone
+# else a clear "requires rustc 1.97.1, you have X" instead of an inscrutable
+# rustfmt diff or a wall of compile errors. Bump both together.
+rust-version = "1.97.1"
 repository = "https://github.com/samsoir/xearthlayer"
 
 [workspace.dependencies]

@@ -1043,7 +1043,7 @@ mod tests {
     /// Runs `f` under a tracing subscriber that captures every event's
     /// fields, returning them in emission order. Uses only
     /// `tracing`/`tracing-subscriber`, both already direct dependencies of
-    /// this crate (see Cargo.toml) — no new dependency is introduced.
+    /// this crate (see Cargo.toml), so no new dependency is introduced.
     fn capture_events<F: FnOnce()>(f: F) -> Vec<std::collections::HashMap<String, String>> {
         use tracing_subscriber::layer::SubscriberExt;
 
@@ -1055,6 +1055,40 @@ mod tests {
         tracing::subscriber::with_default(subscriber, f);
         let captured = events.lock().unwrap().clone();
         captured
+    }
+
+    /// Like [`find_memory_sample`], but panics with what *was* captured.
+    ///
+    /// A bare `.expect` on the lookup cannot distinguish "no events at all"
+    /// from "events, but none of them the one we wanted". That distinction is
+    /// the first thing anyone debugging a missing sample needs, and its
+    /// absence is why one observed failure here taught us nothing.
+    ///
+    /// Read the message before theorising. `0 event(s) captured: []` means the
+    /// capture harness; anything else means `log_memory_sample` itself. Two
+    /// theories about the harness were investigated and **refuted** by
+    /// experiment, so do not spend time on them again: `with_default` installs
+    /// a thread-local subscriber and nothing in this test binary installs a
+    /// global one, and a probe of 16 threads by 2,000 iterations against a
+    /// single shared callsite dropped none of its 32,000 captures.
+    fn expect_memory_sample(
+        events: &[std::collections::HashMap<String, String>],
+    ) -> &std::collections::HashMap<String, String> {
+        find_memory_sample(events).unwrap_or_else(|| {
+            let messages: Vec<&str> = events
+                .iter()
+                .map(|e| {
+                    e.get("message")
+                        .map(String::as_str)
+                        .unwrap_or("<no message>")
+                })
+                .collect();
+            panic!(
+                "log_memory_sample must emit a \"Memory sample\" event, but {} event(s) \
+                 were captured: {messages:?}",
+                events.len()
+            )
+        })
     }
 
     /// Finds the first captured event whose message is "Memory sample".
@@ -1085,7 +1119,7 @@ mod tests {
         let _tiles: Vec<Vec<u8>> = (0..6).map(|_| vec![0u8; 11 * 1024 * 1024]).collect();
 
         let events = capture_events(|| daemon.log_memory_sample());
-        let sample = find_memory_sample(&events).expect("must emit a memory sample");
+        let sample = expect_memory_sample(&events);
 
         let num = |k: &str| -> u64 {
             sample
@@ -1159,8 +1193,7 @@ mod tests {
         daemon.state.mem_cache_writes_active = 20;
 
         let events = capture_events(|| daemon.log_memory_sample());
-        let sample = find_memory_sample(&events)
-            .expect("log_memory_sample must emit a \"Memory sample\" event");
+        let sample = expect_memory_sample(&events);
 
         // Field-by-field: name -> expected value. `rss_mb` and `mem_cache_mb`
         // are seeded from byte counts that are NOT whole multiples of MB, so
