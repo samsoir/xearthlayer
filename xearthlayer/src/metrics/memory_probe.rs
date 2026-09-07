@@ -609,6 +609,10 @@ mod tests {
 ///
 /// The cost is one `mmap`/`munmap` pair per tile, measured at **+0.16 ms** —
 /// about 20 seconds of CPU across an 11-hour flight. See issue #227.
+// Consumed only by `configure_allocator`, which is gated to linux-gnu.
+// Kept compiled everywhere so the unit tests below, which are pure string
+// logic, keep their coverage on macOS.
+#[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]
 const MMAP_THRESHOLD_BYTES: usize = 1024 * 1024;
 
 /// Maximum number of glibc malloc arenas: 4.
@@ -637,12 +641,24 @@ const MMAP_THRESHOLD_BYTES: usize = 1024 * 1024;
 /// [`MMAP_THRESHOLD_BYTES`], so what remains is one dominant size class of
 /// ~256 KiB chunk buffers — close to the best case for a low arena count.
 /// See issue #227.
+// Consumed only by `configure_allocator`, which is gated to linux-gnu.
+// Kept compiled everywhere so the unit tests below, which are pure string
+// logic, keep their coverage on macOS.
+#[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]
 const ARENA_MAX: i32 = 4;
 
 /// The `GLIBC_TUNABLES` key that sets the arena ceiling.
+// Consumed only by `configure_allocator`, which is gated to linux-gnu.
+// Kept compiled everywhere so the unit tests below, which are pure string
+// logic, keep their coverage on macOS.
+#[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]
 const TUNABLE_ARENA_MAX: &str = "glibc.malloc.arena_max";
 
 /// The `GLIBC_TUNABLES` key that sets the mmap threshold.
+// Consumed only by `configure_allocator`, which is gated to linux-gnu.
+// Kept compiled everywhere so the unit tests below, which are pure string
+// logic, keep their coverage on macOS.
+#[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]
 const TUNABLE_MMAP_THRESHOLD: &str = "glibc.malloc.mmap_threshold";
 
 /// Whether the user has already pinned this parameter themselves.
@@ -653,6 +669,10 @@ const TUNABLE_MMAP_THRESHOLD: &str = "glibc.malloc.mmap_threshold";
 /// subsequent `mallopt(M_ARENA_MAX, 4)` yields 1 MB. Without this check a user
 /// running an allocator experiment would have their setting discarded with no
 /// diagnostic.
+// Consumed only by `configure_allocator`, which is gated to linux-gnu.
+// Kept compiled everywhere so the unit tests below, which are pure string
+// logic, keep their coverage on macOS.
+#[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]
 fn user_pinned(env_value: Option<&str>, tunables: Option<&str>, tunable_key: &str) -> bool {
     env_value.is_some() || tunables.is_some_and(|t| t.contains(tunable_key))
 }
