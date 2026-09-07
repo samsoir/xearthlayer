@@ -67,6 +67,15 @@ pub enum PublishError {
 
     /// Release validation failed.
     ReleaseValidation(String),
+
+    /// Region metadata file not found.
+    RegionMetadataNotFound(PathBuf),
+
+    /// Region metadata file could not be parsed.
+    InvalidRegionMetadata { path: PathBuf, message: String },
+
+    /// A region's colour could not be resolved to RGB.
+    UnknownRegionColor { region: String, color: String },
 }
 
 impl fmt::Display for PublishError {
@@ -140,6 +149,23 @@ impl fmt::Display for PublishError {
             }
             PublishError::ReleaseValidation(msg) => {
                 write!(f, "release validation failed: {}", msg)
+            }
+            PublishError::RegionMetadataNotFound(path) => {
+                write!(
+                    f,
+                    "region_metadata.json not found at {}. Pass --metadata to override.",
+                    path.display()
+                )
+            }
+            PublishError::InvalidRegionMetadata { path, message } => {
+                write!(f, "failed to parse {}: {}", path.display(), message)
+            }
+            PublishError::UnknownRegionColor { region, color } => {
+                write!(
+                    f,
+                    "region \"{}\" has unknown color \"{}\". Use a CSS color name or hex (#rrggbb).",
+                    region, color
+                )
             }
         }
     }

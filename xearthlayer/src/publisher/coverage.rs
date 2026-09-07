@@ -21,6 +21,7 @@ use staticmap::tools::Tool;
 use staticmap::{lat_to_y, lon_to_x, Bounds, StaticMapBuilder};
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, PixmapMut, Shader, Stroke, Transform};
 
+use super::region_colors::{brighten, resolve, RegionMetadata};
 use super::{PublishError, PublishResult};
 
 /// Map style/theme for the base layer.
@@ -66,32 +67,11 @@ pub struct CoverageConfig {
 
 impl Default for CoverageConfig {
     fn default() -> Self {
-        let mut region_colors = HashMap::new();
-        // Blue for NA (matches GeoJSON)
-        region_colors.insert("na".to_string(), (51, 136, 255, 180));
-        // Orange for EU (matches GeoJSON)
-        region_colors.insert("eu".to_string(), (255, 136, 0, 180));
-        // Tangerine for EU2 (Eastern Europe / Western Russia) — brighter than EU
-        region_colors.insert("eu2".to_string(), (255, 170, 0, 180));
-        // Green for SA
-        region_colors.insert("sa".to_string(), (0, 200, 83, 180));
-        // Purple for OC
-        region_colors.insert("oc".to_string(), (156, 39, 176, 180));
-        // Red for AS3 (Asia Part 3)
-        region_colors.insert("as3".to_string(), (255, 80, 80, 180));
-        // Green for AS (legacy/future Asia regions)
-        region_colors.insert("as".to_string(), (0, 200, 83, 180));
-        // Cyan for AF1 (North Africa)
-        region_colors.insert("af1".to_string(), (0, 188, 212, 180));
-        // Yellowish-green for AF/AF2 (Southern Africa)
-        region_colors.insert("af".to_string(), (180, 200, 80, 180));
-        region_colors.insert("af2".to_string(), (180, 200, 80, 180));
-
         Self {
             width: 1200,
             height: 600,
             padding: (20, 20),
-            region_colors,
+            region_colors: HashMap::new(),
             default_color: (100, 100, 100, 180),
             border_color: (0, 0, 0, 255),
             border_width: 0.5,
@@ -103,34 +83,38 @@ impl Default for CoverageConfig {
 impl CoverageConfig {
     /// Create a dark mode configuration with adjusted colors for visibility.
     pub fn dark() -> Self {
-        let mut region_colors = HashMap::new();
-        // Brighter colors for dark background
-        region_colors.insert("na".to_string(), (100, 180, 255, 200));
-        region_colors.insert("eu".to_string(), (255, 180, 100, 200));
-        // Tangerine for EU2 (dark mode) — brighter than EU
-        region_colors.insert("eu2".to_string(), (255, 200, 80, 200));
-        region_colors.insert("sa".to_string(), (100, 255, 150, 200));
-        region_colors.insert("oc".to_string(), (200, 100, 255, 200));
-        // Red for AS3 (Asia Part 3)
-        region_colors.insert("as3".to_string(), (255, 100, 100, 200));
-        // Green for AS (legacy/future Asia regions)
-        region_colors.insert("as".to_string(), (100, 255, 150, 200));
-        // Cyan for AF1 (North Africa - brighter for dark background)
-        region_colors.insert("af1".to_string(), (0, 220, 240, 200));
-        // Yellowish-green for AF/AF2 (Southern Africa - brighter for dark background)
-        region_colors.insert("af".to_string(), (210, 230, 120, 200));
-        region_colors.insert("af2".to_string(), (210, 230, 120, 200));
-
         Self {
             width: 1200,
             height: 600,
             padding: (20, 20),
-            region_colors,
+            region_colors: HashMap::new(),
             default_color: (150, 150, 150, 200),
             border_color: (80, 80, 80, 255),
             border_width: 0.3,
             style: MapStyle::Dark,
         }
+    }
+
+    /// Populates `region_colors` from region metadata.
+    ///
+    /// Keys are lowercased because metadata uses uppercase codes ("AS1") while
+    /// package directories on disk use lowercase ("as1"). Dark configs brighten
+    /// each colour and use alpha 200; light configs use alpha 180.
+    ///
+    /// Whether to brighten is decided by `self.style`, so a caller cannot pair
+    /// a dark config with light colours.
+    pub fn with_regions(mut self, metadata: &RegionMetadata) -> PublishResult<Self> {
+        let is_dark = self.style == MapStyle::Dark;
+        let alpha = if is_dark { 200 } else { 180 };
+
+        let mut colors = HashMap::new();
+        for (code, entry) in &metadata.regions {
+            let rgb = resolve(code, &entry.color)?;
+            let rgb = if is_dark { brighten(rgb) } else { rgb };
+            colors.insert(code.to_lowercase(), (rgb.0, rgb.1, rgb.2, alpha));
+        }
+        self.region_colors = colors;
+        Ok(self)
     }
 }
 
@@ -666,6 +650,52 @@ impl CoverageMapGenerator {
 mod tests {
     use super::*;
 
+    fn metadata_fixture() -> crate::publisher::RegionMetadata {
+        serde_json::from_str(
+            r#"{"regions":{
+                "NA":{"color":"blue"},
+                "AS1":{"color":"firebrick"}
+            }}"#,
+        )
+        .unwrap()
+    }
+
+    // Metadata keys are uppercase ("AS1"); package region codes on disk are
+    // lowercase ("as1"). Without normalisation every lookup would miss.
+    #[test]
+    fn with_regions_lowercases_keys() {
+        let config = CoverageConfig::default()
+            .with_regions(&metadata_fixture())
+            .unwrap();
+        assert!(config.region_colors.contains_key("na"));
+        assert!(config.region_colors.contains_key("as1"));
+        assert!(!config.region_colors.contains_key("NA"));
+    }
+
+    #[test]
+    fn light_config_uses_metadata_colour_with_alpha_180() {
+        let config = CoverageConfig::default()
+            .with_regions(&metadata_fixture())
+            .unwrap();
+        assert_eq!(config.region_colors["na"], (0, 0, 255, 180));
+    }
+
+    #[test]
+    fn dark_config_brightens_and_uses_alpha_200() {
+        let config = CoverageConfig::dark()
+            .with_regions(&metadata_fixture())
+            .unwrap();
+        assert_eq!(config.region_colors["na"], (89, 89, 255, 200));
+    }
+
+    #[test]
+    fn with_regions_propagates_unknown_colour_error() {
+        let md: crate::publisher::RegionMetadata =
+            serde_json::from_str(r#"{"regions":{"EU2":{"color":"tangerine"}}}"#).unwrap();
+        let err = CoverageConfig::default().with_regions(&md).unwrap_err();
+        assert!(format!("{}", err).contains("EU2"));
+    }
+
     #[test]
     fn test_filled_rect_extent() {
         let rect = FilledRect::from_tile(37, -122, (255, 0, 0, 255), (0, 0, 0, 255), 1.0);
@@ -684,8 +714,9 @@ mod tests {
 
         assert_eq!(config.width, 1200);
         assert_eq!(config.height, 600);
-        assert!(config.region_colors.contains_key("na"));
-        assert!(config.region_colors.contains_key("eu"));
+        // Colours are no longer hardcoded; region_colors is populated by
+        // `with_regions` from `region_metadata.json`, not by `default()`.
+        assert!(config.region_colors.is_empty());
     }
 
     #[test]

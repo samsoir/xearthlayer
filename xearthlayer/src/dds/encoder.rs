@@ -6,7 +6,9 @@
 //! - [`MipmapCompressor`] backends (GPU channel) own the full mipmap pipeline;
 //!   the encoder only handles DDS header assembly.
 
-use crate::dds::compressor::{default_compressor, ImageCompressor, MipmapCompressor};
+use crate::dds::compressor::{
+    default_compressor, pad_to_block_multiple, ImageCompressor, MipmapCompressor,
+};
 use crate::dds::mipmap::{MipmapGenerator, MipmapStream};
 use crate::dds::types::{DdsError, DdsFormat, DdsHeader};
 use image::RgbaImage;
@@ -245,9 +247,18 @@ impl DdsEncoder {
     /// given dimensions, respecting any explicit `mipmap_count` override.
     ///
     /// When no explicit count is set, counts levels from full size down to 1×1.
+    ///
+    /// An explicit override is clamped to the full chain length. Without the
+    /// clamp a caller asking for more levels than the dimensions allow would
+    /// write that number into the DDS header while [`MipmapStream`] silently
+    /// stopped at 1×1, leaving the header over-declaring what the payload
+    /// contains.
     fn resolve_mipmap_count(&self, width: u32, height: u32) -> usize {
-        self.mipmap_count
-            .unwrap_or_else(|| MipmapGenerator::full_chain_count(width, height))
+        let full = MipmapGenerator::full_chain_count(width, height);
+        match self.mipmap_count {
+            Some(count) => count.clamp(1, full),
+            None => full,
+        }
     }
 
     /// Delegate compression to a MipmapCompressor backend.
@@ -287,9 +298,14 @@ impl DdsEncoder {
     }
 
     /// Compress a single image to BC1/BC3 format using the configured compressor.
+    ///
+    /// Levels smaller than one 4×4 block (the 2×2 and 1×1 tail of a full chain)
+    /// are padded up to block size first — see [`pad_to_block_multiple`].
     fn compress_image(&self, image: &RgbaImage) -> Result<Vec<u8>, DdsError> {
         match &self.backend {
-            CompressorBackend::Image(compressor) => compressor.compress(image, self.format),
+            CompressorBackend::Image(compressor) => {
+                compressor.compress(&pad_to_block_multiple(image), self.format)
+            }
             CompressorBackend::Mipmap(_) => {
                 unreachable!("compress_image called with MipmapCompressor backend")
             }
@@ -630,5 +646,167 @@ mod tests {
 
         // Byte-for-byte parity
         assert_eq!(image_result, mipmap_result);
+    }
+
+    // =========================================================================
+    // Full mipmap chain regression tests (issue #212)
+    // =========================================================================
+    //
+    // A truncated chain makes X-Plane clamp sampling at the last declared
+    // level, which undersamples sloped terrain at grazing angles and reads as
+    // banding along contour lines. These tests pin the chain to the texture
+    // dimensions and keep the DDS header honest about the payload.
+
+    /// Walk a DDS payload level by level and report the levels found.
+    ///
+    /// Returns the per-level dimensions, asserting along the way that the
+    /// payload holds exactly as many bytes as the levels require — no more,
+    /// no less. Levels below 4x4 still occupy one whole block, which the
+    /// naive `w * h / 2` under-counts.
+    fn walk_payload(dds: &[u8], width: u32, height: u32, block_size: usize) -> Vec<(u32, u32)> {
+        let declared = u32::from_le_bytes(dds[28..32].try_into().unwrap()) as usize;
+
+        let mut levels = Vec::new();
+        let mut offset = 128;
+        let (mut w, mut h) = (width, height);
+
+        for _ in 0..declared {
+            let bytes = (w.div_ceil(4) as usize) * (h.div_ceil(4) as usize) * block_size;
+            assert!(
+                offset + bytes <= dds.len(),
+                "payload ends early: level {}x{} needs {} bytes at offset {}, file is {}",
+                w,
+                h,
+                bytes,
+                offset,
+                dds.len()
+            );
+            offset += bytes;
+            levels.push((w, h));
+
+            if w <= 1 || h <= 1 {
+                break;
+            }
+            w /= 2;
+            h /= 2;
+        }
+
+        assert_eq!(
+            offset,
+            dds.len(),
+            "payload has {} trailing bytes after the declared levels",
+            dds.len() - offset
+        );
+        assert_eq!(
+            levels.len(),
+            declared,
+            "header declares {} levels but the payload holds {}",
+            declared,
+            levels.len()
+        );
+
+        levels
+    }
+
+    #[test]
+    fn test_default_emits_full_chain_4096_bc1() {
+        // The production default: no explicit count, so the chain follows the
+        // texture size. This is the acceptance criterion from the work order.
+        let image = RgbaImage::new(4096, 4096);
+        let dds = DdsEncoder::new(DdsFormat::BC1)
+            .with_compressor(Arc::new(crate::dds::SoftwareCompressor))
+            .encode(image)
+            .unwrap();
+
+        assert_eq!(dds.len(), 11_184_952, "full 13-level BC1 tile size");
+        assert_eq!(
+            u32::from_le_bytes(dds[28..32].try_into().unwrap()),
+            13,
+            "header must declare 13 levels"
+        );
+
+        let levels = walk_payload(&dds, 4096, 4096, 8);
+        assert_eq!(levels.len(), 13);
+        assert_eq!(*levels.last().unwrap(), (1, 1), "chain must end at 1x1");
+    }
+
+    #[test]
+    fn test_header_count_matches_payload_for_odd_and_non_square() {
+        // Non-square and non-power-of-two inputs must terminate cleanly
+        // rather than panicking or leaving the header over-declaring.
+        for (w, h) in [(64, 16), (96, 40), (33, 17), (7, 3), (5, 5), (1, 1)] {
+            let dds = DdsEncoder::new(DdsFormat::BC1)
+                .with_compressor(Arc::new(crate::dds::SoftwareCompressor))
+                .encode(RgbaImage::new(w, h))
+                .unwrap();
+
+            let levels = walk_payload(&dds, w, h, 8);
+            assert_eq!(
+                levels.len(),
+                MipmapGenerator::full_chain_count(w, h),
+                "{}x{} chain length",
+                w,
+                h
+            );
+        }
+    }
+
+    #[test]
+    fn test_explicit_count_is_clamped_to_full_chain() {
+        // Asking for more levels than the dimensions allow must not make the
+        // header over-declare what the payload contains.
+        let dds = DdsEncoder::new(DdsFormat::BC1)
+            .with_compressor(Arc::new(crate::dds::SoftwareCompressor))
+            .with_mipmap_count(99)
+            .encode(RgbaImage::new(64, 64))
+            .unwrap();
+
+        assert_eq!(
+            u32::from_le_bytes(dds[28..32].try_into().unwrap()),
+            MipmapGenerator::full_chain_count(64, 64) as u32
+        );
+        walk_payload(&dds, 64, 64, 8);
+    }
+
+    #[test]
+    fn test_explicit_count_still_truncates() {
+        // The override remains usable for tests and special-purpose callers.
+        let dds = DdsEncoder::new(DdsFormat::BC1)
+            .with_compressor(Arc::new(crate::dds::SoftwareCompressor))
+            .with_mipmap_count(3)
+            .encode(RgbaImage::new(4096, 4096))
+            .unwrap();
+
+        assert_eq!(u32::from_le_bytes(dds[28..32].try_into().unwrap()), 3);
+        assert_eq!(walk_payload(&dds, 4096, 4096, 8).len(), 3);
+    }
+
+    #[test]
+    fn test_sub_block_levels_compress_to_one_block() {
+        // 2x2 and 1x1 are smaller than a BC1 block but must still emit one
+        // whole 8-byte block each. This is what padding to the block size
+        // guarantees across every compressor backend.
+        for (w, h) in [(4u32, 4u32), (2, 2), (1, 1)] {
+            let compressed = crate::dds::SoftwareCompressor
+                .compress(
+                    &pad_to_block_multiple(&RgbaImage::new(w, h)),
+                    DdsFormat::BC1,
+                )
+                .unwrap();
+            assert_eq!(compressed.len(), 8, "{}x{} must be one BC1 block", w, h);
+        }
+    }
+
+    #[test]
+    fn test_bc3_full_chain_size() {
+        // BC3 uses 16-byte blocks; the same tail rule applies.
+        let dds = DdsEncoder::new(DdsFormat::BC3)
+            .with_compressor(Arc::new(crate::dds::SoftwareCompressor))
+            .encode(RgbaImage::new(256, 256))
+            .unwrap();
+
+        let levels = walk_payload(&dds, 256, 256, 16);
+        assert_eq!(levels.len(), 9);
+        assert_eq!(*levels.last().unwrap(), (1, 1));
     }
 }

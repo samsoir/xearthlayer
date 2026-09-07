@@ -12,6 +12,7 @@
 
 use crate::executor::{ChunkDownloadError, ChunkProvider};
 use crate::provider::{AsyncProvider, Provider, ProviderError};
+use bytes::Bytes;
 use std::sync::Arc;
 
 /// Adapts a synchronous `Provider` to the async `ChunkProvider` trait.
@@ -49,7 +50,7 @@ impl ChunkProvider for ProviderAdapter {
         row: u32,
         col: u32,
         zoom: u8,
-    ) -> Result<Vec<u8>, ChunkDownloadError> {
+    ) -> Result<Bytes, ChunkDownloadError> {
         let provider = Arc::clone(&self.provider);
 
         // Run blocking HTTP call on the blocking thread pool
@@ -57,6 +58,7 @@ impl ChunkProvider for ProviderAdapter {
             .await
             .map_err(|e| ChunkDownloadError::permanent(format!("task panicked: {}", e)))?
             .map_err(map_provider_error)
+            .map(Bytes::from)
     }
 
     fn name(&self) -> &str {
@@ -133,11 +135,12 @@ impl<P: AsyncProvider + 'static> ChunkProvider for AsyncProviderAdapter<P> {
         row: u32,
         col: u32,
         zoom: u8,
-    ) -> Result<Vec<u8>, ChunkDownloadError> {
+    ) -> Result<Bytes, ChunkDownloadError> {
         self.provider
             .download_chunk(row, col, zoom)
             .await
             .map_err(map_provider_error)
+            .map(Bytes::from)
     }
 
     fn name(&self) -> &str {

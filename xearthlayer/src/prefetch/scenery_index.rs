@@ -26,16 +26,17 @@
 //! - **Efficient**: Only prefetch tiles that actually exist in scenery
 //! - **Skip sea tiles**: Can deprioritize simple water textures
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
-use tracing::{debug, info, trace};
+use tracing::{debug, info};
 
 use crate::coord::TileCoord;
+use crate::geo_index::DsfRegion;
 
 /// A tile entry in the scenery index.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -138,7 +139,10 @@ impl SceneryIndex {
     /// Build the index by scanning a scenery package directory.
     ///
     /// Parses all `.ter` files in the `terrain` subdirectory.
-    pub fn build_from_package(&self, package_path: &Path) -> Result<usize, SceneryIndexError> {
+    pub fn build_from_package(
+        &self,
+        package_path: &Path,
+    ) -> Result<PackageIndexStats, SceneryIndexError> {
         debug!(
             package = %package_path.display(),
             "Building scenery index from package"
@@ -160,7 +164,10 @@ impl SceneryIndex {
             "Found terrain directory"
         );
 
-        let mut count = 0;
+        let mut stats = PackageIndexStats::default();
+        let mut failure_samples: Vec<String> = Vec::new();
+        const MAX_FAILURE_SAMPLES: usize = 5;
+
         let entries =
             fs::read_dir(&terrain_path).map_err(|e| SceneryIndexError::IoError(e.to_string()))?;
 
@@ -168,21 +175,39 @@ impl SceneryIndex {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "ter") {
                 match self.parse_and_add_ter_file(&path) {
-                    Ok(()) => count += 1,
+                    Ok(()) => stats.parsed += 1,
                     Err(e) => {
-                        trace!(path = %path.display(), error = %e, "Failed to parse .ter file");
+                        stats.failed += 1;
+                        // Per-file stays at debug: a wholesale-malformed
+                        // package would emit millions of lines at warn.
+                        // The aggregate below is the visible signal.
+                        debug!(path = %path.display(), error = %e, "Failed to parse .ter file");
+                        if failure_samples.len() < MAX_FAILURE_SAMPLES {
+                            failure_samples.push(path.display().to_string());
+                        }
                     }
                 }
             }
         }
 
+        if stats.failed > 0 {
+            tracing::warn!(
+                package = %package_path.display(),
+                failed = stats.failed,
+                parsed = stats.parsed,
+                samples = ?failure_samples,
+                "Scenery index: .ter files failed to parse — prefetch may under-cover this package"
+            );
+        }
+
         info!(
             package = %package_path.display(),
-            tiles = count,
+            tiles = stats.parsed,
+            failed = stats.failed,
             "Built scenery index"
         );
 
-        Ok(count)
+        Ok(stats)
     }
 
     /// Parse a single .ter file and add it to the index.
@@ -215,82 +240,65 @@ impl SceneryIndex {
         }
     }
 
-    /// Query tiles within a radius of a position.
+    /// Get the deduplicated set of DDS tiles belonging to a DSF region.
     ///
-    /// Returns all tiles whose center is within `radius_nm` nautical miles
-    /// of the given position.
-    pub fn tiles_near(&self, lat: f64, lon: f64, radius_nm: f32) -> Vec<SceneryTile> {
-        let lat = lat as f32;
-        let lon = lon as f32;
-
-        // Convert radius to approximate degrees (1 degree ≈ 60nm at equator)
-        let radius_deg = radius_nm / 60.0;
-
-        // Determine which grid cells to check
-        let min_lat_cell = ((lat - radius_deg) / self.cell_size).floor() as i16;
-        let max_lat_cell = ((lat + radius_deg) / self.cell_size).ceil() as i16;
-        let min_lon_cell = ((lon - radius_deg) / self.cell_size).floor() as i16;
-        let max_lon_cell = ((lon + radius_deg) / self.cell_size).ceil() as i16;
-
-        debug!(
-            lat = lat,
-            lon = lon,
-            radius_nm = radius_nm,
-            lat_cells = format!("{}..={}", min_lat_cell, max_lat_cell),
-            lon_cells = format!("{}..={}", min_lon_cell, max_lon_cell),
-            total_tiles_indexed = *self.tile_count.read().unwrap(),
-            "Searching tiles_near"
-        );
-
+    /// A tile belongs to the region containing its geographic centre, which
+    /// is the `LOAD_CENTER` of its `.ter` file. This is the single definition
+    /// of a region's tile set — the submit, promote and rescue paths all
+    /// consult it, so they cannot disagree about whether a region is complete.
+    ///
+    /// # Why this is cheap
+    ///
+    /// A `DsfRegion` is 1°×1° and `cell_key` floors by `cell_size`, which
+    /// defaults to 1.0 — so in the default configuration a region *is* a grid
+    /// cell and this is a single `HashMap` lookup. The predicate is still
+    /// applied per tile because `grid_cell_size` is configurable.
+    ///
+    /// See #176: the previous implementations reconstructed this answer from a
+    /// 45nm radius query, which returns a circle overlapping the neighbouring
+    /// regions rather than the region itself.
+    pub fn tiles_in_region(&self, region: DsfRegion) -> Vec<TileCoord> {
         let grid = self.grid.read().unwrap();
-        let mut result = Vec::new();
-        let mut cells_with_tiles = 0;
+        let mut unique: HashSet<TileCoord> = HashSet::new();
 
-        for lat_cell in min_lat_cell..=max_lat_cell {
-            for lon_cell in min_lon_cell..=max_lon_cell {
-                if let Some(cell) = grid.get(&(lat_cell, lon_cell)) {
-                    cells_with_tiles += 1;
-                    for tile in &cell.tiles {
-                        // Check actual distance
-                        let dist = approximate_distance_nm(lat, lon, tile.lat, tile.lon);
-                        if dist <= radius_nm {
-                            result.push(*tile);
-                        }
-                    }
+        for key in self.cells_covering_region(region) {
+            let Some(cell) = grid.get(&key) else {
+                continue;
+            };
+            for tile in &cell.tiles {
+                if tile.lat.floor() as i32 == region.lat && tile.lon.floor() as i32 == region.lon {
+                    unique.insert(tile.to_tile_coord());
                 }
             }
         }
 
-        debug!(
-            cells_searched = (max_lat_cell - min_lat_cell + 1) * (max_lon_cell - min_lon_cell + 1),
-            cells_with_tiles = cells_with_tiles,
-            tiles_found = result.len(),
-            "tiles_near search complete"
+        unique.into_iter().collect()
+    }
+
+    /// Grid cell keys that overlap a DSF region.
+    ///
+    /// Derives the corners through `cell_key` rather than recomputing the
+    /// floor division, so there is one mapping from position to cell. With
+    /// the default 1.0 cell size this yields exactly one key.
+    fn cells_covering_region(&self, region: DsfRegion) -> Vec<(i16, i16)> {
+        // Nudge inside the region's far edge: the region is the half-open
+        // box [lat, lat+1) x [lon, lon+1), so lat+1.0 belongs to the *next*
+        // region and must not pull in an extra row of cells.
+        const INSIDE_EDGE: f32 = 1.0 - 1e-4;
+
+        let (lat_min, lon_min) = self.cell_key(region.lat as f32, region.lon as f32);
+        let (lat_max, lon_max) = self.cell_key(
+            region.lat as f32 + INSIDE_EDGE,
+            region.lon as f32 + INSIDE_EDGE,
         );
 
-        result
-    }
-
-    /// Query tiles within a radius, excluding sea tiles.
-    pub fn land_tiles_near(&self, lat: f64, lon: f64, radius_nm: f32) -> Vec<SceneryTile> {
-        self.tiles_near(lat, lon, radius_nm)
-            .into_iter()
-            .filter(|t| !t.is_sea)
-            .collect()
-    }
-
-    /// Query tiles within a radius at a specific zoom level.
-    pub fn tiles_near_at_zoom(
-        &self,
-        lat: f64,
-        lon: f64,
-        radius_nm: f32,
-        chunk_zoom: u8,
-    ) -> Vec<SceneryTile> {
-        self.tiles_near(lat, lon, radius_nm)
-            .into_iter()
-            .filter(|t| t.chunk_zoom == chunk_zoom)
-            .collect()
+        let mut keys = Vec::new();
+        for lat_cell in lat_min..=lat_max {
+            for lon_cell in lon_min..=lon_max {
+                keys.push((lat_cell, lon_cell));
+            }
+        }
+        keys
     }
 
     /// Get the total number of indexed tiles.
@@ -395,6 +403,7 @@ impl SceneryIndex {
         use tokio::time::interval;
 
         let total_packages = packages.len();
+        let mut total_failed = 0usize;
 
         for (i, (name, path)) in packages.into_iter().enumerate() {
             // Send PackageStarted notification
@@ -444,7 +453,10 @@ impl SceneryIndex {
 
             // Get the tile count from the result
             let tiles = match result {
-                Ok(Ok(count)) => count,
+                Ok(Ok(stats)) => {
+                    total_failed += stats.failed;
+                    stats.parsed
+                }
                 Ok(Err(e)) => {
                     tracing::warn!(
                         package = %name_clone,
@@ -482,6 +494,7 @@ impl SceneryIndex {
             total = total,
             land = land,
             sea = sea,
+            failed = total_failed,
             "Scenery index build complete"
         );
     }
@@ -597,14 +610,30 @@ fn parse_dds_filename(filename: &str) -> Option<(u32, u32, u8)> {
     Some((row, col, zoom))
 }
 
-/// Approximate distance in nautical miles using equirectangular projection.
+/// Parse outcome for one scenery package.
 ///
-/// Accurate enough for spatial queries within ~200nm.
-#[inline]
-fn approximate_distance_nm(lat1: f32, lon1: f32, lat2: f32, lon2: f32) -> f32 {
-    let lat_diff = (lat2 - lat1) * 60.0; // 1 degree = 60nm
-    let lon_diff = (lon2 - lon1) * 60.0 * (lat1.to_radians().cos());
-    (lat_diff * lat_diff + lon_diff * lon_diff).sqrt()
+/// `failed` is the count of `.ter` files present on disk that did not yield a
+/// tile. The measured baseline across 4.45M files on a full 11-package install
+/// is zero, so any non-zero value is anomalous — see #176.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PackageIndexStats {
+    /// Files that parsed into an indexed tile.
+    ///
+    /// Note: this counts files that parsed successfully, not tiles added.
+    /// `parse_and_add_ter_file` returns `Ok(())` for a sea tile that was
+    /// skipped because `include_sea_tiles` is false, so `parsed` can exceed
+    /// `SceneryIndex::tile_count()`. That is still the correct denominator
+    /// for a parse-health metric: it counts files on disk, not tiles kept.
+    pub parsed: usize,
+    /// Files that failed to parse.
+    pub failed: usize,
+}
+
+impl PackageIndexStats {
+    /// Total `.ter` files seen.
+    pub fn total(&self) -> usize {
+        self.parsed + self.failed
+    }
 }
 
 /// Errors that can occur when building the scenery index.
@@ -673,6 +702,7 @@ impl std::error::Error for SceneryIndexError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geo_index::DsfRegion;
 
     #[test]
     fn test_parse_dds_filename_bing() {
@@ -716,34 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scenery_index_add_and_query() {
-        let index = SceneryIndex::with_defaults();
-
-        // Add a tile at (45.0, -120.0)
-        let tile = SceneryTile {
-            row: 25000,
-            col: 10000,
-            chunk_zoom: 16,
-            lat: 45.0,
-            lon: -120.0,
-            is_sea: false,
-        };
-        index.add_tile(tile);
-
-        assert_eq!(index.tile_count(), 1);
-
-        // Query near the tile
-        let results = index.tiles_near(45.0, -120.0, 10.0);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].row, 25000);
-
-        // Query far from the tile
-        let results = index.tiles_near(50.0, -120.0, 10.0);
-        assert_eq!(results.len(), 0);
-    }
-
-    #[test]
-    fn test_scenery_index_land_tiles_filter() {
+    fn test_scenery_index_sea_and_land_counts() {
         let index = SceneryIndex::with_defaults();
 
         // Add a land tile
@@ -769,29 +772,198 @@ mod tests {
         assert_eq!(index.tile_count(), 2);
         assert_eq!(index.sea_tile_count(), 1);
         assert_eq!(index.land_tile_count(), 1);
+    }
 
-        // Query all tiles
-        let all = index.tiles_near(45.0, -120.0, 10.0);
-        assert_eq!(all.len(), 2);
-
-        // Query land tiles only
-        let land = index.land_tiles_near(45.0, -120.0, 10.0);
-        assert_eq!(land.len(), 1);
-        assert!(!land[0].is_sea);
+    /// Helper: a land tile at a given position. Row/col are irrelevant to the
+    /// region predicate but must be distinct so dedup tests are meaningful.
+    fn tile_at(row: u32, col: u32, lat: f32, lon: f32) -> SceneryTile {
+        SceneryTile {
+            row,
+            col,
+            chunk_zoom: 16,
+            lat,
+            lon,
+            is_sea: false,
+        }
     }
 
     #[test]
-    fn test_approximate_distance_nm() {
-        // Same point
-        assert!(approximate_distance_nm(45.0, -120.0, 45.0, -120.0) < 0.01);
+    fn test_tiles_in_region_includes_only_tiles_centred_inside() {
+        let index = SceneryIndex::with_defaults();
+        // Inside the +33-119 region.
+        index.add_tile(tile_at(1000, 2000, 33.01, -118.99));
+        index.add_tile(tile_at(1016, 2016, 33.99, -118.01));
+        // Just outside each edge.
+        index.add_tile(tile_at(2000, 2000, 32.99, -118.5)); // south
+        index.add_tile(tile_at(2016, 2016, 34.01, -118.5)); // north
+        index.add_tile(tile_at(2032, 2032, 33.5, -119.01)); // west
+        index.add_tile(tile_at(2048, 2048, 33.5, -117.99)); // east
 
-        // 1 degree north (should be ~60nm)
-        let dist = approximate_distance_nm(45.0, -120.0, 46.0, -120.0);
-        assert!((dist - 60.0).abs() < 1.0);
+        let tiles = index.tiles_in_region(DsfRegion::new(33, -119));
 
-        // 1 degree east at 45° lat (should be ~42nm due to cosine)
-        let dist = approximate_distance_nm(45.0, -120.0, 45.0, -119.0);
-        assert!((dist - 42.4).abs() < 2.0);
+        assert_eq!(
+            tiles.len(),
+            2,
+            "only the two tiles centred inside +33-119 belong to it, got {:?}",
+            tiles
+        );
+    }
+
+    #[test]
+    fn test_tiles_in_region_deduplicates_shared_textures() {
+        let index = SceneryIndex::with_defaults();
+        // Many .ter files share one base DDS texture. After the /16 division in
+        // to_tile_coord these collapse to the same TileCoord.
+        index.add_tile(tile_at(1000, 2000, 33.1, -118.9));
+        index.add_tile(tile_at(1001, 2001, 33.2, -118.8));
+        index.add_tile(tile_at(1007, 2015, 33.3, -118.7));
+
+        let tiles = index.tiles_in_region(DsfRegion::new(33, -119));
+
+        assert_eq!(
+            tiles.len(),
+            1,
+            "1000, 1001, 1007 all fall in chunk-row block [992, 1008), one tile coord"
+        );
+        assert_eq!(tiles[0].row, 1000 / 16);
+        assert_eq!(tiles[0].col, 2000 / 16);
+    }
+
+    #[test]
+    fn test_tiles_in_region_southern_western_hemisphere() {
+        // floor() on negatives is where an off-by-one hides: floor(-33.5) is -34,
+        // so the region containing -33.5 is DsfRegion { lat: -34 }.
+        let index = SceneryIndex::with_defaults();
+        index.add_tile(tile_at(1000, 2000, -33.5, -70.5));
+        index.add_tile(tile_at(3000, 4000, -32.5, -70.5)); // region -33, not -34
+
+        let tiles = index.tiles_in_region(DsfRegion::new(-34, -71));
+
+        assert_eq!(tiles.len(), 1, "only the -33.5 tile is in +-34-071");
+        assert_eq!(tiles[0].row, 1000 / 16);
+    }
+
+    #[test]
+    fn test_tiles_in_region_honours_non_default_cell_size() {
+        // A 0.5 degree grid splits one DSF region across four cells. All four
+        // must be visited or the result silently loses three quarters of them.
+        let config = SceneryIndexConfig {
+            grid_cell_size: 0.5,
+            include_sea_tiles: true,
+        };
+        let index = SceneryIndex::new(config);
+        index.add_tile(tile_at(1000, 2000, 33.2, -118.8)); // cell (66, -238)
+        index.add_tile(tile_at(2000, 3000, 33.7, -118.8)); // cell (67, -238)
+        index.add_tile(tile_at(3000, 4000, 33.2, -118.3)); // cell (66, -237)
+        index.add_tile(tile_at(4000, 5000, 33.7, -118.3)); // cell (67, -237)
+
+        let tiles = index.tiles_in_region(DsfRegion::new(33, -119));
+
+        assert_eq!(
+            tiles.len(),
+            4,
+            "all four sub-cells must be visited, got {:?}",
+            tiles
+        );
+    }
+
+    #[test]
+    fn test_tiles_in_region_empty_for_uncovered_region() {
+        let index = SceneryIndex::with_defaults();
+        index.add_tile(tile_at(1000, 2000, 33.5, -118.5));
+
+        assert!(index.tiles_in_region(DsfRegion::new(50, 10)).is_empty());
+    }
+
+    #[test]
+    fn test_tiles_in_region_predicate_filters_within_shared_cell() {
+        // At cell_size 2.0, one grid cell spans two DSF regions along the lat
+        // axis: floor(33.5 / 2.0) == floor(32.5 / 2.0) == 16, so both tiles
+        // land in the same cell, but floor(33.5) == 33 and floor(32.5) == 32
+        // put them in different regions. Only the predicate -- not cell
+        // visitation -- can tell them apart.
+        let config = SceneryIndexConfig {
+            grid_cell_size: 2.0,
+            include_sea_tiles: true,
+        };
+        let index = SceneryIndex::new(config);
+        index.add_tile(tile_at(1000, 2000, 33.5, -119.5)); // region 33,-120
+        index.add_tile(tile_at(2000, 3000, 32.5, -119.5)); // region 32,-120, same cell
+
+        let tiles = index.tiles_in_region(DsfRegion::new(33, -120));
+
+        assert_eq!(
+            tiles.len(),
+            1,
+            "the same-cell tile from region 32,-120 must be excluded, got {:?}",
+            tiles
+        );
+        assert_eq!(tiles[0].row, 1000 / 16);
+    }
+
+    #[test]
+    fn test_tiles_in_region_includes_sea_tiles() {
+        // The spec requires sea tiles stay in scope: no is_sea filter here.
+        let index = SceneryIndex::with_defaults();
+        let mut tile = tile_at(1000, 2000, 33.5, -118.5);
+        tile.is_sea = true;
+        index.add_tile(tile);
+
+        let tiles = index.tiles_in_region(DsfRegion::new(33, -119));
+
+        assert_eq!(
+            tiles.len(),
+            1,
+            "sea tiles must remain in scope, got {:?}",
+            tiles
+        );
+    }
+
+    /// Write a minimal valid .ter file that parses into one tile.
+    fn write_valid_ter(dir: &std::path::Path, name: &str) {
+        let body = "A\n800\nTERRAIN\n\n\
+                    LOAD_CENTER 33.50000 -118.50000 1744 4096\n\
+                    BASE_TEX_NOWRAP ../textures/25328_49904_BI16.dds\n";
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn test_build_from_package_counts_parse_failures() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let terrain = tmp.path().join("terrain");
+        std::fs::create_dir_all(&terrain).unwrap();
+
+        write_valid_ter(&terrain, "good_a.ter");
+        write_valid_ter(&terrain, "good_b.ter");
+        // No LOAD_CENTER and no BASE_TEX: parse must fail.
+        std::fs::write(terrain.join("bad.ter"), "A\n800\nTERRAIN\n").unwrap();
+        // Not a .ter file: must not be counted at all.
+        std::fs::write(terrain.join("notes.txt"), "ignored").unwrap();
+
+        let index = SceneryIndex::with_defaults();
+        let stats = index.build_from_package(tmp.path()).unwrap();
+
+        assert_eq!(stats.parsed, 2);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(index.tile_count(), 2);
+    }
+
+    #[test]
+    fn test_build_from_package_reports_zero_failures_when_all_parse() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let terrain = tmp.path().join("terrain");
+        std::fs::create_dir_all(&terrain).unwrap();
+        write_valid_ter(&terrain, "a.ter");
+        write_valid_ter(&terrain, "b.ter");
+
+        let index = SceneryIndex::with_defaults();
+        let stats = index.build_from_package(tmp.path()).unwrap();
+
+        assert_eq!(
+            stats.failed, 0,
+            "the measured baseline across 4.45M real files is zero"
+        );
+        assert_eq!(stats.parsed, 2);
     }
 
     /// Integration test with real scenery package.
@@ -809,24 +981,30 @@ mod tests {
         }
 
         let index = SceneryIndex::with_defaults();
-        let count = index
+        let stats = index
             .build_from_package(path)
             .expect("Failed to build index");
+        let count = stats.parsed;
 
         // Should find many tiles
         assert!(count > 1000, "Expected > 1000 tiles, found {}", count);
 
         // Print some statistics
-        eprintln!("Indexed {} tiles", count);
+        eprintln!("Indexed {} tiles ({} failed)", count, stats.failed);
         eprintln!("  Land tiles: {}", index.land_tile_count());
         eprintln!("  Sea tiles: {}", index.sea_tile_count());
 
-        // Query tiles near a known location (California)
-        let tiles = index.tiles_near(36.28, -119.49, 10.0);
-        assert!(!tiles.is_empty(), "Expected tiles near (36.28, -119.49)");
+        // Spot-check the DSF region containing a known location (California).
+        // floor(36.28) == 36, floor(-119.49) == -120, so the region is (36, -120).
+        let tiles = index.tiles_in_region(DsfRegion::new(36, -120));
+        assert!(!tiles.is_empty(), "Expected tiles in region (36, -120)");
 
-        // Verify we have both ZL16 and ZL18 tiles
-        let has_zl16 = tiles.iter().any(|t| t.chunk_zoom == 16);
+        // Verify we have ZL16 tiles. tiles_in_region returns TileCoord, whose
+        // zoom is the *tile* zoom, not the chunk zoom baked into DDS filenames:
+        // chunk_zoom 16 corresponds to tile_zoom 16 - CHUNK_ZOOM_OFFSET == 12.
+        let has_zl16 = tiles
+            .iter()
+            .any(|t| t.zoom == 16 - crate::coord::CHUNK_ZOOM_OFFSET);
         eprintln!("Has ZL16 tiles: {}", has_zl16);
     }
 }

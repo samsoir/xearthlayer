@@ -9,6 +9,7 @@
 //! Keys follow the format `tile:{zoom}:{row}:{col}` for debuggability.
 //! Example: `tile:15:12754:5279`
 
+use bytes::Bytes;
 use std::sync::Arc;
 
 use tracing::warn;
@@ -48,7 +49,7 @@ impl TileCacheClient {
     /// # Returns
     ///
     /// `Some(data)` if cached, `None` otherwise
-    pub async fn get(&self, tile: &TileCoord) -> Option<Vec<u8>> {
+    pub async fn get(&self, tile: &TileCoord) -> Option<Bytes> {
         let key = Self::tile_to_key(tile);
         match self.cache.get(&key).await {
             Ok(Some(data)) => Some(data),
@@ -66,7 +67,7 @@ impl TileCacheClient {
     ///
     /// * `tile` - The tile coordinates
     /// * `data` - The DDS tile data
-    pub async fn set(&self, tile: &TileCoord, data: Vec<u8>) {
+    pub async fn set(&self, tile: &TileCoord, data: Bytes) {
         let key = Self::tile_to_key(tile);
         if let Err(e) = self.cache.set(&key, data).await {
             warn!(error = %e, key = %key, "Tile cache set failed");
@@ -81,6 +82,12 @@ impl TileCacheClient {
     pub async fn contains(&self, tile: &TileCoord) -> bool {
         let key = Self::tile_to_key(tile);
         self.cache.contains(&key).await.unwrap_or(false)
+    }
+
+    /// Check whether a tile exists, synchronously. See `Cache::contains_sync`.
+    pub fn contains_sync(&self, tile: &TileCoord) -> bool {
+        let key = Self::tile_to_key(tile);
+        self.cache.contains_sync(&key)
     }
 
     /// Delete a tile from the cache.
@@ -145,10 +152,10 @@ mod tests {
         };
         let data = vec![1, 2, 3, 4, 5];
 
-        client.set(&tile, data.clone()).await;
+        client.set(&tile, data.clone().into()).await;
 
         let result = client.get(&tile).await;
-        assert_eq!(result, Some(data));
+        assert_eq!(result, Some(Bytes::from(data)));
 
         service.shutdown().await;
     }
@@ -187,7 +194,7 @@ mod tests {
 
         assert!(!client.contains(&tile).await);
 
-        client.set(&tile, vec![1, 2, 3]).await;
+        client.set(&tile, vec![1, 2, 3].into()).await;
 
         assert!(client.contains(&tile).await);
 
@@ -207,7 +214,7 @@ mod tests {
             zoom: 15,
         };
 
-        client.set(&tile, vec![1, 2, 3]).await;
+        client.set(&tile, vec![1, 2, 3].into()).await;
         assert!(client.contains(&tile).await);
 
         let deleted = client.delete(&tile).await;
@@ -235,8 +242,8 @@ mod tests {
             zoom: 15,
         };
 
-        client.set(&tile1, vec![0u8; 1000]).await;
-        client.set(&tile2, vec![0u8; 2000]).await;
+        client.set(&tile1, vec![0u8; 1000].into()).await;
+        client.set(&tile2, vec![0u8; 2000].into()).await;
 
         // Run gc to sync stats
         let _ = service.cache().gc().await;

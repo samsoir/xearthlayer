@@ -50,7 +50,6 @@ pub enum ConfigKey {
     CacheMemorySize,
     CacheDiskSize,
     CacheDdsDiskRatio,
-    CacheDiskIoProfile,
 
     // Texture settings
     TextureFormat,
@@ -109,9 +108,6 @@ pub enum ConfigKey {
     PatchesDirectory,
 
     // Executor settings
-    ExecutorNetworkConcurrent,
-    ExecutorCpuConcurrent,
-    ExecutorDiskIoConcurrent,
     ExecutorMaxConcurrentJobs,
     ExecutorRequestTimeoutSecs,
     ExecutorMaxRetries,
@@ -137,7 +133,6 @@ impl FromStr for ConfigKey {
             "cache.memory_size" => Ok(ConfigKey::CacheMemorySize),
             "cache.disk_size" => Ok(ConfigKey::CacheDiskSize),
             "cache.dds_disk_ratio" => Ok(ConfigKey::CacheDdsDiskRatio),
-            "cache.disk_io_profile" => Ok(ConfigKey::CacheDiskIoProfile),
 
             "texture.format" => Ok(ConfigKey::TextureFormat),
             "texture.compressor" => Ok(ConfigKey::TextureCompressor),
@@ -190,9 +185,6 @@ impl FromStr for ConfigKey {
             "patches.directory" => Ok(ConfigKey::PatchesDirectory),
 
             // Executor settings
-            "executor.network_concurrent" => Ok(ConfigKey::ExecutorNetworkConcurrent),
-            "executor.cpu_concurrent" => Ok(ConfigKey::ExecutorCpuConcurrent),
-            "executor.disk_io_concurrent" => Ok(ConfigKey::ExecutorDiskIoConcurrent),
             "executor.max_concurrent_jobs" => Ok(ConfigKey::ExecutorMaxConcurrentJobs),
             "executor.request_timeout_secs" => Ok(ConfigKey::ExecutorRequestTimeoutSecs),
             "executor.max_retries" => Ok(ConfigKey::ExecutorMaxRetries),
@@ -219,7 +211,6 @@ impl ConfigKey {
             ConfigKey::CacheMemorySize => "cache.memory_size",
             ConfigKey::CacheDiskSize => "cache.disk_size",
             ConfigKey::CacheDdsDiskRatio => "cache.dds_disk_ratio",
-            ConfigKey::CacheDiskIoProfile => "cache.disk_io_profile",
             ConfigKey::TextureFormat => "texture.format",
             ConfigKey::TextureCompressor => "texture.compressor",
             ConfigKey::TextureGpuDevice => "texture.gpu_device",
@@ -263,9 +254,6 @@ impl ConfigKey {
             ConfigKey::PatchesDirectory => "patches.directory",
 
             // Executor settings
-            ConfigKey::ExecutorNetworkConcurrent => "executor.network_concurrent",
-            ConfigKey::ExecutorCpuConcurrent => "executor.cpu_concurrent",
-            ConfigKey::ExecutorDiskIoConcurrent => "executor.disk_io_concurrent",
             ConfigKey::ExecutorMaxConcurrentJobs => "executor.max_concurrent_jobs",
             ConfigKey::ExecutorRequestTimeoutSecs => "executor.request_timeout_secs",
             ConfigKey::ExecutorMaxRetries => "executor.max_retries",
@@ -320,7 +308,6 @@ impl ConfigKey {
             ConfigKey::CacheMemorySize => format_size(config.cache.memory_size),
             ConfigKey::CacheDiskSize => format_size(config.cache.disk_size),
             ConfigKey::CacheDdsDiskRatio => config.cache.dds_disk_ratio.to_string(),
-            ConfigKey::CacheDiskIoProfile => config.cache.disk_io_profile.as_str().to_string(),
             ConfigKey::TextureFormat => config.texture.format.to_string().to_lowercase(),
             ConfigKey::TextureCompressor => config.texture.compressor.clone(),
             ConfigKey::TextureGpuDevice => config.texture.gpu_device.clone(),
@@ -404,9 +391,6 @@ impl ConfigKey {
                 .unwrap_or_default(),
 
             // Executor settings
-            ConfigKey::ExecutorNetworkConcurrent => config.executor.network_concurrent.to_string(),
-            ConfigKey::ExecutorCpuConcurrent => config.executor.cpu_concurrent.to_string(),
-            ConfigKey::ExecutorDiskIoConcurrent => config.executor.disk_io_concurrent.to_string(),
             ConfigKey::ExecutorMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs.to_string()
             }
@@ -459,9 +443,6 @@ impl ConfigKey {
             }
             ConfigKey::CacheDdsDiskRatio => {
                 config.cache.dds_disk_ratio = value.parse().unwrap();
-            }
-            ConfigKey::CacheDiskIoProfile => {
-                config.cache.disk_io_profile = value.parse().unwrap();
             }
             ConfigKey::TextureFormat => {
                 config.texture.format = match value.to_lowercase().as_str() {
@@ -580,15 +561,6 @@ impl ConfigKey {
             }
 
             // Executor settings
-            ConfigKey::ExecutorNetworkConcurrent => {
-                config.executor.network_concurrent = value.parse().unwrap();
-            }
-            ConfigKey::ExecutorCpuConcurrent => {
-                config.executor.cpu_concurrent = value.parse().unwrap();
-            }
-            ConfigKey::ExecutorDiskIoConcurrent => {
-                config.executor.disk_io_concurrent = value.parse().unwrap();
-            }
             ConfigKey::ExecutorMaxConcurrentJobs => {
                 config.control_plane.max_concurrent_jobs = value.parse().unwrap();
             }
@@ -635,9 +607,6 @@ impl ConfigKey {
             ConfigKey::CacheMemorySize => Box::new(SizeSpec),
             ConfigKey::CacheDiskSize => Box::new(SizeSpec),
             ConfigKey::CacheDdsDiskRatio => Box::new(FloatRangeSpec::new(0.0, 1.0)),
-            ConfigKey::CacheDiskIoProfile => {
-                Box::new(OneOfSpec::new(&["auto", "hdd", "ssd", "nvme"]))
-            }
             ConfigKey::TextureFormat => Box::new(OneOfSpec::new(&["bc1", "bc3"])),
             ConfigKey::TextureCompressor => Box::new(OneOfSpec::new(&["software", "ispc", "gpu"])),
             ConfigKey::TextureGpuDevice => Box::new(NonEmptyStringSpec),
@@ -682,9 +651,6 @@ impl ConfigKey {
             ConfigKey::PatchesDirectory => Box::new(OptionalPathSpec),
 
             // Executor settings
-            ConfigKey::ExecutorNetworkConcurrent => Box::new(PositiveIntegerSpec),
-            ConfigKey::ExecutorCpuConcurrent => Box::new(PositiveIntegerSpec),
-            ConfigKey::ExecutorDiskIoConcurrent => Box::new(PositiveIntegerSpec),
             ConfigKey::ExecutorMaxConcurrentJobs => Box::new(IntegerRangeSpec::new(1, 256)),
             ConfigKey::ExecutorRequestTimeoutSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ExecutorMaxRetries => Box::new(PositiveIntegerSpec),
@@ -711,7 +677,6 @@ impl ConfigKey {
             ConfigKey::CacheMemorySize,
             ConfigKey::CacheDiskSize,
             ConfigKey::CacheDdsDiskRatio,
-            ConfigKey::CacheDiskIoProfile,
             ConfigKey::TextureFormat,
             ConfigKey::TextureCompressor,
             ConfigKey::TextureGpuDevice,
@@ -749,9 +714,6 @@ impl ConfigKey {
             ConfigKey::PatchesEnabled,
             ConfigKey::PatchesDirectory,
             // Executor settings
-            ConfigKey::ExecutorNetworkConcurrent,
-            ConfigKey::ExecutorCpuConcurrent,
-            ConfigKey::ExecutorDiskIoConcurrent,
             ConfigKey::ExecutorMaxConcurrentJobs,
             ConfigKey::ExecutorRequestTimeoutSecs,
             ConfigKey::ExecutorMaxRetries,
@@ -1392,5 +1354,22 @@ mod tests {
         assert!(key.validate("RTX 5090").is_ok());
         assert!(key.validate("").is_err());
         assert!(key.validate("   ").is_err());
+    }
+
+    #[test]
+    fn executor_pool_keys_are_no_longer_settable() {
+        // Removed in #249. Pool sizing is derived from the tuned policy in
+        // ResourcePoolConfig::default(); `config set` must not offer a lever
+        // that would silently undo it.
+        for key in [
+            "executor.network_concurrent",
+            "executor.cpu_concurrent",
+            "executor.disk_io_concurrent",
+        ] {
+            assert!(
+                ConfigKey::from_str(key).is_err(),
+                "{key} should no longer resolve to a ConfigKey"
+            );
+        }
     }
 }

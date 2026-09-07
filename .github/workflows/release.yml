@@ -84,13 +84,30 @@ jobs:
     name: Build Release Binary
     runs-on: ubuntu-latest
     needs: [verify]
+    # Built inside an ubuntu:22.04 container rather than on `ubuntu-latest`.
+    # The runner image is not ours to pin: when GitHub moved `ubuntu-latest`
+    # from 22.04 to 24.04 our glibc floor rose from 2.34 to 2.39 with no
+    # commit, and the .deb and tarball stopped installing on Debian 12 and
+    # Ubuntu 22.04 LTS. A container pins the build environment in this repo,
+    # where a change to it is reviewable. Both Linux artifacts are cut from
+    # this one binary, so this job alone sets the floor for both.
+    container:
+      image: ubuntu:22.04
+    env:
+      # Highest glibc symbol version the released binary may require.
+      # 2.34 covers Ubuntu 22.04 (2.35), Debian 12 (2.36) and RHEL 9 (2.34).
+      GLIBC_FLOOR: "2.34"
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Install dependencies
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libfuse3-dev
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config libfuse3-dev \
+            curl ca-certificates git binutils
+
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -98,6 +115,21 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release
+
+      # Fails the release rather than shipping a binary that cannot start on
+      # a supported distro. Without this the floor regresses silently and the
+      # first report arrives from a user who cannot run the program at all.
+      - name: Verify glibc compatibility floor
+        run: |
+          MAX=$(objdump -T target/release/xearthlayer \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' \
+            | sed 's/GLIBC_//' | sort -V -u | tail -1)
+          echo "Highest required glibc symbol: $MAX (floor: $GLIBC_FLOOR)"
+          if [ "$(printf '%s\n%s\n' "$MAX" "$GLIBC_FLOOR" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
+            echo "::error::Binary requires glibc $MAX, above the supported floor $GLIBC_FLOOR."
+            echo "::error::It will not start on Ubuntu 22.04, Debian 12 or RHEL 9."
+            exit 1
+          fi
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
@@ -262,76 +294,82 @@ jobs:
 
   # Prepare AUR package files
   # Stable releases only — AUR `pkgver` forbids the hyphen in pre-release versions.
+  #
+  # Runs in an Arch container for two reasons: `.SRCINFO` is generated from the
+  # PKGBUILD by makepkg rather than hand-written (so the two cannot drift), and
+  # the package is actually built with a stock `makepkg.conf` (LTO on), which is
+  # the only thing that proves the shipped PKGBUILD links. See issue #222.
   prepare-aur:
     name: Prepare AUR Package
     runs-on: ubuntu-latest
     needs: [verify]
     if: ${{ needs.verify.outputs.prerelease != 'true' }}
+    container:
+      image: archlinux:base-devel
     steps:
+      - name: Install prerequisites
+        run: pacman -Syu --noconfirm --needed git
+
       - uses: actions/checkout@v6
 
-      - name: Generate PKGBUILD and .SRCINFO
+      - name: Create unprivileged build user
+        # makepkg refuses to run as root. NOPASSWD sudo lets `makepkg -s`
+        # install the declared depends/makedepends.
+        run: |
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chmod 0440 /etc/sudoers.d/builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Generate PKGBUILD
         env:
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
+          set -euo pipefail
+          case "$VERSION" in
+            *-*) echo "::error::pkgver may not contain a hyphen: $VERSION" && exit 1 ;;
+          esac
+
           mkdir -p pkg/aur
 
-          # Download source tarball to calculate checksum
-          curl -sL "https://github.com/${{ github.repository }}/archive/${RELEASE_TAG}.tar.gz" \
+          # Checksum the release tarball, then discard it so makepkg fetches its
+          # own copy below — that way the build validates the published URL and
+          # the checksum we are about to ship, not a file we already hold.
+          curl -fsSL "https://github.com/${{ github.repository }}/archive/${RELEASE_TAG}.tar.gz" \
             -o "pkg/aur/xearthlayer-${VERSION}.tar.gz"
           SHA256=$(sha256sum "pkg/aur/xearthlayer-${VERSION}.tar.gz" | cut -d' ' -f1)
-
-          # Generate PKGBUILD
-          cat > pkg/aur/PKGBUILD << EOF
-          # Maintainer: XEarthLayer Contributors
-          pkgname=xearthlayer
-          pkgver=${VERSION}
-          pkgrel=1
-          pkgdesc='Virtual Earth imagery layer filesystem for X-Plane using FUSE'
-          arch=('x86_64')
-          url='https://github.com/${{ github.repository }}'
-          license=('MIT')
-          depends=('fuse3')
-          makedepends=('rust' 'cargo')
-          optdepends=('xplane12: X-Plane 12 flight simulator')
-          source=("\${pkgname}-\${pkgver}.tar.gz::https://github.com/${{ github.repository }}/archive/v\${pkgver}.tar.gz")
-          sha256sums=('${SHA256}')
-
-          build() {
-            cd "\${pkgname}-\${pkgver}"
-            cargo build --release --locked
-          }
-
-          package() {
-            cd "\${pkgname}-\${pkgver}"
-            install -Dm755 "target/release/xearthlayer" "\${pkgdir}/usr/bin/xearthlayer"
-            install -Dm644 "LICENSE" "\${pkgdir}/usr/share/licenses/\${pkgname}/LICENSE"
-            install -Dm644 "README.md" "\${pkgdir}/usr/share/doc/\${pkgname}/README.md"
-          }
-          EOF
-
-          # Generate .SRCINFO
-          cat > pkg/aur/.SRCINFO << EOF
-          pkgbase = xearthlayer
-          	pkgdesc = Virtual Earth imagery layer filesystem for X-Plane using FUSE
-          	pkgver = ${VERSION}
-          	pkgrel = 1
-          	url = https://github.com/${{ github.repository }}
-          	arch = x86_64
-          	license = MIT
-          	makedepends = rust
-          	makedepends = cargo
-          	depends = fuse3
-          	optdepends = xplane12: X-Plane 12 flight simulator
-          	source = xearthlayer-\${pkgver}.tar.gz::https://github.com/${{ github.repository }}/archive/v\${pkgver}.tar.gz
-          	sha256sums = ${SHA256}
-
-          pkgname = xearthlayer
-          EOF
-
-          # Clean up tarball
           rm "pkg/aur/xearthlayer-${VERSION}.tar.gz"
+
+          # Template from the single source of truth. Re-authoring the PKGBUILD
+          # here is what dropped `options=(!lto)` and broke every Arch build in
+          # #222; keep this a sed, never a heredoc.
+          sed -e "s/^pkgver=.*/pkgver=${VERSION}/" \
+              -e "s/^sha256sums=.*/sha256sums=('${SHA256}')/" \
+              pkg/arch/PKGBUILD > pkg/aur/PKGBUILD
+
+          grep -q '^options=(!lto)' pkg/aur/PKGBUILD \
+            || { echo "::error::generated PKGBUILD lost options=(!lto)"; exit 1; }
+
+          # pkg/aur is created by this step, as root, after the workspace-wide
+          # chown — so it needs its own. makepkg writes src/ and pkg/ here.
+          chown -R builder:builder pkg/aur
+
+      - name: Generate .SRCINFO
+        working-directory: pkg/aur
+        run: sudo -u builder --set-home makepkg --printsrcinfo > .SRCINFO
+
+      - name: Build with stock makepkg.conf
+        # The regression gate for #222: a default-configured Arch machine has
+        # LTO enabled, and this step fails to link if the flag is ever lost.
+        #
+        # This is release-blocking — `publish` requires prepare-aur != failure —
+        # which is deliberate: shipping a PKGBUILD that cannot build is the very
+        # bug this job exists to prevent. A transient pacman-mirror failure will
+        # also stop a release; recover with `gh run rerun <id> --failed`, since
+        # the tag is immutable and re-runnable.
+        working-directory: pkg/aur
+        run: sudo -u builder --set-home makepkg -Cf -s --noconfirm
 
       - name: Upload AUR package files
         uses: actions/upload-artifact@v7
@@ -378,6 +416,27 @@ jobs:
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
+          # A hand-written notes file for this exact tag wins, if present.
+          # Pre-releases need tester-facing guidance — what to look at, what
+          # noise to ignore, how to report — which does not belong in the
+          # product changelog. Stable tags normally have no such file and
+          # fall through to the CHANGELOG extraction below, unchanged.
+          # RELEASE_TAG becomes a path component here, and on workflow_dispatch
+          # it is caller-supplied, so constrain it to the tag grammar before
+          # use — no slashes, no traversal.
+          if ! printf '%s' "${RELEASE_TAG}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-(dev|alpha|beta|rc)\.[0-9]+)?$'; then
+            echo "Tag '${RELEASE_TAG}' is not a recognised release tag; skipping notes-file lookup."
+            NOTES_FILE=""
+          else
+            NOTES_FILE=".github/release-notes/${RELEASE_TAG}.md"
+          fi
+          if [ -n "${NOTES_FILE}" ] && [ -f "${NOTES_FILE}" ]; then
+            echo "Using hand-written notes: ${NOTES_FILE}"
+            cp "${NOTES_FILE}" release_notes.md
+            cat release_notes.md
+            exit 0
+          fi
+
           # Extract release notes from CHANGELOG.md if available
           if [ -f CHANGELOG.md ]; then
             # Try to extract notes for this version

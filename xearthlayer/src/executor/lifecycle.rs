@@ -17,7 +17,7 @@ use super::task::TaskResult;
 use super::telemetry::TelemetryEvent;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 impl JobExecutor {
     /// Handles a newly submitted job.
@@ -28,7 +28,7 @@ impl JobExecutor {
         let name = submitted.name.clone();
         let priority = submitted.priority;
 
-        info!(
+        debug!(
             job_id = %job_id,
             job_name = %name,
             priority = ?priority,
@@ -299,7 +299,7 @@ impl JobExecutor {
     ) {
         match status {
             JobStatus::Succeeded => {
-                info!(
+                debug!(
                     job_id = %job_id,
                     duration_ms = result.duration.as_millis(),
                     tasks_succeeded = result.succeeded_tasks.len(),
@@ -401,7 +401,7 @@ impl JobExecutor {
         });
 
         let total_tasks = active.pending_tasks.len();
-        info!(job_id = %job_id, task_count = total_tasks, "Job started");
+        debug!(job_id = %job_id, task_count = total_tasks, "Job started");
 
         if !active.pending_tasks.is_empty() {
             let first_task = active.pending_tasks.remove(0);

@@ -3,6 +3,8 @@
 //! This module contains [`ActiveJob`] - the internal state for a job that
 //! is currently being executed by the executor.
 
+use bytes::Bytes;
+
 use super::context::{SharedTaskOutputs, SpawnedChildJob};
 use super::handle::{JobStatus, Signal};
 use super::job::{Job, JobId, JobResult};
@@ -177,7 +179,9 @@ impl ActiveJob {
             let outputs = self.task_outputs.read().unwrap();
             outputs
                 .get("BuildAndCacheDds")
-                .and_then(|output| output.get::<Vec<u8>>("dds_data"))
+                // `.cloned()` on a Bytes is a refcount bump; on the Vec
+                // this used to be it copied the whole 10.66 MiB tile (#237).
+                .and_then(|output| output.get::<Bytes>("dds_data"))
                 .cloned()
         };
 

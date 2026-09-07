@@ -516,7 +516,7 @@ mod tests {
         assert!(received.response_tx.is_some());
 
         // Send a response
-        let response = DdsResponse::cache_hit(vec![1, 2, 3], Duration::from_millis(10));
+        let response = DdsResponse::cache_hit(vec![1, 2, 3].into(), Duration::from_millis(10));
         received.response_tx.unwrap().send(response).unwrap();
 
         // Verify response was received
@@ -641,7 +641,7 @@ mod tests {
         assert!(received.response_tx.is_some());
 
         // Send a response back
-        let response = DdsResponse::cache_hit(vec![42], Duration::from_millis(5));
+        let response = DdsResponse::cache_hit(vec![42].into(), Duration::from_millis(5));
         received.response_tx.unwrap().send(response).unwrap();
 
         // FUSE caller receives the response

@@ -231,6 +231,7 @@ pub trait PublisherService: Send + Sync {
         &self,
         packages_dir: &Path,
         output_path: &Path,
+        metadata_path: &Path,
         width: u32,
         height: u32,
         dark: bool,
@@ -241,6 +242,7 @@ pub trait PublisherService: Send + Sync {
         &self,
         packages_dir: &Path,
         output_path: &Path,
+        metadata_path: &Path,
     ) -> Result<CoverageResult, CliError>;
 
     /// Deduplicate overlapping zoom level tiles in a package.

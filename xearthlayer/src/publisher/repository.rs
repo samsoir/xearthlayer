@@ -34,6 +34,18 @@ const STAGING_DIR: &str = "staging";
 /// Library index filename.
 const LIBRARY_FILE: &str = "xearthlayer_package_library.txt";
 
+/// Region colour metadata consumed by `publish coverage` and the website legend.
+const REGION_METADATA_FILE: &str = "region_metadata.json";
+
+/// Stub written by `init`. The empty `regions` map is intentional — coverage
+/// map generation succeeds and renders everything grey, which is visibly
+/// incomplete, rather than failing on a fresh repository.
+const REGION_METADATA_STUB: &str = r#"{
+  "_comment": "Region colours for the coverage map and website legend. 'color' accepts a CSS colour name (e.g. crimson) or hex (e.g. #ffaa00).",
+  "regions": {}
+}
+"#;
+
 /// A package publisher repository.
 ///
 /// Manages the structure and state of a local package repository used to
@@ -59,6 +71,7 @@ impl Repository {
     /// - `dist/` directory for built archives
     /// - `staging/` directory for work in progress
     /// - Empty `xearthlayer_package_library.txt`
+    /// - `region_metadata.json` stub with an empty region list
     ///
     /// # Errors
     ///
@@ -113,6 +126,15 @@ impl Repository {
         fs::write(&library_path, library_content).map_err(|e| PublishError::WriteFailed {
             path: library_path,
             source: e,
+        })?;
+
+        // Write region metadata stub
+        let region_metadata_path = root.join(REGION_METADATA_FILE);
+        fs::write(&region_metadata_path, REGION_METADATA_STUB).map_err(|e| {
+            PublishError::WriteFailed {
+                path: region_metadata_path,
+                source: e,
+            }
         })?;
 
         Ok(Self {
@@ -559,5 +581,28 @@ mod tests {
         let (_temp, repo) = temp_repo();
         let debug = format!("{:?}", repo);
         assert!(debug.contains("Repository"));
+    }
+
+    #[test]
+    fn init_creates_region_metadata_stub() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let path = repo.root().join("region_metadata.json");
+        assert!(path.exists(), "init should create region_metadata.json");
+    }
+
+    // The stub must be loadable by the coverage map, not merely present.
+    // An empty regions map is intentional: `publish coverage` then succeeds
+    // and renders every region grey, which is obviously incomplete.
+    #[test]
+    fn init_stub_parses_as_region_metadata_with_no_regions() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let metadata =
+            crate::publisher::RegionMetadata::load(&repo.root().join("region_metadata.json"))
+                .expect("stub must parse as RegionMetadata");
+        assert!(metadata.regions.is_empty());
     }
 }

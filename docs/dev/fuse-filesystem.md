@@ -13,7 +13,7 @@ The following features are **implemented and working**:
 | X-Plane Path Detection | ✅ Complete | Auto-detects X-Plane 12 install from reference file |
 | On-demand DDS Generation | ✅ Complete | Downloads satellite imagery and encodes to BC1/BC3 DDS |
 | Multi-provider Support | ✅ Complete | Bing Maps, Google GO2, Google Maps API |
-| Two-tier Caching | ✅ Complete | Memory + disk cache for generated textures |
+| Three-tier Caching | ✅ Complete | Memory, DDS disk, and chunk disk caches for generated textures |
 | Async Pipeline | ✅ Complete | Request coalescing, parallel downloads, async encoding |
 | Graceful Shutdown | ✅ Complete | Auto-unmount on SIGTERM/SIGINT |
 | Package Management | ✅ Complete | Install, update, remove regional packages |
@@ -247,19 +247,19 @@ The regex pattern for recognition:
 
 | Operation | Behavior |
 |-----------|----------|
-| `open` | Virtual DDS inodes: `VIRTUAL_DDS_OPEN_FLAGS` (platform-dependent, see below); Real passthrough files: default flags |
-| `read` | For DDS: serve from cache/generated; For others: read from source |
-| `release` | Clean up handles |
+| `open` | Virtual DDS inodes: `VIRTUAL_DDS_OPEN_FLAGS` (platform-dependent, see below) plus a file handle; Real passthrough files: default flags, no handle |
+| `read` | For DDS: slice the handle's tile, producing it on first read; For others: seek and read the requested range |
+| `release` | Drop the handle's tile |
 
 ### Open Flags for Virtual DDS Files
 
-Both filesystems set `VIRTUAL_DDS_OPEN_FLAGS` (single source of truth in
+The ortho union filesystem sets `VIRTUAL_DDS_OPEN_FLAGS` (single source of truth in
 `fuse/fuse3/shared.rs`) on virtual DDS inodes in `open()`. The value is
 platform-dependent:
 
 **Linux: `FOPEN_DIRECT_IO`** -- bypasses the kernel page cache for generated textures:
 
-- **Full observability** -- every X-Plane DDS read goes through the FUSE handler, visible to `FuseLoadMonitor`, `SceneTracker`, and `DdsAccessEvent`
+- **Full observability** -- every X-Plane DDS read goes through the FUSE handler, visible to `FuseLoadMonitor` and `SceneTracker`
 - **No stale data** -- page cache cannot serve outdated DDS data after provider changes or cache clears
 - **Reduced kernel memory** -- no page cache duplication of data already in the moka memory cache
 - Real passthrough files use default kernel caching (unchanged)
@@ -271,6 +271,31 @@ so generated textures use normal kernel caching. Consequences:
 - **Reduced observability** -- once the kernel caches a DDS file, repeat reads never reach FUSE. `SceneTracker`, `DdsAccessEvent`, and FUSE-load calibration only see the *cold first read* of each tile; `InferenceAdapter` position inference degrades to "tiles seen once since mount", so steady-state position tracking is effectively **Web API-only** on macOS
 - **Prefetch is unaffected** in practice: the adaptive prefetcher is driven by Web API telemetry, and cold reads (the ones that matter for generation) always reach FUSE
 - Stale-data risk is acceptable: generated DDS content for a given tile/provider is immutable within a run
+### Ranged Reads and Handle Reuse (#233, #234)
+
+A FUSE `read()` is always a *ranged* request. Linux caps every one at
+`max_pages * PAGE_SIZE` -- 1 MiB -- regardless of what the application asked
+for, so one X-Plane whole-file read arrives as many calls: 12-23 for an
+11.17 MB DDS, up to 238 for the largest ortho DSF. Direct I/O does not change
+this; it only stops the kernel answering any of them from cache.
+
+Both read paths are built around that:
+
+- **Passthrough files** seek to the offset and read only the requested window.
+  Reading the whole file to serve one window moved it once per call (#233).
+- **Virtual DDS files** get a handle at `open()`. The first read produces the
+  tile, later reads slice it, and `release()` drops it. Each read used to be a
+  separate executor round trip that cloned the whole tile twice (#234).
+
+`open()` deliberately does **not** produce the tile: generation can take up to
+the configured timeout, and X-Plane may open a file it never reads. Handles pin
+memory, so past `MAX_PINNED_TILE_BYTES` `open()` stops handing out memoising
+handles and reads fall back to resolving per call -- a throughput bound, never a
+correctness one. `open_dds_handles()` and `pinned_tile_bytes()` report the live
+figures.
+
+Because a tile is now produced once per open, `FuseAccessEvent` fires once per
+texture rather than once per ranged read.
 
 ### Synthesized DDS Attributes
 
@@ -439,7 +464,7 @@ xearthlayer/src/
 │   ├── radial.rs           # RadialPrefetcher (recommended)
 │   └── web_api/            # X-Plane Web API telemetry
 ├── config/                 # Configuration system
-├── cache/                  # Two-tier caching
+├── cache/                  # Three-tier caching
 ├── provider/               # Imagery providers
 └── texture/                # DDS encoding
 ```

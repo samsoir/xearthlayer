@@ -140,20 +140,24 @@ pub struct AggregatedState {
     pub chunk_disk_cache_hits: u64,
     /// Chunk disk cache misses.
     pub chunk_disk_cache_misses: u64,
-    /// Active disk writes (chunks only — DDS writes don't emit write events).
+    /// Active disk writes across both tiers: chunk disk cache writes and
+    /// DDS disk cache writes both emit `DiskWriteStarted`/`DiskWriteCompleted`
+    /// and are counted here.
     pub disk_writes_active: u64,
     /// Total bytes written to chunk disk cache.
     pub chunk_disk_bytes_written: u64,
+    /// Total bytes written to DDS disk cache.
+    pub dds_disk_bytes_written: u64,
     /// Total bytes read from chunk disk cache (cache hits).
     pub chunk_disk_bytes_read: u64,
-    /// Total disk write time in microseconds.
-    pub disk_write_time_us: u64,
-    /// Initial disk cache size (scanned on startup, not reset).
+    /// Initial disk cache size (scanned on startup).
     pub initial_disk_cache_bytes: u64,
     /// Total bytes evicted from disk cache by the GC daemon.
     pub disk_bytes_evicted: u64,
     /// Current chunk disk cache size in bytes (absolute value from LRU index).
     pub chunk_disk_cache_size_bytes: u64,
+    /// Current number of entries in the chunk disk cache LRU index.
+    pub chunk_index_entries: u64,
 
     // =========================================================================
     // DDS Disk Cache Metrics
@@ -187,6 +191,11 @@ pub struct AggregatedState {
     pub fuse_memory_cache_misses: u64,
     /// Current memory cache size in bytes.
     pub memory_cache_size_bytes: u64,
+    /// Fire-and-forget memory cache writes currently in flight (the spawn in
+    /// `BuildAndCacheDdsTask` that calls `MemoryCache::put`). Mirrors
+    /// `disk_writes_active` but for the memory-cache tier, which previously had
+    /// no in-flight gauge at all — see issue #209.
+    pub mem_cache_writes_active: u64,
 
     // =========================================================================
     // Job Metrics
@@ -234,11 +243,86 @@ pub struct AggregatedState {
     /// FUSE requests waiting in queue.
     pub fuse_requests_waiting: u64,
 
+    // ---- FUSE read amplification (#233 / #234) ----
+    // `*_read_bytes` is what was handed to the kernel; `*_alloc_bytes` is what
+    // the handler had to obtain to produce it. alloc / read is the amplification:
+    // 1.0 means the handler moved exactly what X-Plane consumed.
+    /// `read()` calls served from a real file on disk.
+    pub fuse_file_reads: u64,
+    /// Bytes returned to the kernel from real files on disk.
+    pub fuse_file_read_bytes: u64,
+    /// Bytes obtained from disk to serve those reads.
+    pub fuse_file_alloc_bytes: u64,
+    /// `read()` calls served from a generated DDS tile.
+    pub fuse_dds_reads: u64,
+    /// Bytes returned to the kernel from generated DDS tiles.
+    pub fuse_dds_read_bytes: u64,
+    /// Bytes of whole tiles materialised to serve those reads.
+    pub fuse_dds_alloc_bytes: u64,
+    /// Virtual DDS files currently open (gauge).
+    pub fuse_handles_open: u64,
+    /// Tile bytes currently pinned by open handles (gauge).
+    pub fuse_handles_pinned_bytes: u64,
+    /// Highest concurrent open handle count seen this session.
+    ///
+    /// The current gauges are sampled whenever a handle opens, produces a tile
+    /// or releases, so a periodic reader almost always catches them just after
+    /// a release and reads near zero. The ceiling is what has to be sized
+    /// against, so it is tracked separately.
+    pub fuse_handles_peak_open: u64,
+    /// Highest pinned byte total seen this session.
+    pub fuse_handles_peak_pinned_bytes: u64,
+    /// Opens refused a memoising handle for want of pinned-tile budget
+    /// (counter, cumulative since process start, #236).
+    ///
+    /// Any non-zero value means `MAX_PINNED_TILE_BYTES` engaged and those
+    /// opens fell back to resolving their tile once per read -- the pre-#234
+    /// cost. Read it alongside `dds_pinned_peak_mb`: a climbing
+    /// `fuse_dds_alloc_mb` with this at zero is a different fault entirely.
+    pub fuse_handle_budget_exhausted: u64,
+
     // =========================================================================
     // Peak Tracking
     // =========================================================================
     /// Peak bytes per second observed.
     pub peak_bytes_per_second: f64,
+
+    // =========================================================================
+    // Prefetch Region State Metrics (#176)
+    // =========================================================================
+    /// Regions with tiles submitted, awaiting confirmation (gauge, from
+    /// `PrefetchRegionState`; externally derived from `GeoIndex`, like the
+    /// disk-cache-size gauges above — assigned wholesale each maintenance
+    /// cycle rather than accumulated from this daemon's event stream).
+    pub prefetch_regions_in_progress: usize,
+    /// Regions confirmed fully cached (gauge).
+    pub prefetch_regions_prefetched: usize,
+    /// Regions with no ortho scenery (gauge).
+    pub prefetch_regions_nocoverage: usize,
+    /// Regions currently deferred for making no progress (gauge, #226).
+    ///
+    /// Distinct from [`Self::prefetch_regions_deferred`], which is a
+    /// cumulative count of how many deferrals have *occurred* since process
+    /// start. This is how many regions are deferred *right now*.
+    pub prefetch_regions_deferred_active: usize,
+    /// Total observed divergences between prefetch state and reality (counter).
+    pub prefetch_state_diverged: u64,
+    /// Total regions demoted in response to divergence (counter).
+    pub prefetch_regions_demoted: u64,
+    /// Total regions deferred for making no progress, cumulative since
+    /// process start (counter). Never windowed — difference successive log
+    /// samples to get a rate.
+    pub prefetch_regions_deferred: u64,
+    /// Total region deferrals cleared by on-demand FUSE generation, cumulative
+    /// since process start (counter, #226). The post-fix analogue of
+    /// `prefetch_regions_demoted`: measures how often the sim outruns the
+    /// deferral ladder rather than how often prefetch's state was simply
+    /// wrong.
+    pub prefetch_deferrals_cleared: u64,
+    /// Total regions promoted via the normal completion path (counter).
+    pub prefetch_promotions_normal: u64,
+    /// Total regions promoted via the rescue path (counter).
+    pub prefetch_promotions_rescue: u64,
 }
 
 impl Default for AggregatedState {
@@ -262,11 +346,12 @@ impl AggregatedState {
             chunk_disk_cache_misses: 0,
             disk_writes_active: 0,
             chunk_disk_bytes_written: 0,
+            dds_disk_bytes_written: 0,
             chunk_disk_bytes_read: 0,
-            disk_write_time_us: 0,
             initial_disk_cache_bytes: 0,
             disk_bytes_evicted: 0,
             chunk_disk_cache_size_bytes: 0,
+            chunk_index_entries: 0,
             dds_disk_cache_hits: 0,
             dds_disk_cache_misses: 0,
             fuse_dds_disk_cache_hits: 0,
@@ -278,6 +363,7 @@ impl AggregatedState {
             fuse_memory_cache_hits: 0,
             fuse_memory_cache_misses: 0,
             memory_cache_size_bytes: 0,
+            mem_cache_writes_active: 0,
             jobs_submitted: 0,
             fuse_jobs_submitted: 0,
             jobs_completed: 0,
@@ -293,56 +379,34 @@ impl AggregatedState {
             fuse_tiles_served: 0,
             fuse_requests_active: 0,
             fuse_requests_waiting: 0,
+            fuse_file_reads: 0,
+            fuse_file_read_bytes: 0,
+            fuse_file_alloc_bytes: 0,
+            fuse_dds_reads: 0,
+            fuse_dds_read_bytes: 0,
+            fuse_dds_alloc_bytes: 0,
+            fuse_handles_open: 0,
+            fuse_handles_pinned_bytes: 0,
+            fuse_handles_peak_open: 0,
+            fuse_handles_peak_pinned_bytes: 0,
+            fuse_handle_budget_exhausted: 0,
             peak_bytes_per_second: 0.0,
+            prefetch_regions_in_progress: 0,
+            prefetch_regions_prefetched: 0,
+            prefetch_regions_nocoverage: 0,
+            prefetch_regions_deferred_active: 0,
+            prefetch_state_diverged: 0,
+            prefetch_regions_demoted: 0,
+            prefetch_regions_deferred: 0,
+            prefetch_deferrals_cleared: 0,
+            prefetch_promotions_normal: 0,
+            prefetch_promotions_rescue: 0,
         }
     }
 
     /// Returns the uptime duration.
     pub fn uptime(&self) -> std::time::Duration {
         self.uptime_start.elapsed()
-    }
-
-    /// Resets all counters to zero.
-    pub fn reset(&mut self) {
-        self.uptime_start = Instant::now();
-        self.downloads_active = 0;
-        self.chunks_downloaded = 0;
-        self.chunks_failed = 0;
-        self.chunks_retried = 0;
-        self.bytes_downloaded = 0;
-        self.download_time_us = 0;
-        self.chunk_disk_cache_hits = 0;
-        self.chunk_disk_cache_misses = 0;
-        self.disk_writes_active = 0;
-        self.chunk_disk_bytes_written = 0;
-        self.chunk_disk_bytes_read = 0;
-        self.disk_write_time_us = 0;
-        self.dds_disk_cache_hits = 0;
-        self.dds_disk_cache_misses = 0;
-        self.fuse_dds_disk_cache_hits = 0;
-        self.fuse_dds_disk_cache_misses = 0;
-        self.dds_disk_bytes_read = 0;
-        self.memory_cache_hits = 0;
-        self.memory_cache_misses = 0;
-        self.fuse_memory_cache_hits = 0;
-        self.fuse_memory_cache_misses = 0;
-        self.memory_cache_size_bytes = 0;
-        self.jobs_submitted = 0;
-        self.fuse_jobs_submitted = 0;
-        self.jobs_completed = 0;
-        self.jobs_failed = 0;
-        self.jobs_timed_out = 0;
-        self.jobs_active = 0;
-        self.jobs_coalesced = 0;
-        self.encodes_active = 0;
-        self.encodes_completed = 0;
-        self.bytes_encoded = 0;
-        self.encode_time_us = 0;
-        self.assembly_time_us = 0;
-        self.fuse_tiles_served = 0;
-        self.fuse_requests_active = 0;
-        self.fuse_requests_waiting = 0;
-        self.peak_bytes_per_second = 0.0;
     }
 }
 
@@ -360,8 +424,6 @@ pub const DEFAULT_HISTORY_CAPACITY: usize = 60;
 pub struct TimeSeriesHistory {
     /// Network throughput samples (bytes/sec).
     pub network_throughput: RingBuffer<f64>,
-    /// Disk throughput samples (bytes/sec).
-    pub disk_throughput: RingBuffer<f64>,
     /// Job completion rate samples (jobs/sec).
     pub job_rate: RingBuffer<f64>,
     /// FUSE request rate samples (requests/sec).
@@ -373,7 +435,6 @@ impl TimeSeriesHistory {
     pub fn new(capacity: usize) -> Self {
         Self {
             network_throughput: RingBuffer::new(capacity),
-            disk_throughput: RingBuffer::new(capacity),
             job_rate: RingBuffer::new(capacity),
             fuse_rate: RingBuffer::new(capacity),
         }
@@ -382,7 +443,6 @@ impl TimeSeriesHistory {
     /// Clears all time series data.
     pub fn clear(&mut self) {
         self.network_throughput.clear();
-        self.disk_throughput.clear();
         self.job_rate.clear();
         self.fuse_rate.clear();
     }
@@ -459,32 +519,16 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregated_state_reset() {
-        let mut state = AggregatedState::default();
-        state.chunks_downloaded = 100;
-        state.bytes_downloaded = 1_000_000;
-        state.jobs_completed = 50;
-
-        state.reset();
-        assert_eq!(state.chunks_downloaded, 0);
-        assert_eq!(state.bytes_downloaded, 0);
-        assert_eq!(state.jobs_completed, 0);
-    }
-
-    #[test]
     fn test_time_series_history() {
         let mut history = TimeSeriesHistory::new(10);
 
         history.network_throughput.push(1000.0);
         history.network_throughput.push(2000.0);
-        history.disk_throughput.push(500.0);
 
         assert_eq!(history.network_throughput.len(), 2);
         assert_eq!(history.network_throughput.last(), Some(2000.0));
-        assert_eq!(history.disk_throughput.len(), 1);
 
         history.clear();
         assert!(history.network_throughput.is_empty());
-        assert!(history.disk_throughput.is_empty());
     }
 }

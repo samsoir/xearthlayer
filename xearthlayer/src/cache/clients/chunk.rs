@@ -9,6 +9,7 @@
 //! Keys follow the format `chunk:{zoom}:{tile_row}:{tile_col}:{chunk_row}:{chunk_col}`.
 //! Example: `chunk:15:12754:5279:8:12`
 
+use bytes::Bytes;
 use std::sync::Arc;
 
 use tracing::warn;
@@ -76,7 +77,7 @@ impl ChunkCacheClient {
         zoom: u8,
         chunk_row: u8,
         chunk_col: u8,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<Bytes> {
         let key = Self::chunk_to_key(tile_row, tile_col, zoom, chunk_row, chunk_col);
         match self.cache.get(&key).await {
             Ok(Some(data)) => {
@@ -122,7 +123,7 @@ impl ChunkCacheClient {
         zoom: u8,
         chunk_row: u8,
         chunk_col: u8,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> Result<(), std::io::Error> {
         let key = Self::chunk_to_key(tile_row, tile_col, zoom, chunk_row, chunk_col);
         self.cache
@@ -199,10 +200,13 @@ mod tests {
 
         let data = vec![1, 2, 3, 4, 5];
 
-        client.set(100, 200, 15, 8, 12, data.clone()).await.unwrap();
+        client
+            .set(100, 200, 15, 8, 12, data.clone().into())
+            .await
+            .unwrap();
 
         let result = client.get(100, 200, 15, 8, 12).await;
-        assert_eq!(result, Some(data));
+        assert_eq!(result, Some(Bytes::from(data)));
 
         service.shutdown().await;
     }
@@ -230,7 +234,7 @@ mod tests {
         assert!(!client.contains(100, 200, 15, 8, 12).await);
 
         client
-            .set(100, 200, 15, 8, 12, vec![1, 2, 3])
+            .set(100, 200, 15, 8, 12, vec![1, 2, 3].into())
             .await
             .unwrap();
 
@@ -247,16 +251,31 @@ mod tests {
         let client = ChunkCacheClient::new(service.cache());
 
         // Same tile, different chunk positions
-        client.set(100, 200, 15, 0, 0, vec![1, 1, 1]).await.unwrap();
-        client.set(100, 200, 15, 0, 1, vec![2, 2, 2]).await.unwrap();
         client
-            .set(100, 200, 15, 15, 15, vec![3, 3, 3])
+            .set(100, 200, 15, 0, 0, vec![1, 1, 1].into())
+            .await
+            .unwrap();
+        client
+            .set(100, 200, 15, 0, 1, vec![2, 2, 2].into())
+            .await
+            .unwrap();
+        client
+            .set(100, 200, 15, 15, 15, vec![3, 3, 3].into())
             .await
             .unwrap();
 
-        assert_eq!(client.get(100, 200, 15, 0, 0).await, Some(vec![1, 1, 1]));
-        assert_eq!(client.get(100, 200, 15, 0, 1).await, Some(vec![2, 2, 2]));
-        assert_eq!(client.get(100, 200, 15, 15, 15).await, Some(vec![3, 3, 3]));
+        assert_eq!(
+            client.get(100, 200, 15, 0, 0).await,
+            Some(Bytes::from(vec![1, 1, 1]))
+        );
+        assert_eq!(
+            client.get(100, 200, 15, 0, 1).await,
+            Some(Bytes::from(vec![2, 2, 2]))
+        );
+        assert_eq!(
+            client.get(100, 200, 15, 15, 15).await,
+            Some(Bytes::from(vec![3, 3, 3]))
+        );
 
         service.shutdown().await;
     }

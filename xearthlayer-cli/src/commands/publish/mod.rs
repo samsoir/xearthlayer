@@ -197,6 +197,7 @@ pub fn run(command: PublishCommands) -> Result<(), CliError> {
             height,
             dark,
             geojson,
+            metadata,
             repo,
         } => CoverageHandler::execute(
             CoverageArgs {
@@ -205,6 +206,7 @@ pub fn run(command: PublishCommands) -> Result<(), CliError> {
                 height,
                 dark,
                 geojson,
+                metadata,
                 repo,
             },
             &ctx,

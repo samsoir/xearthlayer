@@ -85,6 +85,34 @@ stale mountpoint automatically. If you ever need to do it manually:
 umount "/path/to/X-Plane 12/Custom Scenery/zzXEL_ortho"
 ```
 
+### Reading a mount over SSH requires Full Disk Access
+
+macOS applies privacy controls (TCC) per *responsible process*. Over SSH your
+commands are parented to `sshd`, not to Terminal, and `sshd` has no Full Disk
+Access by default. A FUSE mount counts as an external volume, so reads through
+it are denied.
+
+The symptom is misleading: the **mount succeeds**, then reads fail with
+`Operation not permitted` (`EPERM`). That reads like a filesystem bug in
+XEarthLayer rather than a policy decision by the OS, so it is worth checking
+before debugging anything else. XEarthLayer's own read path never returns
+`EPERM`; it maps every internal failure to `EIO` or `ENOENT`, so an `EPERM`
+always comes from above us.
+
+Two ways round it:
+
+- **Run locally.** Sit at the machine, or use Screen Sharing, and run from
+  Terminal there. Nothing else is needed.
+- **Grant `sshd` Full Disk Access.** System Settings → Privacy & Security →
+  Full Disk Access → **+**, then press `Cmd+Shift+G` and enter
+  `/usr/sbin/sshd`, since the file picker hides `/usr/sbin`. On some macOS
+  versions the entry is `/usr/libexec/sshd-keygen-wrapper` instead. Disconnect
+  and reconnect afterwards, because the entitlement is evaluated when the
+  session starts.
+
+This matters for releases: `make verify-macos` runs the live macFUSE smoke
+tests, so it cannot be completed over SSH without the above.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -94,3 +122,4 @@ umount "/path/to/X-Plane 12/Custom Scenery/zzXEL_ortho"
 | No approval option appears (Apple Silicon) | Boot into Recovery and enable Reduced Security with kernel extension management first |
 | "Device not configured (os error 6)" on mount | Stale mount from a previous run — recovered automatically at startup; manual fix: `umount <mountpoint>` |
 | macFUSE stops working after a macOS upgrade | Re-run the macFUSE installer and re-approve the extension |
+| Mount succeeds but reads fail with `Operation not permitted` (`EPERM`) | You are probably over SSH. See [Reading a mount over SSH](#reading-a-mount-over-ssh-requires-full-disk-access) |

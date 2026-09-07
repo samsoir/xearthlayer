@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use crate::config::defaults::{
     DEFAULT_BOX_MAX_SPEED, DEFAULT_BOX_MIN_EXTENT, DEFAULT_BOX_MIN_SPEED,
+    DEFAULT_PREFETCH_STALE_REGION_TIMEOUT,
 };
 use crate::config::PrefetchSettings;
 use crate::service::PrefetchConfig;
@@ -143,7 +144,7 @@ impl Default for AdaptivePrefetchConfig {
             ramp_duration: Duration::from_secs(30),
             ramp_start_fraction: 0.25,
             window_buffer: 1,
-            stale_region_timeout: Duration::from_secs(120),
+            stale_region_timeout: Duration::from_secs(DEFAULT_PREFETCH_STALE_REGION_TIMEOUT),
             box_extent: 7.0,
             box_max_bias: 0.8,
             box_min_extent: DEFAULT_BOX_MIN_EXTENT,

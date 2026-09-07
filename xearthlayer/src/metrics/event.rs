@@ -14,6 +14,8 @@
 //! - Job events: per-job (one per tile request)
 //! - FUSE events: per-request
 
+use crate::cache::DiskTier;
+
 /// Events emitted by pipeline components to the metrics daemon.
 ///
 /// Each event represents an atomic occurrence that updates metrics state.
@@ -76,8 +78,8 @@ pub enum MetricEvent {
     DiskWriteCompleted {
         /// Number of bytes written.
         bytes: u64,
-        /// Time taken in microseconds.
-        duration_us: u64,
+        /// Which cache tier the bytes belong to.
+        tier: DiskTier,
     },
 
     /// Set the initial disk cache size (scanned on startup).
@@ -108,6 +110,16 @@ pub enum MetricEvent {
         bytes: u64,
     },
 
+    /// Update the current chunk LRU index entry count.
+    ///
+    /// Emitted by the chunk `DiskCacheProvider` after writes and evictions.
+    /// The index is a memory consumer in its own right — millions of entries on
+    /// a full cache — so it is tracked alongside the byte totals.
+    ChunkIndexEntriesUpdate {
+        /// Current number of entries in the chunk LRU index.
+        entries: u64,
+    },
+
     // =========================================================================
     // Memory Cache Events (tile-level, tracked in daemon)
     // =========================================================================
@@ -128,6 +140,21 @@ pub enum MetricEvent {
         /// Current size in bytes.
         bytes: u64,
     },
+
+    /// A fire-and-forget memory cache write operation started.
+    ///
+    /// Mirrors `DiskWriteStarted`/`DiskWriteCompleted` but for the memory-cache
+    /// spawn in `BuildAndCacheDdsTask`, which previously emitted no start/complete
+    /// pair at all — only `MemoryCacheSizeUpdate`, a size gauge that only moves
+    /// after `cache.put()` actually completes. A backlog concentrated in that
+    /// spawn (each task pinning its own ~11.2 MB DDS clone) would present as
+    /// rising RSS with both `disk_writes_active` and `chunk_index_entries` flat,
+    /// misreading as allocator retention (candidate 2) instead of the
+    /// fire-and-forget backlog (candidate 1). See issue #209.
+    MemCacheWriteStarted,
+
+    /// A fire-and-forget memory cache write operation completed.
+    MemCacheWriteCompleted,
 
     // =========================================================================
     // Job Lifecycle Events
@@ -187,6 +214,55 @@ pub enum MetricEvent {
     /// Used by the TUI to show actual tile request throughput.
     FuseTileServed,
 
+    /// A FUSE `read()` call was answered.
+    ///
+    /// The kernel caps every FUSE read at `max_pages * PAGE_SIZE` (1 MiB on
+    /// Linux), so a file is never handed to the filesystem in a single call:
+    /// a whole-file `read(2)` of a 32 MiB file arrives as 32 separate calls.
+    /// `returned` is what this call handed back to the kernel; `materialised`
+    /// is how many bytes the handler had to obtain to produce it -- bytes read
+    /// from disk for a real file, or the size of the whole tile for a generated
+    /// DDS, whether or not the tile came from cache.
+    ///
+    /// The two should be equal. Their ratio is the read amplification tracked
+    /// by #233 (real files on disk) and #234 (generated DDS tiles) -- measured
+    /// at 12-23x for an 11.17 MB object before those fixes.
+    FuseRead {
+        /// Bytes returned to the kernel for this call.
+        returned: u64,
+        /// Bytes the handler had to obtain in order to serve this call.
+        materialised: u64,
+        /// `true` for a generated DDS tile, `false` for a real file on disk.
+        virtual_dds: bool,
+    },
+
+    /// Open virtual DDS file handles, and the tile bytes they pin.
+    ///
+    /// A gauge, emitted on open and release. Each open handle holds one whole
+    /// tile so later reads can slice it (#234), so this is the live cost of
+    /// that memoisation -- and the only measurement of how many DDS files
+    /// X-Plane keeps open at once, which is what `MAX_PINNED_TILE_BYTES`
+    /// is guessing at.
+    FuseHandlesUpdate {
+        /// Virtual DDS files currently open.
+        open: u64,
+        /// Tile bytes currently pinned by those handles.
+        pinned_bytes: u64,
+        /// Highest concurrent open count seen this session.
+        peak_open: u64,
+        /// Highest pinned byte total seen this session.
+        peak_pinned_bytes: u64,
+    },
+
+    /// An `open()` was refused a memoising handle because the pinned-tile
+    /// budget was exhausted.
+    ///
+    /// Counter, not a gauge: each occurrence is one open that fell back to
+    /// resolving its tile per read -- the pre-#234 cost. The cap has roughly
+    /// 24x measured headroom, so any non-zero value means a scene reached a
+    /// density nothing has been sized against. See #236.
+    FuseHandleBudgetExhausted,
+
     /// A FUSE request started being handled.
     FuseRequestStarted,
 
@@ -198,6 +274,65 @@ pub enum MetricEvent {
 
     /// A FUSE request was removed from the wait queue.
     FuseRequestDequeued,
+
+    // =========================================================================
+    // Prefetch Region State Events (#176)
+    // =========================================================================
+    /// Current region-state distribution, reported each maintenance cycle.
+    ///
+    /// This is a gauge, not a counter: each event replaces the previous values.
+    PrefetchRegionState {
+        /// Regions with tiles submitted, awaiting confirmation.
+        in_progress: usize,
+        /// Regions confirmed fully cached.
+        prefetched: usize,
+        /// Regions with no ortho scenery.
+        no_coverage: usize,
+        /// Regions currently deferred for making no progress (#226).
+        ///
+        /// Deliberately its own bucket rather than folded into
+        /// `no_coverage`: `regions_nocoverage` non-zero only over water is an
+        /// acceptance criterion, and a deferred land region counted there
+        /// would be exactly the false alarm #226 exists to remove.
+        deferred: usize,
+    },
+
+    /// FUSE generated a tile in a region prefetch claimed was handled.
+    ///
+    /// Counted on every occurrence, including those where the rate limit
+    /// suppressed the demotion — so the metric shows the true divergence
+    /// rate rather than the demotion rate.
+    PrefetchStateDiverged,
+
+    /// A region's state was cleared in response to observed divergence.
+    PrefetchRegionDemoted,
+
+    /// A region was deferred after making no progress since the last evaluation.
+    PrefetchRegionDeferred,
+
+    /// A region's deferral was cleared because X-Plane demanded a tile there.
+    ///
+    /// The post-fix analogue of [`Self::PrefetchRegionDemoted`]: prefetch gave
+    /// up on the region (deferred it), then the sim asked for tiles inside it
+    /// anyway. Counted, not logged above `debug!` — it fires once per
+    /// FUSE-generated tile in the region, which is too frequent for the
+    /// default log level — so this counter is the only default-level signal
+    /// for whether the 20/30/40/60s deferral ladder is well-tuned (#226).
+    PrefetchDeferralCleared,
+
+    /// Regions promoted from `InProgress` to `Prefetched` via the normal
+    /// completion path (all tiles in the region confirmed present).
+    ///
+    /// `count` batches multiple regions promoted in the same maintenance
+    /// cycle into one event, mirroring how the coordinator reports them.
+    PrefetchRegionsPromotedNormal {
+        /// Number of regions promoted in this batch.
+        count: usize,
+    },
+
+    /// A region promoted via the rescue path (recovered from a state that
+    /// would otherwise have left it stuck, e.g. a missed normal promotion).
+    PrefetchRegionPromotedRescue,
 }
 
 impl MetricEvent {
@@ -218,9 +353,12 @@ impl MetricEvent {
             Self::DiskCacheEvicted { .. } => "disk_cache_evicted",
             Self::DiskCacheSizeUpdate { .. } => "disk_cache_size_update",
             Self::DdsDiskCacheSizeUpdate { .. } => "dds_disk_cache_size_update",
+            Self::ChunkIndexEntriesUpdate { .. } => "chunk_index_entries_update",
             Self::MemoryCacheHit { .. } => "memory_cache_hit",
             Self::MemoryCacheMiss { .. } => "memory_cache_miss",
             Self::MemoryCacheSizeUpdate { .. } => "memory_cache_size_update",
+            Self::MemCacheWriteStarted => "mem_cache_write_started",
+            Self::MemCacheWriteCompleted => "mem_cache_write_completed",
             Self::JobSubmitted { .. } => "job_submitted",
             Self::JobStarted => "job_started",
             Self::JobCompleted { .. } => "job_completed",
@@ -230,10 +368,20 @@ impl MetricEvent {
             Self::EncodeCompleted { .. } => "encode_completed",
             Self::AssemblyCompleted { .. } => "assembly_completed",
             Self::FuseTileServed => "fuse_tile_served",
+            Self::FuseRead { .. } => "fuse_read",
+            Self::FuseHandlesUpdate { .. } => "fuse_handles_update",
+            Self::FuseHandleBudgetExhausted => "fuse_handle_budget_exhausted",
             Self::FuseRequestStarted => "fuse_request_started",
             Self::FuseRequestCompleted => "fuse_request_completed",
             Self::FuseRequestQueued => "fuse_request_queued",
             Self::FuseRequestDequeued => "fuse_request_dequeued",
+            Self::PrefetchRegionState { .. } => "prefetch_region_state",
+            Self::PrefetchStateDiverged => "prefetch_state_diverged",
+            Self::PrefetchRegionDemoted => "prefetch_region_demoted",
+            Self::PrefetchRegionDeferred => "prefetch_region_deferred",
+            Self::PrefetchDeferralCleared => "prefetch_deferral_cleared",
+            Self::PrefetchRegionsPromotedNormal { .. } => "prefetch_regions_promoted_normal",
+            Self::PrefetchRegionPromotedRescue => "prefetch_region_promoted_rescue",
         }
     }
 }
@@ -293,6 +441,18 @@ mod tests {
         assert_eq!(
             MetricEvent::DdsDiskCacheMiss { is_fuse: false }.event_type(),
             "dds_disk_cache_miss"
+        );
+    }
+
+    #[test]
+    fn test_mem_cache_write_event_types() {
+        assert_eq!(
+            MetricEvent::MemCacheWriteStarted.event_type(),
+            "mem_cache_write_started"
+        );
+        assert_eq!(
+            MetricEvent::MemCacheWriteCompleted.event_type(),
+            "mem_cache_write_completed"
         );
     }
 

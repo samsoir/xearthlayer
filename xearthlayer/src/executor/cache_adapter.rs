@@ -15,6 +15,7 @@
 use crate::cache::{CacheKey, MemoryCache};
 use crate::coord::TileCoord;
 use crate::dds::DdsFormat;
+use bytes::Bytes;
 use std::sync::Arc;
 
 /// Adapter that bridges `cache::MemoryCache` to the executor's `MemoryCache` trait.
@@ -81,11 +82,11 @@ impl ExecutorCacheAdapter {
     /// Stores a tile in the cache (sync version).
     ///
     /// This is a convenience method for sync contexts.
-    pub fn put_sync(&self, row: u32, col: u32, zoom: u8, data: Vec<u8>) {
+    pub fn put_sync(&self, row: u32, col: u32, zoom: u8, data: Bytes) {
         let key = self.make_key(row, col, zoom);
         // MemoryCache has both async put() and sync put_sync().
         // Use the sync version directly.
-        self.cache.put_sync(key, data);
+        self.cache.put_sync(key, data.to_vec());
     }
 
     /// Checks if a tile is in the cache.
@@ -103,15 +104,15 @@ impl ExecutorCacheAdapter {
 // Implement executor::MemoryCache trait.
 // This also provides DaemonMemoryCache via the blanket impl in daemon.rs.
 impl super::MemoryCache for ExecutorCacheAdapter {
-    async fn get(&self, row: u32, col: u32, zoom: u8) -> Option<Vec<u8>> {
+    async fn get(&self, row: u32, col: u32, zoom: u8) -> Option<Bytes> {
         let key = self.make_key(row, col, zoom);
-        self.cache.get(&key).await
+        self.cache.get(&key).await.map(Bytes::from)
     }
 
-    async fn put(&self, row: u32, col: u32, zoom: u8, data: Vec<u8>) {
+    async fn put(&self, row: u32, col: u32, zoom: u8, data: Bytes) {
         let key = self.make_key(row, col, zoom);
         // Use async put to ensure write completes (put_sync can drop writes!)
-        self.cache.put(key, data).await;
+        self.cache.put(key, data.to_vec()).await;
     }
 
     fn size_bytes(&self) -> usize {
@@ -155,11 +156,11 @@ mod tests {
         let adapter = create_test_adapter();
 
         // Put some data
-        MemoryCache::put(&adapter, 100, 200, 14, vec![1, 2, 3, 4]).await;
+        MemoryCache::put(&adapter, 100, 200, 14, vec![1, 2, 3, 4].into()).await;
 
         // Get it back
         let result = MemoryCache::get(&adapter, 100, 200, 14).await;
-        assert_eq!(result, Some(vec![1, 2, 3, 4]));
+        assert_eq!(result, Some(Bytes::from(vec![1, 2, 3, 4])));
     }
 
     #[test]
@@ -168,7 +169,7 @@ mod tests {
 
         assert!(!adapter.contains(100, 200, 14));
 
-        adapter.put_sync(100, 200, 14, vec![1, 2, 3]);
+        adapter.put_sync(100, 200, 14, vec![1, 2, 3].into());
 
         assert!(adapter.contains(100, 200, 14));
     }
@@ -177,8 +178,8 @@ mod tests {
     fn test_different_coords_different_keys() {
         let adapter = create_test_adapter();
 
-        adapter.put_sync(100, 200, 14, vec![1, 2, 3]);
-        adapter.put_sync(101, 200, 14, vec![4, 5, 6]);
+        adapter.put_sync(100, 200, 14, vec![1, 2, 3].into());
+        adapter.put_sync(101, 200, 14, vec![4, 5, 6].into());
 
         assert!(adapter.contains(100, 200, 14));
         assert!(adapter.contains(101, 200, 14));
@@ -193,7 +194,7 @@ mod tests {
         let initial_size = adapter.size_bytes();
 
         // Add some data
-        adapter.put_sync(100, 200, 14, vec![0; 1000]);
+        adapter.put_sync(100, 200, 14, vec![0; 1000].into());
 
         // Size should increase
         assert!(adapter.size_bytes() > initial_size);

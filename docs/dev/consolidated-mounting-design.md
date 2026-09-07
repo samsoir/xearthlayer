@@ -513,7 +513,7 @@ pub struct Fuse3OrthoUnionFS {
     /// DDS handler for on-demand texture generation
     dds_handler: Arc<DdsHandler>,
 
-    /// Inode management (similar to existing Fuse3PassthroughFS)
+    /// Inode management
     inodes: InodeManager,
 }
 ```
@@ -695,7 +695,7 @@ impl RadialPrefetcher {
 | Component | Status |
 |-----------|--------|
 | `patches/` module | Integrate into `ortho_union/` |
-| `Fuse3UnionFS` | Superseded by `Fuse3OrthoUnionFS` |
+| `Fuse3UnionFS` | Superseded by `Fuse3OrthoUnionFS`; deleted in #233 |
 | Per-package mounting in `MountManager` | Keep as fallback |
 | `mount_packages()` method | Keep for `consolidated = false` |
 

@@ -33,5 +33,6 @@ impl CliRunner {
     pub fn log_startup(&self, command: &str) {
         info!("XEarthLayer v{}", xearthlayer::VERSION);
         info!("XEarthLayer CLI: {} command", command);
+        xearthlayer::metrics::log_allocator_environment();
     }
 }

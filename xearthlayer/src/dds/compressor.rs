@@ -15,7 +15,60 @@
 
 use super::types::{DdsError, DdsFormat};
 use image::RgbaImage;
+use std::borrow::Cow;
 use std::sync::Arc;
+
+/// Edge length of a BCn compression block, in pixels.
+pub(crate) const BLOCK_DIM: u32 = 4;
+
+/// Pad an image up to a whole number of 4×4 compression blocks.
+///
+/// The tail of a mipmap chain reaches 2×2 and 1×1, which are smaller than a
+/// single BCn block. Two backends mishandle that:
+///
+/// - The GPU kernel asserts both dimensions are multiples of 4 and panics
+///   otherwise, taking the whole encoder worker down with it.
+/// - The ISPC kernel reads a full 4×4 footprint at `stride = width * 4`, so on
+///   a tightly packed 2×2 (16-byte) or 1×1 (4-byte) surface it reads out of
+///   bounds. It also sizes its output from the pixel area (`ceil(w*h/16)`)
+///   rather than `blocks_wide * blocks_high`; for the square power-of-two
+///   levels of a production tile the two agree, but a non-square level such as
+///   8×2 gets one block allocated where the header expects two.
+///
+/// `SoftwareCompressor` already handles sub-block levels correctly — padding
+/// only changes its pad-region pixels from black to edge-replicated.
+///
+/// Padding once, here, gives every backend a surface it can handle and makes
+/// the emitted byte count match the DDS header's `blocks_wide * blocks_high`
+/// on every path.
+///
+/// Padding replicates the edge pixels rather than filling with black, so the
+/// compressed block keeps the level's actual color.
+///
+/// Returns [`Cow::Borrowed`] when the image is already block-aligned, which is
+/// every level down to 4×4 — the hot path allocates nothing.
+pub(crate) fn pad_to_block_multiple(image: &RgbaImage) -> Cow<'_, RgbaImage> {
+    let width = image.width();
+    let height = image.height();
+    let padded_width = width.next_multiple_of(BLOCK_DIM);
+    let padded_height = height.next_multiple_of(BLOCK_DIM);
+
+    if padded_width == width && padded_height == height {
+        return Cow::Borrowed(image);
+    }
+
+    let mut padded = RgbaImage::new(padded_width, padded_height);
+    for y in 0..padded_height {
+        // Clamp to the source extent so the padding replicates the edge.
+        let src_y = y.min(height - 1);
+        for x in 0..padded_width {
+            let src_x = x.min(width - 1);
+            padded.put_pixel(x, y, *image.get_pixel(src_x, src_y));
+        }
+    }
+
+    Cow::Owned(padded)
+}
 
 // =============================================================================
 // Trait

@@ -17,8 +17,8 @@ use xearthlayer::publisher::dedupe::{
 };
 use xearthlayer::publisher::{
     coverage::{CoverageConfig, CoverageMapGenerator},
-    BuildResult, ProcessSummary, RegionSuggestion, ReleaseResult, ReleaseStatus, RepoConfig,
-    SceneryScanResult, UrlConfigResult, VersionBump,
+    BuildResult, ProcessSummary, RegionMetadata, RegionSuggestion, ReleaseResult, ReleaseStatus,
+    RepoConfig, SceneryScanResult, UrlConfigResult, VersionBump,
 };
 
 // ============================================================================
@@ -292,15 +292,22 @@ impl PublisherService for DefaultPublisherService {
         &self,
         packages_dir: &Path,
         output_path: &Path,
+        metadata_path: &Path,
         width: u32,
         height: u32,
         dark: bool,
     ) -> Result<CoverageResult, CliError> {
-        let mut config = if dark {
+        let metadata =
+            RegionMetadata::load(metadata_path).map_err(|e| CliError::Publish(format!("{}", e)))?;
+
+        let base = if dark {
             CoverageConfig::dark()
         } else {
             CoverageConfig::default()
         };
+        let mut config = base
+            .with_regions(&metadata)
+            .map_err(|e| CliError::Publish(format!("{}", e)))?;
         config.width = width;
         config.height = height;
 
@@ -330,8 +337,13 @@ impl PublisherService for DefaultPublisherService {
         &self,
         packages_dir: &Path,
         output_path: &Path,
+        metadata_path: &Path,
     ) -> Result<CoverageResult, CliError> {
-        let config = CoverageConfig::default();
+        let metadata =
+            RegionMetadata::load(metadata_path).map_err(|e| CliError::Publish(format!("{}", e)))?;
+        let config = CoverageConfig::default()
+            .with_regions(&metadata)
+            .map_err(|e| CliError::Publish(format!("{}", e)))?;
         let generator = CoverageMapGenerator::new(config);
 
         // Scan packages

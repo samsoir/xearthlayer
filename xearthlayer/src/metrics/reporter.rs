@@ -180,6 +180,7 @@ impl MetricsReporter for TuiReporter {
             chunk_disk_cache_hit_rate: chunk_disk_hit_rate,
             chunk_disk_cache_size_bytes: state.chunk_disk_cache_size_bytes,
             chunk_disk_bytes_written: state.chunk_disk_bytes_written,
+            dds_disk_bytes_written: state.dds_disk_bytes_written,
             chunk_disk_bytes_read: state.chunk_disk_bytes_read,
 
             // Encode metrics
@@ -426,5 +427,21 @@ mod tests {
             snapshot.chunk_disk_cache_size_bytes, 5_000_000_000,
             "Reporter should use chunk_disk_cache_size_bytes directly, not initial+written-evicted"
         );
+    }
+
+    #[test]
+    fn reporter_carries_dds_disk_bytes_written() {
+        let mut state = AggregatedState::new();
+        let history = TimeSeriesHistory::default();
+        let reporter = TuiReporter::new();
+
+        // Distinct values so a swapped mapping cannot pass.
+        state.chunk_disk_bytes_written = 111;
+        state.dds_disk_bytes_written = 222;
+
+        let snapshot = reporter.report(&state, &history);
+
+        assert_eq!(snapshot.chunk_disk_bytes_written, 111);
+        assert_eq!(snapshot.dds_disk_bytes_written, 222);
     }
 }

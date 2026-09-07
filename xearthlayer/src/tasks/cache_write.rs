@@ -10,11 +10,13 @@
 //!
 //! # Input
 //!
-//! Reads `TaskOutput` key "dds_data" containing `Vec<u8>` from previous task.
+//! Reads `TaskOutput` key "dds_data" containing `Bytes` from previous task.
 //!
 //! # Output
 //!
 //! No output - cache writes are fire-and-forget.
+
+use bytes::Bytes;
 
 use crate::coord::TileCoord;
 use crate::executor::{MemoryCache, ResourceType, Task, TaskContext, TaskError, TaskResult};
@@ -90,7 +92,7 @@ where
                 let job_id = ctx.job_id();
 
                 // Get DDS data from previous task
-                let dds_data: Option<&Vec<u8>> = ctx.get_output("EncodeDds", "dds_data");
+                let dds_data: Option<&Bytes> = ctx.get_output("EncodeDds", "dds_data");
                 let dds_data = match dds_data {
                     Some(data) => data.clone(),
                     None => {

@@ -44,6 +44,7 @@ mod prewarm;
 pub mod scenery_cache;
 mod scenery_index;
 mod state;
+mod state_observer;
 mod strategy;
 pub mod tile_based;
 pub mod types;
@@ -67,7 +68,8 @@ pub use types::{InputMode, PrefetchTile, PrefetchZone, TurnDirection, TurnState}
 
 // Scenery-aware prefetch
 pub use scenery_index::{
-    IndexingProgress, SceneryIndex, SceneryIndexConfig, SceneryIndexError, SceneryTile,
+    IndexingProgress, PackageIndexStats, SceneryIndex, SceneryIndexConfig, SceneryIndexError,
+    SceneryTile,
 };
 
 // Cold-start prewarm
@@ -83,7 +85,10 @@ pub use scenery_cache::{
 };
 
 // DSF tile types (used by FUSE layer and adaptive prefetch)
-pub use tile_based::{DdsAccessEvent, DsfTileCoord};
+pub use tile_based::DsfTileCoord;
 
 // Adaptive prefetch (self-calibrating DSF-aligned)
 pub use adaptive::{AdaptivePrefetchConfig, AdaptivePrefetchCoordinator};
+
+// Prefetch state divergence detection (FUSE-side, #176)
+pub use state_observer::PrefetchStateObserver;

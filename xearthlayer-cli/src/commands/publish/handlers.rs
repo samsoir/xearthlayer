@@ -730,6 +730,10 @@ impl CommandHandler for CoverageHandler {
     fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
         let repo = ctx.publisher.open_repository(&args.repo)?;
         let packages_dir = repo.root().join("packages");
+        let metadata_path = args
+            .metadata
+            .clone()
+            .unwrap_or_else(|| repo.root().join("region_metadata.json"));
 
         let format_type = if args.geojson { "GeoJSON" } else { "PNG" };
         ctx.output
@@ -738,11 +742,12 @@ impl CommandHandler for CoverageHandler {
 
         let result = if args.geojson {
             ctx.publisher
-                .generate_coverage_geojson(&packages_dir, &args.output)?
+                .generate_coverage_geojson(&packages_dir, &args.output, &metadata_path)?
         } else {
             ctx.publisher.generate_coverage_map(
                 &packages_dir,
                 &args.output,
+                &metadata_path,
                 args.width,
                 args.height,
                 args.dark,

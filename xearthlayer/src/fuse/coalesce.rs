@@ -25,9 +25,9 @@
 //! registration without lock contention. Statistics use atomic counters.
 
 use crate::coord::TileCoord;
+use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, info};
@@ -78,7 +78,10 @@ impl CoalescerStats {
 #[derive(Clone, Debug)]
 pub struct CoalescedResult {
     /// The DDS data, wrapped in Arc for cheap cloning.
-    pub data: Arc<Vec<u8>>,
+    /// `Bytes`, which is already refcounted -- the previous `Arc<Vec<u8>>`
+    /// was undone immediately by `into_data()`, which cloned the whole 10.66
+    /// MiB tile back out under a comment claiming cheap cloning (#237).
+    pub data: Bytes,
     /// Whether this was a cache hit.
     pub cache_hit: bool,
     /// How long the request took.
@@ -87,18 +90,17 @@ pub struct CoalescedResult {
 
 impl CoalescedResult {
     /// Creates a new coalesced result.
-    pub fn new(data: Vec<u8>, cache_hit: bool, duration: Duration) -> Self {
+    pub fn new(data: Bytes, cache_hit: bool, duration: Duration) -> Self {
         Self {
-            data: Arc::new(data),
+            data,
             cache_hit,
             duration,
         }
     }
 
-    /// Returns the data as a cloned Vec.
-    pub fn into_data(self) -> Vec<u8> {
-        // Clone the data out of the Arc
-        (*self.data).clone()
+    /// Returns the data. Refcount only -- no copy.
+    pub fn into_data(self) -> Bytes {
+        self.data
     }
 }
 
@@ -273,6 +275,7 @@ impl CoalesceResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tokio::time::sleep;
 
     fn test_tile(row: u32, col: u32) -> TileCoord {
@@ -280,7 +283,11 @@ mod tests {
     }
 
     fn test_result() -> CoalescedResult {
-        CoalescedResult::new(vec![0xDD, 0x53, 0x20], false, Duration::from_millis(100))
+        CoalescedResult::new(
+            vec![0xDD, 0x53, 0x20].into(),
+            false,
+            Duration::from_millis(100),
+        )
     }
 
     #[tokio::test]
@@ -526,7 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_coalesced_result_into_data() {
-        let result = CoalescedResult::new(vec![1, 2, 3], true, Duration::from_secs(1));
+        let result = CoalescedResult::new(vec![1, 2, 3].into(), true, Duration::from_secs(1));
         let data = result.into_data();
         assert_eq!(data, vec![1, 2, 3]);
     }
