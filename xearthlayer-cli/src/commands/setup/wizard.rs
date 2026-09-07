@@ -21,7 +21,6 @@ use console::style;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use xearthlayer::config::DiskIoProfile;
 use xearthlayer::config::{
     config_file_path, detect_scenery_dir, format_size, ConfigFile, SceneryDetectionResult, GB, MB,
 };
@@ -40,8 +39,6 @@ pub struct SetupConfig {
     pub package_dir: PathBuf,
     /// Cache directory
     pub cache_dir: PathBuf,
-    /// Detected/selected storage profile
-    pub disk_io_profile: DiskIoProfile,
     /// Memory cache size in bytes
     pub memory_cache_size: usize,
     /// Disk cache size in bytes
@@ -92,7 +89,7 @@ pub fn run_wizard() -> Result<(), CliError> {
     print_step_header("Step 2: Package Location");
     let package_dir = step_package_location(&theme)?;
 
-    // Step 3: Cache Configuration (directory + budgets + I/O profile)
+    // Step 3: Cache Configuration (directory + budgets)
     print_step_header("Step 3: Cache Configuration");
     let cache_settings = step_cache(&theme)?;
 
@@ -105,7 +102,6 @@ pub fn run_wizard() -> Result<(), CliError> {
         xplane_scenery_dir,
         package_dir,
         cache_dir: cache_settings.cache_dir,
-        disk_io_profile: cache_settings.disk_io_profile,
         memory_cache_size: cache_settings.memory_cache_size,
         disk_cache_size: cache_settings.disk_cache_size,
         dds_disk_ratio: cache_settings.dds_disk_ratio,
@@ -327,13 +323,12 @@ fn step_package_location(theme: &ColorfulTheme) -> Result<PathBuf, CliError> {
 /// Output of Step 3, the consolidated cache configuration.
 struct CacheSettings {
     cache_dir: PathBuf,
-    disk_io_profile: DiskIoProfile,
     memory_cache_size: usize,
     disk_cache_size: usize,
     dds_disk_ratio: f64,
 }
 
-/// Step 3: Cache directory + disk budget + memory budget + I/O profile.
+/// Step 3: Cache directory + disk budget + memory budget.
 ///
 /// This step absorbs what used to be split between "cache location" and
 /// "system configuration" — the budgets are derived from system info, so
@@ -377,12 +372,8 @@ fn step_cache(theme: &ColorfulTheme) -> Result<CacheSettings, CliError> {
     // 3e. Memory cache size
     let memory_cache_size = prompt_memory_cache_size(theme, &system_info)?;
 
-    // 3f. I/O profile (default to detected)
-    let disk_io_profile = prompt_disk_io_profile(theme, system_info.disk_io_profile)?;
-
     Ok(CacheSettings {
         cache_dir,
-        disk_io_profile,
         memory_cache_size,
         disk_cache_size,
         dds_disk_ratio,
@@ -493,7 +484,7 @@ fn prompt_memory_cache_size(
     println!();
     println!("{}", style("Memory cache size:").bold());
     println!(
-        "  ℹ  System RAM: {} MB — default is RAM ÷ 12 ({} MB)",
+        "  ℹ  System RAM: {} MB — default is RAM ÷ 12, rounded to the nearest GB ({} MB)",
         total_mb, recommended_mb
     );
     println!(
@@ -518,51 +509,6 @@ fn prompt_memory_cache_size(
     }
     println!("  {} {} MB", style("✓").green(), clamped_mb);
     Ok(clamped_mb * MB)
-}
-
-fn prompt_disk_io_profile(
-    theme: &ColorfulTheme,
-    detected: DiskIoProfile,
-) -> Result<DiskIoProfile, CliError> {
-    println!();
-    println!("{}", style("Disk I/O profile:").bold());
-    println!(
-        "  ℹ  Detected: {} (default). Override only if you have a specific reason.",
-        style(profile_label(detected)).cyan()
-    );
-
-    let profiles = ["auto", "nvme", "ssd", "hdd"];
-    let default_idx = match detected {
-        DiskIoProfile::Nvme => 1,
-        DiskIoProfile::Ssd => 2,
-        DiskIoProfile::Hdd => 3,
-        DiskIoProfile::Auto => 0,
-    };
-
-    let idx = Select::with_theme(theme)
-        .with_prompt("I/O profile")
-        .items(&profiles)
-        .default(default_idx)
-        .interact()
-        .map_err(|e| CliError::Config(format!("Selection error: {}", e)))?;
-
-    let profile = match idx {
-        1 => DiskIoProfile::Nvme,
-        2 => DiskIoProfile::Ssd,
-        3 => DiskIoProfile::Hdd,
-        _ => DiskIoProfile::Auto,
-    };
-    println!("  {} {}", style("✓").green(), profile_label(profile));
-    Ok(profile)
-}
-
-fn profile_label(profile: DiskIoProfile) -> &'static str {
-    match profile {
-        DiskIoProfile::Nvme => "NVMe",
-        DiskIoProfile::Ssd => "SSD",
-        DiskIoProfile::Hdd => "HDD",
-        DiskIoProfile::Auto => "Auto",
-    }
 }
 
 /// Step 4: DDS encoding backend (and GPU device selection if applicable).
@@ -670,7 +616,6 @@ fn write_config(setup: &SetupConfig) -> Result<(), CliError> {
     config.cache.memory_size = setup.memory_cache_size;
     config.cache.disk_size = setup.disk_cache_size;
     config.cache.dds_disk_ratio = setup.dds_disk_ratio;
-    config.cache.disk_io_profile = setup.disk_io_profile;
 
     config.texture.compressor = setup.texture_compressor.clone();
     config.texture.gpu_device = setup.texture_gpu_device.clone();

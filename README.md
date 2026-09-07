@@ -58,17 +58,41 @@ See [How It Works](docs/how-it-works.md) for detailed architecture.
 
 ## Quick Start
 
+### Install a prebuilt package (recommended)
+
+Download the package for your distribution from the
+[latest release](https://github.com/samsoir/xearthlayer/releases/latest):
+a `.deb` for Debian and Ubuntu, an `.rpm` for Fedora and RHEL, or the
+`x86_64-linux.tar.gz` tarball for everything else. Arch users can build from
+the AUR.
+
+Prebuilt binaries require **glibc 2.34 or newer**, which covers Ubuntu 22.04
+LTS, Debian 12 and RHEL 9 onwards. On an older distribution, build from source.
+
+### Or build from source
+
+Building needs **Rust 1.97.1 or newer** and the FUSE 3 development headers.
+Install Rust through [rustup](https://rustup.rs), not your distribution's
+package manager: several dependencies require a recent compiler, and most
+distributions ship one that is too old. rustup also reads this repository's
+`rust-toolchain.toml` and selects the correct version automatically.
+
 ```bash
-# Build and install
+# Rust toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# FUSE 3 headers (Debian/Ubuntu; use fuse3-devel on Fedora)
+sudo apt install libfuse3-dev
+
+# Build and install to ~/.local/bin (no sudo required)
 git clone https://github.com/samsoir/xearthlayer.git
 cd xearthlayer
-make release       # Standard build (ISPC compression)
-make install       # Installs to ~/.local/bin (no sudo required)
+make install
+```
 
-# Or build with GPU-accelerated encoding (optional)
-# make release-gpu
-# make install-gpu
+### Then
 
+```bash
 # Run the setup wizard (first-time configuration)
 xearthlayer setup
 

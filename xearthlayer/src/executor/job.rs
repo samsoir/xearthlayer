@@ -25,6 +25,7 @@
 use super::handle::JobStatus;
 use super::policy::{ErrorPolicy, Priority};
 use super::task::Task;
+use bytes::Bytes;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -236,7 +237,7 @@ pub struct JobResult {
     /// This allows jobs to return data directly to the caller without
     /// relying on cache reads, avoiding race conditions with eventual
     /// consistency caches like moka.
-    pub output_data: Option<Vec<u8>>,
+    pub output_data: Option<Bytes>,
 }
 
 impl JobResult {

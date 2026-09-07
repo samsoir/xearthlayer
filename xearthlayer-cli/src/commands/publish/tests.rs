@@ -208,6 +208,7 @@ impl MockPublisherServiceBuilder {
             release_status: self.release_status.unwrap_or(ReleaseStatus::NotBuilt),
             url_config_result: self.url_config_result,
             release_result: self.release_result,
+            captured_coverage_metadata_path: RwLock::new(None),
         }
     }
 }
@@ -225,6 +226,15 @@ pub struct MockPublisherService {
     release_status: ReleaseStatus,
     url_config_result: Option<Result<UrlConfigResult, String>>,
     release_result: Option<Result<ReleaseResult, String>>,
+    captured_coverage_metadata_path: RwLock<Option<PathBuf>>,
+}
+
+impl MockPublisherService {
+    /// Returns the `metadata_path` most recently passed to
+    /// `generate_coverage_map` or `generate_coverage_geojson`, if any.
+    pub fn captured_coverage_metadata_path(&self) -> Option<PathBuf> {
+        self.captured_coverage_metadata_path.read().unwrap().clone()
+    }
 }
 
 impl PublisherService for MockPublisherService {
@@ -420,10 +430,12 @@ impl PublisherService for MockPublisherService {
         &self,
         _packages_dir: &Path,
         _output_path: &Path,
+        metadata_path: &Path,
         _width: u32,
         _height: u32,
         _dark: bool,
     ) -> Result<CoverageResult, CliError> {
+        *self.captured_coverage_metadata_path.write().unwrap() = Some(metadata_path.to_path_buf());
         Ok(CoverageResult {
             total_tiles: 100,
             tiles_by_region: [("na".to_string(), 100)].into_iter().collect(),
@@ -434,7 +446,9 @@ impl PublisherService for MockPublisherService {
         &self,
         _packages_dir: &Path,
         _output_path: &Path,
+        metadata_path: &Path,
     ) -> Result<CoverageResult, CliError> {
+        *self.captured_coverage_metadata_path.write().unwrap() = Some(metadata_path.to_path_buf());
         Ok(CoverageResult {
             total_tiles: 100,
             tiles_by_region: [("na".to_string(), 100)].into_iter().collect(),
@@ -1237,5 +1251,104 @@ mod validate_tests {
         assert!(result.is_ok());
         assert!(output.contains("Validating repository"));
         assert!(output.contains("Repository is valid"));
+    }
+}
+
+// ============================================================================
+// Coverage Handler Tests
+// ============================================================================
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    fn base_coverage_args(metadata: Option<PathBuf>, geojson: bool) -> CoverageArgs {
+        CoverageArgs {
+            output: PathBuf::from("coverage.png"),
+            width: 1200,
+            height: 600,
+            dark: false,
+            geojson,
+            metadata,
+            repo: PathBuf::from("/test/repo"),
+        }
+    }
+
+    #[test]
+    fn test_coverage_png_uses_default_metadata_path_when_not_specified() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .build();
+        let ctx = CommandContext::new(&output, &publisher);
+
+        let args = base_coverage_args(None, false);
+
+        let result = CoverageHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            publisher.captured_coverage_metadata_path(),
+            Some(PathBuf::from("/test/repo/region_metadata.json"))
+        );
+    }
+
+    #[test]
+    fn test_coverage_png_passes_through_explicit_metadata_path() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .build();
+        let ctx = CommandContext::new(&output, &publisher);
+
+        let custom_path = PathBuf::from("/custom/location/region_metadata.json");
+        let args = base_coverage_args(Some(custom_path.clone()), false);
+
+        let result = CoverageHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            publisher.captured_coverage_metadata_path(),
+            Some(custom_path)
+        );
+    }
+
+    #[test]
+    fn test_coverage_geojson_uses_default_metadata_path_when_not_specified() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .build();
+        let ctx = CommandContext::new(&output, &publisher);
+
+        let args = base_coverage_args(None, true);
+
+        let result = CoverageHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            publisher.captured_coverage_metadata_path(),
+            Some(PathBuf::from("/test/repo/region_metadata.json"))
+        );
+    }
+
+    #[test]
+    fn test_coverage_geojson_passes_through_explicit_metadata_path() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .build();
+        let ctx = CommandContext::new(&output, &publisher);
+
+        let custom_path = PathBuf::from("/custom/location/region_metadata.json");
+        let args = base_coverage_args(Some(custom_path.clone()), true);
+
+        let result = CoverageHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            publisher.captured_coverage_metadata_path(),
+            Some(custom_path)
+        );
     }
 }

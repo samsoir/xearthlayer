@@ -44,7 +44,7 @@ mod tests {
 
     #[test]
     fn test_dds_response_creation() {
-        let response = DdsResponse::new(vec![1, 2, 3], true, Duration::from_secs(1), true);
+        let response = DdsResponse::new(vec![1, 2, 3].into(), true, Duration::from_secs(1), true);
 
         assert_eq!(response.data, vec![1, 2, 3]);
         assert!(response.cache_hit);
@@ -54,7 +54,12 @@ mod tests {
 
     #[test]
     fn test_dds_response_cache_miss() {
-        let response = DdsResponse::new(vec![0xDD, 0x53], false, Duration::from_millis(500), true);
+        let response = DdsResponse::new(
+            vec![0xDD, 0x53].into(),
+            false,
+            Duration::from_millis(500),
+            true,
+        );
 
         assert_eq!(response.data, vec![0xDD, 0x53]);
         assert!(!response.cache_hit);

@@ -22,6 +22,7 @@
 //! ```
 
 use super::event::MetricEvent;
+use crate::cache::DiskTier;
 use tokio::sync::mpsc;
 
 /// Client for emitting metric events to the metrics daemon.
@@ -105,6 +106,43 @@ impl MetricsClient {
         self.send(MetricEvent::ChunkDiskCacheHit { bytes });
     }
 
+    /// Records one FUSE `read()` call.
+    ///
+    /// `returned` is the number of bytes handed back to the kernel;
+    /// `materialised` is the number the handler had to obtain to produce
+    /// them. See [`MetricEvent::FuseRead`].
+    #[inline]
+    pub fn fuse_read(&self, returned: u64, materialised: u64, virtual_dds: bool) {
+        self.send(MetricEvent::FuseRead {
+            returned,
+            materialised,
+            virtual_dds,
+        });
+    }
+
+    /// Records an `open()` refused a memoising handle for want of budget.
+    #[inline]
+    pub fn fuse_handle_budget_exhausted(&self) {
+        self.send(MetricEvent::FuseHandleBudgetExhausted);
+    }
+
+    /// Reports the current virtual DDS handle gauge.
+    #[inline]
+    pub fn fuse_handles(
+        &self,
+        open: u64,
+        pinned_bytes: u64,
+        peak_open: u64,
+        peak_pinned_bytes: u64,
+    ) {
+        self.send(MetricEvent::FuseHandlesUpdate {
+            open,
+            pinned_bytes,
+            peak_open,
+            peak_pinned_bytes,
+        });
+    }
+
     /// Records a chunk disk cache miss.
     #[inline]
     pub fn chunk_disk_cache_miss(&self) {
@@ -150,10 +188,10 @@ impl MetricsClient {
     /// # Arguments
     ///
     /// * `bytes` - Number of bytes written
-    /// * `duration_us` - Time taken in microseconds
+    /// * `tier` - Which cache tier the bytes belong to
     #[inline]
-    pub fn disk_write_completed(&self, bytes: u64, duration_us: u64) {
-        self.send(MetricEvent::DiskWriteCompleted { bytes, duration_us });
+    pub fn disk_write_completed(&self, bytes: u64, tier: DiskTier) {
+        self.send(MetricEvent::DiskWriteCompleted { bytes, tier });
     }
 
     /// Sets the initial disk cache size (scanned on startup).
@@ -197,6 +235,12 @@ impl MetricsClient {
         self.send(MetricEvent::DdsDiskCacheSizeUpdate { bytes });
     }
 
+    /// Reports the current chunk LRU index entry count.
+    #[inline]
+    pub fn chunk_index_entries(&self, entries: u64) {
+        self.send(MetricEvent::ChunkIndexEntriesUpdate { entries });
+    }
+
     // =========================================================================
     // Memory Cache Events
     // =========================================================================
@@ -225,6 +269,21 @@ impl MetricsClient {
     #[inline]
     pub fn memory_cache_size(&self, bytes: u64) {
         self.send(MetricEvent::MemoryCacheSizeUpdate { bytes });
+    }
+
+    /// Records a fire-and-forget memory cache write starting.
+    ///
+    /// Mirrors `disk_write_started` for the memory-cache spawn in
+    /// `BuildAndCacheDdsTask`; see `MetricEvent::MemCacheWriteStarted`.
+    #[inline]
+    pub fn mem_cache_write_started(&self) {
+        self.send(MetricEvent::MemCacheWriteStarted);
+    }
+
+    /// Records a fire-and-forget memory cache write completing.
+    #[inline]
+    pub fn mem_cache_write_completed(&self) {
+        self.send(MetricEvent::MemCacheWriteCompleted);
     }
 
     // =========================================================================
@@ -341,6 +400,63 @@ impl MetricsClient {
     pub fn fuse_request_dequeued(&self) {
         self.send(MetricEvent::FuseRequestDequeued);
     }
+
+    // =========================================================================
+    // Prefetch Region State Events
+    // =========================================================================
+
+    /// Reports the current region-state distribution (gauge).
+    #[inline]
+    pub fn prefetch_region_state(
+        &self,
+        in_progress: usize,
+        prefetched: usize,
+        no_coverage: usize,
+        deferred: usize,
+    ) {
+        self.send(MetricEvent::PrefetchRegionState {
+            in_progress,
+            prefetched,
+            no_coverage,
+            deferred,
+        });
+    }
+
+    /// Records an observed divergence between prefetch state and reality.
+    #[inline]
+    pub fn prefetch_state_diverged(&self) {
+        self.send(MetricEvent::PrefetchStateDiverged);
+    }
+
+    /// Records a region demoted in response to divergence.
+    #[inline]
+    pub fn prefetch_region_demoted(&self) {
+        self.send(MetricEvent::PrefetchRegionDemoted);
+    }
+
+    /// Records regions promoted via the normal completion path.
+    #[inline]
+    pub fn prefetch_regions_promoted_normal(&self, count: usize) {
+        self.send(MetricEvent::PrefetchRegionsPromotedNormal { count });
+    }
+
+    /// Records a region promoted via the rescue path.
+    #[inline]
+    pub fn prefetch_region_promoted_rescue(&self) {
+        self.send(MetricEvent::PrefetchRegionPromotedRescue);
+    }
+
+    /// Record that a region was deferred for making no progress.
+    #[inline]
+    pub fn prefetch_region_deferred(&self) {
+        self.send(MetricEvent::PrefetchRegionDeferred);
+    }
+
+    /// Record that a region's deferral was cleared by on-demand generation.
+    #[inline]
+    pub fn prefetch_deferral_cleared(&self) {
+        self.send(MetricEvent::PrefetchDeferralCleared);
+    }
 }
 
 impl std::fmt::Debug for MetricsClient {
@@ -397,7 +513,7 @@ mod tests {
 
         client.chunk_disk_cache_hit(2048);
         client.chunk_disk_cache_miss();
-        client.disk_write_completed(2048, 1000);
+        client.disk_write_completed(2048, DiskTier::Chunk);
         client.disk_cache_size(9_000_000_000);
         client.memory_cache_hit(true);
         client.memory_cache_miss(false);
@@ -415,7 +531,7 @@ mod tests {
             rx.recv().await,
             Some(MetricEvent::DiskWriteCompleted {
                 bytes: 2048,
-                duration_us: 1000
+                tier: DiskTier::Chunk
             })
         ));
         assert!(matches!(
@@ -435,6 +551,23 @@ mod tests {
         assert!(matches!(
             rx.recv().await,
             Some(MetricEvent::MemoryCacheSizeUpdate { bytes: 1_000_000 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_client_mem_cache_write_events() {
+        let (client, mut rx) = create_client();
+
+        client.mem_cache_write_started();
+        client.mem_cache_write_completed();
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(MetricEvent::MemCacheWriteStarted)
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(MetricEvent::MemCacheWriteCompleted)
         ));
     }
 

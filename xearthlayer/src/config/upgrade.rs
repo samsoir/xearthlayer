@@ -105,6 +105,12 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "prefetch.ground_ring_radius",
     // Removed in #58 - prewarm uses separate grid_rows/grid_cols
     "prewarm.grid_size",
+    // Removed in v0.4.7 - never affected I/O concurrency. The executor's disk
+    // pool took a flat DEFAULT_DISK_IO_CAPACITY, the profile-aware constructor
+    // had no production callers, and the profile-sized StorageConcurrencyLimiter
+    // built from this value sat behind #[allow(dead_code)]. Pool sizing is now
+    // derived from the pool capacities themselves (#227).
+    "cache.disk_io_profile",
     // Removed - online network module deleted from aircraft_position
     "online_network.enabled",
     "online_network.network_type",
@@ -134,6 +140,14 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "control_plane.stall_threshold_secs",
     "control_plane.health_check_interval_secs",
     "control_plane.semaphore_timeout_secs",
+    // Removed in #249 — resource pool sizing is derived from the tuned policy in
+    // ResourcePoolConfig::default() and is not user-overridable. The values these
+    // keys carried never reached the executor, so no value on disk represents a
+    // considered choice; config list even reported a cpu_concurrent computed by a
+    // second, contradictory formula that nothing consumed.
+    "executor.network_concurrent",
+    "executor.cpu_concurrent",
+    "executor.disk_io_concurrent",
     // Removed in #160 — internal executor implementation details not useful as config
     "executor.max_concurrent_tasks",
     "executor.job_channel_capacity",
@@ -611,6 +625,55 @@ type = bing
     }
 
     #[test]
+    fn test_deprecated_executor_pool_keys() {
+        // Removed in #249: pool sizing is derived from the tuned policy in
+        // ResourcePoolConfig::default() and is no longer user-overridable.
+        assert!(DEPRECATED_KEYS.contains(&"executor.network_concurrent"));
+        assert!(DEPRECATED_KEYS.contains(&"executor.cpu_concurrent"));
+        assert!(DEPRECATED_KEYS.contains(&"executor.disk_io_concurrent"));
+    }
+
+    #[test]
+    fn test_analyze_flags_executor_pool_keys_as_deprecated() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+
+        std::fs::write(
+            &config_path,
+            r#"
+[executor]
+network_concurrent = 256
+cpu_concurrent = 16
+disk_io_concurrent = 64
+"#,
+        )
+        .unwrap();
+
+        let analysis = analyze_config(&config_path).unwrap();
+
+        for key in [
+            "executor.network_concurrent",
+            "executor.cpu_concurrent",
+            "executor.disk_io_concurrent",
+        ] {
+            assert!(
+                analysis.deprecated_keys.contains(&key.to_string()),
+                "{key} should be reported as deprecated, not silently kept"
+            );
+            assert!(
+                !analysis.unknown_keys.contains(&key.to_string()),
+                "{key} is a known removal, not an unrecognised key"
+            );
+            assert!(
+                !analysis.missing_keys.contains(&key.to_string()),
+                "{key} must not also be reported as missing - that is the \
+                 self-contradiction that made needs_upgrade permanently true \
+                 during the disk_io_profile removal"
+            );
+        }
+    }
+
+    #[test]
     fn test_deprecated_boundary_prefetch_keys() {
         assert!(DEPRECATED_KEYS.contains(&"prefetch.trigger_position"));
         assert!(DEPRECATED_KEYS.contains(&"prefetch.lead_distance"));
@@ -619,6 +682,39 @@ type = bing
         assert!(DEPRECATED_KEYS.contains(&"prefetch.turn_threshold"));
         assert!(DEPRECATED_KEYS.contains(&"prefetch.track_stability_duration"));
         assert!(DEPRECATED_KEYS.contains(&"prefetch.time_budget_margin"));
+    }
+
+    /// `cache.disk_io_profile` never affected I/O concurrency: the pool that
+    /// consumed it had no production callers and the limiter built from it sat
+    /// behind `#[allow(dead_code)]`. Removing the key must take it out of an
+    /// existing user config, not leave it as an unknown setting.
+    #[test]
+    fn upgrade_removes_the_inert_disk_io_profile_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+
+        std::fs::write(
+            &config_path,
+            "[provider]\ntype = bing\n\n[cache]\ndisk_io_profile = nvme\n",
+        )
+        .unwrap();
+
+        let result = upgrade_config(&config_path, false).unwrap();
+
+        assert!(
+            result
+                .removed_keys
+                .iter()
+                .any(|k| k == "cache.disk_io_profile"),
+            "upgrade must report the removal, got {:?}",
+            result.removed_keys
+        );
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !contents.contains("disk_io_profile"),
+            "the key must be gone from the upgraded file"
+        );
     }
 
     #[test]

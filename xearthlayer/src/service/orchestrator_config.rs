@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use crate::config::{ConfigFile, DiskIoProfile};
+use crate::config::ConfigFile;
 use crate::provider::ProviderConfig;
 use crate::service::ServiceConfig;
 
@@ -54,9 +54,6 @@ pub struct OrchestratorConfig {
     /// packages remain installed and cached locally; only the symlink that
     /// X-Plane reads is suppressed. See `packages.disable_overlays` config key.
     pub disable_overlays: bool,
-
-    /// Disk I/O profile for storage-specific tuning.
-    pub disk_io_profile: DiskIoProfile,
 
     /// Prefetch configuration.
     pub prefetch: PrefetchConfig,
@@ -224,7 +221,6 @@ impl OrchestratorConfig {
             patches_enabled: config.patches.enabled,
             packages_install_location,
             disable_overlays: config.packages.disable_overlays,
-            disk_io_profile: config.cache.disk_io_profile,
             prefetch,
             prewarm,
             fuse,

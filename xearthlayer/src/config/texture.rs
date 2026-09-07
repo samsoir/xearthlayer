@@ -1,6 +1,5 @@
 //! Texture encoding configuration.
 
-use super::file::DEFAULT_MIPMAP_COUNT;
 use crate::dds::DdsFormat;
 
 /// Configuration for texture encoding.
@@ -8,29 +7,40 @@ use crate::dds::DdsFormat;
 /// Groups all parameters needed to configure a texture encoder,
 /// providing sensible defaults while allowing customization.
 ///
+/// # Mipmap levels
+///
+/// `mipmap_count` is an [`Option`]: `None` — the default — means the full
+/// chain, derived from the texture dimensions at encode time (13 levels for
+/// 4096×4096, down to 1×1). `Some(n)` truncates the chain to `n` levels and
+/// exists for tests and callers that deliberately want a partial chain.
+///
+/// A truncated chain makes X-Plane clamp sampling at the last declared level,
+/// which undersamples sloped terrain at grazing angles and shows up as banding
+/// along contour lines — so there is no user-facing setting for this.
+///
 /// # Example
 ///
 /// ```
 /// use xearthlayer::config::TextureConfig;
 /// use xearthlayer::dds::DdsFormat;
 ///
-/// // Using defaults (BC1 format, 5 mipmaps)
+/// // Using defaults (BC1 format, full mipmap chain)
 /// let config = TextureConfig::default();
 /// assert_eq!(config.format(), DdsFormat::BC1);
-/// assert_eq!(config.mipmap_count(), 5);
+/// assert_eq!(config.mipmap_count(), None);
 ///
 /// // Custom configuration
 /// let config = TextureConfig::new(DdsFormat::BC3)
 ///     .with_mipmap_count(3);
 /// assert_eq!(config.format(), DdsFormat::BC3);
-/// assert_eq!(config.mipmap_count(), 3);
+/// assert_eq!(config.mipmap_count(), Some(3));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextureConfig {
     /// DDS compression format (BC1 or BC3)
     format: DdsFormat,
-    /// Number of mipmap levels (1-10, default: 5 for 4096→256)
-    mipmap_count: usize,
+    /// Mipmap levels to emit; `None` means the full chain for the texture size
+    mipmap_count: Option<usize>,
     /// Compressor backend: "software", "ispc", or "gpu"
     compressor: String,
     /// GPU device selector: "integrated", "discrete", or adapter name substring
@@ -40,24 +50,24 @@ pub struct TextureConfig {
 impl TextureConfig {
     /// Create a new texture configuration with the specified format.
     ///
-    /// Uses default mipmap count (suitable for 4096×4096 → 256×256 chain).
+    /// Emits the full mipmap chain for whatever texture size is encoded.
     pub fn new(format: DdsFormat) -> Self {
         Self {
             format,
-            mipmap_count: DEFAULT_MIPMAP_COUNT,
+            mipmap_count: None,
             compressor: crate::config::defaults::DEFAULT_COMPRESSOR.to_string(),
             gpu_device: crate::config::defaults::DEFAULT_GPU_DEVICE.to_string(),
         }
     }
 
-    /// Set the number of mipmap levels.
+    /// Truncate the mipmap chain to a fixed number of levels.
     ///
-    /// For a 4096×4096 source image, common values are:
-    /// - 1: No mipmaps (only full resolution)
-    /// - 5: 4096 → 2048 → 1024 → 512 → 256 (default)
-    /// - 10: Full chain down to 4×4
+    /// Intended for tests and special-purpose callers. Production code should
+    /// leave this unset so the chain is derived from the texture dimensions.
+    /// The count is clamped to the full chain length at encode time, so it can
+    /// never make the DDS header over-declare what the payload holds.
     pub fn with_mipmap_count(mut self, count: usize) -> Self {
-        self.mipmap_count = count;
+        self.mipmap_count = Some(count);
         self
     }
 
@@ -66,8 +76,8 @@ impl TextureConfig {
         self.format
     }
 
-    /// Get the number of mipmap levels.
-    pub fn mipmap_count(&self) -> usize {
+    /// Get the mipmap level override, or `None` for the full chain.
+    pub fn mipmap_count(&self) -> Option<usize> {
         self.mipmap_count
     }
 
@@ -98,7 +108,7 @@ impl Default for TextureConfig {
     fn default() -> Self {
         Self {
             format: DdsFormat::BC1,
-            mipmap_count: DEFAULT_MIPMAP_COUNT,
+            mipmap_count: None,
             compressor: crate::config::defaults::DEFAULT_COMPRESSOR.to_string(),
             gpu_device: crate::config::defaults::DEFAULT_GPU_DEVICE.to_string(),
         }
@@ -113,28 +123,28 @@ mod tests {
     fn test_default_config() {
         let config = TextureConfig::default();
         assert_eq!(config.format(), DdsFormat::BC1);
-        assert_eq!(config.mipmap_count(), DEFAULT_MIPMAP_COUNT);
+        assert_eq!(config.mipmap_count(), None, "default is the full chain");
     }
 
     #[test]
     fn test_new_with_format() {
         let config = TextureConfig::new(DdsFormat::BC3);
         assert_eq!(config.format(), DdsFormat::BC3);
-        assert_eq!(config.mipmap_count(), DEFAULT_MIPMAP_COUNT); // Default mipmaps
+        assert_eq!(config.mipmap_count(), None, "default is the full chain");
     }
 
     #[test]
     fn test_with_mipmap_count() {
         let config = TextureConfig::new(DdsFormat::BC1).with_mipmap_count(10);
         assert_eq!(config.format(), DdsFormat::BC1);
-        assert_eq!(config.mipmap_count(), 10);
+        assert_eq!(config.mipmap_count(), Some(10));
     }
 
     #[test]
     fn test_builder_chain() {
         let config = TextureConfig::new(DdsFormat::BC3).with_mipmap_count(3);
         assert_eq!(config.format(), DdsFormat::BC3);
-        assert_eq!(config.mipmap_count(), 3);
+        assert_eq!(config.mipmap_count(), Some(3));
     }
 
     #[test]

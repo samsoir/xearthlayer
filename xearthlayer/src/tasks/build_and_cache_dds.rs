@@ -23,13 +23,14 @@ use crate::executor::{
     TaskError, TaskOutput, TaskResult, TextureEncoderAsync,
 };
 use crate::metrics::OptionalMetrics;
+use bytes::Bytes;
 use image::{Rgba, RgbaImage};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Tile dimensions
 const TILE_SIZE: u32 = 4096;
@@ -232,7 +233,10 @@ where
                         let duration_us = encode_start.elapsed().as_micros() as u64;
                         let bytes = data.len() as u64;
                         metrics.encode_completed(bytes, duration_us);
-                        data
+                        // Bytes::from adopts the encoder's allocation (O(1)),
+                        // so the two fire-and-forget cache spawns below clone a
+                        // refcount rather than 10.66 MiB each (#237).
+                        Bytes::from(data)
                     }
                     Ok(Err(e)) => {
                         return TaskResult::Failed(TaskError::new(format!(
@@ -268,13 +272,24 @@ where
                     // Step 4: Spawn fire-and-forget memory cache write
                     // This avoids blocking the job completion on cache write,
                     // and avoids race conditions with eventual consistency caches.
+                    //
+                    // Instrumented with mem_cache_write_started/completed (mirroring
+                    // the DDS-disk spawn below) so this backlog is visible as
+                    // mem_cache_writes_active — previously this spawn emitted no
+                    // start/complete pair at all, only a size gauge that only moves
+                    // after `cache.put()` completes. See issue #209.
                     let cache = Arc::clone(&self.memory_cache);
                     let tile = self.tile;
                     let dds_data_for_cache = dds_data.clone();
+                    let metrics_for_mem = metrics.clone();
                     tokio::spawn(async move {
+                        metrics_for_mem.mem_cache_write_started();
+
                         cache
                             .put(tile.row, tile.col, tile.zoom, dds_data_for_cache)
                             .await;
+
+                        metrics_for_mem.mem_cache_write_completed();
 
                         debug!(
                             tile = ?tile,
@@ -292,7 +307,6 @@ where
                     let metrics_for_dds = metrics.clone();
                     tokio::spawn(async move {
                         metrics_for_dds.disk_write_started();
-                        let write_start = Instant::now();
 
                         dds_disk
                             .put(
@@ -303,8 +317,7 @@ where
                             )
                             .await;
 
-                        let duration_us = write_start.elapsed().as_micros() as u64;
-                        metrics_for_dds.disk_write_completed(dds_bytes, duration_us);
+                        metrics_for_dds.disk_write_completed(dds_bytes, DD::TIER);
 
                         debug!(
                             tile = ?tile_for_disk,
@@ -322,7 +335,7 @@ where
                     );
                 }
 
-                info!(
+                debug!(
                     job_id = %job_id,
                     tile = ?self.tile,
                     size_bytes = dds_size,
@@ -492,7 +505,7 @@ mod tests {
             _row: u32,
             _col: u32,
             _zoom: u8,
-        ) -> impl Future<Output = Option<Vec<u8>>> + Send {
+        ) -> impl Future<Output = Option<Bytes>> + Send {
             async { None }
         }
         fn put(
@@ -500,7 +513,7 @@ mod tests {
             row: u32,
             col: u32,
             zoom: u8,
-            _data: Vec<u8>,
+            _data: Bytes,
         ) -> impl Future<Output = ()> + Send {
             let tx = self.tx.clone();
             async move {
@@ -524,7 +537,7 @@ mod tests {
             _row: u32,
             _col: u32,
             _zoom: u8,
-        ) -> impl Future<Output = Option<Vec<u8>>> + Send {
+        ) -> impl Future<Output = Option<Bytes>> + Send {
             async { None }
         }
         fn put(
@@ -532,7 +545,7 @@ mod tests {
             row: u32,
             col: u32,
             zoom: u8,
-            _data: Vec<u8>,
+            _data: Bytes,
         ) -> impl Future<Output = ()> + Send {
             let tx = self.tx.clone();
             async move {
@@ -612,7 +625,7 @@ mod tests {
         // X-Plane still gets a tile.
         match result {
             TaskResult::SuccessWithOutput(out) => {
-                let dds: Option<Vec<u8>> = out.get::<Vec<u8>>("dds_data").cloned();
+                let dds: Option<Bytes> = out.get::<Bytes>("dds_data").cloned();
                 assert!(
                     dds.is_some(),
                     "task must return DDS data even when incomplete"
@@ -643,7 +656,7 @@ mod tests {
         let mut chunks = ChunkResults::new();
         for row in 0..16u8 {
             for col in 0..16u8 {
-                chunks.add_success(row, col, vec![]);
+                chunks.add_success(row, col, vec![].into());
             }
         }
         assert!(chunks.is_complete());
@@ -664,5 +677,62 @@ mod tests {
             .expect("DDS disk cache put must fire within 1s for complete tile")
             .expect("DDS disk cache channel closed unexpectedly");
         assert_eq!(disk_put, (100, 200, 15));
+    }
+
+    // ------------------------------------------------------------------
+    // mem_cache_writes_active instrumentation (#209 fix wave)
+    //
+    // Regression guard for the diagnosis hole: before this fix, the
+    // memory-cache spawn emitted no start/complete metrics pair at all, so a
+    // backlog concentrated there was invisible to `mem_cache_writes_active`
+    // and would misread as allocator retention. This asserts the production
+    // spawn actually emits the pair, not just that the daemon can count it.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn complete_tile_reports_mem_cache_write_started_and_completed() {
+        use crate::metrics::MetricEvent;
+        use crate::metrics::MetricsClient;
+
+        let mut chunks = ChunkResults::new();
+        for row in 0..16u8 {
+            for col in 0..16u8 {
+                chunks.add_success(row, col, vec![].into());
+            }
+        }
+        assert!(chunks.is_complete());
+
+        let (task, _mem_rx, _disk_rx, ctx) = make_task_with_chunks(chunks);
+
+        let (metrics_tx, mut metrics_rx) = unbounded_channel();
+        let mut ctx = ctx.with_metrics(MetricsClient::new(metrics_tx));
+
+        let result = task.execute(&mut ctx).await;
+        assert!(matches!(result, TaskResult::SuccessWithOutput(_)));
+
+        // The memory-cache spawn and the DDS-disk spawn run concurrently and
+        // share this channel, so interleave with other event types (encode,
+        // disk write, ...) is expected. Filter to just the mem-cache pair;
+        // sends from a single spawned task preserve their own call order.
+        let mut mem_write_events = Vec::new();
+        let deadline = Duration::from_secs(2);
+        while mem_write_events.len() < 2 {
+            match tokio::time::timeout(deadline, metrics_rx.recv()).await {
+                Ok(Some(MetricEvent::MemCacheWriteStarted)) => {
+                    mem_write_events.push("started");
+                }
+                Ok(Some(MetricEvent::MemCacheWriteCompleted)) => {
+                    mem_write_events.push("completed");
+                }
+                Ok(Some(_)) => {} // other events (encode/assembly/disk) are irrelevant here
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert_eq!(
+            mem_write_events,
+            vec!["started", "completed"],
+            "memory cache spawn must emit MemCacheWriteStarted then MemCacheWriteCompleted"
+        );
     }
 }

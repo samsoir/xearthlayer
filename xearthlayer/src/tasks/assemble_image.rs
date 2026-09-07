@@ -270,7 +270,7 @@ mod tests {
         let mut chunks = ChunkResults::new();
 
         // Add a single green chunk at (0, 0)
-        chunks.add_success(0, 0, create_test_jpeg(0, 255, 0));
+        chunks.add_success(0, 0, create_test_jpeg(0, 255, 0).into());
 
         let result = assemble_chunks(chunks).unwrap();
 

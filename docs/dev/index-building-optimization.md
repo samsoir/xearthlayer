@@ -65,6 +65,14 @@ pub struct IndexCache {
 }
 ```
 
+##### Corruption handling
+
+The cache is a performance optimization, never a source of truth: any file we
+cannot read is discarded and the index is rebuilt from sources. Reads are
+bounded by the file's own length and writes go through `write_atomic`, both
+from the shared model in `cache/integrity`. See
+[Cache Integrity Design](cache-integrity-design.md).
+
 #### Cache Flow
 
 ```

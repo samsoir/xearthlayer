@@ -1,0 +1,410 @@
+//! Detects divergence between prefetch's region-state claims and reality.
+//!
+//! When FUSE has to generate a tile on demand in a region prefetch marked
+//! `Prefetched` or `NoCoverage`, the claim was wrong. Three causes produce
+//! this — a gap in the scenery index, a premature promotion, or eviction of
+//! the tile after promotion — and the response is the same for all three:
+//! clear the state so the region is re-prefetched. See #176.
+//!
+//! Re-prefetching only *repairs* the last two. The scenery index is immutable
+//! for the life of the process, so for an index gap the next cycle re-derives
+//! the same empty tile set and re-marks the region `NoCoverage`. The loop is
+//! bounded and safe, but for that cause the observer can only flag the gap in
+//! the log and metrics — never fix it.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::config::defaults::DEFAULT_PREFETCH_STALE_REGION_TIMEOUT;
+use crate::coord::TileCoord;
+use crate::geo_index::{DsfRegion, GeoIndex, PrefetchedRegion};
+use crate::metrics::MetricsClient;
+
+/// Minimum interval between demotions of the same region.
+///
+/// Derived from the default `prefetch.stale_region_timeout` canonical constant
+/// to maintain a structural link. It is a constant rather than plumbed config
+/// because FUSE has no reason to depend on the prefetch config, and this bounds
+/// a diagnostic response, not a correctness decision. Eviction inside the
+/// retained window can recur, and an unbounded demote → re-prefetch → evict
+/// loop would churn on a long flight.
+const DEFAULT_DEMOTION_INTERVAL: Duration =
+    Duration::from_secs(DEFAULT_PREFETCH_STALE_REGION_TIMEOUT);
+
+pub struct PrefetchStateObserver {
+    geo_index: Arc<GeoIndex>,
+    metrics_client: Option<MetricsClient>,
+    /// Last demotion per region. Bounded by the number of regions that have
+    /// ever diverged, which is small enough not to need eviction.
+    last_demotion: Mutex<HashMap<DsfRegion, Instant>>,
+    demotion_interval: Duration,
+}
+
+impl PrefetchStateObserver {
+    pub fn new(geo_index: Arc<GeoIndex>) -> Self {
+        Self {
+            geo_index,
+            metrics_client: None,
+            last_demotion: Mutex::new(HashMap::new()),
+            demotion_interval: DEFAULT_DEMOTION_INTERVAL,
+        }
+    }
+
+    pub fn with_metrics_client(mut self, client: MetricsClient) -> Self {
+        self.metrics_client = Some(client);
+        self
+    }
+
+    /// Override the demotion rate-limit window. Test seam.
+    pub fn with_demotion_interval(mut self, interval: Duration) -> Self {
+        self.demotion_interval = interval;
+        self
+    }
+
+    /// Evaluate a completed DDS response.
+    ///
+    /// Cheap and non-blocking on the common path: a cache hit returns before
+    /// any lookup, and a region with no prefetch state returns after one.
+    pub fn observe(&self, tile: TileCoord, cache_hit: bool) {
+        if cache_hit {
+            return;
+        }
+
+        let (lat, lon) = tile.to_lat_lon();
+        let region = DsfRegion::from_lat_lon(lat, lon);
+
+        let Some(state) = self.geo_index.get::<PrefetchedRegion>(&region) else {
+            return;
+        };
+
+        // Demand beats backoff. A deferred region was never claimed ready, so
+        // this is not a divergence — but the sim asking for tiles here now is
+        // reason enough to stop skipping it. Note this does not license a
+        // longer ladder: by the time FUSE asks, the miss already happened.
+        // This is a repair, not a prefetch.
+        //
+        // This clears only the region's GeoIndex entry — it deliberately does
+        // NOT reset the coordinator's `region_retry` strike count, which this
+        // observer cannot even reach (it holds only an `Arc<GeoIndex>`). That
+        // is intentional, not an oversight: a region cleared here by demand is
+        // the same ongoing episode as before, not a fresh one, so the
+        // 20/30/40/60s deferral ladder must keep escalating across repeated
+        // demand-driven clears rather than flattening back to 20s each time.
+        if state.is_deferred() {
+            self.geo_index.remove::<PrefetchedRegion>(&region);
+            if let Some(ref metrics) = self.metrics_client {
+                metrics.prefetch_deferral_cleared();
+            }
+            tracing::debug!(
+                lat = region.lat,
+                lon = region.lon,
+                "Deferral cleared by on-demand generation"
+            );
+            return;
+        }
+
+        // InProgress regions are expected to miss — prefetch has not finished.
+        if !(state.is_prefetched() || state.is_no_coverage()) {
+            return;
+        }
+
+        if let Some(ref metrics) = self.metrics_client {
+            metrics.prefetch_state_diverged();
+        }
+
+        if !self.claim_demotion(region) {
+            return;
+        }
+
+        self.geo_index.remove::<PrefetchedRegion>(&region);
+        if let Some(ref metrics) = self.metrics_client {
+            metrics.prefetch_region_demoted();
+        }
+
+        tracing::warn!(
+            lat = region.lat,
+            lon = region.lon,
+            tile_row = tile.row,
+            tile_col = tile.col,
+            tile_zoom = tile.zoom,
+            was_no_coverage = state.is_no_coverage(),
+            "Prefetch state contradicted by on-demand generation — region demoted"
+        );
+    }
+
+    /// Returns true if this region may be demoted now, recording the attempt.
+    ///
+    /// The lock is only reached on the divergence path, after both early
+    /// returns, so contention is not a concern.
+    ///
+    /// `.unwrap()` on the lock panics on poisoning, matching the existing
+    /// convention for `Mutex` state elsewhere in prefetch (e.g.
+    /// `boundary_strategy.rs`, `calibrator.rs`) — this is not a novel risk.
+    /// It also cannot corrupt the DDS bytes served to X-Plane: the caller
+    /// (`do_request()` in `fuse3/shared.rs`) reads `response.data` *after*
+    /// invoking this hook, so this call sits off the texture-response path.
+    fn claim_demotion(&self, region: DsfRegion) -> bool {
+        let now = Instant::now();
+        let mut log = self.last_demotion.lock().unwrap();
+        match log.get(&region) {
+            Some(last) if now.duration_since(*last) < self.demotion_interval => false,
+            _ => {
+                log.insert(region, now);
+                true
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geo_index::PrefetchedRegion;
+    use crate::metrics::MetricEvent;
+
+    /// A tile whose centre lies inside DsfRegion { lat: 33, lon: -119 }.
+    fn tile_in_33_119() -> TileCoord {
+        crate::coord::to_tile_coords(33.5, -118.5, 12).unwrap()
+    }
+
+    fn region_of(tile: TileCoord) -> DsfRegion {
+        let (lat, lon) = tile.to_lat_lon();
+        DsfRegion::from_lat_lon(lat, lon)
+    }
+
+    /// Build a `MetricsClient` over a fresh channel, returning it alongside
+    /// the receiver so a test can drain and assert exactly which events were
+    /// emitted. `MetricsClient` is otherwise fire-and-forget with no way to
+    /// observe emission synchronously — this is that seam.
+    fn test_metrics_client() -> (
+        MetricsClient,
+        tokio::sync::mpsc::UnboundedReceiver<MetricEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (MetricsClient::new(tx), rx)
+    }
+
+    #[test]
+    fn test_diverged_prefetched_region_is_demoted() {
+        let geo_index = Arc::new(GeoIndex::new());
+        let tile = tile_in_33_119();
+        let region = region_of(tile);
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
+
+        let observer = PrefetchStateObserver::new(Arc::clone(&geo_index));
+        observer.observe(tile, false);
+
+        assert!(
+            geo_index.get::<PrefetchedRegion>(&region).is_none(),
+            "a Prefetched region contradicted by an on-demand generation must be demoted"
+        );
+    }
+
+    #[test]
+    fn test_diverged_nocoverage_region_is_cleared() {
+        // NoCoverage is the harsher claim: it excludes the region for the
+        // session. A FUSE generation there disproves it outright.
+        let geo_index = Arc::new(GeoIndex::new());
+        let tile = tile_in_33_119();
+        let region = region_of(tile);
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::no_coverage());
+
+        let observer = PrefetchStateObserver::new(Arc::clone(&geo_index));
+        observer.observe(tile, false);
+
+        assert!(geo_index.get::<PrefetchedRegion>(&region).is_none());
+    }
+
+    #[test]
+    fn test_cache_hit_is_not_divergence() {
+        let geo_index = Arc::new(GeoIndex::new());
+        let tile = tile_in_33_119();
+        let region = region_of(tile);
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
+
+        let (metrics, mut rx) = test_metrics_client();
+        let observer =
+            PrefetchStateObserver::new(Arc::clone(&geo_index)).with_metrics_client(metrics);
+        observer.observe(tile, true);
+
+        assert!(
+            geo_index
+                .get::<PrefetchedRegion>(&region)
+                .unwrap()
+                .is_prefetched(),
+            "serving a prefetched tile from cache is the system working"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a cache hit must not emit any metric — it never reaches the lookup"
+        );
+    }
+
+    #[test]
+    fn test_in_progress_region_is_not_divergence() {
+        // A region still being prefetched is *expected* to miss.
+        let geo_index = Arc::new(GeoIndex::new());
+        let tile = tile_in_33_119();
+        let region = region_of(tile);
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::in_progress());
+
+        let observer = PrefetchStateObserver::new(Arc::clone(&geo_index));
+        observer.observe(tile, false);
+
+        assert!(geo_index
+            .get::<PrefetchedRegion>(&region)
+            .unwrap()
+            .is_in_progress());
+    }
+
+    #[test]
+    fn test_untracked_region_is_not_divergence() {
+        let geo_index = Arc::new(GeoIndex::new());
+        let observer = PrefetchStateObserver::new(Arc::clone(&geo_index));
+        observer.observe(tile_in_33_119(), false);
+        assert_eq!(geo_index.count::<PrefetchedRegion>(), 0);
+    }
+
+    #[test]
+    fn test_demotion_is_rate_limited_but_divergence_is_always_counted() {
+        let geo_index = Arc::new(GeoIndex::new());
+        let tile = tile_in_33_119();
+        let region = region_of(tile);
+
+        let (metrics, mut rx) = test_metrics_client();
+        let observer =
+            PrefetchStateObserver::new(Arc::clone(&geo_index)).with_metrics_client(metrics);
+
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
+        observer.observe(tile, false);
+
+        // First divergence demotes: both events fire, diverged before demoted.
+        assert!(
+            matches!(rx.try_recv(), Ok(MetricEvent::PrefetchStateDiverged)),
+            "a demoted divergence must emit PrefetchStateDiverged"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(MetricEvent::PrefetchRegionDemoted)),
+            "a demoted divergence must emit PrefetchRegionDemoted"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly two events for a demoted divergence"
+        );
+
+        // Region re-promoted, then diverges again inside the window.
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
+        observer.observe(tile, false);
+
+        // Second divergence is still counted (diverged fires)...
+        assert!(
+            matches!(rx.try_recv(), Ok(MetricEvent::PrefetchStateDiverged)),
+            "every divergence is counted, even when the demotion is rate limited"
+        );
+        // ...but the demotion itself is rate limited: no PrefetchRegionDemoted.
+        // This is the assertion that would catch the two emission calls being
+        // swapped: a swap would emit PrefetchRegionDemoted here instead.
+        assert!(
+            rx.try_recv().is_err(),
+            "the second demotion is rate limited — no PrefetchRegionDemoted"
+        );
+        assert!(
+            geo_index
+                .get::<PrefetchedRegion>(&region)
+                .unwrap()
+                .is_prefetched(),
+            "rate-limited divergence must leave the state alone"
+        );
+    }
+
+    #[test]
+    fn test_demotion_allowed_again_after_the_window() {
+        let geo_index = Arc::new(GeoIndex::new());
+        let tile = tile_in_33_119();
+        let region = region_of(tile);
+
+        let (metrics, mut rx) = test_metrics_client();
+        let observer = PrefetchStateObserver::new(Arc::clone(&geo_index))
+            .with_metrics_client(metrics)
+            .with_demotion_interval(Duration::ZERO);
+
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
+        observer.observe(tile, false);
+        geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
+        observer.observe(tile, false);
+
+        let demoted_count = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| matches!(event, MetricEvent::PrefetchRegionDemoted))
+            .count();
+        assert_eq!(
+            demoted_count, 2,
+            "a zero window permits every demotion to emit PrefetchRegionDemoted"
+        );
+    }
+
+    #[test]
+    fn test_fuse_miss_clears_deferral_without_counting_divergence() {
+        let geo_index = Arc::new(GeoIndex::new());
+        let tile = tile_in_33_119();
+        let region = region_of(tile);
+        geo_index.insert::<PrefetchedRegion>(
+            region,
+            PrefetchedRegion::deferred(Instant::now() + Duration::from_secs(60)),
+        );
+
+        let (metrics, mut rx) = test_metrics_client();
+        let observer =
+            PrefetchStateObserver::new(Arc::clone(&geo_index)).with_metrics_client(metrics);
+
+        observer.observe(tile, false);
+
+        assert!(
+            geo_index.get::<PrefetchedRegion>(&region).is_none(),
+            "X-Plane demanding tiles here is the strongest evidence the region matters now"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(MetricEvent::PrefetchDeferralCleared)),
+            "a deferred region was never claimed ready, so this is not a divergence — \
+             it must emit PrefetchDeferralCleared instead, not the divergence events"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one event for a cleared deferral"
+        );
+    }
+
+    #[test]
+    fn test_deferral_cleared_emits_no_divergence_events() {
+        // Companion to the test above, read from the other direction: a
+        // cleared deferral must never ALSO look like a divergence. If the
+        // is_deferred() branch's early `return` were ever removed, this
+        // would start seeing PrefetchStateDiverged / PrefetchRegionDemoted
+        // fall through from the code below it.
+        let geo_index = Arc::new(GeoIndex::new());
+        let tile = tile_in_33_119();
+        let region = region_of(tile);
+        geo_index.insert::<PrefetchedRegion>(
+            region,
+            PrefetchedRegion::deferred(Instant::now() + Duration::from_secs(60)),
+        );
+
+        let (metrics, mut rx) = test_metrics_client();
+        let observer =
+            PrefetchStateObserver::new(Arc::clone(&geo_index)).with_metrics_client(metrics);
+
+        observer.observe(tile, false);
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "clearing a deferral must emit exactly one event, \
+             never also the divergence/demotion events"
+        );
+        assert!(
+            matches!(events[0], MetricEvent::PrefetchDeferralCleared),
+            "the one event emitted must be PrefetchDeferralCleared"
+        );
+    }
+}

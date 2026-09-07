@@ -702,7 +702,7 @@ async fn handle_dds_read(&self, path: &str) -> Result<DdsData> {
 | `TelemetryListener` | APT Module | Replaced by WebApiAdapter, send to aggregator channel |
 | `SharedPrefetchStatus` | Split | APT state + Prefetch stats become separate |
 | `TileBasedPrefetcher.BurstTracker` | Scene Tracker | Extract to standalone module |
-| `DdsAccessEvent` | Scene Tracker | Change `dsf_tile` to `DdsTileCoord` |
+| `DdsAccessEvent` | Deleted (#234) | Its channel was never drained; Scene Tracker's `FuseAccessEvent` already carries this signal |
 | `DsfTileCoord` | Remove/Replace | Use `DdsTileCoord` (empirical) + `GeoRegion` (derived) |
 | `handle_telemetry_update()` | APT Module | Remove from prefetcher |
 | `update_inferred_position()` | APT derives from Scene Tracker | Clean interface |

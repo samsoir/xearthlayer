@@ -14,7 +14,7 @@ The wizard auto-detects your X-Plane installation, system hardware (CPU, memory,
 
 1. **X-Plane Custom Scenery** — auto-detected from your X-Plane install, with fallback to manual entry.
 2. **Package Location** — where regional scenery packages live on disk.
-3. **Cache Configuration** — cache directory, disk cache size (defaults to 25% of free space, floored to 10 GB), DDS-to-chunk disk ratio, memory cache size (defaults to RAM ÷ 12, clamped to 500 MB – RAM ÷ 4), and disk I/O profile (NVMe / SSD / HDD / auto).
+3. **Cache Configuration** — cache directory, disk cache size (defaults to 25% of free space, floored to 10 GB), DDS-to-chunk disk ratio, memory cache size (defaults to RAM ÷ 12, rounded to the nearest whole GB, clamped to 500 MB – RAM ÷ 4), and disk I/O profile (NVMe / SSD / HDD / auto).
 4. **DDS Encoding** — picks ISPC (CPU) by default, or offers to offload encoding to a secondary GPU when **two or more GPU adapters** are detected. The wizard warns against picking the GPU X-Plane renders on. Single-GPU systems skip the choice and stay on ISPC.
 
 GPU enumeration can take 10–30 seconds on multi-adapter systems while drivers are probed; a spinner shows progress.
@@ -126,23 +126,9 @@ Controls tile caching behavior.
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `directory` | path | `~/.cache/xearthlayer` | Directory for storing cached tiles. Supports `~` expansion. |
-| `memory_size` | size | `512MB` | Maximum RAM for in-memory cache. Supports KB, MB, GB suffixes. Memory cache is a staging buffer; DDS disk cache is the retention layer. |
-| `disk_size` | size | `20GB` | Maximum disk space for persistent cache (shared between DDS tiles and raw chunks). Supports KB, MB, GB suffixes. |
+| `memory_size` | size | `512MB` | Maximum RAM for in-memory cache. Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. Memory cache is a staging buffer; DDS disk cache is the retention layer. |
+| `disk_size` | size | `20GB` | Maximum disk space for persistent cache (shared between DDS tiles and raw chunks). Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. |
 | `dds_disk_ratio` | float | `0.6` | Fraction of `disk_size` allocated to DDS tile cache (0.0-1.0). Remainder goes to raw chunk cache. |
-| `disk_io_profile` | string | `auto` | Disk I/O concurrency profile based on storage type (see below) |
-
-**Disk I/O Profile:**
-
-The `disk_io_profile` setting tunes disk I/O concurrency based on your storage type. Different storage devices have vastly different optimal concurrency levels:
-
-| Profile | Description | Concurrent Ops | Best For |
-|---------|-------------|----------------|----------|
-| `auto` | Auto-detect storage type (recommended) | Varies | Most users |
-| `hdd` | Spinning disk, seek-bound | 1-4 | Traditional hard drives |
-| `ssd` | SATA/AHCI SSD | 32-64 | Most SSDs |
-| `nvme` | NVMe SSD, multiple queues | 128-256 | NVMe drives |
-
-**Auto-detection (Linux):** When set to `auto`, XEarthLayer detects the storage type by checking `/sys/block/<device>/queue/rotational`. If detection fails, it defaults to the `ssd` profile as a safe middle-ground.
 
 **Example:**
 ```ini
@@ -151,7 +137,6 @@ The `disk_io_profile` setting tunes disk I/O concurrency based on your storage t
 directory = /mnt/nvme/xearthlayer-cache
 memory_size = 8GB
 disk_size = 50GB
-disk_io_profile = auto
 ```
 
 **Cache Structure:**
@@ -233,14 +218,13 @@ timeout = 10
 
 ### [executor]
 
-Controls the job executor daemon's resource pools and concurrency limits. The executor is the core tile processing engine that manages parallel downloads, encoding, and caching.
+Controls the job executor daemon's job limits and download behaviour. The executor is the core tile processing engine that manages parallel downloads, encoding, and caching.
+
+**Resource pool capacities are not configurable.** Network, CPU and disk I/O pool sizes are derived from the host's logical core count by `ResourcePoolConfig::default()`, using multipliers tuned by flight testing and load-bearing for the memory behaviour fixed in [#227](https://github.com/samsoir/xearthlayer/issues/227). The `network_concurrent`, `cpu_concurrent` and `disk_io_concurrent` keys were removed in [#249](https://github.com/samsoir/xearthlayer/issues/249): they never reached the executor, so any value on disk described a capacity nothing used. `xearthlayer config upgrade` removes them.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `max_concurrent_jobs` | integer | `ceil(num_cpus × 0.75)` | Maximum concurrent DDS tile jobs (1-256). Previously in `[control_plane]`. |
-| `network_concurrent` | integer | `128` | Concurrent HTTP connections (clamped to 64-256) |
-| `cpu_concurrent` | integer | `num_cpus / 2` | Concurrent CPU-bound operations (assemble + encode) — leaves headroom for X-Plane |
-| `disk_io_concurrent` | integer | `64` | Concurrent disk I/O operations (auto-detected from storage type) |
 | `request_timeout_secs` | integer | `10` | HTTP request timeout per chunk (seconds) |
 | `max_retries` | integer | `3` | Maximum retry attempts per failed chunk |
 | `retry_base_delay_ms` | integer | `100` | Base delay for exponential backoff (ms) |
@@ -250,11 +234,6 @@ Controls the job executor daemon's resource pools and concurrency limits. The ex
 [executor]
 ; Job concurrency (defaults are tuned for most systems)
 ; max_concurrent_jobs = 12       ; Max concurrent tile jobs (ceil(num_cpus * 0.75))
-
-; Resource pool sizing
-network_concurrent = 128         ; HTTP connections (64-256 range)
-cpu_concurrent = 8               ; CPU-bound ops (defaults to num_cpus / 2)
-disk_io_concurrent = 64          ; Disk I/O (auto-detected from storage type)
 
 ; Download behavior
 request_timeout_secs = 10        ; Per-chunk timeout
@@ -514,7 +493,6 @@ type = bing
 ; directory = /custom/cache/path
 memory_size = 4GB
 disk_size = 50GB
-; disk_io_profile = auto  ; auto-detect storage type (default)
 
 [texture]
 format = bc1
@@ -673,7 +651,6 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `cache.memory_size` | size (e.g., `512MB`) | Memory cache size (staging buffer) |
 | `cache.disk_size` | size (e.g., `20GB`) | Total disk cache size (DDS + chunks) |
 | `cache.dds_disk_ratio` | float (e.g., `0.6`) | Fraction of disk for DDS tiles (0.0-1.0) |
-| `cache.disk_io_profile` | `auto`, `hdd`, `ssd`, `nvme` | Disk I/O concurrency profile |
 | `texture.format` | `bc1`, `bc3` | DDS compression format |
 | `texture.compressor` | `software`, `ispc`, `gpu` | Compression backend |
 | `texture.gpu_device` | `integrated`, `discrete`, or name | GPU adapter selection (used when compressor = gpu) |

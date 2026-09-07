@@ -10,6 +10,10 @@
 > issue #51. When this feature returns in a later 0.3.x release, it will use GeoIndex
 > as its region ownership layer, replacing the previous `patched_regions` HashSet
 > approach. See [Scenery Patches](scenery-patches.md) for the current patch behavior.
+>
+> **Note (#233)**: the `Fuse3UnionFS` this document proposes was deleted once it became
+> unreachable. When this feature returns it should build on `Fuse3OrthoUnionFS`, which is
+> now the only FUSE implementation.
 
 ## Overview
 
