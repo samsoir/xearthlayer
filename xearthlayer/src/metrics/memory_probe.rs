@@ -353,6 +353,7 @@ mod tests {
     /// The point of #227's next flight: glibc's own accounting must be
     /// readable, and the retention gap must be derivable from it.
     #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn test_allocator_sample_reads_glibc_accounting() {
         let Some(a) = AllocatorSample::read() else {
             panic!("mallinfo2 must be available on a glibc Linux build");
@@ -496,6 +497,7 @@ mod tests {
     ///
     /// Other tests can only ever *add* to these figures, so a floor holds.
     #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn test_allocator_sample_reports_live_allocations() {
         const MIB: usize = 1024 * 1024;
         // DDS-sized blocks, which glibc serves by mmap: an 11 MiB allocation
