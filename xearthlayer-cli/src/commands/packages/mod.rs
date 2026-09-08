@@ -47,12 +47,11 @@ fn load_config() -> ConfigFile {
 /// 1. packages.install_location from config
 /// 2. ~/.xearthlayer/packages (default)
 fn default_install_dir(config: &ConfigFile) -> PathBuf {
-    config.packages.install_location.clone().unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".xearthlayer")
-            .join("packages")
-    })
+    config
+        .packages
+        .install_location
+        .clone()
+        .unwrap_or_else(xearthlayer::paths::packages_dir)
 }
 
 /// Get the Custom Scenery directory for overlay symlinks.
@@ -84,7 +83,7 @@ fn default_temp_dir(config: &ConfigFile) -> PathBuf {
         .packages
         .temp_dir
         .clone()
-        .unwrap_or_else(|| xearthlayer::config::config_directory().join("tmp"))
+        .unwrap_or_else(xearthlayer::paths::temp_dir)
 }
 
 /// Get the default library URL from config.

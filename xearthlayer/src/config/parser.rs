@@ -20,6 +20,11 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
 
     // [general] section
     if let Some(section) = ini.section(Some("general")) {
+        if let Some(v) = section.get("layout_version") {
+            if let Ok(n) = v.trim().parse::<u32>() {
+                config.general.layout_version = n;
+            }
+        }
         if let Some(v) = section.get("update_check") {
             let v = v.to_lowercase();
             config.general.update_check = v == "true" || v == "1" || v == "yes" || v == "on";
@@ -646,6 +651,29 @@ pub(super) fn expand_tilde(path: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_config_file_without_layout_version_reads_as_predating_the_layout() {
+        // The parser overlays a file onto ConfigFile::default(), so this is
+        // only true because the default is 0. A current default here would make
+        // every pre-0.5.0 configuration claim to be migrated already.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        std::fs::write(&path, "[general]\nupdate_check = true\n").unwrap();
+        let config = ConfigFile::load_from(&path).unwrap();
+        assert_eq!(config.general.layout_version, 0);
+    }
+
+    #[test]
+    fn a_stamped_layout_version_is_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        std::fs::write(&path, "[general]\nlayout_version = 1\n").unwrap();
+        assert_eq!(
+            ConfigFile::load_from(&path).unwrap().general.layout_version,
+            1
+        );
+    }
     use super::*;
     use crate::config::defaults::*;
     use crate::config::settings::ConfigFile;

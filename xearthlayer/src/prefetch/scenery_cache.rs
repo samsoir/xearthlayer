@@ -38,7 +38,6 @@ use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
 use super::scenery_index::{SceneryIndex, SceneryTile};
-use crate::config::config_directory;
 
 /// Cache format version. Increment when format changes.
 const CACHE_VERSION: u32 = 1;
@@ -48,9 +47,6 @@ const CACHE_HEADER: &str = "SCENERY INDEX CACHE";
 
 /// Field separator used in the file format (two spaces).
 const FIELD_SEPARATOR: &str = "  ";
-
-/// Cache filename.
-const CACHE_FILENAME: &str = "scenery_index.cache";
 
 /// Minimum bytes a tile data line can occupy: `row  col  chunk_zoom  lat  lon
 /// is_sea\n` with every field at its shortest (single-digit values, no
@@ -116,7 +112,7 @@ pub struct CacheStatus {
 
 /// Get the path to the scenery index cache file.
 pub fn cache_path() -> PathBuf {
-    config_directory().join(CACHE_FILENAME)
+    crate::paths::scenery_index_cache()
 }
 
 /// Read cache header to get status without loading all tiles.

@@ -3,8 +3,6 @@
 //! Contains all `DEFAULT_*` constants, CPU-aware helper functions,
 //! and the `ConfigFile::default()` implementation.
 
-use std::path::PathBuf;
-
 use super::settings::*;
 use crate::dds::DdsFormat;
 
@@ -315,14 +313,15 @@ pub const DEFAULT_PARALLEL_DOWNLOADS: usize = 32;
 
 impl Default for ConfigFile {
     fn default() -> Self {
-        let config_dir = super::file::config_directory();
-        let cache_dir = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("xearthlayer");
+        let cache_dir = crate::paths::tile_cache_dir();
 
         Self {
             general: GeneralSettings {
                 update_check: DEFAULT_UPDATE_CHECK,
+                // Not LAYOUT_VERSION: the parser overlays a file onto these
+                // defaults, so a current version here would make every
+                // pre-0.5.0 configuration claim to be migrated already.
+                layout_version: 0,
             },
             provider: ProviderSettings {
                 provider_type: "bing".to_string(),
@@ -367,7 +366,7 @@ impl Default for ConfigFile {
                 concurrent_downloads: 5,
             },
             logging: LoggingSettings {
-                file: config_dir.join("xearthlayer.log"),
+                file: crate::paths::log_file(),
             },
             prefetch: PrefetchSettings {
                 enabled: true,
@@ -399,7 +398,7 @@ impl Default for ConfigFile {
             },
             patches: PatchesSettings {
                 enabled: true,
-                directory: Some(config_dir.join("patches")),
+                directory: Some(crate::paths::patches_dir()),
             },
             executor: ExecutorSettings {
                 max_concurrent_tasks: DEFAULT_EXECUTOR_MAX_CONCURRENT_TASKS,

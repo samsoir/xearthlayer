@@ -84,6 +84,16 @@ enum Commands {
         action: CacheAction,
     },
 
+    /// Move configuration and resources between layouts
+    Migrate {
+        #[command(subcommand)]
+        action: Option<commands::migrate::MigrateAction>,
+
+        /// Show what would change without changing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Scenery index cache management commands
     #[command(name = "scenery-index")]
     SceneryIndex {
@@ -179,6 +189,7 @@ fn command_name(command: &Option<Commands>) -> &'static str {
         Some(Commands::Setup) => "setup",
         Some(Commands::Config { .. }) => "config",
         Some(Commands::Cache { .. }) => "cache",
+        Some(Commands::Migrate { .. }) => "migrate",
         Some(Commands::SceneryIndex { .. }) => "scenery-index",
         Some(Commands::Diagnostics) => "diagnostics",
         Some(Commands::Publish { .. }) => "publish",
@@ -251,6 +262,7 @@ fn main() -> ExitCode {
         Some(Commands::Setup) => commands::setup::run(),
         Some(Commands::Config { command }) => commands::config::run(command),
         Some(Commands::Cache { action }) => commands::cache::run(action),
+        Some(Commands::Migrate { action, dry_run }) => commands::migrate::run(action, dry_run),
         Some(Commands::SceneryIndex { action }) => commands::scenery_index::run(action),
         Some(Commands::Diagnostics) => commands::diagnostics::run(),
         Some(Commands::Publish { command }) => commands::publish::run(command),

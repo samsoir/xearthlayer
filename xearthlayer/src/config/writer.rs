@@ -60,6 +60,11 @@ pub(super) fn to_config_string(config: &ConfigFile) -> String {
 ; When enabled, performs a single HTTP request once per day (no telemetry)
 update_check = {}
 
+; Directory layout this configuration conforms to. Managed automatically:
+; 0 means the layout predates versioning and files still live in ~/.xearthlayer.
+; Do not edit unless you are recovering from a failed migration.
+layout_version = {}
+
 [provider]
 ; Imagery provider:
 ;   apple  - Apple Maps (free, tokens auto-acquired via DuckDuckGo)
@@ -137,7 +142,8 @@ scenery_dir = {}
 ; URL to the XEarthLayer package library index
 ; This is where available packages are discovered for 'xearthlayer packages check/install'
 library_url = {}
-; Local directory for installed packages (default: ~/.xearthlayer/packages)
+; Local directory for installed packages
+; Default: {packages_default}
 install_location = {}
 ; X-Plane Custom Scenery directory for overlay symlinks
 ; If empty, uses xplane.scenery_dir or auto-detects
@@ -150,14 +156,16 @@ auto_install_overlays = {}
 ; X-Plane reads is suppressed. Use this when running third-party overlay
 ; scenery (e.g., SimHeaven) that conflicts with XEL overlays. (default: false)
 disable_overlays = {}
-; Temporary directory for package downloads (default: ~/.xearthlayer/tmp)
+; Temporary directory for package downloads
+; Default: {temp_default}
 ; Large packages are downloaded here before extraction
 temp_dir = {}
 ; Number of concurrent part downloads (1-10, default: 5)
 concurrent_downloads = {}
 
 [logging]
-; Log file path (default: ~/.xearthlayer/xearthlayer.log)
+; Log file path
+; Default: {log_default}
 file = {}
 
 [prefetch]
@@ -232,7 +240,8 @@ grid_cols = {}
 ; Enable/disable patches functionality (default: true)
 ; When enabled, XEL will mount patch tiles from the patches directory.
 enabled = {}
-; Directory containing patch tiles (default: ~/.xearthlayer/patches)
+; Directory containing patch tiles
+; Default: {patches_default}
 ; Each subdirectory should be a complete Ortho4XP tile with:
 ;   - Earth nav data/*.dsf (custom mesh/elevation)
 ;   - terrain/*.ter (terrain definition files)
@@ -253,6 +262,7 @@ max_background = {}
 congestion_threshold = {}
 "#,
         update_check,
+        config.general.layout_version,
         config.provider.provider_type,
         google_api_key,
         mapbox_access_token,
@@ -307,6 +317,10 @@ congestion_threshold = {}
         // FUSE settings
         config.fuse.max_background,
         config.fuse.congestion_threshold,
+        packages_default = path_to_string(&crate::paths::packages_dir()),
+        temp_default = path_to_string(&crate::paths::temp_dir()),
+        log_default = path_to_string(&crate::paths::log_file()),
+        patches_default = path_to_string(&crate::paths::patches_dir()),
     )
 }
 
@@ -365,7 +379,7 @@ mod tests {
     fn test_patches_config_defaults() {
         let config = ConfigFile::default();
         assert!(config.patches.enabled);
-        // Default directory is ~/.xearthlayer/patches
+        // Default directory comes from the paths resolver
         assert!(config.patches.directory.is_some());
         let dir = config.patches.directory.unwrap();
         assert!(dir.ends_with("patches"));

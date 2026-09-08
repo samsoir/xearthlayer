@@ -8,6 +8,7 @@ use std::str::FromStr;
 use thiserror::Error;
 
 use super::file::ConfigFile;
+use super::parser::expand_tilde;
 use super::size::{format_size, parse_size};
 use crate::dds::DdsFormat;
 
@@ -39,6 +40,7 @@ pub enum ConfigKeyError {
 pub enum ConfigKey {
     // General settings
     GeneralUpdateCheck,
+    GeneralLayoutVersion,
 
     // Provider settings
     ProviderType,
@@ -124,6 +126,7 @@ impl FromStr for ConfigKey {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "general.update_check" => Ok(ConfigKey::GeneralUpdateCheck),
+            "general.layout_version" => Ok(ConfigKey::GeneralLayoutVersion),
 
             "provider.type" => Ok(ConfigKey::ProviderType),
             "provider.google_api_key" => Ok(ConfigKey::ProviderGoogleApiKey),
@@ -204,6 +207,7 @@ impl ConfigKey {
     pub fn name(&self) -> &'static str {
         match self {
             ConfigKey::GeneralUpdateCheck => "general.update_check",
+            ConfigKey::GeneralLayoutVersion => "general.layout_version",
             ConfigKey::ProviderType => "provider.type",
             ConfigKey::ProviderGoogleApiKey => "provider.google_api_key",
             ConfigKey::ProviderMapboxAccessToken => "provider.mapbox_access_token",
@@ -295,6 +299,7 @@ impl ConfigKey {
     pub fn get(&self, config: &ConfigFile) -> String {
         match self {
             ConfigKey::GeneralUpdateCheck => config.general.update_check.to_string(),
+            ConfigKey::GeneralLayoutVersion => config.general.layout_version.to_string(),
             ConfigKey::ProviderType => config.provider.provider_type.clone(),
             ConfigKey::ProviderGoogleApiKey => {
                 config.provider.google_api_key.clone().unwrap_or_default()
@@ -421,6 +426,11 @@ impl ConfigKey {
             ConfigKey::GeneralUpdateCheck => {
                 let v = value.to_lowercase();
                 config.general.update_check = v == "true" || v == "1" || v == "yes" || v == "on";
+            }
+            ConfigKey::GeneralLayoutVersion => {
+                if let Ok(n) = value.trim().parse::<u32>() {
+                    config.general.layout_version = n;
+                }
             }
             ConfigKey::ProviderType => {
                 config.provider.provider_type = value.to_lowercase();
@@ -598,6 +608,7 @@ impl ConfigKey {
     fn specification(&self) -> Box<dyn ValueSpecification> {
         match self {
             ConfigKey::GeneralUpdateCheck => Box::new(BooleanSpec),
+            ConfigKey::GeneralLayoutVersion => Box::new(PositiveIntegerSpec),
             ConfigKey::ProviderType => Box::new(OneOfSpec::new(&[
                 "apple", "arcgis", "bing", "go2", "google", "mapbox", "usgs",
             ])),
@@ -670,6 +681,7 @@ impl ConfigKey {
     pub fn all() -> &'static [ConfigKey] {
         &[
             ConfigKey::GeneralUpdateCheck,
+            ConfigKey::GeneralLayoutVersion,
             ConfigKey::ProviderType,
             ConfigKey::ProviderGoogleApiKey,
             ConfigKey::ProviderMapboxAccessToken,
@@ -939,16 +951,6 @@ impl ValueSpecification for OptionalUrlSpec {
 // Helper Functions
 // ============================================================================
 
-/// Expand ~ to home directory in paths.
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(stripped) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped);
-        }
-    }
-    PathBuf::from(path)
-}
-
 /// Convert path to display string, collapsing home dir to ~.
 fn path_to_display(path: &Path) -> String {
     if let Some(home) = dirs::home_dir() {
@@ -1024,6 +1026,49 @@ mod tests {
         assert!(!ConfigKey::PackagesLibraryUrl.is_sensitive());
         assert!(!ConfigKey::LoggingFile.is_sensitive());
         assert!(!ConfigKey::PrefetchEnabled.is_sensitive());
+    }
+
+    #[test]
+    fn layout_version_round_trips_through_get_and_set() {
+        let mut config = ConfigFile::default();
+        assert_eq!(ConfigKey::GeneralLayoutVersion.get(&config), "0");
+        ConfigKey::GeneralLayoutVersion
+            .set(&mut config, "1")
+            .unwrap();
+        assert_eq!(config.general.layout_version, 1);
+        assert_eq!(ConfigKey::GeneralLayoutVersion.get(&config), "1");
+    }
+
+    #[test]
+    fn layout_version_rejects_a_non_numeric_value() {
+        let mut config = ConfigFile::default();
+        assert!(ConfigKey::GeneralLayoutVersion
+            .set(&mut config, "one")
+            .is_err());
+        assert_eq!(
+            config.general.layout_version, 0,
+            "a rejected value changes nothing"
+        );
+    }
+
+    #[test]
+    fn layout_version_is_enumerated_so_config_upgrade_knows_it() {
+        // ConfigKey::all() is the valid-key set analyze_config compares
+        // against. A key absent from it reads as unknown rather than missing,
+        // which is a quieter failure than it sounds.
+        assert!(
+            ConfigKey::all().contains(&ConfigKey::GeneralLayoutVersion),
+            "every key must be enumerated or config upgrade misreports it"
+        );
+        assert_eq!(
+            ConfigKey::all().len(),
+            ConfigKey::all()
+                .iter()
+                .map(|k| k.name())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            "enumerated keys must be unique"
+        );
     }
 
     #[test]

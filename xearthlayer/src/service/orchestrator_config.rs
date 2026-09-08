@@ -167,12 +167,11 @@ impl OrchestratorConfig {
     ) -> Self {
         // Determine patches directory
         let patches_dir = if config.patches.enabled {
-            config.patches.directory.clone().unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join(".xearthlayer")
-                    .join("patches")
-            })
+            config
+                .patches
+                .directory
+                .clone()
+                .unwrap_or_else(crate::paths::patches_dir)
         } else {
             // Use a non-existent path when patches are disabled
             PathBuf::from("/nonexistent")

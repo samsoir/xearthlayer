@@ -6,7 +6,7 @@
 
 use crate::error::CliError;
 use std::path::PathBuf;
-use xearthlayer::config::{config_directory, config_file_path, ConfigFileError};
+use xearthlayer::config::{config_file_path, ConfigFileError};
 use xearthlayer::preflight::{BootstrapContext, PreflightError, RunOutcome, Runner};
 
 /// Check names.
@@ -15,10 +15,13 @@ use xearthlayer::preflight::{BootstrapContext, PreflightError, RunOutcome, Runne
 /// dispatches on them: a typo would silently fall through to the generic arm
 /// and change what the user sees.
 pub mod config;
+pub mod migrate;
 pub mod paths;
+pub mod proposal;
 pub mod system;
 
 pub mod names {
+    pub const LAYOUT_MIGRATION: &str = "layout-migration";
     pub const FIRST_RUN: &str = "first-run";
     pub const LOAD_CONFIG: &str = "load-config";
     pub const LOG_STARTUP: &str = "log-startup";
@@ -30,6 +33,17 @@ pub mod names {
     pub const AIRPORT_ICAO: &str = "airport-icao";
     pub const MACFUSE_AVAILABLE: &str = "macfuse-available";
     pub const NO_RUNNING_INSTANCE: &str = "no-running-instance";
+}
+
+/// The pre-0.5.0 installation directory.
+///
+/// Distinct from [`legacy_default_packages_dir`]: this is the directory the
+/// migration reads from, that one is how `first-run` recognises an installation
+/// that predates the new layout.
+pub fn legacy_install_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".xearthlayer")
 }
 
 /// The legacy default package directory.
@@ -56,6 +70,8 @@ pub fn legacy_default_packages_dir() -> PathBuf {
 /// one place also means a test fabricating an environment is told, by the
 /// compiler, everything it has to fabricate.
 pub struct RegistryEnv {
+    /// The pre-0.5.0 directory, for detecting and migrating an old install.
+    pub legacy_dir: PathBuf,
     pub config_path: PathBuf,
     pub legacy_packages_dir: PathBuf,
     pub lock_path: PathBuf,
@@ -67,6 +83,7 @@ impl RegistryEnv {
     /// The real environment.
     pub fn production() -> Self {
         Self {
+            legacy_dir: legacy_install_dir(),
             config_path: config_file_path(),
             legacy_packages_dir: legacy_default_packages_dir(),
             lock_path: default_lock_path(),
@@ -88,6 +105,7 @@ pub fn build_registry() -> Runner<BootstrapContext> {
 /// load-bearing and was previously implicit in the shape of one function.
 pub fn build_registry_with(env: RegistryEnv) -> Runner<BootstrapContext> {
     let RegistryEnv {
+        legacy_dir,
         config_path,
         legacy_packages_dir,
         lock_path,
@@ -96,6 +114,13 @@ pub fn build_registry_with(env: RegistryEnv) -> Runner<BootstrapContext> {
     } = env;
 
     let mut runner = Runner::new();
+
+    // First. FirstRun tests the configuration file at the resolver's path, so
+    // an unmigrated installation would read as a fresh one.
+    runner.register(Box::new(migrate::LayoutMigration::automatic(
+        legacy_dir,
+        Box::new(xearthlayer::paths::layout_snapshot()),
+    )));
     runner.register(Box::new(config::FirstRun::with_paths(
         config_path.clone(),
         legacy_packages_dir,
@@ -125,7 +150,7 @@ pub fn build_registry_with(env: RegistryEnv) -> Runner<BootstrapContext> {
 
 /// Where the instance lock lives.
 pub fn default_lock_path() -> PathBuf {
-    config_directory().join("xearthlayer.lock")
+    xearthlayer::paths::lock_file()
 }
 
 /// Run every applicable prerequisite for this command.
@@ -269,6 +294,9 @@ mod tests {
         )
         .unwrap();
         let env = RegistryEnv {
+            // Absent: there is nothing to migrate, which is the state a
+            // complete environment is in.
+            legacy_dir: dir.path().join("no-legacy-install"),
             config_path,
             legacy_packages_dir: dir.path().join("no-legacy-packages"),
             lock_path: dir.path().join("xearthlayer.lock"),
@@ -281,6 +309,7 @@ mod tests {
     /// An environment in which nothing exists.
     fn fabricate_empty_environment(dir: &tempfile::TempDir) -> RegistryEnv {
         RegistryEnv {
+            legacy_dir: dir.path().join("no-legacy-install"),
             config_path: dir.path().join("absent.ini"),
             legacy_packages_dir: dir.path().join("absent-packages"),
             lock_path: dir.path().join("xearthlayer.lock"),
@@ -344,6 +373,7 @@ mod tests {
         assert_eq!(
             order,
             vec![
+                names::LAYOUT_MIGRATION,
                 names::FIRST_RUN,
                 names::LOAD_CONFIG,
                 names::LOG_STARTUP,
@@ -366,10 +396,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let registry = build_registry_with(fabricate_empty_environment(&dir));
         let ctx = BootstrapContext::new("setup", None);
-        assert!(
-            registry.report(&ctx).is_empty(),
-            "no run prerequisite may apply to setup, found {:?}",
-            registry.report(&ctx)
+        let applying: Vec<String> = registry
+            .report(&ctx)
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        assert_eq!(
+            applying,
+            vec![names::LAYOUT_MIGRATION],
+            "setup must inherit the layout migration and nothing else: the \
+             wizard needs the migrated layout, but it exists to create the \
+             state every other prerequisite requires"
         );
     }
 
@@ -409,6 +446,7 @@ mod tests {
     #[test]
     fn check_names_are_unique() {
         let all = [
+            names::LAYOUT_MIGRATION,
             names::FIRST_RUN,
             names::LOAD_CONFIG,
             names::LOG_STARTUP,

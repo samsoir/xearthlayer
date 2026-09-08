@@ -50,7 +50,7 @@ Output:
 XEarthLayer v0.2.11
 ========================================
 
-Packages:       /home/user/.xearthlayer/packages
+Packages:       /home/user/.local/share/xearthlayer/packages
 Custom Scenery: /home/user/X-Plane 12/Custom Scenery
 DDS Format:     BC1
 Provider:       Bing Maps
@@ -80,7 +80,7 @@ Press Ctrl+C to stop.
 
 ### What `run` Does
 
-1. Reads your configuration from `~/.xearthlayer/config.ini`
+1. Reads your configuration from `~/.config/xearthlayer/config.ini`
 2. Discovers installed ortho packages from `install_location`
 3. Creates a single consolidated FUSE mount (`zzXEL_ortho`) combining patches and all ortho packages
 4. Creates consolidated overlay symlinks (`yzXEL_overlay`) for all overlay packages
@@ -114,7 +114,7 @@ To get started:
 Example:
   xearthlayer packages install na    # Install North America
 
-Packages will be installed to: /home/user/.xearthlayer/packages
+Packages will be installed to: /home/user/.local/share/xearthlayer/packages
 ```
 
 ## Advanced: Single Package Mode (`start`)
@@ -196,7 +196,7 @@ Press `c` during pre-warm to cancel and proceed directly to normal operation. Pr
 
 ### Configuration
 
-The pre-warm radius can be adjusted in `~/.xearthlayer/config.ini`:
+The pre-warm radius can be adjusted in `~/.config/xearthlayer/config.ini`:
 
 ```ini
 [prewarm]
@@ -242,7 +242,7 @@ XEarthLayer downloads and encodes multiple tiles in parallel:
 - Default: 8 worker threads
 - Each tile: 256 chunk downloads
 
-Configure in `~/.xearthlayer/config.ini`:
+Configure in `~/.config/xearthlayer/config.ini`:
 
 ```ini
 [generation]
@@ -315,7 +315,7 @@ xearthlayer scenery-index clear
 
 ## Imagery Providers
 
-Configure the default provider in `~/.xearthlayer/config.ini` or override at runtime:
+Configure the default provider in `~/.config/xearthlayer/config.ini` or override at runtime:
 
 ### Bing Maps (Default)
 
@@ -448,14 +448,14 @@ The first time you run v0.2.11+, XEarthLayer will attempt to clean up old mount 
 View logs in real-time:
 
 ```bash
-tail -f ~/.xearthlayer/xearthlayer.log
+tail -f ~/.local/state/xearthlayer/xearthlayer.log
 ```
 
 Log location can be configured:
 
 ```ini
 [logging]
-file = ~/.xearthlayer/xearthlayer.log
+file = ~/.local/state/xearthlayer/xearthlayer.log
 ```
 
 ## Common Issues

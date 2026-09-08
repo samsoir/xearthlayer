@@ -131,7 +131,7 @@ xearthlayer setup
 The wizard will guide you through:
 
 1. **X-Plane Custom Scenery** - Auto-detects your X-Plane 12 installation or lets you specify the path
-2. **Package Location** - Where to store scenery packages (default: `~/.xearthlayer/packages`)
+2. **Package Location** - Where to store scenery packages (default: `~/.local/share/xearthlayer/packages`)
 3. **Cache Location** - Where to store cached tiles with storage type detection (NVMe/SSD/HDD)
 4. **System Configuration** - Recommends optimal memory and disk cache sizes based on your hardware
 
@@ -142,10 +142,10 @@ The wizard detects your system's CPU, memory, and storage type to recommend the 
 If you prefer manual setup:
 
 ```bash
-xearthlayer init  # Creates ~/.xearthlayer/config.ini with defaults
+xearthlayer init  # Creates ~/.config/xearthlayer/config.ini with defaults
 ```
 
-Then edit `~/.xearthlayer/config.ini`:
+Then edit `~/.config/xearthlayer/config.ini`:
 
 ```ini
 [xplane]
@@ -214,7 +214,7 @@ xearthlayer run
 XEarthLayer v0.1.0
 ========================================
 
-Packages:       /home/user/.xearthlayer/packages
+Packages:       /home/user/.local/share/xearthlayer/packages
 Custom Scenery: /home/user/X-Plane 12/Custom Scenery
 DDS Format:     BC1
 Provider:       Bing Maps

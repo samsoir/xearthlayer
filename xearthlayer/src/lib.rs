@@ -38,6 +38,7 @@ pub mod ortho_union;
 pub mod package;
 pub mod panic;
 pub mod patches;
+pub mod paths;
 pub mod prefetch;
 pub mod preflight;
 pub mod provider;
