@@ -20,6 +20,7 @@ use xearthlayer::preflight::BootstrapContext;
 /// and change what the user sees.
 pub mod config;
 pub mod paths;
+pub mod system;
 
 pub mod names {
     pub const FIRST_RUN: &str = "first-run";
