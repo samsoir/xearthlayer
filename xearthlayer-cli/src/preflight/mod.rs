@@ -17,6 +17,7 @@ use xearthlayer::preflight::{BootstrapContext, PreflightError, RunOutcome, Runne
 pub mod config;
 pub mod migrate;
 pub mod paths;
+pub mod proposal;
 pub mod system;
 
 pub mod names {

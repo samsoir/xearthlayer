@@ -51,16 +51,6 @@ impl LayoutMigration {
         self.target.config_dir().join("config.ini")
     }
 
-    /// Pin a legacy default that holds data, so nothing is stranded.
-    ///
-    /// Only when the configuration does not already say where the resource is:
-    /// an explicit setting is the user's answer and is never overwritten.
-    fn pin_if_populated(current: &mut Option<PathBuf>, legacy: &Path) {
-        if current.is_none() && legacy.exists() {
-            *current = Some(legacy.to_path_buf());
-        }
-    }
-
     fn write_marker(&self, migrated_to: &Path) -> std::io::Result<()> {
         let body = format!(
             "XEarthLayer moved its files out of this directory.\n\
@@ -103,6 +93,83 @@ impl LayoutMigration {
             self.target_config_file().display(),
         );
         std::fs::write(&path, notice + &body)
+    }
+}
+
+impl LayoutMigration {
+    /// Show the proposed layout and let the user change it.
+    ///
+    /// One screen, one confirmation, and anything they disagree with can be
+    /// changed individually. **Keep is the standing default throughout**, so
+    /// pressing Enter can never break a working installation.
+    ///
+    /// Without a terminal this does not guess and does not block: the proposal
+    /// stands, which is a no-op that is always correct, and the user is told
+    /// how to review it later. A migration that hung waiting for input under a
+    /// service manager would be worse than one that deferred a question.
+    fn negotiate(
+        &self,
+        mut proposals: Vec<super::proposal::ResourceProposal>,
+    ) -> Vec<super::proposal::ResourceProposal> {
+        use super::proposal::{negotiable, render, toggle};
+        use std::io::IsTerminal;
+
+        let pending = negotiable(&proposals);
+        println!();
+        println!("XEarthLayer is moving to the standard directories for your system.");
+        println!();
+        print!("{}", render(&proposals));
+        println!();
+
+        if pending.is_empty() {
+            return proposals;
+        }
+
+        if !std::io::stdin().is_terminal() {
+            println!(
+                "Some locations were kept where they are. Run 'xearthlayer migrate' \
+                 from a terminal to review them."
+            );
+            println!();
+            return proposals;
+        }
+
+        let theme = dialoguer::theme::ColorfulTheme::default();
+        loop {
+            let accept = dialoguer::Confirm::with_theme(&theme)
+                .with_prompt("Use this layout?")
+                .default(true)
+                .interact()
+                .unwrap_or(true);
+            if accept {
+                return proposals;
+            }
+
+            let choices: Vec<String> = pending
+                .iter()
+                .map(|&i| {
+                    let p = &proposals[i];
+                    format!(
+                        "{}: {}",
+                        p.resource.label(),
+                        p.effective_path().unwrap_or_default().display()
+                    )
+                })
+                .collect();
+
+            let Ok(picked) = dialoguer::Select::with_theme(&theme)
+                .with_prompt("Which location should change?")
+                .items(&choices)
+                .default(0)
+                .interact()
+            else {
+                return proposals;
+            };
+            toggle(&mut proposals[pending[picked]]);
+            println!();
+            print!("{}", render(&proposals));
+            println!();
+        }
     }
 }
 
@@ -165,18 +232,16 @@ impl Preflight<BootstrapContext> for LayoutMigration {
             )
         })?;
 
-        // Pin what holds data, so accepting the migration cannot break a
-        // working installation. Packages and patches are user data we will not
-        // move; the log, the staging directory and the index caches are
-        // regenerable and adopt the new locations silently.
-        Self::pin_if_populated(
-            &mut config.packages.install_location,
-            &self.legacy_dir.join("packages"),
-        );
-        Self::pin_if_populated(
-            &mut config.patches.directory,
-            &self.legacy_dir.join("patches"),
-        );
+        // The decision table decides; this only writes the answer. Keeping the
+        // two apart is what lets the governing invariant, that accepting the
+        // proposal never breaks a working installation, be asserted directly
+        // rather than inferred from what a prompt rendered.
+        let proposals =
+            super::proposal::propose(&config, &self.legacy_dir, self.target.as_ref(), |p| {
+                p.exists()
+            });
+        let proposals = self.negotiate(proposals);
+        super::proposal::apply(&proposals, &mut config);
 
         config.general.layout_version = LAYOUT_VERSION;
 
@@ -367,9 +432,14 @@ mod tests {
         c.remediate(&mut BootstrapContext::new("run", None))
             .unwrap();
         let config = ConfigFile::load_from(&c.target_config_file()).unwrap();
-        assert!(
-            config.packages.install_location.is_none(),
-            "nothing to pin, so the new default applies"
+        assert_eq!(
+            config.packages.install_location,
+            Some(xearthlayer::paths::packages_dir_in(
+                &TestDirectories::rooted_at(
+                    c.target_config_file().parent().unwrap().parent().unwrap()
+                )
+            )),
+            "nothing to pin, so it adopts the new location and says so explicitly"
         );
     }
 
