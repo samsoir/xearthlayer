@@ -65,6 +65,52 @@ fn home() -> PathBuf {
 // Role accessors. Each `_in` variant takes an explicit layout so tests never
 // read a real home directory; the bare variant uses the active layout.
 
+/// The layout in force for this process.
+///
+/// Exposed so the migration can name the target it is writing to, and so a test
+/// can substitute one. Everything else should use the role accessors below
+/// rather than composing paths from this.
+pub fn layout() -> &'static dyn BaseDirectories {
+    active()
+}
+
+/// An owned copy of the active layout.
+///
+/// [`layout`] borrows for the process lifetime, which suits a reader. Anything
+/// that has to *store* the layout, such as the migration, needs its own, and a
+/// test substitutes a different one in the same slot.
+pub fn layout_snapshot() -> impl BaseDirectories {
+    let l = layout();
+    Snapshot {
+        config: l.config_dir(),
+        cache: l.cache_dir(),
+        data: l.data_dir(),
+        state: l.state_dir(),
+    }
+}
+
+struct Snapshot {
+    config: PathBuf,
+    cache: PathBuf,
+    data: PathBuf,
+    state: PathBuf,
+}
+
+impl BaseDirectories for Snapshot {
+    fn config_dir(&self) -> PathBuf {
+        self.config.clone()
+    }
+    fn cache_dir(&self) -> PathBuf {
+        self.cache.clone()
+    }
+    fn data_dir(&self) -> PathBuf {
+        self.data.clone()
+    }
+    fn state_dir(&self) -> PathBuf {
+        self.state.clone()
+    }
+}
+
 /// The directory holding user-editable configuration.
 ///
 /// Exposed as a directory because two callers legitimately need the directory
