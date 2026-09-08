@@ -34,11 +34,28 @@ const MARKER: &str = "MIGRATED.txt";
 pub struct LayoutMigration {
     legacy_dir: PathBuf,
     target: Box<dyn BaseDirectories>,
+    /// Whether this registration is the automatic one run before dispatch.
+    automatic: bool,
 }
 
 impl LayoutMigration {
-    pub fn new(legacy_dir: PathBuf, target: Box<dyn BaseDirectories>) -> Self {
-        Self { legacy_dir, target }
+    /// The registration in the bootstrap registry, run before dispatch.
+    pub fn automatic(legacy_dir: PathBuf, target: Box<dyn BaseDirectories>) -> Self {
+        Self {
+            legacy_dir,
+            target,
+            automatic: true,
+        }
+    }
+
+    /// The registration used by `xearthlayer migrate`, which the user asked for
+    /// explicitly and which therefore applies to that command.
+    pub fn on_demand(legacy_dir: PathBuf, target: Box<dyn BaseDirectories>) -> Self {
+        Self {
+            legacy_dir,
+            target,
+            automatic: false,
+        }
     }
 
     /// The legacy `config.ini`.
@@ -202,14 +219,20 @@ impl Preflight<BootstrapContext> for LayoutMigration {
         Cow::Borrowed(names::LAYOUT_MIGRATION)
     }
 
-    /// **Every command**, unlike every other check.
+    /// **Every command except `migrate` itself.**
     ///
-    /// `run` and the setup wizard each decide independently whether an
-    /// installation exists, and `config`, `packages` and `diagnostics` all read
-    /// paths. A migration that applied only to `run` would leave `setup`
-    /// treating a user as new.
-    fn applies(&self, _ctx: &BootstrapContext) -> bool {
-        true
+    /// Unlike every other check, this applies beyond `run`: the setup wizard
+    /// decides independently whether an installation exists, and `config`,
+    /// `packages` and `diagnostics` all read paths. A migration scoped to `run`
+    /// would leave `setup` treating a migrated user as new.
+    ///
+    /// `migrate` is the exception, and only for the automatic registration.
+    /// The bootstrap registry executes before command dispatch, so migrating
+    /// there would run the migration before `migrate --dry-run` could report on
+    /// it, and the dry run would describe work it had already done. The
+    /// on-demand registration the command builds for itself applies normally.
+    fn applies(&self, ctx: &BootstrapContext) -> bool {
+        !(self.automatic && ctx.command() == "migrate")
     }
 
     fn inspect(&self, _ctx: &BootstrapContext) -> Status {
@@ -324,7 +347,7 @@ mod tests {
     }
 
     fn check(f: &Fixture) -> LayoutMigration {
-        LayoutMigration::new(
+        LayoutMigration::automatic(
             f.legacy.clone(),
             Box::new(TestDirectories::rooted_at(
                 f.base.config_dir().parent().unwrap(),
@@ -498,6 +521,29 @@ mod tests {
                 "{command} needs the migrated layout too"
             );
         }
+    }
+
+    #[test]
+    fn migration_does_not_apply_to_the_migrate_command_itself() {
+        // The registry runs before dispatch. If this applied, the automatic
+        // migration would already have run by the time `migrate --dry-run`
+        // reported, so the dry run would describe work it had just done.
+        let f = fixture();
+        assert!(!check(&f).applies(&BootstrapContext::new("migrate", None)));
+    }
+
+    #[test]
+    fn the_on_demand_registration_applies_to_the_migrate_command() {
+        // The command builds its own registration precisely so that asking for
+        // a migration runs one.
+        let f = fixture();
+        let c = LayoutMigration::on_demand(
+            f.legacy.clone(),
+            Box::new(TestDirectories::rooted_at(
+                f.base.config_dir().parent().unwrap(),
+            )),
+        );
+        assert!(c.applies(&BootstrapContext::new("migrate", None)));
     }
 
     #[test]

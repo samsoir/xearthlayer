@@ -20,6 +20,7 @@ pub mod common;
 pub mod config;
 pub mod diagnostics;
 pub mod init;
+pub mod migrate;
 pub mod packages;
 pub mod patches;
 pub mod publish;

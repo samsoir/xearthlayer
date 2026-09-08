@@ -117,7 +117,7 @@ pub fn build_registry_with(env: RegistryEnv) -> Runner<BootstrapContext> {
 
     // First. FirstRun tests the configuration file at the resolver's path, so
     // an unmigrated installation would read as a fresh one.
-    runner.register(Box::new(migrate::LayoutMigration::new(
+    runner.register(Box::new(migrate::LayoutMigration::automatic(
         legacy_dir,
         Box::new(xearthlayer::paths::layout_snapshot()),
     )));
