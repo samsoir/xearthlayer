@@ -328,7 +328,7 @@ xearthlayer run --no-prefetch       # Disable prefetch system
 xearthlayer run --airport ICAO      # Pre-warm tiles around airport before starting
 xearthlayer download --lat --lon    # Download single tile
 xearthlayer diagnostics             # Show system info, config, and health status
-xearthlayer cache clear|stats|migrate # Cache management ('migrate' is deprecated, see #268)
+xearthlayer cache clear|stats       # Cache management
 xearthlayer migrate [layout|status]  # Move between directory layouts (--dry-run supported)
 
 # Scenery index cache
