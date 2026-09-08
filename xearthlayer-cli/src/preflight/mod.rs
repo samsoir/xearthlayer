@@ -19,6 +19,7 @@ use xearthlayer::preflight::BootstrapContext;
 /// dispatches on them: a typo would silently fall through to the generic arm
 /// and change what the user sees.
 pub mod config;
+pub mod paths;
 
 pub mod names {
     pub const FIRST_RUN: &str = "first-run";
