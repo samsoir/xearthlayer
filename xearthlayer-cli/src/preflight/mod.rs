@@ -6,7 +6,7 @@
 
 use crate::error::CliError;
 use std::path::PathBuf;
-use xearthlayer::config::{config_file_path, ConfigFileError};
+use xearthlayer::config::{config_directory, config_file_path, ConfigFileError};
 use xearthlayer::preflight::{BootstrapContext, PreflightError, RunOutcome, Runner};
 
 /// Check names.
@@ -29,6 +29,7 @@ pub mod names {
     pub const CUSTOM_SCENERY_EXISTS: &str = "custom-scenery-exists";
     pub const AIRPORT_ICAO: &str = "airport-icao";
     pub const MACFUSE_AVAILABLE: &str = "macfuse-available";
+    pub const NO_RUNNING_INSTANCE: &str = "no-running-instance";
 }
 
 /// The legacy default package directory.
@@ -48,15 +49,19 @@ pub fn legacy_default_packages_dir() -> PathBuf {
 /// `commands/run.rs` did inline. It is asserted by test, because it is
 /// load-bearing and was previously implicit in the shape of one function.
 pub fn build_registry() -> Runner<BootstrapContext> {
-    build_registry_with(config_file_path(), legacy_default_packages_dir(), || {
-        xearthlayer::config::detect_custom_scenery().ok()
-    })
+    build_registry_with(
+        config_file_path(),
+        legacy_default_packages_dir(),
+        default_lock_path(),
+        || xearthlayer::config::detect_custom_scenery().ok(),
+    )
 }
 
 /// Build the registry against explicit paths and detector, for tests.
 pub fn build_registry_with(
     config_path: PathBuf,
     legacy_packages_dir: PathBuf,
+    lock_path: PathBuf,
     detect: impl Fn() -> Option<PathBuf> + Send + Sync + 'static,
 ) -> Runner<BootstrapContext> {
     let mut runner = Runner::new();
@@ -75,7 +80,17 @@ pub fn build_registry_with(
     runner.register(Box::new(paths::CustomSceneryExists));
     runner.register(Box::new(system::AirportIcao));
     runner.register(Box::<system::MacFuseAvailable>::default());
+
+    // Last: the lock is claimed only for a run that will actually proceed.
+    // Claiming it earlier would leave a lock behind for a run rejected by a
+    // later prerequisite.
+    runner.register(Box::new(system::NoRunningInstance::new(lock_path)));
     runner
+}
+
+/// Where the instance lock lives.
+pub fn default_lock_path() -> PathBuf {
+    config_directory().join("xearthlayer.lock")
 }
 
 /// Run every applicable prerequisite for this command.
@@ -220,8 +235,12 @@ mod tests {
         // inputs XEarthLayer launches from. Adding a context field with no
         // check to fill it fails here.
         let (dir, config_path) = fabricate_complete_environment();
-        let mut registry =
-            build_registry_with(config_path, dir.path().join("no-legacy-packages"), || None);
+        let mut registry = build_registry_with(
+            config_path,
+            dir.path().join("no-legacy-packages"),
+            dir.path().join("xearthlayer.lock"),
+            || None,
+        );
         let mut ctx = BootstrapContext::new("run", None);
 
         let outcome = registry.enforce(&mut ctx).expect("no remediation failure");
@@ -247,6 +266,7 @@ mod tests {
         let registry = build_registry_with(
             PathBuf::from("/nonexistent/config.ini"),
             PathBuf::from("/nonexistent/packages"),
+            PathBuf::from("/nonexistent/xearthlayer.lock"),
             || None,
         );
         let order: Vec<String> = registry
@@ -267,6 +287,7 @@ mod tests {
                 names::CUSTOM_SCENERY_EXISTS,
                 names::AIRPORT_ICAO,
                 names::MACFUSE_AVAILABLE,
+                names::NO_RUNNING_INSTANCE,
             ]
         );
     }
@@ -278,6 +299,7 @@ mod tests {
         let registry = build_registry_with(
             PathBuf::from("/nonexistent/config.ini"),
             PathBuf::from("/nonexistent/packages"),
+            PathBuf::from("/nonexistent/xearthlayer.lock"),
             || None,
         );
         let ctx = BootstrapContext::new("setup", None);
@@ -294,6 +316,7 @@ mod tests {
         let mut registry = build_registry_with(
             dir.path().join("absent.ini"),
             dir.path().join("absent-packages"),
+            dir.path().join("xearthlayer.lock"),
             || None,
         );
         let mut ctx = BootstrapContext::new("run", None);
@@ -338,6 +361,7 @@ mod tests {
             names::CUSTOM_SCENERY_EXISTS,
             names::AIRPORT_ICAO,
             names::MACFUSE_AVAILABLE,
+            names::NO_RUNNING_INSTANCE,
         ];
         let mut seen: Vec<&str> = all.to_vec();
         seen.sort_unstable();

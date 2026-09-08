@@ -248,10 +248,212 @@ impl Preflight<BootstrapContext> for MacFuseAvailable {
     }
 }
 
+/// Refuse to start while another instance is already running.
+///
+/// Nothing guarded this before: XEarthLayer mounts a filesystem and owns a
+/// cache directory, and a second instance doing the same to the same paths is
+/// not a supported state. #193 needs it specifically, because a configuration
+/// migration must not rewrite paths under a live mount.
+///
+/// # Stale locks never block startup
+///
+/// A lock whose owner is gone is cleared and the run proceeds. The opposite
+/// choice, refusing to start until a user deletes a file, would turn any crash
+/// into an install that appears broken with no obvious cause. That makes a
+/// crash self healing rather than a support ticket, which matters more than
+/// closing the narrow race between the liveness probe and the write.
+pub struct NoRunningInstance {
+    lock_path: PathBuf,
+    is_alive: Box<dyn Fn(u32) -> bool + Send + Sync>,
+}
+
+impl NoRunningInstance {
+    pub fn new(lock_path: PathBuf) -> Self {
+        Self {
+            lock_path,
+            is_alive: Box::new(xearthlayer::system::process::is_alive),
+        }
+    }
+
+    /// Inject the liveness predicate so tests do not depend on which PIDs
+    /// happen to exist on the machine running them.
+    #[cfg(test)]
+    pub fn with_liveness(
+        lock_path: PathBuf,
+        is_alive: impl Fn(u32) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            lock_path,
+            is_alive: Box::new(is_alive),
+        }
+    }
+
+    /// The PID recorded in the lock file, if it holds one.
+    ///
+    /// An unreadable or unparseable lock reads as absent: a corrupt lock should
+    /// be replaced, never treated as a live owner that can never be cleared.
+    fn recorded_pid(&self) -> Option<u32> {
+        std::fs::read_to_string(&self.lock_path)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+}
+
+impl Preflight<BootstrapContext> for NoRunningInstance {
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed(names::NO_RUNNING_INSTANCE)
+    }
+
+    fn applies(&self, ctx: &BootstrapContext) -> bool {
+        ctx.command() == "run"
+    }
+
+    fn inspect(&self, _ctx: &BootstrapContext) -> Status {
+        match self.recorded_pid() {
+            None => Status::unsatisfied("no instance lock is held").remediable(),
+            Some(pid) if pid == std::process::id() => Status::Satisfied,
+            Some(pid) if (self.is_alive)(pid) => {
+                Status::unsatisfied(format!("another instance is already running (pid {})", pid))
+                    .with_hint("Stop the running instance before starting another.")
+            }
+            Some(pid) => {
+                Status::unsatisfied(format!("clearing a stale instance lock from pid {}", pid))
+                    .remediable()
+            }
+        }
+    }
+
+    fn remediate(
+        &self,
+        _ctx: &mut BootstrapContext,
+    ) -> Result<Remedy<BootstrapContext>, PreflightError> {
+        if let Some(parent) = self.lock_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                PreflightError::new(
+                    names::NO_RUNNING_INSTANCE,
+                    format!("Failed to create {}: {}", parent.display(), e),
+                )
+            })?;
+        }
+        std::fs::write(&self.lock_path, std::process::id().to_string()).map_err(|e| {
+            PreflightError::new(
+                names::NO_RUNNING_INSTANCE,
+                format!(
+                    "Failed to write the instance lock at {}: {}",
+                    self.lock_path.display(),
+                    e
+                ),
+            )
+        })?;
+        Ok(Remedy::default())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ---- NoRunningInstance ----
+
+    fn lock_in(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("xearthlayer.lock")
+    }
+
+    #[test]
+    fn no_lock_asks_to_claim_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let check = NoRunningInstance::with_liveness(lock_in(&dir), |_| true);
+        assert!(matches!(
+            check.inspect(&BootstrapContext::new("run", None)),
+            Status::Unsatisfied {
+                remediable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_live_owner_blocks_startup_and_is_not_remediable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(lock_in(&dir), "4242").unwrap();
+        let check = NoRunningInstance::with_liveness(lock_in(&dir), |pid| pid == 4242);
+        match check.inspect(&BootstrapContext::new("run", None)) {
+            Status::Unsatisfied {
+                reason,
+                remediable,
+                hint,
+            } => {
+                assert!(!remediable, "we must not evict a running instance");
+                assert!(reason.contains("pid 4242"), "{reason}");
+                assert!(hint.is_some());
+            }
+            other => panic!("expected Unsatisfied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stale_lock_is_cleared_rather_than_blocking() {
+        // A crash must not leave an installation that looks broken.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(lock_in(&dir), "4242").unwrap();
+        let check = NoRunningInstance::with_liveness(lock_in(&dir), |_| false);
+        let mut ctx = BootstrapContext::new("run", None);
+
+        assert!(matches!(
+            check.inspect(&ctx),
+            Status::Unsatisfied {
+                remediable: true,
+                ..
+            }
+        ));
+        check.remediate(&mut ctx).unwrap();
+        assert_eq!(check.inspect(&ctx), Status::Satisfied);
+        assert_eq!(
+            std::fs::read_to_string(lock_in(&dir)).unwrap(),
+            std::process::id().to_string()
+        );
+    }
+
+    #[test]
+    fn our_own_lock_is_satisfied_not_a_second_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(lock_in(&dir), std::process::id().to_string()).unwrap();
+        let check = NoRunningInstance::with_liveness(lock_in(&dir), |_| true);
+        assert_eq!(
+            check.inspect(&BootstrapContext::new("run", None)),
+            Status::Satisfied
+        );
+    }
+
+    #[test]
+    fn a_corrupt_lock_is_replaced_not_treated_as_a_live_owner() {
+        // Otherwise a garbled lock would be unclearable and permanently block
+        // startup.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(lock_in(&dir), "not a pid").unwrap();
+        let check = NoRunningInstance::with_liveness(lock_in(&dir), |_| true);
+        assert!(matches!(
+            check.inspect(&BootstrapContext::new("run", None)),
+            Status::Unsatisfied {
+                remediable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn remediation_creates_the_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b").join("xearthlayer.lock");
+        let check = NoRunningInstance::with_liveness(nested.clone(), |_| false);
+        check
+            .remediate(&mut BootstrapContext::new("run", None))
+            .unwrap();
+        assert!(nested.exists());
+    }
 
     // ---- MacFuseAvailable ----
 
