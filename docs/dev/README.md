@@ -15,6 +15,7 @@ Technical documentation for XEarthLayer developers and contributors.
 | Document | Description |
 |----------|-------------|
 | [Job Executor Design](job-executor-design.md) | Job/task framework, daemon architecture, resource pools (v0.3.0+) |
+| [Preflight Design](preflight-design.md) | Startup prerequisite registry, bootstrap context, adding a check (v0.5.0+) |
 | [FUSE Filesystem](fuse-filesystem.md) | Virtual filesystem, consolidated mounting, Direct I/O for DDS |
 | [Coordinate System](coordinate-system.md) | Web Mercator projection, tile math, zoom levels |
 | [DDS Implementation](dds-implementation.md) | BC1/BC3 texture compression, mipmap generation |
