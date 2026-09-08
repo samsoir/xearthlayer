@@ -29,6 +29,7 @@
 pub mod filesystem;
 pub mod gpu;
 mod hardware;
+pub mod process;
 mod recommendations;
 mod storage_detect;
 pub mod unmount;

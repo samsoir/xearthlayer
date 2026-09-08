@@ -172,7 +172,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - TUI dashboard shows persistent footer when update available
     - Configurable via `general.update_check` (default: true)
 
-16. **GeoIndex** (`xearthlayer/src/geo_index/`)
+16. **Preflight Checks** (`xearthlayer/src/preflight/`, `xearthlayer-cli/src/preflight/`)
+    - `Preflight<C>` trait and `Runner<C>` in the library, generic over context; the concrete checks live in the CLI
+    - Executed in `main()` **before command dispatch**, so `run` and `setup` get the same answer to "does this installation exist"
+    - `BootstrapContext` accumulates validated inputs (config, install location, Custom Scenery path); carries **inputs, not constructed services**
+    - Registration order is execution order, asserted by test. No dependency graph
+    - `inspect` is pure and `remediate` acts, so the registry can also be run as a report; remediation is verified by a second inspection
+    - Checks never call one another. A check reading an absent contributed value returns `Unsatisfied` **naming** it rather than unwrapping
+    - Platform exclusion uses `cfg!` in `applies()`, not `#[cfg]`, so macOS-only checks are still compiled and tested on Linux
+    - See `docs/dev/preflight-design.md`
+
+17. **GeoIndex** (`xearthlayer/src/geo_index/`)
     - `GeoIndex` - Type-keyed, region-indexed geospatial reference database (thread-safe, ACID)
     - `DsfRegion` - 1°×1° DSF region coordinate type
     - `GeoLayer` trait - Marker trait for storable layer types (`Clone + Send + Sync + 'static`)
@@ -367,6 +377,8 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/fuse/fuse3/` | Fuse3 async multi-threaded filesystem |
 | `xearthlayer/src/fuse/fuse3/shared.rs` | Shared FUSE traits (FileAttrBuilder, DdsRequestor) |
 | `xearthlayer/src/fuse/fuse3/ortho_union_fs.rs` | Consolidated ortho FUSE mount |
+| `xearthlayer/src/preflight/` | Preflight framework: trait, Runner, BootstrapContext |
+| `xearthlayer-cli/src/preflight/` | The concrete startup checks and the registry |
 | `xearthlayer/src/geo_index/` | GeoIndex geospatial reference database |
 | `xearthlayer/src/ortho_union/` | Ortho union index module |
 | `xearthlayer/src/ortho_union/index.rs` | OrthoUnionIndex implementation |
@@ -495,6 +507,7 @@ matrix jobs are renamed.
 - Package publisher design: `docs/dev/package-publisher-design.md`
 - Zoom level overlap management: `docs/dev/zoom-level-overlap-design.md` (dedupe, gap analysis)
 - **Consolidated FUSE mounting**: `docs/dev/consolidated-mounting-design.md` (single ortho mount, patches + packages)
+- **Preflight checks**: `docs/dev/preflight-design.md` (startup prerequisite registry, bootstrap context, operating principles, how to add a check)
 - **GeoIndex design**: `docs/dev/geo-index-design.md` (geospatial reference database, patch region ownership)
 - **Memory telemetry**: `docs/dev/memory-telemetry.md` (periodic memory sampling, trace interpretation, confounders)
 - **Cache integrity model**: `docs/dev/cache-integrity-design.md` (bounded reads, atomic durable writes, discard-on-reject, shared by every on-disk cache)

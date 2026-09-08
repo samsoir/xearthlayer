@@ -9,15 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Preflight check framework** ([#265](https://github.com/samsoir/xearthlayer/issues/265)): Startup prerequisites are now declared in an ordered registry that runs before command dispatch, rather than accumulating as unnamed conditionals at the top of the `run` command. Placement was the point: `run` and the setup wizard each answered "does this installation exist" independently from the same state, so a check living in `run` alone left `xearthlayer setup` treating an existing user as new and offering to overwrite a working configuration. Checks never call one another. They read from and contribute to a bootstrap context holding the validated inputs XEarthLayer launches from, so a misordered registry names the value it lacked instead of panicking, and inspection is separated from action so the whole registry can also be run as a report.
+
+  Two prerequisites that should have existed and did not are included. **macFUSE presence** on macOS, where a missing or unapproved kernel extension previously surfaced as an opaque mount failure that said nothing about the cause, and now points at the approval steps in `docs/macos.md`. And a **running instance guard**, which nothing provided before, so a second instance could mount the same paths and share a cache directory with the first; a lock whose owner is gone is cleared and the run proceeds, since refusing to start until a user deletes a file would turn any crash into an installation that looks broken. Introducing the framework itself changed no behaviour, verified by diffing five startup scenarios against a binary built from the base commit.
+
 - **macOS (Apple Silicon) release tarball** ([#201](https://github.com/samsoir/xearthlayer/issues/201)): Releases now ship `xearthlayer-<tag>-arm64-macos.tar.gz` on both the stable and pre-release channels. CI gained a blocking `Verify (macOS)` job on `macos-15`, and a macOS packaging failure aborts release publication. The binary is unsigned, so first run needs `xattr -dr com.apple.quarantine ./xearthlayer`. Usable once the macOS port lands.
 
-- **`make verify-macos`**: Runs `make verify` plus the live macFUSE smoke tests that CI structurally cannot execute — macFUSE is a kernel extension and hosted runners cannot load one. Required before promoting a release to stable.
+- **`make verify-macos`**: Runs `make verify` plus the live macFUSE smoke tests that CI structurally cannot execute, because macFUSE is a kernel extension and hosted runners cannot load one. Required before promoting a release to stable.
 
-- **`docs/dev/cicd.md`**: Reference for the build pipeline and merge strategy — branch model, release job graph, platform support tiers, release channels, status checks, and version propagation.
+- **`docs/dev/cicd.md`**: Reference for the build pipeline and merge strategy, covering the branch model, release job graph, platform support tiers, release channels, status checks, and version propagation.
 
 ### Fixed
 
-- **`make bump-version` was broken on macOS and covered only two files**: it used GNU-only `sed -i`, and updated only `Cargo.toml` and `pkg/rpm/xearthlayer.spec`. It now uses a portable in-place rewrite and updates all five version-carrying files — `Cargo.toml`, `Cargo.lock` and `version.json` get the full semver, while `pkg/rpm/xearthlayer.spec` and `pkg/arch/PKGBUILD` get the hyphen-stripped base version, since RPM and Arch version fields cannot contain a hyphen. That missing coverage is why the RPM spec had drifted to `0.2.5` and the PKGBUILD to `0.2.0`; both are now correct.
+- **`make bump-version` was broken on macOS and covered only two files**: it used GNU-only `sed -i`, and updated only `Cargo.toml` and `pkg/rpm/xearthlayer.spec`. It now uses a portable in-place rewrite and updates all five version-carrying files. `Cargo.toml`, `Cargo.lock` and `version.json` get the full semver, while `pkg/rpm/xearthlayer.spec` and `pkg/arch/PKGBUILD` get the hyphen-stripped base version, since RPM and Arch version fields cannot contain a hyphen. That missing coverage is why the RPM spec had drifted to `0.2.5` and the PKGBUILD to `0.2.0`; both are now correct.
 
 ## [0.4.8] - 2026-09-01
 
