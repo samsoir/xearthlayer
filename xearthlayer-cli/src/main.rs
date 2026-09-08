@@ -18,6 +18,7 @@
 mod commands;
 mod error;
 mod logging_init;
+mod preflight;
 mod runner;
 mod tui_app;
 mod ui;
