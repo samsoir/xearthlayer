@@ -119,7 +119,7 @@ Regional Package (installed)          XEarthLayer Service (running)
 1. **Configure XEarthLayer**
    ```bash
    xearthlayer init
-   # Edit ~/.xearthlayer/config.ini with your library_url
+   # Edit ~/.config/xearthlayer/config.ini with your library_url
    ```
 
 2. **Install a regional package**

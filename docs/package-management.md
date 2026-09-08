@@ -11,7 +11,7 @@ Scenery packages are distributed through **package libraries** - index files tha
 
 ## Configuration
 
-Set your library URL in `~/.xearthlayer/config.ini`:
+Set your library URL in `~/.config/xearthlayer/config.ini`:
 
 ```ini
 [xplane]
@@ -19,7 +19,7 @@ scenery_dir = /path/to/X-Plane 12/Custom Scenery
 
 [packages]
 # library_url defaults to https://xearthlayer.app/packages/xearthlayer_package_library.txt
-install_location = ~/.xearthlayer/packages
+install_location = ~/.local/share/xearthlayer/packages
 auto_install_overlays = true
 ```
 
@@ -286,7 +286,7 @@ Installed packages appear in your Custom Scenery folder with names like:
 
 ### Package Installation Methods
 
-**Ortho packages** are installed to the package directory (e.g., `~/.xearthlayer/packages/`) and mounted via FUSE to Custom Scenery when you run `xearthlayer run`.
+**Ortho packages** are installed to the package directory (e.g., `~/.local/share/xearthlayer/packages/`) and mounted via FUSE to Custom Scenery when you run `xearthlayer run`.
 
 **Overlay packages** are installed to the package directory, then a symlink is automatically created in Custom Scenery pointing to the installed package. This allows X-Plane to access the overlay files directly without FUSE.
 

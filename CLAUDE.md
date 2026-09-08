@@ -83,7 +83,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `XEarthLayerService::start()` creates `CacheLayer` with proper metrics ordering
 
 6. **Configuration** (`xearthlayer/src/config/`)
-   - INI file at `~/.xearthlayer/config.ini`
+   - INI file at `~/.config/xearthlayer/config.ini` (Linux, honours `$XDG_CONFIG_HOME`) or `~/Library/Application Support/XEarthLayer/config.ini` (macOS). **Never construct this path**: use `paths::config_file()`
    - Auto-detection of X-Plane installation
    - See `docs/configuration.md` for all settings
 
@@ -168,11 +168,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `UpdateChecker` trait - Abstraction for version checking (dependency injection)
     - `RemoteUpdateChecker` - Production implementation with HTTP fetch and 24h disk cache
     - Non-blocking: spawned on Tokio runtime, never delays startup
-    - Cache at `~/.xearthlayer/version_check.json` (mtime-based 24h expiry)
+    - Cache at `paths::version_check_file()`, in the state directory (mtime-based 24h expiry)
     - TUI dashboard shows persistent footer when update available
     - Configurable via `general.update_check` (default: true)
 
-16. **Preflight Checks** (`xearthlayer/src/preflight/`, `xearthlayer-cli/src/preflight/`)
+16. **Path Resolution** (`xearthlayer/src/paths/`)
+    - `BaseDirectories` trait with `XdgDirectories`, `AppleDirectories`, `LegacyDirectories` and a test double
+    - Four roles: config, cache, data, state. **macOS collapses config and data into one directory** and has no `dirs::state_dir()`, so the platforms differ in shape and not only in values
+    - Role accessors (`config_file()`, `packages_dir()`, `log_file()`, ...) are the only supported way to get a path. **Never construct one from `home_dir()`**
+    - Platform selected with `cfg!`, not `#[cfg]`, so both implementations are compiled and tested everywhere
+    - `LAYOUT_VERSION` and `general.layout_version` record which layout a config conforms to; **0 means pre-0.5.0**, and `ConfigFile::default()` uses 0 deliberately because the parser overlays a file onto the defaults
+    - One site intentionally still names `~/.xearthlayer`: `preflight/mod.rs` `legacy_default_packages_dir()`, which detects a pre-XDG install
+    - See `docs/directory-layout.md` and `docs/dev/preflight-design.md`
+
+17. **Preflight Checks** (`xearthlayer/src/preflight/`, `xearthlayer-cli/src/preflight/`)
     - `Preflight<C>` trait and `Runner<C>` in the library, generic over context; the concrete checks live in the CLI
     - Executed in `main()` **before command dispatch**, so `run` and `setup` get the same answer to "does this installation exist"
     - `BootstrapContext` accumulates validated inputs (config, install location, Custom Scenery path); carries **inputs, not constructed services**
@@ -182,7 +191,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - Platform exclusion uses `cfg!` in `applies()`, not `#[cfg]`, so macOS-only checks are still compiled and tested on Linux
     - See `docs/dev/preflight-design.md`
 
-17. **GeoIndex** (`xearthlayer/src/geo_index/`)
+18. **GeoIndex** (`xearthlayer/src/geo_index/`)
     - `GeoIndex` - Type-keyed, region-indexed geospatial reference database (thread-safe, ACID)
     - `DsfRegion` - 1°×1° DSF region coordinate type
     - `GeoLayer` trait - Marker trait for storable layer types (`Clone + Send + Sync + 'static`)
@@ -319,7 +328,8 @@ xearthlayer run --no-prefetch       # Disable prefetch system
 xearthlayer run --airport ICAO      # Pre-warm tiles around airport before starting
 xearthlayer download --lat --lon    # Download single tile
 xearthlayer diagnostics             # Show system info, config, and health status
-xearthlayer cache clear|stats|migrate # Cache management
+xearthlayer cache clear|stats|migrate # Cache management ('migrate' is deprecated, see #268)
+xearthlayer migrate [layout|status]  # Move between directory layouts (--dry-run supported)
 
 # Scenery index cache
 xearthlayer scenery-index status    # Show cache status and tile counts
@@ -377,6 +387,9 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/fuse/fuse3/` | Fuse3 async multi-threaded filesystem |
 | `xearthlayer/src/fuse/fuse3/shared.rs` | Shared FUSE traits (FileAttrBuilder, DdsRequestor) |
 | `xearthlayer/src/fuse/fuse3/ortho_union_fs.rs` | Consolidated ortho FUSE mount |
+| `xearthlayer/src/paths/` | Path resolution: BaseDirectories, platform layouts, role accessors |
+| `xearthlayer-cli/src/preflight/migrate.rs` | Layout migration check |
+| `xearthlayer-cli/src/preflight/proposal.rs` | Migration decision table and guidance (pure) |
 | `xearthlayer/src/preflight/` | Preflight framework: trait, Runner, BootstrapContext |
 | `xearthlayer-cli/src/preflight/` | The concrete startup checks and the registry |
 | `xearthlayer/src/geo_index/` | GeoIndex geospatial reference database |
@@ -407,7 +420,7 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 
 ## Configuration
 
-Default config location: `~/.xearthlayer/config.ini`
+Default config location: `~/.config/xearthlayer/config.ini` (Linux) or `~/Library/Application Support/XEarthLayer/config.ini` (macOS). Resolve it with `xearthlayer config path`, never by construction.
 
 Key sections:
 - `[general]` - General settings (update_check)
@@ -507,6 +520,7 @@ matrix jobs are renamed.
 - Package publisher design: `docs/dev/package-publisher-design.md`
 - Zoom level overlap management: `docs/dev/zoom-level-overlap-design.md` (dedupe, gap analysis)
 - **Consolidated FUSE mounting**: `docs/dev/consolidated-mounting-design.md` (single ortho mount, patches + packages)
+- **Directory layout**: `docs/directory-layout.md` (where files live, upgrading from pre-0.5.0, cleaning up `~/.xearthlayer`)
 - **Preflight checks**: `docs/dev/preflight-design.md` (startup prerequisite registry, bootstrap context, operating principles, how to add a check)
 - **GeoIndex design**: `docs/dev/geo-index-design.md` (geospatial reference database, patch region ownership)
 - **Memory telemetry**: `docs/dev/memory-telemetry.md` (periodic memory sampling, trace interpretation, confounders)

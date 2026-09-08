@@ -1,6 +1,8 @@
 # XEarthLayer Configuration
 
-XEarthLayer uses an INI configuration file located at `~/.xearthlayer/config.ini`.
+XEarthLayer uses an INI configuration file located at `~/.config/xearthlayer/config.ini` on Linux, honouring `$XDG_CONFIG_HOME`, and `~/Library/Application Support/XEarthLayer/config.ini` on macOS. Run `xearthlayer config path` to see yours.
+
+Every path setting below defaults to a platform-appropriate location. See [directory-layout.md](directory-layout.md) for the full layout, for what happens when upgrading from a version before 0.5.0, and for how to clean up the old `~/.xearthlayer` directory.
 
 ## Setup Wizard (Recommended)
 
@@ -25,8 +27,8 @@ For users who prefer manual configuration, this file is created with `xearthlaye
 
 ## Configuration File Location
 
-- **Config file**: `~/.xearthlayer/config.ini`
-- **Log file**: `~/.xearthlayer/xearthlayer.log` (default)
+- **Config file**: `~/.config/xearthlayer/config.ini`
+- **Log file**: `~/.local/state/xearthlayer/xearthlayer.log` (default)
 - **Cache directory**: `~/.cache/xearthlayer/` (default)
 
 For best results, set the cache directory to a fast NVMe or SSD that you can fill with data and is not the primary volume for your system.
@@ -397,12 +399,12 @@ Controls log output.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `file` | path | `~/.xearthlayer/xearthlayer.log` | Log file location. Supports `~` expansion. |
+| `file` | path | `~/.local/state/xearthlayer/xearthlayer.log` | Log file location. Supports `~` expansion. |
 
 **Example:**
 ```ini
 [logging]
-file = ~/.xearthlayer/xearthlayer.log
+file = ~/.local/state/xearthlayer/xearthlayer.log
 ```
 
 ### [packages]
@@ -412,18 +414,18 @@ Controls package manager behavior.
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `library_url` | URL | `https://xearthlayer.app/packages/xearthlayer_package_library.txt` | URL to the package library index file |
-| `install_location` | path | `~/.xearthlayer/packages` | Directory for storing installed packages |
+| `install_location` | path | `~/.local/share/xearthlayer/packages` | Directory for storing installed packages |
 | `custom_scenery_path` | path | (auto-detect) | X-Plane Custom Scenery directory for overlay symlinks |
 | `auto_install_overlays` | bool | `false` | Automatically install matching overlay when installing ortho |
 | `disable_overlays` | bool | `false` | Suppress XEL overlays at runtime (see notes below) |
-| `temp_dir` | path | `~/.xearthlayer/tmp` | Temporary directory for package downloads |
+| `temp_dir` | path | `~/.cache/xearthlayer/tmp` | Temporary directory for package downloads |
 | `concurrent_downloads` | Integer | `5` | Number of concurrent part downloads (1-10) |
 
 **Example:**
 ```ini
 [packages]
 ; library_url defaults to https://xearthlayer.app/packages/xearthlayer_package_library.txt
-install_location = ~/.xearthlayer/packages
+install_location = ~/.local/share/xearthlayer/packages
 custom_scenery_path = /home/user/X-Plane 12/Custom Scenery
 auto_install_overlays = true
 disable_overlays = false
@@ -446,13 +448,13 @@ Settings for tile patches - pre-built Ortho4XP tiles with custom mesh/elevation 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Enable/disable patches functionality |
-| `directory` | path | `~/.xearthlayer/patches` | Directory containing patch tiles |
+| `directory` | path | `~/.local/share/xearthlayer/patches` | Directory containing patch tiles |
 
 **Example:**
 ```ini
 [patches]
 enabled = true
-directory = ~/.xearthlayer/patches
+directory = ~/.local/share/xearthlayer/patches
 ```
 
 **Notes:**
@@ -550,11 +552,11 @@ mode = auto                    ; auto, aggressive, opportunistic, disabled
 ; scenery_dir = /path/to/X-Plane 12/Custom Scenery
 
 [logging]
-file = ~/.xearthlayer/xearthlayer.log
+file = ~/.local/state/xearthlayer/xearthlayer.log
 
 [packages]
 ; library_url defaults to https://xearthlayer.app/packages/xearthlayer_package_library.txt
-; install_location = ~/.xearthlayer/packages
+; install_location = ~/.local/share/xearthlayer/packages
 ; custom_scenery_path = /path/to/X-Plane 12/Custom Scenery
 ; auto_install_overlays = true
 ; disable_overlays = false
@@ -563,7 +565,7 @@ file = ~/.xearthlayer/xearthlayer.log
 [patches]
 ; Tile patches for custom mesh/elevation from airport addons
 enabled = true
-; directory = ~/.xearthlayer/patches
+; directory = ~/.local/share/xearthlayer/patches
 
 [fuse]
 ; FUSE kernel limits for concurrent background requests (advanced)
@@ -580,7 +582,7 @@ XEarthLayer provides CLI commands for viewing and modifying configuration settin
 
 ```bash
 xearthlayer config path
-# Output: /home/user/.xearthlayer/config.ini
+# Output: /home/user/.config/xearthlayer/config.ini
 ```
 
 ### List All Settings
@@ -720,7 +722,7 @@ xearthlayer start --source ./scenery --no-cache
 To regenerate the config file with defaults:
 
 ```bash
-rm ~/.xearthlayer/config.ini
+rm ~/.config/xearthlayer/config.ini
 xearthlayer init
 ```
 
