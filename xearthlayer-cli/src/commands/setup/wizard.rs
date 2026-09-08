@@ -331,10 +331,12 @@ struct CacheSettings {
 /// "system configuration" — the budgets are derived from system info, so
 /// it makes more sense for them to live next to the cache directory choice.
 fn step_cache(theme: &ColorfulTheme) -> Result<CacheSettings, CliError> {
-    let default_cache_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".xearthlayer")
-        .join("cache");
+    // The same default the program itself uses. These disagreed before the
+    // resolver existed: the wizard proposed ~/.xearthlayer/cache while
+    // ConfigFile::default() used the platform cache directory, so accepting the
+    // wizard's suggestion silently produced a different layout than declining
+    // it.
+    let default_cache_dir = xearthlayer::paths::tile_cache_dir();
 
     // 3a. Cache directory selection
     let cache_dir = prompt_cache_directory(theme, &default_cache_dir)?;

@@ -24,8 +24,21 @@ use std::sync::OnceLock;
 /// Resolved once. Every role accessor reads through it, so relocating a role is
 /// a change here rather than a search for every caller that guessed.
 fn active() -> &'static dyn BaseDirectories {
-    static ACTIVE: OnceLock<LegacyDirectories> = OnceLock::new();
-    ACTIVE.get_or_init(|| LegacyDirectories::from_home(home()))
+    static ACTIVE: OnceLock<Box<dyn BaseDirectories>> = OnceLock::new();
+    ACTIVE
+        .get_or_init(|| -> Box<dyn BaseDirectories> {
+            // `cfg!` rather than `#[cfg]`: both implementations are plain path
+            // arithmetic and compile everywhere, so removing one from the build
+            // would only stop it being type checked on the other platform. Same
+            // reasoning as the platform-gated preflight checks; see
+            // docs/dev/preflight-design.md.
+            if cfg!(target_os = "macos") {
+                Box::new(AppleDirectories::from_home(home()))
+            } else {
+                Box::new(XdgDirectories::detect(home()))
+            }
+        })
+        .as_ref()
 }
 
 /// The user's home directory, or the working directory if there is none.
@@ -126,15 +139,14 @@ pub fn temp_dir_in(base: &dyn BaseDirectories) -> PathBuf {
 /// Default location for the generated tile cache. Overridable by
 /// `cache.directory`.
 ///
-/// Deliberately **not** routed through the active layout yet. This tier already
-/// resolved to `dirs::cache_dir()`, which is the correct answer on both
-/// platforms, and routing it through the legacy layout during the conversion
-/// would move it into `~/.xearthlayer`. It joins the resolver when the active
-/// layout becomes platform-native.
+/// This tier was already compliant before the resolver existed: it defaulted to
+/// `dirs::cache_dir()`, which on Linux is exactly the XDG cache directory. The
+/// flip therefore moves nothing there. On macOS it gains the capitalised
+/// application name, which reaches only a fresh install, since an installation
+/// that has written a configuration file keeps whatever `cache.directory` it
+/// stored.
 pub fn tile_cache_dir() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("xearthlayer")
+    active().cache_dir()
 }
 
 #[cfg(test)]
@@ -257,24 +269,55 @@ mod tests {
     }
 
     #[test]
-    fn the_active_layout_is_still_the_legacy_one() {
-        // Converting every call site and changing what they resolve to are
-        // separate steps. This assertion inverting is the signal that the
-        // second step happened.
+    fn the_active_layout_is_platform_native() {
+        // The inverse of the assertion this replaced. Nothing resolves into
+        // ~/.xearthlayer any more.
         let home = dirs::home_dir().unwrap();
-        assert_eq!(config_file(), home.join(".xearthlayer/config.ini"));
-        assert_eq!(log_file(), home.join(".xearthlayer/xearthlayer.log"));
-        assert_eq!(packages_dir(), home.join(".xearthlayer/packages"));
+        let expected_config = if cfg!(target_os = "macos") {
+            home.join("Library/Application Support/XEarthLayer/config.ini")
+        } else {
+            home.join(".config/xearthlayer/config.ini")
+        };
+        assert_eq!(config_file(), expected_config);
+        assert!(
+            !config_file().starts_with(home.join(".xearthlayer")),
+            "nothing may still resolve into the legacy directory"
+        );
     }
 
     #[test]
-    fn the_tile_cache_is_not_yet_routed_through_the_active_layout() {
-        // It already resolved correctly on both platforms. Routing it through
-        // the legacy layout during the conversion would move it.
-        assert_eq!(
+    fn every_role_leaves_the_legacy_directory() {
+        let legacy = dirs::home_dir().unwrap().join(".xearthlayer");
+        for path in [
+            config_file(),
+            scenery_index_cache(),
+            ortho_union_index_cache(),
+            version_check_file(),
+            log_file(),
+            lock_file(),
+            packages_dir(),
+            patches_dir(),
+            temp_dir(),
             tile_cache_dir(),
-            dirs::cache_dir().unwrap().join("xearthlayer")
-        );
+        ] {
+            assert!(!path.starts_with(&legacy), "still legacy: {path:?}");
+        }
+    }
+
+    #[test]
+    fn the_tile_cache_now_reads_through_the_active_layout() {
+        // On Linux this is the same directory dirs::cache_dir() gave, so no
+        // existing cache moves. On macOS it gains the capitalised application
+        // name, which only affects a fresh install: an install with a config
+        // file keeps whatever cache.directory it already stored.
+        assert_eq!(tile_cache_dir(), active().cache_dir());
+        if cfg!(not(target_os = "macos")) {
+            assert_eq!(
+                tile_cache_dir(),
+                dirs::cache_dir().unwrap().join("xearthlayer"),
+                "the Linux tile cache must not move"
+            );
+        }
     }
 
     #[test]
