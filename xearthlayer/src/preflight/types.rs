@@ -81,6 +81,20 @@ pub struct Remedy<C> {
     pub register: Vec<Box<dyn Preflight<C>>>,
 }
 
+impl<C> fmt::Debug for Remedy<C> {
+    // Manual: the registered checks are trait objects and cannot derive Debug.
+    // Their count is the part worth seeing in a test failure.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Remedy")
+            .field("message", &self.message)
+            .field(
+                "register",
+                &format_args!("{} check(s)", self.register.len()),
+            )
+            .finish()
+    }
+}
+
 impl<C> Default for Remedy<C> {
     fn default() -> Self {
         Self {
@@ -94,12 +108,40 @@ impl<C> Default for Remedy<C> {
 ///
 /// Deliberately not `CliError`: that type lives in the binary crate, and naming
 /// it here would make [`Preflight`] unimplementable from anywhere else.
+///
+/// The optional source is how a caller recovers a richer error than the message
+/// string. A check that wraps a domain error attaches it here, and the CLI
+/// downcasts to render the error it has always rendered for that failure.
 #[derive(Debug)]
 pub struct PreflightError {
     /// Name of the check that failed to remediate.
     pub check: Cow<'static, str>,
     /// What went wrong.
     pub message: String,
+    source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+}
+
+impl PreflightError {
+    pub fn new(check: impl Into<Cow<'static, str>>, message: impl Into<String>) -> Self {
+        Self {
+            check: check.into(),
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Attach the underlying error so a caller can downcast to it.
+    pub fn with_source(mut self, source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        self.source = Some(Box::new(source));
+        self
+    }
+
+    /// The attached source, if any.
+    pub fn source_ref(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
 }
 
 impl fmt::Display for PreflightError {
@@ -108,7 +150,11 @@ impl fmt::Display for PreflightError {
     }
 }
 
-impl std::error::Error for PreflightError {}
+impl std::error::Error for PreflightError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source_ref()
+    }
+}
 
 /// Result of running a whole registry.
 #[derive(Debug)]
@@ -181,11 +227,18 @@ mod tests {
     }
 
     #[test]
+    fn remedy_debug_reports_how_many_checks_it_registered() {
+        let r: Remedy<()> = Remedy::default();
+        assert_eq!(
+            format!("{:?}", r),
+            "Remedy { message: None, register: 0 check(s) }"
+        );
+    }
+
+    #[test]
     fn preflight_error_displays_check_and_message() {
-        let e = PreflightError {
-            check: "load-config".into(),
-            message: "permission denied".to_string(),
-        };
+        let e = PreflightError::new("load-config", "permission denied");
         assert_eq!(e.to_string(), "load-config: permission denied");
+        assert!(e.source_ref().is_none());
     }
 }

@@ -18,6 +18,8 @@ use xearthlayer::preflight::BootstrapContext;
 /// Constants rather than literals at the call site because [`to_cli_error`]
 /// dispatches on them: a typo would silently fall through to the generic arm
 /// and change what the user sees.
+pub mod config;
+
 pub mod names {
     pub const FIRST_RUN: &str = "first-run";
     pub const LOAD_CONFIG: &str = "load-config";

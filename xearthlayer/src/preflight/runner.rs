@@ -314,10 +314,7 @@ mod tests {
                 Status::unsatisfied("x").remediable()
             }
             fn remediate(&self, _: &mut Ctx) -> Result<Remedy<Ctx>, PreflightError> {
-                Err(PreflightError {
-                    check: Cow::Borrowed("broken"),
-                    message: "disk is full".to_string(),
-                })
+                Err(PreflightError::new("broken", "disk is full"))
             }
         }
         let mut r = Runner::new();
