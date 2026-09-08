@@ -2,6 +2,7 @@
 
 use super::names;
 use std::borrow::Cow;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use xearthlayer::airport::validate_airport_icao;
 use xearthlayer::preflight::{BootstrapContext, Preflight, PreflightError, Remedy, Status};
@@ -178,10 +179,131 @@ impl Preflight<BootstrapContext> for AirportIcao {
     }
 }
 
+/// Require macFUSE to be installed before attempting to mount.
+///
+/// Without this a missing or unapproved kext surfaces as an opaque mount
+/// failure, which tells the user nothing about what to do.
+///
+/// # What is probed, and what is not
+///
+/// The presence of `/Library/Filesystems/macfuse.fs`. Deliberately **not**
+/// whether the kext is loaded: macFUSE loads on demand at first mount rather
+/// than at boot, so an empty `kmutil showloaded` is the normal state before a
+/// mount and would make this check reject a working installation.
+///
+/// # Why there is no `#[cfg]` here
+///
+/// The check compiles on every platform and is excluded at runtime by
+/// [`Preflight::applies`]. Code removed by `#[cfg]` is never type checked on
+/// the other platform, which is how a macOS path silently rots until someone
+/// builds on a Mac. This way Linux compiles it and runs its tests.
+pub struct MacFuseAvailable {
+    probe: PathBuf,
+}
+
+/// Where macFUSE installs its filesystem bundle.
+const MACFUSE_BUNDLE: &str = "/Library/Filesystems/macfuse.fs";
+
+impl Default for MacFuseAvailable {
+    fn default() -> Self {
+        Self {
+            probe: PathBuf::from(MACFUSE_BUNDLE),
+        }
+    }
+}
+
+impl MacFuseAvailable {
+    /// Construct with an explicit probe path, so tests do not depend on
+    /// whether the machine running them has macFUSE.
+    #[cfg(test)]
+    pub fn with_probe(probe: PathBuf) -> Self {
+        Self { probe }
+    }
+}
+
+impl Preflight<BootstrapContext> for MacFuseAvailable {
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed(names::MACFUSE_AVAILABLE)
+    }
+
+    /// `cfg!` rather than `#[cfg]`: a runtime constant that excludes the check
+    /// off macOS without excluding the code from compilation.
+    fn applies(&self, ctx: &BootstrapContext) -> bool {
+        cfg!(target_os = "macos") && ctx.command() == "run"
+    }
+
+    fn inspect(&self, _ctx: &BootstrapContext) -> Status {
+        if self.probe.exists() {
+            Status::Satisfied
+        } else {
+            Status::unsatisfied(format!(
+                "macFUSE is not installed: {} does not exist",
+                self.probe.display()
+            ))
+            .with_hint(
+                "Install macFUSE from https://macfuse.io, then approve the system \
+                 extension. See docs/macos.md for the approval steps.",
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ---- MacFuseAvailable ----
+
+    #[test]
+    fn macfuse_is_satisfied_when_the_bundle_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("macfuse.fs");
+        std::fs::create_dir(&bundle).unwrap();
+        let check = MacFuseAvailable::with_probe(bundle);
+        assert_eq!(
+            check.inspect(&BootstrapContext::new("run", None)),
+            Status::Satisfied
+        );
+    }
+
+    #[test]
+    fn macfuse_is_unsatisfied_and_points_at_the_install_guide() {
+        let dir = tempfile::tempdir().unwrap();
+        let check = MacFuseAvailable::with_probe(dir.path().join("absent.fs"));
+        match check.inspect(&BootstrapContext::new("run", None)) {
+            Status::Unsatisfied {
+                reason,
+                remediable,
+                hint,
+            } => {
+                assert!(!remediable, "we cannot install macFUSE for the user");
+                assert!(reason.contains("macFUSE is not installed"), "{reason}");
+                assert!(
+                    hint.as_deref()
+                        .unwrap_or_default()
+                        .contains("docs/macos.md"),
+                    "the hint must point at the approval steps"
+                );
+            }
+            other => panic!("expected Unsatisfied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn macfuse_check_only_applies_on_macos() {
+        // Compiles and runs on every platform; excluded at runtime off macOS.
+        // The assertion follows the target so this test is meaningful on both.
+        let check = MacFuseAvailable::default();
+        let ctx = BootstrapContext::new("run", None);
+        assert_eq!(check.applies(&ctx), cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn macfuse_check_does_not_apply_outside_run() {
+        let check = MacFuseAvailable::default();
+        assert!(!check.applies(&BootstrapContext::new("packages", None)));
+    }
 
     // ---- LogStartup ----
 

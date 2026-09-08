@@ -28,6 +28,7 @@ pub mod names {
     pub const RESOLVE_CUSTOM_SCENERY: &str = "resolve-custom-scenery";
     pub const CUSTOM_SCENERY_EXISTS: &str = "custom-scenery-exists";
     pub const AIRPORT_ICAO: &str = "airport-icao";
+    pub const MACFUSE_AVAILABLE: &str = "macfuse-available";
 }
 
 /// The legacy default package directory.
@@ -73,6 +74,7 @@ pub fn build_registry_with(
     runner.register(Box::new(paths::ResolveCustomScenery::with_detector(detect)));
     runner.register(Box::new(paths::CustomSceneryExists));
     runner.register(Box::new(system::AirportIcao));
+    runner.register(Box::<system::MacFuseAvailable>::default());
     runner
 }
 
@@ -264,6 +266,7 @@ mod tests {
                 names::RESOLVE_CUSTOM_SCENERY,
                 names::CUSTOM_SCENERY_EXISTS,
                 names::AIRPORT_ICAO,
+                names::MACFUSE_AVAILABLE,
             ]
         );
     }
@@ -334,6 +337,7 @@ mod tests {
             names::RESOLVE_CUSTOM_SCENERY,
             names::CUSTOM_SCENERY_EXISTS,
             names::AIRPORT_ICAO,
+            names::MACFUSE_AVAILABLE,
         ];
         let mut seen: Vec<&str> = all.to_vec();
         seen.sort_unstable();
