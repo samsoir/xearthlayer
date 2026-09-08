@@ -96,6 +96,30 @@ impl LayoutMigration {
     }
 }
 
+/// Tell the user about data the accepted layout walks away from.
+///
+/// We do not move data, so anything left behind has to be named. A user who
+/// discovers an unexplained several hundred gigabyte directory months later has
+/// been failed by this migration even though nothing broke.
+fn report_guidance(proposals: &[super::proposal::ResourceProposal]) {
+    let items = super::proposal::guidance(proposals);
+    if items.is_empty() {
+        return;
+    }
+
+    println!("Some files are left in their old locations:");
+    println!();
+    for item in items {
+        println!("  {}", item.resource.label());
+        println!("    {}", item.left_behind.display());
+        println!("    {}", item.note);
+        if let Some(command) = item.command {
+            println!("    {}", command);
+        }
+        println!();
+    }
+}
+
 impl LayoutMigration {
     /// Show the proposed layout and let the user change it.
     ///
@@ -241,6 +265,7 @@ impl Preflight<BootstrapContext> for LayoutMigration {
                 p.exists()
             });
         let proposals = self.negotiate(proposals);
+        report_guidance(&proposals);
         super::proposal::apply(&proposals, &mut config);
 
         config.general.layout_version = LAYOUT_VERSION;

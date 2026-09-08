@@ -62,6 +62,12 @@ pub struct ResourceProposal {
     /// Whether the user may change this. Resources with no configuration key
     /// have nothing to ask about.
     pub negotiable: bool,
+    /// Where the resource is right now, when something is actually there.
+    ///
+    /// Distinct from `pinned_to`, which is a decision. This is an observation,
+    /// and it is what lets the guidance name data the migration is walking away
+    /// from.
+    pub occupies: Option<PathBuf>,
 }
 
 impl ResourceProposal {
@@ -100,12 +106,13 @@ pub fn propose(
     target: &dyn BaseDirectories,
     exists: impl Fn(&Path) -> bool,
 ) -> Vec<ResourceProposal> {
-    let adopt = |resource, proposed| ResourceProposal {
+    let adopt = |resource, proposed, occupies: Option<PathBuf>| ResourceProposal {
         resource,
         pinned_to: None,
         proposed,
         disposition: Disposition::Adopt,
         negotiable: false,
+        occupies: occupies.filter(|p| exists(p)),
     };
 
     // An explicit setting and an inferred legacy default are different claims
@@ -130,22 +137,29 @@ pub fn propose(
             } else {
                 Disposition::Adopt
             },
+            occupies: keep.clone().filter(|p| exists(p)),
             pinned_to: keep,
             proposed,
         }
     };
 
     vec![
-        adopt(Resource::Config, paths::config_file_in(target)),
+        adopt(Resource::Config, paths::config_file_in(target), None),
         adopt(
             Resource::SceneryIndex,
             paths::scenery_index_cache_in(target),
+            Some(legacy_dir.join("scenery_index.cache")),
         ),
         adopt(
             Resource::OrthoUnionIndex,
             paths::ortho_union_index_cache_in(target),
+            Some(legacy_dir.join("ortho_union_index.cache")),
         ),
-        adopt(Resource::VersionCheck, paths::version_check_file_in(target)),
+        adopt(
+            Resource::VersionCheck,
+            paths::version_check_file_in(target),
+            None,
+        ),
         negotiable(
             Resource::Cache,
             Some(config.cache.directory.clone()),
@@ -172,8 +186,90 @@ pub fn propose(
         ),
         // A log is worthless: there is never anything to strand, so it adopts
         // even when it sits at a legacy default.
-        adopt(Resource::Log, paths::log_file_in(target)),
+        adopt(Resource::Log, paths::log_file_in(target), None),
     ]
+}
+
+/// What the user should do about data the migration is leaving behind.
+#[derive(Debug, Clone)]
+pub struct Guidance {
+    pub resource: Resource,
+    /// The path that will no longer be used.
+    pub left_behind: PathBuf,
+    /// What it means, in the user's terms.
+    pub note: String,
+    /// A command that resolves it, when one exists.
+    pub command: Option<String>,
+}
+
+/// Explain every resource whose data is being walked away from.
+///
+/// We do not move data, so anything the accepted proposal stops using has to be
+/// named. Silently orphaning a several hundred gigabyte cache with no
+/// indication of what it is would be the worst outcome of this migration.
+///
+/// **No sizes are reported.** The plan asked for them, but measuring a tile
+/// cache means walking millions of files, and a multi-minute stall during
+/// startup is a worse trade than the user running `du` themselves. Naming the
+/// path is what makes reclamation possible; measuring it is not.
+pub fn guidance(proposals: &[ResourceProposal]) -> Vec<Guidance> {
+    proposals
+        .iter()
+        .filter(|p| p.disposition == Disposition::Adopt)
+        .filter_map(|p| {
+            let left_behind = p.occupies.clone()?;
+            let (note, command) = match p.resource {
+                Resource::Cache => (
+                    "Nothing to do: the tile cache refills on demand. This directory \
+                     is now unused and can be deleted."
+                        .to_string(),
+                    None,
+                ),
+                Resource::Packages => (
+                    "Installed scenery is not moved. Move it yourself, or reinstall \
+                     with 'xearthlayer packages install <region>'."
+                        .to_string(),
+                    Some(format!(
+                        "mv {} {}",
+                        left_behind.display(),
+                        p.proposed.display()
+                    )),
+                ),
+                Resource::Patches => (
+                    "These are your own files and cannot be regenerated. Move them \
+                     to keep using them."
+                        .to_string(),
+                    Some(format!(
+                        "mv {} {}",
+                        left_behind.display(),
+                        p.proposed.display()
+                    )),
+                ),
+                Resource::SceneryIndex => (
+                    "Stale. It will be rebuilt in its new location on the next scan, \
+                     so this file can be deleted."
+                        .to_string(),
+                    Some("xearthlayer scenery-index update".to_string()),
+                ),
+                Resource::OrthoUnionIndex => (
+                    "Stale. It is rebuilt automatically on the next start, so this \
+                     file can be deleted."
+                        .to_string(),
+                    None,
+                ),
+                // Transient or worthless: nothing is lost and nothing is owed.
+                Resource::TempDir | Resource::Log | Resource::VersionCheck | Resource::Config => {
+                    return None
+                }
+            };
+            Some(Guidance {
+                resource: p.resource,
+                left_behind,
+                note,
+                command,
+            })
+        })
+        .collect()
 }
 
 /// Write a set of proposals into a configuration.
@@ -310,6 +406,101 @@ mod tests {
             .iter()
             .find(|p| p.resource == r)
             .unwrap_or_else(|| panic!("{r:?} must be in the proposal"))
+    }
+
+    #[test]
+    fn nothing_left_behind_means_no_guidance() {
+        let t = target();
+        let p = propose(&unconfigured_for(&t), &legacy(), &t, |_| false);
+        assert!(
+            guidance(&p).is_empty(),
+            "a clean install has nothing to say"
+        );
+    }
+
+    #[test]
+    fn a_stale_index_cache_is_reported_as_safe_to_delete() {
+        let legacy = legacy();
+        let stale = legacy.join("scenery_index.cache");
+        let exists = move |p: &Path| p == stale;
+        let t = target();
+        let g = guidance(&propose(&unconfigured_for(&t), &legacy, &t, exists));
+
+        let entry = g
+            .iter()
+            .find(|e| e.resource == Resource::SceneryIndex)
+            .expect("a stale index must be reported");
+        assert_eq!(entry.left_behind, legacy.join("scenery_index.cache"));
+        assert!(entry.note.contains("rebuilt"), "{}", entry.note);
+        assert_eq!(
+            entry.command.as_deref(),
+            Some("xearthlayer scenery-index update")
+        );
+    }
+
+    #[test]
+    fn relocating_packages_gives_both_ways_to_reinstate_them() {
+        // We do not move data. If the user chooses to relocate anyway, they
+        // must be told exactly how, in both of the ways that work.
+        let legacy = legacy();
+        let packages = legacy.join("packages");
+        let exists = move |p: &Path| p == packages;
+        let t = target();
+        let mut p = propose(&unconfigured_for(&t), &legacy, &t, exists);
+        let i = negotiable(&p)[0];
+        toggle(&mut p[i]); // the user chose to move
+
+        let g = guidance(&p);
+        let entry = g
+            .iter()
+            .find(|e| e.resource == Resource::Packages)
+            .expect("relocating packages must be explained");
+        let command = entry.command.as_deref().unwrap_or_default();
+        assert!(command.starts_with("mv "), "{command}");
+        assert!(command.contains(&legacy.join("packages").display().to_string()));
+        assert!(entry.note.contains("packages install"), "{}", entry.note);
+    }
+
+    #[test]
+    fn a_kept_resource_needs_no_guidance() {
+        let legacy = legacy();
+        let packages = legacy.join("packages");
+        let exists = move |p: &Path| p == packages;
+        let t = target();
+        let p = propose(&unconfigured_for(&t), &legacy, &t, exists);
+        assert!(
+            !guidance(&p)
+                .iter()
+                .any(|e| e.resource == Resource::Packages),
+            "nothing moved, so there is nothing to explain"
+        );
+    }
+
+    #[test]
+    fn an_orphaned_cache_names_its_path_so_it_can_be_reclaimed() {
+        // Silently orphaning hundreds of gigabytes with no indication of what
+        // it is would be the worst outcome of this migration.
+        let t = target();
+        let mut config = unconfigured_for(&t);
+        config.cache.directory = PathBuf::from("/media/Cache/xearthlayer-cache");
+        let mut p = propose(&config, &legacy(), &t, |_| true);
+        let i = negotiable(&p)
+            .into_iter()
+            .find(|&i| p[i].resource == Resource::Cache)
+            .unwrap();
+        toggle(&mut p[i]);
+
+        let g = guidance(&p);
+        let entry = g.iter().find(|e| e.resource == Resource::Cache).unwrap();
+        assert_eq!(
+            entry.left_behind,
+            PathBuf::from("/media/Cache/xearthlayer-cache")
+        );
+        assert!(entry.note.contains("refill"), "{}", entry.note);
+        assert!(
+            entry.command.is_none(),
+            "a cache needs no command, only its old path"
+        );
     }
 
     #[test]
