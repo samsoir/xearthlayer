@@ -19,6 +19,18 @@ pub use xdg::XdgDirectories;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+/// The layout this build conforms to.
+///
+/// A layout version rather than an application version, so a future relocation
+/// bumps it independently of releases. Recorded in `general.layout_version`.
+///
+/// **0 means the configuration predates the versioned layout**, which is why
+/// [`crate::config::ConfigFile::default`] uses 0 and not this constant: the
+/// parser overlays a file onto the defaults, so defaulting to the current
+/// version would make every pre-0.5.0 configuration claim to be migrated
+/// already.
+pub const LAYOUT_VERSION: u32 = 1;
+
 /// The layout in force for this process.
 ///
 /// Resolved once. Every role accessor reads through it, so relocating a role is

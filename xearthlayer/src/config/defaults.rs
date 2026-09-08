@@ -318,6 +318,10 @@ impl Default for ConfigFile {
         Self {
             general: GeneralSettings {
                 update_check: DEFAULT_UPDATE_CHECK,
+                // Not LAYOUT_VERSION: the parser overlays a file onto these
+                // defaults, so a current version here would make every
+                // pre-0.5.0 configuration claim to be migrated already.
+                layout_version: 0,
             },
             provider: ProviderSettings {
                 provider_type: "bing".to_string(),

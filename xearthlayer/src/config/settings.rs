@@ -49,6 +49,17 @@ pub struct GeneralSettings {
     /// Enable automatic version update checking on startup (default: true).
     /// When enabled, checks for new versions once per day via a cached HTTP request.
     pub update_check: bool,
+
+    /// Which directory layout this configuration conforms to.
+    ///
+    /// Managed automatically. `0` means the configuration predates the
+    /// versioned layout and its files still live in `~/.xearthlayer`; the
+    /// migration stamps [`crate::paths::LAYOUT_VERSION`] once it has run.
+    ///
+    /// This is what distinguishes "migrated" from "the old directory still
+    /// exists", which are different facts: a user may keep files there that no
+    /// migration will ever claim.
+    pub layout_version: u32,
 }
 
 /// Provider configuration.

@@ -60,6 +60,11 @@ pub(super) fn to_config_string(config: &ConfigFile) -> String {
 ; When enabled, performs a single HTTP request once per day (no telemetry)
 update_check = {}
 
+; Directory layout this configuration conforms to. Managed automatically:
+; 0 means the layout predates versioning and files still live in ~/.xearthlayer.
+; Do not edit unless you are recovering from a failed migration.
+layout_version = {}
+
 [provider]
 ; Imagery provider:
 ;   apple  - Apple Maps (free, tokens auto-acquired via DuckDuckGo)
@@ -253,6 +258,7 @@ max_background = {}
 congestion_threshold = {}
 "#,
         update_check,
+        config.general.layout_version,
         config.provider.provider_type,
         google_api_key,
         mapbox_access_token,
