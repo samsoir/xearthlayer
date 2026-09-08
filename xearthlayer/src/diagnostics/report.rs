@@ -359,7 +359,7 @@ impl DiskInfo {
         }
 
         // Config directory existence (independent of cache/install paths).
-        let config_dir = dirs::home_dir().unwrap_or_default().join(".xearthlayer");
+        let config_dir = crate::paths::config_dir();
         info.config_exists = config_dir.exists();
 
         info
@@ -385,10 +385,7 @@ fn cache_dir_for_statvfs(path: &Path) -> &Path {
 /// Default package install location when `packages.install_location`
 /// is unset, mirroring the priority used by the packages CLI subcommands.
 fn default_install_location() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".xearthlayer")
-        .join("packages")
+    crate::paths::packages_dir()
 }
 
 impl NetworkInfo {

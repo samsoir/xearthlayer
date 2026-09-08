@@ -122,11 +122,10 @@ impl CacheLayer {
         let chunk_disk_budget = disk_size - dds_disk_budget;
 
         // Get cache directory with default
-        let disk_dir = config.cache_directory().cloned().unwrap_or_else(|| {
-            dirs::cache_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join("xearthlayer")
-        });
+        let disk_dir = config
+            .cache_directory()
+            .cloned()
+            .unwrap_or_else(crate::paths::tile_cache_dir);
 
         let gc_interval = Duration::from_secs(config.disk_gc_interval_secs());
 

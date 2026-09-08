@@ -41,12 +41,11 @@ pub fn run(action: SceneryIndexAction) -> Result<(), CliError> {
 /// Discover ortho packages from the install location.
 fn discover_ortho_packages(config: &ConfigFile) -> Result<Vec<(String, PathBuf)>, CliError> {
     // Get install location with default fallback
-    let install_location = config.packages.install_location.clone().unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".xearthlayer")
-            .join("packages")
-    });
+    let install_location = config
+        .packages
+        .install_location
+        .clone()
+        .unwrap_or_else(xearthlayer::paths::packages_dir);
 
     let store = LocalPackageStore::new(&install_location);
 

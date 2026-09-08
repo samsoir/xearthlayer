@@ -288,10 +288,7 @@ fn step_xplane(theme: &ColorfulTheme) -> Result<Option<PathBuf>, CliError> {
 
 /// Step 2: Configure package installation location.
 fn step_package_location(theme: &ColorfulTheme) -> Result<PathBuf, CliError> {
-    let default_path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".xearthlayer")
-        .join("packages");
+    let default_path = xearthlayer::paths::packages_dir();
 
     println!("Where should XEarthLayer store scenery packages?");
     println!();

@@ -6,7 +6,7 @@
 
 use crate::error::CliError;
 use std::path::PathBuf;
-use xearthlayer::config::{config_directory, config_file_path, ConfigFileError};
+use xearthlayer::config::{config_file_path, ConfigFileError};
 use xearthlayer::preflight::{BootstrapContext, PreflightError, RunOutcome, Runner};
 
 /// Check names.
@@ -125,7 +125,7 @@ pub fn build_registry_with(env: RegistryEnv) -> Runner<BootstrapContext> {
 
 /// Where the instance lock lives.
 pub fn default_lock_path() -> PathBuf {
-    config_directory().join("xearthlayer.lock")
+    xearthlayer::paths::lock_file()
 }
 
 /// Run every applicable prerequisite for this command.

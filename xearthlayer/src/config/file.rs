@@ -92,16 +92,16 @@ impl ConfigFile {
     }
 }
 
-/// Get the path to the config directory (~/.xearthlayer).
+/// The directory holding the configuration file.
+///
+/// Delegates to [`crate::paths`], which owns every path the program resolves.
 pub fn config_directory() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".xearthlayer")
+    crate::paths::config_dir()
 }
 
-/// Get the path to the config file (~/.xearthlayer/config.ini).
+/// The path to `config.ini`.
 pub fn config_file_path() -> PathBuf {
-    config_directory().join("config.ini")
+    crate::paths::config_file()
 }
 
 #[cfg(test)]

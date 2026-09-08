@@ -84,9 +84,7 @@ pub struct DiskCacheConfig {
 
 impl Default for DiskCacheConfig {
     fn default() -> Self {
-        let cache_dir = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("xearthlayer");
+        let cache_dir = crate::paths::tile_cache_dir();
 
         Self {
             cache_dir,

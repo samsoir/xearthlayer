@@ -8,6 +8,7 @@ use std::str::FromStr;
 use thiserror::Error;
 
 use super::file::ConfigFile;
+use super::parser::expand_tilde;
 use super::size::{format_size, parse_size};
 use crate::dds::DdsFormat;
 
@@ -938,16 +939,6 @@ impl ValueSpecification for OptionalUrlSpec {
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-/// Expand ~ to home directory in paths.
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(stripped) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped);
-        }
-    }
-    PathBuf::from(path)
-}
 
 /// Convert path to display string, collapsing home dir to ~.
 fn path_to_display(path: &Path) -> String {

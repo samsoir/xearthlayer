@@ -16,6 +16,127 @@ pub use base::BaseDirectories;
 pub use legacy::LegacyDirectories;
 pub use xdg::XdgDirectories;
 
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// The layout in force for this process.
+///
+/// Resolved once. Every role accessor reads through it, so relocating a role is
+/// a change here rather than a search for every caller that guessed.
+fn active() -> &'static dyn BaseDirectories {
+    static ACTIVE: OnceLock<LegacyDirectories> = OnceLock::new();
+    ACTIVE.get_or_init(|| LegacyDirectories::from_home(home()))
+}
+
+/// The user's home directory, or the working directory if there is none.
+///
+/// The fallback matches what every call site did before this module existed.
+/// It is a poor answer, but changing it is a behaviour change and belongs to
+/// nobody's task here.
+fn home() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+// Role accessors. Each `_in` variant takes an explicit layout so tests never
+// read a real home directory; the bare variant uses the active layout.
+
+/// The directory holding user-editable configuration.
+///
+/// Exposed as a directory because two callers legitimately need the directory
+/// rather than a file in it: the diagnostics report, which asks whether it
+/// exists, and the migration, which names it to the user.
+pub fn config_dir() -> PathBuf {
+    active().config_dir()
+}
+
+/// `config.ini`.
+pub fn config_file() -> PathBuf {
+    config_file_in(active())
+}
+pub fn config_file_in(base: &dyn BaseDirectories) -> PathBuf {
+    base.config_dir().join("config.ini")
+}
+
+/// The scenery index cache. Regenerable, so it lives with the caches.
+pub fn scenery_index_cache() -> PathBuf {
+    scenery_index_cache_in(active())
+}
+pub fn scenery_index_cache_in(base: &dyn BaseDirectories) -> PathBuf {
+    base.cache_dir().join("scenery_index.cache")
+}
+
+/// The ortho union index cache. Regenerable.
+pub fn ortho_union_index_cache() -> PathBuf {
+    ortho_union_index_cache_in(active())
+}
+pub fn ortho_union_index_cache_in(base: &dyn BaseDirectories) -> PathBuf {
+    base.cache_dir().join("ortho_union_index.cache")
+}
+
+/// The update check's 24 hour cache.
+pub fn version_check_file() -> PathBuf {
+    version_check_file_in(active())
+}
+pub fn version_check_file_in(base: &dyn BaseDirectories) -> PathBuf {
+    base.state_dir().join("version_check.json")
+}
+
+/// The default log file. Overridable by `logging.file`.
+pub fn log_file() -> PathBuf {
+    log_file_in(active())
+}
+pub fn log_file_in(base: &dyn BaseDirectories) -> PathBuf {
+    base.state_dir().join("xearthlayer.log")
+}
+
+/// The running instance lock.
+pub fn lock_file() -> PathBuf {
+    lock_file_in(active())
+}
+pub fn lock_file_in(base: &dyn BaseDirectories) -> PathBuf {
+    base.state_dir().join("xearthlayer.lock")
+}
+
+/// Default location for installed packages. Overridable by
+/// `packages.install_location`.
+pub fn packages_dir() -> PathBuf {
+    packages_dir_in(active())
+}
+pub fn packages_dir_in(base: &dyn BaseDirectories) -> PathBuf {
+    base.data_dir().join("packages")
+}
+
+/// Default location for scenery patches. Overridable by `patches.directory`.
+pub fn patches_dir() -> PathBuf {
+    patches_dir_in(active())
+}
+pub fn patches_dir_in(base: &dyn BaseDirectories) -> PathBuf {
+    base.data_dir().join("patches")
+}
+
+/// Default staging directory for package downloads. Overridable by
+/// `packages.temp_dir`.
+pub fn temp_dir() -> PathBuf {
+    temp_dir_in(active())
+}
+pub fn temp_dir_in(base: &dyn BaseDirectories) -> PathBuf {
+    base.cache_dir().join("tmp")
+}
+
+/// Default location for the generated tile cache. Overridable by
+/// `cache.directory`.
+///
+/// Deliberately **not** routed through the active layout yet. This tier already
+/// resolved to `dirs::cache_dir()`, which is the correct answer on both
+/// platforms, and routing it through the legacy layout during the conversion
+/// would move it into `~/.xearthlayer`. It joins the resolver when the active
+/// layout becomes platform-native.
+pub fn tile_cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("xearthlayer")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +209,72 @@ mod tests {
         assert_eq!(d.cache_dir(), dot);
         assert_eq!(d.data_dir(), dot);
         assert_eq!(d.state_dir(), dot);
+    }
+
+    #[test]
+    fn every_role_resolves_under_the_layout_it_belongs_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = testing::TestDirectories::rooted_at(dir.path());
+
+        assert_eq!(config_file_in(&base), base.config_dir().join("config.ini"));
+        assert_eq!(
+            scenery_index_cache_in(&base),
+            base.cache_dir().join("scenery_index.cache")
+        );
+        assert_eq!(
+            ortho_union_index_cache_in(&base),
+            base.cache_dir().join("ortho_union_index.cache")
+        );
+        assert_eq!(
+            version_check_file_in(&base),
+            base.state_dir().join("version_check.json")
+        );
+        assert_eq!(log_file_in(&base), base.state_dir().join("xearthlayer.log"));
+        assert_eq!(
+            lock_file_in(&base),
+            base.state_dir().join("xearthlayer.lock")
+        );
+        assert_eq!(packages_dir_in(&base), base.data_dir().join("packages"));
+        assert_eq!(patches_dir_in(&base), base.data_dir().join("patches"));
+        assert_eq!(temp_dir_in(&base), base.cache_dir().join("tmp"));
+    }
+
+    #[test]
+    fn regenerable_files_live_in_the_cache_and_state_never_in_config() {
+        // The point of separating the roles. A cleaner may delete the cache
+        // directory at any time, so nothing irreplaceable may resolve into it,
+        // and config.ini must not sit where one would look.
+        let dir = tempfile::tempdir().unwrap();
+        let base = testing::TestDirectories::rooted_at(dir.path());
+        for regenerable in [
+            scenery_index_cache_in(&base),
+            ortho_union_index_cache_in(&base),
+            temp_dir_in(&base),
+        ] {
+            assert!(regenerable.starts_with(base.cache_dir()), "{regenerable:?}");
+        }
+        assert!(!config_file_in(&base).starts_with(base.cache_dir()));
+    }
+
+    #[test]
+    fn the_active_layout_is_still_the_legacy_one() {
+        // Converting every call site and changing what they resolve to are
+        // separate steps. This assertion inverting is the signal that the
+        // second step happened.
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(config_file(), home.join(".xearthlayer/config.ini"));
+        assert_eq!(log_file(), home.join(".xearthlayer/xearthlayer.log"));
+        assert_eq!(packages_dir(), home.join(".xearthlayer/packages"));
+    }
+
+    #[test]
+    fn the_tile_cache_is_not_yet_routed_through_the_active_layout() {
+        // It already resolved correctly on both platforms. Routing it through
+        // the legacy layout during the conversion would move it.
+        assert_eq!(
+            tile_cache_dir(),
+            dirs::cache_dir().unwrap().join("xearthlayer")
+        );
     }
 
     #[test]

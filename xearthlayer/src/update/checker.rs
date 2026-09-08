@@ -66,7 +66,7 @@ impl RemoteUpdateChecker {
 
     /// Create a new checker with the default URL and cache path.
     pub fn new() -> Self {
-        let cache_path = crate::config::config_directory().join("version_check.json");
+        let cache_path = crate::paths::version_check_file();
         Self {
             url: Self::DEFAULT_URL.to_string(),
             cache_path,
