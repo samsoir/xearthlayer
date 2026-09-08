@@ -10,9 +10,11 @@
 //! get their own registries.
 
 mod check;
+mod context;
 mod runner;
 mod types;
 
 pub use check::Preflight;
+pub use context::BootstrapContext;
 pub use runner::{Reporter, Runner};
 pub use types::{PreflightError, Remedy, RunOutcome, Status};
