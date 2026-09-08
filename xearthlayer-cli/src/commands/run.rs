@@ -1,13 +1,10 @@
 //! Run command - mount all installed ortho packages.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use xearthlayer::airport::validate_airport_icao;
 use xearthlayer::config::{
-    analyze_config, config_file_path, format_size, ControlPlaneSettings, DownloadConfig,
-    PipelineSettings, TextureConfig,
+    format_size, ControlPlaneSettings, DownloadConfig, PipelineSettings, TextureConfig,
 };
 use xearthlayer::manager::LocalPackageStore;
 use xearthlayer::package::PackageType;
@@ -19,9 +16,9 @@ use xearthlayer::xplane::XPlaneEnvironment;
 
 use super::common::{resolve_dds_format, resolve_provider, DdsCompression, ProviderType};
 use crate::error::CliError;
-use crate::runner::CliRunner;
 use crate::tui_app::{run_headless, run_tui, TuiAppConfig};
 use crate::ui;
+use xearthlayer::preflight::BootstrapContext;
 
 /// Arguments for the run command.
 ///
@@ -42,82 +39,25 @@ pub struct RunArgs {
 }
 
 /// Run the run command.
-pub fn run(args: RunArgs) -> Result<(), CliError> {
+pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
     // Initialize panic handler early for crash cleanup
     panic_handler::init();
 
-    // Check for first-run scenario: no config file and no packages directory
-    // This provides a friendly welcome message instead of confusing errors
-    let config_path = xearthlayer::config::config_file_path();
-    if !config_path.exists() {
-        let default_packages_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".xearthlayer")
-            .join("packages");
+    // Every prerequisite below was verified before dispatch. Absence here is a
+    // misconfigured registry, not a user error, so it names the check that owed
+    // the value rather than degrading into a vague failure.
+    let config = ctx
+        .config()
+        .expect("preflight check 'load-config' contributes the configuration");
+    let install_location = ctx
+        .install_location()
+        .expect("preflight check 'packages-installed' contributes the install location")
+        .clone();
+    let custom_scenery_path = ctx
+        .custom_scenery_path()
+        .expect("preflight check 'resolve-custom-scenery' contributes the Custom Scenery path")
+        .clone();
 
-        if !default_packages_dir.exists() {
-            // First-run scenario: show welcome message and exit cleanly
-            return Err(CliError::NeedsSetup);
-        }
-    }
-
-    let runner = CliRunner::new()?;
-    runner.log_startup("run");
-
-    // Raise file descriptor limit to the hard maximum. XEL's FUSE mount +
-    // HTTP connections + disk cache can exceed the default soft limit (often
-    // 1024) inherited from the desktop environment. Safe to call at any time;
-    // takes effect immediately for all subsequent open() calls.
-    raise_fd_limit();
-
-    let config = runner.config();
-
-    // Check for config upgrade needs
-    check_config_upgrade_warning();
-
-    // Get install location (where packages are stored)
-    let install_location = config.packages.install_location.clone().unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".xearthlayer")
-            .join("packages")
-    });
-
-    if !install_location.exists() {
-        return Err(CliError::NoPackages {
-            install_location: install_location.clone(),
-        });
-    }
-
-    // Get Custom Scenery path (where mounts go)
-    let custom_scenery_path = resolve_custom_scenery_path(
-        config.packages.custom_scenery_path.clone(),
-        config.xplane.scenery_dir.clone(),
-        || xearthlayer::config::detect_custom_scenery().ok(),
-    )
-    .ok_or_else(|| {
-        CliError::Config(
-            "No Custom Scenery path configured. \
-             Run 'xearthlayer init' or set packages.custom_scenery_path in config.ini"
-                .to_string(),
-        )
-    })?;
-
-    if !custom_scenery_path.exists() {
-        return Err(CliError::Config(format!(
-            "Custom Scenery directory does not exist: {}\n\
-             Check your configuration or run 'xearthlayer init'",
-            custom_scenery_path.display()
-        )));
-    }
-
-    // Validate airport code early (before heavy initialization)
-    if let Some(ref icao) = args.airport {
-        validate_airport_icao(&custom_scenery_path, icao)
-            .map_err(|e| CliError::Config(e.to_string()))?;
-    }
-
-    // Discover installed packages from install_location
     let store = LocalPackageStore::new(&install_location);
     let packages = store
         .list()
@@ -375,124 +315,4 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     println!("All packages unmounted. Goodbye!");
 
     Ok(())
-}
-
-/// Raise the file descriptor soft limit to the hard maximum.
-///
-/// Linux processes inherit a soft FD limit (often 1024) that can be lower
-/// than the hard limit. XEL needs many FDs simultaneously: HTTP connections
-/// to the imagery CDN, disk cache file handles, and FUSE file descriptors
-/// for X-Plane's open textures. This raises the soft limit to the hard
-/// limit (no root required), matching what the system administrator allows.
-fn raise_fd_limit() {
-    match rlimit::Resource::NOFILE.get() {
-        Ok((soft, hard)) if soft < hard => {
-            if let Err(e) = rlimit::Resource::NOFILE.set(hard, hard) {
-                tracing::warn!(soft, hard, error = %e, "Failed to raise FD limit");
-            } else {
-                tracing::info!(
-                    old_soft = soft,
-                    new_soft = hard,
-                    "Raised file descriptor limit"
-                );
-            }
-        }
-        Ok((soft, _)) => {
-            tracing::debug!(soft, "FD limit already at maximum");
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to query FD limit");
-        }
-    }
-}
-
-/// Resolve the Custom Scenery path from configuration, falling back to
-/// auto-detection of the X-Plane installation.
-///
-/// Precedence: `packages.custom_scenery_path` > `xplane.scenery_dir` >
-/// auto-detect. Auto-detection is only attempted when both config values
-/// are unset.
-fn resolve_custom_scenery_path(
-    custom_scenery_path: Option<PathBuf>,
-    scenery_dir: Option<PathBuf>,
-    detect: impl FnOnce() -> Option<PathBuf>,
-) -> Option<PathBuf> {
-    custom_scenery_path.or(scenery_dir).or_else(detect)
-}
-
-/// Display warning if configuration file needs upgrade.
-///
-/// Checks if the user's config.ini is missing settings from the current version
-/// and displays a helpful message with instructions on how to upgrade.
-fn check_config_upgrade_warning() {
-    let path = config_file_path();
-
-    // Only check if config file exists
-    if !path.exists() {
-        return;
-    }
-
-    match analyze_config(&path) {
-        Ok(analysis) if analysis.needs_upgrade => {
-            let missing_count = analysis.missing_keys.len();
-            let deprecated_count = analysis.deprecated_keys.len();
-
-            eprintln!();
-            eprintln!(
-                "Warning: Your configuration file is missing {} new setting(s)",
-                missing_count
-            );
-            if deprecated_count > 0 {
-                eprintln!(
-                    "         and contains {} deprecated setting(s).",
-                    deprecated_count
-                );
-            }
-            eprintln!();
-            eprintln!("Run 'xearthlayer config upgrade' to update your configuration.");
-            eprintln!("Use 'xearthlayer config upgrade --dry-run' to preview changes first.");
-            eprintln!();
-        }
-        Ok(_) => {} // Up to date, no message needed
-        Err(e) => {
-            // Log error but don't fail - config upgrade is informational
-            tracing::warn!("Failed to analyze config for upgrade: {}", e);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn explicit_custom_scenery_path_wins() {
-        let resolved = resolve_custom_scenery_path(
-            Some(PathBuf::from("/configured")),
-            Some(PathBuf::from("/scenery-dir")),
-            || panic!("auto-detect must not run when config is set"),
-        );
-        assert_eq!(resolved, Some(PathBuf::from("/configured")));
-    }
-
-    #[test]
-    fn scenery_dir_used_when_custom_scenery_path_unset() {
-        let resolved =
-            resolve_custom_scenery_path(None, Some(PathBuf::from("/scenery-dir")), || {
-                panic!("auto-detect must not run when scenery_dir is set")
-            });
-        assert_eq!(resolved, Some(PathBuf::from("/scenery-dir")));
-    }
-
-    #[test]
-    fn auto_detect_used_when_both_config_values_unset() {
-        let resolved = resolve_custom_scenery_path(None, None, || Some(PathBuf::from("/detected")));
-        assert_eq!(resolved, Some(PathBuf::from("/detected")));
-    }
-
-    #[test]
-    fn none_when_nothing_configured_and_detection_fails() {
-        let resolved = resolve_custom_scenery_path(None, None, || None);
-        assert_eq!(resolved, None);
-    }
 }

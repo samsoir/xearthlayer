@@ -39,6 +39,7 @@ pub mod package;
 pub mod panic;
 pub mod patches;
 pub mod prefetch;
+pub mod preflight;
 pub mod provider;
 pub mod publisher;
 pub mod runtime;
