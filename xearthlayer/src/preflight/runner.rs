@@ -106,6 +106,27 @@ impl<C> Runner<C> {
                         self.emit(&name, message);
                     }
                     self.checks.extend(remedy.register);
+
+                    // Re-inspect. A remediation must leave the prerequisite
+                    // satisfied, and inspection is pure so this costs nothing
+                    // but a second read. It also lets one check contribute a
+                    // value and then judge it: without the re-inspection, a
+                    // check that resolves a path in remediate could never go
+                    // on to reject that path.
+                    match self.checks[i].inspect(ctx) {
+                        Status::Satisfied => {}
+                        Status::Warning(message) => self.emit(&name, &message),
+                        Status::Unsatisfied { reason, hint, .. } => {
+                            // Deliberately not remediated again: one attempt,
+                            // then the verdict, so a check that cannot fix
+                            // itself cannot spin.
+                            return Ok(RunOutcome::Failed {
+                                check: name,
+                                reason,
+                                hint,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -127,7 +148,7 @@ mod tests {
     use super::*;
     use crate::preflight::{Preflight, PreflightError, Remedy, RunOutcome, Status};
     use std::borrow::Cow;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[derive(Default)]
@@ -135,9 +156,23 @@ mod tests {
         trace: Vec<&'static str>,
     }
 
+    /// A check whose remediation genuinely fixes the problem: once remediated
+    /// it inspects as satisfied. Modelling that matters, because the runner
+    /// verifies remediation with a second inspection.
     struct Recording {
         id: &'static str,
         status: Status,
+        remediated: AtomicBool,
+    }
+
+    impl Recording {
+        fn new(id: &'static str, status: Status) -> Self {
+            Self {
+                id,
+                status,
+                remediated: AtomicBool::new(false),
+            }
+        }
     }
 
     impl Preflight<Ctx> for Recording {
@@ -145,19 +180,21 @@ mod tests {
             Cow::Borrowed(self.id)
         }
         fn inspect(&self, _: &Ctx) -> Status {
-            self.status.clone()
+            if self.remediated.load(Ordering::SeqCst) {
+                Status::Satisfied
+            } else {
+                self.status.clone()
+            }
         }
         fn remediate(&self, ctx: &mut Ctx) -> Result<Remedy<Ctx>, PreflightError> {
             ctx.trace.push(self.id);
+            self.remediated.store(true, Ordering::SeqCst);
             Ok(Remedy::default())
         }
     }
 
     fn remediable(id: &'static str) -> Box<Recording> {
-        Box::new(Recording {
-            id,
-            status: Status::unsatisfied("x").remediable(),
-        })
+        Box::new(Recording::new(id, Status::unsatisfied("x").remediable()))
     }
 
     #[test]
@@ -174,10 +211,10 @@ mod tests {
     #[test]
     fn unsatisfied_and_not_remediable_stops_the_queue() {
         let mut r = Runner::new();
-        r.register(Box::new(Recording {
-            id: "blocker",
-            status: Status::unsatisfied("nope"),
-        }));
+        r.register(Box::new(Recording::new(
+            "blocker",
+            Status::unsatisfied("nope"),
+        )));
         r.register(remediable("never_runs"));
         let mut ctx = Ctx::default();
         match r.enforce(&mut ctx).expect("no remediation error") {
@@ -192,16 +229,24 @@ mod tests {
 
     #[test]
     fn registrations_from_a_remedy_run_at_the_tail() {
-        struct Discovery;
+        #[derive(Default)]
+        struct Discovery {
+            done: AtomicBool,
+        }
         impl Preflight<Ctx> for Discovery {
             fn name(&self) -> Cow<'static, str> {
                 Cow::Borrowed("discovery")
             }
             fn inspect(&self, _: &Ctx) -> Status {
-                Status::unsatisfied("x").remediable()
+                if self.done.load(Ordering::SeqCst) {
+                    Status::Satisfied
+                } else {
+                    Status::unsatisfied("plugins have not been discovered").remediable()
+                }
             }
             fn remediate(&self, ctx: &mut Ctx) -> Result<Remedy<Ctx>, PreflightError> {
                 ctx.trace.push("discovery");
+                self.done.store(true, Ordering::SeqCst);
                 Ok(Remedy {
                     message: None,
                     register: vec![remediable("discovered")],
@@ -209,7 +254,7 @@ mod tests {
             }
         }
         let mut r = Runner::new();
-        r.register(Box::new(Discovery));
+        r.register(Box::<Discovery>::default());
         r.register(remediable("registered_earlier"));
         let mut ctx = Ctx::default();
         r.enforce(&mut ctx).unwrap();
@@ -273,10 +318,10 @@ mod tests {
     fn warning_is_reported_and_does_not_stop_the_queue() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut r = Runner::new();
-        r.register(Box::new(Recording {
-            id: "warn",
-            status: Status::Warning("heads up".into()),
-        }));
+        r.register(Box::new(Recording::new(
+            "warn",
+            Status::Warning("heads up".into()),
+        )));
         r.register(remediable("after_warning"));
         let seen = Arc::clone(&calls);
         r.set_reporter(Box::new(move |_, _| {
@@ -290,6 +335,88 @@ mod tests {
             vec!["after_warning"],
             "a warning does not stop the queue"
         );
+    }
+
+    #[test]
+    fn remediation_is_verified_by_a_second_inspection() {
+        // A check that contributes a value in remediate and then judges it.
+        // Without the re-inspection this could never report the value as bad.
+        struct ResolveThenReject {
+            calls: Arc<AtomicUsize>,
+        }
+        impl Preflight<Ctx> for ResolveThenReject {
+            fn name(&self) -> Cow<'static, str> {
+                Cow::Borrowed("resolve-then-reject")
+            }
+            fn inspect(&self, _: &Ctx) -> Status {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Status::unsatisfied("not resolved yet").remediable()
+                } else {
+                    Status::unsatisfied("resolved, but the directory is missing")
+                }
+            }
+            fn remediate(&self, ctx: &mut Ctx) -> Result<Remedy<Ctx>, PreflightError> {
+                ctx.trace.push("resolved");
+                Ok(Remedy::default())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut r = Runner::new();
+        r.register(Box::new(ResolveThenReject {
+            calls: Arc::clone(&calls),
+        }));
+        r.register(remediable("never_runs"));
+        let mut ctx = Ctx::default();
+
+        match r.enforce(&mut ctx).unwrap() {
+            RunOutcome::Failed { check, reason, .. } => {
+                assert_eq!(check, "resolve-then-reject");
+                assert_eq!(reason, "resolved, but the directory is missing");
+            }
+            other => panic!("expected Failed after re-inspection, got {:?}", other),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "inspected before and after"
+        );
+        assert_eq!(
+            ctx.trace,
+            vec!["resolved"],
+            "the queue stopped at the verdict"
+        );
+    }
+
+    #[test]
+    fn a_remediation_that_fixes_the_problem_lets_the_queue_continue() {
+        struct FixesItself {
+            calls: Arc<AtomicUsize>,
+        }
+        impl Preflight<Ctx> for FixesItself {
+            fn name(&self) -> Cow<'static, str> {
+                Cow::Borrowed("fixes-itself")
+            }
+            fn inspect(&self, _: &Ctx) -> Status {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Status::unsatisfied("not yet").remediable()
+                } else {
+                    Status::Satisfied
+                }
+            }
+            fn remediate(&self, ctx: &mut Ctx) -> Result<Remedy<Ctx>, PreflightError> {
+                ctx.trace.push("fixed");
+                Ok(Remedy::default())
+            }
+        }
+        let mut r = Runner::new();
+        r.register(Box::new(FixesItself {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        r.register(remediable("runs_after"));
+        let mut ctx = Ctx::default();
+        r.enforce(&mut ctx).unwrap();
+        assert_eq!(ctx.trace, vec!["fixed", "runs_after"]);
     }
 
     #[test]
