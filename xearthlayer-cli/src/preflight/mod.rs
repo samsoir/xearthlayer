@@ -48,22 +48,53 @@ pub fn legacy_default_packages_dir() -> PathBuf {
 /// **Registration order is execution order**, and this order reproduces what
 /// `commands/run.rs` did inline. It is asserted by test, because it is
 /// load-bearing and was previously implicit in the shape of one function.
-pub fn build_registry() -> Runner<BootstrapContext> {
-    build_registry_with(
-        config_file_path(),
-        legacy_default_packages_dir(),
-        default_lock_path(),
-        || xearthlayer::config::detect_custom_scenery().ok(),
-    )
+/// Every environment source the registry's checks read.
+///
+/// A struct rather than a parameter list because the checks are injected
+/// wholesale: no check consults the real environment directly, so this grows by
+/// one field for each new check that touches the filesystem. Assembling it in
+/// one place also means a test fabricating an environment is told, by the
+/// compiler, everything it has to fabricate.
+pub struct RegistryEnv {
+    pub config_path: PathBuf,
+    pub legacy_packages_dir: PathBuf,
+    pub lock_path: PathBuf,
+    pub macfuse_probe: PathBuf,
+    pub detect_custom_scenery: Box<dyn Fn() -> Option<PathBuf> + Send + Sync>,
 }
 
-/// Build the registry against explicit paths and detector, for tests.
-pub fn build_registry_with(
-    config_path: PathBuf,
-    legacy_packages_dir: PathBuf,
-    lock_path: PathBuf,
-    detect: impl Fn() -> Option<PathBuf> + Send + Sync + 'static,
-) -> Runner<BootstrapContext> {
+impl RegistryEnv {
+    /// The real environment.
+    pub fn production() -> Self {
+        Self {
+            config_path: config_file_path(),
+            legacy_packages_dir: legacy_default_packages_dir(),
+            lock_path: default_lock_path(),
+            macfuse_probe: PathBuf::from(system::MACFUSE_BUNDLE),
+            detect_custom_scenery: Box::new(|| xearthlayer::config::detect_custom_scenery().ok()),
+        }
+    }
+}
+
+/// Build the bootstrap registry against the real environment.
+pub fn build_registry() -> Runner<BootstrapContext> {
+    build_registry_with(RegistryEnv::production())
+}
+
+/// Build the registry against an explicit environment.
+///
+/// **Registration order is execution order**, and this order reproduces what
+/// `commands/run.rs` did inline. It is asserted by test, because it is
+/// load-bearing and was previously implicit in the shape of one function.
+pub fn build_registry_with(env: RegistryEnv) -> Runner<BootstrapContext> {
+    let RegistryEnv {
+        config_path,
+        legacy_packages_dir,
+        lock_path,
+        macfuse_probe,
+        detect_custom_scenery,
+    } = env;
+
     let mut runner = Runner::new();
     runner.register(Box::new(config::FirstRun::with_paths(
         config_path.clone(),
@@ -76,10 +107,14 @@ pub fn build_registry_with(
         config_path,
     )));
     runner.register(Box::new(paths::PackagesInstalled));
-    runner.register(Box::new(paths::ResolveCustomScenery::with_detector(detect)));
+    runner.register(Box::new(paths::ResolveCustomScenery::with_detector(
+        detect_custom_scenery,
+    )));
     runner.register(Box::new(paths::CustomSceneryExists));
     runner.register(Box::new(system::AirportIcao));
-    runner.register(Box::<system::MacFuseAvailable>::default());
+    runner.register(Box::new(system::MacFuseAvailable::with_probe(
+        macfuse_probe,
+    )));
 
     // Last: the lock is claimed only for a run that will actually proceed.
     // Claiming it earlier would leave a lock behind for a run rejected by a
@@ -210,12 +245,19 @@ mod tests {
         assert_eq!(e.to_string(), "Configuration error: it is broken");
     }
 
-    fn fabricate_complete_environment() -> (tempfile::TempDir, PathBuf) {
+    /// An environment in which every prerequisite is satisfiable.
+    ///
+    /// Includes the macFUSE bundle. On macOS that check applies and a CI runner
+    /// has no macFUSE installed, so omitting it made this fabrication complete
+    /// on Linux and incomplete on macOS.
+    fn fabricate_complete_environment() -> (tempfile::TempDir, RegistryEnv) {
         let dir = tempfile::tempdir().unwrap();
         let packages = dir.path().join("packages");
         let scenery = dir.path().join("Custom Scenery");
+        let macfuse = dir.path().join("macfuse.fs");
         std::fs::create_dir(&packages).unwrap();
         std::fs::create_dir(&scenery).unwrap();
+        std::fs::create_dir(&macfuse).unwrap();
         let config_path = dir.path().join("config.ini");
         std::fs::write(
             &config_path,
@@ -226,7 +268,25 @@ mod tests {
             ),
         )
         .unwrap();
-        (dir, config_path)
+        let env = RegistryEnv {
+            config_path,
+            legacy_packages_dir: dir.path().join("no-legacy-packages"),
+            lock_path: dir.path().join("xearthlayer.lock"),
+            macfuse_probe: macfuse,
+            detect_custom_scenery: Box::new(|| None),
+        };
+        (dir, env)
+    }
+
+    /// An environment in which nothing exists.
+    fn fabricate_empty_environment(dir: &tempfile::TempDir) -> RegistryEnv {
+        RegistryEnv {
+            config_path: dir.path().join("absent.ini"),
+            legacy_packages_dir: dir.path().join("absent-packages"),
+            lock_path: dir.path().join("xearthlayer.lock"),
+            macfuse_probe: dir.path().join("absent-macfuse.fs"),
+            detect_custom_scenery: Box::new(|| None),
+        }
     }
 
     #[test]
@@ -234,13 +294,8 @@ mod tests {
         // The property the whole design rests on: preflight leaves behind the
         // inputs XEarthLayer launches from. Adding a context field with no
         // check to fill it fails here.
-        let (dir, config_path) = fabricate_complete_environment();
-        let mut registry = build_registry_with(
-            config_path,
-            dir.path().join("no-legacy-packages"),
-            dir.path().join("xearthlayer.lock"),
-            || None,
-        );
+        let (_dir, env) = fabricate_complete_environment();
+        let mut registry = build_registry_with(env);
         let mut ctx = BootstrapContext::new("run", None);
 
         let outcome = registry.enforce(&mut ctx).expect("no remediation failure");
@@ -261,14 +316,26 @@ mod tests {
     }
 
     #[test]
+    fn the_fabricated_environment_satisfies_the_macos_only_check_too() {
+        // The registry never runs macfuse-available on Linux, because applies()
+        // is false there, so the completeness test above cannot cover it here.
+        // Asserting it directly means an incomplete fabrication fails on both
+        // platforms rather than only on the one that runs the check. Omitting
+        // this is what let a macOS-only CI failure through.
+        let (_dir, env) = fabricate_complete_environment();
+        use xearthlayer::preflight::{Preflight, Status};
+        let check = system::MacFuseAvailable::with_probe(env.macfuse_probe.clone());
+        assert_eq!(
+            check.inspect(&BootstrapContext::new("run", None)),
+            Status::Satisfied
+        );
+    }
+
+    #[test]
     fn registration_order_reproduces_what_run_did_inline() {
         // Load-bearing and, until now, implicit in the shape of one function.
-        let registry = build_registry_with(
-            PathBuf::from("/nonexistent/config.ini"),
-            PathBuf::from("/nonexistent/packages"),
-            PathBuf::from("/nonexistent/xearthlayer.lock"),
-            || None,
-        );
+        let dir = tempfile::tempdir().unwrap();
+        let registry = build_registry_with(fabricate_empty_environment(&dir));
         let order: Vec<String> = registry
             .check_names()
             .iter()
@@ -296,12 +363,8 @@ mod tests {
     fn setup_does_not_inherit_runs_prerequisites() {
         // setup exists to create the state these checks require. If any applied,
         // a new user could never reach the wizard.
-        let registry = build_registry_with(
-            PathBuf::from("/nonexistent/config.ini"),
-            PathBuf::from("/nonexistent/packages"),
-            PathBuf::from("/nonexistent/xearthlayer.lock"),
-            || None,
-        );
+        let dir = tempfile::tempdir().unwrap();
+        let registry = build_registry_with(fabricate_empty_environment(&dir));
         let ctx = BootstrapContext::new("setup", None);
         assert!(
             registry.report(&ctx).is_empty(),
@@ -313,12 +376,7 @@ mod tests {
     #[test]
     fn a_first_run_environment_still_reports_needs_setup() {
         let dir = tempfile::tempdir().unwrap();
-        let mut registry = build_registry_with(
-            dir.path().join("absent.ini"),
-            dir.path().join("absent-packages"),
-            dir.path().join("xearthlayer.lock"),
-            || None,
-        );
+        let mut registry = build_registry_with(fabricate_empty_environment(&dir));
         let mut ctx = BootstrapContext::new("run", None);
         let err = finish(registry.enforce(&mut ctx), &ctx).expect_err("first run blocks");
         assert!(

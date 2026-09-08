@@ -367,6 +367,14 @@ require, and update the expected order in
 `registration_order_reproduces_what_run_did_inline`. That test failing is the
 intended prompt to think about position.
 
+If the check reads the environment, add its source to `RegistryEnv` rather than
+taking it from a default. The struct exists so that a test fabricating an
+environment is told by the compiler everything it has to fabricate. A check
+excluded on the test machine's platform is the case to watch: it will not run
+through the registry there, so assert its satisfied path directly as well.
+`the_fabricated_environment_satisfies_the_macos_only_check_too` is that
+assertion for macFUSE.
+
 ### 5. Map its failure
 
 By default an unsatisfied check becomes `CliError::Config` with the reason and

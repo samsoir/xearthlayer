@@ -202,7 +202,7 @@ pub struct MacFuseAvailable {
 }
 
 /// Where macFUSE installs its filesystem bundle.
-const MACFUSE_BUNDLE: &str = "/Library/Filesystems/macfuse.fs";
+pub const MACFUSE_BUNDLE: &str = "/Library/Filesystems/macfuse.fs";
 
 impl Default for MacFuseAvailable {
     fn default() -> Self {
@@ -213,9 +213,10 @@ impl Default for MacFuseAvailable {
 }
 
 impl MacFuseAvailable {
-    /// Construct with an explicit probe path, so tests do not depend on
-    /// whether the machine running them has macFUSE.
-    #[cfg(test)]
+    /// Construct with an explicit probe path.
+    ///
+    /// Injected like every other environment source, so a test does not depend
+    /// on whether the machine running it has macFUSE.
     pub fn with_probe(probe: PathBuf) -> Self {
         Self { probe }
     }
