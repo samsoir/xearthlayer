@@ -215,7 +215,10 @@ mod tests {
         assert_eq!(config.max_size_bytes, 20 * 1024 * 1024 * 1024); // 20 GB
         assert_eq!(config.daemon_interval_secs, 60);
         assert!(config.max_age_days.is_none());
-        assert!(config.cache_dir.ends_with("xearthlayer"));
+        // Against the resolver, not a hardcoded directory name. The name
+        // differs by platform, capitalised on macOS per Apple convention, so
+        // an assertion that spells it out passes on Linux and fails on macOS.
+        assert_eq!(config.cache_dir, crate::paths::tile_cache_dir());
     }
 
     // These exact strings already appear in disk cache log output. Changing
