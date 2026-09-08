@@ -7,6 +7,106 @@ use xearthlayer::config::ConfigFile;
 use xearthlayer::paths::{BaseDirectories, LAYOUT_VERSION};
 use xearthlayer::preflight::{BootstrapContext, Preflight, PreflightError, Remedy, Status};
 
+/// How the proposed layout is confirmed with the user.
+///
+/// Injected rather than decided inside the migration. Sniffing the environment
+/// for a terminal is not enough: a unit test run from a developer's shell has a
+/// terminal, so a migration that prompts when it sees one will prompt from
+/// inside the test suite and wait for a keypress that never comes.
+pub trait ConfirmLayout: Send + Sync {
+    fn confirm(
+        &self,
+        proposals: Vec<super::proposal::ResourceProposal>,
+    ) -> Vec<super::proposal::ResourceProposal>;
+}
+
+/// Accept the proposal without asking.
+///
+/// What tests use, and what the interactive confirmer falls back to when there
+/// is no terminal to ask in.
+pub struct AcceptProposal;
+
+impl ConfirmLayout for AcceptProposal {
+    fn confirm(
+        &self,
+        proposals: Vec<super::proposal::ResourceProposal>,
+    ) -> Vec<super::proposal::ResourceProposal> {
+        proposals
+    }
+}
+
+/// Ask the user, when there is a terminal to ask in.
+pub struct AskUser;
+
+impl ConfirmLayout for AskUser {
+    fn confirm(
+        &self,
+        mut proposals: Vec<super::proposal::ResourceProposal>,
+    ) -> Vec<super::proposal::ResourceProposal> {
+        use super::proposal::{negotiable, toggle};
+        use std::io::IsTerminal;
+
+        let pending = negotiable(&proposals);
+        if pending.is_empty() {
+            return proposals;
+        }
+
+        // `cfg!(test)` is a second line of defence behind injection. A test
+        // must never block on input, and stdin *is* a terminal when the suite
+        // is run from a shell, which is how a single unit test came to hang
+        // `make verify` on every platform.
+        let can_ask = !cfg!(test) && std::io::stdin().is_terminal();
+        if !can_ask {
+            // No terminal to ask in, so accept the proposal. That is a no-op
+            // and always correct; blocking under a service manager would not
+            // be.
+            println!(
+                "Some locations were kept where they are. Run 'xearthlayer migrate' \
+                 from a terminal to review them."
+            );
+            println!();
+            return AcceptProposal.confirm(proposals);
+        }
+
+        let theme = dialoguer::theme::ColorfulTheme::default();
+        loop {
+            let accept = dialoguer::Confirm::with_theme(&theme)
+                .with_prompt("Use this layout?")
+                .default(true)
+                .interact()
+                .unwrap_or(true);
+            if accept {
+                return proposals;
+            }
+
+            let choices: Vec<String> = pending
+                .iter()
+                .map(|&i| {
+                    let p = &proposals[i];
+                    format!(
+                        "{}: {}",
+                        p.resource.label(),
+                        p.effective_path().unwrap_or_default().display()
+                    )
+                })
+                .collect();
+
+            let Ok(picked) = dialoguer::Select::with_theme(&theme)
+                .with_prompt("Which location should change?")
+                .items(&choices)
+                .default(0)
+                .interact()
+            else {
+                return proposals;
+            };
+            toggle(&mut proposals[pending[picked]]);
+            println!();
+            print!("{}", super::proposal::render(&proposals));
+            println!();
+        }
+    }
+}
+
 /// Name of the marker left behind in the legacy directory.
 const MARKER: &str = "MIGRATED.txt";
 
@@ -36,6 +136,7 @@ pub struct LayoutMigration {
     target: Box<dyn BaseDirectories>,
     /// Whether this registration is the automatic one run before dispatch.
     automatic: bool,
+    confirm: Box<dyn ConfirmLayout>,
 }
 
 impl LayoutMigration {
@@ -45,6 +146,7 @@ impl LayoutMigration {
             legacy_dir,
             target,
             automatic: true,
+            confirm: Box::new(AskUser),
         }
     }
 
@@ -55,7 +157,18 @@ impl LayoutMigration {
             legacy_dir,
             target,
             automatic: false,
+            confirm: Box::new(AskUser),
         }
+    }
+
+    /// Replace how the layout is confirmed.
+    ///
+    /// A test seam. Nothing in the suite may hold [`AskUser`], because a test
+    /// that reaches a prompt waits for a keypress that never comes.
+    #[cfg(test)]
+    pub fn confirming_with(mut self, confirm: Box<dyn ConfirmLayout>) -> Self {
+        self.confirm = confirm;
+        self
     }
 
     /// The legacy `config.ini`.
@@ -138,79 +251,21 @@ fn report_guidance(proposals: &[super::proposal::ResourceProposal]) {
 }
 
 impl LayoutMigration {
-    /// Show the proposed layout and let the user change it.
+    /// Show the proposed layout, then let the confirmer decide.
     ///
-    /// One screen, one confirmation, and anything they disagree with can be
-    /// changed individually. **Keep is the standing default throughout**, so
-    /// pressing Enter can never break a working installation.
-    ///
-    /// Without a terminal this does not guess and does not block: the proposal
-    /// stands, which is a no-op that is always correct, and the user is told
-    /// how to review it later. A migration that hung waiting for input under a
-    /// service manager would be worse than one that deferred a question.
+    /// The readback is always printed: it answers "where will my files be",
+    /// which matters whether or not anything is being asked. Only the asking is
+    /// delegated.
     fn negotiate(
         &self,
-        mut proposals: Vec<super::proposal::ResourceProposal>,
+        proposals: Vec<super::proposal::ResourceProposal>,
     ) -> Vec<super::proposal::ResourceProposal> {
-        use super::proposal::{negotiable, render, toggle};
-        use std::io::IsTerminal;
-
-        let pending = negotiable(&proposals);
         println!();
         println!("XEarthLayer is moving to the standard directories for your system.");
         println!();
-        print!("{}", render(&proposals));
+        print!("{}", super::proposal::render(&proposals));
         println!();
-
-        if pending.is_empty() {
-            return proposals;
-        }
-
-        if !std::io::stdin().is_terminal() {
-            println!(
-                "Some locations were kept where they are. Run 'xearthlayer migrate' \
-                 from a terminal to review them."
-            );
-            println!();
-            return proposals;
-        }
-
-        let theme = dialoguer::theme::ColorfulTheme::default();
-        loop {
-            let accept = dialoguer::Confirm::with_theme(&theme)
-                .with_prompt("Use this layout?")
-                .default(true)
-                .interact()
-                .unwrap_or(true);
-            if accept {
-                return proposals;
-            }
-
-            let choices: Vec<String> = pending
-                .iter()
-                .map(|&i| {
-                    let p = &proposals[i];
-                    format!(
-                        "{}: {}",
-                        p.resource.label(),
-                        p.effective_path().unwrap_or_default().display()
-                    )
-                })
-                .collect();
-
-            let Ok(picked) = dialoguer::Select::with_theme(&theme)
-                .with_prompt("Which location should change?")
-                .items(&choices)
-                .default(0)
-                .interact()
-            else {
-                return proposals;
-            };
-            toggle(&mut proposals[pending[picked]]);
-            println!();
-            print!("{}", render(&proposals));
-            println!();
-        }
+        self.confirm.confirm(proposals)
     }
 }
 
@@ -346,6 +401,8 @@ mod tests {
         std::fs::write(f.legacy.join("config.ini"), body).unwrap();
     }
 
+    /// Every test builds the migration through here, so no test can hold the
+    /// interactive confirmer and block the suite waiting for a keypress.
     fn check(f: &Fixture) -> LayoutMigration {
         LayoutMigration::automatic(
             f.legacy.clone(),
@@ -353,6 +410,37 @@ mod tests {
                 f.base.config_dir().parent().unwrap(),
             )),
         )
+        .confirming_with(Box::new(AcceptProposal))
+    }
+
+    #[test]
+    fn accepting_the_proposal_asks_nothing_and_changes_nothing() {
+        // The regression this guards: remediate() prompted whenever stdin was a
+        // terminal, which it is for anyone running the suite from a shell, so a
+        // unit test sat waiting for a keypress and hung `make verify` on every
+        // platform. Confirmation is injected now, and this pins the
+        // non-interactive confirmer as a pure pass-through.
+        let f = fixture();
+        std::fs::create_dir_all(f.legacy.join("packages")).unwrap();
+        write_legacy_config(&f, "[general]\n");
+
+        let proposals = crate::preflight::proposal::propose(
+            &ConfigFile::load_from(&f.legacy.join("config.ini")).unwrap(),
+            &f.legacy,
+            &TestDirectories::rooted_at(f.base.config_dir().parent().unwrap()),
+            |p| p.exists(),
+        );
+        assert!(
+            !crate::preflight::proposal::negotiable(&proposals).is_empty(),
+            "the fixture must actually have something to ask about"
+        );
+
+        let before: Vec<_> = proposals.iter().map(|p| p.disposition).collect();
+        let after = AcceptProposal.confirm(proposals);
+        assert_eq!(
+            after.iter().map(|p| p.disposition).collect::<Vec<_>>(),
+            before
+        );
     }
 
     #[test]
@@ -542,7 +630,8 @@ mod tests {
             Box::new(TestDirectories::rooted_at(
                 f.base.config_dir().parent().unwrap(),
             )),
-        );
+        )
+        .confirming_with(Box::new(AcceptProposal));
         assert!(c.applies(&BootstrapContext::new("migrate", None)));
     }
 
