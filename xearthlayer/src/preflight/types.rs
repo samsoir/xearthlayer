@@ -136,6 +136,15 @@ impl PreflightError {
         self
     }
 
+    /// Take ownership of the attached source.
+    ///
+    /// Ownership rather than a borrow because the caller's purpose is to
+    /// downcast it back to a concrete error and rebuild a richer error from it,
+    /// and not every error type is `Clone`.
+    pub fn into_source(self) -> Option<Box<dyn std::error::Error + Send + Sync + 'static>> {
+        self.source
+    }
+
     /// The attached source, if any.
     pub fn source_ref(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.source

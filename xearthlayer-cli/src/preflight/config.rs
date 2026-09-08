@@ -3,17 +3,8 @@
 use super::names;
 use std::borrow::Cow;
 use std::path::PathBuf;
-use xearthlayer::config::{analyze_config, config_file_path, ConfigFile};
+use xearthlayer::config::{analyze_config, ConfigFile};
 use xearthlayer::preflight::{BootstrapContext, Preflight, PreflightError, Remedy, Status};
-
-/// The legacy default package directory, used only to decide whether this is a
-/// genuinely fresh installation.
-fn legacy_default_packages_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".xearthlayer")
-        .join("packages")
-}
 
 /// Is this a first run: no configuration file and no packages?
 ///
@@ -25,13 +16,6 @@ pub struct FirstRun {
 }
 
 impl FirstRun {
-    pub fn production() -> Self {
-        Self {
-            config_path: config_file_path(),
-            legacy_packages_dir: legacy_default_packages_dir(),
-        }
-    }
-
     /// Construct with explicit paths so tests never consult a real home
     /// directory.
     pub fn with_paths(config_path: PathBuf, legacy_packages_dir: PathBuf) -> Self {
@@ -69,12 +53,6 @@ pub struct LoadConfig {
 }
 
 impl LoadConfig {
-    pub fn production() -> Self {
-        Self {
-            path: config_file_path(),
-        }
-    }
-
     pub fn with_path(path: PathBuf) -> Self {
         Self { path }
     }
@@ -123,12 +101,6 @@ pub struct ConfigUpgradeWarning {
 }
 
 impl ConfigUpgradeWarning {
-    pub fn production() -> Self {
-        Self {
-            path: config_file_path(),
-        }
-    }
-
     pub fn with_path(path: PathBuf) -> Self {
         Self { path }
     }

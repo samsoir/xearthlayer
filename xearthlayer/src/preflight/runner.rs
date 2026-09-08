@@ -55,6 +55,14 @@ impl<C> Runner<C> {
         self.checks.retain(|c| c.name() != name);
     }
 
+    /// Names of the registered checks, in execution order.
+    ///
+    /// Exists so the order can be asserted. It is load-bearing and was
+    /// previously implicit in the shape of one function.
+    pub fn check_names(&self) -> Vec<Cow<'static, str>> {
+        self.checks.iter().map(|c| c.name()).collect()
+    }
+
     /// Inspect every applicable check, with no side effects.
     ///
     /// This is what a diagnostic report runs. It never calls

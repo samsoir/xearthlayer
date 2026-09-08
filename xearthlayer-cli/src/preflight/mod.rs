@@ -3,15 +3,11 @@
 //! The framework lives in the library crate; the concrete checks live here,
 //! because what counts as a prerequisite is a property of the CLI rather than
 //! of the engine.
-//!
-// Scaffolding lands before the checks that use it, and the project gate is
-// `-D warnings`. Nothing in the binary consumes these until main() runs the
-// registry. REMOVE THIS ATTRIBUTE in the wiring commit; the tests below
-// already exercise every item it covers.
-#![allow(dead_code)]
 
 use crate::error::CliError;
-use xearthlayer::preflight::BootstrapContext;
+use std::path::PathBuf;
+use xearthlayer::config::{config_file_path, ConfigFileError};
+use xearthlayer::preflight::{BootstrapContext, PreflightError, RunOutcome, Runner};
 
 /// Check names.
 ///
@@ -25,12 +21,101 @@ pub mod system;
 pub mod names {
     pub const FIRST_RUN: &str = "first-run";
     pub const LOAD_CONFIG: &str = "load-config";
+    pub const LOG_STARTUP: &str = "log-startup";
     pub const FD_LIMIT: &str = "fd-limit";
     pub const CONFIG_UPGRADE: &str = "config-upgrade";
     pub const PACKAGES_INSTALLED: &str = "packages-installed";
     pub const RESOLVE_CUSTOM_SCENERY: &str = "resolve-custom-scenery";
     pub const CUSTOM_SCENERY_EXISTS: &str = "custom-scenery-exists";
     pub const AIRPORT_ICAO: &str = "airport-icao";
+}
+
+/// The legacy default package directory.
+///
+/// One definition: two checks need it, and a path rule that exists twice is a
+/// path rule that drifts.
+pub fn legacy_default_packages_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".xearthlayer")
+        .join("packages")
+}
+
+/// Build the bootstrap registry.
+///
+/// **Registration order is execution order**, and this order reproduces what
+/// `commands/run.rs` did inline. It is asserted by test, because it is
+/// load-bearing and was previously implicit in the shape of one function.
+pub fn build_registry() -> Runner<BootstrapContext> {
+    build_registry_with(config_file_path(), legacy_default_packages_dir(), || {
+        xearthlayer::config::detect_custom_scenery().ok()
+    })
+}
+
+/// Build the registry against explicit paths and detector, for tests.
+pub fn build_registry_with(
+    config_path: PathBuf,
+    legacy_packages_dir: PathBuf,
+    detect: impl Fn() -> Option<PathBuf> + Send + Sync + 'static,
+) -> Runner<BootstrapContext> {
+    let mut runner = Runner::new();
+    runner.register(Box::new(config::FirstRun::with_paths(
+        config_path.clone(),
+        legacy_packages_dir,
+    )));
+    runner.register(Box::new(config::LoadConfig::with_path(config_path.clone())));
+    runner.register(Box::<system::LogStartup>::default());
+    runner.register(Box::<system::FdLimit>::default());
+    runner.register(Box::new(config::ConfigUpgradeWarning::with_path(
+        config_path,
+    )));
+    runner.register(Box::new(paths::PackagesInstalled));
+    runner.register(Box::new(paths::ResolveCustomScenery::with_detector(detect)));
+    runner.register(Box::new(paths::CustomSceneryExists));
+    runner.register(Box::new(system::AirportIcao));
+    runner
+}
+
+/// Run every applicable prerequisite for this command.
+///
+/// Executes before dispatch, so `run` and `setup` get the same answer to
+/// "does this installation exist". Placing it inside `run` alone would leave
+/// the setup wizard treating an existing user as new.
+pub fn enforce(ctx: &mut BootstrapContext) -> Result<(), CliError> {
+    let mut registry = build_registry();
+    registry.set_reporter(Box::new(|_check, message| eprintln!("{}", message)));
+    finish(registry.enforce(ctx), ctx)
+}
+
+fn finish(
+    outcome: Result<RunOutcome, PreflightError>,
+    ctx: &BootstrapContext,
+) -> Result<(), CliError> {
+    match outcome {
+        Ok(RunOutcome::AllSatisfied) => Ok(()),
+        Ok(RunOutcome::Failed {
+            check,
+            reason,
+            hint,
+        }) => Err(to_cli_error(&check, reason, hint, ctx)),
+        Err(e) => Err(remediation_to_cli_error(e)),
+    }
+}
+
+/// Map a remediation failure onto the error the CLI already produces.
+///
+/// A corrupt configuration file has always rendered as
+/// [`CliError::ConfigFile`], with its own help text pointing at the file. The
+/// check attaches the underlying error precisely so that survives.
+pub fn remediation_to_cli_error(e: PreflightError) -> CliError {
+    let message = e.message.clone();
+    match e.into_source() {
+        Some(source) => match source.downcast::<ConfigFileError>() {
+            Ok(cause) => CliError::ConfigFile(*cause),
+            Err(_) => CliError::Config(message),
+        },
+        None => CliError::Config(message),
+    }
 }
 
 /// Map a failed check onto the [`CliError`] the CLI already produces for it.
@@ -108,11 +193,141 @@ mod tests {
         assert_eq!(e.to_string(), "Configuration error: it is broken");
     }
 
+    fn fabricate_complete_environment() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let packages = dir.path().join("packages");
+        let scenery = dir.path().join("Custom Scenery");
+        std::fs::create_dir(&packages).unwrap();
+        std::fs::create_dir(&scenery).unwrap();
+        let config_path = dir.path().join("config.ini");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[packages]\ninstall_location = {}\ncustom_scenery_path = {}\n",
+                packages.display(),
+                scenery.display()
+            ),
+        )
+        .unwrap();
+        (dir, config_path)
+    }
+
+    #[test]
+    fn the_bootstrap_pipeline_fills_every_context_field() {
+        // The property the whole design rests on: preflight leaves behind the
+        // inputs XEarthLayer launches from. Adding a context field with no
+        // check to fill it fails here.
+        let (dir, config_path) = fabricate_complete_environment();
+        let mut registry =
+            build_registry_with(config_path, dir.path().join("no-legacy-packages"), || None);
+        let mut ctx = BootstrapContext::new("run", None);
+
+        let outcome = registry.enforce(&mut ctx).expect("no remediation failure");
+        assert!(
+            matches!(outcome, RunOutcome::AllSatisfied),
+            "expected every prerequisite satisfied, got {outcome:?}"
+        );
+
+        assert!(ctx.config().is_some(), "no check contributed the config");
+        assert!(
+            ctx.install_location().is_some(),
+            "no check contributed the install location"
+        );
+        assert!(
+            ctx.custom_scenery_path().is_some(),
+            "no check contributed the Custom Scenery path"
+        );
+    }
+
+    #[test]
+    fn registration_order_reproduces_what_run_did_inline() {
+        // Load-bearing and, until now, implicit in the shape of one function.
+        let registry = build_registry_with(
+            PathBuf::from("/nonexistent/config.ini"),
+            PathBuf::from("/nonexistent/packages"),
+            || None,
+        );
+        let order: Vec<String> = registry
+            .check_names()
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                names::FIRST_RUN,
+                names::LOAD_CONFIG,
+                names::LOG_STARTUP,
+                names::FD_LIMIT,
+                names::CONFIG_UPGRADE,
+                names::PACKAGES_INSTALLED,
+                names::RESOLVE_CUSTOM_SCENERY,
+                names::CUSTOM_SCENERY_EXISTS,
+                names::AIRPORT_ICAO,
+            ]
+        );
+    }
+
+    #[test]
+    fn setup_does_not_inherit_runs_prerequisites() {
+        // setup exists to create the state these checks require. If any applied,
+        // a new user could never reach the wizard.
+        let registry = build_registry_with(
+            PathBuf::from("/nonexistent/config.ini"),
+            PathBuf::from("/nonexistent/packages"),
+            || None,
+        );
+        let ctx = BootstrapContext::new("setup", None);
+        assert!(
+            registry.report(&ctx).is_empty(),
+            "no run prerequisite may apply to setup, found {:?}",
+            registry.report(&ctx)
+        );
+    }
+
+    #[test]
+    fn a_first_run_environment_still_reports_needs_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = build_registry_with(
+            dir.path().join("absent.ini"),
+            dir.path().join("absent-packages"),
+            || None,
+        );
+        let mut ctx = BootstrapContext::new("run", None);
+        let err = finish(registry.enforce(&mut ctx), &ctx).expect_err("first run blocks");
+        assert!(
+            matches!(err, CliError::NeedsSetup),
+            "a fresh install must still print the welcome and exit 0, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_config_still_renders_as_a_config_file_error() {
+        // CliError::ConfigFile carries its own help text pointing at the file.
+        // Degrading it to a generic message would be a behaviour change.
+        let cause = ConfigFileError::WriteError("bad ini".to_string());
+        let e = PreflightError::new(names::LOAD_CONFIG, cause.to_string()).with_source(cause);
+        assert!(matches!(
+            remediation_to_cli_error(e),
+            CliError::ConfigFile(_)
+        ));
+    }
+
+    #[test]
+    fn a_remediation_failure_without_a_source_is_a_plain_config_error() {
+        let e = PreflightError::new(names::RESOLVE_CUSTOM_SCENERY, "nothing configured");
+        match remediation_to_cli_error(e) {
+            CliError::Config(msg) => assert_eq!(msg, "nothing configured"),
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
     #[test]
     fn check_names_are_unique() {
         let all = [
             names::FIRST_RUN,
             names::LOAD_CONFIG,
+            names::LOG_STARTUP,
             names::FD_LIMIT,
             names::CONFIG_UPGRADE,
             names::PACKAGES_INSTALLED,

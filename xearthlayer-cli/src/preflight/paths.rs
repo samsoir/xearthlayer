@@ -1,6 +1,6 @@
 //! Path-resolution preflight checks.
 
-use super::names;
+use super::{legacy_default_packages_dir, names};
 use std::borrow::Cow;
 use std::path::PathBuf;
 use xearthlayer::preflight::{BootstrapContext, Preflight, PreflightError, Remedy, Status};
@@ -20,15 +20,6 @@ pub fn resolve_custom_scenery_path(
     detect: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
     custom_scenery_path.or(scenery_dir).or_else(detect)
-}
-
-/// The legacy default package directory, used when configuration does not
-/// specify one.
-fn legacy_default_packages_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".xearthlayer")
-        .join("packages")
 }
 
 /// Resolve where packages are installed, and require that the directory exists.
@@ -81,12 +72,6 @@ pub struct ResolveCustomScenery {
 }
 
 impl ResolveCustomScenery {
-    pub fn production() -> Self {
-        Self {
-            detect: Box::new(|| xearthlayer::config::detect_custom_scenery().ok()),
-        }
-    }
-
     /// Inject the detector so tests never probe for a real X-Plane install.
     pub fn with_detector(detect: impl Fn() -> Option<PathBuf> + Send + Sync + 'static) -> Self {
         Self {

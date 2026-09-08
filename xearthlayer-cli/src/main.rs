@@ -166,6 +166,35 @@ enum Commands {
 // Main Entry Point
 // ============================================================================
 
+/// The command being run, as the preflight checks name it.
+///
+/// Exhaustive on purpose: a new subcommand must decide what it is called here
+/// before it compiles, rather than silently inheriting another command's
+/// prerequisites.
+fn command_name(command: &Option<Commands>) -> &'static str {
+    match command {
+        // No subcommand defaults to `run`, so it gets `run`'s prerequisites.
+        None | Some(Commands::Run { .. }) => "run",
+        Some(Commands::Init) => "init",
+        Some(Commands::Setup) => "setup",
+        Some(Commands::Config { .. }) => "config",
+        Some(Commands::Cache { .. }) => "cache",
+        Some(Commands::SceneryIndex { .. }) => "scenery-index",
+        Some(Commands::Diagnostics) => "diagnostics",
+        Some(Commands::Publish { .. }) => "publish",
+        Some(Commands::Packages { .. }) => "packages",
+        Some(Commands::Patches { .. }) => "patches",
+    }
+}
+
+/// The airport requested on the command line, if any.
+fn requested_airport(command: &Option<Commands>) -> Option<String> {
+    match command {
+        Some(Commands::Run { airport, .. }) => airport.clone(),
+        _ => None,
+    }
+}
+
 fn main() -> ExitCode {
     // First, before anything allocates in earnest, and before any thread is
     // created — the arena ceiling only bounds arenas not yet made.
@@ -205,9 +234,18 @@ fn main() -> ExitCode {
         }
     };
 
-    let result = match cli.command {
+    // Prerequisites run before dispatch, not inside `run`. Both `run` and the
+    // setup wizard independently answer "does this installation exist" from the
+    // same state, so a check that lived in `run` alone would leave `setup`
+    // treating an existing user as new and discarding their settings.
+    let mut ctx = xearthlayer::preflight::BootstrapContext::new(
+        command_name(&cli.command),
+        requested_airport(&cli.command),
+    );
+
+    let result = preflight::enforce(&mut ctx).and_then(|()| match cli.command {
         // Default to 'run' when no subcommand is provided
-        None => commands::run::run(commands::run::RunArgs::default()),
+        None => commands::run::run(commands::run::RunArgs::default(), &ctx),
 
         Some(Commands::Init) => commands::init::run(),
         Some(Commands::Setup) => commands::setup::run(),
@@ -228,18 +266,21 @@ fn main() -> ExitCode {
             no_cache,
             no_prefetch,
             airport,
-        }) => commands::run::run(commands::run::RunArgs {
-            provider,
-            google_api_key,
-            mapbox_token,
-            dds_format,
-            timeout,
-            parallel,
-            no_cache,
-            no_prefetch,
-            airport,
-        }),
-    };
+        }) => commands::run::run(
+            commands::run::RunArgs {
+                provider,
+                google_api_key,
+                mapbox_token,
+                dds_format,
+                timeout,
+                parallel,
+                no_cache,
+                no_prefetch,
+                airport,
+            },
+            &ctx,
+        ),
+    });
 
     // Returning ExitCode (rather than calling process::exit) lets the
     // _logging_guard drop normally, which forces tracing-appender's

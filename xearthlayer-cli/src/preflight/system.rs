@@ -6,6 +6,48 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use xearthlayer::airport::validate_airport_icao;
 use xearthlayer::preflight::{BootstrapContext, Preflight, PreflightError, Remedy, Status};
 
+/// Write the startup banner to the log.
+///
+/// An action rather than a test, and it lives in the registry because its
+/// **position** is what matters: after the configuration is loaded, and before
+/// anything that can fail. A failed startup is exactly when a support log most
+/// needs to say which version produced it, so this must not move behind the
+/// checks that can reject the run.
+///
+/// Modelled as remediation so a diagnostic report, which only inspects, does
+/// not write to the log as a side effect of being asked a question.
+#[derive(Default)]
+pub struct LogStartup {
+    logged: AtomicBool,
+}
+
+impl Preflight<BootstrapContext> for LogStartup {
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed(names::LOG_STARTUP)
+    }
+
+    fn applies(&self, ctx: &BootstrapContext) -> bool {
+        ctx.command() == "run"
+    }
+
+    fn inspect(&self, _ctx: &BootstrapContext) -> Status {
+        if self.logged.load(Ordering::SeqCst) {
+            Status::Satisfied
+        } else {
+            Status::unsatisfied("startup has not been logged").remediable()
+        }
+    }
+
+    fn remediate(
+        &self,
+        ctx: &mut BootstrapContext,
+    ) -> Result<Remedy<BootstrapContext>, PreflightError> {
+        crate::runner::log_startup(ctx.command());
+        self.logged.store(true, Ordering::SeqCst);
+        Ok(Remedy::default())
+    }
+}
+
 /// Raise the file descriptor soft limit to the hard maximum.
 ///
 /// Processes inherit a soft FD limit (often 1024) that can be lower than the
@@ -37,7 +79,10 @@ impl Default for FdLimit {
 }
 
 impl FdLimit {
-    /// Construct with a fixed view of the limits, for tests.
+    /// Construct with a fixed view of the limits.
+    ///
+    /// A test seam: production reads the real limit through `Default`.
+    #[cfg(test)]
     pub fn with_limits(soft: u64, hard: u64) -> Self {
         Self {
             attempted: AtomicBool::new(false),
@@ -137,6 +182,23 @@ impl Preflight<BootstrapContext> for AirportIcao {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ---- LogStartup ----
+
+    #[test]
+    fn log_startup_records_once_and_is_then_satisfied() {
+        let check = LogStartup::default();
+        let mut ctx = BootstrapContext::new("run", None);
+        assert!(matches!(
+            check.inspect(&ctx),
+            Status::Unsatisfied {
+                remediable: true,
+                ..
+            }
+        ));
+        check.remediate(&mut ctx).unwrap();
+        assert_eq!(check.inspect(&ctx), Status::Satisfied);
+    }
 
     // ---- FdLimit ----
 
