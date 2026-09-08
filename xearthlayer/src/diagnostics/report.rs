@@ -871,7 +871,7 @@ mod tests {
         assert_eq!(
             info.install_location_path.as_deref(),
             Some(expected.display().to_string().as_str()),
-            "must fall back to ~/.xearthlayer/packages when install_location is unset"
+            "must fall back to the resolver's packages directory when install_location is unset"
         );
     }
 

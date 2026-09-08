@@ -137,6 +137,25 @@ fn print_step_header(title: &str) {
     println!();
 }
 
+/// Show where XEarthLayer keeps its files.
+///
+/// New with the platform-native layout. Everything used to live in one
+/// directory, so "where is my stuff" never came up. It now spans three or four,
+/// and the end of the wizard is where that question gets answered rather than
+/// left for the user to discover.
+fn print_layout() {
+    use xearthlayer::paths;
+    println!("{}:", style("Where things live").bold());
+    for (label, path) in [
+        ("Configuration", paths::config_file()),
+        ("Tile cache", paths::tile_cache_dir()),
+        ("Scenery packages", paths::packages_dir()),
+        ("Log file", paths::log_file()),
+    ] {
+        println!("  {:<18}{}", label, style(path.display()).cyan());
+    }
+}
+
 fn print_completion_message() {
     println!();
     println!(
@@ -156,6 +175,8 @@ fn print_completion_message() {
         "Config written to: {}",
         style(config_file_path().display()).cyan()
     );
+    println!();
+    print_layout();
     println!();
     println!("{}:", style("Next Steps").bold());
     println!("  1. View your configuration:");
@@ -211,7 +232,10 @@ fn step_xplane(theme: &ColorfulTheme) -> Result<Option<PathBuf>, CliError> {
                 "{}",
                 style("X-Plane 12 Custom Scenery folder not detected.").yellow()
             );
-            println!("You can configure this later in ~/.xearthlayer/config.ini");
+            println!(
+                "You can configure this later in {}",
+                config_file_path().display()
+            );
             println!();
 
             let manual = Confirm::with_theme(theme)

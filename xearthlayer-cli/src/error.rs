@@ -51,7 +51,10 @@ impl CliError {
         match self {
             CliError::ConfigFile(_) => {
                 eprintln!();
-                eprintln!("Check your config file at ~/.xearthlayer/config.ini");
+                eprintln!(
+                    "Check your config file at {}",
+                    xearthlayer::config::config_file_path().display()
+                );
                 eprintln!("Run 'xearthlayer init' to create a default config file.");
             }
             CliError::Serve(_) => {
