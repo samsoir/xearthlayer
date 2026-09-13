@@ -74,11 +74,11 @@ pub struct DiskInfo {
     /// Bytes available on the filesystem holding the cache directory.
     pub cache_dir_available: Option<String>,
     /// Resolved package install location (`packages.install_location`
-    /// from config, or the default `~/.xearthlayer/packages`).
+    /// from config, or [`crate::paths::packages_dir`] when unset).
     pub install_location_path: Option<String>,
     /// Bytes available on the filesystem holding the install location.
     pub install_location_available: Option<String>,
-    /// Whether the config directory (`~/.xearthlayer`) exists.
+    /// Whether [`crate::paths::config_dir`] exists.
     pub config_exists: bool,
 }
 
@@ -303,8 +303,8 @@ impl DiskInfo {
 
     /// Collect disk info using the provided config. The cache directory
     /// and package install location are read from the config (with the
-    /// install location falling back to `~/.xearthlayer/packages` when
-    /// unset, matching the rest of the CLI).
+    /// install location falling back to [`crate::paths::packages_dir`]
+    /// when unset, matching the rest of the CLI).
     fn from_config(config: &crate::config::ConfigFile) -> Self {
         let mut info = Self::default();
 
@@ -346,7 +346,7 @@ impl DiskInfo {
         }
 
         // Package install location: same priority as the CLI
-        // (config value > ~/.xearthlayer/packages).
+        // (config value > paths::packages_dir()).
         let install_location = config
             .packages
             .install_location
@@ -422,16 +422,20 @@ impl NetworkInfo {
 }
 
 impl ConfigInfo {
+    /// Report the configuration file that is actually in use, as resolved by
+    /// [`crate::paths::config_file`].
     fn collect() -> Self {
-        let mut info = Self::default();
+        Self::from_path(&crate::paths::config_file())
+    }
 
-        let home = dirs::home_dir().unwrap_or_default();
-        let config_path = home.join(".xearthlayer/config.ini");
+    /// Read `config_path`, redacting secrets. Absent file means empty report.
+    fn from_path(config_path: &Path) -> Self {
+        let mut info = Self::default();
 
         if config_path.exists() {
             info.config_path = Some(config_path.display().to_string());
 
-            if let Ok(content) = fs::read_to_string(&config_path) {
+            if let Ok(content) = fs::read_to_string(config_path) {
                 info.config_contents = Some(redact_sensitive_ini(&content));
             }
         }
@@ -786,6 +790,40 @@ mod tests {
         config.cache.directory = cache_dir;
         config.packages.install_location = Some(install_location);
         config
+    }
+
+    /// Regression (diagnostics reported the pre-0.5.0 file): the report must
+    /// read whatever `paths::config_file()` resolves to, not a path built from
+    /// the home directory. Reading a stale `~/.xearthlayer/config.ini` makes
+    /// every bug report show a configuration that is no longer in use.
+    #[test]
+    fn config_info_reads_the_file_it_is_given() {
+        let temp = TempDir::new().unwrap();
+        let base = crate::paths::testing::TestDirectories::rooted_at(temp.path());
+        let config_path = crate::paths::config_file_in(&base);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "[provider]\ntype = apple\n").unwrap();
+
+        let info = ConfigInfo::from_path(&config_path);
+
+        assert_eq!(
+            info.config_path.as_deref(),
+            Some(config_path.display().to_string().as_str())
+        );
+        assert!(info
+            .config_contents
+            .as_deref()
+            .unwrap()
+            .contains("type = apple"));
+    }
+
+    #[test]
+    fn config_info_is_empty_when_the_file_does_not_exist() {
+        let temp = TempDir::new().unwrap();
+        let info = ConfigInfo::from_path(&temp.path().join("absent/config.ini"));
+
+        assert!(info.config_path.is_none());
+        assert!(info.config_contents.is_none());
     }
 
     #[test]
