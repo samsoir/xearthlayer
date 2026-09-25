@@ -39,7 +39,8 @@ impl PackageLibrary {
     /// Create a new empty package library.
     pub fn new() -> Self {
         Self {
-            spec_version: Version::new(1, 0, 0),
+            spec_version: Version::parse(super::spec::CURRENT_SPEC_VERSION)
+                .expect("CURRENT_SPEC_VERSION is valid semver"),
             scope: "EARTH".to_string(),
             sequence: 0,
             published_at: Utc::now(),
@@ -138,6 +139,11 @@ pub enum LibraryParseError {
     InvalidVersion(String),
     /// Entry count mismatch
     EntryCountMismatch { expected: usize, actual: usize },
+    /// The file's specification major is newer than this build understands.
+    UnsupportedSpecVersion {
+        found: Version,
+        supported_major: u64,
+    },
 }
 
 impl fmt::Display for LibraryParseError {
@@ -181,6 +187,16 @@ impl fmt::Display for LibraryParseError {
                     expected, actual
                 )
             }
+            LibraryParseError::UnsupportedSpecVersion {
+                found,
+                supported_major,
+            } => {
+                write!(
+                    f,
+                    "library index uses specification {} but this version of XEarthLayer reads up to {}.x. Upgrade XEarthLayer to use this library",
+                    found, supported_major
+                )
+            }
         }
     }
 }
@@ -221,6 +237,12 @@ pub fn parse_package_library(content: &str) -> Result<PackageLibrary, LibraryPar
     // Line 2: Spec version
     let spec_version = Version::from_str(lines[1].trim())
         .map_err(|e| LibraryParseError::InvalidSpecVersion(e.to_string()))?;
+    if !super::spec::is_supported_spec_major(&spec_version) {
+        return Err(LibraryParseError::UnsupportedSpecVersion {
+            found: spec_version,
+            supported_major: super::spec::SUPPORTED_SPEC_MAJOR,
+        });
+    }
 
     // Line 3: Scope
     let scope = lines[2].trim().to_string();
@@ -453,6 +475,29 @@ c2d3e4f5a6b7890123456789012345678901234567890123456789012345bcde  Y  NORTH AMERI
         let content = "XEARTHLAYER REGIONAL SCENERY PACKAGE LIBRARY\n1.0.0\n";
         let result = parse_package_library(content);
         assert!(matches!(result, Err(LibraryParseError::InsufficientLines)));
+    }
+
+    #[test]
+    fn test_parse_library_refuses_higher_spec_major() {
+        let content = sample_library_content().replacen("1.0.0\nEARTH", "2.0.0\nEARTH", 1);
+        let err = parse_package_library(&content).unwrap_err();
+        assert_eq!(
+            err,
+            LibraryParseError::UnsupportedSpecVersion {
+                found: Version::new(2, 0, 0),
+                supported_major: 1,
+            }
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("2.0.0"), "{msg}");
+        assert!(msg.contains("Upgrade XEarthLayer"), "{msg}");
+    }
+
+    #[test]
+    fn test_parse_library_accepts_higher_minor_same_major() {
+        let content = sample_library_content().replacen("1.0.0\nEARTH", "1.4.0\nEARTH", 1);
+        let library = parse_package_library(&content).unwrap();
+        assert_eq!(library.spec_version, Version::new(1, 4, 0));
     }
 
     #[test]

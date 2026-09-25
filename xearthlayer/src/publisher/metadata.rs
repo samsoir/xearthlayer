@@ -20,7 +20,7 @@ use crate::package::{
 pub const METADATA_FILENAME: &str = "xearthlayer_scenery_package.txt";
 
 /// Default specification version for new packages.
-pub const DEFAULT_SPEC_VERSION: &str = "1.0.0";
+pub const DEFAULT_SPEC_VERSION: &str = crate::package::CURRENT_SPEC_VERSION;
 
 /// Generate initial package metadata.
 ///

@@ -17,7 +17,7 @@ use crate::package::{serialize_package_library, LibraryEntry, PackageLibrary, Pa
 pub const LIBRARY_FILENAME: &str = "xearthlayer_package_library.txt";
 
 /// Default specification version for new libraries.
-pub const SPEC_VERSION: &str = "1.0.0";
+pub const SPEC_VERSION: &str = crate::package::CURRENT_SPEC_VERSION;
 
 /// Default scope for libraries.
 pub const DEFAULT_SCOPE: &str = "EARTH";
