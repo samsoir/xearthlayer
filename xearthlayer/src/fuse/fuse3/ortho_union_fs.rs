@@ -2121,12 +2121,25 @@ mod tests {
         u64,
         tokio::sync::mpsc::UnboundedReceiver<crate::metrics::MetricEvent>,
     ) {
+        // Byte i = i as u8, so a slice's content proves which range was served.
+        let content: Vec<u8> = (0..size).map(|i| i as u8).collect();
+        passthrough_fixture_with(temp, &content)
+    }
+
+    /// Build a one-package index containing a single file with `content` and
+    /// return the mounted FS, its inode, and the metrics receiver.
+    fn passthrough_fixture_with(
+        temp: &TempDir,
+        content: &[u8],
+    ) -> (
+        Fuse3OrthoUnionFS,
+        u64,
+        tokio::sync::mpsc::UnboundedReceiver<crate::metrics::MetricEvent>,
+    ) {
         let pkg_dir = temp.path().join("test_ortho");
         let dsf_dir = pkg_dir.join("Earth nav data/+40-080");
         std::fs::create_dir_all(&dsf_dir).unwrap();
-        // Byte i = i as u8, so a slice's content proves which range was served.
-        let content: Vec<u8> = (0..size).map(|i| i as u8).collect();
-        std::fs::write(dsf_dir.join("+40-074.dsf"), &content).unwrap();
+        std::fs::write(dsf_dir.join("+40-074.dsf"), content).unwrap();
 
         let pkg = InstalledPackage::new(
             Package::new("test", PackageType::Ortho, Version::new(1, 0, 0)),
@@ -2145,6 +2158,32 @@ mod tests {
             .get_or_create_inode(std::path::Path::new("Earth nav data/+40-080/+40-074.dsf"));
 
         (fs, inode, metrics_rx)
+    }
+
+    /// A DSF written by the publisher is a 7z container (#124). FUSE never
+    /// parses DSF content, so the bytes X-Plane receives must be exactly the
+    /// bytes on disk, signature included.
+    #[tokio::test]
+    async fn passthrough_serves_7z_dsf_byte_identical() {
+        let temp = TempDir::new().unwrap();
+        let raw = temp.path().join("raw.dsf");
+        let raw_bytes: Vec<u8> = (0..64 * 1024u32).map(|i| ((i / 5) % 253) as u8).collect();
+        std::fs::write(&raw, &raw_bytes).unwrap();
+        let compressed = temp.path().join("compressed.dsf");
+        crate::publisher::DsfCompressor::laminar()
+            .compress_file(&raw, &compressed)
+            .unwrap();
+        let expected = std::fs::read(&compressed).unwrap();
+        assert!(expected.starts_with(&crate::publisher::SEVENZ_MAGIC));
+
+        let (fs, ino, _rx) = passthrough_fixture_with(&temp, &expected);
+
+        let reply = fs
+            .read(test_request(), ino, 0, 0, expected.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(reply.data.len(), expected.len());
+        assert_eq!(&reply.data[..], expected.as_slice());
     }
 
     fn test_request() -> fuse3::raw::Request {
