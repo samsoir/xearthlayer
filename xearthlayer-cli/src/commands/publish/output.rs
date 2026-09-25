@@ -68,6 +68,23 @@ pub fn print_process_summary(out: &dyn Output, summary: &ProcessSummary) {
     out.subheader("Processing Summary");
     out.println(&format!("Tiles processed: {}", summary.tile_count));
     out.println(&format!("DSF files:       {}", summary.dsf_count));
+    if summary.dsf_count > 0 {
+        let pct = (summary.dsf_stored_bytes * 100)
+            .checked_div(summary.dsf_raw_bytes)
+            .unwrap_or(100);
+        out.println(&format!(
+            "DSF compressed:  {} -> {} ({}%)",
+            format_size(summary.dsf_raw_bytes as usize),
+            format_size(summary.dsf_stored_bytes as usize),
+            pct
+        ));
+        if summary.dsf_precompressed > 0 {
+            out.println(&format!(
+                "DSF unchanged:   {} (already 7z)",
+                summary.dsf_precompressed
+            ));
+        }
+    }
     out.println(&format!("TER files:       {}", summary.ter_count));
     out.println(&format!("Mask files:      {}", summary.mask_count));
     out.println(&format!("DDS skipped:     {}", summary.dds_skipped));
