@@ -126,6 +126,7 @@ Processing Summary
 ------------------
 Tiles processed: 12
 DSF files:       12
+DSF compressed:  245.3 MB -> 108.1 MB (44%)
 TER files:       12
 Mask files:      0
 DDS skipped:     1536
@@ -140,6 +141,8 @@ Next steps:
 ```
 
 **Note:** DDS texture files are intentionally skipped - XEarthLayer streams these on-demand.
+
+DSF files are written as 7z containers, which X-Plane reads directly. This is where the size saving comes from, and it is CPU bound: expect `publish add` to take a few seconds per DSF per core. If a source DSF is already a 7z container it is copied as it is and reported on a `DSF unchanged:` line.
 
 ## Step 4a: Analyze Zoom Level Overlaps (Optional)
 

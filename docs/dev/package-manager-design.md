@@ -103,8 +103,9 @@ No persistent index file - state is always derived from scanning. This ensures:
 
 1. Fetch `xearthlayer_package_library.txt` from `library_root`
 2. Parse library index
-3. Compare sequence number with cached value for quick change detection
-4. Build available packages list
+3. Check the specification version: a MAJOR above `SUPPORTED_SPEC_MAJOR` (`package/spec.rs`) is refused with an instruction to upgrade XEarthLayer. The same check applies when a package's metadata file is fetched
+4. Compare sequence number with cached value for quick change detection
+5. Build available packages list
 
 ### Caching
 

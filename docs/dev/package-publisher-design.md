@@ -240,13 +240,21 @@ zzXEL_na_ortho/
 
 | File Type | Action | Reason |
 |-----------|--------|--------|
-| `*.dsf` | Keep | Terrain mesh data |
+| `*.dsf` | Keep, compressed | Terrain mesh, written as a single-entry 7z container (see DSF Compression) |
 | `*.ter` | Keep | Terrain definitions |
 | `*_sea.png`, `*_mask.png` | Keep | Water masks |
 | `*.dds` | Remove | Generated on-demand |
 | `*.pol` | Keep if present | Polygon definitions |
 | `*.net` | Keep if present | Network definitions |
 | `*.obj` | Keep if present | Object definitions |
+
+### DSF Compression
+
+`DsfCompressor` (`publisher/dsf_compress.rs`) writes each DSF as a 7z archive with one entry named after the file, using LZMA with a 16 MiB dictionary and a plain header. That is the profile of Laminar's own Global Scenery DSF files, and X-Plane has decoded it natively since version 10. The dictionary size is chosen for the consumer rather than the producer: X-Plane allocates the dictionary for every DSF it decodes, so matching Laminar keeps packages inside a memory budget the sim already carries.
+
+Both processors queue their DSF copies and hand the list to `compress_dsf_files`, which runs the batch across rayon's pool because LZMA at this dictionary size is CPU bound and a region holds around two thousand files. A source that already begins with the 7z signature is copied unchanged, so processing a directory twice is a no-op. `ProcessSummary` reports raw and stored bytes, which `publish add` prints as a percentage.
+
+The tar.gz archive around the package is unchanged. Once the DSF files are compressed, only the water masks remain compressible, and moving the container to zstd was measured at 1.1% of download, which did not justify a format change.
 
 ### Region Assignment
 

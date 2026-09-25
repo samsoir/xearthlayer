@@ -73,6 +73,12 @@ Contains DSF (Distribution Scenery Format) files organized by geographic locatio
 
 Each folder contains up to 100 DSF files covering a 10° latitude × 10° longitude area.
 
+#### DSF files are 7z containers
+
+Every `.dsf` in a package is a single-entry 7z archive holding the DSF of the same name. This is the format X-Plane has read natively since version 10 and the one Laminar uses for its own Global Scenery. The file keeps the `.dsf` extension. Publishers write it with the profile Laminar uses: LZMA, a 16 MiB dictionary (`LZMA:24`), one entry, plain header. XEarthLayer never opens a DSF; FUSE serves the bytes as they are on disk and X-Plane decompresses them.
+
+This is where most of a package's size lives. On the European ortho package the uncompressed DSF files were 58% of 52 GB installed. Compressed in place they take roughly 44% of that space, which is a 32% reduction of the installed package and a 12% reduction of the download, with no change to the archive format around them.
+
 ### terrain/
 
 Contains X-Plane Terrain Type (`.ter`) files defining how mesh patches are rendered.
@@ -229,6 +235,10 @@ All versions follow [Semantic Versioning](https://semver.org/):
 - **MAJOR**: Incompatible changes (new spec version)
 - **MINOR**: New tiles or regions added
 - **PATCH**: Bug fixes, metadata corrections
+
+### Specification Compatibility
+
+A client reads a library index or package metadata file only if its specification MAJOR is at or below the MAJOR the client was built for (`SUPPORTED_SPEC_MAJOR` in `package/spec.rs`, currently 1). A higher MAJOR is refused with a message asking the user to upgrade XEarthLayer. MINOR and PATCH differences are accepted in both directions. Any future incompatible change to either format therefore ships as a new MAJOR, and must be published at a separate URL so that clients built before it never fetch it.
 
 ### Library Sequence Number
 
