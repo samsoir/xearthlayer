@@ -16,8 +16,9 @@
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use sevenz_rust2::encoder_options::LzmaOptions;
 use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
 
@@ -148,6 +149,49 @@ impl DsfCompressor {
     }
 }
 
+/// Byte accounting for a batch of DSF files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DsfBatchStats {
+    /// Files written.
+    pub files: usize,
+    /// Sum of source sizes.
+    pub raw_bytes: u64,
+    /// Sum of sizes written to the package.
+    pub stored_bytes: u64,
+    /// How many sources were already 7z and were copied unchanged.
+    pub already_compressed: usize,
+}
+
+impl DsfBatchStats {
+    fn add(mut self, one: DsfCompressStats) -> Self {
+        self.files += 1;
+        self.raw_bytes += one.raw_bytes;
+        self.stored_bytes += one.stored_bytes;
+        self.already_compressed += usize::from(one.already_compressed);
+        self
+    }
+}
+
+/// Compress every `(source, destination)` pair in parallel.
+///
+/// LZMA at a 16 MiB dictionary is CPU bound and a region holds a couple of
+/// thousand DSF files, so the batch fans out across rayon's pool. Order does
+/// not matter: each job writes its own destination. The first error aborts
+/// the batch; files already written stay on disk, which is harmless because
+/// `publish add` is rerun from scratch on failure.
+pub fn compress_dsf_files(
+    jobs: &[(PathBuf, PathBuf)],
+    compressor: &DsfCompressor,
+) -> PublishResult<DsfBatchStats> {
+    let per_file: Vec<DsfCompressStats> = jobs
+        .par_iter()
+        .map(|(src, dest)| compressor.compress_file(src, dest))
+        .collect::<PublishResult<Vec<_>>>()?;
+    Ok(per_file
+        .into_iter()
+        .fold(DsfBatchStats::default(), DsfBatchStats::add))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +318,64 @@ mod tests {
         let sig = temp.path().join("sig");
         fs::write(&sig, SEVENZ_MAGIC).unwrap();
         assert!(is_sevenz_file(&sig).unwrap());
+    }
+
+    #[test]
+    fn compress_dsf_files_runs_every_job_and_sums_bytes() {
+        let temp = TempDir::new().unwrap();
+        let out = temp.path().join("out");
+        fs::create_dir_all(&out).unwrap();
+        let raw = sample_dsf_bytes();
+        let mut jobs = Vec::new();
+        for i in 0..6 {
+            let src = temp.path().join(format!("+4{i}-074.dsf"));
+            fs::write(&src, &raw).unwrap();
+            jobs.push((src, out.join(format!("+4{i}-074.dsf"))));
+        }
+
+        let stats = compress_dsf_files(&jobs, &DsfCompressor::laminar()).unwrap();
+
+        assert_eq!(stats.files, 6);
+        assert_eq!(stats.raw_bytes, 6 * raw.len() as u64);
+        assert_eq!(stats.already_compressed, 0);
+        let on_disk: u64 = jobs
+            .iter()
+            .map(|(_, d)| fs::metadata(d).unwrap().len())
+            .sum();
+        assert_eq!(stats.stored_bytes, on_disk);
+        for (_, dest) in &jobs {
+            assert!(is_sevenz_file(dest).unwrap());
+        }
+    }
+
+    #[test]
+    fn compress_dsf_files_counts_precompressed_inputs() {
+        let temp = TempDir::new().unwrap();
+        let raw = temp.path().join("raw.dsf");
+        let pre = temp.path().join("pre.dsf");
+        fs::write(&raw, sample_dsf_bytes()).unwrap();
+        DsfCompressor::laminar().compress_file(&raw, &pre).unwrap();
+        let jobs = vec![
+            (raw.clone(), temp.path().join("a.dsf")),
+            (pre.clone(), temp.path().join("b.dsf")),
+        ];
+
+        let stats = compress_dsf_files(&jobs, &DsfCompressor::laminar()).unwrap();
+
+        assert_eq!(stats.files, 2);
+        assert_eq!(stats.already_compressed, 1);
+    }
+
+    #[test]
+    fn compress_dsf_files_empty_is_zero() {
+        let stats = compress_dsf_files(&[], &DsfCompressor::laminar()).unwrap();
+        assert_eq!(stats, DsfBatchStats::default());
+    }
+
+    #[test]
+    fn compress_dsf_files_propagates_first_error() {
+        let temp = TempDir::new().unwrap();
+        let jobs = vec![(temp.path().join("missing.dsf"), temp.path().join("out.dsf"))];
+        assert!(compress_dsf_files(&jobs, &DsfCompressor::laminar()).is_err());
     }
 }

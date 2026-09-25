@@ -755,6 +755,9 @@ mod add_tests {
             .with_process_success(ProcessSummary {
                 tile_count: 2,
                 dsf_count: 2,
+                dsf_raw_bytes: 40_000_000,
+                dsf_stored_bytes: 17_000_000,
+                dsf_precompressed: 0,
                 ter_count: 2,
                 mask_count: 1,
                 dds_skipped: 100,
@@ -844,6 +847,9 @@ mod add_tests {
             .with_process_success(ProcessSummary {
                 tile_count: 2,
                 dsf_count: 2,
+                dsf_raw_bytes: 0,
+                dsf_stored_bytes: 0,
+                dsf_precompressed: 0,
                 ter_count: 0,
                 mask_count: 0,
                 dds_skipped: 0,

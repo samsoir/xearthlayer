@@ -63,8 +63,8 @@ pub use config::{
     MIN_PART_SIZE,
 };
 pub use dsf_compress::{
-    is_sevenz, is_sevenz_file, DsfCompressStats, DsfCompressor, DSF_DICT_SIZE, DSF_LZMA_LEVEL,
-    SEVENZ_MAGIC,
+    compress_dsf_files, is_sevenz, is_sevenz_file, DsfBatchStats, DsfCompressStats, DsfCompressor,
+    DSF_DICT_SIZE, DSF_LZMA_LEVEL, SEVENZ_MAGIC,
 };
 pub use error::{PublishError, PublishResult};
 pub use library::{LibraryManager, DEFAULT_SCOPE, LIBRARY_FILENAME, SPEC_VERSION};
