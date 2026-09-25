@@ -5,11 +5,13 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{ProcessSummary, SceneryFormat, SceneryProcessor, SceneryScanResult, TileInfo};
 use crate::package::PackageType;
-use crate::publisher::{PublishError, PublishResult, Repository};
+use crate::publisher::{
+    compress_dsf_files, DsfCompressor, PublishError, PublishResult, Repository,
+};
 
 /// Ortho4XP overlay output processor.
 ///
@@ -33,10 +35,13 @@ use crate::publisher::{PublishError, PublishResult, Repository};
 ///
 /// # File Handling
 ///
-/// - **DSF files**: Kept (overlay vector data: roads, railways, forests, etc.)
+/// - **DSF files**: Kept as single-entry 7z containers (overlay vector data: roads, railways, forests, etc.)
 /// - No terrain or texture files (overlays use X-Plane's built-in textures)
 #[derive(Debug, Clone)]
-pub struct OverlayProcessor;
+pub struct OverlayProcessor {
+    /// Profile used to write DSF files as 7z containers.
+    dsf_compressor: DsfCompressor,
+}
 
 impl Default for OverlayProcessor {
     fn default() -> Self {
@@ -47,7 +52,9 @@ impl Default for OverlayProcessor {
 impl OverlayProcessor {
     /// Create a new overlay processor.
     pub fn new() -> Self {
-        Self
+        Self {
+            dsf_compressor: DsfCompressor::laminar(),
+        }
     }
 
     /// Scan Earth nav data directory for DSF files.
@@ -258,25 +265,29 @@ impl SceneryProcessor for OverlayProcessor {
         // Track copied DSF files to avoid duplicates
         let mut copied_dsf: HashSet<String> = HashSet::new();
 
+        // Dedupe sequentially, then compress the batch in parallel.
+        let mut dsf_jobs: Vec<(PathBuf, PathBuf)> = Vec::new();
+
         for tile in &scan_result.tiles {
             summary.tile_count += 1;
 
-            // Copy DSF files into appropriate 10° grid subdirectory
+            // Queue DSF files for compression into the appropriate 10° grid subdirectory
             let dsf_subdir = self.dsf_grid_dir(&earth_nav_dir, tile.latitude, tile.longitude)?;
 
             for dsf_file in &tile.dsf_files {
                 if let Some(filename) = dsf_file.file_name().and_then(|n| n.to_str()) {
                     if copied_dsf.insert(filename.to_string()) {
-                        let dest = dsf_subdir.join(filename);
-                        fs::copy(dsf_file, &dest).map_err(|e| PublishError::WriteFailed {
-                            path: dest,
-                            source: e,
-                        })?;
-                        summary.dsf_count += 1;
+                        dsf_jobs.push((dsf_file.clone(), dsf_subdir.join(filename)));
                     }
                 }
             }
         }
+
+        let dsf = compress_dsf_files(&dsf_jobs, &self.dsf_compressor)?;
+        summary.dsf_count = dsf.files;
+        summary.dsf_raw_bytes = dsf.raw_bytes;
+        summary.dsf_stored_bytes = dsf.stored_bytes;
+        summary.dsf_precompressed = dsf.already_compressed;
 
         Ok(summary)
     }
@@ -305,7 +316,7 @@ mod tests {
 
     #[test]
     fn test_processor_default() {
-        let processor = OverlayProcessor;
+        let processor = OverlayProcessor::default();
         assert_eq!(processor.name(), "Ortho4XP Overlays");
     }
 
@@ -450,6 +461,47 @@ mod tests {
     }
 
     #[test]
+    fn test_process_writes_dsf_as_7z_container() {
+        let source_temp = TempDir::new().unwrap();
+        create_mock_overlay(source_temp.path(), "+30-120", &["+37-118", "+37-119"]);
+
+        let repo_temp = TempDir::new().unwrap();
+        let repo = Repository::init(repo_temp.path()).unwrap();
+
+        let processor = OverlayProcessor::new();
+        let scan_result = processor.scan(source_temp.path()).unwrap();
+        let summary = processor
+            .process(&scan_result, "na", PackageType::Overlay, &repo)
+            .unwrap();
+
+        assert_eq!(summary.dsf_count, 2);
+        assert_eq!(summary.dsf_raw_bytes, 2 * b"mock dsf".len() as u64);
+        assert_eq!(summary.dsf_precompressed, 0);
+
+        let grid = repo
+            .package_dir("na", PackageType::Overlay)
+            .join("Earth nav data")
+            .join("+30-120");
+        for name in ["+37-118.dsf", "+37-119.dsf"] {
+            let dsf = grid.join(name);
+            assert!(
+                crate::publisher::is_sevenz_file(&dsf).unwrap(),
+                "{name} must be 7z"
+            );
+            let mut reader =
+                sevenz_rust2::ArchiveReader::open(&dsf, sevenz_rust2::Password::empty()).unwrap();
+            assert_eq!(reader.read_file(name).unwrap(), b"mock dsf");
+        }
+        assert_eq!(
+            summary.dsf_stored_bytes,
+            ["+37-118.dsf", "+37-119.dsf"]
+                .iter()
+                .map(|n| fs::metadata(grid.join(n)).unwrap().len())
+                .sum::<u64>()
+        );
+    }
+
+    #[test]
     fn test_process_rejects_ortho_type() {
         let source_temp = TempDir::new().unwrap();
         create_mock_overlay(source_temp.path(), "+30-120", &["+37-118"]);
@@ -499,7 +551,7 @@ mod tests {
     fn test_processor_clone() {
         let processor = OverlayProcessor::new();
         let _cloned = processor.clone();
-        // OverlayProcessor has no state, so just verify clone works
+        // The only state is the Copy-able compressor profile, so just verify clone works
     }
 
     #[test]
