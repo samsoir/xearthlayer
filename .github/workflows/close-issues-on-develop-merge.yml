@@ -1,0 +1,106 @@
+name: Close Issues on Develop Merge
+
+# GitHub honours closing keywords ("Closes #123") only when the commit reaches
+# the repository's DEFAULT branch. Every pull request here targets a
+# `develop/*` integration branch, so an issue whose work is finished and merged
+# stays open until the release merge to `main`, weeks or months later. That
+# makes a milestone unreadable: it reports a fraction of the work actually
+# done, and there is no configuration that changes it.
+#
+# This workflow supplies what GitHub will not: when a PR into `develop/*` is
+# merged, the issues its body closes are closed, with a comment naming the PR
+# and the branch. The milestone then tracks development against the release,
+# and "has it shipped" is answered by the release tag rather than by issue
+# state.
+#
+# `pull_request_target` rather than `pull_request`: a `pull_request` event
+# raised by a fork receives a read-only token, so contributor PRs (which this
+# project takes) could never close anything. `pull_request_target` runs in the
+# base repository's context with a writable token. That trigger is dangerous
+# when a workflow checks out and executes the PR's code, because the PR
+# controls what runs. This one never checks anything out and never runs PR
+# code. The only PR-controlled value it touches is the body text, which is
+# passed through the environment rather than interpolated into the script, so
+# it cannot escape into the shell.
+
+on:
+  pull_request_target:
+    types: [closed]
+    branches:
+      - 'develop/**'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  close-referenced-issues:
+    name: Close Referenced Issues
+    # Closing a PR without merging it must not close anything.
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close issues named by closing keywords in the PR body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          # Untrusted input. Read from the environment, never interpolated
+          # into the script body.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+
+          # close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved,
+          # case-insensitive, followed by #<number>. "Related to #123" and
+          # "See #123" deliberately do not match. The leading
+          # (^|[^[:alnum:]_]) is a word boundary and is load-bearing: without
+          # it "prefixes #8" matches on the "fixes" inside it. Cross-repository
+          # syntax ("Fixes owner/repo#14") does not match, which is intended;
+          # this workflow only closes issues in its own repository.
+          numbers="$(
+            printf '%s' "${PR_BODY:-}" \
+              | grep -oiE '(^|[^[:alnum:]_])(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' \
+              | grep -oE '[0-9]+' \
+              | sort -un \
+            || true
+          )"
+
+          if [ -z "$numbers" ]; then
+            echo "PR #${PR_NUMBER} body names no issues to close. Nothing to do."
+            exit 0
+          fi
+
+          echo "PR #${PR_NUMBER} into ${BASE_REF} names: $(echo "$numbers" | tr '\n' ' ')"
+
+          for n in $numbers; do
+            if ! item="$(gh api "repos/${REPO}/issues/${n}" 2>/dev/null)"; then
+              echo "  #${n}: not found in ${REPO}, skipping"
+              continue
+            fi
+
+            # The issues endpoint also serves pull requests. A PR that says
+            # "Fixes #274" where 274 is itself a PR must not be touched.
+            if [ -n "$(printf '%s' "$item" | jq -r '.pull_request // empty')" ]; then
+              echo "  #${n}: is a pull request, skipping"
+              continue
+            fi
+
+            if [ "$(printf '%s' "$item" | jq -r '.state')" = "closed" ]; then
+              echo "  #${n}: already closed, skipping"
+              continue
+            fi
+
+            body="Closed automatically: merged into \`${BASE_REF}\` by PR #${PR_NUMBER} (${PR_TITLE})."
+            if [ -n "${MERGE_SHA:-}" ]; then
+              body="${body}"$'\n\n'"Merge commit \`${MERGE_SHA}\`."
+            fi
+            body="${body}"$'\n\n'"Closed against \`${BASE_REF}\` rather than \`main\`, because GitHub honours closing keywords only on the default branch and this project integrates through \`develop/*\`. Whether the work has shipped is answered by the release tag, not by issue state."
+
+            gh issue comment "$n" --repo "${REPO}" --body "$body"
+            gh issue close "$n" --repo "${REPO}" --reason completed
+            echo "  #${n}: closed"
+          done
