@@ -93,6 +93,15 @@ pub struct ProcessSummary {
     /// Total DSF files copied.
     pub dsf_count: usize,
 
+    /// Sum of DSF sizes as read from the source.
+    pub dsf_raw_bytes: u64,
+
+    /// Sum of DSF sizes as written to the package (7z containers).
+    pub dsf_stored_bytes: u64,
+
+    /// DSF files that were already 7z at the source and were copied unchanged.
+    pub dsf_precompressed: usize,
+
     /// Total terrain (.ter) files copied.
     pub ter_count: usize,
 

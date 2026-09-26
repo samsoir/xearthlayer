@@ -120,6 +120,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - Archive building with configurable part sizes
    - Library index management for package discovery
    - `Ortho4XPProcessor` for ortho tiles, `OverlayProcessor` for overlays
+   - DSF files are written as single-entry 7z containers (Laminar profile: LZMA, 16 MiB dictionary) by `DsfCompressor`; X-Plane decodes them natively, XEL never parses them (#124)
+   - `spec_version` on both package formats is enforced: a MAJOR above `SUPPORTED_SPEC_MAJOR` (`package/spec.rs`) is refused with an upgrade message
 
 11. **Predictive Tile Caching** (`xearthlayer/src/prefetch/`)
     - `AdaptivePrefetchCoordinator` - Self-calibrating prefetch with flight phase detection
@@ -494,6 +496,7 @@ matrix jobs are renamed.
 - `wgpu` - GPU compute shaders for DDS encoding
 - `block_compression` - BCn GPU compression via WGSL
 - `indicatif` - Progress bar rendering for package downloads
+- `sevenz-rust2` - Pure-Rust 7z writer for DSF compression (`compress` feature only)
 
 ## Performance Notes
 

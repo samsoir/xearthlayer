@@ -42,12 +42,16 @@ mod installed;
 mod library;
 mod metadata;
 mod naming;
+mod spec;
 mod types;
 
 // Core types
 pub use core::Package;
 pub use installed::InstalledPackage;
 pub use types::{ArchivePart, PackageType};
+
+// Specification version policy
+pub use spec::{is_supported_spec_major, CURRENT_SPEC_VERSION, SUPPORTED_SPEC_MAJOR};
 
 // Library and metadata
 pub use library::{parse_package_library, serialize_package_library, LibraryEntry, PackageLibrary};

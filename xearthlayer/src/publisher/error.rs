@@ -76,6 +76,9 @@ pub enum PublishError {
 
     /// A region's colour could not be resolved to RGB.
     UnknownRegionColor { region: String, color: String },
+
+    /// A DSF file could not be written as a 7z container.
+    DsfCompressionFailed { path: PathBuf, message: String },
 }
 
 impl fmt::Display for PublishError {
@@ -166,6 +169,9 @@ impl fmt::Display for PublishError {
                     "region \"{}\" has unknown color \"{}\". Use a CSS color name or hex (#rrggbb).",
                     region, color
                 )
+            }
+            PublishError::DsfCompressionFailed { path, message } => {
+                write!(f, "failed to compress DSF {}: {}", path.display(), message)
             }
         }
     }

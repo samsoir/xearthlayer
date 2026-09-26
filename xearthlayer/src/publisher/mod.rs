@@ -43,6 +43,7 @@ mod archive;
 mod config;
 pub mod coverage;
 pub mod dedupe;
+mod dsf_compress;
 mod error;
 mod library;
 mod metadata;
@@ -60,6 +61,10 @@ pub use archive::{
 pub use config::{
     parse_size, read_config, write_config, RepoConfig, DEFAULT_PART_SIZE, MAX_PART_SIZE,
     MIN_PART_SIZE,
+};
+pub use dsf_compress::{
+    compress_dsf_files, is_sevenz, is_sevenz_file, DsfBatchStats, DsfCompressStats, DsfCompressor,
+    DSF_DICT_SIZE, DSF_LZMA_LEVEL, SEVENZ_MAGIC,
 };
 pub use error::{PublishError, PublishResult};
 pub use library::{LibraryManager, DEFAULT_SCOPE, LIBRARY_FILENAME, SPEC_VERSION};

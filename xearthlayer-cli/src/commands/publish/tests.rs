@@ -755,6 +755,9 @@ mod add_tests {
             .with_process_success(ProcessSummary {
                 tile_count: 2,
                 dsf_count: 2,
+                dsf_raw_bytes: 40_000_000,
+                dsf_stored_bytes: 17_000_000,
+                dsf_precompressed: 0,
                 ter_count: 2,
                 mask_count: 1,
                 dds_skipped: 100,
@@ -780,6 +783,51 @@ mod add_tests {
         assert!(output.contains("Region: NA"));
         assert!(output.contains("Found 2 tiles"));
         assert!(output.contains("Package created successfully"));
+        assert!(
+            output.contains("DSF compressed:  38.1 MB -> 16.2 MB (42%)"),
+            "compression line missing or misformatted"
+        );
+        assert!(
+            !output.contains("DSF unchanged:"),
+            "no precompressed line when the count is 0"
+        );
+    }
+
+    #[test]
+    fn test_add_reports_precompressed_dsf() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_scan_success(create_test_scan_result())
+            .with_process_success(ProcessSummary {
+                tile_count: 1,
+                dsf_count: 3,
+                dsf_raw_bytes: 3_000,
+                dsf_stored_bytes: 3_000,
+                dsf_precompressed: 3,
+                ter_count: 0,
+                mask_count: 0,
+                dds_skipped: 0,
+                warnings: Vec::new(),
+            })
+            .build();
+        let ctx = CommandContext::new(&output, &publisher);
+
+        let args = AddArgs {
+            source: PathBuf::from("/ortho4xp/tiles"),
+            region: "na".to_string(),
+            package_type: PackageTypeArg::Ortho,
+            version: "1.0.0".to_string(),
+            dedupe: false,
+            priority: ZoomPriorityArg("highest".to_string()),
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = AddHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("DSF compressed:"));
+        assert!(output.contains("DSF unchanged:   3 (already 7z)"));
     }
 
     #[test]
@@ -844,6 +892,9 @@ mod add_tests {
             .with_process_success(ProcessSummary {
                 tile_count: 2,
                 dsf_count: 2,
+                dsf_raw_bytes: 0,
+                dsf_stored_bytes: 0,
+                dsf_precompressed: 0,
                 ter_count: 0,
                 mask_count: 0,
                 dds_skipped: 0,

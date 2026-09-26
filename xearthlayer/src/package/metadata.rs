@@ -206,6 +206,11 @@ pub enum MetadataParseError {
     InvalidPartLine(String),
     /// Part count mismatch
     PartCountMismatch { expected: usize, actual: usize },
+    /// The file's specification major is newer than this build understands.
+    UnsupportedSpecVersion {
+        found: Version,
+        supported_major: u64,
+    },
 }
 
 impl fmt::Display for MetadataParseError {
@@ -244,6 +249,16 @@ impl fmt::Display for MetadataParseError {
                     f,
                     "part count mismatch: expected {}, got {}",
                     expected, actual
+                )
+            }
+            MetadataParseError::UnsupportedSpecVersion {
+                found,
+                supported_major,
+            } => {
+                write!(
+                    f,
+                    "package metadata uses specification {} but this version of XEarthLayer reads up to {}.x. Upgrade XEarthLayer to use this package",
+                    found, supported_major
                 )
             }
         }
@@ -288,6 +303,12 @@ pub fn parse_package_metadata(content: &str) -> Result<PackageMetadata, Metadata
     // Line 2: Spec version
     let spec_version = Version::from_str(lines[1].trim())
         .map_err(|e| MetadataParseError::InvalidSpecVersion(e.to_string()))?;
+    if !super::spec::is_supported_spec_major(&spec_version) {
+        return Err(MetadataParseError::UnsupportedSpecVersion {
+            found: spec_version,
+            supported_major: super::spec::SUPPORTED_SPEC_MAJOR,
+        });
+    }
 
     // Line 3: Title and package version (separated by two spaces)
     let title_line = lines[2].trim();
@@ -536,6 +557,27 @@ abc  file.aa  http://example.com/file.aa
         let content = "REGIONAL SCENERY PACKAGE\n1.0.0\n";
         let result = parse_package_metadata(content);
         assert!(matches!(result, Err(MetadataParseError::InsufficientLines)));
+    }
+
+    #[test]
+    fn test_parse_metadata_refuses_higher_spec_major() {
+        let content = sample_metadata_content().replacen("1.0.0\nEUROPE", "2.0.0\nEUROPE", 1);
+        let err = parse_package_metadata(&content).unwrap_err();
+        assert_eq!(
+            err,
+            MetadataParseError::UnsupportedSpecVersion {
+                found: Version::new(2, 0, 0),
+                supported_major: 1,
+            }
+        );
+        assert!(err.to_string().contains("Upgrade XEarthLayer"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_metadata_accepts_higher_minor_same_major() {
+        let content = sample_metadata_content().replacen("1.0.0\nEUROPE", "1.2.0\nEUROPE", 1);
+        let metadata = parse_package_metadata(&content).unwrap();
+        assert_eq!(metadata.spec_version, Version::new(1, 2, 0));
     }
 
     #[test]
