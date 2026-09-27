@@ -530,5 +530,6 @@ matrix jobs are renamed.
 - **Memory telemetry**: `docs/dev/memory-telemetry.md` (periodic memory sampling, trace interpretation, confounders)
 - **Cache integrity model**: `docs/dev/cache-integrity-design.md` (bounded reads, atomic durable writes, discard-on-reject, shared by every on-disk cache)
 - **CI/CD pipeline**: `docs/dev/cicd.md` (branch model, release job graph, platform tiers, version propagation)
+- **Publisher separation**: `docs/dev/publisher-separation-design.md` (**planned for 0.5.0**, not yet implemented: `package` becomes the `xearthlayer-package` contract crate, `publisher` becomes `xearthlayer-publisher`, `xearthlayer publish` becomes the `xearthlayer-publish` binary)
 - memorize review allow(dead_code) macros at major checkpoints. Refactor aggresively to remove them when appropriate.
 - memorize ensure to update the projects documentation to reflect the current state of the project before committing changes

@@ -34,6 +34,7 @@ Technical documentation for XEarthLayer developers and contributors.
 | [Scenery Packages](scenery-packages.md) | File formats, naming conventions, metadata specs |
 | [Package Manager Design](package-manager-design.md) | Download, install, update architecture (parallel downloads, retry) |
 | [Package Publisher Design](package-publisher-design.md) | Build, archive, release pipeline |
+| [Publisher Separation Design](publisher-separation-design.md) | **Planned (0.5.0)**: publishing moves to its own crates and binary, package format becomes a contract crate |
 | [GitHub Releases Publishing](github-releases-publishing.md) | Multi-part upload workflow |
 | [Zoom Level Overlap](zoom-level-overlap-design.md) | Dedupe and gap analysis tools |
 
@@ -97,6 +98,10 @@ xearthlayer-cli
             ├── manager (mounts, symlinks, install/update/remove)
             └── publisher (scan, build, release)
 ```
+
+The last two move in 0.5.0: `package` becomes the `xearthlayer-package` contract
+crate and `publisher` becomes `xearthlayer-publisher` behind a new
+`xearthlayer-publish` binary. See [Publisher Separation Design](publisher-separation-design.md).
 
 ## Getting Started
 

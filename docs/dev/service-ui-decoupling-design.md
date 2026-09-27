@@ -19,6 +19,7 @@ Related: #111 (FUSE hook pipeline), #112 (plugin architecture), #113 (release ch
 | #145 | CLI service commands + cleanup |
 | #146 | Multi-package release pipeline |
 | #147 | `ServiceManager` trait |
+| P1-P4 | Publisher separation, to be filed. See [Publisher Separation Design](publisher-separation-design.md) |
 
 ## Problem Statement
 
@@ -123,7 +124,9 @@ Only one daemon instance may run at a time. On startup, the daemon checks for an
 
 ### Crate Topology
 
-The workspace grows from two crates to six (plus `xearthlayer-plugin-sdk` from #112), with strict layered dependencies. No crate depends sideways on a peer.
+The workspace grows from two crates to nine (plus `xearthlayer-plugin-sdk` from #112), with strict layered dependencies. No crate depends sideways on a peer.
+
+Two of those nine, and one of the three binaries, come from the publishing separation rather than from this design. They are shown separately below because the two halves of the workspace meet at exactly one crate.
 
 ```
 xearthlayer-proto              xearthlayer-plugin-sdk
@@ -149,6 +152,22 @@ xearthlayer-tui  xearthlayer-cli
 
 The two SDK crates (`proto` and `plugin-sdk`) are both pure abstractions at the bottom of the graph. Neither depends on the other — they serve different boundaries (IPC and dynamic loading respectively).
 
+The publishing domain is a separate subgraph joined to this one only through the package format contract:
+
+```
+xearthlayer-package                    (scenery package format contract)
+  ^                      ^
+  |                      |
+xearthlayer          xearthlayer-publisher
+(service library)    (publishing domain)
+  ^                      ^
+  |                      |
+daemon / tui / cli   xearthlayer-publish
+                     (publishing binary)
+```
+
+`xearthlayer-package` is a third pure abstraction at the bottom of the graph, alongside `proto` and `plugin-sdk`, and for the same reason: it is a contract that two independent parties must agree on. The publishing crates are documented in [Publisher Separation Design](publisher-separation-design.md); everything below in this document concerns the service side except where packaging is discussed.
+
 #### xearthlayer-proto
 
 Owns `.proto` files and generated Rust code. No business logic, no dependencies on other XEarthLayer crates. This is the pure abstraction at the bottom of the dependency graph — the interface that all parties depend inward on.
@@ -164,7 +183,9 @@ Depends on `xearthlayer-proto` (for generated types) and `xearthlayer` (for doma
 
 #### xearthlayer (service library)
 
-Unchanged. FUSE, cache, executor, prefetch, providers. Does not know about gRPC or any transport concern. The existing `ServiceOrchestrator` API is already UI-agnostic — the server adapter wraps it without modification.
+FUSE, cache, executor, prefetch, providers. Does not know about gRPC or any transport concern.
+
+Two modules leave it: `package` becomes the `xearthlayer-package` contract crate it now depends on, and `publisher` becomes `xearthlayer-publisher`, which it does not depend on at all. That removes 21 crates from its dependency graph, including a second HTTP and TLS stack reached only by the coverage map renderer. Otherwise the crate is unchanged, and the existing `ServiceOrchestrator` API is already UI-agnostic, so the server adapter wraps it without modification.
 
 #### xearthlayer-daemon
 
@@ -176,7 +197,7 @@ Binary crate. Connects to the daemon via `DaemonClient`, subscribes to telemetry
 
 #### xearthlayer-cli
 
-Retains all offline commands (`config`, `packages`, `cache`, `publish`, `diagnostics`, `setup`, `scenery-index`, `download`). Gains a `service` subcommand group and daemon-targeted commands.
+Retains all offline commands (`config`, `packages`, `cache`, `diagnostics`, `setup`, `scenery-index`, `download`). `publish` is not among them: it becomes the separate `xearthlayer-publish` binary and the subcommand is removed. Gains a `service` subcommand group and daemon-targeted commands.
 
 A `run` convenience command preserves backward compatibility: it starts the daemon via `ServiceManager` (if not already running), then execs the TUI client process. On TUI exit, the daemon continues running. This keeps the familiar `xearthlayer run` experience while using the new architecture underneath.
 
@@ -402,25 +423,29 @@ The `gpu-encode` Cargo feature flag is removed in 0.5.0. GPU-accelerated DDS com
 
 ### Package Model
 
-The three binaries ship as individual packages with a meta-package umbrella:
+The three service binaries ship as individual packages with a meta-package umbrella. The publishing binary ships as a fourth package that the meta-package deliberately does not pull in:
 
 ```
 xearthlayer                     (meta-package — depends on all below)
 ├── xearthlayer-daemon          (service binary + systemd unit)
 ├── xearthlayer-cli             (offline CLI + daemon client commands)
 └── xearthlayer-tui             (terminal UI client)
+
+xearthlayer-publish             (publishing tools, installed deliberately)
 ```
 
 Individual packages can be installed independently. `xearthlayer-daemon` alone is sufficient for a headless server. The meta-package provides the familiar `apt install xearthlayer` or `dnf install xearthlayer` experience that pulls everything in.
+
+`xearthlayer-publish` stays outside that umbrella because installing XEarthLayer means installing a streaming service, not a scenery build toolchain. The audience for the publishing tools is the small number of people producing regional packages, and they can ask for one more package. Keeping it separate is also what keeps the publisher's dependencies, including a second TLS stack and a map rasteriser, out of a default install. It depends on no other XEarthLayer package.
 
 ### Per-Format Details
 
 | Format | Implementation |
 |--------|---------------|
-| **deb** | Three real packages + one virtual meta-package. `xearthlayer-daemon` includes the systemd unit file. The meta-package declares `Depends: xearthlayer-daemon, xearthlayer-cli, xearthlayer-tui`. |
+| **deb** | Four real packages + one virtual meta-package. `xearthlayer-daemon` includes the systemd unit file. The meta-package declares `Depends: xearthlayer-daemon, xearthlayer-cli, xearthlayer-tui`, which excludes `xearthlayer-publish`. |
 | **rpm** | Same structure. Meta-package uses `Requires:` directives. |
-| **AUR** | Four PKGBUILDs: one per binary, one meta. Arch users can install individually. |
-| **tarball** | Single archive containing all three binaries, the systemd unit file, README, and LICENSE. Same as the current single-archive approach. |
+| **AUR** | Five PKGBUILDs: one per binary, one meta. Arch users can install individually. |
+| **tarball** | One archive containing the three service binaries, the systemd unit file, README, and LICENSE, as today. `xearthlayer-publish` ships as its own archive so that a publisher downloads the tools and a flight simulator user does not. |
 
 ### Versioning
 
@@ -433,6 +458,8 @@ Package dependencies use version ranges to enforce this:
 Depends: xearthlayer-daemon (>= 0.5.0), xearthlayer-daemon (<< 0.6.0)
 ```
 
+`xearthlayer-publish` takes part in neither the range nor the meta-package, because it talks to no daemon and shares no runtime state. It is built from the same workspace version for release simplicity, and the compatibility it does have to honour is the package format's `spec_version`, which the `xearthlayer-package` crate carries for both sides.
+
 ### CI/CD Pipeline
 
 The release workflow builds three binaries in parallel from the same workspace, then packages them:
@@ -442,12 +469,14 @@ build-jobs (parallel):
   - build-daemon    → xearthlayer-daemon
   - build-cli       → xearthlayer
   - build-tui       → xearthlayer-tui
+  - build-publish   → xearthlayer-publish
 
 package-jobs (parallel):
-  - package-tarball     (all three binaries + systemd unit)
-  - package-deb         (3 real packages + 1 meta)
-  - package-rpm         (3 real packages + 1 meta)
-  - prepare-aur         (4 PKGBUILDs)
+  - package-tarball     (3 service binaries + systemd unit)
+  - package-publish     (xearthlayer-publish, separate archive)
+  - package-deb         (4 real packages + 1 meta)
+  - package-rpm         (4 real packages + 1 meta)
+  - prepare-aur         (5 PKGBUILDs)
 ```
 
 No build variants, no matrix. One build per binary, one set of packages.
