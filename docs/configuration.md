@@ -12,12 +12,13 @@ The easiest way to configure XEarthLayer is with the interactive setup wizard:
 xearthlayer setup
 ```
 
-The wizard auto-detects your X-Plane installation, system hardware (CPU, memory, storage type), free disk space, and GPU adapters, then recommends optimal settings. The wizard runs four steps:
+The wizard auto-detects your X-Plane installation, system hardware (CPU, memory, storage type), free disk space, and GPU adapters, then recommends optimal settings. The wizard runs five steps:
 
-1. **X-Plane Custom Scenery** — auto-detected from your X-Plane install, with fallback to manual entry.
-2. **Package Location** — where regional scenery packages live on disk.
-3. **Cache Configuration** — cache directory, disk cache size (defaults to 25% of free space, floored to 10 GB), DDS-to-chunk disk ratio, memory cache size (defaults to RAM ÷ 12, rounded to the nearest whole GB, clamped to 500 MB – RAM ÷ 4), and disk I/O profile (NVMe / SSD / HDD / auto).
-4. **DDS Encoding** — picks ISPC (CPU) by default, or offers to offload encoding to a secondary GPU when **two or more GPU adapters** are detected. The wizard warns against picking the GPU X-Plane renders on. Single-GPU systems skip the choice and stay on ISPC.
+1. **X-Plane Custom Scenery**: auto-detected from your X-Plane install, with fallback to manual entry.
+2. **Package Location**: where regional scenery packages live on disk.
+3. **Imagery Provider**: which satellite imagery to stream. Options that need no account are offered first, and the currently configured provider is preselected so re-running setup does not move a working installation. A key or token is requested only for Google Maps and Mapbox, entered without echoing to the terminal, and pressing Enter keeps a credential that is already configured.
+4. **Cache Configuration**: cache directory, disk cache size (defaults to 25% of free space, floored to 10 GB), DDS-to-chunk disk ratio, and memory cache size (defaults to RAM divided by 12, rounded to the nearest whole GB, clamped between 500 MB and a quarter of RAM).
+5. **DDS Encoding**: picks ISPC (CPU) by default, or offers to offload encoding to a secondary GPU when **two or more GPU adapters** are detected. The wizard warns against picking the GPU X-Plane renders on. Single-GPU systems skip the choice and stay on ISPC.
 
 GPU enumeration can take 10–30 seconds on multi-adapter systems while drivers are probed; a spinner shows progress.
 
@@ -49,7 +50,7 @@ Controls which satellite imagery provider to use.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `type` | string | `bing` | Imagery provider (see below for options) |
+| `type` | string | `bing` | Imagery provider (see below for options). `xearthlayer setup` asks for this. |
 | `google_api_key` | string | (empty) | Google Maps API key. Required only when `type = google`. |
 | `mapbox_access_token` | string | (empty) | MapBox access token. Required only when `type = mapbox`. |
 

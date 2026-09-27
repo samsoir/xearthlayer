@@ -593,9 +593,9 @@ impl ConfigKey {
         match self {
             ConfigKey::GeneralUpdateCheck => Box::new(BooleanSpec),
             ConfigKey::GeneralLayoutVersion => Box::new(PositiveIntegerSpec),
-            ConfigKey::ProviderType => Box::new(OneOfSpec::new(&[
-                "apple", "arcgis", "bing", "go2", "google", "mapbox", "usgs",
-            ])),
+            ConfigKey::ProviderType => {
+                Box::new(OneOfSpec::new(crate::provider::catalog::PROVIDER_KEYS))
+            }
             ConfigKey::ProviderGoogleApiKey => Box::new(AnyStringSpec),
             ConfigKey::ProviderMapboxAccessToken => Box::new(AnyStringSpec),
             ConfigKey::CacheDirectory => Box::new(PathSpec),

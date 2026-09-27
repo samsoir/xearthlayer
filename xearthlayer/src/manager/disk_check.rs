@@ -35,12 +35,28 @@ impl FsInfoProvider for RealFsInfoProvider {
 /// Multiplier applied to the sum of part sizes to estimate peak
 /// on-disk footprint during install.
 ///
-/// Peak usage = downloaded archive parts (still on disk during
-/// extraction) + extracted contents. For our scenery archives the
-/// contents are mostly already-compressed BCn DDS textures with low
-/// tar.gz compression ratios, so a 2× multiplier covers
-/// "compressed + extracted" with a small margin.
-pub const SPACE_BUFFER_MULTIPLIER: u64 = 2;
+/// Peak usage is the reassembled archive plus the extracted tree, which
+/// coexist while `tar` runs. The parts themselves are freed as soon as
+/// reassembly succeeds (see `installer::free_downloaded_parts`), so they
+/// are not part of the peak.
+///
+/// **Scenery archives are not incompressible.** The earlier value of 2
+/// assumed they were, on the reasoning that BCn texture data does not
+/// compress. The payload does not, but a package is millions of small
+/// files and gzip compresses the redundancy in tar headers, padding and
+/// the `terrain` and `Earth nav data` text files alongside the textures.
+/// Measured across every published region, extraction expands the
+/// download by 1.49x to 2.12x, so archive plus extracted runs from 2.49x
+/// to 3.12x. Every region exceeded 2x and the smallest regions expand
+/// most: `af1` is the worst at 3.12x.
+///
+/// 4 covers the measured worst case with margin. It is deliberately
+/// crude and errs high, because refusing an install costs a user a
+/// retry while running out of space part way through extraction costs
+/// them the whole download. The accurate fix is for the package
+/// metadata to carry its uncompressed size so this constant is not
+/// needed at all; see issue #260.
+pub const SPACE_BUFFER_MULTIPLIER: u64 = 4;
 
 /// Verify that `path` has at least `required_bytes` available, returning
 /// `ManagerError::InsufficientDiskSpace` otherwise.

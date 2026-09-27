@@ -407,7 +407,17 @@ impl<C: LibraryClient> PackageInstaller<C> {
         let archive_path = install_temp.join(&metadata.filename);
         let extractor = ShellExtractor::new();
         extractor.reassemble(&destinations, &archive_path)?;
-        info!(archive = %metadata.filename, "reassembly completed");
+
+        // Free the parts before extracting rather than at cleanup. They are
+        // redundant now and extraction is where peak disk usage lives, so
+        // holding them through it costs a full extra copy of the download
+        // (#260).
+        let freed_bytes = free_downloaded_parts(&destinations);
+        info!(
+            archive = %metadata.filename,
+            freed_bytes,
+            "reassembly completed, archive parts freed"
+        );
         report(InstallStage::Reassembling, 1.0, "Archive reassembled");
 
         // Stage 5: Extract archive
@@ -566,9 +576,78 @@ fn copy_dir_recursive(source: &Path, dest: &Path) -> ManagerResult<()> {
     Ok(())
 }
 
+/// Remove the downloaded archive parts, returning the bytes reclaimed.
+///
+/// Called once reassembly has succeeded, when the parts are redundant: their
+/// checksums were verified during download and their contents are now in the
+/// reassembled archive. Leaving them in place meant the temp filesystem held
+/// the parts, the archive and the extracted tree at the same time, which is a
+/// whole extra copy of the download at the point of peak usage (#260).
+///
+/// Best effort. A part that cannot be removed is logged and skipped: the
+/// archive is already built, and `InstallTempGuard` removes whatever survives
+/// when the install finishes or fails. Failing an otherwise good install
+/// because a file could not be unlinked would be the wrong trade.
+fn free_downloaded_parts(parts: &[PathBuf]) -> u64 {
+    let mut freed = 0u64;
+    for part in parts {
+        let size = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+        match fs::remove_file(part) {
+            Ok(()) => freed += size,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                info!(part = %part.display(), error = %e, "could not free archive part");
+            }
+        }
+    }
+    freed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #260: the parts stay on disk through reassembly and extraction, so the
+    /// temp filesystem briefly holds the parts, the reassembled archive AND the
+    /// extracted tree. Freeing the parts as soon as the archive exists removes
+    /// a whole copy of the download from the peak.
+    #[test]
+    fn free_downloaded_parts_removes_every_part_and_reports_bytes_freed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut parts = Vec::new();
+        for (i, len) in [10usize, 20, 30].iter().enumerate() {
+            let path = temp.path().join(format!("archive.tar.gz.a{i}"));
+            std::fs::write(&path, vec![b'x'; *len]).expect("write part");
+            parts.push(path);
+        }
+
+        let freed = free_downloaded_parts(&parts);
+
+        assert_eq!(freed, 60, "should report the total bytes reclaimed");
+        for part in &parts {
+            assert!(
+                !part.exists(),
+                "{} should have been removed",
+                part.display()
+            );
+        }
+    }
+
+    /// A part that is already gone must not fail the install: the archive is
+    /// built and verified by this point, and the temp guard removes whatever
+    /// survives. Reclaiming space is best effort.
+    #[test]
+    fn free_downloaded_parts_tolerates_a_missing_part() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let present = temp.path().join("archive.tar.gz.aa");
+        std::fs::write(&present, vec![b'x'; 5]).expect("write part");
+        let absent = temp.path().join("archive.tar.gz.ab");
+
+        let freed = free_downloaded_parts(&[present.clone(), absent]);
+
+        assert_eq!(freed, 5, "counts only what it actually removed");
+        assert!(!present.exists());
+    }
 
     #[test]
     fn test_install_stage_name() {

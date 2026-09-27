@@ -769,7 +769,7 @@ where
         };
 
         match handle {
-            Some(mut handle) => {
+            Ok(mut handle) => {
                 debug!(job_id = %job_id, "Job submitted to executor");
 
                 // Track job submitted (FUSE requests are from RequestOrigin::Fuse)
@@ -888,8 +888,27 @@ where
                     }
                 });
             }
-            None => {
-                warn!(tile = ?tile, "Failed to submit job - executor may be shutdown");
+            Err(err) if err.is_back_pressure() => {
+                // Not a failure. The executor's queue is full, so this tile is
+                // shed and will be requested again if it is still wanted. This
+                // is the common case by a wide margin on a slow system, and
+                // reporting it as a possible shutdown told operators their
+                // executor had died while it was working normally (#272).
+                debug!(
+                    tile = ?tile,
+                    reason = %err,
+                    "Job shed at the executor boundary under back pressure"
+                );
+
+                // Remove from coalescer
+                coalescer.cancel(tile);
+
+                if let Some(tx) = request.response_tx {
+                    let _ = tx.send(DdsResponse::empty(start.elapsed()));
+                }
+            }
+            Err(err) => {
+                warn!(tile = ?tile, reason = %err, "Failed to submit job - executor may be shutdown");
 
                 // Remove from coalescer
                 coalescer.cancel(tile);

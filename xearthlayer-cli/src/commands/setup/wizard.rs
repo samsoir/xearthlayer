@@ -18,12 +18,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use console::style;
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use xearthlayer::config::{
     config_file_path, detect_scenery_dir, format_size, ConfigFile, SceneryDetectionResult, GB, MB,
 };
+use xearthlayer::provider::catalog::{find as find_provider, PROVIDERS};
 use xearthlayer::system::{
     enumerate_gpus, GpuAdapter, SystemInfo, MIN_DISK_CACHE_BYTES, MIN_MEMORY_CACHE_BYTES,
 };
@@ -50,6 +51,19 @@ pub struct SetupConfig {
     /// GPU device selector when compressor is "gpu". Ignored otherwise but
     /// always written to keep the config file shape consistent.
     pub texture_gpu_device: String,
+    /// Imagery provider (`provider.type`).
+    pub provider_type: String,
+    /// Google Maps API key, when the chosen provider needs one.
+    pub google_api_key: Option<String>,
+    /// Mapbox access token, when the chosen provider needs one.
+    pub mapbox_access_token: Option<String>,
+}
+
+/// Output of the provider step.
+struct ProviderSelection {
+    provider_type: String,
+    google_api_key: Option<String>,
+    mapbox_access_token: Option<String>,
 }
 
 /// Run the interactive setup wizard.
@@ -89,12 +103,17 @@ pub fn run_wizard() -> Result<(), CliError> {
     print_step_header("Step 2: Package Location");
     let package_dir = step_package_location(&theme)?;
 
-    // Step 3: Cache Configuration (directory + budgets)
-    print_step_header("Step 3: Cache Configuration");
+    // Step 3: Imagery Provider. Before the cache step because which imagery a
+    // user gets is a more fundamental choice than how much of it to keep.
+    print_step_header("Step 3: Imagery Provider");
+    let provider = step_provider(&theme)?;
+
+    // Step 4: Cache Configuration (directory + budgets)
+    print_step_header("Step 4: Cache Configuration");
     let cache_settings = step_cache(&theme)?;
 
-    // Step 4: DDS Encoding (GPU selection if multi-GPU)
-    print_step_header("Step 4: DDS Encoding");
+    // Step 5: DDS Encoding (GPU selection if multi-GPU)
+    print_step_header("Step 5: DDS Encoding");
     let (texture_compressor, texture_gpu_device) = step_encoding(&theme)?;
 
     // Build setup config
@@ -107,6 +126,9 @@ pub fn run_wizard() -> Result<(), CliError> {
         dds_disk_ratio: cache_settings.dds_disk_ratio,
         texture_compressor,
         texture_gpu_device,
+        provider_type: provider.provider_type,
+        google_api_key: provider.google_api_key,
+        mapbox_access_token: provider.mapbox_access_token,
     };
 
     write_config(&setup_config)?;
@@ -341,7 +363,138 @@ fn step_package_location(theme: &ColorfulTheme) -> Result<PathBuf, CliError> {
     }
 }
 
-/// Output of Step 3, the consolidated cache configuration.
+/// Menu entries for the provider step, one per catalog entry, in catalog order.
+///
+/// Pure so the wording can be asserted: a user has to be able to see from the
+/// menu alone whether a provider costs money or needs an account.
+fn provider_menu_labels() -> Vec<String> {
+    PROVIDERS
+        .iter()
+        .map(|entry| match entry.credential {
+            Some(cred) => format!(
+                "{} ({}, needs a {})",
+                entry.name,
+                entry.summary,
+                cred.label()
+            ),
+            None => format!("{} ({})", entry.name, entry.summary),
+        })
+        .collect()
+}
+
+/// Index to preselect: the configured provider, else the first entry.
+///
+/// Re-running setup must not move a working installation to a different
+/// provider, so whatever is configured comes up selected and Enter keeps it.
+/// The catalog guarantees the first entry needs no credentials, which is the
+/// right landing place for a value that is unset or no longer recognised.
+fn default_provider_index(configured: &str) -> usize {
+    find_provider(configured)
+        .and_then(|entry| PROVIDERS.iter().position(|p| p.key == entry.key))
+        .unwrap_or(0)
+}
+
+/// Resolve a credential prompt: empty entry keeps whatever is already set.
+///
+/// The prompt does not echo, so it cannot show the current value as a default.
+/// Accepting an empty entry as "keep" is what lets a user re-run setup without
+/// having to find their API key again.
+fn resolve_credential(entered: String, existing: Option<&String>) -> Option<String> {
+    let trimmed = entered.trim();
+    if trimmed.is_empty() {
+        return existing.cloned();
+    }
+    Some(trimmed.to_string())
+}
+
+/// Step 3: imagery provider, and its credential if it needs one.
+fn step_provider(theme: &ColorfulTheme) -> Result<ProviderSelection, CliError> {
+    let existing = ConfigFile::load().unwrap_or_default();
+
+    println!("XEarthLayer streams satellite imagery from one of these sources.");
+    println!(
+        "{}",
+        style("Most need no account. Only Google Maps and Mapbox require credentials.").cyan()
+    );
+    println!();
+
+    let labels = provider_menu_labels();
+    let selection = Select::with_theme(theme)
+        .with_prompt("Imagery provider")
+        .items(&labels)
+        .default(default_provider_index(&existing.provider.provider_type))
+        .interact()
+        .map_err(|e| CliError::Config(format!("Provider selection failed: {}", e)))?;
+
+    let entry = &PROVIDERS[selection];
+    let mut google_api_key = None;
+    let mut mapbox_access_token = None;
+
+    if let Some(cred) = entry.credential {
+        let already_set = match cred {
+            xearthlayer::provider::ProviderCredential::GoogleApiKey => {
+                existing.provider.google_api_key.as_ref()
+            }
+            xearthlayer::provider::ProviderCredential::MapboxAccessToken => {
+                existing.provider.mapbox_access_token.as_ref()
+            }
+        };
+
+        println!();
+        if already_set.is_some() {
+            println!(
+                "{}",
+                style(format!(
+                    "A {} is already configured. Press Enter to keep it.",
+                    cred.label()
+                ))
+                .cyan()
+            );
+        }
+
+        // Password rather than Input: the value is a secret, and the terminal
+        // may be shared, recorded, or scrolled back through later.
+        let entered = Password::with_theme(theme)
+            .with_prompt(cred.label())
+            .allow_empty_password(true)
+            .interact()
+            .map_err(|e| CliError::Config(format!("Credential entry failed: {}", e)))?;
+
+        let resolved = resolve_credential(entered, already_set);
+
+        if resolved.is_none() {
+            println!();
+            println!(
+                "{}",
+                style(format!(
+                    "No {} set. {} will not serve tiles until you run:\n  xearthlayer config set {} <value>",
+                    cred.label(),
+                    entry.name,
+                    cred.config_key()
+                ))
+                .yellow()
+            );
+        }
+
+        match cred {
+            xearthlayer::provider::ProviderCredential::GoogleApiKey => google_api_key = resolved,
+            xearthlayer::provider::ProviderCredential::MapboxAccessToken => {
+                mapbox_access_token = resolved
+            }
+        }
+    }
+
+    println!();
+    println!("{}", style(format!("Provider: {}", entry.name)).green());
+
+    Ok(ProviderSelection {
+        provider_type: entry.key.to_string(),
+        google_api_key,
+        mapbox_access_token,
+    })
+}
+
+/// Output of Step 4, the consolidated cache configuration.
 struct CacheSettings {
     cache_dir: PathBuf,
     memory_cache_size: usize,
@@ -349,7 +502,7 @@ struct CacheSettings {
     dds_disk_ratio: f64,
 }
 
-/// Step 3: Cache directory + disk budget + memory budget.
+/// Step 4: Cache directory + disk budget + memory budget.
 ///
 /// This step absorbs what used to be split between "cache location" and
 /// "system configuration" — the budgets are derived from system info, so
@@ -534,7 +687,7 @@ fn prompt_memory_cache_size(
     Ok(clamped_mb * MB)
 }
 
-/// Step 4: DDS encoding backend (and GPU device selection if applicable).
+/// Step 5: DDS encoding backend (and GPU device selection if applicable).
 ///
 /// Returns `(compressor, gpu_device)` ready to write to config. The
 /// `gpu_device` is always populated even when ISPC is selected so that
@@ -643,6 +796,16 @@ fn write_config(setup: &SetupConfig) -> Result<(), CliError> {
     config.texture.compressor = setup.texture_compressor.clone();
     config.texture.gpu_device = setup.texture_gpu_device.clone();
 
+    config.provider.provider_type = setup.provider_type.clone();
+    // Written only when present, so choosing a credential-free provider does
+    // not discard a key the user may still want when switching back.
+    if setup.google_api_key.is_some() {
+        config.provider.google_api_key = setup.google_api_key.clone();
+    }
+    if setup.mapbox_access_token.is_some() {
+        config.provider.mapbox_access_token = setup.mapbox_access_token.clone();
+    }
+
     if let Some(parent) = setup.package_dir.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -655,4 +818,91 @@ fn write_config(setup: &SetupConfig) -> Result<(), CliError> {
         .map_err(|e| CliError::Config(format!("Failed to save config: {}", e)))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_menu_offers_every_provider_in_catalog_order() {
+        let labels = provider_menu_labels();
+
+        assert_eq!(labels.len(), PROVIDERS.len());
+        assert!(
+            labels[0].starts_with("Bing Maps"),
+            "the wizard must lead with a credential-free option, got {:?}",
+            labels[0]
+        );
+        for (label, entry) in labels.iter().zip(PROVIDERS) {
+            assert!(
+                label.contains(entry.name),
+                "{label} should name {}",
+                entry.name
+            );
+            assert!(
+                label.contains(entry.summary),
+                "{label} should summarise the provider"
+            );
+        }
+    }
+
+    #[test]
+    fn menu_labels_mark_the_providers_that_need_credentials() {
+        // A first-time user has to be able to see the cost before choosing.
+        for (label, entry) in provider_menu_labels().iter().zip(PROVIDERS) {
+            if let Some(cred) = entry.credential {
+                assert!(
+                    label.contains(cred.label()),
+                    "{label} should say it needs a {}",
+                    cred.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_selection_is_the_configured_provider() {
+        // Re-running setup must not silently move a working install to another
+        // provider: the current value is preselected so Enter keeps it.
+        let google = PROVIDERS.iter().position(|p| p.key == "google").unwrap();
+        assert_eq!(default_provider_index("google"), google);
+        assert_eq!(default_provider_index("GOOGLE"), google);
+    }
+
+    #[test]
+    fn default_selection_falls_back_to_the_first_free_provider() {
+        // An unset or unrecognised value lands on the first entry, which the
+        // catalog guarantees needs no credentials.
+        assert_eq!(default_provider_index(""), 0);
+        assert_eq!(default_provider_index("nonsuch"), 0);
+        assert!(PROVIDERS[0].is_free());
+    }
+
+    #[test]
+    fn an_empty_credential_entry_keeps_the_existing_one() {
+        let existing = Some("existing-key".to_string());
+
+        assert_eq!(
+            resolve_credential(String::new(), existing.as_ref()),
+            Some("existing-key".to_string()),
+            "pressing Enter must not wipe a working credential"
+        );
+    }
+
+    #[test]
+    fn a_new_credential_entry_replaces_and_is_trimmed() {
+        let existing = Some("old".to_string());
+
+        assert_eq!(
+            resolve_credential("  new-key \n".to_string(), existing.as_ref()),
+            Some("new-key".to_string()),
+            "pasted credentials pick up surrounding whitespace"
+        );
+    }
+
+    #[test]
+    fn an_empty_entry_with_nothing_existing_stays_unset() {
+        assert_eq!(resolve_credential("   ".to_string(), None), None);
+    }
 }
