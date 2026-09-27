@@ -209,11 +209,14 @@ impl XEarthLayerRuntime {
         let job_submitter = daemon.job_submitter();
         let resource_pools = daemon.resource_pools();
 
-        // Create the DDS client with resource pool awareness for executor load reporting
-        let dds_client = Arc::new(ChannelDdsClient::with_resource_pools(
-            job_tx,
-            Arc::clone(&resource_pools),
-        ));
+        // Create the DDS client with resource pool awareness for executor load
+        // reporting, and the pinned-tile budget it reports FUSE demand from.
+        // The budget is created here, before the filesystem exists, because the
+        // client is what carries it to the mount (#246).
+        let dds_client = Arc::new(
+            ChannelDdsClient::with_resource_pools(job_tx, Arc::clone(&resource_pools))
+                .with_pinned_budget(Arc::new(crate::pinned_budget::PinnedTileBudget::new())),
+        );
 
         // Create shutdown token for coordinating shutdown
         let shutdown_token = CancellationToken::new();

@@ -52,7 +52,8 @@ impl ExecutionResult {
 
 /// Execute a prefetch plan by submitting tiles to the DDS client.
 ///
-/// Applies backpressure-aware submission based on executor resource utilization:
+/// Applies backpressure-aware submission based on the higher of executor
+/// resource utilisation and demand on the FUSE mount (#246):
 /// - Load > [`BACKPRESSURE_DEFER_THRESHOLD`]: skips this cycle (deferred)
 /// - Load > [`BACKPRESSURE_REDUCE_THRESHOLD`]: submits reduced fraction
 /// - Applies transition throttle (takeoff ramp-up)
@@ -75,8 +76,15 @@ pub(crate) fn execute_plan(
     )
     .entered();
 
-    // Check executor resource utilization before submitting
-    let load = client.executor_load();
+    // Backpressure is the higher of two independent pressures, because neither
+    // sees the other's load. `executor_load` measures our own pipeline: tile
+    // generation, downloads, encoding. `fuse_pressure` measures X-Plane's demand
+    // on the mount, which at a boundary crossing is mostly reads served from
+    // cache and so invisible to the pools. Submitting at full rate into that
+    // collision is what set the memory ceiling in #227; see #246.
+    let executor_load = client.executor_load();
+    let fuse_pressure = client.fuse_pressure();
+    let load = executor_load.max(fuse_pressure);
     if load > BACKPRESSURE_DEFER_THRESHOLD {
         // Store every planned tile as pending so they're retried when load
         // drops. No cap — the executor controls throughput via its channel
@@ -84,10 +92,21 @@ pub(crate) fn execute_plan(
         // silent drops at submission boundaries create forward-starvation
         // because discarded tiles never get re-planned on subsequent cycles
         // once their regions get marked or cached by some other path.
+        // Both figures, not just the maximum: calibrating this throttle means
+        // knowing which pressure deferred a cycle, and they are the two
+        // independent causes. A log that reported only `load` could not
+        // distinguish "our pipeline is saturated" from "X-Plane is reading hard".
         tracing::info!(
             load = format!("{:.1}%", load * 100.0),
+            executor_load = format!("{:.1}%", executor_load * 100.0),
+            fuse_pressure = format!("{:.1}%", fuse_pressure * 100.0),
+            source = if fuse_pressure > executor_load {
+                "fuse"
+            } else {
+                "executor"
+            },
             tiles_planned = plan.tiles.len(),
-            "Executor backpressure — deferring prefetch cycle, tiles stored as pending"
+            "Backpressure, deferring prefetch cycle, tiles stored as pending"
         );
         return ExecutionResult {
             submitted_tiles: Vec::new(),
@@ -101,9 +120,16 @@ pub(crate) fn execute_plan(
         let reduced = ((plan.tiles.len() as f64) * BACKPRESSURE_REDUCED_FRACTION).ceil() as usize;
         tracing::debug!(
             load = format!("{:.1}%", load * 100.0),
+            executor_load = format!("{:.1}%", executor_load * 100.0),
+            fuse_pressure = format!("{:.1}%", fuse_pressure * 100.0),
+            source = if fuse_pressure > executor_load {
+                "fuse"
+            } else {
+                "executor"
+            },
             full_plan = plan.tiles.len(),
             reduced_to = reduced,
-            "Moderate backpressure — reducing prefetch submission"
+            "Moderate backpressure, reducing prefetch submission"
         );
         reduced
     } else {
@@ -218,6 +244,104 @@ mod tests {
 
     fn default_throttle() -> TransitionThrottle {
         TransitionThrottle::new()
+    }
+
+    /// #246: X-Plane's demand on the mount is invisible to `executor_load`,
+    /// which sees generation jobs but not reads served from cache, and to
+    /// `SimState::should_prefetch`, which reports X-Plane's own DSF loader. At a
+    /// boundary crossing prefetch therefore submitted at full rate into the peak
+    /// concurrency event, which per #227 is what sets the memory floor.
+    #[test]
+    fn fuse_pressure_alone_defers_the_cycle() {
+        // Executor idle, mount saturated: exactly the collision the existing
+        // signals miss.
+        let client = BackpressureMockClient::new(0.0).with_fuse_pressure(0.85);
+        let plan = test_plan(50);
+        let mut throttle = default_throttle();
+
+        let result = execute_plan(
+            &plan,
+            &client,
+            &mut throttle,
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        assert!(
+            result.deferred,
+            "FUSE pressure above the defer threshold must defer the cycle"
+        );
+        assert_eq!(result.submitted_count(), 0);
+        assert_eq!(
+            result.pending.len(),
+            50,
+            "deferred tiles are stored as pending, never dropped (#172)"
+        );
+    }
+
+    #[test]
+    fn fuse_pressure_alone_reduces_the_submission() {
+        // 0.50 is where the reference-leg spike lands: 23 open handles against
+        // the 512 MB ceiling. Reduce, not defer.
+        let client = BackpressureMockClient::new(0.0).with_fuse_pressure(0.55);
+        let plan = test_plan(100);
+        let mut throttle = default_throttle();
+
+        let result = execute_plan(
+            &plan,
+            &client,
+            &mut throttle,
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        assert!(!result.deferred);
+        assert!(
+            result.submitted_count() < 100 && result.submitted_count() > 0,
+            "moderate FUSE pressure should reduce rather than stop, got {}",
+            result.submitted_count()
+        );
+    }
+
+    #[test]
+    fn the_higher_of_the_two_signals_wins() {
+        // Neither signal may mask the other: a busy executor with a quiet mount
+        // must still defer, which is the pre-#246 behaviour.
+        let executor_busy = BackpressureMockClient::new(0.85).with_fuse_pressure(0.0);
+        let plan = test_plan(10);
+        let mut throttle = default_throttle();
+
+        let result = execute_plan(
+            &plan,
+            &executor_busy,
+            &mut throttle,
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        assert!(result.deferred, "executor load must still defer on its own");
+    }
+
+    /// Acceptance criterion 4: no return of the #59 self-tripping behaviour.
+    /// A quiet mount and a quiet executor must submit the whole plan.
+    #[test]
+    fn cruise_conditions_submit_the_full_plan() {
+        // ~900 reads/min cruise pins almost nothing: X-Plane holds a handful of
+        // textures open, nowhere near the ceiling.
+        let client = BackpressureMockClient::new(0.1).with_fuse_pressure(0.05);
+        let plan = test_plan(40);
+        let mut throttle = default_throttle();
+
+        let result = execute_plan(
+            &plan,
+            &client,
+            &mut throttle,
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        assert!(!result.deferred);
+        assert_eq!(
+            result.submitted_count(),
+            40,
+            "cruise prefetch throughput must be unaffected"
+        );
     }
 
     #[test]

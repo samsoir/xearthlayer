@@ -958,13 +958,51 @@ The `GeoIndex` stores spatial state via type-keyed layers:
 
 Prefetch jobs are submitted through the existing `DdsClient` trait with `Priority::Prefetch`. The priority queue ensures ON_DEMAND requests (FUSE) always jump ahead.
 
-### Executor Backpressure
+### Backpressure
 
-The coordinator checks `executor_load()` each cycle:
+Each cycle the coordinator takes the higher of two independent pressures and
+compares it against the same thresholds:
 
 - Load > 80%: defer entire cycle
 - Load > 50%: submit reduced batch (50%)
 - Load < 50%: full submission
+
+**`executor_load()`** is resource-pool utilisation: our own pipeline, meaning
+downloads, encoding and disk writes.
+
+**`fuse_pressure()`** is demand on the mount: memory pinned by open virtual DDS
+handles, as a fraction of the ceiling that bounds it. Added in
+[#246](https://github.com/samsoir/xearthlayer/issues/246).
+
+The two are needed because they diverge exactly when it matters. At a boundary
+crossing X-Plane opens many textures at once, and most of those reads are served
+from cache, so they never become executor work and executor load stays low while
+the mount is saturated. That collision is the peak concurrency event, and per
+[#227](https://github.com/samsoir/xearthlayer/issues/227) the glibc arena grows
+to cover the worst burst it ever sees and never gives the space back, so the
+collision sets the memory floor for the whole session. Prefetch submitting at
+full rate into it was making that peak larger than it needed to be.
+
+Two earlier mechanisms do not cover this. `SimState::should_prefetch()` gates on
+`async_scenery_load_in_progress`, which reports X-Plane's own DSF loader rather
+than demand on us, and was never true during the flight that motivated the
+change. `executor_load()` misses cache-served reads as described above.
+
+Open handles rather than a read rate, deliberately. `open` and `release` reach
+the filesystem on every platform; reads do not. macOS serves virtual DDS through
+the kernel page cache, because macFUSE faults when a `direct_io` file is
+`mmap`ed, so a read-rate signal would be accurate on Linux and nearly blind
+there. Handles also need no sampling window and no threshold of their own: the
+fraction against the ceiling is already the 0 to 1 figure the thresholds above
+compare against.
+
+A deferral logs both figures and which one dominated, because calibrating this
+means knowing which pressure caused a given cycle to yield:
+
+```
+Backpressure, deferring prefetch cycle, tiles stored as pending
+  load=85.0% executor_load=12.0% fuse_pressure=85.0% source=fuse tiles_planned=1425
+```
 
 ### TransitionThrottle
 

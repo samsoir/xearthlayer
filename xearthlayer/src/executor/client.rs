@@ -36,6 +36,7 @@
 use crate::coord::TileCoord;
 use crate::executor::resource_pool::ResourcePools;
 use crate::executor::Priority;
+use crate::pinned_budget::PinnedTileBudget;
 use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
 use std::fmt;
 use std::sync::Arc;
@@ -234,6 +235,39 @@ pub trait DdsClient: Send + Sync + 'static {
         EXECUTOR_LOAD_UNKNOWN
     }
 
+    /// Returns demand on the FUSE mount as a value between 0.0 and 1.0.
+    ///
+    /// Memory pinned by open virtual DDS handles, as a fraction of the ceiling
+    /// that bounds it. A handle exists for as long as X-Plane holds a texture
+    /// open, so this measures how hard the sim is reading from us right now.
+    ///
+    /// This is a different quantity from [`DdsClient::executor_load`], and the
+    /// two diverge exactly when it matters (#246). Executor load sees tile
+    /// generation, so it misses reads served from cache, which is most of a
+    /// boundary load. `SimState::should_prefetch` reports X-Plane's own DSF
+    /// loader, not demand on us, and was never true during the flight that
+    /// motivated this. Prefetch takes the maximum of the two.
+    ///
+    /// Open handles rather than a read rate, deliberately: `open` and `release`
+    /// reach the filesystem on every platform, where reads do not. macOS serves
+    /// virtual DDS through the kernel page cache, so a read-rate signal would be
+    /// accurate on Linux and nearly blind there.
+    ///
+    /// Defaults to 0.0, meaning no pressure, for clients with no mount attached.
+    fn fuse_pressure(&self) -> f64 {
+        0.0
+    }
+
+    /// The pinned-tile budget this client reports pressure from, if any.
+    ///
+    /// The filesystem pins and releases against the same budget the client
+    /// reads, and this client is the one object both sides already hold, so it
+    /// carries the shared handle rather than threading it through the service
+    /// facade. `None` for clients with no mount.
+    fn pinned_budget(&self) -> Option<Arc<PinnedTileBudget>> {
+        None
+    }
+
     /// Returns a clone of the underlying sender for async operations.
     ///
     /// This allows callers to use `send().await` for backpressure-aware
@@ -281,6 +315,13 @@ pub struct ChannelDdsClient {
     /// across all pools. This provides accurate backpressure signaling
     /// based on actual resource consumption rather than channel depth.
     resource_pools: Option<Arc<ResourcePools>>,
+
+    /// Pinned-tile budget for reporting FUSE demand.
+    ///
+    /// Shared with the FUSE filesystem, which pins and releases against it.
+    /// When absent, `fuse_pressure()` reports no pressure, which is correct for
+    /// a client with no mount (prewarm, tests).
+    pinned_budget: Option<Arc<PinnedTileBudget>>,
 }
 
 impl ChannelDdsClient {
@@ -293,6 +334,7 @@ impl ChannelDdsClient {
         Self {
             tx,
             resource_pools: None,
+            pinned_budget: None,
         }
     }
 
@@ -313,7 +355,15 @@ impl ChannelDdsClient {
         Self {
             tx,
             resource_pools: Some(resource_pools),
+            pinned_budget: None,
         }
+    }
+
+    /// Attaches the pinned-tile budget shared with the FUSE filesystem, so
+    /// `fuse_pressure()` reports real demand on the mount (#246).
+    pub fn with_pinned_budget(mut self, budget: Arc<PinnedTileBudget>) -> Self {
+        self.pinned_budget = Some(budget);
+        self
     }
 }
 
@@ -417,6 +467,16 @@ impl DdsClient for ChannelDdsClient {
         self.resource_pools
             .as_ref()
             .map_or(EXECUTOR_LOAD_UNKNOWN, |pools| pools.max_utilization())
+    }
+
+    fn fuse_pressure(&self) -> f64 {
+        self.pinned_budget
+            .as_ref()
+            .map_or(0.0, |budget| budget.fraction())
+    }
+
+    fn pinned_budget(&self) -> Option<Arc<PinnedTileBudget>> {
+        self.pinned_budget.as_ref().map(Arc::clone)
     }
 
     fn sender(&self) -> Option<mpsc::Sender<JobRequest>> {
@@ -797,6 +857,56 @@ mod tests {
             (client.executor_load() - EXECUTOR_LOAD_UNKNOWN).abs() < f64::EPSILON,
             "Client without resource pools should return EXECUTOR_LOAD_UNKNOWN"
         );
+    }
+
+    /// #246: the filesystem pins against the budget and prefetch reads it. If
+    /// the two ever hold separate budgets, both halves still compile and both
+    /// report plausible numbers, so nothing fails except the throttle. This is
+    /// what says they are the same object.
+    #[test]
+    fn fuse_pressure_reflects_pinning_on_the_shared_budget() {
+        let budget = Arc::new(PinnedTileBudget::with_ceiling(1000));
+        let (tx, _rx) = mpsc::channel::<JobRequest>(10);
+        let client = ChannelDdsClient::new(tx).with_pinned_budget(Arc::clone(&budget));
+
+        assert_eq!(client.fuse_pressure(), 0.0, "idle mount, no pressure");
+
+        // Stands in for the filesystem materialising tiles for open handles.
+        budget.pin(500);
+
+        assert_eq!(client.fuse_pressure(), 0.5);
+    }
+
+    /// The mount recovers the budget from the client, because the client is
+    /// created first. A `pinned_budget()` that cloned the value instead of the
+    /// handle would leave the filesystem pinning into an orphan.
+    #[test]
+    fn the_budget_recovered_from_the_client_is_the_same_object() {
+        let budget = Arc::new(PinnedTileBudget::with_ceiling(1000));
+        let (tx, _rx) = mpsc::channel::<JobRequest>(10);
+        let client = ChannelDdsClient::new(tx).with_pinned_budget(Arc::clone(&budget));
+
+        let recovered = client
+            .pinned_budget()
+            .expect("a client given a budget must hand it back");
+        recovered.pin(1000);
+
+        assert_eq!(
+            client.fuse_pressure(),
+            1.0,
+            "pinning through the recovered handle must be visible to the client"
+        );
+    }
+
+    #[test]
+    fn a_client_with_no_mount_reports_no_fuse_pressure() {
+        // Prewarm and tests construct clients with no filesystem attached. They
+        // must not be throttled by a signal that does not apply to them.
+        let (tx, _rx) = mpsc::channel::<JobRequest>(10);
+        let client = ChannelDdsClient::new(tx);
+
+        assert_eq!(client.fuse_pressure(), 0.0);
+        assert!(client.pinned_budget().is_none());
     }
 
     #[test]

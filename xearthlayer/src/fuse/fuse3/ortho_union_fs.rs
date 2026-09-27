@@ -45,6 +45,7 @@ use crate::fuse::coalesce::RequestCoalescer;
 use crate::fuse::{get_default_placeholder, parse_dds_filename, DdsFilename};
 use crate::geo_index::GeoIndex;
 use crate::ortho_union::OrthoUnionIndex;
+use crate::pinned_budget::PinnedTileBudget;
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use crate::scene_tracker::{DdsTileCoord, FuseAccessEvent};
 use bytes::Bytes;
@@ -69,34 +70,6 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::mpsc;
 use tokio::sync::OnceCell;
 use tracing::{debug, trace, warn, Instrument};
-
-/// Ceiling on DDS bytes pinned by open file handles: 512 MiB, or 48 tiles.
-///
-/// Each memoising handle holds one whole tile for as long as X-Plane keeps the
-/// file open, which is new retention in a codebase with an open unbounded-growth
-/// investigation (#227). Past this point `open()` stops handing out memoising
-/// handles and reads fall back to resolving per call, so the bound costs
-/// throughput rather than correctness.
-///
-/// **Sized against measurement, not opens** (#236). Two scene loads on one
-/// machine (KDEN warm, KSLC cold, 2026-08-19) peaked at **31 concurrent opens**
-/// but only **10-21 MiB pinned** -- roughly two tiles, about 24x headroom.
-/// The two figures diverge because `pinned_tile_bytes` counts *materialised*
-/// tiles, and a tile is produced on first read, not on `open()`: X-Plane reads
-/// each texture in two calls and releases promptly, so most open handles hold
-/// nothing. Sizing this from the open count instead would overstate the
-/// requirement by more than an order of magnitude.
-///
-/// The bound is **soft**. Admission tests `pinned + expected` but reserves
-/// nothing, so concurrent opens can all pass against one remaining slot and
-/// then materialise together. Reserving on `open()` would be worse: X-Plane
-/// may open a file it never reads, so reservations would be held for tiles
-/// that never exist and the cap would engage falsely.
-///
-/// If `dds_budget_exhausted` on the `Memory sample` line is ever non-zero, a
-/// real scene has exceeded what this was sized against -- raise it against
-/// `dds_pinned_peak_mb` from that flight rather than by guessing again.
-const MAX_PINNED_TILE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Per-open state for one virtual DDS file.
 struct DdsHandle {
@@ -196,14 +169,15 @@ pub struct Fuse3OrthoUnionFS {
     dds_handles: DashMap<u64, Arc<DdsHandle>>,
     /// Source of file handles. Starts at 1: 0 means "no handle".
     next_fh: AtomicU64,
-    /// Bytes of DDS tiles currently pinned by open handles.
-    pinned_tile_bytes: AtomicU64,
-    /// Highest concurrent handle count seen. The current counts drain to near
-    /// zero between bursts, so the peak is what `MAX_PINNED_TILE_BYTES` has to
-    /// be sized against.
+    /// Bytes of DDS tiles currently pinned by open handles, and the ceiling.
+    ///
+    /// Shared rather than private because prefetch reads the same figure as its
+    /// yield signal (#246). See [`PinnedTileBudget`].
+    pinned: Arc<PinnedTileBudget>,
+    /// Highest concurrent handle count seen. The current count drains to near
+    /// zero between bursts, so the peak is what the pinned ceiling has to be
+    /// sized against.
     peak_handles_open: AtomicU64,
-    /// Highest pinned byte total seen.
-    peak_pinned_tile_bytes: AtomicU64,
     /// Whether the budget-exhausted warning has been emitted this session.
     ///
     /// Latched, because the cap engages for every open in a burst rather than
@@ -277,9 +251,8 @@ impl Fuse3OrthoUnionFS {
             request_coalescer,
             dds_handles: DashMap::new(),
             next_fh: AtomicU64::new(1),
-            pinned_tile_bytes: AtomicU64::new(0),
+            pinned: Arc::new(PinnedTileBudget::new()),
             peak_handles_open: AtomicU64::new(0),
-            peak_pinned_tile_bytes: AtomicU64::new(0),
             budget_warning_logged: AtomicBool::new(false),
             scene_tracker_tx: None,
             metrics_client: None,
@@ -314,15 +287,25 @@ impl Fuse3OrthoUnionFS {
             request_coalescer,
             dds_handles: DashMap::new(),
             next_fh: AtomicU64::new(1),
-            pinned_tile_bytes: AtomicU64::new(0),
+            pinned: Arc::new(PinnedTileBudget::new()),
             peak_handles_open: AtomicU64::new(0),
-            peak_pinned_tile_bytes: AtomicU64::new(0),
             budget_warning_logged: AtomicBool::new(false),
             scene_tracker_tx: None,
             metrics_client: None,
             fuse_max_background: None,
             fuse_congestion_threshold: None,
         }
+    }
+
+    /// Share the pinned-tile budget with the prefetch backpressure signal.
+    ///
+    /// Without this the filesystem accounts against a budget only it can see,
+    /// which is correct for the memoisation cap but leaves prefetch blind to
+    /// demand on the mount (#246). Passing the runtime's budget makes the same
+    /// number answer both questions.
+    pub fn with_pinned_budget(mut self, budget: Arc<PinnedTileBudget>) -> Self {
+        self.pinned = budget;
+        self
     }
 
     /// Set the timeout for DDS generation.
@@ -481,17 +464,15 @@ impl Fuse3OrthoUnionFS {
 
     fn report_handle_gauge(&self) {
         let open = self.dds_handles.len() as u64;
-        let pinned = self.pinned_tile_bytes.load(Ordering::Relaxed);
+        let pinned = self.pinned.pinned_bytes();
         self.peak_handles_open.fetch_max(open, Ordering::Relaxed);
-        self.peak_pinned_tile_bytes
-            .fetch_max(pinned, Ordering::Relaxed);
 
         if let Some(metrics) = &self.metrics_client {
             metrics.fuse_handles(
                 open,
                 pinned,
                 self.peak_handles_open.load(Ordering::Relaxed),
-                self.peak_pinned_tile_bytes.load(Ordering::Relaxed),
+                self.pinned.peak_bytes(),
             );
         }
     }
@@ -503,7 +484,7 @@ impl Fuse3OrthoUnionFS {
 
     /// Highest pinned tile byte total seen.
     pub fn peak_pinned_tile_bytes(&self) -> u64 {
-        self.peak_pinned_tile_bytes.load(Ordering::Relaxed)
+        self.pinned.peak_bytes()
     }
 
     /// Number of virtual DDS files currently open.
@@ -513,7 +494,7 @@ impl Fuse3OrthoUnionFS {
 
     /// Bytes of DDS tiles currently pinned by open handles.
     pub fn pinned_tile_bytes(&self) -> u64 {
-        self.pinned_tile_bytes.load(Ordering::Relaxed)
+        self.pinned.pinned_bytes()
     }
 
     /// Record one FUSE `read()` call for the amplification metric.
@@ -562,8 +543,9 @@ impl Fuse3OrthoUnionFS {
         // comparing dds_pinned_peak_mb against it does not have to know the
         // constant, and does not have to guess which build it came from (#236).
         tracing::info!(
-            dds_pinned_cap_mb = MAX_PINNED_TILE_BYTES / (1024 * 1024),
-            dds_pinned_cap_tiles = MAX_PINNED_TILE_BYTES / self.virtual_dds_config.size().max(1),
+            dds_pinned_cap_mb = self.pinned.ceiling_bytes() / (1024 * 1024),
+            dds_pinned_cap_tiles =
+                self.pinned.ceiling_bytes() / self.virtual_dds_config.size().max(1),
             "Virtual DDS handle memoisation budget"
         );
 
@@ -886,8 +868,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
                     .tile
                     .get_or_init(|| async {
                         let data = self.resolve_tile(&handle.coords).await;
-                        self.pinned_tile_bytes
-                            .fetch_add(data.len() as u64, Ordering::Relaxed);
+                        self.pinned.pin(data.len() as u64);
                         // Report here, not at open(): the tile is produced
                         // on first read, so a gauge sampled only at open
                         // would never see the bytes it is meant to bound.
@@ -1196,8 +1177,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         // Refuse to memoise past the pinned-bytes ceiling. fh 0 makes read()
         // resolve per call, which is slower but correct.
         let expected = self.virtual_dds_config.size();
-        let pinned = self.pinned_tile_bytes.load(Ordering::Relaxed);
-        if pinned + expected > MAX_PINNED_TILE_BYTES {
+        if self.pinned.would_exceed(expected) {
             // Count every refusal: this is what lets a flight log tell "the
             // cap engaged" from "the #234 fix stopped working", which look
             // identical otherwise -- both show fuse_dds_alloc_mb climbing.
@@ -1208,8 +1188,8 @@ impl Filesystem for Fuse3OrthoUnionFS {
             // the degradation was invisible on an ordinary flight.
             if self.claim_budget_warning() {
                 warn!(
-                    pinned_mb = pinned / (1024 * 1024),
-                    cap_mb = MAX_PINNED_TILE_BYTES / (1024 * 1024),
+                    pinned_mb = self.pinned.pinned_bytes() / (1024 * 1024),
+                    cap_mb = self.pinned.ceiling_bytes() / (1024 * 1024),
                     open_handles = self.dds_handles.len(),
                     "DDS handle budget exhausted - serving opens without memoisation. \
                      Reads now resolve their tile once per call. Further occurrences \
@@ -1252,8 +1232,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         // 11.17 MB for the life of the mount.
         if let Some((_, handle)) = self.dds_handles.remove(&fh) {
             if let Some(tile) = handle.tile.get() {
-                self.pinned_tile_bytes
-                    .fetch_sub(tile.len() as u64, Ordering::Relaxed);
+                self.pinned.release(tile.len() as u64);
             }
             self.report_handle_gauge();
         }
@@ -1753,8 +1732,7 @@ mod tests {
         let ino = virtual_inode(&fs);
 
         // One tile short of the ceiling: pinned + expected must exceed it.
-        fs.pinned_tile_bytes
-            .store(MAX_PINNED_TILE_BYTES, Ordering::Relaxed);
+        fs.pinned.pin(fs.pinned.ceiling_bytes());
 
         let opened = fs.open(test_request(), ino, 0).await.unwrap();
         assert_eq!(opened.fh, 0, "refused opens get no memoising handle");
@@ -1776,8 +1754,7 @@ mod tests {
 
         let (fs, mut rx, _temp) = virtual_dds_fixture_with_metrics();
         let ino = virtual_inode(&fs);
-        fs.pinned_tile_bytes
-            .store(MAX_PINNED_TILE_BYTES, Ordering::Relaxed);
+        fs.pinned.pin(fs.pinned.ceiling_bytes());
 
         for _ in 0..3 {
             let opened = fs.open(test_request(), ino, 0).await.unwrap();
@@ -1797,8 +1774,7 @@ mod tests {
 
         let (fs, _rx, _temp) = virtual_dds_fixture_with_metrics();
         let ino = virtual_inode(&fs);
-        fs.pinned_tile_bytes
-            .store(MAX_PINNED_TILE_BYTES, Ordering::Relaxed);
+        fs.pinned.pin(fs.pinned.ceiling_bytes());
 
         // Assert the claim, not the flag. A flag assertion passes even if the
         // warn is emitted unconditionally, so long as something sets it.
@@ -2193,6 +2169,27 @@ mod tests {
             gid: 1000,
             pid: 1000,
         }
+    }
+
+    /// #246: the filesystem must account against the budget it was given, not
+    /// the one it made for itself, or prefetch reads a gauge nothing writes to.
+    #[test]
+    fn with_pinned_budget_accounts_against_the_injected_budget() {
+        let budget = Arc::new(PinnedTileBudget::with_ceiling(1000));
+        let (fs, _rx, _temp) = virtual_dds_fixture_with_metrics();
+        let fs = fs.with_pinned_budget(Arc::clone(&budget));
+
+        budget.pin(400);
+
+        assert_eq!(
+            fs.pinned_tile_bytes(),
+            400,
+            "the filesystem must read the injected budget"
+        );
+        assert!(
+            budget.would_exceed(601),
+            "and the ceiling must come from it too"
+        );
     }
 
     /// Drain the single `FuseRead` event a read is expected to emit.
