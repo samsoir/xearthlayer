@@ -132,8 +132,9 @@ The wizard will guide you through:
 
 1. **X-Plane Custom Scenery** - Auto-detects your X-Plane 12 installation or lets you specify the path
 2. **Package Location** - Where to store scenery packages (default: `~/.local/share/xearthlayer/packages`)
-3. **Cache Location** - Where to store cached tiles with storage type detection (NVMe/SSD/HDD)
-4. **System Configuration** - Recommends optimal memory and disk cache sizes based on your hardware
+3. **Imagery Provider** - Which satellite imagery to stream. Most options need no account; the wizard prompts for a key or token only for Google Maps and Mapbox
+4. **Cache Configuration** - Where to store cached tiles, with storage type detection (NVMe/SSD/HDD), and recommended memory and disk cache sizes based on your hardware
+5. **DDS Encoding** - Chooses the texture encoder, and which GPU to use if you have more than one
 
 The wizard detects your system's CPU, memory, and storage type to recommend the best settings.
 

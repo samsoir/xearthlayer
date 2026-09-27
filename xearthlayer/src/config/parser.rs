@@ -34,14 +34,15 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
     if let Some(section) = ini.section(Some("provider")) {
         if let Some(v) = section.get("type") {
             let v = v.to_lowercase();
-            let valid_providers = ["apple", "arcgis", "bing", "go2", "google", "mapbox", "usgs"];
-            if !valid_providers.contains(&v.as_str()) {
+            if crate::provider::catalog::find(&v).is_none() {
                 return Err(ConfigFileError::InvalidValue {
                     section: "provider".to_string(),
                     key: "type".to_string(),
                     value: v,
-                    reason: "must be one of: apple, arcgis, bing, go2, google, mapbox, usgs"
-                        .to_string(),
+                    reason: format!(
+                        "must be one of: {}",
+                        crate::provider::catalog::keys_sorted_csv()
+                    ),
                 });
             }
             config.provider.provider_type = v;
