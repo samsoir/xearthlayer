@@ -432,7 +432,7 @@ Key sections:
 - `[texture]` - DDS format (bc1/bc3), compressor backend (software/ispc/gpu), GPU device selection
 - `[prefetch]` - Boundary-driven prefetch, web_api_port (default 8086), calibration, transition ramp
 - `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
-- `[executor]` - Job limits and retry behavior. Resource pool capacities are NOT configurable — they are derived from logical core count by `ResourcePoolConfig::default()` (see #249)
+- `[executor]` - Per-chunk download behaviour only: `request_timeout_secs` and `max_retries`, which reach the executor through `ServiceConfig::chunk_download_config()`. Concurrency is NOT configurable: pool capacities, task dispatch limits and channel capacities are derived from logical core count by `ResourcePoolConfig::default()`. `max_concurrent_jobs` and `retry_base_delay_ms` were removed in #249; the backoff base is a literal in `tasks/download_chunks.rs`
 - `[fuse]` - FUSE kernel limits (max_background, congestion_threshold)
 - `[packages]` - Package manager settings (concurrent_downloads: parallel part downloads 1-10)
 

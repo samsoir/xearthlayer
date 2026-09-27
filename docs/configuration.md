@@ -226,42 +226,36 @@ timeout = 10
 
 ### [executor]
 
-Controls the job executor daemon's job limits and download behaviour. The executor is the core tile processing engine that manages parallel downloads, encoding, and caching.
+Controls the per-chunk download behaviour of the job executor, the engine that downloads, encodes and caches tiles.
 
-**Resource pool capacities are not configurable.** Network, CPU and disk I/O pool sizes are derived from the host's logical core count by `ResourcePoolConfig::default()`, using multipliers tuned by flight testing and load-bearing for the memory behaviour fixed in [#227](https://github.com/samsoir/xearthlayer/issues/227). The `network_concurrent`, `cpu_concurrent` and `disk_io_concurrent` keys were removed in [#249](https://github.com/samsoir/xearthlayer/issues/249): they never reached the executor, so any value on disk described a capacity nothing used. `xearthlayer config upgrade` removes them.
+**Only download behaviour is configurable here.** Concurrency is not. Resource pool sizes (network, CPU, disk I/O), task dispatch limits and channel capacities are all derived from the host's logical core count by `ResourcePoolConfig::default()`, using multipliers tuned by flight testing and load-bearing for the memory behaviour fixed in [#227](https://github.com/samsoir/xearthlayer/issues/227).
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `max_concurrent_jobs` | integer | `ceil(num_cpus × 0.75)` | Maximum concurrent DDS tile jobs (1-256). Previously in `[control_plane]`. |
-| `request_timeout_secs` | integer | `10` | HTTP request timeout per chunk (seconds) |
-| `max_retries` | integer | `3` | Maximum retry attempts per failed chunk |
-| `retry_base_delay_ms` | integer | `100` | Base delay for exponential backoff (ms) |
+| `request_timeout_secs` | integer | `10` | HTTP request timeout for a single chunk (seconds) |
+| `max_retries` | integer | `3` | Retry attempts per failed chunk |
 
 **Example:**
 ```ini
 [executor]
-; Job concurrency (defaults are tuned for most systems)
-; max_concurrent_jobs = 12       ; Max concurrent tile jobs (ceil(num_cpus * 0.75))
-
-; Download behavior
 request_timeout_secs = 10        ; Per-chunk timeout
 max_retries = 3                  ; Retry attempts
-retry_base_delay_ms = 100        ; Exponential backoff base (100ms, 200ms, 400ms...)
 ```
 
-**Resource Pool Details:**
+**Retry behaviour:**
 
-- **Network pool**: Limits concurrent HTTP connections to prevent overwhelming imagery providers. Values outside 64-256 are automatically clamped.
-- **CPU pool**: Limits concurrent encoding operations. Default: `num_cpus / 2` — leaves headroom for X-Plane.
-- **Disk I/O pool**: Limits concurrent disk operations. Auto-detected from storage type (HDD: 4, SSD: 64, NVMe: 256).
+A failed chunk download is retried with exponential backoff, `100ms * 2^attempt`:
 
-**Retry Behavior:**
-
-Failed chunk downloads are retried with exponential backoff:
 - Attempt 1: immediate
 - Attempt 2: 100ms delay
 - Attempt 3: 200ms delay
 - Attempt 4: 400ms delay
+
+The base delay is not configurable.
+
+**When to raise the timeout:** a tile is 256 chunks, and a tile with any failed chunk is served to X-Plane but never written to the cache (see [#180](https://github.com/samsoir/xearthlayer/issues/180)). On a slow or lossy connection the same tiles are therefore regenerated on every flight. Raising `request_timeout_secs` lets those chunks complete so the tile can be cached.
+
+**Keys removed in [#249](https://github.com/samsoir/xearthlayer/issues/249):** `network_concurrent`, `cpu_concurrent`, `disk_io_concurrent`, `max_concurrent_jobs` and `retry_base_delay_ms`. None of them reached the executor, so no value on disk described anything that ran. `xearthlayer config upgrade` removes them. The first three were pool capacities, which are derived as described above. `max_concurrent_jobs` named no limit at all; it was only the figure the dashboard divided by. `retry_base_delay_ms` had nothing to reach, because the backoff base is a constant in the retry loop.
 
 ### [prefetch]
 
@@ -512,14 +506,9 @@ threads = 8
 timeout = 10
 
 [executor]
-; Job executor daemon (defaults are auto-tuned)
-; max_concurrent_jobs = 12         ; Max concurrent tile jobs (ceil(num_cpus * 0.75))
-; network_concurrent = 128         ; HTTP connections (64-256 range)
-; cpu_concurrent = 8               ; CPU-bound ops (num_cpus / 2)
-; disk_io_concurrent = 64          ; Disk I/O (auto-detected)
+; Per-chunk download behaviour. Concurrency is derived from the host.
 ; request_timeout_secs = 10        ; Per-chunk HTTP timeout
 ; max_retries = 3                  ; Download retry attempts
-; retry_base_delay_ms = 100        ; Backoff base delay
 
 [prefetch]
 ; Adaptive Prefetch System (v0.3.0+) - self-calibrating tile prefetching
@@ -664,13 +653,8 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `texture.gpu_device` | `integrated`, `discrete`, or name | GPU adapter selection (used when compressor = gpu) |
 | `generation.threads` | positive integer | Worker threads |
 | `generation.timeout` | positive integer | Tile generation timeout (seconds) |
-| `executor.max_concurrent_jobs` | 1-256 | Max concurrent DDS tile jobs |
-| `executor.network_concurrent` | positive integer | Concurrent HTTP connections (64-256) |
-| `executor.cpu_concurrent` | positive integer | Concurrent CPU-bound operations |
-| `executor.disk_io_concurrent` | positive integer | Concurrent disk I/O operations |
 | `executor.request_timeout_secs` | positive integer | Per-chunk HTTP timeout (seconds) |
 | `executor.max_retries` | positive integer | Max retry attempts per chunk |
-| `executor.retry_base_delay_ms` | positive integer | Exponential backoff base (ms) |
 | `prefetch.enabled` | `true`, `false` | Enable predictive prefetching |
 | `prefetch.mode` | `auto`, `aggressive`, `opportunistic`, `disabled` | Prefetch mode (auto uses calibration) |
 | `prefetch.web_api_port` | 1024-65535 | X-Plane Web API port for telemetry and sim state |
