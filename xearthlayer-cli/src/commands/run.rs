@@ -3,9 +3,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use xearthlayer::config::{
-    format_size, ControlPlaneSettings, DownloadConfig, PipelineSettings, TextureConfig,
-};
+use xearthlayer::config::{format_size, ControlPlaneSettings, TextureConfig};
 use xearthlayer::manager::LocalPackageStore;
 use xearthlayer::package::PackageType;
 use xearthlayer::panic as panic_handler;
@@ -32,7 +30,6 @@ pub struct RunArgs {
     pub mapbox_token: Option<String>,
     pub dds_format: Option<DdsCompression>,
     pub timeout: Option<u64>,
-    pub parallel: Option<usize>,
     pub no_cache: bool,
     pub no_prefetch: bool,
     pub airport: Option<String>,
@@ -83,9 +80,8 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
         config,
     )?;
     let format = resolve_dds_format(args.dds_format, config);
-    let timeout_secs = args.timeout.unwrap_or(config.download.timeout);
-    // Default parallel downloads is handled by DownloadConfig::default()
-    let parallel_downloads = args.parallel.unwrap_or(32);
+    let chunk_request_timeout_secs =
+        resolve_chunk_timeout_secs(args.timeout, config.executor.request_timeout_secs);
 
     // Build configurations
     // Mipmap levels are left unset so the encoder emits the full chain for the
@@ -96,27 +92,8 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
         .with_gpu_device(config.texture.gpu_device.clone());
     let dds_format = texture_config.format();
 
-    let download_config = DownloadConfig::new()
-        .with_timeout_secs(timeout_secs)
-        .with_max_retries(3)
-        .with_parallel_downloads(parallel_downloads);
-
     // Check if we'll use TUI (need to know before creating services)
     let use_tui = atty::is(atty::Stream::Stdout);
-
-    // Pool sizing is no longer configurable (#249) — it is derived by
-    // ResourcePoolConfig::default(). These two fields keep their own defaults so
-    // PipelineSettings still constructs; nothing reads them today, since
-    // ServiceConfig::pipeline() has no caller.
-    let pipeline_settings = PipelineSettings {
-        max_http_concurrent: xearthlayer::config::default_http_concurrent(),
-        max_cpu_concurrent: xearthlayer::config::default_cpu_concurrent(),
-        max_prefetch_in_flight: config.pipeline.max_prefetch_in_flight,
-        request_timeout_secs: config.executor.request_timeout_secs,
-        max_retries: config.executor.max_retries,
-        retry_base_delay_ms: config.executor.retry_base_delay_ms,
-        coalesce_channel_capacity: config.pipeline.coalesce_channel_capacity,
-    };
 
     let control_plane_settings = ControlPlaneSettings {
         max_concurrent_jobs: config.control_plane.max_concurrent_jobs,
@@ -127,7 +104,8 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
 
     let service_config = ServiceConfig::builder()
         .texture(texture_config)
-        .download(download_config)
+        .chunk_request_timeout_secs(chunk_request_timeout_secs)
+        .chunk_max_retries(config.executor.max_retries)
         .cache_enabled(!args.no_cache)
         .cache_directory(config.cache.directory.clone())
         .cache_memory_size(config.cache.memory_size)
@@ -135,7 +113,6 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
         .cache_dds_disk_ratio(config.cache.dds_disk_ratio)
         .generation_threads(config.generation.threads)
         .generation_timeout(config.generation.timeout)
-        .pipeline(pipeline_settings)
         .control_plane(control_plane_settings)
         .quiet_mode(use_tui) // Disable stats logging when TUI is active
         .build();
@@ -315,4 +292,31 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
     println!("All packages unmounted. Goodbye!");
 
     Ok(())
+}
+
+/// Resolve the per-chunk HTTP timeout from the `--timeout` flag and config.
+///
+/// The flag wins when given, otherwise `executor.request_timeout_secs` applies.
+///
+/// Both inputs were inert before #249: the flag and the key each landed in a
+/// `ServiceConfig::download()` that has no production reader, so the effective
+/// per-chunk timeout was a compile-time constant that no configuration could
+/// reach. Extracted so that resolution rule is assertable.
+fn resolve_chunk_timeout_secs(flag: Option<u64>, configured: u64) -> u64 {
+    flag.unwrap_or(configured)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_timeout_falls_back_to_the_configured_value() {
+        assert_eq!(resolve_chunk_timeout_secs(None, 45), 45);
+    }
+
+    #[test]
+    fn chunk_timeout_flag_overrides_the_configured_value() {
+        assert_eq!(resolve_chunk_timeout_secs(Some(90), 45), 90);
+    }
 }

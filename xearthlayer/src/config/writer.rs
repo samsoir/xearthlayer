@@ -116,20 +116,13 @@ threads = {}
 timeout = {}
 
 [executor]
-; Job executor daemon settings for tile generation.
-; These control resource pools, concurrency, and retry behavior.
+; Per-chunk download behaviour. Concurrency and resource pool sizes are
+; derived from the host and are not configurable.
 
-; Maximum concurrent DDS tile jobs (default: num_cpus / 2)
-max_concurrent_jobs = {}
-
-; Download behavior
 ; HTTP request timeout in seconds for individual chunk downloads (default: 10)
 request_timeout_secs = {}
 ; Maximum retry attempts per failed chunk download (default: 3)
 max_retries = {}
-; Base delay in milliseconds for exponential backoff between retries (default: 100)
-; Actual delay = base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms, 800ms)
-retry_base_delay_ms = {}
 
 [xplane]
 ; X-Plane Custom Scenery directory for mounting scenery packs
@@ -276,10 +269,8 @@ congestion_threshold = {}
         config.generation.threads,
         config.generation.timeout,
         // Executor settings
-        config.control_plane.max_concurrent_jobs,
         config.executor.request_timeout_secs,
         config.executor.max_retries,
-        config.executor.retry_base_delay_ms,
         scenery_dir,
         library_url,
         install_location,

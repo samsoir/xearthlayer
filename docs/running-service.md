@@ -94,8 +94,7 @@ Press Ctrl+C to stop.
 | `--airport <ICAO>` | Pre-warm cache around an airport before X-Plane loads (e.g., `KJFK`, `EGLL`) |
 | `--provider <TYPE>` | Override imagery provider: `bing`, `go2`, `google` |
 | `--dds-format <FMT>` | Override texture format: `bc1` or `bc3` |
-| `--timeout <SECS>` | Override download timeout |
-| `--parallel <NUM>` | Override parallel downloads |
+| `--timeout <SECS>` | Override `executor.request_timeout_secs`, the per-chunk HTTP timeout |
 | `--no-cache` | Disable caching (not recommended) |
 
 ### No Packages Installed
@@ -247,10 +246,11 @@ Configure in `~/.config/xearthlayer/config.ini`:
 ```ini
 [generation]
 threads = 8
-
-[download]
-parallel = 32
 ```
+
+How many chunks and tiles run at once is derived from the host's logical core
+count and is not configurable. See the `[executor]` section of
+[configuration.md](configuration.md) for what is.
 
 ## Caching
 

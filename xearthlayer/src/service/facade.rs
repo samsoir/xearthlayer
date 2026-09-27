@@ -153,6 +153,7 @@ impl XEarthLayerService {
         .with_async_provider(Arc::clone(&async_provider))
         .with_runtime_handle(runtime_handle.clone())
         .with_metrics_client(metrics_client)
+        .with_download_config(config.chunk_download_config())
         .build_with_cache_service(
             cache_layer.memory_bridge(),
             cache_layer.dds_disk_bridge(),

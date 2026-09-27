@@ -25,8 +25,8 @@ use crate::cache::adapters::{DdsDiskCacheBridge, DiskCacheBridge, MemoryCacheBri
 use crate::cache::MemoryCache;
 use crate::dds::DdsFormat;
 use crate::executor::{
-    AsyncProviderAdapter, DiskCacheAdapter, ExecutorCacheAdapter, NullDdsDiskCache, NullDiskCache,
-    TextureEncoderAdapter, TokioExecutor,
+    AsyncProviderAdapter, DiskCacheAdapter, DownloadConfig, ExecutorCacheAdapter, NullDdsDiskCache,
+    NullDiskCache, TextureEncoderAdapter, TokioExecutor,
 };
 use crate::jobs::DefaultDdsJobFactory;
 use crate::metrics::MetricsClient;
@@ -63,6 +63,12 @@ pub struct RuntimeBuilder {
     runtime_handle: Option<tokio::runtime::Handle>,
     /// Metrics client for event-based telemetry
     metrics_client: Option<MetricsClient>,
+    /// Per-chunk download behaviour handed to the job factory.
+    ///
+    /// Carries `executor.request_timeout_secs` and `executor.max_retries`.
+    /// Defaults to the executor's own defaults so an unconfigured builder
+    /// behaves exactly as it did before #249 wired these keys.
+    download_config: DownloadConfig,
 }
 
 impl RuntimeBuilder {
@@ -88,6 +94,7 @@ impl RuntimeBuilder {
             config: RuntimeConfig::default(),
             runtime_handle: None,
             metrics_client: None,
+            download_config: DownloadConfig::default(),
         }
     }
 
@@ -112,9 +119,12 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Sets the runtime configuration.
-    pub fn with_config(mut self, config: RuntimeConfig) -> Self {
-        self.config = config;
+    /// Sets the per-chunk download behaviour (timeout and retries).
+    ///
+    /// Built from `executor.request_timeout_secs` and `executor.max_retries`
+    /// by `ServiceConfig::chunk_download_config`.
+    pub fn with_download_config(mut self, download_config: DownloadConfig) -> Self {
+        self.download_config = download_config;
         self
     }
 
@@ -174,6 +184,7 @@ impl RuntimeBuilder {
             Arc::clone(&self.encoder),
             Arc::clone(&cache_adapter),
             disk_cache,
+            self.download_config.clone(),
         );
 
         let null_dds_disk = Arc::new(NullDdsDiskCache);
@@ -219,6 +230,7 @@ impl RuntimeBuilder {
             async_provider,
             Arc::clone(&self.encoder),
             Arc::clone(&cache_adapter),
+            self.download_config.clone(),
         );
 
         let null_dds_disk = Arc::new(NullDdsDiskCache);
@@ -238,6 +250,7 @@ impl RuntimeBuilder {
         encoder: Arc<DdsTextureEncoder>,
         cache_adapter: Arc<ExecutorCacheAdapter>,
         disk_cache: Arc<DiskCacheAdapter>,
+        download_config: DownloadConfig,
     ) -> Arc<
         DefaultDdsJobFactory<
             ProviderAdapter,
@@ -253,13 +266,14 @@ impl RuntimeBuilder {
         let dds_disk_cache = Arc::new(NullDdsDiskCache);
         let executor = Arc::new(TokioExecutor::new());
 
-        Arc::new(DefaultDdsJobFactory::new(
+        Arc::new(DefaultDdsJobFactory::with_config(
             provider_adapter,
             encoder_adapter,
             cache_adapter,
             dds_disk_cache,
             disk_cache,
             executor,
+            download_config,
         ))
     }
 
@@ -268,6 +282,7 @@ impl RuntimeBuilder {
         async_provider: Arc<AsyncProviderType>,
         encoder: Arc<DdsTextureEncoder>,
         cache_adapter: Arc<ExecutorCacheAdapter>,
+        download_config: DownloadConfig,
     ) -> Arc<
         DefaultDdsJobFactory<
             ProviderAdapter,
@@ -284,13 +299,14 @@ impl RuntimeBuilder {
         let disk_cache = Arc::new(NullDiskCache);
         let executor = Arc::new(TokioExecutor::new());
 
-        Arc::new(DefaultDdsJobFactory::new(
+        Arc::new(DefaultDdsJobFactory::with_config(
             provider_adapter,
             encoder_adapter,
             cache_adapter,
             dds_disk_cache,
             disk_cache,
             executor,
+            download_config,
         ))
     }
 
@@ -343,6 +359,7 @@ impl RuntimeBuilder {
             Arc::clone(&memory_bridge),
             dds_disk_bridge,
             disk_bridge,
+            self.download_config.clone(),
         );
 
         XEarthLayerRuntime::with_metrics_client(
@@ -356,12 +373,14 @@ impl RuntimeBuilder {
     }
 
     /// Creates a factory with bridge adapters from the cache service.
+    #[allow(clippy::too_many_arguments)]
     fn create_factory_with_bridges(
         async_provider: Arc<AsyncProviderType>,
         encoder: Arc<DdsTextureEncoder>,
         memory_bridge: Arc<MemoryCacheBridge>,
         dds_disk_bridge: Arc<DdsDiskCacheBridge>,
         disk_bridge: Arc<DiskCacheBridge>,
+        download_config: DownloadConfig,
     ) -> Arc<
         DefaultDdsJobFactory<
             ProviderAdapter,
@@ -376,13 +395,14 @@ impl RuntimeBuilder {
         let encoder_adapter = Arc::new(TextureEncoderAdapter::new(encoder));
         let executor = Arc::new(TokioExecutor::new());
 
-        Arc::new(DefaultDdsJobFactory::new(
+        Arc::new(DefaultDdsJobFactory::with_config(
             provider_adapter,
             encoder_adapter,
             memory_bridge,
             dds_disk_bridge,
             disk_bridge,
             executor,
+            download_config,
         ))
     }
 }
@@ -394,6 +414,7 @@ mod tests {
     use crate::dds::DdsFormat;
     use crate::provider::{AsyncBingMapsProvider, AsyncProviderType, AsyncReqwestClient};
     use crate::texture::DdsTextureEncoder;
+    use std::time::Duration;
 
     fn create_test_encoder() -> Arc<DdsTextureEncoder> {
         Arc::new(DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_count(1))
@@ -409,6 +430,72 @@ mod tests {
         let http_client = AsyncReqwestClient::new().expect("Failed to create HTTP client");
         let provider = AsyncBingMapsProvider::new(http_client);
         Arc::new(AsyncProviderType::Bing(provider))
+    }
+
+    /// #249: the configured per-chunk timeout and retry count reach the
+    /// executor only if every factory helper forwards them. Each helper is a
+    /// separate opportunity to drop the config on the floor, so each is
+    /// asserted against a value that is not the default.
+    #[test]
+    fn factory_without_disk_cache_forwards_the_download_config() {
+        let cache_adapter = Arc::new(ExecutorCacheAdapter::new(
+            create_test_memory_cache(),
+            "bing",
+            DdsFormat::BC1,
+        ));
+
+        let factory = RuntimeBuilder::create_factory_without_disk_cache(
+            create_test_provider(),
+            create_test_encoder(),
+            cache_adapter,
+            DownloadConfig::new(Duration::from_secs(45), 7),
+        );
+
+        assert_eq!(
+            factory.download_config().request_timeout,
+            Duration::from_secs(45)
+        );
+        assert_eq!(factory.download_config().max_retries, 7);
+    }
+
+    #[test]
+    fn factory_with_disk_cache_forwards_the_download_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cache_adapter = Arc::new(ExecutorCacheAdapter::new(
+            create_test_memory_cache(),
+            "bing",
+            DdsFormat::BC1,
+        ));
+        let disk_cache = Arc::new(DiskCacheAdapter::new(temp.path().to_path_buf(), "bing"));
+
+        let factory = RuntimeBuilder::create_factory_with_disk_cache(
+            create_test_provider(),
+            create_test_encoder(),
+            cache_adapter,
+            disk_cache,
+            DownloadConfig::new(Duration::from_secs(45), 7),
+        );
+
+        assert_eq!(
+            factory.download_config().request_timeout,
+            Duration::from_secs(45)
+        );
+        assert_eq!(factory.download_config().max_retries, 7);
+    }
+
+    #[test]
+    fn download_config_defaults_to_the_executor_default() {
+        // A builder nobody configures must behave exactly as before.
+        let builder = RuntimeBuilder::new("test", DdsFormat::BC1, create_test_encoder());
+
+        assert_eq!(
+            builder.download_config.request_timeout,
+            DownloadConfig::default().request_timeout
+        );
+        assert_eq!(
+            builder.download_config.max_retries,
+            DownloadConfig::default().max_retries
+        );
     }
 
     #[test]

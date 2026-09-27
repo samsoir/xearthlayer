@@ -16,7 +16,7 @@
 //! # Example
 //!
 //! ```
-//! use xearthlayer::config::{TextureConfig, DownloadConfig, ConfigFile};
+//! use xearthlayer::config::{TextureConfig, ConfigFile};
 //! use xearthlayer::dds::DdsFormat;
 //!
 //! // Load configuration from file (or use defaults)
@@ -25,13 +25,9 @@
 //! // Create texture configuration
 //! let texture_config = TextureConfig::new(DdsFormat::BC1)
 //!     .with_mipmap_count(5);
-//!
-//! // Create download configuration
-//! let download_config = DownloadConfig::default();
 //! ```
 
 pub(crate) mod defaults;
-mod download;
 mod file;
 mod keys;
 mod parser;
@@ -40,33 +36,26 @@ mod size;
 mod texture;
 mod upgrade;
 mod writer;
-pub use download::DownloadConfig;
 pub use file::{
     config_directory,
     config_file_path,
-    default_cpu_concurrent,
-    default_http_concurrent,
     default_max_concurrent_jobs,
-    default_prefetch_in_flight,
     num_cpus,
     CacheSettings,
     ConfigFile,
     ConfigFileError,
     ControlPlaneSettings,
-    DownloadSettings,
     ExecutorSettings,
     GenerationSettings,
     LoggingSettings,
     PackagesSettings,
     PatchesSettings,
-    PipelineSettings,
     PrefetchSettings,
     PrewarmSettings,
     ProviderSettings,
     TextureSettings,
     XPlaneSettings,
     // Pipeline defaults
-    DEFAULT_COALESCE_CHANNEL_CAPACITY,
     // Control plane defaults
     DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
     DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
@@ -75,22 +64,16 @@ pub use file::{
     DEFAULT_DDS_DISK_RATIO,
     DEFAULT_DISK_CACHE_SIZE,
     // Download defaults
-    DEFAULT_DOWNLOAD_TIMEOUT_SECS,
-    DEFAULT_EXECUTOR_JOB_CHANNEL_CAPACITY,
-    DEFAULT_EXECUTOR_MAX_CONCURRENT_TASKS,
-    DEFAULT_EXECUTOR_REQUEST_CHANNEL_CAPACITY,
     // Generation defaults
     DEFAULT_GENERATION_TIMEOUT_SECS,
     // Package manager defaults
     DEFAULT_LIBRARY_URL,
-    DEFAULT_MAX_CONCURRENT_DOWNLOADS,
     DEFAULT_MAX_RETRIES,
     DEFAULT_MEMORY_CACHE_SIZE,
     // DownloadConfig defaults
     DEFAULT_PARALLEL_DOWNLOADS,
     DEFAULT_PREFETCH_CYCLE_INTERVAL_MS,
     DEFAULT_REQUEST_TIMEOUT_SECS,
-    DEFAULT_RETRY_BASE_DELAY_MS,
     DEFAULT_WEB_API_PORT,
 };
 pub use keys::{ConfigKey, ConfigKeyError, SENSITIVE_VALUE_MASK};

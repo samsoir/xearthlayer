@@ -117,7 +117,6 @@ mod tests {
         assert_eq!(config.cache.memory_size, DEFAULT_MEMORY_CACHE_SIZE);
         assert_eq!(config.cache.disk_size, DEFAULT_DISK_CACHE_SIZE);
         assert_eq!(config.texture.format, crate::dds::DdsFormat::BC1);
-        assert_eq!(config.download.timeout, DEFAULT_DOWNLOAD_TIMEOUT_SECS);
         assert!(config.xplane.scenery_dir.is_none());
     }
 
@@ -133,6 +132,9 @@ mod tests {
             config.provider.provider_type,
             default.provider.provider_type
         );
-        assert_eq!(config.download.timeout, default.download.timeout);
+        assert_eq!(
+            config.executor.request_timeout_secs,
+            default.executor.request_timeout_secs
+        );
     }
 }

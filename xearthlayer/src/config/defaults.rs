@@ -28,25 +28,6 @@ pub fn num_cpus() -> usize {
         .unwrap_or(4)
 }
 
-/// Default HTTP concurrency limit.
-/// Returns a conservative value (128) that works reliably with all providers.
-pub fn default_http_concurrent() -> usize {
-    DEFAULT_HTTP_CONCURRENT
-}
-
-/// Default CPU concurrency limit: num_cpus / 2, minimum 2.
-///
-/// Leaves headroom for X-Plane's render thread. 50% of cores provides
-/// good tile throughput without starving the simulator.
-pub fn default_cpu_concurrent() -> usize {
-    (num_cpus() / 2).max(2)
-}
-
-/// Default prefetch in-flight limit: max(num_cpus / 4, 2)
-pub fn default_prefetch_in_flight() -> usize {
-    (num_cpus() / 4).max(2)
-}
-
 /// Default max concurrent jobs: num_cpus / 2, minimum 2.
 ///
 /// Limits total in-flight jobs (download + encode pipeline) to balance
@@ -57,50 +38,8 @@ pub fn default_max_concurrent_jobs() -> usize {
     (num_cpus() / 2).max(2)
 }
 
-/// Clamps HTTP concurrency to valid range and logs a warning if clamped.
-pub(super) fn clamp_http_concurrent(value: usize) -> usize {
-    if value < MIN_HTTP_CONCURRENT {
-        tracing::warn!(
-            requested = value,
-            min = MIN_HTTP_CONCURRENT,
-            max = MAX_HTTP_CONCURRENT,
-            "max_http_concurrent below minimum, clamping to {}",
-            MIN_HTTP_CONCURRENT
-        );
-        MIN_HTTP_CONCURRENT
-    } else if value > MAX_HTTP_CONCURRENT {
-        tracing::warn!(
-            requested = value,
-            min = MIN_HTTP_CONCURRENT,
-            max = MAX_HTTP_CONCURRENT,
-            "max_http_concurrent above maximum, clamping to {} (prevents provider rate limiting)",
-            MAX_HTTP_CONCURRENT
-        );
-        MAX_HTTP_CONCURRENT
-    } else {
-        value
-    }
-}
-
 // =============================================================================
-// HTTP concurrency limits
-// =============================================================================
-
-/// Minimum HTTP concurrency limit.
-/// Below this, performance suffers significantly.
-pub const MIN_HTTP_CONCURRENT: usize = 64;
-
-/// Maximum HTTP concurrency limit.
-/// Above this, providers get rate-limited causing cascade failures.
-pub const MAX_HTTP_CONCURRENT: usize = 256;
-
-/// Default HTTP concurrency limit.
-/// Conservative default of 128 prevents provider rate limiting while
-/// maintaining good performance. Tested stable with Apple/Bing providers.
-pub const DEFAULT_HTTP_CONCURRENT: usize = 128;
-
-// =============================================================================
-// Pipeline defaults
+// Per-chunk download defaults
 // =============================================================================
 
 /// Default request timeout in seconds.
@@ -108,15 +47,6 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 10;
 
 /// Default maximum retry attempts.
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
-
-/// Default retry backoff base delay in milliseconds.
-pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 100;
-
-/// Default coalesce channel capacity.
-pub const DEFAULT_COALESCE_CHANNEL_CAPACITY: usize = 16;
-
-/// Default maximum concurrent downloads per tile.
-pub const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 256;
 
 // =============================================================================
 // Cache defaults
@@ -135,9 +65,6 @@ pub const DEFAULT_DISK_CACHE_SIZE: usize = 20 * 1024 * 1024 * 1024;
 // =============================================================================
 // Download defaults
 // =============================================================================
-
-/// Default download timeout in seconds.
-pub const DEFAULT_DOWNLOAD_TIMEOUT_SECS: u64 = 30;
 
 // =============================================================================
 // Generation defaults
@@ -283,15 +210,6 @@ pub const DEFAULT_GPU_DEVICE: &str = "integrated";
 // Executor defaults
 // =============================================================================
 
-/// Default maximum concurrent tasks in the executor.
-pub const DEFAULT_EXECUTOR_MAX_CONCURRENT_TASKS: usize = 128;
-
-/// Default job channel capacity (internal job queue).
-pub const DEFAULT_EXECUTOR_JOB_CHANNEL_CAPACITY: usize = 256;
-
-/// Default request channel capacity (external request queue).
-pub const DEFAULT_EXECUTOR_REQUEST_CHANNEL_CAPACITY: usize = 1000;
-
 // =============================================================================
 // Package manager defaults
 // =============================================================================
@@ -339,21 +257,9 @@ impl Default for ConfigFile {
                 compressor: DEFAULT_COMPRESSOR.to_string(),
                 gpu_device: DEFAULT_GPU_DEVICE.to_string(),
             },
-            download: DownloadSettings {
-                timeout: DEFAULT_DOWNLOAD_TIMEOUT_SECS,
-            },
             generation: GenerationSettings {
                 threads: (num_cpus() / 2).max(2),
                 timeout: DEFAULT_GENERATION_TIMEOUT_SECS,
-            },
-            pipeline: PipelineSettings {
-                max_http_concurrent: default_http_concurrent(),
-                max_cpu_concurrent: default_cpu_concurrent(),
-                max_prefetch_in_flight: default_prefetch_in_flight(),
-                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-                max_retries: DEFAULT_MAX_RETRIES,
-                retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
-                coalesce_channel_capacity: DEFAULT_COALESCE_CHANNEL_CAPACITY,
             },
             xplane: XPlaneSettings { scenery_dir: None },
             packages: PackagesSettings {
@@ -401,12 +307,8 @@ impl Default for ConfigFile {
                 directory: Some(crate::paths::patches_dir()),
             },
             executor: ExecutorSettings {
-                max_concurrent_tasks: DEFAULT_EXECUTOR_MAX_CONCURRENT_TASKS,
-                job_channel_capacity: DEFAULT_EXECUTOR_JOB_CHANNEL_CAPACITY,
-                request_channel_capacity: DEFAULT_EXECUTOR_REQUEST_CHANNEL_CAPACITY,
                 request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
                 max_retries: DEFAULT_MAX_RETRIES,
-                retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
             },
             fuse: FuseSettings {
                 max_background: DEFAULT_FUSE_MAX_BACKGROUND,
