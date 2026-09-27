@@ -37,9 +37,45 @@ line is promoted as a stable release. This keeps `main` releasable at any moment
 | `release-test.yml` | push and PRs on `release/*` | Same verification for release-prep branches |
 | `release.yml` | push of a `v*` tag; manual dispatch | Build, package, publish a GitHub Release |
 | `website-sync.yml` | push to `main` touching `version.json` | Notify the website repo of a new release |
+| `close-issues-on-develop-merge.yml` | a merged PR into `develop/**` | Close the issues the PR body says it closes |
 
 `ci.yml` and `release-test.yml` each run two jobs — `Verify` (Linux) and
 `Verify (macOS)`.
+
+### Issue closing on develop merges
+
+GitHub honours closing keywords only when a commit reaches the repository's
+default branch. Every PR here targets a `develop/*` integration branch, so
+without help an issue whose work is finished and merged stays open until the
+release merge to `main`, weeks or months later. A milestone then reports a
+fraction of the work actually done. No setting changes this.
+
+`close-issues-on-develop-merge.yml` supplies what GitHub will not. On a merged
+PR into `develop/**` it reads closing keywords from the **PR body**, then
+comments on and closes each issue named. So the PR body is load-bearing: write
+`Closes #123` there for the issue to close on merge to `develop`. Anything
+weaker, such as `Related to #123`, deliberately does not close.
+
+Consequences worth knowing:
+
+- **The milestone tracks development, not shipping.** An issue closes when its
+  work lands on `develop/*`. Whether it has shipped is answered by the release
+  tag. This is the intended trade: the alternative leaves the milestone
+  useless for the entire development cycle.
+- **It is idempotent.** An already-closed issue is skipped, so a re-merge or a
+  reverted-then-remerged PR does not comment twice.
+- **A PR number is never closed.** The issues API also serves pull requests, so
+  the workflow skips anything with a `pull_request` field. `Closes #274` where
+  274 is a PR is a no-op.
+- **Cross-repository syntax does not work.** `Fixes owner/repo#14` is ignored;
+  the workflow only closes issues in this repository.
+- **It uses `pull_request_target`.** A `pull_request` event raised from a fork
+  receives a read-only token, so contributor PRs could never close anything.
+  `pull_request_target` runs in the base repository's context with a writable
+  token. That trigger is dangerous when a workflow checks out and runs the PR's
+  code; this one never checks anything out, and the only PR-controlled values
+  it touches are the title and body, passed through the environment rather than
+  interpolated into the script.
 
 ## The Release Job Graph
 
