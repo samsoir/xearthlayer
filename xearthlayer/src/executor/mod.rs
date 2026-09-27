@@ -180,7 +180,7 @@ pub use config::{
     DEFAULT_SIGNAL_CHANNEL_CAPACITY,
 };
 pub use core::JobExecutor;
-pub use submitter::JobSubmitter;
+pub use submitter::{JobSubmitter, SubmitError};
 
 // Client (for daemon architecture)
 pub use client::{ChannelDdsClient, DdsClient, DdsClientError};

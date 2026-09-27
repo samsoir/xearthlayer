@@ -7,7 +7,47 @@ use super::config::DEFAULT_SIGNAL_CHANNEL_CAPACITY;
 use super::handle::{JobHandle, JobStatus, Signal};
 use super::job::{Job, JobId, JobResult};
 use super::policy::Priority;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
+
+// =============================================================================
+// Submission Errors
+// =============================================================================
+
+/// Why a job could not be handed to the executor.
+///
+/// These were collapsed into a single `None` until #272, which meant the
+/// daemon logged "executor may be shutdown" for ordinary back pressure. On a
+/// slow system that was the loudest line in the log and pointed at exactly the
+/// wrong conclusion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitError {
+    /// The executor's queue is full. Expected under load: the executor is
+    /// healthy and working, and the caller's work is being shed.
+    QueueFull,
+    /// The executor is gone and will accept nothing further.
+    ExecutorGone,
+}
+
+impl SubmitError {
+    /// Whether this is back pressure rather than a failure.
+    ///
+    /// Callers use it to decide how loudly to report a rejected submission:
+    /// shed work is a debug-level fact about load, a gone executor is a
+    /// warning about the process.
+    pub fn is_back_pressure(self) -> bool {
+        matches!(self, Self::QueueFull)
+    }
+}
+
+impl std::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull => write!(f, "executor queue is full"),
+            Self::ExecutorGone => write!(f, "executor is no longer running"),
+        }
+    }
+}
 
 // =============================================================================
 // Job Submitter
@@ -42,16 +82,16 @@ impl JobSubmitter {
 
     /// Attempts to submit a job for execution.
     ///
-    /// Returns `None` if the executor has been dropped.
-    pub fn try_submit(&self, job: impl Job + 'static) -> Option<JobHandle> {
+    /// Distinguishes a full queue from a gone executor; see [`SubmitError`].
+    pub fn try_submit(&self, job: impl Job + 'static) -> Result<JobHandle, SubmitError> {
         self.try_submit_boxed(Box::new(job))
     }
 
     /// Attempts to submit a boxed job for execution.
     ///
     /// This is useful when working with factory patterns that return `Box<dyn Job>`.
-    /// Returns `None` if the executor has been dropped.
-    pub fn try_submit_boxed(&self, job: Box<dyn Job>) -> Option<JobHandle> {
+    /// Distinguishes a full queue from a gone executor; see [`SubmitError`].
+    pub fn try_submit_boxed(&self, job: Box<dyn Job>) -> Result<JobHandle, SubmitError> {
         let job_id = job.id();
         let priority = job.priority();
         let name = job.name().to_string();
@@ -73,8 +113,11 @@ impl JobSubmitter {
             result_holder,
         };
 
-        self.sender.try_send(submitted).ok()?;
-        Some(handle)
+        match self.sender.try_send(submitted) {
+            Ok(()) => Ok(handle),
+            Err(TrySendError::Full(_)) => Err(SubmitError::QueueFull),
+            Err(TrySendError::Closed(_)) => Err(SubmitError::ExecutorGone),
+        }
     }
 }
 
@@ -259,30 +302,58 @@ mod tests {
         }
     }
 
+    struct TestJob;
+    impl Job for TestJob {
+        fn id(&self) -> JobId {
+            JobId::new("test")
+        }
+        fn name(&self) -> &str {
+            "Test"
+        }
+        fn create_tasks(&self) -> Vec<Box<dyn super::super::task::Task>> {
+            vec![]
+        }
+    }
+
+    /// #272: a full queue and a gone executor were both reported as `None`, so
+    /// the daemon logged "executor may be shutdown" for ordinary back pressure.
+    /// The two must be distinguishable at the submission site.
     #[tokio::test]
-    async fn test_submitter_try_submit_closed_channel() {
+    async fn try_submit_reports_a_closed_channel_as_executor_gone() {
         let (tx, rx) = mpsc::channel(1);
         let submitter = JobSubmitter::new(tx);
 
-        // Drop the receiver to close the channel
         drop(rx);
 
-        // Create a simple test job
-        struct TestJob;
-        impl Job for TestJob {
-            fn id(&self) -> JobId {
-                JobId::new("test")
-            }
-            fn name(&self) -> &str {
-                "Test"
-            }
-            fn create_tasks(&self) -> Vec<Box<dyn super::super::task::Task>> {
-                vec![]
-            }
-        }
+        assert_eq!(
+            submitter.try_submit(TestJob).err(),
+            Some(SubmitError::ExecutorGone)
+        );
+    }
 
-        // Should return None when channel is closed
-        let result = submitter.try_submit(TestJob);
-        assert!(result.is_none());
+    #[tokio::test]
+    async fn try_submit_reports_a_full_queue_as_queue_full() {
+        // Capacity 1, receiver alive but never reading: the second submission
+        // is back pressure, not failure.
+        let (tx, _rx) = mpsc::channel(1);
+        let submitter = JobSubmitter::new(tx);
+
+        assert!(
+            submitter.try_submit(TestJob).is_ok(),
+            "first fills the queue"
+        );
+
+        assert_eq!(
+            submitter.try_submit(TestJob).err(),
+            Some(SubmitError::QueueFull)
+        );
+    }
+
+    #[test]
+    fn queue_full_is_back_pressure_and_executor_gone_is_not() {
+        // The predicate the daemon uses to pick a log level, so the two cases
+        // cannot silently collapse back together.
+        assert!(SubmitError::QueueFull.is_back_pressure());
+        assert!(!SubmitError::ExecutorGone.is_back_pressure());
     }
 }
