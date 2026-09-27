@@ -7,25 +7,28 @@ name: Close Issues on Develop Merge
 # makes a milestone unreadable: it reports a fraction of the work actually
 # done, and there is no configuration that changes it.
 #
-# This workflow supplies what GitHub will not: when a PR into `develop/*` is
-# merged, the issues its body closes are closed, with a comment naming the PR
-# and the branch. The milestone then tracks development against the release,
-# and "has it shipped" is answered by the release tag rather than by issue
-# state.
+# This workflow supplies what GitHub will not: when commits land on a
+# `develop/*` branch, the issues they close are closed, with a comment naming
+# the merge. The milestone then tracks development against the release, and
+# "has it shipped" is answered by the release tag rather than by issue state.
 #
-# `pull_request_target` rather than `pull_request`: a `pull_request` event
-# raised by a fork receives a read-only token, so contributor PRs (which this
-# project takes) could never close anything. `pull_request_target` runs in the
-# base repository's context with a writable token. That trigger is dangerous
-# when a workflow checks out and executes the PR's code, because the PR
-# controls what runs. This one never checks anything out and never runs PR
-# code. The only PR-controlled value it touches is the body text, which is
-# passed through the environment rather than interpolated into the script, so
-# it cannot escape into the shell.
+# `push` rather than `pull_request_target`. The first version of this workflow
+# used `pull_request_target`, to get a writable token on pull requests raised
+# from forks. It never ran once. Workflows for `pull_request_target` are read
+# from the DEFAULT branch, not from the pull request's base branch, so a file
+# living only on `develop/*` is never even registered: the workflow did not
+# appear in `/actions/workflows` at all. A workflow written to work around
+# "keywords only count on the default branch" was defeated by "the workflow
+# must be on the default branch."
+#
+# `push` has no such requirement, because the workflow is read from the branch
+# that was pushed. It also needs no fork exception: a fork's pull request
+# becomes a push to `develop/*` in this repository when it is merged, and this
+# repository's token does the work. That removes the `pull_request_target`
+# attack surface entirely.
 
 on:
-  pull_request_target:
-    types: [closed]
+  push:
     branches:
       - 'develop/**'
 
@@ -36,23 +39,63 @@ permissions:
 jobs:
   close-referenced-issues:
     name: Close Referenced Issues
-    # Closing a PR without merging it must not close anything.
-    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
-      - name: Close issues named by closing keywords in the PR body
+      # Full history: the closing keywords are read from the messages of the
+      # commits this push made reachable, which needs more than a shallow clone.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Close issues named by closing keywords
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
-          # Untrusted input. Read from the environment, never interpolated
-          # into the script body.
-          PR_BODY: ${{ github.event.pull_request.body }}
+          BRANCH: ${{ github.ref_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          CREATED: ${{ github.event.created }}
+          FORCED: ${{ github.event.forced }}
         run: |
           set -euo pipefail
+
+          # Which commits to read. Normally the range this push added. A branch
+          # creation has no meaningful `before` (it is all zeroes), and a force
+          # push can make `before` unreachable, so both fall back to the head
+          # commit alone rather than scanning the whole branch and reopening
+          # every keyword in its history.
+          range=""
+          if [ "${CREATED}" = "true" ] || [ "${FORCED}" = "true" ]; then
+            echo "Branch created or force pushed; reading the head commit only."
+          elif ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "Previous head ${BEFORE} is not reachable; reading the head commit only."
+          else
+            range="${BEFORE}..${AFTER}"
+          fi
+
+          if [ -n "$range" ]; then
+            echo "Reading commit messages in ${range}"
+            messages="$(git log --format=%B "$range")"
+          else
+            messages="$(git log -1 --format=%B "${AFTER}")"
+          fi
+
+          # A merge commit's own message does not carry the pull request body,
+          # so read that too when this push merged one. The keyword is normally
+          # in both places; taking the union means either one alone is enough.
+          pr_number="$(
+            git log -1 --format=%s "${AFTER}" \
+              | grep -oE '^Merge pull request #[0-9]+' \
+              | grep -oE '[0-9]+' \
+            || true
+          )"
+          if [ -n "$pr_number" ]; then
+            echo "Head commit merges PR #${pr_number}; including its body."
+            # Untrusted text. It is appended to a variable and piped to grep,
+            # never interpolated into the script.
+            pr_body="$(gh api "repos/${REPO}/pulls/${pr_number}" --jq '.body // ""' || true)"
+            messages="${messages}"$'\n'"${pr_body}"
+          fi
 
           # close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved,
           # case-insensitive, followed by #<number>. "Related to #123" and
@@ -62,7 +105,7 @@ jobs:
           # syntax ("Fixes owner/repo#14") does not match, which is intended;
           # this workflow only closes issues in its own repository.
           numbers="$(
-            printf '%s' "${PR_BODY:-}" \
+            printf '%s' "$messages" \
               | grep -oiE '(^|[^[:alnum:]_])(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' \
               | grep -oE '[0-9]+' \
               | sort -un \
@@ -70,11 +113,11 @@ jobs:
           )"
 
           if [ -z "$numbers" ]; then
-            echo "PR #${PR_NUMBER} body names no issues to close. Nothing to do."
+            echo "Nothing pushed to ${BRANCH} names an issue to close."
             exit 0
           fi
 
-          echo "PR #${PR_NUMBER} into ${BASE_REF} names: $(echo "$numbers" | tr '\n' ' ')"
+          echo "Push to ${BRANCH} names: $(echo "$numbers" | tr '\n' ' ')"
 
           for n in $numbers; do
             if ! item="$(gh api "repos/${REPO}/issues/${n}" 2>/dev/null)"; then
@@ -82,7 +125,7 @@ jobs:
               continue
             fi
 
-            # The issues endpoint also serves pull requests. A PR that says
+            # The issues endpoint also serves pull requests. A commit that says
             # "Fixes #274" where 274 is itself a PR must not be touched.
             if [ -n "$(printf '%s' "$item" | jq -r '.pull_request // empty')" ]; then
               echo "  #${n}: is a pull request, skipping"
@@ -94,11 +137,13 @@ jobs:
               continue
             fi
 
-            body="Closed automatically: merged into \`${BASE_REF}\` by PR #${PR_NUMBER} (${PR_TITLE})."
-            if [ -n "${MERGE_SHA:-}" ]; then
-              body="${body}"$'\n\n'"Merge commit \`${MERGE_SHA}\`."
+            if [ -n "$pr_number" ]; then
+              body="Closed automatically: merged into \`${BRANCH}\` by PR #${pr_number}."
+            else
+              body="Closed automatically: pushed to \`${BRANCH}\`."
             fi
-            body="${body}"$'\n\n'"Closed against \`${BASE_REF}\` rather than \`main\`, because GitHub honours closing keywords only on the default branch and this project integrates through \`develop/*\`. Whether the work has shipped is answered by the release tag, not by issue state."
+            body="${body}"$'\n\n'"Commit \`${AFTER}\`."
+            body="${body}"$'\n\n'"Closed against \`${BRANCH}\` rather than \`main\`, because GitHub honours closing keywords only on the default branch and this project integrates through \`develop/*\`. Whether the work has shipped is answered by the release tag, not by issue state."
 
             gh issue comment "$n" --repo "${REPO}" --body "$body"
             gh issue close "$n" --repo "${REPO}" --reason completed

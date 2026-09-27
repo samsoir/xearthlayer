@@ -37,7 +37,7 @@ line is promoted as a stable release. This keeps `main` releasable at any moment
 | `release-test.yml` | push and PRs on `release/*` | Same verification for release-prep branches |
 | `release.yml` | push of a `v*` tag; manual dispatch | Build, package, publish a GitHub Release |
 | `website-sync.yml` | push to `main` touching `version.json` | Notify the website repo of a new release |
-| `close-issues-on-develop-merge.yml` | a merged PR into `develop/**` | Close the issues the PR body says it closes |
+| `close-issues-on-develop-merge.yml` | a push to `develop/**` | Close the issues the pushed commits say they close |
 
 `ci.yml` and `release-test.yml` each run two jobs — `Verify` (Linux) and
 `Verify (macOS)`.
@@ -50,11 +50,16 @@ without help an issue whose work is finished and merged stays open until the
 release merge to `main`, weeks or months later. A milestone then reports a
 fraction of the work actually done. No setting changes this.
 
-`close-issues-on-develop-merge.yml` supplies what GitHub will not. On a merged
-PR into `develop/**` it reads closing keywords from the **PR body**, then
-comments on and closes each issue named. So the PR body is load-bearing: write
-`Closes #123` there for the issue to close on merge to `develop`. Anything
-weaker, such as `Related to #123`, deliberately does not close.
+`close-issues-on-develop-merge.yml` supplies what GitHub will not. On a push to
+`develop/**` it reads closing keywords from the messages of the commits that
+push made reachable, and from the body of the pull request the head commit
+merges when there is one, then comments on and closes each issue named.
+
+**Put the keyword in a commit message, not only in the PR body.** The body is
+read as well, but only when the head of the push is a `Merge pull request #N`
+commit; a squash merge, a rebase merge or a direct push has no body to read.
+`Closes #123` in a commit message always works. Anything weaker, such as
+`Related to #123`, deliberately does not close.
 
 Consequences worth knowing:
 
@@ -69,13 +74,33 @@ Consequences worth knowing:
   274 is a PR is a no-op.
 - **Cross-repository syntax does not work.** `Fixes owner/repo#14` is ignored;
   the workflow only closes issues in this repository.
-- **It uses `pull_request_target`.** A `pull_request` event raised from a fork
-  receives a read-only token, so contributor PRs could never close anything.
-  `pull_request_target` runs in the base repository's context with a writable
-  token. That trigger is dangerous when a workflow checks out and runs the PR's
-  code; this one never checks anything out, and the only PR-controlled values
-  it touches are the title and body, passed through the environment rather than
-  interpolated into the script.
+- **A force push or a branch creation reads the head commit only.** There is no
+  usable previous head to diff against in either case, and scanning the whole
+  branch would act on every keyword in its history.
+
+#### Why `push` and not `pull_request_target`
+
+The first version used `pull_request_target`, reasoning that a `pull_request`
+event from a fork gets a read-only token and so could never close anything. It
+never ran once, and the reason is worth recording because it is easy to repeat:
+
+**Workflows for `pull_request_target` are read from the default branch, not from
+the pull request's base branch.** A file living only on `develop/*` is never
+registered at all. It did not appear in `/actions/workflows`, and no run was
+created, not even a skipped one. A workflow written to work around "keywords
+only count on the default branch" was defeated by "the workflow must be on the
+default branch."
+
+`push` has no such requirement: the workflow is read from the branch that was
+pushed, so it works from `develop/*` immediately. It also needs no fork
+exception, because a fork's pull request becomes a push to `develop/*` in this
+repository once merged, and this repository's own token does the work. That
+removes the `pull_request_target` attack surface rather than mitigating it.
+
+The lesson generalises to any workflow added on a `develop/*` branch: check
+that it appears in `/actions/workflows` and that a run was created. A trigger
+that silently never fires looks exactly like a trigger whose condition was not
+met.
 
 ## The Release Job Graph
 
