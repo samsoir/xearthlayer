@@ -139,6 +139,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - Submits jobs to shared job executor daemon via `DdsClient` trait
     - Mode selection: Aggressive (>30 tiles/sec), Opportunistic (10-30), or Disabled
     - **Four-tier filtering**: Memory cache → Patched region exclusion (via `GeoIndex`) → Installed package disk (via `OrthoUnionIndex`) → XEL DDS disk cache (the write-only `cached_tiles` local-tracking shadow tier was deleted in #176 after it was confirmed to never be read)
+    - **Backpressure takes the higher of two signals**: `executor_load()` (our resource pools) and `fuse_pressure()` (memory pinned by open virtual DDS handles, as a fraction of the ceiling in `pinned_budget::PinnedTileBudget`). They diverge at a boundary crossing, where most reads are cache-served and so invisible to the pools; that collision sets the memory floor per #227. Open handles rather than a read rate because `open`/`release` reach FUSE on every platform and reads do not (macOS page-cache serving). See #246
     - **Two-phase region commit**: Regions marked `InProgress` in GeoIndex during prefetch, promoted to `Prefetched` on completion
     - **Stale telemetry safe mode**: pauses tile submissions when telemetry stale >5s; on resume, reads `on_ground` from AircraftState to reset PhaseDetector before next cycle
     - See `docs/dev/adaptive-prefetch-design.md` for design details

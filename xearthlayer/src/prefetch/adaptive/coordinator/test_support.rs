@@ -335,6 +335,9 @@ impl SceneTracker for StableBoundsTracker {
 pub(crate) struct BackpressureMockClient {
     /// Simulated executor load (0.0 to 1.0).
     pressure: f64,
+    /// Simulated demand on the FUSE mount (0.0 to 1.0), independent of
+    /// `pressure` so tests can drive either signal alone (#246).
+    fuse_pressure: f64,
     submitted: AtomicUsize,
     /// If Some, return ChannelFull after this many successful submits.
     fail_after: Option<usize>,
@@ -344,9 +347,15 @@ impl BackpressureMockClient {
     pub(crate) fn new(pressure: f64) -> Self {
         Self {
             pressure,
+            fuse_pressure: 0.0,
             submitted: AtomicUsize::new(0),
             fail_after: None,
         }
+    }
+
+    pub(crate) fn with_fuse_pressure(mut self, fuse_pressure: f64) -> Self {
+        self.fuse_pressure = fuse_pressure;
+        self
     }
 
     pub(crate) fn with_fail_after(mut self, n: usize) -> Self {
@@ -397,6 +406,10 @@ impl DdsClient for BackpressureMockClient {
 
     fn executor_load(&self) -> f64 {
         self.pressure
+    }
+
+    fn fuse_pressure(&self) -> f64 {
+        self.fuse_pressure
     }
 }
 

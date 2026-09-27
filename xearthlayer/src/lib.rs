@@ -39,6 +39,7 @@ pub mod package;
 pub mod panic;
 pub mod patches;
 pub mod paths;
+pub mod pinned_budget;
 pub mod prefetch;
 pub mod preflight;
 pub mod provider;

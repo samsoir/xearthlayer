@@ -503,6 +503,10 @@ impl MountManager {
         // Create and mount the consolidated ortho union filesystem with DDS access channel
         // Wire Scene Tracker channel for empirical scenery tracking
         // Wire FUSE kernel limits for concurrent background request control
+        // The client carries the pinned-tile budget it reports FUSE demand from,
+        // so the filesystem accounts against the same one prefetch reads (#246).
+        let pinned_budget = dds_client.pinned_budget();
+
         let mut ortho_union_fs =
             Fuse3OrthoUnionFS::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
                 .with_geo_index(Arc::clone(&geo_index))
@@ -510,6 +514,10 @@ impl MountManager {
                 .with_scene_tracker_channel(scene_tracker_tx)
                 .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold)
                 .with_timeout(Duration::from_secs(self.generation_timeout_secs));
+
+        if let Some(budget) = pinned_budget {
+            ortho_union_fs = ortho_union_fs.with_pinned_budget(budget);
+        }
 
         // Wire metrics client for coalesced request tracking
         if let Some(metrics) = metrics_client {
