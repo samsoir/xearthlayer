@@ -151,10 +151,6 @@ enum Commands {
         #[arg(long)]
         timeout: Option<u64>,
 
-        /// Maximum parallel downloads (default: from config)
-        #[arg(long)]
-        parallel: Option<usize>,
-
         /// Disable caching (always generate tiles fresh)
         #[arg(long)]
         no_cache: bool,
@@ -274,7 +270,6 @@ fn main() -> ExitCode {
             mapbox_token,
             dds_format,
             timeout,
-            parallel,
             no_cache,
             no_prefetch,
             airport,
@@ -285,7 +280,6 @@ fn main() -> ExitCode {
                 mapbox_token,
                 dds_format,
                 timeout,
-                parallel,
                 no_cache,
                 no_prefetch,
                 airport,

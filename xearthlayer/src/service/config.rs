@@ -55,6 +55,15 @@ pub struct ServiceConfig {
     pipeline: PipelineSettings,
     /// Control plane configuration for job management and health monitoring
     control_plane: ControlPlaneSettings,
+    /// HTTP request timeout in seconds for an individual chunk download.
+    ///
+    /// From `executor.request_timeout_secs`. Per chunk, not per tile: a tile is
+    /// 256 chunks, so this bounds one HTTP request rather than the whole tile.
+    chunk_request_timeout_secs: u64,
+    /// Retry attempts per failed chunk download.
+    ///
+    /// From `executor.max_retries`.
+    chunk_max_retries: u32,
 }
 
 impl ServiceConfig {
@@ -71,6 +80,32 @@ impl ServiceConfig {
     /// Get the download configuration.
     pub fn download(&self) -> &DownloadConfig {
         &self.download
+    }
+
+    /// Per-chunk HTTP request timeout in seconds.
+    pub fn chunk_request_timeout_secs(&self) -> u64 {
+        self.chunk_request_timeout_secs
+    }
+
+    /// Retry attempts per failed chunk download.
+    pub fn chunk_max_retries(&self) -> u32 {
+        self.chunk_max_retries
+    }
+
+    /// Build the executor's download configuration from these settings.
+    ///
+    /// This is the only place the configured per-chunk timeout and retry count
+    /// become the executor's behaviour, so it is the seam #249 was missing: the
+    /// keys were parsed and displayed, but the executor took
+    /// `DownloadConfig::default()` and no configured value ever reached it.
+    ///
+    /// The HTTP semaphore is left at its default capacity. Concurrency is not
+    /// user-configurable; it is derived from the host by `ResourcePoolConfig`.
+    pub fn chunk_download_config(&self) -> crate::executor::DownloadConfig {
+        crate::executor::DownloadConfig::new(
+            std::time::Duration::from_secs(self.chunk_request_timeout_secs),
+            self.chunk_max_retries,
+        )
     }
 
     /// Check if caching is enabled.
@@ -172,6 +207,8 @@ impl Default for ServiceConfig {
                 health_check_interval_secs: DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
                 semaphore_timeout_secs: DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
             },
+            chunk_request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            chunk_max_retries: DEFAULT_MAX_RETRIES,
         }
     }
 }
@@ -194,6 +231,8 @@ pub struct ServiceConfigBuilder {
     generation_timeout: Option<u64>,
     quiet_mode: Option<bool>,
     pipeline: Option<PipelineSettings>,
+    chunk_request_timeout_secs: Option<u64>,
+    chunk_max_retries: Option<u32>,
     control_plane: Option<ControlPlaneSettings>,
 }
 
@@ -207,6 +246,18 @@ impl ServiceConfigBuilder {
     /// Set the download/orchestrator configuration.
     pub fn download(mut self, config: DownloadConfig) -> Self {
         self.download = Some(config);
+        self
+    }
+
+    /// Set the per-chunk HTTP request timeout in seconds.
+    pub fn chunk_request_timeout_secs(mut self, secs: u64) -> Self {
+        self.chunk_request_timeout_secs = Some(secs);
+        self
+    }
+
+    /// Set the retry attempts per failed chunk download.
+    pub fn chunk_max_retries(mut self, retries: u32) -> Self {
+        self.chunk_max_retries = Some(retries);
         self
     }
 
@@ -322,6 +373,10 @@ impl ServiceConfigBuilder {
                 health_check_interval_secs: DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
                 semaphore_timeout_secs: DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
             }),
+            chunk_request_timeout_secs: self
+                .chunk_request_timeout_secs
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+            chunk_max_retries: self.chunk_max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
         }
     }
 }
@@ -336,6 +391,34 @@ mod tests {
         let config = ServiceConfig::default();
         assert!(config.cache_enabled());
         assert!(config.mountpoint().is_none());
+    }
+
+    #[test]
+    fn chunk_download_config_carries_configured_timeout_and_retries() {
+        // #249: executor.request_timeout_secs and executor.max_retries were
+        // parsed, validated and displayed but reached nothing. This is the
+        // single seam where they become the executor's download behaviour.
+        let config = ServiceConfig::builder()
+            .chunk_request_timeout_secs(45)
+            .chunk_max_retries(7)
+            .build();
+
+        let download = config.chunk_download_config();
+
+        assert_eq!(download.request_timeout, std::time::Duration::from_secs(45));
+        assert_eq!(download.max_retries, 7);
+    }
+
+    #[test]
+    fn chunk_download_config_defaults_match_the_executor_defaults() {
+        // Wiring the keys must not change behaviour for anyone who has not set
+        // them, so the unset path has to produce exactly what
+        // DownloadConfig::default() produced before.
+        let defaulted = crate::executor::DownloadConfig::default();
+        let from_config = ServiceConfig::default().chunk_download_config();
+
+        assert_eq!(from_config.request_timeout, defaulted.request_timeout);
+        assert_eq!(from_config.max_retries, defaulted.max_retries);
     }
 
     #[test]

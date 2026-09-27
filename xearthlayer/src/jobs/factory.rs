@@ -176,6 +176,14 @@ where
             download_config,
         }
     }
+
+    /// The download configuration these jobs are built with.
+    ///
+    /// Exposed so the wiring from `executor.request_timeout_secs` and
+    /// `executor.max_retries` down to the jobs is assertable (#249).
+    pub fn download_config(&self) -> &DownloadConfig {
+        &self.download_config
+    }
 }
 
 impl<P, E, M, DD, D, X> DdsJobFactory for DefaultDdsJobFactory<P, E, M, DD, D, X>
