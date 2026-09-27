@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use xearthlayer::config::{format_size, ControlPlaneSettings, PipelineSettings, TextureConfig};
+use xearthlayer::config::{format_size, ControlPlaneSettings, TextureConfig};
 use xearthlayer::manager::LocalPackageStore;
 use xearthlayer::package::PackageType;
 use xearthlayer::panic as panic_handler;
@@ -95,20 +95,6 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
     // Check if we'll use TUI (need to know before creating services)
     let use_tui = atty::is(atty::Stream::Stdout);
 
-    // Pool sizing is no longer configurable (#249) — it is derived by
-    // ResourcePoolConfig::default(). These two fields keep their own defaults so
-    // PipelineSettings still constructs; nothing reads them today, since
-    // ServiceConfig::pipeline() has no caller.
-    let pipeline_settings = PipelineSettings {
-        max_http_concurrent: xearthlayer::config::default_http_concurrent(),
-        max_cpu_concurrent: xearthlayer::config::default_cpu_concurrent(),
-        max_prefetch_in_flight: config.pipeline.max_prefetch_in_flight,
-        request_timeout_secs: config.executor.request_timeout_secs,
-        max_retries: config.executor.max_retries,
-        retry_base_delay_ms: config.executor.retry_base_delay_ms,
-        coalesce_channel_capacity: config.pipeline.coalesce_channel_capacity,
-    };
-
     let control_plane_settings = ControlPlaneSettings {
         max_concurrent_jobs: config.control_plane.max_concurrent_jobs,
         stall_threshold_secs: config.control_plane.stall_threshold_secs,
@@ -127,7 +113,6 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
         .cache_dds_disk_ratio(config.cache.dds_disk_ratio)
         .generation_threads(config.generation.threads)
         .generation_timeout(config.generation.timeout)
-        .pipeline(pipeline_settings)
         .control_plane(control_plane_settings)
         .quiet_mode(use_tui) // Disable stats logging when TUI is active
         .build();

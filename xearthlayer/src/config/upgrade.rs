@@ -152,6 +152,18 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "executor.max_concurrent_tasks",
     "executor.job_channel_capacity",
     "executor.request_channel_capacity",
+    // Removed in #249 — neither key reached the executor.
+    //
+    // max_concurrent_jobs was only ever a number the dashboard divided by. It
+    // named no limit: job admission is bounded by the executor's task dispatch
+    // and the resource pools, neither of which consulted it.
+    //
+    // retry_base_delay_ms could not be honoured at all. The backoff between
+    // chunk retries is `100ms * 2^attempt`, written as a literal in
+    // tasks/download_chunks.rs, so there was nothing for the value to reach.
+    // Retry count stays configurable through executor.max_retries.
+    "executor.max_concurrent_jobs",
+    "executor.retry_base_delay_ms",
 ];
 
 /// Result of analyzing a configuration file for upgrade needs.

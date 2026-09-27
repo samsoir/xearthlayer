@@ -6,7 +6,6 @@
 use ini::Ini;
 use std::path::PathBuf;
 
-use super::defaults::clamp_http_concurrent;
 use super::file::ConfigFileError;
 use super::settings::ConfigFile;
 use super::size::parse_size;
@@ -136,18 +135,6 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
         }
     }
 
-    // [download] section
-    if let Some(section) = ini.section(Some("download")) {
-        if let Some(v) = section.get("timeout") {
-            config.download.timeout = v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                section: "download".to_string(),
-                key: "timeout".to_string(),
-                value: v.to_string(),
-                reason: "must be a positive integer (seconds)".to_string(),
-            })?;
-        }
-    }
-
     // [generation] section
     if let Some(section) = ini.section(Some("generation")) {
         if let Some(v) = section.get("threads") {
@@ -165,73 +152,6 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
                 value: v.to_string(),
                 reason: "must be a positive integer (seconds)".to_string(),
             })?;
-        }
-    }
-
-    // [pipeline] section
-    if let Some(section) = ini.section(Some("pipeline")) {
-        if let Some(v) = section.get("max_http_concurrent") {
-            let parsed: usize = v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                section: "pipeline".to_string(),
-                key: "max_http_concurrent".to_string(),
-                value: v.to_string(),
-                reason: "must be a positive integer".to_string(),
-            })?;
-            // Enforce hard limits to prevent provider rate limiting
-            config.pipeline.max_http_concurrent = clamp_http_concurrent(parsed);
-        }
-        if let Some(v) = section.get("max_cpu_concurrent") {
-            config.pipeline.max_cpu_concurrent =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "pipeline".to_string(),
-                    key: "max_cpu_concurrent".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("max_prefetch_in_flight") {
-            config.pipeline.max_prefetch_in_flight =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "pipeline".to_string(),
-                    key: "max_prefetch_in_flight".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("request_timeout_secs") {
-            config.pipeline.request_timeout_secs =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "pipeline".to_string(),
-                    key: "request_timeout_secs".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer (seconds)".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("max_retries") {
-            config.pipeline.max_retries = v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                section: "pipeline".to_string(),
-                key: "max_retries".to_string(),
-                value: v.to_string(),
-                reason: "must be a positive integer".to_string(),
-            })?;
-        }
-        if let Some(v) = section.get("retry_base_delay_ms") {
-            config.pipeline.retry_base_delay_ms =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "pipeline".to_string(),
-                    key: "retry_base_delay_ms".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer (milliseconds)".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("coalesce_channel_capacity") {
-            config.pipeline.coalesce_channel_capacity =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "pipeline".to_string(),
-                    key: "coalesce_channel_capacity".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer".to_string(),
-                })?;
         }
     }
 
@@ -456,46 +376,6 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
         }
     }
 
-    // [control_plane] section
-    if let Some(section) = ini.section(Some("control_plane")) {
-        if let Some(v) = section.get("max_concurrent_jobs") {
-            config.control_plane.max_concurrent_jobs =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "control_plane".to_string(),
-                    key: "max_concurrent_jobs".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("stall_threshold_secs") {
-            config.control_plane.stall_threshold_secs =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "control_plane".to_string(),
-                    key: "stall_threshold_secs".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer (seconds)".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("health_check_interval_secs") {
-            config.control_plane.health_check_interval_secs =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "control_plane".to_string(),
-                    key: "health_check_interval_secs".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer (seconds)".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("semaphore_timeout_secs") {
-            config.control_plane.semaphore_timeout_secs =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "control_plane".to_string(),
-                    key: "semaphore_timeout_secs".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer (seconds)".to_string(),
-                })?;
-        }
-    }
-
     // [prewarm] section
     if let Some(section) = ini.section(Some("prewarm")) {
         if let Some(v) = section.get("grid_rows") {
@@ -542,44 +422,6 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
 
     // [executor] section
     if let Some(section) = ini.section(Some("executor")) {
-        // Moved from the deprecated [control_plane] section in #160. Parsed after
-        // [control_plane] above, so the [executor] value wins when both are present.
-        if let Some(v) = section.get("max_concurrent_jobs") {
-            config.control_plane.max_concurrent_jobs =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "executor".to_string(),
-                    key: "max_concurrent_jobs".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("max_concurrent_tasks") {
-            config.executor.max_concurrent_tasks =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "executor".to_string(),
-                    key: "max_concurrent_tasks".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("job_channel_capacity") {
-            config.executor.job_channel_capacity =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "executor".to_string(),
-                    key: "job_channel_capacity".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("request_channel_capacity") {
-            config.executor.request_channel_capacity =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "executor".to_string(),
-                    key: "request_channel_capacity".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer".to_string(),
-                })?;
-        }
         if let Some(v) = section.get("request_timeout_secs") {
             config.executor.request_timeout_secs =
                 v.parse().map_err(|_| ConfigFileError::InvalidValue {
@@ -596,15 +438,6 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
                 value: v.to_string(),
                 reason: "must be a positive integer".to_string(),
             })?;
-        }
-        if let Some(v) = section.get("retry_base_delay_ms") {
-            config.executor.retry_base_delay_ms =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "executor".to_string(),
-                    key: "retry_base_delay_ms".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer (milliseconds)".to_string(),
-                })?;
         }
     }
 
@@ -679,63 +512,9 @@ mod tests {
     use crate::config::settings::ConfigFile;
     use tempfile::TempDir;
 
-    /// Regression: `max_concurrent_jobs` moved from the deprecated [control_plane]
+    /// Regression: a setting whose section moved without the parser following
     /// section to [executor] in #160, but the parser was not updated — a config
     /// written by XEarthLayer itself could not be read back.
-    #[test]
-    fn test_max_concurrent_jobs_survives_write_read_round_trip() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("config.ini");
-
-        let mut config = ConfigFile::default();
-        let non_default = default_max_concurrent_jobs() + 3;
-        config.control_plane.max_concurrent_jobs = non_default;
-        config.save_to(&config_path).unwrap();
-
-        let loaded = ConfigFile::load_from(&config_path).unwrap();
-        assert_eq!(loaded.control_plane.max_concurrent_jobs, non_default);
-    }
-
-    #[test]
-    fn test_max_concurrent_jobs_read_from_executor_section() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("config.ini");
-
-        std::fs::write(
-            &config_path,
-            r#"
-[executor]
-max_concurrent_jobs = 12
-"#,
-        )
-        .unwrap();
-
-        let config = ConfigFile::load_from(&config_path).unwrap();
-        assert_eq!(config.control_plane.max_concurrent_jobs, 12);
-    }
-
-    /// The [executor] value wins over the deprecated [control_plane] one.
-    #[test]
-    fn test_executor_max_concurrent_jobs_overrides_control_plane() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("config.ini");
-
-        std::fs::write(
-            &config_path,
-            r#"
-[control_plane]
-max_concurrent_jobs = 4
-
-[executor]
-max_concurrent_jobs = 12
-"#,
-        )
-        .unwrap();
-
-        let config = ConfigFile::load_from(&config_path).unwrap();
-        assert_eq!(config.control_plane.max_concurrent_jobs, 12);
-    }
-
     /// Guards the whole writer/parser pair: every value below is non-default and
     /// must survive a save/load cycle. Catches settings the writer emits into a
     /// section the parser does not read.
@@ -747,7 +526,8 @@ max_concurrent_jobs = 12
         let mut config = ConfigFile::default();
         config.cache.dds_disk_ratio = 0.75;
         config.generation.timeout = 42;
-        config.control_plane.max_concurrent_jobs = 11;
+        config.executor.request_timeout_secs = 33;
+        config.executor.max_retries = 6;
         config.fuse.max_background = 512;
         config.fuse.congestion_threshold = 384;
         config.prefetch.cycle_interval_ms = 3000;
@@ -757,7 +537,8 @@ max_concurrent_jobs = 12
         let loaded = ConfigFile::load_from(&config_path).unwrap();
         assert_eq!(loaded.cache.dds_disk_ratio, 0.75);
         assert_eq!(loaded.generation.timeout, 42);
-        assert_eq!(loaded.control_plane.max_concurrent_jobs, 11);
+        assert_eq!(loaded.executor.request_timeout_secs, 33);
+        assert_eq!(loaded.executor.max_retries, 6);
         assert_eq!(loaded.fuse.max_background, 512);
         assert_eq!(loaded.fuse.congestion_threshold, 384);
         assert_eq!(loaded.prefetch.cycle_interval_ms, 3000);
@@ -862,68 +643,10 @@ timeout = 45
         // Specified values
         assert_eq!(config.provider.provider_type, "google");
         assert_eq!(config.provider.google_api_key, Some("my-key".to_string()));
-        assert_eq!(config.download.timeout, 45);
 
         // Default values
         assert_eq!(config.cache.memory_size, DEFAULT_MEMORY_CACHE_SIZE);
         assert_eq!(config.texture.format, DdsFormat::BC1);
-    }
-
-    #[test]
-    fn test_http_concurrent_clamped_to_ceiling() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("config.ini");
-
-        // Test value above maximum gets clamped to 256
-        std::fs::write(
-            &config_path,
-            r#"
-[pipeline]
-max_http_concurrent = 500
-"#,
-        )
-        .unwrap();
-
-        let config = ConfigFile::load_from(&config_path).unwrap();
-        assert_eq!(config.pipeline.max_http_concurrent, MAX_HTTP_CONCURRENT);
-    }
-
-    #[test]
-    fn test_http_concurrent_clamped_to_floor() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("config.ini");
-
-        // Test value below minimum gets clamped to 64
-        std::fs::write(
-            &config_path,
-            r#"
-[pipeline]
-max_http_concurrent = 10
-"#,
-        )
-        .unwrap();
-
-        let config = ConfigFile::load_from(&config_path).unwrap();
-        assert_eq!(config.pipeline.max_http_concurrent, MIN_HTTP_CONCURRENT);
-    }
-
-    #[test]
-    fn test_http_concurrent_in_range_unchanged() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("config.ini");
-
-        // Test value within range is unchanged
-        std::fs::write(
-            &config_path,
-            r#"
-[pipeline]
-max_http_concurrent = 128
-"#,
-        )
-        .unwrap();
-
-        let config = ConfigFile::load_from(&config_path).unwrap();
-        assert_eq!(config.pipeline.max_http_concurrent, 128);
     }
 
     #[test]

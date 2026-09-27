@@ -17,12 +17,8 @@ pub struct ConfigFile {
     pub cache: CacheSettings,
     /// Texture settings
     pub texture: TextureSettings,
-    /// Download settings
-    pub download: DownloadSettings,
     /// Generation settings
     pub generation: GenerationSettings,
-    /// Pipeline settings for concurrency and retry behavior
-    pub pipeline: PipelineSettings,
     /// X-Plane settings
     pub xplane: XPlaneSettings,
     /// Package manager settings
@@ -98,13 +94,6 @@ pub struct TextureSettings {
     pub gpu_device: String,
 }
 
-/// Download configuration.
-#[derive(Debug, Clone)]
-pub struct DownloadSettings {
-    /// Timeout in seconds for HTTP requests.
-    pub timeout: u64,
-}
-
 /// Generation configuration.
 #[derive(Debug, Clone)]
 pub struct GenerationSettings {
@@ -115,37 +104,6 @@ pub struct GenerationSettings {
     /// If exceeded, returns a magenta placeholder.
     /// Default: 10 seconds.
     pub timeout: u64,
-}
-
-/// Pipeline configuration for concurrency and retry behavior.
-#[derive(Debug, Clone)]
-pub struct PipelineSettings {
-    /// Maximum concurrent HTTP requests across all tiles.
-    /// Default: 128 (conservative value stable with all providers)
-    ///
-    /// Hard limits: 64-256 (values outside this range are clamped).
-    /// The ceiling prevents overwhelming imagery providers, which causes
-    /// rate limiting (HTTP 429) and cascade failures.
-    pub max_http_concurrent: usize,
-    /// Maximum concurrent CPU-bound operations (assemble + encode stages).
-    /// Default: num_cpus * 1.25, minimum num_cpus + 2
-    pub max_cpu_concurrent: usize,
-    /// Maximum concurrent prefetch jobs in flight.
-    /// Default: max(num_cpus / 4, 2) - leaves 75% of resources for on-demand
-    pub max_prefetch_in_flight: usize,
-    /// HTTP request timeout in seconds for individual chunk downloads.
-    /// Default: 10 seconds
-    pub request_timeout_secs: u64,
-    /// Maximum retry attempts per failed chunk download.
-    /// Default: 3
-    pub max_retries: u32,
-    /// Base delay in milliseconds for exponential backoff between retries.
-    /// Actual delay = base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms, 800ms)
-    /// Default: 100
-    pub retry_base_delay_ms: u64,
-    /// Broadcast channel capacity for request coalescing.
-    /// Default: 16
-    pub coalesce_channel_capacity: usize,
 }
 
 /// X-Plane configuration.
@@ -301,27 +259,20 @@ pub struct PatchesSettings {
     pub directory: Option<PathBuf>,
 }
 
-/// Executor daemon configuration for the job/task framework.
+/// Per-chunk download behaviour for the job/task framework.
+///
+/// Both fields reach the executor through
+/// `ServiceConfig::chunk_download_config`. The executor's own internal sizing
+/// (task and channel capacities, resource pools) is derived from the host and
+/// is deliberately not configurable.
 #[derive(Debug, Clone)]
 pub struct ExecutorSettings {
-    /// Maximum concurrent tasks the executor can run.
-    /// Default: 128
-    pub max_concurrent_tasks: usize,
-    /// Internal job channel capacity (job queue size).
-    /// Default: 256
-    pub job_channel_capacity: usize,
-    /// External request channel capacity (request queue from FUSE/prefetch).
-    /// Default: 1000
-    pub request_channel_capacity: usize,
     /// HTTP request timeout in seconds for individual chunk downloads.
     /// Default: 10 seconds
     pub request_timeout_secs: u64,
     /// Maximum retry attempts per failed chunk download.
     /// Default: 3
     pub max_retries: u32,
-    /// Base delay in milliseconds for exponential backoff between retries.
-    /// Default: 100ms
-    pub retry_base_delay_ms: u64,
 }
 
 /// FUSE filesystem settings for kernel background request limits.

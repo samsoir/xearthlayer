@@ -110,10 +110,8 @@ pub enum ConfigKey {
     PatchesDirectory,
 
     // Executor settings
-    ExecutorMaxConcurrentJobs,
     ExecutorRequestTimeoutSecs,
     ExecutorMaxRetries,
-    ExecutorRetryBaseDelayMs,
 
     // FUSE settings
     FuseMaxBackground,
@@ -188,10 +186,8 @@ impl FromStr for ConfigKey {
             "patches.directory" => Ok(ConfigKey::PatchesDirectory),
 
             // Executor settings
-            "executor.max_concurrent_jobs" => Ok(ConfigKey::ExecutorMaxConcurrentJobs),
             "executor.request_timeout_secs" => Ok(ConfigKey::ExecutorRequestTimeoutSecs),
             "executor.max_retries" => Ok(ConfigKey::ExecutorMaxRetries),
-            "executor.retry_base_delay_ms" => Ok(ConfigKey::ExecutorRetryBaseDelayMs),
 
             // FUSE settings
             "fuse.max_background" => Ok(ConfigKey::FuseMaxBackground),
@@ -258,10 +254,8 @@ impl ConfigKey {
             ConfigKey::PatchesDirectory => "patches.directory",
 
             // Executor settings
-            ConfigKey::ExecutorMaxConcurrentJobs => "executor.max_concurrent_jobs",
             ConfigKey::ExecutorRequestTimeoutSecs => "executor.request_timeout_secs",
             ConfigKey::ExecutorMaxRetries => "executor.max_retries",
-            ConfigKey::ExecutorRetryBaseDelayMs => "executor.retry_base_delay_ms",
 
             // FUSE settings
             ConfigKey::FuseMaxBackground => "fuse.max_background",
@@ -396,14 +390,10 @@ impl ConfigKey {
                 .unwrap_or_default(),
 
             // Executor settings
-            ConfigKey::ExecutorMaxConcurrentJobs => {
-                config.control_plane.max_concurrent_jobs.to_string()
-            }
             ConfigKey::ExecutorRequestTimeoutSecs => {
                 config.executor.request_timeout_secs.to_string()
             }
             ConfigKey::ExecutorMaxRetries => config.executor.max_retries.to_string(),
-            ConfigKey::ExecutorRetryBaseDelayMs => config.executor.retry_base_delay_ms.to_string(),
 
             // FUSE settings
             ConfigKey::FuseMaxBackground => config.fuse.max_background.to_string(),
@@ -571,17 +561,11 @@ impl ConfigKey {
             }
 
             // Executor settings
-            ConfigKey::ExecutorMaxConcurrentJobs => {
-                config.control_plane.max_concurrent_jobs = value.parse().unwrap();
-            }
             ConfigKey::ExecutorRequestTimeoutSecs => {
                 config.executor.request_timeout_secs = value.parse().unwrap();
             }
             ConfigKey::ExecutorMaxRetries => {
                 config.executor.max_retries = value.parse().unwrap();
-            }
-            ConfigKey::ExecutorRetryBaseDelayMs => {
-                config.executor.retry_base_delay_ms = value.parse().unwrap();
             }
 
             // FUSE settings
@@ -662,10 +646,8 @@ impl ConfigKey {
             ConfigKey::PatchesDirectory => Box::new(OptionalPathSpec),
 
             // Executor settings
-            ConfigKey::ExecutorMaxConcurrentJobs => Box::new(IntegerRangeSpec::new(1, 256)),
             ConfigKey::ExecutorRequestTimeoutSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ExecutorMaxRetries => Box::new(PositiveIntegerSpec),
-            ConfigKey::ExecutorRetryBaseDelayMs => Box::new(PositiveIntegerSpec),
 
             // FUSE settings — range: 1-1024 for both
             ConfigKey::FuseMaxBackground => Box::new(IntegerRangeSpec::new(1, 1024)),
@@ -726,10 +708,8 @@ impl ConfigKey {
             ConfigKey::PatchesEnabled,
             ConfigKey::PatchesDirectory,
             // Executor settings
-            ConfigKey::ExecutorMaxConcurrentJobs,
             ConfigKey::ExecutorRequestTimeoutSecs,
             ConfigKey::ExecutorMaxRetries,
-            ConfigKey::ExecutorRetryBaseDelayMs,
             // FUSE settings
             ConfigKey::FuseMaxBackground,
             ConfigKey::FuseCongestionThreshold,
