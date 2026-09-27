@@ -196,6 +196,12 @@ The `gpu` backend is ideal for systems with both an integrated and discrete GPU.
 
 Run `xearthlayer diagnostics` to see available GPU adapters.
 
+Only Vulkan, Metal and DX12 adapters are listed. The OpenGL backend is not
+probed, because initialising it opens an X11 connection that XEarthLayer never
+uses and whose failure messages are written straight to the terminal. GPU
+encoding needs compute shaders in any case, so a host whose only adapter is
+OpenGL falls back to the `ispc` compressor, which is the right outcome for it.
+
 ### [generation]
 
 Controls parallel tile generation.

@@ -119,6 +119,13 @@ pub enum GpuSelectError {
     },
 }
 
+/// Backends probed when enumerating GPU adapters.
+///
+/// Deliberately `PRIMARY` (Vulkan, Metal, DX12, WebGPU) and not `all()`.
+/// `all()` additionally probes `SECONDARY`, which is GL alone, and
+/// initialising GL on Linux opens the X display. See the test below.
+const PROBE_BACKENDS: wgpu::Backends = wgpu::Backends::PRIMARY;
+
 /// Enumerate all GPU adapters as live `wgpu::Adapter` handles.
 ///
 /// Most callers should prefer [`enumerate`] which returns metadata-only
@@ -129,10 +136,10 @@ pub enum GpuSelectError {
 /// vector if no adapters are visible.
 pub fn enumerate_raw() -> Vec<wgpu::Adapter> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::all(),
+        backends: PROBE_BACKENDS,
         ..Default::default()
     });
-    pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+    pollster::block_on(instance.enumerate_adapters(PROBE_BACKENDS))
 }
 
 /// Enumerate all GPU adapters as metadata-only [`GpuAdapter`] records.
@@ -204,6 +211,34 @@ fn gpu_kind_from(device_type: wgpu::DeviceType) -> GpuKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_backends_exclude_gl() {
+        // Regression guard for #255. The GL backend initialises EGL/GLX, which
+        // opens the X display; with DISPLAY set but no reachable cookie libX11
+        // writes "Authorization required" straight to fd 2, bypassing tracing
+        // and corrupting the TUI. Nothing in the encode path needs GL.
+        assert!(
+            !PROBE_BACKENDS.contains(wgpu::Backends::GL),
+            "GL must not be probed: it opens an X11 connection we never use"
+        );
+    }
+
+    #[test]
+    fn probe_backends_cover_every_shipping_platform() {
+        // Narrowing the probe must not cost us a platform: Linux needs Vulkan,
+        // macOS needs Metal, and Windows (planned) needs DX12.
+        for backend in [
+            wgpu::Backends::VULKAN,
+            wgpu::Backends::METAL,
+            wgpu::Backends::DX12,
+        ] {
+            assert!(
+                PROBE_BACKENDS.contains(backend),
+                "shipping platform backend {backend:?} must be probed"
+            );
+        }
+    }
 
     fn adapter(name: &str, kind: GpuKind) -> GpuAdapter {
         GpuAdapter {

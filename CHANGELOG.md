@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **GPU enumeration no longer opens an X11 connection** ([#255](https://github.com/samsoir/xearthlayer/issues/255)): Adapter enumeration probed every wgpu backend including OpenGL, and initialising OpenGL on Linux opens the X display. On a host where `DISPLAY` is set but no valid cookie is reachable, such as a long-lived tmux session over SSH, libX11 wrote `Authorization required, but no authorization protocol specified` directly to the terminal, bypassing the logger and corrupting the dashboard mid-render. The same line could land in the middle of a `diagnostics` dump, which is the output the bug report template asks users to paste. Enumeration is now limited to the backends XEarthLayer actually encodes on: Vulkan, Metal and DX12. On the reference machine the only adapter this removes is an OpenGL entry for a GPU already listed via Vulkan, so no hardware becomes unavailable. A host whose only adapter is OpenGL now uses the `ispc` compressor instead, which it would have needed regardless, since GPU encoding requires compute shaders.
+
 - **`make bump-version` was broken on macOS and covered only two files**: it used GNU-only `sed -i`, and updated only `Cargo.toml` and `pkg/rpm/xearthlayer.spec`. It now uses a portable in-place rewrite and updates all five version-carrying files. `Cargo.toml`, `Cargo.lock` and `version.json` get the full semver, while `pkg/rpm/xearthlayer.spec` and `pkg/arch/PKGBUILD` get the hyphen-stripped base version, since RPM and Arch version fields cannot contain a hyphen. That missing coverage is why the RPM spec had drifted to `0.2.5` and the PKGBUILD to `0.2.0`; both are now correct.
 
 ## [0.4.8] - 2026-09-01
