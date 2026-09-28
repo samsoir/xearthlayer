@@ -2,7 +2,7 @@
 
 ## Status
 
-**Draft**. Target release: 0.5.0.
+**Implemented** in v0.5.0, tracked by #284.
 
 Related: [Service-UI Decoupling Design](service-ui-decoupling-design.md) (the
 crate topology this extends), [Package Publisher Design](package-publisher-design.md)

@@ -114,7 +114,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - Peer daemon architecture: FUSE, Prefetch, and Executor are independent daemons
     - Channel as mediator pattern for maximum decoupling
 
-10. **Package Publisher** (`xearthlayer/src/publisher/`)
+10. **Package Publisher** (`xearthlayer-publisher/`, its own crate behind the `xearthlayer-publish` binary since #284; the runtime does not link it, and the shared format lives in `xearthlayer-package/`)
    - Creates distributable scenery packages from Ortho4XP output (ortho tiles and overlays)
    - Repository management with package versioning
    - Archive building with configurable part sizes
@@ -353,20 +353,20 @@ xearthlayer config get <key>        # Get a setting (e.g., packages.library_url)
 xearthlayer config set <key> <val>  # Set a setting with validation
 xearthlayer config upgrade          # Add missing settings with defaults (backup created)
 
-# Publisher commands (create scenery packages)
-xearthlayer publish init [<path>]           # Initialize package repository
-xearthlayer publish scan --source <path> [--type <ortho|overlay>]  # Scan Ortho4XP output
-xearthlayer publish add --source <path> --region <code> --type <ortho|overlay>  # Process tiles/overlays
-xearthlayer publish list                    # List packages
-xearthlayer publish build --region <code>   # Create archives
-xearthlayer publish urls --region <code> --base-url <url>  # Configure URLs
-xearthlayer publish version --region <code> --bump <type>  # Manage versions
-xearthlayer publish release --region <code> --metadata-url <url>  # Release
-xearthlayer publish status                  # Show release status
-xearthlayer publish validate                # Validate repository
-xearthlayer publish coverage [--dark] [--geojson] [-o <file>] [--metadata <path>]  # Generate coverage map
-xearthlayer publish dedupe --region <code> [--priority <mode>] [--tile <lat,lon>] [--dry-run]  # Remove overlapping ZL tiles
-xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o <file>]  # Analyze coverage gaps
+# Publisher commands: the separate xearthlayer-publish binary (#284)
+xearthlayer-publish init [<path>]           # Initialize package repository
+xearthlayer-publish scan --source <path> [--type <ortho|overlay>]  # Scan Ortho4XP output
+xearthlayer-publish add --source <path> --region <code> --type <ortho|overlay>  # Process tiles/overlays
+xearthlayer-publish list                    # List packages
+xearthlayer-publish build --region <code>   # Create archives
+xearthlayer-publish urls --region <code> --base-url <url>  # Configure URLs
+xearthlayer-publish version --region <code> --bump <type>  # Manage versions
+xearthlayer-publish release --region <code> --metadata-url <url>  # Release
+xearthlayer-publish status                  # Show release status
+xearthlayer-publish validate                # Validate repository
+xearthlayer-publish coverage [--dark] [--geojson] [-o <file>] [--metadata <path>]  # Generate coverage map
+xearthlayer-publish dedupe --region <code> [--priority <mode>] [--tile <lat,lon>] [--dry-run]  # Remove overlapping ZL tiles
+xearthlayer-publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o <file>]  # Analyze coverage gaps
 ```
 
 ## Key Files
@@ -374,7 +374,7 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | File | Purpose |
 |------|---------|
 | `xearthlayer-cli/src/main.rs` | CLI entry point |
-| `xearthlayer-cli/src/commands/publish/` | Publisher CLI (Command Pattern) |
+| `xearthlayer-publish/src/` | Publisher CLI binary (Command Pattern) |
 | `xearthlayer-cli/src/commands/config.rs` | Config CLI commands |
 | `xearthlayer/src/service/facade.rs` | Main service API, wires up runtime |
 | `xearthlayer/src/runtime/orchestrator.rs` | XEarthLayerRuntime - daemon orchestrator |
@@ -403,8 +403,9 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/update/checker.rs` | UpdateChecker trait and RemoteUpdateChecker |
 | `xearthlayer/src/config/file.rs` | Configuration loading |
 | `xearthlayer/src/config/keys.rs` | ConfigKey enum with validation (Specification Pattern) |
-| `xearthlayer/src/publisher/` | Package publisher library |
-| `xearthlayer/src/publisher/dedupe/` | Zoom level overlap detection and gap analysis |
+| `xearthlayer-package/src/` | Scenery package format: metadata, library index, naming, spec version gate (shared by runtime and publisher) |
+| `xearthlayer-publisher/src/` | Package publisher library |
+| `xearthlayer-publisher/src/dedupe/` | Zoom level overlap detection and gap analysis |
 | `xearthlayer/src/prefetch/strategy.rs` | Prefetcher trait (strategy pattern) |
 | `xearthlayer/src/prefetch/adaptive/coordinator/core.rs` | AdaptivePrefetchCoordinator (sliding box prefetch) |
 | `xearthlayer/src/prefetch/adaptive/prefetch_box.rs` | PrefetchBox (heading-biased sliding prefetch region) |
@@ -530,6 +531,6 @@ matrix jobs are renamed.
 - **Memory telemetry**: `docs/dev/memory-telemetry.md` (periodic memory sampling, trace interpretation, confounders)
 - **Cache integrity model**: `docs/dev/cache-integrity-design.md` (bounded reads, atomic durable writes, discard-on-reject, shared by every on-disk cache)
 - **CI/CD pipeline**: `docs/dev/cicd.md` (branch model, release job graph, platform tiers, version propagation)
-- **Publisher separation**: `docs/dev/publisher-separation-design.md` (**planned for 0.5.0**, not yet implemented: `package` becomes the `xearthlayer-package` contract crate, `publisher` becomes `xearthlayer-publisher`, `xearthlayer publish` becomes the `xearthlayer-publish` binary)
+- **Publisher separation**: `docs/dev/publisher-separation-design.md` (#284: `xearthlayer-package` is the format contract both sides depend on, `xearthlayer-publisher` holds the publishing domain, and `xearthlayer-publish` is its binary; the runtime links none of the publisher's dependencies)
 - memorize review allow(dead_code) macros at major checkpoints. Refactor aggresively to remove them when appropriate.
 - memorize ensure to update the projects documentation to reflect the current state of the project before committing changes

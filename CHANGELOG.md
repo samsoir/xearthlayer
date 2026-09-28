@@ -29,7 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`docs/dev/cicd.md`**: Reference for the build pipeline and merge strategy, covering the branch model, release job graph, platform support tiers, release channels, status checks, and version propagation.
 
+### Changed
+
+- **Publishing is its own program** ([#284](https://github.com/samsoir/xearthlayer/issues/284)): `xearthlayer publish` is now `xearthlayer-publish`, a separate binary with the same thirteen subcommands, shipped as its own package. Every `xearthlayer publish <command>` becomes `xearthlayer-publish <command>`; nothing else changed, not the arguments, the repository layout, or the package format, and a package built by the new binary is byte for byte the one the old command produced. Publishing and streaming were always separate domains joined only by the package format, yet they shared one binary, so the runtime carried a map renderer, a second TLS stack and a 7z encoder it never used, and building a package meant installing a flight simulator service and passing its startup checks. The format itself now lives in a shared `xearthlayer-package` crate that both programs compile against, which is what keeps them from drifting apart.
+
 ### Removed
+
+- **`xearthlayer publish`** ([#284](https://github.com/samsoir/xearthlayer/issues/284)): Replaced by the `xearthlayer-publish` binary, see Changed. There is no forwarding stub; the subcommand is gone in this release.
 
 - **Configuration keys that configured nothing** ([#249](https://github.com/samsoir/xearthlayer/issues/249)): `executor.max_concurrent_jobs` and `executor.retry_base_delay_ms` are removed, joining `network_concurrent`, `cpu_concurrent` and `disk_io_concurrent`. `max_concurrent_jobs` named no limit; it was only the number the dashboard divided by, while job admission is bounded by task dispatch and the resource pools, neither of which consulted it. `retry_base_delay_ms` could not be honoured at all, because the delay between chunk retries is a constant in the retry loop. Retry count stays configurable through `executor.max_retries`. `xearthlayer config upgrade` removes both, along with the deprecated `[control_plane]` and `[download]` sections. The `--parallel` flag on `run` is removed for the same reason: it set a concurrency value nothing read, and concurrency is deliberately derived from the host rather than configured.
 

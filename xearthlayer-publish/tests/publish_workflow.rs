@@ -114,13 +114,13 @@ impl MockTileBuilder {
     }
 }
 
-/// Get the path to the xearthlayer CLI binary.
+/// Get the path to the xearthlayer-publish binary.
 fn cli_binary() -> PathBuf {
     // Try to find the debug binary first
     let debug_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
-        .join("target/debug/xearthlayer");
+        .join("target/debug/xearthlayer-publish");
 
     if debug_path.exists() {
         return debug_path;
@@ -130,7 +130,7 @@ fn cli_binary() -> PathBuf {
     let release_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
-        .join("target/release/xearthlayer");
+        .join("target/release/xearthlayer-publish");
 
     if release_path.exists() {
         return release_path;
@@ -167,7 +167,7 @@ fn test_init_creates_repository_structure() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let repo_path = temp.path().join("test-repo");
 
-    let output = run_cli(&["publish", "init", repo_path.to_str().unwrap()]);
+    let output = run_cli(&["init", repo_path.to_str().unwrap()]);
     assert_success(&output, "publish init");
 
     // Verify directory structure
@@ -189,13 +189,7 @@ fn test_init_with_custom_part_size() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let repo_path = temp.path().join("test-repo");
 
-    let output = run_cli(&[
-        "publish",
-        "init",
-        repo_path.to_str().unwrap(),
-        "--part-size",
-        "200M",
-    ]);
+    let output = run_cli(&["init", repo_path.to_str().unwrap(), "--part-size", "200M"]);
     assert_success(&output, "publish init with part-size");
 
     // Read config and verify part size
@@ -224,7 +218,7 @@ fn test_scan_discovers_tiles() {
         ])
         .expect("Failed to create mock tiles");
 
-    let output = run_cli(&["publish", "scan", "--source", tiles_dir.to_str().unwrap()]);
+    let output = run_cli(&["scan", "--source", tiles_dir.to_str().unwrap()]);
     assert_success(&output, "publish scan");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -249,7 +243,7 @@ fn test_scan_suggests_region() {
         .create_region(&[(36, -122), (37, -122), (38, -122)])
         .expect("Failed to create mock tiles");
 
-    let output = run_cli(&["publish", "scan", "--source", tiles_dir.to_str().unwrap()]);
+    let output = run_cli(&["scan", "--source", tiles_dir.to_str().unwrap()]);
     assert_success(&output, "publish scan");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -276,16 +270,15 @@ fn test_full_workflow_init_scan_add() {
         .expect("Failed to create mock tiles");
 
     // Step 1: Initialize repository
-    let output = run_cli(&["publish", "init", repo_path.to_str().unwrap()]);
+    let output = run_cli(&["init", repo_path.to_str().unwrap()]);
     assert_success(&output, "init");
 
     // Step 2: Scan tiles
-    let output = run_cli(&["publish", "scan", "--source", tiles_dir.to_str().unwrap()]);
+    let output = run_cli(&["scan", "--source", tiles_dir.to_str().unwrap()]);
     assert_success(&output, "scan");
 
     // Step 3: Add package
     let output = run_cli(&[
-        "publish",
         "add",
         "--source",
         tiles_dir.to_str().unwrap(),
@@ -324,9 +317,8 @@ fn test_status_shows_package_info() {
         .expect("Failed to create mock tile");
 
     // Initialize and add
-    run_cli(&["publish", "init", repo_path.to_str().unwrap()]);
+    run_cli(&["init", repo_path.to_str().unwrap()]);
     run_cli(&[
-        "publish",
         "add",
         "--source",
         tiles_dir.to_str().unwrap(),
@@ -341,7 +333,7 @@ fn test_status_shows_package_info() {
     ]);
 
     // Check status
-    let output = run_cli(&["publish", "status", repo_path.to_str().unwrap()]);
+    let output = run_cli(&["status", repo_path.to_str().unwrap()]);
     assert_success(&output, "status");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -359,10 +351,10 @@ fn test_validate_empty_repository() {
     let repo_path = temp.path().join("repo");
 
     // Initialize only
-    run_cli(&["publish", "init", repo_path.to_str().unwrap()]);
+    run_cli(&["init", repo_path.to_str().unwrap()]);
 
     // Validate (should pass - empty repo is valid)
-    let output = run_cli(&["publish", "validate", repo_path.to_str().unwrap()]);
+    let output = run_cli(&["validate", repo_path.to_str().unwrap()]);
     assert_success(&output, "validate empty repo");
 }
 
@@ -373,11 +365,11 @@ fn test_init_fails_on_existing_repository() {
     let repo_path = temp.path().join("repo");
 
     // First init should succeed
-    let output = run_cli(&["publish", "init", repo_path.to_str().unwrap()]);
+    let output = run_cli(&["init", repo_path.to_str().unwrap()]);
     assert_success(&output, "first init");
 
     // Second init should fail
-    let output = run_cli(&["publish", "init", repo_path.to_str().unwrap()]);
+    let output = run_cli(&["init", repo_path.to_str().unwrap()]);
     assert!(
         !output.status.success(),
         "Second init should fail on existing repository"
@@ -400,7 +392,6 @@ fn test_add_fails_without_init() {
 
     // Try to add without init
     let output = run_cli(&[
-        "publish",
         "add",
         "--source",
         tiles_dir.to_str().unwrap(),
@@ -424,7 +415,7 @@ fn test_scan_fails_on_empty_directory() {
     let empty_dir = temp.path().join("empty");
     fs::create_dir_all(&empty_dir).expect("Failed to create empty dir");
 
-    let output = run_cli(&["publish", "scan", "--source", empty_dir.to_str().unwrap()]);
+    let output = run_cli(&["scan", "--source", empty_dir.to_str().unwrap()]);
 
     // Should either fail or report no tiles found
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -454,11 +445,10 @@ fn test_invalid_version_string_rejected() {
         .expect("Failed to create mock tile");
 
     // Initialize
-    run_cli(&["publish", "init", repo_path.to_str().unwrap()]);
+    run_cli(&["init", repo_path.to_str().unwrap()]);
 
     // Try to add with invalid version
     let output = run_cli(&[
-        "publish",
         "add",
         "--source",
         tiles_dir.to_str().unwrap(),
@@ -501,11 +491,10 @@ fn test_multiple_packages_in_same_repository() {
         .expect("Failed to create EU tile");
 
     // Initialize
-    run_cli(&["publish", "init", repo_path.to_str().unwrap()]);
+    run_cli(&["init", repo_path.to_str().unwrap()]);
 
     // Add NA package
     let output = run_cli(&[
-        "publish",
         "add",
         "--source",
         tiles_dir_na.to_str().unwrap(),
@@ -522,7 +511,6 @@ fn test_multiple_packages_in_same_repository() {
 
     // Add EU package
     let output = run_cli(&[
-        "publish",
         "add",
         "--source",
         tiles_dir_eu.to_str().unwrap(),
@@ -548,7 +536,7 @@ fn test_multiple_packages_in_same_repository() {
     );
 
     // Status should show both
-    let output = run_cli(&["publish", "status", repo_path.to_str().unwrap()]);
+    let output = run_cli(&["status", repo_path.to_str().unwrap()]);
     assert_success(&output, "status");
 }
 
@@ -567,9 +555,8 @@ fn test_version_bump_workflow() {
         .expect("Failed to create mock tile");
 
     // Initialize and add v0.1.0
-    run_cli(&["publish", "init", repo_path.to_str().unwrap()]);
+    run_cli(&["init", repo_path.to_str().unwrap()]);
     run_cli(&[
-        "publish",
         "add",
         "--source",
         tiles_dir.to_str().unwrap(),
@@ -585,7 +572,6 @@ fn test_version_bump_workflow() {
 
     // Bump version to 0.2.0 (minor bump) using "version" subcommand
     let output = run_cli(&[
-        "publish",
         "version",
         "--region",
         "na",

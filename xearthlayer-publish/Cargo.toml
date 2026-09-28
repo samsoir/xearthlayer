@@ -1,0 +1,26 @@
+[package]
+name = "xearthlayer-publish"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Create, build and release XEarthLayer scenery packages from Ortho4XP output"
+readme = "../docs/content-publishing.md"
+keywords = ["xplane", "flight-simulator", "scenery", "ortho4xp"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "xearthlayer-publish"
+path = "src/main.rs"
+
+[dependencies]
+xearthlayer-package = { path = "../xearthlayer-package" }
+xearthlayer-publisher = { path = "../xearthlayer-publisher" }
+clap.workspace = true
+semver.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+tempfile.workspace = true

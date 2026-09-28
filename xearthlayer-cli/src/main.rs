@@ -104,12 +104,6 @@ enum Commands {
     /// Output system diagnostics for bug reports
     Diagnostics,
 
-    /// Package publisher commands (create and manage scenery packages)
-    Publish {
-        #[command(subcommand)]
-        command: commands::publish::PublishCommands,
-    },
-
     /// Package manager commands (install and manage scenery packages)
     Packages {
         #[command(subcommand)]
@@ -188,7 +182,6 @@ fn command_name(command: &Option<Commands>) -> &'static str {
         Some(Commands::Migrate { .. }) => "migrate",
         Some(Commands::SceneryIndex { .. }) => "scenery-index",
         Some(Commands::Diagnostics) => "diagnostics",
-        Some(Commands::Publish { .. }) => "publish",
         Some(Commands::Packages { .. }) => "packages",
         Some(Commands::Patches { .. }) => "patches",
     }
@@ -261,7 +254,6 @@ fn main() -> ExitCode {
         Some(Commands::Migrate { action, dry_run }) => commands::migrate::run(action, dry_run),
         Some(Commands::SceneryIndex { action }) => commands::scenery_index::run(action),
         Some(Commands::Diagnostics) => commands::diagnostics::run(),
-        Some(Commands::Publish { command }) => commands::publish::run(command),
         Some(Commands::Packages { command }) => commands::packages::run(command),
         Some(Commands::Patches { command }) => commands::patches::run(command),
         Some(Commands::Run {
@@ -298,4 +290,26 @@ fn main() -> ExitCode {
         Err(e) => e.report(),
     };
     ExitCode::from(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Cli;
+
+    #[test]
+    fn publish_is_no_longer_a_subcommand() {
+        // Publishing moved to the xearthlayer-publish binary (#284). This
+        // pins the removal so a later merge cannot quietly restore the
+        // variant and with it the publisher's dependencies.
+        let Err(err) = Cli::try_parse_from(["xearthlayer", "publish", "init", "."]) else {
+            panic!("`xearthlayer publish` must not parse");
+        };
+
+        assert!(
+            err.to_string().contains("publish"),
+            "the error should name the removed subcommand: {err}"
+        );
+    }
 }

@@ -104,7 +104,7 @@ ZL14 coords = (100032 ÷ 16, 42688 ÷ 16) = (6252, 2668)
 Add overlap detection to the existing scan command:
 
 ```bash
-xearthlayer publish scan --source /path/to/Ortho4XP/Tiles [--tile <lat>,<lon>]
+xearthlayer-publish scan --source /path/to/Ortho4XP/Tiles [--tile <lat>,<lon>]
 
 # Output includes new section:
 Zoom Level Analysis:
@@ -127,7 +127,7 @@ Zoom Level Analysis:
 Add deduplication option during tile import:
 
 ```bash
-xearthlayer publish add \
+xearthlayer-publish add \
   --source /path/to/Ortho4XP/Tiles \
   --region na \
   --type ortho \
@@ -144,7 +144,7 @@ xearthlayer publish add \
 Add deduplication option during archive creation:
 
 ```bash
-xearthlayer publish build \
+xearthlayer-publish build \
   --region na \
   --type ortho \
   --dedupe [--priority <mode>] [--tile <lat>,<lon>]
@@ -157,7 +157,7 @@ This excludes overlapping tiles from the archive without modifying the package d
 Process an existing package to remove overlapping tiles:
 
 ```bash
-xearthlayer publish dedupe \
+xearthlayer-publish dedupe \
   --region na \
   --type ortho \
   [--priority <mode>] \
@@ -184,7 +184,7 @@ xearthlayer publish dedupe \
 Analyze coverage gaps where higher zoom level tiles only partially cover lower zoom level areas:
 
 ```bash
-xearthlayer publish gaps \
+xearthlayer-publish gaps \
   --region na \
   --type ortho \
   [--tile <lat>,<lon>] \
@@ -264,10 +264,10 @@ Tiles are specified using the `--tile <lat>,<lon>` option with integer degree co
 
 ```bash
 # Target the tile at +37°, -118° (Eastern Sierra, CA)
-xearthlayer publish dedupe --region na --tile 37,-118 --dry-run
+xearthlayer-publish dedupe --region na --tile 37,-118 --dry-run
 
 # Target the tile at +48°, -122° (Seattle area)
-xearthlayer publish scan --source /path/to/tiles --tile 48,-122
+xearthlayer-publish scan --source /path/to/tiles --tile 48,-122
 ```
 
 The coordinates map directly to X-Plane's tile naming convention:
@@ -287,16 +287,16 @@ The coordinates map directly to X-Plane's tile naming convention:
 
 ```bash
 # Check overlaps in a specific problem tile (dry run)
-xearthlayer publish dedupe --region na --tile 39,-122 --dry-run
+xearthlayer-publish dedupe --region na --tile 39,-122 --dry-run
 
 # Fix overlaps in a single tile
-xearthlayer publish dedupe --region na --tile 39,-122 --priority highest
+xearthlayer-publish dedupe --region na --tile 39,-122 --priority highest
 
 # Scan a specific tile from Ortho4XP source
-xearthlayer publish scan --source ~/Ortho4XP/Tiles --tile 47,-123
+xearthlayer-publish scan --source ~/Ortho4XP/Tiles --tile 47,-123
 
 # Build with deduplication for only one tile (testing)
-xearthlayer publish build --region na --dedupe --tile 39,-122
+xearthlayer-publish build --region na --dedupe --tile 39,-122
 ```
 
 ### Tile Selection Logic
@@ -405,13 +405,13 @@ Partial Overlaps (no action taken): 12
 
 ```bash
 # Print to console (default)
-xearthlayer publish dedupe --region na
+xearthlayer-publish dedupe --region na
 
 # Save to file
-xearthlayer publish dedupe --region na --report dedupe-report.txt
+xearthlayer-publish dedupe --region na --report dedupe-report.txt
 
 # JSON format for programmatic use
-xearthlayer publish dedupe --region na --report-format json
+xearthlayer-publish dedupe --region na --report-format json
 ```
 
 ## Architecture
@@ -684,11 +684,11 @@ pub trait PublisherService: Send + Sync {
 ```
 Ortho4XP/Tiles/          (SOURCE - never touched)
        ↓
-xearthlayer publish add --dedupe
+xearthlayer-publish add --dedupe
        ↓
 packages/zzXEL_na_ortho/ (PACKAGE - deduped on import)
        ↓
-xearthlayer publish build
+xearthlayer-publish build
        ↓
 dist/zzXEL_na-*.tar.gz   (ARCHIVE - clean output)
 ```

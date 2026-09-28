@@ -4828,7 +4828,6 @@ dependencies = [
  "tracing",
  "xearthlayer",
  "xearthlayer-package",
- "xearthlayer-publisher",
 ]
 
 [[package]]
@@ -4837,6 +4836,18 @@ version = "0.5.0-dev.0"
 dependencies = [
  "chrono",
  "semver",
+]
+
+[[package]]
+name = "xearthlayer-publish"
+version = "0.5.0-dev.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "semver",
+ "tempfile",
+ "xearthlayer-package",
+ "xearthlayer-publisher",
 ]
 
 [[package]]

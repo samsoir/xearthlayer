@@ -1,7 +1,13 @@
-//! Publisher CLI commands for creating and managing scenery packages.
+//! `xearthlayer-publish`: create and publish XEarthLayer scenery packages.
 //!
-//! This module implements the Command Pattern with trait-based dependency
-//! injection, providing a clean separation of concerns:
+//! Publishing is its own binary rather than a subcommand of `xearthlayer`
+//! (#284). The two are separate domains joined only by the package format,
+//! which the `xearthlayer-package` crate carries for both, so a publisher's
+//! machine needs none of the streaming runtime and the runtime links none of
+//! the publisher's dependencies.
+//!
+//! The command layer implements the Command Pattern with trait-based
+//! dependency injection:
 //!
 //! - `traits`: Core interfaces (`Output`, `PublisherService`, `CommandHandler`)
 //! - `services`: Concrete implementations of the traits
@@ -9,31 +15,12 @@
 //! - `handlers`: Command handlers implementing business logic
 //! - `output`: Shared output formatting utilities
 //!
-//! # Architecture
-//!
-//! Each command handler:
-//! - Implements the `CommandHandler` trait
-//! - Depends only on trait interfaces via `CommandContext`
-//! - Can be tested in isolation with mock implementations
-//!
-//! # Example
-//!
-//! ```ignore
-//! // Production usage (in main dispatch)
-//! let output = ConsoleOutput::new();
-//! let publisher = DefaultPublisherService::new();
-//! let ctx = CommandContext::new(&output, &publisher);
-//! InitHandler::execute(args, &ctx)?;
-//!
-//! // Test usage
-//! let output = MockOutput::new();
-//! let publisher = MockPublisherService::new();
-//! let ctx = CommandContext::new(&output, &publisher);
-//! InitHandler::execute(args, &ctx)?;
-//! assert!(output.contains("Initialized"));
-//! ```
+//! Each command handler implements the `CommandHandler` trait, depends only on
+//! trait interfaces via `CommandContext`, and can be tested in isolation with
+//! mock implementations (see `tests`).
 
 mod args;
+mod error;
 mod handlers;
 mod output;
 mod services;
@@ -42,30 +29,49 @@ mod traits;
 #[cfg(test)]
 mod tests;
 
-// Re-export public types
-pub use args::PublishCommands;
-pub use handlers::{
+use std::process::ExitCode;
+
+use clap::Parser;
+
+use args::{
+    AddArgs, BuildArgs, CoverageArgs, DedupeArgs, GapsArgs, InitArgs, ListArgs, PublishCommands,
+    ReleaseArgs, ScanArgs, StatusArgs, UrlsArgs, ValidateArgs, VersionArgs,
+};
+use error::CliError;
+use handlers::{
     AddHandler, BuildHandler, CoverageHandler, DedupeHandler, GapsHandler, InitHandler,
     ListHandler, ReleaseHandler, ScanHandler, StatusHandler, UrlsHandler, ValidateHandler,
     VersionHandler,
 };
-pub use services::{ConsoleOutput, DefaultPublisherService};
-pub use traits::CommandHandler;
+use services::{ConsoleOutput, DefaultPublisherService};
+use traits::{CommandContext, CommandHandler};
 
-use args::{
-    AddArgs, BuildArgs, CoverageArgs, DedupeArgs, GapsArgs, InitArgs, ListArgs, ReleaseArgs,
-    ScanArgs, StatusArgs, UrlsArgs, ValidateArgs, VersionArgs,
-};
-use traits::CommandContext;
+/// Create and publish XEarthLayer scenery packages.
+#[derive(Parser)]
+#[command(name = "xearthlayer-publish")]
+#[command(version)]
+#[command(about = "Create and publish XEarthLayer scenery packages", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: PublishCommands,
+}
 
-use crate::error::CliError;
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    // Returning ExitCode rather than calling process::exit lets destructors
+    // run, the same discipline as the xearthlayer binary (#194).
+    match run(cli.command) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => ExitCode::from(e.report()),
+    }
+}
 
 /// Run a publish subcommand.
 ///
-/// This is the main entry point for publish commands. It creates the
-/// production context with real implementations and dispatches to the
-/// appropriate handler.
-pub fn run(command: PublishCommands) -> Result<(), CliError> {
+/// Creates the production context with real implementations and dispatches
+/// to the appropriate handler.
+fn run(command: PublishCommands) -> Result<(), CliError> {
     // Create production context
     let output = ConsoleOutput::new();
     let publisher = DefaultPublisherService::new();
@@ -253,5 +259,47 @@ pub fn run(command: PublishCommands) -> Result<(), CliError> {
             },
             &ctx,
         ),
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    /// Every subcommand `xearthlayer publish` offered, and none it did not.
+    const SUBCOMMANDS: [&str; 13] = [
+        "init", "scan", "add", "list", "build", "urls", "version", "release", "status", "validate",
+        "coverage", "dedupe", "gaps",
+    ];
+
+    #[test]
+    fn the_binary_offers_every_publish_subcommand() {
+        let command = Cli::command();
+        let mut offered: Vec<&str> = command.get_subcommands().map(|c| c.get_name()).collect();
+        offered.sort_unstable();
+        let mut expected = SUBCOMMANDS.to_vec();
+        expected.sort_unstable();
+
+        assert_eq!(offered, expected);
+    }
+
+    #[test]
+    fn an_unknown_subcommand_is_rejected_by_name() {
+        let Err(err) = <Cli as clap::Parser>::try_parse_from(["xearthlayer-publish", "deploy"])
+        else {
+            panic!("unknown subcommand must not parse");
+        };
+
+        assert!(
+            err.to_string().contains("deploy"),
+            "the error should name the unrecognised subcommand: {err}"
+        );
+    }
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
     }
 }

@@ -16,7 +16,7 @@ The publishing workflow:
 ## Prerequisites
 
 - Ortho4XP-generated scenery tiles
-- XEarthLayer CLI installed
+- `xearthlayer-publish` installed. It ships as its own package, separate from the `xearthlayer` runtime, and needs neither X-Plane nor FUSE on the machine that builds packages
 - Web hosting for distributing packages (any HTTP server, CDN, or cloud storage)
 
 ## Step 1: Generate Tiles with Ortho4XP
@@ -48,7 +48,7 @@ Create a package repository to manage your packages:
 
 ```bash
 cd /path/to/my-scenery-packages
-xearthlayer publish init
+xearthlayer-publish init
 ```
 
 Output:
@@ -70,10 +70,10 @@ Preview what tiles will be included before adding them:
 
 ```bash
 # Scan ortho tiles (default)
-xearthlayer publish scan --source /path/to/Ortho4XP_Tiles
+xearthlayer-publish scan --source /path/to/Ortho4XP_Tiles
 
 # Scan overlay tiles
-xearthlayer publish scan --source /path/to/Overlay_Tiles --type overlay
+xearthlayer-publish scan --source /path/to/Overlay_Tiles --type overlay
 ```
 
 Output:
@@ -101,13 +101,13 @@ Suggested region: EUR (Europe)
 Create a package from the scanned tiles:
 
 ```bash
-xearthlayer publish add --source /path/to/Ortho4XP_Tiles --region eu-paris
+xearthlayer-publish add --source /path/to/Ortho4XP_Tiles --region eu-paris
 ```
 
 For overlay packages:
 
 ```bash
-xearthlayer publish add --source /path/to/Overlay_Tiles --region eu-paris --type overlay
+xearthlayer-publish add --source /path/to/Overlay_Tiles --region eu-paris --type overlay
 ```
 
 Output:
@@ -137,7 +137,7 @@ Package created successfully!
   Location: ./packages/zzXEL_eu-paris_ortho
 
 Next steps:
-  1. Run 'xearthlayer publish build --region eu-paris --type ortho' to create archives
+  1. Run 'xearthlayer-publish build --region eu-paris --type ortho' to create archives
 ```
 
 **Note:** DDS texture files are intentionally skipped - XEarthLayer streams these on-demand.
@@ -153,7 +153,7 @@ If your Ortho4XP tiles include multiple zoom levels (e.g., ZL16 base with ZL18 a
 The scan command automatically reports zoom level overlaps:
 
 ```bash
-xearthlayer publish scan --source /path/to/Ortho4XP_Tiles
+xearthlayer-publish scan --source /path/to/Ortho4XP_Tiles
 ```
 
 Output includes:
@@ -176,7 +176,7 @@ Recommendation:
 Before deduplicating, check if your ZL18 coverage is complete:
 
 ```bash
-xearthlayer publish gaps --region eu-paris --type ortho
+xearthlayer-publish gaps --region eu-paris --type ortho
 ```
 
 Output:
@@ -200,7 +200,7 @@ Estimated download: ~4.8 GB (to generate missing tiles)
 Generate coordinates for Ortho4XP to regenerate missing tiles:
 
 ```bash
-xearthlayer publish gaps --region eu-paris --type ortho \
+xearthlayer-publish gaps --region eu-paris --type ortho \
   --format ortho4xp --output missing_tiles.txt
 ```
 
@@ -212,10 +212,10 @@ Remove redundant lower-resolution tiles where higher-resolution exists:
 
 ```bash
 # Preview what would be removed (dry run)
-xearthlayer publish dedupe --region eu-paris --type ortho --dry-run
+xearthlayer-publish dedupe --region eu-paris --type ortho --dry-run
 
 # Actually remove redundant tiles
-xearthlayer publish dedupe --region eu-paris --type ortho
+xearthlayer-publish dedupe --region eu-paris --type ortho
 ```
 
 Options:
@@ -231,7 +231,7 @@ Options:
 Create distributable archive files:
 
 ```bash
-xearthlayer publish build --region eu-paris --type ortho
+xearthlayer-publish build --region eu-paris --type ortho
 ```
 
 Output:
@@ -252,7 +252,7 @@ Archive parts:
 
 Next steps:
   1. Upload archive parts to your hosting provider
-  2. Run 'xearthlayer publish urls --region eu-paris --type ortho --base-url <url>' to configure URLs
+  2. Run 'xearthlayer-publish urls --region eu-paris --type ortho --base-url <url>' to configure URLs
 ```
 
 Archives are stored in `dist/<region>/<type>/`.
@@ -274,7 +274,7 @@ rsync -av dist/eu-paris/ortho/ user@server:/var/www/packages/eu-paris/ortho/
 Tell XEarthLayer where the archives are hosted:
 
 ```bash
-xearthlayer publish urls --region eu-paris --type ortho \
+xearthlayer-publish urls --region eu-paris --type ortho \
   --base-url https://my-cdn.example.com/packages/eu-paris/ortho
 ```
 
@@ -296,7 +296,7 @@ URLs configured successfully!
 Add the package to your library index:
 
 ```bash
-xearthlayer publish release --region eu-paris --type ortho \
+xearthlayer-publish release --region eu-paris --type ortho \
   --metadata-url https://my-cdn.example.com/packages/eu-paris/metadata.txt
 ```
 
@@ -352,22 +352,22 @@ Before releasing an update:
 
 ```bash
 # Patch version (1.0.0 -> 1.0.1)
-xearthlayer publish version --region eu-paris --type ortho --bump patch
+xearthlayer-publish version --region eu-paris --type ortho --bump patch
 
 # Minor version (1.0.1 -> 1.1.0)
-xearthlayer publish version --region eu-paris --type ortho --bump minor
+xearthlayer-publish version --region eu-paris --type ortho --bump minor
 
 # Major version (1.1.0 -> 2.0.0)
-xearthlayer publish version --region eu-paris --type ortho --bump major
+xearthlayer-publish version --region eu-paris --type ortho --bump major
 ```
 
 Then rebuild and release:
 
 ```bash
-xearthlayer publish build --region eu-paris --type ortho
+xearthlayer-publish build --region eu-paris --type ortho
 # Upload new archives...
-xearthlayer publish urls --region eu-paris --type ortho --base-url <url>
-xearthlayer publish release --region eu-paris --type ortho --metadata-url <url>
+xearthlayer-publish urls --region eu-paris --type ortho --base-url <url>
+xearthlayer-publish release --region eu-paris --type ortho --metadata-url <url>
 # Upload updated library and metadata...
 ```
 
@@ -376,7 +376,7 @@ xearthlayer publish release --region eu-paris --type ortho --metadata-url <url>
 ### List Packages
 
 ```bash
-xearthlayer publish list
+xearthlayer-publish list
 ```
 
 ```
@@ -390,7 +390,7 @@ Packages in repository:
 ### Check Status
 
 ```bash
-xearthlayer publish status
+xearthlayer-publish status
 ```
 
 ```
@@ -415,7 +415,7 @@ EU-ALPS ortho
 Check for issues:
 
 ```bash
-xearthlayer publish validate
+xearthlayer-publish validate
 ```
 
 ## File Formats
@@ -473,7 +473,7 @@ Use clear, consistent region codes:
 The default 500 MB part size works well for most hosting. Adjust with:
 
 ```bash
-xearthlayer publish init --part-size 250MB
+xearthlayer-publish init --part-size 250MB
 ```
 
 Smaller parts are easier to resume on poor connections but require more HTTP requests.

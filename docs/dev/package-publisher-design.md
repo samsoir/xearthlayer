@@ -106,10 +106,10 @@ Part size can be specified with units: `500MB`, `1GB`, `10 MB`, etc.
 Create a new package repository:
 
 ```bash
-xearthlayer publish init /path/to/repo
+xearthlayer-publish init /path/to/repo
 
 # Or in current directory
-xearthlayer publish init .
+xearthlayer-publish init .
 ```
 
 Creates:
@@ -122,7 +122,7 @@ Creates:
 Import Ortho4XP tiles into a regional package:
 
 ```bash
-xearthlayer publish add \
+xearthlayer-publish add \
   --source /path/to/Ortho4XP/Tiles \
   --region na \
   --type ortho \
@@ -144,7 +144,7 @@ Processing steps:
 Create distributable archives:
 
 ```bash
-xearthlayer publish build --region na --type ortho
+xearthlayer-publish build --region na --type ortho
 ```
 
 Steps:
@@ -159,7 +159,7 @@ Steps:
 Set download URLs for the package:
 
 ```bash
-xearthlayer publish urls \
+xearthlayer-publish urls \
   --region na \
   --type ortho \
   --base-url https://dl.example.com/packages/na/ortho/
@@ -172,7 +172,7 @@ Updates metadata file with actual download URLs.
 Finalize and update library index:
 
 ```bash
-xearthlayer publish release
+xearthlayer-publish release
 ```
 
 Steps:
@@ -284,10 +284,10 @@ Each package has independent semantic version:
 
 ```bash
 # Bump version when adding tiles
-xearthlayer publish version --region na --type ortho --bump minor
+xearthlayer-publish version --region na --type ortho --bump minor
 
 # Or set explicitly
-xearthlayer publish version --region na --type ortho --set 2.0.0
+xearthlayer-publish version --region na --type ortho --set 2.0.0
 ```
 
 ### Library Sequence
@@ -306,13 +306,13 @@ Clients can quickly check `sequence > cached_sequence` to know if updates exist.
 
 ```bash
 # Initialize repository
-xearthlayer publish init [<path>] [--part-size <size>]
+xearthlayer-publish init [<path>] [--part-size <size>]
 
 # Scan Ortho4XP output and report tile information
-xearthlayer publish scan --source <ortho4xp_tiles_path>
+xearthlayer-publish scan --source <ortho4xp_tiles_path>
 
 # Add Ortho4XP output to a package
-xearthlayer publish add \
+xearthlayer-publish add \
   --source <ortho4xp_tiles_path> \
   --region <region_code> \
   [--type <ortho|overlay>] \
@@ -320,16 +320,16 @@ xearthlayer publish add \
   [--repo <path>]
 
 # List packages in repository
-xearthlayer publish list [<repo_path>] [--verbose]
+xearthlayer-publish list [<repo_path>] [--verbose]
 
 # Build archives for a package
-xearthlayer publish build \
+xearthlayer-publish build \
   --region <region_code> \
   [--type <ortho|overlay>] \
   [--repo <path>]
 
 # Set download URLs
-xearthlayer publish urls \
+xearthlayer-publish urls \
   --region <region_code> \
   [--type <ortho|overlay>] \
   --base-url <url> \
@@ -337,30 +337,30 @@ xearthlayer publish urls \
   [--repo <path>]
 
 # Bump or set version
-xearthlayer publish version \
+xearthlayer-publish version \
   --region <region_code> \
   [--type <ortho|overlay>] \
   <--bump major|minor|patch | --set <version>> \
   [--repo <path>]
 
 # Finalize and update library index
-xearthlayer publish release \
+xearthlayer-publish release \
   --region <region_code> \
   [--type <ortho|overlay>] \
   --metadata-url <url> \
   [--repo <path>]
 
 # Show package release status
-xearthlayer publish status \
+xearthlayer-publish status \
   [--region <region_code>] \
   [--type <ortho|overlay>] \
   [<repo_path>]
 
 # Validate repository integrity
-xearthlayer publish validate [<repo_path>]
+xearthlayer-publish validate [<repo_path>]
 
 # Analyze coverage gaps (incomplete ZL18 coverage over ZL16)
-xearthlayer publish gaps \
+xearthlayer-publish gaps \
   --region <region_code> \
   [--type <ortho|overlay>] \
   [--tile <lat,lon>] \
@@ -369,7 +369,7 @@ xearthlayer publish gaps \
   [<repo_path>]
 
 # Remove overlapping zoom level tiles
-xearthlayer publish dedupe \
+xearthlayer-publish dedupe \
   --region <region_code> \
   [--type <ortho|overlay>] \
   [--priority <highest|lowest|zl##>] \
@@ -388,7 +388,7 @@ The CLI is implemented using the **Command Pattern** with **trait-based dependen
 xearthlayer-cli/src/commands/publish/
 ├── mod.rs        # Module exports and command dispatch
 ├── traits.rs     # Core interfaces (Output, PublisherService, CommandHandler)
-├── services.rs   # Concrete implementations wrapping xearthlayer publisher
+├── services.rs   # Concrete implementations wrapping xearthlayer-publisher
 ├── args.rs       # CLI argument types and parsing (clap-derived)
 ├── handlers.rs   # Command handlers implementing business logic
 └── output.rs     # Shared output formatting utilities
@@ -452,10 +452,10 @@ assert!(output.contains("Initialized"));
 ### Output Examples
 
 ```
-$ xearthlayer publish init ~/scenery-repo
+$ xearthlayer-publish init ~/scenery-repo
 Initialized XEarthLayer package repository at /home/user/scenery-repo
 
-$ xearthlayer publish add --source ~/Ortho4XP/Tiles --region na --type ortho --version 1.0.0
+$ xearthlayer-publish add --source ~/Ortho4XP/Tiles --region na --type ortho --version 1.0.0
 Scanning Ortho4XP output...
 Found 45 tiles in /home/user/Ortho4XP/Tiles
 
@@ -467,7 +467,7 @@ Processing tiles:
 Removed 12,456 DDS files (saving 45.2 GB in package)
 Created package: zzXEL_na_ortho v1.0.0
 
-$ xearthlayer publish build --region na --type ortho
+$ xearthlayer-publish build --region na --type ortho
 Creating archive...
   Compressing: 2.3 GB → 1.8 GB (22% reduction)
   Splitting into 2 parts (1 GB each)
@@ -476,10 +476,10 @@ Generated:
   dist/zzXEL_na-1.0.0.tar.gz.aa (1.0 GB) SHA256: 55e772c1...
   dist/zzXEL_na-1.0.0.tar.gz.ab (0.8 GB) SHA256: b91f75f9...
 
-$ xearthlayer publish urls --region na --type ortho --base-url https://dl.example.com/na/
+$ xearthlayer-publish urls --region na --type ortho --base-url https://dl.example.com/na/
 Updated URLs in zzXEL_na_ortho metadata
 
-$ xearthlayer publish release
+$ xearthlayer-publish release
 Updating library index...
   Sequence: 0 → 1
   Packages: 1
@@ -646,7 +646,7 @@ git add .
 git commit -m "Initial repository"
 
 # After changes
-xearthlayer publish release
+xearthlayer-publish release
 git add .
 git commit -m "Release: NA ortho 1.0.0"
 git push
