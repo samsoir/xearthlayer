@@ -11,8 +11,8 @@ makedepends=('rust' 'cargo' 'git')
 optdepends=(
     'xplane12: X-Plane 12 flight simulator'
 )
-provides=("xearthlayer=${pkgver#r}")
-conflicts=('xearthlayer')
+provides=("xearthlayer=${pkgver#r}" "xearthlayer-publish=${pkgver#r}")
+conflicts=('xearthlayer' 'xearthlayer-publish')
 options=(!lto)
 source=("$pkgname::git+$url.git")
 sha256sums=('SKIP')
@@ -44,12 +44,15 @@ check() {
 package() {
     cd "$pkgname"
 
-    # Install binary
+    # Install binaries. The stable package splits these two (#284); the
+    # development build carries both and provides both.
     install -Dm755 "target/release/xearthlayer" "$pkgdir/usr/bin/xearthlayer"
+    install -Dm755 "target/release/xearthlayer-publish" "$pkgdir/usr/bin/xearthlayer-publish"
 
     # Install license
     install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 
     # Install documentation
     install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 "docs/content-publishing.md" "$pkgdir/usr/share/doc/$pkgname/content-publishing.md"
 }

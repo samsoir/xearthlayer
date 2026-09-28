@@ -6,7 +6,8 @@ This runbook documents the complete workflow for releasing new versions of XEart
 
 Releases are automated via GitHub Actions when a version tag (`v*`) is pushed. The workflow:
 1. Runs `make verify` (format, lint, test)
-2. Builds the release binary once
+2. Builds the release binaries once (`xearthlayer` and `xearthlayer-publish`, which
+   ships as its own artifact on every channel; see #284)
 3. Packages for multiple platforms (Linux tarball, macOS tarball, Debian, RPM, AUR) —
    the Debian/RPM/AUR packages are **stable releases only**; pre-release tags ship the
    Linux and macOS tarballs alone

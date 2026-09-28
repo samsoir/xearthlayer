@@ -15,6 +15,28 @@ categories = ["command-line-utilities"]
 name = "xearthlayer-publish"
 path = "src/main.rs"
 
+# cargo-deb configuration. A separate package from `xearthlayer` on purpose
+# (#284): installing the runtime must not install publishing tools, and this
+# binary needs no FUSE.
+[package.metadata.deb]
+name = "xearthlayer-publish"
+maintainer = "Sam de Freyssinet <sam@def.reyssi.net>"
+copyright = "2025, XEarthLayer Contributors"
+license-file = ["../LICENSE", "0"]
+extended-description = """\
+xearthlayer-publish creates distributable XEarthLayer scenery packages from \
+Ortho4XP output: repository management, archive building and splitting, \
+versioning, release to a package library, coverage maps and zoom level dedupe. \
+It shares the package format with xearthlayer and nothing else."""
+depends = "$auto"
+section = "games"
+priority = "optional"
+assets = [
+    ["target/release/xearthlayer-publish", "usr/bin/", "755"],
+    ["../docs/content-publishing.md", "usr/share/doc/xearthlayer-publish/content-publishing.md", "644"],
+    ["../LICENSE", "usr/share/doc/xearthlayer-publish/LICENSE", "644"],
+]
+
 [dependencies]
 xearthlayer-package = { path = "../xearthlayer-package" }
 xearthlayer-publisher = { path = "../xearthlayer-publisher" }

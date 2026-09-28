@@ -212,6 +212,13 @@ on macOS. macFUSE is required only at runtime.
 `verify` classifies the tag and emits a `prerelease` output; `package-deb`,
 `build-rpm` and `prepare-aur` are gated on it.
 
+Every channel carries `xearthlayer-publish` as well, as its own artifact (#284): a
+second tarball on Linux and macOS, a second `.deb` from `xearthlayer-publish/Cargo.toml`'s
+cargo-deb metadata, an RPM subpackage from the same spec, and a split package from the
+one PKGBUILD (`pkgbase=xearthlayer`, two `pkgname`s). `build-binary` produces both
+binaries in one build and the glibc floor check runs on each. The publisher is not a
+dependency of the runtime package on any channel; the meta-package relationship is #146.
+
 **Why those three are stable-only — do not "fix" this.** It is not policy, it is a
 format constraint. RPM uses `-` to delimit `Version` from `Release`, so
 `Version: 0.5.0-dev.1` is malformed. Arch's `pkgver` forbids hyphens outright. Neither

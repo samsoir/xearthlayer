@@ -30,6 +30,18 @@ Features:
 - Works with Ortho4XP-generated scenery
 - Linux support (Windows and macOS planned)
 
+# Publishing tools are a separate package (#284). They need neither FUSE nor
+# X-Plane, and a flight simulator user installing xearthlayer should not pull
+# in a map renderer and a second TLS stack to build packages they never will.
+%package        publish
+Summary:        Create, build and release XEarthLayer scenery packages
+
+%description    publish
+xearthlayer-publish creates distributable XEarthLayer scenery packages from
+Ortho4XP output: repository management, archive building and splitting,
+versioning, release to a package library, coverage maps and zoom level
+dedupe. It shares the package format with xearthlayer and nothing else.
+
 %prep
 %autosetup
 
@@ -38,6 +50,7 @@ cargo build --release --locked
 
 %install
 install -Dm755 target/release/xearthlayer %{buildroot}%{_bindir}/xearthlayer
+install -Dm755 target/release/xearthlayer-publish %{buildroot}%{_bindir}/xearthlayer-publish
 install -Dm644 LICENSE %{buildroot}%{_licensedir}/%{name}/LICENSE
 install -Dm644 README.md %{buildroot}%{_docdir}/%{name}/README.md
 
@@ -45,6 +58,11 @@ install -Dm644 README.md %{buildroot}%{_docdir}/%{name}/README.md
 %license LICENSE
 %doc README.md
 %{_bindir}/xearthlayer
+
+%files publish
+%license LICENSE
+%doc docs/content-publishing.md
+%{_bindir}/xearthlayer-publish
 
 %changelog
 * Mon Dec 15 2025 Sam de Freyssinet <sam@def.reyssi.net> - 0.2.0-1

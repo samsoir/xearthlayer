@@ -79,7 +79,7 @@ jobs:
       - name: Run make verify
         run: make verify
 
-  # Build the release binary once for reuse across Linux tarball and Debian package
+  # Build the release binaries once for reuse across Linux tarballs and Debian packages
   build-binary:
     name: Build Release Binary
     runs-on: ubuntu-latest
@@ -113,7 +113,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
+      # One build produces both binaries: the runtime and xearthlayer-publish
+      # (#284). They are packaged separately below.
+      - name: Build release binaries
         run: cargo build --release
 
       # Fails the release rather than shipping a binary that cannot start on
@@ -121,21 +123,25 @@ jobs:
       # first report arrives from a user who cannot run the program at all.
       - name: Verify glibc compatibility floor
         run: |
-          MAX=$(objdump -T target/release/xearthlayer \
-            | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' \
-            | sed 's/GLIBC_//' | sort -V -u | tail -1)
-          echo "Highest required glibc symbol: $MAX (floor: $GLIBC_FLOOR)"
-          if [ "$(printf '%s\n%s\n' "$MAX" "$GLIBC_FLOOR" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
-            echo "::error::Binary requires glibc $MAX, above the supported floor $GLIBC_FLOOR."
-            echo "::error::It will not start on Ubuntu 22.04, Debian 12 or RHEL 9."
-            exit 1
-          fi
+          for bin in xearthlayer xearthlayer-publish; do
+            MAX=$(objdump -T "target/release/$bin" \
+              | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' \
+              | sed 's/GLIBC_//' | sort -V -u | tail -1)
+            echo "$bin: highest required glibc symbol: $MAX (floor: $GLIBC_FLOOR)"
+            if [ "$(printf '%s\n%s\n' "$MAX" "$GLIBC_FLOOR" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
+              echo "::error::$bin requires glibc $MAX, above the supported floor $GLIBC_FLOOR."
+              echo "::error::It will not start on Ubuntu 22.04, Debian 12 or RHEL 9."
+              exit 1
+            fi
+          done
 
-      - name: Upload binary artifact
+      - name: Upload binary artifacts
         uses: actions/upload-artifact@v7
         with:
           name: release-binary
-          path: target/release/xearthlayer
+          path: |
+            target/release/xearthlayer
+            target/release/xearthlayer-publish
 
   # Package Linux binary tarball (uses pre-built binary)
   package-linux:
@@ -151,16 +157,19 @@ jobs:
           name: release-binary
           path: target/release
 
-      - name: Package binary
+      # Two tarballs: the runtime as before, and the publisher on its own so a
+      # flight simulator user downloads a streaming service and a publisher
+      # downloads publishing tools (#284).
+      - name: Package binaries
         env:
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
         run: |
-          chmod +x target/release/xearthlayer
+          chmod +x target/release/xearthlayer target/release/xearthlayer-publish
           mkdir -p dist
-          cp target/release/xearthlayer dist/
-          cp README.md LICENSE dist/
-          cd dist
-          tar czvf xearthlayer-${RELEASE_TAG}-x86_64-linux.tar.gz xearthlayer README.md LICENSE
+          cp target/release/xearthlayer README.md LICENSE dist/
+          (cd dist && tar czvf xearthlayer-${RELEASE_TAG}-x86_64-linux.tar.gz xearthlayer README.md LICENSE)
+          cp target/release/xearthlayer-publish docs/content-publishing.md dist/
+          (cd dist && tar czvf xearthlayer-publish-${RELEASE_TAG}-x86_64-linux.tar.gz xearthlayer-publish content-publishing.md LICENSE)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -193,15 +202,15 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-      - name: Package binary
+      - name: Package binaries
         env:
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
         run: |
           mkdir -p dist
-          cp target/release/xearthlayer dist/
-          cp README.md LICENSE dist/
-          cd dist
-          tar czvf xearthlayer-${RELEASE_TAG}-arm64-macos.tar.gz xearthlayer README.md LICENSE
+          cp target/release/xearthlayer README.md LICENSE dist/
+          (cd dist && tar czvf xearthlayer-${RELEASE_TAG}-arm64-macos.tar.gz xearthlayer README.md LICENSE)
+          cp target/release/xearthlayer-publish docs/content-publishing.md dist/
+          (cd dist && tar czvf xearthlayer-publish-${RELEASE_TAG}-arm64-macos.tar.gz xearthlayer-publish content-publishing.md LICENSE)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -209,7 +218,7 @@ jobs:
           name: macos-binary
           path: dist/*.tar.gz
 
-  # Build .deb package for Debian/Ubuntu (uses pre-built binary)
+  # Build .deb packages for Debian/Ubuntu (uses pre-built binaries)
   # Stable releases only — previews ship the Linux tarball only.
   package-deb:
     name: Package Debian Package
@@ -227,18 +236,20 @@ jobs:
           name: release-binary
           path: target/release
 
-      - name: Make binary executable
-        run: chmod +x target/release/xearthlayer
+      - name: Make binaries executable
+        run: chmod +x target/release/xearthlayer target/release/xearthlayer-publish
 
       - name: Install cargo-deb
         run: cargo install cargo-deb
 
-      - name: Build .deb package
+      # Two packages from one build. The meta-package relationship is #146's;
+      # here xearthlayer-publish is simply its own .deb (#284).
+      - name: Build .deb packages
         run: |
-          cd xearthlayer-cli
-          cargo deb --no-build
-          mkdir -p ../dist
-          cp ../target/debian/*.deb ../dist/
+          (cd xearthlayer-cli && cargo deb --no-build)
+          (cd xearthlayer-publish && cargo deb --no-build)
+          mkdir -p dist
+          cp target/debian/*.deb dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

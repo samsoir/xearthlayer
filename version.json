@@ -23,6 +23,22 @@
     "aur": {
       "filename": "aur-package.zip",
       "description": "Arch Linux AUR package"
+    },
+    "publish_deb": {
+      "filename": "xearthlayer-publish_0.5.0-dev.0-1_amd64.deb",
+      "description": "Publishing tools, Debian/Ubuntu package"
+    },
+    "publish_rpm": {
+      "filename": "xearthlayer-publish-0.5.0-dev.0-1.fc44.x86_64.rpm",
+      "description": "Publishing tools, Fedora/RHEL package"
+    },
+    "publish_tarball": {
+      "filename": "xearthlayer-publish-v0.5.0-dev.0-x86_64-linux.tar.gz",
+      "description": "Publishing tools, Linux binary tarball"
+    },
+    "publish_macos_tarball": {
+      "filename": "xearthlayer-publish-v0.5.0-dev.0-arm64-macos.tar.gz",
+      "description": "Publishing tools, macOS (Apple Silicon) binary tarball"
     }
   },
   "download_base_url": "https://github.com/samsoir/xearthlayer/releases/download/v0.5.0-dev.0"
