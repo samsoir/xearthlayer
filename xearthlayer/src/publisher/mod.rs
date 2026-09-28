@@ -26,7 +26,7 @@
 //!
 //! ```ignore
 //! use xearthlayer::publisher::{Repository, SceneryProcessor, Ortho4XPProcessor};
-//! use xearthlayer::package::PackageType;
+//! use xearthlayer_package::PackageType;
 //!
 //! // Initialize repository
 //! let repo = Repository::init("/path/to/repo")?;

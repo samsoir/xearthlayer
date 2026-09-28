@@ -1295,13 +1295,13 @@ mod tests {
     use crate::coord::TileCoord;
     use crate::executor::{DdsClientError, Priority};
     use crate::ortho_union::OrthoUnionIndexBuilder;
-    use crate::package::{InstalledPackage, Package, PackageType};
     use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
     use semver::Version;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
+    use xearthlayer_package::{InstalledPackage, Package, PackageType};
 
     /// Mock DdsClient for testing
     struct MockDdsClient {

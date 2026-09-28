@@ -12,6 +12,7 @@ name = "xearthlayer"
 path = "src/lib.rs"
 
 [dependencies]
+xearthlayer-package = { path = "../xearthlayer-package" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs", "macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 image = "0.25"
@@ -30,8 +31,8 @@ regex = "1.10"
 thiserror = "1.0"
 dirs = "5.0"
 rust-ini = "0.21"
-semver = "1.0"
-chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+semver.workspace = true
+chrono.workspace = true
 sha2 = "0.10"
 futures = "0.3"
 bytes = "1.11.0"

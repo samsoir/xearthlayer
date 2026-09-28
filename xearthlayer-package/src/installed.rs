@@ -23,7 +23,7 @@ use super::core::Package;
 ///
 /// ```
 /// use semver::Version;
-/// use xearthlayer::package::{Package, InstalledPackage, PackageType};
+/// use xearthlayer_package::{Package, InstalledPackage, PackageType};
 ///
 /// let package = Package::new("na", PackageType::Ortho, Version::new(1, 0, 0));
 /// let installed = InstalledPackage::new(package, "/path/to/na_ortho");
@@ -58,7 +58,7 @@ impl InstalledPackage {
     ///
     /// ```
     /// use semver::Version;
-    /// use xearthlayer::package::{Package, InstalledPackage, PackageType};
+    /// use xearthlayer_package::{Package, InstalledPackage, PackageType};
     ///
     /// let package = Package::new("na", PackageType::Ortho, Version::new(1, 0, 0));
     /// let installed = InstalledPackage::new(package, "/path/to/package");
@@ -79,7 +79,7 @@ impl InstalledPackage {
     ///
     /// ```
     /// use semver::Version;
-    /// use xearthlayer::package::{Package, InstalledPackage, PackageType};
+    /// use xearthlayer_package::{Package, InstalledPackage, PackageType};
     ///
     /// let package = Package::new("na", PackageType::Ortho, Version::new(1, 0, 0));
     /// let installed = InstalledPackage::new_disabled(package, "/path/to/package");
@@ -100,7 +100,7 @@ impl InstalledPackage {
     ///
     /// ```
     /// use semver::Version;
-    /// use xearthlayer::package::{Package, InstalledPackage, PackageType};
+    /// use xearthlayer_package::{Package, InstalledPackage, PackageType};
     ///
     /// let package = Package::new("na", PackageType::Ortho, Version::new(1, 0, 0));
     /// let installed = InstalledPackage::new(package, "/path")
@@ -159,7 +159,7 @@ mod tests {
     use semver::Version;
 
     use super::*;
-    use crate::package::PackageType;
+    use crate::PackageType;
 
     fn test_package() -> Package {
         Package::new("na", PackageType::Ortho, Version::new(1, 0, 0))

@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use semver::Version;
 
 use super::{PublishError, PublishResult};
-use crate::package::{self, PackageType};
+use xearthlayer_package::{self as package, PackageType};
 
 /// Repository marker filename.
 const REPO_MARKER: &str = ".xearthlayer-repo";

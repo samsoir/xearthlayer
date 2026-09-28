@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "xearthlayer",
     "xearthlayer-cli",
+    "xearthlayer-package",
 ]
 
 [workspace.package]
@@ -22,4 +23,7 @@ rust-version = "1.97.1"
 repository = "https://github.com/samsoir/xearthlayer"
 
 [workspace.dependencies]
-# Shared dependencies will be added here as needed
+# Dependencies used by two or more workspace crates are declared once here so
+# their versions cannot drift between manifests.
+semver = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

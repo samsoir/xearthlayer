@@ -12,13 +12,13 @@ use super::args::*;
 use super::handlers::*;
 use super::traits::*;
 use crate::error::CliError;
-use xearthlayer::package::{ArchivePart, PackageMetadata, PackageType};
 use xearthlayer::publisher::dedupe::{DedupeFilter, GapAnalysisResult, ZoomPriority};
 use xearthlayer::publisher::{
     ArchiveBuildResult, BuildResult, ProcessSummary, RegionSuggestion, ReleaseResult,
     ReleaseStatus, RepoConfig, SceneryScanResult, SuggestedRegion, TileInfo, UrlConfigResult,
     VersionBump,
 };
+use xearthlayer_package::{ArchivePart, PackageMetadata, PackageType};
 
 use chrono::Utc;
 

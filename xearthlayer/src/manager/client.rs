@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use reqwest::blocking::Client;
 
-use crate::package::{
+use xearthlayer_package::{
     parse_package_library, parse_package_metadata, PackageLibrary, PackageMetadata,
 };
 

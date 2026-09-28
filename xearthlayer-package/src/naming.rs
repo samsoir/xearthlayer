@@ -26,7 +26,7 @@ use super::PackageType;
 /// # Examples
 ///
 /// ```
-/// use xearthlayer::package::{PackageType, package_mountpoint};
+/// use xearthlayer_package::{PackageType, package_mountpoint};
 ///
 /// assert_eq!(package_mountpoint("na", PackageType::Ortho), "zzXEL_na_ortho");
 /// assert_eq!(package_mountpoint("EU", PackageType::Ortho), "zzXEL_eu_ortho");
@@ -53,7 +53,7 @@ pub fn package_mountpoint(region: &str, package_type: PackageType) -> String {
 ///
 /// ```
 /// use semver::Version;
-/// use xearthlayer::package::{PackageType, archive_filename};
+/// use xearthlayer_package::{PackageType, archive_filename};
 ///
 /// assert_eq!(
 ///     archive_filename("na", PackageType::Ortho, &Version::new(1, 0, 0)),
@@ -84,7 +84,7 @@ pub fn archive_filename(region: &str, package_type: PackageType, version: &Versi
 ///
 /// ```
 /// use semver::Version;
-/// use xearthlayer::package::{PackageType, archive_part_filename};
+/// use xearthlayer_package::{PackageType, archive_part_filename};
 ///
 /// assert_eq!(
 ///     archive_part_filename("na", PackageType::Ortho, &Version::new(1, 0, 0), "aa"),
@@ -113,7 +113,7 @@ pub fn archive_part_filename(
 ///
 /// ```
 /// use semver::Version;
-/// use xearthlayer::package::update_archive_version;
+/// use xearthlayer_package::update_archive_version;
 ///
 /// assert_eq!(
 ///     update_archive_version("zzXEL_na_ortho-1.0.0.tar.gz", &Version::new(2, 0, 0)),

@@ -11,7 +11,7 @@ use chrono::Utc;
 use semver::Version;
 
 use super::{archive_filename, PublishError, PublishResult, Repository};
-use crate::package::{
+use xearthlayer_package::{
     parse_package_metadata, serialize_package_metadata, update_archive_version, ArchivePart,
     PackageMetadata, PackageType,
 };
@@ -20,7 +20,7 @@ use crate::package::{
 pub const METADATA_FILENAME: &str = "xearthlayer_scenery_package.txt";
 
 /// Default specification version for new packages.
-pub const DEFAULT_SPEC_VERSION: &str = crate::package::CURRENT_SPEC_VERSION;
+pub const DEFAULT_SPEC_VERSION: &str = xearthlayer_package::CURRENT_SPEC_VERSION;
 
 /// Generate initial package metadata.
 ///
@@ -166,7 +166,7 @@ pub fn bump_package_version(
 
 /// Update the version in a filename.
 ///
-/// This is a local alias for [`crate::package::update_archive_version`].
+/// This is a local alias for [`xearthlayer_package::update_archive_version`].
 fn update_filename_version(filename: &str, version: &Version) -> String {
     update_archive_version(filename, version)
 }

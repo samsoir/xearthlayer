@@ -9,7 +9,7 @@ use xearthlayer::manager::{
     InstallResult, InstallStage, InstalledPackage, LocalPackageStore, ManagerResult, PackageInfo,
     PackageStatus,
 };
-use xearthlayer::package::{PackageLibrary, PackageMetadata, PackageType};
+use xearthlayer_package::{PackageLibrary, PackageMetadata, PackageType};
 
 use crate::error::CliError;
 

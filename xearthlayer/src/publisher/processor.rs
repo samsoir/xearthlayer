@@ -8,7 +8,7 @@ use std::fmt;
 use std::path::Path;
 
 use super::{PublishResult, Repository};
-use crate::package::PackageType;
+use xearthlayer_package::PackageType;
 
 mod ortho4xp;
 mod overlay;

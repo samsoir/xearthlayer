@@ -23,7 +23,7 @@ use super::types::PackageType;
 ///
 /// ```
 /// use semver::Version;
-/// use xearthlayer::package::{Package, PackageType};
+/// use xearthlayer_package::{Package, PackageType};
 ///
 /// let package = Package::new("na", PackageType::Ortho, Version::new(1, 0, 0));
 ///
@@ -54,7 +54,7 @@ impl Package {
     ///
     /// ```
     /// use semver::Version;
-    /// use xearthlayer::package::{Package, PackageType};
+    /// use xearthlayer_package::{Package, PackageType};
     ///
     /// let package = Package::new("NA", PackageType::Ortho, Version::new(1, 0, 0));
     /// assert_eq!(package.region, "na"); // Normalized to lowercase
@@ -73,7 +73,7 @@ impl Package {
     ///
     /// ```
     /// use semver::Version;
-    /// use xearthlayer::package::{Package, PackageType};
+    /// use xearthlayer_package::{Package, PackageType};
     ///
     /// let ortho = Package::new("na", PackageType::Ortho, Version::new(1, 0, 0));
     /// let overlay = Package::new("na", PackageType::Overlay, Version::new(1, 0, 0));
@@ -91,7 +91,7 @@ impl Package {
     ///
     /// ```
     /// use semver::Version;
-    /// use xearthlayer::package::{Package, PackageType};
+    /// use xearthlayer_package::{Package, PackageType};
     ///
     /// let ortho = Package::new("na", PackageType::Ortho, Version::new(1, 0, 0));
     /// let overlay = Package::new("na", PackageType::Overlay, Version::new(1, 0, 0));
@@ -112,7 +112,7 @@ impl Package {
     ///
     /// ```
     /// use semver::Version;
-    /// use xearthlayer::package::{Package, PackageType};
+    /// use xearthlayer_package::{Package, PackageType};
     ///
     /// let ortho = Package::new("na", PackageType::Ortho, Version::new(1, 0, 0));
     /// let overlay = Package::new("eu", PackageType::Overlay, Version::new(1, 0, 0));

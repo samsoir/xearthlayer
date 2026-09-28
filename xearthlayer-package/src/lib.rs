@@ -1,4 +1,4 @@
-//! Scenery package management types and parsing.
+//! Scenery package format: metadata, library index, naming and the spec gate.
 //!
 //! This module provides the core data structures for XEarthLayer's scenery
 //! package ecosystem, including package metadata, library index, and version
@@ -34,8 +34,16 @@
 //! - `xearthlayer_scenery_package.txt` - Package metadata (per package)
 //! - `xearthlayer_package_library.txt` - Library index (per publisher)
 //!
-//! See the [Scenery Package Specification](../docs/SCENERY_PACKAGES.md) for
-//! detailed format documentation.
+//! See `docs/dev/scenery-packages.md` in the repository for detailed format
+//! documentation.
+//!
+//! # Why a separate crate
+//!
+//! This is the on-disk contract between the publisher, which writes these
+//! files, and the runtime, which reads them. It holds format knowledge only:
+//! no I/O beyond parsing bytes it is handed, no network, no path discovery.
+//! Every statement the format makes lives here rather than in a caller, so
+//! the two sides cannot drift. A manifest test pins its dependency list.
 
 mod core;
 mod installed;
@@ -67,3 +75,45 @@ pub use naming::{
 
 // Re-export semver::Version for convenience
 pub use semver::Version;
+
+#[cfg(test)]
+mod manifest_tests {
+    //! The contract crate holds format knowledge only. Cargo refuses a cycle
+    //! but not a creeping dependency, so the manifest is asserted directly.
+
+    /// Names declared under `[dependencies]` in this crate's own manifest.
+    fn declared_dependencies() -> Vec<String> {
+        let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+            .expect("crate manifest is readable");
+        manifest
+            .lines()
+            .map(str::trim)
+            .skip_while(|line| *line != "[dependencies]")
+            .skip(1)
+            .take_while(|line| !line.starts_with('['))
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                line.split(['=', '.'])
+                    .next()
+                    .expect("dependency line has a name")
+                    .trim()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn manifest_declares_only_format_dependencies() {
+        // semver for package versions, chrono for the timestamps the metadata
+        // format carries. Anything else means format knowledge is leaking in
+        // from one side of the boundary this crate exists to hold.
+        let mut declared = declared_dependencies();
+        declared.sort();
+
+        assert_eq!(
+            declared,
+            ["chrono", "semver"],
+            "xearthlayer-package may depend only on the crates the format itself needs"
+        );
+    }
+}

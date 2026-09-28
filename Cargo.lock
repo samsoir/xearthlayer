@@ -4804,6 +4804,7 @@ dependencies = [
  "tracing-chrome",
  "tracing-subscriber",
  "wgpu",
+ "xearthlayer-package",
 ]
 
 [[package]]
@@ -4829,6 +4830,15 @@ dependencies = [
  "tokio-util",
  "tracing",
  "xearthlayer",
+ "xearthlayer-package",
+]
+
+[[package]]
+name = "xearthlayer-package"
+version = "0.5.0-dev.0"
+dependencies = [
+ "chrono",
+ "semver",
 ]
 
 [[package]]

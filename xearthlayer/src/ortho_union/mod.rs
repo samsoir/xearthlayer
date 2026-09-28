@@ -47,7 +47,7 @@
 //!
 //! ```ignore
 //! use xearthlayer::ortho_union::OrthoUnionIndexBuilder;
-//! use xearthlayer::package::{Package, InstalledPackage, PackageType};
+//! use xearthlayer_package::{Package, InstalledPackage, PackageType};
 //!
 //! let index = OrthoUnionIndexBuilder::new()
 //!     .with_patches_dir("~/.xearthlayer/patches")

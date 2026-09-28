@@ -15,7 +15,7 @@ use super::library::LibraryManager;
 use super::metadata::{add_archive_parts, read_metadata, write_metadata, METADATA_FILENAME};
 use super::urls::{validate_url, UrlVerifier};
 use super::{PublishError, PublishResult, RepoConfig, Repository};
-use crate::package::PackageType;
+use xearthlayer_package::PackageType;
 
 /// Status of a package in the release workflow.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,7 +135,7 @@ pub fn build_package(
     let parts: Vec<_> = archive
         .parts
         .iter()
-        .map(|p| crate::package::ArchivePart::new(p.checksum.clone(), p.filename.clone(), ""))
+        .map(|p| xearthlayer_package::ArchivePart::new(p.checksum.clone(), p.filename.clone(), ""))
         .collect();
 
     add_archive_parts(&package_dir, parts)?;
@@ -248,7 +248,7 @@ pub fn release_package(
     package_type: PackageType,
     metadata_url: &str,
 ) -> PublishResult<ReleaseResult> {
-    use crate::package::ValidationContext;
+    use xearthlayer_package::ValidationContext;
 
     let package_dir = repo.package_dir(region, package_type);
     let metadata = read_metadata(&package_dir)?;

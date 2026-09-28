@@ -14,7 +14,7 @@ use semver::Version;
 
 use super::metadata::calculate_sha256;
 use super::{PublishError, PublishResult, RepoConfig};
-use crate::package::{self, PackageType};
+use xearthlayer_package::{self as package, PackageType};
 
 // Re-export format_size for convenience
 pub use crate::config::format_size as format_archive_size;
@@ -77,7 +77,7 @@ fn check_tool_available(tool: &str, args: &[&str]) -> PublishResult<()> {
 
 /// Generate the archive filename for a package.
 ///
-/// This is a re-export of [`crate::package::archive_filename`] for convenience.
+/// This is a re-export of [`xearthlayer_package::archive_filename`] for convenience.
 /// See that function for full documentation.
 pub fn archive_filename(region: &str, package_type: PackageType, version: &Version) -> String {
     package::archive_filename(region, package_type, version)

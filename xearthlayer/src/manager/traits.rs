@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use crate::package::{PackageLibrary, PackageMetadata};
+use xearthlayer_package::{PackageLibrary, PackageMetadata};
 
 use super::ManagerResult;
 

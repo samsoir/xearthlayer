@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use tracing::info;
 
-use crate::package::{PackageMetadata, PackageType};
+use xearthlayer_package::{PackageMetadata, PackageType};
 
 use super::disk_check::{
     check_disk_space, FsInfoProvider, RealFsInfoProvider, SPACE_BUFFER_MULTIPLIER,

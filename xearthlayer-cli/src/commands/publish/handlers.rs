@@ -17,11 +17,11 @@ use super::output::{
 };
 use super::traits::{CommandContext, CommandHandler};
 use crate::error::CliError;
-use xearthlayer::package::{PackageType, ValidationContext};
 use xearthlayer::publisher::dedupe::{DedupeAuditReport, DedupeFilter, GapAuditReport, TileCoord};
 use xearthlayer::publisher::{
     parse_size, RepoConfig, VersionBump, DEFAULT_PART_SIZE, LIBRARY_FILENAME,
 };
+use xearthlayer_package::{PackageType, ValidationContext};
 
 // ============================================================================
 // Init Handler

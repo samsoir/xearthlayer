@@ -11,7 +11,6 @@ use super::traits::{
     CoverageResult, DedupeReport, Output, OverlapSummary, PublisherService, RepositoryOperations,
 };
 use crate::error::CliError;
-use xearthlayer::package::{PackageMetadata, PackageType};
 use xearthlayer::publisher::dedupe::{
     resolve_overlaps, DedupeFilter, GapAnalysisResult, OverlapDetector, ZoomPriority,
 };
@@ -20,6 +19,7 @@ use xearthlayer::publisher::{
     BuildResult, ProcessSummary, RegionMetadata, RegionSuggestion, ReleaseResult, ReleaseStatus,
     RepoConfig, SceneryScanResult, UrlConfigResult, VersionBump,
 };
+use xearthlayer_package::{PackageMetadata, PackageType};
 
 // ============================================================================
 // Console Output Implementation

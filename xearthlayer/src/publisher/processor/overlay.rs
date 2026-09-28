@@ -8,10 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::{ProcessSummary, SceneryFormat, SceneryProcessor, SceneryScanResult, TileInfo};
-use crate::package::PackageType;
 use crate::publisher::{
     compress_dsf_files, DsfCompressor, PublishError, PublishResult, Repository,
 };
+use xearthlayer_package::PackageType;
 
 /// Ortho4XP overlay output processor.
 ///

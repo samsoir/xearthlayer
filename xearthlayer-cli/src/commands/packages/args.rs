@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use clap::Subcommand;
 
-use xearthlayer::package::PackageType;
+use xearthlayer_package::PackageType;
 
 /// Package type argument for CLI.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
