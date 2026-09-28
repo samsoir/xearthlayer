@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **macOS (Apple Silicon) release tarball** ([#201](https://github.com/samsoir/xearthlayer/issues/201)): Releases now ship `xearthlayer-<tag>-arm64-macos.tar.gz` on both the stable and pre-release channels. CI gained a blocking `Verify (macOS)` job on `macos-15`, and a macOS packaging failure aborts release publication. The binary is unsigned, so first run needs `xattr -dr com.apple.quarantine ./xearthlayer`. Usable once the macOS port lands.
 
+- **Per-binary make targets**: `make install-<binary>`, `make uninstall-<binary>` and `make release-<binary>` for each binary the workspace builds, generated from one list in the Makefile so that the daemon and TUI can be added as one line each. `make install` and `make uninstall` still cover every binary.
+
 - **`make verify-macos`**: Runs `make verify` plus the live macFUSE smoke tests that CI structurally cannot execute, because macFUSE is a kernel extension and hosted runners cannot load one. Required before promoting a release to stable.
 
 - **`docs/dev/cicd.md`**: Reference for the build pipeline and merge strategy, covering the branch model, release job graph, platform support tiers, release channels, status checks, and version propagation.

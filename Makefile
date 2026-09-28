@@ -25,6 +25,12 @@ help: ## Show this help message
 	@echo '$(BLUE)XEarthLayer - Available Make Targets$(NC)'
 	@echo ''
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make $(BLUE)<target>$(NC)\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  $(BLUE)%-20s$(NC) %s\n", $$1, $$2 } /^##@/ { printf "\n$(YELLOW)%s$(NC)\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+	@# Per-binary targets are generated from $(BINARIES), so they are listed
+	@# from it too rather than from a comment that could drift.
+	@printf "\n$(YELLOW)Per-binary (one of: $(BINARIES))$(NC)\n"
+	@printf "  $(BLUE)%-20s$(NC) %s\n" "release-<binary>" "Build one binary in release mode"
+	@printf "  $(BLUE)%-20s$(NC) %s\n" "install-<binary>" "Install one binary to $(BINDIR)"
+	@printf "  $(BLUE)%-20s$(NC) %s\n" "uninstall-<binary>" "Remove one binary from $(BINDIR)"
 
 ##@ Development
 
@@ -287,13 +293,41 @@ ci-full: verify coverage-check audit deps-check ## Run comprehensive CI checks
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
+# Every binary the workspace produces, and the crate that builds each one.
+# The per-binary release, install and uninstall targets below are generated
+# from this list, and `install`/`uninstall` walk it, so a new binary (the
+# daemon and TUI are coming in 0.5.0) is one line here and one CRATE_ entry.
+BINARIES := xearthlayer xearthlayer-publish
+CRATE_xearthlayer := xearthlayer-cli
+CRATE_xearthlayer-publish := xearthlayer-publish
+
+# release-<binary>, install-<binary>, uninstall-<binary>
+define BINARY_TARGETS
+.PHONY: release-$(1) install-$(1) uninstall-$(1)
+release-$(1):
+	@echo "$(BLUE)Building $(1) (release)...$(NC)"
+	$$(CARGO) build --release -p $$(CRATE_$(1)) $$(CARGO_FLAGS)
+
+install-$(1): release-$(1)
+	@echo "$(BLUE)Installing $(1) to $$(BINDIR)...$(NC)"
+	@mkdir -p "$$(BINDIR)"
+	@cp "target/release/$(1)" "$$(BINDIR)/"
+	@chmod 755 "$$(BINDIR)/$(1)"
+	@echo "$(GREEN)Installed: $$(BINDIR)/$(1)$(NC)"
+
+uninstall-$(1):
+	@if [ -f "$$(BINDIR)/$(1)" ]; then \
+		rm "$$(BINDIR)/$(1)"; \
+		echo "$(GREEN)Uninstalled: $$(BINDIR)/$(1)$(NC)"; \
+	else \
+		echo "$(YELLOW)Not found: $$(BINDIR)/$(1)$(NC)"; \
+	fi
+endef
+$(foreach bin,$(BINARIES),$(eval $(call BINARY_TARGETS,$(bin))))
+
 .PHONY: install
-install: release ## Install binaries to $(BINDIR)
-	@echo "$(BLUE)Installing xearthlayer and xearthlayer-publish to $(BINDIR)...$(NC)"
-	@mkdir -p "$(BINDIR)"
-	@cp target/release/xearthlayer target/release/xearthlayer-publish "$(BINDIR)/"
-	@chmod 755 "$(BINDIR)/xearthlayer" "$(BINDIR)/xearthlayer-publish"
-	@echo "$(GREEN)Installed: $(BINDIR)/xearthlayer, $(BINDIR)/xearthlayer-publish$(NC)"
+install: $(addprefix install-,$(BINARIES)) ## Install every binary to $(BINDIR)
+	@echo "$(GREEN)Installed all binaries: $(BINARIES)$(NC)"
 	@if ! echo "$$PATH" | tr ':' '\n' | grep -qx "$(BINDIR)"; then \
 		echo ""; \
 		echo "$(YELLOW)Note: $(BINDIR) may not be in your PATH$(NC)"; \
@@ -307,16 +341,8 @@ setup: build ## Run the interactive setup wizard
 	@./target/debug/xearthlayer setup
 
 .PHONY: uninstall
-uninstall: ## Remove installed binaries from $(BINDIR)
-	@echo "$(BLUE)Uninstalling xearthlayer and xearthlayer-publish from $(BINDIR)...$(NC)"
-	@for bin in xearthlayer xearthlayer-publish; do \
-		if [ -f "$(BINDIR)/$$bin" ]; then \
-			rm "$(BINDIR)/$$bin"; \
-			echo "$(GREEN)Uninstalled: $(BINDIR)/$$bin$(NC)"; \
-		else \
-			echo "$(YELLOW)Not found: $(BINDIR)/$$bin$(NC)"; \
-		fi; \
-	done
+uninstall: $(addprefix uninstall-,$(BINARIES)) ## Remove every installed binary from $(BINDIR)
+	@echo "$(GREEN)Uninstall complete: $(BINARIES)$(NC)"
 
 ##@ Packaging
 

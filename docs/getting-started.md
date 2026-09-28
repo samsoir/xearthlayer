@@ -78,7 +78,7 @@ sudo dnf install fuse3-devel       # Fedora, RHEL
 # Clone, build and install
 git clone https://github.com/samsoir/xearthlayer.git
 cd xearthlayer
-make install  # Builds, then installs to ~/.local/bin (no sudo required)
+make install  # Builds, then installs every binary to ~/.local/bin (no sudo required)
 
 # Verify installation
 xearthlayer --version
@@ -88,6 +88,8 @@ xearthlayer --version
 ```bash
 make install PREFIX=/usr/local  # Requires sudo for /usr/local/bin
 ```
+
+`make install` installs everything the workspace builds. To install one binary, use its own target, for example `make install-xearthlayer` for the runtime alone or `make install-xearthlayer-publish` for the publishing tools; `make help` lists the current set.
 
 If the build stops with `rustc <version> is not supported by the following
 packages`, your Rust is too old. Install rustup as above and start a new

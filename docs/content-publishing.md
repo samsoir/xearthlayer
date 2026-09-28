@@ -16,7 +16,7 @@ The publishing workflow:
 ## Prerequisites
 
 - Ortho4XP-generated scenery tiles
-- `xearthlayer-publish` installed. It ships as its own package, separate from the `xearthlayer` runtime, and needs neither X-Plane nor FUSE on the machine that builds packages
+- `xearthlayer-publish` installed. It ships as its own package, separate from the `xearthlayer` runtime, and needs neither X-Plane nor FUSE on the machine that builds packages. From source: `make install-xearthlayer-publish`
 - Web hosting for distributing packages (any HTTP server, CDN, or cloud storage)
 
 ## Step 1: Generate Tiles with Ortho4XP
