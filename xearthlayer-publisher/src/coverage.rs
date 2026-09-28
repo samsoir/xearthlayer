@@ -6,7 +6,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use xearthlayer::publisher::coverage::{CoverageMapGenerator, CoverageConfig};
+//! use xearthlayer_publisher::coverage::{CoverageMapGenerator, CoverageConfig};
 //!
 //! let generator = CoverageMapGenerator::new(CoverageConfig::default());
 //! generator.generate("/path/to/packages", "/path/to/output.png")?;
@@ -650,7 +650,7 @@ impl CoverageMapGenerator {
 mod tests {
     use super::*;
 
-    fn metadata_fixture() -> crate::publisher::RegionMetadata {
+    fn metadata_fixture() -> crate::RegionMetadata {
         serde_json::from_str(
             r#"{"regions":{
                 "NA":{"color":"blue"},
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn with_regions_propagates_unknown_colour_error() {
-        let md: crate::publisher::RegionMetadata =
+        let md: crate::RegionMetadata =
             serde_json::from_str(r#"{"regions":{"EU2":{"color":"tangerine"}}}"#).unwrap();
         let err = CoverageConfig::default().with_regions(&md).unwrap_err();
         assert!(format!("{}", err).contains("EU2"));

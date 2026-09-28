@@ -10,14 +10,12 @@ use std::path::Path;
 use semver::Version;
 
 use crate::error::CliError;
-use xearthlayer::publisher::dedupe::{
-    DedupeFilter, GapAnalysisResult, TileReference, ZoomPriority,
-};
-use xearthlayer::publisher::{
+use xearthlayer_package::{PackageMetadata, PackageType};
+use xearthlayer_publisher::dedupe::{DedupeFilter, GapAnalysisResult, TileReference, ZoomPriority};
+use xearthlayer_publisher::{
     BuildResult, ProcessSummary, RegionSuggestion, ReleaseResult, ReleaseStatus, RepoConfig,
     SceneryScanResult, UrlConfigResult, VersionBump,
 };
-use xearthlayer_package::{PackageMetadata, PackageType};
 
 /// Result of coverage map generation.
 #[derive(Debug)]

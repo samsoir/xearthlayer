@@ -42,7 +42,6 @@ pub mod pinned_budget;
 pub mod prefetch;
 pub mod preflight;
 pub mod provider;
-pub mod publisher;
 pub mod runtime;
 pub mod scene_tracker;
 pub mod service;

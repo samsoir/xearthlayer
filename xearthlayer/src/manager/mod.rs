@@ -1,7 +1,7 @@
 //! Package Manager for discovering, downloading, and managing XEarthLayer scenery packages.
 //!
 //! This module provides the client-side package management functionality, complementing
-//! the [`publisher`](crate::publisher) module which handles package creation.
+//! the `xearthlayer-publisher` crate, which handles package creation.
 //!
 //! # Overview
 //!

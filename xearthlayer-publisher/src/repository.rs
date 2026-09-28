@@ -600,9 +600,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let repo = Repository::init(temp.path()).unwrap();
 
-        let metadata =
-            crate::publisher::RegionMetadata::load(&repo.root().join("region_metadata.json"))
-                .expect("stub must parse as RegionMetadata");
+        let metadata = crate::RegionMetadata::load(&repo.root().join("region_metadata.json"))
+            .expect("stub must parse as RegionMetadata");
         assert!(metadata.regions.is_empty());
     }
 }

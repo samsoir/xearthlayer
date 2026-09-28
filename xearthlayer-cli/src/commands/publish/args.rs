@@ -7,9 +7,9 @@ use std::path::PathBuf;
 
 use clap::{Subcommand, ValueEnum};
 
-use xearthlayer::publisher::dedupe::ZoomPriority;
-use xearthlayer::publisher::VersionBump;
 use xearthlayer_package::PackageType;
+use xearthlayer_publisher::dedupe::ZoomPriority;
+use xearthlayer_publisher::VersionBump;
 
 /// Package type argument for CLI.
 #[derive(Debug, Clone, Copy, ValueEnum)]

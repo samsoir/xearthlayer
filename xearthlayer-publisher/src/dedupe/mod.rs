@@ -27,7 +27,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use xearthlayer::publisher::dedupe::{OverlapDetector, ZoomPriority, DedupeFilter};
+//! use xearthlayer_publisher::dedupe::{OverlapDetector, ZoomPriority, DedupeFilter};
 //!
 //! let detector = OverlapDetector::new();
 //! let tiles = detector.scan_package("/path/to/package")?;

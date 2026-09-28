@@ -46,7 +46,7 @@ impl RemovalSet {
 /// # Example
 ///
 /// ```ignore
-/// use xearthlayer::publisher::dedupe::{resolve_overlaps, ZoomPriority};
+/// use xearthlayer_publisher::dedupe::{resolve_overlaps, ZoomPriority};
 ///
 /// let result = resolve_overlaps(&tiles, &overlaps, ZoomPriority::Highest);
 /// println!("Tiles to remove: {}", result.tiles_removed.len());
@@ -158,7 +158,7 @@ fn get_sorted_zoom_levels(tiles: &[TileReference]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::publisher::dedupe::OverlapCoverage;
+    use crate::dedupe::OverlapCoverage;
     use std::path::PathBuf;
 
     fn make_tile(row: u32, col: u32, zoom: u8) -> TileReference {

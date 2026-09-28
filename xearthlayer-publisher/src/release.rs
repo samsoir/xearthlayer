@@ -371,8 +371,8 @@ mod tests {
     }
 
     fn setup_test_package(repo: &Repository, region: &str, package_type: PackageType) {
-        use crate::publisher::archive::archive_filename;
-        use crate::publisher::metadata::create_metadata;
+        use crate::archive::archive_filename;
+        use crate::metadata::create_metadata;
 
         let package_dir = repo.package_dir(region, package_type);
         fs::create_dir_all(&package_dir).unwrap();

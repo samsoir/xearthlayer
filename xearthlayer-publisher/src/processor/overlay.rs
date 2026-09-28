@@ -8,9 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::{ProcessSummary, SceneryFormat, SceneryProcessor, SceneryScanResult, TileInfo};
-use crate::publisher::{
-    compress_dsf_files, DsfCompressor, PublishError, PublishResult, Repository,
-};
+use crate::{compress_dsf_files, DsfCompressor, PublishError, PublishResult, Repository};
 use xearthlayer_package::PackageType;
 
 /// Ortho4XP overlay output processor.
@@ -484,10 +482,7 @@ mod tests {
             .join("+30-120");
         for name in ["+37-118.dsf", "+37-119.dsf"] {
             let dsf = grid.join(name);
-            assert!(
-                crate::publisher::is_sevenz_file(&dsf).unwrap(),
-                "{name} must be 7z"
-            );
+            assert!(crate::is_sevenz_file(&dsf).unwrap(), "{name} must be 7z");
             let mut reader =
                 sevenz_rust2::ArchiveReader::open(&dsf, sevenz_rust2::Password::empty()).unwrap();
             assert_eq!(reader.read_file(name).unwrap(), b"mock dsf");

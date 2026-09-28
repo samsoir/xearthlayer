@@ -1,0 +1,37 @@
+[package]
+name = "xearthlayer-publisher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Create, build and release XEarthLayer scenery packages from Ortho4XP output"
+
+[lib]
+name = "xearthlayer_publisher"
+path = "src/lib.rs"
+
+[dependencies]
+xearthlayer-package = { path = "../xearthlayer-package" }
+semver.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+regex.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+# Publisher-only. These are the dependencies the separation exists to keep
+# out of the runtime: a map rasteriser with its own HTTP client, and the 7z
+# encoder for DSF containers (#124).
+staticmap = "0.4"
+tiny-skia = "0.11"
+csscolorparser = "0.8"
+sevenz-rust2 = { version = "0.23.0", default-features = false, features = ["compress"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest = "1.4"
+rand = "0.9"

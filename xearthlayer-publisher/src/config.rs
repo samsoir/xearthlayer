@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 
 use super::{PublishError, PublishResult};
-use crate::config::format_size as format_size_usize;
+use crate::size::format_size;
 
 /// Default archive part size in bytes (500 MB).
 pub const DEFAULT_PART_SIZE: u64 = 500 * 1024 * 1024;
@@ -82,7 +82,7 @@ impl RepoConfig {
     /// Get the part size in human-readable format.
     pub fn part_size_display(&self) -> String {
         // Safe to cast to usize since MAX_PART_SIZE is 2GB which fits in usize
-        format_size_usize(self.part_size as usize)
+        format_size(self.part_size)
     }
 
     /// Parse configuration from repository marker content.

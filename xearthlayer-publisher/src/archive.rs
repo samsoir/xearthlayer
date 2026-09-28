@@ -17,7 +17,7 @@ use super::{PublishError, PublishResult, RepoConfig};
 use xearthlayer_package::{self as package, PackageType};
 
 // Re-export format_size for convenience
-pub use crate::config::format_size as format_archive_size;
+pub use crate::size::format_size as format_archive_size;
 
 /// Result of building an archive.
 #[derive(Debug, Clone)]

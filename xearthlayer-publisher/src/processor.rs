@@ -93,7 +93,7 @@ impl SceneryScanResult {
 /// # Example
 ///
 /// ```ignore
-/// use xearthlayer::publisher::{SceneryProcessor, SceneryFormat, SceneryScanResult};
+/// use xearthlayer_publisher::{SceneryProcessor, SceneryFormat, SceneryScanResult};
 ///
 /// struct MyProcessor;
 ///

@@ -12,13 +12,13 @@ use super::args::*;
 use super::handlers::*;
 use super::traits::*;
 use crate::error::CliError;
-use xearthlayer::publisher::dedupe::{DedupeFilter, GapAnalysisResult, ZoomPriority};
-use xearthlayer::publisher::{
+use xearthlayer_package::{ArchivePart, PackageMetadata, PackageType};
+use xearthlayer_publisher::dedupe::{DedupeFilter, GapAnalysisResult, ZoomPriority};
+use xearthlayer_publisher::{
     ArchiveBuildResult, BuildResult, ProcessSummary, RegionSuggestion, ReleaseResult,
     ReleaseStatus, RepoConfig, SceneryScanResult, SuggestedRegion, TileInfo, UrlConfigResult,
     VersionBump,
 };
-use xearthlayer_package::{ArchivePart, PackageMetadata, PackageType};
 
 use chrono::Utc;
 
@@ -534,13 +534,13 @@ fn create_test_build_result() -> BuildResult {
             archive_name: "zzXEL_na_ortho-1.0.0.tar.gz".to_string(),
             total_size: 1024 * 1024 * 800,
             parts: vec![
-                xearthlayer::publisher::ArchivePart {
+                xearthlayer_publisher::ArchivePart {
                     filename: "zzXEL_na_ortho-1.0.0.tar.gz.aa".to_string(),
                     path: PathBuf::from("/tmp/dist/na/ortho/zzXEL_na_ortho-1.0.0.tar.gz.aa"),
                     size: 1024 * 1024 * 500,
                     checksum: "abc123".to_string(),
                 },
-                xearthlayer::publisher::ArchivePart {
+                xearthlayer_publisher::ArchivePart {
                     filename: "zzXEL_na_ortho-1.0.0.tar.gz.ab".to_string(),
                     path: PathBuf::from("/tmp/dist/na/ortho/zzXEL_na_ortho-1.0.0.tar.gz.ab"),
                     size: 1024 * 1024 * 300,

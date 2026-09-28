@@ -4,9 +4,9 @@
 //! across all publish command handlers.
 
 use super::traits::{DedupeReport, Output, OverlapSummary};
-use xearthlayer::config::format_size;
-use xearthlayer::publisher::dedupe::GapAnalysisResult;
-use xearthlayer::publisher::{ProcessSummary, RegionSuggestion, ReleaseStatus, SceneryScanResult};
+use xearthlayer_publisher::dedupe::GapAnalysisResult;
+use xearthlayer_publisher::format_size;
+use xearthlayer_publisher::{ProcessSummary, RegionSuggestion, ReleaseStatus, SceneryScanResult};
 
 /// Print scan results to the output.
 pub fn print_scan_result(out: &dyn Output, scan: &SceneryScanResult) {
@@ -74,8 +74,8 @@ pub fn print_process_summary(out: &dyn Output, summary: &ProcessSummary) {
             .unwrap_or(100);
         out.println(&format!(
             "DSF compressed:  {} -> {} ({}%)",
-            format_size(summary.dsf_raw_bytes as usize),
-            format_size(summary.dsf_stored_bytes as usize),
+            format_size(summary.dsf_raw_bytes),
+            format_size(summary.dsf_stored_bytes),
             pct
         ));
         if summary.dsf_precompressed > 0 {
@@ -120,7 +120,7 @@ pub fn format_status(status: &ReleaseStatus) -> String {
 
 /// Format a size in bytes as a human-readable string.
 pub fn format_size_display(size: u64) -> String {
-    format_size(size as usize)
+    format_size(size)
 }
 
 /// Print dedupe results to the output.
@@ -188,7 +188,7 @@ pub fn print_gap_result(out: &dyn Output, result: &GapAnalysisResult) {
         out.newline();
 
         // Estimate download size
-        let estimated_download = result.total_missing_tiles * 50 * 1024 * 256;
+        let estimated_download = result.total_missing_tiles as u64 * 50 * 1024 * 256;
         out.println(&format!(
             "Estimated download: ~{} (to generate missing tiles)",
             format_size(estimated_download)

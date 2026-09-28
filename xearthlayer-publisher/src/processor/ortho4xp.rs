@@ -8,9 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::{ProcessSummary, SceneryFormat, SceneryProcessor, SceneryScanResult, TileInfo};
-use crate::publisher::{
-    compress_dsf_files, DsfCompressor, PublishError, PublishResult, Repository,
-};
+use crate::{compress_dsf_files, DsfCompressor, PublishError, PublishResult, Repository};
 use xearthlayer_package::PackageType;
 
 /// Ortho4XP output processor.
@@ -684,7 +682,7 @@ mod tests {
             .join("+30-120")
             .join("+37-118.dsf");
         assert!(
-            crate::publisher::is_sevenz_file(&dsf).unwrap(),
+            crate::is_sevenz_file(&dsf).unwrap(),
             "DSF must be a 7z container"
         );
         assert_eq!(summary.dsf_count, 1);

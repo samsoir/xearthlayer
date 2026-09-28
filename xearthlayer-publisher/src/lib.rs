@@ -1,6 +1,6 @@
 //! Package Publisher for creating distributable XEarthLayer Scenery Packages.
 //!
-//! This module provides tools for creating, building, and managing scenery
+//! This crate provides tools for creating, building, and managing scenery
 //! packages from various scenery sources. It enables anyone to create and host
 //! their own scenery libraries.
 //!
@@ -25,7 +25,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use xearthlayer::publisher::{Repository, SceneryProcessor, Ortho4XPProcessor};
+//! use xearthlayer_publisher::{Repository, SceneryProcessor, Ortho4XPProcessor};
 //! use xearthlayer_package::PackageType;
 //!
 //! // Initialize repository
@@ -52,6 +52,7 @@ mod region;
 mod region_colors;
 mod release;
 mod repository;
+mod size;
 mod urls;
 
 pub use archive::{
@@ -84,4 +85,5 @@ pub use release::{
     BuildResult, ReleaseResult, ReleaseStatus, UrlConfigResult,
 };
 pub use repository::Repository;
+pub use size::format_size;
 pub use urls::{generate_part_urls, validate_url, UrlVerification, UrlVerifier};
