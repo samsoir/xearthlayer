@@ -9,12 +9,15 @@ crate topology this extends), [Package Publisher Design](package-publisher-desig
 (what the publisher does), [Scenery Packages](scenery-packages.md) (the format
 this design promotes to a contract crate).
 
-### Work Items
+### Tracking
 
-Issues to be filed. The order is a dependency order, not a preference.
+All four phases are tracked by a single issue, #284, in milestone v0.5.0. One
+issue rather than four because the phases are one refactor with one acceptance
+gate: a half-applied split leaves the workspace in a shape nobody designed. The
+order below is a dependency order, not a preference.
 
-| Item | Work |
-|------|------|
+| Phase | Work |
+|-------|------|
 | P1 | `xearthlayer-package` contract crate |
 | P2 | `xearthlayer-publisher` library crate |
 | P3 | `xearthlayer-publish` binary crate, `xearthlayer publish` removed |

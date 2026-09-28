@@ -19,7 +19,7 @@ Related: #111 (FUSE hook pipeline), #112 (plugin architecture), #113 (release ch
 | #145 | CLI service commands + cleanup |
 | #146 | Multi-package release pipeline |
 | #147 | `ServiceManager` trait |
-| P1-P4 | Publisher separation, to be filed. See [Publisher Separation Design](publisher-separation-design.md) |
+| #284 | Publisher separation. See [Publisher Separation Design](publisher-separation-design.md) |
 
 ## Problem Statement
 
