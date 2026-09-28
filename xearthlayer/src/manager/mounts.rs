@@ -21,14 +21,14 @@ use crate::metrics::TelemetrySnapshot;
 use crate::ortho_union::{
     default_cache_path, IndexBuildProgressCallback, OrthoUnionIndex, OrthoUnionIndexBuilder,
 };
-use crate::package::{
-    InstalledPackage as PackageInstalledPackage, Package as PackageCore, PackageType,
-};
 use crate::panic as panic_handler;
 use crate::patches::{extract_dsf_regions, PatchDiscovery};
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use crate::scene_tracker::{DefaultSceneTracker, FuseAccessEvent};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
+use xearthlayer_package::{
+    InstalledPackage as PackageInstalledPackage, Package as PackageCore, PackageType,
+};
 
 use super::local::LocalPackageStore;
 use super::{ManagerError, ManagerResult};

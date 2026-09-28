@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use semver::Version;
 
-use crate::package::{self, parse_package_metadata, PackageMetadata, PackageType};
+use xearthlayer_package::{self as package, parse_package_metadata, PackageMetadata, PackageType};
 
 use super::{ManagerError, ManagerResult};
 
@@ -225,7 +225,7 @@ impl LocalPackageStore {
 
 /// Generate the mountpoint (folder) name for a package.
 ///
-/// This is a local alias for [`crate::package::package_mountpoint`].
+/// This is a local alias for [`xearthlayer_package::package_mountpoint`].
 fn package_mountpoint(region: &str, package_type: PackageType) -> String {
     package::package_mountpoint(region, package_type)
 }

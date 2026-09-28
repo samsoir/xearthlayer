@@ -25,6 +25,12 @@ help: ## Show this help message
 	@echo '$(BLUE)XEarthLayer - Available Make Targets$(NC)'
 	@echo ''
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make $(BLUE)<target>$(NC)\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  $(BLUE)%-20s$(NC) %s\n", $$1, $$2 } /^##@/ { printf "\n$(YELLOW)%s$(NC)\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+	@# Per-binary targets are generated from $(BINARIES), so they are listed
+	@# from it too rather than from a comment that could drift.
+	@printf "\n$(YELLOW)Per-binary (one of: $(BINARIES))$(NC)\n"
+	@printf "  $(BLUE)%-20s$(NC) %s\n" "release-<binary>" "Build one binary in release mode"
+	@printf "  $(BLUE)%-20s$(NC) %s\n" "install-<binary>" "Install one binary to $(BINDIR)"
+	@printf "  $(BLUE)%-20s$(NC) %s\n" "uninstall-<binary>" "Remove one binary from $(BINDIR)"
 
 ##@ Development
 
@@ -97,7 +103,7 @@ debug-run: debug-build ## Run release with debug map server
 	$(CARGO) run --release --features debug-map $(CARGO_FLAGS) -- run
 
 .PHONY: install-profiling
-install-profiling: release-profiling ## Install binary with profiling support to $(BINDIR)
+install-profiling: release-profiling ## Install runtime binary with profiling support to $(BINDIR)
 	@echo "$(BLUE)Installing xearthlayer (profiling) to $(BINDIR)...$(NC)"
 	@mkdir -p "$(BINDIR)"
 	@cp target/release/xearthlayer "$(BINDIR)/"
@@ -287,13 +293,41 @@ ci-full: verify coverage-check audit deps-check ## Run comprehensive CI checks
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
+# Every binary the workspace produces, and the crate that builds each one.
+# The per-binary release, install and uninstall targets below are generated
+# from this list, and `install`/`uninstall` walk it, so a new binary (the
+# daemon and TUI are coming in 0.5.0) is one line here and one CRATE_ entry.
+BINARIES := xearthlayer xearthlayer-publish
+CRATE_xearthlayer := xearthlayer-cli
+CRATE_xearthlayer-publish := xearthlayer-publish
+
+# release-<binary>, install-<binary>, uninstall-<binary>
+define BINARY_TARGETS
+.PHONY: release-$(1) install-$(1) uninstall-$(1)
+release-$(1):
+	@echo "$(BLUE)Building $(1) (release)...$(NC)"
+	$$(CARGO) build --release -p $$(CRATE_$(1)) $$(CARGO_FLAGS)
+
+install-$(1): release-$(1)
+	@echo "$(BLUE)Installing $(1) to $$(BINDIR)...$(NC)"
+	@mkdir -p "$$(BINDIR)"
+	@cp "target/release/$(1)" "$$(BINDIR)/"
+	@chmod 755 "$$(BINDIR)/$(1)"
+	@echo "$(GREEN)Installed: $$(BINDIR)/$(1)$(NC)"
+
+uninstall-$(1):
+	@if [ -f "$$(BINDIR)/$(1)" ]; then \
+		rm "$$(BINDIR)/$(1)"; \
+		echo "$(GREEN)Uninstalled: $$(BINDIR)/$(1)$(NC)"; \
+	else \
+		echo "$(YELLOW)Not found: $$(BINDIR)/$(1)$(NC)"; \
+	fi
+endef
+$(foreach bin,$(BINARIES),$(eval $(call BINARY_TARGETS,$(bin))))
+
 .PHONY: install
-install: release ## Install binary to $(BINDIR)
-	@echo "$(BLUE)Installing xearthlayer to $(BINDIR)...$(NC)"
-	@mkdir -p "$(BINDIR)"
-	@cp target/release/xearthlayer "$(BINDIR)/"
-	@chmod 755 "$(BINDIR)/xearthlayer"
-	@echo "$(GREEN)Installed: $(BINDIR)/xearthlayer$(NC)"
+install: $(addprefix install-,$(BINARIES)) ## Install every binary to $(BINDIR)
+	@echo "$(GREEN)Installed all binaries: $(BINARIES)$(NC)"
 	@if ! echo "$$PATH" | tr ':' '\n' | grep -qx "$(BINDIR)"; then \
 		echo ""; \
 		echo "$(YELLOW)Note: $(BINDIR) may not be in your PATH$(NC)"; \
@@ -307,14 +341,8 @@ setup: build ## Run the interactive setup wizard
 	@./target/debug/xearthlayer setup
 
 .PHONY: uninstall
-uninstall: ## Remove installed binary from $(BINDIR)
-	@echo "$(BLUE)Uninstalling xearthlayer from $(BINDIR)...$(NC)"
-	@if [ -f "$(BINDIR)/xearthlayer" ]; then \
-		rm "$(BINDIR)/xearthlayer"; \
-		echo "$(GREEN)Uninstalled: $(BINDIR)/xearthlayer$(NC)"; \
-	else \
-		echo "$(YELLOW)Not found: $(BINDIR)/xearthlayer$(NC)"; \
-	fi
+uninstall: $(addprefix uninstall-,$(BINARIES)) ## Remove every installed binary from $(BINDIR)
+	@echo "$(GREEN)Uninstall complete: $(BINARIES)$(NC)"
 
 ##@ Packaging
 
@@ -325,11 +353,12 @@ AUR_DIR := pkg/aur
 AUR_REPO := ssh://aur@aur.archlinux.org/$(PKG_NAME).git
 
 .PHONY: pkg-deb
-pkg-deb: release ## Build Debian package (.deb)
-	@echo "$(BLUE)Building Debian package...$(NC)"
+pkg-deb: release ## Build Debian packages (.deb) for the runtime and the publisher
+	@echo "$(BLUE)Building Debian packages...$(NC)"
 	@command -v cargo-deb >/dev/null 2>&1 || { echo "$(YELLOW)Installing cargo-deb...$(NC)"; cargo install cargo-deb; }
 	cd xearthlayer-cli && $(CARGO) deb --no-build
-	@echo "$(GREEN)Debian package built: target/debian/$(PKG_NAME)_$(PKG_VERSION)-1_amd64.deb$(NC)"
+	cd xearthlayer-publish && $(CARGO) deb --no-build
+	@echo "$(GREEN)Debian packages built: target/debian/$(PKG_NAME)_$(PKG_VERSION)-1_amd64.deb, target/debian/$(PKG_NAME)-publish_$(PKG_VERSION)-1_amd64.deb$(NC)"
 
 .PHONY: pkg-rpm
 pkg-rpm: release ## Build RPM package (.rpm) - requires rpmbuild
@@ -345,14 +374,18 @@ pkg-rpm: release ## Build RPM package (.rpm) - requires rpmbuild
 	@echo "$(GREEN)RPM package built in ~/rpmbuild/RPMS/$(NC)"
 
 .PHONY: pkg-tarball
-pkg-tarball: release ## Build release tarball
-	@echo "$(BLUE)Building release tarball...$(NC)"
+pkg-tarball: release ## Build release tarballs: the runtime and, separately, the publisher
+	@echo "$(BLUE)Building release tarballs...$(NC)"
 	@mkdir -p dist
-	@cp target/release/xearthlayer dist/
-	@cp README.md LICENSE dist/
+	@cp target/release/xearthlayer README.md LICENSE dist/
 	@cd dist && tar czvf $(PKG_NAME)-$(PKG_VERSION)-x86_64-linux.tar.gz xearthlayer README.md LICENSE
-	@rm dist/xearthlayer dist/README.md dist/LICENSE
-	@echo "$(GREEN)Tarball built: dist/$(PKG_NAME)-$(PKG_VERSION)-x86_64-linux.tar.gz$(NC)"
+	@rm dist/xearthlayer dist/README.md
+	@# The publisher ships alone so that a flight simulator user downloads a
+	@# streaming service and a publisher downloads publishing tools (#284).
+	@cp target/release/xearthlayer-publish docs/content-publishing.md dist/
+	@cd dist && tar czvf $(PKG_NAME)-publish-$(PKG_VERSION)-x86_64-linux.tar.gz xearthlayer-publish content-publishing.md LICENSE
+	@rm dist/xearthlayer-publish dist/content-publishing.md dist/LICENSE
+	@echo "$(GREEN)Tarballs built: dist/$(PKG_NAME)-$(PKG_VERSION)-x86_64-linux.tar.gz, dist/$(PKG_NAME)-publish-$(PKG_VERSION)-x86_64-linux.tar.gz$(NC)"
 
 .PHONY: aur-prepare
 aur-prepare: ## Prepare AUR package for a tagged release (TAG=v0.2.0)
@@ -479,7 +512,7 @@ bump-version: ## Bump version across all files (VERSION=x.y.z or x.y.z-dev.N)
 	@# each recipe line runs in its own shell.
 	@FC=$$(jq -r '.assets.rpm.filename' version.json | sed -E 's/.*\.(fc[0-9]+)\..*/\1/'); \
 		jq --arg v "$(VERSION)" --arg fc "$$FC" \
-			'.version = $$v | .tag = "v" + $$v | .download_base_url = "https://github.com/samsoir/xearthlayer/releases/download/v" + $$v | .assets.deb.filename = "xearthlayer_" + $$v + "-1_amd64.deb" | .assets.rpm.filename = "xearthlayer-" + $$v + "-1." + $$fc + ".x86_64.rpm" | .assets.tarball.filename = "xearthlayer-v" + $$v + "-x86_64-linux.tar.gz" | .assets.macos_tarball = {filename: ("xearthlayer-v" + $$v + "-arm64-macos.tar.gz"), description: "macOS (Apple Silicon) binary tarball"}' \
+			'.version = $$v | .tag = "v" + $$v | .download_base_url = "https://github.com/samsoir/xearthlayer/releases/download/v" + $$v | .assets.deb.filename = "xearthlayer_" + $$v + "-1_amd64.deb" | .assets.rpm.filename = "xearthlayer-" + $$v + "-1." + $$fc + ".x86_64.rpm" | .assets.tarball.filename = "xearthlayer-v" + $$v + "-x86_64-linux.tar.gz" | .assets.macos_tarball = {filename: ("xearthlayer-v" + $$v + "-arm64-macos.tar.gz"), description: "macOS (Apple Silicon) binary tarball"} | .assets.publish_deb = {filename: ("xearthlayer-publish_" + $$v + "-1_amd64.deb"), description: "Publishing tools, Debian/Ubuntu package"} | .assets.publish_rpm = {filename: ("xearthlayer-publish-" + $$v + "-1." + $$fc + ".x86_64.rpm"), description: "Publishing tools, Fedora/RHEL package"} | .assets.publish_tarball = {filename: ("xearthlayer-publish-v" + $$v + "-x86_64-linux.tar.gz"), description: "Publishing tools, Linux binary tarball"} | .assets.publish_macos_tarball = {filename: ("xearthlayer-publish-v" + $$v + "-arm64-macos.tar.gz"), description: "Publishing tools, macOS (Apple Silicon) binary tarball"}' \
 			version.json > version.json.tmp \
 		&& cat version.json.tmp > version.json && rm -f version.json.tmp
 	@# Cargo.lock — refresh the two workspace member entries.

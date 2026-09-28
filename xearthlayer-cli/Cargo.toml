@@ -36,10 +36,11 @@ assets = [
 
 [dependencies]
 xearthlayer = { path = "../xearthlayer" }
-clap = { version = "4.5", features = ["derive"] }
-semver = "1.0"
+xearthlayer-package = { path = "../xearthlayer-package" }
+clap.workspace = true
+semver.workspace = true
 image = "0.25"
-tracing = "0.1"
+tracing.workspace = true
 ctrlc = "3.4"
 dirs = "5"
 ratatui = "0.29"
@@ -57,6 +58,6 @@ profiling = ["xearthlayer/profiling"]
 debug-map = ["xearthlayer/debug-map"]
 
 [dev-dependencies]
-chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono.workspace = true
 proptest = "1.4"
-tempfile = "3"
+tempfile.workspace = true

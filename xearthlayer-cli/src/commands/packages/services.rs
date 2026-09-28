@@ -16,7 +16,7 @@ use xearthlayer::manager::{
     LibraryClient, LocalPackageStore, ManagerResult, PackageInfo, PackageInstaller, PackageStatus,
     PartState, UpdateChecker,
 };
-use xearthlayer::package::{PackageLibrary, PackageMetadata, PackageType};
+use xearthlayer_package::{PackageLibrary, PackageMetadata, PackageType};
 
 // ============================================================================
 // Console Output Implementation

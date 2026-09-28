@@ -23,8 +23,6 @@ pub enum CliError {
     CacheClear(String),
     /// Failed to get cache stats
     CacheStats(String),
-    /// Publisher error
-    Publish(String),
     /// Package manager error
     Packages(String),
     /// No packages installed
@@ -77,10 +75,6 @@ impl CliError {
                         "  3. Mountpoint in use: Try unmounting with: fusermount -u <mountpoint>"
                     );
                 }
-            }
-            CliError::Publish(_) => {
-                eprintln!();
-                eprintln!("Run 'xearthlayer publish --help' for usage information.");
             }
             CliError::Packages(_) => {
                 eprintln!();
@@ -138,7 +132,6 @@ impl fmt::Display for CliError {
             CliError::Serve(e) => write!(f, "FUSE server error: {}", e),
             CliError::CacheClear(msg) => write!(f, "Failed to clear cache: {}", msg),
             CliError::CacheStats(msg) => write!(f, "Failed to get cache stats: {}", msg),
-            CliError::Publish(msg) => write!(f, "Publisher error: {}", msg),
             CliError::Packages(msg) => write!(f, "Package manager error: {}", msg),
             CliError::NoPackages { .. } => write!(f, "No ortho packages installed"),
             CliError::SceneryIndex(msg) => write!(f, "Scenery index error: {}", msg),

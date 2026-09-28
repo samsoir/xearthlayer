@@ -11,10 +11,10 @@ use std::path::PathBuf;
 use clap::Subcommand;
 use xearthlayer::config::{format_size, ConfigFile};
 use xearthlayer::manager::LocalPackageStore;
-use xearthlayer::package::PackageType;
 use xearthlayer::prefetch::{
     cache_status, save_cache, scenery_cache_path, SceneryIndex, SceneryIndexConfig,
 };
+use xearthlayer_package::PackageType;
 
 use crate::error::CliError;
 

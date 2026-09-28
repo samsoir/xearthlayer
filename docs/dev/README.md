@@ -34,6 +34,7 @@ Technical documentation for XEarthLayer developers and contributors.
 | [Scenery Packages](scenery-packages.md) | File formats, naming conventions, metadata specs |
 | [Package Manager Design](package-manager-design.md) | Download, install, update architecture (parallel downloads, retry) |
 | [Package Publisher Design](package-publisher-design.md) | Build, archive, release pipeline |
+| [Publisher Separation Design](publisher-separation-design.md) | Publishing in its own crates and binary, package format as a contract crate (#284) |
 | [GitHub Releases Publishing](github-releases-publishing.md) | Multi-part upload workflow |
 | [Zoom Level Overlap](zoom-level-overlap-design.md) | Dedupe and gap analysis tools |
 
@@ -93,10 +94,14 @@ xearthlayer-cli
             ├── ortho_union (tile → source mapping)
             ├── patches (patch discovery, validation)
             ├── prefetch (boundary-driven adaptive prefetch, flight phase detection)
-            ├── package (metadata, library parsing)
-            ├── manager (mounts, symlinks, install/update/remove)
-            └── publisher (scan, build, release)
+            └── manager (mounts, symlinks, install/update/remove)
 ```
+
+Two crates sit beside the runtime. `xearthlayer-package` carries the scenery
+package format that both the runtime and the publisher depend on, and
+`xearthlayer-publisher` holds publishing behind the `xearthlayer-publish`
+binary. Neither direction crosses: the runtime does not link the publisher.
+See [Publisher Separation Design](publisher-separation-design.md).
 
 ## Getting Started
 

@@ -12,8 +12,8 @@ GitHub Releases provides free hosting for package archives with these benefits:
 
 ## Prerequisites
 
-- XEarthLayer CLI built and available
-- Package repository initialized (`xearthlayer publish init`)
+- `xearthlayer-publish` built and available
+- Package repository initialized (`xearthlayer-publish init`)
 - GitHub CLI (`gh`) installed and authenticated
 - Ortho4XP source tiles ready
 
@@ -67,7 +67,7 @@ cd /path/to/xearthlayer-packages
 ls -la .xearthlayer-repo
 
 # Check current packages
-xearthlayer publish list
+xearthlayer-publish list
 ```
 
 ### Step 2: Configure Part Size (Optional)
@@ -88,7 +88,7 @@ Valid suffixes: `K` (KB), `M` (MB), `G` (GB), or plain bytes.
 ### Step 3: Process Ortho Tiles
 
 ```bash
-xearthlayer publish add \
+xearthlayer-publish add \
   --source /path/to/Ortho4XP/Tiles \
   --region na \
   --type ortho
@@ -123,7 +123,7 @@ Package created successfully!
 ### Step 4: Process Overlay Tiles
 
 ```bash
-xearthlayer publish add \
+xearthlayer-publish add \
   --source /path/to/yOrtho4XP_Overlays \
   --region na \
   --type overlay
@@ -152,22 +152,22 @@ For new packages, version defaults to 1.0.0. To set a specific version:
 
 ```bash
 # Set explicit version
-xearthlayer publish version --region na --type ortho --set 0.2.0
-xearthlayer publish version --region na --type overlay --set 0.2.0
+xearthlayer-publish version --region na --type ortho --set 0.2.0
+xearthlayer-publish version --region na --type overlay --set 0.2.0
 
 # Or bump existing version
-xearthlayer publish version --region na --type ortho --bump minor
-xearthlayer publish version --region na --type overlay --bump minor
+xearthlayer-publish version --region na --type ortho --bump minor
+xearthlayer-publish version --region na --type overlay --bump minor
 ```
 
 ### Step 6: Build Archives
 
 ```bash
 # Build ortho archive (large - may take several minutes)
-xearthlayer publish build --region na --type ortho
+xearthlayer-publish build --region na --type ortho
 
 # Build overlay archive
-xearthlayer publish build --region na --type overlay
+xearthlayer-publish build --region na --type overlay
 ```
 
 **Expected output (ortho):**
@@ -196,10 +196,10 @@ Generate both static PNG and interactive GeoJSON coverage maps:
 
 ```bash
 # Dark theme PNG (recommended for GitHub READMEs)
-xearthlayer publish coverage --dark --output coverage.png
+xearthlayer-publish coverage --dark --output coverage.png
 
 # Interactive GeoJSON (GitHub renders these automatically)
-xearthlayer publish coverage --geojson --output coverage.geojson
+xearthlayer-publish coverage --geojson --output coverage.geojson
 ```
 
 ### Step 8: Update README and Commit
@@ -270,13 +270,13 @@ gh release view na-v0.2.0 \
 
 ```bash
 # Configure ortho URLs
-xearthlayer publish urls \
+xearthlayer-publish urls \
   --region na \
   --type ortho \
   --base-url https://github.com/owner/repo-name/releases/download/na-v0.2.0/
 
 # Configure overlay URLs
-xearthlayer publish urls \
+xearthlayer-publish urls \
   --region na \
   --type overlay \
   --base-url https://github.com/owner/repo-name/releases/download/na-v0.2.0/
@@ -302,13 +302,13 @@ gh release upload na-v0.2.0 \
 
 ```bash
 # Release ortho to library
-xearthlayer publish release \
+xearthlayer-publish release \
   --region na \
   --type ortho \
   --metadata-url https://github.com/owner/repo-name/releases/download/na-v0.2.0/zzXEL_na_ortho-metadata.txt
 
 # Release overlay to library
-xearthlayer publish release \
+xearthlayer-publish release \
   --region na \
   --type overlay \
   --metadata-url https://github.com/owner/repo-name/releases/download/na-v0.2.0/yzXEL_na_overlay-metadata.txt
@@ -347,12 +347,12 @@ curl -sL "https://raw.githubusercontent.com/owner/repo-name/main/xearthlayer_pac
 **Solution:** Use a different version number:
 ```bash
 # Bump to next patch version
-xearthlayer publish version --region na --type ortho --set 0.2.1
-xearthlayer publish version --region na --type overlay --set 0.2.1
+xearthlayer-publish version --region na --type ortho --set 0.2.1
+xearthlayer-publish version --region na --type overlay --set 0.2.1
 
 # Rebuild archives
-xearthlayer publish build --region na --type ortho
-xearthlayer publish build --region na --type overlay
+xearthlayer-publish build --region na --type ortho
+xearthlayer-publish build --region na --type overlay
 
 # Create release with new tag
 gh release create na-v0.2.1 ...
@@ -421,16 +421,16 @@ For GitHub Releases:
 # Full workflow for a new region
 
 # 1-6. Process tiles, set version, build archives
-xearthlayer publish add --source /tiles --region xx --type ortho
-xearthlayer publish add --source /overlays --region xx --type overlay
-xearthlayer publish version --region xx --type ortho --set 1.0.0
-xearthlayer publish version --region xx --type overlay --set 1.0.0
-xearthlayer publish build --region xx --type ortho
-xearthlayer publish build --region xx --type overlay
+xearthlayer-publish add --source /tiles --region xx --type ortho
+xearthlayer-publish add --source /overlays --region xx --type overlay
+xearthlayer-publish version --region xx --type ortho --set 1.0.0
+xearthlayer-publish version --region xx --type overlay --set 1.0.0
+xearthlayer-publish build --region xx --type ortho
+xearthlayer-publish build --region xx --type overlay
 
 # 7-8. Generate coverage maps and update README BEFORE creating release
-xearthlayer publish coverage --dark --output coverage.png
-xearthlayer publish coverage --geojson --output coverage.geojson
+xearthlayer-publish coverage --dark --output coverage.png
+xearthlayer-publish coverage --geojson --output coverage.geojson
 # Edit README.md to add new region info
 git add coverage.png coverage.geojson README.md
 git commit -m "Add XX region coverage maps and docs"
@@ -442,15 +442,15 @@ gh release upload xx-v1.0.0 --repo owner/repo dist/xx/ortho/*.tar.gz.*
 gh release upload xx-v1.0.0 --repo owner/repo dist/xx/overlay/*.tar.gz.*
 
 # 12-14. Configure URLs, upload metadata, release to library
-xearthlayer publish urls --region xx --type ortho --base-url https://github.com/owner/repo/releases/download/xx-v1.0.0/
-xearthlayer publish urls --region xx --type overlay --base-url https://github.com/owner/repo/releases/download/xx-v1.0.0/
+xearthlayer-publish urls --region xx --type ortho --base-url https://github.com/owner/repo/releases/download/xx-v1.0.0/
+xearthlayer-publish urls --region xx --type overlay --base-url https://github.com/owner/repo/releases/download/xx-v1.0.0/
 
 cp packages/zzXEL_xx_ortho/xearthlayer_scenery_package.txt /tmp/zzXEL_xx_ortho-metadata.txt
 cp packages/yzXEL_xx_overlay/xearthlayer_scenery_package.txt /tmp/yzXEL_xx_overlay-metadata.txt
 gh release upload xx-v1.0.0 --repo owner/repo /tmp/*-metadata.txt
 
-xearthlayer publish release --region xx --type ortho --metadata-url https://github.com/owner/repo/releases/download/xx-v1.0.0/zzXEL_xx_ortho-metadata.txt
-xearthlayer publish release --region xx --type overlay --metadata-url https://github.com/owner/repo/releases/download/xx-v1.0.0/yzXEL_xx_overlay-metadata.txt
+xearthlayer-publish release --region xx --type ortho --metadata-url https://github.com/owner/repo/releases/download/xx-v1.0.0/zzXEL_xx_ortho-metadata.txt
+xearthlayer-publish release --region xx --type overlay --metadata-url https://github.com/owner/repo/releases/download/xx-v1.0.0/yzXEL_xx_overlay-metadata.txt
 
 # 15-16. Commit library index update and verify
 git add xearthlayer_package_library.txt && git commit -m "Release XX v1.0.0" && git push
@@ -462,13 +462,13 @@ When updating an existing region:
 
 ```bash
 # 1. Add new/updated tiles (replaces existing package content)
-xearthlayer publish add --source /new-tiles --region na --type ortho
+xearthlayer-publish add --source /new-tiles --region na --type ortho
 
 # 2. Bump version
-xearthlayer publish version --region na --type ortho --bump minor  # or --set x.y.z
+xearthlayer-publish version --region na --type ortho --bump minor  # or --set x.y.z
 
 # 3. Rebuild archives
-xearthlayer publish build --region na --type ortho
+xearthlayer-publish build --region na --type ortho
 
 # 4. Create new release and upload
 gh release create na-v0.3.0 ...
@@ -494,13 +494,13 @@ After publishing packages, generate visual coverage maps for your repository REA
 
 ```bash
 # Light theme (OpenStreetMap tiles)
-xearthlayer publish coverage --output coverage.png
+xearthlayer-publish coverage --output coverage.png
 
 # Dark theme (CartoDB Dark Matter tiles) - recommended for GitHub READMEs
-xearthlayer publish coverage --dark --output coverage.png
+xearthlayer-publish coverage --dark --output coverage.png
 
 # Custom dimensions
-xearthlayer publish coverage --dark --width 1600 --height 800 --output coverage.png
+xearthlayer-publish coverage --dark --width 1600 --height 800 --output coverage.png
 ```
 
 ### Interactive GeoJSON Map
@@ -508,7 +508,7 @@ xearthlayer publish coverage --dark --width 1600 --height 800 --output coverage.
 GitHub automatically renders `.geojson` files with an interactive map viewer:
 
 ```bash
-xearthlayer publish coverage --geojson --output coverage.geojson
+xearthlayer-publish coverage --geojson --output coverage.geojson
 ```
 
 ### Embedding in README
@@ -573,7 +573,7 @@ When you push library index updates to the regional-scenery repository, the publ
 
 ### Region Metadata File
 
-The `region_metadata.json` file in the regional-scenery repo is a **required input to `xearthlayer publish coverage`**, not just a website artefact — it supplies the region names, coverage descriptions, and colors used both by the coverage map generator and the website:
+The `region_metadata.json` file in the regional-scenery repo is a **required input to `xearthlayer-publish coverage`**, not just a website artefact: it supplies the region names, coverage descriptions, and colors used both by the coverage map generator and the website:
 
 `publish coverage` reads it from the repository root by default (`<repo>/region_metadata.json`), overridable with `--metadata <path>`. The `color` field for each region accepts either a CSS colour name (e.g. `"orange"`) or a hex string (e.g. `"#ffaa00"`). An unresolvable colour or a missing metadata file is a **hard error**: the command exits non-zero and writes no map. This is deliberate — a silently grey region is how a wrong map shipped once already (issue #200). Dark mode colours are derived automatically by blending toward white, so there is no separate dark palette to maintain.
 

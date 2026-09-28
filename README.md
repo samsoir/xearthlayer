@@ -191,10 +191,10 @@ xearthlayer cache stats               # View cache usage
 xearthlayer cache clear               # Clear cache
 
 # Content Publishing
-xearthlayer publish init              # Initialize repository
-xearthlayer publish add --source <path> --region <code>  # Create package
-xearthlayer publish build --region <code>   # Build archives
-xearthlayer publish release --region <code> # Release to library
+xearthlayer-publish init              # Initialize repository
+xearthlayer-publish add --source <path> --region <code>  # Create package
+xearthlayer-publish build --region <code>   # Build archives
+xearthlayer-publish release --region <code> # Release to library
 ```
 
 Run `xearthlayer --help` for all options.

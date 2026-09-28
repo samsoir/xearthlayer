@@ -17,7 +17,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
-use crate::package::{self, PackageType};
+use xearthlayer_package::{self as package, PackageType};
 
 use super::local::LocalPackageStore;
 use super::{ManagerError, ManagerResult};

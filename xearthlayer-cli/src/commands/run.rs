@@ -5,12 +5,12 @@ use std::sync::Arc;
 
 use xearthlayer::config::{format_size, ControlPlaneSettings, TextureConfig};
 use xearthlayer::manager::LocalPackageStore;
-use xearthlayer::package::PackageType;
 use xearthlayer::panic as panic_handler;
 use xearthlayer::service::{
     OrchestratorConfig, ServiceConfig, ServiceOrchestrator, StartupProgress,
 };
 use xearthlayer::xplane::XPlaneEnvironment;
+use xearthlayer_package::PackageType;
 
 use super::common::{resolve_dds_format, resolve_provider, DdsCompression, ProviderType};
 use crate::error::CliError;

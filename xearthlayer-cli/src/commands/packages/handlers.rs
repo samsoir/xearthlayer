@@ -7,7 +7,7 @@ use xearthlayer::config::format_size;
 use xearthlayer::manager::{
     create_consolidated_overlay, remove_overlay_symlink, MountStatus, PackageStatus,
 };
-use xearthlayer::package::PackageType;
+use xearthlayer_package::PackageType;
 
 use super::args::{CheckArgs, InfoArgs, InstallArgs, ListArgs, RemoveArgs, UpdateArgs};
 use super::traits::{CommandContext, CommandHandler};
@@ -236,7 +236,7 @@ impl InstallHandler {
     /// Install an overlay package for auto_install_overlays feature.
     fn install_overlay_for_region(
         region: &str,
-        library: &xearthlayer::package::PackageLibrary,
+        library: &xearthlayer_package::PackageLibrary,
         args: &InstallArgs,
         ctx: &CommandContext<'_>,
     ) {

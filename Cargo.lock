@@ -4763,7 +4763,6 @@ dependencies = [
  "block_compression",
  "bytes",
  "chrono",
- "csscolorparser",
  "dashmap",
  "dirs",
  "filetime",
@@ -4791,11 +4790,9 @@ dependencies = [
  "serde_json",
  "sevenz-rust2",
  "sha2",
- "staticmap",
  "tempfile",
  "thiserror 1.0.69",
  "time",
- "tiny-skia",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
@@ -4804,6 +4801,7 @@ dependencies = [
  "tracing-chrome",
  "tracing-subscriber",
  "wgpu",
+ "xearthlayer-package",
 ]
 
 [[package]]
@@ -4829,6 +4827,50 @@ dependencies = [
  "tokio-util",
  "tracing",
  "xearthlayer",
+ "xearthlayer-package",
+]
+
+[[package]]
+name = "xearthlayer-package"
+version = "0.5.0-dev.0"
+dependencies = [
+ "chrono",
+ "semver",
+]
+
+[[package]]
+name = "xearthlayer-publish"
+version = "0.5.0-dev.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "semver",
+ "tempfile",
+ "xearthlayer-package",
+ "xearthlayer-publisher",
+]
+
+[[package]]
+name = "xearthlayer-publisher"
+version = "0.5.0-dev.0"
+dependencies = [
+ "chrono",
+ "csscolorparser",
+ "proptest",
+ "rand 0.9.2",
+ "rayon",
+ "regex",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "sevenz-rust2",
+ "sha2",
+ "staticmap",
+ "tempfile",
+ "tiny-skia",
+ "tracing",
+ "xearthlayer-package",
 ]
 
 [[package]]

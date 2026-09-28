@@ -10,7 +10,6 @@
 //! - [`init`] - Configuration initialization
 //! - [`packages`] - Package management (install, remove, update)
 //! - [`patches`] - Tile patches management (list, validate, path)
-//! - [`publish`] - Package publishing (for scenery creators)
 //! - [`run`] - Main command (mount all packages)
 //! - [`scenery_index`] - SceneryIndex cache management (update, clear, status)
 //! - [`setup`] - Interactive setup wizard
@@ -23,7 +22,6 @@ pub mod init;
 pub mod migrate;
 pub mod packages;
 pub mod patches;
-pub mod publish;
 pub mod run;
 pub mod scenery_index;
 pub mod setup;

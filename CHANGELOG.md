@@ -25,11 +25,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **macOS (Apple Silicon) release tarball** ([#201](https://github.com/samsoir/xearthlayer/issues/201)): Releases now ship `xearthlayer-<tag>-arm64-macos.tar.gz` on both the stable and pre-release channels. CI gained a blocking `Verify (macOS)` job on `macos-15`, and a macOS packaging failure aborts release publication. The binary is unsigned, so first run needs `xattr -dr com.apple.quarantine ./xearthlayer`. Usable once the macOS port lands.
 
+- **Per-binary make targets**: `make install-<binary>`, `make uninstall-<binary>` and `make release-<binary>` for each binary the workspace builds, generated from one list in the Makefile so that the daemon and TUI can be added as one line each. `make install` and `make uninstall` still cover every binary.
+
 - **`make verify-macos`**: Runs `make verify` plus the live macFUSE smoke tests that CI structurally cannot execute, because macFUSE is a kernel extension and hosted runners cannot load one. Required before promoting a release to stable.
 
 - **`docs/dev/cicd.md`**: Reference for the build pipeline and merge strategy, covering the branch model, release job graph, platform support tiers, release channels, status checks, and version propagation.
 
+### Changed
+
+- **Publishing is its own program** ([#284](https://github.com/samsoir/xearthlayer/issues/284)): `xearthlayer publish` is now `xearthlayer-publish`, a separate binary with the same thirteen subcommands, shipped as its own package. Every `xearthlayer publish <command>` becomes `xearthlayer-publish <command>`; nothing else changed, not the arguments, the repository layout, or the package format, and a package built by the new binary is byte for byte the one the old command produced. Publishing and streaming were always separate domains joined only by the package format, yet they shared one binary, so the runtime carried a map renderer, a second TLS stack and a 7z encoder it never used, and building a package meant installing a flight simulator service and passing its startup checks. The format itself now lives in a shared `xearthlayer-package` crate that both programs compile against, which is what keeps them from drifting apart.
+
 ### Removed
+
+- **`xearthlayer publish`** ([#284](https://github.com/samsoir/xearthlayer/issues/284)): Replaced by the `xearthlayer-publish` binary, see Changed. There is no forwarding stub; the subcommand is gone in this release.
 
 - **Configuration keys that configured nothing** ([#249](https://github.com/samsoir/xearthlayer/issues/249)): `executor.max_concurrent_jobs` and `executor.retry_base_delay_ms` are removed, joining `network_concurrent`, `cpu_concurrent` and `disk_io_concurrent`. `max_concurrent_jobs` named no limit; it was only the number the dashboard divided by, while job admission is bounded by task dispatch and the resource pools, neither of which consulted it. `retry_base_delay_ms` could not be honoured at all, because the delay between chunk retries is a constant in the retry loop. Retry count stays configurable through `executor.max_retries`. `xearthlayer config upgrade` removes both, along with the deprecated `[control_plane]` and `[download]` sections. The `--parallel` flag on `run` is removed for the same reason: it set a concurrency value nothing read, and concurrency is deliberately derived from the host rather than configured.
 

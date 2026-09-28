@@ -1,16 +1,17 @@
 # Maintainer: Sam de Freyssinet <sam@def.reyssi.net>
-pkgname=xearthlayer
+#
+# Split package: one source tree, two binaries (#284). `xearthlayer` is the
+# streaming runtime; `xearthlayer-publish` is the scenery package publisher,
+# which needs neither FUSE nor X-Plane and is installed deliberately.
+pkgbase=xearthlayer
+pkgname=('xearthlayer' 'xearthlayer-publish')
 pkgver=0.5.0
 pkgrel=1
 pkgdesc="High-quality satellite imagery for X-Plane, streamed on demand"
 arch=('x86_64')
 url="https://github.com/samsoir/xearthlayer"
 license=('MIT')
-depends=('fuse3')
 makedepends=('rust' 'cargo')
-optdepends=(
-    'xplane12: X-Plane 12 flight simulator'
-)
 backup=()
 # REQUIRED -- do not remove. Arch ships OPTIONS=(... lto ...) with
 # LTOFLAGS="-flto=auto", which the cc crate picks up from CFLAGS. ring's C
@@ -18,24 +19,30 @@ backup=()
 # rustc links with lld, which cannot read GCC GIMPLE bytecode -- so every
 # ring symbol comes back undefined. See issue #222.
 options=(!lto)
-source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+source=("$pkgbase-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
 prepare() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgbase-$pkgver"
     export RUSTUP_TOOLCHAIN=stable
     cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgbase-$pkgver"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
     cargo build --frozen --release
 }
 
-package() {
-    cd "$pkgname-$pkgver"
+package_xearthlayer() {
+    pkgdesc="High-quality satellite imagery for X-Plane, streamed on demand"
+    depends=('fuse3')
+    optdepends=(
+        'xplane12: X-Plane 12 flight simulator'
+        'xearthlayer-publish: create and publish scenery packages'
+    )
+    cd "$pkgbase-$pkgver"
 
     # Install binary
     install -Dm755 "target/release/xearthlayer" "$pkgdir/usr/bin/xearthlayer"
@@ -50,4 +57,14 @@ package() {
     # install -Dm644 "completions/xearthlayer.bash" "$pkgdir/usr/share/bash-completion/completions/xearthlayer"
     # install -Dm644 "completions/xearthlayer.zsh" "$pkgdir/usr/share/zsh/site-functions/_xearthlayer"
     # install -Dm644 "completions/xearthlayer.fish" "$pkgdir/usr/share/fish/vendor_completions.d/xearthlayer.fish"
+}
+
+package_xearthlayer-publish() {
+    pkgdesc="Create, build and release XEarthLayer scenery packages from Ortho4XP output"
+    depends=()
+    cd "$pkgbase-$pkgver"
+
+    install -Dm755 "target/release/xearthlayer-publish" "$pkgdir/usr/bin/xearthlayer-publish"
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 "docs/content-publishing.md" "$pkgdir/usr/share/doc/$pkgname/content-publishing.md"
 }

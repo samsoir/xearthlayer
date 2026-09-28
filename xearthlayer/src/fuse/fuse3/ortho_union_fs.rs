@@ -1295,13 +1295,13 @@ mod tests {
     use crate::coord::TileCoord;
     use crate::executor::{DdsClientError, Priority};
     use crate::ortho_union::OrthoUnionIndexBuilder;
-    use crate::package::{InstalledPackage, Package, PackageType};
     use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
     use semver::Version;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
+    use xearthlayer_package::{InstalledPackage, Package, PackageType};
 
     /// Mock DdsClient for testing
     struct MockDdsClient {
@@ -2141,16 +2141,31 @@ mod tests {
     /// bytes on disk, signature included.
     #[tokio::test]
     async fn passthrough_serves_7z_dsf_byte_identical() {
+        use std::io::Write;
+
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+
         let temp = TempDir::new().unwrap();
-        let raw = temp.path().join("raw.dsf");
         let raw_bytes: Vec<u8> = (0..64 * 1024u32).map(|i| ((i / 5) % 253) as u8).collect();
-        std::fs::write(&raw, &raw_bytes).unwrap();
         let compressed = temp.path().join("compressed.dsf");
-        crate::publisher::DsfCompressor::laminar()
-            .compress_file(&raw, &compressed)
+        // Built here rather than by the publisher's DsfCompressor: this test
+        // only needs an opaque 7z blob, and the runtime must not depend on the
+        // publisher even in tests (#284).
+        let mut writer = ArchiveWriter::new(std::io::BufWriter::new(
+            std::fs::File::create(&compressed).unwrap(),
+        ))
+        .unwrap();
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file("raw.dsf"),
+                Some(std::io::Cursor::new(raw_bytes)),
+            )
             .unwrap();
+        writer.finish().unwrap().flush().unwrap();
         let expected = std::fs::read(&compressed).unwrap();
-        assert!(expected.starts_with(&crate::publisher::SEVENZ_MAGIC));
+        // The 7z signature, which is what X-Plane checks before decoding.
+        const SEVENZ_MAGIC: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
+        assert!(expected.starts_with(&SEVENZ_MAGIC));
 
         let (fs, ino, _rx) = passthrough_fixture_with(&temp, &expected);
 

@@ -3,6 +3,9 @@ resolver = "2"
 members = [
     "xearthlayer",
     "xearthlayer-cli",
+    "xearthlayer-package",
+    "xearthlayer-publisher",
+    "xearthlayer-publish",
 ]
 
 [workspace.package]
@@ -22,4 +25,16 @@ rust-version = "1.97.1"
 repository = "https://github.com/samsoir/xearthlayer"
 
 [workspace.dependencies]
-# Shared dependencies will be added here as needed
+# Dependencies used by two or more workspace crates are declared once here so
+# their versions cannot drift between manifests.
+semver = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+regex = "1.10"
+rayon = "1.10"
+tracing = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+tempfile = "3.8"
+clap = { version = "4.5", features = ["derive"] }
