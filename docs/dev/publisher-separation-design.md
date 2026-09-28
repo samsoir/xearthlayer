@@ -78,7 +78,7 @@ into a long lived process that holds FUSE mounts and will never draw a map. The
 coverage map is a reporting tool for a publisher. It should not be linked into
 a flight simulator's filesystem daemon.
 
-That cost is about to become permanent. `xearthlayer-daemon` (#142) does not
+That is about to become permanent. `xearthlayer-daemon` (#142) does not
 exist yet. Once it does, and once the multi-package release pipeline (#146)
 enumerates the binaries, this becomes a property of a shipped service rather
 than an artifact of a single crate.
@@ -277,7 +277,8 @@ so it does not belong in the contract crate. The publisher gets its own
 formatter. Byte formatting is a dozen lines and the two domains have no reason
 to agree on it: XEL's parses and formats config values and is bound by
 round-trip requirements (#218), while the publisher's only prints sizes in
-reports.
+reports. If ultimately enough common shared functionality for formatting and
+other utilities materialize, a common library or similar can be constructed.
 
 **The FUSE test fixture.** The `#[cfg(test)]` reference to `DsfCompressor`
 becomes a direct `sevenz-rust2` dev-dependency in `xearthlayer`. Cargo permits
