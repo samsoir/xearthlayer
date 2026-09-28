@@ -426,7 +426,7 @@ The `gpu-encode` Cargo feature flag is removed in 0.5.0. GPU-accelerated DDS com
 The three service binaries ship as individual packages with a meta-package umbrella. The publishing binary ships as a fourth package that the meta-package deliberately does not pull in:
 
 ```
-xearthlayer                     (meta-package — depends on all below)
+xearthlayer                     (meta-package, depends on all below)
 ├── xearthlayer-daemon          (service binary + systemd unit)
 ├── xearthlayer-cli             (offline CLI + daemon client commands)
 └── xearthlayer-tui             (terminal UI client)
