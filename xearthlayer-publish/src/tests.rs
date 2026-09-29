@@ -266,6 +266,7 @@ impl MockPublisherServiceBuilder {
             release_result: self.release_result,
             plan_deletion_overrides: self.plan_deletion_overrides,
             captured_coverage_metadata_path: RwLock::new(None),
+            executed_deletions: RwLock::new(Vec::new()),
         }
     }
 }
@@ -285,6 +286,10 @@ pub struct MockPublisherService {
     release_result: Option<Result<ReleaseResult, String>>,
     plan_deletion_overrides: HashMap<PackageType, Result<Option<DeletionPlan>, String>>,
     captured_coverage_metadata_path: RwLock<Option<PathBuf>>,
+    /// Every plan actually passed to `execute_deletion`, in call order. Lets
+    /// tests distinguish "the handler decided not to delete" from "the mock
+    /// would have deleted but we didn't check".
+    executed_deletions: RwLock<Vec<DeletionPlan>>,
 }
 
 impl MockPublisherService {
@@ -292,6 +297,12 @@ impl MockPublisherService {
     /// `generate_coverage_map` or `generate_coverage_geojson`, if any.
     pub fn captured_coverage_metadata_path(&self) -> Option<PathBuf> {
         self.captured_coverage_metadata_path.read().unwrap().clone()
+    }
+
+    /// Returns every plan actually passed to `execute_deletion`, in call
+    /// order.
+    pub fn executed_deletions(&self) -> Vec<DeletionPlan> {
+        self.executed_deletions.read().unwrap().clone()
     }
 }
 
@@ -583,8 +594,9 @@ impl PublisherService for MockPublisherService {
     fn execute_deletion(
         &self,
         _repo: &dyn RepositoryOperations,
-        _plan: &DeletionPlan,
+        plan: &DeletionPlan,
     ) -> Result<(), CliError> {
+        self.executed_deletions.write().unwrap().push(plan.clone());
         Ok(())
     }
 }
@@ -1334,7 +1346,7 @@ mod release_tests {
         assert!(result.is_ok());
         assert!(output.contains("Releasing NA ortho to library index"));
         assert!(output.contains("Package released successfully"));
-        assert!(output.contains("Sequence: 1"));
+        assert!(output.contains("Sequence:  1"));
     }
 
     #[test]
@@ -1365,8 +1377,8 @@ mod release_tests {
         )
         .unwrap();
 
-        assert!(output.contains("Download:"));
-        assert!(output.contains("Installed:"));
+        assert!(output.contains("Download:  31.7 GB"));
+        assert!(output.contains("Installed: 48.4 GB"));
     }
 
     #[test]
@@ -1624,6 +1636,10 @@ mod delete_tests {
 
         assert!(prompt.was_asked(), "deletion must ask before acting");
         assert!(output.contains("Cancelled"));
+        assert!(
+            publisher.executed_deletions().is_empty(),
+            "declining the prompt must delete nothing"
+        );
     }
 
     #[test]
@@ -1646,6 +1662,13 @@ mod delete_tests {
         .unwrap();
 
         assert!(!prompt.was_asked(), "--yes must skip the prompt");
+        let executed = publisher.executed_deletions();
+        assert_eq!(
+            executed.len(),
+            2,
+            "--yes must delete both planned package types"
+        );
+        assert!(executed.iter().all(|plan| plan.region == "na"));
     }
 
     #[test]
@@ -1792,5 +1815,9 @@ mod delete_tests {
 
         assert!(!prompt.was_asked(), "a dry run has nothing to confirm");
         assert!(output.contains("Dry run"));
+        assert!(
+            publisher.executed_deletions().is_empty(),
+            "a dry run must delete nothing"
+        );
     }
 }
