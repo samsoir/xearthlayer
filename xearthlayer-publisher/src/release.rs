@@ -98,8 +98,9 @@ pub struct ReleaseResult {
     /// Apparent size of the package directory, in bytes.
     pub installed_bytes: u64,
 
-    /// Set when the sizes could not be recorded in `region_metadata.json`.
-    /// The library index update still succeeded.
+    /// Set when a size could not be measured, or when the sizes could not be
+    /// recorded in `region_metadata.json`. The library index update still
+    /// succeeded either way; see `release_package`.
     pub size_warning: Option<String>,
 }
 
@@ -296,25 +297,51 @@ pub fn release_package(
     // Sizes are advisory and belong beside the region's other published facts.
     // Measuring them here rather than leaving them hand maintained is the same
     // reasoning as #200: a hand kept value beside an auto kept one diverges.
-    let installed_bytes = crate::directory_size(&package_dir)?;
-    let download_bytes = crate::directory_size(
+    //
+    // The library index update above is the release. A size that cannot be
+    // measured, or a metadata file that cannot be updated, must not turn an
+    // already completed release into an `Err` a caller might retry, which
+    // would run `add_or_update` again and bump the sequence a second time.
+    // Both failure modes are folded into `size_warning` rather than `?`,
+    // each naming which figure it is about so a measurement failure and a
+    // metadata write failure read differently.
+    let mut warnings: Vec<String> = Vec::new();
+
+    let installed_bytes = match crate::directory_size(&package_dir) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warnings.push(format!("installed size could not be measured: {e}"));
+            0
+        }
+    };
+
+    let download_bytes = match crate::directory_size(
         &repo
             .dist_dir()
             .join(region.to_lowercase())
             .join(package_type.folder_suffix()),
-    )?;
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warnings.push(format!("download size could not be measured: {e}"));
+            0
+        }
+    };
 
-    // A repository whose metadata file has not been written yet must still be
-    // releasable, so this is best effort and surfaces as a warning.
-    let size_warning = match crate::write_region_size(
+    if let Err(e) = crate::write_region_size(
         &repo.region_metadata_path(),
         region,
         package_type,
         download_bytes,
         installed_bytes,
     ) {
-        Ok(()) => None,
-        Err(e) => Some(e.to_string()),
+        warnings.push(format!("sizes not recorded in region metadata: {e}"));
+    }
+
+    let size_warning = if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("; "))
     };
 
     Ok(ReleaseResult {
@@ -715,6 +742,65 @@ mod tests {
             .expect("a missing metadata file must not block the library update");
 
         assert_eq!(result.sequence, 1);
+        assert!(
+            result.size_warning.is_some(),
+            "the release succeeded, but the sizes could not be recorded, so the caller must be told"
+        );
+    }
+
+    #[test]
+    fn releasing_still_succeeds_when_a_size_cannot_be_measured() {
+        let (_temp, repo) = setup_test_repo();
+        let config = RepoConfig::default();
+
+        setup_test_package(&repo, "na", PackageType::Ortho);
+        let build = build_package(&repo, "na", PackageType::Ortho, &config).unwrap();
+        let urls: Vec<String> = build
+            .archive
+            .parts
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("https://example.com/part{}.tar.gz", i))
+            .collect();
+        configure_urls(&repo, "na", PackageType::Ortho, &urls, false).unwrap();
+
+        std::fs::write(
+            repo.region_metadata_path(),
+            r#"{"regions":{"NA":{"name":"North America","coverage":"x","color":"blue"}}}"#,
+        )
+        .unwrap();
+
+        // Replace the dist type directory that `download_bytes` walks with a
+        // regular file. `directory_size` treats a missing path as zero, so a
+        // missing directory would not exercise the failure this test is
+        // about; a file where a directory is expected makes `fs::read_dir`
+        // return a real error instead.
+        let dist_type_dir = repo
+            .dist_dir()
+            .join("na")
+            .join(PackageType::Ortho.folder_suffix());
+        std::fs::remove_dir_all(&dist_type_dir).unwrap();
+        std::fs::write(&dist_type_dir, b"not a directory").unwrap();
+
+        let result = release_package(&repo, "na", PackageType::Ortho, "https://example.com/m.txt")
+            .expect("a size measurement failure must not fail an already completed release");
+
+        assert_eq!(
+            result.sequence, 1,
+            "the library index update already happened and must not be undone or retried"
+        );
+        assert_eq!(
+            result.download_bytes, 0,
+            "a size that failed to measure defaults to zero rather than aborting the release"
+        );
+        assert!(
+            result
+                .size_warning
+                .as_deref()
+                .is_some_and(|w| w.contains("download size")),
+            "the warning must say which figure failed to measure: {:?}",
+            result.size_warning
+        );
     }
 
     #[test]

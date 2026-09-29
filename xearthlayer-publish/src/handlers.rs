@@ -607,10 +607,7 @@ impl CommandHandler for ReleaseHandler {
 
         if let Some(ref warning) = result.size_warning {
             ctx.output.newline();
-            ctx.output.println(&format!(
-                "Warning: sizes not recorded in region metadata: {}",
-                warning
-            ));
+            ctx.output.println(&format!("Warning: {}", warning));
         }
 
         ctx.output.newline();

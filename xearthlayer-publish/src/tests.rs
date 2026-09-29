@@ -1256,6 +1256,44 @@ mod release_tests {
         assert!(output.contains("Download:"));
         assert!(output.contains("Installed:"));
     }
+
+    #[test]
+    fn release_reports_a_size_warning_verbatim() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_release_success(ReleaseResult {
+                region: "na".to_string(),
+                package_type: PackageType::Ortho,
+                version: Version::new(0, 1, 0),
+                sequence: 3,
+                download_bytes: 0,
+                installed_bytes: 52_000_000_000,
+                size_warning: Some(
+                    "download size could not be measured: disk went away".to_string(),
+                ),
+            })
+            .build();
+        let ctx = CommandContext::new(&output, &publisher);
+
+        ReleaseHandler::execute(
+            ReleaseArgs {
+                region: "na".to_string(),
+                package_type: PackageTypeArg::Ortho,
+                metadata_url: "https://example.com/m.txt".to_string(),
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        // Specific enough that the warning text being dropped, truncated, or
+        // re-wrapped with different words would fail this, not just the
+        // presence of the word "Warning".
+        assert!(
+            output.contains("download size could not be measured: disk went away"),
+            "the warning text must reach the user verbatim"
+        );
+    }
 }
 
 // ============================================================================
