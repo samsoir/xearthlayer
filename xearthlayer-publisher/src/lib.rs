@@ -85,5 +85,5 @@ pub use release::{
     BuildResult, ReleaseResult, ReleaseStatus, UrlConfigResult,
 };
 pub use repository::Repository;
-pub use size::format_size;
+pub use size::{directory_size, format_size};
 pub use urls::{generate_part_urls, validate_url, UrlVerification, UrlVerifier};

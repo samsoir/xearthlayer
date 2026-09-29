@@ -7,6 +7,11 @@
 //! a formatter would be the kind of accidental link the separation removes.
 //! The output rules are the same today so that no report changed in the move.
 
+use std::fs;
+use std::path::Path;
+
+use super::{PublishError, PublishResult};
+
 const KB: u64 = 1024;
 const MB: u64 = 1024 * KB;
 const GB: u64 = 1024 * MB;
@@ -44,6 +49,64 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Total apparent size of every regular file beneath `path`, in bytes.
+///
+/// A path that does not exist is zero rather than an error, so a caller can ask
+/// about a package that was never built without branching first.
+///
+/// This is apparent size, not allocated size. A tree of many small files
+/// therefore reads low against `du`: a package holding half a million `.ter`
+/// files loses roughly half a 4 KiB block each to slack, a few percent of a
+/// large ortho package. The number is advisory, shown to help a user judge disk
+/// cost, and apparent size keeps the walk portable.
+///
+/// Symlinks are skipped rather than followed, so a link into the tree cannot
+/// double count and a link out of it cannot escape the measurement.
+pub fn directory_size(path: &Path) -> PublishResult<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let mut total: u64 = 0;
+
+    let entries = fs::read_dir(path).map_err(|source| PublishError::ReadFailed {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|source| PublishError::ReadFailed {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        let file_type = entry
+            .file_type()
+            .map_err(|source| PublishError::ReadFailed {
+                path: entry.path(),
+                source,
+            })?;
+
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_dir() {
+            total = total.saturating_add(directory_size(&entry.path())?);
+        } else {
+            let metadata = entry
+                .metadata()
+                .map_err(|source| PublishError::ReadFailed {
+                    path: entry.path(),
+                    source,
+                })?;
+            total = total.saturating_add(metadata.len());
+        }
+    }
+
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +132,30 @@ mod tests {
         // 500 MB is the default archive part size; the prompt that shows it
         // must print the value a publisher typed.
         assert_eq!(format_size(500 * MB), "500 MB");
+    }
+
+    #[test]
+    fn directory_size_sums_files_at_every_depth() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("a.bin"), vec![0u8; 100]).unwrap();
+        let sub = temp.path().join("sub").join("deeper");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("b.bin"), vec![0u8; 250]).unwrap();
+
+        assert_eq!(directory_size(temp.path()).unwrap(), 350);
+    }
+
+    #[test]
+    fn directory_size_of_a_missing_path_is_zero() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        assert_eq!(directory_size(&temp.path().join("absent")).unwrap(), 0);
+    }
+
+    #[test]
+    fn directory_size_of_an_empty_directory_is_zero() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        assert_eq!(directory_size(temp.path()).unwrap(), 0);
     }
 }
