@@ -90,6 +90,17 @@ pub struct ReleaseResult {
 
     /// New library sequence number.
     pub sequence: u64,
+
+    /// Total size of the archive parts in `dist`, in bytes. Zero if nothing is
+    /// built yet.
+    pub download_bytes: u64,
+
+    /// Apparent size of the package directory, in bytes.
+    pub installed_bytes: u64,
+
+    /// Set when the sizes could not be recorded in `region_metadata.json`.
+    /// The library index update still succeeded.
+    pub size_warning: Option<String>,
 }
 
 /// Build archives for a package.
@@ -282,11 +293,38 @@ pub fn release_package(
 
     library.save()?;
 
+    // Sizes are advisory and belong beside the region's other published facts.
+    // Measuring them here rather than leaving them hand maintained is the same
+    // reasoning as #200: a hand kept value beside an auto kept one diverges.
+    let installed_bytes = crate::directory_size(&package_dir)?;
+    let download_bytes = crate::directory_size(
+        &repo
+            .dist_dir()
+            .join(region.to_lowercase())
+            .join(package_type.folder_suffix()),
+    )?;
+
+    // A repository whose metadata file has not been written yet must still be
+    // releasable, so this is best effort and surfaces as a warning.
+    let size_warning = match crate::write_region_size(
+        &repo.region_metadata_path(),
+        region,
+        package_type,
+        download_bytes,
+        installed_bytes,
+    ) {
+        Ok(()) => None,
+        Err(e) => Some(e.to_string()),
+    };
+
     Ok(ReleaseResult {
         region: region.to_string(),
         package_type,
         version: metadata.package_version,
         sequence: library.sequence(),
+        download_bytes,
+        installed_bytes,
+        size_warning,
     })
 }
 
@@ -608,9 +646,75 @@ mod tests {
             package_type: PackageType::Ortho,
             version: Version::new(1, 0, 0),
             sequence: 1,
+            download_bytes: 0,
+            installed_bytes: 0,
+            size_warning: None,
         };
         let debug = format!("{:?}", result);
         assert!(debug.contains("ReleaseResult"));
+    }
+
+    #[test]
+    fn releasing_records_the_package_sizes_in_region_metadata() {
+        let (_temp, repo) = setup_test_repo();
+        let config = RepoConfig::default();
+
+        setup_test_package(&repo, "na", PackageType::Ortho);
+        let build = build_package(&repo, "na", PackageType::Ortho, &config).unwrap();
+        let urls: Vec<String> = build
+            .archive
+            .parts
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("https://example.com/part{}.tar.gz", i))
+            .collect();
+        configure_urls(&repo, "na", PackageType::Ortho, &urls, false).unwrap();
+
+        std::fs::write(
+            repo.region_metadata_path(),
+            r#"{"regions":{"NA":{"name":"North America","coverage":"x","color":"blue"}}}"#,
+        )
+        .unwrap();
+
+        release_package(&repo, "na", PackageType::Ortho, "https://example.com/m.txt").unwrap();
+
+        let document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(repo.region_metadata_path()).unwrap())
+                .unwrap();
+        let size = &document["regions"]["NA"]["size"]["ortho"];
+
+        assert!(
+            size["installed_bytes"].as_u64().unwrap() > 0,
+            "the package directory has content, so installed_bytes must be non zero"
+        );
+        assert!(
+            size.get("download_bytes").is_some(),
+            "download_bytes must be written even when no archive exists yet"
+        );
+    }
+
+    #[test]
+    fn releasing_without_a_region_metadata_file_still_releases() {
+        let (_temp, repo) = setup_test_repo();
+        let config = RepoConfig::default();
+
+        setup_test_package(&repo, "na", PackageType::Ortho);
+        let build = build_package(&repo, "na", PackageType::Ortho, &config).unwrap();
+        let urls: Vec<String> = build
+            .archive
+            .parts
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("https://example.com/part{}.tar.gz", i))
+            .collect();
+        configure_urls(&repo, "na", PackageType::Ortho, &urls, false).unwrap();
+
+        let _ = std::fs::remove_file(repo.region_metadata_path());
+
+        let result = release_package(&repo, "na", PackageType::Ortho, "https://example.com/m.txt")
+            .expect("a missing metadata file must not block the library update");
+
+        assert_eq!(result.sequence, 1);
     }
 
     #[test]

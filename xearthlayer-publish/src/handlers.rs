@@ -596,6 +596,23 @@ impl CommandHandler for ReleaseHandler {
             .indented(&format!("Version:  {}", result.version));
         ctx.output
             .indented(&format!("Sequence: {}", result.sequence));
+        ctx.output.indented(&format!(
+            "Download: {}",
+            format_size_display(result.download_bytes)
+        ));
+        ctx.output.indented(&format!(
+            "Installed: {}",
+            format_size_display(result.installed_bytes)
+        ));
+
+        if let Some(ref warning) = result.size_warning {
+            ctx.output.newline();
+            ctx.output.println(&format!(
+                "Warning: sizes not recorded in region metadata: {}",
+                warning
+            ));
+        }
+
         ctx.output.newline();
         ctx.output.println("Library index updated:");
         ctx.output

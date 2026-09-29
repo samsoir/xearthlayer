@@ -381,6 +381,29 @@ mod tests {
         );
     }
 
+    // serde_json's `preserve_order` feature is what keeps a release from
+    // rewriting the whole file's key order. Without it this still passes every
+    // other test in this module (they only assert on parsed values), so this
+    // one checks the raw written string directly.
+    #[test]
+    fn writing_a_size_preserves_key_order() {
+        let file = write_temp(
+            r#"{"regions":{"NA":{"status":"staging","color":"blue","name":"North America"}}}"#,
+        );
+
+        write_region_size(file.path(), "NA", PackageType::Ortho, 1, 2).unwrap();
+
+        let written = std::fs::read_to_string(file.path()).unwrap();
+        let status_pos = written.find("\"status\"").unwrap();
+        let color_pos = written.find("\"color\"").unwrap();
+        let name_pos = written.find("\"name\"").unwrap();
+
+        assert!(
+            status_pos < color_pos && color_pos < name_pos,
+            "keys must keep their original order, not be alphabetised: {written}"
+        );
+    }
+
     #[test]
     fn an_absent_metadata_file_is_an_error() {
         let temp = tempfile::TempDir::new().unwrap();
