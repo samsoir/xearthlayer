@@ -43,6 +43,7 @@ mod archive;
 mod config;
 pub mod coverage;
 pub mod dedupe;
+mod deletion;
 mod dsf_compress;
 mod error;
 mod library;
@@ -63,6 +64,7 @@ pub use config::{
     parse_size, read_config, write_config, RepoConfig, DEFAULT_PART_SIZE, MAX_PART_SIZE,
     MIN_PART_SIZE,
 };
+pub use deletion::{execute_deletion, plan_deletion, DeletionPlan};
 pub use dsf_compress::{
     compress_dsf_files, is_sevenz, is_sevenz_file, DsfBatchStats, DsfCompressStats, DsfCompressor,
     DSF_DICT_SIZE, DSF_LZMA_LEVEL, SEVENZ_MAGIC,
