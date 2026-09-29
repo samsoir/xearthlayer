@@ -15,6 +15,7 @@ The Package Publisher creates distributable XEarthLayer Scenery Packages from Or
 5. **Generate** checksums and metadata files
 6. **Manage** library index (add, update, remove packages)
 7. **Version** packages with semantic versioning
+8. **Delete** a package the library no longer offers
 
 ## Architecture
 
@@ -47,6 +48,14 @@ The Package Publisher creates distributable XEarthLayer Scenery Packages from Or
 │  │ Detector: Find overlapping tiles across zoom levels      │  │
 │  │ Resolver: Apply priority-based removal (highest/lowest)  │  │
 │  │ Gap Analysis: Find incomplete coverage, export to O4XP   │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                    Deletion Module                        │  │
+│  │                                                           │  │
+│  │ plan_deletion:    Pure. What would go, and how much.     │  │
+│  │ execute_deletion: Acts on a plan, index entry first.     │  │
+│  │ Never touches assets already uploaded to a host.         │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
@@ -185,6 +194,19 @@ Steps:
 3. Generate checksums for metadata files
 4. Mark repository as published
 
+`release` also measures the package and records the result in
+`region_metadata.json`, under the region's `size.ortho` or `size.overlay` block:
+`download_bytes` from the archive parts in `dist/` and `installed_bytes` from
+the package working directory. That file is edited as JSON rather than through
+a typed model, so fields the publisher does not model, including the ones the
+website reads, survive the write.
+
+Updating the library index is the release. A size that cannot be measured, or a
+metadata file that is missing or has no entry for the region, is reported as a
+warning on an otherwise successful release rather than an error. An error here
+would invite a retry, and a second `release` bumps the library sequence again
+for a release that already happened.
+
 ### 6. Upload (Manual)
 
 The Publisher creates files but doesn't upload. User uploads:
@@ -199,6 +221,42 @@ rsync -avz dist/ user@server:/var/www/packages/
 # Or any other method
 ```
 
+### 7. Delete
+
+Retire a package that the library should no longer offer:
+
+```bash
+xearthlayer-publish delete --region na --dry-run   # plan only
+xearthlayer-publish delete --region na             # both package types
+```
+
+Inspection is split from action. `plan_deletion` is pure: it resolves the
+library entry, the package working directory and the dist directory, sums their
+apparent size, and changes nothing. `execute_deletion` acts on that plan. A dry
+run is the inspection on its own, which is what makes it impossible for the
+preview to describe something different from what the real run does.
+
+Three behaviours are deliberate:
+
+- **The index entry is removed first.** If a directory removal then fails, the
+  package is already unadvertised, which is the safe half to have completed:
+  nobody is offered a package whose archives are being removed underneath them.
+- **A region with nothing to delete is an error.** No index entry, no package
+  directory and no archives almost always means a mistyped region code. A
+  package that was built but never released is not an error, since reclaiming
+  its archives is one of the reasons the command exists. Omitting `--type`
+  tolerates a region that has only one of the two package types and reports the
+  other as skipped.
+- **Assets already uploaded to a hosting provider are never touched.** The
+  publisher has no model of the hosting, and those files must outlive the index
+  entry while users are still installing from them. Taking them down is a
+  separate, manual step.
+
+A region code containing a path separator is rejected before any path is built
+from it. Both directory paths are formed by joining the region into a path that
+is eventually handed to a recursive delete, and a region code is a directory
+name under Custom Scenery, so no legitimate code contains a separator.
+
 ## Ortho4XP Processing Details
 
 ### Input Structure (Ortho4XP Output)
@@ -212,8 +270,8 @@ Tiles/
 │   │   ├── 25264_10912_BI16.ter
 │   │   └── ...
 │   └── textures/
-│       ├── 25264_10912_BI16.dds      # REMOVED
-│       ├── 25264_10912_BI16_sea.png  # KEPT
+│       ├── 25264_10912_BI16.dds      # REMOVED (orthophoto)
+│       ├── 25264_10912_ZL16.png      # KEPT (water mask)
 │       └── ...
 └── +37-119/
     └── ...
@@ -232,7 +290,7 @@ zzXEL_na_ortho/
 │   ├── 25264_10912_BI16.ter
 │   └── ...
 └── textures/
-    ├── 25264_10912_BI16_sea.png
+    ├── 25264_10912_ZL16.png
     └── ...
 ```
 
@@ -242,7 +300,7 @@ zzXEL_na_ortho/
 |-----------|--------|--------|
 | `*.dsf` | Keep, compressed | Terrain mesh, written as a single-entry 7z container (see DSF Compression) |
 | `*.ter` | Keep | Terrain definitions |
-| `*_sea.png`, `*_mask.png` | Keep | Water masks |
+| `textures/*.png` | Keep | Water masks. Every PNG under a tile's `textures/` is a mask, named `{x}_{y}_ZL{n}.png` with nothing marking it as a mask, so the processor matches on the extension and keeps all of them |
 | `*.dds` | Remove | Generated on-demand |
 | `*.pol` | Keep if present | Polygon definitions |
 | `*.net` | Keep if present | Network definitions |
@@ -376,6 +434,14 @@ xearthlayer-publish dedupe \
   [--tile <lat,lon>] \
   [--dry-run] \
   [<repo_path>]
+
+# Delete a package: index entry, working directory and archives
+xearthlayer-publish delete \
+  --region <region_code> \
+  [--type <ortho|overlay>] \
+  [--dry-run] \
+  [--yes] \
+  [--repo <path>]
 ```
 
 ### CLI Architecture
@@ -385,14 +451,18 @@ The CLI is implemented using the **Command Pattern** with **trait-based dependen
 #### Module Structure
 
 ```
-xearthlayer-cli/src/commands/publish/
-├── mod.rs        # Module exports and command dispatch
-├── traits.rs     # Core interfaces (Output, PublisherService, CommandHandler)
+xearthlayer-publish/src/
+├── main.rs       # Binary entry point and command dispatch
+├── traits.rs     # Core interfaces (Output, Prompt, PublisherService, CommandHandler)
 ├── services.rs   # Concrete implementations wrapping xearthlayer-publisher
 ├── args.rs       # CLI argument types and parsing (clap-derived)
 ├── handlers.rs   # Command handlers implementing business logic
 └── output.rs     # Shared output formatting utilities
 ```
+
+The binary was split out of `xearthlayer-cli` in #284 so the runtime does not
+link the publishing dependencies. See
+[Publisher Separation](publisher-separation-design.md).
 
 #### Core Traits
 
@@ -404,6 +474,15 @@ pub trait Output: Send + Sync {
     fn newline(&self);
     fn header(&self, title: &str);
     fn indented(&self, message: &str);
+}
+
+/// Abstracts asking the user to confirm an irreversible action.
+///
+/// Separate from `Output`, which is output only. Keeping confirmation behind
+/// its own trait means a handler that deletes data can be tested without a
+/// terminal, and a test can assert that declining deletes nothing.
+pub trait Prompt: Send + Sync {
+    fn confirm(&self, question: &str) -> Result<bool, CliError>;
 }
 
 /// Abstracts all publisher operations
@@ -438,13 +517,15 @@ pub trait CommandHandler {
 // Production usage
 let output = ConsoleOutput::new();
 let publisher = DefaultPublisherService::new();
-let ctx = CommandContext::new(&output, &publisher);
+let prompt = ConsolePrompt::new();
+let ctx = CommandContext::new(&output, &publisher, &prompt);
 InitHandler::execute(args, &ctx)?;
 
 // Test usage with mocks
 let output = MockOutput::new();
 let publisher = MockPublisherService::new();
-let ctx = CommandContext::new(&output, &publisher);
+let prompt = MockPrompt::answering(false);
+let ctx = CommandContext::new(&output, &publisher, &prompt);
 InitHandler::execute(args, &ctx)?;
 assert!(output.contains("Initialized"));
 ```
