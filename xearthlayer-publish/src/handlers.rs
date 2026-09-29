@@ -1011,21 +1011,20 @@ impl CommandHandler for DeleteHandler {
         let repo = ctx.publisher.open_repository(&args.repo)?;
 
         // Plan every package first. A region where one type is missing should
-        // not half delete before reporting that.
+        // not half delete before reporting that. `plan_deletion` answers
+        // "nothing of this type" with `Ok(None)`, not an error, so a real
+        // failure always propagates regardless of whether --type was given.
         let mut plans = Vec::new();
         for package_type in types {
             match ctx
                 .publisher
-                .plan_deletion(repo.as_ref(), &args.region, package_type)
+                .plan_deletion(repo.as_ref(), &args.region, package_type)?
             {
-                Ok(plan) => plans.push(plan),
-                // With no --type this walks both, and a region legitimately
-                // having only one of them is not an error.
-                Err(e) if args.package_type.is_none() => {
+                Some(plan) => plans.push(plan),
+                None => {
                     ctx.output
-                        .indented(&format!("Skipping {}: {}", package_type, e));
+                        .indented(&format!("Skipping {}: no package found", package_type));
                 }
-                Err(e) => return Err(e),
             }
         }
 

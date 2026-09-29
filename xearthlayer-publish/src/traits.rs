@@ -288,12 +288,16 @@ pub trait PublisherService: Send + Sync {
     ) -> Result<GapAnalysisResult, CliError>;
 
     /// Work out what deleting a package would remove. Changes nothing.
+    ///
+    /// `Ok(None)` means there is nothing of this package type to delete,
+    /// which is a legitimate answer when a region has only one of ortho and
+    /// overlay. Every `Err` is a real failure and must reach the user.
     fn plan_deletion(
         &self,
         repo: &dyn RepositoryOperations,
         region: &str,
         package_type: PackageType,
-    ) -> Result<DeletionPlan, CliError>;
+    ) -> Result<Option<DeletionPlan>, CliError>;
 
     /// Carry out a deletion plan.
     fn execute_deletion(

@@ -18,8 +18,8 @@ use xearthlayer_publisher::dedupe::{
 };
 use xearthlayer_publisher::{
     coverage::{CoverageConfig, CoverageMapGenerator},
-    BuildResult, DeletionPlan, ProcessSummary, RegionMetadata, RegionSuggestion, ReleaseResult,
-    ReleaseStatus, RepoConfig, SceneryScanResult, UrlConfigResult, VersionBump,
+    BuildResult, DeletionPlan, ProcessSummary, PublishError, RegionMetadata, RegionSuggestion,
+    ReleaseResult, ReleaseStatus, RepoConfig, SceneryScanResult, UrlConfigResult, VersionBump,
 };
 
 // ============================================================================
@@ -596,12 +596,18 @@ impl PublisherService for DefaultPublisherService {
         repo: &dyn RepositoryOperations,
         region: &str,
         package_type: PackageType,
-    ) -> Result<DeletionPlan, CliError> {
+    ) -> Result<Option<DeletionPlan>, CliError> {
         let actual_repo = xearthlayer_publisher::Repository::open(repo.root())
             .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))?;
 
-        xearthlayer_publisher::plan_deletion(&actual_repo, region, package_type)
-            .map_err(|e| CliError::Publish(format!("Cannot delete: {}", e)))
+        match xearthlayer_publisher::plan_deletion(&actual_repo, region, package_type) {
+            Ok(plan) => Ok(Some(plan)),
+            // Nothing of this package type to delete is an answer, not a
+            // failure: a region legitimately has only one of ortho and
+            // overlay. Every other error is real and must reach the caller.
+            Err(PublishError::PackageNotFound { .. }) => Ok(None),
+            Err(e) => Err(CliError::Publish(format!("Cannot delete: {}", e))),
+        }
     }
 
     fn execute_deletion(

@@ -3,6 +3,7 @@
 //! This module provides mock implementations of the service traits and
 //! comprehensive tests for each command handler.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -159,6 +160,7 @@ pub struct MockPublisherServiceBuilder {
     release_status: Option<ReleaseStatus>,
     url_config_result: Option<Result<UrlConfigResult, String>>,
     release_result: Option<Result<ReleaseResult, String>>,
+    plan_deletion_overrides: HashMap<PackageType, Result<Option<DeletionPlan>, String>>,
 }
 
 impl MockPublisherServiceBuilder {
@@ -231,6 +233,22 @@ impl MockPublisherServiceBuilder {
         self
     }
 
+    /// Make `plan_deletion` answer "nothing of this type to delete" for the
+    /// given package type, without touching the other type's behaviour.
+    pub fn with_plan_deletion_not_found(mut self, package_type: PackageType) -> Self {
+        self.plan_deletion_overrides.insert(package_type, Ok(None));
+        self
+    }
+
+    /// Make `plan_deletion` fail for the given package type. Used to verify
+    /// a real failure reaches the caller instead of being read as "nothing
+    /// to delete".
+    pub fn with_plan_deletion_error(mut self, package_type: PackageType, message: &str) -> Self {
+        self.plan_deletion_overrides
+            .insert(package_type, Err(message.to_string()));
+        self
+    }
+
     pub fn build(self) -> MockPublisherService {
         MockPublisherService {
             init_result: self.init_result.unwrap_or(Ok(PathBuf::from("/tmp/repo"))),
@@ -246,6 +264,7 @@ impl MockPublisherServiceBuilder {
             release_status: self.release_status.unwrap_or(ReleaseStatus::NotBuilt),
             url_config_result: self.url_config_result,
             release_result: self.release_result,
+            plan_deletion_overrides: self.plan_deletion_overrides,
             captured_coverage_metadata_path: RwLock::new(None),
         }
     }
@@ -264,6 +283,7 @@ pub struct MockPublisherService {
     release_status: ReleaseStatus,
     url_config_result: Option<Result<UrlConfigResult, String>>,
     release_result: Option<Result<ReleaseResult, String>>,
+    plan_deletion_overrides: HashMap<PackageType, Result<Option<DeletionPlan>, String>>,
     captured_coverage_metadata_path: RwLock<Option<PathBuf>>,
 }
 
@@ -542,15 +562,22 @@ impl PublisherService for MockPublisherService {
         _repo: &dyn RepositoryOperations,
         region: &str,
         package_type: PackageType,
-    ) -> Result<DeletionPlan, CliError> {
-        Ok(DeletionPlan {
+    ) -> Result<Option<DeletionPlan>, CliError> {
+        if let Some(override_result) = self.plan_deletion_overrides.get(&package_type) {
+            return match override_result {
+                Ok(plan) => Ok(plan.clone()),
+                Err(e) => Err(CliError::Publish(e.clone())),
+            };
+        }
+
+        Ok(Some(DeletionPlan {
             region: region.to_string(),
             package_type,
             in_library: true,
             package_dir: Some(PathBuf::from("/tmp/packages/pkg")),
             dist_dir: Some(PathBuf::from("/tmp/dist/pkg")),
             bytes_freed: 1024,
-        })
+        }))
     }
 
     fn execute_deletion(
@@ -1619,6 +1646,129 @@ mod delete_tests {
         .unwrap();
 
         assert!(!prompt.was_asked(), "--yes must skip the prompt");
+    }
+
+    #[test]
+    fn omitting_type_reports_skip_for_the_package_type_with_nothing_to_delete() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_plan_deletion_not_found(PackageType::Overlay)
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let result = DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: None,
+                dry_run: false,
+                yes: true,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        );
+
+        assert!(
+            result.is_ok(),
+            "a region legitimately having only one package type must not error: {:?}",
+            result
+        );
+        assert!(output.contains("Skipping"));
+        assert!(output.contains("overlay"));
+    }
+
+    #[test]
+    fn omitting_type_with_neither_package_present_is_an_error() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_plan_deletion_not_found(PackageType::Ortho)
+            .with_plan_deletion_not_found(PackageType::Overlay)
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let result = DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: None,
+                dry_run: false,
+                yes: true,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        );
+
+        let Err(err) = result else {
+            panic!("a region with nothing to delete under either type must error");
+        };
+        assert!(err.to_string().contains("Nothing to delete"));
+        assert!(err.to_string().contains("NA"));
+    }
+
+    #[test]
+    fn a_plan_deletion_failure_is_returned_not_swallowed_when_type_is_omitted() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_plan_deletion_error(
+                PackageType::Ortho,
+                "a region code must not contain a path separator",
+            )
+            .with_plan_deletion_error(
+                PackageType::Overlay,
+                "a region code must not contain a path separator",
+            )
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let result = DeleteHandler::execute(
+            DeleteArgs {
+                region: "x/../evil".to_string(),
+                package_type: None,
+                dry_run: false,
+                yes: true,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        );
+
+        let Err(err) = result else {
+            panic!("a real plan_deletion failure must reach the caller, not be skipped");
+        };
+        assert!(
+            err.to_string().contains("path separator"),
+            "the real error must reach the caller: {err}"
+        );
+        assert!(
+            !err.to_string().contains("Nothing to delete"),
+            "a real failure must not be misreported as an empty region: {err}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_type_still_propagates_a_plan_deletion_failure() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_plan_deletion_error(PackageType::Ortho, "boom")
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let result = DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: Some(PackageTypeArg::Ortho),
+                dry_run: false,
+                yes: true,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        );
+
+        let Err(err) = result else {
+            panic!("an explicit --type must not swallow a plan_deletion failure either");
+        };
+        assert!(err.to_string().contains("boom"));
     }
 
     #[test]
