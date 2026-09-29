@@ -157,6 +157,9 @@ mod tests {
 
     /// A repository with a package directory, a dist directory and a library
     /// entry for `na` ortho.
+    ///
+    /// The metadata file `add_or_update` checksums lives outside both
+    /// counted directories, so it does not perturb `bytes_freed`.
     fn repo_with_released_package() -> (TempDir, Repository) {
         let temp = TempDir::new().unwrap();
         let repo = Repository::init(temp.path()).unwrap();
@@ -169,6 +172,20 @@ mod tests {
         std::fs::create_dir_all(&dist).unwrap();
         std::fs::write(dist.join("archive.tar.gz.aa"), vec![0u8; 1024]).unwrap();
 
+        let metadata_path = temp.path().join("meta_source.txt");
+        std::fs::write(&metadata_path, "metadata").unwrap();
+        let mut library = LibraryManager::open_or_create(repo.root()).unwrap();
+        library
+            .add_or_update(
+                &metadata_path,
+                "NA",
+                PackageType::Ortho,
+                semver::Version::new(1, 0, 0),
+                "https://example.com/na/ortho/meta.txt",
+            )
+            .unwrap();
+        library.save().unwrap();
+
         (temp, repo)
     }
 
@@ -178,6 +195,7 @@ mod tests {
 
         let plan = plan_deletion(&repo, "na", PackageType::Ortho).unwrap();
 
+        assert!(plan.in_library, "the fixture registers a library entry");
         assert!(plan.package_dir.is_some());
         assert!(plan.dist_dir.is_some());
         assert_eq!(plan.bytes_freed, 512 + 1024);
@@ -284,11 +302,18 @@ mod tests {
     fn executing_removes_both_directories() {
         let (_temp, repo) = repo_with_released_package();
         let plan = plan_deletion(&repo, "na", PackageType::Ortho).unwrap();
+        assert!(plan.in_library, "the fixture registers a library entry");
 
         execute_deletion(&repo, &plan).unwrap();
 
         assert!(!repo.package_dir("na", PackageType::Ortho).exists());
         assert!(!repo.dist_dir().join("na").join("ortho").exists());
+
+        let library = LibraryManager::open_or_create(repo.root()).unwrap();
+        assert!(
+            !library.contains("na", PackageType::Ortho),
+            "execute_deletion must remove the library index entry"
+        );
     }
 
     #[test]
