@@ -15,7 +15,7 @@ use crate::error::CliError;
 use xearthlayer_package::{ArchivePart, PackageMetadata, PackageType};
 use xearthlayer_publisher::dedupe::{DedupeFilter, GapAnalysisResult, ZoomPriority};
 use xearthlayer_publisher::{
-    ArchiveBuildResult, BuildResult, ProcessSummary, RegionSuggestion, ReleaseResult,
+    ArchiveBuildResult, BuildResult, DeletionPlan, ProcessSummary, RegionSuggestion, ReleaseResult,
     ReleaseStatus, RepoConfig, SceneryScanResult, SuggestedRegion, TileInfo, UrlConfigResult,
     VersionBump,
 };
@@ -535,6 +535,30 @@ impl PublisherService for MockPublisherService {
     ) -> Result<GapAnalysisResult, CliError> {
         // Return an empty gap analysis result
         Ok(GapAnalysisResult::default())
+    }
+
+    fn plan_deletion(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        region: &str,
+        package_type: PackageType,
+    ) -> Result<DeletionPlan, CliError> {
+        Ok(DeletionPlan {
+            region: region.to_string(),
+            package_type,
+            in_library: true,
+            package_dir: Some(PathBuf::from("/tmp/packages/pkg")),
+            dist_dir: Some(PathBuf::from("/tmp/dist/pkg")),
+            bytes_freed: 1024,
+        })
+    }
+
+    fn execute_deletion(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        _plan: &DeletionPlan,
+    ) -> Result<(), CliError> {
+        Ok(())
     }
 }
 
@@ -1545,5 +1569,78 @@ mod coverage_tests {
             publisher.captured_coverage_metadata_path(),
             Some(custom_path)
         );
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+
+    #[test]
+    fn delete_asks_before_removing_anything() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default().build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: None,
+                dry_run: false,
+                yes: false,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(prompt.was_asked(), "deletion must ask before acting");
+        assert!(output.contains("Cancelled"));
+    }
+
+    #[test]
+    fn delete_with_yes_does_not_ask() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default().build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: None,
+                dry_run: false,
+                yes: true,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(!prompt.was_asked(), "--yes must skip the prompt");
+    }
+
+    #[test]
+    fn a_dry_run_never_asks_and_never_deletes() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default().build();
+        let prompt = MockPrompt::answering(true);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: None,
+                dry_run: true,
+                yes: false,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(!prompt.was_asked(), "a dry run has nothing to confirm");
+        assert!(output.contains("Dry run"));
     }
 }

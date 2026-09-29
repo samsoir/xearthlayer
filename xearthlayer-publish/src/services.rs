@@ -18,8 +18,8 @@ use xearthlayer_publisher::dedupe::{
 };
 use xearthlayer_publisher::{
     coverage::{CoverageConfig, CoverageMapGenerator},
-    BuildResult, ProcessSummary, RegionMetadata, RegionSuggestion, ReleaseResult, ReleaseStatus,
-    RepoConfig, SceneryScanResult, UrlConfigResult, VersionBump,
+    BuildResult, DeletionPlan, ProcessSummary, RegionMetadata, RegionSuggestion, ReleaseResult,
+    ReleaseStatus, RepoConfig, SceneryScanResult, UrlConfigResult, VersionBump,
 };
 
 // ============================================================================
@@ -81,9 +81,66 @@ impl Prompt for ConsolePrompt {
             .read_line(&mut answer)
             .map_err(|e| CliError::Publish(format!("could not read the answer: {e}")))?;
 
-        // Anything that is not an explicit yes is a no, including end of input
-        // when stdin is not a terminal.
-        Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+        Ok(is_affirmative(&answer))
+    }
+}
+
+/// True only for an explicit yes. Anything else, including an empty answer
+/// from a closed stdin, is a no.
+fn is_affirmative(answer: &str) -> bool {
+    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+#[cfg(test)]
+mod is_affirmative_tests {
+    use super::is_affirmative;
+
+    #[test]
+    fn lowercase_y_is_affirmative() {
+        assert!(is_affirmative("y"));
+    }
+
+    #[test]
+    fn lowercase_yes_is_affirmative() {
+        assert!(is_affirmative("yes"));
+    }
+
+    #[test]
+    fn uppercase_y_is_affirmative() {
+        assert!(is_affirmative("Y"));
+    }
+
+    #[test]
+    fn uppercase_yes_is_affirmative() {
+        assert!(is_affirmative("YES"));
+    }
+
+    #[test]
+    fn a_trailing_newline_is_still_affirmative() {
+        assert!(is_affirmative("y\n"));
+        assert!(is_affirmative("yes\n"));
+    }
+
+    #[test]
+    fn an_empty_answer_is_not_affirmative() {
+        // The closed-stdin case: read_line returns Ok(0) with an empty string.
+        assert!(!is_affirmative(""));
+    }
+
+    #[test]
+    fn a_bare_newline_is_not_affirmative() {
+        assert!(!is_affirmative("\n"));
+    }
+
+    #[test]
+    fn no_is_not_affirmative() {
+        assert!(!is_affirmative("n"));
+        assert!(!is_affirmative("no"));
+    }
+
+    #[test]
+    fn an_unrecognised_answer_is_not_affirmative() {
+        assert!(!is_affirmative("maybe"));
     }
 }
 
@@ -532,5 +589,30 @@ impl PublisherService for DefaultPublisherService {
         let result = detector.analyze_gaps(&tiles);
 
         Ok(result)
+    }
+
+    fn plan_deletion(
+        &self,
+        repo: &dyn RepositoryOperations,
+        region: &str,
+        package_type: PackageType,
+    ) -> Result<DeletionPlan, CliError> {
+        let actual_repo = xearthlayer_publisher::Repository::open(repo.root())
+            .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))?;
+
+        xearthlayer_publisher::plan_deletion(&actual_repo, region, package_type)
+            .map_err(|e| CliError::Publish(format!("Cannot delete: {}", e)))
+    }
+
+    fn execute_deletion(
+        &self,
+        repo: &dyn RepositoryOperations,
+        plan: &DeletionPlan,
+    ) -> Result<(), CliError> {
+        let actual_repo = xearthlayer_publisher::Repository::open(repo.root())
+            .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))?;
+
+        xearthlayer_publisher::execute_deletion(&actual_repo, plan)
+            .map_err(|e| CliError::Publish(format!("Deletion failed: {}", e)))
     }
 }

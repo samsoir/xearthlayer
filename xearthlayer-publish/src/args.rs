@@ -363,6 +363,30 @@ pub enum PublishCommands {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
+
+    /// Delete a regional package: its library index entry, working directory
+    /// and archives.
+    Delete {
+        /// Region code (e.g. "na-usa-mx-central")
+        #[arg(long)]
+        region: String,
+
+        /// Package type. Omit to delete both ortho and overlay.
+        #[arg(long, value_enum)]
+        r#type: Option<PackageTypeArg>,
+
+        /// Show what would be deleted without deleting it
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+
+        /// Repository path
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
 }
 
 /// Report format options for gap analysis.
@@ -488,5 +512,15 @@ pub struct GapsArgs {
     pub tile: Option<String>,
     pub report: Option<PathBuf>,
     pub report_format: GapReportFormatArg,
+    pub repo: PathBuf,
+}
+
+/// Arguments for the delete command.
+pub struct DeleteArgs {
+    pub region: String,
+    /// `None` means both package types.
+    pub package_type: Option<PackageTypeArg>,
+    pub dry_run: bool,
+    pub yes: bool,
     pub repo: PathBuf,
 }

@@ -34,14 +34,14 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use args::{
-    AddArgs, BuildArgs, CoverageArgs, DedupeArgs, GapsArgs, InitArgs, ListArgs, PublishCommands,
-    ReleaseArgs, ScanArgs, StatusArgs, UrlsArgs, ValidateArgs, VersionArgs,
+    AddArgs, BuildArgs, CoverageArgs, DedupeArgs, DeleteArgs, GapsArgs, InitArgs, ListArgs,
+    PublishCommands, ReleaseArgs, ScanArgs, StatusArgs, UrlsArgs, ValidateArgs, VersionArgs,
 };
 use error::CliError;
 use handlers::{
-    AddHandler, BuildHandler, CoverageHandler, DedupeHandler, GapsHandler, InitHandler,
-    ListHandler, ReleaseHandler, ScanHandler, StatusHandler, UrlsHandler, ValidateHandler,
-    VersionHandler,
+    AddHandler, BuildHandler, CoverageHandler, DedupeHandler, DeleteHandler, GapsHandler,
+    InitHandler, ListHandler, ReleaseHandler, ScanHandler, StatusHandler, UrlsHandler,
+    ValidateHandler, VersionHandler,
 };
 use services::{ConsoleOutput, ConsolePrompt, DefaultPublisherService};
 use traits::{CommandContext, CommandHandler};
@@ -260,6 +260,23 @@ fn run(command: PublishCommands) -> Result<(), CliError> {
             },
             &ctx,
         ),
+
+        PublishCommands::Delete {
+            region,
+            r#type,
+            dry_run,
+            yes,
+            repo,
+        } => DeleteHandler::execute(
+            DeleteArgs {
+                region,
+                package_type: r#type,
+                dry_run,
+                yes,
+                repo,
+            },
+            &ctx,
+        ),
     }
 }
 
@@ -270,9 +287,9 @@ mod cli_tests {
     use super::Cli;
 
     /// Every subcommand `xearthlayer publish` offered, and none it did not.
-    const SUBCOMMANDS: [&str; 13] = [
+    const SUBCOMMANDS: [&str; 14] = [
         "init", "scan", "add", "list", "build", "urls", "version", "release", "status", "validate",
-        "coverage", "dedupe", "gaps",
+        "coverage", "dedupe", "gaps", "delete",
     ];
 
     #[test]

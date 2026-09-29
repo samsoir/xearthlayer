@@ -13,8 +13,8 @@ use crate::error::CliError;
 use xearthlayer_package::{PackageMetadata, PackageType};
 use xearthlayer_publisher::dedupe::{DedupeFilter, GapAnalysisResult, TileReference, ZoomPriority};
 use xearthlayer_publisher::{
-    BuildResult, ProcessSummary, RegionSuggestion, ReleaseResult, ReleaseStatus, RepoConfig,
-    SceneryScanResult, UrlConfigResult, VersionBump,
+    BuildResult, DeletionPlan, ProcessSummary, RegionSuggestion, ReleaseResult, ReleaseStatus,
+    RepoConfig, SceneryScanResult, UrlConfigResult, VersionBump,
 };
 
 /// Result of coverage map generation.
@@ -104,7 +104,6 @@ pub trait Output: Send + Sync {
 /// a trait means a handler that deletes data can be tested without a terminal.
 pub trait Prompt: Send + Sync {
     /// Ask a yes or no question. Returns true only on an explicit yes.
-    #[allow(dead_code)] // Consumed by the delete handler in Task 7 (#287)
     fn confirm(&self, question: &str) -> Result<bool, CliError>;
 }
 
@@ -287,6 +286,21 @@ pub trait PublisherService: Send + Sync {
         package_type: PackageType,
         filter: Option<DedupeFilter>,
     ) -> Result<GapAnalysisResult, CliError>;
+
+    /// Work out what deleting a package would remove. Changes nothing.
+    fn plan_deletion(
+        &self,
+        repo: &dyn RepositoryOperations,
+        region: &str,
+        package_type: PackageType,
+    ) -> Result<DeletionPlan, CliError>;
+
+    /// Carry out a deletion plan.
+    fn execute_deletion(
+        &self,
+        repo: &dyn RepositoryOperations,
+        plan: &DeletionPlan,
+    ) -> Result<(), CliError>;
 }
 
 // ============================================================================
@@ -306,7 +320,6 @@ pub struct CommandContext<'a> {
     pub publisher: &'a dyn PublisherService,
 
     /// Confirmation interface for irreversible actions.
-    #[allow(dead_code)] // Consumed by the delete handler in Task 7 (#287)
     pub prompt: &'a dyn Prompt,
 }
 
