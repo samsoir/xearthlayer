@@ -41,6 +41,41 @@ pub struct DeletionPlan {
     pub bytes_freed: u64,
 }
 
+/// Reject a region code that could escape the repository root once it is
+/// joined into a path.
+///
+/// Both `package_dir` and `dist_dir` are built by joining the region straight
+/// into a path, and `package_mountpoint` only prefixes the first path
+/// component it produces: a `..` segment further along survives untouched.
+/// `plan_deletion` is the last point in the library that sees the raw region
+/// before those paths are built and, eventually, handed to a recursive
+/// delete, so it must refuse anything that is not a plain directory name.
+///
+/// There is no legitimate region code containing a path separator: the code
+/// becomes a directory name under Custom Scenery, so rejecting these costs
+/// nothing real.
+fn validate_region(region: &str) -> PublishResult<()> {
+    if region.is_empty() {
+        return Err(PublishError::InvalidPath(format!(
+            "region '{region}' is invalid: a region code must not be empty"
+        )));
+    }
+
+    if region.chars().any(std::path::is_separator) {
+        return Err(PublishError::InvalidPath(format!(
+            "region '{region}' is invalid: a region code must not contain a path separator"
+        )));
+    }
+
+    if region == "." || region == ".." {
+        return Err(PublishError::InvalidPath(format!(
+            "region '{region}' is invalid: a region code must not be a path traversal segment"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Work out what deleting a package would remove. Changes nothing.
 ///
 /// A region with no index entry, no package directory and no archives is an
@@ -52,6 +87,8 @@ pub fn plan_deletion(
     region: &str,
     package_type: PackageType,
 ) -> PublishResult<DeletionPlan> {
+    validate_region(region)?;
+
     let in_library = LibraryManager::open_or_create(repo.root())?.contains(region, package_type);
 
     let package_dir = repo.package_dir(region, package_type);
@@ -168,6 +205,64 @@ mod tests {
             err.to_string().to_lowercase().contains("zz-typo"),
             "the error should name the region: {err}"
         );
+    }
+
+    #[test]
+    fn planning_rejects_a_region_with_a_path_traversal_segment() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        let region = "x/../../../../tmp/evil";
+        let err = plan_deletion(&repo, region, PackageType::Ortho)
+            .expect_err("a region containing a path separator must be rejected");
+
+        assert!(
+            err.to_string().contains(region),
+            "the error should name the offending region: {err}"
+        );
+    }
+
+    #[test]
+    fn planning_does_not_touch_a_directory_outside_the_repository_root() {
+        let outer = TempDir::new().unwrap();
+        let repo_root = outer.path().join("repo");
+        let repo = Repository::init(&repo_root).unwrap();
+
+        // Two levels up from `repo/dist` lands on `outer`, then back down
+        // into `victim/ortho`: exactly where an unvalidated dist_dir join
+        // would resolve for this region.
+        let victim_dir = outer.path().join("victim").join("ortho");
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        std::fs::write(victim_dir.join("do-not-delete.bin"), b"precious").unwrap();
+
+        let region = "../../victim";
+        let err = plan_deletion(&repo, region, PackageType::Ortho)
+            .expect_err("a region escaping the repository root must be rejected");
+        assert!(
+            err.to_string().contains(region),
+            "the error should name the offending region: {err}"
+        );
+
+        assert!(
+            victim_dir.join("do-not-delete.bin").exists(),
+            "plan_deletion must never touch a path outside the repository root"
+        );
+    }
+
+    #[test]
+    fn planning_accepts_a_region_code_with_hyphens() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let region = "na-usa-mx-central";
+
+        let package_dir = repo.package_dir(region, PackageType::Ortho);
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(package_dir.join("payload.bin"), vec![0u8; 4]).unwrap();
+
+        let plan = plan_deletion(&repo, region, PackageType::Ortho)
+            .expect("a hyphenated region code is a valid region code");
+
+        assert!(plan.package_dir.is_some());
     }
 
     #[test]
