@@ -43,7 +43,7 @@ use handlers::{
     ListHandler, ReleaseHandler, ScanHandler, StatusHandler, UrlsHandler, ValidateHandler,
     VersionHandler,
 };
-use services::{ConsoleOutput, DefaultPublisherService};
+use services::{ConsoleOutput, ConsolePrompt, DefaultPublisherService};
 use traits::{CommandContext, CommandHandler};
 
 /// Create and publish XEarthLayer scenery packages.
@@ -75,7 +75,8 @@ fn run(command: PublishCommands) -> Result<(), CliError> {
     // Create production context
     let output = ConsoleOutput::new();
     let publisher = DefaultPublisherService::new();
-    let ctx = CommandContext::new(&output, &publisher);
+    let prompt = ConsolePrompt::new();
+    let ctx = CommandContext::new(&output, &publisher, &prompt);
 
     // Dispatch to appropriate handler
     match command {

@@ -95,6 +95,20 @@ pub trait Output: Send + Sync {
 }
 
 // ============================================================================
+// Prompt Trait - Abstracts interactive confirmation
+// ============================================================================
+
+/// Trait for asking the user to confirm an irreversible action.
+///
+/// Separate from [`Output`], which is output only. Keeping confirmation behind
+/// a trait means a handler that deletes data can be tested without a terminal.
+pub trait Prompt: Send + Sync {
+    /// Ask a yes or no question. Returns true only on an explicit yes.
+    #[allow(dead_code)] // Consumed by the delete handler in Task 7 (#287)
+    fn confirm(&self, question: &str) -> Result<bool, CliError>;
+}
+
+// ============================================================================
 // Repository Operations Trait - Abstracts repository access
 // ============================================================================
 
@@ -290,12 +304,24 @@ pub struct CommandContext<'a> {
 
     /// Publisher service for repository operations.
     pub publisher: &'a dyn PublisherService,
+
+    /// Confirmation interface for irreversible actions.
+    #[allow(dead_code)] // Consumed by the delete handler in Task 7 (#287)
+    pub prompt: &'a dyn Prompt,
 }
 
 impl<'a> CommandContext<'a> {
     /// Create a new command context.
-    pub fn new(output: &'a dyn Output, publisher: &'a dyn PublisherService) -> Self {
-        Self { output, publisher }
+    pub fn new(
+        output: &'a dyn Output,
+        publisher: &'a dyn PublisherService,
+        prompt: &'a dyn Prompt,
+    ) -> Self {
+        Self {
+            output,
+            publisher,
+            prompt,
+        }
     }
 }
 

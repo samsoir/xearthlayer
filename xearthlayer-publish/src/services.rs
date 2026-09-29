@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use semver::Version;
 
 use super::traits::{
-    CoverageResult, DedupeReport, Output, OverlapSummary, PublisherService, RepositoryOperations,
+    CoverageResult, DedupeReport, Output, OverlapSummary, Prompt, PublisherService,
+    RepositoryOperations,
 };
 use crate::error::CliError;
 use xearthlayer_package::{PackageMetadata, PackageType};
@@ -43,6 +44,46 @@ impl Output for ConsoleOutput {
 
     fn print(&self, message: &str) {
         print!("{}", message);
+    }
+}
+
+// ============================================================================
+// Console Prompt Implementation
+// ============================================================================
+
+/// Reads a yes or no answer from stdin.
+pub struct ConsolePrompt;
+
+impl ConsolePrompt {
+    /// Create a console prompt.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for ConsolePrompt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Prompt for ConsolePrompt {
+    fn confirm(&self, question: &str) -> Result<bool, CliError> {
+        use std::io::{self, Write};
+
+        print!("{} [y/N] ", question);
+        io::stdout()
+            .flush()
+            .map_err(|e| CliError::Publish(format!("could not write the prompt: {e}")))?;
+
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(|e| CliError::Publish(format!("could not read the answer: {e}")))?;
+
+        // Anything that is not an explicit yes is a no, including end of input
+        // when stdin is not a terminal.
+        Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
     }
 }
 

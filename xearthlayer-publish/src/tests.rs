@@ -65,6 +65,44 @@ impl Output for MockOutput {
 }
 
 // ============================================================================
+// Mock Prompt Implementation
+// ============================================================================
+
+/// Mock prompt with a fixed answer, recording what it was asked.
+pub struct MockPrompt {
+    answer: bool,
+    questions: RwLock<Vec<String>>,
+}
+
+impl MockPrompt {
+    pub fn answering(answer: bool) -> Self {
+        Self {
+            answer,
+            questions: RwLock::new(Vec::new()),
+        }
+    }
+
+    pub fn was_asked(&self) -> bool {
+        !self.questions.read().unwrap().is_empty()
+    }
+}
+
+impl Prompt for MockPrompt {
+    fn confirm(&self, question: &str) -> Result<bool, CliError> {
+        self.questions.write().unwrap().push(question.to_string());
+        Ok(self.answer)
+    }
+}
+
+#[test]
+fn a_mock_prompt_records_the_question_and_returns_its_answer() {
+    let prompt = MockPrompt::answering(true);
+
+    assert!(prompt.confirm("Delete NA ortho?").unwrap());
+    assert!(prompt.was_asked());
+}
+
+// ============================================================================
 // Mock Repository Implementation
 // ============================================================================
 
@@ -594,7 +632,8 @@ mod init_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_init_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = InitArgs {
             path: PathBuf::from("/test/repo"),
@@ -616,7 +655,8 @@ mod init_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_init_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = InitArgs {
             path: PathBuf::from("/test/repo"),
@@ -635,7 +675,8 @@ mod init_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_init_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = InitArgs {
             path: PathBuf::from("/test/repo"),
@@ -656,7 +697,8 @@ mod init_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_init_error("Permission denied")
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = InitArgs {
             path: PathBuf::from("/test/repo"),
@@ -686,7 +728,8 @@ mod scan_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_scan_success(create_test_scan_result())
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ScanArgs {
             source: PathBuf::from("/ortho4xp/tiles"),
@@ -709,7 +752,8 @@ mod scan_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_scan_success(SceneryScanResult::new(Vec::new()))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ScanArgs {
             source: PathBuf::from("/ortho4xp/tiles"),
@@ -728,7 +772,8 @@ mod scan_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_scan_error("Directory not found")
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ScanArgs {
             source: PathBuf::from("/nonexistent"),
@@ -767,7 +812,8 @@ mod add_tests {
                 warnings: Vec::new(),
             })
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = AddArgs {
             source: PathBuf::from("/ortho4xp/tiles"),
@@ -814,7 +860,8 @@ mod add_tests {
                 warnings: Vec::new(),
             })
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = AddArgs {
             source: PathBuf::from("/ortho4xp/tiles"),
@@ -840,7 +887,8 @@ mod add_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_scan_success(SceneryScanResult::new(Vec::new()))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = AddArgs {
             source: PathBuf::from("/ortho4xp/tiles"),
@@ -866,7 +914,8 @@ mod add_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_open_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = AddArgs {
             source: PathBuf::from("/ortho4xp/tiles"),
@@ -904,7 +953,8 @@ mod add_tests {
                 warnings: Vec::new(),
             })
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = AddArgs {
             source: PathBuf::from("/ortho4xp/overlays"),
@@ -945,7 +995,8 @@ mod list_tests {
             ])
             .with_release_status(ReleaseStatus::Ready)
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ListArgs {
             repo: PathBuf::from("/test/repo"),
@@ -967,7 +1018,8 @@ mod list_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_packages(Vec::new())
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ListArgs {
             repo: PathBuf::from("/test/repo"),
@@ -989,7 +1041,8 @@ mod list_tests {
             .with_metadata(create_test_metadata())
             .with_release_status(ReleaseStatus::Ready)
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ListArgs {
             repo: PathBuf::from("/test/repo"),
@@ -1020,7 +1073,8 @@ mod build_tests {
             .with_config(RepoConfig::default())
             .with_build_success(create_test_build_result())
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = BuildArgs {
             region: "na".to_string(),
@@ -1061,7 +1115,8 @@ mod urls_tests {
                 failed_urls: Vec::new(),
             })
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = UrlsArgs {
             region: "na".to_string(),
@@ -1088,7 +1143,8 @@ mod urls_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_metadata(metadata)
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = UrlsArgs {
             region: "na".to_string(),
@@ -1122,7 +1178,8 @@ mod version_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_metadata(create_test_metadata())
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = VersionArgs {
             region: "na".to_string(),
@@ -1145,7 +1202,8 @@ mod version_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_metadata(create_test_metadata())
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = VersionArgs {
             region: "na".to_string(),
@@ -1169,7 +1227,8 @@ mod version_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_metadata(create_test_metadata())
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = VersionArgs {
             region: "na".to_string(),
@@ -1209,7 +1268,8 @@ mod release_tests {
                 size_warning: None,
             })
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ReleaseArgs {
             region: "na".to_string(),
@@ -1240,7 +1300,8 @@ mod release_tests {
                 size_warning: None,
             })
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         ReleaseHandler::execute(
             ReleaseArgs {
@@ -1273,7 +1334,8 @@ mod release_tests {
                 ),
             })
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         ReleaseHandler::execute(
             ReleaseArgs {
@@ -1313,7 +1375,8 @@ mod status_tests {
             .with_metadata(create_test_metadata())
             .with_release_status(ReleaseStatus::Ready)
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = StatusArgs {
             region: None,
@@ -1336,7 +1399,8 @@ mod status_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_packages(Vec::new())
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = StatusArgs {
             region: None,
@@ -1366,7 +1430,8 @@ mod validate_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_packages(vec![("na".to_string(), PackageType::Ortho)])
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ValidateArgs {
             repo: PathBuf::from("/test/repo"),
@@ -1406,7 +1471,8 @@ mod coverage_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_open_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = base_coverage_args(None, false);
 
@@ -1425,7 +1491,8 @@ mod coverage_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_open_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let custom_path = PathBuf::from("/custom/location/region_metadata.json");
         let args = base_coverage_args(Some(custom_path.clone()), false);
@@ -1445,7 +1512,8 @@ mod coverage_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_open_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = base_coverage_args(None, true);
 
@@ -1464,7 +1532,8 @@ mod coverage_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_open_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let custom_path = PathBuf::from("/custom/location/region_metadata.json");
         let args = base_coverage_args(Some(custom_path.clone()), true);
