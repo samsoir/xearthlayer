@@ -202,7 +202,6 @@ fn test_init_with_custom_part_size() {
 }
 
 #[test]
-#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_scan_discovers_tiles() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let tiles_dir = temp.path().join("tiles");
@@ -231,7 +230,6 @@ fn test_scan_discovers_tiles() {
 }
 
 #[test]
-#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_scan_suggests_region() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let tiles_dir = temp.path().join("tiles");
@@ -256,7 +254,6 @@ fn test_scan_suggests_region() {
 }
 
 #[test]
-#[ignore = "integration test - run with 'make integration-tests'"]
 fn test_full_workflow_init_scan_add() {
     let temp = TempDir::new().expect("Failed to create temp dir");
     let repo_path = temp.path().join("repo");

@@ -432,9 +432,11 @@ impl PublisherService for DefaultPublisherService {
     fn scan_overlaps(&self, source: &Path) -> Result<OverlapSummary, CliError> {
         let detector = OverlapDetector::new();
 
-        // Scan the source directory for tiles
+        // `source` is an Ortho4XP tiles root: one directory per tile, each
+        // with its own terrain/. Aggregate across all of them rather than
+        // treating the root itself as a single package (#286).
         let tiles = detector
-            .scan_package(source)
+            .scan_tiles_root(source)
             .map_err(|e| CliError::Publish(format!("Failed to scan for overlaps: {}", e)))?;
 
         if tiles.is_empty() {

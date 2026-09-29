@@ -125,8 +125,16 @@ impl CommandHandler for ScanHandler {
         // Scan for overlaps (ortho only, overlays don't have zoom levels)
         if package_type == PackageType::Ortho && !scan_result.tiles.is_empty() {
             ctx.output.newline();
-            let overlap_summary = ctx.publisher.scan_overlaps(&args.source)?;
-            print_overlap_summary(ctx.output, &overlap_summary);
+            // An overlap scan that fails must not turn a successful scan into a
+            // non-zero exit after the results have already printed (#286).
+            match ctx.publisher.scan_overlaps(&args.source) {
+                Ok(summary) => print_overlap_summary(ctx.output, &summary),
+                Err(e) => {
+                    ctx.output.newline();
+                    ctx.output
+                        .println(&format!("Warning: could not scan for zoom overlaps: {}", e));
+                }
+            }
         }
 
         Ok(())
