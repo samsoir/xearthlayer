@@ -306,11 +306,11 @@ Releasing EU-PARIS ortho to library index...
 
 Package released successfully!
 
-  Region:   EU-PARIS
-  Type:     ortho
-  Version:  1.0.0
-  Sequence: 1
-  Download: 1.2 GB
+  Region:    EU-PARIS
+  Type:      ortho
+  Version:   1.0.0
+  Sequence:  1
+  Download:  1.2 GB
   Installed: 3.4 GB
 
 Library index updated:

@@ -5,7 +5,11 @@
 //!
 //! # Running Integration Tests
 //!
-//! Integration tests are excluded from regular test runs. Use:
+//! Most tests in this file are `#[ignore]`d because they shell out to the
+//! built CLI binary, which is slower than the unit tests and needs a prior
+//! `cargo build`. A handful of faster ones are not ignored and already run
+//! as part of a regular `cargo test`. To run everything in this file,
+//! including the ignored ones, use:
 //! ```bash
 //! make integration-tests
 //! ```
@@ -114,30 +118,15 @@ impl MockTileBuilder {
     }
 }
 
-/// Get the path to the xearthlayer-publish binary.
+/// Get the path to the xearthlayer-publish binary Cargo built for this test
+/// run.
+///
+/// `CARGO_BIN_EXE_<name>` is set by Cargo to the binary it just built for the
+/// current profile, so this always matches what `cargo test` (debug or
+/// `--release`) is actually running, rather than whichever of the two a
+/// hand-built path happens to find first.
 fn cli_binary() -> PathBuf {
-    // Try to find the debug binary first
-    let debug_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("target/debug/xearthlayer-publish");
-
-    if debug_path.exists() {
-        return debug_path;
-    }
-
-    // Fall back to release binary
-    let release_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("target/release/xearthlayer-publish");
-
-    if release_path.exists() {
-        return release_path;
-    }
-
-    // If neither exists, use cargo run
-    panic!("CLI binary not found. Run `cargo build` first.");
+    PathBuf::from(env!("CARGO_BIN_EXE_xearthlayer-publish"))
 }
 
 /// Run a CLI command and capture output.

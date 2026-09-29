@@ -308,6 +308,13 @@ pub fn release_package(
     let mut warnings: Vec<String> = Vec::new();
 
     let installed_bytes = match crate::directory_size(&package_dir) {
+        Ok(0) => {
+            warnings.push(format!(
+                "installed size measured as 0 bytes at {}; the directory may be missing or emptied",
+                package_dir.display()
+            ));
+            0
+        }
         Ok(bytes) => bytes,
         Err(e) => {
             warnings.push(format!("installed size could not be measured: {e}"));
@@ -315,12 +322,19 @@ pub fn release_package(
         }
     };
 
-    let download_bytes = match crate::directory_size(
-        &repo
-            .dist_dir()
-            .join(region.to_lowercase())
-            .join(package_type.folder_suffix()),
-    ) {
+    let dist_dir = repo
+        .dist_dir()
+        .join(region.to_lowercase())
+        .join(package_type.folder_suffix());
+
+    let download_bytes = match crate::directory_size(&dist_dir) {
+        Ok(0) => {
+            warnings.push(format!(
+                "download size measured as 0 bytes at {}; the directory may be missing or emptied",
+                dist_dir.display()
+            ));
+            0
+        }
         Ok(bytes) => bytes,
         Err(e) => {
             warnings.push(format!("download size could not be measured: {e}"));
@@ -799,6 +813,53 @@ mod tests {
                 .as_deref()
                 .is_some_and(|w| w.contains("download size")),
             "the warning must say which figure failed to measure: {:?}",
+            result.size_warning
+        );
+    }
+
+    #[test]
+    fn releasing_warns_when_a_measured_size_is_zero() {
+        let (_temp, repo) = setup_test_repo();
+        let config = RepoConfig::default();
+
+        setup_test_package(&repo, "na", PackageType::Ortho);
+        let build = build_package(&repo, "na", PackageType::Ortho, &config).unwrap();
+        let urls: Vec<String> = build
+            .archive
+            .parts
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("https://example.com/part{}.tar.gz", i))
+            .collect();
+        configure_urls(&repo, "na", PackageType::Ortho, &urls, false).unwrap();
+
+        std::fs::write(
+            repo.region_metadata_path(),
+            r#"{"regions":{"NA":{"name":"North America","coverage":"x","color":"blue"}}}"#,
+        )
+        .unwrap();
+
+        // An operator reclaiming disk by deleting `dist/` by hand, after the
+        // parts have been uploaded, is an expected workflow at this scale.
+        // `directory_size` answers a missing path with `Ok(0)`, not an error,
+        // so this must not be silently indistinguishable from an intact,
+        // genuinely empty archive.
+        let dist_type_dir = repo
+            .dist_dir()
+            .join("na")
+            .join(PackageType::Ortho.folder_suffix());
+        std::fs::remove_dir_all(&dist_type_dir).unwrap();
+
+        let result = release_package(&repo, "na", PackageType::Ortho, "https://example.com/m.txt")
+            .expect("a hand reclaimed dist directory must not block release");
+
+        assert_eq!(result.download_bytes, 0);
+        assert!(
+            result
+                .size_warning
+                .as_deref()
+                .is_some_and(|w| w.contains("download") && w.contains('0')),
+            "a zero measured size must be called out by name, not passed through silently: {:?}",
             result.size_warning
         );
     }

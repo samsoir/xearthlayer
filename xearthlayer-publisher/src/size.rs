@@ -1,11 +1,13 @@
-//! Byte counts as people read them, for reports and prompts.
+//! Byte counts as people read them, for reports and prompts, and measuring
+//! them from disk.
 //!
 //! Deliberately the publisher's own rather than a shared utility. XEarthLayer's
 //! configuration formatter is bound by a round-trip requirement (#218): what it
-//! prints must parse back to the same value. This one only labels sizes in
-//! output, so the two have no reason to agree and coupling the crates through
-//! a formatter would be the kind of accidental link the separation removes.
-//! The output rules are the same today so that no report changed in the move.
+//! prints must parse back to the same value. This one only labels and measures
+//! sizes for output, so the two have no reason to agree and coupling the
+//! crates through a formatter would be the kind of accidental link the
+//! separation removes. The output rules are the same today so that no report
+//! changed in the move.
 
 use std::fs;
 use std::path::Path;

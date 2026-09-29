@@ -92,8 +92,10 @@ produces a package with no water boundaries.
    `publish dedupe`.
 5. `publish build` for both types.
 6. Verify locally, over a local HTTP server (below).
-7. Publish the GitHub release, configure the real URLs, upload metadata, and
-   `publish release` for both types. This is the procedure in
+7. Publish the GitHub release, configure the real URLs (a second `publish urls`
+   run against the real GitHub base URL, following the `localhost` one used
+   for local verification in step 6), upload metadata, and `publish release`
+   for both types. This is the procedure in
    [Publishing Packages via GitHub Releases](github-releases-publishing.md).
 8. Commit the library index and `region_metadata.json` on the `staging` branch
    and push.

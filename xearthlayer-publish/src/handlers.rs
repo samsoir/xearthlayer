@@ -590,15 +590,15 @@ impl CommandHandler for ReleaseHandler {
         ctx.output.println("Package released successfully!");
         ctx.output.newline();
         ctx.output
-            .indented(&format!("Region:   {}", result.region.to_uppercase()));
+            .indented(&format!("Region:    {}", result.region.to_uppercase()));
         ctx.output
-            .indented(&format!("Type:     {}", result.package_type));
+            .indented(&format!("Type:      {}", result.package_type));
         ctx.output
-            .indented(&format!("Version:  {}", result.version));
+            .indented(&format!("Version:   {}", result.version));
         ctx.output
-            .indented(&format!("Sequence: {}", result.sequence));
+            .indented(&format!("Sequence:  {}", result.sequence));
         ctx.output.indented(&format!(
-            "Download: {}",
+            "Download:  {}",
             format_size_display(result.download_bytes)
         ));
         ctx.output.indented(&format!(
@@ -1010,6 +1010,10 @@ impl CommandHandler for DeleteHandler {
 
         let repo = ctx.publisher.open_repository(&args.repo)?;
 
+        ctx.output
+            .header(&format!("Delete {}", args.region.to_uppercase()));
+        ctx.output.newline();
+
         // Plan every package first. A region where one type is missing should
         // not half delete before reporting that. `plan_deletion` answers
         // "nothing of this type" with `Ok(None)`, not an error, so a real
@@ -1037,9 +1041,6 @@ impl CommandHandler for DeleteHandler {
 
         let total: u64 = plans.iter().map(|p| p.bytes_freed).sum();
 
-        ctx.output
-            .header(&format!("Delete {}", args.region.to_uppercase()));
-        ctx.output.newline();
         for plan in &plans {
             ctx.output.println(&format!("{}:", plan.package_type));
             ctx.output.indented(&format!(

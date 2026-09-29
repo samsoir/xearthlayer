@@ -1,4 +1,5 @@
-//! Region colour resolution for coverage maps.
+//! Region colour resolution for coverage maps, and writing package sizes into
+//! the same file.
 //!
 //! Colours come from `region_metadata.json` in the package repository root —
 //! the same file the website legend reads — so adding a region requires no
@@ -6,6 +7,10 @@
 //!
 //! An unresolvable colour is a hard error rather than a grey fallback: a
 //! silently grey region is exactly how AS2 v0.1.0 shipped wrong.
+//!
+//! [`write_region_size`] edits the same file to record a released package's
+//! download and installed sizes (#287), so a size writer belongs beside the
+//! colour reader rather than in a third module.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -112,9 +117,9 @@ pub fn write_region_size(
     let entry = document
         .get_mut("regions")
         .and_then(|regions| regions.get_mut(&key))
-        .ok_or_else(|| PublishError::InvalidRegionMetadata {
+        .ok_or_else(|| PublishError::RegionNotInMetadata {
             path: metadata_path.to_path_buf(),
-            message: format!("no entry for region {key}; add it before releasing"),
+            region: key.clone(),
         })?;
 
     let sizes = entry
