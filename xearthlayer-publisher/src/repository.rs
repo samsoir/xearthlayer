@@ -35,7 +35,7 @@ const STAGING_DIR: &str = "staging";
 const LIBRARY_FILE: &str = "xearthlayer_package_library.txt";
 
 /// Region colour metadata consumed by `publish coverage` and the website legend.
-const REGION_METADATA_FILE: &str = "region_metadata.json";
+pub const REGION_METADATA_FILE: &str = "region_metadata.json";
 
 /// Stub written by `init`. The empty `regions` map is intentional — coverage
 /// map generation succeeds and renders everything grey, which is visibly
@@ -236,6 +236,11 @@ impl Repository {
         self.root.join(LIBRARY_FILE)
     }
 
+    /// Get the path to the region metadata file.
+    pub fn region_metadata_path(&self) -> PathBuf {
+        self.root.join(REGION_METADATA_FILE)
+    }
+
     /// Get the path for a package directory.
     ///
     /// The package directory name follows the pattern:
@@ -433,6 +438,17 @@ mod tests {
     fn test_library_path() {
         let (temp, repo) = temp_repo();
         assert_eq!(repo.library_path(), temp.path().join(LIBRARY_FILE));
+    }
+
+    #[test]
+    fn region_metadata_path_sits_at_the_repository_root() {
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
+        assert_eq!(
+            repo.region_metadata_path(),
+            temp.path().join("region_metadata.json")
+        );
     }
 
     #[test]

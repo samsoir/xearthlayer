@@ -79,11 +79,11 @@ pub use processor::{
     SceneryScanResult, TileInfo, TileWarning,
 };
 pub use region::{analyze_tiles, suggest_region, RegionSuggestion, SuggestedRegion};
-pub use region_colors::{brighten, resolve, RegionEntry, RegionMetadata};
+pub use region_colors::{brighten, resolve, write_region_size, RegionEntry, RegionMetadata};
 pub use release::{
     build_package, configure_urls, get_release_status, release_package, validate_repository,
     BuildResult, ReleaseResult, ReleaseStatus, UrlConfigResult,
 };
-pub use repository::Repository;
+pub use repository::{Repository, REGION_METADATA_FILE};
 pub use size::{directory_size, format_size};
 pub use urls::{generate_part_urls, validate_url, UrlVerification, UrlVerifier};
