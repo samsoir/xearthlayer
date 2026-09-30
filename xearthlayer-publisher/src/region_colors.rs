@@ -41,6 +41,14 @@ pub struct RegionMetadata {
 pub struct RegionEntry {
     /// CSS colour name or hex string (e.g. "crimson", "#ffaa00").
     pub color: String,
+
+    /// Region codes this one replaces.
+    ///
+    /// Modelled because it decides draw order on the coverage map: a
+    /// replacement covers the same ground as the region it replaces, so it has
+    /// to be drawn over it or the two are indistinguishable.
+    #[serde(default)]
+    pub supersedes: Vec<String>,
 }
 
 impl RegionMetadata {

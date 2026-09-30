@@ -26,7 +26,6 @@ reqwest.workspace = true
 # Publisher-only. These are the dependencies the separation exists to keep
 # out of the runtime: a map rasteriser with its own HTTP client, and the 7z
 # encoder for DSF containers (#124).
-staticmap = "0.4"
 tiny-skia = "0.11"
 csscolorparser = "0.8"
 sevenz-rust2 = { version = "0.23.0", default-features = false, features = ["compress"] }

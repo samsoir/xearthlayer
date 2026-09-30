@@ -40,6 +40,7 @@
 //! ```
 
 mod archive;
+mod basemap;
 mod config;
 pub mod coverage;
 pub mod dedupe;

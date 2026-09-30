@@ -17,9 +17,11 @@ use std::fs;
 use std::path::Path;
 
 use regex::Regex;
-use staticmap::tools::Tool;
-use staticmap::{lat_to_y, lon_to_x, Bounds, StaticMapBuilder};
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, PixmapMut, Shader, Stroke, Transform};
+use tiny_skia::{
+    Color, FillRule, Paint, PathBuilder, Pixmap, PixmapMut, Shader, Stroke, Transform,
+};
+
+use super::basemap::{self, Projection};
 
 use super::region_colors::{brighten, resolve, RegionMetadata};
 use super::{PublishError, PublishResult};
@@ -35,11 +37,21 @@ pub enum MapStyle {
 }
 
 impl MapStyle {
-    /// Get the tile server URL template for this style.
-    pub fn url_template(&self) -> &'static str {
+    /// Colour of the sea, which is also the background of the whole image.
+    pub fn sea_color(&self) -> Color {
         match self {
-            MapStyle::Light => "https://a.tile.osm.org/{z}/{x}/{y}.png",
-            MapStyle::Dark => "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+            MapStyle::Light => Color::from_rgba8(0xc9, 0xdf, 0xef, 255),
+            MapStyle::Dark => Color::from_rgba8(0x14, 0x18, 0x1d, 255),
+        }
+    }
+
+    /// Colour of land the library does not cover. Distinguishing this from the
+    /// sea is the only reason a basemap is drawn at all: without it, uncovered
+    /// land reads as ocean.
+    pub fn land_color(&self) -> Color {
+        match self {
+            MapStyle::Light => Color::from_rgba8(0xec, 0xe8, 0xe0, 255),
+            MapStyle::Dark => Color::from_rgba8(0x2b, 0x30, 0x36, 255),
         }
     }
 }
@@ -63,6 +75,9 @@ pub struct CoverageConfig {
     pub border_width: f32,
     /// Map style (light or dark theme).
     pub style: MapStyle,
+    /// Regions that another region replaces, lowercased. Drawn first so the
+    /// replacement is painted over them.
+    pub superseded_regions: std::collections::HashSet<String>,
 }
 
 impl Default for CoverageConfig {
@@ -76,6 +91,7 @@ impl Default for CoverageConfig {
             border_color: (0, 0, 0, 255),
             border_width: 0.5,
             style: MapStyle::default(),
+            superseded_regions: std::collections::HashSet::new(),
         }
     }
 }
@@ -92,6 +108,7 @@ impl CoverageConfig {
             border_color: (80, 80, 80, 255),
             border_width: 0.3,
             style: MapStyle::Dark,
+            superseded_regions: std::collections::HashSet::new(),
         }
     }
 
@@ -105,7 +122,11 @@ impl CoverageConfig {
     /// a dark config with light colours.
     pub fn with_regions(mut self, metadata: &RegionMetadata) -> PublishResult<Self> {
         let is_dark = self.style == MapStyle::Dark;
-        let alpha = if is_dark { 200 } else { 180 };
+        // Fills are opaque. A translucent fill blended a region with the one
+        // it replaces into a third colour, so neither could be read. Genuine
+        // overlaps between unrelated regions are minimal, and draw order below
+        // makes the newer scenery win where they are not.
+        let alpha = 255;
 
         let mut colors = HashMap::new();
         for (code, entry) in &metadata.regions {
@@ -113,15 +134,22 @@ impl CoverageConfig {
             let rgb = if is_dark { brighten(rgb) } else { rgb };
             colors.insert(code.to_lowercase(), (rgb.0, rgb.1, rgb.2, alpha));
         }
+        // Anything named in another region's `supersedes` is drawn first, so
+        // the region replacing it lands on top.
+        let superseded: std::collections::HashSet<String> = metadata
+            .regions
+            .values()
+            .flat_map(|e| e.supersedes.iter())
+            .map(|c| c.to_lowercase())
+            .collect();
+        self.superseded_regions = superseded;
+
         self.region_colors = colors;
         Ok(self)
     }
 }
 
-/// A filled rectangle tool for staticmap.
-///
-/// This implements the `Tool` trait to draw filled rectangles representing
-/// tile coverage on the map.
+/// A filled rectangle representing one degree of tile coverage.
 pub struct FilledRect {
     /// Minimum latitude (southern edge).
     lat_min: f64,
@@ -179,17 +207,14 @@ impl FilledRect {
     }
 }
 
-impl Tool for FilledRect {
-    fn extent(&self, _zoom: u8, _tile_size: f64) -> (f64, f64, f64, f64) {
-        (self.lon_min, self.lat_min, self.lon_max, self.lat_max)
-    }
-
-    fn draw(&self, bounds: &Bounds, mut pixmap: PixmapMut) {
+impl FilledRect {
+    /// Draw this tile onto the map.
+    fn draw(&self, projection: &Projection, pixmap: &mut PixmapMut) {
         // Convert lat/lon corners to pixel coordinates (raw values before any clamping)
-        let x1_raw = bounds.x_to_px(lon_to_x(self.lon_min, bounds.zoom)) as f32;
-        let y1_raw = bounds.y_to_px(lat_to_y(self.lat_max, bounds.zoom)) as f32; // north
-        let x2_raw = bounds.x_to_px(lon_to_x(self.lon_max, bounds.zoom)) as f32;
-        let y2_raw = bounds.y_to_px(lat_to_y(self.lat_min, bounds.zoom)) as f32; // south
+        let (x1_raw, y1_raw) = projection.project(self.lat_max, self.lon_min); // north west
+        let (x2_raw, y2_raw) = projection.project(self.lat_min, self.lon_max); // south east
+        let (x1_raw, y1_raw) = (x1_raw as f32, y1_raw as f32);
+        let (x2_raw, y2_raw) = (x2_raw as f32, y2_raw as f32);
 
         let img_width = pixmap.width() as f32;
         let img_height = pixmap.height() as f32;
@@ -396,18 +421,13 @@ impl CoverageMapGenerator {
         Ok(tiles)
     }
 
-    /// Generate a coverage map from tile coverage data.
+    /// Choose the viewport that frames `tiles`.
     ///
-    /// # Arguments
-    /// * `tiles` - Vector of tile coverage information
-    /// * `output_path` - Path to save the PNG image
-    pub fn generate_map(&self, tiles: &[TileCoverage], output_path: &Path) -> PublishResult<()> {
-        if tiles.is_empty() {
-            return Err(PublishError::InvalidSource(
-                "No tiles found to generate coverage map".to_string(),
-            ));
-        }
-
+    /// Extracted so a test can ask the same question the renderer does. A test
+    /// that assumes a projection instead of asking for one checks a different
+    /// image than the one generated, which is how two assertions here first
+    /// came back reading the land colour.
+    pub fn viewport(&self, tiles: &[TileCoverage]) -> Projection {
         // Calculate geographic bounds of all tiles
         let mut min_lat = 90i32;
         let mut max_lat = -90i32;
@@ -463,20 +483,60 @@ impl CoverageMapGenerator {
             (center_lat, center_lon, zoom)
         };
 
-        // Create staticmap builder with explicit center and zoom to prevent auto-calculation
-        // that could cause world wrapping
-        let mut map = StaticMapBuilder::default()
-            .width(self.config.width)
-            .height(self.config.height)
-            .lat_center(center_lat)
-            .lon_center(center_lon)
-            .zoom(zoom)
-            .url_template(self.config.style.url_template())
-            .build()
-            .map_err(|e| PublishError::ArchiveFailed(format!("Failed to create map: {}", e)))?;
+        Projection::new(
+            center_lat,
+            center_lon,
+            zoom,
+            self.config.width,
+            self.config.height,
+        )
+    }
 
-        // Add rectangles for each tile
-        for tile in tiles {
+    /// Generate a coverage map from tile coverage data.
+    ///
+    /// # Arguments
+    /// * `tiles` - Vector of tile coverage information
+    /// * `output_path` - Path to save the PNG image
+    pub fn generate_map(&self, tiles: &[TileCoverage], output_path: &Path) -> PublishResult<()> {
+        if tiles.is_empty() {
+            return Err(PublishError::InvalidSource(
+                "No tiles found to generate coverage map".to_string(),
+            ));
+        }
+
+        let projection = self.viewport(tiles);
+
+        // Render locally rather than fetching raster tiles. See basemap.rs and
+        // issue #289: the tile server began answering HTTP 200 with a watermark,
+        // which every check short of looking at the image accepted.
+        let mut pixmap = Pixmap::new(self.config.width, self.config.height).ok_or_else(|| {
+            PublishError::ArchiveFailed(format!(
+                "invalid map dimensions {}x{}",
+                self.config.width, self.config.height
+            ))
+        })?;
+        let mut canvas = pixmap.as_mut();
+
+        basemap::draw(
+            &mut canvas,
+            &projection,
+            self.config.style.sea_color(),
+            self.config.style.land_color(),
+        );
+
+        // Superseded regions first, so a replacement is drawn over the region
+        // it replaces rather than blended with it.
+        let mut ordered: Vec<&TileCoverage> = tiles.iter().collect();
+        ordered.sort_by_key(|t| {
+            u8::from(
+                !self
+                    .config
+                    .superseded_regions
+                    .contains(&t.region.to_lowercase()),
+            )
+        });
+
+        for tile in ordered {
             let fill_color = self
                 .config
                 .region_colors
@@ -484,19 +544,18 @@ impl CoverageMapGenerator {
                 .copied()
                 .unwrap_or(self.config.default_color);
 
-            let rect = FilledRect::from_tile(
+            FilledRect::from_tile(
                 tile.latitude,
                 tile.longitude,
                 fill_color,
                 self.config.border_color,
                 self.config.border_width,
-            );
-
-            map.add_tool(rect);
+            )
+            .draw(&projection, &mut canvas);
         }
 
-        // Save the map
-        map.save_png(output_path)
+        pixmap
+            .save_png(output_path)
             .map_err(|e| PublishError::WriteFailed {
                 path: output_path.to_path_buf(),
                 source: std::io::Error::other(e.to_string()),
@@ -673,19 +732,64 @@ mod tests {
     }
 
     #[test]
-    fn light_config_uses_metadata_colour_with_alpha_180() {
+    fn light_config_uses_the_metadata_colour_opaquely() {
         let config = CoverageConfig::default()
             .with_regions(&metadata_fixture())
             .unwrap();
-        assert_eq!(config.region_colors["na"], (0, 0, 255, 180));
+        assert_eq!(config.region_colors["na"], (0, 0, 255, 255));
     }
 
     #[test]
-    fn dark_config_brightens_and_uses_alpha_200() {
+    fn dark_config_brightens_and_stays_opaque() {
         let config = CoverageConfig::dark()
             .with_regions(&metadata_fixture())
             .unwrap();
-        assert_eq!(config.region_colors["na"], (89, 89, 255, 200));
+        assert_eq!(config.region_colors["na"], (89, 89, 255, 255));
+    }
+
+    /// A superseding region must completely hide the one it replaces. With a
+    /// translucent fill the two blended into a third colour, so a region and
+    /// its replacement were indistinguishable on the map.
+    #[test]
+    fn a_superseding_region_is_drawn_opaquely_over_the_one_it_replaces() {
+        let md: crate::RegionMetadata = serde_json::from_str(
+            r##"{"regions":{
+                 "OLD":{"color":"#0000ff"},
+                 "NEW":{"color":"#ff0000","supersedes":["OLD"]}
+               }}"##,
+        )
+        .unwrap();
+        let config = CoverageConfig::default().with_regions(&md).unwrap();
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let out = temp.path().join("map.png");
+        // Both regions claim the same ground, as a replacement always does.
+        // Kept to one tile so the view zooms in and the sample below lands on
+        // fill rather than on the anti-aliased tile border, which at a global
+        // zoom covers most of a one-degree tile.
+        let tiles = [
+            TileCoverage {
+                latitude: 40,
+                longitude: -100,
+                region: "new".into(),
+            },
+            TileCoverage {
+                latitude: 40,
+                longitude: -100,
+                region: "old".into(),
+            },
+        ];
+        let generator = CoverageMapGenerator::new(config);
+        generator.generate_map(&tiles, &out).unwrap();
+
+        let img = image_pixel(&out, 1200, 600);
+        let (x, y) = generator.viewport(&tiles).project(40.5, -99.5);
+
+        assert_eq!(
+            img(x as u32, y as u32),
+            (255, 0, 0),
+            "the superseding region must be the exact colour, not a blend"
+        );
     }
 
     #[test]
@@ -697,15 +801,33 @@ mod tests {
     }
 
     #[test]
-    fn test_filled_rect_extent() {
-        let rect = FilledRect::from_tile(37, -122, (255, 0, 0, 255), (0, 0, 0, 255), 1.0);
+    fn a_tile_is_painted_at_its_own_coordinates() {
+        // Replaces a former getter test for staticmap's Tool::extent. This
+        // asserts the tile lands in the right place instead of restating its
+        // fields back to itself.
+        let temp = tempfile::TempDir::new().unwrap();
+        let out = temp.path().join("map.png");
+        let mut config = CoverageConfig::default();
+        config
+            .region_colors
+            .insert("na".to_string(), (255, 0, 0, 255));
 
-        let (lon_min, lat_min, lon_max, lat_max) = rect.extent(10, 256.0);
+        let tiles = [TileCoverage {
+            latitude: 40,
+            longitude: -100,
+            region: "na".into(),
+        }];
+        let generator = CoverageMapGenerator::new(config);
+        generator.generate_map(&tiles, &out).unwrap();
 
-        assert_eq!(lon_min, -122.0);
-        assert_eq!(lat_min, 37.0);
-        assert_eq!(lon_max, -121.0);
-        assert_eq!(lat_max, 38.0);
+        let img = image_pixel(&out, 1200, 600);
+        let (x, y) = generator.viewport(&tiles).project(40.5, -99.5);
+
+        assert_eq!(
+            img(x as u32, y as u32),
+            (255, 0, 0),
+            "the tile should be painted in its region colour at its own location"
+        );
     }
 
     #[test]
@@ -743,5 +865,82 @@ mod tests {
 
         assert_eq!(counts.get("na"), Some(&2));
         assert_eq!(counts.get("eu"), Some(&1));
+    }
+
+    /// The basemap is rendered locally, so an ocean pixel is exactly the sea
+    /// colour rather than whatever a tile server happened to serve. This is the
+    /// assertion that raster tiles could not satisfy (#289).
+    #[test]
+    fn the_ocean_is_rendered_in_the_flat_sea_colour_with_no_network() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let out = temp.path().join("map.png");
+        let config = CoverageConfig::default();
+        let sea = config.style.sea_color();
+
+        // A world-spanning set so the renderer frames the whole globe, which is
+        // what the published map does.
+        let tiles = [
+            TileCoverage {
+                latitude: 40,
+                longitude: -100,
+                region: "na".into(),
+            },
+            TileCoverage {
+                latitude: -30,
+                longitude: 150,
+                region: "oc".into(),
+            },
+        ];
+        let generator = CoverageMapGenerator::new(config);
+        generator
+            .generate_map(&tiles, &out)
+            .expect("a map must render without any network access");
+
+        let img = image_pixel(&out, 1200, 600);
+        // Middle of the South Pacific: no land, and no coverage tile.
+        let (x, y) = generator.viewport(&tiles).project(-30.0, -130.0);
+        assert_eq!(
+            img(x as u32, y as u32),
+            {
+                let c = sea.to_color_u8();
+                (c.red(), c.green(), c.blue())
+            },
+            "open ocean should be the flat sea colour"
+        );
+    }
+
+    /// Reproducibility is the point of rendering locally: the same packages
+    /// must give the same bytes on every run and every machine.
+    #[test]
+    fn two_runs_produce_identical_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let a = temp.path().join("a.png");
+        let b = temp.path().join("b.png");
+        let tiles = [TileCoverage {
+            latitude: 40,
+            longitude: -100,
+            region: "na".into(),
+        }];
+
+        let g = CoverageMapGenerator::new(CoverageConfig::default());
+        g.generate_map(&tiles, &a).unwrap();
+        g.generate_map(&tiles, &b).unwrap();
+
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            std::fs::read(&b).unwrap(),
+            "rendering is deterministic"
+        );
+    }
+
+    /// Read a PNG back as a pixel accessor, so a test can assert on what was
+    /// actually drawn rather than on the fact that a file exists.
+    fn image_pixel(path: &Path, w: u32, _h: u32) -> impl Fn(u32, u32) -> (u8, u8, u8) {
+        let data = tiny_skia::Pixmap::decode_png(&std::fs::read(path).unwrap()).unwrap();
+        let px = data.take();
+        move |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            (px[i], px[i + 1], px[i + 2])
+        }
     }
 }
