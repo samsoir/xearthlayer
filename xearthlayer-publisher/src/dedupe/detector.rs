@@ -71,6 +71,37 @@ impl OverlapDetector {
         Ok(tiles)
     }
 
+    /// Scan an Ortho4XP tiles root, aggregating tile references across every
+    /// tile directory beneath it.
+    ///
+    /// `scan_package` expects a package directory with `terrain/` directly
+    /// beneath it. An Ortho4XP output root instead holds one directory per
+    /// tile, each with its own `terrain/`, which is the input `scan` and
+    /// `add` are documented to take (#286). A directory that is not a tile
+    /// directory is skipped rather than refused, so a stray file in the root
+    /// cannot fail the scan.
+    pub fn scan_tiles_root(&self, root: &Path) -> Result<Vec<TileReference>, DedupeError> {
+        let mut tiles = Vec::new();
+
+        let entries = fs::read_dir(root).map_err(|e| DedupeError::IoError(e.to_string()))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| DedupeError::IoError(e.to_string()))?;
+            let tile_dir = entry.path();
+            if !tile_dir.is_dir() || !tile_dir.join("terrain").is_dir() {
+                continue;
+            }
+            tiles.extend(self.scan_package(&tile_dir)?);
+        }
+
+        debug!(
+            tiles = tiles.len(),
+            root = %root.display(),
+            "Scanned tiles from Ortho4XP tiles root"
+        );
+        Ok(tiles)
+    }
+
     /// Detect all overlaps in a collection of tiles.
     ///
     /// Returns a list of `ZoomOverlap` structs describing each overlap.
@@ -504,6 +535,51 @@ mod tests {
         );
         assert_eq!(parse_dds_filename("invalid.dds"), None);
         assert_eq!(parse_dds_filename("no_extension"), None);
+    }
+
+    #[test]
+    fn scanning_a_tiles_root_aggregates_every_tile_directory() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Two Ortho4XP tile directories, each with its own terrain/.
+        let tile_dirs: [(&str, [(u32, u32); 2]); 2] = [
+            ("zOrtho4XP_+37-123", [(25264, 10912), (25264, 10913)]),
+            ("zOrtho4XP_+37-122", [(25280, 10912), (25280, 10913)]),
+        ];
+
+        for (tile, coords) in tile_dirs {
+            let terrain = root.join(tile).join("terrain");
+            fs::create_dir_all(&terrain).unwrap();
+            for (row, col) in coords {
+                create_test_ter_file(
+                    &terrain,
+                    &format!("{}_{}_BI16.ter", row, col),
+                    37.5,
+                    -123.0,
+                    row,
+                    col,
+                    16,
+                );
+            }
+        }
+
+        let tiles = OverlapDetector::new().scan_tiles_root(root).unwrap();
+
+        assert_eq!(
+            tiles.len(),
+            4,
+            "all four .ter files across both tile directories should be counted"
+        );
+    }
+
+    #[test]
+    fn scanning_a_tiles_root_with_no_tile_directories_is_empty_not_an_error() {
+        let temp = TempDir::new().unwrap();
+
+        let tiles = OverlapDetector::new().scan_tiles_root(temp.path()).unwrap();
+
+        assert!(tiles.is_empty());
     }
 
     #[test]

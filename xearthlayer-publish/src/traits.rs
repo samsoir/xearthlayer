@@ -13,8 +13,8 @@ use crate::error::CliError;
 use xearthlayer_package::{PackageMetadata, PackageType};
 use xearthlayer_publisher::dedupe::{DedupeFilter, GapAnalysisResult, TileReference, ZoomPriority};
 use xearthlayer_publisher::{
-    BuildResult, ProcessSummary, RegionSuggestion, ReleaseResult, ReleaseStatus, RepoConfig,
-    SceneryScanResult, UrlConfigResult, VersionBump,
+    BuildResult, DeletionPlan, ProcessSummary, RegionSuggestion, ReleaseResult, ReleaseStatus,
+    RepoConfig, SceneryScanResult, UrlConfigResult, VersionBump,
 };
 
 /// Result of coverage map generation.
@@ -92,6 +92,19 @@ pub trait Output: Send + Sync {
     fn indented(&self, message: &str) {
         self.println(&format!("  {}", message));
     }
+}
+
+// ============================================================================
+// Prompt Trait - Abstracts interactive confirmation
+// ============================================================================
+
+/// Trait for asking the user to confirm an irreversible action.
+///
+/// Separate from [`Output`], which is output only. Keeping confirmation behind
+/// a trait means a handler that deletes data can be tested without a terminal.
+pub trait Prompt: Send + Sync {
+    /// Ask a yes or no question. Returns true only on an explicit yes.
+    fn confirm(&self, question: &str) -> Result<bool, CliError>;
 }
 
 // ============================================================================
@@ -273,6 +286,25 @@ pub trait PublisherService: Send + Sync {
         package_type: PackageType,
         filter: Option<DedupeFilter>,
     ) -> Result<GapAnalysisResult, CliError>;
+
+    /// Work out what deleting a package would remove. Changes nothing.
+    ///
+    /// `Ok(None)` means there is nothing of this package type to delete,
+    /// which is a legitimate answer when a region has only one of ortho and
+    /// overlay. Every `Err` is a real failure and must reach the user.
+    fn plan_deletion(
+        &self,
+        repo: &dyn RepositoryOperations,
+        region: &str,
+        package_type: PackageType,
+    ) -> Result<Option<DeletionPlan>, CliError>;
+
+    /// Carry out a deletion plan.
+    fn execute_deletion(
+        &self,
+        repo: &dyn RepositoryOperations,
+        plan: &DeletionPlan,
+    ) -> Result<(), CliError>;
 }
 
 // ============================================================================
@@ -290,12 +322,23 @@ pub struct CommandContext<'a> {
 
     /// Publisher service for repository operations.
     pub publisher: &'a dyn PublisherService,
+
+    /// Confirmation interface for irreversible actions.
+    pub prompt: &'a dyn Prompt,
 }
 
 impl<'a> CommandContext<'a> {
     /// Create a new command context.
-    pub fn new(output: &'a dyn Output, publisher: &'a dyn PublisherService) -> Self {
-        Self { output, publisher }
+    pub fn new(
+        output: &'a dyn Output,
+        publisher: &'a dyn PublisherService,
+        prompt: &'a dyn Prompt,
+    ) -> Self {
+        Self {
+            output,
+            publisher,
+            prompt,
+        }
     }
 }
 

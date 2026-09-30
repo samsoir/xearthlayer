@@ -237,6 +237,12 @@ impl<C: LibraryClient> PackageInstaller<C> {
         on_progress: Option<InstallProgressCallback>,
     ) -> ManagerResult<InstallResult> {
         let region = &metadata.title;
+        // The title becomes the install directory name, and metadata reaches
+        // us over HTTP. The parser refuses an unusable title, but
+        // PackageMetadata is publicly constructible, so the write path checks
+        // for itself rather than trusting its caller.
+        xearthlayer_package::validate_region(region)
+            .map_err(|e| ManagerError::InvalidPath(e.to_string()))?;
         let package_type = metadata.package_type;
         let version = metadata.package_version.clone();
 
@@ -705,5 +711,66 @@ mod tests {
 
         let content = fs::read_to_string(dest.join("file1.txt")).unwrap();
         assert_eq!(content, "hello");
+    }
+
+    /// A hostile package metadata file could name a title that escapes the
+    /// Custom Scenery directory once `package_mountpoint` joins it into a
+    /// path, because that function prefixes only the first path component.
+    /// The metadata parser now refuses such a title, but `PackageMetadata` is
+    /// publicly constructible, so the install path itself is checked too.
+    #[test]
+    fn installing_refuses_a_title_that_escapes_the_scenery_directory() {
+        use crate::manager::LocalPackageStore;
+        use xearthlayer_package::PackageType;
+
+        struct UnusedClient;
+        impl LibraryClient for UnusedClient {
+            fn fetch_library(
+                &self,
+                _url: &str,
+            ) -> ManagerResult<xearthlayer_package::PackageLibrary> {
+                panic!("the install must be refused before any network access");
+            }
+            fn fetch_metadata(&self, _url: &str) -> ManagerResult<PackageMetadata> {
+                panic!("the install must be refused before any network access");
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let scenery = temp.path().join("Custom Scenery");
+        std::fs::create_dir_all(&scenery).expect("scenery dir");
+        let victim = temp.path().join("victim");
+        std::fs::create_dir_all(&victim).expect("victim dir");
+        std::fs::write(victim.join("keep.txt"), b"keep").expect("victim file");
+
+        let installer = PackageInstaller::new(
+            UnusedClient,
+            LocalPackageStore::new(&scenery),
+            temp.path().join("tmp"),
+        );
+
+        let metadata = PackageMetadata {
+            spec_version: semver::Version::new(1, 0, 0),
+            title: "../victim".to_string(),
+            package_version: semver::Version::new(1, 0, 0),
+            published_at: chrono::Utc::now(),
+            package_type: PackageType::Ortho,
+            mountpoint: "zzXEL_x_ortho".to_string(),
+            filename: "zzXEL_x_ortho-1.0.0.tar.gz".to_string(),
+            parts: Vec::new(),
+        };
+
+        let err = installer
+            .install_from_metadata(&metadata, None)
+            .expect_err("a title that escapes Custom Scenery must be refused");
+
+        assert!(
+            matches!(err, ManagerError::InvalidPath(_)),
+            "expected the title to be refused as an invalid path, got {err:?}"
+        );
+        assert!(
+            victim.join("keep.txt").exists(),
+            "nothing outside the scenery directory may be touched"
+        );
     }
 }

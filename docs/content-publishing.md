@@ -306,14 +306,23 @@ Releasing EU-PARIS ortho to library index...
 
 Package released successfully!
 
-  Region:   EU-PARIS
-  Type:     ortho
-  Version:  1.0.0
-  Sequence: 1
+  Region:    EU-PARIS
+  Type:      ortho
+  Version:   1.0.0
+  Sequence:  1
+  Download:  1.2 GB
+  Installed: 3.4 GB
 
 Library index updated:
   ./xearthlayer_package_library.txt
 ```
+
+The two sizes are measured as the release runs, from the archive parts in
+`dist/` and from the package working directory, and are recorded in
+`region_metadata.json` under the region's `size.ortho` or `size.overlay` block.
+That file is optional: if it is missing, or has no entry for this region, the
+release still succeeds and prints a warning instead. Updating the library index
+is the release; the sizes are a description published alongside it.
 
 ## Step 9: Upload Library and Metadata
 
@@ -417,6 +426,55 @@ Check for issues:
 ```bash
 xearthlayer-publish validate
 ```
+
+### Delete a Package
+
+Remove a package from the repository: its entry in the library index, its
+working directory under `packages/`, and its built archives under `dist/`.
+
+```bash
+# See what would go, and how much disk it frees, without touching anything
+xearthlayer-publish delete --region eu-paris --dry-run
+
+# Delete both the ortho and the overlay package for the region
+xearthlayer-publish delete --region eu-paris
+
+# Delete only one of the two
+xearthlayer-publish delete --region eu-paris --type ortho
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--region <code>` | Region to delete. Required. |
+| `--type <ortho\|overlay>` | One package type. Omit to delete both, which is what retiring a region means. |
+| `--dry-run` | Print the plan and stop. Never prompts, never deletes. |
+| `--yes` | Skip the confirmation prompt, for use in scripts. |
+| `--repo <path>` | Repository root. Defaults to the current directory. |
+
+The deletion is planned before it is confirmed, so the prompt can name every
+directory that would go and the total it frees. `--dry-run` prints that same
+plan and stops, which is why it is the safe way to check a region code before
+committing to it. Answering anything other than yes at the prompt leaves
+everything in place.
+
+The sizes reported are apparent size, summed from file lengths, so they read a
+little under `du` for a package holding hundreds of thousands of small `.ter`
+files. The figure is there to help you judge the disk cost, not to reconcile
+with the filesystem.
+
+A region that legitimately has only one of the two package types is not an
+error: the missing type is reported as skipped and the other is deleted. A
+region with neither is an error, because the likeliest explanation is a
+mistyped region code. A region code containing a path separator is rejected
+outright, since the code becomes a directory name and no real region code
+contains a slash.
+
+**Archives already uploaded to a hosting provider are not touched.** The
+publisher has no knowledge of your hosting, and those files need to outlive the
+index entry regardless: a user who started an install before you deleted the
+entry is still fetching parts from those URLs. Taking the hosted copies down is
+a separate, manual step, made once you are satisfied that nobody is still
+installing the old version.
 
 ## File Formats
 

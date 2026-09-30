@@ -119,6 +119,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - Repository management with package versioning
    - Archive building with configurable part sizes
    - Library index management for package discovery
+   - `delete` retires a package: library index entry, working directory and built archives. Assets already uploaded to a hosting provider are deliberately never touched, because they must outlive the index entry while users are still installing from them
+   - `release` also records `size.<type>.download_bytes` and `size.<type>.installed_bytes` into `region_metadata.json`; a missing file or missing region entry is a warning, not a failed release, because updating the library index is the release
    - `Ortho4XPProcessor` for ortho tiles, `OverlayProcessor` for overlays
    - DSF files are written as single-entry 7z containers (Laminar profile: LZMA, 16 MiB dictionary) by `DsfCompressor`; X-Plane decodes them natively, XEL never parses them (#124)
    - `spec_version` on both package formats is enforced: a MAJOR above `SUPPORTED_SPEC_MAJOR` (`package/spec.rs`) is refused with an upgrade message
@@ -367,6 +369,7 @@ xearthlayer-publish validate                # Validate repository
 xearthlayer-publish coverage [--dark] [--geojson] [-o <file>] [--metadata <path>]  # Generate coverage map
 xearthlayer-publish dedupe --region <code> [--priority <mode>] [--tile <lat,lon>] [--dry-run]  # Remove overlapping ZL tiles
 xearthlayer-publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o <file>]  # Analyze coverage gaps
+xearthlayer-publish delete --region <code> [--type <ortho|overlay>] [--dry-run] [--yes]  # Remove a package
 ```
 
 ## Key Files
@@ -523,6 +526,7 @@ matrix jobs are renamed.
 - **Fuse3 implementation**: `xearthlayer/src/fuse/fuse3/mod.rs` (async multi-threaded FUSE)
 - **GPU Encoding**: `docs/dev/gpu-encoding-design.md` (wgpu compute shaders, channel worker, memory optimization)
 - Package publisher design: `docs/dev/package-publisher-design.md`
+- **World rebuild runbook**: `docs/dev/world-rebuild-runbook.md` (the campaign to rebuild every regional package: naming, staging channel, promotion, retirement)
 - Zoom level overlap management: `docs/dev/zoom-level-overlap-design.md` (dedupe, gap analysis)
 - **Consolidated FUSE mounting**: `docs/dev/consolidated-mounting-design.md` (single ortho mount, patches + packages)
 - **Directory layout**: `docs/directory-layout.md` (where files live, upgrading from pre-0.5.0, cleaning up `~/.xearthlayer`)

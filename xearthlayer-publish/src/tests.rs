@@ -3,6 +3,7 @@
 //! This module provides mock implementations of the service traits and
 //! comprehensive tests for each command handler.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -15,7 +16,7 @@ use crate::error::CliError;
 use xearthlayer_package::{ArchivePart, PackageMetadata, PackageType};
 use xearthlayer_publisher::dedupe::{DedupeFilter, GapAnalysisResult, ZoomPriority};
 use xearthlayer_publisher::{
-    ArchiveBuildResult, BuildResult, ProcessSummary, RegionSuggestion, ReleaseResult,
+    ArchiveBuildResult, BuildResult, DeletionPlan, ProcessSummary, RegionSuggestion, ReleaseResult,
     ReleaseStatus, RepoConfig, SceneryScanResult, SuggestedRegion, TileInfo, UrlConfigResult,
     VersionBump,
 };
@@ -62,6 +63,44 @@ impl Output for MockOutput {
     fn print(&self, message: &str) {
         self.messages.write().unwrap().push(message.to_string());
     }
+}
+
+// ============================================================================
+// Mock Prompt Implementation
+// ============================================================================
+
+/// Mock prompt with a fixed answer, recording what it was asked.
+pub struct MockPrompt {
+    answer: bool,
+    questions: RwLock<Vec<String>>,
+}
+
+impl MockPrompt {
+    pub fn answering(answer: bool) -> Self {
+        Self {
+            answer,
+            questions: RwLock::new(Vec::new()),
+        }
+    }
+
+    pub fn was_asked(&self) -> bool {
+        !self.questions.read().unwrap().is_empty()
+    }
+}
+
+impl Prompt for MockPrompt {
+    fn confirm(&self, question: &str) -> Result<bool, CliError> {
+        self.questions.write().unwrap().push(question.to_string());
+        Ok(self.answer)
+    }
+}
+
+#[test]
+fn a_mock_prompt_records_the_question_and_returns_its_answer() {
+    let prompt = MockPrompt::answering(true);
+
+    assert!(prompt.confirm("Delete NA ortho?").unwrap());
+    assert!(prompt.was_asked());
 }
 
 // ============================================================================
@@ -121,6 +160,7 @@ pub struct MockPublisherServiceBuilder {
     release_status: Option<ReleaseStatus>,
     url_config_result: Option<Result<UrlConfigResult, String>>,
     release_result: Option<Result<ReleaseResult, String>>,
+    plan_deletion_overrides: HashMap<PackageType, Result<Option<DeletionPlan>, String>>,
 }
 
 impl MockPublisherServiceBuilder {
@@ -193,6 +233,22 @@ impl MockPublisherServiceBuilder {
         self
     }
 
+    /// Make `plan_deletion` answer "nothing of this type to delete" for the
+    /// given package type, without touching the other type's behaviour.
+    pub fn with_plan_deletion_not_found(mut self, package_type: PackageType) -> Self {
+        self.plan_deletion_overrides.insert(package_type, Ok(None));
+        self
+    }
+
+    /// Make `plan_deletion` fail for the given package type. Used to verify
+    /// a real failure reaches the caller instead of being read as "nothing
+    /// to delete".
+    pub fn with_plan_deletion_error(mut self, package_type: PackageType, message: &str) -> Self {
+        self.plan_deletion_overrides
+            .insert(package_type, Err(message.to_string()));
+        self
+    }
+
     pub fn build(self) -> MockPublisherService {
         MockPublisherService {
             init_result: self.init_result.unwrap_or(Ok(PathBuf::from("/tmp/repo"))),
@@ -208,7 +264,9 @@ impl MockPublisherServiceBuilder {
             release_status: self.release_status.unwrap_or(ReleaseStatus::NotBuilt),
             url_config_result: self.url_config_result,
             release_result: self.release_result,
+            plan_deletion_overrides: self.plan_deletion_overrides,
             captured_coverage_metadata_path: RwLock::new(None),
+            executed_deletions: RwLock::new(Vec::new()),
         }
     }
 }
@@ -226,7 +284,12 @@ pub struct MockPublisherService {
     release_status: ReleaseStatus,
     url_config_result: Option<Result<UrlConfigResult, String>>,
     release_result: Option<Result<ReleaseResult, String>>,
+    plan_deletion_overrides: HashMap<PackageType, Result<Option<DeletionPlan>, String>>,
     captured_coverage_metadata_path: RwLock<Option<PathBuf>>,
+    /// Every plan actually passed to `execute_deletion`, in call order. Lets
+    /// tests distinguish "the handler decided not to delete" from "the mock
+    /// would have deleted but we didn't check".
+    executed_deletions: RwLock<Vec<DeletionPlan>>,
 }
 
 impl MockPublisherService {
@@ -234,6 +297,12 @@ impl MockPublisherService {
     /// `generate_coverage_map` or `generate_coverage_geojson`, if any.
     pub fn captured_coverage_metadata_path(&self) -> Option<PathBuf> {
         self.captured_coverage_metadata_path.read().unwrap().clone()
+    }
+
+    /// Returns every plan actually passed to `execute_deletion`, in call
+    /// order.
+    pub fn executed_deletions(&self) -> Vec<DeletionPlan> {
+        self.executed_deletions.read().unwrap().clone()
     }
 }
 
@@ -409,6 +478,9 @@ impl PublisherService for MockPublisherService {
                 package_type: PackageType::Ortho,
                 version: Version::new(1, 0, 0),
                 sequence: 1,
+                download_bytes: 0,
+                installed_bytes: 0,
+                size_warning: None,
             }),
         }
     }
@@ -494,6 +566,38 @@ impl PublisherService for MockPublisherService {
     ) -> Result<GapAnalysisResult, CliError> {
         // Return an empty gap analysis result
         Ok(GapAnalysisResult::default())
+    }
+
+    fn plan_deletion(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        region: &str,
+        package_type: PackageType,
+    ) -> Result<Option<DeletionPlan>, CliError> {
+        if let Some(override_result) = self.plan_deletion_overrides.get(&package_type) {
+            return match override_result {
+                Ok(plan) => Ok(plan.clone()),
+                Err(e) => Err(CliError::Publish(e.clone())),
+            };
+        }
+
+        Ok(Some(DeletionPlan {
+            region: region.to_string(),
+            package_type,
+            in_library: true,
+            package_dir: Some(PathBuf::from("/tmp/packages/pkg")),
+            dist_dir: Some(PathBuf::from("/tmp/dist/pkg")),
+            bytes_freed: 1024,
+        }))
+    }
+
+    fn execute_deletion(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        plan: &DeletionPlan,
+    ) -> Result<(), CliError> {
+        self.executed_deletions.write().unwrap().push(plan.clone());
+        Ok(())
     }
 }
 
@@ -591,7 +695,8 @@ mod init_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_init_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = InitArgs {
             path: PathBuf::from("/test/repo"),
@@ -613,7 +718,8 @@ mod init_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_init_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = InitArgs {
             path: PathBuf::from("/test/repo"),
@@ -632,7 +738,8 @@ mod init_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_init_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = InitArgs {
             path: PathBuf::from("/test/repo"),
@@ -653,7 +760,8 @@ mod init_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_init_error("Permission denied")
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = InitArgs {
             path: PathBuf::from("/test/repo"),
@@ -683,7 +791,8 @@ mod scan_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_scan_success(create_test_scan_result())
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ScanArgs {
             source: PathBuf::from("/ortho4xp/tiles"),
@@ -706,7 +815,8 @@ mod scan_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_scan_success(SceneryScanResult::new(Vec::new()))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ScanArgs {
             source: PathBuf::from("/ortho4xp/tiles"),
@@ -725,7 +835,8 @@ mod scan_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_scan_error("Directory not found")
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ScanArgs {
             source: PathBuf::from("/nonexistent"),
@@ -764,7 +875,8 @@ mod add_tests {
                 warnings: Vec::new(),
             })
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = AddArgs {
             source: PathBuf::from("/ortho4xp/tiles"),
@@ -811,7 +923,8 @@ mod add_tests {
                 warnings: Vec::new(),
             })
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = AddArgs {
             source: PathBuf::from("/ortho4xp/tiles"),
@@ -837,7 +950,8 @@ mod add_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_scan_success(SceneryScanResult::new(Vec::new()))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = AddArgs {
             source: PathBuf::from("/ortho4xp/tiles"),
@@ -863,7 +977,8 @@ mod add_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_open_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = AddArgs {
             source: PathBuf::from("/ortho4xp/tiles"),
@@ -901,7 +1016,8 @@ mod add_tests {
                 warnings: Vec::new(),
             })
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = AddArgs {
             source: PathBuf::from("/ortho4xp/overlays"),
@@ -942,7 +1058,8 @@ mod list_tests {
             ])
             .with_release_status(ReleaseStatus::Ready)
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ListArgs {
             repo: PathBuf::from("/test/repo"),
@@ -964,7 +1081,8 @@ mod list_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_packages(Vec::new())
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ListArgs {
             repo: PathBuf::from("/test/repo"),
@@ -986,7 +1104,8 @@ mod list_tests {
             .with_metadata(create_test_metadata())
             .with_release_status(ReleaseStatus::Ready)
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ListArgs {
             repo: PathBuf::from("/test/repo"),
@@ -1017,7 +1136,8 @@ mod build_tests {
             .with_config(RepoConfig::default())
             .with_build_success(create_test_build_result())
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = BuildArgs {
             region: "na".to_string(),
@@ -1058,7 +1178,8 @@ mod urls_tests {
                 failed_urls: Vec::new(),
             })
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = UrlsArgs {
             region: "na".to_string(),
@@ -1085,7 +1206,8 @@ mod urls_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_metadata(metadata)
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = UrlsArgs {
             region: "na".to_string(),
@@ -1119,7 +1241,8 @@ mod version_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_metadata(create_test_metadata())
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = VersionArgs {
             region: "na".to_string(),
@@ -1142,7 +1265,8 @@ mod version_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_metadata(create_test_metadata())
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = VersionArgs {
             region: "na".to_string(),
@@ -1166,7 +1290,8 @@ mod version_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_metadata(create_test_metadata())
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = VersionArgs {
             region: "na".to_string(),
@@ -1201,9 +1326,13 @@ mod release_tests {
                 package_type: PackageType::Ortho,
                 version: Version::new(1, 0, 0),
                 sequence: 1,
+                download_bytes: 0,
+                installed_bytes: 0,
+                size_warning: None,
             })
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ReleaseArgs {
             region: "na".to_string(),
@@ -1217,7 +1346,78 @@ mod release_tests {
         assert!(result.is_ok());
         assert!(output.contains("Releasing NA ortho to library index"));
         assert!(output.contains("Package released successfully"));
-        assert!(output.contains("Sequence: 1"));
+        assert!(output.contains("Sequence:  1"));
+    }
+
+    #[test]
+    fn release_reports_the_recorded_sizes() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_release_success(ReleaseResult {
+                region: "na".to_string(),
+                package_type: PackageType::Ortho,
+                version: Version::new(0, 1, 0),
+                sequence: 3,
+                download_bytes: 34_000_000_000,
+                installed_bytes: 52_000_000_000,
+                size_warning: None,
+            })
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        ReleaseHandler::execute(
+            ReleaseArgs {
+                region: "na".to_string(),
+                package_type: PackageTypeArg::Ortho,
+                metadata_url: "https://example.com/m.txt".to_string(),
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(output.contains("Download:  31.7 GB"));
+        assert!(output.contains("Installed: 48.4 GB"));
+    }
+
+    #[test]
+    fn release_reports_a_size_warning_verbatim() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_release_success(ReleaseResult {
+                region: "na".to_string(),
+                package_type: PackageType::Ortho,
+                version: Version::new(0, 1, 0),
+                sequence: 3,
+                download_bytes: 0,
+                installed_bytes: 52_000_000_000,
+                size_warning: Some(
+                    "download size could not be measured: disk went away".to_string(),
+                ),
+            })
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        ReleaseHandler::execute(
+            ReleaseArgs {
+                region: "na".to_string(),
+                package_type: PackageTypeArg::Ortho,
+                metadata_url: "https://example.com/m.txt".to_string(),
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        // Specific enough that the warning text being dropped, truncated, or
+        // re-wrapped with different words would fail this, not just the
+        // presence of the word "Warning".
+        assert!(
+            output.contains("download size could not be measured: disk went away"),
+            "the warning text must reach the user verbatim"
+        );
     }
 }
 
@@ -1238,7 +1438,8 @@ mod status_tests {
             .with_metadata(create_test_metadata())
             .with_release_status(ReleaseStatus::Ready)
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = StatusArgs {
             region: None,
@@ -1261,7 +1462,8 @@ mod status_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_packages(Vec::new())
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = StatusArgs {
             region: None,
@@ -1291,7 +1493,8 @@ mod validate_tests {
             .with_open_success(PathBuf::from("/test/repo"))
             .with_packages(vec![("na".to_string(), PackageType::Ortho)])
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = ValidateArgs {
             repo: PathBuf::from("/test/repo"),
@@ -1331,7 +1534,8 @@ mod coverage_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_open_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = base_coverage_args(None, false);
 
@@ -1350,7 +1554,8 @@ mod coverage_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_open_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let custom_path = PathBuf::from("/custom/location/region_metadata.json");
         let args = base_coverage_args(Some(custom_path.clone()), false);
@@ -1370,7 +1575,8 @@ mod coverage_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_open_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let args = base_coverage_args(None, true);
 
@@ -1389,7 +1595,8 @@ mod coverage_tests {
         let publisher = MockPublisherServiceBuilder::new()
             .with_open_success(PathBuf::from("/test/repo"))
             .build();
-        let ctx = CommandContext::new(&output, &publisher);
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
 
         let custom_path = PathBuf::from("/custom/location/region_metadata.json");
         let args = base_coverage_args(Some(custom_path.clone()), true);
@@ -1400,6 +1607,217 @@ mod coverage_tests {
         assert_eq!(
             publisher.captured_coverage_metadata_path(),
             Some(custom_path)
+        );
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+
+    #[test]
+    fn delete_asks_before_removing_anything() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default().build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: None,
+                dry_run: false,
+                yes: false,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(prompt.was_asked(), "deletion must ask before acting");
+        assert!(output.contains("Cancelled"));
+        assert!(
+            publisher.executed_deletions().is_empty(),
+            "declining the prompt must delete nothing"
+        );
+    }
+
+    #[test]
+    fn delete_with_yes_does_not_ask() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default().build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: None,
+                dry_run: false,
+                yes: true,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(!prompt.was_asked(), "--yes must skip the prompt");
+        let executed = publisher.executed_deletions();
+        assert_eq!(
+            executed.len(),
+            2,
+            "--yes must delete both planned package types"
+        );
+        assert!(executed.iter().all(|plan| plan.region == "na"));
+    }
+
+    #[test]
+    fn omitting_type_reports_skip_for_the_package_type_with_nothing_to_delete() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_plan_deletion_not_found(PackageType::Overlay)
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let result = DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: None,
+                dry_run: false,
+                yes: true,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        );
+
+        assert!(
+            result.is_ok(),
+            "a region legitimately having only one package type must not error: {:?}",
+            result
+        );
+        assert!(output.contains("Skipping"));
+        assert!(output.contains("overlay"));
+    }
+
+    #[test]
+    fn omitting_type_with_neither_package_present_is_an_error() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_plan_deletion_not_found(PackageType::Ortho)
+            .with_plan_deletion_not_found(PackageType::Overlay)
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let result = DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: None,
+                dry_run: false,
+                yes: true,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        );
+
+        let Err(err) = result else {
+            panic!("a region with nothing to delete under either type must error");
+        };
+        assert!(err.to_string().contains("Nothing to delete"));
+        assert!(err.to_string().contains("NA"));
+    }
+
+    #[test]
+    fn a_plan_deletion_failure_is_returned_not_swallowed_when_type_is_omitted() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_plan_deletion_error(
+                PackageType::Ortho,
+                "a region code must not contain a path separator",
+            )
+            .with_plan_deletion_error(
+                PackageType::Overlay,
+                "a region code must not contain a path separator",
+            )
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let result = DeleteHandler::execute(
+            DeleteArgs {
+                region: "x/../evil".to_string(),
+                package_type: None,
+                dry_run: false,
+                yes: true,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        );
+
+        let Err(err) = result else {
+            panic!("a real plan_deletion failure must reach the caller, not be skipped");
+        };
+        assert!(
+            err.to_string().contains("path separator"),
+            "the real error must reach the caller: {err}"
+        );
+        assert!(
+            !err.to_string().contains("Nothing to delete"),
+            "a real failure must not be misreported as an empty region: {err}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_type_still_propagates_a_plan_deletion_failure() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_plan_deletion_error(PackageType::Ortho, "boom")
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let result = DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: Some(PackageTypeArg::Ortho),
+                dry_run: false,
+                yes: true,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        );
+
+        let Err(err) = result else {
+            panic!("an explicit --type must not swallow a plan_deletion failure either");
+        };
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn a_dry_run_never_asks_and_never_deletes() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default().build();
+        let prompt = MockPrompt::answering(true);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: None,
+                dry_run: true,
+                yes: false,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(!prompt.was_asked(), "a dry run has nothing to confirm");
+        assert!(output.contains("Dry run"));
+        assert!(
+            publisher.executed_deletions().is_empty(),
+            "a dry run must delete nothing"
         );
     }
 }

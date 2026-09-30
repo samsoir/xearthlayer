@@ -117,6 +117,10 @@ pub fn build_archive(
     }
 
     // Create dist subdirectory for this package type
+    // The region is joined straight into the dist path, so it is untrusted
+    // input to a path until it has been checked.
+    xearthlayer_package::validate_region(region)?;
+
     let type_dist_dir = dist_dir
         .join(region.to_lowercase())
         .join(package_type.folder_suffix());
@@ -523,5 +527,44 @@ mod tests {
         };
         let debug = format!("{:?}", result);
         assert!(debug.contains("ArchiveBuildResult"));
+    }
+
+    #[test]
+    fn building_an_archive_rejects_a_region_that_could_escape_the_dist_directory() {
+        let temp = TempDir::new().unwrap();
+
+        let package_dir = temp.path().join("zzXEL_na_ortho");
+        fs::create_dir_all(&package_dir).unwrap();
+        File::create(package_dir.join("payload.bin"))
+            .unwrap()
+            .write_all(b"payload")
+            .unwrap();
+
+        let dist_dir = temp.path().join("dist");
+        fs::create_dir_all(&dist_dir).unwrap();
+
+        // Resolves to temp/victim, outside dist.
+        let escaping = "../victim";
+        let victim = temp.path().join("victim");
+
+        let config = RepoConfig::new(500 * 1024 * 1024).unwrap();
+        let err = build_archive(
+            &package_dir,
+            &dist_dir,
+            escaping,
+            PackageType::Ortho,
+            &Version::new(1, 0, 0),
+            &config,
+        )
+        .expect_err("a region that escapes the dist directory must be refused");
+
+        assert!(
+            err.to_string().contains(escaping),
+            "the error should name the offending region: {err}"
+        );
+        assert!(
+            !victim.exists(),
+            "nothing may be created outside the dist directory"
+        );
     }
 }

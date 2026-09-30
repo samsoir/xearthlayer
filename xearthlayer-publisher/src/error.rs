@@ -74,6 +74,12 @@ pub enum PublishError {
     /// Region metadata file could not be parsed.
     InvalidRegionMetadata { path: PathBuf, message: String },
 
+    /// Region metadata file parses fine but has no entry for the region.
+    ///
+    /// Distinct from [`PublishError::InvalidRegionMetadata`]: the file is not
+    /// corrupt, the region just has not been added to it yet.
+    RegionNotInMetadata { path: PathBuf, region: String },
+
     /// A region's colour could not be resolved to RGB.
     UnknownRegionColor { region: String, color: String },
 
@@ -154,14 +160,18 @@ impl fmt::Display for PublishError {
                 write!(f, "release validation failed: {}", msg)
             }
             PublishError::RegionMetadataNotFound(path) => {
-                write!(
-                    f,
-                    "region_metadata.json not found at {}. Pass --metadata to override.",
-                    path.display()
-                )
+                write!(f, "region_metadata.json not found at {}", path.display())
             }
             PublishError::InvalidRegionMetadata { path, message } => {
                 write!(f, "failed to parse {}: {}", path.display(), message)
+            }
+            PublishError::RegionNotInMetadata { path, region } => {
+                write!(
+                    f,
+                    "{} has no entry for region {}; add it before releasing",
+                    path.display(),
+                    region
+                )
             }
             PublishError::UnknownRegionColor { region, color } => {
                 write!(
@@ -218,6 +228,34 @@ mod tests {
     }
 
     #[test]
+    fn region_not_in_metadata_names_region_and_file_without_claiming_corruption() {
+        let err = PublishError::RegionNotInMetadata {
+            path: PathBuf::from("/repo/region_metadata.json"),
+            region: "SA-NORTH".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("/repo/region_metadata.json"));
+        assert!(msg.contains("SA-NORTH"));
+        assert!(
+            !msg.to_lowercase().contains("parse"),
+            "a merely absent region must not read as a parse failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn region_metadata_not_found_names_only_the_path() {
+        // The message must stay generic: `release` surfaces this same error
+        // as a warning and has no `--metadata` flag to point the operator at.
+        let err = PublishError::RegionMetadataNotFound(PathBuf::from("/repo/region_metadata.json"));
+        let msg = err.to_string();
+        assert!(msg.contains("/repo/region_metadata.json"));
+        assert!(
+            !msg.contains("--metadata"),
+            "the generic message must not promise a flag every caller has: {msg}"
+        );
+    }
+
+    #[test]
     fn test_checksum_mismatch_display() {
         let err = PublishError::ChecksumMismatch {
             file: PathBuf::from("test.tar.gz"),
@@ -243,5 +281,13 @@ mod tests {
     fn test_error_source_none() {
         let err = PublishError::InvalidVersion("bad".to_string());
         assert!(err.source().is_none());
+    }
+}
+
+impl From<xearthlayer_package::InvalidRegion> for PublishError {
+    /// A region code that cannot safely become a directory name is an invalid
+    /// path, because a path is the only thing the publisher uses it for.
+    fn from(e: xearthlayer_package::InvalidRegion) -> Self {
+        PublishError::InvalidPath(e.to_string())
     }
 }

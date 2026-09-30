@@ -196,6 +196,9 @@ pub enum MetadataParseError {
     InvalidSpecVersion(String),
     /// Invalid title/version line format
     InvalidTitleLine(String),
+    /// The title is not usable as a region code, so it cannot safely become a
+    /// directory name. See [`crate::validate_region`].
+    InvalidRegionTitle(crate::InvalidRegion),
     /// Invalid datetime format
     InvalidDateTime(String),
     /// Invalid package type
@@ -232,6 +235,7 @@ impl fmt::Display for MetadataParseError {
             MetadataParseError::InvalidTitleLine(s) => {
                 write!(f, "invalid title/version line: {}", s)
             }
+            MetadataParseError::InvalidRegionTitle(e) => write!(f, "{}", e),
             MetadataParseError::InvalidDateTime(s) => {
                 write!(f, "invalid datetime: {}", s)
             }
@@ -317,6 +321,9 @@ pub fn parse_package_metadata(content: &str) -> Result<PackageMetadata, Metadata
         return Err(MetadataParseError::InvalidTitleLine(title_line.to_string()));
     }
     let title = title_parts[0].to_string();
+    // The title becomes a directory name under Custom Scenery, and this file
+    // is fetched over HTTP, so it is untrusted input to a path.
+    crate::validate_region(&title).map_err(MetadataParseError::InvalidRegionTitle)?;
     let package_version = Version::from_str(title_parts[1].trim())
         .map_err(|e| MetadataParseError::InvalidTitleLine(e.to_string()))?;
 
@@ -891,5 +898,33 @@ abc123  file.aa
             filename: "file.ab".to_string(),
         };
         assert!(err.to_string().contains("empty checksum"));
+    }
+
+    #[test]
+    fn a_title_that_could_escape_its_parent_directory_is_rejected() {
+        // The title becomes the install directory name under Custom Scenery,
+        // and this metadata arrives over HTTP, so a traversal here would let a
+        // hostile package extract outside the scenery folder.
+        let hostile =
+            sample_metadata_content().replace("EUROPE  1.0.0", "x/../../../../tmp/evil  1.0.0");
+
+        let err = parse_package_metadata(&hostile)
+            .expect_err("a title containing a path separator must not parse");
+
+        assert!(
+            err.to_string().contains("x/../../../../tmp/evil"),
+            "the error should name the offending title: {err}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_hyphenated_title_still_parses() {
+        let renamed =
+            sample_metadata_content().replace("EUROPE  1.0.0", "NA-USA-MX-CENTRAL  1.0.0");
+
+        let metadata = parse_package_metadata(&renamed)
+            .expect("a descriptive region code is a legitimate title");
+
+        assert_eq!(metadata.title, "NA-USA-MX-CENTRAL");
     }
 }

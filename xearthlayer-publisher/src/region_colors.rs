@@ -1,4 +1,5 @@
-//! Region colour resolution for coverage maps.
+//! Region colour resolution for coverage maps, and writing package sizes into
+//! the same file.
 //!
 //! Colours come from `region_metadata.json` in the package repository root —
 //! the same file the website legend reads — so adding a region requires no
@@ -6,6 +7,10 @@
 //!
 //! An unresolvable colour is a hard error rather than a grey fallback: a
 //! silently grey region is exactly how AS2 v0.1.0 shipped wrong.
+//!
+//! [`write_region_size`] edits the same file to record a released package's
+//! download and installed sizes (#287), so a size writer belongs beside the
+//! colour reader rather than in a third module.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,6 +18,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use super::{PublishError, PublishResult};
+use xearthlayer_package::PackageType;
 
 /// Fraction blended toward white to derive dark-mode colours.
 const DARK_BLEND: f32 = 0.35;
@@ -68,6 +74,80 @@ pub fn resolve(region: &str, color: &str) -> PublishResult<(u8, u8, u8)> {
             })?;
     let [r, g, b, _a] = parsed.to_rgba8();
     Ok((r, g, b))
+}
+
+/// Record a package's download and installed sizes for one region.
+///
+/// The file is edited as a `serde_json::Value` rather than through
+/// [`RegionMetadata`], which models only `color`. A typed round trip would
+/// delete `name`, `coverage`, `status`, `supersedes` and anything the website
+/// adds later. Key order is preserved by serde_json's `preserve_order` feature,
+/// so a release shows a two line diff rather than a reordered file.
+///
+/// A region with no entry is an error rather than a new entry: the coverage map
+/// would reject it anyway for having no colour, and inventing a half populated
+/// region is how a wrong map shipped once already (#200).
+pub fn write_region_size(
+    metadata_path: &Path,
+    region: &str,
+    package_type: PackageType,
+    download_bytes: u64,
+    installed_bytes: u64,
+) -> PublishResult<()> {
+    if !metadata_path.exists() {
+        return Err(PublishError::RegionMetadataNotFound(
+            metadata_path.to_path_buf(),
+        ));
+    }
+
+    let contents =
+        std::fs::read_to_string(metadata_path).map_err(|source| PublishError::ReadFailed {
+            path: metadata_path.to_path_buf(),
+            source,
+        })?;
+
+    let mut document: serde_json::Value =
+        serde_json::from_str(&contents).map_err(|e| PublishError::InvalidRegionMetadata {
+            path: metadata_path.to_path_buf(),
+            message: e.to_string(),
+        })?;
+
+    let key = region.to_uppercase();
+
+    let entry = document
+        .get_mut("regions")
+        .and_then(|regions| regions.get_mut(&key))
+        .ok_or_else(|| PublishError::RegionNotInMetadata {
+            path: metadata_path.to_path_buf(),
+            region: key.clone(),
+        })?;
+
+    let sizes = entry
+        .as_object_mut()
+        .ok_or_else(|| PublishError::InvalidRegionMetadata {
+            path: metadata_path.to_path_buf(),
+            message: format!("entry for region {key} is not an object"),
+        })?
+        .entry("size")
+        .or_insert_with(|| serde_json::json!({}));
+
+    sizes[package_type.folder_suffix()] = serde_json::json!({
+        "download_bytes": download_bytes,
+        "installed_bytes": installed_bytes,
+    });
+
+    let mut rendered = serde_json::to_string_pretty(&document).map_err(|e| {
+        PublishError::InvalidRegionMetadata {
+            path: metadata_path.to_path_buf(),
+            message: e.to_string(),
+        }
+    })?;
+    rendered.push('\n');
+
+    std::fs::write(metadata_path, rendered).map_err(|source| PublishError::WriteFailed {
+        path: metadata_path.to_path_buf(),
+        source,
+    })
 }
 
 /// Derives the dark-mode variant by blending toward white.
@@ -199,5 +279,147 @@ mod tests {
         assert_eq!(brighten((128, 0, 128)), (172, 89, 172));
         assert_eq!(brighten((220, 20, 60)), (232, 102, 128));
         assert_eq!(brighten((0, 255, 255)), (89, 255, 255));
+    }
+
+    const METADATA_WITH_NA: &str = r#"{
+  "schema_version": 2,
+  "regions": {
+    "NA-USA-MX-CENTRAL": {
+      "name": "North America: United States, Mexico and Central America",
+      "coverage": "CONUS, Alaska, Hawaii, Mexico, Central America, the Caribbean and Bermuda",
+      "color": "blue",
+      "status": "staging",
+      "supersedes": ["NA"]
+    },
+    "OC": {
+      "name": "Oceania",
+      "coverage": "Australia and New Zealand",
+      "color": "purple"
+    }
+  }
+}"#;
+
+    fn parse(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn writing_a_size_records_both_figures_under_the_package_type() {
+        let file = write_temp(METADATA_WITH_NA);
+
+        write_region_size(
+            file.path(),
+            "na-usa-mx-central",
+            PackageType::Ortho,
+            34_000_000_000,
+            52_000_000_000,
+        )
+        .unwrap();
+
+        let size = &parse(file.path())["regions"]["NA-USA-MX-CENTRAL"]["size"]["ortho"];
+        assert_eq!(size["download_bytes"], 34_000_000_000u64);
+        assert_eq!(size["installed_bytes"], 52_000_000_000u64);
+    }
+
+    #[test]
+    fn writing_a_size_preserves_fields_this_crate_does_not_model() {
+        let file = write_temp(METADATA_WITH_NA);
+
+        write_region_size(file.path(), "NA-USA-MX-CENTRAL", PackageType::Ortho, 1, 2).unwrap();
+
+        let region = &parse(file.path())["regions"]["NA-USA-MX-CENTRAL"];
+        assert_eq!(region["color"], "blue");
+        assert_eq!(region["status"], "staging");
+        assert_eq!(region["supersedes"][0], "NA");
+        assert!(region["name"].is_string(), "name must survive the write");
+        assert!(
+            region["coverage"].is_string(),
+            "coverage must survive the write"
+        );
+        assert_eq!(
+            parse(file.path())["schema_version"],
+            2,
+            "top level keys must survive the write"
+        );
+    }
+
+    #[test]
+    fn writing_one_package_type_leaves_the_other_alone() {
+        let file = write_temp(METADATA_WITH_NA);
+
+        write_region_size(file.path(), "NA-USA-MX-CENTRAL", PackageType::Ortho, 10, 20).unwrap();
+        write_region_size(
+            file.path(),
+            "NA-USA-MX-CENTRAL",
+            PackageType::Overlay,
+            30,
+            40,
+        )
+        .unwrap();
+
+        let size = &parse(file.path())["regions"]["NA-USA-MX-CENTRAL"]["size"];
+        assert_eq!(size["ortho"]["download_bytes"], 10);
+        assert_eq!(size["overlay"]["download_bytes"], 30);
+    }
+
+    #[test]
+    fn writing_a_size_leaves_other_regions_untouched() {
+        let file = write_temp(METADATA_WITH_NA);
+
+        write_region_size(file.path(), "NA-USA-MX-CENTRAL", PackageType::Ortho, 1, 2).unwrap();
+
+        let other = &parse(file.path())["regions"]["OC"];
+        assert_eq!(other["color"], "purple");
+        assert!(other.get("size").is_none(), "OC must not gain a size block");
+    }
+
+    #[test]
+    fn an_absent_region_is_an_error_naming_it() {
+        let file = write_temp(METADATA_WITH_NA);
+
+        let err = write_region_size(file.path(), "sa-north", PackageType::Ortho, 1, 2)
+            .expect_err("a region with no metadata entry must not be invented");
+
+        assert!(
+            err.to_string().contains("SA-NORTH"),
+            "the error should name the missing region: {err}"
+        );
+    }
+
+    // serde_json's `preserve_order` feature is what keeps a release from
+    // rewriting the whole file's key order. Without it this still passes every
+    // other test in this module (they only assert on parsed values), so this
+    // one checks the raw written string directly.
+    #[test]
+    fn writing_a_size_preserves_key_order() {
+        let file = write_temp(
+            r#"{"regions":{"NA":{"status":"staging","color":"blue","name":"North America"}}}"#,
+        );
+
+        write_region_size(file.path(), "NA", PackageType::Ortho, 1, 2).unwrap();
+
+        let written = std::fs::read_to_string(file.path()).unwrap();
+        let status_pos = written.find("\"status\"").unwrap();
+        let color_pos = written.find("\"color\"").unwrap();
+        let name_pos = written.find("\"name\"").unwrap();
+
+        assert!(
+            status_pos < color_pos && color_pos < name_pos,
+            "keys must keep their original order, not be alphabetised: {written}"
+        );
+    }
+
+    #[test]
+    fn an_absent_metadata_file_is_an_error() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        write_region_size(
+            &temp.path().join("region_metadata.json"),
+            "NA",
+            PackageType::Ortho,
+            1,
+            2,
+        )
+        .expect_err("a missing metadata file must not be created silently");
     }
 }

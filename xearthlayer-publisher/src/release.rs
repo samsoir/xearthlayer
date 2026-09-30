@@ -90,6 +90,18 @@ pub struct ReleaseResult {
 
     /// New library sequence number.
     pub sequence: u64,
+
+    /// Total size of the archive parts in `dist`, in bytes. Zero if nothing is
+    /// built yet.
+    pub download_bytes: u64,
+
+    /// Apparent size of the package directory, in bytes.
+    pub installed_bytes: u64,
+
+    /// Set when a size could not be measured, or when the sizes could not be
+    /// recorded in `region_metadata.json`. The library index update still
+    /// succeeded either way; see `release_package`.
+    pub size_warning: Option<String>,
 }
 
 /// Build archives for a package.
@@ -250,6 +262,10 @@ pub fn release_package(
 ) -> PublishResult<ReleaseResult> {
     use xearthlayer_package::ValidationContext;
 
+    // package_dir joins the region straight into a path, so it is untrusted
+    // input until it has been checked.
+    xearthlayer_package::validate_region(region)?;
+
     let package_dir = repo.package_dir(region, package_type);
     let metadata = read_metadata(&package_dir)?;
     let metadata_path = package_dir.join(METADATA_FILENAME);
@@ -282,11 +298,78 @@ pub fn release_package(
 
     library.save()?;
 
+    // Sizes are advisory and belong beside the region's other published facts.
+    // Measuring them here rather than leaving them hand maintained is the same
+    // reasoning as #200: a hand kept value beside an auto kept one diverges.
+    //
+    // The library index update above is the release. A size that cannot be
+    // measured, or a metadata file that cannot be updated, must not turn an
+    // already completed release into an `Err` a caller might retry, which
+    // would run `add_or_update` again and bump the sequence a second time.
+    // Both failure modes are folded into `size_warning` rather than `?`,
+    // each naming which figure it is about so a measurement failure and a
+    // metadata write failure read differently.
+    let mut warnings: Vec<String> = Vec::new();
+
+    let installed_bytes = match crate::directory_size(&package_dir) {
+        Ok(0) => {
+            warnings.push(format!(
+                "installed size measured as 0 bytes at {}; the directory may be missing or emptied",
+                package_dir.display()
+            ));
+            0
+        }
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warnings.push(format!("installed size could not be measured: {e}"));
+            0
+        }
+    };
+
+    let dist_dir = repo
+        .dist_dir()
+        .join(region.to_lowercase())
+        .join(package_type.folder_suffix());
+
+    let download_bytes = match crate::directory_size(&dist_dir) {
+        Ok(0) => {
+            warnings.push(format!(
+                "download size measured as 0 bytes at {}; the directory may be missing or emptied",
+                dist_dir.display()
+            ));
+            0
+        }
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warnings.push(format!("download size could not be measured: {e}"));
+            0
+        }
+    };
+
+    if let Err(e) = crate::write_region_size(
+        &repo.region_metadata_path(),
+        region,
+        package_type,
+        download_bytes,
+        installed_bytes,
+    ) {
+        warnings.push(format!("sizes not recorded in region metadata: {e}"));
+    }
+
+    let size_warning = if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("; "))
+    };
+
     Ok(ReleaseResult {
         region: region.to_string(),
         package_type,
         version: metadata.package_version,
         sequence: library.sequence(),
+        download_bytes,
+        installed_bytes,
+        size_warning,
     })
 }
 
@@ -608,9 +691,181 @@ mod tests {
             package_type: PackageType::Ortho,
             version: Version::new(1, 0, 0),
             sequence: 1,
+            download_bytes: 0,
+            installed_bytes: 0,
+            size_warning: None,
         };
         let debug = format!("{:?}", result);
         assert!(debug.contains("ReleaseResult"));
+    }
+
+    #[test]
+    fn releasing_records_the_package_sizes_in_region_metadata() {
+        let (_temp, repo) = setup_test_repo();
+        let config = RepoConfig::default();
+
+        setup_test_package(&repo, "na", PackageType::Ortho);
+        let build = build_package(&repo, "na", PackageType::Ortho, &config).unwrap();
+        let urls: Vec<String> = build
+            .archive
+            .parts
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("https://example.com/part{}.tar.gz", i))
+            .collect();
+        configure_urls(&repo, "na", PackageType::Ortho, &urls, false).unwrap();
+
+        std::fs::write(
+            repo.region_metadata_path(),
+            r#"{"regions":{"NA":{"name":"North America","coverage":"x","color":"blue"}}}"#,
+        )
+        .unwrap();
+
+        release_package(&repo, "na", PackageType::Ortho, "https://example.com/m.txt").unwrap();
+
+        let document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(repo.region_metadata_path()).unwrap())
+                .unwrap();
+        let size = &document["regions"]["NA"]["size"]["ortho"];
+
+        assert!(
+            size["installed_bytes"].as_u64().unwrap() > 0,
+            "the package directory has content, so installed_bytes must be non zero"
+        );
+        assert!(
+            size.get("download_bytes").is_some(),
+            "download_bytes must be written even when no archive exists yet"
+        );
+    }
+
+    #[test]
+    fn releasing_without_a_region_metadata_file_still_releases() {
+        let (_temp, repo) = setup_test_repo();
+        let config = RepoConfig::default();
+
+        setup_test_package(&repo, "na", PackageType::Ortho);
+        let build = build_package(&repo, "na", PackageType::Ortho, &config).unwrap();
+        let urls: Vec<String> = build
+            .archive
+            .parts
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("https://example.com/part{}.tar.gz", i))
+            .collect();
+        configure_urls(&repo, "na", PackageType::Ortho, &urls, false).unwrap();
+
+        let _ = std::fs::remove_file(repo.region_metadata_path());
+
+        let result = release_package(&repo, "na", PackageType::Ortho, "https://example.com/m.txt")
+            .expect("a missing metadata file must not block the library update");
+
+        assert_eq!(result.sequence, 1);
+        assert!(
+            result.size_warning.is_some(),
+            "the release succeeded, but the sizes could not be recorded, so the caller must be told"
+        );
+    }
+
+    #[test]
+    fn releasing_still_succeeds_when_a_size_cannot_be_measured() {
+        let (_temp, repo) = setup_test_repo();
+        let config = RepoConfig::default();
+
+        setup_test_package(&repo, "na", PackageType::Ortho);
+        let build = build_package(&repo, "na", PackageType::Ortho, &config).unwrap();
+        let urls: Vec<String> = build
+            .archive
+            .parts
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("https://example.com/part{}.tar.gz", i))
+            .collect();
+        configure_urls(&repo, "na", PackageType::Ortho, &urls, false).unwrap();
+
+        std::fs::write(
+            repo.region_metadata_path(),
+            r#"{"regions":{"NA":{"name":"North America","coverage":"x","color":"blue"}}}"#,
+        )
+        .unwrap();
+
+        // Replace the dist type directory that `download_bytes` walks with a
+        // regular file. `directory_size` treats a missing path as zero, so a
+        // missing directory would not exercise the failure this test is
+        // about; a file where a directory is expected makes `fs::read_dir`
+        // return a real error instead.
+        let dist_type_dir = repo
+            .dist_dir()
+            .join("na")
+            .join(PackageType::Ortho.folder_suffix());
+        std::fs::remove_dir_all(&dist_type_dir).unwrap();
+        std::fs::write(&dist_type_dir, b"not a directory").unwrap();
+
+        let result = release_package(&repo, "na", PackageType::Ortho, "https://example.com/m.txt")
+            .expect("a size measurement failure must not fail an already completed release");
+
+        assert_eq!(
+            result.sequence, 1,
+            "the library index update already happened and must not be undone or retried"
+        );
+        assert_eq!(
+            result.download_bytes, 0,
+            "a size that failed to measure defaults to zero rather than aborting the release"
+        );
+        assert!(
+            result
+                .size_warning
+                .as_deref()
+                .is_some_and(|w| w.contains("download size")),
+            "the warning must say which figure failed to measure: {:?}",
+            result.size_warning
+        );
+    }
+
+    #[test]
+    fn releasing_warns_when_a_measured_size_is_zero() {
+        let (_temp, repo) = setup_test_repo();
+        let config = RepoConfig::default();
+
+        setup_test_package(&repo, "na", PackageType::Ortho);
+        let build = build_package(&repo, "na", PackageType::Ortho, &config).unwrap();
+        let urls: Vec<String> = build
+            .archive
+            .parts
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("https://example.com/part{}.tar.gz", i))
+            .collect();
+        configure_urls(&repo, "na", PackageType::Ortho, &urls, false).unwrap();
+
+        std::fs::write(
+            repo.region_metadata_path(),
+            r#"{"regions":{"NA":{"name":"North America","coverage":"x","color":"blue"}}}"#,
+        )
+        .unwrap();
+
+        // An operator reclaiming disk by deleting `dist/` by hand, after the
+        // parts have been uploaded, is an expected workflow at this scale.
+        // `directory_size` answers a missing path with `Ok(0)`, not an error,
+        // so this must not be silently indistinguishable from an intact,
+        // genuinely empty archive.
+        let dist_type_dir = repo
+            .dist_dir()
+            .join("na")
+            .join(PackageType::Ortho.folder_suffix());
+        std::fs::remove_dir_all(&dist_type_dir).unwrap();
+
+        let result = release_package(&repo, "na", PackageType::Ortho, "https://example.com/m.txt")
+            .expect("a hand reclaimed dist directory must not block release");
+
+        assert_eq!(result.download_bytes, 0);
+        assert!(
+            result
+                .size_warning
+                .as_deref()
+                .is_some_and(|w| w.contains("download") && w.contains('0')),
+            "a zero measured size must be called out by name, not passed through silently: {:?}",
+            result.size_warning
+        );
     }
 
     #[test]
@@ -619,5 +874,37 @@ mod tests {
         assert_eq!(ReleaseStatus::Ready, ReleaseStatus::Ready);
         assert_eq!(ReleaseStatus::Released, ReleaseStatus::Released);
         assert_ne!(ReleaseStatus::NotBuilt, ReleaseStatus::Ready);
+    }
+
+    #[test]
+    fn releasing_rejects_a_region_that_could_escape_the_repository() {
+        let (temp, repo) = setup_test_repo();
+
+        let escaping = "../victim";
+        let victim = temp.path().join("victim");
+
+        let err = release_package(
+            &repo,
+            escaping,
+            PackageType::Ortho,
+            "https://example.com/m.txt",
+        )
+        .expect_err("a region that escapes the repository must be refused");
+
+        // Assert the variant, not the message. Without validation this call
+        // still fails, but with ReadFailed on a path that happens to contain
+        // the region, so a message check would pass while proving nothing.
+        assert!(
+            matches!(err, PublishError::InvalidPath(_)),
+            "expected the region to be refused as an invalid path, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(escaping),
+            "the error should name the offending region: {err}"
+        );
+        assert!(
+            !victim.exists(),
+            "nothing may be created outside the repository root"
+        );
     }
 }

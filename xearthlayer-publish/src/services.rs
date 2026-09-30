@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use semver::Version;
 
 use super::traits::{
-    CoverageResult, DedupeReport, Output, OverlapSummary, PublisherService, RepositoryOperations,
+    CoverageResult, DedupeReport, Output, OverlapSummary, Prompt, PublisherService,
+    RepositoryOperations,
 };
 use crate::error::CliError;
 use xearthlayer_package::{PackageMetadata, PackageType};
@@ -17,8 +18,8 @@ use xearthlayer_publisher::dedupe::{
 };
 use xearthlayer_publisher::{
     coverage::{CoverageConfig, CoverageMapGenerator},
-    BuildResult, ProcessSummary, RegionMetadata, RegionSuggestion, ReleaseResult, ReleaseStatus,
-    RepoConfig, SceneryScanResult, UrlConfigResult, VersionBump,
+    BuildResult, DeletionPlan, ProcessSummary, PublishError, RegionMetadata, RegionSuggestion,
+    ReleaseResult, ReleaseStatus, RepoConfig, SceneryScanResult, UrlConfigResult, VersionBump,
 };
 
 // ============================================================================
@@ -43,6 +44,140 @@ impl Output for ConsoleOutput {
 
     fn print(&self, message: &str) {
         print!("{}", message);
+    }
+}
+
+// ============================================================================
+// Console Prompt Implementation
+// ============================================================================
+
+/// Reads a yes or no answer from stdin.
+pub struct ConsolePrompt;
+
+impl ConsolePrompt {
+    /// Create a console prompt.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for ConsolePrompt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Prompt for ConsolePrompt {
+    fn confirm(&self, question: &str) -> Result<bool, CliError> {
+        use std::io::{self, Write};
+
+        print!("{} [y/N] ", question);
+        io::stdout()
+            .flush()
+            .map_err(|e| CliError::Publish(format!("could not write the prompt: {e}")))?;
+
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(|e| CliError::Publish(format!("could not read the answer: {e}")))?;
+
+        Ok(is_affirmative(&answer))
+    }
+}
+
+/// True only for an explicit yes. Anything else, including an empty answer
+/// from a closed stdin, is a no.
+fn is_affirmative(answer: &str) -> bool {
+    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// Turn a [`RegionMetadata::load`] failure into a `CliError`, adding the
+/// `--metadata` hint only for `coverage`, which has that flag. `release` uses
+/// the same loader through [`write_region_size`](xearthlayer_publisher::write_region_size)
+/// but has no such flag, so its own call site must not gain this hint.
+fn coverage_metadata_load_error(error: PublishError) -> CliError {
+    let hint = if matches!(error, PublishError::RegionMetadataNotFound(_)) {
+        " Pass --metadata to override."
+    } else {
+        ""
+    };
+    CliError::Publish(format!("{error}{hint}"))
+}
+
+#[cfg(test)]
+mod coverage_metadata_load_error_tests {
+    use super::coverage_metadata_load_error;
+    use std::path::PathBuf;
+    use xearthlayer_publisher::PublishError;
+
+    #[test]
+    fn a_missing_file_gets_the_metadata_flag_hint() {
+        let err = coverage_metadata_load_error(PublishError::RegionMetadataNotFound(
+            PathBuf::from("/repo/region_metadata.json"),
+        ));
+        assert!(err.to_string().contains("--metadata"));
+    }
+
+    #[test]
+    fn a_parse_failure_gets_no_hint() {
+        let err = coverage_metadata_load_error(PublishError::InvalidRegionMetadata {
+            path: PathBuf::from("/repo/region_metadata.json"),
+            message: "unexpected token".to_string(),
+        });
+        assert!(!err.to_string().contains("--metadata"));
+    }
+}
+
+#[cfg(test)]
+mod is_affirmative_tests {
+    use super::is_affirmative;
+
+    #[test]
+    fn lowercase_y_is_affirmative() {
+        assert!(is_affirmative("y"));
+    }
+
+    #[test]
+    fn lowercase_yes_is_affirmative() {
+        assert!(is_affirmative("yes"));
+    }
+
+    #[test]
+    fn uppercase_y_is_affirmative() {
+        assert!(is_affirmative("Y"));
+    }
+
+    #[test]
+    fn uppercase_yes_is_affirmative() {
+        assert!(is_affirmative("YES"));
+    }
+
+    #[test]
+    fn a_trailing_newline_is_still_affirmative() {
+        assert!(is_affirmative("y\n"));
+        assert!(is_affirmative("yes\n"));
+    }
+
+    #[test]
+    fn an_empty_answer_is_not_affirmative() {
+        // The closed-stdin case: read_line returns Ok(0) with an empty string.
+        assert!(!is_affirmative(""));
+    }
+
+    #[test]
+    fn a_bare_newline_is_not_affirmative() {
+        assert!(!is_affirmative("\n"));
+    }
+
+    #[test]
+    fn no_is_not_affirmative() {
+        assert!(!is_affirmative("n"));
+        assert!(!is_affirmative("no"));
+    }
+
+    #[test]
+    fn an_unrecognised_answer_is_not_affirmative() {
+        assert!(!is_affirmative("maybe"));
     }
 }
 
@@ -297,8 +432,7 @@ impl PublisherService for DefaultPublisherService {
         height: u32,
         dark: bool,
     ) -> Result<CoverageResult, CliError> {
-        let metadata =
-            RegionMetadata::load(metadata_path).map_err(|e| CliError::Publish(format!("{}", e)))?;
+        let metadata = RegionMetadata::load(metadata_path).map_err(coverage_metadata_load_error)?;
 
         let base = if dark {
             CoverageConfig::dark()
@@ -339,8 +473,7 @@ impl PublisherService for DefaultPublisherService {
         output_path: &Path,
         metadata_path: &Path,
     ) -> Result<CoverageResult, CliError> {
-        let metadata =
-            RegionMetadata::load(metadata_path).map_err(|e| CliError::Publish(format!("{}", e)))?;
+        let metadata = RegionMetadata::load(metadata_path).map_err(coverage_metadata_load_error)?;
         let config = CoverageConfig::default()
             .with_regions(&metadata)
             .map_err(|e| CliError::Publish(format!("{}", e)))?;
@@ -432,9 +565,11 @@ impl PublisherService for DefaultPublisherService {
     fn scan_overlaps(&self, source: &Path) -> Result<OverlapSummary, CliError> {
         let detector = OverlapDetector::new();
 
-        // Scan the source directory for tiles
+        // `source` is an Ortho4XP tiles root: one directory per tile, each
+        // with its own terrain/. Aggregate across all of them rather than
+        // treating the root itself as a single package (#286).
         let tiles = detector
-            .scan_package(source)
+            .scan_tiles_root(source)
             .map_err(|e| CliError::Publish(format!("Failed to scan for overlaps: {}", e)))?;
 
         if tiles.is_empty() {
@@ -489,5 +624,36 @@ impl PublisherService for DefaultPublisherService {
         let result = detector.analyze_gaps(&tiles);
 
         Ok(result)
+    }
+
+    fn plan_deletion(
+        &self,
+        repo: &dyn RepositoryOperations,
+        region: &str,
+        package_type: PackageType,
+    ) -> Result<Option<DeletionPlan>, CliError> {
+        let actual_repo = xearthlayer_publisher::Repository::open(repo.root())
+            .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))?;
+
+        match xearthlayer_publisher::plan_deletion(&actual_repo, region, package_type) {
+            Ok(plan) => Ok(Some(plan)),
+            // Nothing of this package type to delete is an answer, not a
+            // failure: a region legitimately has only one of ortho and
+            // overlay. Every other error is real and must reach the caller.
+            Err(PublishError::PackageNotFound { .. }) => Ok(None),
+            Err(e) => Err(CliError::Publish(format!("Cannot delete: {}", e))),
+        }
+    }
+
+    fn execute_deletion(
+        &self,
+        repo: &dyn RepositoryOperations,
+        plan: &DeletionPlan,
+    ) -> Result<(), CliError> {
+        let actual_repo = xearthlayer_publisher::Repository::open(repo.root())
+            .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))?;
+
+        xearthlayer_publisher::execute_deletion(&actual_repo, plan)
+            .map_err(|e| CliError::Publish(format!("Deletion failed: {}", e)))
     }
 }

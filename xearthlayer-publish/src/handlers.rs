@@ -7,8 +7,9 @@
 use semver::Version;
 
 use super::args::{
-    AddArgs, BuildArgs, CoverageArgs, DedupeArgs, GapReportFormatArg, GapsArgs, InitArgs, ListArgs,
-    ReleaseArgs, ReportFormatArg, ScanArgs, StatusArgs, UrlsArgs, ValidateArgs, VersionArgs,
+    AddArgs, BuildArgs, CoverageArgs, DedupeArgs, DeleteArgs, GapReportFormatArg, GapsArgs,
+    InitArgs, ListArgs, ReleaseArgs, ReportFormatArg, ScanArgs, StatusArgs, UrlsArgs, ValidateArgs,
+    VersionArgs,
 };
 use super::output::{
     format_size_display, format_status, print_dedupe_result, print_gap_result,
@@ -125,8 +126,16 @@ impl CommandHandler for ScanHandler {
         // Scan for overlaps (ortho only, overlays don't have zoom levels)
         if package_type == PackageType::Ortho && !scan_result.tiles.is_empty() {
             ctx.output.newline();
-            let overlap_summary = ctx.publisher.scan_overlaps(&args.source)?;
-            print_overlap_summary(ctx.output, &overlap_summary);
+            // An overlap scan that fails must not turn a successful scan into a
+            // non-zero exit after the results have already printed (#286).
+            match ctx.publisher.scan_overlaps(&args.source) {
+                Ok(summary) => print_overlap_summary(ctx.output, &summary),
+                Err(e) => {
+                    ctx.output.newline();
+                    ctx.output
+                        .println(&format!("Warning: could not scan for zoom overlaps: {}", e));
+                }
+            }
         }
 
         Ok(())
@@ -581,13 +590,27 @@ impl CommandHandler for ReleaseHandler {
         ctx.output.println("Package released successfully!");
         ctx.output.newline();
         ctx.output
-            .indented(&format!("Region:   {}", result.region.to_uppercase()));
+            .indented(&format!("Region:    {}", result.region.to_uppercase()));
         ctx.output
-            .indented(&format!("Type:     {}", result.package_type));
+            .indented(&format!("Type:      {}", result.package_type));
         ctx.output
-            .indented(&format!("Version:  {}", result.version));
+            .indented(&format!("Version:   {}", result.version));
         ctx.output
-            .indented(&format!("Sequence: {}", result.sequence));
+            .indented(&format!("Sequence:  {}", result.sequence));
+        ctx.output.indented(&format!(
+            "Download:  {}",
+            format_size_display(result.download_bytes)
+        ));
+        ctx.output.indented(&format!(
+            "Installed: {}",
+            format_size_display(result.installed_bytes)
+        ));
+
+        if let Some(ref warning) = result.size_warning {
+            ctx.output.newline();
+            ctx.output.println(&format!("Warning: {}", warning));
+        }
+
         ctx.output.newline();
         ctx.output.println("Library index updated:");
         ctx.output
@@ -960,6 +983,112 @@ impl CommandHandler for GapsHandler {
             ctx.output
                 .indented("3. Run 'publish add' to import the new tiles");
         }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Delete Handler
+// ============================================================================
+
+/// Handler for the `publish delete` command.
+///
+/// Deletion is planned before it is confirmed, so the prompt can say exactly
+/// what goes and how much it frees. Omitting `--type` deletes both packages of
+/// a region, which is what retiring a region means.
+pub struct DeleteHandler;
+
+impl CommandHandler for DeleteHandler {
+    type Args = DeleteArgs;
+
+    fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
+        let types: Vec<PackageType> = match args.package_type {
+            Some(t) => vec![PackageType::from(t)],
+            None => vec![PackageType::Ortho, PackageType::Overlay],
+        };
+
+        let repo = ctx.publisher.open_repository(&args.repo)?;
+
+        ctx.output
+            .header(&format!("Delete {}", args.region.to_uppercase()));
+        ctx.output.newline();
+
+        // Plan every package first. A region where one type is missing should
+        // not half delete before reporting that. `plan_deletion` answers
+        // "nothing of this type" with `Ok(None)`, not an error, so a real
+        // failure always propagates regardless of whether --type was given.
+        let mut plans = Vec::new();
+        for package_type in types {
+            match ctx
+                .publisher
+                .plan_deletion(repo.as_ref(), &args.region, package_type)?
+            {
+                Some(plan) => plans.push(plan),
+                None => {
+                    ctx.output
+                        .indented(&format!("Skipping {}: no package found", package_type));
+                }
+            }
+        }
+
+        if plans.is_empty() {
+            return Err(CliError::Publish(format!(
+                "Nothing to delete for region {}",
+                args.region.to_uppercase()
+            )));
+        }
+
+        let total: u64 = plans.iter().map(|p| p.bytes_freed).sum();
+
+        for plan in &plans {
+            ctx.output.println(&format!("{}:", plan.package_type));
+            ctx.output.indented(&format!(
+                "Library entry: {}",
+                if plan.in_library { "yes" } else { "not listed" }
+            ));
+            for dir in [plan.package_dir.as_ref(), plan.dist_dir.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                ctx.output.indented(&format!("{}", dir.display()));
+            }
+        }
+        ctx.output.newline();
+        ctx.output
+            .println(&format!("Frees {}", format_size_display(total)));
+
+        if args.dry_run {
+            ctx.output.newline();
+            ctx.output.println("Dry run: nothing was deleted.");
+            return Ok(());
+        }
+
+        if !args.yes {
+            ctx.output.newline();
+            let confirmed = ctx.prompt.confirm(&format!(
+                "Permanently delete {} and its archives?",
+                args.region.to_uppercase()
+            ))?;
+            if !confirmed {
+                ctx.output.println("Cancelled. Nothing was deleted.");
+                return Ok(());
+            }
+        }
+
+        for plan in &plans {
+            ctx.publisher.execute_deletion(repo.as_ref(), plan)?;
+        }
+
+        ctx.output.newline();
+        ctx.output.println(&format!(
+            "Deleted {}. Freed {}.",
+            args.region.to_uppercase(),
+            format_size_display(total)
+        ));
+        ctx.output.newline();
+        ctx.output
+            .println("Note: any GitHub release assets for this package are untouched.");
 
         Ok(())
     }
