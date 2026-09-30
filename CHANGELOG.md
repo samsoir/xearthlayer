@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`xearthlayer-publish delete`** ([#287](https://github.com/samsoir/xearthlayer/issues/287)): removes a regional package's library index entry, working directory and built archives. Omitting `--type` removes both the ortho and overlay packages. `--dry-run` reports what would go and how much it frees without touching anything, and the command confirms before acting unless `--yes` is given. GitHub release assets are deliberately left alone, since they must outlive the index entry while users are still installing from them.
 
+### Security
+
+- **Region codes are validated before they become paths** ([#287](https://github.com/samsoir/xearthlayer/issues/287)): a package's region code is joined directly into a filesystem path, and `package_mountpoint` prefixes only the first path component it produces, so a `..` segment further along survived untouched. A code such as `x/../../../../tmp/evil` therefore resolved outside the directory it was joined to.
+
+  On the runtime side that directory is the user's Custom Scenery folder, and the code arrives as the title of package metadata fetched over HTTP, so a hostile or compromised package library could direct an install to write outside the scenery folder. On the publisher side it is the package repository, where the same code reaches a recursive delete.
+
+  A region code is now rejected if it is empty, contains a path separator, or is a bare `.` or `..`, checked at every point untrusted input enters: both format parsers, the installer, and the publisher's archive, release and delete paths. A dot pair inside a name, such as `foo..bar`, has no traversal power and is still accepted, as are multi word titles. No package published so far is affected; every existing region code is a plain identifier.
+
 ### Changed
 
 - **Publishing is its own program** ([#284](https://github.com/samsoir/xearthlayer/issues/284)): `xearthlayer publish` is now `xearthlayer-publish`, a separate binary with the same thirteen subcommands, shipped as its own package. Every `xearthlayer publish <command>` becomes `xearthlayer-publish <command>`; nothing else changed, not the arguments, the repository layout, or the package format, and a package built by the new binary is byte for byte the one the old command produced. Publishing and streaming were always separate domains joined only by the package format, yet they shared one binary, so the runtime carried a map renderer, a second TLS stack and a 7z encoder it never used, and building a package meant installing a flight simulator service and passing its startup checks. The format itself now lives in a shared `xearthlayer-package` crate that both programs compile against, which is what keeps them from drifting apart.

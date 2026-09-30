@@ -283,3 +283,11 @@ mod tests {
         assert!(err.source().is_none());
     }
 }
+
+impl From<xearthlayer_package::InvalidRegion> for PublishError {
+    /// A region code that cannot safely become a directory name is an invalid
+    /// path, because a path is the only thing the publisher uses it for.
+    fn from(e: xearthlayer_package::InvalidRegion) -> Self {
+        PublishError::InvalidPath(e.to_string())
+    }
+}

@@ -119,6 +119,9 @@ impl LibraryEntry {
 /// Error parsing package library.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LibraryParseError {
+    /// An entry's title is not usable as a region code, so it cannot safely
+    /// become a directory name. See [`crate::validate_region`].
+    InvalidRegionTitle(crate::InvalidRegion),
     /// File is empty or has insufficient lines
     InsufficientLines,
     /// Invalid header line
@@ -149,6 +152,7 @@ pub enum LibraryParseError {
 impl fmt::Display for LibraryParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            LibraryParseError::InvalidRegionTitle(e) => write!(f, "{}", e),
             LibraryParseError::InsufficientLines => {
                 write!(f, "library file has insufficient lines")
             }
@@ -296,6 +300,9 @@ pub fn parse_package_library(content: &str) -> Result<PackageLibrary, LibraryPar
             .ok_or_else(|| LibraryParseError::InvalidPackageType(type_char.to_string()))?;
 
         let title = fields[2].to_string();
+        // Titles reach package_mountpoint and become directory names, and this
+        // index is fetched over HTTP, so it is untrusted input to a path.
+        crate::validate_region(&title).map_err(LibraryParseError::InvalidRegionTitle)?;
 
         let version = Version::from_str(fields[3].trim())
             .map_err(|e| LibraryParseError::InvalidVersion(e.to_string()))?;
@@ -599,5 +606,30 @@ EARTH
         let library = parse_package_library(content).unwrap();
         assert_eq!(library.entries.len(), 0);
         assert!(library.regions().is_empty());
+    }
+
+    #[test]
+    fn an_entry_title_that_could_escape_its_parent_directory_is_rejected() {
+        // Entry titles reach package_mountpoint and become directory names,
+        // and this index is fetched over HTTP.
+        let hostile = sample_library_content().replace("  Z  EUROPE  ", "  Z  ../../../evil  ");
+
+        let err = parse_package_library(&hostile)
+            .expect_err("an entry title containing a path separator must not parse");
+
+        assert!(
+            err.to_string().contains("../../../evil"),
+            "the error should name the offending title: {err}"
+        );
+    }
+
+    #[test]
+    fn a_title_containing_a_space_still_parses() {
+        // "NORTH AMERICA" is a real title in the sample and has no traversal
+        // power, so tightening for security must not reject it.
+        let library = parse_package_library(sample_library_content())
+            .expect("a multi word title is legitimate");
+
+        assert!(library.entries.iter().any(|e| e.title == "NORTH AMERICA"));
     }
 }

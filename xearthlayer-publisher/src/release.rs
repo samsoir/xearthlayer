@@ -262,6 +262,10 @@ pub fn release_package(
 ) -> PublishResult<ReleaseResult> {
     use xearthlayer_package::ValidationContext;
 
+    // package_dir joins the region straight into a path, so it is untrusted
+    // input until it has been checked.
+    xearthlayer_package::validate_region(region)?;
+
     let package_dir = repo.package_dir(region, package_type);
     let metadata = read_metadata(&package_dir)?;
     let metadata_path = package_dir.join(METADATA_FILENAME);
@@ -870,5 +874,37 @@ mod tests {
         assert_eq!(ReleaseStatus::Ready, ReleaseStatus::Ready);
         assert_eq!(ReleaseStatus::Released, ReleaseStatus::Released);
         assert_ne!(ReleaseStatus::NotBuilt, ReleaseStatus::Ready);
+    }
+
+    #[test]
+    fn releasing_rejects_a_region_that_could_escape_the_repository() {
+        let (temp, repo) = setup_test_repo();
+
+        let escaping = "../victim";
+        let victim = temp.path().join("victim");
+
+        let err = release_package(
+            &repo,
+            escaping,
+            PackageType::Ortho,
+            "https://example.com/m.txt",
+        )
+        .expect_err("a region that escapes the repository must be refused");
+
+        // Assert the variant, not the message. Without validation this call
+        // still fails, but with ReadFailed on a path that happens to contain
+        // the region, so a message check would pass while proving nothing.
+        assert!(
+            matches!(err, PublishError::InvalidPath(_)),
+            "expected the region to be refused as an invalid path, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(escaping),
+            "the error should name the offending region: {err}"
+        );
+        assert!(
+            !victim.exists(),
+            "nothing may be created outside the repository root"
+        );
     }
 }

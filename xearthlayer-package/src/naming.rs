@@ -12,6 +12,68 @@ use semver::Version;
 
 use super::PackageType;
 
+/// Why a region code was refused.
+///
+/// Carries the offending code so every caller's message names it without
+/// having to re-quote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidRegion {
+    /// The region code as the caller supplied it.
+    pub region: String,
+    /// What was wrong with it.
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for InvalidRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "region '{}' is invalid: {}", self.region, self.reason)
+    }
+}
+
+impl std::error::Error for InvalidRegion {}
+
+/// Reject a region code that could escape its parent once joined into a path.
+///
+/// Every path derived from a region is built by joining it in, and
+/// [`package_mountpoint`] prefixes only the FIRST path component it produces,
+/// so a `..` segment further along survives untouched. A region of
+/// `x/../../../../tmp/evil` therefore yields a mountpoint that resolves outside
+/// the directory it was joined to. That directory is the publisher's repository
+/// on one side and the user's Custom Scenery folder on the other, and the
+/// region reaching the latter arrives in package metadata fetched over HTTP.
+///
+/// Call this wherever an untrusted region enters, which means the parsers in
+/// this crate and the publisher's path-building entry points. Validating at
+/// those boundaries covers every downstream consumer, which is why
+/// [`package_mountpoint`] itself stays infallible.
+///
+/// There is no legitimate region code containing a path separator: the code
+/// becomes a directory name under Custom Scenery, so rejecting these costs
+/// nothing real. A dot pair inside a name, such as `foo..bar`, has no traversal
+/// power and is accepted.
+pub fn validate_region(region: &str) -> Result<(), InvalidRegion> {
+    let reject = |reason| {
+        Err(InvalidRegion {
+            region: region.to_string(),
+            reason,
+        })
+    };
+
+    if region.is_empty() {
+        return reject("a region code must not be empty");
+    }
+
+    if region.chars().any(std::path::is_separator) {
+        return reject("a region code must not contain a path separator");
+    }
+
+    if region == "." || region == ".." {
+        return reject("a region code must not be a path traversal segment");
+    }
+
+    Ok(())
+}
+
 /// Generate the mountpoint (folder) name for a package.
 ///
 /// This is the directory name used in X-Plane's Custom Scenery folder.
@@ -256,5 +318,52 @@ mod tests {
         let mountpoint = package_mountpoint("na", PackageType::Ortho);
         let archive = archive_filename("na", PackageType::Ortho, &Version::new(1, 0, 0));
         assert!(archive.starts_with(&mountpoint));
+    }
+
+    // ---- region validation ----
+
+    #[test]
+    fn a_plain_region_code_is_valid() {
+        for code in ["na", "NA", "eu2", "na-usa-mx-central", "AS1"] {
+            assert!(
+                validate_region(code).is_ok(),
+                "{code} is a real region code and must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_region_is_rejected() {
+        assert!(validate_region("").is_err());
+    }
+
+    #[test]
+    fn a_region_containing_a_path_separator_is_rejected() {
+        let err = validate_region("x/../../../../tmp/evil")
+            .expect_err("a region with a separator must not be accepted");
+
+        assert!(
+            err.to_string().contains("x/../../../../tmp/evil"),
+            "the error should name the offending region: {err}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_region_is_rejected() {
+        assert!(validate_region("/etc").is_err());
+    }
+
+    #[test]
+    fn a_traversal_segment_is_rejected() {
+        assert!(validate_region("..").is_err());
+        assert!(validate_region(".").is_err());
+    }
+
+    #[test]
+    fn a_dot_inside_a_name_is_not_a_traversal_and_is_accepted() {
+        assert!(
+            validate_region("foo..bar").is_ok(),
+            "a dot pair inside a name has no traversal power"
+        );
     }
 }

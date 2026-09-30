@@ -41,41 +41,6 @@ pub struct DeletionPlan {
     pub bytes_freed: u64,
 }
 
-/// Reject a region code that could escape the repository root once it is
-/// joined into a path.
-///
-/// Both `package_dir` and `dist_dir` are built by joining the region straight
-/// into a path, and `package_mountpoint` only prefixes the first path
-/// component it produces: a `..` segment further along survives untouched.
-/// `plan_deletion` is the last point in the library that sees the raw region
-/// before those paths are built and, eventually, handed to a recursive
-/// delete, so it must refuse anything that is not a plain directory name.
-///
-/// There is no legitimate region code containing a path separator: the code
-/// becomes a directory name under Custom Scenery, so rejecting these costs
-/// nothing real.
-fn validate_region(region: &str) -> PublishResult<()> {
-    if region.is_empty() {
-        return Err(PublishError::InvalidPath(format!(
-            "region '{region}' is invalid: a region code must not be empty"
-        )));
-    }
-
-    if region.chars().any(std::path::is_separator) {
-        return Err(PublishError::InvalidPath(format!(
-            "region '{region}' is invalid: a region code must not contain a path separator"
-        )));
-    }
-
-    if region == "." || region == ".." {
-        return Err(PublishError::InvalidPath(format!(
-            "region '{region}' is invalid: a region code must not be a path traversal segment"
-        )));
-    }
-
-    Ok(())
-}
-
 /// Work out what deleting a package would remove. Changes nothing.
 ///
 /// A region with no index entry, no package directory and no archives is an
@@ -87,7 +52,7 @@ pub fn plan_deletion(
     region: &str,
     package_type: PackageType,
 ) -> PublishResult<DeletionPlan> {
-    validate_region(region)?;
+    xearthlayer_package::validate_region(region)?;
 
     let in_library = LibraryManager::open_or_create(repo.root())?.contains(region, package_type);
 
