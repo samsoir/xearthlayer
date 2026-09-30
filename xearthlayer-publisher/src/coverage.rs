@@ -75,6 +75,9 @@ pub struct CoverageConfig {
     pub border_width: f32,
     /// Map style (light or dark theme).
     pub style: MapStyle,
+    /// Regions that another region replaces, lowercased. Drawn first so the
+    /// replacement is painted over them.
+    pub superseded_regions: std::collections::HashSet<String>,
 }
 
 impl Default for CoverageConfig {
@@ -88,6 +91,7 @@ impl Default for CoverageConfig {
             border_color: (0, 0, 0, 255),
             border_width: 0.5,
             style: MapStyle::default(),
+            superseded_regions: std::collections::HashSet::new(),
         }
     }
 }
@@ -104,6 +108,7 @@ impl CoverageConfig {
             border_color: (80, 80, 80, 255),
             border_width: 0.3,
             style: MapStyle::Dark,
+            superseded_regions: std::collections::HashSet::new(),
         }
     }
 
@@ -117,7 +122,11 @@ impl CoverageConfig {
     /// a dark config with light colours.
     pub fn with_regions(mut self, metadata: &RegionMetadata) -> PublishResult<Self> {
         let is_dark = self.style == MapStyle::Dark;
-        let alpha = if is_dark { 200 } else { 180 };
+        // Fills are opaque. A translucent fill blended a region with the one
+        // it replaces into a third colour, so neither could be read. Genuine
+        // overlaps between unrelated regions are minimal, and draw order below
+        // makes the newer scenery win where they are not.
+        let alpha = 255;
 
         let mut colors = HashMap::new();
         for (code, entry) in &metadata.regions {
@@ -125,6 +134,16 @@ impl CoverageConfig {
             let rgb = if is_dark { brighten(rgb) } else { rgb };
             colors.insert(code.to_lowercase(), (rgb.0, rgb.1, rgb.2, alpha));
         }
+        // Anything named in another region's `supersedes` is drawn first, so
+        // the region replacing it lands on top.
+        let superseded: std::collections::HashSet<String> = metadata
+            .regions
+            .values()
+            .flat_map(|e| e.supersedes.iter())
+            .map(|c| c.to_lowercase())
+            .collect();
+        self.superseded_regions = superseded;
+
         self.region_colors = colors;
         Ok(self)
     }
@@ -505,7 +524,19 @@ impl CoverageMapGenerator {
             self.config.style.land_color(),
         );
 
-        for tile in tiles {
+        // Superseded regions first, so a replacement is drawn over the region
+        // it replaces rather than blended with it.
+        let mut ordered: Vec<&TileCoverage> = tiles.iter().collect();
+        ordered.sort_by_key(|t| {
+            u8::from(
+                !self
+                    .config
+                    .superseded_regions
+                    .contains(&t.region.to_lowercase()),
+            )
+        });
+
+        for tile in ordered {
             let fill_color = self
                 .config
                 .region_colors
@@ -701,19 +732,64 @@ mod tests {
     }
 
     #[test]
-    fn light_config_uses_metadata_colour_with_alpha_180() {
+    fn light_config_uses_the_metadata_colour_opaquely() {
         let config = CoverageConfig::default()
             .with_regions(&metadata_fixture())
             .unwrap();
-        assert_eq!(config.region_colors["na"], (0, 0, 255, 180));
+        assert_eq!(config.region_colors["na"], (0, 0, 255, 255));
     }
 
     #[test]
-    fn dark_config_brightens_and_uses_alpha_200() {
+    fn dark_config_brightens_and_stays_opaque() {
         let config = CoverageConfig::dark()
             .with_regions(&metadata_fixture())
             .unwrap();
-        assert_eq!(config.region_colors["na"], (89, 89, 255, 200));
+        assert_eq!(config.region_colors["na"], (89, 89, 255, 255));
+    }
+
+    /// A superseding region must completely hide the one it replaces. With a
+    /// translucent fill the two blended into a third colour, so a region and
+    /// its replacement were indistinguishable on the map.
+    #[test]
+    fn a_superseding_region_is_drawn_opaquely_over_the_one_it_replaces() {
+        let md: crate::RegionMetadata = serde_json::from_str(
+            r##"{"regions":{
+                 "OLD":{"color":"#0000ff"},
+                 "NEW":{"color":"#ff0000","supersedes":["OLD"]}
+               }}"##,
+        )
+        .unwrap();
+        let config = CoverageConfig::default().with_regions(&md).unwrap();
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let out = temp.path().join("map.png");
+        // Both regions claim the same ground, as a replacement always does.
+        // Kept to one tile so the view zooms in and the sample below lands on
+        // fill rather than on the anti-aliased tile border, which at a global
+        // zoom covers most of a one-degree tile.
+        let tiles = [
+            TileCoverage {
+                latitude: 40,
+                longitude: -100,
+                region: "new".into(),
+            },
+            TileCoverage {
+                latitude: 40,
+                longitude: -100,
+                region: "old".into(),
+            },
+        ];
+        let generator = CoverageMapGenerator::new(config);
+        generator.generate_map(&tiles, &out).unwrap();
+
+        let img = image_pixel(&out, 1200, 600);
+        let (x, y) = generator.viewport(&tiles).project(40.5, -99.5);
+
+        assert_eq!(
+            img(x as u32, y as u32),
+            (255, 0, 0),
+            "the superseding region must be the exact colour, not a blend"
+        );
     }
 
     #[test]

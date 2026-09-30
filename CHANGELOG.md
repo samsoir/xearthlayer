@@ -37,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Coverage maps silently rendered a watermark** ([#289](https://github.com/samsoir/xearthlayer/issues/289)): CartoDB began requiring an API key and answered requests with HTTP 200 and a small PNG reading "API KEY REQUIRED" rather than an error, so `publish coverage --dark` exited zero, wrote a structurally valid image, and produced an unusable map. Every check short of looking at the picture passed.
 
+  Region fills are also opaque now, and a region that supersedes another is drawn over it. Translucent fills blended a region with the one it replaces into a third colour, so neither could be read: on a map showing both the legacy `NA` package and its replacement, the whole of North America appeared as one shape. Genuine overlaps between unrelated regions are rare, and where they exist the newer scenery wins, which is what a user installing everything would actually get. Draw order follows the `supersedes` field in `region_metadata.json`, so adding a region needs no code change.
+
   The basemap is now drawn locally from Natural Earth coastline data vendored in the publisher, rather than fetched as raster tiles. A coverage map needs a land silhouette and the regions drawn over it, and buying the silhouette from a third party cost an API key, a network round trip per tile, and a failure that reported success. Rendering it here makes the output deterministic, byte identical between runs, and produced without any network access at all, which also removes the `staticmap` dependency and its HTTP stack. Both the light and dark themes are rendered this way; leaving either on tiles would have preserved the failure mode.
 
 ### Security
