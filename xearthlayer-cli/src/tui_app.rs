@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use xearthlayer::aircraft_position::SharedAircraftPosition;
 use xearthlayer::config::ConfigFile;
+use xearthlayer::executor::LaneSizing;
 use xearthlayer::manager::{InstalledPackage, LocalPackageStore};
 use xearthlayer::prefetch::{PrewarmHandle, SharedPrefetchStatus};
 use xearthlayer::service::{PrewarmOrchestrator, ServiceOrchestrator, StartupProgress};
@@ -31,7 +32,7 @@ use xearthlayer::xplane::XPlaneEnvironment;
 use crate::error::CliError;
 use crate::ui::{
     self, Dashboard, DashboardConfig, DashboardEvent, DashboardState, LoadingPhase,
-    LoadingProgress, PrewarmProgress,
+    LoadingProgress, PrefetchLaneConfig, PrewarmProgress,
 };
 
 /// Configuration for starting the TUI application.
@@ -85,6 +86,13 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         dds_disk_cache_max: dds_disk_max,
         chunk_disk_cache_max: chunk_disk_max,
         provider_name: cfg.provider.provider_type.clone(),
+        // Same derivation the runtime builder uses, so the group the panel
+        // shows is the group the lane enforces.
+        prefetch_lane: PrefetchLaneConfig {
+            group: LaneSizing::from_configured_share(cfg.prefetch.capacity_share)
+                .prefetch_tile_generation,
+            generation_timeout: Duration::from_secs(cfg.generation.timeout),
+        },
     };
 
     // Create initial loading progress

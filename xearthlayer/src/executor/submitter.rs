@@ -92,6 +92,32 @@ impl JobSubmitter {
     /// This is useful when working with factory patterns that return `Box<dyn Job>`.
     /// Distinguishes a full queue from a gone executor; see [`SubmitError`].
     pub fn try_submit_boxed(&self, job: Box<dyn Job>) -> Result<JobHandle, SubmitError> {
+        let (submitted, handle) = Self::prepare(job);
+        match self.sender.try_send(submitted) {
+            Ok(()) => Ok(handle),
+            Err(TrySendError::Full(_)) => Err(SubmitError::QueueFull),
+            Err(TrySendError::Closed(_)) => Err(SubmitError::ExecutorGone),
+        }
+    }
+
+    /// Submits a boxed job, waiting for room in the executor's queue rather
+    /// than shedding it. Fails only if the executor is gone.
+    ///
+    /// For callers that must never lose a job and can absorb the wait, such
+    /// as the prefetch lane: holding here backs up its request channel, which
+    /// the coordinator sees as a full lane and answers by keeping the tile
+    /// pending.
+    pub async fn submit_boxed_waiting(&self, job: Box<dyn Job>) -> Result<JobHandle, SubmitError> {
+        let (submitted, handle) = Self::prepare(job);
+        self.sender
+            .send(submitted)
+            .await
+            .map(|()| handle)
+            .map_err(|_| SubmitError::ExecutorGone)
+    }
+
+    /// Wraps a job with the channels its handle uses.
+    fn prepare(job: Box<dyn Job>) -> (SubmittedJob, JobHandle) {
         let job_id = job.id();
         let priority = job.priority();
         let name = job.name().to_string();
@@ -112,12 +138,7 @@ impl JobSubmitter {
             signal_rx,
             result_holder,
         };
-
-        match self.sender.try_send(submitted) {
-            Ok(()) => Ok(handle),
-            Err(TrySendError::Full(_)) => Err(SubmitError::QueueFull),
-            Err(TrySendError::Closed(_)) => Err(SubmitError::ExecutorGone),
-        }
+        (submitted, handle)
     }
 }
 

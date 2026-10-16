@@ -106,6 +106,7 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
         .texture(texture_config)
         .chunk_request_timeout_secs(chunk_request_timeout_secs)
         .chunk_max_retries(config.executor.max_retries)
+        .prefetch_capacity_share(config.prefetch.capacity_share)
         .cache_enabled(!args.no_cache)
         .cache_directory(config.cache.directory.clone())
         .cache_memory_size(config.cache.memory_size)

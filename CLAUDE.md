@@ -98,9 +98,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `Job` trait - High-level work unit (e.g., generate a DDS tile, prefetch a region)
    - `Task` trait - Atomic unit of work within a job (e.g., download chunks, encode DDS)
    - `ExecutorDaemon` - Background daemon that receives jobs via channel and executes them
-   - `DdsClient` trait - Abstraction for submitting tile requests (used by FUSE, Prefetch)
+   - `DdsClient` trait - Abstraction for submitting FUSE demand tile requests (`request_dds`); demand only since #296
    - `ChannelDdsClient` - Implementation that sends requests via mpsc channel
-   - Priority scheduling: `ON_DEMAND` > `PREFETCH` > `HOUSEKEEPING`
+   - Priority scheduling inside a lane: `ON_DEMAND` > `PREFETCH` > `HOUSEKEEPING`. FUSE and prefetch no longer share a queue, so priority does not mediate between them
+   - **Two lanes (#296)**: FUSE demand and prefetch each run on their own `ExecutorDaemon` + `JobExecutor` (own coalescer, channels, pools, `tile_generation` group, HTTP semaphore), sharing only the memory, DDS disk and chunk disk caches, plus the GPU encoder worker when `texture.compressor = gpu`. Coalescing is per lane and FUSE always starts its own job (always claim)
+   - **Admission gate**: `ExecutorConfig::admission_gate` (`watch<bool>`). While `true` the executor admits no queued job; admitted jobs run every task. The prefetch lane is gated by demand, the demand lane has no gate. Child jobs bypass admission, and no production job spawns children (`TilePrefetchJob` was deleted)
    - Error policies: `FailFast`, `ContinueOnError`, `PartialSuccess`
    - Resource pools for concurrency limiting by resource type (Network, CPU, DiskIO)
    - See `docs/dev/job-executor-design.md` for full architecture
@@ -111,7 +113,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `JobRequest` - Request message with tile, priority, cancellation, and response channel
     - `DdsResponse` - Response with generated DDS data and metadata
     - `RequestOrigin` - Tracks request source (FUSE, Prefetch, Prewarm, Manual)
-    - Peer daemon architecture: FUSE, Prefetch, and Executor are independent daemons
+    - Peer daemon architecture: FUSE, Prefetch, and the two executor daemons are independent
+    - `PrefetchLane` trait (`runtime/lane.rs`) - Where prefetch work runs: `submit`, `submit_with_receipt` (outcome only, never tile bytes) and `load()`. The result of a submission is a complete tile in the primary's DDS disk cache, so a lane could run elsewhere
+    - `LocalPrefetchLane` - The in-process lane (second daemon + executor). Also carries cache GC jobs via the local-only `job_submitter()`, so GC pauses with prefetch
+    - `DemandTracker` (`executor/demand.rs`) - Counts demand jobs in flight with an RAII `DemandGuard` and publishes the pause state the prefetch lane's admission gate reads
+    - `XEarthLayerRuntime` hands each lane to its consumers at construction (FUSE gets the demand client, the coordinator and prewarm get the lane), so FUSE cannot reach the prefetch lane by type
     - Channel as mediator pattern for maximum decoupling
 
 10. **Package Publisher** (`xearthlayer-publisher/`, its own crate behind the `xearthlayer-publish` binary since #284; the runtime does not link it, and the shared format lives in `xearthlayer-package/`)
@@ -129,18 +135,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `AdaptivePrefetchCoordinator` - Prefetch with flight phase detection
     - `GroundStrategy` - Ring-based prefetching for ground operations (GS < 40kt)
     - `PrefetchBox` - Heading-biased sliding box (speed-proportional extent, proportional 80/20 bias, cruise phase)
-    - `ExtentCalculator` - Speed-proportional box extent: clamped linear ramp 3.5° at 40kt to 6.5° at 450kt
-    - `SceneryWindow` - Window config and dimensions holder
+    - `ExtentCalculator` - Speed-proportional box extent: clamped linear ramp 3.5° at 40kt to `box_extent` (default 7.0°) at 450kt in cruise; the ground box is the full `box_extent`, unbiased
+    - `SceneryWindow` - Window config and dimensions holder; dead code, nothing outside its tests constructs it
     - `BoundaryStrategy` - Region lifecycle management (InProgress/Prefetched/NoCoverage/Deferred)
     - `PhaseDetector` - Ground/Cruise flight phase state machine; reset via `on_ground` from AircraftState on telemetry resume
     - `SimState` - Direct sim state detection via X-Plane Web API (paused, on_ground, scenery_loading, replay)
     - `TransitionThrottle` - Grace period + ramp-up after Ground-to-Cruise transition
     - `LoopState` - Per-cycle runner state including `telemetry_paused` flag for stale telemetry safe mode
     - `PrefetchStateObserver` - FUSE-side divergence detector; demotes a `Prefetched`/`NoCoverage` region back to *absent* when FUSE has to generate a tile on demand there, rate-limited to one demotion per region per 120s window
-    - Submits jobs to shared job executor daemon via `DdsClient` trait
+    - Submits tiles to the prefetch lane via the `PrefetchLane` trait; the lane admits nothing while FUSE is waiting on generation (no-harm contract, see `docs/dev/adaptive-prefetch-design.md`)
+    - Prefetch-lane tile jobs start with `CachedTileProbeTask` (`tasks/cached_tile_probe.rs`), which skips tiles already cached when the job is admitted
+    - `PrefetchState` (`prefetch/state.rs`) - the single dashboard state resolved by precedence (Disabled, Paused (demand), Holding (takeoff), Deferred (load), Ramping, Active, Idle)
     - Mode is `prefetch.mode` alone: `opportunistic` (default), `aggressive` or `disabled`. The throughput calibrator that was meant to choose it had no input and no reader, and was removed in #277 along with the `auto` value; `PerformanceCalibration::default_opportunistic()` survives only as the fixed estimate `PrefetchPlan` budgets with
     - **Four-tier filtering**: Memory cache → Patched region exclusion (via `GeoIndex`) → Installed package disk (via `OrthoUnionIndex`) → XEL DDS disk cache (the write-only `cached_tiles` local-tracking shadow tier was deleted in #176 after it was confirmed to never be read)
-    - **Backpressure takes the higher of two signals**: `executor_load()` (our resource pools) and `fuse_pressure()` (memory pinned by open virtual DDS handles, as a fraction of the ceiling in `pinned_budget::PinnedTileBudget`). They diverge at a boundary crossing, where most reads are cache-served and so invisible to the pools; that collision sets the memory floor per #227. Open handles rather than a read rate because `open`/`release` reach FUSE on every platform and reads do not (macOS page-cache serving). See #246
+    - **Backpressure takes the higher of two signals**: `PrefetchLane::load()` (jobs waiting for admission on the prefetch lane, against its `tile_generation` group size) and `fuse_pressure` (memory pinned by open virtual DDS handles, as a fraction of the ceiling in `pinned_budget::PinnedTileBudget`). They diverge at a boundary crossing, where most reads are cache-served and so invisible to the lanes; that collision sets the memory floor per #227. Open handles rather than a read rate because `open`/`release` reach FUSE on every platform and reads do not (macOS page-cache serving). See #246
     - **Two-phase region commit**: Regions marked `InProgress` in GeoIndex during prefetch, promoted to `Prefetched` on completion
     - **Stale telemetry safe mode**: pauses tile submissions when telemetry stale >5s; on resume, reads `on_ground` from AircraftState to reset PhaseDetector before next cycle
     - See `docs/dev/adaptive-prefetch-design.md` for design details
@@ -218,16 +226,16 @@ xearthlayer-cli
             │       └─→ cache/providers (Memory, Disk with internal GC) │
             │                                                            │
             ├─→ runtime (XEarthLayerRuntime orchestrator) ──────────────┤
-            │       └─→ executor (ExecutorDaemon, DdsClient)            │
-            │               └─→ jobs (DdsGenerateJob, TilePrefetchJob)  │
+            │       └─→ executor (2x ExecutorDaemon: demand + prefetch) │
+            │               └─→ jobs (DdsGenerateJob)                   │
             │                       └─→ tasks (DownloadChunks, BuildAndCacheDds) │
             │                                                            │
             ├─→ fuse/fuse3 (async multi-threaded FUSE) ─────────────────┤
-            │       ├─→ uses DdsClient for tile requests                │
+            │       ├─→ uses DdsClient (demand lane) for tile requests  │
             │       └─→ uses GeoIndex for patch region filtering        │
             │                                                            │
             ├─→ prefetch (AdaptivePrefetchCoordinator) ────────────────┘
-            │       └─→ uses DdsClient + GeoIndex for background prefetch
+            │       └─→ uses PrefetchLane + GeoIndex for background prefetch
             │
             ├─→ geo_index (geospatial reference database)
             ├─→ provider (Bing, Go2, Google - async variants)
@@ -248,8 +256,8 @@ Uses **Web Mercator** (Slippy Map) projection:
 - Main thread: CLI and signal handling
 - Tokio runtime: Multi-threaded async runtime for all I/O
   - Worker threads: tokio default (one per core)
-  - Blocking pool: capped at `ResourcePoolConfig::blocking_threads_required()`
-    (`cpu + disk_io + BLOCKING_POOL_HEADROOM`), built by
+  - Blocking pool: capped at `LaneSizing::blocking_threads_required()`
+    (demand `cpu + disk_io` + prefetch `cpu + disk_io` + `BLOCKING_POOL_HEADROOM`), built by
     `runtime::build_service_runtime()` — **not** tokio's 512 default
   - FUSE operations via fuse3 (native async)
   - HTTP downloads via async reqwest
@@ -300,15 +308,22 @@ Diagnosing memory in the field: `docs/dev/memory-telemetry.md`.
 
 All job executor operations are protected by resource pools with semaphore-based
 limiting to prevent resource exhaustion under heavy load. Each resource type has
-tuned concurrency limits:
+tuned concurrency limits. The figures below are the **demand lane's**. The prefetch
+lane has its own pools, sized by `LaneSizing` (`executor/lane_sizing.rs`) as
+`ceil(demand x prefetch.capacity_share)` per pool (default 0.35, range 0.05 to 0.50,
+the only user-facing sizing setting), `tile_generation = 2 x (prefetch cpu + prefetch network)`
+and its own unscaled 1024 HTTP permits (connections cost X-Plane no CPU, and prefetch
+downloads are bound by connections in flight). The old shared-pool prefetch quota
+(`max_prefetch_fraction`, `prefetch_in_flight`) was removed in #296:
 
 - **Network pool (download tasks)**: `clamp(ceil(cpu_capacity * 1.5), 8, 64)` — pipeline-balanced with CPU pool
-- **HTTP semaphore (chunk connections)**: 1024 shared across all download tasks
+- **HTTP semaphore (chunk connections)**: 1024 shared across the demand lane's download tasks
 - **CPU-bound work** (assemble + encode): `max(num_cpus * 1.25, num_cpus + 2)` shared limiter
 - **Disk I/O pool**: `DEFAULT_DISK_IO_CAPACITY` = 64, flat
-- **Tokio blocking pool**: `cpu + disk_io + BLOCKING_POOL_HEADROOM` — the CPU
-  and disk I/O pools both dispatch through `spawn_blocking`, so their sum is
-  the worst-case demand for blocking threads (#227)
+- **Tokio blocking pool**: `LaneSizing::blocking_threads_required()` = demand
+  `cpu + disk_io` + prefetch `cpu + disk_io` + `BLOCKING_POOL_HEADROOM`. The CPU
+  and disk I/O pools of both lanes dispatch through `spawn_blocking`, so their
+  sum is the worst-case demand for blocking threads (#227)
 
 The `ResourcePool` struct (`executor/resource_pool.rs`) manages concurrency by
 resource type. Each task declares its `ResourceType` and the executor acquires
@@ -382,6 +397,12 @@ xearthlayer-publish delete --region <code> [--type <ortho|overlay>] [--dry-run] 
 | `xearthlayer/src/service/facade.rs` | Main service API, wires up runtime |
 | `xearthlayer/src/runtime/orchestrator.rs` | XEarthLayerRuntime - daemon orchestrator |
 | `xearthlayer/src/runtime/request.rs` | JobRequest, DdsResponse, RequestOrigin types |
+| `xearthlayer/src/runtime/lane.rs` | PrefetchLane trait, LocalPrefetchLane, LaneReceipt |
+| `xearthlayer/src/executor/demand.rs` | DemandTracker and DemandGuard (demand jobs in flight, pause state) |
+| `xearthlayer/src/executor/lane_sizing.rs` | LaneSizing - prefetch lane pools from `prefetch.capacity_share`, blocking-pool cap |
+| `xearthlayer/src/tasks/cached_tile_probe.rs` | CachedTileProbeTask - prefetch-lane admission cache re-check |
+| `xearthlayer/src/metrics/latency.rs` | LatencyWindow - per-sample FUSE latency median, p95, max |
+| `xearthlayer/src/prefetch/state.rs` | PrefetchState and resolve_state - dashboard state by precedence |
 | `xearthlayer/src/executor/daemon.rs` | ExecutorDaemon - background job processor |
 | `xearthlayer/src/executor/client.rs` | DdsClient trait and ChannelDdsClient |
 | `xearthlayer/src/executor/job.rs` | Job trait and JobId, JobResult types |

@@ -34,24 +34,17 @@
 //! ```
 
 use crate::coord::TileCoord;
-use crate::executor::resource_pool::ResourcePools;
 use crate::executor::Priority;
 use crate::pinned_budget::PinnedTileBudget;
 use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 /// Timeout for background send when the channel is full for ON_DEMAND requests.
 const ON_DEMAND_SEND_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// Default executor load when resource pools are not available.
-///
-/// Returns 0.0 (idle) so that prefetch is not throttled when load
-/// information is unavailable (e.g., in tests or mock clients).
-const EXECUTOR_LOAD_UNKNOWN: f64 = 0.0;
 
 // =============================================================================
 // Error Types
@@ -177,107 +170,17 @@ pub trait DdsClient: Send + Sync + 'static {
         cancellation: CancellationToken,
     ) -> oneshot::Receiver<DdsResponse>;
 
-    /// Submits a prefetch request (fire-and-forget).
-    ///
-    /// Convenience method for prefetch requests. Lower priority than
-    /// `request_dds` and doesn't block on response.
-    ///
-    /// # Arguments
-    ///
-    /// * `tile` - The tile coordinates to prefetch
-    fn prefetch(&self, tile: TileCoord) {
-        let request = JobRequest::prefetch(tile);
-        let _ = self.submit(request);
-    }
-
-    /// Submits a prefetch request with shared cancellation.
-    ///
-    /// Allows batch cancellation of prefetch requests during shutdown.
-    ///
-    /// # Arguments
-    ///
-    /// * `tile` - The tile coordinates to prefetch
-    /// * `cancellation` - Shared cancellation token
-    fn prefetch_with_cancellation(&self, tile: TileCoord, cancellation: CancellationToken) {
-        let request = JobRequest::prefetch_with_cancellation(tile, cancellation);
-        let _ = self.submit(request);
-    }
-
     /// Checks if the client is still connected to the executor.
     ///
     /// Returns `false` if the executor has been shut down.
     fn is_connected(&self) -> bool;
 
-    /// Returns the current channel pressure as a value between 0.0 and 1.0.
+    /// The pinned-tile budget the mount accounts against, if any.
     ///
-    /// - 0.0: Channel is empty (no backpressure)
-    /// - 1.0: Channel is full (maximum backpressure)
-    ///
-    /// Producers can use this to throttle submission rate. For example,
-    /// the prefetch coordinator defers cycles when pressure exceeds 0.8.
-    ///
-    /// Default implementation returns 0.0 (no pressure) for mock clients.
-    fn channel_pressure(&self) -> f64 {
-        0.0
-    }
-
-    /// Returns executor resource utilization as a value between 0.0 and 1.0.
-    ///
-    /// This reflects the maximum utilization across all resource pools
-    /// (Network, CPU, DiskIO). Unlike `channel_pressure()`, this measures
-    /// actual resource consumption, not just channel depth.
-    ///
-    /// - 0.0: All pools idle
-    /// - 1.0: At least one pool fully saturated
-    ///
-    /// Default implementation returns [`EXECUTOR_LOAD_UNKNOWN`] for mock clients.
-    fn executor_load(&self) -> f64 {
-        EXECUTOR_LOAD_UNKNOWN
-    }
-
-    /// Returns demand on the FUSE mount as a value between 0.0 and 1.0.
-    ///
-    /// Memory pinned by open virtual DDS handles, as a fraction of the ceiling
-    /// that bounds it. A handle exists for as long as X-Plane holds a texture
-    /// open, so this measures how hard the sim is reading from us right now.
-    ///
-    /// This is a different quantity from [`DdsClient::executor_load`], and the
-    /// two diverge exactly when it matters (#246). Executor load sees tile
-    /// generation, so it misses reads served from cache, which is most of a
-    /// boundary load. `SimState::should_prefetch` reports X-Plane's own DSF
-    /// loader, not demand on us, and was never true during the flight that
-    /// motivated this. Prefetch takes the maximum of the two.
-    ///
-    /// Open handles rather than a read rate, deliberately: `open` and `release`
-    /// reach the filesystem on every platform, where reads do not. macOS serves
-    /// virtual DDS through the kernel page cache, so a read-rate signal would be
-    /// accurate on Linux and nearly blind there.
-    ///
-    /// Defaults to 0.0, meaning no pressure, for clients with no mount attached.
-    fn fuse_pressure(&self) -> f64 {
-        0.0
-    }
-
-    /// The pinned-tile budget this client reports pressure from, if any.
-    ///
-    /// The filesystem pins and releases against the same budget the client
-    /// reads, and this client is the one object both sides already hold, so it
-    /// carries the shared handle rather than threading it through the service
-    /// facade. `None` for clients with no mount.
+    /// The filesystem pins and releases against the same budget the prefetch
+    /// coordinator reads, and this client is the one object the mount already
+    /// holds, so it carries the shared handle. `None` for clients with no mount.
     fn pinned_budget(&self) -> Option<Arc<PinnedTileBudget>> {
-        None
-    }
-
-    /// Returns a clone of the underlying sender for async operations.
-    ///
-    /// This allows callers to use `send().await` for backpressure-aware
-    /// submission, which is useful for bulk operations like prewarm.
-    ///
-    /// # Returns
-    ///
-    /// `Some(sender)` if the client has an underlying channel sender,
-    /// `None` for mock implementations.
-    fn sender(&self) -> Option<mpsc::Sender<JobRequest>> {
         None
     }
 }
@@ -309,18 +212,10 @@ pub struct ChannelDdsClient {
     /// Channel sender for requests.
     tx: mpsc::Sender<JobRequest>,
 
-    /// Resource pools for reporting executor load.
-    ///
-    /// When present, `executor_load()` returns the maximum utilization
-    /// across all pools. This provides accurate backpressure signaling
-    /// based on actual resource consumption rather than channel depth.
-    resource_pools: Option<Arc<ResourcePools>>,
-
-    /// Pinned-tile budget for reporting FUSE demand.
+    /// Pinned-tile budget measuring FUSE demand (#246).
     ///
     /// Shared with the FUSE filesystem, which pins and releases against it.
-    /// When absent, `fuse_pressure()` reports no pressure, which is correct for
-    /// a client with no mount (prewarm, tests).
+    /// Absent for a client with no mount (tests).
     pinned_budget: Option<Arc<PinnedTileBudget>>,
 }
 
@@ -333,34 +228,11 @@ impl ChannelDdsClient {
     pub fn new(tx: mpsc::Sender<JobRequest>) -> Self {
         Self {
             tx,
-            resource_pools: None,
             pinned_budget: None,
         }
     }
 
-    /// Creates a new channel client with resource pool awareness.
-    ///
-    /// The resource pools enable `executor_load()` to return actual
-    /// pool utilization, providing meaningful backpressure for the
-    /// prefetch coordinator.
-    ///
-    /// # Arguments
-    ///
-    /// * `tx` - The channel sender for submitting requests
-    /// * `resource_pools` - Shared resource pools from the executor daemon
-    pub fn with_resource_pools(
-        tx: mpsc::Sender<JobRequest>,
-        resource_pools: Arc<ResourcePools>,
-    ) -> Self {
-        Self {
-            tx,
-            resource_pools: Some(resource_pools),
-            pinned_budget: None,
-        }
-    }
-
-    /// Attaches the pinned-tile budget shared with the FUSE filesystem, so
-    /// `fuse_pressure()` reports real demand on the mount (#246).
+    /// Attaches the pinned-tile budget shared with the FUSE filesystem (#246).
     pub fn with_pinned_budget(mut self, budget: Arc<PinnedTileBudget>) -> Self {
         self.pinned_budget = Some(budget);
         self
@@ -398,6 +270,7 @@ impl DdsClient for ChannelDdsClient {
             cancellation,
             response_tx: Some(tx),
             origin,
+            created: Instant::now(),
         };
 
         // Try non-blocking send first (fast path)
@@ -454,33 +327,8 @@ impl DdsClient for ChannelDdsClient {
         !self.tx.is_closed()
     }
 
-    fn channel_pressure(&self) -> f64 {
-        let max = self.tx.max_capacity();
-        if max == 0 {
-            return 1.0;
-        }
-        let available = self.tx.capacity();
-        1.0 - (available as f64 / max as f64)
-    }
-
-    fn executor_load(&self) -> f64 {
-        self.resource_pools
-            .as_ref()
-            .map_or(EXECUTOR_LOAD_UNKNOWN, |pools| pools.max_utilization())
-    }
-
-    fn fuse_pressure(&self) -> f64 {
-        self.pinned_budget
-            .as_ref()
-            .map_or(0.0, |budget| budget.fraction())
-    }
-
     fn pinned_budget(&self) -> Option<Arc<PinnedTileBudget>> {
         self.pinned_budget.as_ref().map(Arc::clone)
-    }
-
-    fn sender(&self) -> Option<mpsc::Sender<JobRequest>> {
-        Some(self.tx.clone())
     }
 }
 
@@ -608,7 +456,7 @@ mod tests {
         let client = ChannelDdsClient::new(tx);
 
         // Fill the channel with a prefetch request
-        client.prefetch(test_tile());
+        client.submit(JobRequest::prefetch(test_tile())).unwrap();
 
         // ON_DEMAND request on full channel spawns background task that waits
         // up to 500ms. Since we never drain the channel, the background task
@@ -626,35 +474,6 @@ mod tests {
             }
             Err(_timeout) => panic!("Test timed out waiting for background send to complete"),
         }
-    }
-
-    #[tokio::test]
-    async fn test_channel_client_prefetch() {
-        let (tx, mut rx) = mpsc::channel(10);
-        let client = ChannelDdsClient::new(tx);
-
-        client.prefetch(test_tile());
-
-        let received = rx.recv().await.unwrap();
-        assert_eq!(received.tile, test_tile());
-        assert_eq!(received.origin, RequestOrigin::Prefetch);
-        assert!(!received.expects_response());
-    }
-
-    #[tokio::test]
-    async fn test_channel_client_prefetch_with_cancellation() {
-        let (tx, mut rx) = mpsc::channel(10);
-        let client = ChannelDdsClient::new(tx);
-
-        let token = CancellationToken::new();
-        client.prefetch_with_cancellation(test_tile(), token.clone());
-
-        let received = rx.recv().await.unwrap();
-        assert!(!received.cancellation.is_cancelled());
-
-        // Cancelling the original should affect the request
-        token.cancel();
-        assert!(received.cancellation.is_cancelled());
     }
 
     #[tokio::test]
@@ -686,7 +505,7 @@ mod tests {
         let client = ChannelDdsClient::new(tx);
 
         // Fill the channel
-        client.prefetch(test_tile());
+        client.submit(JobRequest::prefetch(test_tile())).unwrap();
 
         // ON_DEMAND request with full channel — should NOT immediately fail.
         // Instead it spawns a background task that waits for capacity.
@@ -709,172 +528,23 @@ mod tests {
         assert_eq!(result.data, vec![42]);
     }
 
-    #[tokio::test]
-    async fn test_prefetch_still_uses_try_send() {
-        // Channel capacity of 1
-        let (tx, _rx) = mpsc::channel(1);
-        let client = ChannelDdsClient::new(tx);
-
-        // Fill the channel
-        client.prefetch(test_tile());
-
-        // Prefetch request should fail silently (fire-and-forget)
-        let result = client.submit(JobRequest::prefetch(test_tile()));
-        assert_eq!(result, Err(DdsClientError::ChannelFull));
-    }
-
-    #[test]
-    fn test_channel_pressure_empty() {
-        let (tx, _rx) = mpsc::channel::<JobRequest>(10);
-        let client = ChannelDdsClient::new(tx);
-
-        let pressure = client.channel_pressure();
-        assert!(
-            (pressure - 0.0).abs() < f64::EPSILON,
-            "Empty channel should have 0.0 pressure, got {}",
-            pressure
-        );
-    }
-
-    #[test]
-    fn test_channel_pressure_full() {
-        let (tx, _rx) = mpsc::channel::<JobRequest>(2);
-        let client = ChannelDdsClient::new(tx);
-
-        // Fill the channel
-        let req1 = JobRequest::prefetch(test_tile());
-        let req2 = JobRequest::prefetch(test_tile());
-        client.submit(req1).unwrap();
-        client.submit(req2).unwrap();
-
-        let pressure = client.channel_pressure();
-        assert!(
-            (pressure - 1.0).abs() < f64::EPSILON,
-            "Full channel should have 1.0 pressure, got {}",
-            pressure
-        );
-    }
-
-    #[test]
-    fn test_channel_pressure_partial() {
-        let (tx, _rx) = mpsc::channel::<JobRequest>(4);
-        let client = ChannelDdsClient::new(tx);
-
-        // Fill half the channel
-        client.submit(JobRequest::prefetch(test_tile())).unwrap();
-        client.submit(JobRequest::prefetch(test_tile())).unwrap();
-
-        let pressure = client.channel_pressure();
-        assert!(
-            (pressure - 0.5).abs() < f64::EPSILON,
-            "Half-full channel should have 0.5 pressure, got {}",
-            pressure
-        );
-    }
-
-    #[test]
-    fn test_channel_pressure_default_trait_impl() {
-        // Mock client using default trait impl should return 0.0
-        struct MockClient;
-        impl DdsClient for MockClient {
-            fn submit(&self, _: JobRequest) -> Result<(), DdsClientError> {
-                Ok(())
-            }
-            fn request_dds(
-                &self,
-                _: TileCoord,
-                _: CancellationToken,
-            ) -> oneshot::Receiver<DdsResponse> {
-                let (_, rx) = oneshot::channel();
-                rx
-            }
-            fn request_dds_with_options(
-                &self,
-                _: TileCoord,
-                _: Priority,
-                _: RequestOrigin,
-                _: CancellationToken,
-            ) -> oneshot::Receiver<DdsResponse> {
-                let (_, rx) = oneshot::channel();
-                rx
-            }
-            fn is_connected(&self) -> bool {
-                true
-            }
-        }
-
-        let client = MockClient;
-        assert!(
-            (client.channel_pressure() - 0.0).abs() < f64::EPSILON,
-            "Default trait impl should return 0.0"
-        );
-    }
-
-    #[test]
-    fn test_executor_load_default_trait_impl() {
-        // Mock client using default trait impl should return EXECUTOR_LOAD_UNKNOWN
-        struct MockClient;
-        impl DdsClient for MockClient {
-            fn submit(&self, _: JobRequest) -> Result<(), DdsClientError> {
-                Ok(())
-            }
-            fn request_dds(
-                &self,
-                _: TileCoord,
-                _: CancellationToken,
-            ) -> oneshot::Receiver<DdsResponse> {
-                let (_, rx) = oneshot::channel();
-                rx
-            }
-            fn request_dds_with_options(
-                &self,
-                _: TileCoord,
-                _: Priority,
-                _: RequestOrigin,
-                _: CancellationToken,
-            ) -> oneshot::Receiver<DdsResponse> {
-                let (_, rx) = oneshot::channel();
-                rx
-            }
-            fn is_connected(&self) -> bool {
-                true
-            }
-        }
-
-        let client = MockClient;
-        assert!(
-            (client.executor_load() - EXECUTOR_LOAD_UNKNOWN).abs() < f64::EPSILON,
-            "Default trait impl should return EXECUTOR_LOAD_UNKNOWN"
-        );
-    }
-
-    #[test]
-    fn test_executor_load_without_pools() {
-        let (tx, _rx) = mpsc::channel::<JobRequest>(10);
-        let client = ChannelDdsClient::new(tx);
-
-        assert!(
-            (client.executor_load() - EXECUTOR_LOAD_UNKNOWN).abs() < f64::EPSILON,
-            "Client without resource pools should return EXECUTOR_LOAD_UNKNOWN"
-        );
-    }
-
     /// #246: the filesystem pins against the budget and prefetch reads it. If
     /// the two ever hold separate budgets, both halves still compile and both
     /// report plausible numbers, so nothing fails except the throttle. This is
     /// what says they are the same object.
     #[test]
-    fn fuse_pressure_reflects_pinning_on_the_shared_budget() {
+    fn pinning_is_visible_through_the_clients_budget() {
         let budget = Arc::new(PinnedTileBudget::with_ceiling(1000));
         let (tx, _rx) = mpsc::channel::<JobRequest>(10);
         let client = ChannelDdsClient::new(tx).with_pinned_budget(Arc::clone(&budget));
 
-        assert_eq!(client.fuse_pressure(), 0.0, "idle mount, no pressure");
+        let held = client.pinned_budget().expect("budget attached");
+        assert_eq!(held.fraction(), 0.0, "idle mount, no pressure");
 
         // Stands in for the filesystem materialising tiles for open handles.
         budget.pin(500);
 
-        assert_eq!(client.fuse_pressure(), 0.5);
+        assert_eq!(held.fraction(), 0.5);
     }
 
     /// The mount recovers the budget from the client, because the client is
@@ -892,50 +562,17 @@ mod tests {
         recovered.pin(1000);
 
         assert_eq!(
-            client.fuse_pressure(),
+            budget.fraction(),
             1.0,
             "pinning through the recovered handle must be visible to the client"
         );
     }
 
     #[test]
-    fn a_client_with_no_mount_reports_no_fuse_pressure() {
-        // Prewarm and tests construct clients with no filesystem attached. They
-        // must not be throttled by a signal that does not apply to them.
+    fn a_client_with_no_mount_has_no_budget() {
         let (tx, _rx) = mpsc::channel::<JobRequest>(10);
         let client = ChannelDdsClient::new(tx);
 
-        assert_eq!(client.fuse_pressure(), 0.0);
         assert!(client.pinned_budget().is_none());
-    }
-
-    #[test]
-    fn test_executor_load_with_resource_pools() {
-        use crate::executor::{ResourcePoolConfig, ResourcePools};
-
-        let (tx, _rx) = mpsc::channel::<JobRequest>(10);
-        let config = ResourcePoolConfig::new(4, 4, 4);
-        let pools = Arc::new(ResourcePools::new(config));
-        let client = ChannelDdsClient::with_resource_pools(tx, Arc::clone(&pools));
-
-        // Empty pools — load should be 0.0
-        assert!(
-            (client.executor_load() - 0.0).abs() < f64::EPSILON,
-            "Empty pools should report 0.0 load"
-        );
-
-        // Acquire 2 of 4 CPU permits → 50% utilization on CPU pool
-        let _p1 = pools
-            .try_acquire(crate::executor::ResourceType::CPU)
-            .unwrap();
-        let _p2 = pools
-            .try_acquire(crate::executor::ResourceType::CPU)
-            .unwrap();
-
-        assert!(
-            (client.executor_load() - 0.5).abs() < f64::EPSILON,
-            "50% CPU utilization should report 0.5 load, got {}",
-            client.executor_load()
-        );
     }
 }

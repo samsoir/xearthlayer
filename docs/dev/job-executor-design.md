@@ -5,7 +5,7 @@
 **Complete** - All phases implemented:
 - ✅ Phase 1: Core Framework (executor, job/task traits, resource pools)
 - ✅ Phase 2: DDS Integration (DdsGenerateJob, tasks)
-- ✅ Phase 3: Tile Prefetch (TilePrefetchJob, factory pattern)
+- ✅ Phase 3: Tile prefetch via the factory pattern (the `TilePrefetchJob` child-job design was removed in #296; see Admission Gate and Lanes)
 - ✅ Phase 4: Daemon Architecture (XEarthLayerRuntime, DdsClient, channel-based communication)
 
 ## Problem Statement
@@ -936,6 +936,42 @@ impl Resources {
 }
 ```
 
+### Admission Gate and Lanes
+
+FUSE demand and prefetch run in separate lanes (#296). Each lane is its own
+`ExecutorDaemon` and `JobExecutor` with its own coalescer, request channel, job
+channel, resource pools, `tile_generation` concurrency group and HTTP
+semaphore. They share only the memory cache, the DDS disk cache and the chunk
+disk cache. Priorities still order work inside a lane, but they no longer
+mediate between FUSE and prefetch, and there is no prefetch quota inside a shared
+pool (`max_prefetch_fraction` and `prefetch_in_flight` were removed).
+
+**Admission gate.** `ExecutorConfig::admission_gate` is an optional
+`watch::Receiver<bool>`. While it reads `true`, the executor admits no queued
+job: new submissions go to `waiting_for_permit` and stay there. Jobs already
+admitted run every one of their tasks, so no job is ever parked between download
+and encode (which would hold chunk data in memory). When the gate clears, the
+executor retries admission. The demand lane has no gate (`None`); the prefetch
+lane is gated by demand. The executor sees only a boolean and knows nothing about
+FUSE. The gate's sender must outlive the executor, because a sender dropped
+while paused leaves the gate paused for good.
+
+**Demand count.** `DemandTracker` (`executor/demand.rs`) counts demand jobs in
+flight. The demand lane takes a `DemandGuard` for each job and the guard is
+released on every exit (success, failure, cancellation by the FUSE timeout, a
+failed submit), because one missed decrement would pause prefetch forever. The
+tracker publishes `true` when the count goes from 0 to 1 and `false` when it
+returns to 0, as latest-value state.
+
+**Child jobs bypass admission.** Child jobs enter through `start_child_job`,
+which applies neither the gate nor a group permit. No production job spawns
+children (the only ones that did were deleted in #296), so nothing escapes the
+gate today.
+
+**Cache GC.** Housekeeping jobs from `cache/gc_scheduler.rs` run on the
+prefetch lane and so pause with it. The disk caches can run over budget during
+a long demand burst until GC resumes.
+
 ### Coalescing
 
 X-Plane often requests the same DDS file multiple times in rapid succession (during initial load and when panning the map). The job executor integrates with coalescing to prevent duplicate work.
@@ -1020,124 +1056,28 @@ impl Fuse3OrthoUnionFS {
 }
 ```
 
-**Coalescing with Prefetch**:
-
-```rust
-impl TileBasedPrefetcher {
-    async fn prefetch_dds(&self, path: PathBuf) {
-        // Submit with PREFETCH priority (lower)
-        // If an ON_DEMAND job is already running for this path,
-        // we'll join it rather than create duplicate work
-        let handle = self.coalescer
-            .submit_or_join(path, Priority::PREFETCH)
-            .await;
-
-        // Don't wait - prefetch is fire-and-forget
-        // Job runs in background, cache populated when done
-    }
-}
-```
+**Coalescing is per lane**: the demand lane and the prefetch lane each have
+their own coalescer, request channel and executor. A prefetch request never joins
+a FUSE job and a FUSE request never joins a prefetch job. FUSE always starts its
+own job in the demand lane (always claim), so the only duplicate work is a prefetch
+job that was already running when FUSE asked for the same tile. The shared caches
+make writes idempotent.
 
 **Design Rationale**:
 
 - Extends existing `RequestCoalescer` pattern from the async pipeline
-- Multiple callers share work: X-Plane request + prefetch don't duplicate
-- Priority is respected: ON_DEMAND jobs run before PREFETCH, but they can coalesce
+- Multiple FUSE callers share work for the same tile
+- Coalescing never crosses lanes, so priority inheritance cannot occur: a prefetch job cannot set the place of a FUSE request
 - Lock granularity: read lock for check, write lock only for new jobs
 - Cleanup prevents unbounded memory growth
 
-## Example: Tile Prefetch Implementation
+## Example: DDS Generation Implementation
 
-### TilePrefetchJob
+### Tile-level jobs (removed)
 
-```rust
-/// Job to prefetch all DDS files within a 1° tile.
-pub struct TilePrefetchJob {
-    id: JobId,
-    lat: i32,
-    lon: i32,
-}
-
-impl TilePrefetchJob {
-    pub fn new(lat: i32, lon: i32) -> Self {
-        Self {
-            id: JobId::new(format!("tile-prefetch-{}-{}", lat, lon)),
-            lat,
-            lon,
-        }
-    }
-}
-
-impl Job for TilePrefetchJob {
-    fn id(&self) -> JobId {
-        self.id.clone()
-    }
-
-    fn name(&self) -> &str {
-        "TilePrefetch"
-    }
-
-    fn error_policy(&self) -> ErrorPolicy {
-        // 80% success = tile is usable
-        ErrorPolicy::PartialSuccess { threshold: 0.8 }
-    }
-
-    fn create_tasks(&self) -> Vec<Box<dyn Task>> {
-        vec![
-            Box::new(EnumerateDdsFilesTask::new(self.lat, self.lon)),
-            Box::new(WaitForChildrenTask::new()),
-        ]
-    }
-}
-```
-
-### EnumerateDdsFilesTask
-
-```rust
-/// Task that enumerates DDS files in a tile and spawns child jobs.
-pub struct EnumerateDdsFilesTask {
-    lat: i32,
-    lon: i32,
-}
-
-impl EnumerateDdsFilesTask {
-    pub fn new(lat: i32, lon: i32) -> Self {
-        Self { lat, lon }
-    }
-}
-
-impl Task for EnumerateDdsFilesTask {
-    fn name(&self) -> &str {
-        "EnumerateDdsFiles"
-    }
-
-    fn resource_type(&self) -> ResourceType {
-        ResourceType::CPU  // Index lookup is CPU-bound
-    }
-
-    async fn execute(&self, ctx: &mut TaskContext) -> TaskResult {
-        let ortho_index = &ctx.resources().ortho_index;
-
-        // Get all DDS files in this 1° tile
-        let dds_files = ortho_index.dds_files_in_tile(self.lat, self.lon);
-
-        if dds_files.is_empty() {
-            return TaskResult::Success;
-        }
-
-        // Spawn a child DdsGenerateJob for each file
-        for dds_path in dds_files {
-            if ctx.is_cancelled() {
-                return TaskResult::Cancelled;
-            }
-
-            ctx.spawn_child_job(DdsGenerateJob::new(dds_path));
-        }
-
-        TaskResult::Success
-    }
-}
-```
+An earlier design had a `TilePrefetchJob` that enumerated a 1 degree tile and
+spawned a `DdsGenerateJob` child per DDS file. It had no production user and was
+deleted in #296. Prefetch now plans individual tiles in the coordinator.
 
 ### DdsGenerateJob
 
@@ -1300,70 +1240,10 @@ impl Task for EncodeDdsTask {
 
 ## Execution Flow
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     Execution Flow Example                           │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  1. Submit TilePrefetchJob(lat=60, lon=-146)                       │
-│     │                                                               │
-│     ▼                                                               │
-│  2. Executor starts TilePrefetchJob                                │
-│     │                                                               │
-│     ▼                                                               │
-│  3. EnumerateDdsFilesTask executes                                 │
-│     │  - Queries OrthoUnionIndex                                   │
-│     │  - Finds 847 DDS files                                       │
-│     │  - Spawns 847 DdsGenerateJob children                        │
-│     │                                                               │
-│     ▼                                                               │
-│  4. Executor receives 847 child jobs                               │
-│     │  - Queues them (respects max_jobs limit)                     │
-│     │                                                               │
-│     ▼                                                               │
-│  5. DdsGenerateJobs execute in parallel                            │
-│     │  - Each runs: Download → Assemble → Encode                   │
-│     │  - Some may fail, retry, or succeed                          │
-│     │                                                               │
-│     ▼                                                               │
-│  6. WaitForChildrenTask waits for all children                     │
-│     │                                                               │
-│     ▼                                                               │
-│  7. TilePrefetchJob::on_complete() evaluates results               │
-│     │  - 812/847 succeeded (95.9%)                                 │
-│     │  - Threshold 80% met → JobStatus::Succeeded                  │
-│     │                                                               │
-│     ▼                                                               │
-│  8. Job complete, handle notified                                  │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-## Integration with Tile-Based Prefetcher
-
-The `TileBasedPrefetcher` uses the job executor:
-
-```rust
-impl TileBasedPrefetcher {
-    async fn prefetch_tile(&self, tile: TileCoord) {
-        // Submit tile prefetch job
-        let job = TilePrefetchJob::new(tile.lat, tile.lon);
-        let handle = self.executor.submit(job);
-
-        // Track active prefetch
-        self.active_tiles.insert(tile, handle.clone());
-
-        // Optionally wait or let it run in background
-        // handle.wait().await;
-    }
-
-    fn cancel_active_prefetch(&self) {
-        for (_, handle) in self.active_tiles.drain() {
-            handle.cancel();
-        }
-    }
-}
-```
+A tile is one `DdsGenerateJob` (download chunks, assemble and encode, cache).
+FUSE submits it to the demand lane. The prefetch coordinator and prewarm submit
+it through `PrefetchLane`, whose jobs start with a `CachedTileProbeTask`. See
+[Admission Gate and Lanes](#admission-gate-and-lanes).
 
 ## Module Structure
 
@@ -1388,7 +1268,6 @@ xearthlayer/src/
 ├── jobs/                       # Job implementations
 │   ├── mod.rs
 │   ├── dds_generate.rs         # DdsGenerateJob
-│   ├── tile_prefetch.rs        # TilePrefetchJob
 │   └── factory.rs              # DdsJobFactory trait
 │
 ├── tasks/                      # Task implementations
@@ -1397,7 +1276,7 @@ xearthlayer/src/
 │   ├── assemble_image.rs       # AssembleImageTask
 │   ├── encode_dds.rs           # EncodeDdsTask
 │   ├── cache_write.rs          # CacheWriteTask
-│   └── generate_tile_list.rs   # GenerateTileListTask
+│   └── cached_tile_probe.rs    # CachedTileProbeTask (prefetch lane admission re-check)
 │
 ├── fuse/fuse3/
 │   └── shared.rs               # DdsRequestor trait (supports DdsClient)
@@ -1421,10 +1300,8 @@ xearthlayer/src/
 3. ✅ Ensure feature parity with current DDS generation
 
 ### Phase 3: Tile Prefetch Integration ✅
-
-1. ✅ Implement `TilePrefetchJob`
-2. ✅ Implement `DdsJobFactory` trait and `DefaultDdsJobFactory`
-3. ✅ Implement `GenerateTileListTask` for child job spawning
+1. ✅ Implement `DdsJobFactory` trait and `DefaultDdsJobFactory`
+2. Removed in #296: `TilePrefetchJob` and `GenerateTileListTask` had no production user. Prefetch submits one `DdsGenerateJob` per tile through the prefetch lane.
 
 ### Phase 4: Daemon Architecture ✅
 
@@ -1535,23 +1412,12 @@ pub struct DownloadChunksTask<P, D> {
 }
 ```
 
-**Spawning Tasks (Phase 3)**:
-```rust
-// Factory injection - encapsulates complex wiring
-pub struct EnumerateDdsFilesTask {
-    job_factory: Arc<dyn DdsJobFactory>,  // Creates child DdsGenerateJobs
-}
-
-pub trait DdsJobFactory: Send + Sync {
-    fn create_job(&self, tile: TileCoord, priority: Priority) -> Box<dyn Job>;
-}
-```
-
-**Rationale**:
-- Leaf tasks have clear, testable dependency contracts
-- Spawning tasks don't need knowledge of child job dependencies
-- Factory can be shared across multiple jobs
-- Dependency wiring happens once at application startup
+**Spawning tasks**: the executor supports tasks that spawn child jobs, but
+no production job does. The only users, `TilePrefetchJob` and
+`GenerateTileListTask`, were deleted in #296. Child jobs enter through
+`start_child_job`, which bypasses the admission gate and the group permit, so a
+job that spawned children would not be held by a paused gate. Gate that path
+before using it for work that must respect admission.
 
 ### TaskOutput Ownership (January 2026)
 

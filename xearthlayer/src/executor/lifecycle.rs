@@ -20,6 +20,14 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit};
 use tracing::{debug, error, warn};
 
 impl JobExecutor {
+    /// Whether the admission gate currently holds new jobs back.
+    pub(crate) fn admission_paused(&self) -> bool {
+        self.config
+            .admission_gate
+            .as_ref()
+            .is_some_and(|gate| *gate.borrow())
+    }
+
     /// Handles a newly submitted job.
     ///
     /// Acquires a concurrency permit if needed, or queues the job for later.
@@ -40,6 +48,18 @@ impl JobExecutor {
             name: name.clone(),
             priority,
         });
+
+        // A paused gate holds every job, grouped or not, in the waiting heap;
+        // start_waiting_jobs admits it once the gate clears.
+        if self.admission_paused() {
+            let seq = self.waiting_sequence;
+            self.waiting_sequence += 1;
+            self.waiting_for_permit.push(WaitingJob {
+                submitted,
+                sequence: seq,
+            });
+            return;
+        }
 
         // Try to acquire concurrency permit (non-blocking to avoid deadlock)
         let concurrency_permit = if let Some(group) = submitted.job.concurrency_group() {
@@ -231,14 +251,20 @@ impl JobExecutor {
     }
 
     /// Finds all jobs that are ready to complete.
+    ///
+    /// A job is ready either when its work has run out, or when it already
+    /// ended early (Kill, Stop, or a FailFast failure) and nothing of it is
+    /// still running. The early case cannot wait for `has_pending_work()` to
+    /// clear: tasks still queued or pending for such a job are discarded at
+    /// dispatch without being counted down, so it never would. Until the job
+    /// completes it keeps its concurrency group permit (#296).
     async fn find_completed_jobs(&self) -> Vec<JobId> {
         let jobs = self.active_jobs.lock().await;
         jobs.iter()
             .filter(|(_, job)| {
-                let is_complete = (!job.has_pending_work() && job.all_children_complete())
-                    || job.status == JobStatus::Stopped
-                    || job.status == JobStatus::Cancelled;
-                is_complete && !job.status.is_terminal()
+                let work_done = !job.has_pending_work() && job.all_children_complete();
+                let ended_early = job.status.is_terminal() && job.tasks_in_flight == 0;
+                work_done || ended_early
             })
             .map(|(id, _)| id.clone())
             .collect()
@@ -347,6 +373,10 @@ impl JobExecutor {
     /// 1. ON_DEMAND jobs are tried before PREFETCH (priority ordering)
     /// 2. A full group doesn't block jobs in OTHER groups (skip-and-continue)
     pub(crate) async fn start_waiting_jobs(&mut self) {
+        if self.admission_paused() {
+            return;
+        }
+
         let mut blocked = Vec::new();
 
         while let Some(waiting) = self.waiting_for_permit.pop() {

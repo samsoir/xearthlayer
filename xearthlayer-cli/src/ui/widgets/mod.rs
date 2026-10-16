@@ -6,7 +6,7 @@
 //!
 //! ## Layout Widgets (v0.3.1)
 //!
-//! - `PrefetchSystemWidget` - Prefetch status (status and mode)
+//! - `PrefetchSystemWidget` - Prefetch state, lane load and FUSE latency
 //! - `ScenerySystemWidget` - 3-column: REQUESTS | QUEUE | PROCESSING
 //! - `InputOutputWidget` - 2-column network/disk I/O
 //! - `CacheWidgetCompact` - Cache display with hit rates and sizes
@@ -27,7 +27,7 @@ pub use network::NetworkHistory;
 // v0.3.0 widgets
 pub use aircraft_position::AircraftPositionWidget;
 pub use input_output::{DiskHistory, InputOutputWidget};
-pub use prefetch_system::PrefetchSystemWidget;
+pub use prefetch_system::{LaneView, PrefetchSystemWidget};
 pub use scenery_system::{SceneryHistory, ScenerySystemWidget};
 
 // Legacy widgets (deprecated in v0.3.0, still used in render_sections.rs)

@@ -13,5 +13,5 @@ pub mod widgets;
 
 pub use dashboard::{
     Dashboard, DashboardConfig, DashboardEvent, DashboardState, LoadingPhase, LoadingProgress,
-    PrewarmProgress,
+    PrefetchLaneConfig, PrewarmProgress,
 };

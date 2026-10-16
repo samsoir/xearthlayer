@@ -438,15 +438,15 @@ impl MountManager {
         // I/O, and at 512 threads it ratchets glibc's arena high-water mark on
         // every excursion. See runtime::build_service_runtime and issue #227.
         //
-        // `ResourcePoolConfig::default()` is the only source of pool sizing,
-        // here and in `RuntimeConfig::default()` for the executor, so the cap
-        // and the pools it bounds cannot diverge. The `[executor]` sizing keys
-        // that could once have forked this were removed in #249 precisely
-        // because they reached neither path — a config carrying them silently
-        // described capacities nothing used.
-        let runtime = match crate::runtime::build_service_runtime(
-            &crate::executor::ResourcePoolConfig::default(),
-        ) {
+        // The cap covers both lanes (#296), each with its own CPU and disk
+        // I/O pools. `LaneSizing::from_configured_share` is the single source
+        // of that sizing, here and in the runtime builder that sizes the
+        // pools, so the cap and the pools it bounds cannot diverge.
+        let blocking_cap = crate::executor::LaneSizing::from_configured_share(
+            service_builder.service_config().prefetch_capacity_share(),
+        )
+        .blocking_threads_required();
+        let runtime = match crate::runtime::build_service_runtime(blocking_cap) {
             Ok(r) => r,
             Err(e) => {
                 return ConsolidatedOrthoMountResult::failure(
@@ -770,6 +770,14 @@ impl MountManager {
             total_download_time_ms: 0,
             total_assembly_time_ms: 0,
             total_encode_time_ms: 0,
+            fuse_latency: None,
+            fuse_session_latency: None,
+            fuse_session_timeouts: 0,
+            demand_in_flight: 0,
+            prefetch_paused: false,
+            prefetch_lane_load: 0.0,
+            prefetch_lane_running: 0,
+            prefetch_lane_queued: 0,
         };
 
         // Collect all services: per-region + patches + consolidated
@@ -842,6 +850,19 @@ impl MountManager {
             total.total_download_time_ms += snapshot.total_download_time_ms;
             total.total_assembly_time_ms += snapshot.total_assembly_time_ms;
             total.total_encode_time_ms += snapshot.total_encode_time_ms;
+
+            // Lane gauges: each service runs its own lanes, and only the
+            // consolidated service has real values. Latency is not summable,
+            // so take the first sample present rather than a blend.
+            total.fuse_latency = total.fuse_latency.or(snapshot.fuse_latency);
+            total.fuse_session_latency =
+                total.fuse_session_latency.or(snapshot.fuse_session_latency);
+            total.fuse_session_timeouts += snapshot.fuse_session_timeouts;
+            total.demand_in_flight += snapshot.demand_in_flight;
+            total.prefetch_paused |= snapshot.prefetch_paused;
+            total.prefetch_lane_load = total.prefetch_lane_load.max(snapshot.prefetch_lane_load);
+            total.prefetch_lane_running += snapshot.prefetch_lane_running;
+            total.prefetch_lane_queued += snapshot.prefetch_lane_queued;
 
             // Use the highest peak from any service
             if snapshot.peak_bytes_per_second > total.peak_bytes_per_second {
@@ -933,6 +954,11 @@ impl ServiceBuilder {
             provider_config,
             tile_request_callback: None,
         }
+    }
+
+    /// The service configuration every built service starts from.
+    pub fn service_config(&self) -> &ServiceConfig {
+        &self.service_config
     }
 
     /// Set the tile request callback for FUSE-based position inference.

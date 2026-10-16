@@ -111,9 +111,11 @@ mod client;
 mod concurrency;
 mod context;
 mod daemon;
+mod demand;
 mod download_config;
 mod handle;
 mod job;
+mod lane_sizing;
 mod policy;
 mod queue;
 mod resource_pool;
@@ -155,9 +157,8 @@ pub use handle::{JobHandle, JobStatus, Signal};
 // Resource pools
 pub use resource_pool::{
     ResourcePermit, ResourcePool, ResourcePoolConfig, ResourcePools, ResourceType,
-    DEFAULT_CPU_CAPACITY_MULTIPLIER, DEFAULT_DISK_IO_CAPACITY, DEFAULT_MAX_PREFETCH_FRACTION,
-    DEFAULT_NETWORK_CAPACITY_MULTIPLIER, MAX_NETWORK_CAPACITY, MIN_CPU_CAPACITY_ADDITION,
-    MIN_NETWORK_CAPACITY,
+    DEFAULT_CPU_CAPACITY_MULTIPLIER, DEFAULT_DISK_IO_CAPACITY, DEFAULT_NETWORK_CAPACITY_MULTIPLIER,
+    MAX_NETWORK_CAPACITY, MIN_CPU_CAPACITY_ADDITION, MIN_NETWORK_CAPACITY,
 };
 
 // Telemetry
@@ -179,7 +180,7 @@ pub use config::{
     ExecutorConfig, DEFAULT_JOB_CHANNEL_CAPACITY, DEFAULT_MAX_CONCURRENT_TASKS,
     DEFAULT_SIGNAL_CHANNEL_CAPACITY,
 };
-pub use core::JobExecutor;
+pub use core::{JobCounts, JobExecutor};
 pub use submitter::{JobSubmitter, SubmitError};
 
 // Client (for daemon architecture)
@@ -188,6 +189,10 @@ pub use client::{ChannelDdsClient, DdsClient, DdsClientError};
 // Daemon
 pub use daemon::{
     DaemonMemoryCache, ExecutorDaemon, ExecutorDaemonConfig, DEFAULT_REQUEST_CHANNEL_CAPACITY,
+};
+pub use demand::{DemandGuard, DemandTracker};
+pub use lane_sizing::{
+    clamp_capacity_share, LaneSizing, MAX_PREFETCH_CAPACITY_SHARE, MIN_PREFETCH_CAPACITY_SHARE,
 };
 
 // Cache adapter (decoupled from pipeline module)

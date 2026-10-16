@@ -8,11 +8,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio_util::sync::CancellationToken;
-
 use crate::coord::TileCoord;
-use crate::executor::{DaemonMemoryCache, DdsClient, DdsDiskCacheChecker};
+use crate::executor::{DaemonMemoryCache, DdsDiskCacheChecker};
 use crate::metrics::MetricsClient;
+use crate::pinned_budget::PinnedTileBudget;
+use crate::runtime::PrefetchLane;
 
 /// Deferral applied after each consecutive no-progress evaluation.
 ///
@@ -135,8 +135,12 @@ pub struct AdaptivePrefetchCoordinator {
     /// X-Plane sim state from Web API (direct detection, replaces heuristics).
     sim_state: crate::aircraft_position::web_api::sim_state::SimState,
 
-    /// DDS client for submitting prefetch requests.
-    pub(super) dds_client: Option<Arc<dyn DdsClient>>,
+    /// Lane prefetch requests are submitted to. Never the FUSE demand lane.
+    pub(super) prefetch_lane: Option<Arc<dyn PrefetchLane>>,
+
+    /// Memory pinned by open virtual DDS handles; the FUSE half of the
+    /// backpressure signal (#246). Absent, there is no FUSE pressure.
+    pub(super) fuse_pressure: Option<Arc<PinnedTileBudget>>,
 
     /// Memory cache for checking tile existence before submitting.
     ///
@@ -182,7 +186,7 @@ pub struct AdaptivePrefetchCoordinator {
 
     /// Tiles that could not be submitted due to channel backpressure.
     ///
-    /// When [`execute()`] encounters `ChannelFull`, remaining tiles are stored
+    /// When [`execute()`] encounters a full lane, remaining tiles are stored
     /// here and drained on subsequent [`process_telemetry()`] cycles before
     /// generating any new boundary plan. This prevents the "fire-and-forget"
     /// bug where large boundary plans are partially submitted and the remainder
@@ -205,19 +209,19 @@ pub struct AdaptivePrefetchCoordinator {
     /// (#226).
     region_retry: std::collections::HashMap<DsfRegion, RegionRetryState>,
 
-    /// Mapping of planned tiles to their source DSF region for the current
-    /// in-flight plan. Populated by the cruise branch of [`update()`] and
-    /// consumed by [`execute()`] to compute per-region submission completeness.
+    /// The current plan's tiles that are still outstanding, mapped to their
+    /// source DSF region. Populated by [`update()`]; a tile leaves the map
+    /// when it is accepted by the executor or filtered out as already
+    /// cached, whichever call that happens in (see [`settle_plan_tiles()`]).
     ///
-    /// A region is marked `InProgress` only when every one of its planned
-    /// tiles is successfully submitted — regions whose tiles were deferred,
-    /// channel-rejected, or throttle-overflowed stay unmarked so they
-    /// naturally re-enter `new_regions_with_extent` on the next cycle.
-    /// This fixes the `#172` bug where regions were marked before
-    /// submission and then stuck `InProgress` despite tiles never being
-    /// generated.
-    ///
-    /// Cleared after each [`execute()`] call (per-plan transient state).
+    /// A region is marked `InProgress` only when it has no outstanding tile
+    /// left (#172: never before its tiles are submitted). The map outlives a
+    /// single [`execute()`] because a plan larger than the request channel is
+    /// cut, and its remainder is submitted by later `boundary_pending` drains.
+    /// Tiles deferred or rejected stay outstanding and are retried through
+    /// `pending_tiles`, so their region stays unmarked until they are
+    /// accepted (#296). Reset when [`update()`] builds the next plan, which it
+    /// only does once pending is empty.
     pub(super) current_plan_regions: std::collections::HashMap<TileCoord, DsfRegion>,
 
     /// Metrics client for prefetch telemetry (#176).
@@ -233,7 +237,7 @@ impl std::fmt::Debug for AdaptivePrefetchCoordinator {
         f.debug_struct("AdaptivePrefetchCoordinator")
             .field("config.enabled", &self.config.enabled)
             .field("config.mode", &self.config.mode)
-            .field("has_dds_client", &self.dds_client.is_some())
+            .field("has_prefetch_lane", &self.prefetch_lane.is_some())
             .field("has_metrics_client", &self.metrics_client.is_some())
             .field("status", &self.status)
             .finish()
@@ -254,7 +258,8 @@ impl AdaptivePrefetchCoordinator {
             phase_detector,
             transition_throttle,
             sim_state: crate::aircraft_position::web_api::sim_state::SimState::default(),
-            dds_client: None,
+            prefetch_lane: None,
+            fuse_pressure: None,
             memory_cache: None,
             status: CoordinatorStatus::default(),
             shared_status: None,
@@ -286,9 +291,16 @@ impl AdaptivePrefetchCoordinator {
         self.sim_state = state;
     }
 
-    /// Set the DDS client for submitting prefetch requests.
-    pub fn with_dds_client(mut self, client: Arc<dyn DdsClient>) -> Self {
-        self.dds_client = Some(client);
+    /// Set the lane prefetch requests are submitted to.
+    pub fn with_prefetch_lane(mut self, lane: Arc<dyn PrefetchLane>) -> Self {
+        self.prefetch_lane = Some(lane);
+        self
+    }
+
+    /// Set the pinned-tile budget the FUSE mount accounts against, so FUSE
+    /// demand counts toward backpressure alongside the lane's own load.
+    pub fn with_fuse_pressure(mut self, budget: Arc<PinnedTileBudget>) -> Self {
+        self.fuse_pressure = Some(budget);
         self
     }
 
@@ -464,6 +476,7 @@ impl AdaptivePrefetchCoordinator {
             self.transition_throttle
                 .on_phase_change(previous_phase, phase);
         }
+        self.refresh_throttle_status();
 
         // Determine if we should prefetch
         let should_prefetch = self.should_prefetch_now(mode);
@@ -622,32 +635,32 @@ impl AdaptivePrefetchCoordinator {
         Some(plan)
     }
 
-    /// Execute a prefetch plan by submitting tiles to the DDS client.
+    /// Execute a prefetch plan by submitting tiles to the prefetch lane.
     ///
     /// Applies backpressure-aware submission based on executor resource utilization:
     /// - Load > [`BACKPRESSURE_DEFER_THRESHOLD`]: skips this cycle (deferred)
     /// - Load > [`BACKPRESSURE_REDUCE_THRESHOLD`]: submits reduced fraction
-    /// - Stops immediately on `ChannelFull` error
+    /// - Stops immediately when the lane is full
     ///
     /// # Arguments
     ///
     /// * `plan` - The prefetch plan to execute
-    /// * `cancellation` - Shared cancellation token for the batch
     ///
     /// # Returns
     ///
     /// Number of tiles submitted. Returns 0 if deferred due to backpressure.
-    pub fn execute(&mut self, plan: &PrefetchPlan, cancellation: CancellationToken) -> usize {
-        let Some(ref client) = self.dds_client else {
-            tracing::warn!("No DDS client configured - cannot execute prefetch");
+    pub fn execute(&mut self, plan: &PrefetchPlan) -> usize {
+        let Some(ref lane) = self.prefetch_lane else {
+            tracing::warn!("No prefetch lane configured - cannot execute prefetch");
             return 0;
         };
 
+        let fuse_pressure = self.fuse_pressure.as_ref().map_or(0.0, |b| b.fraction());
         let result = super::plan_executor::execute_plan(
             plan,
-            client.as_ref(),
+            lane.as_ref(),
+            fuse_pressure,
             &mut self.transition_throttle,
-            cancellation,
         );
 
         // Per-cycle instrumentation (#172 Part 4): surface the
@@ -672,46 +685,18 @@ impl AdaptivePrefetchCoordinator {
             );
         }
 
-        // Mark regions as InProgress only if ALL of their planned tiles
-        // appear in `result.submitted_tiles` — the authoritative record
-        // of what the executor actually accepted. A planned tile that's
-        // neither submitted nor pending would be a logic bug (the
-        // pending cap was removed post-flight #172) — defence in depth
-        // is still correct here, the positive check stays right.
-        //
-        // See #172 Part 1 (the ordering fix) + Part 2 (positive check).
-        if !self.current_plan_regions.is_empty() && !result.deferred {
-            let submitted_set: std::collections::HashSet<TileCoord> =
-                result.submitted_tiles.iter().copied().collect();
-            let mut region_planned: std::collections::HashMap<DsfRegion, Vec<TileCoord>> =
-                std::collections::HashMap::new();
-            for (tile, region) in &self.current_plan_regions {
-                region_planned.entry(*region).or_default().push(*tile);
-            }
-
-            if let Some(ref geo_index) = self.geo_index {
-                let mut marked = 0usize;
-                for (region, planned_tiles) in &region_planned {
-                    let fully_submitted = planned_tiles.iter().all(|t| submitted_set.contains(t));
-                    if fully_submitted {
-                        self.boundary_strategy.mark_in_progress(region, geo_index);
-                        marked += 1;
-                    }
-                }
-                if marked > 0 {
-                    tracing::debug!(
-                        regions_marked = marked,
-                        regions_in_plan = region_planned.len(),
-                        "Prefetch: marked fully-submitted regions as InProgress"
-                    );
-                }
-            }
+        // `result.submitted_tiles` is the authoritative record of what the
+        // executor accepted (#172 Part 2), so only those tiles settle. A
+        // region whose last outstanding tile is among them is marked.
+        if !result.deferred {
+            self.settle_plan_tiles(result.submitted_tiles.iter().copied());
         }
-        self.current_plan_regions.clear();
 
         if result.deferred {
             self.total_deferred_cycles += 1;
         }
+        self.status.deferred_last_cycle = result.deferred;
+        self.refresh_throttle_status();
         if !result.pending.is_empty() {
             self.pending_tiles = result.pending;
         }
@@ -749,11 +734,40 @@ impl AdaptivePrefetchCoordinator {
     /// regions keep being re-planned and filtered each cycle, as they were
     /// before this change.
     ///
-    /// Marked regions are dropped from `current_plan_regions` so
-    /// [`execute()`] only reasons about regions that had tiles to submit.
+    /// Filtered-out tiles settle here, but a region that also has tiles to
+    /// submit is not marked until those are accepted too: that is the job of
+    /// [`settle_plan_tiles()`], which both this and [`execute()`] go through.
     ///
     /// Returns the number of regions marked.
     fn mark_fully_filtered_regions(&mut self, surviving: &[TileCoord]) -> usize {
+        let surviving: HashSet<TileCoord> = surviving.iter().copied().collect();
+        let filtered_out: Vec<TileCoord> = self
+            .current_plan_regions
+            .keys()
+            .filter(|tile| !surviving.contains(tile))
+            .copied()
+            .collect();
+        self.settle_plan_tiles(filtered_out)
+    }
+
+    /// Settle plan tiles that need no further submission, and mark every
+    /// region left with no outstanding tile as `InProgress`.
+    ///
+    /// A tile is settled when the executor accepts it or when the filter
+    /// pipeline removes it as already cached. Either can happen in a later
+    /// call than the one that planned it: a plan cut by the request channel
+    /// is finished by `boundary_pending` drains, which re-filter what they
+    /// carry. Marking only the regions with nothing outstanding keeps the
+    /// #172 rule (never mark before every tile is submitted) while letting it
+    /// span calls, so a region split by the cut is not re-planned and its
+    /// still-queued tiles resubmitted (#296).
+    ///
+    /// Patch-owned regions are never marked, for the reasons given on
+    /// [`mark_fully_filtered_regions()`]; their tiles still settle, so they
+    /// leave the map and are re-planned and filtered each cycle as before.
+    ///
+    /// Returns the number of regions marked.
+    fn settle_plan_tiles(&mut self, settled: impl IntoIterator<Item = TileCoord>) -> usize {
         if self.current_plan_regions.is_empty() {
             return 0;
         }
@@ -761,34 +775,32 @@ impl AdaptivePrefetchCoordinator {
             return 0;
         };
 
-        let surviving_regions: HashSet<DsfRegion> = surviving
-            .iter()
-            .filter_map(|tile| self.current_plan_regions.get(tile).copied())
+        let touched: HashSet<DsfRegion> = settled
+            .into_iter()
+            .filter_map(|tile| self.current_plan_regions.remove(&tile))
             .collect();
-
-        let fully_filtered: HashSet<DsfRegion> = self
-            .current_plan_regions
-            .values()
-            .copied()
-            .filter(|region| !surviving_regions.contains(region))
-            .filter(|region| !geo_index.contains::<PatchCoverage>(region))
-            .collect();
-
-        if fully_filtered.is_empty() {
+        if touched.is_empty() {
             return 0;
         }
 
-        for region in &fully_filtered {
+        let outstanding: HashSet<DsfRegion> = self.current_plan_regions.values().copied().collect();
+        let complete: Vec<DsfRegion> = touched
+            .into_iter()
+            .filter(|region| !outstanding.contains(region))
+            .filter(|region| !geo_index.contains::<PatchCoverage>(region))
+            .collect();
+
+        for region in &complete {
             self.boundary_strategy.mark_in_progress(region, &geo_index);
         }
-        self.current_plan_regions
-            .retain(|_, region| !fully_filtered.contains(region));
-
-        tracing::debug!(
-            regions_marked = fully_filtered.len(),
-            "Prefetch: marked fully-filtered regions InProgress for disk-verified promotion"
-        );
-        fully_filtered.len()
+        if !complete.is_empty() {
+            tracing::debug!(
+                regions_marked = complete.len(),
+                regions_outstanding = outstanding.len(),
+                "Prefetch: marked regions with every tile settled as InProgress"
+            );
+        }
+        complete.len()
     }
 
     /// Get current status for UI/logging.
@@ -878,6 +890,10 @@ impl AdaptivePrefetchCoordinator {
 
         let msl_ft = state.altitude;
 
+        // A deferral describes the cycle that made it; `execute` sets it again
+        // if this cycle defers too.
+        self.status.deferred_last_cycle = false;
+
         // Always update shared status with current position to show TUI we're receiving telemetry
         // This fixes the bug where prefetch status stayed "Idle" when no plan was generated
         self.update_shared_status_position(position);
@@ -897,6 +913,9 @@ impl AdaptivePrefetchCoordinator {
         if !self.pending_tiles.is_empty() {
             let pending = std::mem::take(&mut self.pending_tiles);
             let pending_before_filter = pending.len();
+            // Kept to settle whatever the re-filter removes: a tile found
+            // cached here will never be submitted, but it is accounted for.
+            let pending_unfiltered = pending.clone();
 
             // Still need to update phase detector for correct state tracking
             self.phase_detector.update(state.ground_speed, msl_ft);
@@ -910,6 +929,13 @@ impl AdaptivePrefetchCoordinator {
             )
             .await;
             let filtered_total = filter_counts.total();
+
+            let surviving: HashSet<TileCoord> = filtered_pending.iter().copied().collect();
+            self.settle_plan_tiles(
+                pending_unfiltered
+                    .into_iter()
+                    .filter(|tile| !surviving.contains(tile)),
+            );
 
             tracing::debug!(
                 pending_before = pending_before_filter,
@@ -943,8 +969,7 @@ impl AdaptivePrefetchCoordinator {
                 pending_count,
             );
 
-            let cancellation = CancellationToken::new();
-            let submitted = self.execute(&plan, cancellation);
+            let submitted = self.execute(&plan);
 
             self.total_cycles += 1;
             self.total_tiles_submitted += submitted as u64;
@@ -1008,8 +1033,7 @@ impl AdaptivePrefetchCoordinator {
         let submitted = if plan.is_empty() {
             0
         } else {
-            let cancellation = CancellationToken::new();
-            self.execute(&plan, cancellation)
+            self.execute(&plan)
         };
 
         // Update statistics
@@ -1303,6 +1327,14 @@ impl AdaptivePrefetchCoordinator {
         }
     }
 
+    /// Publish the takeoff throttle's throughput, `None` once it is idle.
+    fn refresh_throttle_status(&mut self) {
+        self.status.throttle_fraction = self
+            .transition_throttle
+            .is_active()
+            .then(|| self.transition_throttle.fraction());
+    }
+
     fn cycle_stats(&self) -> super::status_updater::CycleStats {
         super::status_updater::CycleStats {
             total_cycles: self.total_cycles,
@@ -1359,8 +1391,8 @@ mod tests {
     use crate::prefetch::adaptive::coordinator::test_support::{
         ground_state, make_scenery_index, make_scenery_index_covering, patched_region_area,
         test_calibration, test_plan, AlwaysHitDiskChecker, AlwaysHitMemoryCache,
-        BackpressureMockClient, CapLimitedDdsClient, DummyTracker, HighLoadDdsClient,
-        MockDiskChecker, StableBoundsTracker,
+        BackpressureMockLane, CapLimitedLane, DummyTracker, HighLoadLane, MockDiskChecker,
+        StableBoundsTracker,
     };
     // ─────────────────────────────────────────────────────────────────────────
     // Creation tests
@@ -1371,7 +1403,7 @@ mod tests {
         let coord = AdaptivePrefetchCoordinator::with_defaults();
         assert!(coord.config.enabled);
 
-        assert!(coord.dds_client.is_none());
+        assert!(coord.prefetch_lane.is_none());
     }
 
     #[test]
@@ -1563,11 +1595,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_telemetry_no_dds_client() {
+    async fn test_process_telemetry_no_prefetch_lane() {
         let mut coord = AdaptivePrefetchCoordinator::with_defaults();
         let state = AircraftState::new(53.5, 9.5, 90.0, 10.0, 5.0, false); // Ground conditions
 
-        // No DDS client - returns Some(0) because plan is generated but not executed
+        // No prefetch lane - returns Some(0) because plan is generated but not executed
         let result = coord.process_telemetry(&state).await;
         // The plan may be empty (no scenery index), so result could be Some(0) or None
         assert!(result.is_none() || result == Some(0));
@@ -1720,7 +1752,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_telemetry_updates_status_when_disabled() {
-        use crate::prefetch::state::PrefetchMode as StatePrefetchMode;
+        use crate::prefetch::state::PrefetchState;
 
         let config = AdaptivePrefetchConfig {
             enabled: false,
@@ -1736,9 +1768,9 @@ mod tests {
         let result = coord.process_telemetry(&state).await;
         assert!(result.is_none());
 
-        // Status should be updated to show Idle (since disabled)
+        // Status should be updated to show Disabled
         let snapshot = shared_status.snapshot();
-        assert_eq!(snapshot.prefetch_mode, StatePrefetchMode::Idle);
+        assert_eq!(snapshot.coordinator_state(), PrefetchState::Disabled);
 
         // Position should be updated
         assert!(snapshot.aircraft.is_some());
@@ -1754,14 +1786,32 @@ mod tests {
     // Backpressure tests (Phase 5)
     // ─────────────────────────────────────────────────────────────────────────
 
+    /// The coordinator reads FUSE demand from the mount's own budget, so an
+    /// idle lane must still defer while the mount is saturated (#246).
+    #[test]
+    fn test_prefetch_defers_when_the_mount_budget_is_saturated() {
+        let lane = Arc::new(BackpressureMockLane::new(0.0));
+        let budget = Arc::new(PinnedTileBudget::with_ceiling(1000));
+        budget.pin(900);
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults()
+            .with_prefetch_lane(Arc::clone(&lane) as Arc<dyn PrefetchLane>)
+            .with_fuse_pressure(budget);
+
+        let submitted = coord.execute(&test_plan(10));
+
+        assert_eq!(submitted, 0);
+        assert_eq!(coord.total_deferred_cycles, 1);
+        assert_eq!(lane.submitted_count(), 0);
+    }
+
     #[test]
     fn test_prefetch_defers_under_high_backpressure() {
-        let client = Arc::new(BackpressureMockClient::new(0.85));
+        let client = Arc::new(BackpressureMockLane::new(0.85));
         let mut coord = AdaptivePrefetchCoordinator::with_defaults()
-            .with_dds_client(client.clone() as Arc<dyn crate::executor::DdsClient>);
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>);
 
         let plan = test_plan(10);
-        let submitted = coord.execute(&plan, CancellationToken::new());
+        let submitted = coord.execute(&plan);
 
         assert_eq!(
             submitted, 0,
@@ -1773,12 +1823,12 @@ mod tests {
 
     #[test]
     fn test_prefetch_reduces_under_moderate_backpressure() {
-        let client = Arc::new(BackpressureMockClient::new(0.6));
+        let client = Arc::new(BackpressureMockLane::new(0.6));
         let mut coord = AdaptivePrefetchCoordinator::with_defaults()
-            .with_dds_client(client.clone() as Arc<dyn crate::executor::DdsClient>);
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>);
 
         let plan = test_plan(10);
-        let submitted = coord.execute(&plan, CancellationToken::new());
+        let submitted = coord.execute(&plan);
 
         // 50% of 10 = 5
         assert_eq!(
@@ -1791,12 +1841,12 @@ mod tests {
 
     #[test]
     fn test_prefetch_full_submission_under_low_pressure() {
-        let client = Arc::new(BackpressureMockClient::new(0.2));
+        let client = Arc::new(BackpressureMockLane::new(0.2));
         let mut coord = AdaptivePrefetchCoordinator::with_defaults()
-            .with_dds_client(client.clone() as Arc<dyn crate::executor::DdsClient>);
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>);
 
         let plan = test_plan(10);
-        let submitted = coord.execute(&plan, CancellationToken::new());
+        let submitted = coord.execute(&plan);
 
         assert_eq!(
             submitted, 10,
@@ -1807,14 +1857,14 @@ mod tests {
 
     #[test]
     fn test_prefetch_stops_on_channel_full() {
-        let client = Arc::new(BackpressureMockClient::new(0.0).with_fail_after(3));
+        let client = Arc::new(BackpressureMockLane::new(0.0).with_fail_after(3));
         let mut coord = AdaptivePrefetchCoordinator::with_defaults()
-            .with_dds_client(client.clone() as Arc<dyn crate::executor::DdsClient>);
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>);
 
         let plan = test_plan(10);
-        let submitted = coord.execute(&plan, CancellationToken::new());
+        let submitted = coord.execute(&plan);
 
-        assert_eq!(submitted, 3, "Should stop at first ChannelFull error");
+        assert_eq!(submitted, 3, "Should stop at first full-lane error");
         assert_eq!(client.submitted_count(), 3);
     }
 
@@ -2023,7 +2073,7 @@ mod tests {
         use crate::geo_index::{GeoIndex, PrefetchedRegion};
 
         let geo_index = Arc::new(GeoIndex::new());
-        let client = Arc::new(CapLimitedDdsClient::new(100_000));
+        let client = Arc::new(CapLimitedLane::new(100_000));
         // Zero tiles anywhere — every region the prefetch box touches must
         // report no coverage.
         let empty_index = Arc::new(SceneryIndex::with_defaults());
@@ -2035,7 +2085,7 @@ mod tests {
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>)
             .with_scenery_index(empty_index);
 
         fast_forward_to_cruise(&mut coord);
@@ -2088,7 +2138,7 @@ mod tests {
         use crate::geo_index::{GeoIndex, PrefetchedRegion};
 
         let geo_index = Arc::new(GeoIndex::new());
-        let client = Arc::new(CapLimitedDdsClient::new(100_000));
+        let client = Arc::new(CapLimitedLane::new(100_000));
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
@@ -2099,7 +2149,7 @@ mod tests {
         // shape when `tile_count() == 0` in service/orchestrator/prefetch.rs.
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>);
 
         fast_forward_to_cruise(&mut coord);
         assert_eq!(coord.phase_detector.current_phase(), FlightPhase::Cruise);
@@ -3135,7 +3185,7 @@ mod tests {
         let geo_index = Arc::new(GeoIndex::new());
 
         // Cap at 5 submissions per cycle — way less than a boundary plan generates
-        let client = Arc::new(CapLimitedDdsClient::new(5));
+        let client = Arc::new(CapLimitedLane::new(5));
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
@@ -3145,7 +3195,7 @@ mod tests {
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>)
             .with_scenery_index(wide_scenery_index_at_50_10());
 
         // Fast-forward phase detector into cruise using a CENTER position
@@ -3170,7 +3220,7 @@ mod tests {
         // Aircraft at lat=52.5 → near edge of window.
         let state = AircraftState::new(52.5, 10.0, 0.0, 200.0, 35000.0, false);
 
-        // First cycle: boundary plan generated, only 5 submitted (ChannelFull)
+        // First cycle: boundary plan generated, only 5 submitted (lane full)
         let result = coord.process_telemetry(&state).await;
         let first_submitted = result.unwrap_or(0);
         assert!(
@@ -3179,7 +3229,7 @@ mod tests {
         );
         assert!(
             first_submitted <= 5,
-            "First cycle should be capped at 5 by ChannelFull"
+            "First cycle should be capped at 5 by a full lane"
         );
 
         // KEY ASSERTION: pending tiles should be non-empty (if plan had more than 5)
@@ -3217,7 +3267,7 @@ mod tests {
         let geo_index = Arc::new(GeoIndex::new());
 
         // Allow 1000 submissions — enough to drain everything
-        let client = Arc::new(CapLimitedDdsClient::new(1000));
+        let client = Arc::new(CapLimitedLane::new(1000));
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
@@ -3227,7 +3277,7 @@ mod tests {
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>);
 
         // Fast-forward to cruise
         coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
@@ -3271,7 +3321,7 @@ mod tests {
         // Scenario: 100-tile plan, throttle at 20%, channel accepts all.
         // Expected: 20 submitted, 80 stored as pending for next cycle.
 
-        let client = Arc::new(CapLimitedDdsClient::new(1000)); // no channel limit
+        let client = Arc::new(CapLimitedLane::new(1000)); // no channel limit
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
@@ -3281,7 +3331,7 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>);
 
         // Fast-forward phase to cruise so transition throttle activates
         coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
@@ -3313,8 +3363,7 @@ mod tests {
         let calibration = test_calibration();
         let plan = PrefetchPlan::with_tiles(tiles, &calibration, "boundary", 0, 100);
 
-        let cancellation = CancellationToken::new();
-        let submitted = coord.execute(&plan, cancellation);
+        let submitted = coord.execute(&plan);
 
         // Throttle at ~20% of 100 = ~20 tiles submitted
         assert!(
@@ -3343,7 +3392,7 @@ mod tests {
         // Scenario: 100-tile plan, throttle at 20% (→ 20 tiles), channel cap at 10.
         // Expected: 10 submitted, 90 stored as pending (10 from throttled batch + 80 beyond throttle).
 
-        let client = Arc::new(CapLimitedDdsClient::new(10)); // channel cap at 10
+        let client = Arc::new(CapLimitedLane::new(10)); // channel cap at 10
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
@@ -3352,7 +3401,7 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>);
 
         // Fast-forward to cruise
         coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
@@ -3376,8 +3425,7 @@ mod tests {
         let calibration = test_calibration();
         let plan = PrefetchPlan::with_tiles(tiles, &calibration, "boundary", 0, 100);
 
-        let cancellation = CancellationToken::new();
-        let submitted = coord.execute(&plan, cancellation);
+        let submitted = coord.execute(&plan);
 
         assert_eq!(
             submitted, 10,
@@ -3481,7 +3529,7 @@ mod tests {
         // Scenario: 5000-tile plan, throttle ramp starting at 20%. Some
         // tiles submit (~1000 under throttle), rest go to pending.
         // Invariant: submitted + pending == 5000. No drops.
-        let client = Arc::new(CapLimitedDdsClient::new(10_000));
+        let client = Arc::new(CapLimitedLane::new(10_000));
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
@@ -3490,7 +3538,7 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>);
 
         // Fast-forward to cruise
         coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
@@ -3514,8 +3562,7 @@ mod tests {
         let calibration = test_calibration();
         let plan = PrefetchPlan::with_tiles(tiles, &calibration, "boundary", 0, 5000);
 
-        let cancellation = CancellationToken::new();
-        let submitted = coord.execute(&plan, cancellation);
+        let submitted = coord.execute(&plan);
 
         assert!(submitted > 0, "Should submit some tiles under throttle");
         assert_eq!(
@@ -3532,7 +3579,7 @@ mod tests {
     fn test_pending_retains_full_plan_on_backpressure_defer() {
         // When executor load exceeds BACKPRESSURE_DEFER_THRESHOLD, the
         // entire plan must be stored as pending — no cap, no drops.
-        let client = Arc::new(HighLoadDdsClient);
+        let client = Arc::new(HighLoadLane);
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
@@ -3540,7 +3587,7 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>);
 
         let tiles: Vec<TileCoord> = (0..5000)
             .map(|i| TileCoord {
@@ -3552,8 +3599,7 @@ mod tests {
         let calibration = test_calibration();
         let plan = PrefetchPlan::with_tiles(tiles.clone(), &calibration, "boundary", 0, 5000);
 
-        let cancellation = CancellationToken::new();
-        let submitted = coord.execute(&plan, cancellation);
+        let submitted = coord.execute(&plan);
 
         assert_eq!(submitted, 0, "Should defer due to backpressure");
         assert_eq!(
@@ -3921,10 +3967,10 @@ mod tests {
         use crate::geo_index::GeoIndex;
 
         let geo_index = Arc::new(GeoIndex::new());
-        // HighLoadDdsClient reports executor_load=0.95 — above the
+        // HighLoadLane reports executor_load=0.95 — above the
         // BACKPRESSURE_DEFER_THRESHOLD, so execute_plan returns
         // deferred=true with the whole plan stored as pending.
-        let client = Arc::new(HighLoadDdsClient);
+        let client = Arc::new(HighLoadLane);
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
@@ -3935,7 +3981,7 @@ mod tests {
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>)
             .with_scenery_index(wide_scenery_index_at_50_10());
 
         fast_forward_to_cruise(&mut coord);
@@ -3959,7 +4005,7 @@ mod tests {
         );
         // Prove a real plan existed rather than `submitted == 0` and
         // `in_progress == 0` both being trivially true of an empty plan
-        // (e.g. if the scenery index wiring silently broke). HighLoadDdsClient
+        // (e.g. if the scenery index wiring silently broke). HighLoadLane
         // stores the whole deferred plan as pending, so a non-empty
         // `pending_tiles` is direct evidence tiles were actually planned.
         assert!(
@@ -3976,7 +4022,7 @@ mod tests {
         // Cap of 1 guarantees no region can be 100% submitted — every
         // region in the plan has multiple tiles (4x4 sample grid per
         // region from the scenery index).
-        let client = Arc::new(CapLimitedDdsClient::new(1));
+        let client = Arc::new(CapLimitedLane::new(1));
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
@@ -3985,7 +4031,7 @@ mod tests {
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>)
             .with_scenery_index(wide_scenery_index_at_50_10());
 
         fast_forward_to_cruise(&mut coord);
@@ -4016,7 +4062,7 @@ mod tests {
 
         let geo_index = Arc::new(GeoIndex::new());
         // Cap well above any plausible plan size — all tiles admit.
-        let client = Arc::new(CapLimitedDdsClient::new(100_000));
+        let client = Arc::new(CapLimitedLane::new(100_000));
 
         let config = AdaptivePrefetchConfig {
             mode: PrefetchMode::Aggressive,
@@ -4025,7 +4071,7 @@ mod tests {
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>)
             .with_scenery_index(wide_scenery_index_at_50_10());
 
         fast_forward_to_cruise(&mut coord);
@@ -4042,6 +4088,123 @@ mod tests {
         assert!(
             count_in_progress_regions(&geo_index) > 0,
             "Regions with all tiles submitted must be marked InProgress",
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Mark-after-submit across calls (#296)
+    //
+    // The #172 rule, that a region is marked only once every one of its tiles
+    // has been accepted, must hold over the whole life of a plan, not within a
+    // single `execute()` call. A plan larger than the request channel is cut,
+    // and the remainder is submitted by later `boundary_pending` drains; a
+    // planned tile that filters out as cached is never submitted at all.
+    // Either way the region's tiles are all accounted for, and leaving it
+    // unmarked re-plans it: every tile still queued in the executor passes the
+    // filter and is submitted again.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_region_split_by_channel_is_not_replanned_once_drained() {
+        use crate::geo_index::GeoIndex;
+
+        let geo_index = Arc::new(GeoIndex::new());
+        // Far below a region's 16 tiles, so every region is split by the cut
+        // and only completes through the pending drain.
+        let client = Arc::new(CapLimitedLane::new(5));
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ramp_duration: std::time::Duration::from_secs(0),
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>)
+            .with_scenery_index(wide_scenery_index_at_50_10());
+
+        fast_forward_to_cruise(&mut coord);
+        assert_eq!(coord.phase_detector.current_phase(), FlightPhase::Cruise);
+
+        let state = AircraftState::new(50.0, 10.0, 0.0, 200.0, 35000.0, false);
+        coord.process_telemetry(&state).await;
+        assert!(
+            !coord.pending_tiles.is_empty(),
+            "Precondition: the plan must be cut by the channel"
+        );
+
+        // Drain the remainder, one channel's worth per cycle.
+        for _ in 0..10_000 {
+            if coord.pending_tiles.is_empty() {
+                break;
+            }
+            client.reset();
+            coord.process_telemetry(&state).await;
+        }
+        assert!(
+            coord.pending_tiles.is_empty(),
+            "Precondition: pending must drain"
+        );
+
+        client.reset();
+        coord.process_telemetry(&state).await;
+
+        assert_eq!(
+            client.submitted_count(),
+            0,
+            "Every tile of the box was submitted, so the same box must plan nothing; \
+             resubmitting means the regions were never marked",
+        );
+        assert!(count_in_progress_regions(&geo_index) > 0);
+    }
+
+    #[tokio::test]
+    async fn test_partially_cached_region_is_not_replanned_once_submitted() {
+        use crate::geo_index::GeoIndex;
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let client = Arc::new(CapLimitedLane::new(100_000));
+
+        // Every other tile is already on the DDS disk, so each region is part
+        // cached, part submitted: neither marking path covers it on its own.
+        let scenery_index = wide_scenery_index_at_50_10();
+        let cached = scenery_index
+            .all_tiles()
+            .into_iter()
+            .map(|tile| tile.to_tile_coord())
+            .filter(|tile| tile.row % 2 == 0);
+        let checker: Arc<dyn DdsDiskCacheChecker> = MockDiskChecker::with_tile_coords(cached);
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ramp_duration: std::time::Duration::from_secs(0),
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>)
+            .with_dds_disk_checker(checker)
+            .with_scenery_index(scenery_index);
+
+        fast_forward_to_cruise(&mut coord);
+        assert_eq!(coord.phase_detector.current_phase(), FlightPhase::Cruise);
+
+        let state = AircraftState::new(50.0, 10.0, 0.0, 200.0, 35000.0, false);
+        let submitted = coord.process_telemetry(&state).await.unwrap_or(0);
+        assert!(submitted > 0, "Precondition: the uncached half must submit");
+        assert!(
+            coord.pending_tiles.is_empty(),
+            "Precondition: the whole plan fits the channel"
+        );
+
+        client.reset();
+        coord.process_telemetry(&state).await;
+
+        assert_eq!(
+            client.submitted_count(),
+            0,
+            "Each region's tiles were either cached or submitted, so the same box \
+             must plan nothing; resubmitting means the regions were never marked",
         );
     }
 
@@ -4077,7 +4240,7 @@ mod tests {
         use crate::geo_index::GeoIndex;
 
         let geo_index = Arc::new(GeoIndex::new());
-        let client = Arc::new(CapLimitedDdsClient::new(100_000));
+        let client = Arc::new(CapLimitedLane::new(100_000));
         // Every tile is already on the DDS disk. The filter pipeline empties
         // the plan, so nothing is submitted — and the same checker is what
         // `promote_completed_regions` consults, so the promotion is a real
@@ -4091,7 +4254,7 @@ mod tests {
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>)
             .with_dds_disk_checker(Arc::clone(&checker))
             .with_scenery_index(wide_scenery_index_at_50_10());
 
@@ -4134,7 +4297,7 @@ mod tests {
         use crate::metrics::{MetricEvent, MetricsClient};
 
         let geo_index = Arc::new(GeoIndex::new());
-        let client = Arc::new(CapLimitedDdsClient::new(100_000));
+        let client = Arc::new(CapLimitedLane::new(100_000));
         // Every tile already on the DDS disk: the filter pipeline empties every
         // plan, and the same checker is what promotion consults.
         let checker: Arc<dyn DdsDiskCacheChecker> = Arc::new(AlwaysHitDiskChecker);
@@ -4148,7 +4311,7 @@ mod tests {
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>)
             .with_dds_disk_checker(Arc::clone(&checker))
             .with_scenery_index(wide_scenery_index_at_50_10())
             .with_metrics_client(MetricsClient::new(tx));
@@ -4246,7 +4409,7 @@ mod tests {
         use crate::geo_index::GeoIndex;
 
         let geo_index = Arc::new(GeoIndex::new());
-        let client = Arc::new(CapLimitedDdsClient::new(100_000));
+        let client = Arc::new(CapLimitedLane::new(100_000));
         // Memory cache reports every tile as already cached — this is what
         // empties the plan and fires `mark_fully_filtered_regions`. It is
         // NOT the disk checker, so this test is independent of the disk
@@ -4263,7 +4426,7 @@ mod tests {
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
             .with_geo_index(Arc::clone(&geo_index))
-            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_prefetch_lane(Arc::clone(&client) as Arc<dyn PrefetchLane>)
             .with_memory_cache(always_hit_memory)
             .with_dds_disk_checker(Arc::clone(&checker))
             .with_scenery_index(wide_scenery_index_at_50_10());

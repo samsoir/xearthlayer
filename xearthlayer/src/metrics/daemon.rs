@@ -14,6 +14,7 @@
 //! processing events. This ensures reporters never block event processing.
 
 use super::event::MetricEvent;
+use super::latency::{LatencyHistogram, LatencyWindow};
 use super::memory_probe::{MemoryProbe, ProcessMemoryProbe};
 use super::state::{AggregatedState, TimeSeriesHistory, DEFAULT_HISTORY_CAPACITY};
 use crate::cache::DiskTier;
@@ -73,6 +74,15 @@ pub struct MetricsDaemon {
     /// Last FUSE requests completed (for rate calculation).
     last_fuse_completed: u64,
 
+    /// FUSE generation latencies since the last Prefetch sample.
+    fuse_latency_window: LatencyWindow,
+
+    /// FUSE requests abandoned at the timeout since the last Prefetch sample.
+    fuse_timeouts_in_window: usize,
+
+    /// Every FUSE generation latency since start, in fixed memory.
+    fuse_session_latency: LatencyHistogram,
+
     /// Probe for reading process memory.
     memory_probe: Arc<dyn MemoryProbe>,
 
@@ -111,6 +121,9 @@ impl MetricsDaemon {
             last_bytes_downloaded: 0,
             last_jobs_completed: 0,
             last_fuse_completed: 0,
+            fuse_latency_window: LatencyWindow::default(),
+            fuse_timeouts_in_window: 0,
+            fuse_session_latency: LatencyHistogram::default(),
             memory_probe,
             memory_probe_failed: false,
         }
@@ -277,9 +290,16 @@ impl MetricsDaemon {
             }
             MetricEvent::JobCompleted {
                 success,
-                duration_us: _,
+                duration_us,
+                is_fuse,
             } => {
                 self.state.jobs_active = self.state.jobs_active.saturating_sub(1);
+                // Every FUSE wait counts whatever its outcome; cache hits never
+                // emit JobCompleted.
+                if is_fuse {
+                    self.fuse_latency_window.record(duration_us);
+                    self.fuse_session_latency.record(duration_us);
+                }
                 if success {
                     self.state.jobs_completed += 1;
                 } else {
@@ -289,9 +309,15 @@ impl MetricsDaemon {
             MetricEvent::JobCoalesced => {
                 self.state.jobs_coalesced += 1;
             }
-            MetricEvent::JobTimedOut => {
+            MetricEvent::JobTimedOut { duration_us } => {
                 self.state.jobs_active = self.state.jobs_active.saturating_sub(1);
                 self.state.jobs_timed_out += 1;
+                // The stall is the latency the no-harm measure exists to
+                // see; leaving it out would cap max at the timeout.
+                self.fuse_latency_window.record(duration_us);
+                self.fuse_session_latency.record(duration_us);
+                self.fuse_timeouts_in_window += 1;
+                self.state.fuse_session_timeouts += 1;
             }
 
             // Encode events
@@ -389,6 +415,33 @@ impl MetricsDaemon {
             }
             MetricEvent::PrefetchDeferralCleared => {
                 self.state.prefetch_deferrals_cleared += 1;
+            }
+            MetricEvent::DemandInFlight { count } => {
+                self.state.demand_in_flight = count;
+            }
+            MetricEvent::PrefetchPaused { paused } => {
+                let now = Instant::now();
+                match (paused, self.state.prefetch_paused_since.take()) {
+                    (true, Some(since)) => self.state.prefetch_paused_since = Some(since),
+                    (true, None) => self.state.prefetch_paused_since = Some(now),
+                    (false, Some(since)) => {
+                        self.state.prefetch_paused_accum += now.saturating_duration_since(since);
+                    }
+                    (false, None) => {}
+                }
+                self.state.prefetch_paused = paused;
+            }
+            MetricEvent::PrefetchLaneLoad {
+                load,
+                running,
+                queued,
+            } => {
+                self.state.prefetch_lane_load = load;
+                self.state.prefetch_lane_running = running;
+                self.state.prefetch_lane_queued = queued;
+            }
+            MetricEvent::PrefetchSkippedCached => {
+                self.state.prefetch_skipped_cached += 1;
             }
             MetricEvent::PrefetchRegionsPromotedNormal { count } => {
                 self.state.prefetch_promotions_normal += count as u64;
@@ -497,7 +550,21 @@ impl MetricsDaemon {
     /// distribution stays at `debug!` in the coordinator; this exists so a
     /// default-level flight log is enough to judge the #176 acceptance
     /// criteria without running an entire flight at `--debug`.
-    fn log_prefetch_sample(&self) {
+    fn log_prefetch_sample(&mut self) {
+        // Close this sample's windows before borrowing state for the line.
+        let latency = self.fuse_latency_window.take();
+        // An empty sample must not blank the line's colour source.
+        if latency.is_some() {
+            self.state.fuse_latency = latency;
+        }
+        let timeouts = std::mem::take(&mut self.fuse_timeouts_in_window);
+        let now = Instant::now();
+        let mut paused = std::mem::take(&mut self.state.prefetch_paused_accum);
+        if let Some(since) = self.state.prefetch_paused_since {
+            paused += now.saturating_duration_since(since);
+            self.state.prefetch_paused_since = Some(now);
+        }
+        let ms = |us: u64| us / 1000;
         let state = &self.state;
         tracing::info!(
             uptime_s = state.uptime().as_secs(),
@@ -539,6 +606,25 @@ impl MetricsDaemon {
             // cruise. Per-tile FUSE logging is debug-only (#209), so this
             // aggregated counter is the only default-level source.
             fuse_generations = state.fuse_jobs_submitted,
+            // The no-harm measure (#296): FUSE generation latency over this
+            // sample only. Cache hits are excluded by construction, and
+            // zeros mean no FUSE generation completed in the window.
+            fuse_latency_p50_ms = latency.map_or(0, |s| ms(s.median_us)),
+            fuse_latency_p95_ms = latency.map_or(0, |s| ms(s.p95_us)),
+            fuse_latency_max_ms = latency.map_or(0, |s| ms(s.max_us)),
+            fuse_latency_count = latency.map_or(0, |s| s.count),
+            // Per sample, not cumulative: requests abandoned at the FUSE
+            // timeout. Their wait is inside the latency figures above.
+            fuse_timeouts = timeouts,
+            demand_in_flight = state.demand_in_flight,
+            // Seconds the prefetch lane stood aside for demand this sample.
+            prefetch_paused_secs = paused.as_secs_f64(),
+            // Cumulative since process start, like `regions_deferred`:
+            // difference successive samples for a rate.
+            skipped_cached = state.prefetch_skipped_cached,
+            lane_load = state.prefetch_lane_load,
+            lane_running = state.prefetch_lane_running,
+            lane_queued = state.prefetch_lane_queued,
             "Prefetch sample"
         );
     }
@@ -586,10 +672,19 @@ impl MetricsDaemon {
         self.last_sample = now;
     }
 
+    /// The state as published: the running state plus the session figures,
+    /// which are summarised here rather than on every event.
+    fn published_state(&self) -> AggregatedState {
+        let mut state = self.state.clone();
+        state.fuse_session_latency = self.fuse_session_latency.summary();
+        state
+    }
+
     /// Updates the shared state for reporters to read.
     fn update_shared_state(&self) {
+        let published = self.published_state();
         if let Ok(mut guard) = self.shared_state.write() {
-            guard.state = self.state.clone();
+            guard.state = published;
             guard.history = self.history.clone();
         }
     }
@@ -844,6 +939,7 @@ mod tests {
         daemon.process_event(MetricEvent::JobCompleted {
             success: true,
             duration_us: 100_000,
+            is_fuse: false,
         });
         assert_eq!(daemon.state.jobs_active, 1);
         assert_eq!(daemon.state.jobs_completed, 1);
@@ -851,6 +947,7 @@ mod tests {
         daemon.process_event(MetricEvent::JobCompleted {
             success: false,
             duration_us: 50_000,
+            is_fuse: false,
         });
         assert_eq!(daemon.state.jobs_active, 0);
         assert_eq!(daemon.state.jobs_failed, 1);
@@ -859,7 +956,9 @@ mod tests {
         assert_eq!(daemon.state.jobs_coalesced, 1);
 
         daemon.process_event(MetricEvent::JobStarted);
-        daemon.process_event(MetricEvent::JobTimedOut);
+        daemon.process_event(MetricEvent::JobTimedOut {
+            duration_us: 10_000_000,
+        });
         assert_eq!(daemon.state.jobs_active, 0);
         assert_eq!(daemon.state.jobs_timed_out, 1);
     }
@@ -1525,6 +1624,218 @@ mod tests {
         assert_eq!(daemon.state.prefetch_promotions_normal, 0);
         assert_eq!(daemon.state.prefetch_promotions_rescue, 0);
         assert_eq!(daemon.state.prefetch_deferrals_cleared, 0);
+    }
+
+    fn sample_field<'a>(
+        events: &'a [std::collections::HashMap<String, String>],
+        name: &str,
+    ) -> Option<&'a str> {
+        find_prefetch_sample(events)
+            .expect("sample line")
+            .get(name)
+            .map(String::as_str)
+    }
+
+    fn fuse_done(daemon: &mut MetricsDaemon, ms: u64, success: bool, is_fuse: bool) {
+        daemon.process_event(MetricEvent::JobCompleted {
+            success,
+            duration_us: ms * 1000,
+            is_fuse,
+        });
+    }
+
+    #[test]
+    fn test_prefetch_sample_reports_fuse_latency_and_resets_each_sample() {
+        let (mut daemon, _tx) = create_daemon();
+        for ms in 1..=100 {
+            fuse_done(&mut daemon, ms, true, true);
+        }
+        // Prefetch completions stay out of the window, whatever the outcome.
+        fuse_done(&mut daemon, 9_000, true, false);
+        fuse_done(&mut daemon, 9_000, false, false);
+
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        assert_eq!(sample_field(&events, "fuse_latency_p50_ms"), Some("50"));
+        assert_eq!(sample_field(&events, "fuse_latency_p95_ms"), Some("95"));
+        assert_eq!(sample_field(&events, "fuse_latency_max_ms"), Some("100"));
+        assert_eq!(sample_field(&events, "fuse_latency_count"), Some("100"));
+        assert_eq!(
+            daemon.state.fuse_latency.map(|s| s.count),
+            Some(100),
+            "the closed sample is kept for the TUI"
+        );
+
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        assert_eq!(sample_field(&events, "fuse_latency_count"), Some("0"));
+        assert_eq!(sample_field(&events, "fuse_latency_max_ms"), Some("0"));
+    }
+
+    #[test]
+    fn test_failed_fuse_job_enters_the_latency_window() {
+        let (mut daemon, _tx) = create_daemon();
+        fuse_done(&mut daemon, 10, true, true);
+        fuse_done(&mut daemon, 2_000, false, true);
+
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        assert_eq!(sample_field(&events, "fuse_latency_count"), Some("2"));
+        assert_eq!(sample_field(&events, "fuse_latency_max_ms"), Some("2000"));
+    }
+
+    #[test]
+    fn test_timed_out_fuse_request_appears_in_max_and_timeouts_per_sample() {
+        let (mut daemon, _tx) = create_daemon();
+        fuse_done(&mut daemon, 40, true, true);
+        daemon.process_event(MetricEvent::JobTimedOut {
+            duration_us: 10_000_000,
+        });
+
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        assert_eq!(sample_field(&events, "fuse_latency_max_ms"), Some("10000"));
+        assert_eq!(sample_field(&events, "fuse_latency_count"), Some("2"));
+        assert_eq!(sample_field(&events, "fuse_timeouts"), Some("1"));
+        assert_eq!(daemon.state.fuse_session_timeouts, 1);
+
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        assert_eq!(
+            sample_field(&events, "fuse_timeouts"),
+            Some("0"),
+            "a delta per sample, not cumulative"
+        );
+    }
+
+    #[test]
+    fn test_session_latency_survives_empty_samples_and_recent_is_held() {
+        let (mut daemon, _tx) = create_daemon();
+        for ms in 1..=100 {
+            fuse_done(&mut daemon, ms, true, true);
+        }
+        daemon.process_event(MetricEvent::JobTimedOut {
+            duration_us: 10_000_000,
+        });
+        capture_events(|| daemon.log_prefetch_sample());
+        let recent = daemon.state.fuse_latency;
+        assert_eq!(recent.map(|s| s.count), Some(101));
+
+        capture_events(|| daemon.log_prefetch_sample());
+        capture_events(|| daemon.log_prefetch_sample());
+        let published = daemon.published_state();
+        assert_eq!(published.fuse_latency, recent, "empty samples keep recent");
+        let session = published.fuse_session_latency.expect("session figures");
+        assert_eq!((session.count, session.max_us), (101, 10_000_000));
+        assert_eq!(published.fuse_session_timeouts, 1);
+
+        for ms in [20, 30] {
+            fuse_done(&mut daemon, ms, true, true);
+        }
+        daemon.process_event(MetricEvent::JobTimedOut {
+            duration_us: 11_000_000,
+        });
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        assert_eq!(sample_field(&events, "fuse_timeouts"), Some("1"));
+        let published = daemon.published_state();
+        assert_eq!(published.fuse_latency.map(|s| s.count), Some(3));
+        let session = published.fuse_session_latency.unwrap();
+        assert_eq!((session.count, session.max_us), (104, 11_000_000));
+        assert_eq!(published.fuse_session_timeouts, 2, "accumulates");
+    }
+
+    #[test]
+    fn test_cache_served_counts_are_fuse_only_and_survive_empty_samples() {
+        let (mut daemon, _tx) = create_daemon();
+        daemon.process_event(MetricEvent::MemoryCacheHit { is_fuse: true });
+        daemon.process_event(MetricEvent::MemoryCacheHit { is_fuse: true });
+        daemon.process_event(MetricEvent::DdsDiskCacheHit {
+            bytes: 10,
+            is_fuse: true,
+        });
+        // Prefetch-origin hits and submissions must not count.
+        daemon.process_event(MetricEvent::MemoryCacheHit { is_fuse: false });
+        daemon.process_event(MetricEvent::DdsDiskCacheHit {
+            bytes: 10,
+            is_fuse: false,
+        });
+        daemon.process_event(MetricEvent::JobSubmitted { is_fuse: true });
+        daemon.process_event(MetricEvent::JobSubmitted { is_fuse: false });
+
+        capture_events(|| daemon.log_prefetch_sample());
+        capture_events(|| daemon.log_prefetch_sample());
+        let published = daemon.published_state();
+        assert_eq!(
+            published.fuse_memory_cache_hits + published.fuse_dds_disk_cache_hits,
+            3
+        );
+        assert_eq!(published.fuse_jobs_submitted, 1);
+    }
+
+    #[test]
+    fn test_session_latency_is_live_between_samples() {
+        let (mut daemon, _tx) = create_daemon();
+        assert!(daemon.published_state().fuse_session_latency.is_none());
+        fuse_done(&mut daemon, 40, true, true);
+        fuse_done(&mut daemon, 9_000, true, false);
+        let session = daemon.published_state().fuse_session_latency.unwrap();
+        assert_eq!((session.count, session.max_us), (1, 40_000));
+    }
+
+    #[test]
+    fn test_prefetch_sample_reports_lane_gauges_and_skipped_cached() {
+        let (mut daemon, _tx) = create_daemon();
+        daemon.process_event(MetricEvent::DemandInFlight { count: 7 });
+        daemon.process_event(MetricEvent::PrefetchSkippedCached);
+        daemon.process_event(MetricEvent::PrefetchLaneLoad {
+            load: 0.5,
+            running: 30,
+            queued: 12,
+        });
+
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        assert_eq!(sample_field(&events, "demand_in_flight"), Some("7"));
+        assert_eq!(sample_field(&events, "skipped_cached"), Some("1"));
+        assert_eq!(sample_field(&events, "lane_load"), Some("0.5"));
+        assert_eq!(sample_field(&events, "lane_running"), Some("30"));
+        assert_eq!(sample_field(&events, "lane_queued"), Some("12"));
+    }
+
+    #[test]
+    fn test_prefetch_paused_time_accumulates_per_sample() {
+        let (mut daemon, _tx) = create_daemon();
+        daemon.process_event(MetricEvent::PrefetchPaused { paused: true });
+        std::thread::sleep(Duration::from_millis(20));
+        daemon.process_event(MetricEvent::PrefetchPaused { paused: false });
+        let closed = daemon.state.prefetch_paused_accum;
+        assert!(closed >= Duration::from_millis(20));
+
+        // Still paused at sample time: the open interval counts and restarts.
+        daemon.process_event(MetricEvent::PrefetchPaused { paused: true });
+        std::thread::sleep(Duration::from_millis(20));
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        let secs: f64 = sample_field(&events, "prefetch_paused_secs")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(secs >= 0.04, "closed plus open interval, got {secs}");
+        assert!(daemon.state.prefetch_paused, "still paused");
+        assert_eq!(daemon.state.prefetch_paused_accum, Duration::ZERO);
+
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        let secs: f64 = sample_field(&events, "prefetch_paused_secs")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(secs < 0.04, "window restarted, got {secs}");
+    }
+
+    #[test]
+    fn test_prefetch_skipped_cached_event_increments_the_counter_only() {
+        let (mut daemon, _tx) = create_daemon();
+
+        daemon.process_event(MetricEvent::PrefetchSkippedCached);
+        daemon.process_event(MetricEvent::PrefetchSkippedCached);
+
+        assert_eq!(daemon.state.prefetch_skipped_cached, 2);
+        assert_eq!(daemon.state.prefetch_deferrals_cleared, 0);
+        assert_eq!(daemon.state.prefetch_regions_deferred, 0);
+        assert_eq!(daemon.state.prefetch_promotions_normal, 0);
     }
 
     #[test]

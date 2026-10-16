@@ -22,7 +22,8 @@ use super::super::phase_detector::FlightPhase;
 /// - `phase` - Current flight phase (Ground/Cruise)
 /// - `active_strategy` - Name of the currently active strategy
 /// - `last_prefetch_count` - Tiles prefetched in the last cycle
-/// - `throttled` - Whether circuit breaker is throttling prefetch
+/// - `deferred_last_cycle` - Whether the last cycle was skipped under load
+/// - `throttle_fraction` - Takeoff throttle throughput, `None` at full speed
 /// - `box_extent` - Current prefetch box extent in degrees (Cruise phase only)
 #[derive(Debug, Clone)]
 pub struct CoordinatorStatus {
@@ -41,8 +42,11 @@ pub struct CoordinatorStatus {
     /// Tiles prefetched in the last cycle.
     pub last_prefetch_count: usize,
 
-    /// Whether throttled by circuit breaker.
-    pub throttled: bool,
+    /// Whether the most recent plan was deferred for lane or memory load.
+    pub deferred_last_cycle: bool,
+
+    /// Takeoff throttle throughput (0.0 to 1.0); `None` once it is idle.
+    pub throttle_fraction: Option<f64>,
 
     /// Current prefetch box extent in degrees (Cruise phase only; 0.0 otherwise).
     pub box_extent: f64,
@@ -64,7 +68,8 @@ impl Default for CoordinatorStatus {
             phase: FlightPhase::Ground,
             active_strategy: "none",
             last_prefetch_count: 0,
-            throttled: false,
+            deferred_last_cycle: false,
+            throttle_fraction: None,
             box_extent: 0.0,
             box_bounds: None,
         }
@@ -83,7 +88,8 @@ mod tests {
         assert_eq!(status.phase, FlightPhase::Ground);
         assert_eq!(status.active_strategy, "none");
         assert_eq!(status.last_prefetch_count, 0);
-        assert!(!status.throttled);
+        assert!(!status.deferred_last_cycle);
+        assert_eq!(status.throttle_fraction, None);
         assert_eq!(status.box_extent, 0.0);
     }
 
@@ -95,7 +101,8 @@ mod tests {
             phase: FlightPhase::Cruise,
             active_strategy: "cruise",
             last_prefetch_count: 10,
-            throttled: true,
+            deferred_last_cycle: true,
+            throttle_fraction: Some(0.5),
             box_extent: 5.5,
             box_bounds: None,
         };

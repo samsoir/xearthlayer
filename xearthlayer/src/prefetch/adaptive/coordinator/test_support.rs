@@ -2,7 +2,7 @@
 //!
 //! This module consolidates mock implementations and factory functions used
 //! across the coordinator test suite, eliminating duplication of mock structs
-//! like `StableBoundsTracker`, `BackpressureMockClient`, etc.
+//! like `StableBoundsTracker`, `BackpressureMockLane`, etc.
 
 use bytes::Bytes;
 
@@ -11,15 +11,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio_util::sync::CancellationToken;
-
 use crate::coord::TileCoord;
-use crate::executor::{DdsClient, DdsClientError, DdsDiskCacheChecker, Priority};
+use crate::executor::DdsDiskCacheChecker;
 use crate::prefetch::adaptive::calibration::{PerformanceCalibration, StrategyMode};
 use crate::prefetch::adaptive::strategy::PrefetchPlan;
 use crate::prefetch::state::AircraftState;
 use crate::prefetch::SceneryIndex;
-use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
+use crate::runtime::{LaneError, LaneReceipt, PrefetchLane};
 use crate::scene_tracker::{DdsTileCoord, GeoBounds, GeoRegion, SceneTracker};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -328,22 +326,28 @@ impl SceneTracker for StableBoundsTracker {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DdsClient mocks
+// PrefetchLane mocks
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Mock DDS client with configurable executor load and submission tracking.
-pub(crate) struct BackpressureMockClient {
-    /// Simulated executor load (0.0 to 1.0).
+/// A lane that takes no receipts; the coordinator only fires and forgets.
+fn no_receipts() -> Result<LaneReceipt, LaneError> {
+    Err(LaneError::Closed)
+}
+
+/// Mock lane with configurable load and submission tracking.
+pub(crate) struct BackpressureMockLane {
+    /// Simulated lane load (0.0 to 1.0).
     pressure: f64,
     /// Simulated demand on the FUSE mount (0.0 to 1.0), independent of
-    /// `pressure` so tests can drive either signal alone (#246).
+    /// `pressure` so tests can drive either signal alone (#246). The lane
+    /// does not report it; tests pass it to `execute_plan` themselves.
     fuse_pressure: f64,
     submitted: AtomicUsize,
-    /// If Some, return ChannelFull after this many successful submits.
+    /// If Some, return Full after this many successful submits.
     fail_after: Option<usize>,
 }
 
-impl BackpressureMockClient {
+impl BackpressureMockLane {
     pub(crate) fn new(pressure: f64) -> Self {
         Self {
             pressure,
@@ -363,63 +367,43 @@ impl BackpressureMockClient {
         self
     }
 
+    pub(crate) fn simulated_fuse_pressure(&self) -> f64 {
+        self.fuse_pressure
+    }
+
     pub(crate) fn submitted_count(&self) -> usize {
         self.submitted.load(Ordering::Relaxed)
     }
 }
 
-impl DdsClient for BackpressureMockClient {
-    fn submit(&self, _request: JobRequest) -> Result<(), DdsClientError> {
+impl PrefetchLane for BackpressureMockLane {
+    fn submit(&self, _tile: TileCoord) -> Result<(), LaneError> {
         let count = self.submitted.load(Ordering::Relaxed);
         if let Some(limit) = self.fail_after {
             if count >= limit {
-                return Err(DdsClientError::ChannelFull);
+                return Err(LaneError::Full);
             }
         }
         self.submitted.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    fn request_dds(
-        &self,
-        _tile: TileCoord,
-        _cancellation: CancellationToken,
-    ) -> tokio::sync::oneshot::Receiver<DdsResponse> {
-        let (_, rx) = tokio::sync::oneshot::channel();
-        rx
+    fn submit_with_receipt(&self, _tile: TileCoord) -> Result<LaneReceipt, LaneError> {
+        no_receipts()
     }
 
-    fn request_dds_with_options(
-        &self,
-        _tile: TileCoord,
-        _priority: Priority,
-        _origin: RequestOrigin,
-        _cancellation: CancellationToken,
-    ) -> tokio::sync::oneshot::Receiver<DdsResponse> {
-        let (_, rx) = tokio::sync::oneshot::channel();
-        rx
-    }
-
-    fn is_connected(&self) -> bool {
-        true
-    }
-
-    fn executor_load(&self) -> f64 {
+    fn load(&self) -> f64 {
         self.pressure
-    }
-
-    fn fuse_pressure(&self) -> f64 {
-        self.fuse_pressure
     }
 }
 
-/// Mock DdsClient that accepts N submissions, then returns ChannelFull.
-pub(crate) struct CapLimitedDdsClient {
+/// Mock lane that accepts N submissions, then returns Full.
+pub(crate) struct CapLimitedLane {
     limit: usize,
     submitted: AtomicUsize,
 }
 
-impl CapLimitedDdsClient {
+impl CapLimitedLane {
     pub(crate) fn new(limit: usize) -> Self {
         Self {
             limit,
@@ -438,76 +422,40 @@ impl CapLimitedDdsClient {
     }
 }
 
-impl DdsClient for CapLimitedDdsClient {
-    fn submit(&self, _request: JobRequest) -> Result<(), DdsClientError> {
+impl PrefetchLane for CapLimitedLane {
+    fn submit(&self, _tile: TileCoord) -> Result<(), LaneError> {
         let prev = self.submitted.fetch_add(1, Ordering::SeqCst);
         if prev >= self.limit {
             // Undo the increment since we're rejecting
             self.submitted.fetch_sub(1, Ordering::SeqCst);
-            Err(DdsClientError::ChannelFull)
+            Err(LaneError::Full)
         } else {
             Ok(())
         }
     }
 
-    fn request_dds(
-        &self,
-        _tile: TileCoord,
-        _cancel: CancellationToken,
-    ) -> tokio::sync::oneshot::Receiver<DdsResponse> {
-        let (_, rx) = tokio::sync::oneshot::channel();
-        rx
+    fn submit_with_receipt(&self, _tile: TileCoord) -> Result<LaneReceipt, LaneError> {
+        no_receipts()
     }
 
-    fn request_dds_with_options(
-        &self,
-        _tile: TileCoord,
-        _priority: Priority,
-        _origin: RequestOrigin,
-        _cancel: CancellationToken,
-    ) -> tokio::sync::oneshot::Receiver<DdsResponse> {
-        let (_, rx) = tokio::sync::oneshot::channel();
-        rx
-    }
-
-    fn is_connected(&self) -> bool {
-        true
+    fn load(&self) -> f64 {
+        0.0
     }
 }
 
-/// Mock DdsClient that reports high executor load (above defer threshold).
-pub(crate) struct HighLoadDdsClient;
+/// Mock lane that reports high load (above defer threshold).
+pub(crate) struct HighLoadLane;
 
-impl DdsClient for HighLoadDdsClient {
-    fn submit(&self, _request: JobRequest) -> Result<(), DdsClientError> {
+impl PrefetchLane for HighLoadLane {
+    fn submit(&self, _tile: TileCoord) -> Result<(), LaneError> {
         Ok(())
     }
 
-    fn request_dds(
-        &self,
-        _tile: TileCoord,
-        _cancel: CancellationToken,
-    ) -> tokio::sync::oneshot::Receiver<DdsResponse> {
-        let (_, rx) = tokio::sync::oneshot::channel();
-        rx
+    fn submit_with_receipt(&self, _tile: TileCoord) -> Result<LaneReceipt, LaneError> {
+        no_receipts()
     }
 
-    fn request_dds_with_options(
-        &self,
-        _tile: TileCoord,
-        _priority: Priority,
-        _origin: RequestOrigin,
-        _cancel: CancellationToken,
-    ) -> tokio::sync::oneshot::Receiver<DdsResponse> {
-        let (_, rx) = tokio::sync::oneshot::channel();
-        rx
-    }
-
-    fn is_connected(&self) -> bool {
-        true
-    }
-
-    fn executor_load(&self) -> f64 {
+    fn load(&self) -> f64 {
         0.95 // Above BACKPRESSURE_DEFER_THRESHOLD (0.8)
     }
 }

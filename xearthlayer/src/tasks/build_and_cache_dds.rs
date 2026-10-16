@@ -143,6 +143,10 @@ where
         );
         Box::pin(
             async move {
+                if crate::tasks::cached_tile_probe::tile_already_cached(ctx) {
+                    return TaskResult::Success;
+                }
+
                 // Check for cancellation before starting
                 if ctx.is_cancelled() {
                     return TaskResult::Cancelled;
@@ -609,6 +613,18 @@ mod tests {
             }
         }
         received
+    }
+
+    #[tokio::test]
+    async fn cached_tile_probe_hit_skips_the_build() {
+        // No DownloadChunks output is seeded: reaching the build would fail
+        // with missing_input, so Success proves the short-circuit.
+        let (task, _mem_rx, _disk_rx, mut ctx) = make_task_with_chunks(ChunkResults::new());
+        let mut probe = TaskOutput::new();
+        probe.set(crate::tasks::TILE_CACHED_KEY, true);
+        ctx.add_task_output(crate::tasks::CACHED_TILE_PROBE_TASK.to_string(), probe);
+
+        assert!(matches!(task.execute(&mut ctx).await, TaskResult::Success));
     }
 
     #[tokio::test]

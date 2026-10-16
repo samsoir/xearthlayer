@@ -95,6 +95,10 @@ impl ServiceOrchestrator {
 
         let cancellation = CancellationToken::new();
         let prefetch_status = SharedPrefetchStatus::new();
+        if !config.prefetch_enabled() {
+            // No coordinator will run to publish anything, so say so here.
+            prefetch_status.mark_disabled();
+        }
 
         // Create FUSE request analyzer for position inference (if prefetch enabled)
         let fuse_analyzer = if config.prefetch_enabled() {

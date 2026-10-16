@@ -6,7 +6,8 @@
 //!
 //! # Proportional Bias Model
 //!
-//! The box extent is constant (default 9° per axis). The bias within
+//! The box extent is an input (`box_extent`, default 7° per axis, on the
+//! ground; speed-proportional from 3.5° up to it in cruise). The bias within
 //! that extent slides proportionally with the track heading:
 //!
 //! ```text
@@ -71,7 +72,7 @@ impl Default for PrefetchBox {
 impl PrefetchBox {
     /// Create a new prefetch box.
     ///
-    /// - `extent`: total degrees per axis (default 6.5, min 7.0)
+    /// - `extent`: total degrees per axis (default `DEFAULT_BOX_EXTENT`, 7.0)
     /// - `max_bias`: maximum forward fraction (default 0.8, range 0.5-0.9)
     pub fn new(extent: f64, max_bias: f64) -> Self {
         Self { extent, max_bias }

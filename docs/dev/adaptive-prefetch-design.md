@@ -3,9 +3,9 @@
 **Technical Design Document**
 
 **Project**: XEarthLayer
-**Date**: January 2026
-**Version**: 2.0
-**Status**: Design Phase
+**Date**: January 2026, revised October 2026
+**Version**: 2.4
+**Status**: Implemented (sliding box since PR #102)
 
 ---
 
@@ -15,6 +15,7 @@
 2. [Goals and Non-Goals](#goals-and-non-goals)
 3. [Background Research](#background-research)
 4. [System Architecture](#system-architecture)
+   - [Demand and prefetch lanes](#demand-and-prefetch-lanes)
 5. [Three-Window Model](#three-window-model)
 6. [SceneryWindow](#scenerywindow)
 7. [BoundaryStrategy](#boundarystrategy)
@@ -34,12 +35,14 @@ The Adaptive Prefetch System predicts which scenery tiles X-Plane will request n
 
 ### Key Innovation
 
-The system mirrors X-Plane's own loading model — two independent boundary monitors (latitude and longitude) that trigger row/column loads when the aircraft approaches the edge of the loaded scenery area. By observing what X-Plane has loaded via FUSE requests and predicting the next boundary crossing, XEL does what X-Plane is going to do, before X-Plane does it.
+A **sliding prefetch box** moves with the aircraft, biased in the direction of travel and sized by ground speed. Every cycle, the DSF regions inside the box that XEL has not yet prefetched are expanded to their tiles and submitted. The box is deliberately larger than X-Plane's ~3° scenery window, so the rows and columns X-Plane loads at each boundary crossing are already in the cache when it asks for them.
+
+The first version of this system (v2.0) mirrored X-Plane's loading model directly, with two boundary monitors that fired row and column loads as the aircraft neared the window edge. Flight testing showed that fired too late (#86), and PR #102 replaced it with the box. The research findings below still describe X-Plane's behaviour accurately; the box is a different response to them.
 
 ### Design Principles
 
-- **Observe, don't assume**: Derive X-Plane's scenery window dimensions from actual FUSE request data, not hardcoded constants
-- **Mirror X-Plane's model**: Two independent boundary monitors, position-based triggers, row/column loads
+- **Observe, don't assume**: Ground the model in measured X-Plane behaviour and FUSE request data, not hardcoded assumptions
+- **Stay ahead of X-Plane**: Cover more than X-Plane will load next, rather than predicting exactly what it will load
 - **Three windows**: Track X-Plane's window, XEL's prefetched window, and the target window separately
 - **Performance-aware**: Don't prefetch if the connection can't complete before X-Plane needs it
 - **Non-interfering**: Respect executor backpressure and transition throttling
@@ -50,10 +53,10 @@ The system mirrors X-Plane's own loading model — two independent boundary moni
 
 ### Goals
 
-1. **Predict boundary crossings** — determine which DSF boundary (lat or lon) the aircraft will cross next, using position relative to the observed window edge
-2. **Prefetch exact rows/columns** — generate the tiles X-Plane will request, matching its 3-deep strip loading pattern
-3. **Observe window dimensions** — derive X-Plane's scenery window size from actual FUSE request data during initial scene load
-4. **Stay ahead** — trigger prefetch early enough to complete before X-Plane's reactive loading fires
+1. **Cover what X-Plane loads next**: keep every DSF region X-Plane will load at its next boundary crossing inside the prefetch box, including the 3-deep row and 2-deep column loads it makes
+2. **Size the lookahead to speed**: look further ahead in cruise than on approach, so prefetch depth tracks how far the aircraft will travel in the next few minutes
+3. **Detect world rebuilds**: recognise a teleport or rendering change from FUSE request bursts and reset prefetch state
+4. **Stay ahead**: have tiles generated before X-Plane's reactive loading asks for them
 5. **Handle all flight phases** — turns, diagonal flight, teleports, rendering changes, sparse/ocean regions
 
 ### Non-Goals
@@ -74,7 +77,9 @@ This design is based on empirical research documented in:
 
 ### Key Findings Informing Design
 
-| Finding | Design Impact |
+The findings are X-Plane's measured behaviour and still hold. The **Design Impact** column records the v2.0 boundary-monitor response, kept for the reasoning; where it names monitors, the current design answers the same finding with the sliding box instead (see [Sliding Prefetch Box](#sliding-prefetch-box-cruise-phase)).
+
+| Finding | Design Impact (v2.0) |
 |---------|---------------|
 | X-Plane uses position-only loading (no heading/speed/track) | Use position-based boundary monitors, not track projection |
 | Two independent boundary monitors (lat and lon) | Mirror with dual `BoundaryMonitor` structs |
@@ -113,45 +118,36 @@ This design is based on empirical research documented in:
 ┌───────────────────────────────────────────────────────────────────────────┐
 │                      AdaptivePrefetchCoordinator                          │
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ • Updates SceneryWindow each cycle                                  │  │
-│  │ • Selects strategy by flight phase                                  │  │
-│  │ • Submits prefetch jobs to DdsClient                                │  │
-│  │ • Applies backpressure + transition throttle                        │  │
+│  │ • Picks the box shape by flight phase (PhaseDetector)               │  │
+│  │ • Plans new regions, or drains pending tiles first                  │  │
+│  │ • Filters plans (memory, patch, package, DDS disk)                  │  │
+│  │ • Submits via PrefetchLane under backpressure + transition throttle │  │
+│  │ • Runs region maintenance every cycle                               │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │         │                    │                      │                     │
 │         ▼                    ▼                      ▼                     │
 │  ┌─────────────┐     ┌─────────────────┐     ┌─────────────┐            │
-│  │ Ground      │     │ Boundary        │     │ (Future)    │            │
-│  │ Strategy    │     │ Strategy        │     │ FlightPlan  │            │
-│  ├─────────────┤     ├─────────────────┤     │ Strategy    │            │
-│  │ Ring around │     │ Row/column from │     │             │            │
-│  │ position    │     │ window monitors │     │             │            │
-│  └─────────────┘     └─────────────────┘     └─────────────┘            │
-│                              │                                           │
-│                              ▼                                           │
-│                       ┌─────────────┐                                    │
-│                       │ Scenery     │                                    │
-│                       │ Window      │                                    │
-│                       ├─────────────┤                                    │
-│                       │ LatMonitor  │                                    │
-│                       │ LonMonitor  │                                    │
-│                       │ 3-window    │                                    │
-│                       │ tracking    │                                    │
-│                       └──────┬──────┘                                    │
-│                              │                                           │
-│                     ┌────────┴────────┐                                  │
-│                     ▼                 ▼                                  │
-│              ┌─────────────┐   ┌─────────────┐                          │
-│              │SceneTracker │   │  GeoIndex   │                          │
-│              │(observations)│   │(spatial DB) │                          │
-│              └─────────────┘   └─────────────┘                          │
+│  │ Prefetch    │     │ Boundary        │     │ Scenery     │            │
+│  │ Box         │     │ Strategy        │     │ Index       │            │
+│  ├─────────────┤     ├─────────────────┤     ├─────────────┤            │
+│  │ Box bounds, │     │ Region states:  │     │ Tiles per   │            │
+│  │ new regions,│     │ mark, promote,  │     │ DSF region  │            │
+│  │ retention   │     │ defer, evict    │     │             │            │
+│  └──────┬──────┘     └────────┬────────┘     └─────────────┘            │
+│         └──────────┬──────────┘                                          │
+│                    ▼                                                     │
+│             ┌─────────────┐      ┌──────────────┐                        │
+│             │  GeoIndex   │      │ SceneryWindow│                        │
+│             │(spatial DB) │      │ (rebuild     │                        │
+│             └─────────────┘      │  detection)  │                        │
+│                                  └──────────────┘                        │
 └───────────────────────────────────────────────────────────────────────────┘
          │
          ▼
 ┌─────────────────────┐     ┌─────────────────────┐     ┌──────────────────┐
-│      DdsClient      │────▶│    JobExecutor       │────▶│   CacheLayer     │
-│  (submit prefetch   │     │  (generate tiles)    │     │  (memory + disk) │
-│   jobs)             │     │                      │     │                  │
+│    PrefetchLane     │────▶│  JobExecutor (the    │────▶│   CacheLayer     │
+│  (submit prefetch   │     │  prefetch lane)      │     │  (memory + disk) │
+│   tiles)            │     │                      │     │                  │
 └─────────────────────┘     └──────────────────────┘     └──────────────────┘
 ```
 
@@ -164,14 +160,20 @@ xearthlayer/src/prefetch/
 ├── adaptive/
 │   ├── mod.rs                   # Adaptive module exports
 │   ├── coordinator/
-│   │   ├── core.rs              # AdaptivePrefetchCoordinator
+│   │   ├── core.rs              # AdaptivePrefetchCoordinator (plan, drain, settle)
+│   │   ├── filtering.rs         # Four-tier filter pipeline
+│   │   ├── plan_executor.rs     # Submission under backpressure and throttle
 │   │   ├── runner.rs            # Prefetcher impl (async loop)
-│   │   └── constants.rs         # Timing constants
+│   │   ├── constants.rs         # Timing constants (MIN_CYCLE_INTERVAL, ...)
+│   │   ├── telemetry.rs         # Telemetry processing helpers
+│   │   ├── time_budget.rs       # Plan time budget validation
+│   │   ├── status.rs            # Coordinator status types
+│   │   └── status_updater.rs    # Shared status for the TUI
+│   ├── prefetch_box.rs          # PrefetchBox (heading-biased sliding box)
+│   ├── extent.rs                # Speed-proportional box extent
+│   ├── boundary_strategy.rs     # BoundaryStrategy (region lifecycle)
+│   ├── scenery_window.rs        # SceneryWindow (rebuild detection, dimensions)
 │   ├── strategy.rs              # AdaptivePrefetchStrategy trait, PrefetchPlan
-│   ├── ground_strategy.rs       # GroundStrategy (ring-based)
-│   ├── boundary_strategy.rs     # BoundaryStrategy (row/column from monitors) [NEW]
-│   ├── scenery_window.rs        # SceneryWindow (3-window model) [NEW]
-│   ├── boundary_monitor.rs      # BoundaryMonitor (position vs edge) [NEW]
 │   ├── phase_detector.rs        # PhaseDetector (Ground/Transition/Cruise)
 │   ├── transition_throttle.rs   # TransitionThrottle (takeoff ramp-up)
 │   ├── config.rs                # AdaptivePrefetchConfig
@@ -185,8 +187,142 @@ xearthlayer/src/prefetch/
 | `CruiseStrategy` | `cruise_strategy.rs` | Replaced by `BoundaryStrategy` |
 | `BandCalculator` | `band_calculator.rs` | Band model replaced by boundary prediction |
 | `BoundaryPrioritizer` | `boundary_prioritizer.rs` | Boundary logic absorbed into `SceneryWindow` monitors |
-| `TurnDetector` | `turn_detector.rs` | No longer needed; boundary monitors handle turns naturally |
+| `TurnDetector` | `turn_detector.rs` | Not needed: the box's heading bias follows the track every cycle |
+| `BoundaryMonitor`, `BoundaryCrossing` | `boundary_monitor.rs` | Fired too late at DSF boundaries (#86); replaced by `PrefetchBox` in PR #102 |
+| `GroundStrategy` | `ground_strategy.rs` | Ring-based ground prefetch; the ground phase now uses the box, unbiased (#172) |
 | `PerformanceCalibrator`, `RollingCalibrator`, `ThroughputObserver` | `calibration/` | Never wired: nothing fed them samples and nothing read the result (#277) |
+
+### Demand and prefetch lanes
+
+Prefetch used to share every contention point with FUSE: the request channel,
+the daemon coalescer, the job channel, the `tile_generation` group, the resource
+pools and the HTTP semaphore. At a boundary crossing or a turn, prefetch
+legitimately queues thousands of tiles, and X-Plane ended up waiting behind them
+until the generation timeout (#296). Prefetch and FUSE now run in separate lanes.
+
+**The no-harm contract.** A FUSE request is never slower because prefetch exists
+than it would be with prefetch disabled. It is measured as FUSE demand-generation
+latency (p95 and max) and timeout count, prefetch on against prefetch off.
+
+**Two lanes.**
+
+- The **demand lane** is always local: an `ExecutorDaemon` and `JobExecutor` with
+  their own coalescer, request channel, job channel, pools, `tile_generation`
+  group and HTTP semaphore. FUSE reaches it through `DdsClient::request_dds`,
+  which is demand only.
+- The **prefetch lane** sits behind the `PrefetchLane` trait. `LocalPrefetchLane`
+  is a second `ExecutorDaemon` and `JobExecutor` with their own everything. The
+  adaptive coordinator and prewarm are its consumers.
+
+Lanes are handed to consumers at construction rather than routed by
+`RequestOrigin` at run time, so FUSE cannot land in the prefetch lane by type.
+`RequestOrigin` remains for metrics. The two lanes share the memory cache, the DDS
+disk cache and the chunk disk cache by `Arc`; writes are idempotent. Coalescing is
+per lane. The coordinator, the region state machine and the demand lane stay on
+the primary in every mode.
+
+**What the lanes share.** Besides the three caches, both lanes' job factories hold
+the same texture encoder. With the CPU backends (`software`, `ispc`) that is only
+shared code, but with `texture.compressor = gpu` every encode from both lanes goes
+through one channel to one GPU worker (`dds/gpu_channel.rs`), so a prefetch encode
+can sit ahead of a FUSE encode there.
+
+**Admission pause.** `DemandTracker` (`executor/demand.rs`) counts demand jobs in
+flight, a job being a FUSE cache miss that has a generation running. The count is
+held by an RAII `DemandGuard` released on every exit (success, failure, the FUSE
+timeout cancelling the job, a failed submit). It publishes a `watch<bool>`: paused
+while any demand job is in flight, resumed when the count returns to zero. Cache
+hits never pause. The prefetch lane's executor is built with that receiver as its
+admission gate: while paused it admits no queued job, jobs already admitted run all
+their tasks, and admission retries on resume. See the job executor design for the
+gate itself.
+
+**Always claim.** FUSE always starts its own job in the demand lane. There is no
+cross-lane coalescing or cancellation, so the only duplicate work is a prefetch
+job already running when FUSE asks for the same tile.
+
+**Cache probe.** Every prefetch-lane tile job starts with `CachedTileProbeTask`
+(`tasks/cached_tile_probe.rs`). It checks the memory and DDS disk caches and, on a
+hit, records that fact so `DownloadChunksTask` and `BuildAndCacheDdsTask` return at
+once. This turns tiles that demand generated during a pause into no-ops. Hits are
+counted as `skipped_cached`.
+
+**Sizing.** Demand keeps the full derived capacity, and the prefetch lane is added
+on top, scaled by `prefetch.capacity_share` (default 0.35, range 0.05 to 0.50).
+`LaneSizing` (`executor/lane_sizing.rs`) derives it from the demand lane's
+`ResourcePoolConfig::default()`; each figure is rounded up and never below one:
+
+| Resource | Demand lane | Prefetch lane | Prefetch formula |
+|----------|-------------|---------------|------------------|
+| CPU pool | 40 | 14 | `ceil(demand cpu x share)` |
+| Network pool | 60 | 21 | `ceil(demand network x share)` |
+| Disk I/O pool | 64 | 23 | `ceil(demand disk_io x share)` |
+| `tile_generation` group | 512 | 70 | `2 x (prefetch cpu + prefetch network)` |
+| HTTP semaphore | 1,024 | 1,024 | `DEFAULT_MAX_CONCURRENT_HTTP`, not scaled |
+
+The figures are for a 32 core machine at the default share. The share scales only
+the pools whose work competes with X-Plane for cores: encoding, and the TLS and
+JPEG decoding network tasks do. HTTP connections are not scaled. A connection
+waiting on the network costs the simulator nothing, and prefetch downloads are
+bound by connections in flight: on a 5 Gbit link, a prewarm with 359 permits
+(the share applied to 1,024) moved about 2,000 chunks/s at about 180 ms per
+chunk while CPU sat near 5% and the link near 4%, and raising the permits to
+512 raised the rate in proportion. Before the lanes, prefetch drew on the whole
+shared 1,024, so scaling them made prewarm slower than 0.4.x.
+
+The tokio blocking pool
+covers both lanes: `LaneSizing::blocking_threads_required()` is demand cpu +
+demand disk_io + prefetch cpu + prefetch disk_io + `BLOCKING_POOL_HEADROOM`
+(173 on the reference machine). Admitted prefetch jobs finish after a pause, so
+transient overlap with demand can reach 135% of the old permit totals at the
+default share (150% at the 0.50 ceiling). Under #227 the glibc arena settles at the
+worst peak, so the memory floor should be checked on a flight after changing the
+share.
+
+**The `PrefetchLane` contract.** The lane is written to be met over a network, so
+prefetch can later run on another machine:
+
+```rust
+pub trait PrefetchLane: Send + Sync {
+    fn submit(&self, tile: TileCoord) -> Result<(), LaneError>;
+    fn submit_with_receipt(&self, tile: TileCoord) -> Result<LaneReceipt, LaneError>;
+    fn load(&self) -> f64;
+}
+```
+
+`submit` is fire-and-forget. `submit_with_receipt` is for prewarm, which needs
+per-tile progress: the `LaneReceipt` resolves to a `LaneOutcome` (`Generated`,
+`AlreadyCached`, `Failed`, `Dropped`) and never carries tile bytes. `load()` is
+0.0 to 1.0 and feeds coordinator backpressure: how saturated the lane's queue is,
+measured as jobs waiting for admission against the `tile_generation` group size.
+`LaneError` is `Full` (retry later) or `Closed`. A submission the lane accepts is
+never dropped afterwards: the local lane's daemon waits for room in its executor's
+queue instead of shedding, so a saturated executor backs up the request channel,
+`submit` returns `Full`, and the coordinator keeps the tile pending. Shedding there
+used to lose tiles the coordinator had already counted as submitted, and nothing
+asked for them again. The result of a submission is a complete tile appearing in the
+primary's DDS disk cache, which is how the coordinator already learns of completion
+(`promote_completed_regions`). Pause is not a trait method: the lane is built with
+the demand state and stands aside on its own.
+
+"A tile appears in the cache" carries four obligations that `LocalPrefetchLane`
+meets by writing through `CacheLayer`, and a remote lane would have to meet too:
+
+1. **Completeness:** only tiles with all 256 chunks persist (#180).
+2. **Integrity:** the write is atomic and never visible half-written (`write_atomic`).
+3. **Identical encoding:** format and provider match the primary's configuration.
+4. **Survival:** disk GC may evict a prefetched tile before it is used.
+
+Cache GC housekeeping jobs run on the local prefetch lane through
+`LocalPrefetchLane::job_submitter()`, a local-only method outside the trait, so
+they pause with prefetch. Offloading would have to move GC back to a local executor
+because it maintains the primary's caches. GC jobs count among the lane's running
+jobs, so a GC run shows as lane activity in the TUI and the sample line even when
+no prefetch is in flight.
+
+Cancelling prewarm stops it issuing tiles, but work already submitted to the lane
+runs to completion: a receipt carries no cancellation, so tiles in flight finish
+and land in the cache.
 
 ---
 
@@ -223,7 +359,7 @@ Direction of flight →
 |--------|-----------------|---------|
 | **X-Plane Window** | SceneTracker (`loaded_regions()`, `loaded_bounds()`) + retention inference with buffer | What X-Plane currently holds in memory (inferred) |
 | **XEL Window** | GeoIndex `PrefetchedRegion` layer | What XEL has confirmed as cached (DSF region granularity) |
-| **Target Window** | Computed by boundary monitors | What X-Plane will load next — the next row/column at the approaching window edge |
+| **Target Window** | The prefetch box (`PrefetchBox::bounds_with_shape`) | Everything X-Plane may load next; deliberately larger than the next row/column, so it contains them whichever edge the aircraft approaches |
 
 ### The Prefetch Decision
 
@@ -299,6 +435,20 @@ cycle, and could never return to `Prefetched` — which under-reported
 `regions_prefetched` in the 60s sample. Patch-owned regions are excluded:
 their tiles filter out in full too, but prefetch never places them on the DDS
 disk, so `InProgress` would be a claim nothing could confirm.
+
+That case is one instance of the general rule: a region is marked `InProgress`
+once **none of its planned tiles is outstanding**, where a tile stops being
+outstanding when the executor accepts it or the filter removes it as cached.
+The two can happen in different calls. Prefetch submits until the request
+channel is full and keeps the remainder as pending, and a cruise strip (about
+1,500 tiles) is larger than the channel (1,000), so most plans are finished by
+later `boundary_pending` drains, which re-filter what they carry. The coordinator
+therefore keeps each plan's outstanding tiles until they settle, across drains,
+rather than judging a region inside a single submission. Judging it inside one
+call left every region split by the channel cut, and every region with even one
+cached tile, permanently unmarked: re-planned as new on the next cycle, with each
+tile still queued in the executor passing the filter and being submitted again
+(#296).
 
 ### Region Tile-Set SSOT
 
@@ -452,8 +602,56 @@ each maintenance cycle rather than accumulated:
 INFO Prefetch sample uptime_s=... regions_in_progress=... regions_prefetched=...
      regions_nocoverage=... regions_deferred_active=... promotions_normal=...
      promotions_rescue=... state_diverged=... regions_demoted=...
-     regions_deferred=... fuse_generations=...
+     regions_deferred=... fuse_generations=... fuse_latency_p50_ms=...
+     fuse_latency_p95_ms=... fuse_latency_max_ms=... fuse_latency_count=...
+     fuse_timeouts=... demand_in_flight=... prefetch_paused_secs=...
+     skipped_cached=... lane_load=... lane_running=... lane_queued=...
 ```
+
+The lane fields (#296) are the no-harm instrument:
+- `fuse_latency_p50_ms`, `fuse_latency_p95_ms`, `fuse_latency_max_ms` and
+  `fuse_latency_count` describe FUSE demand-generation latency over this sample
+  only. Cache hits are excluded. Zeros mean no generation completed in the window.
+- `fuse_timeouts` is per sample: requests abandoned at the FUSE timeout, including
+  those that timed out while still queued for the demand lane, before any job
+  started. Their wait, measured from when FUSE made the request, is inside the
+  latency figures.
+- `demand_in_flight` is a gauge of demand jobs running now.
+- `prefetch_paused_secs` is how long the prefetch lane stood aside for demand
+  during this sample.
+- `skipped_cached` is cumulative since process start: tiles the cache probe found
+  already cached when their prefetch job was admitted.
+- `lane_load` is `PrefetchLane::load()`, 0.0 to 1.0: jobs waiting for admission
+  against the lane's `tile_generation` group size. `lane_running` is the jobs the
+  lane has admitted and not finished. `lane_queued` is the jobs held waiting for
+  admission, by a full group or by the demand pause, which is where work sits
+  while demand has the lane paused.
+
+The TUI shows the same latency over the whole session instead of one sample, so
+the line is not blank at cruise, where most samples have no generations. The
+median, 95th percentile and maximum come from a fixed-size log-spaced histogram
+(about 5% relative width, 1 ms to 10 minutes, longer waits in the top bucket;
+the maximum and count are exact) fed by the same FUSE waits as the per-sample
+window, and the timeout count is the session total, shown when non-zero. The
+line's colour comes from the most recent sample that had generations, held
+across empty samples, so one early stall does not keep it red all flight. The
+log fields above are unchanged.
+
+The latency figures cover generations only: a cache hit never waits on a lane,
+and counting it would swamp the percentiles with near-zero waits. That leaves
+the line empty on a well-prefetched flight, which reads as a broken component,
+so it also shows the session cached share: FUSE requests served from the memory
+or DDS disk cache, over those plus FUSE generations (`fuse_jobs_submitted`).
+Requests coalesced onto an in-flight job and all prefetch traffic are excluded.
+The share is a whole percent, shown as `>99%` when some request was generated
+but the rounded value would read 100. It uses the line's neutral style, so it
+never competes with the amber or red of the latency figures. With no FUSE
+request yet the line reads `no FUSE requests yet`; with requests but no
+generations it reads `no FUSE generations yet │ 100% cached`.
+
+To compare prefetch on and off, run the same route with `prefetch.enabled = true`
+and `false` and compare `fuse_latency_p95_ms`, `fuse_latency_max_ms` and
+`fuse_timeouts` across the samples.
 
 **Two of these fields differ only by suffix and are easy to misread against
 each other — read this before reading a flight log:**
@@ -497,24 +695,24 @@ state.
 
 ### Retention Inference
 
-The X-Plane Window is inferred, not observed directly. We use a buffer zone to handle uncertainty:
+The X-Plane Window is inferred, not observed directly. X-Plane's measured
+window is ~3° of latitude by ~3°/cos(lat) of longitude, and it keeps scenery
+it has loaded for a while after the aircraft moves on. Rather than model that
+window separately, retention is derived from the prefetch box, which already
+contains it:
 
 ```
-Window dimensions (empirically measured):
-  Latitude:  ~3° (constant worldwide)
-  Longitude: ~3° / cos(aircraft_latitude) — varies by latitude
-    At equator:  ~4° lon (3 DSF cols)
-    At 35° lat:  ~4° lon (4 DSF cols)
-    At 50° lat:  ~4-5° lon (5 DSF cols)
-
-Buffer: 1° on each side
-
-Total retained area: 5 rows × (lon_cols + 2) columns (window + buffer)
-Centered on: aircraft position (may be biased toward heading)
+Retained area = every DSF region the box touches
+              + `window_buffer` regions on each side (default 1)
 
 Regions inside retained area → RetainedRegion in GeoIndex
-Regions previously retained but now outside → evicted from GeoIndex
+Regions previously retained but now outside → RetainedRegion removed
 ```
+
+`PrefetchBox::update_retention_with_shape` maintains this every cycle, in
+cruise only: on the ground there is no "behind" to retain, and updating it
+there would evict regions that legitimately live away from the aircraft, such
+as prewarm state.
 
 When a region leaves the retained area, the coordinator also evicts:
 - Its `PrefetchedRegion` entry (making it eligible for re-prefetch if the aircraft returns)
@@ -527,29 +725,14 @@ All retention decisions are logged at `DEBUG` level for flight test analysis.
 
 ## SceneryWindow
 
-The `SceneryWindow` is the core computational model. It derives window dimensions, tracks retention, and predicts boundary crossings via two independent monitors.
+In v2.0 `SceneryWindow` was the core model: it derived X-Plane's window
+dimensions, ran the boundary monitors and tracked retention through an
+`Uninitialized → Assumed → Ready` state machine. PR #102 moved prediction to
+`PrefetchBox`, and retention moved there too (see above).
 
-### State Machine
-
-```
-
-  Uninitialized ──▶ Assumed ──▶ Ready
-       │               │          │
-  (no telemetry)  (telemetry   (first tracker bounds
-                   but no FUSE  → config dimensions
-                   activity,    centered on tracker,
-                   using        normal operation)
-                   defaults)         │
-                                ◀────┘
-                               (re-derive on
-                                world rebuild)
-```
-
-| State | Condition | Window Source |
-|-------|-----------|--------------|
-| `Uninitialized` | No telemetry, no FUSE data | No predictions |
-| `Assumed` | Telemetry present, no FUSE activity (ocean/sparse start) | Default dimensions (3 lat × dynamic lon based on latitude) |
-| `Ready` | First tracker bounds observed, or first boundary crossing | Fixed dimensions (3 lat × 3/cos(lat) lon) centered on aircraft position |
+What remains (`adaptive/scenery_window.rs`) is a holder for the window
+configuration and a latitude-dependent column count. Nothing outside its own
+tests constructs it, so it is dead code awaiting removal.
 
 ### Sliding Prefetch Box (Cruise Phase)
 
@@ -573,26 +756,30 @@ The box extent scales linearly with ground speed via `ExtentCalculator::compute_
 
 ```
 t = clamp((ground_speed_kt - 40.0) / (450.0 - 40.0), 0.0, 1.0)
-extent = 3.5 + t * 3.0   // degrees
+extent = box_min_extent + t * (box_extent - box_min_extent)   // 3.5 + t * 3.5 by default
 ```
 
-| Ground Speed | Extent |
+| Ground Speed | Extent (defaults) |
 |-------------|--------|
-| ≤ 40 kt (ground) | 3.5° |
-| 140 kt (approach) | ~4.2° |
+| 40 kt | 3.5° |
+| 140 kt (approach) | ~4.4° |
 | 250 kt (climb/descent) | ~5.3° |
-| 450 kt (cruise) | 6.5° |
-| > 450 kt (supersonic) | 6.5° (clamped) |
+| 450 kt (cruise) | 7.0° |
+| > 450 kt | 7.0° (clamped) |
 
-**Rationale:** At approach speeds (~140 kt), the original fixed 6.5° extent prefetched tiles 25+ minutes ahead of the aircraft, wasting resources and contributing to swap-in storms when those tiles eventually entered memory. Scaling extent to speed ensures prefetch depth stays proportional to how far ahead the aircraft will travel in the next few minutes.
+The maximum is `prefetch.box_extent` (default 7.0°, `DEFAULT_BOX_EXTENT`), the minimum `DEFAULT_BOX_MIN_EXTENT` (3.5°). The ramp applies in the **Cruise** phase only. The **Ground** phase uses the full `box_extent` with a symmetric 0.5 bias, a square box centred on the aircraft, and the **Transition** phase (takeoff) does not prefetch at all.
 
-The coordinator computes extent each cycle from live ground speed and passes it to `PrefetchBox` via the `_with_extent` factory methods. `PrefetchBox` itself remains a pure geometry calculator — extent is an input parameter, not internal state.
+**Rationale:** At approach speeds (~140 kt), a fixed full-size extent prefetched tiles 25+ minutes ahead of the aircraft, wasting resources and contributing to swap-in storms when those tiles eventually entered memory. Scaling extent to speed ensures prefetch depth stays proportional to how far ahead the aircraft will travel in the next few minutes.
+
+The coordinator computes extent each cycle from live ground speed and passes it to `PrefetchBox` as part of a `BoxShape`. `PrefetchBox` itself remains a pure geometry calculator: extent is an input parameter, not internal state.
+
+**Scale.** A 1°×1° DSF holds roughly 200 to 300 DDS tiles at ZL16 in mid latitudes (about 11 columns and 16 rows of tiles at 46°N, plus higher zoom tiles around airports). The full 7° box covers up to 7×7 = 49 DSFs, so one new row or column of DSFs entering the box is around 1,500 tiles, and a turn, which swings the heading bias onto the other axis, can bring in several such strips at once.
 
 #### Box Shape and Proportional Heading Bias
 
 The box is a rectangle in lat/lon space with **proportional heading bias**:
 
-- **Total extent:** Speed-proportional (3.5°-6.5°, see above). Covers X-Plane's observed loading area with overlap scaled to approach speed.
+- **Total extent:** Speed-proportional in cruise (3.5° to 7.0° by default, see above). Covers X-Plane's observed loading area with overlap scaled to approach speed.
 - **Proportional bias formula:** `forward_fraction = 0.5 + (max_bias - 0.5) * |component|`
   - At cardinal headings: primary axis gets 80/20 (at `max_bias=0.8`), perpendicular axes get 50/50
   - At diagonals: both axes share ~71/29
@@ -613,188 +800,93 @@ lat_forward = -cos(track)   // positive = moving north
 | 225° (southwest) | 3° west, 1° east | 3° south, 1° north | Biased SW |
 | 260° (WSW, LOWW->LPPT) | 3° west, 1° east | 3° south, 1° north | Biased WSW |
 
-#### Per-Tick Operation
+#### Per-Cycle Operation
 
-Each telemetry tick (~0.5s):
+Telemetry arrives several times a second; a prefetch cycle runs at most every
+2 s (`MIN_CYCLE_INTERVAL`). Each cycle (`process_telemetry`) does one of two
+things:
 
-1. Compute box from `(aircraft_lat, aircraft_lon, track_heading)`
-2. Enumerate DSF regions that intersect the box (via `floor()` arithmetic)
-3. Filter out regions already prefetched or in-progress (via GeoIndex)
-4. Filter out regions with no scenery coverage (patches, packages)
-5. For new regions: expand to DDS tiles, submit to executor
+**If tiles are pending from an earlier cycle**, it drains them and plans
+nothing new. The pending tiles are re-filtered first (anything cached in the
+meantime is settled without being submitted), then submitted as a
+`boundary_pending` plan.
+
+**Otherwise it plans:**
+
+1. Compute the box from position, track and phase (see above)
+2. Enumerate the DSF regions it intersects (via `floor()` arithmetic)
+3. Keep only regions `PrefetchedRegion::should_prefetch` admits: absent, or
+   `Deferred` with its `retry_after` passed. `InProgress`, `Prefetched` and
+   `NoCoverage` are skipped
+4. Expand each region to its tiles with `SceneryIndex::tiles_in_region`; a
+   region with none is marked `NoCoverage`
+5. Apply the four-tier filter (memory, patch, installed package, DDS disk)
+6. Submit the survivors (see Throttling)
+7. Mark each region `InProgress` once none of its tiles is outstanding (see
+   *Region States*: this can complete in a later cycle's drain)
+
+Tiles are submitted in plan order. There is no distance sort and no per-cycle
+cap: both were removed after the #172 flight, where a distance sort combined
+with a cap starved the far side of the box.
+
+Region maintenance (stale `InProgress` evaluation, promotion to `Prefetched`,
+and eviction of regions outside the retained window, so they can be prefetched
+again on return) runs at the end of every cycle, whether or not anything was
+submitted.
 
 #### Throttling
 
-- **Backpressure:** Same executor load check -- skip cycle if >80% utilisation
-- **Rate limiting:** `max_tiles_per_cycle` cap prevents flooding
-- **Deduplication:** GeoIndex tracks `PrefetchedRegion` state (InProgress, Prefetched, NoCoverage)
-- **Eviction:** Regions that leave the box are marked for GeoIndex cleanup
+- **Backpressure:** the higher of executor load and FUSE pressure (see
+  *Backpressure*). Above 0.8 the cycle is deferred and its whole plan kept as
+  pending; above 0.5 half the plan is submitted and the rest kept as pending
+- **Transition throttle:** after takeoff, the submitted fraction ramps from 25%
+  to 100% over 30 s; the overflow is kept as pending
+- **Lane capacity:** tiles are submitted until the lane returns
+  `LaneError::Full` (its request channel, 1,000 requests, is full); the remainder
+  is kept as pending. Prefetch never waits for space, and pending tiles are never
+  dropped
+- **Admission pause:** while FUSE is waiting on generation the lane admits no new
+  job, so submitted tiles queue in the lane until demand clears
+- **Deduplication:** `PrefetchedRegion` state in the GeoIndex keeps a region
+  from being planned twice. Tiles already queued for generation are not
+  filtered by prefetch; if one is submitted again, the daemon coalescer joins
+  it to the job in flight (coalescing is within the prefetch lane only)
 
 #### Design Decisions
 
 1. **DSF-native math:** Box margins are in degrees, region enumeration uses integer DSF coordinates (`floor()`). No cos(lat) correction -- raw degrees match X-Plane's loading model.
 2. **No component threshold:** Any non-zero heading component biases that axis. Only exact cardinal headings produce symmetric distribution on the perpendicular axis. Rationale: even a slight component means the aircraft will eventually need those tiles. Simplicity over cleverness.
-3. **Ground phase separation:** `GroundStrategy` ring-based approach for ground operations. The sliding box applies in cruise only. The phase detector manages this transition.
+3. **One box for every phase:** the ring-based `GroundStrategy` was deleted after #172. On the ground the same box is used, at full extent with a symmetric bias; in cruise it is speed-proportional and heading-biased. The phase detector selects the shape, and retention tracking runs in cruise only, since a stationary aircraft has no "behind" to retain.
 4. **Transition phase:** The box applies immediately at full size on entering cruise. The `TransitionThrottle` ramp independently controls submission rate (25% -> 100% over 30s).
 
 **Empirical basis:** Debug map flight testing at YBAS (2026-03-21) revealed X-Plane loads a 6x6 DSF area, not the 3x3 previously assumed. The proportional bias model was designed to match X-Plane's directional loading pattern without binary bias switching artefacts.
 
-**SceneryWindow retained for:** world rebuild detection (`check_for_rebuild()`). Retention tracking now uses `PrefetchBox::update_retention()` with box-derived bounds.
+Retention tracking uses `PrefetchBox::update_retention_with_shape()` with box-derived bounds (see [Retention Inference](#retention-inference)).
 
-### World Rebuild Detection
+### World Rebuild Detection (not implemented)
 
-If a burst arrives where tiles cover >50% of the current window area AND are roughly centered on the aircraft (not at an edge), this indicates X-Plane is rebuilding the world (teleport, rendering settings change). Response:
-
-1. Clear XEL Window (all `PrefetchedRegion` entries)
-2. Clear X-Plane Window (all `RetainedRegion` entries)
-3. Reset to `Measuring` state
-4. Re-derive window dimensions from the new load
-
-### Dual Boundary Monitors
-
-Two independent monitors, one per axis. Each compares the aircraft's position on its axis to the window edges on that axis:
-
-```
-SceneryWindow
-    ├── LatitudeMonitor
-    │     Watches: aircraft latitude vs. window north/south edges
-    │     Triggers: ROW load prediction
-    │
-    └── LongitudeMonitor
-          Watches: aircraft longitude vs. window east/west edges
-          Triggers: COLUMN load prediction
-```
-
-#### Monitor Logic
-
-```rust
-pub struct BoundaryMonitor {
-    axis: BoundaryAxis,        // Latitude or Longitude
-    window_min: f64,           // e.g., lat 49.0 (south edge)
-    window_max: f64,           // e.g., lat 52.0 (north edge)
-    trigger_distance: f64,     // e.g., 1.0° from edge
-}
-```
-
-Per-cycle check (position-only, no track dependency):
-
-```
-LatitudeMonitor (window ~3° tall, edges at 49.0 and 52.0):
-    aircraft_lat = 51.55
-    window north edge = 52.0
-    distance to north edge = 0.45°
-
-    0.45° < trigger_distance (1.0°)? YES
-    → Predict: ROW load at lat 52 (1 deep north)
-
-LongitudeMonitor (window ~4° wide at 50°N, edges at 7.0 and 11.0):
-    aircraft_lon = 8.5
-    window east edge = 11.0
-    distance to east edge = 2.5°
-
-    2.5° < trigger_distance (1.0°)? NO
-    → No prediction this cycle
-```
-
-#### Urgency
-
-```
-urgency = 1.0 - (distance_to_edge / trigger_distance)
-
-distance = 0.45°, threshold = 1.0° → urgency = 0.55 (approaching)
-distance = 0.15°, threshold = 1.0° → urgency = 0.85 (imminent)
-distance = 2.50°, threshold = 1.0° → urgency < 0   (not triggered)
-```
-
-#### Window Edge Updates
-
-Window edges update when X-Plane is observed loading the predicted row/column (via SceneTracker's `loaded_regions()` expanding). This keeps the model grounded in observation.
-
-#### Turn Handling
-
-No explicit turn detection. The monitors handle turns naturally:
-
-```
-Before turn (heading north):
-    LatMonitor: 0.3° from north edge → triggered
-    LonMonitor: 3.5° from east edge → not triggered
-
-After turn (heading east):
-    LatMonitor: distance to north edge stops shrinking → drops below urgency
-    LonMonitor: distance to east edge shrinking → triggers
-```
-
-The transition is smooth and automatic. No stabilisation pause, no wasted cycles.
-
-#### Track as Optional Enrichment
-
-The monitors are position-only. However, track can optionally be used for:
-
-- **Direction disambiguation**: If the aircraft is near both north and south edges (small window), track indicates which edge matters
-- **Pre-warming**: If far from all edges but track indicates approach, start low-priority prefetch early
-
-This is XEL's advantage over X-Plane — we know the direction of travel before the position-only trigger fires.
-
-### Interface
-
-```rust
-pub struct SceneryWindow {
-    state: WindowState,
-    window_size: Option<(usize, usize)>,
-    lat_monitor: BoundaryMonitor,
-    lon_monitor: BoundaryMonitor,
-    buffer: u8,
-    scene_tracker: Arc<dyn SceneTracker>,
-    geo_index: Arc<GeoIndex>,
-}
-
-impl SceneryWindow {
-    /// Called each coordinator cycle. Returns boundary predictions if ready.
-    pub fn update(
-        &mut self,
-        position: (f64, f64),
-    ) -> Vec<BoundaryCrossing>;
-
-    /// Optionally refine predictions using track (enrichment, not required).
-    pub fn refine_with_track(
-        &self,
-        predictions: &mut Vec<BoundaryCrossing>,
-        track: f64,
-    );
-
-    /// Current window dimensions, if derived.
-    pub fn window_size(&self) -> Option<(usize, usize)>;
-
-    /// Whether the window model is ready for predictions.
-    pub fn is_ready(&self) -> bool;
-}
-```
+v2.0 specified rebuild detection: a FUSE burst covering more than half the
+window and centred on the aircraft (a teleport or rendering change) would clear
+the `PrefetchedRegion` and `RetainedRegion` layers and re-derive the window.
+**No code implements this today.** After a teleport, the box simply moves:
+regions at the new position are absent and are planned as new, and the old
+regions fall out of the retained area and are evicted. What is lost is only the
+immediate reset; regions marked `Prefetched` near the old position are not
+cleared until they leave the retained area.
 
 ---
 
 ## BoundaryStrategy
 
-Replaces `CruiseStrategy`. Takes boundary predictions from `SceneryWindow` and produces a concrete list of DDS tiles to prefetch.
-
-### Prediction Data
-
-```rust
-pub struct BoundaryCrossing {
-    /// Which axis is being crossed
-    pub axis: BoundaryAxis,        // Latitude or Longitude
-    /// The DSF coordinate of the first row/column to load
-    pub dsf_coord: i16,            // e.g., lat 50 or lon 5
-    /// How urgent (0.0 = distant, 1.0 = imminent)
-    pub urgency: f64,
-    /// How many DSF tiles deep to load (3 for rows, 2 for columns)
-    pub depth: u8,
-}
-
-pub enum BoundaryAxis {
-    Latitude,   // crossing triggers a ROW load (3 deep × 3-4 wide)
-    Longitude,  // crossing triggers a COLUMN load (2 deep × 3-4 wide)
-}
-```
+Despite the name, `BoundaryStrategy` no longer plans anything. Since PR #102 it
+holds the region lifecycle operations on the `PrefetchedRegion` layer: marking
+regions `InProgress` or `NoCoverage`, promoting them to `Prefetched` against
+the DDS disk (`promote_completed_regions`), reporting a region's disk state
+(`region_disk_state`), and evicting regions outside the retained area
+(`evict_non_retained`). The coordinator's `evaluate_stale_regions` uses
+`region_disk_state` to drive stale `InProgress` regions and the `Deferred`
+ladder. See [Region States](#region-states-geoindex-prefetchedregion-layer)
+for the state machine.
 
 ### Algorithm (historical — superseded)
 
@@ -854,20 +946,15 @@ For each BoundaryCrossing:
     8. Append to PrefetchPlan
 ```
 
-### Diagonal Flight
+### Diagonal Flight and Turns
 
-When both monitors trigger, both predictions appear in the list sorted by urgency. The more urgent axis goes first:
-
-```
-LatMonitor: urgency 0.85 (approaching north edge)
-LonMonitor: urgency 0.45 (approaching east edge)
-
-Plan order:
-  1. Lat row tiles (depth 0, 1, 2) — urgent
-  2. Lon column tiles (depth 0, 1, 2) — less urgent
-
-If backpressure reduces batch size, the most urgent axis is served first.
-```
+There is no per-axis prediction to order. On a diagonal track both axes of the
+box are biased forward (about 71/29 each at 45°), so the regions ahead on both
+axes are in the box at once. In a turn the bias swings with the track every
+cycle, and the regions the swing brings into the box are planned as new, which
+is why a turn can submit several strips' worth of tiles at once. Within a plan,
+tiles are submitted in plan order: there is no urgency or distance ordering
+(see [Per-Cycle Operation](#per-cycle-operation)).
 
 ### Interface
 
@@ -897,11 +984,18 @@ The trigger mode comes from `prefetch.mode` and nothing else:
 
 ```rust
 pub enum StrategyMode {
-    Aggressive,      // position-based trigger
-    Opportunistic,   // prefetch when the executor is quiet (default)
+    Aggressive,
+    Opportunistic,   // default
     Disabled,        // never prefetch
 }
 ```
+
+**`Aggressive` and `Opportunistic` currently behave identically.**
+`should_prefetch_now` returns `true` for both, and nothing else branches on the
+mode. The names describe triggers from earlier designs: the position trigger
+went with the boundary monitors (PR #102), and the "executor is quiet" trigger
+was the circuit breaker removed in PR #96. Backpressure and the sim state gates
+now apply in every mode, so in practice the setting is an on/off switch.
 
 ### Why there is no automatic selection
 
@@ -948,9 +1042,13 @@ The `GeoIndex` stores spatial state via type-keyed layers:
 | `RetainedRegion` (new) | DSF region | `()` | SceneryWindow (each cycle) |
 | `PrefetchedRegion` (new) | DSF region | `RegionState` | BoundaryStrategy (on submit/complete/eviction) |
 
-### DdsClient Integration
+### PrefetchLane Integration
 
-Prefetch jobs are submitted through the existing `DdsClient` trait with `Priority::Prefetch`. The priority queue ensures ON_DEMAND requests (FUSE) always jump ahead.
+The coordinator and prewarm submit tiles through `PrefetchLane` (see
+[Demand and prefetch lanes](#demand-and-prefetch-lanes)), never through
+`DdsClient`, which is the FUSE demand path. The earlier `DdsClient::prefetch`,
+`prefetch_with_cancellation`, `sender`, `executor_load` and `fuse_pressure` methods
+were removed. Isolation, not priority, now keeps FUSE ahead of prefetch.
 
 ### Backpressure
 
@@ -961,10 +1059,15 @@ compares it against the same thresholds:
 - Load > 50%: submit reduced batch (50%)
 - Load < 50%: full submission
 
-**`executor_load()`** is resource-pool utilisation: our own pipeline, meaning
-downloads, encoding and disk writes.
+**`PrefetchLane::load()`** is how saturated the prefetch lane's queue is: jobs
+waiting for admission against its `tile_generation` group size, clamped to 1.0.
+A lane busy with work it has admitted reads 0.0; it reaches 1.0 when a full
+group's worth is queued behind the running one. It is not the lane's pool
+utilisation, because a small lane's pools read full whenever it is productively
+busy, which deferred most cycles. The deferral log still names this figure
+`executor_load`.
 
-**`fuse_pressure()`** is demand on the mount: memory pinned by open virtual DDS
+**`PinnedTileBudget`'s pressure** is demand on the mount: memory pinned by open virtual DDS
 handles, as a fraction of the ceiling that bounds it. Added in
 [#246](https://github.com/samsoir/xearthlayer/issues/246).
 
@@ -980,7 +1083,7 @@ full rate into it was making that peak larger than it needed to be.
 Two earlier mechanisms do not cover this. `SimState::should_prefetch()` gates on
 `async_scenery_load_in_progress`, which reports X-Plane's own DSF loader rather
 than demand on us, and was never true during the flight that motivated the
-change. `executor_load()` misses cache-served reads as described above.
+change. Lane load misses cache-served reads as described above.
 
 Open handles rather than a read rate, deliberately. `open` and `release` reach
 the filesystem on every platform; reads do not. macOS serves virtual DDS through
@@ -1030,89 +1133,47 @@ The existing `TransitionThrottle` ramps prefetch from 25% to 100% over 30 second
 
 ### Configuration Options
 
+`docs/configuration.md` is the reference for every setting. The `[prefetch]`
+keys that exist today, with their defaults:
+
 ```ini
 [prefetch]
-# Master enable/disable for the prefetch system
-# Values: true, false
-# Default: true
-enabled = true
+enabled = true                 ; master switch
+mode = opportunistic           ; opportunistic | aggressive | disabled
+web_api_port = 8086            ; X-Plane Web API, for position and SimState
 
-# Strategy mode selection
-# Values:
-#   opportunistic - Prefetch when the executor is quiet (default)
-#   aggressive    - Position-based prefetch
-#   disabled      - Never prefetch
-# Default: opportunistic
-mode = opportunistic
+; Takeoff transition: hold, then ramp submission from 25% to 100% over 30 s
+takeoff_climb_ft = 1000
+takeoff_timeout_secs = 90
+landing_hysteresis_secs = 15
+ramp_duration_secs = 30
+ramp_start_fraction = 0.25
 
-# Maximum tiles per prefetch cycle
-# Caps tiles submitted in a single prefetch operation
-# Range: 500 - 10000
-# Default: 3000
-max_tiles_per_cycle = 3000
+; Region lifecycle
+window_buffer = 1              ; DSF regions retained beyond the box on each side
+stale_region_timeout = 120     ; seconds before an InProgress region is re-evaluated
 
-# Ground strategy ring radius (degrees)
-# Radius of prefetch ring when aircraft is on ground
-# Range: 0.5 - 2.0
-# Default: 1.0
-ground_ring_radius = 1.0
+; Prefetch box
+box_extent = 7.0               ; degrees per axis: ground extent, and cruise maximum
+box_max_bias = 0.8             ; forward fraction on the primary axis
 
-# ═══════════════════════════════════════════════════════════════════════════
-# BOUNDARY-DRIVEN PREFETCH SETTINGS
-# ═══════════════════════════════════════════════════════════════════════════
-# These control the boundary monitor behaviour during cruise flight.
-# Defaults are based on empirical research from 5 flight tests (10.5+ hours)
-# and match X-Plane 12's observed scenery loading patterns.
+; Prefetch lane capacity as a fraction of the capacity FUSE demand gets
+capacity_share = 0.35          ; 0.05 to 0.50
 
-# Distance from window edge to start prefetching (degrees)
-# When the aircraft is within this distance of the X-Plane window edge,
-# the boundary monitor triggers prefetch for the next row/column.
-# With the window only ~3° tall, the aircraft is typically 1-1.5° from
-# the nearest edge, so this should be set conservatively.
-# Range: 0.5 - 2.0
-# Default: 1.0
-trigger_distance = 1.0
-
-# DSF tiles deep per row/column load
-# ROW loads (latitude crossings): 3 rows deep (empirically observed)
-# COLUMN loads (longitude crossings): 2 cols deep (empirically observed)
-# This setting provides a base override. The system uses axis-specific
-# defaults if set to 0 (auto).
-# Range: 0 (auto), 1 - 5
-# Default: 0 (auto: 3 for rows, 2 for columns)
-load_depth = 0
-
-# Buffer around inferred X-Plane window (degrees)
-# Adds hysteresis to retention inference. Regions outside window + buffer
-# are considered evicted by X-Plane.
-# Range: 0 - 2
-# Default: 1
-window_buffer = 1
-
-# Seconds before InProgress region reverts to absent
-# Safety timeout for the two-phase commit. If tiles haven't confirmed
-# as cached within this time, the region is re-evaluated.
-# Range: 30 - 600
-# Default: 120
-stale_region_timeout = 120
-
-# Window latitude height (DSF rows)
-# X-Plane's scenery window is ~3° latitude at all latitudes.
-# Range: 2 - 5
-# Default: 3
-default_window_rows = 3
-
-# Window longitude width mode
-# "auto" computes longitude width dynamically: ceil(3 / cos(latitude))
-# This matches X-Plane's constant-physical-distance window (~330km).
-# A fixed integer value can be used as override.
-# Default: auto
-default_window_cols = auto
+cycle_interval_ms = 2000       ; INERT: parsed but never read, see below
 ```
+
+The cruise minimum extent (3.5°) and the speeds at either end of the ramp
+(40 kt and 450 kt) are constants in `config/defaults.rs`, not settings.
+
+**`cycle_interval_ms` has no effect.** It is parsed and carried into the
+orchestrator configuration, but the runner paces cycles with the
+`MIN_CYCLE_INTERVAL` constant (2 s) and never reads it. It is a removal
+candidate, like the keys retired in #249 and #277.
 
 ### Deprecated Settings
 
-The following settings from v1.x are deprecated and should be added to `DEPRECATED_KEYS` in `config/upgrade.rs`:
+Settings retired by earlier designs. All are in `DEPRECATED_KEYS` (`config/upgrade.rs`), so `xearthlayer config upgrade` removes them. The table records why for the v2.0 retirements; the v2.0 boundary-monitor keys (`trigger_distance`, `load_depth`, `default_window_rows`, `default_window_cols`, `max_tiles_per_cycle`, `ground_ring_radius`) were retired in turn by the sliding box:
 
 | Setting | Replacement | Reason |
 |---------|-------------|--------|
@@ -1132,45 +1193,39 @@ The following settings from v1.x are deprecated and should be added to `DEPRECAT
 
 ## Error Handling & Edge Cases
 
-### Window Not Yet Derived
+### Before the First Cycle
 
-During `Uninitialized` or `Measuring` states, the boundary monitors have no window edges. The coordinator falls through to:
-- `GroundStrategy` if on the ground
-- Skip prefetch if airborne (TransitionThrottle handles takeoff ramp)
+The box needs only position, track and ground speed, so prefetch can plan from
+the first telemetry sample; there is no window to derive first. On the ground
+the box is square and unbiased. During the Transition phase (takeoff) prefetch
+plans nothing, and once Cruise begins the `TransitionThrottle` ramps
+submission up.
 
 ### Ocean / Sparse Regions
 
-When the aircraft flies over areas with no XEL scenery coverage:
+Regions in the box with no tiles in the scenery index are marked `NoCoverage`
+and skipped. The box keeps moving with the aircraft over uncovered areas, so
+covered regions ahead enter it, and are planned, while the aircraft is still
+over water. That makes the **no-coverage to coverage** transition the same as
+any other: the coastline is prefetched before the aircraft reaches it.
 
-1. **FUSE activity drops** — X-Plane has nothing to request
-2. **Telemetry continues** — we know the aircraft is still flying
-3. **Monitors continue** — tracking position vs. window edges
-4. **SceneryIndex consulted for target regions** — if target regions ahead have coverage, prefetch them NOW even though the aircraft is over uncovered area
-5. **Uncovered target regions** → marked `NoCoverage`, skipped silently
+### Starting in a No-Coverage Area
 
-The critical transition is **no-coverage → coverage**: the monitors see the window edge approaching covered regions and prefetch them before the aircraft arrives.
-
-### Starting in No-Coverage Area
-
-If the aircraft spawns over ocean/polar with no scenery:
-1. No FUSE activity → cannot derive window dimensions
-2. Telemetry present → enter `Assumed` state with default window (6×8)
-3. Monitors operate with assumed dimensions
-4. When aircraft enters coverage and X-Plane loads → transition to `Measuring` → `Ready`
-5. Observed dimensions replace assumed dimensions
+Nothing special: the regions around the aircraft are `NoCoverage`, and covered
+regions are planned as soon as the box reaches them.
 
 ### Teleport / World Rebuild
 
-Detection: burst covers >50% of current window area AND is centered on aircraft (not at an edge).
+There is no rebuild detection (see [World Rebuild Detection](#world-rebuild-detection-not-implemented)).
+After a teleport the box is planned at the new position like any other, and
+the old position's regions are evicted once they fall outside the retained
+area.
 
-Response:
-1. Clear XEL Window and X-Plane Window from GeoIndex
-2. Reset to `Measuring` state
-3. Re-derive window dimensions from new load
+### Aircraft Stationary or Orbiting
 
-### Aircraft Stationary in Cruise
-
-Orbiting or circling: aircraft doesn't approach any edge → monitors don't trigger → idle. This is correct — no prefetch needed, the area is already covered.
+A stationary or orbiting aircraft keeps the box over the same regions. Once
+those are `InProgress` or `Prefetched` there is nothing new to plan, and
+cycles submit nothing, which is correct: the area is already covered.
 
 ### Stale Telemetry Safe Mode
 
@@ -1223,32 +1278,42 @@ If some tiles in a submitted region fail:
 
 | Component | Test Focus |
 |-----------|-----------|
-| `BoundaryMonitor` | Trigger at correct distance; no trigger when far; urgency calculation; both edges (north/south or east/west) |
-| `SceneryWindow` | Window derivation from tracker bounds (config-locked dimensions); retention inference with buffer; world rebuild detection; `Assumed` → `Ready` transition |
-| `BoundaryStrategy` | Row generation for lat crossing; column generation for lon crossing; diagonal (both monitors); set difference with XEL Window; depth ordering; `NoCoverage` handling; eviction of non-retained regions and cached tiles |
-| `RegionState` | Two-phase commit: absent → InProgress → Prefetched; timeout revert; `NoTiles` → `NoCoverage`; progress-based strikes → `Deferred` on the 20/30/40/60s ladder; `Deferred` expiry via `should_prefetch`; eviction on window departure |
+| `PrefetchBox` | Proportional bias at cardinal, diagonal and southern headings; constant total extent; region enumeration ahead and behind; `new_regions` skips tracked regions; retention covers the box and never evicts `Prefetched` regions |
+| `extent` | Speed ramp endpoints, clamping and midpoint |
+| `BoundaryStrategy` | `mark_in_progress` / `mark_no_coverage`; disk-verified promotion, including package-shipped tiles and region boundaries; `region_disk_state` counts; `evict_non_retained` preserves `InProgress` |
+| `RegionState` | absent → InProgress → Prefetched; timeout revert; `NoTiles` → `NoCoverage`; progress-based strikes → `Deferred` on the 20/30/40/60s ladder; `Deferred` expiry via `should_prefetch` |
+| `plan_executor` | Defer above 0.8 and halve above 0.5, from either executor load or FUSE pressure; transition throttle overflow; channel-full remainder kept as pending, never dropped |
+| `PhaseDetector`, `TransitionThrottle` | Phase transitions; ramp start, duration and reset on landing |
 | `GeoIndex layers` | RetainedRegion add/remove; PrefetchedRegion state transitions |
 
-### Integration Tests
+### Coordinator Scenarios
+
+These run the real coordinator against test doubles for the DDS client, disk
+checker and scenery index (`coordinator/test_support.rs`):
 
 | Scenario | Validates |
 |----------|-----------|
-| Straight flight north through 3 DSF boundaries | Rows prefetched in correct order, XEL Window grows |
-| Diagonal flight (NE) | Both monitors trigger, interleaved by urgency |
-| Turn from north to east | Lat monitor stops, lon monitor starts, no pause |
-| Scene start → initial load → first prefetch | Window derivation, `Assumed` → `Ready` |
-| Ocean → land transition | `NoCoverage` regions skipped, covered regions prefetched ahead |
-| Start over ocean with telemetry | `Assumed` state, default dimensions, transition on coverage |
-| Partial failure + timeout | Region reverts, re-evaluated, only failed tiles re-submitted |
-| Teleport | World rebuild detected, state reset, re-derive |
+| First cruise tick, then later ticks and a long flight | A plan on the first tick; no region planned twice; new plans as the box moves |
+| Cruise plan over covered terrain | Every tile of every intersecting region is planned, no cap |
+| Uncovered region in the box | Marked `NoCoverage`, nothing submitted |
+| Plan cut by the request channel | Remainder kept as pending and drained before any new plan |
+| Region split by the channel cut, then drained | Region marked once its last tile is submitted; the box is not re-planned (#296) |
+| Region partly cached | Cached and submitted tiles together complete it; not re-planned (#296) |
+| Region entirely cached | Reaches `Prefetched` through disk-verified promotion (#176) |
+| Deferred cycle, channel cap of one | No region marked before its tiles are submitted (#172) |
+| Stuck and slow regions | Deferral ladder, strike reset on progress, never `NoCoverage` while tiles exist (#226) |
+| Stationary aircraft over cached terrain | No promotions inflate the counters |
+| Scenery loading, replay, paused | Prefetch skips or continues as the sim state requires |
 
 ### Flight Test Validation
 
-Replay flight 5 (LFLL diagonal orbit) log data through the new system and verify:
-- Prefetch targets match DSF regions where FUSE cache misses actually occurred
-- No more "prefetch idle 90% of cycles"
-- Target Window regions overlap with actual X-Plane loading events
-- Both row and column loads are predicted before X-Plane triggers them
+Unit tests cannot show whether tiles arrive before X-Plane asks for them; only
+a flight can. The procedure and acceptance criteria are in
+[prefetch-flight-test-plan.md](prefetch-flight-test-plan.md). The default-level
+signals are the 60 s Prefetch sample (`regions_*` gauges and `fuse_generations`,
+which should fall during cruise) and the per-cycle `Prefetch cycle summary`
+line, where `tiles_planned` far above `tiles_submitted` cycle after cycle means
+plans are being cut by the request channel.
 
 ---
 
@@ -1270,3 +1335,5 @@ Replay flight 5 (LFLL diagonal orbit) log data through the new system and verify
 | 2.0 | March 2026 | Major revision: replaced band-based cruise strategy with boundary-driven model. Three-window architecture (X-Plane / XEL / Target). Dual boundary monitors (lat/lon). Removed CruiseStrategy, BandCalculator, BoundaryPrioritizer, TurnDetector. Added SceneryWindow with window derivation, retention inference, and `Assumed` state for no-coverage starts. Two-phase commit for region tracking. GeoIndex extended with RetainedRegion and PrefetchedRegion layers. Updated configuration (deprecated 7 settings, added 6 new). Based on whitepaper v1.1 findings from 5 flights / 10.5+ hours of data. |
 | 2.1 | March 2026 | **Window dimension and loading depth correction.** Empirical map-based measurement at EDDF/YPAD/WSSS revealed window is ~3° lat × ~3°/cos(lat) lon, not 9×9°. FUSE burst analysis (65 classified events with telemetry) confirmed asymmetric loading depth: ROW loads 3 deep (73%), COL loads 2 deep (64%), both 3-4 wide. Trigger distance ~1° from window edge. Updated defaults: `default_window_rows` 9→3, `default_window_cols` 9→auto, `trigger_distance` 3.0→1.0, `load_depth` 3→0 (auto: 3 rows, 2 cols). See whitepaper v1.2 for methodology. |
 | 2.2 | October 2026 | Removed throughput calibration and the `auto` mode (#277). Mode is configuration only; see [Strategy Mode](#strategy-mode). |
+| 2.3 | October 2026 | **Brought into line with the code.** The document still described the v2.0 boundary monitors, deleted in PR #102. Removed the monitor sections; rewrote the overview, goals, component diagram, module structure, per-cycle operation, throttling, retention, edge cases, configuration and testing strategy for the sliding box. Corrected the box extent to 3.5° to 7.0° (default `box_extent` 7.0). Recorded that world rebuild detection is not implemented, that `SceneryWindow` is dead code, and that `cycle_interval_ms` is inert. Documented that a region is marked once none of its tiles is outstanding, across drains (#296). |
+| 2.4 | October 2026 | **Demand and prefetch lanes (#296).** Prefetch moved out of the shared pipeline into its own lane behind the `PrefetchLane` trait, paused while FUSE waits on generation. Added the Demand and prefetch lanes section (no-harm contract, admission pause, always claim, cache probe, sizing, the lane contract), replaced the `DdsClient` integration and backpressure inputs, and added the lane and FUSE latency fields to the Prefetch sample. Added `prefetch.capacity_share`. |

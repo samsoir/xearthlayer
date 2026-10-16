@@ -354,10 +354,11 @@ Supporting reads:
   MB/thread measured, r = 0.939), and each excursion ratchets the glibc arena
   high-water mark — see *The arena ratchet* above. It is also one of the
   mechanisms behind candidate 1, since the DDS-disk write path queues onto the
-  same pool via `tokio::fs`. Since #227 the pool is capped at
-  `ResourcePoolConfig::blocking_threads_required()` — the CPU and disk I/O pool
-  capacities plus a reserve, 136 on a 32-core host — rather than tokio's 512
-  default. A trace reaching 512 means the cap is not being applied.
+  same pool via `tokio::fs`. Since #227 the pool is capped rather than left at
+  tokio's 512 default. Since #296 the cap is
+  `LaneSizing::blocking_threads_required()`: the CPU and disk I/O pool
+  capacities of both lanes plus a reserve, 173 on a 32-core host at the default
+  `prefetch.capacity_share`. A trace reaching 512 means the cap is not being applied.
 - **`tiles_done` per hour** is the load normaliser. Two traces at wildly
   different tile rates are not telling you about memory, they are telling you
   about workload.

@@ -23,10 +23,11 @@
 
 use crate::cache::adapters::{DdsDiskCacheBridge, DiskCacheBridge, MemoryCacheBridge};
 use crate::cache::MemoryCache;
+use crate::config::DEFAULT_PREFETCH_CAPACITY_SHARE;
 use crate::dds::DdsFormat;
 use crate::executor::{
-    AsyncProviderAdapter, DiskCacheAdapter, DownloadConfig, ExecutorCacheAdapter, NullDdsDiskCache,
-    NullDiskCache, TextureEncoderAdapter, TokioExecutor,
+    AsyncProviderAdapter, DiskCacheAdapter, DownloadConfig, ExecutorCacheAdapter, LaneSizing,
+    NullDdsDiskCache, NullDiskCache, TextureEncoderAdapter, TokioExecutor,
 };
 use crate::jobs::DefaultDdsJobFactory;
 use crate::metrics::MetricsClient;
@@ -35,6 +36,7 @@ use crate::runtime::{RuntimeConfig, XEarthLayerRuntime};
 use crate::texture::DdsTextureEncoder;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 // Type aliases for the concrete adapter types
 type ProviderAdapter = AsyncProviderAdapter<AsyncProviderType>;
@@ -69,6 +71,9 @@ pub struct RuntimeBuilder {
     /// Defaults to the executor's own defaults so an unconfigured builder
     /// behaves exactly as it did before #249 wired these keys.
     download_config: DownloadConfig,
+    /// `prefetch.capacity_share`: the prefetch lane's size relative to the
+    /// demand lane. Clamped to its range when the lanes are sized.
+    capacity_share: f64,
 }
 
 impl RuntimeBuilder {
@@ -95,6 +100,7 @@ impl RuntimeBuilder {
             runtime_handle: None,
             metrics_client: None,
             download_config: DownloadConfig::default(),
+            capacity_share: DEFAULT_PREFETCH_CAPACITY_SHARE,
         }
     }
 
@@ -126,6 +132,21 @@ impl RuntimeBuilder {
     pub fn with_download_config(mut self, download_config: DownloadConfig) -> Self {
         self.download_config = download_config;
         self
+    }
+
+    /// Sets `prefetch.capacity_share`, which sizes the prefetch lane.
+    pub fn with_capacity_share(mut self, share: f64) -> Self {
+        self.capacity_share = share;
+        self
+    }
+
+    /// The prefetch lane's download behaviour: the configured timeout and
+    /// retries, but its own HTTP semaphore, so prefetch can never hold a
+    /// connection permit a FUSE request is waiting for.
+    fn prefetch_download_config(demand: &DownloadConfig, sizing: &LaneSizing) -> DownloadConfig {
+        demand
+            .clone()
+            .with_http_semaphore(Arc::new(Semaphore::new(sizing.prefetch_http_permits)))
     }
 
     /// Sets the Tokio runtime handle for spawning tasks.
@@ -179,20 +200,30 @@ impl RuntimeBuilder {
         // Create disk cache adapter
         let disk_cache = Arc::new(DiskCacheAdapter::new(cache_dir, &self.provider_name));
 
-        let factory = Self::create_factory_with_disk_cache(
+        let sizing = LaneSizing::from_configured_share(self.capacity_share);
+        let demand_factory = Self::create_factory_with_disk_cache(
+            Arc::clone(&async_provider),
+            Arc::clone(&self.encoder),
+            Arc::clone(&cache_adapter),
+            Arc::clone(&disk_cache),
+            self.download_config.clone(),
+        );
+        let prefetch_factory = Self::create_factory_with_disk_cache(
             async_provider,
             Arc::clone(&self.encoder),
             Arc::clone(&cache_adapter),
             disk_cache,
-            self.download_config.clone(),
-        );
+            Self::prefetch_download_config(&self.download_config, &sizing),
+        )
+        .with_cache_probe();
 
         let null_dds_disk = Arc::new(NullDdsDiskCache);
         XEarthLayerRuntime::with_metrics_client(
-            factory,
+            Arc::new(demand_factory),
+            Arc::new(prefetch_factory),
             cache_adapter,
             null_dds_disk,
-            self.config,
+            self.config.with_sizing(sizing),
             runtime_handle,
             self.metrics_client,
         )
@@ -226,19 +257,28 @@ impl RuntimeBuilder {
             self.format,
         ));
 
-        let factory = Self::create_factory_without_disk_cache(
-            async_provider,
+        let sizing = LaneSizing::from_configured_share(self.capacity_share);
+        let demand_factory = Self::create_factory_without_disk_cache(
+            Arc::clone(&async_provider),
             Arc::clone(&self.encoder),
             Arc::clone(&cache_adapter),
             self.download_config.clone(),
         );
+        let prefetch_factory = Self::create_factory_without_disk_cache(
+            async_provider,
+            Arc::clone(&self.encoder),
+            Arc::clone(&cache_adapter),
+            Self::prefetch_download_config(&self.download_config, &sizing),
+        )
+        .with_cache_probe();
 
         let null_dds_disk = Arc::new(NullDdsDiskCache);
         XEarthLayerRuntime::with_metrics_client(
-            factory,
+            Arc::new(demand_factory),
+            Arc::new(prefetch_factory),
             cache_adapter,
             null_dds_disk,
-            self.config,
+            self.config.with_sizing(sizing),
             runtime_handle,
             self.metrics_client,
         )
@@ -251,22 +291,20 @@ impl RuntimeBuilder {
         cache_adapter: Arc<ExecutorCacheAdapter>,
         disk_cache: Arc<DiskCacheAdapter>,
         download_config: DownloadConfig,
-    ) -> Arc<
-        DefaultDdsJobFactory<
-            ProviderAdapter,
-            EncoderAdapter,
-            ExecutorCacheAdapter,
-            NullDdsDiskCache,
-            DiskCacheAdapter,
-            TokioExecutor,
-        >,
+    ) -> DefaultDdsJobFactory<
+        ProviderAdapter,
+        EncoderAdapter,
+        ExecutorCacheAdapter,
+        NullDdsDiskCache,
+        DiskCacheAdapter,
+        TokioExecutor,
     > {
         let provider_adapter = Arc::new(AsyncProviderAdapter::from_arc(async_provider));
         let encoder_adapter = Arc::new(TextureEncoderAdapter::new(encoder));
         let dds_disk_cache = Arc::new(NullDdsDiskCache);
         let executor = Arc::new(TokioExecutor::new());
 
-        Arc::new(DefaultDdsJobFactory::with_config(
+        DefaultDdsJobFactory::with_config(
             provider_adapter,
             encoder_adapter,
             cache_adapter,
@@ -274,7 +312,7 @@ impl RuntimeBuilder {
             disk_cache,
             executor,
             download_config,
-        ))
+        )
     }
 
     /// Creates a factory with NullDiskCache and NullDdsDiskCache.
@@ -283,15 +321,13 @@ impl RuntimeBuilder {
         encoder: Arc<DdsTextureEncoder>,
         cache_adapter: Arc<ExecutorCacheAdapter>,
         download_config: DownloadConfig,
-    ) -> Arc<
-        DefaultDdsJobFactory<
-            ProviderAdapter,
-            EncoderAdapter,
-            ExecutorCacheAdapter,
-            NullDdsDiskCache,
-            NullDiskCache,
-            TokioExecutor,
-        >,
+    ) -> DefaultDdsJobFactory<
+        ProviderAdapter,
+        EncoderAdapter,
+        ExecutorCacheAdapter,
+        NullDdsDiskCache,
+        NullDiskCache,
+        TokioExecutor,
     > {
         let provider_adapter = Arc::new(AsyncProviderAdapter::from_arc(async_provider));
         let encoder_adapter = Arc::new(TextureEncoderAdapter::new(encoder));
@@ -299,7 +335,7 @@ impl RuntimeBuilder {
         let disk_cache = Arc::new(NullDiskCache);
         let executor = Arc::new(TokioExecutor::new());
 
-        Arc::new(DefaultDdsJobFactory::with_config(
+        DefaultDdsJobFactory::with_config(
             provider_adapter,
             encoder_adapter,
             cache_adapter,
@@ -307,7 +343,7 @@ impl RuntimeBuilder {
             disk_cache,
             executor,
             download_config,
-        ))
+        )
     }
 
     /// Builds the XEarthLayerRuntime using the cache service architecture.
@@ -353,20 +389,31 @@ impl RuntimeBuilder {
 
         let dds_disk_for_daemon = Arc::clone(&dds_disk_bridge);
 
-        let factory = Self::create_factory_with_bridges(
+        let sizing = LaneSizing::from_configured_share(self.capacity_share);
+        let demand_factory = Self::create_factory_with_bridges(
+            Arc::clone(&async_provider),
+            Arc::clone(&self.encoder),
+            Arc::clone(&memory_bridge),
+            Arc::clone(&dds_disk_bridge),
+            Arc::clone(&disk_bridge),
+            self.download_config.clone(),
+        );
+        let prefetch_factory = Self::create_factory_with_bridges(
             async_provider,
             Arc::clone(&self.encoder),
             Arc::clone(&memory_bridge),
             dds_disk_bridge,
             disk_bridge,
-            self.download_config.clone(),
-        );
+            Self::prefetch_download_config(&self.download_config, &sizing),
+        )
+        .with_cache_probe();
 
         XEarthLayerRuntime::with_metrics_client(
-            factory,
+            Arc::new(demand_factory),
+            Arc::new(prefetch_factory),
             memory_bridge,
             dds_disk_for_daemon,
-            self.config,
+            self.config.with_sizing(sizing),
             runtime_handle,
             self.metrics_client,
         )
@@ -381,21 +428,19 @@ impl RuntimeBuilder {
         dds_disk_bridge: Arc<DdsDiskCacheBridge>,
         disk_bridge: Arc<DiskCacheBridge>,
         download_config: DownloadConfig,
-    ) -> Arc<
-        DefaultDdsJobFactory<
-            ProviderAdapter,
-            EncoderAdapter,
-            MemoryCacheBridge,
-            DdsDiskCacheBridge,
-            DiskCacheBridge,
-            TokioExecutor,
-        >,
+    ) -> DefaultDdsJobFactory<
+        ProviderAdapter,
+        EncoderAdapter,
+        MemoryCacheBridge,
+        DdsDiskCacheBridge,
+        DiskCacheBridge,
+        TokioExecutor,
     > {
         let provider_adapter = Arc::new(AsyncProviderAdapter::from_arc(async_provider));
         let encoder_adapter = Arc::new(TextureEncoderAdapter::new(encoder));
         let executor = Arc::new(TokioExecutor::new());
 
-        Arc::new(DefaultDdsJobFactory::with_config(
+        DefaultDdsJobFactory::with_config(
             provider_adapter,
             encoder_adapter,
             memory_bridge,
@@ -403,7 +448,7 @@ impl RuntimeBuilder {
             disk_bridge,
             executor,
             download_config,
-        ))
+        )
     }
 }
 
@@ -496,6 +541,34 @@ mod tests {
             builder.download_config.max_retries,
             DownloadConfig::default().max_retries
         );
+    }
+
+    #[test]
+    fn capacity_share_defaults_to_the_config_default() {
+        let builder = RuntimeBuilder::new("test", DdsFormat::BC1, create_test_encoder());
+        assert_eq!(builder.capacity_share, DEFAULT_PREFETCH_CAPACITY_SHARE);
+        let builder = builder.with_capacity_share(0.2);
+        assert_eq!(builder.capacity_share, 0.2);
+    }
+
+    /// #296: prefetch keeps the configured timeout and retries but must not
+    /// share the demand lane's HTTP semaphore.
+    #[test]
+    fn prefetch_download_config_has_its_own_http_semaphore() {
+        let builder = RuntimeBuilder::new("test", DdsFormat::BC1, create_test_encoder())
+            .with_download_config(DownloadConfig::new(Duration::from_secs(45), 7))
+            .with_capacity_share(0.35);
+        let sizing = LaneSizing::from_configured_share(builder.capacity_share);
+
+        let prefetch = RuntimeBuilder::prefetch_download_config(&builder.download_config, &sizing);
+
+        assert_eq!(prefetch.request_timeout, Duration::from_secs(45));
+        assert_eq!(prefetch.max_retries, 7);
+        assert_eq!(prefetch.http_capacity(), sizing.prefetch_http_permits);
+        assert!(!Arc::ptr_eq(
+            &prefetch.http_semaphore,
+            &builder.download_config.http_semaphore
+        ));
     }
 
     #[test]

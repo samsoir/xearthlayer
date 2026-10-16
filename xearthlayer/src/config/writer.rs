@@ -163,18 +163,18 @@ file = {}
 
 [prefetch]
 ; Enable predictive tile prefetching based on X-Plane telemetry (default: true)
-; Requires X-Plane to send ForeFlight data: Settings > Network > Send to ForeFlight
+; Telemetry comes from the X-Plane Web API (web_api_port); no X-Plane setup is needed
 enabled = {}
 ; Adaptive prefetch mode (default: opportunistic)
-;   opportunistic - Circuit breaker triggers (recommended)
-;   aggressive    - Position-based triggers (fast connections)
+;   opportunistic - Prefetch on (recommended)
+;   aggressive    - Currently identical to opportunistic
 ;   disabled      - Disable prefetch entirely
 mode = {}
 ; Web API port for X-Plane SimState polling (default: 8086, range: 1024-65535)
 web_api_port = {}
 
 ; Interval between prefetch cycles in milliseconds (default: 2000)
-; Higher values reduce prefetch aggressiveness
+; Currently has no effect: cycles run at a fixed 2 second interval
 cycle_interval_ms = {}
 
 ; Transition ramp settings (takeoff phase management)
@@ -189,14 +189,14 @@ ramp_duration_secs = {}
 ; Starting prefetch fraction when ramp begins (default: 0.25, range: 0.1-0.5)
 ramp_start_fraction = {}
 
-; Boundary-driven prefetch settings
-; Buffer tiles for retention beyond visible window (default: 1, range: 0-3)
+; Region lifecycle settings
+; Regions retained beyond the prefetch box on each side (default: 1, range: 0-3)
 window_buffer = {}
 ; InProgress staleness timeout in seconds (default: 120, range: 30-600)
 stale_region_timeout = {}
 
 ; Prefetch box settings (used by both ground and cruise phases)
-; Total prefetch box extent per axis in degrees (default: 7.0, range: 3.0-15.0)
+; Total prefetch box extent per axis in degrees (default: 7.0, range: 7.0-15.0)
 ; On the ground: used directly with symmetric bias, producing a square box centered on the aircraft.
 ; In cruise: the maximum of a speed-proportional ramp from box_min_extent, with heading bias.
 box_extent = {}
@@ -204,6 +204,11 @@ box_extent = {}
 ; Controls how much the prefetch box shifts forward in the direction of travel
 ; 0.5 = symmetric, 0.8 = 80% ahead / 20% behind on the primary axis
 box_max_bias = {}
+; Share of the machine given to prefetch, as a fraction of the capacity FUSE
+; demand gets (default: 0.35, range: 0.05-0.50). Prefetch never delays X-Plane's
+; own tile requests; this sets how much CPU it may use alongside the simulator.
+; Download connections are not limited by it. Lower it if prefetch costs frame rate.
+capacity_share = {}
 
 [prewarm]
 ; Settings for cold-start cache pre-warming.
@@ -281,6 +286,7 @@ congestion_threshold = {}
         config.prefetch.stale_region_timeout,
         config.prefetch.box_extent,
         config.prefetch.box_max_bias,
+        config.prefetch.capacity_share,
         config.prewarm.grid_rows,
         config.prewarm.grid_cols,
         config.patches.enabled,

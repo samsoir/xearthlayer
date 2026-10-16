@@ -122,6 +122,10 @@ pub const DEFAULT_BOX_EXTENT: f64 = 7.0;
 /// 0.8 means 80% ahead / 20% behind on the primary axis.
 pub const DEFAULT_BOX_MAX_BIAS: f64 = 0.8;
 
+/// Share of the demand lane's capacity given to the prefetch lane.
+/// The one sanctioned sizing knob; the pool formulas stay derived.
+pub const DEFAULT_PREFETCH_CAPACITY_SHARE: f64 = 0.35;
+
 /// Default minimum prefetch box extent (degrees) at low speed.
 ///
 /// Applied when aircraft ground speed is at or below `DEFAULT_BOX_MIN_SPEED`.
@@ -271,6 +275,7 @@ impl Default for ConfigFile {
                 stale_region_timeout: DEFAULT_PREFETCH_STALE_REGION_TIMEOUT,
                 box_extent: DEFAULT_BOX_EXTENT,
                 box_max_bias: DEFAULT_BOX_MAX_BIAS,
+                capacity_share: DEFAULT_PREFETCH_CAPACITY_SHARE,
             },
             control_plane: ControlPlaneSettings {
                 max_concurrent_jobs: default_max_concurrent_jobs(),

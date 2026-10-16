@@ -13,7 +13,7 @@ members = [
 # `develop/X.Y.Z` line it instead carries a pre-release identifier, which sorts
 # below the target release per semver, and is bumped to the dated X.Y.Z only at
 # stable promotion. See docs/dev/app-release-runbook.md.
-version = "0.5.0-dev.0"
+version = "0.5.0-dev.1"
 edition = "2021"
 authors = ["XEarthLayer Contributors"]
 license = "MIT"

@@ -26,7 +26,7 @@
 //!
 //! let coordinator = AdaptivePrefetchCoordinator::with_defaults()
 //!     .with_throttler(circuit_breaker)
-//!     .with_dds_client(dds_client);
+//!     .with_prefetch_lane(prefetch_lane);
 //!
 //! // Run the coordinator loop
 //! coordinator.run(shutdown_token).await;

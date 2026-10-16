@@ -95,6 +95,7 @@ pub enum ConfigKey {
     PrefetchStaleRegionTimeout,
     PrefetchBoxExtent,
     PrefetchBoxMaxBias,
+    PrefetchCapacityShare,
 
     // Prewarm settings
     PrewarmGridRows,
@@ -162,6 +163,7 @@ impl FromStr for ConfigKey {
             "prefetch.stale_region_timeout" => Ok(ConfigKey::PrefetchStaleRegionTimeout),
             "prefetch.box_extent" => Ok(ConfigKey::PrefetchBoxExtent),
             "prefetch.box_max_bias" => Ok(ConfigKey::PrefetchBoxMaxBias),
+            "prefetch.capacity_share" => Ok(ConfigKey::PrefetchCapacityShare),
 
             // Prewarm settings
             "prewarm.grid_rows" => Ok(ConfigKey::PrewarmGridRows),
@@ -224,6 +226,7 @@ impl ConfigKey {
             ConfigKey::PrefetchStaleRegionTimeout => "prefetch.stale_region_timeout",
             ConfigKey::PrefetchBoxExtent => "prefetch.box_extent",
             ConfigKey::PrefetchBoxMaxBias => "prefetch.box_max_bias",
+            ConfigKey::PrefetchCapacityShare => "prefetch.capacity_share",
             // Prewarm settings
             ConfigKey::PrewarmGridRows => "prewarm.grid_rows",
             ConfigKey::PrewarmGridCols => "prewarm.grid_cols",
@@ -345,6 +348,7 @@ impl ConfigKey {
             }
             ConfigKey::PrefetchBoxExtent => config.prefetch.box_extent.to_string(),
             ConfigKey::PrefetchBoxMaxBias => config.prefetch.box_max_bias.to_string(),
+            ConfigKey::PrefetchCapacityShare => config.prefetch.capacity_share.to_string(),
             // Prewarm settings
             ConfigKey::PrewarmGridRows => config.prewarm.grid_rows.to_string(),
             ConfigKey::PrewarmGridCols => config.prewarm.grid_cols.to_string(),
@@ -503,6 +507,9 @@ impl ConfigKey {
             ConfigKey::PrefetchBoxMaxBias => {
                 config.prefetch.box_max_bias = value.parse().unwrap();
             }
+            ConfigKey::PrefetchCapacityShare => {
+                config.prefetch.capacity_share = value.parse().unwrap();
+            }
             // Prewarm settings
             ConfigKey::PrewarmGridRows => {
                 config.prewarm.grid_rows = value.parse().unwrap();
@@ -591,6 +598,10 @@ impl ConfigKey {
             ConfigKey::PrefetchStaleRegionTimeout => Box::new(IntegerRangeSpec::new(30, 600)),
             ConfigKey::PrefetchBoxExtent => Box::new(FloatRangeSpec::new(7.0, 15.0)),
             ConfigKey::PrefetchBoxMaxBias => Box::new(FloatRangeSpec::new(0.5, 0.9)),
+            ConfigKey::PrefetchCapacityShare => Box::new(FloatRangeSpec::new(
+                crate::executor::MIN_PREFETCH_CAPACITY_SHARE,
+                crate::executor::MAX_PREFETCH_CAPACITY_SHARE,
+            )),
             // Prewarm settings
             ConfigKey::PrewarmGridRows => Box::new(PositiveIntegerSpec),
             ConfigKey::PrewarmGridCols => Box::new(PositiveIntegerSpec),
@@ -652,6 +663,7 @@ impl ConfigKey {
             ConfigKey::PrefetchStaleRegionTimeout,
             ConfigKey::PrefetchBoxExtent,
             ConfigKey::PrefetchBoxMaxBias,
+            ConfigKey::PrefetchCapacityShare,
             // Prewarm settings
             ConfigKey::PrewarmGridRows,
             ConfigKey::PrewarmGridCols,
@@ -1243,6 +1255,29 @@ mod tests {
         assert!(key.validate("0.5").is_ok());
         assert!(key.validate("0.05").is_err());
         assert!(key.validate("0.6").is_err());
+    }
+
+    #[test]
+    fn test_config_key_capacity_share_validation() {
+        let key: ConfigKey = "prefetch.capacity_share".parse().unwrap();
+        assert_eq!(key, ConfigKey::PrefetchCapacityShare);
+        assert!(key.validate("0.05").is_ok());
+        assert!(key.validate("0.35").is_ok());
+        assert!(key.validate("0.50").is_ok());
+        assert!(key.validate("0.04").is_err());
+        assert!(key.validate("0.51").is_err());
+        assert!(key.validate("abc").is_err());
+    }
+
+    #[test]
+    fn test_config_key_capacity_share_round_trip() {
+        let mut config = ConfigFile::default();
+        assert_eq!(ConfigKey::PrefetchCapacityShare.get(&config), "0.35");
+        ConfigKey::PrefetchCapacityShare
+            .set(&mut config, "0.2")
+            .unwrap();
+        assert_eq!(config.prefetch.capacity_share, 0.2);
+        assert_eq!(ConfigKey::PrefetchCapacityShare.get(&config), "0.2");
     }
 
     #[test]

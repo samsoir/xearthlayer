@@ -81,7 +81,7 @@ xearthlayer-cli
             │       ├── resource_pool (concurrency limiting)
             │       └── adapters (cache, provider bridges)
             ├── runtime (orchestration, health monitoring)
-            ├── jobs (DdsGenerateJob, TilePrefetchJob)
+            ├── jobs (DdsGenerateJob)
             ├── tasks (DownloadChunks, BuildAndCacheDds)
             ├── texture (DDS encoding)
             ├── cache (memory + disk)

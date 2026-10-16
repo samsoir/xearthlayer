@@ -350,6 +350,15 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
                     reason: "must be a number between 0.5 and 0.9".to_string(),
                 })?;
         }
+        if let Some(v) = section.get("capacity_share") {
+            config.prefetch.capacity_share =
+                v.parse().map_err(|_| ConfigFileError::InvalidValue {
+                    section: "prefetch".to_string(),
+                    key: "capacity_share".to_string(),
+                    value: v.to_string(),
+                    reason: "must be a number between 0.05 and 0.50".to_string(),
+                })?;
+        }
     }
 
     // [prewarm] section

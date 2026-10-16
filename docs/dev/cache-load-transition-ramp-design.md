@@ -372,11 +372,11 @@ At worst during ramp-up with moderate load: `0.25 × 0.5 = 12.5%` effective subm
 ### What Does NOT Change
 
 - **SimState detection** — still pauses prefetch during scene loading *(replaced CircuitBreaker in v0.4.0)*
-- **Executor backpressure** — still checks `executor_load()`
+- **Executor backpressure**: still checks the prefetch lane's load (`PrefetchLane::load()`, formerly `executor_load()`)
 - **Band calculator / strategies** — geometry unchanged
 - **BoundaryPrioritizer** — tile ordering unchanged
 - **Four-tier filter** — caching logic unchanged
-- **DdsClient / Executor** — submission mechanism unchanged
+- **Submission**: now through `PrefetchLane` (formerly `DdsClient`); the ramp is unchanged
 
 ---
 

@@ -32,16 +32,16 @@ use ratatui::{
     Frame,
 };
 use xearthlayer::metrics::TelemetrySnapshot;
-use xearthlayer::prefetch::PrefetchStatusSnapshot;
+use xearthlayer::prefetch::{resolve_state, PrefetchStatusSnapshot, StateInputs};
 use xearthlayer::runtime::{HealthSnapshot, RegionProgressEntry};
 use xearthlayer::update::UpdateInfo;
 
 use super::render_sections::inner_rect;
-use super::state::PrewarmProgress;
+use super::state::{PrefetchLaneConfig, PrewarmProgress};
 use super::utils::format_duration;
 use crate::ui::widgets::{
     AircraftPositionWidget, CacheConfig, CacheWidgetCompact, DiskHistory, InputOutputWidget,
-    NetworkHistory, PrefetchSystemWidget, SceneryHistory, ScenerySystemWidget,
+    LaneView, NetworkHistory, PrefetchSystemWidget, SceneryHistory, ScenerySystemWidget,
 };
 use xearthlayer::aircraft_position::AircraftPositionStatus;
 
@@ -69,6 +69,7 @@ pub fn render_ui(
     prewarm_spinner: Option<char>,
     tile_progress_entries: &[RegionProgressEntry],
     update_info: Option<&UpdateInfo>,
+    prefetch_lane: PrefetchLaneConfig,
 ) {
     let size = frame.area();
 
@@ -76,7 +77,7 @@ pub fn render_ui(
     let mut constraints = vec![
         Constraint::Length(3), // Header
         Constraint::Length(5), // Aircraft Position (3 content lines + border + padding)
-        Constraint::Length(4), // Prefetch System (2 content lines + border + padding)
+        Constraint::Length(5), // Prefetch System (3 content lines + border + padding)
         Constraint::Length(8), // Scenery System (3-column: REQUESTS | QUEUE | PROCESSING)
         Constraint::Length(8), // Input/Output (2-column)
         Constraint::Length(6), // Caches
@@ -99,7 +100,7 @@ pub fn render_ui(
     render_aircraft_position(frame, chunks[1], aircraft_position_status);
 
     // 3. Prefetch System (with restored padding)
-    render_prefetch_system(frame, chunks[2], prefetch_snapshot);
+    render_prefetch_system(frame, chunks[2], prefetch_snapshot, snapshot, prefetch_lane);
 
     // 4. Scenery System (3-column: REQUESTS | QUEUE | PROCESSING)
     let scenery_block = Block::default()
@@ -183,7 +184,13 @@ fn render_aircraft_position(frame: &mut Frame, area: Rect, status: &AircraftPosi
 }
 
 /// Render the prefetch system panel (new in v0.3.0).
-fn render_prefetch_system(frame: &mut Frame, area: Rect, prefetch: &PrefetchStatusSnapshot) {
+fn render_prefetch_system(
+    frame: &mut Frame,
+    area: Rect,
+    prefetch: &PrefetchStatusSnapshot,
+    telemetry: &TelemetrySnapshot,
+    lane_config: PrefetchLaneConfig,
+) {
     let block = Block::default()
         .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -195,10 +202,43 @@ fn render_prefetch_system(frame: &mut Frame, area: Rect, prefetch: &PrefetchStat
     frame.render_widget(block, area);
     let inner = inner_rect(area, 1, 1);
 
+    // The pause and the lane's occupancy are published by the metrics side;
+    // the coordinator cannot see either.
+    let lane_busy = prefetch.state_inputs.lane_busy
+        || telemetry.prefetch_lane_running > 0
+        || telemetry.prefetch_lane_queued > 0;
+    let state = resolve_state(StateInputs {
+        demand_paused: telemetry.prefetch_paused,
+        lane_busy,
+        ..prefetch.state_inputs
+    });
+    let lane = lane_view(telemetry, lane_config.group);
+
     frame.render_widget(
-        PrefetchSystemWidget::new(prefetch.prefetch_mode, prefetch.detailed_stats.as_ref()),
+        PrefetchSystemWidget::new(
+            &state,
+            prefetch.state_inputs.phase,
+            prefetch.detailed_stats.as_ref(),
+            lane,
+            telemetry.fuse_session_latency.as_ref(),
+            lane_config.generation_timeout,
+        )
+        .with_recent(telemetry.fuse_latency.as_ref())
+        .with_timeouts(telemetry.fuse_session_timeouts)
+        .with_cache_served(
+            telemetry.fuse_memory_cache_hits + telemetry.fuse_dds_disk_cache_hits,
+            telemetry.fuse_jobs_submitted,
+        ),
         inner,
     );
+}
+
+fn lane_view(telemetry: &TelemetrySnapshot, group: usize) -> LaneView {
+    LaneView {
+        running: telemetry.prefetch_lane_running,
+        group,
+        queued: telemetry.prefetch_lane_queued,
+    }
 }
 
 /// Render the quit confirmation overlay banner.
@@ -400,4 +440,21 @@ pub fn render_header(
         .alignment(ratatui::layout::Alignment::Right);
 
     frame.render_widget(uptime_text, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lane_view_shows_the_lanes_job_counts() {
+        let telemetry = TelemetrySnapshot {
+            prefetch_lane_load: 1.0,
+            prefetch_lane_running: 28,
+            prefetch_lane_queued: 1_904,
+            ..TelemetrySnapshot::default()
+        };
+        let lane = lane_view(&telemetry, 70);
+        assert_eq!((lane.running, lane.group, lane.queued), (28, 70, 1_904));
+    }
 }

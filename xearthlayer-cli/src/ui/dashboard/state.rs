@@ -5,6 +5,8 @@
 
 use std::time::{Duration, Instant};
 
+use xearthlayer::config::DEFAULT_GENERATION_TIMEOUT_SECS;
+
 /// Events that can occur in the dashboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DashboardEvent {
@@ -235,6 +237,17 @@ pub struct DashboardConfig {
     pub chunk_disk_cache_max: usize,
     /// Provider name for display (e.g., "Bing", "Google", "Go2").
     pub provider_name: String,
+    /// Prefetch lane sizing and the FUSE generation timeout, for the prefetch panel.
+    pub prefetch_lane: PrefetchLaneConfig,
+}
+
+/// What the prefetch panel needs to size and colour its lane and latency lines.
+#[derive(Debug, Clone, Copy)]
+pub struct PrefetchLaneConfig {
+    /// Concurrent prefetch tile jobs the lane allows (`LaneSizing::prefetch_tile_generation`).
+    pub group: usize,
+    /// FUSE generation timeout; latency turns red above it.
+    pub generation_timeout: Duration,
 }
 
 impl Default for DashboardConfig {
@@ -244,6 +257,10 @@ impl Default for DashboardConfig {
             dds_disk_cache_max: 12 * 1024 * 1024 * 1024,
             chunk_disk_cache_max: 8 * 1024 * 1024 * 1024,
             provider_name: "Unknown".to_string(),
+            prefetch_lane: PrefetchLaneConfig {
+                group: 0,
+                generation_timeout: Duration::from_secs(DEFAULT_GENERATION_TIMEOUT_SECS),
+            },
         }
     }
 }

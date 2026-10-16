@@ -124,19 +124,17 @@ XEarthLayer reduces scenery loading stutters by prefetching tiles ahead of your 
 
 ### How It Works
 
-**Flight Phase Detection**: The system automatically switches between strategies:
-   - **Ground Strategy**: Ring-based prefetch around your position (GS < 40kt)
-   - **Cruise Strategy**: Track-based band prefetch ahead of your flight path (GS > 40kt)
+A prefetch box moves with your aircraft and queues the scenery inside it before X-Plane asks for it. On the ground the box is centred on you (GS < 40kt); in cruise it grows with ground speed and shifts ahead in your direction of travel. Prefetch pauses during takeoff and ramps back up once you are climbing, and it yields whenever XEarthLayer or X-Plane is busy.
 
 ### Prefetch Modes
 
 Set with `xearthlayer config set prefetch.mode <mode>`.
 
-| Mode | Trigger | When Used |
-|------|---------|-----------|
-| **Opportunistic** | Executor load below threshold | Default, most users |
-| **Aggressive** | Position-based (0.3° into DSF tile) | Fast connections |
-| **Disabled** | Never | Slow connections or debugging |
+| Mode | Behaviour |
+|------|-----------|
+| **Opportunistic** | Prefetch on (default) |
+| **Aggressive** | Currently identical to Opportunistic |
+| **Disabled** | Never prefetch |
 
 ### Telemetry
 

@@ -35,7 +35,7 @@
 use crate::coord::TileCoord;
 use crate::executor::Priority;
 use bytes::Bytes;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -145,6 +145,11 @@ pub struct JobRequest {
 
     /// Origin of the request for telemetry.
     pub origin: RequestOrigin,
+
+    /// When the producer made the request. FUSE latency is measured from
+    /// here, not from when the daemon took it off the channel: X-Plane is
+    /// already waiting while the request is queued.
+    pub created: Instant,
 }
 
 impl JobRequest {
@@ -172,6 +177,7 @@ impl JobRequest {
             cancellation,
             response_tx: Some(tx),
             origin: RequestOrigin::Fuse,
+            created: Instant::now(),
         };
         (request, rx)
     }
@@ -191,25 +197,7 @@ impl JobRequest {
             cancellation: CancellationToken::new(),
             response_tx: None,
             origin: RequestOrigin::Prefetch,
-        }
-    }
-
-    /// Creates a prefetch request with a shared cancellation token.
-    ///
-    /// Useful when the prefetcher wants to cancel all pending requests
-    /// during shutdown.
-    ///
-    /// # Arguments
-    ///
-    /// * `tile` - The tile coordinates to generate
-    /// * `cancellation` - Shared cancellation token
-    pub fn prefetch_with_cancellation(tile: TileCoord, cancellation: CancellationToken) -> Self {
-        Self {
-            tile,
-            priority: Priority::PREFETCH,
-            cancellation,
-            response_tx: None,
-            origin: RequestOrigin::Prefetch,
+            created: Instant::now(),
         }
     }
 
@@ -229,6 +217,7 @@ impl JobRequest {
             cancellation: CancellationToken::new(),
             response_tx: Some(tx),
             origin: RequestOrigin::Prewarm,
+            created: Instant::now(),
         };
         (request, rx)
     }
@@ -248,6 +237,7 @@ impl JobRequest {
             cancellation: CancellationToken::new(),
             response_tx: Some(tx),
             origin: RequestOrigin::Manual,
+            created: Instant::now(),
         };
         (request, rx)
     }
@@ -404,17 +394,6 @@ mod tests {
         assert!(!request.expects_response());
         assert_eq!(request.origin, RequestOrigin::Prefetch);
         assert_eq!(request.priority, Priority::PREFETCH);
-    }
-
-    #[test]
-    fn test_prefetch_with_shared_cancellation() {
-        let token = CancellationToken::new();
-        let request = JobRequest::prefetch_with_cancellation(test_tile(), token.clone());
-
-        // Cancelling the token should reflect in the request
-        assert!(!request.cancellation.is_cancelled());
-        token.cancel();
-        assert!(request.cancellation.is_cancelled());
     }
 
     #[test]

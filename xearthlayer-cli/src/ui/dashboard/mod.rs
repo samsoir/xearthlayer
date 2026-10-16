@@ -39,7 +39,7 @@ use crate::ui::widgets::{CacheConfig, DiskHistory, NetworkHistory, SceneryHistor
 // Re-export public types from state module
 pub use state::{
     DashboardConfig, DashboardEvent, DashboardState, JobRates, LoadingPhase, LoadingProgress,
-    PrewarmProgress, QUIT_CONFIRM_TIMEOUT, SPINNER_FRAMES,
+    PrefetchLaneConfig, PrewarmProgress, QUIT_CONFIRM_TIMEOUT, SPINNER_FRAMES,
 };
 
 // Re-export utility functions
@@ -265,6 +265,7 @@ impl Dashboard {
                 prewarm_spinner,
                 &tile_progress_entries,
                 update_info,
+                self.config.prefetch_lane,
             );
         })?;
 

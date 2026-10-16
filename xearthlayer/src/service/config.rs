@@ -60,6 +60,10 @@ pub struct ServiceConfig {
     ///
     /// From `executor.max_retries`.
     chunk_max_retries: u32,
+    /// Prefetch lane capacity as a fraction of the demand lane's.
+    ///
+    /// From `prefetch.capacity_share`.
+    prefetch_capacity_share: f64,
 }
 
 impl ServiceConfig {
@@ -71,6 +75,11 @@ impl ServiceConfig {
     /// Get the texture configuration.
     pub fn texture(&self) -> &TextureConfig {
         &self.texture
+    }
+
+    /// Prefetch lane capacity as a fraction of the demand lane's.
+    pub fn prefetch_capacity_share(&self) -> f64 {
+        self.prefetch_capacity_share
     }
 
     /// Per-chunk HTTP request timeout in seconds.
@@ -161,7 +170,7 @@ impl Default for ServiceConfig {
             default_max_concurrent_jobs, DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
             DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
             DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS, DEFAULT_MAX_RETRIES,
-            DEFAULT_REQUEST_TIMEOUT_SECS,
+            DEFAULT_PREFETCH_CAPACITY_SHARE, DEFAULT_REQUEST_TIMEOUT_SECS,
         };
         Self {
             texture: TextureConfig::default(),
@@ -183,6 +192,7 @@ impl Default for ServiceConfig {
             },
             chunk_request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             chunk_max_retries: DEFAULT_MAX_RETRIES,
+            prefetch_capacity_share: DEFAULT_PREFETCH_CAPACITY_SHARE,
         }
     }
 }
@@ -205,6 +215,7 @@ pub struct ServiceConfigBuilder {
     quiet_mode: Option<bool>,
     chunk_request_timeout_secs: Option<u64>,
     chunk_max_retries: Option<u32>,
+    prefetch_capacity_share: Option<f64>,
     control_plane: Option<ControlPlaneSettings>,
 }
 
@@ -218,6 +229,12 @@ impl ServiceConfigBuilder {
     /// Set the per-chunk HTTP request timeout in seconds.
     pub fn chunk_request_timeout_secs(mut self, secs: u64) -> Self {
         self.chunk_request_timeout_secs = Some(secs);
+        self
+    }
+
+    /// Set the prefetch lane capacity as a fraction of the demand lane's.
+    pub fn prefetch_capacity_share(mut self, share: f64) -> Self {
+        self.prefetch_capacity_share = Some(share);
         self
     }
 
@@ -325,6 +342,9 @@ impl ServiceConfigBuilder {
                 .chunk_request_timeout_secs
                 .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
             chunk_max_retries: self.chunk_max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
+            prefetch_capacity_share: self
+                .prefetch_capacity_share
+                .unwrap_or(crate::config::DEFAULT_PREFETCH_CAPACITY_SHARE),
         }
     }
 }
@@ -389,6 +409,15 @@ mod tests {
     fn test_builder_cache_disabled() {
         let config = ServiceConfig::builder().cache_enabled(false).build();
         assert!(!config.cache_enabled());
+    }
+
+    #[test]
+    fn test_prefetch_capacity_share_default_and_override() {
+        assert_eq!(ServiceConfig::default().prefetch_capacity_share(), 0.35);
+        let config = ServiceConfig::builder()
+            .prefetch_capacity_share(0.2)
+            .build();
+        assert_eq!(config.prefetch_capacity_share(), 0.2);
     }
 
     #[test]

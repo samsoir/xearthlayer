@@ -262,44 +262,48 @@ The base delay is not configurable.
 
 Controls the Adaptive Prefetch System, which pre-loads tiles ahead of the aircraft to reduce FPS drops during flight.
 
-**Adaptive Prefetch Architecture (v0.3.0+):**
+**How it works:**
 
-The system uses flight phase detection:
+A prefetch box moves with the aircraft, biased in the direction of travel. Every cycle (about every 2 seconds), the 1°×1° scenery regions inside the box that have not been prefetched yet are expanded to their tiles and queued for generation. The box is larger than X-Plane's own ~3° scenery window, so the scenery X-Plane loads next is already cached when it asks for it.
 
-1. **Flight Phase Strategies**:
-   - **Ground Strategy**: Ring-based prefetch around position (GS < 40kt, AGL < 20ft)
-   - **Cruise Strategy**: Boundary-driven row/column prefetch using SceneryWindow and BoundaryMonitor (GS > 40kt)
+- **On the ground** (GS < 40kt) the box is square, `box_extent` on each side, centred on the aircraft.
+- **During takeoff** nothing is prefetched, then submission ramps up (see Transition Ramp).
+- **In cruise** the box grows with ground speed, from 3.5° at 40kt to `box_extent` at 450kt, and shifts forward in the direction of travel by up to `box_max_bias`.
 
-2. **Mode Selection**: Set by `mode`. Nothing chooses a mode automatically; `opportunistic` is the default and the setting every recent release has been tuned against.
+Prefetch yields when XEarthLayer is busy or X-Plane is reading heavily, and pauses while X-Plane is loading scenery, in replay, or when telemetry stops.
+
+**Prefetch never delays X-Plane.** Prefetch runs in its own lane, with its own download, CPU and disk pools, so it does not compete with the tiles X-Plane asks for. While X-Plane is waiting on a tile to be generated, the prefetch lane admits no new work; work already admitted finishes, and queued work resumes when X-Plane's requests are served. The lane is added on top of the capacity FUSE demand gets, scaled by `capacity_share`. It no longer competes with X-Plane's requests, but it does compete with the simulator itself for CPU, so lower `capacity_share` if prefetch costs frame rate.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable/disable predictive tile prefetching |
-| `mode` | string | `opportunistic` | Mode selection: `aggressive`, `opportunistic`, `disabled` |
+| `mode` | string | `opportunistic` | `opportunistic`, `aggressive` or `disabled`. See Mode Options |
 | `web_api_port` | integer | `8086` | X-Plane Web API port for telemetry and sim state (1024-65535) |
-| `max_tiles_per_cycle` | integer | `200` | Maximum tiles to submit per prefetch cycle |
-| `cycle_interval_ms` | integer | `2000` | Interval between prefetch cycles (milliseconds) |
+| `cycle_interval_ms` | integer | `2000` | **Currently has no effect**: cycles run at a fixed 2 second interval |
 | `takeoff_climb_ft` | float | `1000` | Altitude climb (ft) above takeoff MSL to release transition hold (200-5000) |
 | `takeoff_timeout_secs` | integer | `90` | Maximum seconds before timeout release (30-300) |
 | `landing_hysteresis_secs` | integer | `15` | Sustained seconds at GS < 40kt before landing detection (5-60) |
 | `ramp_duration_secs` | integer | `30` | Duration of linear ramp to full prefetch rate (10-120) |
 | `ramp_start_fraction` | float | `0.25` | Starting prefetch fraction when ramp begins (0.1-0.5) |
-| `box_extent` | float | `9.0` | Prefetch box extent per axis in degrees (7.0-15.0). X-Plane loads ~6×6 DSF; 9° covers with 1.5° overlap |
-| `box_max_bias` | float | `0.8` | Maximum forward bias fraction (0.5-0.9). 0.5 = symmetric, 0.8 = 80/20 at cardinal headings |
-| `window_buffer` | integer | `1` | Extra DSF tiles around window edges to retain (0-3) |
+| `box_extent` | float | `7.0` | Prefetch box size per axis in degrees (7.0-15.0): the ground box, and the cruise maximum. 7° covers up to 7×7 regions, well beyond X-Plane's ~3° window |
+| `box_max_bias` | float | `0.8` | Maximum forward bias fraction (0.5-0.9). 0.5 = symmetric, 0.8 = 80% ahead and 20% behind at cardinal headings |
+| `capacity_share` | float | `0.35` | Prefetch capacity as a fraction of the capacity FUSE demand gets (0.05-0.50). Prefetch never delays X-Plane tile requests; lower this if prefetch costs frame rate |
+| `window_buffer` | integer | `1` | Regions kept beyond the box on each side before their prefetch state is forgotten (0-3) |
 | `stale_region_timeout` | integer | `120` | Seconds before an InProgress region is considered stale (30-600) |
-| `default_window_rows` | integer | `3` | Scenery window height in DSF rows — ~3° at all latitudes (2-12) |
-| `window_lon_extent` | float | `3.0` | Longitude extent in degrees for window column computation (1.0-10.0) |
 
 **Mode Options:**
 
-| Mode | Trigger | When Used |
-|------|---------|-----------|
-| `opportunistic` | Executor backpressure (default) | Most users |
-| `aggressive` | Position-based (0.3° into DSF tile) | Fast connections |
-| `disabled` | Never | Slow connections or debugging |
+| Mode | Behaviour |
+|------|-----------|
+| `opportunistic` | Prefetch on (default) |
+| `aggressive` | Currently identical to `opportunistic` |
+| `disabled` | Never prefetch |
+
+`opportunistic` and `aggressive` once used different triggers; both triggers belonged to earlier designs and have been removed, so the two modes now behave the same.
 
 `auto` was accepted before v0.5.0. It deferred to a throughput calibration that never ran, so it always behaved as `opportunistic`. Older config files that still say `mode = auto` load as `opportunistic`, and `xearthlayer config upgrade` rewrites the value.
+
+`max_tiles_per_cycle`, `default_window_rows` and `window_lon_extent` belonged to earlier designs and are no longer read; `xearthlayer config upgrade` removes them.
 
 **Example:**
 ```ini
@@ -308,10 +312,6 @@ enabled = true
 mode = opportunistic           ; aggressive, opportunistic, disabled
 ; web_api_port = 8086
 
-; Rate limiting
-max_tiles_per_cycle = 3000     ; Tiles per cycle
-cycle_interval_ms = 2000       ; Cycle interval (ms)
-
 ; Transition ramp (takeoff phase management)
 takeoff_climb_ft = 1000                      ; Feet above takeoff MSL to release hold
 takeoff_timeout_secs = 90                    ; Max seconds before timeout release
@@ -319,18 +319,21 @@ landing_hysteresis_secs = 15                 ; Sustained GS < 40kt for landing d
 ramp_duration_secs = 30                      ; Linear ramp duration after hold release
 ramp_start_fraction = 0.25                   ; Starting prefetch fraction (25%)
 
-; Boundary-driven prefetch (cruise mode)
-; window_buffer = 1                          ; Extra DSF tiles around window edges
+; Capacity of the prefetch lane as a fraction of the capacity FUSE demand gets
+; capacity_share = 0.35                      ; 0.05-0.50
+
+; Prefetch box
+; box_extent = 7.0                           ; Degrees per axis (ground box, cruise maximum)
+; box_max_bias = 0.8                         ; Forward bias on the primary axis
+; window_buffer = 1                          ; Regions retained beyond the box
 ; stale_region_timeout = 120                 ; Seconds before InProgress region is stale
-; default_window_rows = 3                    ; Scenery window height (DSF rows, ~3° worldwide)
-; window_lon_extent = 3.0                    ; Longitude extent (degrees) for column computation
 ```
 
 **Transition Ramp:**
 
 The prefetch system uses a three-phase flight model to manage system resources during critical flight phases:
 
-- **Ground** (GS < 40kt): Full-rate prefetch using ring strategy around current position
+- **Ground** (GS < 40kt): Full-rate prefetch using a square box centred on the aircraft
 - **Transition** (GS >= 40kt, climbing): Prefetch fully suppressed while X-Plane loads takeoff scenery
 - **Cruise** (climb confirmed): Prefetch ramps from `ramp_start_fraction` to full rate over `ramp_duration_secs`
 
@@ -500,14 +503,10 @@ timeout = 10
 ; max_retries = 3                  ; Download retry attempts
 
 [prefetch]
-; Adaptive Prefetch System (v0.3.0+)
+; Adaptive Prefetch System
 enabled = true
 mode = opportunistic           ; aggressive, opportunistic, disabled
 ; web_api_port = 8086
-
-; Rate limiting
-; max_tiles_per_cycle = 3000   ; tiles per cycle
-; cycle_interval_ms = 2000     ; cycle interval (ms)
 
 ; Transition ramp (takeoff phase management)
 ; takeoff_climb_ft = 1000                    ; feet above takeoff MSL to release
@@ -516,11 +515,14 @@ mode = opportunistic           ; aggressive, opportunistic, disabled
 ; ramp_duration_secs = 30                    ; linear ramp duration after release
 ; ramp_start_fraction = 0.25                 ; starting prefetch fraction
 
-; Boundary-driven prefetch (cruise mode)
-; window_buffer = 1                          ; extra DSF tiles around window edges
+; Capacity of the prefetch lane as a fraction of the capacity FUSE demand gets
+capacity_share = 0.35                        ; 0.05-0.50
+
+; Prefetch box
+; box_extent = 7.0                           ; degrees per axis (ground box, cruise maximum)
+; box_max_bias = 0.8                         ; forward bias on the primary axis
+; window_buffer = 1                          ; regions retained beyond the box
 ; stale_region_timeout = 120                 ; seconds before InProgress region is stale
-; default_window_rows = 3                    ; scenery window height (DSF rows)
-; window_lon_extent = 3.0                    ; longitude extent for column computation
 
 [prewarm]
 ; Cold-start cache pre-warming (use with --airport ICAO)
@@ -642,17 +644,17 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `prefetch.enabled` | `true`, `false` | Enable predictive prefetching |
 | `prefetch.mode` | `aggressive`, `opportunistic`, `disabled` | Prefetch mode (default `opportunistic`) |
 | `prefetch.web_api_port` | 1024-65535 | X-Plane Web API port for telemetry and sim state |
-| `prefetch.max_tiles_per_cycle` | positive integer | Max tiles per prefetch cycle |
-| `prefetch.cycle_interval_ms` | positive integer | Prefetch cycle interval (ms) |
+| `prefetch.cycle_interval_ms` | positive integer | Prefetch cycle interval (ms); currently has no effect |
 | `prefetch.takeoff_climb_ft` | 200-5000 | Feet above takeoff MSL to release hold |
 | `prefetch.takeoff_timeout_secs` | 30-300 | Max seconds before timeout release |
 | `prefetch.landing_hysteresis_secs` | 5-60 | Sustained GS < 40kt for landing detection |
 | `prefetch.ramp_duration_secs` | 10-120 | Linear ramp duration (seconds) |
 | `prefetch.ramp_start_fraction` | 0.1-0.5 | Starting prefetch fraction |
-| `prefetch.window_buffer` | 0-3 | Extra DSF tiles around window edges |
+| `prefetch.window_buffer` | 0-3 | Regions retained beyond the prefetch box on each side |
 | `prefetch.stale_region_timeout` | 30-600 | Seconds before InProgress region is stale |
-| `prefetch.default_window_rows` | 2-12 | Scenery window height (DSF rows) |
-| `prefetch.window_lon_extent` | 1.0-10.0 | Longitude extent (degrees) for column computation |
+| `prefetch.box_extent` | 7.0-15.0 | Prefetch box degrees per axis (ground box, cruise maximum) |
+| `prefetch.box_max_bias` | 0.5-0.9 | Forward bias fraction on the primary axis |
+| `prefetch.capacity_share` | 0.05-0.50 | Prefetch capacity as a fraction of demand capacity |
 | `prewarm.grid_rows` | positive integer | Latitude extent in DSF tiles for prewarm |
 | `prewarm.grid_cols` | positive integer | Longitude extent in DSF tiles for prewarm |
 | `xplane.scenery_dir` | path | X-Plane Custom Scenery directory |

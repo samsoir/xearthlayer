@@ -54,10 +54,10 @@ pub use condition::{
 };
 pub use error::PrefetchError;
 pub use listener::TelemetryListener;
-pub use state::CircuitState;
 pub use state::{
-    AircraftSnapshot, AircraftState, BoxBoundsSnapshot, DetailedPrefetchStats, GpsStatus,
-    PrefetchMode, PrefetchStatsSnapshot, PrefetchStatusSnapshot, SharedPrefetchStatus,
+    resolve_state, AircraftSnapshot, AircraftState, BoxBoundsSnapshot, DetailedPrefetchStats,
+    GpsStatus, PrefetchState, PrefetchStatsSnapshot, PrefetchStatusSnapshot, SharedPrefetchStatus,
+    StateInputs,
 };
 pub use strategy::Prefetcher;
 
@@ -88,7 +88,7 @@ pub use scenery_cache::{
 pub use tile_based::DsfTileCoord;
 
 // Adaptive prefetch (DSF-aligned, phase-aware)
-pub use adaptive::{AdaptivePrefetchConfig, AdaptivePrefetchCoordinator};
+pub use adaptive::{AdaptivePrefetchConfig, AdaptivePrefetchCoordinator, FlightPhase};
 
 // Prefetch state divergence detection (FUSE-side, #176)
 pub use state_observer::PrefetchStateObserver;

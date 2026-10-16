@@ -32,7 +32,7 @@
 //! ├── strategy.rs             # AdaptivePrefetchStrategy trait
 //! ├── boundary_strategy.rs    # Region lifecycle management (#58)
 //! ├── phase_detector.rs       # Ground/cruise detection
-//! ├── scenery_window.rs       # X-Plane scenery window model
+//! ├── scenery_window.rs       # Window config holder (unused; see design doc)
 //! ├── transition_throttle.rs  # Takeoff ramp-up throttle (#62)
 //! └── coordinator/            # Central orchestration
 //! ```

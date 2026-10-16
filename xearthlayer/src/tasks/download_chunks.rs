@@ -120,6 +120,10 @@ where
         );
         Box::pin(
             async move {
+                if crate::tasks::cached_tile_probe::tile_already_cached(ctx) {
+                    return TaskResult::Success;
+                }
+
                 // Check for cancellation before starting
                 if ctx.is_cancelled() {
                     return TaskResult::Cancelled;
@@ -480,6 +484,69 @@ mod tests {
     #[test]
     fn test_task_name() {
         assert_eq!("DownloadChunks", "DownloadChunks");
+    }
+
+    struct PanickingProvider;
+    impl ChunkProvider for PanickingProvider {
+        fn download_chunk(
+            &self,
+            _row: u32,
+            _col: u32,
+            _zoom: u8,
+        ) -> impl Future<Output = Result<Bytes, crate::executor::ChunkDownloadError>> + Send
+        {
+            async { panic!("provider must not be called for a cached tile") }
+        }
+        fn name(&self) -> &str {
+            "panicking"
+        }
+    }
+
+    struct PanickingDiskCache;
+    impl DiskCache for PanickingDiskCache {
+        fn get(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            _cr: u8,
+            _cc: u8,
+        ) -> impl Future<Output = Option<Bytes>> + Send {
+            async { panic!("chunk cache must not be read for a cached tile") }
+        }
+        fn put(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            _cr: u8,
+            _cc: u8,
+            _d: Bytes,
+        ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+            async { panic!("chunk cache must not be written for a cached tile") }
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_tile_probe_hit_skips_the_download() {
+        use crate::executor::JobId;
+        use tokio_util::sync::CancellationToken;
+
+        let task = DownloadChunksTask::new(
+            TileCoord {
+                row: 100,
+                col: 200,
+                zoom: 15,
+            },
+            Arc::new(PanickingProvider),
+            Arc::new(PanickingDiskCache),
+        );
+        let mut ctx = TaskContext::new(JobId::new("test-job"), CancellationToken::new());
+        let mut probe = TaskOutput::new();
+        probe.set(crate::tasks::TILE_CACHED_KEY, true);
+        ctx.add_task_output(crate::tasks::CACHED_TILE_PROBE_TASK.to_string(), probe);
+
+        assert!(matches!(task.execute(&mut ctx).await, TaskResult::Success));
     }
 
     #[test]

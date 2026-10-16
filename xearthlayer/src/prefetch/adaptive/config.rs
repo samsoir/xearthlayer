@@ -81,7 +81,7 @@ pub struct AdaptivePrefetchConfig {
     ///
     /// Default 7.0° produces a 7×7 DSF grid (49 tiles) at full extent —
     /// comfortably beyond X-Plane's ~3° scenery window.
-    /// Range: 3.0 - 15.0
+    /// Range: 7.0 - 15.0 (enforced by `ConfigKey` validation)
     pub box_extent: f64,
 
     /// Maximum forward bias fraction (0.5 = symmetric, 0.8 = 80/20).

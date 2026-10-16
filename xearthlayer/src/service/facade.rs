@@ -9,9 +9,12 @@ use crate::cache::adapters::MemoryCacheBridge;
 use crate::cache::GcSchedulerDaemon;
 use crate::executor::DdsClient;
 use crate::metrics::{MetricsSystem, TelemetrySnapshot, TuiReporter};
+use crate::pinned_budget::PinnedTileBudget;
 use crate::prefetch::TileRequestCallback;
 use crate::provider::ProviderConfig;
-use crate::runtime::{SharedRuntimeHealth, SharedTileProgressTracker, XEarthLayerRuntime};
+use crate::runtime::{
+    PrefetchLane, SharedRuntimeHealth, SharedTileProgressTracker, XEarthLayerRuntime,
+};
 use crate::texture::{DdsTextureEncoder, TextureEncoder};
 use std::sync::Arc;
 use tokio::runtime::{Handle, Runtime};
@@ -154,6 +157,7 @@ impl XEarthLayerService {
         .with_runtime_handle(runtime_handle.clone())
         .with_metrics_client(metrics_client)
         .with_download_config(config.chunk_download_config())
+        .with_capacity_share(config.prefetch_capacity_share())
         .build_with_cache_service(
             cache_layer.memory_bridge(),
             cache_layer.dds_disk_bridge(),
@@ -162,13 +166,15 @@ impl XEarthLayerService {
 
         let dds_client = xel_runtime.dds_client();
 
-        // 7. Create and spawn GC scheduler daemons (one per disk tier)
+        // 7. Create and spawn GC scheduler daemons (one per disk tier).
+        // GC is housekeeping, so it runs on the prefetch lane and never
+        // competes with FUSE for the demand lane's pools.
         let gc_shutdown = CancellationToken::new();
         let mut gc_scheduler_handles = Vec::new();
 
         // Chunk disk GC daemon
         if let Some(chunk_provider) = cache_layer.disk_provider() {
-            let job_submitter = xel_runtime.job_submitter();
+            let job_submitter = xel_runtime.prefetch_lane().job_submitter();
             let lru_index = chunk_provider.lru_index();
             let cache_dir = chunk_provider.directory().to_path_buf();
             let max_size = chunk_provider.max_size_bytes();
@@ -186,7 +192,7 @@ impl XEarthLayerService {
 
         // DDS disk GC daemon
         if let Some(dds_provider) = cache_layer.dds_disk_provider() {
-            let job_submitter = xel_runtime.job_submitter();
+            let job_submitter = xel_runtime.prefetch_lane().job_submitter();
             let lru_index = dds_provider.lru_index();
             let cache_dir = dds_provider.directory().to_path_buf();
             let max_size = dds_provider.max_size_bytes();
@@ -420,14 +426,20 @@ impl XEarthLayerService {
         self.dds_client.clone()
     }
 
-    /// Get the executor's resource pools for utilization monitoring.
+    /// Get the prefetch lane for background tile work (#296).
     ///
     /// Returns `None` if the runtime has not been started yet.
-    /// Used by the circuit breaker to trip on pool saturation.
-    pub fn resource_pools(&self) -> Option<Arc<crate::executor::ResourcePools>> {
+    pub fn prefetch_lane(&self) -> Option<Arc<dyn PrefetchLane>> {
         self.xearthlayer_runtime
             .as_ref()
-            .map(|r| r.resource_pools())
+            .map(|r| r.prefetch_lane() as Arc<dyn PrefetchLane>)
+    }
+
+    /// Get the pinned-tile budget the FUSE mount accounts against (#246).
+    ///
+    /// Returns `None` if the runtime has not been started yet.
+    pub fn pinned_budget(&self) -> Option<Arc<PinnedTileBudget>> {
+        self.xearthlayer_runtime.as_ref().map(|r| r.pinned_budget())
     }
 
     /// Set the tile request callback for FUSE-based position inference.
