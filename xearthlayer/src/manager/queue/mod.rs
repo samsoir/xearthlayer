@@ -6,6 +6,7 @@
 
 mod job;
 mod ledger;
+mod lock;
 mod stages;
 mod state;
 mod worker;
@@ -23,6 +24,9 @@ use crate::manager::installer::InstallResult;
 
 pub use job::{CancelResult, Job, JobEvent, JobId, JobKind, JobOutcome, JobSummary, QueueObserver};
 pub use stages::{InstallContext, Stages};
+
+#[cfg(test)]
+pub(crate) use lock::LOCK_FILE_NAME;
 
 /// What a signal handler or a UI needs to stop a queue it does not own.
 pub trait QueueControl: Send + Sync {
@@ -67,10 +71,14 @@ impl<S: Stages> QueueControl for state::Shared<S> {
 pub struct InstallQueue<S: Stages = crate::manager::PackageInstaller> {
     shared: Arc<state::Shared<S>>,
     threads: Vec<JoinHandle<()>>,
+    /// Declared last so it is released after `Drop` has joined the threads.
+    _lock: lock::QueueLock,
 }
 
 impl<S: Stages> InstallQueue<S> {
     pub fn start(stages: S, observer: Arc<dyn QueueObserver>) -> ManagerResult<Self> {
+        let lock = lock::QueueLock::acquire(stages.temp_dir())?;
+        lock::sweep(stages.temp_dir(), stages.packages_root());
         let shared = Arc::new(state::Shared::new(stages, observer));
         let spawn = |name: &str, body: fn(Arc<state::Shared<S>>)| {
             let shared = Arc::clone(&shared);
@@ -83,7 +91,11 @@ impl<S: Stages> InstallQueue<S> {
             spawn("xel-queue-download", worker::run_downloader),
             spawn("xel-queue-install", worker::run_installer),
         ];
-        Ok(Self { shared, threads })
+        Ok(Self {
+            shared,
+            threads,
+            _lock: lock,
+        })
     }
 
     /// Queue `job`. Refused if its package already has an unfinished job,

@@ -21,6 +21,9 @@ pub trait Stages: Send + Sync + 'static {
     /// Where downloads are written.
     fn temp_dir(&self) -> &Path;
 
+    /// Where installed packages live; swept for aside folders.
+    fn packages_root(&self) -> &Path;
+
     /// Free bytes on the temp filesystem, read when the queue goes busy.
     fn available_bytes(&self) -> ManagerResult<u64>;
 

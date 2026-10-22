@@ -47,6 +47,7 @@ impl Gate {
 #[derive(Default)]
 struct Fake {
     dir: Option<TempDir>,
+    packages: PathBuf,
     free: AtomicU64,
     sizes: Mutex<HashMap<String, u64>>,
     hold_download: Mutex<HashMap<String, Arc<Gate>>>,
@@ -98,8 +99,10 @@ struct FakeStages(Arc<Fake>);
 
 impl FakeStages {
     fn new(free: u64) -> Self {
+        let dir = TempDir::new().unwrap();
         let fake = Fake {
-            dir: Some(TempDir::new().unwrap()),
+            packages: dir.path().join("packages"),
+            dir: Some(dir),
             ..Fake::default()
         };
         fake.free.store(free, Ordering::SeqCst);
@@ -121,6 +124,10 @@ impl Stages for FakeStages {
 
     fn temp_dir(&self) -> &Path {
         self.0.dir.as_ref().unwrap().path()
+    }
+
+    fn packages_root(&self) -> &Path {
+        &self.0.packages
     }
 
     fn available_bytes(&self) -> ManagerResult<u64> {
@@ -283,6 +290,23 @@ fn start(stages: &FakeStages) -> (InstallQueue<FakeStages>, Arc<Events>) {
     let events = Arc::new(Events::default());
     let queue = InstallQueue::start(stages.clone(), events.clone()).unwrap();
     (queue, events)
+}
+
+#[test]
+fn a_second_queue_on_the_same_temp_directory_is_refused() {
+    let stages = FakeStages::new(u64::MAX);
+    let (_queue, _) = start(&stages);
+    let second = InstallQueue::start(stages.clone(), Arc::new(Events::default()));
+    assert!(matches!(second, Err(ManagerError::QueueBusy { .. })));
+}
+
+#[test]
+fn starting_a_queue_sweeps_what_a_killed_run_left_behind() {
+    let stages = FakeStages::new(u64::MAX);
+    let leftover = stages.temp_dir().join("install_eu_ortho_1.0.0");
+    std::fs::create_dir_all(&leftover).unwrap();
+    let (_queue, _) = start(&stages);
+    assert!(!leftover.exists());
 }
 
 /// Item 1: the network never waits for the disk.

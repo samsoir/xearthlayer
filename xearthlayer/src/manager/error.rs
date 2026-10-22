@@ -107,6 +107,9 @@ pub enum ManagerError {
     /// The queue is shutting down and accepts no more jobs.
     QueueClosed,
 
+    /// Another process holds the queue lock on the temp directory.
+    QueueBusy { path: PathBuf },
+
     /// A queue stage panicked. The job failed and the queue carried on.
     Panicked {
         stage: &'static str,
@@ -234,6 +237,11 @@ impl std::fmt::Display for ManagerError {
                 package_type,
             } => write!(f, "{region} {package_type} already has a job in the queue"),
             Self::QueueClosed => write!(f, "the install queue is shutting down"),
+            Self::QueueBusy { path } => write!(
+                f,
+                "another package operation is running (lock held on {})",
+                path.display()
+            ),
             Self::Panicked { stage, message } => {
                 write!(f, "internal error during {stage}: {message}")
             }

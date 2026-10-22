@@ -196,6 +196,10 @@ impl Stages for PackageInstaller {
         &self.temp_dir
     }
 
+    fn packages_root(&self) -> &Path {
+        self.store.root()
+    }
+
     fn available_bytes(&self) -> ManagerResult<u64> {
         available_bytes(self.fs_info_provider.as_ref(), &self.temp_dir)
             .map_err(|e| ManagerError::InvalidPath(e.to_string()))
@@ -575,7 +579,7 @@ mod tests {
     use xearthlayer_package::ArchivePart;
 
     use crate::manager::queue::{
-        InstallContext, InstallQueue, JobEvent, JobId, QueueObserver, Stages,
+        InstallContext, InstallQueue, JobEvent, JobId, QueueObserver, Stages, LOCK_FILE_NAME,
     };
     use crate::system::FilesystemInfo;
 
@@ -952,6 +956,7 @@ mod tests {
         let leftovers: Vec<_> = fs::read_dir(temp.path().join("tmp"))
             .unwrap()
             .map(|e| e.unwrap().file_name())
+            .filter(|name| name != LOCK_FILE_NAME)
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
@@ -1004,7 +1009,12 @@ mod tests {
             }
         }
         assert!(downloaded.lock().unwrap().is_empty());
-        assert_eq!(fs::read_dir(temp.path().join("tmp")).unwrap().count(), 0);
+        let leftovers: Vec<_> = fs::read_dir(temp.path().join("tmp"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|name| name != LOCK_FILE_NAME)
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]
@@ -1041,6 +1051,7 @@ mod tests {
         let leftovers: Vec<_> = fs::read_dir(temp.path().join("tmp"))
             .unwrap()
             .map(|e| e.unwrap().file_name())
+            .filter(|name| name != LOCK_FILE_NAME)
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
