@@ -264,7 +264,14 @@ the packages directory, which may be another filesystem.
 **Capacity** is the free space of the temp filesystem, read once per busy
 period (when the first job asks to download after the queue was empty) and never
 mid-install, because it would then count a half-extracted tree as used.
-Writers other than the queue are unseen until the next busy period.
+Writers other than the queue are unseen until the next busy period. That
+includes the queue's own installs: releasing an entry frees its `4 * s`
+reservation, but when `packages_root` shares the temp filesystem the installed
+tree (about 1.5 to 2.1 times the download) stays on it, and the ledger does not
+subtract it. A later package in the same busy period can therefore hit ENOSPC
+during extraction. That failure is clean (the job fails, its guard deletes its
+temp tree, the old version is untouched) and the limitation predates the
+queue, so it is documented rather than fixed.
 
 **Removes** skip the downloader and go straight to the install queue, so a
 remove can overtake a download that is waiting for space. `submit` refuses a
