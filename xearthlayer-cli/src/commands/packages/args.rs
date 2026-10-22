@@ -200,7 +200,9 @@ pub struct RemoveArgs {
     pub region: String,
     pub package_type: PackageType,
     pub install_dir: PathBuf,
-    /// Scratch directory the queue locks and renames removed trees into.
+    /// Temp directory that holds the queue lock. A removed package is not
+    /// moved here: it is renamed to `.xel-removed-<name>` inside the
+    /// packages root and deleted there.
     pub temp_dir: PathBuf,
     pub force: bool,
     /// Path to X-Plane Custom Scenery directory for overlay symlinks.

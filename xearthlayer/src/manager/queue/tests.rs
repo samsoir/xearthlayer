@@ -65,6 +65,8 @@ struct Fake {
     hold_swap: Mutex<HashMap<String, Arc<Gate>>>,
     /// Holds what follows the swap, like deleting the replaced version.
     hold_after_swap: Mutex<HashMap<String, Arc<Gate>>>,
+    /// Holds a remove, like deleting a large package.
+    hold_remove: Mutex<HashMap<String, Arc<Gate>>>,
     /// Holds dropping a downloaded package, like deleting its temp tree.
     hold_drop: Mutex<HashMap<String, Arc<Gate>>>,
     /// Installs that never call `end_swap`.
@@ -78,6 +80,8 @@ struct Fake {
     panic_in: Mutex<HashMap<String, &'static str>>,
     /// How many times the queue read the free space.
     free_reads: AtomicU64,
+    /// Holds reading the free space, like statvfs on a slow filesystem.
+    hold_free_read: Mutex<Option<Arc<Gate>>>,
     log: Mutex<Vec<String>>,
 }
 
@@ -161,6 +165,10 @@ impl Stages for FakeStages {
 
     fn available_bytes(&self) -> ManagerResult<u64> {
         self.0.free_reads.fetch_add(1, Ordering::SeqCst);
+        let held = self.0.hold_free_read.lock().unwrap().clone();
+        if let Some(gate) = held {
+            gate.pass(&CancelToken::new());
+        }
         Ok(self.0.free.load(Ordering::SeqCst))
     }
 
@@ -254,6 +262,9 @@ impl Stages for FakeStages {
     }
 
     fn remove(&self, region: &str, _package_type: PackageType) -> ManagerResult<()> {
+        if let Some(gate) = Fake::gate(&self.0.hold_remove, region) {
+            gate.pass(&CancelToken::new()); // a started remove ignores cancellation
+        }
         self.0.record(format!("removed {region}"));
         Ok(())
     }
@@ -1070,4 +1081,102 @@ fn cancelling_a_download_waiting_for_space_waits_for_its_temp_directory() {
     );
     drop(gate);
     assert!(waited.recv_timeout(Duration::from_secs(5)).unwrap());
+}
+
+/// The store keys packages by folder name, which ignores case, so the
+/// duplicate guard must too.
+#[test]
+fn a_job_for_the_same_package_in_another_case_is_refused() {
+    let stages = FakeStages::new(u64::MAX);
+    let _held = OpenOnDrop(Fake::hold(&stages.0.hold_download, "eu"));
+    let (queue, _) = start(&stages);
+    queue.submit(Job::Install(meta("eu"))).unwrap();
+
+    let remove = queue.submit(Job::Remove {
+        region: "EU".into(),
+        package_type: PackageType::Ortho,
+    });
+
+    assert!(
+        matches!(remove, Err(ManagerError::AlreadyQueued { .. })),
+        "{remove:?}"
+    );
+}
+
+/// Reading the free space can block on a slow filesystem, so it happens
+/// outside the state lock: the queue still takes work meanwhile.
+#[test]
+fn reading_the_free_space_does_not_hold_the_queue() {
+    let stages = FakeStages::new(u64::MAX);
+    let read = Arc::new(Gate::default());
+    *stages.0.hold_free_read.lock().unwrap() = Some(Arc::clone(&read));
+    let (queue, _) = start(&stages);
+    let queue = Arc::new(queue);
+    // Declared after the queue, so on a failure it opens first.
+    let read = OpenOnDrop(read);
+    queue.submit(Job::Install(meta("A"))).unwrap();
+    eventually("the free space is being read", || {
+        stages.0.free_reads.load(Ordering::SeqCst) == 1
+    });
+
+    let (tx, submitted) = std::sync::mpsc::channel();
+    let submitter = Arc::clone(&queue);
+    std::thread::spawn(move || {
+        let _ = tx.send(submitter.submit(Job::Install(meta("B"))).is_ok());
+    });
+
+    assert!(
+        submitted.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "submit waited for the free-space read"
+    );
+    drop(read);
+    queue.wait_idle();
+    assert!(stages.0.logged("installed B"));
+    assert_eq!(stages.0.free_reads.load(Ordering::SeqCst), 1);
+}
+
+fn remove_eu() -> Job {
+    Job::Remove {
+        region: "EU".into(),
+        package_type: PackageType::Ortho,
+    }
+}
+
+#[test]
+fn cancelling_a_queued_remove_removes_nothing() {
+    let stages = FakeStages::new(u64::MAX);
+    let held = Fake::hold(&stages.0.hold_install, "A");
+    let (queue, events) = start(&stages);
+    let a = queue.submit(Job::Install(meta("A"))).unwrap();
+    eventually("A extracting", || {
+        events.of(a).contains(&"installing Extracting".to_string())
+    });
+    let removal = queue.submit(remove_eu()).unwrap();
+
+    assert_eq!(queue.cancel(removal), CancelResult::Cancelled);
+
+    held.open();
+    queue.wait_idle();
+    assert!(!stages.0.logged("removed EU"));
+    assert_eq!(events.of(removal), ["queued EU", "finished cancelled"]);
+}
+
+#[test]
+fn a_started_remove_cannot_be_cancelled_and_completes() {
+    let stages = FakeStages::new(u64::MAX);
+    let held = Fake::hold(&stages.0.hold_remove, "EU");
+    let (queue, events) = start(&stages);
+    // Declared after the queue, so on a failure it opens before the
+    // queue's drop joins the installer held at it.
+    let held = OpenOnDrop(held);
+    let removal = queue.submit(remove_eu()).unwrap();
+    eventually("EU removing", || {
+        events.of(removal).contains(&"removing".to_string())
+    });
+
+    assert_eq!(queue.cancel(removal), CancelResult::TooLate);
+
+    drop(held);
+    assert!(matches!(queue.wait_for(&[removal])[0], JobOutcome::Removed));
+    assert!(stages.0.logged("removed EU"));
 }

@@ -96,7 +96,8 @@ pub enum JobOutcome {
 /// What asking to cancel a job achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelResult {
-    /// It will finish as cancelled.
+    /// It will not be installed or removed. It may still be cleaning up,
+    /// and it is reported as finished once that is done.
     Cancelled,
     /// It is swapping or removing, which always completes.
     TooLate,

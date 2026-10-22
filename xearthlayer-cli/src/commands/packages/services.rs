@@ -207,7 +207,8 @@ impl PackageManagerService for DefaultPackageManagerService {
             return Err(ManagerError::Cancelled);
         }
         // Through the queue, so a remove takes the same one-operation-at-a-time
-        // lock as an install and uses the rename-aside removal.
+        // lock as an install and the removal that renames the package to
+        // its removed name first.
         let observer = Arc::new(ConsoleQueueObserver::default());
         let installer = PackageInstaller::new(LocalPackageStore::new(store.root()), temp_dir);
         let queue = InstallQueue::start(installer, observer.clone())?;

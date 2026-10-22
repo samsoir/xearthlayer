@@ -263,7 +263,8 @@ the packages directory, which may be another filesystem.
 
 **Capacity** is the free space of the temp filesystem, read once per busy
 period (when the first job asks to download after the queue was empty) and never
-mid-install, because it would then count a half-extracted tree as used.
+mid-install, because it would then count a half-extracted tree as used. It is
+read outside the state lock, since `statvfs` can block on a slow filesystem.
 Writers other than the queue are unseen until the next busy period. That
 includes the queue's own installs: releasing an entry frees its `4 * s`
 reservation, but when `packages_root` shares the temp filesystem the installed
@@ -276,7 +277,8 @@ queue, so it is documented rather than fixed.
 **Removes** skip the downloader and go straight to the install queue, so a
 remove can overtake a download that is waiting for space. `submit` refuses a
 second unfinished job for the same region and package type
-(`ManagerError::AlreadyQueued`), which keeps that overtaking safe and guards a
+(`ManagerError::AlreadyQueued`), compared by package folder name as the store
+keys packages, so `eu` and `EU` are the same package, which keeps that overtaking safe and guards a
 UI against double selection. It also refuses once the queue is shutting down or
 abandoned (`QueueClosed`). `submit_batch` submits many installs under one lock
 and `finish_batch` waits for them, so a cancel sees all of a batch or none of it.

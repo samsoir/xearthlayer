@@ -111,12 +111,19 @@ fn admit<S: Stages>(
 ) -> Result<(), JobOutcome> {
     let mut state = shared.lock();
     if !state.capacity_known {
-        match guarded("available_bytes", || shared.stages.available_bytes()) {
-            Ok(free) => {
-                state.ledger.set_capacity(free);
-                state.capacity_known = true;
+        // statvfs can block on a slow or network filesystem, so it is read
+        // unlocked, then used only if no reading was taken meanwhile.
+        drop(state);
+        let free = guarded("available_bytes", || shared.stages.available_bytes());
+        state = shared.lock();
+        if !state.capacity_known {
+            match free {
+                Ok(free) => {
+                    state.ledger.set_capacity(free);
+                    state.capacity_known = true;
+                }
+                Err(e) => return Err(JobOutcome::Failed(e)),
             }
-            Err(e) => return Err(JobOutcome::Failed(e)),
         }
     }
     loop {

@@ -6,6 +6,8 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
+use xearthlayer_package::package_mountpoint;
+
 use super::job::{CancelResult, Job, JobEvent, JobId, JobOutcome, JobSummary, QueueObserver};
 use super::ledger::DiskLedger;
 use super::lock::QueueLock;
@@ -85,11 +87,13 @@ impl<D> State<D> {
         }
     }
 
-    /// Whether a job for `summary`'s package is already unfinished.
+    /// Whether a job for `summary`'s package is already unfinished. Jobs
+    /// are compared by package folder, as the store keys packages, so a
+    /// region code in another case is the same package.
     pub(super) fn holds(&self, summary: &JobSummary) -> bool {
-        self.jobs.values().any(|e| {
-            e.summary.region == summary.region && e.summary.package_type == summary.package_type
-        })
+        let folder = |s: &JobSummary| package_mountpoint(&s.region, s.package_type);
+        let wanted = folder(summary);
+        self.jobs.values().any(|e| folder(&e.summary) == wanted)
     }
 }
 
