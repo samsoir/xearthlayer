@@ -97,6 +97,15 @@ pub enum ManagerError {
     /// The operation was cancelled before it finished. Nothing it wrote
     /// outside its temp directory was changed.
     Cancelled,
+
+    /// A job for this package is already queued or running.
+    AlreadyQueued {
+        region: String,
+        package_type: String,
+    },
+
+    /// The queue is shutting down and accepts no more jobs.
+    QueueClosed,
 }
 
 impl std::fmt::Display for ManagerError {
@@ -214,6 +223,11 @@ impl std::fmt::Display for ManagerError {
                 )
             }
             Self::Cancelled => write!(f, "cancelled"),
+            Self::AlreadyQueued {
+                region,
+                package_type,
+            } => write!(f, "{region} {package_type} already has a job in the queue"),
+            Self::QueueClosed => write!(f, "the install queue is shutting down"),
         }
     }
 }

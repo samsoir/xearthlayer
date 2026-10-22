@@ -76,7 +76,9 @@ impl DiskLedger {
         self.entries.retain(|&(entry, _)| entry != id);
     }
 
-    /// The worst disk use the admitted packages can reach.
+    /// The worst disk use the admitted packages can reach. Only the tests
+    /// ask: the queue needs just the admission answer.
+    #[cfg(test)]
     pub(crate) fn peak(&self) -> u64 {
         peak_of(self.sizes())
     }

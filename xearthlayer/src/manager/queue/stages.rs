@@ -1,0 +1,66 @@
+//! The stages a queue drives, so the queue can be tested without a network
+//! or a package store.
+
+use std::path::Path;
+
+use xearthlayer_package::{PackageMetadata, PackageType};
+
+use crate::manager::cancel::CancelToken;
+use crate::manager::download::DownloadProgressCallback;
+use crate::manager::error::ManagerResult;
+use crate::manager::installer::{InstallResult, InstallStage};
+
+/// The work behind each job, split where the queue hands over between its
+/// threads.
+pub trait Stages: Send + Sync + 'static {
+    /// A package validated and sized, not yet downloaded.
+    type Prepared: Send + 'static;
+    /// A package downloaded and waiting to install.
+    type Downloaded: Send + 'static;
+
+    /// Where downloads are written.
+    fn temp_dir(&self) -> &Path;
+
+    /// Free bytes on the temp filesystem, read when the queue goes busy.
+    fn available_bytes(&self) -> ManagerResult<u64>;
+
+    /// Validate and size; no bytes downloaded.
+    fn prepare(&self, metadata: &PackageMetadata) -> ManagerResult<Self::Prepared>;
+
+    /// The bytes `prepared` downloads.
+    fn download_size(&self, prepared: &Self::Prepared) -> u64;
+
+    /// Download `prepared`. Must return `ManagerError::Cancelled` promptly
+    /// once `cancel` is set.
+    fn download(
+        &self,
+        prepared: Self::Prepared,
+        cancel: &CancelToken,
+        progress: DownloadProgressCallback,
+    ) -> ManagerResult<Self::Downloaded>;
+
+    /// Install `downloaded`. Must call `ctx.begin_swap()` before touching
+    /// the installed package and return `ManagerError::Cancelled` if it
+    /// returns false; after that, the swap ignores cancellation.
+    fn install(
+        &self,
+        downloaded: Self::Downloaded,
+        ctx: &dyn InstallContext,
+    ) -> ManagerResult<InstallResult>;
+
+    /// Remove an installed package.
+    fn remove(&self, region: &str, package_type: PackageType) -> ManagerResult<()>;
+}
+
+/// What an install sees of its queue.
+pub trait InstallContext {
+    /// Report reaching `stage`.
+    fn stage(&self, stage: InstallStage);
+
+    /// The job's cancellation token.
+    fn cancel_token(&self) -> &CancelToken;
+
+    /// Claim the swap. False if the job was cancelled first; once true,
+    /// the swap runs to completion.
+    fn begin_swap(&self) -> bool;
+}
