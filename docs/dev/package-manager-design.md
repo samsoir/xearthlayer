@@ -277,9 +277,9 @@ queue, so it is documented rather than fixed.
 **Removes** skip the downloader and go straight to the install queue, so a
 remove can overtake a download that is waiting for space. `submit` refuses a
 second unfinished job for the same region and package type
-(`ManagerError::AlreadyQueued`), compared by package folder name as the store
-keys packages, so `eu` and `EU` are the same package, which keeps that overtaking safe and guards a
-UI against double selection. It also refuses once the queue is shutting down or
+(`ManagerError::AlreadyQueued`). The comparison uses the package folder name,
+as the store does, so `eu` and `EU` are the same package. The refusal is what
+makes overtaking safe, and it also guards a UI against double selection. It also refuses once the queue is shutting down or
 abandoned (`QueueClosed`). `submit_batch` submits many installs under one lock
 and `finish_batch` waits for them, so a cancel sees all of a batch or none of it.
 
@@ -392,7 +392,11 @@ pub struct MountState {
 
 Removal is a `Job::Remove` in the same queue, so it takes the same lock as an
 install. The folder is renamed to `.xel-removed-<name>` before it is deleted,
-so a remove interrupted mid-delete leaves nothing the sweep would restore.
+so a remove interrupted mid-delete leaves nothing the sweep would restore. A
+stale `.xel-aside-<name>` left by an earlier swap is deleted first, while the
+package is still in place; if it cannot be deleted the remove fails and the
+package stays installed, because once the package folder is gone the sweep
+would rename that aside back as the package.
 
 ### Ortho Packages
 

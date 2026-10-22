@@ -216,9 +216,19 @@ impl LocalPackageStore {
         // An aside left by an earlier swap is stale, because the queue runs
         // one operation at a time. Delete it while the package is still in
         // place, or once the package is gone the sweep would rename it back.
+        // If it cannot be deleted, stop: the package stays installed rather
+        // than leaving the aside behind as its only copy.
         let stale_aside = aside::aside_path(&package_dir);
         if stale_aside.exists() {
             aside::discard(&stale_aside);
+            if stale_aside.exists() {
+                return Err(ManagerError::WriteFailed {
+                    path: stale_aside,
+                    source: std::io::Error::other(
+                        "a folder left by an earlier update could not be deleted",
+                    ),
+                });
+            }
         }
 
         let removed = match aside::set_removed(&package_dir) {
@@ -531,6 +541,42 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(left, ["zzXEL_na_ortho"]);
+    }
+
+    /// A stale aside that cannot be deleted must stop the remove. Removing
+    /// the package anyway would leave the aside as the only folder of that
+    /// name, and the startup sweep restores such an aside as the package.
+    #[test]
+    fn a_stale_aside_that_cannot_be_deleted_stops_the_remove() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "eu", PackageType::Ortho, "1.0.0");
+        let install_path = store.install_path("eu", PackageType::Ortho);
+        // A read-only folder inside the aside keeps its files undeletable.
+        let locked = temp.path().join(".xel-aside-zzXEL_eu_ortho/terrain");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("tile.ter"), "old").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let deletable = fs::remove_file(locked.join("tile.ter")).is_ok();
+
+        let result = if deletable {
+            None // running as root: permissions cannot induce the failure
+        } else {
+            Some(store.remove("eu", PackageType::Ortho))
+        };
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let Some(result) = result else { return };
+        assert!(
+            matches!(result, Err(ManagerError::WriteFailed { .. })),
+            "{result:?}"
+        );
+        assert!(store.is_installed("eu", PackageType::Ortho));
+        assert!(install_path
+            .join("xearthlayer_scenery_package.txt")
+            .exists());
     }
 
     #[test]
