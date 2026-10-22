@@ -413,7 +413,7 @@ Controls package manager behavior.
 | `auto_install_overlays` | bool | `false` | Automatically install matching overlay when installing ortho |
 | `disable_overlays` | bool | `false` | Suppress XEL overlays at runtime (see notes below) |
 | `xworld_pro` | bool | `false` | Give SimHeaven X-World Pro priority over XEarthLayer overlays (see [X-World Pro](x-world-pro.md)) |
-| `temp_dir` | path | `~/.cache/xearthlayer/tmp` | Temporary directory for package downloads |
+| `temp_dir` | path | `~/.cache/xearthlayer/tmp` | Temporary directory for downloaded package parts |
 | `concurrent_downloads` | Integer | `5` | Number of concurrent part downloads (1-10) |
 
 **Example:**
@@ -430,7 +430,7 @@ temp_dir = ~/Downloads/xearthlayer-temp
 
 **Notes:**
 - The default `library_url` points to the official XEarthLayer package library; override only if using a custom package source
-- The `temp_dir` is used for downloading archives before extraction; files are cleaned up after installation. The default avoids the system temp directory which is often RAM-backed (tmpfs) on Linux
+- The `temp_dir` holds downloaded package parts, each deleted as its package is extracted; it needs room for about the downloads of the packages in one batch. The default avoids the system temp directory which is often RAM-backed (tmpfs) on Linux
 - When `auto_install_overlays` is enabled, installing an ortho package will automatically install the matching overlay package for the same region (if available)
 - `disable_overlays` is a **runtime** control. When set to `true`, `xearthlayer run` removes the consolidated `yzXEL_overlay/` symlink folder from Custom Scenery on startup so X-Plane does not load XEarthLayer overlays. Overlay packages remain downloaded and stored locally — flipping the setting back to `false` and restarting reinstates them with no re-download. Use this when running third-party overlay scenery (e.g. SimHeaven, Prefab Objects) that conflicts with XEL overlays. Distinct from `auto_install_overlays`, which controls whether overlays are *downloaded* alongside ortho packages.
 - `xworld_pro` is set by `xearthlayer setup` when SimHeaven X-World Pro is detected. With `true`, every `xearthlayer run` leaves XEarthLayer's overlays out for the continents X-World Pro covers (all of them when the whole planet is installed) and checks the scenery order and X-World Pro setup. `disable_overlays = true` still turns every overlay off. See [X-World Pro](x-world-pro.md).

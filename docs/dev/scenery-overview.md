@@ -123,7 +123,7 @@ No dynamic generation needed - these are purely static files.
 2. User selects region to install
 3. Manager downloads package parts (resumable, parallel)
 4. Each part verified via SHA256 checksum
-5. Parts reassembled and extracted to package library location
+5. Parts extracted in order straight into the package library location
 6. For ortho: registered for FUSE mounting
 7. For overlay: symlink created in Custom Scenery
 

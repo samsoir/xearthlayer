@@ -256,7 +256,7 @@ Large archives are cut into parts named after the `split -b` convention (the pub
 - `zzXEL_eur-1.0.0.tar.gz.ac`
 - etc.
 
-Parts are reassembled with `cat *.tar.gz.* > archive.tar.gz` or equivalent.
+The parts are one `tar.gz` cut into pieces, so reading them in order as a single stream gives the archive (`cat *.tar.gz.* > archive.tar.gz` does the same by hand).
 
 ### Recommended Part Size
 

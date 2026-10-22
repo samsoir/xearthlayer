@@ -215,12 +215,12 @@ and watch events; `install_batch` is the blocking entry the CLI uses.
    `InstallTempGuard`, then size its parts with HEAD requests.
 2. **Download** (network bound). Fetch every part into the temp directory,
    verifying checksums as parts arrive.
-3. **Install** (disk bound). Reassemble the parts into one archive and free the
-   parts (#260), extract the `tar.gz` in process with the `tar` crate over
-   flate2's `zlib-rs` backend (#274), stage the extracted tree beside its
-   destination, then swap it in by renaming any old version aside first
-   (`manager/aside.rs`). Dropping the guard removes the temp directory on every
-   exit path.
+3. **Install** (disk bound). Extract the parts straight into
+   `.xel-staging-<name>` beside the install path, reading them as one stream in
+   process with the `tar` crate over flate2's `zlib-rs` backend (#274);
+   `PartsReader` deletes each part once read (#260). Then swap the staged tree
+   in by renaming any old version aside first (`manager/aside.rs`). Dropping the
+   guard removes the temp directory on every exit path.
 
 ### Install queue
 
@@ -280,7 +280,9 @@ count a half-extracted tree as used. It is read outside the state lock, since
 `statvfs` can block on a slow filesystem. Writers other than the queue are unseen
 until the next busy period. If one fills the disk, extraction fails cleanly with
 ENOSPC: the job fails, its guards delete its parts and staging folder, and the
-old version is untouched.
+old version is untouched. Devices are compared by `st_dev`, so two btrfs
+subvolumes of one pool count as two filesystems and their shared free space is
+counted twice; the failure mode is that same clean extraction failure.
 
 **Removes** skip the downloader and go straight to the install queue, so a
 remove can overtake a download that is waiting for space. `submit` refuses a
@@ -298,15 +300,13 @@ download loop and per tar entry by the extractor.
 |---|---|
 | Queued, or downloaded and waiting | Removed from the queue immediately. A downloaded package is marked `Cancelling`, its temp directory is deleted outside the state lock, and only then is the job finished and its ledger entry released, so a waiter that returns finds the directory gone. `abandon` finishes it at once instead |
 | Preparing, waiting for space, downloading | The token is raised; the owning thread notices, aborts every part worker, and the temp guard deletes the parts before the job finishes |
-| Reassembling or extracting | Checked per buffer and per tar entry; the guard deletes the partial tree; the old version is untouched |
-| Staging | As above; the staging folder is deleted |
+| Extracting | Checked per buffer and per tar entry; the guard deletes the staging folder and the temp directory; the old version is untouched |
 | The swap | `TooLate`; the swap runs to completion |
 | A remove that has started | `TooLate` |
 
 The swap is two renames in the destination's parent directory: the old version
 is set aside to `.xel-aside-<name>`, then the staged tree (`.xel-staging-<name>`,
-copied there first when the temp directory is on another filesystem) is renamed
-in. `begin_swap` claims it; `end_swap` marks the renames done, and the old
+already beside it) is renamed in. `begin_swap` claims it; `end_swap` marks the renames done, and the old
 version is deleted after that, outside the uncancellable part. A package folder
 is therefore always either the old version or the new one. Dot-prefixed names
 are skipped by `LocalPackageStore::list`.
