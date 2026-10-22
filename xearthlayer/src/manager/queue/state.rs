@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use xearthlayer_package::package_mountpoint;
 
 use super::job::{CancelResult, Job, JobEvent, JobId, JobOutcome, JobSummary, QueueObserver};
-use super::ledger::DiskLedger;
+use super::ledger::{Capacity, DiskLedger};
 use super::lock::QueueLock;
 use super::stages::Stages;
 use crate::manager::cancel::CancelToken;
@@ -78,7 +78,7 @@ impl<D> State<D> {
             jobs: BTreeMap::new(),
             downloads: VecDeque::new(),
             installs: VecDeque::new(),
-            ledger: DiskLedger::new(0),
+            ledger: DiskLedger::new(Capacity::Shared { free: 0 }),
             capacity_known: false,
             finished: BTreeMap::new(),
             swapping: false,
@@ -254,7 +254,10 @@ impl<S: Stages> Shared<S> {
     pub(super) fn finish(&self, state: &mut State<S::Downloaded>, id: JobId, outcome: JobOutcome) {
         let removed = state.jobs.remove(&id);
         debug_assert!(removed.is_some(), "job {} finished twice", id.0);
-        state.ledger.release(id);
+        match &outcome {
+            JobOutcome::Installed(_) => state.ledger.installed(id),
+            _ => state.ledger.release(id),
+        }
         self.emit(id, JobEvent::Finished(&outcome));
         state.finished.insert(id, outcome);
         if state.jobs.is_empty() {

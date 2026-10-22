@@ -23,6 +23,7 @@ use crate::manager::error::{ManagerError, ManagerResult};
 use crate::manager::installer::InstallResult;
 
 pub use job::{CancelResult, Job, JobEvent, JobId, JobKind, JobOutcome, JobSummary, QueueObserver};
+pub use ledger::Capacity;
 pub use stages::{InstallContext, Stages};
 
 #[cfg(test)]

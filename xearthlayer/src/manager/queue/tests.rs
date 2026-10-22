@@ -59,6 +59,9 @@ struct Fake {
     dir: Option<TempDir>,
     packages: PathBuf,
     free: AtomicU64,
+    /// Free bytes on separate temp and packages filesystems, when set;
+    /// otherwise both folders share `free`.
+    split: Mutex<Option<(u64, u64)>>,
     sizes: Mutex<HashMap<String, u64>>,
     hold_download: Mutex<HashMap<String, Arc<Gate>>>,
     hold_install: Mutex<HashMap<String, Arc<Gate>>>,
@@ -141,6 +144,12 @@ impl FakeStages {
         fake.free.store(free, Ordering::SeqCst);
         Self(Arc::new(fake))
     }
+    /// Temp and packages folders on separate filesystems.
+    fn split(temp: u64, packages: u64) -> Self {
+        let stages = Self::new(0);
+        *stages.0.split.lock().unwrap() = Some((temp, packages));
+        stages
+    }
     fn size(&self, title: &str, bytes: u64) -> &Self {
         self.0
             .sizes
@@ -163,13 +172,18 @@ impl Stages for FakeStages {
         &self.0.packages
     }
 
-    fn available_bytes(&self) -> ManagerResult<u64> {
+    fn capacity(&self) -> ManagerResult<Capacity> {
         self.0.free_reads.fetch_add(1, Ordering::SeqCst);
         let held = self.0.hold_free_read.lock().unwrap().clone();
         if let Some(gate) = held {
             gate.pass(&CancelToken::new());
         }
-        Ok(self.0.free.load(Ordering::SeqCst))
+        Ok(match *self.0.split.lock().unwrap() {
+            Some((temp, packages)) => Capacity::Split { temp, packages },
+            None => Capacity::Shared {
+                free: self.0.free.load(Ordering::SeqCst),
+            },
+        })
     }
 
     fn prepare(&self, metadata: &PackageMetadata) -> ManagerResult<(Payload, u64)> {
@@ -392,27 +406,25 @@ fn downloads_run_ahead_while_an_install_is_held() {
 
 #[test]
 fn a_download_waits_for_space_and_starts_when_an_install_frees_it() {
-    let stages = FakeStages::new(300);
-    stages
-        .size("A", 50)
-        .size("B", 40)
-        .size("C", 60)
-        .size("D", 30);
+    // A's and B's parts fill 90 of the 100 temp bytes; C's 60 fit once A
+    // has installed and its parts are gone.
+    let stages = FakeStages::split(100, 10_000);
+    stages.size("A", 50).size("B", 40).size("C", 60);
     let held = Fake::hold(&stages.0.hold_install, "A");
     let (queue, events) = start(&stages);
-    let ids: Vec<JobId> = ["A", "B", "C", "D"]
+    let ids: Vec<JobId> = ["A", "B", "C"]
         .iter()
         .map(|t| queue.submit(Job::Install(meta(t))).unwrap())
         .collect();
 
-    eventually("D waiting", || {
-        events.of(ids[3]).contains(&"waiting".to_string())
+    eventually("C waiting", || {
+        events.of(ids[2]).contains(&"waiting".to_string())
     });
-    assert!(!stages.0.logged("downloaded D"));
+    assert!(!stages.0.logged("downloaded C"));
 
     held.open();
     queue.wait_idle();
-    assert!(stages.0.logged("installed D"));
+    assert!(stages.0.logged("installed C"));
 }
 
 #[test]
@@ -441,9 +453,73 @@ fn a_package_that_cannot_fit_alone_fails_and_the_rest_continue() {
 }
 
 #[test]
+fn a_package_the_packages_disk_cannot_hold_fails_before_downloading_and_the_rest_install() {
+    let stages = FakeStages::split(1_000, 200);
+    stages.size("A", 50).size("B", 50);
+    let (queue, _) = start(&stages);
+
+    let results = queue.install_batch(vec![meta("A"), meta("B")]);
+
+    assert!(results[0].is_ok(), "{:?}", results[0]);
+    match &results[1] {
+        Err(ManagerError::InsufficientDiskSpace {
+            path,
+            required_bytes,
+            available_bytes,
+        }) => {
+            assert_eq!(path, stages.packages_root());
+            assert_eq!((*required_bytes, *available_bytes), (300, 200));
+        }
+        other => panic!("expected InsufficientDiskSpace, got {other:?}"),
+    }
+    assert!(!stages.0.logged("downloaded B"));
+}
+
+/// A tree installed earlier in the busy period still takes up the packages
+/// disk, so a package submitted after it installs is charged for it.
+#[test]
+fn a_tree_installed_earlier_in_the_busy_period_stays_charged() {
+    let stages = FakeStages::split(1_000, 200);
+    stages.size("A", 50).size("B", 1).size("C", 50);
+    // B keeps the queue busy, so the capacity is not read again. A and B
+    // go in under one lock, so A cannot finish while the queue is idle.
+    let held = Fake::hold(&stages.0.hold_download, "B");
+    let (queue, _) = start(&stages);
+    let _open = OpenOnDrop(Arc::clone(&held));
+    let ids = queue.submit_batch(vec![meta("A"), meta("B")]);
+    let a = *ids[0].as_ref().unwrap();
+    assert!(matches!(
+        queue.wait_for(&[a])[..],
+        [JobOutcome::Installed(_)]
+    ));
+
+    let c = queue.submit(Job::Install(meta("C"))).unwrap();
+    held.open();
+
+    // 150 installed + B's 3 + C's 150 = 303.
+    match &queue.wait_for(&[c])[..] {
+        [JobOutcome::Failed(ManagerError::InsufficientDiskSpace {
+            path,
+            required_bytes,
+            available_bytes,
+        })] => {
+            assert_eq!(path, stages.packages_root());
+            assert_eq!((*required_bytes, *available_bytes), (303, 200));
+        }
+        other => panic!("expected InsufficientDiskSpace, got {other:?}"),
+    }
+    assert!(!stages.0.logged("downloaded C"));
+    assert_eq!(
+        stages.0.free_reads.load(Ordering::SeqCst),
+        1,
+        "one busy period"
+    );
+}
+
+#[test]
 fn a_remove_overtakes_a_download_waiting_for_space() {
-    // A installing (200) plus B waiting (50) is 250: one more than fits.
-    let stages = FakeStages::new(249);
+    // A's parts (50) plus B's (50) are one more than the temp disk holds.
+    let stages = FakeStages::split(99, 10_000);
     stages.size("A", 50).size("B", 50);
     let held = Fake::hold(&stages.0.hold_install, "A");
     let (queue, events) = start(&stages);
@@ -671,9 +747,9 @@ fn a_panicking_observer_does_not_stop_the_queue() {
 
 #[test]
 fn free_space_is_read_once_per_busy_period() {
-    // Each install alone needs the whole 200, so every download after the
-    // first is admitted only once the install ahead of it has finished.
-    let stages = FakeStages::new(200);
+    // Each package's parts fill the whole temp disk, so every download after
+    // the first is admitted only once the install ahead of it has finished.
+    let stages = FakeStages::split(50, 10_000);
     stages
         .size("A", 50)
         .size("B", 50)
@@ -711,7 +787,7 @@ fn cancelling_a_queued_job_finishes_it_without_preparing_it() {
 
 #[test]
 fn cancelling_a_download_waiting_for_space_releases_it() {
-    let stages = FakeStages::new(249);
+    let stages = FakeStages::split(99, 10_000);
     stages.size("A", 50).size("B", 50).size("C", 10);
     let held = Fake::hold(&stages.0.hold_install, "A");
     let (queue, events) = start(&stages);
@@ -726,7 +802,7 @@ fn cancelling_a_download_waiting_for_space_releases_it() {
     eventually("B finished", || {
         events.of(b).last().map(String::as_str) == Some("finished cancelled")
     });
-    queue.submit(Job::Install(meta("C"))).unwrap(); // 4*50 + 10 = 210 fits once B is gone
+    queue.submit(Job::Install(meta("C"))).unwrap(); // 50 + 10 = 60 fits once B is gone
     eventually("C downloaded", || stages.0.logged("downloaded C"));
     held.open();
 }
@@ -1048,7 +1124,7 @@ fn abandoning_does_not_wait_for_a_downloaded_package_to_be_deleted() {
 /// prepared package owns a temp directory too.
 #[test]
 fn cancelling_a_download_waiting_for_space_waits_for_its_temp_directory() {
-    let stages = FakeStages::new(249);
+    let stages = FakeStages::split(99, 10_000);
     stages.size("A", 50).size("B", 50);
     Fake::hold(&stages.0.hold_install, "A");
     let held_drop = Fake::hold(&stages.0.hold_drop, "B");

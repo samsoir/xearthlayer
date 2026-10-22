@@ -232,47 +232,55 @@ failure at any stage is that job's result alone, and a stage that panics fails
 only its own job (`ManagerError::Panicked`).
 
 **Stages.** The `Stages` trait is the seam between the queue and the work:
-`prepare`, `download_size`, `download`, `install`, `remove`, `available_bytes`,
+`prepare`, `download_size`, `download`, `install`, `remove`, `capacity`,
 plus the temp directory and packages root. `PackageInstaller` implements it for
 production; tests use a gated fake. `install` receives an `InstallContext`
 with `begin_swap` and `end_swap`.
 
-**Disk ledger.** Finished archives wait on disk for their turn, so
-`DiskLedger` admits a package to download only if, with `s` the download sizes
-of the admitted packages in install order and `SPACE_BUFFER_MULTIPLIER` (4) the
-install peak factor,
+**Disk ledger.** A package downloads its parts into the temp folder, then
+extracts them straight into a staging folder on the packages filesystem,
+deleting each part once read. So `DiskLedger` charges each package against two
+budgets, with `s` its download size and `TREE_MULTIPLIER` (3) the estimated
+expansion of its extracted tree:
+
+- its parts, `s`, on the temp filesystem until it installs, fails or is
+  cancelled;
+- its tree, `3*s`, on the packages filesystem. An installed tree stays charged
+  for the rest of the busy period, so a batch counts every tree it has already
+  extracted; a failed or cancelled package releases both charges.
+
+`Capacity` says whether the two folders share a device. With `Split { temp,
+packages }` the budgets are independent: a package is refused when
+`installed + sum(3*s of unfinished) + 3*s` exceeds `packages` or `s` alone
+exceeds `temp`, and waits while `sum(s of unfinished) + s` exceeds `temp`. With
+`Shared { free }`, for the unfinished packages in install order plus the new one,
 
 ```
-max over j of  4*s[j] + sum(s[i] for i after j)  <=  capacity
+max over j of  installed + sum(3*s[i] for i before j) + 3*s[j] + sum(s[i] for i from j)  <=  free
 ```
 
-holds for every admitted `j`. Packages ahead of `j` have left the disk by the
-time it installs, and the archives queued behind it are complete. The ledger
-answers one of three ways:
+must hold: while `j` extracts, the trees ahead of it and its own are on disk with
+its parts and the complete parts queued behind it. The ledger answers one of
+three ways:
 
 | Answer | Meaning | Job |
 |---|---|---|
 | `Admitted` | It fits | Downloads |
-| `Wait { needed, available }` | It fits once packages ahead have installed | Emits `WaitingForSpace`, waits on a condvar, retried on every release |
-| `Never { required }` | `4 * s` alone exceeds the capacity | Fails with `InsufficientDiskSpace`; the downloader moves on |
+| `Wait { needed, available }` | It fits once packages ahead have installed | Emits `WaitingForSpace`, waits on a condvar, retried on every finish |
+| `Never { filesystem, required, available }` | It cannot fit even with every package ahead installed | Fails with `InsufficientDiskSpace` naming the temp folder or the packages folder; the downloader moves on |
 
 The check is made at admission, so the installer never waits for space and the
-two threads cannot deadlock. An entry is released when its job installs, fails
-or is cancelled. Removes never touch the ledger: the space they free returns to
-the packages directory, which may be another filesystem.
+two threads cannot deadlock. Removes never touch the ledger: the space they free
+is seen at the next busy period.
 
-**Capacity** is the free space of the temp filesystem, read once per busy
-period (when the first job asks to download after the queue was empty) and never
-mid-install, because it would then count a half-extracted tree as used. It is
-read outside the state lock, since `statvfs` can block on a slow filesystem.
-Writers other than the queue are unseen until the next busy period. That
-includes the queue's own installs: releasing an entry frees its `4 * s`
-reservation, but when `packages_root` shares the temp filesystem the installed
-tree (about 1.5 to 2.1 times the download) stays on it, and the ledger does not
-subtract it. A later package in the same busy period can therefore hit ENOSPC
-during extraction. That failure is clean (the job fails, its guard deletes its
-temp tree, the old version is untouched) and the limitation predates the
-queue, so it is documented rather than fixed.
+**Capacity** comes from `Stages::capacity`: the free space and device of the temp
+and packages filesystems, read once per busy period (when the first job asks to
+download after the queue was empty) and never mid-install, because it would then
+count a half-extracted tree as used. It is read outside the state lock, since
+`statvfs` can block on a slow filesystem. Writers other than the queue are unseen
+until the next busy period. If one fills the disk, extraction fails cleanly with
+ENOSPC: the job fails, its guards delete its parts and staging folder, and the
+old version is untouched.
 
 **Removes** skip the downloader and go straight to the install queue, so a
 remove can overtake a download that is waiting for space. `submit` refuses a
@@ -484,7 +492,7 @@ Run 'xearthlayer start' to begin serving scenery.
 ### Disk Space
 
 - The `DiskLedger` admits each download against the free space (see Install queue)
-- Estimate required space (archive + extracted) as `SPACE_BUFFER_MULTIPLIER` times the download
+- Estimate a package's extracted tree as `TREE_MULTIPLIER` (3) times its download, charged to the packages filesystem, with its parts charged to the temp filesystem until it installs
 - A package that cannot fit fails before downloading, with a clear message; the rest of the batch continues
 
 ### Checksum Failures

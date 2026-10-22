@@ -28,7 +28,7 @@ use super::error::{ManagerError, ManagerResult};
 use super::extractor::TarGzExtractor;
 use super::install_guard::InstallTempGuard;
 use super::local::LocalPackageStore;
-use super::queue::{InstallContext, Stages};
+use super::queue::{Capacity, InstallContext, Stages};
 
 /// Timeout for downloading a single archive part.
 const PART_TIMEOUT: Duration = Duration::from_secs(300);
@@ -183,6 +183,25 @@ impl PackageInstaller {
         ));
         self
     }
+
+    /// The device and free bytes of the filesystem holding `folder`,
+    /// creating the folder first so a fresh install can be measured.
+    fn filesystem_of(&self, folder: &Path) -> ManagerResult<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+
+        fs::create_dir_all(folder).map_err(|e| ManagerError::CreateDirFailed {
+            path: folder.to_path_buf(),
+            source: e,
+        })?;
+        let device = fs::metadata(folder)
+            .map_err(|e| ManagerError::ReadFailed {
+                path: folder.to_path_buf(),
+                source: e,
+            })?
+            .dev();
+        let free = available_bytes(self.fs_info_provider.as_ref(), folder)?;
+        Ok((device, free))
+    }
 }
 
 impl Stages for PackageInstaller {
@@ -197,9 +216,10 @@ impl Stages for PackageInstaller {
         self.store.root()
     }
 
-    fn available_bytes(&self) -> ManagerResult<u64> {
-        available_bytes(self.fs_info_provider.as_ref(), &self.temp_dir)
-            .map_err(|e| ManagerError::InvalidPath(e.to_string()))
+    fn capacity(&self) -> ManagerResult<Capacity> {
+        let temp = self.filesystem_of(&self.temp_dir)?;
+        let packages = self.filesystem_of(self.store.root())?;
+        Ok(Capacity::from_filesystems(temp, packages))
     }
 
     /// Validate `metadata`, create its temp directory and size its parts.
@@ -904,7 +924,7 @@ mod tests {
         ];
         let downloaded = Arc::clone(&transfer.downloaded);
 
-        // One at a time needs 4 * 50 = 200.
+        // One at a time needs its tree, 3 * 50, plus its 50 of parts: 200.
         let results = install_all(installer(&temp, transfer, 199), &batch, Arc::default());
 
         for result in &results {
@@ -929,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_that_only_fits_one_package_at_a_time_still_installs() {
+    fn a_batch_whose_second_tree_the_disk_cannot_hold_installs_only_the_first() {
         let temp = TempDir::new().unwrap();
         let mut transfer = LocalTransfer {
             declared_size: Some(50),
@@ -939,12 +959,38 @@ mod tests {
             package("AF-NORTH", &mut transfer),
             package("AF-SOUTH", &mut transfer),
         ];
+        let downloaded = Arc::clone(&transfer.downloaded);
 
-        // Overlapped needs 4 * 50 + 50 = 250; one at a time needs 200.
+        // The first tree stays on the disk: 150 installed, plus the second
+        // package's 150 tree and 50 of parts, is 350.
         let results = install_all(installer(&temp, transfer, 200), &batch, Arc::default());
 
         assert_eq!(results.len(), 2);
-        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        match &results[1] {
+            Err(ManagerError::InsufficientDiskSpace {
+                required_bytes,
+                available_bytes,
+                ..
+            }) => {
+                assert_eq!((*required_bytes, *available_bytes), (350, 200));
+            }
+            other => panic!("expected InsufficientDiskSpace, got {other:?}"),
+        }
+        assert_eq!(*downloaded.lock().unwrap(), ["test://AF-NORTH"]);
+    }
+
+    #[test]
+    fn capacity_is_shared_for_folders_on_one_filesystem() {
+        let temp = TempDir::new().unwrap();
+        let installer = installer(&temp, LocalTransfer::default(), 1_234);
+
+        assert_eq!(
+            installer.capacity().unwrap(),
+            Capacity::Shared { free: 1_234 }
+        );
+        assert!(installer.temp_dir().is_dir());
+        assert!(installer.packages_root().is_dir());
     }
 
     #[test]

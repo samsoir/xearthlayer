@@ -10,6 +10,8 @@ use crate::manager::download::DownloadProgressCallback;
 use crate::manager::error::ManagerResult;
 use crate::manager::installer::{InstallResult, InstallStage};
 
+use super::ledger::Capacity;
+
 /// The work behind each job, split where the queue hands over between its
 /// threads.
 pub trait Stages: Send + Sync + 'static {
@@ -24,8 +26,9 @@ pub trait Stages: Send + Sync + 'static {
     /// Where installed packages live; swept for aside folders.
     fn packages_root(&self) -> &Path;
 
-    /// Free bytes on the temp filesystem, read when the queue goes busy.
-    fn available_bytes(&self) -> ManagerResult<u64>;
+    /// Free space and device of the temp and packages filesystems, read
+    /// when the queue goes busy.
+    fn capacity(&self) -> ManagerResult<Capacity>;
 
     /// Validate and size; no bytes downloaded.
     fn prepare(&self, metadata: &PackageMetadata) -> ManagerResult<Self::Prepared>;

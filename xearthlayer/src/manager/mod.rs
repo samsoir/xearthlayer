@@ -60,9 +60,7 @@ pub use cache::{CacheStats, CachedLibraryClient};
 pub use cancel::CancelToken;
 pub use client::HttpLibraryClient;
 pub use config::ManagerConfig;
-pub use disk_check::{
-    available_bytes, FsInfoProvider, RealFsInfoProvider, SPACE_BUFFER_MULTIPLIER,
-};
+pub use disk_check::{available_bytes, FsInfoProvider, RealFsInfoProvider, TREE_MULTIPLIER};
 pub use download::{
     DownloadProgress, DownloadProgressCallback, DownloadState, MultiPartDownloader, PartState,
 };
@@ -72,7 +70,7 @@ pub use installer::{InstallResult, InstallStage, PackageInstaller};
 pub use local::{InstalledPackage, LocalPackageStore, MountStatus};
 pub use mounts::{ActiveMount, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder};
 pub use queue::{
-    CancelResult, Canceller, InstallContext, InstallQueue, Job, JobEvent, JobId, JobKind,
+    CancelResult, Canceller, Capacity, InstallContext, InstallQueue, Job, JobEvent, JobId, JobKind,
     JobOutcome, JobSummary, QueueControl, QueueObserver, Stages,
 };
 pub use symlinks::{

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use xearthlayer_package::PackageMetadata;
 
 use super::job::{Job, JobEvent, JobId, JobOutcome};
-use super::ledger::Admission;
+use super::ledger::{Admission, Filesystem};
 use super::stages::{InstallContext, Stages};
 use super::state::{outcome_of, panic_message, Phase, Ready, Shared};
 use crate::manager::cancel::CancelToken;
@@ -101,7 +101,7 @@ fn download_one<S: Stages>(
 }
 
 /// Wait until the ledger admits `size` bytes. Otherwise returns how the
-/// job ends: it can never fit, the free space could not be read, or it was
+/// job ends: it can never fit, the capacity could not be read, or it was
 /// cancelled. The caller finishes it, once the prepared package is dropped.
 fn admit<S: Stages>(
     shared: &Shared<S>,
@@ -114,12 +114,12 @@ fn admit<S: Stages>(
         // statvfs can block on a slow or network filesystem, so it is read
         // unlocked, then used only if no reading was taken meanwhile.
         drop(state);
-        let free = guarded("available_bytes", || shared.stages.available_bytes());
+        let capacity = guarded("capacity", || shared.stages.capacity());
         state = shared.lock();
         if !state.capacity_known {
-            match free {
-                Ok(free) => {
-                    state.ledger.set_capacity(free);
+            match capacity {
+                Ok(capacity) => {
+                    state.ledger.set_capacity(capacity);
                     state.capacity_known = true;
                 }
                 Err(e) => return Err(JobOutcome::Failed(e)),
@@ -137,10 +137,17 @@ fn admit<S: Stages>(
                 }
                 return Ok(());
             }
-            Admission::Never { required } => {
-                let available = state.ledger.capacity();
+            Admission::Never {
+                filesystem,
+                required,
+                available,
+            } => {
+                let path = match filesystem {
+                    Filesystem::Temp => shared.stages.temp_dir(),
+                    Filesystem::Packages => shared.stages.packages_root(),
+                };
                 return Err(JobOutcome::Failed(ManagerError::InsufficientDiskSpace {
-                    path: shared.stages.temp_dir().to_path_buf(),
+                    path: path.to_path_buf(),
                     required_bytes: required,
                     available_bytes: available,
                 }));
