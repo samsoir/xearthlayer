@@ -669,7 +669,7 @@ impl CommandHandler for RemoveHandler {
 
             ctx.output.println("Removing package...");
             ctx.manager
-                .remove_package(&store, region, args.package_type)
+                .remove_package(&store, region, args.package_type, &args.temp_dir)
                 .map_err(|e| CliError::Packages(e.to_string()))?;
 
             ctx.output
@@ -812,6 +812,7 @@ mod tests {
                     region: region.to_string(),
                     package_type: PackageType::Ortho,
                     install_dir: install_dir(),
+                    temp_dir: std::path::PathBuf::from("/tmp/unused"),
                     force,
                     custom_scenery_path: None,
                     disable_overlays: false,

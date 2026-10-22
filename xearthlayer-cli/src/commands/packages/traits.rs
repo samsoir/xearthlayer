@@ -108,6 +108,7 @@ pub trait PackageManagerService: Send + Sync {
         store: &LocalPackageStore,
         region: &str,
         package_type: PackageType,
+        temp_dir: &Path,
     ) -> ManagerResult<()>;
 
     /// List all installed packages.

@@ -224,6 +224,7 @@ impl PackageManagerService for FakeManager {
         _store: &LocalPackageStore,
         region: &str,
         _package_type: PackageType,
+        _temp_dir: &Path,
     ) -> ManagerResult<()> {
         self.removals.lock().unwrap().push(region.to_string());
         Ok(())

@@ -197,6 +197,7 @@ pub fn run(command: PackagesCommands) -> Result<(), CliError> {
                 region,
                 package_type: r#type.into(),
                 install_dir: install_dir.unwrap_or_else(|| default_install_dir(&config)),
+                temp_dir: default_temp_dir(&config),
                 force,
                 custom_scenery_path: default_custom_scenery_dir(&config),
                 disable_overlays: config.packages.disable_overlays,

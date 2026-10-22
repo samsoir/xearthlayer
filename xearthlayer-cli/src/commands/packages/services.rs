@@ -11,8 +11,9 @@ use super::progress::ConsoleQueueObserver;
 use super::traits::{Output, PackageManagerService, UserInteraction};
 use crate::error::CliError;
 use xearthlayer::manager::{
-    HttpLibraryClient, InstallQueue, InstallResult, InstalledPackage, LibraryClient,
-    LocalPackageStore, ManagerResult, PackageInfo, PackageInstaller, PackageStatus, UpdateChecker,
+    HttpLibraryClient, InstallQueue, InstallResult, InstalledPackage, Job, JobOutcome,
+    LibraryClient, LocalPackageStore, ManagerError, ManagerResult, PackageInfo, PackageInstaller,
+    PackageStatus, UpdateChecker,
 };
 use xearthlayer_package::{PackageLibrary, PackageMetadata, PackageType};
 
@@ -166,8 +167,26 @@ impl PackageManagerService for DefaultPackageManagerService {
         store: &LocalPackageStore,
         region: &str,
         package_type: PackageType,
+        temp_dir: &Path,
     ) -> ManagerResult<()> {
-        store.remove(region, package_type)
+        // Through the queue, so a remove takes the same one-operation-at-a-time
+        // lock as an install and uses the rename-aside removal.
+        let observer = Arc::new(ConsoleQueueObserver::default());
+        let installer = PackageInstaller::new(LocalPackageStore::new(store.root()), temp_dir);
+        let queue = InstallQueue::start(installer, observer.clone())?;
+        let id = queue.submit(Job::Remove {
+            region: region.to_string(),
+            package_type,
+        })?;
+        let outcome = queue.wait_for(&[id]).remove(0);
+        drop(queue);
+        observer.finish();
+        match outcome {
+            JobOutcome::Removed => Ok(()),
+            JobOutcome::Cancelled => Err(ManagerError::Cancelled),
+            JobOutcome::Failed(e) => Err(e),
+            JobOutcome::Installed(_) => unreachable!("a remove never ends as an install"),
+        }
     }
 
     fn list_packages(&self, store: &LocalPackageStore) -> ManagerResult<Vec<InstalledPackage>> {

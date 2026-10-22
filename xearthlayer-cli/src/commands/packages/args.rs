@@ -200,6 +200,8 @@ pub struct RemoveArgs {
     pub region: String,
     pub package_type: PackageType,
     pub install_dir: PathBuf,
+    /// Scratch directory the queue locks and renames removed trees into.
+    pub temp_dir: PathBuf,
     pub force: bool,
     /// Path to X-Plane Custom Scenery directory for overlay symlinks.
     pub custom_scenery_path: Option<PathBuf>,
