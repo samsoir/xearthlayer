@@ -350,4 +350,75 @@ mod tests {
             );
         }
     }
+
+    use super::commands::packages::PackagesCommands;
+    use super::Commands;
+
+    fn packages(args: &[&str]) -> Result<PackagesCommands, clap::Error> {
+        let argv = ["xearthlayer", "packages"].iter().chain(args);
+        match Cli::try_parse_from(argv)?.command {
+            Some(Commands::Packages { command }) => Ok(command),
+            _ => panic!("expected a packages command"),
+        }
+    }
+
+    #[test]
+    fn install_and_remove_take_several_regions() {
+        let Ok(PackagesCommands::Install { regions, all, .. }) =
+            packages(&["install", "NA", "EU-WEST"])
+        else {
+            panic!("install with two regions must parse");
+        };
+        assert_eq!((regions, all), (vec!["NA".into(), "EU-WEST".into()], false));
+
+        let Ok(PackagesCommands::Remove { regions, all, .. }) =
+            packages(&["remove", "AF", "AS-RUSSIA", "--force"])
+        else {
+            panic!("remove with two regions must parse");
+        };
+        assert_eq!(
+            (regions, all),
+            (vec!["AF".into(), "AS-RUSSIA".into()], false)
+        );
+    }
+
+    #[test]
+    fn install_and_remove_take_all_with_their_other_options() {
+        let Ok(PackagesCommands::Install {
+            regions,
+            all,
+            r#type,
+            ..
+        }) = packages(&["install", "--all", "--type", "overlay"])
+        else {
+            panic!("install --all must parse");
+        };
+        assert!(all && regions.is_empty());
+        assert_eq!(
+            xearthlayer_package::PackageType::from(r#type),
+            xearthlayer_package::PackageType::Overlay
+        );
+
+        let Ok(PackagesCommands::Remove {
+            regions,
+            all,
+            force,
+            ..
+        }) = packages(&["remove", "--all", "-f"])
+        else {
+            panic!("remove --all must parse");
+        };
+        assert!(all && force && regions.is_empty());
+    }
+
+    #[test]
+    fn install_and_remove_need_regions_or_all_but_not_both() {
+        for command in ["install", "remove"] {
+            assert!(packages(&[command]).is_err(), "{command} with nothing");
+            assert!(
+                packages(&[command, "NA", "--all"]).is_err(),
+                "{command} with a region and --all"
+            );
+        }
+    }
 }

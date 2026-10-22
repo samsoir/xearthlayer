@@ -36,6 +36,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use args::{CheckArgs, InfoArgs, InstallArgs, ListArgs, RemoveArgs, UpdateArgs};
+use selector::Selection;
 use traits::CommandContext;
 use xearthlayer::config::ConfigFile;
 
@@ -156,14 +157,15 @@ pub fn run(command: PackagesCommands) -> Result<(), CliError> {
         ),
 
         PackagesCommands::Install {
-            region,
+            regions,
+            all,
             r#type,
             library_url,
             install_dir,
             temp_dir,
         } => InstallHandler::execute(
             InstallArgs {
-                region,
+                selection: Selection::from_args(regions, all),
                 package_type: r#type.into(),
                 library_url: require_library_url(library_url, &config)?,
                 install_dir: install_dir.unwrap_or_else(|| default_install_dir(&config)),
@@ -201,13 +203,14 @@ pub fn run(command: PackagesCommands) -> Result<(), CliError> {
         ),
 
         PackagesCommands::Remove {
-            region,
+            regions,
+            all,
             r#type,
             install_dir,
             force,
         } => RemoveHandler::execute(
             RemoveArgs {
-                region,
+                selection: Selection::from_args(regions, all),
                 package_type: r#type.into(),
                 install_dir: install_dir.unwrap_or_else(|| default_install_dir(&config)),
                 temp_dir: default_temp_dir(&config),

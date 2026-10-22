@@ -14,7 +14,7 @@ use xearthlayer::xworld_pro::{detect, overlay_plan, OverlayCoverage, OverlayPlan
 use xearthlayer_package::{LibraryEntry, PackageLibrary, PackageType};
 
 use super::args::{CheckArgs, InfoArgs, InstallArgs, ListArgs, RemoveArgs, UpdateArgs};
-use super::selector::resolve;
+use super::selector::{resolve, Selection};
 use super::traits::{CommandContext, CommandHandler};
 use crate::error::CliError;
 
@@ -192,7 +192,7 @@ impl CommandHandler for CheckHandler {
 fn select_installed(
     ctx: &CommandContext<'_>,
     store: &LocalPackageStore,
-    selector: &str,
+    selection: &Selection,
     package_type: PackageType,
 ) -> Result<Vec<InstalledPackage>, CliError> {
     let installed = ctx
@@ -202,7 +202,11 @@ fn select_installed(
         .into_iter()
         .filter(|p| p.package_type() == package_type)
         .collect();
-    resolve(selector, installed, |p| p.region())
+    selection.select(
+        installed,
+        |p| p.region(),
+        &format!("No {package_type} packages are installed"),
+    )
 }
 
 /// Fetch each entry's metadata, then install every package whose metadata
@@ -411,7 +415,8 @@ impl CommandHandler for InstallHandler {
     fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
         ctx.output.println(&format!(
             "Installing {} ({})...",
-            args.region, args.package_type
+            args.selection.describe(),
+            args.package_type
         ));
         ctx.output.newline();
 
@@ -427,12 +432,20 @@ impl CommandHandler for InstallHandler {
             .iter()
             .filter(|e| e.package_type == args.package_type)
             .collect();
-        let entries = resolve(&args.region, offered, |e| e.title.as_str())?;
+        let entries = args.selection.select(
+            offered,
+            |e| e.title.as_str(),
+            &format!("The library offers no {} packages", args.package_type),
+        )?;
 
         if entries.len() > 1 {
+            let verb = match args.selection {
+                Selection::All => "selects",
+                Selection::Regions(_) => "matches",
+            };
             ctx.output.println(&format!(
-                "{} matches {} packages ({}):",
-                args.region,
+                "{} {verb} {} packages ({}):",
+                args.selection.describe(),
                 entries.len(),
                 args.package_type
             ));
@@ -610,7 +623,7 @@ impl CommandHandler for RemoveHandler {
 
     fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
         let store = ctx.manager.create_store(&args.install_dir);
-        let packages = select_installed(ctx, &store, &args.region, args.package_type)?;
+        let packages = select_installed(ctx, &store, &args.selection, args.package_type)?;
 
         // Phase one: show the whole plan and validate all of it, so a batch
         // never deletes some packages and then fails on a later one.
@@ -705,7 +718,8 @@ impl CommandHandler for InfoHandler {
 
     fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
         let store = ctx.manager.create_store(&args.install_dir);
-        let packages = select_installed(ctx, &store, &args.region, args.package_type)?;
+        let selection = Selection::Regions(vec![args.region.clone()]);
+        let packages = select_installed(ctx, &store, &selection, args.package_type)?;
 
         for (i, package) in packages.iter().enumerate() {
             if i > 0 {
@@ -808,10 +822,24 @@ mod tests {
     // ------------------------------------------------------------------------
 
     fn remove(manager: &FakeManager, answer: bool, region: &str, force: bool) -> Run {
+        remove_selection(
+            manager,
+            answer,
+            Selection::Regions(vec![region.to_string()]),
+            force,
+        )
+    }
+
+    fn remove_selection(
+        manager: &FakeManager,
+        answer: bool,
+        selection: Selection,
+        force: bool,
+    ) -> Run {
         run(manager, answer, |ctx| {
             RemoveHandler::execute(
                 RemoveArgs {
-                    region: region.to_string(),
+                    selection,
                     package_type: PackageType::Ortho,
                     install_dir: install_dir(),
                     temp_dir: std::path::PathBuf::from("/tmp/unused"),
@@ -852,7 +880,7 @@ mod tests {
         let run = run(manager, true, |ctx| {
             RemoveHandler::execute(
                 RemoveArgs {
-                    region: "NA".to_string(),
+                    selection: Selection::Regions(vec!["NA".to_string()]),
                     package_type: PackageType::Overlay,
                     install_dir: install_dir(),
                     temp_dir: std::path::PathBuf::from("/tmp/unused"),
@@ -964,6 +992,90 @@ mod tests {
     // info
     // ------------------------------------------------------------------------
 
+    fn regions(codes: &[&str]) -> Selection {
+        Selection::Regions(codes.iter().map(|c| c.to_string()).collect())
+    }
+
+    #[test]
+    fn remove_of_several_regions_removes_everything_they_select_after_one_prompt() {
+        let manager = FakeManager::default().with_installed(
+            PackageType::Ortho,
+            &["NA-CANADA-WEST", "NA-CANADA-EAST", "EU-WEST", "AF-SOUTH"],
+        );
+
+        let run = remove_selection(&manager, true, regions(&["AF", "NA-CANADA"]), false);
+
+        run.result.unwrap();
+        assert_eq!(
+            manager.removals(),
+            ["NA-CANADA-WEST", "NA-CANADA-EAST", "AF-SOUTH"]
+        );
+        assert_eq!(
+            run.interaction.prompts(),
+            ["Are you sure you want to remove these 3 packages?"]
+        );
+    }
+
+    #[test]
+    fn remove_with_one_unmatched_region_removes_nothing() {
+        let manager =
+            FakeManager::default().with_installed(PackageType::Ortho, &["EU-WEST", "AF-SOUTH"]);
+
+        let run = remove_selection(&manager, true, regions(&["EU", "XX"]), true);
+
+        assert!(packages_error(run.result).contains("'XX'"));
+        assert!(manager.removals().is_empty());
+    }
+
+    #[test]
+    fn remove_all_removes_every_installed_package_of_the_type_after_one_prompt() {
+        let manager = FakeManager::default()
+            .with_installed(PackageType::Ortho, &["EU-WEST", "AF-SOUTH"])
+            .with_installed(PackageType::Overlay, &["EU-WEST"]);
+
+        let run = remove_selection(&manager, true, Selection::All, false);
+
+        run.result.unwrap();
+        assert_eq!(manager.removals(), ["EU-WEST", "AF-SOUTH"]);
+        assert_eq!(
+            run.interaction.prompts(),
+            ["Are you sure you want to remove these 2 packages?"]
+        );
+    }
+
+    #[test]
+    fn remove_all_with_force_does_not_prompt() {
+        let manager =
+            FakeManager::default().with_installed(PackageType::Ortho, &["EU-WEST", "AF-SOUTH"]);
+
+        let run = remove_selection(&manager, false, Selection::All, true);
+
+        run.result.unwrap();
+        assert_eq!(manager.removals(), ["EU-WEST", "AF-SOUTH"]);
+        assert!(run.interaction.prompts().is_empty());
+    }
+
+    #[test]
+    fn remove_all_refuses_when_any_package_is_mounted() {
+        let manager = FakeManager::default()
+            .with_installed(PackageType::Ortho, &["EU-WEST", "AF-SOUTH"])
+            .with_mounted("AF-SOUTH");
+
+        let run = remove_selection(&manager, true, Selection::All, true);
+
+        assert!(packages_error(run.result).contains("mounted"));
+        assert!(manager.removals().is_empty());
+    }
+
+    #[test]
+    fn remove_all_with_nothing_installed_is_an_error() {
+        let manager = FakeManager::default();
+
+        let run = remove_selection(&manager, true, Selection::All, true);
+
+        assert!(packages_error(run.result).contains("No ortho packages are installed"));
+    }
+
     fn info(manager: &FakeManager, region: &str) -> Run {
         run(manager, true, |ctx| {
             InfoHandler::execute(
@@ -1004,11 +1116,27 @@ mod tests {
     // ------------------------------------------------------------------------
 
     fn install(manager: &FakeManager, answer: bool, region: &str, auto_overlays: bool) -> Run {
+        install_selection(
+            manager,
+            answer,
+            Selection::Regions(vec![region.to_string()]),
+            PackageType::Ortho,
+            auto_overlays,
+        )
+    }
+
+    fn install_selection(
+        manager: &FakeManager,
+        answer: bool,
+        selection: Selection,
+        package_type: PackageType,
+        auto_overlays: bool,
+    ) -> Run {
         run(manager, answer, |ctx| {
             InstallHandler::execute(
                 InstallArgs {
-                    region: region.to_string(),
-                    package_type: PackageType::Ortho,
+                    selection,
+                    package_type,
                     library_url: String::new(),
                     install_dir: install_dir(),
                     temp_dir: install_dir(),
@@ -1173,6 +1301,122 @@ mod tests {
     // ------------------------------------------------------------------------
     // update
     // ------------------------------------------------------------------------
+
+    #[test]
+    fn install_of_several_regions_installs_everything_they_select_in_one_batch() {
+        let manager = FakeManager::default().with_library(
+            PackageType::Ortho,
+            &["NA-GREENLAND", "EU-WEST", "AF-NORTH", "AF-SOUTH"],
+        );
+
+        let run = install_selection(
+            &manager,
+            true,
+            regions(&["AF", "NA-G"]),
+            PackageType::Ortho,
+            false,
+        );
+
+        run.result.unwrap();
+        assert_eq!(
+            manager.batches(),
+            [vec![
+                "NA-GREENLAND (ortho)".to_string(),
+                "AF-NORTH (ortho)".to_string(),
+                "AF-SOUTH (ortho)".to_string(),
+            ]]
+        );
+        assert_eq!(run.interaction.prompts(), ["Proceed with install?"]);
+        assert!(run
+            .output
+            .text()
+            .contains("AF, NA-G matches 3 packages (ortho):"));
+    }
+
+    #[test]
+    fn install_with_one_unmatched_region_installs_nothing() {
+        let manager =
+            FakeManager::default().with_library(PackageType::Ortho, &["EU-WEST", "AF-SOUTH"]);
+
+        let run = install_selection(
+            &manager,
+            true,
+            regions(&["EU", "XX"]),
+            PackageType::Ortho,
+            false,
+        );
+
+        assert!(packages_error(run.result).contains("'XX'"));
+        assert!(manager.installs().is_empty());
+    }
+
+    #[test]
+    fn install_all_installs_every_library_package_of_the_type_after_confirmation() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["EU-WEST", "AF-SOUTH"])
+            .with_library(PackageType::Overlay, &["EU-WEST"]);
+
+        let run = install_selection(&manager, true, Selection::All, PackageType::Ortho, false);
+
+        run.result.unwrap();
+        assert_eq!(manager.installs(), ["EU-WEST", "AF-SOUTH"]);
+        assert_eq!(run.interaction.prompts(), ["Proceed with install?"]);
+        assert!(run
+            .output
+            .text()
+            .contains("--all selects 2 packages (ortho):"));
+    }
+
+    #[test]
+    fn install_all_respects_the_package_type() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["EU-WEST", "AF-SOUTH"])
+            .with_library(PackageType::Overlay, &["EU-WEST"]);
+
+        let run = install_selection(&manager, true, Selection::All, PackageType::Overlay, false);
+
+        run.result.unwrap();
+        assert_eq!(manager.batches(), [vec!["EU-WEST (overlay)".to_string()]]);
+    }
+
+    #[test]
+    fn install_all_brings_overlays_along_when_auto_install_is_on() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["EU-WEST", "AF-SOUTH"])
+            .with_library(PackageType::Overlay, &["EU-WEST"]);
+
+        let run = install_selection(&manager, true, Selection::All, PackageType::Ortho, true);
+
+        run.result.unwrap();
+        assert_eq!(
+            manager.batches(),
+            [vec![
+                "EU-WEST (ortho)".to_string(),
+                "EU-WEST (overlay)".to_string(),
+                "AF-SOUTH (ortho)".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn declining_install_all_installs_nothing() {
+        let manager =
+            FakeManager::default().with_library(PackageType::Ortho, &["EU-WEST", "AF-SOUTH"]);
+
+        let run = install_selection(&manager, false, Selection::All, PackageType::Ortho, false);
+
+        run.result.unwrap();
+        assert!(manager.installs().is_empty());
+    }
+
+    #[test]
+    fn install_all_from_a_library_without_the_type_is_an_error() {
+        let manager = FakeManager::default().with_library(PackageType::Ortho, &["EU-WEST"]);
+
+        let run = install_selection(&manager, true, Selection::All, PackageType::Overlay, false);
+
+        assert!(packages_error(run.result).contains("The library offers no overlay packages"));
+    }
 
     fn update(manager: &FakeManager, region: &str) -> Run {
         run(manager, true, |ctx| {

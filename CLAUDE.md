@@ -380,9 +380,9 @@ xearthlayer scenery-index clear     # Delete the cache file
 
 # Package management (<reg> may be the start of a code: NA, NA-CANADA; #293)
 xearthlayer packages list           # List installed/available packages
-xearthlayer packages install <reg>  # Install every package <reg> selects
+xearthlayer packages install <reg>... # Install every package the codes select (or --all)
 xearthlayer packages update [reg]   # Update packages
-xearthlayer packages remove <reg>   # Remove packages (whole set validated, one prompt)
+xearthlayer packages remove <reg>...  # Remove packages (or --all; whole set validated, one prompt)
 xearthlayer packages info <reg>     # Show installed package details
 xearthlayer packages check          # Check for updates
 

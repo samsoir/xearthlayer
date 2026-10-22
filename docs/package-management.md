@@ -71,6 +71,19 @@ A full code is still the start of every longer code, so `EU` selects `EU`,
 `EU-WEST` and `EU-EAST` together. There is no way to name only the shorter
 one while the longer ones are installed.
 
+`install` and `remove` take several codes at once and act on everything any of
+them selects, each package once, so `xearthlayer packages install NA-CANADA
+AF` installs both halves of Canada and every Africa package as one batch. If
+any of the codes selects nothing, the command stops before downloading or
+removing anything. `--all` selects every package of the chosen type instead:
+the whole library for `install`, everything installed for `remove`. It works
+with every other option, and like any selection of several packages it is
+listed and confirmed first (`remove --force` skips the confirmation).
+`install --all` treats each package exactly as if you had named it, so a
+package already installed at the library's version reports "already
+installed" and the command ends with an error, while an older installed
+version is replaced.
+
 ### Check Available Packages
 
 See what packages are available and their update status:
@@ -273,6 +286,7 @@ All package commands support these common options:
 
 `<REGION>` is a region code or the start of one; see
 [Selecting Packages by Region Code](#selecting-packages-by-region-code).
+`install` and `remove` take one or more, or `--all` instead.
 
 | Option | Description |
 |--------|-------------|
@@ -283,11 +297,13 @@ All package commands support these common options:
 ### install
 
 ```bash
-xearthlayer packages install <REGION> [OPTIONS]
+xearthlayer packages install <REGION>... [OPTIONS]
+xearthlayer packages install --all [OPTIONS]
 ```
 
 | Option | Description |
 |--------|-------------|
+| `--all` | Install every package of the type in the library |
 | `--type <TYPE>` | Package type (default: ortho) |
 | `--temp-dir <PATH>` | Temporary download directory |
 
@@ -305,11 +321,13 @@ xearthlayer packages update [REGION] [OPTIONS]
 ### remove
 
 ```bash
-xearthlayer packages remove <REGION> [OPTIONS]
+xearthlayer packages remove <REGION>... [OPTIONS]
+xearthlayer packages remove --all [OPTIONS]
 ```
 
 | Option | Description |
 |--------|-------------|
+| `--all` | Remove every installed package of the type |
 | `-f, --force` | Skip confirmation prompt |
 | `--type <TYPE>` | Package type (default: ortho) |
 

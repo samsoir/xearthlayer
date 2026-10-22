@@ -23,18 +23,78 @@ pub fn resolve<T>(
     candidates: Vec<T>,
     code: impl Fn(&T) -> &str,
 ) -> Result<Vec<T>, CliError> {
-    let selector = selector.trim();
-    if selector.is_empty() {
+    resolve_many(&[selector.to_string()], candidates, code)
+}
+
+/// Resolve several selectors together: every candidate any of them selects,
+/// once each, in candidate order. One selector that matches nothing fails
+/// the whole resolution, so a typo never silently shrinks a batch.
+pub fn resolve_many<T>(
+    selectors: &[String],
+    candidates: Vec<T>,
+    code: impl Fn(&T) -> &str,
+) -> Result<Vec<T>, CliError> {
+    let selectors: Vec<&str> = selectors.iter().map(|s| s.trim()).collect();
+    if selectors.is_empty() || selectors.iter().any(|s| s.is_empty()) {
         return Err(CliError::Packages(
             "Region code must not be empty".to_string(),
         ));
     }
 
-    let selects = |c: &T| starts_with_ignore_case(code(c), selector);
-    if !candidates.iter().any(selects) {
-        return Err(no_match(selector, candidates.iter().map(&code)));
+    let selected_by = |c: &T, selector: &str| starts_with_ignore_case(code(c), selector);
+    if let Some(unmatched) = selectors
+        .iter()
+        .find(|s| !candidates.iter().any(|c| selected_by(c, s)))
+    {
+        return Err(no_match(unmatched, candidates.iter().map(&code)));
     }
-    Ok(candidates.into_iter().filter(selects).collect())
+    Ok(candidates
+        .into_iter()
+        .filter(|c| selectors.iter().any(|s| selected_by(c, s)))
+        .collect())
+}
+
+/// What a command acts on: the packages some region selectors pick, or every
+/// package (`--all`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    Regions(Vec<String>),
+    All,
+}
+
+impl Selection {
+    /// From the command line, where clap allows exactly one of the two forms.
+    pub fn from_args(regions: Vec<String>, all: bool) -> Self {
+        if all {
+            Self::All
+        } else {
+            Self::Regions(regions)
+        }
+    }
+
+    /// The candidates this selection picks. `--all` with no candidates is an
+    /// error carrying `nothing`, so a command never runs on an empty set.
+    pub fn select<T>(
+        &self,
+        candidates: Vec<T>,
+        code: impl Fn(&T) -> &str,
+        nothing: &str,
+    ) -> Result<Vec<T>, CliError> {
+        match self {
+            Self::All if candidates.is_empty() => Err(CliError::Packages(nothing.to_string())),
+            Self::All => Ok(candidates),
+            Self::Regions(selectors) => resolve_many(selectors, candidates, code),
+        }
+    }
+
+    /// The selection as the user typed it, for messages: `NA, EU-WEST` or
+    /// `--all`.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::All => "--all".to_string(),
+            Self::Regions(selectors) => selectors.join(", "),
+        }
+    }
 }
 
 /// `str::starts_with`, ignoring ASCII case. `get` rather than slicing, so a
@@ -178,6 +238,78 @@ mod tests {
         let message = error_message(resolve("NA", Vec::<&str>::new(), |c| c));
 
         assert!(message.contains("Available: none"), "{message}");
+    }
+
+    fn select_many(selectors: &[&str]) -> Result<Vec<&'static str>, CliError> {
+        let selectors: Vec<String> = selectors.iter().map(|s| s.to_string()).collect();
+        resolve_many(&selectors, CODES.to_vec(), |c| c)
+    }
+
+    #[test]
+    fn several_selectors_select_everything_any_of_them_matches_in_candidate_order() {
+        assert_eq!(
+            select_many(&["EU-WEST", "NA-CANADA"]).unwrap(),
+            vec!["NA-CANADA-WEST", "NA-CANADA-EAST", "EU-WEST"]
+        );
+    }
+
+    #[test]
+    fn overlapping_selectors_select_each_package_once() {
+        assert_eq!(
+            select_many(&["NA", "NA-CANADA"]).unwrap(),
+            select("NA").unwrap()
+        );
+    }
+
+    #[test]
+    fn one_selector_that_matches_nothing_fails_the_whole_selection() {
+        let message = error_message(select_many(&["NA", "XX"]));
+
+        assert!(message.contains("'XX'"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_selector_among_others_is_refused() {
+        let message = error_message(select_many(&["NA", "  "]));
+
+        assert!(message.contains("must not be empty"), "{message}");
+    }
+
+    #[test]
+    fn all_selects_every_candidate() {
+        assert_eq!(
+            Selection::All
+                .select(vec!["NA", "EU"], |c| c, "nothing")
+                .unwrap(),
+            vec!["NA", "EU"]
+        );
+    }
+
+    #[test]
+    fn all_with_no_candidates_is_an_error_with_the_given_message() {
+        let result =
+            Selection::All.select(Vec::<&str>::new(), |c| c, "No ortho packages installed");
+
+        assert_eq!(error_message(result), "No ortho packages installed");
+    }
+
+    #[test]
+    fn regions_select_through_their_selectors() {
+        let selection = Selection::Regions(vec!["AF".to_string()]);
+
+        assert_eq!(
+            selection.select(CODES.to_vec(), |c| c, "nothing").unwrap(),
+            vec!["AF-NORTH", "AF-SOUTH"]
+        );
+    }
+
+    #[test]
+    fn a_selection_is_built_from_the_command_line() {
+        assert_eq!(Selection::from_args(vec![], true), Selection::All);
+        assert_eq!(
+            Selection::from_args(vec!["NA".into(), "EU".into()], false),
+            Selection::Regions(vec!["NA".into(), "EU".into()])
+        );
     }
 
     #[test]
