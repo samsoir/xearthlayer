@@ -157,6 +157,13 @@ impl PackageManagerService for DefaultPackageManagerService {
         temp_dir: &Path,
         concurrent_downloads: usize,
     ) -> Vec<Result<InstallResult, CliError>> {
+        if self.active.stop_requested() {
+            let reason = ManagerError::Cancelled.to_string();
+            return packages
+                .iter()
+                .map(|_| Err(CliError::Packages(reason.clone())))
+                .collect();
+        }
         let observer = Arc::new(ConsoleQueueObserver::default());
         let installer = PackageInstaller::new(LocalPackageStore::new(install_dir), temp_dir)
             .with_parallel_downloads(concurrent_downloads);
@@ -172,7 +179,10 @@ impl PackageManagerService for DefaultPackageManagerService {
             }
         };
         self.active.set(queue.canceller());
-        let results = queue.install_batch(packages.to_vec());
+        let submitted = queue.submit_batch(packages.to_vec());
+        // A stop asked for before the batch was in the queue found nothing to stop.
+        self.active.reapply();
+        let results = queue.finish_batch(submitted);
         // Before the queue drops, and before any next queue starts: a live
         // canceller keeps the queue's lock held.
         self.active.clear();
@@ -192,6 +202,10 @@ impl PackageManagerService for DefaultPackageManagerService {
         package_type: PackageType,
         temp_dir: &Path,
     ) -> ManagerResult<()> {
+        // A stop asked for during an earlier remove ends a multi-package remove.
+        if self.active.stop_requested() {
+            return Err(ManagerError::Cancelled);
+        }
         // Through the queue, so a remove takes the same one-operation-at-a-time
         // lock as an install and uses the rename-aside removal.
         let observer = Arc::new(ConsoleQueueObserver::default());
@@ -208,6 +222,8 @@ impl PackageManagerService for DefaultPackageManagerService {
                 return Err(e);
             }
         };
+        // A stop asked for before the job was in the queue found nothing to stop.
+        self.active.reapply();
         let outcome = queue.wait_for(&[id]).remove(0);
         self.active.clear();
         drop(queue);
@@ -228,7 +244,7 @@ impl PackageManagerService for DefaultPackageManagerService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xearthlayer_package::package_mountpoint;
+    use xearthlayer_package::{package_mountpoint, parse_package_metadata};
 
     fn install_fake_package(root: &Path, region: &str) -> std::path::PathBuf {
         let folder = package_mountpoint(region, PackageType::Ortho);
@@ -291,6 +307,57 @@ mod tests {
             .remove_package(&store, "na", PackageType::Ortho, temp.path())
             .unwrap();
         assert!(active.current().is_none());
+    }
+
+    #[test]
+    fn a_remove_after_a_stop_request_is_cancelled_and_removes_nothing() {
+        let packages = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = install_fake_package(packages.path(), "eu");
+        let active = ActiveQueue::default();
+        let service = DefaultPackageManagerService::with_active_queue(active.clone());
+        let store = service.create_store(packages.path());
+        // Ctrl+C landed while an earlier package of the same command was removing.
+        active.request(crate::signals::Action::Cancel);
+
+        let err = service
+            .remove_package(&store, "eu", PackageType::Ortho, temp.path())
+            .unwrap_err();
+
+        assert!(matches!(err, ManagerError::Cancelled), "{err:?}");
+        assert!(dir.exists());
+    }
+
+    #[test]
+    fn an_install_after_a_stop_request_cancels_every_package_without_starting_a_queue() {
+        let packages = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let active = ActiveQueue::default();
+        let service = DefaultPackageManagerService::with_active_queue(active.clone());
+        active.request(crate::signals::Action::Cancel);
+        let metadata = |region: &str| {
+            parse_package_metadata(&format!(
+                "REGIONAL SCENERY PACKAGE\n1.0.0\n{}  1.0.0\n2024-01-01T00:00:00Z\nZ\n\
+                 zzXEL_{region}_ortho\ntest.tar.gz\n1\n\nabc123  test.tar.gz  http://127.0.0.1:9/x\n",
+                region.to_uppercase()
+            ))
+            .unwrap()
+        };
+
+        let results = service.install_packages(
+            &[metadata("eu"), metadata("na")],
+            packages.path(),
+            temp.path(),
+            1,
+        );
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.is_err()));
+        assert_eq!(
+            entries(temp.path()),
+            Vec::<String>::new(),
+            "no queue, so no lock file"
+        );
     }
 
     #[test]

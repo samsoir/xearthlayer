@@ -187,15 +187,30 @@ impl<S: Stages> InstallQueue<S> {
         &self,
         packages: Vec<PackageMetadata>,
     ) -> Vec<ManagerResult<InstallResult>> {
-        let submitted: Vec<ManagerResult<JobId>> = {
-            let mut state = self.shared.lock();
-            let submitted = packages
-                .into_iter()
-                .map(|m| self.submit_locked(&mut state, Job::Install(m)))
-                .collect();
-            self.shared.changed.notify_all();
-            submitted
-        };
+        let submitted = self.submit_batch(packages);
+        self.finish_batch(submitted)
+    }
+
+    /// Submit `packages` as install jobs under one lock and return one
+    /// submission result per package, in order. Pair with
+    /// [`finish_batch`](Self::finish_batch); the gap between them lets a
+    /// caller act on the queue once all of the batch is in it.
+    pub fn submit_batch(&self, packages: Vec<PackageMetadata>) -> Vec<ManagerResult<JobId>> {
+        let mut state = self.shared.lock();
+        let submitted = packages
+            .into_iter()
+            .map(|m| self.submit_locked(&mut state, Job::Install(m)))
+            .collect();
+        self.shared.changed.notify_all();
+        submitted
+    }
+
+    /// Wait for a batch from [`submit_batch`](Self::submit_batch) and return
+    /// one result per package, in order.
+    pub fn finish_batch(
+        &self,
+        submitted: Vec<ManagerResult<JobId>>,
+    ) -> Vec<ManagerResult<InstallResult>> {
         let ids: Vec<JobId> = submitted
             .iter()
             .filter_map(|r| r.as_ref().ok().copied())

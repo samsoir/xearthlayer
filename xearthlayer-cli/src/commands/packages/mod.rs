@@ -32,6 +32,7 @@ pub use handlers::{
 pub use services::{ConsoleInteraction, ConsoleOutput, DefaultPackageManagerService};
 pub use traits::CommandHandler;
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use args::{CheckArgs, InfoArgs, InstallArgs, ListArgs, RemoveArgs, UpdateArgs};
@@ -123,8 +124,9 @@ pub fn run(command: PackagesCommands) -> Result<(), CliError> {
     // Signals stop a running package operation cleanly; with none running
     // they keep their default action.
     let watch = SignalWatch::start(active, |notice| {
+        // A closed stderr must not panic the signal thread.
         if !crate::signals::terminal_gone() {
-            eprintln!("{notice}");
+            let _ = writeln!(std::io::stderr(), "{notice}");
         }
     })
     .map_err(|e| CliError::Packages(format!("could not install signal handlers: {e}")))?;
