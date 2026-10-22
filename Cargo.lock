@@ -4846,6 +4846,7 @@ dependencies = [
  "ratatui",
  "rlimit",
  "semver",
+ "signal-hook",
  "tempfile",
  "tokio",
  "tokio-util",

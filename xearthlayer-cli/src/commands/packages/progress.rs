@@ -119,6 +119,11 @@ impl ConsoleQueueObserver {
 
 impl QueueObserver for ConsoleQueueObserver {
     fn on_event(&self, id: JobId, event: &JobEvent<'_>) {
+        if crate::signals::terminal_gone() {
+            self.multi
+                .set_draw_target(indicatif::ProgressDrawTarget::hidden());
+            return;
+        }
         let label = {
             let mut lines = self.lines.lock().unwrap();
             if let JobEvent::Queued(summary) = event {

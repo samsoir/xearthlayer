@@ -52,6 +52,7 @@ dialoguer = "0.11"
 console = "0.15"
 indicatif = "0.17"
 rlimit = "0.10"
+signal-hook = "0.3"
 
 [features]
 profiling = ["xearthlayer/profiling"]

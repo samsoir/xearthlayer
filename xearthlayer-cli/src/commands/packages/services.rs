@@ -10,6 +10,7 @@ use std::sync::Arc;
 use super::progress::ConsoleQueueObserver;
 use super::traits::{Output, PackageManagerService, UserInteraction};
 use crate::error::CliError;
+use crate::signals::ActiveQueue;
 use xearthlayer::manager::{
     HttpLibraryClient, InstallQueue, InstallResult, InstalledPackage, Job, JobOutcome,
     LibraryClient, LocalPackageStore, ManagerError, ManagerResult, PackageInfo, PackageInstaller,
@@ -34,10 +35,16 @@ impl ConsoleOutput {
 
 impl Output for ConsoleOutput {
     fn println(&self, message: &str) {
+        if crate::signals::terminal_gone() {
+            return;
+        }
         println!("{}", message);
     }
 
     fn print(&self, message: &str) {
+        if crate::signals::terminal_gone() {
+            return;
+        }
         print!("{}", message);
         io::stdout().flush().ok();
     }
@@ -89,6 +96,8 @@ impl UserInteraction for ConsoleInteraction {
 #[derive(Debug, Clone, Default)]
 pub struct DefaultPackageManagerService {
     client: HttpLibraryClient,
+    /// The queue a signal should stop while a package operation runs.
+    active: ActiveQueue,
 }
 
 impl DefaultPackageManagerService {
@@ -96,6 +105,16 @@ impl DefaultPackageManagerService {
     pub fn new() -> Self {
         Self {
             client: HttpLibraryClient::new(),
+            active: ActiveQueue::default(),
+        }
+    }
+
+    /// A service whose running queue is published to `active`, so signals can
+    /// reach it.
+    pub fn with_active_queue(active: ActiveQueue) -> Self {
+        Self {
+            active,
+            ..Self::new()
         }
     }
 }
@@ -152,7 +171,11 @@ impl PackageManagerService for DefaultPackageManagerService {
                     .collect();
             }
         };
+        self.active.set(queue.canceller());
         let results = queue.install_batch(packages.to_vec());
+        // Before the queue drops, and before any next queue starts: a live
+        // canceller keeps the queue's lock held.
+        self.active.clear();
         drop(queue);
         observer.finish();
 
@@ -174,11 +197,19 @@ impl PackageManagerService for DefaultPackageManagerService {
         let observer = Arc::new(ConsoleQueueObserver::default());
         let installer = PackageInstaller::new(LocalPackageStore::new(store.root()), temp_dir);
         let queue = InstallQueue::start(installer, observer.clone())?;
-        let id = queue.submit(Job::Remove {
+        self.active.set(queue.canceller());
+        let id = match queue.submit(Job::Remove {
             region: region.to_string(),
             package_type,
-        })?;
+        }) {
+            Ok(id) => id,
+            Err(e) => {
+                self.active.clear();
+                return Err(e);
+            }
+        };
         let outcome = queue.wait_for(&[id]).remove(0);
+        self.active.clear();
         drop(queue);
         observer.finish();
         match outcome {
@@ -239,6 +270,27 @@ mod tests {
 
         assert!(!dir.exists());
         assert_eq!(entries(packages.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_finished_remove_leaves_no_queue_active_and_the_lock_free_for_the_next() {
+        let packages = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        install_fake_package(packages.path(), "eu");
+        install_fake_package(packages.path(), "na");
+        let active = ActiveQueue::default();
+        let service = DefaultPackageManagerService::with_active_queue(active.clone());
+        let store = service.create_store(packages.path());
+
+        service
+            .remove_package(&store, "eu", PackageType::Ortho, temp.path())
+            .unwrap();
+        assert!(active.current().is_none());
+        // A live canceller would keep the first queue's lock held.
+        service
+            .remove_package(&store, "na", PackageType::Ortho, temp.path())
+            .unwrap();
+        assert!(active.current().is_none());
     }
 
     #[test]

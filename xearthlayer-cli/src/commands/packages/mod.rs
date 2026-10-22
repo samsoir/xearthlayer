@@ -39,6 +39,7 @@ use traits::CommandContext;
 use xearthlayer::config::ConfigFile;
 
 use crate::error::CliError;
+use crate::signals::{ActiveQueue, SignalWatch};
 
 /// Load config or return default.
 fn load_config() -> ConfigFile {
@@ -114,12 +115,22 @@ pub fn run(command: PackagesCommands) -> Result<(), CliError> {
 
     // Create production context
     let output = ConsoleOutput::new();
-    let manager = DefaultPackageManagerService::new();
+    let active = ActiveQueue::default();
+    let manager = DefaultPackageManagerService::with_active_queue(active.clone());
     let interaction = ConsoleInteraction::new();
     let ctx = CommandContext::new(&output, &manager, &interaction);
 
+    // Signals stop a running package operation cleanly; with none running
+    // they keep their default action.
+    let watch = SignalWatch::start(active, |notice| {
+        if !crate::signals::terminal_gone() {
+            eprintln!("{notice}");
+        }
+    })
+    .map_err(|e| CliError::Packages(format!("could not install signal handlers: {e}")))?;
+
     // Dispatch to appropriate handler
-    match command {
+    let result = match command {
         PackagesCommands::List {
             install_dir,
             verbose,
@@ -218,5 +229,10 @@ pub fn run(command: PackagesCommands) -> Result<(), CliError> {
             },
             &ctx,
         ),
+    };
+
+    match watch.received() {
+        Some(signal) => Err(CliError::Interrupted(signal)),
+        None => result,
     }
 }

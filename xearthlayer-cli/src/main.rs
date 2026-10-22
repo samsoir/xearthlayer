@@ -20,6 +20,7 @@ mod error;
 mod logging_init;
 mod preflight;
 mod runner;
+mod signals;
 mod tui_app;
 mod ui;
 

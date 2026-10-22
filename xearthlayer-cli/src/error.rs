@@ -31,6 +31,8 @@ pub enum CliError {
     SceneryIndex(String),
     /// XEarthLayer needs initial setup
     NeedsSetup,
+    /// A package operation was stopped by a signal
+    Interrupted(crate::signals::Signal),
 }
 
 impl CliError {
@@ -43,6 +45,13 @@ impl CliError {
     /// from inside this function would skip them and silently truncate
     /// the on-disk log; see issue #194.
     pub fn report(&self) -> u8 {
+        if let CliError::Interrupted(signal) = self {
+            if !crate::signals::terminal_gone() {
+                eprintln!("Interrupted ({signal}). Anything unfinished was cancelled.");
+            }
+            return signal.exit_code();
+        }
+
         eprintln!("Error: {}", self);
 
         // Print additional help for specific errors
@@ -136,6 +145,7 @@ impl fmt::Display for CliError {
             CliError::NoPackages { .. } => write!(f, "No ortho packages installed"),
             CliError::SceneryIndex(msg) => write!(f, "Scenery index error: {}", msg),
             CliError::NeedsSetup => write!(f, "XEarthLayer needs initial setup"),
+            CliError::Interrupted(signal) => write!(f, "interrupted by {signal}"),
         }
     }
 }
