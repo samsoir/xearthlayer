@@ -471,6 +471,11 @@ fn run_part_worker(
                 counters.set_part_state(i, 2); // Done
                 return WorkerOutcome::Success { bytes };
             }
+            // A stop is not a failed attempt: no retry, no Failed state.
+            Err(ManagerError::Cancelled) => {
+                std::fs::remove_file(&dest).ok();
+                return WorkerOutcome::Aborted;
+            }
             Err(e) => {
                 last_error = e.to_string();
                 std::fs::remove_file(&dest).ok();
@@ -648,5 +653,39 @@ mod tests {
         for name in names {
             assert!(!temp.path().join(name).exists(), "{name} left behind");
         }
+    }
+
+    #[test]
+    fn a_stop_mid_stream_aborts_the_part_without_a_retry_or_a_failure() {
+        let base = crate::manager::download::test_server::slow_server();
+        let temp = tempfile::TempDir::new().unwrap();
+        let dest = temp.path().join("p.aa");
+        let counters = Arc::new(ProgressCounters::new(1));
+        let should_abort = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&should_abort);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let begun = Instant::now();
+
+        let outcome = run_part_worker(
+            0,
+            format!("{base}/p.aa"),
+            "0".repeat(64),
+            dest.clone(),
+            "p.aa".to_string(),
+            Duration::from_secs(30),
+            Arc::clone(&counters),
+            Arc::new(CountingSemaphore::new(1)),
+            should_abort,
+        );
+
+        assert!(matches!(outcome, WorkerOutcome::Aborted), "{outcome:?}");
+        assert!(begun.elapsed() < Duration::from_secs(5));
+        // Still "downloading": never Retrying (4) or Failed (3), and no error.
+        assert_eq!(counters.part_state(0), 1);
+        assert_eq!(counters.part_error(0), None);
+        assert!(!dest.exists(), "partial file left behind");
     }
 }
