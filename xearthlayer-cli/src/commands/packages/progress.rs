@@ -25,9 +25,10 @@ struct JobLine {
     bar: ProgressBar,
     /// The download status was shown. Applied once, not per snapshot.
     downloading: bool,
-    /// The spinner is armed. Re-arming joins the old ticker thread, which
-    /// must not happen under the queue's lock.
-    spinning: bool,
+    /// The line's current look, so a style is set only when it changes:
+    /// re-arming the spinner joins the old ticker thread, which must not
+    /// happen under the queue's lock.
+    look: Look,
 }
 
 /// The header, part bars and total of the package downloading now.
@@ -128,12 +129,12 @@ impl QueueObserver for ConsoleQueueObserver {
             let mut lines = self.lines.lock().unwrap();
             if let JobEvent::Queued(summary) = event {
                 let bar = self.multi.add(ProgressBar::new(0));
-                bar.set_style(plain_style());
+                bar.set_style(Look::Plain.style());
                 let line = JobLine {
                     label: label(summary),
                     bar,
                     downloading: false,
-                    spinning: false,
+                    look: Look::Plain,
                 };
                 lines.insert(id, line);
             }
@@ -145,18 +146,19 @@ impl QueueObserver for ConsoleQueueObserver {
                 JobEvent::Downloading(_) => std::mem::replace(&mut line.downloading, true),
                 _ => false,
             };
-            if matches!(event, JobEvent::Installing(_) | JobEvent::Removing) && !line.spinning {
-                line.spinning = true;
-                line.bar
-                    .set_style(ProgressStyle::with_template("{spinner:.cyan} {msg}").unwrap());
-                line.bar.enable_steady_tick(Duration::from_millis(100));
+            let look = look_after(event);
+            if look != line.look {
+                // A finished line drops the spinner, so it starts at column 0.
+                line.look = look;
+                line.bar.set_style(look.style());
+                if look == Look::Spinner {
+                    line.bar.enable_steady_tick(Duration::from_millis(100));
+                }
             }
             if let Some(text) = status(&line.label, event).filter(|_| !repeated_snapshot) {
                 line.bar.set_message(text);
             }
             if let JobEvent::Finished(outcome) = event {
-                // Every finished line starts at column 0, spinner or not.
-                line.bar.set_style(plain_style());
                 line.bar
                     .finish_with_message(finished_line(&line.label, outcome));
             }
@@ -171,9 +173,41 @@ impl QueueObserver for ConsoleQueueObserver {
     }
 }
 
-/// A line that shows only its message.
-fn plain_style() -> ProgressStyle {
-    ProgressStyle::with_template("{msg}").unwrap()
+/// How a job line is drawn. The colour lives in the template, so status
+/// text stays plain and is dropped with colour when output is not a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Look {
+    Plain,
+    /// Downloaded, waiting to install: light blue.
+    Downloaded,
+    Spinner,
+    /// Installed or removed: green, check mark included.
+    Done,
+}
+
+impl Look {
+    fn template(self) -> &'static str {
+        match self {
+            Look::Plain => "{msg}",
+            Look::Downloaded => "{msg:.blue.bright}",
+            Look::Spinner => "{spinner:.cyan} {msg}",
+            Look::Done => "{msg:.green}",
+        }
+    }
+
+    fn style(self) -> ProgressStyle {
+        ProgressStyle::with_template(self.template()).unwrap()
+    }
+}
+
+/// The look a job line takes on after `event`.
+fn look_after(event: &JobEvent<'_>) -> Look {
+    match event {
+        JobEvent::Downloaded => Look::Downloaded,
+        JobEvent::Installing(_) | JobEvent::Removing => Look::Spinner,
+        JobEvent::Finished(JobOutcome::Installed(_) | JobOutcome::Removed) => Look::Done,
+        _ => Look::Plain,
+    }
 }
 
 /// "NA-CANADA ortho v2.1.0", or without a version for a remove.
@@ -195,7 +229,8 @@ fn status(label: &str, event: &JobEvent<'_>) -> Option<String> {
             format_size(*needed as usize),
             format_size(*available as usize)
         )),
-        JobEvent::Downloading(_) => Some(format!("  {label}: downloading")),
+        // The arrow sits in the spinner's column, like the check mark later.
+        JobEvent::Downloading(_) => Some(format!("↓ {label}: downloading")),
         JobEvent::Downloaded => Some(format!("  {label}: downloaded, waiting to install")),
         JobEvent::Installing(stage) => Some(format!("{label}: {}", stage.name().to_lowercase())),
         JobEvent::Removing => Some(format!("{label}: removing")),
@@ -372,7 +407,7 @@ mod tests {
         };
         assert_eq!(
             status(LABEL, &JobEvent::Downloading(&progress)).as_deref(),
-            Some("  NA-CANADA ortho v2.1.0: downloading")
+            Some("↓ NA-CANADA ortho v2.1.0: downloading")
         );
         assert_eq!(
             status(LABEL, &JobEvent::Finished(&JobOutcome::Removed)),
@@ -380,18 +415,84 @@ mod tests {
         );
     }
 
-    #[test]
-    fn every_outcome_leaves_its_own_line() {
-        let installed = JobOutcome::Installed(InstallResult {
+    fn installed() -> JobOutcome {
+        JobOutcome::Installed(InstallResult {
             region: "NA-CANADA".to_string(),
             package_type: PackageType::Ortho,
             version: semver::Version::new(2, 1, 0),
             install_path: PathBuf::from("/scenery/zzXEL_na-canada_ortho"),
             bytes_downloaded: 1,
             files_extracted: 1,
-        });
+        })
+    }
+
+    #[test]
+    fn a_downloaded_package_waiting_to_install_turns_light_blue() {
+        assert_eq!(look_after(&JobEvent::Downloaded), Look::Downloaded);
+        assert!(Look::Downloaded.template().contains("{msg:.blue.bright}"));
+    }
+
+    #[test]
+    fn installing_and_removing_spin() {
+        for event in [
+            JobEvent::Installing(InstallStage::Extracting),
+            JobEvent::Removing,
+        ] {
+            assert_eq!(look_after(&event), Look::Spinner, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn an_installed_or_removed_package_turns_green() {
+        for outcome in [installed(), JobOutcome::Removed] {
+            assert_eq!(
+                look_after(&JobEvent::Finished(&outcome)),
+                Look::Done,
+                "{outcome:?}"
+            );
+        }
+        assert!(Look::Done.template().contains("{msg:.green}"));
+    }
+
+    #[test]
+    fn a_cancelled_or_failed_package_stays_plain() {
+        for outcome in [
+            JobOutcome::Cancelled,
+            JobOutcome::Failed(ManagerError::Cancelled),
+        ] {
+            assert_eq!(
+                look_after(&JobEvent::Finished(&outcome)),
+                Look::Plain,
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn earlier_events_keep_the_plain_look() {
+        let queued = summary(Some(semver::Version::new(2, 1, 0)));
+        let progress = DownloadProgress {
+            parts: Vec::new(),
+            total_bytes_downloaded: 0,
+            total_bytes: None,
+        };
+        for event in [
+            JobEvent::Queued(&queued),
+            JobEvent::Preparing,
+            JobEvent::WaitingForSpace {
+                needed: 1,
+                available: 0,
+            },
+            JobEvent::Downloading(&progress),
+        ] {
+            assert_eq!(look_after(&event), Look::Plain, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn every_outcome_leaves_its_own_line() {
         let cases = [
-            (installed, "✓ NA-CANADA ortho v2.1.0 installed"),
+            (installed(), "✓ NA-CANADA ortho v2.1.0 installed"),
             (JobOutcome::Removed, "✓ NA-CANADA ortho v2.1.0 removed"),
             (JobOutcome::Cancelled, "- NA-CANADA ortho v2.1.0 cancelled"),
             (
