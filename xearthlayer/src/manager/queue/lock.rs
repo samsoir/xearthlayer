@@ -53,15 +53,17 @@ impl QueueLock {
 }
 
 /// Clean up after a run that was killed. Call only while holding the lock.
-/// Install temp directories and staging folders are deleted. An aside
-/// folder is renamed back when its package folder is absent (the run died
-/// between the two renames of a swap, so the aside is the only copy) and
-/// deleted otherwise. Returns how many leftovers it handled.
+/// Install temp directories, staging folders and removed folders are
+/// deleted; a removed folder is a package part way through deletion, so it
+/// is never renamed back. An aside folder is renamed back when its package
+/// folder is absent (the run died between the two renames of a swap, so the
+/// aside is the only copy) and deleted otherwise. Returns how many
+/// leftovers it handled.
 pub(crate) fn sweep(temp_dir: &Path, packages_root: &Path) -> usize {
     let mut handled = 0;
     let deletable = entries(temp_dir, |name| name.starts_with(INSTALL_TEMP_PREFIX))
         .chain(entries(packages_root, |name| {
-            name.starts_with(aside::STAGING_PREFIX)
+            name.starts_with(aside::STAGING_PREFIX) || name.starts_with(aside::REMOVED_PREFIX)
         }));
     for path in deletable {
         handled += remove(&path) as usize;
@@ -173,6 +175,21 @@ mod tests {
         assert!(packages.join("zzXEL_eu_ortho").exists());
         assert!(packages.join("zzXEL_na_ortho").exists());
         assert!(tmp.join("unrelated").exists());
+    }
+
+    /// A removed folder is a package part way through deletion. It is never
+    /// the only good copy, so it is deleted even with no package beside it.
+    #[test]
+    fn the_sweep_deletes_a_removed_folder_and_never_restores_it() {
+        let temp = TempDir::new().unwrap();
+        let packages = temp.path().join("packages");
+        let removed = packages.join(".xel-removed-zzXEL_eu_ortho");
+        std::fs::create_dir_all(removed.join("terrain")).unwrap();
+
+        assert_eq!(sweep(&temp.path().join("tmp"), &packages), 1);
+
+        assert!(!removed.exists());
+        assert!(!packages.join("zzXEL_eu_ortho").exists());
     }
 
     /// The only copy of a package must survive a failed restore.

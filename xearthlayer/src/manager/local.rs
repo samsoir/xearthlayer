@@ -199,19 +199,39 @@ impl LocalPackageStore {
     /// # Safety
     ///
     /// This permanently deletes the package directory and all its contents.
+    /// The folder is first renamed to its removed name, which the startup
+    /// sweep only ever deletes, so a remove that is killed part way through
+    /// its delete never leaves a half-deleted package behind.
     pub fn remove(&self, region: &str, package_type: PackageType) -> ManagerResult<()> {
         let mountpoint = package_mountpoint(region, package_type);
         let package_dir = self.root.join(&mountpoint);
+        let not_found = || ManagerError::PackageNotFound {
+            region: region.to_string(),
+            package_type: package_type.to_string(),
+        };
 
         if !package_dir.exists() {
-            return Err(ManagerError::PackageNotFound {
-                region: region.to_string(),
-                package_type: package_type.to_string(),
-            });
+            return Err(not_found());
+        }
+        // An aside left by an earlier swap is stale, because the queue runs
+        // one operation at a time. Delete it while the package is still in
+        // place, or once the package is gone the sweep would rename it back.
+        let stale_aside = aside::aside_path(&package_dir);
+        if stale_aside.exists() {
+            aside::discard(&stale_aside);
         }
 
-        let aside = aside::set_aside(&package_dir)?.expect("the package folder exists");
-        aside::discard(&aside);
+        let removed = match aside::set_removed(&package_dir) {
+            Ok(removed) => removed,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found()),
+            Err(e) => {
+                return Err(ManagerError::WriteFailed {
+                    path: package_dir,
+                    source: e,
+                })
+            }
+        };
+        aside::discard(&removed);
         Ok(())
     }
 
@@ -465,6 +485,52 @@ mod tests {
 
         assert!(!install_path.exists());
         assert!(!crate::manager::aside::aside_path(&install_path).exists());
+    }
+
+    #[test]
+    fn a_removed_folder_is_not_listed_as_a_package() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "eu", PackageType::Ortho, "1.0.0");
+        let install_path = store.install_path("eu", PackageType::Ortho);
+        let removed = temp.path().join(".xel-removed-zzXEL_eu_ortho");
+        fs::create_dir_all(&removed).unwrap();
+        fs::copy(
+            install_path.join("xearthlayer_scenery_package.txt"),
+            removed.join("xearthlayer_scenery_package.txt"),
+        )
+        .unwrap();
+
+        let packages = store.list().unwrap();
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].path, install_path);
+    }
+
+    /// A remove renames the package straight to its removed name, which the
+    /// sweep only ever deletes. A stale aside beside it (an earlier swap's
+    /// old version that could not be deleted) goes too, or the next sweep
+    /// would rename it back as the package.
+    #[test]
+    fn remove_leaves_no_package_and_no_transient_folder() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "eu", PackageType::Ortho, "1.0.0");
+        create_mock_package(temp.path(), "na", PackageType::Ortho, "1.0.0");
+        let install_path = store.install_path("eu", PackageType::Ortho);
+        let stale_aside = temp.path().join(".xel-aside-zzXEL_eu_ortho");
+        let stale_removed = temp.path().join(".xel-removed-zzXEL_eu_ortho");
+        fs::create_dir_all(stale_aside.join("terrain")).unwrap();
+        fs::create_dir_all(stale_removed.join("terrain")).unwrap();
+
+        store.remove("eu", PackageType::Ortho).unwrap();
+
+        assert!(!install_path.exists());
+        let left: Vec<String> = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["zzXEL_na_ortho"]);
     }
 
     #[test]

@@ -304,10 +304,14 @@ cleanup. A live `Canceller` keeps the queue's lock held.
 **Lock and sweep.** Starting a queue takes an exclusive `flock` on
 `{temp_dir}/.queue.lock` for the queue's life (`ManagerError::QueueBusy` if
 another process holds it); the kernel drops it however the process exits. Under
-that lock, `sweep` deletes leftover `install_*` temp directories and
-`.xel-staging-*` folders, and renames a `.xel-aside-*` folder back when its
-package folder is missing (the process died between the two renames, so the
-aside is the only copy), deleting it otherwise.
+that lock, `sweep` deletes leftover `install_*` temp directories,
+`.xel-staging-*` folders and `.xel-removed-*` folders, and renames a
+`.xel-aside-*` folder back when its package folder is missing (the process died
+between a swap's two renames, so the aside is the only copy), deleting it
+otherwise. A remove never uses the aside name: it renames the package straight
+to `.xel-removed-<name>` and deletes it there. That delete can take minutes, and
+a tree it was part way through must never become a package again, so a removed
+folder is always deleted and never renamed back.
 
 **Observer.** `QueueObserver::on_event(id, &JobEvent)` receives `Queued`,
 `Preparing`, `WaitingForSpace`, `Downloading`, `Downloaded`, `Installing`,
@@ -378,7 +382,8 @@ pub struct MountState {
 ## Package Removal
 
 Removal is a `Job::Remove` in the same queue, so it takes the same lock as an
-install, and the old folder is renamed aside before it is deleted.
+install. The folder is renamed to `.xel-removed-<name>` before it is deleted,
+so a remove interrupted mid-delete leaves nothing the sweep would restore.
 
 ### Ortho Packages
 

@@ -1,18 +1,23 @@
-//! Replacing or removing a package folder by renaming it aside first.
+//! Replacing or removing a package folder by renaming it first.
 //!
 //! A rename is atomic on one filesystem, so a package folder is always
 //! either the old version or the new one, never neither, whenever the
 //! process stops. The new version is first staged beside the install path
 //! (the temp directory may be on another filesystem, so staging may copy),
-//! then swapped in with two renames in the same parent. The slow recursive
-//! delete happens after the rename.
+//! then swapped in with two renames in the same parent: the old version is
+//! renamed aside, then the staged one into place. The slow recursive delete
+//! of the old version happens after both renames.
 //!
-//! Aside and staging names start with a dot, so `LocalPackageStore::list`
-//! skips them. A killed process can leave either behind, and the queue's
-//! startup sweep settles them: a staging folder is always deleted; an aside
-//! whose package folder is absent (killed between the two renames) is renamed
-//! back, since it is then the only copy; an aside whose package folder exists
-//! is deleted.
+//! A remove renames the package straight to its removed name and deletes it
+//! there. That delete can take minutes, and a tree it was part way through
+//! is never a package again, so a removed folder is never renamed back.
+//!
+//! Aside, staging and removed names start with a dot, so
+//! `LocalPackageStore::list` skips them. A killed process can leave any of
+//! them behind, and the queue's startup sweep settles them: a staging or
+//! removed folder is always deleted; an aside whose package folder is absent
+//! (killed between a swap's two renames) is renamed back, since it is then
+//! the only copy; an aside whose package folder exists is deleted.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -24,8 +29,9 @@ use super::error::{ManagerError, ManagerResult};
 
 pub(crate) const ASIDE_PREFIX: &str = ".xel-aside-";
 pub(crate) const STAGING_PREFIX: &str = ".xel-staging-";
+pub(crate) const REMOVED_PREFIX: &str = ".xel-removed-";
 
-/// Where `path` is moved while it is being replaced or removed.
+/// Where `path` is moved while it is being replaced.
 pub(crate) fn aside_path(path: &Path) -> PathBuf {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     path.with_file_name(format!("{ASIDE_PREFIX}{name}"))
@@ -35,6 +41,12 @@ pub(crate) fn aside_path(path: &Path) -> PathBuf {
 pub(crate) fn staging_path(path: &Path) -> PathBuf {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     path.with_file_name(format!("{STAGING_PREFIX}{name}"))
+}
+
+/// Where `path` is moved to be deleted when it is removed.
+pub(crate) fn removed_path(path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!("{REMOVED_PREFIX}{name}"))
 }
 
 /// A package staged beside its install path, not yet swapped in.
@@ -68,7 +80,9 @@ impl Drop for Staged {
 /// True for the names of folders that exist only mid-replacement.
 pub(crate) fn is_transient(name: &OsStr) -> bool {
     let name = name.to_string_lossy();
-    name.starts_with(ASIDE_PREFIX) || name.starts_with(STAGING_PREFIX)
+    [ASIDE_PREFIX, STAGING_PREFIX, REMOVED_PREFIX]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 /// Rename `path` aside if it exists, returning where it went. An aside left
@@ -88,6 +102,19 @@ pub(crate) fn set_aside(path: &Path) -> ManagerResult<Option<PathBuf>> {
     Ok(Some(aside))
 }
 
+/// Rename the package at `path` to its removed name, ready to delete. A
+/// removed folder left by an earlier run is deleted first, since a rename
+/// cannot replace a folder that is not empty. The rename's error is returned
+/// as is, so the caller can tell a package that has gone from a failure.
+pub(crate) fn set_removed(path: &Path) -> std::io::Result<PathBuf> {
+    let removed = removed_path(path);
+    if removed.exists() {
+        discard(&removed);
+    }
+    fs::rename(path, &removed)?;
+    Ok(removed)
+}
+
 /// Undo a failed replacement: drop whatever reached `path` and rename the
 /// aside back. Best effort; a failure is logged and the sweep finishes it.
 pub(crate) fn restore(path: &Path, aside: Option<&Path>) {
@@ -98,15 +125,21 @@ pub(crate) fn restore(path: &Path, aside: Option<&Path>) {
     }
     if let Some(aside) = aside {
         if let Err(e) = fs::rename(aside, path) {
-            warn!(path = %path.display(), error = %e, "could not restore the previous package version");
+            warn!(
+                path = %path.display(),
+                aside = %aside.display(),
+                error = %e,
+                "could not restore the previous package version; it stays on disk at the aside path"
+            );
         }
     }
 }
 
-/// Delete an aside folder. Best effort: the startup sweep retries.
-pub(crate) fn discard(aside: &Path) {
-    if let Err(e) = fs::remove_dir_all(aside) {
-        warn!(path = %aside.display(), error = %e, "could not delete a replaced package");
+/// Delete a set-aside, staging or removed folder. Best effort: the startup
+/// sweep retries.
+pub(crate) fn discard(folder: &Path) {
+    if let Err(e) = fs::remove_dir_all(folder) {
+        warn!(path = %folder.display(), error = %e, "could not delete a replaced or removed package");
     }
 }
 
@@ -171,9 +204,32 @@ mod tests {
     }
 
     #[test]
-    fn transient_names_are_both_prefixes_and_not_packages() {
+    fn set_removed_replaces_a_stale_removed_folder() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("zzXEL_eu_ortho");
+        folder_with(&path, "current.txt", "current");
+        folder_with(&removed_path(&path), "stale.txt", "stale");
+
+        let removed = set_removed(&path).unwrap();
+
+        assert_eq!(removed, removed_path(&path));
+        assert!(!path.exists());
+        assert!(removed.join("current.txt").exists());
+        assert!(!removed.join("stale.txt").exists());
+    }
+
+    #[test]
+    fn set_removed_on_a_missing_path_is_not_found() {
+        let temp = TempDir::new().unwrap();
+        let error = set_removed(&temp.path().join("zzXEL_eu_ortho")).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn transient_names_are_every_prefix_and_not_packages() {
         assert!(is_transient(OsStr::new(".xel-aside-zzXEL_eu_ortho")));
         assert!(is_transient(OsStr::new(".xel-staging-zzXEL_eu_ortho")));
+        assert!(is_transient(OsStr::new(".xel-removed-zzXEL_eu_ortho")));
         assert!(!is_transient(OsStr::new("zzXEL_eu_ortho")));
         assert!(is_transient(
             aside_path(Path::new("/x/zzXEL_eu_ortho"))
@@ -182,6 +238,11 @@ mod tests {
         ));
         assert!(is_transient(
             staging_path(Path::new("/x/zzXEL_eu_ortho"))
+                .file_name()
+                .unwrap()
+        ));
+        assert!(is_transient(
+            removed_path(Path::new("/x/zzXEL_eu_ortho"))
                 .file_name()
                 .unwrap()
         ));
