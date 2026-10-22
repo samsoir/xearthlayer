@@ -152,7 +152,17 @@ impl<S: Stages> Drop for InstallQueue<S> {
             self.shared.changed.notify_all();
         }
         for thread in self.threads.drain(..) {
-            let _ = thread.join();
+            let name = thread
+                .thread()
+                .name()
+                .unwrap_or("install queue")
+                .to_string();
+            if let Err(payload) = thread.join() {
+                tracing::error!(
+                    "{name} thread panicked: {}",
+                    state::panic_message(payload.as_ref())
+                );
+            }
         }
     }
 }

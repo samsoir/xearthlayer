@@ -56,12 +56,22 @@ struct Fake {
     /// Downloads that finish even once cancelled, like one whose last
     /// byte arrives as the queue shuts down.
     ignore_cancel: Mutex<HashSet<String>>,
+    /// Title to the stage that panics for it.
+    panic_in: Mutex<HashMap<String, &'static str>>,
+    /// How many times the queue read the free space.
+    free_reads: AtomicU64,
     log: Mutex<Vec<String>>,
 }
 
 impl Fake {
     fn record(&self, line: String) {
         self.log.lock().unwrap().push(line);
+    }
+    fn maybe_panic(&self, title: &str, stage: &str) {
+        let armed = self.panic_in.lock().unwrap().get(title) == Some(&stage);
+        if armed {
+            panic!("{stage} blew up for {title}");
+        }
     }
     fn logged(&self, line: &str) -> bool {
         self.log.lock().unwrap().iter().any(|l| l == line)
@@ -109,6 +119,7 @@ impl Stages for FakeStages {
     }
 
     fn available_bytes(&self) -> ManagerResult<u64> {
+        self.0.free_reads.fetch_add(1, Ordering::SeqCst);
         Ok(self.0.free.load(Ordering::SeqCst))
     }
 
@@ -135,6 +146,7 @@ impl Stages for FakeStages {
         _progress: DownloadProgressCallback,
     ) -> ManagerResult<String> {
         self.0.record(format!("download started {title}"));
+        self.0.maybe_panic(&title, "download");
         let cancel = if self.0.ignore_cancel.lock().unwrap().contains(&title) {
             &CancelToken::new()
         } else {
@@ -166,6 +178,7 @@ impl Stages for FakeStages {
             return Err(ManagerError::Cancelled);
         }
         ctx.stage(InstallStage::Installing);
+        self.0.maybe_panic(&title, "install");
         if let Some(gate) = Fake::gate(&self.0.hold_swap, &title) {
             gate.pass(&CancelToken::new()); // the swap ignores cancellation
         }
@@ -492,4 +505,102 @@ fn a_download_that_finishes_during_shutdown_still_reports_cancelled() {
 
     assert!(stages.0.logged("downloaded A"));
     assert_eq!(events.of(a).last().unwrap(), "finished cancelled");
+}
+
+fn assert_panicked(result: &ManagerResult<InstallResult>, expected: &str) {
+    match result {
+        Err(ManagerError::Panicked { stage, message }) => {
+            assert_eq!(*stage, expected);
+            assert!(message.contains("blew up"), "{message}");
+        }
+        other => panic!("expected Panicked in {expected}, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_panicking_install_fails_its_job_and_the_queue_carries_on() {
+    let stages = FakeStages::new(u64::MAX);
+    stages
+        .0
+        .panic_in
+        .lock()
+        .unwrap()
+        .insert("A".into(), "install");
+    let (queue, _) = start(&stages);
+
+    let results = queue.install_batch(vec![meta("A"), meta("B")]);
+
+    assert_panicked(&results[0], "install");
+    assert_eq!(results[1].as_ref().unwrap().region, "B");
+    assert!(
+        !queue.shared.lock().swapping,
+        "a panic mid-swap clears the flag"
+    );
+    queue.submit(Job::Install(meta("C"))).unwrap();
+    queue.wait_idle();
+    assert!(stages.0.logged("installed C"));
+}
+
+#[test]
+fn a_panicking_download_fails_its_job_and_the_next_download_runs() {
+    let stages = FakeStages::new(u64::MAX);
+    stages
+        .0
+        .panic_in
+        .lock()
+        .unwrap()
+        .insert("A".into(), "download");
+    let (queue, _) = start(&stages);
+
+    let results = queue.install_batch(vec![meta("A"), meta("B")]);
+
+    assert_panicked(&results[0], "download");
+    assert_eq!(results[1].as_ref().unwrap().region, "B");
+    queue.wait_idle();
+}
+
+/// Panics on the events every job passes through on its way to finishing.
+struct PanickingObserver;
+
+impl QueueObserver for PanickingObserver {
+    fn on_event(&self, _id: JobId, event: &JobEvent<'_>) {
+        if matches!(event, JobEvent::Downloaded | JobEvent::Finished(_)) {
+            panic!("observer blew up");
+        }
+    }
+}
+
+#[test]
+fn a_panicking_observer_does_not_stop_the_queue() {
+    let stages = FakeStages::new(u64::MAX);
+    let queue = InstallQueue::start(stages.clone(), Arc::new(PanickingObserver)).unwrap();
+
+    let results = queue.install_batch(vec![meta("A"), meta("B")]);
+
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    queue.wait_idle();
+}
+
+#[test]
+fn free_space_is_read_once_per_busy_period() {
+    // Each install alone needs the whole 200, so every download after the
+    // first is admitted only once the install ahead of it has finished.
+    let stages = FakeStages::new(200);
+    stages
+        .size("A", 50)
+        .size("B", 50)
+        .size("C", 50)
+        .size("D", 50);
+    let (queue, _) = start(&stages);
+
+    let results = queue.install_batch(vec![meta("A"), meta("B"), meta("C")]);
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    assert_eq!(stages.0.free_reads.load(Ordering::SeqCst), 1);
+
+    assert!(queue.install_batch(vec![meta("D")])[0].is_ok());
+    assert_eq!(
+        stages.0.free_reads.load(Ordering::SeqCst),
+        2,
+        "read again after idle"
+    );
 }

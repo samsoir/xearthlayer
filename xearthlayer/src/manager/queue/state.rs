@@ -1,6 +1,8 @@
 //! The queue's shared state, and the transitions every thread uses.
 
+use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
@@ -107,8 +109,17 @@ impl<S: Stages> Shared<S> {
 
     /// Report an event. Callers hold the lock, so one job's events can
     /// never be reordered between threads.
+    /// An observer that panics is logged and otherwise ignored: unwinding
+    /// here would leave the job unfinished with the lock poisoned.
     pub(super) fn emit(&self, id: JobId, event: JobEvent<'_>) {
-        self.observer.on_event(id, &event);
+        let call = panic::catch_unwind(AssertUnwindSafe(|| self.observer.on_event(id, &event)));
+        if let Err(payload) = call {
+            tracing::error!(
+                job = id.0,
+                "install queue observer panicked: {}",
+                panic_message(payload.as_ref())
+            );
+        }
     }
 
     /// Record `id`'s outcome and wake every waiter. Callers hold the lock.
@@ -134,5 +145,16 @@ pub(super) fn outcome_of(error: ManagerError) -> JobOutcome {
     match error {
         ManagerError::Cancelled => JobOutcome::Cancelled,
         e => JobOutcome::Failed(e),
+    }
+}
+
+/// The text of a panic payload, for logs and `ManagerError::Panicked`.
+pub(super) fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }

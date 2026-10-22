@@ -1,5 +1,6 @@
 //! The downloader and installer threads.
 
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 
 use xearthlayer_package::PackageMetadata;
@@ -7,11 +8,23 @@ use xearthlayer_package::PackageMetadata;
 use super::job::{Job, JobEvent, JobId, JobOutcome};
 use super::ledger::Admission;
 use super::stages::{InstallContext, Stages};
-use super::state::{outcome_of, Phase, Ready, Shared};
+use super::state::{outcome_of, panic_message, Phase, Ready, Shared};
 use crate::manager::cancel::CancelToken;
 use crate::manager::download::DownloadProgressCallback;
-use crate::manager::error::ManagerError;
+use crate::manager::error::{ManagerError, ManagerResult};
 use crate::manager::installer::InstallStage;
+
+/// Run one `Stages` call. A panic becomes `ManagerError::Panicked`, so it
+/// fails that job and the thread goes on to the next one; whatever payload
+/// the call was given was dropped as it unwound.
+fn guarded<T>(stage: &'static str, call: impl FnOnce() -> ManagerResult<T>) -> ManagerResult<T> {
+    panic::catch_unwind(AssertUnwindSafe(call)).unwrap_or_else(|payload| {
+        Err(ManagerError::Panicked {
+            stage,
+            message: panic_message(payload.as_ref()),
+        })
+    })
+}
 
 pub(super) fn run_downloader<S: Stages>(shared: Arc<Shared<S>>) {
     while let Some((id, metadata, token)) = next_download(&shared) {
@@ -48,18 +61,22 @@ fn download_one<S: Stages>(
     metadata: &PackageMetadata,
     token: &CancelToken,
 ) {
-    let prepared = match shared.stages.prepare(metadata) {
-        Ok(prepared) => prepared,
+    let sized = guarded("prepare", || {
+        let prepared = shared.stages.prepare(metadata)?;
+        let size = shared.stages.download_size(&prepared);
+        Ok((prepared, size))
+    });
+    let (prepared, size) = match sized {
+        Ok(sized) => sized,
         Err(e) => return shared.finish_now(id, outcome_of(e)),
     };
-    let size = shared.stages.download_size(&prepared);
     if !admit(shared, id, size, token) {
         return; // `prepared` drops here, outside the lock
     }
-    match shared
-        .stages
-        .download(prepared, token, progress_callback(shared, id))
-    {
+    let progress = progress_callback(shared, id);
+    match guarded("download", || {
+        shared.stages.download(prepared, token, progress)
+    }) {
         Ok(downloaded) => {
             let mut state = shared.lock();
             // Once shutting down, the installer may already have drained its
@@ -86,7 +103,7 @@ fn download_one<S: Stages>(
 fn admit<S: Stages>(shared: &Shared<S>, id: JobId, size: u64, token: &CancelToken) -> bool {
     let mut state = shared.lock();
     if !state.capacity_known {
-        match shared.stages.available_bytes() {
+        match guarded("available_bytes", || shared.stages.available_bytes()) {
             Ok(free) => {
                 state.ledger.set_capacity(free);
                 state.capacity_known = true;
@@ -191,9 +208,9 @@ fn install_one<S: Stages>(
         return;
     }
     let context = Context { shared, id, token };
-    let result = shared.stages.install(downloaded, &context);
+    let result = guarded("install", || shared.stages.install(downloaded, &context));
     let mut state = shared.lock();
-    state.swapping = false;
+    state.swapping = false; // also after a panic mid-swap
     let outcome = match result {
         Ok(installed) => JobOutcome::Installed(installed),
         Err(e) => outcome_of(e),
@@ -212,7 +229,7 @@ fn remove_one<S: Stages>(shared: &Shared<S>, id: JobId, token: CancelToken) {
         let summary = &state.jobs[&id].summary;
         (summary.region.clone(), summary.package_type)
     };
-    let result = shared.stages.remove(&region, package_type);
+    let result = guarded("remove", || shared.stages.remove(&region, package_type));
     let outcome = match result {
         Ok(()) => JobOutcome::Removed,
         Err(e) => outcome_of(e),
