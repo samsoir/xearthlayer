@@ -802,6 +802,29 @@ fn abandoning_returns_without_waiting_for_a_slow_install() {
 }
 
 #[test]
+fn an_abandoned_queue_keeps_its_lock_until_its_detached_threads_finish() {
+    let stages = FakeStages::new(u64::MAX);
+    let stuck = Fake::hold(&stages.0.hold_install, "A");
+    stages.0.ignore_cancel.lock().unwrap().insert("A".into());
+    let (queue, events) = start(&stages);
+    let a = queue.submit(Job::Install(meta("A"))).unwrap();
+    eventually("A extracting", || {
+        events.of(a).contains(&"installing Extracting".to_string())
+    });
+    queue.canceller().abandon();
+    queue.wait_for(&[a]);
+    drop(queue); // abandoned: does not join, the install is still running
+
+    let second = InstallQueue::start(stages.clone(), Arc::new(Events::default()));
+    assert!(matches!(second, Err(ManagerError::QueueBusy { .. })));
+
+    stuck.open();
+    eventually("the detached threads release the lock", || {
+        InstallQueue::start(stages.clone(), Arc::new(Events::default())).is_ok()
+    });
+}
+
+#[test]
 fn abandoning_still_waits_for_a_swap_in_progress() {
     let stages = FakeStages::new(u64::MAX);
     let swap = Fake::hold(&stages.0.hold_swap, "A");

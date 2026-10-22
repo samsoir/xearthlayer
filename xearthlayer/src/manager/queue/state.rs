@@ -8,6 +8,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use super::job::{CancelResult, Job, JobEvent, JobId, JobOutcome, JobSummary, QueueObserver};
 use super::ledger::DiskLedger;
+use super::lock::QueueLock;
 use super::stages::Stages;
 use crate::manager::cancel::CancelToken;
 use crate::manager::error::ManagerError;
@@ -88,16 +89,21 @@ pub(super) struct Shared<S: Stages> {
     state: Mutex<State<S::Downloaded>>,
     pub(super) changed: Condvar,
     pub(super) next_id: AtomicU64,
+    /// Held until the last holder of this state goes: normally after both
+    /// threads are joined, and when the queue is abandoned, after the
+    /// detached threads finish, so no new queue sweeps under them.
+    _lock: QueueLock,
 }
 
 impl<S: Stages> Shared<S> {
-    pub(super) fn new(stages: S, observer: Arc<dyn QueueObserver>) -> Self {
+    pub(super) fn new(stages: S, observer: Arc<dyn QueueObserver>, lock: QueueLock) -> Self {
         Self {
             stages,
             observer,
             state: Mutex::new(State::new()),
             changed: Condvar::new(),
             next_id: AtomicU64::new(1),
+            _lock: lock,
         }
     }
 

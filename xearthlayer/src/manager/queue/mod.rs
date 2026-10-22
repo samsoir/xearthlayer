@@ -38,7 +38,9 @@ pub trait QueueControl: Send + Sync {
     fn abandon(&self);
 }
 
-/// A cloneable handle on a queue's [`QueueControl`].
+/// A cloneable handle on a queue's [`QueueControl`]. While any clone is
+/// alive the queue's lock on its temp directory stays held, so a new queue
+/// cannot start; drop the handle when the queue is done.
 #[derive(Clone)]
 pub struct Canceller(Arc<dyn QueueControl>);
 
@@ -71,15 +73,13 @@ impl<S: Stages> QueueControl for state::Shared<S> {
 pub struct InstallQueue<S: Stages = crate::manager::PackageInstaller> {
     shared: Arc<state::Shared<S>>,
     threads: Vec<JoinHandle<()>>,
-    /// Declared last so it is released after `Drop` has joined the threads.
-    _lock: lock::QueueLock,
 }
 
 impl<S: Stages> InstallQueue<S> {
     pub fn start(stages: S, observer: Arc<dyn QueueObserver>) -> ManagerResult<Self> {
         let lock = lock::QueueLock::acquire(stages.temp_dir())?;
         lock::sweep(stages.temp_dir(), stages.packages_root());
-        let shared = Arc::new(state::Shared::new(stages, observer));
+        let shared = Arc::new(state::Shared::new(stages, observer, lock));
         let spawn = |name: &str, body: fn(Arc<state::Shared<S>>)| {
             let shared = Arc::clone(&shared);
             thread::Builder::new()
@@ -91,11 +91,7 @@ impl<S: Stages> InstallQueue<S> {
             spawn("xel-queue-download", worker::run_downloader),
             spawn("xel-queue-install", worker::run_installer),
         ];
-        Ok(Self {
-            shared,
-            threads,
-            _lock: lock,
-        })
+        Ok(Self { shared, threads })
     }
 
     /// Queue `job`. Refused if its package already has an unfinished job,
@@ -148,7 +144,8 @@ impl<S: Stages> InstallQueue<S> {
     }
 
     /// A handle that cancels or abandons this queue from elsewhere, such
-    /// as a signal handler.
+    /// as a signal handler. A live `Canceller` keeps the queue's lock
+    /// held, because the lock is released with the queue's shared state.
     pub fn canceller(&self) -> Canceller {
         Canceller(self.shared.clone())
     }

@@ -116,3 +116,97 @@ fn entries(dir: &Path, matches: impl Fn(&str) -> bool) -> impl Iterator<Item = P
         .filter(move |e| e.path().is_dir() && matches(&e.file_name().to_string_lossy()))
         .map(|e| e.path())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn a_second_lock_on_the_same_directory_is_refused_until_the_first_is_dropped() {
+        let temp = TempDir::new().unwrap();
+        let first = QueueLock::acquire(temp.path()).unwrap();
+
+        assert!(matches!(
+            QueueLock::acquire(temp.path()),
+            Err(ManagerError::QueueBusy { .. })
+        ));
+
+        drop(first);
+        assert!(QueueLock::acquire(temp.path()).is_ok());
+    }
+
+    #[test]
+    fn the_sweep_restores_an_aside_whose_package_folder_is_missing() {
+        let temp = TempDir::new().unwrap();
+        let packages = temp.path().join("packages");
+        let aside = packages.join(".xel-aside-zzXEL_eu_ortho");
+        std::fs::create_dir_all(aside.join("terrain")).unwrap();
+
+        assert_eq!(sweep(&temp.path().join("tmp"), &packages), 1);
+
+        assert!(packages.join("zzXEL_eu_ortho/terrain").exists());
+        assert!(!aside.exists());
+    }
+
+    #[test]
+    fn the_sweep_deletes_leftover_installs_and_asides_and_nothing_else() {
+        let temp = TempDir::new().unwrap();
+        let tmp = temp.path().join("tmp");
+        let packages = temp.path().join("packages");
+        for dir in [
+            tmp.join("install_eu_ortho_1.0.0/extracted"),
+            packages.join(".xel-aside-zzXEL_eu_ortho/terrain"),
+            packages.join("zzXEL_eu_ortho"), // the aside's package exists, so the aside is stale
+            packages.join(".xel-staging-zzXEL_af_ortho/terrain"),
+            packages.join("zzXEL_na_ortho"),
+            tmp.join("unrelated"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        assert_eq!(sweep(&tmp, &packages), 3);
+
+        assert!(!tmp.join("install_eu_ortho_1.0.0").exists());
+        assert!(!packages.join(".xel-aside-zzXEL_eu_ortho").exists());
+        assert!(!packages.join(".xel-staging-zzXEL_af_ortho").exists());
+        assert!(packages.join("zzXEL_eu_ortho").exists());
+        assert!(packages.join("zzXEL_na_ortho").exists());
+        assert!(tmp.join("unrelated").exists());
+    }
+
+    /// The only copy of a package must survive a failed restore.
+    #[test]
+    fn an_aside_that_cannot_be_restored_is_left_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let packages = temp.path().join("packages");
+        let aside = packages.join(".xel-aside-zzXEL_eu_ortho");
+        std::fs::create_dir_all(aside.join("terrain")).unwrap();
+        // A read-only packages folder makes the rename fail.
+        std::fs::set_permissions(&packages, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let writable = std::fs::File::create(packages.join("probe")).is_ok();
+
+        let handled = sweep(&temp.path().join("tmp"), &packages);
+
+        std::fs::set_permissions(&packages, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if writable {
+            return; // running as root: permissions cannot induce the failure
+        }
+        assert_eq!(handled, 0);
+        assert!(aside.join("terrain").exists());
+    }
+
+    #[test]
+    fn the_sweep_tolerates_missing_directories() {
+        let temp = TempDir::new().unwrap();
+        assert_eq!(
+            sweep(
+                &temp.path().join("no-tmp"),
+                &temp.path().join("no-packages")
+            ),
+            0
+        );
+    }
+}
