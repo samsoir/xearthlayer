@@ -86,11 +86,23 @@ impl<S: Stages> InstallQueue<S> {
         Ok(Self { shared, threads })
     }
 
-    /// Queue `job`. Refused if its package already has an unfinished job.
+    /// Queue `job`. Refused if its package already has an unfinished job,
+    /// or once the queue is shutting down or abandoned.
     pub fn submit(&self, job: Job) -> ManagerResult<JobId> {
-        let summary = job.summary();
         let mut state = self.shared.lock();
-        if state.shutting_down {
+        let submitted = self.submit_locked(&mut state, job);
+        self.shared.changed.notify_all();
+        submitted
+    }
+
+    /// `submit` under a held lock. The caller notifies the threads.
+    fn submit_locked(
+        &self,
+        state: &mut state::State<S::Downloaded>,
+        job: Job,
+    ) -> ManagerResult<JobId> {
+        let summary = job.summary();
+        if state.shutting_down || state.abandoned {
             return Err(ManagerError::QueueClosed);
         }
         if state.holds(&summary) {
@@ -115,7 +127,6 @@ impl<S: Stages> InstallQueue<S> {
             JobKind::Install => state.downloads.push_back(id),
             JobKind::Remove => state.installs.push_back((id, state::Ready::Remove)),
         }
-        self.shared.changed.notify_all();
         Ok(id)
     }
 
@@ -161,14 +172,21 @@ impl<S: Stages> InstallQueue<S> {
     }
 
     /// Install `packages` and return one result per package, in order.
+    /// The whole batch is submitted under one lock, so a `cancel_all`
+    /// sees all of it or none of it.
     pub fn install_batch(
         &self,
         packages: Vec<PackageMetadata>,
     ) -> Vec<ManagerResult<InstallResult>> {
-        let submitted: Vec<ManagerResult<JobId>> = packages
-            .into_iter()
-            .map(|m| self.submit(Job::Install(m)))
-            .collect();
+        let submitted: Vec<ManagerResult<JobId>> = {
+            let mut state = self.shared.lock();
+            let submitted = packages
+                .into_iter()
+                .map(|m| self.submit_locked(&mut state, Job::Install(m)))
+                .collect();
+            self.shared.changed.notify_all();
+            submitted
+        };
         let ids: Vec<JobId> = submitted
             .iter()
             .filter_map(|r| r.as_ref().ok().copied())

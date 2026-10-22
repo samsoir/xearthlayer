@@ -41,7 +41,9 @@ pub trait Stages: Send + Sync + 'static {
 
     /// Install `downloaded`. Must call `ctx.begin_swap()` before touching
     /// the installed package and return `ManagerError::Cancelled` if it
-    /// returns false; after that, the swap ignores cancellation.
+    /// returns false; after that, the swap ignores cancellation. Should
+    /// call `ctx.end_swap()` once the renames are done, so an abandoned
+    /// queue does not wait for the cleanup after them.
     fn install(
         &self,
         downloaded: Self::Downloaded,
@@ -63,4 +65,8 @@ pub trait InstallContext {
     /// Claim the swap. False if the job was cancelled first; once true,
     /// the swap runs to completion.
     fn begin_swap(&self) -> bool;
+
+    /// The renames are done: what remains (deleting the replaced version)
+    /// may be abandoned. Clears the queue's swap-in-progress flag.
+    fn end_swap(&self);
 }

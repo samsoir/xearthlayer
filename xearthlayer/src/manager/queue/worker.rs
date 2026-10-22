@@ -210,7 +210,7 @@ fn install_one<S: Stages>(
     let context = Context { shared, id, token };
     let result = guarded("install", || shared.stages.install(downloaded, &context));
     let mut state = shared.lock();
-    state.swapping = false; // also after a panic mid-swap
+    state.swapping = false; // an install that never ended its swap, or panicked mid-swap
     let outcome = match result {
         Ok(installed) => JobOutcome::Installed(installed),
         Err(e) => outcome_of(e),
@@ -264,5 +264,12 @@ impl<S: Stages> InstallContext for Context<'_, S> {
         }
         state.swapping = true;
         true
+    }
+
+    /// The job stays `Swapping`, so a cancel still answers `TooLate`.
+    fn end_swap(&self) {
+        let mut state = self.shared.lock();
+        state.swapping = false;
+        self.shared.changed.notify_all();
     }
 }

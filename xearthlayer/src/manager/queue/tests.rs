@@ -52,6 +52,10 @@ struct Fake {
     hold_download: Mutex<HashMap<String, Arc<Gate>>>,
     hold_install: Mutex<HashMap<String, Arc<Gate>>>,
     hold_swap: Mutex<HashMap<String, Arc<Gate>>>,
+    /// Holds what follows the swap, like deleting the replaced version.
+    hold_after_swap: Mutex<HashMap<String, Arc<Gate>>>,
+    /// Installs that never call `end_swap`.
+    skip_end_swap: Mutex<HashSet<String>>,
     fail_download: Mutex<HashSet<String>>,
     /// Downloads and installs that run on even once cancelled, like a
     /// download whose last byte arrives as the queue shuts down, or an
@@ -187,6 +191,13 @@ impl Stages for FakeStages {
         self.0.maybe_panic(&title, "install");
         if let Some(gate) = Fake::gate(&self.0.hold_swap, &title) {
             gate.pass(&CancelToken::new()); // the swap ignores cancellation
+        }
+        self.0.record(format!("swapped {title}")); // before end_swap can wake a waiter
+        if !self.0.skip_end_swap.lock().unwrap().contains(&title) {
+            ctx.end_swap();
+        }
+        if let Some(gate) = Fake::gate(&self.0.hold_after_swap, &title) {
+            gate.pass(&CancelToken::new()); // nor does the cleanup after it
         }
         self.0.record(format!("installed {title}"));
         Ok(InstallResult {
@@ -770,6 +781,9 @@ fn abandoning_returns_without_waiting_for_a_slow_install() {
 fn abandoning_still_waits_for_a_swap_in_progress() {
     let stages = FakeStages::new(u64::MAX);
     let swap = Fake::hold(&stages.0.hold_swap, "A");
+    // Held so the job is still unfinished when the swap ends: abandoning
+    // waits for the renames, not for the cleanup after them.
+    let cleanup = Fake::hold(&stages.0.hold_after_swap, "A");
     let (queue, events) = start(&stages);
     let a = queue.submit(Job::Install(meta("A"))).unwrap();
     eventually("A swapping", || {
@@ -784,9 +798,73 @@ fn abandoning_still_waits_for_a_swap_in_progress() {
     let outcomes = queue.wait_for(&[a]);
 
     assert!(
-        matches!(outcomes[0], JobOutcome::Installed(_)),
+        stages.0.logged("swapped A"),
+        "returned before the swap ended"
+    );
+    assert!(
+        matches!(outcomes[0], JobOutcome::Cancelled),
         "{:?}",
         outcomes[0]
     );
     opener.join().unwrap();
+    cleanup.open();
+}
+
+#[test]
+fn a_submit_after_abandoning_is_refused() {
+    let stages = FakeStages::new(u64::MAX);
+    let (queue, _) = start(&stages);
+
+    queue.canceller().abandon();
+
+    let refused = queue.submit(Job::Install(meta("A")));
+    assert!(
+        matches!(refused, Err(ManagerError::QueueClosed)),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn a_batch_refuses_a_duplicate_per_package_and_installs_the_rest() {
+    let stages = FakeStages::new(u64::MAX);
+    let (queue, _) = start(&stages);
+
+    let results = queue.install_batch(vec![meta("A"), meta("A"), meta("B")]);
+
+    assert_eq!(results[0].as_ref().unwrap().region, "A");
+    assert!(
+        matches!(results[1], Err(ManagerError::AlreadyQueued { .. })),
+        "{:?}",
+        results[1]
+    );
+    assert_eq!(results[2].as_ref().unwrap().region, "B");
+}
+
+#[test]
+fn abandoning_does_not_wait_for_the_cleanup_after_a_swap() {
+    let stages = FakeStages::new(u64::MAX);
+    let cleanup = Fake::hold(&stages.0.hold_after_swap, "A");
+    let (queue, _) = start(&stages);
+    let a = queue.submit(Job::Install(meta("A"))).unwrap();
+    eventually("A swapped", || stages.0.logged("swapped A"));
+
+    assert_eq!(queue.cancel(a), CancelResult::TooLate, "still swapping");
+    queue.canceller().abandon();
+    let begun = Instant::now();
+    let outcomes = queue.wait_for(&[a]);
+
+    assert!(begun.elapsed() < Duration::from_secs(1));
+    assert!(matches!(outcomes[0], JobOutcome::Cancelled));
+    cleanup.open();
+}
+
+#[test]
+fn an_install_that_never_ends_its_swap_clears_it_on_return() {
+    let stages = FakeStages::new(u64::MAX);
+    stages.0.skip_end_swap.lock().unwrap().insert("A".into());
+    let (queue, _) = start(&stages);
+
+    assert!(queue.install_batch(vec![meta("A")])[0].is_ok());
+
+    assert!(!queue.shared.lock().swapping);
 }
