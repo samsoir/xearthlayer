@@ -93,6 +93,17 @@ pub enum JobOutcome {
     Failed(ManagerError),
 }
 
+/// What asking to cancel a job achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelResult {
+    /// It will finish as cancelled.
+    Cancelled,
+    /// It is swapping or removing, which always completes.
+    TooLate,
+    /// No unfinished job has this id.
+    Unknown,
+}
+
 /// Receives every job event.
 pub trait QueueObserver: Send + Sync {
     /// Called while the queue's lock is held, from the submitting thread,

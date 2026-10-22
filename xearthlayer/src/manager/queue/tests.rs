@@ -53,8 +53,9 @@ struct Fake {
     hold_install: Mutex<HashMap<String, Arc<Gate>>>,
     hold_swap: Mutex<HashMap<String, Arc<Gate>>>,
     fail_download: Mutex<HashSet<String>>,
-    /// Downloads that finish even once cancelled, like one whose last
-    /// byte arrives as the queue shuts down.
+    /// Downloads and installs that run on even once cancelled, like a
+    /// download whose last byte arrives as the queue shuts down, or an
+    /// install stuck in a long temp-directory delete.
     ignore_cancel: Mutex<HashSet<String>>,
     /// Title to the stage that panics for it.
     panic_in: Mutex<HashMap<String, &'static str>>,
@@ -169,8 +170,13 @@ impl Stages for FakeStages {
 
     fn install(&self, title: String, ctx: &dyn InstallContext) -> ManagerResult<InstallResult> {
         ctx.stage(InstallStage::Extracting);
+        let cancel = if self.0.ignore_cancel.lock().unwrap().contains(&title) {
+            &CancelToken::new()
+        } else {
+            ctx.cancel_token()
+        };
         if let Some(gate) = Fake::gate(&self.0.hold_install, &title) {
-            if !gate.pass(ctx.cancel_token()) {
+            if !gate.pass(cancel) {
                 return Err(ManagerError::Cancelled);
             }
         }
@@ -603,4 +609,184 @@ fn free_space_is_read_once_per_busy_period() {
         2,
         "read again after idle"
     );
+}
+
+#[test]
+fn cancelling_a_queued_job_finishes_it_without_preparing_it() {
+    let stages = FakeStages::new(u64::MAX);
+    let held = Fake::hold(&stages.0.hold_download, "A");
+    let (queue, events) = start(&stages);
+    queue.submit(Job::Install(meta("A"))).unwrap();
+    let b = queue.submit(Job::Install(meta("B"))).unwrap();
+
+    assert_eq!(queue.cancel(b), CancelResult::Cancelled);
+
+    assert_eq!(events.of(b), ["queued B", "finished cancelled"]);
+    held.open();
+    queue.wait_idle();
+    assert!(!stages.0.logged("prepared B"));
+}
+
+#[test]
+fn cancelling_a_download_waiting_for_space_releases_it() {
+    let stages = FakeStages::new(249);
+    stages.size("A", 50).size("B", 50).size("C", 10);
+    let held = Fake::hold(&stages.0.hold_install, "A");
+    let (queue, events) = start(&stages);
+    queue.submit(Job::Install(meta("A"))).unwrap();
+    let b = queue.submit(Job::Install(meta("B"))).unwrap();
+    eventually("B waiting", || {
+        events.of(b).contains(&"waiting".to_string())
+    });
+
+    assert_eq!(queue.cancel(b), CancelResult::Cancelled);
+
+    eventually("B finished", || {
+        events.of(b).last().map(String::as_str) == Some("finished cancelled")
+    });
+    queue.submit(Job::Install(meta("C"))).unwrap(); // 4*50 + 10 = 210 fits once B is gone
+    eventually("C downloaded", || stages.0.logged("downloaded C"));
+    held.open();
+}
+
+#[test]
+fn cancelling_a_running_download_stops_it() {
+    let stages = FakeStages::new(u64::MAX);
+    let _held = Fake::hold(&stages.0.hold_download, "A");
+    let (queue, events) = start(&stages);
+    let a = queue.submit(Job::Install(meta("A"))).unwrap();
+    eventually("A preparing", || {
+        events.of(a).contains(&"preparing".to_string())
+    });
+
+    assert_eq!(queue.cancel(a), CancelResult::Cancelled);
+
+    assert!(matches!(queue.wait_for(&[a])[0], JobOutcome::Cancelled));
+}
+
+#[test]
+fn cancelling_a_downloaded_job_skips_its_install() {
+    let stages = FakeStages::new(u64::MAX);
+    let held = Fake::hold(&stages.0.hold_install, "A");
+    let (queue, events) = start(&stages);
+    queue.submit(Job::Install(meta("A"))).unwrap();
+    let b = queue.submit(Job::Install(meta("B"))).unwrap();
+    eventually("B downloaded", || {
+        events.of(b).contains(&"downloaded".to_string())
+    });
+
+    assert_eq!(queue.cancel(b), CancelResult::Cancelled);
+
+    held.open();
+    queue.wait_idle();
+    assert!(!stages.0.logged("installed B"));
+}
+
+#[test]
+fn cancelling_an_install_before_its_swap_leaves_nothing_installed() {
+    let stages = FakeStages::new(u64::MAX);
+    let _held = Fake::hold(&stages.0.hold_install, "A");
+    let (queue, events) = start(&stages);
+    let a = queue.submit(Job::Install(meta("A"))).unwrap();
+    eventually("A extracting", || {
+        events.of(a).contains(&"installing Extracting".to_string())
+    });
+
+    assert_eq!(queue.cancel(a), CancelResult::Cancelled);
+
+    assert!(matches!(queue.wait_for(&[a])[0], JobOutcome::Cancelled));
+    assert!(!stages.0.logged("installed A"));
+}
+
+#[test]
+fn a_swap_cannot_be_cancelled_and_completes() {
+    let stages = FakeStages::new(u64::MAX);
+    let swap = Fake::hold(&stages.0.hold_swap, "A");
+    let (queue, events) = start(&stages);
+    let a = queue.submit(Job::Install(meta("A"))).unwrap();
+    eventually("A swapping", || {
+        events.of(a).contains(&"installing Installing".to_string())
+    });
+
+    assert_eq!(queue.cancel(a), CancelResult::TooLate);
+
+    swap.open();
+    assert!(matches!(queue.wait_for(&[a])[0], JobOutcome::Installed(_)));
+}
+
+#[test]
+fn an_unknown_job_cannot_be_cancelled() {
+    let stages = FakeStages::new(u64::MAX);
+    let (queue, _) = start(&stages);
+    assert_eq!(queue.cancel(JobId(999)), CancelResult::Unknown);
+}
+
+#[test]
+fn cancel_all_cancels_every_unfinished_job() {
+    let stages = FakeStages::new(u64::MAX);
+    let _held = Fake::hold(&stages.0.hold_install, "A");
+    let (queue, events) = start(&stages);
+    let ids: Vec<JobId> = ["A", "B", "C"]
+        .iter()
+        .map(|t| queue.submit(Job::Install(meta(t))).unwrap())
+        .collect();
+    eventually("A extracting", || {
+        events
+            .of(ids[0])
+            .contains(&"installing Extracting".to_string())
+    });
+
+    queue.canceller().cancel_all();
+
+    assert!(queue
+        .wait_for(&ids)
+        .iter()
+        .all(|o| matches!(o, JobOutcome::Cancelled)));
+}
+
+#[test]
+fn abandoning_returns_without_waiting_for_a_slow_install() {
+    let stages = FakeStages::new(u64::MAX);
+    // An install that ignores its token, like a long temp-directory delete.
+    let stuck = Fake::hold(&stages.0.hold_install, "A");
+    stages.0.ignore_cancel.lock().unwrap().insert("A".into());
+    let (queue, events) = start(&stages);
+    let a = queue.submit(Job::Install(meta("A"))).unwrap();
+    eventually("A extracting", || {
+        events.of(a).contains(&"installing Extracting".to_string())
+    });
+
+    queue.canceller().abandon();
+    let begun = Instant::now();
+    let outcomes = queue.wait_for(&[a]);
+    drop(queue); // abandoned: does not join
+
+    assert!(begun.elapsed() < Duration::from_secs(1));
+    assert!(matches!(outcomes[0], JobOutcome::Cancelled));
+    stuck.open();
+}
+
+#[test]
+fn abandoning_still_waits_for_a_swap_in_progress() {
+    let stages = FakeStages::new(u64::MAX);
+    let swap = Fake::hold(&stages.0.hold_swap, "A");
+    let (queue, events) = start(&stages);
+    let a = queue.submit(Job::Install(meta("A"))).unwrap();
+    eventually("A swapping", || {
+        events.of(a).contains(&"installing Installing".to_string())
+    });
+    let opener = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        swap.open();
+    });
+
+    queue.canceller().abandon();
+    let outcomes = queue.wait_for(&[a]);
+
+    assert!(
+        matches!(outcomes[0], JobOutcome::Installed(_)),
+        "{:?}",
+        outcomes[0]
+    );
+    opener.join().unwrap();
 }

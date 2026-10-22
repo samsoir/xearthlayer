@@ -73,8 +73,8 @@ pub use installer::{InstallObserver, InstallResult, InstallStage, PackageInstall
 pub use local::{InstalledPackage, LocalPackageStore, MountStatus};
 pub use mounts::{ActiveMount, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder};
 pub use queue::{
-    InstallContext, InstallQueue, Job, JobEvent, JobId, JobKind, JobOutcome, JobSummary,
-    QueueObserver, Stages,
+    CancelResult, Canceller, InstallContext, InstallQueue, Job, JobEvent, JobId, JobKind,
+    JobOutcome, JobSummary, QueueControl, QueueObserver, Stages,
 };
 pub use symlinks::{
     consolidated_overlay_exists, create_consolidated_overlay, create_consolidated_overlay_except,

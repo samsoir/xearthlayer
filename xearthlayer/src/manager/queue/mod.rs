@@ -21,8 +21,46 @@ use crate::manager::cancel::CancelToken;
 use crate::manager::error::{ManagerError, ManagerResult};
 use crate::manager::installer::InstallResult;
 
-pub use job::{Job, JobEvent, JobId, JobKind, JobOutcome, JobSummary, QueueObserver};
+pub use job::{CancelResult, Job, JobEvent, JobId, JobKind, JobOutcome, JobSummary, QueueObserver};
 pub use stages::{InstallContext, Stages};
+
+/// What a signal handler or a UI needs to stop a queue it does not own.
+pub trait QueueControl: Send + Sync {
+    /// Cancel every unfinished job.
+    fn cancel_all(&self);
+    /// Cancel every job and stop waiting for cleanup: waiters return once
+    /// no swap is running, and dropping the queue no longer joins its
+    /// threads. Whatever is left on disk is swept on the next start.
+    fn abandon(&self);
+}
+
+/// A cloneable handle on a queue's [`QueueControl`].
+#[derive(Clone)]
+pub struct Canceller(Arc<dyn QueueControl>);
+
+impl Canceller {
+    pub fn new(control: Arc<dyn QueueControl>) -> Self {
+        Self(control)
+    }
+
+    pub fn cancel_all(&self) {
+        self.0.cancel_all();
+    }
+
+    pub fn abandon(&self) {
+        self.0.abandon();
+    }
+}
+
+impl<S: Stages> QueueControl for state::Shared<S> {
+    fn cancel_all(&self) {
+        self.cancel_every(false);
+    }
+
+    fn abandon(&self) {
+        self.cancel_every(true);
+    }
+}
 
 /// Downloads queued packages one after another while installing them in
 /// order on a second thread. See the module documentation.
@@ -81,12 +119,26 @@ impl<S: Stages> InstallQueue<S> {
         Ok(id)
     }
 
+    /// Cancel `id`. See [`CancelResult`].
+    pub fn cancel(&self, id: JobId) -> CancelResult {
+        self.shared.cancel(id)
+    }
+
+    /// A handle that cancels or abandons this queue from elsewhere, such
+    /// as a signal handler.
+    pub fn canceller(&self) -> Canceller {
+        Canceller(self.shared.clone())
+    }
+
     /// Block until every job in `ids` has finished, then claim their
-    /// outcomes in the order given. An id that is unknown or already
-    /// claimed yields `Cancelled`.
+    /// outcomes in the order given. An id that is unknown, already
+    /// claimed, or still unfinished when the queue was abandoned yields
+    /// `Cancelled`. Once abandoned, this waits only for a running swap.
     pub fn wait_for(&self, ids: &[JobId]) -> Vec<JobOutcome> {
         let mut state = self.shared.lock();
-        while ids.iter().any(|id| state.jobs.contains_key(id)) {
+        while ids.iter().any(|id| state.jobs.contains_key(id))
+            && !(state.abandoned && !state.swapping)
+        {
             state = self.shared.wait(state);
         }
         ids.iter()
@@ -94,10 +146,11 @@ impl<S: Stages> InstallQueue<S> {
             .collect()
     }
 
-    /// Block until no job is unfinished.
+    /// Block until no job is unfinished, or, once abandoned, until no
+    /// swap is running.
     pub fn wait_idle(&self) {
         let mut state = self.shared.lock();
-        while !state.jobs.is_empty() {
+        while !state.jobs.is_empty() && !(state.abandoned && !state.swapping) {
             state = self.shared.wait(state);
         }
     }
@@ -138,8 +191,9 @@ impl<S: Stages> InstallQueue<S> {
 
 impl<S: Stages> Drop for InstallQueue<S> {
     /// Cancel everything, let a running swap finish, and join both threads.
+    /// An abandoned queue is not joined: its threads finish on their own.
     fn drop(&mut self) {
-        {
+        let abandoned = {
             let mut state = self.shared.lock();
             state.shutting_down = true;
             for entry in state.jobs.values() {
@@ -150,6 +204,10 @@ impl<S: Stages> Drop for InstallQueue<S> {
                 self.shared.finish(&mut state, id, JobOutcome::Cancelled);
             }
             self.shared.changed.notify_all();
+            state.abandoned
+        };
+        if abandoned {
+            return;
         }
         for thread in self.threads.drain(..) {
             let name = thread
