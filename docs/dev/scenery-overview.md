@@ -121,7 +121,7 @@ No dynamic generation needed - these are purely static files.
 
 1. Manager fetches library index from configured `library_root`
 2. User selects region to install
-3. Manager downloads package parts (resumable, parallel)
+3. Manager downloads package parts (parallel; an interrupted part resumes within the run)
 4. Each part verified via SHA256 checksum
 5. Parts extracted in order straight into the package library location
 6. For ortho: registered for FUSE mounting

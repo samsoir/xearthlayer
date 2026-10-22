@@ -132,7 +132,7 @@ User is notified of available updates on first run of XEarthLayer (not repeatedl
 
 ### Features
 
-- **Resumable downloads**: Track progress, resume interrupted downloads via HTTP Range headers
+- **Retry with resume**: Track progress, and resume an interrupted part via HTTP Range headers within the same run; nothing survives a restart, since each run clears the temp folder
 - **Parallel parts**: Sliding-window concurrency with semaphore-gated execution
 - **Configurable concurrency**: `packages.concurrent_downloads` (1-10, default 5)
 - **Per-part retry**: 3 retries with exponential backoff (2s, 4s, 8s) via `RetryDownloader` decorator
@@ -300,7 +300,7 @@ download loop and per tar entry by the extractor.
 |---|---|
 | Queued, or downloaded and waiting | Removed from the queue immediately. A downloaded package is marked `Cancelling`, its temp directory is deleted outside the state lock, and only then is the job finished and its ledger entry released, so a waiter that returns finds the directory gone. `abandon` finishes it at once instead |
 | Preparing, waiting for space, downloading | The token is raised; the owning thread notices, aborts every part worker, and the temp guard deletes the parts before the job finishes |
-| Extracting | Checked per buffer and per tar entry; the guard deletes the staging folder and the temp directory; the old version is untouched |
+| Extracting | Checked per tar entry; the guard deletes the staging folder and the temp directory; the old version is untouched |
 | The swap | `TooLate`; the swap runs to completion |
 | A remove that has started | `TooLate` |
 
@@ -320,7 +320,7 @@ cleanup. A live `Canceller` keeps the queue's lock held.
 
 **Lock and sweep.** Starting a queue takes an exclusive `flock` on
 `{temp_dir}/.queue.lock` for the queue's life (`ManagerError::QueueBusy` if
-another process holds it); the kernel drops it however the process exits. Under
+another process holds it); the kernel drops it however the process exits. The lock is per temp folder: two commands with different temp folders and the same packages root do not exclude each other, and either one's startup sweep can delete the other's in-progress staging folder, which then fails cleanly. Under
 that lock, `sweep` deletes leftover `install_*` temp directories,
 `.xel-staging-*` folders and `.xel-removed-*` folders, and renames a
 `.xel-aside-*` folder back when its package folder is missing (the process died
