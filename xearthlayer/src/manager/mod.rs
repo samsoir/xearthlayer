@@ -50,6 +50,7 @@ mod installer;
 mod local;
 mod mounts;
 mod pipeline;
+mod queue;
 mod symlinks;
 mod traits;
 mod updates;
@@ -68,6 +69,7 @@ pub use extractor::TarGzExtractor;
 pub use installer::{InstallObserver, InstallResult, InstallStage, PackageInstaller};
 pub use local::{InstalledPackage, LocalPackageStore, MountStatus};
 pub use mounts::{ActiveMount, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder};
+pub use queue::JobId;
 pub use symlinks::{
     consolidated_overlay_exists, create_consolidated_overlay, create_consolidated_overlay_except,
     remove_consolidated_overlay, remove_overlay_symlink, ConsolidatedOverlayResult,
