@@ -15,8 +15,19 @@ use xearthlayer::manager::{
 #[derive(Default)]
 pub struct ConsoleQueueObserver {
     multi: MultiProgress,
-    lines: Mutex<HashMap<JobId, (String, ProgressBar)>>,
+    lines: Mutex<HashMap<JobId, JobLine>>,
     download: Mutex<Option<DownloadBlock>>,
+}
+
+/// One job's line, and which one-off changes it has had.
+struct JobLine {
+    label: String,
+    bar: ProgressBar,
+    /// The download status was shown. Applied once, not per snapshot.
+    downloading: bool,
+    /// The spinner is armed. Re-arming joins the old ticker thread, which
+    /// must not happen under the queue's lock.
+    spinning: bool,
 }
 
 /// The header, part bars and total of the package downloading now.
@@ -111,24 +122,40 @@ impl QueueObserver for ConsoleQueueObserver {
         let label = {
             let mut lines = self.lines.lock().unwrap();
             if let JobEvent::Queued(summary) = event {
-                let line = self.multi.add(ProgressBar::new(0));
-                line.set_style(ProgressStyle::with_template("{msg}").unwrap());
-                lines.insert(id, (label(summary), line));
+                let bar = self.multi.add(ProgressBar::new(0));
+                bar.set_style(plain_style());
+                let line = JobLine {
+                    label: label(summary),
+                    bar,
+                    downloading: false,
+                    spinning: false,
+                };
+                lines.insert(id, line);
             }
-            let Some((label, line)) = lines.get(&id) else {
+            let Some(line) = lines.get_mut(&id) else {
                 return;
             };
-            if matches!(event, JobEvent::Installing(_) | JobEvent::Removing) {
-                line.set_style(ProgressStyle::with_template("{spinner:.cyan} {msg}").unwrap());
-                line.enable_steady_tick(Duration::from_millis(100));
+            // A download's status goes up on its first snapshot, not every 100 ms.
+            let repeated_snapshot = match event {
+                JobEvent::Downloading(_) => std::mem::replace(&mut line.downloading, true),
+                _ => false,
+            };
+            if matches!(event, JobEvent::Installing(_) | JobEvent::Removing) && !line.spinning {
+                line.spinning = true;
+                line.bar
+                    .set_style(ProgressStyle::with_template("{spinner:.cyan} {msg}").unwrap());
+                line.bar.enable_steady_tick(Duration::from_millis(100));
             }
-            if let Some(text) = status(label, event) {
-                line.set_message(text);
+            if let Some(text) = status(&line.label, event).filter(|_| !repeated_snapshot) {
+                line.bar.set_message(text);
             }
             if let JobEvent::Finished(outcome) = event {
-                line.finish_with_message(finished_line(label, outcome));
+                // Every finished line starts at column 0, spinner or not.
+                line.bar.set_style(plain_style());
+                line.bar
+                    .finish_with_message(finished_line(&line.label, outcome));
             }
-            label.clone()
+            line.label.clone()
         };
 
         match event {
@@ -137,6 +164,11 @@ impl QueueObserver for ConsoleQueueObserver {
             _ => {}
         }
     }
+}
+
+/// A line that shows only its message.
+fn plain_style() -> ProgressStyle {
+    ProgressStyle::with_template("{msg}").unwrap()
 }
 
 /// "NA-CANADA ortho v2.1.0", or without a version for a remove.
@@ -148,7 +180,7 @@ fn label(summary: &JobSummary) -> String {
 }
 
 /// The status text a job line shows after `event`, or None when the line
-/// does not change (download progress) or the line is finished.
+/// is finished. A download's status is shown on its first snapshot only.
 fn status(label: &str, event: &JobEvent<'_>) -> Option<String> {
     match event {
         JobEvent::Queued(_) => Some(format!("  {label}: queued")),
@@ -158,7 +190,7 @@ fn status(label: &str, event: &JobEvent<'_>) -> Option<String> {
             format_size(*needed as usize),
             format_size(*available as usize)
         )),
-        JobEvent::Downloading(_) => None,
+        JobEvent::Downloading(_) => Some(format!("  {label}: downloading")),
         JobEvent::Downloaded => Some(format!("  {label}: downloaded, waiting to install")),
         JobEvent::Installing(stage) => Some(format!("{label}: {}", stage.name().to_lowercase())),
         JobEvent::Removing => Some(format!("{label}: removing")),
@@ -327,13 +359,16 @@ mod tests {
     }
 
     #[test]
-    fn download_progress_and_finishing_leave_the_status_alone() {
+    fn a_download_shows_downloading_and_finishing_leaves_the_status_alone() {
         let progress = DownloadProgress {
             parts: Vec::new(),
             total_bytes_downloaded: 0,
             total_bytes: None,
         };
-        assert_eq!(status(LABEL, &JobEvent::Downloading(&progress)), None);
+        assert_eq!(
+            status(LABEL, &JobEvent::Downloading(&progress)).as_deref(),
+            Some("  NA-CANADA ortho v2.1.0: downloading")
+        );
         assert_eq!(
             status(LABEL, &JobEvent::Finished(&JobOutcome::Removed)),
             None
