@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
 
+use super::cancel::CancelToken;
 use super::error::{ManagerError, ManagerResult};
 use super::traits::ArchiveExtractor;
 
@@ -39,11 +40,18 @@ impl TarGzExtractor {
     ///
     /// * `parts` - Paths to the archive parts in order (e.g., .aa, .ab, .ac)
     /// * `output` - Path for the reassembled archive
+    /// * `cancel` - Checked once per buffer; a set token ends the copy with
+    ///   [`ManagerError::Cancelled`]
     ///
     /// # Returns
     ///
     /// The total size of the reassembled archive in bytes.
-    pub fn reassemble(&self, parts: &[PathBuf], output: &Path) -> ManagerResult<u64> {
+    pub fn reassemble(
+        &self,
+        parts: &[PathBuf],
+        output: &Path,
+        cancel: &CancelToken,
+    ) -> ManagerResult<u64> {
         if parts.is_empty() {
             return Err(ManagerError::ExtractionFailed {
                 path: output.to_path_buf(),
@@ -87,6 +95,9 @@ impl TarGzExtractor {
             let mut buffer = vec![0u8; 64 * 1024]; // 64KB buffer
 
             loop {
+                if cancel.is_cancelled() {
+                    return Err(ManagerError::Cancelled);
+                }
                 let bytes_read =
                     reader
                         .read(&mut buffer)
@@ -117,10 +128,17 @@ impl TarGzExtractor {
 
         Ok(total_size)
     }
-}
 
-impl ArchiveExtractor for TarGzExtractor {
-    fn extract(&self, archive_path: &Path, dest_dir: &Path) -> ManagerResult<usize> {
+    /// Extract `archive_path` into `dest_dir`, stopping with
+    /// [`ManagerError::Cancelled`] before the next entry once `cancel` is set.
+    ///
+    /// Returns the number of regular files extracted.
+    pub fn extract_cancellable(
+        &self,
+        archive_path: &Path,
+        dest_dir: &Path,
+        cancel: &CancelToken,
+    ) -> ManagerResult<usize> {
         let failed = |reason: String| ManagerError::ExtractionFailed {
             path: archive_path.to_path_buf(),
             reason,
@@ -140,6 +158,9 @@ impl ArchiveExtractor for TarGzExtractor {
 
         let mut files = 0;
         for entry in archive.entries().map_err(|e| failed(e.to_string()))? {
+            if cancel.is_cancelled() {
+                return Err(ManagerError::Cancelled);
+            }
             let mut entry = entry.map_err(|e| failed(e.to_string()))?;
             let name = entry
                 .path()
@@ -169,6 +190,12 @@ impl ArchiveExtractor for TarGzExtractor {
     }
 }
 
+impl ArchiveExtractor for TarGzExtractor {
+    fn extract(&self, archive_path: &Path, dest_dir: &Path) -> ManagerResult<usize> {
+        self.extract_cancellable(archive_path, dest_dir, &CancelToken::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,7 +214,7 @@ mod tests {
         let extractor = TarGzExtractor::new();
         let output = temp.path().join("output.tar.gz");
 
-        let result = extractor.reassemble(&[], &output);
+        let result = extractor.reassemble(&[], &output, &CancelToken::new());
         assert!(result.is_err());
     }
 
@@ -198,7 +225,7 @@ mod tests {
         let output = temp.path().join("output.tar.gz");
         let missing = temp.path().join("missing.part");
 
-        let result = extractor.reassemble(&[missing], &output);
+        let result = extractor.reassemble(&[missing], &output, &CancelToken::new());
         assert!(result.is_err());
     }
 
@@ -213,7 +240,9 @@ mod tests {
         file.write_all(b"test content").unwrap();
 
         let output = temp.path().join("output.bin");
-        let size = extractor.reassemble(&[part], &output).unwrap();
+        let size = extractor
+            .reassemble(&[part], &output, &CancelToken::new())
+            .unwrap();
 
         assert_eq!(size, 12); // "test content".len()
         assert!(output.exists());
@@ -238,7 +267,7 @@ mod tests {
 
         let output = temp.path().join("output.bin");
         let size = extractor
-            .reassemble(&[part1, part2, part3], &output)
+            .reassemble(&[part1, part2, part3], &output, &CancelToken::new())
             .unwrap();
 
         assert_eq!(size, 11); // "Hello World".len()
@@ -330,5 +359,33 @@ mod tests {
             .expect_err("garbage must not extract");
 
         assert!(err.to_string().contains("broken.tar.gz"), "{err}");
+    }
+
+    #[test]
+    fn a_cancelled_reassembly_stops_and_reports_cancelled() {
+        let temp = TempDir::new().unwrap();
+        let part = temp.path().join("a.aa");
+        fs::write(&part, vec![0u8; 256 * 1024]).unwrap();
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let result = TarGzExtractor::new().reassemble(&[part], &temp.path().join("out"), &cancel);
+
+        assert!(matches!(result, Err(ManagerError::Cancelled)), "{result:?}");
+    }
+
+    #[test]
+    fn a_cancelled_extraction_stops_before_the_next_entry() {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("pkg.tar.gz");
+        tar_gz(&archive, &[("pkg/a.txt", b"alpha"), ("pkg/b.txt", b"beta")]);
+        let dest = temp.path().join("dest");
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let result = TarGzExtractor::new().extract_cancellable(&archive, &dest, &cancel);
+
+        assert!(matches!(result, Err(ManagerError::Cancelled)), "{result:?}");
+        assert!(!dest.join("pkg/a.txt").exists());
     }
 }

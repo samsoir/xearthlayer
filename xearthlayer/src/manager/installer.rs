@@ -19,6 +19,7 @@ use tracing::info;
 
 use xearthlayer_package::{PackageMetadata, PackageType};
 
+use super::cancel::CancelToken;
 use super::disk_check::{available_bytes, FsInfoProvider, RealFsInfoProvider};
 use super::download::{DownloadProgressCallback, DownloadState, MultiPartDownloader};
 use super::error::{ManagerError, ManagerResult};
@@ -86,6 +87,7 @@ pub(crate) trait PartTransfer: Send + Sync {
         &self,
         state: &mut DownloadState,
         on_progress: Option<DownloadProgressCallback>,
+        cancel: &CancelToken,
     ) -> ManagerResult<()>;
 }
 
@@ -98,8 +100,9 @@ impl PartTransfer for MultiPartDownloader {
         &self,
         state: &mut DownloadState,
         on_progress: Option<DownloadProgressCallback>,
+        cancel: &CancelToken,
     ) -> ManagerResult<()> {
-        MultiPartDownloader::download_all(self, state, on_progress)
+        MultiPartDownloader::download_all(self, state, on_progress, cancel)
     }
 }
 
@@ -359,8 +362,11 @@ impl PackageInstaller {
             "download phase started"
         );
         let started = Instant::now();
-        self.transfer
-            .download_all(&mut state, observer.download_started(metadata))?;
+        self.transfer.download_all(
+            &mut state,
+            observer.download_started(metadata),
+            &CancelToken::new(),
+        )?;
         info!(
             region = %metadata.title,
             bytes_downloaded = state.bytes_downloaded,
@@ -396,7 +402,7 @@ impl PackageInstaller {
         report(InstallStage::Reassembling);
         let extractor = TarGzExtractor::new();
         let archive = temp.path().join(&metadata.filename);
-        extractor.reassemble(&parts, &archive)?;
+        extractor.reassemble(&parts, &archive, &CancelToken::new())?;
         // Free the parts before extracting rather than at cleanup. They are
         // redundant now and extraction is where peak disk usage lives, so
         // holding them through it costs a full extra copy of the download
@@ -627,6 +633,7 @@ mod tests {
             &self,
             state: &mut DownloadState,
             _on_progress: Option<DownloadProgressCallback>,
+            _cancel: &CancelToken,
         ) -> ManagerResult<()> {
             for (url, dest) in state.urls.iter().zip(&state.destinations) {
                 if self.failing.contains(url) {

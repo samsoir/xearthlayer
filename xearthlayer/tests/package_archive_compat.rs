@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
-use xearthlayer::manager::{ArchiveExtractor, TarGzExtractor};
+use xearthlayer::manager::{ArchiveExtractor, CancelToken, TarGzExtractor};
 
 /// A package-shaped tree: nested directories, a name with spaces (as in
 /// `Earth nav data`), and binary content.
@@ -114,7 +114,9 @@ fn split_parts_reassemble_and_extract_to_the_source_tree() {
 
     let extractor = TarGzExtractor::new();
     let reassembled = temp.path().join("reassembled.tar.gz");
-    extractor.reassemble(&parts, &reassembled).unwrap();
+    extractor
+        .reassemble(&parts, &reassembled, &CancelToken::new())
+        .unwrap();
     let dest = temp.path().join("dest");
     extractor.extract(&reassembled, &dest).unwrap();
 

@@ -93,6 +93,10 @@ pub enum ManagerError {
         required_bytes: u64,
         available_bytes: u64,
     },
+
+    /// The operation was cancelled before it finished. Nothing it wrote
+    /// outside its temp directory was changed.
+    Cancelled,
 }
 
 impl std::fmt::Display for ManagerError {
@@ -209,6 +213,7 @@ impl std::fmt::Display for ManagerError {
                     crate::config::format_size(*available_bytes as usize),
                 )
             }
+            Self::Cancelled => write!(f, "cancelled"),
         }
     }
 }

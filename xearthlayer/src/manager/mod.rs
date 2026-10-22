@@ -39,6 +39,7 @@
 //! ```
 
 mod cache;
+mod cancel;
 mod client;
 mod config;
 mod disk_check;
@@ -56,6 +57,7 @@ mod traits;
 mod updates;
 
 pub use cache::{CacheStats, CachedLibraryClient};
+pub use cancel::CancelToken;
 pub use client::HttpLibraryClient;
 pub use config::ManagerConfig;
 pub use disk_check::{
