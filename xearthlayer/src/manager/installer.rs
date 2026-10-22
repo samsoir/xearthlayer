@@ -36,6 +36,9 @@ const PART_TIMEOUT: Duration = Duration::from_secs(300);
 /// Parts downloaded in parallel unless `with_parallel_downloads` says otherwise.
 const DEFAULT_PARALLEL_DOWNLOADS: usize = 4;
 
+/// The file every published package carries at its top, naming its version.
+const PACKAGE_METADATA_FILE: &str = "xearthlayer_scenery_package.txt";
+
 /// Start of the name of each package's temp directory.
 pub(crate) const INSTALL_TEMP_PREFIX: &str = "install_";
 
@@ -348,6 +351,15 @@ impl Stages for PackageInstaller {
             TarGzExtractor::new().extract_parts(&parts, staged.path(), ctx.cancel_token())?;
         info!(region = %region, files_extracted, "extraction completed");
         let source = package_source(staged.path(), install_path.file_name())?;
+        // An archive that is empty or was cut short must not replace a
+        // working install: refuse before anything is set aside. `staged`
+        // drops and the old version is untouched.
+        if !source.join(PACKAGE_METADATA_FILE).is_file() {
+            return Err(ManagerError::ExtractionFailed {
+                path: staged.path().to_path_buf(),
+                reason: format!("the archive holds no package (no {PACKAGE_METADATA_FILE})"),
+            });
+        }
         if !ctx.begin_swap() {
             // `staged` drops here, which removes its folder.
             return Err(ManagerError::Cancelled);
@@ -448,12 +460,15 @@ fn package_source(staged: &Path, package_name: Option<&OsStr>) -> ManagerResult<
         .filter_map(|e| e.ok())
         .collect();
 
+    // `file_type` does not follow symlinks, so a link named like the package
+    // is never chosen: it could point anywhere.
+    let is_dir = |e: &fs::DirEntry| e.file_type().is_ok_and(|t| t.is_dir());
     let named_package = entries
         .iter()
-        .find(|e| Some(e.file_name().as_os_str()) == package_name && e.path().is_dir());
+        .find(|e| Some(e.file_name().as_os_str()) == package_name && is_dir(e));
     let source = match named_package {
         Some(entry) => entry.path(),
-        None if entries.len() == 1 && entries[0].path().is_dir() => entries[0].path(),
+        None if entries.len() == 1 && is_dir(&entries[0]) => entries[0].path(),
         None => staged.to_path_buf(),
     };
     Ok(source)
@@ -884,6 +899,7 @@ mod tests {
             fs::read_to_string(install_path.join("terrain/tile.ter")).unwrap(),
             "terrain for AF-NORTH"
         );
+        assert!(!aside::staging_path(&install_path).exists());
         let leftovers: Vec<_> = fs::read_dir(temp.path().join("tmp"))
             .unwrap()
             .map(|e| e.unwrap().file_name())
@@ -1240,6 +1256,84 @@ mod tests {
         assert_eq!(snapshot(&install_path), v1);
         assert!(!aside::staging_path(&install_path).exists());
         assert!(!aside::aside_path(&install_path).exists());
+    }
+
+    /// Replace the downloaded part with a valid archive holding only `names`.
+    fn replace_archive_with(downloaded: &DownloadedPackage, names: &[&str]) {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut builder = tar::Builder::new(gz);
+        for name in names {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(4);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name, &b"text"[..])
+                .unwrap();
+        }
+        let bytes = builder.into_inner().unwrap().finish().unwrap();
+        fs::write(&downloaded.parts[0], bytes).unwrap();
+    }
+
+    /// An archive that holds no package must not replace a working install
+    /// with an empty folder: the old version stays, the staging folder goes.
+    #[test]
+    fn an_archive_without_package_metadata_leaves_the_old_version_untouched() {
+        let temp = TempDir::new().unwrap();
+        let (installer, downloaded, install_path) = v1_installed_and_v2_downloaded(&temp);
+        let v1 = snapshot(&install_path);
+        replace_archive_with(&downloaded, &["README"]);
+        let context = TestContext {
+            token: CancelToken::new(),
+            allow_swap: true,
+        };
+
+        let result = installer.install(downloaded, &context);
+
+        match result {
+            Err(ManagerError::ExtractionFailed { path, reason }) => {
+                assert_eq!(path, aside::staging_path(&install_path));
+                assert!(reason.contains("holds no package"), "{reason}");
+            }
+            other => panic!("expected ExtractionFailed, got {other:?}"),
+        }
+        assert_eq!(snapshot(&install_path), v1);
+        assert!(!aside::staging_path(&install_path).exists());
+        assert!(!aside::aside_path(&install_path).exists());
+    }
+
+    /// A top-level symlink named like the package is not a package folder,
+    /// whatever it points at: nothing outside staging may be renamed into
+    /// the install path.
+    #[test]
+    fn a_symlink_named_like_the_package_is_not_the_package_source() {
+        let temp = TempDir::new().unwrap();
+        let mountpoint = "zzXEL_af-north_ortho";
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let staged = temp.path().join("staged");
+        fs::create_dir_all(&staged).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, staged.join(mountpoint)).unwrap();
+        fs::write(staged.join("README"), "text").unwrap();
+
+        let source = package_source(&staged, Some(OsStr::new(mountpoint))).unwrap();
+
+        assert_eq!(source, staged);
+    }
+
+    /// A lone symlink is no more a package folder than a named one.
+    #[test]
+    fn a_lone_symlink_to_a_folder_is_not_the_package_source() {
+        let temp = TempDir::new().unwrap();
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let staged = temp.path().join("staged");
+        fs::create_dir_all(&staged).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, staged.join("renamed_package")).unwrap();
+
+        let source = package_source(&staged, Some(OsStr::new("zzXEL_af-north_ortho"))).unwrap();
+
+        assert_eq!(source, staged);
     }
 
     #[test]

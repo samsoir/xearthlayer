@@ -23,7 +23,8 @@ pub trait Stages: Send + Sync + 'static {
     /// Where downloads are written.
     fn temp_dir(&self) -> &Path;
 
-    /// Where installed packages live; swept for aside folders.
+    /// Where installed packages live; swept for aside folders. It is also
+    /// the folder measured for the disk check and named in refusals.
     fn packages_root(&self) -> &Path;
 
     /// Free space and device of the temp and packages filesystems, read

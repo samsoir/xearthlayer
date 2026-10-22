@@ -365,6 +365,25 @@ mod tests {
         fn parts(&self) -> u64 {
             self.admitted.iter().map(|&(_, s)| s).sum()
         }
+        /// The most disk a shared filesystem holds at once if `next` joined
+        /// the queue: while package k extracts, the trees before it and its
+        /// own are on disk, with its parts and every later package's parts.
+        fn peak_with(&self, next: u64) -> u64 {
+            let sizes: Vec<u64> = self
+                .admitted
+                .iter()
+                .map(|&(_, s)| s)
+                .chain([next])
+                .collect();
+            (0..sizes.len())
+                .map(|k| {
+                    let trees_before: u64 = sizes[..k].iter().map(|&s| tree(s)).sum();
+                    let parts_from: u64 = sizes[k..].iter().sum();
+                    self.installed_e + trees_before + tree(sizes[k]) + parts_from
+                })
+                .max()
+                .expect("next is always present")
+        }
         /// Install (or fail) the oldest admitted package, checking `safe`
         /// against the disk use while it installs first.
         fn finish_front(
@@ -387,13 +406,16 @@ mod tests {
     }
 
     /// Admit `sizes` in order, installing the oldest whenever the next one
-    /// must wait, the way the installer drains the ledger. `never_ok` says
-    /// whether a refusal was justified, `safe` whether an install fits.
+    /// must wait, the way the installer drains the ledger. `refusal` says
+    /// which filesystem a package of that size can never fit on (`None` if it
+    /// can fit), `wait_needed` whether it truly cannot be admitted yet, and
+    /// `safe` whether an install fits.
     fn run_model(
         capacity: Capacity,
         sizes: &[u64],
         failures: &[bool],
-        never_ok: impl Fn(&Model, u64) -> bool,
+        refusal: impl Fn(&Model, u64) -> Option<Filesystem>,
+        wait_needed: impl Fn(&Model, u64) -> bool,
         safe: impl Fn(&Model, u64) -> bool + Copy,
     ) -> Result<(), TestCaseError> {
         let mut ledger = DiskLedger::new(capacity);
@@ -407,11 +429,17 @@ mod tests {
                         model.admitted.push_back((id, size));
                         break;
                     }
-                    Admission::Never { .. } => {
-                        prop_assert!(never_ok(&model, size), "refused {size} that fits");
+                    Admission::Never { filesystem, .. } => {
+                        prop_assert_eq!(
+                            refusal(&model, size),
+                            Some(filesystem),
+                            "refused {} that fits, or named the wrong disk",
+                            size
+                        );
                         break;
                     }
                     Admission::Wait { .. } => {
+                        prop_assert!(wait_needed(&model, size), "made {size} wait needlessly");
                         // Liveness: something ahead must be installable.
                         prop_assert!(!model.admitted.is_empty(), "waited on nothing");
                         model.finish_front(&mut ledger, fail.next().unwrap(), safe)?;
@@ -437,7 +465,16 @@ mod tests {
                 Capacity::Split { temp, packages },
                 &sizes,
                 &failures,
-                |m, s| s > temp || m.installed_e + m.trees() + tree(s) > packages,
+                |m, s| {
+                    if m.installed_e + m.trees() + tree(s) > packages {
+                        Some(Filesystem::Packages)
+                    } else if s > temp {
+                        Some(Filesystem::Temp)
+                    } else {
+                        None
+                    }
+                },
+                |m, s| m.parts() + s > temp,
                 |m, front| m.parts() <= temp && m.installed_e + tree(front) <= packages,
             )?;
         }
@@ -452,7 +489,8 @@ mod tests {
                 Capacity::Shared { free },
                 &sizes,
                 &failures,
-                |m, s| m.installed_e + m.trees() + tree(s) + s > free,
+                |m, s| (m.installed_e + m.trees() + tree(s) + s > free).then_some(Filesystem::Packages),
+                |m, s| m.peak_with(s) > free,
                 |m, front| m.installed_e + tree(front) + m.parts() <= free,
             )?;
         }

@@ -69,7 +69,10 @@ pub enum JobEvent<'a> {
     Queued(&'a JobSummary),
     /// The downloader picked the job up and is validating and sizing it.
     Preparing,
-    /// The download waits until enough temp space is free.
+    /// The download waits until enough space is free. On a split layout the
+    /// figures are the temp disk's, parts only; on a shared disk they are the
+    /// whole peak: trees installed so far, the one extracting, and every part
+    /// still to read.
     WaitingForSpace { needed: u64, available: u64 },
     /// A download progress snapshot.
     Downloading(&'a DownloadProgress),

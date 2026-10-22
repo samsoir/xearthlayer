@@ -70,9 +70,12 @@ impl TarGzExtractor {
         dest_dir: &Path,
         cancel: &CancelToken,
     ) -> ManagerResult<usize> {
+        // The error's path names the archive, which on a split layout is on
+        // another disk than the one written to. Naming the destination in the
+        // reason tells a full-disk failure which disk filled.
         let failed = |reason: String| ManagerError::ExtractionFailed {
             path: source.to_path_buf(),
-            reason,
+            reason: format!("{reason} (extracting into {})", dest_dir.display()),
         };
 
         fs::create_dir_all(dest_dir).map_err(|e| ManagerError::CreateDirFailed {
@@ -287,6 +290,59 @@ mod tests {
             .expect_err("garbage must not extract");
 
         assert!(err.to_string().contains("broken.tar.gz"), "{err}");
+    }
+
+    /// A failure while writing, such as a full disk, must name the folder
+    /// being written to: on a split layout that is not the disk holding the
+    /// archive, which is what the error's path names.
+    #[test]
+    fn a_failure_while_writing_names_the_destination() {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("whole.tar.gz");
+        tar_gz(&archive, &[("pkg/a.txt", b"alpha")]);
+        let parts = split_into(temp.path(), &fs::read(&archive).unwrap(), 4096);
+        let dest = temp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        // A directory where the archive wants a file makes the write fail.
+        fs::create_dir_all(dest.join("pkg/a.txt")).unwrap();
+
+        let err = TarGzExtractor::new()
+            .extract_parts(&parts, &dest, &CancelToken::new())
+            .expect_err("the write must fail");
+
+        match err {
+            ManagerError::ExtractionFailed { reason, .. } => assert!(
+                reason.ends_with(&format!("(extracting into {})", dest.display())),
+                "{reason}"
+            ),
+            other => panic!("expected ExtractionFailed, got {other:?}"),
+        }
+    }
+
+    /// The gzip trailer is read only by the final drain, so an archive cut
+    /// short inside it extracts every entry and must still fail.
+    #[test]
+    fn an_archive_missing_its_gzip_trailer_is_an_extraction_failure() {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("whole.tar.gz");
+        tar_gz(&archive, &[("pkg/a.txt", b"alpha")]);
+        let mut bytes = fs::read(&archive).unwrap();
+        bytes.truncate(bytes.len() - 4);
+        let parts_dir = temp.path().join("parts");
+        fs::create_dir_all(&parts_dir).unwrap();
+        let parts = split_into(&parts_dir, &bytes, bytes.len() / 2 + 1);
+        assert_eq!(parts.len(), 2);
+
+        let result = TarGzExtractor::new().extract_parts(
+            &parts,
+            &temp.path().join("dest"),
+            &CancelToken::new(),
+        );
+
+        assert!(
+            matches!(result, Err(ManagerError::ExtractionFailed { .. })),
+            "{result:?}"
+        );
     }
 
     /// Split `bytes` into files of `size` bytes in `dir`, named like `split`.
