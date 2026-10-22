@@ -317,13 +317,19 @@ xearthlayer packages remove <REGION> [OPTIONS]
 
 Large packages are split into multiple parts for easier downloading. While a package installs, its temp directory holds the reassembled archive and the extracted tree together, which can take up to four times the size of the download. Temporary files are removed as soon as each package finishes, whether it succeeds or fails.
 
-When a command installs or updates several packages, each package installs while the next one downloads, so a batch takes about as long as its downloads rather than its downloads plus its installs. That overlap needs room for one package's install and the next package's download at the same time. XEarthLayer checks the whole batch once, before downloading anything:
+When a command installs or updates several packages, they download one after another without waiting for installs, while a second stage installs them in order, one at a time. A batch therefore takes about as long as its downloads. Downloaded packages wait on disk for their turn, so XEarthLayer only starts a download when, at every point until it installs, the package installing (up to four times its download) plus every downloaded package waiting behind it still fits in the free space. Otherwise the download waits, shown as "waiting for disk space", and starts as soon as an install finishes. A package whose install alone needs more space than is free fails without downloading anything, and the rest of the batch continues.
 
-- If the overlap fits, packages download and install side by side.
-- If only one package at a time fits, the batch runs one package at a time instead, exactly as earlier versions did.
-- If not even that fits, nothing is downloaded and the command reports how much space it needs.
+The free space is measured when a batch starts. Other programs writing to the same disk during a long batch, including XEarthLayer's own tile cache when it shares the disk, are not seen until the next batch.
+
+Only one package command runs at a time. A second one, or one started while another is running, stops with "another package operation is running".
 
 No external tools are needed to unpack a package: archives are extracted inside XEarthLayer itself.
+
+## Stopping an Install
+
+Press Ctrl+C once to cancel: downloads stop, a package being replaced is left at its old version, and temporary files are removed, either before the command exits or by the next package command. Press Ctrl+C again to quit at once and leave the cleanup for later. A system shutdown, `kill`, or closing the terminal also quits at once. In every case an installed package is always complete, either the old version or the new one, never neither, and the next package command removes whatever an interrupted one left behind. When a command removes several packages, the first Ctrl+C stops the rest of them too.
+
+The one step that is never interrupted is the final swap of the new version for the old one, which takes moments. When `packages.temp_dir` is on another disk than the packages, the new version is first copied next to its destination, which takes longer, but the installed version stays untouched until the swap.
 
 ## Network Issues
 

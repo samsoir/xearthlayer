@@ -200,9 +200,11 @@ Per-part retry via `RetryDownloader` decorator wrapping `HttpDownloader`:
 
 ## Installation Process
 
-`PackageInstaller::install_all` installs a batch of packages; a single install
-is a batch of one. Installing has two halves with different bottlenecks, and
-the batch overlaps them (#292).
+Package installs and removes run through `InstallQueue`
+(`manager/queue/`), a live queue that decouples the two halves of an install.
+Downloading is network bound and installing is disk bound, so downloads run
+ahead of installs for as long as the disk has room (#292). Callers submit jobs
+and watch events; `install_batch` is the blocking entry the CLI uses.
 
 ### Per package
 
@@ -215,45 +217,115 @@ the batch overlaps them (#292).
    verifying checksums as parts arrive.
 3. **Install** (disk bound). Reassemble the parts into one archive and free the
    parts (#260), extract the `tar.gz` in process with the `tar` crate over
-   flate2's `zlib-rs` backend (#274), then move the extracted tree into the
-   package store. Dropping the guard removes the temp directory on every exit
-   path.
+   flate2's `zlib-rs` backend (#274), stage the extracted tree beside its
+   destination, then swap it in by renaming any old version aside first
+   (`manager/aside.rs`). Dropping the guard removes the temp directory on every
+   exit path.
 
-### Batch schedule
+### Install queue
 
-`manager/pipeline.rs` runs downloads on the calling thread and installs on a
-single worker thread, joined by a rendezvous channel (`sync_channel(0)`). A
-downloaded package is handed over only once the previous install has finished,
-so at most one package installs while one downloads, and package `k` cannot
-start downloading before package `k - 2` has left the disk. Packages never
-install in parallel: they would only compete for the same disk.
+**Threads.** One downloader thread takes install jobs in submission order and
+downloads one package at a time (its parts stay parallel). One installer thread
+runs the ready jobs one at a time, in the order they became ready. Packages
+never install in parallel: they would only compete for the same disk. A
+failure at any stage is that job's result alone, and a stage that panics fails
+only its own job (`ManagerError::Panicked`).
 
-The free space is read once, after every package is sized and before anything
-downloads. Installing a package peaks at `SPACE_BUFFER_MULTIPLIER` (4) times
-its download, so with download sizes `s`:
+**Stages.** The `Stages` trait is the seam between the queue and the work:
+`prepare`, `download_size`, `download`, `install`, `remove`, `available_bytes`,
+plus the temp directory and packages root. `PackageInstaller` implements it for
+production; tests use a gated fake. `install` receives an `InstallContext`
+with `begin_swap` and `end_swap`.
 
-| Schedule | Peak |
+**Disk ledger.** Finished archives wait on disk for their turn, so
+`DiskLedger` admits a package to download only if, with `s` the download sizes
+of the admitted packages in install order and `SPACE_BUFFER_MULTIPLIER` (4) the
+install peak factor,
+
+```
+max over j of  4*s[j] + sum(s[i] for i after j)  <=  capacity
+```
+
+holds for every admitted `j`. Packages ahead of `j` have left the disk by the
+time it installs, and the archives queued behind it are complete. The ledger
+answers one of three ways:
+
+| Answer | Meaning | Job |
+|---|---|---|
+| `Admitted` | It fits | Downloads |
+| `Wait { needed, available }` | It fits once packages ahead have installed | Emits `WaitingForSpace`, waits on a condvar, retried on every release |
+| `Never { required }` | `4 * s` alone exceeds the capacity | Fails with `InsufficientDiskSpace`; the downloader moves on |
+
+The check is made at admission, so the installer never waits for space and the
+two threads cannot deadlock. An entry is released when its job installs, fails
+or is cancelled. Removes never touch the ledger: the space they free returns to
+the packages directory, which may be another filesystem.
+
+**Capacity** is the free space of the temp filesystem, read once per busy
+period (when the first job asks to download after the queue was empty) and never
+mid-install, because it would then count a half-extracted tree as used.
+Writers other than the queue are unseen until the next busy period.
+
+**Removes** skip the downloader and go straight to the install queue, so a
+remove can overtake a download that is waiting for space. `submit` refuses a
+second unfinished job for the same region and package type
+(`ManagerError::AlreadyQueued`), which keeps that overtaking safe and guards a
+UI against double selection. It also refuses once the queue is shutting down or
+abandoned (`QueueClosed`). `submit_batch` submits many installs under one lock
+and `finish_batch` waits for them, so a cancel sees all of a batch or none of it.
+
+**Cancellation.** Every job has a `CancelToken`, checked per buffer by the HTTP
+download loop and per tar entry by the extractor.
+
+| Cancelled while | Result |
 |---|---|
-| Overlapped | `max(4 * s[i] + s[i+1], 4 * s[last])` |
-| Sequential | `max(4 * s[i])` |
+| Queued, or downloaded and waiting | Removed from the queue immediately; ledger entry released; a downloaded package's temp directory deleted |
+| Preparing, waiting for space, downloading | The token is raised; the owning thread notices, aborts every part worker, and the temp guard deletes the parts |
+| Reassembling or extracting | Checked per buffer and per tar entry; the guard deletes the partial tree; the old version is untouched |
+| Staging | As above; the staging folder is deleted |
+| The swap | `TooLate`; the swap runs to completion |
+| A remove that has started | `TooLate` |
 
-`pipeline::schedule_for` overlaps when that peak fits, falls back to sequential
-when only that fits, and otherwise refuses the batch before downloading. A
-batch is therefore never refused where installing its packages one at a time
-would have succeeded. A per-package check made when each download starts would
-not work: during the overlap it would see the previous package's half-written
-tree as used space.
+The swap is two renames in the destination's parent directory: the old version
+is set aside to `.xel-aside-<name>`, then the staged tree (`.xel-staging-<name>`,
+copied there first when the temp directory is on another filesystem) is renamed
+in. `begin_swap` claims it; `end_swap` marks the renames done, and the old
+version is deleted after that, outside the uncancellable part. A package folder
+is therefore always either the old version or the new one. Dot-prefixed names
+are skipped by `LocalPackageStore::list`.
 
-A failure at any stage is that package's result alone; every other package in
-the batch still downloads and installs.
+**Shutdown.** Dropping the queue cancels everything, lets a running swap
+finish, and joins both threads. `Canceller` (from `canceller()`) is a cloneable
+handle for signal handlers: `cancel_all` cancels every job in one critical
+section, and `abandon` additionally stops waiters from waiting for anything but
+a running swap and stops the drop from joining, because there may be no time for
+cleanup. A live `Canceller` keeps the queue's lock held.
 
-### Progress
+**Lock and sweep.** Starting a queue takes an exclusive `flock` on
+`{temp_dir}/.queue.lock` for the queue's life (`ManagerError::QueueBusy` if
+another process holds it); the kernel drops it however the process exits. Under
+that lock, `sweep` deletes leftover `install_*` temp directories and
+`.xel-staging-*` folders, and renames a `.xel-aside-*` folder back when its
+package folder is missing (the process died between the two renames, so the
+aside is the only copy), deleting it otherwise.
 
-Progress is reported through `InstallObserver`: `download_started` returns the
-per-part callback for the package downloading, and `install_stage` reports the
-typed stage of the package installing. The two can arrive concurrently. The
-CLI's `ConsoleInstallObserver` shows a spinner line for the install above the
-part bars of the download.
+**Observer.** `QueueObserver::on_event(id, &JobEvent)` receives `Queued`,
+`Preparing`, `WaitingForSpace`, `Downloading`, `Downloaded`, `Installing`,
+`Removing` and `Finished(&JobOutcome)`. Events are borrowed, so errors need not
+be `Clone`. The observer is `Send + Sync` and is called from the submitter, the
+downloader and the installer **while the queue's state lock is held**: it must
+not block and must never call back into the queue. A panicking observer is
+logged and ignored. The CLI's `ConsoleQueueObserver` shows one line per
+unfinished job above the part bars of the download.
+
+**CLI signals.** `xearthlayer-cli/src/signals.rs` routes SIGINT, SIGTERM and
+SIGHUP to the running queue's `Canceller`. A first SIGINT cancels and waits for
+cleanup; a second SIGINT, SIGTERM or SIGHUP abandons. The stop request is
+remembered across queues, so a command that runs one queue per package (remove)
+does not start the next after the user asked to stop. After SIGHUP nothing more
+is written to the terminal. The exit code is 128 plus the signal number of the
+first signal received (130, 143, 129). With no queue running, a signal gets its
+default action.
 
 ### Overlays
 
@@ -304,6 +376,9 @@ pub struct MountState {
 3. **Shutdown**: Unmount all in reverse order, wait for clean unmount
 
 ## Package Removal
+
+Removal is a `Job::Remove` in the same queue, so it takes the same lock as an
+install, and the old folder is renamed aside before it is deleted.
 
 ### Ortho Packages
 
@@ -390,9 +465,9 @@ Run 'xearthlayer start' to begin serving scenery.
 
 ### Disk Space
 
-- Check available space before download
-- Estimate required space (archive + extracted)
-- Fail early with clear message if insufficient
+- The `DiskLedger` admits each download against the free space (see Install queue)
+- Estimate required space (archive + extracted) as `SPACE_BUFFER_MULTIPLIER` times the download
+- A package that cannot fit fails before downloading, with a clear message; the rest of the batch continues
 
 ### Checksum Failures
 
