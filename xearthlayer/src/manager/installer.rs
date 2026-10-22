@@ -418,7 +418,9 @@ impl PackageInstaller {
 
         report(InstallStage::Installing);
         let install_path = self.store.install_path(region, package_type);
-        swap_in(&extract_dir, &install_path)?;
+        let staged = stage(&extract_dir, &install_path)?;
+        // The swap proper starts at swap_in.
+        swap_in(staged, &install_path)?;
         report(InstallStage::Complete);
 
         info!(
@@ -454,13 +456,36 @@ fn validate_file_name(name: &str) -> ManagerResult<()> {
     }
 }
 
-/// Move the extracted package to `install_path`, replacing any older
-/// version so that one of the two is always in place.
-fn swap_in(extract_dir: &Path, install_path: &Path) -> ManagerResult<()> {
-    let replaced = aside::set_aside(install_path)?;
-    if let Err(e) = move_extracted_contents(extract_dir, install_path) {
-        aside::restore(install_path, replaced.as_deref());
+/// Put the extracted package at a staging path beside `install_path`.
+///
+/// The temp directory is routinely on another filesystem, so this may copy
+/// for minutes. Doing it beside the install path keeps that slow step out of
+/// the live folder and makes the final swap a same-filesystem rename.
+fn stage(extract_dir: &Path, install_path: &Path) -> ManagerResult<aside::Staged> {
+    let staging = aside::staging_path(install_path);
+    if staging.exists() {
+        aside::discard(&staging);
+    }
+    if let Err(e) = move_extracted_contents(extract_dir, &staging) {
+        if staging.exists() {
+            aside::discard(&staging);
+        }
         return Err(e);
+    }
+    Ok(aside::Staged::new(staging))
+}
+
+/// Swap the staged package into `install_path`, replacing any older version
+/// so that one of the two is always in place.
+fn swap_in(staged: aside::Staged, install_path: &Path) -> ManagerResult<()> {
+    let replaced = aside::set_aside(install_path)?;
+    if let Err(e) = fs::rename(staged.path(), install_path) {
+        // `staged` is dropped on return, which removes the staging folder.
+        aside::restore(install_path, replaced.as_deref());
+        return Err(ManagerError::WriteFailed {
+            path: install_path.to_path_buf(),
+            source: e,
+        });
     }
     if let Some(old) = replaced {
         aside::discard(&old);
@@ -1056,30 +1081,75 @@ mod tests {
         fs::create_dir_all(extract_dir.join("zzXEL_af-north_ortho")).unwrap();
         fs::write(extract_dir.join("zzXEL_af-north_ortho/new.txt"), "new").unwrap();
 
-        swap_in(&extract_dir, &install_path).unwrap();
+        let staged = stage(&extract_dir, &install_path).unwrap();
+        let staged_path = staged.path().to_path_buf();
+        assert!(staged_path.join("new.txt").exists());
+        assert!(install_path.join("old.txt").exists());
+        swap_in(staged, &install_path).unwrap();
 
         assert!(install_path.join("new.txt").exists());
         assert!(!install_path.join("old.txt").exists());
+        assert!(!staged_path.exists());
         assert!(!crate::manager::aside::aside_path(&install_path).exists());
     }
 
     #[test]
-    fn a_swap_that_fails_part_way_puts_the_old_version_back() {
+    fn a_staging_that_fails_leaves_the_old_version_and_no_staging_folder() {
         let temp = TempDir::new().unwrap();
         let install_path = temp.path().join("Custom Scenery/zzXEL_af-north_ortho");
         fs::create_dir_all(&install_path).unwrap();
         fs::write(install_path.join("old.txt"), "old").unwrap();
-        // A missing extract directory makes the move fail after the old
-        // version is already set aside.
+        // A missing extract directory makes the move fail.
         let extract_dir = temp.path().join("missing");
 
-        assert!(swap_in(&extract_dir, &install_path).is_err());
+        assert!(stage(&extract_dir, &install_path).is_err());
+
+        assert_eq!(
+            fs::read_to_string(install_path.join("old.txt")).unwrap(),
+            "old"
+        );
+        assert!(!crate::manager::aside::staging_path(&install_path).exists());
+        assert!(!crate::manager::aside::aside_path(&install_path).exists());
+    }
+
+    #[test]
+    fn a_swap_whose_rename_fails_puts_the_old_version_back() {
+        let temp = TempDir::new().unwrap();
+        let install_path = temp.path().join("Custom Scenery/zzXEL_af-north_ortho");
+        fs::create_dir_all(&install_path).unwrap();
+        fs::write(install_path.join("old.txt"), "old").unwrap();
+        // The old version is already set aside when this rename fails.
+        let staged = aside::Staged::new(temp.path().join("Custom Scenery/.xel-staging-missing"));
+
+        assert!(swap_in(staged, &install_path).is_err());
 
         assert_eq!(
             fs::read_to_string(install_path.join("old.txt")).unwrap(),
             "old"
         );
         assert!(!crate::manager::aside::aside_path(&install_path).exists());
+    }
+
+    #[test]
+    fn a_staged_package_dropped_without_swapping_is_removed() {
+        let temp = TempDir::new().unwrap();
+        let install_path = temp.path().join("Custom Scenery/zzXEL_af-north_ortho");
+        fs::create_dir_all(&install_path).unwrap();
+        fs::write(install_path.join("old.txt"), "old").unwrap();
+        let extract_dir = temp.path().join("extracted");
+        fs::create_dir_all(extract_dir.join("zzXEL_af-north_ortho")).unwrap();
+        fs::write(extract_dir.join("zzXEL_af-north_ortho/new.txt"), "new").unwrap();
+
+        let staged = stage(&extract_dir, &install_path).unwrap();
+        let staged_path = staged.path().to_path_buf();
+        assert!(staged_path.exists());
+        drop(staged);
+
+        assert!(!staged_path.exists());
+        assert_eq!(
+            fs::read_to_string(install_path.join("old.txt")).unwrap(),
+            "old"
+        );
     }
 
     #[test]

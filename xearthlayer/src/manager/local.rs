@@ -153,7 +153,7 @@ impl LocalPackageStore {
             if !path.is_dir() {
                 continue;
             }
-            if aside::is_aside(&entry.file_name()) {
+            if aside::is_transient(&entry.file_name()) {
                 continue;
             }
 
@@ -431,6 +431,26 @@ mod tests {
 
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].region(), "EU");
+        assert_eq!(packages[0].path, install_path);
+    }
+
+    #[test]
+    fn a_staging_folder_is_not_listed_as_a_package() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "eu", PackageType::Ortho, "1.0.0");
+        let install_path = store.install_path("eu", PackageType::Ortho);
+        let staging = crate::manager::aside::staging_path(&install_path);
+        fs::create_dir_all(&staging).unwrap();
+        fs::copy(
+            install_path.join("xearthlayer_scenery_package.txt"),
+            staging.join("xearthlayer_scenery_package.txt"),
+        )
+        .unwrap();
+
+        let packages = store.list().unwrap();
+
+        assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].path, install_path);
     }
 
