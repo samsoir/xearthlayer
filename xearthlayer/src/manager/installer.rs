@@ -11,6 +11,7 @@
 //! one package installs while the next one downloads (#292). Installing a
 //! single package is a batch of one.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -466,7 +467,7 @@ fn stage(extract_dir: &Path, install_path: &Path) -> ManagerResult<aside::Staged
     if staging.exists() {
         aside::discard(&staging);
     }
-    if let Err(e) = move_extracted_contents(extract_dir, &staging) {
+    if let Err(e) = move_extracted_contents(extract_dir, install_path.file_name(), &staging) {
         if staging.exists() {
             aside::discard(&staging);
         }
@@ -499,7 +500,11 @@ fn swap_in(staged: aside::Staged, install_path: &Path) -> ManagerResult<()> {
 /// folder, named like the install path. A directory of that name is the
 /// package whatever else sits beside it: Finder writes a `.DS_Store` into
 /// any folder it displays, including `extracted/` mid-install (#303).
-fn move_extracted_contents(extract_dir: &Path, install_path: &Path) -> ManagerResult<()> {
+fn move_extracted_contents(
+    extract_dir: &Path,
+    package_name: Option<&OsStr>,
+    install_path: &Path,
+) -> ManagerResult<()> {
     let entries: Vec<_> = fs::read_dir(extract_dir)
         .map_err(|e| ManagerError::ReadFailed {
             path: extract_dir.to_path_buf(),
@@ -510,7 +515,7 @@ fn move_extracted_contents(extract_dir: &Path, install_path: &Path) -> ManagerRe
 
     let named_package = entries
         .iter()
-        .find(|e| Some(e.file_name().as_os_str()) == install_path.file_name() && e.path().is_dir());
+        .find(|e| Some(e.file_name().as_os_str()) == package_name && e.path().is_dir());
     let package_folder = match named_package {
         Some(entry) => Some(entry),
         None if entries.len() == 1 && entries[0].path().is_dir() => Some(&entries[0]),
@@ -1058,7 +1063,7 @@ mod tests {
         fs::write(extract_dir.join(format!("._{mountpoint}")), "appledouble").unwrap();
         let install_path = temp.path().join("Custom Scenery").join(mountpoint);
 
-        move_extracted_contents(&extract_dir, &install_path).unwrap();
+        move_extracted_contents(&extract_dir, install_path.file_name(), &install_path).unwrap();
 
         assert_eq!(
             fs::read_to_string(install_path.join("xearthlayer_scenery_package.txt")).unwrap(),
@@ -1128,6 +1133,35 @@ mod tests {
             "old"
         );
         assert!(!crate::manager::aside::aside_path(&install_path).exists());
+    }
+
+    /// #303 through the staging path: the archive entry is matched by the
+    /// package's name, not the staging folder's, so Finder's files beside the
+    /// package folder do not nest it.
+    #[test]
+    fn a_staged_install_with_finder_files_beside_the_package_does_not_nest_it() {
+        let temp = TempDir::new().unwrap();
+        let mountpoint = "zzXEL_af-north_ortho";
+        let extract_dir = temp.path().join("extracted");
+        let package_dir = extract_dir.join(mountpoint);
+        fs::create_dir_all(&package_dir).unwrap();
+        fs::write(package_dir.join("xearthlayer_scenery_package.txt"), "meta").unwrap();
+        fs::write(extract_dir.join(".DS_Store"), "finder").unwrap();
+        fs::write(extract_dir.join(format!("._{mountpoint}")), "appledouble").unwrap();
+        let install_path = temp.path().join("Custom Scenery").join(mountpoint);
+
+        let staged = stage(&extract_dir, &install_path).unwrap();
+        swap_in(staged, &install_path).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(install_path.join("xearthlayer_scenery_package.txt")).unwrap(),
+            "meta"
+        );
+        assert!(
+            !install_path.join(mountpoint).exists(),
+            "package was nested"
+        );
+        assert!(!install_path.join(".DS_Store").exists());
     }
 
     #[test]
