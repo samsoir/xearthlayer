@@ -7,7 +7,7 @@ use semver::Version;
 
 use xearthlayer_package::{self as package, parse_package_metadata, PackageMetadata, PackageType};
 
-use super::{ManagerError, ManagerResult};
+use super::{aside, ManagerError, ManagerResult};
 
 /// Mount status for ortho packages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +153,9 @@ impl LocalPackageStore {
             if !path.is_dir() {
                 continue;
             }
+            if aside::is_aside(&entry.file_name()) {
+                continue;
+            }
 
             // Check for XEarthLayer package marker
             let metadata_path = path.join("xearthlayer_scenery_package.txt");
@@ -207,10 +210,9 @@ impl LocalPackageStore {
             });
         }
 
-        fs::remove_dir_all(&package_dir).map_err(|e| ManagerError::WriteFailed {
-            path: package_dir,
-            source: e,
-        })
+        let aside = aside::set_aside(&package_dir)?.expect("the package folder exists");
+        aside::discard(&aside);
+        Ok(())
     }
 
     /// Get the expected install path for a package.
@@ -409,6 +411,40 @@ mod tests {
 
         store.remove("na", PackageType::Ortho).unwrap();
         assert!(!store.is_installed("na", PackageType::Ortho));
+    }
+
+    #[test]
+    fn a_folder_set_aside_is_not_listed_as_a_package() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "eu", PackageType::Ortho, "1.0.0");
+        let install_path = store.install_path("eu", PackageType::Ortho);
+        let aside = crate::manager::aside::aside_path(&install_path);
+        fs::create_dir_all(&aside).unwrap();
+        fs::copy(
+            install_path.join("xearthlayer_scenery_package.txt"),
+            aside.join("xearthlayer_scenery_package.txt"),
+        )
+        .unwrap();
+
+        let packages = store.list().unwrap();
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].region(), "EU");
+        assert_eq!(packages[0].path, install_path);
+    }
+
+    #[test]
+    fn remove_leaves_neither_the_package_nor_an_aside_folder() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "eu", PackageType::Ortho, "1.0.0");
+        let install_path = store.install_path("eu", PackageType::Ortho);
+
+        store.remove("eu", PackageType::Ortho).unwrap();
+
+        assert!(!install_path.exists());
+        assert!(!crate::manager::aside::aside_path(&install_path).exists());
     }
 
     #[test]

@@ -19,6 +19,7 @@ use tracing::info;
 
 use xearthlayer_package::{PackageMetadata, PackageType};
 
+use super::aside;
 use super::cancel::CancelToken;
 use super::disk_check::{available_bytes, FsInfoProvider, RealFsInfoProvider};
 use super::download::{DownloadProgressCallback, DownloadState, MultiPartDownloader};
@@ -417,13 +418,7 @@ impl PackageInstaller {
 
         report(InstallStage::Installing);
         let install_path = self.store.install_path(region, package_type);
-        if install_path.exists() {
-            fs::remove_dir_all(&install_path).map_err(|e| ManagerError::WriteFailed {
-                path: install_path.clone(),
-                source: e,
-            })?;
-        }
-        move_extracted_contents(&extract_dir, &install_path)?;
+        swap_in(&extract_dir, &install_path)?;
         report(InstallStage::Complete);
 
         info!(
@@ -457,6 +452,20 @@ fn validate_file_name(name: &str) -> ManagerResult<()> {
             "unsafe file name in package metadata: {name:?}"
         ))),
     }
+}
+
+/// Move the extracted package to `install_path`, replacing any older
+/// version so that one of the two is always in place.
+fn swap_in(extract_dir: &Path, install_path: &Path) -> ManagerResult<()> {
+    let replaced = aside::set_aside(install_path)?;
+    if let Err(e) = move_extracted_contents(extract_dir, install_path) {
+        aside::restore(install_path, replaced.as_deref());
+        return Err(e);
+    }
+    if let Some(old) = replaced {
+        aside::discard(&old);
+    }
+    Ok(())
 }
 
 /// Move extracted contents to the install path.
@@ -1035,6 +1044,42 @@ mod tests {
             !install_path.join(mountpoint).exists(),
             "package was nested"
         );
+    }
+
+    #[test]
+    fn a_swap_replaces_the_old_version_and_leaves_nothing_aside() {
+        let temp = TempDir::new().unwrap();
+        let install_path = temp.path().join("Custom Scenery/zzXEL_af-north_ortho");
+        fs::create_dir_all(&install_path).unwrap();
+        fs::write(install_path.join("old.txt"), "old").unwrap();
+        let extract_dir = temp.path().join("extracted");
+        fs::create_dir_all(extract_dir.join("zzXEL_af-north_ortho")).unwrap();
+        fs::write(extract_dir.join("zzXEL_af-north_ortho/new.txt"), "new").unwrap();
+
+        swap_in(&extract_dir, &install_path).unwrap();
+
+        assert!(install_path.join("new.txt").exists());
+        assert!(!install_path.join("old.txt").exists());
+        assert!(!crate::manager::aside::aside_path(&install_path).exists());
+    }
+
+    #[test]
+    fn a_swap_that_fails_part_way_puts_the_old_version_back() {
+        let temp = TempDir::new().unwrap();
+        let install_path = temp.path().join("Custom Scenery/zzXEL_af-north_ortho");
+        fs::create_dir_all(&install_path).unwrap();
+        fs::write(install_path.join("old.txt"), "old").unwrap();
+        // A missing extract directory makes the move fail after the old
+        // version is already set aside.
+        let extract_dir = temp.path().join("missing");
+
+        assert!(swap_in(&extract_dir, &install_path).is_err());
+
+        assert_eq!(
+            fs::read_to_string(install_path.join("old.txt")).unwrap(),
+            "old"
+        );
+        assert!(!crate::manager::aside::aside_path(&install_path).exists());
     }
 
     #[test]

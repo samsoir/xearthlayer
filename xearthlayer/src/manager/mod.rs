@@ -38,6 +38,7 @@
 //! let installed = manager.list_installed()?;
 //! ```
 
+mod aside;
 mod cache;
 mod cancel;
 mod client;
