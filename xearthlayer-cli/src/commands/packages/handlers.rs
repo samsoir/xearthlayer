@@ -652,7 +652,14 @@ impl CommandHandler for RemoveHandler {
         for package in &packages {
             let region = package.region();
 
-            // Clean up stale per-region overlay symlink if one exists
+            ctx.output.println("Removing package...");
+            ctx.manager
+                .remove_package(&store, region, args.package_type, &args.temp_dir)
+                .map_err(|e| CliError::Packages(e.to_string()))?;
+
+            // Clean up stale per-region overlay symlink if one exists. Only now:
+            // a refused remove (e.g. the queue lock is held) leaves the package
+            // installed, and it must keep its symlink.
             if args.package_type == PackageType::Overlay {
                 if let Some(ref custom_scenery_path) = args.custom_scenery_path {
                     match remove_overlay_symlink(region, custom_scenery_path) {
@@ -666,11 +673,6 @@ impl CommandHandler for RemoveHandler {
                     }
                 }
             }
-
-            ctx.output.println("Removing package...");
-            ctx.manager
-                .remove_package(&store, region, args.package_type, &args.temp_dir)
-                .map_err(|e| CliError::Packages(e.to_string()))?;
 
             ctx.output
                 .success(&format!("Removed {} ({})", region, args.package_type));
@@ -834,6 +836,62 @@ mod tests {
 
         run.result.unwrap();
         assert_eq!(manager.removals(), ["NA-CANADA-WEST", "NA-CANADA-EAST"]);
+    }
+
+    /// Remove the overlay "NA" with its per-region symlink in place; returns
+    /// the run and whether the symlink is still there afterwards.
+    fn remove_overlay_with_symlink(manager: &FakeManager) -> (Run, bool) {
+        let scenery = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let link = scenery.path().join(xearthlayer_package::package_mountpoint(
+            "NA",
+            PackageType::Overlay,
+        ));
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+
+        let run = run(manager, true, |ctx| {
+            RemoveHandler::execute(
+                RemoveArgs {
+                    region: "NA".to_string(),
+                    package_type: PackageType::Overlay,
+                    install_dir: install_dir(),
+                    temp_dir: std::path::PathBuf::from("/tmp/unused"),
+                    force: true,
+                    custom_scenery_path: Some(scenery.path().to_path_buf()),
+                    disable_overlays: false,
+                    xworld_pro: false,
+                },
+                ctx,
+            )
+        });
+        (run, link.symlink_metadata().is_ok())
+    }
+
+    #[test]
+    fn a_refused_remove_leaves_the_overlay_symlink_in_place() {
+        let manager = FakeManager::default()
+            .with_installed(PackageType::Overlay, &["NA"])
+            .refusing_removal_of("NA");
+
+        let (run, symlink_survives) = remove_overlay_with_symlink(&manager);
+
+        assert!(run.result.is_err());
+        assert!(manager.removals().is_empty());
+        assert!(
+            symlink_survives,
+            "the symlink of a package that stayed installed must survive"
+        );
+    }
+
+    #[test]
+    fn a_completed_overlay_remove_clears_its_symlink() {
+        let manager = FakeManager::default().with_installed(PackageType::Overlay, &["NA"]);
+
+        let (run, symlink_survives) = remove_overlay_with_symlink(&manager);
+
+        run.result.unwrap();
+        assert_eq!(manager.removals(), ["NA"]);
+        assert!(!symlink_survives);
     }
 
     #[test]

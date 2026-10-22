@@ -193,3 +193,91 @@ impl PackageManagerService for DefaultPackageManagerService {
         store.list()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xearthlayer_package::package_mountpoint;
+
+    fn install_fake_package(root: &Path, region: &str) -> std::path::PathBuf {
+        let folder = package_mountpoint(region, PackageType::Ortho);
+        let dir = root.join(&folder);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("dummy.dsf"), "dsf").unwrap();
+        std::fs::write(
+            dir.join("xearthlayer_scenery_package.txt"),
+            format!(
+                "REGIONAL SCENERY PACKAGE\n1.0.0\n{}  1.0.0\n2024-01-01T00:00:00Z\nZ\n{folder}\n\
+                 test.tar.gz\n1\n\nabc123  test.tar.gz  http://example.com/test.tar.gz\n",
+                region.to_uppercase()
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn removing_an_installed_package_deletes_it_and_leaves_no_aside_folder() {
+        let packages = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = install_fake_package(packages.path(), "eu");
+        let service = DefaultPackageManagerService::new();
+        let store = service.create_store(packages.path());
+
+        service
+            .remove_package(&store, "eu", PackageType::Ortho, temp.path())
+            .unwrap();
+
+        assert!(!dir.exists());
+        assert_eq!(entries(packages.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn removing_a_package_that_is_not_installed_reports_it_as_not_found() {
+        let packages = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let service = DefaultPackageManagerService::new();
+        let store = service.create_store(packages.path());
+
+        let err = service
+            .remove_package(&store, "eu", PackageType::Ortho, temp.path())
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ManagerError::PackageNotFound { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_remove_refused_by_the_queue_lock_leaves_the_package_installed() {
+        let packages = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = install_fake_package(packages.path(), "eu");
+        let service = DefaultPackageManagerService::new();
+        let store = service.create_store(packages.path());
+        // Another operation owns the temp directory's queue lock.
+        let _holder = InstallQueue::start(
+            PackageInstaller::new(LocalPackageStore::new(packages.path()), temp.path()),
+            Arc::new(ConsoleQueueObserver::default()),
+        )
+        .unwrap();
+
+        let err = service
+            .remove_package(&store, "eu", PackageType::Ortho, temp.path())
+            .unwrap_err();
+
+        assert!(matches!(err, ManagerError::QueueBusy { .. }), "{err:?}");
+        assert!(err.to_string().contains("another package operation"));
+        assert!(dir.join("xearthlayer_scenery_package.txt").exists());
+    }
+}

@@ -11,8 +11,8 @@ use std::sync::Mutex;
 
 use semver::Version;
 use xearthlayer::manager::{
-    InstallResult, InstalledPackage, LocalPackageStore, ManagerResult, MountStatus, PackageInfo,
-    PackageStatus,
+    InstallResult, InstalledPackage, LocalPackageStore, ManagerError, ManagerResult, MountStatus,
+    PackageInfo, PackageStatus,
 };
 use xearthlayer_package::{LibraryEntry, PackageLibrary, PackageMetadata, PackageType};
 
@@ -82,6 +82,8 @@ pub struct FakeManager {
     /// Each `install_packages` call, as "TITLE (type)" per package.
     batches: Mutex<Vec<Vec<String>>>,
     removals: Mutex<Vec<String>>,
+    /// Titles whose removal is refused, as when the queue lock is held.
+    refused_removals: Vec<String>,
 }
 
 impl FakeManager {
@@ -137,6 +139,12 @@ impl FakeManager {
     /// Make installing `title` as `package_type` fail.
     pub fn failing_on(mut self, title: &str, package_type: PackageType) -> Self {
         self.failing.push(format!("{title} ({package_type})"));
+        self
+    }
+
+    /// Make removing `title` fail with `QueueBusy`, as a held queue lock does.
+    pub fn refusing_removal_of(mut self, title: &str) -> Self {
+        self.refused_removals.push(title.to_string());
         self
     }
 
@@ -224,8 +232,13 @@ impl PackageManagerService for FakeManager {
         _store: &LocalPackageStore,
         region: &str,
         _package_type: PackageType,
-        _temp_dir: &Path,
+        temp_dir: &Path,
     ) -> ManagerResult<()> {
+        if self.refused_removals.iter().any(|t| t == region) {
+            return Err(ManagerError::QueueBusy {
+                path: temp_dir.join(".queue.lock"),
+            });
+        }
         self.removals.lock().unwrap().push(region.to_string());
         Ok(())
     }
