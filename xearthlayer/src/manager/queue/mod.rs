@@ -64,7 +64,7 @@ impl<S: Stages> QueueControl for state::Shared<S> {
 
 /// Downloads queued packages one after another while installing them in
 /// order on a second thread. See the module documentation.
-pub struct InstallQueue<S: Stages> {
+pub struct InstallQueue<S: Stages = crate::manager::PackageInstaller> {
     shared: Arc<state::Shared<S>>,
     threads: Vec<JoinHandle<()>>,
 }

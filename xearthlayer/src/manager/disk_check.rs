@@ -2,8 +2,8 @@
 //!
 //! An install batch reads the free space once, after every package's parts
 //! are sized and before any bytes hit the network, so users get a clear
-//! failure up front (#188). `pipeline::schedule_for` turns that figure into
-//! a schedule, or a refusal.
+//! failure up front (#188). The install queue's `DiskLedger` decides from
+//! that figure when each package may download.
 //!
 //! The provider trait exists so tests can inject low-available stubs;
 //! production wires `RealFsInfoProvider`, which delegates to

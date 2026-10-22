@@ -51,7 +51,6 @@ mod install_guard;
 mod installer;
 mod local;
 mod mounts;
-mod pipeline;
 mod queue;
 mod symlinks;
 mod traits;
@@ -69,7 +68,7 @@ pub use download::{
 };
 pub use error::{ManagerError, ManagerResult};
 pub use extractor::TarGzExtractor;
-pub use installer::{InstallObserver, InstallResult, InstallStage, PackageInstaller};
+pub use installer::{InstallResult, InstallStage, PackageInstaller};
 pub use local::{InstalledPackage, LocalPackageStore, MountStatus};
 pub use mounts::{ActiveMount, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder};
 pub use queue::{

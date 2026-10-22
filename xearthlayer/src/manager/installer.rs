@@ -7,9 +7,9 @@
 //! 2. **Install** (disk bound): reassemble the parts, extract the archive and
 //!    move the extracted tree into the package store.
 //!
-//! [`PackageInstaller::install_all`] runs a batch through the [`pipeline`], so
-//! one package installs while the next one downloads (#292). Installing a
-//! single package is a batch of one.
+//! [`PackageInstaller`] does the work of each stage as the [`Stages`] of an
+//! [`InstallQueue`](super::InstallQueue), which downloads packages one after
+//! another while installing them in order (#292).
 
 use std::ffi::OsStr;
 use std::fs;
@@ -28,14 +28,16 @@ use super::error::{ManagerError, ManagerResult};
 use super::extractor::TarGzExtractor;
 use super::install_guard::InstallTempGuard;
 use super::local::LocalPackageStore;
-use super::pipeline;
-use super::traits::ArchiveExtractor;
+use super::queue::{InstallContext, Stages};
 
 /// Timeout for downloading a single archive part.
 const PART_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Parts downloaded in parallel unless `with_parallel_downloads` says otherwise.
 const DEFAULT_PARALLEL_DOWNLOADS: usize = 4;
+
+/// Start of the name of each package's temp directory.
+pub(crate) const INSTALL_TEMP_PREFIX: &str = "install_";
 
 /// Stages of installing a package whose parts have downloaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,8 +48,6 @@ pub enum InstallStage {
     Extracting,
     /// Moving the extracted tree into the package store.
     Installing,
-    /// Installation complete.
-    Complete,
 }
 
 impl InstallStage {
@@ -57,23 +57,8 @@ impl InstallStage {
             Self::Reassembling => "Reassembling",
             Self::Extracting => "Extracting",
             Self::Installing => "Installing",
-            Self::Complete => "Complete",
         }
     }
-}
-
-/// Receives progress from [`PackageInstaller::install_all`].
-///
-/// A package's download reports from the calling thread while an earlier
-/// package installs on a worker thread, so both methods can be called at the
-/// same time.
-pub trait InstallObserver: Send + Sync {
-    /// `package` is about to download. The returned callback, if any,
-    /// receives its per-part progress.
-    fn download_started(&self, package: &PackageMetadata) -> Option<DownloadProgressCallback>;
-
-    /// `package`'s install has reached `stage`.
-    fn install_stage(&self, package: &PackageMetadata, stage: InstallStage);
 }
 
 /// The network half of a download: sizing and fetching archive parts.
@@ -127,15 +112,15 @@ pub struct InstallResult {
 
 /// A package ready to download: validated, its temp directory created and
 /// its parts sized.
-struct Prepared<'a> {
-    metadata: &'a PackageMetadata,
+pub struct PreparedPackage {
+    metadata: PackageMetadata,
     temp: InstallTempGuard,
     state: DownloadState,
 }
 
 /// A package whose parts are all on disk with verified checksums.
-struct Downloaded<'a> {
-    metadata: &'a PackageMetadata,
+pub struct DownloadedPackage {
+    metadata: PackageMetadata,
     temp: InstallTempGuard,
     parts: Vec<PathBuf>,
     bytes_downloaded: u64,
@@ -201,90 +186,23 @@ impl PackageInstaller {
         ));
         self
     }
+}
 
-    /// Install every package in `packages`, returning one result per package
-    /// in the same order.
-    ///
-    /// Each package is validated and sized first, then the peak disk usage of
-    /// the whole batch is checked once, before anything downloads. Packages
-    /// then install while the next one downloads, or one at a time when only
-    /// that fits (see [`pipeline::schedule_for`]). A package that fails at any
-    /// point fails alone.
-    pub fn install_all(
-        &self,
-        packages: &[PackageMetadata],
-        observer: &dyn InstallObserver,
-    ) -> Vec<ManagerResult<InstallResult>> {
-        let mut ready = Vec::new();
-        let refusals: Vec<Option<ManagerError>> = packages
-            .iter()
-            .map(|metadata| match self.prepare(metadata) {
-                Ok(prepared) => {
-                    ready.push(prepared);
-                    None
-                }
-                Err(e) => Some(e),
-            })
-            .collect();
+impl Stages for PackageInstaller {
+    type Prepared = PreparedPackage;
+    type Downloaded = DownloadedPackage;
 
-        let mut installed = self.run_ready(ready, observer).into_iter();
-        refusals
-            .into_iter()
-            .map(|refusal| match refusal {
-                None => installed.next().expect("one result per prepared package"),
-                Some(e) => Err(e),
-            })
-            .collect()
+    fn temp_dir(&self) -> &Path {
+        &self.temp_dir
     }
 
-    /// Check the batch's disk peak, then download and install every prepared
-    /// package. Results are in `ready` order.
-    fn run_ready(
-        &self,
-        ready: Vec<Prepared<'_>>,
-        observer: &dyn InstallObserver,
-    ) -> Vec<ManagerResult<InstallResult>> {
-        if ready.is_empty() {
-            return Vec::new();
-        }
-
-        let refuse_all =
-            |reason: &dyn Fn() -> ManagerError| ready.iter().map(|_| Err(reason())).collect();
-        let available = match available_bytes(self.fs_info_provider.as_ref(), &self.temp_dir) {
-            Ok(available) => available,
-            Err(e) => {
-                let reason = e.to_string();
-                return refuse_all(&|| ManagerError::InvalidPath(reason.clone()));
-            }
-        };
-        let sizes: Vec<u64> = ready.iter().map(|p| p.state.total_size).collect();
-        let schedule = match pipeline::schedule_for(&sizes, available) {
-            Ok(schedule) => schedule,
-            Err(required_bytes) => {
-                return refuse_all(&|| ManagerError::InsufficientDiskSpace {
-                    path: self.temp_dir.clone(),
-                    required_bytes,
-                    available_bytes: available,
-                });
-            }
-        };
-
-        info!(
-            packages = ready.len(),
-            ?schedule,
-            available_bytes = available,
-            "batch install started"
-        );
-        pipeline::run(
-            ready,
-            schedule,
-            |prepared| self.download(prepared, observer),
-            |downloaded| self.install(downloaded, observer),
-        )
+    fn available_bytes(&self) -> ManagerResult<u64> {
+        available_bytes(self.fs_info_provider.as_ref(), &self.temp_dir)
+            .map_err(|e| ManagerError::InvalidPath(e.to_string()))
     }
 
     /// Validate `metadata`, create its temp directory and size its parts.
-    fn prepare<'a>(&self, metadata: &'a PackageMetadata) -> ManagerResult<Prepared<'a>> {
+    fn prepare(&self, metadata: &PackageMetadata) -> ManagerResult<PreparedPackage> {
         let region = &metadata.title;
         // The title becomes the install directory name, and metadata reaches
         // us over HTTP. The parser refuses an unusable title, but
@@ -313,7 +231,7 @@ impl PackageInstaller {
         }
 
         let install_temp = self.temp_dir.join(format!(
-            "install_{}_{}_{}",
+            "{INSTALL_TEMP_PREFIX}{}_{}_{}",
             region.to_lowercase(),
             package_type,
             version
@@ -338,20 +256,25 @@ impl PackageInstaller {
         );
         self.transfer.query_sizes(&mut state);
 
-        Ok(Prepared {
-            metadata,
+        Ok(PreparedPackage {
+            metadata: metadata.clone(),
             temp,
             state,
         })
     }
 
+    fn download_size(&self, prepared: &PreparedPackage) -> u64 {
+        prepared.state.total_size
+    }
+
     /// Download every part of a prepared package.
-    fn download<'a>(
+    fn download(
         &self,
-        prepared: Prepared<'a>,
-        observer: &dyn InstallObserver,
-    ) -> ManagerResult<Downloaded<'a>> {
-        let Prepared {
+        prepared: PreparedPackage,
+        cancel: &CancelToken,
+        progress: DownloadProgressCallback,
+    ) -> ManagerResult<DownloadedPackage> {
+        let PreparedPackage {
             metadata,
             temp,
             mut state,
@@ -364,11 +287,8 @@ impl PackageInstaller {
             "download phase started"
         );
         let started = Instant::now();
-        self.transfer.download_all(
-            &mut state,
-            observer.download_started(metadata),
-            &CancelToken::new(),
-        )?;
+        self.transfer
+            .download_all(&mut state, Some(progress), cancel)?;
         info!(
             region = %metadata.title,
             bytes_downloaded = state.bytes_downloaded,
@@ -376,7 +296,7 @@ impl PackageInstaller {
             "download phase completed"
         );
 
-        Ok(Downloaded {
+        Ok(DownloadedPackage {
             metadata,
             temp,
             parts: state.destinations,
@@ -388,23 +308,22 @@ impl PackageInstaller {
     /// directory is removed when this returns, whatever the outcome.
     fn install(
         &self,
-        downloaded: Downloaded<'_>,
-        observer: &dyn InstallObserver,
+        downloaded: DownloadedPackage,
+        ctx: &dyn InstallContext,
     ) -> ManagerResult<InstallResult> {
-        let Downloaded {
+        let DownloadedPackage {
             metadata,
             temp,
             parts,
             bytes_downloaded,
         } = downloaded;
-        let report = |stage| observer.install_stage(metadata, stage);
         let region = &metadata.title;
         let package_type = metadata.package_type;
 
-        report(InstallStage::Reassembling);
+        ctx.stage(InstallStage::Reassembling);
         let extractor = TarGzExtractor::new();
         let archive = temp.path().join(&metadata.filename);
-        extractor.reassemble(&parts, &archive, &CancelToken::new())?;
+        extractor.reassemble(&parts, &archive, ctx.cancel_token())?;
         // Free the parts before extracting rather than at cleanup. They are
         // redundant now and extraction is where peak disk usage lives, so
         // holding them through it costs a full extra copy of the download
@@ -412,17 +331,27 @@ impl PackageInstaller {
         let freed_bytes = free_downloaded_parts(&parts);
         info!(region = %region, freed_bytes, "reassembly completed, archive parts freed");
 
-        report(InstallStage::Extracting);
+        ctx.stage(InstallStage::Extracting);
         let extract_dir = temp.path().join("extracted");
-        let files_extracted = extractor.extract(&archive, &extract_dir)?;
+        let files_extracted =
+            extractor.extract_cancellable(&archive, &extract_dir, ctx.cancel_token())?;
         info!(region = %region, files_extracted, "extraction completed");
 
-        report(InstallStage::Installing);
         let install_path = self.store.install_path(region, package_type);
+        // Staging may copy across filesystems for minutes, so it comes before
+        // the swap is claimed: a cancel that arrives meanwhile still wins.
         let staged = stage(&extract_dir, &install_path)?;
-        // The swap proper starts at swap_in.
-        swap_in(staged, &install_path)?;
-        report(InstallStage::Complete);
+        if !ctx.begin_swap() {
+            // `staged` drops here, which removes its folder.
+            return Err(ManagerError::Cancelled);
+        }
+        ctx.stage(InstallStage::Installing);
+        let replaced = swap_in(staged, &install_path)?;
+        // The renames are done; deleting the old version may be abandoned.
+        ctx.end_swap();
+        if let Some(old) = replaced {
+            aside::discard(&old);
+        }
 
         info!(
             region = %region,
@@ -441,6 +370,10 @@ impl PackageInstaller {
             bytes_downloaded,
             files_extracted,
         })
+    }
+
+    fn remove(&self, region: &str, package_type: PackageType) -> ManagerResult<()> {
+        self.store.remove(region, package_type)
     }
 }
 
@@ -478,7 +411,10 @@ fn stage(extract_dir: &Path, install_path: &Path) -> ManagerResult<aside::Staged
 
 /// Swap the staged package into `install_path`, replacing any older version
 /// so that one of the two is always in place.
-fn swap_in(staged: aside::Staged, install_path: &Path) -> ManagerResult<()> {
+///
+/// Returns where the replaced version was set aside, if there was one. The
+/// caller discards it: that delete is slow and need not hold up the swap.
+fn swap_in(staged: aside::Staged, install_path: &Path) -> ManagerResult<Option<PathBuf>> {
     let replaced = aside::set_aside(install_path)?;
     if let Err(e) = fs::rename(staged.path(), install_path) {
         // `staged` is dropped on return, which removes the staging folder.
@@ -488,10 +424,7 @@ fn swap_in(staged: aside::Staged, install_path: &Path) -> ManagerResult<()> {
             source: e,
         });
     }
-    if let Some(old) = replaced {
-        aside::discard(&old);
-    }
-    Ok(())
+    Ok(replaced)
 }
 
 /// Move extracted contents to the install path.
@@ -641,6 +574,9 @@ mod tests {
     use tempfile::TempDir;
     use xearthlayer_package::ArchivePart;
 
+    use crate::manager::queue::{
+        InstallContext, InstallQueue, JobEvent, JobId, QueueObserver, Stages,
+    };
     use crate::system::FilesystemInfo;
 
     /// Serves archive parts from memory instead of the network.
@@ -690,31 +626,64 @@ mod tests {
         }
     }
 
-    /// Records every observer event as "<event> <title>".
+    /// Records the events each job passes through as "<event> <region>".
     #[derive(Default)]
-    struct Recorder(Mutex<Vec<String>>);
+    struct Recorder(Mutex<(HashMap<JobId, String>, Vec<String>)>);
 
     impl Recorder {
         fn events(&self) -> Vec<String> {
-            self.0.lock().unwrap().clone()
+            self.0.lock().unwrap().1.clone()
         }
     }
 
-    impl InstallObserver for Recorder {
-        fn download_started(&self, package: &PackageMetadata) -> Option<DownloadProgressCallback> {
-            self.0
-                .lock()
-                .unwrap()
-                .push(format!("download {}", package.title));
-            None
+    impl QueueObserver for Recorder {
+        fn on_event(&self, id: JobId, event: &JobEvent<'_>) {
+            let mut recorded = self.0.lock().unwrap();
+            let (regions, events) = &mut *recorded;
+            let name = match event {
+                JobEvent::Queued(summary) => {
+                    regions.insert(id, summary.region.clone());
+                    return;
+                }
+                JobEvent::Preparing => "download",
+                JobEvent::Installing(stage) => stage.name(),
+                JobEvent::Finished(_) => "Finished",
+                _ => return,
+            };
+            let region = regions.get(&id).cloned().unwrap_or_default();
+            events.push(format!("{name} {region}"));
+        }
+    }
+
+    /// Install `batch` through a queue, one result per package.
+    fn install_all(
+        installer: PackageInstaller,
+        batch: &[PackageMetadata],
+        recorder: Arc<Recorder>,
+    ) -> Vec<ManagerResult<InstallResult>> {
+        InstallQueue::start(installer, recorder)
+            .unwrap()
+            .install_batch(batch.to_vec())
+    }
+
+    /// An install context driven by the test rather than a queue.
+    struct TestContext {
+        token: CancelToken,
+        allow_swap: bool,
+    }
+
+    impl InstallContext for TestContext {
+        fn stage(&self, _stage: InstallStage) {}
+
+        fn cancel_token(&self) -> &CancelToken {
+            &self.token
         }
 
-        fn install_stage(&self, package: &PackageMetadata, stage: InstallStage) {
-            self.0
-                .lock()
-                .unwrap()
-                .push(format!("{} {}", stage.name(), package.title));
+        fn begin_swap(&self) -> bool {
+            self.allow_swap
         }
+
+        fn end_swap(&self) {}
     }
 
     /// Reports a fixed amount of free space.
@@ -733,13 +702,22 @@ mod tests {
     /// published package, its archive holds the package's metadata file
     /// alongside its content, `<mountpoint>/terrain/tile.ter`.
     fn package(title: &str, transfer: &mut LocalTransfer) -> PackageMetadata {
+        package_at(title, semver::Version::new(1, 0, 0), transfer)
+    }
+
+    /// `package` at `version`, which its archive's metadata file records.
+    fn package_at(
+        title: &str,
+        version: semver::Version,
+        transfer: &mut LocalTransfer,
+    ) -> PackageMetadata {
         let mountpoint = xearthlayer_package::package_mountpoint(title, PackageType::Ortho);
         let url = format!("test://{title}");
-        let filename = format!("{mountpoint}-1.0.0.tar.gz");
+        let filename = format!("{mountpoint}-{version}.tar.gz");
         let metadata = PackageMetadata {
             spec_version: semver::Version::new(1, 0, 0),
             title: title.to_string(),
-            package_version: semver::Version::new(1, 0, 0),
+            package_version: version,
             published_at: chrono::Utc::now(),
             package_type: PackageType::Ortho,
             mountpoint: mountpoint.clone(),
@@ -793,8 +771,7 @@ mod tests {
             package("AF-SOUTH", &mut transfer),
         ];
 
-        let results =
-            installer(&temp, transfer, u64::MAX).install_all(&batch, &Recorder::default());
+        let results = install_all(installer(&temp, transfer, u64::MAX), &batch, Arc::default());
 
         assert_eq!(results.len(), 2);
         for (result, title) in results.iter().zip(["AF-NORTH", "AF-SOUTH"]) {
@@ -816,9 +793,13 @@ mod tests {
             package("AF-NORTH", &mut transfer),
             package("AF-SOUTH", &mut transfer),
         ];
-        let recorder = Recorder::default();
+        let recorder = Arc::new(Recorder::default());
 
-        installer(&temp, transfer, u64::MAX).install_all(&batch, &recorder);
+        install_all(
+            installer(&temp, transfer, u64::MAX),
+            &batch,
+            Arc::clone(&recorder),
+        );
 
         let events = recorder.events();
         for title in ["AF-NORTH", "AF-SOUTH"] {
@@ -832,7 +813,7 @@ mod tests {
             assert!(at("download") < at("Reassembling"));
             assert!(at("Reassembling") < at("Extracting"));
             assert!(at("Extracting") < at("Installing"));
-            assert!(at("Installing") < at("Complete"));
+            assert!(at("Installing") < at("Finished"));
         }
     }
 
@@ -846,8 +827,7 @@ mod tests {
         ];
         transfer.failing.push("test://AF-NORTH".to_string());
 
-        let results =
-            installer(&temp, transfer, u64::MAX).install_all(&batch, &Recorder::default());
+        let results = install_all(installer(&temp, transfer, u64::MAX), &batch, Arc::default());
 
         assert!(
             matches!(results[0], Err(ManagerError::DownloadFailed { .. })),
@@ -874,8 +854,11 @@ mod tests {
         let south = package("AF-SOUTH", &mut transfer);
         let downloaded = Arc::clone(&transfer.downloaded);
 
-        let results = installer(&temp, transfer, u64::MAX)
-            .install_all(&[hostile, south], &Recorder::default());
+        let results = install_all(
+            installer(&temp, transfer, u64::MAX),
+            &[hostile, south],
+            Arc::default(),
+        );
 
         assert!(
             matches!(results[0], Err(ManagerError::InvalidPath(_))),
@@ -893,12 +876,18 @@ mod tests {
         let mut transfer = LocalTransfer::default();
         let north = package("AF-NORTH", &mut transfer);
         let downloaded = Arc::clone(&transfer.downloaded);
-        let first = installer(&temp, transfer.clone(), u64::MAX)
-            .install_all(std::slice::from_ref(&north), &Recorder::default());
+        let first = install_all(
+            installer(&temp, transfer.clone(), u64::MAX),
+            std::slice::from_ref(&north),
+            Arc::default(),
+        );
         assert!(first[0].is_ok(), "{:?}", first[0]);
 
-        let again =
-            installer(&temp, transfer, u64::MAX).install_all(&[north], &Recorder::default());
+        let again = install_all(
+            installer(&temp, transfer, u64::MAX),
+            &[north],
+            Arc::default(),
+        );
 
         assert!(
             matches!(again[0], Err(ManagerError::AlreadyInstalled { .. })),
@@ -906,6 +895,84 @@ mod tests {
             again[0]
         );
         assert_eq!(downloaded.lock().unwrap().len(), 1);
+    }
+
+    /// The installed package's files, to compare before and after.
+    fn snapshot(install_path: &Path) -> Vec<Vec<u8>> {
+        ["terrain/tile.ter", "xearthlayer_scenery_package.txt"]
+            .iter()
+            .map(|name| fs::read(install_path.join(name)).unwrap())
+            .collect()
+    }
+
+    /// Install v1 of AF-NORTH through a queue, then download v2 of it
+    /// without installing it. Returns the v2 download and v1's install path.
+    fn v1_installed_and_v2_downloaded(
+        temp: &TempDir,
+    ) -> (PackageInstaller, DownloadedPackage, PathBuf) {
+        let mut transfer = LocalTransfer::default();
+        let v1 = package("AF-NORTH", &mut transfer);
+        let first = install_all(
+            installer(temp, transfer.clone(), u64::MAX),
+            &[v1],
+            Arc::default(),
+        );
+        let install_path = first[0].as_ref().unwrap().install_path.clone();
+
+        let v2 = package_at("AF-NORTH", semver::Version::new(2, 0, 0), &mut transfer);
+        let installer = installer(temp, transfer, u64::MAX);
+        let prepared = Stages::prepare(&installer, &v2).unwrap();
+        let downloaded = installer
+            .download(prepared, &CancelToken::new(), Box::new(|_| {}))
+            .unwrap();
+        (installer, downloaded, install_path)
+    }
+
+    /// Spec section 3: cancelling before the swap leaves the old version untouched.
+    #[test]
+    fn a_cancelled_install_leaves_the_installed_version_byte_for_byte() {
+        let temp = TempDir::new().unwrap();
+        let (installer, downloaded, install_path) = v1_installed_and_v2_downloaded(&temp);
+        let v1 = snapshot(&install_path);
+        let token = CancelToken::new();
+        token.cancel();
+        let context = TestContext {
+            token,
+            allow_swap: true,
+        };
+
+        let result = installer.install(downloaded, &context);
+
+        assert!(matches!(result, Err(ManagerError::Cancelled)), "{result:?}");
+        assert_eq!(snapshot(&install_path), v1);
+        assert_eq!(
+            fs::read_to_string(install_path.join("terrain/tile.ter")).unwrap(),
+            "terrain for AF-NORTH"
+        );
+        let leftovers: Vec<_> = fs::read_dir(temp.path().join("tmp"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// The installer calls `begin_swap` and honours a refusal.
+    #[test]
+    fn an_install_refused_its_swap_changes_nothing() {
+        let temp = TempDir::new().unwrap();
+        let (installer, downloaded, install_path) = v1_installed_and_v2_downloaded(&temp);
+        let v1 = snapshot(&install_path);
+        let context = TestContext {
+            token: CancelToken::new(),
+            allow_swap: false,
+        };
+
+        let result = installer.install(downloaded, &context);
+
+        assert!(matches!(result, Err(ManagerError::Cancelled)), "{result:?}");
+        assert_eq!(snapshot(&install_path), v1);
+        assert!(!aside::staging_path(&install_path).exists());
+        assert!(!aside::aside_path(&install_path).exists());
     }
 
     #[test]
@@ -922,7 +989,7 @@ mod tests {
         let downloaded = Arc::clone(&transfer.downloaded);
 
         // One at a time needs 4 * 50 = 200.
-        let results = installer(&temp, transfer, 199).install_all(&batch, &Recorder::default());
+        let results = install_all(installer(&temp, transfer, 199), &batch, Arc::default());
 
         for result in &results {
             match result {
@@ -953,7 +1020,7 @@ mod tests {
         ];
 
         // Overlapped needs 4 * 50 + 50 = 250; one at a time needs 200.
-        let results = installer(&temp, transfer, 200).install_all(&batch, &Recorder::default());
+        let results = install_all(installer(&temp, transfer, 200), &batch, Arc::default());
 
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(Result::is_ok), "{results:?}");
@@ -969,7 +1036,7 @@ mod tests {
         ];
         transfer.failing.push("test://AF-SOUTH".to_string());
 
-        installer(&temp, transfer, u64::MAX).install_all(&batch, &Recorder::default());
+        install_all(installer(&temp, transfer, u64::MAX), &batch, Arc::default());
 
         let leftovers: Vec<_> = fs::read_dir(temp.path().join("tmp"))
             .unwrap()
@@ -1012,8 +1079,11 @@ mod tests {
         hostile.parts[0].filename = "../../escaped.aa".to_string();
         let downloaded = Arc::clone(&transfer.downloaded);
 
-        let results =
-            installer(&temp, transfer, u64::MAX).install_all(&[hostile], &Recorder::default());
+        let results = install_all(
+            installer(&temp, transfer, u64::MAX),
+            &[hostile],
+            Arc::default(),
+        );
 
         assert!(
             matches!(results[0], Err(ManagerError::InvalidPath(_))),
@@ -1033,8 +1103,11 @@ mod tests {
         hostile.filename = target.to_string_lossy().into_owned();
         let downloaded = Arc::clone(&transfer.downloaded);
 
-        let results =
-            installer(&temp, transfer, u64::MAX).install_all(&[hostile], &Recorder::default());
+        let results = install_all(
+            installer(&temp, transfer, u64::MAX),
+            &[hostile],
+            Arc::default(),
+        );
 
         assert!(
             matches!(results[0], Err(ManagerError::InvalidPath(_))),
@@ -1077,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn a_swap_replaces_the_old_version_and_leaves_nothing_aside() {
+    fn a_swap_replaces_the_old_version_and_hands_back_its_aside_to_discard() {
         let temp = TempDir::new().unwrap();
         let install_path = temp.path().join("Custom Scenery/zzXEL_af-north_ortho");
         fs::create_dir_all(&install_path).unwrap();
@@ -1090,12 +1163,16 @@ mod tests {
         let staged_path = staged.path().to_path_buf();
         assert!(staged_path.join("new.txt").exists());
         assert!(install_path.join("old.txt").exists());
-        swap_in(staged, &install_path).unwrap();
+        let replaced = swap_in(staged, &install_path).unwrap();
 
         assert!(install_path.join("new.txt").exists());
         assert!(!install_path.join("old.txt").exists());
         assert!(!staged_path.exists());
-        assert!(!crate::manager::aside::aside_path(&install_path).exists());
+        let old = replaced.expect("the old version was set aside");
+        assert_eq!(old, aside::aside_path(&install_path));
+        assert_eq!(fs::read_to_string(old.join("old.txt")).unwrap(), "old");
+        aside::discard(&old);
+        assert!(!aside::aside_path(&install_path).exists());
     }
 
     #[test]
@@ -1151,8 +1228,9 @@ mod tests {
         let install_path = temp.path().join("Custom Scenery").join(mountpoint);
 
         let staged = stage(&extract_dir, &install_path).unwrap();
-        swap_in(staged, &install_path).unwrap();
+        let replaced = swap_in(staged, &install_path).unwrap();
 
+        assert_eq!(replaced, None, "nothing was installed before");
         assert_eq!(
             fs::read_to_string(install_path.join("xearthlayer_scenery_package.txt")).unwrap(),
             "meta"
@@ -1191,7 +1269,6 @@ mod tests {
         assert_eq!(InstallStage::Reassembling.name(), "Reassembling");
         assert_eq!(InstallStage::Extracting.name(), "Extracting");
         assert_eq!(InstallStage::Installing.name(), "Installing");
-        assert_eq!(InstallStage::Complete.name(), "Complete");
     }
 
     /// #260: the parts stay on disk through reassembly and extraction, so the

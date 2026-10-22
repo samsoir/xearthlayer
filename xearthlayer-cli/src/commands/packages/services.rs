@@ -5,13 +5,14 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+use std::sync::Arc;
 
-use super::progress::ConsoleInstallObserver;
+use super::progress::ConsoleQueueObserver;
 use super::traits::{Output, PackageManagerService, UserInteraction};
 use crate::error::CliError;
 use xearthlayer::manager::{
-    HttpLibraryClient, InstallResult, InstalledPackage, LibraryClient, LocalPackageStore,
-    ManagerResult, PackageInfo, PackageInstaller, PackageStatus, UpdateChecker,
+    HttpLibraryClient, InstallQueue, InstallResult, InstalledPackage, LibraryClient,
+    LocalPackageStore, ManagerResult, PackageInfo, PackageInstaller, PackageStatus, UpdateChecker,
 };
 use xearthlayer_package::{PackageLibrary, PackageMetadata, PackageType};
 
@@ -136,10 +137,22 @@ impl PackageManagerService for DefaultPackageManagerService {
         temp_dir: &Path,
         concurrent_downloads: usize,
     ) -> Vec<Result<InstallResult, CliError>> {
-        let observer = ConsoleInstallObserver::default();
-        let results = PackageInstaller::new(LocalPackageStore::new(install_dir), temp_dir)
-            .with_parallel_downloads(concurrent_downloads)
-            .install_all(packages, &observer);
+        let observer = Arc::new(ConsoleQueueObserver::default());
+        let installer = PackageInstaller::new(LocalPackageStore::new(install_dir), temp_dir)
+            .with_parallel_downloads(concurrent_downloads);
+        let queue = match InstallQueue::start(installer, observer.clone()) {
+            Ok(queue) => queue,
+            Err(e) => {
+                // Every package gets the reason, e.g. another operation holds the lock.
+                let reason = e.to_string();
+                return packages
+                    .iter()
+                    .map(|_| Err(CliError::Packages(reason.clone())))
+                    .collect();
+            }
+        };
+        let results = queue.install_batch(packages.to_vec());
+        drop(queue);
         observer.finish();
 
         results
