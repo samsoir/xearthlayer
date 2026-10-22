@@ -35,10 +35,9 @@ impl FsInfoProvider for RealFsInfoProvider {
 /// Multiplier applied to the sum of part sizes to estimate peak
 /// on-disk footprint during install.
 ///
-/// Peak usage is the reassembled archive plus the extracted tree, which
-/// coexist while `tar` runs. The parts themselves are freed as soon as
-/// reassembly succeeds (see `installer::free_downloaded_parts`), so they
-/// are not part of the peak.
+/// Peak usage is at most the downloaded parts plus the extracted tree.
+/// Extraction streams the parts and deletes each once it has been read, so
+/// the two never hold more than that together.
 ///
 /// **Scenery archives are not incompressible.** The earlier value of 2
 /// assumed they were, on the reasoning that BCn texture data does not
@@ -46,7 +45,7 @@ impl FsInfoProvider for RealFsInfoProvider {
 /// files and gzip compresses the redundancy in tar headers, padding and
 /// the `terrain` and `Earth nav data` text files alongside the textures.
 /// Measured across every published region, extraction expands the
-/// download by 1.49x to 2.12x, so archive plus extracted runs from 2.49x
+/// download by 1.49x to 2.12x, so parts plus extracted runs from 2.49x
 /// to 3.12x. Every region exceeded 2x and the smallest regions expand
 /// most: `af1` is the worst at 3.12x.
 ///

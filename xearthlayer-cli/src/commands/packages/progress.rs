@@ -379,7 +379,6 @@ mod tests {
     #[test]
     fn each_install_stage_shows_in_lower_case() {
         for (stage, name) in [
-            (InstallStage::Reassembling, "reassembling"),
             (InstallStage::Extracting, "extracting"),
             (InstallStage::Installing, "installing"),
         ] {

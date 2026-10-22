@@ -1,8 +1,9 @@
 //! Archive extraction for package installation.
 //!
-//! A package arrives as a `tar.gz` split into parts. This module joins the
-//! parts back into one archive and unpacks it, all in process: no `tar`
-//! binary is needed, so installs work wherever the client runs (#274).
+//! A package arrives as a `tar.gz` split into parts. This module unpacks the
+//! parts as one stream, in order, without joining them into one file first,
+//! and all in process: no `tar` binary is needed, so installs work wherever
+//! the client runs (#274).
 //!
 //! Decompression goes through flate2's `zlib-rs` backend, which picks SIMD
 //! instructions (AVX2, SSE, NEON) at run time. One binary is therefore fast
@@ -11,7 +12,7 @@
 
 use std::collections::VecDeque;
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
@@ -32,119 +33,6 @@ impl TarGzExtractor {
     /// Create a new extractor.
     pub fn new() -> Self {
         Self
-    }
-
-    /// Reassemble split archive parts into a single file by concatenating
-    /// them in order.
-    ///
-    /// # Arguments
-    ///
-    /// * `parts` - Paths to the archive parts in order (e.g., .aa, .ab, .ac)
-    /// * `output` - Path for the reassembled archive
-    /// * `cancel` - Checked once per buffer; a set token ends the copy with
-    ///   [`ManagerError::Cancelled`]
-    ///
-    /// # Returns
-    ///
-    /// The total size of the reassembled archive in bytes.
-    pub fn reassemble(
-        &self,
-        parts: &[PathBuf],
-        output: &Path,
-        cancel: &CancelToken,
-    ) -> ManagerResult<u64> {
-        if parts.is_empty() {
-            return Err(ManagerError::ExtractionFailed {
-                path: output.to_path_buf(),
-                reason: "No parts provided for reassembly".to_string(),
-            });
-        }
-
-        // Verify all parts exist
-        for part in parts {
-            if !part.exists() {
-                return Err(ManagerError::ReadFailed {
-                    path: part.clone(),
-                    source: io::Error::new(io::ErrorKind::NotFound, "Part file not found"),
-                });
-            }
-        }
-
-        // Create parent directory if needed
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent).map_err(|e| ManagerError::CreateDirFailed {
-                path: parent.to_path_buf(),
-                source: e,
-            })?;
-        }
-
-        let output_file = File::create(output).map_err(|e| ManagerError::WriteFailed {
-            path: output.to_path_buf(),
-            source: e,
-        })?;
-
-        let mut total_size = 0u64;
-        let mut writer = io::BufWriter::new(output_file);
-
-        for part_path in parts {
-            let file = File::open(part_path).map_err(|e| ManagerError::ReadFailed {
-                path: part_path.clone(),
-                source: e,
-            })?;
-
-            let mut reader = BufReader::new(file);
-            let mut buffer = vec![0u8; 64 * 1024]; // 64KB buffer
-
-            loop {
-                if cancel.is_cancelled() {
-                    return Err(ManagerError::Cancelled);
-                }
-                let bytes_read =
-                    reader
-                        .read(&mut buffer)
-                        .map_err(|e| ManagerError::ReadFailed {
-                            path: part_path.clone(),
-                            source: e,
-                        })?;
-
-                if bytes_read == 0 {
-                    break;
-                }
-
-                writer
-                    .write_all(&buffer[..bytes_read])
-                    .map_err(|e| ManagerError::WriteFailed {
-                        path: output.to_path_buf(),
-                        source: e,
-                    })?;
-
-                total_size += bytes_read as u64;
-            }
-        }
-
-        writer.flush().map_err(|e| ManagerError::WriteFailed {
-            path: output.to_path_buf(),
-            source: e,
-        })?;
-
-        Ok(total_size)
-    }
-
-    /// Extract `archive_path` into `dest_dir`, stopping with
-    /// [`ManagerError::Cancelled`] before the next entry once `cancel` is set.
-    ///
-    /// Returns the number of regular files extracted.
-    pub fn extract_cancellable(
-        &self,
-        archive_path: &Path,
-        dest_dir: &Path,
-        cancel: &CancelToken,
-    ) -> ManagerResult<usize> {
-        let file = File::open(archive_path).map_err(|e| ManagerError::ReadFailed {
-            path: archive_path.to_path_buf(),
-            source: e,
-        })?;
-        self.unpack(file, archive_path, dest_dir, cancel)
     }
 
     /// Extract a split archive straight from its `parts`, in order, into
@@ -297,88 +185,23 @@ impl Read for PartsReader {
 
 impl ArchiveExtractor for TarGzExtractor {
     fn extract(&self, archive_path: &Path, dest_dir: &Path) -> ManagerResult<usize> {
-        self.extract_cancellable(archive_path, dest_dir, &CancelToken::new())
+        let file = File::open(archive_path).map_err(|e| ManagerError::ReadFailed {
+            path: archive_path.to_path_buf(),
+            source: e,
+        })?;
+        self.unpack(file, archive_path, dest_dir, &CancelToken::new())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::TempDir;
 
     #[test]
     fn test_tar_gz_extractor_new() {
         let extractor = TarGzExtractor::new();
         assert!(format!("{:?}", extractor).contains("TarGzExtractor"));
-    }
-
-    #[test]
-    fn test_reassemble_empty_parts() {
-        let temp = TempDir::new().unwrap();
-        let extractor = TarGzExtractor::new();
-        let output = temp.path().join("output.tar.gz");
-
-        let result = extractor.reassemble(&[], &output, &CancelToken::new());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_reassemble_missing_part() {
-        let temp = TempDir::new().unwrap();
-        let extractor = TarGzExtractor::new();
-        let output = temp.path().join("output.tar.gz");
-        let missing = temp.path().join("missing.part");
-
-        let result = extractor.reassemble(&[missing], &output, &CancelToken::new());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_reassemble_single_part() {
-        let temp = TempDir::new().unwrap();
-        let extractor = TarGzExtractor::new();
-
-        // Create a test part file
-        let part = temp.path().join("test.part");
-        let mut file = File::create(&part).unwrap();
-        file.write_all(b"test content").unwrap();
-
-        let output = temp.path().join("output.bin");
-        let size = extractor
-            .reassemble(&[part], &output, &CancelToken::new())
-            .unwrap();
-
-        assert_eq!(size, 12); // "test content".len()
-        assert!(output.exists());
-
-        let content = fs::read_to_string(&output).unwrap();
-        assert_eq!(content, "test content");
-    }
-
-    #[test]
-    fn test_reassemble_multiple_parts() {
-        let temp = TempDir::new().unwrap();
-        let extractor = TarGzExtractor::new();
-
-        // Create test part files
-        let part1 = temp.path().join("test.aa");
-        let part2 = temp.path().join("test.ab");
-        let part3 = temp.path().join("test.ac");
-
-        fs::write(&part1, b"Hello").unwrap();
-        fs::write(&part2, b" ").unwrap();
-        fs::write(&part3, b"World").unwrap();
-
-        let output = temp.path().join("output.bin");
-        let size = extractor
-            .reassemble(&[part1, part2, part3], &output, &CancelToken::new())
-            .unwrap();
-
-        assert_eq!(size, 11); // "Hello World".len()
-
-        let content = fs::read_to_string(&output).unwrap();
-        assert_eq!(content, "Hello World");
     }
 
     /// Write a tar.gz at `out`. A name ending in `/` is a directory. Names
@@ -464,34 +287,6 @@ mod tests {
             .expect_err("garbage must not extract");
 
         assert!(err.to_string().contains("broken.tar.gz"), "{err}");
-    }
-
-    #[test]
-    fn a_cancelled_reassembly_stops_and_reports_cancelled() {
-        let temp = TempDir::new().unwrap();
-        let part = temp.path().join("a.aa");
-        fs::write(&part, vec![0u8; 256 * 1024]).unwrap();
-        let cancel = CancelToken::new();
-        cancel.cancel();
-
-        let result = TarGzExtractor::new().reassemble(&[part], &temp.path().join("out"), &cancel);
-
-        assert!(matches!(result, Err(ManagerError::Cancelled)), "{result:?}");
-    }
-
-    #[test]
-    fn a_cancelled_extraction_stops_before_the_next_entry() {
-        let temp = TempDir::new().unwrap();
-        let archive = temp.path().join("pkg.tar.gz");
-        tar_gz(&archive, &[("pkg/a.txt", b"alpha"), ("pkg/b.txt", b"beta")]);
-        let dest = temp.path().join("dest");
-        let cancel = CancelToken::new();
-        cancel.cancel();
-
-        let result = TarGzExtractor::new().extract_cancellable(&archive, &dest, &cancel);
-
-        assert!(matches!(result, Err(ManagerError::Cancelled)), "{result:?}");
-        assert!(!dest.join("pkg/a.txt").exists());
     }
 
     /// Split `bytes` into files of `size` bytes in `dir`, named like `split`.

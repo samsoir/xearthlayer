@@ -2,11 +2,10 @@
 //!
 //! A rename is atomic on one filesystem, so a package folder is always
 //! either the old version or the new one, never neither, whenever the
-//! process stops. The new version is first staged beside the install path
-//! (the temp directory may be on another filesystem, so staging may copy),
-//! then swapped in with two renames in the same parent: the old version is
-//! renamed aside, then the staged one into place. The slow recursive delete
-//! of the old version happens after both renames.
+//! process stops. The new version is first extracted into a staging folder
+//! beside the install path, then swapped in with two renames in the same
+//! parent: the old version is renamed aside, then the staged one into place.
+//! The slow recursive delete of the old version happens after both renames.
 //!
 //! A remove renames the package straight to its removed name and deletes it
 //! there. That delete can take minutes, and a tree it was part way through
