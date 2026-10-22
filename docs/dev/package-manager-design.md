@@ -279,8 +279,8 @@ download loop and per tar entry by the extractor.
 
 | Cancelled while | Result |
 |---|---|
-| Queued, or downloaded and waiting | Removed from the queue immediately; ledger entry released; a downloaded package's temp directory deleted |
-| Preparing, waiting for space, downloading | The token is raised; the owning thread notices, aborts every part worker, and the temp guard deletes the parts |
+| Queued, or downloaded and waiting | Removed from the queue immediately. A downloaded package is marked `Cancelling`, its temp directory is deleted outside the state lock, and only then is the job finished and its ledger entry released, so a waiter that returns finds the directory gone. `abandon` finishes it at once instead |
+| Preparing, waiting for space, downloading | The token is raised; the owning thread notices, aborts every part worker, and the temp guard deletes the parts before the job finishes |
 | Reassembling or extracting | Checked per buffer and per tar entry; the guard deletes the partial tree; the old version is untouched |
 | Staging | As above; the staging folder is deleted |
 | The swap | `TooLate`; the swap runs to completion |

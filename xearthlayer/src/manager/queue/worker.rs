@@ -70,8 +70,11 @@ fn download_one<S: Stages>(
         Ok(sized) => sized,
         Err(e) => return shared.finish_now(id, outcome_of(e)),
     };
-    if !admit(shared, id, size, token) {
-        return; // `prepared` drops here, outside the lock
+    if let Err(outcome) = admit(shared, id, size, token) {
+        // Its temp directory goes before the job finishes, so a waiter
+        // that returns finds it gone.
+        drop(prepared);
+        return shared.finish_now(id, outcome);
     }
     let progress = progress_callback(shared, id);
     match guarded("download", || {
@@ -97,10 +100,15 @@ fn download_one<S: Stages>(
     }
 }
 
-/// Wait until the ledger admits `size` bytes. False when the job finished
-/// instead: it can never fit, the free space could not be read, or it was
-/// cancelled.
-fn admit<S: Stages>(shared: &Shared<S>, id: JobId, size: u64, token: &CancelToken) -> bool {
+/// Wait until the ledger admits `size` bytes. Otherwise returns how the
+/// job ends: it can never fit, the free space could not be read, or it was
+/// cancelled. The caller finishes it, once the prepared package is dropped.
+fn admit<S: Stages>(
+    shared: &Shared<S>,
+    id: JobId,
+    size: u64,
+    token: &CancelToken,
+) -> Result<(), JobOutcome> {
     let mut state = shared.lock();
     if !state.capacity_known {
         match guarded("available_bytes", || shared.stages.available_bytes()) {
@@ -108,33 +116,27 @@ fn admit<S: Stages>(shared: &Shared<S>, id: JobId, size: u64, token: &CancelToke
                 state.ledger.set_capacity(free);
                 state.capacity_known = true;
             }
-            Err(e) => {
-                shared.finish(&mut state, id, JobOutcome::Failed(e));
-                return false;
-            }
+            Err(e) => return Err(JobOutcome::Failed(e)),
         }
     }
     loop {
         if token.is_cancelled() || state.shutting_down {
-            shared.finish(&mut state, id, JobOutcome::Cancelled);
-            return false;
+            return Err(JobOutcome::Cancelled);
         }
         match state.ledger.admit(id, size) {
             Admission::Admitted => {
                 if let Some(entry) = state.jobs.get_mut(&id) {
                     entry.phase = Phase::Downloading;
                 }
-                return true;
+                return Ok(());
             }
             Admission::Never { required } => {
                 let available = state.ledger.capacity();
-                let error = ManagerError::InsufficientDiskSpace {
+                return Err(JobOutcome::Failed(ManagerError::InsufficientDiskSpace {
                     path: shared.stages.temp_dir().to_path_buf(),
                     required_bytes: required,
                     available_bytes: available,
-                };
-                shared.finish(&mut state, id, JobOutcome::Failed(error));
-                return false;
+                }));
             }
             Admission::Wait { needed, available } => {
                 let entry = state
@@ -203,9 +205,8 @@ fn install_one<S: Stages>(
     token: CancelToken,
 ) {
     if token.is_cancelled() {
-        shared.finish_now(id, JobOutcome::Cancelled);
-        drop(downloaded); // its temp directory goes outside the lock
-        return;
+        drop(downloaded); // its temp directory goes outside the lock, first
+        return shared.finish_now(id, JobOutcome::Cancelled);
     }
     let context = Context { shared, id, token };
     let result = guarded("install", || shared.stages.install(downloaded, &context));

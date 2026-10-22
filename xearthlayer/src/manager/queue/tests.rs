@@ -44,6 +44,16 @@ impl Gate {
     }
 }
 
+/// Opens its gate when dropped, so a failing assertion unwinds instead of
+/// leaving a queue thread blocked at the gate while the queue joins it.
+struct OpenOnDrop(Arc<Gate>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
 #[derive(Default)]
 struct Fake {
     dir: Option<TempDir>,
@@ -55,6 +65,8 @@ struct Fake {
     hold_swap: Mutex<HashMap<String, Arc<Gate>>>,
     /// Holds what follows the swap, like deleting the replaced version.
     hold_after_swap: Mutex<HashMap<String, Arc<Gate>>>,
+    /// Holds dropping a downloaded package, like deleting its temp tree.
+    hold_drop: Mutex<HashMap<String, Arc<Gate>>>,
     /// Installs that never call `end_swap`.
     skip_end_swap: Mutex<HashSet<String>>,
     fail_download: Mutex<HashSet<String>>,
@@ -97,6 +109,23 @@ impl Fake {
 #[derive(Clone)]
 struct FakeStages(Arc<Fake>);
 
+/// A prepared or downloaded package. Dropping it stands for deleting its
+/// temp tree.
+struct Payload {
+    title: String,
+    fake: Arc<Fake>,
+}
+
+impl Drop for Payload {
+    fn drop(&mut self) {
+        if let Some(gate) = Fake::gate(&self.fake.hold_drop, &self.title) {
+            self.fake.record(format!("dropping {}", self.title));
+            gate.pass(&CancelToken::new());
+            self.fake.record(format!("dropped {}", self.title));
+        }
+    }
+}
+
 impl FakeStages {
     fn new(free: u64) -> Self {
         let dir = TempDir::new().unwrap();
@@ -119,8 +148,8 @@ impl FakeStages {
 }
 
 impl Stages for FakeStages {
-    type Prepared = (String, u64);
-    type Downloaded = String;
+    type Prepared = (Payload, u64);
+    type Downloaded = Payload;
 
     fn temp_dir(&self) -> &Path {
         self.0.dir.as_ref().unwrap().path()
@@ -135,7 +164,7 @@ impl Stages for FakeStages {
         Ok(self.0.free.load(Ordering::SeqCst))
     }
 
-    fn prepare(&self, metadata: &PackageMetadata) -> ManagerResult<(String, u64)> {
+    fn prepare(&self, metadata: &PackageMetadata) -> ManagerResult<(Payload, u64)> {
         let size = *self
             .0
             .sizes
@@ -144,19 +173,24 @@ impl Stages for FakeStages {
             .get(&metadata.title)
             .unwrap_or(&1);
         self.0.record(format!("prepared {}", metadata.title));
-        Ok((metadata.title.clone(), size))
+        let payload = Payload {
+            title: metadata.title.clone(),
+            fake: Arc::clone(&self.0),
+        };
+        Ok((payload, size))
     }
 
-    fn download_size(&self, prepared: &(String, u64)) -> u64 {
+    fn download_size(&self, prepared: &(Payload, u64)) -> u64 {
         prepared.1
     }
 
     fn download(
         &self,
-        (title, _): (String, u64),
+        (payload, _): (Payload, u64),
         cancel: &CancelToken,
         _progress: DownloadProgressCallback,
-    ) -> ManagerResult<String> {
+    ) -> ManagerResult<Payload> {
+        let title = payload.title.clone();
         self.0.record(format!("download started {title}"));
         self.0.maybe_panic(&title, "download");
         let cancel = if self.0.ignore_cancel.lock().unwrap().contains(&title) {
@@ -176,10 +210,11 @@ impl Stages for FakeStages {
             });
         }
         self.0.record(format!("downloaded {title}"));
-        Ok(title)
+        Ok(payload)
     }
 
-    fn install(&self, title: String, ctx: &dyn InstallContext) -> ManagerResult<InstallResult> {
+    fn install(&self, payload: Payload, ctx: &dyn InstallContext) -> ManagerResult<InstallResult> {
+        let title = payload.title.clone();
         ctx.stage(InstallStage::Extracting);
         let cancel = if self.0.ignore_cancel.lock().unwrap().contains(&title) {
             &CancelToken::new()
@@ -207,6 +242,7 @@ impl Stages for FakeStages {
             gate.pass(&CancelToken::new()); // nor does the cleanup after it
         }
         self.0.record(format!("installed {title}"));
+        drop(payload);
         Ok(InstallResult {
             region: title,
             package_type: PackageType::Ortho,
@@ -914,4 +950,124 @@ fn an_install_that_never_ends_its_swap_clears_it_on_return() {
     assert!(queue.install_batch(vec![meta("A")])[0].is_ok());
 
     assert!(!queue.shared.lock().swapping);
+}
+
+/// Sets up A installing (held) and B downloaded behind it, with dropping
+/// B's payload held. Returns the queue, both ids and B's drop gate.
+fn a_downloaded_payload_held_in_its_drop(
+    stages: &FakeStages,
+) -> (Arc<InstallQueue<FakeStages>>, [JobId; 2], OpenOnDrop) {
+    Fake::hold(&stages.0.hold_install, "A");
+    let gate = OpenOnDrop(Fake::hold(&stages.0.hold_drop, "B"));
+    let (queue, events) = start(stages);
+    let a = queue.submit(Job::Install(meta("A"))).unwrap();
+    let b = queue.submit(Job::Install(meta("B"))).unwrap();
+    eventually("B downloaded", || {
+        events.of(b).contains(&"downloaded".to_string())
+    });
+    (Arc::new(queue), [a, b], gate)
+}
+
+/// Runs `wait_for` on its own thread. The receiver yields whether B's
+/// payload had been dropped by the time it returned.
+fn wait_on_a_thread(
+    queue: &Arc<InstallQueue<FakeStages>>,
+    stages: &FakeStages,
+    ids: [JobId; 2],
+) -> std::sync::mpsc::Receiver<bool> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let queue = Arc::clone(queue);
+    let stages = stages.clone();
+    std::thread::spawn(move || {
+        let outcomes = queue.wait_for(&ids);
+        assert!(outcomes.iter().all(|o| matches!(o, JobOutcome::Cancelled)));
+        let _ = tx.send(stages.0.logged("dropped B"));
+    });
+    rx
+}
+
+/// The first Ctrl+C must clean temp: a cancelled job whose download was
+/// waiting to install finishes only once its temp tree is deleted.
+#[test]
+fn cancelling_waits_for_a_downloaded_package_to_be_deleted() {
+    let stages = FakeStages::new(u64::MAX);
+    let (queue, ids, gate) = a_downloaded_payload_held_in_its_drop(&stages);
+    let canceller = queue.canceller();
+    let cancelling = std::thread::spawn(move || canceller.cancel_all());
+    eventually("B's payload is being dropped", || {
+        stages.0.logged("dropping B")
+    });
+
+    let waited = wait_on_a_thread(&queue, &stages, ids);
+
+    assert!(
+        waited.recv_timeout(Duration::from_millis(200)).is_err(),
+        "wait_for returned before the temp tree was deleted"
+    );
+    drop(gate);
+    assert!(
+        waited.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "wait_for returned before the payload was dropped"
+    );
+    cancelling.join().unwrap();
+}
+
+/// A second Ctrl+C quits at once: abandoning does not wait for the delete.
+#[test]
+fn abandoning_does_not_wait_for_a_downloaded_package_to_be_deleted() {
+    let stages = FakeStages::new(u64::MAX);
+    let (queue, ids, gate) = a_downloaded_payload_held_in_its_drop(&stages);
+    let canceller = queue.canceller();
+    let abandoning = std::thread::spawn(move || canceller.abandon());
+    eventually("B's payload is being dropped", || {
+        stages.0.logged("dropping B")
+    });
+
+    let waited = wait_on_a_thread(&queue, &stages, ids);
+
+    assert!(
+        !waited.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "an abandoned wait_for returns while the delete still runs"
+    );
+    drop(gate);
+    abandoning.join().unwrap();
+}
+
+/// The same holds for a job cancelled while it waits for space: its
+/// prepared package owns a temp directory too.
+#[test]
+fn cancelling_a_download_waiting_for_space_waits_for_its_temp_directory() {
+    let stages = FakeStages::new(249);
+    stages.size("A", 50).size("B", 50);
+    Fake::hold(&stages.0.hold_install, "A");
+    let held_drop = Fake::hold(&stages.0.hold_drop, "B");
+    let (queue, events) = start(&stages);
+    let queue = Arc::new(queue);
+    // Declared after the queue, so on a failure it opens before the queue's
+    // drop joins the downloader held at it.
+    let gate = OpenOnDrop(held_drop);
+    queue.submit(Job::Install(meta("A"))).unwrap();
+    let b = queue.submit(Job::Install(meta("B"))).unwrap();
+    eventually("B waiting", || {
+        events.of(b).contains(&"waiting".to_string())
+    });
+
+    assert_eq!(queue.cancel(b), CancelResult::Cancelled);
+    eventually("B's payload is being dropped", || {
+        stages.0.logged("dropping B")
+    });
+    let (tx, waited) = std::sync::mpsc::channel();
+    let waiter = Arc::clone(&queue);
+    let logged = stages.clone();
+    std::thread::spawn(move || {
+        waiter.wait_for(&[b]);
+        let _ = tx.send(logged.0.logged("dropped B"));
+    });
+
+    assert!(
+        waited.recv_timeout(Duration::from_millis(200)).is_err(),
+        "wait_for returned before the temp directory was deleted"
+    );
+    drop(gate);
+    assert!(waited.recv_timeout(Duration::from_secs(5)).unwrap());
 }

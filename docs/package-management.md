@@ -327,7 +327,7 @@ No external tools are needed to unpack a package: archives are extracted inside 
 
 ## Stopping an Install
 
-Press Ctrl+C once to cancel: downloads stop, a package being replaced is left at its old version, and temporary files are removed, either before the command exits or by the next package command. Press Ctrl+C again to quit at once and leave the cleanup for later. A system shutdown, `kill`, or closing the terminal also quits at once. In every case an installed package is always complete, either the old version or the new one, never neither, and the next package command removes whatever an interrupted one left behind. When a command removes several packages, the first Ctrl+C stops the rest of them too.
+Press Ctrl+C once to cancel: downloads stop, a package being replaced is left at its old version, and temporary files are removed before the command exits. Press Ctrl+C again to quit at once and leave the cleanup for the next package command. A system shutdown, `kill`, or closing the terminal also quits at once. In every case an installed package is always complete, either the old version or the new one, never neither, and the next package command removes whatever an interrupted one left behind. When a command removes several packages, the first Ctrl+C stops the rest of them too.
 
 The one step that is never interrupted is the final swap of the new version for the old one, which takes moments. When `packages.temp_dir` is on another disk than the packages, the new version is first copied next to its destination, which takes longer, but the installed version stays untouched until the swap.
 

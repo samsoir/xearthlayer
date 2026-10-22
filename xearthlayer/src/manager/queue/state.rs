@@ -24,6 +24,9 @@ pub(super) enum Phase {
     Installing,
     Swapping,
     Removing,
+    /// Cancelled while downloaded: the cancelling caller is deleting its
+    /// temp tree and finishes the job once that is done.
+    Cancelling,
 }
 
 pub(super) struct Entry {
@@ -39,8 +42,15 @@ pub(super) enum Ready<D> {
     Remove,
 }
 
-/// Work `cancel` took out of the install queue, dropped once unlocked.
-type Taken<D> = Option<(JobId, Ready<D>)>;
+/// A downloaded package `cancel` took out of the install queue. The
+/// caller drops it once unlocked, which deletes its temp tree, and then
+/// finishes the job if `finish_after` is set.
+struct Taken<D> {
+    id: JobId,
+    /// Held only to be dropped.
+    _payload: D,
+    finish_after: bool,
+}
 
 pub(super) struct State<D> {
     /// Every unfinished job.
@@ -138,55 +148,95 @@ impl<S: Stages> Shared<S> {
     /// Cancel `id`. A job no thread holds (queued, or downloaded and
     /// waiting for the installer) is taken out of its queue and finished
     /// here; one a thread holds only has its token raised, and that thread
-    /// finishes it. Only the thread that popped a job finishes it.
+    /// finishes it. Only the thread that took a job finishes it. A
+    /// downloaded job is finished only after its temp tree is deleted, so
+    /// a waiter that returns can rely on it being gone.
     pub(super) fn cancel(&self, id: JobId) -> CancelResult {
         let mut state = self.lock();
-        let (result, payload) = self.cancel_locked(&mut state, id);
+        let (result, taken) = self.cancel_locked(&mut state, id, true);
         drop(state);
-        drop(payload); // a downloaded package's temp directory goes outside the lock
+        self.clean_up(taken.into_iter().collect());
         result
     }
 
     /// Cancel every unfinished job in one critical section, so no job can
     /// reach its swap while the others are being cancelled. With `abandon`,
-    /// also stop waiters from waiting for anything but a running swap.
+    /// also stop waiters from waiting for anything but a running swap, and
+    /// finish downloaded jobs at once rather than after their cleanup.
     pub(super) fn cancel_every(&self, abandon: bool) {
         let mut state = self.lock();
         let ids: Vec<JobId> = state.jobs.keys().copied().collect();
-        let payloads: Vec<_> = ids
+        let taken: Vec<_> = ids
             .into_iter()
-            .filter_map(|id| self.cancel_locked(&mut state, id).1)
+            .filter_map(|id| self.cancel_locked(&mut state, id, !abandon).1)
             .collect();
         if abandon {
             state.abandoned = true;
             self.changed.notify_all();
         }
         drop(state);
-        drop(payloads); // temp directories go outside the lock
+        self.clean_up(taken);
     }
 
-    /// `cancel` under a held lock. Returns the work it took out of the
-    /// install queue, for the caller to drop once it has unlocked.
+    /// Drop what `cancel_locked` took, outside the lock, then finish the
+    /// jobs it left `Cancelling`.
+    fn clean_up(&self, taken: Vec<Taken<S::Downloaded>>) {
+        let deferred: Vec<JobId> = taken
+            .iter()
+            .filter(|t| t.finish_after)
+            .map(|t| t.id)
+            .collect();
+        drop(taken); // temp directories go outside the lock
+        if deferred.is_empty() {
+            return;
+        }
+        let mut state = self.lock();
+        for id in deferred {
+            self.finish(&mut state, id, JobOutcome::Cancelled);
+        }
+    }
+
+    /// `cancel` under a held lock. Returns a downloaded package it took out
+    /// of the install queue, for the caller to drop once it has unlocked.
+    /// With `defer`, that job is left `Cancelling` for the caller to finish
+    /// after the drop; without it, the job is finished here.
     fn cancel_locked(
         &self,
         state: &mut State<S::Downloaded>,
         id: JobId,
-    ) -> (CancelResult, Taken<S::Downloaded>) {
+        defer: bool,
+    ) -> (CancelResult, Option<Taken<S::Downloaded>>) {
         let Some(entry) = state.jobs.get(&id) else {
             return (CancelResult::Unknown, None);
         };
         match entry.phase {
             Phase::Swapping | Phase::Removing => (CancelResult::TooLate, None),
+            // Already cancelled; its canceller finishes it.
+            Phase::Cancelling => (CancelResult::Cancelled, None),
             Phase::Queued | Phase::Downloaded => {
                 // No thread holds it: take it out of its queue here.
                 state.downloads.retain(|&queued| queued != id);
-                let payload = state
+                let ready = state
                     .installs
                     .iter()
                     .position(|(queued, _)| *queued == id)
                     .and_then(|at| state.installs.remove(at));
-                self.finish(state, id, JobOutcome::Cancelled);
-                (CancelResult::Cancelled, payload)
+                let taken = match ready {
+                    Some((_, Ready::Install(payload))) => Some(Taken {
+                        id,
+                        _payload: payload,
+                        finish_after: defer,
+                    }),
+                    Some((_, Ready::Remove)) | None => None,
+                };
+                if taken.as_ref().is_some_and(|t| t.finish_after) {
+                    if let Some(entry) = state.jobs.get_mut(&id) {
+                        entry.phase = Phase::Cancelling;
+                    }
+                } else {
+                    self.finish(state, id, JobOutcome::Cancelled);
+                }
+                (CancelResult::Cancelled, taken)
             }
             Phase::Preparing | Phase::WaitingForSpace | Phase::Downloading | Phase::Installing => {
                 entry.token.cancel();
