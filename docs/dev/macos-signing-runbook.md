@@ -1,4 +1,10 @@
-# macOS Code Signing and Notarization
+# macOS Signing Runbook
+
+This runbook documents what XEarthLayer needs to sign and notarize its macOS
+binaries, how those credentials were created, where they live, and the
+procedures for a release, a renewal and a compromise.
+
+## Overview
 
 Every macOS binary XEarthLayer ships, on the pre-release channel as much as the
 stable one, is signed with a Developer ID Application certificate and notarized
@@ -6,12 +12,43 @@ by Apple. Without that, a browser download is quarantined and Gatekeeper refuses
 to run it until the user clears the mark by hand (`xattr -c`), which is what
 every release up to `v0.5.0-alpha.2` asked of macOS testers.
 
-This document is the runbook: what Apple needs from us, how the credentials were
-created, where they live, and how the release pipeline uses them. The pipeline
-itself is one script, `scripts/macos/sign-and-notarize.sh`, run by the
-`package-macos` job in `release.yml` and by `make sign-macos`.
+The pipeline is one script, `scripts/macos/sign-and-notarize.sh`, run by the
+`package-macos` job in `release.yml` on every tag and by `make sign-macos` for a
+release built by hand. A release needs nothing manual once the credentials
+below exist; the procedures in this runbook are for setting them up, renewing
+them and diagnosing a failure.
 
-## The pieces
+> For how the release pipeline is structured, see [CI/CD Pipeline](cicd.md); for
+> the release procedure itself, see the
+> [Application Release Runbook](app-release-runbook.md). This runbook covers the
+> Apple side only.
+
+## Prerequisites
+
+What is needed, by role:
+
+| Need | Who or what | Why |
+|------|-------------|-----|
+| Apple Developer Program membership, active | The project's Apple account | Developer ID certificates and the notary service are membership features; a lapsed membership blocks notarization even though existing signatures keep working |
+| The **Account Holder** of that account | The person doing the one-time setup | Only the Account Holder can create a Developer ID certificate. Admins cannot |
+| A Mac with Xcode or the Command Line Tools | The release Mac, and the `macos-15` runner | `codesign`, `security`, `ditto` and `xcrun notarytool` |
+| OpenSSL 3 (`brew install openssl`) | The release Mac, setup only | Generates the key, the signing request and the `.p12`. LibreSSL works without `-legacy` |
+| `gh` CLI authenticated with admin on `samsoir/xearthlayer` | The release Mac, setup only | `gh secret set` |
+| A password manager | The maintainer | The `.p12`, its password and the `.p8` must survive the release Mac |
+| Network access at first run | Every user | A bare executable carries no stapled ticket; Gatekeeper fetches it once (see below) |
+
+Checklist for a working setup (each item is produced by the numbered steps in
+**First-Time Setup**):
+
+- [ ] `security find-identity -v -p codesigning` lists one valid
+      `Developer ID Application: Sam de Freyssinet (Y7DVMR5MEX)` on the release Mac
+- [ ] `xcrun notarytool history --keychain-profile xearthlayer` answers without error
+- [ ] `gh secret list -R samsoir/xearthlayer` shows all five `APPLE_*` secrets
+- [ ] The `.p12`, its password and `AuthKey_<KEYID>.p8` are in the password manager,
+      and the PEM private key is deleted from disk
+- [ ] The certificate's expiry (currently **22 November 2027**) is in a calendar
+
+## The Pieces
 
 | Piece | What it is | Where it lives |
 |-------|------------|----------------|
@@ -32,7 +69,7 @@ Application certificates. Apple sets the validity period; **the current
 certificate expires on 22 November 2027**, so plan the renewal (below) for
 autumn 2027.
 
-## What the signature looks like
+## What the Signature Looks Like
 
 ```bash
 codesign --force --timestamp --options runtime --sign "Developer ID Application: ..." xearthlayer
@@ -73,10 +110,11 @@ will be refused. Shipping a `.pkg` would remove that caveat at the cost of a
 second certificate (Developer ID Installer) and an installer format, and is not
 planned.
 
-## One-time setup
+## First-Time Setup (Golden Path)
 
-Everything below was done once for the project. It is written down so the
-certificate can be renewed and the secrets re-created without rediscovering it.
+Everything below was done once for the project, on 22 October 2026. It is
+written down so the certificate can be renewed and the secrets re-created
+without rediscovering it. Each step produces one item of the checklist above.
 
 ### 1. Private key and signing request
 
@@ -180,7 +218,9 @@ five secrets are read together, so set all five in one sitting: a certificate
 without notary credentials fails the job rather than shipping a signed but
 un-notarized binary that Gatekeeper would still refuse.
 
-## In the release workflow
+## Releasing
+
+### In the release workflow
 
 `package-macos` (see [cicd.md](cicd.md)) gained three steps between the build
 and the tarball, all gated on `env.MACOS_SIGNING` (the secrets context is not
@@ -198,7 +238,7 @@ readable from a step's `if:`, so the job computes the flag once):
 
 Notarization adds a few minutes to the job, typically two to five.
 
-## Releasing by hand
+### By hand
 
 ```bash
 make release
@@ -210,7 +250,7 @@ keychain; set `MACOS_SIGN_IDENTITY` to a name or SHA-1 hash when there is more
 than one. `MACOS_SKIP_NOTARIZE=1` signs without submitting, for a quick check
 that the identity works.
 
-## Checking a shipped binary
+### Checking a shipped binary
 
 ```bash
 codesign --display --verbose=2 xearthlayer        # Authority=Developer ID Application: ..., flags=...(runtime), Timestamp=...
@@ -222,7 +262,7 @@ Gatekeeper finds the ticket. The realistic test is to download the tarball in
 Safari on a Mac that has never run XEarthLayer and run the binary from the
 unpacked folder. It should start with no dialog.
 
-## Renewal, rotation, revocation
+## Renewal, Rotation, Revocation
 
 - **Expiry.** Check with `openssl x509 -in developer_id_application.pem -noout
   -enddate`; the current certificate ends 22 November 2027. Binaries

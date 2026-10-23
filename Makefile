@@ -391,7 +391,7 @@ pkg-tarball: release ## Build release tarballs: the runtime and, separately, the
 sign-macos: ## Sign and notarize the release binaries with the Developer ID in the keychain (macOS only)
 	@if [ "$$(uname)" != "Darwin" ]; then echo "$(RED)Error: sign-macos must be run on macOS$(NC)"; exit 1; fi
 	@# Notary credentials come from MACOS_NOTARY_PROFILE (xcrun notarytool
-	@# store-credentials) or MACOS_NOTARY_KEY/_KEY_ID/_ISSUER_ID; see docs/dev/macos-signing.md.
+	@# store-credentials) or MACOS_NOTARY_KEY/_KEY_ID/_ISSUER_ID; see docs/dev/macos-signing-runbook.md.
 	@scripts/macos/sign-and-notarize.sh target/release/xearthlayer target/release/xearthlayer-publish
 
 .PHONY: aur-prepare

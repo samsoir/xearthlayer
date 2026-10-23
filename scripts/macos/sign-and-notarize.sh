@@ -14,7 +14,7 @@
 # executable.)
 #
 # The same script runs in the release workflow and under `make sign-macos`.
-# See docs/dev/macos-signing.md.
+# See docs/dev/macos-signing-runbook.md.
 #
 # Environment:
 #   MACOS_SIGN_IDENTITY     Identity to sign with: a "Developer ID Application: ..."
@@ -55,7 +55,7 @@ if [ -z "$identity" ]; then
     count=$(printf '%s' "$matches" | grep -c . || true)
     if [ "$count" -eq 0 ]; then
         echo "error: no valid 'Developer ID Application' identity in the keychain search list" >&2
-        echo "       (security find-identity -v -p codesigning). See docs/dev/macos-signing.md." >&2
+        echo "       (security find-identity -v -p codesigning). See docs/dev/macos-signing-runbook.md." >&2
         exit 1
     fi
     if [ "$count" -gt 1 ]; then

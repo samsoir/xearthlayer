@@ -211,7 +211,7 @@ jobs:
       # signs every channel; pre-releases are notarized too, because a tester's
       # Mac applies the same Gatekeeper policy as anyone else's. The identity
       # lives in a throwaway keychain for the life of the job, never the
-      # runner's login keychain. See docs/dev/macos-signing.md.
+      # runner's login keychain. See docs/dev/macos-signing-runbook.md.
       - name: Import Developer ID certificate
         if: env.MACOS_SIGNING == 'true'
         env:
