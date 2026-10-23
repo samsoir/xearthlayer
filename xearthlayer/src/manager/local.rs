@@ -115,6 +115,34 @@ impl LocalPackageStore {
 
     /// List all installed packages.
     pub fn list(&self) -> ManagerResult<Vec<InstalledPackage>> {
+        Ok(self
+            .scan()?
+            .into_iter()
+            .map(|(metadata, path)| {
+                let size_bytes = calculate_dir_size(&path).unwrap_or(0);
+                InstalledPackage {
+                    metadata,
+                    path,
+                    size_bytes,
+                }
+            })
+            .collect())
+    }
+
+    /// The region and type of every installed package, in the order `list`
+    /// gives them. It reads each package's metadata but never walks its
+    /// tree for a size, so it stays quick on a large install.
+    pub fn list_keys(&self) -> ManagerResult<Vec<(String, PackageType)>> {
+        Ok(self
+            .scan()?
+            .into_iter()
+            .map(|(metadata, _)| (metadata.title, metadata.package_type))
+            .collect())
+    }
+
+    /// The metadata and folder of every installed package, sorted by region,
+    /// then by type.
+    fn scan(&self) -> ManagerResult<Vec<(PackageMetadata, PathBuf)>> {
         let mut packages = Vec::new();
 
         if !self.root.exists() {
@@ -144,22 +172,16 @@ impl LocalPackageStore {
             // Try to parse the metadata
             if let Ok(content) = fs::read_to_string(&metadata_path) {
                 if let Ok(metadata) = parse_package_metadata(&content) {
-                    let size_bytes = calculate_dir_size(&path).unwrap_or(0);
-                    packages.push(InstalledPackage {
-                        metadata,
-                        path,
-                        size_bytes,
-                    });
+                    packages.push((metadata, path));
                 }
             }
         }
 
         // Sort by region, then by type
-        packages.sort_by(|a, b| {
-            a.metadata
-                .title
-                .cmp(&b.metadata.title)
-                .then_with(|| a.metadata.package_type.cmp(&b.metadata.package_type))
+        packages.sort_by(|(a, _), (b, _)| {
+            a.title
+                .cmp(&b.title)
+                .then_with(|| a.package_type.cmp(&b.package_type))
         });
 
         Ok(packages)
@@ -374,6 +396,36 @@ mod tests {
         assert_eq!(packages[1].package_type(), PackageType::Ortho);
         assert_eq!(packages[2].region(), "NA");
         assert_eq!(packages[2].package_type(), PackageType::Overlay);
+    }
+
+    #[test]
+    fn the_key_listing_names_what_list_does_in_the_same_order() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "na", PackageType::Overlay, "1.0.0");
+        create_mock_package(temp.path(), "eu", PackageType::Ortho, "2.0.0");
+        create_mock_package(temp.path(), "na", PackageType::Ortho, "1.0.0");
+        // A folder with no package marker is no package.
+        fs::create_dir_all(temp.path().join("not_a_package")).unwrap();
+
+        let keys = store.list_keys().unwrap();
+
+        let listed: Vec<(String, PackageType)> = store
+            .list()
+            .unwrap()
+            .iter()
+            .map(|p| (p.region().to_string(), p.package_type()))
+            .collect();
+        assert_eq!(keys, listed);
+        assert_eq!(keys.len(), 3);
+    }
+
+    #[test]
+    fn the_key_listing_of_a_missing_root_is_empty() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path().join("absent"));
+
+        assert!(store.list_keys().unwrap().is_empty());
     }
 
     #[test]

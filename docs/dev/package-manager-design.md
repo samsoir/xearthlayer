@@ -530,7 +530,10 @@ included.
 
 Slow reads (the installed list, the library over HTTP, the `run` check, package
 metadata, the overlay rebuild) run on one worker thread, so the runner never
-blocks on them. A load of one kind is shared while one of its kind is waiting
+blocks on them. The one read the runner makes itself, the installed list that
+`Submit` re-checks while `run` is serving, is `list_package_keys`
+(`LocalPackageStore::list_keys`): metadata files only, with no walk of each
+package tree for its size. A load of one kind is shared while one of its kind is waiting
 to run; a load asked for while one is running runs again after it.
 
 The `InstallQueue` is started on demand. The first submitted job calls the
@@ -587,7 +590,11 @@ See [Coordination with run](#coordination-with-run). The TUI reads
 `running_instance` through the worker (`Effect::CheckRun`) on start, on refresh
 and each time finished jobs reload the lists, and keeps the answer as
 `run_active`. That answer drives the top banner and refuses `u`, `d` and an
-install over an installed package at the keypress, with `RunActive::message`.
+install over an installed package at the keypress. The status line gives the
+refusal as `RunActive::short_message` ("XEarthLayer is running (pid N): see
+Details"), so the lock path is never the part that is cut, and the Details pane
+of Local and Library ends with the full `RunActive::message`, wrapped, in the
+banner's colour (on Library, a row not yet installed adds `RESTART_NOTE`).
 
 It can be stale: a `run` started while the screen is open is not seen until the
 next check. So `Effects` asks again at the moment it carries out
@@ -601,8 +608,8 @@ as well; the rest install, and the status line adds `RESTART_NOTE`. A batch
 with nothing left is refused, and so is one whose installed list cannot be read.
 A refusal is answered as `QueueRefused` is (the marks come back and the status
 line gives the reason, after the left-out note if there is one) after a
-`RunActive` that brings up the banner. The refusal names the instance lock, so
-a user can delete one a `run` that exited left behind. As in the commands, a
+`RunActive` that brings up the banner. The full refusal, in Details, names the
+instance lock, so a user can delete one a `run` that exited left behind. As in the commands, a
 `run` started after that check is not seen. The queue lock does not cover this
 either: it serialises package operations, and the instance lock is a different
 file.

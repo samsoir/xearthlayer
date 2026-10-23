@@ -235,11 +235,7 @@ where
     /// The packages installed on disk.
     fn installed(&self) -> ManagerResult<Vec<PackageKey>> {
         let store = self.manager.create_store(&self.install_dir);
-        let packages = self.manager.list_packages(&store)?;
-        Ok(packages
-            .iter()
-            .map(|p| (p.region().to_string(), p.package_type()))
-            .collect())
+        self.manager.list_package_keys(&store)
     }
 
     /// Submit the installs as one batch. Each job's `Queued` comes from the
@@ -275,7 +271,7 @@ where
                     .iter()
                     .map(|m| package_name(&m.title, m.package_type))
                     .collect();
-                let note = format!("{} left out. {}", names.join(", "), run.message());
+                let note = format!("{} left out. {}", names.join(", "), run.short_message());
                 if metadata.is_empty() {
                     self.send(Msg::QueueRefused(note));
                     return;
@@ -314,7 +310,7 @@ where
     fn remove(&mut self, targets: Vec<PackageKey>) {
         if let Err(run) = check_removal(self.manager.as_ref()) {
             self.send(Msg::RunActive(Some(run.clone())));
-            self.send(Msg::QueueRefused(run.message()));
+            self.send(Msg::QueueRefused(run.short_message()));
             return;
         }
         let queue = match self.queue() {
@@ -1330,7 +1326,7 @@ mod tests {
         assert!(matches!(next(&rx), Msg::RunActive(Some(run)) if run.pid == 4242));
         let refused = next(&rx);
         assert!(
-            matches!(&refused, Msg::QueueRefused(why) if *why == run_active(4242).message()),
+            matches!(&refused, Msg::QueueRefused(why) if *why == run_active(4242).short_message()),
             "{refused:?}"
         );
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
@@ -1371,7 +1367,7 @@ mod tests {
             refused,
             &[format!(
                 "EU-WEST ortho left out. {}",
-                run_active(4242).message()
+                run_active(4242).short_message()
             )]
         );
         until(&rx, finished);
@@ -1392,7 +1388,7 @@ mod tests {
         let refused = next(&rx);
         assert!(
             matches!(&refused, Msg::QueueRefused(why)
-                if *why == format!("EU-WEST ortho left out. {}", run_active(4242).message())),
+                if *why == format!("EU-WEST ortho left out. {}", run_active(4242).short_message())),
             "{refused:?}"
         );
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
@@ -1429,9 +1425,37 @@ mod tests {
             refused,
             &[format!(
                 "EU-WEST ortho left out. {}",
-                run_active(4242).message()
+                run_active(4242).short_message()
             )]
         );
+        until(&rx, finished);
+    }
+
+    /// The runner thread reads the installed keys, so the size of every
+    /// package tree is not walked there.
+    #[test]
+    fn a_submit_while_run_is_active_lists_the_installed_keys_without_sizes() {
+        let dir = TempDir::new().unwrap();
+        let manager = FakeManager::default()
+            .with_running_instance(4242)
+            .with_installed(PackageType::Ortho, &["eu-west"])
+            .panicking_on_list();
+        let (mut effects, rx) = effects_with(FakeStages::in_dir(dir.path()), manager, settings());
+
+        let _ = effects.apply(Effect::Submit {
+            packages: vec![metadata("EU-WEST"), metadata("NA-EAST")],
+            replacing: Vec::new(),
+        });
+
+        let seen = until(&rx, |msg| matches!(msg, Msg::Submitted { .. }));
+        let queued: Vec<&str> = seen
+            .iter()
+            .filter_map(|msg| match msg {
+                Msg::Queued(_, summary) => Some(summary.region.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queued, ["NA-EAST"]);
         until(&rx, finished);
     }
 
@@ -1450,7 +1474,10 @@ mod tests {
 
         assert!(matches!(next(&rx), Msg::RunActive(Some(run)) if run.pid == 4242));
         let refused = next(&rx);
-        let left_out = format!("EU-WEST ortho left out. {}; ", run_active(4242).message());
+        let left_out = format!(
+            "EU-WEST ortho left out. {}; ",
+            run_active(4242).short_message()
+        );
         assert!(
             matches!(&refused, Msg::QueueRefused(why)
                 if why.starts_with(&left_out) && why.contains("another package operation")),

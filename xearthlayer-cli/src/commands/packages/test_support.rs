@@ -299,6 +299,19 @@ impl PackageManagerService for FakeManager {
         Ok(self.installed.clone())
     }
 
+    /// Unlike `list_packages` it never panics: a read of the keys is the
+    /// quick one.
+    fn list_package_keys(
+        &self,
+        _store: &LocalPackageStore,
+    ) -> ManagerResult<Vec<(String, PackageType)>> {
+        Ok(self
+            .installed
+            .iter()
+            .map(|p| (p.region().to_string(), p.package_type()))
+            .collect())
+    }
+
     fn running_instance(&self) -> Option<u32> {
         self.running
     }

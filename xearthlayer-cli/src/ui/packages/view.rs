@@ -92,8 +92,8 @@ mod tests {
     use PackageType::{Ortho, Overlay};
 
     use super::*;
-    use crate::commands::packages::actions::{LibraryRow, LibraryStatus};
-    use crate::commands::packages::test_support::run_active;
+    use crate::commands::packages::actions::{LibraryRow, LibraryStatus, RESTART_NOTE};
+    use crate::commands::packages::test_support::{run_active, INSTANCE_LOCK};
     use crate::ui::packages::app::{Action, Input, JobMsg, LocalRow, Msg, Tab};
 
     fn v(version: &str) -> Version {
@@ -1078,6 +1078,129 @@ mod tests {
         assert!(rows[1].contains("XX-NOWHERE"), "{rows:#?}");
         assert!(rows[3].contains("Type: ortho"), "{rows:#?}");
         assert!(!rows.concat().contains("Continent"), "{rows:#?}");
+    }
+
+    // ------------------------------------------------------------------------
+    // The full run refusal in Details
+    // ------------------------------------------------------------------------
+
+    /// The details pane's text at 80x24 without any whitespace, so a line
+    /// wrapped across rows reads whole. Compare it with [`squash`]ed text.
+    fn details_run_text(buffer: &Buffer) -> String {
+        squash(
+            &(0..buffer.area.height)
+                .map(|y| {
+                    (49..buffer.area.width - 1)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<String>(),
+        )
+    }
+
+    fn squash(text: &str) -> String {
+        text.split_whitespace().collect()
+    }
+
+    #[test]
+    fn local_details_end_with_the_full_refusal_while_run_is_active() {
+        let mut state = loaded();
+        msg(&mut state, Msg::RunActive(Some(run_active(4242))));
+
+        let buffer = render(&state, 80, 24);
+
+        let details = details_run_text(&buffer);
+        assert!(
+            details.contains(&squash(&run_active(4242).message())),
+            "{details}"
+        );
+        assert!(details.contains(&squash(INSTANCE_LOCK)), "{details}");
+        // Below the fields, in the banner's colour.
+        let published = details.find("Published").unwrap();
+        assert!(details.find("XEarthLayerisrunning").unwrap() > published);
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| (49..79).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let at = rows
+            .iter()
+            .position(|row: &String| row.starts_with("XEarthLayer is"))
+            .unwrap_or_else(|| panic!("{rows:#?}"));
+        assert_eq!(buffer[(49, at as u16)].fg, Color::Yellow);
+        assert!(rows[at - 1].trim().is_empty(), "a blank line before it");
+    }
+
+    #[test]
+    fn local_details_have_no_refusal_when_run_is_not_active() {
+        let state = loaded();
+
+        let details = details_run_text(&render(&state, 80, 24));
+
+        assert!(details.contains("Published"), "{details}");
+        assert!(!details.contains("isrunning"), "{details}");
+        assert!(!details.contains(&squash(INSTANCE_LOCK)), "{details}");
+    }
+
+    #[test]
+    fn library_details_of_a_new_package_add_the_restart_note() {
+        let mut state = loaded();
+        msg(&mut state, Msg::RunActive(Some(run_active(4242))));
+        go(&mut state, Tab::Library); // AF-NORTH ortho, not installed
+
+        let details = details_run_text(&render(&state, 80, 24));
+
+        assert!(details.contains(&squash(INSTANCE_LOCK)), "{details}");
+        assert!(details.contains(&squash(RESTART_NOTE)), "{details}");
+        assert!(
+            details.find(&squash(RESTART_NOTE)).unwrap()
+                > details.find(&squash(INSTANCE_LOCK)).unwrap(),
+            "{details}"
+        );
+    }
+
+    #[test]
+    fn library_details_of_an_installed_package_have_the_refusal_but_no_restart_note() {
+        let mut state = loaded();
+        msg(&mut state, Msg::RunActive(Some(run_active(4242))));
+        go(&mut state, Tab::Library);
+        act(&mut state, Action::End); // SA-SOUTH ortho
+        act(&mut state, Action::Up); // EU-WEST overlay, installed
+
+        let details = details_run_text(&render(&state, 80, 24));
+
+        assert!(details.contains("EU-WEST"), "{details}");
+        assert!(details.contains(&squash(INSTANCE_LOCK)), "{details}");
+        assert!(!details.contains(&squash(RESTART_NOTE)), "{details}");
+    }
+
+    #[test]
+    fn library_details_have_no_refusal_when_run_is_not_active() {
+        let mut state = loaded();
+        go(&mut state, Tab::Library);
+
+        let details = details_run_text(&render(&state, 80, 24));
+
+        assert!(!details.contains("isrunning"), "{details}");
+        assert!(!details.contains(&squash(RESTART_NOTE)), "{details}");
+    }
+
+    /// The status line keeps the short form at both sizes, so the lock
+    /// path is never the part that is cut.
+    #[test]
+    fn the_status_line_keeps_the_short_refusal() {
+        for (width, height) in [(80, 24), (60, 12)] {
+            let mut state = loaded();
+            msg(&mut state, Msg::RunActive(Some(run_active(4242))));
+            act(&mut state, Action::Delete);
+
+            let text = buffer_text(&render(&state, width, height));
+            let status = text.lines().nth(height as usize - 2).unwrap();
+
+            assert_eq!(
+                status.trim(),
+                "XEarthLayer is running (pid 4242): see Details",
+                "{text}"
+            );
+        }
     }
 
     /// The non-blank cells of the list pane's row that contains `needle`.

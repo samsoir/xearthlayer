@@ -10,8 +10,8 @@ use ratatui::{
 };
 
 use super::chrome::{centered_text, fit, list_pane, marked_row, reading_title, spinner};
-use super::detail::{continent, details_pane, field, heading};
-use crate::commands::packages::actions::{LibraryRow, LibraryStatus};
+use super::detail::{continent, details_pane, field, heading, run_refusal};
+use crate::commands::packages::actions::{LibraryRow, LibraryStatus, RESTART_NOTE};
 use crate::ui::packages::app::{AppState, LibraryState, TypeFilter};
 
 /// Columns around the region and the status: mark, type, version and spaces.
@@ -158,6 +158,13 @@ fn detail_lines(state: &AppState, row: &LibraryRow) -> Vec<Line<'static>> {
             "no"
         };
         lines.push(field("Overlay follows", follows));
+    }
+    if let Some(run) = state.run_refusal() {
+        lines.extend(run_refusal(run));
+        // An install of a new package is allowed, and is picked up on restart.
+        if row.status == LibraryStatus::NotInstalled {
+            lines.push(Line::from(format!("New packages: {RESTART_NOTE}")));
+        }
     }
     lines
 }

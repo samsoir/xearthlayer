@@ -127,6 +127,14 @@ impl RunActive {
     }
 }
 
+impl RunActive {
+    /// The refusal for a status line, which has no room for the lock path.
+    /// The details pane carries the full [`message`](Self::message).
+    pub fn short_message(&self) -> String {
+        format!("XEarthLayer is running (pid {}): see Details", self.pid)
+    }
+}
+
 /// Removing a package is refused while `run` serves it.
 pub fn check_removal(manager: &dyn PackageManagerService) -> Result<(), RunActive> {
     match manager.running_instance() {
@@ -458,6 +466,20 @@ mod tests {
             run.message(),
             "XEarthLayer is running (pid 4242): stop it before updating or removing packages, \
              or delete /state/xearthlayer.lock if XEarthLayer is not running"
+        );
+    }
+
+    /// The status line has little room, and the lock path is the long part
+    /// of the full refusal, so its short form leaves it to the details pane.
+    #[test]
+    fn the_short_refusal_names_the_process_and_where_the_rest_is() {
+        let run = RunActive {
+            pid: 4242,
+            lock: PathBuf::from("/state/xearthlayer.lock"),
+        };
+        assert_eq!(
+            run.short_message(),
+            "XEarthLayer is running (pid 4242): see Details"
         );
     }
 

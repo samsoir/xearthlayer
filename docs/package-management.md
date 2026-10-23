@@ -95,10 +95,10 @@ A SIGINT sent from outside (for example `kill -INT`) quits the same way as a con
 
 ### Using It While XEarthLayer Runs
 
-The package manager works while `xearthlayer run` is active, with the same rules the commands follow (see [While XEarthLayer is running](#while-xearthlayer-is-running)). A banner at the top says so, with the process ID.
+The package manager works while `xearthlayer run` is active, with the same rules the commands follow (see [While XEarthLayer is running](#while-xearthlayer-is-running)). A banner at the top says so, with the process ID, and the Details pane of the selected package ends with the full refusal, including the lock file to delete if XEarthLayer is not running.
 
 - Installing a package that is not installed is allowed. The status line reminds you to restart `xearthlayer run` to use it.
-- Updating, deleting, and installing over an installed package are refused, with the message "XEarthLayer is running (pid N): stop it before updating or removing packages, or delete <lock file> if XEarthLayer is not running". Their keys are dimmed while the banner shows. In a batch that mixes new and installed packages, the installed ones are left out and the new ones install, and the status line keeps naming the ones left out until the line that says what was done.
+- Updating, deleting, and installing over an installed package are refused, with the message "XEarthLayer is running (pid N): stop it before updating or removing packages, or delete <lock file> if XEarthLayer is not running". The status line gives the short form, "XEarthLayer is running (pid N): see Details". Their keys are dimmed while the banner shows. In a batch that mixes new and installed packages, the installed ones are left out and the new ones install, and the status line keeps naming the ones left out until the line that says what was done.
 
 Only one package operation runs at a time. If a package command is already running in another terminal, the package manager says "another package operation is running" when you queue a job, and nothing is lost: your marks come back.
 

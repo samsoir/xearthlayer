@@ -239,6 +239,13 @@ impl PackageManagerService for DefaultPackageManagerService {
         store.list()
     }
 
+    fn list_package_keys(
+        &self,
+        store: &LocalPackageStore,
+    ) -> ManagerResult<Vec<(String, PackageType)>> {
+        store.list_keys()
+    }
+
     fn running_instance(&self) -> Option<u32> {
         xearthlayer::system::process::running_instance(&self.instance_lock())
     }

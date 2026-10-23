@@ -11,7 +11,7 @@ use ratatui::{
 use xearthlayer::config::format_size;
 
 use super::chrome::{centered_text, fit, list_pane, marked_row, pane, reading_title, spinner};
-use super::detail::{continent, details_pane, field, heading};
+use super::detail::{continent, details_pane, field, heading, run_refusal};
 use crate::ui::packages::app::{AppState, LocalRow};
 
 /// Columns around the region: mark, type, version, size and the update mark.
@@ -53,7 +53,7 @@ pub fn draw(frame: &mut Frame, list: Rect, details: Rect, state: &AppState, now:
     );
     let lines = rows
         .get(state.selected())
-        .map(detail_lines)
+        .map(|row| detail_lines(state, row))
         .unwrap_or_default();
     details_pane(frame, details, lines, "Nothing selected");
 }
@@ -91,7 +91,7 @@ fn row_line(state: &AppState, row: &LocalRow, width: usize) -> Line<'static> {
     marked_row(line, marked)
 }
 
-fn detail_lines(row: &LocalRow) -> Vec<Line<'static>> {
+fn detail_lines(state: &AppState, row: &LocalRow) -> Vec<Line<'static>> {
     let version = match &row.update {
         Some(update) => format!("{} ({update} available)", row.version),
         None => row.version.to_string(),
@@ -105,5 +105,6 @@ fn detail_lines(row: &LocalRow) -> Vec<Line<'static>> {
         field("Location", row.path.display().to_string()),
         field("Published", row.published_at.format("%Y-%m-%d").to_string()),
     ]);
+    lines.extend(state.run_refusal().into_iter().flat_map(run_refusal));
     lines
 }

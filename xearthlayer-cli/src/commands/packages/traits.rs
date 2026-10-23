@@ -124,6 +124,14 @@ pub trait PackageManagerService: Send + Sync {
     /// List all installed packages.
     fn list_packages(&self, store: &LocalPackageStore) -> ManagerResult<Vec<InstalledPackage>>;
 
+    /// The region and type of every installed package. Unlike
+    /// `list_packages` it walks no package tree for a size, so a caller that
+    /// only needs to know what is installed does not wait on the disk.
+    fn list_package_keys(
+        &self,
+        store: &LocalPackageStore,
+    ) -> ManagerResult<Vec<(String, PackageType)>>;
+
     /// The pid of another `xearthlayer run` that is serving packages, if any.
     ///
     /// Read from the instance lock `run` holds, so it is true for as long as

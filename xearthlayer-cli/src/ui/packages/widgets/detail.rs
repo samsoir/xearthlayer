@@ -11,6 +11,7 @@ use ratatui::{
 use xearthlayer_package::continent_name;
 
 use super::chrome::pane;
+use crate::commands::packages::actions::RunActive;
 
 /// One "Name: value" line.
 pub fn field(name: &str, value: impl Into<String>) -> Line<'static> {
@@ -31,6 +32,18 @@ pub fn heading(text: impl Into<String>) -> Line<'static> {
         text.into(),
         Style::default().add_modifier(Modifier::BOLD),
     ))
+}
+
+/// The full refusal that ends a details pane while `run` is serving: a
+/// blank line, then the refusal in the banner's colour.
+pub fn run_refusal(run: &RunActive) -> Vec<Line<'static>> {
+    vec![
+        Line::default(),
+        Line::from(Span::styled(
+            run.message(),
+            Style::default().fg(Color::Yellow),
+        )),
+    ]
 }
 
 /// Draw `lines` in a pane titled "Details", wrapped to its width. With no

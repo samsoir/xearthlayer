@@ -574,6 +574,11 @@ impl AppState {
         self.run_active.as_ref().map(|run| run.pid)
     }
 
+    /// The refusal the details panes end with while `run` is serving.
+    pub fn run_refusal(&self) -> Option<&RunActive> {
+        self.run_active.as_ref()
+    }
+
     /// The installed list has been read at least once, well or not.
     pub fn local_loaded(&self) -> bool {
         self.local_loaded
@@ -886,7 +891,7 @@ impl AppState {
     fn refused_while_running(&mut self) -> bool {
         match &self.run_active {
             Some(run) => {
-                self.status = Some(run.message());
+                self.status = Some(run.short_message());
                 true
             }
             None => false,
@@ -1025,7 +1030,7 @@ impl AppState {
             left_out.push(format!(
                 "{} left out. {}",
                 refused.join(", "),
-                run.message()
+                run.short_message()
             ));
         }
         let mut notes = left_out.clone();
@@ -1731,7 +1736,7 @@ mod tests {
         let effects = act(&mut state, Action::Update);
 
         assert!(effects.is_empty());
-        assert_eq!(status(&state), run_active(42).message());
+        assert_eq!(status(&state), run_active(42).short_message());
     }
 
     #[test]
@@ -1807,7 +1812,7 @@ mod tests {
 
         assert!(effects.is_empty());
         assert!(state.modal.is_none());
-        assert_eq!(status(&state), run_active(42).message());
+        assert_eq!(status(&state), run_active(42).short_message());
     }
 
     #[test]
@@ -1943,7 +1948,7 @@ mod tests {
             ["AF-NORTH ortho", "AF-NORTH overlay"]
         );
         assert!(
-            status(&state).contains(&run_active(42).message()),
+            status(&state).contains(&run_active(42).short_message()),
             "{}",
             status(&state)
         );
@@ -1992,7 +1997,7 @@ mod tests {
 
         assert!(state.modal.is_none());
         assert!(
-            status(&state).contains(&run_active(42).message()),
+            status(&state).contains(&run_active(42).short_message()),
             "{}",
             status(&state)
         );
@@ -2301,7 +2306,7 @@ mod tests {
         // `run` started after the install was confirmed.
         msg(&mut state, Msg::RunActive(Some(run_active(42))));
         queue(&mut state, &[("AF-NORTH", Ortho, Some("1.0.0"))]);
-        let left_out = format!("EU-WEST ortho left out. {}", run_active(42).message());
+        let left_out = format!("EU-WEST ortho left out. {}", run_active(42).short_message());
 
         msg(
             &mut state,
@@ -3414,7 +3419,7 @@ mod tests {
         }
         act(&mut state, Action::Mark);
         act(&mut state, Action::Install);
-        let left_out = format!("EU-WEST ortho left out. {}", run_active(42).message());
+        let left_out = format!("EU-WEST ortho left out. {}", run_active(42).short_message());
         assert!(status(&state).contains(&left_out), "{}", status(&state));
 
         act(&mut state, Action::Confirm);
