@@ -54,7 +54,8 @@ pub fn plan_deletion(
 ) -> PublishResult<DeletionPlan> {
     xearthlayer_package::validate_region(region)?;
 
-    let in_library = LibraryManager::open_or_create(repo.root())?.contains(region, package_type);
+    let in_library =
+        LibraryManager::open_or_create(&repo.library_root())?.contains(region, package_type);
 
     let package_dir = repo.package_dir(region, package_type);
     let package_dir = package_dir.is_dir().then_some(package_dir);
@@ -97,7 +98,7 @@ pub fn plan_deletion(
 /// not offered a package whose archives are being removed.
 pub fn execute_deletion(repo: &Repository, plan: &DeletionPlan) -> PublishResult<()> {
     if plan.in_library {
-        let mut library = LibraryManager::open_or_create(repo.root())?;
+        let mut library = LibraryManager::open_or_create(&repo.library_root())?;
         library.remove(&plan.region, plan.package_type);
         library.save()?;
     }
@@ -139,7 +140,7 @@ mod tests {
 
         let metadata_path = temp.path().join("meta_source.txt");
         std::fs::write(&metadata_path, "metadata").unwrap();
-        let mut library = LibraryManager::open_or_create(repo.root()).unwrap();
+        let mut library = LibraryManager::open_or_create(&repo.library_root()).unwrap();
         library
             .add_or_update(
                 &metadata_path,
@@ -274,7 +275,7 @@ mod tests {
         assert!(!repo.package_dir("na", PackageType::Ortho).exists());
         assert!(!repo.dist_dir().join("na").join("ortho").exists());
 
-        let library = LibraryManager::open_or_create(repo.root()).unwrap();
+        let library = LibraryManager::open_or_create(&repo.library_root()).unwrap();
         assert!(
             !library.contains("na", PackageType::Ortho),
             "execute_deletion must remove the library index entry"

@@ -35,13 +35,14 @@ use clap::Parser;
 
 use args::{
     AddArgs, BuildArgs, CoverageArgs, DedupeArgs, DeleteArgs, GapsArgs, InitArgs, ListArgs,
-    PublishCommands, ReleaseArgs, ScanArgs, StatusArgs, UrlsArgs, ValidateArgs, VersionArgs,
+    PublishCommands, ReleaseArgs, ScanArgs, StatusArgs, UpgradeArgs, UrlsArgs, ValidateArgs,
+    VersionArgs,
 };
 use error::CliError;
 use handlers::{
     AddHandler, BuildHandler, CoverageHandler, DedupeHandler, DeleteHandler, GapsHandler,
-    InitHandler, ListHandler, ReleaseHandler, ScanHandler, StatusHandler, UrlsHandler,
-    ValidateHandler, VersionHandler,
+    InitHandler, LibraryHandler, ListHandler, ReleaseHandler, ScanHandler, StatusHandler,
+    UpgradeHandler, UrlsHandler, ValidateHandler, VersionHandler,
 };
 use services::{ConsoleOutput, ConsolePrompt, DefaultPublisherService};
 use traits::{CommandContext, CommandHandler};
@@ -52,6 +53,10 @@ use traits::{CommandContext, CommandHandler};
 #[command(version)]
 #[command(about = "Create and publish XEarthLayer scenery packages", long_about = None)]
 struct Cli {
+    /// Work in this library generation (e.g. v1) instead of the current one
+    #[arg(long, global = true)]
+    library: Option<String>,
+
     #[command(subcommand)]
     command: PublishCommands,
 }
@@ -61,7 +66,7 @@ fn main() -> ExitCode {
 
     // Returning ExitCode rather than calling process::exit lets destructors
     // run, the same discipline as the xearthlayer binary (#194).
-    match run(cli.command) {
+    match run(cli.command, cli.library) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => ExitCode::from(e.report()),
     }
@@ -71,10 +76,10 @@ fn main() -> ExitCode {
 ///
 /// Creates the production context with real implementations and dispatches
 /// to the appropriate handler.
-fn run(command: PublishCommands) -> Result<(), CliError> {
+fn run(command: PublishCommands, library: Option<String>) -> Result<(), CliError> {
     // Create production context
     let output = ConsoleOutput::new();
-    let publisher = DefaultPublisherService::new();
+    let publisher = DefaultPublisherService::with_library(library);
     let prompt = ConsolePrompt::new();
     let ctx = CommandContext::new(&output, &publisher, &prompt);
 
@@ -261,6 +266,21 @@ fn run(command: PublishCommands) -> Result<(), CliError> {
             &ctx,
         ),
 
+        PublishCommands::Upgrade {
+            root_as,
+            dry_run,
+            repo,
+        } => UpgradeHandler::execute(
+            UpgradeArgs {
+                root_as,
+                dry_run,
+                repo,
+            },
+            &ctx,
+        ),
+
+        PublishCommands::Library { command } => LibraryHandler::execute(command, &ctx),
+
         PublishCommands::Delete {
             region,
             r#type,
@@ -286,11 +306,59 @@ mod cli_tests {
 
     use super::Cli;
 
-    /// Every subcommand `xearthlayer publish` offered, and none it did not.
-    const SUBCOMMANDS: [&str; 14] = [
+    /// Every subcommand `xearthlayer publish` offered, and none it did not,
+    /// plus the library generation commands added in #333.
+    const SUBCOMMANDS: [&str; 16] = [
         "init", "scan", "add", "list", "build", "urls", "version", "release", "status", "validate",
-        "coverage", "dedupe", "gaps", "delete",
+        "coverage", "dedupe", "gaps", "delete", "upgrade", "library",
     ];
+
+    fn parse(argv: &[&str]) -> Cli {
+        <Cli as clap::Parser>::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"))
+    }
+
+    #[test]
+    fn library_names_a_generation_for_any_command_before_or_after_it() {
+        assert_eq!(
+            parse(&["xearthlayer-publish", "--library", "v1", "list"])
+                .library
+                .as_deref(),
+            Some("v1")
+        );
+        assert_eq!(
+            parse(&["xearthlayer-publish", "status", "--library", "v2"])
+                .library
+                .as_deref(),
+            Some("v2")
+        );
+        assert_eq!(parse(&["xearthlayer-publish", "list"]).library, None);
+    }
+
+    #[test]
+    fn upgrade_and_library_parse() {
+        assert!(matches!(
+            parse(&["xearthlayer-publish", "upgrade", "--root-as", "v1", "--dry-run"]).command,
+            super::PublishCommands::Upgrade { ref root_as, dry_run: true, .. } if root_as == "v1"
+        ));
+        for argv in [
+            &["xearthlayer-publish", "library", "list"][..],
+            &["xearthlayer-publish", "library", "new", "v3"],
+            &["xearthlayer-publish", "library", "use", "v2"],
+            &[
+                "xearthlayer-publish",
+                "library",
+                "import",
+                "v2",
+                "--from",
+                "/tmp/staging",
+            ],
+        ] {
+            assert!(
+                matches!(parse(argv).command, super::PublishCommands::Library { .. }),
+                "{argv:?}"
+            );
+        }
+    }
 
     #[test]
     fn the_binary_offers_every_publish_subcommand() {

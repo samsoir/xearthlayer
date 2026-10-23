@@ -286,7 +286,7 @@ pub fn release_package(
     validate_url(metadata_url)?;
 
     // Update library index
-    let mut library = LibraryManager::open_or_create(repo.root())?;
+    let mut library = LibraryManager::open_or_create(&repo.library_root())?;
 
     library.add_or_update(
         &metadata_path,
@@ -406,7 +406,7 @@ pub fn get_release_status(
     }
 
     // Check if in library
-    let library = match LibraryManager::open_or_create(repo.root()) {
+    let library = match LibraryManager::open_or_create(&repo.library_root()) {
         Ok(l) => l,
         Err(_) => return ReleaseStatus::Ready,
     };

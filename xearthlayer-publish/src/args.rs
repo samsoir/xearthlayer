@@ -387,6 +387,88 @@ pub enum PublishCommands {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
+
+    /// Upgrade a repository from before library generations
+    ///
+    /// The root library is copied into a generation, which becomes current,
+    /// and the working folders it lists move there. The root library files
+    /// stay where they are, unchanged: clients from before generations keep
+    /// reading them, and no command writes them again.
+    Upgrade {
+        /// The generation the root library becomes (e.g. "v1")
+        #[arg(long)]
+        root_as: String,
+
+        /// Show what would change without changing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Repository path
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+
+    /// Manage library generations: v1, v2, ..., each a complete scenery world
+    ///
+    /// Every other command works in the current generation, or in the one
+    /// `--library` names.
+    Library {
+        #[command(subcommand)]
+        command: LibraryCommands,
+    },
+}
+
+/// Library generation subcommands.
+#[derive(Subcommand)]
+pub enum LibraryCommands {
+    /// List the generations and show which is current
+    List {
+        /// Repository path
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+
+    /// Create an empty generation (does not make it current)
+    New {
+        /// Generation name (e.g. "v3")
+        generation: String,
+
+        /// Repository path
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+
+    /// Make a generation current
+    Use {
+        /// Generation name (e.g. "v2")
+        generation: String,
+
+        /// Repository path
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+
+    /// Create a generation from library files kept elsewhere
+    ///
+    /// Copies the library index, region metadata and coverage map from the
+    /// folder, and moves the working folders its index lists out of the
+    /// repository's root packages/ and dist/. Does not make it current.
+    Import {
+        /// Generation name (e.g. "v2")
+        generation: String,
+
+        /// Folder holding the library files (xearthlayer_package_library.txt, ...)
+        #[arg(long)]
+        from: PathBuf,
+
+        /// Show what would change without changing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Repository path
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
 }
 
 /// Report format options for gap analysis.
@@ -522,5 +604,12 @@ pub struct DeleteArgs {
     pub package_type: Option<PackageTypeArg>,
     pub dry_run: bool,
     pub yes: bool,
+    pub repo: PathBuf,
+}
+
+/// Arguments for the upgrade command.
+pub struct UpgradeArgs {
+    pub root_as: String,
+    pub dry_run: bool,
     pub repo: PathBuf,
 }

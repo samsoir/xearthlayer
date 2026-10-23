@@ -16,6 +16,7 @@ use xearthlayer_package::{PackageMetadata, PackageType};
 use xearthlayer_publisher::dedupe::{
     resolve_overlaps, DedupeFilter, GapAnalysisResult, OverlapDetector, ZoomPriority,
 };
+use xearthlayer_publisher::generation::GenerationReport;
 use xearthlayer_publisher::{
     coverage::{CoverageConfig, CoverageMapGenerator},
     BuildResult, DeletionPlan, ProcessSummary, PublishError, RegionMetadata, RegionSuggestion,
@@ -211,6 +212,26 @@ impl RepositoryOperations for RepositoryWrapper {
             .list_packages()
             .map_err(|e| CliError::Publish(format!("Failed to list packages: {}", e)))
     }
+
+    fn generation(&self) -> &str {
+        self.inner.generation()
+    }
+
+    fn library_root(&self) -> PathBuf {
+        self.inner.library_root()
+    }
+}
+
+/// The publisher's repository for `repo`, at the same generation: a command
+/// run with `--library` must not fall back to the current one partway.
+fn reopen(repo: &dyn RepositoryOperations) -> Result<xearthlayer_publisher::Repository, CliError> {
+    xearthlayer_publisher::Repository::open(repo.root())
+        .and_then(|r| r.at_generation(repo.generation()))
+        .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))
+}
+
+fn publish_error(context: &str) -> impl Fn(xearthlayer_publisher::PublishError) -> CliError + '_ {
+    move |e| CliError::Publish(format!("{context}: {e}"))
 }
 
 // ============================================================================
@@ -220,13 +241,16 @@ impl RepositoryOperations for RepositoryWrapper {
 /// Default implementation of the publisher service.
 ///
 /// This wraps the actual xearthlayer publisher functions.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DefaultPublisherService;
+#[derive(Debug, Clone, Default)]
+pub struct DefaultPublisherService {
+    /// The generation `--library` named, for every repository opened.
+    library: Option<String>,
+}
 
 impl DefaultPublisherService {
-    /// Create a new default publisher service.
-    pub fn new() -> Self {
-        Self
+    /// Open every repository at `library` rather than its current generation.
+    pub fn with_library(library: Option<String>) -> Self {
+        Self { library }
     }
 }
 
@@ -238,9 +262,57 @@ impl PublisherService for DefaultPublisherService {
     }
 
     fn open_repository(&self, path: &Path) -> Result<Box<dyn RepositoryOperations>, CliError> {
-        let repo = xearthlayer_publisher::Repository::open(path)
-            .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))?;
+        let error = publish_error("Failed to open repository");
+        let mut repo = xearthlayer_publisher::Repository::open(path).map_err(&error)?;
+        if let Some(library) = &self.library {
+            repo = repo.at_generation(library).map_err(&error)?;
+        }
         Ok(Box::new(RepositoryWrapper::new(repo)))
+    }
+
+    fn upgrade_repository(
+        &self,
+        path: &Path,
+        root_as: &str,
+        dry_run: bool,
+    ) -> Result<GenerationReport, CliError> {
+        xearthlayer_publisher::generation::upgrade(path, root_as, dry_run)
+            .map_err(publish_error("Failed to upgrade repository"))
+    }
+
+    fn list_generations(&self, path: &Path) -> Result<(Vec<String>, String), CliError> {
+        let error = publish_error("Failed to list generations");
+        let repo = xearthlayer_publisher::Repository::open(path).map_err(&error)?;
+        Ok((
+            repo.generations().map_err(&error)?,
+            repo.current_generation().map_err(&error)?,
+        ))
+    }
+
+    fn create_generation(&self, path: &Path, generation: &str) -> Result<(), CliError> {
+        let error = publish_error("Failed to create generation");
+        xearthlayer_publisher::Repository::open(path)
+            .and_then(|repo| repo.create_generation(generation))
+            .map_err(&error)
+    }
+
+    fn use_generation(&self, path: &Path, generation: &str) -> Result<(), CliError> {
+        let error = publish_error("Failed to switch generation");
+        xearthlayer_publisher::Repository::open(path)
+            .and_then(|repo| repo.use_generation(generation))
+            .map_err(&error)
+    }
+
+    fn import_generation(
+        &self,
+        path: &Path,
+        generation: &str,
+        from: &Path,
+        dry_run: bool,
+    ) -> Result<GenerationReport, CliError> {
+        let error = publish_error("Failed to import generation");
+        let repo = xearthlayer_publisher::Repository::open(path).map_err(&error)?;
+        xearthlayer_publisher::generation::import(&repo, generation, from, dry_run).map_err(&error)
     }
 
     fn read_config(&self, repo_root: &Path) -> Result<RepoConfig, CliError> {
@@ -285,8 +357,7 @@ impl PublisherService for DefaultPublisherService {
         // We need to get the actual Repository from the wrapper
         // This is a limitation - we need to downcast or use a different approach
         // For now, we'll re-open the repository
-        let actual_repo = xearthlayer_publisher::Repository::open(repo.root())
-            .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))?;
+        let actual_repo = reopen(repo)?;
 
         // Use appropriate processor based on package type
         match package_type {
@@ -312,8 +383,7 @@ impl PublisherService for DefaultPublisherService {
         package_type: PackageType,
         version: Version,
     ) -> Result<(), CliError> {
-        let actual_repo = xearthlayer_publisher::Repository::open(repo.root())
-            .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))?;
+        let actual_repo = reopen(repo)?;
 
         xearthlayer_publisher::generate_initial_metadata(
             &actual_repo,
@@ -337,8 +407,7 @@ impl PublisherService for DefaultPublisherService {
         package_type: PackageType,
         config: &RepoConfig,
     ) -> Result<BuildResult, CliError> {
-        let actual_repo = xearthlayer_publisher::Repository::open(repo.root())
-            .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))?;
+        let actual_repo = reopen(repo)?;
 
         xearthlayer_publisher::build_package(&actual_repo, region, package_type, config)
             .map_err(|e| CliError::Publish(format!("Build failed: {}", e)))
@@ -361,8 +430,7 @@ impl PublisherService for DefaultPublisherService {
         urls: &[String],
         verify: bool,
     ) -> Result<UrlConfigResult, CliError> {
-        let actual_repo = xearthlayer_publisher::Repository::open(repo.root())
-            .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))?;
+        let actual_repo = reopen(repo)?;
 
         xearthlayer_publisher::configure_urls(&actual_repo, region, package_type, urls, verify)
             .map_err(|e| CliError::Publish(format!("Failed to configure URLs: {}", e)))
@@ -393,8 +461,7 @@ impl PublisherService for DefaultPublisherService {
         package_type: PackageType,
         metadata_url: &str,
     ) -> Result<ReleaseResult, CliError> {
-        let actual_repo = xearthlayer_publisher::Repository::open(repo.root())
-            .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))?;
+        let actual_repo = reopen(repo)?;
 
         xearthlayer_publisher::release_package(&actual_repo, region, package_type, metadata_url)
             .map_err(|e| CliError::Publish(format!("Release failed: {}", e)))
@@ -407,7 +474,7 @@ impl PublisherService for DefaultPublisherService {
         package_type: PackageType,
     ) -> ReleaseStatus {
         // We need an actual Repository here - try to open it
-        match xearthlayer_publisher::Repository::open(repo.root()) {
+        match reopen(repo) {
             Ok(actual_repo) => {
                 xearthlayer_publisher::get_release_status(&actual_repo, region, package_type)
             }
@@ -416,8 +483,7 @@ impl PublisherService for DefaultPublisherService {
     }
 
     fn validate_repository(&self, repo: &dyn RepositoryOperations) -> Result<(), CliError> {
-        let actual_repo = xearthlayer_publisher::Repository::open(repo.root())
-            .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))?;
+        let actual_repo = reopen(repo)?;
 
         xearthlayer_publisher::validate_repository(&actual_repo)
             .map_err(|e| CliError::Publish(format!("Validation failed: {}", e)))
@@ -632,8 +698,7 @@ impl PublisherService for DefaultPublisherService {
         region: &str,
         package_type: PackageType,
     ) -> Result<Option<DeletionPlan>, CliError> {
-        let actual_repo = xearthlayer_publisher::Repository::open(repo.root())
-            .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))?;
+        let actual_repo = reopen(repo)?;
 
         match xearthlayer_publisher::plan_deletion(&actual_repo, region, package_type) {
             Ok(plan) => Ok(Some(plan)),
@@ -650,8 +715,7 @@ impl PublisherService for DefaultPublisherService {
         repo: &dyn RepositoryOperations,
         plan: &DeletionPlan,
     ) -> Result<(), CliError> {
-        let actual_repo = xearthlayer_publisher::Repository::open(repo.root())
-            .map_err(|e| CliError::Publish(format!("Failed to open repository: {}", e)))?;
+        let actual_repo = reopen(repo)?;
 
         xearthlayer_publisher::execute_deletion(&actual_repo, plan)
             .map_err(|e| CliError::Publish(format!("Deletion failed: {}", e)))

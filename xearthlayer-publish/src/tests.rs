@@ -15,6 +15,7 @@ use super::traits::*;
 use crate::error::CliError;
 use xearthlayer_package::{ArchivePart, PackageMetadata, PackageType};
 use xearthlayer_publisher::dedupe::{DedupeFilter, GapAnalysisResult, ZoomPriority};
+use xearthlayer_publisher::generation::GenerationReport;
 use xearthlayer_publisher::{
     ArchiveBuildResult, BuildResult, DeletionPlan, ProcessSummary, RegionSuggestion, ReleaseResult,
     ReleaseStatus, RepoConfig, SceneryScanResult, SuggestedRegion, TileInfo, UrlConfigResult,
@@ -139,6 +140,14 @@ impl RepositoryOperations for MockRepository {
 
     fn list_packages(&self) -> Result<Vec<(String, PackageType)>, CliError> {
         Ok(self.packages.clone())
+    }
+
+    fn generation(&self) -> &str {
+        "v1"
+    }
+
+    fn library_root(&self) -> PathBuf {
+        self.root.join("v1")
     }
 }
 
@@ -267,6 +276,8 @@ impl MockPublisherServiceBuilder {
             plan_deletion_overrides: self.plan_deletion_overrides,
             captured_coverage_metadata_path: RwLock::new(None),
             executed_deletions: RwLock::new(Vec::new()),
+            generation_report: GenerationReport::default(),
+            generation_calls: RwLock::new(Vec::new()),
         }
     }
 }
@@ -290,9 +301,28 @@ pub struct MockPublisherService {
     /// tests distinguish "the handler decided not to delete" from "the mock
     /// would have deleted but we didn't check".
     executed_deletions: RwLock<Vec<DeletionPlan>>,
+    /// The report `upgrade_repository` and `import_generation` return.
+    generation_report: GenerationReport,
+    /// Every generation operation called, as "op args", in call order.
+    generation_calls: RwLock<Vec<String>>,
 }
 
 impl MockPublisherService {
+    /// Every generation operation called, as "op args", in call order.
+    pub fn generation_calls(&self) -> Vec<String> {
+        self.generation_calls.read().unwrap().clone()
+    }
+
+    fn record(&self, call: String) {
+        self.generation_calls.write().unwrap().push(call);
+    }
+
+    /// The report generation operations return, for handler tests.
+    pub fn with_generation_report(mut self, report: GenerationReport) -> Self {
+        self.generation_report = report;
+        self
+    }
+
     /// Returns the `metadata_path` most recently passed to
     /// `generate_coverage_map` or `generate_coverage_geojson`, if any.
     pub fn captured_coverage_metadata_path(&self) -> Option<PathBuf> {
@@ -322,6 +352,57 @@ impl PublisherService for MockPublisherService {
             ))),
             Err(e) => Err(CliError::Publish(e.clone())),
         }
+    }
+
+    fn upgrade_repository(
+        &self,
+        path: &Path,
+        root_as: &str,
+        dry_run: bool,
+    ) -> Result<GenerationReport, CliError> {
+        self.record(format!(
+            "upgrade {} {root_as} dry_run={dry_run}",
+            path.display()
+        ));
+        Ok(GenerationReport {
+            generation: root_as.to_string(),
+            dry_run,
+            ..self.generation_report.clone()
+        })
+    }
+
+    fn list_generations(&self, path: &Path) -> Result<(Vec<String>, String), CliError> {
+        self.record(format!("list {}", path.display()));
+        Ok((vec!["v1".to_string(), "v2".to_string()], "v2".to_string()))
+    }
+
+    fn create_generation(&self, path: &Path, generation: &str) -> Result<(), CliError> {
+        self.record(format!("new {} {generation}", path.display()));
+        Ok(())
+    }
+
+    fn use_generation(&self, path: &Path, generation: &str) -> Result<(), CliError> {
+        self.record(format!("use {} {generation}", path.display()));
+        Ok(())
+    }
+
+    fn import_generation(
+        &self,
+        path: &Path,
+        generation: &str,
+        from: &Path,
+        dry_run: bool,
+    ) -> Result<GenerationReport, CliError> {
+        self.record(format!(
+            "import {} {generation} from {} dry_run={dry_run}",
+            path.display(),
+            from.display()
+        ));
+        Ok(GenerationReport {
+            generation: generation.to_string(),
+            dry_run,
+            ..self.generation_report.clone()
+        })
     }
 
     fn read_config(&self, _repo_root: &Path) -> Result<RepoConfig, CliError> {
@@ -1549,7 +1630,7 @@ mod coverage_tests {
         assert!(result.is_ok());
         assert_eq!(
             publisher.captured_coverage_metadata_path(),
-            Some(PathBuf::from("/test/repo/region_metadata.json"))
+            Some(PathBuf::from("/test/repo/v1/region_metadata.json"))
         );
     }
 
@@ -1590,7 +1671,7 @@ mod coverage_tests {
         assert!(result.is_ok());
         assert_eq!(
             publisher.captured_coverage_metadata_path(),
-            Some(PathBuf::from("/test/repo/region_metadata.json"))
+            Some(PathBuf::from("/test/repo/v1/region_metadata.json"))
         );
     }
 
@@ -1824,5 +1905,136 @@ mod delete_tests {
             publisher.executed_deletions().is_empty(),
             "a dry run must delete nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    fn report() -> GenerationReport {
+        GenerationReport {
+            generation: String::new(),
+            copied: vec![(
+                PathBuf::from("/repo/xearthlayer_package_library.txt"),
+                PathBuf::from("/repo/v1/xearthlayer_package_library.txt"),
+            )],
+            moved: vec![(
+                PathBuf::from("/repo/packages/zzXEL_na_ortho"),
+                PathBuf::from("/repo/v1/packages/zzXEL_na_ortho"),
+            )],
+            left: vec![PathBuf::from("/repo/packages/zzXEL_na-canada-west_ortho")],
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn upgrade_reports_what_it_copied_moved_and_left_relative_to_the_repository() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .build()
+            .with_generation_report(report());
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        UpgradeHandler::execute(
+            UpgradeArgs {
+                root_as: "v1".into(),
+                dry_run: false,
+                repo: PathBuf::from("/repo"),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert_eq!(
+            publisher.generation_calls(),
+            ["upgrade /repo v1 dry_run=false"]
+        );
+        for line in [
+            "copied xearthlayer_package_library.txt -> v1/xearthlayer_package_library.txt",
+            "moved packages/zzXEL_na_ortho -> v1/packages/zzXEL_na_ortho",
+            "Not listed by v1 and left in place (1):",
+            "packages/zzXEL_na-canada-west_ortho",
+            "v1 is the current generation. The root library files are unchanged",
+        ] {
+            assert!(output.contains(line), "missing {line:?}");
+        }
+    }
+
+    #[test]
+    fn a_dry_run_upgrade_says_it_would_and_that_nothing_changed() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .build()
+            .with_generation_report(report());
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        UpgradeHandler::execute(
+            UpgradeArgs {
+                root_as: "v1".into(),
+                dry_run: true,
+                repo: PathBuf::from("/repo"),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(output.contains("would copy xearthlayer_package_library.txt"));
+        assert!(output.contains("would move packages/zzXEL_na_ortho"));
+        assert!(output.contains("Dry run: nothing was changed."));
+        assert!(!output.contains("is the current generation"));
+    }
+
+    #[test]
+    fn library_subcommands_reach_the_publisher_and_list_marks_the_current_one() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new().build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+        let repo = PathBuf::from("/repo");
+
+        LibraryHandler::execute(LibraryCommands::List { repo: repo.clone() }, &ctx).unwrap();
+        LibraryHandler::execute(
+            LibraryCommands::New {
+                generation: "v3".into(),
+                repo: repo.clone(),
+            },
+            &ctx,
+        )
+        .unwrap();
+        LibraryHandler::execute(
+            LibraryCommands::Use {
+                generation: "v2".into(),
+                repo: repo.clone(),
+            },
+            &ctx,
+        )
+        .unwrap();
+        LibraryHandler::execute(
+            LibraryCommands::Import {
+                generation: "v2".into(),
+                from: PathBuf::from("/staging"),
+                dry_run: true,
+                repo,
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert_eq!(
+            publisher.generation_calls(),
+            [
+                "list /repo",
+                "new /repo v3",
+                "use /repo v2",
+                "import /repo v2 from /staging dry_run=true"
+            ]
+        );
+        assert!(output.contains("* v2"), "the current generation is marked");
+        assert!(output.contains("  v1"));
+        assert!(output.contains("Created v3."));
+        assert!(output.contains("v2 is the current generation."));
     }
 }

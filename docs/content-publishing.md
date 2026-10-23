@@ -57,12 +57,15 @@ Initialized XEarthLayer package repository at:
   /path/to/my-scenery-packages
 
 Repository structure:
-  packages/  - Package working directories
-  dist/      - Built archives for distribution
-  staging/   - Temporary processing area
+  v1/           - Library generation v1 (current): its library index and metadata
+  v1/packages/  - Package working directories
+  v1/dist/      - Built archives for distribution
+  staging/      - Work area shared by every generation
 
 Archive part size: 500 MB
 ```
+
+A repository holds one or more **library generations**, each a complete scenery world in its own folder: `v1/`, `v2/`, and so on. A new repository starts with `v1`. Every command works in the current generation; see [Library Generations](#library-generations).
 
 ## Step 3: Scan Tiles
 
@@ -134,7 +137,7 @@ DDS skipped:     1536
 Generating metadata...
 
 Package created successfully!
-  Location: ./packages/zzXEL_eu-paris_ortho
+  Location: ./v1/packages/zzXEL_eu-paris_ortho
 
 Next steps:
   1. Run 'xearthlayer-publish build --region eu-paris --type ortho' to create archives
@@ -255,7 +258,7 @@ Next steps:
   2. Run 'xearthlayer-publish urls --region eu-paris --type ortho --base-url <url>' to configure URLs
 ```
 
-Archives are stored in `dist/<region>/<type>/`.
+Archives are stored in `<generation>/dist/<region>/<type>/`, for example `v1/dist/eu-paris/ortho/`.
 
 ## Step 6: Upload Archives
 
@@ -263,7 +266,7 @@ Upload the archive parts to your web hosting:
 
 ```bash
 # Example using AWS S3
-aws s3 cp dist/eu-paris/ortho/ s3://my-bucket/packages/eu-paris/ortho/ --recursive
+aws s3 cp v1/dist/eu-paris/ortho/ s3://my-bucket/packages/eu-paris/ortho/ --recursive
 
 # Example using rsync
 rsync -av dist/eu-paris/ortho/ user@server:/var/www/packages/eu-paris/ortho/
@@ -475,6 +478,38 @@ index entry regardless: a user who started an install before you deleted the
 entry is still fetching parts from those URLs. Taking the hosted copies down is
 a separate, manual step, made once you are satisfied that nobody is still
 installing the old version.
+
+## Library Generations
+
+Each scenery world is a generation: a library index, region metadata, coverage map, package working folders and archives under `v<N>/`. A library URL clients read never changes meaning, so a rebuilt world goes into a new generation instead of replacing the packages of the old one, and clients of the old world keep working.
+
+```bash
+xearthlayer-publish library list               # the generations, the current one marked *
+xearthlayer-publish library new v2             # start an empty generation
+xearthlayer-publish library use v2             # make it current
+xearthlayer-publish --library v1 status        # one command in another generation
+```
+
+Publish each generation's `xearthlayer_package_library.txt` at its own URL, for example `https://example.com/packages/v2/xearthlayer_package_library.txt`, and point clients at the generation they should read.
+
+### Upgrading a Repository From Before Generations
+
+A repository created before generations keeps its library at the root, and every command refuses it until it is upgraded:
+
+```bash
+xearthlayer-publish upgrade --root-as v1 --dry-run   # see what would change
+xearthlayer-publish upgrade --root-as v1
+```
+
+The upgrade copies the root library index, region metadata and coverage map into `v1/`, makes `v1` current, and moves into `v1/` the package and archive folders the root index lists. Folders it does not list are left where they are and reported. The root files stay, byte for byte: clients from before generations keep reading them, and no command writes them again.
+
+A library kept elsewhere, for example on another branch of the repository, becomes a generation with `library import`, which copies its files and moves the root working folders its index lists:
+
+```bash
+xearthlayer-publish library import v2 --from /path/to/library-files --dry-run
+xearthlayer-publish library import v2 --from /path/to/library-files
+xearthlayer-publish library use v2
+```
 
 ## File Formats
 

@@ -161,10 +161,20 @@ fn test_init_creates_repository_structure() {
 
     // Verify directory structure
     assert!(
-        repo_path.join("packages").exists(),
+        repo_path.join("v1").join("packages").exists(),
         "packages/ should exist"
     );
-    assert!(repo_path.join("dist").exists(), "dist/ should exist");
+    assert!(
+        repo_path.join("v1").join("dist").exists(),
+        "v1/dist/ should exist"
+    );
+    assert!(
+        repo_path
+            .join("v1")
+            .join("xearthlayer_package_library.txt")
+            .exists(),
+        "the first generation's library should exist"
+    );
     assert!(repo_path.join("staging").exists(), "staging/ should exist");
     assert!(
         repo_path.join(".xearthlayer-repo").exists(),
@@ -280,7 +290,7 @@ fn test_full_workflow_init_scan_add() {
     assert_success(&output, "add");
 
     // Verify package was created
-    let package_dir = repo_path.join("packages").join("zzXEL_na_ortho");
+    let package_dir = repo_path.join("v1").join("packages").join("zzXEL_na_ortho");
     assert!(package_dir.exists(), "Package directory should exist");
     assert!(
         package_dir.join("xearthlayer_scenery_package.txt").exists(),
@@ -513,11 +523,19 @@ fn test_multiple_packages_in_same_repository() {
 
     // Verify both packages exist
     assert!(
-        repo_path.join("packages").join("zzXEL_na_ortho").exists(),
+        repo_path
+            .join("v1")
+            .join("packages")
+            .join("zzXEL_na_ortho")
+            .exists(),
         "NA package should exist"
     );
     assert!(
-        repo_path.join("packages").join("zzXEL_eu_ortho").exists(),
+        repo_path
+            .join("v1")
+            .join("packages")
+            .join("zzXEL_eu_ortho")
+            .exists(),
         "EU package should exist"
     );
 
@@ -572,6 +590,7 @@ fn test_version_bump_workflow() {
 
     // Read metadata and verify new version
     let metadata_path = repo_path
+        .join("v1")
         .join("packages")
         .join("zzXEL_na_ortho")
         .join("xearthlayer_scenery_package.txt");

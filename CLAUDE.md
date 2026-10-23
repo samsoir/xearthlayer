@@ -128,6 +128,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 10. **Package Publisher** (`xearthlayer-publisher/`, its own crate behind the `xearthlayer-publish` binary since #284; the runtime does not link it, and the shared format lives in `xearthlayer-package/`)
    - Creates distributable scenery packages from Ortho4XP output (ortho tiles and overlays)
    - Repository management with package versioning
+   - **Library generations** (#333, `generation.rs`, repository format 2.0.0): each scenery world is a folder `v1/`, `v2/`, ... holding its index, `region_metadata.json`, coverage map, `packages/` and `dist/`; the marker records `current <gen>` (header lines only are rewritten, `[config]` is kept) and every path resolves in it, `--library <gen>` for one command. The root index, metadata and coverage of a 1.x repository are FROZEN for pre-0.5 clients: nothing in 2.0.0 writes them, and `Repository::open` refuses 1.x with `UpgradeRequired`. `upgrade --root-as v1` and `library import <gen> --from <dir>` copy library files (root untouched) and move the working folders the index lists; `staging/` stays at the root as a shared work area. The v2 world is promoted this way before beta.1 (#335; runbook)
    - Archive building with configurable part sizes, in process: the `tar.gz` streams straight into `split`-named parts, each hashed as written (#274)
    - Library index management for package discovery
    - `delete` retires a package: library index entry, working directory and built archives. Assets already uploaded to a hosting provider are deliberately never touched, because they must outlive the index entry while users are still installing from them
@@ -423,6 +424,9 @@ xearthlayer-publish coverage [--dark] [--geojson] [-o <file>] [--metadata <path>
 xearthlayer-publish dedupe --region <code> [--priority <mode>] [--tile <lat,lon>] [--dry-run]  # Remove overlapping ZL tiles
 xearthlayer-publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o <file>]  # Analyze coverage gaps
 xearthlayer-publish delete --region <code> [--type <ortho|overlay>] [--dry-run] [--yes]  # Remove a package
+xearthlayer-publish upgrade --root-as v1 [--dry-run]       # Format 1.x to library generations (root library frozen)
+xearthlayer-publish library list|new <gen>|use <gen>|import <gen> --from <dir>  # Library generations (#333)
+xearthlayer-publish --library <gen> <command>              # Any command in another generation
 ```
 
 ## Key Files

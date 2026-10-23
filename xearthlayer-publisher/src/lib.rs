@@ -47,6 +47,7 @@ pub mod dedupe;
 mod deletion;
 mod dsf_compress;
 mod error;
+pub mod generation;
 mod library;
 mod metadata;
 mod processor;
@@ -86,6 +87,6 @@ pub use release::{
     build_package, configure_urls, get_release_status, release_package, validate_repository,
     BuildResult, ReleaseResult, ReleaseStatus, UrlConfigResult,
 };
-pub use repository::{Repository, REGION_METADATA_FILE};
+pub use repository::{is_generation_name, Repository, FIRST_GENERATION, REGION_METADATA_FILE};
 pub use size::{directory_size, format_size};
 pub use urls::{generate_part_urls, validate_url, UrlVerification, UrlVerifier};

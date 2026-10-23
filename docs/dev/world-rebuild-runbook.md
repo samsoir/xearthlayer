@@ -1,9 +1,10 @@
 # World Rebuild Runbook
 
 This runbook covers the campaign to rebuild the entire XEarthLayer regional
-scenery library: retiring every package published so far and replacing it with
-thirteen new ones, published through a staging channel and promoted to stable
-one region at a time.
+scenery library: a new world of regional packages, published through a staging
+channel and promoted to stable as library generation `v2`, while the packages
+published so far stay available, frozen, as generation `v1` for the clients
+that cannot read anything else.
 
 It is the campaign, not the mechanics. The per region publishing procedure
 lives in [Publishing Packages via GitHub Releases](github-releases-publishing.md)
@@ -97,11 +98,12 @@ produces a package with no water boundaries.
    for local verification in step 6), upload metadata, and `publish release`
    for both types. This is the procedure in
    [Publishing Packages via GitHub Releases](github-releases-publishing.md).
-8. Commit the library index and `region_metadata.json` on the `staging` branch
-   and push.
+8. Commit the generation's library index and `region_metadata.json` (under
+   `v2/` once the repository is upgraded) on the `staging` branch and push.
 9. Test the staging channel end to end as a user would.
 10. Open the promotion pull request from `staging` to `main`.
-11. After it merges, retire the region it supersedes with `publish delete`.
+11. Leave the region it supersedes alone: it belongs to the frozen v1 world (see
+    below).
 
 ## Preconditions That Are Easy To Get Wrong
 
@@ -134,7 +136,8 @@ way to explain.
 **Put the merged source in `<repo>/staging/`,** not on a scratch volume
 elsewhere. See above.
 
-**Retire the old region after promotion, not before.** Covered below.
+**Do not retire the old regions.** The old world stays published, frozen, for
+pre-0.5 clients. Covered below.
 
 ## Local Verification Before Publishing
 
@@ -186,39 +189,56 @@ gains `status: "deprecated"` and a matching `replaced_by`. The new region's
 
 ## Promotion and Retirement
 
-Promotion is a pull request from `staging` to `main`. Merging it is what
-releases the region to everyone, because the push to `main` is what triggers
-the website sync.
+The rebuilt world is a new **library generation**, `v2`, beside the old one,
+`v1` (#333). Pre-0.5 clients read the library at the repository root, and they
+cannot be told to read anything else, so that file must keep describing the old
+world they can install: replacing it with the rebuild would hand them night-lit
+scenery that warns about missing resources in X-Plane at best. The root library
+is therefore frozen, and nothing supersedes or retires the old world in it.
 
-**Retire the superseded region only after that pull request has merged.** Users
-on the stable channel are installing from the old package right up to the
-moment the new index reaches them. Delete it first and the stable library
-offers nothing at all for that part of the world until the promotion lands: a
-user who runs `packages check` in that window sees the old region disappear
-with no replacement. Deleting afterwards means the two overlap instead, which
-costs nothing.
+### Promoting v2
 
-```bash
-# Look first: this deletes nothing
-xearthlayer-publish delete --region na --dry-run
-
-# Then retire it, both package types
-xearthlayer-publish delete --region na
-```
-
-This reclaims local disk in the working repository, which is a real motivation
-at this scale: the old world occupies 895 GB there. It removes the library
-index entry, the package working directory and the built archives. The index
-edit is local, like any other, so commit and push it on `main` afterwards.
-
-It does **not** remove the GitHub release assets, deliberately. Those URLs are
-what an install already in progress is still fetching from, and they cost
-nothing to leave in place. Take the old releases down as a separate, manual
-step once you are satisfied nothing is installing from them:
+This happens once, before beta.1 (#335). On a clean checkout of `main`, with
+the generation-aware `xearthlayer-publish`:
 
 ```bash
-gh release delete na-v0.4.0 --repo samsoir/xearthlayer-regional-scenery
+# main's root library is the old world: copy it into v1/, leave the root as it is
+xearthlayer-publish upgrade --root-as v1 --dry-run
+xearthlayer-publish upgrade --root-as v1
+
+# the staging branch's root library is the rebuild: bring it in as v2
+mkdir -p /tmp/v2-library
+for f in xearthlayer_package_library.txt region_metadata.json coverage.png coverage.geojson; do
+    git show staging:$f > /tmp/v2-library/$f
+done
+xearthlayer-publish library import v2 --from /tmp/v2-library --dry-run
+xearthlayer-publish library import v2 --from /tmp/v2-library
+xearthlayer-publish library use v2
 ```
+
+Commit the marker, `v1/` and `v2/` (the root files show no change) and push to
+`main`. Then mark the v2 GitHub releases as no longer pre-release, and one of
+them Latest. The upgrade moves the working folders each library lists into its
+generation, which is a rename on the same disk; anything it does not recognise
+stays under the root `packages/` and is reported.
+
+The `staging` branch stays the staging channel, in the same layout: bring it
+level with `main` after the promotion, and later additions to v2, or a v3,
+are staged there under their generation's folder.
+
+### The old world
+
+**Do not `publish delete` an old region.** In format 2.0.0 the command works in
+a generation, never the root, so `--library v1 delete` would only change `v1/`;
+but there is nothing to gain from it until 0.4.x support ends, and the old
+releases' assets must stay for the root library to keep working. Ending 0.4.x
+support is a separate decision. The old world's working folders are under `v1/`
+after the upgrade (895 GB on the publishing machine); delete them locally when
+disk is needed, since the published releases do not depend on them.
+
+**Never publish with a `xearthlayer-publish` from before generations once the
+repository is upgraded.** An older tool does not know the root is frozen and
+writes the root library on its next release.
 
 ## Related Documentation
 

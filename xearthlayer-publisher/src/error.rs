@@ -19,6 +19,29 @@ pub enum PublishError {
     /// Repository marker file is invalid or corrupted.
     InvalidRepository(String),
 
+    /// The repository uses format 1.x, from before library generations
+    /// (#333), and must be upgraded before anything else touches it.
+    UpgradeRequired(PathBuf),
+
+    /// The repository is already in the current format.
+    AlreadyUpgraded(PathBuf),
+
+    /// The repository was written by a newer publisher.
+    UnsupportedRepositoryVersion(semver::Version),
+
+    /// A library generation name that is not `v<N>`.
+    InvalidGeneration(String),
+
+    /// No library generation of that name in the repository.
+    GenerationNotFound(String),
+
+    /// A library generation of that name already exists.
+    GenerationExists(String),
+
+    /// Upgrading or importing would move a working folder onto one that
+    /// already exists.
+    MoveTargetExists(PathBuf),
+
     /// Failed to create directory.
     CreateDirectoryFailed { path: PathBuf, source: io::Error },
 
@@ -99,6 +122,37 @@ impl fmt::Display for PublishError {
             PublishError::InvalidRepository(msg) => {
                 write!(f, "invalid repository: {}", msg)
             }
+            PublishError::UpgradeRequired(path) => write!(
+                f,
+                "the repository at {} predates library generations; run \
+                 'xearthlayer-publish upgrade --root-as v1' first",
+                path.display()
+            ),
+            PublishError::AlreadyUpgraded(path) => write!(
+                f,
+                "the repository at {} already uses library generations",
+                path.display()
+            ),
+            PublishError::UnsupportedRepositoryVersion(version) => write!(
+                f,
+                "repository format {version} is newer than this publisher understands; \
+                 update xearthlayer-publish"
+            ),
+            PublishError::InvalidGeneration(name) => write!(
+                f,
+                "'{name}' is not a library generation name (expected v1, v2, ...)"
+            ),
+            PublishError::GenerationNotFound(name) => {
+                write!(f, "no library generation '{name}' in this repository")
+            }
+            PublishError::GenerationExists(name) => {
+                write!(f, "library generation '{name}' already exists")
+            }
+            PublishError::MoveTargetExists(path) => write!(
+                f,
+                "{} already exists; move or remove it, then run the command again",
+                path.display()
+            ),
             PublishError::CreateDirectoryFailed { path, source } => {
                 write!(
                     f,

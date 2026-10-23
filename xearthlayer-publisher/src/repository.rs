@@ -1,8 +1,17 @@
 //! Repository management for the package publisher.
 //!
 //! A repository is a local directory structure containing packages being prepared
-//! for distribution. It includes the library index, package working directories,
-//! and built archives.
+//! for distribution. Since format 2.0.0 (#333) it holds one or more library
+//! generations, each a complete scenery world in its own folder (`v1/`, `v2/`,
+//! ...): its library index, region metadata, coverage map, package working
+//! directories and built archives. The repository records which generation is
+//! current, and every path below resolves inside it.
+//!
+//! A published library URL must never change meaning: clients that read the
+//! old world must not be handed a new one. So the files a 1.x repository kept
+//! at its root (the index, region metadata and coverage map) stay there,
+//! frozen, for clients that predate generations, and no 2.0.0 operation writes
+//! them. [`crate::generation::upgrade`] copies them into a generation.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,33 +29,143 @@ const REPO_MARKER: &str = ".xearthlayer-repo";
 const REPO_HEADER: &str = "XEARTHLAYER PACKAGE REPOSITORY";
 
 /// Current repository format version.
-const REPO_VERSION: &str = "1.0.0";
+pub(crate) const REPO_VERSION: &str = "2.0.0";
 
-/// Subdirectory for package working directories.
+/// The marker line naming the current generation: `current v2`.
+const CURRENT_PREFIX: &str = "current ";
+
+/// The generation a new repository starts with.
+pub const FIRST_GENERATION: &str = "v1";
+
+/// Subdirectory for package working directories, inside a generation.
 const PACKAGES_DIR: &str = "packages";
 
-/// Subdirectory for built archives.
+/// Subdirectory for built archives, inside a generation.
 const DIST_DIR: &str = "dist";
 
-/// Subdirectory for work in progress.
+/// Work area at the repository root, shared by every generation: where
+/// Ortho4XP output is gathered before `publish add` (see the world rebuild
+/// runbook). No command reads or writes inside it.
 const STAGING_DIR: &str = "staging";
 
 /// Library index filename.
-const LIBRARY_FILE: &str = "xearthlayer_package_library.txt";
+pub(crate) const LIBRARY_FILE: &str = "xearthlayer_package_library.txt";
 
 /// Region colour metadata consumed by `publish coverage` and the website legend.
 pub const REGION_METADATA_FILE: &str = "region_metadata.json";
 
-/// Stub written by `init`. The empty `regions` map is intentional — coverage
-/// map generation succeeds and renders everything grey, which is visibly
-/// incomplete, rather than failing on a fresh repository.
+/// Stub written for a new generation. The empty `regions` map is intentional:
+/// coverage map generation succeeds and renders everything grey, which is
+/// visibly incomplete, rather than failing on a fresh generation.
 const REGION_METADATA_STUB: &str = r#"{
   "_comment": "Region colours for the coverage map and website legend. 'color' accepts a CSS colour name (e.g. crimson) or hex (e.g. #ffaa00).",
   "regions": {}
 }
 "#;
 
-/// A package publisher repository.
+/// Whether `name` is a library generation name: `v` and a number from 1,
+/// without leading zeros (`v1`, `v2`, `v10`).
+pub fn is_generation_name(name: &str) -> bool {
+    let Some(number) = name.strip_prefix('v') else {
+        return false;
+    };
+    !number.is_empty() && !number.starts_with('0') && number.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn check_generation_name(name: &str) -> PublishResult<()> {
+    if is_generation_name(name) {
+        Ok(())
+    } else {
+        Err(PublishError::InvalidGeneration(name.to_string()))
+    }
+}
+
+/// What a repository marker says.
+#[derive(Debug, Clone)]
+pub(crate) struct Marker {
+    pub version: Version,
+    pub created_at: DateTime<Utc>,
+    /// The current generation; `None` before format 2.0.0.
+    pub current: Option<String>,
+}
+
+impl Marker {
+    /// Read the marker of the repository at `root`, whatever its format.
+    pub(crate) fn read(root: &Path) -> PublishResult<Self> {
+        let marker_path = root.join(REPO_MARKER);
+        if !marker_path.exists() {
+            return Err(PublishError::RepositoryNotFound(root.to_path_buf()));
+        }
+        let content = fs::read_to_string(&marker_path).map_err(|e| PublishError::ReadFailed {
+            path: marker_path.clone(),
+            source: e,
+        })?;
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.len() < 3 {
+            return Err(PublishError::InvalidRepository(
+                "marker file has insufficient lines".to_string(),
+            ));
+        }
+        if lines[0].trim() != REPO_HEADER {
+            return Err(PublishError::InvalidRepository(format!(
+                "invalid header: expected '{}', got '{}'",
+                REPO_HEADER,
+                lines[0].trim()
+            )));
+        }
+        let version = Version::parse(lines[1].trim())
+            .map_err(|e| PublishError::InvalidRepository(format!("invalid version: {}", e)))?;
+        let created_at = DateTime::parse_from_rfc3339(lines[2].trim())
+            .map_err(|e| PublishError::InvalidRepository(format!("invalid timestamp: {}", e)))?
+            .with_timezone(&Utc);
+        let current = lines
+            .get(3)
+            .and_then(|line| line.trim().strip_prefix(CURRENT_PREFIX))
+            .map(|g| g.trim().to_string());
+        Ok(Self {
+            version,
+            created_at,
+            current,
+        })
+    }
+
+    /// Write a format 2.0.0 marker naming `current`.
+    ///
+    /// Only the header lines are rewritten. The marker also carries the
+    /// repository's settings in a `[config]` section (see
+    /// [`crate::write_config`]), and everything from the first section on
+    /// is kept as it was.
+    pub(crate) fn write(
+        root: &Path,
+        created_at: DateTime<Utc>,
+        current: &str,
+    ) -> PublishResult<()> {
+        let marker_path = root.join(REPO_MARKER);
+        let existing = fs::read_to_string(&marker_path).unwrap_or_default();
+        let sections = existing
+            .find("\n[")
+            .map(|at| existing[at..].trim_start_matches('\n'))
+            .unwrap_or("");
+        let mut content = format!(
+            "{}\n{}\n{}\n{}{}\n",
+            REPO_HEADER,
+            REPO_VERSION,
+            created_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            CURRENT_PREFIX,
+            current
+        );
+        if !sections.is_empty() {
+            content.push('\n');
+            content.push_str(sections);
+        }
+        fs::write(&marker_path, content).map_err(|e| PublishError::WriteFailed {
+            path: marker_path,
+            source: e,
+        })
+    }
+}
+
+/// A package publisher repository, opened at one library generation.
 ///
 /// Manages the structure and state of a local package repository used to
 /// create and publish XEarthLayer scenery packages.
@@ -60,18 +179,22 @@ pub struct Repository {
 
     /// When the repository was created.
     created_at: DateTime<Utc>,
+
+    /// The library generation every path resolves in.
+    generation: String,
 }
 
 impl Repository {
     /// Initialize a new repository at the given path.
     ///
     /// Creates the repository structure:
-    /// - `.xearthlayer-repo` marker file
-    /// - `packages/` directory for package working directories
-    /// - `dist/` directory for built archives
-    /// - `staging/` directory for work in progress
-    /// - Empty `xearthlayer_package_library.txt`
-    /// - `region_metadata.json` stub with an empty region list
+    /// - `.xearthlayer-repo` marker file, format 2.0.0, current generation `v1`
+    /// - `v1/` with an empty library index, a `region_metadata.json` stub with
+    ///   an empty region list, and `packages/` and `dist/` directories
+    /// - `staging/`, a work area shared by every generation
+    ///
+    /// A new repository has no root index: the frozen root files exist only
+    /// in repositories that predate generations.
     ///
     /// # Errors
     ///
@@ -82,13 +205,9 @@ impl Repository {
     pub fn init(path: impl AsRef<Path>) -> PublishResult<Self> {
         let root = path.as_ref().to_path_buf();
 
-        // Check if repository already exists
-        let marker_path = root.join(REPO_MARKER);
-        if marker_path.exists() {
+        if Self::exists(&root) {
             return Err(PublishError::RepositoryExists(root));
         }
-
-        // Create root directory if it doesn't exist
         if !root.exists() {
             fs::create_dir_all(&root).map_err(|e| PublishError::CreateDirectoryFailed {
                 path: root.clone(),
@@ -96,104 +215,62 @@ impl Repository {
             })?;
         }
 
-        // Create subdirectories
-        for dir in [PACKAGES_DIR, DIST_DIR, STAGING_DIR] {
-            let dir_path = root.join(dir);
-            fs::create_dir_all(&dir_path).map_err(|e| PublishError::CreateDirectoryFailed {
-                path: dir_path,
-                source: e,
-            })?;
-        }
-
+        let staging = root.join(STAGING_DIR);
+        fs::create_dir_all(&staging).map_err(|e| PublishError::CreateDirectoryFailed {
+            path: staging,
+            source: e,
+        })?;
         let now = Utc::now();
-        let version = Version::parse(REPO_VERSION).expect("valid version constant");
-
-        // Write repository marker
-        let marker_content = format!(
-            "{}\n{}\n{}\n",
-            REPO_HEADER,
-            REPO_VERSION,
-            now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        );
-        fs::write(&marker_path, marker_content).map_err(|e| PublishError::WriteFailed {
-            path: marker_path,
-            source: e,
-        })?;
-
-        // Write empty library index
-        let library_path = root.join(LIBRARY_FILE);
-        let library_content = Self::empty_library_content(&now);
-        fs::write(&library_path, library_content).map_err(|e| PublishError::WriteFailed {
-            path: library_path,
-            source: e,
-        })?;
-
-        // Write region metadata stub
-        let region_metadata_path = root.join(REGION_METADATA_FILE);
-        fs::write(&region_metadata_path, REGION_METADATA_STUB).map_err(|e| {
-            PublishError::WriteFailed {
-                path: region_metadata_path,
-                source: e,
-            }
-        })?;
+        create_generation_files(&root.join(FIRST_GENERATION), &now)?;
+        Marker::write(&root, now, FIRST_GENERATION)?;
 
         Ok(Self {
             root,
-            version,
+            version: Version::parse(REPO_VERSION).expect("valid version constant"),
             created_at: now,
+            generation: FIRST_GENERATION.to_string(),
         })
     }
 
-    /// Open an existing repository at the given path.
+    /// Open an existing repository at its current generation.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - No repository exists at the path
     /// - The repository marker is invalid
+    /// - The repository predates generations ([`PublishError::UpgradeRequired`])
+    /// - The repository is newer than this publisher
+    /// - The current generation's folder is missing
     pub fn open(path: impl AsRef<Path>) -> PublishResult<Self> {
         let root = path.as_ref().to_path_buf();
-        let marker_path = root.join(REPO_MARKER);
-
-        if !marker_path.exists() {
-            return Err(PublishError::RepositoryNotFound(root));
+        let marker = Marker::read(&root)?;
+        match marker.version.major {
+            0 | 1 => return Err(PublishError::UpgradeRequired(root)),
+            2 => {}
+            _ => return Err(PublishError::UnsupportedRepositoryVersion(marker.version)),
         }
-
-        let content = fs::read_to_string(&marker_path).map_err(|e| PublishError::ReadFailed {
-            path: marker_path.clone(),
-            source: e,
+        let generation = marker.current.ok_or_else(|| {
+            PublishError::InvalidRepository("marker names no current generation".to_string())
         })?;
-
-        let lines: Vec<&str> = content.lines().collect();
-        if lines.len() < 3 {
-            return Err(PublishError::InvalidRepository(
-                "marker file has insufficient lines".to_string(),
-            ));
-        }
-
-        // Validate header
-        if lines[0].trim() != REPO_HEADER {
-            return Err(PublishError::InvalidRepository(format!(
-                "invalid header: expected '{}', got '{}'",
-                REPO_HEADER,
-                lines[0].trim()
-            )));
-        }
-
-        // Parse version
-        let version = Version::parse(lines[1].trim())
-            .map_err(|e| PublishError::InvalidRepository(format!("invalid version: {}", e)))?;
-
-        // Parse creation timestamp
-        let created_at = DateTime::parse_from_rfc3339(lines[2].trim())
-            .map_err(|e| PublishError::InvalidRepository(format!("invalid timestamp: {}", e)))?
-            .with_timezone(&Utc);
-
-        Ok(Self {
+        let repo = Self {
             root,
-            version,
-            created_at,
-        })
+            version: marker.version,
+            created_at: marker.created_at,
+            generation: String::new(),
+        };
+        repo.at_generation(&generation)
+    }
+
+    /// The same repository at another generation, for one command's
+    /// `--library`. The recorded current generation is unchanged.
+    pub fn at_generation(mut self, generation: &str) -> PublishResult<Self> {
+        check_generation_name(generation)?;
+        if !self.root.join(generation).join(LIBRARY_FILE).is_file() {
+            return Err(PublishError::GenerationNotFound(generation.to_string()));
+        }
+        self.generation = generation.to_string();
+        Ok(self)
     }
 
     /// Check if a repository exists at the given path.
@@ -216,29 +293,85 @@ impl Repository {
         self.created_at
     }
 
-    /// Get the path to the packages directory.
-    pub fn packages_dir(&self) -> PathBuf {
-        self.root.join(PACKAGES_DIR)
+    /// The library generation this repository was opened at.
+    pub fn generation(&self) -> &str {
+        &self.generation
     }
 
-    /// Get the path to the dist directory.
-    pub fn dist_dir(&self) -> PathBuf {
-        self.root.join(DIST_DIR)
+    /// The folder of the generation in use: its library index, region
+    /// metadata, coverage map, packages and archives.
+    pub fn library_root(&self) -> PathBuf {
+        self.root.join(&self.generation)
     }
 
-    /// Get the path to the staging directory.
+    /// Every library generation in the repository, oldest first.
+    pub fn generations(&self) -> PublishResult<Vec<String>> {
+        let entries = fs::read_dir(&self.root).map_err(|e| PublishError::ReadFailed {
+            path: self.root.clone(),
+            source: e,
+        })?;
+        let mut found: Vec<(u64, String)> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| is_generation_name(name))
+            .filter(|name| self.root.join(name).join(LIBRARY_FILE).is_file())
+            .filter_map(|name| name[1..].parse().ok().map(|n| (n, name)))
+            .collect();
+        found.sort();
+        Ok(found.into_iter().map(|(_, name)| name).collect())
+    }
+
+    /// The generation the repository records as current.
+    pub fn current_generation(&self) -> PublishResult<String> {
+        Marker::read(&self.root)?.current.ok_or_else(|| {
+            PublishError::InvalidRepository("marker names no current generation".to_string())
+        })
+    }
+
+    /// Record `generation` as the current one.
+    pub fn use_generation(&self, generation: &str) -> PublishResult<()> {
+        check_generation_name(generation)?;
+        if !self.root.join(generation).join(LIBRARY_FILE).is_file() {
+            return Err(PublishError::GenerationNotFound(generation.to_string()));
+        }
+        Marker::write(&self.root, self.created_at, generation)
+    }
+
+    /// Create an empty generation: a library index with no packages, a
+    /// region metadata stub, and `packages/` and `dist/`. Does not make it
+    /// current.
+    pub fn create_generation(&self, generation: &str) -> PublishResult<()> {
+        check_generation_name(generation)?;
+        let dir = self.root.join(generation);
+        if dir.exists() {
+            return Err(PublishError::GenerationExists(generation.to_string()));
+        }
+        create_generation_files(&dir, &Utc::now())
+    }
+
+    /// The shared work area at the repository root.
     pub fn staging_dir(&self) -> PathBuf {
         self.root.join(STAGING_DIR)
     }
 
+    /// Get the path to the packages directory.
+    pub fn packages_dir(&self) -> PathBuf {
+        self.library_root().join(PACKAGES_DIR)
+    }
+
+    /// Get the path to the dist directory.
+    pub fn dist_dir(&self) -> PathBuf {
+        self.library_root().join(DIST_DIR)
+    }
+
     /// Get the path to the library index file.
     pub fn library_path(&self) -> PathBuf {
-        self.root.join(LIBRARY_FILE)
+        self.library_root().join(LIBRARY_FILE)
     }
 
     /// Get the path to the region metadata file.
     pub fn region_metadata_path(&self) -> PathBuf {
-        self.root.join(REGION_METADATA_FILE)
+        self.library_root().join(REGION_METADATA_FILE)
     }
 
     /// Get the path for a package directory.
@@ -257,7 +390,7 @@ impl Repository {
         self.package_dir(region, package_type).exists()
     }
 
-    /// List all packages in the repository.
+    /// List all packages in the generation.
     ///
     /// Returns a list of (region, package_type) tuples.
     pub fn list_packages(&self) -> PublishResult<Vec<(String, PackageType)>> {
@@ -310,7 +443,6 @@ impl Repository {
 
         // Find the last underscore to separate region from suffix
         let last_underscore = after_xel.rfind('_')?;
-
         let region = &after_xel[..last_underscore];
         let suffix = &after_xel[last_underscore + 1..];
 
@@ -323,19 +455,45 @@ impl Repository {
 
         Some((region.to_string(), package_type))
     }
+}
 
-    /// Generate empty library index content.
-    fn empty_library_content(timestamp: &DateTime<Utc>) -> String {
-        format!(
-            "XEARTHLAYER REGIONAL SCENERY PACKAGE LIBRARY\n\
-             1.0.0\n\
-             EARTH\n\
-             0\n\
-             {}\n\
-             0\n",
-            timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        )
+/// Generate empty library index content.
+pub(crate) fn empty_library_content(timestamp: &DateTime<Utc>) -> String {
+    format!(
+        "XEARTHLAYER REGIONAL SCENERY PACKAGE LIBRARY\n\
+         1.0.0\n\
+         EARTH\n\
+         0\n\
+         {}\n\
+         0\n",
+        timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    )
+}
+
+/// The working directories of a generation, created by every way a
+/// generation comes to exist.
+pub(crate) fn create_working_dirs(generation_dir: &Path) -> PublishResult<()> {
+    for dir in [PACKAGES_DIR, DIST_DIR] {
+        let dir_path = generation_dir.join(dir);
+        fs::create_dir_all(&dir_path).map_err(|e| PublishError::CreateDirectoryFailed {
+            path: dir_path,
+            source: e,
+        })?;
     }
+    Ok(())
+}
+
+/// A generation folder with an empty index and a region metadata stub.
+fn create_generation_files(dir: &Path, now: &DateTime<Utc>) -> PublishResult<()> {
+    create_working_dirs(dir)?;
+    for (name, content) in [
+        (LIBRARY_FILE, empty_library_content(now)),
+        (REGION_METADATA_FILE, REGION_METADATA_STUB.to_string()),
+    ] {
+        let path = dir.join(name);
+        fs::write(&path, content).map_err(|e| PublishError::WriteFailed { path, source: e })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -349,28 +507,51 @@ mod tests {
         (temp, repo)
     }
 
+    /// A format 1.0.0 repository, as every repository was before #333.
+    pub(crate) fn legacy_repo(root: &Path) {
+        fs::create_dir_all(root.join(PACKAGES_DIR)).unwrap();
+        fs::create_dir_all(root.join(DIST_DIR)).unwrap();
+        fs::write(
+            root.join(REPO_MARKER),
+            format!("{REPO_HEADER}\n1.0.0\n2025-01-01T00:00:00Z\n"),
+        )
+        .unwrap();
+        fs::write(root.join(LIBRARY_FILE), empty_library_content(&Utc::now())).unwrap();
+        fs::write(root.join(REGION_METADATA_FILE), REGION_METADATA_STUB).unwrap();
+    }
+
     #[test]
-    fn test_init_creates_marker() {
+    fn generation_names_are_v_and_a_number() {
+        for good in ["v1", "v2", "v10"] {
+            assert!(is_generation_name(good), "{good}");
+        }
+        for bad in ["", "v", "v0", "v01", "1", "V1", "v1a", "v-1", "../v1"] {
+            assert!(!is_generation_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn init_creates_the_first_generation_and_no_root_index() {
         let temp = TempDir::new().unwrap();
-        Repository::init(temp.path()).unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+
         assert!(temp.path().join(REPO_MARKER).exists());
-    }
-
-    #[test]
-    fn test_init_creates_directories() {
-        let temp = TempDir::new().unwrap();
-        Repository::init(temp.path()).unwrap();
-
-        assert!(temp.path().join(PACKAGES_DIR).exists());
-        assert!(temp.path().join(DIST_DIR).exists());
-        assert!(temp.path().join(STAGING_DIR).exists());
-    }
-
-    #[test]
-    fn test_init_creates_library() {
-        let temp = TempDir::new().unwrap();
-        Repository::init(temp.path()).unwrap();
-        assert!(temp.path().join(LIBRARY_FILE).exists());
+        assert_eq!(repo.generation(), FIRST_GENERATION);
+        let v1 = temp.path().join(FIRST_GENERATION);
+        for path in [
+            v1.join(LIBRARY_FILE),
+            v1.join(REGION_METADATA_FILE),
+            v1.join(PACKAGES_DIR),
+            v1.join(DIST_DIR),
+        ] {
+            assert!(path.exists(), "{}", path.display());
+        }
+        assert!(!temp.path().join(LIBRARY_FILE).exists());
+        assert!(!temp.path().join(REGION_METADATA_FILE).exists());
+        assert!(
+            temp.path().join(STAGING_DIR).is_dir(),
+            "the shared work area stays at the root"
+        );
     }
 
     #[test]
@@ -398,6 +579,7 @@ mod tests {
 
         assert_eq!(repo.root(), temp.path());
         assert_eq!(repo.version().to_string(), REPO_VERSION);
+        assert_eq!(repo.generation(), FIRST_GENERATION);
     }
 
     #[test]
@@ -405,6 +587,33 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let result = Repository::open(temp.path());
         assert!(matches!(result, Err(PublishError::RepositoryNotFound(_))));
+    }
+
+    #[test]
+    fn a_repository_from_before_generations_must_be_upgraded_first() {
+        // #333: an old repository's root index is what pre-0.5 clients read.
+        // Opening it as if nothing changed would let a release rewrite it.
+        let temp = TempDir::new().unwrap();
+        legacy_repo(temp.path());
+
+        let err = Repository::open(temp.path()).unwrap_err();
+        assert!(matches!(err, PublishError::UpgradeRequired(_)), "{err}");
+        assert!(err.to_string().contains("upgrade --root-as v1"), "{err}");
+    }
+
+    #[test]
+    fn a_repository_from_a_newer_publisher_is_refused() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join(REPO_MARKER),
+            format!("{REPO_HEADER}\n3.0.0\n2025-01-01T00:00:00Z\ncurrent v1\n"),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Repository::open(temp.path()),
+            Err(PublishError::UnsupportedRepositoryVersion(_))
+        ));
     }
 
     #[test]
@@ -417,38 +626,80 @@ mod tests {
     }
 
     #[test]
-    fn test_packages_dir() {
+    fn every_path_resolves_inside_the_generation() {
         let (temp, repo) = temp_repo();
-        assert_eq!(repo.packages_dir(), temp.path().join(PACKAGES_DIR));
+        let v1 = temp.path().join(FIRST_GENERATION);
+
+        assert_eq!(repo.library_root(), v1);
+        assert_eq!(repo.packages_dir(), v1.join(PACKAGES_DIR));
+        assert_eq!(repo.dist_dir(), v1.join(DIST_DIR));
+        assert_eq!(repo.library_path(), v1.join(LIBRARY_FILE));
+        assert_eq!(repo.region_metadata_path(), v1.join(REGION_METADATA_FILE));
+        assert!(repo
+            .package_dir("na", PackageType::Ortho)
+            .starts_with(v1.join(PACKAGES_DIR)));
     }
 
     #[test]
-    fn test_dist_dir() {
+    fn generations_are_created_listed_switched_and_overridden() {
         let (temp, repo) = temp_repo();
-        assert_eq!(repo.dist_dir(), temp.path().join(DIST_DIR));
-    }
+        repo.create_generation("v2").unwrap();
+        repo.create_generation("v10").unwrap();
+        // A folder without an index is not a generation.
+        fs::create_dir_all(temp.path().join("v3")).unwrap();
 
-    #[test]
-    fn test_staging_dir() {
-        let (temp, repo) = temp_repo();
-        assert_eq!(repo.staging_dir(), temp.path().join(STAGING_DIR));
-    }
-
-    #[test]
-    fn test_library_path() {
-        let (temp, repo) = temp_repo();
-        assert_eq!(repo.library_path(), temp.path().join(LIBRARY_FILE));
-    }
-
-    #[test]
-    fn region_metadata_path_sits_at_the_repository_root() {
-        let temp = TempDir::new().unwrap();
-        let repo = Repository::init(temp.path()).unwrap();
-
+        assert_eq!(repo.generations().unwrap(), ["v1", "v2", "v10"]);
         assert_eq!(
-            repo.region_metadata_path(),
-            temp.path().join("region_metadata.json")
+            repo.current_generation().unwrap(),
+            "v1",
+            "creating does not switch"
         );
+
+        repo.use_generation("v2").unwrap();
+        let reopened = Repository::open(temp.path()).unwrap();
+        assert_eq!(reopened.generation(), "v2");
+        assert_eq!(reopened.library_root(), temp.path().join("v2"));
+
+        // --library: one command at another generation, the record unchanged.
+        let at_v1 = reopened.at_generation("v1").unwrap();
+        assert_eq!(at_v1.library_root(), temp.path().join("v1"));
+        assert_eq!(Repository::open(temp.path()).unwrap().generation(), "v2");
+    }
+
+    #[test]
+    fn switching_generation_keeps_the_repository_settings() {
+        // The marker also carries [config]; rewriting it must not drop it.
+        let (temp, repo) = temp_repo();
+        let config = crate::RepoConfig::new(64 * 1024 * 1024).unwrap();
+        crate::write_config(temp.path(), &config).unwrap();
+        repo.create_generation("v2").unwrap();
+
+        repo.use_generation("v2").unwrap();
+
+        assert_eq!(crate::read_config(temp.path()).unwrap(), config);
+        assert_eq!(Repository::open(temp.path()).unwrap().generation(), "v2");
+    }
+
+    #[test]
+    fn unknown_or_malformed_generations_are_refused() {
+        let (_temp, repo) = temp_repo();
+
+        assert!(matches!(
+            repo.clone().at_generation("v7"),
+            Err(PublishError::GenerationNotFound(_))
+        ));
+        assert!(matches!(
+            repo.use_generation("v7"),
+            Err(PublishError::GenerationNotFound(_))
+        ));
+        assert!(matches!(
+            repo.create_generation("../v2"),
+            Err(PublishError::InvalidGeneration(_))
+        ));
+        assert!(matches!(
+            repo.create_generation("v1"),
+            Err(PublishError::GenerationExists(_))
+        ));
     }
 
     #[test]
@@ -567,14 +818,14 @@ mod tests {
         assert_eq!(lines[1], REPO_VERSION);
         // Line 3 is the timestamp, just verify it parses
         assert!(DateTime::parse_from_rfc3339(lines[2]).is_ok());
+        assert_eq!(lines[3], "current v1");
     }
 
     #[test]
     fn test_library_content_format() {
-        let temp = TempDir::new().unwrap();
-        Repository::init(temp.path()).unwrap();
+        let (_temp, repo) = temp_repo();
 
-        let content = fs::read_to_string(temp.path().join(LIBRARY_FILE)).unwrap();
+        let content = fs::read_to_string(repo.library_path()).unwrap();
         let lines: Vec<&str> = content.lines().collect();
 
         assert_eq!(lines[0], "XEARTHLAYER REGIONAL SCENERY PACKAGE LIBRARY");
@@ -599,24 +850,14 @@ mod tests {
         assert!(debug.contains("Repository"));
     }
 
-    #[test]
-    fn init_creates_region_metadata_stub() {
-        let temp = TempDir::new().unwrap();
-        let repo = Repository::init(temp.path()).unwrap();
-
-        let path = repo.root().join("region_metadata.json");
-        assert!(path.exists(), "init should create region_metadata.json");
-    }
-
     // The stub must be loadable by the coverage map, not merely present.
     // An empty regions map is intentional: `publish coverage` then succeeds
     // and renders every region grey, which is obviously incomplete.
     #[test]
     fn init_stub_parses_as_region_metadata_with_no_regions() {
-        let temp = TempDir::new().unwrap();
-        let repo = Repository::init(temp.path()).unwrap();
+        let (_temp, repo) = temp_repo();
 
-        let metadata = crate::RegionMetadata::load(&repo.root().join("region_metadata.json"))
+        let metadata = crate::RegionMetadata::load(&repo.region_metadata_path())
             .expect("stub must parse as RegionMetadata");
         assert!(metadata.regions.is_empty());
     }

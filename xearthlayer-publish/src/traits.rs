@@ -12,6 +12,7 @@ use semver::Version;
 use crate::error::CliError;
 use xearthlayer_package::{PackageMetadata, PackageType};
 use xearthlayer_publisher::dedupe::{DedupeFilter, GapAnalysisResult, TileReference, ZoomPriority};
+use xearthlayer_publisher::generation::GenerationReport;
 use xearthlayer_publisher::{
     BuildResult, DeletionPlan, ProcessSummary, RegionSuggestion, ReleaseResult, ReleaseStatus,
     RepoConfig, SceneryScanResult, UrlConfigResult, VersionBump,
@@ -123,6 +124,13 @@ pub trait RepositoryOperations: Send + Sync {
 
     /// List all packages in the repository.
     fn list_packages(&self) -> Result<Vec<(String, PackageType)>, CliError>;
+
+    /// The library generation this repository was opened at (#333).
+    fn generation(&self) -> &str;
+
+    /// The folder of that generation: its library index, region metadata,
+    /// coverage map, packages and archives.
+    fn library_root(&self) -> std::path::PathBuf;
 }
 
 // ============================================================================
@@ -139,6 +147,33 @@ pub trait PublisherService: Send + Sync {
 
     /// Open an existing repository.
     fn open_repository(&self, path: &Path) -> Result<Box<dyn RepositoryOperations>, CliError>;
+
+    /// Upgrade a repository from before library generations, its root
+    /// library becoming `root_as`. The root library files stay.
+    fn upgrade_repository(
+        &self,
+        path: &Path,
+        root_as: &str,
+        dry_run: bool,
+    ) -> Result<GenerationReport, CliError>;
+
+    /// The repository's generations, oldest first, and the current one.
+    fn list_generations(&self, path: &Path) -> Result<(Vec<String>, String), CliError>;
+
+    /// Create an empty generation.
+    fn create_generation(&self, path: &Path, generation: &str) -> Result<(), CliError>;
+
+    /// Make a generation current.
+    fn use_generation(&self, path: &Path, generation: &str) -> Result<(), CliError>;
+
+    /// Create a generation from the library files in `from`.
+    fn import_generation(
+        &self,
+        path: &Path,
+        generation: &str,
+        from: &Path,
+        dry_run: bool,
+    ) -> Result<GenerationReport, CliError>;
 
     /// Read repository configuration.
     fn read_config(&self, repo_root: &Path) -> Result<RepoConfig, CliError>;

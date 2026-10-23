@@ -8,8 +8,8 @@ use semver::Version;
 
 use super::args::{
     AddArgs, BuildArgs, CoverageArgs, DedupeArgs, DeleteArgs, GapReportFormatArg, GapsArgs,
-    InitArgs, ListArgs, ReleaseArgs, ReportFormatArg, ScanArgs, StatusArgs, UrlsArgs, ValidateArgs,
-    VersionArgs,
+    InitArgs, LibraryCommands, ListArgs, ReleaseArgs, ReportFormatArg, ScanArgs, StatusArgs,
+    UpgradeArgs, UrlsArgs, ValidateArgs, VersionArgs,
 };
 use super::output::{
     format_size_display, format_status, print_dedupe_result, print_gap_result,
@@ -57,12 +57,15 @@ impl CommandHandler for InitHandler {
         ctx.output.indented(&repo.root().display().to_string());
         ctx.output.newline();
         ctx.output.println("Repository structure:");
+        ctx.output.indented(
+            "v1/           - Library generation v1 (current): its library index and metadata",
+        );
         ctx.output
-            .indented("packages/  - Package working directories");
+            .indented("v1/packages/  - Package working directories");
         ctx.output
-            .indented("dist/      - Built archives for distribution");
+            .indented("v1/dist/      - Built archives for distribution");
         ctx.output
-            .indented("staging/   - Temporary processing area");
+            .indented("staging/      - Work area shared by every generation");
         ctx.output.newline();
         ctx.output.println(&format!(
             "Archive part size: {}",
@@ -752,11 +755,11 @@ impl CommandHandler for CoverageHandler {
 
     fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
         let repo = ctx.publisher.open_repository(&args.repo)?;
-        let packages_dir = repo.root().join("packages");
+        let packages_dir = repo.library_root().join("packages");
         let metadata_path = args
             .metadata
             .clone()
-            .unwrap_or_else(|| repo.root().join("region_metadata.json"));
+            .unwrap_or_else(|| repo.library_root().join("region_metadata.json"));
 
         let format_type = if args.geojson { "GeoJSON" } else { "PNG" };
         ctx.output
@@ -1090,6 +1093,138 @@ impl CommandHandler for DeleteHandler {
         ctx.output
             .println("Note: any GitHub release assets for this package are untouched.");
 
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Library Generation Handlers (#333)
+// ============================================================================
+
+/// Print what an upgrade or import did, or with a dry run would do, with
+/// paths relative to the repository so the lines stay readable.
+fn print_generation_report(
+    report: &xearthlayer_publisher::generation::GenerationReport,
+    repo: &std::path::Path,
+    ctx: &CommandContext<'_>,
+) {
+    let shown = |p: &std::path::Path| p.strip_prefix(repo).unwrap_or(p).display().to_string();
+    let verb = |done: &str, would: &str| {
+        if report.dry_run {
+            would.to_string()
+        } else {
+            done.to_string()
+        }
+    };
+    for (from, to) in &report.copied {
+        ctx.output.println(&format!(
+            "  {} {} -> {}",
+            verb("copied", "would copy"),
+            shown(from),
+            shown(to)
+        ));
+    }
+    for (from, to) in &report.moved {
+        ctx.output.println(&format!(
+            "  {} {} -> {}",
+            verb("moved", "would move"),
+            shown(from),
+            shown(to)
+        ));
+    }
+    if !report.left.is_empty() {
+        ctx.output.newline();
+        ctx.output.println(&format!(
+            "Not listed by {} and left in place ({}):",
+            report.generation,
+            report.left.len()
+        ));
+        for path in &report.left {
+            ctx.output.println(&format!("  {}", shown(path)));
+        }
+    }
+    ctx.output.newline();
+    if report.dry_run {
+        ctx.output.println("Dry run: nothing was changed.");
+    }
+}
+
+/// Handler for the `upgrade` command.
+pub struct UpgradeHandler;
+
+impl CommandHandler for UpgradeHandler {
+    type Args = UpgradeArgs;
+
+    fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
+        let report = ctx
+            .publisher
+            .upgrade_repository(&args.repo, &args.root_as, args.dry_run)?;
+        ctx.output.header(&format!(
+            "Upgrade to library generations: the root library becomes {}",
+            report.generation
+        ));
+        ctx.output.newline();
+        print_generation_report(&report, &args.repo, ctx);
+        if !report.dry_run {
+            ctx.output.println(&format!(
+                "{} is the current generation. The root library files are unchanged and \
+                 no command writes them again.",
+                report.generation
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Handler for the `library` subcommands.
+pub struct LibraryHandler;
+
+impl CommandHandler for LibraryHandler {
+    type Args = LibraryCommands;
+
+    fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
+        match args {
+            LibraryCommands::List { repo } => {
+                let (generations, current) = ctx.publisher.list_generations(&repo)?;
+                ctx.output.header("Library generations");
+                ctx.output.newline();
+                for generation in &generations {
+                    let mark = if *generation == current { "*" } else { " " };
+                    ctx.output.println(&format!("{mark} {generation}"));
+                }
+                ctx.output.newline();
+                ctx.output.println("* current");
+            }
+            LibraryCommands::New { generation, repo } => {
+                ctx.publisher.create_generation(&repo, &generation)?;
+                ctx.output.println(&format!(
+                    "Created {generation}. Make it current with 'xearthlayer-publish library use {generation}'."
+                ));
+            }
+            LibraryCommands::Use { generation, repo } => {
+                ctx.publisher.use_generation(&repo, &generation)?;
+                ctx.output
+                    .println(&format!("{generation} is the current generation."));
+            }
+            LibraryCommands::Import {
+                generation,
+                from,
+                dry_run,
+                repo,
+            } => {
+                let report = ctx
+                    .publisher
+                    .import_generation(&repo, &generation, &from, dry_run)?;
+                ctx.output.header(&format!("Import {generation}"));
+                ctx.output.newline();
+                print_generation_report(&report, &repo, ctx);
+                if !report.dry_run {
+                    ctx.output.println(&format!(
+                        "Created {generation}. Make it current with 'xearthlayer-publish library use {generation}'."
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }

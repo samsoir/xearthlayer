@@ -63,42 +63,73 @@ The Package Publisher creates distributable XEarthLayer Scenery Packages from Or
 
 ## Repository Structure
 
-A Publisher repository is a local directory containing:
+A Publisher repository is a local directory holding one or more **library
+generations** (#333). Each generation is a complete scenery world in its own
+folder: its library index, region metadata, coverage map, package working
+directories and archives. The marker records which generation is current, and
+every command works in it unless `--library <gen>` names another.
 
 ```
 xearthlayer-packages/
-├── .xearthlayer-repo                    # Repository marker file
-├── xearthlayer_package_library.txt      # Library index
-├── packages/                            # Package working directories
-│   ├── zzXEL_na_ortho/
-│   │   ├── xearthlayer_scenery_package.txt
-│   │   ├── Earth nav data/
-│   │   ├── terrain/
-│   │   └── textures/
-│   └── yzXEL_na_overlay/
-│       └── ...
-├── dist/                                # Published archives
-│   └── na/                              # Region subdirectory
-│       └── ortho/                       # Type subdirectory
-│           ├── zzXEL_na-1.0.0.tar.gz.aa
-│           ├── zzXEL_na-1.0.0.tar.gz.ab
-│           └── ...
-└── staging/                             # Work in progress
-    └── ...
+├── .xearthlayer-repo                    # Repository marker (format 2.0.0)
+├── staging/                             # Work area shared by every generation
+├── v1/                                  # Library generation v1
+│   ├── xearthlayer_package_library.txt  # Library index
+│   ├── region_metadata.json
+│   ├── coverage.png, coverage.geojson
+│   ├── packages/                        # Package working directories
+│   │   ├── zzXEL_na_ortho/
+│   │   │   ├── xearthlayer_scenery_package.txt
+│   │   │   ├── Earth nav data/
+│   │   │   ├── terrain/
+│   │   │   └── textures/
+│   │   └── yzXEL_na_overlay/
+│   └── dist/                            # Published archives
+│       └── na/                          # Region subdirectory
+│           └── ortho/                   # Type subdirectory
+│               ├── zzXEL_na-1.0.0.tar.gz.aa
+│               └── ...
+└── v2/                                  # Library generation v2, same shape
 ```
+
+**Why generations.** A published library URL must never change meaning.
+Replacing a library's packages with a rebuilt world hands it to every client
+reading that URL, including releases that cannot use it: pre-0.5 clients reading
+the night-lit rebuild get missing resource warnings in X-Plane at best. So a new
+world is a new generation, published at its own URL. The generation versions
+the library's contents; the index format, `spec_version`, is unchanged. Release
+tags need no generation: each package's version is in its tag, and semver keeps
+generations apart. Working folders live per generation, so a later rebuild can
+reuse a region code, and a patch release to an older world stays possible.
+
+**Repositories from before generations** (format 1.x) kept the library at the
+root. `upgrade --root-as v1` copies the root index, region metadata and coverage
+map into `v1/` and moves in the working folders the index lists. The root files
+stay, frozen: clients from before generations read them, so nothing in format
+2.0.0 writes them. `Repository::open` refuses a 1.x repository with
+`UpgradeRequired`, so no other command can touch one. `library import <gen>
+--from <dir>` adds a generation from library files kept elsewhere, such as another
+branch. Both are in `xearthlayer-publisher/src/generation.rs` and copy before
+they move, plan before they change anything (so `--dry-run` and a real run
+agree), and refuse a move onto an existing folder.
 
 ### Repository Marker
 
-`.xearthlayer-repo` contains repository metadata and optional configuration:
+`.xearthlayer-repo` contains repository metadata, the current generation, and
+optional configuration:
 
 ```
 XEARTHLAYER PACKAGE REPOSITORY
-1.0.0
+2.0.0
 2025-12-20T10:00:00Z
+current v1
 
 [config]
 part_size = 500000000
 ```
+
+Rewriting the marker (`library use`, `upgrade`) replaces the header lines only
+and keeps every section after them.
 
 The `[config]` section is optional and stores repository-wide settings:
 
@@ -122,9 +153,10 @@ xearthlayer-publish init .
 ```
 
 Creates:
-- `.xearthlayer-repo` marker
-- Empty `xearthlayer_package_library.txt`
-- `packages/`, `dist/`, `staging/` directories
+- `.xearthlayer-repo` marker, format 2.0.0, current generation `v1`
+- `v1/` with an empty `xearthlayer_package_library.txt`, a `region_metadata.json`
+  stub, and `packages/` and `dist/` directories
+- `staging/`, the shared work area
 
 ### 2. Process Ortho4XP Output
 
