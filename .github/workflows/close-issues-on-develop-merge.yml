@@ -80,15 +80,41 @@ jobs:
             messages="$(git log -1 --format=%B "${AFTER}")"
           fi
 
-          # A merge commit's own message does not carry the pull request body,
-          # so read that too when this push merged one. The keyword is normally
-          # in both places; taking the union means either one alone is enough.
+          # A merged pull request's own commit does not carry its body, so read
+          # that too when this push merged one. The keyword is normally in both
+          # places; taking the union means either one alone is enough.
+          #
+          # Two merge styles name the pull request in the head commit's subject:
+          # a merge commit ("Merge pull request #315 from ...") and a squash
+          # merge ("<title> (#315)"). A squash merge's message is the list of
+          # its commits' subjects, so a keyword that lived only in the pull
+          # request body was never seen (#291 stayed open after #315 merged).
+          # A "(#N)" subject can also be a direct push that mentions an issue,
+          # so the squash form counts only when that pull request's merge
+          # commit is the commit this push delivered.
+          subject="$(git log -1 --format=%s "${AFTER}")"
           pr_number="$(
-            git log -1 --format=%s "${AFTER}" \
+            printf '%s' "$subject" \
               | grep -oE '^Merge pull request #[0-9]+' \
               | grep -oE '[0-9]+' \
             || true
           )"
+          if [ -z "$pr_number" ]; then
+            squashed="$(
+              printf '%s' "$subject" \
+                | grep -oE '\(#[0-9]+\)$' \
+                | grep -oE '[0-9]+' \
+              || true
+            )"
+            if [ -n "$squashed" ]; then
+              merged_as="$(gh api "repos/${REPO}/pulls/${squashed}" --jq '.merge_commit_sha // ""' 2>/dev/null || true)"
+              if [ "$merged_as" = "${AFTER}" ]; then
+                pr_number="$squashed"
+              else
+                echo "Subject names #${squashed}, but it is not the pull request that produced ${AFTER}."
+              fi
+            fi
+          fi
           if [ -n "$pr_number" ]; then
             echo "Head commit merges PR #${pr_number}; including its body."
             # Untrusted text. It is appended to a variable and piped to grep,
