@@ -409,7 +409,7 @@ Controls package manager behavior.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `library_url` | URL | `https://xearthlayer.app/packages/xearthlayer_package_library.txt` | URL to the package library index file |
+| `library_url` | URL | `https://xearthlayer.app/packages/v2/xearthlayer_package_library.txt` | URL to the package library index file. The default is library generation v2, the rebuilt world. A config naming the pre-0.5 library, `https://xearthlayer.app/packages/xearthlayer_package_library.txt`, or the 0.5.0 alpha staging library reads v2 instead, and the first start or `xearthlayer config upgrade` rewrites it |
 | `install_location` | path | `~/.local/share/xearthlayer/packages` | Directory for storing installed packages |
 | `custom_scenery_path` | path | (auto-detect) | X-Plane Custom Scenery directory for overlay symlinks |
 | `auto_install_overlays` | bool | `false` | Automatically install matching overlay when installing ortho |
@@ -421,7 +421,7 @@ Controls package manager behavior.
 **Example:**
 ```ini
 [packages]
-; library_url defaults to https://xearthlayer.app/packages/xearthlayer_package_library.txt
+; library_url defaults to https://xearthlayer.app/packages/v2/xearthlayer_package_library.txt
 install_location = ~/.local/share/xearthlayer/packages
 custom_scenery_path = /home/user/X-Plane 12/Custom Scenery
 auto_install_overlays = true
@@ -583,7 +583,7 @@ capacity_share = 0.35                        ; 0.05-0.50
 file = ~/.local/state/xearthlayer/xearthlayer.log
 
 [packages]
-; library_url defaults to https://xearthlayer.app/packages/xearthlayer_package_library.txt
+; library_url defaults to https://xearthlayer.app/packages/v2/xearthlayer_package_library.txt
 ; install_location = ~/.local/share/xearthlayer/packages
 ; custom_scenery_path = /path/to/X-Plane 12/Custom Scenery
 ; auto_install_overlays = true

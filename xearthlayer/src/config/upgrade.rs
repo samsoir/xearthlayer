@@ -188,6 +188,19 @@ pub struct DeprecatedValue {
 
 /// Retired values of current settings.
 pub const DEPRECATED_VALUES: &[DeprecatedValue] = &[
+    // #334: the rebuilt world is library generation v2. The old URL keeps the
+    // old world, frozen, for pre-0.5 clients; the alpha staging channel is
+    // replaced by the promoted v2 library.
+    DeprecatedValue {
+        key: "packages.library_url",
+        value: super::defaults::LEGACY_LIBRARY_URL,
+        replacement: super::defaults::DEFAULT_LIBRARY_URL,
+    },
+    DeprecatedValue {
+        key: "packages.library_url",
+        value: super::defaults::ALPHA_STAGING_LIBRARY_URL,
+        replacement: super::defaults::DEFAULT_LIBRARY_URL,
+    },
     // Removed in #277 - `auto` deferred to a calibration that was never
     // supplied, so it always resolved to opportunistic.
     DeprecatedValue {
@@ -489,6 +502,9 @@ pub fn upgrade_config(path: &Path, dry_run: bool) -> Result<UpgradeResult, Confi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::defaults::{
+        ALPHA_STAGING_LIBRARY_URL, DEFAULT_LIBRARY_URL, LEGACY_LIBRARY_URL,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -690,7 +706,7 @@ type = bing
             missing_keys: vec!["a".to_string(), "b".to_string()],
             deprecated_keys: vec!["c".to_string()],
             unknown_keys: Vec::new(),
-            migrated_values: DEPRECATED_VALUES.to_vec(),
+            migrated_values: vec![deprecated_value("prefetch.mode", "auto").unwrap()],
             needs_upgrade: true,
         };
 
@@ -847,6 +863,38 @@ disk_io_concurrent = 64
                 replacement: "opportunistic",
             }]
         );
+    }
+
+    fn current_config_with_library_url(path: &Path, url: &str) {
+        ConfigFile::default().save_to(path).unwrap();
+        let contents = std::fs::read_to_string(path).unwrap();
+        let line = format!("\nlibrary_url = {DEFAULT_LIBRARY_URL}\n");
+        assert_eq!(contents.matches(&line).count(), 1, "one library_url line");
+        std::fs::write(
+            path,
+            contents.replace(&line, &format!("\nlibrary_url = {url}\n")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn upgrade_moves_a_retired_library_url_to_the_v2_library() {
+        for retired in [LEGACY_LIBRARY_URL, ALPHA_STAGING_LIBRARY_URL] {
+            let temp_dir = TempDir::new().unwrap();
+            let config_path = temp_dir.path().join("config.ini");
+            current_config_with_library_url(&config_path, retired);
+
+            let analysis = analyze_config(&config_path).unwrap();
+            assert!(analysis.needs_upgrade, "{retired}");
+            assert_eq!(analysis.migrated_values.len(), 1);
+            assert_eq!(analysis.migrated_values[0].key, "packages.library_url");
+
+            upgrade_config(&config_path, false).unwrap();
+            let contents = std::fs::read_to_string(&config_path).unwrap();
+            assert!(contents.contains(&format!("\nlibrary_url = {DEFAULT_LIBRARY_URL}\n")));
+            assert!(!contents.contains(retired));
+            assert!(!analyze_config(&config_path).unwrap().needs_upgrade);
+        }
     }
 
     #[test]

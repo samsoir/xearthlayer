@@ -155,7 +155,7 @@ Then edit `~/.config/xearthlayer/config.ini`:
 scenery_dir = /path/to/X-Plane 12/Custom Scenery
 
 [packages]
-# library_url defaults to https://xearthlayer.app/packages/xearthlayer_package_library.txt
+# library_url defaults to https://xearthlayer.app/packages/v2/xearthlayer_package_library.txt
 auto_install_overlays = true
 
 [provider]

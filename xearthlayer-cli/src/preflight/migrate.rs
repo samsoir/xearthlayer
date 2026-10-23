@@ -203,9 +203,18 @@ impl LayoutMigration {
 
     /// Rewrite the legacy configuration so an older version still works, and
     /// prepend a notice so a human editing it is not silently ignored.
-    fn annotate_legacy(&self, config: &ConfigFile) -> std::io::Result<()> {
+    fn annotate_legacy(
+        &self,
+        config: &ConfigFile,
+        retired_library: Option<&str>,
+    ) -> std::io::Result<()> {
         let mut pinned = config.clone();
         pinned.general.layout_version = 0;
+        // The parser read a retired library URL as the v2 library (#334). This
+        // copy is for an older XEarthLayer, which must keep the library it read.
+        if let Some(url) = retired_library {
+            pinned.packages.library_url = Some(url.to_string());
+        }
         let path = self.legacy_config_file();
         pinned
             .save_to(&path)
@@ -323,6 +332,17 @@ impl Preflight<BootstrapContext> for LayoutMigration {
             PreflightError::new(names::LAYOUT_MIGRATION, format!("{}: {}", what, e))
         };
 
+        // A retired library URL is read as the v2 library; remember what the
+        // file said, for the legacy copy and to tell the user.
+        let retired_library = xearthlayer::config::analyze_config(&self.legacy_config_file())
+            .ok()
+            .and_then(|analysis| {
+                analysis
+                    .migrated_values
+                    .into_iter()
+                    .find(|retired| retired.key == "packages.library_url")
+            });
+
         let mut config = ConfigFile::load_from(&self.legacy_config_file()).map_err(|e| {
             PreflightError::new(
                 names::LAYOUT_MIGRATION,
@@ -357,16 +377,23 @@ impl Preflight<BootstrapContext> for LayoutMigration {
             )
         })?;
 
-        self.annotate_legacy(&config)
+        self.annotate_legacy(&config, retired_library.map(|r| r.value))
             .map_err(|e| fail(e, "Failed to annotate the legacy configuration"))?;
         self.write_marker(&self.target_config_file())
             .map_err(|e| fail(e, "Failed to write the migration marker"))?;
 
+        let mut message = format!(
+            "Configuration moved to {}",
+            self.target_config_file().display()
+        );
+        if let Some(retired) = retired_library {
+            message.push_str(&format!(
+                "\npackages.library_url now reads the rebuilt scenery library: {}",
+                retired.replacement
+            ));
+        }
         Ok(Remedy {
-            message: Some(format!(
-                "Configuration moved to {}",
-                self.target_config_file().display()
-            )),
+            message: Some(message),
             register: Vec::new(),
         })
     }
@@ -483,6 +510,62 @@ mod tests {
             "settings must survive the copy"
         );
         assert_eq!(c.inspect(&ctx), Status::Satisfied);
+    }
+
+    #[test]
+    fn migration_moves_the_old_library_url_to_v2_and_leaves_the_legacy_file_on_the_old_one() {
+        // #334: the new layout reads the v2 library. The legacy file is what a
+        // rollback to 0.4.8 reads, and 0.4.8 must keep the old world it can use.
+        use xearthlayer::config::{DEFAULT_LIBRARY_URL, LEGACY_LIBRARY_URL};
+        let f = fixture();
+        write_legacy_config(
+            &f,
+            &format!("[packages]\nlibrary_url = {LEGACY_LIBRARY_URL}\n"),
+        );
+        let c = check(&f);
+
+        let remedy = c
+            .remediate(&mut BootstrapContext::new("run", None))
+            .unwrap();
+
+        let migrated = std::fs::read_to_string(c.target_config_file()).unwrap();
+        assert!(
+            migrated.contains(&format!("\nlibrary_url = {DEFAULT_LIBRARY_URL}\n")),
+            "{migrated}"
+        );
+        let legacy = std::fs::read_to_string(f.legacy.join("config.ini")).unwrap();
+        assert!(
+            legacy.contains(&format!("\nlibrary_url = {LEGACY_LIBRARY_URL}\n")),
+            "{legacy}"
+        );
+        assert!(!legacy.contains(DEFAULT_LIBRARY_URL), "{legacy}");
+        let message = remedy.message.unwrap();
+        assert!(
+            message.contains("library_url") && message.contains(DEFAULT_LIBRARY_URL),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn migration_leaves_a_library_url_of_ones_own_alone() {
+        let f = fixture();
+        let own = "https://example.com/my/xearthlayer_package_library.txt";
+        write_legacy_config(&f, &format!("[packages]\nlibrary_url = {own}\n"));
+        let c = check(&f);
+
+        let remedy = c
+            .remediate(&mut BootstrapContext::new("run", None))
+            .unwrap();
+
+        for file in [c.target_config_file(), f.legacy.join("config.ini")] {
+            let text = std::fs::read_to_string(&file).unwrap();
+            assert!(
+                text.contains(&format!("\nlibrary_url = {own}\n")),
+                "{}",
+                file.display()
+            );
+        }
+        assert!(!remedy.message.unwrap().contains("library_url"));
     }
 
     #[test]

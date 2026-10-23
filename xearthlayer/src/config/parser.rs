@@ -171,7 +171,10 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
     // [packages] section
     if let Some(section) = ini.section(Some("packages")) {
         if let Some(v) = section.get("library_url") {
-            let v = v.trim();
+            let v = match deprecated_value("packages.library_url", v) {
+                Some(retired) => retired.replacement,
+                None => v.trim(),
+            };
             if !v.is_empty() {
                 config.packages.library_url = Some(v.to_string());
             }
@@ -896,6 +899,50 @@ max_retries = 5
         assert_eq!(
             ConfigFile::load_from(&path).unwrap().prefetch.mode,
             "opportunistic"
+        );
+    }
+
+    /// #334: the rebuilt world is library generation v2. The root library at
+    /// the old URL stays frozen for pre-0.5 clients, so a config naming it, or
+    /// the alpha testers' staging URL, must read the v2 library.
+    #[test]
+    fn retired_library_urls_load_as_the_v2_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        for retired in [
+            LEGACY_LIBRARY_URL,
+            ALPHA_STAGING_LIBRARY_URL,
+            "  https://xearthlayer.app/packages/xearthlayer_package_library.txt  ",
+        ] {
+            std::fs::write(&path, format!("[packages]\nlibrary_url = {retired}\n")).unwrap();
+            assert_eq!(
+                ConfigFile::load_from(&path)
+                    .unwrap()
+                    .packages
+                    .library_url
+                    .as_deref(),
+                Some(DEFAULT_LIBRARY_URL),
+                "{retired}"
+            );
+        }
+        let own = "https://example.com/my/xearthlayer_package_library.txt";
+        std::fs::write(&path, format!("[packages]\nlibrary_url = {own}\n")).unwrap();
+        assert_eq!(
+            ConfigFile::load_from(&path)
+                .unwrap()
+                .packages
+                .library_url
+                .as_deref(),
+            Some(own),
+            "a library of one's own is left alone"
+        );
+    }
+
+    #[test]
+    fn the_default_library_is_the_v2_generation() {
+        assert_eq!(
+            DEFAULT_LIBRARY_URL,
+            "https://xearthlayer.app/packages/v2/xearthlayer_package_library.txt"
         );
     }
 

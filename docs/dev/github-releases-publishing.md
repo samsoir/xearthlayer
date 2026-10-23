@@ -619,25 +619,32 @@ xearthlayer-publish coverage --geojson --output coverage.geojson
 ## Staging Channel
 
 A package that is not ready for everyone is published on the `staging` branch
-of the packages repository. The library index keeps its filename; only the ref
-differs:
+of the packages repository. Each library generation (#333) has its own index
+under its own folder, and the staging branch has the same layout, so only the
+ref differs:
 
-| Channel | Library index URL |
-|---------|-------------------|
-| Stable | `https://raw.githubusercontent.com/samsoir/xearthlayer-regional-scenery/main/xearthlayer_package_library.txt` |
-| Staging | `https://raw.githubusercontent.com/samsoir/xearthlayer-regional-scenery/staging/xearthlayer_package_library.txt` |
+| Channel | Library index URL (generation v2) |
+|---------|-----------------------------------|
+| Stable | `https://xearthlayer.app/packages/v2/xearthlayer_package_library.txt`, synced from `main` |
+| Staging | `https://raw.githubusercontent.com/samsoir/xearthlayer-regional-scenery/staging/v2/xearthlayer_package_library.txt` |
+
+The root index, `https://xearthlayer.app/packages/xearthlayer_package_library.txt`,
+is the pre-0.5 library and is frozen. The staging branch's root index was the
+0.5.0 alpha channel; clients reading it are moved to the stable v2 library
+(#334), and the staging branch takes the generation layout at the v2
+promotion (#335).
 
 Testers point at the staging index with the existing override, either per
 command or in their config file:
 
 ```bash
 xearthlayer packages install na-usa-mx-central \
-  --library-url https://raw.githubusercontent.com/samsoir/xearthlayer-regional-scenery/staging/xearthlayer_package_library.txt
+  --library-url https://raw.githubusercontent.com/samsoir/xearthlayer-regional-scenery/staging/v2/xearthlayer_package_library.txt
 ```
 
 ```ini
 [packages]
-library_url = https://raw.githubusercontent.com/samsoir/xearthlayer-regional-scenery/staging/xearthlayer_package_library.txt
+library_url = https://raw.githubusercontent.com/samsoir/xearthlayer-regional-scenery/staging/v2/xearthlayer_package_library.txt
 ```
 
 ### Why a Branch Rather Than a Second Filename

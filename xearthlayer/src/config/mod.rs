@@ -57,6 +57,8 @@ pub use file::{
     TextureSettings,
     TuiSettings,
     XPlaneSettings,
+    // Package manager defaults
+    ALPHA_STAGING_LIBRARY_URL,
     // Pipeline defaults
     // Control plane defaults
     DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
@@ -68,7 +70,6 @@ pub use file::{
     // Download defaults
     // Generation defaults
     DEFAULT_GENERATION_TIMEOUT_SECS,
-    // Package manager defaults
     DEFAULT_LIBRARY_URL,
     DEFAULT_MAX_RETRIES,
     DEFAULT_MEMORY_CACHE_SIZE,
@@ -78,6 +79,7 @@ pub use file::{
     DEFAULT_PREFETCH_CYCLE_INTERVAL_MS,
     DEFAULT_REQUEST_TIMEOUT_SECS,
     DEFAULT_WEB_API_PORT,
+    LEGACY_LIBRARY_URL,
 };
 pub use keys::{ConfigKey, ConfigKeyError, SENSITIVE_VALUE_MASK};
 pub use size::{format_size, parse_size, Size, SizeParseError, GB, KB, MB};

@@ -214,9 +214,20 @@ pub const DEFAULT_GPU_DEVICE: &str = "integrated";
 // Package manager defaults
 // =============================================================================
 
-/// Default package library URL (XEarthLayer official package library).
+/// Default package library URL: library generation v2 of the XEarthLayer
+/// official package library, the rebuilt world (#334).
 pub const DEFAULT_LIBRARY_URL: &str =
+    "https://xearthlayer.app/packages/v2/xearthlayer_package_library.txt";
+
+/// The library every release before 0.5.0 read: the old world, frozen at the
+/// repository root for those clients (#333). A config naming it reads
+/// [`DEFAULT_LIBRARY_URL`].
+pub const LEGACY_LIBRARY_URL: &str =
     "https://xearthlayer.app/packages/xearthlayer_package_library.txt";
+
+/// The staging channel the 0.5.0 alpha testers were pointed at, before the
+/// rebuild was promoted to v2. A config naming it reads [`DEFAULT_LIBRARY_URL`].
+pub const ALPHA_STAGING_LIBRARY_URL: &str = "https://raw.githubusercontent.com/samsoir/xearthlayer-regional-scenery/staging/xearthlayer_package_library.txt";
 
 // =============================================================================
 // Download config defaults (for DownloadConfig struct)

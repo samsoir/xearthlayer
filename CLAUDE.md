@@ -522,7 +522,7 @@ Key sections:
 - `[fuse]` - FUSE kernel limits (max_background, congestion_threshold)
 - `[night]` - Night lighting (enabled, default true)
 - `[tui]` - Dashboard display (symbols: auto/emoji/plain; `auto` detection in `xearthlayer-cli/src/ui/symbols.rs`)
-- `[packages]` - Package manager settings (concurrent_downloads: parallel part downloads 1-10)
+- `[packages]` - Package manager settings (concurrent_downloads: parallel part downloads 1-10). `library_url` defaults to library generation v2, `DEFAULT_LIBRARY_URL` (#334); the pre-0.5 root URL (`LEGACY_LIBRARY_URL`) and the alpha staging URL are retired values (`DEPRECATED_VALUES`) the parser reads as v2, and the layout migration keeps the legacy copy of the config on the old URL for a 0.4.x rollback
 
 See `docs/configuration.md` for full reference.
 
