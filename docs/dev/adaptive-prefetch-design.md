@@ -454,12 +454,28 @@ tile still queued in the executor passing the filter and being submitted again
 
 `SceneryIndex::tiles_in_region(region)` is the single definition of "which DDS
 tiles belong to this DSF region": a tile belongs to the region containing its
-geographic centre (the `LOAD_CENTER` of its `.ter` file). The submit, promote,
+geographic centre (the `LOAD_CENTER` of its `.ter` file, which since #327 is
+computed from the file name rather than read: see "Building the index" below). The submit, promote,
 and rescue paths all consult this one method, so they cannot disagree about
 whether a region is complete. Earlier code reconstructed the tile set from a
 45nm radius query per path, which returns a circle overlapping neighbouring
 regions rather than the region itself — the source of several promotion bugs
 fixed under #176.
+
+### Building the index
+
+`SceneryIndex::build_from_package` lists a package's `terrain/` folder and
+builds each tile from its file name with `tile_from_ter_name` (#327). An
+Ortho4XP name, `<row>_<col>_<provider><zoom>[_water_overlay|_sea_overlay].ter`,
+carries the texture's row, column and chunk zoom, and the sea flag; the centre
+is the Web Mercator centre of the texture's 16x16 chunks, the corner of chunk
+(row + 8, col + 8). Checked against all 4,980,320 `.ter` files of an installed
+world, the computed centre is within 5e-6 degrees of `LOAD_CENTER` (its printed
+rounding) and never in another 1 degree region, and a full index built both
+ways matched tile for tile. A whole-world rebuild fell from 260 s to 17 s with
+a warm page cache, and no longer depends on reading five million files cold.
+Any other name is read and parsed as before, so a hand-made package still
+indexes.
 
 `BoundaryStrategy::region_disk_state` (`xearthlayer/src/prefetch/adaptive/boundary_strategy.rs`)
 is the single completeness predicate built on top of that tile set, consumed

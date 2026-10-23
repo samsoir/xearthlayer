@@ -1,8 +1,9 @@
 //! Persistent cache for SceneryIndex.
 //!
 //! Saves and loads the scenery tile index to avoid rebuilding on every launch.
-//! The cache stores all tiles from `.ter` files along with package metadata
-//! for invalidation checks.
+//! The cache stores all tiles from `.ter` files (built from their names, see
+//! `SceneryIndex::build_from_package`) along with package metadata for
+//! invalidation checks.
 //!
 //! # Cache Format
 //!
