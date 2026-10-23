@@ -2,7 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use super::app::{Action, Modal, Tab};
+use super::app::{Action, EditKey, Modal, Tab};
 
 /// The action a key asks for on `tab`, or `None` if it means nothing there.
 ///
@@ -10,7 +10,7 @@ use super::app::{Action, Modal, Tab};
 /// Esc dismisses, `q` confirms the quit prompt, and help closes on `?` or Esc.
 /// With no modal, Esc gives `Dismiss`, which asks to quit but never abandons
 /// a cancelling quit the way `q` does. Ctrl+C always quits.
-pub fn action_for(key: KeyEvent, tab: Tab, modal: Option<&Modal>) -> Option<Action> {
+pub fn action_for(key: KeyEvent, tab: Tab, modal: Option<&Modal>, editing: bool) -> Option<Action> {
     if key.kind != KeyEventKind::Press {
         return None;
     }
@@ -21,6 +21,9 @@ pub fn action_for(key: KeyEvent, tab: Tab, modal: Option<&Modal>) -> Option<Acti
         let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c' | 'C'));
         return ctrl_c.then_some(Action::Quit);
+    }
+    if editing && modal.is_none() {
+        return edit_action(key.code);
     }
     match modal {
         None => tab_action(key.code, tab),
@@ -41,6 +44,24 @@ pub fn action_for(key: KeyEvent, tab: Tab, modal: Option<&Modal>) -> Option<Acti
 }
 
 /// Keys with no modal open. Some act only on the tabs they belong to.
+/// Keys while a setting is edited: every printable key is text, so `q`, `j`
+/// and digits are typed rather than acted on.
+fn edit_action(code: KeyCode) -> Option<Action> {
+    let key = match code {
+        KeyCode::Enter => return Some(Action::Confirm),
+        KeyCode::Esc => return Some(Action::Dismiss),
+        KeyCode::Char(c) => EditKey::Char(c),
+        KeyCode::Backspace => EditKey::Backspace,
+        KeyCode::Delete => EditKey::Delete,
+        KeyCode::Left => EditKey::Left,
+        KeyCode::Right => EditKey::Right,
+        KeyCode::Home => EditKey::Home,
+        KeyCode::End => EditKey::End,
+        _ => return None,
+    };
+    Some(Action::EditKey(key))
+}
+
 fn tab_action(code: KeyCode, tab: Tab) -> Option<Action> {
     let on = |tabs: &[Tab], action: Action| tabs.contains(&tab).then_some(action);
     let lists = [Tab::Local, Tab::Library];
@@ -48,6 +69,8 @@ fn tab_action(code: KeyCode, tab: Tab) -> Option<Action> {
         KeyCode::Char('1') => Some(Action::GoTab(Tab::Local)),
         KeyCode::Char('2') => Some(Action::GoTab(Tab::Library)),
         KeyCode::Char('3') => Some(Action::GoTab(Tab::Progress)),
+        KeyCode::Char('4') => Some(Action::GoTab(Tab::Settings)),
+        KeyCode::Enter => on(&[Tab::Settings], Action::Edit),
         KeyCode::Tab => Some(Action::NextTab),
         KeyCode::BackTab => Some(Action::PrevTab),
         KeyCode::Up | KeyCode::Char('k') => Some(Action::Up),
@@ -157,7 +180,7 @@ mod tests {
         for tab in TABS {
             for (key, action) in &keys {
                 assert_eq!(
-                    action_for(*key, tab, None),
+                    action_for(*key, tab, None, false),
                     Some(*action),
                     "{key:?} on {tab:?}"
                 );
@@ -181,7 +204,11 @@ mod tests {
         for (key, action, tabs) in keys {
             for tab in TABS {
                 let expected = tabs.contains(&tab).then_some(action);
-                assert_eq!(action_for(key, tab, None), expected, "{key:?} on {tab:?}");
+                assert_eq!(
+                    action_for(key, tab, None, false),
+                    expected,
+                    "{key:?} on {tab:?}"
+                );
             }
         }
     }
@@ -195,7 +222,7 @@ mod tests {
             ctrl('a'),
             ctrl('q'),
         ] {
-            assert_eq!(action_for(key, Tab::Local, None), None, "{key:?}");
+            assert_eq!(action_for(key, Tab::Local, None, false), None, "{key:?}");
         }
     }
 
@@ -204,7 +231,7 @@ mod tests {
         let mut key = ch('q');
         key.kind = KeyEventKind::Release;
 
-        assert_eq!(action_for(key, Tab::Local, None), None);
+        assert_eq!(action_for(key, Tab::Local, None, false), None);
     }
 
     // ------------------------------------------------------------------------
@@ -218,21 +245,21 @@ mod tests {
         for modal in &modals {
             for key in [ch('y'), ch('Y'), press(KeyCode::Enter)] {
                 assert_eq!(
-                    action_for(key, Tab::Local, Some(modal)),
+                    action_for(key, Tab::Local, Some(modal), false),
                     Some(Action::Confirm),
                     "{key:?} in {modal:?}"
                 );
             }
             for key in [ch('n'), ch('N'), press(KeyCode::Esc)] {
                 assert_eq!(
-                    action_for(key, Tab::Local, Some(modal)),
+                    action_for(key, Tab::Local, Some(modal), false),
                     Some(Action::Dismiss),
                     "{key:?} in {modal:?}"
                 );
             }
             for key in [ch('j'), ch('2'), ch('?'), ch('d'), press(KeyCode::Down)] {
                 assert_eq!(
-                    action_for(key, Tab::Local, Some(modal)),
+                    action_for(key, Tab::Local, Some(modal), false),
                     None,
                     "{key:?} in {modal:?}"
                 );
@@ -244,12 +271,12 @@ mod tests {
     fn q_quits_only_inside_the_quit_confirmation() {
         let quit = quit_modal();
         assert_eq!(
-            action_for(ch('q'), Tab::Local, Some(&quit)),
+            action_for(ch('q'), Tab::Local, Some(&quit), false),
             Some(Action::Quit)
         );
         for modal in &confirm_modals() {
             assert_eq!(
-                action_for(ch('q'), Tab::Local, Some(modal)),
+                action_for(ch('q'), Tab::Local, Some(modal), false),
                 None,
                 "{modal:?}"
             );
@@ -261,15 +288,19 @@ mod tests {
         let help = Modal::Help;
 
         assert_eq!(
-            action_for(ch('?'), Tab::Local, Some(&help)),
+            action_for(ch('?'), Tab::Local, Some(&help), false),
             Some(Action::Help)
         );
         assert_eq!(
-            action_for(press(KeyCode::Esc), Tab::Local, Some(&help)),
+            action_for(press(KeyCode::Esc), Tab::Local, Some(&help), false),
             Some(Action::Dismiss)
         );
         for key in [ch('y'), ch('n'), ch('q'), press(KeyCode::Enter), ch('j')] {
-            assert_eq!(action_for(key, Tab::Local, Some(&help)), None, "{key:?}");
+            assert_eq!(
+                action_for(key, Tab::Local, Some(&help), false),
+                None,
+                "{key:?}"
+            );
         }
     }
 
@@ -280,10 +311,54 @@ mod tests {
         modals.push(Modal::Help);
         for modal in &modals {
             assert_eq!(
-                action_for(ctrl('c'), Tab::Progress, Some(modal)),
+                action_for(ctrl('c'), Tab::Progress, Some(modal), false),
                 Some(Action::Quit),
                 "{modal:?}"
             );
         }
+    }
+
+    #[test]
+    fn four_opens_settings_and_enter_edits_only_there() {
+        assert_eq!(
+            action_for(ch('4'), Tab::Local, None, false),
+            Some(Action::GoTab(Tab::Settings))
+        );
+        assert_eq!(
+            action_for(press(KeyCode::Enter), Tab::Settings, None, false),
+            Some(Action::Edit)
+        );
+        for tab in [Tab::Local, Tab::Library, Tab::Progress] {
+            assert_eq!(
+                action_for(press(KeyCode::Enter), tab, None, false),
+                None,
+                "{tab:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn while_editing_every_key_is_text_except_enter_esc_and_ctrl_c() {
+        use crate::ui::packages::app::EditKey;
+        let editing = |key| action_for(key, Tab::Settings, None, true);
+        for c in ['q', 'j', '4', '?', ' ', 'r'] {
+            assert_eq!(
+                editing(ch(c)),
+                Some(Action::EditKey(EditKey::Char(c))),
+                "{c}"
+            );
+        }
+        assert_eq!(editing(press(KeyCode::Enter)), Some(Action::Confirm));
+        assert_eq!(editing(press(KeyCode::Esc)), Some(Action::Dismiss));
+        assert_eq!(
+            editing(press(KeyCode::Backspace)),
+            Some(Action::EditKey(EditKey::Backspace))
+        );
+        assert_eq!(
+            editing(press(KeyCode::Left)),
+            Some(Action::EditKey(EditKey::Left))
+        );
+        assert_eq!(editing(ctrl('c')), Some(Action::Quit), "Ctrl+C still quits");
+        assert_eq!(editing(press(KeyCode::Up)), None);
     }
 }

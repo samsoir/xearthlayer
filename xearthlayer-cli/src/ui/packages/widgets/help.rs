@@ -2,7 +2,7 @@
 
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Clear, Paragraph, Wrap},
     Frame,
@@ -14,11 +14,11 @@ use super::detail::heading;
 use crate::ui::packages::app::Modal;
 
 /// Every key, by where it works.
-const KEY_SECTIONS: [(&str, &[&str]); 4] = [
+const KEY_SECTIONS: [(&str, &[&str]); 5] = [
     (
         "Everywhere",
         &[
-            "1 2 3, Tab, Shift+Tab   switch tabs",
+            "1 2 3 4, Tab, Shift+Tab   switch tabs",
             "Up Down j k PgUp PgDn Home End   move",
             "r refresh   ? help   q, Esc, Ctrl+C quit",
             "u, d and i act on the marked rows, else the selected row",
@@ -30,6 +30,10 @@ const KEY_SECTIONS: [(&str, &[&str]); 4] = [
         &["Space mark   a mark all   t type filter   i install"],
     ),
     ("Progress", &["c cancel   C cancel all   x clear finished"]),
+    (
+        "Settings",
+        &["Enter edit, Enter save, Esc cancel   Space flips true/false"],
+    ),
 ];
 
 /// How the package manager works, in four lines.
@@ -103,6 +107,20 @@ pub fn draw(frame: &mut Frame, modal: &Modal) {
 fn help(frame: &mut Frame, area: Rect) {
     let mut lines = Vec::new();
     for (section, keys) in KEY_SECTIONS {
+        // A tab's keys fit on one line after its name, which keeps the
+        // dialog inside an 80 by 24 terminal with four tabs.
+        if let [only] = keys {
+            if section != "Everywhere" {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{section:<10}"),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(only.to_string()),
+                ]));
+                continue;
+            }
+        }
         lines.push(heading(section));
         lines.extend(keys.iter().map(|keys| Line::from(format!("  {keys}"))));
     }

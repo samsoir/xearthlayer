@@ -22,7 +22,7 @@ use ratatui::{
 };
 
 use super::app::{AppState, Tab};
-use super::widgets::{chrome, help, library, local, progress};
+use super::widgets::{chrome, help, library, local, progress, settings};
 
 /// Smallest terminal the manager draws in.
 const MIN_WIDTH: u16 = 60;
@@ -62,6 +62,10 @@ pub fn draw(frame: &mut Frame, state: &AppState, now: Instant) {
         Tab::Progress => {
             let (list, details) = chrome::split_body(body, 60);
             progress::draw(frame, list, details, state, now);
+        }
+        Tab::Settings => {
+            let (list, details) = chrome::split_body(body, 60);
+            settings::draw(frame, list, details, state, now);
         }
     }
     chrome::status_line(frame, status, state);
@@ -1334,5 +1338,51 @@ mod tests {
         let text = buffer_text(&render_at(&state, 80, 24, start));
         assert!(text.contains("Library: all (5)"), "{text}");
         assert!(!text.contains("reading"), "{text}");
+    }
+
+    // ------------------------------------------------------------------------
+    // Settings (#336)
+    // ------------------------------------------------------------------------
+
+    fn on_settings() -> AppState {
+        let mut state = loaded();
+        state.update(
+            Input::Msg(Msg::Settings(Ok(crate::ui::packages::app::setting_rows(
+                &xearthlayer::config::ConfigFile::default(),
+            )))),
+            Instant::now(),
+        );
+        go(&mut state, Tab::Settings);
+        state
+    }
+
+    #[test]
+    fn the_settings_tab_shows_each_setting_and_the_selected_one_s_help() {
+        let state = on_settings();
+        let text = buffer_text(&render(&state, 100, 30));
+        for wanted in [
+            "4 Settings",
+            "library_url",
+            "concurrent_downloads",
+            "packages.library_url",
+            "URL to the XEarthLayer package library",
+            "Enter edits",
+        ] {
+            assert!(text.contains(wanted), "missing {wanted:?}\n{text}");
+        }
+    }
+
+    #[test]
+    fn the_settings_tab_says_why_it_is_read_only() {
+        let mut state = on_settings();
+        state.update(
+            Input::Msg(Msg::RunActive(Some(run_active(4242)))),
+            Instant::now(),
+        );
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(
+            text.contains("settings are read-only until it stops"),
+            "{text}"
+        );
     }
 }

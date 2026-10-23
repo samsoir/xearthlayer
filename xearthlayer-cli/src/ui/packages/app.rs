@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use semver::Version;
+use xearthlayer::config::{ConfigFile, ConfigKey};
 use xearthlayer::manager::{JobId, JobKind, JobSummary};
 use xearthlayer_package::{LibraryEntry, PackageLibrary, PackageMetadata, PackageType};
 
@@ -35,10 +36,11 @@ pub enum Tab {
     Local,
     Library,
     Progress,
+    Settings,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Local, Tab::Library, Tab::Progress];
+    const ALL: [Tab; 4] = [Tab::Local, Tab::Library, Tab::Progress, Tab::Settings];
 
     fn index(self) -> usize {
         self as usize
@@ -51,6 +53,91 @@ impl Tab {
     fn prev(self) -> Self {
         Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
     }
+}
+
+/// How a setting is edited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingKind {
+    /// Typed text: a URL, a path, a number.
+    Text,
+    /// true or false, flipped with Space or the left and right arrows.
+    Flag,
+}
+
+/// One `[packages]` setting on the Settings tab (#336).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingRow {
+    pub key: ConfigKey,
+    /// As `xearthlayer config get` shows it: empty when unset.
+    pub value: String,
+    /// What an empty value means, shown dimmed in its place.
+    pub default: Option<String>,
+    pub kind: SettingKind,
+    /// The same help `config.ini` carries for it, as paragraphs.
+    pub help: Vec<String>,
+}
+
+/// The Settings tab's rows, from the configuration file.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingsState {
+    Loading,
+    Loaded(Vec<SettingRow>),
+    Failed(String),
+}
+
+/// The value being typed into a setting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Editor {
+    pub buffer: String,
+    /// The insertion point, in characters.
+    pub cursor: usize,
+}
+
+/// A key typed while a setting is being edited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditKey {
+    Char(char),
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Home,
+    End,
+}
+
+/// The rows of the Settings tab for `config`: every `[packages]` setting in
+/// `config.ini`'s order, with its value, default and help.
+pub fn setting_rows(config: &ConfigFile) -> Vec<SettingRow> {
+    xearthlayer::config::help::PACKAGES_SETTINGS
+        .iter()
+        .map(|&key| {
+            let kind = match key {
+                ConfigKey::PackagesAutoInstallOverlays
+                | ConfigKey::PackagesDisableOverlays
+                | ConfigKey::PackagesXworldPro => SettingKind::Flag,
+                _ => SettingKind::Text,
+            };
+            let default = match key {
+                ConfigKey::PackagesInstallLocation => {
+                    Some(xearthlayer::paths::packages_dir().display().to_string())
+                }
+                ConfigKey::PackagesTempDir => {
+                    Some(xearthlayer::paths::temp_dir().display().to_string())
+                }
+                ConfigKey::PackagesCustomSceneryPath => {
+                    Some("found from xplane.scenery_dir or X-Plane's own files".to_string())
+                }
+                _ => None,
+            };
+            SettingRow {
+                key,
+                value: key.get(config),
+                default,
+                kind,
+                help: xearthlayer::config::help::help(key),
+            }
+        })
+        .collect()
 }
 
 /// One installed package.
@@ -195,6 +282,14 @@ pub enum Msg {
     /// The overlay rebuild finished, with the line to show if it has one.
     /// Every [`Effect::RebuildOverlays`] is answered by exactly one.
     OverlaysRebuilt(Option<String>),
+    /// The Settings tab's rows, read from the configuration file.
+    Settings(Result<Vec<SettingRow>, String>),
+    /// A [`Effect::SaveSetting`] was carried out: the rows as saved, or why
+    /// nothing was. Every one is answered by exactly one of these.
+    SettingSaved {
+        key: ConfigKey,
+        result: Result<Vec<SettingRow>, String>,
+    },
     /// Time passed. Sent about once a second so an expired quit prompt
     /// clears without a key press.
     Tick,
@@ -243,6 +338,10 @@ pub enum Action {
     Cancel,
     CancelAll,
     ClearFinished,
+    /// Start editing the selected setting.
+    Edit,
+    /// A key typed into the setting being edited.
+    EditKey(EditKey),
     Refresh,
     Help,
     Quit,
@@ -280,6 +379,14 @@ pub enum Effect {
     /// Leave the running jobs to the queue's own shutdown.
     Abandon,
     RebuildOverlays,
+    /// Read the Settings tab's rows, answered by [`Msg::Settings`].
+    LoadSettings,
+    /// Save one setting, as `xearthlayer config set` does, unless a `run`
+    /// is found when it is carried out. Answered by [`Msg::SettingSaved`].
+    SaveSetting {
+        key: ConfigKey,
+        value: String,
+    },
     /// The queue is idle: drop it and its lock.
     ReleaseQueue,
     Exit,
@@ -361,7 +468,12 @@ pub struct AppState {
     filter: TypeFilter,
     jobs: Vec<JobRow>,
     /// The selected row of each tab, an index into the rows it shows.
-    selection: [usize; 3],
+    selection: [usize; 4],
+    settings: SettingsState,
+    /// The setting being edited, on the selected Settings row.
+    editing: Option<Editor>,
+    /// A setting is being saved: no other edit starts until it is answered.
+    saving: bool,
     local_marks: BTreeSet<PackageKey>,
     library_marks: BTreeSet<PackageKey>,
     /// Marks cleared by a confirmed action, kept until the queue answers
@@ -417,7 +529,10 @@ impl AppState {
             reading_library: false,
             filter: TypeFilter::All,
             jobs: Vec::new(),
-            selection: [0; 3],
+            selection: [0; 4],
+            settings: SettingsState::Loading,
+            editing: None,
+            saving: false,
             local_marks: BTreeSet::new(),
             library_marks: BTreeSet::new(),
             held_marks: None,
@@ -440,7 +555,8 @@ impl AppState {
             tally_at_idle: Tally::default(),
             started: Instant::now(),
         };
-        let effects = reload();
+        let mut effects = reload();
+        effects.push(Effect::LoadSettings);
         state.note_reads(&effects);
         (state, effects)
     }
@@ -610,6 +726,9 @@ impl AppState {
         if self.modal.is_some() {
             return self.on_modal_action(action);
         }
+        if self.editing.is_some() {
+            return self.on_edit_action(action);
+        }
         let tab = self.tab;
         match (action, tab) {
             (Action::NextTab, _) => self.tab = tab.next(),
@@ -651,9 +770,12 @@ impl AppState {
                     .retain(|id| jobs.iter().any(|job| job.id == *id));
                 self.clamp(Tab::Progress);
             }
+            (Action::Edit, Tab::Settings) => self.begin_edit(),
             (Action::Refresh, _) => {
                 self.library = LibraryState::Loading;
-                return reload();
+                let mut effects = reload();
+                effects.push(Effect::LoadSettings);
+                return effects;
             }
             (Action::Help, _) => self.modal = Some(Modal::Help),
             // Esc with nothing to dismiss asks to quit, but never abandons.
@@ -663,6 +785,191 @@ impl AppState {
             _ => {}
         }
         Vec::new()
+    }
+
+    // ------------------------------------------------------------------------
+    // Settings
+    // ------------------------------------------------------------------------
+
+    /// Why settings cannot be edited now, if they cannot: `run` reads them,
+    /// and a queued job was started with them (#336).
+    pub fn settings_refusal(&self) -> Option<String> {
+        if let Some(run) = &self.run_active {
+            return Some(format!(
+                "XEarthLayer is running (pid {}): settings are read-only until it stops",
+                run.pid
+            ));
+        }
+        let busy = self.unfinished() > 0
+            || self.held_marks.is_some()
+            || self.submitting
+            || self.rebuilds > 0;
+        busy.then(|| {
+            "Packages are being installed or removed: finish or cancel the jobs first".to_string()
+        })
+    }
+
+    fn selected_setting(&self) -> Option<&SettingRow> {
+        match &self.settings {
+            SettingsState::Loaded(rows) => rows.get(self.selection[Tab::Settings.index()]),
+            _ => None,
+        }
+    }
+
+    fn begin_edit(&mut self) {
+        let Some(row) = self.selected_setting() else {
+            return;
+        };
+        if self.saving {
+            self.status = Some(format!("saving {}", row.key.name()));
+            return;
+        }
+        if let Some(reason) = self.settings_refusal() {
+            self.status = Some(reason);
+            return;
+        }
+        let buffer = match row.kind {
+            // Unset reads as false.
+            SettingKind::Flag if row.value != "true" => "false".to_string(),
+            _ => row.value.clone(),
+        };
+        let hint = match row.kind {
+            SettingKind::Text => "Enter saves   Esc cancels",
+            SettingKind::Flag => "Space or arrows flip   Enter saves   Esc cancels",
+        };
+        self.status = Some(format!("Editing {}: {hint}", row.key.name()));
+        self.editing = Some(Editor {
+            cursor: buffer.chars().count(),
+            buffer,
+        });
+    }
+
+    /// Keys while a setting is edited: only the editor's apply.
+    fn on_edit_action(&mut self, action: Action) -> Vec<Effect> {
+        match action {
+            Action::Confirm => return self.commit_edit(),
+            Action::Dismiss => {
+                self.editing = None;
+                self.status = Some("Edit cancelled".to_string());
+            }
+            Action::EditKey(key) => self.edit_key(key),
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn edit_key(&mut self, key: EditKey) {
+        let kind = self.selected_setting().map(|row| row.kind);
+        let Some(editor) = self.editing.as_mut() else {
+            return;
+        };
+        if kind == Some(SettingKind::Flag) {
+            if matches!(key, EditKey::Char(' ') | EditKey::Left | EditKey::Right) {
+                editor.buffer = if editor.buffer == "true" {
+                    "false"
+                } else {
+                    "true"
+                }
+                .to_string();
+                editor.cursor = editor.buffer.chars().count();
+            }
+            return;
+        }
+        let len = editor.buffer.chars().count();
+        let byte = |s: &str, at: usize| s.char_indices().nth(at).map_or(s.len(), |(i, _)| i);
+        match key {
+            EditKey::Char(c) => {
+                let at = byte(&editor.buffer, editor.cursor);
+                editor.buffer.insert(at, c);
+                editor.cursor += 1;
+            }
+            EditKey::Backspace if editor.cursor > 0 => {
+                let at = byte(&editor.buffer, editor.cursor - 1);
+                editor.buffer.remove(at);
+                editor.cursor -= 1;
+            }
+            EditKey::Delete if editor.cursor < len => {
+                let at = byte(&editor.buffer, editor.cursor);
+                editor.buffer.remove(at);
+            }
+            EditKey::Left => editor.cursor = editor.cursor.saturating_sub(1),
+            EditKey::Right => editor.cursor = (editor.cursor + 1).min(len),
+            EditKey::Home => editor.cursor = 0,
+            EditKey::End => editor.cursor = len,
+            _ => {}
+        }
+    }
+
+    /// Validate the edited value as `config set` would, and save it.
+    fn commit_edit(&mut self) -> Vec<Effect> {
+        let Some(row) = self.selected_setting().cloned() else {
+            self.editing = None;
+            return Vec::new();
+        };
+        let value = self
+            .editing
+            .as_ref()
+            .map(|e| e.buffer.trim().to_string())
+            .unwrap_or_default();
+        if value == row.value {
+            self.editing = None;
+            self.status = Some(format!("{} unchanged", row.key.name()));
+            return Vec::new();
+        }
+        if let Err(e) = row.key.validate(&value) {
+            // Stay in the editor so the value can be corrected. The error
+            // names the setting.
+            self.status = Some(e.to_string());
+            return Vec::new();
+        }
+        self.editing = None;
+        self.saving = true;
+        self.status = Some(format!("Saving {}", row.key.name()));
+        vec![Effect::SaveSetting {
+            key: row.key,
+            value,
+        }]
+    }
+
+    fn on_setting_saved(
+        &mut self,
+        key: ConfigKey,
+        result: Result<Vec<SettingRow>, String>,
+    ) -> Vec<Effect> {
+        self.saving = false;
+        match result {
+            Ok(rows) => {
+                self.settings = SettingsState::Loaded(rows);
+                self.clamp(Tab::Settings);
+                self.status = Some(format!("Saved {}", key.name()));
+                // What the new value changes is read again.
+                match key {
+                    ConfigKey::PackagesLibraryUrl => {
+                        self.library = LibraryState::Loading;
+                        vec![Effect::LoadLibrary]
+                    }
+                    ConfigKey::PackagesInstallLocation => {
+                        self.library = LibraryState::Loading;
+                        reload()
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            Err(reason) => {
+                self.status = Some(reason);
+                Vec::new()
+            }
+        }
+    }
+
+    /// The Settings tab's rows.
+    pub fn settings(&self) -> &SettingsState {
+        &self.settings
+    }
+
+    /// The setting being edited, if one is.
+    pub fn editor(&self) -> Option<&Editor> {
+        self.editing.as_ref()
     }
 
     /// Keys under an open modal: only its own apply.
@@ -760,7 +1067,7 @@ impl AppState {
                 .iter()
                 .map(|row| (row.entry.title.clone(), row.entry.package_type))
                 .collect(),
-            Tab::Progress => Vec::new(),
+            Tab::Progress | Tab::Settings => Vec::new(),
         }
     }
 
@@ -769,6 +1076,10 @@ impl AppState {
             Tab::Local => self.local.len(),
             Tab::Library => self.shown_library().len(),
             Tab::Progress => self.jobs.len(),
+            Tab::Settings => match &self.settings {
+                SettingsState::Loaded(rows) => rows.len(),
+                _ => 0,
+            },
         }
     }
 
@@ -776,7 +1087,7 @@ impl AppState {
         match tab {
             Tab::Local => Some(&mut self.local_marks),
             Tab::Library => Some(&mut self.library_marks),
-            Tab::Progress => None,
+            Tab::Progress | Tab::Settings => None,
         }
     }
 
@@ -830,7 +1141,7 @@ impl AppState {
         let marks = match tab {
             Tab::Local => &self.local_marks,
             Tab::Library => &self.library_marks,
-            Tab::Progress => return Vec::new(),
+            Tab::Progress | Tab::Settings => return Vec::new(),
         };
         let marked: Vec<PackageKey> = keys
             .iter()
@@ -1077,6 +1388,12 @@ impl AppState {
             Msg::Job(id, job_msg) => return self.on_job(id, job_msg),
             Msg::Status(text) => self.status = Some(text),
             Msg::OverlaysRebuilt(line) => return self.on_rebuilt(line),
+            Msg::Settings(Ok(rows)) => {
+                self.settings = SettingsState::Loaded(rows);
+                self.clamp(Tab::Settings);
+            }
+            Msg::Settings(Err(e)) => self.settings = SettingsState::Failed(e),
+            Msg::SettingSaved { key, result } => return self.on_setting_saved(key, result),
             // `update` already expired the quit prompt.
             Msg::Tick => {}
         }
@@ -1533,7 +1850,7 @@ mod tests {
     fn new_loads_the_installed_list_the_library_and_the_run_check() {
         let (state, effects) = AppState::new(true);
 
-        assert_eq!(effects, RELOAD);
+        assert_eq!(effects, [&RELOAD[..], &[Effect::LoadSettings]].concat());
         assert_eq!(state.tab, Tab::Local);
         assert!(matches!(state.library, LibraryState::Loading));
         assert_eq!(state.unfinished(), 0);
@@ -1601,7 +1918,7 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
-    fn next_and_prev_tab_cycle_local_library_progress() {
+    fn next_and_prev_tab_cycle_local_library_progress_settings() {
         let mut state = loaded();
 
         act(&mut state, Action::NextTab);
@@ -1609,7 +1926,11 @@ mod tests {
         act(&mut state, Action::NextTab);
         assert_eq!(state.tab, Tab::Progress);
         act(&mut state, Action::NextTab);
+        assert_eq!(state.tab, Tab::Settings);
+        act(&mut state, Action::NextTab);
         assert_eq!(state.tab, Tab::Local);
+        act(&mut state, Action::PrevTab);
+        assert_eq!(state.tab, Tab::Settings);
         act(&mut state, Action::PrevTab);
         assert_eq!(state.tab, Tab::Progress);
         act(&mut state, Action::PrevTab);
@@ -2078,7 +2399,10 @@ mod tests {
     fn refresh_reloads_everything_and_shows_the_library_loading() {
         let mut state = loaded();
 
-        assert_eq!(act(&mut state, Action::Refresh), RELOAD);
+        assert_eq!(
+            act(&mut state, Action::Refresh),
+            [&RELOAD[..], &[Effect::LoadSettings]].concat()
+        );
         assert!(matches!(state.library, LibraryState::Loading));
     }
 
@@ -3564,5 +3888,224 @@ mod tests {
         msg(&mut state, Msg::QueueRefused("busy".into()));
         msg(&mut state, Msg::Installed(Ok(Vec::new())));
         assert_eq!(status(&state), "busy");
+    }
+
+    // ------------------------------------------------------------------------
+    // Settings (#336)
+    // ------------------------------------------------------------------------
+
+    /// A loaded state on the Settings tab, its rows from a default config.
+    fn on_settings() -> AppState {
+        let mut state = loaded();
+        msg(
+            &mut state,
+            Msg::Settings(Ok(setting_rows(&ConfigFile::default()))),
+        );
+        act(&mut state, Action::GoTab(Tab::Settings));
+        state
+    }
+
+    fn select(state: &mut AppState, key: ConfigKey) {
+        let SettingsState::Loaded(rows) = &state.settings else {
+            panic!("settings not loaded");
+        };
+        state.selection[Tab::Settings.index()] = rows.iter().position(|r| r.key == key).unwrap();
+    }
+
+    fn type_text(state: &mut AppState, text: &str) {
+        for c in text.chars() {
+            act(state, Action::EditKey(EditKey::Char(c)));
+        }
+    }
+
+    #[test]
+    fn the_settings_tab_lists_every_packages_setting_in_config_order() {
+        let state = on_settings();
+        let SettingsState::Loaded(rows) = state.settings() else {
+            panic!();
+        };
+        let keys: Vec<ConfigKey> = rows.iter().map(|r| r.key).collect();
+        assert_eq!(keys, xearthlayer::config::help::PACKAGES_SETTINGS);
+        assert!(rows.iter().all(|r| !r.help.is_empty()));
+        assert_eq!(state.shown_len(Tab::Settings), 8);
+    }
+
+    #[test]
+    fn enter_edits_and_enter_again_saves_a_valid_value() {
+        let mut state = on_settings();
+        select(&mut state, ConfigKey::PackagesConcurrentDownloads);
+
+        act(&mut state, Action::Edit);
+        assert_eq!(state.editor().unwrap().buffer, "5");
+        act(&mut state, Action::EditKey(EditKey::Backspace));
+        type_text(&mut state, "8");
+        let effects = act(&mut state, Action::Confirm);
+
+        assert_eq!(
+            effects,
+            [Effect::SaveSetting {
+                key: ConfigKey::PackagesConcurrentDownloads,
+                value: "8".to_string()
+            }]
+        );
+        assert!(state.editor().is_none());
+        assert!(status(&state).contains("Saving packages.concurrent_downloads"));
+    }
+
+    #[test]
+    fn an_invalid_value_is_refused_and_stays_open_to_correct() {
+        let mut state = on_settings();
+        select(&mut state, ConfigKey::PackagesConcurrentDownloads);
+        act(&mut state, Action::Edit);
+        type_text(&mut state, "0");
+
+        assert!(
+            act(&mut state, Action::Confirm).is_empty(),
+            "nothing is saved"
+        );
+        assert_eq!(state.editor().unwrap().buffer, "50");
+        let said = status(&state);
+        assert!(said.contains("packages.concurrent_downloads"), "{said}");
+        assert_eq!(
+            said.matches("packages.concurrent_downloads").count(),
+            1,
+            "named once: {said}"
+        );
+    }
+
+    #[test]
+    fn esc_cancels_and_an_unchanged_value_saves_nothing() {
+        let mut state = on_settings();
+        select(&mut state, ConfigKey::PackagesTempDir);
+        act(&mut state, Action::Edit);
+        type_text(&mut state, "/tmp/x");
+        act(&mut state, Action::Dismiss);
+        assert!(state.editor().is_none());
+        assert_eq!(status(&state), "Edit cancelled");
+
+        act(&mut state, Action::Edit);
+        assert!(act(&mut state, Action::Confirm).is_empty());
+        assert!(status(&state).contains("unchanged"));
+    }
+
+    #[test]
+    fn the_editor_inserts_and_deletes_at_the_cursor() {
+        let mut state = on_settings();
+        select(&mut state, ConfigKey::PackagesTempDir);
+        act(&mut state, Action::Edit);
+        type_text(&mut state, "ac");
+        act(&mut state, Action::EditKey(EditKey::Left));
+        type_text(&mut state, "b");
+        act(&mut state, Action::EditKey(EditKey::Home));
+        act(&mut state, Action::EditKey(EditKey::Delete));
+        act(&mut state, Action::EditKey(EditKey::End));
+        type_text(&mut state, "é");
+        act(&mut state, Action::EditKey(EditKey::Backspace));
+        let editor = state.editor().unwrap();
+        assert_eq!(editor.buffer, "bc");
+        assert_eq!(editor.cursor, 2);
+    }
+
+    #[test]
+    fn a_flag_flips_with_space_or_the_arrows_and_ignores_typing() {
+        let mut state = on_settings();
+        select(&mut state, ConfigKey::PackagesAutoInstallOverlays);
+        act(&mut state, Action::Edit);
+        assert_eq!(state.editor().unwrap().buffer, "false");
+        act(&mut state, Action::EditKey(EditKey::Char(' ')));
+        type_text(&mut state, "xyz");
+        assert_eq!(state.editor().unwrap().buffer, "true");
+        act(&mut state, Action::EditKey(EditKey::Right));
+        act(&mut state, Action::EditKey(EditKey::Left));
+        assert_eq!(
+            act(&mut state, Action::Confirm),
+            [Effect::SaveSetting {
+                key: ConfigKey::PackagesAutoInstallOverlays,
+                value: "true".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn settings_are_read_only_while_run_is_active() {
+        let mut state = on_settings();
+        msg(
+            &mut state,
+            Msg::RunActive(Some(crate::commands::packages::test_support::run_active(
+                4242,
+            ))),
+        );
+
+        act(&mut state, Action::Edit);
+
+        assert!(state.editor().is_none());
+        assert!(status(&state).contains("pid 4242") && status(&state).contains("read-only"));
+    }
+
+    #[test]
+    fn settings_are_read_only_while_jobs_are_queued_or_running() {
+        let mut state = on_settings();
+        queue(
+            &mut state,
+            &[("EU-WEST", PackageType::Ortho, Some("1.0.0"))],
+        );
+
+        act(&mut state, Action::Edit);
+
+        assert!(state.editor().is_none());
+        assert!(status(&state).contains("finish or cancel the jobs first"));
+    }
+
+    #[test]
+    fn a_saved_setting_reloads_what_it_changes() {
+        let rows = || Ok(setting_rows(&ConfigFile::default()));
+        let mut state = on_settings();
+        let saved = |state: &mut AppState, key| {
+            msg(
+                state,
+                Msg::SettingSaved {
+                    key,
+                    result: rows(),
+                },
+            )
+        };
+
+        assert_eq!(
+            saved(&mut state, ConfigKey::PackagesLibraryUrl),
+            [Effect::LoadLibrary]
+        );
+        assert!(matches!(state.library, LibraryState::Loading));
+        assert_eq!(
+            saved(&mut state, ConfigKey::PackagesInstallLocation),
+            RELOAD
+        );
+        assert!(saved(&mut state, ConfigKey::PackagesConcurrentDownloads).is_empty());
+        assert_eq!(status(&state), "Saved packages.concurrent_downloads");
+
+        msg(
+            &mut state,
+            Msg::SettingSaved {
+                key: ConfigKey::PackagesTempDir,
+                result: Err(
+                    "XEarthLayer is running (pid 7): settings are read-only until it stops".into(),
+                ),
+            },
+        );
+        assert!(status(&state).contains("pid 7"));
+        assert!(!state.saving);
+    }
+
+    #[test]
+    fn a_second_edit_waits_for_the_save_in_flight() {
+        let mut state = on_settings();
+        select(&mut state, ConfigKey::PackagesTempDir);
+        act(&mut state, Action::Edit);
+        type_text(&mut state, "/tmp/x");
+        act(&mut state, Action::Confirm);
+
+        act(&mut state, Action::Edit);
+
+        assert!(state.editor().is_none());
+        assert!(status(&state).starts_with("saving"));
     }
 }

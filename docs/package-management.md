@@ -41,15 +41,16 @@ xearthlayer packages
 
 The setup wizard offers to open it when it finishes, so a first install can go from setup straight to choosing scenery. The package manager needs a terminal. When input or output is not a terminal (in a script, or piped), `xearthlayer packages` prints the command help instead, and the commands below work as they always have.
 
-### The Three Tabs
+### The Four Tabs
 
-Switch tabs with `1`, `2` and `3`, or with Tab and Shift+Tab.
+Switch tabs with `1`, `2`, `3` and `4`, or with Tab and Shift+Tab.
 
 | Tab | Shows |
 |-----|-------|
 | 1 Local | The packages installed on this machine, with version, size and whether the library has a newer version. Sizes are recorded when a package installs, in `.xearthlayer-package-sizes` in the packages folder; a package installed by an earlier version is measured once, the first time its size is shown. |
 | 2 Library | Every package the library offers, with whether it is not installed, up to date, or has an update. `t` cycles the list between all packages, ortho only and overlay only. |
 | 3 Progress | The jobs of this session: queued, downloading, extracting, installing, removing, done, failed or cancelled. The tab title counts the unfinished ones. |
+| 4 Settings | The `[packages]` settings of `config.ini`, with their values, for editing. See [Settings](#settings). |
 
 Local and Library have a detail pane beside the list for the selected package, which names its continent from the region code (`AF-NORTH` is Africa). Marked rows are drawn in cyan. While the installed list is first read, the Local tab shows a spinner with "Reading the installed packages…", and while either list is read again its title shows the spinner and "reading" beside the count; after the queue changes an overlay, the status line says "Rebuilding the overlay folder…" until the rebuild is done. Queuing a job never switches tabs: the status line says how many jobs are queued, and you look at Progress when you want to.
 
@@ -59,7 +60,7 @@ Press `?` in the package manager for this list.
 
 | Keys | Where | Action |
 |------|-------|--------|
-| `1` `2` `3`, Tab, Shift+Tab | everywhere | Switch tabs |
+| `1` `2` `3` `4`, Tab, Shift+Tab | everywhere | Switch tabs |
 | Up, Down, `j`, `k`, PgUp, PgDn, Home, End | everywhere | Move the selection |
 | `r` | everywhere | Refresh the lists |
 | `?` | everywhere | Help |
@@ -73,6 +74,7 @@ Press `?` in the package manager for this list.
 | `c` | Progress | Cancel the selected job |
 | `C` | Progress | Cancel every unfinished job |
 | `x` | Progress | Clear finished jobs from the list |
+| Enter | Settings | Edit the selected setting, and save it with Enter again |
 
 `u`, `d` and `i` act on the marked rows. With nothing marked, they act on the selected row. A confirmation asks before an install, a delete, a cancel of all jobs and a quit: `y` or Enter confirms, `n` or Esc backs out. An update starts at once, without a dialog, and leaves out packages that are already up to date.
 
@@ -86,6 +88,16 @@ Press `?` in the package manager for this list.
 6. When the last job finishes, the lists refresh and the overlay folder is rebuilt if an overlay changed. Press `q` to leave. The package manager prints one line saying what the session did.
 
 Cancel a job with `c` on the Progress tab. As on the command line, a package being replaced keeps its old version, and temporary files are removed.
+
+### Settings
+
+The Settings tab lists every setting of the `[packages]` section of `config.ini`: the library URL, where packages install, the Custom Scenery folder, the three overlay and X-World Pro switches, the temp folder and the number of concurrent downloads. A setting that is not in the file shows its default, dimmed and in brackets. The Details pane shows the same help text as the comments in `config.ini`.
+
+Press Enter to edit the selected setting. Type the new value and press Enter again to save it, or Esc to cancel. A true or false setting flips with Space or the arrow keys. A value is checked the same way `xearthlayer config set` checks it: an invalid one is refused with the reason, and the editor stays open so you can correct it. The file is written in one step, so an interrupted save leaves the old file in place.
+
+A saved setting takes effect at once. The next job uses the new temp folder and download count, a new library URL reloads the Library tab, and a new install location reloads the Local tab. `xearthlayer run` reads the settings only when it starts.
+
+Settings are read-only while `xearthlayer run` is active, and while any job is queued or running, because a running job uses the folders it started with. The Details pane says which, and Enter is dimmed while `run` is active.
 
 ### Quitting and Signals
 

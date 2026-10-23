@@ -15,7 +15,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 
 use xearthlayer::manager::{
@@ -24,13 +24,14 @@ use xearthlayer::manager::{
 };
 use xearthlayer_package::{LibraryEntry, PackageMetadata, PackageType};
 
-use super::app::{Effect, JobMsg, LocalRow, Msg, PackageKey};
+use super::app::{setting_rows, Effect, JobMsg, LocalRow, Msg, PackageKey};
 use crate::commands::packages::actions::{
     after_removal, check_removal, check_replacement, library_status, rebuild_overlays, LibraryRow,
     LibraryStatus,
 };
 use crate::commands::packages::traits::PackageManagerService;
 use crate::signals::ActiveQueue;
+use xearthlayer::config::{ConfigFile, ConfigKey};
 
 // ============================================================================
 // Queue events
@@ -91,11 +92,46 @@ pub struct Settings {
     pub custom_scenery_path: Option<PathBuf>,
     pub disable_overlays: bool,
     pub xworld_pro: bool,
+    /// Where a queue downloads to.
+    pub temp_dir: PathBuf,
+    /// Parts a queue downloads at once.
+    pub concurrent_downloads: usize,
+}
+
+impl Settings {
+    /// The package settings `config` gives, defaults resolved.
+    pub fn from_config(config: &ConfigFile) -> Self {
+        use crate::commands::packages::{
+            default_custom_scenery_dir, default_install_dir, default_temp_dir,
+        };
+        Self {
+            install_dir: default_install_dir(config),
+            library_url: config.packages.library_url.clone(),
+            custom_scenery_path: default_custom_scenery_dir(config),
+            disable_overlays: config.packages.disable_overlays,
+            xworld_pro: config.packages.xworld_pro,
+            temp_dir: default_temp_dir(config),
+            concurrent_downloads: config.packages.concurrent_downloads,
+        }
+    }
+}
+
+/// The settings every part of the runner reads. A saved setting (#336)
+/// replaces them; each read takes a copy, so a save never waits for a slow
+/// read to finish.
+type SharedSettings = Arc<RwLock<Settings>>;
+
+fn current(settings: &SharedSettings) -> Settings {
+    settings
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 /// Carries out [`Effect`]s, answering with [`Msg`]s on `tx`.
 ///
-/// `start_queue` starts a queue whose observer sends on the same channel.
+/// `start_queue` starts a queue, with the settings in force, whose observer
+/// sends on the same channel.
 pub struct Effects<S: Stages, F> {
     start_queue: F,
     queue: Option<InstallQueue<S>>,
@@ -107,8 +143,9 @@ pub struct Effects<S: Stages, F> {
     manager: Arc<dyn PackageManagerService>,
     /// The package each remove job removes, until the job finishes.
     removing: HashMap<JobId, PackageKey>,
-    install_dir: PathBuf,
-    custom_scenery_path: Option<PathBuf>,
+    settings: SharedSettings,
+    /// The configuration file the Settings tab reads and saves.
+    config_path: PathBuf,
     /// The queue was abandoned: on exit, wait only for a running swap.
     abandoned: bool,
 }
@@ -116,7 +153,7 @@ pub struct Effects<S: Stages, F> {
 impl<S, F> Effects<S, F>
 where
     S: Stages,
-    F: Fn() -> ManagerResult<InstallQueue<S>>,
+    F: Fn(&Settings) -> ManagerResult<InstallQueue<S>>,
 {
     pub fn new(
         start_queue: F,
@@ -125,20 +162,27 @@ where
         active: ActiveQueue,
         tx: Sender<Msg>,
     ) -> Self {
-        let install_dir = settings.install_dir.clone();
-        let custom_scenery_path = settings.custom_scenery_path.clone();
+        let settings = Arc::new(RwLock::new(settings));
         Self {
             start_queue,
             queue: None,
             active,
-            worker: Worker::start(Arc::clone(&manager), settings, tx.clone()),
+            worker: Worker::start(Arc::clone(&manager), Arc::clone(&settings), tx.clone()),
             manager,
             tx,
             removing: HashMap::new(),
-            install_dir,
-            custom_scenery_path,
+            settings,
+            config_path: xearthlayer::paths::config_file(),
             abandoned: false,
         }
+    }
+
+    /// Read and save settings in `path` rather than the user's
+    /// configuration file.
+    #[cfg(test)]
+    pub fn with_config_path(mut self, path: PathBuf) -> Self {
+        self.config_path = path;
+        self
     }
 
     /// Carry out `effect`. `Break` means the runner should leave.
@@ -149,6 +193,8 @@ where
             Effect::CheckRun => self.worker.load(Load::Run),
             Effect::Install(entries) => self.worker.send(Read::Metadata(entries)),
             Effect::RebuildOverlays => self.worker.rebuild_overlays(),
+            Effect::LoadSettings => self.load_settings(),
+            Effect::SaveSetting { key, value } => self.save_setting(key, &value),
             Effect::Submit {
                 packages,
                 replacing,
@@ -175,7 +221,8 @@ where
         match job {
             JobMsg::Removed => {
                 if let Some((region, package_type)) = self.removing.remove(id) {
-                    after_removal(&region, package_type, self.custom_scenery_path.as_deref());
+                    let scenery = current(&self.settings).custom_scenery_path;
+                    after_removal(&region, package_type, scenery.as_deref());
                 }
             }
             JobMsg::Installed | JobMsg::Cancelled | JobMsg::Failed(_) => {
@@ -225,7 +272,7 @@ where
     /// start.
     fn queue(&mut self) -> Result<&InstallQueue<S>, String> {
         if self.queue.is_none() {
-            let queue = (self.start_queue)().map_err(|e| e.to_string())?;
+            let queue = (self.start_queue)(&current(&self.settings)).map_err(|e| e.to_string())?;
             self.active.set(queue.canceller());
             self.queue = Some(queue);
         }
@@ -234,8 +281,47 @@ where
 
     /// The packages installed on disk.
     fn installed(&self) -> ManagerResult<Vec<PackageKey>> {
-        let store = self.manager.create_store(&self.install_dir);
+        let store = self
+            .manager
+            .create_store(&current(&self.settings).install_dir);
         self.manager.list_package_keys(&store)
+    }
+
+    /// The configuration in `config_path`; defaults when there is none yet.
+    fn config(&self) -> Result<ConfigFile, String> {
+        if !self.config_path.exists() {
+            return Ok(ConfigFile::default());
+        }
+        ConfigFile::load_from(&self.config_path).map_err(|e| e.to_string())
+    }
+
+    fn load_settings(&self) {
+        self.send(Msg::Settings(self.config().map(|c| setting_rows(&c))));
+    }
+
+    /// Save one setting as `xearthlayer config set` does, unless `run` is
+    /// serving: the state's answer may be stale. A saved setting is in force
+    /// for every later read and the next queue.
+    fn save_setting(&self, key: ConfigKey, value: &str) {
+        let result = match check_removal(self.manager.as_ref()) {
+            Err(run) => Err(format!(
+                "XEarthLayer is running (pid {}): settings are read-only until it stops",
+                run.pid
+            )),
+            Ok(()) => self.config().and_then(|mut config| {
+                key.set(&mut config, value).map_err(|e| e.to_string())?;
+                config
+                    .save_to(&self.config_path)
+                    .map_err(|e| format!("Could not save {}: {e}", self.config_path.display()))?;
+                *self
+                    .settings
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Settings::from_config(&config);
+                Ok(setting_rows(&config))
+            }),
+        };
+        self.send(Msg::SettingSaved { key, result });
     }
 
     /// Submit the installs as one batch. Each job's `Queued` comes from the
@@ -424,7 +510,7 @@ struct Worker {
 impl Worker {
     fn start(
         manager: Arc<dyn PackageManagerService>,
-        settings: Settings,
+        settings: SharedSettings,
         out: Sender<Msg>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
@@ -563,7 +649,7 @@ fn run_worker(
     rx: Receiver<Read>,
     flags: &WorkerFlags,
     manager: &dyn PackageManagerService,
-    settings: &Settings,
+    settings: &SharedSettings,
     out: &Sender<Msg>,
 ) {
     let mut reads = Reads {
@@ -598,7 +684,7 @@ fn run_worker(
 /// The worker's reads, and what it keeps of the last ones.
 struct Reads<'a> {
     manager: &'a dyn PackageManagerService,
-    settings: &'a Settings,
+    settings: &'a SharedSettings,
     out: &'a Sender<Msg>,
     /// The last installed list and library rows, so each answer can be
     /// joined with the other.
@@ -613,7 +699,8 @@ impl Reads<'_> {
 
     fn run(&mut self, read: Read) {
         let manager = self.manager;
-        let settings = self.settings;
+        let snapshot = current(self.settings);
+        let settings = &snapshot;
         match read {
             Read::Load(Load::Installed) => {
                 let store = manager.create_store(&settings.install_dir);
@@ -900,10 +987,12 @@ mod tests {
             custom_scenery_path: None,
             disable_overlays: false,
             xworld_pro: false,
+            temp_dir: PathBuf::from("/tmp/xel-test"),
+            concurrent_downloads: 1,
         }
     }
 
-    type StartQueue = Box<dyn Fn() -> ManagerResult<InstallQueue<FakeStages>> + Send>;
+    type StartQueue = Box<dyn Fn(&Settings) -> ManagerResult<InstallQueue<FakeStages>> + Send>;
     type TestEffects = Effects<FakeStages, StartQueue>;
 
     /// Effects whose queue runs `stages`, with `manager` behind the reads.
@@ -914,7 +1003,7 @@ mod tests {
     ) -> (TestEffects, Receiver<Msg>) {
         let (tx, rx) = mpsc::channel();
         let observer_tx = tx.clone();
-        let start: StartQueue = Box::new(move || {
+        let start: StartQueue = Box::new(move |_| {
             InstallQueue::start(
                 stages.clone(),
                 Arc::new(ChannelObserver::new(observer_tx.clone())),
@@ -1975,5 +2064,146 @@ mod tests {
         // A later load is answered too, not swallowed as already pending.
         worker.load(Load::Installed);
         assert!(matches!(rx.try_recv(), Ok(Msg::Installed(Err(_)))));
+    }
+
+    // ------------------------------------------------------------------------
+    // Settings (#336)
+    // ------------------------------------------------------------------------
+
+    fn settings_saved(
+        rx: &Receiver<Msg>,
+    ) -> (
+        ConfigKey,
+        Result<Vec<crate::ui::packages::app::SettingRow>, String>,
+    ) {
+        match until(rx, |m| matches!(m, Msg::SettingSaved { .. })).pop() {
+            Some(Msg::SettingSaved { key, result }) => (key, result),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_load_from_the_configuration_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        let mut config = ConfigFile::default();
+        config.packages.concurrent_downloads = 7;
+        config.save_to(&path).unwrap();
+        let (effects, rx) = effects_on(FakeStages::in_dir(dir.path()));
+        let mut effects = effects.with_config_path(path);
+
+        let _ = effects.apply(Effect::LoadSettings);
+
+        let Some(Msg::Settings(Ok(rows))) = until(&rx, |m| matches!(m, Msg::Settings(_))).pop()
+        else {
+            panic!("no settings");
+        };
+        let row = rows
+            .iter()
+            .find(|r| r.key == ConfigKey::PackagesConcurrentDownloads)
+            .unwrap();
+        assert_eq!(row.value, "7");
+    }
+
+    #[test]
+    fn a_saved_setting_is_written_as_config_set_writes_it_and_used_by_the_next_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        ConfigFile::default().save_to(&path).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let seen: Arc<std::sync::Mutex<Vec<PathBuf>>> = Arc::default();
+        let recorded = Arc::clone(&seen);
+        let start: StartQueue = Box::new(move |settings: &Settings| {
+            recorded.lock().unwrap().push(settings.temp_dir.clone());
+            Err(ManagerError::DownloadFailed {
+                url: "test".into(),
+                reason: "no queue in this test".into(),
+            })
+        });
+        let mut effects = Effects::new(
+            start,
+            Arc::new(FakeManager::default()),
+            settings(),
+            ActiveQueue::default(),
+            tx,
+        )
+        .with_config_path(path.clone());
+
+        let _ = effects.apply(Effect::SaveSetting {
+            key: ConfigKey::PackagesTempDir,
+            value: "/tmp/xel-saved-temp".to_string(),
+        });
+        let (key, result) = settings_saved(&rx);
+
+        assert_eq!(key, ConfigKey::PackagesTempDir);
+        let rows = result.unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.key == ConfigKey::PackagesTempDir)
+                .unwrap()
+                .value,
+            "/tmp/xel-saved-temp"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("\ntemp_dir = /tmp/xel-saved-temp\n"),
+            "{text}"
+        );
+
+        // The next queue starts with the saved setting.
+        let _ = effects.apply(Effect::Remove(vec![(
+            "EU-WEST".to_string(),
+            PackageType::Ortho,
+        )]));
+        until(&rx, |m| matches!(m, Msg::QueueRefused(_)));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [PathBuf::from("/tmp/xel-saved-temp")]
+        );
+    }
+
+    #[test]
+    fn an_invalid_setting_is_refused_and_the_file_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        ConfigFile::default().save_to(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (effects, rx) = effects_on(FakeStages::in_dir(dir.path()));
+        let mut effects = effects.with_config_path(path.clone());
+
+        let _ = effects.apply(Effect::SaveSetting {
+            key: ConfigKey::PackagesConcurrentDownloads,
+            value: "99".to_string(),
+        });
+
+        let (_, result) = settings_saved(&rx);
+        assert!(result
+            .unwrap_err()
+            .contains("packages.concurrent_downloads"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_setting_is_not_saved_while_run_is_active() {
+        // The state checked when editing began; run may have started since.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        ConfigFile::default().save_to(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (effects, rx) = effects_with(
+            FakeStages::in_dir(dir.path()),
+            FakeManager::default().with_running_instance(4242),
+            settings(),
+        );
+        let mut effects = effects.with_config_path(path.clone());
+
+        let _ = effects.apply(Effect::SaveSetting {
+            key: ConfigKey::PackagesTempDir,
+            value: "/tmp/elsewhere".to_string(),
+        });
+
+        let (_, result) = settings_saved(&rx);
+        assert!(result.unwrap_err().contains("pid 4242"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 }

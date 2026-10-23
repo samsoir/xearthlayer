@@ -5,10 +5,14 @@
 
 use std::path::Path;
 
+use super::help::ini_comment;
+use super::keys::ConfigKey;
 use super::settings::ConfigFile;
 use super::size::format_size;
 
 /// Convert a `ConfigFile` to a commented INI string for saving.
+/// The `[packages]` comments come from [`super::help`], shared with the
+/// package manager's Settings tab (#336).
 pub(super) fn to_config_string(config: &ConfigFile) -> String {
     let google_api_key = config.provider.google_api_key.as_deref().unwrap_or("");
     let mapbox_access_token = config.provider.mapbox_access_token.as_deref().unwrap_or("");
@@ -137,33 +141,21 @@ max_retries = {}
 scenery_dir = {}
 
 [packages]
-; URL to the XEarthLayer package library index
-; This is where available packages are discovered for 'xearthlayer packages check/install'
+{help_library_url}
 library_url = {}
-; Local directory for installed packages
-; Default: {packages_default}
+{help_install_location}
 install_location = {}
-; X-Plane Custom Scenery directory for overlay symlinks
-; If empty, uses xplane.scenery_dir or auto-detects
+{help_custom_scenery_path}
 custom_scenery_path = {}
-; Automatically install overlay packages when installing ortho for same region
+{help_auto_install_overlays}
 auto_install_overlays = {}
-; Suppress XEL overlays at runtime by removing the consolidated yzXEL_overlay/
-; symlink folder from Custom Scenery on `xearthlayer run` startup. Overlay
-; packages are still downloaded and stored locally — only the symlink that
-; X-Plane reads is suppressed. Use this when running third-party overlay
-; scenery (e.g., SimHeaven) that conflicts with XEL overlays. (default: false)
+{help_disable_overlays}
 disable_overlays = {}
-; Give SimHeaven X-World Pro priority over XEarthLayer overlays. On every
-; `xearthlayer run`, overlays are left out where X-World Pro is active and the
-; scenery order and X-World Pro setup are checked. Set by `xearthlayer setup`.
-; (default: false)
+{help_xworld_pro}
 xworld_pro = {}
-; Temporary directory for package downloads
-; Default: {temp_default}
-; Large packages are downloaded here before extraction
+{help_temp_dir}
 temp_dir = {}
-; Number of concurrent part downloads (1-10, default: 5)
+{help_concurrent_downloads}
 concurrent_downloads = {}
 
 [logging]
@@ -327,15 +319,21 @@ symbols = {}
         config.night.brightness,
         // Terminal dashboard settings
         config.tui.symbols,
-        packages_default = path_to_string(&crate::paths::packages_dir()),
-        temp_default = path_to_string(&crate::paths::temp_dir()),
+        help_library_url = ini_comment(ConfigKey::PackagesLibraryUrl),
+        help_install_location = ini_comment(ConfigKey::PackagesInstallLocation),
+        help_custom_scenery_path = ini_comment(ConfigKey::PackagesCustomSceneryPath),
+        help_auto_install_overlays = ini_comment(ConfigKey::PackagesAutoInstallOverlays),
+        help_disable_overlays = ini_comment(ConfigKey::PackagesDisableOverlays),
+        help_xworld_pro = ini_comment(ConfigKey::PackagesXworldPro),
+        help_temp_dir = ini_comment(ConfigKey::PackagesTempDir),
+        help_concurrent_downloads = ini_comment(ConfigKey::PackagesConcurrentDownloads),
         log_default = path_to_string(&crate::paths::log_file()),
         patches_default = path_to_string(&crate::paths::patches_dir()),
     )
 }
 
 /// Convert path to string, collapsing home dir to ~.
-fn path_to_string(path: &Path) -> String {
+pub(super) fn path_to_string(path: &Path) -> String {
     if let Some(home) = dirs::home_dir() {
         if let Ok(stripped) = path.strip_prefix(&home) {
             return format!("~/{}", stripped.display());

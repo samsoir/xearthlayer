@@ -28,9 +28,7 @@ use super::app::{Action, AppState, Effect, Input, Msg};
 use super::effects::{ChannelObserver, Effects, Settings};
 use super::input::action_for;
 use super::view;
-use crate::commands::packages::{
-    default_custom_scenery_dir, default_install_dir, default_temp_dir, DefaultPackageManagerService,
-};
+use crate::commands::packages::DefaultPackageManagerService;
 use crate::error::CliError;
 use crate::signals::{terminal_gone, ActiveQueue, Signal, SignalWatch};
 
@@ -52,20 +50,16 @@ pub fn run_manager(config: &ConfigFile) -> Result<String, CliError> {
     let watch = SignalWatch::start_handling_all(active.clone(), |_| {})
         .map_err(|e| CliError::Packages(format!("could not install signal handlers: {e}")))?;
 
-    let install_dir = default_install_dir(config);
-    let temp_dir = default_temp_dir(config);
-    let concurrent_downloads = config.packages.concurrent_downloads;
-    let settings = Settings {
-        install_dir: install_dir.clone(),
-        library_url: config.packages.library_url.clone(),
-        custom_scenery_path: default_custom_scenery_dir(config),
-        disable_overlays: config.packages.disable_overlays,
-        xworld_pro: config.packages.xworld_pro,
-    };
+    let settings = Settings::from_config(config);
     let observer_tx = tx.clone();
-    let start_queue = move || {
-        let installer = PackageInstaller::new(LocalPackageStore::new(&install_dir), &temp_dir)
-            .with_parallel_downloads(concurrent_downloads);
+    // Started with the settings in force, so a setting saved on the Settings
+    // tab applies to the next queue.
+    let start_queue = move |settings: &Settings| {
+        let installer = PackageInstaller::new(
+            LocalPackageStore::new(&settings.install_dir),
+            &settings.temp_dir,
+        )
+        .with_parallel_downloads(settings.concurrent_downloads);
         InstallQueue::start(
             installer,
             Arc::new(ChannelObserver::new(observer_tx.clone())),
@@ -115,7 +109,7 @@ fn run_loop<S, F>(
 ) -> io::Result<()>
 where
     S: Stages,
-    F: Fn() -> ManagerResult<InstallQueue<S>>,
+    F: Fn(&Settings) -> ManagerResult<InstallQueue<S>>,
 {
     let mut todo: VecDeque<Effect> = initial.into();
     // Signals acted on so far.
@@ -142,7 +136,9 @@ where
         if event::poll(KEY_POLL)? {
             loop {
                 if let Event::Key(key) = event::read()? {
-                    if let Some(action) = action_for(key, state.tab(), state.modal()) {
+                    if let Some(action) =
+                        action_for(key, state.tab(), state.modal(), state.editor().is_some())
+                    {
                         todo.extend(state.update(Input::Action(action), Instant::now()));
                     }
                 }

@@ -18,10 +18,11 @@ use crate::ui::packages::app::{AppState, Tab};
 const SPINNER_FRAME_MILLIS: u128 = 100;
 
 /// The tabs in title-bar order, with the digit that opens each.
-const TABS: [(Tab, char, &str); 3] = [
+const TABS: [(Tab, char, &str); 4] = [
     (Tab::Local, '1', "Local"),
     (Tab::Library, '2', "Library"),
     (Tab::Progress, '3', "Progress"),
+    (Tab::Settings, '4', "Settings"),
 ];
 
 /// ` XEarthLayer Packages   [1 Local]  2 Library  3 Progress (N)`
@@ -118,6 +119,12 @@ pub fn footer_keys(tab: Tab) -> &'static [(&'static str, &'static str)] {
             ("?", "help"),
             ("q", "quit"),
         ],
+        Tab::Settings => &[
+            ("Enter", "edit"),
+            ("r", "reload"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
     }
 }
 
@@ -129,7 +136,9 @@ pub fn footer(frame: &mut Frame, area: Rect, tab: Tab, run_active: bool) {
         if i > 0 {
             spans.push(Span::raw("  "));
         }
-        let refused = run_active && tab == Tab::Local && matches!(*key, "u" | "d");
+        let refused = run_active
+            && ((tab == Tab::Local && matches!(*key, "u" | "d"))
+                || (tab == Tab::Settings && *key == "Enter"));
         let (key_style, what_style) = if refused {
             let dim = Style::default().fg(Color::DarkGray);
             (dim, dim)

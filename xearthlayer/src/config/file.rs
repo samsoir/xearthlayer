@@ -76,7 +76,11 @@ impl ConfigFile {
         }
 
         let content = super::writer::to_config_string(self);
-        std::fs::write(path, content).map_err(|e| ConfigFileError::WriteError(e.to_string()))
+        // Atomic: an interrupted save leaves the old file, never half of one.
+        crate::cache::integrity::write_atomic(path, |w| {
+            std::io::Write::write_all(w, content.as_bytes())
+        })
+        .map_err(|e| ConfigFileError::WriteError(e.to_string()))
     }
 
     /// Create the default config file if it doesn't exist.

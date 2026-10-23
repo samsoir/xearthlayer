@@ -29,6 +29,7 @@
 
 pub(crate) mod defaults;
 mod file;
+pub mod help;
 mod keys;
 mod parser;
 mod settings;

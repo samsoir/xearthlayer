@@ -4,7 +4,7 @@
 //! - `chrome`: title bar, run banner, status line, footer, and the helpers
 //!   every list shares
 //! - `detail`: the details pane
-//! - `local`, `library`, `progress`: the three tabs
+//! - `local`, `library`, `progress`, `settings`: the four tabs
 //! - `help`: the help and confirmation dialogs
 
 pub mod chrome;
@@ -13,3 +13,4 @@ pub mod help;
 pub mod library;
 pub mod local;
 pub mod progress;
+pub mod settings;
