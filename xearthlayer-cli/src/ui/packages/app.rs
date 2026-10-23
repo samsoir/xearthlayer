@@ -181,7 +181,10 @@ pub enum Msg {
     /// event, so it arrives before any other message for the job.
     Queued(JobId, JobSummary),
     /// `submit_batch` returned: the request was accepted, and these of its
-    /// packages were refused, each naming its package.
+    /// packages were refused, each naming its package. The runner sends it
+    /// after every `Queued` of that batch, and after a [`Effect::Submit`] or
+    /// [`Effect::Remove`] it always sends this or `QueueRefused`: until then
+    /// the queue is not released.
     Submitted {
         refused: Vec<String>,
     },
@@ -314,6 +317,9 @@ pub struct AppState {
     held_marks: Option<(Tab, BTreeSet<PackageKey>)>,
     /// Jobs queued since the request in flight was made.
     queued_count: usize,
+    /// A `Submit` or `Remove` was given and the queue has not answered, so
+    /// the queue must not be released yet.
+    submitting: bool,
     modal: Option<Modal>,
     status: Option<String>,
     run_active: Option<u32>,
@@ -341,6 +347,7 @@ impl AppState {
             library_marks: BTreeSet::new(),
             held_marks: None,
             queued_count: 0,
+            submitting: false,
             modal: None,
             status: None,
             run_active: None,
@@ -359,6 +366,10 @@ impl AppState {
         if let Some(Modal::ConfirmQuit { since, .. }) = self.modal {
             if now.saturating_duration_since(since) > QUIT_CONFIRM_TIMEOUT {
                 self.modal = None;
+                // Dismissing the expired prompt only clears it.
+                if matches!(input, Input::Action(Action::Dismiss)) {
+                    return Vec::new();
+                }
             }
         }
         match input {
@@ -486,6 +497,7 @@ impl AppState {
             }
             Some(Modal::ConfirmDelete { targets, .. }) => {
                 self.hold_marks(Tab::Local);
+                self.submitting = true;
                 vec![Effect::Remove(targets)]
             }
             Some(Modal::ConfirmInstall { entries, .. }) => {
@@ -516,9 +528,11 @@ impl AppState {
         Vec::new()
     }
 
-    /// Quitting was confirmed: exit, or cancel the running jobs first.
+    /// Quitting was confirmed: exit, or cancel the running jobs first. A
+    /// submission in flight counts as running: its jobs are cancelled as they
+    /// are queued, and the exit comes once the queue has answered.
     fn quit_now(&mut self) -> Vec<Effect> {
-        if self.unfinished() == 0 {
+        if self.unfinished() == 0 && !self.submitting {
             return vec![Effect::Exit];
         }
         self.quitting = Quitting::Cancelling;
@@ -851,9 +865,7 @@ impl AppState {
             Msg::QueueRefused(reason) => {
                 self.status = Some(reason);
                 self.restore_marks();
-                if self.unfinished() == 0 {
-                    return vec![Effect::ReleaseQueue];
-                }
+                return self.queue_answered();
             }
             Msg::Job(id, job_msg) => return self.on_job(id, job_msg),
             Msg::Status(text) => self.status = Some(text),
@@ -888,12 +900,15 @@ impl AppState {
             self.restore_marks();
             return Vec::new();
         }
+        self.submitting = true;
         vec![Effect::Submit(fetched)]
     }
 
     fn on_queued(&mut self, id: JobId, summary: JobSummary) -> Vec<Effect> {
         self.queued_count += 1;
-        self.status = Some(self.queued_note());
+        if self.quitting == Quitting::No {
+            self.status = Some(self.queued_note());
+        }
         if summary.package_type == PackageType::Overlay {
             self.overlay_jobs.insert(id);
         }
@@ -920,14 +935,36 @@ impl AppState {
             notes.push(self.queued_note());
         }
         notes.extend(refused);
-        if !notes.is_empty() {
+        // While cancelling, the status keeps saying how to quit now.
+        if !notes.is_empty() && self.quitting == Quitting::No {
             self.status = Some(notes.join("; "));
         }
         self.queued_count = 0;
-        if self.unfinished() == 0 {
-            return vec![Effect::ReleaseQueue];
+        self.queue_answered()
+    }
+
+    /// The queue answered the submission in flight: if that left it idle,
+    /// take the idle step the finished jobs deferred.
+    fn queue_answered(&mut self) -> Vec<Effect> {
+        if std::mem::take(&mut self.submitting) && self.unfinished() == 0 {
+            return self.idle();
         }
         Vec::new()
+    }
+
+    /// The queue went idle: rebuild the overlays once if any changed, release
+    /// the queue, and exit if quitting was waiting for this. Taken exactly
+    /// once per transition to idle.
+    fn idle(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        if std::mem::take(&mut self.overlay_changed) {
+            effects.push(Effect::RebuildOverlays);
+        }
+        effects.push(Effect::ReleaseQueue);
+        if self.quitting == Quitting::Cancelling {
+            effects.push(Effect::Exit);
+        }
+        effects
     }
 
     /// "N jobs queued: see Progress"
@@ -983,14 +1020,10 @@ impl AppState {
         }
 
         let mut effects = reload();
-        if self.unfinished() == 0 {
-            if std::mem::take(&mut self.overlay_changed) {
-                effects.push(Effect::RebuildOverlays);
-            }
-            effects.push(Effect::ReleaseQueue);
-            if self.quitting == Quitting::Cancelling {
-                effects.push(Effect::Exit);
-            }
+        // With a submission in flight the queue is about to get more work:
+        // the queue's answer takes the idle step instead.
+        if self.unfinished() == 0 && !self.submitting {
+            effects.extend(self.idle());
         }
         effects
     }
@@ -2497,6 +2530,169 @@ mod tests {
         );
 
         assert!(state.library_marks.contains(&key("AF-NORTH", Ortho)));
+    }
+
+    // ------------------------------------------------------------------------
+    // Going idle with a submission in flight
+    // ------------------------------------------------------------------------
+
+    fn release_count(effects: &[Effect]) -> usize {
+        effects
+            .iter()
+            .filter(|e| **e == Effect::ReleaseQueue)
+            .count()
+    }
+
+    #[test]
+    fn a_job_finishing_while_a_submit_is_pending_waits_for_submitted() {
+        let mut state = loaded();
+        let ids = queue(&mut state, &[("EU", Overlay, Some("1.0.0"))]);
+        act(&mut state, Action::GoTab(Tab::Library));
+        act(&mut state, Action::Mark);
+        act(&mut state, Action::Install);
+        act(&mut state, Action::Confirm);
+        assert_eq!(
+            msg(
+                &mut state,
+                Msg::MetadataReady(vec![Ok(metadata("AF-NORTH", Ortho))])
+            ),
+            [Effect::Submit(vec![metadata("AF-NORTH", Ortho)])]
+        );
+
+        let effects = msg(&mut state, Msg::Job(ids[0], JobMsg::Installed));
+        assert_eq!(effects, RELOAD);
+
+        let effects = msg(
+            &mut state,
+            Msg::Submitted {
+                refused: Vec::new(),
+            },
+        );
+        assert_eq!(effects, [Effect::RebuildOverlays, Effect::ReleaseQueue]);
+    }
+
+    #[test]
+    fn a_fast_failing_batch_releases_the_queue_once() {
+        let mut state = loaded();
+        let mut effects = act(&mut state, Action::Delete);
+        effects.extend(act(&mut state, Action::Confirm));
+        let ids = queue(&mut state, &[("EU-WEST", Ortho, None)]);
+        effects.extend(msg(
+            &mut state,
+            Msg::Job(ids[0], JobMsg::Failed("x".into())),
+        ));
+        assert_eq!(release_count(&effects), 0);
+
+        effects.extend(msg(
+            &mut state,
+            Msg::Submitted {
+                refused: Vec::new(),
+            },
+        ));
+
+        assert_eq!(release_count(&effects), 1);
+    }
+
+    #[test]
+    fn a_pending_remove_defers_idle_until_the_queue_answers() {
+        let mut state = loaded();
+        let ids = queue(&mut state, &[("NA", Ortho, Some("1.0.0"))]);
+        act(&mut state, Action::Delete);
+        assert!(matches!(
+            act(&mut state, Action::Confirm).as_slice(),
+            [Effect::Remove(_)]
+        ));
+
+        assert_eq!(msg(&mut state, Msg::Job(ids[0], JobMsg::Installed)), RELOAD);
+        assert_eq!(
+            msg(&mut state, Msg::QueueRefused("busy".into())),
+            [Effect::ReleaseQueue]
+        );
+    }
+
+    #[test]
+    fn cancelling_with_a_pending_submit_exits_once_after_submitted() {
+        let (mut state, ids) = progress_with_two_jobs();
+        act(&mut state, Action::GoTab(Tab::Local));
+        act(&mut state, Action::Delete);
+        act(&mut state, Action::Confirm);
+        act(&mut state, Action::Quit);
+        assert_eq!(act(&mut state, Action::Confirm), [Effect::CancelAll]);
+
+        let mut effects = msg(&mut state, Msg::Job(ids[0], JobMsg::Cancelled));
+        effects.extend(msg(&mut state, Msg::Job(ids[1], JobMsg::Cancelled)));
+        effects.extend(msg(
+            &mut state,
+            Msg::Queued(JobId(3), summary("EU-WEST", Ortho, None)),
+        ));
+        effects.extend(msg(&mut state, Msg::Job(JobId(3), JobMsg::Cancelled)));
+        assert!(!effects.contains(&Effect::Exit));
+        assert_eq!(release_count(&effects), 0);
+
+        let effects = msg(
+            &mut state,
+            Msg::Submitted {
+                refused: Vec::new(),
+            },
+        );
+
+        assert_eq!(effects, [Effect::ReleaseQueue, Effect::Exit]);
+    }
+
+    #[test]
+    fn quitting_with_only_a_submit_pending_waits_for_it() {
+        let mut state = loaded();
+        act(&mut state, Action::Delete);
+        act(&mut state, Action::Confirm);
+        act(&mut state, Action::Quit);
+
+        assert_eq!(act(&mut state, Action::Confirm), [Effect::CancelAll]);
+        assert_eq!(
+            msg(
+                &mut state,
+                Msg::Submitted {
+                    refused: Vec::new()
+                }
+            ),
+            [Effect::ReleaseQueue, Effect::Exit]
+        );
+    }
+
+    #[test]
+    fn the_cancelling_status_stays_while_jobs_queue_and_submit() {
+        let (mut state, _) = progress_with_two_jobs();
+        act(&mut state, Action::GoTab(Tab::Local));
+        act(&mut state, Action::Delete);
+        act(&mut state, Action::Confirm);
+        act(&mut state, Action::Quit);
+        act(&mut state, Action::Confirm);
+        let cancelling = "Cancelling, press q again to quit now";
+
+        msg(
+            &mut state,
+            Msg::Queued(JobId(3), summary("EU-WEST", Ortho, None)),
+        );
+        assert_eq!(status(&state), cancelling);
+        msg(
+            &mut state,
+            Msg::Submitted {
+                refused: vec!["EU-WEST overlay: already queued".into()],
+            },
+        );
+        assert_eq!(status(&state), cancelling);
+    }
+
+    #[test]
+    fn dismissing_an_expired_quit_prompt_just_clears_it() {
+        let mut state = loaded();
+        let start = Instant::now();
+        state.update(Input::Action(Action::Quit), start);
+        let later = start + QUIT_CONFIRM_TIMEOUT + Duration::from_millis(1);
+
+        let effects = state.update(Input::Action(Action::Dismiss), later);
+
+        assert!(effects.is_empty());
+        assert!(state.modal.is_none());
     }
 
     // ------------------------------------------------------------------------
