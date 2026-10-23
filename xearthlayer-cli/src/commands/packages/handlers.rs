@@ -3,16 +3,13 @@
 //! Each handler implements the `CommandHandler` trait and contains the
 //! business logic for its respective command.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use xearthlayer::config::format_size;
-use xearthlayer::manager::{
-    create_consolidated_overlay, create_consolidated_overlay_except, remove_overlay_symlink,
-    InstallResult, InstalledPackage, LocalPackageStore, PackageStatus,
-};
-use xearthlayer::xworld_pro::{detect, overlay_plan, OverlayCoverage, OverlayPlan};
-use xearthlayer_package::{LibraryEntry, PackageLibrary, PackageType};
+use xearthlayer::manager::{InstallResult, InstalledPackage, LocalPackageStore, PackageStatus};
+use xearthlayer_package::{LibraryEntry, PackageType};
 
+use super::actions::{self, RunActive};
 use super::args::{CheckArgs, InfoArgs, InstallArgs, ListArgs, RemoveArgs, UpdateArgs};
 use super::selector::{resolve, Selection};
 use super::traits::{CommandContext, CommandHandler};
@@ -200,19 +197,9 @@ fn select_installed(
     )
 }
 
-/// Why a running `xearthlayer run` blocks replacing or removing a package.
-///
-/// `run` keeps every installed package's files open through one union
-/// filesystem, so a package cannot change underneath it.
-fn running_message(pid: u32) -> String {
-    format!("XEarthLayer is running (pid {pid}): stop it before updating or removing packages")
-}
-
-/// Refuse the whole command when another `xearthlayer run` is serving packages.
-fn refuse_while_running(ctx: &CommandContext<'_>) -> Result<(), CliError> {
-    match ctx.manager.running_instance() {
-        Some(pid) => Err(CliError::Packages(running_message(pid))),
-        None => Ok(()),
+impl From<RunActive> for CliError {
+    fn from(run: RunActive) -> Self {
+        CliError::Packages(run.message())
     }
 }
 
@@ -264,66 +251,29 @@ fn install_entries(
         .collect()
 }
 
-/// Rebuild the consolidated overlay folder after an overlay install/remove/update.
-///
-/// This creates a single `yzXEL_overlay/` folder in Custom Scenery containing
-/// symlinks to all DSF files from installed overlay packages. Any stale per-region
-/// symlinks (e.g. `yzXEL_na_overlay`) are automatically cleaned up.
+/// Rebuild the consolidated overlay folder after an overlay install/remove/update
+/// and show what happened.
 fn rebuild_consolidated_overlay(
-    install_dir: &std::path::Path,
-    custom_scenery_path: &Option<std::path::PathBuf>,
+    install_dir: &Path,
+    custom_scenery_path: &Option<PathBuf>,
     disable_overlays: bool,
     xworld_pro: bool,
     ctx: &CommandContext<'_>,
 ) {
-    if disable_overlays {
-        // Per `packages.disable_overlays` the consolidated overlay is suppressed
-        // at runtime. We deliberately leave any existing folder alone here; the
-        // next `xearthlayer run` removes it during startup. Issue #152.
-        ctx.output.println(
-            "Note: packages.disable_overlays = true; skipping consolidated overlay rebuild. \
-             The folder will be removed on next 'xearthlayer run'.",
-        );
-        return;
+    let report = actions::rebuild_overlays(
+        ctx.manager,
+        install_dir,
+        custom_scenery_path.as_deref(),
+        disable_overlays,
+        xworld_pro,
+    );
+    for line in &report.lines {
+        ctx.output.println(line);
     }
-    let Some(ref scenery_path) = custom_scenery_path else {
-        ctx.output
-            .println("Note: No Custom Scenery path configured. Overlay symlink not created.");
-        ctx.output
-            .println("Set 'custom_scenery_path' in config to enable automatic overlay creation.");
-        return;
-    };
-
-    ctx.output.println("Rebuilding consolidated overlay...");
-    let store = ctx.manager.create_store(install_dir);
-    // The same choice `xearthlayer run` makes at startup.
-    let coverage = xworld_pro
-        .then(|| OverlayCoverage::from_detection(&detect(scenery_path)))
-        .filter(|c| !c.is_empty());
-    let result = match overlay_plan(disable_overlays, coverage.as_ref()) {
-        OverlayPlan::Except(coverage) => {
-            let result = create_consolidated_overlay_except(&store, scenery_path, &|r: &str| {
-                coverage.suppresses(r)
-            });
-            ctx.output.println(&format!(
-                "X-World Pro active ({}): left out {} overlay regions",
-                coverage.describe(),
-                result.excluded_regions.len()
-            ));
-            result
-        }
-        _ => create_consolidated_overlay(&store, scenery_path),
-    };
-    if result.success {
-        ctx.output.success(&format!(
-            "Consolidated overlay updated: {} regions, {} files",
-            result.package_count, result.file_count
-        ));
-    } else if let Some(error) = result.error {
-        ctx.output.error(&format!(
-            "Warning: Failed to create consolidated overlay: {}",
-            error
-        ));
+    match report.outcome {
+        Some(outcome) if report.failed => ctx.output.error(&outcome),
+        Some(outcome) => ctx.output.success(&outcome),
+        None => {}
     }
 }
 
@@ -335,39 +285,21 @@ fn rebuild_consolidated_overlay(
 pub struct InstallHandler;
 
 impl InstallHandler {
-    /// The packages to install: each selected entry, followed by its
-    /// region's overlay when auto-install is on and the library has one.
-    fn plan<'a>(
-        entries: &[&'a LibraryEntry],
-        library: &'a PackageLibrary,
-        auto_install_overlays: bool,
-    ) -> Vec<&'a LibraryEntry> {
-        entries
-            .iter()
-            .flat_map(|&entry| {
-                let overlay = (auto_install_overlays && entry.package_type == PackageType::Ortho)
-                    .then(|| library.find(&entry.title, PackageType::Overlay))
-                    .flatten();
-                std::iter::once(entry).chain(overlay)
-            })
-            .collect()
-    }
-
     /// Report each package's outcome, rebuild the consolidated overlay once
     /// if any overlay installed, and fail the command if any package failed.
     ///
     /// Packages succeed or fail independently: an overlay still installs
     /// when its ortho package fails.
     fn report(
-        plan: &[&LibraryEntry],
-        results: Vec<Result<InstallResult, CliError>>,
+        outcomes: Vec<(&LibraryEntry, Result<InstallResult, CliError>)>,
         args: &InstallArgs,
         running: bool,
         ctx: &CommandContext<'_>,
     ) -> Result<(), CliError> {
+        let total = outcomes.len();
         let mut failures = Vec::new();
         let mut overlay_installed = false;
-        for (entry, result) in plan.iter().zip(results) {
+        for (entry, result) in outcomes {
             match result {
                 Ok(result) => {
                     ctx.output.success(&format!(
@@ -384,7 +316,7 @@ impl InstallHandler {
                     ));
                     if running {
                         ctx.output
-                            .indented("Note: restart xearthlayer run to use it");
+                            .indented(&format!("Note: {}", actions::RESTART_NOTE));
                     }
                     overlay_installed |= result.package_type == PackageType::Overlay;
                 }
@@ -405,7 +337,7 @@ impl InstallHandler {
 
         match failures.len() {
             0 => Ok(()),
-            _ if plan.len() == 1 => Err(failures.remove(0).1),
+            _ if total == 1 => Err(failures.remove(0).1),
             failed => {
                 for (entry, e) in &failures {
                     ctx.output
@@ -413,8 +345,7 @@ impl InstallHandler {
                 }
                 Err(CliError::Packages(format!(
                     "{} of {} packages failed to install",
-                    failed,
-                    plan.len()
+                    failed, total
                 )))
             }
         }
@@ -472,51 +403,52 @@ impl CommandHandler for InstallHandler {
             }
         }
 
-        let plan = Self::plan(&entries, &library, args.auto_install_overlays);
-        let running = ctx.manager.running_instance();
-
+        let plan = actions::plan_install(&entries, &library, args.auto_install_overlays);
         // While `run` serves the packages, an install over an installed
         // package is an update in disguise: refuse it, package by package.
         // New packages install, and `run` picks them up on its next start.
-        let refused: Vec<bool> = match running {
-            Some(_) => {
-                let store = ctx.manager.create_store(&args.install_dir);
-                let installed = ctx
-                    .manager
-                    .list_packages(&store)
-                    .map_err(|e| CliError::Packages(e.to_string()))?;
-                plan.iter()
-                    .map(|entry| {
-                        installed.iter().any(|p| {
-                            p.region() == entry.title && p.package_type() == entry.package_type
-                        })
-                    })
-                    .collect()
-            }
-            None => vec![false; plan.len()],
-        };
-        let allowed: Vec<&LibraryEntry> = plan
-            .iter()
-            .zip(&refused)
-            .filter(|(_, refused)| !**refused)
-            .map(|(entry, _)| *entry)
-            .collect();
-        let mut installed = install_entries(
-            &allowed,
+        let refusal = actions::check_replacement(ctx.manager).err();
+        let mut allowed: Vec<_> = plan.iter().copied().enumerate().collect();
+        let mut outcomes = Vec::new();
+        if let Some(run) = refusal {
+            let store = ctx.manager.create_store(&args.install_dir);
+            let installed = ctx
+                .manager
+                .list_packages(&store)
+                .map_err(|e| CliError::Packages(e.to_string()))?;
+            let refused;
+            (refused, allowed) = allowed.into_iter().partition(|(_, entry)| {
+                installed
+                    .iter()
+                    .any(|p| p.region() == entry.title && p.package_type() == entry.package_type)
+            });
+            outcomes.extend(
+                refused
+                    .into_iter()
+                    .map(|(position, entry)| (position, entry, Err(run.into()))),
+            );
+        }
+
+        let results = install_entries(
+            &allowed.iter().map(|&(_, entry)| entry).collect::<Vec<_>>(),
             &args.install_dir,
             &args.temp_dir,
             args.concurrent_downloads,
             ctx,
-        )
-        .into_iter();
-        let results = refused
-            .iter()
-            .map(|&refused| match (refused, running) {
-                (true, Some(pid)) => Err(CliError::Packages(running_message(pid))),
-                _ => installed.next().expect("one result per allowed package"),
-            })
+        );
+        outcomes.extend(
+            allowed
+                .into_iter()
+                .zip(results)
+                .map(|((position, entry), result)| (position, entry, result)),
+        );
+        // Report in plan order, refused and installed alike.
+        outcomes.sort_by_key(|&(position, ..)| position);
+        let outcomes = outcomes
+            .into_iter()
+            .map(|(_, entry, result)| (entry, result))
             .collect();
-        Self::report(&plan, results, &args, running.is_some(), ctx)
+        Self::report(outcomes, &args, refusal.is_some(), ctx)
     }
 }
 
@@ -531,7 +463,7 @@ impl CommandHandler for UpdateHandler {
     type Args = UpdateArgs;
 
     fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
-        refuse_while_running(ctx)?;
+        actions::check_replacement(ctx.manager)?;
         ctx.output.println("Checking for updates...");
         ctx.output.newline();
 
@@ -671,7 +603,7 @@ impl CommandHandler for RemoveHandler {
     type Args = RemoveArgs;
 
     fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
-        refuse_while_running(ctx)?;
+        actions::check_removal(ctx.manager)?;
         let store = ctx.manager.create_store(&args.install_dir);
         let packages = select_installed(ctx, &store, &args.selection, args.package_type)?;
 
@@ -711,22 +643,13 @@ impl CommandHandler for RemoveHandler {
                 .remove_package(&store, region, args.package_type, &args.temp_dir)
                 .map_err(|e| CliError::Packages(e.to_string()))?;
 
-            // Clean up stale per-region overlay symlink if one exists. Only now:
-            // a refused remove (e.g. the queue lock is held) leaves the package
-            // installed, and it must keep its symlink.
-            if args.package_type == PackageType::Overlay {
-                if let Some(ref custom_scenery_path) = args.custom_scenery_path {
-                    match remove_overlay_symlink(region, custom_scenery_path) {
-                        Ok(true) => {
-                            tracing::info!(region = %region, "Removed stale per-region overlay symlink");
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            tracing::warn!(region = %region, error = %e, "Failed to remove per-region overlay symlink");
-                        }
-                    }
-                }
-            }
+            // Only now: a refused remove (e.g. the queue lock is held) leaves the
+            // package installed, and it must keep its overlay symlink.
+            actions::after_removal(
+                region,
+                args.package_type,
+                args.custom_scenery_path.as_deref(),
+            );
 
             ctx.output
                 .success(&format!("Removed {} ({})", region, args.package_type));

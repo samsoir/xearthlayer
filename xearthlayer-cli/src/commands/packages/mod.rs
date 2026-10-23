@@ -7,6 +7,7 @@
 //! - `services`: Concrete implementations of the traits
 //! - `args`: CLI argument types and parsing (clap-derived)
 //! - `handlers`: Command handlers implementing business logic
+//! - `actions`: Console-free package decisions shared with the package manager TUI
 //!
 //! # Architecture
 //!
@@ -15,6 +16,7 @@
 //! - Depends only on trait interfaces via `CommandContext`
 //! - Can be tested in isolation with mock implementations
 
+mod actions;
 mod args;
 mod handlers;
 mod progress;

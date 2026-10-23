@@ -118,12 +118,24 @@ impl FakeManager {
     }
 
     /// Report `title` as installed at 1.0.0 with 2.0.0 available.
-    pub fn with_update(mut self, package_type: PackageType, title: &str) -> Self {
-        self = self.with_library(package_type, &[title]);
-        let status = PackageStatus::UpdateAvailable {
-            installed: Version::new(1, 0, 0),
-            available: Version::new(2, 0, 0),
-        };
+    pub fn with_update(self, package_type: PackageType, title: &str) -> Self {
+        self.with_library(package_type, &[title]).with_status(
+            package_type,
+            title,
+            PackageStatus::UpdateAvailable {
+                installed: Version::new(1, 0, 0),
+                available: Version::new(2, 0, 0),
+            },
+        )
+    }
+
+    /// Report `title` with exactly `status` when updates are checked.
+    pub fn with_status(
+        mut self,
+        package_type: PackageType,
+        title: &str,
+        status: PackageStatus,
+    ) -> Self {
         self.statuses.push((
             PackageInfo {
                 region: title.to_string(),
