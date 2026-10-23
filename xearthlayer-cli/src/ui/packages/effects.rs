@@ -3,8 +3,9 @@
 //! [`Effects`] owns the session's install queue and a worker thread for the
 //! slow reads: the installed packages, the library over HTTP, the `run`
 //! check, package metadata and the overlay rebuild. The queue, the
-//! [`ActiveQueue`] and dropping the queue stay on the runner's thread; the
-//! worker only reads and answers with [`Msg`]s. [`ChannelObserver`] turns the
+//! [`ActiveQueue`], dropping the queue and the quick `run` check made before
+//! each submission stay on the runner's thread; the worker only reads and
+//! answers with [`Msg`]s. [`ChannelObserver`] turns the
 //! queue's events into `Msg`s on the same channel.
 
 use std::collections::HashMap;
@@ -24,7 +25,8 @@ use xearthlayer_package::{LibraryEntry, PackageMetadata, PackageType};
 
 use super::app::{Effect, JobMsg, LocalRow, Msg, PackageKey};
 use crate::commands::packages::actions::{
-    after_removal, library_status, rebuild_overlays, LibraryRow, LibraryStatus,
+    after_removal, check_removal, check_replacement, library_status, rebuild_overlays, LibraryRow,
+    LibraryStatus,
 };
 use crate::commands::packages::traits::PackageManagerService;
 use crate::signals::ActiveQueue;
@@ -99,6 +101,9 @@ pub struct Effects<S: Stages, F> {
     active: ActiveQueue,
     tx: Sender<Msg>,
     worker: Worker,
+    /// Asked again whether `run` is serving when a submission is carried
+    /// out: the state's answer may be stale.
+    manager: Arc<dyn PackageManagerService>,
     /// The package each remove job removes, until the job finishes.
     removing: HashMap<JobId, PackageKey>,
     custom_scenery_path: Option<PathBuf>,
@@ -123,7 +128,8 @@ where
             start_queue,
             queue: None,
             active,
-            worker: Worker::start(manager, settings, tx.clone()),
+            worker: Worker::start(Arc::clone(&manager), settings, tx.clone()),
+            manager,
             tx,
             removing: HashMap::new(),
             custom_scenery_path,
@@ -139,7 +145,10 @@ where
             Effect::CheckRun => self.worker.load(Load::Run),
             Effect::Install(entries) => self.worker.send(Read::Metadata(entries)),
             Effect::RebuildOverlays => self.worker.rebuild_overlays(),
-            Effect::Submit(metadata) => self.submit(metadata),
+            Effect::Submit {
+                packages,
+                replacing,
+            } => self.submit(packages, &replacing),
             Effect::Remove(targets) => self.remove(targets),
             Effect::CancelJob(id) => self.stop(Stop::Job(id)),
             Effect::CancelAll => self.stop(Stop::All),
@@ -222,7 +231,31 @@ where
 
     /// Submit the installs as one batch. Each job's `Queued` comes from the
     /// observer during `submit_batch`, so `Submitted` follows all of them.
-    fn submit(&mut self, metadata: Vec<PackageMetadata>) {
+    /// While `run` is serving, the packages in `replacing` are left out, as
+    /// the CLI leaves them out; with nothing left, the request is refused.
+    fn submit(&mut self, mut metadata: Vec<PackageMetadata>, replacing: &[PackageKey]) {
+        let mut refused = Vec::new();
+        if let Err(run) = check_replacement(self.manager.as_ref()) {
+            self.send(Msg::RunActive(Some(run.0)));
+            let left_out: Vec<PackageMetadata>;
+            (left_out, metadata) = metadata.into_iter().partition(|m| {
+                replacing.iter().any(|(region, package_type)| {
+                    region.eq_ignore_ascii_case(&m.title) && *package_type == m.package_type
+                })
+            });
+            if !left_out.is_empty() {
+                let names: Vec<String> = left_out
+                    .iter()
+                    .map(|m| package_name(&m.title, m.package_type))
+                    .collect();
+                let note = format!("{} left out. {}", names.join(", "), run.message());
+                if metadata.is_empty() {
+                    self.send(Msg::QueueRefused(note));
+                    return;
+                }
+                refused.push(note);
+            }
+        }
         let names: Vec<String> = metadata
             .iter()
             .map(|m| package_name(&m.title, m.package_type))
@@ -231,18 +264,26 @@ where
             return;
         };
         let results = queue.submit_batch(metadata);
-        let refused = names
-            .into_iter()
-            .zip(results)
-            .filter_map(|(name, result)| result.err().map(|e| refusal(&name, &e)))
-            .collect();
+        refused.extend(
+            names
+                .into_iter()
+                .zip(results)
+                .filter_map(|(name, result)| result.err().map(|e| refusal(&name, &e))),
+        );
         // A stop asked for before the batch was in the queue found nothing to stop.
         self.active.reapply();
         self.send(Msg::Submitted { refused });
     }
 
     /// Submit a remove for each target, answered as [`submit`](Self::submit) is.
+    /// While `run` is serving, the whole request is refused, as the CLI
+    /// refuses it.
     fn remove(&mut self, targets: Vec<PackageKey>) {
+        if let Err(run) = check_removal(self.manager.as_ref()) {
+            self.send(Msg::RunActive(Some(run.0)));
+            self.send(Msg::QueueRefused(run.message()));
+            return;
+        }
         let Some(queue) = self.queue() else {
             return;
         };
@@ -642,7 +683,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{self, Receiver};
     use std::sync::{Arc, Condvar, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use semver::Version;
     use tempfile::TempDir;
@@ -654,9 +695,10 @@ mod tests {
     use xearthlayer_package::{LibraryEntry, PackageMetadata, PackageType};
 
     use super::*;
+    use crate::commands::packages::actions::RunActive;
     use crate::commands::packages::test_support::{install_dir, FakeManager};
     use crate::signals::ActiveQueue;
-    use crate::ui::packages::app::{Effect, JobMsg, Msg};
+    use crate::ui::packages::app::{Action, AppState, Effect, Input, JobMsg, Msg};
 
     const WAIT: Duration = Duration::from_secs(10);
 
@@ -890,14 +932,48 @@ mod tests {
         )
     }
 
-    /// One line per message, for asserting on order.
-    fn describe(msg: &Msg) -> String {
-        match msg {
-            Msg::Queued(id, summary) => format!("{} queued {}", id.0, summary.region),
-            Msg::Submitted { refused } => format!("submitted {refused:?}"),
-            Msg::Job(id, job) => format!("{} {job:?}", id.0),
-            other => format!("{other:?}"),
+    /// One line per message, for asserting on order. Jobs are numbered
+    /// from 1 in the order they are first seen: every queue in the test
+    /// process draws its ids from one counter, so their values are not
+    /// known in advance.
+    #[derive(Default)]
+    struct Describe(Vec<JobId>);
+
+    impl Describe {
+        fn number(&mut self, id: JobId) -> usize {
+            match self.0.iter().position(|seen| *seen == id) {
+                Some(i) => i + 1,
+                None => {
+                    self.0.push(id);
+                    self.0.len()
+                }
+            }
         }
+
+        fn one(&mut self, msg: &Msg) -> String {
+            match msg {
+                Msg::Queued(id, summary) => {
+                    format!("{} queued {}", self.number(*id), summary.region)
+                }
+                Msg::Submitted { refused } => format!("submitted {refused:?}"),
+                Msg::Job(id, job) => format!("{} {job:?}", self.number(*id)),
+                other => format!("{other:?}"),
+            }
+        }
+
+        fn all(&mut self, msgs: &[Msg]) -> Vec<String> {
+            msgs.iter().map(|msg| self.one(msg)).collect()
+        }
+    }
+
+    /// The ids of the jobs queued, in order.
+    fn queued_ids(seen: &[Msg]) -> Vec<JobId> {
+        seen.iter()
+            .filter_map(|msg| match msg {
+                Msg::Queued(id, _) => Some(*id),
+                _ => None,
+            })
+            .collect()
     }
 
     // ------------------------------------------------------------------------
@@ -1008,9 +1084,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (mut effects, rx) = effects_on(FakeStages::in_dir(dir.path()));
 
-        let _ = effects.apply(Effect::Submit(vec![metadata("EU-WEST")]));
+        let _ = effects.apply(Effect::Submit {
+            packages: vec![metadata("EU-WEST")],
+            replacing: Vec::new(),
+        });
 
-        let seen: Vec<String> = until(&rx, finished).iter().map(describe).collect();
+        let seen = Describe::default().all(&until(&rx, finished));
         assert_eq!(seen[0], "1 queued EU-WEST", "{seen:#?}");
         assert!(seen.contains(&"submitted []".to_string()), "{seen:#?}");
         let progress: Vec<&str> = seen
@@ -1040,18 +1119,19 @@ mod tests {
             swap_gate: Some(gate.clone()),
             ..FakeStages::in_dir(dir.path())
         };
+        let gate = OpenOnDrop(gate);
         let (mut effects, rx) = effects_on(stages);
 
-        let _ = effects.apply(Effect::Submit(vec![
-            metadata("EU-WEST"),
-            metadata("NA-EAST"),
-            metadata("EU-WEST"),
-        ]));
+        let _ = effects.apply(Effect::Submit {
+            packages: vec![
+                metadata("EU-WEST"),
+                metadata("NA-EAST"),
+                metadata("EU-WEST"),
+            ],
+            replacing: Vec::new(),
+        });
 
-        let seen: Vec<String> = until(&rx, |msg| matches!(msg, Msg::Submitted { .. }))
-            .iter()
-            .map(describe)
-            .collect();
+        let seen = Describe::default().all(&until(&rx, |msg| matches!(msg, Msg::Submitted { .. })));
         let queued: Vec<&String> = seen.iter().filter(|l| l.contains("queued")).collect();
         assert_eq!(
             queued,
@@ -1063,7 +1143,7 @@ mod tests {
             submitted.contains("EU-WEST ortho already has a job in the queue"),
             "{submitted}"
         );
-        gate.open();
+        drop(gate);
     }
 
     #[test]
@@ -1076,11 +1156,12 @@ mod tests {
             ("EU-WEST".to_string(), PackageType::Overlay),
         ]));
 
+        let mut describe = Describe::default();
         let mut seen: Vec<String> = Vec::new();
         while seen.iter().filter(|l| l.ends_with("Removed")).count() < 2
             || !seen.iter().any(|l| l.starts_with("submitted"))
         {
-            seen.push(describe(&next(&rx)));
+            seen.push(describe.one(&next(&rx)));
         }
         assert_eq!(seen[0], "1 queued EU-WEST", "{seen:#?}");
         assert!(seen.contains(&"submitted []".to_string()), "{seen:#?}");
@@ -1091,7 +1172,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let stages = FakeStages::in_dir(dir.path());
         let (mut effects, rx) = effects_on(stages.clone());
-        let _ = effects.apply(Effect::Submit(vec![metadata("EU-WEST")]));
+        let _ = effects.apply(Effect::Submit {
+            packages: vec![metadata("EU-WEST")],
+            replacing: Vec::new(),
+        });
         until(&rx, finished);
 
         let _ = effects.apply(Effect::ReleaseQueue);
@@ -1101,13 +1185,194 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_started_after_a_release_gives_new_ids() {
+        let dir = TempDir::new().unwrap();
+        let (mut effects, rx) = effects_on(FakeStages::in_dir(dir.path()));
+        let _ = effects.apply(Effect::Submit {
+            packages: vec![metadata("EU-WEST")],
+            replacing: Vec::new(),
+        });
+        let first = until(&rx, finished);
+        let _ = effects.apply(Effect::ReleaseQueue);
+
+        let _ = effects.apply(Effect::Remove(vec![(
+            "EU-WEST".to_string(),
+            PackageType::Ortho,
+        )]));
+        let second = until(&rx, finished);
+
+        let (first, id) = (queued_ids(&first), queued_ids(&second)[0]);
+        assert!(!first.contains(&id), "{first:?} and {id:?}");
+        assert!(
+            matches!(second.last(), Some(Msg::Job(done, JobMsg::Removed)) if *done == id),
+            "{second:?}"
+        );
+    }
+
+    /// Carry out `pending` and every effect the state gives for the
+    /// messages that follow, until `done` holds for the state and the
+    /// effects given.
+    fn drive(
+        state: &mut AppState,
+        effects: &mut TestEffects,
+        rx: &Receiver<Msg>,
+        mut pending: Vec<Effect>,
+        done: impl Fn(&AppState, &[Effect]) -> bool,
+    ) -> Vec<Effect> {
+        let mut given = Vec::new();
+        loop {
+            for effect in pending.drain(..) {
+                given.push(effect.clone());
+                let _ = effects.apply(effect);
+            }
+            if done(state, &given) {
+                return given;
+            }
+            let msg = next(rx);
+            effects.observe(&msg);
+            pending = state.update(Input::Msg(msg), Instant::now());
+        }
+    }
+
+    fn released(_: &AppState, given: &[Effect]) -> bool {
+        given.contains(&Effect::ReleaseQueue)
+    }
+
+    /// The state keeps its job rows after the queue is released, so a job
+    /// in the next queue must not be mistaken for a finished one.
+    #[test]
+    fn a_job_queued_after_the_queue_was_released_finishes_and_releases_it_again() {
+        let dir = TempDir::new().unwrap();
+        let manager = FakeManager::default().with_installed(PackageType::Ortho, &["EU-WEST"]);
+        let (mut effects, rx) = effects_with(FakeStages::in_dir(dir.path()), manager, settings());
+        let (mut state, load) = AppState::new(false);
+        drive(&mut state, &mut effects, &rx, load, |state, _| {
+            !state.local_rows().is_empty()
+        });
+        let delete = |state: &mut AppState| {
+            let now = Instant::now();
+            let _ = state.update(Input::Action(Action::Delete), now);
+            state.update(Input::Action(Action::Confirm), now)
+        };
+
+        for _ in 0..2 {
+            let remove = delete(&mut state);
+            assert!(matches!(&remove[..], [Effect::Remove(_)]), "{remove:?}");
+            drive(&mut state, &mut effects, &rx, remove, released);
+        }
+
+        assert_eq!(state.jobs().len(), 2);
+        assert_eq!(state.unfinished(), 0);
+        assert_eq!(state.summary(), "Package manager: 2 removed");
+    }
+
+    /// The state's view of `run` may be stale, so acting checks again.
+    #[test]
+    fn a_remove_while_run_is_active_queues_nothing_and_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let stages = FakeStages::in_dir(dir.path());
+        let manager = FakeManager::default().with_running_instance(4242);
+        let (mut effects, rx) = effects_with(stages.clone(), manager, settings());
+
+        let _ = effects.apply(Effect::Remove(vec![
+            ("EU-WEST".to_string(), PackageType::Ortho),
+            ("NA-EAST".to_string(), PackageType::Ortho),
+        ]));
+
+        assert!(matches!(next(&rx), Msg::RunActive(Some(4242))));
+        let refused = next(&rx);
+        assert!(
+            matches!(&refused, Msg::QueueRefused(why) if *why == RunActive(4242).message()),
+            "{refused:?}"
+        );
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(
+            InstallQueue::start(stages, Arc::new(Quiet)).is_ok(),
+            "no queue was started"
+        );
+    }
+
+    #[test]
+    fn a_submit_while_run_is_active_queues_only_the_new_packages() {
+        let dir = TempDir::new().unwrap();
+        let manager = FakeManager::default().with_running_instance(4242);
+        let (mut effects, rx) = effects_with(FakeStages::in_dir(dir.path()), manager, settings());
+
+        let _ = effects.apply(Effect::Submit {
+            packages: vec![metadata("EU-WEST"), metadata("NA-EAST")],
+            replacing: vec![("eu-west".to_string(), PackageType::Ortho)],
+        });
+
+        let seen = until(&rx, |msg| matches!(msg, Msg::Submitted { .. }));
+        assert!(matches!(seen[0], Msg::RunActive(Some(4242))), "{seen:?}");
+        let queued: Vec<&str> = seen
+            .iter()
+            .filter_map(|msg| match msg {
+                Msg::Queued(_, summary) => Some(summary.region.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queued, ["NA-EAST"]);
+        let Some(Msg::Submitted { refused }) = seen.last() else {
+            panic!("{seen:?}");
+        };
+        assert_eq!(
+            refused,
+            &[format!(
+                "EU-WEST ortho left out. {}",
+                RunActive(4242).message()
+            )]
+        );
+        until(&rx, finished);
+    }
+
+    #[test]
+    fn a_submit_of_only_replacements_while_run_is_active_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let manager = FakeManager::default().with_running_instance(4242);
+        let (mut effects, rx) = effects_with(FakeStages::in_dir(dir.path()), manager, settings());
+
+        let _ = effects.apply(Effect::Submit {
+            packages: vec![metadata("EU-WEST")],
+            replacing: vec![("EU-WEST".to_string(), PackageType::Ortho)],
+        });
+
+        assert!(matches!(next(&rx), Msg::RunActive(Some(4242))));
+        let refused = next(&rx);
+        assert!(
+            matches!(&refused, Msg::QueueRefused(why)
+                if *why == format!("EU-WEST ortho left out. {}", RunActive(4242).message())),
+            "{refused:?}"
+        );
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn a_submit_while_run_is_active_still_installs_new_packages() {
+        let dir = TempDir::new().unwrap();
+        let manager = FakeManager::default().with_running_instance(4242);
+        let (mut effects, rx) = effects_with(FakeStages::in_dir(dir.path()), manager, settings());
+
+        let _ = effects.apply(Effect::Submit {
+            packages: vec![metadata("NA-EAST")],
+            replacing: Vec::new(),
+        });
+
+        let seen = Describe::default().all(&until(&rx, finished));
+        assert!(seen.contains(&"1 Installed".to_string()), "{seen:#?}");
+    }
+
+    #[test]
     fn a_held_lock_refuses_the_queue_and_names_the_other_operation() {
         let dir = TempDir::new().unwrap();
         let stages = FakeStages::in_dir(dir.path());
         let _holder = InstallQueue::start(stages.clone(), Arc::new(Quiet)).unwrap();
         let (mut effects, rx) = effects_on(stages);
 
-        let _ = effects.apply(Effect::Submit(vec![metadata("EU-WEST")]));
+        let _ = effects.apply(Effect::Submit {
+            packages: vec![metadata("EU-WEST")],
+            replacing: Vec::new(),
+        });
         let refused = next(&rx);
         assert!(
             matches!(&refused, Msg::QueueRefused(why) if why.contains("another package operation")),
@@ -1133,21 +1398,25 @@ mod tests {
             swap_gate: Some(gate.clone()),
             ..FakeStages::in_dir(dir.path())
         };
+        let gate = OpenOnDrop(gate);
         let (mut effects, rx) = effects_on(stages);
-        let _ = effects.apply(Effect::Submit(vec![metadata("EU-WEST")]));
-        until(
+        let _ = effects.apply(Effect::Submit {
+            packages: vec![metadata("EU-WEST")],
+            replacing: Vec::new(),
+        });
+        let seen = until(
             &rx,
             |msg| matches!(msg, Msg::Job(_, JobMsg::Stage(stage)) if *stage == "Installing"),
         );
 
-        let _ = effects.apply(Effect::CancelJob(JobId(1)));
+        let _ = effects.apply(Effect::CancelJob(queued_ids(&seen)[0]));
 
         let status = until(&rx, |msg| matches!(msg, Msg::Status(_)));
         assert!(
             matches!(status.last(), Some(Msg::Status(text)) if text == "too late: finishing"),
             "{status:?}"
         );
-        gate.open();
+        drop(gate);
         until(&rx, finished);
     }
 
@@ -1177,32 +1446,41 @@ mod tests {
             swap_gate: Some(gate.clone()),
             ..FakeStages::in_dir(dir.path())
         };
+        let gate = OpenOnDrop(gate);
         let (mut effects, rx) = effects_on(stages);
-        let _ = effects.apply(Effect::Submit(vec![
-            metadata("EU-WEST"),
-            metadata("NA-EAST"),
-        ]));
-        until(
+        let _ = effects.apply(Effect::Submit {
+            packages: vec![metadata("EU-WEST"), metadata("NA-EAST")],
+            replacing: Vec::new(),
+        });
+        let mut describe = Describe::default();
+        describe.all(&until(
             &rx,
             |msg| matches!(msg, Msg::Job(_, JobMsg::Stage(stage)) if *stage == "Installing"),
-        );
+        ));
 
         let _ = effects.apply(Effect::CancelAll);
 
         // The swap is still held: the cancel, applied on its own thread,
         // finishes the queued job without it.
-        let seen: Vec<String> = until(&rx, finished).iter().map(describe).collect();
+        let seen = describe.all(&until(&rx, finished));
         assert_eq!(seen.last().unwrap(), "2 Cancelled", "{seen:#?}");
-        gate.open();
-        let rest: Vec<String> = until(&rx, finished).iter().map(describe).collect();
+        drop(gate);
+        let rest = describe.all(&until(&rx, finished));
         assert_eq!(rest.last().unwrap(), "1 Installed", "the swap completes");
     }
 
     /// EU-WEST held in its swap, and NA-EAST downloaded behind it with the
-    /// delete of its download held. Returns the gates, swap first.
+    /// delete of its download held. Returns the gates, swap first, and the
+    /// two jobs' ids.
     fn swapping_with_a_held_download_behind(
         dir: &Path,
-    ) -> (TestEffects, Receiver<Msg>, OpenOnDrop, OpenOnDrop) {
+    ) -> (
+        TestEffects,
+        Receiver<Msg>,
+        OpenOnDrop,
+        OpenOnDrop,
+        [JobId; 2],
+    ) {
         let swap = Arc::new(Gate::default());
         let delete = Arc::new(Gate::default());
         let stages = FakeStages {
@@ -1211,26 +1489,30 @@ mod tests {
             ..FakeStages::in_dir(dir)
         };
         let (mut effects, rx) = effects_on(stages);
-        let _ = effects.apply(Effect::Submit(vec![
-            metadata("EU-WEST"),
-            metadata("NA-EAST"),
-        ]));
+        let _ = effects.apply(Effect::Submit {
+            packages: vec![metadata("EU-WEST"), metadata("NA-EAST")],
+            replacing: Vec::new(),
+        });
+        let (swap, delete) = (OpenOnDrop(swap), OpenOnDrop(delete));
+        let mut ids = Vec::new();
         let mut swapping = false;
         let mut downloaded = false;
         while !(swapping && downloaded) {
             match next(&rx) {
-                Msg::Job(JobId(1), JobMsg::Stage("Installing")) => swapping = true,
-                Msg::Job(JobId(2), JobMsg::Downloaded) => downloaded = true,
+                Msg::Queued(id, _) => ids.push(id),
+                Msg::Job(id, JobMsg::Stage("Installing")) if id == ids[0] => swapping = true,
+                Msg::Job(id, JobMsg::Downloaded) if id == ids[1] => downloaded = true,
                 _ => {}
             }
         }
-        (effects, rx, OpenOnDrop(swap), OpenOnDrop(delete))
+        (effects, rx, swap, delete, [ids[0], ids[1]])
     }
 
     #[test]
     fn cancel_all_returns_at_once_while_a_download_is_being_deleted() {
         let dir = TempDir::new().unwrap();
-        let (mut effects, rx, swap, delete) = swapping_with_a_held_download_behind(dir.path());
+        let (mut effects, rx, swap, delete, [eu, na]) =
+            swapping_with_a_held_download_behind(dir.path());
         // A watchdog: should cancelling block, this opens the delete late
         // and the timing below fails, rather than the test hanging.
         let watchdog = Arc::clone(&delete.0);
@@ -1252,23 +1534,24 @@ mod tests {
         let _ = effects.apply(Effect::CheckRun);
         assert!(
             !rx.try_iter()
-                .any(|msg| matches!(msg, Msg::Job(JobId(2), JobMsg::Cancelled))),
+                .any(|msg| matches!(msg, Msg::Job(id, JobMsg::Cancelled) if id == na)),
             "NA-EAST finishes only once its download is deleted"
         );
         drop(delete);
-        until(&rx, |msg| {
-            matches!(msg, Msg::Job(JobId(2), JobMsg::Cancelled))
-        });
+        until(
+            &rx,
+            |msg| matches!(msg, Msg::Job(id, JobMsg::Cancelled) if *id == na),
+        );
         drop(swap);
         until(&rx, |msg| {
-            matches!(msg, Msg::Job(JobId(1), _)) && finished(msg)
+            matches!(msg, Msg::Job(id, _) if *id == eu) && finished(msg)
         });
     }
 
     #[test]
     fn exit_after_abandon_waits_for_the_swap_and_nothing_else() {
         let dir = TempDir::new().unwrap();
-        let (mut effects, _rx, swap, delete) = swapping_with_a_held_download_behind(dir.path());
+        let (mut effects, _rx, swap, delete, _) = swapping_with_a_held_download_behind(dir.path());
 
         assert!(effects.apply(Effect::Abandon).is_continue());
         assert!(effects.apply(Effect::Exit).is_break());

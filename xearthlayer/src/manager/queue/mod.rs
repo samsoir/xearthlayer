@@ -12,7 +12,6 @@ mod state;
 mod worker;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -130,7 +129,7 @@ impl<S: Stages> InstallQueue<S> {
                 package_type: summary.package_type.to_string(),
             });
         }
-        let id = JobId(self.shared.next_id.fetch_add(1, Ordering::Relaxed));
+        let id = JobId::next();
         self.shared.emit(id, JobEvent::Queued(&summary));
         let kind = summary.kind;
         state.jobs.insert(

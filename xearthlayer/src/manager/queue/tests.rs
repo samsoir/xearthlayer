@@ -361,6 +361,21 @@ fn a_second_queue_on_the_same_temp_directory_is_refused() {
     assert!(matches!(second, Err(ManagerError::QueueBusy { .. })));
 }
 
+/// A UI keeps its job rows across queues, so an id never repeats.
+#[test]
+fn ids_never_repeat_across_queues() {
+    let stages = FakeStages::new(u64::MAX);
+    let (queue, _) = start(&stages);
+    let first = queue.submit(Job::Install(meta("A"))).unwrap();
+    queue.wait_idle();
+    drop(queue);
+
+    let (queue, _) = start(&stages);
+    let second = queue.submit(Job::Install(meta("A"))).unwrap();
+    queue.wait_idle();
+    assert_ne!(first, second);
+}
+
 #[test]
 fn starting_a_queue_sweeps_what_a_killed_run_left_behind() {
     let stages = FakeStages::new(u64::MAX);

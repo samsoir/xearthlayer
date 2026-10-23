@@ -71,7 +71,9 @@ pub fn draw(frame: &mut Frame, modal: &Modal) {
                 .collect();
             confirm(frame, area, "Delete", question, items, None, "y confirm");
         }
-        Modal::ConfirmInstall { entries, skipped } => {
+        Modal::ConfirmInstall {
+            entries, skipped, ..
+        } => {
             let question = format!("Install {}?", plural(entries.len(), "package"));
             let items = entries
                 .iter()

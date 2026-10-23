@@ -158,6 +158,8 @@ pub enum Modal {
         entries: Vec<LibraryEntry>,
         /// Selected packages left out because they are already current.
         skipped: Vec<String>,
+        /// The entries already installed, at an older version.
+        replacing: Vec<PackageKey>,
     },
     ConfirmCancelAll,
 }
@@ -259,8 +261,14 @@ pub enum Effect {
     /// Fetch these entries' metadata, answered by [`Msg::MetadataReady`].
     Install(Vec<LibraryEntry>),
     /// Start the queue if needed and submit these installs as one batch.
-    Submit(Vec<PackageMetadata>),
-    /// Start the queue if needed and submit these removals as one batch.
+    /// `replacing` names those already installed: a `run` found when the
+    /// effect is carried out refuses them and lets the rest install.
+    Submit {
+        packages: Vec<PackageMetadata>,
+        replacing: Vec<PackageKey>,
+    },
+    /// Start the queue if needed and submit these removals as one batch,
+    /// or refuse all of them if a `run` is found when it is carried out.
     Remove(Vec<PackageKey>),
     CancelJob(JobId),
     CancelAll,
@@ -283,12 +291,46 @@ pub enum Quitting {
 }
 
 /// How the session's jobs ended, for the summary printed after exit.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct Tally {
     installed: usize,
     removed: usize,
     failed: usize,
     cancelled: usize,
+}
+
+impl Tally {
+    /// What ended since `earlier`, a tally taken before this one.
+    fn since(&self, earlier: &Tally) -> Tally {
+        Tally {
+            installed: self.installed - earlier.installed,
+            removed: self.removed - earlier.removed,
+            failed: self.failed - earlier.failed,
+            cancelled: self.cancelled - earlier.cancelled,
+        }
+    }
+
+    /// "2 installed", "1 failed": one part per outcome that happened.
+    fn parts(&self) -> Vec<String> {
+        [
+            (self.installed, "installed"),
+            (self.removed, "removed"),
+            (self.failed, "failed"),
+            (self.cancelled, "cancelled"),
+        ]
+        .iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, what)| format!("{count} {what}"))
+        .collect()
+    }
+}
+
+/// The end of the queued note, which the idle queue replaces.
+const SEE_PROGRESS: &str = "queued: see Progress";
+
+/// The status says how many jobs were queued, and nothing has replaced it.
+fn is_queued_note(status: &str) -> bool {
+    status.contains(SEE_PROGRESS)
 }
 
 // ============================================================================
@@ -314,6 +356,11 @@ pub struct AppState {
     held_marks: Option<(Tab, BTreeSet<PackageKey>)>,
     /// Jobs queued since the request in flight was made.
     queued_count: usize,
+    /// One of them installs a package.
+    queued_install: bool,
+    /// The packages of the request in flight already installed, for its
+    /// `Submit`.
+    replacing: Vec<PackageKey>,
     /// A `Submit` or `Remove` was given and the queue has not answered, so
     /// the queue must not be released yet.
     submitting: bool,
@@ -327,6 +374,8 @@ pub struct AppState {
     overlay_jobs: HashSet<JobId>,
     auto_install_overlays: bool,
     tally: Tally,
+    /// The tally when the queue was last idle.
+    tally_at_idle: Tally,
     started: Instant,
 }
 
@@ -344,6 +393,8 @@ impl AppState {
             library_marks: BTreeSet::new(),
             held_marks: None,
             queued_count: 0,
+            queued_install: false,
+            replacing: Vec::new(),
             submitting: false,
             modal: None,
             status: None,
@@ -353,6 +404,7 @@ impl AppState {
             overlay_jobs: HashSet::new(),
             auto_install_overlays,
             tally: Tally::default(),
+            tally_at_idle: Tally::default(),
             started: Instant::now(),
         };
         (state, reload())
@@ -382,18 +434,11 @@ impl AppState {
 
     /// One line on what the session did, printed after exit.
     pub fn summary(&self) -> String {
+        let mut parts = self.tally.parts();
         let unfinished = self.unfinished();
-        let parts: Vec<String> = [
-            (self.tally.installed, "installed"),
-            (self.tally.removed, "removed"),
-            (self.tally.failed, "failed"),
-            (self.tally.cancelled, "cancelled"),
-            (unfinished, "unfinished"),
-        ]
-        .iter()
-        .filter(|(count, _)| *count > 0)
-        .map(|(count, what)| format!("{count} {what}"))
-        .collect();
+        if unfinished > 0 {
+            parts.push(format!("{unfinished} unfinished"));
+        }
         if parts.is_empty() {
             "Package manager: no packages changed".to_string()
         } else {
@@ -572,8 +617,11 @@ impl AppState {
                 self.submitting = true;
                 vec![Effect::Remove(targets)]
             }
-            Some(Modal::ConfirmInstall { entries, .. }) => {
+            Some(Modal::ConfirmInstall {
+                entries, replacing, ..
+            }) => {
                 self.hold_marks(Tab::Library);
+                self.replacing = replacing;
                 vec![Effect::Install(entries)]
             }
             Some(Modal::ConfirmCancelAll) => vec![Effect::CancelAll],
@@ -729,6 +777,7 @@ impl AppState {
             let marks = std::mem::take(marks);
             self.held_marks = Some((tab, marks));
             self.queued_count = 0;
+            self.queued_install = false;
         }
     }
 
@@ -811,6 +860,11 @@ impl AppState {
                 .filter_map(|(_, row)| row.map(|row| row.entry.clone()))
                 .collect();
             if !entries.is_empty() {
+                // An update replaces what is installed.
+                self.replacing = entries
+                    .iter()
+                    .map(|entry| (entry.title.clone(), entry.package_type))
+                    .collect();
                 effects.push(Effect::Install(entries));
             }
         }
@@ -872,6 +926,7 @@ impl AppState {
         let wanted: Vec<&LibraryEntry> = wanted.iter().map(|row| &row.entry).collect();
         let mut seen = HashSet::new();
         let mut entries = Vec::new();
+        let mut replacing = Vec::new();
         let mut refused = Vec::new();
         for entry in plan_install(&wanted, &library, self.auto_install_overlays) {
             if !seen.insert((entry.title.clone(), entry.package_type)) {
@@ -882,6 +937,10 @@ impl AppState {
                 Some(LibraryStatus::UpToDate) => {}
                 Some(LibraryStatus::Update { .. }) if self.run_active.is_some() => {
                     refused.push(entry_name(entry));
+                }
+                Some(LibraryStatus::Update { .. }) => {
+                    replacing.push((entry.title.clone(), entry.package_type));
+                    entries.push(entry.clone());
                 }
                 _ => entries.push(entry.clone()),
             }
@@ -903,7 +962,11 @@ impl AppState {
             if self.run_active.is_some() {
                 notes.push(format!("New packages: {RESTART_NOTE}"));
             }
-            self.modal = Some(Modal::ConfirmInstall { entries, skipped });
+            self.modal = Some(Modal::ConfirmInstall {
+                entries,
+                skipped,
+                replacing,
+            });
         }
         if !notes.is_empty() {
             self.status = Some(notes.join("; "));
@@ -953,6 +1016,7 @@ impl AppState {
     }
 
     fn on_metadata(&mut self, results: Vec<Result<PackageMetadata, String>>) -> Vec<Effect> {
+        let replacing = std::mem::take(&mut self.replacing);
         if self.quitting != Quitting::No {
             self.status = Some("cancelled".to_string());
             self.restore_marks();
@@ -975,11 +1039,15 @@ impl AppState {
             return Vec::new();
         }
         self.submitting = true;
-        vec![Effect::Submit(fetched)]
+        vec![Effect::Submit {
+            packages: fetched,
+            replacing,
+        }]
     }
 
     fn on_queued(&mut self, id: JobId, summary: JobSummary) -> Vec<Effect> {
         self.queued_count += 1;
+        self.queued_install |= summary.kind == JobKind::Install;
         if self.quitting == Quitting::No {
             self.status = Some(self.queued_note());
         }
@@ -1009,6 +1077,9 @@ impl AppState {
             notes.push(self.queued_note());
         }
         notes.extend(refused);
+        if self.queued_install && self.run_active.is_some() {
+            notes.push(format!("New packages: {RESTART_NOTE}"));
+        }
         // While cancelling, the status keeps saying how to quit now.
         if !notes.is_empty() && self.quitting == Quitting::No {
             self.status = Some(notes.join("; "));
@@ -1026,10 +1097,16 @@ impl AppState {
         Vec::new()
     }
 
-    /// The queue went idle: rebuild the overlays once if any changed, release
-    /// the queue, and exit if quitting was waiting for this. Taken exactly
-    /// once per transition to idle.
+    /// The queue went idle: say what it did in place of the queued note,
+    /// rebuild the overlays once if any changed, release the queue, and exit
+    /// if quitting was waiting for this. Taken exactly once per transition
+    /// to idle.
     fn idle(&mut self) -> Vec<Effect> {
+        let done = self.tally.since(&self.tally_at_idle);
+        self.tally_at_idle = self.tally;
+        if self.status.as_deref().is_some_and(is_queued_note) {
+            self.status = self.done_note(&done);
+        }
         let mut effects = Vec::new();
         if std::mem::take(&mut self.overlay_changed) {
             effects.push(Effect::RebuildOverlays);
@@ -1044,9 +1121,23 @@ impl AppState {
     /// "N jobs queued: see Progress"
     fn queued_note(&self) -> String {
         match self.queued_count {
-            1 => "1 job queued: see Progress".to_string(),
-            n => format!("{n} jobs queued: see Progress"),
+            1 => format!("1 job {SEE_PROGRESS}"),
+            n => format!("{n} jobs {SEE_PROGRESS}"),
         }
+    }
+
+    /// "Done: 1 installed, 1 failed", and the restart note if `run` is
+    /// serving while a package was installed. `None` if nothing finished.
+    fn done_note(&self, done: &Tally) -> Option<String> {
+        let parts = done.parts();
+        if parts.is_empty() {
+            return None;
+        }
+        let mut note = format!("Done: {}", parts.join(", "));
+        if done.installed > 0 && self.run_active.is_some() {
+            note.push_str(&format!("; New packages: {RESTART_NOTE}"));
+        }
+        Some(note)
     }
 
     fn on_job(&mut self, id: JobId, msg: JobMsg) -> Vec<Effect> {
@@ -1634,7 +1725,9 @@ mod tests {
 
     fn confirm_install(state: &AppState) -> (Vec<String>, Vec<String>) {
         match &state.modal {
-            Some(Modal::ConfirmInstall { entries, skipped }) => (
+            Some(Modal::ConfirmInstall {
+                entries, skipped, ..
+            }) => (
                 entries
                     .iter()
                     .map(|e| format!("{} {}", e.title, e.package_type))
@@ -1979,11 +2072,97 @@ mod tests {
             ]),
         );
 
-        assert_eq!(effects, [Effect::Submit(vec![metadata("AF-NORTH", Ortho)])]);
+        assert_eq!(
+            effects,
+            [Effect::Submit {
+                packages: vec![metadata("AF-NORTH", Ortho)],
+                replacing: Vec::new(),
+            }]
+        );
         assert_eq!(
             status(&state),
             "could not fetch metadata for AF-NORTH overlay: timed out"
         );
+    }
+
+    /// Acting checks for `run` again, and refuses what would replace an
+    /// installed package, so the submission says which those are.
+    #[test]
+    fn an_update_is_submitted_as_replacing_the_installed_package() {
+        let mut state = loaded();
+        let effects = act(&mut state, Action::Update);
+        assert_eq!(
+            effects,
+            [Effect::Install(vec![entry("EU-WEST", Ortho, "1.1.0")])]
+        );
+
+        let effects = msg(
+            &mut state,
+            Msg::MetadataReady(vec![Ok(metadata("EU-WEST", Ortho))]),
+        );
+
+        assert_eq!(
+            effects,
+            [Effect::Submit {
+                packages: vec![metadata("EU-WEST", Ortho)],
+                replacing: vec![key("EU-WEST", Ortho)],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_library_install_submits_only_the_installed_packages_as_replacing() {
+        // AF-NORTH ortho (new) and EU-WEST ortho (update).
+        let mut state = library_tab(false, &[0, 2]);
+        act(&mut state, Action::Install);
+        act(&mut state, Action::Confirm);
+
+        let effects = msg(
+            &mut state,
+            Msg::MetadataReady(vec![
+                Ok(metadata("AF-NORTH", Ortho)),
+                Ok(metadata("EU-WEST", Ortho)),
+            ]),
+        );
+
+        assert_eq!(
+            effects,
+            [Effect::Submit {
+                packages: vec![metadata("AF-NORTH", Ortho), metadata("EU-WEST", Ortho)],
+                replacing: vec![key("EU-WEST", Ortho)],
+            }]
+        );
+    }
+
+    #[test]
+    fn submitted_while_run_is_active_says_to_restart_it() {
+        let mut state = library_tab(false, &[0, 2]);
+        act(&mut state, Action::Install);
+        act(&mut state, Action::Confirm);
+        msg(
+            &mut state,
+            Msg::MetadataReady(vec![
+                Ok(metadata("AF-NORTH", Ortho)),
+                Ok(metadata("EU-WEST", Ortho)),
+            ]),
+        );
+        // `run` started after the install was confirmed.
+        msg(&mut state, Msg::RunActive(Some(42)));
+        queue(&mut state, &[("AF-NORTH", Ortho, Some("1.0.0"))]);
+        let left_out = format!("EU-WEST ortho left out. {}", RunActive(42).message());
+
+        msg(
+            &mut state,
+            Msg::Submitted {
+                refused: vec![left_out.clone()],
+            },
+        );
+
+        assert_eq!(
+            status(&state),
+            format!("1 job queued: see Progress; {left_out}; New packages: {RESTART_NOTE}")
+        );
+        assert_eq!(state.run_active(), Some(42));
     }
 
     #[test]
@@ -2270,6 +2449,61 @@ mod tests {
         let mut expected = RELOAD.to_vec();
         expected.push(Effect::ReleaseQueue);
         assert_eq!(effects, expected);
+    }
+
+    #[test]
+    fn the_queued_note_gives_way_to_what_was_done_once_the_queue_is_idle() {
+        let mut state = loaded();
+        let ids = queue(
+            &mut state,
+            &[("EU", Ortho, Some("1.0.0")), ("NA", Ortho, None)],
+        );
+        msg(&mut state, Msg::Job(ids[0], JobMsg::Installed));
+        assert_eq!(status(&state), "2 jobs queued: see Progress");
+
+        msg(&mut state, Msg::Job(ids[1], JobMsg::Removed));
+
+        assert_eq!(status(&state), "Done: 1 installed, 1 removed");
+    }
+
+    #[test]
+    fn each_idle_queue_reports_only_its_own_jobs() {
+        let mut state = loaded();
+        let first = queue(&mut state, &[("EU", Ortho, Some("1.0.0"))]);
+        msg(&mut state, Msg::Job(first[0], JobMsg::Installed));
+        let second = queue(&mut state, &[("NA", Ortho, None)]);
+
+        msg(&mut state, Msg::Job(second[0], JobMsg::Failed("x".into())));
+
+        assert_eq!(status(&state), "Done: 1 failed");
+    }
+
+    #[test]
+    fn an_idle_queue_while_run_is_active_says_to_restart_it() {
+        let mut state = loaded();
+        msg(&mut state, Msg::RunActive(Some(42)));
+        let ids = queue(&mut state, &[("AF-NORTH", Ortho, Some("1.0.0"))]);
+
+        msg(&mut state, Msg::Job(ids[0], JobMsg::Installed));
+
+        assert_eq!(
+            status(&state),
+            format!("Done: 1 installed; New packages: {RESTART_NOTE}")
+        );
+    }
+
+    #[test]
+    fn an_idle_queue_leaves_a_later_status_alone() {
+        let mut state = loaded();
+        let ids = queue(&mut state, &[("EU", Ortho, Some("1.0.0"))]);
+        msg(
+            &mut state,
+            Msg::Status("could not rebuild the overlays".into()),
+        );
+
+        msg(&mut state, Msg::Job(ids[0], JobMsg::Installed));
+
+        assert_eq!(status(&state), "could not rebuild the overlays");
     }
 
     #[test]
@@ -2630,7 +2864,10 @@ mod tests {
                 &mut state,
                 Msg::MetadataReady(vec![Ok(metadata("AF-NORTH", Ortho))])
             ),
-            [Effect::Submit(vec![metadata("AF-NORTH", Ortho)])]
+            [Effect::Submit {
+                packages: vec![metadata("AF-NORTH", Ortho)],
+                replacing: Vec::new(),
+            }]
         );
 
         let effects = msg(&mut state, Msg::Job(ids[0], JobMsg::Installed));

@@ -118,6 +118,7 @@ mod tests {
             Modal::ConfirmInstall {
                 entries: Vec::new(),
                 skipped: Vec::new(),
+                replacing: Vec::new(),
             },
             Modal::ConfirmCancelAll,
         ]

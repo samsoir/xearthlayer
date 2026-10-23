@@ -3,7 +3,6 @@
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use xearthlayer_package::package_mountpoint;
@@ -102,7 +101,6 @@ pub(super) struct Shared<S: Stages> {
     observer: Arc<dyn QueueObserver>,
     state: Mutex<State<S::Downloaded>>,
     pub(super) changed: Condvar,
-    pub(super) next_id: AtomicU64,
     /// Held until the last holder of this state goes: normally after both
     /// threads are joined, and when the queue is abandoned, after the
     /// detached threads finish, so no new queue sweeps under them.
@@ -116,7 +114,6 @@ impl<S: Stages> Shared<S> {
             observer,
             state: Mutex::new(State::new()),
             changed: Condvar::new(),
-            next_id: AtomicU64::new(1),
             _lock: lock,
         }
     }

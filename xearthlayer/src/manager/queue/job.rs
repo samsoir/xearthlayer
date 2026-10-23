@@ -1,14 +1,26 @@
 //! The jobs a queue runs and the events it reports.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use xearthlayer_package::{PackageMetadata, PackageType};
 
 use crate::manager::download::DownloadProgress;
 use crate::manager::error::ManagerError;
 use crate::manager::installer::{InstallResult, InstallStage};
 
-/// Identifies one job for the life of its queue.
+/// Identifies one job for the life of the process. Every queue draws from
+/// one counter, so a UI that keeps its job rows across queues never sees
+/// an id repeat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JobId(pub u64);
+
+impl JobId {
+    /// The next unused id.
+    pub(super) fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 /// Work submitted to the queue.
 #[derive(Debug, Clone)]
