@@ -46,7 +46,30 @@ If the approval prompt never appeared, re-run the macFUSE installer after comple
 
 ### 3. Install XEarthLayer
 
-#### From a release build (Apple Silicon)
+#### With Homebrew (Apple Silicon, recommended)
+
+```bash
+brew install --cask xearthlayer/tap/xearthlayer
+```
+
+That installs the latest stable release and `brew upgrade` keeps it current.
+To follow the pre-release channel (dev, alpha, beta and rc builds) instead:
+
+```bash
+brew install --cask xearthlayer/tap/xearthlayer@prerelease
+```
+
+The two casks conflict, so switching channels means uninstalling one first.
+Both depend on the `macfuse` cask; if macFUSE is already installed from its
+own installer, add `--skip-cask-deps`. The macFUSE approval steps above still
+apply. Then run `xearthlayer setup`.
+
+Homebrew asks nothing extra for a third-party tap when the cask is named in
+full as above: the fully qualified name trusts that one cask and no more (see
+[Tap Trust](https://docs.brew.sh/Tap-Trust)). Homebrew applies its download
+quarantine to every cask, which is why the binaries are signed and notarized.
+
+#### From a release tarball (Apple Silicon)
 
 Each release carries an `arm64-macos.tar.gz` tarball for Apple Silicon Macs.
 There is no Intel build; on an Intel Mac, build from source as below.

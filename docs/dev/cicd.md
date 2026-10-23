@@ -213,8 +213,8 @@ The certificate, the notary key, the secrets and their renewal are in
 
 | Channel | Tag | GitHub Release | Assets |
 |---------|-----|----------------|--------|
-| Stable | `vX.Y.Z` | Latest | Linux tarball, macOS tarball, `.deb`, `.rpm`, AUR |
-| Pre-release | `vX.Y.Z-dev.N`, `-alpha.N`, `-beta.N`, `-rc.N` | Pre-release, never "Latest" | Linux tarball, macOS tarball |
+| Stable | `vX.Y.Z` | Latest | Linux tarball, macOS tarball, `.deb`, `.rpm`, AUR, Homebrew `xearthlayer` cask |
+| Pre-release | `vX.Y.Z-dev.N`, `-alpha.N`, `-beta.N`, `-rc.N` | Pre-release, never "Latest" | Linux tarball, macOS tarball, Homebrew `xearthlayer@prerelease` cask |
 
 `verify` classifies the tag and emits a `prerelease` output; `package-deb`,
 `build-rpm` and `prepare-aur` are gated on it.
@@ -324,6 +324,54 @@ published correct artifacts, and `make pkg-rpm` quietly produced an RPM labelled
 `0.2.5`. Both files have since been swept to `0.5.0`; `make bump-version` and its
 idempotence check above exist to keep it from recurring.
 
+## Homebrew Tap
+
+macOS users install with `brew install --cask xearthlayer/tap/xearthlayer`, which
+resolves to the repository named by `HOMEBREW_TAP_REPO` at the top of `release.yml`
+(`xearthlayer/homebrew-tap`). It is a cask, not a formula, for one deciding reason: a
+formula cannot depend on a cask, and macFUSE is a cask. A cask can also refuse an
+Intel Mac (`depends_on arch: :arm64`) with a clear message. Homebrew applies the
+download quarantine to every cask artifact, unconditionally since Homebrew 7 removed
+`--no-quarantine`, so the tap only works because the binaries are signed and notarized
+(see [macos-signing-runbook.md](macos-signing-runbook.md)); an unsigned build installs
+and is then killed on first exec. Since Homebrew 6, a non-official tap must be trusted
+before its Ruby is loaded; installing by fully qualified name trusts that one cask,
+which is why the documented command is the long form.
+
+Two casks, one per channel, each declaring a conflict with the other:
+
+| Cask | Tracks | Template |
+|------|--------|----------|
+| `xearthlayer` | stable `vX.Y.Z` tags | `pkg/homebrew/xearthlayer.rb.tmpl` |
+| `xearthlayer@prerelease` | `-dev.N`, `-alpha.N`, `-beta.N`, `-rc.N` tags | `pkg/homebrew/xearthlayer@prerelease.rb.tmpl` |
+
+**Nothing in the tap is edited by hand.** The `publish` job's last step, *Update
+Homebrew tap*, renders the template for the tag's channel with
+`scripts/homebrew/render-cask.sh`, taking the SHA-256 from the macOS tarball artifact
+it has just uploaded, and pushes the file to the tap with `HOMEBREW_TAP_TOKEN`. The
+render script refuses a stable version into the pre-release cask and vice versa, so a
+misclassified tag cannot cross channels. The step runs after the release is public: a
+failure marks the run red but un-publishes nothing, and the remedy is to run the
+script by hand against the published tarball and push the result. Without the token
+the step skips with a notice, as the AUR step does without its key.
+
+The tap repository carries its own `Audit` workflow on every push: `brew style`,
+`brew audit --cask --online --strict`, and an install of each cask on a `macos-15`
+runner followed by `xearthlayer --version`. That install goes through Homebrew's
+quarantine, so it fails for a release that was not notarized. The pre-release cask
+excludes one audit, `github_prerelease_version`, which rejects any version whose GitHub
+release is marked pre-release; tracking those is that cask's purpose.
+
+To test a cask change locally before a tag exists, render into a checkout of the tap,
+link the checkout under `$(brew --repository)/Library/Taps/xearthlayer/homebrew-tap`
+(the audit workflow does the same), `brew trust xearthlayer/tap`, and run `brew style`,
+`brew audit` and `brew install --cask --skip-cask-deps` against it. `brew style --fix`
+is the authority on stanza order (`depends_on arch`, `cask`, `macos`).
+
+The first cask appears in the tap with the first tag published after this step
+landed; there is no stable cask until `v0.5.0`, since the `0.4.x` line has no macOS
+build.
+
 ## Secrets and External Repositories
 
 | Secret | Used by | Notes |
@@ -333,6 +381,7 @@ idempotence check above exist to keep it from recurring.
 | `APPLE_DEVELOPER_ID_P12`, `APPLE_DEVELOPER_ID_P12_PASSWORD` | `release.yml` | Developer ID Application identity (base64 `.p12`) and its password. Absent, `package-macos` ships an unsigned tarball |
 | `APPLE_NOTARY_KEY_P8`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID` | `release.yml` | App Store Connect API key for `notarytool`. Required once the certificate is set. See [macos-signing-runbook.md](macos-signing-runbook.md) |
 | `WEBSITE_DISPATCH_TOKEN` | `website-sync.yml` | 90-day PAT. **Expiry is silent** — the website then lags by up to 24h until the daily fallback cron runs |
+| `HOMEBREW_TAP_TOKEN` | `release.yml` | Fine-grained PAT, *Contents: read and write* on the tap repository only. Absent, the tap is not updated (notice). Expired, the push fails and the run goes red after the release is public |
 
 ### The `version.json` contract
 

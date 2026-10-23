@@ -177,7 +177,7 @@ gh run watch --repo samsoir/xearthlayer
 # ✓ Package Linux Binary (~15 sec)
 # ✓ Package macOS Binary (~8-10 min, includes signing and notarization)
 # ✓ Package Debian Package (~1 min)
-# ✓ Publish Release (~15 sec)
+# ✓ Publish Release (~30 sec; its last step pushes the Homebrew cask for the tag's channel)
 ```
 
 > **Prepare AUR Package is now a real build.** It runs in an `archlinux:base-devel`

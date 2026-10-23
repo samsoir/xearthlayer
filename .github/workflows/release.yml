@@ -14,6 +14,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
+  # The Homebrew tap that `publish` bumps after a release (docs/dev/cicd.md,
+  # "Homebrew tap"). `brew tap xearthlayer/tap` is this repository.
+  HOMEBREW_TAP_REPO: xearthlayer/homebrew-tap
 
 jobs:
   # First: Run make verify to gate all builds
@@ -602,6 +605,43 @@ jobs:
           echo "=============================================="
           echo ""
           echo "Release URL: https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG}"
+
+      # Bump the Homebrew tap. A pre-release tag rewrites the `xearthlayer@prerelease`
+      # cask, a stable tag the `xearthlayer` cask; the two never cross. The
+      # tarball's hash is taken from the artifact just uploaded, so the cask can
+      # only ever describe the bytes this run published. The release is already
+      # public by this point, so a failure here marks the run red without
+      # un-publishing anything; the fix is scripts/homebrew/render-cask.sh by hand.
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::notice::HOMEBREW_TAP_TOKEN not configured; the Homebrew tap was not updated."
+            exit 0
+          fi
+          TARBALL="artifacts/macos-binary/xearthlayer-${RELEASE_TAG}-arm64-macos.tar.gz"
+          SHA256=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+          CHANNEL=stable
+          [ "$PRERELEASE" = "true" ] && CHANNEL=prerelease
+
+          git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${HOMEBREW_TAP_REPO}.git" tap
+          CASK=$(scripts/homebrew/render-cask.sh "$CHANNEL" "$VERSION" "$SHA256" "${{ github.repository }}" tap/Casks)
+          cd tap
+          git add Casks
+          if git diff --cached --quiet; then
+            echo "Tap already at ${VERSION}; nothing to push."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "$(basename "$CASK" .rb) ${VERSION}" \
+                     -m "Rendered from ${{ github.repository }}@${RELEASE_TAG} by release.yml run ${{ github.run_id }}."
+          git push
+          echo "Homebrew tap updated: ${HOMEBREW_TAP_REPO} $(basename "$CASK" .rb) -> ${VERSION}"
 
       # Website notification moved to website-sync.yml (triggers on release/* merge to main)
 
