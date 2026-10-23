@@ -6,9 +6,11 @@
 //! # Module Structure
 //!
 //! - `dashboard` - Main TUI dashboard (see submodules for details)
+//! - `packages` - The package manager TUI (`xearthlayer packages`)
 //! - `widgets` - Reusable UI widget components
 
 pub mod dashboard;
+pub mod packages;
 pub mod symbols;
 pub mod widgets;
 

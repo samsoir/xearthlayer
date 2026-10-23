@@ -211,7 +211,7 @@ fn look_after(event: &JobEvent<'_>) -> Look {
 }
 
 /// "NA-CANADA ortho v2.1.0", or without a version for a remove.
-fn label(summary: &JobSummary) -> String {
+pub(crate) fn label(summary: &JobSummary) -> String {
     match &summary.version {
         Some(version) => format!("{} {} v{version}", summary.region, summary.package_type),
         None => format!("{} {}", summary.region, summary.package_type),

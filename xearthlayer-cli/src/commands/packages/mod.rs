@@ -16,10 +16,10 @@
 //! - Depends only on trait interfaces via `CommandContext`
 //! - Can be tested in isolation with mock implementations
 
-mod actions;
+pub(crate) mod actions;
 mod args;
 mod handlers;
-mod progress;
+pub(crate) mod progress;
 mod selector;
 mod services;
 #[cfg(test)]

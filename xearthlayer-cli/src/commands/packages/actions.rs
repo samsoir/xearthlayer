@@ -22,7 +22,6 @@ use super::traits::PackageManagerService;
 
 /// Where a library package stands against what is installed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // read by the package manager TUI
 pub enum LibraryStatus {
     NotInstalled,
     UpToDate,
@@ -34,7 +33,6 @@ pub enum LibraryStatus {
 
 /// One library package and its status.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // read by the package manager TUI
 pub struct LibraryRow {
     pub entry: LibraryEntry,
     pub status: LibraryStatus,

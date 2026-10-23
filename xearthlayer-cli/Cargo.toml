@@ -53,12 +53,12 @@ console = "0.15"
 indicatif = "0.17"
 rlimit = "0.10"
 signal-hook = "0.3"
+chrono.workspace = true
 
 [features]
 profiling = ["xearthlayer/profiling"]
 debug-map = ["xearthlayer/debug-map"]
 
 [dev-dependencies]
-chrono.workspace = true
 proptest = "1.4"
 tempfile.workspace = true
