@@ -14,6 +14,7 @@
 //! - X-Plane detection: [`xearthlayer::config::detect_scenery_dir`]
 //! - Configuration: [`xearthlayer::config::ConfigFile`]
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -142,7 +143,17 @@ pub fn run_wizard() -> Result<(), CliError> {
 
     let written = write_config(&setup_config)?;
     print_completion_message(&written);
-    Ok(())
+
+    // Setup leaves no scenery installed, so offer the way to get some. Without
+    // a terminal there is nobody to ask and nothing to draw on.
+    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let answer = tty
+        && Confirm::with_theme(&theme)
+            .with_prompt("Open the package manager now to install scenery?")
+            .default(true)
+            .interact()
+            .map_err(|e| CliError::Config(format!("Confirm error: {}", e)))?;
+    offer_manager(answer, tty, crate::commands::packages::open_manager)
 }
 
 fn print_banner() {
@@ -223,19 +234,45 @@ fn print_completion_message(config: &ConfigFile) {
     print_layout(config);
     println!();
     println!("{}:", style("Next Steps").bold());
-    println!("  1. View your configuration:");
-    println!("     {} config list", style("xearthlayer").cyan());
-    println!();
-    println!("  2. Install a scenery package:");
-    println!("     {} packages list", style("xearthlayer").cyan());
-    println!(
-        "     {} packages install <region code from the list>",
-        style("xearthlayer").cyan()
-    );
-    println!();
-    println!("  3. Start XEarthLayer:");
-    println!("     {}", style("xearthlayer").cyan());
-    println!();
+    for step in next_steps() {
+        for line in step.lines() {
+            // Indented lines are commands to type; the rest is the step's text.
+            if line.starts_with("     ") {
+                println!("{}", style(line).cyan());
+            } else {
+                println!("{line}");
+            }
+        }
+        println!();
+    }
+}
+
+/// The numbered steps shown after setup, one string per step, plain text.
+///
+/// The first line of a step says what it is for; the indented lines under it
+/// are the commands to type.
+fn next_steps() -> Vec<String> {
+    vec![
+        "  1. Open the package manager to install scenery:\n     xearthlayer packages".to_string(),
+        "  2. View your configuration:\n     xearthlayer config list".to_string(),
+        "  3. Install a scenery package from the command line:\n     xearthlayer packages list\n     xearthlayer packages install <region code from the list>"
+            .to_string(),
+        "  4. Start XEarthLayer:\n     xearthlayer".to_string(),
+    ]
+}
+
+/// Open the package manager when the user said yes and there is a terminal
+/// to draw it in. The decision is separate from the prompt so it can be tested.
+fn offer_manager(
+    answer: bool,
+    tty: bool,
+    launch: impl FnOnce() -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    if tty && answer {
+        launch()
+    } else {
+        Ok(())
+    }
 }
 
 /// Action to take when config already exists.
@@ -978,6 +1015,46 @@ mod tests {
         assert_eq!(
             row(&layout_rows(&config), "Scenery packages"),
             &xearthlayer::paths::packages_dir()
+        );
+    }
+
+    #[test]
+    fn the_manager_opens_only_for_a_yes_at_a_terminal() {
+        for (answer, tty, opens) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            let mut launched = false;
+            offer_manager(answer, tty, || {
+                launched = true;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(launched, opens, "answer {answer}, tty {tty}");
+        }
+    }
+
+    #[test]
+    fn a_failing_manager_reports_its_error() {
+        let result = offer_manager(true, true, || Err(CliError::Config("boom".to_string())));
+
+        assert!(matches!(result, Err(CliError::Config(ref m)) if m == "boom"));
+    }
+
+    #[test]
+    fn the_next_steps_lead_with_the_package_manager() {
+        let steps = next_steps();
+
+        assert!(
+            steps[0].contains("xearthlayer packages"),
+            "the first step should open the package manager, got {:?}",
+            steps[0]
+        );
+        assert!(
+            steps.iter().any(|s| s.contains("packages install")),
+            "the install command should still be listed"
         );
     }
 }
