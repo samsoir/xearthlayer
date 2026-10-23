@@ -52,6 +52,7 @@ mod installer;
 mod local;
 mod mounts;
 mod queue;
+mod sizes;
 mod symlinks;
 mod traits;
 mod updates;

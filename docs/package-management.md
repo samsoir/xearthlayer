@@ -47,7 +47,7 @@ Switch tabs with `1`, `2` and `3`, or with Tab and Shift+Tab.
 
 | Tab | Shows |
 |-----|-------|
-| 1 Local | The packages installed on this machine, with version, size and whether the library has a newer version. |
+| 1 Local | The packages installed on this machine, with version, size and whether the library has a newer version. Sizes are recorded when a package installs, in `.xearthlayer-package-sizes` in the packages folder; a package installed by an earlier version is measured once, the first time its size is shown. |
 | 2 Library | Every package the library offers, with whether it is not installed, up to date, or has an update. `t` cycles the list between all packages, ortho only and overlay only. |
 | 3 Progress | The jobs of this session: queued, downloading, extracting, installing, removing, done, failed or cancelled. The tab title counts the unfinished ones. |
 

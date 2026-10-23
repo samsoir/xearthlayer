@@ -37,7 +37,7 @@ const PART_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_PARALLEL_DOWNLOADS: usize = 4;
 
 /// The file every published package carries at its top, naming its version.
-const PACKAGE_METADATA_FILE: &str = "xearthlayer_scenery_package.txt";
+pub(crate) const PACKAGE_METADATA_FILE: &str = "xearthlayer_scenery_package.txt";
 
 /// Start of the name of each package's temp directory.
 pub(crate) const INSTALL_TEMP_PREFIX: &str = "install_";
@@ -347,8 +347,9 @@ impl Stages for PackageInstaller {
         ctx.stage(InstallStage::Extracting);
         let install_path = self.store.install_path(region, package_type);
         let staged = stage(&install_path)?;
-        let files_extracted =
+        let extracted =
             TarGzExtractor::new().extract_parts(&parts, staged.path(), ctx.cancel_token())?;
+        let files_extracted = extracted.files;
         info!(region = %region, files_extracted, "extraction completed");
         let source = package_source(staged.path(), install_path.file_name())?;
         // An archive that is empty or was cut short must not replace a
@@ -371,6 +372,9 @@ impl Stages for PackageInstaller {
         if let Some(old) = replaced {
             aside::discard(&old);
         }
+        // Recorded so a listing shows the size without walking the tree (#324).
+        self.store
+            .record_size(&install_path, &metadata.package_version, extracted.bytes);
 
         info!(
             region = %region,
@@ -734,6 +738,26 @@ mod tests {
                 format!("terrain for {title}")
             );
         }
+    }
+
+    #[test]
+    fn an_install_records_the_size_a_walk_of_the_installed_tree_measures() {
+        // #324: the bytes extracted are recorded, so listing never walks.
+        let temp = TempDir::new().unwrap();
+        let mut transfer = LocalTransfer::default();
+        let batch = [package("AF-NORTH", &mut transfer)];
+
+        let results = install_all(installer(&temp, transfer, u64::MAX), &batch, Arc::default());
+        let result = results[0].as_ref().unwrap();
+
+        let root = result.install_path.parent().unwrap();
+        let record = super::super::sizes::SizeRecord::load(root);
+        let walked = super::super::local::calculate_dir_size(&result.install_path).unwrap();
+        assert!(walked > 0);
+        assert_eq!(
+            record.size_of(&result.install_path, &result.version.to_string()),
+            Some(walked)
+        );
     }
 
     #[test]

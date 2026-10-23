@@ -2,7 +2,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use super::sizes::SizeRecord;
 
 use semver::Version;
 
@@ -21,6 +23,9 @@ pub struct InstalledPackage {
     /// is called. Listing never measures it: `run` lists every package and
     /// shows no size, and measuring walks every file in the package (#325).
     size: OnceLock<u64>,
+    /// Where a size measured here is recorded, so the next listing reads it
+    /// instead of walking again (#324). `None` records nothing.
+    record: Option<Arc<Mutex<SizeRecord>>>,
 }
 
 impl InstalledPackage {
@@ -30,6 +35,15 @@ impl InstalledPackage {
             metadata,
             path,
             size: OnceLock::new(),
+            record: None,
+        }
+    }
+
+    /// A package whose size, once measured, is recorded in `record`.
+    fn recording(metadata: PackageMetadata, path: PathBuf, record: Arc<Mutex<SizeRecord>>) -> Self {
+        Self {
+            record: Some(record),
+            ..Self::new(metadata, path)
         }
     }
 
@@ -39,6 +53,7 @@ impl InstalledPackage {
             metadata,
             path,
             size: OnceLock::from(size_bytes),
+            record: None,
         }
     }
 
@@ -47,9 +62,16 @@ impl InstalledPackage {
     /// The first call walks every file in the package, which is slow on a
     /// large one; later calls return the same answer.
     pub fn size_bytes(&self) -> u64 {
-        *self
-            .size
-            .get_or_init(|| calculate_dir_size(&self.path).unwrap_or(0))
+        *self.size.get_or_init(|| {
+            let size = calculate_dir_size(&self.path).unwrap_or(0);
+            if let Some(record) = &self.record {
+                record
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .record(&self.path, &self.metadata.package_version.to_string(), size);
+            }
+            size
+        })
     }
 
     /// Get the region code from the package title.
@@ -135,16 +157,54 @@ impl LocalPackageStore {
             }
         })?;
 
-        Ok(InstalledPackage::new(metadata, package_dir))
+        Ok(self.sized(
+            metadata,
+            package_dir,
+            &Arc::new(Mutex::new(self.size_record())),
+        ))
     }
 
     /// List all installed packages.
+    ///
+    /// Sizes come from the record where it is current and are otherwise
+    /// measured on first use, never here (#324, #325).
     pub fn list(&self) -> ManagerResult<Vec<InstalledPackage>> {
+        let record = Arc::new(Mutex::new(self.size_record()));
         Ok(self
             .scan()?
             .into_iter()
-            .map(|(metadata, path)| InstalledPackage::new(metadata, path))
+            .map(|(metadata, path)| self.sized(metadata, path, &record))
             .collect())
+    }
+
+    fn size_record(&self) -> SizeRecord {
+        SizeRecord::load(&self.root)
+    }
+
+    /// The package with its recorded size if that is current, else with its
+    /// size measured on first use and recorded then.
+    fn sized(
+        &self,
+        metadata: PackageMetadata,
+        path: PathBuf,
+        record: &Arc<Mutex<SizeRecord>>,
+    ) -> InstalledPackage {
+        let version = metadata.package_version.to_string();
+        let recorded = record
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .size_of(&path, &version);
+        match recorded {
+            Some(size) => InstalledPackage::with_size(metadata, path, size),
+            None => InstalledPackage::recording(metadata, path, Arc::clone(record)),
+        }
+    }
+
+    /// Record the size of the package installed in `package_dir`, as the
+    /// installer does with the bytes it extracted (#324).
+    pub fn record_size(&self, package_dir: &Path, version: &Version, size: u64) {
+        self.size_record()
+            .record(package_dir, &version.to_string(), size);
     }
 
     /// The region and type of every installed package, in the order `list`
@@ -279,7 +339,7 @@ fn package_mountpoint(region: &str, package_type: PackageType) -> String {
 }
 
 /// Calculate the total size of a directory recursively.
-fn calculate_dir_size(path: &Path) -> std::io::Result<u64> {
+pub(super) fn calculate_dir_size(path: &Path) -> std::io::Result<u64> {
     let mut total = 0;
 
     if path.is_file() {
@@ -384,6 +444,38 @@ mod tests {
         assert_eq!(package.package_type(), PackageType::Ortho);
         assert_eq!(package.version(), &Version::new(1, 0, 0));
         assert!(package.size_bytes() > 0);
+    }
+
+    #[test]
+    fn a_recorded_size_is_shown_without_walking_the_package() {
+        // #324: the record answers, so a whole world lists without 5.3
+        // million stat calls. A deliberately wrong record proves no walk.
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "na", PackageType::Ortho, "1.0.0");
+        let dir = temp.path().join("zzXEL_na_ortho");
+        store.record_size(&dir, &Version::new(1, 0, 0), 123_456_789);
+
+        assert_eq!(store.list().unwrap()[0].size_bytes(), 123_456_789);
+        assert_eq!(
+            store.get("na", PackageType::Ortho).unwrap().size_bytes(),
+            123_456_789
+        );
+    }
+
+    #[test]
+    fn a_size_measured_once_is_recorded_for_the_next_listing() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "na", PackageType::Ortho, "1.0.0");
+        let dir = temp.path().join("zzXEL_na_ortho");
+        let measured = store.list().unwrap()[0].size_bytes();
+        assert_eq!(measured, calculate_dir_size(&dir).unwrap());
+
+        // Grow the package without changing its metadata: a fresh listing
+        // shows the recorded size, so it did not walk again.
+        fs::write(dir.join("extra.bin"), vec![0u8; 4096]).unwrap();
+        assert_eq!(store.list().unwrap()[0].size_bytes(), measured);
     }
 
     #[test]

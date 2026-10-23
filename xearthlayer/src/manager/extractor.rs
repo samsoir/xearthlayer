@@ -25,6 +25,16 @@ use super::traits::ArchiveExtractor;
 /// syscalls, sets the pace.
 const READ_BUFFER_BYTES: usize = 1 << 20;
 
+/// What an extraction wrote.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Extracted {
+    /// Regular files extracted.
+    pub files: usize,
+    /// Their total size in bytes: the package's size on disk as a walk of
+    /// its files counts it, recorded so listing need not walk (#324).
+    pub bytes: u64,
+}
+
 /// Extracts `tar.gz` package archives in process.
 #[derive(Debug, Default)]
 pub struct TarGzExtractor;
@@ -44,13 +54,13 @@ impl TarGzExtractor {
     /// in place. Stops with [`ManagerError::Cancelled`] before the next entry
     /// once `cancel` is set.
     ///
-    /// Returns the number of regular files extracted.
+    /// Returns how many regular files were extracted and their total size.
     pub fn extract_parts(
         &self,
         parts: &[PathBuf],
         dest_dir: &Path,
         cancel: &CancelToken,
-    ) -> ManagerResult<usize> {
+    ) -> ManagerResult<Extracted> {
         let Some(first) = parts.first() else {
             return Err(ManagerError::ExtractionFailed {
                 path: dest_dir.to_path_buf(),
@@ -69,7 +79,7 @@ impl TarGzExtractor {
         source: &Path,
         dest_dir: &Path,
         cancel: &CancelToken,
-    ) -> ManagerResult<usize> {
+    ) -> ManagerResult<Extracted> {
         // The error's path names the archive, which on a split layout is on
         // another disk than the one written to. Naming the destination in the
         // reason tells a full-disk failure which disk filled.
@@ -86,7 +96,7 @@ impl TarGzExtractor {
         let gz = GzDecoder::new(BufReader::with_capacity(READ_BUFFER_BYTES, reader));
         let mut archive = tar::Archive::new(gz);
 
-        let mut files = 0;
+        let mut extracted = Extracted::default();
         for entry in archive.entries().map_err(|e| failed(e.to_string()))? {
             if cancel.is_cancelled() {
                 return Err(ManagerError::Cancelled);
@@ -97,6 +107,7 @@ impl TarGzExtractor {
                 .map_err(|e| failed(e.to_string()))?
                 .into_owned();
             let is_file = entry.header().entry_type().is_file();
+            let size = entry.size();
 
             // `unpack_in` declines, rather than fails, an entry that would
             // land outside `dest_dir`. Ignoring that would install a package
@@ -112,7 +123,8 @@ impl TarGzExtractor {
                 )));
             }
             if is_file {
-                files += 1;
+                extracted.files += 1;
+                extracted.bytes += size;
             }
         }
 
@@ -124,7 +136,7 @@ impl TarGzExtractor {
         io::copy(&mut gz, &mut io::sink()).map_err(|e| failed(e.to_string()))?;
         io::copy(&mut gz.into_inner(), &mut io::sink()).map_err(|e| failed(e.to_string()))?;
 
-        Ok(files)
+        Ok(extracted)
     }
 }
 
@@ -193,6 +205,7 @@ impl ArchiveExtractor for TarGzExtractor {
             source: e,
         })?;
         self.unpack(file, archive_path, dest_dir, &CancelToken::new())
+            .map(|extracted| extracted.files)
     }
 }
 
@@ -408,11 +421,13 @@ mod tests {
         let parts = split_into(&parts_dir, &bytes, 7);
         let dest = temp.path().join("dest");
 
-        let files = TarGzExtractor::new()
+        let extracted = TarGzExtractor::new()
             .extract_parts(&parts, &dest, &CancelToken::new())
             .unwrap();
 
-        assert_eq!(files, 2);
+        assert_eq!(extracted.files, 2);
+        // The bytes of the regular files written, as a walk would count them (#324).
+        assert_eq!(extracted.bytes, (b"alpha".len() + b"beta".len()) as u64);
         assert_eq!(fs::read(dest.join("pkg/a.txt")).unwrap(), b"alpha");
         assert_eq!(fs::read(dest.join("pkg/sub/b.txt")).unwrap(), b"beta");
         assert_eq!(
