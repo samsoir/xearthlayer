@@ -125,9 +125,7 @@ impl RunActive {
             self.lock.display()
         )
     }
-}
 
-impl RunActive {
     /// The refusal for a status line, which has no room for the lock path.
     /// The details pane carries the full [`message`](Self::message).
     pub fn short_message(&self) -> String {
