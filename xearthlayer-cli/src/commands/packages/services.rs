@@ -4,7 +4,7 @@
 //! adapting them to the trait interfaces used by handlers.
 
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::progress::ConsoleQueueObserver;
@@ -240,7 +240,11 @@ impl PackageManagerService for DefaultPackageManagerService {
     }
 
     fn running_instance(&self) -> Option<u32> {
-        xearthlayer::system::process::running_instance(&xearthlayer::paths::lock_file())
+        xearthlayer::system::process::running_instance(&self.instance_lock())
+    }
+
+    fn instance_lock(&self) -> PathBuf {
+        xearthlayer::paths::lock_file()
     }
 }
 

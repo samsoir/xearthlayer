@@ -410,7 +410,7 @@ impl CommandHandler for InstallHandler {
         let refusal = actions::check_replacement(ctx.manager).err();
         let mut allowed: Vec<_> = plan.iter().copied().enumerate().collect();
         let mut outcomes = Vec::new();
-        if let Some(run) = refusal {
+        if let Some(run) = &refusal {
             let store = ctx.manager.create_store(&args.install_dir);
             let installed = ctx
                 .manager
@@ -418,14 +418,15 @@ impl CommandHandler for InstallHandler {
                 .map_err(|e| CliError::Packages(e.to_string()))?;
             let refused;
             (refused, allowed) = allowed.into_iter().partition(|(_, entry)| {
-                installed
-                    .iter()
-                    .any(|p| p.region() == entry.title && p.package_type() == entry.package_type)
+                installed.iter().any(|p| {
+                    p.region().eq_ignore_ascii_case(&entry.title)
+                        && p.package_type() == entry.package_type
+                })
             });
             outcomes.extend(
                 refused
                     .into_iter()
-                    .map(|(position, entry)| (position, entry, Err(run.into()))),
+                    .map(|(position, entry)| (position, entry, Err(run.clone().into()))),
             );
         }
 
@@ -1500,6 +1501,25 @@ mod tests {
         );
         assert!(
             message.contains("stop it before updating or removing packages"),
+            "{message}"
+        );
+        assert!(manager.installs().is_empty());
+    }
+
+    /// Installed metadata may carry a legacy lower-case title; it is the
+    /// same package folder, so it is still refused while `run` serves it.
+    #[test]
+    fn a_running_instance_refuses_an_installed_package_whose_title_differs_in_case() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["NA-GREENLAND"])
+            .with_installed(PackageType::Ortho, &["na-greenland"])
+            .with_running_instance(4242);
+
+        let run = install(&manager, true, "NA-G", false);
+
+        let message = packages_error(run.result);
+        assert!(
+            message.contains("XEarthLayer is running (pid 4242)"),
             "{message}"
         );
         assert!(manager.installs().is_empty());

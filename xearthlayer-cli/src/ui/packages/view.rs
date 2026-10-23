@@ -6,7 +6,7 @@
 //! ┌ list ───────────────┐┌ Details ────────────┐
 //! │                     ││                     │
 //! └─────────────────────┘└─────────────────────┘
-//!  status line
+//!  status line                                 (two rows when it is long)
 //!  keys of the tab
 //! ```
 //!
@@ -41,7 +41,7 @@ pub fn draw(frame: &mut Frame, state: &AppState, now: Instant) {
         Constraint::Length(1),
         Constraint::Length(banner),
         Constraint::Min(3),
-        Constraint::Length(1),
+        Constraint::Length(chrome::status_height(state, area.width)),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -65,7 +65,7 @@ pub fn draw(frame: &mut Frame, state: &AppState, now: Instant) {
         }
     }
     chrome::status_line(frame, status, state);
-    chrome::footer(frame, footer, state.tab());
+    chrome::footer(frame, footer, state.tab(), state.run_active().is_some());
 
     if let Some(modal) = state.modal() {
         help::draw(frame, modal);
@@ -93,6 +93,7 @@ mod tests {
 
     use super::*;
     use crate::commands::packages::actions::{LibraryRow, LibraryStatus};
+    use crate::commands::packages::test_support::run_active;
     use crate::ui::packages::app::{Action, Input, JobMsg, LocalRow, Msg, Tab};
 
     fn v(version: &str) -> Version {
@@ -258,7 +259,7 @@ mod tests {
     fn the_banner_shows_while_run_is_active() {
         let mut state = loaded();
         assert!(!buffer_text(&render(&state, 100, 30)).contains("is running"));
-        msg(&mut state, Msg::RunActive(Some(4242)));
+        msg(&mut state, Msg::RunActive(Some(run_active(4242))));
         let buffer = render(&state, 100, 30);
         let text = buffer_text(&buffer);
         assert!(
@@ -273,7 +274,7 @@ mod tests {
     #[test]
     fn a_narrow_terminal_shortens_the_banner_instead_of_cutting_it() {
         let mut state = loaded();
-        msg(&mut state, Msg::RunActive(Some(1234567)));
+        msg(&mut state, Msg::RunActive(Some(run_active(1234567))));
         let text = buffer_text(&render(&state, 80, 24));
         let banner = text.lines().nth(1).unwrap();
         assert!(banner.contains("(pid 1234567)"), "{banner}");
@@ -331,6 +332,60 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[28].contains("3 jobs queued: see Progress"), "{text}");
         assert!(lines[29].contains("q quit"), "{text}");
+    }
+
+    /// A combined note can be longer than the terminal is wide: it gets a
+    /// second row rather than being cut.
+    #[test]
+    fn a_long_status_wraps_to_two_rows_above_the_footer() {
+        let mut state = loaded();
+        let note = "EU-WEST ortho left out. XEarthLayer is running (pid 4242): stop it \
+                    before updating or removing packages; New packages: restart xearthlayer \
+                    run to use it";
+        msg(&mut state, Msg::Status(note.into()));
+
+        let buffer = render(&state, 80, 24);
+
+        let text = buffer_text(&buffer);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[21].starts_with(" EU-WEST ortho left out."), "{text}");
+        assert!(lines[22].contains("run to use it"), "{text}");
+        assert!(lines[23].contains("q quit"), "{text}");
+        assert!(
+            text.contains("Installed ("),
+            "the lists keep their pane:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_short_status_keeps_one_row() {
+        let mut state = loaded();
+        msg(&mut state, Msg::Status("1 job queued: see Progress".into()));
+
+        let text = buffer_text(&render(&state, 80, 24));
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[22].contains("1 job queued: see Progress"), "{text}");
+        assert!(lines[21].contains('└'), "the body ends just above:\n{text}");
+    }
+
+    /// While `run` is active, updates and deletes are refused, so their keys
+    /// are drawn dimmed, as the banner says.
+    #[test]
+    fn the_local_footer_dims_u_and_d_while_run_is_active() {
+        let mut state = loaded();
+        let buffer = render(&state, 100, 30);
+        assert_eq!(fg_of(&buffer, "u update"), Color::Cyan);
+
+        msg(&mut state, Msg::RunActive(Some(run_active(4242))));
+        let buffer = render(&state, 100, 30);
+
+        assert_eq!(fg_of(&buffer, "u update"), Color::DarkGray);
+        // Not the banner's "updates and deletes".
+        assert_eq!(fg_of(&buffer, "d delete  "), Color::DarkGray);
+        assert_eq!(fg_of(&buffer, "r refresh"), Color::Cyan);
+        go(&mut state, Tab::Library);
+        assert_eq!(fg_of(&render(&state, 100, 30), "i install"), Color::Cyan);
     }
 
     #[test]

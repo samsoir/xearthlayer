@@ -4,7 +4,8 @@
 //! slow reads: the installed packages, the library over HTTP, the `run`
 //! check, package metadata and the overlay rebuild. The queue, the
 //! [`ActiveQueue`], dropping the queue and the quick `run` check made before
-//! each submission stay on the runner's thread; the worker only reads and
+//! each submission (with, while `run` serves, a read of what is installed)
+//! stay on the runner's thread; the worker only reads and
 //! answers with [`Msg`]s. [`ChannelObserver`] turns the
 //! queue's events into `Msg`s on the same channel.
 
@@ -106,6 +107,7 @@ pub struct Effects<S: Stages, F> {
     manager: Arc<dyn PackageManagerService>,
     /// The package each remove job removes, until the job finishes.
     removing: HashMap<JobId, PackageKey>,
+    install_dir: PathBuf,
     custom_scenery_path: Option<PathBuf>,
     /// The queue was abandoned: on exit, wait only for a running swap.
     abandoned: bool,
@@ -123,6 +125,7 @@ where
         active: ActiveQueue,
         tx: Sender<Msg>,
     ) -> Self {
+        let install_dir = settings.install_dir.clone();
         let custom_scenery_path = settings.custom_scenery_path.clone();
         Self {
             start_queue,
@@ -132,6 +135,7 @@ where
             manager,
             tx,
             removing: HashMap::new(),
+            install_dir,
             custom_scenery_path,
             abandoned: false,
         }
@@ -181,6 +185,12 @@ where
         }
     }
 
+    /// An overlay rebuild is still to finish, so dropping these effects
+    /// waits for it.
+    pub fn rebuild_pending(&self) -> bool {
+        self.worker.flags.rebuilds.load(Ordering::SeqCst) > 0
+    }
+
     fn send(&self, msg: Msg) {
         let _ = self.tx.send(msg);
     }
@@ -211,37 +221,54 @@ where
         }
     }
 
-    /// The running queue, started if there is none. A queue that will not
-    /// start is answered with `QueueRefused`.
-    fn queue(&mut self) -> Option<&InstallQueue<S>> {
+    /// The running queue, started if there is none, or why it will not
+    /// start.
+    fn queue(&mut self) -> Result<&InstallQueue<S>, String> {
         if self.queue.is_none() {
-            match (self.start_queue)() {
-                Ok(queue) => {
-                    self.active.set(queue.canceller());
-                    self.queue = Some(queue);
-                }
-                Err(e) => {
-                    self.send(Msg::QueueRefused(e.to_string()));
-                    return None;
-                }
-            }
+            let queue = (self.start_queue)().map_err(|e| e.to_string())?;
+            self.active.set(queue.canceller());
+            self.queue = Some(queue);
         }
-        self.queue.as_ref()
+        Ok(self.queue.as_ref().expect("started above"))
+    }
+
+    /// The packages installed on disk.
+    fn installed(&self) -> ManagerResult<Vec<PackageKey>> {
+        let store = self.manager.create_store(&self.install_dir);
+        let packages = self.manager.list_packages(&store)?;
+        Ok(packages
+            .iter()
+            .map(|p| (p.region().to_string(), p.package_type()))
+            .collect())
     }
 
     /// Submit the installs as one batch. Each job's `Queued` comes from the
     /// observer during `submit_batch`, so `Submitted` follows all of them.
-    /// While `run` is serving, the packages in `replacing` are left out, as
-    /// the CLI leaves them out; with nothing left, the request is refused.
+    /// While `run` is serving, the packages in `replacing` and those
+    /// installed on disk are left out, as the CLI leaves them out; with
+    /// nothing left, the request is refused.
     fn submit(&mut self, mut metadata: Vec<PackageMetadata>, replacing: &[PackageKey]) {
         let mut refused = Vec::new();
         if let Err(run) = check_replacement(self.manager.as_ref()) {
-            self.send(Msg::RunActive(Some(run.0)));
+            self.send(Msg::RunActive(Some(run.clone())));
+            // The state's rows may be stale, so the disk is read again: only
+            // while `run` is serving, when a stale row would matter.
+            let installed = match self.installed() {
+                Ok(installed) => installed,
+                Err(e) => {
+                    let why = format!("could not read the installed packages: {e}");
+                    self.send(Msg::QueueRefused(why));
+                    return;
+                }
+            };
             let left_out: Vec<PackageMetadata>;
             (left_out, metadata) = metadata.into_iter().partition(|m| {
-                replacing.iter().any(|(region, package_type)| {
-                    region.eq_ignore_ascii_case(&m.title) && *package_type == m.package_type
-                })
+                replacing
+                    .iter()
+                    .chain(&installed)
+                    .any(|(region, package_type)| {
+                        region.eq_ignore_ascii_case(&m.title) && *package_type == m.package_type
+                    })
             });
             if !left_out.is_empty() {
                 let names: Vec<String> = left_out
@@ -260,8 +287,14 @@ where
             .iter()
             .map(|m| package_name(&m.title, m.package_type))
             .collect();
-        let Some(queue) = self.queue() else {
-            return;
+        let queue = match self.queue() {
+            Ok(queue) => queue,
+            Err(why) => {
+                // What was left out is still said.
+                refused.push(why);
+                self.send(Msg::QueueRefused(refused.join("; ")));
+                return;
+            }
         };
         let results = queue.submit_batch(metadata);
         refused.extend(
@@ -280,12 +313,13 @@ where
     /// refuses it.
     fn remove(&mut self, targets: Vec<PackageKey>) {
         if let Err(run) = check_removal(self.manager.as_ref()) {
-            self.send(Msg::RunActive(Some(run.0)));
+            self.send(Msg::RunActive(Some(run.clone())));
             self.send(Msg::QueueRefused(run.message()));
             return;
         }
-        let Some(queue) = self.queue() else {
-            return;
+        let queue = match self.queue() {
+            Ok(queue) => queue,
+            Err(why) => return self.send(Msg::QueueRefused(why)),
         };
         let mut removing = Vec::new();
         let mut refused = Vec::new();
@@ -308,17 +342,20 @@ where
     /// a live one keeps the lock held.
     fn release_queue(&mut self) {
         self.active.clear();
-        // Idle, so this joins its threads at once.
+        // Idle, so this returns at once: its threads are joined, or, while
+        // its sweep still runs, left to finish it.
         drop(self.queue.take());
         self.abandoned = false;
     }
 }
 
 impl<S: Stages, F> Drop for Effects<S, F> {
-    /// An abandoned queue is not joined when dropped, so a swap it is
-    /// running is waited for here: the process must not end mid-rename.
-    /// Nothing else is waited for.
+    /// An overlay rebuild still to do is finished first, while the queue
+    /// still holds the lock. An abandoned queue is not joined when dropped,
+    /// so a swap it is running is waited for here: the process must not end
+    /// mid-rename. Nothing else is waited for.
     fn drop(&mut self) {
+        self.worker.close();
         self.active.clear();
         if let Some(queue) = self.queue.take() {
             if self.abandoned {
@@ -460,11 +497,12 @@ impl Worker {
     }
 }
 
-impl Drop for Worker {
-    /// The reads still queued are skipped. A rebuild still to do is waited
-    /// for, so the overlay folder is never left half built; otherwise the
-    /// thread is left to finish its read, which may wait on the network.
-    fn drop(&mut self) {
+impl Worker {
+    /// Take no more reads and skip those still queued. A rebuild still to
+    /// do is waited for, so the overlay folder is never left half built;
+    /// otherwise the thread is left to finish its read, which may wait on
+    /// the network. Closing again does nothing.
+    fn close(&mut self) {
         self.flags.closing.store(true, Ordering::SeqCst);
         drop(self.tx.take());
         if self.flags.rebuilds.load(Ordering::SeqCst) > 0 {
@@ -472,6 +510,12 @@ impl Drop for Worker {
                 let _ = thread.join();
             }
         }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -602,7 +646,7 @@ impl Reads<'_> {
                     Err(e) => self.send(Msg::Library(Err(e.to_string()))),
                 }
             }
-            Read::Load(Load::Run) => self.send(Msg::RunActive(manager.running_instance())),
+            Read::Load(Load::Run) => self.send(Msg::RunActive(check_removal(manager).err())),
             Read::Metadata(entries) => {
                 let results = entries
                     .iter()
@@ -698,8 +742,7 @@ mod tests {
     use xearthlayer_package::{LibraryEntry, PackageMetadata, PackageType};
 
     use super::*;
-    use crate::commands::packages::actions::RunActive;
-    use crate::commands::packages::test_support::{install_dir, FakeManager};
+    use crate::commands::packages::test_support::{install_dir, run_active, FakeManager};
     use crate::signals::ActiveQueue;
     use crate::ui::packages::app::{Action, AppState, Effect, Input, JobMsg, Msg};
 
@@ -1122,8 +1165,10 @@ mod tests {
             swap_gate: Some(gate.clone()),
             ..FakeStages::in_dir(dir.path())
         };
-        let gate = OpenOnDrop(gate);
         let (mut effects, rx) = effects_on(stages);
+        // Bound after the effects, so on a failure it opens before their
+        // drop joins the queue thread held at it.
+        let gate = OpenOnDrop(gate);
 
         let _ = effects.apply(Effect::Submit {
             packages: vec![
@@ -1282,10 +1327,10 @@ mod tests {
             ("NA-EAST".to_string(), PackageType::Ortho),
         ]));
 
-        assert!(matches!(next(&rx), Msg::RunActive(Some(4242))));
+        assert!(matches!(next(&rx), Msg::RunActive(Some(run)) if run.pid == 4242));
         let refused = next(&rx);
         assert!(
-            matches!(&refused, Msg::QueueRefused(why) if *why == RunActive(4242).message()),
+            matches!(&refused, Msg::QueueRefused(why) if *why == run_active(4242).message()),
             "{refused:?}"
         );
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
@@ -1307,7 +1352,10 @@ mod tests {
         });
 
         let seen = until(&rx, |msg| matches!(msg, Msg::Submitted { .. }));
-        assert!(matches!(seen[0], Msg::RunActive(Some(4242))), "{seen:?}");
+        assert!(
+            matches!(&seen[0], Msg::RunActive(Some(run)) if run.pid == 4242),
+            "{seen:?}"
+        );
         let queued: Vec<&str> = seen
             .iter()
             .filter_map(|msg| match msg {
@@ -1323,7 +1371,7 @@ mod tests {
             refused,
             &[format!(
                 "EU-WEST ortho left out. {}",
-                RunActive(4242).message()
+                run_active(4242).message()
             )]
         );
         until(&rx, finished);
@@ -1340,14 +1388,74 @@ mod tests {
             replacing: vec![("EU-WEST".to_string(), PackageType::Ortho)],
         });
 
-        assert!(matches!(next(&rx), Msg::RunActive(Some(4242))));
+        assert!(matches!(next(&rx), Msg::RunActive(Some(run)) if run.pid == 4242));
         let refused = next(&rx);
         assert!(
             matches!(&refused, Msg::QueueRefused(why)
-                if *why == format!("EU-WEST ortho left out. {}", RunActive(4242).message())),
+                if *why == format!("EU-WEST ortho left out. {}", run_active(4242).message())),
             "{refused:?}"
         );
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    /// The state's rows may be stale: a package installed on disk is a
+    /// replacement whatever its library row says.
+    #[test]
+    fn a_submit_while_run_is_active_leaves_out_what_is_installed_on_disk() {
+        let dir = TempDir::new().unwrap();
+        let manager = FakeManager::default()
+            .with_running_instance(4242)
+            .with_installed(PackageType::Ortho, &["eu-west"]);
+        let (mut effects, rx) = effects_with(FakeStages::in_dir(dir.path()), manager, settings());
+
+        let _ = effects.apply(Effect::Submit {
+            packages: vec![metadata("EU-WEST"), metadata("NA-EAST")],
+            replacing: Vec::new(),
+        });
+
+        let seen = until(&rx, |msg| matches!(msg, Msg::Submitted { .. }));
+        let queued: Vec<&str> = seen
+            .iter()
+            .filter_map(|msg| match msg {
+                Msg::Queued(_, summary) => Some(summary.region.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queued, ["NA-EAST"]);
+        let Some(Msg::Submitted { refused }) = seen.last() else {
+            panic!("{seen:?}");
+        };
+        assert_eq!(
+            refused,
+            &[format!(
+                "EU-WEST ortho left out. {}",
+                run_active(4242).message()
+            )]
+        );
+        until(&rx, finished);
+    }
+
+    #[test]
+    fn a_queue_that_will_not_start_keeps_the_left_out_note() {
+        let dir = TempDir::new().unwrap();
+        let stages = FakeStages::in_dir(dir.path());
+        let _holder = InstallQueue::start(stages.clone(), Arc::new(Quiet)).unwrap();
+        let manager = FakeManager::default().with_running_instance(4242);
+        let (mut effects, rx) = effects_with(stages, manager, settings());
+
+        let _ = effects.apply(Effect::Submit {
+            packages: vec![metadata("EU-WEST"), metadata("NA-EAST")],
+            replacing: vec![("EU-WEST".to_string(), PackageType::Ortho)],
+        });
+
+        assert!(matches!(next(&rx), Msg::RunActive(Some(run)) if run.pid == 4242));
+        let refused = next(&rx);
+        let left_out = format!("EU-WEST ortho left out. {}; ", run_active(4242).message());
+        assert!(
+            matches!(&refused, Msg::QueueRefused(why)
+                if why.starts_with(&left_out) && why.contains("another package operation")),
+            "{refused:?}"
+        );
     }
 
     #[test]
@@ -1401,8 +1509,10 @@ mod tests {
             swap_gate: Some(gate.clone()),
             ..FakeStages::in_dir(dir.path())
         };
-        let gate = OpenOnDrop(gate);
         let (mut effects, rx) = effects_on(stages);
+        // Bound after the effects, so on a failure it opens before their
+        // drop joins the queue thread held at it.
+        let gate = OpenOnDrop(gate);
         let _ = effects.apply(Effect::Submit {
             packages: vec![metadata("EU-WEST")],
             replacing: Vec::new(),
@@ -1449,8 +1559,10 @@ mod tests {
             swap_gate: Some(gate.clone()),
             ..FakeStages::in_dir(dir.path())
         };
-        let gate = OpenOnDrop(gate);
         let (mut effects, rx) = effects_on(stages);
+        // Bound after the effects, so on a failure it opens before their
+        // drop joins the queue thread held at it.
+        let gate = OpenOnDrop(gate);
         let _ = effects.apply(Effect::Submit {
             packages: vec![metadata("EU-WEST"), metadata("NA-EAST")],
             replacing: Vec::new(),
@@ -1576,6 +1688,56 @@ mod tests {
         drop(delete);
     }
 
+    /// The queue holds its lock until the overlay rebuild is done, on the
+    /// way out too.
+    #[test]
+    fn exit_finishes_the_overlay_rebuild_before_releasing_the_queue() {
+        let dir = TempDir::new().unwrap();
+        let scenery = dir.path().join("Custom Scenery");
+        std::fs::create_dir_all(&scenery).unwrap();
+        let (release, held) = mpsc::channel();
+        let manager = FakeManager::default().holding_create_store(held);
+        let stages = FakeStages::in_dir(dir.path());
+        let (mut effects, rx) = effects_with(
+            stages.clone(),
+            manager,
+            Settings {
+                custom_scenery_path: Some(scenery),
+                ..settings()
+            },
+        );
+        let _ = effects.apply(Effect::Submit {
+            packages: vec![metadata("EU-WEST")],
+            replacing: Vec::new(),
+        });
+        until(&rx, finished);
+        assert!(!effects.rebuild_pending());
+
+        let _ = effects.apply(Effect::RebuildOverlays);
+        assert!(effects.rebuild_pending());
+        assert!(effects.apply(Effect::Exit).is_break());
+        let (tx, dropped) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(effects);
+            let _ = tx.send(());
+        });
+
+        assert!(
+            dropped.recv_timeout(Duration::from_millis(200)).is_err(),
+            "left before the rebuild was done"
+        );
+        assert!(
+            matches!(
+                InstallQueue::start(stages.clone(), Arc::new(Quiet)),
+                Err(ManagerError::QueueBusy { .. })
+            ),
+            "the queue was released before the rebuild was done"
+        );
+        release.send(()).unwrap();
+        assert!(dropped.recv_timeout(WAIT).is_ok());
+        assert!(InstallQueue::start(stages, Arc::new(Quiet)).is_ok());
+    }
+
     // ------------------------------------------------------------------------
     // The reads
     // ------------------------------------------------------------------------
@@ -1662,7 +1824,7 @@ mod tests {
 
         let _ = effects.apply(Effect::CheckRun);
 
-        assert!(matches!(next(&rx), Msg::RunActive(Some(4242))));
+        assert!(matches!(next(&rx), Msg::RunActive(Some(run)) if run.pid == 4242));
     }
 
     #[test]
@@ -1750,7 +1912,7 @@ mod tests {
             matches!(&msg, Msg::Installed(Err(why)) if why.contains("panicked")),
             "{msg:?}"
         );
-        assert!(matches!(next(&rx), Msg::RunActive(Some(7))));
+        assert!(matches!(next(&rx), Msg::RunActive(Some(run)) if run.pid == 7));
     }
 
     #[test]

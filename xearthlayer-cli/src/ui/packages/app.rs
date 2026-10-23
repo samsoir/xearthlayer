@@ -160,6 +160,8 @@ pub enum Modal {
         skipped: Vec<String>,
         /// The entries already installed, at an older version.
         replacing: Vec<PackageKey>,
+        /// What was left out and why, kept for the request once confirmed.
+        notes: Vec<String>,
     },
     ConfirmCancelAll,
 }
@@ -170,8 +172,8 @@ pub enum Msg {
     Installed(Result<Vec<LocalRow>, String>),
     Library(Result<Vec<LibraryRow>, String>),
     LibraryNotConfigured,
-    /// The pid of a running `xearthlayer run`, if any.
-    RunActive(Option<u32>),
+    /// A running `xearthlayer run`, if any.
+    RunActive(Option<RunActive>),
     /// One result per entry of an [`Effect::Install`]. Each error names its
     /// package: "NA-CANADA ortho: connection refused".
     MetadataReady(Vec<Result<PackageMetadata, String>>),
@@ -377,9 +379,20 @@ pub struct AppState {
     /// A `Submit` or `Remove` was given and the queue has not answered, so
     /// the queue must not be released yet.
     submitting: bool,
+    /// Why some of the request in flight will not happen: a package left
+    /// out, a failed metadata fetch. Later lines about the request keep them.
+    request_notes: Vec<String>,
+    /// The notes of the requests the queue accepted since it was last idle,
+    /// for its "Done" line: none of their packages has a Progress row.
+    done_notes: Vec<String>,
+    /// The idle queue's "Done" line, kept beside the overlay rebuild's.
+    idle_note: Option<String>,
+    /// Overlay rebuilds asked for and not answered. The queue is held until
+    /// they are, so the rebuild runs under its lock.
+    rebuilds: usize,
     modal: Option<Modal>,
     status: Option<String>,
-    run_active: Option<u32>,
+    run_active: Option<RunActive>,
     quitting: Quitting,
     /// An overlay was installed or removed since the queue was last idle.
     overlay_changed: bool,
@@ -412,6 +425,10 @@ impl AppState {
             queued_install: false,
             replacing: Vec::new(),
             submitting: false,
+            request_notes: Vec::new(),
+            done_notes: Vec::new(),
+            idle_note: None,
+            rebuilds: 0,
             modal: None,
             status: None,
             run_active: None,
@@ -453,7 +470,10 @@ impl AppState {
             match effect {
                 Effect::LoadInstalled => self.reading_local = true,
                 Effect::LoadLibrary => self.reading_library = true,
-                Effect::RebuildOverlays => self.status = Some(REBUILDING.to_string()),
+                // While cancelling, the status keeps saying how to quit now.
+                Effect::RebuildOverlays if self.quitting == Quitting::No => {
+                    self.status = self.rebuilding_line();
+                }
                 _ => {}
             }
         }
@@ -551,7 +571,7 @@ impl AppState {
 
     /// The pid of the `xearthlayer run` serving packages, if any.
     pub fn run_active(&self) -> Option<u32> {
-        self.run_active
+        self.run_active.as_ref().map(|run| run.pid)
     }
 
     /// The installed list has been read at least once, well or not.
@@ -665,10 +685,14 @@ impl AppState {
                 vec![Effect::Remove(targets)]
             }
             Some(Modal::ConfirmInstall {
-                entries, replacing, ..
+                entries,
+                replacing,
+                notes,
+                ..
             }) => {
                 self.hold_marks(Tab::Library);
                 self.replacing = replacing;
+                self.request_notes = notes;
                 vec![Effect::Install(entries)]
             }
             Some(Modal::ConfirmCancelAll) => vec![Effect::CancelAll],
@@ -818,13 +842,15 @@ impl AppState {
         }
     }
 
-    /// Clear a tab's marks, keeping a copy until the queue answers.
+    /// Clear a tab's marks, keeping a copy until the queue answers. This
+    /// starts a request: it has no notes yet.
     fn hold_marks(&mut self, tab: Tab) {
         if let Some(marks) = self.marks_mut(tab) {
             let marks = std::mem::take(marks);
             self.held_marks = Some((tab, marks));
             self.queued_count = 0;
             self.queued_install = false;
+            self.request_notes.clear();
         }
     }
 
@@ -858,9 +884,9 @@ impl AppState {
 
     /// `RunActive` refuses the action, saying why.
     fn refused_while_running(&mut self) -> bool {
-        match self.run_active {
-            Some(pid) => {
-                self.status = Some(RunActive(pid).message());
+        match &self.run_active {
+            Some(run) => {
+                self.status = Some(run.message());
                 true
             }
             None => false,
@@ -917,6 +943,7 @@ impl AppState {
         }
         if !effects.is_empty() {
             self.hold_marks(Tab::Local);
+            self.request_notes = notes.clone();
         }
         if !notes.is_empty() {
             self.status = Some(notes.join("; "));
@@ -993,14 +1020,15 @@ impl AppState {
             }
         }
 
-        let mut notes = Vec::new();
-        if let (Some(pid), false) = (self.run_active, refused.is_empty()) {
-            notes.push(format!(
+        let mut left_out = Vec::new();
+        if let (Some(run), false) = (&self.run_active, refused.is_empty()) {
+            left_out.push(format!(
                 "{} left out. {}",
                 refused.join(", "),
-                RunActive(pid).message()
+                run.message()
             ));
         }
+        let mut notes = left_out.clone();
         if entries.is_empty() {
             if !skipped.is_empty() {
                 notes.push(format!("{}: already up to date", skipped.join(", ")));
@@ -1013,6 +1041,7 @@ impl AppState {
                 entries,
                 skipped,
                 replacing,
+                notes: left_out,
             });
         }
         if !notes.is_empty() {
@@ -1030,24 +1059,19 @@ impl AppState {
             Msg::Library(Ok(rows)) => self.set_library(LibraryState::Loaded(rows)),
             Msg::Library(Err(e)) => self.set_library(LibraryState::Failed(e)),
             Msg::LibraryNotConfigured => self.set_library(LibraryState::NotConfigured),
-            Msg::RunActive(pid) => self.run_active = pid,
+            Msg::RunActive(run) => self.run_active = run,
             Msg::MetadataReady(results) => return self.on_metadata(results),
             Msg::Queued(id, summary) => return self.on_queued(id, summary),
             Msg::Submitted { refused } => return self.on_submitted(refused),
             Msg::QueueRefused(reason) => {
-                self.status = Some(reason);
+                let notes = std::mem::take(&mut self.request_notes);
+                self.status = joined(notes.into_iter().chain([reason]));
                 self.restore_marks();
                 return self.queue_answered();
             }
             Msg::Job(id, job_msg) => return self.on_job(id, job_msg),
             Msg::Status(text) => self.status = Some(text),
-            Msg::OverlaysRebuilt(Some(line)) => self.status = Some(line),
-            // Nothing to say: only the rebuilding note goes.
-            Msg::OverlaysRebuilt(None) => {
-                if self.status.as_deref() == Some(REBUILDING) {
-                    self.status = None;
-                }
-            }
+            Msg::OverlaysRebuilt(line) => return self.on_rebuilt(line),
             // `update` already expired the quit prompt.
             Msg::Tick => {}
         }
@@ -1059,7 +1083,8 @@ impl AppState {
         self.reading_local = false;
         match result {
             Ok(rows) => {
-                if rows.is_empty() {
+                // A hint, so it never replaces what the status line says.
+                if rows.is_empty() && self.status.is_none() {
                     self.status =
                         Some("Nothing installed yet: press 2 for the Library".to_string());
                 }
@@ -1082,6 +1107,7 @@ impl AppState {
         let replacing = std::mem::take(&mut self.replacing);
         if self.quitting != Quitting::No {
             self.status = Some("cancelled".to_string());
+            self.request_notes.clear();
             self.restore_marks();
             return Vec::new();
         }
@@ -1089,15 +1115,16 @@ impl AppState {
         let fetched: Vec<PackageMetadata> = fetched.into_iter().filter_map(Result::ok).collect();
         let failed: Vec<String> = failed.into_iter().filter_map(Result::err).collect();
         if !failed.is_empty() {
-            self.status = Some(
-                failed
-                    .iter()
-                    .map(|e| format!("could not fetch metadata for {e}"))
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            );
+            // A package that failed here never gets a Progress row.
+            let failed = failed
+                .iter()
+                .map(|e| format!("could not fetch metadata for {e}"));
+            self.request_notes.extend(failed);
+            self.status = joined(self.request_notes.iter().cloned());
         }
         if fetched.is_empty() {
+            // The request ends here, and so do its notes.
+            self.request_notes.clear();
             self.restore_marks();
             return Vec::new();
         }
@@ -1112,7 +1139,8 @@ impl AppState {
         self.queued_count += 1;
         self.queued_install |= summary.kind == JobKind::Install;
         if self.quitting == Quitting::No {
-            self.status = Some(self.queued_note());
+            let notes = self.done_notes.iter().chain(&self.request_notes).cloned();
+            self.status = joined(std::iter::once(self.queued_note()).chain(notes));
         }
         if summary.package_type == PackageType::Overlay {
             self.overlay_jobs.insert(id);
@@ -1132,14 +1160,18 @@ impl AppState {
     }
 
     /// The request in flight was accepted: release its marks and report
-    /// what was queued and what was refused.
+    /// what was queued and what was refused. Its notes and refusals are kept
+    /// for the idle queue's "Done" line.
     fn on_submitted(&mut self, refused: Vec<String>) -> Vec<Effect> {
         self.held_marks = None;
+        let request_notes = std::mem::take(&mut self.request_notes);
+        self.done_notes
+            .extend(request_notes.into_iter().chain(refused));
         let mut notes = Vec::new();
         if self.queued_count > 0 {
             notes.push(self.queued_note());
         }
-        notes.extend(refused);
+        notes.extend(self.done_notes.iter().cloned());
         if self.queued_install && self.run_active.is_some() {
             notes.push(format!("New packages: {RESTART_NOTE}"));
         }
@@ -1161,24 +1193,66 @@ impl AppState {
     }
 
     /// The queue went idle: say what it did in place of the queued note,
-    /// rebuild the overlays once if any changed, release the queue, and exit
-    /// if quitting was waiting for this. Taken exactly once per transition
-    /// to idle.
+    /// rebuild the overlays once if any changed, and release the queue (and
+    /// exit if quitting was waiting for this) once no rebuild is pending.
+    /// Taken exactly once per transition to idle.
     fn idle(&mut self) -> Vec<Effect> {
         let done = self.tally.since(&self.tally_at_idle);
         self.tally_at_idle = self.tally;
-        if self.status.as_deref().is_some_and(is_queued_note) {
-            self.status = self.done_note(&done);
+        let notes = std::mem::take(&mut self.done_notes);
+        self.idle_note = None;
+        let queued = self.status.as_deref().is_some_and(is_queued_note);
+        if self.quitting == Quitting::No && (queued || !notes.is_empty()) {
+            self.status = self.done_note(&done, notes);
+            self.idle_note = self.status.clone();
         }
         let mut effects = Vec::new();
         if std::mem::take(&mut self.overlay_changed) {
             effects.push(Effect::RebuildOverlays);
+            self.rebuilds += 1;
         }
-        effects.push(Effect::ReleaseQueue);
+        if self.rebuilds == 0 {
+            effects.extend(self.release());
+        }
+        effects
+    }
+
+    /// Drop the idle queue, and exit if quitting was waiting for it.
+    fn release(&self) -> Vec<Effect> {
+        let mut effects = vec![Effect::ReleaseQueue];
         if self.quitting == Quitting::Cancelling {
             effects.push(Effect::Exit);
         }
         effects
+    }
+
+    /// The overlay rebuild answered: show its line beside the idle queue's,
+    /// and release the queue it held unless new work came meanwhile (that
+    /// work's idle step releases it).
+    fn on_rebuilt(&mut self, line: Option<String>) -> Vec<Effect> {
+        self.rebuilds = self.rebuilds.saturating_sub(1);
+        let rebuilding = self.rebuilding_line();
+        let idle_note = self.idle_note.take();
+        match line {
+            Some(line) => self.status = joined(idle_note.into_iter().chain([line])),
+            // Nothing to say: only the rebuilding note goes.
+            None if self.status == rebuilding => self.status = idle_note,
+            None => {}
+        }
+        if self.rebuilds == 0 && self.unfinished() == 0 && !self.submitting {
+            return self.release();
+        }
+        Vec::new()
+    }
+
+    /// The status while the overlay folder is rebuilt, after the idle line.
+    fn rebuilding_line(&self) -> Option<String> {
+        joined(
+            self.idle_note
+                .iter()
+                .cloned()
+                .chain([REBUILDING.to_string()]),
+        )
     }
 
     /// "N jobs queued: see Progress"
@@ -1189,18 +1263,15 @@ impl AppState {
         }
     }
 
-    /// "Done: 1 installed, 1 failed", and the restart note if `run` is
-    /// serving while a package was installed. `None` if nothing finished.
-    fn done_note(&self, done: &Tally) -> Option<String> {
+    /// "Done: 1 installed, 1 failed", then `notes`, then the restart note if
+    /// `run` is serving while a package was installed. `None` if nothing
+    /// finished and there are no notes.
+    fn done_note(&self, done: &Tally, notes: Vec<String>) -> Option<String> {
         let parts = done.parts();
-        if parts.is_empty() {
-            return None;
-        }
-        let mut note = format!("Done: {}", parts.join(", "));
-        if done.installed > 0 && self.run_active.is_some() {
-            note.push_str(&format!("; New packages: {RESTART_NOTE}"));
-        }
-        Some(note)
+        let done_part = (!parts.is_empty()).then(|| format!("Done: {}", parts.join(", ")));
+        let restart = (done.installed > 0 && self.run_active.is_some())
+            .then(|| format!("New packages: {RESTART_NOTE}"));
+        joined(done_part.into_iter().chain(notes).chain(restart))
     }
 
     fn on_job(&mut self, id: JobId, msg: JobMsg) -> Vec<Effect> {
@@ -1273,6 +1344,12 @@ fn find_row<'a>(
     })
 }
 
+/// The parts joined into one status line, or `None` if there are none.
+fn joined(parts: impl IntoIterator<Item = String>) -> Option<String> {
+    let parts: Vec<String> = parts.into_iter().collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
 /// "NA-CANADA ortho"
 fn entry_name(entry: &LibraryEntry) -> String {
     format!("{} {}", entry.title, entry.package_type)
@@ -1296,7 +1373,8 @@ mod tests {
     use xearthlayer_package::{LibraryEntry, PackageMetadata, PackageType};
 
     use super::*;
-    use crate::commands::packages::actions::{LibraryRow, LibraryStatus, RunActive, RESTART_NOTE};
+    use crate::commands::packages::actions::{LibraryRow, LibraryStatus, RESTART_NOTE};
+    use crate::commands::packages::test_support::run_active;
     use crate::ui::dashboard::state::QUIT_CONFIRM_TIMEOUT;
 
     use PackageType::{Ortho, Overlay};
@@ -1648,12 +1726,12 @@ mod tests {
     #[test]
     fn local_update_is_refused_while_run_is_active() {
         let mut state = loaded();
-        msg(&mut state, Msg::RunActive(Some(42)));
+        msg(&mut state, Msg::RunActive(Some(run_active(42))));
 
         let effects = act(&mut state, Action::Update);
 
         assert!(effects.is_empty());
-        assert_eq!(status(&state), RunActive(42).message());
+        assert_eq!(status(&state), run_active(42).message());
     }
 
     #[test]
@@ -1723,13 +1801,13 @@ mod tests {
     #[test]
     fn local_delete_is_refused_while_run_is_active() {
         let mut state = loaded();
-        msg(&mut state, Msg::RunActive(Some(42)));
+        msg(&mut state, Msg::RunActive(Some(run_active(42))));
 
         let effects = act(&mut state, Action::Delete);
 
         assert!(effects.is_empty());
         assert!(state.modal.is_none());
-        assert_eq!(status(&state), RunActive(42).message());
+        assert_eq!(status(&state), run_active(42).message());
     }
 
     #[test]
@@ -1856,7 +1934,7 @@ mod tests {
     fn library_install_drops_updates_while_run_is_active_and_keeps_new_installs() {
         // AF-NORTH ortho (new) and EU-WEST ortho (update).
         let mut state = library_tab(true, &[0, 2]);
-        msg(&mut state, Msg::RunActive(Some(42)));
+        msg(&mut state, Msg::RunActive(Some(run_active(42))));
 
         act(&mut state, Action::Install);
 
@@ -1865,7 +1943,7 @@ mod tests {
             ["AF-NORTH ortho", "AF-NORTH overlay"]
         );
         assert!(
-            status(&state).contains(&RunActive(42).message()),
+            status(&state).contains(&run_active(42).message()),
             "{}",
             status(&state)
         );
@@ -1908,13 +1986,13 @@ mod tests {
     #[test]
     fn library_install_with_only_updates_while_run_is_active_opens_nothing() {
         let mut state = library_tab(true, &[2]);
-        msg(&mut state, Msg::RunActive(Some(42)));
+        msg(&mut state, Msg::RunActive(Some(run_active(42))));
 
         act(&mut state, Action::Install);
 
         assert!(state.modal.is_none());
         assert!(
-            status(&state).contains(&RunActive(42).message()),
+            status(&state).contains(&run_active(42).message()),
             "{}",
             status(&state)
         );
@@ -2142,10 +2220,21 @@ mod tests {
                 replacing: Vec::new(),
             }]
         );
-        assert_eq!(
-            status(&state),
-            "could not fetch metadata for AF-NORTH overlay: timed out"
+        let failure = "could not fetch metadata for AF-NORTH overlay: timed out";
+        assert_eq!(status(&state), failure);
+
+        // The failed package gets no Progress row, so the note stays to the end.
+        let ids = queue(&mut state, &[("AF-NORTH", Ortho, Some("1.0.0"))]);
+        assert!(status(&state).contains(failure), "{}", status(&state));
+        msg(
+            &mut state,
+            Msg::Submitted {
+                refused: Vec::new(),
+            },
         );
+        assert!(status(&state).contains(failure), "{}", status(&state));
+        msg(&mut state, Msg::Job(ids[0], JobMsg::Installed));
+        assert_eq!(status(&state), format!("Done: 1 installed; {failure}"));
     }
 
     /// Acting checks for `run` again, and refuses what would replace an
@@ -2210,9 +2299,9 @@ mod tests {
             ]),
         );
         // `run` started after the install was confirmed.
-        msg(&mut state, Msg::RunActive(Some(42)));
+        msg(&mut state, Msg::RunActive(Some(run_active(42))));
         queue(&mut state, &[("AF-NORTH", Ortho, Some("1.0.0"))]);
-        let left_out = format!("EU-WEST ortho left out. {}", RunActive(42).message());
+        let left_out = format!("EU-WEST ortho left out. {}", run_active(42).message());
 
         msg(
             &mut state,
@@ -2485,6 +2574,7 @@ mod tests {
     // Going idle
     // ------------------------------------------------------------------------
 
+    /// The queue, and with it the lock, is held until the rebuild answers.
     #[test]
     fn the_last_finish_rebuilds_the_overlays_once_then_releases_the_queue() {
         let mut state = loaded();
@@ -2497,9 +2587,79 @@ mod tests {
         let effects = msg(&mut state, Msg::Job(ids[1], JobMsg::Installed));
 
         let mut expected = RELOAD.to_vec();
-        expected.extend([Effect::RebuildOverlays, Effect::ReleaseQueue]);
+        expected.push(Effect::RebuildOverlays);
         assert_eq!(effects, expected);
         assert!(!state.overlay_changed);
+        assert_eq!(
+            msg(&mut state, Msg::OverlaysRebuilt(None)),
+            [Effect::ReleaseQueue]
+        );
+    }
+
+    #[test]
+    fn a_job_queued_during_the_rebuild_holds_the_queue_until_it_finishes() {
+        let mut state = rebuilding();
+        let ids = queue(&mut state, &[("NA", Ortho, Some("1.0.0"))]);
+
+        assert_eq!(msg(&mut state, Msg::OverlaysRebuilt(None)), []);
+
+        let mut expected = RELOAD.to_vec();
+        expected.push(Effect::ReleaseQueue);
+        assert_eq!(
+            msg(&mut state, Msg::Job(ids[0], JobMsg::Installed)),
+            expected
+        );
+    }
+
+    #[test]
+    fn an_idle_queue_during_the_rebuild_waits_for_it_to_release() {
+        let mut state = rebuilding();
+        let ids = queue(&mut state, &[("NA", Ortho, Some("1.0.0"))]);
+
+        assert_eq!(msg(&mut state, Msg::Job(ids[0], JobMsg::Installed)), RELOAD);
+
+        assert_eq!(
+            msg(&mut state, Msg::OverlaysRebuilt(None)),
+            [Effect::ReleaseQueue]
+        );
+    }
+
+    /// Quitting waits for the rebuild's answer, and a second q still quits
+    /// at once.
+    #[test]
+    fn quitting_while_the_overlays_rebuild_exits_once_they_are_done() {
+        let mut state = loaded();
+        let ids = queue(&mut state, &[("EU", Overlay, Some("1.0.0"))]);
+        act(&mut state, Action::Quit);
+        assert_eq!(act(&mut state, Action::Confirm), [Effect::CancelAll]);
+
+        // Too late to cancel: the swap finished.
+        let mut expected = RELOAD.to_vec();
+        expected.push(Effect::RebuildOverlays);
+        assert_eq!(
+            msg(&mut state, Msg::Job(ids[0], JobMsg::Installed)),
+            expected
+        );
+        assert_eq!(status(&state), "Cancelling, press q again to quit now");
+
+        assert_eq!(
+            msg(&mut state, Msg::OverlaysRebuilt(None)),
+            [Effect::ReleaseQueue, Effect::Exit]
+        );
+    }
+
+    #[test]
+    fn a_second_q_during_the_rebuild_quits_now() {
+        let mut state = loaded();
+        let ids = queue(&mut state, &[("EU", Overlay, Some("1.0.0"))]);
+        act(&mut state, Action::Quit);
+        act(&mut state, Action::Confirm);
+        msg(&mut state, Msg::Job(ids[0], JobMsg::Installed));
+
+        assert_eq!(
+            act(&mut state, Action::Quit),
+            [Effect::Abandon, Effect::Exit]
+        );
     }
 
     #[test]
@@ -2544,7 +2704,7 @@ mod tests {
     #[test]
     fn an_idle_queue_while_run_is_active_says_to_restart_it() {
         let mut state = loaded();
-        msg(&mut state, Msg::RunActive(Some(42)));
+        msg(&mut state, Msg::RunActive(Some(run_active(42))));
         let ids = queue(&mut state, &[("AF-NORTH", Ortho, Some("1.0.0"))]);
 
         msg(&mut state, Msg::Job(ids[0], JobMsg::Installed));
@@ -2679,8 +2839,8 @@ mod tests {
     fn run_active_replaces_the_flag() {
         let mut state = loaded();
 
-        msg(&mut state, Msg::RunActive(Some(7)));
-        assert_eq!(state.run_active, Some(7));
+        msg(&mut state, Msg::RunActive(Some(run_active(7))));
+        assert_eq!(state.run_active(), Some(7));
         msg(&mut state, Msg::RunActive(None));
         assert_eq!(state.run_active, None);
     }
@@ -2942,7 +3102,11 @@ mod tests {
                 refused: Vec::new(),
             },
         );
-        assert_eq!(effects, [Effect::RebuildOverlays, Effect::ReleaseQueue]);
+        assert_eq!(effects, [Effect::RebuildOverlays]);
+        assert_eq!(
+            msg(&mut state, Msg::OverlaysRebuilt(None)),
+            [Effect::ReleaseQueue]
+        );
     }
 
     #[test]
@@ -3201,10 +3365,14 @@ mod tests {
         state
     }
 
+    /// What the idle queue did stays beside the rebuild's note and line.
     #[test]
     fn the_overlay_rebuild_says_so_until_it_answers() {
         let mut state = rebuilding();
-        assert_eq!(status(&state), "Rebuilding the overlay folder…");
+        assert_eq!(
+            status(&state),
+            "Done: 1 installed; Rebuilding the overlay folder…"
+        );
 
         msg(
             &mut state,
@@ -3215,7 +3383,7 @@ mod tests {
 
         assert_eq!(
             status(&state),
-            "Consolidated overlay updated: 2 regions, 9 files"
+            "Done: 1 installed; Consolidated overlay updated: 2 regions, 9 files"
         );
     }
 
@@ -3223,11 +3391,173 @@ mod tests {
     fn a_rebuild_with_nothing_to_say_clears_its_note_only() {
         let mut state = rebuilding();
         msg(&mut state, Msg::OverlaysRebuilt(None));
-        assert_eq!(status(&state), "");
+        assert_eq!(status(&state), "Done: 1 installed");
 
         let mut state = rebuilding();
         msg(&mut state, Msg::Status("too late: finishing".into()));
         msg(&mut state, Msg::OverlaysRebuilt(None));
         assert_eq!(status(&state), "too late: finishing");
+    }
+
+    // ------------------------------------------------------------------------
+    // Notes that outlive the status line they were first shown in
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn a_package_left_out_while_run_is_active_is_still_named_when_done() {
+        let mut state = loaded();
+        msg(&mut state, Msg::RunActive(Some(run_active(42))));
+        act(&mut state, Action::GoTab(Tab::Library));
+        act(&mut state, Action::Mark);
+        for _ in 0..2 {
+            act(&mut state, Action::Down);
+        }
+        act(&mut state, Action::Mark);
+        act(&mut state, Action::Install);
+        let left_out = format!("EU-WEST ortho left out. {}", run_active(42).message());
+        assert!(status(&state).contains(&left_out), "{}", status(&state));
+
+        act(&mut state, Action::Confirm);
+        msg(
+            &mut state,
+            Msg::MetadataReady(vec![
+                Ok(metadata("AF-NORTH", Ortho)),
+                Ok(metadata("AF-NORTH", Overlay)),
+            ]),
+        );
+        let ids = queue(
+            &mut state,
+            &[
+                ("AF-NORTH", Ortho, Some("1.0.0")),
+                ("AF-NORTH", Overlay, Some("1.0.0")),
+            ],
+        );
+        assert!(status(&state).contains(&left_out), "{}", status(&state));
+        msg(
+            &mut state,
+            Msg::Submitted {
+                refused: Vec::new(),
+            },
+        );
+        assert!(status(&state).contains(&left_out), "{}", status(&state));
+        msg(&mut state, Msg::Job(ids[0], JobMsg::Installed));
+        msg(&mut state, Msg::Job(ids[1], JobMsg::Installed));
+
+        assert_eq!(
+            status(&state),
+            format!("Done: 2 installed; {left_out}; New packages: {RESTART_NOTE}; Rebuilding the overlay folder…")
+        );
+    }
+
+    #[test]
+    fn a_dismissed_install_leaves_no_note_for_the_next_request() {
+        let mut state = loaded();
+        msg(&mut state, Msg::RunActive(Some(run_active(42))));
+        act(&mut state, Action::GoTab(Tab::Library));
+        act(&mut state, Action::Mark);
+        for _ in 0..2 {
+            act(&mut state, Action::Down);
+        }
+        act(&mut state, Action::Mark);
+        act(&mut state, Action::Install);
+        act(&mut state, Action::Dismiss);
+        msg(&mut state, Msg::RunActive(None));
+        act(&mut state, Action::GoTab(Tab::Local));
+        act(&mut state, Action::Home);
+        act(&mut state, Action::Down);
+        act(&mut state, Action::Down);
+        act(&mut state, Action::Delete);
+
+        act(&mut state, Action::Confirm);
+        let ids = queue(&mut state, &[("NA-EAST", Ortho, None)]);
+        msg(
+            &mut state,
+            Msg::Submitted {
+                refused: Vec::new(),
+            },
+        );
+        msg(&mut state, Msg::Job(ids[0], JobMsg::Removed));
+
+        assert_eq!(status(&state), "Done: 1 removed");
+    }
+
+    #[test]
+    fn a_package_the_queue_refused_is_still_named_when_done() {
+        let mut state = loaded();
+        act(&mut state, Action::Delete);
+        act(&mut state, Action::Confirm);
+        let ids = queue(&mut state, &[("EU-WEST", Ortho, None)]);
+        msg(
+            &mut state,
+            Msg::Submitted {
+                refused: vec!["EU-WEST overlay: already queued".into()],
+            },
+        );
+
+        msg(&mut state, Msg::Job(ids[0], JobMsg::Removed));
+
+        assert_eq!(
+            status(&state),
+            "Done: 1 removed; EU-WEST overlay: already queued"
+        );
+    }
+
+    #[test]
+    fn an_update_that_skips_a_current_package_still_says_so_when_done() {
+        let mut state = loaded();
+        act(&mut state, Action::MarkAll);
+        act(&mut state, Action::Update);
+        let current = "EU-WEST overlay, NA-EAST ortho: already up to date";
+        assert_eq!(status(&state), current);
+
+        msg(
+            &mut state,
+            Msg::MetadataReady(vec![Ok(metadata("EU-WEST", Ortho))]),
+        );
+        let ids = queue(&mut state, &[("EU-WEST", Ortho, Some("1.1.0"))]);
+        msg(
+            &mut state,
+            Msg::Submitted {
+                refused: Vec::new(),
+            },
+        );
+        msg(&mut state, Msg::Job(ids[0], JobMsg::Installed));
+
+        assert_eq!(status(&state), format!("Done: 1 installed; {current}"));
+    }
+
+    #[test]
+    fn a_queue_that_will_not_start_keeps_the_metadata_failure() {
+        let mut state = loaded();
+        msg(
+            &mut state,
+            Msg::MetadataReady(vec![
+                Ok(metadata("AF-NORTH", Ortho)),
+                Err("AF-NORTH overlay: timed out".into()),
+            ]),
+        );
+
+        msg(&mut state, Msg::QueueRefused("busy".into()));
+
+        assert_eq!(
+            status(&state),
+            "could not fetch metadata for AF-NORTH overlay: timed out; busy"
+        );
+    }
+
+    #[test]
+    fn an_empty_installed_list_leaves_a_done_note_or_a_refusal_alone() {
+        let mut state = loaded();
+        let ids = queue(&mut state, &[("EU-WEST", Ortho, None)]);
+        msg(&mut state, Msg::Job(ids[0], JobMsg::Removed));
+        msg(&mut state, Msg::Installed(Ok(Vec::new())));
+        assert_eq!(status(&state), "Done: 1 removed");
+
+        let mut state = loaded();
+        act(&mut state, Action::Delete);
+        act(&mut state, Action::Confirm);
+        msg(&mut state, Msg::QueueRefused("busy".into()));
+        msg(&mut state, Msg::Installed(Ok(Vec::new())));
+        assert_eq!(status(&state), "busy");
     }
 }

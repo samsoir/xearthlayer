@@ -119,6 +119,7 @@ mod tests {
                 entries: Vec::new(),
                 skipped: Vec::new(),
                 replacing: Vec::new(),
+                notes: Vec::new(),
             },
             Modal::ConfirmCancelAll,
         ]

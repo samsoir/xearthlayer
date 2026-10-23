@@ -7,6 +7,7 @@
 //! on call sequences.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
 
 use semver::Version;
@@ -90,6 +91,9 @@ pub struct FakeManager {
     failing_update_check: bool,
     /// Listing the installed packages panics.
     panicking_list: bool,
+    /// Creating a store first waits for a message on this, once, like a
+    /// slow filesystem.
+    held_store: Mutex<Option<Receiver<()>>>,
 }
 
 impl FakeManager {
@@ -112,6 +116,12 @@ impl FakeManager {
         for title in titles {
             self.installed.push(installed(title, package_type));
         }
+        self
+    }
+
+    /// Hold the next `create_store` until `release` is sent to or dropped.
+    pub fn holding_create_store(self, release: Receiver<()>) -> Self {
+        *self.held_store.lock().unwrap() = Some(release);
         self
     }
 
@@ -198,6 +208,10 @@ impl FakeManager {
 
 impl PackageManagerService for FakeManager {
     fn create_store(&self, install_dir: &Path) -> LocalPackageStore {
+        let held = self.held_store.lock().unwrap().take();
+        if let Some(release) = held {
+            let _ = release.recv();
+        }
         LocalPackageStore::new(install_dir)
     }
 
@@ -287,6 +301,21 @@ impl PackageManagerService for FakeManager {
 
     fn running_instance(&self) -> Option<u32> {
         self.running
+    }
+
+    fn instance_lock(&self) -> PathBuf {
+        PathBuf::from(INSTANCE_LOCK)
+    }
+}
+
+/// Where the fake's instance lock is.
+pub const INSTANCE_LOCK: &str = "/nonexistent/state/xearthlayer.lock";
+
+/// The refusal a `FakeManager` running as `pid` gives.
+pub fn run_active(pid: u32) -> crate::commands::packages::actions::RunActive {
+    crate::commands::packages::actions::RunActive {
+        pid,
+        lock: PathBuf::from(INSTANCE_LOCK),
     }
 }
 

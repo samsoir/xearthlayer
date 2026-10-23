@@ -87,11 +87,18 @@ pub fn run_manager(config: &ConfigFile) -> Result<String, CliError> {
         // Nothing can be shown any more: stop the jobs rather than wait.
         let _ = effects.apply(Effect::Abandon);
     }
-    // The terminal comes back first; dropping the queue may wait for a swap.
+    // The terminal comes back first; dropping the effects may wait for an
+    // overlay rebuild or a swap.
     drop(screen);
+    if let Some(note) = finishing_note(effects.rebuild_pending(), terminal_gone()) {
+        eprintln!("{note}");
+    }
     drop(effects);
 
     if let Some(signal) = watch.received() {
+        if summary_after(signal, terminal_gone()) {
+            eprintln!("{}", state.summary());
+        }
         return Err(CliError::Interrupted(signal));
     }
     result.map_err(|e| CliError::Packages(format!("package manager terminal error: {e}")))?;
@@ -170,6 +177,19 @@ fn on_signal(state: &mut AppState, signal: Signal, nth: u64, now: Instant) -> Ve
             vec![Effect::Abandon, Effect::Exit]
         }
     }
+}
+
+/// What is said while dropping the effects finishes an overlay rebuild: the
+/// shell prompt does not come back meanwhile. Nothing once SIGHUP has taken
+/// the terminal.
+fn finishing_note(rebuild_pending: bool, terminal_gone: bool) -> Option<&'static str> {
+    (rebuild_pending && !terminal_gone).then_some("Finishing the overlay folder…")
+}
+
+/// Whether the summary is printed, to stderr, after `signal` ended the
+/// manager: after any signal but SIGHUP, which took the terminal with it.
+fn summary_after(signal: Signal, terminal_gone: bool) -> bool {
+    signal != Signal::Hangup && !terminal_gone
 }
 
 // ============================================================================
@@ -302,6 +322,27 @@ mod tests {
             [Effect::Abandon, Effect::Exit],
             "a second interrupt quits now"
         );
+    }
+
+    #[test]
+    fn the_summary_follows_every_signal_but_a_hangup() {
+        assert!(summary_after(Signal::Interrupt, false));
+        assert!(summary_after(Signal::Terminate, false));
+        assert!(!summary_after(Signal::Hangup, false));
+        assert!(
+            !summary_after(Signal::Interrupt, true),
+            "a later hangup took the terminal"
+        );
+    }
+
+    #[test]
+    fn a_pending_rebuild_is_announced_unless_the_terminal_is_gone() {
+        assert_eq!(
+            finishing_note(true, false),
+            Some("Finishing the overlay folder…")
+        );
+        assert_eq!(finishing_note(false, false), None);
+        assert_eq!(finishing_note(true, true), None);
     }
 
     #[test]

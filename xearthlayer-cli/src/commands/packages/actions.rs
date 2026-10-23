@@ -4,7 +4,7 @@
 //! returns what the caller should show or act on, so the same rules apply
 //! whether the user typed `xearthlayer packages install` or pressed a key.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use semver::Version;
 use xearthlayer::manager::{
@@ -102,19 +102,27 @@ pub fn plan_install<'a>(
 // Refusals while `xearthlayer run` is serving packages
 // ============================================================================
 
-/// Another `xearthlayer run` (this pid) is serving the installed packages.
+/// Another `xearthlayer run` (`pid`) is serving the installed packages, as
+/// its instance lock (`lock`) says.
 ///
 /// `run` keeps every installed package's files open through one union
 /// filesystem, so a package cannot change underneath it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RunActive(pub u32);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunActive {
+    pub pid: u32,
+    pub lock: PathBuf,
+}
 
 impl RunActive {
-    /// Why the job was refused, and what to do about it.
+    /// Why the job was refused, and what to do about it. The lock outlives
+    /// a `run` that exits and its pid may be reused, so a stale lock is
+    /// named for the user to delete.
     pub fn message(&self) -> String {
         format!(
-            "XEarthLayer is running (pid {}): stop it before updating or removing packages",
-            self.0
+            "XEarthLayer is running (pid {}): stop it before updating or removing packages, \
+             or delete {} if XEarthLayer is not running",
+            self.pid,
+            self.lock.display()
         )
     }
 }
@@ -122,7 +130,10 @@ impl RunActive {
 /// Removing a package is refused while `run` serves it.
 pub fn check_removal(manager: &dyn PackageManagerService) -> Result<(), RunActive> {
     match manager.running_instance() {
-        Some(pid) => Err(RunActive(pid)),
+        Some(pid) => Err(RunActive {
+            pid,
+            lock: manager.instance_lock(),
+        }),
         None => Ok(()),
     }
 }
@@ -248,13 +259,13 @@ pub fn rebuild_overlays(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use semver::Version;
     use xearthlayer::manager::PackageStatus;
     use xearthlayer_package::PackageType;
 
-    use super::super::test_support::{install_dir, FakeManager};
+    use super::super::test_support::{install_dir, run_active, FakeManager};
     use super::*;
 
     // ------------------------------------------------------------------------
@@ -431,15 +442,22 @@ mod tests {
     fn removal_and_replacement_are_refused_while_run_is_serving() {
         let manager = FakeManager::default().with_running_instance(4242);
 
-        assert_eq!(check_removal(&manager), Err(RunActive(4242)));
-        assert_eq!(check_replacement(&manager), Err(RunActive(4242)));
+        assert_eq!(check_removal(&manager), Err(run_active(4242)));
+        assert_eq!(check_replacement(&manager), Err(run_active(4242)));
     }
 
+    /// The lock outlives a `run` that exits, and its pid may be reused, so
+    /// the refusal says how to clear a stale one.
     #[test]
-    fn the_refusal_names_the_process_and_what_to_do() {
+    fn the_refusal_names_the_process_the_lock_and_what_to_do() {
+        let run = RunActive {
+            pid: 4242,
+            lock: PathBuf::from("/state/xearthlayer.lock"),
+        };
         assert_eq!(
-            RunActive(4242).message(),
-            "XEarthLayer is running (pid 4242): stop it before updating or removing packages"
+            run.message(),
+            "XEarthLayer is running (pid 4242): stop it before updating or removing packages, \
+             or delete /state/xearthlayer.lock if XEarthLayer is not running"
         );
     }
 

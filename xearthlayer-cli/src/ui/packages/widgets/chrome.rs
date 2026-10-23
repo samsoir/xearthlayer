@@ -69,11 +69,22 @@ pub fn run_banner(frame: &mut Frame, area: Rect, pid: u32) {
     );
 }
 
+/// The rows the status line takes at `width`: two when its text is wider
+/// than one row, so a combined note is wrapped rather than cut.
+pub fn status_height(state: &AppState, width: u16) -> u16 {
+    match state.status() {
+        Some(status) if status.chars().count() + 1 > width as usize => 2,
+        _ => 1,
+    }
+}
+
 /// The status line above the footer.
 pub fn status_line(frame: &mut Frame, area: Rect, state: &AppState) {
     if let Some(status) = state.status() {
         frame.render_widget(
-            Paragraph::new(format!(" {status}")).style(Style::default().fg(Color::Gray)),
+            Paragraph::new(format!(" {status}"))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(Color::Gray)),
             area,
         );
     }
@@ -110,23 +121,28 @@ pub fn footer_keys(tab: Tab) -> &'static [(&'static str, &'static str)] {
     }
 }
 
-/// The current tab's keys.
-pub fn footer(frame: &mut Frame, area: Rect, tab: Tab) {
+/// The current tab's keys. While `run` is active, Local's update and
+/// delete are refused, so they are drawn dimmed.
+pub fn footer(frame: &mut Frame, area: Rect, tab: Tab, run_active: bool) {
     let mut spans = vec![Span::raw(" ")];
     for (i, (key, what)) in footer_keys(tab).iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(
-            *key,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            format!(" {what}"),
-            Style::default().fg(Color::Gray),
-        ));
+        let refused = run_active && tab == Tab::Local && matches!(*key, "u" | "d");
+        let (key_style, what_style) = if refused {
+            let dim = Style::default().fg(Color::DarkGray);
+            (dim, dim)
+        } else {
+            (
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Gray),
+            )
+        };
+        spans.push(Span::styled(*key, key_style));
+        spans.push(Span::styled(format!(" {what}"), what_style));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }

@@ -3,7 +3,7 @@
 //! This module defines the interfaces that handlers depend on, enabling
 //! dependency injection and testability.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use xearthlayer::manager::{
     InstallResult, InstalledPackage, LocalPackageStore, ManagerResult, PackageInfo, PackageStatus,
@@ -129,6 +129,10 @@ pub trait PackageManagerService: Send + Sync {
     /// Read from the instance lock `run` holds, so it is true for as long as
     /// that process lives, whatever it has mounted.
     fn running_instance(&self) -> Option<u32>;
+
+    /// The instance lock `running_instance` reads, named in refusals so a
+    /// user can delete a stale one.
+    fn instance_lock(&self) -> PathBuf;
 }
 
 // ============================================================================
