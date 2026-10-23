@@ -91,14 +91,14 @@ Cancel a job with `c` on the Progress tab. As on the command line, a package bei
 
 `q` asks to confirm. With jobs running, confirming cancels them and leaves when they have stopped. Press `q` again while it cancels to leave at once and let the next package command clean up.
 
-A SIGINT sent from outside (for example `kill -INT`) quits the same way as a confirmed `q`. A second one, or SIGTERM, leaves at once. SIGHUP, a closed terminal, leaves at once and stops drawing. The exit codes are 130, 143 and 129 by the first signal. In every case an installed package is complete, either the old version or the new one. See [Stopping an Install](#stopping-an-install).
+A SIGINT sent from outside (for example `kill -INT`) quits the same way as a confirmed `q`. A second one, or SIGTERM, leaves at once. SIGHUP, a closed terminal, leaves at once and stops drawing. The exit codes are 130, 143 and 129 by the first signal, and except after SIGHUP the one-line summary is still printed, to stderr. When an overlay folder rebuild is still running as you leave, the package manager says "Finishing the overlay folder…" and waits for it. In every case an installed package is complete, either the old version or the new one. See [Stopping an Install](#stopping-an-install).
 
 ### Using It While XEarthLayer Runs
 
 The package manager works while `xearthlayer run` is active, with the same rules the commands follow (see [While XEarthLayer is running](#while-xearthlayer-is-running)). A banner at the top says so, with the process ID.
 
 - Installing a package that is not installed is allowed. The status line reminds you to restart `xearthlayer run` to use it.
-- Updating, deleting, and installing over an installed package are refused, with the message "XEarthLayer is running (pid N): stop it before updating or removing packages". In a batch that mixes new and installed packages, the installed ones are left out and the new ones install.
+- Updating, deleting, and installing over an installed package are refused, with the message "XEarthLayer is running (pid N): stop it before updating or removing packages, or delete <lock file> if XEarthLayer is not running". Their keys are dimmed while the banner shows. In a batch that mixes new and installed packages, the installed ones are left out and the new ones install, and the status line keeps naming the ones left out until the line that says what was done.
 
 Only one package operation runs at a time. If a package command is already running in another terminal, the package manager says "another package operation is running" when you queue a job, and nothing is lost: your marks come back.
 
@@ -414,7 +414,7 @@ The free space is measured when a batch starts. Other programs writing to the sa
 
 `xearthlayer run` records its process ID in the instance lock, and the package commands read it. While that process is alive:
 
-- `update` and `remove` refuse the whole batch before doing anything, with "XEarthLayer is running (pid N): stop it before updating or removing packages". `run` serves every installed package through one filesystem, so a package cannot change under it.
+- `update` and `remove` refuse the whole batch before doing anything, with "XEarthLayer is running (pid N): stop it before updating or removing packages, or delete <lock file> if XEarthLayer is not running". `run` serves every installed package through one filesystem, so a package cannot change under it. The instance lock stays behind when `run` exits, and on a busy machine another program can later get the same process ID; if no XEarthLayer is running, delete the lock file the message names.
 - `install` refuses each package that is already installed, at any version, with the same message, because installing over it is an update. Packages that are not installed install normally and the rest of the batch continues. A new package is picked up the next time `xearthlayer run` starts, and the command says so.
 
 Only one package command runs at a time. A second one, or one started while another is running, stops with "another package operation is running".

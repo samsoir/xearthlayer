@@ -310,7 +310,9 @@ is therefore always either the old version or the new one. Dot-prefixed names
 are skipped by `LocalPackageStore::list`.
 
 **Shutdown.** Dropping the queue cancels everything, lets a running swap
-finish, and joins both threads. `Canceller` (from `canceller()`) is a cloneable
+finish, and joins both threads, unless the startup sweep is still running: a
+sweep cannot be cut short, so that queue's threads are left to finish on their
+own and the lock is held until they do. `Canceller` (from `canceller()`) is a cloneable
 handle for signal handlers: `cancel_all` cancels every job in one critical
 section, and `abandon` additionally stops waiters from waiting for anything but
 a running swap and stops the drop from joining, because there may be no time for
@@ -319,7 +321,9 @@ cleanup. A live `Canceller` keeps the queue's lock held.
 **Lock and sweep.** Starting a queue takes an exclusive `flock` on
 `{temp_dir}/.queue.lock` for the queue's life (`ManagerError::QueueBusy` if
 another process holds it); the kernel drops it however the process exits. The lock is per temp folder: two commands with different temp folders and the same packages root do not exclude each other, and either one's startup sweep can delete the other's in-progress staging folder, which then fails cleanly. Under
-that lock, `sweep` deletes leftover `install_*` temp directories,
+that lock, `sweep` runs on the queue's downloader thread, so `start` returns
+at once: neither thread takes a job, install or remove, until the sweep is done,
+and a sweep that panics is logged and counts as done. It deletes leftover `install_*` temp directories,
 `.xel-staging-*` folders and `.xel-removed-*` folders, and renames a
 `.xel-aside-*` folder back when its package folder is missing (the process died
 between a swap's two renames, so the aside is the only copy), deleting it
@@ -502,6 +506,15 @@ confirmations, the quit sequence, the idle step) is tested by calling `update`.
 The state keeps what is on screen: rows, marks, selection, the open modal, the
 status line and the job rows.
 
+The status line is replaced by the answer to each key, and by each message
+that reports on the queue, but the notes on why some of a request will not
+happen (a package left out while `run` is active, a failed metadata fetch, a
+package the queue refused, one already up to date) are kept with the request.
+None of those packages gets a Progress row, so the notes stay beside the queued
+note and end up in the idle queue's "Done" line, and that line stays beside the
+overlay rebuild's. The "Nothing installed yet" hint only fills an empty status
+line. A line wider than the terminal wraps to a second row.
+
 Everything else is an `Effect` carried out by `Effects` (`effects.rs`): load the
 installed packages, load the library, check for `run`, fetch package metadata,
 submit installs and removes, cancel, abandon, rebuild the overlay folder,
@@ -517,13 +530,20 @@ included.
 
 Slow reads (the installed list, the library over HTTP, the `run` check, package
 metadata, the overlay rebuild) run on one worker thread, so the runner never
-blocks on them. Requests of one kind are shared while one is in flight.
+blocks on them. A load of one kind is shared while one of its kind is waiting
+to run; a load asked for while one is running runs again after it.
 
 The `InstallQueue` is started on demand. The first submitted job calls the
 factory, which takes `{temp_dir}/.queue.lock` and starts the downloader and
-installer threads. When the last job finishes and nothing is in flight, the
-state emits `RebuildOverlays` (once, only if an overlay changed) and
-`ReleaseQueue`, which drops the queue and with it the lock. An idle package
+installer threads, and the queue's startup sweep runs on the downloader thread,
+so starting never blocks the runner. When the last job finishes and nothing is
+in flight, the state emits `RebuildOverlays` (once, only if an overlay changed)
+and, once no rebuild is waiting for its answer, `ReleaseQueue`, which drops the
+queue and with it the lock. The rebuild therefore runs under the lock, and a job
+queued meanwhile holds the queue until its own idle step. Quitting while jobs
+are cancelled waits for the rebuild too; a second `q` leaves at once, and
+dropping `Effects` still finishes the rebuild, saying "Finishing the overlay
+folder…", before it drops the queue. An idle package
 manager therefore holds no lock, and a package command in another terminal is
 refused only while a job is actually running. If the lock is held,
 `QueueRefused` carries the reason to the status line and the marks that the
@@ -544,7 +564,8 @@ process with the terminal in raw mode. In raw mode Ctrl+C is a key (it quits),
 so a SIGINT is one sent from outside. The first acts as a confirmed quit:
 cancel the jobs, then leave. A later SIGINT, and SIGTERM at any time, abandon
 the queue and leave. SIGHUP abandons and stops drawing. The exit status is 130,
-143 or 129 by the first signal (`CliError::Interrupted`). A dropped, abandoned
+143 or 129 by the first signal (`CliError::Interrupted`), after the one-line
+summary on stderr (not after SIGHUP, which took the terminal). A dropped, abandoned
 queue is still waited for while it runs its final swap, because the process
 must not end between the two renames.
 
@@ -574,10 +595,14 @@ next check. So `Effects` asks again at the moment it carries out
 read), through the same `check_removal` and `check_replacement` the commands
 call. A remove batch is refused whole. A `Submit` names in `replacing` the
 packages that are already installed, which the state knows from the library
-statuses, so no disk is read; those are left out, the rest install, and the
-status line adds `RESTART_NOTE`. A batch with nothing left is refused. A refusal
-is answered as `QueueRefused` is (the marks come back and the status line gives
-the reason) after a `RunActive` that brings up the banner. As in the commands, a
+statuses. Those rows may be stale too, so when the re-check finds `run`,
+`Effects` also lists what is installed on disk and leaves out those packages
+as well; the rest install, and the status line adds `RESTART_NOTE`. A batch
+with nothing left is refused, and so is one whose installed list cannot be read.
+A refusal is answered as `QueueRefused` is (the marks come back and the status
+line gives the reason, after the left-out note if there is one) after a
+`RunActive` that brings up the banner. The refusal names the instance lock, so
+a user can delete one a `run` that exited left behind. As in the commands, a
 `run` started after that check is not seen. The queue lock does not cover this
 either: it serialises package operations, and the instance lock is a different
 file.
