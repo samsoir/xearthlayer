@@ -52,7 +52,7 @@ pub fn draw(frame: &mut Frame, state: &AppState, now: Instant) {
     }
     match state.tab() {
         Tab::Local => {
-            let (list, details) = chrome::split_body(body, 50);
+            let (list, details) = chrome::split_body(body, 60);
             local::draw(frame, list, details, state);
         }
         Tab::Library => {
@@ -823,5 +823,161 @@ mod tests {
             text.contains("REGION-59") && !text.contains("REGION-00"),
             "{text}"
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // Review fixes
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn the_update_mark_is_visible_at_80_by_24_and_60_by_12() {
+        let mut state = loaded();
+        // A long region name, the case that pushed the mark out.
+        let rows = vec![
+            local(
+                "NA-CANADA-GREENLAND",
+                Ortho,
+                100 * 1024 * 1024,
+                Some("1.1.0"),
+            ),
+            local("EU-WEST", Overlay, 20 * 1024 * 1024, None),
+        ];
+        msg(&mut state, Msg::Installed(Ok(rows)));
+        for (w, h) in [(80, 24), (60, 12), (100, 30)] {
+            let text = buffer_text(&render(&state, w, h));
+            let row = text.lines().find(|l| l.contains("NA-CAN")).unwrap();
+            assert!(row.contains('\u{2191}'), "{w}x{h}: {row}");
+            assert!(row.contains("100 MB"), "{w}x{h}: {row}");
+        }
+    }
+
+    #[test]
+    fn local_footer_lists_mark_all() {
+        let state = loaded();
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("a all"), "{text}");
+    }
+
+    fn many_library_rows(n: usize) -> Vec<LibraryRow> {
+        (0..n)
+            .map(|i| {
+                lib(
+                    &format!("REGION-{i:02}"),
+                    Ortho,
+                    "1.0.0",
+                    LibraryStatus::NotInstalled,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_long_install_confirmation_keeps_its_question_and_hint() {
+        for (w, h) in [(80, 24), (60, 12)] {
+            let (mut state, _) = AppState::new(false);
+            msg(&mut state, Msg::Library(Ok(many_library_rows(40))));
+            go(&mut state, Tab::Library);
+            act(&mut state, Action::MarkAll);
+            act(&mut state, Action::Install);
+            let text = buffer_text(&render(&state, w, h));
+            assert!(text.contains("Install 40 packages?"), "{w}x{h}\n{text}");
+            assert!(text.contains("... and "), "{w}x{h}\n{text}");
+            assert!(text.contains("more"), "{w}x{h}\n{text}");
+            assert!(text.contains("y confirm"), "{w}x{h}\n{text}");
+            assert!(text.contains("n or Esc cancel"), "{w}x{h}\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_long_delete_confirmation_keeps_its_question_and_hint() {
+        for (w, h) in [(80, 24), (60, 12)] {
+            let (mut state, _) = AppState::new(false);
+            let rows: Vec<LocalRow> = (0..40)
+                .map(|i| local(&format!("REGION-{i:02}"), Ortho, 1024 * 1024, None))
+                .collect();
+            msg(&mut state, Msg::Installed(Ok(rows)));
+            act(&mut state, Action::MarkAll);
+            act(&mut state, Action::Delete);
+            let text = buffer_text(&render(&state, w, h));
+            assert!(
+                text.contains("Delete 40 packages (40 MB)?"),
+                "{w}x{h}\n{text}"
+            );
+            assert!(text.contains("more"), "{w}x{h}\n{text}");
+            assert!(text.contains("y confirm"), "{w}x{h}\n{text}");
+            assert!(text.contains("n or Esc cancel"), "{w}x{h}\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_short_confirmation_lists_every_target_with_no_more_line() {
+        let mut state = loaded();
+        act(&mut state, Action::MarkAll);
+        act(&mut state, Action::Delete);
+        let text = buffer_text(&render(&state, 80, 24));
+        assert!(
+            text.contains("EU-WEST ortho") && text.contains("NA-EAST overlay"),
+            "{text}"
+        );
+        assert!(!text.contains("more"), "{text}");
+    }
+
+    #[test]
+    fn a_long_left_out_note_is_cut_but_the_hint_stays() {
+        let (mut state, _) = AppState::new(false);
+        let mut rows = many_library_rows(2);
+        rows.extend((0..30).map(|i| {
+            lib(
+                &format!("CURRENT-REGION-{i:02}"),
+                Overlay,
+                "1.0.0",
+                LibraryStatus::UpToDate,
+            )
+        }));
+        msg(&mut state, Msg::Library(Ok(rows)));
+        go(&mut state, Tab::Library);
+        act(&mut state, Action::MarkAll);
+        act(&mut state, Action::Install);
+        for (w, h) in [(80, 24), (60, 12)] {
+            let text = buffer_text(&render(&state, w, h));
+            assert!(
+                text.contains("Left out, already up to date"),
+                "{w}x{h}\n{text}"
+            );
+            assert!(text.contains("y confirm"), "{w}x{h}\n{text}");
+            assert!(text.contains("n or Esc cancel"), "{w}x{h}\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_long_library_error_wraps_instead_of_being_cut() {
+        let (mut state, _) = AppState::new(true);
+        go(&mut state, Tab::Library);
+        let error = "connection refused while fetching https://example.com/library/index.txt \
+                     after three attempts with the final one timing out waiting for the server";
+        msg(&mut state, Msg::Library(Err(error.into())));
+        let text = flat(&render(&state, 80, 24));
+        assert!(text.contains(error), "{text}");
+        assert!(text.contains("Press r to retry"), "{text}");
+    }
+
+    #[test]
+    fn help_says_which_rows_u_d_and_i_act_on() {
+        let mut state = loaded();
+        act(&mut state, Action::Help);
+        let text = flat(&render(&state, 80, 24));
+        assert!(
+            text.contains("u, d and i act on the marked rows, else the selected row"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Space mark a mark all u update d delete"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Space mark a mark all t type filter i install"),
+            "{text}"
+        );
+        assert!(text.contains("? or Esc closes"), "{text}");
     }
 }

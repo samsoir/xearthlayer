@@ -8,11 +8,10 @@ use ratatui::{
     Frame,
 };
 use xearthlayer::config::format_size;
-use xearthlayer_package::LibraryEntry;
 
-use super::chrome::{centered_rect, pane};
+use super::chrome::{centered_rect, clip, pane};
 use super::detail::heading;
-use crate::ui::packages::app::{Modal, PackageKey};
+use crate::ui::packages::app::Modal;
 
 /// Every key, by where it works.
 const KEY_SECTIONS: [(&str, &[&str]); 4] = [
@@ -22,6 +21,7 @@ const KEY_SECTIONS: [(&str, &[&str]); 4] = [
             "1 2 3, Tab, Shift+Tab   switch tabs",
             "Up Down j k PgUp PgDn Home End   move",
             "r refresh   ? help   q, Esc, Ctrl+C quit",
+            "u, d and i act on the marked rows, else the selected row",
         ],
     ),
     ("Local", &["Space mark   a mark all   u update   d delete"]),
@@ -54,18 +54,45 @@ pub fn draw(frame: &mut Frame, modal: &Modal) {
                 1 => "1 job running. Quit and cancel it?".to_string(),
                 n => format!("{n} jobs running. Quit and cancel them?"),
             };
-            confirm(frame, area, "Quit", vec![Line::from(question)], "y/q quit");
+            confirm(frame, area, "Quit", question, Vec::new(), None, "y/q quit");
         }
         Modal::ConfirmDelete {
             targets,
             total_bytes,
-        } => delete(frame, area, targets, *total_bytes),
-        Modal::ConfirmInstall { entries, skipped } => install(frame, area, entries, skipped),
+        } => {
+            let question = format!(
+                "Delete {} ({})?",
+                plural(targets.len(), "package"),
+                format_size(*total_bytes as usize)
+            );
+            let items = targets
+                .iter()
+                .map(|(region, package_type)| format!("  {region} {package_type}"))
+                .collect();
+            confirm(frame, area, "Delete", question, items, None, "y confirm");
+        }
+        Modal::ConfirmInstall { entries, skipped } => {
+            let question = format!("Install {}?", plural(entries.len(), "package"));
+            let items = entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "  {} {} v{}",
+                        entry.title, entry.package_type, entry.version
+                    )
+                })
+                .collect();
+            let note = (!skipped.is_empty())
+                .then(|| format!("Left out, already up to date: {}", skipped.join(", ")));
+            confirm(frame, area, "Install", question, items, note, "y confirm");
+        }
         Modal::ConfirmCancelAll => confirm(
             frame,
             area,
             "Cancel all",
-            vec![Line::from("Cancel every unfinished job?")],
+            "Cancel every unfinished job?".to_string(),
+            Vec::new(),
+            None,
             "y confirm",
         ),
     }
@@ -89,47 +116,60 @@ fn help(frame: &mut Frame, area: Rect) {
     show(frame, area, "Help", lines);
 }
 
-fn delete(frame: &mut Frame, area: Rect, targets: &[PackageKey], total_bytes: u64) {
-    let mut lines = vec![Line::from(format!(
-        "Delete {} ({})?",
-        plural(targets.len(), "package"),
-        format_size(total_bytes as usize)
-    ))];
-    lines.push(Line::default());
-    lines.extend(
-        targets
-            .iter()
-            .map(|(region, package_type)| Line::from(format!("  {region} {package_type}"))),
-    );
-    confirm(frame, area, "Delete", lines, "y confirm");
-}
-
-fn install(frame: &mut Frame, area: Rect, entries: &[LibraryEntry], skipped: &[String]) {
-    let mut lines = vec![Line::from(format!(
-        "Install {}?",
-        plural(entries.len(), "package")
-    ))];
-    lines.push(Line::default());
-    lines.extend(entries.iter().map(|entry| {
-        Line::from(format!(
-            "  {} {} v{}",
-            entry.title, entry.package_type, entry.version
-        ))
-    }));
-    if !skipped.is_empty() {
-        lines.push(Line::default());
-        lines.push(Line::from(format!(
-            "Left out, already up to date: {}",
-            skipped.join(", ")
-        )));
+/// A confirmation: the question, the items it concerns, an optional note,
+/// then how to answer it.
+///
+/// Every line is cut to the box rather than wrapped, so the height is known:
+/// the question and the answer keys always fit, and the items give up lines
+/// to "... and N more" when there are too many for the terminal.
+fn confirm(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    question: String,
+    items: Vec<String>,
+    note: Option<String>,
+    yes: &str,
+) {
+    let width = dialog_width(area);
+    let inner = (width as usize).saturating_sub(2);
+    // Borders, the question, a blank line, a blank line and the answer keys.
+    let mut fixed = 2 + 1 + 1 + 1;
+    if !items.is_empty() {
+        fixed += 1;
     }
-    confirm(frame, area, "Install", lines, "y confirm");
-}
+    if note.is_some() {
+        fixed += 2;
+    }
+    let room = (area.height as usize).saturating_sub(fixed);
 
-/// A confirmation: the question, then how to answer it.
-fn confirm(frame: &mut Frame, area: Rect, title: &str, mut lines: Vec<Line<'static>>, yes: &str) {
+    let mut lines = vec![Line::from(clip(&question, inner))];
+    if !items.is_empty() {
+        lines.push(Line::default());
+        let shown = if items.len() <= room {
+            items.len()
+        } else {
+            // One line goes to "... and N more".
+            room.saturating_sub(1)
+        };
+        lines.extend(
+            items[..shown]
+                .iter()
+                .map(|item| Line::from(clip(item, inner))),
+        );
+        if shown < items.len() {
+            lines.push(Line::from(format!(
+                "  ... and {} more",
+                items.len() - shown
+            )));
+        }
+    }
+    if let Some(note) = note {
+        lines.push(Line::default());
+        lines.push(Line::from(clip(&note, inner)));
+    }
     lines.push(Line::default());
-    lines.push(hint(&format!("{yes}   n or Esc cancel")));
+    lines.push(hint(&clip(&format!("{yes}   n or Esc cancel"), inner)));
     show(frame, area, title, lines);
 }
 
@@ -148,9 +188,14 @@ fn plural(count: usize, noun: &str) -> String {
     }
 }
 
+/// How wide a dialog is in `area`.
+fn dialog_width(area: Rect) -> u16 {
+    MAX_WIDTH.min(area.width.saturating_sub(4))
+}
+
 /// Clear a centred box and draw the lines in it, as tall as they need.
 fn show(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) {
-    let width = MAX_WIDTH.min(area.width.saturating_sub(4));
+    let width = dialog_width(area);
     let height = (lines.len() as u16).saturating_add(2);
     let rect = centered_rect(area, width, height);
     let block = pane(title);

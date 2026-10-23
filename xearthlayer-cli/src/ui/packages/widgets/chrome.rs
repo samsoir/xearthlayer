@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 
@@ -79,6 +79,7 @@ pub fn footer_keys(tab: Tab) -> &'static [(&'static str, &'static str)] {
     match tab {
         Tab::Local => &[
             ("Space", "mark"),
+            ("a", "all"),
             ("u", "update"),
             ("d", "delete"),
             ("r", "refresh"),
@@ -187,18 +188,23 @@ pub fn list_pane(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Text centred in an area, one line per `\n`.
+/// Text centred in an area, one paragraph per `\n`, wrapped to its width.
 pub fn centered_text(frame: &mut Frame, area: Rect, text: &str, style: Style) {
-    let lines = text.lines().count() as u16;
+    let width = (area.width as usize).max(1);
+    let lines: usize = text
+        .lines()
+        .map(|line| line.chars().count().div_ceil(width).max(1))
+        .sum();
     let [_, middle, _] = Layout::vertical([
         Constraint::Fill(1),
-        Constraint::Length(lines.min(area.height)),
+        Constraint::Length((lines as u16).min(area.height)),
         Constraint::Fill(1),
     ])
     .areas(area);
     frame.render_widget(
         Paragraph::new(text.to_string())
             .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
             .style(style),
         middle,
     );

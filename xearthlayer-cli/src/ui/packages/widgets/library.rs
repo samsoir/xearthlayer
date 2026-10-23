@@ -19,6 +19,8 @@ const FULL_STATUS_WIDTH: usize = 20;
 const COMPACT_STATUS_WIDTH: usize = 9;
 /// The region is at least this wide before the status is shortened.
 const MIN_REGION_WIDTH: usize = 12;
+/// The version column and its space, left out of a very narrow pane.
+const VERSION_WIDTH: usize = 9;
 
 pub fn draw(frame: &mut Frame, list: Rect, details: Rect, state: &AppState) {
     match state.library() {
@@ -95,16 +97,26 @@ fn row_line(state: &AppState, row: &LibraryRow, width: usize) -> Line<'static> {
     } else {
         COMPACT_STATUS_WIDTH
     };
-    let region_width = width
-        .saturating_sub(FIXED_WIDTH + status_width)
-        .clamp(6, 22);
+    // Too narrow even for the short status: the version goes, the details
+    // pane has it.
+    let compact = width < FIXED_WIDTH + status_width + 8;
+    let fixed = if compact {
+        FIXED_WIDTH - VERSION_WIDTH
+    } else {
+        FIXED_WIDTH
+    };
+    let region_width = width.saturating_sub(fixed + status_width).clamp(4, 22);
+    let version = if compact {
+        String::new()
+    } else {
+        format!("{:<8} ", row.entry.version)
+    };
     let (status, color) = status_text(&row.status, &row.entry.version, full);
     Line::from(vec![
         Span::raw(format!(
-            "{mark}{} {:<7} {:<8} ",
+            "{mark}{} {:<7} {version}",
             fit(&row.entry.title, region_width),
             row.entry.package_type.to_string(),
-            row.entry.version.to_string(),
         )),
         Span::styled(status, Style::default().fg(color)),
     ])
