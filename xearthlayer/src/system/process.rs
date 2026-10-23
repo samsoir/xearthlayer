@@ -34,9 +34,14 @@ pub fn is_alive(pid: u32) -> bool {
             // which is never the question being asked here.
             return false;
         }
+        // A PID no process can have. Cast, it would turn negative and address
+        // every process we may signal, or a process group.
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
         // SAFETY: kill() with signal 0 sends nothing. It only reports whether
         // the PID exists and whether we may signal it.
-        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        let rc = unsafe { libc::kill(pid, 0) };
         if rc == 0 {
             return true;
         }
@@ -63,6 +68,14 @@ mod tests {
         // PID 0 means "my process group" to kill(2), so answering from the
         // syscall would be answering a different question.
         assert!(!is_alive(0));
+    }
+
+    #[test]
+    fn a_pid_beyond_pid_t_is_never_reported_alive() {
+        // Cast to pid_t these are negative: -1 addresses every process we
+        // may signal, and other negatives address a process group.
+        assert!(!is_alive(u32::MAX));
+        assert!(!is_alive(i32::MAX as u32 + 1));
     }
 
     #[test]
@@ -115,13 +128,9 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_pid_is_not_a_running_instance() {
-        let mut child = std::process::Command::new("true")
-            .spawn()
-            .expect("spawn true");
-        let pid = child.id();
-        child.wait().expect("reap");
-        let (_dir, path) = lock_with(&pid.to_string());
+    fn a_pid_no_process_can_have_is_not_a_running_instance() {
+        // A reaped child's PID could be recycled; one beyond pid_t never is.
+        let (_dir, path) = lock_with("4294967295");
         assert_eq!(running_instance(&path), None);
     }
 

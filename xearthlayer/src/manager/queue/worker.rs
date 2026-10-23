@@ -27,9 +27,25 @@ fn guarded<T>(stage: &'static str, call: impl FnOnce() -> ManagerResult<T>) -> M
 }
 
 pub(super) fn run_downloader<S: Stages>(shared: Arc<Shared<S>>) {
+    sweep(&shared);
     while let Some((id, metadata, token)) = next_download(&shared) {
         download_one(&shared, id, &metadata, &token);
     }
+}
+
+/// Sweep before the first job, then let both threads take jobs. A panic
+/// in the sweep is logged and counts as swept: what it left is swept on the
+/// next start, and the queue must not wait for it forever.
+fn sweep<S: Stages>(shared: &Shared<S>) {
+    if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| shared.stages.sweep())) {
+        tracing::error!(
+            "install queue sweep panicked: {}",
+            panic_message(payload.as_ref())
+        );
+    }
+    let mut state = shared.lock();
+    state.swept = true;
+    shared.changed.notify_all();
 }
 
 fn next_download<S: Stages>(shared: &Shared<S>) -> Option<(JobId, PackageMetadata, CancelToken)> {
@@ -191,22 +207,25 @@ pub(super) fn run_installer<S: Stages>(shared: Arc<Shared<S>>) {
 }
 
 /// Take the next ready job and mark it as the installer's, all under one
-/// lock: `cancel` only removes queued work it finds in `installs`.
+/// lock: `cancel` only removes queued work it finds in `installs`. Removes
+/// skip the downloader, so the installer too waits for the sweep.
 fn next_install<S: Stages>(
     shared: &Shared<S>,
 ) -> Option<(JobId, Ready<S::Downloaded>, CancelToken)> {
     let mut state = shared.lock();
     loop {
-        if let Some((id, ready)) = state.installs.pop_front() {
-            let entry = state.jobs.get_mut(&id).expect("a ready job has an entry");
-            entry.phase = match ready {
-                Ready::Install(_) => Phase::Installing,
-                Ready::Remove => Phase::Removing,
-            };
-            return Some((id, ready, entry.token.clone()));
-        }
-        if state.shutting_down {
-            return None;
+        if state.swept {
+            if let Some((id, ready)) = state.installs.pop_front() {
+                let entry = state.jobs.get_mut(&id).expect("a ready job has an entry");
+                entry.phase = match ready {
+                    Ready::Install(_) => Phase::Installing,
+                    Ready::Remove => Phase::Removing,
+                };
+                return Some((id, ready, entry.token.clone()));
+            }
+            if state.shutting_down {
+                return None;
+            }
         }
         state = shared.wait(state);
     }

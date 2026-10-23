@@ -86,9 +86,11 @@ pub struct InstallQueue<S: Stages = crate::manager::PackageInstaller> {
 }
 
 impl<S: Stages> InstallQueue<S> {
+    /// Take the lock and start the threads. The sweep of what a killed run
+    /// left behind runs on the downloader thread, so this returns at once;
+    /// no job starts until the sweep is done.
     pub fn start(stages: S, observer: Arc<dyn QueueObserver>) -> ManagerResult<Self> {
         let lock = lock::QueueLock::acquire(stages.temp_dir())?;
-        lock::sweep(stages.temp_dir(), stages.packages_root());
         let shared = Arc::new(state::Shared::new(stages, observer, lock));
         let spawn = |name: &str, body: fn(Arc<state::Shared<S>>)| {
             let shared = Arc::clone(&shared);
@@ -243,9 +245,11 @@ impl<S: Stages> InstallQueue<S> {
 
 impl<S: Stages> Drop for InstallQueue<S> {
     /// Cancel everything, let a running swap finish, and join both threads.
-    /// An abandoned queue is not joined: its threads finish on their own.
+    /// An abandoned queue is not joined, nor is one still sweeping (a sweep
+    /// cannot be cut short): their threads finish on their own, and the
+    /// lock is held until they do.
     fn drop(&mut self) {
-        let abandoned = {
+        let detached = {
             let mut state = self.shared.lock();
             state.shutting_down = true;
             for entry in state.jobs.values() {
@@ -256,9 +260,9 @@ impl<S: Stages> Drop for InstallQueue<S> {
                 self.shared.finish(&mut state, id, JobOutcome::Cancelled);
             }
             self.shared.changed.notify_all();
-            state.abandoned
+            state.abandoned || !state.swept
         };
-        if abandoned {
+        if detached {
             return;
         }
         for thread in self.threads.drain(..) {

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,6 +85,9 @@ struct Fake {
     free_reads: AtomicU64,
     /// Holds reading the free space, like statvfs on a slow filesystem.
     hold_free_read: Mutex<Option<Arc<Gate>>>,
+    /// Holds the startup sweep, like deleting a large leftover package.
+    hold_sweep: Mutex<Option<Arc<Gate>>>,
+    panic_in_sweep: AtomicBool,
     log: Mutex<Vec<String>>,
 }
 
@@ -275,6 +278,19 @@ impl Stages for FakeStages {
         })
     }
 
+    fn sweep(&self) {
+        self.0.record("sweep started".into());
+        let held = self.0.hold_sweep.lock().unwrap().clone();
+        if let Some(gate) = held {
+            gate.pass(&CancelToken::new());
+        }
+        if self.0.panic_in_sweep.load(Ordering::SeqCst) {
+            panic!("the sweep blew up");
+        }
+        lock::sweep(self.temp_dir(), self.packages_root());
+        self.0.record("swept".into());
+    }
+
     fn remove(&self, region: &str, _package_type: PackageType) -> ManagerResult<()> {
         if let Some(gate) = Fake::gate(&self.0.hold_remove, region) {
             gate.pass(&CancelToken::new()); // a started remove ignores cancellation
@@ -381,8 +397,73 @@ fn starting_a_queue_sweeps_what_a_killed_run_left_behind() {
     let stages = FakeStages::new(u64::MAX);
     let leftover = stages.temp_dir().join("install_eu_ortho_1.0.0");
     std::fs::create_dir_all(&leftover).unwrap();
-    let (_queue, _) = start(&stages);
+    let (queue, _) = start(&stages);
+    // The sweep runs on the queue's thread before its first job.
+    queue.submit(remove_eu()).unwrap();
+    queue.wait_idle();
     assert!(!leftover.exists());
+}
+
+/// A sweep can delete whole packages, so `start` does not wait for it,
+/// and no job, install or remove, starts until it is done.
+#[test]
+fn start_returns_at_once_and_no_job_starts_until_the_sweep_is_done() {
+    let stages = FakeStages::new(u64::MAX);
+    let held = Arc::new(Gate::default());
+    *stages.0.hold_sweep.lock().unwrap() = Some(Arc::clone(&held));
+    let (queue, events) = start(&stages);
+    let held = OpenOnDrop(held);
+    let install = queue.submit(Job::Install(meta("A"))).unwrap();
+    let removal = queue.submit(remove_eu()).unwrap();
+    eventually("the sweep started", || stages.0.logged("sweep started"));
+
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(events.of(install), ["queued A"]);
+    assert_eq!(events.of(removal), ["queued EU"]);
+
+    drop(held);
+    queue.wait_idle();
+    let log = stages.0.log.lock().unwrap().clone();
+    let at = |line: &str| log.iter().position(|l| l == line).unwrap();
+    assert!(at("swept") < at("prepared A"), "{log:?}");
+    assert!(at("swept") < at("removed EU"), "{log:?}");
+}
+
+#[test]
+fn a_panicking_sweep_does_not_wedge_the_queue() {
+    let stages = FakeStages::new(u64::MAX);
+    stages.0.panic_in_sweep.store(true, Ordering::SeqCst);
+    let (queue, _) = start(&stages);
+    let results = queue.install_batch(vec![meta("A")]);
+    assert!(results[0].is_ok(), "{:?}", results[0]);
+    assert!(queue.submit(remove_eu()).is_ok());
+    queue.wait_idle();
+    assert!(stages.0.logged("removed EU"));
+}
+
+/// The sweep cannot be cut short, so dropping a queue still sweeping does
+/// not join it; the lock stays held until the sweep is done.
+#[test]
+fn dropping_a_queue_still_sweeping_returns_and_keeps_its_lock_until_the_sweep_ends() {
+    let stages = FakeStages::new(u64::MAX);
+    let held = Arc::new(Gate::default());
+    *stages.0.hold_sweep.lock().unwrap() = Some(Arc::clone(&held));
+    let (queue, events) = start(&stages);
+    let held = OpenOnDrop(held);
+    let a = queue.submit(Job::Install(meta("A"))).unwrap();
+    eventually("the sweep started", || stages.0.logged("sweep started"));
+
+    let dropper = std::thread::spawn(move || drop(queue));
+    eventually("drop returns", || dropper.is_finished());
+    assert_eq!(events.of(a).last().unwrap(), "finished cancelled");
+    let second = InstallQueue::start(stages.clone(), Arc::new(Events::default()));
+    assert!(matches!(second, Err(ManagerError::QueueBusy { .. })));
+
+    drop(held);
+    eventually("the sweep releases the lock", || {
+        InstallQueue::start(stages.clone(), Arc::new(Events::default())).is_ok()
+    });
+    assert!(!stages.0.logged("prepared A"));
 }
 
 /// Item 1: the network never waits for the disk.

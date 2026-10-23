@@ -65,6 +65,8 @@ pub(super) struct State<D> {
     pub(super) capacity_known: bool,
     pub(super) finished: BTreeMap<JobId, JobOutcome>,
     pub(super) swapping: bool,
+    /// The startup sweep is done. Neither thread takes a job before.
+    pub(super) swept: bool,
     pub(super) shutting_down: bool,
     /// Waiters stop waiting once no swap runs, and dropping the queue
     /// no longer joins its threads.
@@ -81,6 +83,7 @@ impl<D> State<D> {
             capacity_known: false,
             finished: BTreeMap::new(),
             swapping: false,
+            swept: false,
             shutting_down: false,
             abandoned: false,
         }

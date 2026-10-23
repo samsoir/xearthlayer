@@ -59,6 +59,13 @@ pub trait Stages: Send + Sync + 'static {
 
     /// Remove an installed package.
     fn remove(&self, region: &str, package_type: PackageType) -> ManagerResult<()>;
+
+    /// Clean up what a killed run left in the temp and packages folders.
+    /// The queue calls it once, on its downloader thread while holding its
+    /// lock, and starts no job until it returns.
+    fn sweep(&self) {
+        super::lock::sweep(self.temp_dir(), self.packages_root());
+    }
 }
 
 /// What an install sees of its queue.
