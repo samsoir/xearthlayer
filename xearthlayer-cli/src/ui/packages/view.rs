@@ -1,0 +1,827 @@
+//! Draws the package manager's state.
+//!
+//! ```text
+//!  XEarthLayer Packages   [1 Local]  2 Library  3 Progress (2)
+//!  XEarthLayer is running (pid N): ...        (only while run is active)
+//! ┌ list ───────────────┐┌ Details ────────────┐
+//! │                     ││                     │
+//! └─────────────────────┘└─────────────────────┘
+//!  status line
+//!  keys of the tab
+//! ```
+//!
+//! [`draw`] reads the state and the time and nothing else, so one state and
+//! one `now` always draw the same frame.
+
+use std::time::Instant;
+
+use ratatui::{
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Style},
+    Frame,
+};
+
+use super::app::{AppState, Tab};
+use super::widgets::{chrome, help, library, local, progress};
+
+/// Smallest terminal the manager draws in.
+const MIN_WIDTH: u16 = 60;
+const MIN_HEIGHT: u16 = 12;
+
+/// Draw the whole manager: the tabs, then any dialog over them.
+pub fn draw(frame: &mut Frame, state: &AppState, now: Instant) {
+    let area = frame.area();
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        too_small(frame, area);
+        return;
+    }
+
+    let banner = u16::from(state.run_active().is_some());
+    let [title, banner_area, body, status, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(banner),
+        Constraint::Min(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    chrome::title_bar(frame, title, state);
+    if let Some(pid) = state.run_active() {
+        chrome::run_banner(frame, banner_area, pid);
+    }
+    match state.tab() {
+        Tab::Local => {
+            let (list, details) = chrome::split_body(body, 50);
+            local::draw(frame, list, details, state);
+        }
+        Tab::Library => {
+            let (list, details) = chrome::split_body(body, 60);
+            library::draw(frame, list, details, state);
+        }
+        Tab::Progress => {
+            let (list, details) = chrome::split_body(body, 60);
+            progress::draw(frame, list, details, state, now);
+        }
+    }
+    chrome::status_line(frame, status, state);
+    chrome::footer(frame, footer, state.tab());
+
+    if let Some(modal) = state.modal() {
+        help::draw(frame, modal);
+    }
+}
+
+/// The only thing drawn below the minimum size.
+fn too_small(frame: &mut Frame, area: Rect) {
+    let text =
+        format!("Terminal too small for the package manager\n(needs {MIN_WIDTH}x{MIN_HEIGHT})");
+    chrome::centered_text(frame, area, &text, Style::default().fg(Color::Yellow));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use chrono::DateTime;
+    use ratatui::{backend::TestBackend, buffer::Buffer, style::Color, Terminal};
+    use semver::Version;
+    use xearthlayer::manager::{JobId, JobKind, JobSummary};
+    use xearthlayer_package::{LibraryEntry, PackageType};
+    use PackageType::{Ortho, Overlay};
+
+    use super::*;
+    use crate::commands::packages::actions::{LibraryRow, LibraryStatus};
+    use crate::ui::packages::app::{Action, Input, JobMsg, LocalRow, Msg, Tab};
+
+    fn v(version: &str) -> Version {
+        Version::parse(version).unwrap()
+    }
+
+    fn local(region: &str, t: PackageType, size: u64, update: Option<&str>) -> LocalRow {
+        LocalRow {
+            region: region.to_string(),
+            package_type: t,
+            version: v("1.0.0"),
+            size_bytes: size,
+            path: PathBuf::from(format!("/packages/{region}")),
+            published_at: DateTime::from_timestamp(0, 0).unwrap(),
+            update: update.map(v),
+        }
+    }
+
+    fn lib(title: &str, t: PackageType, version: &str, status: LibraryStatus) -> LibraryRow {
+        LibraryRow {
+            entry: LibraryEntry::new("sum", t, title, v(version), "https://example.com/m"),
+            status,
+        }
+    }
+
+    fn fake_library() -> Vec<LibraryRow> {
+        vec![
+            lib("AF-NORTH", Ortho, "1.0.0", LibraryStatus::NotInstalled),
+            lib("AF-NORTH", Overlay, "1.0.0", LibraryStatus::NotInstalled),
+            lib(
+                "EU-WEST",
+                Ortho,
+                "2.2.0",
+                LibraryStatus::Update {
+                    installed: v("2.1.0"),
+                },
+            ),
+            lib("EU-WEST", Overlay, "1.0.0", LibraryStatus::UpToDate),
+            lib("SA-SOUTH", Ortho, "1.0.0", LibraryStatus::NotInstalled),
+        ]
+    }
+
+    /// Local: EU-WEST ortho (update to 1.1.0, 100 MB), NA-EAST overlay.
+    /// Library as above. `run` not active.
+    fn loaded() -> AppState {
+        let (mut state, _) = AppState::new(true);
+        let now = Instant::now();
+        let rows = vec![
+            local("EU-WEST", Ortho, 100 * 1024 * 1024, Some("1.1.0")),
+            local("NA-EAST", Overlay, 20 * 1024 * 1024, None),
+        ];
+        state.update(Input::Msg(Msg::Installed(Ok(rows))), now);
+        state.update(Input::Msg(Msg::Library(Ok(fake_library()))), now);
+        state.update(Input::Msg(Msg::RunActive(None)), now);
+        state
+    }
+
+    fn act(state: &mut AppState, action: Action) {
+        state.update(Input::Action(action), Instant::now());
+    }
+
+    fn msg(state: &mut AppState, msg: Msg) {
+        state.update(Input::Msg(msg), Instant::now());
+    }
+
+    fn queue(state: &mut AppState, id: u64, region: &str, t: PackageType) -> JobId {
+        let id = JobId(id);
+        let summary = JobSummary {
+            kind: JobKind::Install,
+            region: region.to_string(),
+            package_type: t,
+            version: Some(v("2.1.0")),
+        };
+        msg(state, Msg::Queued(id, summary));
+        id
+    }
+
+    fn job(state: &mut AppState, id: JobId, m: JobMsg) {
+        msg(state, Msg::Job(id, m));
+    }
+
+    fn render(state: &AppState, width: u16, height: u16) -> Buffer {
+        render_at(state, width, height, Instant::now())
+    }
+
+    fn render_at(state: &AppState, width: u16, height: u16, now: Instant) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, state, now)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// One line per terminal row, trailing blanks trimmed.
+    fn buffer_text(buffer: &Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The text with line breaks and runs of spaces folded, for sentences
+    /// that wrap.
+    fn flat(buffer: &Buffer) -> String {
+        buffer_text(buffer)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The colour of the first cell of `needle` on the row that contains it.
+    fn fg_of(buffer: &Buffer, needle: &str) -> Color {
+        for y in 0..buffer.area.height {
+            let row: Vec<&str> = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            let line = row.concat();
+            if let Some(at) = line.find(needle) {
+                let column = line[..at].chars().count() as u16;
+                return buffer[(column, y)].fg;
+            }
+        }
+        panic!("{needle:?} not on screen:\n{}", buffer_text(buffer));
+    }
+
+    fn go(state: &mut AppState, tab: Tab) {
+        act(state, Action::GoTab(tab));
+    }
+
+    // ------------------------------------------------------------------------
+    // Chrome
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn the_title_bar_brackets_the_active_tab() {
+        let mut state = loaded();
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("XEarthLayer Packages"), "{text}");
+        assert!(text.contains("[1 Local]  2 Library  3 Progress"), "{text}");
+        go(&mut state, Tab::Library);
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("1 Local  [2 Library]  3 Progress"), "{text}");
+    }
+
+    #[test]
+    fn the_progress_count_shows_only_while_jobs_are_unfinished() {
+        let mut state = loaded();
+        assert!(!buffer_text(&render(&state, 100, 30)).contains("Progress ("));
+        let a = queue(&mut state, 1, "EU-WEST", Ortho);
+        queue(&mut state, 2, "EU-WEST", Overlay);
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("3 Progress (2)"), "{text}");
+        job(&mut state, a, JobMsg::Installed);
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("3 Progress (1)"), "{text}");
+    }
+
+    #[test]
+    fn the_banner_shows_while_run_is_active() {
+        let mut state = loaded();
+        assert!(!buffer_text(&render(&state, 100, 30)).contains("is running"));
+        msg(&mut state, Msg::RunActive(Some(4242)));
+        let buffer = render(&state, 100, 30);
+        let text = buffer_text(&buffer);
+        assert!(
+            text.contains(
+                "XEarthLayer is running (pid 4242): installs allowed, updates and deletes disabled"
+            ),
+            "{text}"
+        );
+        assert_eq!(fg_of(&buffer, "XEarthLayer is running"), Color::Yellow);
+    }
+
+    #[test]
+    fn a_narrow_terminal_shortens_the_banner_instead_of_cutting_it() {
+        let mut state = loaded();
+        msg(&mut state, Msg::RunActive(Some(1234567)));
+        let text = buffer_text(&render(&state, 80, 24));
+        let banner = text.lines().nth(1).unwrap();
+        assert!(banner.contains("(pid 1234567)"), "{banner}");
+        assert!(banner.contains("updates and deletes disabled"), "{banner}");
+        assert!(!banner.contains("installs allowed"), "{banner}");
+    }
+
+    #[test]
+    fn each_tab_shows_its_footer_keys() {
+        let mut state = loaded();
+        let local = buffer_text(&render(&state, 100, 30));
+        for keys in [
+            "Space mark",
+            "u update",
+            "d delete",
+            "r refresh",
+            "? help",
+            "q quit",
+        ] {
+            assert!(local.contains(keys), "{keys}\n{local}");
+        }
+        go(&mut state, Tab::Library);
+        let library = buffer_text(&render(&state, 100, 30));
+        for keys in [
+            "Space mark",
+            "a all",
+            "t type",
+            "i install",
+            "r refresh",
+            "q quit",
+        ] {
+            assert!(library.contains(keys), "{keys}\n{library}");
+        }
+        go(&mut state, Tab::Progress);
+        let progress = buffer_text(&render(&state, 100, 30));
+        for keys in [
+            "c cancel",
+            "C cancel all",
+            "x clear done",
+            "? help",
+            "q quit",
+        ] {
+            assert!(progress.contains(keys), "{keys}\n{progress}");
+        }
+    }
+
+    #[test]
+    fn the_status_line_sits_above_the_footer() {
+        let mut state = loaded();
+        msg(
+            &mut state,
+            Msg::Status("3 jobs queued: see Progress".into()),
+        );
+        let text = buffer_text(&render(&state, 100, 30));
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[28].contains("3 jobs queued: see Progress"), "{text}");
+        assert!(lines[29].contains("q quit"), "{text}");
+    }
+
+    #[test]
+    fn a_terminal_below_60_by_12_shows_only_the_too_small_message() {
+        let state = loaded();
+        let buffer = render(&state, 50, 10);
+        assert!(
+            flat(&buffer).contains("Terminal too small for the package manager (needs 60x12)"),
+            "{}",
+            buffer_text(&buffer)
+        );
+        assert!(!buffer_text(&buffer).contains("XEarthLayer Packages"));
+        // Exactly the minimum draws the manager.
+        let text = buffer_text(&render(&state, 60, 12));
+        assert!(text.contains("XEarthLayer Packages"), "{text}");
+        let text = buffer_text(&render(&state, 60, 11));
+        assert!(text.contains("Terminal too small"), "{text}");
+    }
+
+    // ------------------------------------------------------------------------
+    // Local
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn local_rows_show_their_columns_and_the_update_mark() {
+        let state = loaded();
+        let text = buffer_text(&render(&state, 100, 30));
+        let row = text.lines().find(|l| l.contains("EU-WEST")).unwrap();
+        assert!(row.contains("[ ] EU-WEST"), "{row}");
+        assert!(row.contains("ortho"), "{row}");
+        assert!(row.contains("1.0.0"), "{row}");
+        assert!(row.contains("100 MB"), "{row}");
+        assert!(row.contains('↑'), "{row}");
+        let row = text.lines().find(|l| l.contains("NA-EAST")).unwrap();
+        assert!(row.contains("overlay") && !row.contains('↑'), "{row}");
+    }
+
+    #[test]
+    fn marked_local_rows_show_x() {
+        let mut state = loaded();
+        act(&mut state, Action::Mark);
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("[x] EU-WEST"), "{text}");
+        assert!(text.contains("[ ] NA-EAST"), "{text}");
+    }
+
+    #[test]
+    fn local_details_follow_the_selection() {
+        let mut state = loaded();
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("Type: ortho"), "{text}");
+        assert!(text.contains("Version: 1.0.0 (1.1.0 available)"), "{text}");
+        assert!(text.contains("Size: 100 MB"), "{text}");
+        assert!(text.contains("Location: /packages/EU-WEST"), "{text}");
+        assert!(text.contains("Published: 1970-01-01"), "{text}");
+        act(&mut state, Action::Down);
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("Type: overlay"), "{text}");
+        assert!(text.contains("Version: 1.0.0"), "{text}");
+        assert!(!text.contains("available"), "{text}");
+    }
+
+    #[test]
+    fn an_empty_local_list_says_so_without_failing() {
+        let (state, _) = AppState::new(true);
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("Nothing installed"), "{text}");
+    }
+
+    // ------------------------------------------------------------------------
+    // Library
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn library_rows_show_marks_versions_and_status() {
+        let mut state = loaded();
+        go(&mut state, Tab::Library);
+        act(&mut state, Action::Mark);
+        let text = buffer_text(&render(&state, 100, 30));
+        let row = text
+            .lines()
+            .find(|l| l.contains("AF-NORTH") && l.contains("ortho"))
+            .unwrap();
+        assert!(row.contains("[x] AF-NORTH"), "{row}");
+        let row = text
+            .lines()
+            .find(|l| l.contains("EU-WEST") && l.contains("ortho"))
+            .unwrap();
+        assert!(row.contains("2.2.0"), "{row}");
+        assert!(row.contains("update 2.1.0 → 2.2.0"), "{row}");
+        let row = text
+            .lines()
+            .find(|l| l.contains("EU-WEST") && l.contains("overlay"))
+            .unwrap();
+        assert!(row.contains("installed"), "{row}");
+    }
+
+    #[test]
+    fn a_narrow_terminal_shortens_the_update_status() {
+        let mut state = loaded();
+        go(&mut state, Tab::Library);
+        let text = buffer_text(&render(&state, 80, 24));
+        let row = text
+            .lines()
+            .find(|l| l.contains("EU-WEST") && l.contains("ortho"))
+            .unwrap();
+        assert!(row.contains("update ↑"), "{row}");
+    }
+
+    #[test]
+    fn library_details_show_versions_and_the_overlay() {
+        let mut state = loaded();
+        go(&mut state, Tab::Library);
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("Library version: 1.0.0"), "{text}");
+        assert!(text.contains("Installed version: not installed"), "{text}");
+        assert!(text.contains("Overlay follows: yes"), "{text}");
+        act(&mut state, Action::End); // SA-SOUTH ortho, no overlay offered
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("Overlay follows: no"), "{text}");
+        act(&mut state, Action::Up);
+        act(&mut state, Action::Up); // EU-WEST ortho, update
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("Library version: 2.2.0"), "{text}");
+        assert!(text.contains("Installed version: 2.1.0"), "{text}");
+    }
+
+    #[test]
+    fn the_type_filter_is_named_in_the_title() {
+        let mut state = loaded();
+        go(&mut state, Tab::Library);
+        act(&mut state, Action::CycleFilter);
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("Library: ortho (3)"), "{text}");
+        assert!(!text.contains("AF-NORTH overlay"), "{text}");
+    }
+
+    #[test]
+    fn library_states_other_than_loaded_are_centred_text() {
+        let (mut state, _) = AppState::new(true);
+        go(&mut state, Tab::Library);
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("Loading the library"), "{text}");
+
+        msg(&mut state, Msg::Library(Err("connection refused".into())));
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(
+            text.contains("Could not load the library: connection refused"),
+            "{text}"
+        );
+        assert!(text.contains("Press r to retry"), "{text}");
+
+        msg(&mut state, Msg::LibraryNotConfigured);
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("No package library is configured"), "{text}");
+        assert!(text.contains("packages.library_url"), "{text}");
+    }
+
+    #[test]
+    fn a_library_selection_past_the_rows_does_not_panic() {
+        // The selection is not clamped while the library is away.
+        let mut state = loaded();
+        go(&mut state, Tab::Library);
+        act(&mut state, Action::End);
+        msg(&mut state, Msg::Library(Err("gone".into())));
+        render(&state, 100, 30);
+        // Back, with fewer rows than the stale selection.
+        msg(
+            &mut state,
+            Msg::Library(Ok(vec![lib(
+                "ONLY",
+                Ortho,
+                "1.0.0",
+                LibraryStatus::NotInstalled,
+            )])),
+        );
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("ONLY"), "{text}");
+        // A loaded but empty library.
+        msg(&mut state, Msg::Library(Ok(Vec::new())));
+        render(&state, 100, 30);
+    }
+
+    // ------------------------------------------------------------------------
+    // Progress
+    // ------------------------------------------------------------------------
+
+    fn progress_state() -> AppState {
+        let mut state = loaded();
+        go(&mut state, Tab::Progress);
+        state
+    }
+
+    #[test]
+    fn an_empty_progress_tab_points_at_the_library() {
+        let state = progress_state();
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("No jobs yet"), "{text}");
+    }
+
+    #[test]
+    fn a_downloading_row_has_an_arrow_a_gauge_and_bytes() {
+        let mut state = progress_state();
+        let id = queue(&mut state, 1, "NA-CANADA", Ortho);
+        job(
+            &mut state,
+            id,
+            JobMsg::Downloading {
+                done: 512 * 1024 * 1024,
+                total: Some(1024 * 1024 * 1024),
+            },
+        );
+        let text = buffer_text(&render(&state, 100, 30));
+        let row = text
+            .lines()
+            .find(|l| l.contains("NA-CANADA ortho v2.1.0"))
+            .unwrap();
+        assert!(row.contains('↓'), "{row}");
+        assert!(row.contains("█████░░░░░"), "{row}");
+        assert!(row.contains("512 MB / 1 GB"), "{row}");
+    }
+
+    #[test]
+    fn a_downloaded_row_is_light_blue_and_a_done_row_is_green() {
+        let mut state = progress_state();
+        let a = queue(&mut state, 1, "AAA", Ortho);
+        let b = queue(&mut state, 2, "BBB", Ortho);
+        let c = queue(&mut state, 3, "CCC", Ortho);
+        job(&mut state, a, JobMsg::Downloaded);
+        job(&mut state, b, JobMsg::Installed);
+        job(&mut state, c, JobMsg::Failed("disk full".into()));
+        // The selection is on the first row; the colours are on the others.
+        act(&mut state, Action::Down);
+        act(&mut state, Action::Down);
+        let buffer = render(&state, 100, 30);
+        let text = buffer_text(&buffer);
+        assert!(text.contains("downloaded, waiting to install"), "{text}");
+        assert!(text.contains('✓') && text.contains('✗'), "{text}");
+        assert_eq!(fg_of(&buffer, "AAA ortho"), Color::LightBlue);
+        assert_eq!(fg_of(&buffer, "✓"), Color::Green);
+        assert_eq!(fg_of(&buffer, "✗"), Color::Red);
+    }
+
+    #[test]
+    fn a_working_row_shows_the_spinner_frame_for_now() {
+        let mut state = progress_state();
+        let id = queue(&mut state, 1, "NA-CANADA", Ortho);
+        job(&mut state, id, JobMsg::Stage("Extracting"));
+        let start = state.started();
+        let at = |ms: u64| {
+            buffer_text(&render_at(
+                &state,
+                100,
+                30,
+                start + Duration::from_millis(ms),
+            ))
+        };
+        let first = at(0);
+        let row = first
+            .lines()
+            .find(|l| l.contains("NA-CANADA ortho"))
+            .unwrap();
+        assert!(row.contains('⠋') && row.contains("extracting"), "{row}");
+        assert!(at(350).contains('⠸'));
+        assert!(at(1000).contains('⠋'), "the frames wrap");
+        assert_eq!(at(350), at(399), "a frame lasts 100 ms");
+    }
+
+    #[test]
+    fn cancelled_and_queued_rows_have_their_marks() {
+        let mut state = progress_state();
+        let a = queue(&mut state, 1, "AAA", Ortho);
+        queue(&mut state, 2, "BBB", Ortho);
+        job(&mut state, a, JobMsg::Cancelled);
+        let text = buffer_text(&render(&state, 100, 30));
+        let row = text.lines().find(|l| l.contains("AAA ortho")).unwrap();
+        assert!(
+            row.contains("- AAA ortho") && row.contains("cancelled"),
+            "{row}"
+        );
+        let row = text.lines().find(|l| l.contains("BBB ortho")).unwrap();
+        assert!(row.contains("queued"), "{row}");
+    }
+
+    #[test]
+    fn a_waiting_row_gives_both_sizes() {
+        let mut state = progress_state();
+        let id = queue(&mut state, 1, "AAA", Ortho);
+        let gb = 1024 * 1024 * 1024;
+        job(
+            &mut state,
+            id,
+            JobMsg::Waiting {
+                needed: 3 * gb,
+                available: 2 * gb,
+            },
+        );
+        // Wide enough for the row to carry the whole sentence.
+        let wide = flat(&render(&state, 160, 30));
+        assert!(
+            wide.contains("waiting for disk space (needs 3 GB, 2 GB free)"),
+            "{wide}"
+        );
+        // Narrower, the row is short and the details pane has the numbers.
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("waiting for disk space"), "{text}");
+        assert!(text.contains("Needs: 3 GB"), "{text}");
+        assert!(text.contains("Free: 2 GB"), "{text}");
+    }
+
+    #[test]
+    fn the_details_pane_shows_the_full_error() {
+        let mut state = progress_state();
+        let id = queue(&mut state, 1, "AAA", Ortho);
+        job(
+            &mut state,
+            id,
+            JobMsg::Failed("checksum mismatch in part 3".into()),
+        );
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("State: failed"), "{text}");
+        assert!(
+            text.contains("Error: checksum mismatch in part 3"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn download_details_show_the_percentage() {
+        let mut state = progress_state();
+        let id = queue(&mut state, 1, "AAA", Ortho);
+        job(
+            &mut state,
+            id,
+            JobMsg::Downloading {
+                done: 1024 * 1024,
+                total: Some(4 * 1024 * 1024),
+            },
+        );
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("State: downloading"), "{text}");
+        assert!(text.contains("1 MB of 4 MB (25%)"), "{text}");
+    }
+
+    // ------------------------------------------------------------------------
+    // Modals
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn help_lists_every_key_and_how_it_works() {
+        let mut state = loaded();
+        act(&mut state, Action::Help);
+        let text = flat(&render(&state, 100, 30));
+        for keys in [
+            "1 2 3",
+            "Tab",
+            "Shift+Tab",
+            "Up Down j k PgUp PgDn Home End",
+            "r refresh",
+            "? help",
+            "q, Esc, Ctrl+C quit",
+            "Space mark",
+            "a mark all",
+            "u update",
+            "d delete",
+            "t type filter",
+            "i install",
+            "c cancel",
+            "C cancel all",
+            "x clear finished",
+            "How it works",
+        ] {
+            assert!(text.contains(keys), "{keys}\n{text}");
+        }
+        for line in [
+            "Installs and removals queue in the background",
+            "Queuing never switches tabs",
+            "While xearthlayer run is active",
+            "Overlays follow their ortho",
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+    }
+
+    #[test]
+    fn help_fits_an_80_by_24_terminal() {
+        let mut state = loaded();
+        act(&mut state, Action::Help);
+        let text = buffer_text(&render(&state, 80, 24));
+        assert!(text.contains("How it works"), "{text}");
+        assert!(text.contains("Overlays follow their ortho"), "{text}");
+        assert!(text.contains("? or Esc closes"), "{text}");
+    }
+
+    #[test]
+    fn the_quit_prompt_counts_the_running_jobs() {
+        let mut state = loaded();
+        queue(&mut state, 1, "AAA", Ortho);
+        queue(&mut state, 2, "BBB", Ortho);
+        act(&mut state, Action::Quit);
+        let text = flat(&render(&state, 100, 30));
+        assert!(
+            text.contains("2 jobs running. Quit and cancel them?"),
+            "{text}"
+        );
+        assert!(text.contains("y/q quit"), "{text}");
+        assert!(text.contains("n or Esc cancel"), "{text}");
+    }
+
+    #[test]
+    fn the_delete_prompt_shows_the_total_size() {
+        let mut state = loaded();
+        act(&mut state, Action::MarkAll);
+        act(&mut state, Action::Delete);
+        let text = flat(&render(&state, 100, 30));
+        assert!(text.contains("Delete 2 packages (120 MB)?"), "{text}");
+        assert!(text.contains("EU-WEST ortho"), "{text}");
+        assert!(text.contains("NA-EAST overlay"), "{text}");
+    }
+
+    #[test]
+    fn the_install_prompt_lists_overlays_and_what_was_left_out() {
+        let mut state = loaded();
+        go(&mut state, Tab::Library);
+        // AF-NORTH ortho (+ overlay) and EU-WEST overlay (current).
+        act(&mut state, Action::Mark);
+        act(&mut state, Action::Down);
+        act(&mut state, Action::Down);
+        act(&mut state, Action::Down);
+        act(&mut state, Action::Mark);
+        act(&mut state, Action::Install);
+        let text = flat(&render(&state, 100, 30));
+        assert!(text.contains("Install 2 packages?"), "{text}");
+        assert!(text.contains("AF-NORTH ortho v1.0.0"), "{text}");
+        assert!(text.contains("AF-NORTH overlay v1.0.0"), "{text}");
+        assert!(
+            text.contains("Left out, already up to date: EU-WEST overlay"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_cancel_all_prompt_is_drawn() {
+        let mut state = progress_state();
+        queue(&mut state, 1, "AAA", Ortho);
+        act(&mut state, Action::CancelAll);
+        let text = buffer_text(&render(&state, 100, 30));
+        assert!(text.contains("Cancel every unfinished job?"), "{text}");
+    }
+
+    // ------------------------------------------------------------------------
+    // 80x24 and long lists
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn every_tab_draws_at_80_by_24() {
+        let mut state = loaded();
+        let id = queue(&mut state, 1, "NA-CANADA-GREENLAND", Ortho);
+        job(
+            &mut state,
+            id,
+            JobMsg::Downloading {
+                done: 1,
+                total: Some(100),
+            },
+        );
+        for tab in [Tab::Local, Tab::Library, Tab::Progress] {
+            go(&mut state, tab);
+            let text = buffer_text(&render(&state, 80, 24));
+            assert!(text.contains("XEarthLayer Packages"), "{text}");
+            assert!(text.contains("q quit"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_long_list_scrolls_to_keep_the_selection_in_view() {
+        let (mut state, _) = AppState::new(true);
+        let rows: Vec<LocalRow> = (0..60)
+            .map(|i| local(&format!("REGION-{i:02}"), Ortho, 1024, None))
+            .collect();
+        msg(&mut state, Msg::Installed(Ok(rows)));
+        let text = buffer_text(&render(&state, 100, 20));
+        assert!(
+            text.contains("REGION-00") && !text.contains("REGION-59"),
+            "{text}"
+        );
+        act(&mut state, Action::End);
+        let text = buffer_text(&render(&state, 100, 20));
+        assert!(
+            text.contains("REGION-59") && !text.contains("REGION-00"),
+            "{text}"
+        );
+    }
+}

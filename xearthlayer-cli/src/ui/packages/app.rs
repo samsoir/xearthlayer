@@ -23,7 +23,7 @@ use crate::ui::dashboard::state::QUIT_CONFIRM_TIMEOUT;
 const PAGE_ROWS: usize = 10;
 
 /// A package as the Local and Library tabs identify it: region and type.
-type PackageKey = (String, PackageType);
+pub type PackageKey = (String, PackageType);
 
 // ============================================================================
 // Data
@@ -330,6 +330,7 @@ pub struct AppState {
     overlay_jobs: HashSet<JobId>,
     auto_install_overlays: bool,
     tally: Tally,
+    started: Instant,
 }
 
 impl AppState {
@@ -356,6 +357,7 @@ impl AppState {
             overlay_jobs: HashSet::new(),
             auto_install_overlays,
             tally: Tally::default(),
+            started: Instant::now(),
         };
         (state, reload())
     }
@@ -408,6 +410,95 @@ impl AppState {
     /// The selected row of the current tab.
     pub fn selected(&self) -> usize {
         self.selection[self.tab.index()]
+    }
+
+    // ------------------------------------------------------------------------
+    // Read-only views for rendering
+    // ------------------------------------------------------------------------
+
+    /// The tab being shown.
+    #[allow(dead_code)] // read by the views
+    pub fn tab(&self) -> Tab {
+        self.tab
+    }
+
+    /// The installed packages.
+    #[allow(dead_code)] // read by the views
+    pub fn local_rows(&self) -> &[LocalRow] {
+        &self.local
+    }
+
+    /// Whether this installed package is marked.
+    #[allow(dead_code)] // read by the views
+    pub fn is_local_marked(&self, row: &LocalRow) -> bool {
+        self.local_marks.contains(&row.key())
+    }
+
+    /// What the Library tab has to show.
+    #[allow(dead_code)] // read by the views
+    pub fn library(&self) -> &LibraryState {
+        &self.library
+    }
+
+    /// The type filter of the Library tab.
+    #[allow(dead_code)] // read by the views
+    pub fn filter(&self) -> TypeFilter {
+        self.filter
+    }
+
+    /// The library rows the filter shows, in order. Empty unless loaded.
+    #[allow(dead_code)] // read by the views
+    pub fn library_rows(&self) -> Vec<&LibraryRow> {
+        self.shown_library()
+    }
+
+    /// Whether this library package is marked.
+    #[allow(dead_code)] // read by the views
+    pub fn is_library_marked(&self, row: &LibraryRow) -> bool {
+        self.library_marks
+            .contains(&(row.entry.title.clone(), row.entry.package_type))
+    }
+
+    /// Whether installing this library package also installs its overlay:
+    /// an ortho, with overlays following and the library offering one.
+    #[allow(dead_code)] // read by the views
+    pub fn overlay_follows(&self, row: &LibraryRow) -> bool {
+        let LibraryState::Loaded(rows) = &self.library else {
+            return false;
+        };
+        self.auto_install_overlays
+            && row.entry.package_type == PackageType::Ortho
+            && find_row(rows, &row.entry.title, PackageType::Overlay).is_some()
+    }
+
+    /// Every job, in the order they were queued.
+    #[allow(dead_code)] // read by the views
+    pub fn jobs(&self) -> &[JobRow] {
+        &self.jobs
+    }
+
+    /// The open dialog, if any.
+    #[allow(dead_code)] // read by the views
+    pub fn modal(&self) -> Option<&Modal> {
+        self.modal.as_ref()
+    }
+
+    /// The status line.
+    #[allow(dead_code)] // read by the views
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
+    /// The pid of the `xearthlayer run` serving packages, if any.
+    #[allow(dead_code)] // read by the views
+    pub fn run_active(&self) -> Option<u32> {
+        self.run_active
+    }
+
+    /// When the state was made: the spinner counts its frames from here.
+    #[allow(dead_code)] // read by the views
+    pub fn started(&self) -> Instant {
+        self.started
     }
 
     // ------------------------------------------------------------------------
