@@ -365,8 +365,11 @@ release is marked pre-release; tracking those is that cask's purpose.
 To test a cask change locally before a tag exists, render into a checkout of the tap,
 link the checkout under `$(brew --repository)/Library/Taps/xearthlayer/homebrew-tap`
 (the audit workflow does the same), `brew trust xearthlayer/tap`, and run `brew style`,
-`brew audit` and `brew install --cask --skip-cask-deps` against it. `brew style --fix`
-is the authority on stanza order (`depends_on arch`, `cask`, `macos`).
+`brew audit` and `brew install --cask --skip-cask-deps` against it. `brew style --fix` is the authority on stanza order (`depends_on arch`, `cask`,
+`macos`), but run it on the cask files only, never on the tap as a whole: pointed at
+the tap it also runs rubocop's Markdown plugin over `README.md`, and its autocorrect
+has rewritten that file with its own markers. The tap's audit styles `Casks/*.rb`
+alone for the same reason.
 
 The first cask appears in the tap with the first tag published after this step
 landed; there is no stable cask until `v0.5.0`, since the `0.4.x` line has no macOS
