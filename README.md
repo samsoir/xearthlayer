@@ -96,7 +96,10 @@ make install
 # Run the setup wizard (first-time configuration)
 xearthlayer setup
 
-# Install a regional package
+# Open the package manager and install a regional package
+xearthlayer packages
+
+# Or install one from the command line
 xearthlayer packages install eu
 
 # Start XEarthLayer

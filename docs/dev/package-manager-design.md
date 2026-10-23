@@ -13,7 +13,7 @@ The Package Manager is responsible for discovering, downloading, installing, upd
 3. **Install** packages to local storage
 4. **Update** packages when new versions are available
 5. **Remove** packages from the system
-6. **Mount** ortho packages via FUSE (coordinate with existing mount system)
+6. **Coordinate** with a running `xearthlayer run` (see Coordination with run)
 
 ## Architecture
 
@@ -32,11 +32,11 @@ The Package Manager is responsible for discovering, downloading, installing, upd
 │  └──────────────┘  └──────────────┘  └──────────────────────┘   │
 │                                                                 │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
-│  │   Installer  │  │   Mount      │  │      Update          │   │
-│  │              │  │   Coordinator│  │      Checker         │   │
+│  │   Installer  │  │   Run        │  │      Update          │   │
+│  │              │  │   Check      │  │      Checker         │   │
 │  │ Extract pkg  │  │              │  │                      │   │
-│  │ Create links │  │ Track mounts │  │ Compare local/remote │   │
-│  │ Verify files │  │ Start/stop   │  │ Notify user          │   │
+│  │ Create links │  │ Read the lock│  │ Compare local/remote │   │
+│  │ Verify files │  │ Refuse edits │  │ Notify user          │   │
 │  └──────────────┘  └──────────────┘  └──────────────────────┘   │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -360,39 +360,45 @@ consolidated `yzXEL_overlay/` folder once.
 - Handle existing directory/symlink at target
 - Provide manual copy fallback if symlinks unavailable
 
-## Mount Coordination
+## Coordination with run
 
-For ortho packages, coordinate with XEarthLayer FUSE system.
+`xearthlayer run` serves every installed ortho package, and the patches, through
+one union filesystem mounted at `Custom Scenery/zzXEL_ortho` (see
+[consolidated-mounting-design.md](consolidated-mounting-design.md)). Packages
+are no longer mounted one by one, so the package manager keeps no mount state
+and cannot unmount anything.
 
-### Multi-Mount Strategy
+What it has instead is the instance lock. `run` records its process ID in
+`paths::lock_file()`. `system::process::running_instance(lock_path)` reads it
+(`recorded_pid`) and answers with the PID only when that process is alive and is
+not the caller, so a stale or corrupt lock reads as "not running".
+`PackageManagerService::running_instance` wraps it for the CLI layer, and
+`PackageActions` (`commands/packages/actions.rs`) turns it into decisions:
 
-Each installed ortho package gets its own FUSE mount:
+- `check_removal`: a remove is refused while `run` is alive.
+- `check_replacement`: an update, or an install over an installed package, is
+  refused for the same reason. A package that is not installed is not a
+  replacement, so it installs, and `RESTART_NOTE` tells the user that `run`
+  picks it up on its next start.
 
-```
-Custom Scenery/
-├── zzXEL_afr_ortho/  → FUSE mount → ~/.xearthlayer/packages/zzXEL_afr_ortho/
-├── zzXEL_eur_ortho/  → FUSE mount → ~/.xearthlayer/packages/zzXEL_eur_ortho/
-└── zzXEL_na_ortho/   → FUSE mount → ~/.xearthlayer/packages/zzXEL_na_ortho/
-```
+Both refuse with `RunActive`, whose message names the PID. An update or remove
+batch is refused whole before any work starts; an install batch refuses
+per package and continues with the rest.
 
-### Mount State Tracking
+The reason is that the union filesystem holds the files of every installed
+package open and indexed. A package replaced or deleted under it leaves the
+index and the open handles pointing at files that are gone.
 
-Track active mounts for clean shutdown:
+### Why the old mount check never fired
 
-```rust
-pub struct MountState {
-    pub package: String,
-    pub source_path: PathBuf,
-    pub mount_point: PathBuf,
-    pub session: BackgroundSession,
-}
-```
-
-### Lifecycle
-
-1. **Start**: Iterate installed ortho packages, mount each
-2. **Runtime**: Handle mount failures gracefully (log, continue with others)
-3. **Shutdown**: Unmount all in reverse order, wait for clean unmount
+The first version asked whether each package folder was itself a mount point
+(`MountStatus`, read from `/proc/mounts`). That matched the per-package mounts
+of the design this section used to describe. After consolidated mounting the
+only mount is `zzXEL_ortho`, so the answer for every package folder was always
+"not mounted" and `update` and `remove` ran freely against a live filesystem.
+`MountStatus`, `check_mount_status` and the Mount lines of `list -v` and `info`
+were removed with the fix; the lock is the signal because it describes the
+thing that matters, a running `run`, rather than a mount layout.
 
 ## Package Removal
 
@@ -478,6 +484,92 @@ EUROPE ortho package installed successfully.
 Run 'xearthlayer start' to begin serving scenery.
 ```
 
+## Package manager TUI
+
+`xearthlayer packages` with no subcommand and a terminal on stdin and stdout
+opens a three-tab screen (Local, Library, Progress) over the same machinery as
+the commands. Without a terminal it prints the command help, as before. The
+setup wizard offers to open it at the end (`offer_manager`, which asks only
+when there is a terminal). The code is `xearthlayer-cli/src/ui/packages/`.
+
+### State and effects
+
+`AppState` (`app.rs`) is pure. `AppState::update(Input, Instant)` takes a key's
+`Action` or a `Msg` and returns a list of `Effect`s. It touches no terminal,
+network or disk, so every rule (marks, what `u`, `d` and `i` do, the
+confirmations, the quit sequence, the idle step) is tested by calling `update`.
+The state keeps what is on screen: rows, marks, selection, the open modal, the
+status line and the job rows.
+
+Everything else is an `Effect` carried out by `Effects` (`effects.rs`): load the
+installed packages, load the library, check for `run`, fetch package metadata,
+submit installs and removes, cancel, rebuild the overlay folder, release the
+queue, exit. The answers come back as `Msg`s on one channel.
+
+`runner.rs` is the loop around them. Each turn it acts on a signal, draws, waits
+up to 50 ms for keys, hands the channel's messages to the state, once a second
+sends a `Tick` (which expires the quit prompt), and applies the effects that
+came back. The terminal is restored on every exit, a panic on the runner thread
+included.
+
+### The worker and the queue
+
+Slow reads (the installed list, the library over HTTP, the `run` check, package
+metadata, the overlay rebuild) run on one worker thread, so the runner never
+blocks on them. Requests of one kind are shared while one is in flight.
+
+The `InstallQueue` is started on demand. The first submitted job calls the
+factory, which takes `{temp_dir}/.queue.lock` and starts the downloader and
+installer threads. When the last job finishes and nothing is in flight, the
+state emits `RebuildOverlays` (once, only if an overlay changed) and
+`ReleaseQueue`, which drops the queue and with it the lock. An idle package
+manager therefore holds no lock, and a package command in another terminal is
+refused only while a job is actually running. If the lock is held,
+`QueueRefused` carries the reason to the status line and the marks that the
+confirmed action cleared are put back.
+
+`ChannelObserver` implements `QueueObserver` by sending each `JobEvent` as a
+`Msg` on that channel. The queue calls observers while it holds its own lock, so
+`on_event` only does an unbounded `send` and ignores a closed channel. It never
+blocks, allocates beyond the message, or calls back into the queue.
+
+Cancelling deletes the temp trees of downloaded jobs, which takes time, so
+`Effects::stop` runs it on a short-lived thread and the screen keeps drawing.
+
+### Signals
+
+The runner starts `SignalWatch::start_handling_all`, so a signal never kills the
+process with the terminal in raw mode. In raw mode Ctrl+C is a key (it quits),
+so a SIGINT is one sent from outside. The first acts as a confirmed quit:
+cancel the jobs, then leave. A later SIGINT, and SIGTERM at any time, abandon
+the queue and leave. SIGHUP abandons and stops drawing. The exit status is 130,
+143 or 129 by the first signal (`CliError::Interrupted`). A dropped, abandoned
+queue is still waited for while it runs its final swap, because the process
+must not end between the two renames.
+
+### Shared with the commands
+
+`PackageActions` (`commands/packages/actions.rs`) holds the decisions the
+commands and the TUI must agree on: `library_status` (not installed, up to date,
+or update, and a failed update check is an error rather than "not installed"),
+`plan_install` (a selected ortho followed by its overlay when
+`auto_install_overlays` is on), `check_removal` and `check_replacement` (the
+`run` refusals), `RESTART_NOTE`, `after_removal` (an overlay's stale symlink)
+and `rebuild_overlays`, which returns an `OverlayReport` for the caller to show
+where the commands print it. The commands and the TUI call the same functions, so
+a rule is changed in one place.
+
+### running_instance replaces the mount check
+
+See [Coordination with run](#coordination-with-run). The TUI reads
+`running_instance` through the worker (`Effect::CheckRun`) on start, on refresh
+and each time finished jobs reload the lists, and keeps the answer as
+`run_active`. `u`, `d` and an install over an installed package are refused from
+that answer with `RunActive::message`, and the top banner says so. A `run`
+started while the screen is open is therefore noticed at the next refresh, not
+at the keypress, and the lock the queue takes does not cover it: the queue lock
+serialises package operations, and the instance lock is a different file.
+
 ## Error Handling
 
 ### Network Errors
@@ -498,11 +590,10 @@ Run 'xearthlayer start' to begin serving scenery.
 - If persistent, report corruption and suggest re-download
 - Never proceed with failed checksum
 
-### Mount Failures
+### Running Instance
 
-- Log detailed error
-- Continue mounting other packages
-- Report which packages failed at end
+- Refuse updates and removes while `run` is alive, naming its PID
+- Install new packages, and say that `run` needs a restart to use them
 
 ## Library Interface
 
