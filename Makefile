@@ -387,6 +387,13 @@ pkg-tarball: release ## Build release tarballs: the runtime and, separately, the
 	@rm dist/xearthlayer-publish dist/content-publishing.md dist/LICENSE
 	@echo "$(GREEN)Tarballs built: dist/$(PKG_NAME)-$(PKG_VERSION)-x86_64-linux.tar.gz, dist/$(PKG_NAME)-publish-$(PKG_VERSION)-x86_64-linux.tar.gz$(NC)"
 
+.PHONY: sign-macos
+sign-macos: ## Sign and notarize the release binaries with the Developer ID in the keychain (macOS only)
+	@if [ "$$(uname)" != "Darwin" ]; then echo "$(RED)Error: sign-macos must be run on macOS$(NC)"; exit 1; fi
+	@# Notary credentials come from MACOS_NOTARY_PROFILE (xcrun notarytool
+	@# store-credentials) or MACOS_NOTARY_KEY/_KEY_ID/_ISSUER_ID; see docs/dev/macos-signing.md.
+	@scripts/macos/sign-and-notarize.sh target/release/xearthlayer target/release/xearthlayer-publish
+
 .PHONY: aur-prepare
 aur-prepare: ## Prepare AUR package for a tagged release (TAG=v0.2.0)
 	@if [ -z "$(TAG)" ]; then echo "$(RED)Error: TAG is required. Usage: make aur-prepare TAG=v0.2.0$(NC)"; exit 1; fi

@@ -51,11 +51,11 @@ If the approval prompt never appeared, re-run the macFUSE installer after comple
 Each release carries an `arm64-macos.tar.gz` tarball for Apple Silicon Macs.
 There is no Intel build; on an Intel Mac, build from source as below.
 
-The binary is not signed with an Apple Developer ID. A file downloaded in a
-browser is marked as quarantined, and macOS refuses to run an unsigned
-quarantined program. Running it shows **"xearthlayer" Not Opened: Apple could
-not verify "xearthlayer" is free of malware**. Click **Done**, not Move to
-Trash. Clearing the mark once is enough.
+The binaries are signed with the project's Apple Developer ID and notarized by
+Apple, so macOS runs them as downloaded. The first run of a browser download
+needs a network connection: a bare executable cannot carry its notarization
+ticket, so Gatekeeper fetches it once. Pre-releases up to `v0.5.0-alpha.2` were
+unsigned; see the note at the end of this section if you still have one.
 
 Safari unpacks the tarball for you into a folder of the same name. In that
 case go straight to the folder:
@@ -74,7 +74,6 @@ tar xzf xearthlayer-<version>-arm64-macos.tar.gz
 Then, in either case:
 
 ```bash
-xattr -c xearthlayer                 # clear the download quarantine
 mkdir -p ~/.local/bin
 mv xearthlayer ~/.local/bin/
 xearthlayer --version
@@ -82,8 +81,18 @@ xearthlayer --version
 
 If `xearthlayer` is not found, `~/.local/bin` is not on your `PATH`. Add
 `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` and open a new terminal.
-A tarball downloaded with `curl` instead of a browser is never quarantined, so
-the `xattr` step does nothing there.
+
+To confirm what you downloaded is the project's own build:
+
+```bash
+codesign --display --verbose=2 xearthlayer   # Authority=Developer ID Application: Sam de Freyssinet (Y7DVMR5MEX)
+```
+
+**Unsigned pre-releases (`v0.5.0-alpha.2` and earlier).** Running one shows
+**"xearthlayer" Not Opened: Apple could not verify "xearthlayer" is free of
+malware**. Click **Done**, not Move to Trash, then clear the download
+quarantine once with `xattr -c xearthlayer` before moving it into place. A
+tarball fetched with `curl` instead of a browser is never quarantined.
 
 #### From source
 

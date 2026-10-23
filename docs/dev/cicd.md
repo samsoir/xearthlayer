@@ -202,6 +202,13 @@ unrelated PR.
 `build.rs`, no `pkg-config`, no `cc` — and `xearthlayer/build.rs` already emits `-lc++`
 on macOS. macFUSE is required only at runtime.
 
+**macOS binaries are signed and notarized** on every channel. `package-macos` imports
+the Developer ID identity into a per-job keychain, runs
+`scripts/macos/sign-and-notarize.sh` on both binaries, and deletes the keychain, all
+gated on the signing secrets being present so a fork still gets an unsigned tarball.
+The certificate, the notary key, the secrets and their renewal are in
+[macos-signing.md](macos-signing.md).
+
 ## Release Channels
 
 | Channel | Tag | GitHub Release | Assets |
@@ -323,6 +330,8 @@ idempotence check above exist to keep it from recurring.
 |--------|---------|-------|
 | `GITHUB_TOKEN` | `release.yml` | Automatic; creates the release and uploads assets |
 | `AUR_SSH_PRIVATE_KEY` | `release.yml` | Optional. Absent, the AUR files are attached to the release for manual submission |
+| `APPLE_DEVELOPER_ID_P12`, `APPLE_DEVELOPER_ID_P12_PASSWORD` | `release.yml` | Developer ID Application identity (base64 `.p12`) and its password. Absent, `package-macos` ships an unsigned tarball |
+| `APPLE_NOTARY_KEY_P8`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID` | `release.yml` | App Store Connect API key for `notarytool`. Required once the certificate is set. See [macos-signing.md](macos-signing.md) |
 | `WEBSITE_DISPATCH_TOKEN` | `website-sync.yml` | 90-day PAT. **Expiry is silent** — the website then lags by up to 24h until the daily fallback cron runs |
 
 ### The `version.json` contract

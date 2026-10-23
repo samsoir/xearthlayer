@@ -58,6 +58,7 @@ Technical documentation for XEarthLayer developers and contributors.
 | [Memory Profiling](memory-profiling.md) | Heaptrack profiling guide for memory optimization |
 | [Memory Telemetry](memory-telemetry.md) | Periodic in-process memory sampling for long-flight diagnosis (v0.4.7+) |
 | [CI/CD Pipeline](cicd.md) | Build pipeline, merge strategy, release channels, platform tiers |
+| [macOS Signing and Notarization](macos-signing.md) | Developer ID certificate, notary key, release secrets, renewal |
 | [Application Release Runbook](app-release-runbook.md) | Release workflow, versioning, and troubleshooting |
 
 ## Root Cause Analysis

@@ -175,7 +175,7 @@ gh run watch --repo samsoir/xearthlayer
 # ✓ Prepare AUR Package (~10-15 min, see note below)
 # ✓ Build RPM Package (~7-8 min)
 # ✓ Package Linux Binary (~15 sec)
-# ✓ Package macOS Binary (~6 min)
+# ✓ Package macOS Binary (~8-10 min, includes signing and notarization)
 # ✓ Package Debian Package (~1 min)
 # ✓ Publish Release (~15 sec)
 ```
