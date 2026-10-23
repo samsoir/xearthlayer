@@ -107,6 +107,8 @@ enum Commands {
 
     /// Package manager commands (install and manage scenery packages)
     ///
+    /// With no subcommand, in a terminal, opens the package manager.
+    ///
     /// Region codes are hierarchical, so install, update, remove and info
     /// accept the start of a code and act on every package it selects,
     /// ignoring case:
@@ -123,7 +125,7 @@ enum Commands {
     #[command(verbatim_doc_comment)]
     Packages {
         #[command(subcommand)]
-        command: commands::packages::PackagesCommands,
+        command: Option<commands::packages::PackagesCommands>,
     },
 
     /// Tile patches management commands (custom mesh/elevation tiles)
@@ -354,12 +356,26 @@ mod tests {
     use super::commands::packages::PackagesCommands;
     use super::Commands;
 
-    fn packages(args: &[&str]) -> Result<PackagesCommands, clap::Error> {
+    fn packages_command(args: &[&str]) -> Result<Option<PackagesCommands>, clap::Error> {
         let argv = ["xearthlayer", "packages"].iter().chain(args);
         match Cli::try_parse_from(argv)?.command {
             Some(Commands::Packages { command }) => Ok(command),
             _ => panic!("expected a packages command"),
         }
+    }
+
+    /// A packages subcommand, which these tests always give.
+    fn packages(args: &[&str]) -> Result<PackagesCommands, clap::Error> {
+        packages_command(args).map(|command| command.expect("a subcommand"))
+    }
+
+    #[test]
+    fn packages_with_no_subcommand_parses_to_none_for_the_manager() {
+        assert!(matches!(packages_command(&[]), Ok(None)));
+        assert!(matches!(
+            packages_command(&["list"]),
+            Ok(Some(PackagesCommands::List { .. }))
+        ));
     }
 
     #[test]

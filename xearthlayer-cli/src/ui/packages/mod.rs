@@ -4,10 +4,13 @@
 //!   into effects for the runner to carry out
 //! - `input`: keys to actions, by tab and open modal
 //! - `view`: draws the state; `widgets` holds the pieces
+//! - `effects`: carries out the effects: the session's install queue, and a
+//!   worker thread for the slow reads
+//! - `runner`: the terminal loop, signals and restoring the terminal
 
 pub mod app;
+pub mod effects;
 pub mod input;
-#[allow(dead_code)] // wired by the runner in Task 5
+pub mod runner;
 pub mod view;
-#[allow(dead_code)] // wired by the runner in Task 5
 pub mod widgets;

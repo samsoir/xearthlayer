@@ -86,6 +86,8 @@ pub struct FakeManager {
     refused_removals: Vec<String>,
     /// The pid of a running `xearthlayer run`, when there is one.
     running: Option<u32>,
+    /// Checking for updates fails.
+    failing_update_check: bool,
 }
 
 impl FakeManager {
@@ -148,6 +150,12 @@ impl FakeManager {
         self
     }
 
+    /// Make checking for updates fail, as an unreadable install folder does.
+    pub fn with_failing_update_check(mut self) -> Self {
+        self.failing_update_check = true;
+        self
+    }
+
     /// Make installing `title` as `package_type` fail.
     pub fn failing_on(mut self, title: &str, package_type: PackageType) -> Self {
         self.failing.push(format!("{title} ({package_type})"));
@@ -199,12 +207,18 @@ impl PackageManagerService for FakeManager {
         Ok(metadata(&entry.title, entry.package_type))
     }
 
-    fn check_updates(
+    fn try_check_updates(
         &self,
         _store: &LocalPackageStore,
         _library: &PackageLibrary,
-    ) -> Vec<(PackageInfo, PackageStatus)> {
-        self.statuses.clone()
+    ) -> ManagerResult<Vec<(PackageInfo, PackageStatus)>> {
+        if self.failing_update_check {
+            return Err(ManagerError::ReadFailed {
+                path: install_dir(),
+                source: std::io::Error::other("unreadable"),
+            });
+        }
+        Ok(self.statuses.clone())
     }
 
     fn install_packages(

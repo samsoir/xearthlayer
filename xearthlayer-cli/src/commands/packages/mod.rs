@@ -23,8 +23,8 @@ pub(crate) mod progress;
 mod selector;
 mod services;
 #[cfg(test)]
-mod test_support;
-mod traits;
+pub(crate) mod test_support;
+pub(crate) mod traits;
 
 // Re-export public types
 pub use args::PackagesCommands;
@@ -34,10 +34,11 @@ pub use handlers::{
 pub use services::{ConsoleInteraction, ConsoleOutput, DefaultPackageManagerService};
 pub use traits::CommandHandler;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 use args::{CheckArgs, InfoArgs, InstallArgs, ListArgs, RemoveArgs, UpdateArgs};
+use clap::CommandFactory;
 use selector::Selection;
 use traits::CommandContext;
 use xearthlayer::config::ConfigFile;
@@ -55,7 +56,7 @@ fn load_config() -> ConfigFile {
 /// Priority:
 /// 1. packages.install_location from config
 /// 2. ~/.xearthlayer/packages (default)
-fn default_install_dir(config: &ConfigFile) -> PathBuf {
+pub(crate) fn default_install_dir(config: &ConfigFile) -> PathBuf {
     config
         .packages
         .install_location
@@ -69,7 +70,7 @@ fn default_install_dir(config: &ConfigFile) -> PathBuf {
 /// 1. packages.custom_scenery_path from config
 /// 2. xplane.scenery_dir from config
 /// 3. Auto-detect from X-Plane installation
-fn default_custom_scenery_dir(config: &ConfigFile) -> Option<PathBuf> {
+pub(crate) fn default_custom_scenery_dir(config: &ConfigFile) -> Option<PathBuf> {
     config
         .packages
         .custom_scenery_path
@@ -87,7 +88,7 @@ fn default_custom_scenery_dir(config: &ConfigFile) -> Option<PathBuf> {
 /// `~/.xearthlayer/tmp`. This avoids using the system temp directory which on many
 /// Linux distributions is a tmpfs (RAM-backed), causing OOM when downloading large
 /// scenery packages.
-fn default_temp_dir(config: &ConfigFile) -> PathBuf {
+pub(crate) fn default_temp_dir(config: &ConfigFile) -> PathBuf {
     config
         .packages
         .temp_dir
@@ -108,12 +109,42 @@ fn require_library_url(cli_url: Option<String>, config: &ConfigFile) -> Result<S
         })
 }
 
-/// Run a packages subcommand.
+/// Whether `xearthlayer packages` with no subcommand opens the package
+/// manager: only with a terminal to draw in and keys to read.
+fn open_tui(stdin_tty: bool, stdout_tty: bool) -> bool {
+    stdin_tty && stdout_tty
+}
+
+/// Open the package manager, and print what it did once it exits.
+pub fn open_manager() -> Result<(), CliError> {
+    let summary = crate::ui::packages::runner::run_manager(&load_config())?;
+    println!("{summary}");
+    Ok(())
+}
+
+/// Run a packages subcommand, or with none, open the package manager.
 ///
 /// This is the main entry point for packages commands. It creates the
 /// production context with real implementations and dispatches to the
-/// appropriate handler.
-pub fn run(command: PackagesCommands) -> Result<(), CliError> {
+/// appropriate handler. With no subcommand and no terminal, it prints the
+/// `packages` help, as before the package manager existed.
+pub fn run(command: Option<PackagesCommands>) -> Result<(), CliError> {
+    let Some(command) = command else {
+        if open_tui(
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+        ) {
+            return open_manager();
+        }
+        let mut cli = crate::Cli::command();
+        if let Some(packages) = cli.find_subcommand_mut("packages") {
+            packages
+                .print_long_help()
+                .map_err(|e| CliError::Packages(format!("could not print help: {e}")))?;
+        }
+        return Ok(());
+    };
+
     // Load config once for all commands
     let config = load_config();
 
@@ -241,5 +272,18 @@ pub fn run(command: PackagesCommands) -> Result<(), CliError> {
     match watch.received() {
         Some(signal) => Err(CliError::Interrupted(signal)),
         None => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_tui;
+
+    #[test]
+    fn the_manager_opens_only_when_stdin_and_stdout_are_terminals() {
+        assert!(open_tui(true, true));
+        assert!(!open_tui(true, false), "output piped");
+        assert!(!open_tui(false, true), "input piped");
+        assert!(!open_tui(false, false));
     }
 }

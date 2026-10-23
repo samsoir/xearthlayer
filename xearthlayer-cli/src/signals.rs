@@ -187,6 +187,25 @@ pub struct SignalWatch {
 
 impl SignalWatch {
     pub fn start(active: ActiveQueue, notice: impl Fn(&str) + Send + 'static) -> io::Result<Self> {
+        Self::spawn(active, notice, true)
+    }
+
+    /// Like [`start`](Self::start), except that a signal with no queue
+    /// running is only recorded, never given its default action. For a
+    /// caller that must restore the terminal before it exits, and so reads
+    /// [`received`](Self::received) and leaves on its own.
+    pub fn start_handling_all(
+        active: ActiveQueue,
+        notice: impl Fn(&str) + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::spawn(active, notice, false)
+    }
+
+    fn spawn(
+        active: ActiveQueue,
+        notice: impl Fn(&str) + Send + 'static,
+        default_when_idle: bool,
+    ) -> io::Result<Self> {
         // First, so the flag is set before the watch thread hears of SIGHUP.
         let hangup_flag = signal_hook::flag::register(SIGHUP, Arc::clone(terminal_gone_flag()))?;
         let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
@@ -204,7 +223,9 @@ impl SignalWatch {
                     lock(&first).get_or_insert(signal);
                     let Some((action, queue)) = active.request(action(signal, interrupts)) else {
                         // Nothing to protect: behave as if no handler existed.
-                        let _ = signal_hook::low_level::emulate_default_handler(raw);
+                        if default_when_idle {
+                            let _ = signal_hook::low_level::emulate_default_handler(raw);
+                        }
                         continue;
                     };
                     if signal == Signal::Interrupt {
@@ -397,5 +418,12 @@ mod tests {
             Some(Signal::Interrupt),
             "the first signal decides the exit code"
         );
+        drop(watch);
+
+        // With no queue, a watch handling every signal only records it:
+        // the default action would end the test binary here.
+        let watch = SignalWatch::start_handling_all(ActiveQueue::default(), |_| {}).unwrap();
+        signal_hook::low_level::raise(signal_hook::consts::SIGTERM).unwrap();
+        eventually(|| watch.received() == Some(Signal::Terminate));
     }
 }

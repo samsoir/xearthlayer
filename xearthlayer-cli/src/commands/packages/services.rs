@@ -132,22 +132,20 @@ impl PackageManagerService for DefaultPackageManagerService {
         self.client.fetch_metadata(url)
     }
 
-    fn check_updates(
+    fn try_check_updates(
         &self,
         store: &LocalPackageStore,
         library: &PackageLibrary,
-    ) -> Vec<(PackageInfo, PackageStatus)> {
+    ) -> ManagerResult<Vec<(PackageInfo, PackageStatus)>> {
         let checker = UpdateChecker::new(store, &self.client);
-        match checker.list_all(library) {
-            Ok(infos) => infos
-                .into_iter()
-                .map(|info| {
-                    let status = info.status.clone();
-                    (info, status)
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        Ok(checker
+            .list_all(library)?
+            .into_iter()
+            .map(|info| {
+                let status = info.status.clone();
+                (info, status)
+            })
+            .collect())
     }
 
     fn install_packages(

@@ -9,7 +9,7 @@ use std::path::Path;
 use semver::Version;
 use xearthlayer::manager::{
     create_consolidated_overlay, create_consolidated_overlay_except, remove_overlay_symlink,
-    LocalPackageStore, PackageStatus,
+    LocalPackageStore, ManagerResult, PackageStatus,
 };
 use xearthlayer::xworld_pro::{detect, overlay_plan, OverlayCoverage, OverlayPlan};
 use xearthlayer_package::{LibraryEntry, PackageLibrary, PackageType};
@@ -39,14 +39,15 @@ pub struct LibraryRow {
 }
 
 /// Every package the library offers, in library order, with its status.
-#[allow(dead_code)] // called by the package manager TUI
+/// Fails when the update check does, rather than showing every package as
+/// not installed.
 pub fn library_status(
     manager: &dyn PackageManagerService,
     store: &LocalPackageStore,
     library: &PackageLibrary,
-) -> Vec<LibraryRow> {
-    let statuses = manager.check_updates(store, library);
-    library
+) -> ManagerResult<Vec<LibraryRow>> {
+    let statuses = manager.try_check_updates(store, library)?;
+    Ok(library
         .entries
         .iter()
         .map(|entry| {
@@ -72,7 +73,7 @@ pub fn library_status(
                 },
             }
         })
-        .collect()
+        .collect())
 }
 
 // ============================================================================
@@ -283,7 +284,7 @@ mod tests {
         let library = manager.fetch_library("").unwrap();
         let store = manager.create_store(&install_dir());
 
-        let rows = library_status(&manager, &store, &library);
+        let rows = library_status(&manager, &store, &library).unwrap();
 
         let states: Vec<(&str, &LibraryStatus)> = rows
             .iter()
@@ -320,10 +321,37 @@ mod tests {
         let library = manager.fetch_library("").unwrap();
         let store = manager.create_store(&install_dir());
 
-        let rows = library_status(&manager, &store, &library);
+        let rows = library_status(&manager, &store, &library).unwrap();
 
         assert_eq!(rows[0].status, LibraryStatus::UpToDate);
         assert_eq!(rows[1].status, LibraryStatus::NotInstalled);
+    }
+
+    #[test]
+    fn library_status_fails_when_the_update_check_does() {
+        // Shown as everything "not installed" otherwise, which is not true.
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["EU-WEST"])
+            .with_failing_update_check();
+        let library = manager.fetch_library("").unwrap();
+        let store = manager.create_store(&install_dir());
+
+        let result = library_status(&manager, &store, &library);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_updates_still_gives_nothing_when_the_check_fails() {
+        // The CLI's behaviour, kept on top of try_check_updates.
+        let manager = FakeManager::default()
+            .with_status(PackageType::Ortho, "EU-WEST", PackageStatus::UpToDate)
+            .with_failing_update_check();
+        let library = manager.fetch_library("").unwrap();
+        let store = manager.create_store(&install_dir());
+
+        assert!(manager.check_updates(&store, &library).is_empty());
+        assert!(manager.try_check_updates(&store, &library).is_err());
     }
 
     // ------------------------------------------------------------------------

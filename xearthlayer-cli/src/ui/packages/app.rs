@@ -55,7 +55,6 @@ impl Tab {
 
 /// One installed package.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // wired by the runner in Task 5
 pub struct LocalRow {
     pub region: String,
     pub package_type: PackageType,
@@ -75,7 +74,6 @@ impl LocalRow {
 
 /// What the Library tab has to show.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // wired by the runner in Task 5
 pub enum LibraryState {
     Loading,
     Loaded(Vec<LibraryRow>),
@@ -133,7 +131,6 @@ pub enum JobLook {
 
 /// One job on the Progress tab.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // wired by the runner in Task 5
 pub struct JobRow {
     pub id: JobId,
     /// "NA-CANADA ortho v2.1.0", as the console shows it.
@@ -167,7 +164,6 @@ pub enum Modal {
 
 /// What the runner tells the state.
 #[derive(Debug)]
-#[allow(dead_code)] // wired by the runner in Task 5
 pub enum Msg {
     Installed(Result<Vec<LocalRow>, String>),
     Library(Result<Vec<LibraryRow>, String>),
@@ -192,11 +188,13 @@ pub enum Msg {
     QueueRefused(String),
     Job(JobId, JobMsg),
     Status(String),
+    /// Time passed. Sent about once a second so an expired quit prompt
+    /// clears without a key press.
+    Tick,
 }
 
 /// A job's progress, as an owned copy of the queue's event.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // wired by the runner in Task 5
 pub enum JobMsg {
     Preparing,
     Waiting {
@@ -247,7 +245,6 @@ pub enum Action {
 
 /// Everything `update` reacts to.
 #[derive(Debug)]
-#[allow(dead_code)] // wired by the runner in Task 5
 pub enum Input {
     Action(Action),
     Msg(Msg),
@@ -335,7 +332,6 @@ pub struct AppState {
 
 impl AppState {
     /// A state with nothing loaded, and the effects that load it.
-    #[allow(dead_code)] // wired by the runner in Task 5
     pub fn new(auto_install_overlays: bool) -> (Self, Vec<Effect>) {
         let state = Self {
             tab: Tab::Local,
@@ -363,7 +359,6 @@ impl AppState {
     }
 
     /// Apply one input, returning the work it calls for.
-    #[allow(dead_code)] // wired by the runner in Task 5
     pub fn update(&mut self, input: Input, now: Instant) -> Vec<Effect> {
         if let Some(Modal::ConfirmQuit { since, .. }) = self.modal {
             if now.saturating_duration_since(since) > QUIT_CONFIRM_TIMEOUT {
@@ -386,7 +381,6 @@ impl AppState {
     }
 
     /// One line on what the session did, printed after exit.
-    #[allow(dead_code)] // wired by the runner in Task 5
     pub fn summary(&self) -> String {
         let unfinished = self.unfinished();
         let parts: Vec<String> = [
@@ -947,6 +941,8 @@ impl AppState {
             }
             Msg::Job(id, job_msg) => return self.on_job(id, job_msg),
             Msg::Status(text) => self.status = Some(text),
+            // `update` already expired the quit prompt.
+            Msg::Tick => {}
         }
         Vec::new()
     }
@@ -2768,6 +2764,23 @@ mod tests {
         let later = start + QUIT_CONFIRM_TIMEOUT + Duration::from_millis(1);
 
         let effects = state.update(Input::Action(Action::Dismiss), later);
+
+        assert!(effects.is_empty());
+        assert!(state.modal.is_none());
+    }
+
+    #[test]
+    fn a_tick_clears_an_expired_quit_prompt_and_nothing_else() {
+        let mut state = loaded();
+        let start = Instant::now();
+        state.update(Input::Action(Action::Quit), start);
+
+        let early = state.update(Input::Msg(Msg::Tick), start);
+        assert!(early.is_empty());
+        assert!(matches!(state.modal, Some(Modal::ConfirmQuit { .. })));
+
+        let later = start + QUIT_CONFIRM_TIMEOUT + Duration::from_millis(1);
+        let effects = state.update(Input::Msg(Msg::Tick), later);
 
         assert!(effects.is_empty());
         assert!(state.modal.is_none());

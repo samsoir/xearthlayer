@@ -10,7 +10,6 @@ use super::app::{Action, Modal, Tab};
 /// Esc dismisses, `q` confirms the quit prompt, and help closes on `?` or Esc.
 /// With no modal, Esc gives `Dismiss`, which asks to quit but never abandons
 /// a cancelling quit the way `q` does. Ctrl+C always quits.
-#[allow(dead_code)] // wired by the runner in Task 5
 pub fn action_for(key: KeyEvent, tab: Tab, modal: Option<&Modal>) -> Option<Action> {
     if key.kind != KeyEventKind::Press {
         return None;

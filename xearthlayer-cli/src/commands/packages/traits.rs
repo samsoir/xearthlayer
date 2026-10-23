@@ -85,12 +85,22 @@ pub trait PackageManagerService: Send + Sync {
     /// Fetch package metadata from a URL.
     fn fetch_metadata(&self, url: &str) -> ManagerResult<PackageMetadata>;
 
-    /// Check for package updates.
+    /// Check every installed and library package against the library.
+    fn try_check_updates(
+        &self,
+        store: &LocalPackageStore,
+        library: &PackageLibrary,
+    ) -> ManagerResult<Vec<(PackageInfo, PackageStatus)>>;
+
+    /// Check for package updates. A failed check gives no packages, which
+    /// the CLI reports as nothing to update.
     fn check_updates(
         &self,
         store: &LocalPackageStore,
         library: &PackageLibrary,
-    ) -> Vec<(PackageInfo, PackageStatus)>;
+    ) -> Vec<(PackageInfo, PackageStatus)> {
+        self.try_check_updates(store, library).unwrap_or_default()
+    }
 
     /// Install a batch of packages, each installing while the next one
     /// downloads. Returns one result per package, in order.
