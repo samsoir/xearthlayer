@@ -33,6 +33,9 @@ pub enum CliError {
     NeedsSetup,
     /// A package operation was stopped by a signal
     Interrupted(crate::signals::Signal),
+    /// `run` was stopped by a signal and shut down cleanly (#314): the exit
+    /// code names the signal, and there is nothing more to say
+    Stopped(crate::signals::Signal),
 }
 
 impl CliError {
@@ -49,6 +52,9 @@ impl CliError {
             if !crate::signals::terminal_gone() {
                 eprintln!("Interrupted ({signal}). Anything unfinished was cancelled.");
             }
+            return signal.exit_code();
+        }
+        if let CliError::Stopped(signal) = self {
             return signal.exit_code();
         }
 
@@ -146,6 +152,7 @@ impl fmt::Display for CliError {
             CliError::SceneryIndex(msg) => write!(f, "Scenery index error: {}", msg),
             CliError::NeedsSetup => write!(f, "XEarthLayer needs initial setup"),
             CliError::Interrupted(signal) => write!(f, "interrupted by {signal}"),
+            CliError::Stopped(signal) => write!(f, "stopped by {signal}"),
         }
     }
 }

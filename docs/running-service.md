@@ -214,6 +214,8 @@ Press `Ctrl+C` to stop the service cleanly:
 Shutting down...
 ```
 
+SIGTERM (a system shutdown, `kill`, or a service manager stopping XEarthLayer) and SIGHUP (closing the terminal) stop it the same way: the mount comes down and the caches are flushed. The exit status names the signal, as a shell does: 130 for Ctrl+C, 143 for SIGTERM, 129 for SIGHUP. Pressing `q` on the dashboard exits 0.
+
 **Important:** Always stop the service properly before:
 - Shutting down your computer
 - Running X-Plane maintenance
@@ -375,6 +377,8 @@ After=network.target
 Type=simple
 ExecStart=/path/to/xearthlayer run
 Restart=on-failure
+# `systemctl stop` sends SIGTERM, and XEarthLayer exits 143 after unmounting.
+SuccessExitStatus=143
 
 [Install]
 WantedBy=default.target

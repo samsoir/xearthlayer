@@ -1,6 +1,6 @@
 //! Run command - mount all installed ortho packages.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use xearthlayer::config::{format_size, ControlPlaneSettings, TextureConfig};
@@ -14,6 +14,7 @@ use xearthlayer_package::PackageType;
 
 use super::common::{resolve_dds_format, resolve_provider, DdsCompression, ProviderType};
 use crate::error::CliError;
+use crate::signals::{terminal_gone, Signal, SignalWatch};
 use crate::tui_app::{run_headless, run_tui, TuiAppConfig};
 use crate::ui;
 use xearthlayer::preflight::BootstrapContext;
@@ -246,17 +247,15 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
         println!();
     }
 
-    // Set up signal handler for graceful shutdown
+    // Signals stop the run cleanly (#314): SIGINT as before, and SIGTERM (a
+    // system shutdown, `kill`, a service manager) and SIGHUP (the terminal
+    // closed), which used to kill the process with the mount still up. Each
+    // raises the flag the dashboard and the headless loop poll.
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
+    let watch = SignalWatch::start_for_shutdown(Arc::clone(&shutdown))
+        .map_err(|e| CliError::Config(format!("Failed to set signal handler: {}", e)))?;
 
-    ctrlc::set_handler(move || {
-        shutdown_clone.store(true, Ordering::SeqCst);
-    })
-    .map_err(|e| CliError::Config(format!("Failed to set signal handler: {}", e)))?;
-
-    // Track which cancellation token to use for cleanup
-    let cleanup_cancellation = if use_tui {
+    let front_end = if use_tui {
         // TUI path: Start dashboard in Loading state, mount with progress, then start prefetcher
         // This provides immediate visual feedback during the potentially long index build
         let tui_config = TuiAppConfig {
@@ -280,15 +279,27 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
                 ctx.xworld_pro(),
             ),
         };
-        run_tui(tui_config)?
+        run_tui(tui_config)
     } else {
         // Fallback to simple text output for non-TTY
-        run_headless(&mut orchestrator, shutdown, config.general.update_check)?;
-        orchestrator.cancellation()
+        run_headless(&mut orchestrator, shutdown, config.general.update_check)
+            .map(|()| orchestrator.cancellation())
     };
 
-    // Cancel all systems for cleanup
-    cleanup_cancellation.cancel();
+    // The mount comes down whatever the front end did. A dashboard error used
+    // to return here and leave X-Plane reading a dead mount, and after SIGHUP
+    // a dashboard error is only the terminal going away.
+    let front_end_error = match front_end {
+        Ok(cancellation) => {
+            // Cancel all systems for cleanup
+            cancellation.cancel();
+            None
+        }
+        Err(error) => {
+            orchestrator.cancellation().cancel();
+            Some(error)
+        }
+    };
 
     // Get final telemetry before shutdown
     let final_snapshot = orchestrator.telemetry_snapshot();
@@ -296,13 +307,26 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
     // Graceful shutdown (unmounts FUSE, stops cache GC)
     orchestrator.shutdown();
 
-    // Print final session summary (to stdout after TUI exits)
-    ui::dashboard::print_session_summary(&final_snapshot);
+    // Print final session summary (to stdout after TUI exits), unless SIGHUP
+    // took the terminal: a write to it would fail, and `println!` panics.
+    if !terminal_gone() {
+        ui::dashboard::print_session_summary(&final_snapshot);
 
-    println!();
-    println!("All packages unmounted. Goodbye!");
+        println!();
+        println!("All packages unmounted. Goodbye!");
+    }
 
-    Ok(())
+    outcome(watch.received(), front_end_error)
+}
+
+/// How the run ended: a signal names the exit code (130, 143 or 129), a
+/// front-end error with no signal behind it is reported, and `q` is success.
+fn outcome(received: Option<Signal>, front_end_error: Option<CliError>) -> Result<(), CliError> {
+    match (received, front_end_error) {
+        (Some(signal), _) => Err(CliError::Stopped(signal)),
+        (None, Some(error)) => Err(error),
+        (None, None) => Ok(()),
+    }
 }
 
 /// Resolve the per-chunk HTTP timeout from the `--timeout` flag and config.
@@ -329,5 +353,34 @@ mod tests {
     #[test]
     fn chunk_timeout_flag_overrides_the_configured_value() {
         assert_eq!(resolve_chunk_timeout_secs(Some(90), 45), 90);
+    }
+
+    #[test]
+    fn a_signal_decides_the_exit_code_even_when_the_front_end_failed() {
+        // After SIGHUP the dashboard fails on the dead terminal; the signal
+        // is the cause, so 129, not a dashboard error.
+        let gone = Some(CliError::Config("Dashboard draw error".into()));
+        assert!(matches!(
+            outcome(Some(Signal::Hangup), gone),
+            Err(CliError::Stopped(Signal::Hangup))
+        ));
+        assert_eq!(
+            outcome(Some(Signal::Terminate), None).unwrap_err().report(),
+            143
+        );
+    }
+
+    #[test]
+    fn a_front_end_error_with_no_signal_is_reported() {
+        let error = Some(CliError::Config("Dashboard draw error".into()));
+        assert!(matches!(
+            outcome(None, error),
+            Err(CliError::Config(message)) if message == "Dashboard draw error"
+        ));
+    }
+
+    #[test]
+    fn quitting_with_q_is_a_plain_success() {
+        assert!(outcome(None, None).is_ok());
     }
 }

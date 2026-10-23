@@ -292,6 +292,11 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
                 }
             }
             Ok(None) => {}
+            Err(e) if crate::signals::terminal_gone() => {
+                // SIGHUP: the terminal is gone, so its errors are expected.
+                tracing::info!(error = %e, "Terminal gone, leaving the dashboard");
+                break;
+            }
             Err(e) => return Err(CliError::Config(format!("Dashboard error: {}", e))),
         }
 
@@ -356,6 +361,10 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
             let snapshot = orchestrator.telemetry_snapshot();
             match dashboard.draw(&snapshot) {
                 Ok(()) => {}
+                Err(e) if crate::signals::terminal_gone() => {
+                    tracing::info!(error = %e, "Terminal gone, leaving the dashboard");
+                    break;
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "Dashboard draw error");
                     return Err(CliError::Config(format!("Dashboard draw error: {}", e)));
@@ -487,8 +496,9 @@ pub fn run_headless(
     while !shutdown.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(100));
 
-        // Display telemetry every 30 seconds
-        if last_telemetry.elapsed() >= telemetry_interval {
+        // Display telemetry every 30 seconds, unless SIGHUP took the
+        // terminal during the sleep: `println!` panics on the dead pipe.
+        if last_telemetry.elapsed() >= telemetry_interval && !crate::signals::terminal_gone() {
             let snapshot = orchestrator.telemetry_snapshot();
             ui::dashboard::print_simple_status(&snapshot);
             last_telemetry = Instant::now();

@@ -10,8 +10,21 @@
 //!
 //! With no queue running there is nothing to protect, and the signal gets
 //! its default action, exactly as before this module existed.
+//!
+//! `xearthlayer run` hears the same three signals (#314): each one raises
+//! its shutdown flag, so the mount comes down cleanly on a system shutdown
+//! or a closed terminal as it does on Ctrl+C, and the first decides the exit
+//! code.
+//!
+//! SIGHUP also points stdout and stderr at `/dev/null`. A write to the dead
+//! terminal fails with EIO, and `println!` panics on that; so does code we
+//! do not own, such as ratatui's `Terminal` drop, which prints "Failed to
+//! show the cursor" when the escape sequence cannot be written. With the
+//! descriptors redirected, nothing in the process can panic on the way out.
 
+use std::fs::OpenOptions;
 use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
@@ -31,6 +44,29 @@ fn terminal_gone_flag() -> &'static Arc<AtomicBool> {
 /// Whether SIGHUP said the terminal is gone.
 pub fn terminal_gone() -> bool {
     terminal_gone_flag().load(Ordering::SeqCst)
+}
+
+/// Point every descriptor in `fds` at `/dev/null`, so a write to it succeeds
+/// and goes nowhere.
+fn redirect_to_null(fds: &[RawFd]) -> io::Result<()> {
+    let null = OpenOptions::new().write(true).open("/dev/null")?;
+    for &fd in fds {
+        // SAFETY: both descriptors are open and owned by this process. dup2
+        // replaces `fd` atomically and leaves `null` open until it drops.
+        if unsafe { libc::dup2(null.as_raw_fd(), fd) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// The terminal is gone: stop every write to it from failing.
+fn detach_terminal() {
+    // The test harness reports on this process's stdout.
+    if cfg!(test) {
+        return;
+    }
+    let _ = redirect_to_null(&[libc::STDOUT_FILENO, libc::STDERR_FILENO]);
 }
 
 /// A poisoned lock still holds a usable value, and these locks guard plain
@@ -189,7 +225,14 @@ pub struct SignalWatch {
 
 impl SignalWatch {
     pub fn start(active: ActiveQueue, notice: impl Fn(&str) + Send + 'static) -> io::Result<Self> {
-        Self::spawn(active, notice, true)
+        Self::spawn(active, notice, true, None)
+    }
+
+    /// For `run`: every signal sets `shutdown`, which its front end polls,
+    /// and is recorded for the exit code. No queue, no default action: the
+    /// caller unmounts and leaves on its own.
+    pub fn start_for_shutdown(shutdown: Arc<AtomicBool>) -> io::Result<Self> {
+        Self::spawn(ActiveQueue::default(), |_| {}, false, Some(shutdown))
     }
 
     /// Like [`start`](Self::start), except that a signal with no queue
@@ -200,13 +243,14 @@ impl SignalWatch {
         active: ActiveQueue,
         notice: impl Fn(&str) + Send + 'static,
     ) -> io::Result<Self> {
-        Self::spawn(active, notice, false)
+        Self::spawn(active, notice, false, None)
     }
 
     fn spawn(
         active: ActiveQueue,
         notice: impl Fn(&str) + Send + 'static,
         default_when_idle: bool,
+        shutdown: Option<Arc<AtomicBool>>,
     ) -> io::Result<Self> {
         // First, so the flag is set before the watch thread hears of SIGHUP.
         let hangup_flag = signal_hook::flag::register(SIGHUP, Arc::clone(terminal_gone_flag()))?;
@@ -224,6 +268,12 @@ impl SignalWatch {
                     let Some(signal) = Signal::from_raw(raw) else {
                         continue;
                     };
+                    if signal == Signal::Hangup {
+                        detach_terminal();
+                    }
+                    if let Some(flag) = &shutdown {
+                        flag.store(true, Ordering::SeqCst);
+                    }
                     lock(&first).get_or_insert(signal);
                     {
                         let mut last = lock(&last);
@@ -399,6 +449,21 @@ mod tests {
         assert!(active.stop_requested());
     }
 
+    #[test]
+    fn a_redirected_descriptor_swallows_what_is_written_to_it() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"before\n").unwrap();
+
+        redirect_to_null(&[file.as_raw_fd()]).unwrap();
+        file.write_all(b"after\n").unwrap();
+        file.flush().unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before\n");
+    }
+
     fn eventually(condition: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !condition() {
@@ -450,5 +515,21 @@ mod tests {
         signal_hook::low_level::raise(signal_hook::consts::SIGTERM).unwrap();
         eventually(|| watch.received() == Some(Signal::Terminate));
         assert_eq!(watch.latest(), Some((1, Signal::Terminate)));
+        drop(watch);
+
+        // `run`'s watch (#314): the signal raises the shutdown flag its front
+        // end polls, is recorded for the exit code, and nothing else happens.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let watch = SignalWatch::start_for_shutdown(Arc::clone(&shutdown)).unwrap();
+        signal_hook::low_level::raise(signal_hook::consts::SIGTERM).unwrap();
+        eventually(|| shutdown.load(Ordering::SeqCst));
+        assert_eq!(watch.received(), Some(Signal::Terminate));
+        signal_hook::low_level::raise(signal_hook::consts::SIGINT).unwrap();
+        eventually(|| watch.latest() == Some((2, Signal::Interrupt)));
+        assert_eq!(
+            watch.received(),
+            Some(Signal::Terminate),
+            "the first signal still decides the exit code"
+        );
     }
 }
