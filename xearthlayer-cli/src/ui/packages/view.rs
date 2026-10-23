@@ -53,11 +53,11 @@ pub fn draw(frame: &mut Frame, state: &AppState, now: Instant) {
     match state.tab() {
         Tab::Local => {
             let (list, details) = chrome::split_body(body, 60);
-            local::draw(frame, list, details, state);
+            local::draw(frame, list, details, state, now);
         }
         Tab::Library => {
             let (list, details) = chrome::split_body(body, 60);
-            library::draw(frame, list, details, state);
+            library::draw(frame, list, details, state, now);
         }
         Tab::Progress => {
             let (list, details) = chrome::split_body(body, 60);
@@ -395,7 +395,8 @@ mod tests {
 
     #[test]
     fn an_empty_local_list_says_so_without_failing() {
-        let (state, _) = AppState::new(true);
+        let (mut state, _) = AppState::new(true);
+        msg(&mut state, Msg::Installed(Ok(Vec::new())));
         let text = buffer_text(&render(&state, 100, 30));
         assert!(text.contains("Nothing installed"), "{text}");
     }
@@ -979,5 +980,181 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("? or Esc closes"), "{text}");
+    }
+
+    // ------------------------------------------------------------------------
+    // Reads in progress, marks and the continent
+    // ------------------------------------------------------------------------
+
+    /// The lines of the details pane, from its title down, as a 100x30
+    /// render draws them.
+    fn detail_rows(state: &AppState) -> Vec<String> {
+        let text = buffer_text(&render(state, 100, 30));
+        let start = 60;
+        text.lines()
+            .skip_while(|line| !line.contains("Details"))
+            .map(|line| line.chars().skip(start).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn details_name_the_continent_before_the_type() {
+        let mut state = loaded();
+        go(&mut state, Tab::Library); // AF-NORTH ortho
+        let rows = detail_rows(&state);
+        assert!(rows[1].contains("AF-NORTH"), "{rows:#?}");
+        assert!(rows[3].contains("Continent: Africa"), "{rows:#?}");
+        assert!(rows[4].contains("Type: ortho"), "{rows:#?}");
+
+        go(&mut state, Tab::Local); // EU-WEST ortho
+        let rows = detail_rows(&state);
+        assert!(rows[3].contains("Continent: Europe"), "{rows:#?}");
+        assert!(rows[4].contains("Type: ortho"), "{rows:#?}");
+    }
+
+    #[test]
+    fn details_of_an_unknown_prefix_name_no_continent() {
+        let (mut state, _) = AppState::new(true);
+        msg(
+            &mut state,
+            Msg::Installed(Ok(vec![local("XX-NOWHERE", Ortho, 1024, None)])),
+        );
+        let rows = detail_rows(&state);
+        assert!(rows[1].contains("XX-NOWHERE"), "{rows:#?}");
+        assert!(rows[3].contains("Type: ortho"), "{rows:#?}");
+        assert!(!rows.concat().contains("Continent"), "{rows:#?}");
+    }
+
+    /// The non-blank cells of the list pane's row that contains `needle`.
+    fn row_cells(buffer: &Buffer, needle: &str) -> Vec<(Color, Color)> {
+        for y in 0..buffer.area.height {
+            let line: String = (1..60).map(|x| buffer[(x, y)].symbol()).collect();
+            if line.contains(needle) {
+                return (1..59)
+                    .map(|x| &buffer[(x, y)])
+                    .filter(|cell| cell.symbol() != " ")
+                    .map(|cell| (cell.fg, cell.bg))
+                    .collect();
+            }
+        }
+        panic!("{needle:?} not on screen:\n{}", buffer_text(buffer));
+    }
+
+    #[test]
+    fn a_marked_row_is_cyan_and_keeps_the_cursor_background() {
+        let mut state = loaded();
+        act(&mut state, Action::Mark); // EU-WEST, under the cursor
+        let buffer = render(&state, 100, 30);
+        let marked = row_cells(&buffer, "EU-WEST");
+        assert!(
+            marked
+                .iter()
+                .all(|&(fg, bg)| fg == Color::Cyan && bg == Color::DarkGray),
+            "{marked:?}"
+        );
+        let unmarked = row_cells(&buffer, "NA-EAST");
+        assert!(
+            unmarked.iter().all(|&(fg, _)| fg != Color::Cyan),
+            "{unmarked:?}"
+        );
+
+        // Marked away from the cursor: cyan alone.
+        act(&mut state, Action::Down);
+        let buffer = render(&state, 100, 30);
+        let marked = row_cells(&buffer, "EU-WEST");
+        assert!(
+            marked
+                .iter()
+                .all(|&(fg, bg)| fg == Color::Cyan && bg != Color::DarkGray),
+            "{marked:?}"
+        );
+    }
+
+    #[test]
+    fn a_marked_library_row_is_cyan_status_included() {
+        let mut state = loaded();
+        go(&mut state, Tab::Library);
+        act(&mut state, Action::Down);
+        act(&mut state, Action::Down); // EU-WEST ortho, an update
+        act(&mut state, Action::Mark);
+        act(&mut state, Action::Down);
+        let buffer = render(&state, 100, 30);
+        let marked = row_cells(&buffer, "update 2.1.0");
+        assert!(
+            marked.iter().all(|&(fg, _)| fg == Color::Cyan),
+            "{marked:?}"
+        );
+        // EU-WEST overlay, under the cursor: its status keeps its green.
+        let unmarked = row_cells(&buffer, "installed");
+        assert!(
+            unmarked.iter().all(|&(fg, _)| fg != Color::Cyan),
+            "{unmarked:?}"
+        );
+        assert_eq!(fg_of(&buffer, "installed"), Color::Green);
+    }
+
+    #[test]
+    fn the_first_load_shows_a_spinner_and_what_is_read() {
+        let (mut state, _) = AppState::new(true);
+        let start = state.started();
+        for (w, h) in [(80, 24), (60, 12)] {
+            let text = buffer_text(&render_at(&state, w, h, start));
+            assert!(
+                text.contains("⠋ Reading the installed packages…"),
+                "{w}x{h}:\n{text}"
+            );
+            assert!(!text.contains("Nothing installed"), "{w}x{h}:\n{text}");
+        }
+        let later = buffer_text(&render_at(
+            &state,
+            80,
+            24,
+            start + Duration::from_millis(350),
+        ));
+        assert!(later.contains("⠸ Reading"), "{later}");
+
+        msg(&mut state, Msg::Installed(Ok(Vec::new())));
+        let text = buffer_text(&render_at(&state, 80, 24, start));
+        assert!(!text.contains("Reading"), "{text}");
+        assert!(text.contains("Nothing installed"), "{text}");
+    }
+
+    /// The loaded state with a job just finished, so both lists reload.
+    fn reloading() -> AppState {
+        let mut state = loaded();
+        let id = queue(&mut state, 1, "NA-CANADA", Ortho);
+        job(&mut state, id, JobMsg::Installed);
+        state
+    }
+
+    #[test]
+    fn a_reload_keeps_the_list_and_spins_in_the_title() {
+        let mut state = reloading();
+        let start = state.started();
+        let text = buffer_text(&render_at(&state, 80, 24, start));
+        assert!(text.contains("Installed (2) ⠋ reading"), "{text}");
+        assert!(text.contains("EU-WEST"), "{text}");
+
+        msg(
+            &mut state,
+            Msg::Installed(Ok(vec![local("EU-WEST", Ortho, 1, None)])),
+        );
+        let text = buffer_text(&render_at(&state, 80, 24, start));
+        assert!(text.contains("Installed (1)"), "{text}");
+        assert!(!text.contains("reading"), "{text}");
+    }
+
+    #[test]
+    fn a_library_reload_while_loaded_spins_in_the_title() {
+        let mut state = reloading();
+        go(&mut state, Tab::Library);
+        let start = state.started();
+        let text = buffer_text(&render_at(&state, 80, 24, start));
+        assert!(text.contains("Library: all (5) ⠋ reading"), "{text}");
+
+        msg(&mut state, Msg::Library(Ok(fake_library())));
+        let text = buffer_text(&render_at(&state, 80, 24, start));
+        assert!(text.contains("Library: all (5)"), "{text}");
+        assert!(!text.contains("reading"), "{text}");
     }
 }

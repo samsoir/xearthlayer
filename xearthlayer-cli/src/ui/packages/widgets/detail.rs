@@ -8,6 +8,8 @@ use ratatui::{
     Frame,
 };
 
+use xearthlayer_package::continent_name;
+
 use super::chrome::pane;
 
 /// One "Name: value" line.
@@ -16,6 +18,11 @@ pub fn field(name: &str, value: impl Into<String>) -> Line<'static> {
         Span::styled(format!("{name}: "), Style::default().fg(Color::Gray)),
         Span::raw(value.into()),
     ])
+}
+
+/// "Continent: Africa", if the region code names one.
+pub fn continent(region: &str) -> Option<Line<'static>> {
+    continent_name(region).map(|name| field("Continent", name))
 }
 
 /// A bold heading line.

@@ -71,8 +71,8 @@ pub use metadata::{
 
 // Naming utilities
 pub use naming::{
-    archive_filename, archive_part_filename, package_mountpoint, update_archive_version,
-    validate_region, InvalidRegion,
+    archive_filename, archive_part_filename, continent_name, package_mountpoint,
+    update_archive_version, validate_region, InvalidRegion,
 };
 
 // Re-export semver::Version for convenience

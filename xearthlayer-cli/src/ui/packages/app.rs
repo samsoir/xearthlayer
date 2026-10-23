@@ -190,6 +190,9 @@ pub enum Msg {
     QueueRefused(String),
     Job(JobId, JobMsg),
     Status(String),
+    /// The overlay rebuild finished, with the line to show if it has one.
+    /// Every [`Effect::RebuildOverlays`] is answered by exactly one.
+    OverlaysRebuilt(Option<String>),
     /// Time passed. Sent about once a second so an expired quit prompt
     /// clears without a key press.
     Tick,
@@ -325,6 +328,9 @@ impl Tally {
     }
 }
 
+/// The status while the overlay folder is rebuilt.
+const REBUILDING: &str = "Rebuilding the overlay folder…";
+
 /// The end of the queued note, which the idle queue replaces.
 const SEE_PROGRESS: &str = "queued: see Progress";
 
@@ -342,7 +348,14 @@ fn is_queued_note(status: &str) -> bool {
 pub struct AppState {
     tab: Tab,
     local: Vec<LocalRow>,
+    /// An answer to the first read of the installed list has come.
+    local_loaded: bool,
+    /// The reads given and not yet answered. The worker shares a load with
+    /// one of its kind still waiting, and answers that pair once, so these
+    /// are flags rather than counts: any answer clears its flag.
+    reading_local: bool,
     library: LibraryState,
+    reading_library: bool,
     filter: TypeFilter,
     jobs: Vec<JobRow>,
     /// The selected row of each tab, an index into the rows it shows.
@@ -382,10 +395,13 @@ pub struct AppState {
 impl AppState {
     /// A state with nothing loaded, and the effects that load it.
     pub fn new(auto_install_overlays: bool) -> (Self, Vec<Effect>) {
-        let state = Self {
+        let mut state = Self {
             tab: Tab::Local,
             local: Vec::new(),
+            local_loaded: false,
+            reading_local: false,
             library: LibraryState::Loading,
+            reading_library: false,
             filter: TypeFilter::All,
             jobs: Vec::new(),
             selection: [0; 3],
@@ -407,7 +423,9 @@ impl AppState {
             tally_at_idle: Tally::default(),
             started: Instant::now(),
         };
-        (state, reload())
+        let effects = reload();
+        state.note_reads(&effects);
+        (state, effects)
     }
 
     /// Apply one input, returning the work it calls for.
@@ -421,9 +439,23 @@ impl AppState {
                 }
             }
         }
-        match input {
+        let effects = match input {
             Input::Action(action) => self.on_action(action, now),
             Input::Msg(msg) => self.on_msg(msg),
+        };
+        self.note_reads(&effects);
+        effects
+    }
+
+    /// Note the reads among `effects` as in flight, until their answers.
+    fn note_reads(&mut self, effects: &[Effect]) {
+        for effect in effects {
+            match effect {
+                Effect::LoadInstalled => self.reading_local = true,
+                Effect::LoadLibrary => self.reading_library = true,
+                Effect::RebuildOverlays => self.status = Some(REBUILDING.to_string()),
+                _ => {}
+            }
         }
     }
 
@@ -520,6 +552,21 @@ impl AppState {
     /// The pid of the `xearthlayer run` serving packages, if any.
     pub fn run_active(&self) -> Option<u32> {
         self.run_active
+    }
+
+    /// The installed list has been read at least once, well or not.
+    pub fn local_loaded(&self) -> bool {
+        self.local_loaded
+    }
+
+    /// A read of the installed list is in flight.
+    pub fn reading_local(&self) -> bool {
+        self.reading_local
+    }
+
+    /// A read of the library is in flight.
+    pub fn reading_library(&self) -> bool {
+        self.reading_library
     }
 
     /// When the state was made: the spinner counts its frames from here.
@@ -979,17 +1026,7 @@ impl AppState {
 
     fn on_msg(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
-            Msg::Installed(Ok(rows)) => {
-                if rows.is_empty() {
-                    self.status =
-                        Some("Nothing installed yet: press 2 for the Library".to_string());
-                }
-                self.local = rows;
-                self.clamp(Tab::Local);
-            }
-            Msg::Installed(Err(e)) => {
-                self.status = Some(format!("could not read the installed packages: {e}"));
-            }
+            Msg::Installed(result) => self.on_installed(result),
             Msg::Library(Ok(rows)) => self.set_library(LibraryState::Loaded(rows)),
             Msg::Library(Err(e)) => self.set_library(LibraryState::Failed(e)),
             Msg::LibraryNotConfigured => self.set_library(LibraryState::NotConfigured),
@@ -1004,13 +1041,39 @@ impl AppState {
             }
             Msg::Job(id, job_msg) => return self.on_job(id, job_msg),
             Msg::Status(text) => self.status = Some(text),
+            Msg::OverlaysRebuilt(Some(line)) => self.status = Some(line),
+            // Nothing to say: only the rebuilding note goes.
+            Msg::OverlaysRebuilt(None) => {
+                if self.status.as_deref() == Some(REBUILDING) {
+                    self.status = None;
+                }
+            }
             // `update` already expired the quit prompt.
             Msg::Tick => {}
         }
         Vec::new()
     }
 
+    fn on_installed(&mut self, result: Result<Vec<LocalRow>, String>) {
+        self.local_loaded = true;
+        self.reading_local = false;
+        match result {
+            Ok(rows) => {
+                if rows.is_empty() {
+                    self.status =
+                        Some("Nothing installed yet: press 2 for the Library".to_string());
+                }
+                self.local = rows;
+                self.clamp(Tab::Local);
+            }
+            Err(e) => {
+                self.status = Some(format!("could not read the installed packages: {e}"));
+            }
+        }
+    }
+
     fn set_library(&mut self, library: LibraryState) {
+        self.reading_library = false;
         self.library = library;
         self.clamp(Tab::Library);
     }
@@ -3058,5 +3121,113 @@ mod tests {
         let (state, _) = AppState::new(true);
 
         assert_eq!(state.summary(), "Package manager: no packages changed");
+    }
+
+    // ------------------------------------------------------------------------
+    // Reads in flight
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn the_first_load_is_in_flight_until_the_installed_list_answers() {
+        let (mut state, _) = AppState::new(true);
+        assert!(!state.local_loaded());
+        assert!(state.reading_local());
+
+        msg(&mut state, Msg::Installed(Ok(Vec::new())));
+
+        assert!(state.local_loaded());
+        assert!(!state.reading_local());
+    }
+
+    #[test]
+    fn a_failed_first_read_still_ends_the_first_load() {
+        let (mut state, _) = AppState::new(true);
+
+        msg(&mut state, Msg::Installed(Err("permission denied".into())));
+
+        assert!(state.local_loaded());
+        assert!(!state.reading_local());
+    }
+
+    #[test]
+    fn a_reload_keeps_the_list_and_is_in_flight_until_it_answers() {
+        let mut state = loaded();
+        assert!(!state.reading_local());
+        let ids = queue(&mut state, &[("NA", Ortho, Some("1.0.0"))]);
+
+        msg(&mut state, Msg::Job(ids[0], JobMsg::Installed));
+
+        assert!(state.reading_local());
+        assert!(state.local_loaded());
+        assert_eq!(state.local.len(), 3, "the list stays while it reloads");
+        msg(&mut state, Msg::Installed(Ok(fake_local())));
+        assert!(!state.reading_local());
+
+        act(&mut state, Action::Refresh);
+        assert!(state.reading_local());
+    }
+
+    #[test]
+    fn a_library_reload_while_loaded_is_in_flight_until_it_answers() {
+        let mut state = loaded();
+        assert!(!state.reading_library());
+        let ids = queue(&mut state, &[("NA", Ortho, Some("1.0.0"))]);
+
+        msg(&mut state, Msg::Job(ids[0], JobMsg::Installed));
+
+        assert!(state.reading_library());
+        assert!(matches!(state.library, LibraryState::Loaded(_)));
+        msg(&mut state, Msg::Library(Ok(fake_library())));
+        assert!(!state.reading_library());
+
+        for answer in [
+            Msg::Library(Err("connection refused".into())),
+            Msg::LibraryNotConfigured,
+        ] {
+            act(&mut state, Action::Refresh);
+            assert!(state.reading_library());
+            msg(&mut state, answer);
+            assert!(!state.reading_library());
+        }
+    }
+
+    /// A state whose last job installed an overlay, so the idle queue has
+    /// just asked for the overlays to be rebuilt.
+    fn rebuilding() -> AppState {
+        let mut state = loaded();
+        let ids = queue(&mut state, &[("EU", Overlay, Some("1.0.0"))]);
+        let effects = msg(&mut state, Msg::Job(ids[0], JobMsg::Installed));
+        assert!(effects.contains(&Effect::RebuildOverlays), "{effects:?}");
+        state
+    }
+
+    #[test]
+    fn the_overlay_rebuild_says_so_until_it_answers() {
+        let mut state = rebuilding();
+        assert_eq!(status(&state), "Rebuilding the overlay folder…");
+
+        msg(
+            &mut state,
+            Msg::OverlaysRebuilt(Some(
+                "Consolidated overlay updated: 2 regions, 9 files".into(),
+            )),
+        );
+
+        assert_eq!(
+            status(&state),
+            "Consolidated overlay updated: 2 regions, 9 files"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_with_nothing_to_say_clears_its_note_only() {
+        let mut state = rebuilding();
+        msg(&mut state, Msg::OverlaysRebuilt(None));
+        assert_eq!(status(&state), "");
+
+        let mut state = rebuilding();
+        msg(&mut state, Msg::Status("too late: finishing".into()));
+        msg(&mut state, Msg::OverlaysRebuilt(None));
+        assert_eq!(status(&state), "too late: finishing");
     }
 }

@@ -34,7 +34,9 @@ use crate::commands::packages::{
 use crate::error::CliError;
 use crate::signals::{terminal_gone, ActiveQueue, Signal, SignalWatch};
 
-/// How long each turn waits for a key.
+/// How long each turn waits for a key. Every turn draws, so this is also
+/// the longest gap between frames: short enough for the spinners' 100 ms
+/// frames whenever a read or a job is in flight.
 const KEY_POLL: Duration = Duration::from_millis(50);
 
 /// How often the state hears that time passed.

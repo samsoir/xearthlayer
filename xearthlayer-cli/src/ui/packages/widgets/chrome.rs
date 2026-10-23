@@ -1,16 +1,21 @@
 //! The frame around the tabs, and the helpers every list shares.
 
 use std::ops::Range;
+use std::time::Instant;
 
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 
+use crate::ui::dashboard::state::SPINNER_FRAMES;
 use crate::ui::packages::app::{AppState, Tab};
+
+/// How long each spinner frame shows.
+const SPINNER_FRAME_MILLIS: u128 = 100;
 
 /// The tabs in title-bar order, with the digit that opens each.
 const TABS: [(Tab, char, &str); 3] = [
@@ -136,6 +141,22 @@ pub fn split_body(area: Rect, list_percent: u16) -> (Rect, Rect) {
     (list, details)
 }
 
+/// The spinner frame at `now`, counted from when the state was made.
+pub fn spinner(started: Instant, now: Instant) -> char {
+    let frame = now.saturating_duration_since(started).as_millis() / SPINNER_FRAME_MILLIS;
+    SPINNER_FRAMES[frame as usize % SPINNER_FRAMES.len()]
+}
+
+/// A list's title, followed by the spinner and "reading" while its list is
+/// read again: "Installed (3) ⠋ reading".
+pub fn reading_title(title: String, reading: bool, spinner: char) -> String {
+    if reading {
+        format!("{title} {spinner} reading")
+    } else {
+        title
+    }
+}
+
 /// A bordered pane with a title.
 pub fn pane(title: impl Into<String>) -> Block<'static> {
     Block::default()
@@ -186,6 +207,20 @@ pub fn list_pane(
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// A row drawn cyan, every span of it, when it is marked. The colour is set
+/// on the spans, so the selected row's background still shows under it.
+pub fn marked_row(line: Line<'static>, marked: bool) -> Line<'static> {
+    if !marked {
+        return line;
+    }
+    let spans = line
+        .spans
+        .into_iter()
+        .map(|span| span.fg(Color::Cyan))
+        .collect::<Vec<_>>();
+    Line::from(spans)
 }
 
 /// Text centred in an area, one paragraph per `\n`, wrapped to its width.

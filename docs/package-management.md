@@ -51,7 +51,7 @@ Switch tabs with `1`, `2` and `3`, or with Tab and Shift+Tab.
 | 2 Library | Every package the library offers, with whether it is not installed, up to date, or has an update. `t` cycles the list between all packages, ortho only and overlay only. |
 | 3 Progress | The jobs of this session: queued, downloading, extracting, installing, removing, done, failed or cancelled. The tab title counts the unfinished ones. |
 
-Local and Library have a detail pane beside the list for the selected package. Queuing a job never switches tabs: the status line says how many jobs are queued, and you look at Progress when you want to.
+Local and Library have a detail pane beside the list for the selected package, which names its continent from the region code (`AF-NORTH` is Africa). Marked rows are drawn in cyan. While the installed list is first read, the Local tab shows a spinner with "Reading the installed packages…", and while either list is read again its title shows the spinner and "reading" beside the count; after the queue changes an overlay, the status line says "Rebuilding the overlay folder…" until the rebuild is done. Queuing a job never switches tabs: the status line says how many jobs are queued, and you look at Progress when you want to.
 
 ### Keys
 

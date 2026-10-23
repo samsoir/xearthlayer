@@ -512,7 +512,9 @@ impl Failure {
                     .map(|name| Err(format!("{name}: {why}")))
                     .collect(),
             ),
-            Self::Overlays => Msg::Status(format!("could not rebuild the overlays: {why}")),
+            Self::Overlays => {
+                Msg::OverlaysRebuilt(Some(format!("could not rebuild the overlays: {why}")))
+            }
         }
     }
 }
@@ -620,9 +622,10 @@ impl Reads<'_> {
                     settings.disable_overlays,
                     settings.xworld_pro,
                 );
-                if let Some(line) = report.outcome.or_else(|| report.lines.first().cloned()) {
-                    self.send(Msg::Status(line));
-                }
+                // Answered even with nothing to say: the state shows the
+                // rebuild until it is.
+                let line = report.outcome.or_else(|| report.lines.first().cloned());
+                self.send(Msg::OverlaysRebuilt(line));
             }
         }
     }
@@ -1679,7 +1682,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_overlays_reports_its_outcome_as_the_status() {
+    fn rebuild_overlays_answers_once_with_its_outcome() {
         let dir = TempDir::new().unwrap();
         let (mut effects, rx) = effects_with(
             FakeStages::in_dir(dir.path()),
@@ -1694,9 +1697,11 @@ mod tests {
 
         let msg = next(&rx);
         assert!(
-            matches!(&msg, Msg::Status(text) if text.contains("disable_overlays")),
+            matches!(&msg, Msg::OverlaysRebuilt(Some(text)) if text.contains("disable_overlays")),
             "{msg:?}"
         );
+        drop(effects);
+        assert!(rx.try_recv().is_err(), "answered once");
     }
 
     #[test]
@@ -1774,7 +1779,10 @@ mod tests {
                 if matches!(&results[..], [Err(why)] if why.starts_with("EU-WEST ortho"))),
             "{got:?}"
         );
-        assert!(matches!(&got[4], Msg::Status(_)), "{got:?}");
+        assert!(
+            matches!(&got[4], Msg::OverlaysRebuilt(Some(why)) if why.contains("not running")),
+            "{got:?}"
+        );
         // A later load is answered too, not swallowed as already pending.
         worker.load(Load::Installed);
         assert!(matches!(rx.try_recv(), Ok(Msg::Installed(Err(_)))));

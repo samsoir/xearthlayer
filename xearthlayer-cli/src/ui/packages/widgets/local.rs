@@ -1,5 +1,7 @@
 //! The Local tab: installed packages.
 
+use std::time::Instant;
+
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -8,8 +10,8 @@ use ratatui::{
 };
 use xearthlayer::config::format_size;
 
-use super::chrome::{fit, list_pane};
-use super::detail::{details_pane, field, heading};
+use super::chrome::{centered_text, fit, list_pane, marked_row, pane, reading_title, spinner};
+use super::detail::{continent, details_pane, field, heading};
 use crate::ui::packages::app::{AppState, LocalRow};
 
 /// Columns around the region: mark, type, version, size and the update mark.
@@ -19,12 +21,31 @@ const VERSION_WIDTH: usize = 9;
 /// Below this much room for the region, the version column goes.
 const MIN_REGION_WIDTH: usize = 8;
 
-pub fn draw(frame: &mut Frame, list: Rect, details: Rect, state: &AppState) {
+pub fn draw(frame: &mut Frame, list: Rect, details: Rect, state: &AppState, now: Instant) {
+    let spinner = spinner(state.started(), now);
+    // Before the first answer there is no list to show, empty or not.
+    if !state.local_loaded() {
+        let block = pane("Installed");
+        let inner = block.inner(list);
+        frame.render_widget(block, list);
+        centered_text(
+            frame,
+            inner,
+            &format!("{spinner} Reading the installed packages…"),
+            Style::default().fg(Color::Gray),
+        );
+        details_pane(frame, details, Vec::new(), "");
+        return;
+    }
     let rows = state.local_rows();
     list_pane(
         frame,
         list,
-        format!("Installed ({})", rows.len()),
+        reading_title(
+            format!("Installed ({})", rows.len()),
+            state.reading_local(),
+            spinner,
+        ),
         rows.len(),
         state.selected(),
         "Nothing installed",
@@ -42,11 +63,8 @@ pub fn draw(frame: &mut Frame, list: Rect, details: Rect, state: &AppState) {
 /// readable region drops the version (the details pane has it) so the size
 /// and the update mark always fit.
 fn row_line(state: &AppState, row: &LocalRow, width: usize) -> Line<'static> {
-    let mark = if state.is_local_marked(row) {
-        "[x] "
-    } else {
-        "[ ] "
-    };
+    let marked = state.is_local_marked(row);
+    let mark = if marked { "[x] " } else { "[ ] " };
     let compact = width < FIXED_WIDTH + MIN_REGION_WIDTH;
     let fixed = if compact {
         FIXED_WIDTH - VERSION_WIDTH
@@ -66,10 +84,11 @@ fn row_line(state: &AppState, row: &LocalRow, width: usize) -> Line<'static> {
         format_size(row.size_bytes as usize),
     );
     let update = if row.update.is_some() { " ↑" } else { "" };
-    Line::from(vec![
+    let line = Line::from(vec![
         Span::raw(text),
         Span::styled(update, Style::default().fg(Color::Yellow)),
-    ])
+    ]);
+    marked_row(line, marked)
 }
 
 fn detail_lines(row: &LocalRow) -> Vec<Line<'static>> {
@@ -77,13 +96,14 @@ fn detail_lines(row: &LocalRow) -> Vec<Line<'static>> {
         Some(update) => format!("{} ({update} available)", row.version),
         None => row.version.to_string(),
     };
-    vec![
-        heading(row.region.clone()),
-        Line::default(),
+    let mut lines = vec![heading(row.region.clone()), Line::default()];
+    lines.extend(continent(&row.region));
+    lines.extend([
         field("Type", row.package_type.to_string()),
         field("Version", version),
         field("Size", format_size(row.size_bytes as usize)),
         field("Location", row.path.display().to_string()),
         field("Published", row.published_at.format("%Y-%m-%d").to_string()),
-    ]
+    ]);
+    lines
 }

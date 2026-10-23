@@ -11,9 +11,8 @@ use ratatui::{
 use xearthlayer::config::format_size;
 use xearthlayer::manager::JobKind;
 
-use super::chrome::{fit, list_pane};
+use super::chrome::{fit, list_pane, spinner};
 use super::detail::{details_pane, field, heading};
-use crate::ui::dashboard::state::SPINNER_FRAMES;
 use crate::ui::packages::app::{AppState, JobLook, JobRow};
 
 /// Columns of a download gauge.
@@ -22,7 +21,6 @@ const GAUGE_WIDTH: usize = 10;
 const DOWNLOAD_TAIL_WIDTH: usize = GAUGE_WIDTH + 1 + 8 + 3 + 8;
 /// A label is never cut below this to make room for a longer status.
 const MIN_LABEL_WIDTH: usize = 10;
-const SPINNER_FRAME_MILLIS: u128 = 100;
 
 pub fn draw(frame: &mut Frame, list: Rect, details: Rect, state: &AppState, now: Instant) {
     let jobs = state.jobs();
@@ -47,12 +45,6 @@ pub fn draw(frame: &mut Frame, list: Rect, details: Rect, state: &AppState, now:
         .map(detail_lines)
         .unwrap_or_default();
     details_pane(frame, details, lines, "No job selected");
-}
-
-/// The spinner frame at `now`, counted from when the state was made.
-fn spinner(started: Instant, now: Instant) -> char {
-    let frame = now.saturating_duration_since(started).as_millis() / SPINNER_FRAME_MILLIS;
-    SPINNER_FRAMES[frame as usize % SPINNER_FRAMES.len()]
 }
 
 /// A gauge of `done` out of `total`: "██████░░░░".

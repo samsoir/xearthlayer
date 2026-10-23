@@ -1,5 +1,7 @@
 //! The Library tab: what the package library offers.
 
+use std::time::Instant;
+
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -7,8 +9,8 @@ use ratatui::{
     Frame,
 };
 
-use super::chrome::{centered_text, fit, list_pane};
-use super::detail::{details_pane, field, heading};
+use super::chrome::{centered_text, fit, list_pane, marked_row, reading_title, spinner};
+use super::detail::{continent, details_pane, field, heading};
 use crate::commands::packages::actions::{LibraryRow, LibraryStatus};
 use crate::ui::packages::app::{AppState, LibraryState, TypeFilter};
 
@@ -22,7 +24,7 @@ const MIN_REGION_WIDTH: usize = 12;
 /// The version column and its space, left out of a very narrow pane.
 const VERSION_WIDTH: usize = 9;
 
-pub fn draw(frame: &mut Frame, list: Rect, details: Rect, state: &AppState) {
+pub fn draw(frame: &mut Frame, list: Rect, details: Rect, state: &AppState, now: Instant) {
     match state.library() {
         LibraryState::Loaded(_) => {}
         LibraryState::Loading => {
@@ -61,7 +63,11 @@ pub fn draw(frame: &mut Frame, list: Rect, details: Rect, state: &AppState) {
     list_pane(
         frame,
         list,
-        format!("Library: {} ({})", filter_name(state.filter()), rows.len()),
+        reading_title(
+            format!("Library: {} ({})", filter_name(state.filter()), rows.len()),
+            state.reading_library(),
+            spinner(state.started(), now),
+        ),
         rows.len(),
         state.selected(),
         "No packages match the filter",
@@ -86,11 +92,8 @@ fn filter_name(filter: TypeFilter) -> &'static str {
 
 /// `[x]`/`[ ]`, region, type, version, then the status.
 fn row_line(state: &AppState, row: &LibraryRow, width: usize) -> Line<'static> {
-    let mark = if state.is_library_marked(row) {
-        "[x] "
-    } else {
-        "[ ] "
-    };
+    let marked = state.is_library_marked(row);
+    let mark = if marked { "[x] " } else { "[ ] " };
     let full = width.saturating_sub(FIXED_WIDTH + FULL_STATUS_WIDTH) >= MIN_REGION_WIDTH;
     let status_width = if full {
         FULL_STATUS_WIDTH
@@ -112,14 +115,15 @@ fn row_line(state: &AppState, row: &LibraryRow, width: usize) -> Line<'static> {
         format!("{:<8} ", row.entry.version)
     };
     let (status, color) = status_text(&row.status, &row.entry.version, full);
-    Line::from(vec![
+    let line = Line::from(vec![
         Span::raw(format!(
             "{mark}{} {:<7} {version}",
             fit(&row.entry.title, region_width),
             row.entry.package_type.to_string(),
         )),
         Span::styled(status, Style::default().fg(color)),
-    ])
+    ]);
+    marked_row(line, marked)
 }
 
 /// "installed", "update 2.1.0 → 2.2.0" (or "update ↑" when short), or blank.
@@ -140,13 +144,13 @@ fn detail_lines(state: &AppState, row: &LibraryRow) -> Vec<Line<'static>> {
         LibraryStatus::UpToDate => row.entry.version.to_string(),
         LibraryStatus::Update { installed } => installed.to_string(),
     };
-    let mut lines = vec![
-        heading(row.entry.title.clone()),
-        Line::default(),
+    let mut lines = vec![heading(row.entry.title.clone()), Line::default()];
+    lines.extend(continent(&row.entry.title));
+    lines.extend([
         field("Type", row.entry.package_type.to_string()),
         field("Library version", row.entry.version.to_string()),
         field("Installed version", installed),
-    ];
+    ]);
     if row.entry.package_type == xearthlayer_package::PackageType::Ortho {
         let follows = if state.overlay_follows(row) {
             "yes"

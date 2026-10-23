@@ -74,6 +74,23 @@ pub fn validate_region(region: &str) -> Result<(), InvalidRegion> {
     Ok(())
 }
 
+/// The continent a region code names, by the first segment of
+/// `<CONTINENT>-<TERRITORIES>`, in any case: "AF-NORTH" is Africa. A legacy
+/// single-segment code such as "eu" maps too. `None` for any other prefix.
+pub fn continent_name(region: &str) -> Option<&'static str> {
+    let head = region.split('-').next().unwrap_or("");
+    match head.to_ascii_uppercase().as_str() {
+        "AF" => Some("Africa"),
+        "AN" => Some("Antarctica"),
+        "AS" => Some("Asia"),
+        "EU" => Some("Europe"),
+        "NA" => Some("North America"),
+        "OC" => Some("Oceania"),
+        "SA" => Some("South America"),
+        _ => None,
+    }
+}
+
 /// Generate the mountpoint (folder) name for a package.
 ///
 /// This is the directory name used in X-Plane's Custom Scenery folder.
@@ -365,5 +382,36 @@ mod tests {
             validate_region("foo..bar").is_ok(),
             "a dot pair inside a name has no traversal power"
         );
+    }
+
+    // ---- continent names ----
+
+    #[test]
+    fn the_first_segment_names_the_continent() {
+        for (region, continent) in [
+            ("AF-NORTH", "Africa"),
+            ("AN-WEST", "Antarctica"),
+            ("AS-JAPAN", "Asia"),
+            ("EU-WEST", "Europe"),
+            ("NA-CANADA", "North America"),
+            ("OC-AUSTRALIA", "Oceania"),
+            ("SA-SOUTH", "South America"),
+        ] {
+            assert_eq!(continent_name(region), Some(continent), "{region}");
+        }
+    }
+
+    #[test]
+    fn a_continent_is_found_in_any_case_and_in_a_legacy_code() {
+        assert_eq!(continent_name("na-canada"), Some("North America"));
+        assert_eq!(continent_name("Eu-West"), Some("Europe"));
+        assert_eq!(continent_name("eu"), Some("Europe"));
+    }
+
+    #[test]
+    fn an_unknown_prefix_names_no_continent() {
+        for region in ["XX-NOWHERE", "", "EUR-WEST", "N-A", "-EU"] {
+            assert_eq!(continent_name(region), None, "{region:?}");
+        }
     }
 }
