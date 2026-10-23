@@ -113,6 +113,12 @@ pub trait PackageManagerService: Send + Sync {
 
     /// List all installed packages.
     fn list_packages(&self, store: &LocalPackageStore) -> ManagerResult<Vec<InstalledPackage>>;
+
+    /// The pid of another `xearthlayer run` that is serving packages, if any.
+    ///
+    /// Read from the instance lock `run` holds, so it is true for as long as
+    /// that process lives, whatever it has mounted.
+    fn running_instance(&self) -> Option<u32>;
 }
 
 // ============================================================================

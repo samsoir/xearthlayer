@@ -294,11 +294,7 @@ impl NoRunningInstance {
     /// An unreadable or unparseable lock reads as absent: a corrupt lock should
     /// be replaced, never treated as a live owner that can never be cleared.
     fn recorded_pid(&self) -> Option<u32> {
-        std::fs::read_to_string(&self.lock_path)
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
+        xearthlayer::system::process::recorded_pid(&self.lock_path)
     }
 }
 

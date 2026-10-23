@@ -11,8 +11,8 @@ use std::sync::Mutex;
 
 use semver::Version;
 use xearthlayer::manager::{
-    InstallResult, InstalledPackage, LocalPackageStore, ManagerError, ManagerResult, MountStatus,
-    PackageInfo, PackageStatus,
+    InstallResult, InstalledPackage, LocalPackageStore, ManagerError, ManagerResult, PackageInfo,
+    PackageStatus,
 };
 use xearthlayer_package::{LibraryEntry, PackageLibrary, PackageMetadata, PackageType};
 
@@ -84,6 +84,8 @@ pub struct FakeManager {
     removals: Mutex<Vec<String>>,
     /// Titles whose removal is refused, as when the queue lock is held.
     refused_removals: Vec<String>,
+    /// The pid of a running `xearthlayer run`, when there is one.
+    running: Option<u32>,
 }
 
 impl FakeManager {
@@ -101,19 +103,17 @@ impl FakeManager {
         self
     }
 
-    /// Have `titles` installed as `package_type`, none of them mounted.
+    /// Have `titles` installed as `package_type`.
     pub fn with_installed(mut self, package_type: PackageType, titles: &[&str]) -> Self {
         for title in titles {
-            self.installed
-                .push(installed(title, package_type, MountStatus::NotMounted));
+            self.installed.push(installed(title, package_type));
         }
         self
     }
 
-    /// Have `title` installed as a mounted ortho package.
-    pub fn with_mounted(mut self, title: &str) -> Self {
-        self.installed
-            .push(installed(title, PackageType::Ortho, MountStatus::Mounted));
+    /// Report another `xearthlayer run` serving packages as process `pid`.
+    pub fn with_running_instance(mut self, pid: u32) -> Self {
+        self.running = Some(pid);
         self
     }
 
@@ -246,6 +246,10 @@ impl PackageManagerService for FakeManager {
     fn list_packages(&self, _store: &LocalPackageStore) -> ManagerResult<Vec<InstalledPackage>> {
         Ok(self.installed.clone())
     }
+
+    fn running_instance(&self) -> Option<u32> {
+        self.running
+    }
 }
 
 pub fn install_dir() -> PathBuf {
@@ -269,15 +273,10 @@ fn metadata(title: &str, package_type: PackageType) -> PackageMetadata {
     }
 }
 
-fn installed(
-    title: &str,
-    package_type: PackageType,
-    mount_status: MountStatus,
-) -> InstalledPackage {
+fn installed(title: &str, package_type: PackageType) -> InstalledPackage {
     InstalledPackage {
         metadata: metadata(title, package_type),
         path: install_dir().join(title),
         size_bytes: 1024,
-        mount_status,
     }
 }

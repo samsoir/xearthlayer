@@ -67,7 +67,7 @@ pub use download::{
 pub use error::{ManagerError, ManagerResult};
 pub use extractor::TarGzExtractor;
 pub use installer::{InstallResult, InstallStage, PackageInstaller};
-pub use local::{InstalledPackage, LocalPackageStore, MountStatus};
+pub use local::{InstalledPackage, LocalPackageStore};
 pub use mounts::{ActiveMount, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder};
 pub use queue::{
     CancelResult, Canceller, Capacity, InstallContext, InstallQueue, Job, JobEvent, JobId, JobKind,

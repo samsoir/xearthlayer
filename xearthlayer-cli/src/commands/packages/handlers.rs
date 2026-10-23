@@ -8,7 +8,7 @@ use std::path::Path;
 use xearthlayer::config::format_size;
 use xearthlayer::manager::{
     create_consolidated_overlay, create_consolidated_overlay_except, remove_overlay_symlink,
-    InstallResult, InstalledPackage, LocalPackageStore, MountStatus, PackageStatus,
+    InstallResult, InstalledPackage, LocalPackageStore, PackageStatus,
 };
 use xearthlayer::xworld_pro::{detect, overlay_plan, OverlayCoverage, OverlayPlan};
 use xearthlayer_package::{LibraryEntry, PackageLibrary, PackageType};
@@ -66,15 +66,6 @@ impl CommandHandler for ListHandler {
                     "Size: {}",
                     format_size(package.size_bytes as usize)
                 ));
-
-                if package.package_type() == PackageType::Ortho {
-                    let mount_status = match package.mount_status {
-                        MountStatus::Mounted => "Mounted",
-                        MountStatus::NotMounted => "Not mounted",
-                        MountStatus::Unknown => "Unknown",
-                    };
-                    ctx.output.indented(&format!("Mount: {}", mount_status));
-                }
                 ctx.output.newline();
             } else {
                 ctx.output.println(&format!(
@@ -207,6 +198,22 @@ fn select_installed(
         |p| p.region(),
         &format!("No {package_type} packages are installed"),
     )
+}
+
+/// Why a running `xearthlayer run` blocks replacing or removing a package.
+///
+/// `run` keeps every installed package's files open through one union
+/// filesystem, so a package cannot change underneath it.
+fn running_message(pid: u32) -> String {
+    format!("XEarthLayer is running (pid {pid}): stop it before updating or removing packages")
+}
+
+/// Refuse the whole command when another `xearthlayer run` is serving packages.
+fn refuse_while_running(ctx: &CommandContext<'_>) -> Result<(), CliError> {
+    match ctx.manager.running_instance() {
+        Some(pid) => Err(CliError::Packages(running_message(pid))),
+        None => Ok(()),
+    }
 }
 
 /// Fetch each entry's metadata, then install every package whose metadata
@@ -355,6 +362,7 @@ impl InstallHandler {
         plan: &[&LibraryEntry],
         results: Vec<Result<InstallResult, CliError>>,
         args: &InstallArgs,
+        running: bool,
         ctx: &CommandContext<'_>,
     ) -> Result<(), CliError> {
         let mut failures = Vec::new();
@@ -374,6 +382,10 @@ impl InstallHandler {
                         format_size(result.bytes_downloaded as usize),
                         result.files_extracted
                     ));
+                    if running {
+                        ctx.output
+                            .indented("Note: restart xearthlayer run to use it");
+                    }
                     overlay_installed |= result.package_type == PackageType::Overlay;
                 }
                 Err(e) => failures.push((entry, e)),
@@ -461,14 +473,50 @@ impl CommandHandler for InstallHandler {
         }
 
         let plan = Self::plan(&entries, &library, args.auto_install_overlays);
-        let results = install_entries(
-            &plan,
+        let running = ctx.manager.running_instance();
+
+        // While `run` serves the packages, an install over an installed
+        // package is an update in disguise: refuse it, package by package.
+        // New packages install, and `run` picks them up on its next start.
+        let refused: Vec<bool> = match running {
+            Some(_) => {
+                let store = ctx.manager.create_store(&args.install_dir);
+                let installed = ctx
+                    .manager
+                    .list_packages(&store)
+                    .map_err(|e| CliError::Packages(e.to_string()))?;
+                plan.iter()
+                    .map(|entry| {
+                        installed.iter().any(|p| {
+                            p.region() == entry.title && p.package_type() == entry.package_type
+                        })
+                    })
+                    .collect()
+            }
+            None => vec![false; plan.len()],
+        };
+        let allowed: Vec<&LibraryEntry> = plan
+            .iter()
+            .zip(&refused)
+            .filter(|(_, refused)| !**refused)
+            .map(|(entry, _)| *entry)
+            .collect();
+        let mut installed = install_entries(
+            &allowed,
             &args.install_dir,
             &args.temp_dir,
             args.concurrent_downloads,
             ctx,
-        );
-        Self::report(&plan, results, &args, ctx)
+        )
+        .into_iter();
+        let results = refused
+            .iter()
+            .map(|&refused| match (refused, running) {
+                (true, Some(pid)) => Err(CliError::Packages(running_message(pid))),
+                _ => installed.next().expect("one result per allowed package"),
+            })
+            .collect();
+        Self::report(&plan, results, &args, running.is_some(), ctx)
     }
 }
 
@@ -483,6 +531,7 @@ impl CommandHandler for UpdateHandler {
     type Args = UpdateArgs;
 
     fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
+        refuse_while_running(ctx)?;
         ctx.output.println("Checking for updates...");
         ctx.output.newline();
 
@@ -622,6 +671,7 @@ impl CommandHandler for RemoveHandler {
     type Args = RemoveArgs;
 
     fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
+        refuse_while_running(ctx)?;
         let store = ctx.manager.create_store(&args.install_dir);
         let packages = select_installed(ctx, &store, &args.selection, args.package_type)?;
 
@@ -641,15 +691,6 @@ impl CommandHandler for RemoveHandler {
                 format_size(package.size_bytes as usize)
             ));
             ctx.output.newline();
-        }
-
-        if let Some(mounted) = packages.iter().find(|p| {
-            p.package_type() == PackageType::Ortho && p.mount_status == MountStatus::Mounted
-        }) {
-            return Err(CliError::Packages(format!(
-                "Cannot remove a mounted package ({}). Unmount it first.",
-                mounted.region()
-            )));
         }
 
         // Phase two: one confirmation for the whole set, unless --force.
@@ -757,17 +798,6 @@ impl CommandHandler for InfoHandler {
                 format_size(package.size_bytes as usize)
             ));
             ctx.output.newline();
-
-            if package.package_type() == PackageType::Ortho {
-                ctx.output.println("Mount Status:");
-                let mount_status = match package.mount_status {
-                    MountStatus::Mounted => "Mounted (FUSE filesystem active)",
-                    MountStatus::NotMounted => "Not mounted",
-                    MountStatus::Unknown => "Unknown",
-                };
-                ctx.output.indented(mount_status);
-                ctx.output.newline();
-            }
 
             ctx.output.println("Archive Parts:");
             for part in &package.metadata.parts {
@@ -962,15 +992,19 @@ mod tests {
     }
 
     #[test]
-    fn one_mounted_package_aborts_the_batch_before_anything_is_removed() {
+    fn a_running_instance_refuses_the_whole_remove_batch() {
         let manager = FakeManager::default()
-            .with_installed(PackageType::Ortho, &["NA-CANADA-WEST"])
-            .with_mounted("NA-CANADA-EAST");
+            .with_installed(PackageType::Ortho, &["NA-CANADA-WEST", "NA-CANADA-EAST"])
+            .with_running_instance(4242);
 
         let run = remove(&manager, true, "NA-CANADA", true);
 
         let message = packages_error(run.result);
-        assert!(message.contains("NA-CANADA-EAST"), "{message}");
+        assert!(message.contains("pid 4242"), "{message}");
+        assert!(
+            message.contains("stop it before updating or removing packages"),
+            "{message}"
+        );
         assert!(manager.removals().is_empty());
         assert!(run.interaction.prompts().is_empty());
     }
@@ -1056,14 +1090,14 @@ mod tests {
     }
 
     #[test]
-    fn remove_all_refuses_when_any_package_is_mounted() {
+    fn remove_all_refuses_while_run_is_serving_packages() {
         let manager = FakeManager::default()
             .with_installed(PackageType::Ortho, &["EU-WEST", "AF-SOUTH"])
-            .with_mounted("AF-SOUTH");
+            .with_running_instance(7);
 
         let run = remove_selection(&manager, true, Selection::All, true);
 
-        assert!(packages_error(run.result).contains("mounted"));
+        assert!(packages_error(run.result).contains("XEarthLayer is running (pid 7)"));
         assert!(manager.removals().is_empty());
     }
 
@@ -1490,6 +1524,96 @@ mod tests {
         let text = run.output.text();
         assert!(text.contains("Failed to update NA-CANADA-WEST"), "{text}");
         assert!(text.contains("1 succeeded, 1 failed"), "{text}");
+    }
+
+    #[test]
+    fn a_running_instance_refuses_an_update_and_installs_nothing() {
+        let manager = FakeManager::default()
+            .with_update(PackageType::Ortho, "NA-CANADA-WEST")
+            .with_running_instance(4242);
+
+        let run = update(&manager, "NA-CANADA");
+
+        let message = packages_error(run.result);
+        assert!(message.contains("pid 4242"), "{message}");
+        assert!(
+            message.contains("stop it before updating or removing packages"),
+            "{message}"
+        );
+        assert!(manager.batches().is_empty());
+    }
+
+    // ------------------------------------------------------------------------
+    // install while `xearthlayer run` is serving packages
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn a_running_instance_still_installs_packages_that_are_not_installed() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["NA-GREENLAND"])
+            .with_running_instance(4242);
+
+        let run = install(&manager, true, "NA-G", false);
+
+        run.result.unwrap();
+        assert_eq!(manager.installs(), ["NA-GREENLAND"]);
+        let text = run.output.text();
+        assert!(text.contains("restart xearthlayer run to use it"), "{text}");
+    }
+
+    #[test]
+    fn a_running_instance_refuses_a_package_that_is_already_installed() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["NA-GREENLAND"])
+            .with_installed(PackageType::Ortho, &["NA-GREENLAND"])
+            .with_running_instance(4242);
+
+        let run = install(&manager, true, "NA-G", false);
+
+        let message = packages_error(run.result);
+        assert!(
+            message.contains("XEarthLayer is running (pid 4242)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("stop it before updating or removing packages"),
+            "{message}"
+        );
+        assert!(manager.installs().is_empty());
+    }
+
+    #[test]
+    fn a_running_instance_refuses_per_package_and_the_rest_of_the_batch_continues() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["NA-CANADA-WEST", "NA-CANADA-EAST"])
+            .with_installed(PackageType::Ortho, &["NA-CANADA-WEST"])
+            .with_running_instance(4242);
+
+        let run = install(&manager, true, "NA-CANADA", false);
+
+        assert_eq!(manager.installs(), ["NA-CANADA-EAST"]);
+        let text = run.output.text();
+        assert!(text.contains("Installed NA-CANADA-EAST"), "{text}");
+        assert!(
+            text.contains("NA-CANADA-WEST (ortho): ")
+                && text.contains("XEarthLayer is running (pid 4242)"),
+            "{text}"
+        );
+        assert!(text.contains("restart xearthlayer run to use it"), "{text}");
+        assert!(packages_error(run.result).contains("1 of 2"));
+    }
+
+    #[test]
+    fn without_a_running_instance_an_installed_package_installs_again() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["NA-GREENLAND"])
+            .with_installed(PackageType::Ortho, &["NA-GREENLAND"]);
+
+        let run = install(&manager, true, "NA-G", false);
+
+        run.result.unwrap();
+        assert_eq!(manager.installs(), ["NA-GREENLAND"]);
+        assert!(!run.output.text().contains("restart xearthlayer run"));
     }
 
     // ------------------------------------------------------------------------

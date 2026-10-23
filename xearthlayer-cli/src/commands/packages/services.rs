@@ -240,6 +240,10 @@ impl PackageManagerService for DefaultPackageManagerService {
     fn list_packages(&self, store: &LocalPackageStore) -> ManagerResult<Vec<InstalledPackage>> {
         store.list()
     }
+
+    fn running_instance(&self) -> Option<u32> {
+        xearthlayer::system::process::running_instance(&xearthlayer::paths::lock_file())
+    }
 }
 
 #[cfg(test)]

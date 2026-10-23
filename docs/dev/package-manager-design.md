@@ -87,8 +87,6 @@ pub struct InstalledPackage {
     pub version: Version,
     /// Path to package directory
     pub path: PathBuf,
-    /// Whether currently mounted (ortho only)
-    pub mounted: bool,
 }
 ```
 
@@ -408,9 +406,8 @@ would rename that aside back as the package.
 
 ### Ortho Packages
 
-1. Check if mounted - unmount first if so
-2. Remove mount point directory from Custom Scenery
-3. Delete package directory from `install_location`
+1. Refuse while `xearthlayer run` is alive (the instance lock names its pid)
+2. Delete package directory from `install_location`
 
 ### Overlay Packages
 

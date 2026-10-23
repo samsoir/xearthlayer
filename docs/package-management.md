@@ -135,12 +135,10 @@ Installed Packages (2)
 EU-ALPS (ortho) v2.0.0
   Path: /home/user/X-Plane 12/Custom Scenery/zzXEL_eu-alps_ortho
   Size: 4.2 GB
-  Mount: Not mounted
 
 NA-SOCAL (ortho) v1.2.0
   Path: /home/user/X-Plane 12/Custom Scenery/zzXEL_na-socal_ortho
   Size: 8.7 GB
-  Mount: Not mounted
 ```
 
 ### Install a Package
@@ -200,9 +198,6 @@ Installation:
   Path: /home/user/X-Plane 12/Custom Scenery/zzXEL_eu-paris_ortho
   Size: 1.2 GB
 
-Mount Status:
-  Not mounted
-
 Archive Parts:
   zzXEL_eu-paris_ortho-1.0.0.tar.gz.aa (500 MB)
   zzXEL_eu-paris_ortho-1.0.0.tar.gz.ab (500 MB)
@@ -250,8 +245,7 @@ Success: Removed eu-paris (ortho)
 ```
 
 When a code selects several packages, every one of them is listed, and the
-removal is checked as a whole before anything is deleted: if any selected
-package is mounted, nothing is removed. Then a single prompt covers the set:
+removal is checked as a whole before anything is deleted. Then a single prompt covers the set:
 
 ```
 Are you sure you want to remove these 2 packages? [y/N]:
@@ -263,7 +257,7 @@ To skip the confirmation prompt:
 xearthlayer packages remove eu-paris --force
 ```
 
-`--force` skips only the prompt. A mounted package still stops the removal.
+`--force` skips only the prompt. While `xearthlayer run` is running, nothing is removed (see below).
 
 ## Package Types
 
@@ -340,6 +334,13 @@ When a command installs or updates several packages, they download one after ano
 When the temp folder and the packages folder are on the same disk, both needs add up on it.
 
 The free space is measured when a batch starts. Other programs writing to the same disks during a long batch, including XEarthLayer's own tile cache when it shares a disk, are not seen until the next batch. A package that runs out of space anyway fails cleanly: its temporary files are removed and any version of it already installed is untouched.
+
+### While XEarthLayer is running
+
+`xearthlayer run` records its process ID in the instance lock, and the package commands read it. While that process is alive:
+
+- `update` and `remove` refuse the whole batch before doing anything, with "XEarthLayer is running (pid N): stop it before updating or removing packages". `run` serves every installed package through one filesystem, so a package cannot change under it.
+- `install` refuses each package that is already installed, at any version, with the same message, because installing over it is an update. Packages that are not installed install normally and the rest of the batch continues. A new package is picked up the next time `xearthlayer run` starts, and the command says so.
 
 Only one package command runs at a time. A second one, or one started while another is running, stops with "another package operation is running".
 

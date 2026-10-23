@@ -1,4 +1,22 @@
-//! Process liveness.
+//! Process liveness and the instance lock.
+
+use std::path::Path;
+
+/// The PID recorded in an instance lock file, if it holds one.
+///
+/// An unreadable or unparseable lock reads as absent: a corrupt lock should be
+/// replaced, never treated as a live owner that can never be cleared.
+pub fn recorded_pid(lock_path: &Path) -> Option<u32> {
+    std::fs::read_to_string(lock_path).ok()?.trim().parse().ok()
+}
+
+/// The PID of another live `xearthlayer run` that holds this instance lock.
+///
+/// Our own PID is not "another instance", and a PID that is no longer alive is
+/// a stale lock.
+pub fn running_instance(lock_path: &Path) -> Option<u32> {
+    recorded_pid(lock_path).filter(|&pid| pid != std::process::id() && is_alive(pid))
+}
 
 /// Is a process with this PID currently running?
 ///
@@ -63,5 +81,61 @@ mod tests {
         assert!(is_alive(pid), "a child we have not reaped must be alive");
         child.kill().expect("kill");
         child.wait().expect("reap");
+    }
+
+    fn lock_with(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("xearthlayer.lock");
+        std::fs::write(&path, contents).expect("write lock");
+        (dir, path)
+    }
+
+    #[test]
+    fn recorded_pid_reads_a_pid_with_whitespace() {
+        let (_dir, path) = lock_with("4242\n");
+        assert_eq!(recorded_pid(&path), Some(4242));
+    }
+
+    #[test]
+    fn recorded_pid_is_none_for_a_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(recorded_pid(&dir.path().join("absent.lock")), None);
+    }
+
+    #[test]
+    fn recorded_pid_is_none_for_garbage() {
+        let (_dir, path) = lock_with("not a pid");
+        assert_eq!(recorded_pid(&path), None);
+    }
+
+    #[test]
+    fn our_own_pid_is_not_another_instance() {
+        let (_dir, path) = lock_with(&std::process::id().to_string());
+        assert_eq!(running_instance(&path), None);
+    }
+
+    #[test]
+    fn a_dead_pid_is_not_a_running_instance() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap");
+        let (_dir, path) = lock_with(&pid.to_string());
+        assert_eq!(running_instance(&path), None);
+    }
+
+    #[test]
+    fn a_live_child_is_a_running_instance() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let (_dir, path) = lock_with(&pid.to_string());
+        let found = running_instance(&path);
+        child.kill().expect("kill");
+        child.wait().expect("reap");
+        assert_eq!(found, Some(pid));
     }
 }
