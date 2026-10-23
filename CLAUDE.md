@@ -558,6 +558,7 @@ matrix jobs are renamed.
 - `tokio` - Async runtime
 - `rlimit` - File descriptor limit management (raises soft limit at startup)
 - `wgpu` - GPU compute shaders for DDS encoding
+- `intel_tex_2` - ISPC BC1/BC3 encoder with prebuilt kernels. Pinned to `samsoir/intel-tex-rs-2` `macos-platform-load-command` (0.5.0 with the Darwin kernel objects re-linked to carry `LC_BUILD_VERSION`, else Xcode's linker warns `no platform load command found` on every macOS build); revert to crates.io once upstream regenerates the kernels with ISPC >= 1.26
 - `block_compression` - BCn GPU compression via WGSL
 - `indicatif` - Progress bar rendering for package downloads
 - `sevenz-rust2` - Pure-Rust 7z writer for DSF compression (`compress` feature only)

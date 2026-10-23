@@ -202,6 +202,14 @@ unrelated PR.
 `build.rs`, no `pkg-config`, no `cc` — and `xearthlayer/build.rs` already emits `-lc++`
 on macOS. macFUSE is required only at runtime.
 
+**macOS links warning-free** only because `intel_tex_2` is pinned to a fork
+(`samsoir/intel-tex-rs-2`, branch `macos-platform-load-command`) whose prebuilt Darwin
+ISPC kernel objects were re-linked with `ld -r -platform_version` to carry
+`LC_BUILD_VERSION`. The 0.5.0 crate's kernels come from ISPC 1.20.0, which emitted no
+platform load command, and Xcode's linker has warned about that on every link since
+15.1. Upstream can regenerate with ISPC 1.26 or later (`--darwin-version-min`); when a
+release does, drop the pin.
+
 **macOS binaries are signed and notarized** on every channel. `package-macos` imports
 the Developer ID identity into a per-job keychain, runs
 `scripts/macos/sign-and-notarize.sh` on both binaries, and deletes the keychain, all
