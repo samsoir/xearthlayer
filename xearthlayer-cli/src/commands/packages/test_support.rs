@@ -354,9 +354,9 @@ fn metadata(title: &str, package_type: PackageType) -> PackageMetadata {
 }
 
 fn installed(title: &str, package_type: PackageType) -> InstalledPackage {
-    InstalledPackage {
-        metadata: metadata(title, package_type),
-        path: install_dir().join(title),
-        size_bytes: 1024,
-    }
+    InstalledPackage::with_size(
+        metadata(title, package_type),
+        install_dir().join(title),
+        1024,
+    )
 }

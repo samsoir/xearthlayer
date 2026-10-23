@@ -712,7 +712,7 @@ fn local_rows(installed: &[InstalledPackage], library: &[LibraryRow]) -> Vec<Loc
                 region: metadata.title.clone(),
                 package_type: metadata.package_type,
                 version: metadata.package_version.clone(),
-                size_bytes: package.size_bytes,
+                size_bytes: package.size_bytes(),
                 path: package.path.clone(),
                 published_at: metadata.published_at,
                 update,

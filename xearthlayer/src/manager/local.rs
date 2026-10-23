@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use semver::Version;
 
@@ -16,11 +17,41 @@ pub struct InstalledPackage {
     pub metadata: PackageMetadata,
     /// Path to the package directory.
     pub path: PathBuf,
-    /// Size of the package on disk (bytes).
-    pub size_bytes: u64,
+    /// Size on disk, measured the first time [`size_bytes`](Self::size_bytes)
+    /// is called. Listing never measures it: `run` lists every package and
+    /// shows no size, and measuring walks every file in the package (#325).
+    size: OnceLock<u64>,
 }
 
 impl InstalledPackage {
+    /// A package found at `path`, its size not yet measured.
+    pub fn new(metadata: PackageMetadata, path: PathBuf) -> Self {
+        Self {
+            metadata,
+            path,
+            size: OnceLock::new(),
+        }
+    }
+
+    /// A package whose size is already known, so it is never measured.
+    pub fn with_size(metadata: PackageMetadata, path: PathBuf, size_bytes: u64) -> Self {
+        Self {
+            metadata,
+            path,
+            size: OnceLock::from(size_bytes),
+        }
+    }
+
+    /// Size of the package on disk in bytes, 0 if it cannot be read.
+    ///
+    /// The first call walks every file in the package, which is slow on a
+    /// large one; later calls return the same answer.
+    pub fn size_bytes(&self) -> u64 {
+        *self
+            .size
+            .get_or_init(|| calculate_dir_size(&self.path).unwrap_or(0))
+    }
+
     /// Get the region code from the package title.
     pub fn region(&self) -> &str {
         &self.metadata.title
@@ -104,13 +135,7 @@ impl LocalPackageStore {
             }
         })?;
 
-        let size_bytes = calculate_dir_size(&package_dir).unwrap_or(0);
-
-        Ok(InstalledPackage {
-            metadata,
-            path: package_dir,
-            size_bytes,
-        })
+        Ok(InstalledPackage::new(metadata, package_dir))
     }
 
     /// List all installed packages.
@@ -118,14 +143,7 @@ impl LocalPackageStore {
         Ok(self
             .scan()?
             .into_iter()
-            .map(|(metadata, path)| {
-                let size_bytes = calculate_dir_size(&path).unwrap_or(0);
-                InstalledPackage {
-                    metadata,
-                    path,
-                    size_bytes,
-                }
-            })
+            .map(|(metadata, path)| InstalledPackage::new(metadata, path))
             .collect())
     }
 
@@ -365,7 +383,32 @@ mod tests {
         assert_eq!(package.region(), "NA");
         assert_eq!(package.package_type(), PackageType::Ortho);
         assert_eq!(package.version(), &Version::new(1, 0, 0));
-        assert!(package.size_bytes > 0);
+        assert!(package.size_bytes() > 0);
+    }
+
+    #[test]
+    fn listing_does_not_measure_sizes_until_one_is_asked_for() {
+        // #325: `run` lists every package before its dashboard opens and
+        // never shows a size. Measuring at list time walked every file of
+        // every package (5.3 million on a whole world) with nothing drawn.
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "na", PackageType::Ortho, "1.0.0");
+
+        let listed = store.list().unwrap();
+        let got = store.get("na", PackageType::Ortho).unwrap();
+
+        // Grow the package after listing: a size measured at list time
+        // would miss this file.
+        let extra = temp.path().join("zzXEL_na_ortho").join("extra.bin");
+        fs::write(&extra, vec![0u8; 4096]).unwrap();
+        let expected = calculate_dir_size(&temp.path().join("zzXEL_na_ortho")).unwrap();
+
+        assert_eq!(listed[0].size_bytes(), expected);
+        assert_eq!(got.size_bytes(), expected);
+        // Measured once, then remembered.
+        fs::remove_file(&extra).unwrap();
+        assert_eq!(listed[0].size_bytes(), expected);
     }
 
     #[test]

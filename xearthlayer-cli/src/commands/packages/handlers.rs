@@ -61,7 +61,7 @@ impl CommandHandler for ListHandler {
                     .indented(&format!("Path: {}", package.path.display()));
                 ctx.output.indented(&format!(
                     "Size: {}",
-                    format_size(package.size_bytes as usize)
+                    format_size(package.size_bytes() as usize)
                 ));
                 ctx.output.newline();
             } else {
@@ -70,7 +70,7 @@ impl CommandHandler for ListHandler {
                     package.region(),
                     type_str,
                     package.version(),
-                    format_size(package.size_bytes as usize)
+                    format_size(package.size_bytes() as usize)
                 ));
             }
         }
@@ -621,7 +621,7 @@ impl CommandHandler for RemoveHandler {
                 .println(&format!("Path: {}", package.path.display()));
             ctx.output.println(&format!(
                 "Size: {}",
-                format_size(package.size_bytes as usize)
+                format_size(package.size_bytes() as usize)
             ));
             ctx.output.newline();
         }
@@ -719,7 +719,7 @@ impl CommandHandler for InfoHandler {
                 .indented(&format!("Path: {}", package.path.display()));
             ctx.output.indented(&format!(
                 "Size: {}",
-                format_size(package.size_bytes as usize)
+                format_size(package.size_bytes() as usize)
             ));
             ctx.output.newline();
 
