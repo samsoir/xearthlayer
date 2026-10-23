@@ -393,13 +393,15 @@ Controls log output.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `file` | path | `~/.local/state/xearthlayer/xearthlayer.log` | Log file location. Supports `~` expansion. |
+| `file` | path | `~/.local/state/xearthlayer/xearthlayer.log` | The log `xearthlayer run` writes. Supports `~` expansion. |
 
 **Example:**
 ```ini
 [logging]
 file = ~/.local/state/xearthlayer/xearthlayer.log
 ```
+
+Only `xearthlayer run` writes this file, and it empties it when it starts, so copy a flight's log aside before the next run if you may need it. The package manager and the `packages` commands write their own log, `xearthlayer-packages.log` in the same directory as the default (`~/Library/Logs/XEarthLayer/` on macOS), appended to with a "Session started" line per command. Every other command writes no log file.
 
 ### [packages]
 

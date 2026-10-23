@@ -153,11 +153,24 @@ pub fn version_check_file_in(base: &dyn BaseDirectories) -> PathBuf {
 }
 
 /// The default log file. Overridable by `logging.file`.
+///
+/// Only `xearthlayer run` writes it (#320): it is the flight's log, and it
+/// is truncated when a run starts.
 pub fn log_file() -> PathBuf {
     log_file_in(active())
 }
 pub fn log_file_in(base: &dyn BaseDirectories) -> PathBuf {
     base.state_dir().join("xearthlayer.log")
+}
+
+/// The log the `packages` commands and the package manager write (#320),
+/// appended to, so a run in progress never loses its log to a package
+/// command and a failed install's diagnostics survive the next command.
+pub fn packages_log_file() -> PathBuf {
+    packages_log_file_in(active())
+}
+pub fn packages_log_file_in(base: &dyn BaseDirectories) -> PathBuf {
+    base.state_dir().join("xearthlayer-packages.log")
 }
 
 /// The running instance lock.
@@ -301,6 +314,15 @@ mod tests {
         );
         assert_eq!(log_file_in(&base), base.state_dir().join("xearthlayer.log"));
         assert_eq!(
+            packages_log_file_in(&base),
+            base.state_dir().join("xearthlayer-packages.log")
+        );
+        assert_ne!(
+            packages_log_file_in(&base),
+            log_file_in(&base),
+            "the package commands must never share the flight log (#320)"
+        );
+        assert_eq!(
             lock_file_in(&base),
             base.state_dir().join("xearthlayer.lock")
         );
@@ -352,6 +374,7 @@ mod tests {
             ortho_union_index_cache(),
             version_check_file(),
             log_file(),
+            packages_log_file(),
             lock_file(),
             packages_dir(),
             patches_dir(),

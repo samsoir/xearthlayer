@@ -81,7 +81,7 @@ things went.
 | `scenery_index.cache` | Stale. Rebuilt in the new location on the next scan |
 | `ortho_union_index.cache` | Stale. Rebuilt automatically on the next start |
 | `version_check.json` | Refetched within a day |
-| `xearthlayer.log` | A previous run's log |
+| `xearthlayer.log` | A previous run's log. Since 0.5.0 the `packages` commands log to `xearthlayer-packages.log` beside it instead |
 | `config.ini` | Only if you will not roll back to an earlier version |
 
 **Check before deleting:**

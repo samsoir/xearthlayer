@@ -1,7 +1,7 @@
 //! Logging infrastructure for XEarthLayer.
 //!
 //! Provides structured logging with file output and console output:
-//! - Writes to `logs/xearthlayer.log` (cleared on session start)
+//! - Writes to a log file, truncated or appended per [`LogFileMode`]
 //! - Also prints to stdout for CLI tailing
 //! - Compact single-line format for release builds with UTC date+time
 //!   (supports flight sim sessions lasting 24+ hours)
@@ -37,62 +37,44 @@ pub struct LoggingGuard {
     _file_guard: WorkerGuard,
 }
 
-/// Initialize logging system.
-///
-/// Creates logs directory if needed, clears previous log file,
-/// and sets up output to file and optionally stdout.
-///
-/// # Arguments
-///
-/// * `log_dir` - Directory for log files (e.g., "logs")
-/// * `log_file` - Log filename (e.g., "xearthlayer.log")
-///
-/// # Returns
-///
-/// LoggingGuard that must be kept alive for logging to work
-///
-/// # Errors
-///
-/// Returns error if log directory cannot be created or log file cannot be cleared
-pub fn init_logging(log_dir: &str, log_file: &str) -> Result<LoggingGuard, io::Error> {
-    init_logging_with_options(log_dir, log_file, true)
+/// What happens to a log file that already exists when logging starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFileMode {
+    /// Empty it first: the file holds one session, the latest.
+    Truncate,
+    /// Keep it and write after what is there: the file holds every session.
+    Append,
 }
 
-/// Initialize logging system with options.
+/// Prepare the log file for a session: the directory exists, and so does the
+/// file, emptied when `mode` says so.
 ///
-/// Creates logs directory if needed, clears previous log file,
-/// and sets up output to file and optionally stdout.
-///
-/// # Arguments
-///
-/// * `log_dir` - Directory for log files (e.g., "logs")
-/// * `log_file` - Log filename (e.g., "xearthlayer.log")
-/// * `stdout_enabled` - Whether to also output to stdout (disable for TUI mode)
-///
-/// # Returns
-///
-/// LoggingGuard that must be kept alive for logging to work
-///
-/// # Errors
-///
-/// Returns error if log directory cannot be created or log file cannot be cleared
-pub fn init_logging_with_options(
-    log_dir: &str,
-    log_file: &str,
-    stdout_enabled: bool,
-) -> Result<LoggingGuard, io::Error> {
-    init_logging_full(log_dir, log_file, stdout_enabled, false, false)
+/// Separate from the subscriber so it can be tested: the global subscriber
+/// can be set only once per process.
+fn prepare_log_file(log_path: &Path, mode: LogFileMode) -> io::Result<()> {
+    if let Some(dir) = log_path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    match mode {
+        LogFileMode::Truncate => fs::write(log_path, ""),
+        LogFileMode::Append => fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(log_path)
+            .map(drop),
+    }
 }
 
 /// Initialize logging system with full options including debug and profile modes.
 ///
-/// Creates logs directory if needed, clears previous log file,
-/// and sets up output to file and optionally stdout.
+/// Creates the log directory if needed, truncates or keeps the log file per
+/// `mode`, and sets up output to file and optionally stdout.
 ///
 /// # Arguments
 ///
 /// * `log_dir` - Directory for log files (e.g., "logs")
 /// * `log_file` - Log filename (e.g., "xearthlayer.log")
+/// * `mode` - Whether an existing log file is emptied first or appended to
 /// * `stdout_enabled` - Whether to also output to stdout (disable for TUI mode)
 /// * `debug_mode` - Whether to enable debug-level logging (overrides RUST_LOG)
 /// * `profile_mode` - Whether to enable Chrome Trace profiling (requires `profiling` feature)
@@ -103,21 +85,16 @@ pub fn init_logging_with_options(
 ///
 /// # Errors
 ///
-/// Returns error if log directory cannot be created or log file cannot be cleared
+/// Returns error if log directory cannot be created or log file cannot be opened
 pub fn init_logging_full(
     log_dir: &str,
     log_file: &str,
+    mode: LogFileMode,
     stdout_enabled: bool,
     debug_mode: bool,
     profile_mode: bool,
 ) -> Result<LoggingGuard, io::Error> {
-    // Create logs directory if it doesn't exist
-    fs::create_dir_all(log_dir)?;
-
-    // Clear previous log file by writing empty content
-    // This handles both existing and non-existing files
-    let log_path = Path::new(log_dir).join(log_file);
-    fs::write(&log_path, "")?;
+    prepare_log_file(&Path::new(log_dir).join(log_file), mode)?;
 
     // Create file appender with non-blocking writer
     let file_appender = tracing_appender::rolling::never(log_dir, log_file);
@@ -261,129 +238,60 @@ pub fn init_logging_full(
     })
 }
 
-/// Get default log directory path.
-pub fn default_log_dir() -> &'static str {
-    "logs"
-}
-
-/// Get default log file name.
-pub fn default_log_file() -> &'static str {
-    "xearthlayer.log"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
 
-    fn test_log_dir() -> PathBuf {
-        // Use unique directory for each test to avoid conflicts
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = PathBuf::from(format!("test_logs_{}", timestamp));
-        // Clean up from previous test
-        let _ = fs::remove_dir_all(&dir);
-        dir
+    #[test]
+    fn truncate_creates_the_directory_and_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("deep").join("nested").join("test.log");
+
+        prepare_log_file(&log_path, LogFileMode::Truncate).unwrap();
+
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), "");
     }
 
     #[test]
-    fn test_default_paths() {
-        assert_eq!(default_log_dir(), "logs");
-        assert_eq!(default_log_file(), "xearthlayer.log");
+    fn truncate_empties_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("test.log");
+        fs::write(&log_path, "old log data").unwrap();
+
+        prepare_log_file(&log_path, LogFileMode::Truncate).unwrap();
+
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), "");
     }
 
     #[test]
-    fn test_creates_directory_and_file() {
-        let log_dir = test_log_dir();
-        let log_dir_str = log_dir.to_str().unwrap();
+    fn append_keeps_an_existing_file_and_creates_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("test.log");
+        fs::write(&log_path, "earlier session\n").unwrap();
 
-        assert!(!log_dir.exists(), "Test directory should not exist yet");
-
-        // Can't test init_logging because of global subscriber, but we can test the file operations
-        fs::create_dir_all(log_dir_str).expect("Failed to create directory");
-        let log_path = Path::new(log_dir_str).join("test.log");
-        fs::write(&log_path, "").expect("Failed to create log file");
-
-        assert!(log_dir.exists(), "Log directory should be created");
-        assert!(log_path.exists(), "Log file should be created");
+        prepare_log_file(&log_path, LogFileMode::Append).unwrap();
         assert_eq!(
             fs::read_to_string(&log_path).unwrap(),
-            "",
-            "Log file should be empty"
+            "earlier session\n",
+            "an appended log keeps what is there"
         );
 
-        // Cleanup
-        fs::remove_dir_all(&log_dir).expect("Failed to cleanup");
+        let fresh = dir.path().join("new").join("test.log");
+        prepare_log_file(&fresh, LogFileMode::Append).unwrap();
+        assert_eq!(fs::read_to_string(&fresh).unwrap(), "");
     }
 
     #[test]
-    fn test_clears_existing_file() {
-        let log_dir = test_log_dir();
-        let log_dir_str = log_dir.to_str().unwrap();
+    fn an_unwritable_directory_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the directory should be.
+        let blocker = dir.path().join("blocker");
+        fs::write(&blocker, "").unwrap();
 
-        // Create directory and write some data
-        fs::create_dir_all(log_dir_str).expect("Failed to create test dir");
-        let log_file = log_dir.join("test.log");
-        fs::write(&log_file, "old log data").expect("Failed to write test data");
+        let result = prepare_log_file(&blocker.join("test.log"), LogFileMode::Truncate);
 
-        assert_eq!(
-            fs::read_to_string(&log_file).unwrap(),
-            "old log data",
-            "Test file should contain old data"
-        );
-
-        // Clear the file by writing empty content
-        fs::write(&log_file, "").expect("Failed to clear log file");
-
-        // File should exist but be empty
-        let contents = fs::read_to_string(&log_file).expect("Failed to read log file");
-        assert_eq!(contents, "", "File should be cleared");
-
-        // Cleanup
-        fs::remove_dir_all(&log_dir).expect("Failed to cleanup");
-    }
-
-    #[test]
-    fn test_nested_directory_creation() {
-        let log_dir = PathBuf::from("test_logs_nested/deep/nested");
-        let log_dir_str = log_dir.to_str().unwrap();
-
-        // Clean up from previous test
-        let _ = fs::remove_dir_all("test_logs_nested");
-
-        // Create nested directory
-        fs::create_dir_all(log_dir_str).expect("Failed to create nested directory");
-
-        assert!(log_dir.exists(), "Nested directory should be created");
-
-        let log_file = log_dir.join("test.log");
-        fs::write(&log_file, "").expect("Failed to create log file");
-        assert!(
-            log_file.exists(),
-            "Log file should exist in nested directory"
-        );
-
-        // Cleanup
-        fs::remove_dir_all("test_logs_nested").expect("Failed to cleanup");
-    }
-
-    #[test]
-    fn test_invalid_directory_error() {
-        // Try to create log in a location that should fail (invalid path)
-        #[cfg(unix)]
-        let result = fs::create_dir_all("/root/forbidden/logs");
-
-        #[cfg(windows)]
-        let result = fs::create_dir_all("C:\\Windows\\System32\\logs");
-
-        // Should return error, not panic
-        assert!(
-            result.is_err(),
-            "Should return error for invalid log directory"
-        );
+        assert!(result.is_err());
     }
 
     #[test]

@@ -102,6 +102,8 @@ The package manager works while `xearthlayer run` is active, with the same rules
 
 Only one package operation runs at a time. If a package command is already running in another terminal, the package manager says "another package operation is running" when you queue a job, and nothing is lost: your marks come back.
 
+The package manager and the `packages` commands never touch the flight's log, `xearthlayer.log`. They write their own, `xearthlayer-packages.log` in the same directory (`~/.local/state/xearthlayer/` on Linux, `~/Library/Logs/XEarthLayer/` on macOS), appended to with a "Session started" line for each command, so a failed install's diagnostics are still there after the next command.
+
 ## Command Line
 
 ### Selecting Packages by Region Code

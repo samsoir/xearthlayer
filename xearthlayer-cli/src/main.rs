@@ -30,7 +30,7 @@ use clap::{Parser, Subcommand};
 use commands::cache::CacheAction;
 use commands::common::{DdsCompression, ProviderType};
 use commands::scenery_index::SceneryIndexAction;
-use logging_init::init_cli_logging;
+use logging_init::{init_cli_logging, LogTarget};
 use xearthlayer::config::ConfigFile;
 
 // ============================================================================
@@ -205,6 +205,27 @@ fn command_name(command: &Option<Commands>) -> &'static str {
     }
 }
 
+/// The log a command writes (#320).
+///
+/// Exhaustive like [`command_name`]: a new subcommand must decide here, and
+/// the answer is never the flight log unless the command is `run`.
+fn log_target(command: &Option<Commands>) -> LogTarget {
+    match command {
+        None | Some(Commands::Run { .. }) => LogTarget::Flight,
+        Some(Commands::Packages { .. }) => LogTarget::Packages,
+        Some(
+            Commands::Init
+            | Commands::Setup
+            | Commands::Config { .. }
+            | Commands::Cache { .. }
+            | Commands::Migrate { .. }
+            | Commands::SceneryIndex { .. }
+            | Commands::Diagnostics
+            | Commands::Patches { .. },
+        ) => LogTarget::None,
+    }
+}
+
 /// The airport requested on the command line, if any.
 fn requested_airport(command: &Option<Commands>) -> Option<String> {
     match command {
@@ -236,13 +257,19 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
-    // Initialize logging once for every subcommand. Falls back to default
+    // Initialize logging once, to the log this command writes (#320): `run`
+    // the flight log, `packages` its own, the rest none. Falls back to default
     // config (and therefore the default log path) if the user's config
     // file is missing or unparseable; that keeps first-run scenarios and
     // misconfigured installs from running with no diagnostic output. (#194)
     let config_for_logging = ConfigFile::load().unwrap_or_default();
-    let _logging_guard = match init_cli_logging(&config_for_logging, cli.debug, cli.profile) {
-        Ok(guard) => Some(guard),
+    let _logging_guard = match init_cli_logging(
+        log_target(&cli.command),
+        &config_for_logging,
+        cli.debug,
+        cli.profile,
+    ) {
+        Ok(guard) => guard,
         Err(e) => {
             eprintln!(
                 "warning: failed to initialize logging ({}); continuing without log file",
@@ -314,7 +341,42 @@ fn main() -> ExitCode {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::Cli;
+    use super::{log_target, Cli, LogTarget};
+
+    fn target_of(argv: &[&str]) -> LogTarget {
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        log_target(&cli.command)
+    }
+
+    #[test]
+    fn only_run_writes_the_flight_log() {
+        // #320: a package command opened during a flight erased its log.
+        assert_eq!(target_of(&["xearthlayer"]), LogTarget::Flight);
+        assert_eq!(target_of(&["xearthlayer", "run"]), LogTarget::Flight);
+
+        assert_eq!(target_of(&["xearthlayer", "packages"]), LogTarget::Packages);
+        assert_eq!(
+            target_of(&["xearthlayer", "packages", "install", "na"]),
+            LogTarget::Packages
+        );
+        assert_eq!(
+            target_of(&["xearthlayer", "packages", "list"]),
+            LogTarget::Packages
+        );
+
+        for argv in [
+            &["xearthlayer", "init"][..],
+            &["xearthlayer", "setup"],
+            &["xearthlayer", "config", "path"],
+            &["xearthlayer", "cache", "stats"],
+            &["xearthlayer", "migrate", "status"],
+            &["xearthlayer", "scenery-index", "status"],
+            &["xearthlayer", "diagnostics"],
+            &["xearthlayer", "patches", "list"],
+        ] {
+            assert_eq!(target_of(argv), LogTarget::None, "{argv:?}");
+        }
+    }
 
     #[test]
     fn publish_is_no_longer_a_subcommand() {
