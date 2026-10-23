@@ -256,7 +256,9 @@ mod inner {
                 .map_err(|_| DdsError::CompressionFailed("map_async callback never fired".into()))?
                 .map_err(|e| DdsError::CompressionFailed(format!("buffer mapping failed: {e}")))?;
 
-            let data = buffer_slice.get_mapped_range();
+            let data = buffer_slice.get_mapped_range().map_err(|e| {
+                DdsError::CompressionFailed(format!("mapped range unavailable: {e}"))
+            })?;
             result.extend_from_slice(&data);
             drop(data);
             readback_buffer.unmap();

@@ -179,9 +179,11 @@ const PROBE_BACKENDS: wgpu::Backends = wgpu::Backends::PRIMARY;
 /// **This is blocking and slow** (see module docs). Returns an empty
 /// vector if no adapters are visible.
 pub fn enumerate_raw() -> Vec<wgpu::Adapter> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    // No display handle: this is a headless compute probe, and wgpu 30 makes
+    // the choice explicit instead of defaulting it.
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: PROBE_BACKENDS,
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     pollster::block_on(instance.enumerate_adapters(PROBE_BACKENDS))
 }

@@ -518,7 +518,9 @@ mod gpu {
                     DdsError::CompressionFailed(format!("GPU buffer mapping failed: {e}"))
                 })?;
 
-            let data = buffer_slice.get_mapped_range();
+            let data = buffer_slice.get_mapped_range().map_err(|e| {
+                DdsError::CompressionFailed(format!("GPU mapped range unavailable: {e}"))
+            })?;
             let result = data.to_vec();
             drop(data);
             readback_buffer.unmap();
