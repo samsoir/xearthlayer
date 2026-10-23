@@ -606,10 +606,12 @@ jobs:
           echo ""
           echo "Release URL: https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG}"
 
-      # Bump the Homebrew tap. A pre-release tag rewrites the `xearthlayer@prerelease`
-      # cask, a stable tag the `xearthlayer` cask; the two never cross. The
-      # tarball's hash is taken from the artifact just uploaded, so the cask can
-      # only ever describe the bytes this run published. The release is already
+      # Bump the Homebrew tap: the runtime's cask and the publisher's, in one
+      # commit. A pre-release tag rewrites the `@prerelease` casks
+      # (`xearthlayer@prerelease`, `xearthlayer-publish@prerelease`), a stable
+      # tag the plain ones; the two channels never cross. Each tarball's hash is
+      # taken from the artifact just uploaded, so a cask can only ever describe
+      # the bytes this run published. The release is already
       # public by this point, so a failure here marks the run red without
       # un-publishing anything; the fix is scripts/homebrew/render-cask.sh by hand.
       - name: Update Homebrew tap
@@ -623,13 +625,17 @@ jobs:
             echo "::notice::HOMEBREW_TAP_TOKEN not configured; the Homebrew tap was not updated."
             exit 0
           fi
-          TARBALL="artifacts/macos-binary/xearthlayer-${RELEASE_TAG}-arm64-macos.tar.gz"
-          SHA256=$(sha256sum "$TARBALL" | cut -d' ' -f1)
           CHANNEL=stable
           [ "$PRERELEASE" = "true" ] && CHANNEL=prerelease
 
           git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${HOMEBREW_TAP_REPO}.git" tap
-          CASK=$(scripts/homebrew/render-cask.sh "$CHANNEL" "$VERSION" "$SHA256" "${{ github.repository }}" tap/Casks)
+          TOKENS=()
+          for PRODUCT in xearthlayer xearthlayer-publish; do
+            TARBALL="artifacts/macos-binary/${PRODUCT}-${RELEASE_TAG}-arm64-macos.tar.gz"
+            SHA256=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+            CASK=$(scripts/homebrew/render-cask.sh "$PRODUCT" "$CHANNEL" "$VERSION" "$SHA256" "${{ github.repository }}" tap/Casks)
+            TOKENS+=("$(basename "$CASK" .rb)")
+          done
           cd tap
           git add Casks
           if git diff --cached --quiet; then
@@ -638,10 +644,10 @@ jobs:
           fi
           git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit -m "$(basename "$CASK" .rb) ${VERSION}" \
+              commit -m "${TOKENS[*]} ${VERSION}" \
                      -m "Rendered from ${{ github.repository }}@${RELEASE_TAG} by release.yml run ${{ github.run_id }}."
           git push
-          echo "Homebrew tap updated: ${HOMEBREW_TAP_REPO} $(basename "$CASK" .rb) -> ${VERSION}"
+          echo "Homebrew tap updated: ${HOMEBREW_TAP_REPO} ${TOKENS[*]} -> ${VERSION}"
 
       # Website notification moved to website-sync.yml (triggers on release/* merge to main)
 

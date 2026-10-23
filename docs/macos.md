@@ -60,6 +60,10 @@ brew install --cask xearthlayer/tap/xearthlayer@prerelease
 ```
 
 The two casks conflict, so switching channels means uninstalling one first.
+
+The package publishing tool has its own casks, `xearthlayer/tap/xearthlayer-publish` and
+`xearthlayer/tap/xearthlayer-publish@prerelease`. It does not need macFUSE, and installs
+alongside either XEarthLayer cask.
 Both depend on the `macfuse` cask; if macFUSE is already installed from its
 own installer, add `--skip-cask-deps`. The macFUSE approval steps above still
 apply. Then run `xearthlayer setup`.

@@ -346,17 +346,23 @@ and is then killed on first exec. Since Homebrew 6, a non-official tap must be t
 before its Ruby is loaded; installing by fully qualified name trusts that one cask,
 which is why the documented command is the long form.
 
-Two casks, one per channel, each declaring a conflict with the other:
+Four casks: one per channel for each binary the release ships, the runtime and the
+publisher. The two casks of one binary declare a conflict with each other; the runtime
+and the publisher install side by side. Only the runtime's casks depend on `macfuse`:
+the publisher builds packages and never mounts anything.
 
 | Cask | Tracks | Template |
 |------|--------|----------|
 | `xearthlayer` | stable `vX.Y.Z` tags | `pkg/homebrew/xearthlayer.rb.tmpl` |
 | `xearthlayer@prerelease` | `-dev.N`, `-alpha.N`, `-beta.N`, `-rc.N` tags | `pkg/homebrew/xearthlayer@prerelease.rb.tmpl` |
+| `xearthlayer-publish` | stable `vX.Y.Z` tags | `pkg/homebrew/xearthlayer-publish.rb.tmpl` |
+| `xearthlayer-publish@prerelease` | `-dev.N`, `-alpha.N`, `-beta.N`, `-rc.N` tags | `pkg/homebrew/xearthlayer-publish@prerelease.rb.tmpl` |
 
 **Nothing in the tap is edited by hand.** The `publish` job's last step, *Update
-Homebrew tap*, renders the template for the tag's channel with
-`scripts/homebrew/render-cask.sh`, taking the SHA-256 from the macOS tarball artifact
-it has just uploaded, and pushes the file to the tap with `HOMEBREW_TAP_TOKEN`. The
+Homebrew tap*, renders both binaries' templates for the tag's channel with
+`scripts/homebrew/render-cask.sh <product> <channel> ...`, taking each SHA-256 from the
+macOS tarball artifact it has just uploaded, and pushes both files to the tap in one
+commit with `HOMEBREW_TAP_TOKEN`. The
 render script refuses a stable version into the pre-release cask and vice versa, so a
 misclassified tag cannot cross channels. The step runs after the release is public: a
 failure marks the run red but un-publishes nothing, and the remedy is to run the
@@ -365,10 +371,10 @@ the step skips with a notice, as the AUR step does without its key.
 
 The tap repository carries its own `Audit` workflow on every push: `brew style`,
 `brew audit --cask --online --strict`, and an install of each cask on a `macos-15`
-runner followed by `xearthlayer --version`. That install goes through Homebrew's
-quarantine, so it fails for a release that was not notarized. The pre-release cask
-excludes one audit, `github_prerelease_version`, which rejects any version whose GitHub
-release is marked pre-release; tracking those is that cask's purpose.
+runner followed by `--version` of the binary that cask installs. That install goes
+through Homebrew's quarantine, so it fails for a release that was not notarized. The
+pre-release casks exclude one audit, `github_prerelease_version`, which rejects any
+version whose GitHub release is marked pre-release; tracking those is their purpose.
 
 To test a cask change locally before a tag exists, render into a checkout of the tap,
 link the checkout under `$(brew --repository)/Library/Taps/xearthlayer/homebrew-tap`

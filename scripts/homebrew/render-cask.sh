@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Render a Homebrew cask for one release from the templates in pkg/homebrew/.
 #
-# Usage: scripts/homebrew/render-cask.sh <stable|prerelease> <version> <sha256> <owner/repo> <out-dir>
+# Usage: scripts/homebrew/render-cask.sh <product> <stable|prerelease> <version> <sha256> <owner/repo> <out-dir>
 #
+#   product   xearthlayer (the runtime) or xearthlayer-publish (the publisher)
 #   version   without the leading v, e.g. 0.5.0 or 0.5.0-alpha.2
-#   sha256    of xearthlayer-v<version>-arm64-macos.tar.gz
+#   sha256    of <product>-v<version>-arm64-macos.tar.gz
 #   owner/repo  the GitHub repository the tarball is downloaded from
 #   out-dir   the tap's Casks/ directory; the file is named after the cask token
 #
@@ -12,15 +13,19 @@
 # and by hand when a bump must be redone; see docs/dev/cicd.md.
 set -euo pipefail
 
-if [ "$#" -ne 5 ]; then
-    sed -n '2,12p' "$0" >&2
+if [ "$#" -ne 6 ]; then
+    sed -n '2,13p' "$0" >&2
     exit 2
 fi
-channel=$1 version=$2 sha256=$3 repo=$4 out_dir=$5
+product=$1 channel=$2 version=$3 sha256=$4 repo=$5 out_dir=$6
 
+case "$product" in
+    xearthlayer | xearthlayer-publish) ;;
+    *) echo "error: product must be xearthlayer or xearthlayer-publish, not '$product'" >&2; exit 2 ;;
+esac
 case "$channel" in
-    stable) token="xearthlayer" ;;
-    prerelease) token="xearthlayer@prerelease" ;;
+    stable) token="$product" ;;
+    prerelease) token="${product}@prerelease" ;;
     *) echo "error: channel must be stable or prerelease, not '$channel'" >&2; exit 2 ;;
 esac
 if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-(dev|alpha|beta|rc)\.[0-9]+)?$'; then
