@@ -8,7 +8,8 @@ use super::app::{Action, Modal, Tab};
 ///
 /// With a modal open only its own keys apply: `y` or Enter confirms, `n` or
 /// Esc dismisses, `q` confirms the quit prompt, and help closes on `?` or Esc.
-/// Ctrl+C always quits.
+/// With no modal, Esc gives `Dismiss`, which asks to quit but never abandons
+/// a cancelling quit the way `q` does. Ctrl+C always quits.
 #[allow(dead_code)] // wired by the runner in Task 5
 pub fn action_for(key: KeyEvent, tab: Tab, modal: Option<&Modal>) -> Option<Action> {
     if key.kind != KeyEventKind::Press {
@@ -67,7 +68,9 @@ fn tab_action(code: KeyCode, tab: Tab) -> Option<Action> {
         KeyCode::Char('x') => on(&[Tab::Progress], Action::ClearFinished),
         KeyCode::Char('r') => Some(Action::Refresh),
         KeyCode::Char('?') => Some(Action::Help),
-        KeyCode::Char('q' | 'Q') | KeyCode::Esc => Some(Action::Quit),
+        KeyCode::Char('q' | 'Q') => Some(Action::Quit),
+        // With nothing to dismiss, `update` treats it as asking to quit.
+        KeyCode::Esc => Some(Action::Dismiss),
         _ => None,
     }
 }
@@ -147,7 +150,7 @@ mod tests {
             (ch('r'), Action::Refresh),
             (ch('?'), Action::Help),
             (ch('q'), Action::Quit),
-            (press(KeyCode::Esc), Action::Quit),
+            (press(KeyCode::Esc), Action::Dismiss),
             (ctrl('c'), Action::Quit),
         ];
         for tab in TABS {

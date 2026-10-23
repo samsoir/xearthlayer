@@ -177,8 +177,15 @@ pub enum Msg {
     /// One result per entry of an [`Effect::Install`]. Each error names its
     /// package: "NA-CANADA ortho: connection refused".
     MetadataReady(Vec<Result<PackageMetadata, String>>),
-    Queued(Vec<(JobId, JobSummary)>),
-    /// The queue took none of the jobs, and why.
+    /// The queue accepted this job. Sent from the queue's own `Queued`
+    /// event, so it arrives before any other message for the job.
+    Queued(JobId, JobSummary),
+    /// `submit_batch` returned: the request was accepted, and these of its
+    /// packages were refused, each naming its package.
+    Submitted {
+        refused: Vec<String>,
+    },
+    /// The queue would not start, and why.
     QueueRefused(String),
     Job(JobId, JobMsg),
     Status(String),
@@ -302,7 +309,11 @@ pub struct AppState {
     library_marks: BTreeSet<PackageKey>,
     /// Marks cleared by a confirmed action, kept until the queue answers
     /// so a refusal can put them back.
+    /// Only one package request is in flight at a time: while this is set,
+    /// new ones are refused.
     held_marks: Option<(Tab, BTreeSet<PackageKey>)>,
+    /// Jobs queued since the request in flight was made.
+    queued_count: usize,
     modal: Option<Modal>,
     status: Option<String>,
     run_active: Option<u32>,
@@ -329,6 +340,7 @@ impl AppState {
             local_marks: BTreeSet::new(),
             library_marks: BTreeSet::new(),
             held_marks: None,
+            queued_count: 0,
             modal: None,
             status: None,
             run_active: None,
@@ -444,6 +456,10 @@ impl AppState {
                 return reload();
             }
             (Action::Help, _) => self.modal = Some(Modal::Help),
+            // Esc with nothing to dismiss asks to quit, but never abandons.
+            (Action::Dismiss, _) if self.quitting == Quitting::No => {
+                return self.on_quit(now);
+            }
             _ => {}
         }
         Vec::new()
@@ -463,6 +479,11 @@ impl AppState {
     fn confirm(&mut self) -> Vec<Effect> {
         match self.modal.take() {
             Some(Modal::ConfirmQuit { .. }) => self.quit_now(),
+            Some(Modal::ConfirmDelete { .. } | Modal::ConfirmInstall { .. })
+                if self.request_refused() =>
+            {
+                Vec::new()
+            }
             Some(Modal::ConfirmDelete { targets, .. }) => {
                 self.hold_marks(Tab::Local);
                 vec![Effect::Remove(targets)]
@@ -580,6 +601,10 @@ impl AppState {
 
     /// Keep a tab's selection and marks within the rows it shows.
     fn clamp(&mut self, tab: Tab) {
+        // Marks wait for the rows to come back rather than going with them.
+        if tab == Tab::Library && !matches!(self.library, LibraryState::Loaded(_)) {
+            return;
+        }
         let last = self.shown_len(tab).saturating_sub(1);
         let selected = &mut self.selection[tab.index()];
         *selected = (*selected).min(last);
@@ -617,6 +642,7 @@ impl AppState {
         if let Some(marks) = self.marks_mut(tab) {
             let marks = std::mem::take(marks);
             self.held_marks = Some((tab, marks));
+            self.queued_count = 0;
         }
     }
 
@@ -634,6 +660,20 @@ impl AppState {
     // Package actions
     // ------------------------------------------------------------------------
 
+    /// A new package request is refused while quitting, or while the last
+    /// one waits for the queue, saying why.
+    fn request_refused(&mut self) -> bool {
+        let reason = if self.quitting != Quitting::No {
+            "quitting: no new package requests"
+        } else if self.held_marks.is_some() {
+            "waiting for the queue to accept the last request"
+        } else {
+            return false;
+        };
+        self.status = Some(reason.to_string());
+        true
+    }
+
     /// `RunActive` refuses the action, saying why.
     fn refused_while_running(&mut self) -> bool {
         match self.run_active {
@@ -646,7 +686,7 @@ impl AppState {
     }
 
     fn update_local(&mut self) -> Vec<Effect> {
-        if self.refused_while_running() {
+        if self.request_refused() || self.refused_while_running() {
             return Vec::new();
         }
         let targets = self.targets(Tab::Local);
@@ -698,7 +738,7 @@ impl AppState {
     }
 
     fn delete_local(&mut self) {
-        if self.refused_while_running() {
+        if self.request_refused() || self.refused_while_running() {
             return;
         }
         let targets = self.targets(Tab::Local);
@@ -718,6 +758,9 @@ impl AppState {
     }
 
     fn install_from_library(&mut self) {
+        if self.request_refused() {
+            return;
+        }
         let LibraryState::Loaded(rows) = &self.library else {
             self.status = Some("library not loaded yet, press r".to_string());
             return;
@@ -803,7 +846,8 @@ impl AppState {
             Msg::LibraryNotConfigured => self.set_library(LibraryState::NotConfigured),
             Msg::RunActive(pid) => self.run_active = pid,
             Msg::MetadataReady(results) => return self.on_metadata(results),
-            Msg::Queued(jobs) => self.on_queued(jobs),
+            Msg::Queued(id, summary) => return self.on_queued(id, summary),
+            Msg::Submitted { refused } => return self.on_submitted(refused),
             Msg::QueueRefused(reason) => {
                 self.status = Some(reason);
                 self.restore_marks();
@@ -823,6 +867,11 @@ impl AppState {
     }
 
     fn on_metadata(&mut self, results: Vec<Result<PackageMetadata, String>>) -> Vec<Effect> {
+        if self.quitting != Quitting::No {
+            self.status = Some("cancelled".to_string());
+            self.restore_marks();
+            return Vec::new();
+        }
         let (fetched, failed): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
         let fetched: Vec<PackageMetadata> = fetched.into_iter().filter_map(Result::ok).collect();
         let failed: Vec<String> = failed.into_iter().filter_map(Result::err).collect();
@@ -842,31 +891,56 @@ impl AppState {
         vec![Effect::Submit(fetched)]
     }
 
-    fn on_queued(&mut self, jobs: Vec<(JobId, JobSummary)>) {
-        self.held_marks = None;
-        if jobs.is_empty() {
-            return;
+    fn on_queued(&mut self, id: JobId, summary: JobSummary) -> Vec<Effect> {
+        self.queued_count += 1;
+        self.status = Some(self.queued_note());
+        if summary.package_type == PackageType::Overlay {
+            self.overlay_jobs.insert(id);
         }
-        self.status = Some(match jobs.len() {
+        self.jobs.push(JobRow {
+            id,
+            label: label(&summary),
+            kind: summary.kind,
+            look: JobLook::Queued,
+            finished: false,
+        });
+        // Quitting already cancelled everything else.
+        if self.quitting != Quitting::No {
+            return vec![Effect::CancelJob(id)];
+        }
+        Vec::new()
+    }
+
+    /// The request in flight was accepted: release its marks and report
+    /// what was queued and what was refused.
+    fn on_submitted(&mut self, refused: Vec<String>) -> Vec<Effect> {
+        self.held_marks = None;
+        let mut notes = Vec::new();
+        if self.queued_count > 0 {
+            notes.push(self.queued_note());
+        }
+        notes.extend(refused);
+        if !notes.is_empty() {
+            self.status = Some(notes.join("; "));
+        }
+        self.queued_count = 0;
+        if self.unfinished() == 0 {
+            return vec![Effect::ReleaseQueue];
+        }
+        Vec::new()
+    }
+
+    /// "N jobs queued: see Progress"
+    fn queued_note(&self) -> String {
+        match self.queued_count {
             1 => "1 job queued: see Progress".to_string(),
             n => format!("{n} jobs queued: see Progress"),
-        });
-        for (id, summary) in jobs {
-            if summary.package_type == PackageType::Overlay {
-                self.overlay_jobs.insert(id);
-            }
-            self.jobs.push(JobRow {
-                id,
-                label: label(&summary),
-                kind: summary.kind,
-                look: JobLook::Queued,
-                finished: false,
-            });
         }
     }
 
     fn on_job(&mut self, id: JobId, msg: JobMsg) -> Vec<Effect> {
         let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) else {
+            tracing::debug!(job = id.0, "Package manager: message for an unknown job");
             return Vec::new();
         };
         if job.finished {
@@ -1082,16 +1156,14 @@ mod tests {
     /// Queue jobs 1.. for these packages and return their ids.
     fn queue(state: &mut AppState, jobs: &[(&str, PackageType, Option<&str>)]) -> Vec<JobId> {
         let first = state.jobs.len() as u64 + 1;
-        let queued: Vec<_> = jobs
-            .iter()
+        jobs.iter()
             .enumerate()
             .map(|(i, (region, t, version))| {
-                (JobId(first + i as u64), summary(region, *t, *version))
+                let id = JobId(first + i as u64);
+                msg(state, Msg::Queued(id, summary(region, *t, *version)));
+                id
             })
-            .collect();
-        let ids = queued.iter().map(|(id, _)| *id).collect();
-        msg(state, Msg::Queued(queued));
-        ids
+            .collect()
     }
 
     fn metadata(title: &str, t: PackageType) -> PackageMetadata {
@@ -1873,16 +1945,64 @@ mod tests {
     }
 
     #[test]
-    fn queued_drops_the_kept_copy_of_the_marks() {
+    fn submitted_releases_the_held_marks() {
         let mut state = loaded();
         act(&mut state, Action::Mark);
         act(&mut state, Action::Delete);
         act(&mut state, Action::Confirm);
 
         queue(&mut state, &[("EU-WEST", Ortho, None)]);
+        msg(
+            &mut state,
+            Msg::Submitted {
+                refused: Vec::new(),
+            },
+        );
         msg(&mut state, Msg::QueueRefused("late".into()));
 
         assert!(state.local_marks.is_empty());
+        assert!(state.held_marks.is_none());
+    }
+
+    #[test]
+    fn submitted_shows_the_queued_count_and_each_refusal() {
+        let mut state = loaded();
+        act(&mut state, Action::Mark);
+        act(&mut state, Action::Down);
+        act(&mut state, Action::Mark);
+        act(&mut state, Action::Delete);
+        act(&mut state, Action::Confirm);
+        queue(&mut state, &[("EU-WEST", Ortho, None)]);
+
+        let effects = msg(
+            &mut state,
+            Msg::Submitted {
+                refused: vec!["EU-WEST overlay: already queued".into()],
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            status(&state),
+            "1 job queued: see Progress; EU-WEST overlay: already queued"
+        );
+    }
+
+    #[test]
+    fn a_submitted_batch_that_queued_nothing_releases_the_queue() {
+        let mut state = loaded();
+        act(&mut state, Action::Delete);
+        act(&mut state, Action::Confirm);
+
+        let effects = msg(
+            &mut state,
+            Msg::Submitted {
+                refused: vec!["EU-WEST ortho: already queued".into()],
+            },
+        );
+
+        assert_eq!(effects, [Effect::ReleaseQueue]);
+        assert_eq!(status(&state), "EU-WEST ortho: already queued");
     }
 
     #[test]
@@ -2171,6 +2291,212 @@ mod tests {
         );
 
         assert_eq!(status(&state), "Consolidated overlay updated");
+    }
+
+    // ------------------------------------------------------------------------
+    // One package request at a time
+    // ------------------------------------------------------------------------
+
+    const WAITING: &str = "waiting for the queue to accept the last request";
+
+    #[test]
+    fn a_second_request_waits_for_the_first_to_be_accepted() {
+        // Library: mark AF-NORTH ortho, install, confirm.
+        let mut state = library_tab(false, &[0]);
+        act(&mut state, Action::Install);
+        assert_eq!(
+            act(&mut state, Action::Confirm),
+            [Effect::Install(vec![entry("AF-NORTH", Ortho, "1.0.0")])]
+        );
+
+        // While its metadata is fetched: Local, mark NA-EAST, delete.
+        act(&mut state, Action::GoTab(Tab::Local));
+        act(&mut state, Action::End);
+        act(&mut state, Action::Mark);
+        let effects = act(&mut state, Action::Delete);
+
+        assert!(effects.is_empty());
+        assert!(state.modal.is_none());
+        assert_eq!(status(&state), WAITING);
+        assert!(act(&mut state, Action::Update).is_empty());
+        assert_eq!(status(&state), WAITING);
+
+        // The first request fails: its own marks come back, on its own tab.
+        msg(
+            &mut state,
+            Msg::MetadataReady(vec![Err("AF-NORTH ortho: timed out".into())]),
+        );
+
+        assert_eq!(
+            state.library_marks.iter().cloned().collect::<Vec<_>>(),
+            [key("AF-NORTH", Ortho)]
+        );
+        assert_eq!(
+            state.local_marks.iter().cloned().collect::<Vec<_>>(),
+            [key("NA-EAST", Ortho)]
+        );
+        assert!(state.held_marks.is_none());
+    }
+
+    #[test]
+    fn install_waits_for_the_last_request_too() {
+        let mut state = loaded();
+        act(&mut state, Action::Update);
+        act(&mut state, Action::GoTab(Tab::Library));
+
+        act(&mut state, Action::Install);
+
+        assert!(state.modal.is_none());
+        assert_eq!(status(&state), WAITING);
+    }
+
+    #[test]
+    fn a_confirmation_waits_for_the_last_request() {
+        let mut state = loaded();
+        state.held_marks = Some((Tab::Library, BTreeSet::new()));
+        state.modal = Some(Modal::ConfirmDelete {
+            targets: vec![key("NA-EAST", Ortho)],
+            total_bytes: 300,
+        });
+
+        assert!(act(&mut state, Action::Confirm).is_empty());
+        assert!(state.modal.is_none());
+        assert_eq!(status(&state), WAITING);
+    }
+
+    #[test]
+    fn a_new_request_is_taken_once_the_last_was_accepted() {
+        let mut state = loaded();
+        act(&mut state, Action::Update);
+        msg(
+            &mut state,
+            Msg::Submitted {
+                refused: Vec::new(),
+            },
+        );
+
+        act(&mut state, Action::Delete);
+
+        assert!(matches!(state.modal, Some(Modal::ConfirmDelete { .. })));
+    }
+
+    // ------------------------------------------------------------------------
+    // Quitting takes no new work
+    // ------------------------------------------------------------------------
+
+    fn cancelling() -> (AppState, Vec<JobId>) {
+        let (mut state, ids) = progress_with_two_jobs();
+        act(&mut state, Action::Quit);
+        act(&mut state, Action::Confirm);
+        assert_eq!(state.quitting, Quitting::Cancelling);
+        (state, ids)
+    }
+
+    #[test]
+    fn package_actions_are_refused_while_quitting() {
+        let (mut state, _) = cancelling();
+
+        act(&mut state, Action::GoTab(Tab::Local));
+        assert!(act(&mut state, Action::Update).is_empty());
+        assert!(act(&mut state, Action::Delete).is_empty());
+        act(&mut state, Action::GoTab(Tab::Library));
+        assert!(act(&mut state, Action::Install).is_empty());
+
+        assert!(state.modal.is_none());
+        assert_eq!(status(&state), "quitting: no new package requests");
+    }
+
+    #[test]
+    fn metadata_arriving_while_cancelling_submits_nothing() {
+        let (mut state, _) = progress_with_two_jobs();
+        act(&mut state, Action::GoTab(Tab::Library));
+        act(&mut state, Action::Mark);
+        act(&mut state, Action::Install);
+        act(&mut state, Action::Confirm);
+        act(&mut state, Action::Quit);
+        act(&mut state, Action::Confirm);
+
+        let effects = msg(
+            &mut state,
+            Msg::MetadataReady(vec![Ok(metadata("AF-NORTH", Ortho))]),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(status(&state), "cancelled");
+        assert!(state.held_marks.is_none());
+    }
+
+    #[test]
+    fn a_job_queued_while_cancelling_is_cancelled() {
+        let (mut state, _) = cancelling();
+
+        let effects = msg(
+            &mut state,
+            Msg::Queued(JobId(9), summary("AF-NORTH", Ortho, Some("1.0.0"))),
+        );
+
+        assert_eq!(effects, [Effect::CancelJob(JobId(9))]);
+        assert_eq!(state.unfinished(), 3);
+    }
+
+    #[test]
+    fn dismiss_with_no_modal_asks_to_quit() {
+        let mut state = loaded();
+
+        assert!(act(&mut state, Action::Dismiss).is_empty());
+
+        assert!(matches!(state.modal, Some(Modal::ConfirmQuit { .. })));
+    }
+
+    #[test]
+    fn dismiss_while_cancelling_does_not_abandon() {
+        let (mut state, _) = cancelling();
+
+        assert!(act(&mut state, Action::Dismiss).is_empty());
+
+        assert_eq!(state.quitting, Quitting::Cancelling);
+        assert!(state.modal.is_none());
+    }
+
+    #[test]
+    fn a_job_message_for_an_unknown_id_is_ignored() {
+        let (mut state, _) = progress_with_two_jobs();
+
+        assert!(msg(&mut state, Msg::Job(JobId(99), JobMsg::Installed)).is_empty());
+        assert_eq!(state.unfinished(), 2);
+    }
+
+    // ------------------------------------------------------------------------
+    // Marks while the library reloads
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn library_marks_survive_a_failed_reload() {
+        let mut state = loaded();
+        act(&mut state, Action::GoTab(Tab::Library));
+        act(&mut state, Action::Mark);
+
+        act(&mut state, Action::Refresh);
+        msg(&mut state, Msg::Library(Err("offline".into())));
+        assert!(state.library_marks.contains(&key("AF-NORTH", Ortho)));
+
+        msg(&mut state, Msg::Library(Ok(fake_library())));
+        assert!(state.library_marks.contains(&key("AF-NORTH", Ortho)));
+    }
+
+    #[test]
+    fn marks_restored_while_the_library_reloads_are_kept() {
+        let mut state = library_tab(false, &[0]);
+        act(&mut state, Action::Install);
+        act(&mut state, Action::Confirm);
+        act(&mut state, Action::Refresh);
+
+        msg(
+            &mut state,
+            Msg::MetadataReady(vec![Err("AF-NORTH ortho: timed out".into())]),
+        );
+
+        assert!(state.library_marks.contains(&key("AF-NORTH", Ortho)));
     }
 
     // ------------------------------------------------------------------------
