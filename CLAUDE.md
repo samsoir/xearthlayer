@@ -190,8 +190,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `xearthlayer packages` with no subcommand opens it when stdin and stdout are terminals; otherwise the command help prints. `xearthlayer setup` offers it at the end (`offer_manager`). Three tabs: Local, Library, Progress
     - `AppState::update(Input, Instant) -> Vec<Effect>` (`app.rs`) is pure: no terminal, network or disk, so every rule is tested by calling it. `Effects` (`effects.rs`) carries the effects out and answers with `Msg`s on one channel; slow reads run on a worker thread
     - The `InstallQueue` starts on the first job and is released (with its `.queue.lock`) when idle, after one overlay rebuild if an overlay changed. `ChannelObserver` runs under the queue's lock, so it only does an unbounded `send`
-    - `PackageActions` (`commands/packages/actions.rs`) is shared with the CLI handlers: `library_status`, `plan_install`, `check_removal`/`check_replacement` (`RunActive`), `RESTART_NOTE`, `rebuild_overlays`
-    - While `xearthlayer run` is alive (`system::process::running_instance` on `paths::lock_file()`), updates, deletes and installs over an installed package are refused; new packages install. This replaced a mount-point check that never fired after consolidated mounting
+    - The `actions` module (`commands/packages/actions.rs`) is shared with the CLI handlers: `library_status`, `plan_install`, `check_removal`/`check_replacement` (`RunActive`), `RESTART_NOTE`, `rebuild_overlays`
+    - While `xearthlayer run` is alive (`system::process::running_instance` on `paths::lock_file()`), updates, deletes and installs over an installed package are refused; new packages install. The banner and keypress refusals use the cached answer; `Effects` checks again when it carries out `Remove` or `Submit` (whose `replacing` names the installed packages). This replaced a mount-point check that never fired after consolidated mounting
+    - `JobId`s come from one process-wide counter, so the job rows the TUI keeps across released queues never share an id
     - `runner.rs`: 50 ms key poll, 1 s tick, every signal handled so the terminal is restored; first external SIGINT quits as a confirmed `q`, a later one or SIGTERM abandons, SIGHUP abandons and stops drawing (exit 130, 143, 129)
     - See `docs/package-management.md` (user) and `docs/dev/package-manager-design.md` (design)
 
@@ -474,7 +475,7 @@ xearthlayer-publish delete --region <code> [--type <ortho|overlay>] [--dry-run] 
 | `xearthlayer/src/config/keys.rs` | ConfigKey enum with validation (Specification Pattern) |
 | `xearthlayer/src/manager/queue/` | InstallQueue, DiskLedger, Stages, lock and sweep |
 | `xearthlayer-cli/src/ui/packages/` | Package manager TUI: `app.rs` (pure `AppState::update`), `effects.rs` (effects, worker, `ChannelObserver`), `runner.rs` (loop, signals), `view.rs` and `widgets/` |
-| `xearthlayer-cli/src/commands/packages/actions.rs` | `PackageActions` shared by the package commands and the TUI (install planning, `run` refusals, overlay rebuild) |
+| `xearthlayer-cli/src/commands/packages/actions.rs` | The `actions` module shared by the package commands and the TUI (install planning, `run` refusals, overlay rebuild) |
 | `xearthlayer/src/system/process.rs` | `running_instance`, `recorded_pid`: the instance lock reading |
 | `xearthlayer-package/src/` | Scenery package format: metadata, library index, naming, spec version gate (shared by runtime and publisher) |
 | `xearthlayer-publisher/src/` | Package publisher library |

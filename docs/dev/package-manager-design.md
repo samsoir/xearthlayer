@@ -372,8 +372,8 @@ What it has instead is the instance lock. `run` records its process ID in
 `paths::lock_file()`. `system::process::running_instance(lock_path)` reads it
 (`recorded_pid`) and answers with the PID only when that process is alive and is
 not the caller, so a stale or corrupt lock reads as "not running".
-`PackageManagerService::running_instance` wraps it for the CLI layer, and
-`PackageActions` (`commands/packages/actions.rs`) turns it into decisions:
+`PackageManagerService::running_instance` wraps it for the CLI layer, and the
+`actions` module (`commands/packages/actions.rs`) turns it into decisions:
 
 - `check_removal`: a remove is refused while `run` is alive.
 - `check_replacement`: an update, or an install over an installed package, is
@@ -392,7 +392,8 @@ index and the open handles pointing at files that are gone.
 ### Why the old mount check never fired
 
 The first version asked whether each package folder was itself a mount point
-(`MountStatus`, read from `/proc/mounts`). That matched the per-package mounts
+(`MountStatus`, read from the platform mount table: `/proc/mounts` on Linux,
+the system mount table on macOS). That matched the per-package mounts
 of the design this section used to describe. After consolidated mounting the
 only mount is `zzXEL_ortho`, so the answer for every package folder was always
 "not mounted" and `update` and `remove` ran freely against a live filesystem.
@@ -503,8 +504,8 @@ status line and the job rows.
 
 Everything else is an `Effect` carried out by `Effects` (`effects.rs`): load the
 installed packages, load the library, check for `run`, fetch package metadata,
-submit installs and removes, cancel, rebuild the overlay folder, release the
-queue, exit. The answers come back as `Msg`s on one channel.
+submit installs and removes, cancel, abandon, rebuild the overlay folder,
+release the queue, exit. The answers come back as `Msg`s on one channel.
 
 `runner.rs` is the loop around them. Each turn it acts on a signal, draws, waits
 up to 50 ms for keys, hands the channel's messages to the state, once a second
@@ -549,7 +550,7 @@ must not end between the two renames.
 
 ### Shared with the commands
 
-`PackageActions` (`commands/packages/actions.rs`) holds the decisions the
+The `actions` module (`commands/packages/actions.rs`) holds the decisions the
 commands and the TUI must agree on: `library_status` (not installed, up to date,
 or update, and a failed update check is an error rather than "not installed"),
 `plan_install` (a selected ortho followed by its overlay when
@@ -564,11 +565,26 @@ a rule is changed in one place.
 See [Coordination with run](#coordination-with-run). The TUI reads
 `running_instance` through the worker (`Effect::CheckRun`) on start, on refresh
 and each time finished jobs reload the lists, and keeps the answer as
-`run_active`. `u`, `d` and an install over an installed package are refused from
-that answer with `RunActive::message`, and the top banner says so. A `run`
-started while the screen is open is therefore noticed at the next refresh, not
-at the keypress, and the lock the queue takes does not cover it: the queue lock
-serialises package operations, and the instance lock is a different file.
+`run_active`. That answer drives the top banner and refuses `u`, `d` and an
+install over an installed package at the keypress, with `RunActive::message`.
+
+It can be stale: a `run` started while the screen is open is not seen until the
+next check. So `Effects` asks again at the moment it carries out
+`Effect::Remove` or `Effect::Submit`, on the runner's thread (one lock file
+read), through the same `check_removal` and `check_replacement` the commands
+call. A remove batch is refused whole. A `Submit` names in `replacing` the
+packages that are already installed, which the state knows from the library
+statuses, so no disk is read; those are left out, the rest install, and the
+status line adds `RESTART_NOTE`. A batch with nothing left is refused. A refusal
+is answered as `QueueRefused` is (the marks come back and the status line gives
+the reason) after a `RunActive` that brings up the banner. As in the commands, a
+`run` started after that check is not seen. The queue lock does not cover this
+either: it serialises package operations, and the instance lock is a different
+file.
+
+Job ids come from one counter for the whole process, not one per queue. The
+state keeps its job rows after `ReleaseQueue`, so a job in the next queue must
+never share an id with a finished row.
 
 ## Error Handling
 
