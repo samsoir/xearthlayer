@@ -179,7 +179,12 @@ impl<S: Stages> Shared<S> {
             self.changed.notify_all();
         }
         drop(state);
-        self.clean_up(taken);
+        if abandon {
+            // Nothing waits for these deletes, so neither does the caller.
+            drop_elsewhere(taken);
+        } else {
+            self.clean_up(taken);
+        }
     }
 
     /// Drop what `cancel_locked` took, outside the lock, then finish the
@@ -270,6 +275,19 @@ impl<S: Stages> Shared<S> {
         let mut state = self.lock();
         self.finish(&mut state, id, outcome);
     }
+}
+
+/// Drop `taken` on a thread of its own, or here if none can be made.
+/// Abandoned jobs are already finished, so nothing is left to do after.
+fn drop_elsewhere<D: Send + 'static>(taken: Vec<Taken<D>>) {
+    if taken.is_empty() {
+        return;
+    }
+    debug_assert!(taken.iter().all(|t| !t.finish_after));
+    // A spawn that fails drops the closure, and with it `taken`, here.
+    let _ = std::thread::Builder::new()
+        .name("xel-queue-discard".into())
+        .spawn(move || drop(taken));
 }
 
 /// A stage's error as a job outcome.

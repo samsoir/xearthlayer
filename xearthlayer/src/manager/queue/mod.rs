@@ -31,6 +31,8 @@ pub(crate) use lock::LOCK_FILE_NAME;
 
 /// What a signal handler or a UI needs to stop a queue it does not own.
 pub trait QueueControl: Send + Sync {
+    /// Cancel one job. See [`CancelResult`].
+    fn cancel(&self, id: JobId) -> CancelResult;
     /// Cancel every unfinished job.
     fn cancel_all(&self);
     /// Cancel every job and stop waiting for cleanup: waiters return once
@@ -50,6 +52,10 @@ impl Canceller {
         Self(control)
     }
 
+    pub fn cancel(&self, id: JobId) -> CancelResult {
+        self.0.cancel(id)
+    }
+
     pub fn cancel_all(&self) {
         self.0.cancel_all();
     }
@@ -60,6 +66,10 @@ impl Canceller {
 }
 
 impl<S: Stages> QueueControl for state::Shared<S> {
+    fn cancel(&self, id: JobId) -> CancelResult {
+        state::Shared::cancel(self, id)
+    }
+
     fn cancel_all(&self) {
         self.cancel_every(false);
     }

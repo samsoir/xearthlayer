@@ -88,6 +88,8 @@ pub struct FakeManager {
     running: Option<u32>,
     /// Checking for updates fails.
     failing_update_check: bool,
+    /// Listing the installed packages panics.
+    panicking_list: bool,
 }
 
 impl FakeManager {
@@ -153,6 +155,12 @@ impl FakeManager {
     /// Make checking for updates fail, as an unreadable install folder does.
     pub fn with_failing_update_check(mut self) -> Self {
         self.failing_update_check = true;
+        self
+    }
+
+    /// Make listing the installed packages panic, as a bug in a read would.
+    pub fn panicking_on_list(mut self) -> Self {
+        self.panicking_list = true;
         self
     }
 
@@ -270,6 +278,10 @@ impl PackageManagerService for FakeManager {
     }
 
     fn list_packages(&self, _store: &LocalPackageStore) -> ManagerResult<Vec<InstalledPackage>> {
+        assert!(
+            !self.panicking_list,
+            "listing the installed packages blew up"
+        );
         Ok(self.installed.clone())
     }
 

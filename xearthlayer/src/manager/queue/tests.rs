@@ -1120,6 +1120,31 @@ fn abandoning_does_not_wait_for_a_downloaded_package_to_be_deleted() {
     abandoning.join().unwrap();
 }
 
+/// Abandoning returns to its caller at once: the delete runs elsewhere, so
+/// a UI that abandons keeps drawing and can leave.
+#[test]
+fn abandon_returns_while_a_downloaded_package_is_still_being_deleted() {
+    let stages = FakeStages::new(u64::MAX);
+    let (queue, _ids, gate) = a_downloaded_payload_held_in_its_drop(&stages);
+    let canceller = queue.canceller();
+    let (tx, returned) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        canceller.abandon();
+        let _ = tx.send(());
+    });
+
+    assert!(
+        returned.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "abandon waited for the delete"
+    );
+    eventually("B's payload is being dropped", || {
+        stages.0.logged("dropping B")
+    });
+    assert!(!stages.0.logged("dropped B"), "the delete is still held");
+    drop(gate);
+    eventually("B's payload dropped", || stages.0.logged("dropped B"));
+}
+
 /// The same holds for a job cancelled while it waits for space: its
 /// prepared package owns a temp directory too.
 #[test]

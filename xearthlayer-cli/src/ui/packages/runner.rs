@@ -109,7 +109,8 @@ where
     F: Fn() -> ManagerResult<InstallQueue<S>>,
 {
     let mut todo: VecDeque<Effect> = initial.into();
-    let mut heard: Option<Signal> = None;
+    // Signals acted on so far.
+    let mut heard: u64 = 0;
     let mut last_tick = Instant::now();
     loop {
         while let Some(effect) = todo.pop_front() {
@@ -121,12 +122,10 @@ where
             let _ = effects.apply(Effect::Abandon);
             return Ok(());
         }
-        if heard.is_none() {
-            if let Some(signal) = watch.received() {
-                heard = Some(signal);
-                todo.extend(on_signal(state, signal, Instant::now()));
-                continue;
-            }
+        if let Some((nth, signal)) = watch.latest().filter(|(nth, _)| *nth > heard) {
+            heard = nth;
+            todo.extend(on_signal(state, signal, nth, Instant::now()));
+            continue;
         }
 
         screen.draw(state)?;
@@ -154,17 +153,20 @@ where
     }
 }
 
-/// What a signal from outside does. In raw mode Ctrl+C is a key, so an
-/// interrupt was sent by something else; it quits as a confirmed `q` does,
-/// cancelling any jobs first. SIGTERM and SIGHUP leave at once.
-fn on_signal(state: &mut AppState, signal: Signal, now: Instant) -> Vec<Effect> {
+/// What the `nth` signal from outside does, counting from 1. In raw mode
+/// Ctrl+C is a key, so an interrupt was sent by something else. The first
+/// one quits as a confirmed `q` does, cancelling any jobs first; any signal
+/// after it, and SIGTERM or SIGHUP at any time, leave at once.
+fn on_signal(state: &mut AppState, signal: Signal, nth: u64, now: Instant) -> Vec<Effect> {
     match signal {
-        Signal::Interrupt => {
+        Signal::Interrupt if nth == 1 => {
             let mut effects = state.update(Input::Action(Action::Quit), now);
             effects.extend(state.update(Input::Action(Action::Confirm), now));
             effects
         }
-        Signal::Terminate | Signal::Hangup => vec![Effect::Abandon, Effect::Exit],
+        Signal::Interrupt | Signal::Terminate | Signal::Hangup => {
+            vec![Effect::Abandon, Effect::Exit]
+        }
     }
 }
 
@@ -263,7 +265,7 @@ mod tests {
     fn an_interrupt_with_jobs_running_cancels_them_before_exiting() {
         let mut state = with_a_job();
 
-        let effects = on_signal(&mut state, Signal::Interrupt, Instant::now());
+        let effects = on_signal(&mut state, Signal::Interrupt, 1, Instant::now());
 
         assert_eq!(effects, [Effect::CancelAll]);
     }
@@ -272,9 +274,32 @@ mod tests {
     fn an_interrupt_with_nothing_running_exits() {
         let (mut state, _) = AppState::new(true);
 
-        let effects = on_signal(&mut state, Signal::Interrupt, Instant::now());
+        let effects = on_signal(&mut state, Signal::Interrupt, 1, Instant::now());
 
         assert_eq!(effects, [Effect::Exit]);
+    }
+
+    #[test]
+    fn a_signal_after_the_first_abandons_and_exits() {
+        let mut state = with_a_job();
+        let now = Instant::now();
+
+        assert_eq!(
+            on_signal(&mut state, Signal::Interrupt, 1, now),
+            [Effect::CancelAll]
+        );
+        assert_eq!(
+            on_signal(&mut state, Signal::Terminate, 2, now),
+            [Effect::Abandon, Effect::Exit]
+        );
+
+        let mut state = with_a_job();
+        on_signal(&mut state, Signal::Interrupt, 1, now);
+        assert_eq!(
+            on_signal(&mut state, Signal::Interrupt, 2, now),
+            [Effect::Abandon, Effect::Exit],
+            "a second interrupt quits now"
+        );
     }
 
     #[test]
@@ -282,7 +307,7 @@ mod tests {
         for signal in [Signal::Terminate, Signal::Hangup] {
             let mut state = with_a_job();
 
-            let effects = on_signal(&mut state, signal, Instant::now());
+            let effects = on_signal(&mut state, signal, 1, Instant::now());
 
             assert_eq!(effects, [Effect::Abandon, Effect::Exit], "{signal}");
         }

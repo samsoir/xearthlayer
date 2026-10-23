@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -101,6 +102,8 @@ pub struct Effects<S: Stages, F> {
     /// The package each remove job removes, until the job finishes.
     removing: HashMap<JobId, PackageKey>,
     custom_scenery_path: Option<PathBuf>,
+    /// The queue was abandoned: on exit, wait only for a running swap.
+    abandoned: bool,
 }
 
 impl<S, F> Effects<S, F>
@@ -124,6 +127,7 @@ where
             tx,
             removing: HashMap::new(),
             custom_scenery_path,
+            abandoned: false,
         }
     }
 
@@ -137,24 +141,11 @@ where
             Effect::RebuildOverlays => self.worker.rebuild_overlays(),
             Effect::Submit(metadata) => self.submit(metadata),
             Effect::Remove(targets) => self.remove(targets),
-            Effect::CancelJob(id) => {
-                let too_late = self
-                    .queue
-                    .as_ref()
-                    .is_some_and(|queue| queue.cancel(id) == CancelResult::TooLate);
-                if too_late {
-                    self.send(Msg::Status("too late: finishing".to_string()));
-                }
-            }
-            Effect::CancelAll => {
-                if let Some(queue) = &self.queue {
-                    queue.canceller().cancel_all();
-                }
-            }
+            Effect::CancelJob(id) => self.stop(Stop::Job(id)),
+            Effect::CancelAll => self.stop(Stop::All),
             Effect::Abandon => {
-                if let Some(queue) = &self.queue {
-                    queue.canceller().abandon();
-                }
+                self.abandoned |= self.queue.is_some();
+                self.stop(Stop::Abandon);
             }
             Effect::ReleaseQueue => self.release_queue(),
             Effect::Exit => return ControlFlow::Break(()),
@@ -183,6 +174,32 @@ where
 
     fn send(&self, msg: Msg) {
         let _ = self.tx.send(msg);
+    }
+
+    /// Cancel on a thread of its own: cancelling deletes the temp trees of
+    /// downloaded jobs, and the runner must keep drawing meanwhile. Done
+    /// here if no thread can be made. With no queue there is nothing to stop.
+    fn stop(&self, stop: Stop) {
+        let Some(queue) = &self.queue else {
+            return;
+        };
+        let canceller = queue.canceller();
+        let tx = self.tx.clone();
+        let run = move || match stop {
+            Stop::Job(id) => {
+                if canceller.cancel(id) == CancelResult::TooLate {
+                    let _ = tx.send(Msg::Status("too late: finishing".to_string()));
+                }
+            }
+            Stop::All => canceller.cancel_all(),
+            Stop::Abandon => canceller.abandon(),
+        };
+        let spawned = std::thread::Builder::new()
+            .name("xel-packages-cancel".into())
+            .spawn(run.clone());
+        if spawned.is_err() {
+            run();
+        }
     }
 
     /// The running queue, started if there is none. A queue that will not
@@ -252,14 +269,30 @@ where
         self.active.clear();
         // Idle, so this joins its threads at once.
         drop(self.queue.take());
+        self.abandoned = false;
     }
 }
 
 impl<S: Stages, F> Drop for Effects<S, F> {
+    /// An abandoned queue is not joined when dropped, so a swap it is
+    /// running is waited for here: the process must not end mid-rename.
+    /// Nothing else is waited for.
     fn drop(&mut self) {
         self.active.clear();
-        drop(self.queue.take());
+        if let Some(queue) = self.queue.take() {
+            if self.abandoned {
+                queue.wait_idle();
+            }
+        }
     }
+}
+
+/// What [`Effects::stop`] asks of the queue.
+#[derive(Debug, Clone, Copy)]
+enum Stop {
+    Job(JobId),
+    All,
+    Abandon,
 }
 
 /// "NA-CANADA ortho"
@@ -310,6 +343,8 @@ struct Worker {
     tx: Option<Sender<Read>>,
     thread: Option<JoinHandle<()>>,
     flags: Arc<WorkerFlags>,
+    /// Where a read nobody will do is answered.
+    out: Sender<Msg>,
 }
 
 impl Worker {
@@ -321,21 +356,54 @@ impl Worker {
         let (tx, rx) = mpsc::channel();
         let flags = Arc::new(WorkerFlags::default());
         let worker_flags = Arc::clone(&flags);
+        let worker_out = out.clone();
+        // A failed spawn drops the receiver, so every read is answered
+        // with an error by `send`.
         let thread = std::thread::Builder::new()
             .name("xel-packages-worker".into())
-            .spawn(move || run_worker(rx, &worker_flags, manager.as_ref(), &settings, &out))
+            .spawn(move || run_worker(rx, &worker_flags, manager.as_ref(), &settings, &worker_out))
             .map_err(|e| tracing::error!(error = %e, "Package manager: no worker thread"))
             .ok();
         Self {
             tx: Some(tx),
             thread,
             flags,
+            out,
         }
     }
 
+    /// A worker whose thread never started.
+    #[cfg(test)]
+    fn unstarted(out: Sender<Msg>) -> Self {
+        let (tx, _) = mpsc::channel();
+        Self {
+            tx: Some(tx),
+            thread: None,
+            flags: Arc::new(WorkerFlags::default()),
+            out,
+        }
+    }
+
+    /// Queue `read`. With no thread to do it, answer it now with an error,
+    /// so the state is never left waiting.
     fn send(&self, read: Read) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(read);
+        let Some(tx) = &self.tx else {
+            return;
+        };
+        if let Err(mpsc::SendError(read)) = tx.send(read) {
+            let failed = Failure::of(&read);
+            match read {
+                Read::Load(load) => {
+                    self.flags.pending[load as usize].store(false, Ordering::SeqCst)
+                }
+                Read::RebuildOverlays => {
+                    self.flags.rebuilds.fetch_sub(1, Ordering::SeqCst);
+                }
+                Read::Metadata(_) => {}
+            }
+            let _ = self
+                .out
+                .send(failed.msg("the package manager's worker is not running"));
         }
     }
 
@@ -366,6 +434,48 @@ impl Drop for Worker {
     }
 }
 
+/// The answer to a read that did not happen, built before the read runs.
+enum Failure {
+    Installed,
+    Library,
+    Run,
+    /// The name of each package whose metadata was asked for.
+    Metadata(Vec<String>),
+    Overlays,
+}
+
+impl Failure {
+    fn of(read: &Read) -> Self {
+        match read {
+            Read::Load(Load::Installed) => Self::Installed,
+            Read::Load(Load::Library) => Self::Library,
+            Read::Load(Load::Run) => Self::Run,
+            Read::Metadata(entries) => Self::Metadata(
+                entries
+                    .iter()
+                    .map(|e| package_name(&e.title, e.package_type))
+                    .collect(),
+            ),
+            Read::RebuildOverlays => Self::Overlays,
+        }
+    }
+
+    fn msg(self, why: &str) -> Msg {
+        match self {
+            Self::Installed => Msg::Installed(Err(why.to_string())),
+            Self::Library => Msg::Library(Err(why.to_string())),
+            Self::Run => Msg::Status(format!("could not check for xearthlayer run: {why}")),
+            Self::Metadata(names) => Msg::MetadataReady(
+                names
+                    .into_iter()
+                    .map(|name| Err(format!("{name}: {why}")))
+                    .collect(),
+            ),
+            Self::Overlays => Msg::Status(format!("could not rebuild the overlays: {why}")),
+        }
+    }
+}
+
 fn run_worker(
     rx: Receiver<Read>,
     flags: &WorkerFlags,
@@ -373,51 +483,83 @@ fn run_worker(
     settings: &Settings,
     out: &Sender<Msg>,
 ) {
-    let send = |msg: Msg| {
-        let _ = out.send(msg);
+    let mut reads = Reads {
+        manager,
+        settings,
+        out,
+        installed: None,
+        library: Vec::new(),
     };
-    // The last reads, so each answer can be joined with the other.
-    let mut installed: Option<Vec<InstalledPackage>> = None;
-    let mut library: Vec<LibraryRow> = Vec::new();
     for read in rx {
         if flags.closing.load(Ordering::SeqCst) && !matches!(read, Read::RebuildOverlays) {
             continue;
         }
+        if let Read::Load(load) = &read {
+            // Cleared first, so a request made during this read runs again.
+            flags.pending[*load as usize].store(false, Ordering::SeqCst);
+        }
+        let rebuild = matches!(read, Read::RebuildOverlays);
+        let failure = Failure::of(&read);
+        let done = panic::catch_unwind(AssertUnwindSafe(|| reads.run(read)));
+        if rebuild {
+            flags.rebuilds.fetch_sub(1, Ordering::SeqCst);
+        }
+        if let Err(payload) = done {
+            let why = format!("panicked: {}", panic_text(payload.as_ref()));
+            tracing::error!("Package manager: a read {why}");
+            let _ = out.send(failure.msg(&why));
+        }
+    }
+}
+
+/// The worker's reads, and what it keeps of the last ones.
+struct Reads<'a> {
+    manager: &'a dyn PackageManagerService,
+    settings: &'a Settings,
+    out: &'a Sender<Msg>,
+    /// The last installed list and library rows, so each answer can be
+    /// joined with the other.
+    installed: Option<Vec<InstalledPackage>>,
+    library: Vec<LibraryRow>,
+}
+
+impl Reads<'_> {
+    fn send(&self, msg: Msg) {
+        let _ = self.out.send(msg);
+    }
+
+    fn run(&mut self, read: Read) {
+        let manager = self.manager;
+        let settings = self.settings;
         match read {
-            Read::Load(load) => {
-                // Cleared first, so a request made during this read runs again.
-                flags.pending[load as usize].store(false, Ordering::SeqCst);
-                match load {
-                    Load::Installed => {
-                        let store = manager.create_store(&settings.install_dir);
-                        match manager.list_packages(&store) {
-                            Ok(packages) => {
-                                send(Msg::Installed(Ok(local_rows(&packages, &library))));
-                                installed = Some(packages);
-                            }
-                            Err(e) => send(Msg::Installed(Err(e.to_string()))),
-                        }
+            Read::Load(Load::Installed) => {
+                let store = manager.create_store(&settings.install_dir);
+                match manager.list_packages(&store) {
+                    Ok(packages) => {
+                        self.send(Msg::Installed(Ok(local_rows(&packages, &self.library))));
+                        self.installed = Some(packages);
                     }
-                    Load::Library => {
-                        let Some(url) = &settings.library_url else {
-                            send(Msg::LibraryNotConfigured);
-                            continue;
-                        };
-                        match read_library(manager, settings, url) {
-                            Ok(rows) => {
-                                library = rows.clone();
-                                send(Msg::Library(Ok(rows)));
-                                // The installed rows' updates come from the library.
-                                if let Some(packages) = &installed {
-                                    send(Msg::Installed(Ok(local_rows(packages, &library))));
-                                }
-                            }
-                            Err(e) => send(Msg::Library(Err(e.to_string()))),
-                        }
-                    }
-                    Load::Run => send(Msg::RunActive(manager.running_instance())),
+                    Err(e) => self.send(Msg::Installed(Err(e.to_string()))),
                 }
             }
+            Read::Load(Load::Library) => {
+                let Some(url) = &settings.library_url else {
+                    self.send(Msg::LibraryNotConfigured);
+                    return;
+                };
+                match read_library(manager, settings, url) {
+                    Ok(rows) => {
+                        self.library = rows.clone();
+                        self.send(Msg::Library(Ok(rows)));
+                        // The installed rows' updates come from the library.
+                        if let Some(packages) = &self.installed {
+                            self.send(Msg::Installed(Ok(local_rows(packages, &self.library))));
+                        }
+                    }
+                    Err(e) => self.send(Msg::Library(Err(e.to_string()))),
+                }
+            }
+            Read::Load(Load::Run) => self.send(Msg::RunActive(manager.running_instance())),
             Read::Metadata(entries) => {
                 let results = entries
                     .iter()
@@ -427,7 +569,7 @@ fn run_worker(
                         })
                     })
                     .collect();
-                send(Msg::MetadataReady(results));
+                self.send(Msg::MetadataReady(results));
             }
             Read::RebuildOverlays => {
                 let report = rebuild_overlays(
@@ -437,12 +579,22 @@ fn run_worker(
                     settings.disable_overlays,
                     settings.xworld_pro,
                 );
-                flags.rebuilds.fetch_sub(1, Ordering::SeqCst);
                 if let Some(line) = report.outcome.or_else(|| report.lines.first().cloned()) {
-                    send(Msg::Status(line));
+                    self.send(Msg::Status(line));
                 }
             }
         }
+    }
+}
+
+/// The text of a panic payload.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 
@@ -533,12 +685,24 @@ mod tests {
         }
     }
 
-    /// Every stage succeeds at once, except a swap held by `swap_gate`.
+    /// Opens its gate when dropped, so a failing assertion unwinds instead
+    /// of leaving a queue thread held at the gate.
+    struct OpenOnDrop(Arc<Gate>);
+
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    /// Every stage succeeds at once, except a swap held by `swap_gate` and
+    /// the delete of one package's download held by `drop_gate`.
     #[derive(Clone)]
     struct FakeStages {
         temp: PathBuf,
         packages: PathBuf,
         swap_gate: Option<Arc<Gate>>,
+        drop_gate: Option<(&'static str, Arc<Gate>)>,
     }
 
     impl FakeStages {
@@ -547,13 +711,28 @@ mod tests {
                 temp: dir.join("tmp"),
                 packages: dir.join("packages"),
                 swap_gate: None,
+                drop_gate: None,
+            }
+        }
+    }
+
+    /// A download. Dropping it stands for deleting its temp tree.
+    struct Payload {
+        title: String,
+        gate: Option<Arc<Gate>>,
+    }
+
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            if let Some(gate) = &self.gate {
+                gate.pass();
             }
         }
     }
 
     impl Stages for FakeStages {
         type Prepared = String;
-        type Downloaded = String;
+        type Downloaded = Payload;
 
         fn temp_dir(&self) -> &Path {
             &self.temp
@@ -580,16 +759,25 @@ mod tests {
             title: String,
             _cancel: &CancelToken,
             progress: DownloadProgressCallback,
-        ) -> ManagerResult<String> {
+        ) -> ManagerResult<Payload> {
             progress(&DownloadProgress {
                 parts: Vec::new(),
                 total_bytes_downloaded: 1,
                 total_bytes: Some(1),
             });
-            Ok(title)
+            let gate = match &self.drop_gate {
+                Some((held, gate)) if *held == title => Some(Arc::clone(gate)),
+                _ => None,
+            };
+            Ok(Payload { title, gate })
         }
 
-        fn install(&self, title: String, ctx: &dyn InstallContext) -> ManagerResult<InstallResult> {
+        fn install(
+            &self,
+            payload: Payload,
+            ctx: &dyn InstallContext,
+        ) -> ManagerResult<InstallResult> {
+            let title = payload.title.clone();
             ctx.stage(InstallStage::Extracting);
             if !ctx.begin_swap() {
                 return Err(ManagerError::Cancelled);
@@ -631,8 +819,8 @@ mod tests {
         }
     }
 
-    type TestEffects =
-        Effects<FakeStages, Box<dyn Fn() -> ManagerResult<InstallQueue<FakeStages>>>>;
+    type StartQueue = Box<dyn Fn() -> ManagerResult<InstallQueue<FakeStages>> + Send>;
+    type TestEffects = Effects<FakeStages, StartQueue>;
 
     /// Effects whose queue runs `stages`, with `manager` behind the reads.
     fn effects_with(
@@ -642,7 +830,7 @@ mod tests {
     ) -> (TestEffects, Receiver<Msg>) {
         let (tx, rx) = mpsc::channel();
         let observer_tx = tx.clone();
-        let start: Box<dyn Fn() -> ManagerResult<InstallQueue<FakeStages>>> = Box::new(move || {
+        let start: StartQueue = Box::new(move || {
             InstallQueue::start(
                 stages.clone(),
                 Arc::new(ChannelObserver::new(observer_tx.clone())),
@@ -1000,15 +1188,106 @@ mod tests {
         );
 
         let _ = effects.apply(Effect::CancelAll);
-        gate.open();
 
-        let seen: Vec<String> = until(&rx, |msg| {
+        // The swap is still held: the cancel, applied on its own thread,
+        // finishes the queued job without it.
+        let seen: Vec<String> = until(&rx, finished).iter().map(describe).collect();
+        assert_eq!(seen.last().unwrap(), "2 Cancelled", "{seen:#?}");
+        gate.open();
+        let rest: Vec<String> = until(&rx, finished).iter().map(describe).collect();
+        assert_eq!(rest.last().unwrap(), "1 Installed", "the swap completes");
+    }
+
+    /// EU-WEST held in its swap, and NA-EAST downloaded behind it with the
+    /// delete of its download held. Returns the gates, swap first.
+    fn swapping_with_a_held_download_behind(
+        dir: &Path,
+    ) -> (TestEffects, Receiver<Msg>, OpenOnDrop, OpenOnDrop) {
+        let swap = Arc::new(Gate::default());
+        let delete = Arc::new(Gate::default());
+        let stages = FakeStages {
+            swap_gate: Some(Arc::clone(&swap)),
+            drop_gate: Some(("NA-EAST", Arc::clone(&delete))),
+            ..FakeStages::in_dir(dir)
+        };
+        let (mut effects, rx) = effects_on(stages);
+        let _ = effects.apply(Effect::Submit(vec![
+            metadata("EU-WEST"),
+            metadata("NA-EAST"),
+        ]));
+        let mut swapping = false;
+        let mut downloaded = false;
+        while !(swapping && downloaded) {
+            match next(&rx) {
+                Msg::Job(JobId(1), JobMsg::Stage("Installing")) => swapping = true,
+                Msg::Job(JobId(2), JobMsg::Downloaded) => downloaded = true,
+                _ => {}
+            }
+        }
+        (effects, rx, OpenOnDrop(swap), OpenOnDrop(delete))
+    }
+
+    #[test]
+    fn cancel_all_returns_at_once_while_a_download_is_being_deleted() {
+        let dir = TempDir::new().unwrap();
+        let (mut effects, rx, swap, delete) = swapping_with_a_held_download_behind(dir.path());
+        // A watchdog: should cancelling block, this opens the delete late
+        // and the timing below fails, rather than the test hanging.
+        let watchdog = Arc::clone(&delete.0);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            watchdog.open();
+        });
+
+        let started = std::time::Instant::now();
+        let flow = effects.apply(Effect::CancelAll);
+
+        assert!(flow.is_continue());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancelling held the runner for {:?}",
+            started.elapsed()
+        );
+        // The runner is free: an effect still applies at once.
+        let _ = effects.apply(Effect::CheckRun);
+        assert!(
+            !rx.try_iter()
+                .any(|msg| matches!(msg, Msg::Job(JobId(2), JobMsg::Cancelled))),
+            "NA-EAST finishes only once its download is deleted"
+        );
+        drop(delete);
+        until(&rx, |msg| {
             matches!(msg, Msg::Job(JobId(2), JobMsg::Cancelled))
-        })
-        .iter()
-        .map(describe)
-        .collect();
-        assert!(seen.iter().any(|l| l == "2 Cancelled"), "{seen:#?}");
+        });
+        drop(swap);
+        until(&rx, |msg| {
+            matches!(msg, Msg::Job(JobId(1), _)) && finished(msg)
+        });
+    }
+
+    #[test]
+    fn exit_after_abandon_waits_for_the_swap_and_nothing_else() {
+        let dir = TempDir::new().unwrap();
+        let (mut effects, _rx, swap, delete) = swapping_with_a_held_download_behind(dir.path());
+
+        assert!(effects.apply(Effect::Abandon).is_continue());
+        assert!(effects.apply(Effect::Exit).is_break());
+        let (tx, dropped) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(effects);
+            let _ = tx.send(());
+        });
+
+        assert!(
+            dropped.recv_timeout(Duration::from_millis(300)).is_err(),
+            "left while the swap was running"
+        );
+        drop(swap);
+        assert!(
+            dropped.recv_timeout(WAIT).is_ok(),
+            "waited for more than the swap"
+        );
+        drop(delete);
     }
 
     // ------------------------------------------------------------------------
@@ -1165,5 +1444,56 @@ mod tests {
         }
 
         assert!(link.symlink_metadata().is_err(), "the symlink is gone");
+    }
+
+    #[test]
+    fn a_read_that_panics_is_answered_with_an_error_and_the_worker_goes_on() {
+        let dir = TempDir::new().unwrap();
+        let manager = FakeManager::default()
+            .panicking_on_list()
+            .with_running_instance(7);
+        let (mut effects, rx) = effects_with(FakeStages::in_dir(dir.path()), manager, settings());
+
+        let _ = effects.apply(Effect::LoadInstalled);
+        let _ = effects.apply(Effect::CheckRun);
+
+        let msg = next(&rx);
+        assert!(
+            matches!(&msg, Msg::Installed(Err(why)) if why.contains("panicked")),
+            "{msg:?}"
+        );
+        assert!(matches!(next(&rx), Msg::RunActive(Some(7))));
+    }
+
+    #[test]
+    fn with_no_worker_every_read_is_answered_with_an_error() {
+        let (tx, rx) = mpsc::channel();
+        let worker = Worker::unstarted(tx);
+
+        worker.load(Load::Installed);
+        worker.load(Load::Library);
+        worker.load(Load::Run);
+        worker.send(Read::Metadata(vec![LibraryEntry::new(
+            "sum",
+            PackageType::Ortho,
+            "EU-WEST",
+            Version::new(1, 0, 0),
+            "https://example.invalid/EU-WEST",
+        )]));
+        worker.rebuild_overlays();
+
+        let got: Vec<Msg> = rx.try_iter().collect();
+        assert!(matches!(&got[0], Msg::Installed(Err(_))), "{got:?}");
+        assert!(matches!(&got[1], Msg::Library(Err(_))), "{got:?}");
+        assert!(matches!(&got[2], Msg::Status(_)), "{got:?}");
+        assert!(
+            matches!(&got[3], Msg::MetadataReady(results)
+                if matches!(&results[..], [Err(why)] if why.starts_with("EU-WEST ortho"))),
+            "{got:?}"
+        );
+        assert!(matches!(&got[4], Msg::Status(_)), "{got:?}");
+        // A later load is answered too, not swallowed as already pending.
+        worker.load(Load::Installed);
+        assert!(matches!(rx.try_recv(), Ok(Msg::Installed(Err(_)))));
     }
 }
