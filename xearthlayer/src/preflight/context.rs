@@ -37,6 +37,7 @@ pub struct BootstrapContext {
     custom_scenery_path: Option<PathBuf>,
     xworld_pro: Option<crate::xworld_pro::Detection>,
     xworld_order_accepted: bool,
+    startup_warnings: Vec<String>,
 }
 
 impl BootstrapContext {
@@ -50,6 +51,7 @@ impl BootstrapContext {
             custom_scenery_path: None,
             xworld_pro: None,
             xworld_order_accepted: false,
+            startup_warnings: Vec::new(),
         }
     }
 
@@ -113,6 +115,17 @@ impl BootstrapContext {
     pub fn accept_xworld_order(&mut self) {
         self.xworld_order_accepted = true;
     }
+
+    /// The warnings the checks reported, in order, for a front end that
+    /// replaces the screen they were printed on (#326).
+    pub fn startup_warnings(&self) -> &[String] {
+        &self.startup_warnings
+    }
+
+    /// Record the warnings the checks reported.
+    pub fn set_startup_warnings(&mut self, warnings: Vec<String>) {
+        self.startup_warnings = warnings;
+    }
 }
 
 #[cfg(test)]
@@ -123,6 +136,7 @@ mod tests {
     fn readers_are_empty_before_any_check_contributes() {
         let ctx = BootstrapContext::new("run", None);
         assert_eq!(ctx.command(), "run");
+        assert!(ctx.startup_warnings().is_empty());
         assert!(ctx.airport().is_none());
         assert!(ctx.config().is_none());
         assert!(ctx.install_location().is_none());

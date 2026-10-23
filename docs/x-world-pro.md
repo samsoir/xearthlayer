@@ -49,12 +49,12 @@ With `packages.xworld_pro = true`, `xearthlayer run` runs three preflight checks
 
 **`xworld-pro-detect`** records what it found, for example which continents are active and where XEarthLayer overlays are off, in the log at INFO level; the dashboard's Status pane shows the active continents too. It prints a warning only when something needs your attention: the setting is on but nothing is found, no continent is enabled, or `scenery_packs.ini` cannot be read. In each of those cases it changes nothing.
 
-**`xworld-pro-order`** requires that every enabled XEarthLayer entry (`zzXEL_ortho`, and `yzXEL_overlay` when present) comes after every enabled X-World Pro layer in `scenery_packs.ini`. The library's position is not checked. If the order is wrong, it names the topmost enabled XEarthLayer entry and the lowest enabled X-World Pro layer, with their line numbers, and asks whether to stop or continue:
+**`xworld-pro-order`** requires that every enabled XEarthLayer entry (`zzXEL_ortho`, and `yzXEL_overlay` when present) comes after every enabled X-World Pro layer in `scenery_packs.ini`. The library's position is not checked. If the order is wrong, it shows the file, the topmost enabled XEarthLayer entry and the lowest enabled X-World Pro layer with their line numbers, and how to fix it, then waits for a key:
 
-- Stop: XEarthLayer exits. Reorder `scenery_packs.ini` as the "Scenery_packs.ini" section of the X-World Pro manual describes, then start again.
-- Continue: XEarthLayer starts and repeats the problem as a warning.
+- `s` (or Escape): XEarthLayer exits. Move XEarthLayer's entries below every X-World Pro line as the "Scenery_packs.ini" section of the X-World Pro manual describes, then start again.
+- `c`: XEarthLayer starts, and the problem stays in the log and as a startup warning on the dashboard. The answer is remembered: XEarthLayer does not ask again until `scenery_packs.ini` changes, and any change to it, by you or by X-Plane adding new scenery, asks again.
 
-When there is no terminal (a script, a service), it continues with the warning rather than waiting for an answer.
+It asks only when it can be both seen and answered, which means both standard input and standard error are a terminal. Otherwise (a script, a service, output redirected to a file) it continues with the warning and remembers nothing.
 
 **`xworld-pro-setup`** only warns. It reports:
 

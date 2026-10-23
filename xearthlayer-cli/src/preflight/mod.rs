@@ -6,6 +6,7 @@
 
 use crate::error::CliError;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use xearthlayer::config::{config_file_path, ConfigFileError};
 use xearthlayer::preflight::{BootstrapContext, PreflightError, RunOutcome, Runner};
 
@@ -143,9 +144,10 @@ pub fn build_registry_with(env: RegistryEnv) -> Runner<BootstrapContext> {
     // X-World Pro (#213): detection contributes what X-Plane will load, then the
     // order (which may stop startup) and the setup advice read it.
     runner.register(Box::new(xworld::XWorldProDetect));
-    runner.register(Box::new(xworld::XWorldProOrder::new(Box::new(
-        xworld::AskUserOrder,
-    ))));
+    runner.register(Box::new(xworld::XWorldProOrder::new(
+        Box::new(xworld::AskUserOrder),
+        xearthlayer::paths::xworld_order_accepted_file(),
+    )));
     runner.register(Box::new(xworld::XWorldProSetup));
     runner.register(Box::new(system::AirportIcao));
     runner.register(Box::new(system::MacFuseAvailable::with_probe(
@@ -171,8 +173,28 @@ pub fn default_lock_path() -> PathBuf {
 /// the setup wizard treating an existing user as new.
 pub fn enforce(ctx: &mut BootstrapContext) -> Result<(), CliError> {
     let mut registry = build_registry();
-    registry.set_reporter(Box::new(|_check, message| eprintln!("{}", message)));
-    finish(registry.enforce(ctx), ctx)
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    registry.set_reporter(reporter(Arc::clone(&warnings)));
+    let outcome = registry.enforce(ctx);
+    ctx.set_startup_warnings(std::mem::take(&mut *lock(&warnings)));
+    finish(outcome, ctx)
+}
+
+fn lock(warnings: &Mutex<Vec<String>>) -> std::sync::MutexGuard<'_, Vec<String>> {
+    warnings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Each warning goes to stderr, where it is read before anything else draws,
+/// and to the log, and is kept for the front end: `run`'s dashboard replaces
+/// the screen a moment later, so stderr alone lost it (#326).
+fn reporter(warnings: Arc<Mutex<Vec<String>>>) -> xearthlayer::preflight::Reporter {
+    Box::new(move |check, message| {
+        eprintln!("{}", message);
+        tracing::warn!(check, "{}", message.trim());
+        lock(&warnings).push(message.trim().to_string());
+    })
 }
 
 fn finish(
@@ -241,6 +263,22 @@ pub fn to_cli_error(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn the_reporter_keeps_every_warning_for_the_front_end() {
+        // #326: the dashboard replaces the screen these were printed on.
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let report = reporter(Arc::clone(&warnings));
+        report("config-upgrade", "\nWarning: missing 3 setting(s)\n");
+        report("xworld-pro-setup", "entry points to a missing folder");
+        assert_eq!(
+            *lock(&warnings),
+            vec![
+                "Warning: missing 3 setting(s)".to_string(),
+                "entry points to a missing folder".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn first_run_maps_to_needs_setup_preserving_the_welcome_and_exit_zero() {

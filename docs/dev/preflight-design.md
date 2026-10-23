@@ -319,10 +319,20 @@ commands share one rule, `xworld_pro::overlay_plan` (`Remove`, `Except`, `All`).
 
 `xworld-pro-order` takes an injected `ConfirmOrder` (the pattern of
 `migrate.rs`). A violation is a remediable `Unsatisfied`; `remediate` asks the
-confirmer for `Stop` or `Continue`, and `Continue` records the answer in the
-context so re-inspection returns `Warning`. `AskUserOrder` checks
-`!cfg!(test) && stdin().is_terminal()` and continues without a terminal, so no
-test or script blocks. `xworld-pro-setup` never fails a run.
+confirmer for `Stop`, `Continue` or `ContinueUnasked`. Both continues record
+the answer in the context so re-inspection returns `Warning`; `Continue`, a
+choice the user made, is also remembered as a SHA-256 of `scenery_packs.ini`
+in `paths::xworld_order_accepted_file()`, and a later inspection whose file
+matches returns `Warning` without asking. `AskUserOrder` asks only when stdin
+and stderr are both terminals (`can_ask`), draws the problem and the keys on
+stderr, and reads one key (`s`, Escape or Ctrl+C stop, `c` continues); with no
+terminal, or under `cfg!(test)`, it answers `ContinueUnasked`, so no test or
+script blocks (#326). `xworld-pro-setup` never fails a run.
+
+The CLI's reporter prints each warning to stderr, logs it at WARN with the
+check's name, and keeps it in `BootstrapContext::startup_warnings`. `run`'s
+dashboard replaces the screen the warnings were printed on, so the Status pane
+shows their count and points at the log.
 
 ### Execution
 

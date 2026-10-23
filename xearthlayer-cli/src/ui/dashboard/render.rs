@@ -89,7 +89,8 @@ pub fn render_ui(
         Constraint::Length(9), // Scenery System (3 columns + latency row + border + padding)
         Constraint::Length(8), // Input/Output (2-column)
         Constraint::Length(4), // Caches (2 content lines + border + padding)
-        Constraint::Length(8), // Status (4 content lines + padding above and below + borders)
+        // Status: its lines, plus padding above and below and the borders
+        Constraint::Length(feature_status.map_or(4, FeatureStatus::line_count) + 4),
     ];
     if update_info.is_some() {
         constraints.push(Constraint::Length(1)); // Update footer

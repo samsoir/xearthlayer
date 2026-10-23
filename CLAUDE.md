@@ -224,7 +224,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `inspect` is pure and `remediate` acts, so the registry can also be run as a report; remediation is verified by a second inspection
     - Checks never call one another. A check reading an absent contributed value returns `Unsatisfied` **naming** it rather than unwrapping
     - Platform exclusion uses `cfg!` in `applies()`, not `#[cfg]`, so macOS-only checks are still compiled and tested on Linux
-    - X-World Pro (#213): `xworld-pro-detect` contributes `xearthlayer::xworld_pro::Detection` when `packages.xworld_pro` is on (hint only when off), `xworld-pro-order` stops or continues on a bad `scenery_packs.ini` order via an injected `ConfirmOrder`, `xworld-pro-setup` warns; overlay consolidation leaves active continents out via `OrchestratorConfig.xworld_pro`. See `docs/x-world-pro.md`
+    - X-World Pro (#213): `xworld-pro-detect` contributes `xearthlayer::xworld_pro::Detection` when `packages.xworld_pro` is on (hint only when off), `xworld-pro-order` stops or continues on a bad `scenery_packs.ini` order via an injected `ConfirmOrder` (asks only when stdin and stderr are terminals, one key, `s` or `c`; a `c` is remembered as a SHA-256 of the file in `paths::xworld_order_accepted_file()` until it changes; #326), `xworld-pro-setup` warns; overlay consolidation leaves active continents out via `OrchestratorConfig.xworld_pro`. See `docs/x-world-pro.md`
+    - Warnings go to stderr, the log (WARN, with the check name) and `BootstrapContext::startup_warnings`; the dashboard's Status pane shows their count, because it replaces the screen they were printed on (#326)
     - See `docs/dev/preflight-design.md`
 
 18. **GeoIndex** (`xearthlayer/src/geo_index/`)

@@ -59,6 +59,8 @@ pub struct TuiAppConfig<'a> {
     pub xplane_env: Option<XPlaneEnvironment>,
     /// X-World Pro support, from the preflight detection.
     pub xworld_pro: XworldProStatus,
+    /// Warnings the startup checks printed before the dashboard took the screen.
+    pub startup_warnings: usize,
 }
 
 /// Run the TUI application with dashboard.
@@ -82,6 +84,7 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         airport_icao,
         xplane_env,
         xworld_pro,
+        startup_warnings,
     } = config;
 
     let dds_disk_max = (cfg.cache.disk_size as f64 * cfg.cache.dds_disk_ratio) as usize;
@@ -195,6 +198,7 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         },
         night: orchestrator.night_lighting(),
         xworld_pro,
+        startup_warnings,
     });
 
     // Transition to Running state

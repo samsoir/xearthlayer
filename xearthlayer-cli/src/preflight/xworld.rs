@@ -3,9 +3,13 @@
 //! only warns. XEarthLayer never edits scenery_packs.ini or X-World Pro.
 
 use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 
 use xearthlayer::preflight::{BootstrapContext, Preflight, PreflightError, Remedy, Status};
-use xearthlayer::xworld_pro::{detect, order_violation, setup_findings, OverlayCoverage};
+use xearthlayer::xworld_pro::{
+    detect, order_violation, setup_findings, Detection, OrderViolation, OverlayCoverage,
+    SCENERY_PACKS_FILE,
+};
 
 use super::names;
 
@@ -129,21 +133,62 @@ pub fn coverage_report(
 /// What the user chose when the order is wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderChoice {
+    /// Stop so the user can fix `scenery_packs.ini`.
     Stop,
+    /// The user chose to continue: remembered until the file changes.
     Continue,
+    /// Nobody could be asked (no terminal): continue, warn, remember nothing.
+    ContinueUnasked,
 }
 
 /// How an order problem is put to the user. Injected so a test never asks.
 pub trait ConfirmOrder: Send + Sync {
-    fn decide(&self, problem: &str) -> OrderChoice;
+    fn decide(&self, violation: &OrderViolation, scenery_packs: &Path) -> OrderChoice;
 }
 
-/// Continue without asking: tests, and the interactive confirmer without a terminal.
+/// Continue as if the user chose to: tests.
+#[cfg(test)]
 pub struct ContinueAnyway;
 
+#[cfg(test)]
 impl ConfirmOrder for ContinueAnyway {
-    fn decide(&self, _problem: &str) -> OrderChoice {
+    fn decide(&self, _: &OrderViolation, _: &Path) -> OrderChoice {
         OrderChoice::Continue
+    }
+}
+
+/// Whether there is someone to ask (#326). The prompt is drawn on stderr and
+/// the answer read from stdin, so both must be the terminal: asking on stdin
+/// alone drew the menu into a redirected file, or explained nothing when stdout
+/// was the one redirected.
+fn can_ask(stdin_is_terminal: bool, stderr_is_terminal: bool) -> bool {
+    stdin_is_terminal && stderr_is_terminal
+}
+
+/// The prompt, all on one stream: what is wrong, how to fix it, what each key does.
+fn order_prompt(violation: &OrderViolation, scenery_packs: &Path) -> String {
+    format!(
+        "\nX-World Pro must load before XEarthLayer, but {} has them the other way round:\n\
+         \n  line {:>4}  {}\n  line {:>4}  {}\n\
+         \nTo fix it, move XEarthLayer's entries (zzXEL_..., yzXEL_...) below every \
+         X-World Pro line,\nthen start XEarthLayer again.\n\
+         \n  s  stop now, so you can fix the file\
+         \n  c  continue anyway (not asked again until scenery_packs.ini changes)\n",
+        scenery_packs.display(),
+        violation.xel.line,
+        violation.xel.name(),
+        violation.xwp.line,
+        violation.xwp.name(),
+    )
+}
+
+/// The choice a key makes, if any. Ctrl+C and Escape stop.
+fn choice_for_key(key: &console::Key) -> Option<OrderChoice> {
+    use console::Key;
+    match key {
+        Key::Char('s' | 'S') | Key::Escape | Key::CtrlC => Some(OrderChoice::Stop),
+        Key::Char('c' | 'C') => Some(OrderChoice::Continue),
+        _ => None,
     }
 }
 
@@ -151,39 +196,73 @@ impl ConfirmOrder for ContinueAnyway {
 pub struct AskUserOrder;
 
 impl ConfirmOrder for AskUserOrder {
-    fn decide(&self, problem: &str) -> OrderChoice {
+    fn decide(&self, violation: &OrderViolation, scenery_packs: &Path) -> OrderChoice {
         use std::io::IsTerminal;
         // `cfg!(test)` backs up injection: a test must never block on input,
-        // and stdin is a terminal when the suite runs from a shell.
-        let can_ask = !cfg!(test) && std::io::stdin().is_terminal();
-        if !can_ask {
-            return ContinueAnyway.decide(problem);
+        // and the streams are terminals when the suite runs from a shell.
+        if cfg!(test)
+            || !can_ask(
+                std::io::stdin().is_terminal(),
+                std::io::stderr().is_terminal(),
+            )
+        {
+            return OrderChoice::ContinueUnasked;
         }
-        println!("X-World Pro scenery order: {problem}");
-        let theme = dialoguer::theme::ColorfulTheme::default();
-        let choice = dialoguer::Select::with_theme(&theme)
-            .with_prompt("XEarthLayer should load below X-World Pro")
-            .items(&["Stop so I can fix scenery_packs.ini", "Continue anyway"])
-            .default(0)
-            .interact()
-            .unwrap_or(1);
-        if choice == 0 {
-            OrderChoice::Stop
-        } else {
-            OrderChoice::Continue
+        let term = console::Term::stderr();
+        let _ = term.write_str(&order_prompt(violation, scenery_packs));
+        loop {
+            let _ = term.write_str("\nPress s or c: ");
+            match term.read_key() {
+                Ok(key) => {
+                    if let Some(choice) = choice_for_key(&key) {
+                        let _ = term.write_line(if choice == OrderChoice::Stop {
+                            "s"
+                        } else {
+                            "c"
+                        });
+                        return choice;
+                    }
+                }
+                // A terminal that cannot be read cannot answer: never block.
+                Err(_) => return OrderChoice::ContinueUnasked,
+            }
         }
     }
+}
+
+/// The fingerprint a remembered "continue" is tied to: the file's contents, so
+/// X-Plane rewriting it unchanged keeps the answer and any edit asks again.
+fn fingerprint(scenery_packs: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(scenery_packs).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
 }
 
 /// XEarthLayer's entries must load below every enabled X-World Pro layer.
 pub struct XWorldProOrder {
     confirm: Box<dyn ConfirmOrder>,
+    /// Where a "continue" is remembered, with the fingerprint it applies to.
+    accepted: PathBuf,
 }
 
 impl XWorldProOrder {
-    pub fn new(confirm: Box<dyn ConfirmOrder>) -> Self {
-        Self { confirm }
+    pub fn new(confirm: Box<dyn ConfirmOrder>, accepted: PathBuf) -> Self {
+        Self { confirm, accepted }
     }
+
+    fn remembered(&self, scenery_packs: &Path) -> bool {
+        match (
+            std::fs::read_to_string(&self.accepted),
+            fingerprint(scenery_packs),
+        ) {
+            (Ok(stored), Some(current)) => stored.trim() == current,
+            _ => false,
+        }
+    }
+}
+
+fn scenery_packs_of(d: &Detection) -> PathBuf {
+    d.custom_scenery.join(SCENERY_PACKS_FILE)
 }
 
 impl Preflight<BootstrapContext> for XWorldProOrder {
@@ -201,10 +280,12 @@ impl Preflight<BootstrapContext> for XWorldProOrder {
         };
         match order_violation(d) {
             None => Status::Satisfied,
-            Some(v) if ctx.xworld_order_accepted() => Status::Warning(format!(
-                "X-World Pro scenery order: {}; continuing as asked",
-                v.describe()
-            )),
+            Some(v) if ctx.xworld_order_accepted() || self.remembered(&scenery_packs_of(d)) => {
+                Status::Warning(format!(
+                    "X-World Pro scenery order: {}; continuing. {ORDER_HINT}",
+                    v.describe()
+                ))
+            }
             Some(v) => Status::unsatisfied(format!("X-World Pro scenery order: {}", v.describe()))
                 .remediable()
                 .with_hint(ORDER_HINT),
@@ -215,14 +296,26 @@ impl Preflight<BootstrapContext> for XWorldProOrder {
         &self,
         ctx: &mut BootstrapContext,
     ) -> Result<Remedy<BootstrapContext>, PreflightError> {
-        let problem = ctx
-            .xworld_pro()
-            .and_then(order_violation)
-            .map(|v| v.describe());
-        if let Some(problem) = problem {
-            if self.confirm.decide(&problem) == OrderChoice::Continue {
+        let Some(d) = ctx.xworld_pro() else {
+            return Ok(Remedy::default());
+        };
+        let scenery_packs = scenery_packs_of(d);
+        let Some(violation) = order_violation(d) else {
+            return Ok(Remedy::default());
+        };
+        match self.confirm.decide(&violation, &scenery_packs) {
+            OrderChoice::Stop => {}
+            OrderChoice::Continue => {
+                if let Some(fp) = fingerprint(&scenery_packs) {
+                    // Remembering is a convenience: failing to only means
+                    // being asked again next time.
+                    let _ = xearthlayer::cache::integrity::write_atomic(&self.accepted, |w| {
+                        std::io::Write::write_all(w, fp.as_bytes())
+                    });
+                }
                 ctx.accept_xworld_order();
             }
+            OrderChoice::ContinueUnasked => ctx.accept_xworld_order(),
         }
         Ok(Remedy::default())
     }
@@ -289,9 +382,26 @@ mod tests {
 
     struct Stop;
     impl ConfirmOrder for Stop {
-        fn decide(&self, _: &str) -> OrderChoice {
+        fn decide(&self, _: &OrderViolation, _: &Path) -> OrderChoice {
             OrderChoice::Stop
         }
+    }
+
+    /// Answers like a terminal-less run.
+    struct NoTerminal;
+    impl ConfirmOrder for NoTerminal {
+        fn decide(&self, _: &OrderViolation, _: &Path) -> OrderChoice {
+            OrderChoice::ContinueUnasked
+        }
+    }
+
+    /// An order check remembering its answer in `dir`.
+    fn order_check(confirm: Box<dyn ConfirmOrder>, dir: &tempfile::TempDir) -> XWorldProOrder {
+        XWorldProOrder::new(confirm, dir.path().join("state").join("accepted"))
+    }
+
+    fn bad_order() -> String {
+        pack("zzXEL_ortho") + &pack(EU09)
     }
 
     #[test]
@@ -372,10 +482,10 @@ mod tests {
     #[test]
     fn order_and_setup_apply_only_with_the_setting_on_and_for_run() {
         let (_d, c) = ctx(false, &[], "");
-        assert!(!XWorldProOrder::new(Box::new(ContinueAnyway)).applies(&c));
+        assert!(!order_check(Box::new(ContinueAnyway), &_d).applies(&c));
         assert!(!XWorldProSetup.applies(&c));
         let (_d, c) = ctx(true, &[], "");
-        assert!(XWorldProOrder::new(Box::new(ContinueAnyway)).applies(&c));
+        assert!(order_check(Box::new(ContinueAnyway), &_d).applies(&c));
         let mut s = BootstrapContext::new("setup", None);
         s.set_config(c.config().unwrap().clone());
         assert!(!XWorldProSetup.applies(&s));
@@ -395,15 +505,15 @@ mod tests {
     fn a_good_order_is_satisfied() {
         let (_d, c) = detected(true, &[EU09], &(pack(EU09) + &pack("zzXEL_ortho")));
         assert_eq!(
-            XWorldProOrder::new(Box::new(Stop)).inspect(&c),
+            order_check(Box::new(Stop), &_d).inspect(&c),
             Status::Satisfied
         );
     }
 
     #[test]
     fn a_bad_order_continues_as_a_warning_when_the_user_says_so() {
-        let check = XWorldProOrder::new(Box::new(ContinueAnyway));
-        let (_d, mut c) = detected(true, &[EU09], &(pack("zzXEL_ortho") + &pack(EU09)));
+        let (_d, mut c) = detected(true, &[EU09], &bad_order());
+        let check = order_check(Box::new(ContinueAnyway), &_d);
         assert!(matches!(
             check.inspect(&c),
             Status::Unsatisfied {
@@ -420,8 +530,8 @@ mod tests {
 
     #[test]
     fn a_bad_order_stays_unsatisfied_when_the_user_stops() {
-        let check = XWorldProOrder::new(Box::new(Stop));
-        let (_d, mut c) = detected(true, &[EU09], &(pack("zzXEL_ortho") + &pack(EU09)));
+        let (_d, mut c) = detected(true, &[EU09], &bad_order());
+        let check = order_check(Box::new(Stop), &_d);
         check.remediate(&mut c).unwrap();
         match check.inspect(&c) {
             Status::Unsatisfied { hint: Some(h), .. } => {
@@ -442,8 +552,111 @@ mod tests {
         assert_eq!(XWorldProSetup.inspect(&c), Status::Satisfied);
     }
 
+    /// A later start against the same folder, with `ini` as the file now reads.
+    fn detected_in(dir: &tempfile::TempDir, xworld_pro: bool, ini: &str) -> BootstrapContext {
+        let cs = dir.path().join("Custom Scenery");
+        std::fs::write(cs.join(SCENERY_PACKS_FILE), ini).unwrap();
+        let mut config = ConfigFile::default();
+        config.packages.xworld_pro = xworld_pro;
+        let mut c = BootstrapContext::new("run", None);
+        c.set_config(config);
+        c.set_custom_scenery_path(cs);
+        XWorldProDetect.remediate(&mut c).unwrap();
+        c
+    }
+
+    fn a_violation(c: &BootstrapContext) -> OrderViolation {
+        order_violation(c.xworld_pro().unwrap()).unwrap()
+    }
+
     #[test]
     fn the_interactive_confirmer_never_blocks_under_test() {
-        assert_eq!(AskUserOrder.decide("anything"), OrderChoice::Continue);
+        let (_d, c) = detected(true, &[EU09], &bad_order());
+        assert_eq!(
+            AskUserOrder.decide(&a_violation(&c), Path::new("scenery_packs.ini")),
+            OrderChoice::ContinueUnasked
+        );
+    }
+
+    #[test]
+    fn it_asks_only_when_the_prompt_can_be_seen_and_answered() {
+        // #326: the menu goes to stderr and the key comes from stdin.
+        assert!(can_ask(true, true));
+        assert!(
+            !can_ask(true, false),
+            "stderr redirected: the menu would be invisible"
+        );
+        assert!(!can_ask(false, true), "stdin redirected: nobody can answer");
+        assert!(!can_ask(false, false));
+    }
+
+    #[test]
+    fn the_prompt_names_both_lines_the_file_the_fix_and_each_key() {
+        let (_d, c) = detected(true, &[EU09], &bad_order());
+        let text = order_prompt(
+            &a_violation(&c),
+            Path::new("/xp/Custom Scenery/scenery_packs.ini"),
+        );
+        for wanted in [
+            "/xp/Custom Scenery/scenery_packs.ini",
+            "line    1  zzXEL_ortho",
+            &format!("line    2  {EU09}"),
+            "move XEarthLayer's entries",
+            "s  stop now",
+            "c  continue anyway",
+        ] {
+            assert!(text.contains(wanted), "missing {wanted:?} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn keys_choose_and_anything_else_is_ignored() {
+        use console::Key;
+        assert_eq!(choice_for_key(&Key::Char('s')), Some(OrderChoice::Stop));
+        assert_eq!(choice_for_key(&Key::Char('S')), Some(OrderChoice::Stop));
+        assert_eq!(choice_for_key(&Key::Escape), Some(OrderChoice::Stop));
+        assert_eq!(choice_for_key(&Key::CtrlC), Some(OrderChoice::Stop));
+        assert_eq!(choice_for_key(&Key::Char('c')), Some(OrderChoice::Continue));
+        assert_eq!(choice_for_key(&Key::Enter), None, "no silent default");
+        assert_eq!(choice_for_key(&Key::Char('y')), None);
+    }
+
+    #[test]
+    fn a_continue_is_remembered_until_scenery_packs_changes() {
+        let (d, mut c) = detected(true, &[EU09], &bad_order());
+        order_check(Box::new(ContinueAnyway), &d)
+            .remediate(&mut c)
+            .unwrap();
+
+        // The next start: a fresh context, and a confirmer that would stop.
+        let next = detected_in(&d, true, &bad_order());
+        let check = order_check(Box::new(Stop), &d);
+        assert!(
+            matches!(check.inspect(&next), Status::Warning(_)),
+            "the remembered answer stands while the file is unchanged"
+        );
+
+        // Any edit to the file asks again.
+        let edited = bad_order() + &pack("Some_Other_Scenery");
+        let changed = detected_in(&d, true, &edited);
+        assert!(matches!(
+            check.inspect(&changed),
+            Status::Unsatisfied {
+                remediable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn continuing_without_a_terminal_warns_but_remembers_nothing() {
+        let (d, mut c) = detected(true, &[EU09], &bad_order());
+        let check = order_check(Box::new(NoTerminal), &d);
+        check.remediate(&mut c).unwrap();
+        match check.inspect(&c) {
+            Status::Warning(m) => assert!(m.contains("zzXEL_ortho") && m.contains("Move"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!d.path().join("state").join("accepted").exists());
     }
 }

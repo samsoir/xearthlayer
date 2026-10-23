@@ -278,6 +278,7 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
                 config.packages.xworld_pro,
                 ctx.xworld_pro(),
             ),
+            startup_warnings: ctx.startup_warnings().len(),
         };
         run_tui(tui_config)
     } else {

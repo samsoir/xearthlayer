@@ -173,6 +173,16 @@ pub fn packages_log_file_in(base: &dyn BaseDirectories) -> PathBuf {
     base.state_dir().join("xearthlayer-packages.log")
 }
 
+/// Where `xearthlayer run` remembers that the user chose to continue with
+/// XEarthLayer loading above X-World Pro, as a fingerprint of the
+/// `scenery_packs.ini` it applies to (#326).
+pub fn xworld_order_accepted_file() -> PathBuf {
+    xworld_order_accepted_file_in(active())
+}
+pub fn xworld_order_accepted_file_in(base: &dyn BaseDirectories) -> PathBuf {
+    base.state_dir().join("xworld_pro_order_accepted")
+}
+
 /// The running instance lock.
 pub fn lock_file() -> PathBuf {
     lock_file_in(active())
@@ -323,6 +333,10 @@ mod tests {
             "the package commands must never share the flight log (#320)"
         );
         assert_eq!(
+            xworld_order_accepted_file_in(&base),
+            base.state_dir().join("xworld_pro_order_accepted")
+        );
+        assert_eq!(
             lock_file_in(&base),
             base.state_dir().join("xearthlayer.lock")
         );
@@ -375,6 +389,7 @@ mod tests {
             version_check_file(),
             log_file(),
             packages_log_file(),
+            xworld_order_accepted_file(),
             lock_file(),
             packages_dir(),
             patches_dir(),

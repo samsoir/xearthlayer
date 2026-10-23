@@ -79,6 +79,16 @@ pub struct FeatureStatus {
     pub encoder: EncoderStatus,
     pub night: NightLighting,
     pub xworld_pro: XworldProStatus,
+    /// How many warnings the startup checks printed before the dashboard
+    /// replaced the screen; they are in the log (#326).
+    pub startup_warnings: usize,
+}
+
+impl FeatureStatus {
+    /// Lines the pane draws: one more while there are startup warnings.
+    pub fn line_count(&self) -> u16 {
+        4 + u16::from(self.startup_warnings > 0)
+    }
 }
 
 /// Text of a line whose feature is working.
@@ -283,14 +293,32 @@ fn line(mark: Mark, text: Vec<Span<'static>>) -> Line<'static> {
     Line::from(spans)
 }
 
+impl FeatureStatusWidget<'_> {
+    /// Shown only when there were any: the screen they were printed on is gone.
+    fn startup_warnings_line(&self) -> Option<Line<'static>> {
+        let n = self.status.startup_warnings;
+        (n > 0).then(|| {
+            let noun = if n == 1 { "warning" } else { "warnings" };
+            line(
+                Mark::WARNING,
+                vec![styled(
+                    format!("{n} startup {noun}: see xearthlayer.log"),
+                    WARN,
+                )],
+            )
+        })
+    }
+}
+
 impl Widget for FeatureStatusWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let text = vec![
+        let mut text = vec![
             self.frame_rate_line(),
             self.encoder_line(),
             self.night_line(),
             self.xworld_pro_line(),
         ];
+        text.extend(self.startup_warnings_line());
         Paragraph::new(text).render(area, buf);
     }
 }
@@ -319,7 +347,46 @@ mod tests {
             encoder: EncoderStatus::Gpu(radeon()),
             night: NightLighting::Lit,
             xworld_pro: XworldProStatus::Active(vec!["America", "Europe"]),
+            startup_warnings: 0,
         }
+    }
+
+    #[test]
+    fn startup_warnings_add_a_line_only_when_there_are_any() {
+        let quiet = all_on();
+        assert_eq!(quiet.line_count(), 4);
+        let widget = FeatureStatusWidget::new(&quiet);
+        assert!(widget.startup_warnings_line().is_none());
+
+        let one = FeatureStatus {
+            startup_warnings: 1,
+            ..all_on()
+        };
+        assert_eq!(one.line_count(), 5);
+        let text: String = FeatureStatusWidget::new(&one)
+            .startup_warnings_line()
+            .unwrap()
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            text.contains("1 startup warning: see xearthlayer.log"),
+            "{text}"
+        );
+
+        let two = FeatureStatus {
+            startup_warnings: 2,
+            ..all_on()
+        };
+        let text: String = FeatureStatusWidget::new(&two)
+            .startup_warnings_line()
+            .unwrap()
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("2 startup warnings"), "{text}");
     }
 
     /// Each row as text, skipping the cell a wide symbol covers so an emoji
