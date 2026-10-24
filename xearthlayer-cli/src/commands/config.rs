@@ -196,6 +196,17 @@ fn run_upgrade(dry_run: bool) -> Result<(), CliError> {
         println!();
     }
 
+    if !analysis.folded_values.is_empty() {
+        println!(
+            "Settings that move to another setting ({}):",
+            analysis.folded_values.len()
+        );
+        for fold in &analysis.folded_values {
+            println!("  ~ {}", fold.describe());
+        }
+        println!();
+    }
+
     if !analysis.migrated_values.is_empty() {
         println!(
             "Retired values to rewrite ({}):",

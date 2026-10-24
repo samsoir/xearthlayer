@@ -159,12 +159,6 @@ pub struct LoggingSettings {
 pub struct PrefetchSettings {
     /// Enable predictive tile prefetching based on X-Plane telemetry
     pub enabled: bool,
-    /// Adaptive prefetch mode: "aggressive", "opportunistic", or "disabled"
-    ///
-    /// - "aggressive": currently identical to "opportunistic"
-    /// - "opportunistic": prefetch on (default)
-    /// - "disabled": Disable prefetch
-    pub mode: String,
     /// Web API port for X-Plane SimState polling (default: 8086)
     pub web_api_port: u16,
     /// Interval between prefetch cycles in milliseconds. Default: 2000ms.

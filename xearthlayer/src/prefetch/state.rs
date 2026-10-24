@@ -29,7 +29,7 @@ pub struct PrefetchStatsSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PrefetchState {
     /// Prefetch is switched off (`prefetch.enabled = false` or
-    /// `prefetch.mode = disabled`).
+    /// `run --no-prefetch`).
     Disabled,
     /// The prefetch lane is stood down because FUSE demand is in flight.
     PausedForDemand,

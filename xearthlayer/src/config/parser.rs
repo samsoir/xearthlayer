@@ -8,9 +8,10 @@ use std::path::PathBuf;
 
 use super::defaults::TUI_SYMBOLS_VALUES;
 use super::file::ConfigFileError;
+use super::keys::{ConfigKey, ConfigKeyError};
 use super::settings::ConfigFile;
 use super::size::parse_size;
-use super::upgrade::deprecated_value;
+use super::upgrade::{deprecated_value, folded_value};
 use crate::dds::DdsFormat;
 
 /// Parse an `Ini` object into a `ConfigFile`.
@@ -227,25 +228,6 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
     if let Some(section) = ini.section(Some("prefetch")) {
         if let Some(v) = section.get("enabled") {
             config.prefetch.enabled = parse_bool(v);
-        }
-        if let Some(v) = section.get("mode") {
-            let v = match deprecated_value("prefetch.mode", v) {
-                Some(retired) => retired.replacement.to_string(),
-                None => v.trim().to_lowercase(),
-            };
-            match v.as_str() {
-                "aggressive" | "opportunistic" | "disabled" => {
-                    config.prefetch.mode = v;
-                }
-                _ => {
-                    return Err(ConfigFileError::InvalidValue {
-                        section: "prefetch".to_string(),
-                        key: "mode".to_string(),
-                        value: v.to_string(),
-                        reason: "must be 'aggressive', 'opportunistic', or 'disabled'".to_string(),
-                    });
-                }
-            }
         }
         if let Some(v) = section.get("web_api_port") {
             config.prefetch.web_api_port =
@@ -490,7 +472,37 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
         }
     }
 
+    apply_folds(ini, &mut config)?;
+
     Ok(config)
+}
+
+/// Apply each retired setting's value that moved to a current setting
+/// (`FOLDED_VALUES`). Run after every section is read, so a fold wins over
+/// its target wherever the two lines are.
+fn apply_folds(ini: &Ini, config: &mut ConfigFile) -> Result<(), ConfigFileError> {
+    for (section, props) in ini.iter() {
+        let section = section.unwrap_or("");
+        for (key, value) in props.iter() {
+            let Some(fold) = folded_value(&format!("{section}.{key}"), value) else {
+                continue;
+            };
+            // Both always hold, asserted for every fold by the upgrade tests.
+            let invalid = |reason: String| ConfigFileError::InvalidValue {
+                section: section.to_string(),
+                key: key.to_string(),
+                value: value.to_string(),
+                reason,
+            };
+            let into: ConfigKey = fold
+                .into
+                .parse()
+                .map_err(|e: ConfigKeyError| invalid(e.to_string()))?;
+            into.set(config, fold.becomes)
+                .map_err(|e| invalid(e.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Parse a boolean value from a config string.
@@ -888,18 +900,33 @@ max_retries = 5
         );
     }
 
-    /// `auto` named a calibration-driven mode selector that never ran (#277),
-    /// so it always meant opportunistic. Configs that still say so must load,
-    /// and load as what they actually did.
+    /// #340: `prefetch.mode` is retired. `disabled` reads as
+    /// `prefetch.enabled = false` wherever the two lines are, any other value
+    /// (including ones the old parser refused) is ignored, and an explicit
+    /// `enabled = false` is never turned back on.
     #[test]
-    fn legacy_auto_prefetch_mode_loads_as_opportunistic() {
+    fn retired_prefetch_mode_folds_into_enabled() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.ini");
-        std::fs::write(&path, "[prefetch]\nmode = AUTO\n").unwrap();
-        assert_eq!(
-            ConfigFile::load_from(&path).unwrap().prefetch.mode,
-            "opportunistic"
-        );
+        for (body, expected) in [
+            ("[prefetch]\nmode = disabled\n", false),
+            ("[prefetch]\nmode = Disabled\nenabled = true\n", false),
+            ("[prefetch]\nenabled = true\nmode = disabled\n", false),
+            ("[prefetch]\nenabled = true\nmode = aggressive\n", true),
+            ("[prefetch]\nmode = opportunistic\n", true),
+            ("[prefetch]\nmode = auto\n", true),
+            ("[prefetch]\nmode = nonsense\n", true),
+            ("[prefetch]\nenabled = false\nmode = aggressive\n", false),
+            ("[prefetch]\nenabled = false\n", false),
+            ("[prefetch]\n", true),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            assert_eq!(
+                ConfigFile::load_from(&path).unwrap().prefetch.enabled,
+                expected,
+                "{body:?}"
+            );
+        }
     }
 
     /// #334: the rebuilt world is library generation v2. The root library at
@@ -944,15 +971,5 @@ max_retries = 5
             DEFAULT_LIBRARY_URL,
             "https://xearthlayer.app/packages/v2/xearthlayer_package_library.txt"
         );
-    }
-
-    #[test]
-    fn explicit_prefetch_modes_load_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.ini");
-        for mode in ["aggressive", "opportunistic", "disabled"] {
-            std::fs::write(&path, format!("[prefetch]\nmode = {mode}\n")).unwrap();
-            assert_eq!(ConfigFile::load_from(&path).unwrap().prefetch.mode, mode);
-        }
     }
 }

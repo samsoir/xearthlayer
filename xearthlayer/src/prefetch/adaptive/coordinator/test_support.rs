@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use crate::coord::TileCoord;
 use crate::executor::DdsDiskCacheChecker;
-use crate::prefetch::adaptive::calibration::{PerformanceCalibration, StrategyMode};
+use crate::prefetch::adaptive::calibration::PerformanceCalibration;
 use crate::prefetch::adaptive::strategy::PrefetchPlan;
 use crate::prefetch::state::AircraftState;
 use crate::prefetch::SceneryIndex;
@@ -23,14 +23,13 @@ use crate::runtime::{LaneError, LaneReceipt, PrefetchLane};
 // Factory helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Create a standard test calibration with opportunistic mode.
+/// Create a standard test calibration.
 pub(crate) fn test_calibration() -> PerformanceCalibration {
     PerformanceCalibration {
         throughput_tiles_per_sec: 25.0,
         avg_tile_generation_ms: 40,
         tile_generation_stddev_ms: 10,
         confidence: 0.9,
-        recommended_strategy: StrategyMode::Opportunistic,
         calibrated_at: Instant::now(),
         baseline_throughput: 25.0,
         sample_count: 100,

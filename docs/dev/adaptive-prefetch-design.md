@@ -4,7 +4,7 @@
 
 **Project**: XEarthLayer
 **Date**: January 2026, revised October 2026
-**Version**: 2.4
+**Version**: 2.5
 **Status**: Implemented (sliding box since PR #102)
 
 ---
@@ -19,7 +19,7 @@
 5. [Three-Window Model](#three-window-model)
 6. [SceneryWindow](#scenerywindow)
 7. [BoundaryStrategy](#boundarystrategy)
-8. [Strategy Mode](#strategy-mode)
+8. [On or Off](#on-or-off)
 9. [Integration Points](#integration-points)
 10. [Configuration](#configuration)
 11. [Error Handling & Edge Cases](#error-handling--edge-cases)
@@ -994,24 +994,20 @@ pub trait AdaptivePrefetchStrategy: Send + Sync {
 
 ---
 
-## Strategy Mode
+## On or Off
 
-The trigger mode comes from `prefetch.mode` and nothing else:
+Prefetch is switched by `prefetch.enabled` alone (and `run --no-prefetch`).
+With it off, `run` starts no coordinator.
 
-```rust
-pub enum StrategyMode {
-    Aggressive,
-    Opportunistic,   // default
-    Disabled,        // never prefetch
-}
-```
-
-**`Aggressive` and `Opportunistic` currently behave identically.**
-`should_prefetch_now` returns `true` for both, and nothing else branches on the
-mode. The names describe triggers from earlier designs: the position trigger
-went with the boundary monitors (PR #102), and the "executor is quiet" trigger
-was the circuit breaker removed in PR #96. Backpressure and the sim state gates
-now apply in every mode, so in practice the setting is an on/off switch.
+Until #340 there was also `prefetch.mode`, with `opportunistic` (the default),
+`aggressive` and `disabled`. The first two named triggers from earlier designs:
+the position trigger went with the boundary monitors (PR #102), and the
+"executor is quiet" trigger was the circuit breaker removed in PR #96. By then
+`should_prefetch_now` returned `true` for both and nothing else branched on the
+mode, while `disabled` switched prefetch off by a second route, a coordinator
+that ran and planned nothing. The mode was retired; a config's
+`mode = disabled` is folded into `enabled = false` when the file is read
+(`config::upgrade::FOLDED_VALUES`), and any other value is ignored.
 
 ### Why there is no automatic selection
 
@@ -1027,8 +1023,7 @@ It was removed in #277 rather than wired. Every later change to the prefetcher
 ladder, the transition throttle) was flight tested and tuned against a
 prefetcher that was in fact running opportunistic. Turning selection on would
 change the behaviour those parameters were chosen for, on a signal that has
-never been exercised in the field. `auto` was retired with it; existing configs
-that say `mode = auto` load as `opportunistic`.
+never been exercised in the field.
 
 `PerformanceCalibration` remains as a fixed estimate
 (`PerformanceCalibration::default_opportunistic()`) that `PrefetchPlan` uses to
@@ -1152,8 +1147,7 @@ keys that exist today, with their defaults:
 
 ```ini
 [prefetch]
-enabled = true                 ; master switch
-mode = opportunistic           ; opportunistic | aggressive | disabled
+enabled = true                 ; the only switch
 web_api_port = 8086            ; X-Plane Web API, for position and SimState
 
 ; Takeoff transition: hold, then ramp submission from 25% to 100% over 30 s
@@ -1348,6 +1342,7 @@ plans are being cut by the request channel.
 | 1.1 | January 2026 | Added rolling recalibration, priority-based backpressure, design considerations |
 | 2.0 | March 2026 | Major revision: replaced band-based cruise strategy with boundary-driven model. Three-window architecture (X-Plane / XEL / Target). Dual boundary monitors (lat/lon). Removed CruiseStrategy, BandCalculator, BoundaryPrioritizer, TurnDetector. Added SceneryWindow with window derivation, retention inference, and `Assumed` state for no-coverage starts. Two-phase commit for region tracking. GeoIndex extended with RetainedRegion and PrefetchedRegion layers. Updated configuration (deprecated 7 settings, added 6 new). Based on whitepaper v1.1 findings from 5 flights / 10.5+ hours of data. |
 | 2.1 | March 2026 | **Window dimension and loading depth correction.** Empirical map-based measurement at EDDF/YPAD/WSSS revealed window is ~3° lat × ~3°/cos(lat) lon, not 9×9°. FUSE burst analysis (65 classified events with telemetry) confirmed asymmetric loading depth: ROW loads 3 deep (73%), COL loads 2 deep (64%), both 3-4 wide. Trigger distance ~1° from window edge. Updated defaults: `default_window_rows` 9→3, `default_window_cols` 9→auto, `trigger_distance` 3.0→1.0, `load_depth` 3→0 (auto: 3 rows, 2 cols). See whitepaper v1.2 for methodology. |
-| 2.2 | October 2026 | Removed throughput calibration and the `auto` mode (#277). Mode is configuration only; see [Strategy Mode](#strategy-mode). |
+| 2.2 | October 2026 | Removed throughput calibration and the `auto` mode (#277). Mode is configuration only. |
 | 2.3 | October 2026 | **Brought into line with the code.** The document still described the v2.0 boundary monitors, deleted in PR #102. Removed the monitor sections; rewrote the overview, goals, component diagram, module structure, per-cycle operation, throttling, retention, edge cases, configuration and testing strategy for the sliding box. Corrected the box extent to 3.5° to 7.0° (default `box_extent` 7.0). Recorded that world rebuild detection is not implemented, that `SceneryWindow` is dead code, and that `cycle_interval_ms` is inert. Documented that a region is marked once none of its tiles is outstanding, across drains (#296). |
 | 2.4 | October 2026 | **Demand and prefetch lanes (#296).** Prefetch moved out of the shared pipeline into its own lane behind the `PrefetchLane` trait, paused while FUSE waits on generation. Added the Demand and prefetch lanes section (no-harm contract, admission pause, always claim, cache probe, sizing, the lane contract), replaced the `DdsClient` integration and backpressure inputs, and added the lane and FUSE latency fields to the Prefetch sample. Added `prefetch.capacity_share`. |
+| 2.5 | October 2026 | **`prefetch.mode` retired (#340).** Its two active values behaved the same and `disabled` duplicated `prefetch.enabled = false`, which is now the only switch; replaced Strategy Mode with [On or Off](#on-or-off). |

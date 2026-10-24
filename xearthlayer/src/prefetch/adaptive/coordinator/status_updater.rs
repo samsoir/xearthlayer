@@ -6,7 +6,6 @@
 use crate::coord::TileCoord;
 use crate::prefetch::state::{DetailedPrefetchStats, SharedPrefetchStatus, StateInputs};
 
-use super::super::calibration::StrategyMode;
 use super::super::strategy::PrefetchPlan;
 use super::status::CoordinatorStatus;
 
@@ -96,7 +95,7 @@ pub(crate) fn update_status_no_plan(
 /// and resolves once.
 fn state_inputs(status: &CoordinatorStatus, lane_busy: bool) -> StateInputs {
     StateInputs {
-        enabled: status.enabled && status.mode != StrategyMode::Disabled,
+        enabled: status.enabled,
         demand_paused: false,
         phase: status.phase,
         deferred_last_cycle: status.deferred_last_cycle,

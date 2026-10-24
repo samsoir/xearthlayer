@@ -179,7 +179,6 @@ The transition ramp parameters are user-configurable through the standard INI co
 [prefetch]
 # Existing settings...
 enabled = true
-mode = opportunistic
 
 # Transition ramp settings (new)
 takeoff_climb_ft = 1000

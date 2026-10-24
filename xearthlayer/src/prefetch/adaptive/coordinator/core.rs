@@ -55,8 +55,8 @@ use crate::prefetch::state::{AircraftState, SharedPrefetchStatus};
 use crate::prefetch::SceneryIndex;
 
 use super::super::boundary_strategy::{BoundaryStrategy, CoverageDetail, RegionDiskState};
-use super::super::calibration::{PerformanceCalibration, StrategyMode};
-use super::super::config::{AdaptivePrefetchConfig, PrefetchMode};
+use super::super::calibration::PerformanceCalibration;
+use super::super::config::AdaptivePrefetchConfig;
 use super::super::phase_detector::{FlightPhase, PhaseDetector};
 use super::super::prefetch_box::PrefetchBox;
 use super::super::strategy::PrefetchPlan;
@@ -116,11 +116,6 @@ pub const BACKPRESSURE_REDUCED_FRACTION: f64 = 0.5;
 /// In cruise phase, the coordinator uses a **sliding prefetch box** approach:
 /// the [`PrefetchBox`] computes a heading-biased region around the aircraft,
 /// and the [`BoundaryStrategy`] manages region lifecycle (InProgress/Prefetched).
-///
-/// # Trigger Modes
-///
-/// - **Aggressive**: Position-based trigger at 0.3° into DSF tile
-/// - **Opportunistic**: Circuit breaker trigger when X-Plane is idle
 pub struct AdaptivePrefetchCoordinator {
     /// Configuration.
     pub(super) config: AdaptivePrefetchConfig,
@@ -232,7 +227,6 @@ impl std::fmt::Debug for AdaptivePrefetchCoordinator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdaptivePrefetchCoordinator")
             .field("config.enabled", &self.config.enabled)
-            .field("config.mode", &self.config.mode)
             .field("has_prefetch_lane", &self.prefetch_lane.is_some())
             .field("has_metrics_client", &self.metrics_client.is_some())
             .field("status", &self.status)
@@ -394,15 +388,6 @@ impl AdaptivePrefetchCoordinator {
             .map(|index| index.tiles_in_region(*region))
     }
 
-    /// Get the current effective mode, as configured by `prefetch.mode`.
-    pub fn effective_mode(&self) -> StrategyMode {
-        match self.config.mode {
-            PrefetchMode::Aggressive => StrategyMode::Aggressive,
-            PrefetchMode::Opportunistic => StrategyMode::Opportunistic,
-            PrefetchMode::Disabled => StrategyMode::Disabled,
-        }
-    }
-
     /// Update with new aircraft state.
     ///
     /// Call this with each telemetry update. Returns the tiles to prefetch
@@ -447,14 +432,6 @@ impl AdaptivePrefetchCoordinator {
         }
         self.status.enabled = true;
 
-        // Get effective mode
-        let mode = self.effective_mode();
-        self.status.mode = mode;
-
-        if mode == StrategyMode::Disabled {
-            return None;
-        }
-
         // Update phase detector and notify transition throttle on phase change
         let previous_phase = self.phase_detector.current_phase();
         let phase_changed = self.phase_detector.update(ground_speed_kt, msl_ft);
@@ -466,12 +443,6 @@ impl AdaptivePrefetchCoordinator {
                 .on_phase_change(previous_phase, phase);
         }
         self.refresh_throttle_status();
-
-        // Determine if we should prefetch
-        let should_prefetch = self.should_prefetch_now(mode);
-        if !should_prefetch {
-            return None;
-        }
 
         let calibration = PerformanceCalibration::default_opportunistic();
 
@@ -806,29 +777,11 @@ impl AdaptivePrefetchCoordinator {
     // Internal helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Determine if we should prefetch now based on mode and conditions.
-    fn should_prefetch_now(&self, mode: StrategyMode) -> bool {
-        match mode {
-            StrategyMode::Disabled => false,
-
-            StrategyMode::Aggressive => {
-                // Aggressive mode always prefetches (position-based trigger handled externally)
-                true
-            }
-
-            StrategyMode::Opportunistic => {
-                // Opportunistic mode allows prefetch (SimState handles load detection)
-                true
-            }
-        }
-    }
-
     /// Get startup info string for logging.
     pub fn startup_info_string(&self) -> String {
-        let mode = self.effective_mode();
         format!(
-            "adaptive, mode={:?}, ground_threshold={}kt, box_extent={:.1}°",
-            mode, self.config.ground_speed_threshold_kt, self.config.box_extent,
+            "adaptive, ground_threshold={}kt, box_extent={:.1}°",
+            self.config.ground_speed_threshold_kt, self.config.box_extent,
         )
     }
 
@@ -1392,32 +1345,6 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Mode selection tests
-    // ─────────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_effective_mode_default_is_opportunistic() {
-        let coord = AdaptivePrefetchCoordinator::with_defaults();
-        assert_eq!(coord.effective_mode(), StrategyMode::Opportunistic);
-    }
-
-    #[test]
-    fn test_effective_mode_honours_each_configured_mode() {
-        for (configured, effective) in [
-            (PrefetchMode::Aggressive, StrategyMode::Aggressive),
-            (PrefetchMode::Opportunistic, StrategyMode::Opportunistic),
-            (PrefetchMode::Disabled, StrategyMode::Disabled),
-        ] {
-            let config = AdaptivePrefetchConfig {
-                mode: configured,
-                ..Default::default()
-            };
-            let coord = AdaptivePrefetchCoordinator::new(config);
-            assert_eq!(coord.effective_mode(), effective, "{configured}");
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
     // Update tests
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1432,18 +1359,6 @@ mod tests {
         let plan = coord.update((53.5, 9.5), 45.0, 100.0, 0.0);
         assert!(plan.is_none());
         assert!(!coord.status.enabled);
-    }
-
-    #[test]
-    fn test_update_disabled_mode_returns_none() {
-        let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Disabled,
-            ..Default::default()
-        };
-        let mut coord = AdaptivePrefetchCoordinator::new(config);
-
-        let plan = coord.update((53.5, 9.5), 45.0, 100.0, 0.0);
-        assert!(plan.is_none());
     }
 
     #[test]
@@ -1588,7 +1503,7 @@ mod tests {
 
         let info = coord.startup_info_string();
         assert!(info.contains("adaptive"));
-        assert!(info.contains("mode="));
+        assert!(!info.contains("mode="), "prefetch has no mode since #340");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2043,7 +1958,6 @@ mod tests {
         let empty_index = Arc::new(SceneryIndex::with_defaults());
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ramp_duration: std::time::Duration::from_secs(0),
             ..Default::default()
         };
@@ -2105,7 +2019,6 @@ mod tests {
         let client = Arc::new(CapLimitedLane::new(100_000));
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ramp_duration: std::time::Duration::from_secs(0),
             ..Default::default()
         };
@@ -3077,7 +2990,6 @@ mod tests {
         let scenery_index = make_scenery_index(55, 7, 16);
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
@@ -3148,7 +3060,6 @@ mod tests {
         let client = Arc::new(CapLimitedLane::new(5));
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             // Zero ramp so transition throttle doesn't reduce tile count
             ramp_duration: std::time::Duration::from_secs(0),
             ..Default::default()
@@ -3230,7 +3141,6 @@ mod tests {
         let client = Arc::new(CapLimitedLane::new(1000));
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             // Zero ramp so transition throttle doesn't reduce tile count
             ramp_duration: std::time::Duration::from_secs(0),
             ..Default::default()
@@ -3284,7 +3194,6 @@ mod tests {
         let client = Arc::new(CapLimitedLane::new(1000)); // no channel limit
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             // 5-second ramp so throttle is definitely active
             ramp_duration: std::time::Duration::from_secs(5),
             ramp_start_fraction: 0.20,
@@ -3355,7 +3264,6 @@ mod tests {
         let client = Arc::new(CapLimitedLane::new(10)); // channel cap at 10
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ramp_duration: std::time::Duration::from_secs(5),
             ramp_start_fraction: 0.20,
             ..Default::default()
@@ -3492,7 +3400,6 @@ mod tests {
         let client = Arc::new(CapLimitedLane::new(10_000));
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ramp_duration: std::time::Duration::from_secs(5),
             ramp_start_fraction: 0.20,
             ..Default::default()
@@ -3542,7 +3449,6 @@ mod tests {
         let client = Arc::new(HighLoadLane);
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ramp_duration: std::time::Duration::from_secs(0),
             ..Default::default()
         };
@@ -3584,7 +3490,6 @@ mod tests {
         let geo_index = Arc::new(GeoIndex::new());
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config).with_geo_index(geo_index);
@@ -3618,7 +3523,6 @@ mod tests {
         let geo_index = Arc::new(GeoIndex::new());
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config).with_geo_index(geo_index);
@@ -3653,7 +3557,6 @@ mod tests {
         let geo_index = Arc::new(GeoIndex::new());
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ..Default::default()
         };
         // Post-#176, get_tiles_for_region has no geometric fallback. Cover
@@ -3714,7 +3617,6 @@ mod tests {
         // plan contains many more tiles than the old cap (200) would
         // have imposed.
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
@@ -3808,7 +3710,6 @@ mod tests {
         let geo_index = Arc::new(GeoIndex::new());
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
@@ -3933,7 +3834,6 @@ mod tests {
         let client = Arc::new(HighLoadLane);
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             // Zero ramp so Transition throttle doesn't clip the plan —
             // isolate the backpressure-defer scenario cleanly.
             ramp_duration: std::time::Duration::from_secs(0),
@@ -3985,7 +3885,6 @@ mod tests {
         let client = Arc::new(CapLimitedLane::new(1));
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ramp_duration: std::time::Duration::from_secs(0),
             ..Default::default()
         };
@@ -4025,7 +3924,6 @@ mod tests {
         let client = Arc::new(CapLimitedLane::new(100_000));
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ramp_duration: std::time::Duration::from_secs(0),
             ..Default::default()
         };
@@ -4074,7 +3972,6 @@ mod tests {
         let client = Arc::new(CapLimitedLane::new(5));
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ramp_duration: std::time::Duration::from_secs(0),
             ..Default::default()
         };
@@ -4136,7 +4033,6 @@ mod tests {
         let checker: Arc<dyn DdsDiskCacheChecker> = MockDiskChecker::with_tile_coords(cached);
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ramp_duration: std::time::Duration::from_secs(0),
             ..Default::default()
         };
@@ -4208,7 +4104,6 @@ mod tests {
         let checker: Arc<dyn DdsDiskCacheChecker> = Arc::new(AlwaysHitDiskChecker);
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ramp_duration: std::time::Duration::from_secs(0),
             ..Default::default()
         };
@@ -4265,7 +4160,6 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ramp_duration: std::time::Duration::from_secs(0),
             ..Default::default()
         };
@@ -4380,7 +4274,6 @@ mod tests {
             MockDiskChecker::with_tile_coords(std::iter::empty::<TileCoord>());
 
         let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Aggressive,
             ramp_duration: std::time::Duration::from_secs(0),
             ..Default::default()
         };

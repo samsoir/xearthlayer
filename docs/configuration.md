@@ -279,7 +279,6 @@ Prefetch yields when XEarthLayer is busy or X-Plane is reading heavily, and paus
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable/disable predictive tile prefetching |
-| `mode` | string | `opportunistic` | `opportunistic`, `aggressive` or `disabled`. See Mode Options |
 | `web_api_port` | integer | `8086` | X-Plane Web API port for telemetry and sim state (1024-65535) |
 | `cycle_interval_ms` | integer | `2000` | **Currently has no effect**: cycles run at a fixed 2 second interval |
 | `takeoff_climb_ft` | float | `1000` | Altitude climb (ft) above takeoff MSL to release transition hold (200-5000) |
@@ -293,17 +292,9 @@ Prefetch yields when XEarthLayer is busy or X-Plane is reading heavily, and paus
 | `window_buffer` | integer | `1` | Regions kept beyond the box on each side before their prefetch state is forgotten (0-3) |
 | `stale_region_timeout` | integer | `120` | Seconds before an InProgress region is considered stale (30-600) |
 
-**Mode Options:**
+`enabled` is the only switch. `xearthlayer run --no-prefetch` turns prefetch off for one run without changing the file.
 
-| Mode | Behaviour |
-|------|-----------|
-| `opportunistic` | Prefetch on (default) |
-| `aggressive` | Currently identical to `opportunistic` |
-| `disabled` | Never prefetch |
-
-`opportunistic` and `aggressive` once used different triggers; both triggers belonged to earlier designs and have been removed, so the two modes now behave the same.
-
-`auto` was accepted before v0.5.0. It deferred to a throughput calibration that never ran, so it always behaved as `opportunistic`. Older config files that still say `mode = auto` load as `opportunistic`, and `xearthlayer config upgrade` rewrites the value.
+`mode` was removed in v0.5.0. Its values `opportunistic` and `aggressive` once chose between two triggers that belonged to earlier designs, and both had come to behave the same; `disabled` did what `enabled = false` does. A file that still has a `mode` line keeps working: `mode = disabled` is read as `enabled = false`, any other value is ignored, and `xearthlayer config upgrade` writes `enabled = false` for `disabled` and removes the line.
 
 `max_tiles_per_cycle`, `default_window_rows` and `window_lon_extent` belonged to earlier designs and are no longer read; `xearthlayer config upgrade` removes them.
 
@@ -311,7 +302,6 @@ Prefetch yields when XEarthLayer is busy or X-Plane is reading heavily, and paus
 ```ini
 [prefetch]
 enabled = true
-mode = opportunistic           ; aggressive, opportunistic, disabled
 ; web_api_port = 8086
 
 ; Transition ramp (takeoff phase management)
@@ -552,7 +542,6 @@ timeout = 10
 [prefetch]
 ; Adaptive Prefetch System
 enabled = true
-mode = opportunistic           ; aggressive, opportunistic, disabled
 ; web_api_port = 8086
 
 ; Transition ramp (takeoff phase management)
@@ -700,7 +689,6 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `executor.request_timeout_secs` | positive integer | Per-chunk HTTP timeout (seconds) |
 | `executor.max_retries` | positive integer | Max retry attempts per chunk |
 | `prefetch.enabled` | `true`, `false` | Enable predictive prefetching |
-| `prefetch.mode` | `aggressive`, `opportunistic`, `disabled` | Prefetch mode (default `opportunistic`) |
 | `prefetch.web_api_port` | 1024-65535 | X-Plane Web API port for telemetry and sim state |
 | `prefetch.cycle_interval_ms` | positive integer | Prefetch cycle interval (ms); currently has no effect |
 | `prefetch.takeoff_climb_ft` | 200-5000 | Feet above takeoff MSL to release hold |

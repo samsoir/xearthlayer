@@ -47,7 +47,7 @@ See [How It Works](docs/how-it-works.md) for detailed architecture.
   - **USGS** - Free, US coverage only
 - **Adaptive Prefetch System** - Phase-aware tile prediction
   - Flight phase detection: Ground (ring pattern) vs Cruise (track-based bands)
-  - Configurable mode: Opportunistic (default), Aggressive, or Disabled
+  - On by default; switch off with `prefetch.enabled = false` or `run --no-prefetch`
 - Two-tier caching for instant repeat visits
 - High-quality BC1/BC3 DDS textures with mipmaps
 - **Multiple compression backends**: ISPC SIMD (default), pure-Rust software, or GPU-accelerated via wgpu compute shaders
@@ -130,15 +130,9 @@ XEarthLayer reduces scenery loading stutters by prefetching tiles ahead of your 
 
 A prefetch box moves with your aircraft and queues the scenery inside it before X-Plane asks for it. On the ground the box is centred on you (GS < 40kt); in cruise it grows with ground speed and shifts ahead in your direction of travel. Prefetch pauses during takeoff and ramps back up once you are climbing, and it yields whenever XEarthLayer or X-Plane is busy.
 
-### Prefetch Modes
+### Switching Prefetch Off
 
-Set with `xearthlayer config set prefetch.mode <mode>`.
-
-| Mode | Behaviour |
-|------|-----------|
-| **Opportunistic** | Prefetch on (default) |
-| **Aggressive** | Currently identical to Opportunistic |
-| **Disabled** | Never prefetch |
+Prefetch is on by default. Switch it off with `xearthlayer config set prefetch.enabled false`, or for a single run with `xearthlayer run --no-prefetch`.
 
 ### Telemetry
 

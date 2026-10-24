@@ -12,16 +12,6 @@
 //! - **Takeoff Transition Throttle**: Grace period + ramp-up after Ground→Cruise
 //!   to avoid resource contention during takeoff (#62)
 //!
-//! # Strategy Modes
-//!
-//! Chosen by `prefetch.mode`; nothing selects one automatically (#277).
-//!
-//! | Mode | Trigger |
-//! |------|---------|
-//! | Opportunistic (default) | Circuit breaker close |
-//! | Aggressive | Position-based (0.3° into DSF) |
-//! | Disabled | Skip prefetch |
-//!
 //! # Module Structure
 //!
 //! ```text
@@ -55,8 +45,8 @@ mod transition_throttle;
 
 // Re-export public types
 pub use boundary_strategy::BoundaryStrategy;
-pub use calibration::{PerformanceCalibration, StrategyMode};
-pub use config::{AdaptivePrefetchConfig, PrefetchMode};
+pub use calibration::PerformanceCalibration;
+pub use config::AdaptivePrefetchConfig;
 pub use coordinator::{AdaptivePrefetchCoordinator, CoordinatorStatus};
 pub use extent::compute_extent;
 pub use phase_detector::{FlightPhase, PhaseDetector};

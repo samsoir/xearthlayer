@@ -167,11 +167,6 @@ file = {}
 ; Enable predictive tile prefetching based on X-Plane telemetry (default: true)
 ; Telemetry comes from the X-Plane Web API (web_api_port); no X-Plane setup is needed
 enabled = {}
-; Adaptive prefetch mode (default: opportunistic)
-;   opportunistic - Prefetch on (recommended)
-;   aggressive    - Currently identical to opportunistic
-;   disabled      - Disable prefetch entirely
-mode = {}
 ; Web API port for X-Plane SimState polling (default: 8086, range: 1024-65535)
 web_api_port = {}
 
@@ -289,7 +284,6 @@ symbols = {}
         config.packages.concurrent_downloads,
         path_to_string(&config.logging.file),
         config.prefetch.enabled,
-        config.prefetch.mode,
         config.prefetch.web_api_port,
         config.prefetch.cycle_interval_ms,
         config.prefetch.takeoff_climb_ft,

@@ -295,15 +295,44 @@ mod tests {
 
     #[test]
     fn upgrade_warning_counts_a_retired_value_as_deprecated() {
-        // A current config whose only staleness is `mode = auto` (#277) must
-        // still be warned about, or the rewrite never gets prompted.
+        // A current config whose only staleness is a retired library URL
+        // (#334) must still be warned about, or the rewrite never gets prompted.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        ConfigFile::default().save_to(&path).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let current = format!(
+            "\nlibrary_url = {}\n",
+            xearthlayer::config::DEFAULT_LIBRARY_URL
+        );
+        assert_eq!(contents.matches(&current).count(), 1);
+        let retired = format!(
+            "\nlibrary_url = {}\n",
+            xearthlayer::config::LEGACY_LIBRARY_URL
+        );
+        std::fs::write(&path, contents.replace(&current, &retired)).unwrap();
+
+        let check = ConfigUpgradeWarning::with_path(path);
+        assert_eq!(
+            check.inspect(&ctx_for("run")),
+            Status::Warning(ConfigUpgradeWarning::message(0, 1))
+        );
+    }
+
+    #[test]
+    fn upgrade_warning_counts_a_leftover_prefetch_mode_once() {
+        // #340: `mode = disabled` is a retired key and a folded value; the
+        // user has one thing in their file to change, not two.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.ini");
         ConfigFile::default().save_to(&path).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         std::fs::write(
             &path,
-            contents.replace("\nmode = opportunistic\n", "\nmode = auto\n"),
+            contents.replace(
+                "\nenabled = true\n; Web API port",
+                "\nenabled = true\nmode = disabled\n; Web API port",
+            ),
         )
         .unwrap();
 

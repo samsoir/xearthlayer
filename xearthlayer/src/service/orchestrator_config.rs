@@ -83,9 +83,6 @@ pub struct PrefetchConfig {
     /// Whether prefetch is enabled.
     pub enabled: bool,
 
-    /// Adaptive prefetch mode: "aggressive", "opportunistic", or "disabled".
-    pub mode: String,
-
     /// Web API port for X-Plane SimState polling.
     pub web_api_port: u16,
 
@@ -180,7 +177,6 @@ impl OrchestratorConfig {
         // Extract prefetch configuration
         let prefetch = PrefetchConfig {
             enabled: config.prefetch.enabled,
-            mode: config.prefetch.mode.clone(),
             web_api_port: config.prefetch.web_api_port,
             cycle_interval_ms: config.prefetch.cycle_interval_ms,
             takeoff_climb_ft: config.prefetch.takeoff_climb_ft,

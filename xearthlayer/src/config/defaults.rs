@@ -288,7 +288,6 @@ impl Default for ConfigFile {
             },
             prefetch: PrefetchSettings {
                 enabled: true,
-                mode: "opportunistic".to_string(),
                 web_api_port: DEFAULT_WEB_API_PORT,
                 cycle_interval_ms: DEFAULT_PREFETCH_CYCLE_INTERVAL_MS,
                 takeoff_climb_ft: DEFAULT_TAKEOFF_CLIMB_FT,

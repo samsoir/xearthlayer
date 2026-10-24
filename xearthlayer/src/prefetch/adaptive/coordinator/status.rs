@@ -6,7 +6,6 @@
 
 use crate::prefetch::state::BoxBoundsSnapshot;
 
-use super::super::calibration::StrategyMode;
 use super::super::phase_detector::FlightPhase;
 
 /// Current coordinator state for status reporting.
@@ -18,7 +17,6 @@ use super::super::phase_detector::FlightPhase;
 ///
 /// All fields are public for easy access by UI components:
 /// - `enabled` - Whether prefetch is currently active
-/// - `mode` - Current strategy mode (Aggressive/Opportunistic/Disabled)
 /// - `phase` - Current flight phase (Ground/Cruise)
 /// - `active_strategy` - Name of the currently active strategy
 /// - `last_prefetch_count` - Tiles prefetched in the last cycle
@@ -29,9 +27,6 @@ use super::super::phase_detector::FlightPhase;
 pub struct CoordinatorStatus {
     /// Whether prefetch is currently enabled.
     pub enabled: bool,
-
-    /// Current strategy mode (from calibration or config).
-    pub mode: StrategyMode,
 
     /// Current flight phase.
     pub phase: FlightPhase,
@@ -64,7 +59,6 @@ impl Default for CoordinatorStatus {
     fn default() -> Self {
         Self {
             enabled: true,
-            mode: StrategyMode::Opportunistic,
             phase: FlightPhase::Ground,
             active_strategy: "none",
             last_prefetch_count: 0,
@@ -84,7 +78,6 @@ mod tests {
     fn test_status_default() {
         let status = CoordinatorStatus::default();
         assert!(status.enabled);
-        assert_eq!(status.mode, StrategyMode::Opportunistic);
         assert_eq!(status.phase, FlightPhase::Ground);
         assert_eq!(status.active_strategy, "none");
         assert_eq!(status.last_prefetch_count, 0);
@@ -97,7 +90,6 @@ mod tests {
     fn test_status_clone() {
         let status = CoordinatorStatus {
             enabled: false,
-            mode: StrategyMode::Aggressive,
             phase: FlightPhase::Cruise,
             active_strategy: "cruise",
             last_prefetch_count: 10,
@@ -109,7 +101,6 @@ mod tests {
 
         let cloned = status.clone();
         assert_eq!(cloned.enabled, status.enabled);
-        assert_eq!(cloned.mode, status.mode);
         assert_eq!(cloned.phase, status.phase);
     }
 
@@ -119,6 +110,6 @@ mod tests {
         let debug = format!("{:?}", status);
         assert!(debug.contains("CoordinatorStatus"));
         assert!(debug.contains("enabled"));
-        assert!(debug.contains("mode"));
+        assert!(debug.contains("phase"));
     }
 }

@@ -1,35 +1,11 @@
-//! Strategy mode and the throughput estimate that sizes prefetch plans.
+//! The throughput estimate that sizes prefetch plans.
 //!
-//! Mode is chosen by `prefetch.mode` alone. A throughput calibrator once lived
-//! here to choose it automatically, but nothing fed it samples and nothing read
-//! its result, so it was removed in #277. `PerformanceCalibration` survives as
-//! the fixed estimate `PrefetchPlan` uses for time budgeting.
+//! A throughput calibrator once lived here to choose a prefetch mode, but
+//! nothing fed it samples and nothing read its result, so it was removed in
+//! #277, and the mode itself in #340. `PerformanceCalibration` survives as the
+//! fixed estimate `PrefetchPlan` uses for time budgeting.
 
 use std::time::Instant;
-
-/// How prefetch is triggered, as resolved from `prefetch.mode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum StrategyMode {
-    /// Position-based trigger: prefetch proactively, whenever there is work.
-    Aggressive,
-
-    /// Prefetch during quiet periods, when X-Plane isn't loading scenery.
-    #[default]
-    Opportunistic,
-
-    /// Never prefetch.
-    Disabled,
-}
-
-impl std::fmt::Display for StrategyMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StrategyMode::Aggressive => write!(f, "aggressive"),
-            StrategyMode::Opportunistic => write!(f, "opportunistic"),
-            StrategyMode::Disabled => write!(f, "disabled"),
-        }
-    }
-}
 
 /// Throughput estimate used to budget prefetch plans.
 ///
@@ -58,9 +34,6 @@ pub struct PerformanceCalibration {
     /// - < 0.5: Poor (calibration may be unreliable)
     pub confidence: f64,
 
-    /// Recommended strategy based on throughput.
-    pub recommended_strategy: StrategyMode,
-
     /// When calibration was performed.
     pub calibrated_at: Instant,
 
@@ -81,7 +54,6 @@ impl PerformanceCalibration {
             avg_tile_generation_ms: 67,
             tile_generation_stddev_ms: 20,
             confidence: 0.5,
-            recommended_strategy: StrategyMode::Opportunistic,
             calibrated_at: Instant::now(),
             baseline_throughput: 15.0,
             sample_count: 0,
@@ -109,20 +81,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_strategy_mode_display() {
-        assert_eq!(format!("{}", StrategyMode::Aggressive), "aggressive");
-        assert_eq!(format!("{}", StrategyMode::Opportunistic), "opportunistic");
-        assert_eq!(format!("{}", StrategyMode::Disabled), "disabled");
-    }
-
-    #[test]
     fn test_calibration_estimate_batch_time() {
         let cal = PerformanceCalibration {
             throughput_tiles_per_sec: 20.0, // 20 tiles/sec = 50ms/tile
             avg_tile_generation_ms: 50,
             tile_generation_stddev_ms: 10,
             confidence: 0.9,
-            recommended_strategy: StrategyMode::Opportunistic,
             calibrated_at: Instant::now(),
             baseline_throughput: 20.0,
             sample_count: 100,
@@ -137,7 +101,6 @@ mod tests {
     #[test]
     fn test_default_opportunistic_calibration() {
         let cal = PerformanceCalibration::default_opportunistic();
-        assert_eq!(cal.recommended_strategy, StrategyMode::Opportunistic);
         assert!(cal.confidence < 1.0);
     }
 }

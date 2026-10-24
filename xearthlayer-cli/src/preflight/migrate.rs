@@ -547,6 +547,30 @@ mod tests {
     }
 
     #[test]
+    fn migration_keeps_prefetch_off_for_mode_disabled_in_both_files() {
+        // #340: `prefetch.mode` is retired and `disabled` folds into
+        // `prefetch.enabled = false`. The legacy copy loses the `mode` line,
+        // which 0.4.8 reads as its default `auto`, so 0.4.8 must find prefetch
+        // switched off by `enabled` instead.
+        let f = fixture();
+        write_legacy_config(&f, "[prefetch]\nenabled = true\nmode = disabled\n");
+        let c = check(&f);
+
+        c.remediate(&mut BootstrapContext::new("run", None))
+            .unwrap();
+
+        for path in [c.target_config_file(), f.legacy.join("config.ini")] {
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                text.contains("\nenabled = false\n"),
+                "{}: {text}",
+                path.display()
+            );
+            assert!(!text.contains("\nmode ="), "{}: {text}", path.display());
+        }
+    }
+
+    #[test]
     fn migration_leaves_a_library_url_of_ones_own_alone() {
         let f = fixture();
         let own = "https://example.com/my/xearthlayer_package_library.txt";

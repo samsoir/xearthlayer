@@ -143,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn default_prefetch_mode_is_opportunistic() {
-        assert_eq!(ConfigFile::default().prefetch.mode, "opportunistic");
+    fn prefetch_is_enabled_by_default() {
+        assert!(ConfigFile::default().prefetch.enabled);
     }
 }

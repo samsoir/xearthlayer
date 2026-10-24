@@ -5,7 +5,7 @@
 //!
 //! # Configuration Levels
 //!
-//! 1. **User-facing options**: Simple toggles and mode selection (`enabled`, `mode`)
+//! 1. **User-facing options**: The on/off switch (`enabled`)
 //! 2. **Advanced tuning**: Parameters for users who understand the system
 //!
 //! # Example Configuration (INI)
@@ -13,7 +13,6 @@
 //! ```ini
 //! [prefetch]
 //! enabled = true
-//! mode = opportunistic
 //! ```
 
 use std::time::Duration;
@@ -27,18 +26,11 @@ use crate::service::PrefetchConfig;
 /// Configuration for the adaptive prefetch system.
 ///
 /// This is the top-level configuration that controls all aspects of
-/// adaptive prefetching, including mode selection and strategy parameters.
+/// adaptive prefetching, including its switch and strategy parameters.
 #[derive(Debug, Clone)]
 pub struct AdaptivePrefetchConfig {
     /// Whether prefetch is enabled at all.
     pub enabled: bool,
-
-    /// Strategy mode selection.
-    ///
-    /// - `Aggressive`: Always use position-based triggers
-    /// - `Opportunistic`: Always use circuit breaker triggers
-    /// - `Disabled`: Never prefetch (manual override)
-    pub mode: PrefetchMode,
 
     /// Ground speed threshold for ground vs cruise detection (knots).
     ///
@@ -113,7 +105,6 @@ impl Default for AdaptivePrefetchConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            mode: PrefetchMode::Opportunistic,
             ground_speed_threshold_kt: 40.0,
             takeoff_climb_ft: 1000.0,
             takeoff_timeout: Duration::from_secs(90),
@@ -136,11 +127,8 @@ impl AdaptivePrefetchConfig {
     ///
     /// This is the primary constructor used by the service orchestrator.
     pub fn from_prefetch_config(config: &PrefetchConfig) -> Self {
-        let mode = config.mode.parse().unwrap_or_default();
-
         Self {
             enabled: config.enabled,
-            mode,
             takeoff_climb_ft: config.takeoff_climb_ft,
             takeoff_timeout: Duration::from_secs(config.takeoff_timeout_secs),
             landing_hysteresis: Duration::from_secs(config.landing_hysteresis_secs),
@@ -155,53 +143,6 @@ impl AdaptivePrefetchConfig {
     }
 }
 
-/// Strategy mode for prefetch triggering.
-///
-/// Controls when and how prefetch jobs are submitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PrefetchMode {
-    /// Position-based trigger (0.3° into DSF tile).
-    ///
-    /// Use this for fast connections that can complete prefetch
-    /// well before X-Plane needs the tiles.
-    Aggressive,
-
-    /// Circuit breaker trigger (when X-Plane finishes loading).
-    ///
-    /// The default. Prefetch happens during quiet periods when X-Plane
-    /// isn't actively loading.
-    #[default]
-    Opportunistic,
-
-    /// Prefetch disabled (manual override).
-    ///
-    /// Use this for debugging or when prefetch causes issues.
-    Disabled,
-}
-
-impl std::fmt::Display for PrefetchMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PrefetchMode::Aggressive => write!(f, "aggressive"),
-            PrefetchMode::Opportunistic => write!(f, "opportunistic"),
-            PrefetchMode::Disabled => write!(f, "disabled"),
-        }
-    }
-}
-
-impl std::str::FromStr for PrefetchMode {
-    type Err = std::convert::Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Anything else, including the retired `auto`, is the default.
-        Ok(match s.to_lowercase().as_str() {
-            "aggressive" => Self::Aggressive,
-            "disabled" => Self::Disabled,
-            _ => Self::default(),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,50 +151,7 @@ mod tests {
     fn test_default_config() {
         let config = AdaptivePrefetchConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.mode, PrefetchMode::Opportunistic);
         assert_eq!(config.box_extent, 7.0);
-    }
-
-    #[test]
-    fn default_prefetch_mode_is_opportunistic() {
-        assert_eq!(PrefetchMode::default(), PrefetchMode::Opportunistic);
-    }
-
-    #[test]
-    fn test_prefetch_mode_parsing() {
-        assert_eq!(
-            "aggressive".parse::<PrefetchMode>().unwrap(),
-            PrefetchMode::Aggressive
-        );
-        assert_eq!(
-            "opportunistic".parse::<PrefetchMode>().unwrap(),
-            PrefetchMode::Opportunistic
-        );
-        assert_eq!(
-            "disabled".parse::<PrefetchMode>().unwrap(),
-            PrefetchMode::Disabled
-        );
-        assert_eq!(
-            "unknown".parse::<PrefetchMode>().unwrap(),
-            PrefetchMode::Opportunistic
-        );
-    }
-
-    #[test]
-    fn legacy_auto_mode_parses_as_opportunistic() {
-        // Every config written before #277 says `mode = auto`, and auto always
-        // resolved to opportunistic because no calibration was ever supplied.
-        assert_eq!(
-            "auto".parse::<PrefetchMode>().unwrap(),
-            PrefetchMode::Opportunistic
-        );
-    }
-
-    #[test]
-    fn test_prefetch_mode_display() {
-        assert_eq!(format!("{}", PrefetchMode::Aggressive), "aggressive");
-        assert_eq!(format!("{}", PrefetchMode::Opportunistic), "opportunistic");
-        assert_eq!(format!("{}", PrefetchMode::Disabled), "disabled");
     }
 
     #[test]
@@ -270,10 +168,9 @@ mod tests {
         assert_eq!(config.stale_region_timeout, Duration::from_secs(120));
     }
 
-    fn prefetch_config(mode: &str) -> PrefetchConfig {
+    fn prefetch_config() -> PrefetchConfig {
         PrefetchConfig {
             enabled: true,
-            mode: mode.to_string(),
             web_api_port: 8086,
             cycle_interval_ms: 2000,
             takeoff_climb_ft: 1000.0,
@@ -290,22 +187,18 @@ mod tests {
 
     #[test]
     fn test_from_prefetch_config_boundary_fields() {
-        let config = AdaptivePrefetchConfig::from_prefetch_config(&prefetch_config("aggressive"));
+        let config = AdaptivePrefetchConfig::from_prefetch_config(&prefetch_config());
         assert_eq!(config.window_buffer, 2);
         assert_eq!(config.stale_region_timeout, Duration::from_secs(300));
         assert_eq!(config.box_extent, 11.0);
     }
 
     #[test]
-    fn from_prefetch_config_honours_each_explicit_mode() {
-        for (value, mode) in [
-            ("aggressive", PrefetchMode::Aggressive),
-            ("opportunistic", PrefetchMode::Opportunistic),
-            ("disabled", PrefetchMode::Disabled),
-        ] {
-            let config = AdaptivePrefetchConfig::from_prefetch_config(&prefetch_config(value));
-            assert_eq!(config.mode, mode, "{value}");
-        }
+    fn from_prefetch_config_carries_the_switch() {
+        let mut off = prefetch_config();
+        off.enabled = false;
+        assert!(!AdaptivePrefetchConfig::from_prefetch_config(&off).enabled);
+        assert!(AdaptivePrefetchConfig::from_prefetch_config(&prefetch_config()).enabled);
     }
 
     #[test]

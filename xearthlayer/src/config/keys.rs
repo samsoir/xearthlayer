@@ -80,7 +80,6 @@ pub enum ConfigKey {
 
     // Prefetch settings
     PrefetchEnabled,
-    PrefetchMode,
     PrefetchWebApiPort,
     PrefetchCycleIntervalMs,
 
@@ -160,7 +159,6 @@ impl FromStr for ConfigKey {
             "logging.file" => Ok(ConfigKey::LoggingFile),
 
             "prefetch.enabled" => Ok(ConfigKey::PrefetchEnabled),
-            "prefetch.mode" => Ok(ConfigKey::PrefetchMode),
             "prefetch.web_api_port" => Ok(ConfigKey::PrefetchWebApiPort),
             "prefetch.cycle_interval_ms" => Ok(ConfigKey::PrefetchCycleIntervalMs),
             "prefetch.takeoff_climb_ft" => Ok(ConfigKey::PrefetchTakeoffClimbFt),
@@ -227,7 +225,6 @@ impl ConfigKey {
             ConfigKey::PackagesConcurrentDownloads => "packages.concurrent_downloads",
             ConfigKey::LoggingFile => "logging.file",
             ConfigKey::PrefetchEnabled => "prefetch.enabled",
-            ConfigKey::PrefetchMode => "prefetch.mode",
             ConfigKey::PrefetchWebApiPort => "prefetch.web_api_port",
             ConfigKey::PrefetchCycleIntervalMs => "prefetch.cycle_interval_ms",
             ConfigKey::PrefetchTakeoffClimbFt => "prefetch.takeoff_climb_ft",
@@ -347,7 +344,6 @@ impl ConfigKey {
             }
             ConfigKey::LoggingFile => path_to_display(&config.logging.file),
             ConfigKey::PrefetchEnabled => config.prefetch.enabled.to_string(),
-            ConfigKey::PrefetchMode => config.prefetch.mode.clone(),
             ConfigKey::PrefetchWebApiPort => config.prefetch.web_api_port.to_string(),
             ConfigKey::PrefetchCycleIntervalMs => config.prefetch.cycle_interval_ms.to_string(),
             ConfigKey::PrefetchTakeoffClimbFt => config.prefetch.takeoff_climb_ft.to_string(),
@@ -495,9 +491,6 @@ impl ConfigKey {
                 let v = value.to_lowercase();
                 config.prefetch.enabled = v == "true" || v == "1" || v == "yes" || v == "on";
             }
-            ConfigKey::PrefetchMode => {
-                config.prefetch.mode = value.to_lowercase();
-            }
             ConfigKey::PrefetchWebApiPort => {
                 config.prefetch.web_api_port = value.parse().unwrap();
             }
@@ -622,9 +615,6 @@ impl ConfigKey {
             ConfigKey::PackagesConcurrentDownloads => Box::new(IntegerRangeSpec::new(1, 10)),
             ConfigKey::LoggingFile => Box::new(PathSpec),
             ConfigKey::PrefetchEnabled => Box::new(BooleanSpec),
-            ConfigKey::PrefetchMode => {
-                Box::new(OneOfSpec::new(&["aggressive", "opportunistic", "disabled"]))
-            }
             ConfigKey::PrefetchWebApiPort => Box::new(IntegerRangeSpec::new(1024, 65535)),
             ConfigKey::PrefetchCycleIntervalMs => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchTakeoffClimbFt => Box::new(FloatRangeSpec::new(200.0, 5000.0)),
@@ -693,7 +683,6 @@ impl ConfigKey {
             ConfigKey::PackagesConcurrentDownloads,
             ConfigKey::LoggingFile,
             ConfigKey::PrefetchEnabled,
-            ConfigKey::PrefetchMode,
             ConfigKey::PrefetchWebApiPort,
             ConfigKey::PrefetchCycleIntervalMs,
             ConfigKey::PrefetchTakeoffClimbFt,
@@ -1497,11 +1486,9 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_mode_no_longer_accepts_auto() {
-        assert!(ConfigKey::PrefetchMode.validate("auto").is_err());
-        for mode in ["aggressive", "opportunistic", "disabled"] {
-            assert!(ConfigKey::PrefetchMode.validate(mode).is_ok(), "{mode}");
-        }
+    fn prefetch_mode_is_no_longer_a_setting() {
+        // #340: `prefetch.enabled` is the only switch.
+        assert!("prefetch.mode".parse::<ConfigKey>().is_err());
     }
 
     #[test]

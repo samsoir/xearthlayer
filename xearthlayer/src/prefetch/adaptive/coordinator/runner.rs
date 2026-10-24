@@ -73,7 +73,7 @@ impl Prefetcher for AdaptivePrefetchCoordinator {
         cancellation_token: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async move {
-            tracing::info!(mode = ?self.effective_mode(), "Adaptive prefetcher started");
+            tracing::info!("Adaptive prefetcher started");
 
             let mut ls = LoopState::new();
             let mut staleness_interval = tokio::time::interval(STALENESS_CHECK_INTERVAL);
