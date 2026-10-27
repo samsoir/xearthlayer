@@ -8,10 +8,11 @@ procedures for a release, a renewal and a compromise.
 
 Every macOS binary XEarthLayer ships, on the pre-release channel as much as the
 stable one, is signed with a Developer ID Application certificate and notarized
-by Apple. Each release also carries an installer package per product, signed with
-a Developer ID Installer certificate, notarized and stapled. Without that, a browser download is quarantined and Gatekeeper refuses
+by Apple. Without that, a browser download is quarantined and Gatekeeper refuses
 to run it until the user clears the mark by hand (`xattr -c`), which is what
-every release up to `v0.5.0-alpha.2` asked of macOS testers.
+every release up to `v0.5.0-alpha.2` asked of macOS testers. Each release also
+carries an installer package per product, signed with a Developer ID Installer
+certificate, notarized and stapled.
 
 The pipeline is two scripts, `scripts/macos/sign-and-notarize.sh` (the binaries)
 and `scripts/macos/build-pkg.sh` (the installer packages), with shared helpers in
@@ -290,7 +291,7 @@ a release names packages it does not carry. The website ignores those keys today
 ### In the release workflow
 
 `package-macos` (see [cicd.md](cicd.md)) gained steps between the build and the
-tarball, gated on `env.MACOS_SIGNING` and `env.MACOS_PKG` (the secrets context is
+upload, gated on `env.MACOS_SIGNING` and `env.MACOS_PKG` (the secrets context is
 not readable from a step's `if:`, so the job computes the flags once):
 
 1. **Import Developer ID certificate**: decodes the `.p12` into a keychain
