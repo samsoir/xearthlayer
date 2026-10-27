@@ -211,8 +211,16 @@ lint-fix: ## Run clippy and automatically fix issues
 	$(CARGO) clippy $(CARGO_FLAGS) --fix --allow-dirty --allow-staged
 
 .PHONY: verify
-verify: format-check lint test-strict ## Run all verification checks (format, lint, test)
+verify: format-check lint test-strict test-scripts ## Run all verification checks (format, lint, test)
 	@echo "$(GREEN)All verification checks passed!$(NC)"
+
+.PHONY: test-scripts
+test-scripts: ## Run the release script tests (bash, against fake macOS tools)
+	@echo "$(BLUE)Running release script tests...$(NC)"
+	@scripts/macos/tests/run.sh
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck -x scripts/macos/*.sh scripts/macos/tests/*.sh scripts/macos/tests/fakes/fake-tool; \
+	else echo "$(YELLOW)shellcheck not installed; skipped$(NC)"; fi
 
 .PHONY: verify-macos
 verify-macos: ## Full macOS verification: verify + live macFUSE smoke tests (macOS only)
