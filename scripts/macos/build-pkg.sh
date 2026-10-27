@@ -75,6 +75,7 @@ echo "Installer identity: $identity"
 work=$(mktemp -d "${TMPDIR:-/tmp}/xel-pkg.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/root/usr/local/bin" "$work/resources" "$work/components"
+chmod 755 "$work/root" "$work/root/usr" "$work/root/usr/local" "$work/root/usr/local/bin"
 cp "$binary" "$work/root/usr/local/bin/$product"
 chmod 755 "$work/root/usr/local/bin/$product"
 if [ "$product" = "xearthlayer" ]; then
@@ -89,7 +90,7 @@ pkgbuild --root "$work/root" --identifier "net.defreyssi.$product" --version "$v
 echo "==> productbuild $(basename "$out")"
 mkdir -p "$(dirname "$out")"
 productbuild --distribution "$work/distribution.xml" --resources "$work/resources" \
-    --package-path "$work/components" --sign "$identity" "$out"
+    --package-path "$work/components" --timestamp --sign "$identity" "$out"
 pkgutil --check-signature "$out"
 
 if [ "${MACOS_SKIP_NOTARIZE:-0}" = "1" ]; then

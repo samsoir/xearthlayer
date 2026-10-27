@@ -38,7 +38,7 @@ test_builds_signs_notarizes_and_staples_the_runtime() {
     log=$(cat "$FAKE_LOG")
     assert_contains "$log" "--identifier net.defreyssi.xearthlayer --version 0.5.0-rc.1 --install-location /"
     assert_contains "$log" "staged: xearthlayer"
-    assert_contains "$log" "--sign Developer ID Installer: Sam de Freyssinet (Y7DVMR5MEX) $out"
+    assert_contains "$log" "--timestamp --sign Developer ID Installer: Sam de Freyssinet (Y7DVMR5MEX) $out"
     assert_contains "$log" "xcrun notarytool submit $out --keychain-profile p"
     assert_contains "$log" "xcrun stapler staple $out"
     assert_contains "$log" "xcrun stapler validate $out"
@@ -64,7 +64,7 @@ test_explicit_identity_skips_lookup() {
     MACOS_INSTALLER_IDENTITY="Developer ID Installer: X (Y)" MACOS_SKIP_NOTARIZE=1 \
         "$SCRIPT" xearthlayer "$FAKE_DIR/bin/xearthlayer" 0.5.0 "$FAKE_DIR/out/x.pkg" >/dev/null 2>&1 || fail "build failed"
     assert_not_contains "$(cat "$FAKE_LOG")" "security find-identity"
-    assert_contains "$(cat "$FAKE_LOG")" "--sign Developer ID Installer: X (Y)"
+    assert_contains "$(cat "$FAKE_LOG")" "--timestamp --sign Developer ID Installer: X (Y)"
 }
 
 test_refuses_two_installer_identities() {

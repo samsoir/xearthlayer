@@ -57,7 +57,7 @@ if [ -z "$identity" ]; then
     # and whose private key is present.
     selected=$(security find-identity -v -p codesigning | select_identity "Developer ID Application" MACOS_SIGN_IDENTITY)
     identity=$(printf '%s' "$selected" | cut -f1)
-    echo "Signing identity: $(printf '%s' "$selected" | cut -f2)"
+    echo "Signing identity: $(printf '%s' "$selected" | cut -f2) ($identity)"
 else
     echo "Signing identity: $identity"
 fi

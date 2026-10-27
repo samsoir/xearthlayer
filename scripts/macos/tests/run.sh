@@ -21,6 +21,11 @@ trap 'rm -f "$out"' EXIT
 for file in "$TESTS_DIR"/test_*.sh; do
     # shellcheck source=/dev/null
     names=$( (. "$TESTS_DIR/helpers.sh"; . "$file"; declare -F | awk '{print $3}' | grep '^test_') )
+    if [ -z "$names" ]; then
+        failed=$((failed + 1))
+        echo "FAILED $(basename "$file"): no tests found (failed to source, or defines none)"
+        continue
+    fi
     for name in $names; do
         # shellcheck source=/dev/null
         if ( . "$TESTS_DIR/helpers.sh"; . "$file"; "$name" ) >"$out" 2>&1; then
@@ -34,4 +39,8 @@ for file in "$TESTS_DIR"/test_*.sh; do
 done
 
 echo "release script tests: $passed passed, $failed failed"
+if [ $((passed + failed)) -eq 0 ]; then
+    echo "no tests found"
+    exit 1
+fi
 [ "$failed" -eq 0 ]

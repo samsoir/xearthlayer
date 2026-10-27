@@ -70,6 +70,8 @@ test_notarize_accepted() {
     NOTARY_ARGS=(--keychain-profile p)
     local work
     work=$(mktemp -d)
+    # shellcheck disable=SC2064  # expand now: locals are gone when the trap fires
+    trap "rm -rf '$FAKE_DIR' '$work'" EXIT
     : >"$work/x.pkg"
     notarize "$work/x.pkg" "$work" >/dev/null || fail "accepted submission reported as failure"
     assert_contains "$(cat "$FAKE_LOG")" "xcrun notarytool submit $work/x.pkg --keychain-profile p --wait --timeout 30m"
@@ -80,6 +82,8 @@ test_notarize_rejected_prints_log() {
     NOTARY_ARGS=(--keychain-profile p)
     local work rc=0
     work=$(mktemp -d)
+    # shellcheck disable=SC2064  # expand now: locals are gone when the trap fires
+    trap "rm -rf '$FAKE_DIR' '$work'" EXIT
     : >"$work/x.pkg"
     FAKE_NOTARY_STATUS=Invalid notarize "$work/x.pkg" "$work" >/dev/null 2>&1 || rc=$?
     assert_eq "$rc" 1
@@ -91,6 +95,8 @@ test_notarize_failure_without_submission_id_still_reports() {
     NOTARY_ARGS=(--keychain-profile p)
     local work err rc
     work=$(mktemp -d)
+    # shellcheck disable=SC2064  # expand now: locals are gone when the trap fires
+    trap "rm -rf '$FAKE_DIR' '$work'" EXIT
     : >"$work/x.pkg"
     # The caller runs under set -e and pipefail; a missing id line must not abort it
     # silently. A separate bash, because run.sh calls tests inside an `if`, which

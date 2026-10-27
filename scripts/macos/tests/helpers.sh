@@ -32,6 +32,7 @@ assert_not_contains() {
 # symlink to fakes/fake-tool, which appends "<tool> <args>" to $FAKE_LOG.
 setup_fakes() {
     FAKE_DIR=$(mktemp -d)
+    trap 'rm -rf "$FAKE_DIR"' EXIT
     FAKE_LOG="$FAKE_DIR/calls.log"
     : >"$FAKE_LOG"
     local tool
