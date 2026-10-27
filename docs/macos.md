@@ -75,7 +75,7 @@ quarantine to every cask, which is why the binaries are signed and notarized.
 
 #### From the installer package (Apple Silicon)
 
-Each release carries `xearthlayer-<version>-arm64-macos.pkg`. Download it from the
+Each release carries `xearthlayer-v<version>-arm64-macos.pkg`. Download it from the
 release, double-click it and follow the Installer. It puts `xearthlayer` in
 `/usr/local/bin`, which is already on the `PATH`. The package is signed with the
 project's Developer ID Installer certificate and notarized, with the ticket
@@ -98,8 +98,8 @@ sudo pkgutil --forget net.defreyssi.xearthlayer
 **Checking the download.**
 
 ```bash
-pkgutil --check-signature xearthlayer-<version>-arm64-macos.pkg   # Developer ID Installer: Sam de Freyssinet (Y7DVMR5MEX)
-spctl --assess --type install -vv xearthlayer-<version>-arm64-macos.pkg   # source=Notarized Developer ID
+pkgutil --check-signature xearthlayer-v<version>-arm64-macos.pkg   # Developer ID Installer: Sam de Freyssinet (Y7DVMR5MEX)
+spctl --assess --type install -vv xearthlayer-v<version>-arm64-macos.pkg   # source=Notarized Developer ID
 ```
 
 **Use one method.** Homebrew installs to `/opt/homebrew/bin`, which comes before
@@ -107,7 +107,7 @@ spctl --assess --type install -vv xearthlayer-<version>-arm64-macos.pkg   # sour
 `which -a xearthlayer` lists every copy; remove the one you do not use.
 
 The publishing tools have their own package,
-`xearthlayer-publish-<version>-arm64-macos.pkg` (receipt
+`xearthlayer-publish-v<version>-arm64-macos.pkg` (receipt
 `net.defreyssi.xearthlayer-publish`).
 
 #### From a release tarball (Apple Silicon)

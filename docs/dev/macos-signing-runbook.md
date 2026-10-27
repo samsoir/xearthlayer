@@ -73,7 +73,7 @@ Certificate types we deliberately do **not** use:
 
 Only the **Account Holder** of the developer account can create a Developer ID
 certificate; an Admin cannot. A team may hold at most five Developer ID
-Application certificates (the same limit applies to Installer certificates). Apple sets the validity period; **the current
+Application certificates. Apple sets the validity period; **the current
 Application certificate expires on 22 November 2027**, so plan the renewal (below)
 for autumn 2027. The Installer certificate has its own expiry, recorded in the
 checklist above.
@@ -124,8 +124,9 @@ writes.
 `scripts/macos/build-pkg.sh <product> <binary> <version> <out.pkg>` builds one
 package from an already signed and notarized binary. The package installs
 `/usr/local/bin/<product>` under the receipt `net.defreyssi.<product>`, has no
-install scripts, targets arm64 and macOS 12.0 or later, and shows
-`pkg/macos/welcome.html` in the Installer. The script signs it with the
+install scripts, and targets arm64 and macOS 12.0 or later. The runtime
+package shows `pkg/macos/welcome.html` in the Installer; the publisher package
+has no welcome page. The script signs it with the
 Developer ID Installer identity, submits it for notarization, staples the ticket
 and checks the result. `xcrun stapler validate` gates in every case. The
 `spctl --assess --type install` check is skipped, with a note, on a host whose
@@ -137,7 +138,9 @@ Stapling is tried up to three times, `MACOS_STAPLE_RETRY_DELAY` seconds apart
 
 ## First-Time Setup (Golden Path)
 
-Everything below was done once for the project, on 22 October 2026. It is
+Steps 1 to 4 and the Application secrets of step 6 were done once for the
+project, on 22 October 2026; step 5 is pending until the Installer certificate is
+created. It is
 written down so the certificate can be renewed and the secrets re-created
 without rediscovering it. Each step produces one item of the checklist above.
 
@@ -221,7 +224,7 @@ xcrun notarytool history --keychain-profile xearthlayer     # proves the key wor
 
 ### 5. Developer ID Installer certificate
 
-Account Holder only. Repeat steps 1 to 3 with the Installer certificate type:
+Pending: not yet done. Account Holder only. Repeat steps 1 to 3 with the Installer certificate type:
 
 1. Generate a new key and request with the commands of step 1, using new file
    names (`developer_id_installer.key.pem`,
@@ -276,9 +279,10 @@ Application and notary secrets are read together, so set those five in one sitti
 without notary credentials fails the job rather than shipping a signed but
 un-notarized binary that Gatekeeper would still refuse.
 
-Without the two Installer secrets the workflow still signs and notarizes the
-tarballs, emits a `::notice::` and builds no packages. `version.json` already
-lists `macos_pkg` and `publish_macos_pkg`, so until the Installer secrets are set
+Without `APPLE_DEVELOPER_INSTALLER_P12` the workflow still signs and notarizes the
+tarballs, emits a `::notice::` and builds no packages. A set `.p12` with a missing
+password fails at import. `version.json` already
+lists `macos_pkg` and `publish_macos_pkg`, so until `APPLE_DEVELOPER_INSTALLER_P12` is set
 a release names packages it does not carry. The website ignores those keys today.
 
 ## Releasing
@@ -342,9 +346,9 @@ unpacked folder. It should start with no dialog.
 ### Checking a shipped package
 
 ```bash
-pkgutil --check-signature xearthlayer-<version>-arm64-macos.pkg   # Developer ID Installer: ..., with a timestamp
-spctl -a -vv -t install xearthlayer-<version>-arm64-macos.pkg     # source=Notarized Developer ID
-xcrun stapler validate xearthlayer-<version>-arm64-macos.pkg      # The validate action worked!
+pkgutil --check-signature xearthlayer-v<version>-arm64-macos.pkg   # Developer ID Installer: ..., with a timestamp
+spctl -a -vv -t install xearthlayer-v<version>-arm64-macos.pkg     # source=Notarized Developer ID
+xcrun stapler validate xearthlayer-v<version>-arm64-macos.pkg      # The validate action worked!
 ```
 
 ## Renewal, Rotation, Revocation
