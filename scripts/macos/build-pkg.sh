@@ -24,6 +24,8 @@
 #                             search list. Zero or several is an error.
 #   MACOS_NOTARY_*            Notary credentials, as for sign-and-notarize.sh.
 #   MACOS_SKIP_NOTARIZE       Set to 1 to sign only (local smoke tests).
+#   MACOS_STAPLE_RETRY_DELAY  Seconds between stapling attempts (default 15; 3
+#                             attempts, since the ticket can lag acceptance).
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -98,23 +100,41 @@ fi
 # --- notarize, staple, assess -----------------------------------------------
 
 notarize "$out" "$work"
-xcrun stapler staple "$out"
+
+# The notarization ticket can take a moment to reach the CDN after Apple
+# reports Accepted, so stapling is retried.
+attempt=1
+until xcrun stapler staple "$out"; do
+    if [ "$attempt" -ge 3 ]; then
+        echo "error: could not staple the ticket to $out after $attempt attempts" >&2
+        exit 1
+    fi
+    echo "attempt $attempt: stapler staple failed"
+    sleep "${MACOS_STAPLE_RETRY_DELAY:-15}"
+    attempt=$((attempt + 1))
+done
 xcrun stapler validate "$out"
 
-# spctl understands installer packages (unlike bare executables), so this is
-# the same assessment the Installer makes when a user opens the download.
-assessment=$(spctl --assess --type install -vv "$out" 2>&1) || {
-    printf '%s\n' "$assessment" >&2
-    echo "error: Gatekeeper rejected $out" >&2
-    exit 1
-}
-printf '%s\n' "$assessment"
-case "$assessment" in
-    *"source=Notarized Developer ID"*) ;;
-    *)
-        echo "error: Gatekeeper does not report $out as notarized" >&2
+# spctl understands installer packages (unlike bare executables), so where
+# assessments are enabled this is the assessment the Installer makes when a
+# user opens the download. Some CI hosts disable assessments; there the
+# stapler validation above is the gate.
+if spctl --status 2>&1 | grep -q 'assessments enabled'; then
+    assessment=$(spctl --assess --type install -vv "$out" 2>&1) || {
+        printf '%s\n' "$assessment" >&2
+        echo "error: Gatekeeper rejected $out" >&2
         exit 1
-        ;;
-esac
+    }
+    printf '%s\n' "$assessment"
+    case "$assessment" in
+        *"source=Notarized Developer ID"*) ;;
+        *)
+            echo "error: Gatekeeper does not report $out as notarized" >&2
+            exit 1
+            ;;
+    esac
+else
+    echo "note: Gatekeeper assessments are disabled on this host; skipping the install assessment (stapler validate passed)"
+fi
 
 echo "Built, notarized and stapled: $out"

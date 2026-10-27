@@ -3,6 +3,8 @@
 # name it is invoked as. Each call is logged to $FAKE_LOG; outputs are
 # steered by the FAKE_* variables documented in helpers.sh.
 # FAKE_NOTARY_NO_ID=1 makes notarytool submit fail before printing any id line.
+# FAKE_SPCTL_REJECT=1 makes spctl --assess exit 3 (Gatekeeper rejects the file).
+# FAKE_STAPLE_FAILURES=N makes the first N `stapler staple` calls exit 65.
 set -u
 tool=$(basename "$0")
 echo "$tool $*" >>"$FAKE_LOG"
@@ -21,6 +23,7 @@ case "$tool" in
         if [ "${1:-}" = "--status" ]; then
             echo "${FAKE_SPCTL_STATUS:-assessments disabled}"
         else
+            [ -n "${FAKE_SPCTL_REJECT:-}" ] && { echo "$last: rejected"; exit 3; }
             echo "$last: accepted"
             echo "source=${FAKE_SPCTL_SOURCE:-Notarized Developer ID}"
         fi
@@ -54,7 +57,15 @@ case "$tool" in
                 [ "${FAKE_NOTARY_STATUS:-Accepted}" = "Accepted" ] || exit 1
                 ;;
             "notarytool log") echo '{"issues": ["fake"]}' ;;
-            "stapler staple" | "stapler validate") echo "The staple and validate action worked!" ;;
+            "stapler staple")
+                if [ "${FAKE_STAPLE_FAILURES:-0}" -gt 0 ]; then
+                    n=$(cat "$FAKE_DIR/staple.count" 2>/dev/null || echo 0)
+                    echo $((n + 1)) >"$FAKE_DIR/staple.count"
+                    [ "$n" -lt "$FAKE_STAPLE_FAILURES" ] && { echo "Error 65: ticket not found" >&2; exit 65; }
+                fi
+                echo "The staple and validate action worked!"
+                ;;
+            "stapler validate") echo "The staple and validate action worked!" ;;
             *) echo "fake xcrun: unhandled $*" >&2; exit 64 ;;
         esac
         ;;

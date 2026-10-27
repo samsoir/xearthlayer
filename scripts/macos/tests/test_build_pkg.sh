@@ -32,7 +32,7 @@ test_builds_signs_notarizes_and_staples_the_runtime() {
     setup_fakes
     make_exe "$FAKE_DIR/bin/xearthlayer"
     local out="$FAKE_DIR/out/xearthlayer-v0.5.0-rc.1-arm64-macos.pkg" log
-    FAKE_IDENTITIES="$(ids)" MACOS_NOTARY_PROFILE=p \
+    FAKE_IDENTITIES="$(ids)" FAKE_SPCTL_STATUS="assessments enabled" MACOS_NOTARY_PROFILE=p \
         "$SCRIPT" xearthlayer "$FAKE_DIR/bin/xearthlayer" 0.5.0-rc.1 "$out" >/dev/null 2>&1 || fail "build failed"
     [ -f "$out" ] || fail "no package written"
     log=$(cat "$FAKE_LOG")
@@ -102,7 +102,7 @@ test_fails_when_gatekeeper_does_not_see_notarization() {
     setup_fakes
     make_exe "$FAKE_DIR/bin/xearthlayer"
     local err rc=0
-    err=$(FAKE_IDENTITIES="$(ids)" FAKE_SPCTL_SOURCE="Unnotarized Developer ID" MACOS_NOTARY_PROFILE=p \
+    err=$(FAKE_IDENTITIES="$(ids)" FAKE_SPCTL_STATUS="assessments enabled" FAKE_SPCTL_SOURCE="Unnotarized Developer ID" MACOS_NOTARY_PROFILE=p \
         "$SCRIPT" xearthlayer "$FAKE_DIR/bin/xearthlayer" 0.5.0 "$FAKE_DIR/out/x.pkg" 2>&1) || rc=$?
     assert_eq "$rc" 1
     assert_contains "$err" "Gatekeeper does not report"
@@ -116,4 +116,49 @@ test_refuses_without_notary_credentials_before_building() {
     FAKE_IDENTITIES="$(ids)" "$SCRIPT" xearthlayer "$FAKE_DIR/bin/xearthlayer" 0.5.0 "$FAKE_DIR/out/x.pkg" >/dev/null 2>&1 || rc=$?
     assert_eq "$rc" 1
     assert_not_contains "$(cat "$FAKE_LOG")" "pkgbuild"
+}
+
+test_skips_assessment_when_gatekeeper_assessments_are_disabled() {
+    setup_fakes
+    make_exe "$FAKE_DIR/bin/xearthlayer"
+    local out rc=0
+    out=$(FAKE_IDENTITIES="$(ids)" MACOS_NOTARY_PROFILE=p \
+        "$SCRIPT" xearthlayer "$FAKE_DIR/bin/xearthlayer" 0.5.0 "$FAKE_DIR/out/x.pkg" 2>&1) || rc=$?
+    assert_eq "$rc" 0
+    assert_contains "$out" "Gatekeeper assessments are disabled on this host"
+    assert_contains "$(cat "$FAKE_LOG")" "stapler validate"
+    assert_not_contains "$(cat "$FAKE_LOG")" "spctl --assess"
+}
+
+test_fails_when_gatekeeper_rejects_the_package() {
+    setup_fakes
+    make_exe "$FAKE_DIR/bin/xearthlayer"
+    local err rc=0
+    err=$(FAKE_IDENTITIES="$(ids)" FAKE_SPCTL_STATUS="assessments enabled" FAKE_SPCTL_REJECT=1 MACOS_NOTARY_PROFILE=p \
+        "$SCRIPT" xearthlayer "$FAKE_DIR/bin/xearthlayer" 0.5.0 "$FAKE_DIR/out/x.pkg" 2>&1) || rc=$?
+    assert_eq "$rc" 1
+    assert_contains "$err" "Gatekeeper rejected"
+}
+
+test_retries_stapling_after_a_transient_failure() {
+    setup_fakes
+    make_exe "$FAKE_DIR/bin/xearthlayer"
+    local rc=0 n
+    FAKE_IDENTITIES="$(ids)" FAKE_STAPLE_FAILURES=1 MACOS_STAPLE_RETRY_DELAY=0 MACOS_NOTARY_PROFILE=p \
+        "$SCRIPT" xearthlayer "$FAKE_DIR/bin/xearthlayer" 0.5.0 "$FAKE_DIR/out/x.pkg" >/dev/null 2>&1 || rc=$?
+    assert_eq "$rc" 0
+    n=$(grep -c "xcrun stapler staple" "$FAKE_LOG")
+    assert_eq "$n" 2
+}
+
+test_fails_when_stapling_never_succeeds() {
+    setup_fakes
+    make_exe "$FAKE_DIR/bin/xearthlayer"
+    local err rc=0 n
+    err=$(FAKE_IDENTITIES="$(ids)" FAKE_STAPLE_FAILURES=3 MACOS_STAPLE_RETRY_DELAY=0 MACOS_NOTARY_PROFILE=p \
+        "$SCRIPT" xearthlayer "$FAKE_DIR/bin/xearthlayer" 0.5.0 "$FAKE_DIR/out/x.pkg" 2>&1) || rc=$?
+    assert_eq "$rc" 1
+    assert_contains "$err" "attempt 1: stapler staple failed"
+    n=$(grep -c "xcrun stapler staple" "$FAKE_LOG")
+    assert_eq "$n" 3
 }
