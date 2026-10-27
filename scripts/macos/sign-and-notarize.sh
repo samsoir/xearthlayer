@@ -14,6 +14,7 @@
 # executable.)
 #
 # The same script runs in the release workflow and under `make sign-macos`.
+# Identity selection and notarization live in lib.sh, shared with build-pkg.sh.
 # See docs/dev/macos-signing-runbook.md.
 #
 # Environment:
@@ -28,6 +29,10 @@
 #                           `xcrun notarytool store-credentials`.
 #   MACOS_SKIP_NOTARIZE     Set to 1 to sign only (local smoke tests).
 set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=scripts/macos/lib.sh
+. "$here/lib.sh"
 
 if [ "$(uname)" != "Darwin" ]; then
     echo "error: signing runs on macOS only" >&2
@@ -49,22 +54,10 @@ done
 identity="${MACOS_SIGN_IDENTITY:-}"
 if [ -z "$identity" ]; then
     # `find-identity -v` lists only identities whose certificate is valid now
-    # and whose private key is present, one per line:
-    #   1) <sha1> "Developer ID Application: Name (TEAMID)"
-    matches=$(security find-identity -v -p codesigning | grep 'Developer ID Application' || true)
-    count=$(printf '%s' "$matches" | grep -c . || true)
-    if [ "$count" -eq 0 ]; then
-        echo "error: no valid 'Developer ID Application' identity in the keychain search list" >&2
-        echo "       (security find-identity -v -p codesigning). See docs/dev/macos-signing-runbook.md." >&2
-        exit 1
-    fi
-    if [ "$count" -gt 1 ]; then
-        echo "error: $count 'Developer ID Application' identities found; set MACOS_SIGN_IDENTITY:" >&2
-        printf '%s\n' "$matches" >&2
-        exit 1
-    fi
-    identity=$(printf '%s' "$matches" | awk '{print $2}')
-    echo "Signing identity: $(printf '%s' "$matches" | sed -E 's/^ *[0-9]+\) //')"
+    # and whose private key is present.
+    selected=$(security find-identity -v | select_identity "Developer ID Application" MACOS_SIGN_IDENTITY)
+    identity=$(printf '%s' "$selected" | cut -f1)
+    echo "Signing identity: $(printf '%s' "$selected" | cut -f2)"
 else
     echo "Signing identity: $identity"
 fi
@@ -90,18 +83,7 @@ fi
 
 # --- notarize ---------------------------------------------------------------
 
-notary_args=()
-if [ -n "${MACOS_NOTARY_PROFILE:-}" ]; then
-    notary_args=(--keychain-profile "$MACOS_NOTARY_PROFILE")
-elif [ -n "${MACOS_NOTARY_KEY:-}" ]; then
-    : "${MACOS_NOTARY_KEY_ID:?set with MACOS_NOTARY_KEY}"
-    : "${MACOS_NOTARY_ISSUER_ID:?set with MACOS_NOTARY_KEY}"
-    notary_args=(--key "$MACOS_NOTARY_KEY" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID")
-else
-    echo "error: no notary credentials: set MACOS_NOTARY_PROFILE, or MACOS_NOTARY_KEY/_KEY_ID/_ISSUER_ID," >&2
-    echo "       or MACOS_SKIP_NOTARIZE=1 to sign only" >&2
-    exit 1
-fi
+set_notary_args
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/xel-notarize.XXXXXX")
 trap 'rm -rf "$work"' EXIT
@@ -113,22 +95,7 @@ done
 # executable bits and the signatures intact, where a plain zip may not.
 ditto -c -k --keepParent "$work/payload" "$work/payload.zip"
 
-echo "==> notarytool submit ($# binaries)"
-submit_log="$work/submit.log"
-set +e
-xcrun notarytool submit "$work/payload.zip" "${notary_args[@]}" --wait --timeout 30m 2>&1 | tee "$submit_log"
-submit_status=${PIPESTATUS[0]}
-set -e
-submission_id=$(grep -m1 -E '^ *id: ' "$submit_log" | awk '{print $2}')
-if [ "$submit_status" -ne 0 ] || ! grep -qE '^ *status: Accepted' "$submit_log"; then
-    echo "error: notarization did not succeed (exit $submit_status)" >&2
-    if [ -n "$submission_id" ]; then
-        echo "==> notarytool log $submission_id" >&2
-        xcrun notarytool log "$submission_id" "${notary_args[@]}" >&2 || true
-    fi
-    exit 1
-fi
-echo "Notarized: submission $submission_id accepted"
+notarize "$work/payload.zip" "$work"
 
 # --- confirm Gatekeeper sees the ticket ------------------------------------
 #
