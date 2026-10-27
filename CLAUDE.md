@@ -535,6 +535,7 @@ See `docs/configuration.md` for full reference.
 
 ```bash
 make test           # Run all tests
+make test-scripts   # Release script tests (scripts/macos/tests, part of make verify)
 make verify         # Format + lint + test
 cargo test          # Direct cargo test
 ```
@@ -624,7 +625,7 @@ matrix jobs are renamed.
 - **Night lighting**: `docs/dev/night-lighting-design.md` (phases 1, 2a and 2b implemented (packaging, black serving, real lit sizes, generated lit textures), plus the lit disk cache and LED lighting: lit textures served through FUSE, generated from OXO `.oxn` recipes and the user's Laminar lit art; a separate lit path beside the ortho executor)
 - **CI/CD pipeline**: `docs/dev/cicd.md` (branch model, release job graph, platform tiers, version propagation)
 - **Homebrew tap**: `docs/dev/cicd.md` "Homebrew Tap" (four casks, `xearthlayer`, `xearthlayer@prerelease`, `xearthlayer-publish` and `xearthlayer-publish@prerelease`, rendered from `pkg/homebrew/*.rb.tmpl` by `scripts/homebrew/render-cask.sh` in the publish job and pushed to `HOMEBREW_TAP_REPO`; never edited by hand; casks because a formula cannot depend on the `macfuse` cask)
-- **macOS signing**: `docs/dev/macos-signing-runbook.md` (Developer ID Application certificate, notarization via App Store Connect API key, the five `APPLE_*` release secrets, `scripts/macos/sign-and-notarize.sh` shared by `release.yml` and `make sign-macos`; no entitlements because the binaries link only Apple frameworks and spawn `mount_macfuse` as a process)
+- **macOS signing**: `docs/dev/macos-signing-runbook.md` (Developer ID Application certificate for the binaries and Developer ID Installer certificate for the `.pkg` installers, notarization via App Store Connect API key, the seven `APPLE_*` release secrets, `scripts/macos/sign-and-notarize.sh` and `scripts/macos/build-pkg.sh` shared by `release.yml` and `make sign-macos` / `make pkg-macos`, helpers in `scripts/macos/lib.sh` with tests under `scripts/macos/tests` run by `make test-scripts`; no entitlements because the binaries link only Apple frameworks and spawn `mount_macfuse` as a process)
 - **Publisher separation**: `docs/dev/publisher-separation-design.md` (#284: `xearthlayer-package` is the format contract both sides depend on, `xearthlayer-publisher` holds the publishing domain, and `xearthlayer-publish` is its binary; the runtime links none of the publisher's dependencies)
 - memorize review allow(dead_code) macros at major checkpoints. Refactor aggresively to remove them when appropriate.
 - memorize ensure to update the projects documentation to reflect the current state of the project before committing changes

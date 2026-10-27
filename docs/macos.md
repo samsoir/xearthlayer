@@ -73,9 +73,46 @@ full as above: the fully qualified name trusts that one cask and no more (see
 [Tap Trust](https://docs.brew.sh/Tap-Trust)). Homebrew applies its download
 quarantine to every cask, which is why the binaries are signed and notarized.
 
+#### From the installer package (Apple Silicon)
+
+Each release carries `xearthlayer-<version>-arm64-macos.pkg`. Download it from the
+release, double-click it and follow the Installer. It puts `xearthlayer` in
+`/usr/local/bin`, which is already on the `PATH`. The package is signed with the
+project's Developer ID Installer certificate and notarized, with the ticket
+stapled to it, so it installs without a network connection. Then run:
+
+```bash
+xearthlayer --version
+xearthlayer setup
+```
+
+**Updating.** Open the newer package. It replaces the command in place.
+
+**Removing.**
+
+```bash
+sudo rm /usr/local/bin/xearthlayer
+sudo pkgutil --forget net.defreyssi.xearthlayer
+```
+
+**Checking the download.**
+
+```bash
+pkgutil --check-signature xearthlayer-<version>-arm64-macos.pkg   # Developer ID Installer: Sam de Freyssinet (Y7DVMR5MEX)
+spctl --assess --type install -vv xearthlayer-<version>-arm64-macos.pkg   # source=Notarized Developer ID
+```
+
+**Use one method.** Homebrew installs to `/opt/homebrew/bin`, which comes before
+`/usr/local/bin` on the `PATH`, so with both installed the Homebrew copy wins.
+`which -a xearthlayer` lists every copy; remove the one you do not use.
+
+The publishing tools have their own package,
+`xearthlayer-publish-<version>-arm64-macos.pkg` (receipt
+`net.defreyssi.xearthlayer-publish`).
+
 #### From a release tarball (Apple Silicon)
 
-Each release carries an `arm64-macos.tar.gz` tarball for Apple Silicon Macs.
+The manual route: each release also carries an `arm64-macos.tar.gz` tarball for Apple Silicon Macs.
 There is no Intel build; on an Intel Mac, build from source as below.
 
 The binaries are signed with the project's Apple Developer ID and notarized by

@@ -214,6 +214,9 @@ release does, drop the pin.
 the Developer ID identity into a per-job keychain, runs
 `scripts/macos/sign-and-notarize.sh` on both binaries, and deletes the keychain, all
 gated on the signing secrets being present so a fork still gets an unsigned tarball.
+With the Developer ID Installer identity also present it then runs
+`scripts/macos/build-pkg.sh` once per product to build, sign, notarize and staple an
+installer package (`<product>-vX.Y.Z-arm64-macos.pkg`) that installs `/usr/local/bin/<product>`.
 The certificate, the notary key, the secrets and their renewal are in
 [macos-signing-runbook.md](macos-signing-runbook.md).
 
@@ -221,8 +224,8 @@ The certificate, the notary key, the secrets and their renewal are in
 
 | Channel | Tag | GitHub Release | Assets |
 |---------|-----|----------------|--------|
-| Stable | `vX.Y.Z` | Latest | Linux tarball, macOS tarball, `.deb`, `.rpm`, AUR, Homebrew `xearthlayer` cask |
-| Pre-release | `vX.Y.Z-dev.N`, `-alpha.N`, `-beta.N`, `-rc.N` | Pre-release, never "Latest" | Linux tarball, macOS tarball, Homebrew `xearthlayer@prerelease` cask |
+| Stable | `vX.Y.Z` | Latest | Linux tarball, macOS tarball and installer package, `.deb`, `.rpm`, AUR, Homebrew `xearthlayer` cask |
+| Pre-release | `vX.Y.Z-dev.N`, `-alpha.N`, `-beta.N`, `-rc.N` | Pre-release, never "Latest" | Linux tarball, macOS tarball and installer package, Homebrew `xearthlayer@prerelease` cask |
 
 `verify` classifies the tag and emits a `prerelease` output; `package-deb`,
 `build-rpm` and `prepare-aur` are gated on it.
@@ -396,6 +399,7 @@ build.
 | `GITHUB_TOKEN` | `release.yml` | Automatic; creates the release and uploads assets |
 | `AUR_SSH_PRIVATE_KEY` | `release.yml` | Optional. Absent, the AUR files are attached to the release for manual submission |
 | `APPLE_DEVELOPER_ID_P12`, `APPLE_DEVELOPER_ID_P12_PASSWORD` | `release.yml` | Developer ID Application identity (base64 `.p12`) and its password. Absent, `package-macos` ships an unsigned tarball |
+| `APPLE_DEVELOPER_INSTALLER_P12`, `APPLE_DEVELOPER_INSTALLER_P12_PASSWORD` | `release.yml` | Developer ID Installer identity (base64 `.p12`) and its password. Absent, no installer packages are built (a `::notice::` says so) |
 | `APPLE_NOTARY_KEY_P8`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID` | `release.yml` | App Store Connect API key for `notarytool`. Required once the certificate is set. See [macos-signing-runbook.md](macos-signing-runbook.md) |
 | `WEBSITE_DISPATCH_TOKEN` | `website-sync.yml` | 90-day PAT. **Expiry is silent** — the website then lags by up to 24h until the daily fallback cron runs |
 | `HOMEBREW_TAP_TOKEN` | `release.yml` | Fine-grained PAT, *Contents: read and write* on the tap repository only. Absent, the tap is not updated (notice). Expired, the push fails and the run goes red after the release is public |
@@ -409,6 +413,9 @@ build.
 It reads exactly `deb`, `rpm` and `tarball` and ignores everything else — `aur` is
 already carried in `version.json` and silently dropped. Adding a key is therefore safe,
 but a new asset will not appear on the website until that workflow is taught to read it.
+`macos_pkg` and `publish_macos_pkg` are carried today and the website does not read them.
+The packages themselves are built only once `APPLE_DEVELOPER_INSTALLER_P12` is set, so
+until then a release lists the keys but has no `.pkg` assets.
 
 Website updates fire on a push to `main` that changes `version.json`, gated on the
 commit message indicating a `release/*` branch merge — so merging a release PR is what

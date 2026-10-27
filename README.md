@@ -62,8 +62,9 @@ Download the package for your distribution from the
 [latest release](https://github.com/samsoir/xearthlayer/releases/latest):
 a `.deb` for Debian and Ubuntu, an `.rpm` for Fedora and RHEL, or the
 `x86_64-linux.tar.gz` tarball for everything else. Arch users can build from
-the AUR. Apple Silicon Macs use the `arm64-macos.tar.gz` tarball, after
-installing macFUSE; [docs/macos.md](docs/macos.md) walks through both.
+the AUR. Apple Silicon Macs use Homebrew, the `arm64-macos.pkg` installer package or the
+`arm64-macos.tar.gz` tarball, after installing macFUSE; [docs/macos.md](docs/macos.md)
+walks through each.
 
 Prebuilt binaries require **glibc 2.34 or newer**, which covers Ubuntu 22.04
 LTS, Debian 12 and RHEL 9 onwards. On an older distribution, build from source.
