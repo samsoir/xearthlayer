@@ -54,8 +54,7 @@ Checklist for a working setup (each item is produced by the numbered steps in
 - [ ] The `.p12`, its password and `AuthKey_<KEYID>.p8` are in the password manager,
       and the PEM private key is deleted from disk
 - [ ] The Application certificate's expiry (currently **22 November 2027**) is in a calendar
-- [ ] The Installer certificate's expiry is in a calendar. Expires on: (record the
-      date from `openssl x509 -noout -enddate` when the certificate is created)
+- [ ] The Installer certificate's expiry (currently **25 November 2027**) is in a calendar
 
 ## The Pieces
 
@@ -76,8 +75,8 @@ Only the **Account Holder** of the developer account can create a Developer ID
 certificate; an Admin cannot. A team may hold at most five Developer ID
 Application certificates. Apple sets the validity period; **the current
 Application certificate expires on 22 November 2027**, so plan the renewal (below)
-for autumn 2027. The Installer certificate has its own expiry, recorded in the
-checklist above.
+for autumn 2027. The Installer certificate has its own expiry, **25 November
+2027**.
 
 ## What the Signature Looks Like
 
@@ -140,9 +139,8 @@ Stapling is tried up to three times, `MACOS_STAPLE_RETRY_DELAY` seconds apart
 ## First-Time Setup (Golden Path)
 
 Steps 1 to 4 and the Application secrets of step 6 were done once for the
-project, on 22 October 2026; step 5 is pending until the Installer certificate is
-created. It is
-written down so the certificate can be renewed and the secrets re-created
+project, on 22 October 2026, and step 5 with the Installer secrets on 27 October
+2026. It is written down so the certificate can be renewed and the secrets re-created
 without rediscovering it. Each step produces one item of the checklist above.
 
 ### 1. Private key and signing request
@@ -225,7 +223,7 @@ xcrun notarytool history --keychain-profile xearthlayer     # proves the key wor
 
 ### 5. Developer ID Installer certificate
 
-Pending: not yet done. Account Holder only. Repeat steps 1 to 3 with the Installer certificate type:
+Account Holder only. Repeat steps 1 to 3 with the Installer certificate type:
 
 1. Generate a new key and request with the commands of step 1, using new file
    names (`developer_id_installer.key.pem`,
@@ -355,7 +353,8 @@ xcrun stapler validate xearthlayer-v<version>-arm64-macos.pkg      # The validat
 ## Renewal, Rotation, Revocation
 
 - **Expiry.** Check with `openssl x509 -in developer_id_application.pem -noout
-  -enddate`; the current certificate ends 22 November 2027. Binaries
+  -enddate`; the current certificate ends 22 November 2027, the Installer
+  certificate 25 November 2027. Binaries
   signed with a timestamp keep running after expiry. Renewal is steps 1 to 3
   and 6 above with a new key; the old certificate need not be revoked.
   The Installer certificate renews the same way, with step 5. A package signed
