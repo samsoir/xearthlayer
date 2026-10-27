@@ -39,6 +39,14 @@
     "publish_macos_tarball": {
       "filename": "xearthlayer-publish-v0.5.0-rc.1-arm64-macos.tar.gz",
       "description": "Publishing tools, macOS (Apple Silicon) binary tarball"
+    },
+    "macos_pkg": {
+      "filename": "xearthlayer-v0.5.0-rc.1-arm64-macos.pkg",
+      "description": "macOS (Apple Silicon) installer package"
+    },
+    "publish_macos_pkg": {
+      "filename": "xearthlayer-publish-v0.5.0-rc.1-arm64-macos.pkg",
+      "description": "Publishing tools, macOS (Apple Silicon) installer package"
     }
   },
   "download_base_url": "https://github.com/samsoir/xearthlayer/releases/download/v0.5.0-rc.1"

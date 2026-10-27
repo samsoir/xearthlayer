@@ -402,6 +402,16 @@ sign-macos: ## Sign and notarize the release binaries with the Developer ID in t
 	@# store-credentials) or MACOS_NOTARY_KEY/_KEY_ID/_ISSUER_ID; see docs/dev/macos-signing-runbook.md.
 	@scripts/macos/sign-and-notarize.sh target/release/xearthlayer target/release/xearthlayer-publish
 
+.PHONY: pkg-macos
+pkg-macos: ## Build signed, notarized installer packages from the signed release binaries (macOS only)
+	@if [ "$$(uname)" != "Darwin" ]; then echo "$(RED)Error: pkg-macos must be run on macOS$(NC)"; exit 1; fi
+	@# Run `make sign-macos` first: the packages carry the binaries as they are.
+	@mkdir -p dist
+	@for p in xearthlayer xearthlayer-publish; do \
+		scripts/macos/build-pkg.sh $$p target/release/$$p $(PKG_VERSION) dist/$$p-v$(PKG_VERSION)-arm64-macos.pkg || exit 1; \
+	done
+	@echo "$(GREEN)Packages built: dist/xearthlayer-v$(PKG_VERSION)-arm64-macos.pkg, dist/xearthlayer-publish-v$(PKG_VERSION)-arm64-macos.pkg$(NC)"
+
 .PHONY: aur-prepare
 aur-prepare: ## Prepare AUR package for a tagged release (TAG=v0.2.0)
 	@if [ -z "$(TAG)" ]; then echo "$(RED)Error: TAG is required. Usage: make aur-prepare TAG=v0.2.0$(NC)"; exit 1; fi
@@ -527,7 +537,7 @@ bump-version: ## Bump version across all files (VERSION=x.y.z or x.y.z-dev.N)
 	@# each recipe line runs in its own shell.
 	@FC=$$(jq -r '.assets.rpm.filename' version.json | sed -E 's/.*\.(fc[0-9]+)\..*/\1/'); \
 		jq --arg v "$(VERSION)" --arg fc "$$FC" \
-			'.version = $$v | .tag = "v" + $$v | .download_base_url = "https://github.com/samsoir/xearthlayer/releases/download/v" + $$v | .assets.deb.filename = "xearthlayer_" + $$v + "-1_amd64.deb" | .assets.rpm.filename = "xearthlayer-" + $$v + "-1." + $$fc + ".x86_64.rpm" | .assets.tarball.filename = "xearthlayer-v" + $$v + "-x86_64-linux.tar.gz" | .assets.macos_tarball = {filename: ("xearthlayer-v" + $$v + "-arm64-macos.tar.gz"), description: "macOS (Apple Silicon) binary tarball"} | .assets.publish_deb = {filename: ("xearthlayer-publish_" + $$v + "-1_amd64.deb"), description: "Publishing tools, Debian/Ubuntu package"} | .assets.publish_rpm = {filename: ("xearthlayer-publish-" + $$v + "-1." + $$fc + ".x86_64.rpm"), description: "Publishing tools, Fedora/RHEL package"} | .assets.publish_tarball = {filename: ("xearthlayer-publish-v" + $$v + "-x86_64-linux.tar.gz"), description: "Publishing tools, Linux binary tarball"} | .assets.publish_macos_tarball = {filename: ("xearthlayer-publish-v" + $$v + "-arm64-macos.tar.gz"), description: "Publishing tools, macOS (Apple Silicon) binary tarball"}' \
+			'.version = $$v | .tag = "v" + $$v | .download_base_url = "https://github.com/samsoir/xearthlayer/releases/download/v" + $$v | .assets.deb.filename = "xearthlayer_" + $$v + "-1_amd64.deb" | .assets.rpm.filename = "xearthlayer-" + $$v + "-1." + $$fc + ".x86_64.rpm" | .assets.tarball.filename = "xearthlayer-v" + $$v + "-x86_64-linux.tar.gz" | .assets.macos_tarball = {filename: ("xearthlayer-v" + $$v + "-arm64-macos.tar.gz"), description: "macOS (Apple Silicon) binary tarball"} | .assets.macos_pkg = {filename: ("xearthlayer-v" + $$v + "-arm64-macos.pkg"), description: "macOS (Apple Silicon) installer package"} | .assets.publish_deb = {filename: ("xearthlayer-publish_" + $$v + "-1_amd64.deb"), description: "Publishing tools, Debian/Ubuntu package"} | .assets.publish_rpm = {filename: ("xearthlayer-publish-" + $$v + "-1." + $$fc + ".x86_64.rpm"), description: "Publishing tools, Fedora/RHEL package"} | .assets.publish_tarball = {filename: ("xearthlayer-publish-v" + $$v + "-x86_64-linux.tar.gz"), description: "Publishing tools, Linux binary tarball"} | .assets.publish_macos_tarball = {filename: ("xearthlayer-publish-v" + $$v + "-arm64-macos.tar.gz"), description: "Publishing tools, macOS (Apple Silicon) binary tarball"} | .assets.publish_macos_pkg = {filename: ("xearthlayer-publish-v" + $$v + "-arm64-macos.pkg"), description: "Publishing tools, macOS (Apple Silicon) installer package"}' \
 			version.json > version.json.tmp \
 		&& cat version.json.tmp > version.json && rm -f version.json.tmp
 	@# Cargo.lock — refresh the two workspace member entries.
