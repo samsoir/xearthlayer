@@ -2,6 +2,7 @@
 # One stand-in for every macOS tool the release scripts call, chosen by the
 # name it is invoked as. Each call is logged to $FAKE_LOG; outputs are
 # steered by the FAKE_* variables documented in helpers.sh.
+# FAKE_NOTARY_NO_ID=1 makes notarytool submit fail before printing any id line.
 set -u
 tool=$(basename "$0")
 echo "$tool $*" >>"$FAKE_LOG"
@@ -47,6 +48,7 @@ case "$tool" in
     xcrun)
         case "$1 ${2:-}" in
             "notarytool submit")
+                [ -n "${FAKE_NOTARY_NO_ID:-}" ] && { echo "Error: could not reach the notary service"; exit 1; }
                 echo "  id: 4f1e-test"
                 echo "  status: ${FAKE_NOTARY_STATUS:-Accepted}"
                 [ "${FAKE_NOTARY_STATUS:-Accepted}" = "Accepted" ] || exit 1

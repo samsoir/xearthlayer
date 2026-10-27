@@ -86,6 +86,23 @@ test_notarize_rejected_prints_log() {
     assert_contains "$(cat "$FAKE_LOG")" "xcrun notarytool log 4f1e-test"
 }
 
+test_notarize_failure_without_submission_id_still_reports() {
+    setup_fakes
+    NOTARY_ARGS=(--keychain-profile p)
+    local work err rc
+    work=$(mktemp -d)
+    : >"$work/x.pkg"
+    # The caller runs under set -e and pipefail; a missing id line must not abort it
+    # silently. A separate bash, because run.sh calls tests inside an `if`, which
+    # switches set -e off in everything below it.
+    err=$(FAKE_NOTARY_NO_ID=1 bash -c 'set -eo pipefail; . "$1/lib.sh"; NOTARY_ARGS=(--keychain-profile p); notarize "$2" "$3"' \
+        _ "$SCRIPTS_DIR" "$work/x.pkg" "$work" 2>&1 >/dev/null)
+    rc=$?
+    assert_eq "$rc" 1
+    assert_contains "$err" "did not succeed"
+    assert_not_contains "$(cat "$FAKE_LOG")" "notarytool log"
+}
+
 test_distribution_for_runtime() {
     local xml
     xml=$(render_distribution xearthlayer 0.5.0-rc.1)

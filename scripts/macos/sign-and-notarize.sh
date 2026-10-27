@@ -55,7 +55,7 @@ identity="${MACOS_SIGN_IDENTITY:-}"
 if [ -z "$identity" ]; then
     # `find-identity -v` lists only identities whose certificate is valid now
     # and whose private key is present.
-    selected=$(security find-identity -v | select_identity "Developer ID Application" MACOS_SIGN_IDENTITY)
+    selected=$(security find-identity -v -p codesigning | select_identity "Developer ID Application" MACOS_SIGN_IDENTITY)
     identity=$(printf '%s' "$selected" | cut -f1)
     echo "Signing identity: $(printf '%s' "$selected" | cut -f2)"
 else

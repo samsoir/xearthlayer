@@ -65,7 +65,7 @@ notarize() {
     xcrun notarytool submit "$file" "${NOTARY_ARGS[@]}" --wait --timeout 30m 2>&1 | tee "$log"
     status=${PIPESTATUS[0]}
     set -e
-    id=$(grep -m1 -E '^ *id: ' "$log" | awk '{print $2}')
+    id=$(grep -m1 -E '^ *id: ' "$log" | awk '{print $2}' || true)
     if [ "$status" -ne 0 ] || ! grep -qE '^ *status: Accepted' "$log"; then
         echo "error: notarization of $(basename "$file") did not succeed (exit $status)" >&2
         if [ -n "$id" ]; then
