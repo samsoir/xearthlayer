@@ -7,7 +7,7 @@ License:        MIT
 URL:            https://github.com/samsoir/xearthlayer
 Source0:        %{name}-%{version}.tar.gz
 
-BuildRequires:  rust >= 1.70
+BuildRequires:  rust >= 1.97.1
 BuildRequires:  cargo
 BuildRequires:  fuse3-devel
 
@@ -28,7 +28,7 @@ Features:
 - Two-tier caching for instant repeat visits
 - High-quality BC1/BC3 DDS textures with mipmaps
 - Works with Ortho4XP-generated scenery
-- Linux support (Windows and macOS planned)
+- Linux and macOS support (Windows planned)
 
 # Publishing tools are a separate package (#284). They need neither FUSE nor
 # X-Plane, and a flight simulator user installing xearthlayer should not pull

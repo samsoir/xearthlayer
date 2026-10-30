@@ -270,12 +270,7 @@ Some behaviour is structurally untestable on hosted runners. Know the gaps.
 Silicon requires booting to Recovery, downgrading to Reduced Security, enabling user
 management of kexts, and rebooting. Hosted runners permit none of that.
 
-As of this writing, `xearthlayer/tests/macfuse_smoke.rs` does not yet exist on this
-branch; it ships with the macOS port (PR #202, still open against `develop/0.5.0`).
-Until that merges, `make verify-macos`'s final step has no test to run — the platform
-and macFUSE guards ahead of it still work today.
-
-Once present, the test is designed to be `#[ignore]`d for exactly this reason: CI
+`xearthlayer/tests/macfuse_smoke.rs` is `#[ignore]`d for exactly this reason: CI
 **compiles** it — which catches API and type breakage under `-Dwarnings` — but never
 **runs** it, because macFUSE is a kext and hosted runners cannot load one.
 
@@ -410,12 +405,10 @@ build.
 `sync-version.yml` fetches it, extracts specific keys with `jq`, and rewrites its own
 `data/release.json`.
 
-It reads exactly `deb`, `rpm` and `tarball` and ignores everything else — `aur` is
-already carried in `version.json` and silently dropped. Adding a key is therefore safe,
-but a new asset will not appear on the website until that workflow is taught to read it.
-`macos_pkg` and `publish_macos_pkg` are carried today and the website does not read them.
-The packages themselves are built only once `APPLE_DEVELOPER_INSTALLER_P12` is set, so
-until then a release lists the keys but has no `.pkg` assets.
+It reads `deb`, `rpm`, `tarball`, `macos_tarball`, `macos_pkg` and `aur` and ignores
+everything else. Adding a key is therefore safe, but a new asset will not appear on the
+website until that workflow is taught to read it. The publisher's `publish_*` keys are
+carried and not read.
 
 Website updates fire on a push to `main` that changes `version.json`, gated on the
 commit message indicating a `release/*` branch merge — so merging a release PR is what

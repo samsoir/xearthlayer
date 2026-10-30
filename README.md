@@ -224,13 +224,13 @@ See [Developer Documentation](docs/dev/) for architecture and guidelines.
 
 Architecturally influenced by [AutoOrtho](https://github.com/kubilus1/autoortho) by [kubilus1](https://github.com/kubilus1). XEarthLayer is an independent Rust implementation focused on performance and memory safety.
 
-XEarthLayer Global Scenery created using [OXO: Ortho4 XEarthLayer Orchestrator](https://https://github.com/XEarthLayer/ortho4-xearthlayer-orchestrator)
+XEarthLayer Global Scenery created using [OXO: Ortho4 XEarthLayer Orchestrator](https://github.com/XEarthLayer/ortho4-xearthlayer-orchestrator)
 
 Thanks to [@dlicudi](https://github.com/dlicudi) for leading development of the macOS native port of XEarthLayer.
 
 Developed with assistance from [Claude](https://claude.ai) by Anthropic.
 
- > **NASA VIIRS Land Science Investigator-led Processing System.** (2025). *VIIRS/JPSS1 Lunar BRDF-Adjusted Nighttime Lights Yearly L3 Global 15 arc second Linear Lat Lon Grid* [Dataset](https://doi.org/10.5067/VIIRS/VJ146A4.002). ASA Level 1 and Atmosphere Archive and Distribution System Distributed Active Archive Center. Date Accessed: 2026-10-16
+ > **NASA VIIRS Land Science Investigator-led Processing System.** (2025). *VIIRS/JPSS1 Lunar BRDF-Adjusted Nighttime Lights Yearly L3 Global 15 arc second Linear Lat Lon Grid* [Dataset](https://doi.org/10.5067/VIIRS/VJ146A4.002). NASA Level 1 and Atmosphere Archive and Distribution System Distributed Active Archive Center. Date Accessed: 2026-10-16
 
 Made with :heart: in California.
 
