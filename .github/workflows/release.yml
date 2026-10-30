@@ -372,6 +372,11 @@ jobs:
     if: ${{ needs.verify.outputs.prerelease != 'true' }}
     container:
       image: fedora:latest
+    # Fedora's cargo ignores rust-toolchain.toml, so this job compiles with
+    # whatever rustc Fedora ships. A lint new in that compiler must not stop a
+    # release; `verify` already denies warnings on the pinned toolchain.
+    env:
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v6
 
