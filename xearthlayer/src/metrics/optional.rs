@@ -28,9 +28,9 @@ pub trait OptionalMetrics {
     fn mem_cache_write_completed(&self);
     fn job_submitted(&self, is_fuse: bool);
     fn job_started(&self);
-    fn job_completed(&self, success: bool, duration_us: u64);
+    fn job_completed(&self, success: bool, duration_us: u64, is_fuse: bool);
     fn job_coalesced(&self);
-    fn job_timed_out(&self);
+    fn job_timed_out(&self, duration_us: u64);
     fn encode_started(&self);
     fn encode_completed(&self, bytes: u64, duration_us: u64);
     fn assembly_completed(&self, duration_us: u64);
@@ -180,9 +180,9 @@ impl OptionalMetrics for Option<MetricsClient> {
     }
 
     #[inline]
-    fn job_completed(&self, success: bool, duration_us: u64) {
+    fn job_completed(&self, success: bool, duration_us: u64, is_fuse: bool) {
         if let Some(client) = self {
-            client.job_completed(success, duration_us);
+            client.job_completed(success, duration_us, is_fuse);
         }
     }
 
@@ -194,9 +194,9 @@ impl OptionalMetrics for Option<MetricsClient> {
     }
 
     #[inline]
-    fn job_timed_out(&self) {
+    fn job_timed_out(&self, duration_us: u64) {
         if let Some(client) = self {
-            client.job_timed_out();
+            client.job_timed_out(duration_us);
         }
     }
 

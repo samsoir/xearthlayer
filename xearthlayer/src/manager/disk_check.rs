@@ -1,16 +1,17 @@
 //! Pre-flight disk-space check for package installs.
 //!
-//! Runs after `query_sizes()` (when expected part totals are known) and
-//! before `download_all()` (so users get a clear failure before any
-//! bytes hit the network). See issue #188 for the motivating user
-//! report on Bazzite.
+//! An install batch reads the free space of its temp and packages folders
+//! once, after the first package's parts are sized and before any bytes hit
+//! the network, so users get a clear failure up front (#188). The install
+//! queue's `DiskLedger` decides from those figures when each package may
+//! download.
 //!
 //! The provider trait exists so tests can inject low-available stubs;
 //! production wires `RealFsInfoProvider`, which delegates to
 //! `crate::system::fs_info`.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::error::{ManagerError, ManagerResult};
 use crate::system::FilesystemInfo;
@@ -32,44 +33,28 @@ impl FsInfoProvider for RealFsInfoProvider {
     }
 }
 
-/// Multiplier applied to the sum of part sizes to estimate peak
-/// on-disk footprint during install.
-///
-/// Peak usage = downloaded archive parts (still on disk during
-/// extraction) + extracted contents. For our scenery archives the
-/// contents are mostly already-compressed BCn DDS textures with low
-/// tar.gz compression ratios, so a 2× multiplier covers
-/// "compressed + extracted" with a small margin.
-pub const SPACE_BUFFER_MULTIPLIER: u64 = 2;
+/// Estimated size of a package's extracted tree, as a multiple of its
+/// download. Measured across every published region, extraction expands the
+/// download by 1.49x to 2.12x (`af1` is the worst): a package is millions of
+/// small files and gzip compresses their tar headers and text files. 3 covers
+/// the worst case with margin, because refusing an install costs a retry
+/// while running out of space part way through costs the whole download.
+/// The exact figure would need the uncompressed size in package metadata
+/// (#260), which the closed metadata format cannot carry.
+pub const TREE_MULTIPLIER: u64 = 3;
 
-/// Verify that `path` has at least `required_bytes` available, returning
-/// `ManagerError::InsufficientDiskSpace` otherwise.
-///
-/// `path` is what gets `statvfs`'d directly; if it doesn't exist, the
-/// caller should pass an existing ancestor (the temp dir is created
-/// before this check runs in the installer flow, so this isn't an
-/// issue in production).
-pub fn check_disk_space(
-    provider: &dyn FsInfoProvider,
-    path: &Path,
-    required_bytes: u64,
-) -> ManagerResult<()> {
-    let info = provider
+/// Bytes available to an unprivileged user on the filesystem holding `path`.
+pub fn available_bytes(provider: &dyn FsInfoProvider, path: &Path) -> ManagerResult<u64> {
+    provider
         .fs_info(path)
-        .map_err(|e| ManagerError::InvalidPath(format!("statvfs {}: {}", path.display(), e)))?;
-    if info.available_bytes < required_bytes {
-        return Err(ManagerError::InsufficientDiskSpace {
-            path: PathBuf::from(path),
-            required_bytes,
-            available_bytes: info.available_bytes,
-        });
-    }
-    Ok(())
+        .map(|info| info.available_bytes)
+        .map_err(|e| ManagerError::InvalidPath(format!("statvfs {}: {}", path.display(), e)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     /// Stub provider returning a fixed FilesystemInfo regardless of path.
@@ -98,35 +83,14 @@ mod tests {
     }
 
     #[test]
-    fn returns_ok_when_available_meets_required() {
-        let provider = StubProvider::new(100 * 1024 * 1024 * 1024, 50 * 1024 * 1024 * 1024);
-        let result = check_disk_space(&provider, Path::new("/tmp"), 10 * 1024 * 1024 * 1024);
-        assert!(result.is_ok(), "got {result:?}");
-    }
-
-    #[test]
-    fn returns_ok_when_available_exactly_equals_required() {
-        // Boundary: available == required is success (`<` not `<=`).
-        let provider = StubProvider::new(100, 50);
-        assert!(check_disk_space(&provider, Path::new("/tmp"), 50).is_ok());
-    }
-
-    #[test]
-    fn returns_insufficient_disk_space_when_available_below_required() {
+    fn reports_the_bytes_available_on_the_filesystem_holding_the_path() {
         let provider = StubProvider::new(100, 49);
-        let result = check_disk_space(&provider, Path::new("/tmp"), 50);
-        match result {
-            Err(ManagerError::InsufficientDiskSpace {
-                path,
-                required_bytes,
-                available_bytes,
-            }) => {
-                assert_eq!(path, Path::new("/tmp"));
-                assert_eq!(required_bytes, 50);
-                assert_eq!(available_bytes, 49);
-            }
-            other => panic!("expected InsufficientDiskSpace, got {other:?}"),
-        }
+
+        assert_eq!(available_bytes(&provider, Path::new("/tmp")).unwrap(), 49);
+        assert_eq!(
+            provider.last_path.lock().unwrap().as_deref(),
+            Some(Path::new("/tmp"))
+        );
     }
 
     #[test]
@@ -137,8 +101,7 @@ mod tests {
                 Err(io::Error::other("statvfs failed"))
             }
         }
-        let result = check_disk_space(&ErrorProvider, Path::new("/tmp"), 100);
-        match result {
+        match available_bytes(&ErrorProvider, Path::new("/tmp")) {
             Err(ManagerError::InvalidPath(msg)) => {
                 assert!(msg.contains("statvfs"), "got: {msg}");
             }

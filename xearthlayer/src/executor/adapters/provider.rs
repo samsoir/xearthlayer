@@ -67,10 +67,39 @@ impl ChunkProvider for ProviderAdapter {
 }
 
 /// Maps provider errors to chunk download errors with retry semantics.
+///
+/// # HTTP 404
+///
+/// A 404 for a chunk is permanent (#301): every provider XEarthLayer ships
+/// answers 404 when it has no tile at that position and zoom, and nothing
+/// else. Token and session problems use other codes, so they stay retryable
+/// and the provider's own refresh gets its chance:
+///
+/// - Apple: 404 outside coverage; expired tokens are 400, 403 or 410 and the
+///   provider refreshes and retries once itself
+/// - ArcGIS World Imagery and USGS (both ArcGIS tile servers): 404 for a
+///   tile the cache does not hold
+/// - Bing: 404 when no tile exists at the zoom (the usual answer is a
+///   placeholder image, which arrives as a 200)
+/// - Google GO2 (`khm`): 404 for a missing tile
+/// - Google Map Tiles API: 404 for a missing tile; a bad session or key is
+///   400 or 403
+/// - MapBox: 404 "Tile not found"
+///
+/// Retrying a 404 cannot succeed; it only spends permits and backoff time in
+/// the minutes when the pipeline is already under load.
 fn map_provider_error(err: ProviderError) -> ChunkDownloadError {
     match err {
-        // HTTP errors are typically transient and should be retried
+        // Transport failures (connect, send, read) are transient
         ProviderError::HttpError(msg) => ChunkDownloadError::retryable(msg),
+        // No imagery at this position: retrying cannot succeed
+        ProviderError::HttpStatus { status: 404, url } => {
+            ChunkDownloadError::permanent(format!("HTTP 404 from {}", url))
+        }
+        // Any other status (5xx, 429, token expiry) may clear on retry
+        ProviderError::HttpStatus { status, url } => {
+            ChunkDownloadError::retryable(format!("HTTP {} from {}", status, url))
+        }
         // These are permanent failures - retrying won't help
         ProviderError::UnsupportedCoordinates { row, col, zoom } => {
             ChunkDownloadError::permanent(format!(
@@ -313,5 +342,72 @@ mod tests {
         let provider = MockAsyncProvider::success(vec![]);
         let adapter = AsyncProviderAdapter::new(provider);
         assert_eq!(adapter.name(), "mock_async");
+    }
+
+    // Issue #301: the retry decision must come from the real HTTP response,
+    // so these tests go through a real client against a local server.
+
+    /// Serves `status_line` to every connection and returns the address.
+    async fn serve_status(status_line: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn adapter_for(
+        addr: std::net::SocketAddr,
+    ) -> AsyncProviderAdapter<
+        crate::provider::AsyncBingMapsProvider<crate::provider::AsyncReqwestClient>,
+    > {
+        let http = crate::provider::AsyncReqwestClient::new().unwrap();
+        let provider = crate::provider::AsyncBingMapsProvider::with_base_url(
+            http,
+            format!("http://{addr}/a{{quadkey}}.jpeg?g=1"),
+        );
+        AsyncProviderAdapter::new(provider)
+    }
+
+    #[tokio::test]
+    async fn http_404_from_the_provider_is_permanent() {
+        let addr = serve_status("404 Not Found").await;
+        let adapter = adapter_for(addr);
+
+        let err = adapter.download_chunk(100, 200, 16).await.unwrap_err();
+
+        assert!(
+            !err.is_retryable,
+            "a 404 means the provider has no imagery here; retrying cannot succeed: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_503_from_the_provider_is_retryable() {
+        let addr = serve_status("503 Service Unavailable").await;
+        let adapter = adapter_for(addr);
+
+        let err = adapter.download_chunk(100, 200, 16).await.unwrap_err();
+
+        assert!(err.is_retryable, "a 503 is transient: {err}");
     }
 }

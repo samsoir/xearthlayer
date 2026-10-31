@@ -1,6 +1,6 @@
 //! Service configuration types.
 
-use crate::config::{ControlPlaneSettings, DownloadConfig, PipelineSettings, TextureConfig};
+use crate::config::{ControlPlaneSettings, TextureConfig};
 use std::path::PathBuf;
 
 /// Default disk GC interval in seconds (60 seconds).
@@ -14,12 +14,12 @@ pub const DEFAULT_GC_INTERVAL_SECS: u64 = 60;
 ///
 /// ```
 /// use xearthlayer::service::ServiceConfig;
-/// use xearthlayer::config::{TextureConfig, DownloadConfig};
+/// use xearthlayer::config::TextureConfig;
 /// use xearthlayer::dds::DdsFormat;
 ///
 /// let config = ServiceConfig::builder()
 ///     .texture(TextureConfig::new(DdsFormat::BC1).with_mipmap_count(5))
-///     .download(DownloadConfig::default())
+///     .chunk_request_timeout_secs(10)
 ///     .cache_enabled(true)
 ///     .build();
 ///
@@ -29,8 +29,6 @@ pub const DEFAULT_GC_INTERVAL_SECS: u64 = 60;
 pub struct ServiceConfig {
     /// Texture encoding configuration
     texture: TextureConfig,
-    /// Download/orchestrator configuration
-    download: DownloadConfig,
     /// Whether caching is enabled
     cache_enabled: bool,
     /// FUSE mountpoint (optional, only needed for serve command)
@@ -51,10 +49,23 @@ pub struct ServiceConfig {
     generation_timeout: Option<u64>,
     /// Quiet mode - disables periodic stats logging (for TUI mode)
     quiet_mode: bool,
-    /// Pipeline configuration for concurrency and retry behavior
-    pipeline: PipelineSettings,
+    /// Whether night lighting is on (`night.enabled`); adds the lit disk tier
+    night_enabled: bool,
     /// Control plane configuration for job management and health monitoring
     control_plane: ControlPlaneSettings,
+    /// HTTP request timeout in seconds for an individual chunk download.
+    ///
+    /// From `executor.request_timeout_secs`. Per chunk, not per tile: a tile is
+    /// 256 chunks, so this bounds one HTTP request rather than the whole tile.
+    chunk_request_timeout_secs: u64,
+    /// Retry attempts per failed chunk download.
+    ///
+    /// From `executor.max_retries`.
+    chunk_max_retries: u32,
+    /// Prefetch lane capacity as a fraction of the demand lane's.
+    ///
+    /// From `prefetch.capacity_share`.
+    prefetch_capacity_share: f64,
 }
 
 impl ServiceConfig {
@@ -68,9 +79,35 @@ impl ServiceConfig {
         &self.texture
     }
 
-    /// Get the download configuration.
-    pub fn download(&self) -> &DownloadConfig {
-        &self.download
+    /// Prefetch lane capacity as a fraction of the demand lane's.
+    pub fn prefetch_capacity_share(&self) -> f64 {
+        self.prefetch_capacity_share
+    }
+
+    /// Per-chunk HTTP request timeout in seconds.
+    pub fn chunk_request_timeout_secs(&self) -> u64 {
+        self.chunk_request_timeout_secs
+    }
+
+    /// Retry attempts per failed chunk download.
+    pub fn chunk_max_retries(&self) -> u32 {
+        self.chunk_max_retries
+    }
+
+    /// Build the executor's download configuration from these settings.
+    ///
+    /// This is the only place the configured per-chunk timeout and retry count
+    /// become the executor's behaviour, so it is the seam #249 was missing: the
+    /// keys were parsed and displayed, but the executor took
+    /// `DownloadConfig::default()` and no configured value ever reached it.
+    ///
+    /// The HTTP semaphore is left at its default capacity. Concurrency is not
+    /// user-configurable; it is derived from the host by `ResourcePoolConfig`.
+    pub fn chunk_download_config(&self) -> crate::executor::DownloadConfig {
+        crate::executor::DownloadConfig::new(
+            std::time::Duration::from_secs(self.chunk_request_timeout_secs),
+            self.chunk_max_retries,
+        )
     }
 
     /// Check if caching is enabled.
@@ -98,6 +135,11 @@ impl ServiceConfig {
         self.cache_disk_size
     }
 
+    /// Whether night lighting is enabled (it then gets a lit disk cache tier).
+    pub fn night_enabled(&self) -> bool {
+        self.night_enabled
+    }
+
     /// Get the DDS disk ratio (fraction of disk allocated to DDS), if configured.
     pub fn cache_dds_disk_ratio(&self) -> Option<f64> {
         self.cache_dds_disk_ratio
@@ -123,11 +165,6 @@ impl ServiceConfig {
         self.quiet_mode
     }
 
-    /// Get the pipeline configuration for concurrency and retry behavior.
-    pub fn pipeline(&self) -> &PipelineSettings {
-        &self.pipeline
-    }
-
     /// Get the control plane configuration for job management and health monitoring.
     pub fn control_plane(&self) -> &ControlPlaneSettings {
         &self.control_plane
@@ -137,16 +174,13 @@ impl ServiceConfig {
 impl Default for ServiceConfig {
     fn default() -> Self {
         use crate::config::{
-            default_cpu_concurrent, default_http_concurrent, default_max_concurrent_jobs,
-            default_prefetch_in_flight, DEFAULT_COALESCE_CHANNEL_CAPACITY,
-            DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
+            default_max_concurrent_jobs, DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
             DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
             DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS, DEFAULT_MAX_RETRIES,
-            DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_RETRY_BASE_DELAY_MS,
+            DEFAULT_PREFETCH_CAPACITY_SHARE, DEFAULT_REQUEST_TIMEOUT_SECS,
         };
         Self {
             texture: TextureConfig::default(),
-            download: DownloadConfig::default(),
             cache_enabled: true,
             mountpoint: None,
             cache_directory: None,
@@ -157,21 +191,16 @@ impl Default for ServiceConfig {
             generation_threads: None,
             generation_timeout: None,
             quiet_mode: false,
-            pipeline: PipelineSettings {
-                max_http_concurrent: default_http_concurrent(),
-                max_cpu_concurrent: default_cpu_concurrent(),
-                max_prefetch_in_flight: default_prefetch_in_flight(),
-                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-                max_retries: DEFAULT_MAX_RETRIES,
-                retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
-                coalesce_channel_capacity: DEFAULT_COALESCE_CHANNEL_CAPACITY,
-            },
+            night_enabled: false,
             control_plane: ControlPlaneSettings {
                 max_concurrent_jobs: default_max_concurrent_jobs(),
                 stall_threshold_secs: DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS,
                 health_check_interval_secs: DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
                 semaphore_timeout_secs: DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
             },
+            chunk_request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            chunk_max_retries: DEFAULT_MAX_RETRIES,
+            prefetch_capacity_share: DEFAULT_PREFETCH_CAPACITY_SHARE,
         }
     }
 }
@@ -182,7 +211,6 @@ impl Default for ServiceConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ServiceConfigBuilder {
     texture: Option<TextureConfig>,
-    download: Option<DownloadConfig>,
     cache_enabled: Option<bool>,
     mountpoint: Option<String>,
     cache_directory: Option<PathBuf>,
@@ -193,7 +221,10 @@ pub struct ServiceConfigBuilder {
     generation_threads: Option<usize>,
     generation_timeout: Option<u64>,
     quiet_mode: Option<bool>,
-    pipeline: Option<PipelineSettings>,
+    night_enabled: Option<bool>,
+    chunk_request_timeout_secs: Option<u64>,
+    chunk_max_retries: Option<u32>,
+    prefetch_capacity_share: Option<f64>,
     control_plane: Option<ControlPlaneSettings>,
 }
 
@@ -204,9 +235,21 @@ impl ServiceConfigBuilder {
         self
     }
 
-    /// Set the download/orchestrator configuration.
-    pub fn download(mut self, config: DownloadConfig) -> Self {
-        self.download = Some(config);
+    /// Set the per-chunk HTTP request timeout in seconds.
+    pub fn chunk_request_timeout_secs(mut self, secs: u64) -> Self {
+        self.chunk_request_timeout_secs = Some(secs);
+        self
+    }
+
+    /// Set the prefetch lane capacity as a fraction of the demand lane's.
+    pub fn prefetch_capacity_share(mut self, share: f64) -> Self {
+        self.prefetch_capacity_share = Some(share);
+        self
+    }
+
+    /// Set the retry attempts per failed chunk download.
+    pub fn chunk_max_retries(mut self, retries: u32) -> Self {
+        self.chunk_max_retries = Some(retries);
         self
     }
 
@@ -240,6 +283,12 @@ impl ServiceConfigBuilder {
         self
     }
 
+    /// Enable night lighting, which gives it a share of the disk cache.
+    pub fn night_enabled(mut self, enabled: bool) -> Self {
+        self.night_enabled = Some(enabled);
+        self
+    }
+
     /// Set the DDS disk ratio (fraction of disk allocated to DDS tiles).
     pub fn cache_dds_disk_ratio(mut self, ratio: f64) -> Self {
         self.cache_dds_disk_ratio = Some(ratio);
@@ -270,12 +319,6 @@ impl ServiceConfigBuilder {
         self
     }
 
-    /// Set the pipeline configuration for concurrency and retry behavior.
-    pub fn pipeline(mut self, settings: PipelineSettings) -> Self {
-        self.pipeline = Some(settings);
-        self
-    }
-
     /// Set the control plane configuration for job management and health monitoring.
     pub fn control_plane(mut self, settings: ControlPlaneSettings) -> Self {
         self.control_plane = Some(settings);
@@ -285,16 +328,13 @@ impl ServiceConfigBuilder {
     /// Build the configuration with defaults for unset values.
     pub fn build(self) -> ServiceConfig {
         use crate::config::{
-            default_cpu_concurrent, default_http_concurrent, default_max_concurrent_jobs,
-            default_prefetch_in_flight, DEFAULT_COALESCE_CHANNEL_CAPACITY,
-            DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
+            default_max_concurrent_jobs, DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
             DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
             DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS, DEFAULT_MAX_RETRIES,
-            DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_RETRY_BASE_DELAY_MS,
+            DEFAULT_REQUEST_TIMEOUT_SECS,
         };
         ServiceConfig {
             texture: self.texture.unwrap_or_default(),
-            download: self.download.unwrap_or_default(),
             cache_enabled: self.cache_enabled.unwrap_or(true),
             mountpoint: self.mountpoint,
             cache_directory: self.cache_directory,
@@ -307,21 +347,20 @@ impl ServiceConfigBuilder {
             generation_threads: self.generation_threads,
             generation_timeout: self.generation_timeout,
             quiet_mode: self.quiet_mode.unwrap_or(false),
-            pipeline: self.pipeline.unwrap_or(PipelineSettings {
-                max_http_concurrent: default_http_concurrent(),
-                max_cpu_concurrent: default_cpu_concurrent(),
-                max_prefetch_in_flight: default_prefetch_in_flight(),
-                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-                max_retries: DEFAULT_MAX_RETRIES,
-                retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
-                coalesce_channel_capacity: DEFAULT_COALESCE_CHANNEL_CAPACITY,
-            }),
+            night_enabled: self.night_enabled.unwrap_or(false),
             control_plane: self.control_plane.unwrap_or(ControlPlaneSettings {
                 max_concurrent_jobs: default_max_concurrent_jobs(),
                 stall_threshold_secs: DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS,
                 health_check_interval_secs: DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
                 semaphore_timeout_secs: DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
             }),
+            chunk_request_timeout_secs: self
+                .chunk_request_timeout_secs
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+            chunk_max_retries: self.chunk_max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
+            prefetch_capacity_share: self
+                .prefetch_capacity_share
+                .unwrap_or(crate::config::DEFAULT_PREFETCH_CAPACITY_SHARE),
         }
     }
 }
@@ -332,10 +371,48 @@ mod tests {
     use crate::dds::DdsFormat;
 
     #[test]
+    fn night_enabled_defaults_off_and_round_trips() {
+        assert!(!ServiceConfig::default().night_enabled());
+        assert!(!ServiceConfig::builder().build().night_enabled());
+        assert!(ServiceConfig::builder()
+            .night_enabled(true)
+            .build()
+            .night_enabled());
+    }
+
+    #[test]
     fn test_default_config() {
         let config = ServiceConfig::default();
         assert!(config.cache_enabled());
         assert!(config.mountpoint().is_none());
+    }
+
+    #[test]
+    fn chunk_download_config_carries_configured_timeout_and_retries() {
+        // #249: executor.request_timeout_secs and executor.max_retries were
+        // parsed, validated and displayed but reached nothing. This is the
+        // single seam where they become the executor's download behaviour.
+        let config = ServiceConfig::builder()
+            .chunk_request_timeout_secs(45)
+            .chunk_max_retries(7)
+            .build();
+
+        let download = config.chunk_download_config();
+
+        assert_eq!(download.request_timeout, std::time::Duration::from_secs(45));
+        assert_eq!(download.max_retries, 7);
+    }
+
+    #[test]
+    fn chunk_download_config_defaults_match_the_executor_defaults() {
+        // Wiring the keys must not change behaviour for anyone who has not set
+        // them, so the unset path has to produce exactly what
+        // DownloadConfig::default() produced before.
+        let defaulted = crate::executor::DownloadConfig::default();
+        let from_config = ServiceConfig::default().chunk_download_config();
+
+        assert_eq!(from_config.request_timeout, defaulted.request_timeout);
+        assert_eq!(from_config.max_retries, defaulted.max_retries);
     }
 
     #[test]
@@ -355,20 +432,18 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_with_download() {
-        let download = DownloadConfig::new()
-            .with_timeout_secs(60)
-            .with_max_retries(5);
-        let config = ServiceConfig::builder().download(download).build();
-
-        assert_eq!(config.download().timeout_secs(), 60);
-        assert_eq!(config.download().max_retries(), 5);
-    }
-
-    #[test]
     fn test_builder_cache_disabled() {
         let config = ServiceConfig::builder().cache_enabled(false).build();
         assert!(!config.cache_enabled());
+    }
+
+    #[test]
+    fn test_prefetch_capacity_share_default_and_override() {
+        assert_eq!(ServiceConfig::default().prefetch_capacity_share(), 0.35);
+        let config = ServiceConfig::builder()
+            .prefetch_capacity_share(0.2)
+            .build();
+        assert_eq!(config.prefetch_capacity_share(), 0.2);
     }
 
     #[test]
@@ -384,14 +459,14 @@ mod tests {
     fn test_builder_full_chain() {
         let config = ServiceConfig::builder()
             .texture(TextureConfig::new(DdsFormat::BC1).with_mipmap_count(5))
-            .download(DownloadConfig::new().with_timeout_secs(45))
+            .chunk_request_timeout_secs(45)
             .cache_enabled(true)
             .mountpoint("/mnt/test")
             .build();
 
         assert_eq!(config.texture().format(), DdsFormat::BC1);
         assert_eq!(config.texture().mipmap_count(), Some(5));
-        assert_eq!(config.download().timeout_secs(), 45);
+        assert_eq!(config.chunk_request_timeout_secs(), 45);
         assert!(config.cache_enabled());
         assert_eq!(config.mountpoint(), Some("/mnt/test"));
     }

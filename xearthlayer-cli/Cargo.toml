@@ -36,14 +36,19 @@ assets = [
 
 [dependencies]
 xearthlayer = { path = "../xearthlayer" }
-clap = { version = "4.5", features = ["derive"] }
-semver = "1.0"
+xearthlayer-package = { path = "../xearthlayer-package" }
+clap.workspace = true
+semver.workspace = true
 image = "0.25"
-tracing = "0.1"
-ctrlc = "3.4"
+tracing.workspace = true
 dirs = "5"
 ratatui = "0.29"
-crossterm = "0.28"
+# use-dev-tty: crossterm's default unix event source loops forever once the
+# terminal is hung up (a read that returns end-of-file or EIO is retried
+# without end), so a closed terminal left `run` and the package manager
+# spinning with the mount up. The /dev/tty source returns at the poll timeout
+# instead, and the loops then see the SIGHUP flag (#314).
+crossterm = { version = "0.28", features = ["use-dev-tty"] }
 atty = "0.2"
 tokio = { version = "1", features = ["sync", "macros"] }
 tokio-util = "0.7"
@@ -51,12 +56,15 @@ dialoguer = "0.11"
 console = "0.15"
 indicatif = "0.17"
 rlimit = "0.10"
+signal-hook = "0.3"
+libc = "0.2"
+sha2.workspace = true
+chrono.workspace = true
 
 [features]
 profiling = ["xearthlayer/profiling"]
 debug-map = ["xearthlayer/debug-map"]
 
 [dev-dependencies]
-chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 proptest = "1.4"
-tempfile = "3"
+tempfile.workspace = true

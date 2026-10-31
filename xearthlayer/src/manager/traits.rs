@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use crate::package::{PackageLibrary, PackageMetadata};
+use xearthlayer_package::{PackageLibrary, PackageMetadata};
 
 use super::ManagerResult;
 
@@ -98,17 +98,6 @@ pub trait ArchiveExtractor: Send + Sync {
     ///
     /// The number of files extracted on success.
     fn extract(&self, archive_path: &Path, dest_dir: &Path) -> ManagerResult<usize>;
-
-    /// List contents of an archive without extracting.
-    ///
-    /// # Arguments
-    ///
-    /// * `archive_path` - Path to the archive file
-    ///
-    /// # Returns
-    ///
-    /// List of file paths within the archive.
-    fn list_contents(&self, archive_path: &Path) -> ManagerResult<Vec<String>>;
 }
 
 #[cfg(test)]

@@ -1,8 +1,7 @@
 //! DDS job factory for creating DdsGenerateJob instances.
 //!
 //! The factory pattern encapsulates the complex dependency wiring needed to create
-//! `DdsGenerateJob` instances. This allows tasks that spawn child jobs (like
-//! `GenerateTileListTask`) to remain lean and focused on their core logic.
+//! `DdsGenerateJob` instances.
 //!
 //! # HTTP Concurrency
 //!
@@ -110,6 +109,9 @@ where
 
     /// Shared download configuration with HTTP semaphore
     download_config: DownloadConfig,
+
+    /// Whether jobs re-check the cache when they start (prefetch lane, #296)
+    probe_cache: bool,
 }
 
 impl<P, E, M, DD, D, X> DefaultDdsJobFactory<P, E, M, DD, D, X>
@@ -150,6 +152,7 @@ where
             disk_cache,
             executor,
             download_config: DownloadConfig::default(),
+            probe_cache: false,
         }
     }
 
@@ -174,7 +177,23 @@ where
             disk_cache,
             executor,
             download_config,
+            probe_cache: false,
         }
+    }
+
+    /// Makes every job re-check the cache when it starts, so a tile cached
+    /// while the job waited is skipped. Only the prefetch lane wants this.
+    pub fn with_cache_probe(mut self) -> Self {
+        self.probe_cache = true;
+        self
+    }
+
+    /// The download configuration these jobs are built with.
+    ///
+    /// Exposed so the wiring from `executor.request_timeout_secs` and
+    /// `executor.max_retries` down to the jobs is assertable (#249).
+    pub fn download_config(&self) -> &DownloadConfig {
+        &self.download_config
     }
 }
 
@@ -188,7 +207,7 @@ where
     X: BlockingExecutor,
 {
     fn create_job(&self, tile: TileCoord, priority: Priority) -> Box<dyn Job> {
-        Box::new(DdsGenerateJob::new(
+        let job = DdsGenerateJob::new(
             tile,
             priority,
             Arc::clone(&self.provider),
@@ -198,7 +217,12 @@ where
             Arc::clone(&self.disk_cache),
             Arc::clone(&self.executor),
             self.download_config.clone(), // Clone shares the Arc<Semaphore>
-        ))
+        );
+        if self.probe_cache {
+            Box::new(job.with_cache_probe())
+        } else {
+            Box::new(job)
+        }
     }
 }
 

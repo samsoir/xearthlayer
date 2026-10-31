@@ -318,11 +318,13 @@ impl MetricsClient {
     ///
     /// * `success` - True if the job succeeded
     /// * `duration_us` - Total job duration in microseconds
+    /// * `is_fuse` - True if the job served a FUSE request
     #[inline]
-    pub fn job_completed(&self, success: bool, duration_us: u64) {
+    pub fn job_completed(&self, success: bool, duration_us: u64, is_fuse: bool) {
         self.send(MetricEvent::JobCompleted {
             success,
             duration_us,
+            is_fuse,
         });
     }
 
@@ -332,10 +334,11 @@ impl MetricsClient {
         self.send(MetricEvent::JobCoalesced);
     }
 
-    /// Records a job timing out.
+    /// Records a FUSE job abandoned at the FUSE timeout, with how long it
+    /// waited.
     #[inline]
-    pub fn job_timed_out(&self) {
-        self.send(MetricEvent::JobTimedOut);
+    pub fn job_timed_out(&self, duration_us: u64) {
+        self.send(MetricEvent::JobTimedOut { duration_us });
     }
 
     // =========================================================================
@@ -456,6 +459,35 @@ impl MetricsClient {
     #[inline]
     pub fn prefetch_deferral_cleared(&self) {
         self.send(MetricEvent::PrefetchDeferralCleared);
+    }
+
+    /// Record that a prefetch tile job skipped its work because the tile was
+    /// already cached at admission.
+    #[inline]
+    pub fn prefetch_skipped_cached(&self) {
+        self.send(MetricEvent::PrefetchSkippedCached);
+    }
+
+    /// Record the number of FUSE demand jobs in flight.
+    #[inline]
+    pub fn demand_in_flight(&self, count: usize) {
+        self.send(MetricEvent::DemandInFlight { count });
+    }
+
+    /// Record the prefetch lane pausing or resuming behind demand.
+    #[inline]
+    pub fn prefetch_paused(&self, paused: bool) {
+        self.send(MetricEvent::PrefetchPaused { paused });
+    }
+
+    /// Record the prefetch lane's load, jobs running and jobs waiting.
+    #[inline]
+    pub fn prefetch_lane_load(&self, load: f64, running: usize, queued: usize) {
+        self.send(MetricEvent::PrefetchLaneLoad {
+            load,
+            running,
+            queued,
+        });
     }
 }
 
@@ -610,9 +642,9 @@ mod tests {
 
         client.job_submitted(true);
         client.job_started();
-        client.job_completed(true, 100_000);
+        client.job_completed(true, 100_000, true);
         client.job_coalesced();
-        client.job_timed_out();
+        client.job_timed_out(1);
 
         assert!(matches!(
             rx.recv().await,
@@ -623,11 +655,15 @@ mod tests {
             rx.recv().await,
             Some(MetricEvent::JobCompleted {
                 success: true,
-                duration_us: 100_000
+                duration_us: 100_000,
+                is_fuse: true
             })
         ));
         assert!(matches!(rx.recv().await, Some(MetricEvent::JobCoalesced)));
-        assert!(matches!(rx.recv().await, Some(MetricEvent::JobTimedOut)));
+        assert!(matches!(
+            rx.recv().await,
+            Some(MetricEvent::JobTimedOut { .. })
+        ));
     }
 
     #[tokio::test]
@@ -692,7 +728,7 @@ mod tests {
 
         // Should not panic - fire-and-forget semantics
         client.download_started();
-        client.job_completed(true, 1000);
+        client.job_completed(true, 1000, false);
     }
 
     #[test]

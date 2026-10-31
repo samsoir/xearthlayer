@@ -84,9 +84,7 @@ pub struct DiskCacheConfig {
 
 impl Default for DiskCacheConfig {
     fn default() -> Self {
-        let cache_dir = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("xearthlayer");
+        let cache_dir = crate::paths::tile_cache_dir();
 
         Self {
             cache_dir,
@@ -102,12 +100,15 @@ impl Default for DiskCacheConfig {
 /// Chunk-tier writes are small and frequent (~14 KB, thousands per second);
 /// DDS-tier writes are large and rare (11.17 MB, a few per second). Attributing
 /// bytes to a tier keeps `chunk_disk_bytes_written` honest — see issue #216.
+/// The lit tier (night lighting only) holds generated lit payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiskTier {
     /// The chunk disk cache.
     Chunk,
     /// The DDS tile disk cache.
     Dds,
+    /// The night lit payload disk cache.
+    Lit,
 }
 
 impl DiskTier {
@@ -115,11 +116,12 @@ impl DiskTier {
     ///
     /// These exact strings already appear in disk cache log output; changing
     /// them would break existing log greps. Note the asymmetry — the chunk
-    /// label is plural, the DDS label is not.
+    /// label is plural, the DDS and lit labels are not.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Chunk => "chunks",
             Self::Dds => "dds",
+            Self::Lit => "lit",
         }
     }
 }
@@ -217,7 +219,10 @@ mod tests {
         assert_eq!(config.max_size_bytes, 20 * 1024 * 1024 * 1024); // 20 GB
         assert_eq!(config.daemon_interval_secs, 60);
         assert!(config.max_age_days.is_none());
-        assert!(config.cache_dir.ends_with("xearthlayer"));
+        // Against the resolver, not a hardcoded directory name. The name
+        // differs by platform, capitalised on macOS per Apple convention, so
+        // an assertion that spells it out passes on Linux and fails on macOS.
+        assert_eq!(config.cache_dir, crate::paths::tile_cache_dir());
     }
 
     // These exact strings already appear in disk cache log output. Changing

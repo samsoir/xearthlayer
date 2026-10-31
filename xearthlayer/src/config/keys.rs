@@ -8,6 +8,7 @@ use std::str::FromStr;
 use thiserror::Error;
 
 use super::file::ConfigFile;
+use super::parser::expand_tilde;
 use super::size::{format_size, parse_size};
 use crate::dds::DdsFormat;
 
@@ -39,6 +40,7 @@ pub enum ConfigKeyError {
 pub enum ConfigKey {
     // General settings
     GeneralUpdateCheck,
+    GeneralLayoutVersion,
 
     // Provider settings
     ProviderType,
@@ -69,6 +71,7 @@ pub enum ConfigKey {
     PackagesCustomSceneryPath,
     PackagesAutoInstallOverlays,
     PackagesDisableOverlays,
+    PackagesXworldPro,
     PackagesTempDir,
     PackagesConcurrentDownloads,
 
@@ -77,14 +80,8 @@ pub enum ConfigKey {
 
     // Prefetch settings
     PrefetchEnabled,
-    PrefetchMode,
     PrefetchWebApiPort,
     PrefetchCycleIntervalMs,
-
-    // Adaptive prefetch calibration settings
-    PrefetchCalibrationAggressiveThreshold,
-    PrefetchCalibrationOpportunisticThreshold,
-    PrefetchCalibrationSampleDuration,
 
     // Transition ramp settings
     PrefetchTakeoffClimbFt,
@@ -98,6 +95,7 @@ pub enum ConfigKey {
     PrefetchStaleRegionTimeout,
     PrefetchBoxExtent,
     PrefetchBoxMaxBias,
+    PrefetchCapacityShare,
 
     // Prewarm settings
     PrewarmGridRows,
@@ -108,14 +106,19 @@ pub enum ConfigKey {
     PatchesDirectory,
 
     // Executor settings
-    ExecutorMaxConcurrentJobs,
     ExecutorRequestTimeoutSecs,
     ExecutorMaxRetries,
-    ExecutorRetryBaseDelayMs,
 
     // FUSE settings
     FuseMaxBackground,
     FuseCongestionThreshold,
+
+    // Night lighting settings
+    NightEnabled,
+    NightBrightness,
+
+    // Terminal dashboard settings
+    TuiSymbols,
 }
 
 impl FromStr for ConfigKey {
@@ -124,6 +127,7 @@ impl FromStr for ConfigKey {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "general.update_check" => Ok(ConfigKey::GeneralUpdateCheck),
+            "general.layout_version" => Ok(ConfigKey::GeneralLayoutVersion),
 
             "provider.type" => Ok(ConfigKey::ProviderType),
             "provider.google_api_key" => Ok(ConfigKey::ProviderGoogleApiKey),
@@ -148,24 +152,15 @@ impl FromStr for ConfigKey {
             "packages.custom_scenery_path" => Ok(ConfigKey::PackagesCustomSceneryPath),
             "packages.auto_install_overlays" => Ok(ConfigKey::PackagesAutoInstallOverlays),
             "packages.disable_overlays" => Ok(ConfigKey::PackagesDisableOverlays),
+            "packages.xworld_pro" => Ok(ConfigKey::PackagesXworldPro),
             "packages.temp_dir" => Ok(ConfigKey::PackagesTempDir),
             "packages.concurrent_downloads" => Ok(ConfigKey::PackagesConcurrentDownloads),
 
             "logging.file" => Ok(ConfigKey::LoggingFile),
 
             "prefetch.enabled" => Ok(ConfigKey::PrefetchEnabled),
-            "prefetch.mode" => Ok(ConfigKey::PrefetchMode),
             "prefetch.web_api_port" => Ok(ConfigKey::PrefetchWebApiPort),
             "prefetch.cycle_interval_ms" => Ok(ConfigKey::PrefetchCycleIntervalMs),
-            "prefetch.calibration_aggressive_threshold" => {
-                Ok(ConfigKey::PrefetchCalibrationAggressiveThreshold)
-            }
-            "prefetch.calibration_opportunistic_threshold" => {
-                Ok(ConfigKey::PrefetchCalibrationOpportunisticThreshold)
-            }
-            "prefetch.calibration_sample_duration" => {
-                Ok(ConfigKey::PrefetchCalibrationSampleDuration)
-            }
             "prefetch.takeoff_climb_ft" => Ok(ConfigKey::PrefetchTakeoffClimbFt),
             "prefetch.takeoff_timeout_secs" => Ok(ConfigKey::PrefetchTakeoffTimeoutSecs),
             "prefetch.landing_hysteresis_secs" => Ok(ConfigKey::PrefetchLandingHysteresisSecs),
@@ -175,6 +170,7 @@ impl FromStr for ConfigKey {
             "prefetch.stale_region_timeout" => Ok(ConfigKey::PrefetchStaleRegionTimeout),
             "prefetch.box_extent" => Ok(ConfigKey::PrefetchBoxExtent),
             "prefetch.box_max_bias" => Ok(ConfigKey::PrefetchBoxMaxBias),
+            "prefetch.capacity_share" => Ok(ConfigKey::PrefetchCapacityShare),
 
             // Prewarm settings
             "prewarm.grid_rows" => Ok(ConfigKey::PrewarmGridRows),
@@ -185,14 +181,15 @@ impl FromStr for ConfigKey {
             "patches.directory" => Ok(ConfigKey::PatchesDirectory),
 
             // Executor settings
-            "executor.max_concurrent_jobs" => Ok(ConfigKey::ExecutorMaxConcurrentJobs),
             "executor.request_timeout_secs" => Ok(ConfigKey::ExecutorRequestTimeoutSecs),
             "executor.max_retries" => Ok(ConfigKey::ExecutorMaxRetries),
-            "executor.retry_base_delay_ms" => Ok(ConfigKey::ExecutorRetryBaseDelayMs),
 
             // FUSE settings
             "fuse.max_background" => Ok(ConfigKey::FuseMaxBackground),
             "fuse.congestion_threshold" => Ok(ConfigKey::FuseCongestionThreshold),
+            "night.enabled" => Ok(ConfigKey::NightEnabled),
+            "tui.symbols" => Ok(ConfigKey::TuiSymbols),
+            "night.brightness" => Ok(ConfigKey::NightBrightness),
 
             _ => Err(ConfigKeyError::UnknownKey(s.to_string())),
         }
@@ -204,6 +201,7 @@ impl ConfigKey {
     pub fn name(&self) -> &'static str {
         match self {
             ConfigKey::GeneralUpdateCheck => "general.update_check",
+            ConfigKey::GeneralLayoutVersion => "general.layout_version",
             ConfigKey::ProviderType => "provider.type",
             ConfigKey::ProviderGoogleApiKey => "provider.google_api_key",
             ConfigKey::ProviderMapboxAccessToken => "provider.mapbox_access_token",
@@ -222,20 +220,13 @@ impl ConfigKey {
             ConfigKey::PackagesCustomSceneryPath => "packages.custom_scenery_path",
             ConfigKey::PackagesAutoInstallOverlays => "packages.auto_install_overlays",
             ConfigKey::PackagesDisableOverlays => "packages.disable_overlays",
+            ConfigKey::PackagesXworldPro => "packages.xworld_pro",
             ConfigKey::PackagesTempDir => "packages.temp_dir",
             ConfigKey::PackagesConcurrentDownloads => "packages.concurrent_downloads",
             ConfigKey::LoggingFile => "logging.file",
             ConfigKey::PrefetchEnabled => "prefetch.enabled",
-            ConfigKey::PrefetchMode => "prefetch.mode",
             ConfigKey::PrefetchWebApiPort => "prefetch.web_api_port",
             ConfigKey::PrefetchCycleIntervalMs => "prefetch.cycle_interval_ms",
-            ConfigKey::PrefetchCalibrationAggressiveThreshold => {
-                "prefetch.calibration_aggressive_threshold"
-            }
-            ConfigKey::PrefetchCalibrationOpportunisticThreshold => {
-                "prefetch.calibration_opportunistic_threshold"
-            }
-            ConfigKey::PrefetchCalibrationSampleDuration => "prefetch.calibration_sample_duration",
             ConfigKey::PrefetchTakeoffClimbFt => "prefetch.takeoff_climb_ft",
             ConfigKey::PrefetchTakeoffTimeoutSecs => "prefetch.takeoff_timeout_secs",
             ConfigKey::PrefetchLandingHysteresisSecs => "prefetch.landing_hysteresis_secs",
@@ -245,6 +236,7 @@ impl ConfigKey {
             ConfigKey::PrefetchStaleRegionTimeout => "prefetch.stale_region_timeout",
             ConfigKey::PrefetchBoxExtent => "prefetch.box_extent",
             ConfigKey::PrefetchBoxMaxBias => "prefetch.box_max_bias",
+            ConfigKey::PrefetchCapacityShare => "prefetch.capacity_share",
             // Prewarm settings
             ConfigKey::PrewarmGridRows => "prewarm.grid_rows",
             ConfigKey::PrewarmGridCols => "prewarm.grid_cols",
@@ -254,14 +246,15 @@ impl ConfigKey {
             ConfigKey::PatchesDirectory => "patches.directory",
 
             // Executor settings
-            ConfigKey::ExecutorMaxConcurrentJobs => "executor.max_concurrent_jobs",
             ConfigKey::ExecutorRequestTimeoutSecs => "executor.request_timeout_secs",
             ConfigKey::ExecutorMaxRetries => "executor.max_retries",
-            ConfigKey::ExecutorRetryBaseDelayMs => "executor.retry_base_delay_ms",
 
             // FUSE settings
             ConfigKey::FuseMaxBackground => "fuse.max_background",
             ConfigKey::FuseCongestionThreshold => "fuse.congestion_threshold",
+            ConfigKey::NightEnabled => "night.enabled",
+            ConfigKey::TuiSymbols => "tui.symbols",
+            ConfigKey::NightBrightness => "night.brightness",
         }
     }
 
@@ -295,6 +288,7 @@ impl ConfigKey {
     pub fn get(&self, config: &ConfigFile) -> String {
         match self {
             ConfigKey::GeneralUpdateCheck => config.general.update_check.to_string(),
+            ConfigKey::GeneralLayoutVersion => config.general.layout_version.to_string(),
             ConfigKey::ProviderType => config.provider.provider_type.clone(),
             ConfigKey::ProviderGoogleApiKey => {
                 config.provider.google_api_key.clone().unwrap_or_default()
@@ -338,6 +332,7 @@ impl ConfigKey {
                 config.packages.auto_install_overlays.to_string()
             }
             ConfigKey::PackagesDisableOverlays => config.packages.disable_overlays.to_string(),
+            ConfigKey::PackagesXworldPro => config.packages.xworld_pro.to_string(),
             ConfigKey::PackagesTempDir => config
                 .packages
                 .temp_dir
@@ -349,19 +344,8 @@ impl ConfigKey {
             }
             ConfigKey::LoggingFile => path_to_display(&config.logging.file),
             ConfigKey::PrefetchEnabled => config.prefetch.enabled.to_string(),
-            ConfigKey::PrefetchMode => config.prefetch.mode.clone(),
             ConfigKey::PrefetchWebApiPort => config.prefetch.web_api_port.to_string(),
             ConfigKey::PrefetchCycleIntervalMs => config.prefetch.cycle_interval_ms.to_string(),
-            ConfigKey::PrefetchCalibrationAggressiveThreshold => {
-                config.prefetch.calibration_aggressive_threshold.to_string()
-            }
-            ConfigKey::PrefetchCalibrationOpportunisticThreshold => config
-                .prefetch
-                .calibration_opportunistic_threshold
-                .to_string(),
-            ConfigKey::PrefetchCalibrationSampleDuration => {
-                config.prefetch.calibration_sample_duration.to_string()
-            }
             ConfigKey::PrefetchTakeoffClimbFt => config.prefetch.takeoff_climb_ft.to_string(),
             ConfigKey::PrefetchTakeoffTimeoutSecs => {
                 config.prefetch.takeoff_timeout_secs.to_string()
@@ -377,6 +361,7 @@ impl ConfigKey {
             }
             ConfigKey::PrefetchBoxExtent => config.prefetch.box_extent.to_string(),
             ConfigKey::PrefetchBoxMaxBias => config.prefetch.box_max_bias.to_string(),
+            ConfigKey::PrefetchCapacityShare => config.prefetch.capacity_share.to_string(),
             // Prewarm settings
             ConfigKey::PrewarmGridRows => config.prewarm.grid_rows.to_string(),
             ConfigKey::PrewarmGridCols => config.prewarm.grid_cols.to_string(),
@@ -391,18 +376,17 @@ impl ConfigKey {
                 .unwrap_or_default(),
 
             // Executor settings
-            ConfigKey::ExecutorMaxConcurrentJobs => {
-                config.control_plane.max_concurrent_jobs.to_string()
-            }
             ConfigKey::ExecutorRequestTimeoutSecs => {
                 config.executor.request_timeout_secs.to_string()
             }
             ConfigKey::ExecutorMaxRetries => config.executor.max_retries.to_string(),
-            ConfigKey::ExecutorRetryBaseDelayMs => config.executor.retry_base_delay_ms.to_string(),
 
             // FUSE settings
             ConfigKey::FuseMaxBackground => config.fuse.max_background.to_string(),
             ConfigKey::FuseCongestionThreshold => config.fuse.congestion_threshold.to_string(),
+            ConfigKey::NightEnabled => config.night.enabled.to_string(),
+            ConfigKey::TuiSymbols => config.tui.symbols.clone(),
+            ConfigKey::NightBrightness => config.night.brightness.to_string(),
         }
     }
 
@@ -421,6 +405,11 @@ impl ConfigKey {
             ConfigKey::GeneralUpdateCheck => {
                 let v = value.to_lowercase();
                 config.general.update_check = v == "true" || v == "1" || v == "yes" || v == "on";
+            }
+            ConfigKey::GeneralLayoutVersion => {
+                if let Ok(n) = value.trim().parse::<u32>() {
+                    config.general.layout_version = n;
+                }
             }
             ConfigKey::ProviderType => {
                 config.provider.provider_type = value.to_lowercase();
@@ -485,6 +474,10 @@ impl ConfigKey {
                 config.packages.disable_overlays =
                     v == "true" || v == "1" || v == "yes" || v == "on";
             }
+            ConfigKey::PackagesXworldPro => {
+                let v = value.to_lowercase();
+                config.packages.xworld_pro = v == "true" || v == "1" || v == "yes" || v == "on";
+            }
             ConfigKey::PackagesTempDir => {
                 config.packages.temp_dir = optional_path(value);
             }
@@ -498,23 +491,11 @@ impl ConfigKey {
                 let v = value.to_lowercase();
                 config.prefetch.enabled = v == "true" || v == "1" || v == "yes" || v == "on";
             }
-            ConfigKey::PrefetchMode => {
-                config.prefetch.mode = value.to_lowercase();
-            }
             ConfigKey::PrefetchWebApiPort => {
                 config.prefetch.web_api_port = value.parse().unwrap();
             }
             ConfigKey::PrefetchCycleIntervalMs => {
                 config.prefetch.cycle_interval_ms = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchCalibrationAggressiveThreshold => {
-                config.prefetch.calibration_aggressive_threshold = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchCalibrationOpportunisticThreshold => {
-                config.prefetch.calibration_opportunistic_threshold = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchCalibrationSampleDuration => {
-                config.prefetch.calibration_sample_duration = value.parse().unwrap();
             }
             ConfigKey::PrefetchTakeoffClimbFt => {
                 config.prefetch.takeoff_climb_ft = value.parse().unwrap();
@@ -543,6 +524,9 @@ impl ConfigKey {
             ConfigKey::PrefetchBoxMaxBias => {
                 config.prefetch.box_max_bias = value.parse().unwrap();
             }
+            ConfigKey::PrefetchCapacityShare => {
+                config.prefetch.capacity_share = value.parse().unwrap();
+            }
             // Prewarm settings
             ConfigKey::PrewarmGridRows => {
                 config.prewarm.grid_rows = value.parse().unwrap();
@@ -561,17 +545,11 @@ impl ConfigKey {
             }
 
             // Executor settings
-            ConfigKey::ExecutorMaxConcurrentJobs => {
-                config.control_plane.max_concurrent_jobs = value.parse().unwrap();
-            }
             ConfigKey::ExecutorRequestTimeoutSecs => {
                 config.executor.request_timeout_secs = value.parse().unwrap();
             }
             ConfigKey::ExecutorMaxRetries => {
                 config.executor.max_retries = value.parse().unwrap();
-            }
-            ConfigKey::ExecutorRetryBaseDelayMs => {
-                config.executor.retry_base_delay_ms = value.parse().unwrap();
             }
 
             // FUSE settings
@@ -580,6 +558,19 @@ impl ConfigKey {
             }
             ConfigKey::FuseCongestionThreshold => {
                 config.fuse.congestion_threshold = value.parse().unwrap();
+            }
+
+            // Night lighting settings
+            ConfigKey::NightEnabled => {
+                config.night.enabled = super::parser::parse_bool(value);
+            }
+            ConfigKey::NightBrightness => {
+                config.night.brightness = value.parse().unwrap();
+            }
+
+            // Terminal dashboard settings
+            ConfigKey::TuiSymbols => {
+                config.tui.symbols = value.to_lowercase();
             }
         }
     }
@@ -598,9 +589,10 @@ impl ConfigKey {
     fn specification(&self) -> Box<dyn ValueSpecification> {
         match self {
             ConfigKey::GeneralUpdateCheck => Box::new(BooleanSpec),
-            ConfigKey::ProviderType => Box::new(OneOfSpec::new(&[
-                "apple", "arcgis", "bing", "go2", "google", "mapbox", "usgs",
-            ])),
+            ConfigKey::GeneralLayoutVersion => Box::new(PositiveIntegerSpec),
+            ConfigKey::ProviderType => {
+                Box::new(OneOfSpec::new(crate::provider::catalog::PROVIDER_KEYS))
+            }
             ConfigKey::ProviderGoogleApiKey => Box::new(AnyStringSpec),
             ConfigKey::ProviderMapboxAccessToken => Box::new(AnyStringSpec),
             ConfigKey::CacheDirectory => Box::new(PathSpec),
@@ -618,21 +610,13 @@ impl ConfigKey {
             ConfigKey::PackagesCustomSceneryPath => Box::new(OptionalPathSpec),
             ConfigKey::PackagesAutoInstallOverlays => Box::new(BooleanSpec),
             ConfigKey::PackagesDisableOverlays => Box::new(BooleanSpec),
+            ConfigKey::PackagesXworldPro => Box::new(BooleanSpec),
             ConfigKey::PackagesTempDir => Box::new(OptionalPathSpec),
             ConfigKey::PackagesConcurrentDownloads => Box::new(IntegerRangeSpec::new(1, 10)),
             ConfigKey::LoggingFile => Box::new(PathSpec),
             ConfigKey::PrefetchEnabled => Box::new(BooleanSpec),
-            ConfigKey::PrefetchMode => Box::new(OneOfSpec::new(&[
-                "auto",
-                "aggressive",
-                "opportunistic",
-                "disabled",
-            ])),
             ConfigKey::PrefetchWebApiPort => Box::new(IntegerRangeSpec::new(1024, 65535)),
             ConfigKey::PrefetchCycleIntervalMs => Box::new(PositiveIntegerSpec),
-            ConfigKey::PrefetchCalibrationAggressiveThreshold => Box::new(PositiveNumberSpec),
-            ConfigKey::PrefetchCalibrationOpportunisticThreshold => Box::new(PositiveNumberSpec),
-            ConfigKey::PrefetchCalibrationSampleDuration => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchTakeoffClimbFt => Box::new(FloatRangeSpec::new(200.0, 5000.0)),
             ConfigKey::PrefetchTakeoffTimeoutSecs => Box::new(IntegerRangeSpec::new(30, 300)),
             ConfigKey::PrefetchLandingHysteresisSecs => Box::new(IntegerRangeSpec::new(5, 60)),
@@ -642,6 +626,10 @@ impl ConfigKey {
             ConfigKey::PrefetchStaleRegionTimeout => Box::new(IntegerRangeSpec::new(30, 600)),
             ConfigKey::PrefetchBoxExtent => Box::new(FloatRangeSpec::new(7.0, 15.0)),
             ConfigKey::PrefetchBoxMaxBias => Box::new(FloatRangeSpec::new(0.5, 0.9)),
+            ConfigKey::PrefetchCapacityShare => Box::new(FloatRangeSpec::new(
+                crate::executor::MIN_PREFETCH_CAPACITY_SHARE,
+                crate::executor::MAX_PREFETCH_CAPACITY_SHARE,
+            )),
             // Prewarm settings
             ConfigKey::PrewarmGridRows => Box::new(PositiveIntegerSpec),
             ConfigKey::PrewarmGridCols => Box::new(PositiveIntegerSpec),
@@ -651,14 +639,15 @@ impl ConfigKey {
             ConfigKey::PatchesDirectory => Box::new(OptionalPathSpec),
 
             // Executor settings
-            ConfigKey::ExecutorMaxConcurrentJobs => Box::new(IntegerRangeSpec::new(1, 256)),
             ConfigKey::ExecutorRequestTimeoutSecs => Box::new(PositiveIntegerSpec),
             ConfigKey::ExecutorMaxRetries => Box::new(PositiveIntegerSpec),
-            ConfigKey::ExecutorRetryBaseDelayMs => Box::new(PositiveIntegerSpec),
 
             // FUSE settings — range: 1-1024 for both
             ConfigKey::FuseMaxBackground => Box::new(IntegerRangeSpec::new(1, 1024)),
             ConfigKey::FuseCongestionThreshold => Box::new(IntegerRangeSpec::new(1, 1024)),
+            ConfigKey::NightEnabled => Box::new(BooleanSpec),
+            ConfigKey::NightBrightness => Box::new(FloatRangeSpec::new(0.5, 1.5)),
+            ConfigKey::TuiSymbols => Box::new(OneOfSpec::new(super::defaults::TUI_SYMBOLS_VALUES)),
         }
     }
 
@@ -670,6 +659,7 @@ impl ConfigKey {
     pub fn all() -> &'static [ConfigKey] {
         &[
             ConfigKey::GeneralUpdateCheck,
+            ConfigKey::GeneralLayoutVersion,
             ConfigKey::ProviderType,
             ConfigKey::ProviderGoogleApiKey,
             ConfigKey::ProviderMapboxAccessToken,
@@ -688,16 +678,13 @@ impl ConfigKey {
             ConfigKey::PackagesCustomSceneryPath,
             ConfigKey::PackagesAutoInstallOverlays,
             ConfigKey::PackagesDisableOverlays,
+            ConfigKey::PackagesXworldPro,
             ConfigKey::PackagesTempDir,
             ConfigKey::PackagesConcurrentDownloads,
             ConfigKey::LoggingFile,
             ConfigKey::PrefetchEnabled,
-            ConfigKey::PrefetchMode,
             ConfigKey::PrefetchWebApiPort,
             ConfigKey::PrefetchCycleIntervalMs,
-            ConfigKey::PrefetchCalibrationAggressiveThreshold,
-            ConfigKey::PrefetchCalibrationOpportunisticThreshold,
-            ConfigKey::PrefetchCalibrationSampleDuration,
             ConfigKey::PrefetchTakeoffClimbFt,
             ConfigKey::PrefetchTakeoffTimeoutSecs,
             ConfigKey::PrefetchLandingHysteresisSecs,
@@ -707,6 +694,7 @@ impl ConfigKey {
             ConfigKey::PrefetchStaleRegionTimeout,
             ConfigKey::PrefetchBoxExtent,
             ConfigKey::PrefetchBoxMaxBias,
+            ConfigKey::PrefetchCapacityShare,
             // Prewarm settings
             ConfigKey::PrewarmGridRows,
             ConfigKey::PrewarmGridCols,
@@ -714,13 +702,16 @@ impl ConfigKey {
             ConfigKey::PatchesEnabled,
             ConfigKey::PatchesDirectory,
             // Executor settings
-            ConfigKey::ExecutorMaxConcurrentJobs,
             ConfigKey::ExecutorRequestTimeoutSecs,
             ConfigKey::ExecutorMaxRetries,
-            ConfigKey::ExecutorRetryBaseDelayMs,
             // FUSE settings
             ConfigKey::FuseMaxBackground,
             ConfigKey::FuseCongestionThreshold,
+            // Night lighting settings
+            ConfigKey::NightEnabled,
+            ConfigKey::NightBrightness,
+            // Terminal dashboard settings
+            ConfigKey::TuiSymbols,
         ]
     }
 }
@@ -800,24 +791,6 @@ impl ValueSpecification for PositiveIntegerSpec {
             .parse::<u64>()
             .map(|_| ())
             .map_err(|_| "must be a positive integer".to_string())
-    }
-}
-
-/// Specification for positive floating-point number values.
-struct PositiveNumberSpec;
-
-impl ValueSpecification for PositiveNumberSpec {
-    fn is_satisfied_by(&self, value: &str) -> Result<(), String> {
-        value
-            .parse::<f64>()
-            .map_err(|_| "must be a positive number".to_string())
-            .and_then(|n| {
-                if n >= 0.0 {
-                    Ok(())
-                } else {
-                    Err("must be a positive number".to_string())
-                }
-            })
     }
 }
 
@@ -939,16 +912,6 @@ impl ValueSpecification for OptionalUrlSpec {
 // Helper Functions
 // ============================================================================
 
-/// Expand ~ to home directory in paths.
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(stripped) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped);
-        }
-    }
-    PathBuf::from(path)
-}
-
 /// Convert path to display string, collapsing home dir to ~.
 fn path_to_display(path: &Path) -> String {
     if let Some(home) = dirs::home_dir() {
@@ -1024,6 +987,84 @@ mod tests {
         assert!(!ConfigKey::PackagesLibraryUrl.is_sensitive());
         assert!(!ConfigKey::LoggingFile.is_sensitive());
         assert!(!ConfigKey::PrefetchEnabled.is_sensitive());
+    }
+
+    #[test]
+    fn night_enabled_parses_enumerates_and_validates() {
+        assert_eq!(
+            "night.enabled".parse::<ConfigKey>().unwrap(),
+            ConfigKey::NightEnabled
+        );
+        assert!(ConfigKey::all().contains(&ConfigKey::NightEnabled));
+        let mut config = ConfigFile::default();
+        assert_eq!(ConfigKey::NightEnabled.get(&config), "true");
+        ConfigKey::NightEnabled.set(&mut config, "false").unwrap();
+        assert!(!config.night.enabled);
+        assert_eq!(ConfigKey::NightEnabled.get(&config), "false");
+        assert!(ConfigKey::NightEnabled.set(&mut config, "maybe").is_err());
+        assert!(!config.night.enabled, "a rejected value changes nothing");
+    }
+
+    #[test]
+    fn night_brightness_parses_enumerates_and_validates() {
+        assert_eq!(
+            "night.brightness".parse::<ConfigKey>().unwrap(),
+            ConfigKey::NightBrightness
+        );
+        assert!(ConfigKey::all().contains(&ConfigKey::NightBrightness));
+        let mut config = ConfigFile::default();
+        assert_eq!(ConfigKey::NightBrightness.get(&config), "1");
+        ConfigKey::NightBrightness.set(&mut config, "1.25").unwrap();
+        assert_eq!(config.night.brightness, 1.25);
+        assert!(ConfigKey::NightBrightness.set(&mut config, "2.0").is_err());
+        assert!(ConfigKey::NightBrightness.set(&mut config, "0.4").is_err());
+        assert_eq!(
+            config.night.brightness, 1.25,
+            "a rejected value changes nothing"
+        );
+    }
+
+    #[test]
+    fn layout_version_round_trips_through_get_and_set() {
+        let mut config = ConfigFile::default();
+        assert_eq!(ConfigKey::GeneralLayoutVersion.get(&config), "0");
+        ConfigKey::GeneralLayoutVersion
+            .set(&mut config, "1")
+            .unwrap();
+        assert_eq!(config.general.layout_version, 1);
+        assert_eq!(ConfigKey::GeneralLayoutVersion.get(&config), "1");
+    }
+
+    #[test]
+    fn layout_version_rejects_a_non_numeric_value() {
+        let mut config = ConfigFile::default();
+        assert!(ConfigKey::GeneralLayoutVersion
+            .set(&mut config, "one")
+            .is_err());
+        assert_eq!(
+            config.general.layout_version, 0,
+            "a rejected value changes nothing"
+        );
+    }
+
+    #[test]
+    fn layout_version_is_enumerated_so_config_upgrade_knows_it() {
+        // ConfigKey::all() is the valid-key set analyze_config compares
+        // against. A key absent from it reads as unknown rather than missing,
+        // which is a quieter failure than it sounds.
+        assert!(
+            ConfigKey::all().contains(&ConfigKey::GeneralLayoutVersion),
+            "every key must be enumerated or config upgrade misreports it"
+        );
+        assert_eq!(
+            ConfigKey::all().len(),
+            ConfigKey::all()
+                .iter()
+                .map(|k| k.name())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            "enumerated keys must be unique"
+        );
     }
 
     #[test]
@@ -1256,6 +1297,32 @@ mod tests {
     }
 
     #[test]
+    fn test_packages_xworld_pro_round_trip() {
+        let key = ConfigKey::from_str("packages.xworld_pro").unwrap();
+        assert_eq!(key.name(), "packages.xworld_pro");
+        assert_eq!(key.section(), "packages");
+        assert!(!key.is_sensitive());
+
+        let mut config = ConfigFile::default();
+        assert_eq!(key.get(&config), "false");
+        assert!(!config.packages.xworld_pro);
+
+        for truthy in &["true", "1", "yes", "on", "TRUE"] {
+            key.set(&mut config, truthy).unwrap();
+            assert!(
+                config.packages.xworld_pro,
+                "Expected '{}' to set true",
+                truthy
+            );
+        }
+        key.set(&mut config, "false").unwrap();
+        assert!(!config.packages.xworld_pro);
+
+        assert!(key.validate("maybe").is_err());
+        assert!(ConfigKey::all().contains(&ConfigKey::PackagesXworldPro));
+    }
+
+    #[test]
     fn test_new_prefetch_keys_in_all() {
         let all = ConfigKey::all();
         assert!(all.contains(&ConfigKey::PrefetchWindowBuffer));
@@ -1285,6 +1352,29 @@ mod tests {
         assert!(key.validate("0.5").is_ok());
         assert!(key.validate("0.05").is_err());
         assert!(key.validate("0.6").is_err());
+    }
+
+    #[test]
+    fn test_config_key_capacity_share_validation() {
+        let key: ConfigKey = "prefetch.capacity_share".parse().unwrap();
+        assert_eq!(key, ConfigKey::PrefetchCapacityShare);
+        assert!(key.validate("0.05").is_ok());
+        assert!(key.validate("0.35").is_ok());
+        assert!(key.validate("0.50").is_ok());
+        assert!(key.validate("0.04").is_err());
+        assert!(key.validate("0.51").is_err());
+        assert!(key.validate("abc").is_err());
+    }
+
+    #[test]
+    fn test_config_key_capacity_share_round_trip() {
+        let mut config = ConfigFile::default();
+        assert_eq!(ConfigKey::PrefetchCapacityShare.get(&config), "0.35");
+        ConfigKey::PrefetchCapacityShare
+            .set(&mut config, "0.2")
+            .unwrap();
+        assert_eq!(config.prefetch.capacity_share, 0.2);
+        assert_eq!(ConfigKey::PrefetchCapacityShare.get(&config), "0.2");
     }
 
     #[test]
@@ -1370,6 +1460,45 @@ mod tests {
                 ConfigKey::from_str(key).is_err(),
                 "{key} should no longer resolve to a ConfigKey"
             );
+        }
+    }
+
+    #[test]
+    fn tui_symbols_parses_enumerates_and_validates() {
+        assert_eq!(
+            "tui.symbols".parse::<ConfigKey>().unwrap(),
+            ConfigKey::TuiSymbols
+        );
+        assert!(ConfigKey::all().contains(&ConfigKey::TuiSymbols));
+        let mut config = ConfigFile::default();
+        assert_eq!(ConfigKey::TuiSymbols.get(&config), "auto");
+        for value in ["emoji", "plain", "auto"] {
+            ConfigKey::TuiSymbols.set(&mut config, value).unwrap();
+            assert_eq!(ConfigKey::TuiSymbols.get(&config), value);
+        }
+        ConfigKey::TuiSymbols.set(&mut config, "PLAIN").unwrap();
+        assert_eq!(config.tui.symbols, "plain");
+        assert!(ConfigKey::TuiSymbols.set(&mut config, "ascii").is_err());
+        assert_eq!(
+            config.tui.symbols, "plain",
+            "a rejected value changes nothing"
+        );
+    }
+
+    #[test]
+    fn prefetch_mode_is_no_longer_a_setting() {
+        // #340: `prefetch.enabled` is the only switch.
+        assert!("prefetch.mode".parse::<ConfigKey>().is_err());
+    }
+
+    #[test]
+    fn calibration_keys_are_no_longer_settable() {
+        for key in [
+            "prefetch.calibration_aggressive_threshold",
+            "prefetch.calibration_opportunistic_threshold",
+            "prefetch.calibration_sample_duration",
+        ] {
+            assert!(key.parse::<ConfigKey>().is_err(), "{key}");
         }
     }
 }

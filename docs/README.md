@@ -7,6 +7,7 @@
 | [How It Works](how-it-works.md) | Architecture overview - how packages and streaming work together |
 | [Getting Started](getting-started.md) | First-time setup, installation, and basic usage |
 | [Configuration](configuration.md) | All configuration options and INI file reference |
+| [Directory Layout](directory-layout.md) | Where files live, upgrading from pre-0.5.0, cleaning up |
 | [Package Management](package-management.md) | Installing, updating, and removing scenery packages |
 | [Running the Service](running-service.md) | Streaming service options and management |
 | [Content Publishing](content-publishing.md) | Creating and distributing packages from Ortho4XP |

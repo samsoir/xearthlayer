@@ -10,8 +10,8 @@ use tracing::info;
 use crate::aircraft_position::{SharedAircraftPosition, StateAggregator};
 use crate::geo_index::GeoIndex;
 use crate::manager::{
-    create_consolidated_overlay, remove_consolidated_overlay, InstalledPackage, LocalPackageStore,
-    MountManager, ServiceBuilder,
+    create_consolidated_overlay, create_consolidated_overlay_except, remove_consolidated_overlay,
+    InstalledPackage, LocalPackageStore, MountManager, ServiceBuilder,
 };
 use crate::metrics::TelemetrySnapshot;
 use crate::ortho_union::OrthoUnionIndex;
@@ -20,6 +20,7 @@ use crate::prefetch::{
     SharedPrefetchStatus,
 };
 use crate::runtime::{SharedRuntimeHealth, SharedTileProgressTracker};
+use crate::xworld_pro::{overlay_plan, OverlayPlan};
 
 use super::super::error::ServiceError;
 use super::super::orchestrator_config::OrchestratorConfig;
@@ -95,6 +96,10 @@ impl ServiceOrchestrator {
 
         let cancellation = CancellationToken::new();
         let prefetch_status = SharedPrefetchStatus::new();
+        if !config.prefetch_enabled() {
+            // No coordinator will run to publish anything, so say so here.
+            prefetch_status.mark_disabled();
+        }
 
         // Create FUSE request analyzer for position inference (if prefetch enabled)
         let fuse_analyzer = if config.prefetch_enabled() {
@@ -115,6 +120,8 @@ impl ServiceOrchestrator {
         // Create mount manager with Custom Scenery path and FUSE kernel limits
         let mut mount_manager = MountManager::with_scenery_path(&config.custom_scenery_path);
         mount_manager.set_fuse_limits(config.fuse.max_background, config.fuse.congestion_threshold);
+        mount_manager.set_night_lighting(config.service.night_enabled());
+        mount_manager.set_night_brightness(config.night_brightness);
         if let Some(timeout_secs) = config.service.generation_timeout() {
             mount_manager.set_generation_timeout(timeout_secs);
         }
@@ -234,28 +241,48 @@ impl ServiceOrchestrator {
         if let Some(ref cb) = callback {
             cb(StartupProgress::CreatingOverlay);
         }
-        let (overlay_success, overlay_error) = if self.config.disable_overlays {
-            match remove_consolidated_overlay(&self.config.custom_scenery_path) {
-                Ok(true) => {
-                    tracing::info!(
-                        "Removed consolidated overlay folder (packages.disable_overlays = true); \
-                         X-Plane will not load XEarthLayer overlays this session"
-                    );
-                    (true, None)
-                }
-                Ok(false) => (true, None),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to remove consolidated overlay");
-                    (false, Some(e.to_string()))
+        let (overlay_success, overlay_error) = match overlay_plan(
+            self.config.disable_overlays,
+            self.config.xworld_pro.as_ref(),
+        ) {
+            OverlayPlan::Remove => {
+                match remove_consolidated_overlay(&self.config.custom_scenery_path) {
+                    Ok(true) => {
+                        tracing::info!(
+                            "Removed consolidated overlay folder (packages.disable_overlays = true); \
+                             X-Plane will not load XEarthLayer overlays this session"
+                        );
+                        (true, None)
+                    }
+                    Ok(false) => (true, None),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to remove consolidated overlay");
+                        (false, Some(e.to_string()))
+                    }
                 }
             }
-        } else {
-            let overlay_result =
-                create_consolidated_overlay(store, &self.config.custom_scenery_path);
-            if let Some(ref error) = overlay_result.error {
-                tracing::warn!(error = %error, "Failed to create consolidated overlay");
+            plan => {
+                let overlay_result = match &plan {
+                    OverlayPlan::Except(coverage) => {
+                        let result = create_consolidated_overlay_except(
+                            store,
+                            &self.config.custom_scenery_path,
+                            &|region: &str| coverage.suppresses(region),
+                        );
+                        tracing::info!(
+                            covered = %coverage.describe(),
+                            excluded = ?result.excluded_regions,
+                            "X-World Pro active: XEarthLayer overlays left out there"
+                        );
+                        result
+                    }
+                    _ => create_consolidated_overlay(store, &self.config.custom_scenery_path),
+                };
+                if let Some(ref error) = overlay_result.error {
+                    tracing::warn!(error = %error, "Failed to create consolidated overlay");
+                }
+                (overlay_result.success, overlay_result.error.clone())
             }
-            (overlay_result.success, overlay_result.error.clone())
         };
 
         // Phase 3: Start APT telemetry
@@ -565,6 +592,24 @@ impl ServiceOrchestrator {
     /// Get the underlying service if mounted.
     pub fn service(&self) -> Option<&XEarthLayerService> {
         self.mount_manager.get_service()
+    }
+
+    /// The GPU encoding textures, or `None` when a CPU encoder is in use or
+    /// services are not initialized yet.
+    pub fn gpu_adapter(&self) -> Option<&crate::system::GpuAdapter> {
+        self.service().and_then(|s| s.gpu_adapter())
+    }
+
+    /// The encoder policy's warning that GPU encoding shares the GPU X-Plane
+    /// renders with, or `None` (#203).
+    pub fn gpu_warning(&self) -> Option<&str> {
+        self.service().and_then(|s| s.gpu_warning())
+    }
+
+    /// What night lighting is doing this session, decided when the ortho
+    /// mount was built.
+    pub fn night_lighting(&self) -> crate::night::NightLighting {
+        self.mount_manager.night_lighting()
     }
 
     /// Get the configuration.

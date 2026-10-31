@@ -24,7 +24,7 @@ use std::time::Instant;
 /// # Ordering
 ///
 /// Lower values indicate higher accuracy:
-/// - `TELEMETRY` (10m) > `AIRPORT_FIX` (100m) > `SCENE_INFERENCE` (100,000m)
+/// - `TELEMETRY` (10m) > `MANUAL_REFERENCE` (100m)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PositionAccuracy(pub f32);
 
@@ -45,11 +45,6 @@ impl PositionAccuracy {
     /// Used for positions from airport ICAO, manual coordinates, flight plans, etc.
     /// Accurate but confidence decays rapidly once aircraft moves.
     pub const MANUAL_REFERENCE: Self = Self(100.0);
-
-    /// Scene inference - derived from tile bounds (~60nm).
-    ///
-    /// Used for position inferred from X-Plane's scenery loading patterns.
-    pub const SCENE_INFERENCE: Self = Self(100_000.0);
 
     /// Returns true if this accuracy is better (lower meters) than other.
     #[inline]
@@ -106,8 +101,6 @@ pub enum PositionSource {
     OnlineNetwork,
     /// User-provided reference point (airport ICAO, manual coordinates, flight plan, etc.).
     ManualReference,
-    /// Inferred from Scene Tracker loaded bounds.
-    SceneInference,
 }
 
 /// Source of ground track data.
@@ -140,7 +133,6 @@ impl std::fmt::Display for PositionSource {
             Self::Telemetry => write!(f, "Telemetry"),
             Self::OnlineNetwork => write!(f, "Network"),
             Self::ManualReference => write!(f, "Manual"),
-            Self::SceneInference => write!(f, "Inferred"),
         }
     }
 }
@@ -266,23 +258,6 @@ impl AircraftState {
             timestamp: Instant::now(),
             source: PositionSource::ManualReference,
             accuracy: PositionAccuracy::MANUAL_REFERENCE,
-            on_ground: false,
-        }
-    }
-
-    /// Create a new aircraft state from scene inference.
-    pub fn from_inference(latitude: f64, longitude: f64) -> Self {
-        Self {
-            latitude,
-            longitude,
-            track: None,
-            track_source: TrackSource::Unavailable,
-            heading: 0.0,
-            ground_speed: 0.0,
-            altitude: 0.0,
-            timestamp: Instant::now(),
-            source: PositionSource::SceneInference,
-            accuracy: PositionAccuracy::SCENE_INFERENCE,
             on_ground: false,
         }
     }
@@ -424,19 +399,13 @@ mod tests {
     #[test]
     fn test_position_accuracy_ordering() {
         assert!(PositionAccuracy::TELEMETRY.is_better_than(&PositionAccuracy::MANUAL_REFERENCE));
-        assert!(
-            PositionAccuracy::MANUAL_REFERENCE.is_better_than(&PositionAccuracy::SCENE_INFERENCE)
-        );
-        assert!(PositionAccuracy::TELEMETRY.is_better_than(&PositionAccuracy::SCENE_INFERENCE));
-
-        assert!(!PositionAccuracy::SCENE_INFERENCE.is_better_than(&PositionAccuracy::TELEMETRY));
+        assert!(!PositionAccuracy::MANUAL_REFERENCE.is_better_than(&PositionAccuracy::TELEMETRY));
     }
 
     #[test]
     fn test_position_accuracy_partial_ord() {
         // Higher accuracy (lower meters) should be "greater" in ordering
         assert!(PositionAccuracy::TELEMETRY > PositionAccuracy::MANUAL_REFERENCE);
-        assert!(PositionAccuracy::MANUAL_REFERENCE > PositionAccuracy::SCENE_INFERENCE);
     }
 
     #[test]
@@ -495,10 +464,6 @@ mod tests {
         let state = AircraftState::from_manual_reference(43.6, 1.4);
         assert_eq!(state.effective_track(), None);
         assert_eq!(state.track_source, TrackSource::Unavailable);
-
-        let state = AircraftState::from_inference(53.5, 10.0);
-        assert_eq!(state.effective_track(), None);
-        assert_eq!(state.track_source, TrackSource::Unavailable);
     }
 
     #[test]
@@ -554,15 +519,6 @@ mod tests {
     }
 
     #[test]
-    fn test_aircraft_state_from_inference() {
-        let state = AircraftState::from_inference(53.5, 10.0);
-
-        assert_eq!(state.source, PositionSource::SceneInference);
-        assert_eq!(state.accuracy, PositionAccuracy::SCENE_INFERENCE);
-        assert!(!state.has_vectors());
-    }
-
-    #[test]
     fn test_telemetry_status_display() {
         assert_eq!(TelemetryStatus::Connected.to_string(), "Connected");
         assert_eq!(TelemetryStatus::Disconnected.to_string(), "Disconnected");
@@ -572,7 +528,6 @@ mod tests {
     fn test_position_source_display() {
         assert_eq!(PositionSource::Telemetry.to_string(), "Telemetry");
         assert_eq!(PositionSource::ManualReference.to_string(), "Manual");
-        assert_eq!(PositionSource::SceneInference.to_string(), "Inferred");
     }
 
     #[test]
@@ -673,7 +628,6 @@ mod tests {
 
         // Contrast with non-vector sources
         assert!(!AircraftState::from_manual_reference(43.6, 1.4).has_vectors());
-        assert!(!AircraftState::from_inference(53.5, 10.0).has_vectors());
     }
 
     #[test]
@@ -691,7 +645,6 @@ mod tests {
 
         // All constructors should default to false
         assert!(!AircraftState::from_manual_reference(43.6, 1.4).on_ground);
-        assert!(!AircraftState::from_inference(53.5, 10.0).on_ground);
         assert!(
             !AircraftState::from_network_position(
                 33.9425,
@@ -722,7 +675,7 @@ mod tests {
         assert!(grounded.on_ground);
 
         // Verify builder does not mutate the original (moved, but verify false→true)
-        let airborne = AircraftState::from_inference(53.5, 10.0).with_on_ground(false);
+        let airborne = AircraftState::from_manual_reference(53.5, 10.0).with_on_ground(false);
         assert!(!airborne.on_ground);
     }
 }

@@ -17,7 +17,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
-use crate::package::{self, PackageType};
+use xearthlayer_package::{self as package, PackageType};
 
 use super::local::LocalPackageStore;
 use super::{ManagerError, ManagerResult};
@@ -205,6 +205,8 @@ pub struct ConsolidatedOverlayResult {
     pub success: bool,
     /// Error message if failed.
     pub error: Option<String>,
+    /// Overlay regions left out by the caller's filter, sorted like `regions`.
+    pub excluded_regions: Vec<String>,
 }
 
 impl ConsolidatedOverlayResult {
@@ -222,6 +224,7 @@ impl ConsolidatedOverlayResult {
             regions,
             success: true,
             error: None,
+            excluded_regions: Vec::new(),
         }
     }
 
@@ -234,6 +237,7 @@ impl ConsolidatedOverlayResult {
             regions: Vec::new(),
             success: false,
             error: Some(error),
+            excluded_regions: Vec::new(),
         }
     }
 
@@ -246,6 +250,7 @@ impl ConsolidatedOverlayResult {
             regions: Vec::new(),
             success: true,
             error: None,
+            excluded_regions: Vec::new(),
         }
     }
 }
@@ -319,6 +324,17 @@ pub fn create_consolidated_overlay(
     store: &LocalPackageStore,
     custom_scenery_path: &Path,
 ) -> ConsolidatedOverlayResult {
+    create_consolidated_overlay_except(store, custom_scenery_path, &|_: &str| false)
+}
+
+/// [`create_consolidated_overlay`], leaving out every overlay package whose
+/// region `exclude` accepts (X-World Pro coverage). Excluding every package
+/// removes the folder, like having none installed.
+pub fn create_consolidated_overlay_except(
+    store: &LocalPackageStore,
+    custom_scenery_path: &Path,
+    exclude: &dyn Fn(&str) -> bool,
+) -> ConsolidatedOverlayResult {
     // Verify Custom Scenery directory exists
     if !custom_scenery_path.exists() {
         return ConsolidatedOverlayResult::failure(
@@ -347,6 +363,10 @@ pub fn create_consolidated_overlay(
         .filter(|p| p.package_type() == PackageType::Overlay)
         .collect();
     overlay_packages.sort_by_key(|a| a.region().to_lowercase());
+    let (excluded, overlay_packages): (Vec<_>, Vec<_>) = overlay_packages
+        .into_iter()
+        .partition(|p| exclude(p.region()));
+    let excluded_regions: Vec<String> = excluded.iter().map(|p| p.region().to_string()).collect();
 
     if overlay_packages.is_empty() {
         tracing::debug!("No overlay packages found, cleaning up overlay artifacts");
@@ -356,7 +376,9 @@ pub fn create_consolidated_overlay(
         }
         // Clean up any stale per-region overlay symlinks
         cleanup_all_per_region_overlay_symlinks(custom_scenery_path);
-        return ConsolidatedOverlayResult::no_packages();
+        let mut result = ConsolidatedOverlayResult::no_packages();
+        result.excluded_regions = excluded_regions;
+        return result;
     }
 
     let regions: Vec<String> = overlay_packages
@@ -508,12 +530,14 @@ pub fn create_consolidated_overlay(
     // Clean up all stale per-region overlay symlinks (including regions no longer installed).
     cleanup_all_per_region_overlay_symlinks(custom_scenery_path);
 
-    ConsolidatedOverlayResult::success(
+    let mut result = ConsolidatedOverlayResult::success(
         consolidated_path,
         overlay_packages.len(),
         file_count,
         regions,
-    )
+    );
+    result.excluded_regions = excluded_regions;
+    result
 }
 
 /// Remove the consolidated overlay folder.
@@ -770,6 +794,71 @@ mod tests {
             !scenery_dir.path().join("yzXEL_eu_overlay").exists(),
             "Stale eu per-region symlink should have been removed"
         );
+    }
+
+    #[test]
+    fn test_consolidated_overlay_except_leaves_out_excluded_regions() {
+        let packages_dir = TempDir::new().unwrap();
+        let scenery_dir = TempDir::new().unwrap();
+        create_mock_overlay_with_dsf(packages_dir.path(), "na");
+        create_mock_overlay_with_dsf(packages_dir.path(), "eu");
+        let store = LocalPackageStore::new(packages_dir.path());
+        let result = create_consolidated_overlay_except(&store, scenery_dir.path(), &|r: &str| {
+            r.eq_ignore_ascii_case("eu")
+        });
+        assert!(result.success);
+        assert_eq!(result.regions, vec!["NA".to_string()]);
+        assert_eq!(result.excluded_regions, vec!["EU".to_string()]);
+    }
+
+    #[test]
+    fn test_consolidated_overlay_except_everything_removes_the_folder() {
+        let packages_dir = TempDir::new().unwrap();
+        let scenery_dir = TempDir::new().unwrap();
+        create_mock_overlay_with_dsf(packages_dir.path(), "na");
+        let store = LocalPackageStore::new(packages_dir.path());
+        assert!(create_consolidated_overlay(&store, scenery_dir.path()).success);
+        assert!(consolidated_overlay_exists(scenery_dir.path()));
+        let result =
+            create_consolidated_overlay_except(&store, scenery_dir.path(), &|_: &str| true);
+        assert_eq!(result.excluded_regions, vec!["NA".to_string()]);
+        assert!(!consolidated_overlay_exists(scenery_dir.path()));
+    }
+
+    #[test]
+    fn test_consolidated_overlay_except_over_a_built_folder_drops_the_excluded_links() {
+        let packages_dir = TempDir::new().unwrap();
+        let scenery_dir = TempDir::new().unwrap();
+        let na_dir = create_mock_overlay_with_dsf(packages_dir.path(), "na");
+        create_mock_overlay_with_dsf(packages_dir.path(), "eu");
+        let store = LocalPackageStore::new(packages_dir.path());
+        let plain = create_consolidated_overlay(&store, scenery_dir.path());
+        assert_eq!(plain.regions.len(), 2);
+
+        let result = create_consolidated_overlay_except(&store, scenery_dir.path(), &|r: &str| {
+            r.eq_ignore_ascii_case("na")
+        });
+        assert!(result.success, "Error: {:?}", result.error);
+        assert_eq!(result.regions, vec!["EU".to_string()]);
+        assert!(consolidated_overlay_exists(scenery_dir.path()));
+
+        let nav = scenery_dir
+            .path()
+            .join(CONSOLIDATED_OVERLAY_NAME)
+            .join("Earth nav data");
+        let mut links = 0;
+        for grid in fs::read_dir(&nav).unwrap().flatten() {
+            for f in fs::read_dir(grid.path()).unwrap().flatten() {
+                links += 1;
+                let target = fs::read_link(f.path()).unwrap();
+                assert!(
+                    !target.starts_with(&na_dir),
+                    "{} still points into the excluded package",
+                    f.path().display()
+                );
+            }
+        }
+        assert_eq!(links, 2);
     }
 
     #[test]

@@ -50,8 +50,15 @@ pub fn fs_info(path: &Path) -> io::Result<FilesystemInfo> {
     // f_bsize for almost all filesystems, but the standard says capacity
     // calculations should use f_frsize.
     let frsize = stat.fragment_size();
-    let total_bytes = stat.blocks().saturating_mul(frsize);
-    let available_bytes = stat.blocks_available().saturating_mul(frsize);
+    // Block counts are `fsblkcnt_t`, which is 32-bit on macOS and 64-bit on
+    // Linux. Normalize to u64 so the capacity math is identical on both; the
+    // macOS branch widens, the Linux branch is already u64.
+    #[cfg(target_os = "macos")]
+    let (blocks, blocks_available) = (u64::from(stat.blocks()), u64::from(stat.blocks_available()));
+    #[cfg(not(target_os = "macos"))]
+    let (blocks, blocks_available) = (stat.blocks(), stat.blocks_available());
+    let total_bytes = blocks.saturating_mul(frsize);
+    let available_bytes = blocks_available.saturating_mul(frsize);
     Ok(FilesystemInfo {
         total_bytes,
         available_bytes,

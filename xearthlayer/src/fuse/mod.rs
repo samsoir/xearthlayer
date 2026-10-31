@@ -18,7 +18,7 @@ mod placeholder;
 
 // Re-export types for public API
 pub use coalesce::{CoalesceResult, CoalescedResult, CoalescerStats, RequestCoalescer};
-pub use filename::{parse_dds_filename, DdsFilename, ParseError};
+pub use filename::{parse_dds_filename, DdsFilename, ParseError, TextureKind};
 pub use fuse3::{Fuse3Error, Fuse3Result, MountHandle, SpawnedMountHandle};
 pub use placeholder::{
     generate_default_placeholder, generate_magenta_placeholder, get_default_placeholder,

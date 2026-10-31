@@ -15,10 +15,12 @@ Technical documentation for XEarthLayer developers and contributors.
 | Document | Description |
 |----------|-------------|
 | [Job Executor Design](job-executor-design.md) | Job/task framework, daemon architecture, resource pools (v0.3.0+) |
+| [Preflight Design](preflight-design.md) | Startup prerequisite registry, bootstrap context, adding a check (v0.5.0+) |
 | [FUSE Filesystem](fuse-filesystem.md) | Virtual filesystem, consolidated mounting, Direct I/O for DDS |
 | [Coordinate System](coordinate-system.md) | Web Mercator projection, tile math, zoom levels |
 | [DDS Implementation](dds-implementation.md) | BC1/BC3 texture compression, mipmap generation |
 | [GPU Encoding](gpu-encoding-design.md) | wgpu compute shader encoding, channel worker, memory optimization |
+| [Night Lighting Design](night-lighting-design.md) | Lit textures generated from OXO night recipes and Laminar art (proposed, v0.5.0) |
 | [GeoIndex Design](geo-index-design.md) | Geospatial reference database, patch region ownership |
 | [Cache Design](cache-design.md) | Three-tier caching (memory, DDS disk, chunk disk), LRU eviction |
 | [Cache Service Design](cache-service-design.md) | CacheLayer lifecycle, GC daemons, bridge adapters |
@@ -33,6 +35,7 @@ Technical documentation for XEarthLayer developers and contributors.
 | [Scenery Packages](scenery-packages.md) | File formats, naming conventions, metadata specs |
 | [Package Manager Design](package-manager-design.md) | Download, install, update architecture (parallel downloads, retry) |
 | [Package Publisher Design](package-publisher-design.md) | Build, archive, release pipeline |
+| [Publisher Separation Design](publisher-separation-design.md) | Publishing in its own crates and binary, package format as a contract crate (#284) |
 | [GitHub Releases Publishing](github-releases-publishing.md) | Multi-part upload workflow |
 | [Zoom Level Overlap](zoom-level-overlap-design.md) | Dedupe and gap analysis tools |
 
@@ -45,7 +48,7 @@ Technical documentation for XEarthLayer developers and contributors.
 | [Adaptive Prefetch Design](adaptive-prefetch-design.md) | Sliding prefetch box, boundary monitors, flight phase detection |
 | [X-Plane Scenery Loading Whitepaper](xplane-scenery-loading-whitepaper.md) | Research on X-Plane 12's scenery loading behaviour |
 | [Prefetch Flight Test Plan](prefetch-flight-test-plan.md) | Flight test data and empirical findings |
-| [Aircraft Telemetry Architecture](aircraft-telemetry-architecture.md) | X-Plane Web API telemetry integration (v0.4.0) |
+| [Aircraft Telemetry Architecture](aircraft-telemetry-architecture.md) | X-Plane Web API telemetry integration (v0.4.0); the Scene Tracker it describes was removed in #204 |
 
 ## Debugging & Operations
 
@@ -54,6 +57,8 @@ Technical documentation for XEarthLayer developers and contributors.
 | [Debug Map](debug-map.md) | Live browser map for prefetch observability (`--features debug-map`) |
 | [Memory Profiling](memory-profiling.md) | Heaptrack profiling guide for memory optimization |
 | [Memory Telemetry](memory-telemetry.md) | Periodic in-process memory sampling for long-flight diagnosis (v0.4.7+) |
+| [CI/CD Pipeline](cicd.md) | Build pipeline, merge strategy, release channels, platform tiers |
+| [macOS Signing Runbook](macos-signing-runbook.md) | What signing needs: Developer ID certificate, notary key, release secrets, renewal, troubleshooting |
 | [Application Release Runbook](app-release-runbook.md) | Release workflow, versioning, and troubleshooting |
 
 ## Root Cause Analysis
@@ -78,7 +83,7 @@ xearthlayer-cli
             │       ├── resource_pool (concurrency limiting)
             │       └── adapters (cache, provider bridges)
             ├── runtime (orchestration, health monitoring)
-            ├── jobs (DdsGenerateJob, TilePrefetchJob)
+            ├── jobs (DdsGenerateJob)
             ├── tasks (DownloadChunks, BuildAndCacheDds)
             ├── texture (DDS encoding)
             ├── cache (memory + disk)
@@ -91,10 +96,14 @@ xearthlayer-cli
             ├── ortho_union (tile → source mapping)
             ├── patches (patch discovery, validation)
             ├── prefetch (boundary-driven adaptive prefetch, flight phase detection)
-            ├── package (metadata, library parsing)
-            ├── manager (mounts, symlinks, install/update/remove)
-            └── publisher (scan, build, release)
+            └── manager (mounts, symlinks, install/update/remove)
 ```
+
+Two crates sit beside the runtime. `xearthlayer-package` carries the scenery
+package format that both the runtime and the publisher depend on, and
+`xearthlayer-publisher` holds publishing behind the `xearthlayer-publish`
+binary. Neither direction crosses: the runtime does not link the publisher.
+See [Publisher Separation Design](publisher-separation-design.md).
 
 ## Getting Started
 

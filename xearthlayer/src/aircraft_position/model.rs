@@ -18,11 +18,6 @@
 //! // Seed with manual reference (100m accuracy)
 //! model.seed_from_manual_reference(43.6, 1.4);
 //!
-//! // Scene inference won't replace manual reference (100km < 100m accuracy)
-//! // unless manual reference is stale
-//! let inference = AircraftState::from_inference(43.5, 1.3);
-//! model.apply_update(inference, Duration::from_secs(30));
-//!
 //! // Telemetry always wins (10m > all others)
 //! let telemetry = AircraftState::from_telemetry(43.6001, 1.4001, 90.0, 120.0, 10000.0);
 //! model.apply_update(telemetry, Duration::from_secs(30));
@@ -206,7 +201,7 @@ mod tests {
     #[test]
     fn test_accept_first_update() {
         let mut model = PositionModel::new();
-        let state = AircraftState::from_inference(53.5, 10.0);
+        let state = AircraftState::from_manual_reference(53.5, 10.0);
 
         assert!(model.apply_update(state));
         assert!(model.has_position());
@@ -216,9 +211,9 @@ mod tests {
     fn test_higher_accuracy_wins() {
         let mut model = PositionModel::new();
 
-        // Start with inference (100km accuracy)
-        let inference = AircraftState::from_inference(53.5, 10.0);
-        model.apply_update(inference);
+        // Start with a manual reference (100m accuracy)
+        let manual = AircraftState::from_manual_reference(53.5, 10.0);
+        model.apply_update(manual);
 
         // Telemetry (10m) should replace it
         let telemetry = AircraftState::from_telemetry(
@@ -250,9 +245,9 @@ mod tests {
         );
         model.apply_update(telemetry);
 
-        // Inference (100km) should be rejected
-        let inference = AircraftState::from_inference(53.5, 10.0);
-        assert!(!model.apply_update(inference));
+        // A manual reference (100m) should be rejected
+        let manual = AircraftState::from_manual_reference(53.5, 10.0);
+        assert!(!model.apply_update(manual));
         assert_eq!(model.position_source(), Some(PositionSource::Telemetry));
     }
 
@@ -276,12 +271,12 @@ mod tests {
         // Wait for it to become stale
         thread::sleep(Duration::from_millis(20));
 
-        // Now inference can replace it
-        let inference = AircraftState::from_inference(53.5, 10.0);
-        assert!(model.apply_update(inference));
+        // Now a manual reference can replace it
+        let manual = AircraftState::from_manual_reference(53.5, 10.0);
+        assert!(model.apply_update(manual));
         assert_eq!(
             model.position_source(),
-            Some(PositionSource::SceneInference)
+            Some(PositionSource::ManualReference)
         );
     }
 
@@ -294,9 +289,9 @@ mod tests {
         assert_eq!(model.telemetry_status(), TelemetryStatus::Connected);
         assert!(!model.has_position());
 
-        // Add inference position - telemetry status unchanged
-        let inference = AircraftState::from_inference(53.5, 10.0);
-        model.apply_update(inference);
+        // Add a manual reference position - telemetry status unchanged
+        let manual = AircraftState::from_manual_reference(53.5, 10.0);
+        model.apply_update(manual);
         assert_eq!(model.telemetry_status(), TelemetryStatus::Connected);
     }
 
@@ -304,9 +299,9 @@ mod tests {
     fn test_has_vectors() {
         let mut model = PositionModel::new();
 
-        // Inference has no vectors
-        let inference = AircraftState::from_inference(53.5, 10.0);
-        model.apply_update(inference);
+        // A manual reference has no vectors
+        let manual = AircraftState::from_manual_reference(53.5, 10.0);
+        model.apply_update(manual);
         assert!(!model.has_vectors());
 
         // Telemetry has vectors
@@ -321,26 +316,5 @@ mod tests {
         );
         model.apply_update(telemetry);
         assert!(model.has_vectors());
-    }
-
-    #[test]
-    fn test_manual_reference_vs_inference() {
-        let mut model = PositionModel::new();
-
-        // Start with manual reference (100m accuracy)
-        let manual_reference = AircraftState::from_manual_reference(43.6, 1.4);
-        model.apply_update(manual_reference);
-        assert_eq!(
-            model.position_source(),
-            Some(PositionSource::ManualReference)
-        );
-
-        // Inference (100km) should be rejected - manual reference is more accurate
-        let inference = AircraftState::from_inference(53.5, 10.0);
-        assert!(!model.apply_update(inference));
-        assert_eq!(
-            model.position_source(),
-            Some(PositionSource::ManualReference)
-        );
     }
 }

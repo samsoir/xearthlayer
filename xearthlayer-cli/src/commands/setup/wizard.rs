@@ -14,18 +14,21 @@
 //! - X-Plane detection: [`xearthlayer::config::detect_scenery_dir`]
 //! - Configuration: [`xearthlayer::config::ConfigFile`]
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use console::style;
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use xearthlayer::config::{
     config_file_path, detect_scenery_dir, format_size, ConfigFile, SceneryDetectionResult, GB, MB,
 };
+use xearthlayer::provider::catalog::{find as find_provider, PROVIDERS};
 use xearthlayer::system::{
-    enumerate_gpus, GpuAdapter, SystemInfo, MIN_DISK_CACHE_BYTES, MIN_MEMORY_CACHE_BYTES,
+    enumerate_gpus, CompressorKind, DefaultEncoderPolicy, EncoderPolicy, GpuAdapter,
+    HardwareProfile, SystemInfo, MIN_DISK_CACHE_BYTES, MIN_MEMORY_CACHE_BYTES,
 };
 
 use crate::error::CliError;
@@ -50,6 +53,21 @@ pub struct SetupConfig {
     /// GPU device selector when compressor is "gpu". Ignored otherwise but
     /// always written to keep the config file shape consistent.
     pub texture_gpu_device: String,
+    /// Imagery provider (`provider.type`).
+    pub provider_type: String,
+    /// Google Maps API key, when the chosen provider needs one.
+    pub google_api_key: Option<String>,
+    /// Mapbox access token, when the chosen provider needs one.
+    pub mapbox_access_token: Option<String>,
+    /// Give SimHeaven X-World Pro priority over XEarthLayer overlays.
+    pub xworld_pro: bool,
+}
+
+/// Output of the provider step.
+struct ProviderSelection {
+    provider_type: String,
+    google_api_key: Option<String>,
+    mapbox_access_token: Option<String>,
 }
 
 /// Run the interactive setup wizard.
@@ -89,13 +107,23 @@ pub fn run_wizard() -> Result<(), CliError> {
     print_step_header("Step 2: Package Location");
     let package_dir = step_package_location(&theme)?;
 
-    // Step 3: Cache Configuration (directory + budgets)
-    print_step_header("Step 3: Cache Configuration");
+    // Step 3: Imagery Provider. Before the cache step because which imagery a
+    // user gets is a more fundamental choice than how much of it to keep.
+    print_step_header("Step 3: Imagery Provider");
+    let provider = step_provider(&theme)?;
+
+    // Step 4: Cache Configuration (directory + budgets)
+    print_step_header("Step 4: Cache Configuration");
     let cache_settings = step_cache(&theme)?;
 
-    // Step 4: DDS Encoding (GPU selection if multi-GPU)
-    print_step_header("Step 4: DDS Encoding");
+    // Step 5: DDS Encoding (GPU selection if multi-GPU)
+    print_step_header("Step 5: DDS Encoding");
     let (texture_compressor, texture_gpu_device) = step_encoding(&theme)?;
+
+    // Step 6: Third-party Scenery. Last, so the other step numbers are unchanged,
+    // and it needs Step 1's Custom Scenery folder.
+    print_step_header("Step 6: Third-party Scenery");
+    let xworld_pro = super::xworld::step_xworld(&theme, xplane_scenery_dir.as_deref())?;
 
     // Build setup config
     let setup_config = SetupConfig {
@@ -107,11 +135,25 @@ pub fn run_wizard() -> Result<(), CliError> {
         dds_disk_ratio: cache_settings.dds_disk_ratio,
         texture_compressor,
         texture_gpu_device,
+        provider_type: provider.provider_type,
+        google_api_key: provider.google_api_key,
+        mapbox_access_token: provider.mapbox_access_token,
+        xworld_pro,
     };
 
-    write_config(&setup_config)?;
-    print_completion_message();
-    Ok(())
+    let written = write_config(&setup_config)?;
+    print_completion_message(&written);
+
+    // Setup leaves no scenery installed, so offer the way to get some. Without
+    // a terminal there is nobody to ask and nothing to draw on.
+    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let answer = tty
+        && Confirm::with_theme(&theme)
+            .with_prompt("Open the package manager now to install scenery?")
+            .default(true)
+            .interact()
+            .map_err(|e| CliError::Config(format!("Confirm error: {}", e)))?;
+    offer_manager(answer, tty, crate::commands::packages::open_manager)
 }
 
 fn print_banner() {
@@ -137,7 +179,39 @@ fn print_step_header(title: &str) {
     println!();
 }
 
-fn print_completion_message() {
+/// Show where XEarthLayer keeps its files.
+///
+/// New with the platform-native layout. Everything used to live in one
+/// directory, so "where is my stuff" never came up. It now spans three or four,
+/// and the end of the wizard is where that question gets answered rather than
+/// left for the user to discover.
+/// Where things live, from the configuration setup just wrote, so the summary
+/// shows the user's choices rather than the role defaults. The package
+/// location falls back to its default when the configuration leaves it unset.
+fn layout_rows(config: &ConfigFile) -> Vec<(&'static str, PathBuf)> {
+    vec![
+        ("Configuration", config_file_path()),
+        ("Tile cache", config.cache.directory.clone()),
+        (
+            "Scenery packages",
+            config
+                .packages
+                .install_location
+                .clone()
+                .unwrap_or_else(xearthlayer::paths::packages_dir),
+        ),
+        ("Log file", config.logging.file.clone()),
+    ]
+}
+
+fn print_layout(config: &ConfigFile) {
+    println!("{}:", style("Where things live").bold());
+    for (label, path) in layout_rows(config) {
+        println!("  {:<18}{}", label, style(path.display()).cyan());
+    }
+}
+
+fn print_completion_message(config: &ConfigFile) {
     println!();
     println!(
         "{}",
@@ -157,17 +231,48 @@ fn print_completion_message() {
         style(config_file_path().display()).cyan()
     );
     println!();
+    print_layout(config);
+    println!();
     println!("{}:", style("Next Steps").bold());
-    println!("  1. View your configuration:");
-    println!("     {} config list", style("xearthlayer").cyan());
-    println!();
-    println!("  2. Install a scenery package:");
-    println!("     {} packages list", style("xearthlayer").cyan());
-    println!("     {} packages install na", style("xearthlayer").cyan());
-    println!();
-    println!("  3. Start XEarthLayer:");
-    println!("     {}", style("xearthlayer").cyan());
-    println!();
+    for step in next_steps() {
+        for line in step.lines() {
+            // Indented lines are commands to type; the rest is the step's text.
+            if line.starts_with("     ") {
+                println!("{}", style(line).cyan());
+            } else {
+                println!("{line}");
+            }
+        }
+        println!();
+    }
+}
+
+/// The numbered steps shown after setup, one string per step, plain text.
+///
+/// The first line of a step says what it is for; the indented lines under it
+/// are the commands to type.
+fn next_steps() -> Vec<String> {
+    vec![
+        "  1. Open the package manager to install scenery:\n     xearthlayer packages".to_string(),
+        "  2. View your configuration:\n     xearthlayer config list".to_string(),
+        "  3. Install a scenery package from the command line:\n     xearthlayer packages list\n     xearthlayer packages install <region code from the list>"
+            .to_string(),
+        "  4. Start XEarthLayer:\n     xearthlayer".to_string(),
+    ]
+}
+
+/// Open the package manager when the user said yes and there is a terminal
+/// to draw it in. The decision is separate from the prompt so it can be tested.
+fn offer_manager(
+    answer: bool,
+    tty: bool,
+    launch: impl FnOnce() -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    if tty && answer {
+        launch()
+    } else {
+        Ok(())
+    }
 }
 
 /// Action to take when config already exists.
@@ -211,7 +316,10 @@ fn step_xplane(theme: &ColorfulTheme) -> Result<Option<PathBuf>, CliError> {
                 "{}",
                 style("X-Plane 12 Custom Scenery folder not detected.").yellow()
             );
-            println!("You can configure this later in ~/.xearthlayer/config.ini");
+            println!(
+                "You can configure this later in {}",
+                config_file_path().display()
+            );
             println!();
 
             let manual = Confirm::with_theme(theme)
@@ -288,10 +396,7 @@ fn step_xplane(theme: &ColorfulTheme) -> Result<Option<PathBuf>, CliError> {
 
 /// Step 2: Configure package installation location.
 fn step_package_location(theme: &ColorfulTheme) -> Result<PathBuf, CliError> {
-    let default_path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".xearthlayer")
-        .join("packages");
+    let default_path = xearthlayer::paths::packages_dir();
 
     println!("Where should XEarthLayer store scenery packages?");
     println!();
@@ -320,7 +425,138 @@ fn step_package_location(theme: &ColorfulTheme) -> Result<PathBuf, CliError> {
     }
 }
 
-/// Output of Step 3, the consolidated cache configuration.
+/// Menu entries for the provider step, one per catalog entry, in catalog order.
+///
+/// Pure so the wording can be asserted: a user has to be able to see from the
+/// menu alone whether a provider costs money or needs an account.
+fn provider_menu_labels() -> Vec<String> {
+    PROVIDERS
+        .iter()
+        .map(|entry| match entry.credential {
+            Some(cred) => format!(
+                "{} ({}, needs a {})",
+                entry.name,
+                entry.summary,
+                cred.label()
+            ),
+            None => format!("{} ({})", entry.name, entry.summary),
+        })
+        .collect()
+}
+
+/// Index to preselect: the configured provider, else the first entry.
+///
+/// Re-running setup must not move a working installation to a different
+/// provider, so whatever is configured comes up selected and Enter keeps it.
+/// The catalog guarantees the first entry needs no credentials, which is the
+/// right landing place for a value that is unset or no longer recognised.
+fn default_provider_index(configured: &str) -> usize {
+    find_provider(configured)
+        .and_then(|entry| PROVIDERS.iter().position(|p| p.key == entry.key))
+        .unwrap_or(0)
+}
+
+/// Resolve a credential prompt: empty entry keeps whatever is already set.
+///
+/// The prompt does not echo, so it cannot show the current value as a default.
+/// Accepting an empty entry as "keep" is what lets a user re-run setup without
+/// having to find their API key again.
+fn resolve_credential(entered: String, existing: Option<&String>) -> Option<String> {
+    let trimmed = entered.trim();
+    if trimmed.is_empty() {
+        return existing.cloned();
+    }
+    Some(trimmed.to_string())
+}
+
+/// Step 3: imagery provider, and its credential if it needs one.
+fn step_provider(theme: &ColorfulTheme) -> Result<ProviderSelection, CliError> {
+    let existing = ConfigFile::load().unwrap_or_default();
+
+    println!("XEarthLayer streams satellite imagery from one of these sources.");
+    println!(
+        "{}",
+        style("Most need no account. Only Google Maps and Mapbox require credentials.").cyan()
+    );
+    println!();
+
+    let labels = provider_menu_labels();
+    let selection = Select::with_theme(theme)
+        .with_prompt("Imagery provider")
+        .items(&labels)
+        .default(default_provider_index(&existing.provider.provider_type))
+        .interact()
+        .map_err(|e| CliError::Config(format!("Provider selection failed: {}", e)))?;
+
+    let entry = &PROVIDERS[selection];
+    let mut google_api_key = None;
+    let mut mapbox_access_token = None;
+
+    if let Some(cred) = entry.credential {
+        let already_set = match cred {
+            xearthlayer::provider::ProviderCredential::GoogleApiKey => {
+                existing.provider.google_api_key.as_ref()
+            }
+            xearthlayer::provider::ProviderCredential::MapboxAccessToken => {
+                existing.provider.mapbox_access_token.as_ref()
+            }
+        };
+
+        println!();
+        if already_set.is_some() {
+            println!(
+                "{}",
+                style(format!(
+                    "A {} is already configured. Press Enter to keep it.",
+                    cred.label()
+                ))
+                .cyan()
+            );
+        }
+
+        // Password rather than Input: the value is a secret, and the terminal
+        // may be shared, recorded, or scrolled back through later.
+        let entered = Password::with_theme(theme)
+            .with_prompt(cred.label())
+            .allow_empty_password(true)
+            .interact()
+            .map_err(|e| CliError::Config(format!("Credential entry failed: {}", e)))?;
+
+        let resolved = resolve_credential(entered, already_set);
+
+        if resolved.is_none() {
+            println!();
+            println!(
+                "{}",
+                style(format!(
+                    "No {} set. {} will not serve tiles until you run:\n  xearthlayer config set {} <value>",
+                    cred.label(),
+                    entry.name,
+                    cred.config_key()
+                ))
+                .yellow()
+            );
+        }
+
+        match cred {
+            xearthlayer::provider::ProviderCredential::GoogleApiKey => google_api_key = resolved,
+            xearthlayer::provider::ProviderCredential::MapboxAccessToken => {
+                mapbox_access_token = resolved
+            }
+        }
+    }
+
+    println!();
+    println!("{}", style(format!("Provider: {}", entry.name)).green());
+
+    Ok(ProviderSelection {
+        provider_type: entry.key.to_string(),
+        google_api_key,
+        mapbox_access_token,
+    })
+}
+
+/// Output of Step 4, the consolidated cache configuration.
 struct CacheSettings {
     cache_dir: PathBuf,
     memory_cache_size: usize,
@@ -328,16 +564,18 @@ struct CacheSettings {
     dds_disk_ratio: f64,
 }
 
-/// Step 3: Cache directory + disk budget + memory budget.
+/// Step 4: Cache directory + disk budget + memory budget.
 ///
 /// This step absorbs what used to be split between "cache location" and
 /// "system configuration" — the budgets are derived from system info, so
 /// it makes more sense for them to live next to the cache directory choice.
 fn step_cache(theme: &ColorfulTheme) -> Result<CacheSettings, CliError> {
-    let default_cache_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".xearthlayer")
-        .join("cache");
+    // The same default the program itself uses. These disagreed before the
+    // resolver existed: the wizard proposed ~/.xearthlayer/cache while
+    // ConfigFile::default() used the platform cache directory, so accepting the
+    // wizard's suggestion silently produced a different layout than declining
+    // it.
+    let default_cache_dir = xearthlayer::paths::tile_cache_dir();
 
     // 3a. Cache directory selection
     let cache_dir = prompt_cache_directory(theme, &default_cache_dir)?;
@@ -511,38 +749,44 @@ fn prompt_memory_cache_size(
     Ok(clamped_mb * MB)
 }
 
-/// Step 4: DDS encoding backend (and GPU device selection if applicable).
+/// Step 5: DDS encoding backend (and GPU device selection if applicable).
 ///
 /// Returns `(compressor, gpu_device)` ready to write to config. The
 /// `gpu_device` is always populated even when ISPC is selected so that
 /// switching to GPU later in `config set` doesn't require revisiting
 /// this step.
+///
+/// The choice goes through the [`EncoderPolicy`] (#203): with one GPU or
+/// none there is nothing to offer, because that GPU is the one X-Plane
+/// renders with, and the policy's default (ISPC) stands.
 fn step_encoding(theme: &ColorfulTheme) -> Result<(String, String), CliError> {
-    let adapters = enumerate_with_spinner();
+    let hw = HardwareProfile::new(enumerate_with_spinner());
+    let policy = DefaultEncoderPolicy;
+    let candidates = hw.encoding_candidates();
 
-    if adapters.len() < 2 {
-        // Single adapter (or none): GPU selection has no meaningful
-        // choice. Stick with the safer ISPC default.
-        if adapters.is_empty() {
-            println!(
+    if candidates.is_empty() {
+        match hw.adapters.first() {
+            None => println!(
                 "{}",
                 style("No GPU adapters detected — using ISPC (CPU-based, recommended).").cyan()
-            );
-        } else {
-            println!(
+            ),
+            Some(only) => println!(
                 "{}",
                 style(format!(
-                    "Single GPU detected ({}) — using ISPC (CPU-based, avoids competing with X-Plane).",
-                    adapters[0]
+                    "Single GPU detected ({only}) — using ISPC (CPU-based, avoids competing with X-Plane)."
                 ))
                 .cyan()
-            );
+            ),
         }
-        return Ok(("ispc".to_string(), "integrated".to_string()));
+        let decision = policy.select(&hw, None);
+        return Ok((
+            decision.backend.config_value().to_string(),
+            "integrated".to_string(),
+        ));
     }
 
     println!("Multiple GPUs detected:");
-    for (i, adapter) in adapters.iter().enumerate() {
+    for (i, adapter) in candidates.iter().enumerate() {
         println!("  {}. {}", i + 1, adapter);
     }
     println!();
@@ -556,7 +800,7 @@ fn step_encoding(theme: &ColorfulTheme) -> Result<(String, String), CliError> {
     println!();
 
     let mut items: Vec<String> = vec!["ISPC (CPU, recommended default)".to_string()];
-    for adapter in &adapters {
+    for adapter in candidates {
         items.push(format!("GPU: {}", adapter));
     }
 
@@ -569,17 +813,25 @@ fn step_encoding(theme: &ColorfulTheme) -> Result<(String, String), CliError> {
 
     if idx == 0 {
         println!("  {} ISPC (CPU)", style("✓").green());
-        Ok(("ispc".to_string(), "integrated".to_string()))
+        let decision = policy.select(&hw, Some(CompressorKind::Ispc));
+        Ok((
+            decision.backend.config_value().to_string(),
+            "integrated".to_string(),
+        ))
     } else {
-        let adapter = &adapters[idx - 1];
-        let gpu_device = adapter.config_value(&adapters);
+        let adapter = &candidates[idx - 1];
+        let gpu_device = adapter.config_value(&hw.adapters);
+        let decision = policy.select(&hw, Some(CompressorKind::Gpu));
+        if let Some(warning) = &decision.warning {
+            println!("{}", style(format!("⚠  {warning}")).yellow());
+        }
         println!(
             "  {} GPU: {} (config: {})",
             style("✓").green(),
             adapter,
             gpu_device
         );
-        Ok(("gpu".to_string(), gpu_device))
+        Ok((decision.backend.config_value().to_string(), gpu_device))
     }
 }
 
@@ -602,7 +854,8 @@ fn enumerate_with_spinner() -> Vec<GpuAdapter> {
 }
 
 /// Write the setup configuration to config.ini.
-fn write_config(setup: &SetupConfig) -> Result<(), CliError> {
+/// Write the setup choices into the configuration and return what was saved.
+fn write_config(setup: &SetupConfig) -> Result<ConfigFile, CliError> {
     let mut config = ConfigFile::load().unwrap_or_default();
 
     if let Some(ref scenery_dir) = setup.xplane_scenery_dir {
@@ -611,6 +864,7 @@ fn write_config(setup: &SetupConfig) -> Result<(), CliError> {
     }
 
     config.packages.install_location = Some(setup.package_dir.clone());
+    config.packages.xworld_pro = setup.xworld_pro;
 
     config.cache.directory = setup.cache_dir.clone();
     config.cache.memory_size = setup.memory_cache_size;
@@ -619,6 +873,16 @@ fn write_config(setup: &SetupConfig) -> Result<(), CliError> {
 
     config.texture.compressor = setup.texture_compressor.clone();
     config.texture.gpu_device = setup.texture_gpu_device.clone();
+
+    config.provider.provider_type = setup.provider_type.clone();
+    // Written only when present, so choosing a credential-free provider does
+    // not discard a key the user may still want when switching back.
+    if setup.google_api_key.is_some() {
+        config.provider.google_api_key = setup.google_api_key.clone();
+    }
+    if setup.mapbox_access_token.is_some() {
+        config.provider.mapbox_access_token = setup.mapbox_access_token.clone();
+    }
 
     if let Some(parent) = setup.package_dir.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -631,5 +895,166 @@ fn write_config(setup: &SetupConfig) -> Result<(), CliError> {
         .save()
         .map_err(|e| CliError::Config(format!("Failed to save config: {}", e)))?;
 
-    Ok(())
+    Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_menu_offers_every_provider_in_catalog_order() {
+        let labels = provider_menu_labels();
+
+        assert_eq!(labels.len(), PROVIDERS.len());
+        assert!(
+            labels[0].starts_with("Bing Maps"),
+            "the wizard must lead with a credential-free option, got {:?}",
+            labels[0]
+        );
+        for (label, entry) in labels.iter().zip(PROVIDERS) {
+            assert!(
+                label.contains(entry.name),
+                "{label} should name {}",
+                entry.name
+            );
+            assert!(
+                label.contains(entry.summary),
+                "{label} should summarise the provider"
+            );
+        }
+    }
+
+    #[test]
+    fn menu_labels_mark_the_providers_that_need_credentials() {
+        // A first-time user has to be able to see the cost before choosing.
+        for (label, entry) in provider_menu_labels().iter().zip(PROVIDERS) {
+            if let Some(cred) = entry.credential {
+                assert!(
+                    label.contains(cred.label()),
+                    "{label} should say it needs a {}",
+                    cred.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_selection_is_the_configured_provider() {
+        // Re-running setup must not silently move a working install to another
+        // provider: the current value is preselected so Enter keeps it.
+        let google = PROVIDERS.iter().position(|p| p.key == "google").unwrap();
+        assert_eq!(default_provider_index("google"), google);
+        assert_eq!(default_provider_index("GOOGLE"), google);
+    }
+
+    #[test]
+    fn default_selection_falls_back_to_the_first_free_provider() {
+        // An unset or unrecognised value lands on the first entry, which the
+        // catalog guarantees needs no credentials.
+        assert_eq!(default_provider_index(""), 0);
+        assert_eq!(default_provider_index("nonsuch"), 0);
+        assert!(PROVIDERS[0].is_free());
+    }
+
+    #[test]
+    fn an_empty_credential_entry_keeps_the_existing_one() {
+        let existing = Some("existing-key".to_string());
+
+        assert_eq!(
+            resolve_credential(String::new(), existing.as_ref()),
+            Some("existing-key".to_string()),
+            "pressing Enter must not wipe a working credential"
+        );
+    }
+
+    #[test]
+    fn a_new_credential_entry_replaces_and_is_trimmed() {
+        let existing = Some("old".to_string());
+
+        assert_eq!(
+            resolve_credential("  new-key \n".to_string(), existing.as_ref()),
+            Some("new-key".to_string()),
+            "pasted credentials pick up surrounding whitespace"
+        );
+    }
+
+    #[test]
+    fn an_empty_entry_with_nothing_existing_stays_unset() {
+        assert_eq!(resolve_credential("   ".to_string(), None), None);
+    }
+
+    fn row<'a>(rows: &'a [(&'static str, PathBuf)], label: &str) -> &'a PathBuf {
+        &rows.iter().find(|(l, _)| *l == label).unwrap().1
+    }
+
+    #[test]
+    fn the_layout_shows_the_configured_locations() {
+        let mut config = ConfigFile::default();
+        config.cache.directory = PathBuf::from("/media/Cache/xearthlayer-cache");
+        config.packages.install_location =
+            Some(PathBuf::from("/media/FlightSim/XEarthLayer Packages"));
+        config.logging.file = PathBuf::from("/var/log/xel.log");
+        let rows = layout_rows(&config);
+        assert_eq!(
+            row(&rows, "Tile cache"),
+            &PathBuf::from("/media/Cache/xearthlayer-cache")
+        );
+        assert_eq!(
+            row(&rows, "Scenery packages"),
+            &PathBuf::from("/media/FlightSim/XEarthLayer Packages")
+        );
+        assert_eq!(row(&rows, "Log file"), &PathBuf::from("/var/log/xel.log"));
+        assert_eq!(row(&rows, "Configuration"), &config_file_path());
+    }
+
+    #[test]
+    fn an_unset_package_location_shows_the_default() {
+        let mut config = ConfigFile::default();
+        config.packages.install_location = None;
+        assert_eq!(
+            row(&layout_rows(&config), "Scenery packages"),
+            &xearthlayer::paths::packages_dir()
+        );
+    }
+
+    #[test]
+    fn the_manager_opens_only_for_a_yes_at_a_terminal() {
+        for (answer, tty, opens) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            let mut launched = false;
+            offer_manager(answer, tty, || {
+                launched = true;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(launched, opens, "answer {answer}, tty {tty}");
+        }
+    }
+
+    #[test]
+    fn a_failing_manager_reports_its_error() {
+        let result = offer_manager(true, true, || Err(CliError::Config("boom".to_string())));
+
+        assert!(matches!(result, Err(CliError::Config(ref m)) if m == "boom"));
+    }
+
+    #[test]
+    fn the_next_steps_lead_with_the_package_manager() {
+        let steps = next_steps();
+
+        assert!(
+            steps[0].contains("xearthlayer packages"),
+            "the first step should open the package manager, got {:?}",
+            steps[0]
+        );
+        assert!(
+            steps.iter().any(|s| s.contains("packages install")),
+            "the install command should still be listed"
+        );
+    }
 }

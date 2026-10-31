@@ -189,7 +189,7 @@ impl IndexCache {
 
 /// Get the default cache file path.
 pub fn default_cache_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".xearthlayer").join("ortho_union_index.cache"))
+    Some(crate::paths::ortho_union_index_cache())
 }
 
 /// Try to load a valid cached index.

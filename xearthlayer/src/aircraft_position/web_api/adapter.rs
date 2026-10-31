@@ -99,7 +99,10 @@ impl WebApiAdapter {
         // REST — resolve dataref IDs by name
         let all_names = datarefs::all_datarefs();
         let name_refs: Vec<&str> = all_names.to_vec();
-        let id_map = self.client.lookup_datarefs(&name_refs).await?;
+        let id_map = self
+            .client
+            .lookup_datarefs(&name_refs, datarefs::OPTIONAL_DATAREFS)
+            .await?;
 
         let ids: Vec<u64> = id_map.values().copied().collect();
         let id_to_name = invert_id_map(&id_map);

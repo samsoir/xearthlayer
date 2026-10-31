@@ -79,7 +79,6 @@ impl<'a> AircraftPositionWidget<'a> {
             PositionSource::Telemetry => "GPS",
             PositionSource::OnlineNetwork => "Network",
             PositionSource::ManualReference => "Airport",
-            PositionSource::SceneInference => "Inferred",
         }
     }
 
@@ -252,7 +251,7 @@ mod tests {
             "100m"
         );
         assert_eq!(
-            AircraftPositionWidget::format_accuracy(&PositionAccuracy::SCENE_INFERENCE),
+            AircraftPositionWidget::format_accuracy(&PositionAccuracy(100_000.0)),
             "100km"
         );
     }
@@ -268,7 +267,7 @@ mod tests {
             Color::Yellow
         );
         assert_eq!(
-            AircraftPositionWidget::accuracy_color(&PositionAccuracy::SCENE_INFERENCE),
+            AircraftPositionWidget::accuracy_color(&PositionAccuracy(100_000.0)),
             Color::Red
         );
     }
@@ -282,10 +281,6 @@ mod tests {
         assert_eq!(
             AircraftPositionWidget::source_label(&PositionSource::ManualReference),
             "Airport"
-        );
-        assert_eq!(
-            AircraftPositionWidget::source_label(&PositionSource::SceneInference),
-            "Inferred"
         );
     }
 

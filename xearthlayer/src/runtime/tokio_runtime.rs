@@ -20,28 +20,26 @@
 //! storage profile. Both the CPU pool and the disk I/O pool dispatch through
 //! `spawn_blocking`, so their sum is the worst-case simultaneous demand; the
 //! network pool is excluded because it gates async HTTP on worker threads.
-//! A reserve covers the `spawn_blocking` calls that take no permit — startup
+//! A reserve covers the `spawn_blocking` calls that take no permit: startup
 //! scans, the GPU worker, and the fire-and-forget cache writes.
 //!
-//! On a 32-core host that is `40 + 64 + 32 = 136` against tokio's 512.
+//! The demand and prefetch lanes each have their own CPU and disk I/O pools
+//! (#296), so the caller passes
+//! [`LaneSizing::blocking_threads_required`](crate::executor::LaneSizing::blocking_threads_required),
+//! which sums both.
 //!
 //! Sizing from the storage profile instead would under-provision: the SSD
 //! profile yields 64 against the same 104 of pooled demand.
 
-use crate::executor::ResourcePoolConfig;
 use tokio::runtime::Runtime;
 
 /// Build the Tokio runtime that hosts the XEarthLayer daemons.
 ///
 /// Worker threads keep tokio's default (one per core). The blocking pool is
-/// capped at [`ResourcePoolConfig::blocking_threads_required`] rather than the
-/// default 512.
-pub fn build_service_runtime(pools: &ResourcePoolConfig) -> std::io::Result<Runtime> {
-    let max_blocking = pools.blocking_threads_required();
-
+/// capped at `max_blocking` rather than the default 512; production passes
+/// [`LaneSizing::blocking_threads_required`](crate::executor::LaneSizing::blocking_threads_required).
+pub fn build_service_runtime(max_blocking: usize) -> std::io::Result<Runtime> {
     tracing::info!(
-        cpu_capacity = pools.cpu,
-        disk_io_capacity = pools.disk_io,
         max_blocking_threads = max_blocking,
         "Building service Tokio runtime"
     );
@@ -55,6 +53,7 @@ pub fn build_service_runtime(pools: &ResourcePoolConfig) -> std::io::Result<Runt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::{LaneSizing, ResourcePoolConfig};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc;
@@ -70,9 +69,21 @@ mod tests {
     fn blocking_pool_is_capped_at_the_derived_limit() {
         // Small explicit capacities keep the test fast and independent of the
         // host's core count.
-        let pools = ResourcePoolConfig::new(4, 2, 2);
-        let cap = pools.blocking_threads_required();
-        let runtime = build_service_runtime(&pools).expect("runtime builds");
+        let cap = ResourcePoolConfig::new(4, 2, 2).blocking_threads_required();
+        assert_pool_is_capped_at(cap);
+    }
+
+    /// The production cap covers both lanes and must bind just the same.
+    #[test]
+    fn blocking_pool_honours_a_lane_sizing_cap() {
+        let sizing = LaneSizing::derive(ResourcePoolConfig::new(4, 2, 2), 0.5);
+        let cap = sizing.blocking_threads_required();
+        assert!(cap > ResourcePoolConfig::new(4, 2, 2).blocking_threads_required());
+        assert_pool_is_capped_at(cap);
+    }
+
+    fn assert_pool_is_capped_at(cap: usize) {
+        let runtime = build_service_runtime(cap).expect("runtime builds");
 
         let running = Arc::new(AtomicUsize::new(0));
         // Held by every blocking task; dropping the sender releases them.
@@ -154,7 +165,8 @@ mod tests {
     #[test]
     fn runtime_has_time_and_io_drivers_enabled() {
         let runtime =
-            build_service_runtime(&ResourcePoolConfig::default()).expect("runtime builds");
+            build_service_runtime(ResourcePoolConfig::default().blocking_threads_required())
+                .expect("runtime builds");
         runtime.block_on(async {
             tokio::time::sleep(Duration::from_millis(1)).await;
         });

@@ -1,5 +1,13 @@
 # Aircraft Position & Telemetry Architecture
 
+> **Status (2026-10-20):** Module 3 (the Scene Tracker) and the APT
+> `InferenceAdapter` described below were deleted in #204. Neither had a
+> production consumer on any platform, and on macOS the kernel page cache hides
+> the repeat reads they were designed around. The live position sources are the
+> X-Plane Web API, an online ATC network and a manual reference; `PositionSource`
+> has no `SceneInference` variant. The Scene Tracker sections stay as the record
+> of a design that was built and then removed.
+
 This document specifies the architecture for aircraft position tracking, scene loading analytics, and prefetch coordination in XEarthLayer.
 
 ## Overview & Philosophy

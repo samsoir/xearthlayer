@@ -1,7 +1,7 @@
 //! Package Manager for discovering, downloading, and managing XEarthLayer scenery packages.
 //!
 //! This module provides the client-side package management functionality, complementing
-//! the [`publisher`](crate::publisher) module which handles package creation.
+//! the `xearthlayer-publisher` crate, which handles package creation.
 //!
 //! # Overview
 //!
@@ -38,7 +38,9 @@
 //! let installed = manager.list_installed()?;
 //! ```
 
+mod aside;
 mod cache;
+mod cancel;
 mod client;
 mod config;
 mod disk_check;
@@ -49,27 +51,33 @@ mod install_guard;
 mod installer;
 mod local;
 mod mounts;
+mod queue;
+mod sizes;
 mod symlinks;
 mod traits;
 mod updates;
 
 pub use cache::{CacheStats, CachedLibraryClient};
+pub use cancel::CancelToken;
 pub use client::HttpLibraryClient;
 pub use config::ManagerConfig;
-pub use disk_check::{
-    check_disk_space, FsInfoProvider, RealFsInfoProvider, SPACE_BUFFER_MULTIPLIER,
-};
+pub use disk_check::{available_bytes, FsInfoProvider, RealFsInfoProvider, TREE_MULTIPLIER};
 pub use download::{
     DownloadProgress, DownloadProgressCallback, DownloadState, MultiPartDownloader, PartState,
 };
 pub use error::{ManagerError, ManagerResult};
-pub use extractor::{check_required_tools, ShellExtractor};
-pub use installer::{InstallProgressCallback, InstallResult, InstallStage, PackageInstaller};
-pub use local::{InstalledPackage, LocalPackageStore, MountStatus};
+pub use extractor::TarGzExtractor;
+pub use installer::{InstallResult, InstallStage, PackageInstaller};
+pub use local::{InstalledPackage, LocalPackageStore};
 pub use mounts::{ActiveMount, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder};
+pub use queue::{
+    CancelResult, Canceller, Capacity, InstallContext, InstallQueue, Job, JobEvent, JobId, JobKind,
+    JobOutcome, JobSummary, QueueControl, QueueObserver, Stages,
+};
 pub use symlinks::{
-    consolidated_overlay_exists, create_consolidated_overlay, remove_consolidated_overlay,
-    remove_overlay_symlink, ConsolidatedOverlayResult, CONSOLIDATED_OVERLAY_NAME,
+    consolidated_overlay_exists, create_consolidated_overlay, create_consolidated_overlay_except,
+    remove_consolidated_overlay, remove_overlay_symlink, ConsolidatedOverlayResult,
+    CONSOLIDATED_OVERLAY_NAME,
 };
 pub use traits::{ArchiveExtractor, LibraryClient, PackageDownloader, ProgressCallback};
 pub use updates::{PackageInfo, PackageStatus, UpdateChecker};

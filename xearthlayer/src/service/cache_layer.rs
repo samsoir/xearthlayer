@@ -21,6 +21,9 @@
 //! │  │  chunk_disk_service ──► DiskCacheBridge ────────┘      │      │
 //! │  │       │                                                 │      │
 //! │  │       └──► GC daemon (chunk budget)                    │      │
+//! │  │                                                         │      │
+//! │  │  lit_disk_service (only with night lighting enabled)   │      │
+//! │  │       └──► GC daemon (5% of the disk budget)           │      │
 //! │  └────────────────────────────────────────────────────────┘      │
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
@@ -55,6 +58,32 @@ use crate::metrics::MetricsClient;
 use crate::service::config::ServiceConfig;
 use crate::service::error::ServiceError;
 
+/// Fixed share of `cache.disk_size` given to night lighting payloads.
+pub const LIT_DISK_SHARE: f64 = 0.05;
+
+/// Disk budgets per tier, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskBudgets {
+    pub dds: u64,
+    pub chunk: u64,
+    /// `None` when night lighting is off.
+    pub lit: Option<u64>,
+}
+
+/// Disk budgets per tier. Night lighting takes its fixed share first, so
+/// the DDS/chunk ratio keeps its meaning and the sum never exceeds
+/// `disk_size`; without night lighting the split is the one before it.
+pub fn disk_budgets(disk_size: u64, dds_ratio: f64, night_enabled: bool) -> DiskBudgets {
+    let lit = night_enabled.then_some((disk_size as f64 * LIT_DISK_SHARE) as u64);
+    let rest = disk_size - lit.unwrap_or(0);
+    let dds = (rest as f64 * dds_ratio) as u64;
+    DiskBudgets {
+        dds,
+        chunk: rest - dds,
+        lit,
+    }
+}
+
 /// Cache layer encapsulating the three-tier cache hierarchy.
 ///
 /// This struct owns all cache services and their bridge adapters,
@@ -64,6 +93,9 @@ use crate::service::error::ServiceError;
 /// - **Memory** (moka LRU): Fastest, serves active FUSE reads
 /// - **DDS Disk** (LRU + GC): Persistent DDS tiles, avoids re-encoding
 /// - **Chunk Disk** (LRU + GC): Raw imagery chunks, requires assembly + encoding
+///
+/// With night lighting enabled there is also a **Lit Disk** tier (5% of the
+/// disk budget) holding generated lit texture payloads.
 pub struct CacheLayer {
     /// Memory cache service (owns LRU eviction).
     memory_service: CacheService,
@@ -73,6 +105,10 @@ pub struct CacheLayer {
 
     /// Chunk disk cache service (raw imagery chunks on disk).
     chunk_disk_service: CacheService,
+
+    /// Lit disk cache service (night lighting payloads); `None` when night
+    /// lighting is off.
+    lit_disk_service: Option<CacheService>,
 
     /// Memory cache bridge (implements executor::MemoryCache).
     memory_bridge: Arc<MemoryCacheBridge>,
@@ -89,10 +125,13 @@ impl CacheLayer {
     ///
     /// This method:
     /// 1. Creates memory cache service
-    /// 2. Computes DDS/chunk disk budgets from `disk_size * dds_disk_ratio`
+    /// 2. Computes disk budgets: night lighting's 5% first (only when
+    ///    enabled), then DDS/chunk from `dds_disk_ratio` of the rest
     /// 3. Creates DDS disk cache service at `{disk_dir}/{provider}/dds/`
     /// 4. Creates chunk disk cache service at `{disk_dir}/{provider}/`
-    /// 5. Creates bridge adapters for executor integration
+    /// 5. When night lighting is enabled, creates the lit disk cache
+    ///    service at `{disk_dir}/night/`
+    /// 6. Creates bridge adapters for executor integration
     ///
     /// # Arguments
     ///
@@ -118,15 +157,15 @@ impl CacheLayer {
             .unwrap_or(DEFAULT_DDS_DISK_RATIO);
 
         // Compute per-tier disk budgets
-        let dds_disk_budget = (disk_size as f64 * dds_ratio) as u64;
-        let chunk_disk_budget = disk_size - dds_disk_budget;
+        let budgets = disk_budgets(disk_size, dds_ratio, config.night_enabled());
+        let dds_disk_budget = budgets.dds;
+        let chunk_disk_budget = budgets.chunk;
 
         // Get cache directory with default
-        let disk_dir = config.cache_directory().cloned().unwrap_or_else(|| {
-            dirs::cache_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join("xearthlayer")
-        });
+        let disk_dir = config
+            .cache_directory()
+            .cloned()
+            .unwrap_or_else(crate::paths::tile_cache_dir);
 
         let gc_interval = Duration::from_secs(config.disk_gc_interval_secs());
 
@@ -188,7 +227,34 @@ impl CacheLayer {
             "Chunk disk cache service started in CacheLayer"
         );
 
-        // 4. Create bridge adapters
+        // 4. Start the lit disk cache service, only with night lighting on.
+        // It reports no metrics: `DiskTier::Lit` has no counters yet.
+        let lit_disk_service = match budgets.lit {
+            Some(lit_budget) => {
+                let lit_disk_dir = disk_dir.join("night");
+                let lit_config = ServiceCacheConfig::disk(
+                    lit_budget,
+                    lit_disk_dir.clone(),
+                    gc_interval,
+                    "night".to_string(),
+                )
+                .as_lit_tier();
+
+                let service = CacheService::start(lit_config).await.map_err(|e| {
+                    ServiceError::CacheError(format!("Lit disk cache start failed: {}", e))
+                })?;
+
+                info!(
+                    max_size_bytes = lit_budget,
+                    directory = %lit_disk_dir.display(),
+                    "Lit disk cache service started"
+                );
+                Some(service)
+            }
+            None => None,
+        };
+
+        // 5. Create bridge adapters
         let memory_bridge = Arc::new(MemoryCacheBridge::new(memory_service.cache()));
         let dds_disk_bridge = Arc::new(DdsDiskCacheBridge::new(dds_disk_service.cache()));
         let disk_bridge = Arc::new(DiskCacheBridge::with_metrics(
@@ -202,6 +268,7 @@ impl CacheLayer {
             memory_service,
             dds_disk_service,
             chunk_disk_service,
+            lit_disk_service,
             memory_bridge,
             dds_disk_bridge,
             disk_bridge,
@@ -269,6 +336,22 @@ impl CacheLayer {
         self.dds_disk_service.disk_provider()
     }
 
+    /// Get the lit disk cache provider for GC scheduler integration.
+    ///
+    /// `None` when night lighting is off.
+    pub fn lit_disk_provider(&self) -> Option<Arc<crate::cache::DiskCacheProvider>> {
+        self.lit_disk_service
+            .as_ref()
+            .and_then(|s| s.disk_provider())
+    }
+
+    /// Get the raw lit disk cache for direct access.
+    ///
+    /// `None` when night lighting is off.
+    pub fn lit_disk_cache(&self) -> Option<Arc<dyn Cache>> {
+        self.lit_disk_service.as_ref().map(|s| s.cache())
+    }
+
     /// Scan and report the initial disk cache sizes.
     ///
     /// Scans both DDS and chunk disk cache directories to count existing data.
@@ -316,6 +399,11 @@ impl CacheLayer {
         info!("Shutting down CacheLayer");
 
         // Shutdown in reverse order
+        if let Some(lit) = self.lit_disk_service {
+            lit.shutdown().await;
+            info!("Lit disk cache service shut down");
+        }
+
         self.chunk_disk_service.shutdown().await;
         info!("Chunk disk cache service shut down");
 
@@ -500,5 +588,79 @@ mod tests {
         if let Ok(cache_layer) = result {
             cache_layer.shutdown().await;
         }
+    }
+
+    #[test]
+    fn night_off_leaves_the_split_as_it_was() {
+        let b = disk_budgets(10_000_000, 0.6, false);
+        assert_eq!(
+            b,
+            DiskBudgets {
+                dds: 6_000_000,
+                chunk: 4_000_000,
+                lit: None
+            }
+        );
+    }
+
+    #[test]
+    fn night_on_takes_five_percent_first() {
+        let b = disk_budgets(10_000_000, 0.6, true);
+        assert_eq!(b.lit, Some(500_000));
+        assert_eq!(b.dds, 5_700_000);
+        assert_eq!(b.chunk, 3_800_000);
+        assert_eq!(
+            b.dds + b.chunk + b.lit.unwrap(),
+            10_000_000,
+            "never over budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn night_off_creates_no_lit_tier_or_directory() {
+        let temp_dir = tempdir().unwrap();
+        let config = create_test_config(temp_dir.path().to_path_buf());
+        let cache_layer = CacheLayer::new(&config, "test", create_test_metrics())
+            .await
+            .unwrap();
+
+        assert!(cache_layer.lit_disk_cache().is_none());
+        assert!(cache_layer.lit_disk_provider().is_none());
+        assert!(!temp_dir.path().join("night").exists());
+
+        cache_layer.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn night_on_creates_the_lit_tier_under_night() {
+        let temp_dir = tempdir().unwrap();
+        let config = ServiceConfig::builder()
+            .cache_directory(temp_dir.path().to_path_buf())
+            .cache_memory_size(1_000_000)
+            .cache_disk_size(10_000_000)
+            .cache_dds_disk_ratio(0.6)
+            .disk_gc_interval(3600)
+            .night_enabled(true)
+            .build();
+        let cache_layer = CacheLayer::new(&config, "test", create_test_metrics())
+            .await
+            .unwrap();
+
+        let provider = cache_layer.lit_disk_provider().unwrap();
+        assert_eq!(provider.directory(), &temp_dir.path().join("night"));
+        assert_eq!(provider.max_size_bytes(), 500_000);
+
+        let cache = cache_layer.lit_disk_cache().unwrap();
+        let key = "lit:16:25312:10528";
+        cache
+            .set(key, Bytes::from_static(b"XELLpayload"))
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.get(key).await.unwrap(),
+            Some(Bytes::from_static(b"XELLpayload"))
+        );
+
+        cache_layer.shutdown().await;
     }
 }

@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# One stand-in for every macOS tool the release scripts call, chosen by the
+# name it is invoked as. Each call is logged to $FAKE_LOG; outputs are
+# steered by the FAKE_* variables documented in helpers.sh.
+# FAKE_NOTARY_NO_ID=1 makes notarytool submit fail before printing any id line.
+# FAKE_SPCTL_REJECT=1 makes spctl --assess exit 3 (Gatekeeper rejects the file).
+# FAKE_STAPLE_FAILURES=N makes the first N `stapler staple` calls exit 65.
+set -u
+tool=$(basename "$0")
+echo "$tool $*" >>"$FAKE_LOG"
+last="${!#}"
+
+case "$tool" in
+    uname) echo "${FAKE_UNAME:-Darwin}" ;;
+    security)
+        printf '%s\n' "${FAKE_IDENTITIES:-}"
+        echo "     N valid identities found"
+        ;;
+    codesign | xattr) ;;
+    uuidgen) echo 00000000-0000-0000-0000-000000000000 ;;
+    ditto) : >"$last" ;;
+    spctl)
+        if [ "${1:-}" = "--status" ]; then
+            echo "${FAKE_SPCTL_STATUS:-assessments disabled}"
+        else
+            [ -n "${FAKE_SPCTL_REJECT:-}" ] && { echo "$last: rejected"; exit 3; }
+            echo "$last: accepted"
+            echo "source=${FAKE_SPCTL_SOURCE:-Notarized Developer ID}"
+        fi
+        ;;
+    pkgutil) echo "Status: signed by a developer certificate issued by Apple for distribution" ;;
+    pkgbuild)
+        root=""
+        prev=""
+        for arg in "$@"; do
+            [ "$prev" = "--root" ] && root=$arg
+            prev=$arg
+        done
+        echo "staged: $(ls "$root/usr/local/bin")" >>"$FAKE_LOG"
+        : >"$last"
+        ;;
+    productbuild)
+        prev=""
+        for arg in "$@"; do
+            [ "$prev" = "--distribution" ] && cp "$arg" "$FAKE_DIR/distribution.xml"
+            [ "$prev" = "--resources" ] && ls "$arg" >"$FAKE_DIR/resources.txt" && cp -R "$arg" "$FAKE_DIR/resources"
+            prev=$arg
+        done
+        : >"$last"
+        ;;
+    xcrun)
+        case "$1 ${2:-}" in
+            "notarytool submit")
+                [ -n "${FAKE_NOTARY_NO_ID:-}" ] && { echo "Error: could not reach the notary service"; exit 1; }
+                echo "  id: 4f1e-test"
+                echo "  status: ${FAKE_NOTARY_STATUS:-Accepted}"
+                [ "${FAKE_NOTARY_STATUS:-Accepted}" = "Accepted" ] || exit 1
+                ;;
+            "notarytool log") echo '{"issues": ["fake"]}' ;;
+            "stapler staple")
+                if [ "${FAKE_STAPLE_FAILURES:-0}" -gt 0 ]; then
+                    n=$(cat "$FAKE_DIR/staple.count" 2>/dev/null || echo 0)
+                    echo $((n + 1)) >"$FAKE_DIR/staple.count"
+                    [ "$n" -lt "$FAKE_STAPLE_FAILURES" ] && { echo "Error 65: ticket not found" >&2; exit 65; }
+                fi
+                echo "The staple and validate action worked!"
+                ;;
+            "stapler validate") echo "The staple and validate action worked!" ;;
+            *) echo "fake xcrun: unhandled $*" >&2; exit 64 ;;
+        esac
+        ;;
+    *) echo "fake-tool: unknown tool $tool" >&2; exit 64 ;;
+esac

@@ -36,7 +36,7 @@ impl Default for ManagerConfig {
     fn default() -> Self {
         Self {
             install_dir: PathBuf::from("."),
-            staging_dir: crate::config::config_directory().join("tmp"),
+            staging_dir: crate::paths::temp_dir(),
             library_urls: Vec::new(),
             timeout: Duration::from_secs(30),
             max_concurrent_downloads: 4,

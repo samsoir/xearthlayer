@@ -7,7 +7,18 @@ use std::path::PathBuf;
 
 use clap::Subcommand;
 
-use xearthlayer::package::PackageType;
+use xearthlayer_package::PackageType;
+
+use super::selector::Selection;
+
+/// Help for every `region` argument. They all resolve through
+/// `selector::resolve`, so they share one description.
+const REGION_HELP: &str =
+    "Region code, or the start of one to select a group (e.g. \"NA\", \"NA-CANADA\")";
+
+/// Help for the `regions` of `install` and `remove`, which take several.
+const REGIONS_HELP: &str = "One or more region codes, each a code or the start of one to select \
+     a group (e.g. \"NA\", \"NA-CANADA\")";
 
 /// Package type argument for CLI.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -52,10 +63,14 @@ pub enum PackagesCommands {
         install_dir: Option<PathBuf>,
     },
 
-    /// Install a package from a library
+    /// Install packages from a library
     Install {
-        /// Region code to install (e.g., "na", "eu")
-        region: String,
+        #[arg(help = REGIONS_HELP, required_unless_present = "all", conflicts_with = "all")]
+        regions: Vec<String>,
+
+        /// Install every package of the selected type in the library
+        #[arg(long)]
+        all: bool,
 
         /// Package type
         #[arg(long, value_enum, default_value = "ortho")]
@@ -69,14 +84,14 @@ pub enum PackagesCommands {
         #[arg(long)]
         install_dir: Option<PathBuf>,
 
-        /// Temporary directory for downloads (default: from config or system temp)
+        /// Temporary directory for downloads (default: packages.temp_dir, else the tmp folder in the cache directory)
         #[arg(long)]
         temp_dir: Option<PathBuf>,
     },
 
-    /// Update installed packages
+    /// Update installed packages (all of them when no region is given)
     Update {
-        /// Region code to update (optional, updates all if not specified)
+        #[arg(help = REGION_HELP)]
         region: Option<String>,
 
         /// Package type (optional)
@@ -91,7 +106,7 @@ pub enum PackagesCommands {
         #[arg(long)]
         install_dir: Option<PathBuf>,
 
-        /// Temporary directory for downloads (default: from config or system temp)
+        /// Temporary directory for downloads (default: packages.temp_dir, else the tmp folder in the cache directory)
         #[arg(long)]
         temp_dir: Option<PathBuf>,
 
@@ -100,10 +115,14 @@ pub enum PackagesCommands {
         all: bool,
     },
 
-    /// Remove an installed package
+    /// Remove installed packages
     Remove {
-        /// Region code to remove
-        region: String,
+        #[arg(help = REGIONS_HELP, required_unless_present = "all", conflicts_with = "all")]
+        regions: Vec<String>,
+
+        /// Remove every installed package of the selected type
+        #[arg(long)]
+        all: bool,
 
         /// Package type
         #[arg(long, value_enum, default_value = "ortho")]
@@ -120,7 +139,7 @@ pub enum PackagesCommands {
 
     /// Show detailed information about an installed package
     Info {
-        /// Region code
+        #[arg(help = REGION_HELP)]
         region: String,
 
         /// Package type
@@ -151,7 +170,7 @@ pub struct CheckArgs {
 
 /// Arguments for the install command.
 pub struct InstallArgs {
-    pub region: String,
+    pub selection: Selection,
     pub package_type: PackageType,
     pub library_url: String,
     pub install_dir: PathBuf,
@@ -165,6 +184,9 @@ pub struct InstallArgs {
     /// folder X-Plane reads is left alone. The next `xearthlayer run` will
     /// remove any stale folder. See `packages.disable_overlays` config key.
     pub disable_overlays: bool,
+    /// `packages.xworld_pro`: leave the continents X-World Pro covers out of
+    /// the consolidated overlay, as `xearthlayer run` does.
+    pub xworld_pro: bool,
     /// Number of concurrent part downloads.
     pub concurrent_downloads: usize,
 }
@@ -181,20 +203,28 @@ pub struct UpdateArgs {
     pub custom_scenery_path: Option<PathBuf>,
     /// See `InstallArgs::disable_overlays`.
     pub disable_overlays: bool,
+    /// See `InstallArgs::xworld_pro`.
+    pub xworld_pro: bool,
     /// Number of concurrent part downloads.
     pub concurrent_downloads: usize,
 }
 
 /// Arguments for the remove command.
 pub struct RemoveArgs {
-    pub region: String,
+    pub selection: Selection,
     pub package_type: PackageType,
     pub install_dir: PathBuf,
+    /// Temp directory that holds the queue lock. A removed package is not
+    /// moved here: it is renamed to `.xel-removed-<name>` inside the
+    /// packages root and deleted there.
+    pub temp_dir: PathBuf,
     pub force: bool,
     /// Path to X-Plane Custom Scenery directory for overlay symlinks.
     pub custom_scenery_path: Option<PathBuf>,
     /// See `InstallArgs::disable_overlays`.
     pub disable_overlays: bool,
+    /// See `InstallArgs::xworld_pro`.
+    pub xworld_pro: bool,
 }
 
 /// Arguments for the info command.

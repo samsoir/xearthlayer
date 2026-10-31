@@ -31,6 +31,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - All FUSE operations run asynchronously on the Tokio runtime
    - Shared traits: `FileAttrBuilder`, `DdsRequestor` (SOLID: Interface Segregation)
    - Pattern matching for DDS files: `{row}_{col}_ZL{zoom}.dds`
+   - Virtual DDS files open with `FOPEN_DIRECT_IO` on Linux so every read reaches the handler. macOS serves them through the kernel page cache (direct I/O crashes X-Plane's `mmap` texture loader under macFUSE), so the FUSE read counters under-report there; nothing functional depends on per-read visibility (#204). See `docs/dev/fuse-filesystem.md`
 
 2. **Tile Generation** (`xearthlayer/src/tile/`)
    - `TileGenerator` trait with dependency injection
@@ -41,6 +42,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - Parallel download of 256 chunks (16×16) per tile
    - Configurable concurrency, timeout, and retry logic
    - Failed chunks are not cached (retry on next request); see Cache System for tile-level rules
+   - Retry classification lives in `executor/adapters/provider.rs` `map_provider_error`: transport failures and non-404 statuses are retryable, HTTP 404 is permanent (one attempt) because every shipped provider answers 404 only for "no tile here" (#301). The HTTP clients emit `ProviderError::HttpStatus { status, url }` for non-success responses, so callers match on the code, never on message text
+   - A killed job (FUSE timeout, error policy, shutdown) aborts its in-flight chunk downloads and returns their permits before reporting `Cancelled`; chunks already downloaded keep their cache writes (#300)
 
 4. **DDS Compression** (`xearthlayer/src/dds/`)
    - BC1/BC3 (DXT1/DXT5) compression
@@ -51,10 +54,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `MipmapCompressor` trait for full-pipeline backends (GPU):
      - `GpuEncoderChannel` — Worker-side mipmap streaming, zero-clone channel transfer
    - `MipmapStream` — Memory-efficient iterator yielding one mipmap level at a time (no clones)
+   - `system::encoder_policy` (#203): `EncoderPolicy` chooses the backend from a `HardwareProfile` (the adapters wgpu enumerated). `DefaultEncoderPolicy` honours an explicit `texture.compressor`, warns (log and an amber Status-pane line) when `gpu` is honoured on a host whose only GPU is the one X-Plane renders with (every Apple Silicon Mac, any single-GPU PC), and picks ISPC with no preference; GPU is never auto-selected. The runtime encoder and the wizard's GPU step both go through it, and the profile comes from the one enumeration the GPU path already does (`GpuSelection.host`), never a second one
    - GPU encoding architecture: `mpsc` channel → dedicated pipeline worker → `GpuBlockCompressor`
    - `WgpuCompressor` wraps `block_compression` crate (ISPC kernels ported to WGSL compute shaders)
    - Worker-side tile processing: one channel round-trip per tile, GPU buffer reuse across mipmap levels
-   - `create_gpu_resources()` — shared factory for device/queue/compressor creation (DRY)
+   - `create_gpu_resources()` — shared factory for device/queue/compressor creation (DRY); returns the selected `GpuAdapter`, which reaches the dashboard's Status pane via `EncoderComponents::gpu_adapter` and `ServiceOrchestrator::gpu_adapter()` (never re-enumerate adapters for display: enumeration can take ~30s)
    - GPU pipeline hardening:
      - `map_async` errors propagated via `std::sync::mpsc` (not silently ignored)
      - Worker panic recovery via `catch_unwind` (logs error, sends failure, drains queue, breaks loop)
@@ -62,12 +66,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
      - Structured tracing on buffer lifecycle and error paths
 
 5. **Cache System** (`xearthlayer/src/cache/`, `xearthlayer/src/service/cache_layer.rs`)
-   - Three-tier cache hierarchy: Memory → DDS Disk → Chunk Disk → Network
-   - `CacheLayer` - Service-owned three-tier cache lifecycle with budget management
+   - Three-tier cache hierarchy: Memory → DDS Disk → Chunk Disk → Network, plus a separate lit disk tier when night lighting is on
+   - `CacheLayer` - Service-owned cache lifecycle with budget management: the three tiers, plus the lit disk tier when night lighting is on
    - `CacheService` - Self-contained cache with internal GC daemons
    - `MemoryCacheProvider`: moka-based LRU eviction (default 512MB, staging buffer)
-   - `DiskCacheProvider`: Two instances — DDS tiles and raw chunks, each with own GC
+   - `DiskCacheProvider`: Two instances (DDS tiles and raw chunks), three with night lighting on (plus lit payloads), each with own GC
    - DDS disk cache: Encoded DDS tiles on disk, avoids re-encoding on memory eviction (~3.5ms NVMe read vs ~50-200ms re-encode)
+   - Lit tier (night lighting only, `night.enabled`): generated lit payloads on disk at `{cache_dir}/night/`, read path memory → disk → generate (`night/disk.rs`, `lit_payload_validator`), 5% of `cache.disk_size` taken first with `dds_disk_ratio` splitting the other 95%, own GC daemon on the prefetch lane; entries carry a SHA-256 fingerprint (generator version, brightness, Laminar art and recipe file size+mtime, and the package region each recipe was read from) so a mismatch regenerates. Off means no tier, directory or daemon
    - Shared disk budget: `cache.disk_size` split by `cache.dds_disk_ratio` (default 0.6 = 60% DDS, 40% chunks)
    - DDS disk directory: `{cache_dir}/{provider}/dds/`, chunks keep existing provider directory
    - Region-based disk layout: files in 1°×1° DSF subdirs (e.g., `+33-119/tile_15_12754_5279.cache`)
@@ -79,11 +84,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `migrate_cache()` for migrating flat-layout caches to region layout
    - Bridge adapters for executor integration (MemoryCacheBridge, DdsDiskCacheBridge, DiskCacheBridge)
    - Per-provider cache directories
-   - `cache/integrity`: canonical corruption-handling model shared by every on-disk cache (index cache, scenery index cache, DDS/chunk disk tiers) — bounded reads (`length_ceiling`), atomic durable writes (`write_atomic`, which also creates the parent directory), and invariant-3 satisfied per cache: explicit `discard()` on the disk tiers, unconditional overwrite-on-rebuild for the index caches; see `docs/dev/cache-integrity-design.md`
+   - `cache/integrity`: canonical corruption-handling model shared by every on-disk cache (index cache, scenery index cache, DDS/chunk/lit disk tiers): bounded reads (`length_ceiling`), atomic durable writes (`write_atomic`, which also creates the parent directory), and invariant-3 satisfied per cache: explicit `discard()` on the disk tiers, unconditional overwrite-on-rebuild for the index caches; see `docs/dev/cache-integrity-design.md`
    - `XEarthLayerService::start()` creates `CacheLayer` with proper metrics ordering
 
 6. **Configuration** (`xearthlayer/src/config/`)
-   - INI file at `~/.xearthlayer/config.ini`
+   - INI file at `~/.config/xearthlayer/config.ini` (Linux, honours `$XDG_CONFIG_HOME`) or `~/Library/Application Support/XEarthLayer/config.ini` (macOS). **Never construct this path**: use `paths::config_file()`
    - Auto-detection of X-Plane installation
    - See `docs/configuration.md` for all settings
 
@@ -98,9 +103,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `Job` trait - High-level work unit (e.g., generate a DDS tile, prefetch a region)
    - `Task` trait - Atomic unit of work within a job (e.g., download chunks, encode DDS)
    - `ExecutorDaemon` - Background daemon that receives jobs via channel and executes them
-   - `DdsClient` trait - Abstraction for submitting tile requests (used by FUSE, Prefetch)
+   - `DdsClient` trait - Abstraction for submitting FUSE demand tile requests (`request_dds`); demand only since #296
    - `ChannelDdsClient` - Implementation that sends requests via mpsc channel
-   - Priority scheduling: `ON_DEMAND` > `PREFETCH` > `HOUSEKEEPING`
+   - Priority scheduling inside a lane: `ON_DEMAND` > `PREFETCH` > `HOUSEKEEPING`. FUSE and prefetch no longer share a queue, so priority does not mediate between them
+   - **Two lanes (#296)**: FUSE demand and prefetch each run on their own `ExecutorDaemon` + `JobExecutor` (own coalescer, channels, pools, `tile_generation` group, HTTP semaphore), sharing only the memory, DDS disk and chunk disk caches, plus the GPU encoder worker when `texture.compressor = gpu`. Coalescing is per lane and FUSE always starts its own job (always claim)
+   - **Admission gate**: `ExecutorConfig::admission_gate` (`watch<bool>`). While `true` the executor admits no queued job; admitted jobs run every task. The prefetch lane is gated by demand, the demand lane has no gate. Child jobs bypass admission, and no production job spawns children (`TilePrefetchJob` was deleted)
    - Error policies: `FailFast`, `ContinueOnError`, `PartialSuccess`
    - Resource pools for concurrency limiting by resource type (Network, CPU, DiskIO)
    - See `docs/dev/job-executor-design.md` for full architecture
@@ -111,32 +118,44 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `JobRequest` - Request message with tile, priority, cancellation, and response channel
     - `DdsResponse` - Response with generated DDS data and metadata
     - `RequestOrigin` - Tracks request source (FUSE, Prefetch, Prewarm, Manual)
-    - Peer daemon architecture: FUSE, Prefetch, and Executor are independent daemons
+    - Peer daemon architecture: FUSE, Prefetch, and the two executor daemons are independent
+    - `PrefetchLane` trait (`runtime/lane.rs`) - Where prefetch work runs: `submit`, `submit_with_receipt` (outcome only, never tile bytes) and `load()`. The result of a submission is a complete tile in the primary's DDS disk cache, so a lane could run elsewhere
+    - `LocalPrefetchLane` - The in-process lane (second daemon + executor). Also carries cache GC jobs via the local-only `job_submitter()`, so GC pauses with prefetch
+    - `DemandTracker` (`executor/demand.rs`) - Counts demand jobs in flight with an RAII `DemandGuard` and publishes the pause state the prefetch lane's admission gate reads
+    - `XEarthLayerRuntime` hands each lane to its consumers at construction (FUSE gets the demand client, the coordinator and prewarm get the lane), so FUSE cannot reach the prefetch lane by type
     - Channel as mediator pattern for maximum decoupling
 
-10. **Package Publisher** (`xearthlayer/src/publisher/`)
+10. **Package Publisher** (`xearthlayer-publisher/`, its own crate behind the `xearthlayer-publish` binary since #284; the runtime does not link it, and the shared format lives in `xearthlayer-package/`)
    - Creates distributable scenery packages from Ortho4XP output (ortho tiles and overlays)
    - Repository management with package versioning
-   - Archive building with configurable part sizes
+   - **Library generations** (#333, `generation.rs`, repository format 2.0.0): each scenery world is a folder `v1/`, `v2/`, ... holding its index, `region_metadata.json`, coverage map, `packages/` and `dist/`; the marker records `current <gen>` (header lines only are rewritten, `[config]` is kept) and every path resolves in it, `--library <gen>` for one command. The root index, metadata and coverage of a 1.x repository are FROZEN for pre-0.5 clients: nothing in 2.0.0 writes them, and `Repository::open` refuses 1.x with `UpgradeRequired`. `upgrade --root-as v1` and `library import <gen> --from <dir>` copy library files (root untouched) and move the working folders the index lists; `staging/` stays at the root as a shared work area. The v2 world is promoted this way before beta.1 (#335; runbook)
+   - Archive building with configurable part sizes, in process: the `tar.gz` streams straight into `split`-named parts, each hashed as written (#274)
    - Library index management for package discovery
+   - `delete` retires a package: library index entry, working directory and built archives. Assets already uploaded to a hosting provider are deliberately never touched, because they must outlive the index entry while users are still installing from them
+   - `release` also records `size.<type>.download_bytes` and `size.<type>.installed_bytes` into `region_metadata.json`; a missing file or missing region entry is a warning, not a failed release, because updating the library index is the release
    - `Ortho4XPProcessor` for ortho tiles, `OverlayProcessor` for overlays
+   - DSF files are written as single-entry 7z containers (Laminar profile: LZMA, 16 MiB dictionary) by `DsfCompressor`; X-Plane decodes them natively, XEL never parses them (#124)
+   - `spec_version` on both package formats is enforced: a MAJOR above `SUPPORTED_SPEC_MAJOR` (`package/spec.rs`) is refused with an upgrade message
 
 11. **Predictive Tile Caching** (`xearthlayer/src/prefetch/`)
-    - `AdaptivePrefetchCoordinator` - Self-calibrating prefetch with flight phase detection
+    - `AdaptivePrefetchCoordinator` - Prefetch with flight phase detection
     - `GroundStrategy` - Ring-based prefetching for ground operations (GS < 40kt)
     - `PrefetchBox` - Heading-biased sliding box (speed-proportional extent, proportional 80/20 bias, cruise phase)
-    - `ExtentCalculator` - Speed-proportional box extent: clamped linear ramp 3.5° at 40kt to 6.5° at 450kt
-    - `SceneryWindow` - Window config and dimensions holder
+    - `ExtentCalculator` - Speed-proportional box extent: clamped linear ramp 3.5° at 40kt to `box_extent` (default 7.0°) at 450kt in cruise; the ground box is the full `box_extent`, unbiased
+    - `SceneryWindow` - Window config and dimensions holder; dead code, nothing outside its tests constructs it
     - `BoundaryStrategy` - Region lifecycle management (InProgress/Prefetched/NoCoverage/Deferred)
     - `PhaseDetector` - Ground/Cruise flight phase state machine; reset via `on_ground` from AircraftState on telemetry resume
-    - `PerformanceCalibrator` - Measures throughput during initial load for mode selection
     - `SimState` - Direct sim state detection via X-Plane Web API (paused, on_ground, scenery_loading, replay)
     - `TransitionThrottle` - Grace period + ramp-up after Ground-to-Cruise transition
     - `LoopState` - Per-cycle runner state including `telemetry_paused` flag for stale telemetry safe mode
     - `PrefetchStateObserver` - FUSE-side divergence detector; demotes a `Prefetched`/`NoCoverage` region back to *absent* when FUSE has to generate a tile on demand there, rate-limited to one demotion per region per 120s window
-    - Submits jobs to shared job executor daemon via `DdsClient` trait
-    - Mode selection: Aggressive (>30 tiles/sec), Opportunistic (10-30), or Disabled
+    - Submits tiles to the prefetch lane via the `PrefetchLane` trait; the lane admits nothing while FUSE is waiting on generation (no-harm contract, see `docs/dev/adaptive-prefetch-design.md`)
+    - Prefetch-lane tile jobs start with `CachedTileProbeTask` (`tasks/cached_tile_probe.rs`), which skips tiles already cached when the job is admitted
+    - `PrefetchState` (`prefetch/state.rs`) - the single dashboard state resolved by precedence (Disabled, Paused (demand), Holding (takeoff), Deferred (load), Ramping, Active, Idle)
+    - On or off by `prefetch.enabled` alone (and `run --no-prefetch`). `prefetch.mode` was retired in #340: `aggressive` behaved as `opportunistic`, and `disabled` is folded into `enabled = false` on read by `config::upgrade::FOLDED_VALUES` (a retired key's value moved to a current key; the parser applies folds after every section, and `config upgrade` writes them). The throughput calibrator that was meant to choose a mode was removed in #277; `PerformanceCalibration::default_opportunistic()` survives only as the fixed estimate `PrefetchPlan` budgets with
+    - `SceneryIndex` (`prefetch/scenery_index.rs`) is built from `terrain/` file names, not file contents (#327): `tile_from_ter_name` takes row, column, chunk zoom and sea from an Ortho4XP `.ter` name and computes `LOAD_CENTER` as the Web Mercator centre of chunk (row + 8, col + 8), verified against every `.ter` of a whole installed world; other names are read and parsed. A whole-world rebuild is about 17 s warm instead of about 260 s
     - **Four-tier filtering**: Memory cache → Patched region exclusion (via `GeoIndex`) → Installed package disk (via `OrthoUnionIndex`) → XEL DDS disk cache (the write-only `cached_tiles` local-tracking shadow tier was deleted in #176 after it was confirmed to never be read)
+    - **Backpressure takes the higher of two signals**: `PrefetchLane::load()` (jobs waiting for admission on the prefetch lane, against its `tile_generation` group size) and `fuse_pressure` (memory pinned by open virtual DDS handles, as a fraction of the ceiling in `pinned_budget::PinnedTileBudget`). They diverge at a boundary crossing, where most reads are cache-served and so invisible to the lanes; that collision sets the memory floor per #227. Open handles rather than a read rate because `open`/`release` reach FUSE on every platform and reads do not (macOS page-cache serving). See #246
     - **Two-phase region commit**: Regions marked `InProgress` in GeoIndex during prefetch, promoted to `Prefetched` on completion
     - **Stale telemetry safe mode**: pauses tile submissions when telemetry stale >5s; on resume, reads `on_ground` from AircraftState to reset PhaseDetector before next cycle
     - See `docs/dev/adaptive-prefetch-design.md` for design details
@@ -145,9 +164,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `StateAggregator` - Combines multiple position sources with accuracy-based selection
     - `PositionModel` - Persistent position model refined by best available data
     - `WebApiAdapter` - Connects to X-Plane Web API (REST + WebSocket) for position and sim state
-    - `InferenceAdapter` - Position inference from FUSE file access patterns
     - `FlightPathHistory` - Position history for track derivation
-    - Position sources: Web API (10m), ManualReference (100m), SceneInference (100km)
+    - Position sources: Web API (10m), OnlineNetwork (10m), ManualReference (100m). Position inference from FUSE access patterns (`InferenceAdapter`, `SceneInference`) and the `scene_tracker` module that fed it were deleted in #204: neither had a production caller on any platform
     - Higher accuracy wins; stale high-accuracy can be beaten by fresh lower-accuracy
     - `AircraftState` includes `on_ground: bool` propagated from SimState → WebApiAdapter → aircraft_position → prefetch
 
@@ -162,17 +180,59 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `dds_tile_exists(row, col, zoom)` - Checks if DDS tile exists on disk (used by prefetch)
     - `resolve_lazy_filtered(path, predicate)` - Source-filtered lazy resolution (used by FUSE with GeoIndex)
 
+14. **Package Install Queue** (`xearthlayer/src/manager/queue/`)
+    - `InstallQueue`: a downloader thread and an installer thread; downloads run ahead of installs, installs run one at a time in order. `PackageInstaller` does the work as its `Stages`. A panicking stage fails only its own job
+    - Sizes (#324, #325): `InstalledPackage::size_bytes()` is lazy, so `run` never sizes anything. `manager/sizes.rs` `SizeRecord` keeps sizes in `{install_location}/.xearthlayer-package-sizes` (beside the packages, never inside one: a package folder's mtime keys the ortho union index cache); the installer records `Extracted::bytes` after the swap, an unrecorded package is walked once on first use and recorded, and an entry counts only while the package's version and metadata file mtime match
+    - `DiskLedger` budgets two filesystems: a package's parts (`s`) on temp until it installs or fails, and its estimated tree (`TREE_MULTIPLIER` = 3, times `s`) on the packages filesystem, which stays charged once installed. `Capacity::Split` waits on temp and refuses on packages; `Capacity::Shared` (one device) admits only if `installed + sum(3*s before j) + 3*s[j] + sum(s from j)` fits for every admitted j. The installer never waits, so the threads cannot deadlock. `Stages::capacity` is read once per busy period, never mid-install
+    - Removes (`packages remove` too) skip the downloader; `submit` refuses a second job for the same package
+    - `CancelToken` per job, checked per buffer and per tar entry; the tree is extracted from the verified parts straight into `.xel-staging-*` beside its destination (no joined archive; each part is deleted once read), then the swap (`manager/aside.rs`: rename old aside, rename staged in, delete old after `end_swap`) is the only step that cannot be cancelled. A cancelled job finishes only after its temp tree is deleted (a downloaded one waits in `Phase::Cancelling`), so `wait_for` returning means temp is clean; `abandon` does not wait
+    - `flock` on `{temp_dir}/.queue.lock` allows one package operation at a time; `sweep` runs on the queue's downloader thread (`start` returns at once, no job starts until it is done) and deletes `install_*`, `.xel-staging-*` and `.xel-removed-*` leftovers, and renames a `.xel-aside-*` back when its package folder is missing (else deletes it). A remove renames straight to `.xel-removed-<name>` before its slow delete, so an interrupted remove is never restored as a half-deleted package; the aside rule applies only between a swap's two renames
+    - CLI signals (`xearthlayer-cli/src/signals.rs`): first SIGINT cancels, a second one or SIGTERM/SIGHUP abandons (exit 130, 143, 129 by the first signal); a stop request is remembered across the per-package queues of a multi-package remove; with no queue running, the default action. `run` is on it too (#314): `SignalWatch::start_for_shutdown` raises the shutdown flag its dashboard and headless loop poll on any of the three, the first signal gives the exit code (`CliError::Stopped`), and the mount comes down even when the dashboard failed on the dead terminal. SIGHUP also points stdout and stderr at `/dev/null` (`detach_terminal`): `println!` and ratatui's `Terminal` drop panic on a write to a dead terminal, which turned a clean exit into exit 101. crossterm is built with `use-dev-tty` because its default event source loops forever once the terminal is hung up, so neither TUI would ever see the flag
+    - Logging (#320): `xearthlayer-cli/src/logging_init.rs` `LogTarget`, decided per command by `main.rs` `log_target` (exhaustive). Only `run` writes `logging.file` (truncated at start); the `packages` commands and the manager append to `paths::packages_log_file()` (`xearthlayer-packages.log` in the state directory, one "Session started" line per command); every other command writes no log file. Nothing but `run` may open `xearthlayer.log`
+
+14b. **Package Manager TUI** (`xearthlayer-cli/src/ui/packages/`)
+    - `xearthlayer packages` with no subcommand opens it when stdin and stdout are terminals; otherwise the command help prints. `xearthlayer setup` offers it at the end (`offer_manager`). Four tabs: Local, Library, Progress, Settings
+    - `AppState::update(Input, Instant) -> Vec<Effect>` (`app.rs`) is pure: no terminal, network or disk, so every rule is tested by calling it. `Effects` (`effects.rs`) carries the effects out and answers with `Msg`s on one channel; slow reads run on a worker thread
+    - The `InstallQueue` starts on the first job and is released (with its `.queue.lock`) when idle, after one overlay rebuild if an overlay changed. `ChannelObserver` runs under the queue's lock, so it only does an unbounded `send`
+    - The `actions` module (`commands/packages/actions.rs`) is shared with the CLI handlers: `library_status`, `plan_install`, `check_removal`/`check_replacement` (`RunActive`), `RESTART_NOTE`, `rebuild_overlays`
+    - While `xearthlayer run` is alive (`system::process::running_instance` on `paths::lock_file()`), updates, deletes and installs over an installed package are refused; new packages install. The banner and keypress refusals use the cached answer; `Effects` checks again when it carries out `Remove` or `Submit` (whose `replacing` names the installed packages). This replaced a mount-point check that never fired after consolidated mounting
+    - Settings tab (#336): the `[packages]` keys of `config::help::PACKAGES_SETTINGS`, help from `config::help`, the one source for the TUI and the `config.ini` comments. Saved through `ConfigKey::set` and an atomic `ConfigFile::save_to`; the `Effects` settings are an `Arc<RwLock<Settings>>` read per job, so a saved value reaches the next queue. Read-only while `run` is active or any job is unfinished (`AppState::settings_refusal`)
+    - `JobId`s come from one process-wide counter, so the job rows the TUI keeps across released queues never share an id
+    - `runner.rs`: 50 ms key poll, 1 s tick, every signal handled so the terminal is restored; first external SIGINT quits as a confirmed `q`, a later one or SIGTERM abandons, SIGHUP abandons and stops drawing (exit 130, 143, 129)
+    - See `docs/package-management.md` (user) and `docs/dev/package-manager-design.md` (design)
+
 15. **Version Update Checker** (`xearthlayer/src/update/`)
     - `VersionManifest` - Serde model for remote `version.json`
     - `UpdateInfo` - Update notification data (current version, latest version, homepage)
     - `UpdateChecker` trait - Abstraction for version checking (dependency injection)
     - `RemoteUpdateChecker` - Production implementation with HTTP fetch and 24h disk cache
     - Non-blocking: spawned on Tokio runtime, never delays startup
-    - Cache at `~/.xearthlayer/version_check.json` (mtime-based 24h expiry)
+    - Cache at `paths::version_check_file()`, in the state directory (mtime-based 24h expiry)
     - TUI dashboard shows persistent footer when update available
     - Configurable via `general.update_check` (default: true)
 
-16. **GeoIndex** (`xearthlayer/src/geo_index/`)
+16. **Path Resolution** (`xearthlayer/src/paths/`)
+    - `BaseDirectories` trait with `XdgDirectories`, `AppleDirectories`, `LegacyDirectories` and a test double
+    - Four roles: config, cache, data, state. **macOS collapses config and data into one directory** and has no `dirs::state_dir()`, so the platforms differ in shape and not only in values
+    - Role accessors (`config_file()`, `packages_dir()`, `log_file()`, ...) are the only supported way to get a path. **Never construct one from `home_dir()`**
+    - Platform selected with `cfg!`, not `#[cfg]`, so both implementations are compiled and tested everywhere
+    - `LAYOUT_VERSION` and `general.layout_version` record which layout a config conforms to; **0 means pre-0.5.0**, and `ConfigFile::default()` uses 0 deliberately because the parser overlays a file onto the defaults
+    - One site intentionally still names `~/.xearthlayer`: `preflight/mod.rs` `legacy_default_packages_dir()`, which detects a pre-XDG install
+    - See `docs/directory-layout.md` and `docs/dev/preflight-design.md`
+
+17. **Preflight Checks** (`xearthlayer/src/preflight/`, `xearthlayer-cli/src/preflight/`)
+    - `Preflight<C>` trait and `Runner<C>` in the library, generic over context; the concrete checks live in the CLI
+    - Executed in `main()` **before command dispatch**, so `run` and `setup` get the same answer to "does this installation exist"
+    - `BootstrapContext` accumulates validated inputs (config, install location, Custom Scenery path); carries **inputs, not constructed services**
+    - Registration order is execution order, asserted by test. No dependency graph
+    - `inspect` is pure and `remediate` acts, so the registry can also be run as a report; remediation is verified by a second inspection
+    - Checks never call one another. A check reading an absent contributed value returns `Unsatisfied` **naming** it rather than unwrapping
+    - Platform exclusion uses `cfg!` in `applies()`, not `#[cfg]`, so macOS-only checks are still compiled and tested on Linux
+    - X-World Pro (#213): `xworld-pro-detect` contributes `xearthlayer::xworld_pro::Detection` when `packages.xworld_pro` is on (hint only when off), `xworld-pro-order` stops or continues on a bad `scenery_packs.ini` order via an injected `ConfirmOrder` (asks only when stdin and stderr are terminals, one key, `s` or `c`; a `c` is remembered as a SHA-256 of the file in `paths::xworld_order_accepted_file()` until it changes; #326), `xworld-pro-setup` warns; overlay consolidation leaves active continents out via `OrchestratorConfig.xworld_pro`. See `docs/x-world-pro.md`
+    - Warnings go to stderr, the log (WARN, with the check name) and `BootstrapContext::startup_warnings`; the dashboard's Status pane shows their count, because it replaces the screen they were printed on (#326)
+    - See `docs/dev/preflight-design.md`
+
+18. **GeoIndex** (`xearthlayer/src/geo_index/`)
     - `GeoIndex` - Type-keyed, region-indexed geospatial reference database (thread-safe, ACID)
     - `DsfRegion` - 1°×1° DSF region coordinate type
     - `GeoLayer` trait - Marker trait for storable layer types (`Clone + Send + Sync + 'static`)
@@ -185,6 +245,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - Used by FUSE (`is_geo_filtered`), prewarm, and prefetch for patch region exclusion and prefetch state tracking
     - See `docs/dev/geo-index-design.md` for design details
 
+19. **Night Lighting** (`xearthlayer/src/night/`)
+    - Recipe reader (`recipe.rs`): OXO `.oxn` format 1
+    - `RecipeStore` (`store.rs`): recipes found via each ortho source path, `night/<block>/<tile>.oxn`
+    - `LitTextureSource` / `BlackLitSource` (`service.rs`) and the 152-byte minimal black DDS (`layout.rs`)
+    - FUSE routes `_LIT.dds` names (`TextureKind::Lit`, `LIT_INODE_FLAG`) to the lit source, never the executor
+    - Phase 2a: `NightLitSource` (`service.rs`) answers lit `stat`/`open` with the real file size for the player's texture setting; `LaminarArt` (`laminar/`) reads the installed lit art, `StartupTextureSetting` (`prefs.rs`) reads the setting once at start, and `footprint.rs` gives a texture's ground footprint (whether it has light is `RecipeField::has_light`, phase 2b) and `layout.rs` (`LitLayout`) sizes the file. Wired by `MountManager::set_night_lighting` from `night.enabled` (default true); when the X-Plane installation is not found the black default stays. The outcome is recorded as `night::NightLighting` (Off, Lit, Dark) and read by the dashboard's Status pane through `ServiceOrchestrator::night_lighting()`
+    - Generator (`generator/`): `LitGenerator::generate(&LitRequest) -> RgbaImage` is infallible and `encode_visible` BC1-encodes with the default ISPC encoder, dimming the first visible level to 2/3 of the light (`FADE_RAMP`, sRGB-corrected) so X-Plane's level-by-level page-in fades a texture out in two steps; the first visible level stays fixed in metres at every texture setting because the blank level's texel size sets the cut-out distance; every lit read is logged at debug (`Night lighting: lit read`) with its offset. `CpuLitGenerator` (`cpu.rs`) computes each texel from its ground position alone: `RecipeField` (`field.rs`) gives bilinear brightness and class weights from globally indexed cells (warped by value noise, `noise.rs`, so class edges are soft and cross 1 degree tiles), `gain.rs` maps VIIRS radiance and `night.brightness` (0.5 to 1.5) to a gain, and `tiling.rs` samples the Laminar pattern decoded by `laminar/pattern.rs` with hex stochastic tiling in Web Mercator metres; the LED stage (`led.rs`) turns neighbourhood patches LED white by class, VIIRS brightness and package region, keeping luminance times `LedModel::energy`, and sodium texels keep their bytes. `NightLitSource` serves the result after the blank levels via `LitLayout::read_lit`: payloads cached in memory (256 MB) keyed `(row, col, zoom)` and on disk (the lit tier, see Cache System), concurrent reads of one footprint coalesced (moka `optionally_get_with`), generation permits `(cores / 8).clamp(2, 4)`, 2 probe permits and 2 lit disk permits held inside `BLOCKING_POOL_HEADROOM` by a compile-time assertion, recipe reads retried twice then given up on per tile for the session (`SessionRecipes`), a generation missing a recipe served full-size black and not cached in memory or on disk, first committed probe answer wins. `has_light` is `RecipeField::has_light`, which follows the generator's sampling model (class reach and bilinear brightness reach, gain above zero) so it never answers dark where the generator lights. Tuning continues by flight
+    - Publisher copies `yOrtho4XP_Night/` recipes into the package's `night/` folder
+    - See `docs/dev/night-lighting-design.md`
+
 ### Module Dependencies
 
 ```
@@ -195,16 +265,16 @@ xearthlayer-cli
             │       └─→ cache/providers (Memory, Disk with internal GC) │
             │                                                            │
             ├─→ runtime (XEarthLayerRuntime orchestrator) ──────────────┤
-            │       └─→ executor (ExecutorDaemon, DdsClient)            │
-            │               └─→ jobs (DdsGenerateJob, TilePrefetchJob)  │
+            │       └─→ executor (2x ExecutorDaemon: demand + prefetch) │
+            │               └─→ jobs (DdsGenerateJob)                   │
             │                       └─→ tasks (DownloadChunks, BuildAndCacheDds) │
             │                                                            │
             ├─→ fuse/fuse3 (async multi-threaded FUSE) ─────────────────┤
-            │       ├─→ uses DdsClient for tile requests                │
+            │       ├─→ uses DdsClient (demand lane) for tile requests  │
             │       └─→ uses GeoIndex for patch region filtering        │
             │                                                            │
             ├─→ prefetch (AdaptivePrefetchCoordinator) ────────────────┘
-            │       └─→ uses DdsClient + GeoIndex for background prefetch
+            │       └─→ uses PrefetchLane + GeoIndex for background prefetch
             │
             ├─→ geo_index (geospatial reference database)
             ├─→ provider (Bing, Go2, Google - async variants)
@@ -225,8 +295,8 @@ Uses **Web Mercator** (Slippy Map) projection:
 - Main thread: CLI and signal handling
 - Tokio runtime: Multi-threaded async runtime for all I/O
   - Worker threads: tokio default (one per core)
-  - Blocking pool: capped at `ResourcePoolConfig::blocking_threads_required()`
-    (`cpu + disk_io + BLOCKING_POOL_HEADROOM`), built by
+  - Blocking pool: capped at `LaneSizing::blocking_threads_required()`
+    (demand `cpu + disk_io` + prefetch `cpu + disk_io` + `BLOCKING_POOL_HEADROOM`), built by
     `runtime::build_service_runtime()` — **not** tokio's 512 default
   - FUSE operations via fuse3 (native async)
   - HTTP downloads via async reqwest
@@ -277,15 +347,22 @@ Diagnosing memory in the field: `docs/dev/memory-telemetry.md`.
 
 All job executor operations are protected by resource pools with semaphore-based
 limiting to prevent resource exhaustion under heavy load. Each resource type has
-tuned concurrency limits:
+tuned concurrency limits. The figures below are the **demand lane's**. The prefetch
+lane has its own pools, sized by `LaneSizing` (`executor/lane_sizing.rs`) as
+`ceil(demand x prefetch.capacity_share)` per pool (default 0.35, range 0.05 to 0.50,
+the only user-facing sizing setting), `tile_generation = 2 x (prefetch cpu + prefetch network)`
+and its own unscaled 1024 HTTP permits (connections cost X-Plane no CPU, and prefetch
+downloads are bound by connections in flight). The old shared-pool prefetch quota
+(`max_prefetch_fraction`, `prefetch_in_flight`) was removed in #296:
 
 - **Network pool (download tasks)**: `clamp(ceil(cpu_capacity * 1.5), 8, 64)` — pipeline-balanced with CPU pool
-- **HTTP semaphore (chunk connections)**: 1024 shared across all download tasks
+- **HTTP semaphore (chunk connections)**: 1024 shared across the demand lane's download tasks
 - **CPU-bound work** (assemble + encode): `max(num_cpus * 1.25, num_cpus + 2)` shared limiter
 - **Disk I/O pool**: `DEFAULT_DISK_IO_CAPACITY` = 64, flat
-- **Tokio blocking pool**: `cpu + disk_io + BLOCKING_POOL_HEADROOM` — the CPU
-  and disk I/O pools both dispatch through `spawn_blocking`, so their sum is
-  the worst-case demand for blocking threads (#227)
+- **Tokio blocking pool**: `LaneSizing::blocking_threads_required()` = demand
+  `cpu + disk_io` + prefetch `cpu + disk_io` + `BLOCKING_POOL_HEADROOM`. The CPU
+  and disk I/O pools of both lanes dispatch through `spawn_blocking`, so their
+  sum is the worst-case demand for blocking threads (#227)
 
 The `ResourcePool` struct (`executor/resource_pool.rs`) manages concurrency by
 resource type. Each task declares its `ResourceType` and the executor acquires
@@ -309,18 +386,21 @@ xearthlayer run --no-prefetch       # Disable prefetch system
 xearthlayer run --airport ICAO      # Pre-warm tiles around airport before starting
 xearthlayer download --lat --lon    # Download single tile
 xearthlayer diagnostics             # Show system info, config, and health status
-xearthlayer cache clear|stats|migrate # Cache management
+xearthlayer cache clear|stats       # Cache management
+xearthlayer migrate [layout|status]  # Move between directory layouts (--dry-run supported)
 
 # Scenery index cache
 xearthlayer scenery-index status    # Show cache status and tile counts
 xearthlayer scenery-index update    # Rebuild index from installed packages
 xearthlayer scenery-index clear     # Delete the cache file
 
-# Package management
+# Package management (<reg> may be the start of a code: NA, NA-CANADA; #293)
+xearthlayer packages                # Package manager TUI (no subcommand; command help without a terminal)
 xearthlayer packages list           # List installed/available packages
-xearthlayer packages install <reg>  # Install a regional package
+xearthlayer packages install <reg>... # Install every package the codes select (or --all)
 xearthlayer packages update [reg]   # Update packages
-xearthlayer packages remove <reg>   # Remove a package
+xearthlayer packages remove <reg>...  # Remove packages (or --all; whole set validated, one prompt)
+xearthlayer packages info <reg>     # Show installed package details
 xearthlayer packages check          # Check for updates
 
 # Configuration management
@@ -330,20 +410,24 @@ xearthlayer config get <key>        # Get a setting (e.g., packages.library_url)
 xearthlayer config set <key> <val>  # Set a setting with validation
 xearthlayer config upgrade          # Add missing settings with defaults (backup created)
 
-# Publisher commands (create scenery packages)
-xearthlayer publish init [<path>]           # Initialize package repository
-xearthlayer publish scan --source <path> [--type <ortho|overlay>]  # Scan Ortho4XP output
-xearthlayer publish add --source <path> --region <code> --type <ortho|overlay>  # Process tiles/overlays
-xearthlayer publish list                    # List packages
-xearthlayer publish build --region <code>   # Create archives
-xearthlayer publish urls --region <code> --base-url <url>  # Configure URLs
-xearthlayer publish version --region <code> --bump <type>  # Manage versions
-xearthlayer publish release --region <code> --metadata-url <url>  # Release
-xearthlayer publish status                  # Show release status
-xearthlayer publish validate                # Validate repository
-xearthlayer publish coverage [--dark] [--geojson] [-o <file>] [--metadata <path>]  # Generate coverage map
-xearthlayer publish dedupe --region <code> [--priority <mode>] [--tile <lat,lon>] [--dry-run]  # Remove overlapping ZL tiles
-xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o <file>]  # Analyze coverage gaps
+# Publisher commands: the separate xearthlayer-publish binary (#284)
+xearthlayer-publish init [<path>]           # Initialize package repository
+xearthlayer-publish scan --source <path> [--type <ortho|overlay>]  # Scan Ortho4XP output
+xearthlayer-publish add --source <path> --region <code> --type <ortho|overlay>  # Process tiles/overlays
+xearthlayer-publish list                    # List packages
+xearthlayer-publish build --region <code>   # Create archives
+xearthlayer-publish urls --region <code> --base-url <url>  # Configure URLs
+xearthlayer-publish version --region <code> --bump <type>  # Manage versions
+xearthlayer-publish release --region <code> --metadata-url <url>  # Release
+xearthlayer-publish status                  # Show release status
+xearthlayer-publish validate                # Validate repository
+xearthlayer-publish coverage [--dark] [--geojson] [-o <file>] [--metadata <path>]  # Generate coverage map
+xearthlayer-publish dedupe --region <code> [--priority <mode>] [--tile <lat,lon>] [--dry-run]  # Remove overlapping ZL tiles
+xearthlayer-publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o <file>]  # Analyze coverage gaps
+xearthlayer-publish delete --region <code> [--type <ortho|overlay>] [--dry-run] [--yes]  # Remove a package
+xearthlayer-publish upgrade --root-as v1 [--dry-run]       # Format 1.x to library generations (root library frozen)
+xearthlayer-publish library list|new <gen>|use <gen>|import <gen> --from <dir>  # Library generations (#333)
+xearthlayer-publish --library <gen> <command>              # Any command in another generation
 ```
 
 ## Key Files
@@ -351,11 +435,17 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | File | Purpose |
 |------|---------|
 | `xearthlayer-cli/src/main.rs` | CLI entry point |
-| `xearthlayer-cli/src/commands/publish/` | Publisher CLI (Command Pattern) |
+| `xearthlayer-publish/src/` | Publisher CLI binary (Command Pattern) |
 | `xearthlayer-cli/src/commands/config.rs` | Config CLI commands |
 | `xearthlayer/src/service/facade.rs` | Main service API, wires up runtime |
 | `xearthlayer/src/runtime/orchestrator.rs` | XEarthLayerRuntime - daemon orchestrator |
 | `xearthlayer/src/runtime/request.rs` | JobRequest, DdsResponse, RequestOrigin types |
+| `xearthlayer/src/runtime/lane.rs` | PrefetchLane trait, LocalPrefetchLane, LaneReceipt |
+| `xearthlayer/src/executor/demand.rs` | DemandTracker and DemandGuard (demand jobs in flight, pause state) |
+| `xearthlayer/src/executor/lane_sizing.rs` | LaneSizing - prefetch lane pools from `prefetch.capacity_share`, blocking-pool cap |
+| `xearthlayer/src/tasks/cached_tile_probe.rs` | CachedTileProbeTask - prefetch-lane admission cache re-check |
+| `xearthlayer/src/metrics/latency.rs` | LatencyWindow - per-sample FUSE latency median, p95, max |
+| `xearthlayer/src/prefetch/state.rs` | PrefetchState and resolve_state - dashboard state by precedence |
 | `xearthlayer/src/executor/daemon.rs` | ExecutorDaemon - background job processor |
 | `xearthlayer/src/executor/client.rs` | DdsClient trait and ChannelDdsClient |
 | `xearthlayer/src/executor/job.rs` | Job trait and JobId, JobResult types |
@@ -367,16 +457,40 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/fuse/fuse3/` | Fuse3 async multi-threaded filesystem |
 | `xearthlayer/src/fuse/fuse3/shared.rs` | Shared FUSE traits (FileAttrBuilder, DdsRequestor) |
 | `xearthlayer/src/fuse/fuse3/ortho_union_fs.rs` | Consolidated ortho FUSE mount |
+| `xearthlayer/src/paths/` | Path resolution: BaseDirectories, platform layouts, role accessors |
+| `xearthlayer-cli/src/preflight/migrate.rs` | Layout migration check |
+| `xearthlayer-cli/src/preflight/proposal.rs` | Migration decision table and guidance (pure) |
+| `xearthlayer/src/preflight/` | Preflight framework: trait, Runner, BootstrapContext |
+| `xearthlayer/src/xworld_pro/` | SimHeaven X-World Pro detection, continent coverage, order rule, setup findings |
+| `xearthlayer-cli/src/preflight/xworld.rs` | The three `xworld-pro-*` checks and `ConfirmOrder` |
+| `xearthlayer-cli/src/preflight/` | The concrete startup checks and the registry |
 | `xearthlayer/src/geo_index/` | GeoIndex geospatial reference database |
 | `xearthlayer/src/ortho_union/` | Ortho union index module |
+| `xearthlayer/src/night/recipe.rs` | OXO `.oxn` recipe reader and validation |
+| `xearthlayer/src/night/store.rs` | RecipeStore - finds and caches recipes per ortho source |
+| `xearthlayer/src/night/service.rs` | LitTextureSource trait, BlackLitSource and NightLitSource |
+| `xearthlayer/src/night/layout.rs` | Lit DDS layout, `minimal_black_dds()` |
+| `xearthlayer/src/night/laminar/` | Laminar lit art reader (`art.rs`, `library.rs`, `ter.rs`) |
+| `xearthlayer/src/night/prefs.rs` | StartupTextureSetting - texture setting read once from `X-Plane.prf` |
+| `xearthlayer/src/night/footprint.rs` | Footprint geometry (`RecipeField::has_light` decides full-size vs minimal) |
+| `xearthlayer/src/night/generator/cpu.rs` | CpuLitGenerator: per-texel lit generation from ground position |
+| `xearthlayer/src/night/generator/tiling.rs` | Hex stochastic tiling of the Laminar pattern in Web Mercator metres |
+| `xearthlayer/src/night/generator/led.rs` | LED lighting model: regions, patches, colour temperature, recolour |
 | `xearthlayer/src/ortho_union/index.rs` | OrthoUnionIndex implementation |
 | `xearthlayer/src/ortho_union/builder.rs` | OrthoUnionIndexBuilder (with progress + caching) |
 | `xearthlayer/src/update/mod.rs` | Version update checking (VersionManifest, UpdateInfo) |
 | `xearthlayer/src/update/checker.rs` | UpdateChecker trait and RemoteUpdateChecker |
 | `xearthlayer/src/config/file.rs` | Configuration loading |
 | `xearthlayer/src/config/keys.rs` | ConfigKey enum with validation (Specification Pattern) |
-| `xearthlayer/src/publisher/` | Package publisher library |
-| `xearthlayer/src/publisher/dedupe/` | Zoom level overlap detection and gap analysis |
+| `xearthlayer/src/manager/queue/` | InstallQueue, DiskLedger, Stages, lock and sweep |
+| `xearthlayer-cli/src/ui/packages/` | Package manager TUI: `app.rs` (pure `AppState::update`), `effects.rs` (effects, worker, `ChannelObserver`), `runner.rs` (loop, signals), `view.rs` and `widgets/` |
+| `xearthlayer-cli/src/commands/packages/actions.rs` | The `actions` module shared by the package commands and the TUI (install planning, `run` refusals, overlay rebuild) |
+| `xearthlayer-cli/src/logging_init.rs` | `LogTarget`: which log a command writes (`run` the flight log, `packages` its own, the rest none) |
+| `xearthlayer-cli/src/signals.rs` | SIGINT/SIGTERM/SIGHUP for the package queue and for `run`'s shutdown flag |
+| `xearthlayer/src/system/process.rs` | `running_instance`, `recorded_pid`: the instance lock reading |
+| `xearthlayer-package/src/` | Scenery package format: metadata, library index, naming, spec version gate (shared by runtime and publisher) |
+| `xearthlayer-publisher/src/` | Package publisher library |
+| `xearthlayer-publisher/src/dedupe/` | Zoom level overlap detection and gap analysis |
 | `xearthlayer/src/prefetch/strategy.rs` | Prefetcher trait (strategy pattern) |
 | `xearthlayer/src/prefetch/adaptive/coordinator/core.rs` | AdaptivePrefetchCoordinator (sliding box prefetch) |
 | `xearthlayer/src/prefetch/adaptive/prefetch_box.rs` | PrefetchBox (heading-biased sliding prefetch region) |
@@ -388,14 +502,14 @@ xearthlayer publish gaps --region <code> [--tile <lat,lon>] [--format <fmt>] [-o
 | `xearthlayer/src/aircraft_position/web_api/datarefs.rs` | X-Plane dataref definitions |
 | `xearthlayer/src/aircraft_position/web_api/sim_state.rs` | SimState - sim state detection (paused, loading, etc.) |
 | `xearthlayer/src/aircraft_position/web_api/config.rs` | Web API connection configuration |
-| `xearthlayer/src/service/cache_layer.rs` | CacheLayer - three-tier cache lifecycle (memory + DDS disk + chunk disk) |
+| `xearthlayer/src/service/cache_layer.rs` | CacheLayer - cache lifecycle (memory + DDS disk + chunk disk, plus lit disk with night lighting on) |
 | `xearthlayer/src/cache/providers/disk.rs` | DiskCacheProvider with internal GC daemon |
 | `xearthlayer/src/cache/adapters/` | Bridge adapters for backward compatibility |
 | `xearthlayer/src/cache/integrity/` | Canonical cache integrity model (`length_ceiling`, `write_atomic`, `discard`, `CacheEntryValidator`) |
 
 ## Configuration
 
-Default config location: `~/.xearthlayer/config.ini`
+Default config location: `~/.config/xearthlayer/config.ini` (Linux) or `~/Library/Application Support/XEarthLayer/config.ini` (macOS). Resolve it with `xearthlayer config path`, never by construction.
 
 Key sections:
 - `[general]` - General settings (update_check)
@@ -403,15 +517,17 @@ Key sections:
 - `[cache]` - Memory/disk sizes, directory, DDS disk ratio
 - `[generation]` - Thread count, timeout
 - `[texture]` - DDS format (bc1/bc3), compressor backend (software/ispc/gpu), GPU device selection
-- `[prefetch]` - Boundary-driven prefetch, web_api_port (default 8086), calibration, transition ramp
+- `[prefetch]` - Boundary-driven prefetch, mode, web_api_port (default 8086), transition ramp
 - `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
-- `[executor]` - Job limits and retry behavior. Resource pool capacities are NOT configurable — they are derived from logical core count by `ResourcePoolConfig::default()` (see #249)
+- `[executor]` - Per-chunk download behaviour only: `request_timeout_secs` and `max_retries`, which reach the executor through `ServiceConfig::chunk_download_config()`. Concurrency is NOT configurable: pool capacities, task dispatch limits and channel capacities are derived from logical core count by `ResourcePoolConfig::default()`. `max_concurrent_jobs` and `retry_base_delay_ms` were removed in #249; the backoff base is a literal in `tasks/download_chunks.rs`
 - `[fuse]` - FUSE kernel limits (max_background, congestion_threshold)
-- `[packages]` - Package manager settings (concurrent_downloads: parallel part downloads 1-10)
+- `[night]` - Night lighting (enabled, default true)
+- `[tui]` - Dashboard display (symbols: auto/emoji/plain; `auto` detection in `xearthlayer-cli/src/ui/symbols.rs`)
+- `[packages]` - Package manager settings (concurrent_downloads: parallel part downloads 1-10). `library_url` defaults to library generation v2, `DEFAULT_LIBRARY_URL` (#334); the pre-0.5 root URL (`LEGACY_LIBRARY_URL`) and the alpha staging URL are retired values (`DEPRECATED_VALUES`) the parser reads as v2, and the layout migration keeps the legacy copy of the config on the old URL for a 0.4.x rollback
 
 See `docs/configuration.md` for full reference.
 
-**IMPORTANT - Deprecating Config Settings**: When removing a configuration key from `ConfigKey` enum in `config/keys.rs`, you MUST add it to `DEPRECATED_KEYS` in `config/upgrade.rs`. This ensures `xearthlayer config upgrade` properly detects and removes the obsolete setting from user config files.
+**IMPORTANT - Deprecating Config Settings**: When removing a configuration key from `ConfigKey` enum in `config/keys.rs`, you MUST add it to `DEPRECATED_KEYS` in `config/upgrade.rs`. This ensures `xearthlayer config upgrade` properly detects and removes the obsolete setting from user config files. If one of the removed key's values still changes behaviour, also add a `FoldedValue` to `FOLDED_VALUES` so that value moves to the current key instead of vanishing with the line (#340).
 
 ## Development
 
@@ -419,9 +535,13 @@ See `docs/configuration.md` for full reference.
 
 ```bash
 make test           # Run all tests
+make test-scripts   # Release script tests (scripts/macos/tests, part of make verify)
 make verify         # Format + lint + test
 cargo test          # Direct cargo test
 ```
+
+On macOS, `make verify-macos` additionally runs the live macFUSE smoke tests that CI
+cannot execute (macFUSE is a kext; hosted runners cannot load it).
 
 ### Building
 
@@ -447,6 +567,11 @@ CI will fail if pre-commit checks were not run.
 
 **Exception**: For documentation-only changes (`.md`, `.txt`, or other static files that don't affect compilation), `make pre-commit` is not required.
 
+**Platform CI**: PRs run `Verify` (Linux, `ubuntu-latest`) and `Verify (macOS)`
+(Apple Silicon, `macos-15`). Both are blocking. Do not convert the `verify` job to a
+matrix — `main`'s branch protection requires the exact status context `Verify`, and
+matrix jobs are renamed.
+
 ### Key Crates Used
 
 - `fuse3` - Async FUSE filesystem (multi-threaded)
@@ -459,8 +584,12 @@ CI will fail if pre-commit checks were not run.
 - `tokio` - Async runtime
 - `rlimit` - File descriptor limit management (raises soft limit at startup)
 - `wgpu` - GPU compute shaders for DDS encoding
+- `intel_tex_2` - ISPC BC1/BC3 encoder with prebuilt kernels. Pinned to `samsoir/intel-tex-rs-2` `macos-platform-load-command` (0.5.0 with the Darwin kernel objects re-linked to carry `LC_BUILD_VERSION`, else Xcode's linker warns `no platform load command found` on every macOS build); revert to crates.io once upstream regenerates the kernels with ISPC >= 1.26
 - `block_compression` - BCn GPU compression via WGSL
 - `indicatif` - Progress bar rendering for package downloads
+- `crossterm` + `ratatui` - The dashboard and the package manager. crossterm is built with `use-dev-tty`: its default event source never returns once the terminal is hung up (#314)
+- `sevenz-rust2` - Pure-Rust 7z writer for DSF compression (`compress` feature only)
+- `tar` + `flate2` - In-process `tar.gz` handling (#274): the client extracts packages and the publisher builds them, no `tar` or `split` binary on either side. Declared once in `[workspace.dependencies]`. flate2 runs on the `zlib-rs` backend, which picks AVX2/SSE/NEON at run time: never use `target-cpu` flags, the packaged binary must run on every CPU
 
 ## Performance Notes
 
@@ -473,8 +602,8 @@ CI will fail if pre-commit checks were not run.
 ## Platform Support
 
 - **Linux**: ✅ Fully working (native FUSE)
+- **macOS**: ✅ Working (requires [macFUSE](https://macfuse.io); Apple Silicon tested; fuse3 pinned to `samsoir/fuse3` `master` (upstream + `configurable-background` plus the macOS reply-resilience patch — upstream PR [Sherlock-Holo/fuse3#137](https://github.com/Sherlock-Holo/fuse3/pull/137) — comma-joined mount options, and reply-drop log demotion); install/approval guide in `docs/macos.md`)
 - **Windows**: ⏳ Planned (requires Dokan/WinFSP)
-- **macOS**: ⏳ Planned (requires macFUSE)
 
 ## References
 
@@ -485,10 +614,18 @@ CI will fail if pre-commit checks were not run.
 - **Fuse3 implementation**: `xearthlayer/src/fuse/fuse3/mod.rs` (async multi-threaded FUSE)
 - **GPU Encoding**: `docs/dev/gpu-encoding-design.md` (wgpu compute shaders, channel worker, memory optimization)
 - Package publisher design: `docs/dev/package-publisher-design.md`
+- **World rebuild runbook**: `docs/dev/world-rebuild-runbook.md` (the campaign to rebuild every regional package: naming, staging channel, promotion, retirement)
 - Zoom level overlap management: `docs/dev/zoom-level-overlap-design.md` (dedupe, gap analysis)
 - **Consolidated FUSE mounting**: `docs/dev/consolidated-mounting-design.md` (single ortho mount, patches + packages)
+- **Directory layout**: `docs/directory-layout.md` (where files live, upgrading from pre-0.5.0, cleaning up `~/.xearthlayer`)
+- **Preflight checks**: `docs/dev/preflight-design.md` (startup prerequisite registry, bootstrap context, operating principles, how to add a check)
 - **GeoIndex design**: `docs/dev/geo-index-design.md` (geospatial reference database, patch region ownership)
 - **Memory telemetry**: `docs/dev/memory-telemetry.md` (periodic memory sampling, trace interpretation, confounders)
 - **Cache integrity model**: `docs/dev/cache-integrity-design.md` (bounded reads, atomic durable writes, discard-on-reject, shared by every on-disk cache)
+- **Night lighting**: `docs/dev/night-lighting-design.md` (phases 1, 2a and 2b implemented (packaging, black serving, real lit sizes, generated lit textures), plus the lit disk cache and LED lighting: lit textures served through FUSE, generated from OXO `.oxn` recipes and the user's Laminar lit art; a separate lit path beside the ortho executor)
+- **CI/CD pipeline**: `docs/dev/cicd.md` (branch model, release job graph, platform tiers, version propagation)
+- **Homebrew tap**: `docs/dev/cicd.md` "Homebrew Tap" (four casks, `xearthlayer`, `xearthlayer@prerelease`, `xearthlayer-publish` and `xearthlayer-publish@prerelease`, rendered from `pkg/homebrew/*.rb.tmpl` by `scripts/homebrew/render-cask.sh` in the publish job and pushed to `HOMEBREW_TAP_REPO`; never edited by hand; casks because a formula cannot depend on the `macfuse` cask)
+- **macOS signing**: `docs/dev/macos-signing-runbook.md` (Developer ID Application certificate for the binaries and Developer ID Installer certificate for the `.pkg` installers, notarization via App Store Connect API key, the seven `APPLE_*` release secrets, `scripts/macos/sign-and-notarize.sh` and `scripts/macos/build-pkg.sh` shared by `release.yml` and `make sign-macos` / `make pkg-macos`, helpers in `scripts/macos/lib.sh` with tests under `scripts/macos/tests` run by `make test-scripts`; no entitlements because the binaries link only Apple frameworks and spawn `mount_macfuse` as a process)
+- **Publisher separation**: `docs/dev/publisher-separation-design.md` (#284: `xearthlayer-package` is the format contract both sides depend on, `xearthlayer-publisher` holds the publishing domain, and `xearthlayer-publish` is its binary; the runtime links none of the publisher's dependencies)
 - memorize review allow(dead_code) macros at major checkpoints. Refactor aggresively to remove them when appropriate.
 - memorize ensure to update the projects documentation to reflect the current state of the project before committing changes

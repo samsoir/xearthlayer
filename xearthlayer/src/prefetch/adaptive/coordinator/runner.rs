@@ -32,7 +32,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::prefetch::state::{AircraftState, GpsStatus};
+use crate::prefetch::state::AircraftState;
 use crate::prefetch::strategy::Prefetcher;
 
 use super::constants::{MIN_CYCLE_INTERVAL, STALENESS_CHECK_INTERVAL, TELEMETRY_STALE_THRESHOLD};
@@ -73,7 +73,7 @@ impl Prefetcher for AdaptivePrefetchCoordinator {
         cancellation_token: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async move {
-            tracing::info!(mode = ?self.effective_mode(), "Adaptive prefetcher started");
+            tracing::info!("Adaptive prefetcher started");
 
             let mut ls = LoopState::new();
             let mut staleness_interval = tokio::time::interval(STALENESS_CHECK_INTERVAL);
@@ -104,7 +104,7 @@ impl Prefetcher for AdaptivePrefetchCoordinator {
     }
 
     fn description(&self) -> &'static str {
-        "Self-calibrating adaptive prefetch with phase detection and turn handling"
+        "Adaptive prefetch with phase detection and turn handling"
     }
 
     fn startup_info(&self) -> String {
@@ -138,7 +138,6 @@ impl AdaptivePrefetchCoordinator {
             );
             self.reset_phase_from_on_ground(state.on_ground);
             ls.telemetry_paused = false;
-            self.set_gps_status(GpsStatus::Connected);
         }
 
         if !should_run_cycle(ls.last_cycle, MIN_CYCLE_INTERVAL) {
@@ -169,55 +168,13 @@ impl AdaptivePrefetchCoordinator {
                 "Telemetry stale — entering safe mode (prefetch paused)"
             );
             ls.telemetry_paused = true;
-            self.set_gps_status(GpsStatus::Acquiring);
-        }
-    }
-
-    /// Update the shared GPS status, if a shared status handle is configured.
-    fn set_gps_status(&self, status: GpsStatus) {
-        if let Some(ref shared) = self.shared_status {
-            shared.update_gps_status(status);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::prefetch::state::{AircraftState, GpsStatus, SharedPrefetchStatus};
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Staleness detection regression test
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Regression test for Bug 3: Telemetry persisting after X-Plane exit.
-    ///
-    /// When X-Plane exits, it stops sending UDP telemetry packets. The prefetch
-    /// system must detect this and update the GPS status to show we've lost
-    /// connection, rather than continuing to display the stale position.
-    #[tokio::test]
-    async fn test_stale_telemetry_updates_gps_status_regression() {
-        let shared_status = SharedPrefetchStatus::new();
-
-        // Simulate receiving telemetry (sets GPS status to Connected)
-        let state = AircraftState::new(51.47, -0.46, 90.0, 0.0, 0.0, false); // EGLL
-        shared_status.update_aircraft(&state);
-
-        // Verify status is Connected
-        let snapshot = shared_status.snapshot();
-        assert_eq!(snapshot.gps_status, GpsStatus::Connected);
-
-        // Simulate the staleness check updating status when telemetry stops
-        // (This simulates what the run loop does when telemetry goes stale)
-        shared_status.update_gps_status(GpsStatus::Acquiring);
-
-        // Verify status changed to Acquiring
-        let snapshot = shared_status.snapshot();
-        assert_eq!(
-            snapshot.gps_status,
-            GpsStatus::Acquiring,
-            "GPS status should change to Acquiring when telemetry is stale"
-        );
-    }
+    use crate::prefetch::state::{AircraftState, SharedPrefetchStatus};
 
     // ─────────────────────────────────────────────────────────────────────────
     // Safe mode integration tests (Issue #125)
@@ -246,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_staleness_tick_enters_safe_mode() {
-        let (mut coord, shared) = safe_mode_coordinator();
+        let (mut coord, _shared) = safe_mode_coordinator();
         let mut ls = stale_loop_state();
 
         assert!(!ls.telemetry_paused, "Should not start paused");
@@ -256,11 +213,6 @@ mod tests {
         assert!(
             ls.telemetry_paused,
             "Should enter safe mode after stale tick"
-        );
-        assert_eq!(
-            shared.snapshot().gps_status,
-            GpsStatus::Acquiring,
-            "GPS should be Acquiring in safe mode"
         );
     }
 
@@ -305,13 +257,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_resume_from_safe_mode_on_ground() {
-        let (mut coord, shared) = safe_mode_coordinator();
+        let (mut coord, _shared) = safe_mode_coordinator();
         let mut ls = stale_loop_state();
 
         // Enter safe mode
         coord.on_staleness_tick(&mut ls);
         assert!(ls.telemetry_paused);
-        assert_eq!(shared.snapshot().gps_status, GpsStatus::Acquiring);
 
         // Resume with on_ground=true (aircraft landed)
         let state = AircraftState::new(47.0, 8.0, 90.0, 15.0, 500.0, true);
@@ -323,16 +274,11 @@ mod tests {
             FlightPhase::Ground,
             "Should reset to Ground when on_ground=true"
         );
-        assert_eq!(
-            shared.snapshot().gps_status,
-            GpsStatus::Connected,
-            "GPS should be restored to Connected"
-        );
     }
 
     #[tokio::test]
     async fn test_resume_from_safe_mode_airborne() {
-        let (mut coord, shared) = safe_mode_coordinator();
+        let (mut coord, _shared) = safe_mode_coordinator();
         let mut ls = stale_loop_state();
 
         // Enter safe mode
@@ -349,7 +295,6 @@ mod tests {
             FlightPhase::Cruise,
             "Should reset to Cruise when on_ground=false"
         );
-        assert_eq!(shared.snapshot().gps_status, GpsStatus::Connected);
     }
 
     #[tokio::test]
@@ -380,7 +325,9 @@ mod tests {
         let coord = AdaptivePrefetchCoordinator::with_defaults();
 
         assert_eq!(coord.name(), "adaptive");
-        assert!(coord.description().contains("Self-calibrating"));
+        assert!(coord.description().contains("phase detection"));
+        // Nothing calibrates since #277; the description must not claim it does.
+        assert!(!coord.description().to_lowercase().contains("calibrat"));
         assert!(coord.startup_info().contains("adaptive"));
     }
 }

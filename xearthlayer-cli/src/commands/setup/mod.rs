@@ -17,6 +17,7 @@
 //! - Any other frontend
 
 mod wizard;
+mod xworld;
 
 use crate::error::CliError;
 

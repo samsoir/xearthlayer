@@ -9,8 +9,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-
 use crate::config::defaults::{
     DEFAULT_FUSE_CONGESTION_THRESHOLD, DEFAULT_FUSE_MAX_BACKGROUND, DEFAULT_GENERATION_TIMEOUT_SECS,
 };
@@ -21,14 +19,13 @@ use crate::metrics::TelemetrySnapshot;
 use crate::ortho_union::{
     default_cache_path, IndexBuildProgressCallback, OrthoUnionIndex, OrthoUnionIndexBuilder,
 };
-use crate::package::{
-    InstalledPackage as PackageInstalledPackage, Package as PackageCore, PackageType,
-};
 use crate::panic as panic_handler;
 use crate::patches::{extract_dsf_regions, PatchDiscovery};
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
-use crate::scene_tracker::{DefaultSceneTracker, FuseAccessEvent};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
+use xearthlayer_package::{
+    InstalledPackage as PackageInstalledPackage, Package as PackageCore, PackageType,
+};
 
 use super::local::LocalPackageStore;
 use super::{ManagerError, ManagerResult};
@@ -130,12 +127,6 @@ pub struct MountManager {
     /// Target scenery directory for mounts (e.g., X-Plane Custom Scenery).
     /// If None, packages are mounted in-place.
     scenery_path: Option<PathBuf>,
-    /// Scene Tracker for empirical X-Plane request tracking.
-    ///
-    /// This serves as the single source of truth for:
-    /// - Tile tracking (which DDS tiles X-Plane has requested)
-    /// - Burst detection (identifying loading patterns)
-    scene_tracker: Arc<DefaultSceneTracker>,
     /// Active patches union filesystem mount (if any).
     patches_session: Option<SpawnedMountHandle>,
     /// Patches mount info for display.
@@ -148,10 +139,6 @@ pub struct MountManager {
     consolidated_mount: Option<ActiveMount>,
     /// Service for consolidated ortho (owns the runtime for DDS generation).
     consolidated_service: Option<XEarthLayerService>,
-    /// Scene Tracker event receiver for empirical scenery tracking.
-    /// This is populated when mounting consolidated ortho and can be retrieved
-    /// by the Scene Tracker via `take_scene_tracker_receiver()`.
-    scene_tracker_rx: Option<mpsc::UnboundedReceiver<FuseAccessEvent>>,
     /// OrthoUnionIndex for DSF tile enumeration (tile-based prefetch).
     /// This is populated when mounting consolidated ortho.
     ortho_union_index: Option<Arc<OrthoUnionIndex>>,
@@ -164,6 +151,12 @@ pub struct MountManager {
     fuse_congestion_threshold: u16,
     /// Upper bound in seconds for a single DDS generation behind a FUSE read.
     generation_timeout_secs: u64,
+    /// Whether the ortho mount serves generated night lighting (`night.enabled`).
+    night_enabled: bool,
+    /// Outcome of the last night lit source resolution.
+    night_lighting: crate::night::NightLighting,
+    /// Overall lit brightness multiplier (`night.brightness`).
+    night_brightness: f64,
 }
 
 impl MountManager {
@@ -174,19 +167,20 @@ impl MountManager {
             services: HashMap::new(),
             mounts: HashMap::new(),
             scenery_path: None,
-            scene_tracker: Arc::new(DefaultSceneTracker::with_defaults()),
             patches_session: None,
             patches_mount: None,
             patches_service: None,
             consolidated_session: None,
             consolidated_mount: None,
             consolidated_service: None,
-            scene_tracker_rx: None,
             ortho_union_index: None,
             geo_index: None,
             fuse_max_background: DEFAULT_FUSE_MAX_BACKGROUND,
             fuse_congestion_threshold: DEFAULT_FUSE_CONGESTION_THRESHOLD,
             generation_timeout_secs: DEFAULT_GENERATION_TIMEOUT_SECS,
+            night_enabled: false,
+            night_lighting: crate::night::NightLighting::Off,
+            night_brightness: crate::night::DEFAULT_NIGHT_BRIGHTNESS,
         }
     }
 
@@ -208,6 +202,79 @@ impl MountManager {
     pub fn set_fuse_limits(&mut self, max_background: u16, congestion_threshold: u16) {
         self.fuse_max_background = max_background;
         self.fuse_congestion_threshold = congestion_threshold;
+    }
+
+    /// Enable or disable generated night lighting for the ortho mount.
+    ///
+    /// Off by default; the service turns it on from `night.enabled`. When on
+    /// but the X-Plane installation cannot be found, lit textures stay black.
+    pub fn set_night_lighting(&mut self, enabled: bool) {
+        self.night_enabled = enabled;
+    }
+
+    /// What night lighting is doing this session: off, lit, or enabled but
+    /// dark because the X-Plane installation was not found. `Off` until the
+    /// ortho mount is built.
+    pub fn night_lighting(&self) -> crate::night::NightLighting {
+        self.night_lighting
+    }
+
+    /// Resolve the lit source for the ortho mount and record the outcome for
+    /// [`night_lighting`](Self::night_lighting).
+    fn resolve_night_lit_source(
+        &mut self,
+        index: &OrthoUnionIndex,
+        disk: Option<Arc<dyn crate::cache::Cache>>,
+    ) -> Option<Arc<dyn crate::night::LitTextureSource>> {
+        let source = self.night_lit_source(index, disk);
+        self.night_lighting = if source.is_some() {
+            crate::night::NightLighting::Lit
+        } else {
+            crate::night::NightLighting::Dark
+        };
+        source
+    }
+
+    /// Overall lit brightness for the night lit source (`night.brightness`).
+    pub fn set_night_brightness(&mut self, brightness: f64) {
+        self.night_brightness = brightness;
+    }
+
+    /// The lit source for this installation, or `None` (black) when the
+    /// X-Plane installation behind the scenery path cannot be found. `disk`
+    /// is the lit disk tier, `None` when caching is off.
+    fn night_lit_source(
+        &self,
+        index: &OrthoUnionIndex,
+        disk: Option<Arc<dyn crate::cache::Cache>>,
+    ) -> Option<Arc<dyn crate::night::LitTextureSource>> {
+        let scenery = self.scenery_path.as_ref()?;
+        let env = match crate::xplane::XPlaneEnvironment::from_custom_scenery_path(scenery) {
+            Ok(env) => env,
+            Err(e) => {
+                tracing::warn!(error = %e, "Night lighting: X-Plane installation not found; lit textures stay dark");
+                return None;
+            }
+        };
+        let art_root = env
+            .resources_path()
+            .join("default scenery")
+            .join("1000 world terrain");
+        let prefs = env
+            .installation_path()
+            .join("Output")
+            .join("preferences")
+            .join("X-Plane.prf");
+        let mut source = crate::night::NightLitSource::new(
+            Arc::new(crate::night::RecipeStore::from_index(index)),
+            Arc::new(crate::night::LaminarArt::new(art_root)),
+            Arc::new(crate::night::StartupTextureSetting::read(&prefs)),
+        )
+        .with_brightness(self.night_brightness);
+        if let Some(disk) = disk {
+            source = source.with_disk_cache(disk);
+        }
+        Some(Arc::new(source))
     }
 
     /// Set the upper bound for a single DDS generation behind a FUSE read.
@@ -413,6 +480,13 @@ impl MountManager {
             "Built consolidated ortho union index"
         );
 
+        // A previous run that died hard (crash, SIGKILL, system sleep) can
+        // leave a stale FUSE mount on the mountpoint; mounting over it fails
+        // (macFUSE: ENXIO "Device not configured"). A stale mount also makes
+        // exists() report false, so recovery must happen before the directory
+        // check below.
+        crate::system::recover_stale_fuse_mount(&mountpoint);
+
         // Create mountpoint directory
         if !mountpoint.exists() {
             if let Err(e) = std::fs::create_dir_all(&mountpoint) {
@@ -431,15 +505,15 @@ impl MountManager {
         // I/O, and at 512 threads it ratchets glibc's arena high-water mark on
         // every excursion. See runtime::build_service_runtime and issue #227.
         //
-        // `ResourcePoolConfig::default()` is the only source of pool sizing,
-        // here and in `RuntimeConfig::default()` for the executor, so the cap
-        // and the pools it bounds cannot diverge. The `[executor]` sizing keys
-        // that could once have forked this were removed in #249 precisely
-        // because they reached neither path — a config carrying them silently
-        // described capacities nothing used.
-        let runtime = match crate::runtime::build_service_runtime(
-            &crate::executor::ResourcePoolConfig::default(),
-        ) {
+        // The cap covers both lanes (#296), each with its own CPU and disk
+        // I/O pools. `LaneSizing::from_configured_share` is the single source
+        // of that sizing, here and in the runtime builder that sizes the
+        // pools, so the cap and the pools it bounds cannot diverge.
+        let blocking_cap = crate::executor::LaneSizing::from_configured_share(
+            service_builder.service_config().prefetch_capacity_share(),
+        )
+        .blocking_threads_required();
+        let runtime = match crate::runtime::build_service_runtime(blocking_cap) {
             Ok(r) => r,
             Err(e) => {
                 return ConsolidatedOrthoMountResult::failure(
@@ -475,10 +549,6 @@ impl MountManager {
         let expected_dds_size = service.expected_dds_size();
         let runtime_handle = service.runtime_handle().clone();
 
-        // Create Scene Tracker event channel for empirical scenery tracking
-        // The sender goes to FUSE, the receiver goes to the Scene Tracker
-        let (scene_tracker_tx, scene_tracker_rx) = mpsc::unbounded_channel();
-
         // Store the index for tile-based prefetcher to use later
         let index_for_prefetch = Arc::new(index);
 
@@ -494,15 +564,29 @@ impl MountManager {
         let state_observer = Arc::new(state_observer);
 
         // Create and mount the consolidated ortho union filesystem with DDS access channel
-        // Wire Scene Tracker channel for empirical scenery tracking
         // Wire FUSE kernel limits for concurrent background request control
+        // The client carries the pinned-tile budget it reports FUSE demand from,
+        // so the filesystem accounts against the same one prefetch reads (#246).
+        let pinned_budget = dds_client.pinned_budget();
+
         let mut ortho_union_fs =
             Fuse3OrthoUnionFS::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
                 .with_geo_index(Arc::clone(&geo_index))
                 .with_state_observer(state_observer)
-                .with_scene_tracker_channel(scene_tracker_tx)
                 .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold)
                 .with_timeout(Duration::from_secs(self.generation_timeout_secs));
+
+        if let Some(budget) = pinned_budget {
+            ortho_union_fs = ortho_union_fs.with_pinned_budget(budget);
+        }
+
+        if self.night_enabled {
+            if let Some(source) =
+                self.resolve_night_lit_source(&index_for_prefetch, service.lit_disk_cache())
+            {
+                ortho_union_fs = ortho_union_fs.with_lit_source(source);
+            }
+        }
 
         // Wire metrics client for coalesced request tracking
         if let Some(metrics) = metrics_client {
@@ -531,9 +615,6 @@ impl MountManager {
                 // Store indexes for tile-based prefetcher
                 self.ortho_union_index = Some(index_for_prefetch);
                 self.geo_index = Some(geo_index);
-
-                // Store Scene Tracker receiver for empirical scenery tracking
-                self.scene_tracker_rx = Some(scene_tracker_rx);
 
                 tracing::info!(
                     mountpoint = %mountpoint.display(),
@@ -564,22 +645,6 @@ impl MountManager {
     /// Get consolidated ortho mount info (if mounted).
     pub fn consolidated_mount(&self) -> Option<&ActiveMount> {
         self.consolidated_mount.as_ref()
-    }
-
-    /// Take the Scene Tracker event receiver for empirical scenery tracking.
-    ///
-    /// This method takes ownership of the receiver, so it can only be called once.
-    /// The receiver is created when mounting consolidated ortho and is used by
-    /// the Scene Tracker to receive FUSE access events.
-    ///
-    /// # Returns
-    ///
-    /// `Some(receiver)` if consolidated ortho is mounted and receiver hasn't been taken,
-    /// `None` otherwise.
-    pub fn take_scene_tracker_receiver(
-        &mut self,
-    ) -> Option<mpsc::UnboundedReceiver<FuseAccessEvent>> {
-        self.scene_tracker_rx.take()
     }
 
     /// Get a reference to the OrthoUnionIndex for tile-based prefetching.
@@ -671,9 +736,6 @@ impl MountManager {
         // Clear tile-based prefetch resources
         self.ortho_union_index = None;
         self.geo_index = None;
-
-        // Clear Scene Tracker resources
-        self.scene_tracker_rx = None;
     }
 
     /// Get a reference to a mounted service (if any).
@@ -686,18 +748,6 @@ impl MountManager {
             .as_ref()
             .or(self.patches_service.as_ref())
             .or_else(|| self.services.values().next())
-    }
-
-    /// Get the Scene Tracker for empirical X-Plane request tracking.
-    ///
-    /// The Scene Tracker maintains an empirical model of what X-Plane has
-    /// requested, including:
-    /// - Which DDS tiles have been accessed
-    /// - Burst detection for loading patterns
-    /// - Geographic region tracking
-    ///
-    pub fn scene_tracker(&self) -> Arc<DefaultSceneTracker> {
-        Arc::clone(&self.scene_tracker)
     }
 
     /// Get aggregated telemetry from all mounted services.
@@ -755,6 +805,14 @@ impl MountManager {
             total_download_time_ms: 0,
             total_assembly_time_ms: 0,
             total_encode_time_ms: 0,
+            fuse_latency: None,
+            fuse_session_latency: None,
+            fuse_session_timeouts: 0,
+            demand_in_flight: 0,
+            prefetch_paused: false,
+            prefetch_lane_load: 0.0,
+            prefetch_lane_running: 0,
+            prefetch_lane_queued: 0,
         };
 
         // Collect all services: per-region + patches + consolidated
@@ -827,6 +885,19 @@ impl MountManager {
             total.total_download_time_ms += snapshot.total_download_time_ms;
             total.total_assembly_time_ms += snapshot.total_assembly_time_ms;
             total.total_encode_time_ms += snapshot.total_encode_time_ms;
+
+            // Lane gauges: each service runs its own lanes, and only the
+            // consolidated service has real values. Latency is not summable,
+            // so take the first sample present rather than a blend.
+            total.fuse_latency = total.fuse_latency.or(snapshot.fuse_latency);
+            total.fuse_session_latency =
+                total.fuse_session_latency.or(snapshot.fuse_session_latency);
+            total.fuse_session_timeouts += snapshot.fuse_session_timeouts;
+            total.demand_in_flight += snapshot.demand_in_flight;
+            total.prefetch_paused |= snapshot.prefetch_paused;
+            total.prefetch_lane_load = total.prefetch_lane_load.max(snapshot.prefetch_lane_load);
+            total.prefetch_lane_running += snapshot.prefetch_lane_running;
+            total.prefetch_lane_queued += snapshot.prefetch_lane_queued;
 
             // Use the highest peak from any service
             if snapshot.peak_bytes_per_second > total.peak_bytes_per_second {
@@ -920,6 +991,11 @@ impl ServiceBuilder {
         }
     }
 
+    /// The service configuration every built service starts from.
+    pub fn service_config(&self) -> &ServiceConfig {
+        &self.service_config
+    }
+
     /// Set the tile request callback for FUSE-based position inference.
     ///
     /// When set, all services built by this builder will forward tile requests
@@ -968,6 +1044,54 @@ mod tests {
         let manager = MountManager::new();
         assert_eq!(manager.mount_count(), 0);
         assert!(!manager.has_mounts());
+    }
+
+    #[test]
+    fn test_night_lighting_off_by_default_and_settable() {
+        let mut manager = MountManager::new();
+        assert!(!manager.night_enabled);
+        manager.set_night_lighting(true);
+        assert!(manager.night_enabled);
+    }
+
+    #[test]
+    fn night_lighting_reports_off_when_disabled() {
+        let manager = MountManager::new();
+        assert_eq!(manager.night_lighting(), crate::night::NightLighting::Off);
+    }
+
+    #[test]
+    fn night_lighting_reports_lit_once_the_installation_is_found() {
+        let install = tempfile::tempdir().unwrap();
+        let scenery = install.path().join("Custom Scenery");
+        let mut manager = MountManager::with_scenery_path(&scenery);
+        manager.set_night_lighting(true);
+
+        let source = manager.resolve_night_lit_source(&OrthoUnionIndex::default(), None);
+
+        assert!(source.is_some());
+        assert_eq!(manager.night_lighting(), crate::night::NightLighting::Lit);
+    }
+
+    #[test]
+    fn night_lighting_reports_dark_when_the_installation_is_missing() {
+        let mut manager = MountManager::with_scenery_path(std::path::Path::new(
+            "/nonexistent/xel-test/X-Plane 12/Custom Scenery",
+        ));
+        manager.set_night_lighting(true);
+
+        let source = manager.resolve_night_lit_source(&OrthoUnionIndex::default(), None);
+
+        assert!(source.is_none());
+        assert_eq!(manager.night_lighting(), crate::night::NightLighting::Dark);
+    }
+
+    #[test]
+    fn test_night_brightness_defaults_to_one_and_is_settable() {
+        let mut manager = MountManager::new();
+        assert_eq!(manager.night_brightness, 1.0);
+        manager.set_night_brightness(1.25);
+        assert_eq!(manager.night_brightness, 1.25);
     }
 
     #[test]

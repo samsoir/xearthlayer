@@ -10,11 +10,15 @@
 //! When any part exhausts its retries, the orchestrator sets a shared
 //! `should_abort` flag. Other workers observe the flag at boundaries
 //! they can act on (after acquiring their semaphore permit, between
-//! retry attempts, and during backoff sleeps) and exit early without
-//! starting or completing further attempts. Workers in the middle of
-//! an HTTP download finish their current attempt — interrupting an
-//! in-flight reqwest stream would require plumbing cancellation into
-//! `HttpDownloader`, which is left as a future change.
+//! retry attempts, during backoff sleeps, and between read buffers of an
+//! in-flight HTTP download) and exit early without starting or completing
+//! further attempts.
+//!
+//! # External cancel
+//!
+//! The caller's [`CancelToken`] is polled by the main loop, which raises the
+//! same `should_abort` flag. Every abort path therefore serves a cancel too,
+//! and `download_all` reports [`ManagerError::Cancelled`].
 //!
 //! Cleanup of partial files on disk is the caller's responsibility
 //! and is handled by [`crate::manager::install_guard::InstallTempGuard`]
@@ -32,6 +36,7 @@ use super::http::HttpDownloader;
 use super::progress::{DownloadProgressCallback, ProgressCounters, ProgressReporter};
 use super::semaphore::CountingSemaphore;
 use super::state::DownloadState;
+use crate::manager::cancel::CancelToken;
 use crate::manager::error::{ManagerError, ManagerResult};
 use crate::manager::traits::{PackageDownloader, ProgressCallback};
 
@@ -177,9 +182,10 @@ impl MultiPartDownloader {
         &self,
         state: &mut DownloadState,
         on_progress: Option<DownloadProgressCallback>,
+        cancel: &CancelToken,
     ) -> ManagerResult<()> {
         let on_progress = on_progress.map(Arc::new);
-        self.run_downloads(state, on_progress)
+        self.run_downloads(state, on_progress, cancel)
     }
 
     /// Spawn one worker per part, gate concurrency via a semaphore,
@@ -189,6 +195,7 @@ impl MultiPartDownloader {
         &self,
         state: &mut DownloadState,
         on_progress: Option<Arc<DownloadProgressCallback>>,
+        cancel: &CancelToken,
     ) -> ManagerResult<()> {
         let total_parts = state.total_parts;
 
@@ -266,7 +273,17 @@ impl MultiPartDownloader {
         let mut completed = 0usize;
         let mut failed_parts: Vec<usize> = Vec::new();
         let mut first_failure: Option<(String, String)> = None; // (filename, error)
-        while let Ok((index, outcome)) = result_rx.recv() {
+        loop {
+            let (index, outcome) = match result_rx.recv_timeout(ABORT_CHECK_GRANULARITY) {
+                Ok(message) => message,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if cancel.is_cancelled() {
+                        should_abort.store(true, Ordering::SeqCst);
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             match outcome {
                 WorkerOutcome::Success { bytes } => {
                     debug!(part_index = index, bytes, "part download completed");
@@ -315,6 +332,12 @@ impl MultiPartDownloader {
         state.downloaded_parts = completed;
         state.bytes_downloaded = total_bytes;
         state.failed = failed_parts;
+
+        // An external cancel ends with aborted parts and no failure of its
+        // own. Without this it would look like a success.
+        if cancel.is_cancelled() {
+            return Err(ManagerError::Cancelled);
+        }
 
         // Surface a first-failure-specific error if anything failed.
         if let Some((filename, error)) = first_failure {
@@ -434,14 +457,24 @@ fn run_part_worker(
             counters_clone.update_part(i, downloaded);
         });
 
-        let result =
-            downloader.download_with_progress(&url, &dest, Some(checksum.as_str()), progress_cb);
+        let result = downloader.download_cancellable(
+            &url,
+            &dest,
+            Some(checksum.as_str()),
+            progress_cb,
+            &|| should_abort.load(Ordering::SeqCst),
+        );
 
         match result {
             Ok(bytes) => {
                 counters.mark_completed(i, bytes);
                 counters.set_part_state(i, 2); // Done
                 return WorkerOutcome::Success { bytes };
+            }
+            // A stop is not a failed attempt: no retry, no Failed state.
+            Err(ManagerError::Cancelled) => {
+                std::fs::remove_file(&dest).ok();
+                return WorkerOutcome::Aborted;
             }
             Err(e) => {
                 last_error = e.to_string();
@@ -592,5 +625,67 @@ mod tests {
         };
         let display = err.to_string();
         assert!(display.contains("(5 other parts also failed)"));
+    }
+
+    #[test]
+    fn an_external_cancel_stops_every_part_and_reports_cancelled() {
+        let base = crate::manager::download::test_server::slow_server();
+        let temp = tempfile::TempDir::new().unwrap();
+        let names = ["p.aa", "p.ab", "p.ac"];
+        let mut state = DownloadState::new(
+            names.iter().map(|n| format!("{base}/{n}")).collect(),
+            names.iter().map(|_| "0".repeat(64)).collect(),
+            names.iter().map(|n| temp.path().join(n)).collect(),
+        );
+        let cancel = CancelToken::new();
+        let trigger = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            trigger.cancel();
+        });
+        let begun = std::time::Instant::now();
+
+        let result = MultiPartDownloader::with_settings(Duration::from_secs(30), 2)
+            .download_all(&mut state, None, &cancel);
+
+        assert!(matches!(result, Err(ManagerError::Cancelled)), "{result:?}");
+        assert!(begun.elapsed() < Duration::from_secs(5));
+        for name in names {
+            assert!(!temp.path().join(name).exists(), "{name} left behind");
+        }
+    }
+
+    #[test]
+    fn a_stop_mid_stream_aborts_the_part_without_a_retry_or_a_failure() {
+        let base = crate::manager::download::test_server::slow_server();
+        let temp = tempfile::TempDir::new().unwrap();
+        let dest = temp.path().join("p.aa");
+        let counters = Arc::new(ProgressCounters::new(1));
+        let should_abort = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&should_abort);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let begun = Instant::now();
+
+        let outcome = run_part_worker(
+            0,
+            format!("{base}/p.aa"),
+            "0".repeat(64),
+            dest.clone(),
+            "p.aa".to_string(),
+            Duration::from_secs(30),
+            Arc::clone(&counters),
+            Arc::new(CountingSemaphore::new(1)),
+            should_abort,
+        );
+
+        assert!(matches!(outcome, WorkerOutcome::Aborted), "{outcome:?}");
+        assert!(begun.elapsed() < Duration::from_secs(5));
+        // Still "downloading": never Retrying (4) or Failed (3), and no error.
+        assert_eq!(counters.part_state(0), 1);
+        assert_eq!(counters.part_error(0), None);
+        assert!(!dest.exists(), "partial file left behind");
     }
 }

@@ -41,6 +41,21 @@ pub struct ExecutorConfig {
     /// This limits how many jobs in that group can run simultaneously,
     /// creating back-pressure for balanced pipeline flow.
     pub job_concurrency_limits: JobConcurrencyLimits,
+
+    /// Optional admission gate. While it reads `true`, the executor admits no
+    /// queued job; jobs already admitted run all their tasks. `None` (the
+    /// default) means always open. The prefetch lane is gated by demand (#296).
+    /// The gate's sender must outlive the executor: once it drops, the gate
+    /// keeps its last value, so a gate dropped while paused never reopens.
+    pub admission_gate: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+impl ExecutorConfig {
+    /// Gates job admission on `gate`: `true` pauses admission.
+    pub fn with_admission_gate(mut self, gate: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.admission_gate = Some(gate);
+        self
+    }
 }
 
 impl Default for ExecutorConfig {
@@ -50,6 +65,7 @@ impl Default for ExecutorConfig {
             job_channel_capacity: DEFAULT_JOB_CHANNEL_CAPACITY,
             max_concurrent_tasks: DEFAULT_MAX_CONCURRENT_TASKS,
             job_concurrency_limits: JobConcurrencyLimits::new(),
+            admission_gate: None,
         }
     }
 }

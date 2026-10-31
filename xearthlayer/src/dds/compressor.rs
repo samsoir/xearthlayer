@@ -314,13 +314,13 @@ mod gpu {
         /// Returns `DdsError::CompressionFailed` if no matching adapter is found or
         /// device creation fails.
         pub fn try_new(gpu_device: &str) -> Result<Self, DdsError> {
-            let (device, queue, compressor, adapter_name) = create_gpu_resources(gpu_device)?;
+            let (device, queue, compressor, selection) = create_gpu_resources(gpu_device)?;
 
             Ok(Self {
                 device,
                 queue,
                 compressor: std::sync::Mutex::new(compressor),
-                adapter_name,
+                adapter_name: selection.adapter.to_string(),
             })
         }
     }
@@ -337,18 +337,35 @@ mod gpu {
     ///
     /// # Returns
     ///
-    /// A tuple of `(Device, Queue, GpuBlockCompressor, adapter_name)`.
+    /// A tuple of `(Device, Queue, GpuBlockCompressor, selection)`, where
+    /// `selection` names the GPU that was selected and carries every GPU
+    /// the host offered, for the encoder policy (#203).
     pub fn create_gpu_resources(
         gpu_device: &str,
-    ) -> Result<(wgpu::Device, wgpu::Queue, GpuBlockCompressor, String), DdsError> {
+    ) -> Result<
+        (
+            wgpu::Device,
+            wgpu::Queue,
+            GpuBlockCompressor,
+            crate::system::GpuSelection,
+        ),
+        DdsError,
+    > {
         // Enumeration + selection live in `system::gpu` so the wizard's
         // adapter→config-string mapping (`GpuAdapter::config_value`) stays
         // in lockstep with this module's config-string→adapter mapping.
         let adapters = crate::system::enumerate_gpus_raw();
         let adapter = crate::system::find_gpu(&adapters, gpu_device)
             .map_err(|e| DdsError::CompressionFailed(e.to_string()))?;
-        let info = adapter.get_info();
-        let adapter_name = format!("{} ({:?}, {:?})", info.name, info.device_type, info.backend);
+        let selected = crate::system::GpuSelection {
+            adapter: crate::system::GpuAdapter::from_wgpu(adapter),
+            host: crate::system::HardwareProfile::new(
+                adapters
+                    .iter()
+                    .map(crate::system::GpuAdapter::from_wgpu)
+                    .collect(),
+            ),
+        };
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("xearthlayer-dds"),
@@ -362,9 +379,9 @@ mod gpu {
 
         let compressor = GpuBlockCompressor::new(device.clone(), queue.clone());
 
-        tracing::info!(adapter = %adapter_name, "GPU resources initialized");
+        tracing::info!(adapter = %selected.adapter, "GPU resources initialized");
 
-        Ok((device, queue, compressor, adapter_name))
+        Ok((device, queue, compressor, selected))
     }
 
     impl ImageCompressor for WgpuCompressor {
@@ -501,7 +518,9 @@ mod gpu {
                     DdsError::CompressionFailed(format!("GPU buffer mapping failed: {e}"))
                 })?;
 
-            let data = buffer_slice.get_mapped_range();
+            let data = buffer_slice.get_mapped_range().map_err(|e| {
+                DdsError::CompressionFailed(format!("GPU mapped range unavailable: {e}"))
+            })?;
             let result = data.to_vec();
             drop(data);
             readback_buffer.unmap();
@@ -709,8 +728,12 @@ mod gpu_tests {
     fn test_create_gpu_resources_returns_adapter_name() {
         // Skip if no GPU available
         let result = create_gpu_resources("integrated");
-        if let Ok((_, _, _, adapter_name)) = result {
-            assert!(!adapter_name.is_empty());
+        if let Ok((_, _, _, selection)) = result {
+            assert!(!selection.adapter.name.is_empty());
+            assert!(
+                selection.host.adapters.contains(&selection.adapter),
+                "the host profile includes the selected adapter"
+            );
         }
     }
 
@@ -722,7 +745,7 @@ mod gpu_tests {
         // Either succeeds (GPU available) or fails with adapter error (no GPU)
         // — neither should panic from the error handler registration.
         match result {
-            Ok((_, _, _, name)) => assert!(!name.is_empty()),
+            Ok((_, _, _, selection)) => assert!(!selection.adapter.name.is_empty()),
             Err(_) => {} // No GPU available, that's fine
         }
     }

@@ -65,7 +65,8 @@ file; neither leaves it in place to be rejected again on the next read.
 cache/integrity/
 ├── mod.rs        # IntegrityError, CacheEntryValidator trait
 ├── io.rs         # length_ceiling, write_atomic, discard
-└── validators.rs # MagicAndSize, dds_tile_validator, raw_chunk_validator
+└── validators.rs # MagicAndSize, dds_tile_validator, raw_chunk_validator,
+                  # lit_payload_validator
 ```
 
 It imports nothing from `fuse`, `metrics`, or `service` — it is a leaf module
@@ -109,6 +110,7 @@ as `Empty`, never `BadMagic`), then magic, then length.
 ```rust
 pub fn dds_tile_validator() -> MagicAndSize   // b"DDS ", exact EXPECTED_DDS_SIZE
 pub fn raw_chunk_validator() -> MagicAndSize  // empty magic slice, no length check
+pub fn lit_payload_validator() -> MagicAndSize // b"XELL", night lighting tier (fingerprint checked by night/disk.rs)
 ```
 
 An empty `magic` slice makes `BadMagic` unreachable — every byte slice
@@ -244,6 +246,7 @@ fn validator_for_tier(tier: DiskTier) -> Arc<dyn CacheEntryValidator> {
     match tier {
         DiskTier::Dds => Arc::new(dds_tile_validator()),
         DiskTier::Chunk => Arc::new(raw_chunk_validator()),
+        DiskTier::Lit => Arc::new(lit_payload_validator()),
     }
 }
 ```

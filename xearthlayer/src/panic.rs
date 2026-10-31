@@ -12,7 +12,6 @@
 use std::io::Write;
 use std::panic::{self, PanicHookInfo};
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 use crate::metrics::TelemetrySnapshot;
@@ -187,48 +186,15 @@ fn handle_panic(info: &PanicHookInfo<'_>) {
                 for mount_point in &guard.mount_points {
                     let _ = write!(stderr, "  Unmounting {}... ", mount_point.display());
 
-                    // Try fusermount -u first (graceful unmount)
-                    let result = Command::new("fusermount")
-                        .arg("-u")
-                        .arg(mount_point)
-                        .output();
-
-                    match result {
-                        Ok(output) if output.status.success() => {
-                            let _ = writeln!(stderr, "OK");
-                        }
-                        Ok(_) => {
-                            // Try fusermount3 -u as fallback
-                            let result3 = Command::new("fusermount3")
-                                .arg("-u")
-                                .arg(mount_point)
-                                .output();
-
-                            match result3 {
-                                Ok(output) if output.status.success() => {
-                                    let _ = writeln!(stderr, "OK (fusermount3)");
-                                }
-                                _ => {
-                                    // Last resort: lazy unmount
-                                    let lazy_result = Command::new("fusermount")
-                                        .arg("-uz")
-                                        .arg(mount_point)
-                                        .output();
-
-                                    match lazy_result {
-                                        Ok(output) if output.status.success() => {
-                                            let _ = writeln!(stderr, "OK (lazy)");
-                                        }
-                                        _ => {
-                                            let _ = writeln!(stderr, "FAILED");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = writeln!(stderr, "ERROR: {}", e);
-                        }
+                    // Graceful first, then escalate to the platform's forced
+                    // unmount if the mount is still busy. unmount_fuse picks
+                    // fusermount (Linux) or umount (macOS).
+                    if crate::system::unmount_fuse(mount_point, false) {
+                        let _ = writeln!(stderr, "OK");
+                    } else if crate::system::unmount_fuse(mount_point, true) {
+                        let _ = writeln!(stderr, "OK (forced)");
+                    } else {
+                        let _ = writeln!(stderr, "FAILED");
                     }
                 }
             }

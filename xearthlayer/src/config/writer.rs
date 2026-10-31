@@ -5,10 +5,14 @@
 
 use std::path::Path;
 
+use super::help::ini_comment;
+use super::keys::ConfigKey;
 use super::settings::ConfigFile;
 use super::size::format_size;
 
 /// Convert a `ConfigFile` to a commented INI string for saving.
+/// The `[packages]` comments come from [`super::help`], shared with the
+/// package manager's Settings tab (#336).
 pub(super) fn to_config_string(config: &ConfigFile) -> String {
     let google_api_key = config.provider.google_api_key.as_deref().unwrap_or("");
     let mapbox_access_token = config.provider.mapbox_access_token.as_deref().unwrap_or("");
@@ -41,6 +45,11 @@ pub(super) fn to_config_string(config: &ConfigFile) -> String {
     } else {
         "false"
     };
+    let xworld_pro = if config.packages.xworld_pro {
+        "true"
+    } else {
+        "false"
+    };
     let temp_dir = config
         .packages
         .temp_dir
@@ -59,6 +68,11 @@ pub(super) fn to_config_string(config: &ConfigFile) -> String {
 ; Check for new versions on startup (default: true)
 ; When enabled, performs a single HTTP request once per day (no telemetry)
 update_check = {}
+
+; Directory layout this configuration conforms to. Managed automatically:
+; 0 means the layout predates versioning and files still live in ~/.xearthlayer.
+; Do not edit unless you are recovering from a failed migration.
+layout_version = {}
 
 [provider]
 ; Imagery provider:
@@ -111,81 +125,54 @@ threads = {}
 timeout = {}
 
 [executor]
-; Job executor daemon settings for tile generation.
-; These control resource pools, concurrency, and retry behavior.
+; Per-chunk download behaviour. Concurrency and resource pool sizes are
+; derived from the host and are not configurable.
 
-; Maximum concurrent DDS tile jobs (default: num_cpus / 2)
-max_concurrent_jobs = {}
-
-; Download behavior
 ; HTTP request timeout in seconds for individual chunk downloads (default: 10)
 request_timeout_secs = {}
 ; Maximum retry attempts per failed chunk download (default: 3)
 max_retries = {}
-; Base delay in milliseconds for exponential backoff between retries (default: 100)
-; Actual delay = base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms, 800ms)
-retry_base_delay_ms = {}
 
 [xplane]
 ; X-Plane Custom Scenery directory for mounting scenery packs
-; If empty, auto-detects from ~/.x-plane/x-plane_install_12.txt
+; If empty, auto-detects from the X-Plane install reference file
+; (Linux: ~/.x-plane/x-plane_install_12.txt, macOS: ~/Library/Preferences/x-plane_install_12.txt)
 ; This is also where packages are installed by 'xearthlayer packages install'
 scenery_dir = {}
 
 [packages]
-; URL to the XEarthLayer package library index
-; This is where available packages are discovered for 'xearthlayer packages check/install'
+{help_library_url}
 library_url = {}
-; Local directory for installed packages (default: ~/.xearthlayer/packages)
+{help_install_location}
 install_location = {}
-; X-Plane Custom Scenery directory for overlay symlinks
-; If empty, uses xplane.scenery_dir or auto-detects
+{help_custom_scenery_path}
 custom_scenery_path = {}
-; Automatically install overlay packages when installing ortho for same region
+{help_auto_install_overlays}
 auto_install_overlays = {}
-; Suppress XEL overlays at runtime by removing the consolidated yzXEL_overlay/
-; symlink folder from Custom Scenery on `xearthlayer run` startup. Overlay
-; packages are still downloaded and stored locally — only the symlink that
-; X-Plane reads is suppressed. Use this when running third-party overlay
-; scenery (e.g., SimHeaven) that conflicts with XEL overlays. (default: false)
+{help_disable_overlays}
 disable_overlays = {}
-; Temporary directory for package downloads (default: ~/.xearthlayer/tmp)
-; Large packages are downloaded here before extraction
+{help_xworld_pro}
+xworld_pro = {}
+{help_temp_dir}
 temp_dir = {}
-; Number of concurrent part downloads (1-10, default: 5)
+{help_concurrent_downloads}
 concurrent_downloads = {}
 
 [logging]
-; Log file path (default: ~/.xearthlayer/xearthlayer.log)
+; Log file path
+; Default: {log_default}
 file = {}
 
 [prefetch]
 ; Enable predictive tile prefetching based on X-Plane telemetry (default: true)
-; Requires X-Plane to send ForeFlight data: Settings > Network > Send to ForeFlight
+; Telemetry comes from the X-Plane Web API (web_api_port); no X-Plane setup is needed
 enabled = {}
-; Adaptive prefetch mode (default: auto)
-;   auto         - Select mode based on throughput calibration (recommended)
-;   aggressive   - Position-based triggers (fast connections)
-;   opportunistic - Circuit breaker triggers (moderate connections)
-;   disabled     - Disable prefetch entirely
-mode = {}
 ; Web API port for X-Plane SimState polling (default: 8086, range: 1024-65535)
 web_api_port = {}
 
 ; Interval between prefetch cycles in milliseconds (default: 2000)
-; Higher values reduce prefetch aggressiveness
+; Currently has no effect: cycles run at a fixed 2 second interval
 cycle_interval_ms = {}
-
-; Adaptive prefetch calibration
-; Minimum throughput for aggressive mode (tiles/sec, default: 30)
-; Systems exceeding this use position-based prefetch triggers
-calibration_aggressive_threshold = {}
-; Minimum throughput for opportunistic mode (tiles/sec, default: 10)
-; Systems between this and aggressive use circuit breaker triggers
-; Below this, prefetch is disabled
-calibration_opportunistic_threshold = {}
-; How long to measure throughput during initial calibration (seconds, default: 60)
-calibration_sample_duration = {}
 
 ; Transition ramp settings (takeoff phase management)
 ; Altitude climb (feet) above takeoff MSL to release transition hold (default: 1000, range: 200-5000)
@@ -199,14 +186,14 @@ ramp_duration_secs = {}
 ; Starting prefetch fraction when ramp begins (default: 0.25, range: 0.1-0.5)
 ramp_start_fraction = {}
 
-; Boundary-driven prefetch settings
-; Buffer tiles for retention beyond visible window (default: 1, range: 0-3)
+; Region lifecycle settings
+; Regions retained beyond the prefetch box on each side (default: 1, range: 0-3)
 window_buffer = {}
 ; InProgress staleness timeout in seconds (default: 120, range: 30-600)
 stale_region_timeout = {}
 
 ; Prefetch box settings (used by both ground and cruise phases)
-; Total prefetch box extent per axis in degrees (default: 7.0, range: 3.0-15.0)
+; Total prefetch box extent per axis in degrees (default: 7.0, range: 7.0-15.0)
 ; On the ground: used directly with symmetric bias, producing a square box centered on the aircraft.
 ; In cruise: the maximum of a speed-proportional ramp from box_min_extent, with heading bias.
 box_extent = {}
@@ -214,6 +201,11 @@ box_extent = {}
 ; Controls how much the prefetch box shifts forward in the direction of travel
 ; 0.5 = symmetric, 0.8 = 80% ahead / 20% behind on the primary axis
 box_max_bias = {}
+; Share of the machine given to prefetch, as a fraction of the capacity FUSE
+; demand gets (default: 0.35, range: 0.05-0.50). Prefetch never delays X-Plane's
+; own tile requests; this sets how much CPU it may use alongside the simulator.
+; Download connections are not limited by it. Lower it if prefetch costs frame rate.
+capacity_share = {}
 
 [prewarm]
 ; Settings for cold-start cache pre-warming.
@@ -231,7 +223,8 @@ grid_cols = {}
 ; Enable/disable patches functionality (default: true)
 ; When enabled, XEL will mount patch tiles from the patches directory.
 enabled = {}
-; Directory containing patch tiles (default: ~/.xearthlayer/patches)
+; Directory containing patch tiles
+; Default: {patches_default}
 ; Each subdirectory should be a complete Ortho4XP tile with:
 ;   - Earth nav data/*.dsf (custom mesh/elevation)
 ;   - terrain/*.ter (terrain definition files)
@@ -250,8 +243,21 @@ max_background = {}
 ; Congestion threshold for background FUSE requests (default: 192, range: 1-1024)
 ; Kernel starts throttling when pending requests exceed this. Convention: 75% of max_background.
 congestion_threshold = {}
+
+[night]
+; Night lighting from OXO night recipes in installed packages.
+; Lit textures are generated from your own X-Plane lit art. false = always dark.
+enabled = {}
+; Overall lit brightness, 0.5 to 1.5. A development setting.
+brightness = {}
+
+[tui]
+; Status pane symbols: auto, emoji or plain (default: auto).
+; auto uses emoji when the terminal can draw them and plain symbols otherwise.
+symbols = {}
 "#,
         update_check,
+        config.general.layout_version,
         config.provider.provider_type,
         google_api_key,
         mapbox_access_token,
@@ -265,26 +271,21 @@ congestion_threshold = {}
         config.generation.threads,
         config.generation.timeout,
         // Executor settings
-        config.control_plane.max_concurrent_jobs,
         config.executor.request_timeout_secs,
         config.executor.max_retries,
-        config.executor.retry_base_delay_ms,
         scenery_dir,
         library_url,
         install_location,
         custom_scenery_path,
         auto_install_overlays,
         disable_overlays,
+        xworld_pro,
         temp_dir,
         config.packages.concurrent_downloads,
         path_to_string(&config.logging.file),
         config.prefetch.enabled,
-        config.prefetch.mode,
         config.prefetch.web_api_port,
         config.prefetch.cycle_interval_ms,
-        config.prefetch.calibration_aggressive_threshold,
-        config.prefetch.calibration_opportunistic_threshold,
-        config.prefetch.calibration_sample_duration,
         config.prefetch.takeoff_climb_ft,
         config.prefetch.takeoff_timeout_secs,
         config.prefetch.landing_hysteresis_secs,
@@ -294,6 +295,7 @@ congestion_threshold = {}
         config.prefetch.stale_region_timeout,
         config.prefetch.box_extent,
         config.prefetch.box_max_bias,
+        config.prefetch.capacity_share,
         config.prewarm.grid_rows,
         config.prewarm.grid_cols,
         config.patches.enabled,
@@ -306,11 +308,26 @@ congestion_threshold = {}
         // FUSE settings
         config.fuse.max_background,
         config.fuse.congestion_threshold,
+        // Night lighting settings
+        config.night.enabled,
+        config.night.brightness,
+        // Terminal dashboard settings
+        config.tui.symbols,
+        help_library_url = ini_comment(ConfigKey::PackagesLibraryUrl),
+        help_install_location = ini_comment(ConfigKey::PackagesInstallLocation),
+        help_custom_scenery_path = ini_comment(ConfigKey::PackagesCustomSceneryPath),
+        help_auto_install_overlays = ini_comment(ConfigKey::PackagesAutoInstallOverlays),
+        help_disable_overlays = ini_comment(ConfigKey::PackagesDisableOverlays),
+        help_xworld_pro = ini_comment(ConfigKey::PackagesXworldPro),
+        help_temp_dir = ini_comment(ConfigKey::PackagesTempDir),
+        help_concurrent_downloads = ini_comment(ConfigKey::PackagesConcurrentDownloads),
+        log_default = path_to_string(&crate::paths::log_file()),
+        patches_default = path_to_string(&crate::paths::patches_dir()),
     )
 }
 
 /// Convert path to string, collapsing home dir to ~.
-fn path_to_string(path: &Path) -> String {
+pub(super) fn path_to_string(path: &Path) -> String {
     if let Some(home) = dirs::home_dir() {
         if let Ok(stripped) = path.strip_prefix(&home) {
             return format!("~/{}", stripped.display());
@@ -364,9 +381,21 @@ mod tests {
     fn test_patches_config_defaults() {
         let config = ConfigFile::default();
         assert!(config.patches.enabled);
-        // Default directory is ~/.xearthlayer/patches
+        // Default directory comes from the paths resolver
         assert!(config.patches.directory.is_some());
         let dir = config.patches.directory.unwrap();
         assert!(dir.ends_with("patches"));
+    }
+
+    #[test]
+    fn xworld_pro_survives_a_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        let mut config = ConfigFile::default();
+        config.packages.xworld_pro = true;
+        config.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("xworld_pro = true"), "{text}");
+        assert!(ConfigFile::load_from(&path).unwrap().packages.xworld_pro);
     }
 }

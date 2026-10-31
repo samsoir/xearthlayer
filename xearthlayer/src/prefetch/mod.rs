@@ -8,7 +8,7 @@
 //!
 //! ## Adaptive Prefetcher (Recommended)
 //!
-//! Self-calibrating prefetch with flight phase detection (ground/cruise):
+//! Prefetch with flight phase detection (ground/cruise):
 //!
 //! ```text
 //! X-Plane Telemetry → TelemetryListener → AircraftState
@@ -54,10 +54,9 @@ pub use condition::{
 };
 pub use error::PrefetchError;
 pub use listener::TelemetryListener;
-pub use state::CircuitState;
 pub use state::{
-    AircraftSnapshot, AircraftState, BoxBoundsSnapshot, DetailedPrefetchStats, GpsStatus,
-    PrefetchMode, PrefetchStatsSnapshot, PrefetchStatusSnapshot, SharedPrefetchStatus,
+    resolve_state, AircraftState, BoxBoundsSnapshot, DetailedPrefetchStats, PrefetchState,
+    PrefetchStatsSnapshot, PrefetchStatusSnapshot, SharedPrefetchStatus, StateInputs,
 };
 pub use strategy::Prefetcher;
 
@@ -87,8 +86,8 @@ pub use scenery_cache::{
 // DSF tile types (used by FUSE layer and adaptive prefetch)
 pub use tile_based::DsfTileCoord;
 
-// Adaptive prefetch (self-calibrating DSF-aligned)
-pub use adaptive::{AdaptivePrefetchConfig, AdaptivePrefetchCoordinator};
+// Adaptive prefetch (DSF-aligned, phase-aware)
+pub use adaptive::{AdaptivePrefetchConfig, AdaptivePrefetchCoordinator, FlightPhase};
 
 // Prefetch state divergence detection (FUSE-side, #176)
 pub use state_observer::PrefetchStateObserver;

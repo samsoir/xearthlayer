@@ -38,6 +38,10 @@ pub struct SimState {
     pub replay: bool,
     /// Sim speed multiplier (1 = normal, 2 = 2x, etc.).
     pub sim_speed: i32,
+    /// X-Plane's smoothed frame rate in whole frames per second, for display.
+    /// `None` until X-Plane reports a usable frame period, or when its
+    /// version does not publish one.
+    pub frame_rate: Option<u16>,
 }
 
 impl Default for SimState {
@@ -52,6 +56,7 @@ impl Default for SimState {
             scenery_loading: false,
             replay: false,
             sim_speed: 1,
+            frame_rate: None,
         }
     }
 }
@@ -73,6 +78,9 @@ impl SimState {
                 .get(datarefs::IS_REPLAY)
                 .is_some_and(|v| *v as i32 != 0),
             sim_speed: values.get(datarefs::SIM_SPEED).map_or(1, |v| *v as i32),
+            frame_rate: values
+                .get(datarefs::FRAME_RATE_PERIOD)
+                .and_then(|period| frame_rate_from_period(*period)),
         }
     }
 
@@ -88,6 +96,12 @@ impl SimState {
     pub fn should_prefetch(&self) -> bool {
         !self.scenery_loading && !self.replay
     }
+}
+
+/// Whole frames per second from a frame period in seconds, or `None` when
+/// the period is not a positive finite number.
+fn frame_rate_from_period(period: f64) -> Option<u16> {
+    (period.is_finite() && period > 0.0).then(|| (1.0 / period).round().min(u16::MAX as f64) as u16)
 }
 
 #[cfg(test)]
@@ -129,6 +143,34 @@ mod tests {
     }
 
     #[test]
+    fn frame_rate_is_the_reciprocal_of_the_frame_period() {
+        let mut values = HashMap::new();
+        values.insert(datarefs::FRAME_RATE_PERIOD.to_string(), 1.0 / 45.0);
+        assert_eq!(SimState::from_dataref_values(&values).frame_rate, Some(45));
+
+        // Rounded, not truncated: 1/29.6 is 29.6 fps.
+        values.insert(datarefs::FRAME_RATE_PERIOD.to_string(), 1.0 / 29.6);
+        assert_eq!(SimState::from_dataref_values(&values).frame_rate, Some(30));
+    }
+
+    #[test]
+    fn frame_rate_is_unknown_without_a_usable_period() {
+        assert_eq!(
+            SimState::from_dataref_values(&HashMap::new()).frame_rate,
+            None
+        );
+        for period in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut values = HashMap::new();
+            values.insert(datarefs::FRAME_RATE_PERIOD.to_string(), period);
+            assert_eq!(
+                SimState::from_dataref_values(&values).frame_rate,
+                None,
+                "period {period}"
+            );
+        }
+    }
+
+    #[test]
     fn test_sim_state_missing_values_default_safe() {
         let values = HashMap::new();
         let state = SimState::from_dataref_values(&values);
@@ -148,6 +190,7 @@ mod tests {
             scenery_loading: false,
             replay: false,
             sim_speed: 1,
+            frame_rate: None,
         };
         assert!(flying.should_prefetch());
     }

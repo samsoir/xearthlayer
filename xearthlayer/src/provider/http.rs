@@ -190,11 +190,10 @@ impl HttpClient for ReqwestClient {
 
         // Check HTTP status
         if !response.status().is_success() {
-            return Err(ProviderError::HttpError(format!(
-                "HTTP {} from {}",
-                response.status(),
-                url
-            )));
+            return Err(ProviderError::HttpStatus {
+                status: response.status().as_u16(),
+                url: url.to_string(),
+            });
         }
 
         // Read response body
@@ -214,11 +213,10 @@ impl HttpClient for ReqwestClient {
 
         // Check HTTP status
         if !response.status().is_success() {
-            return Err(ProviderError::HttpError(format!(
-                "HTTP {} from {}",
-                response.status(),
-                url
-            )));
+            return Err(ProviderError::HttpStatus {
+                status: response.status().as_u16(),
+                url: url.to_string(),
+            });
         }
 
         // Read response body
@@ -239,11 +237,10 @@ impl HttpClient for ReqwestClient {
 
         // Check HTTP status
         if !response.status().is_success() {
-            return Err(ProviderError::HttpError(format!(
-                "HTTP {} from POST {}",
-                response.status(),
-                url
-            )));
+            return Err(ProviderError::HttpStatus {
+                status: response.status().as_u16(),
+                url: format!("POST {}", url),
+            });
         }
 
         // Read response body
@@ -348,11 +345,10 @@ impl AsyncHttpClient for AsyncReqwestClient {
                 status = response.status().as_u16(),
                 "HTTP error status"
             );
-            return Err(ProviderError::HttpError(format!(
-                "HTTP {} from {}",
-                response.status(),
-                url
-            )));
+            return Err(ProviderError::HttpStatus {
+                status: response.status().as_u16(),
+                url: url.to_string(),
+            });
         }
 
         // Read response body
@@ -389,11 +385,10 @@ impl AsyncHttpClient for AsyncReqwestClient {
 
         // Check HTTP status
         if !response.status().is_success() {
-            return Err(ProviderError::HttpError(format!(
-                "HTTP {} from {}",
-                response.status(),
-                url
-            )));
+            return Err(ProviderError::HttpStatus {
+                status: response.status().as_u16(),
+                url: url.to_string(),
+            });
         }
 
         // Read response body
@@ -419,11 +414,10 @@ impl AsyncHttpClient for AsyncReqwestClient {
 
         // Check HTTP status
         if !response.status().is_success() {
-            return Err(ProviderError::HttpError(format!(
-                "HTTP {} from {}",
-                response.status(),
-                url
-            )));
+            return Err(ProviderError::HttpStatus {
+                status: response.status().as_u16(),
+                url: url.to_string(),
+            });
         }
 
         // Read response body
@@ -446,11 +440,10 @@ impl AsyncHttpClient for AsyncReqwestClient {
 
         // Check HTTP status
         if !response.status().is_success() {
-            return Err(ProviderError::HttpError(format!(
-                "HTTP {} from POST {}",
-                response.status(),
-                url
-            )));
+            return Err(ProviderError::HttpStatus {
+                status: response.status().as_u16(),
+                url: format!("POST {}", url),
+            });
         }
 
         // Read response body

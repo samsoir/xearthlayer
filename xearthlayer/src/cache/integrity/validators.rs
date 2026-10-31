@@ -55,6 +55,19 @@ pub fn dds_tile_validator() -> MagicAndSize {
     }
 }
 
+/// Magic that opens every lit disk cache entry.
+pub const LIT_ENTRY_MAGIC: &[u8; 4] = b"XELL";
+
+/// Lit payloads: the lit entry magic; length varies by zoom, and the night
+/// source checks it (with the fingerprint) against the layout it expects.
+pub fn lit_payload_validator() -> MagicAndSize {
+    MagicAndSize {
+        name: "lit_payload",
+        magic: LIT_ENTRY_MAGIC,
+        expected_len: None,
+    }
+}
+
 /// Raw chunks: non-empty only.
 ///
 /// Asserting a JPEG magic would require proving every provider (Bing, Go2,
@@ -76,7 +89,7 @@ pub fn raw_chunk_validator() -> MagicAndSize {
 /// reaches 1, and sizing every level as `blocks_wide * blocks_high * 8`. The
 /// `div_ceil` matters for the tail: 4×4, 2×2 and 1×1 each still occupy one
 /// whole 8-byte block, which the naive `w * h / 2` under-counts.
-const fn full_chain_bc1_dds_size(width: u32, height: u32) -> usize {
+pub(crate) const fn full_chain_bc1_dds_size(width: u32, height: u32) -> usize {
     const HEADER_BYTES: usize = 128;
     const BLOCK_BYTES: usize = 8;
 
@@ -112,6 +125,17 @@ pub const EXPECTED_DDS_SIZE: usize = full_chain_bc1_dds_size(4096, 4096);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lit_payloads_need_the_lit_magic_and_any_length() {
+        let v = lit_payload_validator();
+        assert!(v.validate(b"XELL").is_ok());
+        assert!(v
+            .validate(&[b"XELL".as_slice(), &[0u8; 1000]].concat())
+            .is_ok());
+        assert!(v.validate(b"DDS \0\0\0\0").is_err());
+        assert!(v.validate(b"").is_err());
+    }
 
     #[test]
     fn dds_validator_accepts_a_well_formed_tile() {

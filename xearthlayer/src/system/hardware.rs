@@ -46,7 +46,11 @@ pub struct SystemInfo {
     pub cpu_cores: usize,
     /// Total system memory in bytes
     pub total_memory: usize,
-    /// Detected storage type for the cache path
+    /// Whether `total_memory` was actually detected. False means the
+    /// 8 GB fallback is in use and displays should say so.
+    pub memory_detected: bool,
+    /// Detected storage type for the cache path. `Unknown` when detection
+    /// failed; displays should say so rather than presenting a guess.
     pub storage_type: StorageType,
     /// Bytes available to a non-privileged user at the cache path's
     /// filesystem. Used to size the recommended disk cache. Zero if
@@ -72,7 +76,10 @@ impl SystemInfo {
     /// ```
     pub fn detect(cache_path: &Path) -> Self {
         let cpu_cores = detect_cpu_cores();
-        let total_memory = detect_total_memory();
+        let (total_memory, memory_detected) = match try_detect_total_memory() {
+            Some(mem) => (mem, true),
+            None => (fallback_memory(), false),
+        };
         let storage_type =
             super::storage_detect::detect_storage_type(cache_path).unwrap_or(StorageType::Unknown);
         let cache_path_available_bytes = available_bytes_for(cache_path);
@@ -80,6 +87,7 @@ impl SystemInfo {
         Self {
             cpu_cores,
             total_memory,
+            memory_detected,
             storage_type,
             cache_path_available_bytes,
         }
@@ -102,6 +110,7 @@ impl SystemInfo {
         Self {
             cpu_cores,
             total_memory,
+            memory_detected: true,
             storage_type,
             cache_path_available_bytes,
         }
@@ -134,8 +143,18 @@ impl SystemInfo {
     // =========================================================================
 
     /// Get formatted memory string (e.g., "32 GB").
+    ///
+    /// When detection failed, the fallback value is flagged as a guess
+    /// (e.g., "8 GB (assumed, detection failed)") so the user can verify.
     pub fn memory_display(&self) -> String {
-        format_size(self.total_memory)
+        if self.memory_detected {
+            format_size(self.total_memory)
+        } else {
+            format!(
+                "{} (assumed, detection failed)",
+                format_size(self.total_memory)
+            )
+        }
     }
 
     /// Get formatted recommended memory cache size (e.g., "8 GB").
@@ -182,37 +201,75 @@ pub fn detect_cpu_cores() -> usize {
 
 /// Detect total system memory in bytes.
 ///
+/// Falls back to 8GB if detection fails. Use [`try_detect_total_memory`]
+/// when the caller needs to distinguish a detected value from the fallback.
+///
 /// # Platform Support
 ///
 /// - **Linux**: Parses `/proc/meminfo`
+/// - **macOS**: Reads `hw.memsize` via `sysctl(8)`
 /// - **Other platforms**: Returns fallback of 8GB
-#[cfg(target_os = "linux")]
 pub fn detect_total_memory() -> usize {
+    try_detect_total_memory().unwrap_or_else(fallback_memory)
+}
+
+/// Detect total system memory in bytes, surfacing failure.
+///
+/// Returns `None` when detection fails so callers (e.g. the setup wizard)
+/// can flag the fallback instead of presenting it as a detection.
+#[cfg(target_os = "linux")]
+pub fn try_detect_total_memory() -> Option<usize> {
     use std::fs;
 
     // Parse /proc/meminfo
-    if let Ok(content) = fs::read_to_string("/proc/meminfo") {
-        for line in content.lines() {
-            if line.starts_with("MemTotal:") {
-                // Format: "MemTotal:       16384000 kB"
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(kb) = parts[1].parse::<usize>() {
-                        return kb * 1024; // Convert to bytes
-                    }
+    let content = fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if line.starts_with("MemTotal:") {
+            // Format: "MemTotal:       16384000 kB"
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Ok(kb) = parts[1].parse::<usize>() {
+                    return Some(kb * 1024); // Convert to bytes
                 }
             }
         }
     }
-
-    // Fallback: 8GB
-    fallback_memory()
+    None
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn detect_total_memory() -> usize {
-    // Fallback for non-Linux: 8GB
-    fallback_memory()
+/// macOS has no `/proc/meminfo`; `hw.memsize` reports total physical RAM in
+/// bytes. Without this, the setup wizard silently sized the cache from the 8GB
+/// fallback (RAM/12 → ~682MB) on every Mac regardless of actual memory.
+#[cfg(target_os = "macos")]
+pub fn try_detect_total_memory() -> Option<usize> {
+    use std::process::Command;
+
+    Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| parse_sysctl_memsize(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Parse the byte count printed by `sysctl -n hw.memsize`.
+///
+/// Pure function (no I/O) so the parsing is unit-testable. The output is a
+/// single decimal byte count, e.g. `137438953472\n`. Returns `None` for empty,
+/// non-numeric, or zero values so the caller can fall back.
+#[cfg(target_os = "macos")]
+fn parse_sysctl_memsize(output: &str) -> Option<usize> {
+    output
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|&bytes| bytes > 0)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn try_detect_total_memory() -> Option<usize> {
+    // No detection on unsupported platforms; callers fall back to 8GB.
+    None
 }
 
 /// Fallback memory value when detection fails.
@@ -235,6 +292,27 @@ mod tests {
     fn test_detect_total_memory_returns_positive() {
         let memory = detect_total_memory();
         assert!(memory > 0, "Should detect some memory");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_sysctl_memsize_parses_bytes_and_rejects_garbage() {
+        assert_eq!(parse_sysctl_memsize("137438953472\n"), Some(137438953472));
+        assert_eq!(parse_sysctl_memsize("  68719476736  "), Some(68719476736));
+        assert_eq!(parse_sysctl_memsize(""), None);
+        assert_eq!(parse_sysctl_memsize("not-a-number"), None);
+        assert_eq!(parse_sysctl_memsize("0"), None, "zero is not a valid total");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detect_total_memory_reads_real_ram_on_macos() {
+        // Exercise the sysctl path via the failure-surfacing variant: a sysctl
+        // failure is None here, not the 8GB fallback, so this test cannot pass
+        // by failing. The floor is 2GB rather than the fallback because CI
+        // runners are macOS hosts with less than 8GB (macos-15 has 7GB).
+        let mem = try_detect_total_memory().expect("sysctl hw.memsize should succeed on macOS");
+        assert!(mem >= 2 * GB, "detected RAM implausibly low: {mem}");
     }
 
     #[test]
@@ -264,6 +342,26 @@ mod tests {
         // 16GB / 12 = 1.333... GB, rounded to a whole GB for a tidy config value
         assert_eq!(info.recommended_memory_cache_display(), "1 GB");
         assert_eq!(info.storage_display(), "SATA SSD");
+    }
+
+    #[test]
+    fn memory_display_flags_fallback_when_detection_failed() {
+        let mut info = SystemInfo::new(8, fallback_memory(), StorageType::Ssd);
+        info.memory_detected = false;
+        assert_eq!(info.memory_display(), "8 GB (assumed, detection failed)");
+
+        info.memory_detected = true;
+        assert_eq!(info.memory_display(), "8 GB");
+    }
+
+    #[test]
+    fn detect_flags_memory_as_detected_on_supported_platforms() {
+        // Linux (/proc/meminfo) and macOS (sysctl) both detect reliably;
+        // the flag must be true so no caveat is shown for real values.
+        // Storage is not asserted: /tmp may be tmpfs where detection
+        // legitimately fails (and Unknown is then the correct answer).
+        let info = SystemInfo::detect(Path::new("/tmp"));
+        assert!(info.memory_detected);
     }
 
     #[test]

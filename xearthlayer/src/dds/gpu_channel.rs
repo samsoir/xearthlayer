@@ -256,7 +256,9 @@ mod inner {
                 .map_err(|_| DdsError::CompressionFailed("map_async callback never fired".into()))?
                 .map_err(|e| DdsError::CompressionFailed(format!("buffer mapping failed: {e}")))?;
 
-            let data = buffer_slice.get_mapped_range();
+            let data = buffer_slice.get_mapped_range().map_err(|e| {
+                DdsError::CompressionFailed(format!("mapped range unavailable: {e}"))
+            })?;
             result.extend_from_slice(&data);
             drop(data);
             readback_buffer.unmap();
@@ -370,7 +372,9 @@ mod inner {
     /// Create a [`GpuEncoderChannel`] with a full-tile streaming worker.
     ///
     /// Initializes GPU resources and spawns the worker thread. Returns the
-    /// channel handle and worker `JoinHandle`.
+    /// channel handle, the worker `JoinHandle`, and the selection: the
+    /// adapter chosen (for display; the worker owns the device) with the
+    /// host's other adapters for the encoder policy.
     ///
     /// # Errors
     ///
@@ -378,15 +382,21 @@ mod inner {
     pub fn create_gpu_encoder_channel(
         gpu_device: &str,
         shutdown: tokio_util::sync::CancellationToken,
-    ) -> Result<(GpuEncoderChannel, tokio::task::JoinHandle<()>), DdsError> {
-        let (device, queue, compressor, adapter_name) =
-            crate::dds::create_gpu_resources(gpu_device)?;
+    ) -> Result<
+        (
+            GpuEncoderChannel,
+            tokio::task::JoinHandle<()>,
+            crate::system::GpuSelection,
+        ),
+        DdsError,
+    > {
+        let (device, queue, compressor, selection) = crate::dds::create_gpu_resources(gpu_device)?;
 
-        tracing::info!(adapter = %adapter_name, "GPU pipeline worker starting");
+        tracing::info!(adapter = %selection.adapter, "GPU pipeline worker starting");
 
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let handle = spawn_gpu_worker(device, queue, compressor, rx, shutdown);
-        Ok((GpuEncoderChannel::new(tx), handle))
+        Ok((GpuEncoderChannel::new(tx), handle, selection))
     }
 }
 
@@ -663,10 +673,11 @@ mod tests {
     #[ignore] // Requires GPU hardware
     async fn test_create_gpu_encoder_channel_convenience() {
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (channel, worker_handle) = match create_gpu_encoder_channel("integrated", shutdown) {
-            Ok(r) => r,
-            Err(_) => return,
-        };
+        let (channel, worker_handle, _adapter) =
+            match create_gpu_encoder_channel("integrated", shutdown) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
 
         // Verify channel is connected
         assert!(channel.is_connected());

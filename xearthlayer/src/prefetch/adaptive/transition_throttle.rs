@@ -26,6 +26,19 @@ const DEFAULT_RAMP_DURATION: Duration = Duration::from_secs(30);
 /// Default ramp start fraction.
 const DEFAULT_RAMP_START_FRACTION: f64 = 0.25;
 
+/// Computes the ramp fraction for a given elapsed time.
+///
+/// Returns `None` once the ramp has completed, signalling the caller to fall
+/// back to full throughput. Kept free of `Instant` so the interpolation can be
+/// tested deterministically without wall-clock sleeps.
+fn ramp_fraction(elapsed: Duration, ramp_duration: Duration, start_fraction: f64) -> Option<f64> {
+    if elapsed >= ramp_duration {
+        return None;
+    }
+    let t = elapsed.as_secs_f64() / ramp_duration.as_secs_f64();
+    Some(start_fraction + t * (1.0 - start_fraction))
+}
+
 /// Internal state of the transition throttle.
 #[derive(Debug, Clone)]
 enum ThrottleState {
@@ -123,14 +136,17 @@ impl TransitionThrottle {
             ThrottleState::Idle => 1.0,
             ThrottleState::Held => 0.0,
             ThrottleState::Ramping { started_at } => {
-                let elapsed = started_at.elapsed();
-                if elapsed >= self.ramp_duration {
-                    tracing::debug!("TransitionThrottle: ramp complete");
-                    self.state = ThrottleState::Idle;
-                    1.0
-                } else {
-                    let t = elapsed.as_secs_f64() / self.ramp_duration.as_secs_f64();
-                    self.ramp_start_fraction + t * (1.0 - self.ramp_start_fraction)
+                match ramp_fraction(
+                    started_at.elapsed(),
+                    self.ramp_duration,
+                    self.ramp_start_fraction,
+                ) {
+                    Some(fraction) => fraction,
+                    None => {
+                        tracing::debug!("TransitionThrottle: ramp complete");
+                        self.state = ThrottleState::Idle;
+                        1.0
+                    }
                 }
             }
         }
@@ -209,14 +225,15 @@ mod tests {
 
     #[test]
     fn test_ramp_resets_on_re_transition() {
-        let mut throttle = TransitionThrottle::with_config(Duration::from_millis(100), 0.25);
+        // Long ramp so no plausible scheduling delay advances it meaningfully;
+        // this test covers the state machine, not the interpolation.
+        let mut throttle = TransitionThrottle::with_config(Duration::from_secs(60), 0.25);
 
         // First cycle: Transition → Cruise (start ramp)
         throttle.on_phase_change(FlightPhase::Ground, FlightPhase::Transition);
         throttle.on_phase_change(FlightPhase::Transition, FlightPhase::Cruise);
-        std::thread::sleep(Duration::from_millis(50));
-        let mid_ramp = throttle.fraction();
-        assert!(mid_ramp > 0.25 && mid_ramp < 1.0);
+        let started = throttle.fraction();
+        assert!(started >= 0.25 && started < 0.35);
 
         // Touch-and-go: Cruise → Ground → Transition → Cruise
         throttle.on_phase_change(FlightPhase::Cruise, FlightPhase::Ground);
@@ -234,19 +251,28 @@ mod tests {
     }
 
     #[test]
-    fn test_ramp_linear_at_midpoint() {
-        let mut throttle = TransitionThrottle::with_config(Duration::from_millis(100), 0.25);
-        throttle.on_phase_change(FlightPhase::Ground, FlightPhase::Transition);
-        throttle.on_phase_change(FlightPhase::Transition, FlightPhase::Cruise);
+    fn test_ramp_fraction_is_linear_between_start_and_full() {
+        let ramp = Duration::from_millis(100);
 
-        std::thread::sleep(Duration::from_millis(50));
-        let frac = throttle.fraction();
+        // At t=0: the configured start fraction.
+        assert_eq!(ramp_fraction(Duration::ZERO, ramp, 0.25), Some(0.25));
+
         // At t=0.5: 0.25 + 0.5 * (1.0 - 0.25) = 0.625
-        let expected = 0.625;
-        assert!(
-            (frac - expected).abs() < 0.1,
-            "Expected ~{expected} at midpoint, got {frac}"
-        );
+        let mid = ramp_fraction(Duration::from_millis(50), ramp, 0.25).unwrap();
+        assert!((mid - 0.625).abs() < 1e-9, "expected 0.625, got {mid}");
+
+        // At t=0.75: 0.25 + 0.75 * 0.75 = 0.8125
+        let late = ramp_fraction(Duration::from_millis(75), ramp, 0.25).unwrap();
+        assert!((late - 0.8125).abs() < 1e-9, "expected 0.8125, got {late}");
+    }
+
+    #[test]
+    fn test_ramp_fraction_completes_at_and_beyond_duration() {
+        let ramp = Duration::from_millis(100);
+        assert_eq!(ramp_fraction(ramp, ramp, 0.25), None);
+        assert_eq!(ramp_fraction(Duration::from_millis(101), ramp, 0.25), None);
+        // A zero-length ramp completes immediately rather than dividing by zero.
+        assert_eq!(ramp_fraction(Duration::ZERO, Duration::ZERO, 0.25), None);
     }
 
     #[test]

@@ -3,7 +3,6 @@
 //! This module provides the [`AdaptivePrefetchCoordinator`] which orchestrates
 //! all adaptive prefetch components including:
 //!
-//! - Performance calibration for mode selection
 //! - Flight phase detection (ground/cruise)
 //! - Turn detection for prefetch pausing
 //! - Transition throttle for takeoff ramp-up (#62)
@@ -26,9 +25,8 @@
 //! use xearthlayer::prefetch::adaptive::coordinator::AdaptivePrefetchCoordinator;
 //!
 //! let coordinator = AdaptivePrefetchCoordinator::with_defaults()
-//!     .with_calibration(calibration)
 //!     .with_throttler(circuit_breaker)
-//!     .with_dds_client(dds_client);
+//!     .with_prefetch_lane(prefetch_lane);
 //!
 //! // Run the coordinator loop
 //! coordinator.run(shutdown_token).await;

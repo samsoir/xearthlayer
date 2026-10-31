@@ -353,6 +353,7 @@ mod tests {
     /// The point of #227's next flight: glibc's own accounting must be
     /// readable, and the retention gap must be derivable from it.
     #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn test_allocator_sample_reads_glibc_accounting() {
         let Some(a) = AllocatorSample::read() else {
             panic!("mallinfo2 must be available on a glibc Linux build");
@@ -451,12 +452,55 @@ mod tests {
     /// the OS. Measured on glibc 2.44: holding 44 MiB gives hblkhd 44.4 MB on
     /// the first round, then 0.4 MB with arena 45.6 MB on every round after.
     ///
-    /// Asserted as a lower bound while holding the memory. `mallinfo2` is
-    /// process-global and cargo runs tests in parallel, so a delta here is not
-    /// this test's to measure -- see `test_allocator_sample_reports_live_allocations`.
+    /// Measured in a process of its own. glibc consults the mmap threshold
+    /// only after failing to find a free arena chunk big enough, so tiles are
+    /// carved from any free space other tests have left in the arenas, pin or
+    /// no pin. Sharing a process with the rest of the suite, the result
+    /// depended on what those tests had last freed: on PR #295 it absorbed up
+    /// to five of the twelve tiles and failed about one run in three, while
+    /// the arena never grew. Unlike the sibling probe below, other tests can
+    /// push this figure down, so a floor alone does not make it robust.
     #[test]
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn test_configure_allocator_keeps_large_blocks_off_the_arena() {
+        if std::env::var_os(ISOLATED_PROBE).is_some() {
+            keeps_large_blocks_off_the_arena();
+            return;
+        }
+
+        // Re-run this test binary with only this test in it.
+        let name = format!(
+            "{}::test_configure_allocator_keeps_large_blocks_off_the_arena",
+            module_path!()
+                .split_once("::")
+                .expect("crate-qualified path")
+                .1
+        );
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", &name, "--test-threads=1", "--nocapture"])
+            .env(ISOLATED_PROBE, "1")
+            .output()
+            .expect("the test binary can re-run itself");
+
+        assert!(
+            output.status.success(),
+            "isolated allocator probe failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the isolated run did not execute the probe:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// Set in the child process that performs the measurement.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    const ISOLATED_PROBE: &str = "XEARTHLAYER_ISOLATED_ALLOCATOR_PROBE";
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn keeps_large_blocks_off_the_arena() {
         const MIB: usize = 1024 * 1024;
 
         // Drive the adaptation the way the tile pipeline does. Without the pin
@@ -496,6 +540,7 @@ mod tests {
     ///
     /// Other tests can only ever *add* to these figures, so a floor holds.
     #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn test_allocator_sample_reports_live_allocations() {
         const MIB: usize = 1024 * 1024;
         // DDS-sized blocks, which glibc serves by mmap: an 11 MiB allocation
@@ -609,6 +654,10 @@ mod tests {
 ///
 /// The cost is one `mmap`/`munmap` pair per tile, measured at **+0.16 ms** —
 /// about 20 seconds of CPU across an 11-hour flight. See issue #227.
+// Consumed only by `configure_allocator`, which is gated to linux-gnu.
+// Kept compiled everywhere so the unit tests below, which are pure string
+// logic, keep their coverage on macOS.
+#[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]
 const MMAP_THRESHOLD_BYTES: usize = 1024 * 1024;
 
 /// Maximum number of glibc malloc arenas: 4.
@@ -637,12 +686,24 @@ const MMAP_THRESHOLD_BYTES: usize = 1024 * 1024;
 /// [`MMAP_THRESHOLD_BYTES`], so what remains is one dominant size class of
 /// ~256 KiB chunk buffers — close to the best case for a low arena count.
 /// See issue #227.
+// Consumed only by `configure_allocator`, which is gated to linux-gnu.
+// Kept compiled everywhere so the unit tests below, which are pure string
+// logic, keep their coverage on macOS.
+#[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]
 const ARENA_MAX: i32 = 4;
 
 /// The `GLIBC_TUNABLES` key that sets the arena ceiling.
+// Consumed only by `configure_allocator`, which is gated to linux-gnu.
+// Kept compiled everywhere so the unit tests below, which are pure string
+// logic, keep their coverage on macOS.
+#[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]
 const TUNABLE_ARENA_MAX: &str = "glibc.malloc.arena_max";
 
 /// The `GLIBC_TUNABLES` key that sets the mmap threshold.
+// Consumed only by `configure_allocator`, which is gated to linux-gnu.
+// Kept compiled everywhere so the unit tests below, which are pure string
+// logic, keep their coverage on macOS.
+#[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]
 const TUNABLE_MMAP_THRESHOLD: &str = "glibc.malloc.mmap_threshold";
 
 /// Whether the user has already pinned this parameter themselves.
@@ -653,6 +714,10 @@ const TUNABLE_MMAP_THRESHOLD: &str = "glibc.malloc.mmap_threshold";
 /// subsequent `mallopt(M_ARENA_MAX, 4)` yields 1 MB. Without this check a user
 /// running an allocator experiment would have their setting discarded with no
 /// diagnostic.
+// Consumed only by `configure_allocator`, which is gated to linux-gnu.
+// Kept compiled everywhere so the unit tests below, which are pure string
+// logic, keep their coverage on macOS.
+#[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]
 fn user_pinned(env_value: Option<&str>, tunables: Option<&str>, tunable_key: &str) -> bool {
     env_value.is_some() || tunables.is_some_and(|t| t.contains(tunable_key))
 }

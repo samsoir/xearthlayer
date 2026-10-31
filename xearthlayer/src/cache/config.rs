@@ -121,6 +121,12 @@ impl ServiceCacheConfig {
         self
     }
 
+    /// Mark this config as the night lit payload cache tier.
+    pub fn as_lit_tier(mut self) -> Self {
+        self.tier = DiskTier::Lit;
+        self
+    }
+
     /// Set the metrics client for reporting cache stats.
     ///
     /// For disk caches, this enables GC eviction reporting to the metrics system.
@@ -199,6 +205,19 @@ impl DiskProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn as_lit_tier_marks_the_lit_tier() {
+        let c = ServiceCacheConfig::disk(
+            1,
+            PathBuf::from("/tmp/xel-tier-test"),
+            Duration::from_secs(60),
+            "night".into(),
+        )
+        .as_lit_tier();
+        assert_eq!(c.tier, DiskTier::Lit);
+        assert_eq!(DiskTier::Lit.as_str(), "lit");
+    }
 
     #[test]
     fn test_memory_config() {

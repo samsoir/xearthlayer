@@ -5,7 +5,6 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::Command;
 use std::task::{Context, Poll};
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -188,29 +187,37 @@ impl SpawnedMountHandle {
         if let Some(task) = self.task.take() {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
 
+            let mut finished = false;
             while std::time::Instant::now() < deadline {
                 if task.is_finished() {
-                    debug!(mountpoint = %mountpoint_str, "Mount task completed cleanly");
-                    return;
+                    debug!(mountpoint = %mountpoint_str, "Mount task completed");
+                    finished = true;
+                    break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
 
-            // Task didn't finish in time — abort and fall back to fusermount
-            warn!(
-                mountpoint = %mountpoint_str,
-                "Mount task did not complete within 5s, aborting"
-            );
-            task.abort();
+            if !finished {
+                // Task didn't finish in time — abort and fall back to umount.
+                warn!(
+                    mountpoint = %mountpoint_str,
+                    "Mount task did not complete within 5s, aborting"
+                );
+                task.abort();
+            }
         }
 
-        // Fallback: check if still mounted and use fusermount
+        // Always verify the mount is actually gone. The fuse3 task completing
+        // does NOT prove the kernel released the mount — on macFUSE it routinely
+        // leaves the mount wedged — so we must check and force-unmount rather
+        // than trust task completion. `is_mounted` is platform-correct, so a
+        // false here genuinely means unmounted.
         if !Self::is_mounted(&self.mountpoint) {
-            debug!(mountpoint = %mountpoint_str, "Already unmounted after task abort");
+            debug!(mountpoint = %mountpoint_str, "Unmounted cleanly");
             return;
         }
 
-        debug!(mountpoint = %mountpoint_str, "Still mounted, attempting fusermount");
+        debug!(mountpoint = %mountpoint_str, "Still mounted, forcing unmount");
 
         let graceful_success = Self::try_unmount(&mountpoint_str, false);
 
@@ -239,70 +246,30 @@ impl SpawnedMountHandle {
         }
     }
 
-    /// Attempt to unmount using fusermount3 or fusermount.
+    /// Attempt to unmount the filesystem at `mountpoint`.
+    ///
+    /// Delegates to the platform-abstracted [`unmount_fuse`] helper
+    /// (fusermount on Linux, umount on macOS).
     ///
     /// # Arguments
     /// * `mountpoint` - Path to unmount
-    /// * `lazy` - If true, use lazy unmount (-uz) which detaches immediately
+    /// * `lazy` - If true, escalate to the platform's most aggressive unmount
+    ///   (Linux lazy `-uz`, macOS force `-f`)
     ///
     /// # Returns
     /// `true` if unmount command succeeded, `false` otherwise
     fn try_unmount(mountpoint: &str, lazy: bool) -> bool {
-        let args: &[&str] = if lazy {
-            &["-uz", mountpoint]
-        } else {
-            &["-u", mountpoint]
-        };
-
-        let result = Command::new("fusermount3")
-            .args(args)
-            .output()
-            .or_else(|_| Command::new("fusermount").args(args).output());
-
-        match result {
-            Ok(output) => {
-                if output.status.success() {
-                    true
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    // "not found" or "not mounted" means already unmounted - that's success
-                    if stderr.contains("not found") || stderr.contains("not mounted") {
-                        true
-                    } else {
-                        debug!(
-                            mountpoint = %mountpoint,
-                            lazy = lazy,
-                            stderr = %stderr,
-                            "fusermount failed"
-                        );
-                        false
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    mountpoint = %mountpoint,
-                    error = %e,
-                    "Failed to run fusermount"
-                );
-                false
-            }
-        }
+        crate::system::unmount_fuse(std::path::Path::new(mountpoint), lazy)
     }
 
     /// Check if a path is currently mounted.
+    ///
+    /// Delegates to the shared, platform-aware [`crate::system::is_path_mounted`]
+    /// so mount detection lives in exactly one place. A wrong answer here is not
+    /// cosmetic: `unmount_sync` only escalates to a real `umount` when this
+    /// returns `true`.
     fn is_mounted(path: &Path) -> bool {
-        // Read /proc/mounts to check if the path is mounted
-        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-            let path_str = path.to_string_lossy();
-            for line in mounts.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 && parts[1] == path_str {
-                    return true;
-                }
-            }
-        }
-        false
+        crate::system::is_path_mounted(path)
     }
 }
 

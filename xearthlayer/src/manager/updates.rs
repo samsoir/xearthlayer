@@ -2,7 +2,7 @@
 
 use semver::Version;
 
-use crate::package::{LibraryEntry, PackageLibrary, PackageType};
+use xearthlayer_package::{LibraryEntry, PackageLibrary, PackageType};
 
 use super::traits::LibraryClient;
 use super::{LocalPackageStore, ManagerResult};
@@ -234,9 +234,9 @@ impl<'a, C: LibraryClient> UpdateChecker<'a, C> {
 mod tests {
     use super::*;
     use crate::manager::ManagerError;
-    use crate::package::PackageMetadata;
     use std::fs;
     use tempfile::TempDir;
+    use xearthlayer_package::PackageMetadata;
 
     /// Mock library client for testing.
     struct MockLibraryClient {
@@ -293,7 +293,7 @@ mod tests {
     }
 
     fn create_mock_package(dir: &std::path::Path, region: &str, version: &str) {
-        let mountpoint = crate::package::package_mountpoint(region, PackageType::Ortho);
+        let mountpoint = xearthlayer_package::package_mountpoint(region, PackageType::Ortho);
         let package_dir = dir.join(&mountpoint);
         fs::create_dir_all(&package_dir).unwrap();
 

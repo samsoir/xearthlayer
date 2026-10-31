@@ -98,12 +98,14 @@
 //! ```
 
 mod health;
+mod lane;
 mod orchestrator;
 mod request;
 mod tile_progress;
 mod tokio_runtime;
 
 pub use health::{HealthSnapshot, HealthStatus, RuntimeHealth, SharedRuntimeHealth};
+pub use lane::{LaneError, LaneOutcome, LaneReceipt, LocalPrefetchLane, PrefetchLane};
 pub use orchestrator::{RuntimeConfig, XEarthLayerRuntime};
 pub use request::{DdsResponse, JobRequest, RequestOrigin};
 pub use tile_progress::{

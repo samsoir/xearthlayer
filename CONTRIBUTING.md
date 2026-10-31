@@ -31,12 +31,12 @@ XEarthLayer maintains two long-lived branches, one per release channel:
 | Branch | Channel | Version format | Purpose |
 |--------|---------|----------------|---------|
 | `main` | Stable | `X.Y.Z` (e.g. `0.4.6`) | Production releases — what most users run. |
-| `develop/0.4.7` | Unstable | `X.Y.Z-dev.N` (e.g. `0.4.7-dev.3`) | The next release, including breaking changes. |
+| `develop/0.5.0` | Unstable | `X.Y.Z-dev.N` (e.g. `0.5.0-dev.3`) | The next release, including breaking changes. |
 
 Work branches off — and its PR targets — whichever long-lived branch owns the change:
 
 - **Fixes and small features for the current stable line** target `main`.
-- **Breaking changes and features for the next release** target `develop/0.4.7`.
+- **Breaking changes and features for the next release** target `develop/0.5.0`.
 
 Branch naming (the prefix names the *change*; the base branch selects the *channel*):
 
@@ -46,7 +46,7 @@ Branch naming (the prefix names the *change*; the base branch selects the *chann
 - `chore/<description>` — tooling, docs, maintenance
 
 **Golden rule — fixes flow one way.** Land fixes on `main` first, then forward-merge
-`main` → `develop/0.4.7` to carry them into the unstable line. `develop/0.4.7` is
+`main` → `develop/0.5.0` to carry them into the unstable line. `develop/0.5.0` is
 **never** merged back into `main` until the whole line is promoted as a stable release.
 This keeps `main` releasable at any moment.
 
@@ -69,6 +69,16 @@ This runs:
 The hook skips checks for documentation-only commits (no `.rs`, `.toml`, or `Makefile` changes). To bypass the hook in exceptional cases: `git commit --no-verify`.
 
 CI will reject PRs that haven't passed these checks.
+
+**Every PR must pass two status checks:** `Verify` (Linux) and `Verify (macOS)`. Both
+are required by design — macOS is a Tier 1 platform, and every release is gated on both
+passing before publish. You do not need a Mac to contribute; CI builds and verifies
+macOS for you. Note that `Verify (macOS)` is expected to fail on `develop/0.5.0` until
+the macOS port (PR #202) merges — don't try to fix it if your PR targets that branch
+in the meantime.
+
+See [CI/CD Pipeline](docs/dev/cicd.md) for the full pipeline description, including how
+merge-blocking and release-blocking currently differ per platform.
 
 ### Writing Code
 

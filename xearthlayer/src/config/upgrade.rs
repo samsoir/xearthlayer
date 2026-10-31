@@ -152,7 +152,120 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     "executor.max_concurrent_tasks",
     "executor.job_channel_capacity",
     "executor.request_channel_capacity",
+    // Removed in #249 — neither key reached the executor.
+    //
+    // max_concurrent_jobs was only ever a number the dashboard divided by. It
+    // named no limit: job admission is bounded by the executor's task dispatch
+    // and the resource pools, neither of which consulted it.
+    //
+    // retry_base_delay_ms could not be honoured at all. The backoff between
+    // chunk retries is `100ms * 2^attempt`, written as a literal in
+    // tasks/download_chunks.rs, so there was nothing for the value to reach.
+    // Retry count stays configurable through executor.max_retries.
+    "executor.max_concurrent_jobs",
+    "executor.retry_base_delay_ms",
+    // Removed in #277 - they configured a throughput calibrator that nothing
+    // fed and whose result nothing read, so no value here ever changed the mode.
+    "prefetch.calibration_aggressive_threshold",
+    "prefetch.calibration_opportunistic_threshold",
+    "prefetch.calibration_sample_duration",
+    // Removed in #340 - only on or off was left of the mode: `aggressive`
+    // behaved as `opportunistic`, and `disabled` is `prefetch.enabled = false`
+    // (see FOLDED_VALUES).
+    "prefetch.mode",
 ];
+
+/// A value a setting no longer accepts, and the value that replaces it.
+///
+/// `DEPRECATED_KEYS` retires a whole setting. This retires one value of a
+/// setting that stays: the parser reads `value` as `replacement`, so an old
+/// config keeps loading, and `config upgrade` rewrites it on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeprecatedValue {
+    /// Setting in "section.key" format.
+    pub key: &'static str,
+    /// The retired value, matched case-insensitively.
+    pub value: &'static str,
+    /// What the retired value is read as.
+    pub replacement: &'static str,
+}
+
+/// Retired values of current settings.
+pub const DEPRECATED_VALUES: &[DeprecatedValue] = &[
+    // #334: the rebuilt world is library generation v2. The old URL keeps the
+    // old world, frozen, for pre-0.5 clients; the alpha staging channel is
+    // replaced by the promoted v2 library.
+    DeprecatedValue {
+        key: "packages.library_url",
+        value: super::defaults::LEGACY_LIBRARY_URL,
+        replacement: super::defaults::DEFAULT_LIBRARY_URL,
+    },
+    DeprecatedValue {
+        key: "packages.library_url",
+        value: super::defaults::ALPHA_STAGING_LIBRARY_URL,
+        replacement: super::defaults::DEFAULT_LIBRARY_URL,
+    },
+];
+
+/// Look up the retired-value entry for `key = value`, if there is one.
+pub fn deprecated_value(key: &str, value: &str) -> Option<DeprecatedValue> {
+    let value = value.trim();
+    DEPRECATED_VALUES
+        .iter()
+        .find(|d| d.key == key && d.value.eq_ignore_ascii_case(value))
+        .copied()
+}
+
+/// A value of a retired setting that must survive the setting: the parser
+/// reads `key = value` as `into = becomes`, and `config upgrade` writes it so.
+///
+/// `DEPRECATED_KEYS` drops a setting. A fold is for the setting whose removal
+/// alone would change behaviour, because one of its values switched something
+/// that a current setting now owns. A fold only ever applies `becomes`, so it
+/// can narrow `into` but never undo an explicit value the other way: with
+/// `becomes = "false"`, an `into` already false stays false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldedValue {
+    /// The retired setting, in "section.key" format, listed in `DEPRECATED_KEYS`.
+    pub key: &'static str,
+    /// Its value that still matters, matched case-insensitively.
+    pub value: &'static str,
+    /// The current setting that carries it now.
+    pub into: &'static str,
+    /// What `into` is set to.
+    pub becomes: &'static str,
+}
+
+/// Values of retired settings that move to a current setting.
+pub const FOLDED_VALUES: &[FoldedValue] = &[
+    // #340: `prefetch.mode = disabled` switched prefetch off by a second route.
+    // The new switch is the old `enabled` AND the mode not being `disabled`.
+    FoldedValue {
+        key: "prefetch.mode",
+        value: "disabled",
+        into: "prefetch.enabled",
+        becomes: "false",
+    },
+];
+
+impl FoldedValue {
+    /// One line for the user: what their file said and what it now says.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} = {} is now {} = {}",
+            self.key, self.value, self.into, self.becomes
+        )
+    }
+}
+
+/// Look up the fold for the retired `key = value`, if there is one.
+pub fn folded_value(key: &str, value: &str) -> Option<FoldedValue> {
+    let value = value.trim();
+    FOLDED_VALUES
+        .iter()
+        .find(|f| f.key == key && f.value.eq_ignore_ascii_case(value))
+        .copied()
+}
 
 /// Result of analyzing a configuration file for upgrade needs.
 #[derive(Debug, Clone)]
@@ -167,6 +280,13 @@ pub struct ConfigUpgradeAnalysis {
     /// These are preserved during upgrade but flagged for user review.
     pub unknown_keys: Vec<String>,
 
+    /// Settings in user's config holding a retired value, to be rewritten.
+    pub migrated_values: Vec<DeprecatedValue>,
+
+    /// Retired settings whose value moves to a current setting. Each one's key
+    /// is also in `deprecated_keys`.
+    pub folded_values: Vec<FoldedValue>,
+
     /// Whether any upgrade action is needed.
     pub needs_upgrade: bool,
 }
@@ -178,6 +298,8 @@ impl ConfigUpgradeAnalysis {
             missing_keys: Vec::new(),
             deprecated_keys: Vec::new(),
             unknown_keys: Vec::new(),
+            migrated_values: Vec::new(),
+            folded_values: Vec::new(),
             needs_upgrade: false,
         }
     }
@@ -205,6 +327,10 @@ impl ConfigUpgradeAnalysis {
             parts.push(format!("{} obsolete setting(s)", self.unknown_keys.len()));
         }
 
+        if !self.migrated_values.is_empty() {
+            parts.push(format!("{} retired value(s)", self.migrated_values.len()));
+        }
+
         if parts.is_empty() {
             "Configuration is up to date.".to_string()
         } else {
@@ -225,6 +351,12 @@ pub struct UpgradeResult {
     /// Keys that were removed (deprecated).
     pub removed_keys: Vec<String>,
 
+    /// Retired values that were rewritten to their replacement.
+    pub migrated_values: Vec<DeprecatedValue>,
+
+    /// Retired settings whose value was moved to a current setting.
+    pub folded_values: Vec<FoldedValue>,
+
     /// Whether this was a dry run (no changes made).
     pub dry_run: bool,
 }
@@ -243,10 +375,15 @@ impl UpgradeResult {
         }
 
         msg.push_str(&format!(
-            "\nAdded {} setting(s), removed {} deprecated setting(s).",
+            "\nAdded {} setting(s), removed {} deprecated setting(s), rewrote {} retired value(s).",
             self.added_keys.len(),
-            self.removed_keys.len()
+            self.removed_keys.len(),
+            self.migrated_values.len()
         ));
+
+        for fold in &self.folded_values {
+            msg.push_str(&format!("\n{}", fold.describe()));
+        }
 
         msg
     }
@@ -283,10 +420,15 @@ pub fn analyze_config(path: &Path) -> Result<ConfigUpgradeAnalysis, ConfigFileEr
 
     // Build set of keys present in user's INI file
     let mut user_keys: HashSet<String> = HashSet::new();
+    let mut migrated_values: Vec<DeprecatedValue> = Vec::new();
+    let mut folded_values: Vec<FoldedValue> = Vec::new();
     for (section, props) in ini.iter() {
         let section_name = section.unwrap_or("");
-        for (key, _) in props.iter() {
-            user_keys.insert(format!("{}.{}", section_name, key));
+        for (key, value) in props.iter() {
+            let name = format!("{}.{}", section_name, key);
+            migrated_values.extend(deprecated_value(&name, value));
+            folded_values.extend(folded_value(&name, value));
+            user_keys.insert(name);
         }
     }
 
@@ -322,13 +464,17 @@ pub fn analyze_config(path: &Path) -> Result<ConfigUpgradeAnalysis, ConfigFileEr
 
     // Upgrade needed if there are missing keys, deprecated keys, OR unknown keys
     // Unknown keys are stale settings from old versions that should be cleaned up
-    let needs_upgrade =
-        !missing_keys.is_empty() || !deprecated_keys.is_empty() || !unknown_keys.is_empty();
+    let needs_upgrade = !missing_keys.is_empty()
+        || !deprecated_keys.is_empty()
+        || !unknown_keys.is_empty()
+        || !migrated_values.is_empty();
 
     Ok(ConfigUpgradeAnalysis {
         missing_keys,
         deprecated_keys,
         unknown_keys,
+        migrated_values,
+        folded_values,
         needs_upgrade,
     })
 }
@@ -373,6 +519,8 @@ pub fn upgrade_config(path: &Path, dry_run: bool) -> Result<UpgradeResult, Confi
             backup_path: None,
             added_keys: Vec::new(),
             removed_keys: Vec::new(),
+            migrated_values: Vec::new(),
+            folded_values: Vec::new(),
             dry_run,
         });
     }
@@ -383,6 +531,8 @@ pub fn upgrade_config(path: &Path, dry_run: bool) -> Result<UpgradeResult, Confi
             backup_path: None,
             added_keys: analysis.missing_keys,
             removed_keys: analysis.deprecated_keys,
+            migrated_values: analysis.migrated_values,
+            folded_values: analysis.folded_values,
             dry_run: true,
         });
     }
@@ -398,7 +548,9 @@ pub fn upgrade_config(path: &Path, dry_run: bool) -> Result<UpgradeResult, Confi
         None
     };
 
-    // Load existing config (fills missing values with defaults)
+    // Load existing config (fills missing values with defaults, and the parser
+    // reads each retired value as its replacement and applies each fold, so
+    // a folded value is written before its retired key disappears)
     let config = ConfigFile::load_from(path)?;
 
     // Save back - this regenerates the complete INI with all settings
@@ -408,6 +560,8 @@ pub fn upgrade_config(path: &Path, dry_run: bool) -> Result<UpgradeResult, Confi
         backup_path,
         added_keys: analysis.missing_keys,
         removed_keys: analysis.deprecated_keys,
+        migrated_values: analysis.migrated_values,
+        folded_values: analysis.folded_values,
         dry_run: false,
     })
 }
@@ -415,6 +569,9 @@ pub fn upgrade_config(path: &Path, dry_run: bool) -> Result<UpgradeResult, Confi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::defaults::{
+        ALPHA_STAGING_LIBRARY_URL, DEFAULT_LIBRARY_URL, LEGACY_LIBRARY_URL,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -616,12 +773,17 @@ type = bing
             missing_keys: vec!["a".to_string(), "b".to_string()],
             deprecated_keys: vec!["c".to_string()],
             unknown_keys: Vec::new(),
+            migrated_values: vec![
+                deprecated_value("packages.library_url", LEGACY_LIBRARY_URL).unwrap()
+            ],
+            folded_values: Vec::new(),
             needs_upgrade: true,
         };
 
         let summary = analysis.summary();
         assert!(summary.contains("2 new setting(s)"));
         assert!(summary.contains("1 deprecated setting(s)"));
+        assert!(summary.contains("1 retired value(s)"));
     }
 
     #[test]
@@ -723,9 +885,209 @@ disk_io_concurrent = 64
             backup_path: None,
             added_keys: vec!["a".to_string()],
             removed_keys: Vec::new(),
+            migrated_values: Vec::new(),
+            folded_values: Vec::new(),
             dry_run: true,
         };
 
         assert!(result.summary().contains("DRY RUN"));
+    }
+
+    #[test]
+    fn upgrade_summary_names_each_moved_value() {
+        let result = UpgradeResult {
+            backup_path: None,
+            added_keys: Vec::new(),
+            removed_keys: vec!["prefetch.mode".to_string()],
+            migrated_values: Vec::new(),
+            folded_values: FOLDED_VALUES.to_vec(),
+            dry_run: false,
+        };
+
+        assert!(
+            result
+                .summary()
+                .contains("prefetch.mode = disabled is now prefetch.enabled = false"),
+            "{}",
+            result.summary()
+        );
+    }
+
+    #[test]
+    fn test_deprecated_calibration_keys() {
+        // Removed in #277: nothing fed the calibrator and nothing read its result.
+        for key in [
+            "prefetch.calibration_aggressive_threshold",
+            "prefetch.calibration_opportunistic_threshold",
+            "prefetch.calibration_sample_duration",
+        ] {
+            assert!(DEPRECATED_KEYS.contains(&key), "{key}");
+        }
+    }
+
+    fn current_config_with_library_url(path: &Path, url: &str) {
+        ConfigFile::default().save_to(path).unwrap();
+        let contents = std::fs::read_to_string(path).unwrap();
+        let line = format!("\nlibrary_url = {DEFAULT_LIBRARY_URL}\n");
+        assert_eq!(contents.matches(&line).count(), 1, "one library_url line");
+        std::fs::write(
+            path,
+            contents.replace(&line, &format!("\nlibrary_url = {url}\n")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn upgrade_moves_a_retired_library_url_to_the_v2_library() {
+        for retired in [LEGACY_LIBRARY_URL, ALPHA_STAGING_LIBRARY_URL] {
+            let temp_dir = TempDir::new().unwrap();
+            let config_path = temp_dir.path().join("config.ini");
+            current_config_with_library_url(&config_path, retired);
+
+            let analysis = analyze_config(&config_path).unwrap();
+            assert!(analysis.needs_upgrade, "{retired}");
+            assert_eq!(analysis.migrated_values.len(), 1);
+            assert_eq!(analysis.migrated_values[0].key, "packages.library_url");
+
+            upgrade_config(&config_path, false).unwrap();
+            let contents = std::fs::read_to_string(&config_path).unwrap();
+            assert!(contents.contains(&format!("\nlibrary_url = {DEFAULT_LIBRARY_URL}\n")));
+            assert!(!contents.contains(retired));
+            assert!(!analyze_config(&config_path).unwrap().needs_upgrade);
+        }
+    }
+
+    /// A complete, current config with `extra` appended to its `[prefetch]`
+    /// section and its `enabled` line set to `enabled`.
+    fn current_config_with_prefetch(path: &Path, enabled: bool, extra: &str) {
+        ConfigFile::default().save_to(path).unwrap();
+        let contents = std::fs::read_to_string(path).unwrap();
+        let line = "\nenabled = true\n; Web API port";
+        assert_eq!(
+            contents.matches(line).count(),
+            1,
+            "one prefetch enabled line"
+        );
+        let replaced = format!("\nenabled = {enabled}\n{extra}; Web API port");
+        std::fs::write(path, contents.replace(line, &replaced)).unwrap();
+    }
+
+    /// #340: `prefetch.mode` is retired, and `disabled` was its only value
+    /// that did anything `prefetch.enabled` does not.
+    #[test]
+    fn prefetch_mode_is_retired_and_disabled_folds_into_enabled() {
+        assert!(DEPRECATED_KEYS.contains(&"prefetch.mode"));
+        assert!(
+            DEPRECATED_VALUES.iter().all(|d| d.key != "prefetch.mode"),
+            "a retired key has no retired values"
+        );
+        assert_eq!(
+            folded_value("prefetch.mode", " Disabled "),
+            Some(FoldedValue {
+                key: "prefetch.mode",
+                value: "disabled",
+                into: "prefetch.enabled",
+                becomes: "false",
+            })
+        );
+        for mode in ["opportunistic", "aggressive", "auto", "anything"] {
+            assert_eq!(folded_value("prefetch.mode", mode), None, "{mode}");
+        }
+    }
+
+    /// Every fold retires its key and lands on a current key with a value that
+    /// key accepts, so the parser can always apply it.
+    #[test]
+    fn every_fold_moves_a_retired_key_to_a_valid_value_of_a_current_key() {
+        for fold in FOLDED_VALUES {
+            assert!(DEPRECATED_KEYS.contains(&fold.key), "{}", fold.key);
+            let into: ConfigKey = fold.into.parse().unwrap();
+            into.validate(fold.becomes).unwrap();
+        }
+    }
+
+    #[test]
+    fn upgrade_turns_mode_disabled_into_enabled_false() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+        current_config_with_prefetch(&config_path, true, "mode = disabled\n");
+
+        let analysis = analyze_config(&config_path).unwrap();
+        assert!(analysis.needs_upgrade);
+        assert_eq!(analysis.deprecated_keys, ["prefetch.mode"]);
+        assert_eq!(analysis.folded_values, [FOLDED_VALUES[0]]);
+
+        let dry = upgrade_config(&config_path, true).unwrap();
+        assert_eq!(dry.folded_values, [FOLDED_VALUES[0]]);
+        assert_eq!(dry.removed_keys, ["prefetch.mode"]);
+
+        let result = upgrade_config(&config_path, false).unwrap();
+        assert_eq!(result.folded_values, [FOLDED_VALUES[0]]);
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(contents.contains("\nenabled = false\n"), "{contents}");
+        assert!(!contents.contains("\nmode ="), "{contents}");
+        assert!(!analyze_config(&config_path).unwrap().needs_upgrade);
+        assert!(
+            !ConfigFile::load_from(&config_path)
+                .unwrap()
+                .prefetch
+                .enabled
+        );
+    }
+
+    #[test]
+    fn upgrade_drops_every_other_mode_and_leaves_enabled_alone() {
+        for (enabled, mode) in [
+            (true, "opportunistic"),
+            (true, "aggressive"),
+            (true, "auto"),
+            (true, "nonsense"),
+            (false, "aggressive"),
+            (false, "disabled"),
+        ] {
+            let temp_dir = TempDir::new().unwrap();
+            let config_path = temp_dir.path().join("config.ini");
+            current_config_with_prefetch(&config_path, enabled, &format!("mode = {mode}\n"));
+
+            upgrade_config(&config_path, false).unwrap();
+
+            let contents = std::fs::read_to_string(&config_path).unwrap();
+            let expected = enabled && mode != "disabled";
+            assert!(
+                contents.contains(&format!("\nenabled = {expected}\n")),
+                "{enabled} {mode}"
+            );
+            assert!(!contents.contains("\nmode ="), "{enabled} {mode}");
+        }
+    }
+
+    #[test]
+    fn a_config_without_mode_needs_no_upgrade_for_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+        current_config_with_prefetch(&config_path, false, "");
+
+        let analysis = analyze_config(&config_path).unwrap();
+
+        assert!(!analysis.needs_upgrade, "{analysis:?}");
+        assert!(analysis.folded_values.is_empty());
+    }
+
+    #[test]
+    fn upgrade_removes_the_inert_calibration_keys() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+        std::fs::write(
+            &config_path,
+            "[prefetch]\ncalibration_aggressive_threshold = 30\n\
+             calibration_opportunistic_threshold = 10\ncalibration_sample_duration = 60\n",
+        )
+        .unwrap();
+
+        let result = upgrade_config(&config_path, false).unwrap();
+
+        assert_eq!(result.removed_keys.len(), 3, "{:?}", result.removed_keys);
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!contents.contains("calibration_"));
     }
 }

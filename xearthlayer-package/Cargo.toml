@@ -1,0 +1,19 @@
+[package]
+name = "xearthlayer-package"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "XEarthLayer scenery package format: metadata, library index, naming and the specification version gate"
+
+[lib]
+name = "xearthlayer_package"
+path = "src/lib.rs"
+
+# Format knowledge only. This list is asserted by a test in src/lib.rs so the
+# contract crate cannot quietly acquire runtime or publisher dependencies.
+[dependencies]
+semver.workspace = true
+chrono.workspace = true

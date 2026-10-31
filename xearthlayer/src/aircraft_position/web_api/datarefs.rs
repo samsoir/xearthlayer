@@ -56,7 +56,19 @@ pub const SCENERY_LOADING: &str = "sim/graphics/scenery/async_scenery_load_in_pr
 pub const ALL_SIM_STATE_DATAREFS: &[&str] =
     &[PAUSED, SIM_SPEED, IS_REPLAY, ON_GROUND, SCENERY_LOADING];
 
-/// All datarefs we subscribe to (position + sim state).
+// ─────────────────────────────────────────────────────────────────────────────
+// Optional datarefs (display only)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Smoothed time to draw a full sim frame, in seconds (float). 1.0 / FPS.
+pub const FRAME_RATE_PERIOD: &str = "sim/time/framerate_period";
+
+/// Datarefs subscribed when X-Plane has them. Display only: a missing one
+/// must never fail the connection that position and sim state depend on.
+pub const OPTIONAL_DATAREFS: &[&str] = &[FRAME_RATE_PERIOD];
+
+/// All required datarefs (position + sim state). A missing one fails the
+/// connection.
 pub fn all_datarefs() -> Vec<&'static str> {
     let mut all = Vec::with_capacity(ALL_POSITION_DATAREFS.len() + ALL_SIM_STATE_DATAREFS.len());
     all.extend_from_slice(ALL_POSITION_DATAREFS);
@@ -122,6 +134,19 @@ pub fn resolve_dataref_ids_checked(
     }
 }
 
+/// Resolve IDs for a subscription: every `required` name must be present,
+/// `optional` names are added when X-Plane has them. Returns the missing
+/// required names on failure.
+pub fn resolve_subscription(
+    json: &serde_json::Value,
+    required: &[&str],
+    optional: &[&str],
+) -> Result<DatarefIdMap, Vec<String>> {
+    let mut ids = resolve_dataref_ids_checked(json, required)?;
+    ids.extend(resolve_dataref_ids(json, optional));
+    Ok(ids)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // WebSocket message parsing
 // ─────────────────────────────────────────────────────────────────────────────
@@ -178,6 +203,43 @@ pub fn build_subscribe_message(req_id: u64, ids: &[u64]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn catalog(names: &[(&str, u64)]) -> serde_json::Value {
+        let data: Vec<serde_json::Value> = names
+            .iter()
+            .map(|(name, id)| serde_json::json!({"name": name, "id": id}))
+            .collect();
+        serde_json::json!({ "data": data })
+    }
+
+    #[test]
+    fn a_missing_optional_dataref_does_not_fail_the_subscription() {
+        let json = catalog(&[(LATITUDE, 1)]);
+        let ids = resolve_subscription(&json, &[LATITUDE], &[FRAME_RATE_PERIOD])
+            .expect("optional datarefs never fail resolution");
+        assert_eq!(ids.get(LATITUDE), Some(&1));
+        assert!(!ids.contains_key(FRAME_RATE_PERIOD));
+    }
+
+    #[test]
+    fn a_present_optional_dataref_is_subscribed() {
+        let json = catalog(&[(LATITUDE, 1), (FRAME_RATE_PERIOD, 2)]);
+        let ids = resolve_subscription(&json, &[LATITUDE], &[FRAME_RATE_PERIOD]).unwrap();
+        assert_eq!(ids.get(FRAME_RATE_PERIOD), Some(&2));
+    }
+
+    #[test]
+    fn a_missing_required_dataref_still_fails() {
+        let json = catalog(&[(FRAME_RATE_PERIOD, 2)]);
+        let missing = resolve_subscription(&json, &[LATITUDE], &[FRAME_RATE_PERIOD]).unwrap_err();
+        assert_eq!(missing, vec![LATITUDE.to_string()]);
+    }
+
+    #[test]
+    fn frame_rate_is_optional_not_required() {
+        assert!(OPTIONAL_DATAREFS.contains(&FRAME_RATE_PERIOD));
+        assert!(!all_datarefs().contains(&FRAME_RATE_PERIOD));
+    }
 
     #[test]
     fn test_all_datarefs_count() {

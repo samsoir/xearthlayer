@@ -57,8 +57,8 @@
 
 use crate::coord::TileCoord;
 use crate::executor::{
-    ExecutorConfig, JobExecutor, JobStatus, JobSubmitter as ExecutorSubmitter, TelemetrySink,
-    TracingTelemetrySink,
+    DemandGuard, DemandTracker, ExecutorConfig, Job, JobExecutor, JobHandle, JobStatus,
+    JobSubmitter as ExecutorSubmitter, SubmitError, TelemetrySink, TracingTelemetrySink,
 };
 use crate::jobs::DdsJobFactory;
 use crate::metrics::MetricsClient;
@@ -66,7 +66,7 @@ use crate::runtime::{DdsResponse, JobRequest};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn, Instrument};
@@ -112,6 +112,16 @@ pub struct ExecutorDaemonConfig {
 
     /// Request channel capacity.
     pub channel_capacity: usize,
+
+    /// Wait for room in the executor's job queue instead of shedding the job.
+    ///
+    /// The prefetch lane sets this: a shed prefetch job is lost without the
+    /// coordinator knowing, which counted its tile as submitted and never asked
+    /// for it again. Waiting holds the daemon instead, the request channel
+    /// fills, and the coordinator sees a full lane and keeps the tile pending.
+    /// The demand lane leaves it off, so a FUSE request on a saturated executor
+    /// is answered at once rather than waiting out its timeout.
+    pub wait_for_executor: bool,
 }
 
 impl Default for ExecutorDaemonConfig {
@@ -119,6 +129,7 @@ impl Default for ExecutorDaemonConfig {
         Self {
             executor: ExecutorConfig::default(),
             channel_capacity: DEFAULT_REQUEST_CHANNEL_CAPACITY,
+            wait_for_executor: false,
         }
     }
 }
@@ -292,6 +303,13 @@ impl DaemonCoalescer {
         }
     }
 
+    /// Whether any request is waiting on the in-flight job for `tile`.
+    fn has_waiters(&self, tile: TileCoord) -> bool {
+        self.in_flight
+            .get(&tile)
+            .is_some_and(|tx| tx.receiver_count() > 0)
+    }
+
     /// Cancels a job, removing it from in-flight.
     fn cancel(&self, tile: TileCoord) {
         if let Some((_, _tx)) = self.in_flight.remove(&tile) {
@@ -343,6 +361,23 @@ where
 
     /// Optional metrics client for event-based metrics.
     metrics_client: Option<MetricsClient>,
+
+    /// Counts submitted jobs as FUSE demand (demand lane only).
+    demand: Option<DemandTracker>,
+    /// Wait for executor room instead of shedding (prefetch lane only).
+    wait_for_executor: bool,
+}
+
+/// The shared dependencies `run` hands to every request, built once.
+struct RequestContext<'a, F, M, DD> {
+    submitter: &'a ExecutorSubmitter,
+    factory: &'a Arc<F>,
+    memory_cache: &'a Arc<M>,
+    dds_disk_cache: &'a Arc<DD>,
+    coalescer: &'a Arc<DaemonCoalescer>,
+    metrics_client: &'a Option<MetricsClient>,
+    demand: &'a Option<DemandTracker>,
+    wait_for_executor: bool,
 }
 
 impl<F, M, DD> ExecutorDaemon<F, M, DD>
@@ -404,6 +439,8 @@ where
             dds_disk_cache,
             request_rx,
             metrics_client: None,
+            demand: None,
+            wait_for_executor: config.wait_for_executor,
         };
 
         (daemon, request_tx)
@@ -446,9 +483,17 @@ where
             dds_disk_cache,
             request_rx,
             metrics_client: Some(metrics_client),
+            demand: None,
+            wait_for_executor: config.wait_for_executor,
         };
 
         (daemon, request_tx)
+    }
+
+    /// Counts this daemon's submitted jobs as FUSE demand (demand lane only).
+    pub fn with_demand_tracker(mut self, tracker: DemandTracker) -> Self {
+        self.demand = Some(tracker);
+        self
     }
 
     /// Returns a clone of the internal job submitter.
@@ -462,6 +507,13 @@ where
     /// This must be called before `run()` consumes the daemon.
     pub fn job_submitter(&self) -> ExecutorSubmitter {
         self.submitter.clone()
+    }
+
+    /// Jobs running and jobs held waiting for admission, refreshed every
+    /// executor loop. The prefetch lane's load and gauges read these; the
+    /// stall watchdog deliberately does not.
+    pub fn job_counts(&self) -> super::JobCounts {
+        self.executor.job_counts.clone()
     }
 
     /// Returns a shared reference to the executor's resource pools.
@@ -491,10 +543,23 @@ where
             dds_disk_cache,
             mut request_rx,
             metrics_client,
+            demand,
+            wait_for_executor,
         } = self;
 
         // Create shared coalescer for daemon-level request deduplication
         let coalescer = Arc::new(DaemonCoalescer::new());
+
+        let ctx = RequestContext {
+            submitter: &submitter,
+            factory: &factory,
+            memory_cache: &memory_cache,
+            dds_disk_cache: &dds_disk_cache,
+            coalescer: &coalescer,
+            metrics_client: &metrics_client,
+            demand: &demand,
+            wait_for_executor,
+        };
 
         // Spawn the executor in a separate task
         let executor_shutdown = shutdown.clone();
@@ -519,15 +584,7 @@ where
 
                 // Receive new job requests
                 Some(request) = request_rx.recv() => {
-                    Self::handle_request(
-                        request,
-                        &submitter,
-                        &factory,
-                        &memory_cache,
-                        &dds_disk_cache,
-                        &coalescer,
-                        &metrics_client,
-                    ).await;
+                    Self::handle_request(request, &ctx).await;
                 }
             }
         }
@@ -537,16 +594,39 @@ where
         info!("Executor daemon stopped");
     }
 
-    async fn handle_request(
-        request: JobRequest,
+    /// Submits `job`, holding a demand guard for as long as it is in flight.
+    /// On error the guard is dropped here, which is how the shed and
+    /// failed-submit exits release their demand. With `wait_for_executor`
+    /// the submit waits for queue room and never sheds.
+    async fn submit_tracked(
         submitter: &ExecutorSubmitter,
-        factory: &Arc<F>,
-        memory_cache: &Arc<M>,
-        dds_disk_cache: &Arc<DD>,
-        coalescer: &Arc<DaemonCoalescer>,
-        metrics_client: &Option<MetricsClient>,
-    ) {
-        let start = Instant::now();
+        job: Box<dyn Job>,
+        demand: &Option<DemandTracker>,
+        wait_for_executor: bool,
+    ) -> Result<(JobHandle, Option<DemandGuard>), SubmitError> {
+        let guard = demand.as_ref().map(DemandTracker::begin);
+        let submitted = if wait_for_executor {
+            submitter.submit_boxed_waiting(job).await
+        } else {
+            submitter.try_submit_boxed(job)
+        };
+        submitted.map(|handle| (handle, guard))
+    }
+
+    async fn handle_request(request: JobRequest, ctx: &RequestContext<'_, F, M, DD>) {
+        let RequestContext {
+            submitter,
+            factory,
+            memory_cache,
+            dds_disk_cache,
+            coalescer,
+            metrics_client,
+            demand,
+            wait_for_executor,
+        } = *ctx;
+        // The producer's clock, so every duration below counts the time the
+        // request sat queued on the channel: X-Plane was already waiting.
+        let start = request.created;
         let tile = request.tile;
         let priority = request.priority;
         let origin = request.origin;
@@ -570,6 +650,15 @@ where
         // Check for cancellation first
         if request.cancellation.is_cancelled() {
             debug!(tile = ?tile, "Request already cancelled");
+            // A FUSE request cancelled before the daemon reached it timed out
+            // while queued on the channel. X-Plane waited the whole time, so
+            // it is reported like any other FUSE timeout; otherwise queue
+            // stalls would vanish from the no-harm measure.
+            if origin.is_fuse() {
+                if let Some(client) = metrics_client {
+                    client.job_timed_out(start.elapsed().as_micros() as u64);
+                }
+            }
             if let Some(tx) = request.response_tx {
                 let _ = tx.send(DdsResponse::empty(start.elapsed()));
             }
@@ -763,13 +852,12 @@ where
         let job_id = job.id();
         debug!(job_id = %job_id, tile = ?tile, "Created DDS generation job");
 
-        let handle = {
-            let _span = tracing::trace_span!(target: "profiling", "job_submit").entered();
-            submitter.try_submit_boxed(job)
-        };
+        let handle = Self::submit_tracked(submitter, job, demand, wait_for_executor)
+            .instrument(tracing::trace_span!(target: "profiling", "job_submit"))
+            .await;
 
         match handle {
-            Some(mut handle) => {
+            Ok((mut handle, demand_guard)) => {
                 debug!(job_id = %job_id, "Job submitted to executor");
 
                 // Track job submitted (FUSE requests are from RequestOrigin::Fuse)
@@ -779,12 +867,17 @@ where
                 }
 
                 let memory_cache = Arc::clone(memory_cache);
+                let dds_disk_cache = Arc::clone(dds_disk_cache);
                 let coalescer = Arc::clone(coalescer);
                 let cancellation = request.cancellation.clone();
                 let metrics_for_completion = metrics_client.clone();
                 let dsf_tile_for_log = dsf_tile.clone();
 
                 tokio::spawn(async move {
+                    // Released when this task ends, on the success, failure
+                    // and cancellation arms alike.
+                    let _demand_guard = demand_guard;
+
                     // Wait for job completion
                     tokio::select! {
                         job_result = handle.wait() => {
@@ -794,14 +887,14 @@ where
                             // Track job completion
                             let success = status == JobStatus::Succeeded;
                             if let Some(ref client) = metrics_for_completion {
-                                client.job_completed(success, duration.as_micros() as u64);
+                                client.job_completed(success, duration.as_micros() as u64, origin.is_fuse());
                                 if origin.is_fuse() {
                                     client.fuse_tile_served();
                                 }
                             }
 
                             // Get DDS data directly from job result (avoids cache race conditions)
-                            let data = if success {
+                            let (data, served_from_cache) = if success {
                                 match job_result.output_data {
                                     Some(d) => {
                                         debug!(
@@ -823,20 +916,45 @@ where
                                             crate::debug_map::activity::TileCacheResult::Generated,
                                         );
 
-                                        d
+                                        (d, false)
+                                    }
+                                    // A job skipped by the prefetch lane's cache probe
+                                    // succeeds without output: its tile was cached while it
+                                    // waited, often on DDS disk only. With nobody to answer,
+                                    // reading the tile back would cost a whole-tile read for
+                                    // nothing. A waiter that joins after this check is told
+                                    // the job succeeded, which is true.
+                                    None if request.response_tx.is_none()
+                                        && !coalescer.has_waiters(tile) =>
+                                    {
+                                        (Bytes::new(), true)
                                     }
                                     None => {
-                                        // Job succeeded but no output data - should not happen
-                                        // but fall back to cache read for safety
-                                        warn!(
-                                            tile_row = tile.row,
-                                            tile_col = tile.col,
-                                            tile_zoom = tile.zoom,
-                                            dsf_tile = %dsf_tile_for_log,
-                                            duration_ms = duration.as_millis(),
-                                            "Job succeeded but output_data was None - falling back to cache"
-                                        );
-                                        memory_cache.get(tile.row, tile.col, tile.zoom).await.unwrap_or_default()
+                                        let cached = match memory_cache
+                                            .get(tile.row, tile.col, tile.zoom)
+                                            .await
+                                        {
+                                            Some(d) => Some(d),
+                                            None => {
+                                                dds_disk_cache
+                                                    .get(tile.row, tile.col, tile.zoom)
+                                                    .await
+                                            }
+                                        };
+                                        match cached {
+                                            Some(d) => (d, true),
+                                            None => {
+                                                warn!(
+                                                    tile_row = tile.row,
+                                                    tile_col = tile.col,
+                                                    tile_zoom = tile.zoom,
+                                                    dsf_tile = %dsf_tile_for_log,
+                                                    duration_ms = duration.as_millis(),
+                                                    "Job succeeded with no output and the tile is in no cache"
+                                                );
+                                                (Bytes::new(), false)
+                                            }
+                                        }
                                     }
                                 }
                             } else {
@@ -848,7 +966,7 @@ where
                                     latency_ms = duration.as_millis(),
                                     "Job failed - returning empty data"
                                 );
-                                Bytes::new()
+                                (Bytes::new(), false)
                             };
 
                             // Broadcast result to coalesced waiters
@@ -860,7 +978,11 @@ where
                             coalescer.complete(tile, coalesced_result);
 
                             // Create response with job_succeeded flag set correctly
-                            let response = DdsResponse::new(data, false, duration, success);
+                            let response = if served_from_cache {
+                                DdsResponse::cache_hit(data, duration)
+                            } else {
+                                DdsResponse::new(data, false, duration, success)
+                            };
 
                             // Send response if requested
                             if let Some(tx) = request.response_tx {
@@ -878,6 +1000,15 @@ where
                             );
                             handle.kill();
 
+                            // A cancelled FUSE request is a FUSE timeout. Its
+                            // wait feeds the latency window: a stall must not
+                            // vanish from the no-harm measure.
+                            if origin.is_fuse() {
+                                if let Some(ref client) = metrics_for_completion {
+                                    client.job_timed_out(start.elapsed().as_micros() as u64);
+                                }
+                            }
+
                             // Remove from coalescer so other waiters know job was cancelled
                             coalescer.cancel(tile);
 
@@ -888,8 +1019,30 @@ where
                     }
                 });
             }
-            None => {
-                warn!(tile = ?tile, "Failed to submit job - executor may be shutdown");
+            Err(err) if err.is_back_pressure() => {
+                // Not a failure. The executor's queue is full, so this tile is
+                // shed: the requester gets an empty answer now and asks again
+                // if it still wants the tile. Only a daemon without
+                // `wait_for_executor` sheds, which is the demand lane; FUSE
+                // re-requests a tile it still needs. The prefetch lane waits
+                // instead, because nothing re-requested a shed prefetch tile.
+                // Reporting this as a possible shutdown told operators their
+                // executor had died while it was working normally (#272).
+                debug!(
+                    tile = ?tile,
+                    reason = %err,
+                    "Job shed at the executor boundary under back pressure"
+                );
+
+                // Remove from coalescer
+                coalescer.cancel(tile);
+
+                if let Some(tx) = request.response_tx {
+                    let _ = tx.send(DdsResponse::empty(start.elapsed()));
+                }
+            }
+            Err(err) => {
+                warn!(tile = ?tile, reason = %err, "Failed to submit job - executor may be shutdown");
 
                 // Remove from coalescer
                 coalescer.cancel(tile);
@@ -971,12 +1124,21 @@ mod tests {
     /// Mock job factory that tracks job creation count
     struct MockJobFactory {
         jobs_created: AtomicUsize,
+        fail: bool,
     }
 
     impl MockJobFactory {
         fn new() -> Self {
             Self {
                 jobs_created: AtomicUsize::new(0),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                jobs_created: AtomicUsize::new(0),
+                fail: true,
             }
         }
 
@@ -991,6 +1153,7 @@ mod tests {
         priority: Priority,
         tile: TileCoord,
         delay: Duration,
+        fail: bool,
     }
 
     impl MockJob {
@@ -1000,7 +1163,32 @@ mod tests {
                 priority,
                 tile,
                 delay,
+                fail: false,
             }
+        }
+    }
+
+    /// Task that always fails, for the failure exit of a job.
+    struct FailingMockTask;
+
+    impl Task for FailingMockTask {
+        fn name(&self) -> &str {
+            "BuildAndCacheDds"
+        }
+
+        fn resource_type(&self) -> crate::executor::ResourceType {
+            crate::executor::ResourceType::CPU
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a mut TaskContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::executor::TaskResult> + Send + 'a>,
+        > {
+            Box::pin(async {
+                crate::executor::TaskResult::Failed(crate::executor::TaskError::new("mock failure"))
+            })
         }
     }
 
@@ -1022,6 +1210,9 @@ mod tests {
         }
 
         fn create_tasks(&self) -> Vec<Box<dyn Task>> {
+            if self.fail {
+                return vec![Box::new(FailingMockTask)];
+            }
             // Create a task that simulates work and produces output
             vec![Box::new(MockDdsTask {
                 tile: self.tile,
@@ -1082,8 +1273,457 @@ mod tests {
         fn create_job(&self, tile: TileCoord, priority: Priority) -> Box<dyn Job> {
             self.jobs_created.fetch_add(1, Ordering::SeqCst);
             // Use 50ms delay to simulate real job timing
-            Box::new(MockJob::new(tile, priority, Duration::from_millis(50)))
+            let mut job = MockJob::new(tile, priority, Duration::from_millis(50));
+            job.fail = self.fail;
+            Box::new(job)
         }
+    }
+
+    type TestDaemon =
+        ExecutorDaemon<MockJobFactory, MockMemoryCache, crate::executor::NullDdsDiskCache>;
+
+    fn demand_daemon(
+        factory: Arc<MockJobFactory>,
+    ) -> (TestDaemon, mpsc::Sender<JobRequest>, DemandTracker) {
+        let tracker = DemandTracker::new();
+        let (daemon, tx) = ExecutorDaemon::new(
+            ExecutorDaemonConfig::default(),
+            factory,
+            Arc::new(MockMemoryCache::new()),
+            Arc::new(super::super::NullDdsDiskCache),
+        );
+        (daemon.with_demand_tracker(tracker.clone()), tx, tracker)
+    }
+
+    async fn settle(tracker: &DemandTracker) {
+        for _ in 0..200 {
+            if tracker.in_flight() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "demand count never returned to zero: {}",
+            tracker.in_flight()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_demand_count_returns_to_zero_after_success() {
+        let (daemon, tx, tracker) = demand_daemon(Arc::new(MockJobFactory::new()));
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(daemon.run(shutdown.clone()));
+        let (request, rx) = JobRequest::fuse(test_tile(), CancellationToken::new());
+        tx.send(request).await.unwrap();
+        assert!(rx.await.unwrap().is_success());
+        settle(&tracker).await;
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
+    #[tokio::test]
+    async fn test_demand_count_returns_to_zero_after_failure() {
+        let (daemon, tx, tracker) = demand_daemon(Arc::new(MockJobFactory::failing()));
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(daemon.run(shutdown.clone()));
+        let (request, rx) = JobRequest::fuse(test_tile(), CancellationToken::new());
+        tx.send(request).await.unwrap();
+        assert!(!rx.await.unwrap().is_success());
+        settle(&tracker).await;
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
+    #[tokio::test]
+    async fn test_demand_count_returns_to_zero_after_cancellation() {
+        let (daemon, tx, tracker) = demand_daemon(Arc::new(MockJobFactory::new()));
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(daemon.run(shutdown.clone()));
+        let token = CancellationToken::new();
+        let (request, _rx) = JobRequest::fuse(test_tile(), token.clone());
+        tx.send(request).await.unwrap();
+        for _ in 0..200 {
+            if tracker.in_flight() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            tracker.in_flight(),
+            1,
+            "the job must be counted while it runs"
+        );
+        token.cancel();
+        settle(&tracker).await;
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
+    fn mock_job() -> Box<dyn Job> {
+        Box::new(MockJob::new(
+            test_tile(),
+            Priority::ON_DEMAND,
+            Duration::ZERO,
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_shed_submit_releases_demand() {
+        let config = ExecutorConfig {
+            job_channel_capacity: 1,
+            ..Default::default()
+        };
+        let (executor, submitter) = JobExecutor::new(config);
+        let tracker = DemandTracker::new();
+        let demand = Some(tracker.clone());
+        let _first = TestDaemon::submit_tracked(&submitter, mock_job(), &demand, false)
+            .await
+            .unwrap();
+        let shed = TestDaemon::submit_tracked(&submitter, mock_job(), &demand, false).await;
+        assert!(shed
+            .err()
+            .expect("second submit is shed")
+            .is_back_pressure());
+        assert_eq!(tracker.in_flight(), 1, "only the accepted job is in flight");
+        drop(executor);
+    }
+
+    #[tokio::test]
+    async fn test_failed_submit_releases_demand() {
+        let (executor, submitter) = JobExecutor::new(Default::default());
+        drop(executor);
+        let tracker = DemandTracker::new();
+        let result =
+            TestDaemon::submit_tracked(&submitter, mock_job(), &Some(tracker.clone()), false).await;
+        assert!(result.is_err());
+        assert_eq!(tracker.in_flight(), 0);
+    }
+
+    /// The prefetch lane waits for room instead of shedding: a shed prefetch
+    /// job was lost without the coordinator knowing, so its tile was counted
+    /// as submitted and never requested again (2,871 sheds on one stressed
+    /// flight, 66 of them later timing out under FUSE). Waiting holds the
+    /// daemon, the lane's request channel fills, and the coordinator keeps
+    /// the tile pending.
+    #[tokio::test]
+    async fn test_waiting_submit_holds_a_job_until_the_executor_has_room() {
+        let config = ExecutorConfig {
+            job_channel_capacity: 1,
+            ..Default::default()
+        };
+        let (mut executor, submitter) = JobExecutor::new(config);
+        let _first = TestDaemon::submit_tracked(&submitter, mock_job(), &None, true)
+            .await
+            .unwrap();
+
+        let waiting_submitter = submitter.clone();
+        let second = tokio::spawn(async move {
+            TestDaemon::submit_tracked(&waiting_submitter, mock_job(), &None, true)
+                .await
+                .map(|_| ())
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second.is_finished(),
+            "with the channel full, a waiting submit must hold, not shed"
+        );
+
+        executor
+            .job_receiver
+            .recv()
+            .await
+            .expect("first job queued");
+        let accepted = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("room freed, the waiting submit must complete")
+            .unwrap();
+        assert!(accepted.is_ok(), "the held job is accepted, not lost");
+    }
+
+    #[tokio::test]
+    async fn test_waiting_submit_fails_only_when_the_executor_is_gone() {
+        let (executor, submitter) = JobExecutor::new(Default::default());
+        drop(executor);
+        let result = TestDaemon::submit_tracked(&submitter, mock_job(), &None, true).await;
+        assert!(matches!(result, Err(err) if !err.is_back_pressure()));
+    }
+
+    /// DDS disk cache holding at most one tile, written by the job itself.
+    /// Counts reads, because a whole-tile read nobody wanted is the cost.
+    #[derive(Default)]
+    struct OneTileDdsDisk {
+        tile: Mutex<Option<(TileCoord, Bytes)>>,
+        gets: AtomicUsize,
+    }
+
+    impl OneTileDdsDisk {
+        fn holds_a_tile(&self) -> bool {
+            self.tile.lock().unwrap().is_some()
+        }
+    }
+
+    impl crate::executor::DdsDiskCache for OneTileDdsDisk {
+        async fn get(&self, row: u32, col: u32, zoom: u8) -> Option<Bytes> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            let held = self.tile.lock().unwrap().clone();
+            held.filter(|(t, _)| (t.row, t.col, t.zoom) == (row, col, zoom))
+                .map(|(_, data)| data)
+        }
+
+        async fn put(&self, row: u32, col: u32, zoom: u8, data: Bytes) {
+            *self.tile.lock().unwrap() = Some((TileCoord { row, col, zoom }, data));
+        }
+
+        async fn contains(&self, row: u32, col: u32, zoom: u8) -> bool {
+            let held = self.tile.lock().unwrap().clone();
+            held.is_some_and(|(t, _)| (t.row, t.col, t.zoom) == (row, col, zoom))
+        }
+    }
+
+    /// Stands in for a probe-skipped job: while it waited, another lane put
+    /// its tile in the DDS disk cache, so it succeeds with no output.
+    struct SkippedByProbeTask {
+        disk: Arc<OneTileDdsDisk>,
+        tile: TileCoord,
+    }
+
+    impl Task for SkippedByProbeTask {
+        fn name(&self) -> &str {
+            "CachedTileProbe"
+        }
+
+        fn resource_type(&self) -> crate::executor::ResourceType {
+            crate::executor::ResourceType::CPU
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a mut TaskContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::executor::TaskResult> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                use crate::executor::DdsDiskCache;
+                let t = self.tile;
+                self.disk
+                    .put(t.row, t.col, t.zoom, Bytes::from_static(b"ON-DISK"))
+                    .await;
+                crate::executor::TaskResult::Success
+            })
+        }
+    }
+
+    struct SkippedByProbeJob {
+        disk: Arc<OneTileDdsDisk>,
+        tile: TileCoord,
+    }
+
+    impl Job for SkippedByProbeJob {
+        fn id(&self) -> JobId {
+            JobId::new("skipped-by-probe")
+        }
+
+        fn name(&self) -> &str {
+            "SkippedByProbe"
+        }
+
+        fn priority(&self) -> Priority {
+            Priority::PREFETCH
+        }
+
+        fn create_tasks(&self) -> Vec<Box<dyn Task>> {
+            vec![Box::new(SkippedByProbeTask {
+                disk: Arc::clone(&self.disk),
+                tile: self.tile,
+            })]
+        }
+
+        fn on_complete(&self, _result: &JobResult) -> JobStatus {
+            JobStatus::Succeeded
+        }
+    }
+
+    struct SkippedByProbeFactory {
+        disk: Arc<OneTileDdsDisk>,
+    }
+
+    impl DdsJobFactory for SkippedByProbeFactory {
+        fn create_job(&self, tile: TileCoord, _priority: Priority) -> Box<dyn Job> {
+            Box::new(SkippedByProbeJob {
+                disk: Arc::clone(&self.disk),
+                tile,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_probe_skipped_job_is_served_from_dds_disk_as_a_cache_hit() {
+        let disk = Arc::new(OneTileDdsDisk::default());
+        let (daemon, tx) = ExecutorDaemon::new(
+            ExecutorDaemonConfig::default(),
+            Arc::new(SkippedByProbeFactory {
+                disk: Arc::clone(&disk),
+            }),
+            Arc::new(MockMemoryCache::new()),
+            disk,
+        );
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(daemon.run(shutdown.clone()));
+
+        let (request, rx) = JobRequest::prewarm(test_tile());
+        tx.send(request).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(response.data, Bytes::from_static(b"ON-DISK"));
+        assert!(response.cache_hit, "a skipped job reports AlreadyCached");
+        assert!(response.is_success());
+
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
+    /// X-Plane starts waiting when FUSE makes the request, not when the
+    /// daemon takes it off the channel, so time spent queued is latency.
+    #[tokio::test]
+    async fn test_fuse_latency_includes_time_queued_before_the_daemon() {
+        use crate::metrics::MetricEvent;
+        const QUEUED: Duration = Duration::from_millis(150);
+
+        let (metrics_tx, mut metrics_rx) = mpsc::unbounded_channel();
+        let (daemon, tx) = ExecutorDaemon::with_metrics_client(
+            ExecutorDaemonConfig::default(),
+            Arc::new(MockJobFactory::new()),
+            Arc::new(MockMemoryCache::new()),
+            Arc::new(super::super::NullDdsDiskCache),
+            Arc::new(crate::executor::NullTelemetrySink),
+            MetricsClient::new(metrics_tx),
+        );
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(daemon.run(shutdown.clone()));
+
+        let (request, rx) = JobRequest::fuse(test_tile(), CancellationToken::new());
+        tokio::time::sleep(QUEUED).await;
+        tx.send(request).await.unwrap();
+        assert!(rx.await.unwrap().is_success());
+
+        let mut latency_us = None;
+        while let Ok(event) = metrics_rx.try_recv() {
+            if let MetricEvent::JobCompleted {
+                duration_us,
+                is_fuse: true,
+                ..
+            } = event
+            {
+                latency_us = Some(duration_us);
+            }
+        }
+        let latency = Duration::from_micros(latency_us.expect("a FUSE job completed"));
+        assert!(
+            latency >= QUEUED,
+            "latency {latency:?} must include the {QUEUED:?} the request sat queued"
+        );
+
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
+    /// A FUSE request can time out while still queued on the demand channel,
+    /// before the daemon reaches it. X-Plane waited the whole time and got a
+    /// placeholder, so it is a timeout like any other: if it went unreported,
+    /// queue stalls would vanish from the no-harm measure.
+    #[tokio::test]
+    async fn test_fuse_request_cancelled_while_queued_reports_a_timeout() {
+        use crate::metrics::MetricEvent;
+        const QUEUED: Duration = Duration::from_millis(150);
+
+        let (metrics_tx, mut metrics_rx) = mpsc::unbounded_channel();
+        let (daemon, tx) = ExecutorDaemon::with_metrics_client(
+            ExecutorDaemonConfig::default(),
+            Arc::new(MockJobFactory::new()),
+            Arc::new(MockMemoryCache::new()),
+            Arc::new(super::super::NullDdsDiskCache),
+            Arc::new(crate::executor::NullTelemetrySink),
+            MetricsClient::new(metrics_tx),
+        );
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(daemon.run(shutdown.clone()));
+
+        let fuse_token = CancellationToken::new();
+        let (fuse_request, fuse_rx) = JobRequest::fuse(test_tile(), fuse_token.clone());
+        let prefetch_token = CancellationToken::new();
+        let prefetch_request = JobRequest {
+            cancellation: prefetch_token.clone(),
+            ..JobRequest::prefetch(TileCoord {
+                row: 101,
+                ..test_tile()
+            })
+        };
+        tokio::time::sleep(QUEUED).await;
+        fuse_token.cancel();
+        prefetch_token.cancel();
+        tx.send(fuse_request).await.unwrap();
+        tx.send(prefetch_request).await.unwrap();
+        assert!(!fuse_rx.await.unwrap().is_success());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let timeouts: Vec<u64> = std::iter::from_fn(|| metrics_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                MetricEvent::JobTimedOut { duration_us } => Some(duration_us),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            timeouts.len(),
+            1,
+            "the queued FUSE request is one timeout; a cancelled prefetch request is none"
+        );
+        assert!(
+            Duration::from_micros(timeouts[0]) >= QUEUED,
+            "the timeout must carry the {QUEUED:?} the request sat queued"
+        );
+
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
+    /// With no response channel and no coalesced waiter, nobody wants the
+    /// skipped job's tile, so reading it back from disk is pure cost.
+    #[tokio::test]
+    async fn test_probe_skipped_job_without_listeners_reads_nothing_back() {
+        let disk = Arc::new(OneTileDdsDisk::default());
+        let (daemon, tx) = ExecutorDaemon::new(
+            ExecutorDaemonConfig::default(),
+            Arc::new(SkippedByProbeFactory {
+                disk: Arc::clone(&disk),
+            }),
+            Arc::new(MockMemoryCache::new()),
+            Arc::clone(&disk),
+        );
+        let counts = daemon.job_counts();
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(daemon.run(shutdown.clone()));
+
+        tx.send(JobRequest::prefetch(test_tile())).await.unwrap();
+        for _ in 0..200 {
+            if disk.holds_a_tile() && counts.running() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(disk.holds_a_tile(), "the job ran");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            disk.gets.load(Ordering::SeqCst),
+            1,
+            "only the admission check reads the disk tier"
+        );
+
+        shutdown.cancel();
+        let _ = run.await;
     }
 
     #[test]

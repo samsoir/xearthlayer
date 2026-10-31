@@ -1,6 +1,8 @@
 # XEarthLayer Configuration
 
-XEarthLayer uses an INI configuration file located at `~/.xearthlayer/config.ini`.
+XEarthLayer uses an INI configuration file located at `~/.config/xearthlayer/config.ini` on Linux, honouring `$XDG_CONFIG_HOME`, and `~/Library/Application Support/XEarthLayer/config.ini` on macOS. Run `xearthlayer config path` to see yours.
+
+Every path setting below defaults to a platform-appropriate location. See [directory-layout.md](directory-layout.md) for the full layout, for what happens when upgrading from a version before 0.5.0, and for how to clean up the old `~/.xearthlayer` directory.
 
 ## Setup Wizard (Recommended)
 
@@ -10,12 +12,13 @@ The easiest way to configure XEarthLayer is with the interactive setup wizard:
 xearthlayer setup
 ```
 
-The wizard auto-detects your X-Plane installation, system hardware (CPU, memory, storage type), free disk space, and GPU adapters, then recommends optimal settings. The wizard runs four steps:
+The wizard auto-detects your X-Plane installation, system hardware (CPU, memory, storage type), free disk space, and GPU adapters, then recommends optimal settings. The wizard runs five steps:
 
-1. **X-Plane Custom Scenery** — auto-detected from your X-Plane install, with fallback to manual entry.
-2. **Package Location** — where regional scenery packages live on disk.
-3. **Cache Configuration** — cache directory, disk cache size (defaults to 25% of free space, floored to 10 GB), DDS-to-chunk disk ratio, memory cache size (defaults to RAM ÷ 12, rounded to the nearest whole GB, clamped to 500 MB – RAM ÷ 4), and disk I/O profile (NVMe / SSD / HDD / auto).
-4. **DDS Encoding** — picks ISPC (CPU) by default, or offers to offload encoding to a secondary GPU when **two or more GPU adapters** are detected. The wizard warns against picking the GPU X-Plane renders on. Single-GPU systems skip the choice and stay on ISPC.
+1. **X-Plane Custom Scenery**: auto-detected from your X-Plane install, with fallback to manual entry.
+2. **Package Location**: where regional scenery packages live on disk.
+3. **Imagery Provider**: which satellite imagery to stream. Options that need no account are offered first, and the currently configured provider is preselected so re-running setup does not move a working installation. A key or token is requested only for Google Maps and Mapbox, entered without echoing to the terminal, and pressing Enter keeps a credential that is already configured.
+4. **Cache Configuration**: cache directory, disk cache size (defaults to 25% of free space, floored to 10 GB), DDS-to-chunk disk ratio, and memory cache size (defaults to RAM divided by 12, rounded to the nearest whole GB, clamped between 500 MB and a quarter of RAM).
+5. **DDS Encoding**: picks ISPC (CPU) by default, or offers to offload encoding to a secondary GPU when **two or more GPU adapters** are detected. The wizard warns against picking the GPU X-Plane renders on. Single-GPU systems skip the choice and stay on ISPC.
 
 GPU enumeration can take 10–30 seconds on multi-adapter systems while drivers are probed; a spinner shows progress.
 
@@ -25,8 +28,8 @@ For users who prefer manual configuration, this file is created with `xearthlaye
 
 ## Configuration File Location
 
-- **Config file**: `~/.xearthlayer/config.ini`
-- **Log file**: `~/.xearthlayer/xearthlayer.log` (default)
+- **Config file**: `~/.config/xearthlayer/config.ini`
+- **Log file**: `~/.local/state/xearthlayer/xearthlayer.log` (default)
 - **Cache directory**: `~/.cache/xearthlayer/` (default)
 
 For best results, set the cache directory to a fast NVMe or SSD that you can fill with data and is not the primary volume for your system.
@@ -47,7 +50,7 @@ Controls which satellite imagery provider to use.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `type` | string | `bing` | Imagery provider (see below for options) |
+| `type` | string | `bing` | Imagery provider (see below for options). `xearthlayer setup` asks for this. |
 | `google_api_key` | string | (empty) | Google Maps API key. Required only when `type = google`. |
 | `mapbox_access_token` | string | (empty) | MapBox access token. Required only when `type = mapbox`. |
 
@@ -127,8 +130,8 @@ Controls tile caching behavior.
 |---------|------|---------|-------------|
 | `directory` | path | `~/.cache/xearthlayer` | Directory for storing cached tiles. Supports `~` expansion. |
 | `memory_size` | size | `512MB` | Maximum RAM for in-memory cache. Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. Memory cache is a staging buffer; DDS disk cache is the retention layer. |
-| `disk_size` | size | `20GB` | Maximum disk space for persistent cache (shared between DDS tiles and raw chunks). Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. |
-| `dds_disk_ratio` | float | `0.6` | Fraction of `disk_size` allocated to DDS tile cache (0.0-1.0). Remainder goes to raw chunk cache. |
+| `disk_size` | size | `20GB` | Maximum disk space for persistent cache (shared between DDS tiles and raw chunks). With `night.enabled`, 5% goes to the night lighting texture cache first and the rest is split as below. Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. |
+| `dds_disk_ratio` | float | `0.6` | Fraction of `disk_size` allocated to DDS tile cache (0.0-1.0). Remainder goes to raw chunk cache. With `night.enabled` it splits the 95% left after the night lighting share. |
 
 **Example:**
 ```ini
@@ -186,6 +189,8 @@ gpu_device = integrated
 
 The `gpu` backend is ideal for systems with both an integrated and discrete GPU. Configure `gpu_device = integrated` to use the iGPU for encoding while the discrete GPU handles X-Plane rendering. This eliminates CPU contention between encoding and the simulator.
 
+On a machine with one GPU, X-Plane renders on that GPU, so `gpu` encoding competes with the simulator for it. That covers every Apple Silicon Mac (one unified GPU, and no Apple-native BC1/BC3 encoder to make the contention worthwhile) and any PC with only an integrated or only a discrete GPU. XEarthLayer honours the setting, but logs a warning at startup and marks the Tile Processing Engine line on the dashboard's Status pane with an amber `!`; the setup wizard never selects `gpu` on such a machine. The ISPC default ships prebuilt kernels for x86-64 and Apple Silicon, so it needs nothing extra on either.
+
 **GPU Device Selection:**
 - `integrated` — Use the integrated GPU (e.g., AMD Radeon on Ryzen). Recommended when
   a discrete GPU is handling X-Plane display.
@@ -193,6 +198,12 @@ The `gpu` backend is ideal for systems with both an integrated and discrete GPU.
 - `<name>` — Match by adapter name substring (e.g., `Radeon`, `RTX 5090`).
 
 Run `xearthlayer diagnostics` to see available GPU adapters.
+
+Only Vulkan, Metal and DX12 adapters are listed. The OpenGL backend is not
+probed, because initialising it opens an X11 connection that XEarthLayer never
+uses and whose failure messages are written straight to the terminal. GPU
+encoding needs compute shaders in any case, so a host whose only adapter is
+OpenGL falls back to the `ispc` compressor, which is the right outcome for it.
 
 ### [generation]
 
@@ -218,108 +229,80 @@ timeout = 10
 
 ### [executor]
 
-Controls the job executor daemon's job limits and download behaviour. The executor is the core tile processing engine that manages parallel downloads, encoding, and caching.
+Controls the per-chunk download behaviour of the job executor, the engine that downloads, encodes and caches tiles.
 
-**Resource pool capacities are not configurable.** Network, CPU and disk I/O pool sizes are derived from the host's logical core count by `ResourcePoolConfig::default()`, using multipliers tuned by flight testing and load-bearing for the memory behaviour fixed in [#227](https://github.com/samsoir/xearthlayer/issues/227). The `network_concurrent`, `cpu_concurrent` and `disk_io_concurrent` keys were removed in [#249](https://github.com/samsoir/xearthlayer/issues/249): they never reached the executor, so any value on disk described a capacity nothing used. `xearthlayer config upgrade` removes them.
+**Only download behaviour is configurable here.** Concurrency is not. Resource pool sizes (network, CPU, disk I/O), task dispatch limits and channel capacities are all derived from the host's logical core count by `ResourcePoolConfig::default()`, using multipliers tuned by flight testing and load-bearing for the memory behaviour fixed in [#227](https://github.com/samsoir/xearthlayer/issues/227).
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `max_concurrent_jobs` | integer | `ceil(num_cpus × 0.75)` | Maximum concurrent DDS tile jobs (1-256). Previously in `[control_plane]`. |
-| `request_timeout_secs` | integer | `10` | HTTP request timeout per chunk (seconds) |
-| `max_retries` | integer | `3` | Maximum retry attempts per failed chunk |
-| `retry_base_delay_ms` | integer | `100` | Base delay for exponential backoff (ms) |
+| `request_timeout_secs` | integer | `10` | HTTP request timeout for a single chunk (seconds) |
+| `max_retries` | integer | `3` | Attempts per failed chunk. An HTTP 404 (no imagery there) fails on the first attempt and is never retried |
 
 **Example:**
 ```ini
 [executor]
-; Job concurrency (defaults are tuned for most systems)
-; max_concurrent_jobs = 12       ; Max concurrent tile jobs (ceil(num_cpus * 0.75))
-
-; Download behavior
 request_timeout_secs = 10        ; Per-chunk timeout
 max_retries = 3                  ; Retry attempts
-retry_base_delay_ms = 100        ; Exponential backoff base (100ms, 200ms, 400ms...)
 ```
 
-**Resource Pool Details:**
+**Retry behaviour:**
 
-- **Network pool**: Limits concurrent HTTP connections to prevent overwhelming imagery providers. Values outside 64-256 are automatically clamped.
-- **CPU pool**: Limits concurrent encoding operations. Default: `num_cpus / 2` — leaves headroom for X-Plane.
-- **Disk I/O pool**: Limits concurrent disk operations. Auto-detected from storage type (HDD: 4, SSD: 64, NVMe: 256).
+A failed chunk download is retried with exponential backoff, `100ms * 2^attempt`:
 
-**Retry Behavior:**
-
-Failed chunk downloads are retried with exponential backoff:
 - Attempt 1: immediate
 - Attempt 2: 100ms delay
 - Attempt 3: 200ms delay
 - Attempt 4: 400ms delay
 
+The base delay is not configurable.
+
+**When to raise the timeout:** a tile is 256 chunks, and a tile with any failed chunk is served to X-Plane but never written to the cache (see [#180](https://github.com/samsoir/xearthlayer/issues/180)). On a slow or lossy connection the same tiles are therefore regenerated on every flight. Raising `request_timeout_secs` lets those chunks complete so the tile can be cached.
+
+**Keys removed in [#249](https://github.com/samsoir/xearthlayer/issues/249):** `network_concurrent`, `cpu_concurrent`, `disk_io_concurrent`, `max_concurrent_jobs` and `retry_base_delay_ms`. None of them reached the executor, so no value on disk described anything that ran. `xearthlayer config upgrade` removes them. The first three were pool capacities, which are derived as described above. `max_concurrent_jobs` named no limit at all; it was only the figure the dashboard divided by. `retry_base_delay_ms` had nothing to reach, because the backoff base is a constant in the retry loop.
+
 ### [prefetch]
 
-Controls the Adaptive Prefetch System, which pre-loads tiles ahead of the aircraft to reduce FPS drops during flight. The system automatically calibrates itself based on your network and system performance.
+Controls the Adaptive Prefetch System, which pre-loads tiles ahead of the aircraft to reduce FPS drops during flight.
 
-**Adaptive Prefetch Architecture (v0.3.0+):**
+**How it works:**
 
-The system uses flight phase detection and performance calibration:
+A prefetch box moves with the aircraft, biased in the direction of travel. Every cycle (about every 2 seconds), the 1°×1° scenery regions inside the box that have not been prefetched yet are expanded to their tiles and queued for generation. The box is larger than X-Plane's own ~3° scenery window, so the scenery X-Plane loads next is already cached when it asks for it.
 
-1. **Performance Calibration**: During X-Plane's initial scenery load, XEarthLayer measures tile generation throughput to determine the optimal prefetch mode.
+- **On the ground** (GS < 40kt) the box is square, `box_extent` on each side, centred on the aircraft.
+- **During takeoff** nothing is prefetched, then submission ramps up (see Transition Ramp).
+- **In cruise** the box grows with ground speed, from 3.5° at 40kt to `box_extent` at 450kt, and shifts forward in the direction of travel by up to `box_max_bias`.
 
-2. **Flight Phase Strategies**:
-   - **Ground Strategy**: Ring-based prefetch around position (GS < 40kt, AGL < 20ft)
-   - **Cruise Strategy**: Boundary-driven row/column prefetch using SceneryWindow and BoundaryMonitor (GS > 40kt)
+Prefetch yields when XEarthLayer is busy or X-Plane is reading heavily, and pauses while X-Plane is loading scenery, in replay, or when telemetry stops.
 
-3. **Mode Selection**: Based on calibration throughput:
-   - **Aggressive**: >30 tiles/sec - Position-based trigger (0.3° into DSF tile)
-   - **Opportunistic**: 10-30 tiles/sec - Executor backpressure-based trigger
-   - **Disabled**: <10 tiles/sec - Prefetch skipped (won't complete in time)
+**Prefetch never delays X-Plane.** Prefetch runs in its own lane, with its own download, CPU and disk pools, so it does not compete with the tiles X-Plane asks for. While X-Plane is waiting on a tile to be generated, the prefetch lane admits no new work; work already admitted finishes, and queued work resumes when X-Plane's requests are served. The lane is added on top of the capacity FUSE demand gets, scaled by `capacity_share`. It no longer competes with X-Plane's requests, but it does compete with the simulator itself for CPU, so lower `capacity_share` if prefetch costs frame rate.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable/disable predictive tile prefetching |
-| `mode` | string | `auto` | Mode selection: `auto`, `aggressive`, `opportunistic`, `disabled` |
 | `web_api_port` | integer | `8086` | X-Plane Web API port for telemetry and sim state (1024-65535) |
-| `max_tiles_per_cycle` | integer | `200` | Maximum tiles to submit per prefetch cycle |
-| `cycle_interval_ms` | integer | `2000` | Interval between prefetch cycles (milliseconds) |
-| `calibration_aggressive_threshold` | float | `30.0` | Tiles/sec threshold for aggressive mode |
-| `calibration_opportunistic_threshold` | float | `10.0` | Tiles/sec threshold for opportunistic mode |
-| `calibration_sample_duration` | integer | `60` | Duration (secs) to measure throughput during calibration |
+| `cycle_interval_ms` | integer | `2000` | **Currently has no effect**: cycles run at a fixed 2 second interval |
 | `takeoff_climb_ft` | float | `1000` | Altitude climb (ft) above takeoff MSL to release transition hold (200-5000) |
 | `takeoff_timeout_secs` | integer | `90` | Maximum seconds before timeout release (30-300) |
 | `landing_hysteresis_secs` | integer | `15` | Sustained seconds at GS < 40kt before landing detection (5-60) |
 | `ramp_duration_secs` | integer | `30` | Duration of linear ramp to full prefetch rate (10-120) |
 | `ramp_start_fraction` | float | `0.25` | Starting prefetch fraction when ramp begins (0.1-0.5) |
-| `box_extent` | float | `9.0` | Prefetch box extent per axis in degrees (7.0-15.0). X-Plane loads ~6×6 DSF; 9° covers with 1.5° overlap |
-| `box_max_bias` | float | `0.8` | Maximum forward bias fraction (0.5-0.9). 0.5 = symmetric, 0.8 = 80/20 at cardinal headings |
-| `window_buffer` | integer | `1` | Extra DSF tiles around window edges to retain (0-3) |
+| `box_extent` | float | `7.0` | Prefetch box size per axis in degrees (7.0-15.0): the ground box, and the cruise maximum. 7° covers up to 7×7 regions, well beyond X-Plane's ~3° window |
+| `box_max_bias` | float | `0.8` | Maximum forward bias fraction (0.5-0.9). 0.5 = symmetric, 0.8 = 80% ahead and 20% behind at cardinal headings |
+| `capacity_share` | float | `0.35` | Prefetch capacity as a fraction of the capacity FUSE demand gets (0.05-0.50). Prefetch never delays X-Plane tile requests; lower this if prefetch costs frame rate |
+| `window_buffer` | integer | `1` | Regions kept beyond the box on each side before their prefetch state is forgotten (0-3) |
 | `stale_region_timeout` | integer | `120` | Seconds before an InProgress region is considered stale (30-600) |
-| `default_window_rows` | integer | `3` | Scenery window height in DSF rows — ~3° at all latitudes (2-12) |
-| `window_lon_extent` | float | `3.0` | Longitude extent in degrees for window column computation (1.0-10.0) |
 
-**Mode Options:**
+`enabled` is the only switch. `xearthlayer run --no-prefetch` turns prefetch off for one run without changing the file.
 
-| Mode | Trigger | When Used |
-|------|---------|-----------|
-| `auto` | Based on calibration (recommended) | Most users |
-| `aggressive` | Position-based (0.3° into DSF tile) | Fast connections (>30 tiles/sec) |
-| `opportunistic` | Executor backpressure | Moderate connections (10-30 tiles/sec) |
-| `disabled` | Never | Slow connections or debugging |
+`mode` was removed in v0.5.0. Its values `opportunistic` and `aggressive` once chose between two triggers that belonged to earlier designs, and both had come to behave the same; `disabled` did what `enabled = false` does. A file that still has a `mode` line keeps working: `mode = disabled` is read as `enabled = false`, any other value is ignored, and `xearthlayer config upgrade` writes `enabled = false` for `disabled` and removes the line.
+
+`max_tiles_per_cycle`, `default_window_rows` and `window_lon_extent` belonged to earlier designs and are no longer read; `xearthlayer config upgrade` removes them.
 
 **Example:**
 ```ini
 [prefetch]
 enabled = true
-mode = auto                    ; Let calibration determine mode
 ; web_api_port = 8086
-
-; Rate limiting
-max_tiles_per_cycle = 3000     ; Tiles per cycle
-cycle_interval_ms = 2000       ; Cycle interval (ms)
-
-; Calibration thresholds (tiles/sec)
-calibration_aggressive_threshold = 30.0      ; Above = aggressive mode
-calibration_opportunistic_threshold = 10.0   ; Above = opportunistic, below = disabled
-calibration_sample_duration = 60             ; Calibration period (seconds)
 
 ; Transition ramp (takeoff phase management)
 takeoff_climb_ft = 1000                      ; Feet above takeoff MSL to release hold
@@ -328,18 +311,21 @@ landing_hysteresis_secs = 15                 ; Sustained GS < 40kt for landing d
 ramp_duration_secs = 30                      ; Linear ramp duration after hold release
 ramp_start_fraction = 0.25                   ; Starting prefetch fraction (25%)
 
-; Boundary-driven prefetch (cruise mode)
-; window_buffer = 1                          ; Extra DSF tiles around window edges
+; Capacity of the prefetch lane as a fraction of the capacity FUSE demand gets
+; capacity_share = 0.35                      ; 0.05-0.50
+
+; Prefetch box
+; box_extent = 7.0                           ; Degrees per axis (ground box, cruise maximum)
+; box_max_bias = 0.8                         ; Forward bias on the primary axis
+; window_buffer = 1                          ; Regions retained beyond the box
 ; stale_region_timeout = 120                 ; Seconds before InProgress region is stale
-; default_window_rows = 3                    ; Scenery window height (DSF rows, ~3° worldwide)
-; window_lon_extent = 3.0                    ; Longitude extent (degrees) for column computation
 ```
 
 **Transition Ramp:**
 
 The prefetch system uses a three-phase flight model to manage system resources during critical flight phases:
 
-- **Ground** (GS < 40kt): Full-rate prefetch using ring strategy around current position
+- **Ground** (GS < 40kt): Full-rate prefetch using a square box centred on the aircraft
 - **Transition** (GS >= 40kt, climbing): Prefetch fully suppressed while X-Plane loads takeoff scenery
 - **Cruise** (climb confirmed): Prefetch ramps from `ramp_start_fraction` to full rate over `ramp_duration_secs`
 
@@ -397,13 +383,15 @@ Controls log output.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `file` | path | `~/.xearthlayer/xearthlayer.log` | Log file location. Supports `~` expansion. |
+| `file` | path | `~/.local/state/xearthlayer/xearthlayer.log` | The log `xearthlayer run` writes. Supports `~` expansion. |
 
 **Example:**
 ```ini
 [logging]
-file = ~/.xearthlayer/xearthlayer.log
+file = ~/.local/state/xearthlayer/xearthlayer.log
 ```
+
+Only `xearthlayer run` writes this file, and it empties it when it starts, so copy a flight's log aside before the next run if you may need it. The package manager and the `packages` commands write their own log, `xearthlayer-packages.log` in the same directory as the default (`~/Library/Logs/XEarthLayer/` on macOS), appended to with a "Session started" line per command. Every other command writes no log file.
 
 ### [packages]
 
@@ -411,30 +399,33 @@ Controls package manager behavior.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `library_url` | URL | `https://xearthlayer.app/packages/xearthlayer_package_library.txt` | URL to the package library index file |
-| `install_location` | path | `~/.xearthlayer/packages` | Directory for storing installed packages |
+| `library_url` | URL | `https://xearthlayer.app/packages/v2/xearthlayer_package_library.txt` | URL to the package library index file. The default is library generation v2, the rebuilt world. A config naming the pre-0.5 library, `https://xearthlayer.app/packages/xearthlayer_package_library.txt`, or the 0.5.0 alpha staging library reads v2 instead, and the first start or `xearthlayer config upgrade` rewrites it |
+| `install_location` | path | `~/.local/share/xearthlayer/packages` | Directory for storing installed packages |
 | `custom_scenery_path` | path | (auto-detect) | X-Plane Custom Scenery directory for overlay symlinks |
 | `auto_install_overlays` | bool | `false` | Automatically install matching overlay when installing ortho |
 | `disable_overlays` | bool | `false` | Suppress XEL overlays at runtime (see notes below) |
-| `temp_dir` | path | `~/.xearthlayer/tmp` | Temporary directory for package downloads |
+| `xworld_pro` | bool | `false` | Give SimHeaven X-World Pro priority over XEarthLayer overlays (see [X-World Pro](x-world-pro.md)) |
+| `temp_dir` | path | `~/.cache/xearthlayer/tmp` | Temporary directory for downloaded package parts |
 | `concurrent_downloads` | Integer | `5` | Number of concurrent part downloads (1-10) |
 
 **Example:**
 ```ini
 [packages]
-; library_url defaults to https://xearthlayer.app/packages/xearthlayer_package_library.txt
-install_location = ~/.xearthlayer/packages
+; library_url defaults to https://xearthlayer.app/packages/v2/xearthlayer_package_library.txt
+install_location = ~/.local/share/xearthlayer/packages
 custom_scenery_path = /home/user/X-Plane 12/Custom Scenery
 auto_install_overlays = true
 disable_overlays = false
+xworld_pro = false
 temp_dir = ~/Downloads/xearthlayer-temp
 ```
 
 **Notes:**
 - The default `library_url` points to the official XEarthLayer package library; override only if using a custom package source
-- The `temp_dir` is used for downloading archives before extraction; files are cleaned up after installation. The default avoids the system temp directory which is often RAM-backed (tmpfs) on Linux
+- The `temp_dir` holds downloaded package parts, each deleted as its package is extracted; it needs at least room for the largest download in a batch; more space lets downloads run further ahead of installs. An update needs room for the new version beside the old one until the swap. The default avoids the system temp directory which is often RAM-backed (tmpfs) on Linux
 - When `auto_install_overlays` is enabled, installing an ortho package will automatically install the matching overlay package for the same region (if available)
 - `disable_overlays` is a **runtime** control. When set to `true`, `xearthlayer run` removes the consolidated `yzXEL_overlay/` symlink folder from Custom Scenery on startup so X-Plane does not load XEarthLayer overlays. Overlay packages remain downloaded and stored locally — flipping the setting back to `false` and restarting reinstates them with no re-download. Use this when running third-party overlay scenery (e.g. SimHeaven, Prefab Objects) that conflicts with XEL overlays. Distinct from `auto_install_overlays`, which controls whether overlays are *downloaded* alongside ortho packages.
+- `xworld_pro` is set by `xearthlayer setup` when SimHeaven X-World Pro is detected. With `true`, every `xearthlayer run` leaves XEarthLayer's overlays out for the continents X-World Pro covers (all of them when the whole planet is installed) and checks the scenery order and X-World Pro setup. `disable_overlays = true` still turns every overlay off. See [X-World Pro](x-world-pro.md).
 - If `custom_scenery_path` is not set, it falls back to `[xplane] scenery_dir` or auto-detects from X-Plane installation
 
 ---
@@ -446,13 +437,13 @@ Settings for tile patches - pre-built Ortho4XP tiles with custom mesh/elevation 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Enable/disable patches functionality |
-| `directory` | path | `~/.xearthlayer/patches` | Directory containing patch tiles |
+| `directory` | path | `~/.local/share/xearthlayer/patches` | Directory containing patch tiles |
 
 **Example:**
 ```ini
 [patches]
 enabled = true
-directory = ~/.xearthlayer/patches
+directory = ~/.local/share/xearthlayer/patches
 ```
 
 **Notes:**
@@ -483,6 +474,46 @@ max_background = 256
 congestion_threshold = 192
 ```
 
+### [night]
+
+Controls night lighting. Packages built with OXO night recipes carry `night/` folders; XEarthLayer serves `*_LIT.dds` textures for those tiles, sized from your own X-Plane lit art.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | true | Serve generated lit textures. `false` makes every lit texture the minimal dark texture |
+| `brightness` | 1.0 | Overall lit brightness, 0.5 to 1.5. A development setting while the lighting is tuned |
+
+Lit textures are built from the X-Plane installation behind your Custom Scenery path. If that installation cannot be found, lit textures stay dark whatever this setting says. The texture quality setting is read once when XEarthLayer starts, so a change to it takes effect on the next start.
+
+Lit urban ground glows where your X-Plane art and NASA VIIRS night lights say a city is, with soft edges between neighbourhoods and no visible repeat in the street pattern. Some neighbourhoods are lit with white LED street lighting instead of sodium orange, more often in bright downtown and industrial areas than in suburbs, at a share and colour temperature that depend on the package's region. The lit layer switches off close to the aircraft, where X-Plane's own 3D lights take over. Generated lit textures are kept in the disk cache (see `disk_size` above), so a revisited area does not need to generate them again.
+
+The brightness of the night lights comes from NASA Black Marble VJ146A4 annual nighttime lights, from the VIIRS instrument on NOAA-20 (JPSS1):
+
+> NASA VIIRS Land Science Investigator-led Processing System. (2025). *VIIRS/JPSS1 Lunar BRDF-Adjusted Nighttime Lights Yearly L3 Global 15 arc second Linear Lat Lon Grid* [Dataset]. NASA Level 1 and Atmosphere Archive and Distribution System Distributed Active Archive Center. https://doi.org/10.5067/VIIRS/VJ146A4.002 Date Accessed: 2026-10-16
+
+**Example:**
+```ini
+[night]
+enabled = true
+brightness = 1.0
+```
+
+### [tui]
+
+Controls the terminal dashboard.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `symbols` | auto | Symbols on the Status pane: `auto`, `emoji` or `plain` |
+
+The Status pane leads each feature line with an emoji: 🌐 for the tile processing engine, 🌙 or 🌑 for night lighting, 🌍 for X-World Pro. A terminal without a colour emoji font draws those as empty boxes, so `plain` replaces them with check, cross and warning marks, which carry the same states. `auto` picks emoji only when every check it can make says they will draw: the terminal is not the text console, the locale is UTF-8 (or unset), the session is not over SSH, a colour font covers all four emoji (on Linux, asked of fontconfig; macOS always has one), and the terminal moves the cursor two columns for one emoji. Over SSH the fonts that matter are on the machine you type at, which XEarthLayer cannot see, so set `emoji` there if your terminal draws them. The choice and the reason for it are logged at startup.
+
+**Example:**
+```ini
+[tui]
+symbols = auto
+```
+
 ## Complete Example
 
 ```ini
@@ -504,29 +535,14 @@ threads = 8
 timeout = 10
 
 [executor]
-; Job executor daemon (defaults are auto-tuned)
-; max_concurrent_jobs = 12         ; Max concurrent tile jobs (ceil(num_cpus * 0.75))
-; network_concurrent = 128         ; HTTP connections (64-256 range)
-; cpu_concurrent = 8               ; CPU-bound ops (num_cpus / 2)
-; disk_io_concurrent = 64          ; Disk I/O (auto-detected)
+; Per-chunk download behaviour. Concurrency is derived from the host.
 ; request_timeout_secs = 10        ; Per-chunk HTTP timeout
 ; max_retries = 3                  ; Download retry attempts
-; retry_base_delay_ms = 100        ; Backoff base delay
 
 [prefetch]
-; Adaptive Prefetch System (v0.3.0+) - self-calibrating tile prefetching
+; Adaptive Prefetch System
 enabled = true
-mode = auto                    ; auto, aggressive, opportunistic, disabled
 ; web_api_port = 8086
-
-; Rate limiting
-; max_tiles_per_cycle = 3000   ; tiles per cycle
-; cycle_interval_ms = 2000     ; cycle interval (ms)
-
-; Performance calibration thresholds (tiles/sec)
-; calibration_aggressive_threshold = 30.0    ; above = aggressive mode
-; calibration_opportunistic_threshold = 10.0 ; above = opportunistic, below = disabled
-; calibration_sample_duration = 60           ; calibration period (seconds)
 
 ; Transition ramp (takeoff phase management)
 ; takeoff_climb_ft = 1000                    ; feet above takeoff MSL to release
@@ -535,11 +551,14 @@ mode = auto                    ; auto, aggressive, opportunistic, disabled
 ; ramp_duration_secs = 30                    ; linear ramp duration after release
 ; ramp_start_fraction = 0.25                 ; starting prefetch fraction
 
-; Boundary-driven prefetch (cruise mode)
-; window_buffer = 1                          ; extra DSF tiles around window edges
+; Capacity of the prefetch lane as a fraction of the capacity FUSE demand gets
+capacity_share = 0.35                        ; 0.05-0.50
+
+; Prefetch box
+; box_extent = 7.0                           ; degrees per axis (ground box, cruise maximum)
+; box_max_bias = 0.8                         ; forward bias on the primary axis
+; window_buffer = 1                          ; regions retained beyond the box
 ; stale_region_timeout = 120                 ; seconds before InProgress region is stale
-; default_window_rows = 3                    ; scenery window height (DSF rows)
-; window_lon_extent = 3.0                    ; longitude extent for column computation
 
 [prewarm]
 ; Cold-start cache pre-warming (use with --airport ICAO)
@@ -550,26 +569,37 @@ mode = auto                    ; auto, aggressive, opportunistic, disabled
 ; scenery_dir = /path/to/X-Plane 12/Custom Scenery
 
 [logging]
-file = ~/.xearthlayer/xearthlayer.log
+file = ~/.local/state/xearthlayer/xearthlayer.log
 
 [packages]
-; library_url defaults to https://xearthlayer.app/packages/xearthlayer_package_library.txt
-; install_location = ~/.xearthlayer/packages
+; library_url defaults to https://xearthlayer.app/packages/v2/xearthlayer_package_library.txt
+; install_location = ~/.local/share/xearthlayer/packages
 ; custom_scenery_path = /path/to/X-Plane 12/Custom Scenery
 ; auto_install_overlays = true
 ; disable_overlays = false
+; xworld_pro = false
 ; temp_dir = ~/Downloads/xearthlayer-temp
 
 [patches]
 ; Tile patches for custom mesh/elevation from airport addons
 enabled = true
-; directory = ~/.xearthlayer/patches
+; directory = ~/.local/share/xearthlayer/patches
 
 [fuse]
 ; FUSE kernel limits for concurrent background requests (advanced)
 ; The Linux kernel default of 12/9 causes X-Plane freezes at DSF boundaries
 max_background = 256
 congestion_threshold = 192
+
+[night]
+; Night lighting from OXO night recipes in installed packages (false = always dark)
+enabled = true
+; Overall lit brightness, 0.5 to 1.5 (development setting)
+brightness = 1.0
+
+[tui]
+; Status pane symbols: auto, emoji or plain
+symbols = auto
 ```
 
 ## Config CLI Commands
@@ -580,7 +610,7 @@ XEarthLayer provides CLI commands for viewing and modifying configuration settin
 
 ```bash
 xearthlayer config path
-# Output: /home/user/.xearthlayer/config.ini
+# Output: /home/user/.config/xearthlayer/config.ini
 ```
 
 ### List All Settings
@@ -649,37 +679,28 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `provider.mapbox_access_token` | string | MapBox access token |
 | `cache.directory` | path | Cache directory |
 | `cache.memory_size` | size (e.g., `512MB`) | Memory cache size (staging buffer) |
-| `cache.disk_size` | size (e.g., `20GB`) | Total disk cache size (DDS + chunks) |
-| `cache.dds_disk_ratio` | float (e.g., `0.6`) | Fraction of disk for DDS tiles (0.0-1.0) |
+| `cache.disk_size` | size (e.g., `20GB`) | Total disk cache size (DDS + chunks, plus 5% for night lighting when enabled) |
+| `cache.dds_disk_ratio` | float (e.g., `0.6`) | Fraction of disk for DDS tiles (0.0-1.0), after any night lighting share |
 | `texture.format` | `bc1`, `bc3` | DDS compression format |
 | `texture.compressor` | `software`, `ispc`, `gpu` | Compression backend |
 | `texture.gpu_device` | `integrated`, `discrete`, or name | GPU adapter selection (used when compressor = gpu) |
 | `generation.threads` | positive integer | Worker threads |
 | `generation.timeout` | positive integer | Tile generation timeout (seconds) |
-| `executor.max_concurrent_jobs` | 1-256 | Max concurrent DDS tile jobs |
-| `executor.network_concurrent` | positive integer | Concurrent HTTP connections (64-256) |
-| `executor.cpu_concurrent` | positive integer | Concurrent CPU-bound operations |
-| `executor.disk_io_concurrent` | positive integer | Concurrent disk I/O operations |
 | `executor.request_timeout_secs` | positive integer | Per-chunk HTTP timeout (seconds) |
 | `executor.max_retries` | positive integer | Max retry attempts per chunk |
-| `executor.retry_base_delay_ms` | positive integer | Exponential backoff base (ms) |
 | `prefetch.enabled` | `true`, `false` | Enable predictive prefetching |
-| `prefetch.mode` | `auto`, `aggressive`, `opportunistic`, `disabled` | Prefetch mode (auto uses calibration) |
 | `prefetch.web_api_port` | 1024-65535 | X-Plane Web API port for telemetry and sim state |
-| `prefetch.max_tiles_per_cycle` | positive integer | Max tiles per prefetch cycle |
-| `prefetch.cycle_interval_ms` | positive integer | Prefetch cycle interval (ms) |
-| `prefetch.calibration_aggressive_threshold` | positive number | Tiles/sec for aggressive mode |
-| `prefetch.calibration_opportunistic_threshold` | positive number | Tiles/sec for opportunistic mode |
-| `prefetch.calibration_sample_duration` | positive integer | Calibration period (seconds) |
+| `prefetch.cycle_interval_ms` | positive integer | Prefetch cycle interval (ms); currently has no effect |
 | `prefetch.takeoff_climb_ft` | 200-5000 | Feet above takeoff MSL to release hold |
 | `prefetch.takeoff_timeout_secs` | 30-300 | Max seconds before timeout release |
 | `prefetch.landing_hysteresis_secs` | 5-60 | Sustained GS < 40kt for landing detection |
 | `prefetch.ramp_duration_secs` | 10-120 | Linear ramp duration (seconds) |
 | `prefetch.ramp_start_fraction` | 0.1-0.5 | Starting prefetch fraction |
-| `prefetch.window_buffer` | 0-3 | Extra DSF tiles around window edges |
+| `prefetch.window_buffer` | 0-3 | Regions retained beyond the prefetch box on each side |
 | `prefetch.stale_region_timeout` | 30-600 | Seconds before InProgress region is stale |
-| `prefetch.default_window_rows` | 2-12 | Scenery window height (DSF rows) |
-| `prefetch.window_lon_extent` | 1.0-10.0 | Longitude extent (degrees) for column computation |
+| `prefetch.box_extent` | 7.0-15.0 | Prefetch box degrees per axis (ground box, cruise maximum) |
+| `prefetch.box_max_bias` | 0.5-0.9 | Forward bias fraction on the primary axis |
+| `prefetch.capacity_share` | 0.05-0.50 | Prefetch capacity as a fraction of demand capacity |
 | `prewarm.grid_rows` | positive integer | Latitude extent in DSF tiles for prewarm |
 | `prewarm.grid_cols` | positive integer | Longitude extent in DSF tiles for prewarm |
 | `xplane.scenery_dir` | path | X-Plane Custom Scenery directory |
@@ -688,8 +709,12 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `packages.custom_scenery_path` | path | Custom Scenery for overlays |
 | `packages.auto_install_overlays` | `true`, `false` | Auto-install matching overlays |
 | `packages.disable_overlays` | `true`, `false` | Suppress XEL overlays at runtime |
+| `packages.xworld_pro` | `true`, `false` | Give X-World Pro priority over XEL overlays |
 | `packages.temp_dir` | path | Temporary download directory |
 | `logging.file` | path | Log file location |
+| `night.enabled` | `true`, `false` | Serve generated night lighting textures |
+| `night.brightness` | 0.5 to 1.5 | Overall lit brightness (development setting) |
+| `tui.symbols` | `auto`, `emoji`, `plain` | Status pane symbols (default `auto`) |
 
 ## CLI Overrides
 
@@ -720,7 +745,7 @@ xearthlayer start --source ./scenery --no-cache
 To regenerate the config file with defaults:
 
 ```bash
-rm ~/.xearthlayer/config.ini
+rm ~/.config/xearthlayer/config.ini
 xearthlayer init
 ```
 

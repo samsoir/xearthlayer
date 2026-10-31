@@ -9,9 +9,12 @@ use crate::cache::adapters::MemoryCacheBridge;
 use crate::cache::GcSchedulerDaemon;
 use crate::executor::DdsClient;
 use crate::metrics::{MetricsSystem, TelemetrySnapshot, TuiReporter};
+use crate::pinned_budget::PinnedTileBudget;
 use crate::prefetch::TileRequestCallback;
 use crate::provider::ProviderConfig;
-use crate::runtime::{SharedRuntimeHealth, SharedTileProgressTracker, XEarthLayerRuntime};
+use crate::runtime::{
+    PrefetchLane, SharedRuntimeHealth, SharedTileProgressTracker, XEarthLayerRuntime,
+};
 use crate::texture::{DdsTextureEncoder, TextureEncoder};
 use std::sync::Arc;
 use tokio::runtime::{Handle, Runtime};
@@ -85,6 +88,11 @@ pub struct XEarthLayerService {
     gpu_worker_handle: Option<JoinHandle<()>>,
     /// Shutdown token for the GPU pipeline worker.
     gpu_shutdown: Option<CancellationToken>,
+    /// The GPU the encoder selected (when `texture.compressor = gpu`).
+    gpu_adapter: Option<crate::system::GpuAdapter>,
+    /// The encoder policy's contention warning, when `gpu` was honoured on
+    /// a host whose only GPU is the one X-Plane renders with (#203).
+    gpu_warning: Option<String>,
 }
 
 impl XEarthLayerService {
@@ -140,6 +148,8 @@ impl XEarthLayerService {
         let dds_encoder = encoder_components.encoder;
         let gpu_worker_handle = encoder_components.gpu_worker_handle;
         let gpu_shutdown = encoder_components.gpu_shutdown;
+        let gpu_adapter = encoder_components.gpu_adapter;
+        let gpu_warning = encoder_components.gpu_warning;
 
         // 6. Create XEarthLayer runtime with cache bridges
         // Clone metrics_client before passing to RuntimeBuilder (we need it for GC daemon)
@@ -153,6 +163,8 @@ impl XEarthLayerService {
         .with_async_provider(Arc::clone(&async_provider))
         .with_runtime_handle(runtime_handle.clone())
         .with_metrics_client(metrics_client)
+        .with_download_config(config.chunk_download_config())
+        .with_capacity_share(config.prefetch_capacity_share())
         .build_with_cache_service(
             cache_layer.memory_bridge(),
             cache_layer.dds_disk_bridge(),
@@ -161,13 +173,15 @@ impl XEarthLayerService {
 
         let dds_client = xel_runtime.dds_client();
 
-        // 7. Create and spawn GC scheduler daemons (one per disk tier)
+        // 7. Create and spawn GC scheduler daemons (one per disk tier).
+        // GC is housekeeping, so it runs on the prefetch lane and never
+        // competes with FUSE for the demand lane's pools.
         let gc_shutdown = CancellationToken::new();
         let mut gc_scheduler_handles = Vec::new();
 
         // Chunk disk GC daemon
         if let Some(chunk_provider) = cache_layer.disk_provider() {
-            let job_submitter = xel_runtime.job_submitter();
+            let job_submitter = xel_runtime.prefetch_lane().job_submitter();
             let lru_index = chunk_provider.lru_index();
             let cache_dir = chunk_provider.directory().to_path_buf();
             let max_size = chunk_provider.max_size_bytes();
@@ -185,7 +199,7 @@ impl XEarthLayerService {
 
         // DDS disk GC daemon
         if let Some(dds_provider) = cache_layer.dds_disk_provider() {
-            let job_submitter = xel_runtime.job_submitter();
+            let job_submitter = xel_runtime.prefetch_lane().job_submitter();
             let lru_index = dds_provider.lru_index();
             let cache_dir = dds_provider.directory().to_path_buf();
             let max_size = dds_provider.max_size_bytes();
@@ -199,6 +213,25 @@ impl XEarthLayerService {
             }));
 
             tracing::info!("DDS disk GC scheduler daemon started");
+        }
+
+        // Lit disk GC daemon (only with night lighting enabled). No metrics
+        // client: its evictions are not ortho disk evictions and must not
+        // land in that metric.
+        if let Some(lit_provider) = cache_layer.lit_disk_provider() {
+            let job_submitter = xel_runtime.prefetch_lane().job_submitter();
+            let lru_index = lit_provider.lru_index();
+            let cache_dir = lit_provider.directory().to_path_buf();
+            let max_size = lit_provider.max_size_bytes();
+
+            let gc_daemon = GcSchedulerDaemon::new(lru_index, cache_dir, max_size, job_submitter);
+
+            let gc_shutdown_clone = gc_shutdown.clone();
+            gc_scheduler_handles.push(runtime_handle.spawn(async move {
+                gc_daemon.run(gc_shutdown_clone).await;
+            }));
+
+            tracing::info!("Lit disk GC scheduler daemon started");
         }
 
         let gc_scheduler_shutdown = if gc_scheduler_handles.is_empty() {
@@ -231,6 +264,8 @@ impl XEarthLayerService {
             gc_scheduler_shutdown,
             gpu_worker_handle,
             gpu_shutdown,
+            gpu_adapter,
+            gpu_warning,
         })
     }
 
@@ -362,6 +397,24 @@ impl XEarthLayerService {
         })
     }
 
+    /// The GPU encoding textures, or `None` when a CPU encoder is in use.
+    pub fn gpu_adapter(&self) -> Option<&crate::system::GpuAdapter> {
+        self.gpu_adapter.as_ref()
+    }
+
+    /// Why GPU encoding will contend with X-Plane on this host, or `None`
+    /// when it will not or a CPU encoder is in use (#203).
+    pub fn gpu_warning(&self) -> Option<&str> {
+        self.gpu_warning.as_deref()
+    }
+
+    /// The lit disk cache (generated night lighting payloads).
+    ///
+    /// `None` when caching or night lighting is off.
+    pub fn lit_disk_cache(&self) -> Option<Arc<dyn crate::cache::Cache>> {
+        self.cache_layer.as_ref().and_then(|cl| cl.lit_disk_cache())
+    }
+
     /// Shutdown the cache layer gracefully.
     ///
     /// This stops the GC daemon and flushes pending operations.
@@ -419,14 +472,20 @@ impl XEarthLayerService {
         self.dds_client.clone()
     }
 
-    /// Get the executor's resource pools for utilization monitoring.
+    /// Get the prefetch lane for background tile work (#296).
     ///
     /// Returns `None` if the runtime has not been started yet.
-    /// Used by the circuit breaker to trip on pool saturation.
-    pub fn resource_pools(&self) -> Option<Arc<crate::executor::ResourcePools>> {
+    pub fn prefetch_lane(&self) -> Option<Arc<dyn PrefetchLane>> {
         self.xearthlayer_runtime
             .as_ref()
-            .map(|r| r.resource_pools())
+            .map(|r| r.prefetch_lane() as Arc<dyn PrefetchLane>)
+    }
+
+    /// Get the pinned-tile budget the FUSE mount accounts against (#246).
+    ///
+    /// Returns `None` if the runtime has not been started yet.
+    pub fn pinned_budget(&self) -> Option<Arc<PinnedTileBudget>> {
+        self.xearthlayer_runtime.as_ref().map(|r| r.pinned_budget())
     }
 
     /// Set the tile request callback for FUSE-based position inference.

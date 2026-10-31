@@ -29,6 +29,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn, Instrument};
 
 /// Task that downloads all chunks for a tile.
@@ -120,6 +121,10 @@ where
         );
         Box::pin(
             async move {
+                if crate::tasks::cached_tile_probe::tile_already_cached(ctx) {
+                    return TaskResult::Success;
+                }
+
                 // Check for cancellation before starting
                 if ctx.is_cancelled() {
                     return TaskResult::Cancelled;
@@ -133,13 +138,16 @@ where
                     "Starting chunk downloads"
                 );
 
-                // Download all chunks with metrics tracking
+                // Download all chunks with metrics tracking. The token is
+                // threaded through so a killed job stops downloading at once
+                // (#300) instead of when its last chunk request completes.
                 let chunks = download_all_chunks(
                     self.tile,
                     Arc::clone(&self.provider),
                     Arc::clone(&self.disk_cache),
                     &self.config,
                     metrics,
+                    ctx.cancellation_token().clone(),
                 )
                 .await;
 
@@ -198,12 +206,22 @@ struct ChunkError {
 /// Uses the **shared semaphore** from [`DownloadConfig`] to limit concurrent
 /// HTTP requests across ALL tiles being downloaded. This prevents the
 /// multiplicative effect where N tiles × 256 chunks overwhelms the provider.
+///
+/// # Cancellation
+///
+/// When `cancellation` fires, every download still in flight is aborted and
+/// awaited before this returns, so their network and HTTP permits are back in
+/// the pool by the time the task reports `Cancelled`. Chunks that had already
+/// completed keep their cache writes (those are spawned independently), so a
+/// retry of the same tile reuses them. The partial results returned on
+/// cancellation are not meant to be served.
 async fn download_all_chunks<P, D>(
     tile: TileCoord,
     provider: Arc<P>,
     disk_cache: Arc<D>,
     config: &DownloadConfig,
     metrics: Option<MetricsClient>,
+    cancellation: CancellationToken,
 ) -> ChunkResults
 where
     P: ChunkProvider,
@@ -243,8 +261,24 @@ where
         });
     }
 
-    // Collect results as they complete
-    while let Some(result) = downloads.join_next().await {
+    // Collect results as they complete, or stop the moment the job is killed
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                debug!(
+                    tile = ?tile,
+                    in_flight = downloads.len(),
+                    "Job cancelled, aborting in-flight chunk downloads"
+                );
+                downloads.shutdown().await;
+                break;
+            }
+            next = downloads.join_next() => match next {
+                Some(result) => result,
+                None => break,
+            },
+        };
         match result {
             Ok(Ok(chunk_data)) => {
                 results.add_success(chunk_data.row, chunk_data.col, chunk_data.data);
@@ -482,8 +516,189 @@ mod tests {
         assert_eq!("DownloadChunks", "DownloadChunks");
     }
 
+    struct PanickingProvider;
+    impl ChunkProvider for PanickingProvider {
+        fn download_chunk(
+            &self,
+            _row: u32,
+            _col: u32,
+            _zoom: u8,
+        ) -> impl Future<Output = Result<Bytes, crate::executor::ChunkDownloadError>> + Send
+        {
+            async { panic!("provider must not be called for a cached tile") }
+        }
+        fn name(&self) -> &str {
+            "panicking"
+        }
+    }
+
+    struct PanickingDiskCache;
+    impl DiskCache for PanickingDiskCache {
+        fn get(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            _cr: u8,
+            _cc: u8,
+        ) -> impl Future<Output = Option<Bytes>> + Send {
+            async { panic!("chunk cache must not be read for a cached tile") }
+        }
+        fn put(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            _cr: u8,
+            _cc: u8,
+            _d: Bytes,
+        ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+            async { panic!("chunk cache must not be written for a cached tile") }
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_tile_probe_hit_skips_the_download() {
+        use crate::executor::JobId;
+        use tokio_util::sync::CancellationToken;
+
+        let task = DownloadChunksTask::new(
+            TileCoord {
+                row: 100,
+                col: 200,
+                zoom: 15,
+            },
+            Arc::new(PanickingProvider),
+            Arc::new(PanickingDiskCache),
+        );
+        let mut ctx = TaskContext::new(JobId::new("test-job"), CancellationToken::new());
+        let mut probe = TaskOutput::new();
+        probe.set(crate::tasks::TILE_CACHED_KEY, true);
+        ctx.add_task_output(crate::tasks::CACHED_TILE_PROBE_TASK.to_string(), probe);
+
+        assert!(matches!(task.execute(&mut ctx).await, TaskResult::Success));
+    }
+
     #[test]
     fn test_output_key() {
         assert_eq!(OUTPUT_KEY_CHUNKS, "chunks");
+    }
+
+    /// A chunk cache with nothing in it that accepts every write.
+    struct EmptyDiskCache;
+    impl DiskCache for EmptyDiskCache {
+        fn get(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            _cr: u8,
+            _cc: u8,
+        ) -> impl Future<Output = Option<Bytes>> + Send {
+            async { None }
+        }
+        fn put(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            _cr: u8,
+            _cc: u8,
+            _d: Bytes,
+        ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+            async { Ok(()) }
+        }
+    }
+
+    /// Counts downloads in flight: incremented when a download starts and
+    /// decremented when its future is dropped, however that happens.
+    struct InFlightGuard(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A provider whose downloads never complete, like a stalled network.
+    struct StallingProvider {
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ChunkProvider for StallingProvider {
+        fn download_chunk(
+            &self,
+            _row: u32,
+            _col: u32,
+            _zoom: u8,
+        ) -> impl Future<Output = Result<Bytes, crate::executor::ChunkDownloadError>> + Send
+        {
+            self.in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let guard = InFlightGuard(Arc::clone(&self.in_flight));
+            async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+        fn name(&self) -> &str {
+            "stalling"
+        }
+    }
+
+    /// Issue #300: a killed job must stop downloading. Cancelling the job's
+    /// token while chunk downloads are in flight must end the task promptly
+    /// and drop every download, not wait for the last one to finish.
+    #[tokio::test]
+    async fn cancellation_aborts_in_flight_chunk_downloads() {
+        use crate::executor::JobId;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let task = DownloadChunksTask::with_config(
+            TileCoord {
+                row: 100,
+                col: 200,
+                zoom: 15,
+            },
+            Arc::new(StallingProvider {
+                in_flight: Arc::clone(&in_flight),
+            }),
+            Arc::new(EmptyDiskCache),
+            DownloadConfig {
+                // Longer than the test's own deadline, so only cancellation
+                // can end the downloads.
+                request_timeout: Duration::from_secs(60),
+                ..DownloadConfig::default()
+            },
+        );
+        let token = CancellationToken::new();
+        let mut ctx = TaskContext::new(JobId::new("test-job"), token.clone());
+
+        // Kill the job once the downloads are under way.
+        let killer = {
+            let in_flight = Arc::clone(&in_flight);
+            tokio::spawn(async move {
+                while in_flight.load(Ordering::SeqCst) < 256 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                token.cancel();
+            })
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(5), task.execute(&mut ctx))
+            .await
+            .expect("a cancelled task must return promptly, not wait for its downloads");
+        killer.await.unwrap();
+
+        assert!(
+            matches!(result, TaskResult::Cancelled),
+            "expected Cancelled, got {result:?}"
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "every chunk download must be dropped when the task is cancelled"
+        );
     }
 }

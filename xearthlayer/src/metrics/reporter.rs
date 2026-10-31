@@ -199,6 +199,16 @@ impl MetricsReporter for TuiReporter {
             total_download_time_ms: state.download_time_us / 1000,
             total_assembly_time_ms: state.assembly_time_us / 1000,
             total_encode_time_ms: state.encode_time_us / 1000,
+
+            // Lane metrics
+            fuse_latency: state.fuse_latency,
+            fuse_session_latency: state.fuse_session_latency,
+            fuse_session_timeouts: state.fuse_session_timeouts,
+            demand_in_flight: state.demand_in_flight,
+            prefetch_paused: state.prefetch_paused,
+            prefetch_lane_load: state.prefetch_lane_load,
+            prefetch_lane_running: state.prefetch_lane_running,
+            prefetch_lane_queued: state.prefetch_lane_queued,
         }
     }
 }
@@ -240,6 +250,31 @@ mod tests {
         state.encode_time_us = 45_000_000; // 45 seconds
 
         state
+    }
+
+    #[test]
+    fn test_tui_reporter_carries_lane_state() {
+        let mut state = create_test_state();
+        state.fuse_latency = Some(crate::metrics::LatencySummary {
+            median_us: 40_000,
+            p95_us: 90_000,
+            max_us: 120_000,
+            count: 7,
+        });
+        state.demand_in_flight = 3;
+        state.prefetch_paused = true;
+        state.prefetch_lane_load = 0.25;
+        state.prefetch_lane_running = 9;
+        state.prefetch_lane_queued = 11;
+
+        let snapshot = TuiReporter::new().report(&state, &TimeSeriesHistory::default());
+
+        assert_eq!(snapshot.fuse_latency, state.fuse_latency);
+        assert_eq!(snapshot.demand_in_flight, 3);
+        assert!(snapshot.prefetch_paused);
+        assert_eq!(snapshot.prefetch_lane_load, 0.25);
+        assert_eq!(snapshot.prefetch_lane_running, 9);
+        assert_eq!(snapshot.prefetch_lane_queued, 11);
     }
 
     #[test]

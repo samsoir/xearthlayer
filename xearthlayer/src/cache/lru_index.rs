@@ -73,10 +73,12 @@ pub struct EvictionCandidate {
 ///
 /// - `"tile:15:12754:5279"` → region based on tile center lat/lon
 /// - `"chunk:15:12754:5279:8:12"` → same region as parent tile
+/// - `"lit:16:25312:10528"` → region of that texture at its own zoom
 pub fn key_to_region(key: &str) -> Option<String> {
     let parts: Vec<&str> = key.split(':').collect();
     let (zoom, row, col) = match parts.as_slice() {
         ["tile", zoom, row, col] => (*zoom, *row, *col),
+        ["lit", zoom, row, col] => (*zoom, *row, *col),
         ["chunk", zoom, tile_row, tile_col, _, _] => (*zoom, *tile_row, *tile_col),
         _ => return None,
     };
@@ -435,6 +437,17 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn lit_keys_land_in_the_region_of_their_texture() {
+        // A lit key names a texture at its own zoom, like an ortho tile key.
+        assert_eq!(
+            key_to_region("lit:16:25312:10528"),
+            key_to_region("tile:16:25312:10528")
+        );
+        assert!(key_to_region("lit:16:25312:10528").is_some());
+        assert_eq!(key_to_region("lit:16:x:10528"), None);
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Basic operations

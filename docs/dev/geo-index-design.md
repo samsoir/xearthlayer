@@ -206,10 +206,9 @@ pub struct PatchCoverage {
 
 #### `RetainedRegion`
 
-Unit struct marking a DSF region as retained by X-Plane's scenery window
-(inferred from `SceneTracker` observations). Inserted/removed by
-`SceneryWindow` each coordinator cycle; presence in the layer is the entire
-payload:
+Unit struct marking a DSF region as inside the aircraft's retention box.
+Inserted/removed by `PrefetchBox::update_retention` each coordinator cycle;
+presence in the layer is the entire payload:
 
 ```rust
 pub struct RetainedRegion;

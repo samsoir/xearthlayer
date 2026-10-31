@@ -6,8 +6,14 @@ use std::future::Future;
 /// Errors that can occur during provider operations.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderError {
-    /// HTTP request failed
+    /// HTTP request failed before a response arrived (connect, send, read)
     HttpError(String),
+    /// The server answered with a non-success status code.
+    ///
+    /// Carried as a number so callers decide on the status itself rather than
+    /// by searching the message: a 404 is a permanent "no imagery here"
+    /// (#301) while a 5xx is worth retrying.
+    HttpStatus { status: u16, url: String },
     /// Coordinates outside provider's supported range
     UnsupportedCoordinates { row: u32, col: u32, zoom: u8 },
     /// Zoom level not supported by this provider
@@ -22,6 +28,9 @@ impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ProviderError::HttpError(msg) => write!(f, "HTTP error: {}", msg),
+            ProviderError::HttpStatus { status, url } => {
+                write!(f, "HTTP {} from {}", status, url)
+            }
             ProviderError::UnsupportedCoordinates { row, col, zoom } => {
                 write!(
                     f,

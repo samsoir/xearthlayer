@@ -16,12 +16,12 @@ With tile patches, XEL mounts these tiles and **generates textures dynamically**
 
 1. **Create the patches directory**:
    ```bash
-   mkdir -p ~/.xearthlayer/patches
+   mkdir -p ~/.local/share/xearthlayer/patches
    ```
 
 2. **Add your patch tiles**:
    ```bash
-   mv ~/Ortho4XP/Tiles/+33-119/ ~/.xearthlayer/patches/KLAX_Mesh/
+   mv ~/Ortho4XP/Tiles/+33-119/ ~/.local/share/xearthlayer/patches/KLAX_Mesh/
    ```
 
 3. **Verify patches are detected**:
@@ -37,7 +37,7 @@ With tile patches, XEL mounts these tiles and **generates textures dynamically**
 ## Directory Structure
 
 ```
-~/.xearthlayer/patches/
+~/.local/share/xearthlayer/patches/
 ├── A_KDEN_Mesh/                      # 'A' prefix = highest priority
 │   ├── Earth nav data/
 │   │   └── +30-110/
@@ -101,7 +101,7 @@ Build the tile in Ortho4XP using the addon's elevation data:
 Move the built tile to your patches directory:
 
 ```bash
-mv ~/Ortho4XP/Tiles/+33-119/ ~/.xearthlayer/patches/KLAX_Mesh/
+mv ~/Ortho4XP/Tiles/+33-119/ ~/.local/share/xearthlayer/patches/KLAX_Mesh/
 ```
 
 ### Step 4: Verify
@@ -142,15 +142,15 @@ Displays the configured patches directory location.
 
 ## Configuration
 
-Patches settings in `~/.xearthlayer/config.ini`:
+Patches settings in `~/.config/xearthlayer/config.ini`:
 
 ```ini
 [patches]
 ; Enable/disable patches functionality (default: true)
 enabled = true
 
-; Directory containing patch tiles (default: ~/.xearthlayer/patches)
-directory = ~/.xearthlayer/patches
+; Directory containing patch tiles (default: ~/.local/share/xearthlayer/patches)
+directory = ~/.local/share/xearthlayer/patches
 ```
 
 ### Configuration Keys
@@ -158,7 +158,7 @@ directory = ~/.xearthlayer/patches
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `patches.enabled` | bool | `true` | Enable/disable patches mounting |
-| `patches.directory` | path | `~/.xearthlayer/patches` | Location of patch tiles |
+| `patches.directory` | path | `~/.local/share/xearthlayer/patches` | Location of patch tiles |
 
 ## X-Plane Scenery Order
 
@@ -221,7 +221,7 @@ xearthlayer patches list
 ```
 
 Check that:
-- Patches directory exists (`~/.xearthlayer/patches/`)
+- Patches directory exists (`~/.local/share/xearthlayer/patches/`)
 - Each patch has `Earth nav data/` directory
 - DSF files are present in `Earth nav data/+XX-XXX/` subdirectories
 
@@ -269,8 +269,8 @@ ls !Ortho4XP_Patch/
 # (Use Ortho4XP GUI or CLI)
 
 # 4. Install the patch
-mkdir -p ~/.xearthlayer/patches
-mv ~/Ortho4XP/Tiles/+33-119 ~/.xearthlayer/patches/A_KLAX_Mesh/
+mkdir -p ~/.local/share/xearthlayer/patches
+mv ~/Ortho4XP/Tiles/+33-119 ~/.local/share/xearthlayer/patches/A_KLAX_Mesh/
 
 # 5. Verify
 xearthlayer patches list
@@ -280,9 +280,9 @@ xearthlayer patches list
 
 ```bash
 # Install multiple patches with priority control
-mv ~/Ortho4XP/Tiles/+33-119 ~/.xearthlayer/patches/A_KLAX/
-mv ~/Ortho4XP/Tiles/+39-105 ~/.xearthlayer/patches/B_KDEN/
-mv ~/Ortho4XP/Tiles/+40-074 ~/.xearthlayer/patches/C_KJFK/
+mv ~/Ortho4XP/Tiles/+33-119 ~/.local/share/xearthlayer/patches/A_KLAX/
+mv ~/Ortho4XP/Tiles/+39-105 ~/.local/share/xearthlayer/patches/B_KDEN/
+mv ~/Ortho4XP/Tiles/+40-074 ~/.local/share/xearthlayer/patches/C_KJFK/
 
 # Verify all patches
 xearthlayer patches list

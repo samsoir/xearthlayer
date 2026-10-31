@@ -125,7 +125,7 @@ pub enum RegionState {
     Prefetched,
     /// No scenery data exists for this region.
     NoCoverage,
-    /// In the retained window (tracked by SceneryWindow).
+    /// In the retained window (maintained by `PrefetchBox` retention).
     Retained,
     /// Owned by a scenery patch.
     Patched,
@@ -145,7 +145,7 @@ pub struct StatsInfo {
     pub memory_cache_hit_rate: f64,
     pub tiles_submitted: u64,
     pub deferred_cycles: u64,
-    pub prefetch_mode: String,
+    pub prefetch_state: String,
     pub active_strategy: String,
 }
 
@@ -286,7 +286,7 @@ fn collect_regions(state: &DebugMapState) -> Vec<RegionInfo> {
             }
         }
 
-        // Layer 4: Retained regions — tracked by SceneryWindow retention,
+        // Layer 4: Retained regions — maintained by `PrefetchBox` retention,
         // visible only when nothing else has claimed the region.
         for region in geo_index.regions::<RetainedRegion>() {
             let key = (region.lat, region.lon);
@@ -361,7 +361,7 @@ fn collect_stats(state: &DebugMapState) -> StatsInfo {
         memory_cache_hit_rate: 0.0, // TODO: wire from TelemetrySnapshot when available
         tiles_submitted,
         deferred_cycles,
-        prefetch_mode: format!("{:?}", snapshot.prefetch_mode),
+        prefetch_state: snapshot.coordinator_state().label(),
         active_strategy,
     }
 }
