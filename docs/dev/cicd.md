@@ -9,25 +9,30 @@ release, see the [Application Release Runbook](app-release-runbook.md). For publ
 
 ## Branch Model
 
-Two long-lived branches, one per release channel:
+Three long-lived branches. Both develop lines are the unstable channel: their tags are
+pre-releases, and only `main` is stable.
 
-| Branch | Channel | Version format | Purpose |
-|--------|---------|----------------|---------|
-| `main` | Stable | `X.Y.Z` | Production releases — what most users run |
-| `develop/X.Y.Z` | Unstable | `X.Y.Z-dev.N` | The next release, including breaking changes |
+| Branch | Line | Version format | Purpose |
+|--------|------|----------------|---------|
+| `main` | Stable | `X.Y.Z` | Production releases, what most users run |
+| `develop/X.Y.(Z+1)` (now `develop/0.5.1`) | Maintenance | `X.Y.Z-dev.N` | The next patch: fixes and minor updates |
+| `develop/X.(Y+1).0` (now `develop/0.6.0`) | Next minor | `X.Y.Z-dev.N` | The next minor release, including breaking changes |
 
 Work branches are named for the *kind* of change; the base branch selects the
 *channel*:
 
 - `feature/<name>` — new functionality
 - `bugfix/<issue>-<description>` — bug fixes
-- `hotfix/<description>` — urgent fix to stable (branch from `main`)
+- `hotfix/<description>`: urgent fix to stable that cannot wait for the maintenance
+  line (branch from `main`)
 - `chore/<description>` — tooling, docs, maintenance
 - `release/<version>` — version bump and changelog, immediately before a tag
 
-**Fixes flow one way.** Land fixes on `main`, then forward-merge `main` into the
-unstable branch. The unstable branch is never merged back into `main` until the whole
-line is promoted as a stable release. This keeps `main` releasable at any moment.
+**Changes flow forward.** A fix lands on the maintenance line, reaches `main` through a
+`release/*` branch, and is then forward-merged from `main` into the next-minor line. The
+next-minor line is never merged into the maintenance line or `main`; it reaches `main`
+only when the whole line is promoted. This keeps `main` releasable at any moment. The
+procedure is in the [runbook](app-release-runbook.md#branch-model--release-channels).
 
 ## Workflows
 
@@ -178,10 +183,9 @@ The two halves are enforced by different mechanisms, and only one is live today:
 Release publication is gated for both: `publish` names each packaging job in its
 `needs:` *and* its `if:` expression (see the job graph above). Merge blocking, by
 contrast, is **branch protection** — a repository setting, not a workflow. `main`
-currently requires only the `Verify` context, and `develop/0.5.0` is unprotected, so a
-red `Verify (macOS)` is visible but not merge-blocking. Adding it as a required check
-is deliberately deferred until the macOS port merges: protecting the branch while that
-job is red would block every merge, including the port itself. See
+currently requires only the `Verify` context, and the develop lines are unprotected, so a
+red `Verify (macOS)` is visible but not merge-blocking. Requiring it is still to do now
+that the macOS port has merged. See
 [Status Checks and Branch Protection](#status-checks-and-branch-protection).
 
 | Platform | Arch | CI runner | Notes |
@@ -260,7 +264,7 @@ Required contexts:
 | Branch | Required checks |
 |--------|-----------------|
 | `main` | `Verify` |
-| `develop/0.5.0` | `Verify`, `Verify (macOS)` — planned, pending the macOS port merge |
+| `develop/*` | None today; `Verify` and `Verify (macOS)` planned |
 
 ## What CI Cannot Verify
 
