@@ -17,12 +17,8 @@ pub struct ConfigFile {
     pub cache: CacheSettings,
     /// Texture settings
     pub texture: TextureSettings,
-    /// Download settings
-    pub download: DownloadSettings,
     /// Generation settings
     pub generation: GenerationSettings,
-    /// Pipeline settings for concurrency and retry behavior
-    pub pipeline: PipelineSettings,
     /// X-Plane settings
     pub xplane: XPlaneSettings,
     /// Package manager settings
@@ -41,6 +37,10 @@ pub struct ConfigFile {
     pub executor: ExecutorSettings,
     /// FUSE filesystem settings
     pub fuse: FuseSettings,
+    /// Night lighting settings
+    pub night: NightSettings,
+    /// Terminal dashboard settings
+    pub tui: TuiSettings,
 }
 
 /// General application settings.
@@ -49,6 +49,17 @@ pub struct GeneralSettings {
     /// Enable automatic version update checking on startup (default: true).
     /// When enabled, checks for new versions once per day via a cached HTTP request.
     pub update_check: bool,
+
+    /// Which directory layout this configuration conforms to.
+    ///
+    /// Managed automatically. `0` means the configuration predates the
+    /// versioned layout and its files still live in `~/.xearthlayer`; the
+    /// migration stamps [`crate::paths::LAYOUT_VERSION`] once it has run.
+    ///
+    /// This is what distinguishes "migrated" from "the old directory still
+    /// exists", which are different facts: a user may keep files there that no
+    /// migration will ever claim.
+    pub layout_version: u32,
 }
 
 /// Provider configuration.
@@ -87,13 +98,6 @@ pub struct TextureSettings {
     pub gpu_device: String,
 }
 
-/// Download configuration.
-#[derive(Debug, Clone)]
-pub struct DownloadSettings {
-    /// Timeout in seconds for HTTP requests.
-    pub timeout: u64,
-}
-
 /// Generation configuration.
 #[derive(Debug, Clone)]
 pub struct GenerationSettings {
@@ -104,37 +108,6 @@ pub struct GenerationSettings {
     /// If exceeded, returns a magenta placeholder.
     /// Default: 10 seconds.
     pub timeout: u64,
-}
-
-/// Pipeline configuration for concurrency and retry behavior.
-#[derive(Debug, Clone)]
-pub struct PipelineSettings {
-    /// Maximum concurrent HTTP requests across all tiles.
-    /// Default: 128 (conservative value stable with all providers)
-    ///
-    /// Hard limits: 64-256 (values outside this range are clamped).
-    /// The ceiling prevents overwhelming imagery providers, which causes
-    /// rate limiting (HTTP 429) and cascade failures.
-    pub max_http_concurrent: usize,
-    /// Maximum concurrent CPU-bound operations (assemble + encode stages).
-    /// Default: num_cpus * 1.25, minimum num_cpus + 2
-    pub max_cpu_concurrent: usize,
-    /// Maximum concurrent prefetch jobs in flight.
-    /// Default: max(num_cpus / 4, 2) - leaves 75% of resources for on-demand
-    pub max_prefetch_in_flight: usize,
-    /// HTTP request timeout in seconds for individual chunk downloads.
-    /// Default: 10 seconds
-    pub request_timeout_secs: u64,
-    /// Maximum retry attempts per failed chunk download.
-    /// Default: 3
-    pub max_retries: u32,
-    /// Base delay in milliseconds for exponential backoff between retries.
-    /// Actual delay = base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms, 800ms)
-    /// Default: 100
-    pub retry_base_delay_ms: u64,
-    /// Broadcast channel capacity for request coalescing.
-    /// Default: 16
-    pub coalesce_channel_capacity: usize,
 }
 
 /// X-Plane configuration.
@@ -153,7 +126,8 @@ pub struct PackagesSettings {
     /// Local directory for installed packages (default: ~/.xearthlayer/packages).
     pub install_location: Option<PathBuf>,
     /// X-Plane Custom Scenery directory for overlay symlinks.
-    /// If None, auto-detects from xplane.scenery_dir or ~/.x-plane/x-plane_install_12.txt
+    /// If None, auto-detects from xplane.scenery_dir or the platform's
+    /// X-Plane install reference file (see [`crate::xplane::paths`]).
     pub custom_scenery_path: Option<PathBuf>,
     /// Automatically install overlay packages when installing ortho for same region.
     pub auto_install_overlays: bool,
@@ -163,6 +137,10 @@ pub struct PackagesSettings {
     /// `xearthlayer run` starts. Useful when running third-party overlay scenery
     /// (e.g., SimHeaven) that would otherwise conflict with XEL overlays.
     pub disable_overlays: bool,
+    /// Give SimHeaven X-World Pro priority over XEarthLayer overlays: on every
+    /// `run`, overlays are left out of `yzXEL_overlay/` for the continents
+    /// X-World Pro covers, and the scenery order and setup are checked.
+    pub xworld_pro: bool,
     /// Temporary directory for downloads (default: ~/.xearthlayer/tmp).
     pub temp_dir: Option<PathBuf>,
     /// Number of concurrent part downloads (1-10, default: 5).
@@ -181,33 +159,14 @@ pub struct LoggingSettings {
 pub struct PrefetchSettings {
     /// Enable predictive tile prefetching based on X-Plane telemetry
     pub enabled: bool,
-    /// Adaptive prefetch mode: "auto", "aggressive", "opportunistic", or "disabled"
-    ///
-    /// - "auto": Select mode based on calibration results (recommended)
-    /// - "aggressive": Position-based triggers (fast connections)
-    /// - "opportunistic": Circuit breaker triggers (moderate connections)
-    /// - "disabled": Disable prefetch
-    pub mode: String,
     /// Web API port for X-Plane SimState polling (default: 8086)
     pub web_api_port: u16,
     /// Interval between prefetch cycles in milliseconds. Default: 2000ms.
+    ///
+    /// Inert: carried into the orchestrator configuration but never read;
+    /// the runner paces cycles with `MIN_CYCLE_INTERVAL`.
     /// Higher values reduce prefetch aggressiveness.
     pub cycle_interval_ms: u64,
-    // Adaptive prefetch calibration settings
-    /// Minimum throughput for aggressive mode (tiles/sec).
-    /// If measured throughput exceeds this, aggressive (position-based) prefetch is enabled.
-    /// Default: 30.0
-    pub calibration_aggressive_threshold: f64,
-    /// Minimum throughput for opportunistic mode (tiles/sec).
-    /// If measured throughput is between this and aggressive_threshold,
-    /// opportunistic (circuit breaker) prefetch is enabled.
-    /// Below this threshold, prefetch is disabled.
-    /// Default: 10.0
-    pub calibration_opportunistic_threshold: f64,
-    /// How long to measure throughput during initial calibration (seconds).
-    /// Default: 60
-    pub calibration_sample_duration: u64,
-
     // Transition ramp settings
     /// Altitude climb (feet) above takeoff MSL to release transition hold.
     /// Default: 1000.0, Range: 200-5000
@@ -244,6 +203,9 @@ pub struct PrefetchSettings {
     /// Controls how much the prefetch box shifts forward in the direction of travel.
     /// Default: 0.8, Range: 0.5-0.9
     pub box_max_bias: f64,
+    /// Share of the demand lane's capacity given to prefetch.
+    /// Default: 0.35, Range: 0.05-0.50
+    pub capacity_share: f64,
 }
 
 /// Control plane configuration for job management and health monitoring.
@@ -289,27 +251,39 @@ pub struct PatchesSettings {
     pub directory: Option<PathBuf>,
 }
 
-/// Executor daemon configuration for the job/task framework.
+/// Per-chunk download behaviour for the job/task framework.
+///
+/// Both fields reach the executor through
+/// `ServiceConfig::chunk_download_config`. The executor's own internal sizing
+/// (task and channel capacities, resource pools) is derived from the host and
+/// is deliberately not configurable.
 #[derive(Debug, Clone)]
 pub struct ExecutorSettings {
-    /// Maximum concurrent tasks the executor can run.
-    /// Default: 128
-    pub max_concurrent_tasks: usize,
-    /// Internal job channel capacity (job queue size).
-    /// Default: 256
-    pub job_channel_capacity: usize,
-    /// External request channel capacity (request queue from FUSE/prefetch).
-    /// Default: 1000
-    pub request_channel_capacity: usize,
     /// HTTP request timeout in seconds for individual chunk downloads.
     /// Default: 10 seconds
     pub request_timeout_secs: u64,
     /// Maximum retry attempts per failed chunk download.
     /// Default: 3
     pub max_retries: u32,
-    /// Base delay in milliseconds for exponential backoff between retries.
-    /// Default: 100ms
-    pub retry_base_delay_ms: u64,
+}
+
+/// Night lighting settings.
+#[derive(Debug, Clone)]
+pub struct NightSettings {
+    /// Generate lit textures from OXO night recipes (default: true).
+    /// When false, every lit texture is the minimal black texture.
+    pub enabled: bool,
+    /// Overall lit brightness multiplier, 0.5 to 1.5 (default: 1.0).
+    /// A development setting while the gain curve is tuned.
+    pub brightness: f64,
+}
+
+/// Terminal dashboard settings.
+#[derive(Debug, Clone)]
+pub struct TuiSettings {
+    /// Symbols on the Status pane: `auto` (default) uses emoji when the
+    /// terminal can draw them, `emoji` and `plain` force one set.
+    pub symbols: String,
 }
 
 /// FUSE filesystem settings for kernel background request limits.

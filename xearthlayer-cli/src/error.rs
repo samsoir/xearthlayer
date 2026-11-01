@@ -23,8 +23,6 @@ pub enum CliError {
     CacheClear(String),
     /// Failed to get cache stats
     CacheStats(String),
-    /// Publisher error
-    Publish(String),
     /// Package manager error
     Packages(String),
     /// No packages installed
@@ -33,6 +31,11 @@ pub enum CliError {
     SceneryIndex(String),
     /// XEarthLayer needs initial setup
     NeedsSetup,
+    /// A package operation was stopped by a signal
+    Interrupted(crate::signals::Signal),
+    /// `run` was stopped by a signal and shut down cleanly (#314): the exit
+    /// code names the signal, and there is nothing more to say
+    Stopped(crate::signals::Signal),
 }
 
 impl CliError {
@@ -45,27 +48,48 @@ impl CliError {
     /// from inside this function would skip them and silently truncate
     /// the on-disk log; see issue #194.
     pub fn report(&self) -> u8 {
+        if let CliError::Interrupted(signal) = self {
+            if !crate::signals::terminal_gone() {
+                eprintln!("Interrupted ({signal}). Anything unfinished was cancelled.");
+            }
+            return signal.exit_code();
+        }
+        if let CliError::Stopped(signal) = self {
+            return signal.exit_code();
+        }
+
         eprintln!("Error: {}", self);
 
         // Print additional help for specific errors
         match self {
             CliError::ConfigFile(_) => {
                 eprintln!();
-                eprintln!("Check your config file at ~/.xearthlayer/config.ini");
+                eprintln!(
+                    "Check your config file at {}",
+                    xearthlayer::config::config_file_path().display()
+                );
                 eprintln!("Run 'xearthlayer init' to create a default config file.");
             }
             CliError::Serve(_) => {
                 eprintln!();
                 eprintln!("Common issues:");
-                eprintln!("  1. FUSE not installed: sudo apt install fuse (Linux)");
-                eprintln!("  2. Permissions: You may need to add your user to 'fuse' group");
-                eprintln!(
-                    "  3. Mountpoint in use: Try unmounting with: fusermount -u <mountpoint>"
-                );
-            }
-            CliError::Publish(_) => {
-                eprintln!();
-                eprintln!("Run 'xearthlayer publish --help' for usage information.");
+                #[cfg(target_os = "macos")]
+                {
+                    eprintln!("  1. macFUSE not installed: download from https://macfuse.io");
+                    eprintln!(
+                        "  2. macFUSE not approved: allow it under System Settings > \
+                         Privacy & Security, then restart"
+                    );
+                    eprintln!("  3. Stale mount from a previous run: umount \"<mountpoint>\"");
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    eprintln!("  1. FUSE not installed: sudo apt install fuse (Linux)");
+                    eprintln!("  2. Permissions: You may need to add your user to 'fuse' group");
+                    eprintln!(
+                        "  3. Mountpoint in use: Try unmounting with: fusermount -u <mountpoint>"
+                    );
+                }
             }
             CliError::Packages(_) => {
                 eprintln!();
@@ -123,11 +147,12 @@ impl fmt::Display for CliError {
             CliError::Serve(e) => write!(f, "FUSE server error: {}", e),
             CliError::CacheClear(msg) => write!(f, "Failed to clear cache: {}", msg),
             CliError::CacheStats(msg) => write!(f, "Failed to get cache stats: {}", msg),
-            CliError::Publish(msg) => write!(f, "Publisher error: {}", msg),
             CliError::Packages(msg) => write!(f, "Package manager error: {}", msg),
             CliError::NoPackages { .. } => write!(f, "No ortho packages installed"),
             CliError::SceneryIndex(msg) => write!(f, "Scenery index error: {}", msg),
             CliError::NeedsSetup => write!(f, "XEarthLayer needs initial setup"),
+            CliError::Interrupted(signal) => write!(f, "interrupted by {signal}"),
+            CliError::Stopped(signal) => write!(f, "stopped by {signal}"),
         }
     }
 }

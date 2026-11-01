@@ -51,10 +51,11 @@ pub struct PatchCoverage {
 
 impl GeoLayer for PatchCoverage {}
 
-/// Marks a DSF region as retained by X-Plane (inferred from SceneTracker
-/// observations and the sliding window + buffer model).
+/// Marks a DSF region as retained by X-Plane, inferred as the prefetch box's
+/// regions plus a buffer.
 ///
-/// Inserted/removed by `SceneryWindow` each coordinator cycle.
+/// Inserted/removed by `PrefetchBox::update_retention_with_shape` each cruise
+/// cycle.
 #[derive(Debug, Clone, Copy)]
 pub struct RetainedRegion;
 

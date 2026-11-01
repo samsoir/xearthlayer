@@ -92,6 +92,7 @@ impl HttpDownloader {
         dest: &Path,
         expected_checksum: Option<&str>,
         progress: Option<ProgressCallback>,
+        should_stop: &dyn Fn() -> bool,
     ) -> ManagerResult<u64> {
         // Check existing file for resume
         let existing_size = if dest.exists() {
@@ -119,7 +120,15 @@ impl HttpDownloader {
             self.prepare_destination(dest, existing_size, total_size, supports_range)?;
 
         // Download the content
-        self.stream_download(url, file, dest, start_byte, total_size, progress)?;
+        self.stream_download(
+            url,
+            file,
+            dest,
+            start_byte,
+            total_size,
+            progress,
+            should_stop,
+        )?;
 
         // Verify checksum if provided
         if let Some(expected) = expected_checksum {
@@ -127,6 +136,20 @@ impl HttpDownloader {
         }
 
         Ok(total_size.max(start_byte))
+    }
+
+    /// Download like `download_with_progress`, stopping with
+    /// [`ManagerError::Cancelled`] at the next buffer once `should_stop`
+    /// returns true.
+    pub fn download_cancellable(
+        &self,
+        url: &str,
+        dest: &Path,
+        expected_checksum: Option<&str>,
+        on_progress: ProgressCallback,
+        should_stop: &dyn Fn() -> bool,
+    ) -> ManagerResult<u64> {
+        self.download_with_resume(url, dest, expected_checksum, Some(on_progress), should_stop)
     }
 
     /// Query file info via HEAD request.
@@ -227,6 +250,7 @@ impl HttpDownloader {
     }
 
     /// Stream the download to the destination file.
+    #[allow(clippy::too_many_arguments)]
     fn stream_download(
         &self,
         url: &str,
@@ -235,6 +259,7 @@ impl HttpDownloader {
         start_byte: u64,
         total_size: u64,
         progress: Option<ProgressCallback>,
+        should_stop: &dyn Fn() -> bool,
     ) -> ManagerResult<u64> {
         // Build request with optional Range header
         let mut request = self.client.get(url);
@@ -271,6 +296,9 @@ impl HttpDownloader {
         let mut downloaded = start_byte;
 
         loop {
+            if should_stop() {
+                return Err(ManagerError::Cancelled);
+            }
             let bytes_read =
                 response
                     .read(&mut buffer)
@@ -313,7 +341,7 @@ impl PackageDownloader for HttpDownloader {
         dest: &Path,
         expected_checksum: Option<&str>,
     ) -> ManagerResult<u64> {
-        self.download_with_resume(url, dest, expected_checksum, None)
+        self.download_with_resume(url, dest, expected_checksum, None, &|| false)
     }
 
     fn download_with_progress(
@@ -323,7 +351,7 @@ impl PackageDownloader for HttpDownloader {
         expected_checksum: Option<&str>,
         on_progress: ProgressCallback,
     ) -> ManagerResult<u64> {
-        self.download_with_resume(url, dest, expected_checksum, Some(on_progress))
+        self.download_with_resume(url, dest, expected_checksum, Some(on_progress), &|| false)
     }
 }
 
@@ -347,5 +375,31 @@ mod tests {
     fn test_http_downloader_new() {
         let downloader = HttpDownloader::new();
         assert_eq!(downloader.timeout.as_secs(), DEFAULT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn a_stop_request_ends_a_download_within_one_buffer() {
+        let url = format!(
+            "{}/part.aa",
+            crate::manager::download::test_server::slow_server()
+        );
+        let temp = tempfile::TempDir::new().unwrap();
+        let dest = temp.path().join("part.aa");
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&started);
+        let progress: ProgressCallback = Box::new(move |downloaded, _| {
+            if downloaded > 0 {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let begun = std::time::Instant::now();
+
+        let result =
+            HttpDownloader::new().download_cancellable(&url, &dest, None, progress, &|| {
+                started.load(std::sync::atomic::Ordering::SeqCst)
+            });
+
+        assert!(matches!(result, Err(ManagerError::Cancelled)), "{result:?}");
+        assert!(begun.elapsed() < std::time::Duration::from_secs(5));
     }
 }

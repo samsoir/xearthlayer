@@ -12,7 +12,7 @@
 //! ensure safe concurrent access from async contexts without blocking Tokio
 //! worker threads.
 
-use crate::fuse::DdsFilename;
+use crate::fuse::{DdsFilename, TextureKind};
 use dashmap::DashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +21,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// Virtual inodes start at this value to avoid collision with real file inodes.
 pub const VIRTUAL_INODE_BASE: u64 = 0x1000_0000_0000_0000;
+
+/// Added to a lit texture's virtual inode so it never shares one with the
+/// ortho texture of the same row, column and zoom (R8). Above every bit
+/// `row << 32` can reach for real zoom levels, below `VIRTUAL_INODE_BASE`.
+pub const LIT_INODE_FLAG: u64 = 1 << 59;
 
 /// Manages inode allocation and path/coordinate mappings.
 ///
@@ -47,7 +52,7 @@ pub const VIRTUAL_INODE_BASE: u64 = 0x1000_0000_0000_0000;
 /// let inode = manager.get_or_create_inode(&PathBuf::from("/scenery/tile.dsf"));
 ///
 /// // Create virtual inode for DDS
-/// let coords = DdsFilename { row: 100, col: 200, zoom: 16, map_type: "BI".to_string() };
+/// let coords = DdsFilename { row: 100, col: 200, zoom: 16, map_type: "BI".to_string(), kind: TextureKind::Ortho };
 /// let virtual_inode = manager.create_virtual_inode(coords);
 /// ```
 pub struct InodeManager {
@@ -136,7 +141,12 @@ impl InodeManager {
     ///
     /// This is a pure function that deterministically maps coordinates to inodes.
     fn compute_virtual_inode(coords: &DdsFilename) -> u64 {
+        let kind_flag = match coords.kind {
+            TextureKind::Ortho => 0,
+            TextureKind::Lit => LIT_INODE_FLAG,
+        };
         VIRTUAL_INODE_BASE
+            + kind_flag
             + ((coords.row as u64) << 32)
             + ((coords.col as u64) << 8)
             + (coords.zoom as u64)
@@ -162,6 +172,31 @@ impl InodeManager {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_lit_and_ortho_inodes_differ_for_the_same_coords() {
+        let manager = InodeManager::new(PathBuf::from("/"));
+        let ortho = DdsFilename {
+            row: 25712,
+            col: 12960,
+            zoom: 16,
+            map_type: "BI".into(),
+            kind: TextureKind::Ortho,
+        };
+        let lit = DdsFilename {
+            kind: TextureKind::Lit,
+            ..ortho.clone()
+        };
+        let (a, b) = (
+            manager.create_virtual_inode(ortho.clone()),
+            manager.create_virtual_inode(lit.clone()),
+        );
+        assert_ne!(a, b);
+        assert_eq!(b, a + LIT_INODE_FLAG);
+        assert!(InodeManager::is_virtual_inode(b));
+        assert_eq!(manager.get_virtual_dds(a), Some(ortho));
+        assert_eq!(manager.get_virtual_dds(b), Some(lit));
+    }
 
     #[test]
     fn test_new_reserves_root_inode() {
@@ -248,6 +283,7 @@ mod tests {
             col: 200,
             zoom: 16,
             map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
         };
 
         let inode = manager.create_virtual_inode(coords.clone());
@@ -266,12 +302,14 @@ mod tests {
             col: 200,
             zoom: 16,
             map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
         };
         let coords2 = DdsFilename {
             row: 100,
             col: 200,
             zoom: 16,
             map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
         };
 
         let inode1 = manager.create_virtual_inode(coords1);
@@ -290,12 +328,14 @@ mod tests {
             col: 200,
             zoom: 16,
             map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
         };
         let coords2 = DdsFilename {
             row: 100,
             col: 201,
             zoom: 16,
             map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
         };
 
         let inode1 = manager.create_virtual_inode(coords1);
@@ -330,6 +370,7 @@ mod tests {
             col: 200,
             zoom: 16,
             map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
         };
         let virtual_inode = manager.create_virtual_inode(coords);
         assert!(InodeManager::is_virtual_inode(virtual_inode));

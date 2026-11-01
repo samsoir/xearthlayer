@@ -429,9 +429,10 @@ impl<C: HttpClient + Clone> Provider for AppleMapsProvider<C> {
         let url = self.build_url(row, col, zoom)?;
         match self.http_client.get(&url) {
             Ok(data) => Ok(data),
-            Err(ProviderError::HttpError(msg))
-                if msg.contains("400") || msg.contains("403") || msg.contains("410") =>
-            {
+            Err(ProviderError::HttpStatus {
+                status: 400 | 403 | 410,
+                ..
+            }) => {
                 // Token expired or invalid, refresh and retry
                 // Apple Maps may return 400, 403, or 410 for expired tokens
                 self.refresh_credentials()?;
@@ -587,19 +588,13 @@ impl<C: AsyncHttpClient + Clone> AsyncProvider for AsyncAppleMapsProvider<C> {
 
         match self.http_client.get_with_headers(&url, &headers).await {
             Ok(data) => Ok(data),
-            Err(ProviderError::HttpError(ref msg))
-                if msg.contains("400") || msg.contains("403") || msg.contains("410") =>
-            {
+            Err(ProviderError::HttpStatus {
+                status: error_code @ (400 | 403 | 410),
+                ..
+            }) => {
                 // Token expired or invalid, refresh and retry
                 // Apple Maps may return 400 Bad Request, 403 Forbidden, or 410 Gone
                 // for expired/invalid tokens
-                let error_code = if msg.contains("400") {
-                    "400"
-                } else if msg.contains("403") {
-                    "403"
-                } else {
-                    "410"
-                };
 
                 // Use generation-based refresh to avoid concurrent refresh stampede
                 if let Err(e) = self.refresh_credentials_if_needed(generation_before).await {
@@ -787,5 +782,87 @@ mod tests {
         assert_eq!(snapshot.refresh_success_count, 1);
         assert_eq!(snapshot.refresh_failure_count, 1);
         assert_eq!(snapshot.last_error, Some("Test error".to_string()));
+    }
+
+    // Issue #301: the token-refresh arm matches on the response status, not
+    // on digits found in the error text.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Serves credentials for the token endpoints and `tile_status` for tiles.
+    #[derive(Clone)]
+    struct RoutingClient {
+        tile_status: u16,
+        tile_calls: Arc<AtomicUsize>,
+        bootstrap_calls: Arc<AtomicUsize>,
+    }
+
+    impl RoutingClient {
+        fn new(tile_status: u16) -> Self {
+            Self {
+                tile_status,
+                tile_calls: Arc::new(AtomicUsize::new(0)),
+                bootstrap_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl HttpClient for RoutingClient {
+        fn get(&self, url: &str) -> Result<Vec<u8>, ProviderError> {
+            if url == DUCKDUCKGO_TOKEN_URL {
+                return Ok(br#"DDG.Data.mapsAPIKey = "ddg_token_long_enough";"#.to_vec());
+            }
+            self.tile_calls.fetch_add(1, Ordering::SeqCst);
+            Err(ProviderError::HttpStatus {
+                status: self.tile_status,
+                url: url.to_string(),
+            })
+        }
+
+        fn get_with_bearer(&self, _url: &str, _token: &str) -> Result<Vec<u8>, ProviderError> {
+            self.bootstrap_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(b"https://sat-cdn.apple-mapkit.com/tile?accessKey=key123&v=9571".to_vec())
+        }
+
+        fn post_json(&self, _url: &str, _body: &str) -> Result<Vec<u8>, ProviderError> {
+            unreachable!("the Apple provider never POSTs")
+        }
+    }
+
+    #[test]
+    fn http_403_refreshes_the_token_and_retries_once() {
+        let client = RoutingClient::new(403);
+        let provider = AppleMapsProvider::new(client.clone()).unwrap();
+        assert_eq!(client.bootstrap_calls.load(Ordering::SeqCst), 1);
+
+        let result = provider.download_chunk(100, 200, 15);
+
+        assert!(result.is_err());
+        assert_eq!(
+            client.bootstrap_calls.load(Ordering::SeqCst),
+            2,
+            "a 403 must refresh the credentials"
+        );
+        assert_eq!(
+            client.tile_calls.load(Ordering::SeqCst),
+            2,
+            "the tile must be retried once with the new token"
+        );
+    }
+
+    #[test]
+    fn http_404_is_returned_without_a_token_refresh() {
+        let client = RoutingClient::new(404);
+        let provider = AppleMapsProvider::new(client.clone()).unwrap();
+
+        let result = provider.download_chunk(100, 200, 15);
+
+        assert!(
+            matches!(result, Err(ProviderError::HttpStatus { status: 404, .. })),
+            "got {result:?}"
+        );
+        assert_eq!(client.bootstrap_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(client.tile_calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -25,7 +25,7 @@
 //! - `gs_kt` - Ground speed in knots
 //! - `alt_ft` - Altitude in feet
 //! - `accuracy_m` - Position accuracy in meters
-//! - `source` - Position source (Telemetry, ManualReference, Inference)
+//! - `source` - Position source (Telemetry, ManualReference, Network)
 //! - `telemetry` - Telemetry connection status
 //! - `dsf_tile` - X-Plane DSF tile name (e.g., "+53+009")
 

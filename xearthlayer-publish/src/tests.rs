@@ -1,0 +1,2040 @@
+//! Tests for publish command handlers.
+//!
+//! This module provides mock implementations of the service traits and
+//! comprehensive tests for each command handler.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+
+use semver::Version;
+
+use super::args::*;
+use super::handlers::*;
+use super::traits::*;
+use crate::error::CliError;
+use xearthlayer_package::{ArchivePart, PackageMetadata, PackageType};
+use xearthlayer_publisher::dedupe::{DedupeFilter, GapAnalysisResult, ZoomPriority};
+use xearthlayer_publisher::generation::GenerationReport;
+use xearthlayer_publisher::{
+    ArchiveBuildResult, BuildResult, DeletionPlan, ProcessSummary, RegionSuggestion, ReleaseResult,
+    ReleaseStatus, RepoConfig, SceneryScanResult, SuggestedRegion, TileInfo, UrlConfigResult,
+    VersionBump,
+};
+
+use chrono::Utc;
+
+// ============================================================================
+// Mock Output Implementation
+// ============================================================================
+
+/// Mock output that captures all messages for verification.
+pub struct MockOutput {
+    messages: RwLock<Vec<String>>,
+}
+
+impl Default for MockOutput {
+    fn default() -> Self {
+        Self {
+            messages: RwLock::new(Vec::new()),
+        }
+    }
+}
+
+impl MockOutput {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check if any message contains the given substring.
+    pub fn contains(&self, substring: &str) -> bool {
+        self.messages
+            .read()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains(substring))
+    }
+}
+
+impl Output for MockOutput {
+    fn println(&self, message: &str) {
+        self.messages.write().unwrap().push(message.to_string());
+    }
+
+    fn print(&self, message: &str) {
+        self.messages.write().unwrap().push(message.to_string());
+    }
+}
+
+// ============================================================================
+// Mock Prompt Implementation
+// ============================================================================
+
+/// Mock prompt with a fixed answer, recording what it was asked.
+pub struct MockPrompt {
+    answer: bool,
+    questions: RwLock<Vec<String>>,
+}
+
+impl MockPrompt {
+    pub fn answering(answer: bool) -> Self {
+        Self {
+            answer,
+            questions: RwLock::new(Vec::new()),
+        }
+    }
+
+    pub fn was_asked(&self) -> bool {
+        !self.questions.read().unwrap().is_empty()
+    }
+}
+
+impl Prompt for MockPrompt {
+    fn confirm(&self, question: &str) -> Result<bool, CliError> {
+        self.questions.write().unwrap().push(question.to_string());
+        Ok(self.answer)
+    }
+}
+
+#[test]
+fn a_mock_prompt_records_the_question_and_returns_its_answer() {
+    let prompt = MockPrompt::answering(true);
+
+    assert!(prompt.confirm("Delete NA ortho?").unwrap());
+    assert!(prompt.was_asked());
+}
+
+// ============================================================================
+// Mock Repository Implementation
+// ============================================================================
+
+/// Mock repository for testing.
+pub struct MockRepository {
+    root: PathBuf,
+    packages: Vec<(String, PackageType)>,
+}
+
+impl MockRepository {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            packages: Vec::new(),
+        }
+    }
+
+    pub fn with_packages(root: PathBuf, packages: Vec<(String, PackageType)>) -> Self {
+        Self { root, packages }
+    }
+}
+
+impl RepositoryOperations for MockRepository {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn package_dir(&self, region: &str, package_type: PackageType) -> PathBuf {
+        self.root
+            .join("packages")
+            .join(format!("{}_{}", region, package_type.folder_suffix()))
+    }
+
+    fn list_packages(&self) -> Result<Vec<(String, PackageType)>, CliError> {
+        Ok(self.packages.clone())
+    }
+
+    fn generation(&self) -> &str {
+        "v1"
+    }
+
+    fn library_root(&self) -> PathBuf {
+        self.root.join("v1")
+    }
+}
+
+// ============================================================================
+// Mock Publisher Service Implementation
+// ============================================================================
+
+/// Builder for configuring mock publisher behavior.
+#[derive(Default)]
+pub struct MockPublisherServiceBuilder {
+    init_result: Option<Result<PathBuf, String>>,
+    open_result: Option<Result<PathBuf, String>>,
+    packages: Vec<(String, PackageType)>,
+    scan_result: Option<Result<SceneryScanResult, String>>,
+    process_result: Option<Result<ProcessSummary, String>>,
+    build_result: Option<Result<BuildResult, String>>,
+    read_metadata_result: Option<Result<PackageMetadata, String>>,
+    config: Option<RepoConfig>,
+    release_status: Option<ReleaseStatus>,
+    url_config_result: Option<Result<UrlConfigResult, String>>,
+    release_result: Option<Result<ReleaseResult, String>>,
+    plan_deletion_overrides: HashMap<PackageType, Result<Option<DeletionPlan>, String>>,
+}
+
+impl MockPublisherServiceBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_init_success(mut self, path: PathBuf) -> Self {
+        self.init_result = Some(Ok(path));
+        self
+    }
+
+    pub fn with_init_error(mut self, error: &str) -> Self {
+        self.init_result = Some(Err(error.to_string()));
+        self
+    }
+
+    pub fn with_open_success(mut self, path: PathBuf) -> Self {
+        self.open_result = Some(Ok(path));
+        self
+    }
+
+    pub fn with_packages(mut self, packages: Vec<(String, PackageType)>) -> Self {
+        self.packages = packages;
+        self
+    }
+
+    pub fn with_scan_success(mut self, result: SceneryScanResult) -> Self {
+        self.scan_result = Some(Ok(result));
+        self
+    }
+
+    pub fn with_scan_error(mut self, error: &str) -> Self {
+        self.scan_result = Some(Err(error.to_string()));
+        self
+    }
+
+    pub fn with_process_success(mut self, summary: ProcessSummary) -> Self {
+        self.process_result = Some(Ok(summary));
+        self
+    }
+
+    pub fn with_build_success(mut self, result: BuildResult) -> Self {
+        self.build_result = Some(Ok(result));
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: PackageMetadata) -> Self {
+        self.read_metadata_result = Some(Ok(metadata));
+        self
+    }
+
+    pub fn with_config(mut self, config: RepoConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    pub fn with_release_status(mut self, status: ReleaseStatus) -> Self {
+        self.release_status = Some(status);
+        self
+    }
+
+    pub fn with_url_config_success(mut self, result: UrlConfigResult) -> Self {
+        self.url_config_result = Some(Ok(result));
+        self
+    }
+
+    pub fn with_release_success(mut self, result: ReleaseResult) -> Self {
+        self.release_result = Some(Ok(result));
+        self
+    }
+
+    /// Make `plan_deletion` answer "nothing of this type to delete" for the
+    /// given package type, without touching the other type's behaviour.
+    pub fn with_plan_deletion_not_found(mut self, package_type: PackageType) -> Self {
+        self.plan_deletion_overrides.insert(package_type, Ok(None));
+        self
+    }
+
+    /// Make `plan_deletion` fail for the given package type. Used to verify
+    /// a real failure reaches the caller instead of being read as "nothing
+    /// to delete".
+    pub fn with_plan_deletion_error(mut self, package_type: PackageType, message: &str) -> Self {
+        self.plan_deletion_overrides
+            .insert(package_type, Err(message.to_string()));
+        self
+    }
+
+    pub fn build(self) -> MockPublisherService {
+        MockPublisherService {
+            init_result: self.init_result.unwrap_or(Ok(PathBuf::from("/tmp/repo"))),
+            open_result: self.open_result.unwrap_or(Ok(PathBuf::from("/tmp/repo"))),
+            packages: self.packages,
+            scan_result: self
+                .scan_result
+                .unwrap_or_else(|| Ok(SceneryScanResult::new(Vec::new()))),
+            process_result: self.process_result.unwrap_or(Ok(ProcessSummary::default())),
+            build_result: self.build_result,
+            read_metadata_result: self.read_metadata_result,
+            config: self.config.unwrap_or_default(),
+            release_status: self.release_status.unwrap_or(ReleaseStatus::NotBuilt),
+            url_config_result: self.url_config_result,
+            release_result: self.release_result,
+            plan_deletion_overrides: self.plan_deletion_overrides,
+            captured_coverage_metadata_path: RwLock::new(None),
+            executed_deletions: RwLock::new(Vec::new()),
+            generation_report: GenerationReport::default(),
+            generation_calls: RwLock::new(Vec::new()),
+        }
+    }
+}
+
+/// Mock publisher service for testing handlers.
+pub struct MockPublisherService {
+    init_result: Result<PathBuf, String>,
+    open_result: Result<PathBuf, String>,
+    packages: Vec<(String, PackageType)>,
+    scan_result: Result<SceneryScanResult, String>,
+    process_result: Result<ProcessSummary, String>,
+    build_result: Option<Result<BuildResult, String>>,
+    read_metadata_result: Option<Result<PackageMetadata, String>>,
+    config: RepoConfig,
+    release_status: ReleaseStatus,
+    url_config_result: Option<Result<UrlConfigResult, String>>,
+    release_result: Option<Result<ReleaseResult, String>>,
+    plan_deletion_overrides: HashMap<PackageType, Result<Option<DeletionPlan>, String>>,
+    captured_coverage_metadata_path: RwLock<Option<PathBuf>>,
+    /// Every plan actually passed to `execute_deletion`, in call order. Lets
+    /// tests distinguish "the handler decided not to delete" from "the mock
+    /// would have deleted but we didn't check".
+    executed_deletions: RwLock<Vec<DeletionPlan>>,
+    /// The report `upgrade_repository` and `import_generation` return.
+    generation_report: GenerationReport,
+    /// Every generation operation called, as "op args", in call order.
+    generation_calls: RwLock<Vec<String>>,
+}
+
+impl MockPublisherService {
+    /// Every generation operation called, as "op args", in call order.
+    pub fn generation_calls(&self) -> Vec<String> {
+        self.generation_calls.read().unwrap().clone()
+    }
+
+    fn record(&self, call: String) {
+        self.generation_calls.write().unwrap().push(call);
+    }
+
+    /// The report generation operations return, for handler tests.
+    pub fn with_generation_report(mut self, report: GenerationReport) -> Self {
+        self.generation_report = report;
+        self
+    }
+
+    /// Returns the `metadata_path` most recently passed to
+    /// `generate_coverage_map` or `generate_coverage_geojson`, if any.
+    pub fn captured_coverage_metadata_path(&self) -> Option<PathBuf> {
+        self.captured_coverage_metadata_path.read().unwrap().clone()
+    }
+
+    /// Returns every plan actually passed to `execute_deletion`, in call
+    /// order.
+    pub fn executed_deletions(&self) -> Vec<DeletionPlan> {
+        self.executed_deletions.read().unwrap().clone()
+    }
+}
+
+impl PublisherService for MockPublisherService {
+    fn init_repository(&self, _path: &Path) -> Result<Box<dyn RepositoryOperations>, CliError> {
+        match &self.init_result {
+            Ok(path) => Ok(Box::new(MockRepository::new(path.clone()))),
+            Err(e) => Err(CliError::Publish(e.clone())),
+        }
+    }
+
+    fn open_repository(&self, _path: &Path) -> Result<Box<dyn RepositoryOperations>, CliError> {
+        match &self.open_result {
+            Ok(path) => Ok(Box::new(MockRepository::with_packages(
+                path.clone(),
+                self.packages.clone(),
+            ))),
+            Err(e) => Err(CliError::Publish(e.clone())),
+        }
+    }
+
+    fn upgrade_repository(
+        &self,
+        path: &Path,
+        root_as: &str,
+        dry_run: bool,
+    ) -> Result<GenerationReport, CliError> {
+        self.record(format!(
+            "upgrade {} {root_as} dry_run={dry_run}",
+            path.display()
+        ));
+        Ok(GenerationReport {
+            generation: root_as.to_string(),
+            dry_run,
+            ..self.generation_report.clone()
+        })
+    }
+
+    fn list_generations(&self, path: &Path) -> Result<(Vec<String>, String), CliError> {
+        self.record(format!("list {}", path.display()));
+        Ok((vec!["v1".to_string(), "v2".to_string()], "v2".to_string()))
+    }
+
+    fn create_generation(&self, path: &Path, generation: &str) -> Result<(), CliError> {
+        self.record(format!("new {} {generation}", path.display()));
+        Ok(())
+    }
+
+    fn use_generation(&self, path: &Path, generation: &str) -> Result<(), CliError> {
+        self.record(format!("use {} {generation}", path.display()));
+        Ok(())
+    }
+
+    fn import_generation(
+        &self,
+        path: &Path,
+        generation: &str,
+        from: &Path,
+        dry_run: bool,
+    ) -> Result<GenerationReport, CliError> {
+        self.record(format!(
+            "import {} {generation} from {} dry_run={dry_run}",
+            path.display(),
+            from.display()
+        ));
+        Ok(GenerationReport {
+            generation: generation.to_string(),
+            dry_run,
+            ..self.generation_report.clone()
+        })
+    }
+
+    fn read_config(&self, _repo_root: &Path) -> Result<RepoConfig, CliError> {
+        Ok(self.config.clone())
+    }
+
+    fn write_config(&self, _repo_root: &Path, _config: &RepoConfig) -> Result<(), CliError> {
+        Ok(())
+    }
+
+    fn scan_scenery(&self, _source: &Path) -> Result<SceneryScanResult, CliError> {
+        match &self.scan_result {
+            Ok(result) => Ok(result.clone()),
+            Err(e) => Err(CliError::Publish(e.clone())),
+        }
+    }
+
+    fn scan_overlay(&self, _source: &Path) -> Result<SceneryScanResult, CliError> {
+        // Use the same scan_result for overlays in tests
+        match &self.scan_result {
+            Ok(result) => Ok(result.clone()),
+            Err(e) => Err(CliError::Publish(e.clone())),
+        }
+    }
+
+    fn analyze_tiles(&self, coords: &[(i32, i32)]) -> RegionSuggestion {
+        if coords.is_empty() {
+            RegionSuggestion {
+                region: None,
+                regions_found: Vec::new(),
+                ambiguous_tiles: Vec::new(),
+                overlapping_tiles: Vec::new(),
+            }
+        } else {
+            RegionSuggestion {
+                region: Some(SuggestedRegion::NorthAmerica),
+                regions_found: vec![SuggestedRegion::NorthAmerica],
+                ambiguous_tiles: Vec::new(),
+                overlapping_tiles: Vec::new(),
+            }
+        }
+    }
+
+    fn process_tiles(
+        &self,
+        _scan_result: &SceneryScanResult,
+        _region: &str,
+        _package_type: PackageType,
+        _repo: &dyn RepositoryOperations,
+    ) -> Result<ProcessSummary, CliError> {
+        match &self.process_result {
+            Ok(result) => Ok(result.clone()),
+            Err(e) => Err(CliError::Publish(e.clone())),
+        }
+    }
+
+    fn generate_initial_metadata(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        _region: &str,
+        _package_type: PackageType,
+        _version: Version,
+    ) -> Result<(), CliError> {
+        Ok(())
+    }
+
+    fn read_metadata(&self, _package_dir: &Path) -> Result<PackageMetadata, CliError> {
+        match &self.read_metadata_result {
+            Some(Ok(metadata)) => Ok(metadata.clone()),
+            Some(Err(e)) => Err(CliError::Publish(e.clone())),
+            None => Ok(create_test_metadata()),
+        }
+    }
+
+    fn build_package(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        _region: &str,
+        _package_type: PackageType,
+        _config: &RepoConfig,
+    ) -> Result<BuildResult, CliError> {
+        match &self.build_result {
+            Some(Ok(result)) => Ok(result.clone()),
+            Some(Err(e)) => Err(CliError::Publish(e.clone())),
+            None => Ok(create_test_build_result()),
+        }
+    }
+
+    fn generate_part_urls(
+        &self,
+        base_url: &str,
+        archive_name: &str,
+        suffixes: &[&str],
+    ) -> Vec<String> {
+        suffixes
+            .iter()
+            .map(|s| format!("{}{}.{}", base_url, archive_name, s))
+            .collect()
+    }
+
+    fn configure_urls(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        region: &str,
+        package_type: PackageType,
+        _urls: &[String],
+        _verify: bool,
+    ) -> Result<UrlConfigResult, CliError> {
+        match &self.url_config_result {
+            Some(Ok(result)) => Ok(result.clone()),
+            Some(Err(e)) => Err(CliError::Publish(e.clone())),
+            None => Ok(UrlConfigResult {
+                region: region.to_string(),
+                package_type,
+                urls_configured: 2,
+                urls_verified: 0,
+                failed_urls: Vec::new(),
+            }),
+        }
+    }
+
+    fn bump_package_version(
+        &self,
+        _package_dir: &Path,
+        _bump: VersionBump,
+    ) -> Result<PackageMetadata, CliError> {
+        let mut metadata = create_test_metadata();
+        metadata.package_version = Version::new(1, 1, 0);
+        Ok(metadata)
+    }
+
+    fn update_version(
+        &self,
+        _package_dir: &Path,
+        version: Version,
+    ) -> Result<PackageMetadata, CliError> {
+        let mut metadata = create_test_metadata();
+        metadata.package_version = version;
+        Ok(metadata)
+    }
+
+    fn release_package(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        _region: &str,
+        _package_type: PackageType,
+        _metadata_url: &str,
+    ) -> Result<ReleaseResult, CliError> {
+        match &self.release_result {
+            Some(Ok(result)) => Ok(result.clone()),
+            Some(Err(e)) => Err(CliError::Publish(e.clone())),
+            None => Ok(ReleaseResult {
+                region: "na".to_string(),
+                package_type: PackageType::Ortho,
+                version: Version::new(1, 0, 0),
+                sequence: 1,
+                download_bytes: 0,
+                installed_bytes: 0,
+                size_warning: None,
+            }),
+        }
+    }
+
+    fn get_release_status(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        _region: &str,
+        _package_type: PackageType,
+    ) -> ReleaseStatus {
+        self.release_status.clone()
+    }
+
+    fn validate_repository(&self, _repo: &dyn RepositoryOperations) -> Result<(), CliError> {
+        Ok(())
+    }
+
+    fn generate_coverage_map(
+        &self,
+        _packages_dir: &Path,
+        _output_path: &Path,
+        metadata_path: &Path,
+        _width: u32,
+        _height: u32,
+        _dark: bool,
+    ) -> Result<CoverageResult, CliError> {
+        *self.captured_coverage_metadata_path.write().unwrap() = Some(metadata_path.to_path_buf());
+        Ok(CoverageResult {
+            total_tiles: 100,
+            tiles_by_region: [("na".to_string(), 100)].into_iter().collect(),
+        })
+    }
+
+    fn generate_coverage_geojson(
+        &self,
+        _packages_dir: &Path,
+        _output_path: &Path,
+        metadata_path: &Path,
+    ) -> Result<CoverageResult, CliError> {
+        *self.captured_coverage_metadata_path.write().unwrap() = Some(metadata_path.to_path_buf());
+        Ok(CoverageResult {
+            total_tiles: 100,
+            tiles_by_region: [("na".to_string(), 100)].into_iter().collect(),
+        })
+    }
+
+    fn dedupe_package(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        _region: &str,
+        _package_type: PackageType,
+        _priority: ZoomPriority,
+        _filter: Option<DedupeFilter>,
+        dry_run: bool,
+    ) -> Result<DedupeReport, CliError> {
+        // Return a mock dedupe result
+        Ok(DedupeReport {
+            tiles_analyzed: 100,
+            zoom_levels_present: vec![16, 18],
+            overlaps_by_pair: [(18, 16)].into_iter().map(|k| (k, 10)).collect(),
+            tiles_removed: Vec::new(),
+            tiles_preserved: Vec::new(),
+            dry_run,
+        })
+    }
+
+    fn scan_overlaps(&self, _source: &Path) -> Result<OverlapSummary, CliError> {
+        // Return a mock overlap summary
+        Ok(OverlapSummary {
+            tiles_scanned: 100,
+            tiles_by_zoom: [(16, 80), (18, 20)].into_iter().collect(),
+            overlaps_by_pair: [(18, 16)].into_iter().map(|k| (k, 10)).collect(),
+            total_overlaps: 10,
+        })
+    }
+
+    fn analyze_gaps(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        _region: &str,
+        _package_type: PackageType,
+        _filter: Option<DedupeFilter>,
+    ) -> Result<GapAnalysisResult, CliError> {
+        // Return an empty gap analysis result
+        Ok(GapAnalysisResult::default())
+    }
+
+    fn plan_deletion(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        region: &str,
+        package_type: PackageType,
+    ) -> Result<Option<DeletionPlan>, CliError> {
+        if let Some(override_result) = self.plan_deletion_overrides.get(&package_type) {
+            return match override_result {
+                Ok(plan) => Ok(plan.clone()),
+                Err(e) => Err(CliError::Publish(e.clone())),
+            };
+        }
+
+        Ok(Some(DeletionPlan {
+            region: region.to_string(),
+            package_type,
+            in_library: true,
+            package_dir: Some(PathBuf::from("/tmp/packages/pkg")),
+            dist_dir: Some(PathBuf::from("/tmp/dist/pkg")),
+            bytes_freed: 1024,
+        }))
+    }
+
+    fn execute_deletion(
+        &self,
+        _repo: &dyn RepositoryOperations,
+        plan: &DeletionPlan,
+    ) -> Result<(), CliError> {
+        self.executed_deletions.write().unwrap().push(plan.clone());
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Test Helpers
+// ============================================================================
+
+fn create_test_metadata() -> PackageMetadata {
+    PackageMetadata {
+        spec_version: Version::new(1, 0, 0),
+        title: "NORTH AMERICA".to_string(),
+        package_version: Version::new(1, 0, 0),
+        published_at: Utc::now(),
+        package_type: PackageType::Ortho,
+        mountpoint: "zzXEL_na".to_string(),
+        filename: "zzXEL_na_ortho-1.0.0.tar.gz".to_string(),
+        parts: vec![
+            ArchivePart::new(
+                "abc123",
+                "zzXEL_na_ortho-1.0.0.tar.gz.aa",
+                "https://example.com/aa",
+            ),
+            ArchivePart::new(
+                "def456",
+                "zzXEL_na_ortho-1.0.0.tar.gz.ab",
+                "https://example.com/ab",
+            ),
+        ],
+    }
+}
+
+fn create_test_build_result() -> BuildResult {
+    BuildResult {
+        region: "na".to_string(),
+        package_type: PackageType::Ortho,
+        version: Version::new(1, 0, 0),
+        archive: ArchiveBuildResult {
+            archive_name: "zzXEL_na_ortho-1.0.0.tar.gz".to_string(),
+            total_size: 1024 * 1024 * 800,
+            parts: vec![
+                xearthlayer_publisher::ArchivePart {
+                    filename: "zzXEL_na_ortho-1.0.0.tar.gz.aa".to_string(),
+                    path: PathBuf::from("/tmp/dist/na/ortho/zzXEL_na_ortho-1.0.0.tar.gz.aa"),
+                    size: 1024 * 1024 * 500,
+                    checksum: "abc123".to_string(),
+                },
+                xearthlayer_publisher::ArchivePart {
+                    filename: "zzXEL_na_ortho-1.0.0.tar.gz.ab".to_string(),
+                    path: PathBuf::from("/tmp/dist/na/ortho/zzXEL_na_ortho-1.0.0.tar.gz.ab"),
+                    size: 1024 * 1024 * 300,
+                    checksum: "def456".to_string(),
+                },
+            ],
+        },
+        metadata_path: PathBuf::from("/tmp/packages/na/ortho/xearthlayer_scenery_package.txt"),
+    }
+}
+
+fn create_test_scan_result() -> SceneryScanResult {
+    SceneryScanResult::new(vec![
+        TileInfo {
+            id: "+37-122".to_string(),
+            path: PathBuf::from("/tiles/+37-122"),
+            latitude: 37,
+            longitude: -122,
+            dsf_files: vec![PathBuf::from("test.dsf")],
+            ter_files: vec![PathBuf::from("test.ter")],
+            mask_files: vec![PathBuf::from("test_mask.png")],
+            dds_files: Vec::new(),
+            night_recipe: None,
+        },
+        TileInfo {
+            id: "+38-122".to_string(),
+            path: PathBuf::from("/tiles/+38-122"),
+            latitude: 38,
+            longitude: -122,
+            dsf_files: vec![PathBuf::from("test.dsf")],
+            ter_files: vec![PathBuf::from("test.ter")],
+            mask_files: Vec::new(),
+            dds_files: Vec::new(),
+            night_recipe: None,
+        },
+    ])
+}
+
+// ============================================================================
+// Init Handler Tests
+// ============================================================================
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+
+    #[test]
+    fn test_init_success() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_init_success(PathBuf::from("/test/repo"))
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = InitArgs {
+            path: PathBuf::from("/test/repo"),
+            part_size: "500M".to_string(),
+        };
+
+        let result = InitHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("Initialized XEarthLayer package repository"));
+        assert!(output.contains("/test/repo"));
+        assert!(output.contains("packages/"));
+        assert!(output.contains("dist/"));
+    }
+
+    #[test]
+    fn test_init_with_custom_part_size() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_init_success(PathBuf::from("/test/repo"))
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = InitArgs {
+            path: PathBuf::from("/test/repo"),
+            part_size: "1G".to_string(),
+        };
+
+        let result = InitHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("1 GB"));
+    }
+
+    #[test]
+    fn test_init_invalid_part_size() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_init_success(PathBuf::from("/test/repo"))
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = InitArgs {
+            path: PathBuf::from("/test/repo"),
+            part_size: "invalid".to_string(),
+        };
+
+        let result = InitHandler::execute(args, &ctx);
+
+        assert!(result.is_err());
+        if let Err(CliError::Publish(msg)) = result {
+            assert!(msg.contains("Invalid part size"));
+        }
+    }
+
+    #[test]
+    fn test_init_repository_error() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_init_error("Permission denied")
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = InitArgs {
+            path: PathBuf::from("/test/repo"),
+            part_size: "500M".to_string(),
+        };
+
+        let result = InitHandler::execute(args, &ctx);
+
+        assert!(result.is_err());
+        if let Err(CliError::Publish(msg)) = result {
+            assert!(msg.contains("Permission denied"));
+        }
+    }
+}
+
+// ============================================================================
+// Scan Handler Tests
+// ============================================================================
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    #[test]
+    fn test_scan_success_with_tiles() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_scan_success(create_test_scan_result())
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = ScanArgs {
+            source: PathBuf::from("/ortho4xp/tiles"),
+            package_type: PackageTypeArg::Ortho,
+        };
+
+        let result = ScanHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("Scanning Ortho4XP tiles"));
+        assert!(output.contains("Tiles:  2"));
+        assert!(output.contains("+37-122"));
+        assert!(output.contains("+38-122"));
+        assert!(output.contains("Region Suggestion"));
+    }
+
+    #[test]
+    fn test_scan_empty_result() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_scan_success(SceneryScanResult::new(Vec::new()))
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = ScanArgs {
+            source: PathBuf::from("/ortho4xp/tiles"),
+            package_type: PackageTypeArg::Ortho,
+        };
+
+        let result = ScanHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("Tiles:  0"));
+    }
+
+    #[test]
+    fn test_scan_error() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_scan_error("Directory not found")
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = ScanArgs {
+            source: PathBuf::from("/nonexistent"),
+            package_type: PackageTypeArg::Ortho,
+        };
+
+        let result = ScanHandler::execute(args, &ctx);
+
+        assert!(result.is_err());
+    }
+}
+
+// ============================================================================
+// Add Handler Tests
+// ============================================================================
+
+#[cfg(test)]
+mod add_tests {
+    use super::*;
+
+    #[test]
+    fn test_add_success() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_scan_success(create_test_scan_result())
+            .with_process_success(ProcessSummary {
+                tile_count: 2,
+                dsf_count: 2,
+                dsf_raw_bytes: 40_000_000,
+                dsf_stored_bytes: 17_000_000,
+                dsf_precompressed: 0,
+                ter_count: 2,
+                mask_count: 1,
+                dds_skipped: 100,
+                night_recipe_count: 0,
+                warnings: Vec::new(),
+            })
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = AddArgs {
+            source: PathBuf::from("/ortho4xp/tiles"),
+            region: "na".to_string(),
+            package_type: PackageTypeArg::Ortho,
+            version: "1.0.0".to_string(),
+            dedupe: false,
+            priority: ZoomPriorityArg("highest".to_string()),
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = AddHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("Processing Ortho4XP tiles output"));
+        assert!(output.contains("Region: NA"));
+        assert!(output.contains("Found 2 tiles"));
+        assert!(output.contains("Package created successfully"));
+        assert!(
+            output.contains("DSF compressed:  38.1 MB -> 16.2 MB (42%)"),
+            "compression line missing or misformatted"
+        );
+        assert!(
+            !output.contains("DSF unchanged:"),
+            "no precompressed line when the count is 0"
+        );
+    }
+
+    #[test]
+    fn test_add_reports_precompressed_dsf() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_scan_success(create_test_scan_result())
+            .with_process_success(ProcessSummary {
+                tile_count: 1,
+                dsf_count: 3,
+                dsf_raw_bytes: 3_000,
+                dsf_stored_bytes: 3_000,
+                dsf_precompressed: 3,
+                ter_count: 0,
+                mask_count: 0,
+                dds_skipped: 0,
+                night_recipe_count: 0,
+                warnings: Vec::new(),
+            })
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = AddArgs {
+            source: PathBuf::from("/ortho4xp/tiles"),
+            region: "na".to_string(),
+            package_type: PackageTypeArg::Ortho,
+            version: "1.0.0".to_string(),
+            dedupe: false,
+            priority: ZoomPriorityArg("highest".to_string()),
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = AddHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("DSF compressed:"));
+        assert!(output.contains("DSF unchanged:   3 (already 7z)"));
+    }
+
+    #[test]
+    fn test_add_no_tiles_found() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_scan_success(SceneryScanResult::new(Vec::new()))
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = AddArgs {
+            source: PathBuf::from("/ortho4xp/tiles"),
+            region: "na".to_string(),
+            package_type: PackageTypeArg::Ortho,
+            version: "1.0.0".to_string(),
+            dedupe: false,
+            priority: ZoomPriorityArg("highest".to_string()),
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = AddHandler::execute(args, &ctx);
+
+        assert!(result.is_err());
+        if let Err(CliError::Publish(msg)) = result {
+            assert!(msg.contains("No valid tiles found"));
+        }
+    }
+
+    #[test]
+    fn test_add_invalid_version() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = AddArgs {
+            source: PathBuf::from("/ortho4xp/tiles"),
+            region: "na".to_string(),
+            package_type: PackageTypeArg::Ortho,
+            version: "not-a-version".to_string(),
+            dedupe: false,
+            priority: ZoomPriorityArg("highest".to_string()),
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = AddHandler::execute(args, &ctx);
+
+        assert!(result.is_err());
+        if let Err(CliError::Publish(msg)) = result {
+            assert!(msg.contains("Invalid version"));
+        }
+    }
+
+    #[test]
+    fn test_add_overlay_success() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_scan_success(create_test_scan_result())
+            .with_process_success(ProcessSummary {
+                tile_count: 2,
+                dsf_count: 2,
+                dsf_raw_bytes: 0,
+                dsf_stored_bytes: 0,
+                dsf_precompressed: 0,
+                ter_count: 0,
+                mask_count: 0,
+                dds_skipped: 0,
+                night_recipe_count: 0,
+                warnings: Vec::new(),
+            })
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = AddArgs {
+            source: PathBuf::from("/ortho4xp/overlays"),
+            region: "na".to_string(),
+            package_type: PackageTypeArg::Overlay,
+            version: "1.0.0".to_string(),
+            dedupe: false,
+            priority: ZoomPriorityArg("highest".to_string()),
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = AddHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("Processing Ortho4XP overlays output"));
+        assert!(output.contains("Region: NA"));
+        assert!(output.contains("Found 2 tiles"));
+        assert!(output.contains("Package created successfully"));
+    }
+}
+
+// ============================================================================
+// List Handler Tests
+// ============================================================================
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    #[test]
+    fn test_list_with_packages() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_packages(vec![
+                ("na".to_string(), PackageType::Ortho),
+                ("eur".to_string(), PackageType::Ortho),
+            ])
+            .with_release_status(ReleaseStatus::Ready)
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = ListArgs {
+            repo: PathBuf::from("/test/repo"),
+            verbose: false,
+        };
+
+        let result = ListHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("Packages in repository"));
+        assert!(output.contains("NA"));
+        assert!(output.contains("EUR"));
+    }
+
+    #[test]
+    fn test_list_empty_repository() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_packages(Vec::new())
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = ListArgs {
+            repo: PathBuf::from("/test/repo"),
+            verbose: false,
+        };
+
+        let result = ListHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("No packages in repository"));
+    }
+
+    #[test]
+    fn test_list_verbose() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_packages(vec![("na".to_string(), PackageType::Ortho)])
+            .with_metadata(create_test_metadata())
+            .with_release_status(ReleaseStatus::Ready)
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = ListArgs {
+            repo: PathBuf::from("/test/repo"),
+            verbose: true,
+        };
+
+        let result = ListHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("Version: 1.0.0"));
+        assert!(output.contains("Parts:   2"));
+    }
+}
+
+// ============================================================================
+// Build Handler Tests
+// ============================================================================
+
+#[cfg(test)]
+mod build_tests {
+    use super::*;
+
+    #[test]
+    fn test_build_success() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_config(RepoConfig::default())
+            .with_build_success(create_test_build_result())
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = BuildArgs {
+            region: "na".to_string(),
+            package_type: PackageTypeArg::Ortho,
+            dedupe: false,
+            priority: ZoomPriorityArg("highest".to_string()),
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = BuildHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("Building archive for NA"));
+        assert!(output.contains("Archive created successfully"));
+        assert!(output.contains("Parts:   2"));
+    }
+}
+
+// ============================================================================
+// Urls Handler Tests
+// ============================================================================
+
+#[cfg(test)]
+mod urls_tests {
+    use super::*;
+
+    #[test]
+    fn test_urls_success() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_metadata(create_test_metadata())
+            .with_url_config_success(UrlConfigResult {
+                region: "na".to_string(),
+                package_type: PackageType::Ortho,
+                urls_configured: 2,
+                urls_verified: 0,
+                failed_urls: Vec::new(),
+            })
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = UrlsArgs {
+            region: "na".to_string(),
+            package_type: PackageTypeArg::Ortho,
+            base_url: "https://cdn.example.com/".to_string(),
+            verify: false,
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = UrlsHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("Configuring URLs for NA"));
+        assert!(output.contains("URLs configured successfully"));
+    }
+
+    #[test]
+    fn test_urls_no_parts() {
+        let output = MockOutput::new();
+        let mut metadata = create_test_metadata();
+        metadata.parts = Vec::new();
+
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_metadata(metadata)
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = UrlsArgs {
+            region: "na".to_string(),
+            package_type: PackageTypeArg::Ortho,
+            base_url: "https://cdn.example.com/".to_string(),
+            verify: false,
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = UrlsHandler::execute(args, &ctx);
+
+        assert!(result.is_err());
+        if let Err(CliError::Publish(msg)) = result {
+            assert!(msg.contains("no archive parts"));
+        }
+    }
+}
+
+// ============================================================================
+// Version Handler Tests
+// ============================================================================
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn test_version_show_current() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_metadata(create_test_metadata())
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = VersionArgs {
+            region: "na".to_string(),
+            package_type: PackageTypeArg::Ortho,
+            bump: None,
+            set: None,
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = VersionHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("NA ortho version: 1.0.0"));
+    }
+
+    #[test]
+    fn test_version_bump_minor() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_metadata(create_test_metadata())
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = VersionArgs {
+            region: "na".to_string(),
+            package_type: PackageTypeArg::Ortho,
+            bump: Some(BumpType::Minor),
+            set: None,
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = VersionHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("Updated NA ortho version"));
+        assert!(output.contains("1.0.0 → 1.1.0"));
+    }
+
+    #[test]
+    fn test_version_set_explicit() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_metadata(create_test_metadata())
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = VersionArgs {
+            region: "na".to_string(),
+            package_type: PackageTypeArg::Ortho,
+            bump: None,
+            set: Some("2.0.0".to_string()),
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = VersionHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("1.0.0 → 2.0.0"));
+    }
+}
+
+// ============================================================================
+// Release Handler Tests
+// ============================================================================
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    #[test]
+    fn test_release_success() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_release_success(ReleaseResult {
+                region: "na".to_string(),
+                package_type: PackageType::Ortho,
+                version: Version::new(1, 0, 0),
+                sequence: 1,
+                download_bytes: 0,
+                installed_bytes: 0,
+                size_warning: None,
+            })
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = ReleaseArgs {
+            region: "na".to_string(),
+            package_type: PackageTypeArg::Ortho,
+            metadata_url: "https://cdn.example.com/na/metadata.txt".to_string(),
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = ReleaseHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("Releasing NA ortho to library index"));
+        assert!(output.contains("Package released successfully"));
+        assert!(output.contains("Sequence:  1"));
+    }
+
+    #[test]
+    fn release_reports_the_recorded_sizes() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_release_success(ReleaseResult {
+                region: "na".to_string(),
+                package_type: PackageType::Ortho,
+                version: Version::new(0, 1, 0),
+                sequence: 3,
+                download_bytes: 34_000_000_000,
+                installed_bytes: 52_000_000_000,
+                size_warning: None,
+            })
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        ReleaseHandler::execute(
+            ReleaseArgs {
+                region: "na".to_string(),
+                package_type: PackageTypeArg::Ortho,
+                metadata_url: "https://example.com/m.txt".to_string(),
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(output.contains("Download:  31.7 GB"));
+        assert!(output.contains("Installed: 48.4 GB"));
+    }
+
+    #[test]
+    fn release_reports_a_size_warning_verbatim() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_release_success(ReleaseResult {
+                region: "na".to_string(),
+                package_type: PackageType::Ortho,
+                version: Version::new(0, 1, 0),
+                sequence: 3,
+                download_bytes: 0,
+                installed_bytes: 52_000_000_000,
+                size_warning: Some(
+                    "download size could not be measured: disk went away".to_string(),
+                ),
+            })
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        ReleaseHandler::execute(
+            ReleaseArgs {
+                region: "na".to_string(),
+                package_type: PackageTypeArg::Ortho,
+                metadata_url: "https://example.com/m.txt".to_string(),
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        // Specific enough that the warning text being dropped, truncated, or
+        // re-wrapped with different words would fail this, not just the
+        // presence of the word "Warning".
+        assert!(
+            output.contains("download size could not be measured: disk went away"),
+            "the warning text must reach the user verbatim"
+        );
+    }
+}
+
+// ============================================================================
+// Status Handler Tests
+// ============================================================================
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn test_status_with_packages() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_packages(vec![("na".to_string(), PackageType::Ortho)])
+            .with_metadata(create_test_metadata())
+            .with_release_status(ReleaseStatus::Ready)
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = StatusArgs {
+            region: None,
+            package_type: None,
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = StatusHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("Package Status"));
+        assert!(output.contains("NA ortho"));
+        assert!(output.contains("Ready"));
+    }
+
+    #[test]
+    fn test_status_empty_repository() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_packages(Vec::new())
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = StatusArgs {
+            region: None,
+            package_type: None,
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = StatusHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("No packages in repository"));
+    }
+}
+
+// ============================================================================
+// Validate Handler Tests
+// ============================================================================
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_success() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .with_packages(vec![("na".to_string(), PackageType::Ortho)])
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = ValidateArgs {
+            repo: PathBuf::from("/test/repo"),
+        };
+
+        let result = ValidateHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert!(output.contains("Validating repository"));
+        assert!(output.contains("Repository is valid"));
+    }
+}
+
+// ============================================================================
+// Coverage Handler Tests
+// ============================================================================
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    fn base_coverage_args(metadata: Option<PathBuf>, geojson: bool) -> CoverageArgs {
+        CoverageArgs {
+            output: PathBuf::from("coverage.png"),
+            width: 1200,
+            height: 600,
+            dark: false,
+            geojson,
+            metadata,
+            repo: PathBuf::from("/test/repo"),
+        }
+    }
+
+    #[test]
+    fn test_coverage_png_uses_default_metadata_path_when_not_specified() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = base_coverage_args(None, false);
+
+        let result = CoverageHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            publisher.captured_coverage_metadata_path(),
+            Some(PathBuf::from("/test/repo/v1/region_metadata.json"))
+        );
+    }
+
+    #[test]
+    fn test_coverage_png_passes_through_explicit_metadata_path() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let custom_path = PathBuf::from("/custom/location/region_metadata.json");
+        let args = base_coverage_args(Some(custom_path.clone()), false);
+
+        let result = CoverageHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            publisher.captured_coverage_metadata_path(),
+            Some(custom_path)
+        );
+    }
+
+    #[test]
+    fn test_coverage_geojson_uses_default_metadata_path_when_not_specified() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let args = base_coverage_args(None, true);
+
+        let result = CoverageHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            publisher.captured_coverage_metadata_path(),
+            Some(PathBuf::from("/test/repo/v1/region_metadata.json"))
+        );
+    }
+
+    #[test]
+    fn test_coverage_geojson_passes_through_explicit_metadata_path() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .with_open_success(PathBuf::from("/test/repo"))
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let custom_path = PathBuf::from("/custom/location/region_metadata.json");
+        let args = base_coverage_args(Some(custom_path.clone()), true);
+
+        let result = CoverageHandler::execute(args, &ctx);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            publisher.captured_coverage_metadata_path(),
+            Some(custom_path)
+        );
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+
+    #[test]
+    fn delete_asks_before_removing_anything() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default().build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: None,
+                dry_run: false,
+                yes: false,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(prompt.was_asked(), "deletion must ask before acting");
+        assert!(output.contains("Cancelled"));
+        assert!(
+            publisher.executed_deletions().is_empty(),
+            "declining the prompt must delete nothing"
+        );
+    }
+
+    #[test]
+    fn delete_with_yes_does_not_ask() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default().build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: None,
+                dry_run: false,
+                yes: true,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(!prompt.was_asked(), "--yes must skip the prompt");
+        let executed = publisher.executed_deletions();
+        assert_eq!(
+            executed.len(),
+            2,
+            "--yes must delete both planned package types"
+        );
+        assert!(executed.iter().all(|plan| plan.region == "na"));
+    }
+
+    #[test]
+    fn omitting_type_reports_skip_for_the_package_type_with_nothing_to_delete() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_plan_deletion_not_found(PackageType::Overlay)
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let result = DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: None,
+                dry_run: false,
+                yes: true,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        );
+
+        assert!(
+            result.is_ok(),
+            "a region legitimately having only one package type must not error: {:?}",
+            result
+        );
+        assert!(output.contains("Skipping"));
+        assert!(output.contains("overlay"));
+    }
+
+    #[test]
+    fn omitting_type_with_neither_package_present_is_an_error() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_plan_deletion_not_found(PackageType::Ortho)
+            .with_plan_deletion_not_found(PackageType::Overlay)
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let result = DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: None,
+                dry_run: false,
+                yes: true,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        );
+
+        let Err(err) = result else {
+            panic!("a region with nothing to delete under either type must error");
+        };
+        assert!(err.to_string().contains("Nothing to delete"));
+        assert!(err.to_string().contains("NA"));
+    }
+
+    #[test]
+    fn a_plan_deletion_failure_is_returned_not_swallowed_when_type_is_omitted() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_plan_deletion_error(
+                PackageType::Ortho,
+                "a region code must not contain a path separator",
+            )
+            .with_plan_deletion_error(
+                PackageType::Overlay,
+                "a region code must not contain a path separator",
+            )
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let result = DeleteHandler::execute(
+            DeleteArgs {
+                region: "x/../evil".to_string(),
+                package_type: None,
+                dry_run: false,
+                yes: true,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        );
+
+        let Err(err) = result else {
+            panic!("a real plan_deletion failure must reach the caller, not be skipped");
+        };
+        assert!(
+            err.to_string().contains("path separator"),
+            "the real error must reach the caller: {err}"
+        );
+        assert!(
+            !err.to_string().contains("Nothing to delete"),
+            "a real failure must not be misreported as an empty region: {err}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_type_still_propagates_a_plan_deletion_failure() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default()
+            .with_plan_deletion_error(PackageType::Ortho, "boom")
+            .build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        let result = DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: Some(PackageTypeArg::Ortho),
+                dry_run: false,
+                yes: true,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        );
+
+        let Err(err) = result else {
+            panic!("an explicit --type must not swallow a plan_deletion failure either");
+        };
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn a_dry_run_never_asks_and_never_deletes() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::default().build();
+        let prompt = MockPrompt::answering(true);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        DeleteHandler::execute(
+            DeleteArgs {
+                region: "na".to_string(),
+                package_type: None,
+                dry_run: true,
+                yes: false,
+                repo: PathBuf::from("."),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(!prompt.was_asked(), "a dry run has nothing to confirm");
+        assert!(output.contains("Dry run"));
+        assert!(
+            publisher.executed_deletions().is_empty(),
+            "a dry run must delete nothing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    fn report() -> GenerationReport {
+        GenerationReport {
+            generation: String::new(),
+            copied: vec![(
+                PathBuf::from("/repo/xearthlayer_package_library.txt"),
+                PathBuf::from("/repo/v1/xearthlayer_package_library.txt"),
+            )],
+            moved: vec![(
+                PathBuf::from("/repo/packages/zzXEL_na_ortho"),
+                PathBuf::from("/repo/v1/packages/zzXEL_na_ortho"),
+            )],
+            left: vec![PathBuf::from("/repo/packages/zzXEL_na-canada-west_ortho")],
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn upgrade_reports_what_it_copied_moved_and_left_relative_to_the_repository() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .build()
+            .with_generation_report(report());
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        UpgradeHandler::execute(
+            UpgradeArgs {
+                root_as: "v1".into(),
+                dry_run: false,
+                repo: PathBuf::from("/repo"),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert_eq!(
+            publisher.generation_calls(),
+            ["upgrade /repo v1 dry_run=false"]
+        );
+        for line in [
+            "copied xearthlayer_package_library.txt -> v1/xearthlayer_package_library.txt",
+            "moved packages/zzXEL_na_ortho -> v1/packages/zzXEL_na_ortho",
+            "Not listed by v1 and left in place (1):",
+            "packages/zzXEL_na-canada-west_ortho",
+            "v1 is the current generation. The root library files are unchanged",
+        ] {
+            assert!(output.contains(line), "missing {line:?}");
+        }
+    }
+
+    #[test]
+    fn a_dry_run_upgrade_says_it_would_and_that_nothing_changed() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new()
+            .build()
+            .with_generation_report(report());
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+
+        UpgradeHandler::execute(
+            UpgradeArgs {
+                root_as: "v1".into(),
+                dry_run: true,
+                repo: PathBuf::from("/repo"),
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(output.contains("would copy xearthlayer_package_library.txt"));
+        assert!(output.contains("would move packages/zzXEL_na_ortho"));
+        assert!(output.contains("Dry run: nothing was changed."));
+        assert!(!output.contains("is the current generation"));
+    }
+
+    #[test]
+    fn library_subcommands_reach_the_publisher_and_list_marks_the_current_one() {
+        let output = MockOutput::new();
+        let publisher = MockPublisherServiceBuilder::new().build();
+        let prompt = MockPrompt::answering(false);
+        let ctx = CommandContext::new(&output, &publisher, &prompt);
+        let repo = PathBuf::from("/repo");
+
+        LibraryHandler::execute(LibraryCommands::List { repo: repo.clone() }, &ctx).unwrap();
+        LibraryHandler::execute(
+            LibraryCommands::New {
+                generation: "v3".into(),
+                repo: repo.clone(),
+            },
+            &ctx,
+        )
+        .unwrap();
+        LibraryHandler::execute(
+            LibraryCommands::Use {
+                generation: "v2".into(),
+                repo: repo.clone(),
+            },
+            &ctx,
+        )
+        .unwrap();
+        LibraryHandler::execute(
+            LibraryCommands::Import {
+                generation: "v2".into(),
+                from: PathBuf::from("/staging"),
+                dry_run: true,
+                repo,
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert_eq!(
+            publisher.generation_calls(),
+            [
+                "list /repo",
+                "new /repo v3",
+                "use /repo v2",
+                "import /repo v2 from /staging dry_run=true"
+            ]
+        );
+        assert!(output.contains("* v2"), "the current generation is marked");
+        assert!(output.contains("  v1"));
+        assert!(output.contains("Created v3."));
+        assert!(output.contains("v2 is the current generation."));
+    }
+}

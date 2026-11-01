@@ -1,8 +1,7 @@
 //! Time budget validation for prefetch plans.
 //!
 //! This module provides functions to validate whether a prefetch plan
-//! can complete before X-Plane triggers scenery loading. This is critical
-//! for the aggressive prefetch mode where we need to predict timing.
+//! can complete before X-Plane triggers scenery loading.
 
 use super::super::strategy::PrefetchPlan;
 
@@ -112,8 +111,6 @@ mod tests {
             avg_tile_generation_ms: 40,
             tile_generation_stddev_ms: 10,
             confidence: 0.9,
-            recommended_strategy:
-                crate::prefetch::adaptive::calibration::StrategyMode::Opportunistic,
             calibrated_at: Instant::now(),
             baseline_throughput: 25.0,
             sample_count: 100,

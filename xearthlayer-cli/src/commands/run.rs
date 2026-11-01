@@ -1,27 +1,23 @@
 //! Run command - mount all installed ortho packages.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use xearthlayer::airport::validate_airport_icao;
-use xearthlayer::config::{
-    analyze_config, config_file_path, format_size, ControlPlaneSettings, DownloadConfig,
-    PipelineSettings, TextureConfig,
-};
+use xearthlayer::config::{format_size, ControlPlaneSettings, TextureConfig};
 use xearthlayer::manager::LocalPackageStore;
-use xearthlayer::package::PackageType;
 use xearthlayer::panic as panic_handler;
 use xearthlayer::service::{
     OrchestratorConfig, ServiceConfig, ServiceOrchestrator, StartupProgress,
 };
 use xearthlayer::xplane::XPlaneEnvironment;
+use xearthlayer_package::PackageType;
 
 use super::common::{resolve_dds_format, resolve_provider, DdsCompression, ProviderType};
 use crate::error::CliError;
-use crate::runner::CliRunner;
+use crate::signals::{terminal_gone, Signal, SignalWatch};
 use crate::tui_app::{run_headless, run_tui, TuiAppConfig};
 use crate::ui;
+use xearthlayer::preflight::BootstrapContext;
 
 /// Arguments for the run command.
 ///
@@ -35,89 +31,31 @@ pub struct RunArgs {
     pub mapbox_token: Option<String>,
     pub dds_format: Option<DdsCompression>,
     pub timeout: Option<u64>,
-    pub parallel: Option<usize>,
     pub no_cache: bool,
     pub no_prefetch: bool,
     pub airport: Option<String>,
 }
 
 /// Run the run command.
-pub fn run(args: RunArgs) -> Result<(), CliError> {
+pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
     // Initialize panic handler early for crash cleanup
     panic_handler::init();
 
-    // Check for first-run scenario: no config file and no packages directory
-    // This provides a friendly welcome message instead of confusing errors
-    let config_path = xearthlayer::config::config_file_path();
-    if !config_path.exists() {
-        let default_packages_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".xearthlayer")
-            .join("packages");
+    // Every prerequisite below was verified before dispatch. Absence here is a
+    // misconfigured registry, not a user error, so it names the check that owed
+    // the value rather than degrading into a vague failure.
+    let config = ctx
+        .config()
+        .expect("preflight check 'load-config' contributes the configuration");
+    let install_location = ctx
+        .install_location()
+        .expect("preflight check 'packages-installed' contributes the install location")
+        .clone();
+    let custom_scenery_path = ctx
+        .custom_scenery_path()
+        .expect("preflight check 'resolve-custom-scenery' contributes the Custom Scenery path")
+        .clone();
 
-        if !default_packages_dir.exists() {
-            // First-run scenario: show welcome message and exit cleanly
-            return Err(CliError::NeedsSetup);
-        }
-    }
-
-    let runner = CliRunner::new()?;
-    runner.log_startup("run");
-
-    // Raise file descriptor limit to the hard maximum. XEL's FUSE mount +
-    // HTTP connections + disk cache can exceed the default soft limit (often
-    // 1024) inherited from the desktop environment. Safe to call at any time;
-    // takes effect immediately for all subsequent open() calls.
-    raise_fd_limit();
-
-    let config = runner.config();
-
-    // Check for config upgrade needs
-    check_config_upgrade_warning();
-
-    // Get install location (where packages are stored)
-    let install_location = config.packages.install_location.clone().unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".xearthlayer")
-            .join("packages")
-    });
-
-    if !install_location.exists() {
-        return Err(CliError::NoPackages {
-            install_location: install_location.clone(),
-        });
-    }
-
-    // Get Custom Scenery path (where mounts go)
-    let custom_scenery_path = config
-        .packages
-        .custom_scenery_path
-        .clone()
-        .or_else(|| config.xplane.scenery_dir.clone())
-        .ok_or_else(|| {
-            CliError::Config(
-                "No Custom Scenery path configured. \
-                 Run 'xearthlayer init' or set packages.custom_scenery_path in config.ini"
-                    .to_string(),
-            )
-        })?;
-
-    if !custom_scenery_path.exists() {
-        return Err(CliError::Config(format!(
-            "Custom Scenery directory does not exist: {}\n\
-             Check your configuration or run 'xearthlayer init'",
-            custom_scenery_path.display()
-        )));
-    }
-
-    // Validate airport code early (before heavy initialization)
-    if let Some(ref icao) = args.airport {
-        validate_airport_icao(&custom_scenery_path, icao)
-            .map_err(|e| CliError::Config(e.to_string()))?;
-    }
-
-    // Discover installed packages from install_location
     let store = LocalPackageStore::new(&install_location);
     let packages = store
         .list()
@@ -143,9 +81,8 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         config,
     )?;
     let format = resolve_dds_format(args.dds_format, config);
-    let timeout_secs = args.timeout.unwrap_or(config.download.timeout);
-    // Default parallel downloads is handled by DownloadConfig::default()
-    let parallel_downloads = args.parallel.unwrap_or(32);
+    let chunk_request_timeout_secs =
+        resolve_chunk_timeout_secs(args.timeout, config.executor.request_timeout_secs);
 
     // Build configurations
     // Mipmap levels are left unset so the encoder emits the full chain for the
@@ -156,27 +93,8 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         .with_gpu_device(config.texture.gpu_device.clone());
     let dds_format = texture_config.format();
 
-    let download_config = DownloadConfig::new()
-        .with_timeout_secs(timeout_secs)
-        .with_max_retries(3)
-        .with_parallel_downloads(parallel_downloads);
-
     // Check if we'll use TUI (need to know before creating services)
     let use_tui = atty::is(atty::Stream::Stdout);
-
-    // Pool sizing is no longer configurable (#249) — it is derived by
-    // ResourcePoolConfig::default(). These two fields keep their own defaults so
-    // PipelineSettings still constructs; nothing reads them today, since
-    // ServiceConfig::pipeline() has no caller.
-    let pipeline_settings = PipelineSettings {
-        max_http_concurrent: xearthlayer::config::default_http_concurrent(),
-        max_cpu_concurrent: xearthlayer::config::default_cpu_concurrent(),
-        max_prefetch_in_flight: config.pipeline.max_prefetch_in_flight,
-        request_timeout_secs: config.executor.request_timeout_secs,
-        max_retries: config.executor.max_retries,
-        retry_base_delay_ms: config.executor.retry_base_delay_ms,
-        coalesce_channel_capacity: config.pipeline.coalesce_channel_capacity,
-    };
 
     let control_plane_settings = ControlPlaneSettings {
         max_concurrent_jobs: config.control_plane.max_concurrent_jobs,
@@ -187,15 +105,17 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
 
     let service_config = ServiceConfig::builder()
         .texture(texture_config)
-        .download(download_config)
+        .chunk_request_timeout_secs(chunk_request_timeout_secs)
+        .chunk_max_retries(config.executor.max_retries)
+        .prefetch_capacity_share(config.prefetch.capacity_share)
         .cache_enabled(!args.no_cache)
         .cache_directory(config.cache.directory.clone())
         .cache_memory_size(config.cache.memory_size)
         .cache_disk_size(config.cache.disk_size)
         .cache_dds_disk_ratio(config.cache.dds_disk_ratio)
+        .night_enabled(config.night.enabled)
         .generation_threads(config.generation.threads)
         .generation_timeout(config.generation.timeout)
-        .pipeline(pipeline_settings)
         .control_plane(control_plane_settings)
         .quiet_mode(use_tui) // Disable stats logging when TUI is active
         .build();
@@ -242,7 +162,7 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
 
     // Create ServiceOrchestrator configuration
     // This consolidates all config needed for backend services
-    let orch_config = OrchestratorConfig::from_config_file(
+    let mut orch_config = OrchestratorConfig::from_config_file(
         config,
         provider_config.clone(),
         service_config.clone(),
@@ -250,6 +170,11 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         install_location.clone(),
         use_tui,
     );
+    // X-World Pro (#213): preflight contributed the detection when
+    // packages.xworld_pro is on; overlay consolidation leaves those continents out.
+    orch_config.xworld_pro = ctx
+        .xworld_pro()
+        .map(xearthlayer::xworld_pro::OverlayCoverage::from_detection);
 
     // Start ServiceOrchestrator - this initializes:
     // - Cache services (CacheLayer with internal GC daemon)
@@ -322,17 +247,15 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
         println!();
     }
 
-    // Set up signal handler for graceful shutdown
+    // Signals stop the run cleanly (#314): SIGINT as before, and SIGTERM (a
+    // system shutdown, `kill`, a service manager) and SIGHUP (the terminal
+    // closed), which used to kill the process with the mount still up. Each
+    // raises the flag the dashboard and the headless loop poll.
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
+    let watch = SignalWatch::start_for_shutdown(Arc::clone(&shutdown))
+        .map_err(|e| CliError::Config(format!("Failed to set signal handler: {}", e)))?;
 
-    ctrlc::set_handler(move || {
-        shutdown_clone.store(true, Ordering::SeqCst);
-    })
-    .map_err(|e| CliError::Config(format!("Failed to set signal handler: {}", e)))?;
-
-    // Track which cancellation token to use for cleanup
-    let cleanup_cancellation = if use_tui {
+    let front_end = if use_tui {
         // TUI path: Start dashboard in Loading state, mount with progress, then start prefetcher
         // This provides immediate visual feedback during the potentially long index build
         let tui_config = TuiAppConfig {
@@ -351,16 +274,33 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
                 .as_ref()
                 .or(config.xplane.scenery_dir.as_ref())
                 .and_then(|p| XPlaneEnvironment::from_custom_scenery_path(p).ok()),
+            xworld_pro: crate::ui::XworldProStatus::from_detection(
+                config.packages.xworld_pro,
+                ctx.xworld_pro(),
+            ),
+            startup_warnings: ctx.startup_warnings().len(),
         };
-        run_tui(tui_config)?
+        run_tui(tui_config)
     } else {
         // Fallback to simple text output for non-TTY
-        run_headless(&mut orchestrator, shutdown, config.general.update_check)?;
-        orchestrator.cancellation()
+        run_headless(&mut orchestrator, shutdown, config.general.update_check)
+            .map(|()| orchestrator.cancellation())
     };
 
-    // Cancel all systems for cleanup
-    cleanup_cancellation.cancel();
+    // The mount comes down whatever the front end did. A dashboard error used
+    // to return here and leave X-Plane reading a dead mount, and after SIGHUP
+    // a dashboard error is only the terminal going away.
+    let front_end_error = match front_end {
+        Ok(cancellation) => {
+            // Cancel all systems for cleanup
+            cancellation.cancel();
+            None
+        }
+        Err(error) => {
+            orchestrator.cancellation().cancel();
+            Some(error)
+        }
+    };
 
     // Get final telemetry before shutdown
     let final_snapshot = orchestrator.telemetry_snapshot();
@@ -368,81 +308,80 @@ pub fn run(args: RunArgs) -> Result<(), CliError> {
     // Graceful shutdown (unmounts FUSE, stops cache GC)
     orchestrator.shutdown();
 
-    // Print final session summary (to stdout after TUI exits)
-    ui::dashboard::print_session_summary(&final_snapshot);
+    // Print final session summary (to stdout after TUI exits), unless SIGHUP
+    // took the terminal: a write to it would fail, and `println!` panics.
+    if !terminal_gone() {
+        ui::dashboard::print_session_summary(&final_snapshot);
 
-    println!();
-    println!("All packages unmounted. Goodbye!");
+        println!();
+        println!("All packages unmounted. Goodbye!");
+    }
 
-    Ok(())
+    outcome(watch.received(), front_end_error)
 }
 
-/// Raise the file descriptor soft limit to the hard maximum.
-///
-/// Linux processes inherit a soft FD limit (often 1024) that can be lower
-/// than the hard limit. XEL needs many FDs simultaneously: HTTP connections
-/// to the imagery CDN, disk cache file handles, and FUSE file descriptors
-/// for X-Plane's open textures. This raises the soft limit to the hard
-/// limit (no root required), matching what the system administrator allows.
-fn raise_fd_limit() {
-    match rlimit::Resource::NOFILE.get() {
-        Ok((soft, hard)) if soft < hard => {
-            if let Err(e) = rlimit::Resource::NOFILE.set(hard, hard) {
-                tracing::warn!(soft, hard, error = %e, "Failed to raise FD limit");
-            } else {
-                tracing::info!(
-                    old_soft = soft,
-                    new_soft = hard,
-                    "Raised file descriptor limit"
-                );
-            }
-        }
-        Ok((soft, _)) => {
-            tracing::debug!(soft, "FD limit already at maximum");
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to query FD limit");
-        }
+/// How the run ended: a signal names the exit code (130, 143 or 129), a
+/// front-end error with no signal behind it is reported, and `q` is success.
+fn outcome(received: Option<Signal>, front_end_error: Option<CliError>) -> Result<(), CliError> {
+    match (received, front_end_error) {
+        (Some(signal), _) => Err(CliError::Stopped(signal)),
+        (None, Some(error)) => Err(error),
+        (None, None) => Ok(()),
     }
 }
 
-/// Display warning if configuration file needs upgrade.
+/// Resolve the per-chunk HTTP timeout from the `--timeout` flag and config.
 ///
-/// Checks if the user's config.ini is missing settings from the current version
-/// and displays a helpful message with instructions on how to upgrade.
-fn check_config_upgrade_warning() {
-    let path = config_file_path();
+/// The flag wins when given, otherwise `executor.request_timeout_secs` applies.
+///
+/// Both inputs were inert before #249: the flag and the key each landed in a
+/// `ServiceConfig::download()` that has no production reader, so the effective
+/// per-chunk timeout was a compile-time constant that no configuration could
+/// reach. Extracted so that resolution rule is assertable.
+fn resolve_chunk_timeout_secs(flag: Option<u64>, configured: u64) -> u64 {
+    flag.unwrap_or(configured)
+}
 
-    // Only check if config file exists
-    if !path.exists() {
-        return;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_timeout_falls_back_to_the_configured_value() {
+        assert_eq!(resolve_chunk_timeout_secs(None, 45), 45);
     }
 
-    match analyze_config(&path) {
-        Ok(analysis) if analysis.needs_upgrade => {
-            let missing_count = analysis.missing_keys.len();
-            let deprecated_count = analysis.deprecated_keys.len();
+    #[test]
+    fn chunk_timeout_flag_overrides_the_configured_value() {
+        assert_eq!(resolve_chunk_timeout_secs(Some(90), 45), 90);
+    }
 
-            eprintln!();
-            eprintln!(
-                "Warning: Your configuration file is missing {} new setting(s)",
-                missing_count
-            );
-            if deprecated_count > 0 {
-                eprintln!(
-                    "         and contains {} deprecated setting(s).",
-                    deprecated_count
-                );
-            }
-            eprintln!();
-            eprintln!("Run 'xearthlayer config upgrade' to update your configuration.");
-            eprintln!("Use 'xearthlayer config upgrade --dry-run' to preview changes first.");
-            eprintln!();
-        }
-        Ok(_) => {} // Up to date, no message needed
-        Err(e) => {
-            // Log error but don't fail - config upgrade is informational
-            tracing::warn!("Failed to analyze config for upgrade: {}", e);
-        }
+    #[test]
+    fn a_signal_decides_the_exit_code_even_when_the_front_end_failed() {
+        // After SIGHUP the dashboard fails on the dead terminal; the signal
+        // is the cause, so 129, not a dashboard error.
+        let gone = Some(CliError::Config("Dashboard draw error".into()));
+        assert!(matches!(
+            outcome(Some(Signal::Hangup), gone),
+            Err(CliError::Stopped(Signal::Hangup))
+        ));
+        assert_eq!(
+            outcome(Some(Signal::Terminate), None).unwrap_err().report(),
+            143
+        );
+    }
+
+    #[test]
+    fn a_front_end_error_with_no_signal_is_reported() {
+        let error = Some(CliError::Config("Dashboard draw error".into()));
+        assert!(matches!(
+            outcome(None, error),
+            Err(CliError::Config(message)) if message == "Dashboard draw error"
+        ));
+    }
+
+    #[test]
+    fn quitting_with_q_is_a_plain_success() {
+        assert!(outcome(None, None).is_ok());
     }
 }

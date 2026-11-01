@@ -10,8 +10,10 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::aircraft_position::AircraftPositionBroadcaster;
-use crate::executor::{DdsClient, MemoryCache};
+use crate::executor::MemoryCache;
+use crate::pinned_budget::PinnedTileBudget;
 use crate::prefetch::{AdaptivePrefetchConfig, AdaptivePrefetchCoordinator, Prefetcher};
+use crate::runtime::PrefetchLane;
 
 use super::super::error::ServiceError;
 use super::{PrefetchHandle, ServiceOrchestrator};
@@ -32,9 +34,12 @@ impl ServiceOrchestrator {
             .get_service()
             .ok_or_else(|| ServiceError::NotStarted("No service available for prefetch".into()))?;
 
-        let dds_client = service
-            .dds_client()
-            .ok_or_else(|| ServiceError::NotStarted("DDS client not available".into()))?;
+        let prefetch_lane = service
+            .prefetch_lane()
+            .ok_or_else(|| ServiceError::NotStarted("Prefetch lane not available".into()))?;
+        let pinned_budget = service
+            .pinned_budget()
+            .ok_or_else(|| ServiceError::NotStarted("Pinned-tile budget not available".into()))?;
 
         let runtime_handle = service.runtime_handle().clone();
 
@@ -44,7 +49,8 @@ impl ServiceOrchestrator {
         if let Some(memory_cache) = service.memory_cache_bridge() {
             self.start_prefetch_with_cache(
                 &runtime_handle,
-                dds_client,
+                prefetch_lane,
+                pinned_budget,
                 memory_cache,
                 dds_disk_checker,
                 metrics_client,
@@ -61,7 +67,8 @@ impl ServiceOrchestrator {
     fn start_prefetch_with_cache<M: MemoryCache + 'static>(
         &mut self,
         runtime_handle: &Handle,
-        dds_client: Arc<dyn DdsClient>,
+        prefetch_lane: Arc<dyn PrefetchLane>,
+        pinned_budget: Arc<PinnedTileBudget>,
         memory_cache: Arc<M>,
         dds_disk_checker: Option<Arc<dyn crate::executor::DdsDiskCacheChecker>>,
         metrics_client: Option<crate::metrics::MetricsClient>,
@@ -116,9 +123,6 @@ impl ServiceOrchestrator {
         // Build prefetcher
         let config = &self.config.prefetch;
 
-        // Keep a reference to DDS client for adaptive strategy
-        let dds_client_for_adaptive = Arc::clone(&dds_client);
-
         // Build and start the prefetcher
         let prefetcher_cancel = self.cancellation.clone();
 
@@ -126,8 +130,11 @@ impl ServiceOrchestrator {
         let adaptive_config = AdaptivePrefetchConfig::from_prefetch_config(config);
         let mut coordinator = AdaptivePrefetchCoordinator::new(adaptive_config);
 
-        // Wire DDS client
-        coordinator = coordinator.with_dds_client(dds_client_for_adaptive);
+        // Wire the prefetch lane, and the FUSE mount's pinned-tile budget so
+        // X-Plane's demand throttles submission (#246)
+        coordinator = coordinator
+            .with_prefetch_lane(prefetch_lane)
+            .with_fuse_pressure(pinned_budget);
 
         // Wire memory cache for tile existence checks (Bug 5 fix)
         coordinator = coordinator.with_memory_cache(memory_cache);
@@ -174,20 +181,6 @@ impl ServiceOrchestrator {
             coordinator = coordinator.with_geo_index(geo_index);
             tracing::info!("GeoIndex wired to prefetch (patched region filtering enabled)");
         }
-
-        // Wire SceneTracker for boundary-driven prefetch (#58)
-        // Start the event processing loop so FUSE access events populate
-        // requested_tiles and loaded_bounds() returns real X-Plane window data.
-        let scene_tracker = self.mount_manager.scene_tracker();
-        if let Some(rx) = self.mount_manager.take_scene_tracker_receiver() {
-            scene_tracker.clone().start_on(rx, runtime_handle);
-            tracing::info!("Scene tracker started for boundary-driven prefetch");
-        } else {
-            tracing::warn!(
-                "Scene tracker receiver not available — window will use assumed dimensions"
-            );
-        }
-        coordinator = coordinator.with_scene_tracker(scene_tracker);
 
         // Wire shared status for TUI display
         coordinator = coordinator.with_shared_status(Arc::clone(&self.prefetch_status));

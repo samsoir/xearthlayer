@@ -14,6 +14,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
+  # The Homebrew tap that `publish` bumps after a release (docs/dev/cicd.md,
+  # "Homebrew tap"). `brew tap xearthlayer/tap` is this repository.
+  HOMEBREW_TAP_REPO: xearthlayer/homebrew-tap
 
 jobs:
   # First: Run make verify to gate all builds
@@ -62,7 +65,24 @@ jobs:
       - name: Run make verify
         run: make verify
 
-  # Build the release binary once for reuse across Linux tarball and Debian package
+  # macOS release gate. Mirrors the Linux `verify` job; see ci.yml for why the
+  # runner is pinned and why no dependency install is required.
+  verify-macos:
+    name: Verify (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run make verify
+        run: make verify
+
+  # Build the release binaries once for reuse across Linux tarballs and Debian packages
   build-binary:
     name: Build Release Binary
     runs-on: ubuntu-latest
@@ -96,7 +116,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
+      # One build produces both binaries: the runtime and xearthlayer-publish
+      # (#284). They are packaged separately below.
+      - name: Build release binaries
         run: cargo build --release
 
       # Fails the release rather than shipping a binary that cannot start on
@@ -104,21 +126,25 @@ jobs:
       # first report arrives from a user who cannot run the program at all.
       - name: Verify glibc compatibility floor
         run: |
-          MAX=$(objdump -T target/release/xearthlayer \
-            | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' \
-            | sed 's/GLIBC_//' | sort -V -u | tail -1)
-          echo "Highest required glibc symbol: $MAX (floor: $GLIBC_FLOOR)"
-          if [ "$(printf '%s\n%s\n' "$MAX" "$GLIBC_FLOOR" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
-            echo "::error::Binary requires glibc $MAX, above the supported floor $GLIBC_FLOOR."
-            echo "::error::It will not start on Ubuntu 22.04, Debian 12 or RHEL 9."
-            exit 1
-          fi
+          for bin in xearthlayer xearthlayer-publish; do
+            MAX=$(objdump -T "target/release/$bin" \
+              | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' \
+              | sed 's/GLIBC_//' | sort -V -u | tail -1)
+            echo "$bin: highest required glibc symbol: $MAX (floor: $GLIBC_FLOOR)"
+            if [ "$(printf '%s\n%s\n' "$MAX" "$GLIBC_FLOOR" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
+              echo "::error::$bin requires glibc $MAX, above the supported floor $GLIBC_FLOOR."
+              echo "::error::It will not start on Ubuntu 22.04, Debian 12 or RHEL 9."
+              exit 1
+            fi
+          done
 
-      - name: Upload binary artifact
+      - name: Upload binary artifacts
         uses: actions/upload-artifact@v7
         with:
           name: release-binary
-          path: target/release/xearthlayer
+          path: |
+            target/release/xearthlayer
+            target/release/xearthlayer-publish
 
   # Package Linux binary tarball (uses pre-built binary)
   package-linux:
@@ -134,16 +160,19 @@ jobs:
           name: release-binary
           path: target/release
 
-      - name: Package binary
+      # Two tarballs: the runtime as before, and the publisher on its own so a
+      # flight simulator user downloads a streaming service and a publisher
+      # downloads publishing tools (#284).
+      - name: Package binaries
         env:
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
         run: |
-          chmod +x target/release/xearthlayer
+          chmod +x target/release/xearthlayer target/release/xearthlayer-publish
           mkdir -p dist
-          cp target/release/xearthlayer dist/
-          cp README.md LICENSE dist/
-          cd dist
-          tar czvf xearthlayer-${RELEASE_TAG}-x86_64-linux.tar.gz xearthlayer README.md LICENSE
+          cp target/release/xearthlayer README.md LICENSE dist/
+          (cd dist && tar czvf xearthlayer-${RELEASE_TAG}-x86_64-linux.tar.gz xearthlayer README.md LICENSE)
+          cp target/release/xearthlayer-publish docs/content-publishing.md dist/
+          (cd dist && tar czvf xearthlayer-publish-${RELEASE_TAG}-x86_64-linux.tar.gz xearthlayer-publish content-publishing.md LICENSE)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -151,7 +180,151 @@ jobs:
           name: linux-binary
           path: dist/*.tar.gz
 
-  # Build .deb package for Debian/Ubuntu (uses pre-built binary)
+  # Package the macOS (Apple Silicon) binary tarball.
+  #
+  # Unlike the Linux path this builds AND packages in one job. actions/upload-artifact
+  # zips its payload and does not preserve the executable bit — which is why
+  # package-linux must `chmod +x` after downloading. Creating the tarball before
+  # upload puts the exec bit inside the archive, where the zip cannot strip it, and
+  # saves a macOS runner spin-up.
+  #
+  # No prerelease gate, matching package-linux: .deb/.rpm/AUR are stable-only because
+  # their version fields forbid the hyphen in `0.5.0-dev.1`; a tarball has no such
+  # constraint, and preview tags are exactly what macOS testers need.
+  package-macos:
+    name: Package macOS Binary
+    runs-on: macos-15
+    needs: [verify, verify-macos]
+    env:
+      # The secrets context cannot be read from a step's `if:`, so the decision
+      # is taken here. Without the certificate (a fork, or before the secrets
+      # are set) the job still ships, unsigned, exactly as before.
+      MACOS_SIGNING: ${{ secrets.APPLE_DEVELOPER_ID_P12 != '' }}
+      # Installer packages need both identities: notarizing a package rejects
+      # unsigned code inside it, so the Installer certificate alone is useless.
+      MACOS_PKG: ${{ secrets.APPLE_DEVELOPER_ID_P12 != '' && secrets.APPLE_DEVELOPER_INSTALLER_P12 != '' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # An Installer password without its certificate is a broken secret, not an
+      # absent one: `gh secret set` stores an empty value when the command feeding
+      # it fails, and GitHub reads an empty secret as unset. Without this check the
+      # job ships tarballs only and passes, with nothing but a notice (v0.5.0-rc.1).
+      - name: Check installer secrets
+        if: env.MACOS_SIGNING == 'true'
+        env:
+          INSTALLER_P12_SET: ${{ secrets.APPLE_DEVELOPER_INSTALLER_P12 != '' }}
+          INSTALLER_PASSWORD_SET: ${{ secrets.APPLE_DEVELOPER_INSTALLER_P12_PASSWORD != '' }}
+        run: |
+          if [ "$INSTALLER_PASSWORD_SET" = "true" ] && [ "$INSTALLER_P12_SET" != "true" ]; then
+            echo "::error::APPLE_DEVELOPER_INSTALLER_P12_PASSWORD is set but APPLE_DEVELOPER_INSTALLER_P12 is empty. Set it again from the directory holding the .p12 (docs/dev/macos-signing-runbook.md)."
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # Signing and notarization: the same Developer ID Application identity
+      # signs every channel; pre-releases are notarized too, because a tester's
+      # Mac applies the same Gatekeeper policy as anyone else's. The identity
+      # lives in a throwaway keychain for the life of the job, never the
+      # runner's login keychain. See docs/dev/macos-signing-runbook.md.
+      - name: Import Developer ID certificate
+        if: env.MACOS_SIGNING == 'true'
+        env:
+          P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          INSTALLER_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_INSTALLER_P12 }}
+          INSTALLER_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_INSTALLER_P12_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/developer_id.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/developer_id.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/developer_id.p12"
+          if [ -n "$INSTALLER_P12_BASE64" ]; then
+            printf '%s' "$INSTALLER_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/developer_id_installer.p12"
+            security import "$RUNNER_TEMP/developer_id_installer.p12" -k "$KEYCHAIN" -P "$INSTALLER_P12_PASSWORD" \
+              -T /usr/bin/productbuild -T /usr/bin/productsign
+            rm -f "$RUNNER_TEMP/developer_id_installer.p12"
+          fi
+          # Let codesign and productbuild use the keys without a UI prompt (there is no UI).
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          # Prepend to the search list so find-identity and codesign see it.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          security find-identity -v -p basic "$KEYCHAIN"
+          echo "SIGNING_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Sign and notarize
+        if: env.MACOS_SIGNING == 'true'
+        env:
+          NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          export MACOS_NOTARY_KEY="$RUNNER_TEMP/notary.p8"
+          printf '%s\n' "$NOTARY_KEY_P8" > "$MACOS_NOTARY_KEY"
+          trap 'rm -f "$MACOS_NOTARY_KEY"' EXIT
+          scripts/macos/sign-and-notarize.sh target/release/xearthlayer target/release/xearthlayer-publish
+
+      - name: Package binaries
+        env:
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+        run: |
+          mkdir -p dist
+          cp target/release/xearthlayer README.md LICENSE dist/
+          (cd dist && tar czvf xearthlayer-${RELEASE_TAG}-arm64-macos.tar.gz xearthlayer README.md LICENSE)
+          cp target/release/xearthlayer-publish docs/content-publishing.md dist/
+          (cd dist && tar czvf xearthlayer-publish-${RELEASE_TAG}-arm64-macos.tar.gz xearthlayer-publish content-publishing.md LICENSE)
+
+      # Installer packages: the job's last step before the upload. They are
+      # built from the binaries signed above, so the tarball and the package
+      # carry the same bytes. Notarized and stapled, so a package installs
+      # with no network. See docs/dev/macos-signing-runbook.md.
+      - name: Build installer packages
+        if: env.MACOS_PKG == 'true'
+        env:
+          NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          export MACOS_NOTARY_KEY="$RUNNER_TEMP/notary.p8"
+          printf '%s\n' "$NOTARY_KEY_P8" > "$MACOS_NOTARY_KEY"
+          trap 'rm -f "$MACOS_NOTARY_KEY"' EXIT
+          for PRODUCT in xearthlayer xearthlayer-publish; do
+            scripts/macos/build-pkg.sh "$PRODUCT" "target/release/$PRODUCT" "$VERSION" \
+              "dist/${PRODUCT}-${RELEASE_TAG}-arm64-macos.pkg"
+          done
+
+      - name: Note missing installer identity
+        if: env.MACOS_SIGNING == 'true' && env.MACOS_PKG != 'true'
+        run: echo "::notice::APPLE_DEVELOPER_INSTALLER_P12 is not set; this release ships macOS tarballs without installer packages."
+
+      - name: Remove signing keychain
+        if: always() && env.SIGNING_KEYCHAIN != ''
+        run: security delete-keychain "$SIGNING_KEYCHAIN"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-binary
+          path: |
+            dist/*.tar.gz
+            dist/*.pkg
+
+  # Build .deb packages for Debian/Ubuntu (uses pre-built binaries)
   # Stable releases only — previews ship the Linux tarball only.
   package-deb:
     name: Package Debian Package
@@ -169,18 +342,20 @@ jobs:
           name: release-binary
           path: target/release
 
-      - name: Make binary executable
-        run: chmod +x target/release/xearthlayer
+      - name: Make binaries executable
+        run: chmod +x target/release/xearthlayer target/release/xearthlayer-publish
 
       - name: Install cargo-deb
         run: cargo install cargo-deb
 
-      - name: Build .deb package
+      # Two packages from one build. The meta-package relationship is #146's;
+      # here xearthlayer-publish is simply its own .deb (#284).
+      - name: Build .deb packages
         run: |
-          cd xearthlayer-cli
-          cargo deb --no-build
-          mkdir -p ../dist
-          cp ../target/debian/*.deb ../dist/
+          (cd xearthlayer-cli && cargo deb --no-build)
+          (cd xearthlayer-publish && cargo deb --no-build)
+          mkdir -p dist
+          cp target/debian/*.deb dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -197,6 +372,11 @@ jobs:
     if: ${{ needs.verify.outputs.prerelease != 'true' }}
     container:
       image: fedora:latest
+    # Fedora's cargo ignores rust-toolchain.toml, so this job compiles with
+    # whatever rustc Fedora ships. A lint new in that compiler must not stop a
+    # release; `verify` already denies warnings on the pinned toolchain.
+    env:
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v6
 
@@ -328,11 +508,12 @@ jobs:
   publish:
     name: Publish Release
     runs-on: ubuntu-latest
-    needs: [verify, package-linux, package-deb, build-rpm, prepare-aur]
+    needs: [verify, package-linux, package-macos, package-deb, build-rpm, prepare-aur]
     if: >-
       ${{ !cancelled()
       && needs.verify.result == 'success'
       && needs.package-linux.result == 'success'
+      && needs.package-macos.result == 'success'
       && needs.package-deb.result != 'failure'
       && needs.build-rpm.result != 'failure'
       && needs.prepare-aur.result != 'failure' }}
@@ -435,6 +616,17 @@ jobs:
         run: |
           gh release upload "${RELEASE_TAG}" artifacts/linux-binary/*.tar.gz
 
+      - name: Upload macOS binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+        run: |
+          gh release upload "${RELEASE_TAG}" artifacts/macos-binary/*.tar.gz
+          # Packages exist only when the Installer identity is configured.
+          if compgen -G "artifacts/macos-binary/*.pkg" > /dev/null; then
+            gh release upload "${RELEASE_TAG}" artifacts/macos-binary/*.pkg
+          fi
+
       - name: Upload Debian package
         if: ${{ needs.verify.outputs.prerelease != 'true' }}
         env:
@@ -476,6 +668,49 @@ jobs:
           echo "=============================================="
           echo ""
           echo "Release URL: https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG}"
+
+      # Bump the Homebrew tap: the runtime's cask and the publisher's, in one
+      # commit. A pre-release tag rewrites the `@prerelease` casks
+      # (`xearthlayer@prerelease`, `xearthlayer-publish@prerelease`), a stable
+      # tag the plain ones; the two channels never cross. Each tarball's hash is
+      # taken from the artifact just uploaded, so a cask can only ever describe
+      # the bytes this run published. The release is already
+      # public by this point, so a failure here marks the run red without
+      # un-publishing anything; the fix is scripts/homebrew/render-cask.sh by hand.
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::notice::HOMEBREW_TAP_TOKEN not configured; the Homebrew tap was not updated."
+            exit 0
+          fi
+          CHANNEL=stable
+          [ "$PRERELEASE" = "true" ] && CHANNEL=prerelease
+
+          git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${HOMEBREW_TAP_REPO}.git" tap
+          TOKENS=()
+          for PRODUCT in xearthlayer xearthlayer-publish; do
+            TARBALL="artifacts/macos-binary/${PRODUCT}-${RELEASE_TAG}-arm64-macos.tar.gz"
+            SHA256=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+            CASK=$(scripts/homebrew/render-cask.sh "$PRODUCT" "$CHANNEL" "$VERSION" "$SHA256" "${{ github.repository }}" tap/Casks)
+            TOKENS+=("$(basename "$CASK" .rb)")
+          done
+          cd tap
+          git add Casks
+          if git diff --cached --quiet; then
+            echo "Tap already at ${VERSION}; nothing to push."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "${TOKENS[*]} ${VERSION}" \
+                     -m "Rendered from ${{ github.repository }}@${RELEASE_TAG} by release.yml run ${{ github.run_id }}."
+          git push
+          echo "Homebrew tap updated: ${HOMEBREW_TAP_REPO} ${TOKENS[*]} -> ${VERSION}"
 
       # Website notification moved to website-sync.yml (triggers on release/* merge to main)
 

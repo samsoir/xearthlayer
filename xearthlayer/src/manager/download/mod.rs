@@ -42,7 +42,7 @@
 //! // Download with progress callback
 //! downloader.download_all(&mut state, Some(Box::new(|progress| {
 //!     println!("Downloaded {} bytes", progress.total_bytes_downloaded);
-//! })))?;
+//! })), &CancelToken::new())?;
 //! ```
 
 mod checksum;
@@ -52,6 +52,8 @@ mod progress;
 pub(crate) mod retry;
 pub(crate) mod semaphore;
 mod state;
+#[cfg(test)]
+pub(crate) mod test_server;
 
 // Public API - types used by installer and other modules
 pub use orchestrator::MultiPartDownloader;

@@ -196,6 +196,31 @@ fn run_upgrade(dry_run: bool) -> Result<(), CliError> {
         println!();
     }
 
+    if !analysis.folded_values.is_empty() {
+        println!(
+            "Settings that move to another setting ({}):",
+            analysis.folded_values.len()
+        );
+        for fold in &analysis.folded_values {
+            println!("  ~ {}", fold.describe());
+        }
+        println!();
+    }
+
+    if !analysis.migrated_values.is_empty() {
+        println!(
+            "Retired values to rewrite ({}):",
+            analysis.migrated_values.len()
+        );
+        for retired in &analysis.migrated_values {
+            println!(
+                "  ~ {} = {} -> {}",
+                retired.key, retired.value, retired.replacement
+            );
+        }
+        println!();
+    }
+
     if !analysis.unknown_keys.is_empty() {
         println!("Unknown settings (will be preserved):");
         for key in &analysis.unknown_keys {
@@ -217,9 +242,10 @@ fn run_upgrade(dry_run: bool) -> Result<(), CliError> {
         println!("Backup created: {}", backup.display());
     }
     println!(
-        "Added {} setting(s), removed {} deprecated setting(s).",
+        "Added {} setting(s), removed {} deprecated setting(s), rewrote {} retired value(s).",
         result.added_keys.len(),
-        result.removed_keys.len()
+        result.removed_keys.len(),
+        result.migrated_values.len()
     );
 
     Ok(())

@@ -3,7 +3,6 @@
 //! The aggregator receives position updates from multiple sources:
 //! - Telemetry (XGPS2 UDP)
 //! - Prewarm (airport ICAO)
-//! - Scene Inference (from Scene Tracker)
 //!
 //! It applies updates to the Position Model based on accuracy and freshness,
 //! tracks telemetry connection status, and broadcasts position changes.
@@ -20,9 +19,6 @@
 //!
 //! // Receive from telemetry
 //! aggregator.receive_telemetry(state).await;
-//!
-//! // Receive from inference
-//! aggregator.receive_inference(state).await;
 //!
 //! // Seed from prewarm
 //! aggregator.seed_from_prewarm(43.6, 1.4);
@@ -181,19 +177,6 @@ impl StateAggregator {
         }
 
         // Apply update (competes on accuracy like any other source)
-        if state.model.apply_update(aircraft_state) {
-            self.maybe_broadcast(&mut state);
-        }
-    }
-
-    /// Receive a position update from inference.
-    pub fn receive_inference(&self, aircraft_state: AircraftState) {
-        let mut state = self.state.write().unwrap();
-
-        // Check telemetry timeout
-        self.check_telemetry_timeout(&mut state);
-
-        // Apply update
         if state.model.apply_update(aircraft_state) {
             self.maybe_broadcast(&mut state);
         }
@@ -368,23 +351,6 @@ mod tests {
     }
 
     #[test]
-    fn test_inference_rejected_when_telemetry_fresh() {
-        let (tx, _rx) = broadcast::channel(16);
-        let aggregator = StateAggregator::new(tx);
-
-        // Start with telemetry
-        let telemetry = make_telemetry_state(53.5, 10.0, 90.0);
-        aggregator.receive_telemetry(telemetry);
-
-        // Inference should be rejected
-        let inference = AircraftState::from_inference(40.0, 5.0);
-        aggregator.receive_inference(inference);
-
-        // Position should still be from telemetry
-        assert_eq!(aggregator.position(), Some((53.5, 10.0)));
-    }
-
-    #[test]
     fn test_telemetry_timeout() {
         // Use longer timeouts to avoid flakiness on loaded systems
         let config = StateAggregatorConfig {
@@ -504,19 +470,18 @@ mod tests {
     }
 
     #[test]
-    fn test_network_position_beats_inference() {
+    fn test_network_position_beats_manual_reference() {
         let (tx, _rx) = broadcast::channel(16);
         let aggregator = StateAggregator::new(tx);
 
-        // Start with inference (100km accuracy)
-        let inference = AircraftState::from_inference(40.0, 5.0);
-        aggregator.receive_inference(inference);
+        // Start with a manual reference (100m accuracy)
+        assert!(aggregator.receive_manual_reference(40.0, 5.0));
         assert_eq!(
             aggregator.status().state.unwrap().source,
-            PositionSource::SceneInference
+            PositionSource::ManualReference
         );
 
-        // Network (10m accuracy) should replace inference
+        // Network (10m accuracy) should replace it
         let network = AircraftState::from_network_position(
             33.9425,
             -118.408,

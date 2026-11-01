@@ -16,7 +16,7 @@
 //! # Example
 //!
 //! ```
-//! use xearthlayer::config::{TextureConfig, DownloadConfig, ConfigFile};
+//! use xearthlayer::config::{TextureConfig, ConfigFile};
 //! use xearthlayer::dds::DdsFormat;
 //!
 //! // Load configuration from file (or use defaults)
@@ -25,14 +25,11 @@
 //! // Create texture configuration
 //! let texture_config = TextureConfig::new(DdsFormat::BC1)
 //!     .with_mipmap_count(5);
-//!
-//! // Create download configuration
-//! let download_config = DownloadConfig::default();
 //! ```
 
 pub(crate) mod defaults;
-mod download;
 mod file;
+pub mod help;
 mod keys;
 mod parser;
 mod settings;
@@ -40,33 +37,30 @@ mod size;
 mod texture;
 mod upgrade;
 mod writer;
-pub use download::DownloadConfig;
 pub use file::{
     config_directory,
     config_file_path,
-    default_cpu_concurrent,
-    default_http_concurrent,
     default_max_concurrent_jobs,
-    default_prefetch_in_flight,
     num_cpus,
     CacheSettings,
     ConfigFile,
     ConfigFileError,
     ControlPlaneSettings,
-    DownloadSettings,
     ExecutorSettings,
     GenerationSettings,
     LoggingSettings,
+    NightSettings,
     PackagesSettings,
     PatchesSettings,
-    PipelineSettings,
     PrefetchSettings,
     PrewarmSettings,
     ProviderSettings,
     TextureSettings,
+    TuiSettings,
     XPlaneSettings,
+    // Package manager defaults
+    ALPHA_STAGING_LIBRARY_URL,
     // Pipeline defaults
-    DEFAULT_COALESCE_CHANNEL_CAPACITY,
     // Control plane defaults
     DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
     DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
@@ -75,29 +69,25 @@ pub use file::{
     DEFAULT_DDS_DISK_RATIO,
     DEFAULT_DISK_CACHE_SIZE,
     // Download defaults
-    DEFAULT_DOWNLOAD_TIMEOUT_SECS,
-    DEFAULT_EXECUTOR_JOB_CHANNEL_CAPACITY,
-    DEFAULT_EXECUTOR_MAX_CONCURRENT_TASKS,
-    DEFAULT_EXECUTOR_REQUEST_CHANNEL_CAPACITY,
     // Generation defaults
     DEFAULT_GENERATION_TIMEOUT_SECS,
-    // Package manager defaults
     DEFAULT_LIBRARY_URL,
-    DEFAULT_MAX_CONCURRENT_DOWNLOADS,
     DEFAULT_MAX_RETRIES,
     DEFAULT_MEMORY_CACHE_SIZE,
     // DownloadConfig defaults
     DEFAULT_PARALLEL_DOWNLOADS,
+    DEFAULT_PREFETCH_CAPACITY_SHARE,
     DEFAULT_PREFETCH_CYCLE_INTERVAL_MS,
     DEFAULT_REQUEST_TIMEOUT_SECS,
-    DEFAULT_RETRY_BASE_DELAY_MS,
     DEFAULT_WEB_API_PORT,
+    LEGACY_LIBRARY_URL,
 };
 pub use keys::{ConfigKey, ConfigKeyError, SENSITIVE_VALUE_MASK};
 pub use size::{format_size, parse_size, Size, SizeParseError, GB, KB, MB};
 pub use texture::TextureConfig;
 pub use upgrade::{
-    analyze_config, upgrade_config, ConfigUpgradeAnalysis, UpgradeResult, DEPRECATED_KEYS,
+    analyze_config, deprecated_value, folded_value, upgrade_config, ConfigUpgradeAnalysis,
+    DeprecatedValue, FoldedValue, UpgradeResult, DEPRECATED_KEYS, DEPRECATED_VALUES, FOLDED_VALUES,
 };
 // Re-export X-Plane utilities for backwards compatibility
 // Prefer using xearthlayer::xplane module directly for new code

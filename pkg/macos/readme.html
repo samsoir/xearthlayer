@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>:root { color-scheme: light dark; } body { font-family: -apple-system, sans-serif; font-size: 13px; line-height: 1.4; } li { margin-bottom: 0.4em; }</style>
+</head>
+<body>
+<h3>XEarthLayer needs macFUSE</h3>
+<p>XEarthLayer serves its scenery to X-Plane through a virtual file system, and macOS provides those through <a href="https://macfuse.io">macFUSE</a>. macFUSE is a separate download, and macOS must be allowed to load it. Until both are done, <code>xearthlayer run</code> cannot start.</p>
+<p>If macFUSE is already installed and approved on this Mac, there is nothing more to do here.</p>
+
+<h3>1. Install macFUSE</h3>
+<p>Download the installer from <a href="https://macfuse.io">macfuse.io</a> and run it, or with Homebrew run <code>brew install --cask macfuse</code>.</p>
+
+<h3>2. Allow kernel extensions (Apple Silicon only)</h3>
+<ol>
+<li>Shut down the Mac completely.</li>
+<li>Press and hold the power button until "Loading startup options" appears, then choose Options to start in Recovery.</li>
+<li>Open Utilities, then Startup Security Utility. Select your startup disk, choose Reduced Security, and check "Allow user management of kernel extensions from identified developers".</li>
+<li>Restart into macOS.</li>
+</ol>
+
+<h3>3. Approve macFUSE</h3>
+<ol>
+<li>Open System Settings, then Privacy &amp; Security.</li>
+<li>Under Security, macOS reports that system software from the developer "Benjamin Fleischer" was blocked. Click Allow. macOS may ask you to enable system extensions first.</li>
+<li>Restart when asked.</li>
+</ol>
+<p>If the Allow button never appears, run the macFUSE installer again after the Recovery steps.</p>
+
+<p>You can do these steps before or after installing XEarthLayer. The <a href="https://xearthlayer.app/docs/macos/#installing-macfuse">macOS guide</a> covers them in more detail.</p>
+</body>
+</html>

@@ -55,6 +55,12 @@ pub struct OrchestratorConfig {
     /// X-Plane reads is suppressed. See `packages.disable_overlays` config key.
     pub disable_overlays: bool,
 
+    /// Where SimHeaven X-World Pro is active (`packages.xworld_pro`). Startup
+    /// leaves the overlay packages of those continents out of
+    /// `yzXEL_overlay/`. Set by the run command from preflight, not by
+    /// `from_config_file`; `disable_overlays` still wins.
+    pub xworld_pro: Option<crate::xworld_pro::OverlayCoverage>,
+
     /// Prefetch configuration.
     pub prefetch: PrefetchConfig,
 
@@ -63,6 +69,9 @@ pub struct OrchestratorConfig {
 
     /// FUSE kernel configuration.
     pub fuse: FuseConfig,
+
+    /// Overall lit brightness multiplier (`night.brightness`).
+    pub night_brightness: f64,
 
     /// Whether TUI mode is active (affects logging behavior).
     pub tui_mode: bool,
@@ -74,23 +83,11 @@ pub struct PrefetchConfig {
     /// Whether prefetch is enabled.
     pub enabled: bool,
 
-    /// Adaptive prefetch mode: "auto", "aggressive", "opportunistic", or "disabled".
-    pub mode: String,
-
     /// Web API port for X-Plane SimState polling.
     pub web_api_port: u16,
 
     /// Cycle interval (milliseconds).
     pub cycle_interval_ms: u64,
-
-    /// Calibration: aggressive mode threshold (tiles/sec).
-    pub calibration_aggressive_threshold: f64,
-
-    /// Calibration: opportunistic mode threshold (tiles/sec).
-    pub calibration_opportunistic_threshold: f64,
-
-    /// Calibration: sample duration (seconds).
-    pub calibration_sample_duration: u64,
 
     /// Altitude climb (feet) above takeoff MSL to release transition hold.
     pub takeoff_climb_ft: f32,
@@ -167,12 +164,11 @@ impl OrchestratorConfig {
     ) -> Self {
         // Determine patches directory
         let patches_dir = if config.patches.enabled {
-            config.patches.directory.clone().unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join(".xearthlayer")
-                    .join("patches")
-            })
+            config
+                .patches
+                .directory
+                .clone()
+                .unwrap_or_else(crate::paths::patches_dir)
         } else {
             // Use a non-existent path when patches are disabled
             PathBuf::from("/nonexistent")
@@ -181,14 +177,8 @@ impl OrchestratorConfig {
         // Extract prefetch configuration
         let prefetch = PrefetchConfig {
             enabled: config.prefetch.enabled,
-            mode: config.prefetch.mode.clone(),
             web_api_port: config.prefetch.web_api_port,
             cycle_interval_ms: config.prefetch.cycle_interval_ms,
-            calibration_aggressive_threshold: config.prefetch.calibration_aggressive_threshold,
-            calibration_opportunistic_threshold: config
-                .prefetch
-                .calibration_opportunistic_threshold,
-            calibration_sample_duration: config.prefetch.calibration_sample_duration,
             takeoff_climb_ft: config.prefetch.takeoff_climb_ft,
             takeoff_timeout_secs: config.prefetch.takeoff_timeout_secs,
             landing_hysteresis_secs: config.prefetch.landing_hysteresis_secs,
@@ -221,9 +211,11 @@ impl OrchestratorConfig {
             patches_enabled: config.patches.enabled,
             packages_install_location,
             disable_overlays: config.packages.disable_overlays,
+            xworld_pro: None,
             prefetch,
             prewarm,
             fuse,
+            night_brightness: config.night.brightness,
             tui_mode,
         }
     }

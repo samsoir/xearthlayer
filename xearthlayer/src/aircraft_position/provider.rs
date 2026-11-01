@@ -95,11 +95,6 @@ impl SharedAircraftPosition {
         self.inner.receive_telemetry(state);
     }
 
-    /// Receive a position update from inference.
-    pub fn receive_inference(&self, state: AircraftState) {
-        self.inner.receive_inference(state);
-    }
-
     /// Receive a position update from an online network (VATSIM/IVAO/PilotEdge).
     pub fn receive_network_position(&self, state: AircraftState) {
         self.inner.receive_network_position(state);

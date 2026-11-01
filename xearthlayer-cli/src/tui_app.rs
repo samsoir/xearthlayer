@@ -22,16 +22,19 @@ use tokio_util::sync::CancellationToken;
 
 use xearthlayer::aircraft_position::SharedAircraftPosition;
 use xearthlayer::config::ConfigFile;
+use xearthlayer::executor::LaneSizing;
 use xearthlayer::manager::{InstalledPackage, LocalPackageStore};
 use xearthlayer::prefetch::{PrewarmHandle, SharedPrefetchStatus};
 use xearthlayer::service::{PrewarmOrchestrator, ServiceOrchestrator, StartupProgress};
+use xearthlayer::system::CompressorKind;
 use xearthlayer::update::{RemoteUpdateChecker, UpdateChecker, UpdateInfo};
 use xearthlayer::xplane::XPlaneEnvironment;
 
 use crate::error::CliError;
+use crate::ui::symbols::SymbolPreference;
 use crate::ui::{
-    self, Dashboard, DashboardConfig, DashboardEvent, DashboardState, LoadingPhase,
-    LoadingProgress, PrewarmProgress,
+    self, Dashboard, DashboardConfig, DashboardEvent, DashboardState, EncoderStatus, FeatureStatus,
+    LoadingPhase, LoadingProgress, PrefetchLaneConfig, PrewarmProgress, XworldProStatus,
 };
 
 /// Configuration for starting the TUI application.
@@ -54,6 +57,10 @@ pub struct TuiAppConfig<'a> {
     pub airport_icao: Option<String>,
     /// X-Plane environment for apt.dat lookup and resource paths.
     pub xplane_env: Option<XPlaneEnvironment>,
+    /// X-World Pro support, from the preflight detection.
+    pub xworld_pro: XworldProStatus,
+    /// Warnings the startup checks printed before the dashboard took the screen.
+    pub startup_warnings: usize,
 }
 
 /// Run the TUI application with dashboard.
@@ -76,6 +83,8 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         ortho_packages,
         airport_icao,
         xplane_env,
+        xworld_pro,
+        startup_warnings,
     } = config;
 
     let dds_disk_max = (cfg.cache.disk_size as f64 * cfg.cache.dds_disk_ratio) as usize;
@@ -85,6 +94,14 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         dds_disk_cache_max: dds_disk_max,
         chunk_disk_cache_max: chunk_disk_max,
         provider_name: cfg.provider.provider_type.clone(),
+        // Same derivation the runtime builder uses, so the group the panel
+        // shows is the group the lane enforces.
+        prefetch_lane: PrefetchLaneConfig {
+            group: LaneSizing::from_configured_share(cfg.prefetch.capacity_share)
+                .prefetch_tile_generation,
+            generation_timeout: Duration::from_secs(cfg.generation.timeout),
+        },
+        symbols: SymbolPreference::from_config(&cfg.tui.symbols),
     };
 
     // Create initial loading progress
@@ -95,7 +112,8 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
     let mut dashboard = Dashboard::with_state(dashboard_config, shutdown.clone(), initial_state)
         .map_err(|e| CliError::Config(format!("Failed to create dashboard: {}", e)))?
         .with_prefetch_status(Arc::clone(&prefetch_status))
-        .with_aircraft_position(aircraft_position.clone());
+        .with_aircraft_position(aircraft_position.clone())
+        .with_sim_state(orchestrator.sim_state());
 
     // Draw initial loading screen immediately
     dashboard
@@ -164,6 +182,24 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
     if let Some(tile_progress_tracker) = orchestrator.tile_progress_tracker() {
         dashboard = dashboard.with_tile_progress_tracker(tile_progress_tracker);
     }
+
+    // Key features' state for the Status pane: what the service actually
+    // selected and resolved, not what the configuration asked for.
+    dashboard.set_feature_status(FeatureStatus {
+        encoder: match (orchestrator.gpu_adapter(), orchestrator.gpu_warning()) {
+            (Some(adapter), Some(_)) => EncoderStatus::GpuSharedWithSim(adapter.clone()),
+            (Some(adapter), None) => EncoderStatus::Gpu(adapter.clone()),
+            // No adapter means a CPU encoder: a GPU that fails to start
+            // stops the service rather than falling back.
+            (None, _) => match CompressorKind::parse(&cfg.texture.compressor) {
+                Some(CompressorKind::Software) => EncoderStatus::Software,
+                _ => EncoderStatus::Ispc,
+            },
+        },
+        night: orchestrator.night_lighting(),
+        xworld_pro,
+        startup_warnings,
+    });
 
     // Transition to Running state
     tracing::info!("Transitioning to Running state");
@@ -260,6 +296,11 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
                 }
             }
             Ok(None) => {}
+            Err(e) if crate::signals::terminal_gone() => {
+                // SIGHUP: the terminal is gone, so its errors are expected.
+                tracing::info!(error = %e, "Terminal gone, leaving the dashboard");
+                break;
+            }
             Err(e) => return Err(CliError::Config(format!("Dashboard error: {}", e))),
         }
 
@@ -324,6 +365,10 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
             let snapshot = orchestrator.telemetry_snapshot();
             match dashboard.draw(&snapshot) {
                 Ok(()) => {}
+                Err(e) if crate::signals::terminal_gone() => {
+                    tracing::info!(error = %e, "Terminal gone, leaving the dashboard");
+                    break;
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "Dashboard draw error");
                     return Err(CliError::Config(format!("Dashboard draw error: {}", e)));
@@ -455,8 +500,9 @@ pub fn run_headless(
     while !shutdown.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(100));
 
-        // Display telemetry every 30 seconds
-        if last_telemetry.elapsed() >= telemetry_interval {
+        // Display telemetry every 30 seconds, unless SIGHUP took the
+        // terminal during the sleep: `println!` panics on the dead pipe.
+        if last_telemetry.elapsed() >= telemetry_interval && !crate::signals::terminal_gone() {
             let snapshot = orchestrator.telemetry_snapshot();
             ui::dashboard::print_simple_status(&snapshot);
             last_telemetry = Instant::now();

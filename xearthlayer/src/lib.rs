@@ -34,15 +34,16 @@ pub mod jobs;
 pub mod logging;
 pub mod manager;
 pub mod metrics;
+pub mod night;
 pub mod ortho_union;
-pub mod package;
 pub mod panic;
 pub mod patches;
+pub mod paths;
+pub mod pinned_budget;
 pub mod prefetch;
+pub mod preflight;
 pub mod provider;
-pub mod publisher;
 pub mod runtime;
-pub mod scene_tracker;
 pub mod service;
 pub mod system;
 pub mod tasks;
@@ -50,6 +51,7 @@ pub mod texture;
 pub mod time;
 pub mod update;
 pub mod xplane;
+pub mod xworld_pro;
 
 /// Version of the XEarthLayer library and CLI.
 ///

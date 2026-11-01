@@ -486,7 +486,6 @@ mod tests {
             avg_tile_generation_ms: 50,
             tile_generation_stddev_ms: 10,
             confidence: 0.9,
-            recommended_strategy: super::super::calibration::StrategyMode::Opportunistic,
             calibrated_at: Instant::now(),
             baseline_throughput: 20.0,
             sample_count: 100,

@@ -15,6 +15,7 @@ The Package Publisher creates distributable XEarthLayer Scenery Packages from Or
 5. **Generate** checksums and metadata files
 6. **Manage** library index (add, update, remove packages)
 7. **Version** packages with semantic versioning
+8. **Delete** a package the library no longer offers
 
 ## Architecture
 
@@ -49,47 +50,86 @@ The Package Publisher creates distributable XEarthLayer Scenery Packages from Or
 │  │ Gap Analysis: Find incomplete coverage, export to O4XP   │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                    Deletion Module                        │  │
+│  │                                                           │  │
+│  │ plan_deletion:    Pure. What would go, and how much.     │  │
+│  │ execute_deletion: Acts on a plan, index entry first.     │  │
+│  │ Never touches assets already uploaded to a host.         │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Repository Structure
 
-A Publisher repository is a local directory containing:
+A Publisher repository is a local directory holding one or more **library
+generations** (#333). Each generation is a complete scenery world in its own
+folder: its library index, region metadata, coverage map, package working
+directories and archives. The marker records which generation is current, and
+every command works in it unless `--library <gen>` names another.
 
 ```
 xearthlayer-packages/
-├── .xearthlayer-repo                    # Repository marker file
-├── xearthlayer_package_library.txt      # Library index
-├── packages/                            # Package working directories
-│   ├── zzXEL_na_ortho/
-│   │   ├── xearthlayer_scenery_package.txt
-│   │   ├── Earth nav data/
-│   │   ├── terrain/
-│   │   └── textures/
-│   └── yzXEL_na_overlay/
-│       └── ...
-├── dist/                                # Published archives
-│   └── na/                              # Region subdirectory
-│       └── ortho/                       # Type subdirectory
-│           ├── zzXEL_na-1.0.0.tar.gz.aa
-│           ├── zzXEL_na-1.0.0.tar.gz.ab
-│           └── ...
-└── staging/                             # Work in progress
-    └── ...
+├── .xearthlayer-repo                    # Repository marker (format 2.0.0)
+├── staging/                             # Work area shared by every generation
+├── v1/                                  # Library generation v1
+│   ├── xearthlayer_package_library.txt  # Library index
+│   ├── region_metadata.json
+│   ├── coverage.png, coverage.geojson
+│   ├── packages/                        # Package working directories
+│   │   ├── zzXEL_na_ortho/
+│   │   │   ├── xearthlayer_scenery_package.txt
+│   │   │   ├── Earth nav data/
+│   │   │   ├── terrain/
+│   │   │   └── textures/
+│   │   └── yzXEL_na_overlay/
+│   └── dist/                            # Published archives
+│       └── na/                          # Region subdirectory
+│           └── ortho/                   # Type subdirectory
+│               ├── zzXEL_na-1.0.0.tar.gz.aa
+│               └── ...
+└── v2/                                  # Library generation v2, same shape
 ```
+
+**Why generations.** A published library URL must never change meaning.
+Replacing a library's packages with a rebuilt world hands it to every client
+reading that URL, including releases that cannot use it: pre-0.5 clients reading
+the night-lit rebuild get missing resource warnings in X-Plane at best. So a new
+world is a new generation, published at its own URL. The generation versions
+the library's contents; the index format, `spec_version`, is unchanged. Release
+tags need no generation: each package's version is in its tag, and semver keeps
+generations apart. Working folders live per generation, so a later rebuild can
+reuse a region code, and a patch release to an older world stays possible.
+
+**Repositories from before generations** (format 1.x) kept the library at the
+root. `upgrade --root-as v1` copies the root index, region metadata and coverage
+map into `v1/` and moves in the working folders the index lists. The root files
+stay, frozen: clients from before generations read them, so nothing in format
+2.0.0 writes them. `Repository::open` refuses a 1.x repository with
+`UpgradeRequired`, so no other command can touch one. `library import <gen>
+--from <dir>` adds a generation from library files kept elsewhere, such as another
+branch. Both are in `xearthlayer-publisher/src/generation.rs` and copy before
+they move, plan before they change anything (so `--dry-run` and a real run
+agree), and refuse a move onto an existing folder.
 
 ### Repository Marker
 
-`.xearthlayer-repo` contains repository metadata and optional configuration:
+`.xearthlayer-repo` contains repository metadata, the current generation, and
+optional configuration:
 
 ```
 XEARTHLAYER PACKAGE REPOSITORY
-1.0.0
+2.0.0
 2025-12-20T10:00:00Z
+current v1
 
 [config]
 part_size = 500000000
 ```
+
+Rewriting the marker (`library use`, `upgrade`) replaces the header lines only
+and keeps every section after them.
 
 The `[config]` section is optional and stores repository-wide settings:
 
@@ -106,23 +146,24 @@ Part size can be specified with units: `500MB`, `1GB`, `10 MB`, etc.
 Create a new package repository:
 
 ```bash
-xearthlayer publish init /path/to/repo
+xearthlayer-publish init /path/to/repo
 
 # Or in current directory
-xearthlayer publish init .
+xearthlayer-publish init .
 ```
 
 Creates:
-- `.xearthlayer-repo` marker
-- Empty `xearthlayer_package_library.txt`
-- `packages/`, `dist/`, `staging/` directories
+- `.xearthlayer-repo` marker, format 2.0.0, current generation `v1`
+- `v1/` with an empty `xearthlayer_package_library.txt`, a `region_metadata.json`
+  stub, and `packages/` and `dist/` directories
+- `staging/`, the shared work area
 
 ### 2. Process Ortho4XP Output
 
 Import Ortho4XP tiles into a regional package:
 
 ```bash
-xearthlayer publish add \
+xearthlayer-publish add \
   --source /path/to/Ortho4XP/Tiles \
   --region na \
   --type ortho \
@@ -144,22 +185,28 @@ Processing steps:
 Create distributable archives:
 
 ```bash
-xearthlayer publish build --region na --type ortho
+xearthlayer-publish build --region na --type ortho
 ```
 
-Steps:
+Steps, in one pass and in process (no `tar` or `split` binary, #274):
 
-1. Create tar.gz archive of package directory
-2. Split into parts (configurable size, default 1GB)
-3. Generate SHA-256 checksum for each part
-4. Store in `dist/` directory
+1. Archive the package directory as `tar.gz`, entries in sorted order
+2. Stream the archive straight into parts of `part_size` bytes, named
+   `.aa`, `.ab`, ... exactly as `split -b` would cut them
+3. Hash each part with SHA-256 as it is written, so no part is read back
+4. Store the parts in `dist/`
+
+The same tree always produces the same parts and checksums: entries are
+sorted and the gzip header carries no timestamp. File modification times
+are kept as `tar` keeps them, because the runtime's ortho union index
+invalidates its cache by mtime.
 
 ### 4. Configure URLs
 
 Set download URLs for the package:
 
 ```bash
-xearthlayer publish urls \
+xearthlayer-publish urls \
   --region na \
   --type ortho \
   --base-url https://dl.example.com/packages/na/ortho/
@@ -172,7 +219,7 @@ Updates metadata file with actual download URLs.
 Finalize and update library index:
 
 ```bash
-xearthlayer publish release
+xearthlayer-publish release
 ```
 
 Steps:
@@ -184,6 +231,19 @@ Steps:
    - Add/update package entries
 3. Generate checksums for metadata files
 4. Mark repository as published
+
+`release` also measures the package and records the result in
+`region_metadata.json`, under the region's `size.ortho` or `size.overlay` block:
+`download_bytes` from the archive parts in `dist/` and `installed_bytes` from
+the package working directory. That file is edited as JSON rather than through
+a typed model, so fields the publisher does not model, including the ones the
+website reads, survive the write.
+
+Updating the library index is the release. A size that cannot be measured, or a
+metadata file that is missing or has no entry for the region, is reported as a
+warning on an otherwise successful release rather than an error. An error here
+would invite a retry, and a second `release` bumps the library sequence again
+for a release that already happened.
 
 ### 6. Upload (Manual)
 
@@ -199,6 +259,42 @@ rsync -avz dist/ user@server:/var/www/packages/
 # Or any other method
 ```
 
+### 7. Delete
+
+Retire a package that the library should no longer offer:
+
+```bash
+xearthlayer-publish delete --region na --dry-run   # plan only
+xearthlayer-publish delete --region na             # both package types
+```
+
+Inspection is split from action. `plan_deletion` is pure: it resolves the
+library entry, the package working directory and the dist directory, sums their
+apparent size, and changes nothing. `execute_deletion` acts on that plan. A dry
+run is the inspection on its own, which is what makes it impossible for the
+preview to describe something different from what the real run does.
+
+Three behaviours are deliberate:
+
+- **The index entry is removed first.** If a directory removal then fails, the
+  package is already unadvertised, which is the safe half to have completed:
+  nobody is offered a package whose archives are being removed underneath them.
+- **A region with nothing to delete is an error.** No index entry, no package
+  directory and no archives almost always means a mistyped region code. A
+  package that was built but never released is not an error, since reclaiming
+  its archives is one of the reasons the command exists. Omitting `--type`
+  tolerates a region that has only one of the two package types and reports the
+  other as skipped.
+- **Assets already uploaded to a hosting provider are never touched.** The
+  publisher has no model of the hosting, and those files must outlive the index
+  entry while users are still installing from them. Taking them down is a
+  separate, manual step.
+
+A region code containing a path separator is rejected before any path is built
+from it. Both directory paths are formed by joining the region into a path that
+is eventually handed to a recursive delete, and a region code is a directory
+name under Custom Scenery, so no legitimate code contains a separator.
+
 ## Ortho4XP Processing Details
 
 ### Input Structure (Ortho4XP Output)
@@ -212,8 +308,8 @@ Tiles/
 │   │   ├── 25264_10912_BI16.ter
 │   │   └── ...
 │   └── textures/
-│       ├── 25264_10912_BI16.dds      # REMOVED
-│       ├── 25264_10912_BI16_sea.png  # KEPT
+│       ├── 25264_10912_BI16.dds      # REMOVED (orthophoto)
+│       ├── 25264_10912_ZL16.png      # KEPT (water mask)
 │       └── ...
 └── +37-119/
     └── ...
@@ -232,7 +328,7 @@ zzXEL_na_ortho/
 │   ├── 25264_10912_BI16.ter
 │   └── ...
 └── textures/
-    ├── 25264_10912_BI16_sea.png
+    ├── 25264_10912_ZL16.png
     └── ...
 ```
 
@@ -240,13 +336,25 @@ zzXEL_na_ortho/
 
 | File Type | Action | Reason |
 |-----------|--------|--------|
-| `*.dsf` | Keep | Terrain mesh data |
+| `*.dsf` | Keep, compressed | Terrain mesh, written as a single-entry 7z container (see DSF Compression) |
 | `*.ter` | Keep | Terrain definitions |
-| `*_sea.png`, `*_mask.png` | Keep | Water masks |
+| `textures/*.png` | Keep | Water masks. Every PNG under a tile's `textures/` is a mask, named `{x}_{y}_ZL{n}.png` with nothing marking it as a mask, so the processor matches on the extension and keeps all of them |
 | `*.dds` | Remove | Generated on-demand |
 | `*.pol` | Keep if present | Polygon definitions |
 | `*.net` | Keep if present | Network definitions |
 | `*.obj` | Keep if present | Object definitions |
+
+### Night Recipes
+
+The processor also carries OXO night recipes from `yOrtho4XP_Night/<block>/<tile>.oxn` beside the tile folders into the package at `night/<block>/<tile>.oxn`, where `<tile>` is the Ortho4XP tile name (`+37-118`) and `<block>` its 10 degree block (`+30-120`). It checks only the `OXN1` magic, because the publisher does not link the runtime; XEL validates the rest. A recipe of another version, or one with no matching tile, produces a warning and is not copied. A source without the night tree publishes exactly as before. See [night-lighting-design.md](night-lighting-design.md).
+
+### DSF Compression
+
+`DsfCompressor` (`publisher/dsf_compress.rs`) writes each DSF as a 7z archive with one entry named after the file, using LZMA with a 16 MiB dictionary and a plain header. That is the profile of Laminar's own Global Scenery DSF files, and X-Plane has decoded it natively since version 10. The dictionary size is chosen for the consumer rather than the producer: X-Plane allocates the dictionary for every DSF it decodes, so matching Laminar keeps packages inside a memory budget the sim already carries.
+
+Both processors queue their DSF copies and hand the list to `compress_dsf_files`, which runs the batch across rayon's pool because LZMA at this dictionary size is CPU bound and a region holds around two thousand files. A source that already begins with the 7z signature is copied unchanged, so processing a directory twice is a no-op. `ProcessSummary` reports raw and stored bytes, which `publish add` prints as a percentage.
+
+The tar.gz archive around the package is unchanged. Once the DSF files are compressed, only the water masks remain compressible, and moving the container to zstd was measured at 1.1% of download, which did not justify a format change.
 
 ### Region Assignment
 
@@ -276,10 +384,10 @@ Each package has independent semantic version:
 
 ```bash
 # Bump version when adding tiles
-xearthlayer publish version --region na --type ortho --bump minor
+xearthlayer-publish version --region na --type ortho --bump minor
 
 # Or set explicitly
-xearthlayer publish version --region na --type ortho --set 2.0.0
+xearthlayer-publish version --region na --type ortho --set 2.0.0
 ```
 
 ### Library Sequence
@@ -298,13 +406,13 @@ Clients can quickly check `sequence > cached_sequence` to know if updates exist.
 
 ```bash
 # Initialize repository
-xearthlayer publish init [<path>] [--part-size <size>]
+xearthlayer-publish init [<path>] [--part-size <size>]
 
 # Scan Ortho4XP output and report tile information
-xearthlayer publish scan --source <ortho4xp_tiles_path>
+xearthlayer-publish scan --source <ortho4xp_tiles_path>
 
 # Add Ortho4XP output to a package
-xearthlayer publish add \
+xearthlayer-publish add \
   --source <ortho4xp_tiles_path> \
   --region <region_code> \
   [--type <ortho|overlay>] \
@@ -312,16 +420,16 @@ xearthlayer publish add \
   [--repo <path>]
 
 # List packages in repository
-xearthlayer publish list [<repo_path>] [--verbose]
+xearthlayer-publish list [<repo_path>] [--verbose]
 
 # Build archives for a package
-xearthlayer publish build \
+xearthlayer-publish build \
   --region <region_code> \
   [--type <ortho|overlay>] \
   [--repo <path>]
 
 # Set download URLs
-xearthlayer publish urls \
+xearthlayer-publish urls \
   --region <region_code> \
   [--type <ortho|overlay>] \
   --base-url <url> \
@@ -329,30 +437,30 @@ xearthlayer publish urls \
   [--repo <path>]
 
 # Bump or set version
-xearthlayer publish version \
+xearthlayer-publish version \
   --region <region_code> \
   [--type <ortho|overlay>] \
   <--bump major|minor|patch | --set <version>> \
   [--repo <path>]
 
 # Finalize and update library index
-xearthlayer publish release \
+xearthlayer-publish release \
   --region <region_code> \
   [--type <ortho|overlay>] \
   --metadata-url <url> \
   [--repo <path>]
 
 # Show package release status
-xearthlayer publish status \
+xearthlayer-publish status \
   [--region <region_code>] \
   [--type <ortho|overlay>] \
   [<repo_path>]
 
 # Validate repository integrity
-xearthlayer publish validate [<repo_path>]
+xearthlayer-publish validate [<repo_path>]
 
 # Analyze coverage gaps (incomplete ZL18 coverage over ZL16)
-xearthlayer publish gaps \
+xearthlayer-publish gaps \
   --region <region_code> \
   [--type <ortho|overlay>] \
   [--tile <lat,lon>] \
@@ -361,13 +469,21 @@ xearthlayer publish gaps \
   [<repo_path>]
 
 # Remove overlapping zoom level tiles
-xearthlayer publish dedupe \
+xearthlayer-publish dedupe \
   --region <region_code> \
   [--type <ortho|overlay>] \
   [--priority <highest|lowest|zl##>] \
   [--tile <lat,lon>] \
   [--dry-run] \
   [<repo_path>]
+
+# Delete a package: index entry, working directory and archives
+xearthlayer-publish delete \
+  --region <region_code> \
+  [--type <ortho|overlay>] \
+  [--dry-run] \
+  [--yes] \
+  [--repo <path>]
 ```
 
 ### CLI Architecture
@@ -377,14 +493,18 @@ The CLI is implemented using the **Command Pattern** with **trait-based dependen
 #### Module Structure
 
 ```
-xearthlayer-cli/src/commands/publish/
-├── mod.rs        # Module exports and command dispatch
-├── traits.rs     # Core interfaces (Output, PublisherService, CommandHandler)
-├── services.rs   # Concrete implementations wrapping xearthlayer publisher
+xearthlayer-publish/src/
+├── main.rs       # Binary entry point and command dispatch
+├── traits.rs     # Core interfaces (Output, Prompt, PublisherService, CommandHandler)
+├── services.rs   # Concrete implementations wrapping xearthlayer-publisher
 ├── args.rs       # CLI argument types and parsing (clap-derived)
 ├── handlers.rs   # Command handlers implementing business logic
 └── output.rs     # Shared output formatting utilities
 ```
+
+The binary was split out of `xearthlayer-cli` in #284 so the runtime does not
+link the publishing dependencies. See
+[Publisher Separation](publisher-separation-design.md).
 
 #### Core Traits
 
@@ -396,6 +516,15 @@ pub trait Output: Send + Sync {
     fn newline(&self);
     fn header(&self, title: &str);
     fn indented(&self, message: &str);
+}
+
+/// Abstracts asking the user to confirm an irreversible action.
+///
+/// Separate from `Output`, which is output only. Keeping confirmation behind
+/// its own trait means a handler that deletes data can be tested without a
+/// terminal, and a test can assert that declining deletes nothing.
+pub trait Prompt: Send + Sync {
+    fn confirm(&self, question: &str) -> Result<bool, CliError>;
 }
 
 /// Abstracts all publisher operations
@@ -430,13 +559,15 @@ pub trait CommandHandler {
 // Production usage
 let output = ConsoleOutput::new();
 let publisher = DefaultPublisherService::new();
-let ctx = CommandContext::new(&output, &publisher);
+let prompt = ConsolePrompt::new();
+let ctx = CommandContext::new(&output, &publisher, &prompt);
 InitHandler::execute(args, &ctx)?;
 
 // Test usage with mocks
 let output = MockOutput::new();
 let publisher = MockPublisherService::new();
-let ctx = CommandContext::new(&output, &publisher);
+let prompt = MockPrompt::answering(false);
+let ctx = CommandContext::new(&output, &publisher, &prompt);
 InitHandler::execute(args, &ctx)?;
 assert!(output.contains("Initialized"));
 ```
@@ -444,10 +575,10 @@ assert!(output.contains("Initialized"));
 ### Output Examples
 
 ```
-$ xearthlayer publish init ~/scenery-repo
+$ xearthlayer-publish init ~/scenery-repo
 Initialized XEarthLayer package repository at /home/user/scenery-repo
 
-$ xearthlayer publish add --source ~/Ortho4XP/Tiles --region na --type ortho --version 1.0.0
+$ xearthlayer-publish add --source ~/Ortho4XP/Tiles --region na --type ortho --version 1.0.0
 Scanning Ortho4XP output...
 Found 45 tiles in /home/user/Ortho4XP/Tiles
 
@@ -459,7 +590,7 @@ Processing tiles:
 Removed 12,456 DDS files (saving 45.2 GB in package)
 Created package: zzXEL_na_ortho v1.0.0
 
-$ xearthlayer publish build --region na --type ortho
+$ xearthlayer-publish build --region na --type ortho
 Creating archive...
   Compressing: 2.3 GB → 1.8 GB (22% reduction)
   Splitting into 2 parts (1 GB each)
@@ -468,10 +599,10 @@ Generated:
   dist/zzXEL_na-1.0.0.tar.gz.aa (1.0 GB) SHA256: 55e772c1...
   dist/zzXEL_na-1.0.0.tar.gz.ab (0.8 GB) SHA256: b91f75f9...
 
-$ xearthlayer publish urls --region na --type ortho --base-url https://dl.example.com/na/
+$ xearthlayer-publish urls --region na --type ortho --base-url https://dl.example.com/na/
 Updated URLs in zzXEL_na_ortho metadata
 
-$ xearthlayer publish release
+$ xearthlayer-publish release
 Updating library index...
   Sequence: 0 → 1
   Packages: 1
@@ -638,7 +769,7 @@ git add .
 git commit -m "Initial repository"
 
 # After changes
-xearthlayer publish release
+xearthlayer-publish release
 git add .
 git commit -m "Release: NA ortho 1.0.0"
 git push

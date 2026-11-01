@@ -119,7 +119,7 @@ Regional Package (installed)          XEarthLayer Service (running)
 1. **Configure XEarthLayer**
    ```bash
    xearthlayer init
-   # Edit ~/.xearthlayer/config.ini with your library_url
+   # Edit ~/.config/xearthlayer/config.ini with your library_url
    ```
 
 2. **Install a regional package**
@@ -149,8 +149,8 @@ Regional Package (installed)          XEarthLayer Service (running)
 
 2. **Create a package** (strips out DDS files, keeps DSF/TER)
    ```bash
-   xearthlayer publish add --source ./Ortho4XP_Tiles --region eu
-   xearthlayer publish build --region eu
+   xearthlayer-publish add --source ./Ortho4XP_Tiles --region eu
+   xearthlayer-publish build --region eu
    ```
 
 3. **Distribute the package** (small, just metadata)

@@ -115,7 +115,7 @@ function updateStats(data) {
   lines.push(['Prefetched', String(prefetchedCount)]);
   lines.push(['In Progress', String(inProgressCount)]);
   lines.push(['Tiles Submitted', String(s.tiles_submitted)]);
-  lines.push(['Mode', s.prefetch_mode]);
+  lines.push(['Prefetch', s.prefetch_state]);
 
   for (const [label, value] of lines) {
     const div = document.createElement('div');

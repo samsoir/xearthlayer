@@ -37,3 +37,26 @@ jobs:
       - name: Run make verify
         run: make verify
 
+  # macOS is a Tier 1 platform. Pinned to macos-15 (Apple Silicon) rather than
+  # macos-latest: that label has moved across both OS versions and CPU
+  # architectures, and a silent bump would surface as an unexplained failure on
+  # an unrelated PR.
+  #
+  # No dependency-install step is needed. The pinned fuse3 fork is pure Rust
+  # (no build.rs / pkg-config / cc) and xearthlayer/build.rs already emits
+  # -lc++ for macOS. macFUSE is a runtime dependency only, and cannot be loaded
+  # on hosted runners in any case (it is a kext).
+  verify-macos:
+    name: Verify (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run make verify
+        run: make verify

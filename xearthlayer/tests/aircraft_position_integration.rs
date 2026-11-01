@@ -1,25 +1,19 @@
 //! Integration tests for the Aircraft Position & Telemetry (APT) module.
 //!
 //! These tests verify the complete APT data flows:
-//! - Telemetry → APT (X-Plane UDP → AircraftState → Position Model)
+//! - Telemetry → APT (X-Plane Web API → AircraftState → Position Model)
 //! - Manual Reference → APT (Airport seed → Position Model)
-//! - Scene Tracker → Inference → APT (Burst → InferenceAdapter → Position Model)
 //! - Source priority and accuracy-based selection
 //!
 //! Run with: `cargo test --test aircraft_position_integration`
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 use xearthlayer::aircraft_position::{
-    AircraftPositionProvider, AircraftState, InferenceAdapter, InferenceAdapterConfig,
-    PositionAccuracy, PositionSource, SharedAircraftPosition, StateAggregator,
-    StateAggregatorConfig, TelemetryStatus, TrackSource,
-};
-use xearthlayer::scene_tracker::{
-    DdsTileCoord, DefaultSceneTracker, FuseAccessEvent, GeoBounds, GeoRegion, SceneTracker,
+    AircraftPositionProvider, AircraftState, PositionAccuracy, PositionSource,
+    SharedAircraftPosition, StateAggregator, StateAggregatorConfig, TelemetryStatus, TrackSource,
 };
 
 // ============================================================================
@@ -51,17 +45,12 @@ fn create_telemetry_state(lat: f64, lon: f64) -> AircraftState {
     AircraftState::from_telemetry(
         lat,
         lon,
-        Some(90.0), // Track from XGPS2
+        Some(90.0), // Track from the Web API
         TrackSource::Telemetry,
-        90.0, // Heading from XATT2
+        90.0, // Heading
         120.0,
         10000.0,
     )
-}
-
-/// Create an inference AircraftState from scene bounds center.
-fn create_inference_state(lat: f64, lon: f64) -> AircraftState {
-    AircraftState::from_inference(lat, lon)
 }
 
 /// Hamburg airport coordinates for testing.
@@ -71,14 +60,6 @@ const HAMBURG_LON: f64 = 9.988333;
 /// Toulouse airport coordinates for testing.
 const TOULOUSE_LAT: f64 = 43.629444;
 const TOULOUSE_LON: f64 = 1.363889;
-
-/// Tile coordinates in the Hamburg area (ZL18).
-const HAMBURG_TILES: &[(u32, u32)] = &[
-    (83776, 138240),
-    (83777, 138240),
-    (83776, 138241),
-    (83777, 138241),
-];
 
 // ============================================================================
 // Manual Reference → APT Tests
@@ -220,154 +201,28 @@ async fn test_telemetry_timeout_status() {
 }
 
 // ============================================================================
-// Scene Tracker → Inference → APT Tests
-// ============================================================================
-
-/// Mock Scene Tracker that returns configurable bounds.
-struct MockSceneTracker {
-    bounds: Option<GeoBounds>,
-}
-
-impl MockSceneTracker {
-    fn with_bounds(min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64) -> Arc<Self> {
-        Arc::new(Self {
-            bounds: Some(GeoBounds::new(min_lat, max_lat, min_lon, max_lon)),
-        })
-    }
-}
-
-impl SceneTracker for MockSceneTracker {
-    fn requested_tiles(&self) -> std::collections::HashSet<DdsTileCoord> {
-        std::collections::HashSet::new()
-    }
-
-    fn is_tile_requested(&self, _tile: &DdsTileCoord) -> bool {
-        false
-    }
-
-    fn total_requests(&self) -> u64 {
-        0
-    }
-
-    fn loaded_regions(&self) -> std::collections::HashSet<GeoRegion> {
-        std::collections::HashSet::new()
-    }
-
-    fn is_region_loaded(&self, _region: &GeoRegion) -> bool {
-        false
-    }
-
-    fn loaded_bounds(&self) -> Option<GeoBounds> {
-        self.bounds.clone()
-    }
-}
-
-/// Test inference from Scene Tracker bounds flows to APT.
-#[tokio::test]
-async fn test_inference_updates_apt() {
-    let (apt, _rx) = create_apt();
-
-    // Create inference state (as InferenceAdapter would)
-    let inference_state = create_inference_state(53.5, 10.0);
-    apt.receive_inference(inference_state);
-
-    // Position should be from inference
-    assert!(apt.has_position());
-    assert_eq!(apt.position_source(), Some(PositionSource::SceneInference));
-
-    let (lat, lon) = apt.position().expect("Should have position");
-    assert!((lat - 53.5).abs() < 0.001);
-    assert!((lon - 10.0).abs() < 0.001);
-
-    // Inference has low accuracy (~100km)
-    let status = apt.status();
-    let state = status.state.expect("Should have state");
-    assert_eq!(state.accuracy, PositionAccuracy::SCENE_INFERENCE);
-}
-
-/// Test that telemetry overrides inference (higher accuracy).
-#[tokio::test]
-async fn test_telemetry_overrides_inference() {
-    let (apt, _rx) = create_apt();
-
-    // Start with inference (low accuracy)
-    apt.receive_inference(create_inference_state(53.0, 10.0));
-    assert_eq!(apt.position_source(), Some(PositionSource::SceneInference));
-
-    // Receive telemetry (high accuracy)
-    apt.receive_telemetry(create_telemetry_state(53.5, 10.5));
-
-    // Should now use telemetry
-    assert_eq!(apt.position_source(), Some(PositionSource::Telemetry));
-}
-
-/// Test the InferenceAdapter flow with fallback timer.
-#[tokio::test]
-async fn test_inference_adapter_fallback_flow() {
-    // Create mock Scene Tracker with Hamburg bounds
-    let tracker = MockSceneTracker::with_bounds(53.0, 54.0, 9.0, 11.0);
-
-    // Create channel for inference states
-    let (inference_tx, mut inference_rx) = mpsc::channel(16);
-
-    // Create and start InferenceAdapter with short fallback interval for testing
-    let config = InferenceAdapterConfig {
-        fallback_interval: Duration::from_millis(100),
-    };
-    let adapter = InferenceAdapter::with_config(tracker, inference_tx, config);
-    let handle = adapter.start();
-
-    // Should receive inferred position from fallback timer
-    match tokio::time::timeout(Duration::from_millis(500), inference_rx.recv()).await {
-        Ok(Some(state)) => {
-            assert_eq!(state.source, PositionSource::SceneInference);
-            // Center of bounds: (53.5, 10.0)
-            assert!((state.latitude - 53.5).abs() < 0.01);
-            assert!((state.longitude - 10.0).abs() < 0.01);
-        }
-        Ok(None) => panic!("Channel closed unexpectedly"),
-        Err(_) => panic!("Timeout waiting for inference"),
-    }
-
-    // Clean shutdown
-    handle.abort();
-    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
-}
-
-// ============================================================================
 // Source Priority Tests
 // ============================================================================
 
-/// Test the accuracy hierarchy: Telemetry > ManualReference > Inference.
+/// Test the accuracy hierarchy: Telemetry > ManualReference.
 #[tokio::test]
 async fn test_accuracy_hierarchy() {
     let (apt, _rx) = create_apt();
 
-    // 1. Start with inference (lowest accuracy ~100km)
-    apt.receive_inference(create_inference_state(50.0, 5.0));
-    assert_eq!(apt.position_source(), Some(PositionSource::SceneInference));
-
-    // 2. Manual reference beats inference (~100m < ~100km)
+    // 1. Start with a manual reference (~100m)
     apt.receive_manual_reference(51.0, 6.0);
     assert_eq!(apt.position_source(), Some(PositionSource::ManualReference));
 
-    // 3. Telemetry beats manual reference (~10m < ~100m)
+    // 2. Telemetry beats manual reference (~10m < ~100m)
     apt.receive_telemetry(create_telemetry_state(52.0, 7.0));
     assert_eq!(apt.position_source(), Some(PositionSource::Telemetry));
 
-    // 4. Lower accuracy sources rejected while telemetry is fresh
+    // 3. Lower accuracy sources rejected while telemetry is fresh
     apt.receive_manual_reference(53.0, 8.0);
     assert_eq!(
         apt.position_source(),
         Some(PositionSource::Telemetry),
         "Manual reference should not override fresh telemetry"
-    );
-
-    apt.receive_inference(create_inference_state(54.0, 9.0));
-    assert_eq!(
-        apt.position_source(),
-        Some(PositionSource::Telemetry),
-        "Inference should not override fresh telemetry"
     );
 }
 
@@ -396,80 +251,6 @@ async fn test_position_persistence() {
     );
 }
 
-// ============================================================================
-// Full Pipeline Integration Tests
-// ============================================================================
-
-/// Test the complete Scene Tracker → InferenceAdapter → APT → Subscriber pipeline.
-#[tokio::test]
-async fn test_full_pipeline_scene_to_subscriber() {
-    // Create the full pipeline:
-    // Scene Tracker → InferenceAdapter → APT → Subscriber
-
-    // 1. Create Scene Tracker
-    let scene_tracker = Arc::new(DefaultSceneTracker::with_defaults());
-    let (fuse_tx, fuse_rx) = mpsc::unbounded_channel();
-
-    // Start Scene Tracker
-    let scene_tracker_clone = Arc::clone(&scene_tracker);
-    let scene_handle = scene_tracker_clone.start(fuse_rx);
-
-    // 2. Create APT
-    let (apt, _subscriber_rx) = create_apt();
-
-    // 3. Create channel for inference states
-    let (inference_tx, mut inference_rx) = mpsc::channel(16);
-
-    // 4. Create InferenceAdapter with short fallback for testing
-    let config = InferenceAdapterConfig {
-        fallback_interval: Duration::from_millis(100),
-    };
-    let adapter = InferenceAdapter::with_config(
-        Arc::clone(&scene_tracker) as Arc<dyn SceneTracker>,
-        inference_tx,
-        config,
-    );
-    let adapter_handle = adapter.start();
-
-    // 5. Start a bridge task to forward inference to APT
-    let apt_clone = apt.clone();
-    let bridge_handle = tokio::spawn(async move {
-        while let Some(state) = inference_rx.recv().await {
-            apt_clone.receive_inference(state);
-        }
-    });
-
-    // 6. Simulate FUSE tile requests
-    for (row, col) in HAMBURG_TILES {
-        fuse_tx
-            .send(FuseAccessEvent::new(DdsTileCoord::new(*row, *col, 18)))
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-
-    // 7. Wait for inference fallback timer to fire and propagate
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // 8. Verify APT received the inference
-    // Note: Position may or may not be set depending on timing, but pipeline should work
-    let status = apt.status();
-    if status.state.is_some() {
-        assert_eq!(
-            apt.position_source(),
-            Some(PositionSource::SceneInference),
-            "Position should be from inference"
-        );
-    }
-
-    // 9. Clean shutdown
-    drop(fuse_tx);
-    let _ = tokio::time::timeout(Duration::from_secs(1), scene_handle).await;
-    adapter_handle.abort();
-    let _ = tokio::time::timeout(Duration::from_secs(1), adapter_handle).await;
-    drop(apt); // This closes inference_rx
-    let _ = tokio::time::timeout(Duration::from_secs(1), bridge_handle).await;
-}
-
 /// Test that multiple data sources can coexist and the best one is used.
 #[tokio::test]
 async fn test_multi_source_coexistence() {
@@ -480,15 +261,7 @@ async fn test_multi_source_coexistence() {
     apt.receive_manual_reference(TOULOUSE_LAT, TOULOUSE_LON);
     assert_eq!(apt.position_source(), Some(PositionSource::ManualReference));
 
-    // 2. Scene loads, inference kicks in (but manual reference is better)
-    apt.receive_inference(create_inference_state(43.0, 1.0));
-    assert_eq!(
-        apt.position_source(),
-        Some(PositionSource::ManualReference),
-        "Manual reference should beat inference"
-    );
-
-    // 3. X-Plane starts sending telemetry (best accuracy)
+    // 2. X-Plane starts sending telemetry (best accuracy)
     apt.receive_telemetry(create_telemetry_state(43.631, 1.365));
     assert_eq!(
         apt.position_source(),

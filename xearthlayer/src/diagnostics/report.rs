@@ -74,11 +74,11 @@ pub struct DiskInfo {
     /// Bytes available on the filesystem holding the cache directory.
     pub cache_dir_available: Option<String>,
     /// Resolved package install location (`packages.install_location`
-    /// from config, or the default `~/.xearthlayer/packages`).
+    /// from config, or [`crate::paths::packages_dir`] when unset).
     pub install_location_path: Option<String>,
     /// Bytes available on the filesystem holding the install location.
     pub install_location_available: Option<String>,
-    /// Whether the config directory (`~/.xearthlayer`) exists.
+    /// Whether [`crate::paths::config_dir`] exists.
     pub config_exists: bool,
 }
 
@@ -110,6 +110,33 @@ impl SystemReport {
     }
 }
 
+/// Run a command and return its trimmed stdout, or `None` on failure / empty.
+///
+/// Used by the macOS collectors, which read hardware/OS facts from `sysctl`,
+/// `sw_vers`, and `route` rather than the Linux `/proc` and `/etc` files.
+#[cfg(target_os = "macos")]
+fn command_output(cmd: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(cmd).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let trimmed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+/// Extract the interface name from `route -n get default` output.
+///
+/// Pure function (no I/O) so the parsing is unit-testable. The relevant line
+/// looks like `  interface: en0`.
+#[cfg(target_os = "macos")]
+fn parse_default_interface(route_output: &str) -> Option<String> {
+    route_output.lines().find_map(|line| {
+        line.split_once(':')
+            .filter(|(key, _)| key.trim() == "interface")
+            .map(|(_, value)| value.trim().to_string())
+    })
+}
+
 impl OsInfo {
     fn collect() -> Self {
         let mut info = Self::default();
@@ -135,6 +162,17 @@ impl OsInfo {
             }
         }
 
+        // macOS has no /etc/os-release; assemble the name from sw_vers.
+        #[cfg(target_os = "macos")]
+        if info.os_name.is_none() {
+            if let (Some(name), Some(version)) = (
+                command_output("sw_vers", &["-productName"]),
+                command_output("sw_vers", &["-productVersion"]),
+            ) {
+                info.os_name = Some(format!("{} {}", name, version));
+            }
+        }
+
         // Desktop environment
         if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
             info.desktop = Some(desktop);
@@ -154,6 +192,17 @@ impl OsInfo {
 impl HardwareInfo {
     fn collect() -> Self {
         let mut info = Self::default();
+
+        // macOS has no /proc; read CPU/memory facts from sysctl.
+        #[cfg(target_os = "macos")]
+        {
+            info.cpu_model = command_output("sysctl", &["-n", "machdep.cpu.brand_string"]);
+            info.cpu_cores =
+                command_output("sysctl", &["-n", "hw.logicalcpu"]).and_then(|s| s.parse().ok());
+            info.memory_gb = command_output("sysctl", &["-n", "hw.memsize"])
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|bytes| bytes as f64 / 1024.0 / 1024.0 / 1024.0);
+        }
 
         // CPU info
         if let Ok(content) = fs::read_to_string("/proc/cpuinfo") {
@@ -254,8 +303,8 @@ impl DiskInfo {
 
     /// Collect disk info using the provided config. The cache directory
     /// and package install location are read from the config (with the
-    /// install location falling back to `~/.xearthlayer/packages` when
-    /// unset, matching the rest of the CLI).
+    /// install location falling back to [`crate::paths::packages_dir`]
+    /// when unset, matching the rest of the CLI).
     fn from_config(config: &crate::config::ConfigFile) -> Self {
         let mut info = Self::default();
 
@@ -297,7 +346,7 @@ impl DiskInfo {
         }
 
         // Package install location: same priority as the CLI
-        // (config value > ~/.xearthlayer/packages).
+        // (config value > paths::packages_dir()).
         let install_location = config
             .packages
             .install_location
@@ -310,7 +359,7 @@ impl DiskInfo {
         }
 
         // Config directory existence (independent of cache/install paths).
-        let config_dir = dirs::home_dir().unwrap_or_default().join(".xearthlayer");
+        let config_dir = crate::paths::config_dir();
         info.config_exists = config_dir.exists();
 
         info
@@ -336,10 +385,7 @@ fn cache_dir_for_statvfs(path: &Path) -> &Path {
 /// Default package install location when `packages.install_location`
 /// is unset, mirroring the priority used by the packages CLI subcommands.
 fn default_install_location() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".xearthlayer")
-        .join("packages")
+    crate::paths::packages_dir()
 }
 
 impl NetworkInfo {
@@ -363,21 +409,33 @@ impl NetworkInfo {
             }
         }
 
+        // macOS has no `ip`; ask the BSD routing table for the default route.
+        #[cfg(target_os = "macos")]
+        if info.default_interface.is_none() {
+            if let Some(out) = command_output("route", &["-n", "get", "default"]) {
+                info.default_interface = parse_default_interface(&out);
+            }
+        }
+
         info
     }
 }
 
 impl ConfigInfo {
+    /// Report the configuration file that is actually in use, as resolved by
+    /// [`crate::paths::config_file`].
     fn collect() -> Self {
-        let mut info = Self::default();
+        Self::from_path(&crate::paths::config_file())
+    }
 
-        let home = dirs::home_dir().unwrap_or_default();
-        let config_path = home.join(".xearthlayer/config.ini");
+    /// Read `config_path`, redacting secrets. Absent file means empty report.
+    fn from_path(config_path: &Path) -> Self {
+        let mut info = Self::default();
 
         if config_path.exists() {
             info.config_path = Some(config_path.display().to_string());
 
-            if let Ok(content) = fs::read_to_string(&config_path) {
+            if let Ok(content) = fs::read_to_string(config_path) {
                 info.config_contents = Some(redact_sensitive_ini(&content));
             }
         }
@@ -685,6 +743,39 @@ impl fmt::Display for SystemReport {
     }
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+
+    #[test]
+    fn parse_default_interface_extracts_iface() {
+        let out = "   route to: default\n  destination: default\n  interface: en0\n        flags: <UP,GATEWAY>\n";
+        assert_eq!(parse_default_interface(out).as_deref(), Some("en0"));
+    }
+
+    #[test]
+    fn parse_default_interface_handles_missing() {
+        assert_eq!(parse_default_interface(""), None);
+        assert_eq!(parse_default_interface("no interface here\n"), None);
+    }
+
+    #[test]
+    fn hardware_collect_populates_on_macos() {
+        // Exercises the sysctl path end to end; every Mac has a CPU model,
+        // logical cores, and RAM, so none of these should be None.
+        let info = HardwareInfo::collect();
+        assert!(info.cpu_model.is_some(), "cpu_model should be detected");
+        assert!(info.cpu_cores.is_some(), "cpu_cores should be detected");
+        assert!(info.memory_gb.is_some(), "memory_gb should be detected");
+    }
+
+    #[test]
+    fn os_collect_populates_name_on_macos() {
+        let info = OsInfo::collect();
+        assert!(info.os_name.is_some(), "os_name should be set via sw_vers");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,6 +790,40 @@ mod tests {
         config.cache.directory = cache_dir;
         config.packages.install_location = Some(install_location);
         config
+    }
+
+    /// Regression (diagnostics reported the pre-0.5.0 file): the report must
+    /// read whatever `paths::config_file()` resolves to, not a path built from
+    /// the home directory. Reading a stale `~/.xearthlayer/config.ini` makes
+    /// every bug report show a configuration that is no longer in use.
+    #[test]
+    fn config_info_reads_the_file_it_is_given() {
+        let temp = TempDir::new().unwrap();
+        let base = crate::paths::testing::TestDirectories::rooted_at(temp.path());
+        let config_path = crate::paths::config_file_in(&base);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "[provider]\ntype = apple\n").unwrap();
+
+        let info = ConfigInfo::from_path(&config_path);
+
+        assert_eq!(
+            info.config_path.as_deref(),
+            Some(config_path.display().to_string().as_str())
+        );
+        assert!(info
+            .config_contents
+            .as_deref()
+            .unwrap()
+            .contains("type = apple"));
+    }
+
+    #[test]
+    fn config_info_is_empty_when_the_file_does_not_exist() {
+        let temp = TempDir::new().unwrap();
+        let info = ConfigInfo::from_path(&temp.path().join("absent/config.ini"));
+
+        assert!(info.config_path.is_none());
+        assert!(info.config_contents.is_none());
     }
 
     #[test]
@@ -784,7 +909,7 @@ mod tests {
         assert_eq!(
             info.install_location_path.as_deref(),
             Some(expected.display().to_string().as_str()),
-            "must fall back to ~/.xearthlayer/packages when install_location is unset"
+            "must fall back to the resolver's packages directory when install_location is unset"
         );
     }
 

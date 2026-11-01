@@ -1,7 +1,6 @@
 //! Dashboard section rendering.
 //!
 //! This module contains rendering functions for specific dashboard sections:
-//! - Aircraft position / prefetch status
 //! - Control plane metrics
 //!
 //! Note: Some functions here are legacy (v0.2.x) and kept for reference.
@@ -15,7 +14,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use xearthlayer::prefetch::{GpsStatus, PrefetchMode, PrefetchStatusSnapshot};
 use xearthlayer::runtime::HealthSnapshot;
 
 use super::state::JobRates;
@@ -54,115 +52,6 @@ pub fn render_control_plane(
         let paragraph = Paragraph::new(text);
         frame.render_widget(paragraph, inner);
     }
-}
-
-/// Render the aircraft position section.
-pub fn render_prefetch(frame: &mut Frame, area: Rect, prefetch: &PrefetchStatusSnapshot) {
-    let prefetch_block = Block::default()
-        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            " Aircraft Position ",
-            Style::default().fg(Color::Magenta),
-        ));
-
-    frame.render_widget(prefetch_block, area);
-    let inner = inner_rect(area, 1, 1);
-
-    // GPS Status line with colored indicator
-    let (gps_indicator, gps_text, gps_color) = match prefetch.gps_status {
-        GpsStatus::Connected => ("●", "Connected", Color::Green),
-        GpsStatus::Acquiring => ("●", "Acquiring...", Color::Yellow),
-        GpsStatus::Inferred => ("●", "Inferred", Color::Red),
-    };
-
-    let gps_line = Line::from(vec![
-        Span::styled("GPS Status: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!("{} ", gps_indicator),
-            Style::default().fg(gps_color),
-        ),
-        Span::styled(gps_text, Style::default().fg(gps_color)),
-    ]);
-
-    // Position line
-    let position_line = if prefetch.aircraft.is_some() {
-        Line::from(vec![
-            Span::styled("Position:   ", Style::default().fg(Color::DarkGray)),
-            Span::styled(prefetch.aircraft_line(), Style::default().fg(Color::Green)),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("Position:   ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "Waiting for X-Plane telemetry...",
-                Style::default().fg(Color::Yellow),
-            ),
-        ])
-    };
-
-    // Prefetch mode line
-    let mode_color = match prefetch.prefetch_mode {
-        PrefetchMode::Telemetry => Color::Green,
-        PrefetchMode::FuseInference => Color::Yellow,
-        PrefetchMode::Radial => Color::Cyan,
-        PrefetchMode::TileBased => Color::Blue, // DSF tile-aligned prefetch
-        PrefetchMode::Idle => Color::DarkGray,
-        PrefetchMode::CircuitOpen => Color::Magenta, // Paused due to high X-Plane load
-    };
-
-    // Build the prefetch line with detailed stats if available
-    let prefetch_line = if let Some(ref stats) = prefetch.detailed_stats {
-        // Format: "Prefetch: ● Mode | 45/cyc | ↑120 ⊘5"
-        let activity_indicator = if stats.is_active { "●" } else { "○" };
-        let activity_color = if stats.is_active {
-            Color::Green
-        } else {
-            Color::DarkGray
-        };
-
-        Line::from(vec![
-            Span::styled("Prefetch:   ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{} ", activity_indicator),
-                Style::default().fg(activity_color),
-            ),
-            Span::styled(
-                format!("{}", prefetch.prefetch_mode),
-                Style::default().fg(mode_color),
-            ),
-            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}/cyc", stats.tiles_submitted_last_cycle),
-                Style::default().fg(Color::White),
-            ),
-            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
-            Span::styled("↑", Style::default().fg(Color::Green)),
-            Span::styled(
-                format!("{}", stats.cache_hits),
-                Style::default().fg(Color::Green),
-            ),
-            Span::styled(" ", Style::default()),
-            Span::styled("⊘", Style::default().fg(Color::Yellow)),
-            Span::styled(
-                format!("{}", stats.ttl_skipped),
-                Style::default().fg(Color::Yellow),
-            ),
-        ])
-    } else {
-        // Fallback to simple display when no detailed stats
-        Line::from(vec![
-            Span::styled("Prefetch:   ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}", prefetch.prefetch_mode),
-                Style::default().fg(mode_color),
-            ),
-        ])
-    };
-
-    let text = vec![gps_line, position_line, prefetch_line];
-    let paragraph = Paragraph::new(text);
-    frame.render_widget(paragraph, inner);
 }
 
 /// Calculate inner rect with margins.

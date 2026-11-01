@@ -25,6 +25,12 @@ help: ## Show this help message
 	@echo '$(BLUE)XEarthLayer - Available Make Targets$(NC)'
 	@echo ''
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make $(BLUE)<target>$(NC)\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  $(BLUE)%-20s$(NC) %s\n", $$1, $$2 } /^##@/ { printf "\n$(YELLOW)%s$(NC)\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+	@# Per-binary targets are generated from $(BINARIES), so they are listed
+	@# from it too rather than from a comment that could drift.
+	@printf "\n$(YELLOW)Per-binary (one of: $(BINARIES))$(NC)\n"
+	@printf "  $(BLUE)%-20s$(NC) %s\n" "release-<binary>" "Build one binary in release mode"
+	@printf "  $(BLUE)%-20s$(NC) %s\n" "install-<binary>" "Install one binary to $(BINDIR)"
+	@printf "  $(BLUE)%-20s$(NC) %s\n" "uninstall-<binary>" "Remove one binary from $(BINDIR)"
 
 ##@ Development
 
@@ -97,7 +103,7 @@ debug-run: debug-build ## Run release with debug map server
 	$(CARGO) run --release --features debug-map $(CARGO_FLAGS) -- run
 
 .PHONY: install-profiling
-install-profiling: release-profiling ## Install binary with profiling support to $(BINDIR)
+install-profiling: release-profiling ## Install runtime binary with profiling support to $(BINDIR)
 	@echo "$(BLUE)Installing xearthlayer (profiling) to $(BINDIR)...$(NC)"
 	@mkdir -p "$(BINDIR)"
 	@cp target/release/xearthlayer "$(BINDIR)/"
@@ -205,8 +211,27 @@ lint-fix: ## Run clippy and automatically fix issues
 	$(CARGO) clippy $(CARGO_FLAGS) --fix --allow-dirty --allow-staged
 
 .PHONY: verify
-verify: format-check lint test-strict ## Run all verification checks (format, lint, test)
+verify: format-check lint test-strict test-scripts ## Run all verification checks (format, lint, test)
 	@echo "$(GREEN)All verification checks passed!$(NC)"
+
+.PHONY: test-scripts
+test-scripts: ## Run the release script tests (bash, against fake macOS tools)
+	@echo "$(BLUE)Running release script tests...$(NC)"
+	@scripts/macos/tests/run.sh
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck -x scripts/macos/*.sh scripts/macos/tests/*.sh scripts/macos/tests/fakes/fake-tool; \
+	else echo "$(YELLOW)shellcheck not installed; skipped$(NC)"; fi
+
+.PHONY: verify-macos
+verify-macos: ## Full macOS verification: verify + live macFUSE smoke tests (macOS only)
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+		echo "$(RED)Error: verify-macos must be run on macOS$(NC)"; exit 1; fi
+	@if [ ! -d /Library/Filesystems/macfuse.fs ]; then \
+		echo "$(RED)Error: macFUSE not installed. See docs/macos.md$(NC)"; exit 1; fi
+	@$(MAKE) verify
+	@echo "$(BLUE)Running macFUSE smoke tests...$(NC)"
+	RUST_BACKTRACE=$(RUST_BACKTRACE) RUSTFLAGS="$(STRICT_RUSTFLAGS)" $(CARGO) test -p xearthlayer --test macfuse_smoke -- --ignored --nocapture
+	@echo "$(GREEN)macOS verification complete!$(NC)"
 
 .PHONY: pre-commit
 pre-commit: verify ## Run pre-commit checks (format-check + lint + test)
@@ -276,13 +301,41 @@ ci-full: verify coverage-check audit deps-check ## Run comprehensive CI checks
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
+# Every binary the workspace produces, and the crate that builds each one.
+# The per-binary release, install and uninstall targets below are generated
+# from this list, and `install`/`uninstall` walk it, so a new binary (the
+# daemon and TUI are coming in 0.5.0) is one line here and one CRATE_ entry.
+BINARIES := xearthlayer xearthlayer-publish
+CRATE_xearthlayer := xearthlayer-cli
+CRATE_xearthlayer-publish := xearthlayer-publish
+
+# release-<binary>, install-<binary>, uninstall-<binary>
+define BINARY_TARGETS
+.PHONY: release-$(1) install-$(1) uninstall-$(1)
+release-$(1):
+	@echo "$(BLUE)Building $(1) (release)...$(NC)"
+	$$(CARGO) build --release -p $$(CRATE_$(1)) $$(CARGO_FLAGS)
+
+install-$(1): release-$(1)
+	@echo "$(BLUE)Installing $(1) to $$(BINDIR)...$(NC)"
+	@mkdir -p "$$(BINDIR)"
+	@cp "target/release/$(1)" "$$(BINDIR)/"
+	@chmod 755 "$$(BINDIR)/$(1)"
+	@echo "$(GREEN)Installed: $$(BINDIR)/$(1)$(NC)"
+
+uninstall-$(1):
+	@if [ -f "$$(BINDIR)/$(1)" ]; then \
+		rm "$$(BINDIR)/$(1)"; \
+		echo "$(GREEN)Uninstalled: $$(BINDIR)/$(1)$(NC)"; \
+	else \
+		echo "$(YELLOW)Not found: $$(BINDIR)/$(1)$(NC)"; \
+	fi
+endef
+$(foreach bin,$(BINARIES),$(eval $(call BINARY_TARGETS,$(bin))))
+
 .PHONY: install
-install: release ## Install binary to $(BINDIR)
-	@echo "$(BLUE)Installing xearthlayer to $(BINDIR)...$(NC)"
-	@mkdir -p "$(BINDIR)"
-	@cp target/release/xearthlayer "$(BINDIR)/"
-	@chmod 755 "$(BINDIR)/xearthlayer"
-	@echo "$(GREEN)Installed: $(BINDIR)/xearthlayer$(NC)"
+install: $(addprefix install-,$(BINARIES)) ## Install every binary to $(BINDIR)
+	@echo "$(GREEN)Installed all binaries: $(BINARIES)$(NC)"
 	@if ! echo "$$PATH" | tr ':' '\n' | grep -qx "$(BINDIR)"; then \
 		echo ""; \
 		echo "$(YELLOW)Note: $(BINDIR) may not be in your PATH$(NC)"; \
@@ -296,14 +349,8 @@ setup: build ## Run the interactive setup wizard
 	@./target/debug/xearthlayer setup
 
 .PHONY: uninstall
-uninstall: ## Remove installed binary from $(BINDIR)
-	@echo "$(BLUE)Uninstalling xearthlayer from $(BINDIR)...$(NC)"
-	@if [ -f "$(BINDIR)/xearthlayer" ]; then \
-		rm "$(BINDIR)/xearthlayer"; \
-		echo "$(GREEN)Uninstalled: $(BINDIR)/xearthlayer$(NC)"; \
-	else \
-		echo "$(YELLOW)Not found: $(BINDIR)/xearthlayer$(NC)"; \
-	fi
+uninstall: $(addprefix uninstall-,$(BINARIES)) ## Remove every installed binary from $(BINDIR)
+	@echo "$(GREEN)Uninstall complete: $(BINARIES)$(NC)"
 
 ##@ Packaging
 
@@ -314,11 +361,12 @@ AUR_DIR := pkg/aur
 AUR_REPO := ssh://aur@aur.archlinux.org/$(PKG_NAME).git
 
 .PHONY: pkg-deb
-pkg-deb: release ## Build Debian package (.deb)
-	@echo "$(BLUE)Building Debian package...$(NC)"
+pkg-deb: release ## Build Debian packages (.deb) for the runtime and the publisher
+	@echo "$(BLUE)Building Debian packages...$(NC)"
 	@command -v cargo-deb >/dev/null 2>&1 || { echo "$(YELLOW)Installing cargo-deb...$(NC)"; cargo install cargo-deb; }
 	cd xearthlayer-cli && $(CARGO) deb --no-build
-	@echo "$(GREEN)Debian package built: target/debian/$(PKG_NAME)_$(PKG_VERSION)-1_amd64.deb$(NC)"
+	cd xearthlayer-publish && $(CARGO) deb --no-build
+	@echo "$(GREEN)Debian packages built: target/debian/$(PKG_NAME)_$(PKG_VERSION)-1_amd64.deb, target/debian/$(PKG_NAME)-publish_$(PKG_VERSION)-1_amd64.deb$(NC)"
 
 .PHONY: pkg-rpm
 pkg-rpm: release ## Build RPM package (.rpm) - requires rpmbuild
@@ -334,14 +382,35 @@ pkg-rpm: release ## Build RPM package (.rpm) - requires rpmbuild
 	@echo "$(GREEN)RPM package built in ~/rpmbuild/RPMS/$(NC)"
 
 .PHONY: pkg-tarball
-pkg-tarball: release ## Build release tarball
-	@echo "$(BLUE)Building release tarball...$(NC)"
+pkg-tarball: release ## Build release tarballs: the runtime and, separately, the publisher
+	@echo "$(BLUE)Building release tarballs...$(NC)"
 	@mkdir -p dist
-	@cp target/release/xearthlayer dist/
-	@cp README.md LICENSE dist/
+	@cp target/release/xearthlayer README.md LICENSE dist/
 	@cd dist && tar czvf $(PKG_NAME)-$(PKG_VERSION)-x86_64-linux.tar.gz xearthlayer README.md LICENSE
-	@rm dist/xearthlayer dist/README.md dist/LICENSE
-	@echo "$(GREEN)Tarball built: dist/$(PKG_NAME)-$(PKG_VERSION)-x86_64-linux.tar.gz$(NC)"
+	@rm dist/xearthlayer dist/README.md
+	@# The publisher ships alone so that a flight simulator user downloads a
+	@# streaming service and a publisher downloads publishing tools (#284).
+	@cp target/release/xearthlayer-publish docs/content-publishing.md dist/
+	@cd dist && tar czvf $(PKG_NAME)-publish-$(PKG_VERSION)-x86_64-linux.tar.gz xearthlayer-publish content-publishing.md LICENSE
+	@rm dist/xearthlayer-publish dist/content-publishing.md dist/LICENSE
+	@echo "$(GREEN)Tarballs built: dist/$(PKG_NAME)-$(PKG_VERSION)-x86_64-linux.tar.gz, dist/$(PKG_NAME)-publish-$(PKG_VERSION)-x86_64-linux.tar.gz$(NC)"
+
+.PHONY: sign-macos
+sign-macos: ## Sign and notarize the release binaries with the Developer ID in the keychain (macOS only)
+	@if [ "$$(uname)" != "Darwin" ]; then echo "$(RED)Error: sign-macos must be run on macOS$(NC)"; exit 1; fi
+	@# Notary credentials come from MACOS_NOTARY_PROFILE (xcrun notarytool
+	@# store-credentials) or MACOS_NOTARY_KEY/_KEY_ID/_ISSUER_ID; see docs/dev/macos-signing-runbook.md.
+	@scripts/macos/sign-and-notarize.sh target/release/xearthlayer target/release/xearthlayer-publish
+
+.PHONY: pkg-macos
+pkg-macos: ## Build signed, notarized installer packages from the signed release binaries (macOS only)
+	@if [ "$$(uname)" != "Darwin" ]; then echo "$(RED)Error: pkg-macos must be run on macOS$(NC)"; exit 1; fi
+	@# Run `make sign-macos` first: the packages carry the binaries as they are.
+	@mkdir -p dist
+	@for p in xearthlayer xearthlayer-publish; do \
+		scripts/macos/build-pkg.sh $$p target/release/$$p $(PKG_VERSION) dist/$$p-v$(PKG_VERSION)-arm64-macos.pkg || exit 1; \
+	done
+	@echo "$(GREEN)Packages built: dist/xearthlayer-v$(PKG_VERSION)-arm64-macos.pkg, dist/xearthlayer-publish-v$(PKG_VERSION)-arm64-macos.pkg$(NC)"
 
 .PHONY: aur-prepare
 aur-prepare: ## Prepare AUR package for a tagged release (TAG=v0.2.0)
@@ -434,33 +503,53 @@ pkg-all: pkg-deb pkg-tarball ## Build all packages (deb + tarball)
 version: ## Show current version
 	@echo "$(BLUE)Current version:$(NC) $(PKG_VERSION)"
 
+# Pre-release suffix (e.g. `-dev.0`) stripped for RPM and PKGBUILD, whose version
+# fields cannot represent it: RPM uses `-` to delimit Version from Release, and
+# Arch `pkgver` forbids hyphens. This is the same constraint that makes
+# release.yml gate .deb/.rpm/AUR to stable tags. For a stable VERSION the two
+# forms are identical, so this is a no-op on the stable path.
+BASE_VERSION = $(firstword $(subst -, ,$(VERSION)))
+
 .PHONY: bump-version
-bump-version: ## Bump version across all files (VERSION=x.y.z, STABLE ONLY)
-	@if [ -z "$(VERSION)" ]; then echo "$(RED)Error: VERSION is required. Usage: make bump-version VERSION=0.3.0$(NC)"; exit 1; fi
-	@# RPM forbids '-' in a Version: field (it separates Version from Release), so a
-	@# pre-release identifier would commit an invalid spec. The RPM job is skipped for
-	@# pre-releases, so this fails later — on the next stable build — not now.
-	@case "$(VERSION)" in *-*) \
-		echo "$(RED)Error: '$(VERSION)' is a pre-release identifier.$(NC)"; \
-		echo "$(YELLOW)This target also rewrites pkg/rpm/xearthlayer.spec, and RPM forbids '-' in Version:.$(NC)"; \
-		echo "$(YELLOW)Edit the version in Cargo.toml directly, then run: cargo update -w$(NC)"; \
-		exit 1;; esac
-	@echo "$(BLUE)Bumping version to $(VERSION)...$(NC)"
-	@# Update workspace Cargo.toml
-	@sed -i 's/^version = ".*"/version = "$(VERSION)"/' Cargo.toml
-	@# Update RPM spec file
-	@sed -i 's/^Version:.*/Version:        $(VERSION)/' pkg/rpm/xearthlayer.spec
-	@# Update the Arch PKGBUILD. Omitting this shipped an AUR package at the
-	@# previous version; tests/packaging_metadata.rs guards it, but the guard
-	@# should never be what finds it.
-	@sed -i 's/^pkgver=.*/pkgver=$(VERSION)/' pkg/arch/PKGBUILD
+bump-version: ## Bump version across all files (VERSION=x.y.z or x.y.z-dev.N)
+	@if [ -z "$(VERSION)" ]; then echo "$(RED)Error: VERSION is required. Usage: make bump-version VERSION=0.5.0-dev.1$(NC)"; exit 1; fi
+	@command -v jq >/dev/null 2>&1 || { echo "$(RED)Error: jq not found. Install jq to update version.json$(NC)"; exit 1; }
+	@# Validate the Fedora tag BEFORE writing anything — a mid-recipe abort would
+	@# leave a half-bumped tree, which is the drift this target exists to prevent.
+	@FC=$$(jq -r '.assets.rpm.filename' version.json | sed -E 's/.*\.(fc[0-9]+)\..*/\1/'); \
+		case "$$FC" in fc[0-9]*) ;; *) echo "$(RED)Error: could not read Fedora tag (fcNN) from version.json .assets.rpm.filename$(NC)"; exit 1;; esac
+	@echo "$(BLUE)Bumping version to $(VERSION) (packaging base: $(BASE_VERSION))...$(NC)"
+	@# Workspace Cargo.toml — full semver.
+	@# `cat tmp > file` rather than in-place sed: portable across GNU and BSD sed,
+	@# and preserves the original file's inode and permissions.
+	@sed 's/^version = ".*"/version = "$(VERSION)"/' Cargo.toml > Cargo.toml.tmp \
+		&& cat Cargo.toml.tmp > Cargo.toml && rm -f Cargo.toml.tmp
+	@# RPM spec — base version only.
+	@sed 's/^Version:.*/Version:        $(BASE_VERSION)/' pkg/rpm/xearthlayer.spec > pkg/rpm/xearthlayer.spec.tmp \
+		&& cat pkg/rpm/xearthlayer.spec.tmp > pkg/rpm/xearthlayer.spec && rm -f pkg/rpm/xearthlayer.spec.tmp
+	@# Arch PKGBUILD — base version only.
+	@sed 's/^pkgver=.*/pkgver=$(BASE_VERSION)/' pkg/arch/PKGBUILD > pkg/arch/PKGBUILD.tmp \
+		&& cat pkg/arch/PKGBUILD.tmp > pkg/arch/PKGBUILD && rm -f pkg/arch/PKGBUILD.tmp
+	@# version.json — full semver. The Fedora tag (fcNN) in the RPM filename is
+	@# read back from the current value rather than hardcoded: it drifts when CI's
+	@# Fedora base image upgrades, and the runbook has a reconciliation step for it.
+	@# Already validated above, before any file was written; re-extract here since
+	@# each recipe line runs in its own shell.
+	@FC=$$(jq -r '.assets.rpm.filename' version.json | sed -E 's/.*\.(fc[0-9]+)\..*/\1/'); \
+		jq --arg v "$(VERSION)" --arg fc "$$FC" \
+			'.version = $$v | .tag = "v" + $$v | .download_base_url = "https://github.com/samsoir/xearthlayer/releases/download/v" + $$v | .assets.deb.filename = "xearthlayer_" + $$v + "-1_amd64.deb" | .assets.rpm.filename = "xearthlayer-" + $$v + "-1." + $$fc + ".x86_64.rpm" | .assets.tarball.filename = "xearthlayer-v" + $$v + "-x86_64-linux.tar.gz" | .assets.macos_tarball = {filename: ("xearthlayer-v" + $$v + "-arm64-macos.tar.gz"), description: "macOS (Apple Silicon) binary tarball"} | .assets.macos_pkg = {filename: ("xearthlayer-v" + $$v + "-arm64-macos.pkg"), description: "macOS (Apple Silicon) installer package"} | .assets.publish_deb = {filename: ("xearthlayer-publish_" + $$v + "-1_amd64.deb"), description: "Publishing tools, Debian/Ubuntu package"} | .assets.publish_rpm = {filename: ("xearthlayer-publish-" + $$v + "-1." + $$fc + ".x86_64.rpm"), description: "Publishing tools, Fedora/RHEL package"} | .assets.publish_tarball = {filename: ("xearthlayer-publish-v" + $$v + "-x86_64-linux.tar.gz"), description: "Publishing tools, Linux binary tarball"} | .assets.publish_macos_tarball = {filename: ("xearthlayer-publish-v" + $$v + "-arm64-macos.tar.gz"), description: "Publishing tools, macOS (Apple Silicon) binary tarball"} | .assets.publish_macos_pkg = {filename: ("xearthlayer-publish-v" + $$v + "-arm64-macos.pkg"), description: "Publishing tools, macOS (Apple Silicon) installer package"}' \
+			version.json > version.json.tmp \
+		&& cat version.json.tmp > version.json && rm -f version.json.tmp
+	@# Cargo.lock — refresh the two workspace member entries.
+	@$(CARGO) update --workspace --offline >/dev/null
 	@echo "$(GREEN)Version bumped to $(VERSION)$(NC)"
 	@echo ""
 	@echo "$(YELLOW)Next steps:$(NC)"
-	@echo "  1. Update CHANGELOG.md with release notes"
-	@echo "  2. Commit: git add -A && git commit -m 'Bump version to $(VERSION)'"
-	@echo "  3. Tag: git tag v$(VERSION)"
-	@echo "  4. Push: git push origin HEAD && git push origin v$(VERSION)"
+	@echo "  1. Update version.json release_date (not automated — see below)"
+	@echo "  2. Update CHANGELOG.md with release notes"
+	@echo "  3. Commit: git add -A && git commit -m 'Bump version to $(VERSION)'"
+	@echo "  4. Tag: git tag v$(VERSION)"
+	@echo "  5. Push: git push origin HEAD && git push origin v$(VERSION)"
 
 .PHONY: release-checklist
 release-checklist: ## Show release checklist

@@ -15,7 +15,7 @@
 //! let handle = PrewarmContext::start(
 //!     "KSFO".to_string(),
 //!     tiles,
-//!     dds_client,
+//!     prefetch_lane,
 //!     memory_cache,
 //!     ortho_index,
 //!     &runtime_handle,
@@ -36,23 +36,26 @@ use std::sync::Arc;
 use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
 use tokio::runtime::Handle;
-use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::coord::TileCoord;
-use crate::executor::{DdsClient, MemoryCache, Priority};
+use crate::executor::MemoryCache;
 use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage};
 use crate::ortho_union::OrthoUnionIndex;
 use crate::prefetch::tile_based::DsfTileCoord;
-use crate::runtime::{JobRequest, RequestOrigin};
+use crate::runtime::{LaneError, LaneOutcome, PrefetchLane};
 
 /// Maximum concurrent tile requests in flight.
 ///
-/// This must be less than the executor's job channel capacity (256 by default)
-/// to prevent job submission failures. We use 128 to leave headroom for FUSE
-/// requests during prewarm.
+/// This must be less than the prefetch lane's job channel capacity so the
+/// window does not routinely meet a full lane. FUSE has its own lane, so it
+/// needs no headroom here.
 const MAX_CONCURRENT: usize = 128;
+
+/// How long to wait before retrying when the lane is full and none of our own
+/// tiles are in flight to free a slot.
+const LANE_FULL_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Authoritative status of the prewarm operation.
 ///
@@ -172,7 +175,7 @@ impl PrewarmHandle {
 /// Runs as a self-driving tokio task. Updates shared status as jobs complete.
 struct PrewarmContext<M: MemoryCache> {
     tiles: Vec<TileCoord>,
-    dds_client: Arc<dyn DdsClient>,
+    lane: Arc<dyn PrefetchLane>,
     memory_cache: Arc<M>,
     ortho_index: Arc<OrthoUnionIndex>,
     geo_index: Option<Arc<GeoIndex>>,
@@ -193,7 +196,7 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
     ///
     /// * `icao` - Airport ICAO code (for display)
     /// * `tiles` - Tiles to prewarm
-    /// * `dds_client` - Client for submitting DDS generation jobs
+    /// * `lane` - Prefetch lane that generates the tiles
     /// * `memory_cache` - Cache to check for already-cached tiles
     /// * `ortho_index` - Index for checking disk-resident tiles (patches, cache)
     /// * `geo_index` - Geospatial index for patched region filtering
@@ -201,7 +204,7 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
     pub fn start(
         icao: String,
         tiles: Vec<TileCoord>,
-        dds_client: Arc<dyn DdsClient>,
+        lane: Arc<dyn PrefetchLane>,
         memory_cache: Arc<M>,
         ortho_index: Arc<OrthoUnionIndex>,
         geo_index: Option<Arc<GeoIndex>>,
@@ -226,7 +229,7 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
 
         let context = Self {
             tiles,
-            dds_client,
+            lane,
             memory_cache,
             ortho_index,
             geo_index,
@@ -318,37 +321,49 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
             return;
         }
 
-        // Step 2: Get sender for job submission
-        let sender = match self.dds_client.sender() {
-            Some(s) => s,
-            None => {
-                warn!("DdsClient does not support async submission");
-                self.mark_all_failed(to_generate.len());
-                return;
-            }
-        };
-
-        // Step 3: Submit initial batch and track completions
+        // Steps 2-4: keep a sliding window of tiles in flight on the lane and
+        // count each outcome as its receipt resolves. `submit_with_receipt`
+        // spawns onto the current runtime, which this task runs on.
         let mut pending = FuturesUnordered::new();
-        let mut tiles_iter = to_generate.into_iter();
+        let mut queue = to_generate.into_iter().peekable();
 
-        // Submit initial batch
-        for tile in tiles_iter.by_ref().take(MAX_CONCURRENT) {
-            if let Some(rx) = self.submit_tile(&sender, tile).await {
-                pending.push(rx);
+        loop {
+            while pending.len() < MAX_CONCURRENT {
+                let Some(&tile) = queue.peek() else { break };
+                match self.lane.submit_with_receipt(tile) {
+                    Ok(receipt) => {
+                        queue.next();
+                        pending.push(receipt.outcome());
+                    }
+                    Err(LaneError::Full) => break,
+                    Err(LaneError::Closed) => {
+                        warn!(?tile, "Prefetch lane closed - failing remaining tiles");
+                        self.mark_all_failed(pending.len() + queue.len());
+                        return;
+                    }
+                }
             }
-        }
 
-        debug!(in_flight = pending.len(), "Initial batch submitted");
+            if pending.is_empty() && queue.peek().is_none() {
+                break;
+            }
 
-        // Step 4: Process completions with sliding window
-        while !pending.is_empty() {
+            // A full lane with nothing of ours in flight has no completion to
+            // wait for, so poll for room instead.
+            let nothing_in_flight = pending.is_empty();
+            let retry = async {
+                if nothing_in_flight {
+                    tokio::time::sleep(LANE_FULL_RETRY).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+
             tokio::select! {
                 biased;
 
-                // Check cancellation first
                 _ = self.cancellation.cancelled() => {
-                    let remaining = pending.len() + tiles_iter.len();
+                    let remaining = pending.len() + queue.len();
                     info!(
                         completed = self.status.lock().completed,
                         remaining,
@@ -358,17 +373,9 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
                     return;
                 }
 
-                // Process next completion
-                Some(result) = pending.next() => {
-                    self.handle_completion(result);
+                Some(outcome) = pending.next() => self.handle_outcome(outcome),
 
-                    // Submit another tile if available
-                    if let Some(tile) = tiles_iter.next() {
-                        if let Some(rx) = self.submit_tile(&sender, tile).await {
-                            pending.push(rx);
-                        }
-                    }
-                }
+                _ = retry => {}
             }
         }
 
@@ -376,48 +383,11 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
         self.mark_complete();
     }
 
-    /// Submit a single tile for generation.
-    async fn submit_tile(
-        &self,
-        sender: &tokio::sync::mpsc::Sender<JobRequest>,
-        tile: TileCoord,
-    ) -> Option<oneshot::Receiver<crate::runtime::DdsResponse>> {
-        let (tx, rx) = oneshot::channel();
-        let request = JobRequest {
-            tile,
-            priority: Priority::PREFETCH,
-            cancellation: self.cancellation.child_token(),
-            response_tx: Some(tx),
-            origin: RequestOrigin::Prewarm,
-        };
-
-        match sender.send(request).await {
-            Ok(()) => Some(rx),
-            Err(_) => {
-                warn!(?tile, "Failed to submit tile - executor may be shutdown");
-                self.increment_failed();
-                None
-            }
-        }
-    }
-
-    /// Handle a completed job.
-    fn handle_completion(
-        &self,
-        result: Result<crate::runtime::DdsResponse, oneshot::error::RecvError>,
-    ) {
-        match result {
-            Ok(response) if response.is_success() => {
-                self.increment_completed();
-            }
-            Ok(_) => {
-                // Response received but indicated failure
-                self.increment_failed();
-            }
-            Err(_) => {
-                // Sender dropped without response (executor crashed/cancelled)
-                self.increment_failed();
-            }
+    /// Count the outcome of one tile.
+    fn handle_outcome(&self, outcome: LaneOutcome) {
+        match outcome {
+            LaneOutcome::Generated | LaneOutcome::AlreadyCached => self.increment_completed(),
+            LaneOutcome::Failed | LaneOutcome::Dropped => self.increment_failed(),
         }
     }
 
@@ -470,7 +440,7 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
         let mut s = self.status.lock();
         s.failed += count;
         s.is_complete = true;
-        warn!(failed = s.failed, "Prewarm failed - no sender available");
+        warn!(failed = s.failed, "Prewarm failed - prefetch lane closed");
     }
 }
 
@@ -483,7 +453,7 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
 ///
 /// * `icao` - Airport ICAO code (for display)
 /// * `tiles` - Tiles to prewarm
-/// * `dds_client` - Client for submitting DDS generation jobs
+/// * `lane` - Prefetch lane that generates the tiles
 /// * `memory_cache` - Cache to check for already-cached tiles
 /// * `ortho_index` - Index for checking disk-resident tiles (patches, cache)
 /// * `geo_index` - Geospatial index for patched region filtering
@@ -491,7 +461,7 @@ impl<M: MemoryCache + Send + Sync + 'static> PrewarmContext<M> {
 pub fn start_prewarm<M: MemoryCache + Send + Sync + 'static>(
     icao: String,
     tiles: Vec<TileCoord>,
-    dds_client: Arc<dyn DdsClient>,
+    lane: Arc<dyn PrefetchLane>,
     memory_cache: Arc<M>,
     ortho_index: Arc<OrthoUnionIndex>,
     geo_index: Option<Arc<GeoIndex>>,
@@ -500,7 +470,7 @@ pub fn start_prewarm<M: MemoryCache + Send + Sync + 'static>(
     PrewarmContext::start(
         icao,
         tiles,
-        dds_client,
+        lane,
         memory_cache,
         ortho_index,
         geo_index,
@@ -673,56 +643,48 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
 
     use crate::ortho_union::{OrthoSource, OrthoUnionIndex};
-    use crate::runtime::DdsResponse;
+    use crate::runtime::LaneReceipt;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
+    use tokio::sync::oneshot;
 
-    /// Mock DdsClient that provides a sender for async job submission.
-    struct TestDdsClient {
-        sender: mpsc::Sender<JobRequest>,
+    /// A submission the test lane received, awaiting the test's answer.
+    struct LaneRequest {
+        tile: TileCoord,
+        response_tx: Option<oneshot::Sender<LaneOutcome>>,
     }
 
-    impl TestDdsClient {
-        fn new() -> (Arc<Self>, mpsc::Receiver<JobRequest>) {
+    /// Mock lane that hands each receipted submission to the test, which
+    /// answers it with an outcome.
+    struct TestLane {
+        sender: mpsc::Sender<LaneRequest>,
+    }
+
+    impl TestLane {
+        fn new() -> (Arc<Self>, mpsc::Receiver<LaneRequest>) {
             let (tx, rx) = mpsc::channel(256);
             (Arc::new(Self { sender: tx }), rx)
         }
     }
 
-    impl DdsClient for TestDdsClient {
-        fn submit(&self, request: JobRequest) -> Result<(), crate::executor::DdsClientError> {
-            self.sender
-                .try_send(request)
-                .map_err(|_| crate::executor::DdsClientError::ChannelFull)
+    impl PrefetchLane for TestLane {
+        fn submit(&self, _tile: TileCoord) -> Result<(), LaneError> {
+            Ok(())
         }
 
-        fn request_dds(
-            &self,
-            tile: TileCoord,
-            _cancellation: CancellationToken,
-        ) -> oneshot::Receiver<DdsResponse> {
+        fn submit_with_receipt(&self, tile: TileCoord) -> Result<LaneReceipt, LaneError> {
             let (tx, rx) = oneshot::channel();
-            drop(tx);
-            let _ = self.sender.try_send(JobRequest::prefetch(tile));
-            rx
+            self.sender
+                .try_send(LaneRequest {
+                    tile,
+                    response_tx: Some(tx),
+                })
+                .map_err(|_| LaneError::Full)?;
+            Ok(LaneReceipt::from_outcome_channel(rx))
         }
 
-        fn request_dds_with_options(
-            &self,
-            tile: TileCoord,
-            _priority: crate::executor::Priority,
-            _origin: RequestOrigin,
-            cancellation: CancellationToken,
-        ) -> oneshot::Receiver<DdsResponse> {
-            self.request_dds(tile, cancellation)
-        }
-
-        fn is_connected(&self) -> bool {
-            true
-        }
-
-        fn sender(&self) -> Option<mpsc::Sender<JobRequest>> {
-            Some(self.sender.clone())
+        fn load(&self) -> f64 {
+            0.0
         }
     }
 
@@ -807,7 +769,7 @@ mod tests {
             }, // chunk (96, 224, 16) — NOT on disk
         ];
 
-        let (client, mut rx) = TestDdsClient::new();
+        let (client, mut rx) = TestLane::new();
         let memory_cache = Arc::new(EmptyMemoryCache);
 
         let handle = start_prewarm(
@@ -827,10 +789,7 @@ mod tests {
                 "Only non-disk tile should be submitted"
             );
             if let Some(tx) = request.response_tx {
-                let _ = tx.send(DdsResponse::success(
-                    vec![0u8; 10].into(),
-                    std::time::Duration::from_millis(1),
-                ));
+                let _ = tx.send(LaneOutcome::Generated);
             }
         }
 
@@ -902,7 +861,7 @@ mod tests {
 
         let tiles = vec![tc_patched, tc_patched2, tc_outside];
 
-        let (client, mut rx) = TestDdsClient::new();
+        let (client, mut rx) = TestLane::new();
         let memory_cache = Arc::new(EmptyMemoryCache);
 
         let handle = start_prewarm(
@@ -922,10 +881,7 @@ mod tests {
                 "Only non-patched tile should be submitted"
             );
             if let Some(tx) = request.response_tx {
-                let _ = tx.send(DdsResponse::success(
-                    vec![0u8; 10].into(),
-                    std::time::Duration::from_millis(1),
-                ));
+                let _ = tx.send(LaneOutcome::Generated);
             }
         }
 
@@ -957,7 +913,7 @@ mod tests {
             },
         ];
 
-        let (client, _rx) = TestDdsClient::new();
+        let (client, _rx) = TestLane::new();
         let memory_cache = Arc::new(EmptyMemoryCache);
 
         let handle = start_prewarm(
@@ -981,5 +937,156 @@ mod tests {
         assert_eq!(status.disk_hits, 2);
         assert_eq!(status.completed, 0, "No tiles should need generation");
         assert_eq!(status.total, 2);
+    }
+
+    fn three_tiles() -> Vec<TileCoord> {
+        (0..3)
+            .map(|col| TileCoord {
+                row: 6,
+                col: 20 + col,
+                zoom: 12,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_counts_each_outcome() {
+        let temp = TempDir::new().unwrap();
+        let (lane, mut rx) = TestLane::new();
+
+        let handle = start_prewarm(
+            "OUT".to_string(),
+            three_tiles(),
+            lane,
+            Arc::new(EmptyMemoryCache),
+            build_test_index(&temp),
+            None,
+            &tokio::runtime::Handle::current(),
+        );
+
+        let answers = [
+            LaneOutcome::Generated,
+            LaneOutcome::AlreadyCached,
+            LaneOutcome::Failed,
+        ];
+        for answer in answers {
+            let request = rx.recv().await.expect("tile submitted");
+            let _ = request.response_tx.unwrap().send(answer);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let status = handle.status();
+        assert!(status.is_complete);
+        assert_eq!(status.completed, 2, "Generated and AlreadyCached count");
+        assert_eq!(status.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_counts_a_dropped_receipt_as_failed() {
+        let temp = TempDir::new().unwrap();
+        let (lane, mut rx) = TestLane::new();
+
+        let handle = start_prewarm(
+            "DROP".to_string(),
+            three_tiles()[..1].to_vec(),
+            lane,
+            Arc::new(EmptyMemoryCache),
+            build_test_index(&temp),
+            None,
+            &tokio::runtime::Handle::current(),
+        );
+
+        drop(rx.recv().await.expect("tile submitted").response_tx);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let status = handle.status();
+        assert!(status.is_complete);
+        assert_eq!(status.failed, 1);
+    }
+
+    /// A lane that is full and holds none of our tiles has no completion to
+    /// wait for; prewarm must poll until room appears, not fail or stall.
+    #[tokio::test]
+    async fn test_prewarm_retries_when_the_lane_is_full() {
+        struct FullThenOpen {
+            refusals: std::sync::atomic::AtomicUsize,
+            inner: TestLane,
+        }
+        impl PrefetchLane for FullThenOpen {
+            fn submit(&self, tile: TileCoord) -> Result<(), LaneError> {
+                self.inner.submit(tile)
+            }
+            fn submit_with_receipt(&self, tile: TileCoord) -> Result<LaneReceipt, LaneError> {
+                use std::sync::atomic::Ordering;
+                if self.refusals.fetch_add(1, Ordering::SeqCst) < 2 {
+                    return Err(LaneError::Full);
+                }
+                self.inner.submit_with_receipt(tile)
+            }
+            fn load(&self) -> f64 {
+                0.0
+            }
+        }
+
+        let temp = TempDir::new().unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let lane = Arc::new(FullThenOpen {
+            refusals: std::sync::atomic::AtomicUsize::new(0),
+            inner: TestLane { sender: tx },
+        });
+
+        let handle = start_prewarm(
+            "FULL".to_string(),
+            three_tiles()[..1].to_vec(),
+            lane,
+            Arc::new(EmptyMemoryCache),
+            build_test_index(&temp),
+            None,
+            &tokio::runtime::Handle::current(),
+        );
+
+        let request = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("tile is resubmitted after the lane frees")
+            .expect("tile submitted");
+        let _ = request.response_tx.unwrap().send(LaneOutcome::Generated);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let status = handle.status();
+        assert!(status.is_complete);
+        assert_eq!(status.completed, 1);
+        assert_eq!(status.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_fails_remaining_tiles_when_the_lane_closes() {
+        struct ClosedLane;
+        impl PrefetchLane for ClosedLane {
+            fn submit(&self, _: TileCoord) -> Result<(), LaneError> {
+                Err(LaneError::Closed)
+            }
+            fn submit_with_receipt(&self, _: TileCoord) -> Result<LaneReceipt, LaneError> {
+                Err(LaneError::Closed)
+            }
+            fn load(&self) -> f64 {
+                0.0
+            }
+        }
+
+        let temp = TempDir::new().unwrap();
+        let handle = start_prewarm(
+            "CLOSED".to_string(),
+            three_tiles(),
+            Arc::new(ClosedLane),
+            Arc::new(EmptyMemoryCache),
+            build_test_index(&temp),
+            None,
+            &tokio::runtime::Handle::current(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let status = handle.status();
+        assert!(status.is_complete);
+        assert_eq!(status.failed, 3);
     }
 }

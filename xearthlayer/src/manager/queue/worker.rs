@@ -1,0 +1,309 @@
+//! The downloader and installer threads.
+
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::Arc;
+
+use xearthlayer_package::PackageMetadata;
+
+use super::job::{Job, JobEvent, JobId, JobOutcome};
+use super::ledger::{Admission, Filesystem};
+use super::stages::{InstallContext, Stages};
+use super::state::{outcome_of, panic_message, Phase, Ready, Shared};
+use crate::manager::cancel::CancelToken;
+use crate::manager::download::DownloadProgressCallback;
+use crate::manager::error::{ManagerError, ManagerResult};
+use crate::manager::installer::InstallStage;
+
+/// Run one `Stages` call. A panic becomes `ManagerError::Panicked`, so it
+/// fails that job and the thread goes on to the next one; whatever payload
+/// the call was given was dropped as it unwound.
+fn guarded<T>(stage: &'static str, call: impl FnOnce() -> ManagerResult<T>) -> ManagerResult<T> {
+    panic::catch_unwind(AssertUnwindSafe(call)).unwrap_or_else(|payload| {
+        Err(ManagerError::Panicked {
+            stage,
+            message: panic_message(payload.as_ref()),
+        })
+    })
+}
+
+pub(super) fn run_downloader<S: Stages>(shared: Arc<Shared<S>>) {
+    sweep(&shared);
+    while let Some((id, metadata, token)) = next_download(&shared) {
+        download_one(&shared, id, &metadata, &token);
+    }
+}
+
+/// Sweep before the first job, then let both threads take jobs. A panic
+/// in the sweep is logged and counts as swept: what it left is swept on the
+/// next start, and the queue must not wait for it forever.
+fn sweep<S: Stages>(shared: &Shared<S>) {
+    if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| shared.stages.sweep())) {
+        tracing::error!(
+            "install queue sweep panicked: {}",
+            panic_message(payload.as_ref())
+        );
+    }
+    let mut state = shared.lock();
+    state.swept = true;
+    shared.changed.notify_all();
+}
+
+fn next_download<S: Stages>(shared: &Shared<S>) -> Option<(JobId, PackageMetadata, CancelToken)> {
+    let mut state = shared.lock();
+    loop {
+        if state.shutting_down {
+            return None;
+        }
+        if let Some(id) = state.downloads.pop_front() {
+            let entry = state
+                .jobs
+                .get_mut(&id)
+                .expect("a queued download has an entry");
+            entry.phase = Phase::Preparing;
+            let Job::Install(metadata) = &entry.job else {
+                unreachable!("only installs are queued for download")
+            };
+            let next = (id, metadata.clone(), entry.token.clone());
+            shared.emit(id, JobEvent::Preparing);
+            return Some(next);
+        }
+        state = shared.wait(state);
+    }
+}
+
+fn download_one<S: Stages>(
+    shared: &Arc<Shared<S>>,
+    id: JobId,
+    metadata: &PackageMetadata,
+    token: &CancelToken,
+) {
+    let sized = guarded("prepare", || {
+        let prepared = shared.stages.prepare(metadata)?;
+        let size = shared.stages.download_size(&prepared);
+        Ok((prepared, size))
+    });
+    let (prepared, size) = match sized {
+        Ok(sized) => sized,
+        Err(e) => return shared.finish_now(id, outcome_of(e)),
+    };
+    if let Err(outcome) = admit(shared, id, size, token) {
+        // Its temp directory goes before the job finishes, so a waiter
+        // that returns finds it gone.
+        drop(prepared);
+        return shared.finish_now(id, outcome);
+    }
+    let progress = progress_callback(shared, id);
+    match guarded("download", || {
+        shared.stages.download(prepared, token, progress)
+    }) {
+        Ok(downloaded) => {
+            let mut state = shared.lock();
+            // Once shutting down, the installer may already have drained its
+            // queue and left, so a download that finished anyway ends here.
+            if state.shutting_down {
+                shared.finish(&mut state, id, JobOutcome::Cancelled);
+            } else if let Some(entry) = state.jobs.get_mut(&id) {
+                entry.phase = Phase::Downloaded;
+                shared.emit(id, JobEvent::Downloaded);
+                state.installs.push_back((id, Ready::Install(downloaded)));
+                shared.changed.notify_all();
+                return;
+            }
+            drop(state);
+            drop(downloaded); // its temp directory goes outside the lock
+        }
+        Err(e) => shared.finish_now(id, outcome_of(e)),
+    }
+}
+
+/// Wait until the ledger admits `size` bytes. Otherwise returns how the
+/// job ends: it can never fit, the capacity could not be read, or it was
+/// cancelled. The caller finishes it, once the prepared package is dropped.
+fn admit<S: Stages>(
+    shared: &Shared<S>,
+    id: JobId,
+    size: u64,
+    token: &CancelToken,
+) -> Result<(), JobOutcome> {
+    let mut state = shared.lock();
+    if !state.capacity_known {
+        // statvfs can block on a slow or network filesystem, so it is read
+        // unlocked, then used only if no reading was taken meanwhile.
+        drop(state);
+        let capacity = guarded("capacity", || shared.stages.capacity());
+        state = shared.lock();
+        if !state.capacity_known {
+            match capacity {
+                Ok(capacity) => {
+                    state.ledger.set_capacity(capacity);
+                    state.capacity_known = true;
+                }
+                Err(e) => return Err(JobOutcome::Failed(e)),
+            }
+        }
+    }
+    loop {
+        if token.is_cancelled() || state.shutting_down {
+            return Err(JobOutcome::Cancelled);
+        }
+        match state.ledger.admit(id, size) {
+            Admission::Admitted => {
+                if let Some(entry) = state.jobs.get_mut(&id) {
+                    entry.phase = Phase::Downloading;
+                }
+                return Ok(());
+            }
+            Admission::Never {
+                filesystem,
+                required,
+                available,
+            } => {
+                let path = match filesystem {
+                    Filesystem::Temp => shared.stages.temp_dir(),
+                    Filesystem::Packages => shared.stages.packages_root(),
+                };
+                return Err(JobOutcome::Failed(ManagerError::InsufficientDiskSpace {
+                    path: path.to_path_buf(),
+                    required_bytes: required,
+                    available_bytes: available,
+                }));
+            }
+            Admission::Wait { needed, available } => {
+                let entry = state
+                    .jobs
+                    .get_mut(&id)
+                    .expect("an admitting job has an entry");
+                if entry.phase != Phase::WaitingForSpace {
+                    entry.phase = Phase::WaitingForSpace;
+                    shared.emit(id, JobEvent::WaitingForSpace { needed, available });
+                }
+                state = shared.wait(state);
+            }
+        }
+    }
+}
+
+fn progress_callback<S: Stages>(shared: &Arc<Shared<S>>, id: JobId) -> DownloadProgressCallback {
+    let shared = Arc::clone(shared);
+    Box::new(move |progress| {
+        let state = shared.lock();
+        if state
+            .jobs
+            .get(&id)
+            .is_some_and(|e| e.phase == Phase::Downloading)
+        {
+            shared.emit(id, JobEvent::Downloading(progress));
+        }
+    })
+}
+
+pub(super) fn run_installer<S: Stages>(shared: Arc<Shared<S>>) {
+    while let Some((id, ready, token)) = next_install(&shared) {
+        match ready {
+            Ready::Install(downloaded) => install_one(&shared, id, downloaded, token),
+            Ready::Remove => remove_one(&shared, id, token),
+        }
+    }
+}
+
+/// Take the next ready job and mark it as the installer's, all under one
+/// lock: `cancel` only removes queued work it finds in `installs`. Removes
+/// skip the downloader, so the installer too waits for the sweep.
+fn next_install<S: Stages>(
+    shared: &Shared<S>,
+) -> Option<(JobId, Ready<S::Downloaded>, CancelToken)> {
+    let mut state = shared.lock();
+    loop {
+        if state.swept {
+            if let Some((id, ready)) = state.installs.pop_front() {
+                let entry = state.jobs.get_mut(&id).expect("a ready job has an entry");
+                entry.phase = match ready {
+                    Ready::Install(_) => Phase::Installing,
+                    Ready::Remove => Phase::Removing,
+                };
+                return Some((id, ready, entry.token.clone()));
+            }
+            if state.shutting_down {
+                return None;
+            }
+        }
+        state = shared.wait(state);
+    }
+}
+
+fn install_one<S: Stages>(
+    shared: &Shared<S>,
+    id: JobId,
+    downloaded: S::Downloaded,
+    token: CancelToken,
+) {
+    if token.is_cancelled() {
+        drop(downloaded); // its temp directory goes outside the lock, first
+        return shared.finish_now(id, JobOutcome::Cancelled);
+    }
+    let context = Context { shared, id, token };
+    let result = guarded("install", || shared.stages.install(downloaded, &context));
+    let mut state = shared.lock();
+    state.swapping = false; // an install that never ended its swap, or panicked mid-swap
+    let outcome = match result {
+        Ok(installed) => JobOutcome::Installed(installed),
+        Err(e) => outcome_of(e),
+    };
+    shared.finish(&mut state, id, outcome);
+}
+
+fn remove_one<S: Stages>(shared: &Shared<S>, id: JobId, token: CancelToken) {
+    let (region, package_type) = {
+        let mut state = shared.lock();
+        if token.is_cancelled() {
+            shared.finish(&mut state, id, JobOutcome::Cancelled);
+            return;
+        }
+        shared.emit(id, JobEvent::Removing);
+        let summary = &state.jobs[&id].summary;
+        (summary.region.clone(), summary.package_type)
+    };
+    let result = guarded("remove", || shared.stages.remove(&region, package_type));
+    let outcome = match result {
+        Ok(()) => JobOutcome::Removed,
+        Err(e) => outcome_of(e),
+    };
+    shared.finish_now(id, outcome);
+}
+
+/// What an install sees of its queue.
+struct Context<'a, S: Stages> {
+    shared: &'a Shared<S>,
+    id: JobId,
+    token: CancelToken,
+}
+
+impl<S: Stages> InstallContext for Context<'_, S> {
+    fn stage(&self, stage: InstallStage) {
+        let _state = self.shared.lock();
+        self.shared.emit(self.id, JobEvent::Installing(stage));
+    }
+
+    fn cancel_token(&self) -> &CancelToken {
+        &self.token
+    }
+
+    fn begin_swap(&self) -> bool {
+        let mut state = self.shared.lock();
+        if self.token.is_cancelled() {
+            return false;
+        }
+        if let Some(entry) = state.jobs.get_mut(&self.id) {
+            entry.phase = Phase::Swapping;
+        }
+        state.swapping = true;
+        true
+    }
+
+    /// The job stays `Swapping`, so a cancel still answers `TooLate`.
+    fn end_swap(&self) {
+        let mut state = self.shared.lock();
+        state.swapping = false;
+        self.shared.changed.notify_all();
+    }
+}

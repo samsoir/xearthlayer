@@ -18,6 +18,7 @@
 mod apple;
 mod arcgis;
 mod bing;
+pub mod catalog;
 mod factory;
 mod go2;
 mod google;
@@ -31,6 +32,7 @@ pub use apple::{
 };
 pub use arcgis::{ArcGisProvider, AsyncArcGisProvider};
 pub use bing::{AsyncBingMapsProvider, BingMapsProvider};
+pub use catalog::{ProviderCredential, ProviderEntry, PROVIDERS};
 pub use factory::{AsyncProviderFactory, AsyncProviderType, ProviderConfig, ProviderFactory};
 pub use go2::{AsyncGo2Provider, Go2Provider};
 pub use google::{AsyncGoogleMapsProvider, GoogleMapsProvider};

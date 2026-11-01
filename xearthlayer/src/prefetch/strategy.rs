@@ -6,8 +6,8 @@
 //!
 //! # Available Strategies
 //!
-//! - [`AdaptivePrefetchCoordinator`](super::AdaptivePrefetchCoordinator): Self-calibrating
-//!   adaptive prefetch with flight phase detection (ground/cruise). This is the only
+//! - [`AdaptivePrefetchCoordinator`](super::AdaptivePrefetchCoordinator): Adaptive
+//!   prefetch with flight phase detection (ground/cruise). This is the only
 //!   available strategy as of v0.4.0.
 //!
 //! The adaptive prefetcher automatically selects the appropriate mode (aggressive,

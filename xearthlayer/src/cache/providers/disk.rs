@@ -37,7 +37,7 @@ use tracing::{debug, info, warn};
 
 use crate::cache::config::DiskProviderConfig;
 use crate::cache::integrity::{
-    dds_tile_validator, discard, raw_chunk_validator, CacheEntryValidator,
+    dds_tile_validator, discard, lit_payload_validator, raw_chunk_validator, CacheEntryValidator,
 };
 use crate::cache::lru_index::LruIndex;
 use crate::cache::traits::{BoxFuture, Cache, GcResult, ServiceCacheError};
@@ -48,11 +48,13 @@ use crate::metrics::MetricsClient;
 ///
 /// This is the one place tier maps to a validator, keeping
 /// `DiskCacheProvider` itself ignorant of what it stores — the same struct
-/// backs both the DDS tile tier and the raw chunk tier (#253).
+/// backs all three tiers: DDS tiles, raw chunks (#253) and, with night
+/// lighting on, lit payloads.
 fn validator_for_tier(tier: DiskTier) -> Arc<dyn CacheEntryValidator> {
     match tier {
         DiskTier::Dds => Arc::new(dds_tile_validator()),
         DiskTier::Chunk => Arc::new(raw_chunk_validator()),
+        DiskTier::Lit => Arc::new(lit_payload_validator()),
     }
 }
 
@@ -272,6 +274,8 @@ impl DiskCacheProvider {
         if let Some(ref client) = self.metrics_client {
             match self.tier {
                 DiskTier::Dds => client.dds_disk_cache_size(size),
+                // Not on the dashboard yet.
+                DiskTier::Lit => {}
                 DiskTier::Chunk => {
                     client.disk_cache_size(size);
                     client.chunk_index_entries(self.lru_index.entry_count());
@@ -332,6 +336,9 @@ impl Cache for DiskCacheProvider {
                 }
                 DiskTier::Chunk => {
                     debug!(key = %key_owned, size, "Cache set");
+                }
+                DiskTier::Lit => {
+                    debug!(key = %key_owned, size, "Lit disk cache write complete");
                 }
             }
             Ok(())
@@ -530,6 +537,45 @@ mod tests {
             tier: DiskTier::Chunk,
             validator: Arc::new(raw_chunk_validator()),
         })
+    }
+
+    /// A lit-tier provider, built the same way as `dds_provider` above.
+    fn lit_provider(temp: &TempDir) -> Arc<DiskCacheProvider> {
+        Arc::new(DiskCacheProvider {
+            directory: temp.path().to_path_buf(),
+            max_size_bytes: AtomicU64::new(1_000_000_000),
+            lru_index: Arc::new(LruIndex::new(temp.path().to_path_buf())),
+            shutdown: CancellationToken::new(),
+            metrics_client: None,
+            tier: DiskTier::Lit,
+            validator: validator_for_tier(DiskTier::Lit),
+        })
+    }
+
+    #[tokio::test]
+    async fn lit_entry_without_the_magic_is_discarded_and_reported_as_a_miss() {
+        let temp = TempDir::new().unwrap();
+        let provider = lit_provider(&temp);
+        let key = "lit:16:25312:10528";
+
+        let path = provider.key_path(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not a lit entry").unwrap();
+
+        assert!(provider.get(key).await.unwrap().is_none());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_lit_entry_with_the_magic_round_trips() {
+        let temp = TempDir::new().unwrap();
+        let provider = lit_provider(&temp);
+        let key = "lit:16:25312:10528";
+
+        let entry = Bytes::from([b"XELL".as_slice(), &[7u8; 64]].concat());
+        provider.set(key, entry.clone()).await.unwrap();
+
+        assert_eq!(provider.get(key).await.unwrap(), Some(entry));
     }
 
     #[tokio::test]

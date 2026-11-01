@@ -3,18 +3,14 @@
 //! This module defines the interfaces that handlers depend on, enabling
 //! dependency injection and testability.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use xearthlayer::manager::{
-    InstallResult, InstallStage, InstalledPackage, LocalPackageStore, ManagerResult, PackageInfo,
-    PackageStatus,
+    InstallResult, InstalledPackage, LocalPackageStore, ManagerResult, PackageInfo, PackageStatus,
 };
-use xearthlayer::package::{PackageLibrary, PackageMetadata, PackageType};
+use xearthlayer_package::{PackageLibrary, PackageMetadata, PackageType};
 
 use crate::error::CliError;
-
-/// Type alias for progress callback to reduce complexity.
-pub type ProgressCallback = Box<dyn Fn(InstallStage, f64, &str) + Send + Sync>;
 
 // ============================================================================
 // Output Trait - Abstracts console/UI output
@@ -31,17 +27,6 @@ pub trait Output: Send + Sync {
     /// Print text without a newline.
     #[allow(dead_code)]
     fn print(&self, message: &str);
-
-    /// Signal that progress display is complete.
-    ///
-    /// Call this after progress operations are done to ensure proper output formatting.
-    fn progress_done(&self);
-
-    /// Create a progress callback for package installation.
-    ///
-    /// Returns a boxed callback compatible with the manager's install function.
-    /// The callback is responsible for displaying progress information.
-    fn create_progress_callback(&self) -> ProgressCallback;
 
     /// Print an empty line.
     fn newline(&self) {
@@ -100,22 +85,32 @@ pub trait PackageManagerService: Send + Sync {
     /// Fetch package metadata from a URL.
     fn fetch_metadata(&self, url: &str) -> ManagerResult<PackageMetadata>;
 
-    /// Check for package updates.
+    /// Check every installed and library package against the library.
+    fn try_check_updates(
+        &self,
+        store: &LocalPackageStore,
+        library: &PackageLibrary,
+    ) -> ManagerResult<Vec<(PackageInfo, PackageStatus)>>;
+
+    /// Check for package updates. A failed check gives no packages, which
+    /// the CLI reports as nothing to update.
     fn check_updates(
         &self,
         store: &LocalPackageStore,
         library: &PackageLibrary,
-    ) -> Vec<(PackageInfo, PackageStatus)>;
+    ) -> Vec<(PackageInfo, PackageStatus)> {
+        self.try_check_updates(store, library).unwrap_or_default()
+    }
 
-    /// Install a package.
-    fn install_package(
+    /// Install a batch of packages, each installing while the next one
+    /// downloads. Returns one result per package, in order.
+    fn install_packages(
         &self,
-        metadata: &PackageMetadata,
+        packages: &[PackageMetadata],
         install_dir: &Path,
         temp_dir: &Path,
         concurrent_downloads: usize,
-        on_progress: Option<ProgressCallback>,
-    ) -> Result<InstallResult, CliError>;
+    ) -> Vec<Result<InstallResult, CliError>>;
 
     /// Remove a package.
     fn remove_package(
@@ -123,18 +118,29 @@ pub trait PackageManagerService: Send + Sync {
         store: &LocalPackageStore,
         region: &str,
         package_type: PackageType,
+        temp_dir: &Path,
     ) -> ManagerResult<()>;
-
-    /// Get an installed package.
-    fn get_package(
-        &self,
-        store: &LocalPackageStore,
-        region: &str,
-        package_type: PackageType,
-    ) -> ManagerResult<InstalledPackage>;
 
     /// List all installed packages.
     fn list_packages(&self, store: &LocalPackageStore) -> ManagerResult<Vec<InstalledPackage>>;
+
+    /// The region and type of every installed package. Unlike
+    /// `list_packages` it walks no package tree for a size, so a caller that
+    /// only needs to know what is installed does not wait on the disk.
+    fn list_package_keys(
+        &self,
+        store: &LocalPackageStore,
+    ) -> ManagerResult<Vec<(String, PackageType)>>;
+
+    /// The pid of another `xearthlayer run` that is serving packages, if any.
+    ///
+    /// Read from the instance lock `run` holds, so it is true for as long as
+    /// that process lives, whatever it has mounted.
+    fn running_instance(&self) -> Option<u32>;
+
+    /// The instance lock `running_instance` reads, named in refusals so a
+    /// user can delete a stale one.
+    fn instance_lock(&self) -> PathBuf;
 }
 
 // ============================================================================

@@ -3,29 +3,7 @@
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-/// Circuit breaker state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CircuitState {
-    /// Circuit is closed - prefetch is active (normal operation).
-    Closed,
-    /// Circuit is open - prefetch is blocked (high X-Plane load detected).
-    Open,
-    /// Circuit is half-open - testing if safe to resume prefetch.
-    HalfOpen,
-}
-
-impl CircuitState {
-    /// User-friendly display string (NOT circuit breaker jargon).
-    ///
-    /// Returns terminology suitable for end-user TUI display.
-    pub fn display_status(&self) -> &'static str {
-        match self {
-            CircuitState::Closed => "Active",
-            CircuitState::Open => "Paused",
-            CircuitState::HalfOpen => "Resuming...",
-        }
-    }
-}
+use super::adaptive::FlightPhase;
 
 /// Snapshot of prefetch statistics for UI display.
 ///
@@ -44,44 +22,95 @@ pub struct PrefetchStatsSnapshot {
     pub tiles_predicted: u64,
 }
 
-/// GPS/telemetry connection status for UI display.
+/// What the prefetcher is doing right now, in one word for the dashboard.
+///
+/// Resolved in precedence order by [`resolve_state`]: the first condition
+/// that holds wins, so a disabled prefetcher never reports "ramping".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum GpsStatus {
-    /// XGPS2 configured and receiving data from X-Plane.
-    Connected,
-    /// XGPS2 configured but not yet receiving data.
+pub enum PrefetchState {
+    /// Prefetch is switched off (`prefetch.enabled = false` or
+    /// `run --no-prefetch`).
+    Disabled,
+    /// The prefetch lane is stood down because FUSE demand is in flight.
+    PausedForDemand,
+    /// Held back during the takeoff transition.
+    HoldingTakeoff,
+    /// The last cycle was skipped because the lane or memory was loaded.
+    DeferredLoad,
+    /// Throttle ramping back up after takeoff; `percent` of full throughput.
+    Ramping { percent: u8 },
+    /// Tiles are in flight on the prefetch lane.
+    Active,
+    /// Enabled, nothing to do.
     #[default]
-    Acquiring,
-    /// XGPS2 not configured; using FUSE-based position inference.
-    Inferred,
+    Idle,
 }
 
-impl std::fmt::Display for GpsStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl PrefetchState {
+    /// Dashboard text for the state.
+    pub fn label(&self) -> String {
         match self {
-            Self::Connected => write!(f, "Connected"),
-            Self::Acquiring => write!(f, "Acquiring..."),
-            Self::Inferred => write!(f, "Inferred"),
+            Self::Disabled => "Disabled".to_string(),
+            Self::PausedForDemand => "Paused (demand)".to_string(),
+            Self::HoldingTakeoff => "Holding (takeoff)".to_string(),
+            Self::DeferredLoad => "Deferred (load)".to_string(),
+            Self::Ramping { percent } => format!("Ramping {percent}%"),
+            Self::Active => "Active".to_string(),
+            Self::Idle => "Idle".to_string(),
         }
     }
 }
 
-/// Prefetch operating mode for UI display.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PrefetchMode {
-    /// Using UDP telemetry for heading-aware cone prefetch.
-    Telemetry,
-    /// Using FUSE request analysis for position/heading inference.
-    FuseInference,
-    /// Fallback to simple radial prefetch (no heading data).
-    Radial,
-    /// Tile-based prefetch aligned with X-Plane's DSF loading behavior.
-    TileBased,
-    /// Prefetch system is idle (no data received yet).
-    #[default]
-    Idle,
-    /// Prefetch blocked due to high FUSE load (circuit breaker open).
-    CircuitOpen,
+/// Everything [`resolve_state`] needs to choose a state.
+#[derive(Debug, Clone, Copy)]
+pub struct StateInputs {
+    pub enabled: bool,
+    pub demand_paused: bool,
+    pub phase: FlightPhase,
+    pub deferred_last_cycle: bool,
+    /// `None` when the throttle is idle (full throughput).
+    pub throttle_fraction: Option<f64>,
+    pub lane_busy: bool,
+}
+
+impl Default for StateInputs {
+    /// A running prefetcher with nothing to report yet.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            demand_paused: false,
+            phase: FlightPhase::default(),
+            deferred_last_cycle: false,
+            throttle_fraction: None,
+            lane_busy: false,
+        }
+    }
+}
+
+/// Choose the single state to show, first match in precedence order.
+pub fn resolve_state(inputs: StateInputs) -> PrefetchState {
+    if !inputs.enabled {
+        return PrefetchState::Disabled;
+    }
+    if inputs.demand_paused {
+        return PrefetchState::PausedForDemand;
+    }
+    if inputs.phase == FlightPhase::Transition || inputs.throttle_fraction == Some(0.0) {
+        return PrefetchState::HoldingTakeoff;
+    }
+    if inputs.deferred_last_cycle {
+        return PrefetchState::DeferredLoad;
+    }
+    if let Some(fraction) = inputs.throttle_fraction.filter(|f| *f < 1.0) {
+        return PrefetchState::Ramping {
+            percent: (fraction * 100.0).round().clamp(0.0, 100.0) as u8,
+        };
+    }
+    if inputs.lane_busy {
+        PrefetchState::Active
+    } else {
+        PrefetchState::Idle
+    }
 }
 
 /// Detailed prefetch statistics for dashboard display.
@@ -98,15 +127,8 @@ pub struct DetailedPrefetchStats {
     pub tiles_submitted_total: u64,
     /// Tiles skipped because they were already in cache.
     pub cache_hits: u64,
-    /// Tiles skipped due to TTL (recently attempted).
-    pub ttl_skipped: u64,
     /// Zoom levels active in the most recent cycle.
     pub active_zoom_levels: Vec<u8>,
-    /// Whether the prefetcher is actively submitting tiles.
-    pub is_active: bool,
-    /// Circuit breaker state (None if circuit breaker is disabled).
-    /// Used by TUI to show prefetch pause status.
-    pub circuit_state: Option<CircuitState>,
     /// Tile coordinates currently being prefetched (limited to 10 for display).
     /// Each tuple is (latitude, longitude) of the tile's southwest corner.
     pub loading_tiles: Vec<(i32, i32)>,
@@ -114,23 +136,10 @@ pub struct DetailedPrefetchStats {
     pub deferred_cycles: u64,
 }
 
-impl std::fmt::Display for PrefetchMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Telemetry => write!(f, "Heading-Aware (Telemetry)"),
-            Self::FuseInference => write!(f, "Heading-Aware (Inferred)"),
-            Self::Radial => write!(f, "Radial"),
-            Self::TileBased => write!(f, "Tile-Based"),
-            Self::Idle => write!(f, "Idle"),
-            Self::CircuitOpen => write!(f, "Paused"),
-        }
-    }
-}
-
 /// Shared prefetch status for display in the UI.
 ///
 /// This provides a thread-safe way to share the current prefetch state
-/// (aircraft position and statistics) with the dashboard.
+/// (state inputs, box geometry and statistics) with the dashboard.
 #[derive(Debug, Default)]
 pub struct SharedPrefetchStatus {
     inner: RwLock<PrefetchStatusSnapshot>,
@@ -144,23 +153,6 @@ impl SharedPrefetchStatus {
         })
     }
 
-    /// Update the aircraft state from telemetry.
-    ///
-    /// This also sets GPS status to Connected since we received data.
-    pub fn update_aircraft(&self, state: &AircraftState) {
-        if let Ok(mut inner) = self.inner.write() {
-            inner.aircraft = Some(AircraftSnapshot {
-                latitude: state.latitude,
-                longitude: state.longitude,
-                heading: state.heading,
-                ground_speed: state.ground_speed,
-                altitude: state.altitude,
-            });
-            // Receiving telemetry means GPS is connected
-            inner.gps_status = GpsStatus::Connected;
-        }
-    }
-
     /// Update the prefetch statistics.
     pub fn update_stats(&self, stats: PrefetchStatsSnapshot) {
         if let Ok(mut inner) = self.inner.write() {
@@ -168,38 +160,18 @@ impl SharedPrefetchStatus {
         }
     }
 
-    /// Update the GPS connection status.
-    pub fn update_gps_status(&self, status: GpsStatus) {
+    /// Publish the coordinator's raw state inputs. The dashboard completes
+    /// them (demand pause, lane occupancy) and calls [`resolve_state`] once.
+    pub fn update_state_inputs(&self, inputs: StateInputs) {
         if let Ok(mut inner) = self.inner.write() {
-            inner.gps_status = status;
+            inner.state_inputs = inputs;
         }
     }
 
-    /// Update the aircraft position from FUSE inference.
-    ///
-    /// This is a fallback when telemetry is unavailable - we infer
-    /// approximate position from DSF tile loading patterns.
-    /// Sets GPS status to Inferred.
-    pub fn update_inferred_position(&self, latitude: f64, longitude: f64) {
+    /// Record that no coordinator runs (`--no-prefetch`, `prefetch.enabled = false`).
+    pub fn mark_disabled(&self) {
         if let Ok(mut inner) = self.inner.write() {
-            // Only update if we don't have real telemetry
-            if inner.gps_status != GpsStatus::Connected {
-                inner.aircraft = Some(AircraftSnapshot {
-                    latitude,
-                    longitude,
-                    heading: 0.0,      // Unknown without telemetry
-                    ground_speed: 0.0, // Unknown without telemetry
-                    altitude: 0.0,     // Unknown without telemetry
-                });
-                inner.gps_status = GpsStatus::Inferred;
-            }
-        }
-    }
-
-    /// Update the current prefetch operating mode.
-    pub fn update_prefetch_mode(&self, mode: PrefetchMode) {
-        if let Ok(mut inner) = self.inner.write() {
-            inner.prefetch_mode = mode;
+            inner.state_inputs.enabled = false;
         }
     }
 
@@ -246,14 +218,10 @@ impl SharedPrefetchStatus {
 /// Snapshot of prefetch status for display.
 #[derive(Debug, Clone, Default)]
 pub struct PrefetchStatusSnapshot {
-    /// Current aircraft state (if telemetry is active).
-    pub aircraft: Option<AircraftSnapshot>,
     /// Prefetch statistics.
     pub stats: PrefetchStatsSnapshot,
-    /// GPS/telemetry connection status.
-    pub gps_status: GpsStatus,
-    /// Current prefetch operating mode.
-    pub prefetch_mode: PrefetchMode,
+    /// Raw inputs to [`resolve_state`], as last published by the coordinator.
+    pub state_inputs: StateInputs,
     /// Detailed prefetch statistics for dashboard display.
     pub detailed_stats: Option<DetailedPrefetchStats>,
     /// Current prefetch box extent in degrees (speed-proportional; 0.0 when unknown).
@@ -279,27 +247,10 @@ pub struct BoxBoundsSnapshot {
     pub lon_max: f64,
 }
 
-/// Aircraft state snapshot for display (without Instant which can't be cloned easily).
-#[derive(Debug, Clone)]
-pub struct AircraftSnapshot {
-    pub latitude: f64,
-    pub longitude: f64,
-    pub heading: f32,
-    pub ground_speed: f32,
-    pub altitude: f32,
-}
-
 impl PrefetchStatusSnapshot {
-    /// Format the aircraft state as a single line.
-    pub fn aircraft_line(&self) -> String {
-        if let Some(ref ac) = self.aircraft {
-            format!(
-                "Pos: {:.4}°, {:.4}° | Hdg: {:.0}° | GS: {:.0}kt | Alt: {:.0}ft",
-                ac.latitude, ac.longitude, ac.heading, ac.ground_speed, ac.altitude
-            )
-        } else {
-            "Waiting for X-Plane telemetry...".to_string()
-        }
+    /// The state as the coordinator alone sees it (no demand pause).
+    pub fn coordinator_state(&self) -> PrefetchState {
+        resolve_state(self.state_inputs)
     }
 
     /// Format the prefetch stats as a single line.
@@ -457,6 +408,106 @@ impl AircraftState {
 
 #[cfg(test)]
 mod tests {
+
+    fn inputs() -> StateInputs {
+        StateInputs {
+            enabled: true,
+            demand_paused: false,
+            phase: FlightPhase::Cruise,
+            deferred_last_cycle: false,
+            throttle_fraction: None,
+            lane_busy: false,
+        }
+    }
+
+    #[test]
+    fn disabled_beats_everything() {
+        let all = StateInputs {
+            enabled: false,
+            demand_paused: true,
+            phase: FlightPhase::Transition,
+            deferred_last_cycle: true,
+            throttle_fraction: Some(0.4),
+            lane_busy: true,
+        };
+        assert_eq!(resolve_state(all), PrefetchState::Disabled);
+    }
+
+    #[test]
+    fn demand_pause_beats_takeoff_hold_and_deferral() {
+        let held = StateInputs {
+            demand_paused: true,
+            phase: FlightPhase::Transition,
+            deferred_last_cycle: true,
+            ..inputs()
+        };
+        assert_eq!(resolve_state(held), PrefetchState::PausedForDemand);
+    }
+
+    #[test]
+    fn transition_phase_holds_for_takeoff() {
+        let s = StateInputs {
+            phase: FlightPhase::Transition,
+            ..inputs()
+        };
+        assert_eq!(resolve_state(s), PrefetchState::HoldingTakeoff);
+        let s = StateInputs {
+            throttle_fraction: Some(0.0),
+            ..inputs()
+        };
+        assert_eq!(resolve_state(s), PrefetchState::HoldingTakeoff);
+    }
+
+    #[test]
+    fn deferral_beats_ramp_and_activity() {
+        let s = StateInputs {
+            deferred_last_cycle: true,
+            throttle_fraction: Some(0.4),
+            lane_busy: true,
+            ..inputs()
+        };
+        assert_eq!(resolve_state(s), PrefetchState::DeferredLoad);
+    }
+
+    #[test]
+    fn partial_throttle_is_a_ramp_with_percent() {
+        let s = StateInputs {
+            throttle_fraction: Some(0.4),
+            lane_busy: true,
+            ..inputs()
+        };
+        assert_eq!(resolve_state(s), PrefetchState::Ramping { percent: 40 });
+    }
+
+    #[test]
+    fn busy_lane_is_active_and_quiet_lane_is_idle() {
+        let busy = StateInputs {
+            lane_busy: true,
+            ..inputs()
+        };
+        assert_eq!(resolve_state(busy), PrefetchState::Active);
+        assert_eq!(resolve_state(inputs()), PrefetchState::Idle);
+    }
+
+    #[test]
+    fn mark_disabled_resolves_to_disabled_in_the_snapshot() {
+        let status = SharedPrefetchStatus::new();
+        assert_eq!(status.snapshot().coordinator_state(), PrefetchState::Idle);
+        status.mark_disabled();
+        assert_eq!(
+            status.snapshot().coordinator_state(),
+            PrefetchState::Disabled
+        );
+    }
+
+    #[test]
+    fn labels_are_stable() {
+        assert_eq!(PrefetchState::PausedForDemand.label(), "Paused (demand)");
+        assert_eq!(
+            PrefetchState::Ramping { percent: 40 }.label(),
+            "Ramping 40%"
+        );
+    }
     use super::*;
 
     #[test]

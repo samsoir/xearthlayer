@@ -61,6 +61,12 @@ pub struct EncoderComponents {
     /// GPU worker handle (present when `texture.compressor = gpu`).
     /// Must be awaited during shutdown to ensure GPU resources are released.
     pub gpu_worker_handle: Option<tokio::task::JoinHandle<()>>,
+    /// The GPU the encoder selected (present when `texture.compressor = gpu`).
+    pub gpu_adapter: Option<crate::system::GpuAdapter>,
+    /// The encoder policy's warning when `gpu` was honoured on a host whose
+    /// only GPU is the one X-Plane renders with (#203). Logged at creation
+    /// and shown on the dashboard's Status pane.
+    pub gpu_warning: Option<String>,
     /// Shutdown token for the GPU worker (present when `texture.compressor = gpu`).
     /// Cancelling this token causes the worker to exit its loop regardless of
     /// the channel state. Required because `spawn_blocking` threads are not
@@ -81,22 +87,53 @@ fn apply_mipmap_count(encoder: DdsTextureEncoder, count: Option<usize>) -> DdsTe
 
 /// Create texture encoder from configuration.
 ///
-/// Selects the block compressor backend based on the `texture.compressor`
-/// config setting:
+/// The backend is `texture.compressor`, parsed as a [`CompressorKind`]:
 /// - `"ispc"` — SIMD-optimized via Intel ISPC (default)
 /// - `"software"` — Pure-Rust fallback
 /// - `"gpu"` — GPU compute via wgpu
+///
+/// The GPU path runs the choice past the [`EncoderPolicy`] with the
+/// adapters its own enumeration produced, so a host whose only GPU is the
+/// one X-Plane renders with gets its contention warning without a second
+/// enumeration (#203).
 pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, ServiceError> {
     use crate::dds::{IspcCompressor, SoftwareCompressor};
+    use crate::system::{CompressorKind, DefaultEncoderPolicy, EncoderPolicy};
 
-    match config.texture().compressor() {
-        "gpu" => {
+    let backend = CompressorKind::parse(config.texture().compressor()).ok_or_else(|| {
+        ServiceError::ConfigError(format!(
+            "Unknown texture compressor '{}'. Valid options: software, ispc, gpu",
+            config.texture().compressor()
+        ))
+    })?;
+
+    let cpu_components = |compressor: Arc<dyn crate::dds::ImageCompressor>| EncoderComponents {
+        encoder: Arc::new(
+            apply_mipmap_count(
+                DdsTextureEncoder::new(config.texture().format()),
+                config.texture().mipmap_count(),
+            )
+            .with_compressor(compressor),
+        ),
+        gpu_worker_handle: None,
+        gpu_adapter: None,
+        gpu_warning: None,
+        gpu_shutdown: None,
+    };
+
+    match backend {
+        CompressorKind::Gpu => {
             use crate::dds::gpu_channel::create_gpu_encoder_channel;
 
             let shutdown_token = tokio_util::sync::CancellationToken::new();
-            let (channel, worker_handle) =
+            let (channel, worker_handle, selection) =
                 create_gpu_encoder_channel(config.texture().gpu_device(), shutdown_token.clone())
                     .map_err(|e| ServiceError::ConfigError(format!("GPU compressor: {e}")))?;
+
+            let decision = DefaultEncoderPolicy.select(&selection.host, Some(CompressorKind::Gpu));
+            if let Some(warning) = &decision.warning {
+                tracing::warn!(adapter = %selection.adapter, "{warning}");
+            }
 
             tracing::info!("GPU pipeline encoder created with dedicated worker");
 
@@ -109,33 +146,13 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
                     .with_mipmap_compressor(Arc::new(channel)),
                 ),
                 gpu_worker_handle: Some(worker_handle),
+                gpu_adapter: Some(selection.adapter),
+                gpu_warning: decision.warning,
                 gpu_shutdown: Some(shutdown_token),
             })
         }
-        compressor_name => {
-            let compressor: Arc<dyn crate::dds::ImageCompressor> = match compressor_name {
-                "software" => Arc::new(SoftwareCompressor),
-                "ispc" => Arc::new(IspcCompressor),
-                other => {
-                    return Err(ServiceError::ConfigError(format!(
-                        "Unknown texture compressor '{}'. Valid options: software, ispc, gpu",
-                        other
-                    )));
-                }
-            };
-
-            Ok(EncoderComponents {
-                encoder: Arc::new(
-                    apply_mipmap_count(
-                        DdsTextureEncoder::new(config.texture().format()),
-                        config.texture().mipmap_count(),
-                    )
-                    .with_compressor(compressor),
-                ),
-                gpu_worker_handle: None,
-                gpu_shutdown: None,
-            })
-        }
+        CompressorKind::Software => Ok(cpu_components(Arc::new(SoftwareCompressor))),
+        CompressorKind::Ispc => Ok(cpu_components(Arc::new(IspcCompressor))),
     }
 }
 
@@ -181,7 +198,23 @@ mod tests {
             .build();
         let result = create_encoder(&config);
         match result {
-            Ok(components) => assert_eq!(components.encoder.extension(), "dds"),
+            Ok(components) => {
+                assert_eq!(components.encoder.extension(), "dds");
+                // The dashboard names the adapter the worker actually chose.
+                let adapter = components
+                    .gpu_adapter
+                    .expect("a GPU encoder reports its adapter");
+                assert!(!adapter.name.is_empty());
+                // The policy's verdict must match the host: a lone GPU is the
+                // one X-Plane renders with and warns, two or more do not (#203).
+                let host = crate::system::HardwareProfile::new(crate::system::enumerate_gpus());
+                assert_eq!(
+                    components.gpu_warning.is_some(),
+                    host.shares_render_gpu(),
+                    "warning {:?} on host {host:?}",
+                    components.gpu_warning
+                );
+            }
             Err(e) => assert!(
                 e.to_string().contains("GPU"),
                 "error should mention GPU, got: {e}"
@@ -234,6 +267,11 @@ mod tests {
         assert!(
             components.gpu_worker_handle.is_none(),
             "ISPC compressor should not have a GPU worker handle"
+        );
+        assert!(components.gpu_adapter.is_none());
+        assert!(
+            components.gpu_warning.is_none(),
+            "a CPU encoder never contends with the sim's GPU"
         );
     }
 }

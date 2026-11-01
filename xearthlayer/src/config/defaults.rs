@@ -3,8 +3,6 @@
 //! Contains all `DEFAULT_*` constants, CPU-aware helper functions,
 //! and the `ConfigFile::default()` implementation.
 
-use std::path::PathBuf;
-
 use super::settings::*;
 use crate::dds::DdsFormat;
 
@@ -30,25 +28,6 @@ pub fn num_cpus() -> usize {
         .unwrap_or(4)
 }
 
-/// Default HTTP concurrency limit.
-/// Returns a conservative value (128) that works reliably with all providers.
-pub fn default_http_concurrent() -> usize {
-    DEFAULT_HTTP_CONCURRENT
-}
-
-/// Default CPU concurrency limit: num_cpus / 2, minimum 2.
-///
-/// Leaves headroom for X-Plane's render thread. 50% of cores provides
-/// good tile throughput without starving the simulator.
-pub fn default_cpu_concurrent() -> usize {
-    (num_cpus() / 2).max(2)
-}
-
-/// Default prefetch in-flight limit: max(num_cpus / 4, 2)
-pub fn default_prefetch_in_flight() -> usize {
-    (num_cpus() / 4).max(2)
-}
-
 /// Default max concurrent jobs: num_cpus / 2, minimum 2.
 ///
 /// Limits total in-flight jobs (download + encode pipeline) to balance
@@ -59,50 +38,8 @@ pub fn default_max_concurrent_jobs() -> usize {
     (num_cpus() / 2).max(2)
 }
 
-/// Clamps HTTP concurrency to valid range and logs a warning if clamped.
-pub(super) fn clamp_http_concurrent(value: usize) -> usize {
-    if value < MIN_HTTP_CONCURRENT {
-        tracing::warn!(
-            requested = value,
-            min = MIN_HTTP_CONCURRENT,
-            max = MAX_HTTP_CONCURRENT,
-            "max_http_concurrent below minimum, clamping to {}",
-            MIN_HTTP_CONCURRENT
-        );
-        MIN_HTTP_CONCURRENT
-    } else if value > MAX_HTTP_CONCURRENT {
-        tracing::warn!(
-            requested = value,
-            min = MIN_HTTP_CONCURRENT,
-            max = MAX_HTTP_CONCURRENT,
-            "max_http_concurrent above maximum, clamping to {} (prevents provider rate limiting)",
-            MAX_HTTP_CONCURRENT
-        );
-        MAX_HTTP_CONCURRENT
-    } else {
-        value
-    }
-}
-
 // =============================================================================
-// HTTP concurrency limits
-// =============================================================================
-
-/// Minimum HTTP concurrency limit.
-/// Below this, performance suffers significantly.
-pub const MIN_HTTP_CONCURRENT: usize = 64;
-
-/// Maximum HTTP concurrency limit.
-/// Above this, providers get rate-limited causing cascade failures.
-pub const MAX_HTTP_CONCURRENT: usize = 256;
-
-/// Default HTTP concurrency limit.
-/// Conservative default of 128 prevents provider rate limiting while
-/// maintaining good performance. Tested stable with Apple/Bing providers.
-pub const DEFAULT_HTTP_CONCURRENT: usize = 128;
-
-// =============================================================================
-// Pipeline defaults
+// Per-chunk download defaults
 // =============================================================================
 
 /// Default request timeout in seconds.
@@ -110,15 +47,6 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 10;
 
 /// Default maximum retry attempts.
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
-
-/// Default retry backoff base delay in milliseconds.
-pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 100;
-
-/// Default coalesce channel capacity.
-pub const DEFAULT_COALESCE_CHANNEL_CAPACITY: usize = 16;
-
-/// Default maximum concurrent downloads per tile.
-pub const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 256;
 
 // =============================================================================
 // Cache defaults
@@ -138,9 +66,6 @@ pub const DEFAULT_DISK_CACHE_SIZE: usize = 20 * 1024 * 1024 * 1024;
 // Download defaults
 // =============================================================================
 
-/// Default download timeout in seconds.
-pub const DEFAULT_DOWNLOAD_TIMEOUT_SECS: u64 = 30;
-
 // =============================================================================
 // Generation defaults
 // =============================================================================
@@ -157,23 +82,6 @@ pub const DEFAULT_WEB_API_PORT: u16 = 8086;
 
 /// Default interval between prefetch cycles in milliseconds.
 pub const DEFAULT_PREFETCH_CYCLE_INTERVAL_MS: u64 = 2000;
-
-// =============================================================================
-// Adaptive prefetch calibration defaults
-// =============================================================================
-
-/// Default aggressive threshold: 30 tiles/sec.
-/// Systems exceeding this use position-based prefetch triggers.
-pub const DEFAULT_CALIBRATION_AGGRESSIVE_THRESHOLD: f64 = 30.0;
-
-/// Default opportunistic threshold: 10 tiles/sec.
-/// Systems between this and aggressive use circuit breaker triggers.
-/// Below this, prefetch is disabled.
-pub const DEFAULT_CALIBRATION_OPPORTUNISTIC_THRESHOLD: f64 = 10.0;
-
-/// Default calibration sample duration: 60 seconds.
-/// How long to measure throughput during initial calibration.
-pub const DEFAULT_CALIBRATION_SAMPLE_DURATION: u64 = 60;
 
 // =============================================================================
 // Transition ramp defaults
@@ -214,6 +122,10 @@ pub const DEFAULT_BOX_EXTENT: f64 = 7.0;
 /// 0.8 means 80% ahead / 20% behind on the primary axis.
 pub const DEFAULT_BOX_MAX_BIAS: f64 = 0.8;
 
+/// Share of the demand lane's capacity given to the prefetch lane.
+/// The one sanctioned sizing knob; the pool formulas stay derived.
+pub const DEFAULT_PREFETCH_CAPACITY_SHARE: f64 = 0.35;
+
 /// Default minimum prefetch box extent (degrees) at low speed.
 ///
 /// Applied when aircraft ground speed is at or below `DEFAULT_BOX_MIN_SPEED`.
@@ -250,6 +162,19 @@ pub const DEFAULT_FUSE_MAX_BACKGROUND: u16 = 256;
 /// Set to 75% of `max_background` as per kernel convention.
 pub const DEFAULT_FUSE_CONGESTION_THRESHOLD: u16 = DEFAULT_FUSE_MAX_BACKGROUND * 3 / 4; // 192
 
+/// Night lighting is on by default; it only acts when the installed packages
+/// carry night recipes and the X-Plane installation is found.
+pub const DEFAULT_NIGHT_ENABLED: bool = true;
+
+/// Default night lighting brightness multiplier.
+pub const DEFAULT_NIGHT_BRIGHTNESS: f64 = 1.0;
+
+/// Status pane symbols: emoji when the terminal is found able to draw them.
+pub const DEFAULT_TUI_SYMBOLS: &str = "auto";
+
+/// The values `tui.symbols` accepts.
+pub const TUI_SYMBOLS_VALUES: &[&str] = &["auto", "emoji", "plain"];
+
 // =============================================================================
 // Control plane defaults
 // =============================================================================
@@ -285,22 +210,24 @@ pub const DEFAULT_GPU_DEVICE: &str = "integrated";
 // Executor defaults
 // =============================================================================
 
-/// Default maximum concurrent tasks in the executor.
-pub const DEFAULT_EXECUTOR_MAX_CONCURRENT_TASKS: usize = 128;
-
-/// Default job channel capacity (internal job queue).
-pub const DEFAULT_EXECUTOR_JOB_CHANNEL_CAPACITY: usize = 256;
-
-/// Default request channel capacity (external request queue).
-pub const DEFAULT_EXECUTOR_REQUEST_CHANNEL_CAPACITY: usize = 1000;
-
 // =============================================================================
 // Package manager defaults
 // =============================================================================
 
-/// Default package library URL (XEarthLayer official package library).
+/// Default package library URL: library generation v2 of the XEarthLayer
+/// official package library, the rebuilt world (#334).
 pub const DEFAULT_LIBRARY_URL: &str =
+    "https://xearthlayer.app/packages/v2/xearthlayer_package_library.txt";
+
+/// The library every release before 0.5.0 read: the old world, frozen at the
+/// repository root for those clients (#333). A config naming it reads
+/// [`DEFAULT_LIBRARY_URL`].
+pub const LEGACY_LIBRARY_URL: &str =
     "https://xearthlayer.app/packages/xearthlayer_package_library.txt";
+
+/// The staging channel the 0.5.0 alpha testers were pointed at, before the
+/// rebuild was promoted to v2. A config naming it reads [`DEFAULT_LIBRARY_URL`].
+pub const ALPHA_STAGING_LIBRARY_URL: &str = "https://raw.githubusercontent.com/samsoir/xearthlayer-regional-scenery/staging/xearthlayer_package_library.txt";
 
 // =============================================================================
 // Download config defaults (for DownloadConfig struct)
@@ -315,14 +242,15 @@ pub const DEFAULT_PARALLEL_DOWNLOADS: usize = 32;
 
 impl Default for ConfigFile {
     fn default() -> Self {
-        let config_dir = super::file::config_directory();
-        let cache_dir = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("xearthlayer");
+        let cache_dir = crate::paths::tile_cache_dir();
 
         Self {
             general: GeneralSettings {
                 update_check: DEFAULT_UPDATE_CHECK,
+                // Not LAYOUT_VERSION: the parser overlays a file onto these
+                // defaults, so a current version here would make every
+                // pre-0.5.0 configuration claim to be migrated already.
+                layout_version: 0,
             },
             provider: ProviderSettings {
                 provider_type: "bing".to_string(),
@@ -340,21 +268,9 @@ impl Default for ConfigFile {
                 compressor: DEFAULT_COMPRESSOR.to_string(),
                 gpu_device: DEFAULT_GPU_DEVICE.to_string(),
             },
-            download: DownloadSettings {
-                timeout: DEFAULT_DOWNLOAD_TIMEOUT_SECS,
-            },
             generation: GenerationSettings {
                 threads: (num_cpus() / 2).max(2),
                 timeout: DEFAULT_GENERATION_TIMEOUT_SECS,
-            },
-            pipeline: PipelineSettings {
-                max_http_concurrent: default_http_concurrent(),
-                max_cpu_concurrent: default_cpu_concurrent(),
-                max_prefetch_in_flight: default_prefetch_in_flight(),
-                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-                max_retries: DEFAULT_MAX_RETRIES,
-                retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
-                coalesce_channel_capacity: DEFAULT_COALESCE_CHANNEL_CAPACITY,
             },
             xplane: XPlaneSettings { scenery_dir: None },
             packages: PackagesSettings {
@@ -363,20 +279,17 @@ impl Default for ConfigFile {
                 custom_scenery_path: None,
                 auto_install_overlays: false,
                 disable_overlays: false,
+                xworld_pro: false,
                 temp_dir: None,
                 concurrent_downloads: 5,
             },
             logging: LoggingSettings {
-                file: config_dir.join("xearthlayer.log"),
+                file: crate::paths::log_file(),
             },
             prefetch: PrefetchSettings {
                 enabled: true,
-                mode: "auto".to_string(),
                 web_api_port: DEFAULT_WEB_API_PORT,
                 cycle_interval_ms: DEFAULT_PREFETCH_CYCLE_INTERVAL_MS,
-                calibration_aggressive_threshold: DEFAULT_CALIBRATION_AGGRESSIVE_THRESHOLD,
-                calibration_opportunistic_threshold: DEFAULT_CALIBRATION_OPPORTUNISTIC_THRESHOLD,
-                calibration_sample_duration: DEFAULT_CALIBRATION_SAMPLE_DURATION,
                 takeoff_climb_ft: DEFAULT_TAKEOFF_CLIMB_FT,
                 takeoff_timeout_secs: DEFAULT_TAKEOFF_TIMEOUT_SECS,
                 landing_hysteresis_secs: DEFAULT_LANDING_HYSTERESIS_SECS,
@@ -386,6 +299,7 @@ impl Default for ConfigFile {
                 stale_region_timeout: DEFAULT_PREFETCH_STALE_REGION_TIMEOUT,
                 box_extent: DEFAULT_BOX_EXTENT,
                 box_max_bias: DEFAULT_BOX_MAX_BIAS,
+                capacity_share: DEFAULT_PREFETCH_CAPACITY_SHARE,
             },
             control_plane: ControlPlaneSettings {
                 max_concurrent_jobs: default_max_concurrent_jobs(),
@@ -399,19 +313,22 @@ impl Default for ConfigFile {
             },
             patches: PatchesSettings {
                 enabled: true,
-                directory: Some(config_dir.join("patches")),
+                directory: Some(crate::paths::patches_dir()),
             },
             executor: ExecutorSettings {
-                max_concurrent_tasks: DEFAULT_EXECUTOR_MAX_CONCURRENT_TASKS,
-                job_channel_capacity: DEFAULT_EXECUTOR_JOB_CHANNEL_CAPACITY,
-                request_channel_capacity: DEFAULT_EXECUTOR_REQUEST_CHANNEL_CAPACITY,
                 request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
                 max_retries: DEFAULT_MAX_RETRIES,
-                retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
             },
             fuse: FuseSettings {
                 max_background: DEFAULT_FUSE_MAX_BACKGROUND,
                 congestion_threshold: DEFAULT_FUSE_CONGESTION_THRESHOLD,
+            },
+            night: NightSettings {
+                enabled: DEFAULT_NIGHT_ENABLED,
+                brightness: DEFAULT_NIGHT_BRIGHTNESS,
+            },
+            tui: TuiSettings {
+                symbols: DEFAULT_TUI_SYMBOLS.to_string(),
             },
         }
     }

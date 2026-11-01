@@ -16,7 +16,7 @@ See [How It Works](how-it-works.md) for a detailed architectural explanation.
 ## Prerequisites
 
 - **X-Plane 12** (X-Plane 11 may work but is untested)
-- **Linux** (Windows and macOS support planned)
+- **Linux** with FUSE support, or **macOS** with [macFUSE](https://macfuse.io) — see the [macOS guide](macos.md) (Windows support planned)
 - **Internet connection** for streaming imagery
 - Basic familiarity with the command line
 
@@ -78,7 +78,7 @@ sudo dnf install fuse3-devel       # Fedora, RHEL
 # Clone, build and install
 git clone https://github.com/samsoir/xearthlayer.git
 cd xearthlayer
-make install  # Builds, then installs to ~/.local/bin (no sudo required)
+make install  # Builds, then installs every binary to ~/.local/bin (no sudo required)
 
 # Verify installation
 xearthlayer --version
@@ -88,6 +88,8 @@ xearthlayer --version
 ```bash
 make install PREFIX=/usr/local  # Requires sudo for /usr/local/bin
 ```
+
+`make install` installs everything the workspace builds. To install one binary, use its own target, for example `make install-xearthlayer` for the runtime alone or `make install-xearthlayer-publish` for the publishing tools; `make help` lists the current set.
 
 If the build stops with `rustc <version> is not supported by the following
 packages`, your Rust is too old. Install rustup as above and start a new
@@ -131,9 +133,10 @@ xearthlayer setup
 The wizard will guide you through:
 
 1. **X-Plane Custom Scenery** - Auto-detects your X-Plane 12 installation or lets you specify the path
-2. **Package Location** - Where to store scenery packages (default: `~/.xearthlayer/packages`)
-3. **Cache Location** - Where to store cached tiles with storage type detection (NVMe/SSD/HDD)
-4. **System Configuration** - Recommends optimal memory and disk cache sizes based on your hardware
+2. **Package Location** - Where to store scenery packages (default: `~/.local/share/xearthlayer/packages`)
+3. **Imagery Provider** - Which satellite imagery to stream. Most options need no account; the wizard prompts for a key or token only for Google Maps and Mapbox
+4. **Cache Configuration** - Where to store cached tiles, with storage type detection (NVMe/SSD/HDD), and recommended memory and disk cache sizes based on your hardware
+5. **DDS Encoding** - Chooses the texture encoder, and which GPU to use if you have more than one
 
 The wizard detects your system's CPU, memory, and storage type to recommend the best settings.
 
@@ -142,17 +145,17 @@ The wizard detects your system's CPU, memory, and storage type to recommend the 
 If you prefer manual setup:
 
 ```bash
-xearthlayer init  # Creates ~/.xearthlayer/config.ini with defaults
+xearthlayer init  # Creates ~/.config/xearthlayer/config.ini with defaults
 ```
 
-Then edit `~/.xearthlayer/config.ini`:
+Then edit `~/.config/xearthlayer/config.ini`:
 
 ```ini
 [xplane]
 scenery_dir = /path/to/X-Plane 12/Custom Scenery
 
 [packages]
-# library_url defaults to https://xearthlayer.app/packages/xearthlayer_package_library.txt
+# library_url defaults to https://xearthlayer.app/packages/v2/xearthlayer_package_library.txt
 auto_install_overlays = true
 
 [provider]
@@ -214,7 +217,7 @@ xearthlayer run
 XEarthLayer v0.1.0
 ========================================
 
-Packages:       /home/user/.xearthlayer/packages
+Packages:       /home/user/.local/share/xearthlayer/packages
 Custom Scenery: /home/user/X-Plane 12/Custom Scenery
 DDS Format:     BC1
 Provider:       Bing Maps

@@ -20,7 +20,7 @@ use crate::executor::{
 use crate::executor::{
     ErrorPolicy, Job, JobId, JobResult, JobStatus, Priority, Task, TILE_GENERATION_GROUP,
 };
-use crate::tasks::{BuildAndCacheDdsTask, DownloadChunksTask};
+use crate::tasks::{BuildAndCacheDdsTask, CachedTileProbeTask, DownloadChunksTask};
 use std::sync::Arc;
 
 /// Job for generating a single DDS texture from satellite imagery.
@@ -81,6 +81,10 @@ where
 
     /// Download configuration with shared HTTP semaphore
     download_config: DownloadConfig,
+
+    /// Prepend a cache re-check so a tile cached since queueing is skipped
+    /// (prefetch lane only, #296)
+    probe_cache: bool,
 }
 
 impl<P, E, M, DD, D, X> DdsGenerateJob<P, E, M, DD, D, X>
@@ -129,7 +133,15 @@ where
             disk_cache,
             executor,
             download_config,
+            probe_cache: false,
         }
+    }
+
+    /// Starts the job with a cache probe, so it becomes a no-op when the
+    /// tile is already cached by the time the job is admitted.
+    pub fn with_cache_probe(mut self) -> Self {
+        self.probe_cache = true;
+        self
     }
 
     /// Returns the tile coordinates for this job.
@@ -171,13 +183,21 @@ where
     }
 
     fn create_tasks(&self) -> Vec<Box<dyn Task>> {
-        vec![
+        let mut tasks: Vec<Box<dyn Task>> = Vec::with_capacity(3);
+        if self.probe_cache {
+            tasks.push(Box::new(CachedTileProbeTask::new(
+                self.tile,
+                Arc::clone(&self.memory_cache),
+                Arc::clone(&self.dds_disk_cache),
+            )));
+        }
+        tasks.extend([
             Box::new(DownloadChunksTask::with_config(
                 self.tile,
                 Arc::clone(&self.provider),
                 Arc::clone(&self.disk_cache),
                 self.download_config.clone(),
-            )),
+            )) as Box<dyn Task>,
             Box::new(BuildAndCacheDdsTask::new(
                 self.tile,
                 Arc::clone(&self.encoder),
@@ -185,7 +205,8 @@ where
                 Arc::clone(&self.dds_disk_cache),
                 Arc::clone(&self.executor),
             )),
-        ]
+        ]);
+        tasks
     }
 
     fn on_complete(&self, result: &JobResult) -> JobStatus {
@@ -222,6 +243,173 @@ mod tests {
         // DdsGenerateJob should report its name correctly
         // This test just verifies the expected name string
         assert_eq!("DdsGenerate", "DdsGenerate");
+    }
+
+    struct StubProvider;
+    impl ChunkProvider for StubProvider {
+        fn download_chunk(
+            &self,
+            _row: u32,
+            _col: u32,
+            _zoom: u8,
+        ) -> impl std::future::Future<
+            Output = Result<bytes::Bytes, crate::executor::ChunkDownloadError>,
+        > + Send {
+            async { unreachable!("tasks are only listed, never run") }
+        }
+        fn name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    struct StubEncoder;
+    impl TextureEncoderAsync for StubEncoder {
+        fn encode(
+            &self,
+            _image: image::RgbaImage,
+        ) -> Result<Vec<u8>, crate::executor::TextureEncodeError> {
+            unreachable!("tasks are only listed, never run")
+        }
+        fn expected_size(&self, _w: u32, _h: u32) -> usize {
+            0
+        }
+    }
+
+    struct StubMemory;
+    impl MemoryCache for StubMemory {
+        fn get(
+            &self,
+            _r: u32,
+            _c: u32,
+            _z: u8,
+        ) -> impl std::future::Future<Output = Option<bytes::Bytes>> + Send {
+            async { None }
+        }
+        fn put(
+            &self,
+            _r: u32,
+            _c: u32,
+            _z: u8,
+            _d: bytes::Bytes,
+        ) -> impl std::future::Future<Output = ()> + Send {
+            async {}
+        }
+        fn size_bytes(&self) -> usize {
+            0
+        }
+        fn entry_count(&self) -> usize {
+            0
+        }
+    }
+
+    struct StubDdsDisk;
+    impl DdsDiskCache for StubDdsDisk {
+        fn get(
+            &self,
+            _r: u32,
+            _c: u32,
+            _z: u8,
+        ) -> impl std::future::Future<Output = Option<bytes::Bytes>> + Send {
+            async { None }
+        }
+        fn put(
+            &self,
+            _r: u32,
+            _c: u32,
+            _z: u8,
+            _d: bytes::Bytes,
+        ) -> impl std::future::Future<Output = ()> + Send {
+            async {}
+        }
+        fn contains(
+            &self,
+            _r: u32,
+            _c: u32,
+            _z: u8,
+        ) -> impl std::future::Future<Output = bool> + Send {
+            async { false }
+        }
+    }
+
+    struct StubDisk;
+    impl DiskCache for StubDisk {
+        fn get(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            _cr: u8,
+            _cc: u8,
+        ) -> impl std::future::Future<Output = Option<bytes::Bytes>> + Send {
+            async { None }
+        }
+        fn put(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            _cr: u8,
+            _cc: u8,
+            _d: bytes::Bytes,
+        ) -> impl std::future::Future<Output = Result<(), std::io::Error>> + Send {
+            async { Ok(()) }
+        }
+    }
+
+    struct StubExecutor;
+    impl BlockingExecutor for StubExecutor {
+        fn execute_blocking<F, R>(
+            &self,
+            f: F,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<R, crate::executor::ExecutorError>> + Send>,
+        >
+        where
+            F: FnOnce() -> R + Send + 'static,
+            R: Send + 'static,
+        {
+            Box::pin(async move { Ok(f()) })
+        }
+    }
+
+    fn make_job(
+    ) -> DdsGenerateJob<StubProvider, StubEncoder, StubMemory, StubDdsDisk, StubDisk, StubExecutor>
+    {
+        DdsGenerateJob::new(
+            TileCoord {
+                row: 100,
+                col: 200,
+                zoom: 15,
+            },
+            Priority::PREFETCH,
+            Arc::new(StubProvider),
+            Arc::new(StubEncoder),
+            Arc::new(StubMemory),
+            Arc::new(StubDdsDisk),
+            Arc::new(StubDisk),
+            Arc::new(StubExecutor),
+            DownloadConfig::default(),
+        )
+    }
+
+    #[test]
+    fn cache_probe_runs_first_only_when_enabled() {
+        let plain = make_job();
+        assert_eq!(
+            plain.create_tasks().first().unwrap().name(),
+            "DownloadChunks"
+        );
+
+        let probed = make_job().with_cache_probe();
+        let names: Vec<_> = probed
+            .create_tasks()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["CachedTileProbe", "DownloadChunks", "BuildAndCacheDds"]
+        );
     }
 
     #[test]

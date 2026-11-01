@@ -1,15 +1,18 @@
 //! RAII cleanup of an install's temporary directory.
 //!
-//! [`InstallTempGuard`] wraps the per-install temp directory created by
-//! `PackageInstaller::install_from_metadata`. On drop, the directory is
-//! recursively removed. This catches cleanup on every exit path:
+//! [`InstallTempGuard`] wraps the per-install temp directory that
+//! `PackageInstaller` creates to hold a package's downloaded parts. On drop,
+//! the directory is recursively removed. This catches cleanup on every exit
+//! path:
 //!
-//! - Early `Err` from a download failure (issue #187: previously, the
-//!   temp directory leaked on hard download failures).
-//! - Mid-install errors from extraction, checksum mismatch, or move.
-//! - The success path (the explicit Stage 7 cleanup at end of
-//!   `install_from_metadata` is no longer needed and is removed in
-//!   the same change).
+//! - A failed or cancelled download (issue #187: previously, the temp
+//!   directory leaked on hard download failures).
+//! - A failed or cancelled extraction, which leaves any parts not yet read.
+//! - The success path, where the parts are already gone and only the empty
+//!   directory remains.
+//!
+//! The extracted tree is not under this guard: it is written beside the
+//! install path and has its own staging guard (`aside::Staged`).
 //!
 //! Cleanup is unconditional and idempotent: removing an already-deleted
 //! directory is silently ignored.

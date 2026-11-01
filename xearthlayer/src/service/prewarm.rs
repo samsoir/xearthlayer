@@ -33,12 +33,13 @@ use std::sync::Arc;
 
 use crate::aircraft_position::SharedAircraftPosition;
 use crate::airport::AirportIndex;
-use crate::executor::{DdsClient, MemoryCache};
+use crate::executor::MemoryCache;
 use crate::geo_index::GeoIndex;
 use crate::prefetch::{
     generate_dsf_grid, start_prewarm, DsfGridBounds, FileTerrainScanner, PrewarmHandle,
     TerrainScanner,
 };
+use crate::runtime::PrefetchLane;
 use crate::xplane::XPlaneEnvironment;
 
 use super::orchestrator_config::PrewarmConfig as OrchestratorPrewarmConfig;
@@ -191,14 +192,14 @@ impl PrewarmOrchestrator {
             )));
         }
 
-        // Get service for DDS client and memory cache
+        // Get service for prefetch lane and memory cache
         let service = orchestrator
             .service()
             .ok_or_else(|| PrewarmStartError::new("No services available for prewarm"))?;
 
-        let dds_client = service
-            .dds_client()
-            .ok_or_else(|| PrewarmStartError::new("DDS client not available for prewarm"))?;
+        let prefetch_lane = service
+            .prefetch_lane()
+            .ok_or_else(|| PrewarmStartError::new("Prefetch lane not available for prewarm"))?;
 
         let tile_count = tiles.len();
         let airport_name = airport.name.clone();
@@ -211,7 +212,7 @@ impl PrewarmOrchestrator {
             Self::start_prewarm_with_cache(
                 icao,
                 tiles,
-                dds_client,
+                prefetch_lane,
                 memory_cache,
                 Arc::clone(&ortho_index),
                 geo_index,
@@ -234,7 +235,7 @@ impl PrewarmOrchestrator {
     fn start_prewarm_with_cache<M: MemoryCache + Send + Sync + 'static>(
         icao: &str,
         tiles: Vec<crate::coord::TileCoord>,
-        dds_client: Arc<dyn DdsClient>,
+        prefetch_lane: Arc<dyn PrefetchLane>,
         memory_cache: Arc<M>,
         ortho_index: Arc<crate::ortho_union::OrthoUnionIndex>,
         geo_index: Option<Arc<GeoIndex>>,
@@ -243,7 +244,7 @@ impl PrewarmOrchestrator {
         start_prewarm(
             icao.to_string(),
             tiles,
-            dds_client,
+            prefetch_lane,
             memory_cache,
             ortho_index,
             geo_index,

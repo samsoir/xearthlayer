@@ -5,7 +5,7 @@
 //! channel-full handling.
 
 use crate::coord::TileCoord;
-use crate::executor::DdsClient;
+use crate::runtime::{LaneError, PrefetchLane};
 
 use super::super::strategy::PrefetchPlan;
 use super::super::transition_throttle::TransitionThrottle;
@@ -50,22 +50,23 @@ impl ExecutionResult {
 // Execution
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Execute a prefetch plan by submitting tiles to the DDS client.
+/// Execute a prefetch plan by submitting tiles to the prefetch lane.
 ///
-/// Applies backpressure-aware submission based on executor resource utilization:
+/// Applies backpressure-aware submission based on the higher of executor
+/// resource utilisation and demand on the FUSE mount (#246):
 /// - Load > [`BACKPRESSURE_DEFER_THRESHOLD`]: skips this cycle (deferred)
 /// - Load > [`BACKPRESSURE_REDUCE_THRESHOLD`]: submits reduced fraction
 /// - Applies transition throttle (takeoff ramp-up)
-/// - Stops immediately on `ChannelFull` error
+/// - Stops immediately on a full lane
 ///
 /// # Returns
 ///
 /// An [`ExecutionResult`] with submitted count, pending tiles, and defer flag.
 pub(crate) fn execute_plan(
     plan: &PrefetchPlan,
-    client: &dyn DdsClient,
+    lane: &dyn PrefetchLane,
+    fuse_pressure: f64,
     transition_throttle: &mut TransitionThrottle,
-    cancellation: tokio_util::sync::CancellationToken,
 ) -> ExecutionResult {
     let _span = tracing::debug_span!(
         target: "profiling",
@@ -75,8 +76,14 @@ pub(crate) fn execute_plan(
     )
     .entered();
 
-    // Check executor resource utilization before submitting
-    let load = client.executor_load();
+    // Backpressure is the higher of two independent pressures, because neither
+    // sees the other's load. `executor_load` measures our own pipeline: how
+    // much work waits on the prefetch lane for admission. `fuse_pressure`
+    // measures X-Plane's demand on the mount, which at a boundary crossing is
+    // mostly reads served from cache and so invisible to the lanes. Submitting at full rate into that
+    // collision is what set the memory ceiling in #227; see #246.
+    let executor_load = lane.load();
+    let load = executor_load.max(fuse_pressure);
     if load > BACKPRESSURE_DEFER_THRESHOLD {
         // Store every planned tile as pending so they're retried when load
         // drops. No cap — the executor controls throughput via its channel
@@ -84,10 +91,21 @@ pub(crate) fn execute_plan(
         // silent drops at submission boundaries create forward-starvation
         // because discarded tiles never get re-planned on subsequent cycles
         // once their regions get marked or cached by some other path.
+        // Both figures, not just the maximum: calibrating this throttle means
+        // knowing which pressure deferred a cycle, and they are the two
+        // independent causes. A log that reported only `load` could not
+        // distinguish "our pipeline is saturated" from "X-Plane is reading hard".
         tracing::info!(
             load = format!("{:.1}%", load * 100.0),
+            executor_load = format!("{:.1}%", executor_load * 100.0),
+            fuse_pressure = format!("{:.1}%", fuse_pressure * 100.0),
+            source = if fuse_pressure > executor_load {
+                "fuse"
+            } else {
+                "executor"
+            },
             tiles_planned = plan.tiles.len(),
-            "Executor backpressure — deferring prefetch cycle, tiles stored as pending"
+            "Backpressure, deferring prefetch cycle, tiles stored as pending"
         );
         return ExecutionResult {
             submitted_tiles: Vec::new(),
@@ -101,9 +119,16 @@ pub(crate) fn execute_plan(
         let reduced = ((plan.tiles.len() as f64) * BACKPRESSURE_REDUCED_FRACTION).ceil() as usize;
         tracing::debug!(
             load = format!("{:.1}%", load * 100.0),
+            executor_load = format!("{:.1}%", executor_load * 100.0),
+            fuse_pressure = format!("{:.1}%", fuse_pressure * 100.0),
+            source = if fuse_pressure > executor_load {
+                "fuse"
+            } else {
+                "executor"
+            },
             full_plan = plan.tiles.len(),
             reduced_to = reduced,
-            "Moderate backpressure — reducing prefetch submission"
+            "Moderate backpressure, reducing prefetch submission"
         );
         reduced
     } else {
@@ -150,11 +175,9 @@ pub(crate) fn execute_plan(
     let mut submitted_tiles: Vec<TileCoord> = Vec::with_capacity(tiles_to_submit.len());
     let mut channel_remainder = Vec::new();
     for (idx, tile) in tiles_to_submit.iter().enumerate() {
-        let request =
-            crate::runtime::JobRequest::prefetch_with_cancellation(*tile, cancellation.clone());
-        match client.submit(request) {
+        match lane.submit(*tile) {
             Ok(()) => submitted_tiles.push(*tile),
-            Err(crate::executor::DdsClientError::ChannelFull) => {
+            Err(LaneError::Full) => {
                 channel_remainder = tiles_to_submit[idx..].to_vec();
                 tracing::debug!(
                     submitted = submitted_tiles.len(),
@@ -163,7 +186,7 @@ pub(crate) fn execute_plan(
                 );
                 break;
             }
-            Err(crate::executor::DdsClientError::ChannelClosed) => {
+            Err(LaneError::Closed) => {
                 tracing::warn!("Executor channel closed — stopping prefetch");
                 break;
             }
@@ -211,7 +234,7 @@ pub(crate) fn execute_plan(
 mod tests {
     use super::*;
     use crate::prefetch::adaptive::coordinator::test_support::{
-        test_calibration, test_plan, BackpressureMockClient, CapLimitedDdsClient, HighLoadDdsClient,
+        test_calibration, test_plan, BackpressureMockLane, CapLimitedLane, HighLoadLane,
     };
     use crate::prefetch::adaptive::transition_throttle::TransitionThrottle;
     use std::sync::Arc;
@@ -220,17 +243,115 @@ mod tests {
         TransitionThrottle::new()
     }
 
+    /// #246: X-Plane's demand on the mount is invisible to `executor_load`,
+    /// which sees generation jobs but not reads served from cache, and to
+    /// `SimState::should_prefetch`, which reports X-Plane's own DSF loader. At a
+    /// boundary crossing prefetch therefore submitted at full rate into the peak
+    /// concurrency event, which per #227 is what sets the memory floor.
+    #[test]
+    fn fuse_pressure_alone_defers_the_cycle() {
+        // Executor idle, mount saturated: exactly the collision the existing
+        // signals miss.
+        let client = BackpressureMockLane::new(0.0).with_fuse_pressure(0.85);
+        let plan = test_plan(50);
+        let mut throttle = default_throttle();
+
+        let result = execute_plan(
+            &plan,
+            &client,
+            client.simulated_fuse_pressure(),
+            &mut throttle,
+        );
+
+        assert!(
+            result.deferred,
+            "FUSE pressure above the defer threshold must defer the cycle"
+        );
+        assert_eq!(result.submitted_count(), 0);
+        assert_eq!(
+            result.pending.len(),
+            50,
+            "deferred tiles are stored as pending, never dropped (#172)"
+        );
+    }
+
+    #[test]
+    fn fuse_pressure_alone_reduces_the_submission() {
+        // 0.50 is where the reference-leg spike lands: 23 open handles against
+        // the 512 MB ceiling. Reduce, not defer.
+        let client = BackpressureMockLane::new(0.0).with_fuse_pressure(0.55);
+        let plan = test_plan(100);
+        let mut throttle = default_throttle();
+
+        let result = execute_plan(
+            &plan,
+            &client,
+            client.simulated_fuse_pressure(),
+            &mut throttle,
+        );
+
+        assert!(!result.deferred);
+        assert!(
+            result.submitted_count() < 100 && result.submitted_count() > 0,
+            "moderate FUSE pressure should reduce rather than stop, got {}",
+            result.submitted_count()
+        );
+    }
+
+    #[test]
+    fn the_higher_of_the_two_signals_wins() {
+        // Neither signal may mask the other: a busy executor with a quiet mount
+        // must still defer, which is the pre-#246 behaviour.
+        let executor_busy = BackpressureMockLane::new(0.85).with_fuse_pressure(0.0);
+        let plan = test_plan(10);
+        let mut throttle = default_throttle();
+
+        let result = execute_plan(
+            &plan,
+            &executor_busy,
+            executor_busy.simulated_fuse_pressure(),
+            &mut throttle,
+        );
+
+        assert!(result.deferred, "executor load must still defer on its own");
+    }
+
+    /// Acceptance criterion 4: no return of the #59 self-tripping behaviour.
+    /// A quiet mount and a quiet executor must submit the whole plan.
+    #[test]
+    fn cruise_conditions_submit_the_full_plan() {
+        // ~900 reads/min cruise pins almost nothing: X-Plane holds a handful of
+        // textures open, nowhere near the ceiling.
+        let client = BackpressureMockLane::new(0.1).with_fuse_pressure(0.05);
+        let plan = test_plan(40);
+        let mut throttle = default_throttle();
+
+        let result = execute_plan(
+            &plan,
+            &client,
+            client.simulated_fuse_pressure(),
+            &mut throttle,
+        );
+
+        assert!(!result.deferred);
+        assert_eq!(
+            result.submitted_count(),
+            40,
+            "cruise prefetch throughput must be unaffected"
+        );
+    }
+
     #[test]
     fn test_defers_under_high_backpressure() {
-        let client = BackpressureMockClient::new(0.85);
+        let client = BackpressureMockLane::new(0.85);
         let mut throttle = default_throttle();
         let plan = test_plan(10);
 
         let result = execute_plan(
             &plan,
             &client,
+            client.simulated_fuse_pressure(),
             &mut throttle,
-            tokio_util::sync::CancellationToken::new(),
         );
 
         assert_eq!(result.submitted_count(), 0);
@@ -241,15 +362,15 @@ mod tests {
 
     #[test]
     fn test_reduces_under_moderate_backpressure() {
-        let client = BackpressureMockClient::new(0.6);
+        let client = BackpressureMockLane::new(0.6);
         let mut throttle = default_throttle();
         let plan = test_plan(10);
 
         let result = execute_plan(
             &plan,
             &client,
+            client.simulated_fuse_pressure(),
             &mut throttle,
-            tokio_util::sync::CancellationToken::new(),
         );
 
         assert_eq!(result.submitted_count(), 5);
@@ -258,15 +379,15 @@ mod tests {
 
     #[test]
     fn test_full_submission_under_low_pressure() {
-        let client = BackpressureMockClient::new(0.1);
+        let client = BackpressureMockLane::new(0.1);
         let mut throttle = default_throttle();
         let plan = test_plan(10);
 
         let result = execute_plan(
             &plan,
             &client,
+            client.simulated_fuse_pressure(),
             &mut throttle,
-            tokio_util::sync::CancellationToken::new(),
         );
 
         assert_eq!(result.submitted_count(), 10);
@@ -275,16 +396,11 @@ mod tests {
 
     #[test]
     fn test_channel_full_stores_remainder() {
-        let client = CapLimitedDdsClient::new(5);
+        let client = CapLimitedLane::new(5);
         let mut throttle = default_throttle();
         let plan = test_plan(10);
 
-        let result = execute_plan(
-            &plan,
-            &client,
-            &mut throttle,
-            tokio_util::sync::CancellationToken::new(),
-        );
+        let result = execute_plan(&plan, &client, 0.0, &mut throttle);
 
         assert_eq!(result.submitted_count(), 5);
         assert_eq!(result.pending.len(), 5);
@@ -297,7 +413,7 @@ mod tests {
         // silent drops. The executor's natural backpressure is the only
         // rate governor; the coordinator must not discard work at the
         // submission boundary.
-        let client = Arc::new(HighLoadDdsClient);
+        let client = Arc::new(HighLoadLane);
         let mut throttle = default_throttle();
 
         let tiles: Vec<TileCoord> = (0..5000)
@@ -310,12 +426,7 @@ mod tests {
         let cal = test_calibration();
         let plan = PrefetchPlan::with_tiles(tiles.clone(), &cal, "boundary", 0, 5000);
 
-        let result = execute_plan(
-            &plan,
-            client.as_ref(),
-            &mut throttle,
-            tokio_util::sync::CancellationToken::new(),
-        );
+        let result = execute_plan(&plan, client.as_ref(), 0.0, &mut throttle);
 
         assert_eq!(result.submitted_count(), 0);
         assert!(result.deferred);
@@ -349,15 +460,10 @@ mod tests {
             .collect();
         let cal = test_calibration();
         let plan = PrefetchPlan::with_tiles(tiles.clone(), &cal, "test", 0, 5);
-        let client = CapLimitedDdsClient::new(3);
+        let client = CapLimitedLane::new(3);
         let mut throttle = default_throttle();
 
-        let result = execute_plan(
-            &plan,
-            &client,
-            &mut throttle,
-            tokio_util::sync::CancellationToken::new(),
-        );
+        let result = execute_plan(&plan, &client, 0.0, &mut throttle);
 
         assert_eq!(result.submitted_tiles.len(), 3, "First 3 tiles submit");
         assert_eq!(result.pending.len(), 2, "Last 2 tiles become pending");
@@ -378,18 +484,18 @@ mod tests {
 
     #[test]
     fn test_submitted_tiles_empty_when_throttle_cuts_all() {
-        // A BackpressureMockClient at high pressure causes defer — all
+        // A BackpressureMockLane at high pressure causes defer — all
         // tiles go to pending, none submitted. `submitted_tiles` must be
         // empty.
         let plan = test_plan(10);
-        let client = BackpressureMockClient::new(0.9);
+        let client = BackpressureMockLane::new(0.9);
         let mut throttle = default_throttle();
 
         let result = execute_plan(
             &plan,
             &client,
+            client.simulated_fuse_pressure(),
             &mut throttle,
-            tokio_util::sync::CancellationToken::new(),
         );
 
         assert!(result.submitted_tiles.is_empty());
@@ -416,15 +522,10 @@ mod tests {
             .collect();
         let cal = test_calibration();
         let plan = PrefetchPlan::with_tiles(tiles.clone(), &cal, "test", 0, tile_count);
-        let client = Arc::new(HighLoadDdsClient);
+        let client = Arc::new(HighLoadLane);
         let mut throttle = default_throttle();
 
-        let result = execute_plan(
-            &plan,
-            client.as_ref(),
-            &mut throttle,
-            tokio_util::sync::CancellationToken::new(),
-        );
+        let result = execute_plan(&plan, client.as_ref(), 0.0, &mut throttle);
 
         assert!(result.submitted_tiles.is_empty(), "High load defers all");
         assert_eq!(

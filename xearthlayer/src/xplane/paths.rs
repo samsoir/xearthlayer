@@ -10,7 +10,7 @@ use super::detection::XPlanePathError;
 ///
 /// The location varies by OS:
 /// - Linux: `~/.x-plane/x-plane_install_12.txt`
-/// - macOS: `~/.x-plane/x-plane_install_12.txt`
+/// - macOS: `~/Library/Preferences/x-plane_install_12.txt`
 /// - Windows: `%LOCALAPPDATA%\x-plane\x-plane_install_12.txt`
 pub fn get_install_reference_path() -> Result<PathBuf, XPlanePathError> {
     #[cfg(target_os = "windows")]
@@ -23,9 +23,17 @@ pub fn get_install_reference_path() -> Result<PathBuf, XPlanePathError> {
             .join("x-plane_install_12.txt"))
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        // Linux and macOS use ~/.x-plane
+        let home = dirs::home_dir().ok_or(XPlanePathError::NoHomeDirectory)?;
+        Ok(home
+            .join("Library")
+            .join("Preferences")
+            .join("x-plane_install_12.txt"))
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
         let home = dirs::home_dir().ok_or(XPlanePathError::NoHomeDirectory)?;
         Ok(home.join(".x-plane").join("x-plane_install_12.txt"))
     }

@@ -76,7 +76,11 @@ impl ConfigFile {
         }
 
         let content = super::writer::to_config_string(self);
-        std::fs::write(path, content).map_err(|e| ConfigFileError::WriteError(e.to_string()))
+        // Atomic: an interrupted save leaves the old file, never half of one.
+        crate::cache::integrity::write_atomic(path, |w| {
+            std::io::Write::write_all(w, content.as_bytes())
+        })
+        .map_err(|e| ConfigFileError::WriteError(e.to_string()))
     }
 
     /// Create the default config file if it doesn't exist.
@@ -92,16 +96,16 @@ impl ConfigFile {
     }
 }
 
-/// Get the path to the config directory (~/.xearthlayer).
+/// The directory holding the configuration file.
+///
+/// Delegates to [`crate::paths`], which owns every path the program resolves.
 pub fn config_directory() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".xearthlayer")
+    crate::paths::config_dir()
 }
 
-/// Get the path to the config file (~/.xearthlayer/config.ini).
+/// The path to `config.ini`.
 pub fn config_file_path() -> PathBuf {
-    config_directory().join("config.ini")
+    crate::paths::config_file()
 }
 
 #[cfg(test)]
@@ -117,7 +121,6 @@ mod tests {
         assert_eq!(config.cache.memory_size, DEFAULT_MEMORY_CACHE_SIZE);
         assert_eq!(config.cache.disk_size, DEFAULT_DISK_CACHE_SIZE);
         assert_eq!(config.texture.format, crate::dds::DdsFormat::BC1);
-        assert_eq!(config.download.timeout, DEFAULT_DOWNLOAD_TIMEOUT_SECS);
         assert!(config.xplane.scenery_dir.is_none());
     }
 
@@ -133,6 +136,14 @@ mod tests {
             config.provider.provider_type,
             default.provider.provider_type
         );
-        assert_eq!(config.download.timeout, default.download.timeout);
+        assert_eq!(
+            config.executor.request_timeout_secs,
+            default.executor.request_timeout_secs
+        );
+    }
+
+    #[test]
+    fn prefetch_is_enabled_by_default() {
+        assert!(ConfigFile::default().prefetch.enabled);
     }
 }

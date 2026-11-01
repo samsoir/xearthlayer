@@ -5,6 +5,8 @@
 use std::fmt;
 use std::time::Duration;
 
+use super::latency::LatencySummary;
+
 /// A point-in-time snapshot of pipeline metrics.
 ///
 /// This is an immutable copy of all metrics, safe to use for display
@@ -136,6 +138,25 @@ pub struct TelemetrySnapshot {
     pub total_assembly_time_ms: u64,
     /// Total encode time
     pub total_encode_time_ms: u64,
+
+    // === Lane metrics (#296) ===
+    /// FUSE generation latency of the most recent 60 s sample that had any,
+    /// cache hits excluded. Held across empty samples; `None` until one closes.
+    pub fuse_latency: Option<LatencySummary>,
+    /// FUSE generation latency since start. `None` until the first generation.
+    pub fuse_session_latency: Option<LatencySummary>,
+    /// FUSE requests abandoned at the timeout since start.
+    pub fuse_session_timeouts: usize,
+    /// FUSE demand jobs in flight
+    pub demand_in_flight: usize,
+    /// True while the prefetch lane stands aside for demand
+    pub prefetch_paused: bool,
+    /// Prefetch lane queue saturation, 0.0..=1.0: jobs waiting for admission against the group size
+    pub prefetch_lane_load: f64,
+    /// Prefetch lane jobs admitted and not yet finished
+    pub prefetch_lane_running: usize,
+    /// Prefetch lane jobs held waiting for admission
+    pub prefetch_lane_queued: usize,
 }
 
 impl Default for TelemetrySnapshot {
@@ -190,6 +211,14 @@ impl Default for TelemetrySnapshot {
             total_download_time_ms: 0,
             total_assembly_time_ms: 0,
             total_encode_time_ms: 0,
+            fuse_latency: None,
+            fuse_session_latency: None,
+            fuse_session_timeouts: 0,
+            demand_in_flight: 0,
+            prefetch_paused: false,
+            prefetch_lane_load: 0.0,
+            prefetch_lane_running: 0,
+            prefetch_lane_queued: 0,
         }
     }
 }
@@ -441,6 +470,7 @@ mod tests {
             total_download_time_ms: 120_000,
             total_assembly_time_ms: 15_000,
             total_encode_time_ms: 45_000,
+            ..Default::default()
         }
     }
 

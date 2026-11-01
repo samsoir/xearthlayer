@@ -7,8 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::package::{InstalledPackage, PackageType};
 use crate::patches::PatchDiscovery;
+use xearthlayer_package::{InstalledPackage, PackageType};
 
 use super::cache::{save_index_cache, try_load_cached_index, IndexCacheKey};
 use super::index::OrthoUnionIndex;
@@ -25,7 +25,7 @@ use super::source::OrthoSource;
 ///
 /// ```ignore
 /// use xearthlayer::ortho_union::OrthoUnionIndexBuilder;
-/// use xearthlayer::package::{Package, InstalledPackage, PackageType};
+/// use xearthlayer_package::{Package, InstalledPackage, PackageType};
 /// use semver::Version;
 ///
 /// let na = InstalledPackage::new(
@@ -90,7 +90,7 @@ impl OrthoUnionIndexBuilder {
     ///
     /// ```
     /// use xearthlayer::ortho_union::OrthoUnionIndexBuilder;
-    /// use xearthlayer::package::{Package, InstalledPackage, PackageType};
+    /// use xearthlayer_package::{Package, InstalledPackage, PackageType};
     /// use semver::Version;
     ///
     /// let na = InstalledPackage::new(
@@ -112,7 +112,7 @@ impl OrthoUnionIndexBuilder {
     ///
     /// ```
     /// use xearthlayer::ortho_union::OrthoUnionIndexBuilder;
-    /// use xearthlayer::package::{Package, InstalledPackage, PackageType};
+    /// use xearthlayer_package::{Package, InstalledPackage, PackageType};
     /// use semver::Version;
     ///
     /// let packages = vec![
@@ -316,7 +316,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::package::Package;
+    use xearthlayer_package::Package;
 
     fn create_test_patch(temp: &TempDir, name: &str) {
         let patch_dir = temp.path().join(name);

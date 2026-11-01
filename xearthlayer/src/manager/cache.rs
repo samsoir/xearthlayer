@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::package::PackageLibrary;
+use xearthlayer_package::PackageLibrary;
 
 use super::traits::LibraryClient;
 use super::ManagerResult;
@@ -151,7 +151,7 @@ impl<C: LibraryClient> LibraryClient for CachedLibraryClient<C> {
         self.fetch_fresh(url)
     }
 
-    fn fetch_metadata(&self, url: &str) -> ManagerResult<crate::package::PackageMetadata> {
+    fn fetch_metadata(&self, url: &str) -> ManagerResult<xearthlayer_package::PackageMetadata> {
         // Metadata is not cached - always fetch fresh
         // (metadata files change more frequently than library indexes)
         self.inner.fetch_metadata(url)
@@ -173,8 +173,8 @@ pub struct CacheStats {
 mod tests {
     use super::*;
     use crate::manager::ManagerError;
-    use crate::package::PackageMetadata;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use xearthlayer_package::PackageMetadata;
 
     /// Mock client that counts fetches.
     struct CountingClient {

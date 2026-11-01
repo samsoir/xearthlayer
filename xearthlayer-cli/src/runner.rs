@@ -28,11 +28,15 @@ impl CliRunner {
     pub fn config(&self) -> &ConfigFile {
         &self.config
     }
+}
 
-    /// Log startup information for a command.
-    pub fn log_startup(&self, command: &str) {
-        info!("XEarthLayer v{}", xearthlayer::VERSION);
-        info!("XEarthLayer CLI: {} command", command);
-        xearthlayer::metrics::log_allocator_environment();
-    }
+/// Log startup information for a command.
+///
+/// Free function because it never needed the runner's state, and `run` now
+/// takes its configuration from the preflight context rather than from a
+/// `CliRunner`.
+pub fn log_startup(command: &str) {
+    info!("XEarthLayer v{}", xearthlayer::VERSION);
+    info!("XEarthLayer CLI: {} command", command);
+    xearthlayer::metrics::log_allocator_environment();
 }

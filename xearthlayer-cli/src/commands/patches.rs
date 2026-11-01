@@ -48,12 +48,11 @@ pub fn run(command: PatchesCommands) -> Result<(), CliError> {
 
 /// Get the patches directory from config.
 fn get_patches_dir(config: &ConfigFile) -> PathBuf {
-    config.patches.directory.clone().unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".xearthlayer")
-            .join("patches")
-    })
+    config
+        .patches
+        .directory
+        .clone()
+        .unwrap_or_else(xearthlayer::paths::patches_dir)
 }
 
 /// List all patches.

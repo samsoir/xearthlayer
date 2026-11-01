@@ -66,8 +66,14 @@ impl WebApiClient {
 
     /// Fetch all datarefs from X-Plane and resolve IDs for the requested names.
     ///
-    /// Returns an error if any required datarefs are missing from X-Plane's response.
-    pub async fn lookup_datarefs(&self, names: &[&str]) -> Result<DatarefIdMap, WebApiError> {
+    /// Returns an error if any `required` dataref is missing from X-Plane's
+    /// response; `optional` ones are resolved when present and skipped
+    /// otherwise.
+    pub async fn lookup_datarefs(
+        &self,
+        required: &[&str],
+        optional: &[&str],
+    ) -> Result<DatarefIdMap, WebApiError> {
         let url = self.datarefs_url();
         let response = self
             .http
@@ -91,7 +97,8 @@ impl WebApiClient {
         let json: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| WebApiError::Json(e.to_string()))?;
 
-        datarefs::resolve_dataref_ids_checked(&json, names).map_err(WebApiError::MissingDatarefs)
+        datarefs::resolve_subscription(&json, required, optional)
+            .map_err(WebApiError::MissingDatarefs)
     }
 }
 

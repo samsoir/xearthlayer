@@ -8,13 +8,12 @@
 //! ```ignore
 //! use xearthlayer::service::{XEarthLayerService, ServiceConfig};
 //! use xearthlayer::provider::ProviderConfig;
-//! use xearthlayer::config::{TextureConfig, DownloadConfig};
+//! use xearthlayer::config::TextureConfig;
 //! use xearthlayer::dds::DdsFormat;
 //!
 //! // Create service configuration
 //! let config = ServiceConfig::builder()
 //!     .texture(TextureConfig::new(DdsFormat::BC1).with_mipmap_count(5))
-//!     .download(DownloadConfig::default())
 //!     .build();
 //!
 //! // Create service

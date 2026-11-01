@@ -1,12 +1,13 @@
 //! DDS filename parsing for X-Plane texture coordinates.
 //!
 //! Parses filenames in AutoOrtho/Ortho4XP Web Mercator format:
-//! `{row}_{col}_{maptype}{zoom}.dds`
+//! `{row}_{col}_{maptype}{zoom}[_LIT].dds`
 //!
 //! Examples:
 //! - `100000_125184_BI18.dds` (Bing Maps, zoom 18)
 //! - `25264_10368_GO216.dds` (Google Maps GO2 variant, zoom 16)
 //! - `169840_253472_BI18.dds` (Australia: lat ~-46.91°, lon ~168.10°)
+//! - `25712_12960_BI16_LIT.dds` (lit texture for night lighting)
 //!
 //! The coordinates are unsigned Web Mercator tile indices at the specified zoom level.
 //! - Row increases southward (equator ≈ 2^(zoom-1))
@@ -23,6 +24,16 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
+/// Which texture a DDS name refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TextureKind {
+    /// The ortho texture X-Plane draws by day.
+    #[default]
+    Ortho,
+    /// The lit texture a night-lit `.ter` names: `<stem>_LIT.dds`.
+    Lit,
+}
+
 /// Parsed DDS filename containing Web Mercator tile coordinates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DdsFilename {
@@ -34,6 +45,8 @@ pub struct DdsFilename {
     pub zoom: u8,
     /// Map type identifier (e.g., "BI" for Bing, "GO" for Google)
     pub map_type: String,
+    /// Ortho or lit texture
+    pub kind: TextureKind,
 }
 
 impl std::fmt::Display for DdsFilename {
@@ -42,7 +55,11 @@ impl std::fmt::Display for DdsFilename {
             f,
             "{}_{}_{}{}",
             self.row, self.col, self.map_type, self.zoom
-        )
+        )?;
+        if self.kind == TextureKind::Lit {
+            f.write_str("_LIT")?;
+        }
+        Ok(())
     }
 }
 
@@ -94,8 +111,9 @@ fn dds_pattern() -> &'static Regex {
         // _           - separator
         // ([A-Za-z]+\d?) - map type (letters + optional trailing digit for GO2, etc.)
         // (\d{2})     - zoom level (exactly 2 digits)
+        // (_LIT)?     - optional lit-texture suffix (night lighting)
         // \.dds       - extension (case insensitive)
-        Regex::new(r"(\d+)_(\d+)_([A-Za-z]+\d?)(\d{2})\.dds$").unwrap()
+        Regex::new(r"(\d+)_(\d+)_([A-Za-z]+\d?)(\d{2})(_LIT)?\.dds$").unwrap()
     })
 }
 
@@ -155,17 +173,67 @@ pub fn parse_dds_filename(filename: &str) -> Result<DdsFilename, ParseError> {
         .parse::<u8>()
         .map_err(|_| ParseError::InvalidZoom(zoom_str.to_string()))?;
 
+    let kind = if captures.get(5).is_some() {
+        TextureKind::Lit
+    } else {
+        TextureKind::Ortho
+    };
+
     Ok(DdsFilename {
         row,
         col,
         zoom,
         map_type,
+        kind,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_lit_texture() {
+        let coords = parse_dds_filename("25712_12960_BI16_LIT.dds").unwrap();
+        assert_eq!((coords.row, coords.col, coords.zoom), (25712, 12960, 16));
+        assert_eq!(coords.map_type, "BI");
+        assert_eq!(coords.kind, TextureKind::Lit);
+    }
+
+    #[test]
+    fn test_parse_go2_lit_texture() {
+        let coords = parse_dds_filename("25264_10368_GO216_LIT.dds").unwrap();
+        assert_eq!(
+            (coords.map_type.as_str(), coords.zoom, coords.kind),
+            ("GO2", 16, TextureKind::Lit)
+        );
+    }
+
+    #[test]
+    fn test_ortho_names_stay_ortho() {
+        assert_eq!(
+            parse_dds_filename("25712_12960_BI16.dds").unwrap().kind,
+            TextureKind::Ortho
+        );
+    }
+
+    #[test]
+    fn test_display_round_trips_both_kinds() {
+        for name in [
+            "25712_12960_BI16",
+            "25712_12960_BI16_LIT",
+            "25264_10368_GO216_LIT",
+        ] {
+            let parsed = parse_dds_filename(&format!("{name}.dds")).unwrap();
+            assert_eq!(parsed.to_string(), name);
+        }
+    }
+
+    #[test]
+    fn test_other_suffixes_are_rejected() {
+        assert!(parse_dds_filename("25712_12960_BI16_NML.dds").is_err());
+        assert!(parse_dds_filename("25712_12960_BI16_lit.dds").is_err());
+    }
 
     // ========================================================================
     // AutoOrtho format tests (primary format)
@@ -466,18 +534,21 @@ mod tests {
             col: 125184,
             zoom: 18,
             map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
         };
         let coords2 = DdsFilename {
             row: 100000,
             col: 125184,
             zoom: 18,
             map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
         };
         let coords3 = DdsFilename {
             row: 100001,
             col: 125184,
             zoom: 18,
             map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
         };
 
         assert_eq!(coords1, coords2);
@@ -491,6 +562,7 @@ mod tests {
             col: 125184,
             zoom: 18,
             map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
         };
         let cloned = coords.clone();
         assert_eq!(coords, cloned);
@@ -503,6 +575,7 @@ mod tests {
             col: 125184,
             zoom: 18,
             map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
         };
         let debug_str = format!("{:?}", coords);
         assert!(debug_str.contains("100000"));
@@ -518,6 +591,7 @@ mod tests {
             col: 125184,
             zoom: 18,
             map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
         };
         // Display format matches the original filename (without .dds extension)
         assert_eq!(format!("{}", coords), "100000_125184_BI18");
@@ -530,6 +604,7 @@ mod tests {
             col: 10368,
             zoom: 16,
             map_type: "GO2".to_string(),
+            kind: TextureKind::Ortho,
         };
         assert_eq!(format!("{}", coords), "25264_10368_GO216");
     }

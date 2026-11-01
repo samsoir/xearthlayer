@@ -177,12 +177,19 @@ impl GcSchedulerDaemon {
         }
 
         match self.job_submitter.try_submit(job) {
-            Some(handle) => {
+            Ok(handle) => {
                 debug!(job_id = %handle.id(), "GC job submitted");
                 true
             }
-            None => {
-                warn!("Failed to submit GC job - executor channel closed");
+            Err(err) if err.is_back_pressure() => {
+                // Housekeeping is the lowest priority work there is, so a full
+                // queue means the executor is busy with tiles. Skipping this
+                // round is correct; the scheduler checks again next interval.
+                debug!(reason = %err, "GC job skipped, executor queue is full");
+                false
+            }
+            Err(err) => {
+                warn!(reason = %err, "Failed to submit GC job - executor channel closed");
                 false
             }
         }

@@ -174,6 +174,14 @@ impl SceneryIndex {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "ter") {
+                // The name carries the whole tile (#327), so an Ortho4XP
+                // package is indexed from its listing without opening a file.
+                // Anything else is read, as it always was.
+                if let Some(tile) = entry.file_name().to_str().and_then(tile_from_ter_name) {
+                    self.add_unless_filtered(tile);
+                    stats.parsed += 1;
+                    continue;
+                }
                 match self.parse_and_add_ter_file(&path) {
                     Ok(()) => stats.parsed += 1,
                     Err(e) => {
@@ -212,15 +220,16 @@ impl SceneryIndex {
 
     /// Parse a single .ter file and add it to the index.
     fn parse_and_add_ter_file(&self, path: &Path) -> Result<(), SceneryIndexError> {
-        let tile = parse_ter_file(path)?;
-
-        // Skip sea tiles if configured
-        if tile.is_sea && !self.config.include_sea_tiles {
-            return Ok(());
-        }
-
-        self.add_tile(tile);
+        self.add_unless_filtered(parse_ter_file(path)?);
         Ok(())
+    }
+
+    /// Add a tile unless the configuration leaves sea tiles out.
+    fn add_unless_filtered(&self, tile: SceneryTile) {
+        if tile.is_sea && !self.config.include_sea_tiles {
+            return;
+        }
+        self.add_tile(tile);
     }
 
     /// Add a tile to the index.
@@ -506,6 +515,61 @@ impl Default for SceneryIndex {
     }
 }
 
+/// The highest chunk zoom a name may carry: tile zoom 20 plus the chunk offset.
+const MAX_CHUNK_ZOOM: u8 = 24;
+
+/// The suffixes Ortho4XP gives a tile's `.ter` files after `<provider><zoom>`.
+const TER_NAME_SUFFIXES: [&str; 3] = ["", "_water_overlay", "_sea_overlay"];
+
+/// A tile from its Ortho4XP `.ter` file name alone, without opening the file
+/// (#327): `<row>_<col>_<provider><zoom>[_water_overlay|_sea_overlay].ter`.
+///
+/// The row, column and chunk zoom are the texture's, exactly as `BASE_TEX`
+/// names them, and sea is read from the name as [`parse_ter_file`] does. The
+/// centre is computed rather than read: Ortho4XP's `LOAD_CENTER` is the Web
+/// Mercator centre of the texture's 16x16 chunks, which is the corner of chunk
+/// (row + 8, col + 8). Checked against every `.ter` file of a whole installed
+/// world (4,980,320 files): within 5e-6 degrees, the rounding of the five
+/// decimals `LOAD_CENTER` is printed with, and never in another 1 degree region.
+///
+/// Returns `None` for any other name, so the caller reads the file instead.
+pub fn tile_from_ter_name(file_name: &str) -> Option<SceneryTile> {
+    let stem = file_name.strip_suffix(".ter")?;
+    let mut parts = stem.splitn(3, '_');
+    let row: u32 = parts.next()?.parse().ok()?;
+    let col: u32 = parts.next()?.parse().ok()?;
+    let rest = parts.next()?;
+    let (provider_zoom, suffix) = match rest.find('_') {
+        Some(at) => rest.split_at(at),
+        None => (rest, ""),
+    };
+    if !TER_NAME_SUFFIXES.contains(&suffix) {
+        return None;
+    }
+    let zoom_at = provider_zoom.len().checked_sub(2)?;
+    if zoom_at == 0 || !provider_zoom.is_char_boundary(zoom_at) {
+        return None;
+    }
+    let chunk_zoom: u8 = provider_zoom[zoom_at..].parse().ok()?;
+    if chunk_zoom == 0 || chunk_zoom > MAX_CHUNK_ZOOM {
+        return None;
+    }
+    let half = crate::coord::CHUNKS_PER_TILE_SIDE / 2;
+    let (lat, lon) = crate::coord::tile_to_lat_lon(&TileCoord {
+        row: row.checked_add(half)?,
+        col: col.checked_add(half)?,
+        zoom: chunk_zoom,
+    });
+    Some(SceneryTile {
+        row,
+        col,
+        chunk_zoom,
+        lat: lat as f32,
+        lon: lon as f32,
+        is_sea: file_name.contains("_sea"),
+    })
+}
+
 /// Parse a .ter file to extract tile information.
 ///
 /// Expected format:
@@ -703,6 +767,118 @@ impl std::error::Error for SceneryIndexError {}
 mod tests {
     use super::*;
     use crate::geo_index::DsfRegion;
+
+    /// Real `.ter` files from an installed world (#327): the three tiles whose
+    /// centres lie closest to a 1 degree line, then a sea overlay in each
+    /// hemisphere. Name, then contents, verbatim.
+    const REAL_TER_FILES: &[(&str, &str)] = &[
+        (
+            "16608_44224_GO216.ter",
+            "A\n800\nTERRAIN\n\nLOAD_CENTER 66.00015 62.97363 3979 4096\n\
+             BASE_TEX_NOWRAP ../textures/16608_44224_GO216.dds\nNO_ALPHA\n\
+             TEXTURE_LIT ../textures/16608_44224_GO216_LIT.dds\nLUMINANCE 600\n",
+        ),
+        (
+            "25520_33488_GO216_water_overlay.ter",
+            "A\n800\nTERRAIN\n\nLOAD_CENTER 36.91476 3.99902 7822 4096\n\
+             BASE_TEX_NOWRAP ../textures/25520_33488_GO216.dds\n\
+             BORDER_TEX ../textures/water_transition.png\nWET\nNO_SHADOW\n",
+        ),
+        (
+            "25520_33488_GO216_sea_overlay.ter",
+            "A\n800\nTERRAIN\n\nLOAD_CENTER 36.91476 3.99902 7822 4096\n\
+             BASE_TEX_NOWRAP ../textures/25520_33488_GO216.dds\n\
+             LOAD_CENTER_BORDER 36.91476 3.99902 7822 1024\n\
+             BORDER_TEX ../textures/25520_33488_ZL16.png\nWET\nNO_SHADOW\n",
+        ),
+        (
+            "39136_23088_GO216_sea_overlay.ter",
+            "A\n800\nTERRAIN\n\nLOAD_CENTER -33.02709 -53.12988 8202 4096\n\
+             BASE_TEX_NOWRAP ../textures/39136_23088_GO216.dds\n\
+             LOAD_CENTER_BORDER -33.02709 -53.12988 8202 1024\n\
+             BORDER_TEX ../textures/39136_23088_ZL16.png\nWET\nNO_SHADOW\n",
+        ),
+        (
+            "24336_10816_GO216_sea_overlay.ter",
+            "A\n800\nTERRAIN\n\nLOAD_CENTER 41.93498 -120.54199 7278 4096\n\
+             BASE_TEX_NOWRAP ../textures/24336_10816_GO216.dds\n\
+             LOAD_CENTER_BORDER 41.93498 -120.54199 7278 1024\n\
+             BORDER_TEX ../textures/24336_10816_ZL16.png\nWET\nNO_SHADOW\n",
+        ),
+    ];
+
+    fn region_of(tile: &SceneryTile) -> (i32, i32) {
+        (tile.lat.floor() as i32, tile.lon.floor() as i32)
+    }
+
+    #[test]
+    fn a_tile_from_its_name_matches_the_tile_read_from_its_file() {
+        // #327: the name carries everything the file does. The centre is
+        // computed, so it must land in the same 1 degree region the file's
+        // LOAD_CENTER does, including 0.00015 degrees from a region line.
+        let dir = tempfile::tempdir().unwrap();
+        for (name, contents) in REAL_TER_FILES {
+            let path = dir.path().join(name);
+            fs::write(&path, contents).unwrap();
+            let read = parse_ter_file(&path).unwrap();
+            let named = tile_from_ter_name(name).unwrap_or_else(|| panic!("{name} did not parse"));
+
+            assert_eq!(
+                (named.row, named.col, named.chunk_zoom),
+                (read.row, read.col, read.chunk_zoom),
+                "{name}"
+            );
+            assert_eq!(named.is_sea, read.is_sea, "{name}");
+            assert!(
+                (named.lat - read.lat).abs() < 1e-5,
+                "{name}: lat {} vs {}",
+                named.lat,
+                read.lat
+            );
+            assert!(
+                (named.lon - read.lon).abs() < 1e-5,
+                "{name}: lon {} vs {}",
+                named.lon,
+                read.lon
+            );
+            assert_eq!(region_of(&named), region_of(&read), "{name}");
+        }
+    }
+
+    #[test]
+    fn names_that_are_not_ortho4xp_tiles_do_not_parse() {
+        for name in [
+            "custom.ter",
+            "16608_44224.ter",
+            "a_44224_GO216.ter",
+            "16608_44224_G.ter",
+            "16608_44224_GO216_lit_overlay.ter",
+            "16608_44224_GO216.dds",
+            "16608_44224_GO299.ter",
+        ] {
+            assert!(
+                tile_from_ter_name(name).is_none(),
+                "{name} should not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn building_from_a_package_reads_names_not_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let terrain = dir.path().join("terrain");
+        fs::create_dir_all(&terrain).unwrap();
+        // Contents that would fail to parse: indexing must not open the file.
+        fs::write(terrain.join("16608_44224_GO216.ter"), "not a terrain file").unwrap();
+        // A name that is not Ortho4XP's falls back to reading the file.
+        fs::write(terrain.join("hand_made.ter"), REAL_TER_FILES[0].1).unwrap();
+
+        let index = SceneryIndex::with_defaults();
+        let stats = index.build_from_package(dir.path()).unwrap();
+
+        assert_eq!((stats.parsed, stats.failed), (2, 0));
+        assert_eq!(index.tile_count(), 2);
+    }
 
     #[test]
     fn test_parse_dds_filename_bing() {

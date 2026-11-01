@@ -346,9 +346,14 @@ mod tests {
     #[test]
     fn test_with_defaults() {
         let limiter = StorageConcurrencyLimiter::with_defaults("disk_io");
-        // Should be between 64 (4 CPUs * 16) and 256 (cap)
-        assert!(limiter.max_concurrent() >= 64);
-        assert!(limiter.max_concurrent() <= 256);
+        // Mirror with_scaling's formula rather than hard-coding a floor: the
+        // old `>= 64` assertion assumed at least 4 CPUs and failed on the
+        // 3-core macos-15 CI runner (3 * 16 = 48).
+        let cpus = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4);
+        let expected = (cpus * DEFAULT_SCALING_FACTOR).min(DEFAULT_CEILING).max(1);
+        assert_eq!(limiter.max_concurrent(), expected);
         assert_eq!(limiter.label(), "disk_io");
     }
 

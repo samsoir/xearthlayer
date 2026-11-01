@@ -42,11 +42,12 @@ use super::types::{Fuse3Error, Fuse3Result};
 use crate::coord::TileCoord;
 use crate::executor::{DdsClient, StorageConcurrencyLimiter};
 use crate::fuse::coalesce::RequestCoalescer;
-use crate::fuse::{get_default_placeholder, parse_dds_filename, DdsFilename};
+use crate::fuse::{get_default_placeholder, parse_dds_filename, DdsFilename, TextureKind};
 use crate::geo_index::GeoIndex;
+use crate::night::{BlackLitSource, LitTextureSource};
 use crate::ortho_union::OrthoUnionIndex;
+use crate::pinned_budget::PinnedTileBudget;
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
-use crate::scene_tracker::{DdsTileCoord, FuseAccessEvent};
 use bytes::Bytes;
 use dashmap::DashMap;
 use fuse3::raw::prelude::*;
@@ -60,43 +61,14 @@ use futures::stream::{self, Stream, StreamExt};
 use std::ffi::{OsStr, OsString};
 use std::io::SeekFrom;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::mpsc;
 use tokio::sync::OnceCell;
 use tracing::{debug, trace, warn, Instrument};
-
-/// Ceiling on DDS bytes pinned by open file handles: 512 MiB, or 48 tiles.
-///
-/// Each memoising handle holds one whole tile for as long as X-Plane keeps the
-/// file open, which is new retention in a codebase with an open unbounded-growth
-/// investigation (#227). Past this point `open()` stops handing out memoising
-/// handles and reads fall back to resolving per call, so the bound costs
-/// throughput rather than correctness.
-///
-/// **Sized against measurement, not opens** (#236). Two scene loads on one
-/// machine (KDEN warm, KSLC cold, 2026-08-19) peaked at **31 concurrent opens**
-/// but only **10-21 MiB pinned** -- roughly two tiles, about 24x headroom.
-/// The two figures diverge because `pinned_tile_bytes` counts *materialised*
-/// tiles, and a tile is produced on first read, not on `open()`: X-Plane reads
-/// each texture in two calls and releases promptly, so most open handles hold
-/// nothing. Sizing this from the open count instead would overstate the
-/// requirement by more than an order of magnitude.
-///
-/// The bound is **soft**. Admission tests `pinned + expected` but reserves
-/// nothing, so concurrent opens can all pass against one remaining slot and
-/// then materialise together. Reserving on `open()` would be worse: X-Plane
-/// may open a file it never reads, so reservations would be held for tiles
-/// that never exist and the cap would engage falsely.
-///
-/// If `dds_budget_exhausted` on the `Memory sample` line is ever non-zero, a
-/// real scene has exceeded what this was sized against -- raise it against
-/// `dds_pinned_peak_mb` from that flight rather than by guessing again.
-const MAX_PINNED_TILE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Per-open state for one virtual DDS file.
 struct DdsHandle {
@@ -114,9 +86,30 @@ struct DdsHandle {
 ///
 /// When set in `ReplyOpen::flags`, the kernel sends every `read()` through
 /// the FUSE handler instead of serving from its page cache. Used for virtual
-/// DDS files so that `FuseLoadMonitor` and `SceneTracker`
-/// see every X-Plane read.
+/// DDS files so that every X-Plane read is counted (`MetricEvent::FuseRead`)
+/// and none is answered from a cache this filesystem cannot invalidate.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const FOPEN_DIRECT_IO: u32 = 1;
+
+/// Open flags reported for virtual DDS files.
+///
+/// Linux uses [`FOPEN_DIRECT_IO`]: every `read()` reaches this handler, so the
+/// FUSE read counters are exact and the page cache never holds a second copy
+/// of a tile the memory cache already has.
+///
+/// **macOS must not.** X-Plane memory-maps texture files, and macFUSE faults
+/// with `EXC_BAD_ACCESS` when a `direct_io` file is `mmap`ed, because `mmap`
+/// needs the page cache that `direct_io` bypasses. macOS therefore serves
+/// virtual DDS through the page cache, trading per-read visibility for not
+/// crashing the sim's texture loader. The one consequence is that the FUSE
+/// read counters under-report there: a tile's cold first read reaches this
+/// handler and repeat reads are answered by the kernel. Nothing functional
+/// depends on seeing every read (#204): prefetch is driven by telemetry, and
+/// the cold reads that trigger generation still arrive.
+#[cfg(not(target_os = "macos"))]
+const VIRTUAL_DDS_OPEN_FLAGS: u32 = FOPEN_DIRECT_IO;
+#[cfg(target_os = "macos")]
+const VIRTUAL_DDS_OPEN_FLAGS: u32 = 0;
 
 /// Consolidated ortho union FUSE filesystem.
 ///
@@ -168,6 +161,10 @@ pub struct Fuse3OrthoUnionFS {
     tile_request_callback: Option<TileRequestCallback>,
     /// Request coalescer for deduplicating concurrent requests
     request_coalescer: Arc<RequestCoalescer>,
+    /// Source of lit textures (`<stem>_LIT.dds`). Lit inodes never reach the
+    /// DDS client, coalescer or caches above (night lighting, R8). Defaults
+    /// to [`BlackLitSource`], which serves the minimal black DDS.
+    lit_source: Arc<dyn LitTextureSource>,
     /// Per-open state for virtual DDS files, keyed by file handle.
     ///
     /// The kernel caps each FUSE read at 1 MiB, so X-Plane reading one 11.17 MB
@@ -176,29 +173,21 @@ pub struct Fuse3OrthoUnionFS {
     dds_handles: DashMap<u64, Arc<DdsHandle>>,
     /// Source of file handles. Starts at 1: 0 means "no handle".
     next_fh: AtomicU64,
-    /// Bytes of DDS tiles currently pinned by open handles.
-    pinned_tile_bytes: AtomicU64,
-    /// Highest concurrent handle count seen. The current counts drain to near
-    /// zero between bursts, so the peak is what `MAX_PINNED_TILE_BYTES` has to
-    /// be sized against.
+    /// Bytes of DDS tiles currently pinned by open handles, and the ceiling.
+    ///
+    /// Shared rather than private because prefetch reads the same figure as its
+    /// yield signal (#246). See [`PinnedTileBudget`].
+    pinned: Arc<PinnedTileBudget>,
+    /// Highest concurrent handle count seen. The current count drains to near
+    /// zero between bursts, so the peak is what the pinned ceiling has to be
+    /// sized against.
     peak_handles_open: AtomicU64,
-    /// Highest pinned byte total seen.
-    peak_pinned_tile_bytes: AtomicU64,
     /// Whether the budget-exhausted warning has been emitted this session.
     ///
     /// Latched, because the cap engages for every open in a burst rather than
     /// once: an unlatched warn would bury the log it exists to serve. The
     /// per-occurrence count goes to metrics instead (#236).
     budget_warning_logged: AtomicBool,
-    /// Optional channel for notifying Scene Tracker of DDS accesses.
-    ///
-    /// When set, the filesystem sends a [`FuseAccessEvent`] for each DDS
-    /// texture request, enabling the Scene Tracker to build an empirical
-    /// model of what X-Plane has requested.
-    ///
-    /// Sends raw DDS tile coordinates (row, col, zoom) for Scene Tracker to
-    /// store as empirical data.
-    scene_tracker_tx: Option<mpsc::UnboundedSender<FuseAccessEvent>>,
     /// Optional metrics client for reporting FUSE-level metrics.
     ///
     /// When set, reports coalesced requests and other FUSE-specific metrics.
@@ -255,13 +244,12 @@ impl Fuse3OrthoUnionFS {
             disk_io_limiter,
             tile_request_callback: None,
             request_coalescer,
+            lit_source: Arc::new(BlackLitSource),
             dds_handles: DashMap::new(),
             next_fh: AtomicU64::new(1),
-            pinned_tile_bytes: AtomicU64::new(0),
+            pinned: Arc::new(PinnedTileBudget::new()),
             peak_handles_open: AtomicU64::new(0),
-            peak_pinned_tile_bytes: AtomicU64::new(0),
             budget_warning_logged: AtomicBool::new(false),
-            scene_tracker_tx: None,
             metrics_client: None,
             fuse_max_background: None,
             fuse_congestion_threshold: None,
@@ -292,16 +280,48 @@ impl Fuse3OrthoUnionFS {
             disk_io_limiter,
             tile_request_callback: None,
             request_coalescer,
+            lit_source: Arc::new(BlackLitSource),
             dds_handles: DashMap::new(),
             next_fh: AtomicU64::new(1),
-            pinned_tile_bytes: AtomicU64::new(0),
+            pinned: Arc::new(PinnedTileBudget::new()),
             peak_handles_open: AtomicU64::new(0),
-            peak_pinned_tile_bytes: AtomicU64::new(0),
             budget_warning_logged: AtomicBool::new(false),
-            scene_tracker_tx: None,
             metrics_client: None,
             fuse_max_background: None,
             fuse_congestion_threshold: None,
+        }
+    }
+
+    /// Share the pinned-tile budget with the prefetch backpressure signal.
+    ///
+    /// Without this the filesystem accounts against a budget only it can see,
+    /// which is correct for the memoisation cap but leaves prefetch blind to
+    /// demand on the mount (#246). Passing the runtime's budget makes the same
+    /// number answer both questions.
+    pub fn with_pinned_budget(mut self, budget: Arc<PinnedTileBudget>) -> Self {
+        self.pinned = budget;
+        self
+    }
+
+    /// Serve lit textures from `source` instead of the black default.
+    pub fn with_lit_source(mut self, source: Arc<dyn LitTextureSource>) -> Self {
+        self.lit_source = source;
+        self
+    }
+
+    /// Attributes for a lit texture: a virtual DDS with the lit source's size.
+    fn lit_dds_attr(&self, ino: u64, size: u64) -> FileAttr {
+        let mut attr = self.virtual_dds_attr(ino);
+        attr.size = size;
+        attr.blocks = size.div_ceil(u64::from(attr.blksize));
+        attr
+    }
+
+    /// Attributes for any virtual DDS, by kind.
+    async fn virtual_attr_for(&self, ino: u64, coords: &DdsFilename) -> FileAttr {
+        match coords.kind {
+            TextureKind::Ortho => self.virtual_dds_attr(ino),
+            TextureKind::Lit => self.lit_dds_attr(ino, self.lit_source.size(coords).await),
         }
     }
 
@@ -320,36 +340,6 @@ impl Fuse3OrthoUnionFS {
     /// the prefetch system to infer aircraft position from FUSE requests.
     pub fn with_tile_request_callback(mut self, callback: TileRequestCallback) -> Self {
         self.tile_request_callback = Some(callback);
-        self
-    }
-
-    /// Set the channel for Scene Tracker events.
-    ///
-    /// When set, the filesystem sends a [`FuseAccessEvent`] for each DDS
-    /// texture accessed. This enables the Scene Tracker to build an empirical
-    /// model of X-Plane's requests, which can be used for position inference
-    /// and prefetch prediction.
-    ///
-    /// Unlike the prefetcher channel which sends derived DSF regions, this
-    /// channel sends raw DDS tile coordinates (row, col, zoom) - the Scene
-    /// Tracker stores empirical data and derives regions via calculation.
-    ///
-    /// The channel is fire-and-forget: sending is non-blocking and failures
-    /// are silently ignored to avoid impacting FUSE performance.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let (tx, rx) = mpsc::unbounded_channel();
-    /// let fs = Fuse3OrthoUnionFS::new(index, client, size)
-    ///     .with_scene_tracker_channel(tx);
-    /// // rx is passed to DefaultSceneTracker::start()
-    /// ```
-    pub fn with_scene_tracker_channel(
-        mut self,
-        tx: mpsc::UnboundedSender<FuseAccessEvent>,
-    ) -> Self {
-        self.scene_tracker_tx = Some(tx);
         self
     }
 
@@ -430,18 +420,11 @@ impl Fuse3OrthoUnionFS {
     /// `lookup()`, not here.
     ///
     /// This is the composition point: GeoIndex (geography) + OrthoUnionIndex (files).
-    /// Produce a whole DDS tile, reporting the access to Scene Tracker.
+    /// Produce a whole DDS tile.
     ///
     /// Called once per open when the handle memoises, once per read when it
-    /// does not. Scene Tracker therefore sees one event per texture X-Plane
-    /// opens rather than one per ranged read -- the same access pattern,
-    /// without the 12-23x inflation.
+    /// does not.
     async fn resolve_tile(&self, coords: &DdsFilename) -> Bytes {
-        if let Some(ref tx) = self.scene_tracker_tx {
-            let tile = DdsTileCoord::new(coords.row, coords.col, coords.zoom);
-            let _ = tx.send(FuseAccessEvent::new(tile));
-        }
-
         // request_dds parses a filename; Display carries the correct zoom.
         self.request_dds(&format!("{}.dds", coords))
             .await
@@ -461,17 +444,15 @@ impl Fuse3OrthoUnionFS {
 
     fn report_handle_gauge(&self) {
         let open = self.dds_handles.len() as u64;
-        let pinned = self.pinned_tile_bytes.load(Ordering::Relaxed);
+        let pinned = self.pinned.pinned_bytes();
         self.peak_handles_open.fetch_max(open, Ordering::Relaxed);
-        self.peak_pinned_tile_bytes
-            .fetch_max(pinned, Ordering::Relaxed);
 
         if let Some(metrics) = &self.metrics_client {
             metrics.fuse_handles(
                 open,
                 pinned,
                 self.peak_handles_open.load(Ordering::Relaxed),
-                self.peak_pinned_tile_bytes.load(Ordering::Relaxed),
+                self.pinned.peak_bytes(),
             );
         }
     }
@@ -483,7 +464,7 @@ impl Fuse3OrthoUnionFS {
 
     /// Highest pinned tile byte total seen.
     pub fn peak_pinned_tile_bytes(&self) -> u64 {
-        self.peak_pinned_tile_bytes.load(Ordering::Relaxed)
+        self.pinned.peak_bytes()
     }
 
     /// Number of virtual DDS files currently open.
@@ -493,7 +474,7 @@ impl Fuse3OrthoUnionFS {
 
     /// Bytes of DDS tiles currently pinned by open handles.
     pub fn pinned_tile_bytes(&self) -> u64 {
-        self.pinned_tile_bytes.load(Ordering::Relaxed)
+        self.pinned.pinned_bytes()
     }
 
     /// Record one FUSE `read()` call for the amplification metric.
@@ -530,20 +511,16 @@ impl Fuse3OrthoUnionFS {
     /// This is a blocking operation that runs until the filesystem is unmounted.
     /// For non-blocking usage, see [`mount_spawned`](Self::mount_spawned).
     pub async fn mount(self, mountpoint: &str) -> Fuse3Result<super::types::MountHandle> {
-        let mut mount_options = MountOptions::default();
-        mount_options.read_only(true);
-        mount_options.force_readdir_plus(false);
-        // Tell kernel we don't implement opendir - it should call readdir directly
-        mount_options.no_open_dir_support(true);
-
         let mount_path = PathBuf::from(mountpoint);
+        let mount_options = mount_options(&mount_path);
 
         // State the ceiling once, so a flight log is self-describing: a reader
         // comparing dds_pinned_peak_mb against it does not have to know the
         // constant, and does not have to guess which build it came from (#236).
         tracing::info!(
-            dds_pinned_cap_mb = MAX_PINNED_TILE_BYTES / (1024 * 1024),
-            dds_pinned_cap_tiles = MAX_PINNED_TILE_BYTES / self.virtual_dds_config.size().max(1),
+            dds_pinned_cap_mb = self.pinned.ceiling_bytes() / (1024 * 1024),
+            dds_pinned_cap_tiles =
+                self.pinned.ceiling_bytes() / self.virtual_dds_config.size().max(1),
             "Virtual DDS handle memoisation budget"
         );
 
@@ -578,13 +555,8 @@ impl Fuse3OrthoUnionFS {
         self,
         mountpoint: &str,
     ) -> Fuse3Result<super::types::SpawnedMountHandle> {
-        let mut mount_options = MountOptions::default();
-        mount_options.read_only(true);
-        mount_options.force_readdir_plus(false);
-        // Tell kernel we don't implement opendir - it should call readdir directly
-        mount_options.no_open_dir_support(true);
-
         let mount_path = PathBuf::from(mountpoint);
+        let mount_options = mount_options(&mount_path);
 
         #[cfg(target_os = "linux")]
         let handle = fuse3::raw::Session::new(mount_options)
@@ -610,6 +582,36 @@ impl Fuse3OrthoUnionFS {
         let coords = parse_dds_filename(name_str).ok()?;
         Some(self.request_dds_impl(&coords).await)
     }
+}
+
+/// Mount options shared by [`Fuse3OrthoUnionFS::mount`] and
+/// [`Fuse3OrthoUnionFS::mount_spawned`].
+fn mount_options(mount_path: &Path) -> MountOptions {
+    let mut mount_options = MountOptions::default();
+    mount_options.read_only(true);
+    mount_options.force_readdir_plus(false);
+    // Tell kernel we don't implement opendir - it should call readdir directly
+    mount_options.no_open_dir_support(true);
+    if let Some(volname) = volume_name_option(mount_path, cfg!(target_os = "macos")) {
+        mount_options.custom_options(volname);
+    }
+    mount_options
+}
+
+/// The macFUSE `volname` option naming the volume after its mount-point
+/// folder (#305).
+///
+/// Finder shows a mounted volume's name in place of the folder it is mounted
+/// on, and macFUSE's default is `macFUSE Volume 0 (<process>)`, so without
+/// this `zzXEL_ortho` appears in Custom Scenery under that name. `None` off
+/// macOS, which has no volume names, and for a folder name containing a
+/// comma, which macFUSE would split into a second option.
+fn volume_name_option(mount_path: &Path, macos: bool) -> Option<String> {
+    if !macos {
+        return None;
+    }
+    let name = mount_path.file_name()?.to_str()?;
+    (!name.contains(',')).then(|| format!("volname={name}"))
 }
 
 // =============================================================================
@@ -756,8 +758,8 @@ impl Filesystem for Fuse3OrthoUnionFS {
             }
 
             if let Ok(coords) = parse_dds_filename(&name_str) {
-                let inode = self.inode_manager.create_virtual_inode(coords);
-                let attr = self.virtual_dds_attr(inode);
+                let inode = self.inode_manager.create_virtual_inode(coords.clone());
+                let attr = self.virtual_attr_for(inode, &coords).await;
                 return Ok(ReplyEntry {
                     ttl: TTL,
                     attr,
@@ -788,8 +790,8 @@ impl Filesystem for Fuse3OrthoUnionFS {
 
         // Virtual DDS inode
         if InodeManager::is_virtual_inode(ino) {
-            if self.inode_manager.get_virtual_dds(ino).is_some() {
-                let attr = self.virtual_dds_attr(ino);
+            if let Some(coords) = self.inode_manager.get_virtual_dds(ino) {
+                let attr = self.virtual_attr_for(ino, &coords).await;
                 return Ok(ReplyAttr { ttl: TTL, attr });
             }
             return Err(Errno::from(libc::ENOENT));
@@ -854,6 +856,13 @@ impl Filesystem for Fuse3OrthoUnionFS {
                 .get_virtual_dds(ino)
                 .ok_or(Errno::from(libc::ENOENT))?;
 
+            // Lit textures come from the lit source alone: no executor, no
+            // memoising handle, no DDS read metrics.
+            if coords.kind == TextureKind::Lit {
+                let data = self.lit_source.read(&coords, offset, size).await;
+                return Ok(ReplyData { data });
+            }
+
             let fuse_read_span = tracing::debug_span!(target: "profiling", "fuse_read", ino = ino, offset = offset, size = size,);
 
             // Resolve the tile once per open. The kernel splits one X-Plane
@@ -866,8 +875,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
                     .tile
                     .get_or_init(|| async {
                         let data = self.resolve_tile(&handle.coords).await;
-                        self.pinned_tile_bytes
-                            .fetch_add(data.len() as u64, Ordering::Relaxed);
+                        self.pinned.pin(data.len() as u64);
                         // Report here, not at open(): the tile is produced
                         // on first read, so a gauge sampled only at open
                         // would never see the bytes it is meant to bound.
@@ -1156,7 +1164,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         }
 
         // Virtual DDS files: bypass the kernel page cache so every read()
-        // reaches this handler and SceneTracker sees the access pattern.
+        // reaches this handler (see VIRTUAL_DDS_OPEN_FLAGS).
         //
         // Allocate a handle so the tile is produced once and every later read
         // slices it. The tile itself is NOT produced here: generation can take
@@ -1169,15 +1177,24 @@ impl Filesystem for Fuse3OrthoUnionFS {
         let Some(coords) = self.inode_manager.get_virtual_dds(inode) else {
             return Ok(ReplyOpen {
                 fh: 0,
-                flags: FOPEN_DIRECT_IO,
+                flags: VIRTUAL_DDS_OPEN_FLAGS,
             });
         };
+
+        // Lit textures are small or served by range from their source; they
+        // pin nothing and need no handle. Same flags, so Linux reads bypass
+        // the page cache and a size change can never be served stale.
+        if coords.kind == TextureKind::Lit {
+            return Ok(ReplyOpen {
+                fh: 0,
+                flags: VIRTUAL_DDS_OPEN_FLAGS,
+            });
+        }
 
         // Refuse to memoise past the pinned-bytes ceiling. fh 0 makes read()
         // resolve per call, which is slower but correct.
         let expected = self.virtual_dds_config.size();
-        let pinned = self.pinned_tile_bytes.load(Ordering::Relaxed);
-        if pinned + expected > MAX_PINNED_TILE_BYTES {
+        if self.pinned.would_exceed(expected) {
             // Count every refusal: this is what lets a flight log tell "the
             // cap engaged" from "the #234 fix stopped working", which look
             // identical otherwise -- both show fuse_dds_alloc_mb climbing.
@@ -1188,8 +1205,8 @@ impl Filesystem for Fuse3OrthoUnionFS {
             // the degradation was invisible on an ordinary flight.
             if self.claim_budget_warning() {
                 warn!(
-                    pinned_mb = pinned / (1024 * 1024),
-                    cap_mb = MAX_PINNED_TILE_BYTES / (1024 * 1024),
+                    pinned_mb = self.pinned.pinned_bytes() / (1024 * 1024),
+                    cap_mb = self.pinned.ceiling_bytes() / (1024 * 1024),
                     open_handles = self.dds_handles.len(),
                     "DDS handle budget exhausted - serving opens without memoisation. \
                      Reads now resolve their tile once per call. Further occurrences \
@@ -1198,7 +1215,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
             }
             return Ok(ReplyOpen {
                 fh: 0,
-                flags: FOPEN_DIRECT_IO,
+                flags: VIRTUAL_DDS_OPEN_FLAGS,
             });
         }
 
@@ -1215,7 +1232,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
 
         Ok(ReplyOpen {
             fh,
-            flags: FOPEN_DIRECT_IO,
+            flags: VIRTUAL_DDS_OPEN_FLAGS,
         })
     }
 
@@ -1232,8 +1249,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         // 11.17 MB for the life of the mount.
         if let Some((_, handle)) = self.dds_handles.remove(&fh) {
             if let Some(tile) = handle.tile.get() {
-                self.pinned_tile_bytes
-                    .fetch_sub(tile.len() as u64, Ordering::Relaxed);
+                self.pinned.release(tile.len() as u64);
             }
             self.report_handle_gauge();
         }
@@ -1296,13 +1312,41 @@ mod tests {
     use crate::coord::TileCoord;
     use crate::executor::{DdsClientError, Priority};
     use crate::ortho_union::OrthoUnionIndexBuilder;
-    use crate::package::{InstalledPackage, Package, PackageType};
     use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
     use semver::Version;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
+    use xearthlayer_package::{InstalledPackage, Package, PackageType};
+
+    /// #305: Finder shows a mounted volume's name in place of its mount-point
+    /// folder, and macFUSE's default is `macFUSE Volume 0 (<process>)`.
+    #[test]
+    fn on_macos_the_volume_is_named_after_the_mount_point_folder() {
+        let mount = Path::new("/X-Plane 12/Custom Scenery/zzXEL_ortho");
+
+        assert_eq!(
+            volume_name_option(mount, true).as_deref(),
+            Some("volname=zzXEL_ortho")
+        );
+    }
+
+    #[test]
+    fn off_macos_there_is_no_volume_name() {
+        let mount = Path::new("/X-Plane 12/Custom Scenery/zzXEL_ortho");
+
+        assert_eq!(volume_name_option(mount, false), None);
+    }
+
+    /// macFUSE splits its option list on commas, so a name containing one
+    /// would leak its tail in as a separate option.
+    #[test]
+    fn a_folder_name_with_a_comma_is_not_passed_as_a_volume_name() {
+        let mount = Path::new("/Custom Scenery/zzXEL_ortho,allow_other");
+
+        assert_eq!(volume_name_option(mount, true), None);
+    }
 
     /// Mock DdsClient for testing
     struct MockDdsClient {
@@ -1335,6 +1379,7 @@ mod tests {
                 cancellation,
                 response_tx: Some(tx),
                 origin: RequestOrigin::Fuse,
+                created: std::time::Instant::now(),
             };
             let _ = self.tx.try_send(request);
             rx
@@ -1354,6 +1399,7 @@ mod tests {
                 cancellation,
                 response_tx: Some(tx),
                 origin,
+                created: std::time::Instant::now(),
             };
             let _ = self.tx.try_send(request);
             rx
@@ -1472,6 +1518,7 @@ mod tests {
             col: 84000,
             zoom: 20,
             map_type: "BI".to_string(),
+            kind: crate::fuse::TextureKind::Ortho,
         };
 
         let tile = chunk_to_tile_coords(&coords);
@@ -1690,7 +1737,173 @@ mod tests {
                 col: 5279,
                 zoom: 16,
                 map_type: "BI".to_string(),
+                kind: crate::fuse::TextureKind::Ortho,
             })
+    }
+
+    fn lit_name() -> &'static std::ffi::OsStr {
+        std::ffi::OsStr::new("25712_12960_BI16_LIT.dds")
+    }
+
+    fn textures_inode(fs: &Fuse3OrthoUnionFS) -> u64 {
+        fs.inode_manager
+            .get_or_create_inode(std::path::Path::new("textures"))
+    }
+
+    #[tokio::test]
+    async fn test_lit_lookup_reports_the_minimal_black_size_and_its_own_inode() {
+        use fuse3::raw::Filesystem;
+        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let parent = textures_inode(&fs);
+
+        let lit = fs.lookup(test_request(), parent, lit_name()).await.unwrap();
+        assert_eq!(lit.attr.size, 152);
+
+        let ortho = fs
+            .lookup(
+                test_request(),
+                parent,
+                std::ffi::OsStr::new("25712_12960_BI16.dds"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ortho.attr.size,
+            crate::fuse::EXPECTED_DDS_SIZE as u64,
+            "ortho unchanged"
+        );
+        assert_ne!(lit.attr.ino, ortho.attr.ino);
+    }
+
+    #[tokio::test]
+    async fn test_lit_getattr_matches_lookup() {
+        use fuse3::raw::Filesystem;
+        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let entry = fs
+            .lookup(test_request(), textures_inode(&fs), lit_name())
+            .await
+            .unwrap();
+        let attr = fs
+            .getattr(test_request(), entry.attr.ino, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(attr.attr.size, 152);
+    }
+
+    #[tokio::test]
+    async fn test_lit_read_serves_black_without_touching_the_executor() {
+        use fuse3::raw::Filesystem;
+        let (fs, requests, _temp) = virtual_dds_fixture();
+        let ino = fs
+            .lookup(test_request(), textures_inode(&fs), lit_name())
+            .await
+            .unwrap()
+            .attr
+            .ino;
+
+        let opened = fs.open(test_request(), ino, 0).await.unwrap();
+        assert_eq!(opened.fh, 0, "lit files hold no memoising handle");
+        assert!(fs.dds_handles.is_empty());
+
+        let data = fs
+            .read(test_request(), ino, opened.fh, 0, 1 << 20)
+            .await
+            .unwrap()
+            .data;
+        assert_eq!(data, crate::night::minimal_black_dds());
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no DDS request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_dds_impl_serves_black_for_a_lit_name_without_a_request() {
+        let (fs, requests, _temp) = virtual_dds_fixture();
+        let coords = crate::fuse::DdsFilename {
+            row: 25712,
+            col: 12960,
+            zoom: 16,
+            map_type: "BI".to_string(),
+            kind: crate::fuse::TextureKind::Lit,
+        };
+
+        let data = fs.request_dds_impl(&coords).await;
+
+        assert_eq!(data, crate::night::minimal_black_dds());
+        assert_eq!(data.len(), 152);
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a lit name must never reach the DDS client"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_real_lit_file_on_disk_wins_over_the_virtual_lit_texture() {
+        use fuse3::raw::Filesystem;
+        let temp = TempDir::new().unwrap();
+        let pkg_dir = temp.path().join("test_ortho");
+        std::fs::create_dir_all(pkg_dir.join("Earth nav data/+40-080")).unwrap();
+        std::fs::create_dir_all(pkg_dir.join("textures")).unwrap();
+        std::fs::write(pkg_dir.join("textures/25712_12960_BI16_LIT.dds"), [7u8; 10]).unwrap();
+        let pkg = InstalledPackage::new(
+            Package::new("test", PackageType::Ortho, Version::new(1, 0, 0)),
+            &pkg_dir,
+        );
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(pkg)
+            .build()
+            .unwrap();
+        let (client, _requests) = CountingDdsClient::new();
+        let fs = Fuse3OrthoUnionFS::new(index, client, crate::fuse::EXPECTED_DDS_SIZE);
+
+        let entry = fs
+            .lookup(test_request(), textures_inode(&fs), lit_name())
+            .await
+            .unwrap();
+
+        assert_eq!(entry.attr.size, 10, "the real file, not the 152-byte black");
+        assert!(
+            entry.attr.ino < crate::fuse::support::inode::VIRTUAL_INODE_BASE,
+            "a real file has a real inode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lit_source_is_injectable() {
+        use fuse3::raw::Filesystem;
+        struct Fixed;
+        impl crate::night::LitTextureSource for Fixed {
+            fn size<'a>(
+                &'a self,
+                _n: &'a crate::fuse::DdsFilename,
+            ) -> futures::future::BoxFuture<'a, u64> {
+                Box::pin(async { 1000 })
+            }
+            fn read<'a>(
+                &'a self,
+                _n: &'a crate::fuse::DdsFilename,
+                _o: u64,
+                _l: u32,
+            ) -> futures::future::BoxFuture<'a, Bytes> {
+                Box::pin(async { Bytes::from_static(b"lit") })
+            }
+        }
+        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let fs = fs.with_lit_source(Arc::new(Fixed));
+        let entry = fs
+            .lookup(test_request(), textures_inode(&fs), lit_name())
+            .await
+            .unwrap();
+        assert_eq!(entry.attr.size, 1000);
+        let data = fs
+            .read(test_request(), entry.attr.ino, 0, 0, 16)
+            .await
+            .unwrap()
+            .data;
+        assert_eq!(&data[..], b"lit");
     }
 
     /// Fixture wired to an observable metrics channel.
@@ -1733,13 +1946,12 @@ mod tests {
         let ino = virtual_inode(&fs);
 
         // One tile short of the ceiling: pinned + expected must exceed it.
-        fs.pinned_tile_bytes
-            .store(MAX_PINNED_TILE_BYTES, Ordering::Relaxed);
+        fs.pinned.pin(fs.pinned.ceiling_bytes());
 
         let opened = fs.open(test_request(), ino, 0).await.unwrap();
         assert_eq!(opened.fh, 0, "refused opens get no memoising handle");
         assert_eq!(
-            opened.flags, FOPEN_DIRECT_IO,
+            opened.flags, VIRTUAL_DDS_OPEN_FLAGS,
             "the file must still bypass the page cache"
         );
         assert!(
@@ -1756,8 +1968,7 @@ mod tests {
 
         let (fs, mut rx, _temp) = virtual_dds_fixture_with_metrics();
         let ino = virtual_inode(&fs);
-        fs.pinned_tile_bytes
-            .store(MAX_PINNED_TILE_BYTES, Ordering::Relaxed);
+        fs.pinned.pin(fs.pinned.ceiling_bytes());
 
         for _ in 0..3 {
             let opened = fs.open(test_request(), ino, 0).await.unwrap();
@@ -1777,8 +1988,7 @@ mod tests {
 
         let (fs, _rx, _temp) = virtual_dds_fixture_with_metrics();
         let ino = virtual_inode(&fs);
-        fs.pinned_tile_bytes
-            .store(MAX_PINNED_TILE_BYTES, Ordering::Relaxed);
+        fs.pinned.pin(fs.pinned.ceiling_bytes());
 
         // Assert the claim, not the flag. A flag assertion passes even if the
         // warn is emitted unconditionally, so long as something sets it.
@@ -1894,7 +2104,7 @@ mod tests {
         let reply = fs.open(test_request(), ino, 0).await.unwrap();
 
         assert_ne!(reply.fh, 0, "a known tile must get a memoising handle");
-        assert_eq!(reply.flags, FOPEN_DIRECT_IO);
+        assert_eq!(reply.flags, VIRTUAL_DDS_OPEN_FLAGS);
         assert_eq!(fs.open_dds_handles(), 1);
         // open() must not produce the tile: generation can take up to the
         // configured timeout, and X-Plane may open a file it never reads.
@@ -1923,6 +2133,7 @@ mod tests {
                     col: 5279 + col,
                     zoom: 16,
                     map_type: "BI".to_string(),
+                    kind: crate::fuse::TextureKind::Ortho,
                 });
             let reply = fs.open(test_request(), ino, 0).await.unwrap();
             fs.read(test_request(), ino, reply.fh, 0, 4096)
@@ -2101,12 +2312,25 @@ mod tests {
         u64,
         tokio::sync::mpsc::UnboundedReceiver<crate::metrics::MetricEvent>,
     ) {
+        // Byte i = i as u8, so a slice's content proves which range was served.
+        let content: Vec<u8> = (0..size).map(|i| i as u8).collect();
+        passthrough_fixture_with(temp, &content)
+    }
+
+    /// Build a one-package index containing a single file with `content` and
+    /// return the mounted FS, its inode, and the metrics receiver.
+    fn passthrough_fixture_with(
+        temp: &TempDir,
+        content: &[u8],
+    ) -> (
+        Fuse3OrthoUnionFS,
+        u64,
+        tokio::sync::mpsc::UnboundedReceiver<crate::metrics::MetricEvent>,
+    ) {
         let pkg_dir = temp.path().join("test_ortho");
         let dsf_dir = pkg_dir.join("Earth nav data/+40-080");
         std::fs::create_dir_all(&dsf_dir).unwrap();
-        // Byte i = i as u8, so a slice's content proves which range was served.
-        let content: Vec<u8> = (0..size).map(|i| i as u8).collect();
-        std::fs::write(dsf_dir.join("+40-074.dsf"), &content).unwrap();
+        std::fs::write(dsf_dir.join("+40-074.dsf"), content).unwrap();
 
         let pkg = InstalledPackage::new(
             Package::new("test", PackageType::Ortho, Version::new(1, 0, 0)),
@@ -2127,6 +2351,47 @@ mod tests {
         (fs, inode, metrics_rx)
     }
 
+    /// A DSF written by the publisher is a 7z container (#124). FUSE never
+    /// parses DSF content, so the bytes X-Plane receives must be exactly the
+    /// bytes on disk, signature included.
+    #[tokio::test]
+    async fn passthrough_serves_7z_dsf_byte_identical() {
+        use std::io::Write;
+
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+
+        let temp = TempDir::new().unwrap();
+        let raw_bytes: Vec<u8> = (0..64 * 1024u32).map(|i| ((i / 5) % 253) as u8).collect();
+        let compressed = temp.path().join("compressed.dsf");
+        // Built here rather than by the publisher's DsfCompressor: this test
+        // only needs an opaque 7z blob, and the runtime must not depend on the
+        // publisher even in tests (#284).
+        let mut writer = ArchiveWriter::new(std::io::BufWriter::new(
+            std::fs::File::create(&compressed).unwrap(),
+        ))
+        .unwrap();
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file("raw.dsf"),
+                Some(std::io::Cursor::new(raw_bytes)),
+            )
+            .unwrap();
+        writer.finish().unwrap().flush().unwrap();
+        let expected = std::fs::read(&compressed).unwrap();
+        // The 7z signature, which is what X-Plane checks before decoding.
+        const SEVENZ_MAGIC: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
+        assert!(expected.starts_with(&SEVENZ_MAGIC));
+
+        let (fs, ino, _rx) = passthrough_fixture_with(&temp, &expected);
+
+        let reply = fs
+            .read(test_request(), ino, 0, 0, expected.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(reply.data.len(), expected.len());
+        assert_eq!(&reply.data[..], expected.as_slice());
+    }
+
     fn test_request() -> fuse3::raw::Request {
         fuse3::raw::Request {
             unique: 1,
@@ -2134,6 +2399,27 @@ mod tests {
             gid: 1000,
             pid: 1000,
         }
+    }
+
+    /// #246: the filesystem must account against the budget it was given, not
+    /// the one it made for itself, or prefetch reads a gauge nothing writes to.
+    #[test]
+    fn with_pinned_budget_accounts_against_the_injected_budget() {
+        let budget = Arc::new(PinnedTileBudget::with_ceiling(1000));
+        let (fs, _rx, _temp) = virtual_dds_fixture_with_metrics();
+        let fs = fs.with_pinned_budget(Arc::clone(&budget));
+
+        budget.pin(400);
+
+        assert_eq!(
+            fs.pinned_tile_bytes(),
+            400,
+            "the filesystem must read the injected budget"
+        );
+        assert!(
+            budget.would_exceed(601),
+            "and the ceiling must come from it too"
+        );
     }
 
     /// Drain the single `FuseRead` event a read is expected to emit.
@@ -2767,7 +3053,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_virtual_dds_returns_direct_io() {
-        use super::FOPEN_DIRECT_IO;
+        use super::VIRTUAL_DDS_OPEN_FLAGS;
         use fuse3::raw::Filesystem;
 
         let temp = TempDir::new().unwrap();
@@ -2796,8 +3082,9 @@ mod tests {
 
         let reply = result.expect("open on virtual DDS inode should succeed");
         assert_eq!(
-            reply.flags, FOPEN_DIRECT_IO,
-            "virtual DDS files should have FOPEN_DIRECT_IO flag"
+            reply.flags, VIRTUAL_DDS_OPEN_FLAGS,
+            "virtual DDS files should use the platform's virtual-DDS open flags \
+             (direct I/O on Linux, page cache on macOS for mmap compatibility)"
         );
         // This inode was synthesised, not registered by lookup, so there is no
         // tile to memoise and no handle to hand out. Reads still work (#234).
@@ -2903,6 +3190,7 @@ mod tests {
             col: tile.col * 16,
             zoom: tile.zoom + 4,
             map_type: "BI".to_string(),
+            kind: crate::fuse::TextureKind::Ortho,
         };
         let _ = fs.request_dds_impl(&coords).await;
         responder.await.unwrap();

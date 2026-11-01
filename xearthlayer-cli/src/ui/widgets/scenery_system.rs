@@ -11,8 +11,14 @@
 //! │ Req/s: 12.5    │ 140E,36S ████░░░░░░ 25%    │ Done/s: 10.2   │
 //! │ Pressure: Δ+2/s│ 140E,37S ░░░░░░░░░░  0%    │ Active: 8/32   │
 //! │ Error Rate: 0% │                            │ Error Rate: 0% │
+//! │                │ 140E,38S ░░░░░░░░░░  0%    │                │
+//! │ Latency: p50 180ms │ p95 1.4s │ max 3.9s │ 97% cached          │
 //! └────────────────┴────────────────────────────┴────────────────┘
 //! ```
+//!
+//! The latency row spans the full width because its figures do not fit in
+//! one column, and it takes a row of its own because the QUEUE column can
+//! fill every row above it.
 
 use ratatui::{
     buffer::Buffer,
@@ -24,6 +30,7 @@ use ratatui::{
 use xearthlayer::metrics::TelemetrySnapshot;
 use xearthlayer::runtime::{HealthSnapshot, RegionProgressEntry};
 
+use super::fuse_latency::FuseLatencyWidget;
 use super::primitives::{Sparkline, SparklineHistory};
 
 /// Characters for progress bar rendering (used in QUEUE column).
@@ -125,6 +132,7 @@ pub struct ScenerySystemWidget<'a> {
     health: Option<&'a HealthSnapshot>,
     history: Option<&'a SceneryHistory>,
     tile_progress: &'a [RegionProgressEntry],
+    latency: Option<FuseLatencyWidget<'a>>,
 }
 
 impl<'a> ScenerySystemWidget<'a> {
@@ -135,7 +143,14 @@ impl<'a> ScenerySystemWidget<'a> {
             health: None,
             history: None,
             tile_progress: &[],
+            latency: None,
         }
+    }
+
+    /// FUSE generation latency, rendered on the last row below the columns.
+    pub fn with_latency(mut self, latency: FuseLatencyWidget<'a>) -> Self {
+        self.latency = Some(latency);
+        self
     }
 
     /// Set health snapshot for additional metrics.
@@ -218,6 +233,18 @@ impl<'a> ScenerySystemWidget<'a> {
 
 impl Widget for ScenerySystemWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // The latency row, when present, takes the bottom row; the columns
+        // keep everything above it.
+        let area = match self.latency {
+            Some(latency) if area.height > 1 => {
+                let [columns, latency_row] =
+                    Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+                latency.render(latency_row, buf);
+                columns
+            }
+            _ => area,
+        };
+
         // Get sparklines and rates from history
         let (request_sparkline, request_rate, completion_sparkline, completion_rate, pressure) =
             if let Some(history) = self.history {
@@ -426,5 +453,60 @@ impl ScenerySystemWidget<'_> {
             26..=75 => Color::Cyan,
             _ => Color::Green,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::widgets::FuseLatencyWidget;
+    use std::time::Duration;
+    use xearthlayer::metrics::LatencySummary;
+
+    fn render(widget: ScenerySystemWidget<'_>, height: u16) -> String {
+        let area = Rect::new(0, 0, 120, height);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn renders_fuse_latency_on_its_own_row_below_the_columns() {
+        let snapshot = TelemetrySnapshot::default();
+        let summary = LatencySummary {
+            median_us: 180_000,
+            p95_us: 1_400_000,
+            max_us: 3_900_000,
+            count: 40,
+        };
+        let latency = FuseLatencyWidget::new(Some(&summary), Duration::from_secs(10))
+            .with_cache_served(97, 3);
+        let out = render(ScenerySystemWidget::new(&snapshot).with_latency(latency), 7);
+
+        let last = out.lines().last().unwrap();
+        assert!(
+            last.starts_with("  Latency: p50 180ms │ p95 1.4s │ max 3.9s │ 97% cached"),
+            "latency is the last row, aligned with the TILE REQUESTS labels, got:\n{out}"
+        );
+        // The columns keep every row above it, including the QUEUE column's
+        // fourth entry row.
+        assert!(
+            out.lines().nth(4).unwrap().contains("Error Rate"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn without_latency_the_columns_use_the_whole_area() {
+        let snapshot = TelemetrySnapshot::default();
+        let out = render(ScenerySystemWidget::new(&snapshot), 6);
+        assert!(!out.contains("Latency:"), "got:\n{out}");
     }
 }
