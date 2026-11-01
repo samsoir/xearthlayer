@@ -5,7 +5,7 @@
 # which needs neither FUSE nor X-Plane and is installed deliberately.
 pkgbase=xearthlayer
 pkgname=('xearthlayer' 'xearthlayer-publish')
-pkgver=0.5.0
+pkgver=0.6.0
 pkgrel=1
 pkgdesc="High-quality satellite imagery for X-Plane, streamed on demand"
 arch=('x86_64')
