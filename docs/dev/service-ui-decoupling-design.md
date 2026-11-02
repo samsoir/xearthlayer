@@ -385,7 +385,7 @@ Short-lived commands create a `DaemonClient`, make one RPC, print the result, an
 
 ## Relationship to Other 0.5.0 Work
 
-This design develops on the `develop/0.5.0` branch established by #113. It interacts with two other workstreams:
+This design develops on `develop/0.6.0`, following `develop/0.5.0` established by #113. It interacts with two other workstreams:
 
 **#111 (FUSE hook pipeline)**: The hook pipeline runs inside the daemon process. No impact on the gRPC API — hooks are an internal daemon concern. The two workstreams develop in parallel.
 

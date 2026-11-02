@@ -26,29 +26,35 @@ make test    # Run all tests
 
 ### Branching
 
-XEarthLayer maintains two long-lived branches, one per release channel:
+XEarthLayer maintains three long-lived branches:
 
-| Branch | Channel | Version format | Purpose |
-|--------|---------|----------------|---------|
-| `main` | Stable | `X.Y.Z` (e.g. `0.4.6`) | Production releases — what most users run. |
-| `develop/0.5.0` | Unstable | `X.Y.Z-dev.N` (e.g. `0.5.0-dev.3`) | The next release, including breaking changes. |
+| Branch | Line | Version format | Purpose |
+|--------|------|----------------|---------|
+| `main` | Stable | `X.Y.Z` (e.g. `0.5.0`) | Production releases, what most users run. |
+| `develop/0.5.1` | Maintenance | `X.Y.Z-dev.N` (e.g. `0.5.1-dev.0`) | The next patch release: fixes and minor updates to the current stable line. |
+| `develop/0.6.0` | Next minor | `X.Y.Z-dev.N` (e.g. `0.6.0-dev.0`) | The next minor release: new features, including breaking changes. |
 
-Work branches off — and its PR targets — whichever long-lived branch owns the change:
+Work branches off, and its PR targets, whichever develop line owns the change:
 
-- **Fixes and small features for the current stable line** target `main`.
-- **Breaking changes and features for the next release** target `develop/0.5.0`.
+- **Fixes and minor updates to the current release** target `develop/0.5.1`.
+- **New features and breaking changes** target `develop/0.6.0`.
+
+If you are unsure, ask on the issue or target `develop/0.5.1` for a bug and
+`develop/0.6.0` for anything else. The issue's milestone names the line it belongs to.
 
 Branch naming (the prefix names the *change*; the base branch selects the *channel*):
 
 - `feature/<name>` — new functionality
 - `bugfix/<issue>-<description>` — bug fixes
-- `hotfix/<description>` — urgent fix to stable (branch from `main`)
+- `hotfix/<description>`: urgent fix to stable that cannot wait for the maintenance line
+  (branch from `main`)
 - `chore/<description>` — tooling, docs, maintenance
 
-**Golden rule — fixes flow one way.** Land fixes on `main` first, then forward-merge
-`main` → `develop/0.5.0` to carry them into the unstable line. `develop/0.5.0` is
-**never** merged back into `main` until the whole line is promoted as a stable release.
-This keeps `main` releasable at any moment.
+**Golden rule: changes flow forward.** A fix lands on `develop/0.5.1`, reaches `main`
+through a `release/0.5.x` branch, and is then forward-merged from `main` into
+`develop/0.6.0`. `develop/0.6.0` is **never** merged into `develop/0.5.1` or `main`; it
+reaches `main` only when the whole line is promoted as a stable release. This keeps
+`main` releasable at any moment and keeps unfinished features out of a patch release.
 
 See the [Application Release Runbook](docs/dev/app-release-runbook.md) for the full
 branch model and per-channel release procedures.
@@ -73,9 +79,7 @@ CI will reject PRs that haven't passed these checks.
 **Every PR must pass two status checks:** `Verify` (Linux) and `Verify (macOS)`. Both
 are required by design — macOS is a Tier 1 platform, and every release is gated on both
 passing before publish. You do not need a Mac to contribute; CI builds and verifies
-macOS for you. Note that `Verify (macOS)` is expected to fail on `develop/0.5.0` until
-the macOS port (PR #202) merges — don't try to fix it if your PR targets that branch
-in the meantime.
+macOS for you.
 
 See [CI/CD Pipeline](docs/dev/cicd.md) for the full pipeline description, including how
 merge-blocking and release-blocking currently differ per platform.
