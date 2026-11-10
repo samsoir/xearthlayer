@@ -33,7 +33,7 @@ pub use aircraft_position::AircraftPositionWidget;
 pub use feature_status::{EncoderStatus, FeatureStatus, FeatureStatusWidget, XworldProStatus};
 pub use fuse_latency::FuseLatencyWidget;
 pub use input_output::{DiskHistory, InputOutputWidget};
-pub use prefetch_system::{LaneView, PrefetchSystemWidget};
+pub use prefetch_system::{LaneHistory, LaneView, PrefetchSystemWidget};
 pub use scenery_system::{SceneryHistory, ScenerySystemWidget};
 
 // Legacy widgets (deprecated in v0.3.0, still used in render_sections.rs)

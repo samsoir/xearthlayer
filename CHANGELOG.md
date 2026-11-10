@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+#### Dashboard
+
+- **The prefetch lane meter is labelled `Utilization` and shows its history** ([#355](https://github.com/samsoir/xearthlayer/issues/355)): The Prefetch System pane's meter shows how much of the prefetch lane is in use, from 0% at rest to 100% with every slot busy. It was labelled `Capacity`, which names the fixed size rather than the share in use; it now reads `Utilization`, aligned with the `Prefetch` row above it. Beside the meter a sparkline shows the lane's utilization over the last twelve seconds, one cell per second, each the average of that second, scaled against a full lane so a half-busy lane always draws at half height. The other panes' sparklines show the last twelve draws, 1.2 seconds at the dashboard's refresh rate, which is too short to read a trend from.
+
 ## [0.5.0] - 2026-11-01
 
 ### Added
