@@ -32,7 +32,7 @@ use xearthlayer::runtime::JobRequest;
 /// actually talks to, exercising lookup → getattr → open → read → readdir →
 /// release on the live code path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires macFUSE installed and kext loaded"]
+#[ignore = "requires macFUSE with its FSKit extension on (or the kext, for fuse.macos_backend = kernel)"]
 async fn ortho_union_fs_mounts_and_serves_a_file_through_macfuse() {
     // A patches dir holding one patch with a known scenery file.
     let patches = tempfile::tempdir().expect("patches tempdir");
@@ -89,7 +89,7 @@ async fn ortho_union_fs_mounts_and_serves_a_file_through_macfuse() {
 /// folder. Without a `volname` the mount appears in Custom Scenery as
 /// `macFUSE Volume 0 (<process>)` rather than `zzXEL_ortho`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires macFUSE installed and kext loaded"]
+#[ignore = "requires macFUSE with its FSKit extension on (or the kext, for fuse.macos_backend = kernel)"]
 async fn ortho_union_fs_volume_is_named_after_its_mount_point_folder() {
     let patches = tempfile::tempdir().expect("patches tempdir");
     std::fs::create_dir_all(patches.path().join("TestPatch/terrain")).unwrap();

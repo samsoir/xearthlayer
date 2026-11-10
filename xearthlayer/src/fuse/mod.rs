@@ -14,12 +14,14 @@ pub(crate) mod support;
 mod coalesce;
 mod filename;
 pub mod fuse3;
+mod macos_backend;
 mod placeholder;
 
 // Re-export types for public API
 pub use coalesce::{CoalesceResult, CoalescedResult, CoalescerStats, RequestCoalescer};
 pub use filename::{parse_dds_filename, DdsFilename, ParseError, TextureKind};
 pub use fuse3::{Fuse3Error, Fuse3Result, MountHandle, SpawnedMountHandle};
+pub use macos_backend::{MacosBackend, UnknownMacosBackend};
 pub use placeholder::{
     generate_default_placeholder, generate_magenta_placeholder, get_default_placeholder,
     init_placeholder_cache, validate_dds_or_placeholder, EXPECTED_DDS_SIZE,
