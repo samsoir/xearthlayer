@@ -43,3 +43,9 @@ tempfile = "3.8"
 flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 tar = "0.4"
 clap = { version = "4.5", features = ["derive"] }
+
+# TEMPORARY (#210): fuse3 with the macFUSE FSKit transport (MFMount), from the
+# zodiac1214/fuse3 fork (branch feat/mfmount-transport) until it is merged into
+# samsoir/fuse3 master. Remove once samsoir/fuse3 carries the transport.
+[patch."https://github.com/samsoir/fuse3"]
+fuse3 = { git = "https://github.com/zodiac1214/fuse3", branch = "feat/mfmount-transport" }

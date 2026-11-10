@@ -120,6 +120,7 @@ impl ServiceOrchestrator {
         // Create mount manager with Custom Scenery path and FUSE kernel limits
         let mut mount_manager = MountManager::with_scenery_path(&config.custom_scenery_path);
         mount_manager.set_fuse_limits(config.fuse.max_background, config.fuse.congestion_threshold);
+        mount_manager.set_macos_backend(config.fuse.macos_backend);
         mount_manager.set_night_lighting(config.service.night_enabled());
         mount_manager.set_night_brightness(config.night_brightness);
         if let Some(timeout_secs) = config.service.generation_timeout() {

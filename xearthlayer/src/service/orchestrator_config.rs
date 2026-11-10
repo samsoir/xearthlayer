@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use crate::config::ConfigFile;
+use crate::fuse::MacosBackend;
 use crate::provider::ProviderConfig;
 use crate::service::ServiceConfig;
 
@@ -138,6 +139,9 @@ pub struct FuseConfig {
 
     /// Congestion threshold for background FUSE requests.
     pub congestion_threshold: u16,
+
+    /// Which macFUSE backend mounts the ortho volume (macOS only).
+    pub macos_backend: MacosBackend,
 }
 
 impl OrchestratorConfig {
@@ -201,6 +205,9 @@ impl OrchestratorConfig {
         let fuse = FuseConfig {
             max_background: config.fuse.max_background,
             congestion_threshold: config.fuse.congestion_threshold,
+            // Validated when the config was read; a value set in code that
+            // names no backend falls back to the default.
+            macos_backend: config.fuse.macos_backend.parse().unwrap_or_default(),
         };
 
         Self {
@@ -294,5 +301,26 @@ mod tests {
             orch_config.prefetch.web_api_port,
             config.prefetch.web_api_port
         );
+    }
+
+    #[test]
+    fn the_macos_backend_is_extracted_and_defaults_to_auto() {
+        let (mut config, provider, service, custom_scenery, packages_dir) = create_test_config();
+        let extract = |config: &ConfigFile| {
+            OrchestratorConfig::from_config_file(
+                config,
+                provider.clone(),
+                service.clone(),
+                custom_scenery.clone(),
+                packages_dir.clone(),
+                false,
+            )
+            .fuse
+            .macos_backend
+        };
+
+        assert_eq!(extract(&config), MacosBackend::Auto);
+        config.fuse.macos_backend = "kernel".to_string();
+        assert_eq!(extract(&config), MacosBackend::Kernel);
     }
 }
