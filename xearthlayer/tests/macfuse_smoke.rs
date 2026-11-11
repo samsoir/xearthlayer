@@ -12,8 +12,16 @@
 //! Run this after bumping the pinned fuse3 fork revision or changing the
 //! mount/session code.
 //!
-//! Ignored by default because it needs macFUSE installed and the kext loaded.
+//! Every test runs once per backend, pinned with `with_macos_backend` rather
+//! than left on `auto`, so a pass says which backend was tested: the
+//! `_kernel` variants need the kext approved, the `_macfuse_fskit` variants
+//! need macFUSE 5.3.3+ with its File System Extension on. Each variant also
+//! checks the mount table, so it cannot pass on the other backend. A machine
+//! set up for one backend passes that backend's variants only.
+//!
+//! Ignored by default because they need macFUSE installed.
 //! Run with: `cargo test --test macfuse_smoke -- --ignored --nocapture`
+//! (append `kernel` or `macfuse_fskit` to run one backend's variants).
 //!
 //! Run it in a terminal on the Mac itself, not over SSH. macOS treats a
 //! macFUSE mount as a network volume and attributes an SSH session to
@@ -33,6 +41,7 @@ use tokio::sync::mpsc;
 
 use xearthlayer::executor::ChannelDdsClient;
 use xearthlayer::fuse::fuse3::Fuse3OrthoUnionFS;
+use xearthlayer::fuse::MacosBackend;
 use xearthlayer::ortho_union::OrthoUnionIndexBuilder;
 use xearthlayer::runtime::JobRequest;
 
@@ -41,8 +50,18 @@ use xearthlayer::runtime::JobRequest;
 /// actually talks to, exercising lookup → getattr → open → read → readdir →
 /// release on the live code path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires macFUSE with its FSKit extension on (or the kext, for fuse.macos_backend = kernel)"]
-async fn ortho_union_fs_mounts_and_serves_a_file_through_macfuse() {
+#[ignore = "requires macFUSE with its kernel extension approved"]
+async fn ortho_union_fs_mounts_and_serves_a_file_kernel() {
+    mounts_and_serves_a_file(MacosBackend::Kernel).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires macFUSE 5.3.3+ with its File System Extension on"]
+async fn ortho_union_fs_mounts_and_serves_a_file_macfuse_fskit() {
+    mounts_and_serves_a_file(MacosBackend::MacFuseFsKit).await;
+}
+
+async fn mounts_and_serves_a_file(backend: MacosBackend) {
     // A patches dir holding one patch with a known scenery file.
     let patches = tempfile::tempdir().expect("patches tempdir");
     let patch_dir = patches.path().join("TestPatch");
@@ -65,13 +84,14 @@ async fn ortho_union_fs_mounts_and_serves_a_file_through_macfuse() {
     let (tx, _rx) = mpsc::channel::<JobRequest>(8);
     let dds_client = Arc::new(ChannelDdsClient::new(tx));
 
-    let fs = Fuse3OrthoUnionFS::new(index, dds_client, 11_174_016);
+    let fs = Fuse3OrthoUnionFS::new(index, dds_client, 11_174_016).with_macos_backend(backend);
     let handle = fs
         .mount_spawned(&mount_str)
         .await
         .expect("ortho union mount_spawned must succeed on macFUSE");
 
     tokio::time::sleep(Duration::from_millis(500)).await;
+    let flags = mount_flags(mountpoint.path());
 
     // Read the real scenery file back through the union mount.
     let mounted = mountpoint.path().join(dsf_rel);
@@ -92,14 +112,25 @@ async fn ortho_union_fs_mounts_and_serves_a_file_through_macfuse() {
     );
 
     handle.unmount().await.expect("union unmount must succeed");
+    assert_mounted_with(backend, &flags);
 }
 
 /// #305: Finder shows a mounted volume's name in place of its mount-point
 /// folder. Without a `volname` the mount appears in Custom Scenery as
 /// `macFUSE Volume 0 (<process>)` rather than `zzXEL_ortho`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires macFUSE with its FSKit extension on (or the kext, for fuse.macos_backend = kernel)"]
-async fn ortho_union_fs_volume_is_named_after_its_mount_point_folder() {
+#[ignore = "requires macFUSE with its kernel extension approved"]
+async fn ortho_union_fs_volume_is_named_after_its_mount_point_folder_kernel() {
+    volume_is_named_after_its_mount_point_folder(MacosBackend::Kernel).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires macFUSE 5.3.3+ with its File System Extension on"]
+async fn ortho_union_fs_volume_is_named_after_its_mount_point_folder_macfuse_fskit() {
+    volume_is_named_after_its_mount_point_folder(MacosBackend::MacFuseFsKit).await;
+}
+
+async fn volume_is_named_after_its_mount_point_folder(backend: MacosBackend) {
     let patches = tempfile::tempdir().expect("patches tempdir");
     std::fs::create_dir_all(patches.path().join("TestPatch/terrain")).unwrap();
     std::fs::write(patches.path().join("TestPatch/terrain/test.ter"), b"t").unwrap();
@@ -113,7 +144,8 @@ async fn ortho_union_fs_volume_is_named_after_its_mount_point_folder() {
     std::fs::create_dir(&mountpoint).unwrap();
 
     let (tx, _rx) = mpsc::channel::<JobRequest>(8);
-    let fs = Fuse3OrthoUnionFS::new(index, Arc::new(ChannelDdsClient::new(tx)), 11_174_016);
+    let fs = Fuse3OrthoUnionFS::new(index, Arc::new(ChannelDdsClient::new(tx)), 11_174_016)
+        .with_macos_backend(backend);
     let handle = fs
         .mount_spawned(mountpoint.to_str().unwrap())
         .await
@@ -121,9 +153,48 @@ async fn ortho_union_fs_volume_is_named_after_its_mount_point_folder() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
     let name = volume_name(&mountpoint);
+    let flags = mount_flags(&mountpoint);
     handle.unmount().await.expect("union unmount must succeed");
 
+    assert_mounted_with(backend, &flags);
     assert_eq!(name, "zzXEL_ortho");
+}
+
+/// Asserts the volume was served by `backend`, from its mount-table flags.
+/// An FSKit volume carries the `fskit` flag (macFUSE 5.5.0, macOS 26.6):
+///   macfuse://<UUID> on <dir> (macfuse, nodev, nosuid, noowners, noatime,
+///   fskit, mounted by <user>)
+/// and a kernel-extension volume does not.
+fn assert_mounted_with(backend: MacosBackend, flags: &[String]) {
+    let fskit = flags.iter().any(|flag| flag == "fskit");
+    match backend {
+        MacosBackend::MacFuseFsKit => assert!(fskit, "not an FSKit mount: {flags:?}"),
+        MacosBackend::Kernel => assert!(!fskit, "not a kernel-extension mount: {flags:?}"),
+        MacosBackend::Auto => panic!("pin a backend: auto passes on either"),
+    }
+}
+
+/// The flags `mount` lists for the volume mounted on `path`. Read while the
+/// volume is mounted; panics if `path` is not in the mount table.
+fn mount_flags(path: &std::path::Path) -> Vec<String> {
+    // The mount table names the resolved path (`/private/var/...`, not the
+    // `/var/...` a temp dir is handed out as).
+    let dir = path.canonicalize().expect("canonicalize mount point");
+    let needle = format!(" on {} (", dir.display());
+    let out = std::process::Command::new("/sbin/mount")
+        .output()
+        .expect("run mount");
+    let table = String::from_utf8_lossy(&out.stdout);
+    let line = table
+        .lines()
+        .find(|line| line.contains(&needle))
+        .unwrap_or_else(|| panic!("{} not in the mount table:\n{table}", dir.display()));
+    line.rsplit_once(" (")
+        .map(|(_, flags)| flags.trim_end_matches(')'))
+        .unwrap_or_default()
+        .split(", ")
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The volume name Finder shows for `path`, read with `getattrlist`
