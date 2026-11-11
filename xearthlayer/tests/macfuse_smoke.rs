@@ -14,6 +14,15 @@
 //!
 //! Ignored by default because it needs macFUSE installed and the kext loaded.
 //! Run with: `cargo test --test macfuse_smoke -- --ignored --nocapture`
+//!
+//! Run it in a terminal on the Mac itself, not over SSH. macOS treats a
+//! macFUSE mount as a network volume and attributes an SSH session to
+//! `/usr/libexec/sshd-keygen-wrapper`, which has no permission to open files
+//! on one: the mount succeeds and the first read through it fails with
+//! `Operation not permitted` (EPERM). The filesystem never returns EPERM
+//! itself, so that error always means macOS refused the caller. To run over
+//! SSH anyway, give `sshd-keygen-wrapper` Full Disk Access under System
+//! Settings > Privacy & Security.
 
 #![cfg(target_os = "macos")]
 

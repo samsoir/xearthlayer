@@ -604,7 +604,7 @@ matrix jobs are renamed.
 ## Platform Support
 
 - **Linux**: ✅ Fully working (native FUSE)
-- **macOS**: ✅ Working (requires [macFUSE](https://macfuse.io); Apple Silicon tested; fuse3 pinned to `samsoir/fuse3` `master` (upstream + `configurable-background` plus the macOS reply-resilience patch — upstream PR [Sherlock-Holo/fuse3#137](https://github.com/Sherlock-Holo/fuse3/pull/137) — comma-joined mount options, and reply-drop log demotion); install/approval guide in `docs/macos.md`)
+- **macOS**: ✅ Working (requires [macFUSE](https://macfuse.io); Apple Silicon tested; fuse3 pinned to `samsoir/fuse3` `master`: upstream master at 0.10.0, which already has the configurable `max_background`/`congestion_threshold`, plus three macOS-only commits (the reply-resilience patch, upstream PR [Sherlock-Holo/fuse3#137](https://github.com/Sherlock-Holo/fuse3/pull/137); comma-joined mount options; reply-drop log demotion). The fork is synced by merging upstream, never by rebasing: released `Cargo.lock` files pin its commits (tag `xel-0.5.0` marks the one v0.5.0 pins); install/approval guide in `docs/macos.md`)
 - **Windows**: ⏳ Planned (requires Dokan/WinFSP)
 
 ## References
