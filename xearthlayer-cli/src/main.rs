@@ -21,6 +21,7 @@ mod logging_init;
 mod preflight;
 mod runner;
 mod signals;
+mod stderr_detour;
 mod tui_app;
 mod ui;
 
@@ -264,6 +265,11 @@ fn main() -> ExitCode {
     // Either can be overridden with MALLOC_MMAP_THRESHOLD_ / MALLOC_ARENA_MAX
     // or GLIBC_TUNABLES; an explicit user setting always wins.
     xearthlayer::metrics::configure_allocator();
+
+    // Also before any thread: the environment is process-wide. XEarthLayer
+    // never presents to a display, but the Vulkan stack opens one when it is
+    // named, and the display server's refusal lands on the dashboard (#358).
+    xearthlayer::system::disown_display();
 
     let cli = Cli::parse();
 

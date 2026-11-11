@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **macFUSE without the kernel extension** ([#210](https://github.com/samsoir/xearthlayer/issues/210)): On macOS, XEarthLayer can now mount its scenery through macFUSE's FSKit backend, which needs no kernel extension. A new Mac no longer has to boot into Recovery, lower its security and approve the kext. With macFUSE 5.3.3 or later, you turn macFUSE on once under System Settings → General → Login Items & Extensions → File System Extensions. If X-Plane is on an external drive, you also give `/usr/libexec/fskitd` Full Disk Access. A new setting, `fuse.macos_backend`, chooses the backend: `auto` (the default) tries FSKit, logs why if it cannot mount, and falls back to the kernel extension; `fskit` uses FSKit only; `kernel` uses the kext only. Because `auto` falls back, an existing install with the kext approved keeps working on upgrade, and moves to FSKit by itself once the file system extension is on. If macFUSE is missing, the startup check's hint now names the version and the external-drive step. See [macOS](docs/macos.md#installing-macfuse).
 
+### Changed
+
+#### Dashboard
+
+- **The prefetch lane meter is labelled `Utilization` and shows its history** ([#355](https://github.com/samsoir/xearthlayer/issues/355)): The Prefetch System pane's meter shows how much of the prefetch lane is in use, from 0% at rest to 100% with every slot busy. It was labelled `Capacity`, which names the fixed size rather than the share in use; it now reads `Utilization`, aligned with the `Prefetch` row above it. Beside the meter a sparkline shows the lane's utilization over the last twelve seconds, one cell per second, each the average of that second, scaled against a full lane so a half-busy lane always draws at half height. The other panes' sparklines show the last twelve draws, 1.2 seconds at the dashboard's refresh rate, which is too short to read a trend from.
+
+#### FUSE
+
+- **fuse3 is updated to 0.10.0** ([#155](https://github.com/samsoir/xearthlayer/issues/155)): XEarthLayer's fork of the fuse3 crate now follows the upstream 0.10.0 release, which includes the configurable FUSE kernel limits XEarthLayer contributed earlier this year. The fork is down to three macOS fixes that upstream has not taken yet. Nothing changes in how scenery is mounted or served.
+
+### Fixed
+
+#### Dashboard
+
+- **The display server's refusal no longer bleeds into the dashboard** ([#358](https://github.com/samsoir/xearthlayer/issues/358)): In a shell with `DISPLAY` set but no usable `XAUTHORITY`, such as a tmux server older than the desktop session, `xearthlayer run` printed "Authorization required, but no authorization protocol specified" at launch and the line then corrupted the dashboard, and `xearthlayer diagnostics` printed it three times under its GPU section. The line is the X server's reason for refusing a connection, written by libxcb straight to the terminal; the connections came from the Vulkan stack during GPU enumeration (Mesa's device-select layer and the NVIDIA driver open the display when one is named), not from anything XEarthLayer asked for. XEarthLayer never presents to a display and chooses its own adapter, so it now removes `DISPLAY` and `WAYLAND_DISPLAY` from its own environment before anything else runs, which also spares enumeration the display round trips. Separately, while the dashboard is up, stderr is pointed at the flight log, so a warning from any library that writes to it, or a panic message, lands in the log instead of on the screen; the terminal gets it back when the dashboard closes.
+
 ## [0.5.0] - 2026-11-01
 
 ### Added

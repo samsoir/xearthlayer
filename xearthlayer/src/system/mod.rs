@@ -40,8 +40,8 @@ pub use encoder_policy::{
 };
 pub use filesystem::{fs_info, is_immutable_os, FilesystemInfo};
 pub use gpu::{
-    enumerate as enumerate_gpus, enumerate_raw as enumerate_gpus_raw, find_adapter as find_gpu,
-    GpuAdapter, GpuKind, GpuSelectError, GpuSelection,
+    disown_display, enumerate as enumerate_gpus, enumerate_raw as enumerate_gpus_raw,
+    find_adapter as find_gpu, GpuAdapter, GpuKind, GpuSelectError, GpuSelection,
 };
 pub use hardware::{detect_cpu_cores, detect_total_memory, StorageType, SystemInfo};
 pub use recommendations::{

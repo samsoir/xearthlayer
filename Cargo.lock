@@ -1145,8 +1145,8 @@ dependencies = [
 
 [[package]]
 name = "fuse3"
-version = "0.9.0"
-source = "git+https://github.com/zodiac1214/fuse3?branch=feat%2Fmfmount-transport#1910979c4b57d84d7725585c5ebdeb55e7b33d4c"
+version = "0.10.0"
+source = "git+https://github.com/zodiac1214/fuse3?branch=feat%2Fmfmount-transport#e119e8595fbc9ae2e536b0698095783e681e08e8"
 dependencies = [
  "async-notify",
  "bytes",
