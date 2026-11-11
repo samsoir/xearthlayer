@@ -36,7 +36,9 @@ use xearthlayer::runtime::{SharedRuntimeHealth, SharedTileProgressTracker};
 use xearthlayer::update::UpdateInfo;
 
 use crate::ui::symbols::{self, SymbolSet, SystemTerminal};
-use crate::ui::widgets::{CacheConfig, DiskHistory, FeatureStatus, NetworkHistory, SceneryHistory};
+use crate::ui::widgets::{
+    CacheConfig, DiskHistory, FeatureStatus, LaneHistory, NetworkHistory, SceneryHistory,
+};
 
 // Re-export public types from state module
 pub use state::{
@@ -56,6 +58,8 @@ pub struct Dashboard {
     scenery_history: SceneryHistory,
     /// History for disk I/O sparklines (new v0.3.0 layout).
     disk_history: DiskHistory,
+    /// Prefetch lane utilization, one cell per second, for its sparkline.
+    lane_history: LaneHistory,
     shutdown: Arc<AtomicBool>,
     start_time: Instant,
     last_draw: Instant,
@@ -110,6 +114,7 @@ impl Dashboard {
             network_history: NetworkHistory::new(60), // 60 samples for sparkline
             scenery_history: SceneryHistory::new(12), // 12 samples for scenery sparklines
             disk_history: DiskHistory::new(12),       // 12 samples for disk I/O sparkline
+            lane_history: LaneHistory::new(),
             shutdown,
             start_time: now,
             last_draw: now,
@@ -223,6 +228,12 @@ impl Dashboard {
             sample_interval,
         );
 
+        // Record the prefetch lane's utilization for its sparkline
+        self.lane_history.record(
+            render::lane_view(snapshot, self.config.prefetch_lane.group),
+            now,
+        );
+
         let uptime = self.start_time.elapsed();
         let cache_config = CacheConfig {
             memory_max_bytes: self.config.memory_cache_max,
@@ -288,6 +299,7 @@ impl Dashboard {
                 &self.network_history,
                 &scenery_history,
                 &disk_history,
+                &self.lane_history,
                 &provider_name,
                 uptime,
                 &cache_config,
