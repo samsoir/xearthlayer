@@ -244,13 +244,13 @@ max_background = {}
 ; Kernel starts throttling when pending requests exceed this. Convention: 75% of max_background.
 congestion_threshold = {}
 ; macOS only: which macFUSE backend mounts the scenery (default: auto)
-;   auto   - FSKit when it can mount, the kernel extension otherwise; the log
-;            says why FSKit could not mount
-;   fskit  - macFUSE's FSKit backend, recommended: no kernel extension
-;            (macFUSE 5.3.3+; turn on macFUSE under System Settings > General >
-;            Login Items & Extensions > File System Extensions; with X-Plane on
-;            an external drive, also give /usr/libexec/fskitd Full Disk Access)
-;   kernel - the macFUSE kernel extension (needs Recovery mode approval on Apple Silicon)
+;   auto          - FSKit when it can mount, the kernel extension otherwise; the
+;                   log says why FSKit could not mount
+;   macfuse-fskit - macFUSE's FSKit backend, recommended: no kernel extension
+;                   (macFUSE 5.3.3+; turn on macFUSE under System Settings > General >
+;                   Login Items & Extensions > File System Extensions; with X-Plane
+;                   on an external drive, also give /usr/libexec/fskitd Full Disk Access)
+;   kernel        - the macFUSE kernel extension (needs Recovery mode approval on Apple Silicon)
 macos_backend = {}
 
 [night]

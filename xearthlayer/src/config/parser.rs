@@ -441,7 +441,7 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
                     section: "fuse".to_string(),
                     key: "macos_backend".to_string(),
                     value: v,
-                    reason: "must be 'fskit', 'kernel', or 'auto'".to_string(),
+                    reason: "must be 'macfuse-fskit', 'kernel', or 'auto'".to_string(),
                 });
             }
             config.fuse.macos_backend = v;

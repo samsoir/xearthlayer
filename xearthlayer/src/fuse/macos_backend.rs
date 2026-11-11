@@ -30,7 +30,7 @@ impl MacosBackend {
     /// The setting's value as written in `config.ini`.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::FsKit => "fskit",
+            Self::FsKit => "macfuse-fskit",
             Self::Kernel => "kernel",
             Self::Auto => "auto",
         }
@@ -51,7 +51,7 @@ impl fmt::Display for UnknownMacosBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "unknown macOS backend '{}': expected fskit, kernel or auto",
+            "unknown macOS backend '{}': expected macfuse-fskit, kernel or auto",
             self.0
         )
     }
@@ -64,7 +64,7 @@ impl FromStr for MacosBackend {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "fskit" => Ok(Self::FsKit),
+            "macfuse-fskit" => Ok(Self::FsKit),
             "kernel" => Ok(Self::Kernel),
             "auto" => Ok(Self::Auto),
             _ => Err(UnknownMacosBackend(s.to_string())),
@@ -90,8 +90,8 @@ mod tests {
 
     #[test]
     fn the_default_is_auto() {
-        // Not fskit: a 0.5.0 install has the kext approved and almost never
-        // the File System Extension, so an fskit default would turn a working
+        // Not macfuse-fskit: a 0.5.0 install has the kext approved and almost never
+        // the File System Extension, so a macfuse-fskit default would turn a working
         // install into a failed mount on upgrade.
         assert_eq!(MacosBackend::default(), MacosBackend::Auto);
     }
@@ -113,6 +113,15 @@ mod tests {
     #[test]
     fn parsing_ignores_case_and_surrounding_space() {
         assert_eq!(" Kernel ".parse(), Ok(MacosBackend::Kernel));
+        assert_eq!("macFUSE-fskit".parse(), Ok(MacosBackend::FsKit));
+    }
+
+    #[test]
+    fn plain_fskit_is_refused_because_it_is_reserved_for_native_fskit() {
+        // `fskit` will name the native FSKit backend (no macFUSE, #361);
+        // macFUSE's FSKit backend is `macfuse-fskit`.
+        assert!("fskit".parse::<MacosBackend>().is_err());
+        assert!(!FUSE_MACOS_BACKEND_VALUES.contains(&"fskit"));
     }
 
     #[test]

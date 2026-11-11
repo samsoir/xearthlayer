@@ -15,7 +15,7 @@ macFUSE can serve XEarthLayer's volume two ways, chosen by the
 
 | Backend | Setting | Setup |
 |---------|---------|-------|
-| **FSKit** (recommended) | `fskit` | Turn macFUSE on once in System Settings. No kernel extension, no Recovery mode |
+| **FSKit** (recommended) | `macfuse-fskit` | Turn macFUSE on once in System Settings. No kernel extension, no Recovery mode |
 | Kernel extension (fallback) | `kernel` | One-time kext approval, which on Apple Silicon needs Recovery mode |
 
 The default is `auto`: XEarthLayer tries FSKit first and, if it cannot mount,
@@ -23,7 +23,7 @@ logs why (`macFUSE FSKit backend unavailable (...); using the kernel backend`)
 and uses the kernel extension. An installation that already has the kext
 approved therefore keeps working on upgrade, and moves to FSKit by itself once
 you turn the file system extension on (step 2). The default will move to
-`fskit` once that backend has more flight time (#210).
+`macfuse-fskit` once that backend has more flight time (#210).
 
 **New installations** should set up FSKit (steps 1, 2 and, with X-Plane on an
 external drive, 2a) and skip the kernel extension. If you see stutters on
@@ -48,7 +48,7 @@ brew install --cask macfuse
 That is all the FSKit backend needs, unless X-Plane is on an external drive
 (step 2a). To check it, run XEarthLayer: with the default `auto`, no
 `macFUSE FSKit backend unavailable` warning in the log means the volume is on
-FSKit. With `fuse.macos_backend = fskit`, a mount that fails names the setting
+FSKit. With `fuse.macos_backend = macfuse-fskit`, a mount that fails names the setting
 to turn on.
 
 ### 2a. X-Plane on an external drive: give `fskitd` Full Disk Access
@@ -57,7 +57,7 @@ If X-Plane (and so its `Custom Scenery` folder, where XEarthLayer mounts) is
 on an external drive, under `/Volumes/...`, the FSKit mount is made by
 macOS's `fskitd` daemon, and `fskitd` needs Full Disk Access to reach a folder
 on an external volume. Without it, FSKit cannot serve the mount there: `auto`
-falls back to the kernel extension, and `fskit` fails to mount. X-Plane on the
+falls back to the kernel extension, and `macfuse-fskit` fails to mount. X-Plane on the
 internal disk does not need this.
 
 1. Open **System Settings → Privacy & Security → Full Disk Access**.

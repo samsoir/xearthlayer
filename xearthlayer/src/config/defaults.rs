@@ -163,12 +163,12 @@ pub const DEFAULT_FUSE_MAX_BACKGROUND: u16 = 256;
 pub const DEFAULT_FUSE_CONGESTION_THRESHOLD: u16 = DEFAULT_FUSE_MAX_BACKGROUND * 3 / 4; // 192
 
 /// Default macOS mount backend: FSKit when it can mount, the kernel extension
-/// otherwise (#210). Not `fskit`, which would turn a 0.5.0 install whose kext
+/// otherwise (#210). Not `macfuse-fskit`, which would turn a 0.5.0 install whose kext
 /// is approved but whose File System Extension is off into a failed mount.
 pub const DEFAULT_FUSE_MACOS_BACKEND: &str = "auto";
 
 /// The values `fuse.macos_backend` accepts.
-pub const FUSE_MACOS_BACKEND_VALUES: &[&str] = &["fskit", "kernel", "auto"];
+pub const FUSE_MACOS_BACKEND_VALUES: &[&str] = &["macfuse-fskit", "kernel", "auto"];
 
 /// Night lighting is on by default; it only acts when the installed packages
 /// carry night recipes and the X-Plane installation is found.
