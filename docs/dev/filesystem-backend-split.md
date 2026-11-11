@@ -171,7 +171,7 @@ and can be leveraged for the final implementation.
 ### Neutral Conformance Suite
 
 The neutral conformance suite runs the core contract suite once, against
-`OrhtoUnionCore`. The suite drives the `UnionFilesystem` operations, testing
+`OrthoUnionCore`. The suite drives the `UnionFilesystem` operations, testing
 only the neutral types. There should not be any instances of backend-specific
 symbols (`fuse3::`) or references to inode, kernel flags, caching policy.
 This suite should not test adapter-specific translations.
@@ -502,7 +502,7 @@ In addition:
 - regression flying on macOS and Linux before merge
 - structural checks
   - `manager/mounts.rs` contains no `cfg` and names no backend
-  - `common` module contains no `fuse3::`, inode or kernal-flag symbols
+  - `common` module contains no `fuse3::`, inode or kernel-flag symbols
   - no `cfg(target_os)` remains in `vfs/` outside `fuse_platform.rs` (and `select_backend`)
   - no `crate::vfs::fuse3::` import outside `vfs/`
   - `system/unmount.rs` moves into the fuse3 backend, so `panic.rs` and `mounts.rs` reach it only through `MountBackend`
