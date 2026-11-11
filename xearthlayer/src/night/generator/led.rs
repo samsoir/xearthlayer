@@ -70,6 +70,32 @@ pub struct RegionTone {
     pub kelvin_shift: f64,
 }
 
+/// How the sodium texels the LED stage leaves alone are toned (#363).
+///
+/// Laminar's sodium is about as saturated as a 2700 K blackbody, which is
+/// physically fair for high-pressure sodium, but seen from the air a city's
+/// sodium districts read less orange than the art. A texel is mixed `mix`
+/// of the way towards the white of `kelvin` at its own luminance, then its
+/// luminance is raised by `mix` of `energy`, because a less saturated light
+/// of equal luminance looks dimmer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SodiumTone {
+    /// How far towards the white, 0 (Laminar's bytes) to 1.
+    pub mix: f32,
+    pub kelvin: f64,
+    /// Luminance multiplier at a full mix; a partial mix gets that share.
+    pub energy: f32,
+}
+
+impl SodiumTone {
+    /// Laminar's sodium bytes, untouched.
+    pub const NONE: Self = Self {
+        mix: 0.0,
+        kelvin: 3200.0,
+        energy: 1.0,
+    };
+}
+
 /// The whole LED model. Provisional values, tuned in flight.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LedModel {
@@ -82,6 +108,8 @@ pub struct LedModel {
     /// Above 1: saturated orange looks brighter than white of equal
     /// luminance, and LED should read brighter, not merely equal.
     pub energy: f32,
+    /// The tone of the texels that stay sodium.
+    pub sodium: SodiumTone,
 }
 
 const fn region(share_scale: f64, kelvin_shift: f64) -> RegionTone {
@@ -93,16 +121,18 @@ const fn region(share_scale: f64, kelvin_shift: f64) -> RegionTone {
 
 impl LedModel {
     pub const DEFAULT: Self = Self {
+        // Shares raised in #363: from the air, cities that have converted
+        // their street lighting read mostly white, residential included.
         industrial: Tone {
-            share: 0.80,
+            share: 0.90,
             kelvin: 4500.0,
         },
         urban_bright: Tone {
-            share: 0.75,
+            share: 0.90,
             kelvin: 4000.0,
         },
         urban_dim: Tone {
-            share: 0.45,
+            share: 0.80,
             kelvin: 3200.0,
         },
         // Na, Sa, Eu, Af, As, Oc, Unknown
@@ -116,9 +146,15 @@ impl LedModel {
             region(0.75, 0.0),
         ],
         energy: 1.25,
+        sodium: SodiumTone {
+            mix: 0.30,
+            kelvin: 3200.0,
+            energy: 1.125,
+        },
     };
 
-    /// No LED anywhere: the generator's output is the sodium-only one.
+    /// No LED anywhere and Laminar's sodium untouched: the generator's
+    /// output is the sodium-only one.
     pub const OFF: Self = Self {
         industrial: Tone {
             share: 0.0,
@@ -132,6 +168,7 @@ impl LedModel {
             share: 0.0,
             kelvin: 3200.0,
         },
+        sodium: SodiumTone::NONE,
         ..Self::DEFAULT
     };
 
@@ -289,28 +326,59 @@ fn byte_luminance(c: [u8; 3]) -> f32 {
     luminance(c.map(|v| (f32::from(v) / 255.0).powf(SRGB_GAMMA)))
 }
 
-/// The bytes of a texel after the gain `s`. A sodium texel is `sodium * s`
-/// rounded to nearest. An LED texel is `led * s`, which must not read dimmer
-/// than those sodium bytes: rounding to nearest can lose a little luminance
-/// (near black, or where the colour sits at full scale), so it falls back to
-/// rounding up, then to the sodium bytes themselves.
-pub fn texel_bytes(sodium: [f32; 3], led: Option<[f32; 3]>, s: f32) -> [u8; 3] {
+/// The bytes of a texel after the gain `s`. Laminar's sodium is `sodium * s`
+/// rounded to nearest. A desaturated sodium texel, and then an LED texel,
+/// must each not read dimmer than the bytes below it: rounding to nearest
+/// can lose a little luminance (near black, or where the colour sits at full
+/// scale), so each falls back to rounding up, then to the bytes below.
+pub fn texel_bytes(
+    sodium: [f32; 3],
+    desaturated: Option<[f32; 3]>,
+    led: Option<[f32; 3]>,
+    s: f32,
+) -> [u8; 3] {
     let quantise = |c: [f32; 3], f: fn(f32) -> f32| c.map(|v| f(v * s).clamp(0.0, 255.0) as u8);
-    let base = quantise(sodium, f32::round);
-    let Some(led) = led else {
-        return base;
+    let no_dimmer = |below: [u8; 3], over: [f32; 3]| {
+        let floor = byte_luminance(below);
+        let nearest = quantise(over, f32::round);
+        if byte_luminance(nearest) >= floor {
+            return nearest;
+        }
+        let up = quantise(over, f32::ceil);
+        if byte_luminance(up) >= floor {
+            up
+        } else {
+            below
+        }
     };
-    let floor = byte_luminance(base);
-    let nearest = quantise(led, f32::round);
-    if byte_luminance(nearest) >= floor {
-        return nearest;
+    let mut bytes = quantise(sodium, f32::round);
+    if let Some(d) = desaturated {
+        bytes = no_dimmer(bytes, d);
     }
-    let up = quantise(led, f32::ceil);
-    if byte_luminance(up) >= floor {
-        up
-    } else {
-        base
+    if let Some(l) = led {
+        bytes = no_dimmer(bytes, l);
     }
+    bytes
+}
+
+/// A sodium texel (stored values, 0..255) toned by `tone`: mixed in linear
+/// light towards the white of `tone.kelvin` at its own luminance, then that
+/// luminance raised by `tone.mix` of `tone.energy`. No mix, or black, returns
+/// the input exactly, so `SodiumTone::NONE` keeps Laminar's bytes.
+pub fn desaturate(stored: [f32; 3], tone: &SodiumTone) -> [f32; 3] {
+    let m = tone.mix.clamp(0.0, 1.0);
+    if m <= 0.0 {
+        return stored;
+    }
+    let linear = decode(stored);
+    let y = luminance(linear);
+    if y <= 0.0 {
+        return stored;
+    }
+    let w = white(tone.kelvin);
+    let gain = 1.0 + m * (tone.energy - 1.0);
+    let out = [0, 1, 2].map(|c| (linear[c] * (1.0 - m) + w[c] * y * m) * gain);
+    encode(keep_light(out, y))
 }
 
 /// A sodium texel (stored values, 0..255) as LED white at `kelvin`: its
@@ -318,12 +386,28 @@ pub fn texel_bytes(sodium: [f32; 3], led: Option<[f32; 3]>, s: f32) -> [u8; 3] {
 /// with its hue kept; if that leaves it dimmer than the input, it is mixed
 /// towards full white until it is not.
 pub fn recolour(stored: [f32; 3], kelvin: f64, energy: f32) -> [f32; 3] {
-    let linear = stored.map(|v| (v / 255.0).clamp(0.0, 1.0).powf(SRGB_GAMMA));
-    let y = luminance(linear);
+    let y = luminance(decode(stored));
     if y <= 0.0 {
         return stored;
     }
-    let mut out = white(kelvin).map(|c| c * y * energy);
+    encode(keep_light(white(kelvin).map(|c| c * y * energy), y))
+}
+
+/// Stored values (0..255) to linear light.
+fn decode(stored: [f32; 3]) -> [f32; 3] {
+    stored.map(|v| (v / 255.0).clamp(0.0, 1.0).powf(SRGB_GAMMA))
+}
+
+/// Linear light to stored values (0..255).
+fn encode(linear: [f32; 3]) -> [f32; 3] {
+    linear.map(|c| c.clamp(0.0, 1.0).powf(1.0 / SRGB_GAMMA) * 255.0)
+}
+
+/// A linear colour brought within full scale without reading dimmer than
+/// luminance `y`: a channel past full scales all three down so the hue
+/// holds, and if that leaves it dimmer than `y`, it is mixed towards full
+/// white until it is not.
+fn keep_light(mut out: [f32; 3], y: f32) -> [f32; 3] {
     let peak = out.iter().copied().fold(0.0f32, f32::max);
     if peak > 1.0 {
         out = out.map(|c| c / peak);
@@ -333,7 +417,7 @@ pub fn recolour(stored: [f32; 3], kelvin: f64, energy: f32) -> [f32; 3] {
         let t = (y - l) / (1.0 - l);
         out = out.map(|c| c + t * (1.0 - c));
     }
-    out.map(|c| c.clamp(0.0, 1.0).powf(1.0 / SRGB_GAMMA) * 255.0)
+    out
 }
 
 #[cfg(test)]
@@ -342,10 +426,6 @@ mod tests {
 
     fn lum(c: [f32; 3]) -> f32 {
         0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
-    }
-
-    fn decode(stored: [f32; 3]) -> [f32; 3] {
-        stored.map(|v| (v / 255.0).powf(SRGB_GAMMA))
     }
 
     #[test]
@@ -412,9 +492,9 @@ mod tests {
         ];
         let m = LedModel::DEFAULT;
         for (region, scale, shift) in table {
-            // Urban bright: share 0.75, kelvin 4000.
+            // Urban bright: share 0.90, kelvin 4000.
             let t = m.tone(false, 1.0, region);
-            assert!((t.share - 0.75 * scale).abs() < 1e-12, "{region:?} share");
+            assert!((t.share - 0.90 * scale).abs() < 1e-12, "{region:?} share");
             assert!(
                 (t.kelvin - (4000.0 + shift)).abs() < 1e-9,
                 "{region:?} kelvin"
@@ -429,17 +509,17 @@ mod tests {
         let sodium = [200.0, 120.0, 50.0];
         let led = Some(recolour(sodium, 4000.0, 1.25));
         let s = 0.0025;
-        let base = texel_bytes(sodium, None, s);
+        let base = texel_bytes(sodium, None, None, s);
         assert_eq!(base, [1, 0, 0]);
-        assert!(lum_b(texel_bytes(sodium, led, s)) >= lum_b(base));
+        assert!(lum_b(texel_bytes(sodium, None, led, s)) >= lum_b(base));
         // Clip branch: equal luminance by construction.
         let sodium = [255.0, 195.0, 0.0];
         let led = Some(recolour(sodium, 3200.0, 1.25));
         let s = 0.995;
-        let base = texel_bytes(sodium, None, s);
-        assert!(lum_b(texel_bytes(sodium, led, s)) >= lum_b(base));
+        let base = texel_bytes(sodium, None, None, s);
+        assert!(lum_b(texel_bytes(sodium, None, led, s)) >= lum_b(base));
         // No LED: exactly the rounded sodium bytes.
-        assert_eq!(texel_bytes([10.4, 10.6, 0.0], None, 1.0), [10, 11, 0]);
+        assert_eq!(texel_bytes([10.4, 10.6, 0.0], None, None, 1.0), [10, 11, 0]);
     }
 
     #[test]
@@ -467,17 +547,31 @@ mod tests {
     fn the_default_tones_follow_the_spec_tables() {
         let m = LedModel::DEFAULT;
         let t = m.tone(true, 0.0, LedRegion::Na);
-        assert_eq!((t.share, t.kelvin), (0.80, 4900.0));
+        assert_eq!((t.share, t.kelvin), (0.90, 4900.0));
         let t = m.tone(false, 1.0, LedRegion::Eu);
-        assert!((t.share - 0.675).abs() < 1e-12);
+        assert!((t.share - 0.81).abs() < 1e-12);
         assert_eq!(t.kelvin, 3600.0);
         let t = m.tone(false, 0.0, LedRegion::Af);
-        assert!((t.share - 0.225).abs() < 1e-12);
+        assert!((t.share - 0.40).abs() < 1e-12);
         assert_eq!(t.kelvin, 3600.0);
         let t = m.tone(false, 0.5, LedRegion::Unknown);
-        assert!((t.share - 0.45).abs() < 1e-12, "0.75 x mean(0.75, 0.45)");
+        assert!((t.share - 0.6375).abs() < 1e-12, "0.75 x mean(0.90, 0.80)");
         assert_eq!(t.kelvin, 3600.0);
         assert_eq!(m.energy, 1.25);
+        assert_eq!(
+            m.sodium,
+            SodiumTone {
+                mix: 0.30,
+                kelvin: 3200.0,
+                energy: 1.125,
+            }
+        );
+    }
+
+    #[test]
+    fn the_off_model_leaves_sodium_alone() {
+        assert_eq!(LedModel::OFF.sodium, SodiumTone::NONE);
+        assert_eq!(SodiumTone::NONE.mix, 0.0);
     }
 
     #[test]
@@ -560,6 +654,81 @@ mod tests {
     #[test]
     fn recolour_leaves_black_black() {
         assert_eq!(recolour([0.0, 0.0, 0.0], 4000.0, 1.25), [0.0, 0.0, 0.0]);
+    }
+
+    fn saturation(c: [f32; 3]) -> f32 {
+        let (mx, mn) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+        (mx - mn) / mx
+    }
+
+    #[test]
+    fn desaturate_without_a_mix_returns_the_input_exactly() {
+        for stored in [[56.0, 36.0, 18.0], [255.0, 160.0, 60.0], [0.0, 0.0, 0.0]] {
+            assert_eq!(desaturate(stored, &SodiumTone::NONE), stored);
+        }
+    }
+
+    #[test]
+    fn desaturate_lowers_saturation_and_keeps_the_compensated_light() {
+        let tone = LedModel::DEFAULT.sodium;
+        // Laminar's mean sodium texel and the generator tests' orange.
+        for stored in [[56.0, 36.0, 18.0], [200.0, 120.0, 50.0]] {
+            let out = desaturate(stored, &tone);
+            assert!(
+                saturation(out) < saturation(stored),
+                "{stored:?} -> {out:?} not less saturated"
+            );
+            let want = 1.0 + tone.mix * (tone.energy - 1.0);
+            let got = lum(decode(out)) / lum(decode(stored));
+            assert!(
+                (got - want).abs() < 1e-3,
+                "{stored:?}: luminance x{got}, want x{want}"
+            );
+            // Still sodium, not LED: blue stays well under red.
+            assert!(out[2] / out[0] < 0.4, "{stored:?} -> {out:?} reads as LED");
+        }
+    }
+
+    #[test]
+    fn desaturate_never_dims_a_bright_texel() {
+        let tone = LedModel::DEFAULT.sodium;
+        for stored in [
+            [255.0, 255.0, 255.0],
+            [255.0, 200.0, 120.0],
+            [255.0, 160.0, 60.0],
+        ] {
+            let out = desaturate(stored, &tone);
+            assert!(out.iter().all(|&c| c <= 255.0 + 1e-3), "{out:?}");
+            assert!(
+                lum(decode(out)) >= lum(decode(stored)) - 1e-4,
+                "{stored:?} dimmed"
+            );
+        }
+    }
+
+    #[test]
+    fn desaturate_leaves_black_black() {
+        assert_eq!(
+            desaturate([0.0, 0.0, 0.0], &LedModel::DEFAULT.sodium),
+            [0.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn texel_bytes_keep_desaturated_sodium_at_least_as_bright_as_laminar() {
+        let lum_b = |c: [u8; 3]| byte_luminance(c);
+        let tone = LedModel::DEFAULT.sodium;
+        for laminar in [[200.0, 120.0, 50.0], [56.0, 36.0, 18.0], [90.0, 40.0, 10.0]] {
+            let sodium = Some(desaturate(laminar, &tone));
+            for s in [0.0025, 0.01, 0.05, 0.3, 1.0] {
+                let raw = texel_bytes(laminar, None, None, s);
+                let out = texel_bytes(laminar, sodium, None, s);
+                assert!(
+                    lum_b(out) >= lum_b(raw),
+                    "{laminar:?} at gain {s}: {out:?} dimmer than {raw:?}"
+                );
+            }
+        }
     }
 
     #[test]

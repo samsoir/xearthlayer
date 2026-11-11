@@ -521,9 +521,16 @@ with no config keys, tuned in flight:
 
 | Category | Share | Base temperature |
 |---|---|---|
-| Industrial | 0.80 | 4500 K |
-| Urban bright | 0.75 | 4000 K |
-| Urban dim | 0.45 | 3200 K |
+| Industrial | 0.90 | 4500 K |
+| Urban bright | 0.90 | 4000 K |
+| Urban dim | 0.80 | 3200 K |
+
+The shares were raised from 0.80, 0.75 and 0.45 in #363: night photos of
+central Mexico and Mexico City from the air showed city light mostly
+neutral white (median saturation 0.08 to 0.21 over the brightest lit
+pixels, almost no saturated orange), against 0.34 and a quarter saturated
+orange in a 0.5.0 screenshot of Ontario, California, where most
+residential ground stayed sodium.
 
 | Region | Share scale | Temperature shift |
 |---|---|---|
@@ -546,8 +553,24 @@ white until it is not. LED is therefore never dimmer than the sodium it
 replaces, and this holds after rounding to bytes: the generator compares
 the decoded luminance of the LED bytes with that of the sodium bytes for
 the same gain, and rounds the LED channels up, then falls back to the
-sodium bytes, when rounding to nearest would lose any. A sodium texel keeps its bytes exactly, and `LedModel::OFF`
+sodium bytes, when rounding to nearest would lose any. `LedModel::OFF`
 reproduces the sodium-only output.
+
+**Sodium tone.** The texels that stay sodium are toned too (#363,
+`SodiumTone`, `LedModel::sodium`). Laminar's sodium is linear
+R : G : B ≈ 1 : 0.38 : 0.08, about as saturated as a 2700 K blackbody
+(1 : 0.42 : 0.10), and high-pressure sodium itself sits near 2000 K, so a
+low-temperature white would not desaturate it: the hue is physically fair,
+and the change is perceptual (scatter, and the eye adapting to a mostly
+white city). Each sodium texel is mixed `mix` (0.30) of the way towards the
+3200 K white at its own luminance in linear light, then its luminance is
+multiplied by `1 + mix × (energy - 1)` with `energy` 1.125, about half the
+LED energy, because a less saturated light of equal luminance looks dimmer.
+Laminar's mean texel goes from saturation 0.68 to 0.63; sodium districts
+stay amber and never read as LED. The byte rule is the same as for LED: the
+toned bytes are never dimmer than Laminar's bytes at the same gain, and LED
+bytes are never dimmer than the toned ones. `SodiumTone::NONE` (in
+`LedModel::OFF`) returns Laminar's bytes exactly.
 
 **Regions.** The region is the first segment of the code of the package a
 recipe was read from (`NA-USA-MX-CENTRAL` is NA; legacy `na` and `eu`
@@ -555,8 +578,9 @@ work), recorded when the recipe is loaded, as the identity is. Patches
 (`_patches/...`), unknown codes and missing recipes are Unknown.
 
 **Cache.** The region is part of each tile's entry in the footprint
-fingerprint, and `LIT_GENERATOR_VERSION` is 2, so lit entries from before
-the LED stage miss once and regenerate; the GC ages the old ones out.
+fingerprint, and `LIT_GENERATOR_VERSION` is 3 (2 added the LED stage, 3
+the raised shares and the sodium tone), so lit entries from before
+the current generator miss once and regenerate; the GC ages the old ones out.
 
 **Cost.** Measured with the ignored test
 `night::generator::cpu::tests::time_a_real_zl16_texture` (release, a real

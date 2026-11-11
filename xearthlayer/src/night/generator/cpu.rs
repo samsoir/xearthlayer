@@ -105,6 +105,8 @@ impl LitGenerator for CpuLitGenerator {
                     kelvin += w.weight * tone.kelvin;
                 }
                 let sodium = rgb;
+                let toned = (request.led.sodium.mix > 0.0)
+                    .then(|| led::desaturate(sodium, &request.led.sodium));
                 let mut led_rgb = None;
                 if wsum > 0.0 && share > 0.0 {
                     let patch = led::patch_at(x, y);
@@ -113,7 +115,7 @@ impl LitGenerator for CpuLitGenerator {
                         led_rgb = Some(led::recolour(sodium, k, request.led.energy));
                     }
                 }
-                let [tr, tg, tb] = led::texel_bytes(sodium, led_rgb, g as f32);
+                let [tr, tg, tb] = led::texel_bytes(sodium, toned, led_rgb, g as f32);
                 img.put_pixel(j as u32, i as u32, Rgba([tr, tg, tb, 255]));
             }
         }
@@ -381,6 +383,20 @@ mod tests {
         p[0] > 0 && f32::from(p[2]) / f32::from(p[0]) > 0.4
     }
 
+    /// No LED, but the default sodium stage: what the generator writes for
+    /// texels the LED stage leaves alone.
+    fn sodium_only() -> LedModel {
+        LedModel {
+            sodium: LedModel::DEFAULT.sodium,
+            ..LedModel::OFF
+        }
+    }
+
+    fn saturation(p: &image::Rgba<u8>) -> f32 {
+        let (mx, mn) = (p[0].max(p[1]).max(p[2]), p[0].min(p[1]).min(p[2]));
+        f32::from(mx - mn) / f32::from(mx)
+    }
+
     fn lum(p: &image::Rgba<u8>) -> f32 {
         let l = |v: u8| (f32::from(v) / 255.0).powf(crate::night::generator::SRGB_GAMMA);
         0.2126 * l(p[0]) + 0.7152 * l(p[1]) + 0.0722 * l(p[2])
@@ -434,7 +450,7 @@ mod tests {
             uniform(),
             orange,
             1.0,
-            &LedModel::OFF,
+            &sodium_only(),
             LedRegion::Na,
         );
         let led = generate_led(
@@ -454,6 +470,88 @@ mod tests {
             }
         }
         assert!(changed > 0, "some patches are LED");
+    }
+
+    #[test]
+    fn the_default_model_desaturates_the_sodium_it_keeps() {
+        let name = name_at(37.5, -122.5);
+        let laminar = generate_led(
+            &name,
+            64,
+            uniform(),
+            orange,
+            1.0,
+            &LedModel::OFF,
+            LedRegion::Na,
+        );
+        let kept = generate_led(
+            &name,
+            64,
+            uniform(),
+            orange,
+            1.0,
+            &sodium_only(),
+            LedRegion::Na,
+        );
+        let mut lit = 0;
+        for (a, b) in laminar.pixels().zip(kept.pixels()) {
+            if a[0] == 0 {
+                continue;
+            }
+            lit += 1;
+            assert!(
+                saturation(b) < saturation(a),
+                "{b:?} not less saturated than {a:?}"
+            );
+            assert!(!is_led(b), "{b:?} reads as LED");
+        }
+        assert!(lit > 0, "the tile is lit");
+    }
+
+    /// The sodium stage never writes a texel dimmer than Laminar's bytes,
+    /// from the gain floor up and at every brightness setting.
+    #[test]
+    fn desaturated_sodium_is_never_dimmer_after_rounding_to_bytes() {
+        let name = name_at(37.5, -122.5);
+        let mut changed = 0;
+        for rgb in [[200u8, 120, 50], [255, 160, 60], [90, 40, 10], [56, 36, 18]] {
+            let pattern = move |_: &str| {
+                Some(Arc::new(LitPattern {
+                    size: 4,
+                    rgb: vec![rgb; 16],
+                    ground_scale_m: 4096.0,
+                }))
+            };
+            for byte in (1u8..=255).step_by(2).chain([255]) {
+                let r = synthetic(37, -123, 120, |_, _| 1, 4, move |_, _| byte);
+                let recipes = move |a: i32, b: i32| ((a, b) == (37, -123)).then(|| r.clone());
+                for brightness in [0.5, 1.0, 1.5] {
+                    let run = |m: &LedModel| {
+                        generate_led(
+                            &name,
+                            16,
+                            recipes.clone(),
+                            pattern,
+                            brightness,
+                            m,
+                            LedRegion::Na,
+                        )
+                    };
+                    let (laminar, kept) = (run(&LedModel::OFF), run(&sodium_only()));
+                    for (a, b) in laminar.pixels().zip(kept.pixels()) {
+                        if a != b {
+                            changed += 1;
+                            assert!(
+                                lum(b) >= lum(a),
+                                "{rgb:?}, byte {byte}, brightness {brightness}: \
+                                 {b:?} dimmer than {a:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(changed > 0, "the sweep reaches desaturated texels");
     }
 
     /// Every texel the LED stage changes is at least as bright as the
@@ -505,7 +603,7 @@ mod tests {
                                 LedRegion::Na,
                             )
                         };
-                        let (sodium, led) = (run(&LedModel::OFF), run(&all));
+                        let (sodium, led) = (run(&sodium_only()), run(&all));
                         for (s, l) in sodium.pixels().zip(led.pixels()) {
                             if s != l {
                                 changed += 1;

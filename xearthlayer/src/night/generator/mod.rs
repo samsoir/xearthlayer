@@ -58,7 +58,8 @@ pub trait LitGenerator: Send + Sync {
 /// then miss and are regenerated.
 ///
 /// 2: LED patches (`led`).
-pub const LIT_GENERATOR_VERSION: u32 = 2;
+/// 3: raised LED shares and toned sodium (`led::SodiumTone`, #363).
+pub const LIT_GENERATOR_VERSION: u32 = 3;
 
 /// Gamma of the sRGB decode X-Plane applies to a texture's stored values.
 pub const SRGB_GAMMA: f32 = 2.2;
@@ -103,8 +104,8 @@ mod tests {
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
 
     #[test]
-    fn led_lighting_is_generator_version_two() {
-        assert_eq!(LIT_GENERATOR_VERSION, 2);
+    fn sodium_desaturation_is_generator_version_three() {
+        assert_eq!(LIT_GENERATOR_VERSION, 3);
     }
 
     fn name_at(lat: f64, lon: f64) -> DdsFilename {
