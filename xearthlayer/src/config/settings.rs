@@ -298,7 +298,7 @@ pub struct FuseSettings {
     /// Default: 192 (75% of max_background)
     pub congestion_threshold: u16,
     /// Which macFUSE backend mounts the volume on macOS: `auto` (default,
-    /// FSKit falling back to the kext), `fskit` (no kernel extension) or
+    /// FSKit falling back to the kext), `macfuse-fskit` (no kernel extension) or
     /// `kernel` (the macFUSE kext). Ignored on other platforms.
     pub macos_backend: String,
 }

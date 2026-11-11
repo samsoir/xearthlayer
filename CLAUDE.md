@@ -522,7 +522,7 @@ Key sections:
 - `[prefetch]` - Boundary-driven prefetch, mode, web_api_port (default 8086), transition ramp
 - `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
 - `[executor]` - Per-chunk download behaviour only: `request_timeout_secs` and `max_retries`, which reach the executor through `ServiceConfig::chunk_download_config()`. Concurrency is NOT configurable: pool capacities, task dispatch limits and channel capacities are derived from logical core count by `ResourcePoolConfig::default()`. `max_concurrent_jobs` and `retry_base_delay_ms` were removed in #249; the backoff base is a literal in `tasks/download_chunks.rs`
-- `[fuse]` - FUSE kernel limits (max_background, congestion_threshold); `macos_backend` (auto default: FSKit, falling back to the kext / fskit / kernel, #210)
+- `[fuse]` - FUSE kernel limits (max_background, congestion_threshold); `macos_backend` (auto default: FSKit, falling back to the kext / macfuse-fskit / kernel, #210; `macfuse-fskit` rather than `fskit` so the plain name stays free for native FSKit, #361)
 - `[night]` - Night lighting (enabled, default true)
 - `[tui]` - Dashboard display (symbols: auto/emoji/plain; `auto` detection in `xearthlayer-cli/src/ui/symbols.rs`)
 - `[packages]` - Package manager settings (concurrent_downloads: parallel part downloads 1-10). `library_url` defaults to library generation v2, `DEFAULT_LIBRARY_URL` (#334); the pre-0.5 root URL (`LEGACY_LIBRARY_URL`) and the alpha staging URL are retired values (`DEPRECATED_VALUES`) the parser reads as v2, and the layout migration keeps the legacy copy of the config on the old URL for a 0.4.x rollback

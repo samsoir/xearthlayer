@@ -1505,7 +1505,7 @@ mod tests {
         assert!(ConfigKey::all().contains(&ConfigKey::FuseMacosBackend));
         let mut config = ConfigFile::default();
         assert_eq!(ConfigKey::FuseMacosBackend.get(&config), "auto");
-        for value in ["kernel", "auto", "fskit"] {
+        for value in ["kernel", "auto", "macfuse-fskit"] {
             ConfigKey::FuseMacosBackend.set(&mut config, value).unwrap();
             assert_eq!(ConfigKey::FuseMacosBackend.get(&config), value);
         }
