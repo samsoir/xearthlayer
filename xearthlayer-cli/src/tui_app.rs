@@ -14,6 +14,7 @@
 //! 2. Creates the `ServiceOrchestrator`
 //! 3. Delegates to `run_tui()` or `run_headless()`
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,6 +32,8 @@ use xearthlayer::update::{RemoteUpdateChecker, UpdateChecker, UpdateInfo};
 use xearthlayer::xplane::XPlaneEnvironment;
 
 use crate::error::CliError;
+use crate::logging_init::{log_file_for, LogTarget};
+use crate::stderr_detour::StderrDetour;
 use crate::ui::symbols::SymbolPreference;
 use crate::ui::{
     self, Dashboard, DashboardConfig, DashboardEvent, DashboardState, EncoderStatus, FeatureStatus,
@@ -61,6 +64,26 @@ pub struct TuiAppConfig<'a> {
     pub xworld_pro: XworldProStatus,
     /// Warnings the startup checks printed before the dashboard took the screen.
     pub startup_warnings: usize,
+}
+
+/// Point stderr at the flight log for the dashboard's lifetime, or at
+/// `/dev/null` when the log cannot be opened. `None`, with a warning in the
+/// log, when neither can be: the dashboard still runs, as it always did.
+fn detour_stderr(cfg: &ConfigFile) -> Option<StderrDetour> {
+    let log = log_file_for(LogTarget::Flight, cfg).map(|(path, _)| path);
+    let sinks = log
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(std::iter::once(Path::new("/dev/null")));
+    for sink in sinks {
+        match StderrDetour::to(sink) {
+            Ok(detour) => return Some(detour),
+            Err(e) => {
+                tracing::warn!(sink = %sink.display(), error = %e, "stderr stays on the terminal")
+            }
+        }
+    }
+    None
 }
 
 /// Run the TUI application with dashboard.
@@ -106,6 +129,12 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
 
     // Create initial loading progress
     let loading_progress = LoadingProgress::new(ortho_packages.len());
+
+    // Nothing written to stderr may reach the screen while the dashboard owns
+    // it (#358): C libraries write there past `tracing`, and a panic message
+    // would be lost with the alternate screen. Declared before the dashboard
+    // so it is restored after the terminal is.
+    let _stderr = detour_stderr(cfg);
 
     // Start dashboard in Loading state
     let initial_state = DashboardState::Loading(loading_progress);

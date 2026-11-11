@@ -205,6 +205,12 @@ uses and whose failure messages are written straight to the terminal. GPU
 encoding needs compute shaders in any case, so a host whose only adapter is
 OpenGL falls back to the `ispc` compressor, which is the right outcome for it.
 
+For the same reason XEarthLayer removes `DISPLAY` and `WAYLAND_DISPLAY` from
+its own environment at startup: some Vulkan drivers and layers open the display
+when one is named, to ask which GPU drives the desktop, and XEarthLayer chooses
+its adapter from this setting instead. Nothing else in the process uses a
+display. The shell that launched XEarthLayer is not affected.
+
 ### [generation]
 
 Controls parallel tile generation.

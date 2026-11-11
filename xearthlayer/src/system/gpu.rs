@@ -170,6 +170,33 @@ pub enum GpuSelectError {
 /// initialising GL on Linux opens the X display. See the test below.
 const PROBE_BACKENDS: wgpu::Backends = wgpu::Backends::PRIMARY;
 
+/// The environment variables that name a display server.
+const DISPLAY_VARIABLES: [&str; 2] = ["DISPLAY", "WAYLAND_DISPLAY"];
+
+/// Remove the display server from this process's environment, so that no
+/// library it loads tries to connect to one (#358).
+///
+/// XEarthLayer never presents to a display: the GPU is a compute device and
+/// the adapter is chosen by `texture.gpu_device`, not by whichever GPU drives
+/// the desktop. Parts of the Vulkan stack still open the display inside
+/// `vkCreateInstance` and `vkEnumeratePhysicalDevices`, whatever backends
+/// wgpu asks for: Mesa's `VK_LAYER_MESA_device_select` asks the display
+/// server which GPU is the default (two connections), and the NVIDIA ICD
+/// opens it once. When the connection is refused, libxcb writes the server's
+/// reason ("Authorization required, but no authorization protocol
+/// specified") with a raw `write(2)` on fd 2, past `tracing`, onto the
+/// dashboard. #255 removed the GL probe for the same reason; this closes the
+/// Vulkan path. With no display named there is nothing to connect to, and
+/// enumeration is spared the round trips.
+///
+/// Call it before any other thread exists: the environment is process-wide
+/// and C code reads it without a lock.
+pub fn disown_display() {
+    for name in DISPLAY_VARIABLES {
+        std::env::remove_var(name);
+    }
+}
+
 /// Enumerate all GPU adapters as live `wgpu::Adapter` handles.
 ///
 /// Most callers should prefer [`enumerate`] which returns metadata-only
@@ -316,6 +343,20 @@ mod tests {
             !PROBE_BACKENDS.contains(wgpu::Backends::GL),
             "GL must not be probed: it opens an X11 connection we never use"
         );
+    }
+
+    #[test]
+    fn disowning_the_display_removes_both_display_variables() {
+        // #358: the Vulkan loader's device-select layer and the NVIDIA ICD
+        // open the display at instance creation whatever backends wgpu asks
+        // for. With no display named there is nothing to connect to.
+        std::env::set_var("DISPLAY", ":9");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-9");
+
+        disown_display();
+
+        assert_eq!(std::env::var_os("DISPLAY"), None);
+        assert_eq!(std::env::var_os("WAYLAND_DISPLAY"), None);
     }
 
     #[test]
