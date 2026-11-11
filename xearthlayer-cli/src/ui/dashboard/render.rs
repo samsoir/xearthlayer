@@ -45,8 +45,8 @@ use super::utils::format_duration;
 use crate::ui::symbols::SymbolSet;
 use crate::ui::widgets::{
     AircraftPositionWidget, CacheConfig, CacheWidgetCompact, DiskHistory, FeatureStatus,
-    FeatureStatusWidget, FuseLatencyWidget, InputOutputWidget, LaneView, NetworkHistory,
-    PrefetchSystemWidget, SceneryHistory, ScenerySystemWidget,
+    FeatureStatusWidget, FuseLatencyWidget, InputOutputWidget, LaneHistory, LaneView,
+    NetworkHistory, PrefetchSystemWidget, SceneryHistory, ScenerySystemWidget,
 };
 use xearthlayer::aircraft_position::AircraftPositionStatus;
 
@@ -63,6 +63,7 @@ pub fn render_ui(
     network_history: &NetworkHistory,
     scenery_history: &SceneryHistory,
     disk_history: &DiskHistory,
+    lane_history: &LaneHistory,
     provider_name: &str,
     uptime: Duration,
     cache_config: &CacheConfig,
@@ -116,6 +117,7 @@ pub fn render_ui(
         prefetch_snapshot,
         snapshot,
         prefetch_lane.group,
+        lane_history,
     );
 
     // 4. Scenery System (3-column: REQUESTS | QUEUE | PROCESSING, then latency)
@@ -222,6 +224,7 @@ fn render_prefetch_system(
     prefetch: &PrefetchStatusSnapshot,
     telemetry: &TelemetrySnapshot,
     lane_group: usize,
+    lane_history: &LaneHistory,
 ) {
     let block = Block::default()
         .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
@@ -252,7 +255,8 @@ fn render_prefetch_system(
             prefetch.state_inputs.phase,
             prefetch.detailed_stats.as_ref(),
             lane,
-        ),
+        )
+        .with_history(lane_history),
         inner,
     );
 }
@@ -283,7 +287,9 @@ pub(super) fn displayed_frame_rate(
     }
 }
 
-fn lane_view(telemetry: &TelemetrySnapshot, group: usize) -> LaneView {
+/// The prefetch lane as the dashboard shows and records it: running jobs and
+/// backlog from telemetry, group size from configuration.
+pub(super) fn lane_view(telemetry: &TelemetrySnapshot, group: usize) -> LaneView {
     LaneView {
         running: telemetry.prefetch_lane_running,
         group,
