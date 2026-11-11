@@ -14,11 +14,11 @@ use std::str::FromStr;
 /// `Auto` is the default: every 0.5.0 Mac has the kernel extension approved
 /// and few have turned on the File System Extension, so it tries FSKit, logs
 /// why it could not mount, and falls back to the kext. The default can move
-/// to `FsKit` once that backend has flight time behind it.
+/// to `MacFuseFsKit` once that backend has flight time behind it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MacosBackend {
     /// macFUSE's FSKit backend (macFUSE 5.3.3+, File System Extensions on).
-    FsKit,
+    MacFuseFsKit,
     /// The macFUSE kernel extension.
     Kernel,
     /// FSKit when it can mount, the kernel extension otherwise.
@@ -30,7 +30,7 @@ impl MacosBackend {
     /// The setting's value as written in `config.ini`.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::FsKit => "macfuse-fskit",
+            Self::MacFuseFsKit => "macfuse-fskit",
             Self::Kernel => "kernel",
             Self::Auto => "auto",
         }
@@ -64,7 +64,7 @@ impl FromStr for MacosBackend {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "macfuse-fskit" => Ok(Self::FsKit),
+            "macfuse-fskit" => Ok(Self::MacFuseFsKit),
             "kernel" => Ok(Self::Kernel),
             "auto" => Ok(Self::Auto),
             _ => Err(UnknownMacosBackend(s.to_string())),
@@ -76,7 +76,7 @@ impl FromStr for MacosBackend {
 impl From<MacosBackend> for fuse3::MacFuseBackend {
     fn from(backend: MacosBackend) -> Self {
         match backend {
-            MacosBackend::FsKit => fuse3::MacFuseBackend::FsKit,
+            MacosBackend::MacFuseFsKit => fuse3::MacFuseBackend::FsKit,
             MacosBackend::Kernel => fuse3::MacFuseBackend::Kernel,
             MacosBackend::Auto => fuse3::MacFuseBackend::Auto,
         }
@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn parsing_ignores_case_and_surrounding_space() {
         assert_eq!(" Kernel ".parse(), Ok(MacosBackend::Kernel));
-        assert_eq!("macFUSE-fskit".parse(), Ok(MacosBackend::FsKit));
+        assert_eq!("macFUSE-fskit".parse(), Ok(MacosBackend::MacFuseFsKit));
     }
 
     #[test]
