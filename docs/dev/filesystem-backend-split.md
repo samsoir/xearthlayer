@@ -27,7 +27,7 @@ filesystem backend implementation to facilitate the implementation of multiple
 backends that are specific to various platforms (e.g., Linux, Windows, macOS).
 The current implementation has a single backend that supports Linux and macOS
 via fuse3.
-This "works" today, but there still is no clean boundary between them to handle
+This "works" for now, but there still is no clean boundary between them to handle
 their minor differences.
 
 The planned addition of Windows support (via WinFSP) and other approaches such as
@@ -117,6 +117,33 @@ xearthlayer/src/vfs
 
 ```
 
+### Core state and metrics
+
+The read-path state in `ortho_union_fs.rs` is backend neutral
+and moves to `common/core.rs` unchanged:
+
+- the `DdsHandle` memo (`dds_handles`)
+- the `PinnedTileBudget` (`pinned`)
+- the metrics client
+- the `PrefetchStateObserver`
+- the geo filter (`resolve_lazy_geo`)
+- the water-mask guard in `lookup` (#68): return `ENOENT` when the `.png`
+  exists so X-Plane falls back to it instead of a generated virtual DDS
+
+The core is the sole emitter of the metrics the dashboard reads. In
+particular, per-read latency (`MetricEvent::FuseRead`, from which the daemon
+derives the latency window) and `fuse_handle_budget_exhausted` are both
+emitted on the core's read/open path. The adapter emits no dashboard metrics;
+it performs only the platform translation (open flags, mount API, `FileAttr`
+fields). Keeping these two core-emitted is what guarantees they are reported
+identically on Linux and macOS: if they drifted into the adapter, the macOS
+page-cache path (reads served by the kernel, never reaching the handler) would
+silently drop them.
+
+Note that the per-read metric already under-reports on macOS by design (#204):
+the cold first read reaches the core, repeat reads are kernel-served. That is
+a known, accepted property, not a regression this move should change.
+
 ### Components
 
 #### `fuse/` becomes `vfs/`
@@ -153,8 +180,13 @@ The adapter-specific tests need to be in a live mount test that reads through a
 real mount to exercise filesystem operations (lookup, attributes, virtual DDS read,
 directory listing).  These tests run for each backend.
 
-For implementation, `tests/macfuse_smoke.rs` can be turned into a live mount test
-parameterized by backend.
+For implementation, `tests/macfuse_smoke.rs` is turned into a live mount test
+parameterized by backend. The test is **unignored on Linux** (CI installs
+`libfuse3-dev` on `ubuntu-latest`, so `mount_with_unprivileged` works) and
+**`#[ignore]` on macOS** (macFUSE is a kext; hosted runners cannot load it —
+run via `make verify-macos`). This means green CI exercises the `LinuxFuse`
+adapter; the `MacFuse` adapter is covered by `verify-macos` and the regression
+flight.
 
 
 ### MountBackend ("Live" Mounting)
@@ -200,16 +232,41 @@ Each backend should have a test to make sure the unmount occurs on a `MountSessi
 pub type MountFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Box<dyn MountSession>, MountError>> + Send + 'a>>;
 
+/// Failure to establish or tear down a live mount.
+#[derive(Debug)]
+pub enum MountError {
+    /// The backend could not mount (e.g. `mount_with_unprivileged` failed).
+    Mount(std::io::Error),
+    /// The backend could not unmount.
+    Unmount(std::io::Error),
+}
+
 /// A platform backend that can mount the union filesystem.
 pub trait MountBackend: Send + Sync {
     /// Mount `fs` according to `req`, returning a handle to the live mount.
     fn mount(&self, fs: Arc<dyn UnionFilesystem>, req: MountRequest) -> MountFuture<'_>;
+    /// Whether a stale mount at `mountpoint` was recovered. Synchronous, needs
+    /// no runtime, and must not panic (see the panic-hook contract below).
     fn recover_stale(&self, mountpoint: &Path) -> bool;
-    fn force_unmount(&self, path: &Path);
+    /// Force-detach the mount at `path`. Returns `true` if the mountpoint
+    /// ended up unmounted (including the benign already-unmounted case), matching
+    /// `unmount_fuse`. Synchronous, needs no runtime, and must not
+    /// panic.
+    fn force_unmount(&self, path: &Path) -> bool;
 }
 ```
-The calls in `MountManager` that handle crash and stale mount recovery need to be migrated to
-the new calls in the `MountBackend.`
+
+The crash path is the panic hook (`panic.rs`), not the `MountManager`. It
+calls `unmount_fuse(path, false)` and, if that fails, `unmount_fuse(path, true)`,
+logging which one worked. Under the split the hook gets a backend with its own
+`select_backend()` call (cheap enough) and calls `force_unmount` the same way:
+graceful first, then forced, reporting the `bool` outcome. `force_unmount`
+returns `bool` so the hook can still say which attempt succeeded.
+
+Both `recover_stale` and `force_unmount` are synchronous, need no runtime, and
+must not panic. A panic inside a panic hook aborts the process with the mount
+still up, so these two are the one place in the backend where that guarantee
+matters.
 ```rust
 /// The mount backend for the OS this binary runs on.
 ///
@@ -217,23 +274,27 @@ the new calls in the `MountBackend.`
 /// ask for a backend here and then work only with [`MountBackend`] and
 /// [`MountSession`].
 pub fn select_backend() -> Box<dyn MountBackend> {
-    #[cfg(target_os = "macos")]
-    {
+    if cfg!(target_os = "macos") {
         Box::new(crate::vfs::fuse3::MacFuse)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
+    } else {
         Box::new(crate::vfs::fuse3::LinuxFuse)
     }
 }
 ```
-Backend specific parameters are passed in a `MountRequest` where each backend can
-choose to use or ignore them.
 
 ```rust
 pub struct MountRequest {
     /// The directory the union filesystem is mounted at.
     pub mountpoint: PathBuf,
+    /// Kernel background-request limits (fuse3 `max_background` /
+    /// `congestion_threshold`); backends that have no equivalent ignore them.
+    pub fuse_limits: FuseLimits,
+}
+
+/// FUSE kernel limits, from the `[fuse]` config section.
+pub struct FuseLimits {
+    pub max_background: u16,
+    pub congestion_threshold: u16,
 }
 ```
     
@@ -252,8 +313,31 @@ use crate::vfs::{select_backend, UnionFilesystem, MountRequest, MountSession};
 ```
 
 This keeps the `cfg` that decides the mount backend in one place.
-Backend specific parameters (fuse3's max_background and congestion_threshold) are
-also handled by `select_backend` by passing to the backends`constructors.
+Backend specific parameters (fuse3's max_background and congestion_threshold)
+travel in `MountRequest::fuse_limits`; the fuse3 backend reads them and any
+backend without an equivalent ignores them.
+
+### FusePlatform Policy
+
+`fuse_platform.rs` holds the per-platform FUSE behavior and policy,
+consolidating the `cfg(target_os)` sites that are scattered inside `fuse/`. Its complete contents
+are the four decisions below; the shared fuse3 translation in `adapters.rs`
+stays platform-neutral.
+
+| Policy decision | Linux | macOS |
+|---|---|---|
+| Open flags reported for virtual DDS files | `FOPEN_DIRECT_IO` — every `read()` reaches the handler, so the FUSE read counters are exact and the page cache never holds a second copy of a tile | `0` — X-Plane `mmap`s texture files and macFUSE faults with `EXC_BAD_ACCESS` when a `direct_io` file is mapped, so virtual DDS is served through the page cache and the read counters under-report (#204) |
+| Mount API call | `Session::mount_with_unprivileged` | `Session::mount` |
+| `volname` mount option | not set | set, so Finder shows a meaningful volume name |
+| `FileAttr` fields | — | `crtime` (creation time) and `flags` (BSD file flags) exist only in macFUSE's `FileAttr`; the policy supplies their values |
+
+Because the contract's `open` returns a bare `u64` file handle, the open flags
+are the adapter's decision, keyed on the `FsNode` variant: a `VirtualDds` node
+gets the platform's virtual-DDS flags from the policy, and `RealFile` and
+`Directory` nodes get none.
+
+`select_backend()` keeps its `cfg` — it is the one place in the crate that
+names a concrete backend.
 
 ### Union Filesystem
 
@@ -264,12 +348,17 @@ hand, with no `async-trait` dependency) so the trait can be used as
 stay plain.
 
 ```rust
+pub struct Entry {
+    pub node: FsNode,
+    pub attrs: FileAttributes,
+}
+
 pub trait UnionFilesystem: Send + Sync {
     fn lookup<'a>(
         &'a self,
         node: &'a FsNode,
         name: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<FsNode, FsError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Entry, FsError>> + Send + 'a>>;
 
     fn attrs<'a>(
         &'a self,
@@ -289,13 +378,25 @@ pub trait UnionFilesystem: Send + Sync {
         node: &'a FsNode,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<DirEntry>, FsError>> + Send + 'a>>;
 
-    /// open can return a fh of 0 when the pinned-tile budget is exhausted.
+    /// open returns a file handle, or 0 when no handle is allocated. 0 is a
+    /// valid return for four cases: real files (no handle state), lit
+    /// textures (served by range, pin nothing), unknown virtual inodes (the
+    /// gap surfaces as ENOENT in read, not a failed open), and the exhausted
+    /// pinned-tile budget. A 0 handle means read resolves the tile per call.
     fn open(&self, node: &FsNode) -> Result<u64, FsError>;
+    /// release(0) is a no-op: there is no handle to drop. A backend must not
+    /// treat 0 as a real handle or error on release(0).
     fn release(&self, fh: u64) -> Result<(), FsError>;
     fn statfs(&self) -> StatFsInfo;
 }
 ```
-Conformance suite should cover the budget-exhausted case.
+Conformance suite should cover all four 0-handle cases and that `release(0)`
+is a no-op.
+
+`open` returns a bare file handle; the open flags reported to the kernel are
+the adapter's decision, keyed on the `FsNode` variant — a `VirtualDds` node
+gets the platform's virtual-DDS flags from the `FusePlatform` policy, and
+`RealFile` and `Directory` nodes get none.
 
 Types and errno mapping.
 ```rust
@@ -321,10 +422,6 @@ pub enum FsError {
 }
 
 /// File attributes in the neutral form shared by all backends.
-///
-/// `uid`/`gid` are carried for the backends that report them: the FUSE
-/// mapper fills them from the file metadata (real files) or the process
-/// (virtual files), so `libc`/`MetadataExt` calls stay out of core logic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileAttributes {
     /// File size in bytes.
@@ -335,6 +432,10 @@ pub struct FileAttributes {
     pub atime: SystemTime,
     /// Last modification time.
     pub mtime: SystemTime,
+    /// Last metadata or status change time.
+    pub ctime: SystemTime,
+    /// Creation time.
+    pub crtime: SystemTime,
     /// Node kind.
     pub kind: NodeKind,
     /// Permission bits (e.g. `0o444`).
@@ -352,25 +453,9 @@ pub struct FileAttributes {
 }
 
 pub struct DirEntry {
-    /// File or directory name (stored as String for serialization).
-    #[serde(
-        serialize_with = "serialize_os_string",
-        deserialize_with = "deserialize_os_string"
-    )]
     pub name: OsString,
-
-    /// Whether this is a directory.
-    pub is_dir: bool,
-
-    /// File size (0 for directories).
-    pub size: u64,
-
-    /// Modification time (stored as secs since UNIX_EPOCH for serialization).
-    #[serde(
-        serialize_with = "serialize_system_time",
-        deserialize_with = "deserialize_system_time"
-    )]
-    pub mtime: SystemTime,
+    pub node: FsNode,
+    pub attrs: FileAttributes,
 }
 
 /// Volume statistics in neutral form (FUSE `statfs` / WinFSP `GetVolumeInfo`).
@@ -418,7 +503,9 @@ In addition:
 - structural checks
   - `manager/mounts.rs` contains no `cfg` and names no backend
   - `common` module contains no `fuse3::`, inode or kernal-flag symbols
-  - nothing outside of `vfs/` refers to FUSE
+  - no `cfg(target_os)` remains in `vfs/` outside `fuse_platform.rs` (and `select_backend`)
+  - no `crate::vfs::fuse3::` import outside `vfs/`
+  - `system/unmount.rs` moves into the fuse3 backend, so `panic.rs` and `mounts.rs` reach it only through `MountBackend`
 
 The design should be further validated by the addition of any new backends,
 which are expected to follow shortly after this lands.
