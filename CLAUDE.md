@@ -522,7 +522,7 @@ Key sections:
 - `[prefetch]` - Boundary-driven prefetch, mode, web_api_port (default 8086), transition ramp
 - `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
 - `[executor]` - Per-chunk download behaviour only: `request_timeout_secs` and `max_retries`, which reach the executor through `ServiceConfig::chunk_download_config()`. Concurrency is NOT configurable: pool capacities, task dispatch limits and channel capacities are derived from logical core count by `ResourcePoolConfig::default()`. `max_concurrent_jobs` and `retry_base_delay_ms` were removed in #249; the backoff base is a literal in `tasks/download_chunks.rs`
-- `[fuse]` - FUSE kernel limits (max_background, congestion_threshold)
+- `[fuse]` - FUSE kernel limits (max_background, congestion_threshold); `macos_backend` (auto default: FSKit, falling back to the kext / macfuse-fskit / kernel, #210; `macfuse-fskit` rather than `fskit` so the plain name stays free for native FSKit, #361)
 - `[night]` - Night lighting (enabled, default true)
 - `[tui]` - Dashboard display (symbols: auto/emoji/plain; `auto` detection in `xearthlayer-cli/src/ui/symbols.rs`)
 - `[packages]` - Package manager settings (concurrent_downloads: parallel part downloads 1-10). `library_url` defaults to library generation v2, `DEFAULT_LIBRARY_URL` (#334); the pre-0.5 root URL (`LEGACY_LIBRARY_URL`) and the alpha staging URL are retired values (`DEPRECATED_VALUES`) the parser reads as v2, and the layout migration keeps the legacy copy of the config on the old URL for a 0.4.x rollback
@@ -604,7 +604,7 @@ matrix jobs are renamed.
 ## Platform Support
 
 - **Linux**: ✅ Fully working (native FUSE)
-- **macOS**: ✅ Working (requires [macFUSE](https://macfuse.io); Apple Silicon tested; fuse3 pinned to `samsoir/fuse3` `master`: upstream master at 0.10.0, which already has the configurable `max_background`/`congestion_threshold`, plus three macOS-only commits (the reply-resilience patch, upstream PR [Sherlock-Holo/fuse3#137](https://github.com/Sherlock-Holo/fuse3/pull/137); comma-joined mount options; reply-drop log demotion). The fork is synced by merging upstream, never by rebasing: released `Cargo.lock` files pin its commits (tag `xel-0.5.0` marks the one v0.5.0 pins); install/approval guide in `docs/macos.md`)
+- **macOS**: ✅ Working (requires [macFUSE](https://macfuse.io); Apple Silicon tested; fuse3 pinned to `samsoir/fuse3` `master`: upstream master at 0.10.0, which already has the configurable `max_background`/`congestion_threshold`, plus three macOS-only commits (the reply-resilience patch, upstream PR [Sherlock-Holo/fuse3#137](https://github.com/Sherlock-Holo/fuse3/pull/137); comma-joined mount options; reply-drop log demotion). The fork is synced by merging upstream, never by rebasing: released `Cargo.lock` files pin its commits (tag `xel-0.5.0` marks the one v0.5.0 pins); install/approval guide in `docs/macos.md`). Mounts through macFUSE's FSKit backend when it can (`fuse.macos_backend` defaults to `auto`: FSKit, falling back to the kext with the reason logged; macFUSE 5.3.3+ for FSKit, #210): fuse3's `MFMount` channel transport (`MacFuseBackend`), no kernel extension; `fuse::MacosBackend` maps the setting, `Fuse3OrthoUnionFS::with_macos_backend` applies it. The fuse3 transport is temporarily `[patch]`ed to the `zodiac1214/fuse3` fork (branch `feat/mfmount-transport`) in the workspace `Cargo.toml`, until it lands in `samsoir/fuse3`
 - **Windows**: ⏳ Planned (requires Dokan/WinFSP)
 
 ## References

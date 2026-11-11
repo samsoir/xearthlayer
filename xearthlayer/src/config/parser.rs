@@ -6,7 +6,7 @@
 use ini::Ini;
 use std::path::PathBuf;
 
-use super::defaults::TUI_SYMBOLS_VALUES;
+use super::defaults::{FUSE_MACOS_BACKEND_VALUES, TUI_SYMBOLS_VALUES};
 use super::file::ConfigFileError;
 use super::keys::{ConfigKey, ConfigKeyError};
 use super::settings::ConfigFile;
@@ -434,6 +434,18 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
                     reason: "must be a positive integer (1-1024)".to_string(),
                 })?;
         }
+        if let Some(v) = section.get("macos_backend") {
+            let v = v.trim().to_lowercase();
+            if !FUSE_MACOS_BACKEND_VALUES.contains(&v.as_str()) {
+                return Err(ConfigFileError::InvalidValue {
+                    section: "fuse".to_string(),
+                    key: "macos_backend".to_string(),
+                    value: v,
+                    reason: "must be 'macfuse-fskit', 'kernel', or 'auto'".to_string(),
+                });
+            }
+            config.fuse.macos_backend = v;
+        }
     }
 
     // [night] section
@@ -648,6 +660,36 @@ mod tests {
         std::fs::write(&path, "[tui]\nsymbols = Emoji\n").unwrap();
         assert_eq!(ConfigFile::load_from(&path).unwrap().tui.symbols, "emoji");
         std::fs::write(&path, "[tui]\nsymbols = ascii\n").unwrap();
+        assert!(ConfigFile::load_from(&path).is_err());
+    }
+
+    #[test]
+    fn test_fuse_macos_backend_round_trips_and_defaults_to_auto() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+        let mut config = ConfigFile::default();
+        assert_eq!(config.fuse.macos_backend, "auto");
+        config.fuse.macos_backend = "kernel".to_string();
+        config.save_to(&config_path).unwrap();
+        assert_eq!(
+            ConfigFile::load_from(&config_path)
+                .unwrap()
+                .fuse
+                .macos_backend,
+            "kernel"
+        );
+    }
+
+    #[test]
+    fn test_fuse_macos_backend_is_case_insensitive_and_rejects_unknown_values() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.ini");
+        std::fs::write(&path, "[fuse]\nmacos_backend = Auto\n").unwrap();
+        assert_eq!(
+            ConfigFile::load_from(&path).unwrap().fuse.macos_backend,
+            "auto"
+        );
+        std::fs::write(&path, "[fuse]\nmacos_backend = kext\n").unwrap();
         assert!(ConfigFile::load_from(&path).is_err());
     }
 

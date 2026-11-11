@@ -42,7 +42,9 @@ use super::types::{Fuse3Error, Fuse3Result};
 use crate::coord::TileCoord;
 use crate::executor::{DdsClient, StorageConcurrencyLimiter};
 use crate::fuse::coalesce::RequestCoalescer;
-use crate::fuse::{get_default_placeholder, parse_dds_filename, DdsFilename, TextureKind};
+use crate::fuse::{
+    get_default_placeholder, parse_dds_filename, DdsFilename, MacosBackend, TextureKind,
+};
 use crate::geo_index::GeoIndex;
 use crate::night::{BlackLitSource, LitTextureSource};
 use crate::ortho_union::OrthoUnionIndex;
@@ -198,6 +200,8 @@ pub struct Fuse3OrthoUnionFS {
     /// Congestion threshold for background FUSE requests (kernel limit).
     /// When set, overrides the kernel default (9) in the FUSE init handshake.
     fuse_congestion_threshold: Option<u16>,
+    /// Which macFUSE backend mounts the volume (macOS only, #210).
+    macos_backend: MacosBackend,
 }
 
 impl Fuse3OrthoUnionFS {
@@ -253,6 +257,7 @@ impl Fuse3OrthoUnionFS {
             metrics_client: None,
             fuse_max_background: None,
             fuse_congestion_threshold: None,
+            macos_backend: MacosBackend::default(),
         }
     }
 
@@ -289,6 +294,7 @@ impl Fuse3OrthoUnionFS {
             metrics_client: None,
             fuse_max_background: None,
             fuse_congestion_threshold: None,
+            macos_backend: MacosBackend::default(),
         }
     }
 
@@ -381,6 +387,18 @@ impl Fuse3OrthoUnionFS {
         self.fuse_max_background = Some(max_background);
         self.fuse_congestion_threshold = Some(congestion_threshold);
         self
+    }
+
+    /// Set which macFUSE backend mounts the volume on macOS
+    /// (`fuse.macos_backend`). Has no effect on other platforms.
+    pub fn with_macos_backend(mut self, backend: MacosBackend) -> Self {
+        self.macos_backend = backend;
+        self
+    }
+
+    /// The macFUSE backend the volume will be mounted with on macOS.
+    pub fn macos_backend(&self) -> MacosBackend {
+        self.macos_backend
     }
 
     /// Returns the disk I/O limiter for monitoring/metrics.
@@ -512,7 +530,7 @@ impl Fuse3OrthoUnionFS {
     /// For non-blocking usage, see [`mount_spawned`](Self::mount_spawned).
     pub async fn mount(self, mountpoint: &str) -> Fuse3Result<super::types::MountHandle> {
         let mount_path = PathBuf::from(mountpoint);
-        let mount_options = mount_options(&mount_path);
+        let mount_options = mount_options(&mount_path, self.macos_backend);
 
         // State the ceiling once, so a flight log is self-describing: a reader
         // comparing dds_pinned_peak_mb against it does not have to know the
@@ -556,7 +574,7 @@ impl Fuse3OrthoUnionFS {
         mountpoint: &str,
     ) -> Fuse3Result<super::types::SpawnedMountHandle> {
         let mount_path = PathBuf::from(mountpoint);
-        let mount_options = mount_options(&mount_path);
+        let mount_options = mount_options(&mount_path, self.macos_backend);
 
         #[cfg(target_os = "linux")]
         let handle = fuse3::raw::Session::new(mount_options)
@@ -586,8 +604,15 @@ impl Fuse3OrthoUnionFS {
 
 /// Mount options shared by [`Fuse3OrthoUnionFS::mount`] and
 /// [`Fuse3OrthoUnionFS::mount_spawned`].
-fn mount_options(mount_path: &Path) -> MountOptions {
+fn mount_options(mount_path: &Path, macos_backend: MacosBackend) -> MountOptions {
     let mut mount_options = MountOptions::default();
+    #[cfg(target_os = "macos")]
+    {
+        tracing::info!(backend = %macos_backend, "macFUSE backend");
+        mount_options.macfuse_backend(macos_backend.into());
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = macos_backend;
     mount_options.read_only(true);
     mount_options.force_readdir_plus(false);
     // Tell kernel we don't implement opendir - it should call readdir directly
@@ -1459,6 +1484,15 @@ mod tests {
 
         assert_eq!(fs.index().source_count(), 1);
         assert!(fs.index().file_count() > 0);
+    }
+
+    #[test]
+    fn the_macos_backend_defaults_to_auto_and_is_settable() {
+        let index = OrthoUnionIndexBuilder::new().build().unwrap();
+        let fs = Fuse3OrthoUnionFS::new(index, create_test_client(), 1024);
+        assert_eq!(fs.macos_backend(), MacosBackend::Auto);
+        let fs = fs.with_macos_backend(MacosBackend::Kernel);
+        assert_eq!(fs.macos_backend(), MacosBackend::Kernel);
     }
 
     #[test]
