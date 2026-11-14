@@ -23,6 +23,17 @@ const KNOWN_UNLIT: [u8; 7] = [0, 74, 151, 152, 153, 154, 220];
 impl RoadClass {
     pub const COUNT: usize = 7;
 
+    /// Every class, in [`RoadClass::index`] order.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Motorway,
+        Self::Ramp,
+        Self::Primary,
+        Self::Secondary,
+        Self::Local,
+        Self::Minor,
+        Self::LitFootway,
+    ];
+
     pub fn of(subtype: u8) -> Option<Self> {
         match subtype {
             100..=119 => Some(Self::Motorway),
@@ -94,6 +105,71 @@ mod tests {
     fn unknown_subtypes_are_unlit() {
         for s in [1u8, 9, 76, 83, 99, 130, 200, 255] {
             assert_eq!(RoadClass::of(s), None, "subtype {s}");
+            assert!(!is_lit_subtype(s), "subtype {s}");
+            assert!(!is_lit_subtype(s), "subtype {s}, logged once");
+        }
+    }
+
+    #[test]
+    fn every_range_holds_from_its_lower_to_its_upper_bound() {
+        use RoadClass::*;
+        let ranges: [(std::ops::RangeInclusive<u8>, RoadClass); 8] = [
+            (100..=119, Motorway),
+            (120..=129, Ramp),
+            (10..=29, Primary),
+            (30..=49, Secondary),
+            (50..=69, Local),
+            (70..=73, Minor),
+            (80..=82, Minor),
+            (75..=75, LitFootway),
+        ];
+        for (range, class) in &ranges {
+            for s in [*range.start(), *range.end()] {
+                assert_eq!(RoadClass::of(s), Some(*class), "subtype {s}");
+                assert!(is_lit_subtype(s), "subtype {s}");
+            }
+        }
+        // Every subtype is in at most one range, and outside them none.
+        for s in 0..=255u8 {
+            let holding: Vec<_> = ranges.iter().filter(|(r, _)| r.contains(&s)).collect();
+            assert!(holding.len() <= 1, "subtype {s}");
+            assert_eq!(
+                RoadClass::of(s),
+                holding.first().map(|(_, c)| *c),
+                "subtype {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_lists_the_classes_in_index_order() {
+        assert_eq!(RoadClass::ALL.len(), RoadClass::COUNT);
+        for (i, class) in RoadClass::ALL.iter().enumerate() {
+            assert_eq!(class.index(), i, "{class:?}");
+        }
+    }
+
+    #[test]
+    fn the_default_model_is_indexed_by_class() {
+        use crate::night::roads::RoadModel;
+        // The table of `docs/dev/night-lighting-design.md` (Road classes):
+        // half width, sigma and intensity per class.
+        let table = [
+            (RoadClass::Motorway, 8.0, 10.0, 1.00),
+            (RoadClass::Ramp, 4.0, 8.0, 0.90),
+            (RoadClass::Primary, 6.0, 9.0, 0.95),
+            (RoadClass::Secondary, 5.0, 8.0, 0.85),
+            (RoadClass::Local, 3.0, 7.0, 0.60),
+            (RoadClass::Minor, 2.0, 6.0, 0.45),
+            (RoadClass::LitFootway, 1.5, 5.0, 0.30),
+        ];
+        for (class, half_width_m, sigma_m, intensity) in table {
+            let p = RoadModel::DEFAULT.classes[class.index()];
+            assert_eq!(
+                (p.half_width_m, p.sigma_m, p.intensity),
+                (half_width_m, sigma_m, intensity),
+                "{class:?}"
+            );
         }
     }
 }

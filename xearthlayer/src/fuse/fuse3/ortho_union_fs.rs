@@ -1985,13 +1985,17 @@ mod tests {
         }
     }
 
-    /// The DSF fixture plus a `.ter` and a DSF-named file outside `Earth nav
-    /// data`, and a lit source (wanting hints or not) that records its hints.
+    /// The DSF fixture plus a `.ter`, a DSF-named file one folder too deep
+    /// (`Earth nav data/+40-080/extra/`, which the index lists eagerly, so
+    /// a lookup reaches the hint check rather than the lazy `terrain` path),
+    /// and a lit source (wanting hints or not) that records its hints.
     fn dsf_hint_fixture(temp: &TempDir, wants: bool) -> (Fuse3OrthoUnionFS, u64, Arc<SeenTiles>) {
         let terrain = temp.path().join("test_ortho/terrain");
         std::fs::create_dir_all(&terrain).unwrap();
         std::fs::write(terrain.join("25712_12960_BI16.ter"), b"ter").unwrap();
-        std::fs::write(terrain.join("+40-074.dsf"), b"XPLNEDSF").unwrap();
+        let decoy = temp.path().join("test_ortho/Earth nav data/+40-080/extra");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::write(decoy.join("+40-074.dsf"), b"XPLNEDSF").unwrap();
         let (fs, ino, _rx) = passthrough_fixture_with(temp, b"XPLNEDSF");
         let seen = SeenTiles::new(wants);
         (fs.with_lit_source(seen.clone()), ino, seen)
@@ -2059,16 +2063,19 @@ mod tests {
         use fuse3::raw::Filesystem;
         let temp = TempDir::new().unwrap();
         let (fs, _ino, seen) = dsf_hint_fixture(&temp, true);
+        let decoy_dir = fs
+            .inode_manager
+            .get_or_create_inode(std::path::Path::new("Earth nav data/+40-080/extra"));
         fs.lookup(
             test_request(),
-            terrain_inode(&fs),
+            decoy_dir,
             std::ffi::OsStr::new("+40-074.dsf"),
         )
         .await
         .unwrap();
-        let ino = fs
-            .inode_manager
-            .get_or_create_inode(std::path::Path::new("terrain/+40-074.dsf"));
+        let ino = fs.inode_manager.get_or_create_inode(std::path::Path::new(
+            "Earth nav data/+40-080/extra/+40-074.dsf",
+        ));
         fs.open(test_request(), ino, 0).await.unwrap();
         assert!(seen.seen().is_empty());
     }

@@ -56,17 +56,6 @@ const INDEX_BYTES: usize = 2 * INDEX_LEN * 4;
 
 const _: () = assert!(RoadClass::COUNT <= 1 << (8 - COUNT_BITS));
 
-/// Every class, by [`RoadClass::index`].
-const CLASSES: [RoadClass; RoadClass::COUNT] = [
-    RoadClass::Motorway,
-    RoadClass::Ramp,
-    RoadClass::Primary,
-    RoadClass::Secondary,
-    RoadClass::Local,
-    RoadClass::Minor,
-    RoadClass::LitFootway,
-];
-
 /// A chain's byte: its class above its point count less one.
 fn chain_byte(class: RoadClass, points: usize) -> u8 {
     debug_assert!((1..=MAX_CHAIN_POINTS).contains(&points));
@@ -74,7 +63,7 @@ fn chain_byte(class: RoadClass, points: usize) -> u8 {
 }
 
 fn class_of(byte: u8) -> RoadClass {
-    CLASSES[usize::from(byte >> COUNT_BITS)]
+    RoadClass::ALL[usize::from(byte >> COUNT_BITS)]
 }
 
 fn points_of(byte: u8) -> usize {
@@ -406,8 +395,11 @@ impl Merger {
             let Some(class) = RoadClass::of(c.subtype[i]) else {
                 continue;
             };
+            // A chain of fewer than two points has no segment to draw, and
+            // a stored chain needs at least one point: this also keeps a
+            // corrupt extraction from underflowing the chain byte.
             let pts = c.points(i);
-            if pts.is_empty() {
+            if pts.len() < 2 {
                 continue;
             }
             let (lon, lat) = (&c.lon[pts.clone()], &c.lat[pts]);
@@ -480,7 +472,7 @@ impl Merger {
     /// chains are reordered by cell (a counting sort) into exactly sized
     /// arrays; the arrival-order arrays are freed only once the copy is
     /// done, so the transient peak is about twice the tile.
-    fn finish_with(self, index: bool) -> MergedRoads {
+    pub(super) fn finish_with(self, index: bool) -> MergedRoads {
         let mut out = MergedRoads {
             tile: self.tile,
             lon: vec![],
@@ -818,7 +810,7 @@ mod tests {
 
     #[test]
     fn long_chains_are_split_with_a_shared_point_and_lose_none() {
-        for n in [1usize, 2, 31, 32, 33, 63, 64, 100, 300] {
+        for n in [2usize, 31, 32, 33, 63, 64, 100, 300] {
             let pts: Vec<(f32, f32)> = (0..n)
                 .map(|k| (0.1 + k as f32 * 1e-4, 0.2 + (k % 7) as f32 * 1e-4))
                 .collect();
@@ -849,6 +841,29 @@ mod tests {
             }
             assert_eq!(joined, want, "{n} points");
         }
+    }
+
+    #[test]
+    fn chains_of_fewer_than_two_points_are_skipped() {
+        // Built by offsets, as a decoded cache entry could hold them.
+        let chains = Chains {
+            lon: vec![0.1, 0.2, 0.3],
+            lat: vec![0.1, 0.2, 0.3],
+            start: vec![0, 0, 1, 3],
+            subtype: vec![100, 100, 100],
+        };
+        let mut m = Merger::new((46, 6));
+        m.add(&DsfRoads {
+            chains,
+            ..layer(&[], &[])
+        });
+        let r = m.finish();
+        assert_eq!(r.len(), 1, "only the two-point chain");
+        assert_eq!(all(&r)[0].1.len(), 2);
+        assert!(
+            !r.crosses(46.09, 6.09, 46.11, 6.11),
+            "nothing kept of the one-point chain"
+        );
     }
 
     /// Chains of 2 to 5 points: corners, edges and pseudo-random.
@@ -1076,16 +1091,22 @@ mod tests {
         for (seed, n) in RANDOM_TILES {
             let chains = random_chains(seed, n);
             let input: Vec<(u8, &[(f32, f32)])> = chains.iter().map(|c| (100u8, &c[..])).collect();
-            let r = merged_of(&input);
-            let mut hits = 0;
-            for k in 0..4000i64 {
-                let b = random_box(k, seed);
-                let want = crosses_scan(&r, b.0, b.1, b.2, b.3);
-                assert_eq!(r.crosses(b.0, b.1, b.2, b.3), want, "seed {seed} box {k}");
-                hits += usize::from(want);
-            }
-            if n >= 400 {
-                assert!(hits > 100, "seed {seed}: the boxes must meet chains too");
+            for index in [false, true] {
+                let r = merger_of(&input).finish_with(index);
+                let mut hits = 0;
+                for k in 0..4000i64 {
+                    let b = random_box(k, seed);
+                    let want = crosses_scan(&r, b.0, b.1, b.2, b.3);
+                    assert_eq!(
+                        r.crosses(b.0, b.1, b.2, b.3),
+                        want,
+                        "index {index} seed {seed} box {k}"
+                    );
+                    hits += usize::from(want);
+                }
+                if n >= 400 {
+                    assert!(hits > 100, "seed {seed}: the boxes must meet chains too");
+                }
             }
         }
     }

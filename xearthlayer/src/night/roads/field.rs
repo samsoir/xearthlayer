@@ -983,6 +983,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_field_is_the_same_in_both_tile_layouts() {
+        // A street grid over the texture, and long diagonals that span many
+        // cells (the boxed list of an indexed tile).
+        let name = name_at_zoom(46.2, 6.15, 16);
+        let f = Footprint::from_name(&name);
+        let tile = (46, 6);
+        let rel = |v: f64, o: i32| (v - f64::from(o)) as f32;
+        let mut c = Chains::new();
+        street_grid(
+            &mut c,
+            (rel(f.south, tile.0), rel(f.north, tile.0)),
+            (rel(f.west, tile.1), rel(f.east, tile.1)),
+            120.0,
+            30,
+        );
+        let (s, w) = (rel(f.south - 0.05, 46), rel(f.west - 0.05, 6));
+        let (n, e) = (rel(f.north + 0.05, 46), rel(f.east + 0.05, 6));
+        c.push(100, &[(w, s), (e, n)]);
+        c.push(30, &[(w, n), (e, s)]);
+        let layouts = [false, true].map(|index| {
+            let mut m = Merger::new(tile);
+            m.add(&DsfRoads {
+                tile,
+                overlay: true,
+                net_def: Some("n".into()),
+                exclusions: vec![],
+                chains: c.clone(),
+            });
+            Arc::new(m.finish_with(index))
+        });
+        let size = 256;
+        let [a, b] = layouts.map(|r| RoadField::raster(&name, size, &[r], &RoadModel::DEFAULT));
+        assert!(a.stats.lit_texels > size as usize * 8, "{:?}", a.stats);
+        assert_eq!(a.stats.lit_texels, b.stats.lit_texels);
+        for row in 0..size {
+            assert_eq!(a.row(row), b.row(row), "row {row}");
+        }
+    }
+
+    #[test]
     fn a_row_holds_the_texels_of_that_row() {
         let n = name_at_zoom(46.5, 6.5, 16);
         let f = crossing_field(&n, 64);

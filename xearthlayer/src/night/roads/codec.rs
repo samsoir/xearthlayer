@@ -304,6 +304,21 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_polygon_decodes_as_none() {
+        // The parser never gives one (it needs three vertices), and the
+        // even-odd test cannot take one: an entry that holds one decodes as
+        // a box.
+        let mut zone = Exclusion::parse("6/46/7/47").unwrap();
+        zone.polygon = Some(vec![]);
+        let r = DsfRoads {
+            exclusions: vec![zone],
+            ..roads(Chains::new())
+        };
+        let back = decode_roads(&encode_roads(&r)).unwrap();
+        assert_eq!(back.exclusions[0].polygon, None);
+    }
+
+    #[test]
     fn declared_counts_beyond_the_bytes_are_rejected_without_allocating() {
         // zones = u32::MAX straight after an empty net definition.
         let mut v = encode_roads(&roads(Chains::new()));
@@ -313,6 +328,23 @@ mod tests {
         // net length = u32::MAX.
         let mut v = encode_roads(&roads(Chains::new()));
         v[13..17].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_roads(&v).is_none());
+        // A zone's vertex count = u32::MAX: after the zone count (4) and the
+        // zone's four f64 (32).
+        let r = DsfRoads {
+            exclusions: vec![Exclusion::parse("6/46/7/47;6,46,7,46,6,47").unwrap()],
+            ..roads(Chains::new())
+        };
+        let mut v = encode_roads(&r);
+        let n_poly = zones_at + 4 + 32;
+        assert_eq!(v[n_poly..n_poly + 4], 3u32.to_le_bytes());
+        v[n_poly..n_poly + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_roads(&v).is_none());
+        // The point count = u32::MAX: after the zone count and the chain count.
+        let mut v = encode_roads(&roads(chains()));
+        let n_points = zones_at + 4 + 4;
+        assert_eq!(v[n_points..n_points + 4], 5u32.to_le_bytes());
+        v[n_points..n_points + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(decode_roads(&v).is_none());
     }
 }

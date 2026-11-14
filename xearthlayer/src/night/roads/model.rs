@@ -112,18 +112,72 @@ impl RoadModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::night::roads::RoadClass;
 
     #[test]
-    fn digest_changes_with_any_parameter() {
-        let a = RoadModel::DEFAULT.digest();
-        let mut m = RoadModel::DEFAULT;
-        m.country += 0.01;
-        assert_ne!(a, m.digest());
-        let mut m = RoadModel::DEFAULT;
-        m.rural_lamps = Some(LampParams::TEST);
-        assert_ne!(a, m.digest());
-        assert_eq!(a, RoadModel::DEFAULT.digest());
+    fn digest_changes_with_every_parameter() {
+        let base = RoadModel::DEFAULT.digest();
+        assert_eq!(base, RoadModel::DEFAULT.digest());
+        let mut changed: Vec<(String, RoadModel)> = vec![];
+        let mut with = |what: String, f: &dyn Fn(&mut RoadModel)| {
+            let mut m = RoadModel::DEFAULT;
+            f(&mut m);
+            changed.push((what, m));
+        };
+        for c in 0..RoadClass::COUNT {
+            with(format!("half_width_m {c}"), &|m| {
+                m.classes[c].half_width_m += 0.5
+            });
+            with(format!("sigma_m {c}"), &|m| m.classes[c].sigma_m += 0.5);
+            with(format!("intensity {c}"), &|m| {
+                m.classes[c].intensity += 0.01
+            });
+        }
+        with("peak".into(), &|m| m.peak += 0.01);
+        with("country".into(), &|m| m.country += 0.01);
+        with("full_nw".into(), &|m| m.full_nw += 1.0);
+        for ch in 0..3 {
+            with(format!("sodium {ch}"), &|m| m.sodium[ch] -= 1.0);
+        }
+        with("rural_lamps".into(), &|m| {
+            m.rural_lamps = Some(LampParams::TEST)
+        });
+        let lamp = |f: fn(&mut LampParams)| {
+            move |m: &mut RoadModel| {
+                let mut l = LampParams::TEST;
+                f(&mut l);
+                m.rural_lamps = Some(l);
+            }
+        };
+        let lamps_on = {
+            let mut m = RoadModel::DEFAULT;
+            m.rural_lamps = Some(LampParams::TEST);
+            m.digest()
+        };
+        let mut lamp_changes: Vec<(&str, RoadModel)> = vec![];
+        for (what, f) in [
+            ("spacing_m", lamp(|l| l.spacing_m += 1.0)),
+            ("lit_share", lamp(|l| l.lit_share += 0.1)),
+            ("sigma_m", lamp(|l| l.sigma_m += 1.0)),
+            ("intensity", lamp(|l| l.intensity -= 0.1)),
+        ] {
+            let mut m = RoadModel::DEFAULT;
+            f(&mut m);
+            lamp_changes.push((what, m));
+        }
+        for (what, m) in &changed {
+            assert_ne!(m.digest(), base, "{what}");
+        }
+        for (what, m) in &lamp_changes {
+            assert_ne!(m.digest(), lamps_on, "lamp {what}");
+        }
+        // Each change is its own input, not just a different one.
+        let mut all: Vec<[u8; 32]> = changed.iter().map(|(_, m)| m.digest()).collect();
+        all.extend(lamp_changes.iter().map(|(_, m)| m.digest()));
+        all.push(base);
+        let n = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), n);
     }
 
     #[test]

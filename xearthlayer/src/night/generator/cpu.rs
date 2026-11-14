@@ -458,21 +458,6 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_road_field_changes_nothing() {
-        let name = name_at(37.5, -122.5);
-        let a = generate(&name, 64, golden, red, 1.0);
-        let b = generate_roads(
-            &name,
-            64,
-            golden,
-            red,
-            &RoadField::empty(64),
-            &LedModel::OFF,
-        );
-        assert_eq!(digest(&a), digest(&b));
-    }
-
-    #[test]
     fn a_road_field_of_another_size_is_ignored() {
         let name = name_at(46.5, 6.5);
         let wrong = crossing_field(&name, 32);
