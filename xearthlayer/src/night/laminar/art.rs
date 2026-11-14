@@ -282,9 +282,29 @@ mod tests {
     }
 
     /// Runs `f` under a subscriber and returns everything it logged.
+    ///
+    /// Tests run in parallel and the others log with no subscriber. While
+    /// at most one dispatcher is registered, tracing computes a callsite's
+    /// interest from the registering thread's own default, without its
+    /// dispatcher lock: another thread's first hit of a `warn!` while this
+    /// test runs would store "never" for every thread, and the warning
+    /// would vanish (about one parallel run in ten). Two dispatchers kept
+    /// for the life of the test process end that mode, so every interest is
+    /// computed from the dispatcher list under its lock, and the rebuild
+    /// inside the scope settles any interest stored before.
     fn logged<F: FnOnce()>(f: F) -> String {
         use std::io::Write;
-        use std::sync::Mutex;
+        use std::sync::{Mutex, OnceLock};
+        use tracing::subscriber::NoSubscriber;
+        use tracing::Dispatch;
+
+        static KEEP: OnceLock<[Dispatch; 2]> = OnceLock::new();
+        KEEP.get_or_init(|| {
+            [
+                Dispatch::new(NoSubscriber::default()),
+                Dispatch::new(NoSubscriber::default()),
+            ]
+        });
 
         #[derive(Clone)]
         struct Buf(Arc<Mutex<Vec<u8>>>);
@@ -304,7 +324,10 @@ mod tests {
             .with_ansi(false)
             .with_max_level(tracing::Level::DEBUG)
             .finish();
-        tracing::subscriber::with_default(subscriber, f);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
         let bytes = buf.0.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
     }
