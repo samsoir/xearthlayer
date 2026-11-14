@@ -3,6 +3,7 @@
 //! See `docs/dev/night-lighting-design.md` (Road lights).
 
 pub mod class;
+pub mod codec;
 pub mod dsf;
 pub mod exclusion;
 pub mod merge;

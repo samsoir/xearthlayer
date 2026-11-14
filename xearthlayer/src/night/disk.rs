@@ -72,17 +72,30 @@ pub fn encode_entry(fp: &LitFingerprint, payload: &[u8]) -> Bytes {
     out.freeze()
 }
 
-/// The payload of `entry` when it carries `fp` and is exactly
-/// `expected_len` bytes long; `None` otherwise. Slices, no copy.
-pub fn decode_entry(entry: Bytes, fp: &LitFingerprint, expected_len: u64) -> Option<Bytes> {
+/// The stored payload length of `entry` when it has the magic and carries
+/// `fp`; `None` for anything else, including a short header.
+fn stamped_len(entry: &Bytes, fp: &LitFingerprint) -> Option<u64> {
     if entry.len() < ENTRY_HEADER_LEN || &entry[..4] != LIT_ENTRY_MAGIC || entry[4..36] != fp.0 {
         return None;
     }
-    let stored = u64::from_le_bytes(entry[36..44].try_into().ok()?);
+    Some(u64::from_le_bytes(entry[36..44].try_into().ok()?))
+}
+
+/// The payload of `entry` when it carries `fp` and is exactly
+/// `expected_len` bytes long; `None` otherwise. Slices, no copy.
+pub fn decode_entry(entry: Bytes, fp: &LitFingerprint, expected_len: u64) -> Option<Bytes> {
+    let stored = stamped_len(&entry, fp)?;
     if stored != expected_len || (entry.len() - ENTRY_HEADER_LEN) as u64 != expected_len {
         return None;
     }
     Some(entry.slice(ENTRY_HEADER_LEN..))
+}
+
+/// Like [`decode_entry`] for entries whose length is not known in advance
+/// (road cache entries): the stored length must match the bytes present.
+pub fn decode_entry_unsized(entry: Bytes, fp: &LitFingerprint) -> Option<Bytes> {
+    let stored = stamped_len(&entry, fp)?;
+    ((entry.len() - ENTRY_HEADER_LEN) as u64 == stored).then(|| entry.slice(ENTRY_HEADER_LEN..))
 }
 
 #[cfg(test)]
@@ -126,6 +139,24 @@ mod tests {
             "torn write"
         );
         assert_eq!(decode_entry(Bytes::from_static(b"XEL"), &fp(1), 0), None);
+    }
+
+    #[test]
+    fn unsized_decode_checks_magic_fingerprint_and_length() {
+        let e = encode_entry(&fp(1), b"abc");
+        assert_eq!(
+            decode_entry_unsized(e.clone(), &fp(1)).as_deref(),
+            Some(&b"abc"[..])
+        );
+        assert!(decode_entry_unsized(e.clone(), &fp(2)).is_none());
+        assert!(decode_entry_unsized(e.slice(..e.len() - 1), &fp(1)).is_none());
+        let mut longer = e.to_vec();
+        longer.push(0);
+        assert!(decode_entry_unsized(Bytes::from(longer), &fp(1)).is_none());
+        let mut bad_magic = e.to_vec();
+        bad_magic[0] ^= 0xFF;
+        assert!(decode_entry_unsized(Bytes::from(bad_magic), &fp(1)).is_none());
+        assert!(decode_entry_unsized(Bytes::from_static(b"XEL"), &fp(1)).is_none());
     }
 
     #[test]
