@@ -6,8 +6,9 @@
 //!
 //! The reader is forward-only and keeps only what roads need: 16-bit
 //! pools, rasters and any other atom are read past without buffering, a
-//! DSF without a network stops after HEAD and DEFN, and one with a network
-//! stops once GEOD and CMDS are read. [`read_dsf_file`] streams a raw file
+//! DSF without a network stops after HEAD and DEFN, one with a network
+//! stops once GEOD and CMDS are read, and a base mesh read for overlays
+//! only ([`ReadMode::OverlaysOnly`]) stops after HEAD. [`read_dsf_file`] streams a raw file
 //! or the single entry of a 7z, so decompression stops where reading does.
 //!
 //! Layout: `XPLNEDSF`, `u32 1`, atoms (`u32 id, u32 size` with the size
@@ -126,6 +127,16 @@ pub struct DsfRoads {
     pub chains: Chains,
 }
 
+/// Which DSFs are read in full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadMode {
+    /// A DSF that is not an overlay (a base mesh) stops right after HEAD:
+    /// its `DsfRoads` has `overlay == false`, no network and no chains.
+    OverlaysOnly,
+    /// Every DSF is read until its roads are known.
+    Any,
+}
+
 /// What reading one DSF file cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DsfFileStats {
@@ -141,9 +152,9 @@ pub struct DsfFileStats {
     pub walk_visits: u64,
 }
 
-/// [`read_dsf_stream`] over a DSF already in memory.
+/// [`read_dsf_stream`] over a DSF already in memory, read in full.
 pub fn read_dsf(bytes: &[u8], keep: impl Fn(u8) -> bool) -> Result<DsfRoads, DsfError> {
-    read_dsf_stream(&mut &bytes[..], bytes.len() as u64, keep)
+    read_dsf_stream(&mut &bytes[..], bytes.len() as u64, keep, ReadMode::Any)
 }
 
 /// A bounded little-endian reader over a byte slice.

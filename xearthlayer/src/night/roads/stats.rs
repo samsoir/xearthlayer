@@ -15,7 +15,8 @@ use crate::metrics::{LatencySummary, LatencyWindow};
 pub struct StatsSnapshot {
     /// Compressed DSFs whose extraction was read from the disk cache.
     pub cache_hits: u64,
-    /// Compressed DSFs read from the file with a disk cache present.
+    /// Compressed DSFs read in full from the file with a disk cache
+    /// present (a base mesh read only to its header is not one).
     pub cache_misses: u64,
     /// Probe footprints that waited for a tile or timed out.
     pub probe_waits: u64,

@@ -444,15 +444,17 @@ impl NightLitSource {
         .await
         .ok()?
         .ok()?;
+        // A tile whose identities could not be taken leaves no fingerprint:
+        // the payload is then kept in memory only.
         let roads = match &self.roads {
-            Some(roads) => {
-                futures::future::join_all(
-                    field_tiles(name)
-                        .into_iter()
-                        .map(|tile| async move { (tile, roads.identities(tile).await) }),
-                )
-                .await
-            }
+            Some(roads) => futures::future::join_all(
+                field_tiles(name)
+                    .into_iter()
+                    .map(|tile| async move { Some((tile, roads.identities(tile).await?)) }),
+            )
+            .await
+            .into_iter()
+            .collect::<Option<Vec<_>>>()?,
             None => Vec::new(),
         };
         Some(footprint_fingerprint(session, &identities, &roads))
@@ -1846,6 +1848,31 @@ mod tests {
                 a_fp,
                 "road lights on and off are different inputs"
             );
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_road_dsf_that_cannot_be_stated_leaves_no_fingerprint() {
+            use std::os::unix::fs::PermissionsExt;
+            let temp = TempDir::new().unwrap();
+            let name = lit_name();
+            let xp = xp_install(&temp, Some(road_across(&name)));
+            let roads = RoadService::new(xp.clone(), vec![], None);
+            let source = source_in(&temp)
+                .with_disk_cache(disk())
+                .with_roads(roads.clone());
+            assert!(roads.identities((10, 10)).await.is_some(), "index built");
+            let block = xp.join("Custom Scenery/Roads/Earth nav data/+30-130");
+            let mode = |m| std::fs::set_permissions(&block, std::fs::Permissions::from_mode(m));
+            mode(0o000).unwrap();
+            if std::fs::read_dir(&block).is_ok() {
+                mode(0o755).unwrap();
+                return; // root: permissions do not apply
+            }
+            let fp = source.fingerprint(&name).await;
+            mode(0o755).unwrap();
+            assert_eq!(fp, None, "not the fingerprint of a tile without DSFs");
+            assert!(source.fingerprint(&name).await.is_some());
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

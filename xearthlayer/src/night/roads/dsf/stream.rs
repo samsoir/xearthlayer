@@ -9,7 +9,8 @@ use std::path::Path;
 use super::pool::{Pool, MAX_POOL_POINTS};
 use super::walk::{walk_commands, Segmenter, MAX_WALK_VISITS, WALK_SLACK};
 use super::{
-    le_u32, Bytes, Chains, DsfError, DsfFileStats, DsfRoads, MAX_DSF_BYTES, MAX_RETAINED_ATOM_BYTES,
+    le_u32, Bytes, Chains, DsfError, DsfFileStats, DsfRoads, ReadMode, MAX_DSF_BYTES,
+    MAX_RETAINED_ATOM_BYTES,
 };
 use crate::night::roads::exclusion::Exclusion;
 
@@ -38,6 +39,7 @@ const CMDS: u32 = 0x434D_4453;
 pub fn read_dsf_file(
     path: &Path,
     keep: impl Fn(u8) -> bool,
+    mode: ReadMode,
 ) -> Result<(DsfRoads, DsfFileStats), DsfError> {
     let mut file = File::open(path).map_err(io_error)?;
     let file_bytes = file.metadata().map_err(io_error)?.len();
@@ -49,10 +51,10 @@ pub fn read_dsf_file(
     file.seek(SeekFrom::Start(0)).map_err(io_error)?;
     let compressed = magic == SEVENZ_MAGIC;
     let (roads, read_bytes, walk) = if compressed {
-        read_7z(file, keep)?
+        read_7z(file, keep, mode)?
     } else {
         let mut r = Counting::new(BufReader::new(file));
-        let (roads, walk) = read_roads(&mut r, file_bytes, keep, Limits::DEFAULT)?;
+        let (roads, walk) = read_roads(&mut r, file_bytes, keep, mode, Limits::DEFAULT)?;
         (roads, r.bytes, walk)
     };
     let stats = DsfFileStats {
@@ -70,7 +72,11 @@ pub fn read_dsf_file(
 /// from its header, before a decoder (with a dictionary the header sizes)
 /// is built. The iteration stops after the entry, so an early exit ends
 /// decompression.
-fn read_7z(file: File, keep: impl Fn(u8) -> bool) -> Result<(DsfRoads, u64, WalkStats), DsfError> {
+fn read_7z(
+    file: File,
+    keep: impl Fn(u8) -> bool,
+    mode: ReadMode,
+) -> Result<(DsfRoads, u64, WalkStats), DsfError> {
     let archive = |e: sevenz_rust2::Error| DsfError::Archive(e.to_string());
     let mut reader =
         sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty()).map_err(archive)?;
@@ -97,7 +103,7 @@ fn read_7z(file: File, keep: impl Fn(u8) -> bool) -> Result<(DsfRoads, u64, Walk
                 Err(DsfError::TooLarge)
             } else {
                 let mut r = Counting::new(r);
-                read_roads(&mut r, entry.size(), &keep, Limits::DEFAULT)
+                read_roads(&mut r, entry.size(), &keep, mode, Limits::DEFAULT)
                     .map(|(roads, walk)| (roads, r.bytes, walk))
             });
             Ok(false)
@@ -111,8 +117,9 @@ pub fn read_dsf_stream(
     reader: &mut dyn Read,
     len: u64,
     keep: impl Fn(u8) -> bool,
+    mode: ReadMode,
 ) -> Result<DsfRoads, DsfError> {
-    read_roads(reader, len, keep, Limits::DEFAULT).map(|(roads, _)| roads)
+    read_roads(reader, len, keep, mode, Limits::DEFAULT).map(|(roads, _)| roads)
 }
 
 /// Absolute ceilings on what one DSF may make the reader do. Production
@@ -143,6 +150,7 @@ fn read_roads(
     reader: &mut dyn Read,
     len: u64,
     keep: impl Fn(u8) -> bool,
+    mode: ReadMode,
     limits: Limits,
 ) -> Result<(DsfRoads, WalkStats), DsfError> {
     if len > MAX_DSF_BYTES as u64 {
@@ -171,6 +179,9 @@ fn read_roads(
             CMDS => cmds = Some(s.retain(size)?),
             _ => s.skip(size)?,
         }
+        if mode == ReadMode::OverlaysOnly && head.as_ref().is_some_and(|h| !h.overlay) {
+            break;
+        }
         // Network chains index only PO32 points: without any, CMDS can
         // hold no segment and is not read (mesh DSFs declare a network
         // yet carry only empty PO32 pools).
@@ -184,10 +195,11 @@ fn read_roads(
         }
     }
     let head = head.ok_or(DsfError::BadAtom)?;
+    let base_skipped = mode == ReadMode::OverlaysOnly && !head.overlay;
     let mut roads = DsfRoads {
         tile: (head.south.round() as i32, head.west.round() as i32),
         overlay: head.overlay,
-        net_def: net_def.flatten(),
+        net_def: net_def.flatten().filter(|_| !base_skipped),
         exclusions: head.exclusions,
         chains: Chains::new(),
     };
@@ -424,8 +436,8 @@ fn read_geod(s: &mut Stream, size: u64, max_points: usize) -> Result<Vec<Pool>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::night::roads::dsf::read_dsf;
     use crate::night::roads::dsf::test_dsf::{two_segment_dsf, Builder};
+    use crate::night::roads::dsf::{read_dsf, ReadMode};
 
     #[test]
     fn reads_properties_net_and_exclusions() {
@@ -520,7 +532,7 @@ mod tests {
         let want = read_dsf(&dsf, |_| true).unwrap();
         for sevenz in [false, true] {
             let path = write_dsf(dir.path(), "+46+006.dsf", &dsf, sevenz);
-            let (got, stats) = read_dsf_file(&path, |_| true).unwrap();
+            let (got, stats) = read_dsf_file(&path, |_| true, ReadMode::Any).unwrap();
             assert_eq!(got, want, "7z {sevenz}");
             assert_eq!(stats.compressed, sevenz);
             assert_eq!(stats.file_bytes, std::fs::metadata(&path).unwrap().len());
@@ -539,12 +551,51 @@ mod tests {
             // returns false; a crate bump that drains would still pass
             // here (read_bytes counts what we read) but cost the time.
             let path = write_dsf(dir.path(), "+46+006.dsf", &dsf, sevenz);
-            let (r, stats) = read_dsf_file(&path, |_| true).unwrap();
+            let (r, stats) = read_dsf_file(&path, |_| true, ReadMode::Any).unwrap();
             assert!(r.net_def.is_none());
             assert_eq!(r.tile, (46, 6));
             assert!(stats.file_bytes > 2 << 20, "7z {sevenz}");
             assert!(stats.read_bytes < 4096, "7z {sevenz}: {stats:?}");
         }
+    }
+
+    #[test]
+    fn overlays_only_stops_a_base_mesh_after_head() {
+        // A base mesh with roads, then a megabyte that does not compress:
+        // asked for overlays only, nothing past HEAD is read or kept.
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = Builder::new(46, 6);
+        b.road(46, 6, 100, &[(6.1, 46.1), (6.2, 46.2)]);
+        b.trailing.push((*b"DEMS", junk(1 << 20)));
+        let dsf = b.bytes();
+        for sevenz in [false, true] {
+            let path = write_dsf(dir.path(), "+46+006.dsf", &dsf, sevenz);
+            let (r, stats) = read_dsf_file(&path, |_| true, ReadMode::OverlaysOnly).unwrap();
+            assert!(!r.overlay, "7z {sevenz}");
+            assert_eq!(r.tile, (46, 6));
+            assert!(r.net_def.is_none() && r.chains.is_empty(), "7z {sevenz}");
+            let head = 12 + top_atoms(&dsf)[0].len() as u64;
+            assert_eq!(stats.read_bytes, head, "7z {sevenz}: {stats:?}");
+            let (all, _) = read_dsf_file(&path, |_| true, ReadMode::Any).unwrap();
+            assert_eq!(all.chains.len(), 1, "7z {sevenz}: read in full when asked");
+        }
+    }
+
+    #[test]
+    fn overlays_only_reads_an_overlay_in_full() {
+        let dsf = two_segment_dsf(0).bytes();
+        let len = dsf.len() as u64;
+        assert_eq!(
+            read_dsf_stream(&mut &dsf[..], len, |_| true, ReadMode::OverlaysOnly),
+            read_dsf_stream(&mut &dsf[..], len, |_| true, ReadMode::Any)
+        );
+        assert_eq!(
+            read_dsf_stream(&mut &dsf[..], len, |_| true, ReadMode::Any)
+                .unwrap()
+                .chains
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -554,7 +605,7 @@ mod tests {
         b.trailing.push((*b"DEMS", junk(1 << 20)));
         let dsf = b.bytes();
         let path = write_dsf(dir.path(), "+46+006.dsf", &dsf, false);
-        let (r, stats) = read_dsf_file(&path, |_| true).unwrap();
+        let (r, stats) = read_dsf_file(&path, |_| true, ReadMode::Any).unwrap();
         assert_eq!(r.chains.len(), 2);
         assert!(stats.read_bytes < 4096, "{stats:?}");
     }
@@ -568,7 +619,7 @@ mod tests {
         b.pools.push((vec![], vec![], 0));
         b.cmds = vec![16; 1 << 20]; // a megabyte of TerrainPatch
         let path = write_dsf(dir.path(), "+79+012.dsf", &b.bytes(), false);
-        let (r, stats) = read_dsf_file(&path, |_| true).unwrap();
+        let (r, stats) = read_dsf_file(&path, |_| true, ReadMode::Any).unwrap();
         assert_eq!(r.net_def.as_deref(), Some("lib/g10/roads_EU.net"));
         assert!(r.chains.is_empty());
         assert!(stats.read_bytes < 4096, "{stats:?}");
@@ -628,7 +679,7 @@ mod tests {
             std::io::Read::chain(&head[..], std::io::Read::take(std::io::repeat(0), pool_len)),
             &tail[..],
         );
-        let r = read_dsf_stream(&mut stream, len, |_| true).unwrap();
+        let r = read_dsf_stream(&mut stream, len, |_| true, ReadMode::Any).unwrap();
         assert_eq!(r.chains.len(), 2);
     }
 
@@ -644,7 +695,7 @@ mod tests {
     fn a_length_above_the_ceiling_is_rejected_unread() {
         let len = MAX_DSF_BYTES as u64 + 1;
         assert_eq!(
-            read_dsf_stream(&mut PanicsOnRead, len, |_| true),
+            read_dsf_stream(&mut PanicsOnRead, len, |_| true, ReadMode::Any),
             Err(DsfError::TooLarge)
         );
     }
@@ -657,7 +708,7 @@ mod tests {
         bytes.extend((MAX_RETAINED_ATOM_BYTES as u32 + 9).to_le_bytes());
         let len = MAX_DSF_BYTES as u64;
         assert_eq!(
-            read_dsf_stream(&mut &bytes[..], len, |_| true),
+            read_dsf_stream(&mut &bytes[..], len, |_| true, ReadMode::Any),
             Err(DsfError::TooLarge)
         );
     }
@@ -667,7 +718,7 @@ mod tests {
         let dsf = two_segment_dsf(0).bytes();
         for cut in [6, 12, 30, dsf.len() / 2, dsf.len() - 20] {
             assert_eq!(
-                read_dsf_stream(&mut &dsf[..cut], dsf.len() as u64, |_| true),
+                read_dsf_stream(&mut &dsf[..cut], dsf.len() as u64, |_| true, ReadMode::Any),
                 Err(DsfError::Truncated),
                 "cut {cut}"
             );
@@ -678,7 +729,7 @@ mod tests {
     fn a_missing_file_is_an_io_error() {
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(
-            read_dsf_file(&dir.path().join("none.dsf"), |_| true),
+            read_dsf_file(&dir.path().join("none.dsf"), |_| true, ReadMode::Any),
             Err(DsfError::Io(_))
         ));
     }
@@ -706,7 +757,8 @@ mod tests {
     /// `cargo test --release -p xearthlayer --lib night::roads::dsf::stream::tests::golden -- --ignored --nocapture`
     fn golden(path: &str) {
         let started = std::time::Instant::now();
-        let (ours, stats) = read_dsf_file(std::path::Path::new(path), |_| true).unwrap();
+        let (ours, stats) =
+            read_dsf_file(std::path::Path::new(path), |_| true, ReadMode::Any).unwrap();
         println!(
             "{path}: read_dsf_file {} ms, {} segments, {} points, Chains {} B, {stats:?}",
             started.elapsed().as_millis(),
@@ -718,6 +770,7 @@ mod tests {
         let (lit, _) = read_dsf_file(
             std::path::Path::new(path),
             crate::night::roads::is_lit_subtype,
+            ReadMode::Any,
         )
         .unwrap();
         println!(
@@ -779,6 +832,7 @@ mod tests {
             let (r, stats) = read_dsf_file(
                 std::path::Path::new(&path),
                 crate::night::roads::is_lit_subtype,
+                ReadMode::Any,
             )
             .unwrap();
             println!(
@@ -812,7 +866,15 @@ mod tests {
             pool_points: MAX_POOL_POINTS,
             walk_visits: 12,
         };
-        let read = |dsf: Vec<u8>| read_roads(&mut &dsf[..], dsf.len() as u64, |_| true, limits);
+        let read = |dsf: Vec<u8>| {
+            read_roads(
+                &mut &dsf[..],
+                dsf.len() as u64,
+                |_| true,
+                ReadMode::Any,
+                limits,
+            )
+        };
         let (r, stats) = read(repeated_chain(2)).unwrap();
         assert_eq!(r.chains.len(), 4);
         assert_eq!(stats.walk_visits, 10);
@@ -826,7 +888,7 @@ mod tests {
             pool_points,
             walk_visits: MAX_WALK_VISITS,
         };
-        let read = |l| read_roads(&mut &dsf[..], dsf.len() as u64, |_| true, l);
+        let read = |l| read_roads(&mut &dsf[..], dsf.len() as u64, |_| true, ReadMode::Any, l);
         assert_eq!(read(limits(5)).unwrap().1.pool_points, 5);
         assert_eq!(read(limits(4)), Err(DsfError::TooLarge));
     }
@@ -843,7 +905,7 @@ mod tests {
     fn file_stats_count_pool_points_and_visits() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_dsf(dir.path(), "+46+006.dsf", &repeated_chain(3), false);
-        let (_, stats) = read_dsf_file(&path, |_| true).unwrap();
+        let (_, stats) = read_dsf_file(&path, |_| true, ReadMode::Any).unwrap();
         assert_eq!((stats.pool_points, stats.walk_visits), (5, 15));
     }
 
@@ -864,7 +926,7 @@ mod tests {
         bytes.extend((8 + sc).to_le_bytes());
         let len = MAX_DSF_BYTES as u64;
         assert_eq!(
-            read_dsf_stream(&mut &bytes[..], len, |_| true),
+            read_dsf_stream(&mut &bytes[..], len, |_| true, ReadMode::Any),
             Err(DsfError::BadPool)
         );
     }
@@ -885,7 +947,7 @@ mod tests {
         }
         w.finish().unwrap();
         assert!(matches!(
-            read_dsf_file(&path, |_| true),
+            read_dsf_file(&path, |_| true, ReadMode::Any),
             Err(DsfError::Archive(_))
         ));
     }
@@ -899,6 +961,7 @@ mod tests {
         let (r, stats) = read_dsf_file(
             std::path::Path::new(path),
             crate::night::roads::is_lit_subtype,
+            ReadMode::Any,
         )
         .unwrap();
         println!(

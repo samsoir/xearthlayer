@@ -8,9 +8,17 @@
 //! kept in the lit disk tier, because decompressing a mesh costs far more
 //! than reading the entry back; raw DSFs are parsed again each session.
 //!
-//! Callers wait per tile, not per call: the first `footprint` for a tile
-//! and purpose sets that tile's deadline, and no call waits past it. X-Plane
-//! stats thousands of lit names, so a wait per call would multiply.
+//! Only overlay DSFs give networks and exclusion zones, as X-Plane shows
+//! the networks of every overlay of a tile but of one base mesh only, the
+//! highest priority one (XEL's own wherever lit textures are served, which
+//! the pack index leaves out). A base mesh is read past its header only as
+//! the fallback: see [`RoadService::merge_sources`].
+//!
+//! Callers wait per build, not per call: the first `footprint` of a tile's
+//! build for a purpose sets that build's deadline, and no call waits past
+//! it. X-Plane stats thousands of lit names, so a wait per call would
+//! multiply. A tile rebuilt after eviction is a new build with new
+//! deadlines.
 //!
 //! Blocking work is bounded by [`ROAD_EXTRACT_PERMITS`]: a build holds one
 //! permit for its whole tile and no other lit permit, and hands it to the
@@ -32,8 +40,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
-use super::codec::{decode_roads, encode_roads};
-use super::dsf::{read_dsf_file, DsfFileStats};
+use super::codec::{decode_roads, encode_roads, is_overlay};
+use super::dsf::{read_dsf_file, DsfFileStats, DsfRoads, ReadMode};
 use super::is_lit_subtype;
 use super::merge::{MergedRoads, Merger};
 use super::packs::PackIndex;
@@ -53,9 +61,15 @@ pub const ROAD_PROBE_WAIT: Duration = Duration::from_secs(2);
 pub const ROAD_GENERATE_WAIT: Duration = Duration::from_secs(10);
 /// Memory for merged tiles, weighted by [`MergedRoads::bytes`].
 pub const ROAD_TILE_CACHE_BYTES: u64 = 128 * 1024 * 1024;
-/// Stamped into every disk cache entry: bump it when what an extraction
-/// keeps changes (the reader, the subtype filter or the codec's input).
+/// Stamped into every road disk cache entry: bump it when what one DSF's
+/// extraction keeps changes (the reader, the subtype filter, the codec's
+/// input). It guards road entries only; lit payloads are guarded by
+/// `ROADS_VERSION`.
 pub const ROAD_EXTRACT_VERSION: u32 = 1;
+/// DSF-open hints are ignored while this many builds are pending, so a
+/// burst of hints cannot queue ahead of the builds a probe or a generation
+/// is waiting on. Builds those ask for are never refused.
+pub const ROAD_HINT_BACKLOG: usize = 8;
 /// Between two `Night roads: summary` lines.
 const SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -66,7 +80,6 @@ type Tile = (i32, i32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Trigger {
     DsfOpen,
-    PrefetchHint,
     Probe,
     Generate,
 }
@@ -101,6 +114,10 @@ pub struct RoadServiceConfig {
     /// Every tile build sleeps this long first (deadline tests).
     #[cfg(test)]
     pub build_delay: Duration,
+    /// When set, every tile build first takes one permit of it, so a test
+    /// decides when each build may run (`add_permits`).
+    #[cfg(test)]
+    pub gate: Option<Arc<Semaphore>>,
 }
 
 impl Default for RoadServiceConfig {
@@ -112,6 +129,8 @@ impl Default for RoadServiceConfig {
             extract_permits: ROAD_EXTRACT_PERMITS,
             #[cfg(test)]
             build_delay: Duration::ZERO,
+            #[cfg(test)]
+            gate: None,
         }
     }
 }
@@ -185,10 +204,13 @@ pub struct RoadService {
     pending: DashMap<Tile, Pending>,
     /// Tiles with an unreadable DSF: no roads for the session.
     failed: DashSet<Tile>,
-    /// When callers stop waiting for a tile, per purpose; set by the first.
+    /// When callers stop waiting for a tile's current build, per purpose;
+    /// set by the first of them, cleared when a new build starts.
     deadlines: DashMap<(Tile, Purpose), Instant>,
+    /// Tiles a probe has asked for, for the lead time.
+    probed: DashSet<Tile>,
     /// Every source's identity, taken once per tile; concurrent first
-    /// callers share one pass.
+    /// callers share one pass. A failed pass is not kept.
     identities: DashMap<Tile, Arc<OnceCell<Arc<[DsfIdentity]>>>>,
     /// When each tile was first ready, for the lead time.
     ready_at: DashMap<Tile, Instant>,
@@ -222,19 +244,80 @@ struct Merged {
     roads: MergedRoads,
     /// Disk entries to write once the tile is known to be good.
     writes: Vec<(String, Bytes)>,
-    /// Sources that existed and were read.
+    /// Sources that existed and were reached.
     dsfs: usize,
+    /// Overlays merged.
+    overlays_read: usize,
+    /// Base meshes passed over by the overlay pass.
+    base_skipped: usize,
+    /// Whether a base mesh was merged because no overlay gave a road.
+    base_fallback: bool,
     /// Sources never reached because a zone covered the tile.
     skipped: usize,
 }
 
-/// One DSF read from its file, after it was merged.
+/// One DSF read from its file, after it was offered to the merger.
 struct Extracted {
     stats: DsfFileStats,
+    absorbed: Absorbed,
+    /// A base mesh read only to its header.
+    head_only: bool,
     segments_kept: usize,
     exclusions: usize,
     entry: Option<Bytes>,
     encode_us: u64,
+}
+
+/// The two passes of a tile build: every overlay first, then, only when
+/// they gave no road, the base meshes until one has a network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Overlays,
+    Fallback,
+}
+
+impl Pass {
+    fn mode(self) -> ReadMode {
+        match self {
+            Self::Overlays => ReadMode::OverlaysOnly,
+            Self::Fallback => ReadMode::Any,
+        }
+    }
+}
+
+/// What a source gave a tile's merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Absorbed {
+    Merged,
+    /// A base mesh, passed over by the overlay pass.
+    Base,
+    /// A base mesh without a network, passed over by the fallback.
+    NoNetwork,
+    /// A DSF whose header names another tile than the one it is filed as.
+    Mismatch((i32, i32)),
+}
+
+/// Merges `roads`, a source of `tile`, when `pass` takes it.
+fn absorb(merger: &mut Merger, tile: Tile, roads: &DsfRoads, pass: Pass) -> Absorbed {
+    if roads.tile != tile {
+        return Absorbed::Mismatch(roads.tile);
+    }
+    match pass {
+        Pass::Overlays if !roads.overlay => Absorbed::Base,
+        Pass::Fallback if roads.net_def.is_none() => Absorbed::NoNetwork,
+        _ => {
+            merger.add(roads);
+            Absorbed::Merged
+        }
+    }
+}
+
+/// A source of a tile: its file, its identity, and its stored extraction
+/// when one was already read and checked.
+struct Source {
+    path: PathBuf,
+    id: DsfIdentity,
+    entry: Option<Bytes>,
 }
 
 /// Ends a build's `pending` entry however its task ends. A task that ends
@@ -301,6 +384,7 @@ impl RoadService {
             pending: DashMap::new(),
             failed: DashSet::new(),
             deadlines: DashMap::new(),
+            probed: DashSet::new(),
             identities: DashMap::new(),
             ready_at: DashMap::new(),
             extract: Arc::new(Semaphore::new(permits)),
@@ -312,29 +396,36 @@ impl RoadService {
     }
 
     /// Starts building `tile` unless it is ready, failed or building.
-    /// Returns at once; the build runs in its own task.
+    /// Returns at once; the build runs in its own task. A DSF-open hint is
+    /// ignored while [`ROAD_HINT_BACKLOG`] builds are pending.
     pub fn ensure(self: &Arc<Self>, tile: Tile, trigger: Trigger) {
-        if !self.tiles.contains_key(&tile) {
-            let _ = self.start(tile, trigger);
+        if self.tiles.contains_key(&tile) {
+            return;
         }
+        if trigger == Trigger::DsfOpen && !self.pending.contains_key(&tile) {
+            let pending = self.pending.len();
+            if pending >= ROAD_HINT_BACKLOG {
+                debug!(
+                    lat = tile.0,
+                    lon = tile.1,
+                    pending,
+                    "Night roads: hint ignored"
+                );
+                return;
+            }
+        }
+        let _ = self.start(tile, trigger);
     }
 
     /// The ready roads of `tiles`, waiting for each tile at most until its
-    /// deadline for `purpose` (set by the first call that asked for it).
-    /// Records the call's wait and timeout, and the lead time of each tile
-    /// this call is the first probe of.
+    /// build's deadline for `purpose` (set by the first call that waited on
+    /// that build). Records the call's wait and timeout, and the lead time
+    /// of each tile this call is the first probe of.
     pub async fn footprint(self: &Arc<Self>, tiles: &[Tile], purpose: Purpose) -> FootprintRoads {
         let started = Instant::now();
-        let wait = self.config.wait(purpose);
-        let found = join_all(tiles.iter().map(|&tile| {
-            let (deadline, first) = match self.deadlines.entry((tile, purpose)) {
-                Entry::Occupied(e) => (*e.get(), false),
-                Entry::Vacant(e) => (*e.insert(started + wait), true),
-            };
-            async move {
-                let (state, waited) = self.tile_by(tile, purpose.trigger(), deadline).await;
-                (tile, first, state, waited)
-            }
+        let found = join_all(tiles.iter().map(|&tile| async move {
+            let (state, waited) = self.tile_by(tile, purpose, started).await;
+            (tile, state, waited)
         }))
         .await;
         let now = Instant::now();
@@ -344,9 +435,9 @@ impl RoadService {
             timed_out: false,
         };
         let mut waited = false;
-        for (tile, first, state, tile_waited) in found {
+        for (tile, state, tile_waited) in found {
             waited |= tile_waited;
-            if first && purpose == Purpose::Probe {
+            if purpose == Purpose::Probe && self.probed.insert(tile) {
                 self.note_lead(tile, started, now);
             }
             match state {
@@ -374,37 +465,35 @@ impl RoadService {
 
     /// The identities of every DSF of `tile`, highest priority first,
     /// taken once per tile per session (X-Plane does not change a DSF it
-    /// has loaded). Metadata only; a missing file is left out. The `stat`s
-    /// run on the blocking pool under the caller's permit, if any: this
-    /// takes none. A pass that fails (a panic) answers empty for this call
-    /// only and is not kept.
-    pub async fn identities(self: &Arc<Self>, tile: Tile) -> Arc<[DsfIdentity]> {
+    /// has loaded). Metadata only; a file that is gone (NotFound) is left
+    /// out. `None` when the pass failed: a source whose `stat` failed for
+    /// another reason, or a panic. A failed pass is not kept, so a later
+    /// call tries again. The `stat`s run on the blocking pool under the
+    /// caller's permit, if any: this takes none.
+    pub async fn identities(self: &Arc<Self>, tile: Tile) -> Option<Arc<[DsfIdentity]>> {
         let cell = Arc::clone(&self.identities.entry(tile).or_default());
         let ids = cell
             .get_or_try_init(|| async {
                 let paths = self.source_paths(tile).await;
                 #[cfg(test)]
                 self.test.identity_passes.fetch_add(1, Ordering::SeqCst);
-                tokio::task::spawn_blocking(move || {
-                    paths
-                        .iter()
-                        .filter_map(|p| DsfIdentity::of(p).ok())
-                        .collect::<Vec<_>>()
-                })
-                .await
-                .map(Arc::<[DsfIdentity]>::from)
+                tokio::task::spawn_blocking(move || stat_all(&paths))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map(Arc::<[DsfIdentity]>::from)
+                    .map_err(|e| e.to_string())
             })
             .await;
         match ids {
-            Ok(ids) => Arc::clone(ids),
-            Err(e) => {
+            Ok(ids) => Some(Arc::clone(ids)),
+            Err(error) => {
                 debug!(
                     lat = tile.0,
                     lon = tile.1,
-                    error = %e,
+                    error,
                     "Night roads: DSF identities unavailable for this call"
                 );
-                Arc::from(Vec::new())
+                None
             }
         }
     }
@@ -445,34 +534,47 @@ impl RoadService {
         );
     }
 
-    /// How the tile ended for a caller waiting until `deadline`, and whether
-    /// the caller waited for it. Starts its build if needed.
+    /// How the tile ended for a caller that asked at `asked`, and whether
+    /// the caller waited for it. Starts its build if needed, then waits
+    /// until the build's deadline for `purpose`.
     async fn tile_by(
         self: &Arc<Self>,
         tile: Tile,
-        trigger: Trigger,
-        deadline: Instant,
+        purpose: Purpose,
+        asked: Instant,
     ) -> (TileWait, bool) {
         if let Some(ready) = self.tiles.get(&tile).await {
             return (TileWait::Ready(ready), false);
         }
-        let Some(pending) = self.start(tile, trigger) else {
+        let Some(pending) = self.start(tile, purpose.trigger()) else {
             return (TileWait::Failed, false);
         };
+        let deadline = self.deadline(tile, purpose, asked);
         let Some(until) = wait_until(deadline, Instant::now()) else {
-            return (TileWait::TimedOut, false);
+            return (settled(&pending), false);
         };
-        let state = match tokio::time::timeout_at(until.into(), pending).await {
+        let state = match tokio::time::timeout_at(until.into(), pending.clone()).await {
             Ok(Some(roads)) => TileWait::Ready(roads),
             Ok(None) => TileWait::Failed,
-            Err(_) => TileWait::TimedOut,
+            Err(_) => settled(&pending),
         };
         (state, true)
     }
 
+    /// The deadline of `tile`'s current build for `purpose`: set by the
+    /// first caller to wait on that build, to when it asked plus the
+    /// purpose's wait.
+    fn deadline(&self, tile: Tile, purpose: Purpose, asked: Instant) -> Instant {
+        *self
+            .deadlines
+            .entry((tile, purpose))
+            .or_insert(asked + self.config.wait(purpose))
+    }
+
     /// The build of `tile`, started unless one is in flight; `None` for a
     /// failed tile. The build is its own task, so dropping the returned
-    /// future never cancels it.
+    /// future never cancels it. A new build clears the tile's deadlines,
+    /// so its first caller sets fresh ones.
     fn start(self: &Arc<Self>, tile: Tile, trigger: Trigger) -> Option<Pending> {
         if self.failed.contains(&tile) {
             return None;
@@ -485,6 +587,9 @@ impl RoadService {
                 // before its guard removed the entry this lock now guards.
                 if self.failed.contains(&tile) {
                     return None;
+                }
+                for purpose in [Purpose::Probe, Purpose::Generate] {
+                    self.deadlines.remove(&(tile, purpose));
                 }
                 let svc = Arc::clone(self);
                 let build = tokio::spawn(async move {
@@ -515,7 +620,14 @@ impl RoadService {
     /// source fails the tile for the session.
     async fn build_tile(self: Arc<Self>, tile: Tile, trigger: Trigger) -> Option<MergedRoads> {
         #[cfg(test)]
-        tokio::time::sleep(self.config.build_delay).await;
+        {
+            tokio::time::sleep(self.config.build_delay).await;
+            if let Some(gate) = &self.config.gate {
+                if let Ok(p) = gate.acquire().await {
+                    p.forget();
+                }
+            }
+        }
         let started = Instant::now();
         let sources = self.source_paths(tile).await;
         let asked = Instant::now();
@@ -541,6 +653,9 @@ impl RoadService {
                     lon = tile.1,
                     trigger = ?trigger,
                     dsfs = m.dsfs,
+                    overlays_read = m.overlays_read,
+                    base_skipped = m.base_skipped,
+                    base_fallback = m.base_fallback,
                     cache_hits = record.cache_hits,
                     cache_misses = record.cache_misses,
                     merged_segments = m.roads.len(),
@@ -567,9 +682,18 @@ impl RoadService {
         }
     }
 
-    /// Feeds the tile's sources to a merger, highest priority first, until
-    /// a zone covers the tile. Each extraction is dropped once merged (and
-    /// encoded, for a 7z), so at most one is alive at a time.
+    /// Feeds the tile's sources to a merger in two passes, each extraction
+    /// dropped once merged (and encoded, for a 7z), so at most one is alive
+    /// at a time.
+    ///
+    /// The overlay pass reads every overlay, highest priority first, until a
+    /// zone covers the tile; a base mesh stops at its header. The fallback
+    /// runs only when, after every overlay, the merger holds no chain at all
+    /// (no overlay had a network, or every chain was unlit or inside a
+    /// higher zone) and no zone covers the tile: the base meshes passed
+    /// over are then read in full, highest priority first, and the first
+    /// with a network is merged, alone, under the overlays' zones. A source
+    /// whose header names another tile is skipped.
     async fn merge_sources(
         &self,
         tile: Tile,
@@ -578,116 +702,51 @@ impl RoadService {
     ) -> Result<Merged, Unreadable> {
         let mut merger = Merger::new(tile);
         let mut writes = vec![];
-        let (mut dsfs, mut reached) = (0, 0);
+        let mut base = vec![];
+        let (mut dsfs, mut reached, mut overlays_read) = (0, 0, 0);
         for path in sources {
             reached += 1;
-            let p = path.clone();
-            let (id, cpu) = on_blocking_pool(&path.to_string_lossy(), move || {
-                timed(|| DsfIdentity::of(&p))
-            })
-            .await?;
-            record.cpu_us += cpu;
-            let id = match id {
-                Ok(id) => id,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return Err(Unreadable {
-                        path: path.to_string_lossy().into_owned(),
-                        error: e.to_string(),
-                    })
-                }
+            let Some(id) = self.identity_of(path, record).await? else {
+                continue;
             };
             dsfs += 1;
-            let (key, fp) = (cache_key(tile, &id.path), entry_fingerprint(&id));
-
-            let lookup = Instant::now();
-            let stored = match &self.disk {
-                Some(disk) => disk.get(&key).await.ok().flatten(),
-                None => None,
+            let mut source = Source {
+                path: path.clone(),
+                id,
+                entry: None,
             };
-            let read_ms = lookup.elapsed().as_millis() as u64;
-            if let Some(entry) = stored {
-                let (m, segments, decode_us, cpu) = on_blocking_pool(&id.path, move || {
-                    let t = Instant::now();
-                    let roads = decode_entry_unsized(entry, &fp).and_then(|b| decode_roads(&b));
-                    let decode_us = micros(t.elapsed());
-                    let segments = roads.map(|r| {
-                        merger.add(&r);
-                        r.chains.len()
-                    });
-                    (merger, segments, decode_us, micros(t.elapsed()))
-                })
+            let absorbed;
+            (merger, absorbed, source.entry) = self
+                .take(merger, tile, &source, Pass::Overlays, record, &mut writes)
                 .await?;
-                merger = m;
-                record.cpu_us += cpu;
-                if let Some(segments) = segments {
-                    record.cache_hits += 1;
-                    debug!(
-                        path = %id.path,
-                        read_ms,
-                        decode_ms = decode_us / 1000,
-                        segments,
-                        "Night roads: DSF cache hit"
-                    );
+            match absorbed {
+                Absorbed::Merged => {
+                    overlays_read += 1;
                     if merger.covered() {
                         break;
                     }
-                    continue;
                 }
+                Absorbed::Base => base.push(source),
+                Absorbed::Mismatch(at) => note_mismatch(tile, &source.id, at),
+                Absorbed::NoNetwork => {}
             }
-
-            let cache = self.disk.is_some();
-            let p = path.clone();
-            let (m, read, read_us, cpu) = on_blocking_pool(&id.path, move || {
-                let t = Instant::now();
-                let read = read_dsf_file(&p, is_lit_subtype);
-                let read_us = micros(t.elapsed());
-                let read = read.map(|(roads, stats)| {
-                    let (payload, mut encode_us) =
-                        timed(|| (cache && stats.compressed).then(|| encode_roads(&roads)));
-                    merger.add(&roads);
-                    let (segments_kept, exclusions) = (roads.chains.len(), roads.exclusions.len());
-                    drop(roads);
-                    let (entry, us) = timed(|| payload.map(|p| encode_entry(&fp, &p)));
-                    encode_us += us;
-                    Extracted {
-                        stats,
-                        segments_kept,
-                        exclusions,
-                        entry,
-                        encode_us,
+        }
+        let base_skipped = base.len();
+        let mut base_fallback = false;
+        if merger.is_empty() && !merger.covered() {
+            for source in base {
+                let absorbed;
+                (merger, absorbed, _) = self
+                    .take(merger, tile, &source, Pass::Fallback, record, &mut writes)
+                    .await?;
+                match absorbed {
+                    Absorbed::Merged => {
+                        base_fallback = true;
+                        break;
                     }
-                });
-                (merger, read, read_us, micros(t.elapsed()))
-            })
-            .await?;
-            merger = m;
-            record.cpu_us += cpu;
-            record.extract_us.push(read_us);
-            let x = read.map_err(|e| Unreadable {
-                path: id.path.clone(),
-                error: e.to_string(),
-            })?;
-            if cache && x.stats.compressed {
-                record.cache_misses += 1;
-            }
-            debug!(
-                path = %id.path,
-                file_bytes = x.stats.file_bytes,
-                read_bytes = x.stats.read_bytes,
-                compressed = x.stats.compressed,
-                ms = read_us / 1000,
-                encode_ms = x.encode_us / 1000,
-                segments_kept = x.segments_kept,
-                exclusions = x.exclusions,
-                pool_points = x.stats.pool_points,
-                walk_visits = x.stats.walk_visits,
-                cached = x.entry.is_some(),
-                "Night roads: DSF extracted"
-            );
-            writes.extend(x.entry.map(|e| (key, e)));
-            if merger.covered() {
-                break;
+                    Absorbed::Mismatch(at) => note_mismatch(tile, &source.id, at),
+                    Absorbed::Base | Absorbed::NoNetwork => {}
+                }
             }
         }
         let (roads, cpu) = on_blocking_pool("merge", move || timed(|| merger.finish())).await?;
@@ -696,8 +755,155 @@ impl RoadService {
             roads,
             writes,
             dsfs,
+            overlays_read,
+            base_skipped,
+            base_fallback,
             skipped: sources.len() - reached,
         })
+    }
+
+    /// The identity of a source, `None` when it is gone. Any other `stat`
+    /// failure fails the tile.
+    async fn identity_of(
+        &self,
+        path: &Path,
+        record: &mut BuildRecord,
+    ) -> Result<Option<DsfIdentity>, Unreadable> {
+        let p = path.to_path_buf();
+        let (id, cpu) = on_blocking_pool(&path.to_string_lossy(), move || {
+            timed(|| DsfIdentity::of(&p))
+        })
+        .await?;
+        record.cpu_us += cpu;
+        match id {
+            Ok(id) => Ok(Some(id)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Unreadable {
+                path: path.to_string_lossy().into_owned(),
+                error: e.to_string(),
+            }),
+        }
+    }
+
+    /// Offers one source to `merger` as `pass` asks: from its stored
+    /// extraction (the one `source` carries, or the disk tier's) when there
+    /// is one, else from its file. A compressed DSF read in full leaves its
+    /// entry in `writes`; a base mesh read to its header leaves none. Hands
+    /// back a stored extraction the pass did not use, so the fallback need
+    /// not read it again.
+    async fn take(
+        &self,
+        mut merger: Merger,
+        tile: Tile,
+        source: &Source,
+        pass: Pass,
+        record: &mut BuildRecord,
+        writes: &mut Vec<(String, Bytes)>,
+    ) -> Result<(Merger, Absorbed, Option<Bytes>), Unreadable> {
+        let id = &source.id;
+        let (key, fp) = (cache_key(tile, &id.path), entry_fingerprint(id));
+        let lookup = Instant::now();
+        let stored = match (&source.entry, &self.disk) {
+            (Some(entry), _) => Some(entry.clone()),
+            (None, Some(disk)) => disk
+                .get(&key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|e| decode_entry_unsized(e, &fp)),
+            (None, None) => None,
+        };
+        let read_ms = lookup.elapsed().as_millis() as u64;
+        if let Some(payload) = stored {
+            let fresh = source.entry.is_none();
+            let (m, hit, decode_us) = on_blocking_pool(&id.path, move || {
+                let t = Instant::now();
+                // A base mesh's entry is recognised from its header and kept
+                // whole for the fallback.
+                let hit = if pass == Pass::Overlays && is_overlay(&payload) == Some(false) {
+                    Some((Absorbed::Base, 0, Some(payload)))
+                } else {
+                    decode_roads(&payload).map(|r| {
+                        let absorbed = absorb(&mut merger, tile, &r, pass);
+                        (absorbed, r.chains.len(), None)
+                    })
+                };
+                (merger, hit, micros(t.elapsed()))
+            })
+            .await?;
+            merger = m;
+            record.cpu_us += decode_us;
+            if let Some((absorbed, segments, kept)) = hit {
+                if fresh {
+                    record.cache_hits += 1;
+                }
+                debug!(
+                    path = %id.path,
+                    read_ms,
+                    decode_ms = decode_us / 1000,
+                    segments,
+                    "Night roads: DSF cache hit"
+                );
+                return Ok((merger, absorbed, kept));
+            }
+        }
+
+        let cache = self.disk.is_some();
+        let p = source.path.clone();
+        let (m, read, read_us, cpu) = on_blocking_pool(&id.path, move || {
+            let t = Instant::now();
+            let read = read_dsf_file(&p, is_lit_subtype, pass.mode());
+            let read_us = micros(t.elapsed());
+            let read = read.map(|(roads, stats)| {
+                let head_only = pass == Pass::Overlays && !roads.overlay;
+                let (payload, mut encode_us) = timed(|| {
+                    (cache && stats.compressed && !head_only).then(|| encode_roads(&roads))
+                });
+                let absorbed = absorb(&mut merger, tile, &roads, pass);
+                let (segments_kept, exclusions) = (roads.chains.len(), roads.exclusions.len());
+                drop(roads);
+                let (entry, us) = timed(|| payload.map(|p| encode_entry(&fp, &p)));
+                encode_us += us;
+                Extracted {
+                    stats,
+                    absorbed,
+                    head_only,
+                    segments_kept,
+                    exclusions,
+                    entry,
+                    encode_us,
+                }
+            });
+            (merger, read, read_us, micros(t.elapsed()))
+        })
+        .await?;
+        merger = m;
+        record.cpu_us += cpu;
+        record.extract_us.push(read_us);
+        let x = read.map_err(|e| Unreadable {
+            path: id.path.clone(),
+            error: e.to_string(),
+        })?;
+        if cache && x.stats.compressed && !x.head_only {
+            record.cache_misses += 1;
+        }
+        debug!(
+            path = %id.path,
+            file_bytes = x.stats.file_bytes,
+            read_bytes = x.stats.read_bytes,
+            compressed = x.stats.compressed,
+            head_only = x.head_only,
+            ms = read_us / 1000,
+            encode_ms = x.encode_us / 1000,
+            segments_kept = x.segments_kept,
+            exclusions = x.exclusions,
+            pool_points = x.stats.pool_points,
+            walk_visits = x.stats.walk_visits,
+            cached = x.entry.is_some(),
+            "Night roads: DSF extracted"
+        );
+        writes.extend(x.entry.map(|e| (key, e)));
+        Ok((merger, x.absorbed, None))
     }
 
     /// The tile's DSF paths, highest priority first.
@@ -813,6 +1019,42 @@ async fn on_blocking_pool<T: Send + 'static>(
         })
 }
 
+/// How a waiter whose deadline has passed finds the tile: a build that
+/// has just resolved is used, not reported as a timeout.
+fn settled(pending: &Pending) -> TileWait {
+    match pending.clone().now_or_never() {
+        Some(Some(roads)) => TileWait::Ready(roads),
+        Some(None) => TileWait::Failed,
+        None => TileWait::TimedOut,
+    }
+}
+
+/// The identities of `paths`, in order. A file that is gone is left out;
+/// any other `stat` failure fails the pass. Blocking.
+fn stat_all(paths: &[PathBuf]) -> std::io::Result<Vec<DsfIdentity>> {
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        match DsfIdentity::of(path) {
+            Ok(id) => out.push(id),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
+/// A source filed as `tile` whose header says `at`: it is skipped.
+fn note_mismatch(tile: Tile, id: &DsfIdentity, at: (i32, i32)) {
+    debug!(
+        lat = tile.0,
+        lon = tile.1,
+        path = %id.path,
+        dsf_lat = at.0,
+        dsf_lon = at.1,
+        "Night roads: DSF tile mismatch"
+    );
+}
+
 /// `f`'s result and its wall time in microseconds.
 fn timed<T>(f: impl FnOnce() -> T) -> (T, u64) {
     let started = Instant::now();
@@ -868,8 +1110,15 @@ pub(crate) mod tests {
 
     const TILE: (i32, i32) = (46, 6);
 
+    /// An overlay DSF for `(lat, lon)`, as road packs ship them.
+    fn overlay(lat: i32, lon: i32) -> Builder {
+        let mut b = Builder::new(lat, lon);
+        b.props.push(("sim/overlay".into(), "1".into()));
+        b
+    }
+
     fn high(zone: Option<&str>) -> Builder {
-        let mut b = Builder::new(46, 6);
+        let mut b = overlay(46, 6);
         if let Some(z) = zone {
             b.props.push(("sim/exclude_net".into(), z.into()));
         }
@@ -878,9 +1127,36 @@ pub(crate) mod tests {
     }
 
     fn low() -> Builder {
-        let mut b = Builder::new(46, 6);
+        let mut b = overlay(46, 6);
         b.road(46, 6, 50, &[(6.5, 46.5), (6.6, 46.6)]);
         b
+    }
+
+    /// A base mesh (not an overlay) for the tile with one road at `lon`.
+    fn base_mesh(lon: f64) -> Builder {
+        let mut b = Builder::new(46, 6);
+        b.road(46, 6, 30, &[(lon, 46.3), (lon, 46.4)]);
+        b
+    }
+
+    /// `dsf` with every byte after its HEAD atom replaced by garbage: it
+    /// reads only as far as HEAD, so reading it further fails its tile.
+    fn past_head_garbage(dsf: Vec<u8>) -> Vec<u8> {
+        let head = 12 + u32::from_le_bytes(dsf[16..20].try_into().unwrap()) as usize;
+        let mut out = dsf;
+        out[head..].fill(0xFF);
+        out
+    }
+
+    /// The tile's merged chains as (lon, lat) of their first point, sorted.
+    fn starts(r: &MergedRoads) -> Vec<(i64, i64)> {
+        let mut out = vec![];
+        r.for_each_chain_near(46.0, 6.0, 47.0, 7.0, |c| {
+            let (x, y) = c.points().next().unwrap();
+            out.push(((x * 100.0).round() as i64, (y * 100.0).round() as i64));
+        });
+        out.sort();
+        out
     }
 
     /// install/ with scenery_packs listing High above Low, both with +46+006.
@@ -905,14 +1181,29 @@ pub(crate) mod tests {
         Arc::new(crate::cache::MemoryCacheProvider::new(64 << 20, None))
     }
 
-    fn config(probe_ms: u64, generate_ms: u64, delay_ms: u64) -> RoadServiceConfig {
+    fn config(probe_ms: u64, generate_ms: u64) -> RoadServiceConfig {
         RoadServiceConfig {
             probe_wait: Duration::from_millis(probe_ms),
             generate_wait: Duration::from_millis(generate_ms),
-            build_delay: Duration::from_millis(delay_ms),
             ..RoadServiceConfig::default()
         }
     }
+
+    /// `config` whose builds wait for the returned gate: each
+    /// `add_permits(1)` lets one build run.
+    fn gated(probe_ms: u64, generate_ms: u64) -> (RoadServiceConfig, Arc<Semaphore>) {
+        let gate = Arc::new(Semaphore::new(0));
+        let c = RoadServiceConfig {
+            gate: Some(Arc::clone(&gate)),
+            ..config(probe_ms, generate_ms)
+        };
+        (c, gate)
+    }
+
+    /// A wait long enough that a build never outlasts it: a test that
+    /// expects the roads waits this long and returns as soon as they are
+    /// ready.
+    const LONG: u64 = 10_000;
 
     /// A tile-cache budget that holds `tiles` test tiles of at most two
     /// chains of two points each, whatever a tile's fixed overhead is. The
@@ -996,7 +1287,7 @@ pub(crate) mod tests {
 
     #[test]
     fn purposes_have_their_own_waits_and_triggers() {
-        let c = config(10, 20, 0);
+        let c = config(10, 20);
         assert_eq!(c.wait(Purpose::Probe), Duration::from_millis(10));
         assert_eq!(c.wait(Purpose::Generate), Duration::from_millis(20));
         assert!(matches!(Purpose::Probe.trigger(), Trigger::Probe));
@@ -1044,11 +1335,207 @@ pub(crate) mod tests {
     async fn a_source_removed_since_the_index_was_built_is_skipped() {
         let t = install(None);
         let svc = RoadService::new(t.path().into(), vec![], None);
-        assert_eq!(svc.identities(TILE).await.len(), 2, "index built");
+        assert_eq!(svc.identities(TILE).await.unwrap().len(), 2, "index built");
         std::fs::remove_file(dsf(&t, "Low")).unwrap();
         let r = svc.footprint(&[TILE], Purpose::Probe).await;
         assert!(r.complete);
         assert_eq!(r.tiles[0].len(), 1);
+    }
+
+    // Overlays, base meshes and the fallback.
+
+    #[tokio::test]
+    async fn overlays_give_the_roads_and_a_base_mesh_is_read_only_to_its_header() {
+        // Past its HEAD the base mesh is garbage: reading on fails the tile.
+        let t = tempfile::tempdir().unwrap();
+        let base = past_head_garbage(base_mesh(6.8).bytes());
+        write_install(
+            t.path(),
+            TILE,
+            &[("Overlay", Some(high(None).bytes())), ("Mesh", Some(base))],
+        );
+        let svc = RoadService::new(t.path().into(), vec![], None);
+        let r = svc.footprint(&[TILE], Purpose::Probe).await;
+        assert!(r.complete, "the base mesh was not read past HEAD");
+        assert_eq!(
+            starts(&r.tiles[0]),
+            vec![(610, 4610)],
+            "the overlay's road only"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_overlay_roads_the_highest_base_mesh_with_a_network_is_merged_alone() {
+        let t = tempfile::tempdir().unwrap();
+        let mut no_network = Builder::new(46, 6);
+        no_network
+            .props
+            .push(("sim/exclude_obj".into(), "6/46/7/47".into()));
+        let mut bare_overlay = overlay(46, 6);
+        bare_overlay.nets.push("lib/g10/roads.net".into());
+        write_install(
+            t.path(),
+            TILE,
+            &[
+                ("Overlay", Some(bare_overlay.bytes())),
+                ("Ortho", Some(no_network.bytes())),
+                ("MeshA", Some(base_mesh(6.7).bytes())),
+                ("MeshB", Some(base_mesh(6.8).bytes())),
+            ],
+        );
+        let svc = RoadService::new(t.path().into(), vec![], None);
+        let r = svc.footprint(&[TILE], Purpose::Probe).await;
+        assert!(r.complete);
+        assert_eq!(starts(&r.tiles[0]), vec![(670, 4630)], "MeshA alone");
+    }
+
+    #[tokio::test]
+    async fn the_fallback_runs_when_every_overlay_chain_was_unlit_or_excluded() {
+        // The overlay's only road is unlit and its zone covers the west
+        // half: the merge is empty, so the base mesh is merged, under it.
+        let t = tempfile::tempdir().unwrap();
+        let mut o = overlay(46, 6);
+        o.props
+            .push(("sim/exclude_net".into(), "6/46/6.5/47".into()));
+        o.road(46, 6, 74, &[(6.1, 46.1), (6.2, 46.2)]);
+        let mut mesh = base_mesh(6.3);
+        mesh.road(46, 6, 30, &[(6.8, 46.3), (6.8, 46.4)]);
+        write_install(
+            t.path(),
+            TILE,
+            &[("Overlay", Some(o.bytes())), ("Mesh", Some(mesh.bytes()))],
+        );
+        let svc = RoadService::new(t.path().into(), vec![], None);
+        let r = svc.footprint(&[TILE], Purpose::Probe).await;
+        assert!(r.complete);
+        assert_eq!(starts(&r.tiles[0]), vec![(680, 4630)]);
+        assert_eq!(r.tiles[0].removed, 1, "the overlay's zone still applies");
+    }
+
+    #[tokio::test]
+    async fn a_covering_overlay_without_roads_leaves_the_base_mesh_unread() {
+        let t = tempfile::tempdir().unwrap();
+        let mut o = overlay(46, 6);
+        o.props.push(("sim/exclude_net".into(), "6/46/7/47".into()));
+        o.nets.push("lib/g10/roads.net".into());
+        // The mesh ranks above the overlay, so the overlay pass passes it
+        // over before the zone is known.
+        let base = past_head_garbage(base_mesh(6.8).bytes());
+        write_install(
+            t.path(),
+            TILE,
+            &[("Mesh", Some(base)), ("Overlay", Some(o.bytes()))],
+        );
+        let svc = RoadService::new(t.path().into(), vec![], None);
+        let r = svc.footprint(&[TILE], Purpose::Probe).await;
+        assert!(r.complete, "no fallback under a whole-tile zone");
+        assert!(r.tiles[0].is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_base_mesh_skipped_at_its_header_writes_no_entry() {
+        let t = tempfile::tempdir().unwrap();
+        write_install(
+            t.path(),
+            TILE,
+            &[
+                ("Overlay", Some(high(None).bytes())),
+                ("Mesh", Some(sevenz(&base_mesh(6.8).bytes()))),
+            ],
+        );
+        let d = disk();
+        let svc = RoadService::new(t.path().into(), vec![], Some(d.clone()));
+        assert!(svc.footprint(&[TILE], Purpose::Probe).await.complete);
+        assert_eq!(entries(&svc, &d).await, 0);
+        let s = svc.stats_snapshot();
+        assert_eq!((s.cache_hits, s.cache_misses), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_fallback_base_mesh_is_cached_and_read_back_once() {
+        let t = tempfile::tempdir().unwrap();
+        write_install(
+            t.path(),
+            TILE,
+            &[("Mesh", Some(sevenz(&base_mesh(6.8).bytes())))],
+        );
+        let d = disk();
+        let a = RoadService::new(t.path().into(), vec![], Some(d.clone()));
+        let first = a.footprint(&[TILE], Purpose::Probe).await;
+        assert_eq!(starts(&first.tiles[0]), vec![(680, 4630)]);
+        assert_eq!(entries(&a, &d).await, 1, "the fallback's extraction");
+        let s = a.stats_snapshot();
+        assert_eq!((s.cache_hits, s.cache_misses), (0, 1));
+        // Garbage of the same length and mtime: the entry still matches, and
+        // reading the file would fail the tile.
+        let path = dsf(&t, "Mesh");
+        let meta = std::fs::metadata(&path).unwrap();
+        std::fs::write(&path, vec![0u8; meta.len() as usize]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(meta.modified().unwrap())
+            .unwrap();
+        // The overlay pass finds the entry and the fallback merges it.
+        let b = RoadService::new(t.path().into(), vec![], Some(d));
+        let second = b.footprint(&[TILE], Purpose::Probe).await;
+        assert!(second.complete, "the file was not read");
+        assert_eq!(second.tiles[0], first.tiles[0]);
+        let s = b.stats_snapshot();
+        assert_eq!((s.cache_hits, s.cache_misses), (1, 0), "one disk read");
+    }
+
+    #[tokio::test]
+    async fn a_dsf_filed_under_another_tile_is_skipped() {
+        let t = tempfile::tempdir().unwrap();
+        let mut misnamed = overlay(47, 6);
+        misnamed.road(47, 6, 100, &[(6.1, 47.1), (6.2, 47.2)]);
+        write_install(
+            t.path(),
+            TILE,
+            &[
+                ("Wrong", Some(misnamed.bytes())),
+                ("Low", Some(low().bytes())),
+            ],
+        );
+        let svc = RoadService::new(t.path().into(), vec![], None);
+        let r = svc.footprint(&[TILE], Purpose::Probe).await;
+        assert!(r.complete, "not a failure");
+        assert_eq!(
+            starts(&r.tiles[0]),
+            vec![(650, 4650)],
+            "the right tile's roads only"
+        );
+    }
+
+    // Hints.
+
+    #[tokio::test]
+    async fn dsf_hints_are_ignored_past_the_backlog_but_probes_are_not() {
+        let t = install(None);
+        let (c, _gate) = gated(30, LONG);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        // The gate stays shut, so every build stays pending.
+        let tiles: Vec<Tile> = (0..ROAD_HINT_BACKLOG as i32 + 1).map(|k| (10, k)).collect();
+        for &tile in &tiles {
+            svc.ensure(tile, Trigger::DsfOpen);
+        }
+        assert_eq!(svc.pending.len(), ROAD_HINT_BACKLOG);
+        let last = *tiles.last().unwrap();
+        assert!(
+            !svc.pending.contains_key(&last),
+            "the hint past the backlog"
+        );
+        svc.ensure(tiles[0], Trigger::DsfOpen);
+        assert_eq!(
+            svc.pending.len(),
+            ROAD_HINT_BACKLOG,
+            "a pending tile is no new build"
+        );
+        let r = svc.footprint(&[last], Purpose::Probe).await;
+        assert!(r.timed_out, "the probe started its build and waited");
+        assert!(svc.pending.contains_key(&last));
     }
 
     // Failure.
@@ -1070,7 +1557,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_failed_tile_answers_at_once_and_incomplete_later() {
         let t = install_with(high(None).bytes(), b"garbage".to_vec());
-        let svc = RoadService::with_config(t.path().into(), vec![], None, config(5_000, 5_000, 0));
+        let svc = RoadService::with_config(t.path().into(), vec![], None, config(LONG, LONG));
         assert!(!svc.footprint(&[TILE], Purpose::Probe).await.complete);
         let started = Instant::now();
         let r = svc.footprint(&[TILE], Purpose::Generate).await;
@@ -1111,7 +1598,7 @@ pub(crate) mod tests {
         let first = a.footprint(&[TILE], Purpose::Probe).await;
         assert_eq!(a.stats_snapshot().cache_misses, 1);
         assert_eq!(entries(&a, &d).await, 1, "only the 7z DSF");
-        let id = &a.identities(TILE).await[0];
+        let id = &a.identities(TILE).await.unwrap()[0];
         let entry = d.get(&cache_key(TILE, &id.path)).await.unwrap().unwrap();
         assert_eq!(&entry[..4], crate::cache::integrity::LIT_ENTRY_MAGIC);
 
@@ -1146,17 +1633,56 @@ pub(crate) mod tests {
     async fn identities_are_ordered_cached_and_change_with_the_file() {
         let t = install(None);
         let svc = RoadService::new(t.path().into(), vec![], None);
-        let a = svc.identities(TILE).await;
+        let a = svc.identities(TILE).await.unwrap();
         assert_eq!(a.len(), 2);
         assert!(a[0].path.contains("High"));
         assert!(a[1].path.contains("Low"));
         std::fs::write(dsf(&t, "Low"), b"changed length").unwrap();
-        assert_eq!(svc.identities(TILE).await, a, "cached for the session");
+        assert_eq!(
+            svc.identities(TILE).await,
+            Some(a.clone()),
+            "cached for the session"
+        );
         let fresh = RoadService::new(t.path().into(), vec![], None);
-        let b = fresh.identities(TILE).await;
+        let b = fresh.identities(TILE).await.unwrap();
         assert_ne!(a, b);
         assert_eq!(a[0], b[0]);
-        assert!(fresh.identities((10, 10)).await.is_empty());
+        assert!(fresh.identities((10, 10)).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_source_gone_since_the_index_was_built_is_left_out_of_the_identities() {
+        let t = install(None);
+        let svc = RoadService::new(t.path().into(), vec![], None);
+        assert!(svc.identities((10, 10)).await.is_some(), "index built");
+        std::fs::remove_file(dsf(&t, "Low")).unwrap();
+        let ids = svc.identities(TILE).await.unwrap();
+        assert_eq!(ids.len(), 1);
+        assert!(ids[0].path.contains("High"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identities_fail_when_a_source_cannot_be_stated() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = install(None);
+        let svc = RoadService::new(t.path().into(), vec![], None);
+        assert!(svc.identities((10, 10)).await.is_some(), "index built");
+        let block = dsf(&t, "Low").parent().unwrap().to_path_buf();
+        let mode = |m| std::fs::set_permissions(&block, std::fs::Permissions::from_mode(m));
+        mode(0o000).unwrap();
+        if std::fs::metadata(dsf(&t, "Low")).is_ok() {
+            mode(0o755).unwrap();
+            return; // root: permissions do not apply
+        }
+        let failed = svc.identities(TILE).await;
+        mode(0o755).unwrap();
+        assert_eq!(failed, None, "not a tile without that DSF");
+        assert_eq!(
+            svc.identities(TILE).await.unwrap().len(),
+            2,
+            "a failed pass is not kept"
+        );
     }
 
     // Coalescing, readiness and the cache.
@@ -1164,10 +1690,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn concurrent_footprints_build_a_tile_once() {
         let t = install(None);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, config(5_000, 5_000, 30));
-        let (a, b) = tokio::join!(
+        let (c, gate) = gated(LONG, LONG);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        // Both callers are waiting on the build before the gate opens.
+        let (a, b, ()) = tokio::join!(
             svc.footprint(&[TILE], Purpose::Probe),
-            svc.footprint(&[TILE], Purpose::Generate)
+            svc.footprint(&[TILE], Purpose::Generate),
+            async { gate.add_permits(1) }
         );
         assert!(a.complete && b.complete);
         assert!(Arc::ptr_eq(&a.tiles[0], &b.tiles[0]));
@@ -1177,13 +1706,16 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn callers_that_stop_waiting_share_one_build_and_never_cancel_it() {
         let t = install(None);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, config(30, 30, 150));
+        let (c, gate) = gated(30, 30);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        // The gate is shut: both callers give up on a build still waiting.
         assert!(!svc.footprint(&[TILE], Purpose::Probe).await.complete);
         assert!(!svc.footprint(&[TILE], Purpose::Generate).await.complete);
         svc.ensure(TILE, Trigger::DsfOpen);
         let a = svc.start(TILE, Trigger::Probe).unwrap();
         assert!(a.ptr_eq(&svc.start(TILE, Trigger::Generate).unwrap()));
         assert_eq!(svc.pending.len(), 1, "one build in flight");
+        gate.add_permits(1);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !svc.is_ready(TILE) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1201,7 +1733,7 @@ pub(crate) mod tests {
         let t = tempfile::tempdir().unwrap();
         let tiles = [(46, 6), (47, 6), (48, 6), (49, 6), (50, 6)];
         for &(lat, lon) in &tiles {
-            let mut b = Builder::new(lat, lon);
+            let mut b = overlay(lat, lon);
             let (x, y) = (f64::from(lon), f64::from(lat));
             b.road(lat, lon, 100, &[(x + 0.1, y + 0.1), (x + 0.2, y + 0.2)]);
             write_install(t.path(), (lat, lon), &[("High", Some(sevenz(&b.bytes())))]);
@@ -1209,7 +1741,7 @@ pub(crate) mod tests {
         let d = disk();
         let c = RoadServiceConfig {
             extract_permits: 1,
-            ..config(5_000, 5_000, 0)
+            ..config(LONG, LONG)
         };
         let svc = RoadService::with_config(t.path().into(), vec![], Some(d.clone()), c);
         for &tile in &tiles {
@@ -1239,9 +1771,9 @@ pub(crate) mod tests {
     async fn the_tile_cache_evicts_by_weight_and_rebuilds() {
         let t = install(None);
         let other = (47, 6);
-        let mut h = Builder::new(47, 6);
+        let mut h = overlay(47, 6);
         h.road(47, 6, 100, &[(6.1, 47.1), (6.2, 47.2)]);
-        let mut l = Builder::new(47, 6);
+        let mut l = overlay(47, 6);
         l.road(47, 6, 50, &[(6.5, 47.5), (6.6, 47.6)]);
         write_install(
             t.path(),
@@ -1251,7 +1783,7 @@ pub(crate) mod tests {
         let budget = budget_for(1);
         let c = RoadServiceConfig {
             tile_cache_bytes: budget,
-            ..config(5_000, 5_000, 0)
+            ..config(LONG, LONG)
         };
         let svc = RoadService::with_config(t.path().into(), vec![], None, c);
         let a = svc.footprint(&[TILE], Purpose::Probe).await;
@@ -1280,13 +1812,13 @@ pub(crate) mod tests {
         // cache is full and rebuild it on every request.
         let t = install(None);
         let other = (47, 6);
-        let mut h = Builder::new(47, 6);
+        let mut h = overlay(47, 6);
         h.road(47, 6, 100, &[(6.1, 47.1), (6.2, 47.2)]);
         write_install(t.path(), other, &[("High", Some(h.bytes()))]);
         let budget = budget_for(1);
         let c = RoadServiceConfig {
             tile_cache_bytes: budget,
-            ..config(5_000, 5_000, 0)
+            ..config(LONG, LONG)
         };
         let svc = RoadService::with_config(t.path().into(), vec![], None, c);
         let mut old = 0;
@@ -1305,18 +1837,28 @@ pub(crate) mod tests {
         assert!(!svc.is_ready(TILE));
     }
 
-    // Per-tile deadlines.
+    // Per-build deadlines.
 
     #[tokio::test]
     async fn a_probe_after_the_first_probes_deadline_does_not_wait() {
         let t = install(None);
-        let svc =
-            RoadService::with_config(t.path().into(), vec![], None, config(100, 5_000, 2_000));
+        let wait = Duration::from_millis(500);
+        let (c, _gate) = gated(500, LONG);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        // The gate stays shut: the build outlasts every deadline.
         let first = svc.footprint(&[TILE], Purpose::Probe).await;
-        assert!(!first.complete);
+        assert!(!first.complete && first.timed_out);
+        let deadline = *svc.deadlines.get(&(TILE, Purpose::Probe)).unwrap();
         let started = Instant::now();
         let second = svc.footprint(&[TILE], Purpose::Probe).await;
-        assert!(started.elapsed() < Duration::from_millis(250));
+        // A wait of its own would last the whole probe wait; the margin is
+        // that wait, far above any scheduling delay.
+        assert!(started.elapsed() < wait);
+        assert_eq!(
+            *svc.deadlines.get(&(TILE, Purpose::Probe)).unwrap(),
+            deadline,
+            "the build's deadline, not a new one"
+        );
         assert!(!second.complete);
         assert!(second.timed_out, "still building past its deadline");
         assert!(second.tiles.is_empty());
@@ -1326,31 +1868,33 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_probe_during_the_build_waits_only_the_remaining_time() {
         let t = install(None);
-        let wait = Duration::from_millis(200);
-        let svc =
-            RoadService::with_config(t.path().into(), vec![], None, config(200, 5_000, 2_000));
-        let t0 = Instant::now();
+        let wait = Duration::from_millis(1_000);
+        let (c, _gate) = gated(1_000, LONG);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
         let s = Arc::clone(&svc);
         let first = tokio::spawn(async move { s.footprint(&[TILE], Purpose::Probe).await });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The second probe asks 400 ms after the first: had it a wait of its
+        // own, it would end 400 ms after the build's deadline.
+        tokio::time::sleep(Duration::from_millis(400)).await;
         let started = Instant::now();
         let second = svc.footprint(&[TILE], Purpose::Probe).await;
         let ended = Instant::now();
-        assert!(!second.complete);
-        assert!(
-            ended >= t0 + wait,
-            "waited until the first probe's deadline"
-        );
-        assert!(ended - started < wait, "not a wait of its own");
+        let deadline = *svc.deadlines.get(&(TILE, Purpose::Probe)).unwrap();
+        assert!(!second.complete && second.timed_out);
+        assert!(ended >= deadline, "waited until the build's deadline");
+        assert!(ended < started + wait, "not a wait of its own");
         assert!(!first.await.unwrap().complete);
     }
 
     #[tokio::test]
     async fn probe_and_generate_deadlines_are_independent() {
         let t = install(None);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, config(30, 5_000, 200));
+        let (c, gate) = gated(30, LONG);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
         assert!(!svc.footprint(&[TILE], Purpose::Probe).await.complete);
-        let r = svc.footprint(&[TILE], Purpose::Generate).await;
+        let (r, ()) = tokio::join!(svc.footprint(&[TILE], Purpose::Generate), async {
+            gate.add_permits(1)
+        });
         assert!(r.complete, "the generate wait is its own");
         assert!(
             svc.footprint(&[TILE], Purpose::Probe).await.complete,
@@ -1358,12 +1902,66 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_evicted_tile_asked_for_after_its_first_deadline_is_waited_for() {
+        let t = install(None);
+        let (c, gate) = gated(LONG, LONG);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let (first, ()) = tokio::join!(svc.footprint(&[TILE], Purpose::Probe), async {
+            gate.add_permits(1)
+        });
+        assert!(first.complete);
+        // Its first build's deadline has passed, and the tile is evicted.
+        svc.deadlines.insert((TILE, Purpose::Probe), Instant::now());
+        svc.tiles.invalidate(&TILE).await;
+        assert!(!svc.is_ready(TILE));
+        let (again, ()) = tokio::join!(svc.footprint(&[TILE], Purpose::Probe), async {
+            gate.add_permits(1)
+        });
+        assert!(
+            again.complete && !again.timed_out,
+            "the rebuild is waited for"
+        );
+        assert_eq!(again.tiles[0].len(), 2);
+        assert_eq!(svc.stats_snapshot().tiles_ready, 2, "rebuilt");
+    }
+
+    #[tokio::test]
+    async fn a_build_that_resolved_as_the_deadline_passed_is_not_a_timeout() {
+        let t = install(None);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, config(LONG, LONG));
+        let tile = (10, 10);
+        let roads = Arc::new(MergedRoads::empty(tile));
+        let done = Some(Arc::clone(&roads));
+        // A finished build whose tile is not (or no longer) in the cache,
+        // its deadline already past.
+        svc.pending
+            .insert(tile, futures::future::ready(done).boxed().shared());
+        svc.deadlines.insert((tile, Purpose::Probe), Instant::now());
+        let r = svc.footprint(&[tile], Purpose::Probe).await;
+        assert!(r.complete && !r.timed_out);
+        assert!(Arc::ptr_eq(&r.tiles[0], &roads));
+        assert_eq!(svc.stats_snapshot().probe_timeouts, 0);
+    }
+
+    #[test]
+    fn a_settled_build_is_its_answer_and_a_running_one_a_timeout() {
+        let roads = Arc::new(MergedRoads::empty(TILE));
+        let ready: Pending = futures::future::ready(Some(roads)).boxed().shared();
+        assert!(matches!(settled(&ready), TileWait::Ready(_)));
+        let failed: Pending = futures::future::ready(None).boxed().shared();
+        assert!(matches!(settled(&failed), TileWait::Failed));
+        let running: Pending = futures::future::pending().boxed().shared();
+        assert!(matches!(settled(&running), TileWait::TimedOut));
+    }
+
     // Instrumentation.
 
     #[tokio::test]
     async fn a_footprint_past_a_building_tiles_deadline_times_out() {
         let t = install(None);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, config(30, 5_000, 300));
+        let (c, _gate) = gated(30, LONG);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
         let r = svc.footprint(&[TILE], Purpose::Probe).await;
         assert!(!r.complete && r.timed_out);
         let s = svc.stats_snapshot();
@@ -1375,7 +1973,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn generate_waits_and_timeouts_are_counted_apart() {
         let t = install(None);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, config(5_000, 30, 300));
+        let (c, _gate) = gated(LONG, 30);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
         assert!(svc.footprint(&[TILE], Purpose::Generate).await.timed_out);
         let s = svc.stats_snapshot();
         assert_eq!((s.generate_waits, s.generate_timeouts), (1, 1));
@@ -1385,8 +1984,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_wait_that_ends_ready_is_a_wait_and_no_timeout() {
         let t = install(None);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, config(5_000, 5_000, 30));
-        let r = svc.footprint(&[TILE], Purpose::Probe).await;
+        let (c, gate) = gated(LONG, LONG);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let (r, ()) = tokio::join!(svc.footprint(&[TILE], Purpose::Probe), async {
+            gate.add_permits(1)
+        });
         assert!(r.complete && !r.timed_out);
         assert!(svc.footprint(&[TILE], Purpose::Probe).await.complete);
         let s = svc.stats_snapshot();
@@ -1441,7 +2043,7 @@ pub(crate) mod tests {
         let t = install(None);
         let svc = RoadService::new(t.path().into(), vec![], None);
         let _ = tokio::time::timeout(Duration::ZERO, svc.identities(TILE)).await;
-        assert_eq!(svc.identities(TILE).await.len(), 2);
+        assert_eq!(svc.identities(TILE).await.unwrap().len(), 2);
         assert_eq!(svc.test.index_builds.load(Ordering::SeqCst), 1);
     }
 
@@ -1450,7 +2052,7 @@ pub(crate) mod tests {
         let t = install(None);
         let svc = RoadService::new(t.path().into(), vec![], None);
         let (a, b) = tokio::join!(svc.identities(TILE), svc.identities(TILE));
-        assert!(Arc::ptr_eq(&a, &b));
+        assert!(Arc::ptr_eq(&a.unwrap(), &b.unwrap()));
         assert_eq!(svc.test.identity_passes.load(Ordering::SeqCst), 1);
     }
 
