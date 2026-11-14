@@ -1368,7 +1368,7 @@ mod tests {
                 });
             let texels = f64::from(size * size);
             println!(
-                "{label} {}_{}_ZL{} ({} tiles, {} merged chains): {} segments, \
+                "{label} {}_{}_ZL{} ({} tiles, {} merged segments): {} segments rastered, \
                  {} road texels ({:.1}% of the texture); lit texels {} without roads, {} with; \
                  pixels {:016x} without roads, {:016x} with",
                 n.row,

@@ -1612,10 +1612,12 @@ pub(crate) mod tests {
                 .try_init();
         }
 
-        /// `tiles` made ready for generation, and the wall time in ms.
+        /// `tiles` made ready for generation, and the wall time in ms. Every
+        /// tile must be ready, or the numbers measure nothing.
         async fn ready(svc: &Arc<RoadService>, tiles: &[Tile]) -> (FootprintRoads, f64) {
             let started = Instant::now();
             let roads = svc.footprint(tiles, Purpose::Generate).await;
+            assert!(roads.complete, "every tile ready");
             (roads, started.elapsed().as_secs_f64() * 1e3)
         }
 
@@ -1695,7 +1697,7 @@ pub(crate) mod tests {
                     let r = &roads.tiles[0];
                     println!(
                         "{label}: tile {tile:?} cold {ms:.1} ms, {considered} sources, \
-                         {} merged chains, {} removed, {} bytes ({})",
+                         {} merged segments, {} removed, {} bytes ({})",
                         r.len(),
                         r.removed,
                         r.bytes(),
@@ -1739,15 +1741,16 @@ pub(crate) mod tests {
                 .count();
             let ns = started.elapsed().as_nanos() as f64 / boxes.len() as f64;
             println!(
-                "crosses on Tokyo ({} chains): {ns:.0} ns per call, {crossed} of {} crossed",
+                "crosses on Tokyo ({} merged segments): {ns:.0} ns per call, {crossed} of {} crossed",
                 tokyo.len(),
                 boxes.len()
             );
         }
 
         /// Geneva without its simHeaven packs falls back to the packs below
-        /// and Global Scenery's 7z mesh: cold (decompression), then a second
-        /// service reading the same disk tier.
+        /// and Global Scenery's 7z mesh: cold (decompression, a cache miss
+        /// that writes the mesh's entry), then a second service reading the
+        /// same disk tier (hits only).
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         #[ignore]
         async fn global_scenery_fallback_for_geneva() {
@@ -1767,7 +1770,7 @@ pub(crate) mod tests {
                 svc.writes_settled().await;
                 let s = svc.stats_snapshot();
                 println!(
-                    "{pass}: {ms:.1} ms, {} sources, {} merged chains, {} bytes, \
+                    "{pass}: {ms:.1} ms, {} sources, {} merged segments, {} bytes, \
                      cache hits {}, misses {}",
                     sources.len(),
                     r.len(),
@@ -1780,6 +1783,20 @@ pub(crate) mod tests {
                     if let Some(entry) = d.get(&key).await.unwrap() {
                         println!("  entry {} for {}", entry.len(), path.display());
                     }
+                }
+                // Global Scenery is the last source, and it was read: only
+                // a read 7z leaves an entry.
+                let global = sources.last().expect("Geneva has sources");
+                assert!(
+                    global.starts_with(Path::new(INSTALL).join("Global Scenery")),
+                    "{}",
+                    global.display()
+                );
+                let key = cache_key(GENEVA, &global.to_string_lossy());
+                assert!(d.get(&key).await.unwrap().is_some(), "the mesh was read");
+                match pass {
+                    "cold" => assert!(s.cache_misses > 0, "the cold pass decompressed"),
+                    _ => assert_eq!(s.cache_misses, 0, "the warm pass read entries only"),
                 }
             }
         }
