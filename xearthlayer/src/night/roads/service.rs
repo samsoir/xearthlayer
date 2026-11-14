@@ -705,8 +705,8 @@ impl RoadService {
         let index = self.index().await;
         index
             .sources(tile.0, tile.1)
-            .iter()
-            .map(|s| s.path.clone())
+            .into_iter()
+            .map(|s| s.path)
             .collect()
     }
 
@@ -731,6 +731,7 @@ impl RoadService {
                     enabled = s.enabled,
                     dsfs = s.dsfs,
                     tiles = s.tiles,
+                    bytes = index.bytes(),
                     ms = s.ms,
                     "Night roads: pack index built"
                 );
@@ -1670,12 +1671,18 @@ pub(crate) mod tests {
             print_road_events();
             let index = tokio::task::spawn_blocking(|| {
                 let started = Instant::now();
-                let (_, s) = PackIndex::build(Path::new(INSTALL), &xel_mounts());
-                (s, started.elapsed().as_secs_f64() * 1e3)
+                let (idx, s) = PackIndex::build(Path::new(INSTALL), &xel_mounts());
+                (s, idx.bytes(), started.elapsed().as_secs_f64() * 1e3)
             })
             .await
             .unwrap();
-            println!("pack index, built alone: {:?}, {:.1} ms", index.0, index.1);
+            println!(
+                "pack index, built alone: {:?}, {} bytes ({}), {:.1} ms",
+                index.0,
+                index.1,
+                mib(index.1 as f64),
+                index.2
+            );
 
             let mut tokyo = None;
             for (label, disk) in [("no disk tier", None), ("disk tier", Some(memory_disk()))] {
@@ -1777,24 +1784,6 @@ pub(crate) mod tests {
             }
         }
 
-        /// About what the pack index holds: every source's path and entry,
-        /// and an entry per tile.
-        fn index_bytes(index: &PackIndex) -> usize {
-            let entry = std::mem::size_of::<crate::night::roads::packs::DsfSource>();
-            let tile = std::mem::size_of::<(Tile, Vec<PathBuf>)>();
-            (-90..90)
-                .flat_map(|lat| (-180..180).map(move |lon| (lat, lon)))
-                .map(|(lat, lon)| index.sources(lat, lon))
-                .filter(|s| !s.is_empty())
-                .map(|s| {
-                    tile + s
-                        .iter()
-                        .map(|d| entry + d.path.as_os_str().len())
-                        .sum::<usize>()
-                })
-                .sum()
-        }
-
         /// Returns freed memory the allocator still holds to the system, so
         /// what remains resident is live.
         fn trim() {
@@ -1805,20 +1794,36 @@ pub(crate) mod tests {
             }
         }
 
+        /// Starts rayon's global pool. `run` has it running long before a
+        /// road tile is asked for (the ortho union index and the cache
+        /// scans use it), so its threads are not the pack index's cost.
+        fn warm_rayon() {
+            use rayon::prelude::*;
+            let n: usize = (0..100_000usize)
+                .into_par_iter()
+                .map(|k| std::hint::black_box(vec![k as u8; 64]).len())
+                .sum();
+            std::hint::black_box(n);
+        }
+
         /// Resident memory around building the pack index and readying the
         /// 3 x 3 tiles centred on `centre`, then after the service is
         /// dropped, and after the allocator gives back what it holds free.
-        /// The allocator is configured as `run` configures it.
+        /// The allocator is configured as `run` configures it, and rayon's
+        /// pool is already running.
         async fn memory_of_a_block(centre: Tile) {
             if !installed() {
                 return;
             }
             crate::metrics::configure_allocator();
+            warm_rayon();
+            // And a blocking-pool thread, which `run` has too.
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
             let start = resident();
             let svc = service(xel_mounts(), None);
             ready(&svc, &[OCEAN]).await;
             let indexed = resident();
-            let index = index_bytes(&*svc.index().await);
+            let index = svc.index().await.bytes();
             let tiles: Vec<Tile> = (-1..=1)
                 .flat_map(|a| (-1..=1).map(move |b| (centre.0 + a, centre.1 + b)))
                 .collect();
@@ -1836,7 +1841,7 @@ pub(crate) mod tests {
             let trimmed = resident();
             println!(
                 "3 x 3 around {centre:?}: ready in {ms:.0} ms; merged {} (tile cache holds {}); \
-                 pack index about {}; resident: start {}, pack index +{}, tiles +{}, \
+                 pack index {}; resident: start {}, pack index +{}, tiles +{}, \
                  after drop +{} over start, after trim +{}; peak {}",
                 mib(merged as f64),
                 mib(held as f64),
