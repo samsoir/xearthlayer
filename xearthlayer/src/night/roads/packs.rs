@@ -41,6 +41,13 @@ impl PackIndex {
     /// Lists the DSFs of the enabled packs of `install`, then Global
     /// Scenery. `skip` holds packs to leave out (XEL's own FUSE mounts).
     /// Only directories are read: no DSF is opened or stat'ed.
+    ///
+    /// A pack is left out when its resolved root equals a `skip` path
+    /// (trailing separators ignored), or when its ini entry is a relative
+    /// path inside the install and its folder name equals a `skip` path's
+    /// folder name. The name rule covers a mount point spelled with another
+    /// prefix (symlink, case); an absolute entry elsewhere that happens to
+    /// share the name is kept, because XEL's mounts live in `Custom Scenery`.
     pub fn build(install: &Path, skip: &[PathBuf]) -> (Self, PackIndexStats) {
         let started = Instant::now();
         let ini = install.join("Custom Scenery").join(SCENERY_PACKS_FILE);
@@ -51,8 +58,10 @@ impl PackIndex {
         let mut roots: Vec<PathBuf> = entries
             .iter()
             .filter(|e| e.enabled)
-            .map(|e| pack_root(install, &e.path))
-            .filter(|p| !skip.iter().any(|s| s == p))
+            .filter_map(|e| {
+                let root = pack_root(install, &e.path);
+                (!is_skipped(&e.path, &root, skip)).then_some(root)
+            })
             .collect();
         let enabled = roots.len();
         roots.push(
@@ -88,6 +97,18 @@ impl PackIndex {
     pub fn sources(&self, lat: i32, lon: i32) -> &[DsfSource] {
         self.tiles.get(&(lat, lon)).map_or(&[], Vec::as_slice)
     }
+}
+
+/// Whether the pack of ini `entry` (resolving to `root`) is one of `skip`.
+fn is_skipped(entry: &str, root: &Path, skip: &[PathBuf]) -> bool {
+    let entry = entry.trim();
+    let inside_install = entry != GLOBAL_AIRPORTS && !Path::new(entry).is_absolute();
+    skip.iter().any(|s| {
+        // `Path` equality compares components, so separators at the end
+        // never matter.
+        root == s.as_path()
+            || (inside_install && s.file_name().is_some() && root.file_name() == s.file_name())
+    })
 }
 
 /// The folder a `scenery_packs.ini` path names.
@@ -227,5 +248,65 @@ mod tests {
         let (idx, stats) = PackIndex::build(i, &[]);
         assert_eq!(idx.sources(46, 6).len(), 1);
         assert_eq!(stats.dsfs, 1);
+    }
+
+    /// An ini listing of `entries` (all enabled) for an install in `i`.
+    fn write_ini(i: &std::path::Path, entries: &[String]) {
+        std::fs::create_dir_all(i.join("Custom Scenery")).unwrap();
+        let mut text = String::from("I\n1000 Version\nSCENERY\n\n");
+        for e in entries {
+            text.push_str(&format!("SCENERY_PACK {e}\n"));
+        }
+        std::fs::write(i.join("Custom Scenery/scenery_packs.ini"), text).unwrap();
+    }
+
+    const DSF: &str = "Earth nav data/+40+000/+46+006.dsf";
+
+    #[test]
+    fn a_skip_path_spelled_with_trailing_separators_still_skips() {
+        let t = tempfile::tempdir().unwrap();
+        let i = t.path();
+        write_ini(i, &["Custom Scenery/zzXEL_ortho/".into()]);
+        touch(&i.join(format!("Custom Scenery/zzXEL_ortho/{DSF}")));
+        let skip = PathBuf::from(format!("{}/Custom Scenery/zzXEL_ortho//", i.display()));
+        let (idx, stats) = PackIndex::build(i, &[skip]);
+        assert!(idx.sources(46, 6).is_empty());
+        assert_eq!(stats.enabled, 0);
+    }
+
+    #[test]
+    fn a_relative_pack_is_skipped_by_folder_name_when_the_prefix_differs() {
+        let t = tempfile::tempdir().unwrap();
+        let i = t.path();
+        write_ini(i, &["Custom Scenery/zzXEL_ortho/".into()]);
+        touch(&i.join(format!("Custom Scenery/zzXEL_ortho/{DSF}")));
+        // The mount manager's spelling of the same folder: another prefix.
+        let skip = PathBuf::from("/somewhere/else/entirely/zzXEL_ortho");
+        let (idx, stats) = PackIndex::build(i, &[skip]);
+        assert!(idx.sources(46, 6).is_empty());
+        assert_eq!(stats.enabled, 0);
+    }
+
+    #[test]
+    fn an_absolute_pack_with_the_same_folder_name_is_not_skipped_by_name() {
+        let t = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let i = t.path();
+        let pack = elsewhere.path().join("zzXEL_ortho");
+        write_ini(i, &[format!("{}/", pack.display())]);
+        touch(&pack.join(DSF));
+        let (idx, stats) = PackIndex::build(i, &[i.join("Custom Scenery/zzXEL_ortho")]);
+        assert_eq!(idx.sources(46, 6).len(), 1);
+        assert_eq!(stats.enabled, 1);
+    }
+
+    #[test]
+    fn a_skip_path_does_not_skip_a_pack_with_another_name() {
+        let t = tempfile::tempdir().unwrap();
+        let i = t.path();
+        write_ini(i, &["Custom Scenery/Other/".into()]);
+        touch(&i.join(format!("Custom Scenery/Other/{DSF}")));
+        let (idx, _) = PackIndex::build(i, &[i.join("Custom Scenery/zzXEL_ortho")]);
+        assert_eq!(idx.sources(46, 6).len(), 1);
     }
 }
