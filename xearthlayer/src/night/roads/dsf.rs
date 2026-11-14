@@ -1,23 +1,50 @@
-//! Pure DSF reader for road networks. Reads the HEAD properties (corner,
-//! overlay, `sim/exclude_net`), the NETW definition, the 32-bit point pools
-//! and the command stream, keeping the network segments whose subtype
-//! `keep` accepts. Every command is sized, so the others are skipped
-//! byte-exactly.
+//! Streaming DSF reader for road networks. Reads the HEAD properties
+//! (corner, overlay, `sim/exclude_net`), the NETW definition, the 32-bit
+//! point pools and the command stream, keeping the network segments whose
+//! subtype `keep` accepts. Every command is sized, so the others are
+//! skipped byte-exactly.
+//!
+//! The reader is forward-only and keeps only what roads need: 16-bit
+//! pools, rasters and any other atom are read past without buffering, a
+//! DSF without a network stops after HEAD and DEFN, and one with a network
+//! stops once GEOD and CMDS are read. [`read_dsf_file`] streams a raw file
+//! or the single entry of a 7z, so decompression stops where reading does.
 //!
 //! Layout: `XPLNEDSF`, `u32 1`, atoms (`u32 id, u32 size` with the size
 //! counting the 8 header bytes; ids are the letters packed big-endian and
 //! stored little-endian), then a 16-byte MD5 footer. A PO32 atom is
 //! `u32 count, u8 planes`, then per plane `u8 encoding` and its data; the
-//! matching SC32 holds `(f32 scale, f32 offset)` per plane.
+//! matching SC32 (the i-th SC32 pairs with the i-th PO32) holds
+//! `(f32 scale, f32 offset)` per plane.
 
-use std::io::{Cursor, Read};
+use std::fs::File;
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::path::Path;
 
 use super::exclusion::Exclusion;
 
 pub const MAX_DSF_BYTES: usize = 512 * 1024 * 1024;
+/// Ceiling on any one atom body the reader keeps (HEAD, DEFN, a PO32, an
+/// SC32, CMDS), checked before anything is allocated for it.
+pub const MAX_RETAINED_ATOM_BYTES: u64 = 256 * 1024 * 1024;
+/// Ceiling on the points of all PO32 pools of one DSF: 24 times the 2.7
+/// million of X-World Pro's `+46+006`. It also keeps the walk budget, and
+/// so every point index in [`Chains`], below 2^32.
+const MAX_POOL_POINTS: usize = 1 << 26;
+/// Chain indices a walk may visit beyond 4 per pool point. A real DSF
+/// visits about one index per pool point.
+const WALK_SLACK: u64 = 65_536;
+/// Retained bodies are read in steps of this many bytes, so a declared
+/// size never allocates far ahead of the bytes that arrive.
+const RETAIN_STEP: u64 = 16 * 1024 * 1024;
+/// Most values one byte of a run-length plane can expand to: a 5-byte
+/// repeat run holds 127.
+const RLE_VALUES_PER_BYTE: usize = 26;
+
 const SEVENZ_MAGIC: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 const COOKIE: &[u8; 8] = b"XPLNEDSF";
-const FOOTER: usize = 16;
+const HEADER: u64 = 12;
+const FOOTER: u64 = 16;
 
 const HEAD: u32 = 0x4845_4144;
 const PROP: u32 = 0x5052_4F50;
@@ -44,12 +71,14 @@ pub enum DsfError {
     Archive(String),
     #[error("DSF larger than the ceiling")]
     TooLarge,
+    #[error("I/O: {0}")]
+    Io(String),
 }
 
 /// Road segments as flat point arrays. `lon`/`lat` are degrees east/north
 /// of the tile's west/south corner; segment `i` owns points
 /// `start[i]..start[i + 1]`, so `start` has one entry more than `subtype`.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Chains {
     pub lon: Vec<f32>,
     pub lat: Vec<f32>,
@@ -57,11 +86,19 @@ pub struct Chains {
     pub subtype: Vec<u8>,
 }
 
+impl Default for Chains {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Chains {
     pub fn new() -> Self {
         Self {
+            lon: vec![],
+            lat: vec![],
             start: vec![0],
-            ..Default::default()
+            subtype: vec![],
         }
     }
 
@@ -78,9 +115,6 @@ impl Chains {
     }
 
     pub fn push(&mut self, subtype: u8, pts: &[(f32, f32)]) {
-        if self.start.is_empty() {
-            self.start.push(0);
-        }
         for &(x, y) in pts {
             self.lon.push(x);
             self.lat.push(y);
@@ -91,9 +125,6 @@ impl Chains {
 
     /// Appends chain `i` of `src` without building an intermediate point list.
     pub fn push_from(&mut self, src: &Chains, i: usize) {
-        if self.start.is_empty() {
-            self.start.push(0);
-        }
         let r = src.points(i);
         self.lon.extend_from_slice(&src.lon[r.clone()]);
         self.lat.extend_from_slice(&src.lat[r]);
@@ -117,36 +148,248 @@ pub struct DsfRoads {
     pub chains: Chains,
 }
 
-/// The DSF inside a 7z container, or `bytes` unchanged when not 7z.
-pub fn unwrap_7z(bytes: Vec<u8>) -> Result<Vec<u8>, DsfError> {
-    if !bytes.starts_with(&SEVENZ_MAGIC) {
-        return Ok(bytes);
-    }
-    let err = |e: sevenz_rust2::Error| DsfError::Archive(e.to_string());
+/// What reading one DSF file cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DsfFileStats {
+    /// Size of the file on disk.
+    pub file_bytes: u64,
+    /// Whether it is a 7z container.
+    pub compressed: bool,
+    /// DSF bytes (decompressed for a 7z) the reader consumed.
+    pub read_bytes: u64,
+}
+
+/// Reads the roads of the DSF at `path`, raw or the first file of a 7z,
+/// without holding the file or the decompressed DSF in memory.
+pub fn read_dsf_file(
+    path: &Path,
+    keep: impl Fn(u8) -> bool,
+) -> Result<(DsfRoads, DsfFileStats), DsfError> {
+    let mut file = File::open(path).map_err(io_error)?;
+    let file_bytes = file.metadata().map_err(io_error)?.len();
+    let mut magic = Vec::with_capacity(SEVENZ_MAGIC.len());
+    (&mut file)
+        .take(SEVENZ_MAGIC.len() as u64)
+        .read_to_end(&mut magic)
+        .map_err(io_error)?;
+    file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+    let compressed = magic == SEVENZ_MAGIC;
+    let (roads, read_bytes) = if compressed {
+        read_7z(file, keep)?
+    } else {
+        let mut r = Counting::new(BufReader::new(file));
+        (read_dsf_stream(&mut r, file_bytes, keep)?, r.bytes)
+    };
+    let stats = DsfFileStats {
+        file_bytes,
+        compressed,
+        read_bytes,
+    };
+    Ok((roads, stats))
+}
+
+/// The first file entry of a 7z, streamed into [`read_dsf_stream`]. The
+/// iteration stops after it, so an early exit ends decompression.
+fn read_7z(file: File, keep: impl Fn(u8) -> bool) -> Result<(DsfRoads, u64), DsfError> {
+    let archive = |e: sevenz_rust2::Error| DsfError::Archive(e.to_string());
     let mut reader =
-        sevenz_rust2::ArchiveReader::new(Cursor::new(bytes), sevenz_rust2::Password::empty())
-            .map_err(err)?;
-    let mut out: Option<Vec<u8>> = None;
-    let mut too_large = false;
+        sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty()).map_err(archive)?;
+    let mut out = None;
     reader
         .for_each_entries(|entry, r| {
+            // The crate keeps iterating later blocks after a `false`, so
+            // every later entry is refused here too.
+            if out.is_some() {
+                return Ok(false);
+            }
             if entry.is_directory() {
                 return Ok(true);
             }
-            if entry.size() > MAX_DSF_BYTES as u64 {
-                too_large = true;
-                return Ok(false);
-            }
-            let mut buf = Vec::with_capacity(entry.size() as usize);
-            r.take(MAX_DSF_BYTES as u64).read_to_end(&mut buf)?;
-            out = Some(buf);
+            out = Some(if entry.size() > MAX_DSF_BYTES as u64 {
+                Err(DsfError::TooLarge)
+            } else {
+                let mut r = Counting::new(r);
+                read_dsf_stream(&mut r, entry.size(), &keep).map(|roads| (roads, r.bytes))
+            });
             Ok(false)
         })
-        .map_err(err)?;
-    if too_large {
+        .map_err(archive)?;
+    out.unwrap_or_else(|| Err(DsfError::Archive("no file entry".into())))
+}
+
+/// Reads the roads of a DSF of `len` bytes from `reader`, forward only.
+pub fn read_dsf_stream(
+    reader: &mut dyn Read,
+    len: u64,
+    keep: impl Fn(u8) -> bool,
+) -> Result<DsfRoads, DsfError> {
+    if len > MAX_DSF_BYTES as u64 {
         return Err(DsfError::TooLarge);
     }
-    out.ok_or_else(|| DsfError::Archive("empty archive".into()))
+    if len < HEADER + FOOTER {
+        return Err(DsfError::NotDsf);
+    }
+    let mut s = Stream { r: reader, pos: 0 };
+    let mut header = [0u8; HEADER as usize];
+    s.fill(&mut header)?;
+    if &header[..8] != COOKIE || le_u32(&header[8..]) != 1 {
+        return Err(DsfError::NotDsf);
+    }
+    let end = len - FOOTER;
+    let mut head = None;
+    let mut net_def: Option<Option<String>> = None;
+    let mut geod = None;
+    let mut cmds = None;
+    while s.pos < end {
+        let (id, size) = s.atom(end)?;
+        match id {
+            HEAD => head = Some(Head::parse(&s.retain(size)?)?),
+            DEFN => net_def = Some(network_definition(&s.retain(size)?)?),
+            GEOD => geod = Some(read_geod(&mut s, size)?),
+            CMDS => cmds = Some(s.retain(size)?),
+            _ => s.skip(size)?,
+        }
+        // Network chains index only PO32 points: without any, CMDS can
+        // hold no segment and is not read (mesh DSFs declare a network
+        // yet carry only empty PO32 pools).
+        let no_network = matches!(net_def, Some(None));
+        let no_points = geod
+            .as_deref()
+            .is_some_and(|g: &[Pool]| g.iter().all(|p| p.len() == 0));
+        let complete = geod.is_some() && cmds.is_some();
+        if head.is_some() && net_def.is_some() && (no_network || no_points || complete) {
+            break;
+        }
+    }
+    let head = head.ok_or(DsfError::BadAtom)?;
+    let mut roads = DsfRoads {
+        tile: (head.south.round() as i32, head.west.round() as i32),
+        overlay: head.overlay,
+        net_def: net_def.flatten(),
+        exclusions: head.exclusions,
+        chains: Chains::new(),
+    };
+    if roads.net_def.is_none() {
+        return Ok(roads);
+    }
+    let pools = geod.ok_or(DsfError::BadAtom)?;
+    let points: usize = pools.iter().map(Pool::len).sum();
+    if points == 0 {
+        return Ok(roads);
+    }
+    let cmds = cmds.ok_or(DsfError::BadAtom)?;
+    let mut seg = Segmenter {
+        pools: &pools,
+        origin: (head.west, head.south),
+        keep,
+        visits_left: 4 * points as u64 + WALK_SLACK,
+        out: Chains::new(),
+        cur: vec![],
+        sub: 0,
+        open: false,
+        keeping: false,
+    };
+    walk_commands(&cmds, &mut seg)?;
+    roads.chains = seg.out;
+    // Grown by doubling; trimmed so `Chains::bytes` is what the cache holds.
+    roads.chains.lon.shrink_to_fit();
+    roads.chains.lat.shrink_to_fit();
+    roads.chains.start.shrink_to_fit();
+    roads.chains.subtype.shrink_to_fit();
+    Ok(roads)
+}
+
+/// [`read_dsf_stream`] over a DSF already in memory.
+pub fn read_dsf(bytes: &[u8], keep: impl Fn(u8) -> bool) -> Result<DsfRoads, DsfError> {
+    read_dsf_stream(&mut &bytes[..], bytes.len() as u64, keep)
+}
+
+fn io_error(e: io::Error) -> DsfError {
+    if e.kind() == io::ErrorKind::UnexpectedEof {
+        DsfError::Truncated
+    } else {
+        DsfError::Io(e.to_string())
+    }
+}
+
+/// Counts the bytes read through it.
+struct Counting<R> {
+    inner: R,
+    bytes: u64,
+}
+
+impl<R> Counting<R> {
+    fn new(inner: R) -> Self {
+        Self { inner, bytes: 0 }
+    }
+}
+
+impl<R: Read> Read for Counting<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes += n as u64;
+        Ok(n)
+    }
+}
+
+/// A forward-only atom reader that tracks its position in the DSF.
+struct Stream<'r> {
+    r: &'r mut dyn Read,
+    pos: u64,
+}
+
+impl Stream<'_> {
+    fn fill(&mut self, buf: &mut [u8]) -> Result<(), DsfError> {
+        self.r.read_exact(buf).map_err(io_error)?;
+        self.pos += buf.len() as u64;
+        Ok(())
+    }
+
+    /// The next atom header as (id, body length), its body inside `end`.
+    fn atom(&mut self, end: u64) -> Result<(u32, u64), DsfError> {
+        if end - self.pos < 8 {
+            return Err(DsfError::BadAtom);
+        }
+        let mut h = [0u8; 8];
+        self.fill(&mut h)?;
+        let size = u64::from(le_u32(&h[4..]));
+        if size < 8 || size - 8 > end - self.pos {
+            return Err(DsfError::BadAtom);
+        }
+        Ok((le_u32(&h[..4]), size - 8))
+    }
+
+    /// The next `n` bytes, kept. Checked against the cap before any
+    /// allocation, then read in steps as the bytes arrive.
+    fn retain(&mut self, n: u64) -> Result<Vec<u8>, DsfError> {
+        if n > MAX_RETAINED_ATOM_BYTES {
+            return Err(DsfError::TooLarge);
+        }
+        let mut v = Vec::new();
+        while (v.len() as u64) < n {
+            let step = (n - v.len() as u64).min(RETAIN_STEP);
+            v.reserve_exact(step as usize);
+            let got = (&mut *self.r)
+                .take(step)
+                .read_to_end(&mut v)
+                .map_err(io_error)?;
+            if (got as u64) < step {
+                return Err(DsfError::Truncated);
+            }
+        }
+        self.pos += n;
+        Ok(v)
+    }
+
+    /// Reads past the next `n` bytes without keeping them.
+    fn skip(&mut self, n: u64) -> Result<(), DsfError> {
+        let got = io::copy(&mut (&mut *self.r).take(n), &mut io::sink()).map_err(io_error)?;
+        if got < n {
+            return Err(DsfError::Truncated);
+        }
+        self.pos += n;
+        Ok(())
+    }
 }
 
 /// A bounded little-endian reader over a byte slice.
@@ -179,6 +422,10 @@ impl<'a> Bytes<'a> {
         Ok(le_u32(self.take(4)?))
     }
 
+    fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.p)
+    }
+
     fn done(&self) -> bool {
         self.p >= self.b.len()
     }
@@ -188,7 +435,7 @@ fn le_u32(b: &[u8]) -> u32 {
     u32::from_le_bytes(b.try_into().unwrap())
 }
 
-/// Child atoms of `body` as (id, body).
+/// Child atoms of an in-memory `body` as (id, body).
 fn atoms(body: &[u8]) -> Result<Vec<(u32, &[u8])>, DsfError> {
     let mut r = Bytes::new(body);
     let mut out = vec![];
@@ -203,6 +450,13 @@ fn atoms(body: &[u8]) -> Result<Vec<(u32, &[u8])>, DsfError> {
     Ok(out)
 }
 
+fn child(body: &[u8], id: u32) -> Result<Option<&[u8]>, DsfError> {
+    Ok(atoms(body)?
+        .into_iter()
+        .find(|(a, _)| *a == id)
+        .map(|(_, b)| b))
+}
+
 /// A string table: NUL-terminated strings, none for an empty body.
 fn strings(body: &[u8]) -> Vec<String> {
     let body = body.strip_suffix(&[0]).unwrap_or(body);
@@ -214,27 +468,277 @@ fn strings(body: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// One PO32 pool: raw planes 0 (lon), 1 (lat) and 3 (junction id, when
-/// present) with their (scale, offset). Elevation and curve planes are
-/// read past, never kept.
+/// What roads need from HEAD.
+struct Head {
+    west: f64,
+    south: f64,
+    overlay: bool,
+    exclusions: Vec<Exclusion>,
+}
+
+impl Head {
+    fn parse(body: &[u8]) -> Result<Self, DsfError> {
+        let props = child(body, PROP)?.map(strings).unwrap_or_default();
+        let props: Vec<(&str, &str)> = props
+            .chunks_exact(2)
+            .map(|p| (p[0].as_str(), p[1].as_str()))
+            .collect();
+        let prop = |k: &str| props.iter().find(|p| p.0 == k).map(|p| p.1);
+        let corner = |k: &str, limit: f64| -> Result<f64, DsfError> {
+            prop(k)
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| (-limit..limit).contains(v))
+                .ok_or(DsfError::BadAtom)
+        };
+        Ok(Self {
+            west: corner("sim/west", 180.0)?,
+            south: corner("sim/south", 90.0)?,
+            overlay: prop("sim/overlay") == Some("1"),
+            exclusions: props
+                .iter()
+                .filter(|p| p.0 == "sim/exclude_net")
+                .filter_map(|p| Exclusion::parse(p.1))
+                .collect(),
+        })
+    }
+}
+
+/// The first NETW string of DEFN; none when absent or empty.
+fn network_definition(body: &[u8]) -> Result<Option<String>, DsfError> {
+    Ok(child(body, NETW)?
+        .and_then(|b| strings(b).into_iter().next())
+        .filter(|s| !s.is_empty()))
+}
+
+/// GEOD's PO32 pools, each paired with its SC32. Every other child (the
+/// 16-bit POOL and SCAL of a mesh) is read past without buffering, and
+/// each PO32 body is dropped once decoded.
+fn read_geod(s: &mut Stream, size: u64) -> Result<Vec<Pool>, DsfError> {
+    let end = s.pos + size;
+    let mut pools: Vec<Pool> = vec![];
+    let mut scales: Vec<Vec<u8>> = vec![];
+    let mut points = 0;
+    while s.pos < end {
+        let (id, n) = s.atom(end)?;
+        match id {
+            PO32 => {
+                let pool = Pool::decode(&s.retain(n)?, MAX_POOL_POINTS - points)?;
+                points += pool.len();
+                pools.push(pool);
+            }
+            SC32 => scales.push(s.retain(n)?),
+            _ => s.skip(n)?,
+        }
+    }
+    if pools.len() != scales.len() {
+        return Err(DsfError::BadPool);
+    }
+    for (pool, sc) in pools.iter_mut().zip(&scales) {
+        pool.set_scales(sc)?;
+    }
+    Ok(pools)
+}
+
+/// Where a decoded plane goes.
+trait PlaneSink {
+    /// False when the plane is only read past.
+    const WANTS: bool = true;
+    fn reserve(&mut self, n: usize);
+    fn put(&mut self, v: u32);
+}
+
+/// Reads a plane past.
+struct Skip;
+
+impl PlaneSink for Skip {
+    const WANTS: bool = false;
+    fn reserve(&mut self, _: usize) {}
+    fn put(&mut self, _: u32) {}
+}
+
+impl PlaneSink for Vec<u32> {
+    fn reserve(&mut self, n: usize) {
+        self.reserve_exact(n);
+    }
+    fn put(&mut self, v: u32) {
+        self.push(v);
+    }
+}
+
+/// One bit per value: whether it is nonzero. Junction ids are only ever
+/// tested for zero, so this is all a pool keeps of them.
+#[derive(Default)]
+struct Nonzero {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl Nonzero {
+    fn get(&self, i: usize) -> bool {
+        self.words[i / 64] >> (i % 64) & 1 != 0
+    }
+}
+
+impl PlaneSink for Nonzero {
+    fn reserve(&mut self, n: usize) {
+        self.words.reserve_exact(n.div_ceil(64));
+    }
+    fn put(&mut self, v: u32) {
+        if self.len.is_multiple_of(64) {
+            self.words.push(0);
+        }
+        if v != 0 {
+            *self.words.last_mut().unwrap() |= 1 << (self.len % 64);
+        }
+        self.len += 1;
+    }
+}
+
+/// Reads one plane of `n` values into `sink`. Encodings: 0 raw,
+/// 1 differenced, 2 run-length, 3 run-length then differenced (a wrapping
+/// running sum from 0). A run byte with the high bit set repeats the next
+/// value `b & 0x7F` times; clear, it is followed by `b & 0x7F` literal
+/// values. Room is reserved only for values the remaining bytes can hold.
+fn read_plane<S: PlaneSink>(r: &mut Bytes, n: usize, sink: &mut S) -> Result<(), DsfError> {
+    let enc = r.u8()?;
+    let differenced = matches!(enc, 1 | 3);
+    let mut acc = 0u32;
+    let mut put = |sink: &mut S, x: u32| {
+        if differenced {
+            acc = acc.wrapping_add(x);
+            sink.put(acc);
+        } else {
+            sink.put(x);
+        }
+    };
+    match enc {
+        0 | 1 => {
+            let raw = r.take(n.checked_mul(4).ok_or(DsfError::BadPool)?)?;
+            if S::WANTS {
+                sink.reserve(n);
+                for c in raw.chunks_exact(4) {
+                    put(sink, le_u32(c));
+                }
+            }
+        }
+        2 | 3 => {
+            if S::WANTS {
+                sink.reserve(n.min(r.remaining().saturating_mul(RLE_VALUES_PER_BYTE)));
+            }
+            let mut have = 0;
+            while have < n {
+                let b = r.u8()?;
+                let c = usize::from(b & 0x7F);
+                if c > n - have {
+                    return Err(DsfError::BadPool);
+                }
+                if b & 0x80 != 0 {
+                    let x = r.u32()?;
+                    if S::WANTS {
+                        for _ in 0..c {
+                            put(sink, x);
+                        }
+                    }
+                } else {
+                    let raw = r.take(4 * c)?;
+                    if S::WANTS {
+                        for v in raw.chunks_exact(4) {
+                            put(sink, le_u32(v));
+                        }
+                    }
+                }
+                have += c;
+            }
+        }
+        _ => return Err(DsfError::BadPool),
+    }
+    Ok(())
+}
+
+/// One PO32 pool: raw planes 0 (lon) and 1 (lat), plane 3 (junction id,
+/// when present) as a bit per point, and the (scale, offset) of each.
+/// Elevation and curve planes are read past, never kept.
 struct Pool {
     lon: Vec<u32>,
     lat: Vec<u32>,
-    junction: Option<Vec<u32>>,
+    junction: Option<Nonzero>,
+    planes: usize,
     lon_scale: (f32, f32),
     lat_scale: (f32, f32),
-    junction_scale: (f32, f32),
 }
 
 impl Pool {
+    /// Decodes a PO32 body of at most `max_points` points; its scales
+    /// follow in [`Pool::set_scales`].
+    fn decode(po: &[u8], max_points: usize) -> Result<Self, DsfError> {
+        let mut r = Bytes::new(po);
+        let n = r.u32()? as usize;
+        let planes = usize::from(r.u8()?);
+        // An empty pool (Global Scenery ends GEOD with one of 0 points and
+        // 0 planes) is valid. Run-length planes expand at most about 101
+        // times, so a count beyond 128 values per atom byte is corrupt.
+        if (planes < 2 && n > 0)
+            || n.checked_mul(4)
+                .is_none_or(|b| b > po.len().saturating_mul(128))
+        {
+            return Err(DsfError::BadPool);
+        }
+        if n > max_points {
+            return Err(DsfError::TooLarge);
+        }
+        let mut pool = Self {
+            lon: vec![],
+            lat: vec![],
+            junction: (planes > 3).then(Nonzero::default),
+            planes,
+            lon_scale: (0.0, 0.0),
+            lat_scale: (0.0, 0.0),
+        };
+        for k in 0..planes {
+            match (k, pool.junction.as_mut()) {
+                (0, _) => read_plane(&mut r, n, &mut pool.lon)?,
+                (1, _) => read_plane(&mut r, n, &mut pool.lat)?,
+                (3, Some(j)) => read_plane(&mut r, n, j)?,
+                _ => read_plane(&mut r, n, &mut Skip)?,
+            }
+        }
+        Ok(pool)
+    }
+
+    /// Applies the matching SC32. The junction plane is kept as a bit per
+    /// point, which expresses the test `scaled value != 0` only when the
+    /// scale is 0 (the raw id, as every DSF seen so far) or finite with no
+    /// offset; any other junction scaling is refused, not guessed.
+    fn set_scales(&mut self, sc: &[u8]) -> Result<(), DsfError> {
+        if !sc.len().is_multiple_of(8) || sc.len() / 8 < self.planes {
+            return Err(DsfError::BadPool);
+        }
+        let scale = |k: usize| {
+            let s = &sc[k * 8..k * 8 + 8];
+            (
+                f32::from_le_bytes(s[..4].try_into().unwrap()),
+                f32::from_le_bytes(s[4..].try_into().unwrap()),
+            )
+        };
+        if self.planes >= 2 {
+            self.lon_scale = scale(0);
+            self.lat_scale = scale(1);
+        }
+        if self.junction.is_some() {
+            let (s, o) = scale(3);
+            if !(s == 0.0 || (s.is_finite() && o == 0.0)) {
+                return Err(DsfError::BadPool);
+            }
+        }
+        Ok(())
+    }
+
     fn len(&self) -> usize {
         self.lon.len()
     }
 
     fn is_junction(&self, i: usize) -> bool {
-        self.junction
-            .as_ref()
-            .is_some_and(|j| scaled(j[i], self.junction_scale) != 0.0)
+        self.junction.as_ref().is_some_and(|j| j.get(i))
     }
 
     /// Point `i` in degrees from `(west, south)`.
@@ -254,187 +758,18 @@ fn scaled(raw: u32, (scale, offset): (f32, f32)) -> f64 {
     }
 }
 
-/// Reads one plane of `n` values: decoded into `out` (replacing its
-/// contents) when given, else only read past. Encodings: 0 raw,
-/// 1 differenced, 2 run-length, 3 run-length then differenced. A run byte
-/// with the high bit set repeats the next value `b & 0x7F` times; clear,
-/// it is followed by `b & 0x7F` literal values.
-fn read_plane(r: &mut Bytes, n: usize, mut out: Option<&mut Vec<u32>>) -> Result<(), DsfError> {
-    let enc = r.u8()?;
-    if let Some(v) = out.as_deref_mut() {
-        v.clear();
-        v.reserve_exact(n);
-    }
-    match enc {
-        0 | 1 => {
-            let raw = r.take(n.checked_mul(4).ok_or(DsfError::BadPool)?)?;
-            if let Some(v) = out.as_deref_mut() {
-                v.extend(raw.chunks_exact(4).map(le_u32));
-            }
-        }
-        2 | 3 => {
-            let mut have = 0;
-            while have < n {
-                let b = r.u8()?;
-                let c = usize::from(b & 0x7F);
-                if c > n - have {
-                    return Err(DsfError::BadPool);
-                }
-                if b & 0x80 != 0 {
-                    let x = r.u32()?;
-                    if let Some(v) = out.as_deref_mut() {
-                        v.extend(std::iter::repeat_n(x, c));
-                    }
-                } else {
-                    let raw = r.take(4 * c)?;
-                    if let Some(v) = out.as_deref_mut() {
-                        v.extend(raw.chunks_exact(4).map(le_u32));
-                    }
-                }
-                have += c;
-            }
-        }
-        _ => return Err(DsfError::BadPool),
-    }
-    if let (1 | 3, Some(v)) = (enc, out) {
-        let mut acc = 0u32;
-        for x in v.iter_mut() {
-            acc = acc.wrapping_add(*x);
-            *x = acc;
-        }
-    }
-    Ok(())
-}
-
-fn read_pool(po: &[u8], sc: &[u8]) -> Result<Pool, DsfError> {
-    let mut r = Bytes::new(po);
-    let n = r.u32()? as usize;
-    let planes = usize::from(r.u8()?);
-    // An empty pool (Global Scenery ends GEOD with one of 0 points and 0
-    // planes) is valid. Run-length planes expand at most about 101 times,
-    // so a count beyond 128 values per atom byte is corrupt and must not
-    // size an allocation.
-    if (planes < 2 && n > 0)
-        || n.checked_mul(4)
-            .is_none_or(|b| b > po.len().saturating_mul(128))
-    {
-        return Err(DsfError::BadPool);
-    }
-    if !sc.len().is_multiple_of(8) || sc.len() / 8 < planes {
-        return Err(DsfError::BadPool);
-    }
-    let scale = |k: usize| match sc.get(k * 8..k * 8 + 8) {
-        Some(s) if k < planes => (
-            f32::from_le_bytes(s[..4].try_into().unwrap()),
-            f32::from_le_bytes(s[4..].try_into().unwrap()),
-        ),
-        _ => (0.0, 0.0),
-    };
-    let (mut lon, mut lat, mut junction) = (vec![], vec![], vec![]);
-    for k in 0..planes {
-        let out = match k {
-            0 => Some(&mut lon),
-            1 => Some(&mut lat),
-            3 => Some(&mut junction),
-            _ => None,
-        };
-        read_plane(&mut r, n, out)?;
-    }
-    Ok(Pool {
-        lon,
-        lat,
-        junction: (planes > 3).then_some(junction),
-        lon_scale: scale(0),
-        lat_scale: scale(1),
-        junction_scale: scale(3),
-    })
-}
-
-pub fn read_dsf(bytes: &[u8], keep: impl Fn(u8) -> bool) -> Result<DsfRoads, DsfError> {
-    if bytes.len() < 12 + FOOTER || &bytes[..8] != COOKIE || le_u32(&bytes[8..12]) != 1 {
-        return Err(DsfError::NotDsf);
-    }
-    let top = atoms(&bytes[12..bytes.len() - FOOTER])?;
-    let child = |id: u32| top.iter().find(|(a, _)| *a == id).map(|(_, b)| *b);
-    let grandchild = |parent: u32, id: u32| -> Result<Option<&[u8]>, DsfError> {
-        let Some(body) = child(parent) else {
-            return Ok(None);
-        };
-        Ok(atoms(body)?
-            .into_iter()
-            .find(|(a, _)| *a == id)
-            .map(|(_, b)| b))
-    };
-
-    let props = grandchild(HEAD, PROP)?.map(strings).unwrap_or_default();
-    let props: Vec<(&str, &str)> = props
-        .chunks_exact(2)
-        .map(|p| (p[0].as_str(), p[1].as_str()))
-        .collect();
-    let prop = |k: &str| props.iter().find(|p| p.0 == k).map(|p| p.1);
-    let corner = |k: &str| -> Result<f64, DsfError> {
-        prop(k)
-            .and_then(|v| v.parse().ok())
-            .ok_or(DsfError::BadAtom)
-    };
-    let (west, south) = (corner("sim/west")?, corner("sim/south")?);
-    let exclusions = props
-        .iter()
-        .filter(|p| p.0 == "sim/exclude_net")
-        .filter_map(|p| Exclusion::parse(p.1))
-        .collect();
-    let net_def = grandchild(DEFN, NETW)?
-        .and_then(|b| strings(b).into_iter().next())
-        .filter(|s| !s.is_empty());
-    let mut roads = DsfRoads {
-        tile: (south.round() as i32, west.round() as i32),
-        overlay: prop("sim/overlay") == Some("1"),
-        net_def,
-        exclusions,
-        chains: Chains::new(),
-    };
-    if roads.net_def.is_none() {
-        return Ok(roads); // no network: skip pools and commands
-    }
-
-    let geod = atoms(child(GEOD).ok_or(DsfError::BadAtom)?)?;
-    let of = |id: u32| geod.iter().filter(move |(a, _)| *a == id).map(|(_, b)| *b);
-    if of(PO32).count() != of(SC32).count() {
-        return Err(DsfError::BadPool);
-    }
-    let pools = of(PO32)
-        .zip(of(SC32))
-        .map(|(p, s)| read_pool(p, s))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut seg = Segmenter {
-        pools: &pools,
-        origin: (west, south),
-        keep,
-        out: Chains::new(),
-        cur: vec![],
-        sub: 0,
-        open: false,
-        keeping: false,
-    };
-    walk_commands(child(CMDS).ok_or(DsfError::BadAtom)?, &mut seg)?;
-    roads.chains = seg.out;
-    // Grown by doubling; trimmed so `Chains::bytes` is what the cache holds.
-    roads.chains.lon.shrink_to_fit();
-    roads.chains.lat.shrink_to_fit();
-    roads.chains.start.shrink_to_fit();
-    roads.chains.subtype.shrink_to_fit();
-    Ok(roads)
-}
-
 /// Turns network chains into segments by DSFLib's rule: a junction ends
 /// the open segment (unless it is the chain's first point) and begins a
 /// new one (unless it is the last); any other point is a shape point. The
-/// segment buffer is reused, and points of segments `keep` rejects are
-/// never computed.
+/// segment buffer is reused, points of segments `keep` rejects are never
+/// computed, and the indices visited are budgeted from the pool sizes, so
+/// a small pool walked many times cannot grow the output or the time
+/// without bound.
 struct Segmenter<'a, K> {
     pools: &'a [Pool],
     origin: (f64, f64),
     keep: K,
+    visits_left: u64,
     out: Chains,
     cur: Vec<(f32, f32)>,
     sub: u8,
@@ -450,6 +785,11 @@ impl<K: Fn(u8) -> bool> Segmenter<'_, K> {
         idx: impl ExactSizeIterator<Item = u32>,
     ) -> Result<(), DsfError> {
         let p = self.pools.get(pool).ok_or(DsfError::BadPool)?;
+        let count = idx.len() as u64;
+        if count > self.visits_left {
+            return Err(DsfError::TooLarge);
+        }
+        self.visits_left -= count;
         let last = idx.len().saturating_sub(1);
         for (counter, i) in idx.enumerate() {
             let i = i as usize;
@@ -600,9 +940,14 @@ pub(crate) mod test_dsf {
         /// plane encoding.
         pub pools: Vec<(Vec<Vec<u32>>, Vec<(f32, f32)>, u8)>,
         pub cmds: Vec<u8>,
+        /// GEOD children written before the PO32/SC32 pairs (16-bit POOL
+        /// and SCAL in real meshes).
+        pub geod_extra: Vec<([u8; 4], Vec<u8>)>,
+        /// Top-level atoms written after CMDS (DEMS in real meshes).
+        pub trailing: Vec<([u8; 4], Vec<u8>)>,
     }
 
-    fn atom(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    pub fn atom(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
         let mut out = u32::from_be_bytes(*id).to_le_bytes().to_vec();
         out.extend_from_slice(&((body.len() + 8) as u32).to_le_bytes());
         out.extend_from_slice(body);
@@ -653,6 +998,8 @@ pub(crate) mod test_dsf {
                 nets: vec![],
                 pools: vec![],
                 cmds: vec![],
+                geod_extra: vec![],
+                trailing: vec![],
             }
         }
 
@@ -722,6 +1069,9 @@ pub(crate) mod test_dsf {
             out.extend(atom(b"HEAD", &atom(b"PROP", &strings(&props))));
             out.extend(atom(b"DEFN", &atom(b"NETW", &strings(&self.nets))));
             let mut geod = vec![];
+            for (id, body) in &self.geod_extra {
+                geod.extend(atom(id, body));
+            }
             for (planes, scales, enc) in &self.pools {
                 let count = planes.first().map_or(0, Vec::len) as u32;
                 let mut po = count.to_le_bytes().to_vec();
@@ -738,6 +1088,9 @@ pub(crate) mod test_dsf {
             }
             out.extend(atom(b"GEOD", &geod));
             out.extend(atom(b"CMDS", &self.cmds));
+            for (id, body) in &self.trailing {
+                out.extend(atom(id, body));
+            }
             out.extend([0u8; 16]);
             out
         }
@@ -1010,14 +1363,25 @@ mod tests {
             plane.extend(&body);
             plane.push(0xEE); // the next field
             let mut r = Bytes { b: &plane, p: 0 };
-            let mut v = vec![];
-            read_plane(&mut r, 4, Some(&mut v)).unwrap();
+            let mut v: Vec<u32> = vec![];
+            read_plane(&mut r, 4, &mut v).unwrap();
             assert_eq!(v, want, "encoding {enc}");
             assert_eq!(r.u8().unwrap(), 0xEE);
             let mut r = Bytes { b: &plane, p: 0 };
-            read_plane(&mut r, 4, None).unwrap();
+            read_plane(&mut r, 4, &mut Skip).unwrap();
             assert_eq!(r.u8().unwrap(), 0xEE, "skipped encoding {enc}");
         }
+    }
+
+    #[test]
+    fn nonzero_bits_cross_word_boundaries() {
+        let mut bits = Nonzero::default();
+        bits.reserve(130);
+        for i in 0..130u32 {
+            bits.put(if i % 3 == 0 { i + 1 } else { 0 });
+        }
+        assert_eq!(bits.words.len(), 3);
+        assert!((0..130).all(|i| bits.get(i) == (i % 3 == 0)));
     }
 
     #[test]
@@ -1025,7 +1389,7 @@ mod tests {
         let mut plane = vec![2u8, 0x85];
         plane.extend(7u32.to_le_bytes());
         let mut r = Bytes { b: &plane, p: 0 };
-        assert_eq!(read_plane(&mut r, 4, None), Err(DsfError::BadPool));
+        assert_eq!(read_plane(&mut r, 4, &mut Skip), Err(DsfError::BadPool));
     }
 
     #[test]
@@ -1039,50 +1403,335 @@ mod tests {
         assert_eq!(c.bytes(), 5 * 8 + 3 * 4 + 2);
     }
 
-    #[test]
-    fn unwrap_7z_returns_the_single_entry_and_passes_raw_through() {
+    /// Writes `dsf` to `dir/name`, raw or as a single-entry 7z.
+    fn write_dsf(
+        dir: &std::path::Path,
+        name: &str,
+        dsf: &[u8],
+        sevenz: bool,
+    ) -> std::path::PathBuf {
         use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
-        use std::io::Write;
-        let raw = two_segment_dsf(0).bytes();
-        let mut buf = std::io::Cursor::new(Vec::new());
-        {
-            let mut w = ArchiveWriter::new(&mut buf).unwrap();
-            w.push_archive_entry(
-                ArchiveEntry::new_file("+46+006.dsf"),
-                Some(std::io::Cursor::new(raw.clone())),
-            )
-            .unwrap();
-            w.finish().unwrap().flush().unwrap();
+        let path = dir.join(name);
+        if !sevenz {
+            std::fs::write(&path, dsf).unwrap();
+            return path;
         }
-        assert_eq!(unwrap_7z(buf.into_inner()).unwrap(), raw);
-        assert_eq!(unwrap_7z(raw.clone()).unwrap(), raw);
+        let mut w = ArchiveWriter::create(&path).unwrap();
+        w.push_archive_entry(
+            ArchiveEntry::new_file(name),
+            Some(std::io::Cursor::new(dsf.to_vec())),
+        )
+        .unwrap();
+        w.finish().unwrap();
+        path
+    }
+
+    /// The top-level atoms of `dsf`, each with its header.
+    fn top_atoms(dsf: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = vec![];
+        let mut p = 12;
+        while p < dsf.len() - 16 {
+            let size = le_u32(&dsf[p + 4..p + 8]) as usize;
+            out.push(dsf[p..p + size].to_vec());
+            p += size;
+        }
+        out
+    }
+
+    fn assemble(atoms: &[&Vec<u8>]) -> Vec<u8> {
+        let mut out = b"XPLNEDSF".to_vec();
+        out.extend(1u32.to_le_bytes());
+        for a in atoms {
+            out.extend(a.iter());
+        }
+        out.extend([0u8; 16]);
+        out
+    }
+
+    /// Junk that does not compress away, so a 7z of it stays large.
+    fn junk(n: usize) -> Vec<u8> {
+        let mut x = 0x9E37_79B9u32;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn raw_and_7z_files_read_like_the_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let dsf = two_segment_dsf(3).bytes();
+        let want = read_dsf(&dsf, |_| true).unwrap();
+        for sevenz in [false, true] {
+            let path = write_dsf(dir.path(), "+46+006.dsf", &dsf, sevenz);
+            let (got, stats) = read_dsf_file(&path, |_| true).unwrap();
+            assert_eq!(got, want, "7z {sevenz}");
+            assert_eq!(stats.compressed, sevenz);
+            assert_eq!(stats.file_bytes, std::fs::metadata(&path).unwrap().len());
+        }
+    }
+
+    #[test]
+    fn a_dsf_without_networks_stops_reading_after_head_and_defn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = Builder::new(46, 6);
+        b.trailing.push((*b"DEMS", junk(2 << 20)));
+        let dsf = b.bytes();
+        for sevenz in [false, true] {
+            let path = write_dsf(dir.path(), "+46+006.dsf", &dsf, sevenz);
+            let (r, stats) = read_dsf_file(&path, |_| true).unwrap();
+            assert!(r.net_def.is_none());
+            assert_eq!(r.tile, (46, 6));
+            assert!(stats.file_bytes > 2 << 20, "7z {sevenz}");
+            assert!(stats.read_bytes < 4096, "7z {sevenz}: {stats:?}");
+        }
+    }
+
+    #[test]
+    fn reading_stops_once_the_network_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = two_segment_dsf(0);
+        b.trailing.push((*b"DEMS", junk(1 << 20)));
+        let dsf = b.bytes();
+        let path = write_dsf(dir.path(), "+46+006.dsf", &dsf, false);
+        let (r, stats) = read_dsf_file(&path, |_| true).unwrap();
+        assert_eq!(r.chains.len(), 2);
+        assert!(stats.read_bytes < 4096, "{stats:?}");
+    }
+
+    #[test]
+    fn a_network_without_32_bit_points_stops_before_cmds() {
+        // Mesh DSFs declare a network yet carry only empty PO32 pools.
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = Builder::new(79, 12);
+        b.nets.push("lib/g10/roads_EU.net".into());
+        b.pools.push((vec![], vec![], 0));
+        b.cmds = vec![16; 1 << 20]; // a megabyte of TerrainPatch
+        let path = write_dsf(dir.path(), "+79+012.dsf", &b.bytes(), false);
+        let (r, stats) = read_dsf_file(&path, |_| true).unwrap();
+        assert_eq!(r.net_def.as_deref(), Some("lib/g10/roads_EU.net"));
+        assert!(r.chains.is_empty());
+        assert!(stats.read_bytes < 4096, "{stats:?}");
+    }
+
+    #[test]
+    fn cmds_before_geod_reads_alike() {
+        let dsf = two_segment_dsf(1).bytes();
+        let a = top_atoms(&dsf);
+        assert_eq!(a.len(), 4); // HEAD, DEFN, GEOD, CMDS
+        let swapped = assemble(&[&a[0], &a[1], &a[3], &a[2]]);
+        assert_eq!(
+            read_dsf(&swapped, |_| true).unwrap(),
+            read_dsf(&dsf, |_| true).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_absent_defn_is_no_network() {
+        let dsf = two_segment_dsf(0).bytes();
+        let a = top_atoms(&dsf);
+        let r = read_dsf(&assemble(&[&a[0], &a[2], &a[3]]), |_| true).unwrap();
+        assert!(r.net_def.is_none());
+        assert!(r.chains.is_empty());
+    }
+
+    #[test]
+    fn sixteen_bit_pools_in_geod_are_skipped() {
+        let mut b = two_segment_dsf(0);
+        b.geod_extra.push((*b"POOL", junk(1000)));
+        b.geod_extra.push((*b"SCAL", junk(24)));
+        let r = read_dsf(&b.bytes(), |_| true).unwrap();
+        assert_eq!(r, read_dsf(&two_segment_dsf(0).bytes(), |_| true).unwrap());
+    }
+
+    #[test]
+    fn a_geod_child_beyond_the_retained_cap_is_skipped_not_retained() {
+        // A 300 MiB POOL: retaining it would be TooLarge, skipping streams it.
+        let dsf = two_segment_dsf(0).bytes();
+        let a = top_atoms(&dsf);
+        let pool_len = 300u64 << 20;
+        let geod_body = &a[2][8..];
+        let geod_len = 8 + 8 + pool_len + geod_body.len() as u64;
+        let mut head = b"XPLNEDSF".to_vec();
+        head.extend(1u32.to_le_bytes());
+        head.extend(&a[0]);
+        head.extend(&a[1]);
+        head.extend(&a[2][..4]);
+        head.extend((geod_len as u32).to_le_bytes());
+        head.extend(&b"POOL"[..].iter().rev().copied().collect::<Vec<u8>>());
+        head.extend(((pool_len + 8) as u32).to_le_bytes());
+        let mut tail = geod_body.to_vec();
+        tail.extend(&a[3]);
+        tail.extend([0u8; 16]);
+        let len = head.len() as u64 + pool_len + tail.len() as u64;
+        let mut stream = std::io::Read::chain(
+            std::io::Read::chain(&head[..], std::io::Read::take(std::io::repeat(0), pool_len)),
+            &tail[..],
+        );
+        let r = read_dsf_stream(&mut stream, len, |_| true).unwrap();
+        assert_eq!(r.chains.len(), 2);
+    }
+
+    struct PanicsOnRead;
+
+    impl std::io::Read for PanicsOnRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("read after the length was known to be too large");
+        }
+    }
+
+    #[test]
+    fn a_length_above_the_ceiling_is_rejected_unread() {
+        let len = MAX_DSF_BYTES as u64 + 1;
+        assert_eq!(
+            read_dsf_stream(&mut PanicsOnRead, len, |_| true),
+            Err(DsfError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn a_retained_atom_above_the_cap_is_rejected_before_allocating() {
+        let mut bytes = b"XPLNEDSF".to_vec();
+        bytes.extend(1u32.to_le_bytes());
+        bytes.extend(u32::from_be_bytes(*b"HEAD").to_le_bytes());
+        bytes.extend((MAX_RETAINED_ATOM_BYTES as u32 + 9).to_le_bytes());
+        let len = MAX_DSF_BYTES as u64;
+        assert_eq!(
+            read_dsf_stream(&mut &bytes[..], len, |_| true),
+            Err(DsfError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn a_stream_that_ends_early_is_truncated() {
+        let dsf = two_segment_dsf(0).bytes();
+        for cut in [6, 12, 30, dsf.len() / 2, dsf.len() - 20] {
+            assert_eq!(
+                read_dsf_stream(&mut &dsf[..cut], dsf.len() as u64, |_| true),
+                Err(DsfError::Truncated),
+                "cut {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_file_is_an_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            read_dsf_file(&dir.path().join("none.dsf"), |_| true),
+            Err(DsfError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn a_repeated_range_command_trips_the_walk_budget() {
+        let mut b = Builder::new(46, 6);
+        b.nets.push("lib/g10/roads.net".into());
+        let pool = b.pool(46, 6, &[(6.1, 46.1, 1), (6.2, 46.2, 2)], 0);
+        b.cmds.extend([1u8, pool as u8, 0]);
+        // Budget 4 * 2 + 65,536 visits; each command visits 2.
+        for _ in 0..40_000 {
+            b.cmds.extend([10u8, 0, 0, 2, 0]);
+        }
+        assert_eq!(read_dsf(&b.bytes(), |_| true), Err(DsfError::TooLarge));
+        assert_eq!(read_dsf(&b.bytes(), |_| false), Err(DsfError::TooLarge));
+    }
+
+    #[test]
+    fn shape_points_after_one_junction_trip_the_walk_budget() {
+        let mut b = Builder::new(46, 6);
+        b.nets.push("lib/g10/roads.net".into());
+        let pool = b.pool(46, 6, &[(6.1, 46.1, 1), (6.2, 46.2, 0), (6.3, 46.3, 0)], 0);
+        b.cmds.extend([1u8, pool as u8, 0]);
+        b.cmds.extend([9u8, 2, 0, 0, 1, 0]); // opens a segment
+        for _ in 0..40_000 {
+            b.cmds.extend([10u8, 1, 0, 3, 0]); // two shape points
+        }
+        assert_eq!(read_dsf(&b.bytes(), |_| true), Err(DsfError::TooLarge));
+    }
+
+    #[test]
+    fn corners_must_be_finite_and_on_the_globe() {
+        for (k, v) in [
+            ("sim/west", "NaN"),
+            ("sim/west", "inf"),
+            ("sim/west", "180"),
+            ("sim/west", "-181"),
+            ("sim/south", "90"),
+            ("sim/south", "-91"),
+        ] {
+            let mut b = two_segment_dsf(0);
+            b.props.iter_mut().find(|p| p.0 == k).unwrap().1 = v.into();
+            assert_eq!(
+                read_dsf(&b.bytes(), |_| true),
+                Err(DsfError::BadAtom),
+                "{k}={v}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_chains_equal_new() {
+        assert_eq!(Chains::default(), Chains::new());
+        assert_eq!(Chains::default().start, vec![0]);
+    }
+
+    #[test]
+    fn a_scaled_junction_plane_tests_the_scaled_value() {
+        let mut b = two_segment_dsf(0);
+        b.pools[0].1[3] = (1.0, 0.0);
+        let r = read_dsf(&b.bytes(), |_| true).unwrap();
+        assert_eq!(r.chains.len(), 2);
+        // With an offset every raw 0 would be a junction: refused rather
+        // than guessed, as a bit per point cannot express it.
+        b.pools[0].1[3] = (1.0, 5.0);
+        assert_eq!(read_dsf(&b.bytes(), |_| true), Err(DsfError::BadPool));
+    }
+
+    #[test]
+    fn a_huge_pool_count_in_a_tiny_atom_is_rejected() {
+        let mut b = two_segment_dsf(0);
+        let mut po = 1_000_000u32.to_le_bytes().to_vec();
+        po.extend([4u8, 0, 0, 0, 0]);
+        b.geod_extra.push((*b"PO32", po));
+        b.geod_extra.push((*b"SC32", vec![0; 32]));
+        assert_eq!(read_dsf(&b.bytes(), |_| true), Err(DsfError::BadPool));
+    }
+
+    #[test]
+    fn pools_beyond_the_point_cap_are_too_large() {
+        let mut b = two_segment_dsf(0);
+        let n = MAX_POOL_POINTS as u32 + 1;
+        let mut po = n.to_le_bytes().to_vec();
+        po.push(2);
+        po.resize(n as usize * 4 / 128 + 64, 0);
+        b.geod_extra.push((*b"PO32", po));
+        b.geod_extra.push((*b"SC32", vec![0; 16]));
+        assert_eq!(read_dsf(&b.bytes(), |_| true), Err(DsfError::TooLarge));
     }
 
     /// `cargo test --release -p xearthlayer --lib night::roads::dsf::tests::golden -- --ignored --nocapture`
     fn golden(path: &str) {
         let started = std::time::Instant::now();
-        let file = std::fs::read(path).unwrap();
-        let file_bytes = file.len();
-        let bytes = unwrap_7z(file).unwrap();
-        let unwrapped = started.elapsed();
-        let ours = read_dsf(&bytes, |_| true).unwrap();
+        let (ours, stats) = read_dsf_file(std::path::Path::new(path), |_| true).unwrap();
         println!(
-            "{path}: parse {} ms ({} ms read and unwrap), {} segments",
+            "{path}: read_dsf_file {} ms, {} segments, {} points, Chains {} B, {stats:?}",
             started.elapsed().as_millis(),
-            unwrapped.as_millis(),
-            ours.chains.len()
+            ours.chains.len(),
+            ours.chains.lon.len(),
+            ours.chains.bytes()
         );
         let t = std::time::Instant::now();
-        let lit = read_dsf(&bytes, super::super::is_lit_subtype).unwrap();
+        let (lit, _) =
+            read_dsf_file(std::path::Path::new(path), super::super::is_lit_subtype).unwrap();
         println!(
-            "  file {file_bytes} B, DSF {} B; keep all: {} points, Chains {} B; \
-             keep lit: {} ms, {} segments, {} points, Chains {} B",
-            bytes.len(),
-            ours.chains.lon.len(),
-            ours.chains.bytes(),
+            "  keep lit: {} ms, {} segments, Chains {} B",
             t.elapsed().as_millis(),
             lit.chains.len(),
-            lit.chains.lon.len(),
             lit.chains.bytes()
         );
         let out = std::env::temp_dir().join(format!("golden-{}.txt", std::process::id()));
@@ -1119,6 +1768,35 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(out);
+    }
+
+    /// Real DSFs without road segments: an airport overlay with no network
+    /// (raw) and two 7z meshes that declare a network but hold no 32-bit
+    /// points. `read_bytes` against the file shows where reading stopped.
+    #[test]
+    #[ignore]
+    fn timing_dsfs_without_roads() {
+        let xp = "/media/FlightSim/X-Plane 12-beta";
+        let mesh = "Custom Scenery/Svalbard4XPlane - MESH/Earth nav data/+70+010";
+        for path in [
+            format!("{xp}/Global Scenery/Global Airports/Earth nav data/+50-010/+51-001.dsf"),
+            format!("{xp}/{mesh}/+79+012.dsf"),
+            format!("{xp}/{mesh}/+78+016.dsf"),
+        ] {
+            let started = std::time::Instant::now();
+            let (r, stats) =
+                read_dsf_file(std::path::Path::new(&path), super::super::is_lit_subtype).unwrap();
+            println!(
+                "{path}: {} ms, net {:?}, {} segments, {stats:?}",
+                started.elapsed().as_millis(),
+                r.net_def,
+                r.chains.len()
+            );
+            assert!(r.chains.is_empty());
+            if r.net_def.is_none() {
+                assert!(stats.read_bytes < stats.file_bytes / 10, "{stats:?}");
+            }
+        }
     }
 
     #[test]
