@@ -9,8 +9,9 @@ use super::class::RoadClass;
 /// Bump when the meaning of a `RoadModel` parameter changes, so the same
 /// values would draw different light: it is hashed into
 /// [`RoadModel::digest`] with the values. A change to how roads are read,
-/// merged or drawn is `ROADS_VERSION`'s.
-pub const ROAD_MODEL_VERSION: u32 = 1;
+/// merged or drawn is `ROADS_VERSION`'s. 2: lamps light every class, with
+/// the class sigma (the lamp's a floor) and intensity (the lamp's a factor).
+pub const ROAD_MODEL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClassParams {
@@ -22,21 +23,43 @@ pub struct ClassParams {
     pub intensity: f32,
 }
 
-/// Sparse lamps instead of glow on every non-motorway class (testing option).
+/// Roads as chains of lamps instead of a continuous glow: one lamp every
+/// `spacing_m` of ground along every glowing road, each a point glow with
+/// its class's sigma and intensity.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LampParams {
+    /// Ground metres between lamps along a road.
     pub spacing_m: f32,
+    /// Share of the lamps lit, 0..1 (by a hash of the road and the lamp).
     pub lit_share: f32,
+    /// The least sigma a lamp has, ground metres: a lamp's glow fall-off is
+    /// the larger of this and its class's `sigma_m`.
     pub sigma_m: f32,
+    /// Factor on the class intensity.
     pub intensity: f32,
 }
 
 impl LampParams {
+    /// Every lamp lit, as X-Plane lines its motorways and arterials. After
+    /// the fourth flight (KCCR, 2026-11-14) the glow read a little dense:
+    /// at 32 m the road light over 20 ZL16 textures around KCCR is 0.495 of
+    /// the continuous glow's (0.547 at 26 m, 0.464 at 36 m; neighbouring
+    /// lamps overlap, so the light falls slower than the spacing grows).
+    /// The sigma floor is below every glowing class's.
+    pub const DEFAULT: Self = Self {
+        spacing_m: 32.0,
+        lit_share: 1.0,
+        sigma_m: 4.0,
+        intensity: 1.0,
+    };
+
+    /// Sparse lamps whose sigma floor lies between the class sigmas.
+    #[cfg(test)]
     pub const TEST: Self = Self {
         spacing_m: 30.0,
         lit_share: 0.3,
-        sigma_m: 4.0,
-        intensity: 1.0,
+        sigma_m: 9.0,
+        intensity: 0.8,
     };
 }
 
@@ -52,7 +75,8 @@ pub struct RoadModel {
     pub full_nw: f64,
     /// Road sodium colour, stored values 0..255 (toned like the pattern).
     pub sodium: [f32; 3],
-    pub rural_lamps: Option<LampParams>,
+    /// Lamps along every glowing road, or the continuous glow when `None`.
+    pub lamps: Option<LampParams>,
 }
 
 const fn c(half_width_m: f32, sigma_m: f32, intensity: f32) -> ClassParams {
@@ -80,7 +104,7 @@ impl RoadModel {
         country: 0.2,
         full_nw: 10.0,
         sodium: [255.0, 178.0, 92.0],
-        rural_lamps: None,
+        lamps: Some(LampParams::DEFAULT),
     };
 
     /// Digest of every parameter, for the lit session fingerprint.
@@ -98,7 +122,7 @@ impl RoadModel {
         for v in self.sodium {
             h.update(v.to_bits().to_le_bytes());
         }
-        match self.rural_lamps {
+        match self.lamps {
             None => h.update([0u8]),
             Some(l) => {
                 h.update([1u8]);
@@ -140,25 +164,18 @@ mod tests {
         for ch in 0..3 {
             with(format!("sodium {ch}"), &|m| m.sodium[ch] -= 1.0);
         }
-        with("rural_lamps".into(), &|m| {
-            m.rural_lamps = Some(LampParams::TEST)
-        });
+        with("lamps".into(), &|m| m.lamps = None);
         let lamp = |f: fn(&mut LampParams)| {
             move |m: &mut RoadModel| {
-                let mut l = LampParams::TEST;
+                let mut l = LampParams::DEFAULT;
                 f(&mut l);
-                m.rural_lamps = Some(l);
+                m.lamps = Some(l);
             }
-        };
-        let lamps_on = {
-            let mut m = RoadModel::DEFAULT;
-            m.rural_lamps = Some(LampParams::TEST);
-            m.digest()
         };
         let mut lamp_changes: Vec<(&str, RoadModel)> = vec![];
         for (what, f) in [
             ("spacing_m", lamp(|l| l.spacing_m += 1.0)),
-            ("lit_share", lamp(|l| l.lit_share += 0.1)),
+            ("lit_share", lamp(|l| l.lit_share -= 0.1)),
             ("sigma_m", lamp(|l| l.sigma_m += 1.0)),
             ("intensity", lamp(|l| l.intensity -= 0.1)),
         ] {
@@ -170,7 +187,7 @@ mod tests {
             assert_ne!(m.digest(), base, "{what}");
         }
         for (what, m) in &lamp_changes {
-            assert_ne!(m.digest(), lamps_on, "lamp {what}");
+            assert_ne!(m.digest(), base, "lamp {what}");
         }
         // Each change is its own input, not just a different one.
         let mut all: Vec<[u8; 32]> = changed.iter().map(|(_, m)| m.digest()).collect();
@@ -194,9 +211,25 @@ mod tests {
     }
 
     #[test]
-    fn default_has_no_rural_lamps_and_brightest_motorways() {
+    fn default_draws_every_glowing_road_as_a_chain_of_lit_lamps() {
+        // Flight 4 (KCCR, 2026-11-14): X-Plane's roads read as dotted
+        // chains of lamps, and the glow a little too dense.
         let m = RoadModel::DEFAULT;
-        assert!(m.rural_lamps.is_none());
+        assert_eq!(m.lamps, Some(LampParams::DEFAULT));
+        assert_eq!(LampParams::DEFAULT.spacing_m, 32.0, "half the glow's light");
+        assert_eq!(LampParams::DEFAULT.lit_share, 1.0, "no random gaps");
+        assert_eq!(LampParams::DEFAULT.intensity, 1.0);
+        for class in RoadClass::ALL.into_iter().filter(|c| c.is_lit()) {
+            assert!(
+                LampParams::DEFAULT.sigma_m < m.classes[class.index()].sigma_m,
+                "{class:?} lamps have their class sigma"
+            );
+        }
+    }
+
+    #[test]
+    fn motorways_are_the_brightest_class() {
+        let m = RoadModel::DEFAULT;
         let i = |c: RoadClass| m.classes[c.index()].intensity;
         assert!(i(RoadClass::Motorway) >= i(RoadClass::Primary));
         assert!(i(RoadClass::Primary) > i(RoadClass::Local));

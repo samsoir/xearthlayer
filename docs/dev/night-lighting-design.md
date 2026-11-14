@@ -133,7 +133,7 @@ branch on a bool, see Trigger). Everything else is new code in
 | `night/generator/cpu.rs` | `CpuLitGenerator`, the CPU implementation |
 | `night/service.rs` | `LitTextureService`: the FUSE-facing entry point |
 | `night/disk.rs` | Lit disk entries and the fingerprint of a payload's inputs |
-| `night/roads/` | Road lights: the simulator's road network as a glow (see Road lights) |
+| `night/roads/` | Road lights: the simulator's road network as chains of lamps (see Road lights) |
 
 ### Recipe reader (`night/recipe.rs`)
 
@@ -659,9 +659,9 @@ Laminar's pattern art, not real roads, so without road lights a 3D road
 appears where the lit texture showed no road to match, and a road across
 dark countryside, where VIIRS sees nothing and the gain is zero, appears
 out of nothing. Road lights draw the roads the simulator actually presents
-into the lit texture: a glow along every lit road class, on top of the
-pattern in towns and faint between them, so the hand-off from far to near
-matches. The code is `xearthlayer/src/night/roads/`.
+into the lit texture: a chain of lamps along every lit road class, on top
+of the pattern in towns and faint between them, so the hand-off from far
+to near matches. The code is `xearthlayer/src/night/roads/`.
 
 | File | Responsibility |
 |---|---|
@@ -671,7 +671,7 @@ matches. The code is `xearthlayer/src/night/roads/`.
 | `roads/class.rs` | `RoadClass` from a DSF road subtype |
 | `roads/merge.rs` | `Merger` and `MergedRoads`: the priority merge and the compact merged tile |
 | `roads/codec.rs` | The disk cache entry of one DSF's extraction |
-| `roads/model.rs` | `RoadModel`: glow per class, rural floor, colour, the lamp option |
+| `roads/model.rs` | `RoadModel`: glow per class, rural floor, colour, lamps |
 | `roads/field.rs` | `RoadField`: a texture's glow raster, and `reach_deg` |
 | `roads/service/` | `RoadService`: per-tile builds (overlays only), waits, caches, identities; `real.rs` holds the ignored real-install measurements |
 | `roads/stats.rs` | Counters, latency windows and the minute summary |
@@ -821,8 +821,7 @@ building light, which the Laminar pattern already carries, and only
 motorways and arterials as lines of lamps. Over 20 ZL16 textures around
 KCCR, glowing every class lit 19.1% of the texels and the main classes
 alone 4.7% (the pattern alone 1.2%). The parameters of the dark classes
-are kept for a lamp option (`RoadModel::rural_lamps`, dots instead of a
-line), the next step if residential areas look too dark.
+are kept, should residential areas need road light again.
 
 X-World Pro adds 70 to 73 (single-lane roads), 74 (`#Pedestrian`), 75
 (`#Footway, cycleway streetlights`), 80 (local entrance) and 82
@@ -985,15 +984,36 @@ The region is looked up once per 1° tile, the patch the pattern's LED
 stage drew is reused (otherwise it is found once per patch cell as a row is
 walked), and the white of the last temperature is kept.
 
-**Lamps (test option).** `RoadModel::rural_lamps` replaces the continuous
-glow on every class but motorways and ramps by sparse lamps: one every
-`spacing_m` of ground arc length along a segment, each lit or not by a hash
-of its segment's first point and its index, so lamps land on the same
-ground at any zoom. A segment stored as pieces starts a walk at each
-joint, the same in every texture. `LampParams::TEST` (30 m, 30% lit,
-sigma 4 m) is the only preset. It is a field of the model, not a
-configuration key, and is off in `RoadModel::DEFAULT`; it exists to
-compare the two looks in flight.
+**Lamps.** With `RoadModel::lamps` set, as in `RoadModel::DEFAULT`, every
+glowing road is drawn as a chain of lamps instead of the continuous glow:
+one lamp every `spacing_m` of ground arc length along a segment, each a
+point glow (no core) with its class's sigma and intensity, the lamp
+`sigma_m` a floor (`max(lamp sigma, class sigma)`, and a texel at least)
+and the lamp `intensity` a factor on the class's. Each lamp is lit or not
+by a hash of its segment's first point and its index (`lit_share`), so
+lamps land on the same ground at any zoom. A segment stored as pieces
+starts a walk at each joint, the same in every texture. After the fourth
+flight (KCCR, 2026-11-14) the light levels were close to right but the
+roads still read a little dense, and X-Plane's own 3D roads beside them
+read as dotted chains of lamps (sodium dots along motorways, white along
+arterials) where the texture drew continuous bands. `LampParams::DEFAULT`
+lights every lamp (`lit_share` 1, a regular chain like the simulator's,
+no random gaps), with a sigma floor of 4 m (below every glowing class's,
+so the class sigma rules) and its spacing chosen for half the light per
+metre of road. Over the 20 ZL16 textures around KCCR at 1024 px (road
+light being the mean linear luminance with roads minus the pattern's
+alone), the lamps give this share of the continuous glow's light:
+
+| Spacing | 20 m | 24 m | 26 m | 28 m | 30 m | **32 m** | 36 m | 40 m |
+|---|---|---|---|---|---|---|---|---|
+| Road light | 0.602 | 0.565 | 0.547 | 0.530 | 0.512 | **0.495** | 0.464 | 0.438 |
+| Texels above 0.002 | 3.25% | 3.14% | 3.08% | 3.03% | 2.98% | **2.93%** | 2.83% | 2.73% |
+
+The continuous glow lights 4.08% of the texels above linear 0.002 and the
+pattern alone 1.24%. The light falls slower than the spacing grows,
+because at 7.5 m texels neighbouring lamps' glows overlap and take the
+maximum. `lamps: None` draws the continuous glow, byte for byte as before
+(a test pins its digest), kept so a flight can compare the two.
 
 ### Road service (`roads/service/`)
 
@@ -1134,7 +1154,7 @@ guards one thing:
 |---|---|---|
 | `LIT_GENERATOR_VERSION` (6) | Generated bytes change for the same inputs: ramp, tiling, encoder, layout of the visible levels, the road composite | Lit payloads |
 | `ROADS_VERSION` (3) | The same DSFs and road model can give different road light: the reader, the class table, the merge and source rules, quantisation, the kernel | Lit payloads |
-| `ROAD_MODEL_VERSION` (1) | The meaning of a `RoadModel` parameter changes | Lit payloads (through the model digest) |
+| `ROAD_MODEL_VERSION` (2) | The meaning of a `RoadModel` parameter changes (2: lamps light every glowing class, the lamp sigma a floor on the class's and the lamp intensity a factor on it) | Lit payloads (through the model digest) |
 | `ROAD_EXTRACT_VERSION` (3) | What one DSF's extraction keeps, or which DSFs are stored, changes: the reader, the subtype filter, the codec's input (2: overlays only; 3: glowing classes only; it is hashed into the key, so an earlier version's entries are never loaded) | Road disk entries |
 | `ROAD_CODEC_VERSION` (1) | The byte layout of a road entry's payload changes | Road disk entries (another layout does not decode) |
 
@@ -1258,11 +1278,14 @@ not the index.
 
 | Texture | Road texels | Raster | Composite | Without roads | Raster and generation | Increase |
 |---|---|---|---|---|---|---|
-| Geneva `23248_33872_ZL16` (8,878 segments rastered) | 10.8% | 4 ms | 4 ms | 304 ms | 312 ms | 2.5% |
-| Densest Tokyo `25792_58208_ZL16` (26,896 segments rastered) | 21.0% | 10 ms | 10 ms | 421 ms | 440 ms | 4.5% |
+| Geneva `23248_33872_ZL16` (8,878 segments rastered) | 8.8% | 2 ms | 4 ms | 309 ms | 314 ms | 1.9% |
+| Densest Tokyo `25792_58208_ZL16` (26,896 segments rastered) | 17.2% | 7 ms | 6 ms | 423 ms | 435 ms | 2.9% |
 
-With every class glowing these were 9.8 to 9.9% for Geneva and 15.8% for
-Tokyo.
+That is with lamps (32 m). In the same session the continuous glow
+(`lamps: None`) rastered in 4 and 10 ms, lit 10.8% and 21.0% of the
+texels, and cost 2.6% and 4.5%: a lamp's window is smaller than a
+segment's. With every class glowing these were 9.8 to 9.9% for Geneva
+and 15.8% for Tokyo.
 
 The densest Tokyo texture is the ZL16 texture of the tile holding the most
 road points. The segments rastered are those the cell index hands over,
@@ -1279,7 +1302,7 @@ generator's output is unchanged byte for byte.
 |---|---|---|
 | Source of the roads | The DSFs the simulator loads, at run time | The lit layer has to match the 3D roads the user's own scenery presents; a publish-time layer could not know the user's overlays |
 | Urban look | Glow on top of the pattern everywhere | Simple, and the pattern's street structure stays |
-| Rural look | A faint continuous glow; sparse lamps as a model option for testing | The lamps stay a test option until a flight compares the two |
+| Road look | Every glowing road a regular chain of lit lamps (32 m), the continuous glow kept as `lamps: None` | X-Plane's 3D roads read as dotted chains of lamps, and after the fourth flight the continuous glow read a little dense; the chain gives half its light per metre |
 | Airport roads | Included as any other road | `sim/filter/aptid` segments are kept; no airport ownership model |
 | Configuration | None | The road model is internal, like the LED model, and tuned by flight |
 | Road sources | Overlay DSFs only; a base mesh is read to its HEAD | X-Plane shows every overlay's network but one base mesh's, XEL's own wherever lit textures are served, which has no roads; so a tile no overlay gives a road has no road glow, as in the simulator. A Global Scenery fallback for such tiles was removed after the first flight as against X-Plane's conventions |
@@ -1339,7 +1362,8 @@ The LED stage (`led.rs`) turns neighbourhood patches LED white by class,
 brightness and package region.
 
 **Road lights.** The road network the simulator presents, read from the
-DSFs X-Plane loads, drawn as a glow composited last (see Road lights).
+DSFs X-Plane loads, drawn as chains of lamps composited last (see Road
+lights).
 
 ## Testing
 
@@ -1379,8 +1403,9 @@ DSFs X-Plane loads, drawn as a glow composited last (see Road lights).
   box, on random queries; the cell visit against every chain, on random
   tiles and queries; the raster against an independent plain `f64`
   reference (exact distances and `exp`, every class and lamps, two zooms
-  and two sizes, within 3e-4 of the class intensity); glow zoom
-  invariance, reach and culling; an
+  and two sizes, within 3e-4 of the class intensity); glow and lamp zoom
+  invariance (lamps on every glowing class), the continuous glow's digest
+  without lamps, reach and culling; an
   empty field leaving the generator's output byte for byte, with the
   LED-on golden digests pinned; the service's coalescing, deadlines,
   failure, permit and cache rules; the probe, generation, disk and

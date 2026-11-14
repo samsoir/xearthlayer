@@ -1,6 +1,7 @@
-//! Per-footprint road glow: for each texel the brightest class profile of
-//! any nearby segment, in 0..=1 (class intensity included). Light comes
-//! from geometry in metres, so it is world-anchored at every zoom.
+//! Per-footprint road light: for each texel the brightest profile of any
+//! nearby lamp (or, without lamps, segment glow), in 0..=1 (class
+//! intensity included). Light comes from geometry in metres, so it is
+//! world-anchored at every zoom.
 //!
 //! Cost: a merged tile hands over only the chains filed in cells near the
 //! footprint (no test per chain of the tile), a point's northing is a
@@ -16,7 +17,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::class::RoadClass;
 use super::merge::{ChainRef, MergedRoads};
 use super::model::{ClassParams, LampParams, RoadModel};
 use crate::fuse::DdsFilename;
@@ -31,9 +31,11 @@ const COS_REACH_FLOOR: f64 = 0.087_155_742_747_658_17; // cos 85 degrees
 /// of a `size` x `size` raster, in degrees, for either axis: the widest
 /// reach of any class (half width + 3 sigma, with the sigma never below a
 /// texel's ground size) over the least metres per degree (longitude, at the
-/// footprint's highest latitude). Cheap and allocation free: only the
-/// footprint's edges are needed. The raster culls with it and the has-light
-/// probe must use it too, so the two cannot disagree.
+/// footprint's highest latitude). A lamp is a class glow without its core,
+/// so lamps reach further only by a sigma floor wider than every class's.
+/// Cheap and allocation free: only the footprint's edges are needed. The
+/// raster culls with it and the has-light probe must use it too, so the two
+/// cannot disagree.
 pub fn reach_deg(name: &DdsFilename, size: u32, model: &RoadModel) -> f64 {
     let fp = Footprint::from_name(name);
     let metres_per_degree = EARTH_RADIUS_M.to_radians();
@@ -53,7 +55,7 @@ pub fn reach_deg(name: &DdsFilename, size: u32, model: &RoadModel) -> f64 {
         .map(|p| f64::from(p.half_width_m) + 3.0 * f64::from(p.sigma_m).max(texel_max))
         .fold(0.0, f64::max);
     let lamps = model
-        .rural_lamps
+        .lamps
         .map_or(0.0, |l| 3.0 * f64::from(l.sigma_m).max(texel_max));
     let reach_m = glow.max(lamps);
     let highest = fp.south.abs().max(fp.north.abs()) + reach_m / metres_per_degree;
@@ -150,7 +152,7 @@ impl RoadField {
             tile.for_each_chain_near(south, west, north, east, |chain| {
                 let canvas = canvas.get_or_insert_with(|| Canvas::new(Grid::new(name, size)));
                 let ys = northings.get_or_insert_with(|| Northings::new(&chain, south, north));
-                let class = chain.class();
+                let p = model.classes[chain.class().index()];
                 pts.clear();
                 pts.extend(
                     chain
@@ -159,14 +161,11 @@ impl RoadField {
                         .map(|((lon, lat), &step)| (mercator(0.0, lon).0, ys.at(step, lat))),
                 );
                 segments += pts.len().saturating_sub(1);
-                let lamps = model
-                    .rural_lamps
-                    .filter(|_| !matches!(class, RoadClass::Motorway | RoadClass::Ramp));
-                match lamps {
-                    None => canvas.draw_glow(&pts, model.classes[class.index()]),
+                match model.lamps {
+                    None => canvas.draw_glow(&pts, p),
                     Some(l) => {
                         let first = chain.points().next().unwrap_or_default();
-                        canvas.draw_lamps(&pts, chain_key(first), &l);
+                        canvas.draw_lamps(&pts, chain_key(first), &l, p);
                     }
                 }
             });
@@ -364,12 +363,13 @@ impl Canvas {
         }
     }
 
-    /// The lamps of a polyline (Mercator metres), each a point glow.
-    fn draw_lamps(&mut self, pts: &[(f64, f64)], key: i64, l: &LampParams) {
-        let sigma = f64::from(l.sigma_m);
-        lamp_positions(pts, key, l, |at| {
-            self.stamp(at, at, 0.0, sigma, l.intensity)
-        });
+    /// The lamps of a polyline (Mercator metres) of class `p`, each a point
+    /// glow with the class sigma (or the lamp floor, when wider) at the
+    /// class intensity scaled by the lamp's.
+    fn draw_lamps(&mut self, pts: &[(f64, f64)], key: i64, l: &LampParams, p: ClassParams) {
+        let sigma = f64::from(l.sigma_m.max(p.sigma_m));
+        let intensity = p.intensity * l.intensity;
+        lamp_positions(pts, key, l, |at| self.stamp(at, at, 0.0, sigma, intensity));
     }
 
     /// Max-combines the profile of the segment `a` to `b` (Mercator
@@ -518,10 +518,17 @@ fn falloff(u: f32) -> f32 {
 pub(crate) mod tests {
     use super::*;
     use crate::fuse::TextureKind;
+    use crate::night::roads::class::RoadClass;
     use crate::night::roads::dsf::{Chains, DsfRoads};
     use crate::night::roads::merge::Merger;
     use crate::night::roads::model::LampParams;
     use crate::night::Footprint;
+
+    /// The default model with the continuous glow instead of lamps.
+    const GLOW: RoadModel = RoadModel {
+        lamps: None,
+        ..RoadModel::DEFAULT
+    };
 
     pub(crate) fn name_at_zoom(lat: f64, lon: f64, zoom: u8) -> DdsFilename {
         let n = f64::from(1u32 << zoom);
@@ -788,22 +795,20 @@ pub(crate) mod tests {
         roads.for_each_chain_near(lat0, lon0, lat0 + 1.0, lon0 + 1.0, |chain| {
             let deg: Vec<(f64, f64)> = chain.points().collect();
             let pts: Vec<(f64, f64)> = deg.iter().map(|&(x, y)| project(x, y)).collect();
-            let class = chain.class();
-            let lamps = model
-                .rural_lamps
-                .filter(|_| class != RoadClass::Motorway && class != RoadClass::Ramp);
-            match lamps {
+            let p = model.classes[chain.class().index()];
+            match model.lamps {
+                // A point glow per lamp, the class's sigma unless the lamp
+                // floor is wider, at the class intensity scaled by the lamp's.
                 Some(l) => lamp_positions(&pts, chain_key(deg[0]), &l, |at| {
                     marks.push(Mark {
                         a: at,
                         b: at,
                         half_width: 0.0,
-                        sigma_m: f64::from(l.sigma_m),
-                        intensity: f64::from(l.intensity),
+                        sigma_m: f64::from(l.sigma_m).max(f64::from(p.sigma_m)),
+                        intensity: f64::from(p.intensity) * f64::from(l.intensity),
                     })
                 }),
                 None => {
-                    let p = model.classes[class.index()];
                     for w in pts.windows(2) {
                         marks.push(Mark {
                             a: w[0],
@@ -905,17 +910,19 @@ pub(crate) mod tests {
 
     #[test]
     fn the_raster_matches_an_independent_reference_in_plain_f64() {
-        let lamps = RoadModel {
-            rural_lamps: Some(LampParams::TEST),
+        let sparse = RoadModel {
+            lamps: Some(LampParams::TEST),
             ..RoadModel::DEFAULT
         };
-        // Each class alone, so the tolerance is its own intensity, then
-        // lamps beside motorways.
+        // Each class alone in the continuous glow, so the tolerance is its
+        // own intensity, then the default lamps on every glowing class, and
+        // sparse lamps whose sigma floor is wider than some classes'.
         let mut cases: Vec<(Vec<u8>, RoadModel)> = [100u8, 120, 10, 30, 50, 70, 75]
             .into_iter()
-            .map(|s| (vec![s], RoadModel::DEFAULT))
+            .map(|s| (vec![s], GLOW))
             .collect();
-        cases.push((vec![50, 70, 75, 100], lamps));
+        cases.push((vec![100, 120, 10, 30], RoadModel::DEFAULT));
+        cases.push((vec![100, 120, 10, 30, 50], sparse));
         // Texels from 3.3 m to 13 m: below and above every class sigma.
         for (zoom, size) in [(17u8, 256u32), (17, 512), (18, 256), (18, 512)] {
             let name = name_at_zoom(46.5, 6.5, zoom);
@@ -929,8 +936,8 @@ pub(crate) mod tests {
                         let class = RoadClass::of(s).unwrap();
                         model.classes[class.index()].intensity
                     })
-                    .chain(model.rural_lamps.map(|l| l.intensity))
-                    .fold(0.0f32, f32::max);
+                    .fold(0.0f32, f32::max)
+                    * model.lamps.map_or(1.0, |l| l.intensity);
                 let tolerance = 3e-4 * f64::from(intensity) + 1e-6;
                 let (mut lit, mut edges, mut worst) = (0, 0, 0.0f64);
                 for i in 0..size {
@@ -1057,7 +1064,7 @@ pub(crate) mod tests {
     #[test]
     fn a_road_lights_a_line_and_fades_with_distance() {
         let n = name_at_zoom(46.5, 6.5, 16);
-        let f = crossing_field(&n, 256);
+        let f = RoadField::raster(&n, 256, &[crossing(&n)], &GLOW);
         let mid = 128;
         let on = f.at(mid, mid);
         assert!(on > 0.9, "core at full class intensity, got {on}");
@@ -1101,18 +1108,57 @@ pub(crate) mod tests {
         }
     }
 
+    /// FNV-1a over the bits of every texel of `f`.
+    fn field_digest(f: &RoadField) -> u64 {
+        (0..f.size())
+            .flat_map(|i| (0..f.size()).map(move |j| (i, j)))
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, (i, j)| {
+                f.at(i, j)
+                    .to_bits()
+                    .to_le_bytes()
+                    .iter()
+                    .fold(h, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+            })
+    }
+
     #[test]
-    fn rural_lamps_draw_dots_not_a_line() {
+    fn without_lamps_roads_get_the_continuous_glow_byte_for_byte() {
+        // The digest of the continuous glow as it was drawn before lamps
+        // became the default (cf0e147): a street grid of every class and
+        // a motorway across it.
         let n = name_at_zoom(46.5, 6.5, 16);
-        let roads = across(&n, 50);
-        let glow = RoadField::raster(&n, 1024, &[roads.clone()], &RoadModel::DEFAULT);
-        let lamp_model = RoadModel {
-            rural_lamps: Some(LampParams::TEST),
-            ..RoadModel::DEFAULT
-        };
-        let lamps = RoadField::raster(&n, 1024, &[roads], &lamp_model);
-        assert!(lamps.stats.lit_texels > 0);
-        assert!(lamps.stats.lit_texels < glow.stats.lit_texels);
+        let roads = [street_grid_over(&n, 150.0), crossing(&n)];
+        let f = RoadField::raster(&n, 512, &roads, &GLOW);
+        assert!(f.stats.lit_texels > 512 * 8, "{:?}", f.stats);
+        assert_eq!(
+            field_digest(&f),
+            0x5aca_5cf7_6567_3b7e,
+            "{:016x}",
+            field_digest(&f)
+        );
+    }
+
+    #[test]
+    fn every_glowing_class_is_drawn_as_a_chain_of_lamps() {
+        let n = name_at_zoom(46.5, 6.5, 16);
+        let size = 1024;
+        for subtype in [100u8, 120, 10, 30] {
+            let class = RoadClass::of(subtype).unwrap();
+            let intensity = RoadModel::DEFAULT.classes[class.index()].intensity;
+            let roads = [across(&n, subtype)];
+            let glow = RoadField::raster(&n, size, &roads, &GLOW);
+            let lamps = RoadField::raster(&n, size, &roads, &RoadModel::DEFAULT);
+            // The road runs north to south: the brightest texel of each row,
+            // away from the edges.
+            let peaks: Vec<f32> = (8..size - 8)
+                .map(|i| (0..size).map(|j| lamps.at(i, j)).fold(0.0, f32::max))
+                .collect();
+            let hi = peaks.iter().copied().fold(0.0, f32::max);
+            let lo = peaks.iter().copied().fold(f32::MAX, f32::min);
+            assert!(hi > 0.8 * intensity, "{class:?}: a lamp at {hi}");
+            assert!(lo < 0.7 * hi, "{class:?}: {lo} between lamps, {hi} on one");
+            assert!(lamps.stats.lit_texels < glow.stats.lit_texels, "{class:?}");
+        }
     }
 
     #[test]
@@ -1149,44 +1195,84 @@ pub(crate) mod tests {
             reach_deg(&z12, 1024, &m) > fine,
             "a lower zoom reaches further"
         );
-        let lamps = RoadModel {
-            rural_lamps: Some(LampParams::TEST),
+        // A lamp is as wide as its class's glow without the core, unless
+        // its sigma floor is wider than every class reach.
+        assert_eq!(reach_deg(&z16, 1024, &GLOW), fine);
+        let wide = RoadModel {
+            lamps: Some(LampParams {
+                sigma_m: 40.0,
+                ..LampParams::DEFAULT
+            }),
             ..m
         };
-        assert!(reach_deg(&z16, 1024, &lamps) >= fine);
+        assert!(reach_deg(&z16, 1024, &wide) > fine);
         // Never divides by zero near a pole.
         let polar = name_at_zoom(84.9, 6.5, 12);
         assert!(reach_deg(&polar, 64, &m).is_finite());
     }
 
     #[test]
-    fn rural_lamps_land_on_the_same_ground_at_any_zoom() {
+    fn a_lamp_has_its_class_sigma_unless_its_floor_is_wider() {
+        // ZL18 at 512 px: 3.3 m texels, below the class sigma of 8 m.
+        let n = name_at_zoom(46.5, 6.5, 18);
+        let p = RoadModel::DEFAULT.classes[RoadClass::Secondary.index()];
+        // One lamp (the chain is shorter than the spacing) on a texel centre:
+        // its value there and three texels east, and that distance.
+        let draw = |l: LampParams| {
+            let mut c = Canvas::new(Grid::new(&n, 512));
+            let at = (c.grid.xs[256], c.grid.ys[256]);
+            c.draw_lamps(&[at, at], 0, &l, p);
+            let metres = (c.grid.xs[259] - c.grid.xs[256]) * c.grid.cos[256];
+            let row = &c.profile[256 * 512..257 * 512];
+            (row[256], f64::from(row[259]), metres)
+        };
+        let lamp = LampParams {
+            spacing_m: 1000.0,
+            lit_share: 1.0,
+            sigma_m: 2.0,
+            intensity: 0.5,
+        };
+        let (peak, side, metres) = draw(lamp);
+        assert_eq!(peak, p.intensity * 0.5, "class intensity times the lamp's");
+        let want = |sigma: f64| f64::from(peak) * (-(metres / sigma).powi(2) / 2.0).exp();
+        assert!((side - want(8.0)).abs() < 1e-3, "{side} for {}", want(8.0));
+        let (_, wide, _) = draw(LampParams {
+            sigma_m: 20.0,
+            ..lamp
+        });
+        assert!(
+            (wide - want(20.0)).abs() < 1e-3,
+            "{wide} for {}",
+            want(20.0)
+        );
+    }
+
+    #[test]
+    fn lamps_land_on_the_same_ground_at_any_zoom() {
         let n16 = name_at_zoom(46.5, 6.5, 16);
         let f = Footprint::from_name(&n16);
         let w = f.east - f.west;
-        // A slanted local road through the north-west quarter.
+        // A slanted road of every glowing class through the north-west
+        // quarter.
         let roads = merged(
             (46, 6),
-            &[(
-                50,
-                vec![
-                    (f.west + 0.2 * w, f.north + 0.01),
-                    (f.west + 0.3 * w, f.south - 0.01),
-                ],
-            )],
+            &[100u8, 120, 10, 30]
+                .iter()
+                .enumerate()
+                .map(|(k, &s)| {
+                    let x = f.west + (0.05 + 0.1 * k as f64) * w;
+                    (s, vec![(x, f.north + 0.01), (x + 0.1 * w, f.south - 0.01)])
+                })
+                .collect::<Vec<_>>(),
         );
-        let model = RoadModel {
-            rural_lamps: Some(LampParams::TEST),
-            ..RoadModel::DEFAULT
-        };
-        let f16 = RoadField::raster(&n16, 512, &[roads.clone()], &model);
+        let f16 = RoadField::raster(&n16, 512, &[roads.clone()], &RoadModel::DEFAULT);
         let n17 = DdsFilename {
             row: n16.row * 2,
             col: n16.col * 2,
             zoom: 17,
             ..n16.clone()
         };
-        let f17 = RoadField::raster(&n17, 256, &[roads], &model);
+        let f17 = RoadField::raster(&n17, 256, &[roads], &RoadModel::DEFAULT);
         let mut lit = 0;
         for i in 0..256 {
             for j in 0..256 {
@@ -1194,7 +1280,7 @@ pub(crate) mod tests {
                 lit += usize::from(f17.at(i, j) > 0.0);
             }
         }
-        assert!(lit > 20, "the shared quarter holds lamps: {lit}");
+        assert!(lit > 80, "the shared quarter holds lamps: {lit}");
     }
 
     #[test]
@@ -1216,18 +1302,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn motorways_stay_glowing_under_rural_lamps() {
-        let n = name_at_zoom(46.5, 6.5, 16);
-        let lamp_model = RoadModel {
-            rural_lamps: Some(LampParams::TEST),
-            ..RoadModel::DEFAULT
-        };
-        let f = RoadField::raster(&n, 256, &[crossing(&n)], &lamp_model);
-        assert!(f.at(128, 128) > 0.9);
-        assert!(f.at(10, 128) > 0.9, "lit along the whole line, not in dots");
-    }
-
-    #[test]
     fn a_chain_outside_the_footprint_leaves_it_dark() {
         let n = name_at_zoom(46.5, 6.5, 16);
         let f = Footprint::from_name(&n);
@@ -1240,9 +1314,7 @@ pub(crate) mod tests {
     #[test]
     fn a_class_with_more_intensity_is_brighter() {
         let n = name_at_zoom(46.5, 6.5, 16);
-        let at = |subtype| {
-            RoadField::raster(&n, 256, &[across(&n, subtype)], &RoadModel::DEFAULT).at(128, 128)
-        };
+        let at = |subtype| RoadField::raster(&n, 256, &[across(&n, subtype)], &GLOW).at(128, 128);
         assert!(at(100) > at(50));
         assert!(at(50) > at(75));
         assert!(at(75) > 0.0);
@@ -1339,16 +1411,7 @@ pub(crate) mod tests {
             tile.bytes(),
             tile.bytes() as f64 / chains as f64
         );
-        for (label, model) in [
-            ("glow", RoadModel::DEFAULT),
-            (
-                "lamps",
-                RoadModel {
-                    rural_lamps: Some(LampParams::TEST),
-                    ..RoadModel::DEFAULT
-                },
-            ),
-        ] {
+        for (label, model) in [("glow", GLOW), ("lamps", RoadModel::DEFAULT)] {
             for pass in ["cold", "warm"] {
                 let started = std::time::Instant::now();
                 let field = RoadField::raster(&n, 1024, &[tile.clone()], &model);
