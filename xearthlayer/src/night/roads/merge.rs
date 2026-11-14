@@ -1,19 +1,56 @@
 //! Merge one tile's DSF networks as X-Plane presents them: highest
 //! priority first; a chain is dropped when any point lies in a zone of a
 //! higher-priority DSF. Unlit subtypes are dropped too.
+//!
+//! The merged tile is what the road cache keeps in memory, so it is stored
+//! compactly: points as 16-bit offsets in the tile (1/65535 degree, about
+//! 1.7 m, far below a lit texel), one class byte per chain and a 4-byte box
+//! of 1/256 degree cells for culling. Consumers see degrees through
+//! [`MergedRoads::points`] and cull through [`MergedRoads::query`] and
+//! [`MergedRoads::in_box`], never the encoding.
 
 use super::class::RoadClass;
-use super::dsf::{Chains, DsfRoads};
+use super::dsf::DsfRoads;
 use super::exclusion::Exclusion;
+
+/// Steps per degree of a point offset.
+const STEPS: f64 = 65535.0;
+/// A cell is `1 << CELL_SHIFT` steps: 1/256 degree.
+const CELL_SHIFT: u32 = 8;
+/// Bytes held beyond the Vec contents (the struct itself, rounded).
+const FIXED_BYTES: usize = 64;
+
+/// A tile-relative offset (degrees, clamped to the tile) in steps.
+fn quantise(offset: f32) -> u16 {
+    (f64::from(offset).clamp(0.0, 1.0) * STEPS).round() as u16
+}
+
+fn cell_of(step: u16) -> u8 {
+    (step >> CELL_SHIFT) as u8
+}
+
+/// A query box in cells, as [`MergedRoads::query`] prepares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellBox {
+    south: u8,
+    west: u8,
+    north: u8,
+    east: u8,
+}
 
 /// One tile's lit road chains after the priority merge.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergedRoads {
     pub tile: (i32, i32),
-    pub chains: Chains,
-    pub class: Vec<RoadClass>,
-    /// Per chain `[south, west, north, east]`, offsets from the tile corner.
-    pub bbox: Vec<[f32; 4]>,
+    /// Point offsets east of the tile's west edge, in steps.
+    lon: Vec<u16>,
+    /// Point offsets north of the tile's south edge, in steps.
+    lat: Vec<u16>,
+    /// Chain `i` owns points `start[i]..start[i + 1]`.
+    start: Vec<u32>,
+    class: Vec<RoadClass>,
+    /// Per chain `[south, west, north, east]` cells containing every point.
+    bbox: Vec<[u8; 4]>,
     /// Chains dropped by a higher-priority exclusion zone.
     pub removed: usize,
 }
@@ -22,27 +59,79 @@ impl MergedRoads {
     pub fn empty(tile: (i32, i32)) -> Self {
         Self {
             tile,
-            chains: Chains::new(),
+            lon: vec![],
+            lat: vec![],
+            start: vec![0],
             class: vec![],
             bbox: vec![],
             removed: 0,
         }
     }
 
+    /// Number of chains.
+    pub fn len(&self) -> usize {
+        self.class.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.class.is_empty()
+    }
+
+    pub fn class(&self, i: usize) -> RoadClass {
+        self.class[i]
+    }
+
+    /// Chain `i`'s points as absolute `(lon, lat)` degrees.
+    pub fn points(&self, i: usize) -> impl Iterator<Item = (f64, f64)> + '_ {
+        let r = self.start[i] as usize..self.start[i + 1] as usize;
+        let (lat0, lon0) = (f64::from(self.tile.0), f64::from(self.tile.1));
+        self.lon[r.clone()]
+            .iter()
+            .zip(&self.lat[r])
+            .map(move |(&x, &y)| (lon0 + f64::from(x) / STEPS, lat0 + f64::from(y) / STEPS))
+    }
+
     /// Heap bytes held, for the byte-bounded tile cache.
     pub fn bytes(&self) -> usize {
-        self.chains.bytes() + self.class.len() + self.bbox.len() * 16 + 64
+        self.lon.len() * 2
+            + self.lat.len() * 2
+            + self.start.len() * 4
+            + self.class.len()
+            + self.bbox.len() * 4
+            + FIXED_BYTES
+    }
+
+    /// An absolute-degree box as cells of this tile, or `None` when it
+    /// misses the tile. Conservative: every point whose exact or decoded
+    /// position is in the box is in a cell of the result.
+    pub fn query(&self, south: f64, west: f64, north: f64, east: f64) -> Option<CellBox> {
+        let (lat0, lon0) = (f64::from(self.tile.0), f64::from(self.tile.1));
+        // Half a step either way covers the rounding of a point's offset.
+        let range = |lo: f64, hi: f64, origin: f64| {
+            let (lo, hi) = ((lo - origin) * STEPS - 0.5, (hi - origin) * STEPS + 0.5);
+            (hi >= 0.0 && lo <= STEPS)
+                .then(|| (cell_of(lo.max(0.0) as u16), cell_of(hi.min(STEPS) as u16)))
+        };
+        let (south, north) = range(south, north, lat0)?;
+        let (west, east) = range(west, east, lon0)?;
+        Some(CellBox {
+            south,
+            west,
+            north,
+            east,
+        })
+    }
+
+    /// Whether chain `i`'s cell box meets `q`.
+    pub fn in_box(&self, i: usize, q: &CellBox) -> bool {
+        let b = self.bbox[i];
+        b[2] >= q.south && b[0] <= q.north && b[3] >= q.west && b[1] <= q.east
     }
 
     /// Whether any chain's box meets the box (absolute degrees).
     pub fn crosses(&self, south: f64, west: f64, north: f64, east: f64) -> bool {
-        let (lat0, lon0) = (f64::from(self.tile.0), f64::from(self.tile.1));
-        self.bbox.iter().any(|b| {
-            f64::from(b[2]) + lat0 >= south
-                && f64::from(b[0]) + lat0 <= north
-                && f64::from(b[3]) + lon0 >= west
-                && f64::from(b[1]) + lon0 <= east
-        })
+        self.query(south, west, north, east)
+            .is_some_and(|q| (0..self.len()).any(|i| self.in_box(i, &q)))
     }
 }
 
@@ -63,8 +152,9 @@ impl Merger {
     }
 
     /// Merges `layer` under every layer added before it, then adds its own
-    /// zones for the layers below. Appends straight from the layer's
-    /// arrays: no allocation per chain.
+    /// zones for the layers below. Quantises straight from the layer's
+    /// arrays into the output: no allocation per chain. The exclusion test
+    /// uses the layer's exact points.
     pub fn add(&mut self, layer: &DsfRoads) {
         let (lat0, lon0) = (f64::from(self.tile.0), f64::from(self.tile.1));
         let c = &layer.chains;
@@ -73,6 +163,9 @@ impl Merger {
                 continue;
             };
             let pts = c.points(i);
+            if pts.is_empty() {
+                continue;
+            }
             let (lon, lat) = (&c.lon[pts.clone()], &c.lat[pts]);
             if !self.zones.is_empty()
                 && lon.iter().zip(lat).any(|(&x, &y)| {
@@ -83,13 +176,18 @@ impl Merger {
                 self.out.removed += 1;
                 continue;
             }
-            let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+            let out = &mut self.out;
+            // Min and max step of `[south, west, north, east]`.
+            let mut b = [u16::MAX, u16::MAX, 0, 0];
             for (&x, &y) in lon.iter().zip(lat) {
-                b = [b[0].min(y), b[1].min(x), b[2].max(y), b[3].max(x)];
+                let (qx, qy) = (quantise(x), quantise(y));
+                out.lon.push(qx);
+                out.lat.push(qy);
+                b = [b[0].min(qy), b[1].min(qx), b[2].max(qy), b[3].max(qx)];
             }
-            self.out.chains.push_from(c, i);
-            self.out.class.push(class);
-            self.out.bbox.push(b);
+            out.start.push(out.lon.len() as u32);
+            out.class.push(class);
+            out.bbox.push(b.map(cell_of));
         }
         self.zones.extend(layer.exclusions.iter().cloned());
     }
@@ -103,10 +201,9 @@ impl Merger {
 
     pub fn finish(mut self) -> MergedRoads {
         let o = &mut self.out;
-        o.chains.lon.shrink_to_fit();
-        o.chains.lat.shrink_to_fit();
-        o.chains.start.shrink_to_fit();
-        o.chains.subtype.shrink_to_fit();
+        o.lon.shrink_to_fit();
+        o.lat.shrink_to_fit();
+        o.start.shrink_to_fit();
         o.class.shrink_to_fit();
         o.bbox.shrink_to_fit();
         self.out
@@ -116,6 +213,8 @@ impl Merger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::night::generator::noise::{hash2, unit};
+    use crate::night::roads::dsf::Chains;
 
     fn layer(chains: &[(u8, &[(f32, f32)])], zones: &[&str]) -> DsfRoads {
         let mut c = Chains::new();
@@ -137,6 +236,19 @@ mod tests {
         m.covered()
     }
 
+    fn merged_of(chains: &[(u8, &[(f32, f32)])]) -> MergedRoads {
+        let mut m = Merger::new((46, 6));
+        m.add(&layer(chains, &[]));
+        m.finish()
+    }
+
+    /// Chain `i` decoded to tile-relative offsets.
+    fn offsets(r: &MergedRoads, i: usize) -> Vec<(f64, f64)> {
+        r.points(i).map(|(x, y)| (x - 6.0, y - 46.0)).collect()
+    }
+
+    const STEP: f64 = 1.0 / 65535.0;
+
     #[test]
     fn a_higher_zone_removes_lower_chains_with_any_point_inside() {
         let mut m = Merger::new((46, 6));
@@ -154,11 +266,7 @@ mod tests {
             &[],
         ));
         let r = m.finish();
-        assert_eq!(
-            r.chains.len(),
-            2,
-            "high chain + the low chain wholly outside"
-        );
+        assert_eq!(r.len(), 2, "high chain + the low chain wholly outside");
         assert_eq!(r.removed, 1);
     }
 
@@ -168,7 +276,7 @@ mod tests {
         m.add(&layer(&[(10, &[(0.1, 0.1), (0.2, 0.2)])], &[]));
         m.add(&layer(&[(50, &[(0.3, 0.3), (0.4, 0.4)])], &["6/46/7/47"]));
         let r = m.finish();
-        assert_eq!(r.chains.len(), 2);
+        assert_eq!(r.len(), 2);
         assert_eq!(r.removed, 0);
     }
 
@@ -181,18 +289,17 @@ mod tests {
 
     #[test]
     fn unlit_subtypes_are_not_merged_and_classes_and_boxes_follow_chains() {
-        let mut m = Merger::new((46, 6));
-        m.add(&layer(
-            &[
-                (74, &[(0.1, 0.1), (0.2, 0.2)]),
-                (100, &[(0.3, 0.5), (0.6, 0.4)]),
-            ],
-            &[],
-        ));
-        let r = m.finish();
-        assert_eq!(r.chains.len(), 1);
-        assert_eq!(r.class, vec![RoadClass::Motorway]);
-        assert_eq!(r.bbox[0], [0.4, 0.3, 0.5, 0.6]);
+        let r = merged_of(&[
+            (74, &[(0.1, 0.1), (0.2, 0.2)]),
+            (100, &[(0.3, 0.5), (0.6, 0.4)]),
+        ]);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.class(0), RoadClass::Motorway);
+        // Points are (lon, lat) offsets: lon 0.3..0.6, lat 0.4..0.5. The
+        // cell box is [south, west, north, east] in 1/256 degree cells and
+        // asymmetric on purpose, so a swapped axis fails.
+        let cell = |v: f64| (((v * 65535.0).round() as u16) >> 8) as u8;
+        assert_eq!(r.bbox[0], [cell(0.4), cell(0.3), cell(0.5), cell(0.6)]);
         assert!(r.crosses(46.45, 6.35, 46.46, 6.36));
         assert!(!r.crosses(46.8, 6.8, 46.9, 6.9));
     }
@@ -212,18 +319,164 @@ mod tests {
             &[],
         ));
         let r = m.finish();
-        let mut expect = Chains::new();
-        expect.push(10, &[(0.1, 0.2), (0.3, 0.4)]);
-        expect.push(50, &[(0.5, 0.6), (0.7, 0.8), (0.9, 0.95)]);
-        assert_eq!(r.chains, expect);
+        assert_eq!(r.len(), 2);
         assert_eq!(r.removed, 1);
-        assert!(r.bytes() >= r.chains.bytes());
+        let close = |got: Vec<(f64, f64)>, want: &[(f64, f64)]| {
+            assert_eq!(got.len(), want.len());
+            for (g, w) in got.iter().zip(want) {
+                assert!(
+                    (g.0 - w.0).abs() < STEP && (g.1 - w.1).abs() < STEP,
+                    "{g:?} {w:?}"
+                );
+            }
+        };
+        close(offsets(&r, 0), &[(0.1, 0.2), (0.3, 0.4)]);
+        close(offsets(&r, 1), &[(0.5, 0.6), (0.7, 0.8), (0.9, 0.95)]);
+        assert_eq!(
+            (r.class(0), r.class(1)),
+            (RoadClass::Primary, RoadClass::Local)
+        );
+        assert!(r.bytes() > 0);
     }
 
     #[test]
     fn an_empty_merge_crosses_nothing() {
         let r = MergedRoads::empty((46, 6));
         assert!(!r.crosses(46.0, 6.0, 47.0, 7.0));
-        assert_eq!(r.chains.len(), 0);
+        assert_eq!(r.len(), 0);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn a_road_class_is_one_byte() {
+        assert_eq!(std::mem::size_of::<RoadClass>(), 1);
+    }
+
+    #[test]
+    fn points_round_trip_within_half_a_step_and_clamp_at_the_edges() {
+        let xs = [0.0f32, 1.0, -1e-6, 1.000_001, 0.123_456, 0.5, 0.999_99];
+        let pts: Vec<(f32, f32)> = xs.iter().map(|&x| (x, 1.0 - x)).collect();
+        let r = merged_of(&[(100, &pts)]);
+        let got = offsets(&r, 0);
+        for ((&x, g), &(ox, oy)) in xs.iter().zip(&got).zip(&pts) {
+            let want_x = f64::from(ox).clamp(0.0, 1.0);
+            let want_y = f64::from(oy).clamp(0.0, 1.0);
+            assert!(
+                (g.0 - want_x).abs() <= STEP / 2.0 + 1e-6,
+                "lon {x}: {}",
+                g.0
+            );
+            assert!(
+                (g.1 - want_y).abs() <= STEP / 2.0 + 1e-6,
+                "lat {x}: {}",
+                g.1
+            );
+            assert!((0.0..=1.0).contains(&g.0) && (0.0..=1.0).contains(&g.1));
+        }
+        assert_eq!(got[0].0, 0.0);
+        assert_eq!(got[1].0, 1.0);
+        assert_eq!(got[2].0, 0.0, "clamped, not wrapped");
+        assert_eq!(got[3].0, 1.0, "clamped, not wrapped");
+    }
+
+    /// Chains of 2 to 5 points: corners, edges and pseudo-random.
+    fn sample_chains() -> Vec<Vec<(f32, f32)>> {
+        let mut out = vec![
+            vec![(0.0, 0.0), (0.0, 0.0)],
+            vec![(1.0, 1.0), (1.0, 1.0)],
+            vec![(0.0, 1.0), (1.0, 0.0)],
+            vec![(0.999_99, 0.5), (1.0, 0.5)],
+            vec![(0.5, 0.003_906_25), (0.5, 0.003_906_3)],
+        ];
+        for k in 0..300i64 {
+            let n = 2 + (hash2(k, 0, 1) % 4) as usize;
+            let mut p = vec![];
+            let (mut x, mut y) = (unit(hash2(k, 1, 1)), unit(hash2(k, 2, 1)));
+            for m in 0..n as i64 {
+                p.push((x.clamp(0.0, 1.0) as f32, y.clamp(0.0, 1.0) as f32));
+                x += (unit(hash2(k, 3 + m, 1)) - 0.5) * 0.05;
+                y += (unit(hash2(k, 40 + m, 1)) - 0.5) * 0.05;
+            }
+            out.push(p);
+        }
+        out
+    }
+
+    #[test]
+    fn cell_boxes_hold_their_chain_and_never_miss_a_query_it_meets() {
+        let chains = sample_chains();
+        let input: Vec<(u8, &[(f32, f32)])> = chains.iter().map(|c| (100u8, &c[..])).collect();
+        let r = merged_of(&input);
+        assert_eq!(r.len(), chains.len());
+        let (lat0, lon0) = (46.0, 6.0);
+        for (i, c) in chains.iter().enumerate() {
+            let b = r.bbox[i];
+            for (x, y) in r.points(i) {
+                // Each decoded point lies inside its cell box.
+                let cx = ((x - lon0) * 65535.0).round() as u16 >> 8;
+                let cy = ((y - lat0) * 65535.0).round() as u16 >> 8;
+                assert!(b[1] as u16 <= cx && cx <= b[3] as u16, "chain {i} lon cell");
+                assert!(b[0] as u16 <= cy && cy <= b[2] as u16, "chain {i} lat cell");
+            }
+            // A query around each exact input point finds the chain, at any size.
+            for &(x, y) in c {
+                let (x, y) = (lon0 + f64::from(x), lat0 + f64::from(y));
+                for grow in [0.0, 1e-6, 0.0004, 0.01] {
+                    let q = r.query(y - grow, x - grow, y + grow, x + grow).unwrap();
+                    assert!(r.in_box(i, &q), "chain {i} at {x},{y} grow {grow}");
+                }
+            }
+        }
+        // Random boxes: whenever an exact point lies in the box, the chain is found.
+        for k in 0..500i64 {
+            let (x, y) = (unit(hash2(k, 7, 2)), unit(hash2(k, 8, 2)));
+            let (w, h) = (unit(hash2(k, 9, 2)) * 0.1, unit(hash2(k, 10, 2)) * 0.1);
+            let (s, wst, n, e) = (lat0 + y, lon0 + x, lat0 + y + h, lon0 + x + w);
+            let q = r.query(s, wst, n, e);
+            for (i, c) in chains.iter().enumerate() {
+                let meets = c.iter().any(|&(px, py)| {
+                    let (px, py) = (lon0 + f64::from(px), lat0 + f64::from(py));
+                    (wst..=e).contains(&px) && (s..=n).contains(&py)
+                });
+                if meets {
+                    assert!(q.is_some_and(|q| r.in_box(i, &q)), "chain {i} box {k}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn query_and_crosses_handle_the_tile_edges() {
+        let r = merged_of(&[(100, &[(0.9, 1.0), (1.0, 1.0)])]);
+        // A chain on the north and east edge (offset 1.0) is found.
+        assert!(r.crosses(46.999, 6.999, 47.0, 7.0));
+        assert!(r.query(46.999, 6.999, 47.0, 7.0).is_some());
+        // A box that only overlaps the tile edge, mostly outside, finds it too.
+        assert!(r.crosses(46.9999, 6.95, 47.5, 7.5));
+        // Boxes wholly outside the tile miss.
+        assert!(!r.crosses(47.01, 6.0, 47.5, 7.5));
+        assert!(r.query(47.01, 6.0, 47.5, 7.5).is_none());
+        assert!(r.query(45.0, 6.0, 45.99, 7.0).is_none());
+        assert!(r.query(46.0, 7.01, 47.0, 7.5).is_none());
+        assert!(r.query(46.0, 4.0, 47.0, 5.99).is_none());
+        // And a box in the tile's empty corner does not.
+        assert!(!r.crosses(46.0, 6.0, 46.1, 6.1));
+    }
+
+    #[test]
+    fn bytes_counts_every_vec() {
+        // Chain A has 2 points, chain B has 3: 5 points, 2 chains.
+        let mut m = Merger::new((46, 6));
+        m.add(&layer(
+            &[
+                (100, &[(0.1, 0.1), (0.2, 0.2)]),
+                (50, &[(0.3, 0.3), (0.4, 0.4), (0.5, 0.5)]),
+            ],
+            &[],
+        ));
+        let r = m.finish();
+        let expect = 5 * 2 + 5 * 2 + 3 * 4 + 2 + 2 * 4 + FIXED_BYTES;
+        assert_eq!(r.bytes(), expect);
+        assert_eq!(MergedRoads::empty((0, 0)).bytes(), 4 + FIXED_BYTES);
     }
 }

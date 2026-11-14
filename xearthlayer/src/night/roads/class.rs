@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum RoadClass {
     Motorway,
     Ramp,

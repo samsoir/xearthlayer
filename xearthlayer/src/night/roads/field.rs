@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::class::RoadClass;
-use super::dsf::Chains;
 use super::merge::MergedRoads;
 use super::model::{ClassParams, LampParams, RoadModel};
 use crate::fuse::DdsFilename;
@@ -127,42 +126,33 @@ impl RoadField {
         let mut pts: Vec<(f64, f64)> = Vec::new();
         let mut segments = 0usize;
         for tile in tiles {
-            if !tile.crosses(
+            // The footprint and its reach, as cells of this tile.
+            let Some(want) = tile.query(
                 fp.south - reach,
                 fp.west - reach,
                 fp.north + reach,
                 fp.east + reach,
-            ) {
+            ) else {
                 continue;
-            }
-            let canvas = canvas.get_or_insert_with(|| Canvas::new(Grid::new(name, size)));
-            let (lat0, lon0) = (f64::from(tile.tile.0), f64::from(tile.tile.1));
-            // The footprint and its reach as offsets from the tile corner.
-            let want = [
-                (fp.south - reach - lat0) as f32,
-                (fp.west - reach - lon0) as f32,
-                (fp.north + reach - lat0) as f32,
-                (fp.east + reach - lon0) as f32,
-            ];
-            for (ci, b) in tile.bbox.iter().enumerate() {
-                if b[2] < want[0] || b[0] > want[2] || b[3] < want[1] || b[1] > want[3] {
+            };
+            for ci in 0..tile.len() {
+                if !tile.in_box(ci, &want) {
                     continue;
                 }
-                let class = tile.class[ci];
+                let canvas = canvas.get_or_insert_with(|| Canvas::new(Grid::new(name, size)));
+                let class = tile.class(ci);
                 pts.clear();
-                pts.extend(tile.chains.points(ci).map(|p| {
-                    mercator(
-                        f64::from(tile.chains.lat[p]) + lat0,
-                        f64::from(tile.chains.lon[p]) + lon0,
-                    )
-                }));
+                pts.extend(tile.points(ci).map(|(lon, lat)| mercator(lat, lon)));
                 segments += pts.len().saturating_sub(1);
                 let lamps = model
                     .rural_lamps
                     .filter(|_| !matches!(class, RoadClass::Motorway | RoadClass::Ramp));
                 match lamps {
                     None => canvas.draw_glow(&pts, model.classes[class.index()]),
-                    Some(l) => canvas.draw_lamps(&pts, chain_key(&tile.chains, ci, lat0, lon0), &l),
+                    Some(l) => {
+                        let first = tile.points(ci).next().unwrap_or_default();
+                        canvas.draw_lamps(&pts, chain_key(first), &l);
+                    }
                 }
             }
         }
@@ -187,12 +177,11 @@ impl RoadField {
     }
 }
 
-/// The lamp key of a chain: its first point quantised to 1e-6 degrees.
-fn chain_key(chains: &Chains, ci: usize, lat0: f64, lon0: f64) -> i64 {
-    let p = chains.points(ci).start;
+/// The lamp key of a chain: its first point `(lon, lat)` quantised to 1e-6 degrees.
+fn chain_key((lon, lat): (f64, f64)) -> i64 {
     hash2(
-        ((f64::from(chains.lon[p]) + lon0) * 1e6).round() as i64,
-        ((f64::from(chains.lat[p]) + lat0) * 1e6).round() as i64,
+        (lon * 1e6).round() as i64,
+        (lat * 1e6).round() as i64,
         LAMP_SEED,
     ) as i64
 }
@@ -675,12 +664,14 @@ pub(crate) mod tests {
 
     /// A street grid over `[south, north] x [west, east]` (tile-relative
     /// degrees) with one east-west and one north-south chain of two to four
-    /// points per `pitch_m` cell, classes mixed by a hash of the cell.
+    /// points per `pitch_m` cell, classes mixed by a hash of the cell. A
+    /// chain gets one more interior point with a chance of `bends_pct` per cent.
     fn street_grid(
         c: &mut Chains,
         (south, north): (f32, f32),
         (west, east): (f32, f32),
         pitch_m: f64,
+        bends_pct: u64,
     ) {
         use crate::night::generator::noise::hash2;
         const SUBTYPES: [u8; 10] = [100, 120, 10, 30, 50, 50, 50, 70, 70, 75];
@@ -700,8 +691,15 @@ pub(crate) mod tests {
                 if (h >> 16) % 5 == 0 {
                     ew.insert(1, (lon + dlon * 0.2, lat - dlat * 0.05));
                 }
+                let mut ns = vec![(lon, lat), (lon, lat + dlat)];
+                if (h >> 24) % 100 < bends_pct {
+                    ew.insert(1, (lon + dlon * 0.6, lat));
+                }
+                if (h >> 32) % 100 < bends_pct {
+                    ns.insert(1, (lon + dlon * 0.02, lat + dlat * 0.5));
+                }
                 c.push(subtype, &ew);
-                c.push(subtype, &[(lon, lat), (lon, lat + dlat)]);
+                c.push(subtype, &ns);
                 j += 1;
                 lon += dlon;
             }
@@ -719,7 +717,7 @@ pub(crate) mod tests {
         let f = Footprint::from_name(&n);
         let mut c = Chains::new();
         // The whole tile at a 207 m pitch (about 400,000 chains) ...
-        street_grid(&mut c, (0.0, 1.0), (0.0, 1.0), 207.0);
+        street_grid(&mut c, (0.0, 1.0), (0.0, 1.0), 207.0, 0);
         // ... and a dense core over the footprint at an 80 m pitch.
         let rel = |v: f64, o: i32| (v - f64::from(o)) as f32;
         street_grid(
@@ -727,6 +725,7 @@ pub(crate) mod tests {
             (rel(f.south, 46), rel(f.north, 46)),
             (rel(f.west, 6), rel(f.east, 6)),
             80.0,
+            0,
         );
         let chains = c.len();
         let mut m = Merger::new((46, 6));
@@ -739,6 +738,11 @@ pub(crate) mod tests {
         });
         let tile = Arc::new(m.finish());
         println!("chains in the tile: {chains}");
+        println!(
+            "merged tile: {} bytes, {:.1} per chain",
+            tile.bytes(),
+            tile.bytes() as f64 / chains as f64
+        );
         for (label, model) in [
             ("glow", RoadModel::DEFAULT),
             (
@@ -759,6 +763,40 @@ pub(crate) mod tests {
                 );
                 assert!(!field.is_empty());
             }
+        }
+    }
+
+    /// A Tokyo-sized tile (about 1.93 million chains, about 5.9 million
+    /// points): what the merged tile holds and how long a texture takes.
+    #[test]
+    #[ignore]
+    fn merged_roads_of_a_tokyo_sized_tile() {
+        let n = name_at_zoom(35.7, 139.7, 16);
+        let mut c = Chains::new();
+        street_grid(&mut c, (0.0, 1.0), (0.0, 1.0), 94.0, 80);
+        let (chains, points) = (c.len(), c.lon.len());
+        let before = points * 8 + (chains + 1) * 4 + chains * 18;
+        let mut m = Merger::new((35, 139));
+        m.add(&DsfRoads {
+            tile: (35, 139),
+            overlay: true,
+            net_def: Some("n".into()),
+            exclusions: vec![],
+            chains: c,
+        });
+        let tile = Arc::new(m.finish());
+        println!(
+            "{chains} chains, {points} points: {} bytes now, {before} with f32 points and boxes",
+            tile.bytes()
+        );
+        for pass in ["cold", "warm"] {
+            let field = RoadField::raster(&n, 1024, &[tile.clone()], &RoadModel::DEFAULT);
+            println!(
+                "ZL16 1024 px {pass}: {:.1} ms, segments {}, lit texels {}",
+                field.stats.raster_us as f64 / 1e3,
+                field.stats.segments,
+                field.stats.lit_texels
+            );
         }
     }
 }
