@@ -58,7 +58,10 @@ pub trait LitGenerator: Send + Sync {
 /// then miss and are regenerated.
 ///
 /// 2: LED patches (`led`).
-pub const LIT_GENERATOR_VERSION: u32 = 2;
+/// 3: raised LED shares and toned sodium (`led::SodiumTone`, #363).
+/// 4: mips averaged in linear light (`lit_chain`, #363).
+/// 5: cooler LED whites and halved region shifts (#363).
+pub const LIT_GENERATOR_VERSION: u32 = 5;
 
 /// Gamma of the sRGB decode X-Plane applies to a texture's stored values.
 pub const SRGB_GAMMA: f32 = 2.2;
@@ -78,7 +81,7 @@ pub const FADE_RAMP: [f32; 1] = [0.8318];
 /// chain is downsampled from the undimmed image, then the levels named by
 /// [`FADE_RAMP`] are dimmed, so the levels below them stay at full light.
 pub fn encode_visible(image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsError> {
-    let mut chain = crate::dds::MipmapGenerator::generate_chain(&image);
+    let mut chain = lit_chain(&image);
     for (level, &gain) in chain.iter_mut().zip(FADE_RAMP.iter()) {
         for px in level.pixels_mut() {
             for c in &mut px.0[..3] {
@@ -89,6 +92,50 @@ pub fn encode_visible(image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsE
     let dds =
         crate::dds::DdsEncoder::new(crate::dds::DdsFormat::BC1).encode_with_mipmaps(&chain)?;
     Ok(bytes::Bytes::from(dds).slice(DDS_HEADER_LEN..))
+}
+
+/// The mip chain of a lit level down to 1 x 1, averaged in linear light.
+/// Lit art is bright points on black, and averaging stored (sRGB) values
+/// counts a lit texel beside dark ones at a fraction of its light: by the
+/// sixth level a town kept a quarter of its light, and blue, the sparsest
+/// channel of warm light, lost the most, so distance made every town dimmer
+/// and more orange (#363). Each level is averaged from the linear values of
+/// the level above, never from its rounded bytes. Alpha is linear already.
+fn lit_chain(image: &RgbaImage) -> Vec<RgbaImage> {
+    let decode: [f32; 256] = std::array::from_fn(|v| (v as f32 / 255.0).powf(SRGB_GAMMA));
+    let encode = |c: f32| (c.clamp(0.0, 1.0).powf(1.0 / SRGB_GAMMA) * 255.0).round() as u8;
+    let (mut w, mut h) = image.dimensions();
+    let mut linear: Vec<[f32; 4]> = image
+        .pixels()
+        .map(|p| {
+            let [r, g, b, a] = p.0;
+            [
+                decode[usize::from(r)],
+                decode[usize::from(g)],
+                decode[usize::from(b)],
+                f32::from(a) / 255.0,
+            ]
+        })
+        .collect();
+    let mut chain = vec![image.clone()];
+    while w > 1 && h > 1 {
+        let (nw, nh) = (w / 2, h / 2);
+        let above = &linear;
+        let at = |x: u32, y: u32| above[(y * w + x) as usize];
+        let next: Vec<[f32; 4]> = (0..nh)
+            .flat_map(|y| (0..nw).map(move |x| (x * 2, y * 2)))
+            .map(|(x, y)| {
+                let q = [at(x, y), at(x + 1, y), at(x, y + 1), at(x + 1, y + 1)];
+                std::array::from_fn(|c| (q[0][c] + q[1][c] + q[2][c] + q[3][c]) / 4.0)
+            })
+            .collect();
+        (linear, w, h) = (next, nw, nh);
+        chain.push(RgbaImage::from_fn(w, h, |x, y| {
+            let [r, g, b, a] = linear[(y * w + x) as usize];
+            image::Rgba([encode(r), encode(g), encode(b), (a * 255.0).round() as u8])
+        }));
+    }
+    chain
 }
 
 /// Bytes of a DDS header (magic plus the 124-byte header).
@@ -103,8 +150,8 @@ mod tests {
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
 
     #[test]
-    fn led_lighting_is_generator_version_two() {
-        assert_eq!(LIT_GENERATOR_VERSION, 2);
+    fn cooler_led_whites_are_generator_version_five() {
+        assert_eq!(LIT_GENERATOR_VERSION, 5);
     }
 
     fn name_at(lat: f64, lon: f64) -> DdsFilename {
@@ -181,6 +228,49 @@ mod tests {
         assert!(
             reds[1..].iter().all(|&r| near(r, 240.0)),
             "full below {reds:?}"
+        );
+    }
+
+    /// A one-texel checkerboard of `lit` and black.
+    fn checker(size: u32, lit: [u8; 3]) -> RgbaImage {
+        RgbaImage::from_fn(size, size, |x, y| {
+            let [r, g, b] = if (x + y) % 2 == 0 { lit } else { [0; 3] };
+            image::Rgba([r, g, b, 255])
+        })
+    }
+
+    fn light(v: u8) -> f32 {
+        (f32::from(v) / 255.0).powf(SRGB_GAMMA)
+    }
+
+    #[test]
+    fn mip_levels_keep_the_light_of_the_level_above() {
+        // Half the texels sodium, half black: every smaller level gives half
+        // the light in each channel, so it is neither dimmer nor warmer.
+        let lit = [200, 120, 50];
+        let source = checker(64, lit);
+        let chain = lit_chain(&source);
+        assert_eq!(chain.len(), 7, "64 px down to 1 px");
+        assert_eq!(chain[0], source, "the first level is the image");
+        for (level, img) in chain.iter().enumerate().skip(1) {
+            let p = img.get_pixel(0, 0);
+            for c in 0..3 {
+                let (got, want) = (light(p[c]), light(lit[c]) / 2.0);
+                assert!(
+                    (got - want).abs() <= want * 0.05,
+                    "level {level} channel {c}: {got} against {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_mips_average_light_not_stored_values() {
+        // Half of 240's light is stored 175; averaging stored values gives 120.
+        let reds = level_reds(&encode_visible(checker(64, [240; 3])).unwrap(), 64);
+        assert!(
+            reds[1..].iter().all(|&r| (i32::from(r) - 175).abs() <= 8),
+            "{reds:?}"
         );
     }
 

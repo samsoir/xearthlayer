@@ -234,6 +234,20 @@ level is at full light, and the ramp costs no bytes. Two steps (2/3 and
 scaling stored values instead of light (1/3 stored is about 9% of the
 light) read as black before the 3D lights were drawn.
 
+**Mips in linear light.** The chain below the first visible level is
+averaged in linear light (`lit_chain`, #363), not by averaging stored
+values as the ortho encoder does. Lit art is bright points on black, and a
+stored-value average counts a lit texel beside dark ones at a fraction of
+its light. Measured on a ZL16 texture over Mexico City, the stored-value
+chain kept 82% of the light at the first coarser level, 53% at the third
+and 24% at the sixth, and it warmed as it went: blue, the sparsest channel
+of warm light, lost the most, so linear B/R fell from 0.45 to 0.33 by the
+sixth level (0.17 to 0.04 for sodium alone). Distant towns, which X-Plane
+draws from those levels, read dimmer and more orange than the near ground.
+Each level is now averaged from the linear values of the level above, not
+from its rounded bytes, so every level keeps the light and colour of the
+first.
+
 A footprint without light is a fixed **minimal black DDS**: 4 × 4, BC1,
 with its full chain (4, 2 and 1 px levels), all blocks zero, 152 bytes
 (R6).
@@ -521,18 +535,42 @@ with no config keys, tuned in flight:
 
 | Category | Share | Base temperature |
 |---|---|---|
-| Industrial | 0.80 | 4500 K |
-| Urban bright | 0.75 | 4000 K |
-| Urban dim | 0.45 | 3200 K |
+| Industrial | 0.90 | 4500 K |
+| Urban bright | 0.90 | 4500 K |
+| Urban dim | 0.80 | 4000 K |
+
+The shares were raised from 0.80, 0.75 and 0.45 in #363: night photos of
+central Mexico and Mexico City from the air showed city light mostly
+neutral white (median saturation 0.08 to 0.21 over the brightest lit
+pixels, almost no saturated orange), against 0.34 and a quarter saturated
+orange in a 0.5.0 screenshot of Ontario, California, where most
+residential ground stayed sodium.
+
+The temperatures were raised from 4000 K (urban bright) and 3200 K (urban
+dim), and the region shifts halved from ±400 K, also in #363. Once the
+mips kept their light, the generated Bay Area textures (61 ZL16 textures
+from San Francisco to San Jose) were nine tenths LED by texel but still
+averaged to amber (linear R : G : B over luminance 1.44 : 0.92 : 0.53,
+saturation 0.37 as an sRGB colour), because a distant city is mostly
+residential white. With these values it averages to saturation 0.28; a
+stronger sodium tone (`mix` 0.45) moved it by nothing measurable. Field
+practice: US conversions before 2016 were mostly 4000 to 5000 K, after
+which the AMA's 3000 K guidance turned many residential streets warmer
+(Tacoma: 3000 K residential, 4000 K arterials); EU procurement guidance
+asks for warm white in residential areas, but most UK councils install
+4000 K or more. The continents converge more than they differ, so the
+shift is ±200 K, and how much of a region has converted (Belgium and
+Germany least in Europe, per the ISS colour maps of Sánchez de Miguel et
+al., 2022) is left to the share scale.
 
 | Region | Share scale | Temperature shift |
 |---|---|---|
-| NA | 1.0 | +400 K |
-| EU | 0.9 | -400 K |
-| OC | 0.9 | -400 K |
-| AS | 0.8 | -400 K |
-| SA | 0.7 | +400 K |
-| AF | 0.5 | +400 K |
+| NA | 1.0 | +200 K |
+| EU | 0.9 | -200 K |
+| OC | 0.9 | -200 K |
+| AS | 0.8 | -200 K |
+| SA | 0.7 | +200 K |
+| AF | 0.5 | +200 K |
 | Patch or unknown | 0.75 | 0 |
 
 **Recolour.** An LED texel keeps the luminance of the pattern sum (decoded
@@ -546,8 +584,24 @@ white until it is not. LED is therefore never dimmer than the sodium it
 replaces, and this holds after rounding to bytes: the generator compares
 the decoded luminance of the LED bytes with that of the sodium bytes for
 the same gain, and rounds the LED channels up, then falls back to the
-sodium bytes, when rounding to nearest would lose any. A sodium texel keeps its bytes exactly, and `LedModel::OFF`
+sodium bytes, when rounding to nearest would lose any. `LedModel::OFF`
 reproduces the sodium-only output.
+
+**Sodium tone.** The texels that stay sodium are toned too (#363,
+`SodiumTone`, `LedModel::sodium`). Laminar's sodium is linear
+R : G : B ≈ 1 : 0.38 : 0.08, about as saturated as a 2700 K blackbody
+(1 : 0.42 : 0.10), and high-pressure sodium itself sits near 2000 K, so a
+low-temperature white would not desaturate it: the hue is physically fair,
+and the change is perceptual (scatter, and the eye adapting to a mostly
+white city). Each sodium texel is mixed `mix` (0.30) of the way towards the
+3200 K white at its own luminance in linear light, then its luminance is
+multiplied by `1 + mix × (energy - 1)` with `energy` 1.125, about half the
+LED energy, because a less saturated light of equal luminance looks dimmer.
+Laminar's mean texel goes from saturation 0.68 to 0.63; sodium districts
+stay amber and never read as LED. The byte rule is the same as for LED: the
+toned bytes are never dimmer than Laminar's bytes at the same gain, and LED
+bytes are never dimmer than the toned ones. `SodiumTone::NONE` (in
+`LedModel::OFF`) returns Laminar's bytes exactly.
 
 **Regions.** The region is the first segment of the code of the package a
 recipe was read from (`NA-USA-MX-CENTRAL` is NA; legacy `na` and `eu`
@@ -555,8 +609,10 @@ work), recorded when the recipe is loaded, as the identity is. Patches
 (`_patches/...`), unknown codes and missing recipes are Unknown.
 
 **Cache.** The region is part of each tile's entry in the footprint
-fingerprint, and `LIT_GENERATOR_VERSION` is 2, so lit entries from before
-the LED stage miss once and regenerate; the GC ages the old ones out.
+fingerprint, and `LIT_GENERATOR_VERSION` is 5 (2 added the LED stage, 3
+the raised shares and the sodium tone, 4 the linear-light mips, 5 the
+cooler whites), so lit entries from before
+the current generator miss once and regenerate; the GC ages the old ones out.
 
 **Cost.** Measured with the ignored test
 `night::generator::cpu::tests::time_a_real_zl16_texture` (release, a real
