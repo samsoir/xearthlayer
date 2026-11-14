@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Night lighting
+
+- **Roads light up at night**: XEarthLayer's night lighting now draws a glow along the roads the simulator actually shows, read from the scenery X-Plane loads for each area, in the order `scenery_packs.ini` gives it: road overlays such as X-World Pro first, Global Scenery last, with each pack's road exclusions honoured as X-Plane honours them. Until now the lit streets were Laminar's city pattern rather than real roads, so close to the aircraft, where X-Plane's own 3D roads and lights take over, roads appeared where the night texture showed none, and roads across dark countryside appeared out of nothing. Major roads glow brighter and wider than residential streets and footpaths; in towns the glow sits on top of the city light, and between towns it stays faint. Its colour follows the city light around it, white where a neighbourhood is LED and soft amber where it is sodium. Roads are read when X-Plane loads an area, before its night textures are needed, and Global Scenery's compressed road data is kept in the night lighting disk cache, so it is decompressed once. Night lighting already saved on disk is generated again the first time it is needed, and again whenever the scenery packs that provide the roads change.
+
 ### Changed
 
 #### Dashboard
