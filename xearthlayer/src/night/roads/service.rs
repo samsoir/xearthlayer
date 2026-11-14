@@ -918,9 +918,9 @@ pub(crate) mod tests {
     /// chains of two points each, whatever a tile's fixed overhead is. The
     /// tests that use it assert their real tiles fit it.
     fn budget_for(tiles: usize) -> u64 {
-        // Per chain: two points of two u16 offsets, a start, a class byte
-        // and a four-cell box.
-        let chain = 2 * 2 * 2 + 4 + 1 + 4;
+        // Per chain: two points of two u16 offsets, a chain byte and a
+        // four-cell box (a tile this small has no cell index).
+        let chain = 2 * 2 * 2 + 1 + 4;
         (tiles * (MergedRoads::empty(TILE).bytes() + 2 * chain)) as u64
     }
 

@@ -1398,12 +1398,13 @@ mod tests {
     /// The ZL16 texture of `roads`' tile that holds the most road points.
     fn densest_zl16(roads: &crate::night::roads::merge::MergedRoads) -> DdsFilename {
         let mut counts = std::collections::HashMap::<(u32, u32), usize>::new();
-        for i in 0..roads.len() {
-            for (lon, lat) in roads.points(i) {
+        let (lat0, lon0) = (f64::from(roads.tile.0), f64::from(roads.tile.1));
+        roads.for_each_chain_near(lat0, lon0, lat0 + 1.0, lon0 + 1.0, |chain| {
+            for (lon, lat) in chain.points() {
                 let n = name_at(lat, lon);
                 *counts.entry((n.row, n.col)).or_default() += 1;
             }
-        }
+        });
         let ((row, col), _) = counts
             .into_iter()
             .max_by_key(|&(k, c)| (c, k))

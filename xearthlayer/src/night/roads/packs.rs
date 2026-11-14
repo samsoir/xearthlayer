@@ -521,7 +521,7 @@ mod tests {
         write_ini(i, &packs.map(|p| format!("Custom Scenery/{p}/")));
         // Standard and unusual spellings alternate down the ranks.
         let file = |k: usize| {
-            if k % 2 == 0 {
+            if k.is_multiple_of(2) {
                 "Earth nav data/+40+000/+46+006.dsf"
             } else {
                 "Earth nav data/+40+000/+46+006.DSF"

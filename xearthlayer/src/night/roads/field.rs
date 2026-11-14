@@ -2,9 +2,10 @@
 //! any nearby segment, in 0..=1 (class intensity included). Light comes
 //! from geometry in metres, so it is world-anchored at every zoom.
 //!
-//! Cost: a tile is skipped whole when no chain nears the footprint, a chain
-//! is culled by its box in tile-relative `f32`, and a segment visits only
-//! the texels in its reach window, found from the even texel spacing. The
+//! Cost: a merged tile hands over only the chains filed in cells near the
+//! footprint (no test per chain of the tile), a point's northing is a
+//! table lookup, and a segment visits only the texels in its reach window,
+//! found from the even texel spacing. The
 //! texel loop has no branch and no table (the fall-off is a few multiplies
 //! in `f32`, the reach test a select), so the compiler vectorises it;
 //! everything that varies only by row is computed once per row, with no
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::class::RoadClass;
-use super::merge::MergedRoads;
+use super::merge::{ChainRef, MergedRoads};
 use super::model::{ClassParams, LampParams, RoadModel};
 use crate::fuse::DdsFilename;
 use crate::night::footprint::{Footprint, TILES_PER_TEXTURE};
@@ -143,23 +144,21 @@ impl RoadField {
         let mut pts: Vec<(f64, f64)> = Vec::new();
         let mut segments = 0usize;
         for tile in tiles {
-            // The footprint and its reach, as cells of this tile.
-            let Some(want) = tile.query(
-                fp.south - reach,
-                fp.west - reach,
-                fp.north + reach,
-                fp.east + reach,
-            ) else {
-                continue;
-            };
-            for ci in 0..tile.len() {
-                if !tile.in_box(ci, &want) {
-                    continue;
-                }
+            // The chains near the footprint and its reach.
+            let (south, west) = (fp.south - reach, fp.west - reach);
+            let (north, east) = (fp.north + reach, fp.east + reach);
+            let mut northings: Option<Northings> = None;
+            tile.for_each_chain_near(south, west, north, east, |chain| {
                 let canvas = canvas.get_or_insert_with(|| Canvas::new(Grid::new(name, size)));
-                let class = tile.class(ci);
+                let ys = northings.get_or_insert_with(|| Northings::new(&chain, south, north));
+                let class = chain.class();
                 pts.clear();
-                pts.extend(tile.points(ci).map(|(lon, lat)| mercator(lat, lon)));
+                pts.extend(
+                    chain
+                        .points()
+                        .zip(chain.lat_steps())
+                        .map(|((lon, lat), &step)| (mercator(0.0, lon).0, ys.at(step, lat))),
+                );
                 segments += pts.len().saturating_sub(1);
                 let lamps = model
                     .rural_lamps
@@ -167,11 +166,11 @@ impl RoadField {
                 match lamps {
                     None => canvas.draw_glow(&pts, model.classes[class.index()]),
                     Some(l) => {
-                        let first = tile.points(ci).next().unwrap_or_default();
+                        let first = chain.points().next().unwrap_or_default();
                         canvas.draw_lamps(&pts, chain_key(first), &l);
                     }
                 }
-            }
+            });
         }
         let Some(canvas) = canvas else {
             return Self::empty(size);
@@ -194,7 +193,45 @@ impl RoadField {
     }
 }
 
-/// The lamp key of a chain: its first point `(lon, lat)` quantised to 1e-6 degrees.
+/// The Web Mercator northings of a tile's quantised latitudes over a
+/// texture's footprint and a margin, so a point's northing is a lookup
+/// instead of a logarithm. A latitude outside the table is computed; both
+/// give `mercator(lat, _).1` of the same decoded latitude, so the table
+/// never changes a result.
+struct Northings {
+    lo: usize,
+    ys: Vec<f64>,
+}
+
+/// Steps either side of the footprint the table also covers: two cells,
+/// so a chain found from a neighbouring cell is still a lookup.
+const NORTHING_MARGIN: f64 = 512.0;
+
+impl Northings {
+    /// The table for latitudes `south..=north` of `chain`'s tile.
+    fn new(chain: &ChainRef<'_>, south: f64, north: f64) -> Self {
+        let step = |lat: f64| chain.step_of_lat(lat);
+        let last = f64::from(u16::MAX);
+        let lo = (step(south) - NORTHING_MARGIN).clamp(0.0, last) as usize;
+        let hi = (step(north) + NORTHING_MARGIN).clamp(0.0, last) as usize;
+        let ys = (lo..=hi)
+            .map(|s| mercator(chain.lat_of(s as u16), 0.0).1)
+            .collect();
+        Self { lo, ys }
+    }
+
+    /// The northing of quantised latitude `step`, which decodes to `lat`.
+    fn at(&self, step: u16, lat: f64) -> f64 {
+        match self.ys.get(usize::from(step).wrapping_sub(self.lo)) {
+            Some(&y) => y,
+            None => mercator(lat, 0.0).1,
+        }
+    }
+}
+
+/// The lamp key of a chain: its first point `(lon, lat)` quantised to 1e-6
+/// degrees. A chain the merge stores as pieces (more than 32 points)
+/// starts a walk at each joint: still the same lamps in every texture.
 fn chain_key((lon, lat): (f64, f64)) -> i64 {
     hash2(
         (lon * 1e6).round() as i64,
@@ -568,6 +605,45 @@ pub(crate) mod tests {
     /// The `crossing` road rastered with the default model.
     pub(crate) fn crossing_field(name: &DdsFilename, size: u32) -> RoadField {
         RoadField::raster(name, size, &[crossing(name)], &RoadModel::DEFAULT)
+    }
+
+    #[test]
+    fn the_northing_table_equals_the_projection_at_every_step() {
+        // Footprints inside the tile, on its edges and past them.
+        for (tile, south, north) in [
+            ((46, 6), 46.4, 46.43),
+            ((46, 6), 45.9, 46.01),
+            ((46, 6), 46.99, 47.2),
+            ((-34, -71), -33.5, -33.2),
+        ] {
+            let roads = merged(
+                tile,
+                &[(
+                    100,
+                    vec![
+                        (f64::from(tile.1) + 0.5, south),
+                        (f64::from(tile.1) + 0.5, north),
+                    ],
+                )],
+            );
+            let (lat0, lon0) = (f64::from(tile.0), f64::from(tile.1));
+            let mut checked = 0;
+            roads.for_each_chain_near(lat0, lon0, lat0 + 1.0, lon0 + 1.0, |chain| {
+                let table = Northings::new(&chain, south, north);
+                assert!(!table.ys.is_empty());
+                for step in 0..=u16::MAX {
+                    let lat = chain.lat_of(step);
+                    let want = mercator(lat, 0.0).1;
+                    assert_eq!(
+                        table.at(step, lat).to_bits(),
+                        want.to_bits(),
+                        "{tile:?} step {step}"
+                    );
+                }
+                checked += 1;
+            });
+            assert_eq!(checked, 1);
+        }
     }
 
     #[test]
