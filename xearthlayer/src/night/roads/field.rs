@@ -87,6 +87,11 @@ impl RoadField {
         }
     }
 
+    /// Width and height in texels.
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
     /// Whether no texel is lit.
     pub fn is_empty(&self) -> bool {
         self.stats.lit_texels == 0
@@ -465,6 +470,8 @@ pub(crate) mod tests {
             }
         }
         assert!(RoadField::empty(64).row(0).is_none(), "nothing lit");
+        assert!(f.row(64).is_none(), "past the last row");
+        assert_eq!((f.size(), RoadField::empty(32).size()), (64, 32));
     }
 
     #[test]

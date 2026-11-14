@@ -17,6 +17,7 @@ use std::f64::consts::PI;
 use std::sync::{Arc, OnceLock};
 
 use image::{Rgba, RgbaImage};
+use tracing::debug;
 
 use super::field::RecipeField;
 use super::led::{self, LedRegion};
@@ -24,6 +25,7 @@ use super::tiling::{mercator, sample_cached, CornerCache};
 use super::{gain, LitGenerator, LitRequest};
 use crate::night::footprint::{Footprint, TILES_PER_TEXTURE};
 use crate::night::laminar::LitPattern;
+use crate::night::roads::field::RoadField;
 
 /// Palette indexes per tile: a class cell is one byte.
 const PALETTE_SLOTS: usize = 256;
@@ -64,12 +66,23 @@ impl LitGenerator for CpuLitGenerator {
         let mut weights = Vec::with_capacity(4);
         let mut corners = CornerCache::default();
         let mut road_light = RoadLight::new(request);
+        // A field rastered for another size would put glow on the wrong
+        // texels: it is left out rather than misplaced.
+        let no_roads = RoadField::empty(size);
+        let roads = if request.roads.is_empty() || request.roads.size() == size {
+            request.roads
+        } else {
+            debug!(
+                field = request.roads.size(),
+                size, "Night roads: road field size differs from the texture; no road light"
+            );
+            &no_roads
+        };
         let mut img = RgbaImage::from_pixel(size, size, Rgba([0, 0, 0, 255]));
 
         for (i, (&lat, &y)) in lats.iter().zip(&ys).enumerate() {
-            // `None` for a row no road reaches: one branch per row.
-            let road_row = request.roads.row(i as u32);
-            debug_assert!(road_row.is_none_or(|r| r.len() == lons.len()));
+            // `None` when the whole field is empty: one branch per row.
+            let road_row = roads.row(i as u32);
             for (j, (&lon, &x)) in lons.iter().zip(&xs).enumerate() {
                 let road = road_row.map_or(0.0, |r| r[j]);
                 field.class_weights(lat, lon, &mut weights);
@@ -244,7 +257,6 @@ mod tests {
     use crate::night::parse_recipe;
     use crate::night::recipe::Recipe;
     use crate::night::roads::field::tests::crossing_field;
-    use crate::night::roads::field::RoadField;
     use crate::night::roads::RoadModel;
 
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
@@ -282,6 +294,33 @@ mod tests {
     fn the_sodium_output_is_pinned() {
         let img = generate(&name_at(37.20, -122.725), 128, golden, speckled, 1.0);
         assert_eq!(digest(&img), SODIUM_DIGEST, "digest {:#018x}", digest(&img));
+    }
+
+    /// LED-on output for the golden block with the speckled pattern and no
+    /// roads, under `LedModel::DEFAULT` and `full_share_model()` in region
+    /// Na. Captured at d2fd12f, before road compositing and the `patch_at`
+    /// cache: generation without roads must not move.
+    const LED_DEFAULT_DIGEST: u64 = 0x313c_df53_ad1d_c310;
+    const LED_FULL_SHARE_DIGEST: u64 = 0x6f7d_fa2c_f75a_3b14;
+
+    #[test]
+    fn the_led_output_is_pinned() {
+        for (model, want) in [
+            (LedModel::DEFAULT, LED_DEFAULT_DIGEST),
+            (full_share_model(), LED_FULL_SHARE_DIGEST),
+        ] {
+            let img = generate_led(
+                &name_at(37.20, -122.725),
+                128,
+                golden,
+                speckled,
+                1.0,
+                &model,
+                LedRegion::Na,
+            );
+            assert!(img.pixels().any(is_led), "the pin covers LED texels");
+            assert_eq!(digest(&img), want, "digest {:#018x}", digest(&img));
+        }
     }
 
     fn golden(lat: i32, lon: i32) -> Option<Arc<Recipe>> {
@@ -380,6 +419,15 @@ mod tests {
     }
 
     #[test]
+    fn a_road_field_of_another_size_is_ignored() {
+        let name = name_at(46.5, 6.5);
+        let wrong = crossing_field(&name, 32);
+        assert!(!wrong.is_empty());
+        let img = generate_roads(&name, 64, dark, red, &wrong, &LedModel::OFF);
+        assert_eq!(lit_texels(&img), 0, "no glow at the wrong places");
+    }
+
+    #[test]
     fn countryside_roads_are_lit_where_viirs_reads_zero() {
         let name = name_at(46.5, 6.5);
         let field = crossing_field(&name, 64);
@@ -459,14 +507,15 @@ mod tests {
         (lat, lon): (f64, f64),
         (x, y): (f64, f64),
         r: &LitRequest<'_>,
-    ) -> [u8; 3] {
+    ) -> ([u8; 3], bool) {
         let m = r.road_model;
         let density = (radiance / m.full_nw).clamp(0.0, 1.0) as f32;
         let level = m.peak * road * (m.country + (1.0 - m.country) * density) * r.brightness as f32;
         let region = (r.regions)(lat.floor() as i32, lon.floor() as i32);
         let tone = r.led.tone(false, led::bright_weight(radiance), region);
         let patch = led::patch_at(x, y);
-        let mut colour = if patch.u < tone.share {
+        let is_led = patch.u < tone.share;
+        let mut colour = if is_led {
             led::white(led::patch_kelvin(tone.kelvin, &patch))
         } else {
             led::decode(led::desaturate(m.sodium, &r.led.sodium))
@@ -477,7 +526,7 @@ mod tests {
         }
         let base = led::decode(below.map(f32::from));
         let out = led::encode([0, 1, 2].map(|k| base[k] + colour[k] * level));
-        out.map(|v| v.round().clamp(0.0, 255.0) as u8)
+        (out.map(|v| v.round().clamp(0.0, 255.0) as u8), is_led)
     }
 
     #[test]
@@ -504,7 +553,7 @@ mod tests {
                 road_model: &RoadModel::DEFAULT,
             };
             let mut light = RoadLight::new(&request);
-            let mut checked = 0;
+            let (mut whites, mut sodiums) = (0, 0);
             for k in 0..4000u64 {
                 let h = hash2(k as i64, 0, 7);
                 let below = [
@@ -518,11 +567,19 @@ mod tests {
                 let (lat, lon) = (45.9 + k as f64 * 0.0004, 5.8 + k as f64 * 0.0006);
                 let (x, y) = mercator(lat, lon);
                 let got = light.over(below, road, radiance, (lat, lon), (x, y));
-                let want = composite_reference(below, road, radiance, (lat, lon), (x, y), &request);
+                let (want, is_led) =
+                    composite_reference(below, road, radiance, (lat, lon), (x, y), &request);
                 assert_eq!(got, want, "step {k}");
-                checked += 1;
+                (whites, sodiums) = if is_led {
+                    (whites + 1, sodiums)
+                } else {
+                    (whites, sodiums + 1)
+                };
             }
-            assert_eq!(checked, 4000);
+            assert!(sodiums > 0, "the sodium colour is compared");
+            if model == LedModel::DEFAULT {
+                assert!(whites > 0, "the LED white is compared");
+            }
         }
     }
 

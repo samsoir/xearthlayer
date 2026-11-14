@@ -774,8 +774,11 @@ mod tests {
 
     #[test]
     fn a_shared_patch_cache_gives_the_uncached_patches() {
-        // Rows of ZL16 texels (about 7.5 m apart) across many cells, then
-        // jumps back and forth, all through one cache.
+        // The stale-hit guard: a cache shared by rows of ZL16 texels (about
+        // 7.5 m apart) across many cells, then by jumps back and forth,
+        // gives what a fresh cache gives. That the patches equal the ones
+        // drawn before the cache existed is pinned by the LED-on goldens
+        // (`cpu::tests::the_led_output_is_pinned`).
         let mut cache = PatchCache::default();
         let mut points = Vec::new();
         for row in 0..40 {
