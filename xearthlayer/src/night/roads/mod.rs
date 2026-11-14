@@ -3,6 +3,7 @@
 //! See `docs/dev/night-lighting-design.md` (Road lights).
 
 pub mod class;
+pub mod exclusion;
 pub mod model;
 
 pub use class::{is_lit_subtype, RoadClass};
