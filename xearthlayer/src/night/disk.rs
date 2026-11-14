@@ -28,8 +28,9 @@ pub type TileDsfs = ((i32, i32), Arc<[DsfIdentity]>);
 pub struct LitFingerprint(pub [u8; 32]);
 
 /// The inputs shared by every tile of a session: generator version,
-/// brightness, the Laminar art fingerprint and the road model's digest
-/// (all zero without road lights).
+/// brightness, the Laminar art fingerprint and the road digest
+/// (`roads::roads_digest`: `ROADS_VERSION` and the road model; all zero
+/// without road lights).
 pub fn session_fingerprint(brightness: f64, art: [u8; 32], roads: [u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(LIT_GENERATOR_VERSION.to_le_bytes());

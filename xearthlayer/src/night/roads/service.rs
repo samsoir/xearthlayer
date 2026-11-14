@@ -111,9 +111,6 @@ pub struct RoadServiceConfig {
     /// Concurrent builds, 1 to [`ROAD_EXTRACT_PERMITS`] (clamped: the night
     /// permit budget has no room for more).
     pub extract_permits: usize,
-    /// Every tile build sleeps this long first (deadline tests).
-    #[cfg(test)]
-    pub build_delay: Duration,
     /// When set, every tile build first takes one permit of it, so a test
     /// decides when each build may run (`add_permits`).
     #[cfg(test)]
@@ -127,8 +124,6 @@ impl Default for RoadServiceConfig {
             generate_wait: ROAD_GENERATE_WAIT,
             tile_cache_bytes: ROAD_TILE_CACHE_BYTES,
             extract_permits: ROAD_EXTRACT_PERMITS,
-            #[cfg(test)]
-            build_delay: Duration::ZERO,
             #[cfg(test)]
             gate: None,
         }
@@ -231,6 +226,9 @@ struct TestProbes {
     index_builds: std::sync::atomic::AtomicUsize,
     identity_passes: std::sync::atomic::AtomicUsize,
     leads_noted: std::sync::atomic::AtomicUsize,
+    /// `start` marks its tile failed between its two checks, as a build
+    /// failing on another thread at that moment would.
+    fail_between_checks: AtomicBool,
 }
 
 /// A source that stopped a tile build.
@@ -580,6 +578,10 @@ impl RoadService {
             return None;
         }
         self.start_summary();
+        #[cfg(test)]
+        if self.test.fail_between_checks.load(Ordering::SeqCst) {
+            self.failed.insert(tile);
+        }
         match self.pending.entry(tile) {
             Entry::Occupied(e) => Some(e.get().clone()),
             Entry::Vacant(e) => {
@@ -620,12 +622,9 @@ impl RoadService {
     /// source fails the tile for the session.
     async fn build_tile(self: Arc<Self>, tile: Tile, trigger: Trigger) -> Option<MergedRoads> {
         #[cfg(test)]
-        {
-            tokio::time::sleep(self.config.build_delay).await;
-            if let Some(gate) = &self.config.gate {
-                if let Ok(p) = gate.acquire().await {
-                    p.forget();
-                }
+        if let Some(gate) = &self.config.gate {
+            if let Ok(p) = gate.acquire().await {
+                p.forget();
             }
         }
         let started = Instant::now();
@@ -997,6 +996,18 @@ impl RoadService {
         });
     }
 
+    /// Builds in flight.
+    #[cfg(test)]
+    pub(crate) fn builds_pending(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Drops a ready tile from the tile cache, as the LRU would.
+    #[cfg(test)]
+    pub(crate) async fn evict(&self, tile: Tile) {
+        self.tiles.invalidate(&tile).await;
+    }
+
     #[cfg(test)]
     async fn writes_settled(&self) {
         while self.test.writes_pending.load(Ordering::SeqCst) > 0 {
@@ -1296,7 +1307,7 @@ pub(crate) mod tests {
         assert_eq!(d.probe_wait, ROAD_PROBE_WAIT);
         assert_eq!(d.generate_wait, ROAD_GENERATE_WAIT);
         assert_eq!(d.tile_cache_bytes, ROAD_TILE_CACHE_BYTES);
-        assert_eq!(d.build_delay, Duration::ZERO);
+        assert!(d.gate.is_none());
     }
 
     // Merging.
@@ -2071,6 +2082,20 @@ pub(crate) mod tests {
             assert!(!svc.pending.contains_key(&tile));
             assert_eq!(svc.failed.contains(&tile), !answered);
         }
+    }
+
+    #[tokio::test]
+    async fn a_tile_that_fails_while_a_build_is_being_started_starts_none() {
+        // The build failed after `start` found the tile not failed, and its
+        // guard removed the pending entry: the re-check under the entry's
+        // lock must answer failed rather than start a doomed build.
+        let t = install(None);
+        let svc = RoadService::new(t.path().into(), vec![], None);
+        svc.test.fail_between_checks.store(true, Ordering::SeqCst);
+        assert!(svc.start(TILE, Trigger::Probe).is_none());
+        assert!(svc.pending.is_empty(), "no build started");
+        let r = svc.footprint(&[TILE], Purpose::Probe).await;
+        assert!(!r.complete && !r.timed_out, "failed, at once");
     }
 
     /// Waits until no build is in flight.

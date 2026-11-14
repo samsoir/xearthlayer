@@ -6,7 +6,10 @@ use sha2::{Digest, Sha256};
 
 use super::class::RoadClass;
 
-/// Bump when the meaning of a parameter or the drawing changes.
+/// Bump when the meaning of a `RoadModel` parameter changes, so the same
+/// values would draw different light: it is hashed into
+/// [`RoadModel::digest`] with the values. A change to how roads are read,
+/// merged or drawn is `ROADS_VERSION`'s.
 pub const ROAD_MODEL_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq)]

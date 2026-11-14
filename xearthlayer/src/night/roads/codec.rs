@@ -11,6 +11,10 @@
 use super::dsf::{Chains, DsfRoads};
 use super::exclusion::Exclusion;
 
+/// The byte layout of a road disk entry's payload, its first field: bump it
+/// when the layout changes. An entry of another version does not decode
+/// and is re-extracted. What an extraction keeps is
+/// `service::ROAD_EXTRACT_VERSION`'s.
 pub const ROAD_CODEC_VERSION: u32 = 1;
 
 /// Bytes of one zone with no polygon: four f64 and a u32 vertex count.
