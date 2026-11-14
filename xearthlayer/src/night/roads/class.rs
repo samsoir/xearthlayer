@@ -50,13 +50,27 @@ impl RoadClass {
     pub fn index(self) -> usize {
         self as usize
     }
+
+    /// Whether roads of this class glow. In flight (KCCR, 2026-11-14) the
+    /// sim's own residential streets read as scattered building light, not
+    /// lines of lamps, and the Laminar pattern already carries that light;
+    /// glowing local streets, minor roads and footways covered about four
+    /// times the texels X-Plane's 3D scene lights beside them. They keep
+    /// their class and model parameters for a later lamp option.
+    pub fn is_lit(self) -> bool {
+        matches!(
+            self,
+            Self::Motorway | Self::Ramp | Self::Primary | Self::Secondary
+        )
+    }
 }
 
-/// Whether a subtype is drawn. An unknown subtype (neither lit nor known
-/// unlit) is logged once per run.
+/// Whether a subtype is drawn: its class glows ([`RoadClass::is_lit`]).
+/// An unknown subtype (neither classified nor known unlit) is logged once
+/// per run.
 pub fn is_lit_subtype(subtype: u8) -> bool {
-    if RoadClass::of(subtype).is_some() {
-        return true;
+    if let Some(class) = RoadClass::of(subtype) {
+        return class.is_lit();
     }
     if !KNOWN_UNLIT.contains(&subtype) {
         static SEEN: OnceLock<Mutex<HashSet<u8>>> = OnceLock::new();
@@ -94,6 +108,18 @@ mod tests {
     }
 
     #[test]
+    fn only_motorways_ramps_and_main_roads_are_drawn() {
+        for s in [100u8, 119, 120, 129, 10, 29, 30, 49] {
+            assert!(is_lit_subtype(s), "subtype {s}");
+        }
+        // Classified, so never logged as unknown, but drawn unlit.
+        for s in [50u8, 69, 70, 73, 80, 82, 75] {
+            assert!(RoadClass::of(s).is_some(), "subtype {s}");
+            assert!(!is_lit_subtype(s), "subtype {s}");
+        }
+    }
+
+    #[test]
     fn pedestrian_rail_power_and_zero_are_unlit() {
         for s in [0u8, 74, 151, 152, 153, 154, 220] {
             assert_eq!(RoadClass::of(s), None, "subtype {s}");
@@ -126,7 +152,7 @@ mod tests {
         for (range, class) in &ranges {
             for s in [*range.start(), *range.end()] {
                 assert_eq!(RoadClass::of(s), Some(*class), "subtype {s}");
-                assert!(is_lit_subtype(s), "subtype {s}");
+                assert_eq!(is_lit_subtype(s), class.is_lit(), "subtype {s}");
             }
         }
         // Every subtype is in at most one range, and outside them none.
