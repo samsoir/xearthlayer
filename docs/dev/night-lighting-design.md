@@ -234,6 +234,20 @@ level is at full light, and the ramp costs no bytes. Two steps (2/3 and
 scaling stored values instead of light (1/3 stored is about 9% of the
 light) read as black before the 3D lights were drawn.
 
+**Mips in linear light.** The chain below the first visible level is
+averaged in linear light (`lit_chain`, #363), not by averaging stored
+values as the ortho encoder does. Lit art is bright points on black, and a
+stored-value average counts a lit texel beside dark ones at a fraction of
+its light. Measured on a ZL16 texture over Mexico City, the stored-value
+chain kept 82% of the light at the first coarser level, 53% at the third
+and 24% at the sixth, and it warmed as it went: blue, the sparsest channel
+of warm light, lost the most, so linear B/R fell from 0.45 to 0.33 by the
+sixth level (0.17 to 0.04 for sodium alone). Distant towns, which X-Plane
+draws from those levels, read dimmer and more orange than the near ground.
+Each level is now averaged from the linear values of the level above, not
+from its rounded bytes, so every level keeps the light and colour of the
+first.
+
 A footprint without light is a fixed **minimal black DDS**: 4 × 4, BC1,
 with its full chain (4, 2 and 1 px levels), all blocks zero, 152 bytes
 (R6).
@@ -578,8 +592,8 @@ work), recorded when the recipe is loaded, as the identity is. Patches
 (`_patches/...`), unknown codes and missing recipes are Unknown.
 
 **Cache.** The region is part of each tile's entry in the footprint
-fingerprint, and `LIT_GENERATOR_VERSION` is 3 (2 added the LED stage, 3
-the raised shares and the sodium tone), so lit entries from before
+fingerprint, and `LIT_GENERATOR_VERSION` is 4 (2 added the LED stage, 3
+the raised shares and the sodium tone, 4 the linear-light mips), so lit entries from before
 the current generator miss once and regenerate; the GC ages the old ones out.
 
 **Cost.** Measured with the ignored test
