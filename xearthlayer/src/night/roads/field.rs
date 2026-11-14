@@ -13,7 +13,6 @@
 //! `f32` per texel) is allocated when the first segment reaches the grid,
 //! so a texture with no road nearby costs no heap at all.
 
-use std::f64::consts::PI;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,7 +20,7 @@ use super::class::RoadClass;
 use super::merge::{ChainRef, MergedRoads};
 use super::model::{ClassParams, LampParams, RoadModel};
 use crate::fuse::DdsFilename;
-use crate::night::footprint::{Footprint, TILES_PER_TEXTURE};
+use crate::night::footprint::{Footprint, TexelCentres, TILES_PER_TEXTURE};
 use crate::night::generator::noise::{hash2, unit};
 use crate::night::generator::tiling::{mercator, EARTH_RADIUS_M};
 
@@ -245,8 +244,9 @@ fn cos_lat_of(y: f64) -> f64 {
     1.0 / (y / EARTH_RADIUS_M).cosh()
 }
 
-/// The texel centres of a texture, in Web Mercator metres, exactly as
-/// `CpuLitGenerator::generate` computes them.
+/// The texel centres of a texture ([`TexelCentres`], the ones
+/// `CpuLitGenerator::generate` samples) and what the raster derives from
+/// them.
 struct Grid {
     size: usize,
     /// Per column, ascending.
@@ -269,19 +269,7 @@ struct Grid {
 
 impl Grid {
     fn new(name: &DdsFilename, size: u32) -> Self {
-        let n = f64::from(1u32 << name.zoom);
-        let side = f64::from(TILES_PER_TEXTURE);
-        let px = f64::from(size);
-        let lons = (0..size)
-            .map(|j| (f64::from(name.col) + (f64::from(j) + 0.5) / px * side) / n * 360.0 - 180.0);
-        let lats: Vec<f64> = (0..size)
-            .map(|i| {
-                let y = f64::from(name.row) + (f64::from(i) + 0.5) / px * side;
-                (PI * (1.0 - 2.0 * y / n)).sinh().atan().to_degrees()
-            })
-            .collect();
-        let xs: Vec<f64> = lons.map(|lon| mercator(0.0, lon).0).collect();
-        let ys: Vec<f64> = lats.iter().map(|&lat| mercator(lat, 0.0).1).collect();
+        let TexelCentres { lats, xs, ys, .. } = TexelCentres::of(name, size);
         let cos: Vec<f64> = lats.iter().map(|lat| lat.to_radians().cos()).collect();
         let last = size as usize - 1;
         // Mercator metres per texel along x.

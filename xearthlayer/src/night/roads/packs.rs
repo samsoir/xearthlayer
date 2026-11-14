@@ -14,7 +14,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use super::dsf_tile_of_name;
-use crate::coord::format_dsf_name;
+use crate::night::store::{block_name, tile_name};
 use crate::xworld_pro::{parse_scenery_packs, SCENERY_PACKS_FILE};
 
 /// One DSF that covers a tile. A lower `rank` loads first (wins).
@@ -189,18 +189,14 @@ impl PackIndex {
     }
 }
 
-/// The 10 degree block folder of a tile, as X-Plane names it: `+40+000`.
-fn block_name(lat: i32, lon: i32) -> String {
-    format!(
-        "{:+03}{:+04}",
-        lat.div_euclid(10) * 10,
-        lon.div_euclid(10) * 10
-    )
-}
-
 /// The DSF file name of a tile, as X-Plane names it: `+46+006.dsf`.
 fn file_name(lat: i32, lon: i32) -> String {
-    format!("{}.dsf", format_dsf_name(lat, lon))
+    format!("{}.dsf", tile_name(lat, lon))
+}
+
+/// The south-west corner of a tile's 10 degree block.
+fn block_of(lat: i32, lon: i32) -> (i32, i32) {
+    (lat.div_euclid(10) * 10, lon.div_euclid(10) * 10)
 }
 
 /// A tile's DSF path under its pack root, as X-Plane names it.
@@ -255,13 +251,29 @@ fn list_dsfs(root: &Path, rank: u16) -> Listing {
             continue;
         };
         let block_folder = block.file_name();
+        // Whether the folder is named as X-Plane names the block of the
+        // last DSF seen: a folder holds one block, so this is worked out
+        // once per folder.
+        let mut folder_names: Option<((i32, i32), bool)> = None;
         for f in files.flatten() {
             let name = f.file_name();
             let Some((lat, lon)) = name.to_str().and_then(dsf_tile_of_name) else {
                 continue;
             };
-            let unusual = name.to_str() != Some(&file_name(lat, lon))
-                || block_folder.to_str() != Some(&block_name(lat, lon));
+            let block = block_of(lat, lon);
+            let folder_is_standard = match folder_names {
+                Some((b, standard)) if b == block => standard,
+                _ => {
+                    let standard = block_folder.to_str() == Some(&block_name(lat, lon));
+                    folder_names = Some((block, standard));
+                    standard
+                }
+            };
+            let unusual = !folder_is_standard
+                || name
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(".dsf"))
+                    .is_none_or(|stem| stem != tile_name(lat, lon));
             let e = Entry {
                 lat: lat as i8,
                 lon: lon as i16,
@@ -548,7 +560,7 @@ mod tests {
         for p in packs {
             for lat in 40..50 {
                 for lon in -60..60 {
-                    let name = crate::coord::format_dsf_name(lat, lon);
+                    let name = tile_name(lat, lon);
                     let block = block_name(lat, lon);
                     touch(&i.join(format!(
                         "Custom Scenery/{p}/Earth nav data/{block}/{name}.dsf"

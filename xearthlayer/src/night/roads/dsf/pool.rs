@@ -4,8 +4,8 @@
 use super::{le_u32, Bytes, DsfError};
 
 /// Ceiling on the points of all PO32 pools of one DSF (about 33.5 million,
-/// 256 MiB of lon and lat planes): about 3.8 times the largest real file
-/// seen, X-World Pro's Tokyo `+35+139`. Run-length planes can claim this
+/// 256 MiB of lon and lat planes): 4.1 times the largest real file seen,
+/// X-World Pro's Tokyo `+35+139` (8.19 million points). Run-length planes can claim this
 /// many points in a few megabytes, so the cap is absolute.
 pub(super) const MAX_POOL_POINTS: usize = 1 << 25;
 /// Most values one byte of a run-length plane can expand to: a 5-byte

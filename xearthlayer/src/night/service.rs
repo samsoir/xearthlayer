@@ -215,7 +215,7 @@ fn field_tiles(name: &DdsFilename) -> Vec<(i32, i32)> {
 /// The tiles whose roads can light `name` at `size` texels: its footprint
 /// grown by the glow's reach, never by less than the recipe field's margin.
 /// The probe, the generation and the fingerprint all ask for these.
-fn road_tiles(name: &DdsFilename, size: u32, model: &RoadModel) -> Vec<(i32, i32)> {
+pub(crate) fn road_tiles(name: &DdsFilename, size: u32, model: &RoadModel) -> Vec<(i32, i32)> {
     let margin = FIELD_MARGIN_DEG.max(reach_deg(name, size, model));
     Footprint::from_name(name).expanded(margin).tiles()
 }

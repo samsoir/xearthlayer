@@ -470,8 +470,9 @@ impl Merger {
 
     /// The merged tile, with or without the cell index. With it, the
     /// chains are reordered by cell (a counting sort) into exactly sized
-    /// arrays; the arrival-order arrays are freed only once the copy is
-    /// done, so the transient peak is about twice the tile.
+    /// arrays; the arrival-order arrays (with their growth slack) are freed
+    /// only once the copy is done, so the transient peak is two to three
+    /// times the tile while the exact copies are allocated.
     pub(super) fn finish_with(self, index: bool) -> MergedRoads {
         let mut out = MergedRoads {
             tile: self.tile,

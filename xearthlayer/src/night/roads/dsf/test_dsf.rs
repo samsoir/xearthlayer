@@ -119,11 +119,7 @@ impl Builder {
 
     /// The 10 degree block folder of a tile: `+30-130` for (37, -123).
     pub fn block(lat: i32, lon: i32) -> String {
-        format!(
-            "{:+03}{:+04}",
-            lat.div_euclid(10) * 10,
-            lon.div_euclid(10) * 10
-        )
+        crate::night::store::block_name(lat, lon)
     }
 
     pub fn bytes(&self) -> Vec<u8> {
@@ -179,7 +175,7 @@ pub fn install(root: &std::path::Path, tile: (i32, i32), packs: &[(&str, Option<
             .join("Earth nav data")
             .join(Builder::block(tile.0, tile.1));
         std::fs::create_dir_all(&dir).unwrap();
-        let file = format!("{:+03}{:+04}.dsf", tile.0, tile.1);
+        let file = format!("{}.dsf", crate::night::store::tile_name(tile.0, tile.1));
         let body = bytes.clone().unwrap_or_else(|| b"garbage".to_vec());
         std::fs::write(dir.join(file), body).unwrap();
     }

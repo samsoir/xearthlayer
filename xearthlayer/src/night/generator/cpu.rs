@@ -13,7 +13,6 @@
 //! Road glow (`LitRequest::roads`) is added last, in linear light, only on
 //! the texels it reaches: an empty road field leaves every byte as it was.
 
-use std::f64::consts::PI;
 use std::sync::{Arc, OnceLock};
 
 use image::{Rgba, RgbaImage};
@@ -21,9 +20,9 @@ use tracing::debug;
 
 use super::field::RecipeField;
 use super::led::{self, LedRegion};
-use super::tiling::{mercator, sample_cached, CornerCache};
+use super::tiling::{sample_cached, CornerCache};
 use super::{gain, LitGenerator, LitRequest};
-use crate::night::footprint::{Footprint, TILES_PER_TEXTURE};
+use crate::night::footprint::{Footprint, TexelCentres};
 use crate::night::laminar::LitPattern;
 use crate::night::roads::field::RoadField;
 
@@ -38,23 +37,7 @@ impl LitGenerator for CpuLitGenerator {
     fn generate(&self, request: &LitRequest<'_>) -> RgbaImage {
         let name = request.name;
         let size = request.size;
-        let n = f64::from(1u32 << name.zoom);
-        let side = f64::from(TILES_PER_TEXTURE);
-        let px = f64::from(size);
-        // Texel centres: longitudes per column, latitudes per row (north first).
-        let lons: Vec<f64> = (0..size)
-            .map(|j| (f64::from(name.col) + (f64::from(j) + 0.5) / px * side) / n * 360.0 - 180.0)
-            .collect();
-        let lats: Vec<f64> = (0..size)
-            .map(|i| {
-                let y = f64::from(name.row) + (f64::from(i) + 0.5) / px * side;
-                (PI * (1.0 - 2.0 * y / n)).sinh().atan().to_degrees()
-            })
-            .collect();
-
-        // Web Mercator metres: x depends only on the column, y only on the row.
-        let xs: Vec<f64> = lons.iter().map(|&lon| mercator(0.0, lon).0).collect();
-        let ys: Vec<f64> = lats.iter().map(|&lat| mercator(lat, 0.0).1).collect();
+        let TexelCentres { lons, lats, xs, ys } = TexelCentres::of(name, size);
 
         let field = RecipeField::new(&Footprint::from_name(name), request.recipes);
         // Patterns by (tile slot, palette index), resolved on first use.
@@ -308,10 +291,12 @@ mod tests {
     use crate::night::generator::field::tests_support::synthetic;
     use crate::night::generator::led::{LedModel, LedRegion, RegionTone, Tone};
     use crate::night::generator::noise::{hash2, unit};
+    use crate::night::generator::tiling::mercator;
     use crate::night::parse_recipe;
     use crate::night::recipe::Recipe;
     use crate::night::roads::field::tests::crossing_field;
     use crate::night::roads::RoadModel;
+    use std::f64::consts::PI;
 
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
 
@@ -1272,8 +1257,7 @@ mod tests {
     #[test]
     #[ignore]
     fn time_real_roads_on_real_zl16_textures() {
-        use crate::night::generator::field::FIELD_MARGIN_DEG;
-        use crate::night::roads::service::tests::real;
+        use crate::night::roads::service::real;
         let packages = "/media/FlightSim/XEarthLayer Packages";
         let art = "/media/FlightSim/X-Plane 12-beta/Resources/default scenery/1000 world terrain";
         if !std::path::Path::new(art).is_dir() {
@@ -1301,7 +1285,8 @@ mod tests {
                 };
                 densest_zl16(&t[0])
             };
-            let tiles = Footprint::from_name(&n).expanded(FIELD_MARGIN_DEG).tiles();
+            // The tiles the service would ask roads for.
+            let tiles = crate::night::service::road_tiles(&n, size, &model);
             let Some(roads) = real::merged_roads(&tiles) else {
                 return;
             };

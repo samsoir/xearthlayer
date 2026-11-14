@@ -1094,7 +1094,7 @@ The existing `Night lighting: lit texture generated` line gains
 
 Release build on the developer's machine (32 threads), over the developer's
 installation, with the ignored tests
-`night::roads::service::tests::real::*` (one test per process, so memory
+`night::roads::service::real::*` (one test per process, so memory
 readings are its own) and
 `night::generator::cpu::tests::time_real_roads_on_real_zl16_textures`.
 Files were in the page cache.

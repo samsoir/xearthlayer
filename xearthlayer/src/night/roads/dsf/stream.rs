@@ -896,7 +896,8 @@ mod tests {
     #[test]
     fn the_caps_are_the_sized_values() {
         // Sized from X-World Pro's Tokyo +35+139, the largest real file
-        // seen (about 3.2 times Geneva's 2.75 million points).
+        // seen: 8.19 million points, about 3.0 times Geneva's 2.75 million,
+        // and 4.1 times below the caps.
         assert_eq!(MAX_POOL_POINTS, 1 << 25);
         assert_eq!(MAX_WALK_VISITS, 1 << 25);
     }
