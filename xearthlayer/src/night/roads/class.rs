@@ -184,7 +184,7 @@ mod tests {
             (RoadClass::Motorway, 8.0, 10.0, 1.00),
             (RoadClass::Ramp, 4.0, 8.0, 0.90),
             (RoadClass::Primary, 6.0, 9.0, 0.95),
-            (RoadClass::Secondary, 5.0, 8.0, 0.85),
+            (RoadClass::Secondary, 5.0, 8.0, 0.425),
             (RoadClass::Local, 3.0, 7.0, 0.60),
             (RoadClass::Minor, 2.0, 6.0, 0.45),
             (RoadClass::LitFootway, 1.5, 5.0, 0.30),

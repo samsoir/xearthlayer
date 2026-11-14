@@ -801,7 +801,7 @@ ranges:
 | 100 to 119 | Motorway | yes | 8 m | 10 m | 1.00 |
 | 120 to 129 | Ramp | yes | 4 m | 8 m | 0.90 |
 | 10 to 29 | Primary | yes | 6 m | 9 m | 0.95 |
-| 30 to 49 | Secondary | yes | 5 m | 8 m | 0.85 |
+| 30 to 49 | Secondary | yes | 5 m | 8 m | 0.425 |
 | 50 to 69 | Local | no | 3 m | 7 m | 0.60 |
 | 70 to 73, 80 to 82 | Minor | no | 2 m | 6 m | 0.45 |
 | 75 | Lit footway | no | 1.5 m | 5 m | 0.30 |
@@ -956,12 +956,18 @@ function, `TexelCentres::of` (`night/footprint.rs`). The level is
 peak × glow × (country + (1 − country) × clamp(R / full_nw, 0, 1)) × night.brightness
 ```
 
-with `peak` 0.015, `country` 0.2 and `full_nw` 10 nW·cm⁻²·sr⁻¹. `peak` was
+with `peak` 0.0106, `country` 0.2 and `full_nw` 10 nW·cm⁻²·sr⁻¹. `peak` was
 0.12 until the first flight, at KCCR, where the glow was 98.6% of the lit
 light (72 times the pattern's area light) and the lit side of the near
 hand-off was 10 to 20 times brighter in area average than X-Plane's 3D
-roads and lights; 0.015 is three stops down, a first step of flight
-tuning, since auto exposure makes up part of that gap. Roads do
+roads and lights; the second flight flew three stops down (0.015), since
+auto exposure makes up part of that gap. After the third flight a lit
+pixel was as bright on both sides of the hand-off and the lit side still
+read a little bright, so `peak` went down half a stop more and secondary
+roads, the most numerous glowing class, to half their intensity (0.85 to
+0.425): together 0.6 stops less area light over 20 ZL16 textures around
+KCCR, where halving the core widths gave only 0.14, since at 7.6 m
+texels the one-texel sigma floor sets a road's width. Roads do
 not use the gain curve: the gain is zero below its floor radiance, so dark
 countryside would stay dark. Instead the VIIRS radiance `R` raises the road
 from a rural floor (a fifth of the light) to full light at 10. The colour
@@ -1288,7 +1294,7 @@ generator's output is unchanged byte for byte.
 **Known costs.** The road profile is `size^2` `f32`, held while a texture
 generates under its generation permit: 4 MiB at a 1024 px first visible
 level, and proportionally more for a coarser-zoom texture with a larger
-first visible level. A dense tile's build peaks at about 240 MiB of
+first visible level. A dense tile's build peaks at about 200 MiB of
 transient memory (Tokyo, its DSF read and the counting sort's copies),
 and two builds may run at once.
 
