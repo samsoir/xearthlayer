@@ -90,10 +90,23 @@ impl LitGenerator for CpuLitGenerator {
                     continue;
                 }
                 let radiance = field.radiance(lat, lon);
-                let g = gain(radiance, request.brightness);
-                if weights.is_empty() || g <= 0.0 {
+                // No class here: only the road can light the texel, and the
+                // gain is not needed.
+                let g = if weights.is_empty() {
+                    0.0
+                } else {
+                    gain(radiance, request.brightness)
+                };
+                if g <= 0.0 {
                     if road > 0.0 {
-                        let bytes = road_light.over([0; 3], road, radiance, (lat, lon), (x, y));
+                        let texel = RoadTexel {
+                            at: (lat, lon),
+                            xy: (x, y),
+                            radiance,
+                            bright: led::bright_weight(radiance),
+                            patch: None,
+                        };
+                        let bytes = road_light.over([0; 3], road, &texel);
                         img.put_pixel(j as u32, i as u32, opaque(bytes));
                     }
                     continue;
@@ -132,9 +145,10 @@ impl LitGenerator for CpuLitGenerator {
                 let sodium = rgb;
                 let toned = (request.led.sodium.mix > 0.0)
                     .then(|| led::desaturate(sodium, &request.led.sodium));
-                let mut led_rgb = None;
+                let (mut led_rgb, mut patch_here) = (None, None);
                 if wsum > 0.0 && share > 0.0 {
                     let patch = led::patch_at(x, y);
+                    patch_here = Some(patch);
                     if patch.u < share / wsum {
                         let k = led::patch_kelvin(kelvin / wsum, &patch);
                         led_rgb = Some(led::recolour(sodium, k, request.led.energy));
@@ -142,7 +156,14 @@ impl LitGenerator for CpuLitGenerator {
                 }
                 let mut bytes = led::texel_bytes(sodium, toned, led_rgb, g as f32);
                 if road > 0.0 {
-                    bytes = road_light.over(bytes, road, radiance, (lat, lon), (x, y));
+                    let texel = RoadTexel {
+                        at: (lat, lon),
+                        xy: (x, y),
+                        radiance,
+                        bright,
+                        patch: patch_here,
+                    };
+                    bytes = road_light.over(bytes, road, &texel);
                 }
                 img.put_pixel(j as u32, i as u32, opaque(bytes));
             }
@@ -172,11 +193,29 @@ fn linear_table() -> &'static [f32; 256] {
 struct RoadLight<'r> {
     request: &'r LitRequest<'r>,
     linear: &'static [f32; 256],
+    encoder: &'static led::ByteEncoder,
     /// The road sodium, toned and at luminance 1: fixed per request.
     sodium: [f32; 3],
     /// The last 1 degree tile looked up and its region.
     region: Option<((i32, i32), LedRegion)>,
     patches: led::PatchCache,
+    /// The last LED temperature (its bits) and its white at luminance 1:
+    /// a patch keeps one temperature wherever its brightness is settled.
+    white: Option<(u64, [f32; 3])>,
+}
+
+/// Where a road texel is, and what the pattern pass already knows of it.
+#[derive(Debug, Clone, Copy)]
+struct RoadTexel {
+    /// Latitude and longitude.
+    at: (f64, f64),
+    /// Web Mercator metres.
+    xy: (f64, f64),
+    radiance: f64,
+    /// `led::bright_weight(radiance)`.
+    bright: f64,
+    /// The texel's LED patch, when the pattern pass drew it.
+    patch: Option<led::Patch>,
 }
 
 impl<'r> RoadLight<'r> {
@@ -188,9 +227,24 @@ impl<'r> RoadLight<'r> {
         Self {
             request,
             linear: linear_table(),
+            encoder: led::ByteEncoder::get(),
             sodium: unit_luminance(sodium),
             region: None,
             patches: led::PatchCache::default(),
+            white: None,
+        }
+    }
+
+    /// `unit_luminance(led::white(kelvin))`, from the last one when the
+    /// temperature has not changed.
+    fn white(&mut self, kelvin: f64) -> [f32; 3] {
+        match self.white {
+            Some((k, w)) if k == kelvin.to_bits() => w,
+            _ => {
+                let w = unit_luminance(led::white(kelvin));
+                self.white = Some((kelvin.to_bits(), w));
+                w
+            }
         }
     }
 
@@ -205,35 +259,35 @@ impl<'r> RoadLight<'r> {
         }
     }
 
-    /// The bytes of a texel whose pattern gave `below`, with `road` glow
-    /// (above 0) under `radiance`, at `(lat, lon)` and Mercator `(x, y)`.
-    fn over(
-        &mut self,
-        below: [u8; 3],
-        road: f32,
-        radiance: f64,
-        (lat, lon): (f64, f64),
-        (x, y): (f64, f64),
-    ) -> [u8; 3] {
+    /// The bytes of `texel`, whose pattern gave `below`, with `road` glow
+    /// (above 0).
+    fn over(&mut self, below: [u8; 3], road: f32, texel: &RoadTexel) -> [u8; 3] {
+        let RoadTexel {
+            at: (lat, lon),
+            xy: (x, y),
+            radiance,
+            bright,
+            patch,
+        } = *texel;
         let r = self.request;
         let m = r.road_model;
         let density = (radiance / m.full_nw).clamp(0.0, 1.0) as f32;
         let level = m.peak * road * (m.country + (1.0 - m.country) * density) * r.brightness as f32;
-        let region = self.region((lat.floor() as i32, lon.floor() as i32));
-        let tone = r.led.tone(false, led::bright_weight(radiance), region);
+        let region = self.region((led::floor_i64(lat) as i32, led::floor_i64(lon) as i32));
+        let tone = r.led.tone(false, bright, region);
         // `patch.u` is below 1, so no share means sodium without a patch.
-        let patch = (tone.share > 0.0).then(|| led::patch_at_cached(x, y, &mut self.patches));
+        let patch = (tone.share > 0.0)
+            .then(|| patch.unwrap_or_else(|| led::patch_at_cached(x, y, &mut self.patches)));
         let colour = match patch {
             Some(p) if p.u < tone.share => {
                 // `white` is linear light at luminance 1, as `recolour`
                 // relies on when it scales it by a linear luminance.
-                unit_luminance(led::white(led::patch_kelvin(tone.kelvin, &p)))
+                self.white(led::patch_kelvin(tone.kelvin, &p))
             }
             _ => self.sodium,
         };
         let base = below.map(|v| self.linear[usize::from(v)]);
-        let out = led::encode([0, 1, 2].map(|k| base[k] + colour[k] * level));
-        out.map(|v| v.round().clamp(0.0, 255.0) as u8)
+        [0, 1, 2].map(|k| self.encoder.byte(base[k] + colour[k] * level))
     }
 }
 
@@ -566,7 +620,18 @@ mod tests {
                 // A walk of about 0.004 degrees a step through three degree lines.
                 let (lat, lon) = (45.9 + k as f64 * 0.0004, 5.8 + k as f64 * 0.0006);
                 let (x, y) = mercator(lat, lon);
-                let got = light.over(below, road, radiance, (lat, lon), (x, y));
+                // Half the steps hand over the bright weight and the patch,
+                // as the generator does where the pattern was lit.
+                let patch = (k % 2 == 0).then(|| led::patch_at(x, y));
+                let bright = led::bright_weight(radiance);
+                let texel = RoadTexel {
+                    at: (lat, lon),
+                    xy: (x, y),
+                    radiance,
+                    bright,
+                    patch,
+                };
+                let got = light.over(below, road, &texel);
                 let (want, is_led) =
                     composite_reference(below, road, radiance, (lat, lon), (x, y), &request);
                 assert_eq!(got, want, "step {k}");
@@ -1274,39 +1339,38 @@ mod tests {
                 })
             };
             let raster = || RoadField::raster(&n, size, &roads, &model);
-            /// Minimum and median ms of seven runs.
-            fn timed(mut f: impl FnMut()) -> (f64, f64) {
-                let mut ms: Vec<f64> = (0..7)
-                    .map(|_| {
-                        let started = std::time::Instant::now();
-                        f();
-                        started.elapsed().as_secs_f64() * 1e3
-                    })
-                    .collect();
-                ms.sort_by(f64::total_cmp);
-                (ms[0], ms[3])
+            /// Wall time of `f` in ms.
+            fn ms(f: impl FnOnce()) -> f64 {
+                let started = std::time::Instant::now();
+                f();
+                started.elapsed().as_secs_f64() * 1e3
             }
             // Inflates the recipes and decodes the patterns.
             let empty = RoadField::empty(size);
             let dark = run(&empty);
             let field = raster();
             let lit = run(&field);
-            let (raster_min, raster_med) = timed(|| {
-                std::hint::black_box(raster());
+            // Nine rounds of the four timings in turn, so a change in the
+            // machine's load reaches all four alike; minimum and median.
+            let rounds: [[f64; 4]; 9] = std::array::from_fn(|_| {
+                [
+                    ms(|| drop(std::hint::black_box(raster()))),
+                    ms(|| drop(std::hint::black_box(run(&empty)))),
+                    ms(|| drop(std::hint::black_box(run(&field)))),
+                    ms(|| drop(std::hint::black_box(run(&raster())))),
+                ]
             });
-            let (none_min, none_med) = timed(|| {
-                std::hint::black_box(run(&empty));
-            });
-            let (gen_min, gen_med) = timed(|| {
-                std::hint::black_box(run(&field));
-            });
-            let (all_min, all_med) = timed(|| {
-                std::hint::black_box(run(&raster()));
-            });
+            let [(raster_min, raster_med), (none_min, none_med), (gen_min, gen_med), (all_min, all_med)] =
+                std::array::from_fn(|k| {
+                    let mut r = rounds.map(|round| round[k]);
+                    r.sort_by(f64::total_cmp);
+                    (r[0], r[4])
+                });
             let texels = f64::from(size * size);
             println!(
                 "{label} {}_{}_ZL{} ({} tiles, {} merged chains): {} segments, \
-                 {} road texels ({:.1}% of the texture); lit texels {} without roads, {} with",
+                 {} road texels ({:.1}% of the texture); lit texels {} without roads, {} with; \
+                 pixels {:016x} without roads, {:016x} with",
                 n.row,
                 n.col,
                 n.zoom,
@@ -1316,7 +1380,9 @@ mod tests {
                 field.stats.lit_texels,
                 field.stats.lit_texels as f64 / texels * 100.0,
                 lit_texels(&dark),
-                lit_texels(&lit)
+                lit_texels(&lit),
+                digest(&dark),
+                digest(&lit)
             );
             println!(
                 "{label}: raster min {raster_min:.1} ms, median {raster_med:.1} ms; \

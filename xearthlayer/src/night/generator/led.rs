@@ -7,6 +7,8 @@
 //! times `LedModel::energy`, so Laminar's street pattern survives and LED
 //! never reads dimmer than the sodium it replaces.
 
+use std::sync::OnceLock;
+
 use super::noise::{hash2, unit};
 use super::SRGB_GAMMA;
 
@@ -207,8 +209,12 @@ pub const URBAN_BRIGHT_HI_NW: f64 = 80.0;
 
 /// How bright (0 dim, 1 downtown) urban ground is: a smoothstep in `ln(R)`.
 pub fn bright_weight(radiance_nw: f64) -> f64 {
-    if radiance_nw.is_nan() || radiance_nw <= 0.0 {
+    // Outside the ramp the smoothstep is exactly 0 or 1: no logarithm.
+    if radiance_nw.is_nan() || radiance_nw <= URBAN_BRIGHT_LO_NW {
         return 0.0;
+    }
+    if radiance_nw >= URBAN_BRIGHT_HI_NW {
+        return 1.0;
     }
     let t = ((radiance_nw.ln() - URBAN_BRIGHT_LO_NW.ln())
         / (URBAN_BRIGHT_HI_NW.ln() - URBAN_BRIGHT_LO_NW.ln()))
@@ -268,7 +274,7 @@ pub struct PatchCache {
 /// `patch_at`, reusing the centres and the last patch from `cache`.
 pub fn patch_at_cached(x: f64, y: f64, cache: &mut PatchCache) -> Patch {
     let (gx, gy) = (x / PATCH_SIZE_M, y / PATCH_SIZE_M);
-    let (cx, cy) = (gx.floor() as i64, gy.floor() as i64);
+    let (cx, cy) = (floor_i64(gx), floor_i64(gy));
     if cache.cell != Some((cx, cy)) {
         let mut k = 0;
         for dy in -1..=1 {
@@ -300,6 +306,18 @@ pub fn patch_at_cached(x: f64, y: f64, cache: &mut PatchCache) -> Patch {
             cache.last = Some(((ix, iy), patch));
             patch
         }
+    }
+}
+
+/// `x.floor() as i64` without the call to `floor` (not an instruction on
+/// the baseline x86-64 target): a cast truncates towards zero, one less
+/// below zero unless already whole.
+pub(crate) fn floor_i64(x: f64) -> i64 {
+    let t = x as i64;
+    if (t as f64) > x {
+        t - 1
+    } else {
+        t
     }
 }
 
@@ -352,7 +370,8 @@ const WHITE_TABLE: [[f32; 3]; 31] = [
 /// The white of `kelvin` (clamped to the table), interpolated.
 pub fn white(kelvin: f64) -> [f32; 3] {
     let t = ((kelvin.clamp(KELVIN_MIN, KELVIN_MAX) - KELVIN_MIN) / 100.0) as f32;
-    let i = (t.floor() as usize).min(WHITE_TABLE.len() - 2);
+    // `t` is at least 0, so the cast is its floor.
+    let i = (t as usize).min(WHITE_TABLE.len() - 2);
     let f = t - i as f32;
     let (a, b) = (WHITE_TABLE[i], WHITE_TABLE[i + 1]);
     [0, 1, 2].map(|c| a[c] + (b[c] - a[c]) * f)
@@ -444,6 +463,88 @@ pub(crate) fn encode(linear: [f32; 3]) -> [f32; 3] {
     linear.map(|c| c.clamp(0.0, 1.0).powf(1.0 / SRGB_GAMMA) * 255.0)
 }
 
+/// Linear light to the byte `encode` gives it, rounded to nearest and
+/// clamped, exactly, for every input (NaN and anything at or below 0 give
+/// 0), with no `powf`: [`ByteEncoder::byte`]. The tables are built once per
+/// process; a caller encoding many values holds [`ByteEncoder::get`].
+pub(crate) struct ByteEncoder {
+    thresholds: &'static [f32; 255],
+    /// Bucket of the first threshold (floats share a bucket when their
+    /// top 16 bits do).
+    first_bucket: usize,
+    /// Per bucket from `first_bucket` up to 1.0, how many thresholds lie
+    /// at or below the bucket's smallest float.
+    starts: Vec<u8>,
+}
+
+impl ByteEncoder {
+    pub(crate) fn get() -> &'static Self {
+        static ENCODER: OnceLock<ByteEncoder> = OnceLock::new();
+        ENCODER.get_or_init(|| {
+            let thresholds = byte_thresholds();
+            let first_bucket = (thresholds[0].to_bits() >> 16) as usize;
+            let last_bucket = (1.0f32.to_bits() >> 16) as usize;
+            let starts = (first_bucket..last_bucket)
+                .map(|k| {
+                    let lowest = f32::from_bits((k as u32) << 16);
+                    thresholds.partition_point(|&x| x <= lowest) as u8
+                })
+                .collect();
+            Self {
+                thresholds,
+                first_bucket,
+                starts,
+            }
+        })
+    }
+
+    /// The number of thresholds at or below `linear`, counted on from
+    /// where its bucket says the count starts (a step or two at most).
+    pub(crate) fn byte(&self, linear: f32) -> u8 {
+        if linear.is_nan() || linear <= 0.0 {
+            return 0;
+        }
+        if linear >= 1.0 {
+            return 255;
+        }
+        let bucket = (linear.to_bits() >> 16) as usize;
+        let mut b = bucket
+            .checked_sub(self.first_bucket)
+            .map_or(0, |k| usize::from(self.starts[k]));
+        while b < self.thresholds.len() && self.thresholds[b] <= linear {
+            b += 1;
+        }
+        b as u8
+    }
+}
+
+/// Threshold `b - 1` is the least float whose encoded value rounds to `b`
+/// or more, found once by bisecting the floats from 0 to 1 (ordered by
+/// their bits). Exact because the encode never decreases.
+fn byte_thresholds() -> &'static [f32; 255] {
+    static TABLE: OnceLock<[f32; 255]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let byte = |bits: u32| {
+            encode([f32::from_bits(bits); 3])[0]
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
+        std::array::from_fn(|i| {
+            let want = i as u8 + 1;
+            let (mut lo, mut hi) = (0u32, 1.0f32.to_bits());
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if byte(mid) >= want {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            f32::from_bits(lo)
+        })
+    })
+}
+
 /// A linear colour brought within full scale without reading dimmer than
 /// luminance `y`: a channel past full scales all three down so the hue
 /// holds, and if that leaves it dimmer than `y`, it is mixed towards full
@@ -464,6 +565,107 @@ fn keep_light(mut out: [f32; 3], y: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a road texel's channel became before the byte table: encode,
+    /// round to nearest, clamp.
+    fn encode_round(x: f32) -> u8 {
+        encode([x; 3])[0].round().clamp(0.0, 255.0) as u8
+    }
+
+    #[test]
+    fn bright_weight_is_the_smoothstep_everywhere() {
+        let smoothstep = |r: f64| {
+            if r.is_nan() || r <= 0.0 {
+                return 0.0;
+            }
+            let t = ((r.ln() - URBAN_BRIGHT_LO_NW.ln())
+                / (URBAN_BRIGHT_HI_NW.ln() - URBAN_BRIGHT_LO_NW.ln()))
+            .clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        let mut rs = vec![0.0, -1.0, f64::NAN, f64::INFINITY, 1e-300, 1e300];
+        for edge in [URBAN_BRIGHT_LO_NW, URBAN_BRIGHT_HI_NW] {
+            let mut r = edge;
+            for _ in 0..1000 {
+                r = r.next_down();
+            }
+            for _ in 0..2000 {
+                rs.push(r);
+                r = r.next_up();
+            }
+        }
+        rs.extend((0..200_000).map(|k| f64::from(k) * 0.001));
+        for r in rs {
+            assert_eq!(bright_weight(r).to_bits(), smoothstep(r).to_bits(), "{r}");
+        }
+    }
+
+    #[test]
+    fn floor_i64_is_floor() {
+        let mut xs = vec![0.0, -0.0, 1.0, -1.0, 1e15, -1e15, 0.5, -0.5];
+        xs.extend((-200_000..200_000).map(|k| f64::from(k) * 0.000_9));
+        for k in -400..400 {
+            let x = f64::from(k);
+            xs.extend([x, x.next_up(), x.next_down()]);
+        }
+        for x in xs {
+            assert_eq!(floor_i64(x), x.floor() as i64, "{x}");
+        }
+    }
+
+    #[test]
+    fn the_byte_encoder_is_encode_rounded_for_every_kind_of_input() {
+        let mut inputs = vec![
+            0.0,
+            -0.0,
+            1.0,
+            1.5,
+            -1.0,
+            f32::MIN_POSITIVE,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::MAX,
+        ];
+        // Around every byte boundary: the float steps either side of the
+        // linear value whose encoded value is exactly b + 0.5.
+        for b in 0..256 {
+            let t = ((b as f64 + 0.5) / 255.0).powf(f64::from(SRGB_GAMMA)) as f32;
+            let mut x = t;
+            for _ in 0..64 {
+                x = f32::from_bits(x.to_bits().saturating_sub(1));
+            }
+            for _ in 0..128 {
+                inputs.push(x);
+                x = f32::from_bits(x.to_bits() + 1);
+            }
+        }
+        // And a dense sweep of [0, 1.25].
+        inputs.extend((0..=2_000_000).map(|i| i as f32 / 1_600_000.0));
+        let encoder = ByteEncoder::get();
+        for x in inputs {
+            assert_eq!(
+                encoder.byte(x),
+                encode_round(x),
+                "linear {x:e} ({:#x})",
+                x.to_bits()
+            );
+        }
+    }
+
+    /// Every float from 0 to 1: the byte table assumes the encode is
+    /// monotonic. Release only (about a billion `powf`):
+    /// `cargo test --release -p xearthlayer --lib the_byte_encoder_exhaustive -- --ignored`.
+    #[test]
+    #[ignore]
+    fn the_byte_encoder_exhaustive() {
+        let (encoder, mut mismatches) = (ByteEncoder::get(), 0u64);
+        for bits in 0..=1.0f32.to_bits() {
+            let x = f32::from_bits(bits);
+            mismatches += u64::from(encoder.byte(x) != encode_round(x));
+        }
+        assert_eq!(mismatches, 0);
+    }
 
     fn lum(c: [f32; 3]) -> f32 {
         0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
