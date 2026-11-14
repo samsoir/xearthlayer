@@ -813,7 +813,12 @@ reads into one value from 0 to 1 per texel of the first visible level, at
 the texel centres `CpuLitGenerator` samples. Each segment between two
 points contributes its class profile: the class intensity within the half
 width of the line, then a Gaussian fall-off with the class sigma, cut at
-half width plus 3 sigma. Distances are in ground metres (Web Mercator
+half width plus 3 sigma. The fall-off `exp(-u^2 / 2)`, with `u` the
+distance beyond the half width in sigmas, is computed as `(1 - u^2 / 2^11)`
+squared ten times, in `f32`: within 2.7e-4 of the Gaussian (a test holds it
+under 3e-4, far inside a 1024th of the class intensity) and exactly 1 at
+0, with no branch and no table. Glow and lamps share this one kernel, so
+world anchoring is untouched. Distances are in ground metres (Web Mercator
 metres times cos(latitude) on each row), so the glow is anchored to the
 world and the same ground gives the same light at any zoom. The sigma is
 `max(class sigma, a texel's ground size)` on each row, not once per
@@ -822,11 +827,16 @@ roads take the **maximum**, not the sum, so a junction or a dual
 carriageway is no brighter than its brightest road.
 
 Cost is kept down at every level: a tile is skipped whole when no segment
-box nears the footprint, a segment is culled by its cell box, it visits
-only the texels in its reach window, and a texel is rejected by squared
-distance before any square root or exponential. The profile (one `f32` per
-texel, 4 MiB at 1024 px) is allocated when the first segment reaches the
-grid, so a texture with no road nearby costs no heap.
+box nears the footprint, a segment is culled by its cell box, and it
+visits only the texels in its reach window, whose bounds come from the
+even texel spacing (a guess and a step or two, not a binary search). The
+texel loop has no branch: every texel of the window computes its value,
+zero beyond the reach by a select, and keeps the larger, so the compiler
+vectorises it. What varies by row (the sigma and its inverse, the reach)
+is computed once per row without a division, and lit texels are counted
+once after drawing. The profile (one `f32` per texel, 4 MiB at 1024 px)
+is allocated when the first segment reaches the grid, so a texture with no
+road nearby costs no heap.
 
 `reach_deg(name, size, model)` is how far outside a footprint a road can
 still light one of its texels, in degrees: the widest class reach (half
@@ -837,7 +847,12 @@ probe tests with it, so the two cannot disagree.
 
 **Composite.** The generator adds the glow last, only on texels it reaches,
 in linear light: the pattern's bytes below are decoded (through a 256-entry
-table), the road light is added, and the sum is encoded. An empty field
+table), the road light is added, and the sum is encoded to bytes by
+`ByteEncoder`, which gives exactly the byte the sRGB encode would round to
+(checked for every float from 0 to 1) with no `powf`: 255 thresholds found
+once by bisection, and a table on the float's top 16 bits saying where to
+start counting them. A texel with no class skips the gain, which only the
+pattern needs. An empty field
 leaves every byte as it was, and a field rastered for another size is
 ignored rather than misplaced. The level is
 
@@ -853,8 +868,9 @@ follows the pattern's: where the texel's LED patch is LED (the same
 `patch_at` decision, with the urban share for its brightness and region),
 the patch's white at luminance 1; elsewhere the road sodium (stored
 255, 178, 92) toned by the same sodium tone as the pattern, at luminance 1.
-The region is looked up once per 1° tile and the patch once per patch cell
-as a row is walked.
+The region is looked up once per 1° tile, the patch the pattern's LED
+stage drew is reused (otherwise it is found once per patch cell as a row is
+walked), and the white of the last temperature is kept.
 
 **Lamps (test option).** `RoadModel::rural_lamps` replaces the continuous
 glow on every class but motorways and ramps by sparse lamps: one every
@@ -1074,16 +1090,19 @@ resident for the session, because its many small allocations are not
 returned to the system. A 3 × 3 block around Tokyo alone fills 93% of the
 tile cache.
 
-**Generation** at 1024 px (seven runs each, medians):
+**Generation** at 1024 px (nine interleaved rounds each, medians of two
+runs):
 
-| Texture | Road texels | Raster | Without roads | Raster and generation | Increase |
-|---|---|---|---|---|---|
-| Geneva `23248_33872_ZL16` (65,272 segments rastered) | 42.9% | 40 ms | 307 to 311 ms | 374 to 380 ms | 22% |
-| Densest Tokyo `25792_58208_ZL16` (159,005 segments rastered) | 83.3% | 101 to 103 ms | 424 to 432 ms | 580 to 582 ms | 34 to 37% |
+| Texture | Road texels | Raster | Composite | Without roads | Raster and generation | Increase |
+|---|---|---|---|---|---|---|
+| Geneva `23248_33872_ZL16` (65,272 segments rastered) | 42.9% | 20 ms | 14 ms | 309 to 311 ms | 342 to 344 ms | 10.5 to 10.7% |
+| Densest Tokyo `25792_58208_ZL16` (159,005 segments rastered) | 83.3% | 59 ms | 21 ms | 429 to 431 ms | 510 to 511 ms | 18.6 to 18.7% |
 
-The raster is about 60% of the increase on Geneva and two thirds on Tokyo;
-the rest is the composite of the road texels. The densest Tokyo texture is
-the ZL16 texture of the tile holding the most road points. Where no road reaches a texture the raster allocates nothing and
+The densest Tokyo texture is the ZL16 texture of the tile holding the most
+road points. Of Tokyo's raster, about 8 ms is the cull of the tile's 3.2
+million segment boxes and 4 ms the projection of the 274,000 points kept;
+the rest is the texel loop, about 4 ns per texel visited (11.6 million, 73
+per segment). Where no road reaches a texture the raster allocates nothing and
 the generator's output is unchanged byte for byte.
 
 ### Decisions
