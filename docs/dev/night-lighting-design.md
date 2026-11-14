@@ -680,9 +680,19 @@ resolved root equals a mount point, or when its ini entry is relative and its fo
 the mount point's (which covers a mount point spelled with another prefix,
 a symlink or a case difference). The index is built once per session, in
 its own blocking task, on first use; building the lit source reads nothing
-from the installation. On the developer's installation (315 pack lines,
-301 enabled, X-World Pro on every continent) it lists 181,290 DSFs over
-39,017 tiles in 15 to 60 ms.
+from the installation. The index lives for the session, so it stores no
+path per DSF: one root per pack and one sorted array of six-byte entries
+(tile, rank, and whether the file is spelled as X-Plane names it,
+`Earth nav data/+40+000/+46+006.dsf`), so a tile's sources are one
+binary-searched run, highest priority first. A standard path is rebuilt
+from its pack's root when the tile is built; any other spelling the
+listing accepts (an upper-case `.DSF`, a tile filed under another block's
+folder) keeps its relative path in a small side table, so it is still
+found where it is. The listing parses each directory entry's name straight
+into an entry, in parallel across packs. On the developer's installation
+(315 pack lines, 301 enabled, X-World Pro on every continent) it lists
+181,290 DSFs over 39,017 tiles in 15 to 25 ms and holds them in 1.1 MiB
+(`PackIndex::bytes`).
 
 The sources of a tile are then merged top down (see Merge), so a
 `sim/exclude_net` zone in a higher pack removes the roads of the packs
@@ -785,26 +795,48 @@ Pro's road packs carry `sim/exclude_net` over their whole tile, so with
 them installed Global Scenery's mesh is never decompressed for the tile.
 
 **Compact merged tiles.** The merged tile is what the memory cache keeps,
-so it is stored compactly: points as 16-bit offsets in the tile (1/65535
-degree, about 1.7 m north to south, far below a lit texel), one class byte
-per segment, and a 4-byte box per segment in cells of 1/256 degree, used
-only to cull (the exact test is in the raster). A one-bit-per-cell
-occupancy map of the 256 × 256 cells (8 KiB per tile) answers
+so it is stored compactly. Points are 16-bit offsets in the tile (1/65535
+degree, about 1.7 m north to south, far below a lit texel). Segments are
+stored back to back with one byte each: the class in the top three bits
+and the point count less one in the low five, so a segment of more than
+32 points is stored as pieces that share the joint point (1% of Geneva's
+segments, 0.1% of Tokyo's). The tile is a 256 × 256 grid of cells of
+1/256 degree:
+
+- In a dense tile the segments are sorted by the cell of their box's
+  south-west corner, and a prefix index gives each cell's first segment
+  and first point (two `u32` per cell, 512 KiB). A segment whose box spans
+  more than one cell (`MAX_SPAN`; 1% of Geneva's segments, 0.1% of
+  Tokyo's) carries its 4-byte box in a short list instead, and the tile
+  records the largest span of the others. A query visits the cells from
+  that span south and west of its box to its north-east corner, row by
+  row, then tests the boxes of the short list.
+- Where the index would cost more than a box for every segment (fewer
+  than 131,075 segments within a cell's span), the tile has no index and
+  every segment carries its box.
+
+`Merger` collects segments in arrival order with their boxes, and `finish`
+lays the tile out by cell with a counting sort into exactly sized arrays
+(about 30 ms for Tokyo, 3 ms for Geneva), a transient peak of about twice
+the tile. A one-bit-per-cell occupancy map (8 KiB per tile) answers
 `MergedRoads::crosses` in time proportional to the query's cells, not to
 the tile's segments: two cell boxes meet exactly when they share a cell.
-Consumers see degrees through `points`, `query` and `in_box`, never the
-encoding. `MergedRoads::bytes` is the weight in the tile cache.
+Consumers visit the segments near a box through
+`MergedRoads::for_each_chain_near`, which hands over a `ChainRef` (the
+class, the points in degrees, and the quantised offsets), never the
+encoding; it may hand over a segment just outside the box, never miss one
+inside. `MergedRoads::bytes`, the weight in the tile cache, is exact.
 
-| Tile | Segments | Merged |
-|---|---|---|
-| Geneva `+46+006`, X-World Pro | 412,448 | 11.4 MiB |
-| Geneva, Global Scenery only | 109,383 | 2.5 MiB |
-| Tokyo `+35+139`, X-World Pro and the Haneda overlay | 3,193,344 | 61.0 MiB |
-| 3 × 3 tiles around Geneva | | 63.9 MiB |
-| 3 × 3 tiles around Tokyo | | 119.2 MiB |
+| Tile | Segments stored | Index | Merged |
+|---|---|---|---|
+| Geneva `+46+006`, X-World Pro | 418,937 | yes | 8.8 MiB |
+| Geneva, Global Scenery only | 109,996 | no | 2.1 MiB |
+| Tokyo `+35+139`, X-World Pro and the Haneda overlay | 3,197,492 | yes | 37.2 MiB |
+| 3 × 3 tiles around Geneva | | | 51.4 MiB |
+| 3 × 3 tiles around Tokyo | | | 81.0 MiB |
 
-The `Night roads: tile ready` field `merged_segments` counts these
-segments.
+The `Night roads: tile ready` field `merged_segments` counts the stored
+segments (pieces included).
 
 ### Glow model (`roads/field.rs`, `roads/model.rs`)
 
@@ -826,8 +858,11 @@ texture, so a ZL16 texture and its ZL17 quarter agree exactly. Overlapping
 roads take the **maximum**, not the sum, so a junction or a dual
 carriageway is no brighter than its brightest road.
 
-Cost is kept down at every level: a tile is skipped whole when no segment
-box nears the footprint, a segment is culled by its cell box, and it
+Cost is kept down at every level: a merged tile hands over only the
+segments filed in cells near the footprint and its reach (no test per
+segment of the tile), a point's Web Mercator northing is read from a table
+built once per raster over the footprint's quantised latitudes (the value
+the projection gives, so the table changes no result), and a segment
 visits only the texels in its reach window, whose bounds come from the
 even texel spacing (a guess and a step or two, not a binary search). The
 texel loop has no branch: every texel of the window computes its value,
@@ -876,7 +911,8 @@ walked), and the white of the last temperature is kept.
 glow on every class but motorways and ramps by sparse lamps: one every
 `spacing_m` of ground arc length along a segment, each lit or not by a hash
 of its segment's first point and its index, so lamps land on the same
-ground at any zoom. `LampParams::TEST` (30 m, 30% lit, sigma 4 m) is the
+ground at any zoom. A segment stored as pieces starts a walk at each
+joint, the same in every texture. `LampParams::TEST` (30 m, 30% lit, sigma 4 m) is the
 only preset. It is a field of the model, not a configuration key, and is
 off in `RoadModel::DEFAULT`; it exists to compare the two looks in flight.
 
@@ -888,8 +924,8 @@ off in `RoadModel::DEFAULT`; it exists to compare the two looks in flight.
   index, then reads them on the blocking pool, highest priority first,
   feeding each extraction to the merger and dropping it, so at most one
   extraction is alive at a time, until a zone covers the tile. Every
-  scratch buffer is reused, and the merged arrays are trimmed to their
-  length.
+  scratch buffer is reused, and the merged tile is laid out in exactly
+  sized arrays (see Merge).
 - **Permits.** `ROAD_EXTRACT_PERMITS` (2) bound concurrent builds. A build
   holds one permit for its whole tile and no other lit permit. A successful
   build hands its permit to one detached task that writes the tile's disk
@@ -1035,7 +1071,7 @@ warning for an unreadable DSF. Read them with `run --debug`.
 
 | Message | Fields |
 |---|---|
-| `Night roads: pack index built` | `packs`, `enabled`, `dsfs`, `tiles`, `ms` |
+| `Night roads: pack index built` | `packs`, `enabled`, `dsfs`, `tiles`, `bytes`, `ms` |
 | `Night roads: DSF extracted` | `path`, `file_bytes`, `read_bytes`, `compressed`, `ms`, `encode_ms`, `segments_kept`, `exclusions`, `pool_points`, `walk_visits`, `cached` |
 | `Night roads: DSF cache hit` | `path`, `read_ms`, `decode_ms`, `segments` |
 | `Night roads: tile ready` | `lat`, `lon`, `trigger`, `dsfs`, `cache_hits`, `cache_misses`, `merged_segments`, `removed`, `skipped_below_cover`, `bytes`, `total_ms` |
@@ -1067,42 +1103,47 @@ Files were in the page cache.
 
 | Tile | Sources | Read | Ready |
 |---|---|---|---|
-| Geneva `+46+006` | 14 | 13 (Global Scenery skipped below X-World Pro's cover) | 32 to 44 ms |
-| Tokyo `+35+139` | 18 | 16 | 168 to 198 ms |
-| Geneva without simHeaven packs, cold (Global Scenery 7z) | 4 | 4 | 317 ms |
+| Geneva `+46+006` | 14 | 13 (Global Scenery skipped below X-World Pro's cover) | 36 to 44 ms |
+| Tokyo `+35+139` | 18 | 16 | 198 to 218 ms |
+| Geneva without simHeaven packs, cold (Global Scenery 7z) | 4 | 4 | 307 ms |
 | The same, second service, from the disk tier | 4 | 4 | 5 ms |
 
-**Memory** (resident, allocator configured as `run` configures it):
+**Memory** (resident, allocator configured as `run` configures it, with
+rayon's pool and a blocking-pool thread already running, as they are in
+`run` long before a road tile is asked for):
 
 | | Geneva 3 × 3 | Tokyo 3 × 3 |
 |---|---|---|
-| Merged roads (`MergedRoads::bytes`) | 63.9 MiB | 119.2 MiB |
-| Resident growth readying them | 68 to 71 MiB | 124 to 126 MiB |
-| Pack index, resident growth when built | 61 to 62 MiB | 61 to 62 MiB |
-| Peak resident (process) | 162 to 187 MiB | 294 to 344 MiB |
+| Merged roads (`MergedRoads::bytes`) | 51.4 MiB | 81.0 MiB |
+| Resident growth readying them | 55 to 56 MiB | 85 to 86 MiB |
+| The service's first build (the pack index and an empty tile) | 7 to 8 MiB | 7 to 8 MiB |
+| Peak resident (process) | 112 to 131 MiB | 240 to 244 MiB |
 
 Merged tiles cost about their `bytes` in resident memory and are returned
 to the system when evicted (their arrays are large single allocations).
-Steady-state tile memory is bounded by the 128 MiB tile cache. The pack
-index is not inside that bound: it holds about 26.6 MiB of paths and
-entries for this installation's 181,290 DSFs, and costs about 61 MiB
-resident for the session, because its many small allocations are not
-returned to the system. A 3 × 3 block around Tokyo alone fills 93% of the
-tile cache.
+Steady-state tile memory is bounded by the 128 MiB tile cache, which a
+3 × 3 block around Tokyo fills to 63%. The pack index is outside that
+bound and holds 1.1 MiB. Built alone in a process whose rayon pool is
+running, it adds 4 to 5 MiB resident: the rest is the listing's transient
+allocations in the pool's threads, which later allocations reuse (a
+second index built beside the first adds 1.5 to 2 MiB). Of the service's
+first build, nearly all stays resident after the service and its index
+are dropped and the allocator is trimmed: it is the runtime's first use,
+not the index.
 
 **Generation** at 1024 px (nine interleaved rounds each, medians of two
 runs):
 
 | Texture | Road texels | Raster | Composite | Without roads | Raster and generation | Increase |
 |---|---|---|---|---|---|---|
-| Geneva `23248_33872_ZL16` (65,272 segments rastered) | 42.9% | 20 ms | 14 ms | 309 to 311 ms | 342 to 344 ms | 10.5 to 10.7% |
-| Densest Tokyo `25792_58208_ZL16` (159,005 segments rastered) | 83.3% | 59 ms | 21 ms | 429 to 431 ms | 510 to 511 ms | 18.6 to 18.7% |
+| Geneva `23248_33872_ZL16` (69,886 segments rastered) | 42.9% | 17 ms | 12 to 14 ms | 306 to 307 ms | 336 to 337 ms | 9.6 to 10.0% |
+| Densest Tokyo `25792_58208_ZL16` (170,251 segments rastered) | 83.3% | 45 to 46 ms | 19 to 22 ms | 420 to 423 ms | 485 to 489 ms | 15.5% |
 
 The densest Tokyo texture is the ZL16 texture of the tile holding the most
-road points. Of Tokyo's raster, about 8 ms is the cull of the tile's 3.2
-million segment boxes and 4 ms the projection of the 274,000 points kept;
-the rest is the texel loop, about 4 ns per texel visited (11.6 million, 73
-per segment). Where no road reaches a texture the raster allocates nothing and
+road points. The segments rastered are those the cell index hands over,
+a few more than reach the texture. The raster tests no segment box of the
+tile and computes no logarithm per point, so nearly all of it is the texel
+loop, about 4 ns per texel visited. Where no road reaches a texture the raster allocates nothing and
 the generator's output is unchanged byte for byte.
 
 ### Decisions
