@@ -6,6 +6,7 @@ pub mod class;
 pub mod codec;
 pub mod dsf;
 pub mod exclusion;
+pub mod field;
 pub mod merge;
 pub mod model;
 pub mod packs;
