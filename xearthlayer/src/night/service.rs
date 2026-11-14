@@ -82,13 +82,16 @@ const SUPPORTED_LIT_ZOOMS: std::ops::RangeInclusive<u8> = 12..=22;
 const MIN_LIT_GENERATION_PERMITS: usize = 2;
 const MAX_LIT_GENERATION_PERMITS: usize = 4;
 
-// Lit work (probes, generations, disk tier) runs on the blocking pool inside
-// its headroom (R17); keep it to a quarter of that headroom so it cannot
-// starve other blocking work. The lit share is fully used (8 of 8): a new lit
-// permit needs a smaller one elsewhere or a larger headroom.
+// Lit work (probes, generations, disk tier, road extraction) runs on the
+// blocking pool inside its headroom (R17); night may use a third of it so it
+// cannot starve other blocking work. The night share is fully used (10 of
+// 10): a new night permit needs a smaller one elsewhere or a larger headroom.
 const _: () = assert!(
-    LIT_PROBE_PERMITS + MAX_LIT_GENERATION_PERMITS + LIT_DISK_PERMITS
-        <= crate::executor::BLOCKING_POOL_HEADROOM / 4
+    LIT_PROBE_PERMITS
+        + MAX_LIT_GENERATION_PERMITS
+        + LIT_DISK_PERMITS
+        + super::roads::service::ROAD_EXTRACT_PERMITS
+        <= crate::executor::BLOCKING_POOL_HEADROOM / 3
 );
 
 /// Concurrent lit generations for a machine with `cores` cores: an eighth of
@@ -598,6 +601,19 @@ mod tests {
             Err("down")
         });
         assert_eq!((r, calls), (Err("down"), 3));
+    }
+
+    #[test]
+    fn night_permits_fit_a_third_of_the_headroom() {
+        const {
+            assert!(
+                LIT_PROBE_PERMITS
+                    + MAX_LIT_GENERATION_PERMITS
+                    + LIT_DISK_PERMITS
+                    + crate::night::roads::service::ROAD_EXTRACT_PERMITS
+                    <= crate::executor::BLOCKING_POOL_HEADROOM / 3
+            )
+        };
     }
 
     #[test]

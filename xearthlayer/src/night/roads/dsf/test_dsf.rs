@@ -186,6 +186,18 @@ pub fn install(root: &std::path::Path, tile: (i32, i32), packs: &[(&str, Option<
     std::fs::write(cs.join("scenery_packs.ini"), ini).unwrap();
 }
 
+/// `dsf` as the single entry of a 7z, as X-Plane ships a DSF.
+pub fn sevenz(dsf: &[u8]) -> Vec<u8> {
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+    let mut w = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+    w.push_archive_entry(
+        ArchiveEntry::new_file("tile.dsf"),
+        Some(std::io::Cursor::new(dsf.to_vec())),
+    )
+    .unwrap();
+    w.finish().unwrap().into_inner()
+}
+
 pub(crate) fn chain_cmd(b: &mut Builder, pool: u16, def: u8, subtype: u8, idx: &[u16]) {
     b.cmds.push(1); // PoolSelect
     b.cmds.extend(pool.to_le_bytes());

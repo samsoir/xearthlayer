@@ -74,12 +74,16 @@ pub struct EvictionCandidate {
 /// - `"tile:15:12754:5279"` → region based on tile center lat/lon
 /// - `"chunk:15:12754:5279:8:12"` → same region as parent tile
 /// - `"lit:16:25312:10528"` → region of that texture at its own zoom
+/// - `"roads:46:6:0123456789abcdef"` → `+46+006`, the DSF tile it names
 pub fn key_to_region(key: &str) -> Option<String> {
     let parts: Vec<&str> = key.split(':').collect();
     let (zoom, row, col) = match parts.as_slice() {
         ["tile", zoom, row, col] => (*zoom, *row, *col),
         ["lit", zoom, row, col] => (*zoom, *row, *col),
         ["chunk", zoom, tile_row, tile_col, _, _] => (*zoom, *tile_row, *tile_col),
+        ["roads", lat, lon, _] => {
+            return Some(format_dsf_name(lat.parse().ok()?, lon.parse().ok()?))
+        }
         _ => return None,
     };
     let zoom: u8 = zoom.parse().ok()?;
@@ -447,6 +451,28 @@ mod tests {
         );
         assert!(key_to_region("lit:16:25312:10528").is_some());
         assert_eq!(key_to_region("lit:16:x:10528"), None);
+    }
+
+    #[test]
+    fn road_keys_land_in_the_region_of_their_dsf_tile() {
+        assert_eq!(
+            key_to_region("roads:46:6:0123456789abcdef").as_deref(),
+            Some("+46+006")
+        );
+        assert_eq!(
+            key_to_region("roads:-34:-71:0123456789abcdef").as_deref(),
+            Some("-34-071")
+        );
+        assert_eq!(key_to_region("roads:46:x:0123456789abcdef"), None);
+    }
+
+    #[test]
+    fn a_negative_road_key_survives_the_filename_round_trip() {
+        let key = "roads:-34:-71:0123456789abcdef";
+        assert_eq!(
+            LruIndex::filename_to_key(&LruIndex::key_to_filename(key)).as_deref(),
+            Some(key)
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -10,6 +10,8 @@ pub mod field;
 pub mod merge;
 pub mod model;
 pub mod packs;
+pub mod service;
+pub mod stats;
 
 pub use class::{is_lit_subtype, RoadClass};
 pub use model::{ClassParams, LampParams, RoadModel, ROAD_MODEL_VERSION};
