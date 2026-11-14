@@ -211,10 +211,12 @@ async fn tiles_ready_over_the_real_install() {
     );
 }
 
-/// Geneva without its simHeaven packs falls back to the packs below
-/// and Global Scenery's 7z mesh: cold (decompression, a cache miss
-/// that writes the mesh's entry), then a second service reading the
-/// same disk tier (hits only).
+/// Geneva without its simHeaven packs. With Global Airports, the airport's
+/// roads are overlay roads, so Global Scenery's 7z mesh is read only to
+/// its header and writes no entry. Without Global Airports too, no
+/// overlay gives a road and the service falls back to the mesh: cold
+/// (decompression, a cache miss that writes the mesh's entry), then a
+/// second service reading the same disk tier (hits only).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn global_scenery_fallback_for_geneva() {
@@ -222,11 +224,17 @@ async fn global_scenery_fallback_for_geneva() {
         return;
     }
     print_road_events();
-    let skip = without_simheaven();
-    println!("{} packs left out", skip.len());
+    let airports = Path::new(INSTALL).join("Global Scenery/Global Airports");
+    let mut without_airports = without_simheaven();
+    without_airports.push(airports);
+    println!("{} packs left out", without_airports.len());
     let d = memory_disk();
-    for pass in ["cold", "warm"] {
-        let svc = service(skip.clone(), Some(Arc::clone(&d)));
+    for pass in ["with Global Airports", "cold", "warm"] {
+        let skip = match pass {
+            "with Global Airports" => without_simheaven(),
+            _ => without_airports.clone(),
+        };
+        let svc = service(skip, Some(Arc::clone(&d)));
         ready(&svc, &[OCEAN]).await;
         let sources = svc.source_paths(GENEVA).await;
         let (roads, ms) = ready(&svc, &[GENEVA]).await;
@@ -248,19 +256,30 @@ async fn global_scenery_fallback_for_geneva() {
                 println!("  entry {} for {}", entry.len(), path.display());
             }
         }
-        // Global Scenery is the last source, and it was read: only
-        // a read 7z leaves an entry.
+        // Global Scenery is the last source; only a 7z read in full
+        // leaves an entry.
         let global = sources.last().expect("Geneva has sources");
         assert!(
-            global.starts_with(Path::new(INSTALL).join("Global Scenery")),
+            global.starts_with(Path::new(INSTALL).join("Global Scenery/X-Plane 12 Global Scenery")),
             "{}",
             global.display()
         );
         let key = cache_key(GENEVA, &global.to_string_lossy());
-        assert!(d.get(&key).await.unwrap().is_some(), "the mesh was read");
+        let mesh_read = d.get(&key).await.unwrap().is_some();
         match pass {
-            "cold" => assert!(s.cache_misses > 0, "the cold pass decompressed"),
-            _ => assert_eq!(s.cache_misses, 0, "the warm pass read entries only"),
+            "with Global Airports" => {
+                assert!(!mesh_read, "the airport's roads are overlay roads");
+                assert!(r.len() < 100, "the airport's roads only");
+            }
+            "cold" => {
+                assert!(mesh_read, "the fallback read the mesh");
+                assert!(r.len() > 100_000, "the mesh's roads");
+                assert!(s.cache_misses > 0, "the cold pass decompressed");
+            }
+            _ => {
+                assert!(r.len() > 100_000, "the mesh's roads");
+                assert_eq!(s.cache_misses, 0, "the warm pass read entries only");
+            }
         }
     }
 }

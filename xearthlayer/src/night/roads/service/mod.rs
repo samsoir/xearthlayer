@@ -841,6 +841,7 @@ impl RoadService {
                     read_ms,
                     decode_ms = decode_us / 1000,
                     segments,
+                    head_only = kept.is_some(),
                     "Night roads: DSF cache hit"
                 );
                 return Ok((merger, absorbed, kept));
