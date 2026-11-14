@@ -123,26 +123,33 @@ impl LedModel {
     pub const DEFAULT: Self = Self {
         // Shares raised in #363: from the air, cities that have converted
         // their street lighting read mostly white, residential included.
+        // Whites cooled in #363: most conversions were 4000 K (US 4000 to
+        // 5000 K before 2016, UK councils mostly 4000 K or more), with
+        // newer residential streets warmer; at 3200 K a distant city
+        // averaged to amber even when nine texels in ten were LED.
         industrial: Tone {
             share: 0.90,
             kelvin: 4500.0,
         },
         urban_bright: Tone {
             share: 0.90,
-            kelvin: 4000.0,
+            kelvin: 4500.0,
         },
         urban_dim: Tone {
             share: 0.80,
-            kelvin: 3200.0,
+            kelvin: 4000.0,
         },
-        // Na, Sa, Eu, Af, As, Oc, Unknown
+        // Na, Sa, Eu, Af, As, Oc, Unknown. The shifts were halved in #363:
+        // European guidance leans warm for residential streets, but its
+        // practice and the US's converge on 4000 K; how much a region has
+        // converted is the share's job, not the temperature's.
         regions: [
-            region(1.0, 400.0),
-            region(0.7, 400.0),
-            region(0.9, -400.0),
-            region(0.5, 400.0),
-            region(0.8, -400.0),
-            region(0.9, -400.0),
+            region(1.0, 200.0),
+            region(0.7, 200.0),
+            region(0.9, -200.0),
+            region(0.5, 200.0),
+            region(0.8, -200.0),
+            region(0.9, -200.0),
             region(0.75, 0.0),
         ],
         energy: 1.25,
@@ -482,21 +489,21 @@ mod tests {
     fn every_region_row_follows_the_spec_table() {
         // (region, share scale, kelvin shift), from the spec.
         let table = [
-            (LedRegion::Na, 1.0, 400.0),
-            (LedRegion::Sa, 0.7, 400.0),
-            (LedRegion::Eu, 0.9, -400.0),
-            (LedRegion::Af, 0.5, 400.0),
-            (LedRegion::As, 0.8, -400.0),
-            (LedRegion::Oc, 0.9, -400.0),
+            (LedRegion::Na, 1.0, 200.0),
+            (LedRegion::Sa, 0.7, 200.0),
+            (LedRegion::Eu, 0.9, -200.0),
+            (LedRegion::Af, 0.5, 200.0),
+            (LedRegion::As, 0.8, -200.0),
+            (LedRegion::Oc, 0.9, -200.0),
             (LedRegion::Unknown, 0.75, 0.0),
         ];
         let m = LedModel::DEFAULT;
         for (region, scale, shift) in table {
-            // Urban bright: share 0.90, kelvin 4000.
+            // Urban bright: share 0.90, kelvin 4500.
             let t = m.tone(false, 1.0, region);
             assert!((t.share - 0.90 * scale).abs() < 1e-12, "{region:?} share");
             assert!(
-                (t.kelvin - (4000.0 + shift)).abs() < 1e-9,
+                (t.kelvin - (4500.0 + shift)).abs() < 1e-9,
                 "{region:?} kelvin"
             );
         }
@@ -547,16 +554,16 @@ mod tests {
     fn the_default_tones_follow_the_spec_tables() {
         let m = LedModel::DEFAULT;
         let t = m.tone(true, 0.0, LedRegion::Na);
-        assert_eq!((t.share, t.kelvin), (0.90, 4900.0));
+        assert_eq!((t.share, t.kelvin), (0.90, 4700.0));
         let t = m.tone(false, 1.0, LedRegion::Eu);
         assert!((t.share - 0.81).abs() < 1e-12);
-        assert_eq!(t.kelvin, 3600.0);
+        assert_eq!(t.kelvin, 4300.0);
         let t = m.tone(false, 0.0, LedRegion::Af);
         assert!((t.share - 0.40).abs() < 1e-12);
-        assert_eq!(t.kelvin, 3600.0);
+        assert_eq!(t.kelvin, 4200.0);
         let t = m.tone(false, 0.5, LedRegion::Unknown);
         assert!((t.share - 0.6375).abs() < 1e-12, "0.75 x mean(0.90, 0.80)");
-        assert_eq!(t.kelvin, 3600.0);
+        assert_eq!(t.kelvin, 4250.0, "mean(4500, 4000)");
         assert_eq!(m.energy, 1.25);
         assert_eq!(
             m.sodium,

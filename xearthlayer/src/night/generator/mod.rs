@@ -60,7 +60,8 @@ pub trait LitGenerator: Send + Sync {
 /// 2: LED patches (`led`).
 /// 3: raised LED shares and toned sodium (`led::SodiumTone`, #363).
 /// 4: mips averaged in linear light (`lit_chain`, #363).
-pub const LIT_GENERATOR_VERSION: u32 = 4;
+/// 5: cooler LED whites and halved region shifts (#363).
+pub const LIT_GENERATOR_VERSION: u32 = 5;
 
 /// Gamma of the sRGB decode X-Plane applies to a texture's stored values.
 pub const SRGB_GAMMA: f32 = 2.2;
@@ -149,8 +150,8 @@ mod tests {
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
 
     #[test]
-    fn linear_light_mips_are_generator_version_four() {
-        assert_eq!(LIT_GENERATOR_VERSION, 4);
+    fn cooler_led_whites_are_generator_version_five() {
+        assert_eq!(LIT_GENERATOR_VERSION, 5);
     }
 
     fn name_at(lat: f64, lon: f64) -> DdsFilename {

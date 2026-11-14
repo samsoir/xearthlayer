@@ -536,8 +536,8 @@ with no config keys, tuned in flight:
 | Category | Share | Base temperature |
 |---|---|---|
 | Industrial | 0.90 | 4500 K |
-| Urban bright | 0.90 | 4000 K |
-| Urban dim | 0.80 | 3200 K |
+| Urban bright | 0.90 | 4500 K |
+| Urban dim | 0.80 | 4000 K |
 
 The shares were raised from 0.80, 0.75 and 0.45 in #363: night photos of
 central Mexico and Mexico City from the air showed city light mostly
@@ -546,14 +546,31 @@ pixels, almost no saturated orange), against 0.34 and a quarter saturated
 orange in a 0.5.0 screenshot of Ontario, California, where most
 residential ground stayed sodium.
 
+The temperatures were raised from 4000 K (urban bright) and 3200 K (urban
+dim), and the region shifts halved from ±400 K, also in #363. Once the
+mips kept their light, the generated Bay Area textures (61 ZL16 textures
+from San Francisco to San Jose) were nine tenths LED by texel but still
+averaged to amber (linear R : G : B over luminance 1.44 : 0.92 : 0.53,
+saturation 0.37 as an sRGB colour), because a distant city is mostly
+residential white. With these values it averages to saturation 0.28; a
+stronger sodium tone (`mix` 0.45) moved it by nothing measurable. Field
+practice: US conversions before 2016 were mostly 4000 to 5000 K, after
+which the AMA's 3000 K guidance turned many residential streets warmer
+(Tacoma: 3000 K residential, 4000 K arterials); EU procurement guidance
+asks for warm white in residential areas, but most UK councils install
+4000 K or more. The continents converge more than they differ, so the
+shift is ±200 K, and how much of a region has converted (Belgium and
+Germany least in Europe, per the ISS colour maps of Sánchez de Miguel et
+al., 2022) is left to the share scale.
+
 | Region | Share scale | Temperature shift |
 |---|---|---|
-| NA | 1.0 | +400 K |
-| EU | 0.9 | -400 K |
-| OC | 0.9 | -400 K |
-| AS | 0.8 | -400 K |
-| SA | 0.7 | +400 K |
-| AF | 0.5 | +400 K |
+| NA | 1.0 | +200 K |
+| EU | 0.9 | -200 K |
+| OC | 0.9 | -200 K |
+| AS | 0.8 | -200 K |
+| SA | 0.7 | +200 K |
+| AF | 0.5 | +200 K |
 | Patch or unknown | 0.75 | 0 |
 
 **Recolour.** An LED texel keeps the luminance of the pattern sum (decoded
@@ -592,8 +609,9 @@ work), recorded when the recipe is loaded, as the identity is. Patches
 (`_patches/...`), unknown codes and missing recipes are Unknown.
 
 **Cache.** The region is part of each tile's entry in the footprint
-fingerprint, and `LIT_GENERATOR_VERSION` is 4 (2 added the LED stage, 3
-the raised shares and the sodium tone, 4 the linear-light mips), so lit entries from before
+fingerprint, and `LIT_GENERATOR_VERSION` is 5 (2 added the LED stage, 3
+the raised shares and the sodium tone, 4 the linear-light mips, 5 the
+cooler whites), so lit entries from before
 the current generator miss once and regenerate; the GC ages the old ones out.
 
 **Cost.** Measured with the ignored test
