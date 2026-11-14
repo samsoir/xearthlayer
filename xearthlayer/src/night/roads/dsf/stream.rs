@@ -7,7 +7,7 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::pool::{Pool, MAX_POOL_POINTS};
-use super::walk::{walk_commands, Segmenter, WALK_SLACK};
+use super::walk::{walk_commands, Segmenter, MAX_WALK_VISITS, WALK_SLACK};
 use super::{
     le_u32, Bytes, Chains, DsfError, DsfFileStats, DsfRoads, MAX_DSF_BYTES, MAX_RETAINED_ATOM_BYTES,
 };
@@ -20,6 +20,8 @@ const RETAIN_STEP: u64 = 16 * 1024 * 1024;
 const SEVENZ_MAGIC: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 const COOKIE: &[u8; 8] = b"XPLNEDSF";
 const HEADER: u64 = 12;
+/// The largest SC32: 255 planes of `(f32 scale, f32 offset)`.
+const MAX_SC32_BYTES: u64 = 255 * 8;
 const FOOTER: u64 = 16;
 
 const HEAD: u32 = 0x4845_4144;
@@ -46,26 +48,40 @@ pub fn read_dsf_file(
         .map_err(io_error)?;
     file.seek(SeekFrom::Start(0)).map_err(io_error)?;
     let compressed = magic == SEVENZ_MAGIC;
-    let (roads, read_bytes) = if compressed {
+    let (roads, read_bytes, walk) = if compressed {
         read_7z(file, keep)?
     } else {
         let mut r = Counting::new(BufReader::new(file));
-        (read_dsf_stream(&mut r, file_bytes, keep)?, r.bytes)
+        let (roads, walk) = read_roads(&mut r, file_bytes, keep, Limits::DEFAULT)?;
+        (roads, r.bytes, walk)
     };
     let stats = DsfFileStats {
         file_bytes,
         compressed,
         read_bytes,
+        pool_points: walk.pool_points,
+        walk_visits: walk.walk_visits,
     };
     Ok((roads, stats))
 }
 
-/// The first file entry of a 7z, streamed into [`read_dsf_stream`]. The
-/// iteration stops after it, so an early exit ends decompression.
-fn read_7z(file: File, keep: impl Fn(u8) -> bool) -> Result<(DsfRoads, u64), DsfError> {
+/// The file entry of a single-entry, single-block 7z (as X-Plane ships a
+/// DSF), streamed into [`read_dsf_stream`]. Any other archive is refused
+/// from its header, before a decoder (with a dictionary the header sizes)
+/// is built. The iteration stops after the entry, so an early exit ends
+/// decompression.
+fn read_7z(file: File, keep: impl Fn(u8) -> bool) -> Result<(DsfRoads, u64, WalkStats), DsfError> {
     let archive = |e: sevenz_rust2::Error| DsfError::Archive(e.to_string());
     let mut reader =
         sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty()).map_err(archive)?;
+    let header = reader.archive();
+    if header.blocks.len() > 1 || header.files.len() > 1 {
+        return Err(DsfError::Archive(format!(
+            "{} entries in {} blocks, not one DSF",
+            header.files.len(),
+            header.blocks.len()
+        )));
+    }
     let mut out = None;
     reader
         .for_each_entries(|entry, r| {
@@ -81,7 +97,8 @@ fn read_7z(file: File, keep: impl Fn(u8) -> bool) -> Result<(DsfRoads, u64), Dsf
                 Err(DsfError::TooLarge)
             } else {
                 let mut r = Counting::new(r);
-                read_dsf_stream(&mut r, entry.size(), &keep).map(|roads| (roads, r.bytes))
+                read_roads(&mut r, entry.size(), &keep, Limits::DEFAULT)
+                    .map(|(roads, walk)| (roads, r.bytes, walk))
             });
             Ok(false)
         })
@@ -95,6 +112,39 @@ pub fn read_dsf_stream(
     len: u64,
     keep: impl Fn(u8) -> bool,
 ) -> Result<DsfRoads, DsfError> {
+    read_roads(reader, len, keep, Limits::DEFAULT).map(|(roads, _)| roads)
+}
+
+/// Absolute ceilings on what one DSF may make the reader do. Production
+/// always uses [`Limits::DEFAULT`]; tests reach the ceilings with small ones.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    /// Points across all PO32 pools.
+    pool_points: usize,
+    /// Chain indices the walk visits.
+    walk_visits: u64,
+}
+
+impl Limits {
+    const DEFAULT: Self = Self {
+        pool_points: MAX_POOL_POINTS,
+        walk_visits: MAX_WALK_VISITS,
+    };
+}
+
+/// What reading the network cost, for [`DsfFileStats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WalkStats {
+    pool_points: u64,
+    walk_visits: u64,
+}
+
+fn read_roads(
+    reader: &mut dyn Read,
+    len: u64,
+    keep: impl Fn(u8) -> bool,
+    limits: Limits,
+) -> Result<(DsfRoads, WalkStats), DsfError> {
     if len > MAX_DSF_BYTES as u64 {
         return Err(DsfError::TooLarge);
     }
@@ -117,7 +167,7 @@ pub fn read_dsf_stream(
         match id {
             HEAD => head = Some(Head::parse(&s.retain(size)?)?),
             DEFN => net_def = Some(network_definition(&s.retain(size)?)?),
-            GEOD => geod = Some(read_geod(&mut s, size)?),
+            GEOD => geod = Some(read_geod(&mut s, size, limits.pool_points)?),
             CMDS => cmds = Some(s.retain(size)?),
             _ => s.skip(size)?,
         }
@@ -142,19 +192,20 @@ pub fn read_dsf_stream(
         chains: Chains::new(),
     };
     if roads.net_def.is_none() {
-        return Ok(roads);
+        return Ok((roads, WalkStats::default()));
     }
     let pools = geod.ok_or(DsfError::BadAtom)?;
     let points: usize = pools.iter().map(Pool::len).sum();
     if points == 0 {
-        return Ok(roads);
+        return Ok((roads, WalkStats::default()));
     }
     let cmds = cmds.ok_or(DsfError::BadAtom)?;
+    let budget = (4 * points as u64 + WALK_SLACK).min(limits.walk_visits);
     let mut seg = Segmenter {
         pools: &pools,
         origin: (head.west, head.south),
         keep,
-        visits_left: 4 * points as u64 + WALK_SLACK,
+        visits_left: budget,
         out: Chains::new(),
         cur: vec![],
         sub: 0,
@@ -162,13 +213,17 @@ pub fn read_dsf_stream(
         keeping: false,
     };
     walk_commands(&cmds, &mut seg)?;
+    let stats = WalkStats {
+        pool_points: points as u64,
+        walk_visits: budget - seg.visits_left,
+    };
     roads.chains = seg.out;
     // Grown by doubling; trimmed so `Chains::bytes` is what the cache holds.
     roads.chains.lon.shrink_to_fit();
     roads.chains.lat.shrink_to_fit();
     roads.chains.start.shrink_to_fit();
     roads.chains.subtype.shrink_to_fit();
-    Ok(roads)
+    Ok((roads, stats))
 }
 
 fn io_error(e: io::Error) -> DsfError {
@@ -334,10 +389,11 @@ fn network_definition(body: &[u8]) -> Result<Option<String>, DsfError> {
         .filter(|s| !s.is_empty()))
 }
 
-/// GEOD's PO32 pools, each paired with its SC32. Every other child (the
-/// 16-bit POOL and SCAL of a mesh) is read past without buffering, and
-/// each PO32 body is dropped once decoded.
-fn read_geod(s: &mut Stream, size: u64) -> Result<Vec<Pool>, DsfError> {
+/// GEOD's PO32 pools, each paired with its SC32, at most `max_points`
+/// points in all. Every other child (the 16-bit POOL and SCAL of a mesh)
+/// is read past without buffering, and each PO32 body is dropped once
+/// decoded.
+fn read_geod(s: &mut Stream, size: u64, max_points: usize) -> Result<Vec<Pool>, DsfError> {
     let end = s.pos + size;
     let mut pools: Vec<Pool> = vec![];
     let mut scales: Vec<Vec<u8>> = vec![];
@@ -346,10 +402,12 @@ fn read_geod(s: &mut Stream, size: u64) -> Result<Vec<Pool>, DsfError> {
         let (id, n) = s.atom(end)?;
         match id {
             PO32 => {
-                let pool = Pool::decode(&s.retain(n)?, MAX_POOL_POINTS - points)?;
+                let pool = Pool::decode(&s.retain(n)?, max_points - points)?;
                 points += pool.len();
                 pools.push(pool);
             }
+            // At most 255 planes of (f32, f32): refused before it is read.
+            SC32 if n > MAX_SC32_BYTES => return Err(DsfError::BadPool),
             SC32 => scales.push(s.retain(n)?),
             _ => s.skip(n)?,
         }
@@ -476,6 +534,10 @@ mod tests {
         b.trailing.push((*b"DEMS", junk(2 << 20)));
         let dsf = b.bytes();
         for sevenz in [false, true] {
+            // For 7z this relies on sevenz-rust2 (0.23) returning from its
+            // block decoder without draining the entry when the callback
+            // returns false; a crate bump that drains would still pass
+            // here (read_bytes counts what we read) but cost the time.
             let path = write_dsf(dir.path(), "+46+006.dsf", &dsf, sevenz);
             let (r, stats) = read_dsf_file(&path, |_| true).unwrap();
             assert!(r.net_def.is_none());
@@ -730,6 +792,123 @@ mod tests {
                 assert!(stats.read_bytes < stats.file_bytes / 10, "{stats:?}");
             }
         }
+    }
+
+    /// `two_segment_dsf` with its one 5-index chain command repeated.
+    fn repeated_chain(times: usize) -> Vec<u8> {
+        let mut b = two_segment_dsf(0);
+        let one = b.cmds.clone();
+        for _ in 1..times {
+            b.cmds.extend(&one);
+        }
+        b.bytes()
+    }
+
+    #[test]
+    fn the_walk_stops_at_its_absolute_cap() {
+        // 5 pool points give a relative budget of 65,556 visits; the
+        // absolute cap of 12 governs. Each command visits 5.
+        let limits = Limits {
+            pool_points: MAX_POOL_POINTS,
+            walk_visits: 12,
+        };
+        let read = |dsf: Vec<u8>| read_roads(&mut &dsf[..], dsf.len() as u64, |_| true, limits);
+        let (r, stats) = read(repeated_chain(2)).unwrap();
+        assert_eq!(r.chains.len(), 4);
+        assert_eq!(stats.walk_visits, 10);
+        assert_eq!(read(repeated_chain(3)), Err(DsfError::TooLarge));
+    }
+
+    #[test]
+    fn pool_points_stop_at_their_absolute_cap() {
+        let dsf = two_segment_dsf(0).bytes();
+        let limits = |pool_points| Limits {
+            pool_points,
+            walk_visits: MAX_WALK_VISITS,
+        };
+        let read = |l| read_roads(&mut &dsf[..], dsf.len() as u64, |_| true, l);
+        assert_eq!(read(limits(5)).unwrap().1.pool_points, 5);
+        assert_eq!(read(limits(4)), Err(DsfError::TooLarge));
+    }
+
+    #[test]
+    fn the_caps_are_the_sized_values() {
+        // Sized from X-World Pro's Tokyo +35+139, the largest real file
+        // seen (about 3.2 times Geneva's 2.75 million points).
+        assert_eq!(MAX_POOL_POINTS, 1 << 25);
+        assert_eq!(MAX_WALK_VISITS, 1 << 25);
+    }
+
+    #[test]
+    fn file_stats_count_pool_points_and_visits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dsf(dir.path(), "+46+006.dsf", &repeated_chain(3), false);
+        let (_, stats) = read_dsf_file(&path, |_| true).unwrap();
+        assert_eq!((stats.pool_points, stats.walk_visits), (5, 15));
+    }
+
+    #[test]
+    fn an_oversized_sc32_is_refused_before_it_is_read() {
+        // 255 planes of 8 bytes at most. This SC32 claims 300 MiB and the
+        // stream ends after its header: refusing it reads nothing more.
+        let dsf = two_segment_dsf(0).bytes();
+        let a = top_atoms(&dsf);
+        let mut bytes = b"XPLNEDSF".to_vec();
+        bytes.extend(1u32.to_le_bytes());
+        bytes.extend(&a[0]);
+        bytes.extend(&a[1]);
+        let sc = 300u32 << 20;
+        bytes.extend(&a[2][..4]);
+        bytes.extend((8 + 8 + sc).to_le_bytes());
+        bytes.extend(u32::from_be_bytes(*b"SC32").to_le_bytes());
+        bytes.extend((8 + sc).to_le_bytes());
+        let len = MAX_DSF_BYTES as u64;
+        assert_eq!(
+            read_dsf_stream(&mut &bytes[..], len, |_| true),
+            Err(DsfError::BadPool)
+        );
+    }
+
+    #[test]
+    fn a_7z_with_more_than_one_entry_is_refused() {
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("+46+006.dsf");
+        let dsf = two_segment_dsf(0).bytes();
+        let mut w = ArchiveWriter::create(&path).unwrap();
+        for name in ["+46+006.dsf", "extra.dsf"] {
+            w.push_archive_entry(
+                ArchiveEntry::new_file(name),
+                Some(std::io::Cursor::new(dsf.clone())),
+            )
+            .unwrap();
+        }
+        w.finish().unwrap();
+        assert!(matches!(
+            read_dsf_file(&path, |_| true),
+            Err(DsfError::Archive(_))
+        ));
+    }
+
+    /// The largest real road DSF seen: it must read well inside both caps.
+    #[test]
+    #[ignore]
+    fn timing_xworld_pro_tokyo() {
+        let path = "/media/FlightSim/X-Plane 12-beta/Custom Scenery/simHeaven_X-WORLD-Pro_Asia-13-net3-roads/Earth nav data/+30+130/+35+139.dsf";
+        let started = std::time::Instant::now();
+        let (r, stats) = read_dsf_file(
+            std::path::Path::new(path),
+            crate::night::roads::is_lit_subtype,
+        )
+        .unwrap();
+        println!(
+            "{path}: {} ms, {} segments kept, Chains {} B, {stats:?}",
+            started.elapsed().as_millis(),
+            r.chains.len(),
+            r.chains.bytes()
+        );
+        assert!(stats.pool_points * 2 < MAX_POOL_POINTS as u64, "{stats:?}");
+        assert!(stats.walk_visits * 2 < MAX_WALK_VISITS, "{stats:?}");
     }
 
     #[test]

@@ -7,14 +7,19 @@ use super::{le_u32, Bytes, Chains, DsfError};
 /// Chain indices a walk may visit beyond 4 per pool point. A real DSF
 /// visits about one index per pool point.
 pub(super) const WALK_SLACK: u64 = 65_536;
+/// Absolute ceiling on the chain indices one walk visits, whatever the
+/// pools claim: about 33.5 million, so the segments a walk emits stay
+/// within about 700 MB and every point index in [`Chains`] below 2^32.
+pub(super) const MAX_WALK_VISITS: u64 = 1 << 25;
 
 /// Turns network chains into segments by DSFLib's rule: a junction ends
 /// the open segment (unless it is the chain's first point) and begins a
 /// new one (unless it is the last); any other point is a shape point. The
 /// segment buffer is reused, points of segments `keep` rejects are never
-/// computed, and the indices visited are budgeted from the pool sizes, so
-/// a small pool walked many times cannot grow the output or the time
-/// without bound.
+/// computed, and the indices visited are budgeted from the pool sizes
+/// (capped at [`MAX_WALK_VISITS`]), so a small pool walked many times, or
+/// a pool inflated by run-length planes, cannot grow the output or the
+/// time without bound.
 pub(super) struct Segmenter<'a, K> {
     pub(super) pools: &'a [Pool],
     pub(super) origin: (f64, f64),

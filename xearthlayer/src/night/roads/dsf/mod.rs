@@ -135,6 +135,10 @@ pub struct DsfFileStats {
     pub compressed: bool,
     /// DSF bytes (decompressed for a 7z) the reader consumed.
     pub read_bytes: u64,
+    /// Points in the DSF's PO32 pools.
+    pub pool_points: u64,
+    /// Chain indices the network walk visited.
+    pub walk_visits: u64,
 }
 
 /// [`read_dsf_stream`] over a DSF already in memory.

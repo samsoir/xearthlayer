@@ -3,10 +3,11 @@
 
 use super::{le_u32, Bytes, DsfError};
 
-/// Ceiling on the points of all PO32 pools of one DSF: 24 times the 2.7
-/// million of X-World Pro's `+46+006`. It also keeps the walk budget, and
-/// so every point index in [`Chains`](super::Chains), below 2^32.
-pub(super) const MAX_POOL_POINTS: usize = 1 << 26;
+/// Ceiling on the points of all PO32 pools of one DSF (about 33.5 million,
+/// 256 MiB of lon and lat planes): about 3.8 times the largest real file
+/// seen, X-World Pro's Tokyo `+35+139`. Run-length planes can claim this
+/// many points in a few megabytes, so the cap is absolute.
+pub(super) const MAX_POOL_POINTS: usize = 1 << 25;
 /// Most values one byte of a run-length plane can expand to: a 5-byte
 /// repeat run holds 127.
 const RLE_VALUES_PER_BYTE: usize = 26;
