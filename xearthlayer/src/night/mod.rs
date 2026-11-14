@@ -14,6 +14,7 @@ pub mod laminar;
 pub mod layout;
 pub mod prefs;
 pub mod recipe;
+pub mod roads;
 pub mod service;
 pub mod store;
 
