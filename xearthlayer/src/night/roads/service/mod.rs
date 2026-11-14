@@ -10,9 +10,10 @@
 //!
 //! Only overlay DSFs give networks and exclusion zones, as X-Plane shows
 //! the networks of every overlay of a tile but of one base mesh only, the
-//! highest priority one (XEL's own wherever lit textures are served, which
-//! the pack index leaves out). A base mesh is read past its header only as
-//! the fallback: see [`RoadService::merge_sources`].
+//! highest priority one: XEL's own wherever lit textures are served, which
+//! carries no roads and which the pack index leaves out. Any other base
+//! mesh is read only to its header, and a tile no overlay gives a road has
+//! no road light: see [`RoadService::merge_sources`].
 //!
 //! Callers wait per build, not per call: the first `footprint` of a tile's
 //! build for a purpose sets that build's deadline, and no call waits past
@@ -40,7 +41,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
-use super::codec::{decode_roads, encode_roads, is_overlay};
+use super::codec::{decode_roads, encode_roads};
 use super::dsf::{read_dsf_file, DsfFileStats, DsfRoads, ReadMode};
 use super::is_lit_subtype;
 use super::merge::{MergedRoads, Merger};
@@ -61,11 +62,13 @@ pub const ROAD_PROBE_WAIT: Duration = Duration::from_secs(2);
 pub const ROAD_GENERATE_WAIT: Duration = Duration::from_secs(10);
 /// Memory for merged tiles, weighted by [`MergedRoads::bytes`].
 pub const ROAD_TILE_CACHE_BYTES: u64 = 128 * 1024 * 1024;
-/// Stamped into every road disk cache entry: bump it when what one DSF's
-/// extraction keeps changes (the reader, the subtype filter, the codec's
-/// input). It guards road entries only; lit payloads are guarded by
-/// `ROADS_VERSION`.
-pub const ROAD_EXTRACT_VERSION: u32 = 1;
+/// Stamped into every road disk cache entry and hashed into its key: bump
+/// it when what one DSF's extraction keeps, or which DSFs are stored,
+/// changes (the reader, the subtype filter, the codec's input). Version 2
+/// stores overlays only; version 1 also stored the base meshes a fallback
+/// read, and its keys are never looked up again. It guards road entries
+/// only; lit payloads are guarded by `ROADS_VERSION`.
+pub const ROAD_EXTRACT_VERSION: u32 = 2;
 /// DSF-open hints are ignored while this many builds are pending, so a
 /// burst of hints cannot queue ahead of the builds a probe or a generation
 /// is waiting on. Builds those ask for are never refused.
@@ -246,10 +249,8 @@ struct Merged {
     dsfs: usize,
     /// Overlays merged.
     overlays_read: usize,
-    /// Base meshes passed over by the overlay pass.
+    /// Base meshes passed over at their header.
     base_skipped: usize,
-    /// Whether a base mesh was merged because no overlay gave a road.
-    base_fallback: bool,
     /// Sources never reached because a zone covered the tile.
     skipped: usize,
 }
@@ -266,56 +267,26 @@ struct Extracted {
     encode_us: u64,
 }
 
-/// The two passes of a tile build: every overlay first, then, only when
-/// they gave no road, the base meshes until one has a network.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pass {
-    Overlays,
-    Fallback,
-}
-
-impl Pass {
-    fn mode(self) -> ReadMode {
-        match self {
-            Self::Overlays => ReadMode::OverlaysOnly,
-            Self::Fallback => ReadMode::Any,
-        }
-    }
-}
-
 /// What a source gave a tile's merge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Absorbed {
     Merged,
-    /// A base mesh, passed over by the overlay pass.
+    /// A base mesh, passed over.
     Base,
-    /// A base mesh without a network, passed over by the fallback.
-    NoNetwork,
     /// A DSF whose header names another tile than the one it is filed as.
     Mismatch((i32, i32)),
 }
 
-/// Merges `roads`, a source of `tile`, when `pass` takes it.
-fn absorb(merger: &mut Merger, tile: Tile, roads: &DsfRoads, pass: Pass) -> Absorbed {
+/// Merges `roads`, a source of `tile`, when it is an overlay of the tile.
+fn absorb(merger: &mut Merger, tile: Tile, roads: &DsfRoads) -> Absorbed {
     if roads.tile != tile {
-        return Absorbed::Mismatch(roads.tile);
+        Absorbed::Mismatch(roads.tile)
+    } else if !roads.overlay {
+        Absorbed::Base
+    } else {
+        merger.add(roads);
+        Absorbed::Merged
     }
-    match pass {
-        Pass::Overlays if !roads.overlay => Absorbed::Base,
-        Pass::Fallback if roads.net_def.is_none() => Absorbed::NoNetwork,
-        _ => {
-            merger.add(roads);
-            Absorbed::Merged
-        }
-    }
-}
-
-/// A source of a tile: its file, its identity, and its stored extraction
-/// when one was already read and checked.
-struct Source {
-    path: PathBuf,
-    id: DsfIdentity,
-    entry: Option<Bytes>,
 }
 
 /// Ends a build's `pending` entry however its task ends. A task that ends
@@ -654,7 +625,6 @@ impl RoadService {
                     dsfs = m.dsfs,
                     overlays_read = m.overlays_read,
                     base_skipped = m.base_skipped,
-                    base_fallback = m.base_fallback,
                     cache_hits = record.cache_hits,
                     cache_misses = record.cache_misses,
                     merged_segments = m.roads.len(),
@@ -681,18 +651,14 @@ impl RoadService {
         }
     }
 
-    /// Feeds the tile's sources to a merger in two passes, each extraction
-    /// dropped once merged (and encoded, for a 7z), so at most one is alive
-    /// at a time.
+    /// Feeds the tile's sources to a merger, each extraction dropped once
+    /// merged (and encoded, for a 7z), so at most one is alive at a time.
     ///
-    /// The overlay pass reads every overlay, highest priority first, until a
-    /// zone covers the tile; a base mesh stops at its header. The fallback
-    /// runs only when, after every overlay, the merger holds no chain at all
-    /// (no overlay had a network, or every chain was unlit or inside a
-    /// higher zone) and no zone covers the tile: the base meshes passed
-    /// over are then read in full, highest priority first, and the first
-    /// with a network is merged, alone, under the overlays' zones. A source
-    /// whose header names another tile is skipped.
+    /// Every overlay is read, highest priority first, until a zone covers
+    /// the tile. A base mesh stops at its header and gives nothing, wherever
+    /// it ranks: X-Plane draws the network of the one base mesh it shows,
+    /// XEL's own, which has none. A source whose header names another tile
+    /// is skipped.
     async fn merge_sources(
         &self,
         tile: Tile,
@@ -701,22 +667,16 @@ impl RoadService {
     ) -> Result<Merged, Unreadable> {
         let mut merger = Merger::new(tile);
         let mut writes = vec![];
-        let mut base = vec![];
-        let (mut dsfs, mut reached, mut overlays_read) = (0, 0, 0);
+        let (mut dsfs, mut reached, mut overlays_read, mut base_skipped) = (0, 0, 0, 0);
         for path in sources {
             reached += 1;
             let Some(id) = self.identity_of(path, record).await? else {
                 continue;
             };
             dsfs += 1;
-            let mut source = Source {
-                path: path.clone(),
-                id,
-                entry: None,
-            };
             let absorbed;
-            (merger, absorbed, source.entry) = self
-                .take(merger, tile, &source, Pass::Overlays, record, &mut writes)
+            (merger, absorbed) = self
+                .take(merger, tile, path, &id, record, &mut writes)
                 .await?;
             match absorbed {
                 Absorbed::Merged => {
@@ -725,27 +685,8 @@ impl RoadService {
                         break;
                     }
                 }
-                Absorbed::Base => base.push(source),
-                Absorbed::Mismatch(at) => note_mismatch(tile, &source.id, at),
-                Absorbed::NoNetwork => {}
-            }
-        }
-        let base_skipped = base.len();
-        let mut base_fallback = false;
-        if merger.is_empty() && !merger.covered() {
-            for source in base {
-                let absorbed;
-                (merger, absorbed, _) = self
-                    .take(merger, tile, &source, Pass::Fallback, record, &mut writes)
-                    .await?;
-                match absorbed {
-                    Absorbed::Merged => {
-                        base_fallback = true;
-                        break;
-                    }
-                    Absorbed::Mismatch(at) => note_mismatch(tile, &source.id, at),
-                    Absorbed::Base | Absorbed::NoNetwork => {}
-                }
+                Absorbed::Base => base_skipped += 1,
+                Absorbed::Mismatch(at) => note_mismatch(tile, &id, at),
             }
         }
         let (roads, cpu) = on_blocking_pool("merge", move || timed(|| merger.finish())).await?;
@@ -756,7 +697,6 @@ impl RoadService {
             dsfs,
             overlays_read,
             base_skipped,
-            base_fallback,
             skipped: sources.len() - reached,
         })
     }
@@ -784,82 +724,69 @@ impl RoadService {
         }
     }
 
-    /// Offers one source to `merger` as `pass` asks: from its stored
-    /// extraction (the one `source` carries, or the disk tier's) when there
-    /// is one, else from its file. A compressed DSF read in full leaves its
-    /// entry in `writes`; a base mesh read to its header leaves none. Hands
-    /// back a stored extraction the pass did not use, so the fallback need
-    /// not read it again.
+    /// Offers one source to `merger`: from its stored extraction when the
+    /// disk tier has one, else from its file. Only an overlay's extraction
+    /// is ever stored, so a base mesh costs a lookup that misses and a read
+    /// of its header. A compressed overlay read from its file leaves its
+    /// entry in `writes`.
     async fn take(
         &self,
         mut merger: Merger,
         tile: Tile,
-        source: &Source,
-        pass: Pass,
+        path: &Path,
+        id: &DsfIdentity,
         record: &mut BuildRecord,
         writes: &mut Vec<(String, Bytes)>,
-    ) -> Result<(Merger, Absorbed, Option<Bytes>), Unreadable> {
-        let id = &source.id;
+    ) -> Result<(Merger, Absorbed), Unreadable> {
         let (key, fp) = (cache_key(tile, &id.path), entry_fingerprint(id));
         let lookup = Instant::now();
-        let stored = match (&source.entry, &self.disk) {
-            (Some(entry), _) => Some(entry.clone()),
-            (None, Some(disk)) => disk
+        let stored = match &self.disk {
+            Some(disk) => disk
                 .get(&key)
                 .await
                 .ok()
                 .flatten()
                 .and_then(|e| decode_entry_unsized(e, &fp)),
-            (None, None) => None,
+            None => None,
         };
         let read_ms = lookup.elapsed().as_millis() as u64;
         if let Some(payload) = stored {
-            let fresh = source.entry.is_none();
             let (m, hit, decode_us) = on_blocking_pool(&id.path, move || {
                 let t = Instant::now();
-                // A base mesh's entry is recognised from its header and kept
-                // whole for the fallback.
-                let hit = if pass == Pass::Overlays && is_overlay(&payload) == Some(false) {
-                    Some((Absorbed::Base, 0, Some(payload)))
-                } else {
-                    decode_roads(&payload).map(|r| {
-                        let absorbed = absorb(&mut merger, tile, &r, pass);
-                        (absorbed, r.chains.len(), None)
-                    })
-                };
+                let hit = decode_roads(&payload).map(|r| {
+                    let absorbed = absorb(&mut merger, tile, &r);
+                    (absorbed, r.chains.len())
+                });
                 (merger, hit, micros(t.elapsed()))
             })
             .await?;
             merger = m;
             record.cpu_us += decode_us;
-            if let Some((absorbed, segments, kept)) = hit {
-                if fresh {
-                    record.cache_hits += 1;
-                }
+            if let Some((absorbed, segments)) = hit {
+                record.cache_hits += 1;
                 debug!(
                     path = %id.path,
                     read_ms,
                     decode_ms = decode_us / 1000,
                     segments,
-                    head_only = kept.is_some(),
                     "Night roads: DSF cache hit"
                 );
-                return Ok((merger, absorbed, kept));
+                return Ok((merger, absorbed));
             }
         }
 
         let cache = self.disk.is_some();
-        let p = source.path.clone();
+        let p = path.to_path_buf();
         let (m, read, read_us, cpu) = on_blocking_pool(&id.path, move || {
             let t = Instant::now();
-            let read = read_dsf_file(&p, is_lit_subtype, pass.mode());
+            let read = read_dsf_file(&p, is_lit_subtype, ReadMode::OverlaysOnly);
             let read_us = micros(t.elapsed());
             let read = read.map(|(roads, stats)| {
-                let head_only = pass == Pass::Overlays && !roads.overlay;
+                let head_only = !roads.overlay;
                 let (payload, mut encode_us) = timed(|| {
                     (cache && stats.compressed && !head_only).then(|| encode_roads(&roads))
                 });
-                let absorbed = absorb(&mut merger, tile, &roads, pass);
+                let absorbed = absorb(&mut merger, tile, &roads);
                 let (segments_kept, exclusions) = (roads.chains.len(), roads.exclusions.len());
                 drop(roads);
                 let (entry, us) = timed(|| payload.map(|p| encode_entry(&fp, &p)));
@@ -903,7 +830,7 @@ impl RoadService {
             "Night roads: DSF extracted"
         );
         writes.extend(x.entry.map(|e| (key, e)));
-        Ok((merger, x.absorbed, None))
+        Ok((merger, x.absorbed))
     }
 
     /// The tile's DSF paths, highest priority first.
@@ -1080,9 +1007,13 @@ fn micros(d: Duration) -> u64 {
 
 /// The disk cache key of a DSF's extraction: `roads:{lat}:{lon}:{hex16}`,
 /// the tile (so the entry lands in the tile's region directory) and the
-/// first 8 bytes of the path's SHA-256.
+/// first 8 bytes of the SHA-256 of [`ROAD_EXTRACT_VERSION`] and the path.
+/// An entry of an earlier version is never looked up, so never loaded.
 fn cache_key(tile: Tile, path: &str) -> String {
-    let digest = Sha256::digest(path.as_bytes());
+    let mut h = Sha256::new();
+    h.update(ROAD_EXTRACT_VERSION.to_le_bytes());
+    h.update(path.as_bytes());
+    let digest = h.finalize();
     let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
     format!("roads:{}:{}:{hex}", tile.0, tile.1)
 }
@@ -1121,6 +1052,7 @@ pub(crate) mod real;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::cache::{GcResult, ServiceCacheError};
     use crate::night::roads::dsf::test_dsf::{install as write_install, sevenz, Builder};
 
     const TILE: (i32, i32) = (46, 6);
@@ -1194,6 +1126,75 @@ pub(crate) mod tests {
 
     fn disk() -> Arc<dyn Cache> {
         Arc::new(crate::cache::MemoryCacheProvider::new(64 << 20, None))
+    }
+
+    /// A disk tier that records each key whose `get` returned an entry.
+    pub(super) struct Loads {
+        inner: Arc<dyn Cache>,
+        loaded: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Loads {
+        pub(super) fn new(inner: Arc<dyn Cache>) -> Self {
+            Self {
+                inner,
+                loaded: std::sync::Mutex::default(),
+            }
+        }
+
+        pub(super) fn loaded(&self) -> Vec<String> {
+            self.loaded.lock().unwrap().clone()
+        }
+    }
+
+    impl Cache for Loads {
+        fn set(&self, key: &str, value: Bytes) -> BoxFuture<'_, Result<(), ServiceCacheError>> {
+            self.inner.set(key, value)
+        }
+
+        fn get(&self, key: &str) -> BoxFuture<'_, Result<Option<Bytes>, ServiceCacheError>> {
+            let key = key.to_owned();
+            async move {
+                let got = self.inner.get(&key).await?;
+                if got.is_some() {
+                    self.loaded.lock().unwrap().push(key);
+                }
+                Ok(got)
+            }
+            .boxed()
+        }
+
+        fn delete(&self, key: &str) -> BoxFuture<'_, Result<bool, ServiceCacheError>> {
+            self.inner.delete(key)
+        }
+
+        fn contains(&self, key: &str) -> BoxFuture<'_, Result<bool, ServiceCacheError>> {
+            self.inner.contains(key)
+        }
+
+        fn contains_sync(&self, key: &str) -> bool {
+            self.inner.contains_sync(key)
+        }
+
+        fn size_bytes(&self) -> u64 {
+            self.inner.size_bytes()
+        }
+
+        fn entry_count(&self) -> u64 {
+            self.inner.entry_count()
+        }
+
+        fn max_size_bytes(&self) -> u64 {
+            self.inner.max_size_bytes()
+        }
+
+        fn set_max_size(&self, size_bytes: u64) -> BoxFuture<'_, Result<(), ServiceCacheError>> {
+            self.inner.set_max_size(size_bytes)
+        }
+
+        fn gc(&self) -> BoxFuture<'_, Result<GcResult, ServiceCacheError>> {
+            self.inner.gc()
+        }
     }
 
     fn config(probe_ms: u64, generate_ms: u64) -> RoadServiceConfig {
@@ -1363,7 +1364,7 @@ pub(crate) mod tests {
         assert_eq!(r.tiles[0].len(), 1);
     }
 
-    // Overlays, base meshes and the fallback.
+    // Overlays and base meshes.
 
     #[tokio::test]
     async fn overlays_give_the_roads_and_a_base_mesh_is_read_only_to_its_header() {
@@ -1386,71 +1387,49 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn without_overlay_roads_the_highest_base_mesh_with_a_network_is_merged_alone() {
-        let t = tempfile::tempdir().unwrap();
-        let mut no_network = Builder::new(46, 6);
+    async fn a_tile_whose_only_network_is_in_a_base_mesh_has_no_roads() {
+        // Past their HEAD the base meshes are garbage, raw and 7z: reading
+        // either further fails the tile.
+        let mut no_network = overlay(46, 6);
         no_network
             .props
             .push(("sim/exclude_obj".into(), "6/46/7/47".into()));
-        let mut bare_overlay = overlay(46, 6);
-        bare_overlay.nets.push("lib/g10/roads.net".into());
-        write_install(
-            t.path(),
-            TILE,
-            &[
-                ("Overlay", Some(bare_overlay.bytes())),
-                ("Ortho", Some(no_network.bytes())),
-                ("MeshA", Some(base_mesh(6.7).bytes())),
-                ("MeshB", Some(base_mesh(6.8).bytes())),
-            ],
-        );
-        let svc = patient(t.path(), None);
-        let r = svc.footprint(&[TILE], Purpose::Probe).await;
-        assert!(r.complete);
-        assert_eq!(starts(&r.tiles[0]), vec![(670, 4630)], "MeshA alone");
+        let mut unlit = overlay(46, 6);
+        unlit.road(46, 6, 74, &[(6.1, 46.1), (6.2, 46.2)]);
+        for o in [no_network, unlit] {
+            let t = tempfile::tempdir().unwrap();
+            write_install(
+                t.path(),
+                TILE,
+                &[
+                    ("Overlay", Some(o.bytes())),
+                    ("MeshA", Some(past_head_garbage(base_mesh(6.7).bytes()))),
+                    (
+                        "MeshB",
+                        Some(sevenz(&past_head_garbage(base_mesh(6.8).bytes()))),
+                    ),
+                ],
+            );
+            let svc = patient(t.path(), Some(disk()));
+            let r = svc.footprint(&[TILE], Purpose::Probe).await;
+            assert!(r.complete, "no base mesh was read past its HEAD");
+            assert!(r.tiles[0].is_empty(), "{:?}", starts(&r.tiles[0]));
+        }
     }
 
     #[tokio::test]
-    async fn the_fallback_runs_when_every_overlay_chain_was_unlit_or_excluded() {
-        // The overlay's only road is unlit and its zone covers the west
-        // half: the merge is empty, so the base mesh is merged, under it.
-        let t = tempfile::tempdir().unwrap();
-        let mut o = overlay(46, 6);
-        o.props
-            .push(("sim/exclude_net".into(), "6/46/6.5/47".into()));
-        o.road(46, 6, 74, &[(6.1, 46.1), (6.2, 46.2)]);
-        let mut mesh = base_mesh(6.3);
-        mesh.road(46, 6, 30, &[(6.8, 46.3), (6.8, 46.4)]);
-        write_install(
-            t.path(),
-            TILE,
-            &[("Overlay", Some(o.bytes())), ("Mesh", Some(mesh.bytes()))],
-        );
-        let svc = patient(t.path(), None);
-        let r = svc.footprint(&[TILE], Purpose::Probe).await;
-        assert!(r.complete);
-        assert_eq!(starts(&r.tiles[0]), vec![(680, 4630)]);
-        assert_eq!(r.tiles[0].removed, 1, "the overlay's zone still applies");
-    }
-
-    #[tokio::test]
-    async fn a_covering_overlay_without_roads_leaves_the_base_mesh_unread() {
-        let t = tempfile::tempdir().unwrap();
-        let mut o = overlay(46, 6);
-        o.props.push(("sim/exclude_net".into(), "6/46/7/47".into()));
-        o.nets.push("lib/g10/roads.net".into());
-        // The mesh ranks above the overlay, so the overlay pass passes it
-        // over before the zone is known.
+    async fn a_base_mesh_above_the_overlays_is_read_only_to_its_header() {
         let base = past_head_garbage(base_mesh(6.8).bytes());
+        let t = tempfile::tempdir().unwrap();
         write_install(
             t.path(),
             TILE,
-            &[("Mesh", Some(base)), ("Overlay", Some(o.bytes()))],
+            &[("Mesh", Some(base)), ("Overlay", Some(low().bytes()))],
         );
         let svc = patient(t.path(), None);
         let r = svc.footprint(&[TILE], Purpose::Probe).await;
-        assert!(r.complete, "no fallback under a whole-tile zone");
-        assert!(r.tiles[0].is_empty());
+        assert!(r.complete, "the mesh was read only to its HEAD");
+        assert_eq!(starts(&r.tiles[0]), vec![(650, 4650)], "the overlay's road");
     }
 
     #[tokio::test]
@@ -1472,41 +1451,47 @@ pub(crate) mod tests {
         assert_eq!((s.cache_hits, s.cache_misses), (0, 0));
     }
 
+    /// The key extraction version 1 gave a DSF's entry: the path's digest
+    /// alone. That version also stored base meshes, for a fallback.
+    pub(super) fn version_1_key(tile: Tile, path: &str) -> String {
+        let digest = Sha256::digest(path.as_bytes());
+        let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+        format!("roads:{}:{}:{hex}", tile.0, tile.1)
+    }
+
     #[tokio::test]
-    async fn a_fallback_base_mesh_is_cached_and_read_back_once() {
+    async fn a_base_mesh_entry_from_an_earlier_session_is_never_loaded() {
         let t = tempfile::tempdir().unwrap();
         write_install(
             t.path(),
             TILE,
-            &[("Mesh", Some(sevenz(&base_mesh(6.8).bytes())))],
+            &[
+                ("Overlay", Some(sevenz(&high(None).bytes()))),
+                (
+                    "Mesh",
+                    Some(sevenz(&past_head_garbage(base_mesh(6.8).bytes()))),
+                ),
+            ],
         );
-        let d = disk();
-        let a = patient(t.path(), Some(d.clone()));
-        let first = a.footprint(&[TILE], Purpose::Probe).await;
-        assert_eq!(starts(&first.tiles[0]), vec![(680, 4630)]);
-        assert_eq!(entries(&a, &d).await, 1, "the fallback's extraction");
-        let s = a.stats_snapshot();
-        assert_eq!((s.cache_hits, s.cache_misses), (0, 1));
-        // Garbage of the same length and mtime: the entry still matches, and
-        // reading the file would fail the tile.
-        let path = dsf(&t, "Mesh");
-        let meta = std::fs::metadata(&path).unwrap();
-        std::fs::write(&path, vec![0u8; meta.len() as usize]).unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(meta.modified().unwrap())
+        let mesh = dsf(&t, "Mesh").to_string_lossy().into_owned();
+        let overlay = dsf(&t, "Overlay").to_string_lossy().into_owned();
+        let d = Arc::new(Loads::new(disk()));
+        d.set(&version_1_key(TILE, &mesh), Bytes::from_static(b"garbage"))
+            .await
             .unwrap();
-        // The overlay pass finds the entry and the fallback merges it.
-        let b = patient(t.path(), Some(d));
-        let second = b.footprint(&[TILE], Purpose::Probe).await;
-        assert!(second.complete, "the file was not read");
-        assert_eq!(second.tiles[0], first.tiles[0]);
-        let s = b.stats_snapshot();
-        assert_eq!((s.cache_hits, s.cache_misses), (1, 0), "one disk read");
+        for session in ["first", "second"] {
+            let svc = patient(t.path(), Some(d.clone() as Arc<dyn Cache>));
+            let r = svc.footprint(&[TILE], Purpose::Probe).await;
+            assert!(r.complete, "{session}: the mesh was read only to its HEAD");
+            assert_eq!(starts(&r.tiles[0]), vec![(610, 4610)], "{session}");
+            svc.writes_settled().await;
+        }
+        assert_eq!(
+            d.loaded(),
+            vec![cache_key(TILE, &overlay)],
+            "the overlay's entry, once; never the mesh's"
+        );
     }
-
     #[tokio::test]
     async fn a_dsf_filed_under_another_tile_is_skipped() {
         let t = tempfile::tempdir().unwrap();

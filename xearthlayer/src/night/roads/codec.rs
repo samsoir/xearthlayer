@@ -122,17 +122,6 @@ fn f32s(run: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// The overlay flag of an encoded extraction, read from its header alone;
-/// `None` for another version or a header cut short.
-pub fn is_overlay(b: &[u8]) -> Option<bool> {
-    let mut r = Reader { b, p: 0 };
-    if r.u32()? != ROAD_CODEC_VERSION {
-        return None;
-    }
-    r.take(8)?;
-    r.flag()
-}
-
 pub fn decode_roads(b: &[u8]) -> Option<DsfRoads> {
     let mut r = Reader { b, p: 0 };
     if r.u32()? != ROAD_CODEC_VERSION {
@@ -249,22 +238,6 @@ mod tests {
         };
         assert!(encode_roads(&r).len() < 64);
         assert_eq!(decode_roads(&encode_roads(&r)), Some(r));
-    }
-
-    #[test]
-    fn the_overlay_flag_is_read_from_the_header() {
-        for overlay in [false, true] {
-            let b = encode_roads(&DsfRoads {
-                overlay,
-                ..roads(chains())
-            });
-            assert_eq!(is_overlay(&b), Some(overlay));
-            assert_eq!(is_overlay(&b[..13]), Some(overlay), "the header suffices");
-            assert_eq!(is_overlay(&b[..12]), None, "cut short");
-            let mut v = b.clone();
-            v[0] ^= 0xFF;
-            assert_eq!(is_overlay(&v), None, "another version");
-        }
     }
 
     #[test]

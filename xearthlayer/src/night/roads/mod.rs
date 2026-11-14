@@ -24,7 +24,7 @@ pub use model::{ClassParams, LampParams, RoadModel, ROAD_MODEL_VERSION};
 /// session fingerprint ([`roads_digest`]), so every lit payload on disk
 /// misses after a bump. Road disk entries have their own version
 /// (`service::ROAD_EXTRACT_VERSION`).
-pub const ROADS_VERSION: u32 = 1;
+pub const ROADS_VERSION: u32 = 2;
 
 /// The road part of the lit session fingerprint: [`ROADS_VERSION`] and
 /// every parameter of `model`.

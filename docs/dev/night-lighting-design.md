@@ -667,7 +667,7 @@ matches. The code is `xearthlayer/src/night/roads/`.
 | `roads/codec.rs` | The disk cache entry of one DSF's extraction |
 | `roads/model.rs` | `RoadModel`: glow per class, rural floor, colour, the lamp option |
 | `roads/field.rs` | `RoadField`: a texture's glow raster, and `reach_deg` |
-| `roads/service/` | `RoadService`: per-tile builds (overlay and fallback passes), waits, caches, identities; `real.rs` holds the ignored real-install measurements |
+| `roads/service/` | `RoadService`: per-tile builds (overlays only), waits, caches, identities; `real.rs` holds the ignored real-install measurements |
 | `roads/stats.rs` | Counters, latency windows and the minute summary |
 
 ### Source of truth
@@ -706,28 +706,28 @@ and holds them in 1.1 MiB (`PackIndex::bytes`).
 of a tile (`sim/overlay 1`) but of one base mesh only, the highest
 priority one. Wherever XEL serves lit textures that base mesh is XEL's own
 (left out of the index, and it carries no roads), so a lower base mesh's
-roads, Global Scenery's among them, are never on screen. A tile is
-therefore built in two passes:
+roads, Global Scenery's among them, are never on screen. The lit layer
+follows the same convention: it shows exactly the overlay roads X-Plane
+draws, and a tile no overlay gives a road has no road glow.
 
-1. **Overlays.** The sources are taken from the highest priority down;
-   each overlay's network and `sim/exclude_net` zones are merged (see
-   Merge), so a zone in a higher pack removes the roads of the packs below
-   it, as X-Plane does, until a zone covers the whole tile. A base mesh
-   is read only to its HEAD (`ReadMode::OverlaysOnly`: a few hundred
-   bytes, even of a 7z) and passed over.
-2. **Fallback.** Only when, after every overlay, the merge holds no chain
-   at all (no overlay had a network, or every chain was unlit or inside a
-   higher zone) and no zone covers the tile, the base meshes passed over
-   are read in full, highest priority first, and the first with a
-   network is merged, alone, under the overlays' zones. This is the
-   Global Scenery fallback: some road light where no overlay gives any.
+The sources are taken from the highest priority down; each overlay's
+network and `sim/exclude_net` zones are merged (see Merge), so a zone in a
+higher pack removes the roads of the packs below it, as X-Plane does,
+until a zone covers the whole tile. A base mesh, wherever it ranks, is
+read only to its HEAD (`ReadMode::OverlaysOnly`: 169 bytes of Global
+Scenery's Geneva 7z) and passed over; no path reads one further. Its
+extraction is never stored, so it costs a disk cache lookup that misses
+and that HEAD read. Entries the version 1 road cache stored for base
+meshes (Global Scenery's Geneva entry is 3.7 MB) stay on disk until the
+tier's GC evicts them, but are never loaded: the entry key hashes
+`ROAD_EXTRACT_VERSION` (now 2) with the path, so an earlier version's
+keys are never looked up.
 
 A source whose header names another tile than the one it is filed as (a
 misnamed file) is skipped with a debug line, rather than merged at the
-wrong offsets. An overlay with a single airport road keeps the fallback
-from running: on the developer's installation, Geneva without its
-simHeaven packs has six airport road segments from Global Airports and no
-Global Scenery roads.
+wrong offsets. On the developer's installation, Geneva without its
+simHeaven packs has six airport road segments from Global Airports, and
+without Global Airports too it has none.
 
 ### Streaming DSF reader (`roads/dsf/`)
 
@@ -785,9 +785,10 @@ seen uses one.
 Measured on the developer's installation (release build): X-World Pro's
 Geneva roads (`+46+006`, 32 MB raw, 412,443 lit segments kept) in 22 ms,
 its Tokyo roads (`+35+139`, 108 MB raw, 1,927,833 kept) in 70 ms, and
-Global Scenery's Geneva mesh (11.6 MB 7z, 17.2 MB read after
-decompression, 109,384 kept) in 310 ms. DSFs without roads (objects,
-forests, facades) cost a few kilobytes of reading each.
+Global Scenery's Geneva mesh read in full (11.6 MB 7z, 17.2 MB read after
+decompression, 109,384 kept) in 310 ms, which the service never does (a
+base mesh is read to its HEAD). DSFs without roads (objects, forests,
+facades) cost a few kilobytes of reading each.
 
 ### Road classes (`roads/class.rs`)
 
@@ -815,8 +816,8 @@ through the pack's `.net` is deferred.
 
 ### Merge (`roads/merge.rs`)
 
-`Merger` takes a tile's DSFs from the highest priority down (the overlays,
-then the fallback base mesh if any; see Which DSFs give roads). A segment
+`Merger` takes a tile's overlay DSFs from the highest priority down (see
+Which DSFs give roads). A segment
 of a DSF is dropped when any of its points lies in a zone of a
 higher-priority DSF (tested on its exact points), then the DSF's own zones
 are added for the DSFs below; a DSF's zones never apply to its own roads.
@@ -874,7 +875,6 @@ exact.
 | Tile | Segments stored | Index | Merged |
 |---|---|---|---|
 | Geneva `+46+006`, X-World Pro | 418,937 | yes | 8.8 MiB |
-| Geneva, Global Scenery only | 109,996 | no | 2.1 MiB |
 | Tokyo `+35+139`, X-World Pro and the Haneda overlay | 3,197,492 | yes | 37.2 MiB |
 | 3 × 3 tiles around Geneva | | | 51.4 MiB |
 | 3 × 3 tiles around Tokyo | | | 81.0 MiB |
@@ -968,8 +968,8 @@ compare the two looks in flight.
 `RoadService` makes a tile's merged roads ready for the lit source:
 
 - **Per-tile builds.** A build lists the tile's sources from the pack
-  index, then reads them on the blocking pool in the two passes of Which
-  DSFs give roads, feeding each extraction to the merger and dropping it,
+  index, then reads them on the blocking pool as Which DSFs give roads
+  says, feeding each extraction to the merger and dropping it,
   so at most one extraction is alive at a time. Every scratch buffer is
   reused, and the merged tile is laid out in exactly sized arrays (see
   Merge).
@@ -989,26 +989,29 @@ compare the two looks in flight.
   popularity would refuse a tile just built once the cache is full, and
   every request for it would rebuild it. An eviction is logged
   (`Night roads: LRU`) and costs a rebuild on the next request.
-- **Disk cache.** Only extractions of 7z DSFs read in full are written to
-  the lit disk tier (an overlay, or a base mesh the fallback read; a base
-  mesh read only to its HEAD writes none): decompressing a mesh costs far
-  more than reading the entry back (302 ms against 3.5 ms for Geneva). In
-  a later session the overlay pass recognises a base mesh's entry from its
-  header and keeps it for the fallback, so the entry is read once. Raw
-  DSFs are parsed again each session, because their parse (16 to 90 ms
+- **Disk cache.** Only extractions of 7z overlays are written to the lit
+  disk tier (a base mesh, read only to its HEAD, writes none):
+  decompression costs far more than reading the entry back (302 ms
+  against 3.5 ms, measured on Global Scenery's Geneva mesh when version 1
+  still read it; XEL's own overlay packages carry Global Scenery's overlay
+  part, roads included, as 7z).
+  Raw DSFs are parsed again each session, because their parse (16 to 90 ms
   measured) is no slower than reading an entry of the same size, and
   caching them would duplicate tens of megabytes per city tile on disk and
   in transient memory. The key is `roads:{lat}:{lon}:{hex16}` (the tile,
   so the entry lands in the tile's region folder and the tier's startup
-  scan and GC see it, and the first 8 bytes of the SHA-256 of the DSF
-  path). An entry is the lit tier's format (magic `XELL`, a fingerprint,
+  scan and GC see it, and the first 8 bytes of the SHA-256 of
+  `ROAD_EXTRACT_VERSION` and the DSF path, so an earlier version's entries
+  are never looked up). An entry is the lit tier's format (magic `XELL`, a fingerprint,
   the length, the payload); the fingerprint covers `ROAD_EXTRACT_VERSION`
   (bump it when what an extraction keeps changes) and the DSF's path, size
   and mtime, so an updated pack or a new reader misses and re-extracts.
   The payload is the `DsfRoads` in `codec.rs`'s little-endian layout,
   decoded with every count checked against the bytes present before it
   allocates. Entries are written only after the whole tile succeeded.
-  Geneva's Global Scenery entry is 3.7 MB (109,384 segments).
+  Version 1 also stored the base meshes a fallback read (Geneva's Global
+  Scenery entry was 3.7 MB, 109,384 segments); version 2 stores overlays
+  only, and its keys never reach a version 1 entry.
   `ROAD_EXTRACT_VERSION` guards road entries only; lit payloads have their
   own versions (see Lit source integration).
 - **Identities.** `identities(tile)` gives each source's path, size and
@@ -1098,9 +1101,9 @@ guards one thing:
 | Constant | Bump when | Guards |
 |---|---|---|
 | `LIT_GENERATOR_VERSION` (6) | Generated bytes change for the same inputs: ramp, tiling, encoder, layout of the visible levels, the road composite | Lit payloads |
-| `ROADS_VERSION` (1) | The same DSFs and road model can give different road light: the reader, the class table, the merge and source rules, quantisation, the kernel | Lit payloads |
+| `ROADS_VERSION` (2) | The same DSFs and road model can give different road light: the reader, the class table, the merge and source rules, quantisation, the kernel | Lit payloads |
 | `ROAD_MODEL_VERSION` (1) | The meaning of a `RoadModel` parameter changes | Lit payloads (through the model digest) |
-| `ROAD_EXTRACT_VERSION` (1) | What one DSF's extraction keeps changes: the reader, the subtype filter, the codec's input | Road disk entries |
+| `ROAD_EXTRACT_VERSION` (2) | What one DSF's extraction keeps, or which DSFs are stored, changes: the reader, the subtype filter, the codec's input (2: overlays only; it is hashed into the key, so an earlier version's entries are never loaded) | Road disk entries |
 | `ROAD_CODEC_VERSION` (1) | The byte layout of a road entry's payload changes | Road disk entries (another layout does not decode) |
 
 ### Trigger (FUSE)
@@ -1144,7 +1147,7 @@ flights show negative lead times.
 | A road disk entry that does not match or does not decode | Re-extracted from the file | No |
 | A road disk entry write fails | Nothing (re-extracted next session) | Debug |
 | An unknown road subtype | Drawn unlit | Once per subtype, debug |
-| `scenery_packs.ini` missing | Only Global Scenery is read | No |
+| `scenery_packs.ini` missing | Only Global Scenery is listed; its meshes are read to their HEAD, so no road light | No |
 
 ### Instrumentation
 
@@ -1155,9 +1158,9 @@ warning for an unreadable DSF. Read them with `run --debug`.
 |---|---|
 | `Night roads: pack index built` | `packs`, `enabled`, `dsfs`, `tiles`, `bytes`, `ms` |
 | `Night roads: DSF extracted` | `path`, `file_bytes`, `read_bytes`, `compressed`, `head_only` (a base mesh read to its HEAD), `ms`, `encode_ms`, `segments_kept`, `exclusions`, `pool_points`, `walk_visits`, `cached` |
-| `Night roads: DSF cache hit` | `path`, `read_ms`, `decode_ms`, `segments`, `head_only` (a base mesh's entry recognised from its header and kept for the fallback) |
+| `Night roads: DSF cache hit` | `path`, `read_ms`, `decode_ms`, `segments` |
 | `Night roads: DSF tile mismatch` | `lat`, `lon`, `path`, `dsf_lat`, `dsf_lon` |
-| `Night roads: tile ready` | `lat`, `lon`, `trigger`, `dsfs`, `overlays_read`, `base_skipped`, `base_fallback`, `cache_hits`, `cache_misses`, `merged_segments`, `removed`, `skipped_below_cover`, `bytes`, `total_ms` |
+| `Night roads: tile ready` | `lat`, `lon`, `trigger`, `dsfs`, `overlays_read`, `base_skipped` (base meshes read to their HEAD), `cache_hits`, `cache_misses`, `merged_segments`, `removed`, `skipped_below_cover`, `bytes`, `total_ms` |
 | `Night roads: hint ignored` | `lat`, `lon`, `pending` |
 | `Night roads: footprint waited` | `purpose`, `tiles`, `waited_ms`, `timed_out`, `complete` (only when the call waited or timed out) |
 | `Night roads: lead time` | `lat`, `lon`, `ms` |
@@ -1174,8 +1177,8 @@ The existing `Night lighting: lit texture generated` line gains
 `road_segments` (point-to-point segments handed to the raster, see
 Merge), `road_raster_us`, `road_texels`, `roads_complete` and
 `roads_timed_out`, and `Night lighting: lit probe` gains `roads_complete`
-and `roads_timed_out`. `cache_misses` counts 7z DSFs read in full with a
-disk tier present; a base mesh read to its HEAD is not one.
+and `roads_timed_out`. `cache_misses` counts 7z overlays read from their file
+with a disk tier present; a base mesh read to its HEAD is not one.
 
 ### Measured cost
 
@@ -1190,11 +1193,10 @@ Files were in the page cache.
 
 | Tile | Sources | Read | Ready |
 |---|---|---|---|
-| Geneva `+46+006` | 14 | 13 overlays (Global Scenery skipped below X-World Pro's cover) | 36 to 43 ms |
-| Tokyo `+35+139` | 18 | 16 overlays | 208 to 211 ms |
-| Geneva without simHeaven packs | 4 | 3 overlays (6 airport road segments from Global Airports); Global Scenery to its HEAD only (169 bytes) | 1.6 ms |
-| Geneva without simHeaven packs or Global Airports, cold (the fallback decompresses Global Scenery's 7z) | 3 | 2 overlays, then the mesh | 302 ms |
-| The same, second service, from the disk tier | 3 | entries only | 3.5 ms |
+| Geneva `+46+006` | 14 | 13 overlays (Global Scenery skipped below X-World Pro's cover) | 36 to 41 ms |
+| Tokyo `+35+139` | 18 | 16 overlays | 195 to 211 ms |
+| Geneva without simHeaven packs | 4 | 3 overlays (6 airport road segments from Global Airports); Global Scenery to its HEAD only (169 of 11,638,782 bytes) | 0.9 ms |
+| Geneva without simHeaven packs or Global Airports | 3 | 2 overlays, no road; Global Scenery to its HEAD only | 0.9 ms |
 
 **Memory** (resident, allocator configured as `run` configures it, with
 rayon's pool and a blocking-pool thread already running, as they are in
@@ -1245,7 +1247,7 @@ generator's output is unchanged byte for byte.
 | Rural look | A faint continuous glow; sparse lamps as a model option for testing | The lamps stay a test option until a flight compares the two |
 | Airport roads | Included as any other road | `sim/filter/aptid` segments are kept; no airport ownership model |
 | Configuration | None | The road model is internal, like the LED model, and tuned by flight |
-| Road sources | Overlay DSFs; one base mesh, alone, only when no overlay gives a road | X-Plane shows every overlay's network but one base mesh's, XEL's own wherever lit textures are served; Global Scenery stays a fallback for tiles no overlay covers |
+| Road sources | Overlay DSFs only; a base mesh is read to its HEAD | X-Plane shows every overlay's network but one base mesh's, XEL's own wherever lit textures are served, which has no roads; so a tile no overlay gives a road has no road glow, as in the simulator. A Global Scenery fallback for such tiles was removed after the first flight as against X-Plane's conventions |
 
 ### Deferred
 

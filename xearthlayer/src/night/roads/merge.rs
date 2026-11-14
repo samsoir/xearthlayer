@@ -445,11 +445,6 @@ impl Merger {
         self.boxes.push([s, w, n, e]);
     }
 
-    /// Whether no chain has been merged yet.
-    pub fn is_empty(&self) -> bool {
-        self.chains.is_empty()
-    }
-
     /// Whether a zone covers the whole tile, so no lower DSF can add roads.
     pub fn covered(&self) -> bool {
         self.zones
@@ -675,21 +670,6 @@ mod tests {
         let r = m.finish();
         assert_eq!(r.len(), 2);
         assert_eq!(r.removed, 0);
-    }
-
-    #[test]
-    fn a_merger_is_empty_until_a_lit_chain_is_kept() {
-        let mut m = Merger::new((46, 6));
-        assert!(m.is_empty());
-        m.add(&layer(
-            &[(74, &[(0.1, 0.1), (0.2, 0.2)])],
-            &["6/46/6.5/46.5"],
-        ));
-        assert!(m.is_empty(), "unlit, and zones are not roads");
-        m.add(&layer(&[(50, &[(0.3, 0.3), (0.4, 0.4)])], &[]));
-        assert!(m.is_empty(), "excluded by the zone above");
-        m.add(&layer(&[(50, &[(0.7, 0.7), (0.8, 0.8)])], &[]));
-        assert!(!m.is_empty());
     }
 
     #[test]
