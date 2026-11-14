@@ -118,6 +118,15 @@ impl InodeManager {
         self.inode_to_path.get(&inode).map(|r| r.value().clone())
     }
 
+    /// Run `f` on the path of a real file inode without cloning it.
+    ///
+    /// For callers on the hot path that only need to look at the path. `f`
+    /// runs while the map shard is read-locked: keep it short and never call
+    /// back into the manager from it.
+    pub fn with_path<R>(&self, inode: u64, f: impl FnOnce(&Path) -> R) -> Option<R> {
+        self.inode_to_path.get(&inode).map(|r| f(r.value()))
+    }
+
     /// Get the inode for a path if it exists.
     ///
     /// Unlike `get_or_create_inode`, this does not allocate a new inode.
@@ -172,6 +181,17 @@ impl InodeManager {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn with_path_lends_the_stored_path_and_misses_unknown_inodes() {
+        let manager = InodeManager::new(PathBuf::from("/"));
+        let ino = manager.get_or_create_inode(Path::new("textures/a.dds"));
+        assert_eq!(
+            manager.with_path(ino, |p| p.to_path_buf()),
+            Some(PathBuf::from("textures/a.dds"))
+        );
+        assert_eq!(manager.with_path(999, |_| ()), None);
+    }
 
     #[test]
     fn test_lit_and_ortho_inodes_differ_for_the_same_coords() {

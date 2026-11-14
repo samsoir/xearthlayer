@@ -49,6 +49,12 @@ pub trait LitTextureSource: Send + Sync {
     /// X-Plane looked up the DSF of the 1 degree tile `(lat, lon)`: a hint
     /// to get ready for its lit names. Must not block.
     fn dsf_seen(&self, _lat: i32, _lon: i32) {}
+
+    /// Whether `dsf_seen` does anything. The filesystem reads this once and
+    /// skips its DSF test on every lookup and open when it is `false`.
+    fn wants_dsf_hints(&self) -> bool {
+        false
+    }
 }
 
 /// Serves the minimal black DDS for every lit name.
@@ -695,6 +701,10 @@ impl LitTextureSource for NightLitSource {
         if let Some(roads) = &self.roads {
             roads.ensure((lat, lon), Trigger::DsfOpen);
         }
+    }
+
+    fn wants_dsf_hints(&self) -> bool {
+        self.roads.is_some()
     }
 }
 
