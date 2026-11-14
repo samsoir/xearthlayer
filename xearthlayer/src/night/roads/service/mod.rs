@@ -1220,6 +1220,12 @@ pub(crate) mod tests {
     /// ready.
     const LONG: u64 = 10_000;
 
+    /// A service that waits `LONG` for its roads, so a test that expects
+    /// them does not depend on how fast the machine builds a tile.
+    fn patient(install: &Path, disk: Option<Arc<dyn Cache>>) -> Arc<RoadService> {
+        RoadService::with_config(install.into(), vec![], disk, config(LONG, LONG))
+    }
+
     /// A tile-cache budget that holds `tiles` test tiles of at most two
     /// chains of two points each, whatever a tile's fixed overhead is. The
     /// tests that use it assert their real tiles fit it.
@@ -1319,7 +1325,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn merges_both_packs_without_exclusions() {
         let t = install(None);
-        let svc = RoadService::new(t.path().into(), vec![], Some(disk()));
+        let svc = patient(t.path(), Some(disk()));
         let r = svc.footprint(&[TILE], Purpose::Probe).await;
         assert!(r.complete);
         assert_eq!(r.tiles[0].len(), 2);
@@ -1331,7 +1337,7 @@ pub(crate) mod tests {
         let t = install(Some("6/46/7/47"));
         // Corrupt the low DSF: if it were read, the tile would fail.
         std::fs::write(dsf(&t, "Low"), b"garbage").unwrap();
-        let svc = RoadService::new(t.path().into(), vec![], Some(disk()));
+        let svc = patient(t.path(), Some(disk()));
         let r = svc.footprint(&[TILE], Purpose::Probe).await;
         assert!(r.complete, "the low DSF is never read");
         assert_eq!(r.tiles[0].len(), 1);
@@ -1340,7 +1346,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_tile_with_no_sources_is_complete_and_empty() {
         let t = install(None);
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         let r = svc.footprint(&[(10, 10)], Purpose::Probe).await;
         assert!(r.complete);
         assert!(r.tiles[0].is_empty());
@@ -1349,7 +1355,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_source_removed_since_the_index_was_built_is_skipped() {
         let t = install(None);
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         assert_eq!(svc.identities(TILE).await.unwrap().len(), 2, "index built");
         std::fs::remove_file(dsf(&t, "Low")).unwrap();
         let r = svc.footprint(&[TILE], Purpose::Probe).await;
@@ -1369,7 +1375,7 @@ pub(crate) mod tests {
             TILE,
             &[("Overlay", Some(high(None).bytes())), ("Mesh", Some(base))],
         );
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         let r = svc.footprint(&[TILE], Purpose::Probe).await;
         assert!(r.complete, "the base mesh was not read past HEAD");
         assert_eq!(
@@ -1398,7 +1404,7 @@ pub(crate) mod tests {
                 ("MeshB", Some(base_mesh(6.8).bytes())),
             ],
         );
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         let r = svc.footprint(&[TILE], Purpose::Probe).await;
         assert!(r.complete);
         assert_eq!(starts(&r.tiles[0]), vec![(670, 4630)], "MeshA alone");
@@ -1420,7 +1426,7 @@ pub(crate) mod tests {
             TILE,
             &[("Overlay", Some(o.bytes())), ("Mesh", Some(mesh.bytes()))],
         );
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         let r = svc.footprint(&[TILE], Purpose::Probe).await;
         assert!(r.complete);
         assert_eq!(starts(&r.tiles[0]), vec![(680, 4630)]);
@@ -1441,7 +1447,7 @@ pub(crate) mod tests {
             TILE,
             &[("Mesh", Some(base)), ("Overlay", Some(o.bytes()))],
         );
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         let r = svc.footprint(&[TILE], Purpose::Probe).await;
         assert!(r.complete, "no fallback under a whole-tile zone");
         assert!(r.tiles[0].is_empty());
@@ -1459,7 +1465,7 @@ pub(crate) mod tests {
             ],
         );
         let d = disk();
-        let svc = RoadService::new(t.path().into(), vec![], Some(d.clone()));
+        let svc = patient(t.path(), Some(d.clone()));
         assert!(svc.footprint(&[TILE], Purpose::Probe).await.complete);
         assert_eq!(entries(&svc, &d).await, 0);
         let s = svc.stats_snapshot();
@@ -1475,7 +1481,7 @@ pub(crate) mod tests {
             &[("Mesh", Some(sevenz(&base_mesh(6.8).bytes())))],
         );
         let d = disk();
-        let a = RoadService::new(t.path().into(), vec![], Some(d.clone()));
+        let a = patient(t.path(), Some(d.clone()));
         let first = a.footprint(&[TILE], Purpose::Probe).await;
         assert_eq!(starts(&first.tiles[0]), vec![(680, 4630)]);
         assert_eq!(entries(&a, &d).await, 1, "the fallback's extraction");
@@ -1493,7 +1499,7 @@ pub(crate) mod tests {
             .set_modified(meta.modified().unwrap())
             .unwrap();
         // The overlay pass finds the entry and the fallback merges it.
-        let b = RoadService::new(t.path().into(), vec![], Some(d));
+        let b = patient(t.path(), Some(d));
         let second = b.footprint(&[TILE], Purpose::Probe).await;
         assert!(second.complete, "the file was not read");
         assert_eq!(second.tiles[0], first.tiles[0]);
@@ -1514,7 +1520,7 @@ pub(crate) mod tests {
                 ("Low", Some(low().bytes())),
             ],
         );
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         let r = svc.footprint(&[TILE], Purpose::Probe).await;
         assert!(r.complete, "not a failure");
         assert_eq!(
@@ -1560,7 +1566,7 @@ pub(crate) mod tests {
         // The high DSF is a valid 7z, so it would be cached if the tile succeeded.
         let t = install_with(sevenz(&high(None).bytes()), b"garbage".to_vec());
         let d = disk();
-        let svc = RoadService::new(t.path().into(), vec![], Some(d.clone()));
+        let svc = patient(t.path(), Some(d.clone()));
         let r = svc.footprint(&[TILE], Purpose::Probe).await;
         assert!(!r.complete);
         assert!(r.tiles.is_empty());
@@ -1572,7 +1578,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_failed_tile_answers_at_once_and_incomplete_later() {
         let t = install_with(high(None).bytes(), b"garbage".to_vec());
-        let svc = RoadService::with_config(t.path().into(), vec![], None, config(LONG, LONG));
+        let svc = patient(t.path(), None);
         assert!(!svc.footprint(&[TILE], Purpose::Probe).await.complete);
         let started = Instant::now();
         let r = svc.footprint(&[TILE], Purpose::Generate).await;
@@ -1585,7 +1591,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_failed_tile_keeps_the_other_tiles_of_a_footprint() {
         let t = install_with(high(None).bytes(), b"garbage".to_vec());
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         let r = svc.footprint(&[TILE, (10, 10)], Purpose::Probe).await;
         assert!(!r.complete);
         assert_eq!(r.tiles.len(), 1);
@@ -1598,7 +1604,7 @@ pub(crate) mod tests {
     async fn a_raw_dsf_is_never_written_to_the_disk_cache() {
         let t = install(None);
         let d = disk();
-        let svc = RoadService::new(t.path().into(), vec![], Some(d.clone()));
+        let svc = patient(t.path(), Some(d.clone()));
         assert!(svc.footprint(&[TILE], Purpose::Probe).await.complete);
         assert_eq!(entries(&svc, &d).await, 0);
         let s = svc.stats_snapshot();
@@ -1609,7 +1615,7 @@ pub(crate) mod tests {
     async fn a_second_service_reads_a_compressed_extraction_from_the_disk_cache() {
         let t = install_with(sevenz(&high(None).bytes()), low().bytes());
         let d = disk();
-        let a = RoadService::new(t.path().into(), vec![], Some(d.clone()));
+        let a = patient(t.path(), Some(d.clone()));
         let first = a.footprint(&[TILE], Purpose::Probe).await;
         assert_eq!(a.stats_snapshot().cache_misses, 1);
         assert_eq!(entries(&a, &d).await, 1, "only the 7z DSF");
@@ -1617,7 +1623,7 @@ pub(crate) mod tests {
         let entry = d.get(&cache_key(TILE, &id.path)).await.unwrap().unwrap();
         assert_eq!(&entry[..4], crate::cache::integrity::LIT_ENTRY_MAGIC);
 
-        let b = RoadService::new(t.path().into(), vec![], Some(d));
+        let b = patient(t.path(), Some(d));
         let second = b.footprint(&[TILE], Purpose::Probe).await;
         assert_eq!(b.stats_snapshot().cache_hits, 1);
         assert_eq!(b.stats_snapshot().cache_misses, 0);
@@ -1628,14 +1634,14 @@ pub(crate) mod tests {
     async fn a_cache_entry_for_another_version_of_the_file_is_ignored() {
         let t = install_with(sevenz(&high(None).bytes()), low().bytes());
         let d = disk();
-        let a = RoadService::new(t.path().into(), vec![], Some(d.clone()));
+        let a = patient(t.path(), Some(d.clone()));
         a.footprint(&[TILE], Purpose::Probe).await;
         a.writes_settled().await;
         let mut changed = high(None);
         changed.road(46, 6, 100, &[(6.3, 46.3), (6.4, 46.4), (6.45, 46.45)]);
         std::fs::write(dsf(&t, "High"), sevenz(&changed.bytes())).unwrap();
 
-        let b = RoadService::new(t.path().into(), vec![], Some(d));
+        let b = patient(t.path(), Some(d));
         let r = b.footprint(&[TILE], Purpose::Probe).await;
         let s = b.stats_snapshot();
         assert_eq!((s.cache_hits, s.cache_misses), (0, 1));
@@ -1647,7 +1653,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn identities_are_ordered_cached_and_change_with_the_file() {
         let t = install(None);
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         let a = svc.identities(TILE).await.unwrap();
         assert_eq!(a.len(), 2);
         assert!(a[0].path.contains("High"));
@@ -1658,7 +1664,7 @@ pub(crate) mod tests {
             Some(a.clone()),
             "cached for the session"
         );
-        let fresh = RoadService::new(t.path().into(), vec![], None);
+        let fresh = patient(t.path(), None);
         let b = fresh.identities(TILE).await.unwrap();
         assert_ne!(a, b);
         assert_eq!(a[0], b[0]);
@@ -1668,7 +1674,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_source_gone_since_the_index_was_built_is_left_out_of_the_identities() {
         let t = install(None);
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         assert!(svc.identities((10, 10)).await.is_some(), "index built");
         std::fs::remove_file(dsf(&t, "Low")).unwrap();
         let ids = svc.identities(TILE).await.unwrap();
@@ -1681,7 +1687,7 @@ pub(crate) mod tests {
     async fn identities_fail_when_a_source_cannot_be_stated() {
         use std::os::unix::fs::PermissionsExt;
         let t = install(None);
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         assert!(svc.identities((10, 10)).await.is_some(), "index built");
         let block = dsf(&t, "Low").parent().unwrap().to_path_buf();
         let mode = |m| std::fs::set_permissions(&block, std::fs::Permissions::from_mode(m));
@@ -1771,7 +1777,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn ensure_alone_makes_the_tile_ready() {
         let t = install(None);
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         svc.ensure(TILE, Trigger::DsfOpen);
         svc.ensure(TILE, Trigger::DsfOpen);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1944,7 +1950,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_build_that_resolved_as_the_deadline_passed_is_not_a_timeout() {
         let t = install(None);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, config(LONG, LONG));
+        let svc = patient(t.path(), None);
         let tile = (10, 10);
         let roads = Arc::new(MergedRoads::empty(tile));
         let done = Some(Arc::clone(&roads));
@@ -2017,7 +2023,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_failed_tile_is_incomplete_but_not_timed_out() {
         let t = install_with(high(None).bytes(), b"garbage".to_vec());
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         for _ in 0..2 {
             let r = svc.footprint(&[TILE], Purpose::Probe).await;
             assert!(!r.complete && !r.timed_out);
@@ -2028,7 +2034,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn dark_answers_before_roads_are_counted() {
         let t = install(None);
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         svc.note_dark_answer_before_roads();
         svc.note_dark_answer_before_roads();
         assert_eq!(
@@ -2043,7 +2049,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn lead_time_is_noted_for_the_first_probe_of_each_tile() {
         let t = install(None);
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         let noted = || svc.test.leads_noted.load(Ordering::SeqCst);
         svc.footprint(&[TILE], Purpose::Generate).await;
         assert_eq!(noted(), 0, "not a probe");
@@ -2056,7 +2062,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_cancelled_first_caller_does_not_restart_the_pack_index() {
         let t = install(None);
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         let _ = tokio::time::timeout(Duration::ZERO, svc.identities(TILE)).await;
         assert_eq!(svc.identities(TILE).await.unwrap().len(), 2);
         assert_eq!(svc.test.index_builds.load(Ordering::SeqCst), 1);
@@ -2065,7 +2071,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn concurrent_identity_calls_share_one_stat_pass() {
         let t = install(None);
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         let (a, b) = tokio::join!(svc.identities(TILE), svc.identities(TILE));
         assert!(Arc::ptr_eq(&a.unwrap(), &b.unwrap()));
         assert_eq!(svc.test.identity_passes.load(Ordering::SeqCst), 1);
@@ -2074,7 +2080,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_build_that_ends_without_an_answer_fails_its_tile() {
         let t = install(None);
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         for (answered, tile) in [(true, (1, 1)), (false, (2, 2))] {
             svc.pending
                 .insert(tile, futures::future::ready(None).boxed().shared());
@@ -2094,7 +2100,7 @@ pub(crate) mod tests {
         // guard removed the pending entry: the re-check under the entry's
         // lock must answer failed rather than start a doomed build.
         let t = install(None);
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         svc.test.fail_between_checks.store(true, Ordering::SeqCst);
         assert!(svc.start(TILE, Trigger::Probe).is_none());
         assert!(svc.pending.is_empty(), "no build started");
@@ -2113,7 +2119,7 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn many_concurrent_callers_build_a_tile_once() {
         let t = install(None);
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         let calls = (0..32).map(|i| {
             let s = Arc::clone(&svc);
             tokio::spawn(async move {
@@ -2134,7 +2140,7 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn many_concurrent_callers_fail_a_tile_once() {
         let t = install_with(high(None).bytes(), b"garbage".to_vec());
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         let calls = (0..32).map(|i| {
             let s = Arc::clone(&svc);
             tokio::spawn(async move {
@@ -2155,7 +2161,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_summary_task_does_not_keep_the_service_alive() {
         let t = install(None);
-        let svc = RoadService::new(t.path().into(), vec![], None);
+        let svc = patient(t.path(), None);
         svc.ensure(TILE, Trigger::DsfOpen);
         assert!(svc.footprint(&[TILE], Purpose::Probe).await.complete);
         assert!(svc.summary_started.load(Ordering::Relaxed));
