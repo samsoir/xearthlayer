@@ -941,7 +941,12 @@ function, `TexelCentres::of` (`night/footprint.rs`). The level is
 peak × glow × (country + (1 − country) × clamp(R / full_nw, 0, 1)) × night.brightness
 ```
 
-with `peak` 0.12, `country` 0.2 and `full_nw` 10 nW·cm⁻²·sr⁻¹. Roads do
+with `peak` 0.015, `country` 0.2 and `full_nw` 10 nW·cm⁻²·sr⁻¹. `peak` was
+0.12 until the first flight, at KCCR, where the glow was 98.6% of the lit
+light (72 times the pattern's area light) and the lit side of the near
+hand-off was 10 to 20 times brighter in area average than X-Plane's 3D
+roads and lights; 0.015 is three stops down, a first step of flight
+tuning, since auto exposure makes up part of that gap. Roads do
 not use the gain curve: the gain is zero below its floor radiance, so dark
 countryside would stay dark. Instead the VIIRS radiance `R` raises the road
 from a rural floor (a fifth of the light) to full light at 10. The colour

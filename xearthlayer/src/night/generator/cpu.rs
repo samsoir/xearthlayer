@@ -424,6 +424,27 @@ mod tests {
         roads: &RoadField,
         led: &LedModel,
     ) -> RgbaImage {
+        generate_roads_with(
+            name,
+            size,
+            recipes,
+            patterns,
+            roads,
+            led,
+            &RoadModel::DEFAULT,
+        )
+    }
+
+    /// [`generate_roads`] with another road model.
+    fn generate_roads_with(
+        name: &DdsFilename,
+        size: u32,
+        recipes: impl Fn(i32, i32) -> Option<Arc<Recipe>> + Sync,
+        patterns: impl Fn(&str) -> Option<Arc<LitPattern>> + Sync,
+        roads: &RoadField,
+        led: &LedModel,
+        road_model: &RoadModel,
+    ) -> RgbaImage {
         CpuLitGenerator.generate(&LitRequest {
             name,
             size,
@@ -433,7 +454,7 @@ mod tests {
             regions: &|_, _| LedRegion::Unknown,
             led,
             roads,
-            road_model: &RoadModel::DEFAULT,
+            road_model,
         })
     }
 
@@ -494,8 +515,15 @@ mod tests {
             }; LedRegion::COUNT],
             ..full_share_model()
         };
-        let img = generate_roads(&name, 128, dark, red, &field, &all_led);
-        let warm = generate_roads(&name, 128, dark, red, &field, &sodium_only());
+        // Bright enough over dark ground that the road's bytes clear the
+        // rounding of the faint edge; the hue rule does not depend on it.
+        let bright = RoadModel {
+            peak: 0.12,
+            ..RoadModel::DEFAULT
+        };
+        let gen = |led: &LedModel| generate_roads_with(&name, 128, dark, red, &field, led, &bright);
+        let img = gen(&all_led);
+        let warm = gen(&sodium_only());
         let blue_red = |p: &image::Rgba<u8>| f32::from(p[2]) / f32::from(p[0]);
         let mut compared = 0;
         for (led, sodium) in img.pixels().zip(warm.pixels()) {

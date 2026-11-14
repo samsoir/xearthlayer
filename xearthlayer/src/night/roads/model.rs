@@ -74,7 +74,7 @@ impl RoadModel {
             c(2.0, 6.0, 0.45),  // Minor
             c(1.5, 5.0, 0.30),  // LitFootway
         ],
-        peak: 0.12,
+        peak: 0.015,
         country: 0.2,
         full_nw: 10.0,
         sodium: [255.0, 178.0, 92.0],
@@ -178,6 +178,13 @@ mod tests {
         all.sort();
         all.dedup();
         assert_eq!(all.len(), n);
+    }
+
+    #[test]
+    fn the_road_glow_is_three_stops_below_its_first_flight() {
+        // At KCCR the glow was 98.6% of the lit light, 10 to 20 times the
+        // area light of X-Plane's 3D roads beside it, at a peak of 0.12.
+        assert_eq!(RoadModel::DEFAULT.peak, 0.12 / 8.0);
     }
 
     #[test]
