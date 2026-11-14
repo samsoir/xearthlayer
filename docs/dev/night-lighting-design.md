@@ -233,14 +233,20 @@ same file at every setting, VRAM quartered per notch) was flown on
 
 **Fade ramp.** Because X-Plane pages levels in one at a time (fact 7), a
 texture would jump from full light straight to its blank level, and was
-seen to switch off as one visible square. The first visible level is
-dimmed to 2/3 of the light (`FADE_RAMP`, `(2/3)^(1/2.2)` in stored value,
-since X-Plane decodes sRGB), so each texture steps from full to 2/3 to
-off. The chain is downsampled from the undimmed image, so every coarser
-level is at full light, and the ramp costs no bytes. Two steps (2/3 and
-1/3 of the light) pushed the effective cut-out a level farther out, and
-scaling stored values instead of light (1/3 stored is about 9% of the
-light) read as black before the 3D lights were drawn.
+seen to switch off as one visible square. The first visible level gives
+an eighth of the light and the next half (`FADE_RAMP`, `(1/8)^(1/2.2)` and
+`(1/2)^(1/2.2)` in stored value, since X-Plane decodes sRGB), so each
+texture steps from full to half to an eighth to off. The chain is
+downsampled from the undimmed image, so every coarser level is at full
+light, and the ramp costs no bytes. The nearest level is cut far back so
+the ground under X-Plane's 3D roads and lights is only faintly lit, and two
+levels make the fade span twice the mip range: on a wide view the screen's
+stretch puts the blank-to-visible change about a level farther out at the
+sides than at the centre and squeezes a one-level fade into a few pixels
+there (KCCR, 2026-11-14). Until then one level was dimmed, to 2/3 of the
+light. A two-step ramp flown on 2026-10-18 (2/3 and 1/3) read as black
+before the 3D lights were drawn, but it scaled stored values (1/3 stored
+is about 9% of the light), and no road lights covered the hand-off yet.
 
 **Mips in linear light.** The chain below the first visible level is
 averaged in linear light (`lit_chain`, #363), not by averaging stored

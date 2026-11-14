@@ -70,7 +70,8 @@ pub trait LitGenerator: Send + Sync {
 /// 4: mips averaged in linear light (`lit_chain`, #363).
 /// 5: cooler LED whites and halved region shifts (#363).
 /// 6: road lights (`night/roads`).
-pub const LIT_GENERATOR_VERSION: u32 = 6;
+/// 7: two-level fade, an eighth then half of the light (`FADE_RAMP`).
+pub const LIT_GENERATOR_VERSION: u32 = 7;
 
 /// Gamma of the sRGB decode X-Plane applies to a texture's stored values.
 pub const SRGB_GAMMA: f32 = 2.2;
@@ -78,12 +79,16 @@ pub const SRGB_GAMMA: f32 = 2.2;
 /// Scale of the stored values of the first visible levels, nearest first;
 /// every level after them is full. X-Plane pages a lit texture's levels in
 /// one at a time as the aircraft closes, so without a ramp a texture jumps
-/// from full light to the blank level in one step. One step at 2/3 of the
-/// light, `(2/3) ^ (1/2.2)` in stored value, softens that without moving the
-/// cut-out. Two steps (2/3, 1/3) pushed it a whole level farther out, and
-/// stored-value scaling (1/3 read as 9% of the light) read as black before
-/// the 3D lights were drawn (both flown 2026-10-18).
-pub const FADE_RAMP: [f32; 1] = [0.8318];
+/// from full light to the blank level in one step. The nearest level gives
+/// an eighth of the light, `(1/8) ^ (1/2.2)` in stored value, so the ground
+/// under X-Plane's 3D roads and lights is only faintly lit, and the next
+/// one half. Two levels make the fade span twice the mip range, which
+/// softens the cut-out at the sides of a wide view, where the screen's
+/// stretch squeezes one level's fade into a few pixels (KCCR, 2026-11-14).
+/// One step at 2/3 was the ramp until then; a two-step ramp flown on
+/// 2026-10-18 read as black because it scaled stored values (1/3 gave 9%
+/// of the light) and before road lights covered the hand-off.
+pub const FADE_RAMP: [f32; 2] = [0.3886, 0.7297];
 
 /// BC1-encode the first visible level and its mip chain down to 1 x 1, as
 /// the bytes that follow the blank levels in a lit DDS (no header). The
@@ -161,8 +166,8 @@ mod tests {
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
 
     #[test]
-    fn road_lights_are_generator_version_six() {
-        assert_eq!(LIT_GENERATOR_VERSION, 6);
+    fn the_two_level_fade_is_generator_version_seven() {
+        assert_eq!(LIT_GENERATOR_VERSION, 7);
     }
 
     fn name_at(lat: f64, lon: f64) -> DdsFilename {
@@ -234,12 +239,10 @@ mod tests {
         let reds = level_reds(&encode_visible(img).unwrap(), 64);
         assert_eq!(reds.len(), 7, "64 px down to 1 px");
         let near = |got: u8, want: f32| (f32::from(got) - want).abs() <= 8.0;
+        assert!(near(reds[0], 240.0 * FADE_RAMP[0]), "nearest {reds:?}");
+        assert!(near(reds[1], 240.0 * FADE_RAMP[1]), "second {reds:?}");
         assert!(
-            near(reds[0], 240.0 * FADE_RAMP[0]),
-            "first visible {reds:?}"
-        );
-        assert!(
-            reds[1..].iter().all(|&r| near(r, 240.0)),
+            reds[2..].iter().all(|&r| near(r, 240.0)),
             "full below {reds:?}"
         );
     }
@@ -279,19 +282,22 @@ mod tests {
 
     #[test]
     fn encoded_mips_average_light_not_stored_values() {
-        // Half of 240's light is stored 175; averaging stored values gives 120.
+        // Half of 240's light is stored 175; averaging stored values gives
+        // 120. The levels below the fade are undimmed.
         let reds = level_reds(&encode_visible(checker(64, [240; 3])).unwrap(), 64);
         assert!(
-            reds[1..].iter().all(|&r| (i32::from(r) - 175).abs() <= 8),
+            reds[FADE_RAMP.len()..]
+                .iter()
+                .all(|&r| (i32::from(r) - 175).abs() <= 8),
             "{reds:?}"
         );
     }
 
     #[test]
-    fn the_dimmed_level_gives_two_thirds_of_the_light() {
+    fn the_dimmed_levels_give_an_eighth_then_half_of_the_light() {
         // Stored values are sRGB: the light they give is value ^ 2.2.
         let light = FADE_RAMP.map(|v| v.powf(SRGB_GAMMA));
-        assert_eq!(light.len(), 1);
-        assert!((light[0] - 2.0 / 3.0).abs() < 1e-3, "{light:?}");
+        assert!((light[0] - 1.0 / 8.0).abs() < 1e-3, "{light:?}");
+        assert!((light[1] - 1.0 / 2.0).abs() < 1e-3, "{light:?}");
     }
 }
