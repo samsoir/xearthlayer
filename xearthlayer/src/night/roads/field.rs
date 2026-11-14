@@ -3,11 +3,14 @@
 //! from geometry in metres, so it is world-anchored at every zoom.
 //!
 //! Cost: a tile is skipped whole when no chain nears the footprint, a chain
-//! is culled by its box in tile-relative `f32`, a segment visits only the
-//! texels in its reach window, and a texel is rejected by squared distance
-//! before any square root or exponential. The profile (one `f32` per
-//! texel) is allocated when the first segment reaches the grid, so a
-//! texture with no road nearby costs no heap at all.
+//! is culled by its box in tile-relative `f32`, and a segment visits only
+//! the texels in its reach window, found from the even texel spacing. The
+//! texel loop has no branch and no table (the fall-off is a few multiplies
+//! in `f32`, the reach test a select), so the compiler vectorises it;
+//! everything that varies only by row is computed once per row, with no
+//! division. Lit texels are counted once, after drawing. The profile (one
+//! `f32` per texel) is allocated when the first segment reaches the grid,
+//! so a texture with no road nearby costs no heap at all.
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -173,7 +176,7 @@ impl RoadField {
         let Some(canvas) = canvas else {
             return Self::empty(size);
         };
-        let lit_texels = canvas.lit;
+        let lit_texels = canvas.lit();
         Self {
             size,
             // A window can reach the grid without lighting a texel.
@@ -219,6 +222,12 @@ struct Grid {
     texel: Vec<f64>,
     cos_min: f64,
     texel_max: f64,
+    /// Per row, the inverse of `texel`.
+    inv_texel: Vec<f64>,
+    /// Columns per Mercator metre east, and rows per Mercator metre south
+    /// (the centres are evenly spaced both ways).
+    inv_dx: f64,
+    inv_dy: f64,
 }
 
 impl Grid {
@@ -245,6 +254,9 @@ impl Grid {
             size: size as usize,
             cos_min: cos.iter().copied().fold(f64::MAX, f64::min).max(1e-6),
             texel_max: texel.iter().copied().fold(0.0, f64::max),
+            inv_texel: texel.iter().map(|t| 1.0 / t).collect(),
+            inv_dx: inverse(dx),
+            inv_dy: inverse((ys[0] - ys[last]) / last.max(1) as f64),
             xs,
             ys,
             cos,
@@ -253,13 +265,34 @@ impl Grid {
     }
 }
 
+/// `1 / x`, or 0 for 0 (a grid of one texel).
+fn inverse(x: f64) -> f64 {
+    if x > 0.0 {
+        1.0 / x
+    } else {
+        0.0
+    }
+}
+
+/// `v.partition_point(pred)` for a `pred` true on a prefix of `v`, walked
+/// from `guess` (any index, clamped): exact whatever the guess, and a step
+/// or two when the guess is close.
+fn partition_from(v: &[f64], guess: f64, pred: impl Fn(f64) -> bool) -> usize {
+    let mut k = (guess.max(0.0) as usize).min(v.len());
+    while k > 0 && !pred(v[k - 1]) {
+        k -= 1;
+    }
+    while k < v.len() && pred(v[k]) {
+        k += 1;
+    }
+    k
+}
+
 /// A grid and the profile drawn on it (allocated by the first draw that
 /// reaches the grid).
 struct Canvas {
     grid: Grid,
     profile: Vec<f32>,
-    /// Texels above zero so far.
-    lit: usize,
 }
 
 impl Canvas {
@@ -267,8 +300,13 @@ impl Canvas {
         Self {
             grid,
             profile: Vec::new(),
-            lit: 0,
         }
+    }
+
+    /// Texels above zero, counted once when drawing is done rather than
+    /// on every draw.
+    fn lit(&self) -> usize {
+        self.profile.iter().filter(|&&v| v > 0.0).count()
     }
 
     /// The class glow along each segment of a polyline.
@@ -321,50 +359,124 @@ impl Canvas {
         let reach_m = (half_width + 3.0 * sigma_m.max(g.texel_max)) / g.cos_min;
         let (xmin, xmax) = (a.0.min(b.0) - reach_m, a.0.max(b.0) + reach_m);
         let (ymin, ymax) = (a.1.min(b.1) - reach_m, a.1.max(b.1) + reach_m);
-        let j0 = g.xs.partition_point(|&x| x < xmin);
-        let j1 = g.xs.partition_point(|&x| x <= xmax);
-        let i0 = g.ys.partition_point(|&y| y > ymax);
-        let i1 = g.ys.partition_point(|&y| y >= ymin);
+        // The texel centres are evenly spaced, so each bound is guessed from
+        // the spacing and settled by a step or two.
+        let col = |x: f64| (x - g.xs[0]) * g.inv_dx;
+        let row = |y: f64| (g.ys[0] - y) * g.inv_dy;
+        let j0 = partition_from(&g.xs, col(xmin), |x| x < xmin);
+        let j1 = partition_from(&g.xs, col(xmax) + 1.0, |x| x <= xmax);
+        let i0 = partition_from(&g.ys, row(ymax), |y| y > ymax);
+        let i1 = partition_from(&g.ys, row(ymin) + 1.0, |y| y >= ymin);
         if j0 >= j1 || i0 >= i1 {
             return;
         }
         if self.profile.is_empty() {
             self.profile = vec![0f32; g.size * g.size];
         }
-        let (vx, vy) = (b.0 - a.0, b.1 - a.1);
-        let len2 = vx * vx + vy * vy;
-        let inv_len2 = if len2 > 0.0 { 1.0 / len2 } else { 0.0 };
-        let core2 = half_width * half_width;
+        let seg = Segment::new(a, b);
+        let sigma = (sigma_m, 1.0 / sigma_m);
         for i in i0..i1 {
-            let sigma = sigma_m.max(g.texel[i]);
-            let reach = half_width + 3.0 * sigma;
-            let reach2 = reach * reach;
-            let neg_inv_two_s2 = -1.0 / (2.0 * sigma * sigma);
-            let c2 = g.cos[i] * g.cos[i];
-            let dy = g.ys[i] - a.1;
-            let along_y = dy * vy;
-            let row = &mut self.profile[i * g.size..(i + 1) * g.size];
-            for (&x, cell) in g.xs[j0..j1].iter().zip(&mut row[j0..j1]) {
-                let dx = x - a.0;
-                let t = ((dx * vx + along_y) * inv_len2).clamp(0.0, 1.0);
-                let (ex, ey) = (dx - t * vx, dy - t * vy);
-                let d2 = (ex * ex + ey * ey) * c2;
-                if d2 > reach2 || intensity <= *cell {
-                    continue;
-                }
-                let v = if d2 <= core2 {
-                    intensity
-                } else {
-                    let d = d2.sqrt() - half_width;
-                    intensity * (d * d * neg_inv_two_s2).exp() as f32
-                };
-                if v > *cell {
-                    self.lit += usize::from(*cell == 0.0);
-                    *cell = v;
-                }
-            }
+            let k = RowKernel::new(&self.grid, i, half_width, sigma);
+            self.stamp_row(i, j0..j1, &seg, &k, intensity);
         }
     }
+
+    /// Max-combines the segment's profile into texels `cols` of row `i`.
+    fn stamp_row(
+        &mut self,
+        i: usize,
+        cols: std::ops::Range<usize>,
+        seg: &Segment,
+        k: &RowKernel,
+        intensity: f32,
+    ) {
+        let g = &self.grid;
+        let (a, (vx, vy)) = (seg.a, seg.v);
+        let dy = g.ys[i] - a.1;
+        let along_y = dy * vy;
+        let row = &mut self.profile[i * g.size..(i + 1) * g.size];
+        // Branch and table free, so it vectorises: every texel of the window
+        // computes its value (0 out of reach) and keeps the larger. Inside
+        // the core `u` is 0 and the fall-off exactly 1, so the core needs no
+        // test either.
+        for (&x, cell) in g.xs[cols.clone()].iter().zip(&mut row[cols]) {
+            let dx = x - a.0;
+            let t = ((dx * vx + along_y) * seg.inv_len2).clamp(0.0, 1.0);
+            let (ex, ey) = (dx - t * vx, dy - t * vy);
+            let d2 = (ex * ex + ey * ey) * k.c2;
+            let u = ((d2 as f32).sqrt() - k.half_width) * k.inv_sigma;
+            let v = if d2 <= k.reach2 {
+                intensity * falloff(u)
+            } else {
+                0.0
+            };
+            *cell = cell.max(v);
+        }
+    }
+}
+
+/// A segment in Mercator metres: its start, its vector and the inverse of
+/// its squared length (0 for a point).
+struct Segment {
+    a: (f64, f64),
+    v: (f64, f64),
+    inv_len2: f64,
+}
+
+impl Segment {
+    fn new(a: (f64, f64), b: (f64, f64)) -> Self {
+        let v = (b.0 - a.0, b.1 - a.1);
+        let len2 = v.0 * v.0 + v.1 * v.1;
+        Self {
+            a,
+            v,
+            inv_len2: if len2 > 0.0 { 1.0 / len2 } else { 0.0 },
+        }
+    }
+}
+
+/// What a segment's glow needs on one texel row: everything that varies by
+/// row and not by texel, with no division.
+struct RowKernel {
+    /// cos(latitude) squared: squared Mercator metres to ground metres.
+    c2: f64,
+    half_width: f32,
+    reach2: f64,
+    /// `1 / sigma`, the smaller of the two inverses (division rounds
+    /// monotonically, so it is the inverse of the larger sigma exactly).
+    inv_sigma: f32,
+}
+
+impl RowKernel {
+    /// The sigma is `max(sigma_m, a texel)`; `inv_sigma_m` is `1 / sigma_m`.
+    fn new(g: &Grid, i: usize, half_width: f64, (sigma_m, inv_sigma_m): (f64, f64)) -> Self {
+        let inv_sigma = inv_sigma_m.min(g.inv_texel[i]);
+        let reach = half_width + 3.0 * sigma_m.max(g.texel[i]);
+        Self {
+            c2: g.cos[i] * g.cos[i],
+            half_width: half_width as f32,
+            reach2: reach * reach,
+            inv_sigma: inv_sigma as f32,
+        }
+    }
+}
+
+/// Squarings in [`falloff`].
+const FALLOFF_SQUARINGS: u32 = 10;
+
+/// The glow fall-off `exp(-u^2 / 2)` at `u = (distance - half width) /
+/// sigma`, `u` clamped to `[0, 3]` (the glow's cut): `(1 - u^2 / 2^11)`
+/// squared ten times, within 3e-4 of the Gaussian, exactly 1 at 0. No
+/// branch and no table, so the texel loop vectorises. Every glow and lamp
+/// texel is computed with it, so the same ground gets the same light in
+/// any texture.
+fn falloff(u: f32) -> f32 {
+    let u = u.clamp(0.0, 3.0);
+    let mut e = 1.0 - u * u * (0.5 / (1u32 << FALLOFF_SQUARINGS) as f32);
+    for _ in 0..FALLOFF_SQUARINGS {
+        e *= e;
+    }
+    e
 }
 
 #[cfg(test)]
@@ -456,6 +568,111 @@ pub(crate) mod tests {
     /// The `crossing` road rastered with the default model.
     pub(crate) fn crossing_field(name: &DdsFilename, size: u32) -> RoadField {
         RoadField::raster(name, size, &[crossing(name)], &RoadModel::DEFAULT)
+    }
+
+    #[test]
+    fn partition_from_any_guess_is_the_partition_point() {
+        use crate::night::generator::noise::{hash2, unit};
+        let v: Vec<f64> = (0..300i32)
+            .map(|k| f64::from(k) * 1.5 + unit(hash2(k.into(), 0, 3)))
+            .collect();
+        for k in 0..5_000i64 {
+            let at = -20.0 + 500.0 * unit(hash2(k, 1, 3));
+            let guess = -50.0 + 400.0 * unit(hash2(k, 2, 3));
+            let want = v.partition_point(|&x| x < at);
+            assert_eq!(
+                partition_from(&v, guess, |x| x < at),
+                want,
+                "{at} from {guess}"
+            );
+        }
+        assert_eq!(
+            partition_from(&v, f64::NAN, |x| x < 10.0),
+            v.partition_point(|&x| x < 10.0)
+        );
+        assert_eq!(partition_from(&[], 3.0, |x| x < 1.0), 0);
+    }
+
+    #[test]
+    fn the_glow_falloff_is_within_a_1024th_of_the_gaussian() {
+        let mut worst = 0.0f64;
+        for k in 0..=300_000 {
+            let u = 3.0 * f64::from(k) / 300_000.0;
+            let err = (f64::from(falloff(u as f32)) - (-u * u / 2.0).exp()).abs();
+            worst = worst.max(err);
+        }
+        // Measured: 2.7e-4.
+        assert!(worst <= 1.0 / 1024.0, "largest error {worst:e}");
+        assert!(worst < 3e-4, "largest error {worst:e}");
+        assert_eq!(falloff(0.0), 1.0);
+        // Rounding can put a texel at the cut a hair past 3 sigma.
+        assert_eq!(falloff(3.0001), falloff(3.0));
+        assert!(falloff(3.0) > 0.0);
+    }
+
+    /// `stamp` with every texel of the grid visited: no window, no span.
+    fn stamp_everywhere(
+        c: &mut Canvas,
+        (a, b): ((f64, f64), (f64, f64)),
+        half_width: f64,
+        sigma_m: f64,
+        intensity: f32,
+    ) {
+        let size = c.grid.size;
+        if c.profile.is_empty() {
+            c.profile = vec![0f32; size * size];
+        }
+        let seg = Segment::new(a, b);
+        for i in 0..size {
+            let k = RowKernel::new(&c.grid, i, half_width, (sigma_m, 1.0 / sigma_m));
+            c.stamp_row(i, 0..size, &seg, &k, intensity);
+        }
+    }
+
+    #[test]
+    fn the_raster_equals_a_reference_that_visits_every_texel() {
+        use crate::night::generator::noise::{hash2, unit};
+        let n = name_at_zoom(46.5, 6.5, 16);
+        for size in [64u32, 200] {
+            let (mut fast, mut slow) = (
+                Canvas::new(Grid::new(&n, size)),
+                Canvas::new(Grid::new(&n, size)),
+            );
+            let g = &fast.grid;
+            let (x0, x1) = (g.xs[0], g.xs[g.size - 1]);
+            let (y0, y1) = (g.ys[g.size - 1], g.ys[0]);
+            let r = |k: i64, s: u64| unit(hash2(k, size.into(), s));
+            for k in 0..600 {
+                // Anywhere over the grid and a little beyond it.
+                let a = (
+                    x0 + (x1 - x0) * (r(k, 1) * 1.2 - 0.1),
+                    y0 + (y1 - y0) * (r(k, 2) * 1.2 - 0.1),
+                );
+                // Points, sub-texel, texel-sized and long segments, some
+                // exactly horizontal or vertical.
+                let len = [0.0, 3.0, 12.0, 80.0, 600.0][(k % 5) as usize] * r(k, 3);
+                let angle = r(k, 4) * std::f64::consts::TAU;
+                let mut b = (a.0 + len * angle.cos(), a.1 + len * angle.sin());
+                match k % 7 {
+                    0 => b.1 = a.1,
+                    1 => b.0 = a.0,
+                    _ => {}
+                }
+                let p = RoadModel::DEFAULT.classes[(k % 7) as usize];
+                let (hw, sigma) = (f64::from(p.half_width_m), f64::from(p.sigma_m));
+                fast.stamp(a, b, hw, sigma, p.intensity);
+                stamp_everywhere(&mut slow, (a, b), hw, sigma, p.intensity);
+            }
+            assert!(fast.lit() > 0);
+            assert_eq!(fast.lit(), slow.lit(), "{size} px");
+            let differ = fast
+                .profile
+                .iter()
+                .zip(&slow.profile)
+                .filter(|(f, s)| f.to_bits() != s.to_bits())
+                .count();
+            assert_eq!(differ, 0, "{size} px");
+        }
     }
 
     #[test]
