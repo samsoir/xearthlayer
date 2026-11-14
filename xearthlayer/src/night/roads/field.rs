@@ -101,6 +101,15 @@ impl RoadField {
             .unwrap_or(0.0)
     }
 
+    /// The glow of texel row `row`, west first, `None` when nothing is lit
+    /// (or past the last row): a reader of a whole texture pays one branch
+    /// per row for an empty field instead of one call per texel.
+    pub fn row(&self, row: u32) -> Option<&[f32]> {
+        let size = self.size as usize;
+        let start = row as usize * size;
+        self.profile.get(start..start + size)
+    }
+
     /// Whether the profile has been allocated.
     #[cfg(test)]
     fn allocated(&self) -> bool {
@@ -391,15 +400,37 @@ pub(crate) mod tests {
                 .collect();
             c.push(*s, &rel);
         }
+        merge_tile(tile, c)
+    }
+
+    /// One tile's merged roads from tile-relative chains.
+    fn merge_tile(tile: (i32, i32), chains: Chains) -> Arc<MergedRoads> {
         let mut m = Merger::new(tile);
         m.add(&DsfRoads {
             tile,
             overlay: true,
             net_def: Some("n".into()),
             exclusions: vec![],
-            chains: c,
+            chains,
         });
         Arc::new(m.finish())
+    }
+
+    /// A street grid at about `pitch_m` over the footprint of `name` (which
+    /// must lie in one 1 degree tile): a dense urban road field.
+    pub(crate) fn street_grid_over(name: &DdsFilename, pitch_m: f64) -> Arc<MergedRoads> {
+        let f = Footprint::from_name(name);
+        let tile = (f.south.floor() as i32, f.west.floor() as i32);
+        let rel = |v: f64, o: i32| (v - f64::from(o)) as f32;
+        let mut c = Chains::new();
+        street_grid(
+            &mut c,
+            (rel(f.south, tile.0), rel(f.north, tile.0)),
+            (rel(f.west, tile.1), rel(f.east, tile.1)),
+            pitch_m,
+            0,
+        );
+        merge_tile(tile, c)
     }
 
     /// A road of `subtype` straight across a footprint, north to south
@@ -420,6 +451,20 @@ pub(crate) mod tests {
     /// The `crossing` road rastered with the default model.
     pub(crate) fn crossing_field(name: &DdsFilename, size: u32) -> RoadField {
         RoadField::raster(name, size, &[crossing(name)], &RoadModel::DEFAULT)
+    }
+
+    #[test]
+    fn a_row_holds_the_texels_of_that_row() {
+        let n = name_at_zoom(46.5, 6.5, 16);
+        let f = crossing_field(&n, 64);
+        for i in 0..64 {
+            let row = f.row(i).expect("a lit field has every row");
+            assert_eq!(row.len(), 64);
+            for j in 0..64 {
+                assert_eq!(row[j as usize], f.at(i, j), "texel {i},{j}");
+            }
+        }
+        assert!(RoadField::empty(64).row(0).is_none(), "nothing lit");
     }
 
     #[test]
@@ -728,15 +773,7 @@ pub(crate) mod tests {
             0,
         );
         let chains = c.len();
-        let mut m = Merger::new((46, 6));
-        m.add(&DsfRoads {
-            tile: (46, 6),
-            overlay: true,
-            net_def: Some("n".into()),
-            exclusions: vec![],
-            chains: c,
-        });
-        let tile = Arc::new(m.finish());
+        let tile = merge_tile((46, 6), c);
         println!("chains in the tile: {chains}");
         println!(
             "merged tile: {} bytes, {:.1} per chain",
@@ -776,15 +813,7 @@ pub(crate) mod tests {
         street_grid(&mut c, (0.0, 1.0), (0.0, 1.0), 94.0, 80);
         let (chains, points) = (c.len(), c.lon.len());
         let before = points * 8 + (chains + 1) * 4 + chains * 18;
-        let mut m = Merger::new((35, 139));
-        m.add(&DsfRoads {
-            tile: (35, 139),
-            overlay: true,
-            net_def: Some("n".into()),
-            exclusions: vec![],
-            chains: c,
-        });
-        let tile = Arc::new(m.finish());
+        let tile = merge_tile((35, 139), c);
         println!(
             "{chains} chains, {points} points: {} bytes now, {before} with f32 points and boxes",
             tile.bytes()

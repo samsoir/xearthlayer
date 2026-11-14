@@ -22,6 +22,8 @@ use tracing::{debug, warn};
 use super::generator::field::{RecipeField, FIELD_MARGIN_DEG};
 use super::generator::{CpuLitGenerator, LedModel, LedRegion, LitGenerator, LitRequest};
 use super::layout::minimal_black_dds;
+use super::roads::field::RoadField;
+use super::roads::RoadModel;
 use super::{
     decode_entry, encode_entry, footprint_fingerprint, lit_cache_key, session_fingerprint,
     FileIdentity, Footprint, LaminarArt, LitFingerprint, LitLayout, Recipe, RecipeStore,
@@ -412,6 +414,8 @@ impl NightLitSource {
                 patterns: &patterns,
                 regions: &regions,
                 led: &LedModel::DEFAULT,
+                roads: &RoadField::empty(size),
+                road_model: &RoadModel::DEFAULT,
             });
             Some(super::generator::encode_visible(image))
         })

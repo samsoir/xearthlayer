@@ -16,6 +16,8 @@ use image::RgbaImage;
 
 use super::laminar::LitPattern;
 use super::recipe::Recipe;
+use super::roads::field::RoadField;
+use super::roads::RoadModel;
 use crate::fuse::DdsFilename;
 
 pub use cpu::CpuLitGenerator;
@@ -45,6 +47,11 @@ pub struct LitRequest<'a> {
     pub regions: RegionLookup<'a>,
     /// The LED model; `LedModel::OFF` for sodium only.
     pub led: &'a LedModel,
+    /// The road glow over this texture's texels (`size` x `size`);
+    /// `RoadField::empty` leaves the output exactly as without roads.
+    pub roads: &'a RoadField,
+    /// How road glow becomes light: level, rural floor and colour.
+    pub road_model: &'a RoadModel,
 }
 
 /// Produces the first visible level of a lit texture.
@@ -61,7 +68,8 @@ pub trait LitGenerator: Send + Sync {
 /// 3: raised LED shares and toned sodium (`led::SodiumTone`, #363).
 /// 4: mips averaged in linear light (`lit_chain`, #363).
 /// 5: cooler LED whites and halved region shifts (#363).
-pub const LIT_GENERATOR_VERSION: u32 = 5;
+/// 6: road lights (`night/roads`).
+pub const LIT_GENERATOR_VERSION: u32 = 6;
 
 /// Gamma of the sRGB decode X-Plane applies to a texture's stored values.
 pub const SRGB_GAMMA: f32 = 2.2;
@@ -146,12 +154,14 @@ mod tests {
     use super::*;
     use crate::fuse::TextureKind;
     use crate::night::parse_recipe;
+    use crate::night::roads::field::RoadField;
+    use crate::night::roads::RoadModel;
 
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
 
     #[test]
-    fn cooler_led_whites_are_generator_version_five() {
-        assert_eq!(LIT_GENERATOR_VERSION, 5);
+    fn road_lights_are_generator_version_six() {
+        assert_eq!(LIT_GENERATOR_VERSION, 6);
     }
 
     fn name_at(lat: f64, lon: f64) -> DdsFilename {
@@ -190,6 +200,8 @@ mod tests {
             patterns: &patterns,
             regions: &|_, _| LedRegion::Unknown,
             led: &LedModel::OFF,
+            roads: &RoadField::empty(size),
+            road_model: &RoadModel::DEFAULT,
         })
     }
 

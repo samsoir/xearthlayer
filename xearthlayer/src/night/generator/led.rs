@@ -247,25 +247,59 @@ pub struct Patch {
 /// The patch at Web Mercator `(x, y)`: the nearest of the 3 x 3 jittered
 /// cell centres around it. A function of position only.
 pub fn patch_at(x: f64, y: f64) -> Patch {
+    patch_at_cached(x, y, &mut PatchCache::default())
+}
+
+/// A jittered cell centre (in cells) and its cell.
+type Centre = (f64, f64, i64, i64);
+
+/// The 3 x 3 jittered centres around the last cell a texel fell in, and the
+/// last patch drawn. A cell is about 53 ZL16 texels wide, so texels along a
+/// row reuse its centres instead of hashing them again. The cached values
+/// are the ones computed without a cache, so a patch is the same either way.
+#[derive(Debug, Default)]
+pub struct PatchCache {
+    cell: Option<(i64, i64)>,
+    /// In the order they are compared: the first nearest wins.
+    centres: [Centre; 9],
+    last: Option<((i64, i64), Patch)>,
+}
+
+/// `patch_at`, reusing the centres and the last patch from `cache`.
+pub fn patch_at_cached(x: f64, y: f64, cache: &mut PatchCache) -> Patch {
     let (gx, gy) = (x / PATCH_SIZE_M, y / PATCH_SIZE_M);
     let (cx, cy) = (gx.floor() as i64, gy.floor() as i64);
-    let mut best = (f64::INFINITY, cx, cy);
-    for dy in -1..=1 {
-        for dx in -1..=1 {
-            let (ix, iy) = (cx + dx, cy + dy);
-            let ox = (unit(hash2(ix, iy, PATCH_SEED_X)) - 0.5) * PATCH_JITTER;
-            let oy = (unit(hash2(ix, iy, PATCH_SEED_Y)) - 0.5) * PATCH_JITTER;
-            let (px, py) = (ix as f64 + 0.5 + ox, iy as f64 + 0.5 + oy);
-            let d = (gx - px).powi(2) + (gy - py).powi(2);
-            if d < best.0 {
-                best = (d, ix, iy);
+    if cache.cell != Some((cx, cy)) {
+        let mut k = 0;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let (ix, iy) = (cx + dx, cy + dy);
+                let ox = (unit(hash2(ix, iy, PATCH_SEED_X)) - 0.5) * PATCH_JITTER;
+                let oy = (unit(hash2(ix, iy, PATCH_SEED_Y)) - 0.5) * PATCH_JITTER;
+                cache.centres[k] = (ix as f64 + 0.5 + ox, iy as f64 + 0.5 + oy, ix, iy);
+                k += 1;
             }
+        }
+        cache.cell = Some((cx, cy));
+    }
+    let mut best = (f64::INFINITY, cx, cy);
+    for &(px, py, ix, iy) in &cache.centres {
+        let d = (gx - px).powi(2) + (gy - py).powi(2);
+        if d < best.0 {
+            best = (d, ix, iy);
         }
     }
     let (_, ix, iy) = best;
-    Patch {
-        u: unit(hash2(ix, iy, PATCH_SEED_U)),
-        jitter: unit(hash2(ix, iy, PATCH_SEED_J)) * 2.0 - 1.0,
+    match cache.last {
+        Some((cell, patch)) if cell == (ix, iy) => patch,
+        _ => {
+            let patch = Patch {
+                u: unit(hash2(ix, iy, PATCH_SEED_U)),
+                jitter: unit(hash2(ix, iy, PATCH_SEED_J)) * 2.0 - 1.0,
+            };
+            cache.last = Some(((ix, iy), patch));
+            patch
+        }
     }
 }
 
@@ -324,7 +358,7 @@ pub fn white(kelvin: f64) -> [f32; 3] {
     [0, 1, 2].map(|c| a[c] + (b[c] - a[c]) * f)
 }
 
-fn luminance(c: [f32; 3]) -> f32 {
+pub(crate) fn luminance(c: [f32; 3]) -> f32 {
     0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
 }
 
@@ -401,12 +435,12 @@ pub fn recolour(stored: [f32; 3], kelvin: f64, energy: f32) -> [f32; 3] {
 }
 
 /// Stored values (0..255) to linear light.
-fn decode(stored: [f32; 3]) -> [f32; 3] {
+pub(crate) fn decode(stored: [f32; 3]) -> [f32; 3] {
     stored.map(|v| (v / 255.0).clamp(0.0, 1.0).powf(SRGB_GAMMA))
 }
 
 /// Linear light to stored values (0..255).
-fn encode(linear: [f32; 3]) -> [f32; 3] {
+pub(crate) fn encode(linear: [f32; 3]) -> [f32; 3] {
     linear.map(|c| c.clamp(0.0, 1.0).powf(1.0 / SRGB_GAMMA) * 255.0)
 }
 
@@ -735,6 +769,29 @@ mod tests {
                     "{laminar:?} at gain {s}: {out:?} dimmer than {raw:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_shared_patch_cache_gives_the_uncached_patches() {
+        // Rows of ZL16 texels (about 7.5 m apart) across many cells, then
+        // jumps back and forth, all through one cache.
+        let mut cache = PatchCache::default();
+        let mut points = Vec::new();
+        for row in 0..40 {
+            let y = 5_000_000.0 + f64::from(row) * 97.0;
+            points.extend((0..800).map(|i| (-1_200.0 + f64::from(i) * 7.5, y)));
+        }
+        points.extend((0..2000).map(|i| {
+            let h = hash2(i, 1, 3);
+            (unit(h) * 1e5 - 5e4, unit(h >> 16) * 1e5 - 5e4)
+        }));
+        for (x, y) in points {
+            assert_eq!(
+                patch_at_cached(x, y, &mut cache),
+                patch_at(x, y),
+                "at {x},{y}"
+            );
         }
     }
 
