@@ -17,11 +17,15 @@ pub struct StatsSnapshot {
     pub cache_hits: u64,
     /// Compressed DSFs read from the file with a disk cache present.
     pub cache_misses: u64,
-    /// Probes that waited for roads or ended without them.
+    /// Probe footprints that waited for a tile or timed out.
     pub probe_waits: u64,
-    /// Probes whose roads were not all ready by their deadline.
+    /// Probe footprints with a tile still building past its deadline.
     pub probe_timeouts: u64,
-    /// Probes that committed an answer without all their roads.
+    /// Generation footprints that waited for a tile or timed out.
+    pub generate_waits: u64,
+    /// Generation footprints with a tile still building past its deadline.
+    pub generate_timeouts: u64,
+    /// Dark lit answers committed while the probe's roads were late.
     pub answered_before_roads: u64,
     pub tiles_ready: u64,
     pub tiles_failed: u64,
@@ -35,6 +39,8 @@ impl StatsSnapshot {
             cache_misses: self.cache_misses - earlier.cache_misses,
             probe_waits: self.probe_waits - earlier.probe_waits,
             probe_timeouts: self.probe_timeouts - earlier.probe_timeouts,
+            generate_waits: self.generate_waits - earlier.generate_waits,
+            generate_timeouts: self.generate_timeouts - earlier.generate_timeouts,
             answered_before_roads: self.answered_before_roads - earlier.answered_before_roads,
             tiles_ready: self.tiles_ready - earlier.tiles_ready,
             tiles_failed: self.tiles_failed - earlier.tiles_failed,
@@ -84,8 +90,9 @@ struct Window {
 pub struct Stats {
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
-    probe_waits: AtomicU64,
-    probe_timeouts: AtomicU64,
+    /// Footprints of each purpose.
+    pub probe: WaitCounters,
+    pub generate: WaitCounters,
     answered_before_roads: AtomicU64,
     tiles_ready: AtomicU64,
     tiles_failed: AtomicU64,
@@ -94,6 +101,33 @@ pub struct Stats {
 
 fn add(counter: &AtomicU64, n: u64) {
     counter.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Waits and timeouts of the footprints of one purpose.
+#[derive(Default)]
+pub struct WaitCounters {
+    waits: AtomicU64,
+    timeouts: AtomicU64,
+}
+
+impl WaitCounters {
+    /// A footprint that `waited` for a tile, and whether a tile was still
+    /// building past its deadline. One that did neither is not counted.
+    pub fn record(&self, waited: bool, timed_out: bool) {
+        if waited || timed_out {
+            add(&self.waits, 1);
+        }
+        if timed_out {
+            add(&self.timeouts, 1);
+        }
+    }
+
+    fn get(&self) -> (u64, u64) {
+        (
+            self.waits.load(Ordering::Relaxed),
+            self.timeouts.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl Stats {
@@ -121,25 +155,22 @@ impl Stats {
         w.cpu_us += b.cpu_us;
     }
 
-    /// A probe that waited `waited_ms` for its roads, and whether they were
-    /// all there in time. One that neither waited nor missed is not counted.
-    pub fn record_probe(&self, waited_ms: u64, in_time: bool) {
-        if waited_ms > 0 || !in_time {
-            add(&self.probe_waits, 1);
-        }
-        if !in_time {
-            add(&self.probe_timeouts, 1);
-            add(&self.answered_before_roads, 1);
-        }
+    /// A dark lit answer committed while the probe's roads were late.
+    pub fn record_dark_answer(&self) {
+        add(&self.answered_before_roads, 1);
     }
 
     pub fn snapshot(&self) -> StatsSnapshot {
         let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        let (probe_waits, probe_timeouts) = self.probe.get();
+        let (generate_waits, generate_timeouts) = self.generate.get();
         StatsSnapshot {
             cache_hits: get(&self.cache_hits),
             cache_misses: get(&self.cache_misses),
-            probe_waits: get(&self.probe_waits),
-            probe_timeouts: get(&self.probe_timeouts),
+            probe_waits,
+            probe_timeouts,
+            generate_waits,
+            generate_timeouts,
             answered_before_roads: get(&self.answered_before_roads),
             tiles_ready: get(&self.tiles_ready),
             tiles_failed: get(&self.tiles_failed),
@@ -195,6 +226,8 @@ impl Stats {
             tiles_failed = d.tiles_failed,
             probe_waits = d.probe_waits,
             probe_timeouts = d.probe_timeouts,
+            generate_waits = d.generate_waits,
+            generate_timeouts = d.generate_timeouts,
             answered_before_roads = d.answered_before_roads,
             extracted,
             extract_median_ms,
@@ -268,7 +301,8 @@ mod tests {
         let s = Stats::default();
         s.record_build(&build(true, 2, 0));
         s.take_window().unwrap();
-        s.record_probe(5, false);
+        s.probe.record(true, true);
+        s.record_dark_answer();
         let w = s.take_window().unwrap();
         assert_eq!(
             w.delta,
@@ -283,13 +317,15 @@ mod tests {
     }
 
     #[test]
-    fn a_probe_that_did_not_wait_and_got_its_roads_is_not_counted() {
+    fn a_footprint_that_neither_waited_nor_timed_out_is_not_counted() {
         let s = Stats::default();
-        s.record_probe(0, true);
+        s.probe.record(false, false);
         assert_eq!(s.snapshot(), StatsSnapshot::default());
-        s.record_probe(3, true);
+        s.probe.record(true, false);
+        s.generate.record(false, true);
         let snap = s.snapshot();
         assert_eq!((snap.probe_waits, snap.probe_timeouts), (1, 0));
+        assert_eq!((snap.generate_waits, snap.generate_timeouts), (1, 1));
         assert_eq!(snap.answered_before_roads, 0);
     }
 
