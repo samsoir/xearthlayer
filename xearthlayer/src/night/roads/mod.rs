@@ -8,6 +8,7 @@ pub mod dsf;
 pub mod exclusion;
 pub mod merge;
 pub mod model;
+pub mod packs;
 
 pub use class::{is_lit_subtype, RoadClass};
 pub use model::{ClassParams, LampParams, RoadModel, ROAD_MODEL_VERSION};
