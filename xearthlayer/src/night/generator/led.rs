@@ -310,12 +310,13 @@ pub fn patch_at_cached(x: f64, y: f64, cache: &mut PatchCache) -> Patch {
 }
 
 /// `x.floor() as i64` without the call to `floor` (not an instruction on
-/// the baseline x86-64 target): a cast truncates towards zero, one less
-/// below zero unless already whole.
+/// the baseline x86-64 target), for every `f64`: a cast truncates towards
+/// zero, one less below zero unless already whole. Past the ends of `i64`
+/// the cast saturates, and the step down saturates with it.
 pub(crate) fn floor_i64(x: f64) -> i64 {
     let t = x as i64;
     if (t as f64) > x {
-        t - 1
+        t.saturating_sub(1)
     } else {
         t
     }
@@ -606,6 +607,20 @@ mod tests {
         xs.extend((-200_000..200_000).map(|k| f64::from(k) * 0.000_9));
         for k in -400..400 {
             let x = f64::from(k);
+            xs.extend([x, x.next_up(), x.next_down()]);
+        }
+        // Past the ends of i64 the cast saturates, and so must this.
+        for x in [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            1e300,
+            -1e300,
+            f64::MAX,
+            f64::MIN,
+            i64::MIN as f64,
+            i64::MAX as f64,
+        ] {
             xs.extend([x, x.next_up(), x.next_down()]);
         }
         for x in xs {

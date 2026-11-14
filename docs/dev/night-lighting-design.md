@@ -1142,9 +1142,10 @@ runs):
 The densest Tokyo texture is the ZL16 texture of the tile holding the most
 road points. The segments rastered are those the cell index hands over,
 a few more than reach the texture. The raster tests no segment box of the
-tile and computes no logarithm per point, so nearly all of it is the texel
-loop, about 4 ns per texel visited. Where no road reaches a texture the raster allocates nothing and
-the generator's output is unchanged byte for byte.
+tile and computes no logarithm per point; what it spends is the texel
+loop and each segment's window (only the raster's total is measured).
+Where no road reaches a texture the raster allocates nothing and the
+generator's output is unchanged byte for byte.
 
 ### Decisions
 
@@ -1239,7 +1240,11 @@ DSFs X-Plane loads, drawn as a glow composited last (see Road lights).
   early exit) and, in ignored golden tests, against `DSFTool`'s decoding
   of real files; exclusion zones and the merge order; the codec's round
   trip and bounded decoding; the occupancy map against a scan of every
-  box, on random queries; glow zoom invariance, reach and culling; an
+  box, on random queries; the cell visit against every chain, on random
+  tiles and queries; the raster against an independent plain `f64`
+  reference (exact distances and `exp`, every class and lamps, two zooms
+  and two sizes, within 3e-4 of the class intensity); glow zoom
+  invariance, reach and culling; an
   empty field leaving the generator's output byte for byte, with the
   LED-on golden digests pinned; the service's coalescing, deadlines,
   failure, permit and cache rules; the probe, generation, disk and

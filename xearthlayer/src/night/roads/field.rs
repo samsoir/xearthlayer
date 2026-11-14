@@ -325,6 +325,28 @@ fn partition_from(v: &[f64], guess: f64, pred: impl Fn(f64) -> bool) -> usize {
     k
 }
 
+/// Hands `f` the lamps of a polyline (Mercator metres), in order: one at
+/// every `spacing_m` of ground arc length, each lit or not by a hash of
+/// the chain's key and its index.
+fn lamp_positions(pts: &[(f64, f64)], key: i64, l: &LampParams, mut f: impl FnMut((f64, f64))) {
+    let spacing = f64::from(l.spacing_m).max(MIN_LAMP_SPACING_M);
+    let lit_share = f64::from(l.lit_share);
+    let (mut along, mut next, mut k) = (0.0f64, 0.0f64, 0i64);
+    for w in pts.windows(2) {
+        let ((x0, y0), (x1, y1)) = (w[0], w[1]);
+        let len = (x1 - x0).hypot(y1 - y0) * cos_lat_of(y0);
+        while next <= along + len {
+            if unit(hash2(key, k, LAMP_SEED)) < lit_share {
+                let t = if len > 0.0 { (next - along) / len } else { 0.0 };
+                f((x0 + t * (x1 - x0), y0 + t * (y1 - y0)));
+            }
+            k += 1;
+            next += spacing;
+        }
+        along += len;
+    }
+}
+
 /// A grid and the profile drawn on it (allocated by the first draw that
 /// reaches the grid).
 struct Canvas {
@@ -354,29 +376,12 @@ impl Canvas {
         }
     }
 
-    /// Lamps at every `spacing_m` of ground arc length along a polyline,
-    /// each lit by its chain's hash.
+    /// The lamps of a polyline (Mercator metres), each a point glow.
     fn draw_lamps(&mut self, pts: &[(f64, f64)], key: i64, l: &LampParams) {
-        let (sigma, spacing) = (
-            f64::from(l.sigma_m),
-            f64::from(l.spacing_m).max(MIN_LAMP_SPACING_M),
-        );
-        let lit_share = f64::from(l.lit_share);
-        let (mut along, mut next, mut k) = (0.0f64, 0.0f64, 0i64);
-        for w in pts.windows(2) {
-            let ((x0, y0), (x1, y1)) = (w[0], w[1]);
-            let len = (x1 - x0).hypot(y1 - y0) * cos_lat_of(y0);
-            while next <= along + len {
-                if unit(hash2(key, k, LAMP_SEED)) < lit_share {
-                    let t = if len > 0.0 { (next - along) / len } else { 0.0 };
-                    let at = (x0 + t * (x1 - x0), y0 + t * (y1 - y0));
-                    self.stamp(at, at, 0.0, sigma, l.intensity);
-                }
-                k += 1;
-                next += spacing;
-            }
-            along += len;
-        }
+        let sigma = f64::from(l.sigma_m);
+        lamp_positions(pts, key, l, |at| {
+            self.stamp(at, at, 0.0, sigma, l.intensity)
+        });
     }
 
     /// Max-combines the profile of the segment `a` to `b` (Mercator
@@ -506,7 +511,12 @@ const FALLOFF_SQUARINGS: u32 = 10;
 /// squared ten times, within 3e-4 of the Gaussian, exactly 1 at 0. No
 /// branch and no table, so the texel loop vectorises. Every glow and lamp
 /// texel is computed with it, so the same ground gets the same light in
-/// any texture.
+/// any texture, up to rounding: the squarings multiply a one-ULP change of
+/// the first term (2^-24 just below 1) by about 1024, so an output can
+/// move by up to about 6.1e-5 when the `f32` distance moves by one ULP.
+/// Two textures whose `f64` squared distances for the same ground round to
+/// neighbouring `f32` values can therefore differ by that much, about 60%
+/// of the 1e-4 the zoom-agreement tests allow.
 fn falloff(u: f32) -> f32 {
     let u = u.clamp(0.0, 3.0);
     let mut e = 1.0 - u * u * (0.5 / (1u32 << FALLOFF_SQUARINGS) as f32);
@@ -706,7 +716,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_raster_equals_a_reference_that_visits_every_texel() {
+    fn the_reach_window_misses_no_texel_the_whole_grid_would_light() {
         use crate::night::generator::noise::{hash2, unit};
         let n = name_at_zoom(46.5, 6.5, 16);
         for size in [64u32, 200] {
@@ -748,6 +758,227 @@ pub(crate) mod tests {
                 .filter(|(f, s)| f.to_bits() != s.to_bits())
                 .count();
             assert_eq!(differ, 0, "{size} px");
+        }
+    }
+
+    /// One mark of the reference raster: a segment `a` to `b` (Mercator
+    /// metres, a point when equal) and its glow.
+    struct Mark {
+        a: (f64, f64),
+        b: (f64, f64),
+        half_width: f64,
+        sigma_m: f64,
+        intensity: f64,
+    }
+
+    /// A raster written apart from the fast path, in plain `f64`: texel
+    /// centres and Web Mercator from their formulas, every mark tested
+    /// against every texel whose centre lies within its reach box, the exact
+    /// distance and `exp`. Only lamp placement is shared (placement is not
+    /// what it checks). Returns the profile and, per texel, whether some
+    /// mark's distance is within 1e-6 relative of its reach (the cut).
+    fn reference_raster(
+        name: &DdsFilename,
+        size: u32,
+        roads: &MergedRoads,
+        model: &RoadModel,
+    ) -> (Vec<f64>, Vec<bool>) {
+        use std::f64::consts::{FRAC_PI_4, PI, TAU};
+        let r = EARTH_RADIUS_M;
+        let n = f64::from(1u32 << name.zoom);
+        let side = f64::from(TILES_PER_TEXTURE);
+        let px = f64::from(size);
+        let project = |lon: f64, lat: f64| {
+            (
+                r * lon.to_radians(),
+                r * (FRAC_PI_4 + lat.to_radians() / 2.0).tan().ln(),
+            )
+        };
+        // The marks of every chain of the tile.
+        let mut marks = Vec::new();
+        let (lat0, lon0) = (f64::from(roads.tile.0), f64::from(roads.tile.1));
+        roads.for_each_chain_near(lat0, lon0, lat0 + 1.0, lon0 + 1.0, |chain| {
+            let deg: Vec<(f64, f64)> = chain.points().collect();
+            let pts: Vec<(f64, f64)> = deg.iter().map(|&(x, y)| project(x, y)).collect();
+            let class = chain.class();
+            let lamps = model
+                .rural_lamps
+                .filter(|_| class != RoadClass::Motorway && class != RoadClass::Ramp);
+            match lamps {
+                Some(l) => lamp_positions(&pts, chain_key(deg[0]), &l, |at| {
+                    marks.push(Mark {
+                        a: at,
+                        b: at,
+                        half_width: 0.0,
+                        sigma_m: f64::from(l.sigma_m),
+                        intensity: f64::from(l.intensity),
+                    })
+                }),
+                None => {
+                    let p = model.classes[class.index()];
+                    for w in pts.windows(2) {
+                        marks.push(Mark {
+                            a: w[0],
+                            b: w[1],
+                            half_width: f64::from(p.half_width_m),
+                            sigma_m: f64::from(p.sigma_m),
+                            intensity: f64::from(p.intensity),
+                        });
+                    }
+                }
+            }
+        });
+        let size = size as usize;
+        let (mut out, mut edge) = (vec![0.0f64; size * size], vec![false; size * size]);
+        // Column of a Mercator easting, unrounded (centres at whole values).
+        let col_of = |x: f64| ((x / r + PI) / TAU * n - f64::from(name.col)) * px / side - 0.5;
+        for i in 0..size {
+            let lat = (PI * (1.0 - 2.0 * (f64::from(name.row) + (i as f64 + 0.5) / px * side) / n))
+                .sinh()
+                .atan();
+            let y = r * (FRAC_PI_4 + lat / 2.0).tan().ln();
+            let cos = lat.cos();
+            let texel = r * TAU * side / (n * px) * cos;
+            for m in &marks {
+                let sigma = m.sigma_m.max(texel);
+                let reach = m.half_width + 3.0 * sigma;
+                let reach_mercator = reach / cos;
+                if y < m.a.1.min(m.b.1) - reach_mercator || y > m.a.1.max(m.b.1) + reach_mercator {
+                    continue;
+                }
+                let lo = col_of(m.a.0.min(m.b.0) - reach_mercator).ceil().max(0.0) as usize;
+                let hi = col_of(m.a.0.max(m.b.0) + reach_mercator).floor();
+                if hi < 0.0 {
+                    continue;
+                }
+                for j in lo..=(hi as usize).min(size - 1) {
+                    let lon = (f64::from(name.col) + (j as f64 + 0.5) / px * side) / n * TAU - PI;
+                    let x = r * lon;
+                    let (vx, vy) = (m.b.0 - m.a.0, m.b.1 - m.a.1);
+                    let len2 = vx * vx + vy * vy;
+                    let t = if len2 > 0.0 {
+                        (((x - m.a.0) * vx + (y - m.a.1) * vy) / len2).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let (ex, ey) = (x - (m.a.0 + t * vx), y - (m.a.1 + t * vy));
+                    let d = (ex * ex + ey * ey).sqrt() * cos;
+                    let v = if d <= m.half_width {
+                        m.intensity
+                    } else if d <= reach {
+                        let u = (d - m.half_width) / sigma;
+                        m.intensity * (-u * u / 2.0).exp()
+                    } else {
+                        0.0
+                    };
+                    let k = i * size + j;
+                    out[k] = out[k].max(v);
+                    edge[k] |= (d - reach).abs() <= 1e-6 * reach;
+                }
+            }
+        }
+        (out, edge)
+    }
+
+    /// `count` random chains of `subtypes` over the footprint of `name`
+    /// and a little beyond: points, short and long segments, some with a
+    /// third point.
+    fn random_roads(
+        name: &DdsFilename,
+        subtypes: &[u8],
+        count: i64,
+        seed: u64,
+    ) -> Arc<MergedRoads> {
+        use crate::night::generator::noise::{hash2, unit};
+        let f = Footprint::from_name(name);
+        let (w, h) = (f.east - f.west, f.north - f.south);
+        let roads: Vec<(u8, Vec<(f64, f64)>)> = (0..count)
+            .map(|k| {
+                let u = |m: i64| unit(hash2(k, m, seed));
+                let at = |m: i64| {
+                    (
+                        f.west + w * (u(m) * 1.2 - 0.1),
+                        f.south + h * (u(m + 1) * 1.2 - 0.1),
+                    )
+                };
+                let len = [0.0, 0.02, 0.1, 0.5][(k % 4) as usize] * w;
+                let angle = u(5) * std::f64::consts::TAU;
+                let a = at(1);
+                let mut pts = vec![a, (a.0 + len * angle.cos(), a.1 + len * angle.sin())];
+                if k % 3 == 0 {
+                    pts.push(at(3));
+                }
+                (subtypes[(k as usize) % subtypes.len()], pts)
+            })
+            .collect();
+        let f0 = Footprint::from_name(name);
+        merged((f0.south.floor() as i32, f0.west.floor() as i32), &roads)
+    }
+
+    #[test]
+    fn the_raster_matches_an_independent_reference_in_plain_f64() {
+        let lamps = RoadModel {
+            rural_lamps: Some(LampParams::TEST),
+            ..RoadModel::DEFAULT
+        };
+        // Each class alone, so the tolerance is its own intensity, then
+        // lamps beside motorways.
+        let mut cases: Vec<(Vec<u8>, RoadModel)> = [100u8, 120, 10, 30, 50, 70, 75]
+            .into_iter()
+            .map(|s| (vec![s], RoadModel::DEFAULT))
+            .collect();
+        cases.push((vec![50, 70, 75, 100], lamps));
+        // Texels from 3.3 m to 13 m: below and above every class sigma.
+        for (zoom, size) in [(17u8, 256u32), (17, 512), (18, 256), (18, 512)] {
+            let name = name_at_zoom(46.5, 6.5, zoom);
+            for (c, (subtypes, model)) in cases.iter().enumerate() {
+                let roads = random_roads(&name, subtypes, 40, 11 + c as u64);
+                let fast = RoadField::raster(&name, size, std::slice::from_ref(&roads), model);
+                let (want, edge) = reference_raster(&name, size, &roads, model);
+                let intensity = subtypes
+                    .iter()
+                    .map(|&s| {
+                        let class = RoadClass::of(s).unwrap();
+                        model.classes[class.index()].intensity
+                    })
+                    .chain(model.rural_lamps.map(|l| l.intensity))
+                    .fold(0.0f32, f32::max);
+                let tolerance = 3e-4 * f64::from(intensity) + 1e-6;
+                let (mut lit, mut edges, mut worst) = (0, 0, 0.0f64);
+                for i in 0..size {
+                    for j in 0..size {
+                        let k = (i * size + j) as usize;
+                        if edge[k] {
+                            edges += 1;
+                            continue;
+                        }
+                        let got = f64::from(fast.at(i, j));
+                        let diff = (got - want[k]).abs();
+                        worst = worst.max(diff);
+                        assert!(
+                            diff <= tolerance,
+                            "ZL{zoom} {size} px case {c} texel {i},{j}: fast {got}, reference {}",
+                            want[k]
+                        );
+                        assert_eq!(
+                            got > 0.0,
+                            want[k] > 0.0,
+                            "ZL{zoom} {size} px case {c} texel {i},{j}: lit"
+                        );
+                        lit += usize::from(want[k] > 0.0);
+                    }
+                }
+                let texels = (size * size) as usize;
+                assert!(
+                    lit > texels / 50,
+                    "ZL{zoom} {size} px case {c}: only {lit} lit"
+                );
+                assert!(
+                    edges < texels / 1000,
+                    "ZL{zoom} {size} px case {c}: {edges} at the cut"
+                );
+                assert!(worst > 0.0 || lit == 0);
+            }
         }
     }
 
