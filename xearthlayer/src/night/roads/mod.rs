@@ -5,6 +5,7 @@
 pub mod class;
 pub mod dsf;
 pub mod exclusion;
+pub mod merge;
 pub mod model;
 
 pub use class::{is_lit_subtype, RoadClass};

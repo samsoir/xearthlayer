@@ -89,6 +89,18 @@ impl Chains {
         self.subtype.push(subtype);
     }
 
+    /// Appends chain `i` of `src` without building an intermediate point list.
+    pub fn push_from(&mut self, src: &Chains, i: usize) {
+        if self.start.is_empty() {
+            self.start.push(0);
+        }
+        let r = src.points(i);
+        self.lon.extend_from_slice(&src.lon[r.clone()]);
+        self.lat.extend_from_slice(&src.lat[r]);
+        self.start.push(self.lon.len() as u32);
+        self.subtype.push(src.subtype[i]);
+    }
+
     /// Heap bytes held, for the byte-bounded tile cache.
     pub fn bytes(&self) -> usize {
         self.lon.len() * 8 + self.start.len() * 4 + self.subtype.len()
@@ -758,6 +770,21 @@ pub(crate) mod test_dsf {
 mod tests {
     use super::test_dsf::{self, Builder};
     use super::*;
+
+    #[test]
+    fn push_from_copies_one_chain_like_push() {
+        let mut src = Chains::new();
+        src.push(10, &[(0.1, 0.2), (0.3, 0.4)]);
+        src.push(50, &[(0.5, 0.6), (0.7, 0.8), (0.9, 0.95)]);
+        let mut a = Chains::new();
+        a.push_from(&src, 1);
+        let mut b = Chains::new();
+        b.push(50, &[(0.5, 0.6), (0.7, 0.8), (0.9, 0.95)]);
+        assert_eq!(a, b);
+        let mut empty = Chains::default();
+        empty.push_from(&src, 0);
+        assert_eq!(empty.start, vec![0, 2]);
+    }
 
     fn chain_cmd(b: &mut Builder, pool: u16, def: u8, subtype: u8, idx: &[u16]) {
         b.cmds.push(1); // PoolSelect
