@@ -7,7 +7,10 @@
 //! 1.7 m, far below a lit texel), one class byte per chain and a 4-byte box
 //! of 1/256 degree cells for culling. Consumers see degrees through
 //! [`MergedRoads::points`] and cull through [`MergedRoads::query`] and
-//! [`MergedRoads::in_box`], never the encoding.
+//! [`MergedRoads::in_box`], never the encoding. A one-bit-per-cell
+//! occupancy map (8 KB per tile) answers [`MergedRoads::crosses`] in time
+//! proportional to the query's cells, not to the tile's chains: the lit
+//! probe asks it for every footprint X-Plane stats.
 
 use super::class::RoadClass;
 use super::dsf::DsfRoads;
@@ -19,6 +22,15 @@ const STEPS: f64 = 65535.0;
 const CELL_SHIFT: u32 = 8;
 /// Bytes held beyond the Vec contents (the struct itself, rounded).
 const FIXED_BYTES: usize = 64;
+/// Cells along each side of a tile.
+const CELLS: usize = 256;
+/// Occupancy words per row of cells.
+const ROW_WORDS: usize = CELLS / 64;
+/// One bit per cell: row `r` (from the south) is words `r * ROW_WORDS..`,
+/// cell column `c` bit `c % 64` of word `c / 64` of its row.
+type Occupancy = Box<[u64; CELLS * ROW_WORDS]>;
+/// Heap bytes of an [`Occupancy`].
+const OCCUPANCY_BYTES: usize = CELLS * ROW_WORDS * 8;
 
 /// A tile-relative offset (degrees, clamped to the tile) in steps.
 fn quantise(offset: f32) -> u16 {
@@ -27,6 +39,34 @@ fn quantise(offset: f32) -> u16 {
 
 fn cell_of(step: u16) -> u8 {
     (step >> CELL_SHIFT) as u8
+}
+
+/// The bits of occupancy word `k` of a row (cell columns `64k..64k + 63`)
+/// that lie in `west..=east`.
+fn span_mask(k: usize, west: u8, east: u8) -> u64 {
+    let lo = k * 64;
+    let (w, e) = (usize::from(west).max(lo), usize::from(east).min(lo + 63));
+    if w > e {
+        return 0;
+    }
+    let width = e - w + 1;
+    let ones = if width == 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    };
+    ones << (w - lo)
+}
+
+/// The occupancy words and masks covering cells `south..=north` by
+/// `west..=east`, row by row.
+fn spans(south: u8, west: u8, north: u8, east: u8) -> impl Iterator<Item = (usize, u64)> {
+    let words = usize::from(west) / 64..=usize::from(east) / 64;
+    (usize::from(south)..=usize::from(north)).flat_map(move |row| {
+        words
+            .clone()
+            .map(move |k| (row * ROW_WORDS + k, span_mask(k, west, east)))
+    })
 }
 
 /// A query box in cells, as [`MergedRoads::query`] prepares it.
@@ -51,6 +91,8 @@ pub struct MergedRoads {
     class: Vec<RoadClass>,
     /// Per chain `[south, west, north, east]` cells containing every point.
     bbox: Vec<[u8; 4]>,
+    /// The cells of every chain's box.
+    occupied: Occupancy,
     /// Chains dropped by a higher-priority exclusion zone.
     pub removed: usize,
 }
@@ -64,6 +106,7 @@ impl MergedRoads {
             start: vec![0],
             class: vec![],
             bbox: vec![],
+            occupied: Box::new([0; CELLS * ROW_WORDS]),
             removed: 0,
         }
     }
@@ -98,6 +141,7 @@ impl MergedRoads {
             + self.start.len() * 4
             + self.class.len()
             + self.bbox.len() * 4
+            + OCCUPANCY_BYTES
             + FIXED_BYTES
     }
 
@@ -128,10 +172,13 @@ impl MergedRoads {
         b[2] >= q.south && b[0] <= q.north && b[3] >= q.west && b[1] <= q.east
     }
 
-    /// Whether any chain's box meets the box (absolute degrees).
+    /// Whether any chain's box meets the box (absolute degrees). Two cell
+    /// boxes meet exactly when they share a cell, so the occupancy map
+    /// gives the answer a scan of every chain's box would.
     pub fn crosses(&self, south: f64, west: f64, north: f64, east: f64) -> bool {
-        self.query(south, west, north, east)
-            .is_some_and(|q| (0..self.len()).any(|i| self.in_box(i, &q)))
+        self.query(south, west, north, east).is_some_and(|q| {
+            spans(q.south, q.west, q.north, q.east).any(|(i, mask)| self.occupied[i] & mask != 0)
+        })
     }
 }
 
@@ -187,7 +234,11 @@ impl Merger {
             }
             out.start.push(out.lon.len() as u32);
             out.class.push(class);
-            out.bbox.push(b.map(cell_of));
+            let [s, w, n, e] = b.map(cell_of);
+            for (i, mask) in spans(s, w, n, e) {
+                out.occupied[i] |= mask;
+            }
+            out.bbox.push([s, w, n, e]);
         }
         self.zones.extend(layer.exclusions.iter().cloned());
     }
@@ -475,8 +526,89 @@ mod tests {
             &[],
         ));
         let r = m.finish();
-        let expect = 5 * 2 + 5 * 2 + 3 * 4 + 2 + 2 * 4 + FIXED_BYTES;
+        let expect = 5 * 2 + 5 * 2 + 3 * 4 + 2 + 2 * 4 + OCCUPANCY_BYTES + FIXED_BYTES;
         assert_eq!(r.bytes(), expect);
-        assert_eq!(MergedRoads::empty((0, 0)).bytes(), 4 + FIXED_BYTES);
+        assert_eq!(
+            MergedRoads::empty((0, 0)).bytes(),
+            4 + OCCUPANCY_BYTES + FIXED_BYTES
+        );
+        assert_eq!(OCCUPANCY_BYTES, 8192, "256 x 256 cells, one bit each");
+    }
+
+    /// The per-chain answer `crosses` must equal: any chain's cell box
+    /// meets the query's.
+    fn crosses_scan(r: &MergedRoads, south: f64, west: f64, north: f64, east: f64) -> bool {
+        r.query(south, west, north, east)
+            .is_some_and(|q| (0..r.len()).any(|i| r.in_box(i, &q)))
+    }
+
+    /// `n` chains of 2 to 4 points; one in eight spans up to half the tile,
+    /// the rest stay within a few cells, some on the tile edges.
+    fn random_chains(seed: u64, n: i64) -> Vec<Vec<(f32, f32)>> {
+        (0..n)
+            .map(|k| {
+                let reach = if hash2(k, 0, seed) % 8 == 0 {
+                    0.5
+                } else {
+                    0.02
+                };
+                let edge = |v: f64, h: u64| match h % 16 {
+                    0 => 0.0,
+                    1 => 1.0,
+                    _ => v,
+                };
+                let (x, y) = (
+                    edge(unit(hash2(k, 1, seed)), hash2(k, 2, seed)),
+                    edge(unit(hash2(k, 3, seed)), hash2(k, 4, seed)),
+                );
+                let points = 2 + (hash2(k, 5, seed) % 3) as i64;
+                (0..points)
+                    .map(|m| {
+                        let dx = (unit(hash2(k, 10 + m, seed)) - 0.5) * reach;
+                        let dy = (unit(hash2(k, 20 + m, seed)) - 0.5) * reach;
+                        (
+                            (x + dx).clamp(0.0, 1.0) as f32,
+                            (y + dy).clamp(0.0, 1.0) as f32,
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn crosses_answers_exactly_as_the_chain_scan() {
+        let (lat0, lon0) = (46.0, 6.0);
+        for (seed, n) in [(1u64, 0i64), (2, 1), (3, 12), (4, 400), (5, 3000)] {
+            let chains = random_chains(seed, n);
+            let input: Vec<(u8, &[(f32, f32)])> = chains.iter().map(|c| (100u8, &c[..])).collect();
+            let r = merged_of(&input);
+            let mut hits = 0;
+            for k in 0..4000i64 {
+                // Boxes from a point to a few cells, some reaching past the
+                // tile, some wholly outside it, some on its edges.
+                let size = [0.0, 1e-5, 0.002, 0.02, 0.3][(hash2(k, 30, seed) % 5) as usize];
+                let (x, y) = (
+                    unit(hash2(k, 31, seed)) * 1.2 - 0.1,
+                    unit(hash2(k, 32, seed)) * 1.2 - 0.1,
+                );
+                let (w, h) = (
+                    unit(hash2(k, 33, seed)) * size,
+                    unit(hash2(k, 34, seed)) * size,
+                );
+                let b = match k % 50 {
+                    0 => (lat0, lon0, lat0 + 1.0, lon0 + 1.0),
+                    1 => (lat0 + 1.0, lon0 + 1.0, lat0 + 1.0, lon0 + 1.0),
+                    2 => (lat0, lon0, lat0, lon0),
+                    _ => (lat0 + y, lon0 + x, lat0 + y + h, lon0 + x + w),
+                };
+                let want = crosses_scan(&r, b.0, b.1, b.2, b.3);
+                assert_eq!(r.crosses(b.0, b.1, b.2, b.3), want, "seed {seed} box {k}");
+                hits += usize::from(want);
+            }
+            if n >= 400 {
+                assert!(hits > 100, "seed {seed}: the boxes must meet chains too");
+            }
+        }
     }
 }

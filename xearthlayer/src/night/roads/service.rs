@@ -913,6 +913,16 @@ mod tests {
         }
     }
 
+    /// A tile-cache budget that holds `tiles` test tiles of at most two
+    /// chains of two points each, whatever a tile's fixed overhead is. The
+    /// tests that use it assert their real tiles fit it.
+    fn budget_for(tiles: usize) -> u64 {
+        // Per chain: two points of two u16 offsets, a start, a class byte
+        // and a four-cell box.
+        let chain = 2 * 2 * 2 + 4 + 1 + 4;
+        (tiles * (MergedRoads::empty(TILE).bytes() + 2 * chain)) as u64
+    }
+
     /// The disk cache's entry count once pending writes and maintenance ran.
     async fn entries(svc: &RoadService, d: &Arc<dyn Cache>) -> u64 {
         svc.writes_settled().await;
@@ -1237,7 +1247,7 @@ mod tests {
             other,
             &[("High", Some(h.bytes())), ("Low", Some(l.bytes()))],
         );
-        let budget = 150;
+        let budget = budget_for(1);
         let c = RoadServiceConfig {
             tile_cache_bytes: budget,
             ..config(5_000, 5_000, 0)
@@ -1246,13 +1256,17 @@ mod tests {
         let a = svc.footprint(&[TILE], Purpose::Probe).await;
         let b = svc.footprint(&[other], Purpose::Probe).await;
         assert!(a.complete && b.complete);
-        assert!(a.tiles[0].bytes() + b.tiles[0].bytes() > budget as usize);
+        let (wa, wb) = (a.tiles[0].bytes() as u64, b.tiles[0].bytes() as u64);
+        assert!(wa <= budget && wb <= budget, "either tile alone fits");
+        assert!(wa + wb > budget, "both do not");
         svc.tiles.run_pending_tasks().await;
         assert!(svc.tiles.weighted_size() <= budget);
-        let evicted = [TILE, other]
+        let ready: Vec<_> = [TILE, other]
             .into_iter()
-            .find(|&t| !svc.is_ready(t))
-            .expect("one tile evicted");
+            .filter(|&t| svc.is_ready(t))
+            .collect();
+        assert_eq!(ready.len(), 1, "exactly one tile kept");
+        let evicted = if ready[0] == TILE { other } else { TILE };
         let r = svc.footprint(&[evicted], Purpose::Probe).await;
         assert!(r.complete);
         assert_eq!(r.tiles[0].len(), 2);
@@ -1268,15 +1282,23 @@ mod tests {
         let mut h = Builder::new(47, 6);
         h.road(47, 6, 100, &[(6.1, 47.1), (6.2, 47.2)]);
         write_install(t.path(), other, &[("High", Some(h.bytes()))]);
+        let budget = budget_for(1);
         let c = RoadServiceConfig {
-            tile_cache_bytes: 120,
+            tile_cache_bytes: budget,
             ..config(5_000, 5_000, 0)
         };
         let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let mut old = 0;
         for _ in 0..5 {
-            assert!(svc.footprint(&[TILE], Purpose::Probe).await.complete);
+            let r = svc.footprint(&[TILE], Purpose::Probe).await;
+            assert!(r.complete);
+            old = r.tiles[0].bytes() as u64;
         }
-        assert!(svc.footprint(&[other], Purpose::Probe).await.complete);
+        let new = svc.footprint(&[other], Purpose::Probe).await;
+        assert!(new.complete);
+        let new = new.tiles[0].bytes() as u64;
+        assert!(old <= budget && new <= budget, "either tile alone fits");
+        assert!(old + new > budget, "both do not");
         svc.tiles.run_pending_tasks().await;
         assert!(svc.is_ready(other));
         assert!(!svc.is_ready(TILE));
