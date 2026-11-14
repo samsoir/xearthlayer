@@ -22,10 +22,42 @@ use crate::night::footprint::{Footprint, TILES_PER_TEXTURE};
 use crate::night::generator::noise::{hash2, unit};
 use crate::night::generator::tiling::{mercator, EARTH_RADIUS_M};
 
-/// How far outside a footprint a road can still light it, in degrees;
-/// covers the widest class reach (half width + 3 sigma, about 38 m) at any
-/// latitude lit textures exist for.
-pub const ROAD_REACH_DEG: f64 = 0.002;
+/// The cosine of the highest latitude [`reach_deg`] divides by.
+const COS_REACH_FLOOR: f64 = 0.087_155_742_747_658_17; // cos 85 degrees
+
+/// How far outside the footprint of `name` a road can still light a texel
+/// of a `size` x `size` raster, in degrees, for either axis: the widest
+/// reach of any class (half width + 3 sigma, with the sigma never below a
+/// texel's ground size) over the least metres per degree (longitude, at the
+/// footprint's highest latitude). Cheap and allocation free: only the
+/// footprint's edges are needed. The raster culls with it and the has-light
+/// probe must use it too, so the two cannot disagree.
+pub fn reach_deg(name: &DdsFilename, size: u32, model: &RoadModel) -> f64 {
+    let fp = Footprint::from_name(name);
+    let metres_per_degree = EARTH_RADIUS_M.to_radians();
+    // A texel's ground size is widest on the footprint row nearest the equator.
+    let nearest = if fp.south <= 0.0 && fp.north >= 0.0 {
+        0.0
+    } else {
+        fp.south.abs().min(fp.north.abs())
+    };
+    let texel_max = metres_per_degree * 360.0 * f64::from(TILES_PER_TEXTURE)
+        / f64::from(1u32 << name.zoom)
+        / f64::from(size.max(1))
+        * nearest.to_radians().cos();
+    let glow = model
+        .classes
+        .iter()
+        .map(|p| f64::from(p.half_width_m) + 3.0 * f64::from(p.sigma_m).max(texel_max))
+        .fold(0.0, f64::max);
+    let lamps = model
+        .rural_lamps
+        .map_or(0.0, |l| 3.0 * f64::from(l.sigma_m).max(texel_max));
+    let reach_m = glow.max(lamps);
+    let highest = fp.south.abs().max(fp.north.abs()) + reach_m / metres_per_degree;
+    let cos = highest.min(90.0).to_radians().cos().max(COS_REACH_FLOOR);
+    reach_m / (metres_per_degree * cos)
+}
 
 const LAMP_SEED: u64 = 0x524F_4144_4C41_4D50;
 
@@ -63,6 +95,7 @@ impl RoadField {
 
     /// The glow at texel (`row`, `col`), 0 when nothing reaches it.
     pub fn at(&self, row: u32, col: u32) -> f32 {
+        debug_assert!(row < self.size && col < self.size);
         self.profile
             .get(row as usize * self.size as usize + col as usize)
             .copied()
@@ -88,25 +121,28 @@ impl RoadField {
             return Self::empty(size);
         }
         let fp = Footprint::from_name(name);
-        let mut canvas = Canvas::new(Grid::new(name, size));
+        let reach = reach_deg(name, size, model);
+        // Built when the first tile with a chain near the footprint turns up.
+        let mut canvas: Option<Canvas> = None;
         let mut pts: Vec<(f64, f64)> = Vec::new();
         let mut segments = 0usize;
         for tile in tiles {
             if !tile.crosses(
-                fp.south - ROAD_REACH_DEG,
-                fp.west - ROAD_REACH_DEG,
-                fp.north + ROAD_REACH_DEG,
-                fp.east + ROAD_REACH_DEG,
+                fp.south - reach,
+                fp.west - reach,
+                fp.north + reach,
+                fp.east + reach,
             ) {
                 continue;
             }
+            let canvas = canvas.get_or_insert_with(|| Canvas::new(Grid::new(name, size)));
             let (lat0, lon0) = (f64::from(tile.tile.0), f64::from(tile.tile.1));
             // The footprint and its reach as offsets from the tile corner.
             let want = [
-                (fp.south - ROAD_REACH_DEG - lat0) as f32,
-                (fp.west - ROAD_REACH_DEG - lon0) as f32,
-                (fp.north + ROAD_REACH_DEG - lat0) as f32,
-                (fp.east + ROAD_REACH_DEG - lon0) as f32,
+                (fp.south - reach - lat0) as f32,
+                (fp.west - reach - lon0) as f32,
+                (fp.north + reach - lat0) as f32,
+                (fp.east + reach - lon0) as f32,
             ];
             for (ci, b) in tile.bbox.iter().enumerate() {
                 if b[2] < want[0] || b[0] > want[2] || b[3] < want[1] || b[1] > want[3] {
@@ -130,12 +166,18 @@ impl RoadField {
                 }
             }
         }
-        let profile = canvas.profile;
-        let lit_texels = profile.iter().filter(|v| **v > 0.0).count();
+        let Some(canvas) = canvas else {
+            return Self::empty(size);
+        };
+        let lit_texels = canvas.lit;
         Self {
             size,
             // A window can reach the grid without lighting a texel.
-            profile: if lit_texels == 0 { Vec::new() } else { profile },
+            profile: if lit_texels == 0 {
+                Vec::new()
+            } else {
+                canvas.profile
+            },
             stats: RoadFieldStats {
                 segments,
                 raster_us: started.elapsed().as_micros() as u64,
@@ -213,6 +255,8 @@ impl Grid {
 struct Canvas {
     grid: Grid,
     profile: Vec<f32>,
+    /// Texels above zero so far.
+    lit: usize,
 }
 
 impl Canvas {
@@ -220,6 +264,7 @@ impl Canvas {
         Self {
             grid,
             profile: Vec::new(),
+            lit: 0,
         }
     }
 
@@ -311,6 +356,7 @@ impl Canvas {
                     intensity * (d * d * neg_inv_two_s2).exp() as f32
                 };
                 if v > *cell {
+                    self.lit += usize::from(*cell == 0.0);
                     *cell = v;
                 }
             }
@@ -474,6 +520,106 @@ pub(crate) mod tests {
         let lamps = RoadField::raster(&n, 1024, &[roads], &lamp_model);
         assert!(lamps.stats.lit_texels > 0);
         assert!(lamps.stats.lit_texels < glow.stats.lit_texels);
+    }
+
+    #[test]
+    fn a_road_just_outside_a_coarse_footprint_still_lights_its_border() {
+        // At ZL12 and 1024 px a texel is about 100 m, so a glow reaches
+        // over 300 m: a road 200 m west of the footprint lights its edge.
+        let n = name_at_zoom(46.5, 6.5, 12);
+        let f = Footprint::from_name(&n);
+        let lat_mid = ((f.north + f.south) / 2.0).to_radians();
+        let lon = f.west - (200.0 / (EARTH_RADIUS_M * lat_mid.cos())).to_degrees();
+        let tile = (f.south.floor() as i32, f.west.floor() as i32);
+        let road = merged(
+            tile,
+            &[(100, vec![(lon, f.north + 0.01), (lon, f.south - 0.01)])],
+        );
+        let field = RoadField::raster(&n, 1024, &[road], &RoadModel::DEFAULT);
+        assert!(field.at(512, 0) > 0.0, "border texel lit");
+        assert!(field.at(512, 1023) == 0.0);
+    }
+
+    #[test]
+    fn the_reach_grows_with_the_texel_and_is_small_at_zl16() {
+        let m = RoadModel::DEFAULT;
+        let z16 = name_at_zoom(46.5, 6.5, 16);
+        let z12 = name_at_zoom(46.5, 6.5, 12);
+        let fine = reach_deg(&z16, 1024, &m);
+        // 38 m of reach over 76 km of a degree of longitude at 46.5 N.
+        assert!((0.0004..0.0007).contains(&fine), "{fine}");
+        assert!(
+            reach_deg(&z16, 128, &m) > fine,
+            "a coarser texel reaches further"
+        );
+        assert!(
+            reach_deg(&z12, 1024, &m) > fine,
+            "a lower zoom reaches further"
+        );
+        let lamps = RoadModel {
+            rural_lamps: Some(LampParams::TEST),
+            ..m
+        };
+        assert!(reach_deg(&z16, 1024, &lamps) >= fine);
+        // Never divides by zero near a pole.
+        let polar = name_at_zoom(84.9, 6.5, 12);
+        assert!(reach_deg(&polar, 64, &m).is_finite());
+    }
+
+    #[test]
+    fn rural_lamps_land_on_the_same_ground_at_any_zoom() {
+        let n16 = name_at_zoom(46.5, 6.5, 16);
+        let f = Footprint::from_name(&n16);
+        let w = f.east - f.west;
+        // A slanted local road through the north-west quarter.
+        let roads = merged(
+            (46, 6),
+            &[(
+                50,
+                vec![
+                    (f.west + 0.2 * w, f.north + 0.01),
+                    (f.west + 0.3 * w, f.south - 0.01),
+                ],
+            )],
+        );
+        let model = RoadModel {
+            rural_lamps: Some(LampParams::TEST),
+            ..RoadModel::DEFAULT
+        };
+        let f16 = RoadField::raster(&n16, 512, &[roads.clone()], &model);
+        let n17 = DdsFilename {
+            row: n16.row * 2,
+            col: n16.col * 2,
+            zoom: 17,
+            ..n16.clone()
+        };
+        let f17 = RoadField::raster(&n17, 256, &[roads], &model);
+        let mut lit = 0;
+        for i in 0..256 {
+            for j in 0..256 {
+                assert!((f16.at(i, j) - f17.at(i, j)).abs() < 1e-4, "texel {i},{j}");
+                lit += usize::from(f17.at(i, j) > 0.0);
+            }
+        }
+        assert!(lit > 20, "the shared quarter holds lamps: {lit}");
+    }
+
+    #[test]
+    fn a_window_that_reaches_the_grid_but_lights_nothing_leaves_no_profile() {
+        // A slanted road passing north-west of the footprint: its box
+        // overlaps the grid corner, the road itself is 2 km away.
+        let n = name_at_zoom(46.5, 6.5, 16);
+        let f = Footprint::from_name(&n);
+        let road = merged(
+            (46, 6),
+            &[(
+                100,
+                vec![(f.west - 0.02, f.north), (f.west + 0.04, f.north + 0.06)],
+            )],
+        );
+        let field = RoadField::raster(&n, 256, &[road], &RoadModel::DEFAULT);
+        assert!(field.is_empty() && !field.allocated());
+        assert_eq!(field.stats.segments, 1);
     }
 
     #[test]
