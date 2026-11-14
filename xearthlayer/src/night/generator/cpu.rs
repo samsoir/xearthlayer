@@ -1212,6 +1212,139 @@ mod tests {
         }
     }
 
+    /// Release-build timing of road light from the real road network, at
+    /// 1024 px: the Geneva texture above, and the Tokyo ZL16 texture with
+    /// the most road points in its tile, each generated without roads and
+    /// with the roads the installation's DSFs give (read and merged by the
+    /// road service). Skipped without the installation, the packages or the
+    /// art. Run with `cargo test --release -p xearthlayer --lib
+    /// time_real_roads_on_real_zl16_textures -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn time_real_roads_on_real_zl16_textures() {
+        use crate::night::generator::field::FIELD_MARGIN_DEG;
+        use crate::night::roads::service::tests::real;
+        let packages = "/media/FlightSim/XEarthLayer Packages";
+        let art = "/media/FlightSim/X-Plane 12-beta/Resources/default scenery/1000 world terrain";
+        if !std::path::Path::new(art).is_dir() {
+            println!("no Laminar art at {art}; skipped");
+            return;
+        }
+        let art = crate::night::LaminarArt::new(art.into());
+        let model = RoadModel::DEFAULT;
+        let size = 1024;
+        for (label, pkg, tile) in [
+            ("Geneva", "zzXEL_eu-west_ortho", (46, 6)),
+            ("Tokyo", "zzXEL_as-asia-pacific_ortho", (35, 139)),
+        ] {
+            let pkg = format!("{packages}/{pkg}");
+            let store = crate::night::RecipeStore::new(vec![pkg.clone().into()]);
+            if store.get(tile.0, tile.1).is_none() {
+                println!("{label}: no night recipe for {tile:?} in {pkg}; skipped");
+                continue;
+            }
+            let n = if label == "Geneva" {
+                name_at(46.20, 6.14)
+            } else {
+                let Some(t) = real::merged_roads(&[tile]) else {
+                    return;
+                };
+                densest_zl16(&t[0])
+            };
+            let tiles = Footprint::from_name(&n).expanded(FIELD_MARGIN_DEG).tiles();
+            let Some(roads) = real::merged_roads(&tiles) else {
+                return;
+            };
+            let regions = |a: i32, b: i32| {
+                store
+                    .get_with_region(a, b)
+                    .map_or(LedRegion::Unknown, |(_, r)| r)
+            };
+            let run = |field: &RoadField| {
+                CpuLitGenerator.generate(&LitRequest {
+                    name: &n,
+                    size,
+                    brightness: 1.0,
+                    recipes: &|a, b| store.get(a, b),
+                    patterns: &|c| art.pattern(c),
+                    regions: &regions,
+                    led: &LedModel::DEFAULT,
+                    roads: field,
+                    road_model: &model,
+                })
+            };
+            let raster = || RoadField::raster(&n, size, &roads, &model);
+            /// Minimum and median ms of seven runs.
+            fn timed(mut f: impl FnMut()) -> (f64, f64) {
+                let mut ms: Vec<f64> = (0..7)
+                    .map(|_| {
+                        let started = std::time::Instant::now();
+                        f();
+                        started.elapsed().as_secs_f64() * 1e3
+                    })
+                    .collect();
+                ms.sort_by(f64::total_cmp);
+                (ms[0], ms[3])
+            }
+            // Inflates the recipes and decodes the patterns.
+            let empty = RoadField::empty(size);
+            let dark = run(&empty);
+            let field = raster();
+            let lit = run(&field);
+            let (raster_min, raster_med) = timed(|| {
+                std::hint::black_box(raster());
+            });
+            let (none_min, none_med) = timed(|| {
+                std::hint::black_box(run(&empty));
+            });
+            let (gen_min, gen_med) = timed(|| {
+                std::hint::black_box(run(&field));
+            });
+            let (all_min, all_med) = timed(|| {
+                std::hint::black_box(run(&raster()));
+            });
+            let texels = f64::from(size * size);
+            println!(
+                "{label} {}_{}_ZL{} ({} tiles, {} merged chains): {} segments, \
+                 {} road texels ({:.1}% of the texture); lit texels {} without roads, {} with",
+                n.row,
+                n.col,
+                n.zoom,
+                tiles.len(),
+                roads.iter().map(|r| r.len()).sum::<usize>(),
+                field.stats.segments,
+                field.stats.lit_texels,
+                field.stats.lit_texels as f64 / texels * 100.0,
+                lit_texels(&dark),
+                lit_texels(&lit)
+            );
+            println!(
+                "{label}: raster min {raster_min:.1} ms, median {raster_med:.1} ms; \
+                 generation without roads min {none_min:.1} ms, median {none_med:.1} ms; \
+                 with the field min {gen_min:.1} ms, median {gen_med:.1} ms; \
+                 raster and generation min {all_min:.1} ms, median {all_med:.1} ms \
+                 ({:+.1}% on the median)",
+                (all_med / none_med - 1.0) * 100.0
+            );
+        }
+    }
+
+    /// The ZL16 texture of `roads`' tile that holds the most road points.
+    fn densest_zl16(roads: &crate::night::roads::merge::MergedRoads) -> DdsFilename {
+        let mut counts = std::collections::HashMap::<(u32, u32), usize>::new();
+        for i in 0..roads.len() {
+            for (lon, lat) in roads.points(i) {
+                let n = name_at(lat, lon);
+                *counts.entry((n.row, n.col)).or_default() += 1;
+            }
+        }
+        let ((row, col), _) = counts
+            .into_iter()
+            .max_by_key(|&(k, c)| (c, k))
+            .expect("a tile with roads");
+        name(row, col, 16)
+    }
+
     /// What the service answers for a lit `stat` of `name`.
     fn probe(
         name: &DdsFilename,
