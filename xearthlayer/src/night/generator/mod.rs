@@ -72,7 +72,8 @@ pub trait LitGenerator: Send + Sync {
 /// 6: road lights (`night/roads`).
 /// 7: two-level fade, an eighth then half of the light (`FADE_RAMP`).
 /// 8: the nearest level gives a quarter of the light, not an eighth.
-pub const LIT_GENERATOR_VERSION: u32 = 8;
+/// 9: texels below [`BC1_FLOOR`] encoded black.
+pub const LIT_GENERATOR_VERSION: u32 = 9;
 
 /// Gamma of the sRGB decode X-Plane applies to a texture's stored values.
 pub const SRGB_GAMMA: f32 = 2.2;
@@ -94,22 +95,43 @@ pub const SRGB_GAMMA: f32 = 2.2;
 /// gave 9% of the light) and before road lights covered the hand-off.
 pub const FADE_RAMP: [f32; 2] = [0.5325, 0.7297];
 
+/// The largest stored R, G or B below which a texel is encoded black. BC1
+/// stores colours as RGB565: below about 4 in stored value red and blue
+/// round to 0 while green keeps a 4, so very dim texels decode green or
+/// purple. Over 20 KCCR ZL16 textures at 1024 px the generator made no
+/// green or purple dim texels, but after BC1 at full light 151,263 texels
+/// decoded green and 61,088 purple. Black below 8 left 3,947 green and
+/// 13,585 purple, and kept 0.916 of the decoded light against 0.960
+/// without (flight 7, 2026-11-14).
+pub const BC1_FLOOR: u8 = 8;
+
 /// BC1-encode the first visible level and its mip chain down to 1 x 1, as
 /// the bytes that follow the blank levels in a lit DDS (no header). The
 /// chain is downsampled from the undimmed image, then the levels named by
-/// [`FADE_RAMP`] are dimmed, so the levels below them stay at full light.
+/// [`FADE_RAMP`] are dimmed, so the levels below them stay at full light,
+/// and every level is floored at [`BC1_FLOOR`] after its dimming.
 pub fn encode_visible(image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsError> {
     let mut chain = lit_chain(&image);
-    for (level, &gain) in chain.iter_mut().zip(FADE_RAMP.iter()) {
-        for px in level.pixels_mut() {
-            for c in &mut px.0[..3] {
-                *c = (f32::from(*c) * gain).round() as u8;
-            }
-        }
+    for (n, level) in chain.iter_mut().enumerate() {
+        dim(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
     }
     let dds =
         crate::dds::DdsEncoder::new(crate::dds::DdsFormat::BC1).encode_with_mipmaps(&chain)?;
     Ok(bytes::Bytes::from(dds).slice(DDS_HEADER_LEN..))
+}
+
+/// Scales a level's stored R, G and B by `gain`, then turns black every
+/// texel whose largest of them is below [`BC1_FLOOR`]. Alpha is untouched.
+fn dim(level: &mut RgbaImage, gain: f32) {
+    for px in level.pixels_mut() {
+        let rgb = &mut px.0[..3];
+        for c in rgb.iter_mut() {
+            *c = (f32::from(*c) * gain).round() as u8;
+        }
+        if rgb.iter().all(|&c| c < BC1_FLOOR) {
+            rgb.fill(0);
+        }
+    }
 }
 
 /// The mip chain of a lit level down to 1 x 1, averaged in linear light.
@@ -170,8 +192,8 @@ mod tests {
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
 
     #[test]
-    fn a_quarter_at_the_nearest_level_is_generator_version_eight() {
-        assert_eq!(LIT_GENERATOR_VERSION, 8);
+    fn the_bc1_floor_is_generator_version_nine() {
+        assert_eq!(LIT_GENERATOR_VERSION, 9);
     }
 
     fn name_at(lat: f64, lon: f64) -> DdsFilename {
@@ -248,6 +270,61 @@ mod tests {
         assert!(
             reds[2..].iter().all(|&r| near(r, 240.0)),
             "full below {reds:?}"
+        );
+    }
+
+    /// The decoded RGB of the first texel of each level of a BC1 chain.
+    fn level_rgbs(payload: &[u8], top: u32) -> Vec<[u8; 3]> {
+        let (mut at, mut size, mut rgbs) = (0, top, Vec::new());
+        while size >= 1 {
+            let mut rgba = [0u8; 4 * 4 * 4];
+            bcdec_rs::bc1(&payload[at..at + 8], &mut rgba, 16);
+            rgbs.push([rgba[0], rgba[1], rgba[2]]);
+            at += (size.div_ceil(4) * size.div_ceil(4) * 8) as usize;
+            size /= 2;
+        }
+        rgbs
+    }
+
+    fn solid(size: u32, rgb: [u8; 3]) -> RgbaImage {
+        RgbaImage::from_pixel(size, size, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
+    }
+
+    #[test]
+    fn dimming_blacks_out_texels_below_the_floor_and_keeps_alpha() {
+        let mut img = RgbaImage::from_fn(2, 1, |x, _| {
+            if x == 0 {
+                image::Rgba([7, 3, 0, 200])
+            } else {
+                image::Rgba([1, 8, 2, 200])
+            }
+        });
+        dim(&mut img, 1.0);
+        assert_eq!(img.get_pixel(0, 0).0, [0, 0, 0, 200], "largest channel 7");
+        assert_eq!(img.get_pixel(1, 0).0, [1, 8, 2, 200], "largest channel 8");
+    }
+
+    #[test]
+    fn encoded_visible_levels_are_black_below_the_floor_after_their_dimming() {
+        // The levels below the fade are full: 7 is black, 8 is kept.
+        let full = FADE_RAMP.len();
+        assert_eq!(
+            level_rgbs(&encode_visible(solid(64, [7, 3, 2])).unwrap(), 64)[full],
+            [0; 3]
+        );
+        assert_ne!(
+            level_rgbs(&encode_visible(solid(64, [8, 3, 2])).unwrap(), 64)[full],
+            [0; 3]
+        );
+        // The nearest level is floored after its dimming: 14 dims to 7, 15
+        // to 8.
+        assert_eq!(
+            level_rgbs(&encode_visible(solid(64, [14; 3])).unwrap(), 64)[0],
+            [0; 3]
+        );
+        assert_ne!(
+            level_rgbs(&encode_visible(solid(64, [15; 3])).unwrap(), 64)[0],
+            [0; 3]
         );
     }
 
