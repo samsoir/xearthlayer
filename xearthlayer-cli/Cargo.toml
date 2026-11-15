@@ -25,7 +25,10 @@ extended-description = """\
 XEarthLayer delivers satellite/aerial imagery to X-Plane without massive downloads. \
 Instead of pre-downloading thousands of gigabytes of textures, XEarthlayer installs \
 small regional packages and streams textures on-demand as you fly."""
-depends = "$auto, libfuse3-3"
+# The fuse3 crate talks to /dev/fuse itself and links no libfuse; it only runs
+# fusermount3 (package fuse3) to mount without root. Naming the libfuse
+# runtime package broke installs where it was renamed libfuse3-4 (#353).
+depends = "$auto, fuse3"
 section = "games"
 priority = "optional"
 assets = [

@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### Packaging
+
+- **The `.deb` installs on Ubuntu 26.04 and Debian 13** ([#353](https://github.com/samsoir/xearthlayer/issues/353)): The package required `libfuse3-3`, the libfuse runtime library, which these releases replace with `libfuse3-4`, so `apt` refused to install it. XEarthLayer never used that library: it talks to the kernel's FUSE device itself and only runs `fusermount3` to mount without root. The package now requires `fuse3`, which provides `fusermount3` on every Debian and Ubuntu release, as the RPM and Arch packages already did.
+
 #### Dashboard
 
 - **The display server's refusal no longer bleeds into the dashboard** ([#358](https://github.com/samsoir/xearthlayer/issues/358)): In a shell with `DISPLAY` set but no usable `XAUTHORITY`, such as a tmux server older than the desktop session, `xearthlayer run` printed "Authorization required, but no authorization protocol specified" at launch and the line then corrupted the dashboard, and `xearthlayer diagnostics` printed it three times under its GPU section. The line is the X server's reason for refusing a connection, written by libxcb straight to the terminal; the connections came from the Vulkan stack during GPU enumeration (Mesa's device-select layer and the NVIDIA driver open the display when one is named), not from anything XEarthLayer asked for. XEarthLayer never presents to a display and chooses its own adapter, so it now removes `DISPLAY` and `WAYLAND_DISPLAY` from its own environment before anything else runs, which also spares enumeration the display round trips. Separately, while the dashboard is up, stderr is pointed at the flight log, so a warning from any library that writes to it, or a panic message, lands in the log instead of on the screen; the terminal gets it back when the dashboard closes.
