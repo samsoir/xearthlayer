@@ -108,10 +108,15 @@ pub const TOP_GAIN: f32 = 0.3886;
 /// stores colours as RGB565: below about 4 in stored value red and blue
 /// round to 0 while green keeps a 4, so very dim texels decode green or
 /// purple. Over 20 KCCR ZL16 textures at 1024 px the generator made no
-/// green or purple dim texels, but after BC1 at full light 151,263 texels
-/// decoded green and 61,088 purple. Black below 8 left 3,947 green and
-/// 13,585 purple, and kept 0.916 of the decoded light against 0.960
-/// without (flight 7, 2026-11-14).
+/// green or purple dim texels. After BC1 at full light, the flight 7 probe
+/// (every decoded texel of the 20 textures, those whose source was black
+/// included, which block interpolation can decode purple) counted 151,263
+/// green and 61,088 purple; black below 8 left 3,947 green and 13,585
+/// purple and kept 0.916 of the decoded light against 0.960 without. The
+/// first level encoded alone from the undimmed image with real roads,
+/// every decoded texel counted (green when G > max(R, B) + 2, purple when
+/// min(R, B) > G + 2), gave 150,100 green and 22,016 purple, and 3,853
+/// and 13,525 with the floor (flight 7, 2026-11-14).
 pub const BC1_FLOOR: u8 = 8;
 
 /// BC1-encode the first visible level and its mip chain down to 1 x 1, as

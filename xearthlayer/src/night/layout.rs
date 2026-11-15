@@ -101,7 +101,7 @@ impl LitLayout {
         let end = start.saturating_add(u64::from(len)).min(self.total_len);
         let payload_start = self.payload_start();
         LitReach {
-            top: start < payload_start && end > self.uploaded_top_start(),
+            top: start < end && start < payload_start && end > self.uploaded_top_start(),
             payload: start < end && end > payload_start,
         }
     }
@@ -289,6 +289,7 @@ mod lit_tests {
             payload: false,
         };
         assert_eq!(l.reach(top - 1, 2), only_top);
+        assert_eq!(l.reach(top + 8, 0), none, "an empty read inside the top");
         assert_eq!(l.reach(start - 8, 8), only_top);
         let both = LitReach {
             top: true,

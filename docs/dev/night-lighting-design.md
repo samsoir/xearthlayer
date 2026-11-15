@@ -254,7 +254,16 @@ no chain, its stored values scaled by `TOP_GAIN` (`(1/8)^(1/2.2)`, an
 eighth of the light) and floored. Only the textures whose top X-Plane
 loads pay for it: on a KCCR ZL16 texture with real roads (release build)
 raster, generation and BC1 take about 720 ms at 2048 px against about
-190 ms for the payload at 1024 px. Tops are kept in memory
+190 ms for the payload at 1024 px. A top holds a generation permit that
+long, about 3.8 times a payload, so a burst of near textures can delay
+payload generations by a few seconds on 2 to 4 permits, and a read
+spanning the top and the payload waits for both, one after the other.
+Only tops of at most 2048 px a side are generated (`MAX_GENERATED_TOP`,
+the ZL16 top at texture setting 4): tops double per zoom level below 16,
+and a ZL12 top is 16384 px, 128 MiB of BC1 and about 1 GiB of RGBA while
+generating, more than the top cache holds, so it would be generated again
+on every 1 MiB read. A larger top reads as zeros (black, as before it was
+lit) and nothing generates it. Tops are kept in memory
 (`LIT_TOP_CACHE_BYTES`, 64 MiB, 32 ZL16 tops), never on disk, so they
 need no fingerprint, and they follow the payload's rules otherwise: one
 generation per texture however many reads wait on it, under the same
@@ -267,8 +276,9 @@ the fade below is now the dimmed levels alone, and the lit layer no
 longer switches off near the aircraft.
 
 **Fade ramp.** Because X-Plane pages levels in one at a time (fact 7), a
-texture would jump from full light straight to its black top level, and
-was seen to switch off as one visible square. The first visible level
+texture would jump from full light straight to its top level, black
+before the ramp and before the top was lit, and was seen to switch off as
+one visible square. The first visible level
 gives a quarter of the light and the next half (`FADE_RAMP`,
 `(1/4)^(1/2.2)` and `(1/2)^(1/2.2)` in stored value, since X-Plane decodes
 sRGB), so each texture steps from full to half to a quarter, one stop per
@@ -307,12 +317,20 @@ first.
 value red and blue round to 0 while green keeps a 4: very dim texels
 decode green or purple, and in flight 7 (KCCR, 2026-11-14) green and
 purple texels showed in the lit layer. Over 20 KCCR ZL16 textures at
-1024 px the generator itself makes no green or purple dim texels; after
-BC1 at full light 151,263 texels decoded green and 61,088 purple. Every
+1024 px the generator itself makes no green or purple dim texels. Every
 encoded level is therefore floored before BC1, after its dimming: a texel
 whose largest stored R, G or B is below 8 (`BC1_FLOOR`) becomes black,
-its alpha untouched. That left 3,947 green and 13,585 purple texels and
-kept 0.916 of the decoded light, against 0.960 without the floor.
+its alpha untouched. Two counts after BC1 at full light, by two methods
+(green when decoded G > max(R, B) + 2, purple when min(R, B) > G + 2):
+
+| Method | Green | Purple | With the floor |
+|---|---|---|---|
+| Flight 7 probe: every decoded texel of the 20 textures, those whose source was black included (block interpolation can decode them purple) | 151,263 | 61,088 | 3,947 green, 13,585 purple; 0.916 of the decoded light kept, against 0.960 without |
+| The first level encoded alone from the undimmed image with real roads, every decoded texel counted | 150,100 | 22,016 | 3,853 green, 13,525 purple |
+
+At the dimmed levels as served the counts are lower: 1,727 green and
+8,740 purple over the 20 first visible levels at a quarter, and 639 green
+and 4,619 purple over three 2048 px tops at an eighth.
 
 A footprint without light is a fixed **minimal black DDS**: 4 × 4, BC1,
 with its full chain (4, 2 and 1 px levels), all blocks zero, 152 bytes
@@ -1457,7 +1475,9 @@ lights).
   The service generates the top once at twice the first visible size,
   coalesces concurrent top reads, never generates the top for a payload
   read nor the payload for a top read, never touches the disk for a top,
-  and keeps no top whose roads were late.
+  keeps no top whose roads were late, whose recipe is unreadable or whose
+  encode failed, never generates a top above `MAX_GENERATED_TOP` (it reads
+  as zeros), and writes only the payload to disk for a read spanning both.
 - **LED.** Share: the fraction of lit texels that are LED matches the
   model, and a region moves it. Coherence: patches are contiguous, not
   per-texel. Zoom agreement: the LED decision for the same ground agrees at

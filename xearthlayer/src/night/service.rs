@@ -234,6 +234,15 @@ const LIT_PAYLOAD_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 /// textures at KCCR, 2026-11-14).
 const LIT_TOP_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The largest top level generated, in pixels a side: the ZL16 top at
+/// texture setting 4 (2 MiB of BC1). Tops grow 2x per zoom level below 16:
+/// a ZL12 top is 16384 px, 128 MiB of BC1 and about 1 GiB of RGBA while
+/// generating, over the top cache's cap, so it would never be kept and
+/// every 1 MiB read of it would generate it again. A top above the bound
+/// reads as zeros (black, as the top was before it was lit) and nothing
+/// generates it.
+const MAX_GENERATED_TOP: u32 = 2048;
+
 /// Default overall brightness (`night.brightness`).
 pub const DEFAULT_NIGHT_BRIGHTNESS: f64 = 1.0;
 
@@ -409,10 +418,10 @@ impl NightLitSource {
         self
     }
 
-    /// The tiles whose roads can light `name` (see [`road_tiles`]), at the
-    /// size of its first visible level.
-    fn road_tiles(&self, name: &DdsFilename) -> Vec<(i32, i32)> {
-        road_tiles(name, self.layout(name).first_visible, &self.road_model)
+    /// The tiles whose roads can light `name` drawn at `size` texels (see
+    /// [`road_tiles`]).
+    fn road_tiles(&self, name: &DdsFilename, size: u32) -> Vec<(i32, i32)> {
+        road_tiles(name, size, &self.road_model)
     }
 
     /// The ready roads of the tiles that can light `name` drawn at `size`
@@ -425,10 +434,7 @@ impl NightLitSource {
         purpose: Purpose,
     ) -> FootprintRoads {
         match &self.roads {
-            Some(roads) => {
-                let tiles = road_tiles(name, size, &self.road_model);
-                roads.footprint(&tiles, purpose).await
-            }
+            Some(roads) => roads.footprint(&self.road_tiles(name, size), purpose).await,
             None => FootprintRoads {
                 tiles: Vec::new(),
                 complete: true,
@@ -447,8 +453,12 @@ impl NightLitSource {
     }
 
     /// The generated top level of a lit footprint, or `None` (black), under
-    /// the payload's rules but never read from or written to disk.
+    /// the payload's rules but never read from or written to disk. A top
+    /// larger than [`MAX_GENERATED_TOP`] is never generated: black.
     async fn top(&self, name: &DdsFilename, layout: &LitLayout) -> Option<Bytes> {
+        if Part::Top.size(layout) > MAX_GENERATED_TOP {
+            return None;
+        }
         let generate = async { memory_only(self.generate(name.clone(), layout, Part::Top).await) };
         shared(&self.tops, name, generate).await
     }
@@ -563,7 +573,7 @@ impl NightLitSource {
         // the payload is then kept in memory only.
         let roads = match &self.roads {
             Some(roads) => futures::future::join_all(
-                self.road_tiles(name)
+                self.road_tiles(name, self.layout(name).first_visible)
                     .into_iter()
                     .map(|tile| async move { Some((tile, roads.identities(tile).await?)) }),
             )
@@ -1277,6 +1287,84 @@ mod tests {
                 .read(&name, layout.uploaded_top_start() + 4096, 4096)
                 .await;
             assert_eq!(sizes.sizes(), [2048], "once, and never the payload");
+        }
+
+        #[tokio::test]
+        async fn a_top_above_the_bound_reads_as_zeros_and_generates_nothing() {
+            // A ZL15 top is 4096 px; a ZL12 one 16384 px, heavier than the
+            // top cache, so it would regenerate on every read.
+            let (_t, source) = fixture();
+            let sizes = Arc::new(Sizes::default());
+            let source = source.with_generator(sizes.clone());
+            let name = name_at_zoom(37.20, -122.725, 15);
+            let layout = LitLayout::new(15, 4);
+            assert!(layout.first_visible * 2 > MAX_GENERATED_TOP);
+            assert_eq!(source.size(&name).await, layout.total_len, "lit");
+            let top = source.read(&name, layout.uploaded_top_start(), 4096).await;
+            assert_eq!(top.len(), 4096);
+            assert!(top.iter().all(|&b| b == 0), "black, as before");
+            assert!(sizes.sizes().is_empty(), "nothing generated");
+            // The ZL16 top at texture setting 4 is within the bound.
+            assert_eq!(LitLayout::new(16, 4).first_visible * 2, MAX_GENERATED_TOP);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_top_whose_recipe_is_unreadable_is_black_and_not_kept() {
+            let (temp, source) = fixture();
+            let name = name_at(37.20, -122.725);
+            let layout = LitLayout::new(16, 4);
+            if !set_recipe_readable(&temp, false) {
+                return;
+            }
+            assert_eq!(source.top(&name, &layout).await, None);
+            source.tops.run_pending_tasks().await;
+            assert_eq!(source.tops.entry_count(), 0, "nothing cached");
+        }
+
+        /// Draws nothing: an empty image, which the encoder refuses.
+        #[derive(Default)]
+        struct Unencodable(std::sync::atomic::AtomicUsize);
+
+        impl crate::night::generator::LitGenerator for Unencodable {
+            fn generate(&self, _: &crate::night::generator::LitRequest<'_>) -> image::RgbaImage {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                image::RgbaImage::new(0, 0)
+            }
+        }
+
+        #[tokio::test]
+        async fn a_top_whose_encode_fails_is_black_and_not_kept() {
+            let (_t, source) = fixture();
+            let failing = Arc::new(Unencodable::default());
+            let source = source.with_generator(failing.clone());
+            let name = name_at(37.20, -122.725);
+            let layout = LitLayout::new(16, 4);
+            let top = source.read(&name, layout.uploaded_top_start(), 4096).await;
+            assert!(top.iter().all(|&b| b == 0), "black");
+            source.tops.run_pending_tasks().await;
+            assert_eq!(source.tops.entry_count(), 0, "not kept");
+            source.read(&name, layout.uploaded_top_start(), 4096).await;
+            assert_eq!(failing.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn a_read_across_the_top_and_the_payload_writes_only_the_payload_to_disk() {
+            let temp = TempDir::new().unwrap();
+            let d = disk();
+            let source = source_in(&temp)
+                .with_generator(Arc::new(White::default()))
+                .with_disk_cache(d.clone());
+            let name = name_at(37.20, -122.725);
+            let layout = LitLayout::new(16, 4);
+            source.read(&name, layout.payload_start() - 8, 16).await;
+            settle(&d, &name).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let key = crate::night::lit_cache_key(&name);
+            let entry = d.get(&key).await.unwrap().expect("the payload is written");
+            let fp = source.fingerprint(&name).await.unwrap();
+            assert!(crate::night::decode_entry(entry, &fp, layout.payload_len()).is_some());
+            assert_eq!(d.entry_count(), 1, "and nothing else");
         }
 
         #[tokio::test]
