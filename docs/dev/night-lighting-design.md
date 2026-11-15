@@ -64,9 +64,11 @@ Established in the simulator (X-Plane 12 beta, 2026-10-16), not inferred:
    restrained.
 7. X-Plane pages a lit texture's mip levels in one at a time (seen in the
    FUSE reads, 2026-10-18): the first load reads only the small levels at
-   the end of the file, and the first visible level and the blank levels
+   the end of the file, and the first visible level and the top level
    arrive tens of seconds later as the aircraft closes. The mip fade
-   therefore happens per texture, when its blank level is paged in.
+   therefore happens per texture, as each level is paged in, and the
+   level shown is the largest one loaded (fully read for 19 of 1,006
+   ZL16 lit textures, 2026-11-14).
 
 ## Decisions
 
@@ -123,7 +125,7 @@ branch on a bool, see Trigger). Everything else is new code in
 | `night/laminar/ter.rs` | Read a Laminar `.ter`'s lit texture and pattern scale |
 | `night/laminar/art.rs` | `LaminarArt`: name to decoded lit pattern, cached |
 | `night/footprint.rs` | A lit texture's ground footprint |
-| `night/layout.rs` | The lit DDS layout: sizes, blank levels, zero regions |
+| `night/layout.rs` | The lit DDS layout: sizes, the black levels X-Plane drops, the uploaded top built from the first visible level |
 | `night/prefs.rs` | `XPlanePrefs`: the texture quality setting |
 | `night/generator/mod.rs` | The `LitGenerator` trait, `LitRequest`, and `encode_visible` |
 | `night/generator/gain.rs` | The gain curve |
@@ -209,9 +211,11 @@ footprint gives:
 
 With the texture quality setting `t` (0 to 4):
 
-- X-Plane drops `4 − t` top levels at load. XEL blanks
-  `B = (4 − t) + 1` top levels, so the first level X-Plane uploads is
-  black at any setting (R15).
+- X-Plane drops `4 − t` top levels at load. XEL puts
+  `B = (4 − t) + 1` levels above the first visible one (R15): the ones
+  X-Plane drops are black, and the one it uploads (the uploaded top, twice
+  the first visible level's size) repeats the first visible level, each of
+  its texels over 2 × 2 (see Uploaded top below).
 - The first visible level `F` is 1024 px for a ZL16 texture, halving per
   zoom level above 16 and doubling per zoom level below it (512 px at ZL17,
   256 px at ZL18), about 7.5 m per texel throughout.
@@ -224,19 +228,40 @@ With the texture quality setting `t` (0 to 4):
 | 3 | 2 | 4096 | 11.2 MB | 2.8 MB |
 | 2 | 3 | 8192 | 44.7 MB | 2.8 MB |
 
-The cut-out distance is set by the texel size of the blank level
-X-Plane uploads first, so the first visible level stays fixed in metres
-at every setting. This is why lit VRAM does not fall with the texture
-setting. A layout that shrank the visible level with the setting (the
-same file at every setting, VRAM quartered per notch) was flown on
-2026-10-18 and moved the cut-out 2x farther out per notch.
+Where each texture's levels change is set by the texel size of the
+level X-Plane uploads first, so the first visible level stays fixed in
+metres at every setting. This is why lit VRAM does not fall with the
+texture setting. A layout that shrank the visible level with the setting
+(the same file at every setting, VRAM quartered per notch) was flown on
+2026-10-18 and moved the cut-out (the uploaded top was black then) 2x
+farther out per notch.
+
+**Uploaded top.** X-Plane loads a texture's top level only for the
+textures nearest the aircraft, and shows it over the whole texture. In
+the flight of 2026-11-14 at KCCR it fully read the top level of 19 of
+1,006 ZL16 lit textures, the first visible level of 25 more, the next of
+338, and only the small levels of the other 624. While the uploaded top
+was black, the ground under X-Plane's 3D scenery was lit by the 3D
+objects alone, whatever the levels below gave, and dimming the nearest
+visible levels could not change it. The uploaded top now repeats the
+first visible level: each BC1 block of it is one quadrant of a block of
+the first visible level, with that block's two colours and the indices of
+its quadrant, so its light is a quarter, like that level's, and it costs
+no generation, decoding or encoding. It is built per read from the cached
+payload (about 0.8 ms per 1 MiB read, release build) and never stored.
+Its texels are 2 × 2 copies, so it has the first visible level's detail,
+under the 3D lights. The levels X-Plane drops stay black. The earlier
+black top was the distance fade (fact 3); the fade below is now the dimmed
+levels alone, and the lit layer no longer switches off near the
+aircraft.
 
 **Fade ramp.** Because X-Plane pages levels in one at a time (fact 7), a
-texture would jump from full light straight to its blank level, and was
-seen to switch off as one visible square. The first visible level gives
-a quarter of the light and the next half (`FADE_RAMP`, `(1/4)^(1/2.2)` and
-`(1/2)^(1/2.2)` in stored value, since X-Plane decodes sRGB), so each
-texture steps from full to half to a quarter to off, one stop per level.
+texture would jump from full light straight to its black top level, and
+was seen to switch off as one visible square. The first visible level
+gives a quarter of the light and the next half (`FADE_RAMP`,
+`(1/4)^(1/2.2)` and `(1/2)^(1/2.2)` in stored value, since X-Plane decodes
+sRGB), so each texture steps from full to half to a quarter, one stop per
+level, and the uploaded top stays at a quarter.
 The chain is downsampled from the undimmed image, so every coarser level
 is at full light, and the ramp costs no bytes. The nearest level is cut
 back so the ground under X-Plane's 3D roads and lights is only faintly
@@ -271,10 +296,13 @@ A footprint without light is a fixed **minimal black DDS**: 4 × 4, BC1,
 with its full chain (4, 2 and 1 px levels), all blocks zero, 152 bytes
 (R6).
 
-The blank levels are never stored. A lit texture's bytes are
-`header ‖ zero region ‖ payload`, and a read at an offset inside the zero
-region is answered with zeros. Only the payload (the visible levels, about
-0.7 MB for an urban ZL16 texture) is generated, encoded and cached.
+The levels above the first visible one are never stored. A lit
+texture's bytes are `header ‖ zero region ‖ uploaded top ‖ payload`: a read
+inside the zero region (the levels X-Plane drops) is answered with zeros
+and needs no payload, and a read of the uploaded top is built from the
+payload's first level (`LitLayout::read_lit`, `reads_light`). Only the
+payload (the visible levels, about 0.7 MB for an urban ZL16 texture) is
+generated, encoded and cached.
 
 **Risk.** At `t = 0` the top level would be 32768 px. Whether X-Plane
 accepts a header that large, even though it only uploads from level 4
@@ -659,8 +687,8 @@ commercial flags for the category; SDGSAT-1 colour data.
 
 ## Road lights
 
-Close to the aircraft the lit layer cuts out (its blank levels) and
-X-Plane's 3D roads and their lights take over. The lit layer's streets are
+Close to the aircraft X-Plane's 3D roads and their lights take over,
+over the lit layer at a quarter of its light. The lit layer's streets are
 Laminar's pattern art, not real roads, so without road lights a 3D road
 appears where the lit texture showed no road to match, and a road across
 dark countryside, where VIIRS sees nothing and the gain is zero, appears
@@ -1389,8 +1417,9 @@ lights).
   at 128 px and the ZL16 texture covering one quarter of it at 64 px
   agree to within 2 levels per channel); no brightness step appears at a
   degree line, where two tiles' recipes meet; an empty footprint gives
-  the minimal black DDS; blank levels are all zero and the next level is
-  not.
+  the minimal black DDS; the levels X-Plane drops are all zero, and the
+  uploaded top repeats the first visible level texel for texel over
+  2 × 2, at any split of the read.
 - **LED.** Share: the fraction of lit texels that are LED matches the
   model, and a region moves it. Coherence: patches are contiguous, not
   per-texel. Zoom agreement: the LED decision for the same ground agrees at

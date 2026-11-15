@@ -736,11 +736,10 @@ impl LitTextureSource for NightLitSource {
         Box::pin(async move {
             if self.has_light(name).await {
                 let layout = self.layout(name);
-                // Header and blank levels need no pixels; only a read that
-                // reaches the visible levels generates them.
-                let (part, bytes) = if offset >= layout.total_len
-                    || offset.saturating_add(u64::from(len)) <= layout.payload_start()
-                {
+                // The header and the levels X-Plane drops need no pixels;
+                // only a read that reaches the uploaded top level or the
+                // visible levels generates them.
+                let (part, bytes) = if !layout.reads_light(offset, len) {
                     ("blank", layout.read_black(offset, len))
                 } else {
                     match self.payload(name, &layout).await {
@@ -1003,17 +1002,13 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_lit_footprint_is_full_size_black() {
+        async fn a_lit_footprint_is_full_size() {
             let (_t, source) = fixture();
             let name = name_at(37.20, -122.725); // inside the golden urban block over radiance
             assert_eq!(source.size(&name).await, 2_796_344);
             let head = source.read(&name, 0, 128).await;
             assert_eq!(&head[0..4], b"DDS ");
-            assert!(source
-                .read(&name, 1_000_000, 4096)
-                .await
-                .iter()
-                .all(|&b| b == 0));
+            assert_eq!(source.read(&name, 1_000_000, 4096).await.len(), 4096);
         }
 
         #[tokio::test]
@@ -1036,8 +1031,8 @@ mod tests {
                 "short read at EOF"
             );
             assert!(visible.iter().any(|&b| b != 0), "generated light");
-            let blank = source.read(&name, 128, 4096).await;
-            assert!(blank.iter().all(|&b| b == 0), "the fade level stays black");
+            let top = source.read(&name, 128, 1 << 20).await;
+            assert!(top.iter().any(|&b| b != 0), "the uploaded top level is lit");
         }
 
         #[tokio::test]
