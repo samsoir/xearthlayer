@@ -113,6 +113,8 @@ fn read_7z(
 }
 
 /// Reads the roads of a DSF of `len` bytes from `reader`, forward only.
+/// Tests only: production goes through [`read_dsf_file`].
+#[cfg(test)]
 pub fn read_dsf_stream(
     reader: &mut dyn Read,
     len: u64,

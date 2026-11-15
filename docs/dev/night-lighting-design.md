@@ -216,7 +216,7 @@ With the texture quality setting `t` (0 to 4):
   `B = (4 − t) + 1` levels above the first visible one (R15): the ones
   X-Plane drops are black, and the one it uploads (the uploaded top, twice
   the first visible level's size) is generated at its own size, at a
-  twelfth of the light (see Uploaded top below).
+  twelfth of the light, up to `MAX_GENERATED_TOP` (see Uploaded top below).
 - The first visible level `F` is 1024 px for a ZL16 texture, halving per
   zoom level above 16 and doubling per zoom level below it (512 px at ZL17,
   256 px at ZL18), about 7.5 m per texel throughout.
@@ -275,7 +275,11 @@ kept when a recipe cannot be read or the encode fails. A read that
 reaches only the payload never generates the top, and the other way
 round. The levels X-Plane drops stay black. The earlier black top was
 the distance fade (fact 3); the fade below is now the dimmed levels
-alone, and the lit layer no longer switches off near the aircraft.
+alone, and where the top is generated the lit layer no longer switches
+off near the aircraft. The top is generated only up to `MAX_GENERATED_TOP`
+(2048 px, ZL16 and finer at setting 4); at ZL12 to ZL15 it is larger,
+reads as zeros and stays black, so the lit layer still switches off right
+around the aircraft there.
 
 **Fade ramp.** Because X-Plane pages levels in one at a time (fact 7), a
 texture would jump from full light straight to its top level, black
@@ -790,7 +794,8 @@ commercial flags for the category; SDGSAT-1 colour data.
 
 Close to the aircraft X-Plane's 3D roads and their lights take over,
 over the lit layer at a quarter of its light, and at a twelfth on the
-nearest textures, whose generated top level X-Plane uploads. The lit layer's streets are
+nearest textures whose top is generated (up to `MAX_GENERATED_TOP`, so not
+at ZL12 to ZL15), whose top level X-Plane uploads. The lit layer's streets are
 Laminar's pattern art, not real roads, so without road lights a 3D road
 appears where the lit texture showed no road to match, and a road across
 dark countryside, where VIIRS sees nothing and the gain is zero, appears
@@ -1368,8 +1373,9 @@ Merge), `road_raster_us`, `road_texels`, `roads_complete` and
 carries the same fields for a generated top. `Night lighting: lit probe`
 gains `roads_complete` and `roads_timed_out`. `Night lighting: lit read`
 names the parts a read reached in `part`: `blank` (header or dropped
-levels), `top`, `lit` (payload) or `top+lit`, with `top black`, `black`
-or `top+lit black` when a part it reached was served black. `cache_misses` counts 7z overlays read from their file
+levels), `top`, `lit` (payload) or `top+lit`, with `top black`, `black`,
+`top black+lit`, `top+black` or `top black+black` when a part it reached
+was served black. `cache_misses` counts 7z overlays read from their file
 with a disk tier present; a base mesh read to its HEAD is not one.
 
 ### Measured cost

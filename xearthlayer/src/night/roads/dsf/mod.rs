@@ -27,7 +27,9 @@ mod walk;
 #[cfg(test)]
 pub(crate) mod test_dsf;
 
-pub use stream::{read_dsf_file, read_dsf_stream};
+pub use stream::read_dsf_file;
+#[cfg(test)]
+pub use stream::read_dsf_stream;
 
 pub const MAX_DSF_BYTES: usize = 512 * 1024 * 1024;
 /// Ceiling on any one atom body the reader keeps (HEAD, DEFN, a PO32, an
@@ -133,7 +135,9 @@ pub enum ReadMode {
     /// A DSF that is not an overlay (a base mesh) stops right after HEAD:
     /// its `DsfRoads` has `overlay == false`, no network and no chains.
     OverlaysOnly,
-    /// Every DSF is read until its roads are known.
+    /// Every DSF is read until its roads are known. Tests only: production
+    /// reads overlays, and a base mesh only to its HEAD.
+    #[cfg(test)]
     Any,
 }
 
@@ -152,7 +156,8 @@ pub struct DsfFileStats {
     pub walk_visits: u64,
 }
 
-/// [`read_dsf_stream`] over a DSF already in memory, read in full.
+/// [`read_dsf_stream`] over a DSF already in memory, read in full. Tests only.
+#[cfg(test)]
 pub fn read_dsf(bytes: &[u8], keep: impl Fn(u8) -> bool) -> Result<DsfRoads, DsfError> {
     read_dsf_stream(&mut &bytes[..], bytes.len() as u64, keep, ReadMode::Any)
 }

@@ -1,4 +1,5 @@
-//! The lit generator: the first visible level of a lit texture, as pixels.
+//! The lit generator: a level of a lit texture (the first visible level, or
+//! the uploaded top at twice its size), as pixels.
 //!
 //! `LitGenerator` is the seam for other implementations (a GPU one later,
 //! R17); `CpuLitGenerator` is the one in use.
@@ -38,7 +39,8 @@ pub type PatternLookup<'a> = &'a (dyn Fn(&str) -> Option<Arc<LitPattern>> + Sync
 pub struct LitRequest<'a> {
     /// The lit texture's name: its footprint and zoom.
     pub name: &'a DdsFilename,
-    /// Width and height of the first visible level, in pixels.
+    /// Width and height of the level to generate, in pixels: the first
+    /// visible level, or the uploaded top at twice that size.
     pub size: u32,
     /// `night.brightness`.
     pub brightness: f64,
@@ -55,7 +57,8 @@ pub struct LitRequest<'a> {
     pub road_model: &'a RoadModel,
 }
 
-/// Produces the first visible level of a lit texture.
+/// Produces a level of a lit texture: the first visible level, or the
+/// uploaded top at twice its size.
 pub trait LitGenerator: Send + Sync {
     /// `size` x `size` pixels, north up, black wherever nothing is lit.
     fn generate(&self, request: &LitRequest<'_>) -> RgbaImage;
@@ -299,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_visible_level_is_dimmed_and_the_rest_are_full() {
+    fn the_two_fade_levels_are_dimmed_and_the_rest_are_full() {
         let img = RgbaImage::from_pixel(64, 64, image::Rgba([240, 240, 240, 255]));
         let reds = level_reds(&encode_visible(img).unwrap(), 64);
         assert_eq!(reds.len(), 7, "64 px down to 1 px");

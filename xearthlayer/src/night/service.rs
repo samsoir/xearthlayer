@@ -814,7 +814,9 @@ fn read_part(reach: LitReach, top: bool, payload: bool) -> &'static str {
         (None, Some(true)) => "lit",
         (None, Some(false)) => "black",
         (Some(true), Some(true)) => "top+lit",
-        (Some(_), Some(_)) => "top+lit black",
+        (Some(false), Some(true)) => "top black+lit",
+        (Some(true), Some(false)) => "top+black",
+        (Some(false), Some(false)) => "top black+black",
     }
 }
 
@@ -901,6 +903,24 @@ impl LitTextureSource for NightLitSource {
 mod tests {
     use super::*;
     use crate::fuse::{DdsFilename, TextureKind};
+
+    #[test]
+    fn every_outcome_of_a_read_has_its_own_part_value() {
+        let both = LitReach {
+            top: true,
+            payload: true,
+        };
+        let parts: Vec<_> = [(true, true), (false, true), (true, false), (false, false)]
+            .into_iter()
+            .map(|(top, payload)| read_part(both, top, payload))
+            .collect();
+        for (i, a) in parts.iter().enumerate() {
+            for b in &parts[i + 1..] {
+                assert_ne!(a, b, "{parts:?}");
+            }
+        }
+        assert_eq!(parts[0], "top+lit");
+    }
 
     fn lit() -> DdsFilename {
         DdsFilename {

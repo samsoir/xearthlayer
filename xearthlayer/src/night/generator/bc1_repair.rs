@@ -19,21 +19,21 @@ use super::BC1_FLOOR;
 /// than this, purple when R and B both exceed G by more. A margin of 4 misses
 /// the commonest codes, `(8, 4, 8)` and `(16, 12, 16)`, which differ by 4 yet
 /// carry 4.6 and 1.9 times the green's light in red and blue.
-pub const TINT_MARGIN: i32 = 2;
+const TINT_MARGIN: i32 = 2;
 
 /// Weight of a texel's chroma error (in R - G and B - G) against its
 /// luminance error.
-pub const CHROMA_WEIGHT: f32 = 4.0;
+const CHROMA_WEIGHT: f32 = 4.0;
 
 /// Error added for a texel that decodes with a tint its source does not
 /// have: larger than any colour error near black, so a repair removes the
 /// tint first.
-pub const TINT_PENALTY: f32 = 1000.0;
+const TINT_PENALTY: f32 = 1000.0;
 
 /// Most sweeps of the endpoint search over one block. Every kept step
 /// strictly lowers the block's error, so the search ends anyway; the cap
 /// bounds its cost. Over the flight 9 probe's 25 encodes it never bound.
-pub const MAX_SWEEPS: usize = 64;
+const MAX_SWEEPS: usize = 64;
 
 /// Bytes of one BC1 block.
 const BLOCK_BYTES: usize = 8;
@@ -67,7 +67,7 @@ fn tint([r, g, b]: [u8; 3]) -> Tint {
 
 /// Whether `decoded` is lit (its largest channel at least [`BC1_FLOOR`]) and
 /// tinted green or purple where `source` is not tinted the same way.
-pub fn introduced(decoded: [u8; 3], source: [u8; 3]) -> bool {
+fn introduced(decoded: [u8; 3], source: [u8; 3]) -> bool {
     let t = tint(decoded);
     decoded.iter().max().is_some_and(|&m| m >= BC1_FLOOR) && t != Tint::None && t != tint(source)
 }
