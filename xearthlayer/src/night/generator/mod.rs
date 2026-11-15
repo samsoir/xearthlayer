@@ -95,6 +95,15 @@ pub const SRGB_GAMMA: f32 = 2.2;
 /// gave 9% of the light) and before road lights covered the hand-off.
 pub const FADE_RAMP: [f32; 2] = [0.5325, 0.7297];
 
+/// Scale of the stored values of the top level X-Plane uploads (twice the
+/// first visible level's size, generated on its own): an eighth of the
+/// light, `(1/8) ^ (1/2.2)`. X-Plane loads that level only for the textures
+/// nearest the aircraft and shows it over the whole texture, under its 3D
+/// scenery. Built from the first visible level it gave a quarter of the
+/// light in 2 x 2 copies of 7.5 m texels, and in flight 7 (KCCR,
+/// 2026-11-14) that near field was too bright and too coarse.
+pub const TOP_GAIN: f32 = 0.3886;
+
 /// The largest stored R, G or B below which a texel is encoded black. BC1
 /// stores colours as RGB565: below about 4 in stored value red and blue
 /// round to 0 while green keeps a 4, so very dim texels decode green or
@@ -115,8 +124,20 @@ pub fn encode_visible(image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsE
     for (n, level) in chain.iter_mut().enumerate() {
         dim(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
     }
+    bc1_levels(&chain)
+}
+
+/// BC1-encode `image` as the top level X-Plane uploads: one level, no
+/// chain and no header, at [`TOP_GAIN`] and floored at [`BC1_FLOOR`].
+pub fn encode_top(mut image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsError> {
+    dim(&mut image, TOP_GAIN);
+    bc1_levels(std::slice::from_ref(&image))
+}
+
+/// The BC1 blocks of `levels`, in order, without the DDS header.
+fn bc1_levels(levels: &[RgbaImage]) -> Result<bytes::Bytes, crate::dds::DdsError> {
     let dds =
-        crate::dds::DdsEncoder::new(crate::dds::DdsFormat::BC1).encode_with_mipmaps(&chain)?;
+        crate::dds::DdsEncoder::new(crate::dds::DdsFormat::BC1).encode_with_mipmaps(levels)?;
     Ok(bytes::Bytes::from(dds).slice(DDS_HEADER_LEN..))
 }
 
@@ -273,10 +294,11 @@ mod tests {
         );
     }
 
-    /// The decoded RGB of the first texel of each level of a BC1 chain.
+    /// The decoded RGB of the first texel of each level of a BC1 chain, or
+    /// of as many levels as `payload` holds.
     fn level_rgbs(payload: &[u8], top: u32) -> Vec<[u8; 3]> {
         let (mut at, mut size, mut rgbs) = (0, top, Vec::new());
-        while size >= 1 {
+        while size >= 1 && at < payload.len() {
             let mut rgba = [0u8; 4 * 4 * 4];
             bcdec_rs::bc1(&payload[at..at + 8], &mut rgba, 16);
             rgbs.push([rgba[0], rgba[1], rgba[2]]);
@@ -324,6 +346,36 @@ mod tests {
         );
         assert_ne!(
             level_rgbs(&encode_visible(solid(64, [15; 3])).unwrap(), 64)[0],
+            [0; 3]
+        );
+    }
+
+    #[test]
+    fn the_top_gives_an_eighth_of_the_light() {
+        assert!((TOP_GAIN.powf(SRGB_GAMMA) - 1.0 / 8.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_encoded_top_is_one_level_at_an_eighth_of_the_light() {
+        let top = encode_top(solid(64, [240; 3])).unwrap();
+        assert_eq!(top.len(), 64 * 64 / 2, "one BC1 level, no header, no chain");
+        let rgb = level_rgbs(&top, 64)[0];
+        let want = 240.0 * TOP_GAIN;
+        assert!(
+            rgb.iter().all(|&c| (f32::from(c) - want).abs() <= 8.0),
+            "{rgb:?} against {want}"
+        );
+    }
+
+    #[test]
+    fn the_encoded_top_is_black_below_the_floor_after_its_dimming() {
+        // 18 dims to 7, 21 to 8.
+        assert_eq!(
+            level_rgbs(&encode_top(solid(64, [18; 3])).unwrap(), 64)[0],
+            [0; 3]
+        );
+        assert_ne!(
+            level_rgbs(&encode_top(solid(64, [21; 3])).unwrap(), 64)[0],
             [0; 3]
         );
     }

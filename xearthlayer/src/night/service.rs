@@ -8,7 +8,9 @@
 //! reads of one footprint share a single generation, and the number of
 //! concurrent generations follows the core count. With the cache layer's lit
 //! disk tier, a payload is read from disk before generating and written back
-//! after. With a road service attached, roads light footprints too: the probe
+//! after. The top level X-Plane uploads is generated on its own, at twice the
+//! first visible level's size, when a read reaches it, and kept in memory
+//! only. With a road service attached, roads light footprints too: the probe
 //! counts a footprint whose glow reach holds a road as lit, and generation
 //! rasters the roads into the texture.
 
@@ -23,7 +25,7 @@ use tracing::{debug, warn};
 
 use super::generator::field::{RecipeField, FIELD_MARGIN_DEG};
 use super::generator::{CpuLitGenerator, LedModel, LedRegion, LitGenerator, LitRequest};
-use super::layout::minimal_black_dds;
+use super::layout::{minimal_black_dds, LitReach};
 use super::roads::field::{reach_deg, RoadField};
 use super::roads::service::{FootprintRoads, Purpose, RoadService, Trigger};
 use super::roads::RoadModel;
@@ -227,13 +229,19 @@ type FootprintRecipes = HashMap<(i32, i32), (Option<Arc<Recipe>>, LedRegion)>;
 /// Memory for generated visible levels (about 0.7 MB per urban ZL16 texture).
 const LIT_PAYLOAD_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Memory for generated top levels: 32 ZL16 tops of 2 MiB. Only the
+/// textures nearest the aircraft have their top read (19 of 1,006 ZL16 lit
+/// textures at KCCR, 2026-11-14).
+const LIT_TOP_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Default overall brightness (`night.brightness`).
 pub const DEFAULT_NIGHT_BRIGHTNESS: f64 = 1.0;
 
 /// The night lit source: full-size, correctly laid out textures where the
-/// recipe and the user's art say there is light (generated on first read of
-/// the visible levels, coalesced across concurrent readers, with permits
-/// following the core count); the minimal black DDS everywhere else.
+/// recipe and the user's art say there is light (the visible levels and the
+/// uploaded top level each generated on the first read that reaches them,
+/// coalesced across concurrent readers, with permits following the core
+/// count); the minimal black DDS everywhere else.
 pub struct NightLitSource {
     recipes: Arc<SessionRecipes>,
     art: Arc<LaminarArt>,
@@ -249,6 +257,10 @@ pub struct NightLitSource {
     /// recipes has been given up on, and never changes the size. A payload is
     /// only built from a complete set of recipes.
     payloads: moka::future::Cache<(u32, u32, u8), Bytes>,
+    /// Generated top levels by footprint, under the same rules as
+    /// `payloads`, but never on disk: few textures have their top read, and
+    /// one generates in about 0.7 s at ZL16. No fingerprint is needed.
+    tops: moka::future::Cache<(u32, u32, u8), Bytes>,
     generations: tokio::sync::Semaphore,
     brightness: f64,
     generator: Arc<dyn LitGenerator>,
@@ -265,10 +277,47 @@ pub struct NightLitSource {
     road_model: RoadModel,
 }
 
-/// The visible levels of a footprint, and how complete its roads were.
+/// A generated part of a footprint, and how complete its roads were.
 struct Generated {
-    payload: Bytes,
+    bytes: Bytes,
     roads: RoadsState,
+}
+
+/// The parts of a lit texture that are generated, each on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part {
+    /// The visible levels: the first visible level and its chain, cached in
+    /// memory and on disk.
+    Payload,
+    /// The top level X-Plane uploads, twice the first visible level's
+    /// size, at an eighth of the light; cached in memory only.
+    Top,
+}
+
+impl Part {
+    /// The size the generator draws this part at.
+    fn size(self, layout: &LitLayout) -> u32 {
+        match self {
+            Self::Payload => layout.first_visible,
+            Self::Top => layout.first_visible * 2,
+        }
+    }
+
+    /// The part's BC1 bytes from the generated image.
+    fn encode(self, image: image::RgbaImage) -> Result<Bytes, crate::dds::DdsError> {
+        match self {
+            Self::Payload => super::generator::encode_visible(image),
+            Self::Top => super::generator::encode_top(image),
+        }
+    }
+
+    /// The debug message of a generation.
+    fn generated(self) -> &'static str {
+        match self {
+            Self::Payload => "Night lighting: lit texture generated",
+            Self::Top => "Night lighting: lit top level generated",
+        }
+    }
 }
 
 /// Whether a generation had every road tile it could draw.
@@ -317,6 +366,10 @@ impl NightLitSource {
                 .max_capacity(LIT_PAYLOAD_CACHE_BYTES)
                 .weigher(|_, v: &Bytes| v.len().try_into().unwrap_or(u32::MAX))
                 .build(),
+            tops: moka::future::Cache::builder()
+                .max_capacity(LIT_TOP_CACHE_BYTES)
+                .weigher(|_, v: &Bytes| v.len().try_into().unwrap_or(u32::MAX))
+                .build(),
             generations: tokio::sync::Semaphore::new(lit_generation_permits(
                 std::thread::available_parallelism().map_or(1, |n| n.get()),
             )),
@@ -362,12 +415,20 @@ impl NightLitSource {
         road_tiles(name, self.layout(name).first_visible, &self.road_model)
     }
 
-    /// The ready roads of the tiles that can light `name`, waited for as
-    /// `purpose` allows; complete and empty without road lights. The
-    /// caller holds no permit.
-    async fn footprint_roads(&self, name: &DdsFilename, purpose: Purpose) -> FootprintRoads {
+    /// The ready roads of the tiles that can light `name` drawn at `size`
+    /// texels, waited for as `purpose` allows; complete and empty without
+    /// road lights. The caller holds no permit.
+    async fn footprint_roads(
+        &self,
+        name: &DdsFilename,
+        size: u32,
+        purpose: Purpose,
+    ) -> FootprintRoads {
         match &self.roads {
-            Some(roads) => roads.footprint(&self.road_tiles(name), purpose).await,
+            Some(roads) => {
+                let tiles = road_tiles(name, size, &self.road_model);
+                roads.footprint(&tiles, purpose).await
+            }
             None => FootprintRoads {
                 tiles: Vec::new(),
                 complete: true,
@@ -381,15 +442,15 @@ impl NightLitSource {
     /// for one key share one load or generation. A failure is not cached,
     /// nor a payload whose roads were late: the next read generates again.
     async fn payload(&self, name: &DdsFilename, layout: &LitLayout) -> Option<Bytes> {
-        let key = (name.row, name.col, name.zoom);
-        match self
-            .payloads
-            .try_get_with(key, self.load_or_generate(name.clone(), layout.clone()))
-            .await
-        {
-            Ok(payload) => Some(payload),
-            Err(uncached) => uncached.0.clone(),
-        }
+        let load = self.load_or_generate(name.clone(), layout.clone());
+        shared(&self.payloads, name, load).await
+    }
+
+    /// The generated top level of a lit footprint, or `None` (black), under
+    /// the payload's rules but never read from or written to disk.
+    async fn top(&self, name: &DdsFilename, layout: &LitLayout) -> Option<Bytes> {
+        let generate = async { memory_only(self.generate(name.clone(), layout, Part::Top).await) };
+        shared(&self.tops, name, generate).await
     }
 
     /// Disk first, then generation; a generated payload is written back
@@ -403,7 +464,7 @@ impl NightLitSource {
         layout: LitLayout,
     ) -> Result<Bytes, Uncached> {
         let Some(disk) = self.disk.clone() else {
-            return memory_only(self.generate(name, layout.first_visible).await);
+            return memory_only(self.generate(name, &layout, Part::Payload).await);
         };
         let key = lit_cache_key(&name);
         // The disk permit covers the fingerprint and the read, and is released
@@ -431,11 +492,11 @@ impl NightLitSource {
         }
         let Some(fp) = fp else {
             // No fingerprint, no safe disk entry: generate and keep it in memory only.
-            return memory_only(self.generate(name, layout.first_visible).await);
+            return memory_only(self.generate(name, &layout, Part::Payload).await);
         };
-        let generated = self.generate(name, layout.first_visible).await;
+        let generated = self.generate(name, &layout, Part::Payload).await;
         let Some(Generated {
-            payload,
+            bytes: payload,
             roads: RoadsState::Complete,
         }) = generated
         else {
@@ -514,11 +575,19 @@ impl NightLitSource {
         Some(footprint_fingerprint(session, &identities, &roads))
     }
 
-    /// The footprint's visible levels. Waits for its roads first, holding
+    /// A generated part of the footprint. Waits for its roads first, holding
     /// no permit, then generates under a generation permit; the road raster
-    /// is generation work and runs under it.
-    async fn generate(&self, name: DdsFilename, size: u32) -> Option<Generated> {
-        let found = self.footprint_roads(&name, Purpose::Generate).await;
+    /// is generation work and runs under it. The roads are those that can
+    /// light the part at its own size: the top's are among the first visible
+    /// level's, since a finer raster reaches no farther.
+    async fn generate(
+        &self,
+        name: DdsFilename,
+        layout: &LitLayout,
+        part: Part,
+    ) -> Option<Generated> {
+        let size = part.size(layout);
+        let found = self.footprint_roads(&name, size, Purpose::Generate).await;
         let roads_state = RoadsState::of(&found);
         let road_tiles = found.tiles;
         let _permit = self.generations.acquire().await.ok()?;
@@ -560,7 +629,7 @@ impl NightLitSource {
                 roads: &roads,
                 road_model: &road_model,
             });
-            Some((super::generator::encode_visible(image), roads.stats))
+            Some((part.encode(image), roads.stats))
         })
         .await;
         match generated {
@@ -574,7 +643,7 @@ impl NightLitSource {
                 );
                 None
             }
-            Ok(Some((Ok(payload), road))) => {
+            Ok(Some((Ok(bytes), road))) => {
                 debug!(
                     row = name.row,
                     col = name.col,
@@ -583,12 +652,14 @@ impl NightLitSource {
                     road_segments = road.segments,
                     road_raster_us = road.raster_us,
                     road_texels = road.lit_texels,
+                    size,
                     roads_complete = roads_state == RoadsState::Complete,
                     roads_timed_out = roads_state == RoadsState::TimedOut,
-                    "Night lighting: lit texture generated"
+                    "{}",
+                    part.generated()
                 );
                 Some(Generated {
-                    payload,
+                    bytes,
                     roads: roads_state,
                 })
             }
@@ -617,7 +688,9 @@ impl NightLitSource {
             tiles: road_tiles,
             complete: roads_complete,
             timed_out: roads_timed_out,
-        } = self.footprint_roads(name, Purpose::Probe).await;
+        } = self
+            .footprint_roads(name, self.layout(name).first_visible, Purpose::Probe)
+            .await;
         let started = Instant::now();
         let Ok(_permit) = self.probes.acquire().await else {
             return false;
@@ -705,18 +778,48 @@ impl NightLitSource {
     }
 }
 
-/// A generated payload for the memory cache: kept unless its roads were
+/// The cached part of `name` in `cache`, loaded by `load` on a miss, which
+/// concurrent callers share; `None` (black) when the load gave nothing.
+async fn shared(
+    cache: &moka::future::Cache<(u32, u32, u8), Bytes>,
+    name: &DdsFilename,
+    load: impl std::future::Future<Output = Result<Bytes, Uncached>>,
+) -> Option<Bytes> {
+    match cache
+        .try_get_with((name.row, name.col, name.zoom), load)
+        .await
+    {
+        Ok(part) => Some(part),
+        Err(uncached) => uncached.0.clone(),
+    }
+}
+
+/// The `part` field of a lit read's debug event: what the read reached, and
+/// whether each generated part it reached came back (`black` when not).
+fn read_part(reach: LitReach, top: bool, payload: bool) -> &'static str {
+    match (reach.top.then_some(top), reach.payload.then_some(payload)) {
+        (None, None) => "blank",
+        (Some(true), None) => "top",
+        (Some(false), None) => "top black",
+        (None, Some(true)) => "lit",
+        (None, Some(false)) => "black",
+        (Some(true), Some(true)) => "top+lit",
+        (Some(_), Some(_)) => "top+lit black",
+    }
+}
+
+/// A generated part for the memory cache: kept unless its roads were
 /// late; `None` (black) is never kept.
 fn memory_only(generated: Option<Generated>) -> Result<Bytes, Uncached> {
     match generated {
         Some(Generated {
-            payload,
+            bytes,
             roads: RoadsState::Complete | RoadsState::Failed,
-        }) => Ok(payload),
+        }) => Ok(bytes),
         Some(Generated {
-            payload,
+            bytes,
             roads: RoadsState::TimedOut,
-        }) => Err(Uncached(Some(payload))),
+        }) => Err(Uncached(Some(bytes))),
         None => Err(Uncached(None)),
     }
 }
@@ -737,18 +840,24 @@ impl LitTextureSource for NightLitSource {
             if self.has_light(name).await {
                 let layout = self.layout(name);
                 // The header and the levels X-Plane drops need no pixels;
-                // only a read that reaches the uploaded top level or the
-                // visible levels generates them.
-                let (part, bytes) = if !layout.reads_light(offset, len) {
-                    ("blank", layout.read_black(offset, len))
+                // the uploaded top level and the visible levels are each
+                // generated only by a read that reaches them, one after
+                // the other, so a read never holds two generation permits.
+                let reach = layout.reach(offset, len);
+                let top = if reach.top {
+                    self.top(name, &layout).await
                 } else {
-                    match self.payload(name, &layout).await {
-                        Some(payload) => ("lit", layout.read_lit(offset, len, &payload)),
-                        None => ("black", layout.read_black(offset, len)),
-                    }
+                    None
                 };
+                let payload = if reach.payload {
+                    self.payload(name, &layout).await
+                } else {
+                    None
+                };
+                let part = read_part(reach, top.is_some(), payload.is_some());
+                let bytes = layout.read_lit(offset, len, top.as_ref(), payload.as_ref());
                 // The order X-Plane reads a lit file in shows whether it
-                // loads the small levels (at the end) before the blank top.
+                // loads the small levels (at the end) before the top.
                 debug!(
                     row = name.row,
                     col = name.col,
@@ -1031,7 +1140,11 @@ mod tests {
                 "short read at EOF"
             );
             assert!(visible.iter().any(|&b| b != 0), "generated light");
-            let top = source.read(&name, 128, 1 << 20).await;
+            // The top level X-Plane uploads is generated on its own, at an
+            // eighth of the light.
+            let top = source
+                .read(&name, layout.uploaded_top_start(), 1 << 20)
+                .await;
             assert!(top.iter().any(|&b| b != 0), "the uploaded top level is lit");
         }
 
@@ -1128,6 +1241,97 @@ mod tests {
             let visible = source.read(&name, layout.payload_start(), 1 << 20).await;
             assert!(visible.iter().any(|&b| b != 0));
             assert_eq!(white.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+
+        /// Lights every texel white and records the size of every request.
+        #[derive(Default)]
+        struct Sizes(std::sync::Mutex<Vec<u32>>);
+
+        impl Sizes {
+            fn sizes(&self) -> Vec<u32> {
+                let mut sizes = self.0.lock().unwrap().clone();
+                sizes.sort_unstable();
+                sizes
+            }
+        }
+
+        impl crate::night::generator::LitGenerator for Sizes {
+            fn generate(&self, r: &crate::night::generator::LitRequest<'_>) -> image::RgbaImage {
+                self.0.lock().unwrap().push(r.size);
+                image::RgbaImage::from_pixel(r.size, r.size, image::Rgba([255, 255, 255, 255]))
+            }
+        }
+
+        #[tokio::test]
+        async fn a_top_read_generates_the_top_once_at_twice_the_first_visible_size() {
+            // X-Plane loads the top level only for the textures nearest the
+            // aircraft, so only they pay for it (flight 7, KCCR).
+            let (_t, source) = fixture();
+            let sizes = Arc::new(Sizes::default());
+            let source = source.with_generator(sizes.clone());
+            let name = name_at(37.20, -122.725);
+            let layout = LitLayout::new(16, 4);
+            let top = source.read(&name, layout.uploaded_top_start(), 4096).await;
+            assert!(top.iter().any(|&b| b != 0), "lit");
+            source
+                .read(&name, layout.uploaded_top_start() + 4096, 4096)
+                .await;
+            assert_eq!(sizes.sizes(), [2048], "once, and never the payload");
+        }
+
+        #[tokio::test]
+        async fn a_payload_read_never_generates_the_top() {
+            let (_t, source) = fixture();
+            let sizes = Arc::new(Sizes::default());
+            let source = source.with_generator(sizes.clone());
+            let layout = LitLayout::new(16, 4);
+            source
+                .read(&name_at(37.20, -122.725), layout.payload_start(), 4096)
+                .await;
+            assert_eq!(sizes.sizes(), [1024]);
+        }
+
+        #[tokio::test]
+        async fn a_read_across_the_top_and_the_payload_generates_both() {
+            let (_t, source) = fixture();
+            let sizes = Arc::new(Sizes::default());
+            let source = source.with_generator(sizes.clone());
+            let name = name_at(37.20, -122.725);
+            let layout = LitLayout::new(16, 4);
+            let bytes = source.read(&name, layout.payload_start() - 8, 16).await;
+            assert!(bytes[..8].iter().any(|&b| b != 0), "the top is lit");
+            assert!(bytes[8..].iter().any(|&b| b != 0), "the payload is lit");
+            assert_eq!(sizes.sizes(), [1024, 2048]);
+        }
+
+        #[tokio::test]
+        async fn concurrent_top_reads_share_one_generation() {
+            let (_t, source) = fixture();
+            let slow = Arc::new(Slow::default());
+            let source = source.with_generator(slow.clone());
+            let name = name_at(37.20, -122.725);
+            let top = LitLayout::new(16, 4).uploaded_top_start();
+            let reads = (0..8).map(|i| source.read(&name, top + i * 4096, 4096));
+            let results = futures::future::join_all(reads).await;
+            assert!(results.iter().all(|r| r.iter().any(|&b| b != 0)));
+            assert_eq!(slow.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn the_top_is_never_read_from_or_written_to_disk() {
+            let temp = TempDir::new().unwrap();
+            let counting = Arc::new(Counting::new());
+            let source = source_in(&temp)
+                .with_generator(Arc::new(White::default()))
+                .with_disk_cache(counting.clone());
+            let name = name_at(37.20, -122.725);
+            let layout = LitLayout::new(16, 4);
+            let top = source.read(&name, layout.uploaded_top_start(), 4096).await;
+            assert!(top.iter().any(|&b| b != 0));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let most = counting.most.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(most, 0, "no disk call");
+            assert_eq!(counting.inner().entry_count(), 0);
         }
 
         /// Like `White`, but slow enough that concurrent reads overlap.
@@ -1892,9 +2096,76 @@ mod tests {
             roads.evict(TILE).await;
             let file = source.read(&name, 0, u32::MAX).await;
             assert_eq!(file.len() as u64, size, "size and read agree");
-            let visible = &file[layout.payload_start() as usize..];
-            assert!(visible.iter().all(|&b| b == 0), "black");
+            let lit = &file[layout.uploaded_top_start() as usize..];
+            assert!(lit.iter().all(|&b| b == 0), "the top and the payload black");
+            assert_eq!(
+                roads.stats_snapshot().generate_timeouts,
+                2,
+                "the top and the payload each waited"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_top_past_its_road_wait_is_served_and_not_kept() {
+            let temp = TempDir::new().unwrap();
+            let name = lit_name();
+            let gate = shut();
+            let roads = roads(
+                xp_install(&temp, Some(road_across(&name))),
+                LONG,
+                30,
+                Some(gate.clone()),
+            );
+            let white = Arc::new(White::default());
+            let source = source_in(&temp)
+                .with_generator(white.clone())
+                .with_roads(roads.clone());
+            let top = LitLayout::new(16, 4).uploaded_top_start();
+            // The gate is shut: the generation times out on its roads.
+            let bytes = source.read(&name, top, 4096).await;
+            assert!(bytes.iter().any(|&b| b != 0), "served");
             assert_eq!(roads.stats_snapshot().generate_timeouts, 1);
+            source.tops.run_pending_tasks().await;
+            assert_eq!(source.tops.entry_count(), 0, "not in memory");
+            source.read(&name, top, 4096).await;
+            assert_eq!(calls(&white), 2, "generated again");
+            gate.add_permits(1);
+        }
+
+        #[tokio::test]
+        async fn a_top_with_a_failed_road_tile_is_kept_in_memory() {
+            let temp = TempDir::new().unwrap();
+            let (source, _) = source_with_roads(&temp, None); // unreadable DSF
+            let white = Arc::new(White::default());
+            let source = source.with_generator(white.clone());
+            let top = LitLayout::new(16, 4).uploaded_top_start();
+            assert!(source
+                .read(&lit_name(), top, 4096)
+                .await
+                .iter()
+                .any(|&b| b != 0));
+            source.read(&lit_name(), top, 4096).await;
+            assert_eq!(calls(&white), 1, "the failed tile is final: from memory");
+        }
+
+        #[test]
+        fn the_top_needs_no_road_tile_the_first_visible_level_does_not() {
+            // A finer raster reaches no farther: its texel floor on the glow
+            // is smaller, so the first visible level's tiles cover the top's.
+            let mut model = RoadModel::DEFAULT;
+            model.classes[0].sigma_m = 3_000.0;
+            for name in [name_at(37.5, -122.5), name_at_zoom(70.0, 20.0, 12)] {
+                let first = LitLayout::new(name.zoom, 4).first_visible;
+                for model in [RoadModel::DEFAULT, model] {
+                    let visible = road_tiles(&name, first, &model);
+                    let top = road_tiles(&name, first * 2, &model);
+                    assert!(
+                        top.iter().all(|t| visible.contains(t)),
+                        "{top:?} {visible:?}"
+                    );
+                    assert!(reach_deg(&name, first * 2, &model) <= reach_deg(&name, first, &model));
+                }
+            }
         }
 
         #[test]

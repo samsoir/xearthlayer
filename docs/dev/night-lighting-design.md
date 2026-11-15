@@ -125,9 +125,9 @@ branch on a bool, see Trigger). Everything else is new code in
 | `night/laminar/ter.rs` | Read a Laminar `.ter`'s lit texture and pattern scale |
 | `night/laminar/art.rs` | `LaminarArt`: name to decoded lit pattern, cached |
 | `night/footprint.rs` | A lit texture's ground footprint |
-| `night/layout.rs` | The lit DDS layout: sizes, the black levels X-Plane drops, the uploaded top built from the first visible level |
+| `night/layout.rs` | The lit DDS layout: sizes, the black levels X-Plane drops, where the uploaded top and the payload sit, and which of them a read reaches |
 | `night/prefs.rs` | `XPlanePrefs`: the texture quality setting |
-| `night/generator/mod.rs` | The `LitGenerator` trait, `LitRequest`, and `encode_visible` |
+| `night/generator/mod.rs` | The `LitGenerator` trait, `LitRequest`, `encode_visible` and `encode_top` |
 | `night/generator/gain.rs` | The gain curve |
 | `night/generator/noise.rs` | Integer hashing and world-anchored value noise |
 | `night/generator/field.rs` | `RecipeField`: recipe layers as continuous functions of world position |
@@ -214,8 +214,8 @@ With the texture quality setting `t` (0 to 4):
 - X-Plane drops `4 − t` top levels at load. XEL puts
   `B = (4 − t) + 1` levels above the first visible one (R15): the ones
   X-Plane drops are black, and the one it uploads (the uploaded top, twice
-  the first visible level's size) repeats the first visible level, each of
-  its texels over 2 × 2 (see Uploaded top below).
+  the first visible level's size) is generated at its own size, at an
+  eighth of the light (see Uploaded top below).
 - The first visible level `F` is 1024 px for a ZL16 texture, halving per
   zoom level above 16 and doubling per zoom level below it (512 px at ZL17,
   256 px at ZL18), about 7.5 m per texel throughout.
@@ -243,17 +243,28 @@ the flight of 2026-11-14 at KCCR it fully read the top level of 19 of
 338, and only the small levels of the other 624. While the uploaded top
 was black, the ground under X-Plane's 3D scenery was lit by the 3D
 objects alone, whatever the levels below gave, and dimming the nearest
-visible levels could not change it. The uploaded top now repeats the
-first visible level: each BC1 block of it is one quadrant of a block of
-the first visible level, with that block's two colours and the indices of
-its quadrant, so its light is a quarter, like that level's, and it costs
-no generation, decoding or encoding. It is built per read from the cached
-payload (about 0.8 ms per 1 MiB read, release build) and never stored.
-Its texels are 2 × 2 copies, so it has the first visible level's detail,
-under the 3D lights. The levels X-Plane drops stay black. The earlier
-black top was the distance fade (fact 3); the fade below is now the dimmed
-levels alone, and the lit layer no longer switches off near the
-aircraft.
+visible levels could not change it. The first fix filled it from the
+first visible level, each texel repeated over 2 x 2 at a quarter of the
+light; in flight 7 the near field showed, but too bright, too coarse (7.5 m
+texels in 2 x 2 copies), and with green and purple texels (see BC1
+floor). The uploaded top is now generated at its own size, twice the
+first visible level (2048 px, 3.75 m texels at ZL16), when X-Plane first
+reads a byte range inside it, and encoded by `encode_top`: one BC1 level,
+no chain, its stored values scaled by `TOP_GAIN` (`(1/8)^(1/2.2)`, an
+eighth of the light) and floored. Only the textures whose top X-Plane
+loads pay for it: on a KCCR ZL16 texture with real roads (release build)
+raster, generation and BC1 take about 720 ms at 2048 px against about
+190 ms for the payload at 1024 px. Tops are kept in memory
+(`LIT_TOP_CACHE_BYTES`, 64 MiB, 32 ZL16 tops), never on disk, so they
+need no fingerprint, and they follow the payload's rules otherwise: one
+generation per texture however many reads wait on it, under the same
+generation permits and road wait, served but not kept when a road tile was
+late, kept in memory when one failed, black and not kept when a recipe
+cannot be read or the encode fails. A read that reaches only the payload
+never generates the top, and the other way round. The levels X-Plane
+drops stay black. The earlier black top was the distance fade (fact 3);
+the fade below is now the dimmed levels alone, and the lit layer no
+longer switches off near the aircraft.
 
 **Fade ramp.** Because X-Plane pages levels in one at a time (fact 7), a
 texture would jump from full light straight to its black top level, and
@@ -261,7 +272,7 @@ was seen to switch off as one visible square. The first visible level
 gives a quarter of the light and the next half (`FADE_RAMP`,
 `(1/4)^(1/2.2)` and `(1/2)^(1/2.2)` in stored value, since X-Plane decodes
 sRGB), so each texture steps from full to half to a quarter, one stop per
-level, and the uploaded top stays at a quarter.
+level, and to an eighth at the uploaded top (`TOP_GAIN`).
 The chain is downsampled from the undimmed image, so every coarser level
 is at full light, and the ramp costs no bytes. The nearest level is cut
 back so the ground under X-Plane's 3D roads and lights is only faintly
@@ -307,13 +318,17 @@ A footprint without light is a fixed **minimal black DDS**: 4 × 4, BC1,
 with its full chain (4, 2 and 1 px levels), all blocks zero, 152 bytes
 (R6).
 
-The levels above the first visible one are never stored. A lit
-texture's bytes are `header ‖ zero region ‖ uploaded top ‖ payload`: a read
-inside the zero region (the levels X-Plane drops) is answered with zeros
-and needs no payload, and a read of the uploaded top is built from the
-payload's first level (`LitLayout::read_lit`, `reads_light`). Only the
-payload (the visible levels, about 0.7 MB for an urban ZL16 texture) is
-generated, encoded and cached.
+The levels X-Plane drops are never stored. A lit texture's bytes are
+`header ‖ zero region ‖ uploaded top ‖ payload`: a read inside the zero
+region (the levels X-Plane drops) is answered with zeros and generates
+nothing; `LitLayout::reach` says whether a read reaches the uploaded top,
+the payload or both, and only the parts it reaches are generated, one
+after the other. `LitLayout::read_lit` composes the bytes from the top and
+the payload it is given; a part that is absent or of the wrong length
+reads as zeros, and any split of a read gives the same bytes as one whole
+read. The payload (the visible levels, about 0.7 MB for an urban ZL16
+texture) is cached in memory and on disk, the top (2 MiB at ZL16) in
+memory only.
 
 **Risk.** At `t = 0` the top level would be 32768 px. Whether X-Plane
 accepts a header that large, even though it only uploads from level 4
@@ -496,7 +511,8 @@ Inside:
   so the night share is fully used). This keeps `executor` free of a
   dependency on `night`.
 - **Cache.** Reads go memory (256 MB, bounded by bytes), then disk, then
-  generate. The disk tier holds payloads only (file sizes and the DDS layout
+  generate. Generated top levels have their own memory cache (64 MiB) and
+  never reach the disk. The disk tier holds payloads only (file sizes and the DDS layout
   are unchanged) under `{cache_dir}/night/` in region folders, with its own
   GC daemon on the prefetch lane. With `night.enabled` it takes 5% of
   `cache.disk_size` first (`LIT_DISK_SHARE`) and `dds_disk_ratio` splits the
@@ -700,7 +716,8 @@ commercial flags for the category; SDGSAT-1 colour data.
 ## Road lights
 
 Close to the aircraft X-Plane's 3D roads and their lights take over,
-over the lit layer at a quarter of its light. The lit layer's streets are
+over the lit layer at a quarter of its light, and at an eighth on the
+nearest textures, whose generated top level X-Plane uploads. The lit layer's streets are
 Laminar's pattern art, not real roads, so without road lights a 3D road
 appears where the lit texture showed no road to match, and a road across
 dark countryside, where VIIRS sees nothing and the gain is zero, appears
@@ -1198,7 +1215,7 @@ guards one thing:
 
 | Constant | Bump when | Guards |
 |---|---|---|
-| `LIT_GENERATOR_VERSION` (9) | Generated bytes change for the same inputs: ramp, tiling, encoder (the BC1 floor), layout of the visible levels, the road composite | Lit payloads |
+| `LIT_GENERATOR_VERSION` (9) | Generated bytes change for the same inputs: ramp, tiling, encoder (the BC1 floor), layout of the visible levels, the road composite | Lit payloads (generated tops are memory only and need none) |
 | `ROADS_VERSION` (3) | The same DSFs and road model can give different road light: the reader, the class table, the merge and source rules, quantisation, the kernel | Lit payloads |
 | `ROAD_MODEL_VERSION` (2) | The meaning of a `RoadModel` parameter changes (2: lamps light every glowing class, the lamp sigma a floor on the class's and the lamp intensity a factor on it) | Lit payloads (through the model digest) |
 | `ROAD_EXTRACT_VERSION` (3) | What one DSF's extraction keeps, or which DSFs are stored, changes: the reader, the subtype filter, the codec's input (2: overlays only; 3: glowing classes only; it is hashed into the key, so an earlier version's entries are never loaded) | Road disk entries |
@@ -1274,8 +1291,12 @@ warning for an unreadable DSF. Read them with `run --debug`.
 The existing `Night lighting: lit texture generated` line gains
 `road_segments` (point-to-point segments handed to the raster, see
 Merge), `road_raster_us`, `road_texels`, `roads_complete` and
-`roads_timed_out`, and `Night lighting: lit probe` gains `roads_complete`
-and `roads_timed_out`. `cache_misses` counts 7z overlays read from their file
+`roads_timed_out`, and `size`; `Night lighting: lit top level generated`
+carries the same fields for a generated top. `Night lighting: lit probe`
+gains `roads_complete` and `roads_timed_out`. `Night lighting: lit read`
+names the parts a read reached in `part`: `blank` (header or dropped
+levels), `top`, `lit` (payload) or `top+lit`, with `top black`, `black`
+or `top+lit black` when a part it reached was served black. `cache_misses` counts 7z overlays read from their file
 with a disk tier present; a base mesh read to its HEAD is not one.
 
 ### Measured cost
@@ -1430,8 +1451,13 @@ lights).
   agree to within 2 levels per channel); no brightness step appears at a
   degree line, where two tiles' recipes meet; an empty footprint gives
   the minimal black DDS; the levels X-Plane drops are all zero, and the
-  uploaded top repeats the first visible level texel for texel over
-  2 × 2, at any split of the read.
+  uploaded top is the generated top's bytes, at any split of the read;
+  a missing top reads as zeros. `encode_top` gives one level at an eighth
+  of the light, and both encoders floor a texel at 7 and keep one at 8.
+  The service generates the top once at twice the first visible size,
+  coalesces concurrent top reads, never generates the top for a payload
+  read nor the payload for a top read, never touches the disk for a top,
+  and keeps no top whose roads were late.
 - **LED.** Share: the fraction of lit texels that are LED matches the
   model, and a region moves it. Coherence: patches are contiguous, not
   per-texel. Zoom agreement: the LED decision for the same ground agrees at
@@ -1484,7 +1510,7 @@ Feature: Night lighting on ortho scenery
     And the texture quality setting is 4
     When X-Plane reads its _LIT.dds
     Then the file is a DXT1 DDS with a 2048 px top level
-    And the top level is all zero
+    And the top level is generated at an eighth of the light
     And the next level has non-zero content
     And stat and the read agree on size
 
@@ -1496,7 +1522,7 @@ Feature: Night lighting on ortho scenery
   Scenario: The fade follows the texture setting
     Given the texture quality setting is 2
     When X-Plane reads a city footprint's _LIT.dds
-    Then three top levels are blank
+    Then the two top levels X-Plane drops are blank
 
   Scenario: Deterministic and seamless
     Given two adjacent city footprints
