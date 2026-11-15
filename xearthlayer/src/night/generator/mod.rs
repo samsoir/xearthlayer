@@ -71,7 +71,8 @@ pub trait LitGenerator: Send + Sync {
 /// 5: cooler LED whites and halved region shifts (#363).
 /// 6: road lights (`night/roads`).
 /// 7: two-level fade, an eighth then half of the light (`FADE_RAMP`).
-pub const LIT_GENERATOR_VERSION: u32 = 7;
+/// 8: the nearest level gives a quarter of the light, not an eighth.
+pub const LIT_GENERATOR_VERSION: u32 = 8;
 
 /// Gamma of the sRGB decode X-Plane applies to a texture's stored values.
 pub const SRGB_GAMMA: f32 = 2.2;
@@ -80,15 +81,18 @@ pub const SRGB_GAMMA: f32 = 2.2;
 /// every level after them is full. X-Plane pages a lit texture's levels in
 /// one at a time as the aircraft closes, so without a ramp a texture jumps
 /// from full light to the blank level in one step. The nearest level gives
-/// an eighth of the light, `(1/8) ^ (1/2.2)` in stored value, so the ground
-/// under X-Plane's 3D roads and lights is only faintly lit, and the next
-/// one half. Two levels make the fade span twice the mip range, which
-/// softens the cut-out at the sides of a wide view, where the screen's
-/// stretch squeezes one level's fade into a few pixels (KCCR, 2026-11-14).
-/// One step at 2/3 was the ramp until then; a two-step ramp flown on
-/// 2026-10-18 read as black because it scaled stored values (1/3 gave 9%
-/// of the light) and before road lights covered the hand-off.
-pub const FADE_RAMP: [f32; 2] = [0.3886, 0.7297];
+/// a quarter of the light, `(1/4) ^ (1/2.2)` in stored value, so the ground
+/// under X-Plane's 3D roads and lights is faintly lit, and the next one
+/// half: one stop per level. Two levels make the fade span twice the mip
+/// range, which softens the cut-out at the sides of a wide view, where the
+/// screen's stretch squeezes one level's fade into a few pixels (KCCR,
+/// 2026-11-14). An eighth at the nearest level was not seen at all: it left
+/// 0.08% of its texels above a linear 0.002, against 2.9% at full light and
+/// 0.4% at a quarter (20 KCCR textures, after BC1, which kept 87% of the
+/// eighth's light). One step at 2/3 was the ramp before; a two-step ramp
+/// flown on 2026-10-18 read as black because it scaled stored values (1/3
+/// gave 9% of the light) and before road lights covered the hand-off.
+pub const FADE_RAMP: [f32; 2] = [0.5325, 0.7297];
 
 /// BC1-encode the first visible level and its mip chain down to 1 x 1, as
 /// the bytes that follow the blank levels in a lit DDS (no header). The
@@ -166,8 +170,8 @@ mod tests {
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
 
     #[test]
-    fn the_two_level_fade_is_generator_version_seven() {
-        assert_eq!(LIT_GENERATOR_VERSION, 7);
+    fn a_quarter_at_the_nearest_level_is_generator_version_eight() {
+        assert_eq!(LIT_GENERATOR_VERSION, 8);
     }
 
     fn name_at(lat: f64, lon: f64) -> DdsFilename {
@@ -294,10 +298,10 @@ mod tests {
     }
 
     #[test]
-    fn the_dimmed_levels_give_an_eighth_then_half_of_the_light() {
+    fn the_dimmed_levels_give_a_quarter_then_half_of_the_light() {
         // Stored values are sRGB: the light they give is value ^ 2.2.
         let light = FADE_RAMP.map(|v| v.powf(SRGB_GAMMA));
-        assert!((light[0] - 1.0 / 8.0).abs() < 1e-3, "{light:?}");
+        assert!((light[0] - 1.0 / 4.0).abs() < 1e-3, "{light:?}");
         assert!((light[1] - 1.0 / 2.0).abs() < 1e-3, "{light:?}");
     }
 }
