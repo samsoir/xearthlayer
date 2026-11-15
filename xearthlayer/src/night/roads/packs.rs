@@ -299,6 +299,16 @@ mod tests {
         std::fs::write(p, b"x").unwrap();
     }
 
+    /// Whether `dir`'s filesystem tells names apart by case. macOS volumes
+    /// are case-insensitive by default, so `.dsf` and `.DSF` of one tile
+    /// cannot both exist in one directory there.
+    fn case_sensitive(dir: &std::path::Path) -> bool {
+        touch(&dir.join("case-probe"));
+        let sensitive = !dir.join("CASE-PROBE").exists();
+        std::fs::remove_file(dir.join("case-probe")).unwrap();
+        sensitive
+    }
+
     #[test]
     fn sources_follow_scenery_packs_order_with_global_scenery_last() {
         let t = tempfile::tempdir().unwrap();
@@ -507,6 +517,10 @@ mod tests {
     fn both_spellings_of_a_tile_in_one_pack_are_kept() {
         let t = tempfile::tempdir().unwrap();
         let i = t.path();
+        if !case_sensitive(i) {
+            eprintln!("case-insensitive filesystem: two spellings cannot coexist; skipped");
+            return;
+        }
         let files = [
             "Earth nav data/+40+000/+46+006.dsf",
             "Earth nav data/+40+000/+46+006.DSF",
@@ -569,10 +583,12 @@ mod tests {
                 }
             }
         }
-        touch(&i.join("Custom Scenery/A/Earth nav data/+40+000/+41+001.DSF"));
+        // An unusual spelling of a tile no other file has, so it is a file
+        // of its own on a case-insensitive filesystem too.
+        touch(&i.join("Custom Scenery/A/Earth nav data/+50+000/+50+001.DSF"));
         let (idx, stats) = PackIndex::build(i, &[]);
         assert_eq!(stats.dsfs, dsfs + 1);
-        assert_eq!(stats.tiles, 10 * 120);
+        assert_eq!(stats.tiles, 10 * 120 + 1);
         assert_eq!(std::mem::size_of::<Entry>(), 6, "an entry must not grow");
         assert_eq!(std::mem::size_of_val(&*idx.entries), 6 * (dsfs + 1));
         let roots: usize = idx
