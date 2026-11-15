@@ -246,36 +246,36 @@ was black, the ground under X-Plane's 3D scenery was lit by the 3D
 objects alone, whatever the levels below gave, and dimming the nearest
 visible levels could not change it. The first fix filled it from the
 first visible level, each texel repeated over 2 x 2 at a quarter of the
-light; in flight 7 the near field showed, but too bright, too coarse (7.5 m
-texels in 2 x 2 copies), and with green and purple texels (see BC1
-floor and BC1 endpoint repair). The uploaded top is now generated at its own size, twice the
-first visible level (2048 px, 3.75 m texels at ZL16), when X-Plane first
-reads a byte range inside it, and encoded by `encode_top`: one BC1 level,
-no chain, its stored values scaled by `TOP_GAIN` (`(1/12)^(1/2.2)`, a
-twelfth of the light; at an eighth, flight 8, the near field was still
-too bright) and floored. Only the textures whose top X-Plane
-loads pay for it: on a KCCR ZL16 texture with real roads (release build)
-raster, generation and BC1 take about 720 ms at 2048 px against about
-190 ms for the payload at 1024 px. A top holds a generation permit that
-long, about 3.8 times a payload, so a burst of near textures can delay
-payload generations by a few seconds on 2 to 4 permits, and a read
-spanning the top and the payload waits for both, one after the other.
-Only tops of at most 2048 px a side are generated (`MAX_GENERATED_TOP`,
-the ZL16 top at texture setting 4): tops double per zoom level below 16,
-and a ZL12 top is 16384 px, 128 MiB of BC1 and about 1 GiB of RGBA while
-generating, more than the top cache holds, so it would be generated again
-on every 1 MiB read. A larger top reads as zeros (black, as before it was
-lit) and nothing generates it. Tops are kept in memory
-(`LIT_TOP_CACHE_BYTES`, 64 MiB, 32 ZL16 tops), never on disk, so they
-need no fingerprint, and they follow the payload's rules otherwise: one
-generation per texture however many reads wait on it, under the same
-generation permits and road wait, served but not kept when a road tile was
-late, kept in memory when one failed, black and not kept when a recipe
-cannot be read or the encode fails. A read that reaches only the payload
-never generates the top, and the other way round. The levels X-Plane
-drops stay black. The earlier black top was the distance fade (fact 3);
-the fade below is now the dimmed levels alone, and the lit layer no
-longer switches off near the aircraft.
+light; in flight 7 the near field showed, but too bright, too coarse
+(7.5 m texels in 2 x 2 copies), and with green and purple texels (see
+BC1 floor and BC1 endpoint repair). The uploaded top is now generated at
+its own size, twice the first visible level (2048 px, 3.75 m texels at
+ZL16), when X-Plane first reads a byte range inside it, and encoded by
+`encode_top`: one BC1 level, no chain, its stored values scaled by
+`TOP_GAIN` (`(1/12)^(1/2.2)`, a twelfth of the light; at an eighth,
+flight 8, the near field was still too bright) and floored. Only the
+textures whose top X-Plane loads pay for it: on a KCCR ZL16 texture with
+real roads (release build) raster, generation and BC1 take about 720 ms
+at 2048 px against about 190 ms for the payload at 1024 px. A top holds
+a generation permit that long, about 3.8 times a payload, so a burst of
+near textures can delay payload generations by a few seconds on 2 to 4
+permits, and a read spanning the top and the payload waits for both, one
+after the other. Only tops of at most 2048 px a side are generated
+(`MAX_GENERATED_TOP`, the ZL16 top at texture setting 4): tops double
+per zoom level below 16, and a ZL12 top is 16384 px, 128 MiB of BC1 and
+about 1 GiB of RGBA while generating, more than the top cache holds, so
+it would be generated again on every 1 MiB read. A larger top reads as
+zeros (black, as before it was lit) and nothing generates it. Tops are
+kept in memory (`LIT_TOP_CACHE_BYTES`, 64 MiB, 32 ZL16 tops), never on
+disk, so they need no fingerprint, and they follow the payload's rules
+otherwise: one generation per texture however many reads wait on it,
+under the same generation permits and road wait, served but not kept
+when a road tile was late, kept in memory when one failed, black and not
+kept when a recipe cannot be read or the encode fails. A read that
+reaches only the payload never generates the top, and the other way
+round. The levels X-Plane drops stay black. The earlier black top was
+the distance fade (fact 3); the fade below is now the dimmed levels
+alone, and the lit layer no longer switches off near the aircraft.
 
 **Fade ramp.** Because X-Plane pages levels in one at a time (fact 7), a
 texture would jump from full light straight to its top level, black
@@ -358,28 +358,31 @@ After ISPC, `generator/bc1_repair.rs` looks at every block of every
 encoded level (both encoders, through `bc1_levels`) whose decode has a
 tint its source does not have, at a margin of 2 (`TINT_MARGIN`), on a
 texel whose largest decoded channel is at least `BC1_FLOOR`. It searches
-the block's endpoints by coordinate descent, each endpoint's R, G and B
-one 565 step down or up, keeping every step that lowers the block's
-error, until none does; with every candidate the indices are chosen anew.
-A texel's error is `4 x ((dR - dG)^2 + (dB - dG)^2)` (`CHROMA_WEIGHT`)
-plus the square of its Rec.709 luminance difference plus 1000
-(`TINT_PENALTY`) if it decodes with a tint its source does not have, in
-stored values. The block keeps its mode (four colours while `c0 > c1`,
-three otherwise, whose transparent fourth entry is never chosen) and is
-replaced only when its error strictly drops. Blocks whose endpoints are
-both below the floor are skipped, as no colour of theirs can be lit. The
-repair works in place on the encoded bytes and allocates nothing. On the
-same 25 encodes it leaves no tint introduced at a margin of 2 (from 3,009
-green and 30,458 purple), and at a linear-light ratio of 1.5 (green when
-G > 1.5 x max(R, B) after an sRGB decode, purple when min(R, B) > 1.5 x G)
-1 green and 152 purple against 2,996 and 31,220, keeping 0.999 of the
+the block's endpoints by coordinate descent from the original endpoints
+with their indices chosen anew, each endpoint's R, G and B one 565 step
+down or up, keeping every step that lowers the block's error, until none
+does or 64 sweeps have run (`MAX_SWEEPS`; the probe's encodes needed at
+most 4); with every candidate the indices are chosen anew. A texel's
+error is `4 x ((dR - dG)^2 + (dB - dG)^2)` (`CHROMA_WEIGHT`) plus the
+square of its Rec.709 luminance difference plus 1000 (`TINT_PENALTY`) if
+it decodes with a tint its source does not have, in stored values. The
+block keeps its mode (four colours while `c0 > c1`, three otherwise,
+whose transparent fourth entry is never chosen) and is replaced only
+when its error strictly drops. Blocks whose endpoints are both below the
+floor are skipped, as no colour of theirs can be lit. The repair works
+in place on the encoded bytes and allocates nothing. On the same 25
+encodes it leaves no tint introduced at a margin of 2 (from 3,009 green
+and 30,458 purple), and at a linear-light ratio of 1.5 (green when G >
+1.5 x max(R, B) after an sRGB decode, purple when min(R, B) > 1.5 x G) 1
+green and 152 purple against 2,996 and 31,220, keeping 0.999 of the
 light (the tops 1.001). It costs about 1.5 ms per 1024 px payload and
-3.2 ms per 2048 px top (release, KCCR r1582 c659), against about 180 and
-700 ms to generate them. A margin of 4 is blind to it: the commonest codes
-differ from green by exactly 4, so at m = 4 BC1 seems to introduce 2 green
-and no purple, yet `(8, 4, 8)` carries 4.6 times the green's light in red
-and blue and `(16, 12, 16)` 1.9 times. The repair is judged against a
-D3D-exact decode; GPUs round the interpolated colours by about 1.
+3.2 ms per 2048 px top (release, KCCR r1582 c659), against about 190 ms
+(185 to 195 measured) and 700 ms to generate them. A margin of 4 is
+blind to it: the commonest codes differ from green by exactly 4, so at a
+margin of 4 BC1 seems to introduce 2 green and no purple, yet `(8, 4,
+8)` carries 4.6 times the green's light in red and blue and `(16, 12,
+16)` 1.9 times. The repair is judged against a D3D-exact decode; GPUs
+round the interpolated colours by about 1.
 
 A footprint without light is a fixed **minimal black DDS**: 4 × 4, BC1,
 with its full chain (4, 2 and 1 px levels), all blocks zero, 152 bytes
@@ -504,16 +507,17 @@ For each texel of the first visible level, the CPU implementation:
 
 `encode_visible` then averages the lower levels from the first visible
 level in linear light (see Mips in linear light), dims the fade levels,
-floors every level (see BC1 floor) and BC1-encodes them with the default ISPC
-encoder, whatever `texture.compressor` says. A lit payload is about a tenth
-of an ortho tile, so wiring the GPU channel worker into the lit path is not
-worth it now. A real ZL16 texture at 1024 px generated in about 130 ms
-warm and 147 ms cold before the LED stage, and generates in about 153 ms
-warm and 168 ms cold with it (release build, developer machine). Three
-things keep it there: recipes sit in a small table of tile slots rather
-than a hash map, patterns resolve once per tile and palette index, and
-the tiling caches the lattice corners neighbouring texels share (with the
-same bits as without the cache).
+floors every level (see BC1 floor), BC1-encodes them with the default
+ISPC encoder, whatever `texture.compressor` says, and repairs the blocks
+whose decode tints a dim texel (see BC1 endpoint repair). A lit payload
+is about a tenth of an ortho tile, so wiring the GPU channel worker into
+the lit path is not worth it now. A real ZL16 texture at 1024 px
+generated in about 130 ms warm and 147 ms cold before the LED stage, and
+generates in about 153 ms warm and 168 ms cold with it (release build,
+developer machine). Three things keep it there: recipes sit in a small
+table of tile slots rather than a hash map, patterns resolve once per
+tile and palette index, and the tiling caches the lattice corners
+neighbouring texels share (with the same bits as without the cache).
 
 Determinism (R13): hashes use fixed seeds and integer inputs, and the
 generator holds no state between calls, so the same recipe, art and
@@ -1525,9 +1529,13 @@ lights).
   The BC1 endpoint repair decodes the palette as bcdec does, repairs a
   dim lamp block ISPC tints purple (the purple decode is asserted first,
   so a changed encoder fails loudly), leaves a block without an
-  introduced tint byte for byte, keeps four-colour and three-colour
-  blocks in their mode, never raises a block's error over 2,000
-  pseudo-random dim blocks, ignores texels past a small level's edge, and
+  introduced tint byte for byte, keeps a four-colour and a three-colour
+  block in their mode when one step would equalise or swap their
+  endpoints (with no transparent texel), decodes no worse than ISPC over
+  2,000 pseudo-random dim blocks, repairs each block of a non-square level
+  against its own texels (lamps at two positions, mirrored, stay where
+  they are; the other blocks are untouched), ignores texels past a small
+  level's edge, and
   through `encode_visible` and `encode_top` leaves no introduced tint on
   a level of such lamps.
   The service generates the top once at twice the first visible size,

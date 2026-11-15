@@ -30,6 +30,11 @@ pub const CHROMA_WEIGHT: f32 = 4.0;
 /// tint first.
 pub const TINT_PENALTY: f32 = 1000.0;
 
+/// Most sweeps of the endpoint search over one block. Every kept step
+/// strictly lowers the block's error, so the search ends anyway; the cap
+/// bounds its cost. Over the flight 9 probe's 25 encodes it never bound.
+pub const MAX_SWEEPS: usize = 64;
+
 /// Bytes of one BC1 block.
 const BLOCK_BYTES: usize = 8;
 
@@ -111,11 +116,12 @@ fn texels(level: &RgbaImage, bx: u32, by: u32) -> Texels {
 }
 
 /// Repairs one block (see the module doc) when its decode has an
-/// introduced tint: coordinate descent over each endpoint's R, G and B, one
-/// 565 step at a time, keeping every step that lowers the block's error,
-/// until none does; then, if no step helped, the same endpoints with indices
-/// chosen anew. The block keeps its mode (four colours while `c0 > c1`, three
-/// and transparent black otherwise) and changes only when its error drops.
+/// introduced tint: the same endpoints with indices chosen anew, then
+/// coordinate descent over each endpoint's R, G and B, one 565 step at a
+/// time, keeping every step that lowers the block's error, until none does
+/// or [`MAX_SWEEPS`] sweeps have run. The block keeps its mode (four colours
+/// while `c0 > c1`, three and transparent black otherwise) and changes only
+/// when its error drops.
 fn repair_block(block: &mut [u8; BLOCK_BYTES], texels: &Texels) {
     let (c0, c1) = endpoints(block);
     let colours = palette(c0, c1);
@@ -131,8 +137,12 @@ fn repair_block(block: &mut [u8; BLOCK_BYTES], texels: &Texels) {
         |e: Endpoint| (0..32).contains(&e[0]) && (0..64).contains(&e[1]) && (0..32).contains(&e[2]);
     let mut best_error = block_error(block, texels);
     let mut best = None;
+    let (error, indices) = fit(c0, c1, texels);
+    if error < best_error {
+        (best_error, best) = (error, Some((c0, c1, indices)));
+    }
     let mut ends = [unpack(c0), unpack(c1)];
-    loop {
+    for _ in 0..MAX_SWEEPS {
         let mut improved = false;
         for channel in 0..6 {
             for step in [-1, 1] {
@@ -151,12 +161,6 @@ fn repair_block(block: &mut [u8; BLOCK_BYTES], texels: &Texels) {
         }
         if !improved {
             break;
-        }
-    }
-    if best.is_none() {
-        let (error, indices) = fit(c0, c1, texels);
-        if error < best_error {
-            best = Some((c0, c1, indices));
         }
     }
     if let Some((n0, n1, indices)) = best {
@@ -271,7 +275,7 @@ fn block_error(block: &[u8; BLOCK_BYTES], texels: &Texels) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::dds::{DdsFormat, ImageCompressor, IspcCompressor};
 
@@ -313,12 +317,27 @@ mod tests {
         std::array::from_fn(|i| [rgba[4 * i], rgba[4 * i + 1], rgba[4 * i + 2]])
     }
 
+    /// Texels of BC1 level `encoded` that decode with a tint `level`, the
+    /// image it was encoded from, does not have.
+    pub(crate) fn introduced_tints(encoded: &[u8], level: &RgbaImage) -> usize {
+        let (width, height) = level.dimensions();
+        let per_row = width.div_ceil(4) as usize;
+        let mut count = 0;
+        for (i, block) in encoded.chunks_exact(BLOCK_BYTES).enumerate() {
+            let (bx, by) = ((i % per_row) as u32, (i / per_row) as u32);
+            for (t, d) in decode(block).into_iter().enumerate() {
+                let (x, y) = (bx * 4 + t as u32 % 4, by * 4 + t as u32 / 4);
+                if x < width && y < height {
+                    let [r, g, b, _] = level.get_pixel(x, y).0;
+                    count += usize::from(introduced(d, [r, g, b]));
+                }
+            }
+        }
+        count
+    }
+
     fn introduced_count(block: &[u8], texels: &[[u8; 3]; 16]) -> usize {
-        decode(block)
-            .iter()
-            .zip(texels)
-            .filter(|(&d, &s)| introduced(d, s))
-            .count()
+        introduced_tints(block, &image(texels))
     }
 
     fn some(texels: &[[u8; 3]; 16]) -> Texels {
@@ -395,59 +414,57 @@ mod tests {
         block
     }
 
-    /// Texels 0..8 the lamp's (8, 6, 5), the rest black.
-    fn half_lamp() -> [[u8; 3]; 16] {
-        std::array::from_fn(|i| if i < 8 { [8, 6, 5] } else { [0; 3] })
+    /// Texels whose decode has alpha 0: three-colour mode's fourth entry.
+    fn transparent(block: &[u8]) -> usize {
+        let mut rgba = [0u8; 64];
+        bcdec_rs::bc1(block, &mut rgba, 16);
+        rgba.chunks_exact(4).filter(|p| p[3] == 0).count()
+    }
+
+    /// Repairs `block`, which stands for 16 texels of the lamp's
+    /// `(8, 6, 5)` and whose decode the lamp shows tinted, and asserts that
+    /// it keeps its mode, no texel decodes transparent and none is tinted.
+    /// Its endpoints are one 565 step apart, so a single step can equalise
+    /// or swap them: unguarded, the best repair of either block found here
+    /// changes its mode.
+    fn assert_repaired_in_its_mode(mut block: [u8; BLOCK_BYTES]) {
+        let lamp = [[8, 6, 5]; 16];
+        let (c0, c1) = endpoints(&block);
+        let four_colour = c0 > c1;
+        assert!(introduced_count(&block, &lamp) > 0, "{:?}", decode(&block));
+        repair_block(&mut block, &some(&lamp));
+        let (n0, n1) = endpoints(&block);
+        assert_eq!(
+            n0 > n1,
+            four_colour,
+            "mode kept: {:?} {:?}",
+            unpack(n0),
+            unpack(n1)
+        );
+        assert_eq!(transparent(&block), 0, "{:?}", decode(&block));
+        assert_eq!(introduced_count(&block, &lamp), 0, "{:?}", decode(&block));
     }
 
     #[test]
-    fn a_four_colour_block_stays_four_colour() {
-        // (1, 1, 1) decodes (8, 4, 8): purple over the lamp.
-        let texels = half_lamp();
-        let mut block = block_of(
-            [1, 1, 1],
-            [0, 0, 0],
+    fn a_four_colour_block_one_step_from_three_colours_stays_four_colour() {
+        // (0, 2, 0) decodes (0, 8, 0), green over the lamp; c1 is one green
+        // step below it.
+        assert_repaired_in_its_mode(block_of([0, 2, 0], [0, 1, 0], [0; 16]));
+    }
+
+    #[test]
+    fn a_three_colour_block_one_step_from_four_colours_stays_three_colour() {
+        // c0 < c1 by one red step; (1, 0, 1) decodes (8, 0, 8), purple over
+        // the lamp's second half.
+        assert_repaired_in_its_mode(block_of(
+            [0, 0, 1],
+            [1, 0, 1],
             std::array::from_fn(|i| usize::from(i >= 8)),
-        );
-        let (c0, c1) = endpoints(&block);
-        assert!(c0 > c1);
-        assert!(introduced_count(&block, &texels) > 0);
-        repair_block(&mut block, &some(&texels));
-        let (c0, c1) = endpoints(&block);
-        assert!(
-            c0 > c1,
-            "four colours kept: {:?} {:?}",
-            unpack(c0),
-            unpack(c1)
-        );
-        assert_eq!(introduced_count(&block, &texels), 0, "{:?}", decode(&block));
+        ));
     }
 
     #[test]
-    fn a_three_colour_block_stays_three_colour() {
-        // c0 <= c1: three colours and black, the lamp on c1.
-        let texels = half_lamp();
-        let mut block = block_of(
-            [0, 0, 0],
-            [1, 1, 1],
-            std::array::from_fn(|i| usize::from(i < 8)),
-        );
-        let (c0, c1) = endpoints(&block);
-        assert!(c0 <= c1);
-        assert!(introduced_count(&block, &texels) > 0);
-        repair_block(&mut block, &some(&texels));
-        let (c0, c1) = endpoints(&block);
-        assert!(
-            c0 <= c1,
-            "three colours kept: {:?} {:?}",
-            unpack(c0),
-            unpack(c1)
-        );
-        assert_eq!(introduced_count(&block, &texels), 0, "{:?}", decode(&block));
-    }
-
-    #[test]
-    fn the_repair_never_raises_a_blocks_error() {
+    fn a_repaired_block_decodes_no_worse_than_ispcs() {
         let mut repaired = 0;
         for n in 0..2000u64 {
             // Dim near-white or warm texels beside black, as lamps are.
@@ -472,6 +489,53 @@ mod tests {
             repaired += usize::from(after != before);
         }
         assert!(repaired > 0, "some blocks need a repair");
+    }
+
+    #[test]
+    fn each_block_is_repaired_against_its_own_texels() {
+        // An 8 x 12 level, 2 x 3 blocks: the lamp at block (1, 2), the lamp
+        // mirrored left to right at block (0, 1), sodium at block (0, 0),
+        // black elsewhere. A wrong block or texel mapping judges a block
+        // against texels it does not stand for.
+        let mirrored: [[u8; 3]; 16] = std::array::from_fn(|i| LAMP[i / 4 * 4 + 3 - i % 4]);
+        let level = RgbaImage::from_fn(8, 12, |x, y| {
+            let t = (y % 4 * 4 + x % 4) as usize;
+            let [r, g, b] = match (x / 4, y / 4) {
+                (1, 2) => LAMP[t],
+                (0, 1) => mirrored[t],
+                (0, 0) => [200, 120, 50],
+                _ => [0; 3],
+            };
+            image::Rgba([r, g, b, 255])
+        });
+        let encoded = ispc(&level);
+        let block = |bytes: &[u8], i: usize| bytes[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES].to_vec();
+        // Pinned: ISPC tints both lamps.
+        for i in [2, 5] {
+            assert!(
+                decode(&block(&encoded, i)).contains(&[8, 4, 8]),
+                "block {i}"
+            );
+        }
+        assert!(introduced_tints(&encoded, &level) > 0);
+        let mut repaired = encoded.clone();
+        repair_level(&mut repaired, &level);
+        assert_eq!(introduced_tints(&repaired, &level), 0);
+        // Each lamp is still where its texels are: black exactly where the
+        // source is black.
+        for (i, texels) in [(2, mirrored), (5, LAMP)] {
+            let decoded = decode(&block(&repaired, i));
+            for t in 0..16 {
+                assert_eq!(
+                    decoded[t] == [0; 3],
+                    texels[t] == [0; 3],
+                    "block {i} texel {t}"
+                );
+            }
+        }
+        for i in [0, 1, 3, 4] {
+            assert_eq!(block(&repaired, i), block(&encoded, i), "block {i}");
+        }
     }
 
     #[test]

@@ -155,6 +155,7 @@ fn bc1_levels(levels: &[RgbaImage]) -> Result<bytes::Bytes, crate::dds::DdsError
         bc1_repair::repair_level(&mut dds[at..at + len], level);
         at += len;
     }
+    debug_assert_eq!(at, dds.len(), "the encoder writes the levels in order");
     Ok(bytes::Bytes::from(dds).slice(DDS_HEADER_LEN..))
 }
 
@@ -459,31 +460,6 @@ mod tests {
         })
     }
 
-    /// Texels of BC1 level `encoded` (`size` px) that decode with a tint
-    /// `level`, the image it was encoded from, does not have.
-    fn introduced_tints(encoded: &[u8], level: &RgbaImage) -> usize {
-        let size = level.width();
-        let per_row = size.div_ceil(4);
-        let mut count = 0;
-        for (i, block) in encoded.chunks_exact(8).enumerate() {
-            let mut rgba = [0u8; 64];
-            bcdec_rs::bc1(block, &mut rgba, 16);
-            let (bx, by) = (i as u32 % per_row, i as u32 / per_row);
-            for t in 0..16u32 {
-                let (x, y) = (bx * 4 + t % 4, by * 4 + t / 4);
-                if x < size && y < size {
-                    let d = &rgba[4 * t as usize..4 * t as usize + 3];
-                    let s = level.get_pixel(x, y).0;
-                    count += usize::from(bc1_repair::introduced(
-                        [d[0], d[1], d[2]],
-                        [s[0], s[1], s[2]],
-                    ));
-                }
-            }
-        }
-        count
-    }
-
     /// One level BC1-encoded by ISPC alone, without the repair.
     fn unrepaired(level: &RgbaImage) -> Vec<u8> {
         let dds = crate::dds::DdsEncoder::new(crate::dds::DdsFormat::BC1)
@@ -503,13 +479,13 @@ mod tests {
         }
         assert_eq!(chain[0].get_pixel(0, 0).0, [9, 7, 5, 255]);
         // Pinned: ISPC alone tints the nearest level purple.
-        assert!(introduced_tints(&unrepaired(&chain[0]), &chain[0]) > 0);
+        assert!(bc1_repair::tests::introduced_tints(&unrepaired(&chain[0]), &chain[0]) > 0);
         let payload = encode_visible(img).unwrap();
         let mut at = 0;
         for (n, level) in chain.iter().enumerate() {
             let len = bc1_repair::level_len(level.width(), level.height());
             assert_eq!(
-                introduced_tints(&payload[at..at + len], level),
+                bc1_repair::tests::introduced_tints(&payload[at..at + len], level),
                 0,
                 "level {n}"
             );
@@ -526,8 +502,11 @@ mod tests {
         dim(&mut level, TOP_GAIN);
         assert_eq!(level.get_pixel(0, 0).0, [9, 7, 5, 255]);
         assert_eq!(level.get_pixel(3, 0).0, [8, 6, 5, 255]);
-        assert!(introduced_tints(&unrepaired(&level), &level) > 0);
-        assert_eq!(introduced_tints(&encode_top(img).unwrap(), &level), 0);
+        assert!(bc1_repair::tests::introduced_tints(&unrepaired(&level), &level) > 0);
+        assert_eq!(
+            bc1_repair::tests::introduced_tints(&encode_top(img).unwrap(), &level),
+            0
+        );
     }
 
     #[test]
