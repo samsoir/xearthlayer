@@ -320,13 +320,13 @@ purple texels showed in the lit layer. Over 20 KCCR ZL16 textures at
 1024 px the generator itself makes no green or purple dim texels. Every
 encoded level is therefore floored before BC1, after its dimming: a texel
 whose largest stored R, G or B is below 8 (`BC1_FLOOR`) becomes black,
-its alpha untouched. Two counts after BC1 at full light, by two methods
-(green when decoded G > max(R, B) + 2, purple when min(R, B) > G + 2):
-
-| Method | Green | Purple | With the floor |
-|---|---|---|---|
-| Flight 7 probe: every decoded texel of the 20 textures, those whose source was black included (block interpolation can decode them purple) | 151,263 | 61,088 | 3,947 green, 13,585 purple; 0.916 of the decoded light kept, against 0.960 without |
-| The first level encoded alone from the undimmed image with real roads, every decoded texel counted | 150,100 | 22,016 | 3,853 green, 13,525 purple |
+its alpha untouched. Counted over every decoded texel after BC1 at full
+light (green when decoded G > max(R, B) + 2, purple when
+min(R, B) > G + 2), two probes found about 150,000 green texels without
+the floor and about 3,900 green and 13,500 purple with it, the floor
+keeping 0.916 of the decoded light against 0.960 without. Their purple
+counts without the floor differ, 61,088 and 22,016, for a reason not
+found; with the floor they agree.
 
 At the dimmed levels as served the counts are lower: 1,727 green and
 8,740 purple over the 20 first visible levels at a quarter, and 639 green
