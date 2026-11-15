@@ -568,7 +568,6 @@ pub(crate) mod tests {
         m.add(&DsfRoads {
             tile,
             overlay: true,
-            net_def: Some("n".into()),
             exclusions: vec![],
             chains,
         });
@@ -1002,7 +1001,6 @@ pub(crate) mod tests {
             m.add(&DsfRoads {
                 tile,
                 overlay: true,
-                net_def: Some("n".into()),
                 exclusions: vec![],
                 chains: c.clone(),
             });

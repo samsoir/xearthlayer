@@ -560,7 +560,6 @@ mod tests {
         DsfRoads {
             tile: (46, 6),
             overlay: true,
-            net_def: Some("x.net".into()),
             exclusions: zones.iter().map(|z| Exclusion::parse(z).unwrap()).collect(),
             chains: c,
         }

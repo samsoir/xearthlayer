@@ -1,5 +1,6 @@
 //! Streaming DSF reader for road networks. Reads the HEAD properties
-//! (corner, overlay, `sim/exclude_net`), the NETW definition, the 32-bit
+//! (corner, overlay, `sim/exclude_net`), whether DEFN's NETW names a
+//! network (the name is not kept), the 32-bit
 //! point pools and the command stream, keeping the network segments whose
 //! subtype `keep` accepts. Every command is sized, so the others are
 //! skipped byte-exactly.
@@ -124,7 +125,6 @@ pub struct DsfRoads {
     /// `(lat, lon)` of the south-west corner.
     pub tile: (i32, i32),
     pub overlay: bool,
-    pub net_def: Option<String>,
     pub exclusions: Vec<Exclusion>,
     pub chains: Chains,
 }
@@ -133,7 +133,7 @@ pub struct DsfRoads {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadMode {
     /// A DSF that is not an overlay (a base mesh) stops right after HEAD:
-    /// its `DsfRoads` has `overlay == false`, no network and no chains.
+    /// its `DsfRoads` has `overlay == false` and no chains.
     OverlaysOnly,
     /// Every DSF is read until its roads are known. Tests only: production
     /// reads overlays, and a base mesh only to its HEAD.

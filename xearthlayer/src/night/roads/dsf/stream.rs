@@ -169,14 +169,16 @@ fn read_roads(
     }
     let end = len - FOOTER;
     let mut head = None;
-    let mut net_def: Option<Option<String>> = None;
+    // Whether DEFN has been read, and then whether it names a network. The
+    // name itself is never used.
+    let mut has_network: Option<bool> = None;
     let mut geod = None;
     let mut cmds = None;
     while s.pos < end {
         let (id, size) = s.atom(end)?;
         match id {
             HEAD => head = Some(Head::parse(&s.retain(size)?)?),
-            DEFN => net_def = Some(network_definition(&s.retain(size)?)?),
+            DEFN => has_network = Some(declares_network(&s.retain(size)?)?),
             GEOD => geod = Some(read_geod(&mut s, size, limits.pool_points)?),
             CMDS => cmds = Some(s.retain(size)?),
             _ => s.skip(size)?,
@@ -187,12 +189,12 @@ fn read_roads(
         // Network chains index only PO32 points: without any, CMDS can
         // hold no segment and is not read (mesh DSFs declare a network
         // yet carry only empty PO32 pools).
-        let no_network = matches!(net_def, Some(None));
+        let no_network = has_network == Some(false);
         let no_points = geod
             .as_deref()
             .is_some_and(|g: &[Pool]| g.iter().all(|p| p.len() == 0));
         let complete = geod.is_some() && cmds.is_some();
-        if head.is_some() && net_def.is_some() && (no_network || no_points || complete) {
+        if head.is_some() && has_network.is_some() && (no_network || no_points || complete) {
             break;
         }
     }
@@ -201,11 +203,10 @@ fn read_roads(
     let mut roads = DsfRoads {
         tile: (head.south.round() as i32, head.west.round() as i32),
         overlay: head.overlay,
-        net_def: net_def.flatten().filter(|_| !base_skipped),
         exclusions: head.exclusions,
         chains: Chains::new(),
     };
-    if roads.net_def.is_none() {
+    if !has_network.unwrap_or(false) || base_skipped {
         return Ok((roads, WalkStats::default()));
     }
     let pools = geod.ok_or(DsfError::BadAtom)?;
@@ -396,11 +397,12 @@ impl Head {
     }
 }
 
-/// The first NETW string of DEFN; none when absent or empty.
-fn network_definition(body: &[u8]) -> Result<Option<String>, DsfError> {
+/// Whether DEFN's first NETW string names a network: false when NETW is
+/// absent or its first string is empty.
+fn declares_network(body: &[u8]) -> Result<bool, DsfError> {
     Ok(child(body, NETW)?
         .and_then(|b| strings(b).into_iter().next())
-        .filter(|s| !s.is_empty()))
+        .is_some_and(|s| !s.is_empty()))
 }
 
 /// GEOD's PO32 pools, each paired with its SC32, at most `max_points`
@@ -442,11 +444,11 @@ mod tests {
     use crate::night::roads::dsf::{read_dsf, ReadMode};
 
     #[test]
-    fn reads_properties_net_and_exclusions() {
+    fn reads_properties_chains_and_exclusions() {
         let r = read_dsf(&two_segment_dsf(0).bytes(), |_| true).unwrap();
         assert_eq!(r.tile, (46, 6));
         assert!(r.overlay);
-        assert_eq!(r.net_def.as_deref(), Some("lib/g10/roads_EU.net"));
+        assert_eq!(r.chains.len(), 2, "a declared network gives its chains");
         assert_eq!(r.exclusions.len(), 1);
     }
 
@@ -455,7 +457,6 @@ mod tests {
         let mut b = Builder::new(46, 6);
         b.props.push(("sim/exclude_obj".into(), "6/46/7/47".into()));
         let r = read_dsf(&b.bytes(), |_| true).unwrap();
-        assert!(r.net_def.is_none());
         assert!(r.chains.is_empty());
         assert!(r.exclusions.is_empty(), "only exclude_net is kept");
     }
@@ -465,7 +466,6 @@ mod tests {
         let mut b = two_segment_dsf(0);
         b.nets = vec![String::new()];
         let r = read_dsf(&b.bytes(), |_| true).unwrap();
-        assert!(r.net_def.is_none());
         assert!(r.chains.is_empty());
     }
 
@@ -554,7 +554,7 @@ mod tests {
             // here (read_bytes counts what we read) but cost the time.
             let path = write_dsf(dir.path(), "+46+006.dsf", &dsf, sevenz);
             let (r, stats) = read_dsf_file(&path, |_| true, ReadMode::Any).unwrap();
-            assert!(r.net_def.is_none());
+            assert!(r.chains.is_empty());
             assert_eq!(r.tile, (46, 6));
             assert!(stats.file_bytes > 2 << 20, "7z {sevenz}");
             assert!(stats.read_bytes < 4096, "7z {sevenz}: {stats:?}");
@@ -575,7 +575,7 @@ mod tests {
             let (r, stats) = read_dsf_file(&path, |_| true, ReadMode::OverlaysOnly).unwrap();
             assert!(!r.overlay, "7z {sevenz}");
             assert_eq!(r.tile, (46, 6));
-            assert!(r.net_def.is_none() && r.chains.is_empty(), "7z {sevenz}");
+            assert!(r.chains.is_empty(), "7z {sevenz}");
             let head = 12 + top_atoms(&dsf)[0].len() as u64;
             assert_eq!(stats.read_bytes, head, "7z {sevenz}: {stats:?}");
             let (all, _) = read_dsf_file(&path, |_| true, ReadMode::Any).unwrap();
@@ -622,7 +622,6 @@ mod tests {
         b.cmds = vec![16; 1 << 20]; // a megabyte of TerrainPatch
         let path = write_dsf(dir.path(), "+79+012.dsf", &b.bytes(), false);
         let (r, stats) = read_dsf_file(&path, |_| true, ReadMode::Any).unwrap();
-        assert_eq!(r.net_def.as_deref(), Some("lib/g10/roads_EU.net"));
         assert!(r.chains.is_empty());
         assert!(stats.read_bytes < 4096, "{stats:?}");
     }
@@ -640,11 +639,28 @@ mod tests {
     }
 
     #[test]
+    fn a_base_mesh_is_passed_over_wherever_its_defn_sits() {
+        // DEFN ahead of HEAD: the network is known before the mesh is seen
+        // to be a base mesh, and overlays only must still give it no roads
+        // (and not an error for the GEOD it never read).
+        let mut b = Builder::new(46, 6);
+        b.road(46, 6, 100, &[(6.1, 46.1), (6.2, 46.2)]);
+        let dsf = b.bytes();
+        let a = top_atoms(&dsf);
+        let swapped = assemble(&[&a[1], &a[0], &a[2], &a[3]]);
+        let len = swapped.len() as u64;
+        let r = read_dsf_stream(&mut &swapped[..], len, |_| true, ReadMode::OverlaysOnly).unwrap();
+        assert!(!r.overlay);
+        assert!(r.chains.is_empty());
+        let all = read_dsf_stream(&mut &swapped[..], len, |_| true, ReadMode::Any).unwrap();
+        assert_eq!(all.chains.len(), 1, "read in full when asked");
+    }
+
+    #[test]
     fn an_absent_defn_is_no_network() {
         let dsf = two_segment_dsf(0).bytes();
         let a = top_atoms(&dsf);
         let r = read_dsf(&assemble(&[&a[0], &a[2], &a[3]]), |_| true).unwrap();
-        assert!(r.net_def.is_none());
         assert!(r.chains.is_empty());
     }
 
@@ -825,10 +841,14 @@ mod tests {
     fn timing_dsfs_without_roads() {
         let xp = "/media/FlightSim/X-Plane 12-beta";
         let mesh = "Custom Scenery/Svalbard4XPlane - MESH/Earth nav data/+70+010";
-        for path in [
-            format!("{xp}/Global Scenery/Global Airports/Earth nav data/+50-010/+51-001.dsf"),
-            format!("{xp}/{mesh}/+79+012.dsf"),
-            format!("{xp}/{mesh}/+78+016.dsf"),
+        // The airport declares no network: reading stops after DEFN.
+        for (path, no_network) in [
+            (
+                format!("{xp}/Global Scenery/Global Airports/Earth nav data/+50-010/+51-001.dsf"),
+                true,
+            ),
+            (format!("{xp}/{mesh}/+79+012.dsf"), false),
+            (format!("{xp}/{mesh}/+78+016.dsf"), false),
         ] {
             let started = std::time::Instant::now();
             let (r, stats) = read_dsf_file(
@@ -838,13 +858,12 @@ mod tests {
             )
             .unwrap();
             println!(
-                "{path}: {} ms, net {:?}, {} segments, {stats:?}",
+                "{path}: {} ms, {} segments, {stats:?}",
                 started.elapsed().as_millis(),
-                r.net_def,
                 r.chains.len()
             );
             assert!(r.chains.is_empty());
-            if r.net_def.is_none() {
+            if no_network {
                 assert!(stats.read_bytes < stats.file_bytes / 10, "{stats:?}");
             }
         }

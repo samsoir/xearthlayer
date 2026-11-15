@@ -1,8 +1,8 @@
 //! The road cache's bytes for one DSF's extraction (`DsfRoads`).
 //!
 //! Little-endian: `u32 version | i32 lat | i32 lon | u8 overlay |
-//! u32 net_len + bytes | u8 has_net | u32 n_zones, per zone: 4 f64,
-//! u32 n_poly, n_poly * (f64, f64) | u32 n_chains | u32 n_points |
+//! u32 n_zones, per zone: 4 f64, u32 n_poly, n_poly * (f64, f64) |
+//! u32 n_chains | u32 n_points |
 //! (n_chains + 1) u32 start | n_chains u8 subtype | n_points f32 lon |
 //! n_points f32 lat`. Decoding takes each run of bytes before it allocates
 //! for it, so a corrupt count can never ask for more memory than the entry
@@ -15,7 +15,7 @@ use super::exclusion::Exclusion;
 /// when the layout changes. An entry of another version does not decode
 /// and is re-extracted. What an extraction keeps is
 /// `service::ROAD_EXTRACT_VERSION`'s.
-pub const ROAD_CODEC_VERSION: u32 = 1;
+pub const ROAD_CODEC_VERSION: u32 = 2;
 
 /// Bytes of one zone with no polygon: four f64 and a u32 vertex count.
 const MIN_ZONE_BYTES: usize = 36;
@@ -27,10 +27,6 @@ pub fn encode_roads(r: &DsfRoads) -> Vec<u8> {
     o.extend_from_slice(&r.tile.0.to_le_bytes());
     o.extend_from_slice(&r.tile.1.to_le_bytes());
     o.push(u8::from(r.overlay));
-    let net = r.net_def.as_deref().unwrap_or("").as_bytes();
-    o.extend_from_slice(&(net.len() as u32).to_le_bytes());
-    o.extend_from_slice(net);
-    o.push(u8::from(r.net_def.is_some()));
     o.extend_from_slice(&(r.exclusions.len() as u32).to_le_bytes());
     for z in &r.exclusions {
         for v in [z.west, z.south, z.east, z.north] {
@@ -129,9 +125,6 @@ pub fn decode_roads(b: &[u8]) -> Option<DsfRoads> {
     }
     let tile = (r.i32()?, r.i32()?);
     let overlay = r.flag()?;
-    let n = r.count()?;
-    let net = String::from_utf8(r.take(n)?.to_vec()).ok()?;
-    let net_def = r.flag()?.then_some(net);
 
     let zones = r.count()?;
     if zones.checked_mul(MIN_ZONE_BYTES)? > r.remaining() {
@@ -175,7 +168,6 @@ pub fn decode_roads(b: &[u8]) -> Option<DsfRoads> {
     Some(DsfRoads {
         tile,
         overlay,
-        net_def,
         exclusions,
         chains: Chains {
             lon,
@@ -201,7 +193,6 @@ mod tests {
         DsfRoads {
             tile: (46, 6),
             overlay: true,
-            net_def: None,
             exclusions: vec![],
             chains,
         }
@@ -210,7 +201,6 @@ mod tests {
     #[test]
     fn round_trips_every_field() {
         let r = DsfRoads {
-            net_def: Some("lib/g10/roads_EU.net".into()),
             exclusions: vec![
                 Exclusion::parse("6/46/7/47").unwrap(),
                 Exclusion::parse("6/46/7/47;6,46,7,46,6,47").unwrap(),
@@ -218,6 +208,26 @@ mod tests {
             ..roads(chains())
         };
         assert_eq!(decode_roads(&encode_roads(&r)), Some(r));
+    }
+
+    #[test]
+    fn an_entry_of_the_previous_layout_is_rejected() {
+        // Version 1 carried the network definition name between the overlay
+        // flag and the zones; its bytes must never be read as version 2.
+        let b = encode_roads(&roads(chains()));
+        assert_eq!(&b[..4], &ROAD_CODEC_VERSION.to_le_bytes());
+        assert_eq!(ROAD_CODEC_VERSION, 2);
+        let mut old = b.clone();
+        old[..4].copy_from_slice(&1u32.to_le_bytes());
+        assert!(decode_roads(&old).is_none());
+    }
+
+    #[test]
+    fn a_dsf_without_roads_or_zones_is_version_tile_overlay_and_three_counts() {
+        // u32 version, i32 lat, i32 lon, u8 overlay, then zone, chain and
+        // point counts and the one start offset an empty chain list holds.
+        let b = encode_roads(&roads(Chains::new()));
+        assert_eq!(b.len(), 4 + 4 + 4 + 1 + 4 + 4 + 4 + 4);
     }
 
     #[test]
@@ -244,7 +254,6 @@ mod tests {
     fn truncated_or_altered_entries_are_rejected() {
         let r = DsfRoads {
             exclusions: vec![Exclusion::parse("6/46/7/47;6,46,7,46,6,47").unwrap()],
-            net_def: Some("x.net".into()),
             ..roads(chains())
         };
         let b = encode_roads(&r);
@@ -263,8 +272,8 @@ mod tests {
     fn inconsistent_chain_offsets_are_rejected() {
         let b = encode_roads(&roads(chains()));
         // Offsets start after the three counts that precede them:
-        // header 13 + net len 4 + flag 1 + zones 4 + chains 4 + points 4.
-        let start0 = 13 + 4 + 1 + 4 + 4 + 4;
+        // header 13 + zones 4 + chains 4 + points 4.
+        let start0 = 13 + 4 + 4 + 4;
         for (at, value) in [(0, 1u32), (1, 99), (1, 6), (2, 4)] {
             let mut v = b.clone();
             let o = start0 + at * 4;
@@ -272,7 +281,7 @@ mod tests {
             assert!(decode_roads(&v).is_none(), "offset {at} = {value}");
         }
         let mut v = b.clone();
-        v[13 + 4 + 1 + 4..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        v[13 + 4..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(decode_roads(&v).is_none(), "declared chain count");
     }
 
@@ -293,14 +302,10 @@ mod tests {
 
     #[test]
     fn declared_counts_beyond_the_bytes_are_rejected_without_allocating() {
-        // zones = u32::MAX straight after an empty net definition.
+        // zones = u32::MAX straight after the 13 header bytes.
         let mut v = encode_roads(&roads(Chains::new()));
-        let zones_at = 13 + 4 + 1;
+        let zones_at = 13;
         v[zones_at..zones_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(decode_roads(&v).is_none());
-        // net length = u32::MAX.
-        let mut v = encode_roads(&roads(Chains::new()));
-        v[13..17].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(decode_roads(&v).is_none());
         // A zone's vertex count = u32::MAX: after the zone count (4) and the
         // zone's four f64 (32).

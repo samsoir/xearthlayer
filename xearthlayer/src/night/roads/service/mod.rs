@@ -64,12 +64,13 @@ pub const ROAD_GENERATE_WAIT: Duration = Duration::from_secs(10);
 pub const ROAD_TILE_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 /// Stamped into every road disk cache entry and hashed into its key: bump
 /// it when what one DSF's extraction keeps, or which DSFs are stored,
-/// changes (the reader, the subtype filter, the codec's input). Version 3
+/// changes (the reader, the subtype filter, the codec's input or layout). Version 3
 /// keeps the glowing classes only; version 2 also kept local streets,
 /// minor roads and footways; version 1 also stored the base meshes a
-/// fallback read. Older keys are never looked up again. It guards road
-/// entries only; lit payloads are guarded by `ROADS_VERSION`.
-pub const ROAD_EXTRACT_VERSION: u32 = 3;
+/// fallback read. Version 4 stores no network definition name (the codec's
+/// layout changed with it). Older keys are never looked up again. It guards
+/// road entries only; lit payloads are guarded by `ROADS_VERSION`.
+pub const ROAD_EXTRACT_VERSION: u32 = 4;
 /// DSF-open hints are ignored while this many builds are pending, so a
 /// burst of hints cannot queue ahead of the builds a probe or a generation
 /// is waiting on. Builds those ask for are never refused.

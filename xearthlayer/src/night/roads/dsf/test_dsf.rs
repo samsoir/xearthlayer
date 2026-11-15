@@ -245,7 +245,6 @@ mod tests {
         let mut b = Builder::new(46, 6);
         b.road(46, 6, 30, &[(6.1, 46.1), (6.2, 46.15), (6.3, 46.2)]);
         let r = read_dsf(&b.bytes(), |_| true).unwrap();
-        assert_eq!(r.net_def.as_deref(), Some("lib/g10/roads.net"));
         assert_eq!(r.chains.subtype, vec![30]);
         assert_eq!(r.chains.points(0), 0..3);
     }
