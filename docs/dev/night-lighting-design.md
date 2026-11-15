@@ -214,8 +214,8 @@ With the texture quality setting `t` (0 to 4):
 - X-Plane drops `4 − t` top levels at load. XEL puts
   `B = (4 − t) + 1` levels above the first visible one (R15): the ones
   X-Plane drops are black, and the one it uploads (the uploaded top, twice
-  the first visible level's size) is generated at its own size, at an
-  eighth of the light (see Uploaded top below).
+  the first visible level's size) is generated at its own size, at a
+  twelfth of the light (see Uploaded top below).
 - The first visible level `F` is 1024 px for a ZL16 texture, halving per
   zoom level above 16 and doubling per zoom level below it (512 px at ZL17,
   256 px at ZL18), about 7.5 m per texel throughout.
@@ -250,8 +250,9 @@ texels in 2 x 2 copies), and with green and purple texels (see BC1
 floor). The uploaded top is now generated at its own size, twice the
 first visible level (2048 px, 3.75 m texels at ZL16), when X-Plane first
 reads a byte range inside it, and encoded by `encode_top`: one BC1 level,
-no chain, its stored values scaled by `TOP_GAIN` (`(1/8)^(1/2.2)`, an
-eighth of the light) and floored. Only the textures whose top X-Plane
+no chain, its stored values scaled by `TOP_GAIN` (`(1/12)^(1/2.2)`, a
+twelfth of the light; at an eighth, flight 8, the near field was still
+too bright) and floored. Only the textures whose top X-Plane
 loads pay for it: on a KCCR ZL16 texture with real roads (release build)
 raster, generation and BC1 take about 720 ms at 2048 px against about
 190 ms for the payload at 1024 px. A top holds a generation permit that
@@ -282,7 +283,7 @@ one visible square. The first visible level
 gives a quarter of the light and the next half (`FADE_RAMP`,
 `(1/4)^(1/2.2)` and `(1/2)^(1/2.2)` in stored value, since X-Plane decodes
 sRGB), so each texture steps from full to half to a quarter, one stop per
-level, and to an eighth at the uploaded top (`TOP_GAIN`).
+level, and to a twelfth at the uploaded top (`TOP_GAIN`).
 The chain is downsampled from the undimmed image, so every coarser level
 is at full light, and the ramp costs no bytes. The nearest level is cut
 back so the ground under X-Plane's 3D roads and lights is only faintly
@@ -734,7 +735,7 @@ commercial flags for the category; SDGSAT-1 colour data.
 ## Road lights
 
 Close to the aircraft X-Plane's 3D roads and their lights take over,
-over the lit layer at a quarter of its light, and at an eighth on the
+over the lit layer at a quarter of its light, and at a twelfth on the
 nearest textures, whose generated top level X-Plane uploads. The lit layer's streets are
 Laminar's pattern art, not real roads, so without road lights a 3D road
 appears where the lit texture showed no road to match, and a road across
@@ -1470,7 +1471,7 @@ lights).
   degree line, where two tiles' recipes meet; an empty footprint gives
   the minimal black DDS; the levels X-Plane drops are all zero, and the
   uploaded top is the generated top's bytes, at any split of the read;
-  a missing top reads as zeros. `encode_top` gives one level at an eighth
+  a missing top reads as zeros. `encode_top` gives one level at a twelfth
   of the light, and both encoders floor a texel at 7 and keep one at 8.
   The service generates the top once at twice the first visible size,
   coalesces concurrent top reads, never generates the top for a payload
@@ -1530,7 +1531,7 @@ Feature: Night lighting on ortho scenery
     And the texture quality setting is 4
     When X-Plane reads its _LIT.dds
     Then the file is a DXT1 DDS with a 2048 px top level
-    And the top level is generated at an eighth of the light
+    And the top level is generated at a twelfth of the light
     And the next level has non-zero content
     And stat and the read agree on size
 

@@ -299,7 +299,7 @@ enum Part {
     /// memory and on disk.
     Payload,
     /// The top level X-Plane uploads, twice the first visible level's
-    /// size, at an eighth of the light; cached in memory only.
+    /// size, at a twelfth of the light; cached in memory only.
     Top,
 }
 
@@ -1150,8 +1150,8 @@ mod tests {
                 "short read at EOF"
             );
             assert!(visible.iter().any(|&b| b != 0), "generated light");
-            // The top level X-Plane uploads is generated on its own, at an
-            // eighth of the light.
+            // The top level X-Plane uploads is generated on its own, at a
+            // twelfth of the light.
             let top = source
                 .read(&name, layout.uploaded_top_start(), 1 << 20)
                 .await;
@@ -1364,6 +1364,16 @@ mod tests {
             let entry = d.get(&key).await.unwrap().expect("the payload is written");
             let fp = source.fingerprint(&name).await.unwrap();
             assert!(crate::night::decode_entry(entry, &fp, layout.payload_len()).is_some());
+            // The memory provider's count is eventually consistent (moka
+            // applies a write on its next housekeeping pass, at most 300 ms
+            // after an operation): keep operating until it has caught up.
+            for _ in 0..100 {
+                if d.entry_count() >= 1 {
+                    break;
+                }
+                let _ = d.get(&key).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             assert_eq!(d.entry_count(), 1, "and nothing else");
         }
 
