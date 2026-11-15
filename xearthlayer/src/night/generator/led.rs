@@ -7,6 +7,8 @@
 //! times `LedModel::energy`, so Laminar's street pattern survives and LED
 //! never reads dimmer than the sodium it replaces.
 
+use std::sync::OnceLock;
+
 use super::noise::{hash2, unit};
 use super::SRGB_GAMMA;
 
@@ -70,6 +72,32 @@ pub struct RegionTone {
     pub kelvin_shift: f64,
 }
 
+/// How the sodium texels the LED stage leaves alone are toned (#363).
+///
+/// Laminar's sodium is about as saturated as a 2700 K blackbody, which is
+/// physically fair for high-pressure sodium, but seen from the air a city's
+/// sodium districts read less orange than the art. A texel is mixed `mix`
+/// of the way towards the white of `kelvin` at its own luminance, then its
+/// luminance is raised by `mix` of `energy`, because a less saturated light
+/// of equal luminance looks dimmer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SodiumTone {
+    /// How far towards the white, 0 (Laminar's bytes) to 1.
+    pub mix: f32,
+    pub kelvin: f64,
+    /// Luminance multiplier at a full mix; a partial mix gets that share.
+    pub energy: f32,
+}
+
+impl SodiumTone {
+    /// Laminar's sodium bytes, untouched.
+    pub const NONE: Self = Self {
+        mix: 0.0,
+        kelvin: 3200.0,
+        energy: 1.0,
+    };
+}
+
 /// The whole LED model. Provisional values, tuned in flight.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LedModel {
@@ -82,6 +110,8 @@ pub struct LedModel {
     /// Above 1: saturated orange looks brighter than white of equal
     /// luminance, and LED should read brighter, not merely equal.
     pub energy: f32,
+    /// The tone of the texels that stay sodium.
+    pub sodium: SodiumTone,
 }
 
 const fn region(share_scale: f64, kelvin_shift: f64) -> RegionTone {
@@ -93,32 +123,47 @@ const fn region(share_scale: f64, kelvin_shift: f64) -> RegionTone {
 
 impl LedModel {
     pub const DEFAULT: Self = Self {
+        // Shares raised in #363: from the air, cities that have converted
+        // their street lighting read mostly white, residential included.
+        // Whites cooled in #363: most conversions were 4000 K (US 4000 to
+        // 5000 K before 2016, UK councils mostly 4000 K or more), with
+        // newer residential streets warmer; at 3200 K a distant city
+        // averaged to amber even when nine texels in ten were LED.
         industrial: Tone {
-            share: 0.80,
+            share: 0.90,
             kelvin: 4500.0,
         },
         urban_bright: Tone {
-            share: 0.75,
-            kelvin: 4000.0,
+            share: 0.90,
+            kelvin: 4500.0,
         },
         urban_dim: Tone {
-            share: 0.45,
-            kelvin: 3200.0,
+            share: 0.80,
+            kelvin: 4000.0,
         },
-        // Na, Sa, Eu, Af, As, Oc, Unknown
+        // Na, Sa, Eu, Af, As, Oc, Unknown. The shifts were halved in #363:
+        // European guidance leans warm for residential streets, but its
+        // practice and the US's converge on 4000 K; how much a region has
+        // converted is the share's job, not the temperature's.
         regions: [
-            region(1.0, 400.0),
-            region(0.7, 400.0),
-            region(0.9, -400.0),
-            region(0.5, 400.0),
-            region(0.8, -400.0),
-            region(0.9, -400.0),
+            region(1.0, 200.0),
+            region(0.7, 200.0),
+            region(0.9, -200.0),
+            region(0.5, 200.0),
+            region(0.8, -200.0),
+            region(0.9, -200.0),
             region(0.75, 0.0),
         ],
         energy: 1.25,
+        sodium: SodiumTone {
+            mix: 0.30,
+            kelvin: 3200.0,
+            energy: 1.125,
+        },
     };
 
-    /// No LED anywhere: the generator's output is the sodium-only one.
+    /// No LED anywhere and Laminar's sodium untouched: the generator's
+    /// output is the sodium-only one.
     pub const OFF: Self = Self {
         industrial: Tone {
             share: 0.0,
@@ -132,6 +177,7 @@ impl LedModel {
             share: 0.0,
             kelvin: 3200.0,
         },
+        sodium: SodiumTone::NONE,
         ..Self::DEFAULT
     };
 
@@ -163,8 +209,12 @@ pub const URBAN_BRIGHT_HI_NW: f64 = 80.0;
 
 /// How bright (0 dim, 1 downtown) urban ground is: a smoothstep in `ln(R)`.
 pub fn bright_weight(radiance_nw: f64) -> f64 {
-    if radiance_nw.is_nan() || radiance_nw <= 0.0 {
+    // Outside the ramp the smoothstep is exactly 0 or 1: no logarithm.
+    if radiance_nw.is_nan() || radiance_nw <= URBAN_BRIGHT_LO_NW {
         return 0.0;
+    }
+    if radiance_nw >= URBAN_BRIGHT_HI_NW {
+        return 1.0;
     }
     let t = ((radiance_nw.ln() - URBAN_BRIGHT_LO_NW.ln())
         / (URBAN_BRIGHT_HI_NW.ln() - URBAN_BRIGHT_LO_NW.ln()))
@@ -203,25 +253,72 @@ pub struct Patch {
 /// The patch at Web Mercator `(x, y)`: the nearest of the 3 x 3 jittered
 /// cell centres around it. A function of position only.
 pub fn patch_at(x: f64, y: f64) -> Patch {
+    patch_at_cached(x, y, &mut PatchCache::default())
+}
+
+/// A jittered cell centre (in cells) and its cell.
+type Centre = (f64, f64, i64, i64);
+
+/// The 3 x 3 jittered centres around the last cell a texel fell in, and the
+/// last patch drawn. A cell is about 53 ZL16 texels wide, so texels along a
+/// row reuse its centres instead of hashing them again. The cached values
+/// are the ones computed without a cache, so a patch is the same either way.
+#[derive(Debug, Default)]
+pub struct PatchCache {
+    cell: Option<(i64, i64)>,
+    /// In the order they are compared: the first nearest wins.
+    centres: [Centre; 9],
+    last: Option<((i64, i64), Patch)>,
+}
+
+/// `patch_at`, reusing the centres and the last patch from `cache`.
+pub fn patch_at_cached(x: f64, y: f64, cache: &mut PatchCache) -> Patch {
     let (gx, gy) = (x / PATCH_SIZE_M, y / PATCH_SIZE_M);
-    let (cx, cy) = (gx.floor() as i64, gy.floor() as i64);
-    let mut best = (f64::INFINITY, cx, cy);
-    for dy in -1..=1 {
-        for dx in -1..=1 {
-            let (ix, iy) = (cx + dx, cy + dy);
-            let ox = (unit(hash2(ix, iy, PATCH_SEED_X)) - 0.5) * PATCH_JITTER;
-            let oy = (unit(hash2(ix, iy, PATCH_SEED_Y)) - 0.5) * PATCH_JITTER;
-            let (px, py) = (ix as f64 + 0.5 + ox, iy as f64 + 0.5 + oy);
-            let d = (gx - px).powi(2) + (gy - py).powi(2);
-            if d < best.0 {
-                best = (d, ix, iy);
+    let (cx, cy) = (floor_i64(gx), floor_i64(gy));
+    if cache.cell != Some((cx, cy)) {
+        let mut k = 0;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let (ix, iy) = (cx + dx, cy + dy);
+                let ox = (unit(hash2(ix, iy, PATCH_SEED_X)) - 0.5) * PATCH_JITTER;
+                let oy = (unit(hash2(ix, iy, PATCH_SEED_Y)) - 0.5) * PATCH_JITTER;
+                cache.centres[k] = (ix as f64 + 0.5 + ox, iy as f64 + 0.5 + oy, ix, iy);
+                k += 1;
             }
+        }
+        cache.cell = Some((cx, cy));
+    }
+    let mut best = (f64::INFINITY, cx, cy);
+    for &(px, py, ix, iy) in &cache.centres {
+        let d = (gx - px).powi(2) + (gy - py).powi(2);
+        if d < best.0 {
+            best = (d, ix, iy);
         }
     }
     let (_, ix, iy) = best;
-    Patch {
-        u: unit(hash2(ix, iy, PATCH_SEED_U)),
-        jitter: unit(hash2(ix, iy, PATCH_SEED_J)) * 2.0 - 1.0,
+    match cache.last {
+        Some((cell, patch)) if cell == (ix, iy) => patch,
+        _ => {
+            let patch = Patch {
+                u: unit(hash2(ix, iy, PATCH_SEED_U)),
+                jitter: unit(hash2(ix, iy, PATCH_SEED_J)) * 2.0 - 1.0,
+            };
+            cache.last = Some(((ix, iy), patch));
+            patch
+        }
+    }
+}
+
+/// `x.floor() as i64` without the call to `floor` (not an instruction on
+/// the baseline x86-64 target), for every `f64`: a cast truncates towards
+/// zero, one less below zero unless already whole. Past the ends of `i64`
+/// the cast saturates, and the step down saturates with it.
+pub(crate) fn floor_i64(x: f64) -> i64 {
+    let t = x as i64;
+    if (t as f64) > x {
+        t.saturating_sub(1)
+    } else {
+        t
     }
 }
 
@@ -274,13 +371,14 @@ const WHITE_TABLE: [[f32; 3]; 31] = [
 /// The white of `kelvin` (clamped to the table), interpolated.
 pub fn white(kelvin: f64) -> [f32; 3] {
     let t = ((kelvin.clamp(KELVIN_MIN, KELVIN_MAX) - KELVIN_MIN) / 100.0) as f32;
-    let i = (t.floor() as usize).min(WHITE_TABLE.len() - 2);
+    // `t` is at least 0, so the cast is its floor.
+    let i = (t as usize).min(WHITE_TABLE.len() - 2);
     let f = t - i as f32;
     let (a, b) = (WHITE_TABLE[i], WHITE_TABLE[i + 1]);
     [0, 1, 2].map(|c| a[c] + (b[c] - a[c]) * f)
 }
 
-fn luminance(c: [f32; 3]) -> f32 {
+pub(crate) fn luminance(c: [f32; 3]) -> f32 {
     0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
 }
 
@@ -289,28 +387,59 @@ fn byte_luminance(c: [u8; 3]) -> f32 {
     luminance(c.map(|v| (f32::from(v) / 255.0).powf(SRGB_GAMMA)))
 }
 
-/// The bytes of a texel after the gain `s`. A sodium texel is `sodium * s`
-/// rounded to nearest. An LED texel is `led * s`, which must not read dimmer
-/// than those sodium bytes: rounding to nearest can lose a little luminance
-/// (near black, or where the colour sits at full scale), so it falls back to
-/// rounding up, then to the sodium bytes themselves.
-pub fn texel_bytes(sodium: [f32; 3], led: Option<[f32; 3]>, s: f32) -> [u8; 3] {
+/// The bytes of a texel after the gain `s`. Laminar's sodium is `sodium * s`
+/// rounded to nearest. A desaturated sodium texel, and then an LED texel,
+/// must each not read dimmer than the bytes below it: rounding to nearest
+/// can lose a little luminance (near black, or where the colour sits at full
+/// scale), so each falls back to rounding up, then to the bytes below.
+pub fn texel_bytes(
+    sodium: [f32; 3],
+    desaturated: Option<[f32; 3]>,
+    led: Option<[f32; 3]>,
+    s: f32,
+) -> [u8; 3] {
     let quantise = |c: [f32; 3], f: fn(f32) -> f32| c.map(|v| f(v * s).clamp(0.0, 255.0) as u8);
-    let base = quantise(sodium, f32::round);
-    let Some(led) = led else {
-        return base;
+    let no_dimmer = |below: [u8; 3], over: [f32; 3]| {
+        let floor = byte_luminance(below);
+        let nearest = quantise(over, f32::round);
+        if byte_luminance(nearest) >= floor {
+            return nearest;
+        }
+        let up = quantise(over, f32::ceil);
+        if byte_luminance(up) >= floor {
+            up
+        } else {
+            below
+        }
     };
-    let floor = byte_luminance(base);
-    let nearest = quantise(led, f32::round);
-    if byte_luminance(nearest) >= floor {
-        return nearest;
+    let mut bytes = quantise(sodium, f32::round);
+    if let Some(d) = desaturated {
+        bytes = no_dimmer(bytes, d);
     }
-    let up = quantise(led, f32::ceil);
-    if byte_luminance(up) >= floor {
-        up
-    } else {
-        base
+    if let Some(l) = led {
+        bytes = no_dimmer(bytes, l);
     }
+    bytes
+}
+
+/// A sodium texel (stored values, 0..255) toned by `tone`: mixed in linear
+/// light towards the white of `tone.kelvin` at its own luminance, then that
+/// luminance raised by `tone.mix` of `tone.energy`. No mix, or black, returns
+/// the input exactly, so `SodiumTone::NONE` keeps Laminar's bytes.
+pub fn desaturate(stored: [f32; 3], tone: &SodiumTone) -> [f32; 3] {
+    let m = tone.mix.clamp(0.0, 1.0);
+    if m <= 0.0 {
+        return stored;
+    }
+    let linear = decode(stored);
+    let y = luminance(linear);
+    if y <= 0.0 {
+        return stored;
+    }
+    let w = white(tone.kelvin);
+    let gain = 1.0 + m * (tone.energy - 1.0);
+    let out = [0, 1, 2].map(|c| (linear[c] * (1.0 - m) + w[c] * y * m) * gain);
+    encode(keep_light(out, y))
 }
 
 /// A sodium texel (stored values, 0..255) as LED white at `kelvin`: its
@@ -318,12 +447,110 @@ pub fn texel_bytes(sodium: [f32; 3], led: Option<[f32; 3]>, s: f32) -> [u8; 3] {
 /// with its hue kept; if that leaves it dimmer than the input, it is mixed
 /// towards full white until it is not.
 pub fn recolour(stored: [f32; 3], kelvin: f64, energy: f32) -> [f32; 3] {
-    let linear = stored.map(|v| (v / 255.0).clamp(0.0, 1.0).powf(SRGB_GAMMA));
-    let y = luminance(linear);
+    let y = luminance(decode(stored));
     if y <= 0.0 {
         return stored;
     }
-    let mut out = white(kelvin).map(|c| c * y * energy);
+    encode(keep_light(white(kelvin).map(|c| c * y * energy), y))
+}
+
+/// Stored values (0..255) to linear light.
+pub(crate) fn decode(stored: [f32; 3]) -> [f32; 3] {
+    stored.map(|v| (v / 255.0).clamp(0.0, 1.0).powf(SRGB_GAMMA))
+}
+
+/// Linear light to stored values (0..255).
+pub(crate) fn encode(linear: [f32; 3]) -> [f32; 3] {
+    linear.map(|c| c.clamp(0.0, 1.0).powf(1.0 / SRGB_GAMMA) * 255.0)
+}
+
+/// Linear light to the byte `encode` gives it, rounded to nearest and
+/// clamped, exactly, for every input (NaN and anything at or below 0 give
+/// 0), with no `powf`: [`ByteEncoder::byte`]. The tables are built once per
+/// process; a caller encoding many values holds [`ByteEncoder::get`].
+pub(crate) struct ByteEncoder {
+    thresholds: &'static [f32; 255],
+    /// Bucket of the first threshold (floats share a bucket when their
+    /// top 16 bits do).
+    first_bucket: usize,
+    /// Per bucket from `first_bucket` up to 1.0, how many thresholds lie
+    /// at or below the bucket's smallest float.
+    starts: Vec<u8>,
+}
+
+impl ByteEncoder {
+    pub(crate) fn get() -> &'static Self {
+        static ENCODER: OnceLock<ByteEncoder> = OnceLock::new();
+        ENCODER.get_or_init(|| {
+            let thresholds = byte_thresholds();
+            let first_bucket = (thresholds[0].to_bits() >> 16) as usize;
+            let last_bucket = (1.0f32.to_bits() >> 16) as usize;
+            let starts = (first_bucket..last_bucket)
+                .map(|k| {
+                    let lowest = f32::from_bits((k as u32) << 16);
+                    thresholds.partition_point(|&x| x <= lowest) as u8
+                })
+                .collect();
+            Self {
+                thresholds,
+                first_bucket,
+                starts,
+            }
+        })
+    }
+
+    /// The number of thresholds at or below `linear`, counted on from
+    /// where its bucket says the count starts (a step or two at most).
+    pub(crate) fn byte(&self, linear: f32) -> u8 {
+        if linear.is_nan() || linear <= 0.0 {
+            return 0;
+        }
+        if linear >= 1.0 {
+            return 255;
+        }
+        let bucket = (linear.to_bits() >> 16) as usize;
+        let mut b = bucket
+            .checked_sub(self.first_bucket)
+            .map_or(0, |k| usize::from(self.starts[k]));
+        while b < self.thresholds.len() && self.thresholds[b] <= linear {
+            b += 1;
+        }
+        b as u8
+    }
+}
+
+/// Threshold `b - 1` is the least float whose encoded value rounds to `b`
+/// or more, found once by bisecting the floats from 0 to 1 (ordered by
+/// their bits). Exact because the encode never decreases.
+fn byte_thresholds() -> &'static [f32; 255] {
+    static TABLE: OnceLock<[f32; 255]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let byte = |bits: u32| {
+            encode([f32::from_bits(bits); 3])[0]
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
+        std::array::from_fn(|i| {
+            let want = i as u8 + 1;
+            let (mut lo, mut hi) = (0u32, 1.0f32.to_bits());
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if byte(mid) >= want {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            f32::from_bits(lo)
+        })
+    })
+}
+
+/// A linear colour brought within full scale without reading dimmer than
+/// luminance `y`: a channel past full scales all three down so the hue
+/// holds, and if that leaves it dimmer than `y`, it is mixed towards full
+/// white until it is not.
+fn keep_light(mut out: [f32; 3], y: f32) -> [f32; 3] {
     let peak = out.iter().copied().fold(0.0f32, f32::max);
     if peak > 1.0 {
         out = out.map(|c| c / peak);
@@ -333,19 +560,130 @@ pub fn recolour(stored: [f32; 3], kelvin: f64, energy: f32) -> [f32; 3] {
         let t = (y - l) / (1.0 - l);
         out = out.map(|c| c + t * (1.0 - c));
     }
-    out.map(|c| c.clamp(0.0, 1.0).powf(1.0 / SRGB_GAMMA) * 255.0)
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn lum(c: [f32; 3]) -> f32 {
-        0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    /// What a road texel's channel became before the byte table: encode,
+    /// round to nearest, clamp.
+    fn encode_round(x: f32) -> u8 {
+        encode([x; 3])[0].round().clamp(0.0, 255.0) as u8
     }
 
-    fn decode(stored: [f32; 3]) -> [f32; 3] {
-        stored.map(|v| (v / 255.0).powf(SRGB_GAMMA))
+    #[test]
+    fn bright_weight_is_the_smoothstep_everywhere() {
+        let smoothstep = |r: f64| {
+            if r.is_nan() || r <= 0.0 {
+                return 0.0;
+            }
+            let t = ((r.ln() - URBAN_BRIGHT_LO_NW.ln())
+                / (URBAN_BRIGHT_HI_NW.ln() - URBAN_BRIGHT_LO_NW.ln()))
+            .clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        let mut rs = vec![0.0, -1.0, f64::NAN, f64::INFINITY, 1e-300, 1e300];
+        for edge in [URBAN_BRIGHT_LO_NW, URBAN_BRIGHT_HI_NW] {
+            let mut r = edge;
+            for _ in 0..1000 {
+                r = r.next_down();
+            }
+            for _ in 0..2000 {
+                rs.push(r);
+                r = r.next_up();
+            }
+        }
+        rs.extend((0..200_000).map(|k| f64::from(k) * 0.001));
+        for r in rs {
+            assert_eq!(bright_weight(r).to_bits(), smoothstep(r).to_bits(), "{r}");
+        }
+    }
+
+    #[test]
+    fn floor_i64_is_floor() {
+        let mut xs = vec![0.0, -0.0, 1.0, -1.0, 1e15, -1e15, 0.5, -0.5];
+        xs.extend((-200_000..200_000).map(|k| f64::from(k) * 0.000_9));
+        for k in -400..400 {
+            let x = f64::from(k);
+            xs.extend([x, x.next_up(), x.next_down()]);
+        }
+        // Past the ends of i64 the cast saturates, and so must this.
+        for x in [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            1e300,
+            -1e300,
+            f64::MAX,
+            f64::MIN,
+            i64::MIN as f64,
+            i64::MAX as f64,
+        ] {
+            xs.extend([x, x.next_up(), x.next_down()]);
+        }
+        for x in xs {
+            assert_eq!(floor_i64(x), x.floor() as i64, "{x}");
+        }
+    }
+
+    #[test]
+    fn the_byte_encoder_is_encode_rounded_for_every_kind_of_input() {
+        let mut inputs = vec![
+            0.0,
+            -0.0,
+            1.0,
+            1.5,
+            -1.0,
+            f32::MIN_POSITIVE,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::MAX,
+        ];
+        // Around every byte boundary: the float steps either side of the
+        // linear value whose encoded value is exactly b + 0.5.
+        for b in 0..256 {
+            let t = ((b as f64 + 0.5) / 255.0).powf(f64::from(SRGB_GAMMA)) as f32;
+            let mut x = t;
+            for _ in 0..64 {
+                x = f32::from_bits(x.to_bits().saturating_sub(1));
+            }
+            for _ in 0..128 {
+                inputs.push(x);
+                x = f32::from_bits(x.to_bits() + 1);
+            }
+        }
+        // And a dense sweep of [0, 1.25].
+        inputs.extend((0..=2_000_000).map(|i| i as f32 / 1_600_000.0));
+        let encoder = ByteEncoder::get();
+        for x in inputs {
+            assert_eq!(
+                encoder.byte(x),
+                encode_round(x),
+                "linear {x:e} ({:#x})",
+                x.to_bits()
+            );
+        }
+    }
+
+    /// Every float from 0 to 1: the byte table assumes the encode is
+    /// monotonic. Release only (about a billion `powf`):
+    /// `cargo test --release -p xearthlayer --lib the_byte_encoder_exhaustive -- --ignored`.
+    #[test]
+    #[ignore]
+    fn the_byte_encoder_exhaustive() {
+        let (encoder, mut mismatches) = (ByteEncoder::get(), 0u64);
+        for bits in 0..=1.0f32.to_bits() {
+            let x = f32::from_bits(bits);
+            mismatches += u64::from(encoder.byte(x) != encode_round(x));
+        }
+        assert_eq!(mismatches, 0);
+    }
+
+    fn lum(c: [f32; 3]) -> f32 {
+        0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
     }
 
     #[test]
@@ -402,21 +740,21 @@ mod tests {
     fn every_region_row_follows_the_spec_table() {
         // (region, share scale, kelvin shift), from the spec.
         let table = [
-            (LedRegion::Na, 1.0, 400.0),
-            (LedRegion::Sa, 0.7, 400.0),
-            (LedRegion::Eu, 0.9, -400.0),
-            (LedRegion::Af, 0.5, 400.0),
-            (LedRegion::As, 0.8, -400.0),
-            (LedRegion::Oc, 0.9, -400.0),
+            (LedRegion::Na, 1.0, 200.0),
+            (LedRegion::Sa, 0.7, 200.0),
+            (LedRegion::Eu, 0.9, -200.0),
+            (LedRegion::Af, 0.5, 200.0),
+            (LedRegion::As, 0.8, -200.0),
+            (LedRegion::Oc, 0.9, -200.0),
             (LedRegion::Unknown, 0.75, 0.0),
         ];
         let m = LedModel::DEFAULT;
         for (region, scale, shift) in table {
-            // Urban bright: share 0.75, kelvin 4000.
+            // Urban bright: share 0.90, kelvin 4500.
             let t = m.tone(false, 1.0, region);
-            assert!((t.share - 0.75 * scale).abs() < 1e-12, "{region:?} share");
+            assert!((t.share - 0.90 * scale).abs() < 1e-12, "{region:?} share");
             assert!(
-                (t.kelvin - (4000.0 + shift)).abs() < 1e-9,
+                (t.kelvin - (4500.0 + shift)).abs() < 1e-9,
                 "{region:?} kelvin"
             );
         }
@@ -429,17 +767,17 @@ mod tests {
         let sodium = [200.0, 120.0, 50.0];
         let led = Some(recolour(sodium, 4000.0, 1.25));
         let s = 0.0025;
-        let base = texel_bytes(sodium, None, s);
+        let base = texel_bytes(sodium, None, None, s);
         assert_eq!(base, [1, 0, 0]);
-        assert!(lum_b(texel_bytes(sodium, led, s)) >= lum_b(base));
+        assert!(lum_b(texel_bytes(sodium, None, led, s)) >= lum_b(base));
         // Clip branch: equal luminance by construction.
         let sodium = [255.0, 195.0, 0.0];
         let led = Some(recolour(sodium, 3200.0, 1.25));
         let s = 0.995;
-        let base = texel_bytes(sodium, None, s);
-        assert!(lum_b(texel_bytes(sodium, led, s)) >= lum_b(base));
+        let base = texel_bytes(sodium, None, None, s);
+        assert!(lum_b(texel_bytes(sodium, None, led, s)) >= lum_b(base));
         // No LED: exactly the rounded sodium bytes.
-        assert_eq!(texel_bytes([10.4, 10.6, 0.0], None, 1.0), [10, 11, 0]);
+        assert_eq!(texel_bytes([10.4, 10.6, 0.0], None, None, 1.0), [10, 11, 0]);
     }
 
     #[test]
@@ -467,17 +805,31 @@ mod tests {
     fn the_default_tones_follow_the_spec_tables() {
         let m = LedModel::DEFAULT;
         let t = m.tone(true, 0.0, LedRegion::Na);
-        assert_eq!((t.share, t.kelvin), (0.80, 4900.0));
+        assert_eq!((t.share, t.kelvin), (0.90, 4700.0));
         let t = m.tone(false, 1.0, LedRegion::Eu);
-        assert!((t.share - 0.675).abs() < 1e-12);
-        assert_eq!(t.kelvin, 3600.0);
+        assert!((t.share - 0.81).abs() < 1e-12);
+        assert_eq!(t.kelvin, 4300.0);
         let t = m.tone(false, 0.0, LedRegion::Af);
-        assert!((t.share - 0.225).abs() < 1e-12);
-        assert_eq!(t.kelvin, 3600.0);
+        assert!((t.share - 0.40).abs() < 1e-12);
+        assert_eq!(t.kelvin, 4200.0);
         let t = m.tone(false, 0.5, LedRegion::Unknown);
-        assert!((t.share - 0.45).abs() < 1e-12, "0.75 x mean(0.75, 0.45)");
-        assert_eq!(t.kelvin, 3600.0);
+        assert!((t.share - 0.6375).abs() < 1e-12, "0.75 x mean(0.90, 0.80)");
+        assert_eq!(t.kelvin, 4250.0, "mean(4500, 4000)");
         assert_eq!(m.energy, 1.25);
+        assert_eq!(
+            m.sodium,
+            SodiumTone {
+                mix: 0.30,
+                kelvin: 3200.0,
+                energy: 1.125,
+            }
+        );
+    }
+
+    #[test]
+    fn the_off_model_leaves_sodium_alone() {
+        assert_eq!(LedModel::OFF.sodium, SodiumTone::NONE);
+        assert_eq!(SodiumTone::NONE.mix, 0.0);
     }
 
     #[test]
@@ -560,6 +912,107 @@ mod tests {
     #[test]
     fn recolour_leaves_black_black() {
         assert_eq!(recolour([0.0, 0.0, 0.0], 4000.0, 1.25), [0.0, 0.0, 0.0]);
+    }
+
+    fn saturation(c: [f32; 3]) -> f32 {
+        let (mx, mn) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+        (mx - mn) / mx
+    }
+
+    #[test]
+    fn desaturate_without_a_mix_returns_the_input_exactly() {
+        for stored in [[56.0, 36.0, 18.0], [255.0, 160.0, 60.0], [0.0, 0.0, 0.0]] {
+            assert_eq!(desaturate(stored, &SodiumTone::NONE), stored);
+        }
+    }
+
+    #[test]
+    fn desaturate_lowers_saturation_and_keeps_the_compensated_light() {
+        let tone = LedModel::DEFAULT.sodium;
+        // Laminar's mean sodium texel and the generator tests' orange.
+        for stored in [[56.0, 36.0, 18.0], [200.0, 120.0, 50.0]] {
+            let out = desaturate(stored, &tone);
+            assert!(
+                saturation(out) < saturation(stored),
+                "{stored:?} -> {out:?} not less saturated"
+            );
+            let want = 1.0 + tone.mix * (tone.energy - 1.0);
+            let got = lum(decode(out)) / lum(decode(stored));
+            assert!(
+                (got - want).abs() < 1e-3,
+                "{stored:?}: luminance x{got}, want x{want}"
+            );
+            // Still sodium, not LED: blue stays well under red.
+            assert!(out[2] / out[0] < 0.4, "{stored:?} -> {out:?} reads as LED");
+        }
+    }
+
+    #[test]
+    fn desaturate_never_dims_a_bright_texel() {
+        let tone = LedModel::DEFAULT.sodium;
+        for stored in [
+            [255.0, 255.0, 255.0],
+            [255.0, 200.0, 120.0],
+            [255.0, 160.0, 60.0],
+        ] {
+            let out = desaturate(stored, &tone);
+            assert!(out.iter().all(|&c| c <= 255.0 + 1e-3), "{out:?}");
+            assert!(
+                lum(decode(out)) >= lum(decode(stored)) - 1e-4,
+                "{stored:?} dimmed"
+            );
+        }
+    }
+
+    #[test]
+    fn desaturate_leaves_black_black() {
+        assert_eq!(
+            desaturate([0.0, 0.0, 0.0], &LedModel::DEFAULT.sodium),
+            [0.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn texel_bytes_keep_desaturated_sodium_at_least_as_bright_as_laminar() {
+        let lum_b = |c: [u8; 3]| byte_luminance(c);
+        let tone = LedModel::DEFAULT.sodium;
+        for laminar in [[200.0, 120.0, 50.0], [56.0, 36.0, 18.0], [90.0, 40.0, 10.0]] {
+            let sodium = Some(desaturate(laminar, &tone));
+            for s in [0.0025, 0.01, 0.05, 0.3, 1.0] {
+                let raw = texel_bytes(laminar, None, None, s);
+                let out = texel_bytes(laminar, sodium, None, s);
+                assert!(
+                    lum_b(out) >= lum_b(raw),
+                    "{laminar:?} at gain {s}: {out:?} dimmer than {raw:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_shared_patch_cache_gives_the_uncached_patches() {
+        // The stale-hit guard: a cache shared by rows of ZL16 texels (about
+        // 7.5 m apart) across many cells, then by jumps back and forth,
+        // gives what a fresh cache gives. That the patches equal the ones
+        // drawn before the cache existed is pinned by the LED-on goldens
+        // (`cpu::tests::the_led_output_is_pinned`).
+        let mut cache = PatchCache::default();
+        let mut points = Vec::new();
+        for row in 0..40 {
+            let y = 5_000_000.0 + f64::from(row) * 97.0;
+            points.extend((0..800).map(|i| (-1_200.0 + f64::from(i) * 7.5, y)));
+        }
+        points.extend((0..2000).map(|i| {
+            let h = hash2(i, 1, 3);
+            (unit(h) * 1e5 - 5e4, unit(h >> 16) * 1e5 - 5e4)
+        }));
+        for (x, y) in points {
+            assert_eq!(
+                patch_at_cached(x, y, &mut cache),
+                patch_at(x, y),
+                "at {x},{y}"
+            );
+        }
     }
 
     #[test]

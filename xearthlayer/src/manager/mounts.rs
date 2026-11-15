@@ -5,7 +5,7 @@
 //! own FUSE mount where DDS files are generated on-demand.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -225,8 +225,9 @@ impl MountManager {
         &mut self,
         index: &OrthoUnionIndex,
         disk: Option<Arc<dyn crate::cache::Cache>>,
+        ortho_mount: &Path,
     ) -> Option<Arc<dyn crate::night::LitTextureSource>> {
-        let source = self.night_lit_source(index, disk);
+        let source = self.night_lit_source(index, disk, ortho_mount);
         self.night_lighting = if source.is_some() {
             crate::night::NightLighting::Lit
         } else {
@@ -242,11 +243,15 @@ impl MountManager {
 
     /// The lit source for this installation, or `None` (black) when the
     /// X-Plane installation behind the scenery path cannot be found. `disk`
-    /// is the lit disk tier, `None` when caching is off.
+    /// is the lit disk tier, `None` when caching is off. `ortho_mount` is
+    /// XEL's own mount point, which the road service must not read back.
+    /// Nothing is read from the installation here: the road service lists
+    /// its scenery packs on the first DSF hint.
     fn night_lit_source(
         &self,
         index: &OrthoUnionIndex,
         disk: Option<Arc<dyn crate::cache::Cache>>,
+        ortho_mount: &Path,
     ) -> Option<Arc<dyn crate::night::LitTextureSource>> {
         let scenery = self.scenery_path.as_ref()?;
         let env = match crate::xplane::XPlaneEnvironment::from_custom_scenery_path(scenery) {
@@ -271,6 +276,12 @@ impl MountManager {
             Arc::new(crate::night::StartupTextureSetting::read(&prefs)),
         )
         .with_brightness(self.night_brightness);
+        let roads = crate::night::roads::service::RoadService::new(
+            env.installation_path().to_path_buf(),
+            vec![ortho_mount.to_path_buf()],
+            disk.clone(),
+        );
+        source = source.with_roads(roads);
         if let Some(disk) = disk {
             source = source.with_disk_cache(disk);
         }
@@ -581,9 +592,11 @@ impl MountManager {
         }
 
         if self.night_enabled {
-            if let Some(source) =
-                self.resolve_night_lit_source(&index_for_prefetch, service.lit_disk_cache())
-            {
+            if let Some(source) = self.resolve_night_lit_source(
+                &index_for_prefetch,
+                service.lit_disk_cache(),
+                &mountpoint,
+            ) {
                 ortho_union_fs = ortho_union_fs.with_lit_source(source);
             }
         }
@@ -1067,9 +1080,19 @@ mod tests {
         let mut manager = MountManager::with_scenery_path(&scenery);
         manager.set_night_lighting(true);
 
-        let source = manager.resolve_night_lit_source(&OrthoUnionIndex::default(), None);
+        // The install has no `scenery_packs.ini`: building the source must not
+        // read the install (the pack index is built on the first hint).
+        let source = manager.resolve_night_lit_source(
+            &OrthoUnionIndex::default(),
+            None,
+            std::path::Path::new("/nonexistent/zzXEL_ortho"),
+        );
 
-        assert!(source.is_some());
+        let source = source.expect("a lit source");
+        assert!(
+            source.wants_dsf_hints(),
+            "roads are attached, so the filesystem should send DSF hints"
+        );
         assert_eq!(manager.night_lighting(), crate::night::NightLighting::Lit);
     }
 
@@ -1080,7 +1103,11 @@ mod tests {
         ));
         manager.set_night_lighting(true);
 
-        let source = manager.resolve_night_lit_source(&OrthoUnionIndex::default(), None);
+        let source = manager.resolve_night_lit_source(
+            &OrthoUnionIndex::default(),
+            None,
+            std::path::Path::new("/nonexistent/zzXEL_ortho"),
+        );
 
         assert!(source.is_none());
         assert_eq!(manager.night_lighting(), crate::night::NightLighting::Dark);

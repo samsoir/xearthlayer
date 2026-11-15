@@ -14,12 +14,13 @@ pub mod laminar;
 pub mod layout;
 pub mod prefs;
 pub mod recipe;
+pub mod roads;
 pub mod service;
 pub mod store;
 
 pub use disk::{
-    decode_entry, encode_entry, footprint_fingerprint, lit_cache_key, session_fingerprint,
-    LitFingerprint,
+    decode_entry, decode_entry_unsized, encode_entry, footprint_fingerprint, lit_cache_key,
+    session_fingerprint, LitFingerprint,
 };
 pub use footprint::Footprint;
 pub use generator::{

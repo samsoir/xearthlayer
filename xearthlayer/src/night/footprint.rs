@@ -6,6 +6,7 @@
 use std::f64::consts::PI;
 
 use crate::fuse::DdsFilename;
+use crate::night::generator::tiling::mercator;
 
 /// Web Mercator tiles along each side of one Ortho4XP texture.
 pub const TILES_PER_TEXTURE: u32 = 16;
@@ -57,6 +58,41 @@ impl Footprint {
     }
 }
 
+/// The texel centres of a `size` x `size` lit texture: per column (west
+/// first) and per row (north first), in degrees and in Web Mercator metres.
+/// The generator samples here and the road raster draws here, so both take
+/// them from this one place.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TexelCentres {
+    pub lons: Vec<f64>,
+    pub lats: Vec<f64>,
+    /// Web Mercator x of each column.
+    pub xs: Vec<f64>,
+    /// Web Mercator y of each row.
+    pub ys: Vec<f64>,
+}
+
+impl TexelCentres {
+    pub fn of(name: &DdsFilename, size: u32) -> Self {
+        let n = f64::from(1u32 << name.zoom);
+        let side = f64::from(TILES_PER_TEXTURE);
+        let px = f64::from(size);
+        let lons: Vec<f64> = (0..size)
+            .map(|j| (f64::from(name.col) + (f64::from(j) + 0.5) / px * side) / n * 360.0 - 180.0)
+            .collect();
+        let lats: Vec<f64> = (0..size)
+            .map(|i| {
+                let y = f64::from(name.row) + (f64::from(i) + 0.5) / px * side;
+                (PI * (1.0 - 2.0 * y / n)).sinh().atan().to_degrees()
+            })
+            .collect();
+        // x depends only on the column, y only on the row.
+        let xs = lons.iter().map(|&lon| mercator(0.0, lon).0).collect();
+        let ys = lats.iter().map(|&lat| mercator(lat, 0.0).1).collect();
+        Self { lons, lats, xs, ys }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +125,21 @@ mod tests {
         assert!(((f.north + f.south) / 2.0 - 42.19597).abs() < 0.01);
         assert!(f.north > f.south);
         assert_eq!(f.tiles(), vec![(42, -123)]);
+    }
+
+    #[test]
+    fn texel_centres_are_half_a_texel_inside_the_footprint() {
+        let name = parse_dds_filename("24272_10480_GO216_LIT.dds").unwrap();
+        let f = Footprint::from_name(&name);
+        let size = 8;
+        let c = TexelCentres::of(&name, size);
+        let dx = (f.east - f.west) / f64::from(size);
+        assert!((c.lons[0] - (f.west + dx / 2.0)).abs() < 1e-9);
+        assert!((c.lons[7] - (f.east - dx / 2.0)).abs() < 1e-9);
+        assert!(c.lats.windows(2).all(|w| w[0] > w[1]), "north first");
+        assert!(c.lats[0] < f.north && c.lats[7] > f.south);
+        assert_eq!(c.xs[3], mercator(0.0, c.lons[3]).0);
+        assert_eq!(c.ys[3], mercator(c.lats[3], 0.0).1);
     }
 
     #[test]

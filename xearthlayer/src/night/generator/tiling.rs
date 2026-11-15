@@ -11,7 +11,7 @@
 use super::noise::{hash2, mix, unit};
 use crate::night::laminar::LitPattern;
 
-const EARTH_RADIUS_M: f64 = 6_378_137.0;
+pub(crate) const EARTH_RADIUS_M: f64 = 6_378_137.0;
 
 /// Exponent that sharpens the three blend weights, so the blend keeps the
 /// pattern's contrast instead of averaging three copies flat.

@@ -34,6 +34,8 @@ fuse3 = { git = "https://github.com/samsoir/fuse3", branch = "master", features 
 libc = "0.2"
 regex.workspace = true
 thiserror = "1.0"
+# Night road lights read DSFs, which X-Plane ships in 7z containers (decode only).
+sevenz-rust2 = { version = "0.23.0", default-features = false }
 dirs = "5.0"
 rust-ini = "0.21"
 semver.workspace = true

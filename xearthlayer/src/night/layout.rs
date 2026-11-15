@@ -1,6 +1,7 @@
 //! The layout of lit DDS files: the minimal black DDS (phase 1), and
-//! `LitLayout`, the full mip chain geometry and all-zero bytes of a lit
-//! footprint (phase 2a).
+//! `LitLayout`, the full mip chain geometry of a lit footprint and the bytes
+//! of its levels (phase 2a): the header, the black levels X-Plane drops, the
+//! top level it uploads and the generated payload.
 
 use std::sync::OnceLock;
 
@@ -17,7 +18,9 @@ pub const FIRST_VISIBLE_ZL16: u32 = 1024;
 /// first visible level instead (design: Lit DDS layout, Risk).
 pub const MAX_TOP_LEVEL: u32 = 16384;
 
-/// The shape of one lit DDS: blank levels for the fade, then the visible ones.
+/// The shape of one lit DDS: the levels above the first visible one (the
+/// `blank_levels`, all black but the last, which X-Plane uploads), then the
+/// visible ones.
 #[derive(Debug, Clone)]
 pub struct LitLayout {
     pub top: u32,
@@ -78,28 +81,86 @@ impl LitLayout {
         self.total_len - self.payload_len()
     }
 
-    /// Bytes `[offset, offset + len)` of the lit texture: the header, zero
-    /// blank levels, then `payload` (BC1 visible levels). A payload of the
-    /// wrong length is ignored and the texture reads black (same size, R7).
-    pub fn read_lit(&self, offset: u64, len: u32, payload: &Bytes) -> Bytes {
-        if payload.len() as u64 != self.payload_len() {
-            return self.read_black(offset, len);
-        }
-        let payload_start = self.payload_start();
+    /// Bytes of the top level X-Plane uploads: the last blank level, twice
+    /// the first visible level's size.
+    pub fn top_len(&self) -> u64 {
+        let blocks = u64::from(self.first_visible * 2).div_ceil(4);
+        blocks * blocks * BC1_BLOCK_LEN
+    }
+
+    /// Where the top level X-Plane uploads starts. The levels above it are
+    /// the ones the texture setting drops at load.
+    pub fn uploaded_top_start(&self) -> u64 {
+        self.payload_start() - self.top_len()
+    }
+
+    /// The generated parts bytes `[offset, offset + len)` overlap: the
+    /// uploaded top level, the payload, both or neither.
+    pub fn reach(&self, offset: u64, len: u32) -> LitReach {
         let start = offset.min(self.total_len);
         let end = start.saturating_add(u64::from(len)).min(self.total_len);
-        if start >= payload_start {
-            // Entirely inside the payload: a refcount slice, no copy.
-            return payload.slice((start - payload_start) as usize..(end - payload_start) as usize);
+        let payload_start = self.payload_start();
+        LitReach {
+            top: start < end && start < payload_start && end > self.uploaded_top_start(),
+            payload: start < end && end > payload_start,
+        }
+    }
+
+    /// Bytes `[offset, offset + len)` of the lit texture: the header, the
+    /// black levels X-Plane drops, the uploaded `top` level, then `payload`
+    /// (BC1 visible levels). Each part is generated separately; one that is
+    /// absent or of the wrong length reads as zeros (black, same size, R7).
+    pub fn read_lit(
+        &self,
+        offset: u64,
+        len: u32,
+        top: Option<&Bytes>,
+        payload: Option<&Bytes>,
+    ) -> Bytes {
+        let start = offset.min(self.total_len);
+        let end = start.saturating_add(u64::from(len)).min(self.total_len);
+        let parts = [
+            (
+                self.uploaded_top_start(),
+                top.filter(|t| t.len() as u64 == self.top_len()),
+            ),
+            (
+                self.payload_start(),
+                payload.filter(|p| p.len() as u64 == self.payload_len()),
+            ),
+        ];
+        // Entirely inside one part: a refcount slice, no copy.
+        for (at, part) in parts {
+            if let Some(part) = part {
+                if start >= at && end <= at + part.len() as u64 {
+                    return part.slice((start - at) as usize..(end - at) as usize);
+                }
+            }
         }
         let mut out = self.read_black(start, (end - start) as u32).to_vec();
-        if end > payload_start {
-            let from = (payload_start - start) as usize;
-            out[from..].copy_from_slice(&payload[..(end - payload_start) as usize]);
+        for (at, part) in parts {
+            let Some(part) = part else { continue };
+            let (from, to) = (start.max(at), end.min(at + part.len() as u64));
+            if from < to {
+                out[(from - start) as usize..(to - start) as usize]
+                    .copy_from_slice(&part[(from - at) as usize..(to - at) as usize]);
+            }
         }
         Bytes::from(out)
     }
 }
+
+/// Which generated parts of a lit texture a read overlaps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LitReach {
+    /// The top level X-Plane uploads.
+    pub top: bool,
+    /// The visible levels.
+    pub payload: bool,
+}
+
+/// Bytes of one BC1 block: two RGB565 colours, then sixteen 2-bit indices.
+const BC1_BLOCK_LEN: u64 = 8;
 
 /// The texture served wherever nothing is lit: 4 x 4 DXT1 with its full
 /// chain (4, 2 and 1 px levels, one 8-byte block each), all blocks zero,
@@ -129,31 +190,130 @@ mod lit_tests {
         assert_eq!(l.payload_start() + l.payload_len(), l.total_len);
     }
 
+    /// `len` bytes that differ from one another: a hash of the offset,
+    /// salted so a top and a payload differ too.
+    fn varied(len: u64, salt: u64) -> Bytes {
+        (0..len)
+            .map(|i| ((i ^ salt).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8)
+            .collect::<Vec<u8>>()
+            .into()
+    }
+
     #[test]
-    fn lit_reads_compose_header_zeros_and_payload() {
-        let l = LitLayout::new(18, 4); // top 512, first visible 256
+    fn lit_reads_compose_header_zeros_top_and_payload() {
+        let l = LitLayout::new(18, 3); // top 1024: 1024 dropped, 512 uploaded, 256 visible
+        let top = Bytes::from(vec![5u8; l.top_len() as usize]);
         let payload = Bytes::from(vec![7u8; l.payload_len() as usize]);
-        let start = l.payload_start();
-        assert_eq!(&l.read_lit(0, 4, &payload)[..], b"DDS ");
+        let read = |offset, len| l.read_lit(offset, len, Some(&top), Some(&payload));
+        assert_eq!(&read(0, 4)[..], b"DDS ");
         assert!(
-            l.read_lit(128, 64, &payload).iter().all(|&b| b == 0),
-            "blank level"
+            read(128, 64).iter().all(|&b| b == 0),
+            "the level X-Plane drops"
         );
-        let across = l.read_lit(start - 2, 4, &payload);
-        assert_eq!(&across[..], &[0, 0, 7, 7]);
-        let all: usize = (0..l.total_len)
-            .step_by(1 << 16)
-            .map(|o| l.read_lit(o, 1 << 16, &payload).len())
-            .sum();
-        assert_eq!(all as u64, l.total_len);
-        assert!(l.read_lit(l.total_len, 8, &payload).is_empty());
+        let (top_start, start) = (l.uploaded_top_start(), l.payload_start());
+        assert_eq!(
+            &read(top_start - 2, 4)[..],
+            &[0, 0, 5, 5],
+            "dropped, then top"
+        );
+        assert_eq!(&read(start - 2, 4)[..], &[5, 5, 7, 7], "top, then payload");
+        assert!(read(l.total_len, 8).is_empty());
+    }
+
+    #[test]
+    fn the_uploaded_top_is_twice_the_first_visible_level() {
+        for (zoom, t) in [(18, 4), (17, 3), (16, 4), (16, 0)] {
+            let l = LitLayout::new(zoom, t);
+            let size = u64::from(l.first_visible * 2);
+            assert_eq!(l.top_len(), size * size / 2, "ZL{zoom} t = {t}");
+            assert_eq!(l.uploaded_top_start() + l.top_len(), l.payload_start());
+        }
+    }
+
+    #[test]
+    fn a_missing_or_wrong_size_top_reads_as_zeros() {
+        // As before the top was lit: black, and the payload still serves.
+        let l = LitLayout::new(16, 3);
+        let payload = varied(l.payload_len(), 1);
+        let (from, to) = (l.uploaded_top_start() as usize, l.payload_start() as usize);
+        let bad = Bytes::from(vec![5u8; 10]);
+        for top in [None, Some(&bad)] {
+            let file = l.read_lit(0, u32::MAX, top, Some(&payload));
+            assert!(file[from..to].iter().all(|&b| b == 0));
+            assert_eq!(&file[to..], &payload[..]);
+        }
+    }
+
+    #[test]
+    fn levels_x_plane_drops_stay_black() {
+        let l = LitLayout::new(16, 2); // 8192 and 4096 dropped, 2048 uploaded
+        let (top, payload) = (varied(l.top_len(), 2), varied(l.payload_len(), 1));
+        let file = l.read_lit(0, u32::MAX, Some(&top), Some(&payload));
+        let dropped = &file[128..l.uploaded_top_start() as usize];
+        assert_eq!(dropped.len(), (8192 * 8192 + 4096 * 4096) / 2);
+        assert!(dropped.iter().all(|&b| b == 0));
+        assert_eq!(
+            &file[l.uploaded_top_start() as usize..l.payload_start() as usize],
+            &top[..]
+        );
+    }
+
+    #[test]
+    fn any_split_of_a_lit_read_gives_the_same_bytes() {
+        // FUSE reads arrive in ranges of up to 1 MiB at any offset.
+        let l = LitLayout::new(18, 3);
+        let (top, payload) = (varied(l.top_len(), 2), varied(l.payload_len(), 1));
+        let whole = l.read_lit(0, u32::MAX, Some(&top), Some(&payload));
+        assert_eq!(whole.len() as u64, l.total_len);
+        for step in [1 << 16, 999, 8 * 1000 + 3] {
+            let pieces: Vec<u8> = (0..l.total_len)
+                .step_by(step)
+                .flat_map(|o| {
+                    l.read_lit(o, step as u32, Some(&top), Some(&payload))
+                        .to_vec()
+                })
+                .collect();
+            assert_eq!(pieces, whole.to_vec(), "step {step}");
+        }
+    }
+
+    #[test]
+    fn a_read_reaches_the_parts_its_range_overlaps() {
+        let l = LitLayout::new(16, 3);
+        let (top, start) = (l.uploaded_top_start(), l.payload_start());
+        let none = LitReach::default();
+        assert_eq!(l.reach(0, 128), none, "header");
+        assert_eq!(l.reach(128, (top - 128) as u32), none, "dropped level");
+        let only_top = LitReach {
+            top: true,
+            payload: false,
+        };
+        assert_eq!(l.reach(top - 1, 2), only_top);
+        assert_eq!(l.reach(top + 8, 0), none, "an empty read inside the top");
+        assert_eq!(l.reach(start - 8, 8), only_top);
+        let both = LitReach {
+            top: true,
+            payload: true,
+        };
+        assert_eq!(l.reach(start - 1, 2), both);
+        assert_eq!(l.reach(0, u32::MAX), both);
+        let only_payload = LitReach {
+            top: false,
+            payload: true,
+        };
+        assert_eq!(l.reach(start, 8), only_payload);
+        assert_eq!(l.reach(l.total_len - 1, 8), only_payload);
+        assert_eq!(l.reach(l.total_len, 8), none, "at EOF");
     }
 
     #[test]
     fn a_wrong_size_payload_reads_black() {
         let l = LitLayout::new(18, 4);
         let bad = Bytes::from(vec![7u8; 10]);
-        assert_eq!(l.read_lit(0, u32::MAX, &bad), l.read_black(0, u32::MAX));
+        assert_eq!(
+            l.read_lit(0, u32::MAX, None, Some(&bad)),
+            l.read_black(0, u32::MAX)
+        );
     }
 }
 

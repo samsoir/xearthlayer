@@ -9,18 +9,22 @@
 //!
 //! Neighbourhood patches then turn some texels LED white (`led`), by class,
 //! brightness and region.
+//!
+//! Road glow (`LitRequest::roads`) is added last, in linear light, only on
+//! the texels it reaches: an empty road field leaves every byte as it was.
 
-use std::f64::consts::PI;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use image::{Rgba, RgbaImage};
+use tracing::debug;
 
 use super::field::RecipeField;
 use super::led::{self, LedRegion};
-use super::tiling::{mercator, sample_cached, CornerCache};
+use super::tiling::{sample_cached, CornerCache};
 use super::{gain, LitGenerator, LitRequest};
-use crate::night::footprint::{Footprint, TILES_PER_TEXTURE};
+use crate::night::footprint::{Footprint, TexelCentres};
 use crate::night::laminar::LitPattern;
+use crate::night::roads::field::RoadField;
 
 /// Palette indexes per tile: a class cell is one byte.
 const PALETTE_SLOTS: usize = 256;
@@ -33,23 +37,7 @@ impl LitGenerator for CpuLitGenerator {
     fn generate(&self, request: &LitRequest<'_>) -> RgbaImage {
         let name = request.name;
         let size = request.size;
-        let n = f64::from(1u32 << name.zoom);
-        let side = f64::from(TILES_PER_TEXTURE);
-        let px = f64::from(size);
-        // Texel centres: longitudes per column, latitudes per row (north first).
-        let lons: Vec<f64> = (0..size)
-            .map(|j| (f64::from(name.col) + (f64::from(j) + 0.5) / px * side) / n * 360.0 - 180.0)
-            .collect();
-        let lats: Vec<f64> = (0..size)
-            .map(|i| {
-                let y = f64::from(name.row) + (f64::from(i) + 0.5) / px * side;
-                (PI * (1.0 - 2.0 * y / n)).sinh().atan().to_degrees()
-            })
-            .collect();
-
-        // Web Mercator metres: x depends only on the column, y only on the row.
-        let xs: Vec<f64> = lons.iter().map(|&lon| mercator(0.0, lon).0).collect();
-        let ys: Vec<f64> = lats.iter().map(|&lat| mercator(lat, 0.0).1).collect();
+        let TexelCentres { lons, lats, xs, ys } = TexelCentres::of(name, size);
 
         let field = RecipeField::new(&Footprint::from_name(name), request.recipes);
         // Patterns by (tile slot, palette index), resolved on first use.
@@ -60,17 +48,50 @@ impl LitGenerator for CpuLitGenerator {
         let mut regions: Vec<Option<LedRegion>> = vec![None; field.slot_count()];
         let mut weights = Vec::with_capacity(4);
         let mut corners = CornerCache::default();
+        let mut road_light = RoadLight::new(request);
+        // A field rastered for another size would put glow on the wrong
+        // texels: it is left out rather than misplaced.
+        let no_roads = RoadField::empty(size);
+        let roads = if request.roads.is_empty() || request.roads.size() == size {
+            request.roads
+        } else {
+            debug!(
+                field = request.roads.size(),
+                size, "Night roads: road field size differs from the texture; no road light"
+            );
+            &no_roads
+        };
         let mut img = RgbaImage::from_pixel(size, size, Rgba([0, 0, 0, 255]));
 
         for (i, (&lat, &y)) in lats.iter().zip(&ys).enumerate() {
+            // `None` when the whole field is empty: one branch per row.
+            let road_row = roads.row(i as u32);
             for (j, (&lon, &x)) in lons.iter().zip(&xs).enumerate() {
+                let road = road_row.map_or(0.0, |r| r[j]);
                 field.class_weights(lat, lon, &mut weights);
-                if weights.is_empty() {
+                if weights.is_empty() && road <= 0.0 {
                     continue;
                 }
                 let radiance = field.radiance(lat, lon);
-                let g = gain(radiance, request.brightness);
+                // No class here: only the road can light the texel, and the
+                // gain is not needed.
+                let g = if weights.is_empty() {
+                    0.0
+                } else {
+                    gain(radiance, request.brightness)
+                };
                 if g <= 0.0 {
+                    if road > 0.0 {
+                        let texel = RoadTexel {
+                            at: (lat, lon),
+                            xy: (x, y),
+                            radiance,
+                            bright: led::bright_weight(radiance),
+                            patch: None,
+                        };
+                        let bytes = road_light.over([0; 3], road, &texel);
+                        img.put_pixel(j as u32, i as u32, opaque(bytes));
+                    }
                     continue;
                 }
                 let bright = led::bright_weight(radiance);
@@ -105,19 +126,161 @@ impl LitGenerator for CpuLitGenerator {
                     kelvin += w.weight * tone.kelvin;
                 }
                 let sodium = rgb;
-                let mut led_rgb = None;
+                let toned = (request.led.sodium.mix > 0.0)
+                    .then(|| led::desaturate(sodium, &request.led.sodium));
+                let (mut led_rgb, mut patch_here) = (None, None);
                 if wsum > 0.0 && share > 0.0 {
                     let patch = led::patch_at(x, y);
+                    patch_here = Some(patch);
                     if patch.u < share / wsum {
                         let k = led::patch_kelvin(kelvin / wsum, &patch);
                         led_rgb = Some(led::recolour(sodium, k, request.led.energy));
                     }
                 }
-                let [tr, tg, tb] = led::texel_bytes(sodium, led_rgb, g as f32);
-                img.put_pixel(j as u32, i as u32, Rgba([tr, tg, tb, 255]));
+                let mut bytes = led::texel_bytes(sodium, toned, led_rgb, g as f32);
+                if road > 0.0 {
+                    let texel = RoadTexel {
+                        at: (lat, lon),
+                        xy: (x, y),
+                        radiance,
+                        bright,
+                        patch: patch_here,
+                    };
+                    bytes = road_light.over(bytes, road, &texel);
+                }
+                img.put_pixel(j as u32, i as u32, opaque(bytes));
             }
         }
         img
+    }
+}
+
+fn opaque([r, g, b]: [u8; 3]) -> Rgba<u8> {
+    Rgba([r, g, b, 255])
+}
+
+/// Stored values (0..255) to linear light, exactly as `led::decode` gives
+/// them, built once: a road texel decodes its pattern bytes by lookup.
+fn linear_table() -> &'static [f32; 256] {
+    static TABLE: OnceLock<[f32; 256]> = OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|v| led::decode([v as f32; 3])[0]))
+}
+
+/// Road glow added over a texel's pattern bytes, in linear light. The level
+/// follows the glow, the radiance (from the rural floor `country` up to full
+/// at `full_nw`) and `night.brightness`; the colour is the white of the
+/// texel's LED patch, or the road sodium toned like the pattern's, at
+/// luminance 1. Holds what is fixed for a texture, the last region looked up
+/// (a texel costs no lookup while it stays in one 1 degree tile) and the
+/// last patch cell (no hashing while it stays in one cell).
+struct RoadLight<'r> {
+    request: &'r LitRequest<'r>,
+    linear: &'static [f32; 256],
+    encoder: &'static led::ByteEncoder,
+    /// The road sodium, toned and at luminance 1: fixed per request.
+    sodium: [f32; 3],
+    /// The last 1 degree tile looked up and its region.
+    region: Option<((i32, i32), LedRegion)>,
+    patches: led::PatchCache,
+    /// The last LED temperature (its bits) and its white at luminance 1:
+    /// a patch keeps one temperature wherever its brightness is settled.
+    white: Option<(u64, [f32; 3])>,
+}
+
+/// Where a road texel is, and what the pattern pass already knows of it.
+#[derive(Debug, Clone, Copy)]
+struct RoadTexel {
+    /// Latitude and longitude.
+    at: (f64, f64),
+    /// Web Mercator metres.
+    xy: (f64, f64),
+    radiance: f64,
+    /// `led::bright_weight(radiance)`.
+    bright: f64,
+    /// The texel's LED patch, when the pattern pass drew it.
+    patch: Option<led::Patch>,
+}
+
+impl<'r> RoadLight<'r> {
+    fn new(request: &'r LitRequest<'r>) -> Self {
+        let sodium = led::decode(led::desaturate(
+            request.road_model.sodium,
+            &request.led.sodium,
+        ));
+        Self {
+            request,
+            linear: linear_table(),
+            encoder: led::ByteEncoder::get(),
+            sodium: unit_luminance(sodium),
+            region: None,
+            patches: led::PatchCache::default(),
+            white: None,
+        }
+    }
+
+    /// `unit_luminance(led::white(kelvin))`, from the last one when the
+    /// temperature has not changed.
+    fn white(&mut self, kelvin: f64) -> [f32; 3] {
+        match self.white {
+            Some((k, w)) if k == kelvin.to_bits() => w,
+            _ => {
+                let w = unit_luminance(led::white(kelvin));
+                self.white = Some((kelvin.to_bits(), w));
+                w
+            }
+        }
+    }
+
+    fn region(&mut self, tile: (i32, i32)) -> LedRegion {
+        match self.region {
+            Some((t, r)) if t == tile => r,
+            _ => {
+                let r = (self.request.regions)(tile.0, tile.1);
+                self.region = Some((tile, r));
+                r
+            }
+        }
+    }
+
+    /// The bytes of `texel`, whose pattern gave `below`, with `road` glow
+    /// (above 0).
+    fn over(&mut self, below: [u8; 3], road: f32, texel: &RoadTexel) -> [u8; 3] {
+        let RoadTexel {
+            at: (lat, lon),
+            xy: (x, y),
+            radiance,
+            bright,
+            patch,
+        } = *texel;
+        let r = self.request;
+        let m = r.road_model;
+        let density = (radiance / m.full_nw).clamp(0.0, 1.0) as f32;
+        let level = m.peak * road * (m.country + (1.0 - m.country) * density) * r.brightness as f32;
+        let region = self.region((led::floor_i64(lat) as i32, led::floor_i64(lon) as i32));
+        let tone = r.led.tone(false, bright, region);
+        // `patch.u` is below 1, so no share means sodium without a patch.
+        let patch = (tone.share > 0.0)
+            .then(|| patch.unwrap_or_else(|| led::patch_at_cached(x, y, &mut self.patches)));
+        let colour = match patch {
+            Some(p) if p.u < tone.share => {
+                // `white` is linear light at luminance 1, as `recolour`
+                // relies on when it scales it by a linear luminance.
+                self.white(led::patch_kelvin(tone.kelvin, &p))
+            }
+            _ => self.sodium,
+        };
+        let base = below.map(|v| self.linear[usize::from(v)]);
+        [0, 1, 2].map(|k| self.encoder.byte(base[k] + colour[k] * level))
+    }
+}
+
+/// A linear colour scaled to luminance 1 (black stays black).
+fn unit_luminance(c: [f32; 3]) -> [f32; 3] {
+    let l = led::luminance(c);
+    if l > 0.0 {
+        c.map(|v| v / l)
+    } else {
+        c
     }
 }
 
@@ -128,8 +291,12 @@ mod tests {
     use crate::night::generator::field::tests_support::synthetic;
     use crate::night::generator::led::{LedModel, LedRegion, RegionTone, Tone};
     use crate::night::generator::noise::{hash2, unit};
+    use crate::night::generator::tiling::mercator;
     use crate::night::parse_recipe;
     use crate::night::recipe::Recipe;
+    use crate::night::roads::field::tests::crossing_field;
+    use crate::night::roads::RoadModel;
+    use std::f64::consts::PI;
 
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
 
@@ -166,6 +333,33 @@ mod tests {
     fn the_sodium_output_is_pinned() {
         let img = generate(&name_at(37.20, -122.725), 128, golden, speckled, 1.0);
         assert_eq!(digest(&img), SODIUM_DIGEST, "digest {:#018x}", digest(&img));
+    }
+
+    /// LED-on output for the golden block with the speckled pattern and no
+    /// roads, under `LedModel::DEFAULT` and `full_share_model()` in region
+    /// Na. Captured at d2fd12f, before road compositing and the `patch_at`
+    /// cache: generation without roads must not move.
+    const LED_DEFAULT_DIGEST: u64 = 0x313c_df53_ad1d_c310;
+    const LED_FULL_SHARE_DIGEST: u64 = 0x6f7d_fa2c_f75a_3b14;
+
+    #[test]
+    fn the_led_output_is_pinned() {
+        for (model, want) in [
+            (LedModel::DEFAULT, LED_DEFAULT_DIGEST),
+            (full_share_model(), LED_FULL_SHARE_DIGEST),
+        ] {
+            let img = generate_led(
+                &name_at(37.20, -122.725),
+                128,
+                golden,
+                speckled,
+                1.0,
+                &model,
+                LedRegion::Na,
+            );
+            assert!(img.pixels().any(is_led), "the pin covers LED texels");
+            assert_eq!(digest(&img), want, "digest {:#018x}", digest(&img));
+        }
     }
 
     fn golden(lat: i32, lon: i32) -> Option<Arc<Recipe>> {
@@ -217,7 +411,239 @@ mod tests {
             patterns: &patterns,
             regions: &move |_, _| region,
             led,
+            roads: &RoadField::empty(size),
+            road_model: &RoadModel::DEFAULT,
         })
+    }
+
+    fn generate_roads(
+        name: &DdsFilename,
+        size: u32,
+        recipes: impl Fn(i32, i32) -> Option<Arc<Recipe>> + Sync,
+        patterns: impl Fn(&str) -> Option<Arc<LitPattern>> + Sync,
+        roads: &RoadField,
+        led: &LedModel,
+    ) -> RgbaImage {
+        generate_roads_with(
+            name,
+            size,
+            recipes,
+            patterns,
+            roads,
+            led,
+            &RoadModel::DEFAULT,
+        )
+    }
+
+    /// [`generate_roads`] with another road model.
+    fn generate_roads_with(
+        name: &DdsFilename,
+        size: u32,
+        recipes: impl Fn(i32, i32) -> Option<Arc<Recipe>> + Sync,
+        patterns: impl Fn(&str) -> Option<Arc<LitPattern>> + Sync,
+        roads: &RoadField,
+        led: &LedModel,
+        road_model: &RoadModel,
+    ) -> RgbaImage {
+        CpuLitGenerator.generate(&LitRequest {
+            name,
+            size,
+            brightness: 1.0,
+            recipes: &recipes,
+            patterns: &patterns,
+            regions: &|_, _| LedRegion::Unknown,
+            led,
+            roads,
+            road_model,
+        })
+    }
+
+    /// Every tile is dark: no class, radiance 0.
+    fn dark(lat: i32, lon: i32) -> Option<Arc<Recipe>> {
+        Some(synthetic(lat, lon, 4, |_, _| 0, 4, |_, _| 0))
+    }
+
+    #[test]
+    fn a_road_field_of_another_size_is_ignored() {
+        let name = name_at(46.5, 6.5);
+        let wrong = crossing_field(&name, 32);
+        assert!(!wrong.is_empty());
+        let img = generate_roads(&name, 64, dark, red, &wrong, &LedModel::OFF);
+        assert_eq!(lit_texels(&img), 0, "no glow at the wrong places");
+    }
+
+    #[test]
+    fn countryside_roads_are_lit_where_viirs_reads_zero() {
+        let name = name_at(46.5, 6.5);
+        let field = crossing_field(&name, 64);
+        let img = generate_roads(&name, 64, dark, red, &field, &LedModel::OFF);
+        assert!(lit_texels(&img) > 0);
+        let none = generate_roads(&name, 64, dark, red, &RoadField::empty(64), &LedModel::OFF);
+        assert_eq!(lit_texels(&none), 0);
+    }
+
+    #[test]
+    fn road_light_is_never_dimmer_than_the_pattern_below_it() {
+        // The tile under the road lit in east-west stripes (so the road
+        // crosses lit and dark ground) at a middling gain.
+        let name = name_at(46.5, 6.5);
+        let half = synthetic(46, 6, 120, |r, _| u8::from(r % 2 == 0), 4, |_, _| 60);
+        let recipes = move |a: i32, b: i32| ((a, b) == (46, 6)).then(|| half.clone());
+        let field = crossing_field(&name, 64);
+        for model in [LedModel::OFF, LedModel::DEFAULT] {
+            let empty = RoadField::empty(64);
+            let base = generate_roads(&name, 64, &recipes, orange, &empty, &model);
+            let with = generate_roads(&name, 64, &recipes, orange, &field, &model);
+            let mut brighter = 0;
+            for (a, b) in base.pixels().zip(with.pixels()) {
+                assert!(lum(b) + 1e-3 >= lum(a), "{b:?} dimmer than {a:?}");
+                brighter += usize::from(lum(b) > lum(a) && a[0] > 0);
+            }
+            assert!(brighter > 0, "the road crosses lit pattern texels");
+        }
+    }
+
+    #[test]
+    fn road_hue_follows_the_led_patch() {
+        let name = name_at(46.5, 6.5);
+        let field = crossing_field(&name, 128);
+        // Every road texel LED, whatever its region.
+        let all_led = LedModel {
+            regions: [RegionTone {
+                share_scale: 1.0,
+                kelvin_shift: 0.0,
+            }; LedRegion::COUNT],
+            ..full_share_model()
+        };
+        // Bright enough over dark ground that the road's bytes clear the
+        // rounding of the faint edge; the hue rule does not depend on it.
+        let bright = RoadModel {
+            peak: 0.12,
+            ..RoadModel::DEFAULT
+        };
+        let gen = |led: &LedModel| generate_roads_with(&name, 128, dark, red, &field, led, &bright);
+        let img = gen(&all_led);
+        let warm = gen(&sodium_only());
+        let blue_red = |p: &image::Rgba<u8>| f32::from(p[2]) / f32::from(p[0]);
+        let mut compared = 0;
+        for (led, sodium) in img.pixels().zip(warm.pixels()) {
+            // Away from the faint edge, where bytes round to a few levels.
+            if sodium[0] >= 32 {
+                compared += 1;
+                assert!(
+                    blue_red(led) > blue_red(sodium),
+                    "LED {led:?} not whiter than sodium {sodium:?}"
+                );
+            }
+        }
+        assert!(compared > 0, "the road is lit");
+    }
+
+    #[test]
+    fn the_linear_table_is_the_led_decode() {
+        let table = linear_table();
+        for v in 0..=255u8 {
+            assert_eq!(
+                table[usize::from(v)].to_bits(),
+                led::decode([f32::from(v); 3])[0].to_bits(),
+                "stored {v}"
+            );
+        }
+    }
+
+    /// The composition rule written out plainly, with no table or memo.
+    fn composite_reference(
+        below: [u8; 3],
+        road: f32,
+        radiance: f64,
+        (lat, lon): (f64, f64),
+        (x, y): (f64, f64),
+        r: &LitRequest<'_>,
+    ) -> ([u8; 3], bool) {
+        let m = r.road_model;
+        let density = (radiance / m.full_nw).clamp(0.0, 1.0) as f32;
+        let level = m.peak * road * (m.country + (1.0 - m.country) * density) * r.brightness as f32;
+        let region = (r.regions)(lat.floor() as i32, lon.floor() as i32);
+        let tone = r.led.tone(false, led::bright_weight(radiance), region);
+        let patch = led::patch_at(x, y);
+        let is_led = patch.u < tone.share;
+        let mut colour = if is_led {
+            led::white(led::patch_kelvin(tone.kelvin, &patch))
+        } else {
+            led::decode(led::desaturate(m.sodium, &r.led.sodium))
+        };
+        let l = led::luminance(colour);
+        if l > 0.0 {
+            colour = colour.map(|c| c / l);
+        }
+        let base = led::decode(below.map(f32::from));
+        let out = led::encode([0, 1, 2].map(|k| base[k] + colour[k] * level));
+        (out.map(|v| v.round().clamp(0.0, 255.0) as u8), is_led)
+    }
+
+    #[test]
+    fn road_light_matches_the_plain_composition_rule() {
+        // Regions change by tile, so the region memo is exercised across
+        // degree lines; positions sweep many LED patches.
+        let regions = |lat: i32, lon: i32| match (lat + lon).rem_euclid(3) {
+            0 => LedRegion::Na,
+            1 => LedRegion::Af,
+            _ => LedRegion::Eu,
+        };
+        let name = name_at(46.5, 6.5);
+        let roads = RoadField::empty(1);
+        for (brightness, model) in [(1.0, LedModel::DEFAULT), (1.5, LedModel::OFF)] {
+            let request = LitRequest {
+                name: &name,
+                size: 1,
+                brightness,
+                recipes: &|_, _| None,
+                patterns: &|_| None,
+                regions: &regions,
+                led: &model,
+                roads: &roads,
+                road_model: &RoadModel::DEFAULT,
+            };
+            let mut light = RoadLight::new(&request);
+            let (mut whites, mut sodiums) = (0, 0);
+            for k in 0..4000u64 {
+                let h = hash2(k as i64, 0, 7);
+                let below = [
+                    (h & 255) as u8,
+                    ((h >> 8) & 255) as u8,
+                    ((h >> 16) & 63) as u8,
+                ];
+                let road = unit(h >> 24) as f32;
+                let radiance = unit(h >> 32) * 120.0;
+                // A walk of about 0.004 degrees a step through three degree lines.
+                let (lat, lon) = (45.9 + k as f64 * 0.0004, 5.8 + k as f64 * 0.0006);
+                let (x, y) = mercator(lat, lon);
+                // Half the steps hand over the bright weight and the patch,
+                // as the generator does where the pattern was lit.
+                let patch = (k % 2 == 0).then(|| led::patch_at(x, y));
+                let bright = led::bright_weight(radiance);
+                let texel = RoadTexel {
+                    at: (lat, lon),
+                    xy: (x, y),
+                    radiance,
+                    bright,
+                    patch,
+                };
+                let got = light.over(below, road, &texel);
+                let (want, is_led) =
+                    composite_reference(below, road, radiance, (lat, lon), (x, y), &request);
+                assert_eq!(got, want, "step {k}");
+                (whites, sodiums) = if is_led {
+                    (whites + 1, sodiums)
+                } else {
+                    (whites, sodiums + 1)
+                };
+            }
+            assert!(sodiums > 0, "the sodium colour is compared");
+            if model == LedModel::DEFAULT {
+                assert!(whites > 0, "the LED white is compared");
+            }
+        }
     }
 
     fn lit_texels(img: &RgbaImage) -> usize {
@@ -381,6 +807,20 @@ mod tests {
         p[0] > 0 && f32::from(p[2]) / f32::from(p[0]) > 0.4
     }
 
+    /// No LED, but the default sodium stage: what the generator writes for
+    /// texels the LED stage leaves alone.
+    fn sodium_only() -> LedModel {
+        LedModel {
+            sodium: LedModel::DEFAULT.sodium,
+            ..LedModel::OFF
+        }
+    }
+
+    fn saturation(p: &image::Rgba<u8>) -> f32 {
+        let (mx, mn) = (p[0].max(p[1]).max(p[2]), p[0].min(p[1]).min(p[2]));
+        f32::from(mx - mn) / f32::from(mx)
+    }
+
     fn lum(p: &image::Rgba<u8>) -> f32 {
         let l = |v: u8| (f32::from(v) / 255.0).powf(crate::night::generator::SRGB_GAMMA);
         0.2126 * l(p[0]) + 0.7152 * l(p[1]) + 0.0722 * l(p[2])
@@ -400,9 +840,9 @@ mod tests {
         assert_eq!(digest(&img), SODIUM_DIGEST);
     }
 
-    #[test]
-    fn full_share_makes_every_lit_texel_led() {
-        let all = LedModel {
+    /// Every urban tone at share 1 and 4000 K.
+    fn full_share_model() -> LedModel {
+        LedModel {
             urban_bright: Tone {
                 share: 1.0,
                 kelvin: 4000.0,
@@ -412,14 +852,18 @@ mod tests {
                 kelvin: 4000.0,
             },
             ..LedModel::DEFAULT
-        };
+        }
+    }
+
+    #[test]
+    fn full_share_makes_every_lit_texel_led() {
         let img = generate_led(
             &name_at(37.5, -122.5),
             64,
             uniform(),
             orange,
             1.0,
-            &all,
+            &full_share_model(),
             LedRegion::Na,
         );
         assert!(img.pixels().filter(|p| p[0] > 0).all(is_led));
@@ -434,7 +878,7 @@ mod tests {
             uniform(),
             orange,
             1.0,
-            &LedModel::OFF,
+            &sodium_only(),
             LedRegion::Na,
         );
         let led = generate_led(
@@ -454,6 +898,88 @@ mod tests {
             }
         }
         assert!(changed > 0, "some patches are LED");
+    }
+
+    #[test]
+    fn the_default_model_desaturates_the_sodium_it_keeps() {
+        let name = name_at(37.5, -122.5);
+        let laminar = generate_led(
+            &name,
+            64,
+            uniform(),
+            orange,
+            1.0,
+            &LedModel::OFF,
+            LedRegion::Na,
+        );
+        let kept = generate_led(
+            &name,
+            64,
+            uniform(),
+            orange,
+            1.0,
+            &sodium_only(),
+            LedRegion::Na,
+        );
+        let mut lit = 0;
+        for (a, b) in laminar.pixels().zip(kept.pixels()) {
+            if a[0] == 0 {
+                continue;
+            }
+            lit += 1;
+            assert!(
+                saturation(b) < saturation(a),
+                "{b:?} not less saturated than {a:?}"
+            );
+            assert!(!is_led(b), "{b:?} reads as LED");
+        }
+        assert!(lit > 0, "the tile is lit");
+    }
+
+    /// The sodium stage never writes a texel dimmer than Laminar's bytes,
+    /// from the gain floor up and at every brightness setting.
+    #[test]
+    fn desaturated_sodium_is_never_dimmer_after_rounding_to_bytes() {
+        let name = name_at(37.5, -122.5);
+        let mut changed = 0;
+        for rgb in [[200u8, 120, 50], [255, 160, 60], [90, 40, 10], [56, 36, 18]] {
+            let pattern = move |_: &str| {
+                Some(Arc::new(LitPattern {
+                    size: 4,
+                    rgb: vec![rgb; 16],
+                    ground_scale_m: 4096.0,
+                }))
+            };
+            for byte in (1u8..=255).step_by(2).chain([255]) {
+                let r = synthetic(37, -123, 120, |_, _| 1, 4, move |_, _| byte);
+                let recipes = move |a: i32, b: i32| ((a, b) == (37, -123)).then(|| r.clone());
+                for brightness in [0.5, 1.0, 1.5] {
+                    let run = |m: &LedModel| {
+                        generate_led(
+                            &name,
+                            16,
+                            recipes.clone(),
+                            pattern,
+                            brightness,
+                            m,
+                            LedRegion::Na,
+                        )
+                    };
+                    let (laminar, kept) = (run(&LedModel::OFF), run(&sodium_only()));
+                    for (a, b) in laminar.pixels().zip(kept.pixels()) {
+                        if a != b {
+                            changed += 1;
+                            assert!(
+                                lum(b) >= lum(a),
+                                "{rgb:?}, byte {byte}, brightness {brightness}: \
+                                 {b:?} dimmer than {a:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(changed > 0, "the sweep reaches desaturated texels");
     }
 
     /// Every texel the LED stage changes is at least as bright as the
@@ -505,7 +1031,7 @@ mod tests {
                                 LedRegion::Na,
                             )
                         };
-                        let (sodium, led) = (run(&LedModel::OFF), run(&all));
+                        let (sodium, led) = (run(&sodium_only()), run(&all));
                         for (s, l) in sodium.pixels().zip(led.pixels()) {
                             if s != l {
                                 changed += 1;
@@ -677,6 +1203,211 @@ mod tests {
             let us = started.elapsed().as_micros();
             println!("probe ZL{}: {us} us, lit {lit}", n.zoom);
         }
+    }
+
+    /// Release-build timing of road light on the developer's installation
+    /// (Geneva, ZL16 at 1024 px, eu-west night recipes); skipped elsewhere.
+    /// Run with `cargo test --release -p xearthlayer --lib
+    /// time_road_light_on_a_real_zl16_texture -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn time_road_light_on_a_real_zl16_texture() {
+        use crate::night::roads::field::tests::{crossing, street_grid_over};
+        let pkg = "/media/FlightSim/XEarthLayer Packages/zzXEL_eu-west_ortho";
+        let art = "/media/FlightSim/X-Plane 12-beta/Resources/default scenery/1000 world terrain";
+        if !std::path::Path::new(pkg).is_dir() || !std::path::Path::new(art).is_dir() {
+            return;
+        }
+        let store = crate::night::RecipeStore::new(vec![pkg.into()]);
+        let art = crate::night::LaminarArt::new(art.into());
+        let n = name_at(46.20, 6.14);
+        let size = 1024;
+        let model = RoadModel::DEFAULT;
+        let empty = RoadField::empty(size);
+        let sparse = RoadField::raster(&n, size, &[crossing(&n)], &model);
+        let grid = street_grid_over(&n, 100.0);
+        let started = std::time::Instant::now();
+        let dense = RoadField::raster(&n, size, &[grid], &model);
+        println!(
+            "100 m street grid raster: {:.1} ms, {} segments, {} lit texels",
+            started.elapsed().as_secs_f64() * 1e3,
+            dense.stats.segments,
+            dense.stats.lit_texels
+        );
+        let run = |roads: &RoadField| {
+            CpuLitGenerator.generate(&LitRequest {
+                name: &n,
+                size,
+                brightness: 1.0,
+                recipes: &|a, b| store.get(a, b),
+                patterns: &|c| art.pattern(c),
+                regions: &|_, _| LedRegion::Na,
+                led: &LedModel::DEFAULT,
+                roads,
+                road_model: &model,
+            })
+        };
+        // Inflates the recipes and decodes the patterns.
+        run(&empty);
+        for (label, roads) in [
+            ("no roads", &empty),
+            ("one motorway", &sparse),
+            ("100 m street grid", &dense),
+        ] {
+            let mut ms = Vec::new();
+            let mut img = None;
+            for _ in 0..5 {
+                let started = std::time::Instant::now();
+                img = Some(run(roads));
+                ms.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+            ms.sort_by(f64::total_cmp);
+            let img = img.unwrap();
+            println!(
+                "ZL16 1024 px, {label} ({} road texels): min {:.1} ms, median {:.1} ms, \
+                 lit {}, pixels {:016x}",
+                roads.stats.lit_texels,
+                ms[0],
+                ms[2],
+                lit_texels(&img),
+                digest(&img)
+            );
+        }
+    }
+
+    /// Release-build timing of road light from the real road network, at
+    /// 1024 px: the Geneva texture above, and the Tokyo ZL16 texture with
+    /// the most road points in its tile, each generated without roads and
+    /// with the roads the installation's DSFs give (read and merged by the
+    /// road service). Skipped without the installation, the packages or the
+    /// art. Run with `cargo test --release -p xearthlayer --lib
+    /// time_real_roads_on_real_zl16_textures -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn time_real_roads_on_real_zl16_textures() {
+        use crate::night::roads::service::real;
+        let packages = "/media/FlightSim/XEarthLayer Packages";
+        let art = "/media/FlightSim/X-Plane 12-beta/Resources/default scenery/1000 world terrain";
+        if !std::path::Path::new(art).is_dir() {
+            println!("no Laminar art at {art}; skipped");
+            return;
+        }
+        let art = crate::night::LaminarArt::new(art.into());
+        let model = RoadModel::DEFAULT;
+        let size = 1024;
+        for (label, pkg, tile) in [
+            ("Geneva", "zzXEL_eu-west_ortho", (46, 6)),
+            ("Tokyo", "zzXEL_as-asia-pacific_ortho", (35, 139)),
+        ] {
+            let pkg = format!("{packages}/{pkg}");
+            let store = crate::night::RecipeStore::new(vec![pkg.clone().into()]);
+            if store.get(tile.0, tile.1).is_none() {
+                println!("{label}: no night recipe for {tile:?} in {pkg}; skipped");
+                continue;
+            }
+            let n = if label == "Geneva" {
+                name_at(46.20, 6.14)
+            } else {
+                let Some(t) = real::merged_roads(&[tile]) else {
+                    return;
+                };
+                densest_zl16(&t[0])
+            };
+            // The tiles the service would ask roads for.
+            let tiles = crate::night::service::road_tiles(&n, size, &model);
+            let Some(roads) = real::merged_roads(&tiles) else {
+                return;
+            };
+            let regions = |a: i32, b: i32| {
+                store
+                    .get_with_region(a, b)
+                    .map_or(LedRegion::Unknown, |(_, r)| r)
+            };
+            let run = |field: &RoadField| {
+                CpuLitGenerator.generate(&LitRequest {
+                    name: &n,
+                    size,
+                    brightness: 1.0,
+                    recipes: &|a, b| store.get(a, b),
+                    patterns: &|c| art.pattern(c),
+                    regions: &regions,
+                    led: &LedModel::DEFAULT,
+                    roads: field,
+                    road_model: &model,
+                })
+            };
+            let raster = || RoadField::raster(&n, size, &roads, &model);
+            /// Wall time of `f` in ms.
+            fn ms(f: impl FnOnce()) -> f64 {
+                let started = std::time::Instant::now();
+                f();
+                started.elapsed().as_secs_f64() * 1e3
+            }
+            // Inflates the recipes and decodes the patterns.
+            let empty = RoadField::empty(size);
+            let dark = run(&empty);
+            let field = raster();
+            let lit = run(&field);
+            // Nine rounds of the four timings in turn, so a change in the
+            // machine's load reaches all four alike; minimum and median.
+            let rounds: [[f64; 4]; 9] = std::array::from_fn(|_| {
+                [
+                    ms(|| drop(std::hint::black_box(raster()))),
+                    ms(|| drop(std::hint::black_box(run(&empty)))),
+                    ms(|| drop(std::hint::black_box(run(&field)))),
+                    ms(|| drop(std::hint::black_box(run(&raster())))),
+                ]
+            });
+            let [(raster_min, raster_med), (none_min, none_med), (gen_min, gen_med), (all_min, all_med)] =
+                std::array::from_fn(|k| {
+                    let mut r = rounds.map(|round| round[k]);
+                    r.sort_by(f64::total_cmp);
+                    (r[0], r[4])
+                });
+            let texels = f64::from(size * size);
+            println!(
+                "{label} {}_{}_ZL{} ({} tiles, {} merged segments): {} segments rastered, \
+                 {} road texels ({:.1}% of the texture); lit texels {} without roads, {} with; \
+                 pixels {:016x} without roads, {:016x} with",
+                n.row,
+                n.col,
+                n.zoom,
+                tiles.len(),
+                roads.iter().map(|r| r.len()).sum::<usize>(),
+                field.stats.segments,
+                field.stats.lit_texels,
+                field.stats.lit_texels as f64 / texels * 100.0,
+                lit_texels(&dark),
+                lit_texels(&lit),
+                digest(&dark),
+                digest(&lit)
+            );
+            println!(
+                "{label}: raster min {raster_min:.1} ms, median {raster_med:.1} ms; \
+                 generation without roads min {none_min:.1} ms, median {none_med:.1} ms; \
+                 with the field min {gen_min:.1} ms, median {gen_med:.1} ms; \
+                 raster and generation min {all_min:.1} ms, median {all_med:.1} ms \
+                 ({:+.1}% on the median)",
+                (all_med / none_med - 1.0) * 100.0
+            );
+        }
+    }
+
+    /// The ZL16 texture of `roads`' tile that holds the most road points.
+    fn densest_zl16(roads: &crate::night::roads::merge::MergedRoads) -> DdsFilename {
+        let mut counts = std::collections::HashMap::<(u32, u32), usize>::new();
+        let (lat0, lon0) = (f64::from(roads.tile.0), f64::from(roads.tile.1));
+        roads.for_each_chain_near(lat0, lon0, lat0 + 1.0, lon0 + 1.0, |chain| {
+            for (lon, lat) in chain.points() {
+                let n = name_at(lat, lon);
+                *counts.entry((n.row, n.col)).or_default() += 1;
+            }
+        });
+        let ((row, col), _) = counts
+            .into_iter()
+            .max_by_key(|&(k, c)| (c, k))
+            .expect("a tile with roads");
+        name(row, col, 16)
     }
 
     /// What the service answers for a lit `stat` of `name`.

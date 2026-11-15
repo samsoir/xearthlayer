@@ -44,6 +44,7 @@ use crate::executor::{DdsClient, StorageConcurrencyLimiter};
 use crate::fuse::coalesce::RequestCoalescer;
 use crate::fuse::{get_default_placeholder, parse_dds_filename, DdsFilename, TextureKind};
 use crate::geo_index::GeoIndex;
+use crate::night::roads::dsf_tile_of_name;
 use crate::night::{BlackLitSource, LitTextureSource};
 use crate::ortho_union::OrthoUnionIndex;
 use crate::pinned_budget::PinnedTileBudget;
@@ -165,6 +166,9 @@ pub struct Fuse3OrthoUnionFS {
     /// DDS client, coalescer or caches above (night lighting, R8). Defaults
     /// to [`BlackLitSource`], which serves the minimal black DDS.
     lit_source: Arc<dyn LitTextureSource>,
+    /// `lit_source.wants_dsf_hints()`, read once in `with_lit_source`. While
+    /// `false`, `lookup` and `open` do nothing about DSFs but test this.
+    dsf_hints: bool,
     /// Per-open state for virtual DDS files, keyed by file handle.
     ///
     /// The kernel caps each FUSE read at 1 MiB, so X-Plane reading one 11.17 MB
@@ -245,6 +249,7 @@ impl Fuse3OrthoUnionFS {
             tile_request_callback: None,
             request_coalescer,
             lit_source: Arc::new(BlackLitSource),
+            dsf_hints: false,
             dds_handles: DashMap::new(),
             next_fh: AtomicU64::new(1),
             pinned: Arc::new(PinnedTileBudget::new()),
@@ -281,6 +286,7 @@ impl Fuse3OrthoUnionFS {
             tile_request_callback: None,
             request_coalescer,
             lit_source: Arc::new(BlackLitSource),
+            dsf_hints: false,
             dds_handles: DashMap::new(),
             next_fh: AtomicU64::new(1),
             pinned: Arc::new(PinnedTileBudget::new()),
@@ -305,8 +311,17 @@ impl Fuse3OrthoUnionFS {
 
     /// Serve lit textures from `source` instead of the black default.
     pub fn with_lit_source(mut self, source: Arc<dyn LitTextureSource>) -> Self {
+        self.dsf_hints = source.wants_dsf_hints();
         self.lit_source = source;
         self
+    }
+
+    /// Tell the lit source X-Plane touched the DSF of `tile`, if it is one.
+    /// The source must not block, and deduplicates repeated hints itself.
+    fn note_dsf(&self, tile: Option<(i32, i32)>) {
+        if let Some((lat, lon)) = tile {
+            self.lit_source.dsf_seen(lat, lon);
+        }
     }
 
     /// Attributes for a lit texture: a virtual DDS with the lit source's size.
@@ -584,6 +599,15 @@ impl Fuse3OrthoUnionFS {
     }
 }
 
+/// The 1 degree tile of a virtual path `Earth nav data/<block>/<tile>.dsf`.
+/// Borrows and allocates nothing: it runs on every real open while road
+/// lights are on, and a name that is not a DSF fails at the first check.
+fn dsf_tile_of_path(path: &Path) -> Option<(i32, i32)> {
+    let tile = dsf_tile_of_name(path.file_name()?.to_str()?)?;
+    let in_earth_nav_data = path.parent()?.parent()?.file_name()? == "Earth nav data";
+    in_earth_nav_data.then_some(tile)
+}
+
 /// Mount options shared by [`Fuse3OrthoUnionFS::mount`] and
 /// [`Fuse3OrthoUnionFS::mount_spawned`].
 fn mount_options(mount_path: &Path) -> MountOptions {
@@ -699,6 +723,9 @@ impl Filesystem for Fuse3OrthoUnionFS {
         if let Some(source) = self.index.resolve(&child_path) {
             // Real file from a source
             if let Ok(metadata) = fs::metadata(&source.real_path).await {
+                if self.dsf_hints {
+                    self.note_dsf(dsf_tile_of_path(&child_path));
+                }
                 let inode = self.inode_manager.get_or_create_inode(&child_path);
                 let attr = self.metadata_to_attr(inode, &metadata);
                 return Ok(ReplyEntry {
@@ -1160,6 +1187,16 @@ impl Filesystem for Fuse3OrthoUnionFS {
     async fn open(&self, _req: Request, inode: u64, _flags: u32) -> Fuse3InternalResult<ReplyOpen> {
         if !InodeManager::is_virtual_inode(inode) {
             // Real passthrough files: use default kernel caching, no handle state.
+            // The kernel may open a DSF it cached the entry of without a lookup.
+            if self.dsf_hints {
+                // The tile is parsed under the inode map's read lock; the
+                // hint is sent after it is released.
+                let tile = self
+                    .inode_manager
+                    .with_path(inode, dsf_tile_of_path)
+                    .flatten();
+                self.note_dsf(tile);
+            }
             return Ok(ReplyOpen { fh: 0, flags: 0 });
         }
 
@@ -1904,6 +1941,187 @@ mod tests {
             .unwrap()
             .data;
         assert_eq!(&data[..], b"lit");
+    }
+
+    /// A lit source that records every `dsf_seen` tile.
+    struct SeenTiles {
+        wants: bool,
+        seen: std::sync::Mutex<Vec<(i32, i32)>>,
+    }
+
+    impl SeenTiles {
+        fn new(wants: bool) -> Arc<Self> {
+            Arc::new(Self {
+                wants,
+                seen: Default::default(),
+            })
+        }
+
+        fn seen(&self) -> Vec<(i32, i32)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::night::LitTextureSource for SeenTiles {
+        fn size<'a>(
+            &'a self,
+            _n: &'a crate::fuse::DdsFilename,
+        ) -> futures::future::BoxFuture<'a, u64> {
+            Box::pin(async { 152 })
+        }
+        fn read<'a>(
+            &'a self,
+            _n: &'a crate::fuse::DdsFilename,
+            _o: u64,
+            _l: u32,
+        ) -> futures::future::BoxFuture<'a, Bytes> {
+            Box::pin(async { Bytes::new() })
+        }
+        fn dsf_seen(&self, lat: i32, lon: i32) {
+            self.seen.lock().unwrap().push((lat, lon));
+        }
+        fn wants_dsf_hints(&self) -> bool {
+            self.wants
+        }
+    }
+
+    /// The DSF fixture plus a `.ter`, a DSF-named file one folder too deep
+    /// (`Earth nav data/+40-080/extra/`, which the index lists eagerly, so
+    /// a lookup reaches the hint check rather than the lazy `terrain` path),
+    /// and a lit source (wanting hints or not) that records its hints.
+    fn dsf_hint_fixture(temp: &TempDir, wants: bool) -> (Fuse3OrthoUnionFS, u64, Arc<SeenTiles>) {
+        let terrain = temp.path().join("test_ortho/terrain");
+        std::fs::create_dir_all(&terrain).unwrap();
+        std::fs::write(terrain.join("25712_12960_BI16.ter"), b"ter").unwrap();
+        let decoy = temp.path().join("test_ortho/Earth nav data/+40-080/extra");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::write(decoy.join("+40-074.dsf"), b"XPLNEDSF").unwrap();
+        let (fs, ino, _rx) = passthrough_fixture_with(temp, b"XPLNEDSF");
+        let seen = SeenTiles::new(wants);
+        (fs.with_lit_source(seen.clone()), ino, seen)
+    }
+
+    fn dsf_dir(fs: &Fuse3OrthoUnionFS) -> u64 {
+        fs.inode_manager
+            .get_or_create_inode(std::path::Path::new("Earth nav data/+40-080"))
+    }
+
+    fn terrain_inode(fs: &Fuse3OrthoUnionFS) -> u64 {
+        fs.inode_manager
+            .get_or_create_inode(std::path::Path::new("terrain"))
+    }
+
+    #[tokio::test]
+    async fn looking_up_a_dsf_tells_the_lit_source_its_tile() {
+        use fuse3::raw::Filesystem;
+        let temp = TempDir::new().unwrap();
+        let (fs, _ino, seen) = dsf_hint_fixture(&temp, true);
+        fs.lookup(
+            test_request(),
+            dsf_dir(&fs),
+            std::ffi::OsStr::new("+40-074.dsf"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen.seen(), vec![(40, -74)]);
+    }
+
+    #[tokio::test]
+    async fn opening_a_dsf_tells_the_lit_source_its_tile() {
+        use fuse3::raw::Filesystem;
+        let temp = TempDir::new().unwrap();
+        let (fs, ino, seen) = dsf_hint_fixture(&temp, true);
+        fs.open(test_request(), ino, 0).await.unwrap();
+        assert_eq!(seen.seen(), vec![(40, -74)]);
+    }
+
+    #[tokio::test]
+    async fn other_real_files_tell_the_lit_source_nothing() {
+        use fuse3::raw::Filesystem;
+        let temp = TempDir::new().unwrap();
+        let (fs, _ino, seen) = dsf_hint_fixture(&temp, true);
+        let ter = std::ffi::OsStr::new("25712_12960_BI16.ter");
+        fs.lookup(test_request(), terrain_inode(&fs), ter)
+            .await
+            .unwrap();
+        let ino = fs
+            .inode_manager
+            .get_or_create_inode(std::path::Path::new("terrain/25712_12960_BI16.ter"));
+        fs.open(test_request(), ino, 0).await.unwrap();
+        // Directories, virtual textures and misses too.
+        let _ = fs
+            .lookup(test_request(), 1, std::ffi::OsStr::new("Earth nav data"))
+            .await;
+        let _ = fs
+            .lookup(test_request(), textures_inode(&fs), lit_name())
+            .await;
+        assert!(seen.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dsf_named_file_outside_earth_nav_data_tells_nothing() {
+        use fuse3::raw::Filesystem;
+        let temp = TempDir::new().unwrap();
+        let (fs, _ino, seen) = dsf_hint_fixture(&temp, true);
+        let decoy_dir = fs
+            .inode_manager
+            .get_or_create_inode(std::path::Path::new("Earth nav data/+40-080/extra"));
+        fs.lookup(
+            test_request(),
+            decoy_dir,
+            std::ffi::OsStr::new("+40-074.dsf"),
+        )
+        .await
+        .unwrap();
+        let ino = fs.inode_manager.get_or_create_inode(std::path::Path::new(
+            "Earth nav data/+40-080/extra/+40-074.dsf",
+        ));
+        fs.open(test_request(), ino, 0).await.unwrap();
+        assert!(seen.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_dsf_tells_the_lit_source_nothing() {
+        use fuse3::raw::Filesystem;
+        let temp = TempDir::new().unwrap();
+        let (fs, _ino, seen) = dsf_hint_fixture(&temp, true);
+        assert!(fs
+            .lookup(
+                test_request(),
+                dsf_dir(&fs),
+                std::ffi::OsStr::new("+41-074.dsf")
+            )
+            .await
+            .is_err());
+        assert!(seen.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lit_source_that_wants_no_hints_hears_nothing() {
+        use fuse3::raw::Filesystem;
+        let temp = TempDir::new().unwrap();
+        let (fs, ino, seen) = dsf_hint_fixture(&temp, false);
+        fs.lookup(
+            test_request(),
+            dsf_dir(&fs),
+            std::ffi::OsStr::new("+40-074.dsf"),
+        )
+        .await
+        .unwrap();
+        fs.open(test_request(), ino, 0).await.unwrap();
+        assert!(seen.seen().is_empty());
+    }
+
+    #[test]
+    fn dsf_tile_of_path_needs_a_dsf_name_inside_earth_nav_data() {
+        let tile = |p: &str| dsf_tile_of_path(std::path::Path::new(p));
+        assert_eq!(tile("Earth nav data/+40-080/+40-074.dsf"), Some((40, -74)));
+        assert_eq!(tile("Earth nav data/+40-080/+40-074.DSF"), Some((40, -74)));
+        assert_eq!(tile("terrain/+40-074.dsf"), None);
+        assert_eq!(tile("Earth nav data/+40-074.dsf"), None);
+        assert_eq!(tile("Earth nav data/+40-080/25712_12960_BI16.ter"), None);
+        assert_eq!(tile("+40-074.dsf"), None);
+        assert_eq!(tile(""), None);
     }
 
     /// Fixture wired to an observable metrics channel.

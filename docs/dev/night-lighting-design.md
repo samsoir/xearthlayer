@@ -1,6 +1,6 @@
 # Night Lighting Design
 
-**Status**: Phase 1, phase 2a and phase 2b implemented (packaging, black serving, real lit sizes, the `LitGenerator` trait with its CPU implementation, bilinear world fields, warped soft class edges, hex stochastic tiling, and a coalesced service), plus the lit disk cache and LED lighting; tuning continues by flight
+**Status**: Phase 1, phase 2a and phase 2b implemented (packaging, black serving, real lit sizes, the `LitGenerator` trait with its CPU implementation, bilinear world fields, warped soft class edges, hex stochastic tiling, and a coalesced service), plus the lit disk cache, LED lighting and road lights; tuning continues by flight
 **Created**: 2026-10-17
 **Branch**: `blackmarble`, proposed for `develop/0.5.0` so others can test it
 
@@ -64,9 +64,11 @@ Established in the simulator (X-Plane 12 beta, 2026-10-16), not inferred:
    restrained.
 7. X-Plane pages a lit texture's mip levels in one at a time (seen in the
    FUSE reads, 2026-10-18): the first load reads only the small levels at
-   the end of the file, and the first visible level and the blank levels
+   the end of the file, and the first visible level and the top level
    arrive tens of seconds later as the aircraft closes. The mip fade
-   therefore happens per texture, when its blank level is paged in.
+   therefore happens per texture, as each level is paged in, and the
+   level shown is the largest one loaded (fully read for 19 of 1,006
+   ZL16 lit textures, 2026-11-14).
 
 ## Decisions
 
@@ -104,10 +106,16 @@ Established in the simulator (X-Plane 12 beta, 2026-10-16), not inferred:
                                      ▼                       ┌──────────────┐
                             LitGenerator (trait) ◀───────────│ XPlanePrefs  │
                             CPU implementation now           └──────────────┘
+                                     ▲                       ┌──────────────┐
+                                     └── road glow ──────────│ RoadService  │◀── DSF hints (FUSE)
+                                                             └──────────────┘
 ```
 
 The ortho path is untouched apart from the filename parser learning a
-texture kind. Everything else is new code in `xearthlayer/src/night/`:
+texture kind, and the FUSE `lookup` and `open` handlers telling the lit
+source when a DSF is reached (for road lights; with hints off this is one
+branch on a bool, see Trigger). Everything else is new code in
+`xearthlayer/src/night/`:
 
 | File | Responsibility |
 |---|---|
@@ -117,15 +125,18 @@ texture kind. Everything else is new code in `xearthlayer/src/night/`:
 | `night/laminar/ter.rs` | Read a Laminar `.ter`'s lit texture and pattern scale |
 | `night/laminar/art.rs` | `LaminarArt`: name to decoded lit pattern, cached |
 | `night/footprint.rs` | A lit texture's ground footprint |
-| `night/layout.rs` | The lit DDS layout: sizes, blank levels, zero regions |
+| `night/layout.rs` | The lit DDS layout: sizes, the black levels X-Plane drops, where the uploaded top and the payload sit, and which of them a read reaches |
 | `night/prefs.rs` | `XPlanePrefs`: the texture quality setting |
-| `night/generator/mod.rs` | The `LitGenerator` trait, `LitRequest`, and `encode_visible` |
+| `night/generator/mod.rs` | The `LitGenerator` trait, `LitRequest`, `encode_visible` and `encode_top` |
+| `night/generator/bc1_repair.rs` | The BC1 endpoint repair of blocks that tint dim texels green or purple |
 | `night/generator/gain.rs` | The gain curve |
 | `night/generator/noise.rs` | Integer hashing and world-anchored value noise |
 | `night/generator/field.rs` | `RecipeField`: recipe layers as continuous functions of world position |
 | `night/generator/tiling.rs` | Hex-grid stochastic tiling in Web Mercator metres |
 | `night/generator/cpu.rs` | `CpuLitGenerator`, the CPU implementation |
 | `night/service.rs` | `LitTextureService`: the FUSE-facing entry point |
+| `night/disk.rs` | Lit disk entries and the fingerprint of a payload's inputs |
+| `night/roads/` | Road lights: the simulator's road network as chains of lamps (see Road lights) |
 
 ### Recipe reader (`night/recipe.rs`)
 
@@ -201,9 +212,11 @@ footprint gives:
 
 With the texture quality setting `t` (0 to 4):
 
-- X-Plane drops `4 − t` top levels at load. XEL blanks
-  `B = (4 − t) + 1` top levels, so the first level X-Plane uploads is
-  black at any setting (R15).
+- X-Plane drops `4 − t` top levels at load. XEL puts
+  `B = (4 − t) + 1` levels above the first visible one (R15): the ones
+  X-Plane drops are black, and the one it uploads (the uploaded top, twice
+  the first visible level's size) is generated at its own size, at a
+  twelfth of the light, up to `MAX_GENERATED_TOP` (see Uploaded top below).
 - The first visible level `F` is 1024 px for a ZL16 texture, halving per
   zoom level above 16 and doubling per zoom level below it (512 px at ZL17,
   256 px at ZL18), about 7.5 m per texel throughout.
@@ -216,32 +229,181 @@ With the texture quality setting `t` (0 to 4):
 | 3 | 2 | 4096 | 11.2 MB | 2.8 MB |
 | 2 | 3 | 8192 | 44.7 MB | 2.8 MB |
 
-The cut-out distance is set by the texel size of the blank level
-X-Plane uploads first, so the first visible level stays fixed in metres
-at every setting. This is why lit VRAM does not fall with the texture
-setting. A layout that shrank the visible level with the setting (the
-same file at every setting, VRAM quartered per notch) was flown on
-2026-10-18 and moved the cut-out 2x farther out per notch.
+Where each texture's levels change is set by the texel size of the
+level X-Plane uploads first, so the first visible level stays fixed in
+metres at every setting. This is why lit VRAM does not fall with the
+texture setting. A layout that shrank the visible level with the setting
+(the same file at every setting, VRAM quartered per notch) was flown on
+2026-10-18 and moved the cut-out (the uploaded top was black then) 2x
+farther out per notch.
+
+**Uploaded top.** X-Plane loads a texture's top level only for the
+textures nearest the aircraft, and shows it over the whole texture. In
+the flight of 2026-11-14 at KCCR it fully read the top level of 19 of
+1,006 ZL16 lit textures, the first visible level of 25 more, the next of
+338, and only the small levels of the other 624. While the uploaded top
+was black, the ground under X-Plane's 3D scenery was lit by the 3D
+objects alone, whatever the levels below gave, and dimming the nearest
+visible levels could not change it. The first fix filled it from the
+first visible level, each texel repeated over 2 x 2 at a quarter of the
+light; in flight 7 the near field showed, but too bright, too coarse
+(7.5 m texels in 2 x 2 copies), and with green and purple texels (see
+BC1 floor and BC1 endpoint repair). The uploaded top is now generated at
+its own size, twice the first visible level (2048 px, 3.75 m texels at
+ZL16), when X-Plane first reads a byte range inside it, and encoded by
+`encode_top`: one BC1 level, no chain, its stored values scaled by
+`TOP_GAIN` (`(1/12)^(1/2.2)`, a twelfth of the light; at an eighth,
+flight 8, the near field was still too bright) and floored. Only the
+textures whose top X-Plane loads pay for it: on a KCCR ZL16 texture with
+real roads (release build) raster, generation and BC1 take about 720 ms
+at 2048 px against about 190 ms for the payload at 1024 px. A top holds
+a generation permit that long, about 3.8 times a payload, so a burst of
+near textures can delay payload generations by a few seconds on 2 to 4
+permits, and a read spanning the top and the payload waits for both, one
+after the other. Only tops of at most 2048 px a side are generated
+(`MAX_GENERATED_TOP`, the ZL16 top at texture setting 4): tops double
+per zoom level below 16, and a ZL12 top is 16384 px, 128 MiB of BC1 and
+about 1 GiB of RGBA while generating, more than the top cache holds, so
+it would be generated again on every 1 MiB read. A larger top reads as
+zeros (black, as before it was lit) and nothing generates it. Tops are
+kept in memory (`LIT_TOP_CACHE_BYTES`, 64 MiB, 32 ZL16 tops), never on
+disk, so they need no fingerprint, and they follow the payload's rules
+otherwise: one generation per texture however many reads wait on it,
+under the same generation permits and road wait, served but not kept
+when a road tile was late, kept in memory when one failed, black and not
+kept when a recipe cannot be read or the encode fails. A read that
+reaches only the payload never generates the top, and the other way
+round. The levels X-Plane drops stay black. The earlier black top was
+the distance fade (fact 3); the fade below is now the dimmed levels
+alone, and where the top is generated the lit layer no longer switches
+off near the aircraft. The top is generated only up to `MAX_GENERATED_TOP`
+(2048 px, ZL16 and finer at setting 4); at ZL12 to ZL15 it is larger,
+reads as zeros and stays black, so the lit layer still switches off right
+around the aircraft there.
 
 **Fade ramp.** Because X-Plane pages levels in one at a time (fact 7), a
-texture would jump from full light straight to its blank level, and was
-seen to switch off as one visible square. The first visible level is
-dimmed to 2/3 of the light (`FADE_RAMP`, `(2/3)^(1/2.2)` in stored value,
-since X-Plane decodes sRGB), so each texture steps from full to 2/3 to
-off. The chain is downsampled from the undimmed image, so every coarser
-level is at full light, and the ramp costs no bytes. Two steps (2/3 and
-1/3 of the light) pushed the effective cut-out a level farther out, and
-scaling stored values instead of light (1/3 stored is about 9% of the
-light) read as black before the 3D lights were drawn.
+texture would jump from full light straight to its top level, black
+before the ramp and before the top was lit, and was seen to switch off as
+one visible square. The first visible level
+gives a quarter of the light and the next half (`FADE_RAMP`,
+`(1/4)^(1/2.2)` and `(1/2)^(1/2.2)` in stored value, since X-Plane decodes
+sRGB), so each texture steps from full to half to a quarter, one stop per
+level, and to a twelfth at the uploaded top (`TOP_GAIN`).
+The chain is downsampled from the undimmed image, so every coarser level
+is at full light, and the ramp costs no bytes. The nearest level is cut
+back so the ground under X-Plane's 3D roads and lights is only faintly
+lit, and two levels make the fade span twice the mip range: on a wide
+view the screen's stretch puts the blank-to-visible change about a level
+farther out at the sides than at the centre and squeezes a one-level fade
+into a few pixels there (KCCR, 2026-11-14). The nearest level first gave
+an eighth of the light, and in flight it did not show at all: over the 20
+KCCR textures of the road light measurements, 0.08% of its texels stayed
+above a linear 0.002, against 2.9% at full light and 0.4% at a quarter.
+BC1 was not the cause; it kept 87% of the eighth's light (92% of a
+quarter's). Until then one level was dimmed, to 2/3 of the
+light. A two-step ramp flown on 2026-10-18 (2/3 and 1/3) read as black
+before the 3D lights were drawn, but it scaled stored values (1/3 stored
+is about 9% of the light), and no road lights covered the hand-off yet.
+
+**Mips in linear light.** The chain below the first visible level is
+averaged in linear light (`lit_chain`, #363), not by averaging stored
+values as the ortho encoder does. Lit art is bright points on black, and a
+stored-value average counts a lit texel beside dark ones at a fraction of
+its light. Measured on a ZL16 texture over Mexico City, the stored-value
+chain kept 82% of the light at the first coarser level, 53% at the third
+and 24% at the sixth, and it warmed as it went: blue, the sparsest channel
+of warm light, lost the most, so linear B/R fell from 0.45 to 0.33 by the
+sixth level (0.17 to 0.04 for sodium alone). Distant towns, which X-Plane
+draws from those levels, read dimmer and more orange than the near ground.
+Each level is now averaged from the linear values of the level above, not
+from its rounded bytes, so every level keeps the light and colour of the
+first.
+
+**BC1 floor.** BC1 stores colours as RGB565, so below about 4 in stored
+value red and blue round to 0 while green keeps a 4: very dim texels
+decode green or purple, and in flight 7 (KCCR, 2026-11-14) green and
+purple texels showed in the lit layer. Over 20 KCCR ZL16 textures at
+1024 px the generator itself makes no green or purple dim texels. Every
+encoded level is therefore floored before BC1, after its dimming: a texel
+whose largest stored R, G or B is below 8 (`BC1_FLOOR`) becomes black,
+its alpha untouched. Counted over every decoded texel after BC1 at full
+light (green when decoded G > max(R, B) + 2, purple when
+min(R, B) > G + 2), two probes found about 150,000 green texels without
+the floor and about 3,900 green and 13,500 purple with it, the floor
+keeping 0.916 of the decoded light against 0.960 without. Their purple
+counts without the floor differ, 61,088 and 22,016, for a reason not
+found; with the floor they agree.
+
+At the dimmed levels as served the counts are lower: 1,727 green and
+8,740 purple over the 20 first visible levels at a quarter, and 639 green
+and 4,619 purple over three 2048 px tops at an eighth. The floor no longer
+carries the tint fix alone: the texels left just above it are the ones the
+encoder tints, which the endpoint repair below corrects in measurement
+(flight is the check on the GPU's decode).
+
+**BC1 endpoint repair.** Flight 9 (KCCR, 2026-11-14) still showed whole
+road lamps lavender beside grey-white ones, and pink and green specks in
+towns, in the distant levels too. Near black the RGB565 grid has no neutral
+colour between 8 and 16 in red and blue (decoded 0, 8, 16, 25), while green
+also has 4 and 12 (0, 4, 8, 12, 16), and ISPC quantises each endpoint's
+channels on their own. In blocks mixing a dim lamp with black it puts dim
+near-white texels on lavender codes: a lamp of `(9, 7, 5)` decodes
+`(8, 4, 8)` (where nearest rounding would give the neutral `(8, 8, 8)`),
+`(17, 14, 12)` decodes `(16, 12, 16)`. A probe over 20 KCCR ZL16 payloads
+and 5 tops at 2048 px, encoded as served, found the tints introduced by
+BC1 (decoded tinted at a margin of 2, the pre-encode level not) at 3,009
+green and 30,458 purple; 99.6% of the purple had a source largest channel
+of 8 to 15, near neutral, in mixed blocks, and 60% sat on road texels; the
+generator's own levels had 8 green and no purple. Raising the floor (to
+12, 16 or 24) left green and lost 20% to 76% of the light; moving texels
+onto the 565 grid before encoding did not survive the encoder's refit and
+raised green eightfold.
+
+After ISPC, `generator/bc1_repair.rs` looks at every block of every
+encoded level (both encoders, through `bc1_levels`) whose decode has a
+tint its source does not have, at a margin of 2 (`TINT_MARGIN`), on a
+texel whose largest decoded channel is at least `BC1_FLOOR`. It searches
+the block's endpoints by coordinate descent from the original endpoints
+with their indices chosen anew, each endpoint's R, G and B one 565 step
+down or up, keeping every step that lowers the block's error, until none
+does or 64 sweeps have run (`MAX_SWEEPS`; the probe's encodes needed at
+most 4), re-choosing the indices for every candidate. A texel's
+error is `4 x ((dR - dG)^2 + (dB - dG)^2)` (`CHROMA_WEIGHT`) plus the
+square of its Rec.709 luminance difference plus 1000 (`TINT_PENALTY`) if
+it decodes with a tint its source does not have, in stored values. The
+block keeps its mode (four colours while `c0 > c1`, three otherwise,
+whose transparent fourth entry is never chosen) and is replaced only
+when its error strictly drops. Blocks whose endpoints are both below the
+floor are skipped, as no colour of theirs can be lit. The repair works
+in place on the encoded bytes and allocates nothing. On the same 25
+encodes it leaves no tint introduced at a margin of 2 (from 3,009 green
+and 30,458 purple), and at a linear-light ratio of 1.5 (green when G >
+1.5 x max(R, B) after an sRGB decode, purple when min(R, B) > 1.5 x G) 1
+green and 152 purple against 2,996 and 31,220, keeping 0.999 of the
+light (the tops 1.001). It costs about 1.5 ms per 1024 px payload and
+3.2 ms per 2048 px top (release, KCCR r1582 c659), against about 190 ms
+(185 to 195 measured) and 700 ms to generate them. A margin of 4 is
+blind to it: the commonest codes differ from green by exactly 4, so at a
+margin of 4 BC1 seems to introduce 2 green and no purple, yet `(8, 4,
+8)` carries 4.6 times the green's light in red and blue and `(16, 12,
+16)` 1.9 times. The repair is judged against a D3D-exact decode; GPUs
+round the interpolated colours by about 1.
 
 A footprint without light is a fixed **minimal black DDS**: 4 × 4, BC1,
 with its full chain (4, 2 and 1 px levels), all blocks zero, 152 bytes
 (R6).
 
-The blank levels are never stored. A lit texture's bytes are
-`header ‖ zero region ‖ payload`, and a read at an offset inside the zero
-region is answered with zeros. Only the payload (the visible levels, about
-0.7 MB for an urban ZL16 texture) is generated, encoded and cached.
+The levels X-Plane drops are never stored. A lit texture's bytes are
+`header ‖ zero region ‖ uploaded top ‖ payload`: a read inside the zero
+region (the levels X-Plane drops) is answered with zeros and generates
+nothing; `LitLayout::reach` says whether a read reaches the uploaded top,
+the payload or both, and only the parts it reaches are generated, one
+after the other. `LitLayout::read_lit` composes the bytes from the top and
+the payload it is given; a part that is absent or of the wrong length
+reads as zeros, and any split of a read gives the same bytes as one whole
+read. The payload (the visible levels, about 0.7 MB for an urban ZL16
+texture) is cached in memory and on disk, the top (2 MiB at ZL16) in
+memory only.
 
 **Risk.** At `t = 0` the top level would be 32768 px. Whether X-Plane
 accepts a header that large, even though it only uploads from level 4
@@ -288,7 +450,8 @@ pub trait LitGenerator: Send + Sync {
 ```
 
 `LitRequest` carries the texture name (footprint and zoom), the size of the
-first visible level, `night.brightness`, the LED model (`led`), and lookups:
+first visible level, `night.brightness`, the LED model (`led`), the road
+glow raster (`roads`, a `RoadField`) with its `RoadModel`, and lookups:
 recipes by 1 degree tile, the package region each recipe was read from
 (`regions`) and lit patterns by palette name. The trait leaves room for a
 GPU generator later (R17); the CPU implementation comes first.
@@ -344,18 +507,22 @@ For each texel of the first visible level, the CPU implementation:
 6. **Outputs** the (possibly recoloured) weighted sum of class patterns ×
    gain, as RGB. An LED texel is held to at least the byte luminance of the
    sodium bytes it replaces (see LED lighting).
+7. **Adds road light** where the road raster reaches the texel, in linear
+   light, including texels the recipe leaves dark (see Road lights).
 
-`encode_visible` then box-filters the lower levels from the first visible
-level, as the ortho path does, and BC1-encodes them with the default ISPC
-encoder, whatever `texture.compressor` says. A lit payload is about a tenth
-of an ortho tile, so wiring the GPU channel worker into the lit path is not
-worth it now. A real ZL16 texture at 1024 px generated in about 130 ms
-warm and 147 ms cold before the LED stage, and generates in about 153 ms
-warm and 168 ms cold with it (release build, developer machine). Three
-things keep it there: recipes sit in a small table of tile slots rather
-than a hash map, patterns resolve once per tile and palette index, and
-the tiling caches the lattice corners neighbouring texels share (with the
-same bits as without the cache).
+`encode_visible` then averages the lower levels from the first visible
+level in linear light (see Mips in linear light), dims the fade levels,
+floors every level (see BC1 floor), BC1-encodes them with the default
+ISPC encoder, whatever `texture.compressor` says, and repairs the blocks
+whose decode tints a dim texel (see BC1 endpoint repair). A lit payload
+is about a tenth of an ortho tile, so wiring the GPU channel worker into
+the lit path is not worth it now. A real ZL16 texture at 1024 px
+generated in about 130 ms warm and 147 ms cold before the LED stage, and
+generates in about 153 ms warm and 168 ms cold with it (release build,
+developer machine). Three things keep it there: recipes sit in a small
+table of tile slots rather than a hash map, patterns resolve once per
+tile and palette index, and the tiling caches the lattice corners
+neighbouring texels share (with the same bits as without the cache).
 
 Determinism (R13): hashes use fixed seeds and integer inputs, and the
 generator holds no state between calls, so the same recipe, art and
@@ -399,23 +566,29 @@ Inside:
   (`entry().or_insert`), so two probes that finish differently cannot give
   `size` and `read` different lengths.
 - **Coalescing.** Concurrent requests for one footprint share one
-  generation through moka's `optionally_get_with` on the payload cache,
-  which is the lit path's own (R8). The key is `(row, col, zoom)` with no
-  settings fingerprint, because `night.brightness` and the texture setting
-  are fixed for the session. A failed generation is not cached.
+  generation through moka's `try_get_with` on the payload cache, which is
+  the lit path's own (R8). The key is `(row, col, zoom)` with no settings
+  fingerprint, because `night.brightness` and the texture setting are
+  fixed for the session. A failed generation is not cached, nor a payload
+  generated while one of its road tiles was still building (see Road
+  lights): every caller waiting on that generation is served it, and the
+  next read generates again.
   Generation reads all the recipes of its field first; if one cannot be
   read it returns no payload (not cached) and the read serves full-size
   black, so a payload is never built with a tile missing.
 - **CPU budget.** A semaphore of `(cores / 8).clamp(2, 4)` permits bounds
   concurrent generations, which run on the blocking pool. Generation,
-  probe and disk permits (2, for the lit disk tier's fingerprint, read and
-  write-back) are not added to `LaneSizing::blocking_threads_required()`.
-  They sit inside `BLOCKING_POOL_HEADROOM` (32), held there by a
-  compile-time assertion that probe permits plus the maximum generation
-  permits plus disk permits are at most a quarter of the headroom. This
-  keeps `executor` free of a dependency on `night`.
+  probe, disk (2, for the lit disk tier's fingerprint, read and
+  write-back) and road extract permits (2, see Road lights) are not added
+  to `LaneSizing::blocking_threads_required()`. They sit inside
+  `BLOCKING_POOL_HEADROOM` (32), held there by a compile-time assertion
+  that probe permits plus the maximum generation permits plus disk permits
+  plus road extract permits are at most a third of the headroom (10 of 10,
+  so the night share is fully used). This keeps `executor` free of a
+  dependency on `night`.
 - **Cache.** Reads go memory (256 MB, bounded by bytes), then disk, then
-  generate. The disk tier holds payloads only (file sizes and the DDS layout
+  generate. Generated top levels have their own memory cache (64 MiB) and
+  never reach the disk. The disk tier holds payloads only (file sizes and the DDS layout
   are unchanged) under `{cache_dir}/night/` in region folders, with its own
   GC daemon on the prefetch lane. With `night.enabled` it takes 5% of
   `cache.disk_size` first (`LIT_DISK_SHARE`) and `dds_disk_ratio` splits the
@@ -427,12 +600,16 @@ Inside:
   `night.brightness`, the size and mtime of the Laminar lit art
   (`library.txt`, `.ter`, `_LIT.dds`) and of the recipe files the
   footprint's field reads, each with the package region it was read from
-  (the LED stage depends on it). Recipe identities are taken when each
-  recipe is loaded, so a recipe replaced while XEL runs does not lend its
-  new identity to a payload built from the old one. A mismatch is a miss:
-  the payload is regenerated and overwrites the entry, so package updates,
-  X-Plane updates and brightness changes need no cache clear. Write-back is fire-and-forget,
-  only for payloads built from a complete set of recipes (black is never
+  (the LED stage depends on it), and with road lights the road digest
+  (`ROADS_VERSION` and the road model) and the identities of each road
+  tile's DSFs (see Road lights). The tier also holds the road extractions
+  of 7z DSFs. Recipe identities are taken when each recipe is loaded, so a
+  recipe replaced while XEL runs does not lend its new identity to a
+  payload built from the old one. A mismatch is a miss: the payload is
+  regenerated and overwrites the entry, so package updates, X-Plane
+  updates and brightness changes need no cache clear. Write-back is
+  fire-and-forget, only for payloads built from a complete set of recipes
+  (black is never
   written), and never after an art file failed to read or decode this
   session (`LaminarArt::had_failure`), since that failure is invisible to
   the fingerprint. Disk work runs under `LIT_DISK_PERMITS` (2). Evicting is
@@ -521,18 +698,42 @@ with no config keys, tuned in flight:
 
 | Category | Share | Base temperature |
 |---|---|---|
-| Industrial | 0.80 | 4500 K |
-| Urban bright | 0.75 | 4000 K |
-| Urban dim | 0.45 | 3200 K |
+| Industrial | 0.90 | 4500 K |
+| Urban bright | 0.90 | 4500 K |
+| Urban dim | 0.80 | 4000 K |
+
+The shares were raised from 0.80, 0.75 and 0.45 in #363: night photos of
+central Mexico and Mexico City from the air showed city light mostly
+neutral white (median saturation 0.08 to 0.21 over the brightest lit
+pixels, almost no saturated orange), against 0.34 and a quarter saturated
+orange in a 0.5.0 screenshot of Ontario, California, where most
+residential ground stayed sodium.
+
+The temperatures were raised from 4000 K (urban bright) and 3200 K (urban
+dim), and the region shifts halved from ±400 K, also in #363. Once the
+mips kept their light, the generated Bay Area textures (61 ZL16 textures
+from San Francisco to San Jose) were nine tenths LED by texel but still
+averaged to amber (linear R : G : B over luminance 1.44 : 0.92 : 0.53,
+saturation 0.37 as an sRGB colour), because a distant city is mostly
+residential white. With these values it averages to saturation 0.28; a
+stronger sodium tone (`mix` 0.45) moved it by nothing measurable. Field
+practice: US conversions before 2016 were mostly 4000 to 5000 K, after
+which the AMA's 3000 K guidance turned many residential streets warmer
+(Tacoma: 3000 K residential, 4000 K arterials); EU procurement guidance
+asks for warm white in residential areas, but most UK councils install
+4000 K or more. The continents converge more than they differ, so the
+shift is ±200 K, and how much of a region has converted (Belgium and
+Germany least in Europe, per the ISS colour maps of Sánchez de Miguel et
+al., 2022) is left to the share scale.
 
 | Region | Share scale | Temperature shift |
 |---|---|---|
-| NA | 1.0 | +400 K |
-| EU | 0.9 | -400 K |
-| OC | 0.9 | -400 K |
-| AS | 0.8 | -400 K |
-| SA | 0.7 | +400 K |
-| AF | 0.5 | +400 K |
+| NA | 1.0 | +200 K |
+| EU | 0.9 | -200 K |
+| OC | 0.9 | -200 K |
+| AS | 0.8 | -200 K |
+| SA | 0.7 | +200 K |
+| AF | 0.5 | +200 K |
 | Patch or unknown | 0.75 | 0 |
 
 **Recolour.** An LED texel keeps the luminance of the pattern sum (decoded
@@ -546,8 +747,24 @@ white until it is not. LED is therefore never dimmer than the sodium it
 replaces, and this holds after rounding to bytes: the generator compares
 the decoded luminance of the LED bytes with that of the sodium bytes for
 the same gain, and rounds the LED channels up, then falls back to the
-sodium bytes, when rounding to nearest would lose any. A sodium texel keeps its bytes exactly, and `LedModel::OFF`
+sodium bytes, when rounding to nearest would lose any. `LedModel::OFF`
 reproduces the sodium-only output.
+
+**Sodium tone.** The texels that stay sodium are toned too (#363,
+`SodiumTone`, `LedModel::sodium`). Laminar's sodium is linear
+R : G : B ≈ 1 : 0.38 : 0.08, about as saturated as a 2700 K blackbody
+(1 : 0.42 : 0.10), and high-pressure sodium itself sits near 2000 K, so a
+low-temperature white would not desaturate it: the hue is physically fair,
+and the change is perceptual (scatter, and the eye adapting to a mostly
+white city). Each sodium texel is mixed `mix` (0.30) of the way towards the
+3200 K white at its own luminance in linear light, then its luminance is
+multiplied by `1 + mix × (energy - 1)` with `energy` 1.125, about half the
+LED energy, because a less saturated light of equal luminance looks dimmer.
+Laminar's mean texel goes from saturation 0.68 to 0.63; sodium districts
+stay amber and never read as LED. The byte rule is the same as for LED: the
+toned bytes are never dimmer than Laminar's bytes at the same gain, and LED
+bytes are never dimmer than the toned ones. `SodiumTone::NONE` (in
+`LedModel::OFF`) returns Laminar's bytes exactly.
 
 **Regions.** The region is the first segment of the code of the package a
 recipe was read from (`NA-USA-MX-CENTRAL` is NA; legacy `na` and `eu`
@@ -555,8 +772,12 @@ work), recorded when the recipe is loaded, as the identity is. Patches
 (`_patches/...`), unknown codes and missing recipes are Unknown.
 
 **Cache.** The region is part of each tile's entry in the footprint
-fingerprint, and `LIT_GENERATOR_VERSION` is 2, so lit entries from before
-the LED stage miss once and regenerate; the GC ages the old ones out.
+fingerprint, and `LIT_GENERATOR_VERSION` is 10 (2 added the LED stage, 3
+the raised shares and the sodium tone, 4 the linear-light mips, 5 the
+cooler whites, 6 road lights, 7 the two-level fade, 8 a quarter of the
+light at its nearest level, 9 the BC1 floor, 10 the BC1 endpoint repair),
+so lit entries from before
+the current generator miss once and regenerate; the GC ages the old ones out.
 
 **Cost.** Measured with the ignored test
 `night::generator::cpu::tests::time_a_real_zl16_texture` (release, a real
@@ -568,6 +789,696 @@ generation permits.
 **Deferred.** An OXO brightness-trend LED model computed once and encoded
 per tile at tile creation, which would replace the formula here; OSM
 commercial flags for the category; SDGSAT-1 colour data.
+
+## Road lights
+
+Close to the aircraft X-Plane's 3D roads and their lights take over,
+over the lit layer at a quarter of its light, and at a twelfth on the
+nearest textures whose top is generated (up to `MAX_GENERATED_TOP`, so not
+at ZL12 to ZL15), whose top level X-Plane uploads. The lit layer's streets are
+Laminar's pattern art, not real roads, so without road lights a 3D road
+appears where the lit texture showed no road to match, and a road across
+dark countryside, where VIIRS sees nothing and the gain is zero, appears
+out of nothing. Road lights draw the roads the simulator actually presents
+into the lit texture: a chain of lamps along every lit road class, on top
+of the pattern in towns and faint between them, so the hand-off from far
+to near matches. The code is `xearthlayer/src/night/roads/`.
+
+| File | Responsibility |
+|---|---|
+| `roads/packs.rs` | `PackIndex`: which DSFs X-Plane loads for each 1° tile, in priority order |
+| `roads/dsf/` | Streaming DSF reader: `stream.rs` (atoms, 7z), `pool.rs` (PO32 point pools), `walk.rs` (the command walk) |
+| `roads/exclusion.rs` | `sim/exclude_net` zones |
+| `roads/class.rs` | `RoadClass` from a DSF road subtype |
+| `roads/merge.rs` | `Merger` and `MergedRoads`: the priority merge and the compact merged tile |
+| `roads/codec.rs` | The disk cache entry of one DSF's extraction |
+| `roads/model.rs` | `RoadModel`: glow per class, rural floor, colour, lamps |
+| `roads/field.rs` | `RoadField`: a texture's glow raster, and `reach_deg` |
+| `roads/service/` | `RoadService`: per-tile builds (overlays only), waits, caches, identities; `real.rs` holds the ignored real-install measurements |
+| `roads/stats.rs` | Counters, latency windows and the minute summary |
+
+### Source of truth
+
+The roads are those of the DSFs X-Plane loads for a tile, read at run time
+from the user's installation, not a layer built at publishing time:
+whatever overlays the user has (X-World Pro, airport packs, other road
+packs) decide the network, as they do in the simulator.
+
+`PackIndex::build` reads `Custom Scenery/scenery_packs.ini` (with the
+parser X-World Pro detection uses), keeps the enabled entries in file
+order, appends Global Scenery (`X-Plane 12 Global Scenery`) last, and
+lists `<pack>/Earth nav data/*/*.dsf` of each by name. `*GLOBAL_AIRPORTS*`
+resolves to `Global Scenery/Global Airports`. Only directories are read:
+no DSF is opened or stat'ed. XEL's own mount is left out, so XEL never
+reads its own DSFs back through its own filesystem: a pack is skipped when
+its resolved root equals a mount point, or when its ini entry is relative
+and its folder name equals the mount point's (which covers a mount point
+spelled with another prefix, a symlink or a case difference). The index is
+built once per session, in its own blocking task, on first use; building
+the lit source reads nothing from the installation. The index lives for
+the session, so it stores no path per DSF: one root per pack and one
+sorted array of six-byte entries (tile, rank, and whether the file is
+spelled as X-Plane names it, `Earth nav data/+40+000/+46+006.dsf`), so a
+tile's sources are one binary-searched run, highest priority first. A
+standard path is rebuilt from its pack's root when the tile is built; any
+other spelling the listing accepts (an upper-case `.DSF`, a tile filed
+under another block's folder) keeps its relative path in a small side
+table, so it is still found where it is. The listing parses each directory
+entry's name straight into an entry, in parallel across packs. On the
+developer's installation (315 pack lines, 301 enabled, X-World Pro on
+every continent) it lists 181,290 DSFs over 39,017 tiles in 16 to 33 ms
+and holds them in 1.1 MiB (`PackIndex::bytes`).
+
+**Which DSFs give roads.** X-Plane shows the networks of every overlay DSF
+of a tile (`sim/overlay 1`) but of one base mesh only, the highest
+priority one. Wherever XEL serves lit textures that base mesh is XEL's own
+(left out of the index, and it carries no roads), so a lower base mesh's
+roads, Global Scenery's among them, are never on screen. The lit layer
+follows the same convention: it shows exactly the overlay roads X-Plane
+draws, and a tile no overlay gives a road has no road glow.
+
+The sources are taken from the highest priority down; each overlay's
+network and `sim/exclude_net` zones are merged (see Merge), so a zone in a
+higher pack removes the roads of the packs below it, as X-Plane does,
+until a zone covers the whole tile. A base mesh, wherever it ranks, is
+read only to its HEAD (`ReadMode::OverlaysOnly`: 169 bytes of Global
+Scenery's Geneva 7z) and passed over; no path reads one further. Its
+extraction is never stored, so it costs a disk cache lookup that misses
+and that HEAD read. Entries the version 1 road cache stored for base
+meshes (Global Scenery's Geneva entry is 3.7 MB) stay on disk until the
+tier's GC evicts them, but are never loaded: the entry key hashes
+`ROAD_EXTRACT_VERSION` (now 4) with the path, so an earlier version's
+keys are never looked up.
+
+A source whose header names another tile than the one it is filed as (a
+misnamed file) is skipped with a debug line, rather than merged at the
+wrong offsets. On the developer's installation, Geneva without its
+simHeaven packs has six airport road segments from Global Airports, and
+without Global Airports too it has none.
+
+### Streaming DSF reader (`roads/dsf/`)
+
+`read_dsf_file` reads a DSF forward only, raw or as the single entry of a
+7z, and keeps only what roads need:
+
+- **HEAD** properties: `sim/west`, `sim/south`, `sim/overlay` and every
+  `sim/exclude_net`.
+- **DEFN**'s **NETW**: whether its first string, the network definition
+  (`.net`), is present and not empty. A DSF without one has no network. The
+  name itself is not kept: nothing uses it, so neither `DsfRoads` nor the
+  disk entry stores it.
+- **GEOD**'s 32-bit pools (**PO32**, each with its **SC32**): longitude and
+  latitude planes, and the junction plane kept as one bit per point
+  (junction ids are only ever tested for zero). Elevation and curve planes,
+  the 16-bit pools of a mesh and their scales are read past.
+- **CMDS**: walked once. Network chains (commands 9, 10 and 11, with the
+  junction offset of command 2 and the subtype of command 6) become road
+  segments by DSFLib's rule: a junction ends the open segment, unless it is
+  the chain's first point, and begins the next, unless it is the last; any
+  other point is a shape point. Every other command is sized, so it is
+  skipped byte-exactly. Points of segments whose subtype is not lit are
+  never computed.
+
+Everything else (rasters, other atoms) is read past without being
+buffered. Reading stops as soon as the roads are known: after HEAD for a
+base mesh read for overlays only, after HEAD and DEFN when there is no
+network, after GEOD when a network is declared but the pools hold no
+32-bit point (mesh DSFs do this), and once GEOD and CMDS are read
+otherwise. The result is a `DsfRoads`: tile, overlay flag, network
+definition, zones and the kept segments as flat arrays (`Chains`:
+tile-relative `f32` longitude and latitude, start offsets, a subtype byte).
+
+A 7z is read only when it is X-Plane's form, one entry in one block; any
+other archive is refused from its header, before a decoder is built. The
+entry is streamed into the same reader, and the entry iteration stops with
+it, so decompression stops where reading does. `sevenz-rust2` is built
+without its `compress` feature in the runtime, so it decodes only.
+
+Bounds, all checked before anything is allocated for them, so a hostile or
+damaged file cannot make the reader use unbounded memory or time:
+
+| Bound | Value |
+|---|---|
+| A DSF (decompressed size for a 7z) | 512 MiB (`MAX_DSF_BYTES`) |
+| Any atom body the reader keeps (HEAD, DEFN, a PO32, an SC32, CMDS) | 256 MiB (`MAX_RETAINED_ATOM_BYTES`), read in 16 MiB steps as the bytes arrive |
+| Points across all PO32 pools | 2^25, about 33.5 million (`MAX_POOL_POINTS`, about four times the largest real file seen, X-World Pro's Tokyo) |
+| Chain indices the walk visits | 4 per pool point plus 65,536, and never more than 2^25 (`MAX_WALK_VISITS`) |
+| An SC32 | 255 planes |
+
+Run-length planes can claim millions of points in a few bytes, which is why
+the point and visit caps are absolute. A junction plane with both a scale
+and an offset is refused (the tile has no road lights), because whether a
+scaled id is zero cannot be decided before its SC32 arrives; no real file
+seen uses one.
+
+Measured on the developer's installation (release build): X-World Pro's
+Geneva roads (`+46+006`, 32 MB raw, 412,443 lit segments kept) in 22 ms,
+its Tokyo roads (`+35+139`, 108 MB raw, 1,927,833 kept) in 70 ms, and
+Global Scenery's Geneva mesh read in full (11.6 MB 7z, 17.2 MB read after
+decompression, 109,384 kept) in 310 ms, which the service never does (a
+base mesh is read to its HEAD). DSFs without roads (objects, forests,
+facades) cost a few kilobytes of reading each.
+
+### Road classes (`roads/class.rs`)
+
+A DSF segment's subtype is the `.net` file's `ROAD_TYPE` divided by 100.
+Laminar's `roads.net` and `roads_EU.net` and X-World Pro's nets share these
+ranges:
+
+| Subtypes | Class | Glows | Half width | Sigma | Intensity |
+|---|---|---|---|---|---|
+| 100 to 119 | Motorway | yes | 8 m | 10 m | 1.00 |
+| 120 to 129 | Ramp | yes | 4 m | 8 m | 0.90 |
+| 10 to 29 | Primary | yes | 6 m | 9 m | 0.95 |
+| 30 to 49 | Secondary | yes | 5 m | 8 m | 0.425 |
+| 50 to 69 | Local | no | 3 m | 7 m | 0.60 |
+| 70 to 73, 80 to 82 | Minor | no | 2 m | 6 m | 0.45 |
+| 75 | Lit footway | no | 1.5 m | 5 m | 0.30 |
+
+Only motorways, ramps, primary and secondary roads glow
+(`RoadClass::is_lit`); the reader drops the other classes with the unlit
+subtypes. In the second flight (KCCR, 2026-11-14) a lit pixel was as bright
+on both sides of the hand-off, but 24 to 54% of the screen was lit above it
+against 3 to 11% below: X-Plane's residential streets read as scattered
+building light, which the Laminar pattern already carries, and only
+motorways and arterials as lines of lamps. Over 20 ZL16 textures around
+KCCR, glowing every class lit 19.1% of the texels and the main classes
+alone 4.7% (the pattern alone 1.2%). The parameters of the dark classes
+are kept, should residential areas need road light again.
+
+X-World Pro adds 70 to 73 (single-lane roads), 74 (`#Pedestrian`), 75
+(`#Footway, cycleway streetlights`), 80 (local entrance) and 82
+(residential street) through its own nets. Subtypes known to carry no road
+light are dropped: 0 (Laminar's unnamed type), 74, 151 to 154 (rail) and
+220 (power lines). Any other subtype is drawn unlit and logged once per
+session (`Night roads: unknown road subtype, drawn unlit`); resolving it
+through the pack's `.net` is deferred (the reader would have to keep the
+network definition name, which it does not).
+
+### Merge (`roads/merge.rs`)
+
+`Merger` takes a tile's overlay DSFs from the highest priority down (see
+Which DSFs give roads). A segment
+of a DSF is dropped when any of its points lies in a zone of a
+higher-priority DSF (tested on its exact points), then the DSF's own zones
+are added for the DSFs below; a DSF's zones never apply to its own roads.
+A zone is a west/south/east/north box or, in X-Plane 12, that box followed
+by a polygon (`;lon,lat,...`, even-odd test). Unlit subtypes are dropped by
+the reader (its `keep` filter) before the merge sees them, and the merge
+skips any chain of fewer than two points, which has no segment to draw.
+When a rectangle zone covers the whole tile, no lower DSF can add a road,
+so the service stops reading there (`skipped_below_cover`): X-World Pro's
+road packs carry `sim/exclude_net` over their whole tile, so with them
+installed Global Scenery's mesh is never opened for the tile.
+
+Two counts are easily confused. A *segment* in a DSF, and in
+`merged_segments`, `segments_kept` and `removed`, is a chain from junction
+to junction; the merged tile stores it as one or more pieces (below), and
+`merged_segments` counts the pieces. The raster's `road_segments` counts
+point-to-point segments, the straight pieces between two consecutive
+points, of every chain the merged tiles hand over near the texture,
+including chains just outside its reach that a cell visit hands over too.
+
+**Compact merged tiles.** The merged tile is what the memory cache keeps,
+so it is stored compactly. Points are 16-bit offsets in the tile (1/65535
+degree, about 1.7 m north to south, far below a lit texel). Segments are
+stored back to back with one byte each: the class in the top three bits
+and the point count less one in the low five, so a segment of more than
+32 points is stored as pieces that share the joint point (1% of Geneva's
+segments, 0.1% of Tokyo's). The tile is a 256 × 256 grid of cells of
+1/256 degree:
+
+- In a dense tile the segments are sorted by the cell of their box's
+  south-west corner, and a prefix index gives each cell's first segment
+  and first point (two `u32` per cell, 512 KiB). A segment whose box spans
+  more than one cell (`MAX_SPAN`; 1% of Geneva's segments, 0.1% of
+  Tokyo's) carries its 4-byte box in a short list instead, and the tile
+  records the largest span of the others. A query visits the cells from
+  that span south and west of its box to its north-east corner, row by
+  row, then tests the boxes of the short list.
+- Where the index would cost more than a box for every segment (fewer
+  than 131,075 segments within a cell's span), the tile has no index and
+  every segment carries its box.
+
+`Merger` collects segments in arrival order with their boxes, and `finish`
+lays the tile out by cell with a counting sort into exactly sized arrays
+(about 30 ms for Tokyo, 3 ms for Geneva), a transient peak of two to three
+times the tile while the exact copies are allocated. A one-bit-per-cell
+occupancy map (8 KiB per tile) answers `MergedRoads::crosses` in time
+proportional to the query's cells, not to the tile's segments: two cell
+boxes meet exactly when they share a cell. Consumers visit the segments
+near a box through `MergedRoads::for_each_chain_near`, which hands over a
+`ChainRef` (the class, the points in degrees, and the quantised offsets),
+never the encoding; it may hand over a segment just outside the box, never
+miss one inside. `MergedRoads::bytes`, the weight in the tile cache, is
+exact.
+
+| Tile | Segments stored | Index | Merged |
+|---|---|---|---|
+| Geneva `+46+006`, X-World Pro | 42,920 | no | 1.1 MiB |
+| Tokyo `+35+139`, X-World Pro and the Haneda overlay | 281,233 | yes | 4.0 MiB |
+| 3 × 3 tiles around Geneva | | | 6.7 MiB |
+| 3 × 3 tiles around Tokyo | | | 9.9 MiB |
+
+Before local streets, minor roads and footways were left dark, Geneva
+stored 418,937 segments in 8.8 MiB and Tokyo 3,197,492 in 37.2 MiB.
+
+The `Night roads: tile ready` field `merged_segments` counts the stored
+segments (pieces included).
+
+### Glow model (`roads/field.rs`, `roads/model.rs`)
+
+`RoadField::raster` turns the merged roads of the tiles a texture's field
+reads into one value from 0 to 1 per texel of the first visible level, at
+the texel centres `CpuLitGenerator` samples. Each segment between two
+points contributes its class profile: the class intensity within the half
+width of the line, then a Gaussian fall-off with the class sigma, cut at
+half width plus 3 sigma. The fall-off `exp(-u^2 / 2)`, with `u` the
+distance beyond the half width in sigmas, is computed as `(1 - u^2 / 2^11)`
+squared ten times, in `f32`: within 2.7e-4 of the Gaussian (a test holds it
+under 3e-4, far inside a 1024th of the class intensity) and exactly 1 at
+0, with no branch and no table. Glow and lamps share this one kernel, so
+world anchoring is untouched. Distances are in ground metres (Web Mercator
+metres times cos(latitude) on each row), so the glow is anchored to the
+world and the same ground gives the same light at any zoom. The sigma is
+`max(class sigma, a texel's ground size)` on each row, not once per
+texture, so a ZL16 texture and its ZL17 quarter agree exactly. Overlapping
+roads take the **maximum**, not the sum, so a junction or a dual
+carriageway is no brighter than its brightest road.
+
+Cost is kept down at every level: a merged tile hands over only the
+segments filed in cells near the footprint and its reach (no test per
+segment of the tile), a point's Web Mercator northing is read from a table
+built once per tile per raster over the footprint's quantised latitudes
+and a margin of two cells (the value the projection gives, so the table
+changes no result; a point beyond it is computed), and a segment
+visits only the texels in its reach window, whose bounds come from the
+even texel spacing (a guess and a step or two, not a binary search). The
+texel loop has no branch: every texel of the window computes its value,
+zero beyond the reach by a select, and keeps the larger, so the compiler
+vectorises it. What varies by row (the sigma and its inverse, the reach)
+is computed once per row without a division, and lit texels are counted
+once after drawing. The profile (one `f32` per texel, 4 MiB at 1024 px)
+is allocated when the first segment reaches the grid, so a texture with no
+road nearby costs no heap.
+
+`reach_deg(name, size, model)` is how far outside a footprint a road can
+still light one of its texels, in degrees: the widest class reach (half
+width plus 3 sigma, with the sigma never below the texture's largest
+texel) over the fewest metres per degree (longitude at the footprint's
+highest latitude, floored at cos 85°). The raster culls with it and the
+probe tests with it, so the two cannot disagree.
+
+**Composite.** The generator adds the glow last, only on texels it reaches,
+in linear light: the pattern's bytes below are decoded (through a 256-entry
+table), the road light is added, and the sum is encoded to bytes by
+`ByteEncoder`, which gives exactly the byte the sRGB encode would round to
+(checked for every float from 0 to 1) with no `powf`: 255 thresholds found
+once by bisection, and a table on the float's top 16 bits saying where to
+start counting them. A texel with no class skips the gain, which only the
+pattern needs. An empty field leaves every byte as it was, and a field
+rastered for another size is ignored rather than misplaced. The texel
+centres the raster draws at and the generator samples come from one
+function, `TexelCentres::of` (`night/footprint.rs`). The level is
+
+```
+peak × glow × (country + (1 − country) × clamp(R / full_nw, 0, 1)) × night.brightness
+```
+
+with `peak` 0.0106, `country` 0.2 and `full_nw` 10 nW·cm⁻²·sr⁻¹. `peak` was
+0.12 until the first flight, at KCCR, where the glow was 98.6% of the lit
+light (72 times the pattern's area light) and the lit side of the near
+hand-off was 10 to 20 times brighter in area average than X-Plane's 3D
+roads and lights; the second flight flew three stops down (0.015), since
+auto exposure makes up part of that gap. After the third flight a lit
+pixel was as bright on both sides of the hand-off and the lit side still
+read a little bright, so `peak` went down half a stop more and secondary
+roads, the most numerous glowing class, to half their intensity (0.85 to
+0.425): together 0.6 stops less area light over 20 ZL16 textures around
+KCCR, where halving the core widths gave only 0.14, since at 7.6 m
+texels the one-texel sigma floor sets a road's width. Roads do
+not use the gain curve: the gain is zero below its floor radiance, so dark
+countryside would stay dark. Instead the VIIRS radiance `R` raises the road
+from a rural floor (a fifth of the light) to full light at 10. The colour
+follows the pattern's: where the texel's LED patch is LED (the same
+`patch_at` decision, with the urban share for its brightness and region),
+the patch's white at luminance 1; elsewhere the road sodium (stored
+255, 178, 92) toned by the same sodium tone as the pattern, at luminance 1.
+The region is looked up once per 1° tile, the patch the pattern's LED
+stage drew is reused (otherwise it is found once per patch cell as a row is
+walked), and the white of the last temperature is kept.
+
+**Lamps.** With `RoadModel::lamps` set, as in `RoadModel::DEFAULT`, every
+glowing road is drawn as a chain of lamps instead of the continuous glow:
+one lamp every `spacing_m` of ground arc length along a segment, each a
+point glow (no core) with its class's sigma and intensity, the lamp
+`sigma_m` a floor (`max(lamp sigma, class sigma)`, and a texel at least)
+and the lamp `intensity` a factor on the class's. Each lamp is lit or not
+by a hash of its segment's first point and its index (`lit_share`), so
+lamps land on the same ground at any zoom. A segment stored as pieces
+starts a walk at each joint, the same in every texture. After the fourth
+flight (KCCR, 2026-11-14) the light levels were close to right but the
+roads still read a little dense, and X-Plane's own 3D roads beside them
+read as dotted chains of lamps (sodium dots along motorways, white along
+arterials) where the texture drew continuous bands. `LampParams::DEFAULT`
+lights every lamp (`lit_share` 1, a regular chain like the simulator's,
+no random gaps), with a sigma floor of 4 m (below every glowing class's,
+so the class sigma rules) and its spacing chosen for half the light per
+metre of road. Over the 20 ZL16 textures around KCCR at 1024 px (road
+light being the mean linear luminance with roads minus the pattern's
+alone), the lamps give this share of the continuous glow's light:
+
+| Spacing | 20 m | 24 m | 26 m | 28 m | 30 m | **32 m** | 36 m | 40 m |
+|---|---|---|---|---|---|---|---|---|
+| Road light | 0.602 | 0.565 | 0.547 | 0.530 | 0.512 | **0.495** | 0.464 | 0.438 |
+| Texels above 0.002 | 3.25% | 3.14% | 3.08% | 3.03% | 2.98% | **2.93%** | 2.83% | 2.73% |
+
+The continuous glow lights 4.08% of the texels above linear 0.002 and the
+pattern alone 1.24%. The light falls slower than the spacing grows,
+because at 7.5 m texels neighbouring lamps' glows overlap and take the
+maximum. `lamps: None` draws the continuous glow, byte for byte as before
+(a test pins its digest), kept so a flight can compare the two.
+
+### Road service (`roads/service/`)
+
+`RoadService` makes a tile's merged roads ready for the lit source:
+
+- **Per-tile builds.** A build lists the tile's sources from the pack
+  index, then reads them on the blocking pool as Which DSFs give roads
+  says, feeding each extraction to the merger and dropping it,
+  so at most one extraction is alive at a time. Every scratch buffer is
+  reused, and the merged tile is laid out in exactly sized arrays (see
+  Merge).
+- **Permits.** `ROAD_EXTRACT_PERMITS` (2) bound concurrent builds. A build
+  holds one permit for its whole tile and no other lit permit. A successful
+  build hands its permit to one detached task that writes the tile's disk
+  entries and releases it when done: readiness never waits for a write,
+  and at most two tiles' entries are ever waiting in memory.
+- **Coalescing.** A build runs in its own task, kept in a map of shared
+  futures by tile, so concurrent callers share it and a caller that stops
+  waiting never cancels it. A tile with an unreadable source is marked
+  failed and has no roads for the session; later callers are answered at
+  once.
+- **Tile cache.** Ready tiles are kept in memory, weighted by
+  `MergedRoads::bytes`, up to `ROAD_TILE_CACHE_BYTES` (128 MiB), evicting
+  least recently used. LRU, not moka's default TinyLFU: admission by
+  popularity would refuse a tile just built once the cache is full, and
+  every request for it would rebuild it. An eviction is logged
+  (`Night roads: LRU`) and costs a rebuild on the next request.
+- **Disk cache.** Only extractions of 7z overlays are written to the lit
+  disk tier (a base mesh, read only to its HEAD, writes none):
+  decompression costs far more than reading the entry back (302 ms
+  against 3.5 ms, measured on Global Scenery's Geneva mesh when version 1
+  still read it; XEL's own overlay packages carry Global Scenery's overlay
+  part, roads included, as 7z).
+  Raw DSFs are parsed again each session, because their parse (16 to 90 ms
+  measured) is no slower than reading an entry of the same size, and
+  caching them would duplicate tens of megabytes per city tile on disk and
+  in transient memory. The key is `roads:{lat}:{lon}:{hex16}` (the tile,
+  so the entry lands in the tile's region folder and the tier's startup
+  scan and GC see it, and the first 8 bytes of the SHA-256 of
+  `ROAD_EXTRACT_VERSION` and the DSF path, so an earlier version's entries
+  are never looked up). An entry is the lit tier's format (magic `XELL`, a fingerprint,
+  the length, the payload); the fingerprint covers `ROAD_EXTRACT_VERSION`
+  (bump it when what an extraction keeps changes) and the DSF's path, size
+  and mtime, so an updated pack or a new reader misses and re-extracts.
+  The payload is the `DsfRoads` in `codec.rs`'s little-endian layout,
+  decoded with every count checked against the bytes present before it
+  allocates. Entries are written only after the whole tile succeeded.
+  Version 1 also stored the base meshes a fallback read (Geneva's Global
+  Scenery entry was 3.7 MB, 109,384 segments); version 2 stores overlays
+  only, and its keys never reach a version 1 entry. Version 4 drops the
+  network definition name from the payload (codec version 2), and its keys
+  never reach an entry of an earlier version.
+  `ROAD_EXTRACT_VERSION` guards road entries only; lit payloads have their
+  own versions (see Lit source integration).
+- **Identities.** `identities(tile)` gives each source's path, size and
+  mtime (one `stat` each, on the blocking pool, under the caller's permit),
+  highest priority first, taken once per tile per session and shared by
+  concurrent first callers. A DSF that is gone (NotFound) is left out; any
+  other `stat` failure fails the pass, which answers `None` for that call
+  and is not kept, so the lit source keeps that payload in memory only
+  rather than fingerprint it as a tile without the DSF.
+- **Waits.** A caller asks for a footprint's tiles with a purpose: `Probe`
+  waits up to `ROAD_PROBE_WAIT` (2 s), `Generate` up to
+  `ROAD_GENERATE_WAIT` (10 s). The wait is a budget per build, not per
+  call: the first call that waits on a tile's build for a purpose sets
+  that build's deadline, and later calls wait only until it. X-Plane
+  stats thousands of lit names while a scene loads, so a wait per call
+  would stall loading for as long as the slowest tile multiplied by the
+  names it covers. A new build (a tile rebuilt after the LRU evicted it)
+  clears the tile's deadlines, so its first caller waits a full budget
+  again. A caller past its deadline first looks whether the build has
+  just finished, and uses it if so. A footprint answers with the ready
+  tiles, whether it is complete, and whether a tile was still building at
+  its deadline (a failed tile is incomplete but not timed out).
+- **Construction** reads nothing: `RoadService::new` stores the
+  installation, the packs to skip and the disk tier. Waits and the cache
+  size come from `RoadServiceConfig`, whose default is the constants.
+
+**Permit budget.** Night work runs on the blocking pool inside
+`BLOCKING_POOL_HEADROOM` (32) and may use a third of it: probe permits (2)
+plus the most generation permits (4) plus lit disk permits (2) plus road
+extract permits (2) is 10, held there by a compile-time assertion. The
+share is fully used, so a new night permit needs a smaller one elsewhere
+or a larger headroom. The pack index build takes no permit (it is a
+one-off listing), so a caller that holds a lit disk permit while it asks
+for identities never holds two.
+
+### Lit source integration
+
+`NightLitSource::with_roads` attaches the service; without it every answer
+and payload is exactly as without road lights.
+
+**Probe.** `has_light` answers in this order: a committed answer for the
+footprint, if any; otherwise it waits for the footprint's road tiles
+(purpose `Probe`) holding no permit, takes a probe permit, and answers lit
+when the recipe field lights the footprint or, failing that, when any ready
+road tile `crosses` the footprint grown by `reach_deg` at the size of its
+first visible level. The road tiles a footprint asks for (in the probe,
+the generation and the fingerprint alike) are those of the footprint grown
+by `max(FIELD_MARGIN_DEG, reach_deg)`, so a coarse zoom, a low texture
+setting, a high latitude or a wider model cannot leave a lit road's tile
+out. A road just outside a footprint whose glow reaches in
+therefore makes it full size, so glow is never cut at a texture edge. The
+occupancy map makes the road test about 20 ns per footprint on Tokyo's
+3.2 million segments.
+
+**The size never changes.** The first committed answer stands for the
+session, as for recipes. If the probe's roads were late (timed out) and the
+committed answer is dark, the texture stays the minimal black DDS for the
+session even when the roads arrive; this is counted as
+`answered_before_roads`. If the probe answered lit because of a road and
+the generation then finds that tile missing, the texture is generated
+without it, possibly full-size black; its size is unchanged.
+
+**Generation.** `generate` waits for the footprint's road tiles (purpose
+`Generate`) holding no permit, then takes a generation permit; the raster
+runs inside the generation task, and the tiles' handles are dropped once
+rastered, so the tile cache alone keeps merged roads.
+
+**Memory and disk.** A payload is written to the lit tier only when every
+road tile it asked for was ready (and, as before, every recipe was read
+and no art file failed). A payload generated while a road tile was still
+building past its deadline is served but kept neither in memory nor on
+disk: a timeout is transient, so the next read generates again, with the
+roads once they are ready (while the tile is still building past the
+generation budget, each read generates). A payload missing a failed tile
+is kept in memory (the tile has no roads this session) but not on disk,
+because a later session may read the tile.
+
+**Fingerprints.** The session fingerprint includes the road digest
+(`roads::roads_digest`: `ROADS_VERSION` and `RoadModel::digest()`; zeros
+without road lights), and the footprint fingerprint includes, for each
+road tile, the identities of that tile's DSFs in priority order. Order
+matters because it decides what the merge keeps. A changed, added or
+removed DSF, a reordered `scenery_packs.ini`, a new road model or a new
+`ROADS_VERSION` therefore regenerates the payload. Each version constant
+guards one thing:
+
+| Constant | Bump when | Guards |
+|---|---|---|
+| `LIT_GENERATOR_VERSION` (10) | Generated bytes change for the same inputs: ramp, tiling, encoder (the BC1 floor and endpoint repair), layout of the visible levels, the road composite | Lit payloads (generated tops are memory only and need none) |
+| `ROADS_VERSION` (3) | The same DSFs and road model can give different road light: the reader, the class table, the merge and source rules, quantisation, the kernel | Lit payloads |
+| `ROAD_MODEL_VERSION` (2) | The meaning of a `RoadModel` parameter changes (2: lamps light every glowing class, the lamp sigma a floor on the class's and the lamp intensity a factor on it) | Lit payloads (through the model digest) |
+| `ROAD_EXTRACT_VERSION` (4) | What one DSF's extraction keeps, or which DSFs are stored, changes: the reader, the subtype filter, the codec's input (2: overlays only; 3: glowing classes only; 4: no network definition name in the payload; it is hashed into the key, so an earlier version's entries are never loaded) | Road disk entries |
+| `ROAD_CODEC_VERSION` (2) | The byte layout of a road entry's payload changes | Road disk entries (another layout does not decode; 2: no network definition name) |
+
+### Trigger (FUSE)
+
+X-Plane looks up and opens a tile's DSF before it asks about the tile's lit
+textures. XEL's ortho mount serves those DSFs (every tile it serves
+textures for has one), so `lookup` and `open` of a real file at
+`Earth nav data/<block>/<tile>.dsf` call `LitTextureSource::dsf_seen(lat,
+lon)`, and the road service starts that tile's build at once
+(`ensure`, which returns immediately and does nothing for a tile ready,
+building or failed). A hint is ignored, with `Night roads: hint ignored`,
+while `ROAD_HINT_BACKLOG` (8) builds are pending, so a burst of hints
+cannot queue ahead of the builds a probe or a generation waits on; those
+are never refused. Both handlers hint because the kernel may open a DSF
+whose entry it cached (from `readdirplus`) without a lookup. The lit source
+says once, when it is attached, whether it wants hints
+(`wants_dsf_hints`); the filesystem keeps the answer in a bool, so with
+night lighting off or without a road service the handlers gain one branch
+and nothing else. With hints on, a real open borrows the inode's path and
+tests its name without allocating. A probe or generation for a tile no hint
+reached starts the build itself (triggers `Probe` and `Generate`).
+
+The `Night roads: lead time` event gives, for each tile, how long before
+(positive) or after (negative) its first probe it was ready. A prefetch box
+hint (starting builds for tiles ahead of the aircraft) is deferred until
+flights show negative lead times.
+
+### Failure rules
+
+| Failure | Effect | Logged |
+|---|---|---|
+| A source DSF cannot be read: I/O error, not a DSF, malformed, over a bound, a refused 7z, or a panic while reading | The whole tile has no road lights for the session (a partial merge would keep roads a higher pack's zones remove) | Once per tile, as a warning, with the path |
+| A source removed since the pack index was built | Skipped | No |
+| A source whose header names another tile | Skipped | `Night roads: DSF tile mismatch`, debug |
+| A source whose `stat` fails when its identities are taken | No fingerprint: the payload is kept in memory only | `Night roads: DSF identities unavailable for this call`, debug |
+| A build that ends without an answer (a panic outside the reading) | The tile has no road lights for the session | Once, debug |
+| Roads late at the probe | The answer commits without them and stands for the session | Counted as `answered_before_roads` |
+| Roads late at generation | Generated without them, kept neither in memory nor on disk (the next read generates again) | `roads_timed_out = true` on the generation line |
+| A road tile failed at generation | Generated without it, kept in memory only | `roads_complete = false`, `roads_timed_out = false` |
+| More than `ROAD_HINT_BACKLOG` builds pending at a DSF hint | The hint is ignored; a probe or generation still starts the build | `Night roads: hint ignored`, debug |
+| A road disk entry that does not match or does not decode | Re-extracted from the file | No |
+| A road disk entry write fails | Nothing (re-extracted next session) | Debug |
+| An unknown road subtype | Drawn unlit | Once per subtype, debug |
+| `scenery_packs.ini` missing | Only Global Scenery is listed; its meshes are read to their HEAD, so no road light | No |
+
+### Instrumentation
+
+Every event is at debug level and starts with `Night roads:`, except the
+warning for an unreadable DSF. Read them with `run --debug`.
+
+| Message | Fields |
+|---|---|
+| `Night roads: pack index built` | `packs`, `enabled`, `dsfs`, `tiles`, `bytes`, `ms` |
+| `Night roads: DSF extracted` | `path`, `file_bytes`, `read_bytes`, `compressed`, `head_only` (a base mesh read to its HEAD), `ms`, `encode_ms`, `segments_kept`, `exclusions`, `pool_points`, `walk_visits`, `cached` |
+| `Night roads: DSF cache hit` | `path`, `read_ms`, `decode_ms`, `segments` |
+| `Night roads: DSF tile mismatch` | `lat`, `lon`, `path`, `dsf_lat`, `dsf_lon` |
+| `Night roads: tile ready` | `lat`, `lon`, `trigger`, `dsfs`, `overlays_read`, `base_skipped` (base meshes read to their HEAD), `cache_hits`, `cache_misses`, `merged_segments`, `removed`, `skipped_below_cover`, `bytes`, `total_ms` |
+| `Night roads: hint ignored` | `lat`, `lon`, `pending` |
+| `Night roads: footprint waited` | `purpose`, `tiles`, `waited_ms`, `timed_out`, `complete` (only when the call waited or timed out) |
+| `Night roads: lead time` | `lat`, `lon`, `ms` |
+| `Night roads: LRU` | `lat`, `lon`, `bytes_held` |
+| `Night roads: summary` (every 60 s, only when something happened) | `tile_cache_bytes`, `cache_hits`, `cache_misses`, `cache_hit_rate`, `tiles_ready`, `tiles_failed`, `probe_waits`, `probe_timeouts`, `generate_waits`, `generate_timeouts`, `answered_before_roads`, `extracted`, `extract_median_ms`, `extract_p95_ms`, `extract_max_ms`, `ready_median_ms`, `ready_p95_ms`, `ready_max_ms`, `permit_wait_p95_ms`, `road_cpu_ms` |
+| `Night roads: unknown road subtype, drawn unlit` | `subtype` |
+| `Night roads: DSF unreadable; tile has no road lights this session` (warning) | `lat`, `lon`, `path`, `error` |
+| `Night roads: tile build ended without an answer; no road lights this session` | `lat`, `lon` |
+| `Night roads: DSF identities unavailable for this call` | `lat`, `lon`, `error` |
+| `Night roads: road cache write failed` | `error`, `key` |
+| `Night roads: road field size differs from the texture; no road light` | `field`, `size` |
+
+The existing `Night lighting: lit texture generated` line gains
+`road_segments` (point-to-point segments handed to the raster, see
+Merge), `road_raster_us`, `road_texels`, `roads_complete` and
+`roads_timed_out`, and `size`; `Night lighting: lit top level generated`
+carries the same fields for a generated top. `Night lighting: lit probe`
+gains `roads_complete` and `roads_timed_out`. `Night lighting: lit read`
+names the parts a read reached in `part`: `blank` (header or dropped
+levels), `top`, `lit` (payload) or `top+lit`, with `top black`, `black`,
+`top black+lit`, `top+black` or `top black+black` when a part it reached
+was served black. `cache_misses` counts 7z overlays read from their file
+with a disk tier present; a base mesh read to its HEAD is not one.
+
+### Measured cost
+
+Release build on the developer's machine (32 threads), over the developer's
+installation, with the ignored tests
+`night::roads::service::real::*` (one test per process, so memory
+readings are its own) and
+`night::generator::cpu::tests::time_real_roads_on_real_zl16_textures`.
+Files were in the page cache.
+
+**Tile readiness** (cold service, every installed pack):
+
+| Tile | Sources | Read | Ready |
+|---|---|---|---|
+| Geneva `+46+006` | 14 | 13 overlays (Global Scenery skipped below X-World Pro's cover) | 13 to 15 ms |
+| Tokyo `+35+139` | 18 | 16 overlays | 65 to 70 ms |
+| Geneva without simHeaven packs | 4 | 3 overlays (6 airport road segments from Global Airports); Global Scenery to its HEAD only (169 of 11,638,782 bytes) | 0.9 ms |
+| Geneva without simHeaven packs or Global Airports | 3 | 2 overlays, no road; Global Scenery to its HEAD only | 0.9 ms |
+
+**Memory** (resident, allocator configured as `run` configures it, with
+rayon's pool and a blocking-pool thread already running, as they are in
+`run` long before a road tile is asked for):
+
+| | Geneva 3 × 3 | Tokyo 3 × 3 |
+|---|---|---|
+| Merged roads (`MergedRoads::bytes`) | 6.7 MiB | 9.9 MiB |
+| Resident growth readying them | 12.5 to 13.2 MiB | 13.8 to 14.2 MiB |
+| The service's first build (the pack index and an empty tile) | 7.4 to 7.9 MiB | 7.8 to 7.9 MiB |
+| Peak resident (process) | 89 MiB | 212 MiB |
+
+Merged tiles cost about their `bytes` in resident memory and are returned
+to the system when evicted (their arrays are large single allocations).
+Steady-state tile memory is bounded by the 128 MiB tile cache, which a
+3 × 3 block around Tokyo fills to 8%. The Tokyo peak is the reader's
+transient while it streams the 103 MB X-World Pro road DSF. The pack index is outside that
+bound and holds 1.1 MiB. Built alone in a process whose rayon pool is
+running, it adds 4 to 5 MiB resident: the rest is the listing's transient
+allocations in the pool's threads, which later allocations reuse (a
+second index built beside the first adds 1.5 to 2 MiB). Of the service's
+first build, nearly all stays resident after the service and its index
+are dropped and the allocator is trimmed: it is the runtime's first use,
+not the index.
+
+**Generation** at 1024 px (nine interleaved rounds, medians):
+
+| Texture | Road texels | Raster | Composite | Without roads | Raster and generation | Increase |
+|---|---|---|---|---|---|---|
+| Geneva `23248_33872_ZL16` (8,878 segments rastered) | 8.8% | 2 ms | 4 ms | 309 ms | 314 ms | 1.9% |
+| Densest Tokyo `25792_58208_ZL16` (26,896 segments rastered) | 17.2% | 7 ms | 6 ms | 423 ms | 435 ms | 2.9% |
+
+That is with lamps (32 m). In the same session the continuous glow
+(`lamps: None`) rastered in 4 and 10 ms, lit 10.8% and 21.0% of the
+texels, and cost 2.6% and 4.5%: a lamp's window is smaller than a
+segment's. With every class glowing these were 9.8 to 9.9% for Geneva
+and 15.8% for Tokyo.
+
+The densest Tokyo texture is the ZL16 texture of the tile holding the most
+road points. The segments rastered are those the cell index hands over,
+a few more than reach the texture. The raster tests no segment box of the
+tile and computes no logarithm for a point inside its northing table;
+what it spends is the texel loop and each segment's window (only the
+raster's total is measured).
+Where no road reaches a texture the raster allocates nothing and the
+generator's output is unchanged byte for byte.
+
+### Decisions
+
+| Decision | Choice | Why |
+|---|---|---|
+| Source of the roads | The DSFs the simulator loads, at run time | The lit layer has to match the 3D roads the user's own scenery presents; a publish-time layer could not know the user's overlays |
+| Urban look | Glow on top of the pattern everywhere | Simple, and the pattern's street structure stays |
+| Road look | Every glowing road a regular chain of lit lamps (32 m), the continuous glow kept as `lamps: None` | X-Plane's 3D roads read as dotted chains of lamps, and after the fourth flight the continuous glow read a little dense; the chain gives half its light per metre |
+| Airport roads | Included as any other road | `sim/filter/aptid` segments are kept; no airport ownership model |
+| Configuration | None | The road model is internal, like the LED model, and tuned by flight |
+| Road sources | Overlay DSFs only; a base mesh is read to its HEAD | X-Plane shows every overlay's network but one base mesh's, XEL's own wherever lit textures are served, which has no roads; so a tile no overlay gives a road has no road glow, as in the simulator. A Global Scenery fallback for such tiles was removed after the first flight as against X-Plane's conventions |
+
+### Deferred
+
+- A prefetch box hint that starts builds for the tiles ahead of the
+  aircraft, if flights show negative lead times.
+- Resolving unknown subtypes through the pack's `.net` and `library.txt`
+  (the reader does not keep the network definition name, so it would first
+  have to).
+- GPU generation, decided from the stage timings above.
+- A seekable path for raw DSFs, so skipped atoms (DEMS) are not read.
+- Honouring the airport filter comments (commands 32 to 34, for
+  `sim/filter/aptid`): segments an airport filters are drawn whichever
+  airport is installed.
+- Curved pools: a chain's points are drawn as chords through them, with
+  no bezier flattening; none of the real files measured uses curves.
+
+**Known costs.** The road profile is `size^2` `f32`, held while a texture
+generates under its generation permit: 4 MiB at a 1024 px first visible
+level, and proportionally more for a coarser-zoom texture with a larger
+first visible level. A dense tile's build peaks at about 200 MiB of
+transient memory (Tokyo, its DSF read and the counting sort's copies),
+and two builds may run at once.
 
 ## Error Handling
 
@@ -582,6 +1493,7 @@ degrades to black, at the narrowest scope it affects (R19):
 | A recipe that cannot be read (I/O error after two retries, 50 ms apart) | That tile, for the session: probes treat it as having no light, and any lit footprint whose generation needs it is served full-size black, not cached (memory or disk) | Once per tile, when it is given up on |
 | No recipe for a tile | That tile | Never (normal for countryside) |
 | Generation or encoding fails | That texture, not cached (memory or disk) | Every time, as a warning |
+| A road DSF cannot be read | Road light for that 1° tile, for the session; recipe light is unchanged (see Road lights) | Once per tile, as a warning |
 | `X-Plane.prf` unreadable | Nothing: the full setting is assumed | Once |
 
 **Size invariant (R7).** `getattr` and `read` always agree. If generation
@@ -599,8 +1511,12 @@ name, and they draw nothing.
 **Phase 2: the generator.** `LaminarArt`, `XPlanePrefs`, the layout's
 blank levels, `LitGenerator` and its CPU implementation, the lit cache, and
 the tuning flight that sets the gain constants and confirms `LUMINANCE 150`.
-The LED stage (`led.rs`) is the last generator step: neighbourhood patches
-turn LED white by class, brightness and package region.
+The LED stage (`led.rs`) turns neighbourhood patches LED white by class,
+brightness and package region.
+
+**Road lights.** The road network the simulator presents, read from the
+DSFs X-Plane loads, drawn as chains of lamps composited last (see Road
+lights).
 
 ## Testing
 
@@ -620,8 +1536,27 @@ turn LED white by class, brightness and package region.
   at 128 px and the ZL16 texture covering one quarter of it at 64 px
   agree to within 2 levels per channel); no brightness step appears at a
   degree line, where two tiles' recipes meet; an empty footprint gives
-  the minimal black DDS; blank levels are all zero and the next level is
-  not.
+  the minimal black DDS; the levels X-Plane drops are all zero, and the
+  uploaded top is the generated top's bytes, at any split of the read;
+  a missing top reads as zeros. `encode_top` gives one level at a twelfth
+  of the light, and both encoders floor a texel at 7 and keep one at 8.
+  The BC1 endpoint repair decodes the palette as bcdec does, repairs a
+  dim lamp block ISPC tints purple (the purple decode is asserted first,
+  so a changed encoder fails loudly), leaves a block without an
+  introduced tint byte for byte, keeps a four-colour and a three-colour
+  block in their mode when one step would equalise or swap their
+  endpoints (with no transparent texel), decodes no worse than ISPC over
+  2,000 pseudo-random dim blocks, repairs each block of a non-square level
+  against its own texels (lamps at two positions, mirrored, stay where
+  they are; the other blocks are untouched), ignores texels past a small
+  level's edge, and through `encode_visible` and `encode_top` leaves no
+  introduced tint on a level of such lamps.
+  The service generates the top once at twice the first visible size,
+  coalesces concurrent top reads, never generates the top for a payload
+  read nor the payload for a top read, never touches the disk for a top,
+  keeps no top whose roads were late, whose recipe is unreadable or whose
+  encode failed, never generates a top above `MAX_GENERATED_TOP` (it reads
+  as zeros), and writes only the payload to disk for a read spanning both.
 - **LED.** Share: the fraction of lit texels that are LED matches the
   model, and a region moves it. Coherence: patches are contiguous, not
   per-texel. Zoom agreement: the LED decision for the same ground agrees at
@@ -632,6 +1567,22 @@ turn LED white by class, brightness and package region.
   its sodium bytes. Region tags and every `DEFAULT` region row are pinned,
   and a different package region invalidates a lit disk entry while the
   same one is served from disk.
+- **Road lights.** The DSF reader against a builder of synthetic DSFs
+  (every point encoding, junction rule, command, 7z, each bound and each
+  early exit) and, in ignored golden tests, against `DSFTool`'s decoding
+  of real files; exclusion zones and the merge order; the codec's round
+  trip and bounded decoding; the occupancy map against a scan of every
+  box, on random queries; the cell visit against every chain, on random
+  tiles and queries; the raster against an independent plain `f64`
+  reference (exact distances and `exp`, every class and lamps, two zooms
+  and two sizes, within 3e-4 of the class intensity); glow and lamp zoom
+  invariance (lamps on every glowing class), the continuous glow's digest
+  without lamps, reach and culling; an
+  empty field leaving the generator's output byte for byte, with the
+  LED-on golden digests pinned; the service's coalescing, deadlines,
+  failure, permit and cache rules; the probe, generation, disk and
+  fingerprint rules in the lit source; and the FUSE hints. Ignored tests
+  time all of it on a real installation (see Measured cost).
 - **FUSE integration.** `stat` and a full read agree on size; a lit
   texture and the ortho texture with the same row, column and zoom have
   different inodes and different bytes; `night/` does not appear in a
@@ -658,7 +1609,7 @@ Feature: Night lighting on ortho scenery
     And the texture quality setting is 4
     When X-Plane reads its _LIT.dds
     Then the file is a DXT1 DDS with a 2048 px top level
-    And the top level is all zero
+    And the top level is generated at a twelfth of the light
     And the next level has non-zero content
     And stat and the read agree on size
 
@@ -670,7 +1621,7 @@ Feature: Night lighting on ortho scenery
   Scenario: The fade follows the texture setting
     Given the texture quality setting is 2
     When X-Plane reads a city footprint's _LIT.dds
-    Then three top levels are blank
+    Then the two top levels X-Plane drops are blank
 
   Scenario: Deterministic and seamless
     Given two adjacent city footprints
@@ -755,7 +1706,8 @@ from the user's own X-Plane installation and never redistributed.
 ## Out of Scope
 
 - Changes to OXO or the recipe format.
-- Lighting outside Laminar's urban and industrial classes from VIIRS
-  alone.
+- Area lighting (the lit pattern) outside Laminar's urban and industrial
+  classes from VIIRS alone. Roads are lit everywhere, faintly in the
+  countryside (see Road lights).
 - A GPU lit generator (the trait leaves room for one).
 - Following VR's texture setting.
