@@ -334,7 +334,8 @@ At the dimmed levels as served the counts are lower: 1,727 green and
 8,740 purple over the 20 first visible levels at a quarter, and 639 green
 and 4,619 purple over three 2048 px tops at an eighth. The floor no longer
 carries the tint fix alone: the texels left just above it are the ones the
-encoder tints, which the endpoint repair below removes.
+encoder tints, which the endpoint repair below corrects in measurement
+(flight is the check on the GPU's decode).
 
 **BC1 endpoint repair.** Flight 9 (KCCR, 2026-11-14) still showed whole
 road lamps lavender beside grey-white ones, and pink and green specks in
@@ -362,7 +363,7 @@ the block's endpoints by coordinate descent from the original endpoints
 with their indices chosen anew, each endpoint's R, G and B one 565 step
 down or up, keeping every step that lowers the block's error, until none
 does or 64 sweeps have run (`MAX_SWEEPS`; the probe's encodes needed at
-most 4); with every candidate the indices are chosen anew. A texel's
+most 4), re-choosing the indices for every candidate. A texel's
 error is `4 x ((dR - dG)^2 + (dB - dG)^2)` (`CHROMA_WEIGHT`) plus the
 square of its Rec.709 luminance difference plus 1000 (`TINT_PENALTY`) if
 it decodes with a tint its source does not have, in stored values. The
@@ -1535,9 +1536,8 @@ lights).
   2,000 pseudo-random dim blocks, repairs each block of a non-square level
   against its own texels (lamps at two positions, mirrored, stay where
   they are; the other blocks are untouched), ignores texels past a small
-  level's edge, and
-  through `encode_visible` and `encode_top` leaves no introduced tint on
-  a level of such lamps.
+  level's edge, and through `encode_visible` and `encode_top` leaves no
+  introduced tint on a level of such lamps.
   The service generates the top once at twice the first visible size,
   coalesces concurrent top reads, never generates the top for a payload
   read nor the payload for a top read, never touches the disk for a top,
