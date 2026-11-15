@@ -128,6 +128,7 @@ branch on a bool, see Trigger). Everything else is new code in
 | `night/layout.rs` | The lit DDS layout: sizes, the black levels X-Plane drops, where the uploaded top and the payload sit, and which of them a read reaches |
 | `night/prefs.rs` | `XPlanePrefs`: the texture quality setting |
 | `night/generator/mod.rs` | The `LitGenerator` trait, `LitRequest`, `encode_visible` and `encode_top` |
+| `night/generator/bc1_repair.rs` | The BC1 endpoint repair of blocks that tint dim texels green or purple |
 | `night/generator/gain.rs` | The gain curve |
 | `night/generator/noise.rs` | Integer hashing and world-anchored value noise |
 | `night/generator/field.rs` | `RecipeField`: recipe layers as continuous functions of world position |
@@ -247,7 +248,7 @@ visible levels could not change it. The first fix filled it from the
 first visible level, each texel repeated over 2 x 2 at a quarter of the
 light; in flight 7 the near field showed, but too bright, too coarse (7.5 m
 texels in 2 x 2 copies), and with green and purple texels (see BC1
-floor). The uploaded top is now generated at its own size, twice the
+floor and BC1 endpoint repair). The uploaded top is now generated at its own size, twice the
 first visible level (2048 px, 3.75 m texels at ZL16), when X-Plane first
 reads a byte range inside it, and encoded by `encode_top`: one BC1 level,
 no chain, its stored values scaled by `TOP_GAIN` (`(1/12)^(1/2.2)`, a
@@ -331,7 +332,54 @@ found; with the floor they agree.
 
 At the dimmed levels as served the counts are lower: 1,727 green and
 8,740 purple over the 20 first visible levels at a quarter, and 639 green
-and 4,619 purple over three 2048 px tops at an eighth.
+and 4,619 purple over three 2048 px tops at an eighth. The floor no longer
+carries the tint fix alone: the texels left just above it are the ones the
+encoder tints, which the endpoint repair below removes.
+
+**BC1 endpoint repair.** Flight 9 (KCCR, 2026-11-14) still showed whole
+road lamps lavender beside grey-white ones, and pink and green specks in
+towns, in the distant levels too. Near black the RGB565 grid has no neutral
+colour between 8 and 16 in red and blue (decoded 0, 8, 16, 25), while green
+also has 4 and 12 (0, 4, 8, 12, 16), and ISPC quantises each endpoint's
+channels on their own. In blocks mixing a dim lamp with black it puts dim
+near-white texels on lavender codes: a lamp of `(9, 7, 5)` decodes
+`(8, 4, 8)` (where nearest rounding would give the neutral `(8, 8, 8)`),
+`(17, 14, 12)` decodes `(16, 12, 16)`. A probe over 20 KCCR ZL16 payloads
+and 5 tops at 2048 px, encoded as served, found the tints introduced by
+BC1 (decoded tinted at a margin of 2, the pre-encode level not) at 3,009
+green and 30,458 purple; 99.6% of the purple had a source largest channel
+of 8 to 15, near neutral, in mixed blocks, and 60% sat on road texels; the
+generator's own levels had 8 green and no purple. Raising the floor (to
+12, 16 or 24) left green and lost 20% to 76% of the light; moving texels
+onto the 565 grid before encoding did not survive the encoder's refit and
+raised green eightfold.
+
+After ISPC, `generator/bc1_repair.rs` looks at every block of every
+encoded level (both encoders, through `bc1_levels`) whose decode has a
+tint its source does not have, at a margin of 2 (`TINT_MARGIN`), on a
+texel whose largest decoded channel is at least `BC1_FLOOR`. It searches
+the block's endpoints by coordinate descent, each endpoint's R, G and B
+one 565 step down or up, keeping every step that lowers the block's
+error, until none does; with every candidate the indices are chosen anew.
+A texel's error is `4 x ((dR - dG)^2 + (dB - dG)^2)` (`CHROMA_WEIGHT`)
+plus the square of its Rec.709 luminance difference plus 1000
+(`TINT_PENALTY`) if it decodes with a tint its source does not have, in
+stored values. The block keeps its mode (four colours while `c0 > c1`,
+three otherwise, whose transparent fourth entry is never chosen) and is
+replaced only when its error strictly drops. Blocks whose endpoints are
+both below the floor are skipped, as no colour of theirs can be lit. The
+repair works in place on the encoded bytes and allocates nothing. On the
+same 25 encodes it leaves no tint introduced at a margin of 2 (from 3,009
+green and 30,458 purple), and at a linear-light ratio of 1.5 (green when
+G > 1.5 x max(R, B) after an sRGB decode, purple when min(R, B) > 1.5 x G)
+1 green and 152 purple against 2,996 and 31,220, keeping 0.999 of the
+light (the tops 1.001). It costs about 1.5 ms per 1024 px payload and
+3.2 ms per 2048 px top (release, KCCR r1582 c659), against about 180 and
+700 ms to generate them. A margin of 4 is blind to it: the commonest codes
+differ from green by exactly 4, so at m = 4 BC1 seems to introduce 2 green
+and no purple, yet `(8, 4, 8)` carries 4.6 times the green's light in red
+and blue and `(16, 12, 16)` 1.9 times. The repair is judged against a
+D3D-exact decode; GPUs round the interpolated colours by about 1.
 
 A footprint without light is a fixed **minimal black DDS**: 4 × 4, BC1,
 with its full chain (4, 2 and 1 px levels), all blocks zero, 152 bytes
@@ -715,10 +763,11 @@ work), recorded when the recipe is loaded, as the identity is. Patches
 (`_patches/...`), unknown codes and missing recipes are Unknown.
 
 **Cache.** The region is part of each tile's entry in the footprint
-fingerprint, and `LIT_GENERATOR_VERSION` is 9 (2 added the LED stage, 3
+fingerprint, and `LIT_GENERATOR_VERSION` is 10 (2 added the LED stage, 3
 the raised shares and the sodium tone, 4 the linear-light mips, 5 the
 cooler whites, 6 road lights, 7 the two-level fade, 8 a quarter of the
-light at its nearest level, 9 the BC1 floor), so lit entries from before
+light at its nearest level, 9 the BC1 floor, 10 the BC1 endpoint repair),
+so lit entries from before
 the current generator miss once and regenerate; the GC ages the old ones out.
 
 **Cost.** Measured with the ignored test
@@ -1234,7 +1283,7 @@ guards one thing:
 
 | Constant | Bump when | Guards |
 |---|---|---|
-| `LIT_GENERATOR_VERSION` (9) | Generated bytes change for the same inputs: ramp, tiling, encoder (the BC1 floor), layout of the visible levels, the road composite | Lit payloads (generated tops are memory only and need none) |
+| `LIT_GENERATOR_VERSION` (10) | Generated bytes change for the same inputs: ramp, tiling, encoder (the BC1 floor and endpoint repair), layout of the visible levels, the road composite | Lit payloads (generated tops are memory only and need none) |
 | `ROADS_VERSION` (3) | The same DSFs and road model can give different road light: the reader, the class table, the merge and source rules, quantisation, the kernel | Lit payloads |
 | `ROAD_MODEL_VERSION` (2) | The meaning of a `RoadModel` parameter changes (2: lamps light every glowing class, the lamp sigma a floor on the class's and the lamp intensity a factor on it) | Lit payloads (through the model digest) |
 | `ROAD_EXTRACT_VERSION` (3) | What one DSF's extraction keeps, or which DSFs are stored, changes: the reader, the subtype filter, the codec's input (2: overlays only; 3: glowing classes only; it is hashed into the key, so an earlier version's entries are never loaded) | Road disk entries |
@@ -1473,6 +1522,14 @@ lights).
   uploaded top is the generated top's bytes, at any split of the read;
   a missing top reads as zeros. `encode_top` gives one level at a twelfth
   of the light, and both encoders floor a texel at 7 and keep one at 8.
+  The BC1 endpoint repair decodes the palette as bcdec does, repairs a
+  dim lamp block ISPC tints purple (the purple decode is asserted first,
+  so a changed encoder fails loudly), leaves a block without an
+  introduced tint byte for byte, keeps four-colour and three-colour
+  blocks in their mode, never raises a block's error over 2,000
+  pseudo-random dim blocks, ignores texels past a small level's edge, and
+  through `encode_visible` and `encode_top` leaves no introduced tint on
+  a level of such lamps.
   The service generates the top once at twice the first visible size,
   coalesces concurrent top reads, never generates the top for a payload
   read nor the payload for a top read, never touches the disk for a top,

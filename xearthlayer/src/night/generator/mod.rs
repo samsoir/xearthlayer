@@ -3,6 +3,7 @@
 //! `LitGenerator` is the seam for other implementations (a GPU one later,
 //! R17); `CpuLitGenerator` is the one in use.
 
+pub mod bc1_repair;
 pub mod cpu;
 pub mod field;
 pub mod gain;
@@ -73,7 +74,8 @@ pub trait LitGenerator: Send + Sync {
 /// 7: two-level fade, an eighth then half of the light (`FADE_RAMP`).
 /// 8: the nearest level gives a quarter of the light, not an eighth.
 /// 9: texels below [`BC1_FLOOR`] encoded black.
-pub const LIT_GENERATOR_VERSION: u32 = 9;
+/// 10: BC1 endpoints repaired where they tint dim texels ([`bc1_repair`]).
+pub const LIT_GENERATOR_VERSION: u32 = 10;
 
 /// Gamma of the sRGB decode X-Plane applies to a texture's stored values.
 pub const SRGB_GAMMA: f32 = 2.2;
@@ -114,14 +116,18 @@ pub const TOP_GAIN: f32 = 0.32319;
 /// two probes found about 150,000 green without the floor and about 3,900
 /// green and 13,500 purple with it, keeping 0.916 of the decoded light
 /// against 0.960 without; their purple counts without it (61,088 and
-/// 22,016) differ for a reason not found (flight 7, 2026-11-14).
+/// 22,016) differ for a reason not found (flight 7, 2026-11-14). The floor
+/// alone does not remove the tint: just above it ISPC still puts dim
+/// near-white texels on lavender codes such as `(8, 4, 8)`, which
+/// [`bc1_repair`] removes (flight 9).
 pub const BC1_FLOOR: u8 = 8;
 
 /// BC1-encode the first visible level and its mip chain down to 1 x 1, as
 /// the bytes that follow the blank levels in a lit DDS (no header). The
 /// chain is downsampled from the undimmed image, then the levels named by
 /// [`FADE_RAMP`] are dimmed, so the levels below them stay at full light,
-/// and every level is floored at [`BC1_FLOOR`] after its dimming.
+/// and every level is floored at [`BC1_FLOOR`] after its dimming, then
+/// repaired where BC1 tints it ([`bc1_repair`]).
 pub fn encode_visible(image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsError> {
     let mut chain = lit_chain(&image);
     for (n, level) in chain.iter_mut().enumerate() {
@@ -131,16 +137,24 @@ pub fn encode_visible(image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsE
 }
 
 /// BC1-encode `image` as the top level X-Plane uploads: one level, no
-/// chain and no header, at [`TOP_GAIN`] and floored at [`BC1_FLOOR`].
+/// chain and no header, at [`TOP_GAIN`], floored at [`BC1_FLOOR`] and
+/// repaired where BC1 tints it ([`bc1_repair`]).
 pub fn encode_top(mut image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsError> {
     dim(&mut image, TOP_GAIN);
     bc1_levels(std::slice::from_ref(&image))
 }
 
-/// The BC1 blocks of `levels`, in order, without the DDS header.
+/// The BC1 blocks of `levels`, in order, without the DDS header, each level
+/// repaired where its endpoints tint dim texels ([`bc1_repair`]).
 fn bc1_levels(levels: &[RgbaImage]) -> Result<bytes::Bytes, crate::dds::DdsError> {
-    let dds =
+    let mut dds =
         crate::dds::DdsEncoder::new(crate::dds::DdsFormat::BC1).encode_with_mipmaps(levels)?;
+    let mut at = DDS_HEADER_LEN;
+    for level in levels {
+        let len = bc1_repair::level_len(level.width(), level.height());
+        bc1_repair::repair_level(&mut dds[at..at + len], level);
+        at += len;
+    }
     Ok(bytes::Bytes::from(dds).slice(DDS_HEADER_LEN..))
 }
 
@@ -216,8 +230,8 @@ mod tests {
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
 
     #[test]
-    fn the_bc1_floor_is_generator_version_nine() {
-        assert_eq!(LIT_GENERATOR_VERSION, 9);
+    fn the_bc1_repair_is_generator_version_ten() {
+        assert_eq!(LIT_GENERATOR_VERSION, 10);
     }
 
     fn name_at(lat: f64, lon: f64) -> DdsFilename {
@@ -427,6 +441,93 @@ mod tests {
                 .all(|&r| (i32::from(r) - 175).abs() <= 8),
             "{reds:?}"
         );
+    }
+
+    /// A level tiled with the flight 9 probe's lamp block: dim near-white
+    /// lamps of `lamp`, `edge` and `rim` beside black, as the lamp crop at
+    /// the top level shows them.
+    fn lamps(size: u32, lamp: [u8; 3], edge: [u8; 3], rim: [u8; 3]) -> RgbaImage {
+        const PATTERN: [u8; 16] = [1, 1, 1, 3, 1, 1, 2, 0, 3, 3, 3, 0, 0, 0, 0, 0];
+        RgbaImage::from_fn(size, size, |x, y| {
+            let [r, g, b] = match PATTERN[(y % 4 * 4 + x % 4) as usize] {
+                1 => lamp,
+                2 => rim,
+                3 => edge,
+                _ => [0; 3],
+            };
+            image::Rgba([r, g, b, 255])
+        })
+    }
+
+    /// Texels of BC1 level `encoded` (`size` px) that decode with a tint
+    /// `level`, the image it was encoded from, does not have.
+    fn introduced_tints(encoded: &[u8], level: &RgbaImage) -> usize {
+        let size = level.width();
+        let per_row = size.div_ceil(4);
+        let mut count = 0;
+        for (i, block) in encoded.chunks_exact(8).enumerate() {
+            let mut rgba = [0u8; 64];
+            bcdec_rs::bc1(block, &mut rgba, 16);
+            let (bx, by) = (i as u32 % per_row, i as u32 / per_row);
+            for t in 0..16u32 {
+                let (x, y) = (bx * 4 + t % 4, by * 4 + t / 4);
+                if x < size && y < size {
+                    let d = &rgba[4 * t as usize..4 * t as usize + 3];
+                    let s = level.get_pixel(x, y).0;
+                    count += usize::from(bc1_repair::introduced(
+                        [d[0], d[1], d[2]],
+                        [s[0], s[1], s[2]],
+                    ));
+                }
+            }
+        }
+        count
+    }
+
+    /// One level BC1-encoded by ISPC alone, without the repair.
+    fn unrepaired(level: &RgbaImage) -> Vec<u8> {
+        let dds = crate::dds::DdsEncoder::new(crate::dds::DdsFormat::BC1)
+            .encode_with_mipmaps(std::slice::from_ref(level))
+            .unwrap();
+        dds[DDS_HEADER_LEN..].to_vec()
+    }
+
+    #[test]
+    fn encoded_visible_levels_have_no_introduced_tint_on_dim_lamps() {
+        // The nearest level's dimming turns these into the probe's lamp,
+        // (9, 7, 5), (8, 6, 5) and (8, 7, 5).
+        let img = lamps(64, [17, 13, 9], [15, 11, 9], [15, 13, 9]);
+        let mut chain = lit_chain(&img);
+        for (n, level) in chain.iter_mut().enumerate() {
+            dim(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
+        }
+        assert_eq!(chain[0].get_pixel(0, 0).0, [9, 7, 5, 255]);
+        // Pinned: ISPC alone tints the nearest level purple.
+        assert!(introduced_tints(&unrepaired(&chain[0]), &chain[0]) > 0);
+        let payload = encode_visible(img).unwrap();
+        let mut at = 0;
+        for (n, level) in chain.iter().enumerate() {
+            let len = bc1_repair::level_len(level.width(), level.height());
+            assert_eq!(
+                introduced_tints(&payload[at..at + len], level),
+                0,
+                "level {n}"
+            );
+            at += len;
+        }
+        assert_eq!(at, payload.len());
+    }
+
+    #[test]
+    fn the_encoded_top_has_no_introduced_tint_on_dim_lamps() {
+        // The top's dimming turns these into the probe's lamp.
+        let img = lamps(64, [28, 22, 15], [25, 19, 15], [25, 22, 15]);
+        let mut level = img.clone();
+        dim(&mut level, TOP_GAIN);
+        assert_eq!(level.get_pixel(0, 0).0, [9, 7, 5, 255]);
+        assert_eq!(level.get_pixel(3, 0).0, [8, 6, 5, 255]);
+        assert!(introduced_tints(&unrepaired(&level), &level) > 0);
+        assert_eq!(introduced_tints(&encode_top(img).unwrap(), &level), 0);
     }
 
     #[test]
