@@ -180,14 +180,20 @@ The adapter-specific tests need to be in a live mount test that reads through a
 real mount to exercise filesystem operations (lookup, attributes, virtual DDS read,
 directory listing).  These tests run for each backend.
 
-For implementation, `tests/macfuse_smoke.rs` is turned into a live mount test
-parameterized by backend. The test is **unignored on Linux** (CI installs
-`libfuse3-dev` on `ubuntu-latest`, so `mount_with_unprivileged` works) and
-**`#[ignore]` on macOS** (macFUSE is a kext; hosted runners cannot load it —
-run via `make verify-macos`). This means green CI exercises the `LinuxFuse`
-adapter; the `MacFuse` adapter is covered by `verify-macos` and the regression
-flight.
+The `tests/macfuse_smoke.rs` test is turned into a live mount test parameterized
+by backend to allow it to run on Linux and macOS.
 
+For implementation on Linux, `fuse3` live mount tests can run on CI runners. The
+runners provide `/dev/fuse` in their `ubuntu-latest` kernels, and CI installs
+`fuse3` and not `libfuse3-dev`, allowing `mount_with_unprivileged` to work.
+
+For implementation on macOS, the live mount tests can run only on a user's
+machine (macFUSE is a kext; hosted runners cannot load it — run via `make
+verify-macos`).
+
+This means green CI exercises the `LinuxFuse` adapter; the `MacFuse` adapter is
+covered by `make verify-macos` and the regression flight, both run on a local
+machine.
 
 ### MountBackend ("Live" Mounting)
 
@@ -218,7 +224,7 @@ pub trait MountSession: Send {
     fn mountpoint(&self) -> &Path;
 
     /// Unmount the filesystem, consuming the session.
-    fn unmount(self: Box<Self>) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
+    fn unmount(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), MountError>> + Send>>;
 
     /// Whether the mount point currently reports a live mount.
     fn is_mounted(&self) -> bool;
@@ -252,7 +258,7 @@ pub trait MountBackend: Send + Sync {
     /// ended up unmounted (including the benign already-unmounted case), matching
     /// `unmount_fuse`. Synchronous, needs no runtime, and must not
     /// panic.
-    fn force_unmount(&self, path: &Path) -> bool;
+    fn force_unmount(&self, path: &Path, force: bool) -> bool;
 }
 ```
 
@@ -329,15 +335,18 @@ stays platform-neutral.
 | Open flags reported for virtual DDS files | `FOPEN_DIRECT_IO` — every `read()` reaches the handler, so the FUSE read counters are exact and the page cache never holds a second copy of a tile | `0` — X-Plane `mmap`s texture files and macFUSE faults with `EXC_BAD_ACCESS` when a `direct_io` file is mapped, so virtual DDS is served through the page cache and the read counters under-report (#204) |
 | Mount API call | `Session::mount_with_unprivileged` | `Session::mount` |
 | `volname` mount option | not set | set, so Finder shows a meaningful volume name |
-| `FileAttr` fields | — | `crtime` (creation time) and `flags` (BSD file flags) exist only in macFUSE's `FileAttr`; the policy supplies their values |
+| `FileAttr` fields | — | `crtime` (creation time) and `flags` (BSD file flags) exist only in macFUSE's `FileAttr`; the core supplies its value and the policy only decides whether it reaches `FileAttr` (macOS) and supplies `flags`. |
 
 Because the contract's `open` returns a bare `u64` file handle, the open flags
 are the adapter's decision, keyed on the `FsNode` variant: a `VirtualDds` node
 gets the platform's virtual-DDS flags from the policy, and `RealFile` and
 `Directory` nodes get none.
 
-`select_backend()` keeps its `cfg` — it is the one place in the crate that
-names a concrete backend.
+`fuse_platform.rs` keeps its `#cfg(target_os)` — it is the one place in the
+crate that names a concrete backend.  `#[cfg]` is still used in `FileAttr` as an
+exception for `crtime`.  `select_backend()` can use `cfg!`. `Session::mount` and
+`mount_with_unprivledged` both compile on Linux and macOS, meaning that
+LinuxFuse and MacFuse can both build in CI.
 
 ### Union Filesystem
 
@@ -392,11 +401,6 @@ pub trait UnionFilesystem: Send + Sync {
 ```
 Conformance suite should cover all four 0-handle cases and that `release(0)`
 is a no-op.
-
-`open` returns a bare file handle; the open flags reported to the kernel are
-the adapter's decision, keyed on the `FsNode` variant — a `VirtualDds` node
-gets the platform's virtual-DDS flags from the `FusePlatform` policy, and
-`RealFile` and `Directory` nodes get none.
 
 Types and errno mapping.
 ```rust
@@ -454,8 +458,7 @@ pub struct FileAttributes {
 
 pub struct DirEntry {
     pub name: OsString,
-    pub node: FsNode,
-    pub attrs: FileAttributes,
+    pub entry: Entry,
 }
 
 /// Volume statistics in neutral form (FUSE `statfs` / WinFSP `GetVolumeInfo`).
@@ -480,11 +483,16 @@ pub struct StatFsInfo {
 }
 
 /// Map the core's neutral error onto FUSE's.
+/// errno_from belongs in the fuse3 adapter since common code cannot
+/// reference Errno or libc.
+#[derive(Debug, thiserror::Error)]
 fn errno_from(err: FsError) -> Errno {
     match err {
         FsError::NotFound => Errno::from(libc::ENOENT),
         FsError::NotADirectory => Errno::from(libc::ENOTDIR),
         FsError::Io(_) => Errno::from(libc::EIO),
+        /// This may be better for Io()
+        FsError::Io(e) => Errno::from(e.raw_os_error().unwrap_or(libc::EIO)),
     }
 }
 
@@ -503,9 +511,10 @@ In addition:
 - structural checks
   - `manager/mounts.rs` contains no `cfg` and names no backend
   - `common` module contains no `fuse3::`, inode or kernel-flag symbols
-  - no `cfg(target_os)` remains in `vfs/` outside `fuse_platform.rs` (and `select_backend`)
+  - no `cfg(target_os)` remains in `vfs/` outside `fuse_platform.rs`
   - no `crate::vfs::fuse3::` import outside `vfs/`
   - `system/unmount.rs` moves into the fuse3 backend, so `panic.rs` and `mounts.rs` reach it only through `MountBackend`
+  - Expect `night/*` and `runtime/request.rs` to churn on the rename: they import `DdsFilename`, `TextureKind` and `DdsResponse` from crate::fuse.
 
 The design should be further validated by the addition of any new backends,
 which are expected to follow shortly after this lands.
