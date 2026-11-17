@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **macFUSE without the kernel extension** ([#210](https://github.com/samsoir/xearthlayer/issues/210)): On macOS, XEarthLayer now mounts its scenery through macFUSE's FSKit backend, which needs no kernel extension. A new Mac no longer has to boot into Recovery, lower its security and approve the kext. With macFUSE 5.3.3 or later, you turn "macFUSE (local)" on once under System Settings → General → Login Items & Extensions → File System Extensions. If X-Plane is on an external drive, you also give `/usr/libexec/fskitd` Full Disk Access. If macFUSE is missing, the startup check's hint now names the version and the external-drive step. See [macOS](docs/macos.md#installing-macfuse).
 
+- **Diagnostics and the log report the macFUSE mount** ([#362](https://github.com/samsoir/xearthlayer/issues/362)): `xearthlayer diagnostics` has a new macFUSE section on macOS: the installed macFUSE version, whether the `MFMount` framework the FSKit mount needs is present, and, while XEarthLayer is running, its volume as the mount table shows it, served by FSKit or flagged when it is not. The log also records the volume and the macFUSE version once after mounting, so a flight log says what it was flown on, and warns if the volume does not appear in the mount table or appears without FSKit. See [macOS](docs/macos.md#checking-the-mount).
+
 ### Changed
 
 #### Dashboard

@@ -9,6 +9,7 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
@@ -66,13 +67,7 @@ pub fn is_path_mounted(path: &Path) -> bool {
 
     #[cfg(target_os = "macos")]
     {
-        match Command::new("/sbin/mount").output() {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                mount_output_contains(&stdout, &path_str)
-            }
-            Err(_) => false,
-        }
+        macos_mount_table().is_some_and(|table| mount_output_contains(&table, &path_str))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -105,12 +100,94 @@ fn proc_mounts_contains(mounts: &str, path: &str) -> bool {
 /// that contain spaces (e.g. `X-Plane 12`) intact.
 #[cfg(target_os = "macos")]
 fn mount_output_contains(output: &str, path: &str) -> bool {
-    output.lines().any(|line| {
-        line.split_once(" on ")
-            .and_then(|(_, rest)| rest.rsplit_once(" (").map(|(mp, _)| mp))
-            .map(|mp| mp == path)
-            .unwrap_or(false)
-    })
+    output
+        .lines()
+        .filter_map(bsd_mount_line)
+        .any(|(mountpoint, _)| mountpoint == path)
+}
+
+/// The mount point and the flags of one BSD `mount(8)` line,
+/// `device on /mount/point (fstype, flag, ...)`. The first flag is the
+/// filesystem type.
+fn bsd_mount_line(line: &str) -> Option<(&str, Vec<&str>)> {
+    let (_, rest) = line.split_once(" on ")?;
+    let (mountpoint, flags) = rest.rsplit_once(" (")?;
+    Some((
+        mountpoint,
+        flags.trim_end_matches(')').split(", ").collect(),
+    ))
+}
+
+/// A macFUSE volume in the macOS mount table (#362).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacfuseMount {
+    /// The mount point, as the mount table names it.
+    pub path: String,
+    /// Whether the volume carries the `fskit` flag, which every volume
+    /// XEarthLayer mounts should: macOS mounts through macFUSE's FSKit
+    /// backend only, so a macFUSE volume without it was mounted by
+    /// something else.
+    pub fskit: bool,
+}
+
+/// Every macFUSE volume in BSD `mount(8)` output, in table order. An FSKit
+/// volume carries the `fskit` flag (macFUSE 5.5.0, macOS 26.6):
+///   macfuse://<UUID> on <dir> (macfuse, nodev, nosuid, noowners, noatime,
+///   fskit, mounted by <user>)
+///
+/// Pure and compiled on every platform, so the parsing is tested on Linux
+/// too.
+pub fn macfuse_mounts_in(output: &str) -> Vec<MacfuseMount> {
+    output
+        .lines()
+        .filter_map(bsd_mount_line)
+        .filter(|(_, flags)| flags.first() == Some(&"macfuse"))
+        .map(|(mountpoint, flags)| MacfuseMount {
+            path: mountpoint.to_string(),
+            fskit: flags.contains(&"fskit"),
+        })
+        .collect()
+}
+
+/// The macFUSE volume mounted on `path`, from BSD `mount(8)` output; `None`
+/// when no macFUSE volume is mounted there.
+pub fn macfuse_mount_in(output: &str, path: &str) -> Option<MacfuseMount> {
+    macfuse_mounts_in(output)
+        .into_iter()
+        .find(|mount| mount.path == path)
+}
+
+/// The mount table as `mount(8)` prints it; macOS only, `None` elsewhere.
+pub fn macos_mount_table() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let output = Command::new("/sbin/mount").output().ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// How often [`wait_for_macfuse_mount`] reads the mount table.
+const MOUNT_TABLE_POLL: Duration = Duration::from_millis(25);
+
+/// The macFUSE volume mounted on `mountpoint`, waiting up to `deadline` for
+/// macOS to list it: fuse3 can return from a mount before the volume is in
+/// the mount table (#349). `None` on other platforms, or when no macFUSE
+/// volume appears there in time.
+pub fn wait_for_macfuse_mount(mountpoint: &Path, deadline: Duration) -> Option<MacfuseMount> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    // The table names the resolved path (`/private/var`, not `/var`).
+    let path = mountpoint.canonicalize().ok()?;
+    let path = path.to_string_lossy();
+    let give_up = Instant::now() + deadline;
+    loop {
+        let found = macos_mount_table().and_then(|table| macfuse_mount_in(&table, &path));
+        if found.is_some() || Instant::now() >= give_up {
+            return found;
+        }
+        std::thread::sleep(MOUNT_TABLE_POLL);
+    }
 }
 
 /// Detect a stale FUSE mount at `mountpoint`.
@@ -275,6 +352,87 @@ mod tests {
         assert!(proc_mounts_contains(mounts, "/mnt/zzXEL_ortho"));
         assert!(proc_mounts_contains(mounts, "/"));
         assert!(!proc_mounts_contains(mounts, "/mnt/not_mounted"));
+    }
+
+    /// `mount(8)` on macOS 26.6 with macFUSE 5.5.0: XEarthLayer's FSKit
+    /// volume (whose mount point has a space), a macFUSE volume without the
+    /// `fskit` flag, and others.
+    const MACOS_MOUNT_TABLE: &str = "\
+/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)
+macfuse://8F0C2D51-6E57-4E7A-9B0F-3A2D1C4B5E6F on /Users/me/X-Plane 12/Custom Scenery/zzXEL_ortho (macfuse, nodev, nosuid, noowners, noatime, fskit, mounted by me)
+vault@macfuse0 on /Volumes/Vault (macfuse, nodev, nosuid, synchronous, mounted by me)
+map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)
+";
+
+    #[test]
+    fn macfuse_mount_in_reads_fskit_from_the_mount_flags() {
+        assert_eq!(
+            macfuse_mount_in(
+                MACOS_MOUNT_TABLE,
+                "/Users/me/X-Plane 12/Custom Scenery/zzXEL_ortho"
+            ),
+            Some(MacfuseMount {
+                path: "/Users/me/X-Plane 12/Custom Scenery/zzXEL_ortho".to_string(),
+                fskit: true,
+            })
+        );
+    }
+
+    #[test]
+    fn macfuse_mount_in_reports_a_volume_without_the_fskit_flag() {
+        assert_eq!(
+            macfuse_mount_in(MACOS_MOUNT_TABLE, "/Volumes/Vault").map(|mount| mount.fskit),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn macfuse_mount_in_ignores_paths_that_are_not_macfuse_volumes() {
+        assert_eq!(macfuse_mount_in(MACOS_MOUNT_TABLE, "/"), None);
+        assert_eq!(
+            macfuse_mount_in(MACOS_MOUNT_TABLE, "/System/Volumes/Data/home"),
+            None
+        );
+        assert_eq!(macfuse_mount_in(MACOS_MOUNT_TABLE, "/Users/me"), None);
+        assert_eq!(macfuse_mount_in("", "/"), None);
+    }
+
+    #[test]
+    fn macfuse_mount_in_does_not_take_fskit_from_a_mount_point_name() {
+        let table = "x@macfuse0 on /Volumes/fskit, scratch (macfuse, nodev, mounted by me)\n";
+        assert_eq!(
+            macfuse_mount_in(table, "/Volumes/fskit, scratch").map(|mount| mount.fskit),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn macfuse_mounts_in_lists_every_macfuse_volume_in_table_order() {
+        let paths: Vec<String> = macfuse_mounts_in(MACOS_MOUNT_TABLE)
+            .into_iter()
+            .map(|mount| mount.path)
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/Users/me/X-Plane 12/Custom Scenery/zzXEL_ortho".to_string(),
+                "/Volumes/Vault".to_string(),
+            ]
+        );
+    }
+
+    /// Off macOS there is no macFUSE mount table, so the wait answers at once.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn wait_for_macfuse_mount_answers_none_at_once_off_macos() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let started = Instant::now();
+        assert_eq!(
+            wait_for_macfuse_mount(dir.path(), Duration::from_secs(5)),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(macos_mount_table(), None);
     }
 
     #[cfg(target_os = "macos")]

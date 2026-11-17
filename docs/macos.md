@@ -29,7 +29,8 @@ brew install --cask macfuse
    **macFUSE (local)**; XEarthLayer's FSKit mount needs **macFUSE (local)**.
 
 That is all macFUSE needs, unless X-Plane is on an external drive (step 2a).
-If the extension is off, the mount fails and the error says so.
+If the extension is off, the mount fails and the error says so. To check it,
+see [Checking the mount](#checking-the-mount).
 
 ### 2a. X-Plane on an external drive: give `fskitd` Full Disk Access
 
@@ -213,6 +214,35 @@ terminal see. Versions before 0.5.0 gave no volume name, and Finder showed
 macFUSE's default, `macFUSE Volume 0 (xearthlayer)`, although the folder on
 disk was always `zzXEL_ortho` ([#305](https://github.com/samsoir/xearthlayer/issues/305)).
 
+### Checking the mount
+
+Once the volume is mounted, XEarthLayer looks it up in the mount table and
+logs one line with the macFUSE version:
+
+```
+2026-11-17 21:04:05Z  INFO macFUSE FSKit volume mounted mountpoint=/Users/you/X-Plane 12/Custom Scenery/zzXEL_ortho macfuse=5.5.0
+```
+
+It warns instead if the volume is listed without the `fskit` flag (`not served
+by FSKit`) or is not listed within two seconds.
+
+`xearthlayer diagnostics` has a macFUSE section, read from the system and not
+from XEarthLayer, so it works while `xearthlayer run` is up in another
+terminal:
+
+```
+## macFUSE
+Version: 5.5.0
+MFMount framework: yes
+Mounted: FSKit, /Users/you/X-Plane 12/Custom Scenery/zzXEL_ortho
+```
+
+`Version: not installed` or `MFMount framework: no` means macFUSE is missing
+or older than 5.3.3. `Mounted: no XEarthLayer volume` while XEarthLayer is
+running means the mount did not happen, and the log says why. The same check
+by hand is `mount | grep zzXEL_ortho`, whose line should include `fskit`.
+Include the section when you report a macOS problem.
+
 ### Stale mount recovery
 
 If XEarthLayer is killed without unmounting (crash, force-quit), macFUSE leaves
@@ -262,6 +292,7 @@ Extensions first.
 | `MFMount.framework has no MF...` or `MFMount.framework could not be loaded` | macFUSE is older than 5.3.3, or missing; update it from [macfuse.io](https://macfuse.io) |
 | FSKit fails to mount with X-Plane on an external drive | Give `/usr/libexec/fskitd` Full Disk Access (step 2a above) |
 | FSKit volume mounts but `ls` or reads hang | FSKit's state is stuck (seen once during testing, macFUSE's own samples hung too). Re-register with `/Library/Filesystems/macfuse.fs/Contents/Resources/macfuse.app/Contents/MacOS/macfuse install --force` and restart the Mac |
+| Not sure which macFUSE is installed, or whether the volume is mounted | Run `xearthlayer diagnostics` and read its macFUSE section ([Checking the mount](#checking-the-mount)) |
 | "Device not configured (os error 6)" on mount | Stale mount from a previous run — recovered automatically at startup; manual fix: `umount <mountpoint>` |
 | macFUSE stops working after a macOS upgrade | Re-run the macFUSE installer and check macFUSE (local) is still on under File System Extensions |
 | Mount succeeds but reads fail with `Operation not permitted` (`EPERM`) | You are probably over SSH. See [Reading a mount over SSH](#reading-a-mount-over-ssh-requires-full-disk-access) |

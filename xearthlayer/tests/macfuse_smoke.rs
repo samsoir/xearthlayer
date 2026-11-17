@@ -44,9 +44,10 @@ use tokio::sync::mpsc;
 
 use xearthlayer::executor::ChannelDdsClient;
 use xearthlayer::fuse::fuse3::Fuse3OrthoUnionFS;
+use xearthlayer::manager::ORTHO_MOUNT_FOLDER;
 use xearthlayer::ortho_union::OrthoUnionIndexBuilder;
 use xearthlayer::runtime::JobRequest;
-use xearthlayer::system::is_path_mounted;
+use xearthlayer::system::{is_path_mounted, macfuse_mount_in, macos_mount_table, MacfuseMount};
 
 /// Mount the *production* consolidated ortho union FS over macFUSE and read a
 /// real passthrough scenery file back through it. This is the FS X-Plane
@@ -85,7 +86,7 @@ async fn ortho_union_fs_mounts_and_serves_a_file() {
         .expect("ortho union mount_spawned must succeed on macFUSE");
 
     wait_for_mount_table(&in_table, true).await;
-    let flags = mount_flags(&in_table);
+    let served = served_by(&in_table);
 
     // Read the real scenery file back through the union mount.
     let mounted = mountpoint.path().join(dsf_rel);
@@ -107,7 +108,7 @@ async fn ortho_union_fs_mounts_and_serves_a_file() {
 
     handle.unmount().await.expect("union unmount must succeed");
     wait_for_mount_table(&in_table, false).await;
-    assert_fskit_mount(&flags);
+    assert_fskit_mount(&in_table, served);
 }
 
 /// #305: Finder shows a mounted volume's name in place of its mount-point
@@ -125,7 +126,7 @@ async fn ortho_union_fs_volume_is_named_after_its_mount_point_folder() {
         .expect("build ortho union index");
 
     let scenery = tempfile::tempdir().expect("custom scenery tempdir");
-    let mountpoint = scenery.path().join("zzXEL_ortho");
+    let mountpoint = scenery.path().join(ORTHO_MOUNT_FOLDER);
     std::fs::create_dir(&mountpoint).unwrap();
     let in_table = mount_table_path(&mountpoint);
 
@@ -138,23 +139,26 @@ async fn ortho_union_fs_volume_is_named_after_its_mount_point_folder() {
 
     wait_for_mount_table(&in_table, true).await;
     let name = volume_name(&mountpoint);
-    let flags = mount_flags(&in_table);
+    let served = served_by(&in_table);
     handle.unmount().await.expect("union unmount must succeed");
     wait_for_mount_table(&in_table, false).await;
 
-    assert_fskit_mount(&flags);
-    assert_eq!(name, "zzXEL_ortho");
+    assert_fskit_mount(&in_table, served);
+    assert_eq!(name, ORTHO_MOUNT_FOLDER);
 }
 
-/// Asserts the volume was served through FSKit, from its mount-table flags.
-/// An FSKit volume carries the `fskit` flag (macFUSE 5.5.0, macOS 26.6):
-///   macfuse://<UUID> on <dir> (macfuse, nodev, nosuid, noowners, noatime,
-///   fskit, mounted by <user>)
-fn assert_fskit_mount(flags: &[String]) {
-    assert!(
-        flags.iter().any(|flag| flag == "fskit"),
-        "not an FSKit mount: {flags:?}"
-    );
+/// Asserts the volume on `dir` was served through FSKit, as the mount table
+/// showed it while mounted. Read through the parser `diagnostics` and the
+/// mount log use (#362), so every run also checks it against a live mount
+/// table.
+fn assert_fskit_mount(dir: &Path, served: Option<MacfuseMount>) {
+    let served = served.unwrap_or_else(|| {
+        panic!(
+            "{} is not a macFUSE volume in the mount table",
+            dir.display()
+        )
+    });
+    assert!(served.fskit, "not an FSKit mount: {served:?}");
 }
 
 /// How long macOS may take to list or drop a mount before a test fails.
@@ -189,25 +193,11 @@ async fn wait_for_mount_table(path: &Path, mounted: bool) {
     }
 }
 
-/// The flags `mount` lists for the volume mounted on `dir`, a path as the
-/// mount table names it (see `mount_table_path`). Read while the volume is
-/// mounted; panics if `dir` is not in the mount table.
-fn mount_flags(dir: &Path) -> Vec<String> {
-    let needle = format!(" on {} (", dir.display());
-    let out = std::process::Command::new("/sbin/mount")
-        .output()
-        .expect("run mount");
-    let table = String::from_utf8_lossy(&out.stdout);
-    let line = table
-        .lines()
-        .find(|line| line.contains(&needle))
-        .unwrap_or_else(|| panic!("{} not in the mount table:\n{table}", dir.display()));
-    line.rsplit_once(" (")
-        .map(|(_, flags)| flags.trim_end_matches(')'))
-        .unwrap_or_default()
-        .split(", ")
-        .map(str::to_owned)
-        .collect()
+/// The macFUSE volume on `dir`, a path as the mount table names it (see
+/// `mount_table_path`). Read while the volume is mounted.
+fn served_by(dir: &Path) -> Option<MacfuseMount> {
+    let table = macos_mount_table().expect("run mount");
+    macfuse_mount_in(&table, &dir.to_string_lossy())
 }
 
 /// The volume name Finder shows for `path`, read with `getattrlist`
