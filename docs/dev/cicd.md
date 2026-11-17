@@ -270,13 +270,14 @@ Required contexts:
 
 Some behaviour is structurally untestable on hosted runners. Know the gaps.
 
-**macFUSE mounts.** macFUSE is a kernel extension. Loading a third-party kext on Apple
-Silicon requires booting to Recovery, downgrading to Reduced Security, enabling user
-management of kexts, and rebooting. Hosted runners permit none of that.
+**macFUSE mounts.** macFUSE mounts through its FSKit extension, which a user must
+turn on in System Settings (File System Extensions); its older kernel extension needs a
+boot to Recovery and Reduced Security on Apple Silicon. Hosted runners permit neither.
 
 `xearthlayer/tests/macfuse_smoke.rs` is `#[ignore]`d for exactly this reason: CI
-**compiles** it — which catches API and type breakage under `-Dwarnings` — but never
-**runs** it, because macFUSE is a kext and hosted runners cannot load one.
+**compiles** it, which catches API and type breakage under `-Dwarnings`, but never
+**runs** it. `make verify-macos` runs its FSKit variants on a maintainer's Mac and never
+loads the kext (#349).
 
 **Live FUSE mounts on Linux** are equally uncovered: `make verify` runs
 `cargo test` without `--ignored`, so `#[ignore]`d tests are skipped on both platforms.

@@ -229,14 +229,10 @@ verify-macos: ## Full macOS verification: verify + live macFUSE smoke tests (mac
 	@if [ ! -d /Library/Filesystems/macfuse.fs ]; then \
 		echo "$(RED)Error: macFUSE not installed. See docs/macos.md$(NC)"; exit 1; fi
 	@$(MAKE) verify
-	@# Load the kext before the tests mount (#349): after a boot it is not
-	@# loaded, and a mount racing its first load fails. setuid root, a no-op
-	@# when already loaded; a host using FSKit only fails just the _kernel tests.
-	@echo "$(BLUE)Loading the macFUSE kernel extension...$(NC)"
-	@/Library/Filesystems/macfuse.fs/Contents/Resources/load_macfuse || \
-		echo "$(YELLOW)load_macfuse failed; the _kernel smoke tests will fail$(NC)"
-	@echo "$(BLUE)Running macFUSE smoke tests...$(NC)"
-	RUST_BACKTRACE=$(RUST_BACKTRACE) RUSTFLAGS="$(STRICT_RUSTFLAGS)" $(CARGO) test -p xearthlayer --test macfuse_smoke -- --ignored --nocapture --test-threads=1
+	@# FSKit only (#349): the _kernel variants would load the kext, which
+	@# verification no longer depends on. Run them by hand if ever needed.
+	@echo "$(BLUE)Running macFUSE smoke tests (FSKit)...$(NC)"
+	RUST_BACKTRACE=$(RUST_BACKTRACE) RUSTFLAGS="$(STRICT_RUSTFLAGS)" $(CARGO) test -p xearthlayer --test macfuse_smoke -- --ignored --nocapture --test-threads=1 --skip _kernel
 	@echo "$(GREEN)macOS verification complete!$(NC)"
 
 .PHONY: pre-commit

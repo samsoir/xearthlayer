@@ -20,9 +20,10 @@
 //! set up for one backend passes that backend's variants only.
 //!
 //! Ignored by default because they need macFUSE installed.
-//! Run with: `cargo test --test macfuse_smoke -- --ignored --nocapture --test-threads=1`
-//! (append `kernel` or `macfuse_fskit` to run one backend's variants), or
-//! `make verify-macos`, which also loads the kext first.
+//! `make verify-macos` runs the `_macfuse_fskit` variants only: verification
+//! does not depend on the kext (#349). Run them with:
+//! `cargo test --test macfuse_smoke -- --ignored --nocapture --test-threads=1 macfuse_fskit`
+//! (or `kernel` for the kext variants, which load the kext when it is not).
 //!
 //! Run them one at a time (#349). After a boot the kext is not loaded, and
 //! two `_kernel` variants mounting at once each start their own
