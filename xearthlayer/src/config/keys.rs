@@ -112,7 +112,6 @@ pub enum ConfigKey {
     // FUSE settings
     FuseMaxBackground,
     FuseCongestionThreshold,
-    FuseMacosBackend,
 
     // Night lighting settings
     NightEnabled,
@@ -188,7 +187,6 @@ impl FromStr for ConfigKey {
             // FUSE settings
             "fuse.max_background" => Ok(ConfigKey::FuseMaxBackground),
             "fuse.congestion_threshold" => Ok(ConfigKey::FuseCongestionThreshold),
-            "fuse.macos_backend" => Ok(ConfigKey::FuseMacosBackend),
             "night.enabled" => Ok(ConfigKey::NightEnabled),
             "tui.symbols" => Ok(ConfigKey::TuiSymbols),
             "night.brightness" => Ok(ConfigKey::NightBrightness),
@@ -254,7 +252,6 @@ impl ConfigKey {
             // FUSE settings
             ConfigKey::FuseMaxBackground => "fuse.max_background",
             ConfigKey::FuseCongestionThreshold => "fuse.congestion_threshold",
-            ConfigKey::FuseMacosBackend => "fuse.macos_backend",
             ConfigKey::NightEnabled => "night.enabled",
             ConfigKey::TuiSymbols => "tui.symbols",
             ConfigKey::NightBrightness => "night.brightness",
@@ -387,7 +384,6 @@ impl ConfigKey {
             // FUSE settings
             ConfigKey::FuseMaxBackground => config.fuse.max_background.to_string(),
             ConfigKey::FuseCongestionThreshold => config.fuse.congestion_threshold.to_string(),
-            ConfigKey::FuseMacosBackend => config.fuse.macos_backend.clone(),
             ConfigKey::NightEnabled => config.night.enabled.to_string(),
             ConfigKey::TuiSymbols => config.tui.symbols.clone(),
             ConfigKey::NightBrightness => config.night.brightness.to_string(),
@@ -563,9 +559,6 @@ impl ConfigKey {
             ConfigKey::FuseCongestionThreshold => {
                 config.fuse.congestion_threshold = value.parse().unwrap();
             }
-            ConfigKey::FuseMacosBackend => {
-                config.fuse.macos_backend = value.to_lowercase();
-            }
 
             // Night lighting settings
             ConfigKey::NightEnabled => {
@@ -652,9 +645,6 @@ impl ConfigKey {
             // FUSE settings — range: 1-1024 for both
             ConfigKey::FuseMaxBackground => Box::new(IntegerRangeSpec::new(1, 1024)),
             ConfigKey::FuseCongestionThreshold => Box::new(IntegerRangeSpec::new(1, 1024)),
-            ConfigKey::FuseMacosBackend => {
-                Box::new(OneOfSpec::new(super::defaults::FUSE_MACOS_BACKEND_VALUES))
-            }
             ConfigKey::NightEnabled => Box::new(BooleanSpec),
             ConfigKey::NightBrightness => Box::new(FloatRangeSpec::new(0.5, 1.5)),
             ConfigKey::TuiSymbols => Box::new(OneOfSpec::new(super::defaults::TUI_SYMBOLS_VALUES)),
@@ -717,7 +707,6 @@ impl ConfigKey {
             // FUSE settings
             ConfigKey::FuseMaxBackground,
             ConfigKey::FuseCongestionThreshold,
-            ConfigKey::FuseMacosBackend,
             // Night lighting settings
             ConfigKey::NightEnabled,
             ConfigKey::NightBrightness,
@@ -1497,29 +1486,9 @@ mod tests {
     }
 
     #[test]
-    fn fuse_macos_backend_parses_enumerates_and_validates() {
-        assert_eq!(
-            "fuse.macos_backend".parse::<ConfigKey>().unwrap(),
-            ConfigKey::FuseMacosBackend
-        );
-        assert!(ConfigKey::all().contains(&ConfigKey::FuseMacosBackend));
-        let mut config = ConfigFile::default();
-        assert_eq!(ConfigKey::FuseMacosBackend.get(&config), "auto");
-        for value in ["kernel", "auto", "macfuse-fskit"] {
-            ConfigKey::FuseMacosBackend.set(&mut config, value).unwrap();
-            assert_eq!(ConfigKey::FuseMacosBackend.get(&config), value);
-        }
-        ConfigKey::FuseMacosBackend
-            .set(&mut config, "KERNEL")
-            .unwrap();
-        assert_eq!(config.fuse.macos_backend, "kernel");
-        assert!(ConfigKey::FuseMacosBackend
-            .set(&mut config, "kext")
-            .is_err());
-        assert_eq!(
-            config.fuse.macos_backend, "kernel",
-            "a rejected value changes nothing"
-        );
+    fn fuse_macos_backend_is_no_longer_a_setting() {
+        // macOS mounts through macFUSE's FSKit backend only: nothing to choose.
+        assert!("fuse.macos_backend".parse::<ConfigKey>().is_err());
     }
 
     #[test]

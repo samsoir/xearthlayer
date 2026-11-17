@@ -173,6 +173,10 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     // behaved as `opportunistic`, and `disabled` is `prefetch.enabled = false`
     // (see FOLDED_VALUES).
     "prefetch.mode",
+    // Removed before 0.5.1 shipped: macOS mounts through macFUSE's FSKit
+    // backend only, so every old value (auto, macfuse-fskit, kernel) now
+    // means the same thing and nothing is folded.
+    "fuse.macos_backend",
 ];
 
 /// A value a setting no longer accepts, and the value that replaces it.
@@ -1089,5 +1093,27 @@ disk_io_concurrent = 64
         assert_eq!(result.removed_keys.len(), 3, "{:?}", result.removed_keys);
         let contents = std::fs::read_to_string(&config_path).unwrap();
         assert!(!contents.contains("calibration_"));
+    }
+    #[test]
+    fn upgrade_removes_the_macos_backend_key() {
+        // macOS mounts through macFUSE's FSKit backend only: every value the
+        // key held now means the same thing, so it is removed, not folded.
+        assert!(DEPRECATED_KEYS.contains(&"fuse.macos_backend"));
+        assert!(FOLDED_VALUES.iter().all(|f| f.key != "fuse.macos_backend"));
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+        std::fs::write(
+            &config_path,
+            "[fuse]\nmax_background = 300\nmacos_backend = kernel\n",
+        )
+        .unwrap();
+
+        let result = upgrade_config(&config_path, false).unwrap();
+
+        assert_eq!(result.removed_keys, ["fuse.macos_backend"]);
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!contents.contains("macos_backend"), "{contents}");
+        assert!(contents.contains("\nmax_background = 300\n"), "{contents}");
     }
 }

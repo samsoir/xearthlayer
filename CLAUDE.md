@@ -527,7 +527,7 @@ Key sections:
 - `[prefetch]` - Boundary-driven prefetch, mode, web_api_port (default 8086), transition ramp
 - `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
 - `[executor]` - Per-chunk download behaviour only: `request_timeout_secs` and `max_retries`, which reach the executor through `ServiceConfig::chunk_download_config()`. Concurrency is NOT configurable: pool capacities, task dispatch limits and channel capacities are derived from logical core count by `ResourcePoolConfig::default()`. `max_concurrent_jobs` and `retry_base_delay_ms` were removed in #249; the backoff base is a literal in `tasks/download_chunks.rs`
-- `[fuse]` - FUSE kernel limits (max_background, congestion_threshold); `macos_backend` (auto default: FSKit, falling back to the kext / macfuse-fskit / kernel, #210; `macfuse-fskit` rather than `fskit` so the plain name stays free for native FSKit, #361)
+- `[fuse]` - FUSE kernel limits (max_background, congestion_threshold). No macOS backend setting: macOS mounts through macFUSE's FSKit backend only (`fuse.macos_backend` is in `DEPRECATED_KEYS`)
 - `[night]` - Night lighting (enabled, default true)
 - `[tui]` - Dashboard display (symbols: auto/emoji/plain; `auto` detection in `xearthlayer-cli/src/ui/symbols.rs`)
 - `[packages]` - Package manager settings (concurrent_downloads: parallel part downloads 1-10). `library_url` defaults to library generation v2, `DEFAULT_LIBRARY_URL` (#334); the pre-0.5 root URL (`LEGACY_LIBRARY_URL`) and the alpha staging URL are retired values (`DEPRECATED_VALUES`) the parser reads as v2, and the layout migration keeps the legacy copy of the config on the old URL for a 0.4.x rollback
@@ -548,8 +548,8 @@ cargo test          # Direct cargo test
 ```
 
 On macOS, `make verify-macos` additionally runs the live macFUSE smoke tests that CI
-cannot execute (hosted runners cannot approve macFUSE's FSKit extension). It runs the FSKit
-variants only and never loads the kext.
+cannot execute (hosted runners cannot approve macFUSE's FSKit extension). It runs them one
+at a time, so a failure or a hang is attributable to one mount.
 
 ### Building
 
@@ -610,7 +610,7 @@ matrix jobs are renamed.
 ## Platform Support
 
 - **Linux**: ✅ Fully working (native FUSE)
-- **macOS**: ✅ Working (requires [macFUSE](https://macfuse.io); Apple Silicon tested; fuse3 pinned to `samsoir/fuse3` `master`: upstream master at 0.10.0, which already has the configurable `max_background`/`congestion_threshold`, plus three macOS-only commits (the reply-resilience patch, upstream PR [Sherlock-Holo/fuse3#137](https://github.com/Sherlock-Holo/fuse3/pull/137); comma-joined mount options; reply-drop log demotion). The fork is synced by merging upstream, never by rebasing: released `Cargo.lock` files pin its commits (tag `xel-0.5.0` marks the one v0.5.0 pins); install/approval guide in `docs/macos.md`). Mounts through macFUSE's FSKit backend when it can (`fuse.macos_backend` defaults to `auto`: FSKit, falling back to the kext with the reason logged; macFUSE 5.3.3+ for FSKit, #210): fuse3's `MFMount` channel transport (`MacFuseBackend`), no kernel extension; `fuse::MacosBackend` maps the setting, `Fuse3OrthoUnionFS::with_macos_backend` applies it.
+- **macOS**: ✅ Working (requires [macFUSE](https://macfuse.io); Apple Silicon tested; fuse3 pinned to `samsoir/fuse3` `master`: upstream master at 0.10.0, which already has the configurable `max_background`/`congestion_threshold`, plus three macOS-only commits (the reply-resilience patch, upstream PR [Sherlock-Holo/fuse3#137](https://github.com/Sherlock-Holo/fuse3/pull/137); comma-joined mount options; reply-drop log demotion). The fork is synced by merging upstream, never by rebasing: released `Cargo.lock` files pin its commits (tag `xel-0.5.0` marks the one v0.5.0 pins); install/approval guide in `docs/macos.md`). Mounts through macFUSE's FSKit backend only (macOS 15.4+, macFUSE 5.3.3+ with "macFUSE (local)" turned on under File System Extensions, #210): fuse3's `MFMount` channel transport, `MacFuseBackend::FsKit` set unconditionally in `ortho_union_fs.rs` `mount_options` (fuse3's own default is macFUSE's other transport, which XEarthLayer never uses). There is no backend setting and no fallback.
 - **Windows**: ⏳ Planned (requires Dokan/WinFSP)
 
 ## References
@@ -633,7 +633,7 @@ matrix jobs are renamed.
 - **Night lighting**: `docs/dev/night-lighting-design.md` (phases 1, 2a and 2b implemented (packaging, black serving, real lit sizes, generated lit textures), plus the lit disk cache, LED lighting and road lights: lit textures served through FUSE, generated from OXO `.oxn` recipes and the user's Laminar lit art, with a glow along the roads of the DSFs X-Plane loads; a separate lit path beside the ortho executor)
 - **CI/CD pipeline**: `docs/dev/cicd.md` (branch model, release job graph, platform tiers, version propagation)
 - **Homebrew tap**: `docs/dev/cicd.md` "Homebrew Tap" (four casks, `xearthlayer`, `xearthlayer@prerelease`, `xearthlayer-publish` and `xearthlayer-publish@prerelease`, rendered from `pkg/homebrew/*.rb.tmpl` by `scripts/homebrew/render-cask.sh` in the publish job and pushed to `HOMEBREW_TAP_REPO`; never edited by hand; casks because a formula cannot depend on the `macfuse` cask)
-- **macOS signing**: `docs/dev/macos-signing-runbook.md` (Developer ID Application certificate for the binaries and Developer ID Installer certificate for the `.pkg` installers, notarization via App Store Connect API key, the seven `APPLE_*` release secrets, `scripts/macos/sign-and-notarize.sh` and `scripts/macos/build-pkg.sh` shared by `release.yml` and `make sign-macos` / `make pkg-macos`, helpers in `scripts/macos/lib.sh` with tests under `scripts/macos/tests` run by `make test-scripts`; no entitlements because the binaries link only Apple frameworks and spawn `mount_macfuse` as a process)
+- **macOS signing**: `docs/dev/macos-signing-runbook.md` (Developer ID Application certificate for the binaries and Developer ID Installer certificate for the `.pkg` installers, notarization via App Store Connect API key, the seven `APPLE_*` release secrets, `scripts/macos/sign-and-notarize.sh` and `scripts/macos/build-pkg.sh` shared by `release.yml` and `make sign-macos` / `make pkg-macos`, helpers in `scripts/macos/lib.sh` with tests under `scripts/macos/tests` run by `make test-scripts`; no entitlements because the binaries link only Apple frameworks; fuse3 `dlopen`s macFUSE's `MFMount.framework` at mount time, which library validation checks, see the runbook)
 - **Publisher separation**: `docs/dev/publisher-separation-design.md` (#284: `xearthlayer-package` is the format contract both sides depend on, `xearthlayer-publisher` holds the publishing domain, and `xearthlayer-publish` is its binary; the runtime links none of the publisher's dependencies)
 - memorize review allow(dead_code) macros at major checkpoints. Refactor aggresively to remove them when appropriate.
 - memorize ensure to update the projects documentation to reflect the current state of the project before committing changes

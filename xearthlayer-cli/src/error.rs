@@ -75,10 +75,14 @@ impl CliError {
                 eprintln!("Common issues:");
                 #[cfg(target_os = "macos")]
                 {
-                    eprintln!("  1. macFUSE not installed: download from https://macfuse.io");
                     eprintln!(
-                        "  2. macFUSE not approved: allow it under System Settings > \
-                         Privacy & Security, then restart"
+                        "  1. macFUSE 5.3.3 or later not installed: download from \
+                         https://macfuse.io"
+                    );
+                    eprintln!(
+                        "  2. macFUSE not turned on: switch on \"macFUSE (local)\" under \
+                         System Settings > General > Login Items & Extensions > \
+                         File System Extensions"
                     );
                     eprintln!("  3. Stale mount from a previous run: umount \"<mountpoint>\"");
                 }

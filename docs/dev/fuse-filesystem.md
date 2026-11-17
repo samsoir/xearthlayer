@@ -550,7 +550,7 @@ The DDS generation system uses a job/task framework:
 ### Operating Systems
 
 - Linux: Native FUSE support (✅ fully working)
-- macOS: Requires [macFUSE](https://macfuse.io) (✅ working, Apple Silicon tested — see [macOS guide](../macos.md))
+- macOS: Requires [macFUSE](https://macfuse.io) 5.3.3 or later on macOS 15.4 or later, mounted through its FSKit backend only (✅ working, Apple Silicon tested; see [macOS guide](../macos.md))
 - Windows: Requires WinFSP (⏳ planned)
 
 ### Scenery Compatibility

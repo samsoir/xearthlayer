@@ -186,10 +186,10 @@ impl Preflight<BootstrapContext> for AirportIcao {
 ///
 /// # What is probed, and what is not
 ///
-/// The presence of `/Library/Filesystems/macfuse.fs`. Deliberately **not**
-/// whether the kext is loaded: macFUSE loads on demand at first mount rather
-/// than at boot, so an empty `kmutil showloaded` is the normal state before a
-/// mount and would make this check reject a working installation.
+/// The presence of macFUSE's `MFMount.framework`, the library fuse3's FSKit
+/// transport loads to mount. Deliberately **not** whether the File System
+/// Extension is turned on: macOS has no reliable query for it, and a mount
+/// that is refused for that reason reports it in its own error.
 ///
 /// # Why there is no `#[cfg]` here
 ///
@@ -201,13 +201,15 @@ pub struct MacFuseAvailable {
     probe: PathBuf,
 }
 
-/// Where macFUSE installs its filesystem bundle.
-pub const MACFUSE_BUNDLE: &str = "/Library/Filesystems/macfuse.fs";
+/// The `MFMount` library inside macFUSE's filesystem bundle, which the FSKit
+/// mount loads (macFUSE 5.3.3 or later).
+pub const MACFUSE_MFMOUNT: &str =
+    "/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/MFMount";
 
 impl Default for MacFuseAvailable {
     fn default() -> Self {
         Self {
-            probe: PathBuf::from(MACFUSE_BUNDLE),
+            probe: PathBuf::from(MACFUSE_MFMOUNT),
         }
     }
 }
@@ -238,15 +240,14 @@ impl Preflight<BootstrapContext> for MacFuseAvailable {
             Status::Satisfied
         } else {
             Status::unsatisfied(format!(
-                "macFUSE is not installed: {} does not exist",
+                "macFUSE is not installed, or is older than 5.3.3: {} does not exist",
                 self.probe.display()
             ))
             .with_hint(
                 "Install macFUSE 5.3.3 or later from https://macfuse.io, then turn on \
-                 macFUSE under System Settings > General > Login Items & Extensions > \
-                 File System Extensions (FSKit, recommended), or approve its kernel \
-                 extension. If X-Plane is on an external drive, also give \
-                 /usr/libexec/fskitd Full Disk Access. See docs/macos.md.",
+                 \"macFUSE (local)\" under System Settings > General > Login Items & \
+                 Extensions > File System Extensions. If X-Plane is on an external drive, \
+                 also give /usr/libexec/fskitd Full Disk Access. See docs/macos.md.",
             )
         }
     }
@@ -458,11 +459,11 @@ mod tests {
     // ---- MacFuseAvailable ----
 
     #[test]
-    fn macfuse_is_satisfied_when_the_bundle_is_present() {
+    fn macfuse_is_satisfied_when_mfmount_is_present() {
         let dir = tempfile::tempdir().unwrap();
-        let bundle = dir.path().join("macfuse.fs");
-        std::fs::create_dir(&bundle).unwrap();
-        let check = MacFuseAvailable::with_probe(bundle);
+        let mfmount = dir.path().join("MFMount");
+        std::fs::write(&mfmount, b"").unwrap();
+        let check = MacFuseAvailable::with_probe(mfmount);
         assert_eq!(
             check.inspect(&BootstrapContext::new("run", None)),
             Status::Satisfied
@@ -472,7 +473,7 @@ mod tests {
     #[test]
     fn macfuse_is_unsatisfied_and_points_at_the_install_guide() {
         let dir = tempfile::tempdir().unwrap();
-        let check = MacFuseAvailable::with_probe(dir.path().join("absent.fs"));
+        let check = MacFuseAvailable::with_probe(dir.path().join("absent-MFMount"));
         match check.inspect(&BootstrapContext::new("run", None)) {
             Status::Unsatisfied {
                 reason,
@@ -489,6 +490,9 @@ mod tests {
                 // MFChannelInterrupt, which the FSKit transport binds, first
                 // shipped in macFUSE 5.3.3.
                 assert!(hint.contains("5.3.3"), "{hint}");
+                // macOS lists "macFUSE" and "macFUSE (local)"; FSKit needs the
+                // local one.
+                assert!(hint.contains("\"macFUSE (local)\""), "{hint}");
                 assert!(
                     hint.contains("/usr/libexec/fskitd Full Disk Access"),
                     "the external-drive step must be in the hint: {hint}"

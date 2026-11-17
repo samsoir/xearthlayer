@@ -69,8 +69,8 @@ for bin in "$@"; do
     # --force replaces the ad-hoc, linker-generated signature every Rust build
     # carries on Apple Silicon. --options runtime (hardened runtime) and
     # --timestamp are both notarization requirements. No entitlements: the
-    # binaries link only Apple frameworks and reach macFUSE by launching its
-    # mount helper as a child process, never by loading a library.
+    # binaries link only Apple frameworks. macFUSE's MFMount.framework is
+    # dlopen'd at mount time; see docs/dev/macos-signing-runbook.md.
     codesign --force --timestamp --options runtime --sign "$identity" "$bin"
     codesign --verify --strict --verbose=2 "$bin"
     codesign --display --verbose=2 "$bin" 2>&1 | grep -E '^(Authority|TeamIdentifier|Timestamp|CodeDirectory)' || true

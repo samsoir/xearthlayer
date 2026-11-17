@@ -4,31 +4,14 @@ XEarthLayer supports macOS (Apple Silicon tested) using [macFUSE](https://macfus
 
 ## Requirements
 
-- macOS 15.4 or later for the FSKit backend (tested on macOS 26, Apple Silicon); macOS 12 or later with the kernel backend. Intel Macs should work but are untested
-- [macFUSE](https://macfuse.io) 5.3.3 or later for the FSKit backend (5.4.0 or later reports a mount point it cannot create by name); any 5.x with the kernel backend
+- macOS 15.4 or later (tested on macOS 26, Apple Silicon). Intel Macs should work but are untested
+- [macFUSE](https://macfuse.io) 5.3.3 or later (5.4.0 or later reports a mount point it cannot create by name)
 - X-Plane 12
 
 ## Installing macFUSE
 
-macFUSE can serve XEarthLayer's volume two ways, chosen by the
-`fuse.macos_backend` setting:
-
-| Backend | Setting | Setup |
-|---------|---------|-------|
-| **FSKit** (recommended) | `macfuse-fskit` | Turn macFUSE on once in System Settings. No kernel extension, no Recovery mode |
-| Kernel extension (fallback) | `kernel` | One-time kext approval, which on Apple Silicon needs Recovery mode |
-
-The default is `auto`: XEarthLayer tries FSKit first and, if it cannot mount,
-logs why (`macFUSE FSKit backend unavailable (...); using the kernel backend`)
-and uses the kernel extension. An installation that already has the kext
-approved therefore keeps working on upgrade, and moves to FSKit by itself once
-you turn the file system extension on (step 2). The default will move to
-`macfuse-fskit` once that backend has more flight time (#210).
-
-**New installations** should set up FSKit (steps 1, 2 and, with X-Plane on an
-external drive, 2a) and skip the kernel extension. If you see stutters on
-FSKit that the kernel backend does not show, switch with
-`xearthlayer config set fuse.macos_backend kernel` and please report it.
+XEarthLayer mounts its volume through macFUSE's FSKit backend, which needs
+only macFUSE installed and turned on once in System Settings.
 
 ### 1. Install the package
 
@@ -38,59 +21,29 @@ Download the installer from [macfuse.io](https://macfuse.io) and run it, or use 
 brew install --cask macfuse
 ```
 
-### 2. Turn on the file system extension (FSKit backend)
+### 2. Turn on the file system extension
 
 1. Open **System Settings → General → Login Items & Extensions**.
 2. Scroll to **Extensions**, click the **ⓘ** next to **File System Extensions**.
-3. Turn on **macFUSE**. The second entry, **macFUSE (local)**, is only for
-   volumes mounted with `-o local`; XEarthLayer does not need it.
+3. Turn on **macFUSE (local)**. System Settings may list both **macFUSE** and
+   **macFUSE (local)**; XEarthLayer's FSKit mount needs **macFUSE (local)**.
 
-That is all the FSKit backend needs, unless X-Plane is on an external drive
-(step 2a). To check it, run XEarthLayer: with the default `auto`, no
-`macFUSE FSKit backend unavailable` warning in the log means the volume is on
-FSKit. With `fuse.macos_backend = macfuse-fskit`, a mount that fails names the setting
-to turn on.
+That is all macFUSE needs, unless X-Plane is on an external drive (step 2a).
+If the extension is off, the mount fails and the error says so.
 
 ### 2a. X-Plane on an external drive: give `fskitd` Full Disk Access
 
 If X-Plane (and so its `Custom Scenery` folder, where XEarthLayer mounts) is
 on an external drive, under `/Volumes/...`, the FSKit mount is made by
 macOS's `fskitd` daemon, and `fskitd` needs Full Disk Access to reach a folder
-on an external volume. Without it, FSKit cannot serve the mount there: `auto`
-falls back to the kernel extension, and `macfuse-fskit` fails to mount. X-Plane on the
-internal disk does not need this.
+on an external volume. Without it, the mount fails. X-Plane on the internal
+disk does not need this.
 
 1. Open **System Settings → Privacy & Security → Full Disk Access**.
 2. Click **+**, press `Cmd+Shift+G` (the file picker hides `/usr/libexec`)
    and enter `/usr/libexec/fskitd`.
 3. Make sure the new **fskitd** entry is switched on, then start XEarthLayer
    again.
-
-### 2b. Approve the kernel extension (kernel backend only)
-
-Skip this if FSKit mounts. It is needed only for `fuse.macos_backend = kernel`,
-or when `auto` falls back to the kext.
-
-**Apple Silicon Macs** must first allow third-party kernel extensions:
-
-1. Shut down the Mac completely.
-2. Press and **hold** the power button until "Loading startup options" appears, then choose **Options** to boot into Recovery.
-3. Open **Utilities → Startup Security Utility**, select your startup disk, and choose **Reduced Security** with **"Allow user management of kernel extensions from identified developers"** checked.
-4. Restart back into macOS.
-
-**All Macs** then approve the extension:
-
-1. Open **System Settings → Privacy & Security**.
-2. Under Security you will see a message that system software from developer **"Benjamin Fleischer"** (the macFUSE developer) was blocked — click **Allow** (macOS may ask you to **Enable System Extensions** and restart).
-3. Restart when prompted.
-
-After the restart, verify macFUSE is active — the mount helper should exist:
-
-```bash
-ls /usr/local/lib/libfuse* /Library/Filesystems/macfuse.fs 2>/dev/null
-```
-
-If the approval prompt never appeared, re-run the macFUSE installer after completing the Recovery steps.
 
 ### 3. Install XEarthLayer
 
@@ -298,21 +251,17 @@ Two ways round it:
 
 This matters for releases: `make verify-macos` runs the live macFUSE smoke
 tests, so it cannot be completed over SSH without the above. It runs the
-FSKit smoke tests only, one at a time, and never loads the kernel extension:
-turn on macFUSE (local) under File System Extensions first.
+smoke tests one at a time: turn on macFUSE (local) under File System
+Extensions first.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
-| `the macFUSE file system extension needs approval` | FSKit backend: turn on macFUSE under File System Extensions (step 2 above) |
-| `macFUSE FSKit backend unavailable (...); using the kernel backend` | `auto` fell back to the kext; the reason in brackets says what FSKit needs. Harmless if the kext is approved |
+| `the macFUSE file system extension needs approval` | Turn on macFUSE (local) under File System Extensions (step 2 above) |
 | `MFMount.framework has no MF...` or `MFMount.framework could not be loaded` | macFUSE is older than 5.3.3, or missing; update it from [macfuse.io](https://macfuse.io) |
 | FSKit fails to mount with X-Plane on an external drive | Give `/usr/libexec/fskitd` Full Disk Access (step 2a above) |
-| FSKit volume mounts but `ls` or reads hang | FSKit's state is stuck (seen once during testing, macFUSE's own samples hung too). Re-register with `/Library/Filesystems/macfuse.fs/Contents/Resources/macfuse.app/Contents/MacOS/macfuse install --force` and restart the Mac; meanwhile `fuse.macos_backend = kernel` works if the kext is approved |
-| `mount_macfuse: the file system is not available (255)` | Kernel backend: macFUSE kext not approved — redo the approval steps above |
-| "System extension blocked" notification | System Settings → Privacy & Security → Allow, then restart |
-| No approval option appears (Apple Silicon) | Boot into Recovery and enable Reduced Security with kernel extension management first |
+| FSKit volume mounts but `ls` or reads hang | FSKit's state is stuck (seen once during testing, macFUSE's own samples hung too). Re-register with `/Library/Filesystems/macfuse.fs/Contents/Resources/macfuse.app/Contents/MacOS/macfuse install --force` and restart the Mac |
 | "Device not configured (os error 6)" on mount | Stale mount from a previous run — recovered automatically at startup; manual fix: `umount <mountpoint>` |
-| macFUSE stops working after a macOS upgrade | Re-run the macFUSE installer and re-approve the extension |
+| macFUSE stops working after a macOS upgrade | Re-run the macFUSE installer and check macFUSE (local) is still on under File System Extensions |
 | Mount succeeds but reads fail with `Operation not permitted` (`EPERM`) | You are probably over SSH. See [Reading a mount over SSH](#reading-a-mount-over-ssh-requires-full-disk-access) |

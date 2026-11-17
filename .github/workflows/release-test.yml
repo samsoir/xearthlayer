@@ -42,7 +42,7 @@ jobs:
   # (no build.rs / pkg-config / cc) and xearthlayer/build.rs already emits
   # -lc++ for macOS. macFUSE is a runtime dependency only, and cannot mount
   # on hosted runners in any case (its FSKit extension needs a user's approval
-  # in System Settings, its kext a reboot to Recovery).
+  # in System Settings).
   verify-macos:
     name: Verify (macOS)
     runs-on: macos-15

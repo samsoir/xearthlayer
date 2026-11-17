@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### macOS
 
-- **macFUSE without the kernel extension** ([#210](https://github.com/samsoir/xearthlayer/issues/210)): On macOS, XEarthLayer can now mount its scenery through macFUSE's FSKit backend, which needs no kernel extension. A new Mac no longer has to boot into Recovery, lower its security and approve the kext. With macFUSE 5.3.3 or later, you turn macFUSE on once under System Settings → General → Login Items & Extensions → File System Extensions. If X-Plane is on an external drive, you also give `/usr/libexec/fskitd` Full Disk Access. A new setting, `fuse.macos_backend`, chooses the backend: `auto` (the default) tries FSKit, logs why if it cannot mount, and falls back to the kernel extension; `macfuse-fskit` uses macFUSE's FSKit backend only; `kernel` uses the kext only. Because `auto` falls back, an existing install with the kext approved keeps working on upgrade, and moves to FSKit by itself once the file system extension is on. If macFUSE is missing, the startup check's hint now names the version and the external-drive step. See [macOS](docs/macos.md#installing-macfuse).
+- **macFUSE without the kernel extension** ([#210](https://github.com/samsoir/xearthlayer/issues/210)): On macOS, XEarthLayer now mounts its scenery through macFUSE's FSKit backend, which needs no kernel extension. A new Mac no longer has to boot into Recovery, lower its security and approve the kext. With macFUSE 5.3.3 or later, you turn "macFUSE (local)" on once under System Settings → General → Login Items & Extensions → File System Extensions. If X-Plane is on an external drive, you also give `/usr/libexec/fskitd` Full Disk Access. If macFUSE is missing, the startup check's hint now names the version and the external-drive step. See [macOS](docs/macos.md#installing-macfuse).
 
 ### Changed
 
@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Dashboard
 
 - **The display server's refusal no longer bleeds into the dashboard** ([#358](https://github.com/samsoir/xearthlayer/issues/358)): In a shell with `DISPLAY` set but no usable `XAUTHORITY`, such as a tmux server older than the desktop session, `xearthlayer run` printed "Authorization required, but no authorization protocol specified" at launch and the line then corrupted the dashboard, and `xearthlayer diagnostics` printed it three times under its GPU section. The line is the X server's reason for refusing a connection, written by libxcb straight to the terminal; the connections came from the Vulkan stack during GPU enumeration (Mesa's device-select layer and the NVIDIA driver open the display when one is named), not from anything XEarthLayer asked for. XEarthLayer never presents to a display and chooses its own adapter, so it now removes `DISPLAY` and `WAYLAND_DISPLAY` from its own environment before anything else runs, which also spares enumeration the display round trips. Separately, while the dashboard is up, stderr is pointed at the flight log, so a warning from any library that writes to it, or a panic message, lands in the log instead of on the screen; the terminal gets it back when the dashboard closes.
+
+### Removed
+
+#### macOS
+
+- **The macFUSE kernel extension backend and `fuse.macos_backend`** ([#369](https://github.com/samsoir/xearthlayer/issues/369)): macOS mounts the scenery through macFUSE's FSKit backend only. XEarthLayer no longer uses macFUSE's kernel extension, so an existing install whose kext is approved but whose file system extension is off no longer mounts: it needs macOS 15.4 or later, macFUSE 5.3.3 or later, and "macFUSE (local)" turned on under System Settings → General → Login Items & Extensions → File System Extensions (see [macOS](docs/macos.md#installing-macfuse)). With nothing left to choose, the `fuse.macos_backend` setting is gone: a config file that still has it loads as before, and `xearthlayer config upgrade` removes the line.
 
 ## [0.5.0] - 2026-11-01
 

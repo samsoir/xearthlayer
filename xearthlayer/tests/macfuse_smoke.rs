@@ -1,6 +1,6 @@
 //! Manual smoke test for the macFUSE mount path.
 //!
-//! Exercises the live fuse3 backend end-to-end: kernel → macFUSE → fuse3 →
+//! Exercises the live fuse3 backend end-to-end: FSKit → macFUSE → fuse3 →
 //! `Fuse3OrthoUnionFS`, the filesystem X-Plane actually talks to. Mounts it
 //! over a temp directory, reads a file back through the mountpoint, and
 //! unmounts.
@@ -12,23 +12,18 @@
 //! Run this after bumping the pinned fuse3 fork revision or changing the
 //! mount/session code.
 //!
-//! Every test runs once per backend, pinned with `with_macos_backend` rather
-//! than left on `auto`, so a pass says which backend was tested: the
-//! `_kernel` variants need the kext approved, the `_macfuse_fskit` variants
-//! need macFUSE 5.3.3+ with its File System Extension on. Each variant also
-//! checks the mount table, so it cannot pass on the other backend. A machine
-//! set up for one backend passes that backend's variants only.
+//! Every mount goes through macFUSE's FSKit backend, the only one
+//! XEarthLayer uses on macOS, so the tests need macFUSE 5.3.3+ with
+//! "macFUSE (local)" turned on under File System Extensions. Each test also
+//! checks the mount table for the `fskit` flag, so it cannot pass on any
+//! other transport.
 //!
-//! Ignored by default because they need macFUSE installed.
-//! `make verify-macos` runs the `_macfuse_fskit` variants only: verification
-//! does not depend on the kext (#349). Run them with:
-//! `cargo test --test macfuse_smoke -- --ignored --nocapture --test-threads=1 macfuse_fskit`
-//! (or `kernel` for the kext variants, which load the kext when it is not).
+//! Ignored by default because they need macFUSE installed. `make
+//! verify-macos` runs them with:
+//! `cargo test --test macfuse_smoke -- --ignored --nocapture --test-threads=1`
 //!
-//! Run them one at a time (#349). After a boot the kext is not loaded, and
-//! two `_kernel` variants mounting at once each start their own
-//! `load_macfuse`; one of the two `mount_macfuse` helpers then exits without
-//! handing over the device fd and fuse3 reports `get fuse fd failed`.
+//! Run them one at a time: one mount at a time, so a failure or a hang is
+//! attributable to one test.
 //!
 //! Run it in a terminal on the Mac itself, not over SSH. macOS treats a
 //! macFUSE mount as a network volume and attributes an SSH session to
@@ -49,7 +44,6 @@ use tokio::sync::mpsc;
 
 use xearthlayer::executor::ChannelDdsClient;
 use xearthlayer::fuse::fuse3::Fuse3OrthoUnionFS;
-use xearthlayer::fuse::MacosBackend;
 use xearthlayer::ortho_union::OrthoUnionIndexBuilder;
 use xearthlayer::runtime::JobRequest;
 use xearthlayer::system::is_path_mounted;
@@ -59,18 +53,8 @@ use xearthlayer::system::is_path_mounted;
 /// actually talks to, exercising lookup → getattr → open → read → readdir →
 /// release on the live code path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires macFUSE with its kernel extension approved"]
-async fn ortho_union_fs_mounts_and_serves_a_file_kernel() {
-    mounts_and_serves_a_file(MacosBackend::Kernel).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires macFUSE 5.3.3+ with its File System Extension on"]
-async fn ortho_union_fs_mounts_and_serves_a_file_macfuse_fskit() {
-    mounts_and_serves_a_file(MacosBackend::MacFuseFsKit).await;
-}
-
-async fn mounts_and_serves_a_file(backend: MacosBackend) {
+async fn ortho_union_fs_mounts_and_serves_a_file() {
     // A patches dir holding one patch with a known scenery file.
     let patches = tempfile::tempdir().expect("patches tempdir");
     let patch_dir = patches.path().join("TestPatch");
@@ -94,7 +78,7 @@ async fn mounts_and_serves_a_file(backend: MacosBackend) {
     let (tx, _rx) = mpsc::channel::<JobRequest>(8);
     let dds_client = Arc::new(ChannelDdsClient::new(tx));
 
-    let fs = Fuse3OrthoUnionFS::new(index, dds_client, 11_174_016).with_macos_backend(backend);
+    let fs = Fuse3OrthoUnionFS::new(index, dds_client, 11_174_016);
     let handle = fs
         .mount_spawned(&mount_str)
         .await
@@ -123,25 +107,15 @@ async fn mounts_and_serves_a_file(backend: MacosBackend) {
 
     handle.unmount().await.expect("union unmount must succeed");
     wait_for_mount_table(&in_table, false).await;
-    assert_mounted_with(backend, &flags);
+    assert_fskit_mount(&flags);
 }
 
 /// #305: Finder shows a mounted volume's name in place of its mount-point
 /// folder. Without a `volname` the mount appears in Custom Scenery as
 /// `macFUSE Volume 0 (<process>)` rather than `zzXEL_ortho`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires macFUSE with its kernel extension approved"]
-async fn ortho_union_fs_volume_is_named_after_its_mount_point_folder_kernel() {
-    volume_is_named_after_its_mount_point_folder(MacosBackend::Kernel).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires macFUSE 5.3.3+ with its File System Extension on"]
-async fn ortho_union_fs_volume_is_named_after_its_mount_point_folder_macfuse_fskit() {
-    volume_is_named_after_its_mount_point_folder(MacosBackend::MacFuseFsKit).await;
-}
-
-async fn volume_is_named_after_its_mount_point_folder(backend: MacosBackend) {
+async fn ortho_union_fs_volume_is_named_after_its_mount_point_folder() {
     let patches = tempfile::tempdir().expect("patches tempdir");
     std::fs::create_dir_all(patches.path().join("TestPatch/terrain")).unwrap();
     std::fs::write(patches.path().join("TestPatch/terrain/test.ter"), b"t").unwrap();
@@ -156,8 +130,7 @@ async fn volume_is_named_after_its_mount_point_folder(backend: MacosBackend) {
     let in_table = mount_table_path(&mountpoint);
 
     let (tx, _rx) = mpsc::channel::<JobRequest>(8);
-    let fs = Fuse3OrthoUnionFS::new(index, Arc::new(ChannelDdsClient::new(tx)), 11_174_016)
-        .with_macos_backend(backend);
+    let fs = Fuse3OrthoUnionFS::new(index, Arc::new(ChannelDdsClient::new(tx)), 11_174_016);
     let handle = fs
         .mount_spawned(mountpoint.to_str().unwrap())
         .await
@@ -169,25 +142,22 @@ async fn volume_is_named_after_its_mount_point_folder(backend: MacosBackend) {
     handle.unmount().await.expect("union unmount must succeed");
     wait_for_mount_table(&in_table, false).await;
 
-    assert_mounted_with(backend, &flags);
+    assert_fskit_mount(&flags);
     assert_eq!(name, "zzXEL_ortho");
 }
 
-/// Asserts the volume was served by `backend`, from its mount-table flags.
+/// Asserts the volume was served through FSKit, from its mount-table flags.
 /// An FSKit volume carries the `fskit` flag (macFUSE 5.5.0, macOS 26.6):
 ///   macfuse://<UUID> on <dir> (macfuse, nodev, nosuid, noowners, noatime,
 ///   fskit, mounted by <user>)
-/// and a kernel-extension volume does not.
-fn assert_mounted_with(backend: MacosBackend, flags: &[String]) {
-    let fskit = flags.iter().any(|flag| flag == "fskit");
-    match backend {
-        MacosBackend::MacFuseFsKit => assert!(fskit, "not an FSKit mount: {flags:?}"),
-        MacosBackend::Kernel => assert!(!fskit, "not a kernel-extension mount: {flags:?}"),
-        MacosBackend::Auto => panic!("pin a backend: auto passes on either"),
-    }
+fn assert_fskit_mount(flags: &[String]) {
+    assert!(
+        flags.iter().any(|flag| flag == "fskit"),
+        "not an FSKit mount: {flags:?}"
+    );
 }
 
-/// How long the kernel may take to list or drop a mount before a test fails.
+/// How long macOS may take to list or drop a mount before a test fails.
 const MOUNT_TABLE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The path the mount table names for the mount point `path`: the resolved
@@ -200,9 +170,9 @@ fn mount_table_path(path: &Path) -> PathBuf {
 
 /// Waits until the mount table lists `path` (`mounted`) or no longer does.
 ///
-/// fuse3 returns from a mount as soon as `mount_macfuse` hands over the
-/// device fd, before the kernel has finished `mount(2)`, and returns from an
-/// unmount before its detached unmount task has run. Without the second wait
+/// fuse3 can return from a mount before the volume is listed in the mount
+/// table, and returns from an unmount before its detached unmount task has
+/// run. Without the second wait
 /// the test runtime could shut down first and leave a dead mount under
 /// `$TMPDIR` (#349).
 async fn wait_for_mount_table(path: &Path, mounted: bool) {

@@ -87,12 +87,14 @@ codesign --force --timestamp --options runtime --sign "Developer ID Application:
 - `--force` replaces the ad-hoc, linker-generated signature every Rust build
   carries on Apple Silicon.
 - `--options runtime` turns on the hardened runtime, which notarization
-  requires. The binaries need **no entitlements**: they link only Apple
-  frameworks (Metal, Foundation, CoreGraphics and libSystem), and the pinned
-  `fuse3` fork reaches macFUSE by launching `mount_macfuse` as a child process,
-  never by loading a library. If a future dependency `dlopen`s a third-party
-  library, signing will keep working and the binary will fail at run time with
-  a library-validation error; that is the moment to add an entitlements file.
+  requires. The binaries carry **no entitlements**: they link only Apple
+  frameworks (Metal, Foundation, CoreGraphics and libSystem). The pinned
+  `fuse3` fork reaches macFUSE's FSKit backend by `dlopen`ing
+  `/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework` when
+  it mounts. The hardened runtime's library validation applies to that load,
+  and macFUSE is signed by another team: if a signed build fails to mount with
+  a library-validation error, that is the moment to add an entitlements file
+  (`com.apple.security.cs.disable-library-validation`).
 - `--timestamp` attaches a secure timestamp from Apple's server. It is what
   keeps a signature valid after the certificate expires, so a build signed
   today still runs in six years.

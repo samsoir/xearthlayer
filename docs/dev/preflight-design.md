@@ -40,7 +40,7 @@ overwrite a working configuration.
 distinct outcome shapes already existed there, none of them named: act
 silently, warn and continue, stop with an error. Two prerequisites that plainly
 should have existed did not, because adding one meant growing a function that
-was already doing too much. A missing macFUSE kernel extension surfaced as an
+was already doing too much. A missing macFUSE surfaced as an
 opaque mount failure, and nothing at all prevented a second instance from
 mounting the same paths.
 
