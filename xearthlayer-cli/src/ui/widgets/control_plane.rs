@@ -22,15 +22,13 @@ use crate::ui::dashboard::JobRates;
 /// Widget displaying control plane health status.
 pub struct ControlPlaneWidget<'a> {
     snapshot: &'a HealthSnapshot,
-    max_concurrent_jobs: usize,
     job_rates: Option<&'a JobRates>,
 }
 
 impl<'a> ControlPlaneWidget<'a> {
-    pub fn new(snapshot: &'a HealthSnapshot, max_concurrent_jobs: usize) -> Self {
+    pub fn new(snapshot: &'a HealthSnapshot) -> Self {
         Self {
             snapshot,
-            max_concurrent_jobs,
             job_rates: None,
         }
     }
@@ -86,7 +84,6 @@ impl Widget for ControlPlaneWidget<'_> {
             columns[1],
             buf,
             self.snapshot.jobs_in_progress,
-            self.max_concurrent_jobs,
             self.snapshot.peak_concurrent_jobs,
         );
 
@@ -207,7 +204,9 @@ impl ControlPlaneWidget<'_> {
         }
     }
 
-    fn render_jobs_column(area: Rect, buf: &mut Buffer, current: usize, max: usize, peak: usize) {
+    /// Jobs in progress and the peak, with no denominator: no single limit
+    /// bounds jobs across both executor lanes, so a ratio would mislead (#280).
+    fn render_jobs_column(area: Rect, buf: &mut Buffer, current: usize, peak: usize) {
         // Row 1: Label
         let label = Line::from(Span::styled(
             format!("{:^width$}", "JOBS", width = area.width as usize),
@@ -219,7 +218,7 @@ impl ControlPlaneWidget<'_> {
 
         // Row 3: Value
         if area.height >= 3 {
-            let value_str = format!("{}/{}", current, max);
+            let value_str = current.to_string();
             let peak_str = format!("(peak: {})", peak);
             let value = Line::from(vec![
                 Span::styled(
@@ -323,5 +322,42 @@ impl ControlPlaneWidget<'_> {
                 buf,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(snapshot: &HealthSnapshot) -> String {
+        let area = Rect::new(0, 0, 120, 3);
+        let mut buf = Buffer::empty(area);
+        ControlPlaneWidget::new(snapshot).render(area, &mut buf);
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The JOBS column shows jobs in progress and the peak, with no
+    /// denominator: the executor enforces no limit matching the old one (#280).
+    #[test]
+    fn jobs_column_shows_in_progress_and_peak_without_a_denominator() {
+        let snapshot = HealthSnapshot {
+            jobs_in_progress: 47,
+            peak_concurrent_jobs: 112,
+            ..HealthSnapshot::default()
+        };
+
+        let out = render(&snapshot);
+        let jobs_row = out.lines().nth(2).expect("value row");
+
+        assert!(jobs_row.contains("47"), "in progress shown: {jobs_row:?}");
+        assert!(jobs_row.contains("(peak: 112)"), "peak shown: {jobs_row:?}");
+        assert!(!jobs_row.contains("47/"), "no denominator: {jobs_row:?}");
     }
 }

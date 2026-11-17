@@ -28,16 +28,6 @@ pub fn num_cpus() -> usize {
         .unwrap_or(4)
 }
 
-/// Default max concurrent jobs: num_cpus / 2, minimum 2.
-///
-/// Limits total in-flight jobs (download + encode pipeline) to balance
-/// XEarthLayer throughput against X-Plane frame overhead. Empirically
-/// tuned — higher values starve X-Plane's render thread, lower values
-/// under-feed the executor on high-core systems.
-pub fn default_max_concurrent_jobs() -> usize {
-    (num_cpus() / 2).max(2)
-}
-
 // =============================================================================
 // Per-chunk download defaults
 // =============================================================================
@@ -196,9 +186,6 @@ pub const DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
 /// Default semaphore timeout in seconds for acquiring a job slot.
 pub const DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS: u64 = 30;
 
-// Note: DEFAULT_CONTROL_PLANE_JOB_SCALING_FACTOR removed — default_max_concurrent_jobs()
-// now uses ceil(num_cpus * 0.75) directly.
-
 // =============================================================================
 // Texture defaults
 // =============================================================================
@@ -310,7 +297,6 @@ impl Default for ConfigFile {
                 capacity_share: DEFAULT_PREFETCH_CAPACITY_SHARE,
             },
             control_plane: ControlPlaneSettings {
-                max_concurrent_jobs: default_max_concurrent_jobs(),
                 stall_threshold_secs: DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS,
                 health_check_interval_secs: DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
                 semaphore_timeout_secs: DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,

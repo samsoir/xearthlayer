@@ -24,7 +24,6 @@ pub fn render_control_plane(
     frame: &mut Frame,
     area: Rect,
     snapshot: Option<&HealthSnapshot>,
-    max_concurrent_jobs: usize,
     job_rates: Option<&JobRates>,
 ) {
     let control_plane_block = Block::default()
@@ -40,7 +39,7 @@ pub fn render_control_plane(
 
     if let Some(health_snapshot) = snapshot {
         frame.render_widget(
-            ControlPlaneWidget::new(health_snapshot, max_concurrent_jobs).with_job_rates(job_rates),
+            ControlPlaneWidget::new(health_snapshot).with_job_rates(job_rates),
             inner,
         );
     } else {

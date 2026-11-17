@@ -338,14 +338,6 @@ impl XEarthLayerService {
             .unwrap_or(false)
     }
 
-    /// Get the maximum concurrent jobs configured for the executor.
-    ///
-    /// This is used by the dashboard to display capacity utilization.
-    /// Returns the configured value from the control plane settings.
-    pub fn max_concurrent_jobs(&self) -> usize {
-        self.config.control_plane().max_concurrent_jobs
-    }
-
     /// Get the runtime health monitor for dashboard display.
     ///
     /// Returns `None` if the runtime is not yet started or health tracking
