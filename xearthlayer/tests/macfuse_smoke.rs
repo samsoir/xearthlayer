@@ -20,8 +20,14 @@
 //! set up for one backend passes that backend's variants only.
 //!
 //! Ignored by default because they need macFUSE installed.
-//! Run with: `cargo test --test macfuse_smoke -- --ignored --nocapture`
-//! (append `kernel` or `macfuse_fskit` to run one backend's variants).
+//! Run with: `cargo test --test macfuse_smoke -- --ignored --nocapture --test-threads=1`
+//! (append `kernel` or `macfuse_fskit` to run one backend's variants), or
+//! `make verify-macos`, which also loads the kext first.
+//!
+//! Run them one at a time (#349). After a boot the kext is not loaded, and
+//! two `_kernel` variants mounting at once each start their own
+//! `load_macfuse`; one of the two `mount_macfuse` helpers then exits without
+//! handing over the device fd and fuse3 reports `get fuse fd failed`.
 //!
 //! Run it in a terminal on the Mac itself, not over SSH. macOS treats a
 //! macFUSE mount as a network volume and attributes an SSH session to
@@ -34,8 +40,9 @@
 
 #![cfg(target_os = "macos")]
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
@@ -44,6 +51,7 @@ use xearthlayer::fuse::fuse3::Fuse3OrthoUnionFS;
 use xearthlayer::fuse::MacosBackend;
 use xearthlayer::ortho_union::OrthoUnionIndexBuilder;
 use xearthlayer::runtime::JobRequest;
+use xearthlayer::system::is_path_mounted;
 
 /// Mount the *production* consolidated ortho union FS over macFUSE and read a
 /// real passthrough scenery file back through it. This is the FS X-Plane
@@ -80,6 +88,7 @@ async fn mounts_and_serves_a_file(backend: MacosBackend) {
 
     let mountpoint = tempfile::tempdir().expect("mountpoint tempdir");
     let mount_str = mountpoint.path().to_str().unwrap().to_string();
+    let in_table = mount_table_path(mountpoint.path());
 
     let (tx, _rx) = mpsc::channel::<JobRequest>(8);
     let dds_client = Arc::new(ChannelDdsClient::new(tx));
@@ -90,8 +99,8 @@ async fn mounts_and_serves_a_file(backend: MacosBackend) {
         .await
         .expect("ortho union mount_spawned must succeed on macFUSE");
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let flags = mount_flags(mountpoint.path());
+    wait_for_mount_table(&in_table, true).await;
+    let flags = mount_flags(&in_table);
 
     // Read the real scenery file back through the union mount.
     let mounted = mountpoint.path().join(dsf_rel);
@@ -112,6 +121,7 @@ async fn mounts_and_serves_a_file(backend: MacosBackend) {
     );
 
     handle.unmount().await.expect("union unmount must succeed");
+    wait_for_mount_table(&in_table, false).await;
     assert_mounted_with(backend, &flags);
 }
 
@@ -142,6 +152,7 @@ async fn volume_is_named_after_its_mount_point_folder(backend: MacosBackend) {
     let scenery = tempfile::tempdir().expect("custom scenery tempdir");
     let mountpoint = scenery.path().join("zzXEL_ortho");
     std::fs::create_dir(&mountpoint).unwrap();
+    let in_table = mount_table_path(&mountpoint);
 
     let (tx, _rx) = mpsc::channel::<JobRequest>(8);
     let fs = Fuse3OrthoUnionFS::new(index, Arc::new(ChannelDdsClient::new(tx)), 11_174_016)
@@ -151,10 +162,11 @@ async fn volume_is_named_after_its_mount_point_folder(backend: MacosBackend) {
         .await
         .expect("ortho union mount_spawned must succeed on macFUSE");
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_mount_table(&in_table, true).await;
     let name = volume_name(&mountpoint);
-    let flags = mount_flags(&mountpoint);
+    let flags = mount_flags(&in_table);
     handle.unmount().await.expect("union unmount must succeed");
+    wait_for_mount_table(&in_table, false).await;
 
     assert_mounted_with(backend, &flags);
     assert_eq!(name, "zzXEL_ortho");
@@ -174,12 +186,42 @@ fn assert_mounted_with(backend: MacosBackend, flags: &[String]) {
     }
 }
 
-/// The flags `mount` lists for the volume mounted on `path`. Read while the
-/// volume is mounted; panics if `path` is not in the mount table.
-fn mount_flags(path: &std::path::Path) -> Vec<String> {
-    // The mount table names the resolved path (`/private/var/...`, not the
-    // `/var/...` a temp dir is handed out as).
-    let dir = path.canonicalize().expect("canonicalize mount point");
+/// How long the kernel may take to list or drop a mount before a test fails.
+const MOUNT_TABLE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The path the mount table names for the mount point `path`: the resolved
+/// path (`/private/var/...`, not the `/var/...` a temp dir is handed out as).
+/// `is_path_mounted` compares paths exactly, so polling the unresolved path
+/// would report "not mounted" at every moment.
+fn mount_table_path(path: &Path) -> PathBuf {
+    path.canonicalize().expect("canonicalize mount point")
+}
+
+/// Waits until the mount table lists `path` (`mounted`) or no longer does.
+///
+/// fuse3 returns from a mount as soon as `mount_macfuse` hands over the
+/// device fd, before the kernel has finished `mount(2)`, and returns from an
+/// unmount before its detached unmount task has run. Without the second wait
+/// the test runtime could shut down first and leave a dead mount under
+/// `$TMPDIR` (#349).
+async fn wait_for_mount_table(path: &Path, mounted: bool) {
+    let deadline = Instant::now() + MOUNT_TABLE_DEADLINE;
+    while is_path_mounted(path) != mounted {
+        assert!(
+            Instant::now() < deadline,
+            "{} still {} the mount table after {:?}",
+            path.display(),
+            if mounted { "missing from" } else { "in" },
+            MOUNT_TABLE_DEADLINE
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// The flags `mount` lists for the volume mounted on `dir`, a path as the
+/// mount table names it (see `mount_table_path`). Read while the volume is
+/// mounted; panics if `dir` is not in the mount table.
+fn mount_flags(dir: &Path) -> Vec<String> {
     let needle = format!(" on {} (", dir.display());
     let out = std::process::Command::new("/sbin/mount")
         .output()
@@ -199,7 +241,7 @@ fn mount_flags(path: &std::path::Path) -> Vec<String> {
 
 /// The volume name Finder shows for `path`, read with `getattrlist`
 /// (`ATTR_VOL_NAME`), which is what Foundation's `volumeNameKey` reads.
-fn volume_name(path: &std::path::Path) -> String {
+fn volume_name(path: &Path) -> String {
     use std::ffi::{CStr, CString};
     use std::os::unix::ffi::OsStrExt;
 

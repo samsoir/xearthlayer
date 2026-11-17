@@ -297,7 +297,9 @@ Two ways round it:
   session starts.
 
 This matters for releases: `make verify-macos` runs the live macFUSE smoke
-tests, so it cannot be completed over SSH without the above.
+tests, so it cannot be completed over SSH without the above. It loads the
+kernel extension first and runs the smoke tests one at a time, because after a
+boot two mounts racing the kext's first load fail with `get fuse fd failed`.
 
 ## Troubleshooting
 
