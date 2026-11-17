@@ -126,7 +126,8 @@ writes.
 `scripts/macos/build-pkg.sh <product> <binary> <version> <out.pkg>` builds one
 package from an already signed and notarized binary. The package installs
 `/usr/local/bin/<product>` under the receipt `net.defreyssi.<product>`, has no
-install scripts, and targets arm64 and macOS 12.0 or later. Both packages show
+install scripts, and targets arm64: macOS 15.4 or later for the runtime (FSKit,
+#369), macOS 12.0 or later for the publisher. Both packages show
 the repository's `LICENSE` (MIT) as the license the user accepts, with each
 paragraph joined onto one line, because the Installer wraps the text itself and
 also breaks at every newline. The runtime

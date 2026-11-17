@@ -118,7 +118,7 @@ test_distribution_for_runtime() {
     assert_contains "$xml" '<license file="LICENSE.txt" mime-type="text/plain"/>'
     assert_contains "$xml" '<conclusion file="conclusion.html" mime-type="text/html"/>'
     assert_contains "$xml" 'hostArchitectures="arm64"'
-    assert_contains "$xml" '<os-version min="12.0"/>'
+    assert_contains "$xml" '<os-version min="15.4"/>'
     assert_contains "$xml" '<pkg-ref id="net.defreyssi.xearthlayer" version="0.5.0-rc.1" onConclusion="none">xearthlayer.pkg</pkg-ref>'
     if command -v xmllint >/dev/null 2>&1; then
         printf '%s' "$xml" | xmllint --noout - || fail "distribution.xml is not well formed"
@@ -130,6 +130,7 @@ test_distribution_for_publisher_has_license_only() {
     xml=$(render_distribution xearthlayer-publish 0.5.0)
     assert_contains "$xml" '<title>XEarthLayer Publishing Tools</title>'
     assert_contains "$xml" 'net.defreyssi.xearthlayer-publish'
+    assert_contains "$xml" '<os-version min="12.0"/>'
     assert_contains "$xml" '<license file="LICENSE.txt" mime-type="text/plain"/>'
     assert_not_contains "$xml" '<welcome'
     assert_not_contains "$xml" '<readme'
