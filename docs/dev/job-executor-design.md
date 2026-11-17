@@ -865,6 +865,15 @@ impl TelemetrySink for NullTelemetrySink {
 }
 ```
 
+**Running job count (`jobs_active`)**: the executor also reports to the metrics
+system, beside the telemetry sink. Every job that enters `active_jobs` sends
+`MetricEvent::JobStarted` (`start_job_with_permit`, `start_child_job`) and
+`MetricEvent::JobFinished` when it leaves (`complete_job`, or `shutdown`). The
+metrics daemon counts the difference as `jobs_active`: jobs running in either
+lane, not queued or held by the admission gate. The daemon's own
+`JobCompleted` and `JobTimedOut` are per request and never move it, because a
+request can time out while its job keeps running (#368).
+
 **Telemetry Architecture**:
 
 ```

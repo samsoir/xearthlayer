@@ -165,8 +165,14 @@ pub enum MetricEvent {
         is_fuse: bool,
     },
 
-    /// A job started executing.
+    /// The executor admitted a job and started running it (either lane).
+    /// Paired with [`JobFinished`](Self::JobFinished); together they count
+    /// `jobs_active` (#368).
     JobStarted,
+
+    /// A job the executor started left it: done, failed, killed, or
+    /// cancelled at shutdown.
+    JobFinished,
 
     /// A job completed execution.
     JobCompleted {
@@ -385,6 +391,7 @@ impl MetricEvent {
             Self::MemCacheWriteCompleted => "mem_cache_write_completed",
             Self::JobSubmitted { .. } => "job_submitted",
             Self::JobStarted => "job_started",
+            Self::JobFinished => "job_finished",
             Self::JobCompleted { .. } => "job_completed",
             Self::JobCoalesced => "job_coalesced",
             Self::JobTimedOut { .. } => "job_timed_out",

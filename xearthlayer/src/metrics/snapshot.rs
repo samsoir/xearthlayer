@@ -37,7 +37,8 @@ pub struct TelemetrySnapshot {
     pub jobs_failed: u64,
     /// Jobs that timed out (FUSE timeout, work may have completed in background)
     pub jobs_timed_out: u64,
-    /// Currently active jobs
+    /// Jobs the executors are running now, demand and prefetch lanes
+    /// together; queued and admission-held jobs are not counted (#368)
     pub jobs_active: usize,
     /// Jobs that were coalesced
     pub jobs_coalesced: u64,
@@ -304,7 +305,7 @@ impl fmt::Display for TelemetrySnapshot {
             format_number(self.jobs_completed),
             self.jobs_per_second
         )?;
-        writeln!(f, "  Active: {}", format_number(self.jobs_active))?;
+        writeln!(f, "  Running: {}", format_number(self.jobs_active))?;
         writeln!(f, "  Timed out: {}", format_number(self.jobs_timed_out))?;
         writeln!(f, "  Errors: {}", format_number(self.jobs_failed))?;
         writeln!(

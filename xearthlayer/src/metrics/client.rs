@@ -306,10 +306,16 @@ impl MetricsClient {
         self.send(MetricEvent::FuseTileServed);
     }
 
-    /// Records a job starting execution.
+    /// Records the executor starting a job.
     #[inline]
     pub fn job_started(&self) {
         self.send(MetricEvent::JobStarted);
+    }
+
+    /// Records a started job leaving the executor, whatever its outcome.
+    #[inline]
+    pub fn job_finished(&self) {
+        self.send(MetricEvent::JobFinished);
     }
 
     /// Records a job completing.

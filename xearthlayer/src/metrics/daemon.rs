@@ -287,15 +287,20 @@ impl MetricsDaemon {
                     self.state.fuse_jobs_submitted += 1;
                 }
             }
+            // jobs_active follows the executor (#368). A request's
+            // completion or timeout is the daemon's view and does not move
+            // it: a timed-out job may still be running.
             MetricEvent::JobStarted => {
                 self.state.jobs_active += 1;
+            }
+            MetricEvent::JobFinished => {
+                self.state.jobs_active = self.state.jobs_active.saturating_sub(1);
             }
             MetricEvent::JobCompleted {
                 success,
                 duration_us,
                 is_fuse,
             } => {
-                self.state.jobs_active = self.state.jobs_active.saturating_sub(1);
                 // Every FUSE wait counts whatever its outcome; cache hits never
                 // emit JobCompleted.
                 if is_fuse {
@@ -312,7 +317,6 @@ impl MetricsDaemon {
                 self.state.jobs_coalesced += 1;
             }
             MetricEvent::JobTimedOut { duration_us } => {
-                self.state.jobs_active = self.state.jobs_active.saturating_sub(1);
                 self.state.jobs_timed_out += 1;
                 // The stall is the latency the no-harm measure exists to
                 // see; leaving it out would cap max at the timeout.
@@ -934,6 +938,8 @@ mod tests {
         assert_eq!(daemon.state.jobs_submitted, 2);
         assert_eq!(daemon.state.fuse_jobs_submitted, 1);
 
+        // jobs_active follows the executor's start and finish (#368); a
+        // request's completion or timeout does not move it.
         daemon.process_event(MetricEvent::JobStarted);
         daemon.process_event(MetricEvent::JobStarted);
         assert_eq!(daemon.state.jobs_active, 2);
@@ -943,16 +949,19 @@ mod tests {
             duration_us: 100_000,
             is_fuse: false,
         });
-        assert_eq!(daemon.state.jobs_active, 1);
+        assert_eq!(daemon.state.jobs_active, 2);
         assert_eq!(daemon.state.jobs_completed, 1);
+        daemon.process_event(MetricEvent::JobFinished);
+        assert_eq!(daemon.state.jobs_active, 1);
 
         daemon.process_event(MetricEvent::JobCompleted {
             success: false,
             duration_us: 50_000,
             is_fuse: false,
         });
-        assert_eq!(daemon.state.jobs_active, 0);
         assert_eq!(daemon.state.jobs_failed, 1);
+        daemon.process_event(MetricEvent::JobFinished);
+        assert_eq!(daemon.state.jobs_active, 0);
 
         daemon.process_event(MetricEvent::JobCoalesced);
         assert_eq!(daemon.state.jobs_coalesced, 1);
@@ -961,8 +970,14 @@ mod tests {
         daemon.process_event(MetricEvent::JobTimedOut {
             duration_us: 10_000_000,
         });
-        assert_eq!(daemon.state.jobs_active, 0);
+        assert_eq!(daemon.state.jobs_active, 1);
         assert_eq!(daemon.state.jobs_timed_out, 1);
+        daemon.process_event(MetricEvent::JobFinished);
+        assert_eq!(daemon.state.jobs_active, 0);
+
+        // A stray finish never takes the count below zero.
+        daemon.process_event(MetricEvent::JobFinished);
+        assert_eq!(daemon.state.jobs_active, 0);
     }
 
     #[test]

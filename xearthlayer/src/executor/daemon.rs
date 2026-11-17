@@ -1630,6 +1630,97 @@ mod tests {
         let _ = run.await;
     }
 
+    /// Counts the job start and finish events seen so far (#368).
+    fn job_start_and_finish(
+        metrics_rx: &mut mpsc::UnboundedReceiver<crate::metrics::MetricEvent>,
+        seen: &mut (usize, usize),
+    ) {
+        use crate::metrics::MetricEvent;
+        while let Ok(event) = metrics_rx.try_recv() {
+            match event {
+                MetricEvent::JobStarted => seen.0 += 1,
+                MetricEvent::JobFinished => seen.1 += 1,
+                _ => {}
+            }
+        }
+    }
+
+    fn metrics_daemon(
+        factory: MockJobFactory,
+    ) -> (
+        TestDaemon,
+        mpsc::Sender<JobRequest>,
+        mpsc::UnboundedReceiver<crate::metrics::MetricEvent>,
+    ) {
+        let (metrics_tx, metrics_rx) = mpsc::unbounded_channel();
+        let (daemon, tx) = ExecutorDaemon::with_metrics_client(
+            ExecutorDaemonConfig::default(),
+            Arc::new(factory),
+            Arc::new(MockMemoryCache::new()),
+            Arc::new(super::super::NullDdsDiskCache),
+            Arc::new(crate::executor::NullTelemetrySink),
+            MetricsClient::new(metrics_tx),
+        );
+        (daemon, tx, metrics_rx)
+    }
+
+    /// `jobs_active` counts jobs the executor is running (#368): a job
+    /// reports its start while it runs and its finish once it is done,
+    /// whether it succeeded or failed.
+    #[tokio::test]
+    async fn test_a_running_job_reports_its_start_then_its_finish() {
+        for (factory, fails) in [
+            (MockJobFactory::new(), false),
+            (MockJobFactory::failing(), true),
+        ] {
+            let (daemon, tx, mut metrics_rx) = metrics_daemon(factory);
+            let shutdown = CancellationToken::new();
+            let run = tokio::spawn(daemon.run(shutdown.clone()));
+
+            let (request, rx) = JobRequest::fuse(test_tile(), CancellationToken::new());
+            tx.send(request).await.unwrap();
+            let mut seen = (0, 0);
+            if !fails {
+                // The mock job runs for 50 ms; the failing one ends at once.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                job_start_and_finish(&mut metrics_rx, &mut seen);
+                assert_eq!(seen, (1, 0), "started and still running");
+            }
+
+            let _ = rx.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            job_start_and_finish(&mut metrics_rx, &mut seen);
+            assert_eq!(seen, (1, 1), "finished once it is done");
+
+            shutdown.cancel();
+            let _ = run.await;
+        }
+    }
+
+    /// A job killed by its request's cancellation (the FUSE timeout) still
+    /// reports its finish, or `jobs_active` would grow by one per timeout.
+    #[tokio::test]
+    async fn test_a_killed_job_reports_its_finish() {
+        let (daemon, tx, mut metrics_rx) = metrics_daemon(MockJobFactory::new());
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(daemon.run(shutdown.clone()));
+
+        let token = CancellationToken::new();
+        let (request, rx) = JobRequest::fuse(test_tile(), token.clone());
+        tx.send(request).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        token.cancel();
+        assert!(!rx.await.unwrap().is_success());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut seen = (0, 0);
+        job_start_and_finish(&mut metrics_rx, &mut seen);
+        assert_eq!(seen, (1, 1));
+
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
     /// A FUSE request can time out while still queued on the demand channel,
     /// before the daemon reaches it. X-Plane waited the whole time and got a
     /// placeholder, so it is a timeout like any other: if it went unreported,

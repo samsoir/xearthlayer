@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### Dashboard
+
+- **The running job count is no longer always 0** ([#368](https://github.com/samsoir/xearthlayer/issues/368)): The headless status line (`Tiles: N completed, M running`), the panic report and the telemetry summary showed no jobs at work even during a scene load, because no job ever reported that it had started. The executor now reports each job when it starts and when it leaves, done, failed or killed, so the count is the number of tiles being generated right now, in the demand and prefetch lanes together. Jobs still queued or held back while X-Plane is waiting are not counted. The label reads "running" instead of "active".
+
 #### Packaging
 
 - **The `.deb` installs on Ubuntu 26.04 and Debian 13** ([#353](https://github.com/samsoir/xearthlayer/issues/353)): The package required `libfuse3-3`, the libfuse runtime library, which these releases replace with `libfuse3-4`, so `apt` refused to install it. XEarthLayer never used that library: it talks to the kernel's FUSE device itself and only runs `fusermount3` to mount without root. The package now requires `fuse3`, which provides `fusermount3` on every Debian and Ubuntu release, as the RPM and Arch packages already did.
