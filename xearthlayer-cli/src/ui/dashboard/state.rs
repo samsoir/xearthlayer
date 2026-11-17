@@ -270,24 +270,6 @@ impl Default for DashboardConfig {
     }
 }
 
-/// Job rate metrics for the control plane display.
-///
-/// Note: Used by legacy ControlPlaneWidget, kept for compatibility.
-#[derive(Debug, Clone)]
-pub struct JobRates {
-    /// Jobs submitted per second (instantaneous rate).
-    pub submitted_per_sec: f64,
-    /// Jobs completed per second (instantaneous rate).
-    pub completed_per_sec: f64,
-}
-
-impl JobRates {
-    /// Calculate the pressure delta (submitted - completed per second).
-    pub fn pressure(&self) -> f64 {
-        self.submitted_per_sec - self.completed_per_sec
-    }
-}
-
 /// Timeout for quit confirmation (auto-cancels after this duration).
 pub const QUIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
