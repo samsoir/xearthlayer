@@ -181,8 +181,8 @@ impl Preflight<BootstrapContext> for AirportIcao {
 
 /// Require macFUSE to be installed before attempting to mount.
 ///
-/// Without this a missing or unapproved kext surfaces as an opaque mount
-/// failure, which tells the user nothing about what to do.
+/// Without this a missing macFUSE surfaces as an opaque mount failure, which
+/// tells the user nothing about what to do.
 ///
 /// # What is probed, and what is not
 ///
@@ -242,8 +242,11 @@ impl Preflight<BootstrapContext> for MacFuseAvailable {
                 self.probe.display()
             ))
             .with_hint(
-                "Install macFUSE from https://macfuse.io, then approve the system \
-                 extension. See docs/macos.md for the approval steps.",
+                "Install macFUSE 5.3.3 or later from https://macfuse.io, then turn on \
+                 macFUSE under System Settings > General > Login Items & Extensions > \
+                 File System Extensions (FSKit, recommended), or approve its kernel \
+                 extension. If X-Plane is on an external drive, also give \
+                 /usr/libexec/fskitd Full Disk Access. See docs/macos.md.",
             )
         }
     }
@@ -478,11 +481,17 @@ mod tests {
             } => {
                 assert!(!remediable, "we cannot install macFUSE for the user");
                 assert!(reason.contains("macFUSE is not installed"), "{reason}");
+                let hint = hint.unwrap_or_default();
                 assert!(
-                    hint.as_deref()
-                        .unwrap_or_default()
-                        .contains("docs/macos.md"),
+                    hint.contains("docs/macos.md"),
                     "the hint must point at the approval steps"
+                );
+                // MFChannelInterrupt, which the FSKit transport binds, first
+                // shipped in macFUSE 5.3.3.
+                assert!(hint.contains("5.3.3"), "{hint}");
+                assert!(
+                    hint.contains("/usr/libexec/fskitd Full Disk Access"),
+                    "the external-drive step must be in the hint: {hint}"
                 );
             }
             other => panic!("expected Unsatisfied, got {other:?}"),
