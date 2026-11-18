@@ -382,6 +382,9 @@ pub trait UnionFilesystem: Send + Sync {
         size: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Bytes, FsError>> + Send + 'a>>;
 
+    /// Lists the directory's real children only.  The '.' and '..' entries are
+    /// the backend's job: each names a kernel identity (the directory itself,
+    /// its parent) that the core does not hold.
     fn list_directory<'a>(
         &'a self,
         node: &'a FsNode,
@@ -446,7 +449,7 @@ pub struct FileAttributes {
     pub perm: u16,
     /// Link count.
     pub nlink: u32,
-    /// Owner user id.
+    /// Owner user id (the serving process for virtual nodes; metadata for real files).
     pub uid: u32,
     /// Owner group id.
     pub gid: u32,
