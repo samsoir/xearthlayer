@@ -485,13 +485,10 @@ pub struct StatFsInfo {
 /// Map the core's neutral error onto FUSE's.
 /// errno_from belongs in the fuse3 adapter since common code cannot
 /// reference Errno or libc.
-#[derive(Debug, thiserror::Error)]
 fn errno_from(err: FsError) -> Errno {
     match err {
         FsError::NotFound => Errno::from(libc::ENOENT),
         FsError::NotADirectory => Errno::from(libc::ENOTDIR),
-        FsError::Io(_) => Errno::from(libc::EIO),
-        /// This may be better for Io()
         FsError::Io(e) => Errno::from(e.raw_os_error().unwrap_or(libc::EIO)),
     }
 }
