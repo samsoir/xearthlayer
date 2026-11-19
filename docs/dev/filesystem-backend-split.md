@@ -218,7 +218,13 @@ concrete SpawnedMountHandle.
 ///
 /// Callers do not need to know which backend produced the session; they only
 /// need the mount point, an unmount operation, and a liveness check.
-/// When a MountSession is dropped, the filesystem must be unmounted by the backend.
+/// When a MountSession is dropped, the backend attempts the unmount best-effort;
+/// Drop cannot report, so the outcome goes to the logs.
+/// A successful unmount guarantees the mount is gone from the mount table.
+/// A backend whose mount API detaches asynchronously owns the confirmation and escalation —
+/// it may not report success when the kernel may still hold the mount.
+/// If the escalation fails, `unmount` returns `MountError::Unmount` and the
+/// mount may remain; callers log that and do not retry.
 pub trait MountSession: Send {
     /// The directory the filesystem is mounted at.
     fn mountpoint(&self) -> &Path;
