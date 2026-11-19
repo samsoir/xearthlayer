@@ -30,6 +30,7 @@ pub mod encoder_policy;
 pub mod filesystem;
 pub mod gpu;
 mod hardware;
+mod mount_folder;
 pub mod process;
 mod recommendations;
 mod storage_detect;
@@ -44,6 +45,10 @@ pub use gpu::{
     find_adapter as find_gpu, GpuAdapter, GpuKind, GpuSelectError, GpuSelection,
 };
 pub use hardware::{detect_cpu_cores, detect_total_memory, StorageType, SystemInfo};
+pub use mount_folder::{
+    external_volume_root, ignores_ownership, prepare_mount_folder, volume_ignores_ownership,
+    MountFolder, MNT_IGNORE_OWNERSHIP,
+};
 pub use recommendations::{
     recommended_disk_cache, recommended_memory_cache, RecommendedSettings, MIN_DISK_CACHE_BYTES,
     MIN_MEMORY_CACHE_BYTES,

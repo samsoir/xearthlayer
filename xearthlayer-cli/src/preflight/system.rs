@@ -2,7 +2,7 @@
 
 use super::names;
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use xearthlayer::airport::validate_airport_icao;
 use xearthlayer::preflight::{BootstrapContext, Preflight, PreflightError, Remedy, Status};
@@ -186,10 +186,10 @@ impl Preflight<BootstrapContext> for AirportIcao {
 ///
 /// # What is probed, and what is not
 ///
-/// The presence of `/Library/Filesystems/macfuse.fs`. Deliberately **not**
-/// whether the kext is loaded: macFUSE loads on demand at first mount rather
-/// than at boot, so an empty `kmutil showloaded` is the normal state before a
-/// mount and would make this check reject a working installation.
+/// The presence of macFUSE's `MFMount.framework`, the library fuse3's FSKit
+/// transport loads to mount. Deliberately **not** whether the File System
+/// Extension is turned on: macOS has no reliable query for it, and a mount
+/// that is refused for that reason reports it in its own error.
 ///
 /// # Why there is no `#[cfg]` here
 ///
@@ -201,13 +201,15 @@ pub struct MacFuseAvailable {
     probe: PathBuf,
 }
 
-/// Where macFUSE installs its filesystem bundle.
-pub const MACFUSE_BUNDLE: &str = "/Library/Filesystems/macfuse.fs";
+/// The `MFMount` library inside macFUSE's filesystem bundle, which the FSKit
+/// mount loads (macFUSE 5.3.3 or later).
+pub const MACFUSE_MFMOUNT: &str =
+    "/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/MFMount";
 
 impl Default for MacFuseAvailable {
     fn default() -> Self {
         Self {
-            probe: PathBuf::from(MACFUSE_BUNDLE),
+            probe: PathBuf::from(MACFUSE_MFMOUNT),
         }
     }
 }
@@ -238,16 +240,81 @@ impl Preflight<BootstrapContext> for MacFuseAvailable {
             Status::Satisfied
         } else {
             Status::unsatisfied(format!(
-                "macFUSE is not installed: {} does not exist",
+                "macFUSE is not installed, or is older than 5.3.3: {} does not exist",
                 self.probe.display()
             ))
             .with_hint(
                 "Install macFUSE 5.3.3 or later from https://macfuse.io, then turn on \
-                 macFUSE under System Settings > General > Login Items & Extensions > \
-                 File System Extensions (FSKit, recommended), or approve its kernel \
-                 extension. If X-Plane is on an external drive, also give \
-                 /usr/libexec/fskitd Full Disk Access. See docs/macos.md.",
+                 \"macFUSE (local)\" under System Settings > General > Login Items & \
+                 Extensions > File System Extensions. If X-Plane is on an external drive, \
+                 also give /usr/libexec/fskitd Full Disk Access. See docs/macos.md.",
             )
+        }
+    }
+}
+
+/// Refuse to mount on a drive that ignores ownership (#369).
+///
+/// fskitd refuses a mount folder the user does not own, and on a drive with
+/// ownership ignored every folder belongs to uid 99. The mount would fail with
+/// macFUSE's uninformative `os error 35`, so the run stops here with the
+/// command that fixes it. See `xearthlayer::system::mount_folder`.
+pub struct MountVolumeOwnership {
+    probe: Box<OwnershipProbe>,
+}
+
+/// Whether the drive holding a path ignores ownership.
+type OwnershipProbe = dyn Fn(&Path) -> std::io::Result<bool> + Send + Sync;
+
+impl Default for MountVolumeOwnership {
+    fn default() -> Self {
+        Self::with_probe(xearthlayer::system::volume_ignores_ownership)
+    }
+}
+
+impl MountVolumeOwnership {
+    /// Construct with an explicit probe, answering whether the drive holding a
+    /// path ignores ownership.
+    pub fn with_probe(
+        probe: impl Fn(&Path) -> std::io::Result<bool> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            probe: Box::new(probe),
+        }
+    }
+}
+
+impl Preflight<BootstrapContext> for MountVolumeOwnership {
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed(names::MOUNT_VOLUME_OWNERSHIP)
+    }
+
+    fn applies(&self, ctx: &BootstrapContext) -> bool {
+        cfg!(target_os = "macos") && ctx.command() == "run"
+    }
+
+    fn inspect(&self, ctx: &BootstrapContext) -> Status {
+        let Some(scenery) = ctx.custom_scenery_path() else {
+            return Status::unsatisfied("Custom Scenery path has not been resolved");
+        };
+        match (self.probe)(scenery) {
+            Ok(true) => {
+                let drive = xearthlayer::system::external_volume_root(scenery)
+                    .map(|root| root.display().to_string())
+                    .unwrap_or_else(|| "<drive>".to_string());
+                Status::unsatisfied(format!(
+                    "The drive holding Custom Scenery ignores ownership: {}",
+                    scenery.display()
+                ))
+                .with_hint(format!(
+                    "macFUSE can only mount on a folder you own, and on this drive every \
+                     file belongs to user 99. Turn ownership on with: \
+                     sudo diskutil enableOwnership \"{drive}\" (or untick \"Ignore ownership \
+                     on this volume\" in the drive's Get Info window). See docs/macos.md."
+                ))
+            }
+            // Unreadable: let the mount report its own error.
+            Ok(false) | Err(_) => Status::Satisfied,
         }
     }
 }
@@ -458,11 +525,11 @@ mod tests {
     // ---- MacFuseAvailable ----
 
     #[test]
-    fn macfuse_is_satisfied_when_the_bundle_is_present() {
+    fn macfuse_is_satisfied_when_mfmount_is_present() {
         let dir = tempfile::tempdir().unwrap();
-        let bundle = dir.path().join("macfuse.fs");
-        std::fs::create_dir(&bundle).unwrap();
-        let check = MacFuseAvailable::with_probe(bundle);
+        let mfmount = dir.path().join("MFMount");
+        std::fs::write(&mfmount, b"").unwrap();
+        let check = MacFuseAvailable::with_probe(mfmount);
         assert_eq!(
             check.inspect(&BootstrapContext::new("run", None)),
             Status::Satisfied
@@ -472,7 +539,7 @@ mod tests {
     #[test]
     fn macfuse_is_unsatisfied_and_points_at_the_install_guide() {
         let dir = tempfile::tempdir().unwrap();
-        let check = MacFuseAvailable::with_probe(dir.path().join("absent.fs"));
+        let check = MacFuseAvailable::with_probe(dir.path().join("absent-MFMount"));
         match check.inspect(&BootstrapContext::new("run", None)) {
             Status::Unsatisfied {
                 reason,
@@ -489,6 +556,9 @@ mod tests {
                 // MFChannelInterrupt, which the FSKit transport binds, first
                 // shipped in macFUSE 5.3.3.
                 assert!(hint.contains("5.3.3"), "{hint}");
+                // macOS lists "macFUSE" and "macFUSE (local)"; FSKit needs the
+                // local one.
+                assert!(hint.contains("\"macFUSE (local)\""), "{hint}");
                 assert!(
                     hint.contains("/usr/libexec/fskitd Full Disk Access"),
                     "the external-drive step must be in the hint: {hint}"
@@ -510,6 +580,85 @@ mod tests {
     #[test]
     fn macfuse_check_does_not_apply_outside_run() {
         let check = MacFuseAvailable::default();
+        assert!(!check.applies(&BootstrapContext::new("packages", None)));
+    }
+
+    // ---- MountVolumeOwnership ----
+
+    fn ctx_with_scenery(path: &str) -> BootstrapContext {
+        let mut ctx = BootstrapContext::new("run", None);
+        ctx.set_custom_scenery_path(PathBuf::from(path));
+        ctx
+    }
+
+    #[test]
+    fn a_drive_that_honours_ownership_is_satisfied() {
+        let check = MountVolumeOwnership::with_probe(|_| Ok(false));
+        assert_eq!(
+            check.inspect(&ctx_with_scenery(
+                "/Volumes/Media/X-Plane 12/Custom Scenery"
+            )),
+            Status::Satisfied
+        );
+    }
+
+    #[test]
+    fn a_drive_that_ignores_ownership_is_refused_with_the_command_to_fix_it() {
+        let check = MountVolumeOwnership::with_probe(|_| Ok(true));
+        match check.inspect(&ctx_with_scenery(
+            "/Volumes/Davinci Resolve Media/X-Plane 12/Custom Scenery",
+        )) {
+            Status::Unsatisfied {
+                reason,
+                remediable,
+                hint,
+            } => {
+                assert!(!remediable, "turning ownership on needs the user's sudo");
+                assert!(reason.contains("ignores ownership"), "{reason}");
+                let hint = hint.unwrap_or_default();
+                assert!(
+                    hint.contains(
+                        "sudo diskutil enableOwnership \"/Volumes/Davinci Resolve Media\""
+                    ),
+                    "the hint must name the drive: {hint}"
+                );
+                assert!(hint.contains("docs/macos.md"), "{hint}");
+            }
+            other => panic!("expected Unsatisfied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_drive_does_not_block_the_run() {
+        // The mount reports its own error; a probe failure is no reason to
+        // refuse a run that may well work.
+        let check = MountVolumeOwnership::with_probe(|_| {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert_eq!(
+            check.inspect(&ctx_with_scenery("/Volumes/Gone/Custom Scenery")),
+            Status::Satisfied
+        );
+    }
+
+    #[test]
+    fn the_ownership_check_names_a_missing_custom_scenery_path() {
+        let check = MountVolumeOwnership::with_probe(|_| Ok(false));
+        match check.inspect(&BootstrapContext::new("run", None)) {
+            Status::Unsatisfied { reason, .. } => {
+                assert!(reason.contains("Custom Scenery path"), "{reason}")
+            }
+            other => panic!("expected Unsatisfied naming the missing value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_ownership_check_only_applies_to_run_on_macos() {
+        let check = MountVolumeOwnership::default();
+        assert_eq!(
+            check.applies(&BootstrapContext::new("run", None)),
+            cfg!(target_os = "macos")
+        );
         assert!(!check.applies(&BootstrapContext::new("packages", None)));
     }
 

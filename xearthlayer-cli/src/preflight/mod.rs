@@ -37,6 +37,7 @@ pub mod names {
     pub const XWORLD_PRO_SETUP: &str = "xworld-pro-setup";
     pub const AIRPORT_ICAO: &str = "airport-icao";
     pub const MACFUSE_AVAILABLE: &str = "macfuse-available";
+    pub const MOUNT_VOLUME_OWNERSHIP: &str = "mount-volume-ownership";
     pub const NO_RUNNING_INSTANCE: &str = "no-running-instance";
 }
 
@@ -92,7 +93,7 @@ impl RegistryEnv {
             config_path: config_file_path(),
             legacy_packages_dir: legacy_default_packages_dir(),
             lock_path: default_lock_path(),
-            macfuse_probe: PathBuf::from(system::MACFUSE_BUNDLE),
+            macfuse_probe: PathBuf::from(system::MACFUSE_MFMOUNT),
             detect_custom_scenery: Box::new(|| xearthlayer::config::detect_custom_scenery().ok()),
         }
     }
@@ -153,6 +154,7 @@ pub fn build_registry_with(env: RegistryEnv) -> Runner<BootstrapContext> {
     runner.register(Box::new(system::MacFuseAvailable::with_probe(
         macfuse_probe,
     )));
+    runner.register(Box::new(system::MountVolumeOwnership::default()));
 
     // Last: the lock is claimed only for a run that will actually proceed.
     // Claiming it earlier would leave a lock behind for a run rejected by a
@@ -321,17 +323,17 @@ mod tests {
 
     /// An environment in which every prerequisite is satisfiable.
     ///
-    /// Includes the macFUSE bundle. On macOS that check applies and a CI runner
+    /// Includes macFUSE's MFMount library. On macOS that check applies and a CI runner
     /// has no macFUSE installed, so omitting it made this fabrication complete
     /// on Linux and incomplete on macOS.
     fn fabricate_complete_environment() -> (tempfile::TempDir, RegistryEnv) {
         let dir = tempfile::tempdir().unwrap();
         let packages = dir.path().join("packages");
         let scenery = dir.path().join("Custom Scenery");
-        let macfuse = dir.path().join("macfuse.fs");
+        let macfuse = dir.path().join("MFMount");
         std::fs::create_dir(&packages).unwrap();
         std::fs::create_dir(&scenery).unwrap();
-        std::fs::create_dir(&macfuse).unwrap();
+        std::fs::write(&macfuse, b"").unwrap();
         let config_path = dir.path().join("config.ini");
         std::fs::write(
             &config_path,
@@ -362,7 +364,7 @@ mod tests {
             config_path: dir.path().join("absent.ini"),
             legacy_packages_dir: dir.path().join("absent-packages"),
             lock_path: dir.path().join("xearthlayer.lock"),
-            macfuse_probe: dir.path().join("absent-macfuse.fs"),
+            macfuse_probe: dir.path().join("absent-MFMount"),
             detect_custom_scenery: Box::new(|| None),
         }
     }
@@ -456,6 +458,7 @@ mod tests {
                 names::XWORLD_PRO_SETUP,
                 names::AIRPORT_ICAO,
                 names::MACFUSE_AVAILABLE,
+                names::MOUNT_VOLUME_OWNERSHIP,
                 names::NO_RUNNING_INSTANCE,
             ]
         );
@@ -532,6 +535,7 @@ mod tests {
             names::XWORLD_PRO_SETUP,
             names::AIRPORT_ICAO,
             names::MACFUSE_AVAILABLE,
+            names::MOUNT_VOLUME_OWNERSHIP,
             names::NO_RUNNING_INSTANCE,
         ];
         let mut seen: Vec<&str> = all.to_vec();

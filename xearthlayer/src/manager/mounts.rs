@@ -13,7 +13,7 @@ use crate::config::defaults::{
     DEFAULT_FUSE_CONGESTION_THRESHOLD, DEFAULT_FUSE_MAX_BACKGROUND, DEFAULT_GENERATION_TIMEOUT_SECS,
 };
 use crate::fuse::fuse3::Fuse3OrthoUnionFS;
-use crate::fuse::{MacosBackend, SpawnedMountHandle};
+use crate::fuse::SpawnedMountHandle;
 use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage};
 use crate::metrics::TelemetrySnapshot;
 use crate::ortho_union::{
@@ -149,8 +149,6 @@ pub struct MountManager {
     fuse_max_background: u16,
     /// Congestion threshold for background FUSE requests (kernel limit).
     fuse_congestion_threshold: u16,
-    /// Which macFUSE backend mounts the ortho volume (macOS only).
-    macos_backend: MacosBackend,
     /// Upper bound in seconds for a single DDS generation behind a FUSE read.
     generation_timeout_secs: u64,
     /// Whether the ortho mount serves generated night lighting (`night.enabled`).
@@ -179,7 +177,6 @@ impl MountManager {
             geo_index: None,
             fuse_max_background: DEFAULT_FUSE_MAX_BACKGROUND,
             fuse_congestion_threshold: DEFAULT_FUSE_CONGESTION_THRESHOLD,
-            macos_backend: MacosBackend::default(),
             generation_timeout_secs: DEFAULT_GENERATION_TIMEOUT_SECS,
             night_enabled: false,
             night_lighting: crate::night::NightLighting::Off,
@@ -205,13 +202,6 @@ impl MountManager {
     pub fn set_fuse_limits(&mut self, max_background: u16, congestion_threshold: u16) {
         self.fuse_max_background = max_background;
         self.fuse_congestion_threshold = congestion_threshold;
-    }
-
-    /// Set which macFUSE backend mounts the ortho volume (`fuse.macos_backend`).
-    ///
-    /// Only consulted on macOS; `auto` (FSKit, else the kext) by default.
-    pub fn set_macos_backend(&mut self, backend: MacosBackend) {
-        self.macos_backend = backend;
     }
 
     /// Enable or disable generated night lighting for the ortho mount.
@@ -508,9 +498,15 @@ impl MountManager {
         // check below.
         crate::system::recover_stale_fuse_mount(&mountpoint);
 
-        // Create mountpoint directory
-        if !mountpoint.exists() {
-            if let Err(e) = std::fs::create_dir_all(&mountpoint) {
+        // Create the mountpoint directory. On macOS an empty one is recreated
+        // first: fskitd refuses a folder made while its drive ignored
+        // ownership, even after ownership is turned back on (#369).
+        match crate::system::prepare_mount_folder(&mountpoint, cfg!(target_os = "macos")) {
+            Ok(crate::system::MountFolder::Recreated) => {
+                tracing::info!(mountpoint = %mountpoint.display(), "Recreated the empty mount folder");
+            }
+            Ok(_) => {}
+            Err(e) => {
                 return ConsolidatedOrthoMountResult::failure(
                     mountpoint,
                     format!("Failed to create mountpoint directory: {}", e),
@@ -595,7 +591,6 @@ impl MountManager {
                 .with_geo_index(Arc::clone(&geo_index))
                 .with_state_observer(state_observer)
                 .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold)
-                .with_macos_backend(self.macos_backend)
                 .with_timeout(Duration::from_secs(self.generation_timeout_secs));
 
         if let Some(budget) = pinned_budget {

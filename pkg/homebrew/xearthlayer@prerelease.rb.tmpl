@@ -28,7 +28,7 @@ cask "xearthlayer@prerelease" do
   conflicts_with cask: "xearthlayer"
   depends_on arch: :arm64
   depends_on cask: "macfuse"
-  depends_on macos: :monterey
+  depends_on macos: :sequoia
 
   binary "xearthlayer"
 
@@ -42,8 +42,9 @@ cask "xearthlayer@prerelease" do
     This is the pre-release channel; it tracks every dev, alpha, beta and rc
     tag. For stable releases, install the `xearthlayer` cask instead.
 
-    macFUSE needs a one-time approval in System Settings, and on Apple Silicon
-    kernel extensions must first be allowed in Recovery. The steps are in
+    macFUSE (5.3.3 or later, on macOS 15.4 or later) must be turned on once:
+    System Settings > General > Login Items & Extensions > File System
+    Extensions, switch on "macFUSE (local)". The steps are in
       https://github.com/@REPO@/blob/main/docs/macos.md
     Then run `xearthlayer setup`.
   EOS

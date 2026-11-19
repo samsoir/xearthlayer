@@ -13,6 +13,25 @@ valid_product() {
     esac
 }
 
+# Prints the absolute path of the entitlements file a binary is signed with,
+# or nothing for a binary that needs none. Only the runtime has any: fuse3
+# dlopens macFUSE's MFMount.framework when it mounts, and the hardened
+# runtime's library validation refuses a framework signed by another team
+# ("mapping process and mapped file (non-platform) have different Team
+# IDs"), so a signed xearthlayer could not mount without
+# com.apple.security.cs.disable-library-validation. The publisher never
+# mounts and keeps library validation.
+entitlements_for() {
+    case "$(basename "$1")" in
+        xearthlayer)
+            local root
+            root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+            echo "$root/pkg/macos/xearthlayer.entitlements"
+            ;;
+        *) ;;
+    esac
+}
+
 # Reads `security find-identity -v` output on stdin and prints
 # "<sha1><TAB><name>" for the one valid identity of the given kind
 # ("Developer ID Application" or "Developer ID Installer"). Zero or several
@@ -94,24 +113,30 @@ unwrap_paragraphs() {
 }
 
 # Prints the productbuild distribution for one product's package: arm64
-# only, macOS 12 or later (the casks' `depends_on macos: :monterey`), one
-# hidden choice, no customisation, no scripts. Both packages show the MIT
+# only, one hidden choice, no customisation, no scripts. Both packages show the MIT
 # license (LICENSE.txt) for the user to accept. The runtime also gets the
 # welcome, readme and conclusion pages from pkg/macos/, which cover macFUSE:
-# the publisher does not mount anything, so it needs none of them.
+# the publisher does not mount anything, so it needs none of them. The
+# runtime needs macOS 15.4 or later, the first with the FSKit macFUSE mounts
+# through (#369); the publisher runs on macOS 12 or later. The casks state the
+# same floors, to the major version only.
 render_distribution() {
-    local product=$1 version=$2 title id="net.defreyssi.$1"
+    local product=$1 version=$2 title min_os id="net.defreyssi.$1"
     local pages='    <license file="LICENSE.txt" mime-type="text/plain"/>
 '
     case "$product" in
         xearthlayer)
             title="XEarthLayer"
+            min_os="15.4"
             pages='    <welcome file="welcome.html" mime-type="text/html"/>
     <readme file="readme.html" mime-type="text/html"/>
 '"$pages"'    <conclusion file="conclusion.html" mime-type="text/html"/>
 '
             ;;
-        xearthlayer-publish) title="XEarthLayer Publishing Tools" ;;
+        xearthlayer-publish)
+            title="XEarthLayer Publishing Tools"
+            min_os="12.0"
+            ;;
         *)
             valid_product "$product"
             return 2
@@ -125,7 +150,7 @@ ${pages}    <options customize="never" require-scripts="false" hostArchitectures
     <domains enable_localSystem="true" enable_anywhere="false" enable_currentUserHome="false"/>
     <volume-check>
         <allowed-os-versions>
-            <os-version min="12.0"/>
+            <os-version min="$min_os"/>
         </allowed-os-versions>
     </volume-check>
     <choices-outline>
