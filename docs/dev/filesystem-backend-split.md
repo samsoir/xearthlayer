@@ -339,7 +339,7 @@ stays platform-neutral.
 | Policy decision | Linux | macOS |
 |---|---|---|
 | Open flags reported for virtual DDS files | `FOPEN_DIRECT_IO` — every `read()` reaches the handler, so the FUSE read counters are exact and the page cache never holds a second copy of a tile | `0` — X-Plane `mmap`s texture files and macFUSE faults with `EXC_BAD_ACCESS` when a `direct_io` file is mapped, so virtual DDS is served through the page cache and the read counters under-report (#204) |
-| Mount API call | `Session::mount_with_unprivileged` | `Session::mount` |
+| Mount API call | `Session::mount_with_unprivileged` — routes the mount through the setuid `fusermount3` helper; `mount(2)` itself is privileged (the method needs the `unprivileged` crate feature) | `Session::mount` — macFUSE's own `mount_macfuse` helper is setuid, so the plain call is already unprivileged |
 | `volname` mount option | not set | set, so Finder shows a meaningful volume name |
 | `FileAttr` fields | — | `crtime` (creation time) and `flags` (BSD file flags) exist only in macFUSE's `FileAttr`; the core supplies the values in `FileAttributes`, and the policy owns the `FileAttr` constructor outright — `file_attr(&FileAttributes, ino)` is the crate's only `FileAttr` literal. |
 
@@ -355,7 +355,7 @@ too — no exception is needed, and none is possible: `FileAttr` has no
 converter outside this file could not construct the value on both hosts.
 The adapter never builds a `FileAttr`; it calls this constructor.
 `select_backend()` can use `cfg!`. `Session::mount` and
-`mount_with_unprivledged` both compile on Linux and macOS, meaning that
+`mount_with_unprivileged` both compile on Linux and macOS, meaning that
 LinuxFuse and MacFuse can both build in CI.
 
 The mount-table operations that move into the backend with `system/unmount.rs`
