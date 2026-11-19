@@ -1,0 +1,645 @@
+# Filesystem Backend Split
+
+**Technical Design Document**
+
+**Project**: XEarthLayer
+**Date**: November 2026
+**Version**: 1.0
+**Status**: Design Phase
+
+---
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Goals and Non-Goals](#goals-and-non-goals)
+3. [System Architecture](#system-architecture)
+4. [Acceptance](#acceptance)
+
+---
+
+## Overview
+
+### Purpose
+
+The filesystem backend split is an architectural reorganization of the (virtual)
+filesystem backend implementation to facilitate the implementation of multiple
+backends that are specific to various platforms (e.g., Linux, Windows, macOS).
+The current implementation has a single backend that supports Linux and macOS
+via fuse3.
+This "works" for now, but there still is no clean boundary between them to handle
+their minor differences.
+
+The planned addition of Windows support (via WinFSP) and other approaches such as
+FSKit for macOS will introduce far greater differences that would have to be handled
+with clumsy or `cfg`-driven modifications throughout the code base.
+A more modular backend architecture addresses this concern.
+
+### Key Observation
+
+This is largely a code reorganization with no user-visible changes.
+
+---
+
+## Goals and Non-Goals
+
+### Goals
+
+1. **No changes in overall functionality and behavior** - The app should still run as before.
+2. **All tests continue to pass** - Green CI required
+3. **Update developer/internal documentation** - The internals change substantially in this project.
+
+### Non-Goals
+
+1. **Implementation of new backends** - This project is viewed as a prerequisite before any new backend implementation.
+2. **Changes to existing Linux and macOS backends** - These operate as they did before with only the code changes needed to adapt to the new architecture.  That is, we keep one shared fuse3 translation and add only thin per-OS adapters and a FusePlatform policy.
+
+---
+
+## System Architecture
+
+### Module Structure
+
+#### Present Structure
+
+```
+xearthlayer/src/fuse
+|── fuse3/
+|  |── inode.rs
+|  |── mod.rs
+|  |── ortho_union_fs.rs
+|  |── shared.rs
+|  |── types.rs
+|── support/
+|  |── inode.rs
+|  |── mod.rs
+|  |── types.rs
+|── coalesce.rs
+|── filename.rs
+|── mod.rs
+|── placeholder.rs
+
+```
+
+#### Future Structure
+
+The module layout is shown for illustrative purposes, the implementation may be different.
+
+New items indicated by the addition of a comment.
+
+The new items marked with "(refactor)" are added solely as part of a feature-preserving refactoring.
+
+```
+xearthlayer/src/vfs
+|── fuse3/
+|  |── adapters.rs              # New adapters for LinuxFuse and MacFuse translations
+|  |── fuse_platform.rs         # Per-platform FUSE behavior/policy within fuse3 backend
+|  |── inode.rs
+|  |── mod.rs
+|  |── ortho_union_fs.rs
+|  |── shared.rs
+|  |── types.rs
+|  |── unmount.rs               # Backend mount-table operations (moved from system/)
+|── common/
+|  |── attrs.rs                 # Neutral file attribute types (refactor)
+|  |── conformance.rs           # Neutral one contract test suite
+|  |── core.rs                  # Neutral core of union filesystem (refactor)
+|  |── error.rs                 # Neutral error handling (refactor)
+|  |── mod.rs
+|  |── node.rs                  # Neutral filesystem-node identity (refactor)
+|  |── requestor.rs             # Neutral DDS-generation request pipeline (refactor)
+|  |── types.rs
+|  |── union.rs                 # Union filesystem trait
+|── backend.rs                  # MountBackend returns MountSession
+|── coalesce.rs
+|── filename.rs
+|── mod.rs
+|── placeholder.rs
+
+```
+
+### Core state and metrics
+
+The read-path state in `ortho_union_fs.rs` is backend neutral
+and moves to `common/core.rs` unchanged:
+
+- the `DdsHandle` memo (`dds_handles`)
+- the `PinnedTileBudget` (`pinned`)
+- the metrics client
+- the `PrefetchStateObserver`
+- the geo filter (`resolve_lazy_geo`)
+- the water-mask guard in `lookup` (#68): return `ENOENT` when the `.png`
+  exists so X-Plane falls back to it instead of a generated virtual DDS
+
+The core is the sole emitter of the metrics the dashboard reads. In
+particular, per-read latency (`MetricEvent::FuseRead`, from which the daemon
+derives the latency window) and `fuse_handle_budget_exhausted` are both
+emitted on the core's read/open path. The adapter emits no dashboard metrics;
+it performs only the platform translation (open flags, mount API; `FileAttr`
+is built by the policy). Keeping these two core-emitted is what guarantees they
+are reported identically on Linux and macOS: if they drifted into the adapter, the macOS
+page-cache path (reads served by the kernel, never reaching the handler) would
+silently drop them.
+
+Note that the per-read metric already under-reports on macOS by design (#204):
+the cold first read reaches the core, repeat reads are kernel-served. That is
+a known, accepted property, not a regression this move should change.
+
+### Components
+
+#### `fuse/` becomes `vfs/`
+
+This is a rename ("move-only") operation to better represent the underlying
+structure. "`fuse`" or "FUSE" is sometimes used to describe more generally a
+"Filesystem in Userspace" software interface. Because there are other solutions
+that are "FUSE-compatible" and not strictly "FUSE", such as WinFSP, it is better
+to describe these as a more generic virtual filesystem (vfs).
+
+`fuse3/` remains `fuse3/` under `vfs/` because it is a backend that explicitly
+uses "fuse 3" on Linux and macOS. Future backends will be added as siblings to
+`fuse3/`.
+
+This operation is an initial straightforward renaming. However, further
+refactoring is required to move code that is backend neutral to the common
+`common/` area. This is to avoid this code being duplicated by a copy-and-paste
+operation when starting a new backend.
+
+This refactoring became more complex than expected after driving the design to a
+more detailed level. Therefore, a prototype of this step was implemented to
+mitigate any unseen risks. The completed prototype returns a green cargo test
+and can be leveraged for the final implementation.
+
+### Neutral Conformance Suite
+
+The neutral conformance suite runs the core contract suite once, against
+`OrthoUnionCore`. The suite drives the `UnionFilesystem` operations, testing
+only the neutral types. There should not be any instances of backend-specific
+symbols (`fuse3::`) or references to inode, kernel flags, caching policy.
+This suite should not test adapter-specific translations.
+
+The adapter-specific tests need to be in a live mount test that reads through a
+real mount to exercise filesystem operations (lookup, attributes, virtual DDS read,
+directory listing).  These tests run for each backend.
+
+The `tests/macfuse_smoke.rs` test is turned into a live mount test parameterized
+by backend to allow it to run on Linux and macOS.
+
+For implementation on Linux, `fuse3` live mount tests can run on CI runners. The
+runners provide `/dev/fuse` in their `ubuntu-latest` kernels, and CI installs
+`fuse3` and not `libfuse3-dev`, allowing `mount_with_unprivileged` to work.
+
+For implementation on macOS, the live mount tests can run only on a user's
+machine (macFUSE is a kext; hosted runners cannot load it — run via `make
+verify-macos`).
+
+This means green CI exercises the `LinuxFuse` adapter; the `MacFuse` adapter is
+covered by `make verify-macos` and the regression flight, both run on a local
+machine.
+
+### MountBackend ("Live" Mounting)
+
+The manager builds the neutral OrthoUnionCore and mounts it via
+select_backend(), holding the live mount as Box<dyn MountSession> instead of a
+concrete SpawnedMountHandle.
+
+```text
+             UnionFilesystem (implemented by OrthoUnionCore)
+                               ▲
+                         MountBackend
+        ┌───────────────┬──────┴───────┬─────────────────┐
+    LinuxFuse        MacFuse         WinFsp            FsKit, <...>, <...>
+        └───────┬───────┘
+    shared fuse3 translation
+    + a small FusePlatform policy per OS
+```
+
+
+```rust
+/// A live mount of the union filesystem.
+///
+/// Callers do not need to know which backend produced the session; they only
+/// need the mount point, an unmount operation, and a liveness check.
+/// When a MountSession is dropped, the backend attempts the unmount best-effort;
+/// Drop cannot report, so the outcome goes to the logs.
+/// A successful unmount guarantees the mount is gone from the mount table.
+/// A backend whose mount API detaches asynchronously owns the confirmation and escalation —
+/// it may not report success when the kernel may still hold the mount.
+/// If the escalation fails, `unmount` returns `MountError::Unmount` and the
+/// mount may remain; callers log that and do not retry.
+pub trait MountSession: Send {
+    /// The directory the filesystem is mounted at.
+    fn mountpoint(&self) -> &Path;
+
+    /// Unmount the filesystem, consuming the session.
+    fn unmount(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), MountError>> + Send>>;
+
+    /// Whether the mount point currently reports a live mount.
+    fn is_mounted(&self) -> bool;
+}
+```
+Each backend should have a test to make sure the unmount occurs on a `MountSession` drop.
+
+```rust 
+/// The future returned by [`MountBackend::mount`]: resolves to a live mount
+/// session or a [`MountError`].
+pub type MountFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Box<dyn MountSession>, MountError>> + Send + 'a>>;
+
+/// Failure to establish or tear down a live mount.
+#[derive(Debug)]
+pub enum MountError {
+    /// The backend could not mount (e.g. `mount_with_unprivileged` failed).
+    Mount(std::io::Error),
+    /// The backend could not unmount.
+    Unmount(std::io::Error),
+}
+
+/// A platform backend that can mount the union filesystem.
+pub trait MountBackend: Send + Sync {
+    /// Mount `fs` according to `req`, returning a handle to the live mount.
+    /// `fs` must arrive fully wired: past `Arc<dyn UnionFilesystem>` nothing
+    /// can add to it — the builders consume and rebuild a concrete type the
+    /// backend cannot name — so there is no post-wrap configuration path,
+    /// by design.
+    fn mount(&self, fs: Arc<dyn UnionFilesystem>, req: MountRequest) -> MountFuture<'_>;
+    /// Whether a stale mount at `mountpoint` was recovered. Synchronous, needs
+    /// no runtime, and must not panic (see the panic-hook contract below).
+    fn recover_stale(&self, mountpoint: &Path) -> bool;
+    /// Force-detach the mount at `path`. Returns `true` if the mountpoint
+    /// ended up unmounted (including the benign already-unmounted case), matching
+    /// `unmount_fuse`. Synchronous, needs no runtime, and must not
+    /// panic.
+    fn force_unmount(&self, path: &Path, force: bool) -> bool;
+}
+```
+
+The crash path is the panic hook (`panic.rs`), not the `MountManager`. It
+calls `unmount_fuse(path, false)` and, if that fails, `unmount_fuse(path, true)`,
+logging which one worked. Under the split the hook gets a backend with its own
+`select_backend()` call (cheap enough) and calls `force_unmount` the same way:
+graceful first, then forced, reporting the `bool` outcome. `force_unmount`
+returns `bool` so the hook can still say which attempt succeeded.
+
+Both `recover_stale` and `force_unmount` are synchronous, need no runtime, and
+must not panic. A panic inside a panic hook aborts the process with the mount
+still up, so these two are the one place in the backend where that guarantee
+matters.
+```rust
+/// The mount backend for the OS this binary runs on.
+///
+/// This is the one place in the crate that names a concrete backend. Callers
+/// ask for a backend here and then work only with [`MountBackend`] and
+/// [`MountSession`].
+pub fn select_backend() -> Box<dyn MountBackend> {
+    if cfg!(target_os = "macos") {
+        Box::new(crate::vfs::fuse3::MacFuse)
+    } else {
+        Box::new(crate::vfs::fuse3::LinuxFuse)
+    }
+}
+```
+
+```rust
+pub struct MountRequest {
+    /// The directory the union filesystem is mounted at.
+    pub mountpoint: PathBuf,
+    /// Kernel background-request limits (fuse3 `max_background` /
+    /// `congestion_threshold`); backends that have no equivalent ignore them.
+    pub fuse_limits: FuseLimits,
+}
+
+/// FUSE kernel limits, from the `[fuse]` config section.
+pub struct FuseLimits {
+    pub max_background: u16,
+    pub congestion_threshold: u16,
+}
+```
+    
+
+The mount manager then mounts with something like this:
+
+```rust
+use std::sync::Arc;
+use crate::vfs::{select_backend, UnionFilesystem, MountRequest, MountSession};
+...
+        let backend = select_backend();
+        let fs: Arc<dyn UnionFilesystem> = Arc::new(core);
+
+        let mount_result = runtime_handle.block_on(backend.mount(fs, request));
+
+```
+
+`core` is finished work: every wiring — geo index, state observer, lit
+source, pinned-tile budget, metrics, timeout — is applied to the typed
+`OrthoUnionCore` before `Arc::new(core)`. Mount-time statements about that
+configuration (the pinned-budget capacity log, #236) are emitted at this
+wiring site too, while the typed core still exists; the mount call cannot
+log what the type makes unreachable.
+
+This keeps the `cfg` that decides the mount backend in one place.
+Backend specific parameters (fuse3's max_background and congestion_threshold)
+travel in `MountRequest::fuse_limits`; the fuse3 backend reads them and any
+backend without an equivalent ignores them.
+
+### FusePlatform Policy
+
+`fuse_platform.rs` holds the per-platform FUSE behavior and policy,
+consolidating the `cfg(target_os)` sites that are scattered inside `fuse/`. Its complete contents
+are the four decisions below; the shared fuse3 translation in `adapters.rs`
+stays platform-neutral.
+
+| Policy decision | Linux | macOS |
+|---|---|---|
+| Open flags reported for virtual DDS files | `FOPEN_DIRECT_IO` — every `read()` reaches the handler, so the FUSE read counters are exact and the page cache never holds a second copy of a tile | `0` — X-Plane `mmap`s texture files and macFUSE faults with `EXC_BAD_ACCESS` when a `direct_io` file is mapped, so virtual DDS is served through the page cache and the read counters under-report (#204) |
+| Mount API call | `Session::mount_with_unprivileged` — routes the mount through the setuid `fusermount3` helper; `mount(2)` itself is privileged (the method needs the `unprivileged` crate feature) | `Session::mount` — macFUSE's own `mount_macfuse` helper is setuid, so the plain call is already unprivileged |
+| `volname` mount option | not set | set, so Finder shows a meaningful volume name |
+| `FileAttr` fields | — | `crtime` (creation time) and `flags` (BSD file flags) exist only in macFUSE's `FileAttr`; the core supplies the values in `FileAttributes`, and the policy owns the `FileAttr` constructor outright — `file_attr(&FileAttributes, ino)` is the crate's only `FileAttr` literal. |
+
+Because the contract's `open` returns a bare `u64` file handle, the open flags
+are the adapter's decision, keyed on the `FsNode` variant: a `VirtualDds` node
+gets the platform's virtual-DDS flags from the policy, and `RealFile` and
+`Directory` nodes get none.
+
+`fuse_platform.rs` keeps its `#cfg(target_os)` — it is the one place in the
+crate that names a concrete backend.  The `FileAttr` constructor lives here
+too — no exception is needed, and none is possible: `FileAttr` has no
+`Default` and its platform fields are themselves `#[cfg]`-gated, so a
+converter outside this file could not construct the value on both hosts.
+The adapter never builds a `FileAttr`; it calls this constructor.
+`select_backend()` can use `cfg!`. `Session::mount` and
+`mount_with_unprivileged` both compile on Linux and macOS, meaning that
+LinuxFuse and MacFuse can both build in CI.
+
+The mount-table operations that move into the backend with `system/unmount.rs`
+(`fusermount3 -uz` vs `umount -f`, `/proc/mounts` vs `mount(8)`) keep their
+`#[cfg(target_os)]` as written: those arms are the module's platform substance,
+and rewriting them would change tested teardown behavior, not platform-ness.
+They too are transitional — every one of their cfgs names a fact that belongs to
+exactly one future backend.
+
+### Union Filesystem
+
+The backend-neutral contract shared by every mount backend. The asynchronous
+operations are object-safety-boxed (`Pin<Box<dyn Future + Send + '_>>`, done by
+hand, with no `async-trait` dependency) so the trait can be used as
+`Arc<dyn UnionFilesystem>`; the synchronous ones (`open`, `release`, `statfs`)
+stay plain.
+
+The shared `'a` on the async operations is load-bearing, not stylistic: the
+returned future borrows `node` (and `lookup`'s `name`), so the lifetimes must
+stay named and identical — eliding them to `'_` leaves the future with no
+bound that covers the borrowed arguments. The fix for that compile error is
+never `async-trait` or an owned `node`; the signature is the contract.
+Implementations may spell the boxed return `BoxFuture<'a, T>`, the alias
+`common/union.rs` exports.
+
+Every operation here reads; the union is read-only by design. That
+omission holds because each backend must establish its mount read-only —
+the fuse3 backend passes the kernel's `read_only` mount option, so writes
+are refused in-kernel and never dispatched — and a backend that cannot
+enforce read-only at mount establishment must refuse writes itself.
+Reopening this omission (a write-through story of any kind) changes the
+contract's core shape, not just its surface.
+
+```rust
+/// A node *and* its attributes, as one answer.  A kernel's lookup reply
+/// carries an attribute template, so attributes are needed at lookup time
+/// anyway; a bare-node lookup would force every backend to resolve and
+/// stat a second time to answer its kernel.  In the core, the single
+/// stat answers both halves: its metadata fills `attrs` and decides
+/// which `FsNode` variant to return.  Listed children (`DirEntry`)
+/// reuse `Entry` for the same reason: they are handed straight to a
+/// readdirplus reply.
+pub struct Entry {
+    pub node: FsNode,
+    pub attrs: FileAttributes,
+}
+
+pub trait UnionFilesystem: Send + Sync {
+    /// Resolve `name` inside `node` to a child and its attributes.
+    /// Resolution is ordered: (1) a union-index hit — real file or
+    /// directory — stat'ed once for its attributes (that stat also
+    /// decides which variant the node takes); (2) a directory of the
+    /// union view, answered with template attributes; (3) lazy
+    /// resolution under the lazily-scanned directories (`terrain/`,
+    /// `textures/`), which consults the sources' filesystems on demand
+    /// instead of an index; (4) a generatable `.dds` name, subject to
+    /// the water-mask guard's deliberate NotFound (see the core's
+    /// geo/water-mask filtering).
+    ///
+    /// Step (3) has a reachability consequence worth stating: a
+    /// lazily-scanned parent is itself resolved by steps (1)–(2), so
+    /// `terrain/` and `textures/` must exist on some source's
+    /// filesystem for their children to be reachable at all. Shipped
+    /// worlds always satisfy this; unit and conformance tests name
+    /// nodes directly and cannot observe the requirement — only a live
+    /// mount walks root → textures → child.
+    fn lookup<'a>(
+        &'a self,
+        node: &'a FsNode,
+        name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Entry, FsError>> + Send + 'a>>;
+
+    /// Attributes of `node`.  The attributes one operation answers for a
+    /// node must agree with what another answers later: `lookup`'s
+    /// `Entry.attrs` against a subsequent `attrs(node)`, field-for-field
+    /// for source-backed nodes.  Virtual textures have no source to date
+    /// them — they stamp fresh timestamps per construction — so their
+    /// agreement is on kind, size, permissions, and link count.
+    ///
+    /// For a source-backed node, `attrs` *is* the resolve-and-stat: union
+    /// index first, lazy source fallback second, then the stat — and a
+    /// failed stat answers `NotFound`, since a source that vanished
+    /// mid-flight reads as "nothing here", not as an I/O failure.  A
+    /// backend needing attributes for any reply — getattr, a readdirplus
+    /// upgrade — awaits `attrs(&node)` once and never resolves or stats
+    /// on its own side.
+    fn attrs<'a>(
+        &'a self,
+        node: &'a FsNode,
+    ) -> Pin<Box<dyn Future<Output = Result<FileAttributes, FsError>> + Send + 'a>>;
+
+    fn read<'a>(
+        &'a self,
+        node: &'a FsNode,
+        fh: u64,
+        offset: u64,
+        size: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Bytes, FsError>> + Send + 'a>>;
+
+    /// Lists the directory's real children only.  The '.' and '..' entries are
+    /// the backend's job: each names a kernel identity (the directory itself,
+    /// its parent) that the core does not hold.
+    fn list_directory<'a>(
+        &'a self,
+        node: &'a FsNode,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DirEntry>, FsError>> + Send + 'a>>;
+
+    /// open returns a file handle, or 0 when no handle is allocated. 0 is a
+    /// valid return for three cases: real files and directories (no handle
+    /// state), lit textures (served by range, pin nothing), and the exhausted
+    /// pinned-tile budget. A 0 handle means read resolves the tile per call —
+    /// and resolution needs only the node's coordinates, never a handle: a
+    /// read naming a handle the filesystem never issued still serves.
+    fn open(&self, node: &FsNode) -> Result<u64, FsError>;
+    /// release(0) is a no-op: there is no handle to drop. A backend must not
+    /// treat 0 as a real handle or error on release(0).
+    fn release(&self, fh: u64) -> Result<(), FsError>;
+    fn statfs(&self) -> StatFsInfo;
+}
+```
+An unknown *inode* never reaches this surface: backends that carry inode
+tables answer ENOENT for inodes they cannot map, before the filesystem is
+consulted. That is a backend duty, not a contract case.
+
+Conformance suite should cover the three 0-handle cases, that a read against
+a handle the filesystem never issued still serves the tile, and that
+`release(0)` is a no-op.
+
+Types and errno mapping.
+```rust
+pub enum FsNode {
+    Directory(PathBuf),      // root = empty path
+    RealFile(PathBuf),       // a source file, addressed by its virtual path
+    VirtualDds(DdsFilename), // generated texture: ortho or night-lit (kind)
+}
+
+pub enum FsError {
+    /// The requested node does not exist in the union view.
+    #[error("not found")]
+    NotFound,
+
+    /// The requested node is not a directory (e.g. a directory listing was
+    /// asked for a file).  A neutral invariant, held by the conformance
+    /// suite's direct calls.  Whether a kernel path ever reaches it is a
+    /// backend fact: one that reconstructs path identities as directories
+    /// and lets resolution answer ENOENT may never trigger it from its
+    /// kernel; kinds-carrying backends will.
+    #[error("not a directory")]
+    NotADirectory,
+
+    /// An I/O failure while reading a real file from its source.
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+}
+
+/// File attributes in the neutral form shared by all backends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileAttributes {
+    /// File size in bytes.
+    pub size: u64,
+    /// Number of 512-byte blocks allocated (POSIX convention).
+    pub blocks: u64,
+    /// Last access time.
+    pub atime: SystemTime,
+    /// Last modification time.
+    pub mtime: SystemTime,
+    /// Last metadata or status change time.
+    pub ctime: SystemTime,
+    /// Creation time.
+    pub crtime: SystemTime,
+    /// Node kind.
+    pub kind: NodeKind,
+    /// Permission bits (e.g. `0o444`).
+    pub perm: u16,
+    /// Link count.
+    pub nlink: u32,
+    /// Owner user id — for virtual nodes the serving process (`getuid()`
+    /// on unix; 0 elsewhere, where a non-unix backend supplies the
+    /// launching user's identity in its own reply translation); for real
+    /// files, from the source's metadata.
+    pub uid: u32,
+    /// Owner group id, same sources as `uid`.
+    pub gid: u32,
+    /// Device number (0 for non-device files).
+    pub rdev: u32,
+    /// Filesystem block size.
+    pub blksize: u32,
+}
+
+pub struct DirEntry {
+    pub name: OsString,
+    /// Node plus attributes for the child.  For virtual children these
+    /// attrs are authoritative — the templates those nodes always answer
+    /// with.  For source-backed children they are provisional: listing
+    /// resolves the union index, not the filesystem.  A backend that
+    /// publishes attributes in its directory replies must upgrade each
+    /// source-backed child with `attrs(&node)` — as fuse3's readdirplus
+    /// does; name-and-kind-only replies may use the node as-is.
+    pub entry: Entry,
+}
+
+/// Volume statistics in neutral form (FUSE `statfs` / WinFSP `GetVolumeInfo`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatFsInfo {
+    /// Total data blocks.
+    pub blocks: u64,
+    /// Free blocks.
+    pub bfree: u64,
+    /// Free blocks available to unprivileged users.
+    pub bavail: u64,
+    /// Total inodes.
+    pub files: u64,
+    /// Free inodes.
+    pub ffree: u64,
+    /// Block size.
+    pub bsize: u32,
+    /// Maximum filename length.
+    pub namelen: u32,
+    /// Fundamental block size.
+    pub frsize: u32,
+}
+
+/// Map the core's neutral error onto FUSE's.
+/// errno_from belongs in the fuse3 adapter since common code cannot
+/// reference Errno or libc.
+fn errno_from(err: FsError) -> Errno {
+    match err {
+        FsError::NotFound => Errno::from(libc::ENOENT),
+        FsError::NotADirectory => Errno::from(libc::ENOTDIR),
+        FsError::Io(e) => Errno::from(e.raw_os_error().unwrap_or(libc::EIO)),
+    }
+}
+
+```
+
+---
+
+## Acceptance
+
+Since there is no new functionality, all existing checks are required and expected to pass.
+Green CI all the way.
+
+In addition:
+- passing `make verify-macos` run
+- regression flying on macOS and Linux before merge
+- structural checks
+  - `manager/mounts.rs` contains no `cfg` and names no backend
+  - `common` module contains no `fuse3::`, inode or kernel-flag symbols
+  - no `cfg(target_os)` remains in `vfs/` outside `fuse_platform.rs`
+    - exception, transitional: `fuse3/unmount.rs` keeps the cfgs it was born with
+      when it moves in from `system/` — its platform-shaped mount-table operations
+      are the module's substance, and rewriting them would change tested behavior.
+      The Linux/macOS backend split (below) folds each cfg into the single backend
+      it names; when that lands, delete this bullet.
+  - no `crate::vfs::fuse3::` import outside `vfs/`
+  - `system/unmount.rs` moves into the fuse3 backend, so `panic.rs` and `mounts.rs` reach it only through `MountBackend`
+  - Expect `night/*` and `runtime/request.rs` to churn on the rename: they import `DdsFilename`, `TextureKind` and `DdsResponse` from crate::fuse.
+
+The design should be further validated by the addition of any new backends,
+which are expected to follow shortly after this lands.
+Actually adding a new backend is a true test.
+
+The first follow-up should be the macOS backend split: lift the MacFuse
+backend out of the shared `fuse3/` module into a backend of its own, leaving
+`fuse3/` Linux-only. It adds no behavior — the
+per-OS facts relocate (mount call, `volname`, open flags, `FileAttr` fields,
+mount-table operations) and the transitional `cfg(target_os)` sites are deleted
+rather than duplicated. It is the smallest true second-backend test — one backend
+becoming two, on hardware the project already owns — so it validates the seam's
+structure before WinFSP tests it against a foreign kernel. It should ship as its
+own change with its own `make verify-macos` and regression flights: the split's
+"no new backends, no behavior change" non-goal is what makes the split reviewable,
+and this follow-up earns its keep by carrying a change of its own.
+
+Landing this at the start of a new development branch will also provide a lot of exercise.
