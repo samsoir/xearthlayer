@@ -778,8 +778,8 @@ Update the comparison links at the bottom of CHANGELOG.md:
 - [ ] Release branch created and PR opened
 - [ ] CI passes on PR
 - [ ] **macOS verification (required for stable promotion).** CI compiles the macFUSE
-      smoke tests but cannot run them — macFUSE is a kext and hosted runners cannot
-      load it. A maintainer with Apple Silicon hardware must run `make verify-macos`
+      smoke tests but cannot run them: hosted runners cannot approve macFUSE's FSKit
+      extension. A maintainer with Apple Silicon hardware must run `make verify-macos`
       and post the output on the release PR. See
       [CI/CD Pipeline](cicd.md#what-ci-cannot-verify) for why this gap exists.
 - [ ] Tag created and pushed (BEFORE merging PR)

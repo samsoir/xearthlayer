@@ -297,7 +297,9 @@ Two ways round it:
   session starts.
 
 This matters for releases: `make verify-macos` runs the live macFUSE smoke
-tests, so it cannot be completed over SSH without the above.
+tests, so it cannot be completed over SSH without the above. It runs the
+FSKit smoke tests only, one at a time, and never loads the kernel extension:
+turn on macFUSE (local) under File System Extensions first.
 
 ## Troubleshooting
 

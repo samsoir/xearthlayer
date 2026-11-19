@@ -40,8 +40,9 @@ jobs:
   #
   # No dependency-install step is needed. The pinned fuse3 fork is pure Rust
   # (no build.rs / pkg-config / cc) and xearthlayer/build.rs already emits
-  # -lc++ for macOS. macFUSE is a runtime dependency only, and cannot be loaded
-  # on hosted runners in any case (it is a kext).
+  # -lc++ for macOS. macFUSE is a runtime dependency only, and cannot mount
+  # on hosted runners in any case (its FSKit extension needs a user's approval
+  # in System Settings, its kext a reboot to Recovery).
   verify-macos:
     name: Verify (macOS)
     runs-on: macos-15

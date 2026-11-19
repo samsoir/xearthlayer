@@ -548,7 +548,8 @@ cargo test          # Direct cargo test
 ```
 
 On macOS, `make verify-macos` additionally runs the live macFUSE smoke tests that CI
-cannot execute (macFUSE is a kext; hosted runners cannot load it).
+cannot execute (hosted runners cannot approve macFUSE's FSKit extension). It runs the FSKit
+variants only and never loads the kext.
 
 ### Building
 
