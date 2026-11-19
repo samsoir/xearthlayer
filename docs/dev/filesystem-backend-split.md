@@ -393,6 +393,14 @@ Implementations may spell the boxed return `BoxFuture<'a, T>`, the alias
 `common/union.rs` exports.
 
 ```rust
+/// A node *and* its attributes, as one answer.  A kernel's lookup reply
+/// carries an attribute template, so attributes are needed at lookup time
+/// anyway; a bare-node lookup would force every backend to resolve and
+/// stat a second time to answer its kernel.  In the core, the single
+/// stat answers both halves: its metadata fills `attrs` and decides
+/// which `FsNode` variant to return.  Listed children (`DirEntry`)
+/// reuse `Entry` for the same reason: they are handed straight to a
+/// readdirplus reply.
 pub struct Entry {
     pub node: FsNode,
     pub attrs: FileAttributes,
