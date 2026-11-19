@@ -384,6 +384,14 @@ hand, with no `async-trait` dependency) so the trait can be used as
 `Arc<dyn UnionFilesystem>`; the synchronous ones (`open`, `release`, `statfs`)
 stay plain.
 
+The shared `'a` on the async operations is load-bearing, not stylistic: the
+returned future borrows `node` (and `lookup`'s `name`), so the lifetimes must
+stay named and identical — eliding them to `'_` leaves the future with no
+bound that covers the borrowed arguments. The fix for that compile error is
+never `async-trait` or an owned `node`; the signature is the contract.
+Implementations may spell the boxed return `BoxFuture<'a, T>`, the alias
+`common/union.rs` exports.
+
 ```rust
 pub struct Entry {
     pub node: FsNode,
