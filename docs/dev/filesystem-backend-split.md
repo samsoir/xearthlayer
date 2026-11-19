@@ -408,10 +408,11 @@ pub trait UnionFilesystem: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<DirEntry>, FsError>> + Send + 'a>>;
 
     /// open returns a file handle, or 0 when no handle is allocated. 0 is a
-    /// valid return for four cases: real files (no handle state), lit
-    /// textures (served by range, pin nothing), unknown virtual inodes (the
-    /// gap surfaces as ENOENT in read, not a failed open), and the exhausted
-    /// pinned-tile budget. A 0 handle means read resolves the tile per call.
+    /// valid return for three cases: real files and directories (no handle
+    /// state), lit textures (served by range, pin nothing), and the exhausted
+    /// pinned-tile budget. A 0 handle means read resolves the tile per call —
+    /// and resolution needs only the node's coordinates, never a handle: a
+    /// read naming a handle the filesystem never issued still serves.
     fn open(&self, node: &FsNode) -> Result<u64, FsError>;
     /// release(0) is a no-op: there is no handle to drop. A backend must not
     /// treat 0 as a real handle or error on release(0).
@@ -419,8 +420,13 @@ pub trait UnionFilesystem: Send + Sync {
     fn statfs(&self) -> StatFsInfo;
 }
 ```
-Conformance suite should cover all four 0-handle cases and that `release(0)`
-is a no-op.
+An unknown *inode* never reaches this surface: backends that carry inode
+tables answer ENOENT for inodes they cannot map, before the filesystem is
+consulted. That is a backend duty, not a contract case.
+
+Conformance suite should cover the three 0-handle cases, that a read against
+a handle the filesystem never issued still serves the tile, and that
+`release(0)` is a no-op.
 
 Types and errno mapping.
 ```rust
