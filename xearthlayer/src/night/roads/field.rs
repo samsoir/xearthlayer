@@ -321,7 +321,11 @@ fn lamp_positions(pts: &[(f64, f64)], key: i64, l: &LampParams, mut f: impl FnMu
     let (mut along, mut next, mut k) = (0.0f64, 0.0f64, 0i64);
     for w in pts.windows(2) {
         let ((x0, y0), (x1, y1)) = (w[0], w[1]);
-        let len = (x1 - x0).hypot(y1 - y0) * cos_lat_of(y0);
+        // Not `hypot`: linked against glibc 2.35 it needs `hypot@GLIBC_2.35`,
+        // above the release's glibc floor (clippy.toml). Mercator metres are
+        // far from overflowing when squared.
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let len = (dx * dx + dy * dy).sqrt() * cos_lat_of(y0);
         while next <= along + len {
             if unit(hash2(key, k, LAMP_SEED)) < lit_share {
                 let t = if len > 0.0 { (next - along) / len } else { 0.0 };

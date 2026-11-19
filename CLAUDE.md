@@ -569,6 +569,11 @@ make release        # Release build (runs verify first)
 make pre-commit     # Format + lint + test (REQUIRED before push)
 ```
 
+**Before tagging a release**, also run `make glibc-floor`: it builds the Linux
+release in `release.yml`'s `ubuntu:22.04` container and applies its glibc floor
+check (2.34), which no PR check runs. `clippy.toml` disallows `f64::hypot` and
+`f32::hypot`, which link `hypot@GLIBC_2.35` there (0.5.1-beta.1's first tag).
+
 This ensures:
 - Code is formatted with `cargo fmt`
 - Clippy linting passes with no warnings
