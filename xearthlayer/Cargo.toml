@@ -25,9 +25,10 @@ time = { version = "0.3", features = ["formatting", "local-offset"] }
 tracing-appender = "0.2"
 # FUSE library - fuse3 is the active implementation (async multi-threaded)
 # Temporary fork: samsoir/fuse3 `master` = upstream master (0.10.0, which carries
-# our configurable max_background/congestion_threshold) plus three macOS fixes:
-# reply resilience (upstream PR #137), comma-joined mount options, and reply drops
-# logged at debug. Required for 0.5.x (macOS support) until these ship on crates.io;
+# our configurable max_background/congestion_threshold) plus macOS changes:
+# reply resilience (upstream PR #137), comma-joined mount options, reply drops
+# logged at debug, the MFMount (FSKit) channel transport, and the retry of an
+# interrupted FSKit receive (samsoir/fuse3#4). Required for 0.5.x (macOS support) until these ship on crates.io;
 # revert to the published fuse3 release then. See #155.
 # Never rewrite that branch's history: released Cargo.lock files pin its commits.
 fuse3 = { git = "https://github.com/samsoir/fuse3", branch = "master", features = ["tokio-runtime", "unprivileged"] }
