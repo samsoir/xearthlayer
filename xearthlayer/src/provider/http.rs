@@ -269,30 +269,26 @@ impl AsyncReqwestClient {
     /// - TCP keepalive to maintain warm connections
     /// - TCP nodelay for reduced latency
     pub fn new() -> Result<Self, ProviderError> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
-            .user_agent(DEFAULT_USER_AGENT)
-            // Connection pooling - keep many connections alive for parallel requests
-            .pool_max_idle_per_host(DEFAULT_POOL_MAX_IDLE_PER_HOST)
-            .pool_idle_timeout(Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS))
-            // TCP optimizations
-            .tcp_keepalive(Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS))
-            .tcp_nodelay(true)
-            .build()
-            .map_err(|e| {
-                ProviderError::HttpError(format!("Failed to create async HTTP client: {}", e))
-            })?;
+        Self::at_network_level(crate::config::NetworkLevel::Max)
+    }
 
-        Ok(Self { client })
+    /// Creates a client whose idle pool is `network.connections` of the
+    /// default (#367): fewer connections kept open per imagery host.
+    pub fn at_network_level(level: crate::config::NetworkLevel) -> Result<Self, ProviderError> {
+        Self::build(DEFAULT_HTTP_TIMEOUT_SECS, pool_max_idle_per_host(level))
     }
 
     /// Creates a new AsyncReqwestClient with custom timeout.
     pub fn with_timeout(timeout_secs: u64) -> Result<Self, ProviderError> {
+        Self::build(timeout_secs, DEFAULT_POOL_MAX_IDLE_PER_HOST)
+    }
+
+    fn build(timeout_secs: u64, pool_max_idle: usize) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .user_agent(DEFAULT_USER_AGENT)
             // Connection pooling - keep many connections alive for parallel requests
-            .pool_max_idle_per_host(DEFAULT_POOL_MAX_IDLE_PER_HOST)
+            .pool_max_idle_per_host(pool_max_idle)
             .pool_idle_timeout(Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS))
             // TCP optimizations
             .tcp_keepalive(Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS))
@@ -304,6 +300,11 @@ impl AsyncReqwestClient {
 
         Ok(Self { client })
     }
+}
+
+/// Idle connections kept per imagery host at a `network.connections` level.
+pub fn pool_max_idle_per_host(level: crate::config::NetworkLevel) -> usize {
+    level.scale(DEFAULT_POOL_MAX_IDLE_PER_HOST)
 }
 
 impl Default for AsyncReqwestClient {
@@ -458,6 +459,20 @@ impl AsyncHttpClient for AsyncReqwestClient {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    #[test]
+    fn the_idle_pool_follows_the_network_level() {
+        use crate::config::NetworkLevel;
+        assert_eq!(
+            pool_max_idle_per_host(NetworkLevel::Max),
+            DEFAULT_POOL_MAX_IDLE_PER_HOST
+        );
+        assert_eq!(pool_max_idle_per_host(NetworkLevel::High), 683);
+        assert_eq!(pool_max_idle_per_host(NetworkLevel::Low), 342);
+        for level in NetworkLevel::ALL {
+            assert!(AsyncReqwestClient::at_network_level(level).is_ok());
+        }
+    }
 
     /// Mock HTTP client for testing (synchronous)
     #[derive(Clone)]

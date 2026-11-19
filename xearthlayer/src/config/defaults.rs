@@ -316,6 +316,9 @@ impl Default for ConfigFile {
             tui: TuiSettings {
                 symbols: DEFAULT_TUI_SYMBOLS.to_string(),
             },
+            network: NetworkSettings {
+                connections: super::network::NetworkLevel::default(),
+            },
         }
     }
 }

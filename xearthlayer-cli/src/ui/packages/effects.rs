@@ -111,7 +111,7 @@ impl Settings {
             disable_overlays: config.packages.disable_overlays,
             xworld_pro: config.packages.xworld_pro,
             temp_dir: default_temp_dir(config),
-            concurrent_downloads: config.packages.concurrent_downloads,
+            concurrent_downloads: config.package_downloads(),
         }
     }
 }
@@ -2080,6 +2080,18 @@ mod tests {
             Some(Msg::SettingSaved { key, result }) => (key, result),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn queue_downloads_follow_the_network_level() {
+        // #367: the queue downloads packages.concurrent_downloads parts at the
+        // network.connections level; the setting itself keeps its value.
+        let mut config = ConfigFile::default();
+        config.packages.concurrent_downloads = 5;
+        assert_eq!(Settings::from_config(&config).concurrent_downloads, 4);
+        config.network.connections = xearthlayer::config::NetworkLevel::Low;
+        assert_eq!(Settings::from_config(&config).concurrent_downloads, 2);
+        assert_eq!(config.packages.concurrent_downloads, 5);
     }
 
     #[test]

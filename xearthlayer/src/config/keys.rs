@@ -119,6 +119,9 @@ pub enum ConfigKey {
 
     // Terminal dashboard settings
     TuiSymbols,
+
+    // Network settings
+    NetworkConnections,
 }
 
 impl FromStr for ConfigKey {
@@ -189,6 +192,7 @@ impl FromStr for ConfigKey {
             "fuse.congestion_threshold" => Ok(ConfigKey::FuseCongestionThreshold),
             "night.enabled" => Ok(ConfigKey::NightEnabled),
             "tui.symbols" => Ok(ConfigKey::TuiSymbols),
+            "network.connections" => Ok(ConfigKey::NetworkConnections),
             "night.brightness" => Ok(ConfigKey::NightBrightness),
 
             _ => Err(ConfigKeyError::UnknownKey(s.to_string())),
@@ -254,6 +258,7 @@ impl ConfigKey {
             ConfigKey::FuseCongestionThreshold => "fuse.congestion_threshold",
             ConfigKey::NightEnabled => "night.enabled",
             ConfigKey::TuiSymbols => "tui.symbols",
+            ConfigKey::NetworkConnections => "network.connections",
             ConfigKey::NightBrightness => "night.brightness",
         }
     }
@@ -386,6 +391,7 @@ impl ConfigKey {
             ConfigKey::FuseCongestionThreshold => config.fuse.congestion_threshold.to_string(),
             ConfigKey::NightEnabled => config.night.enabled.to_string(),
             ConfigKey::TuiSymbols => config.tui.symbols.clone(),
+            ConfigKey::NetworkConnections => config.network.connections.to_string(),
             ConfigKey::NightBrightness => config.night.brightness.to_string(),
         }
     }
@@ -572,6 +578,11 @@ impl ConfigKey {
             ConfigKey::TuiSymbols => {
                 config.tui.symbols = value.to_lowercase();
             }
+
+            // Network settings
+            ConfigKey::NetworkConnections => {
+                config.network.connections = value.parse().unwrap();
+            }
         }
     }
 
@@ -648,6 +659,9 @@ impl ConfigKey {
             ConfigKey::NightEnabled => Box::new(BooleanSpec),
             ConfigKey::NightBrightness => Box::new(FloatRangeSpec::new(0.5, 1.5)),
             ConfigKey::TuiSymbols => Box::new(OneOfSpec::new(super::defaults::TUI_SYMBOLS_VALUES)),
+            ConfigKey::NetworkConnections => {
+                Box::new(OneOfSpec::new(super::network::NETWORK_CONNECTIONS_VALUES))
+            }
         }
     }
 
@@ -712,6 +726,8 @@ impl ConfigKey {
             ConfigKey::NightBrightness,
             // Terminal dashboard settings
             ConfigKey::TuiSymbols,
+            // Network settings
+            ConfigKey::NetworkConnections,
         ]
     }
 }
@@ -1481,6 +1497,36 @@ mod tests {
         assert!(ConfigKey::TuiSymbols.set(&mut config, "ascii").is_err());
         assert_eq!(
             config.tui.symbols, "plain",
+            "a rejected value changes nothing"
+        );
+    }
+
+    #[test]
+    fn network_connections_parses_enumerates_and_validates() {
+        use crate::config::NetworkLevel;
+        assert_eq!(
+            "network.connections".parse::<ConfigKey>().unwrap(),
+            ConfigKey::NetworkConnections
+        );
+        assert!(ConfigKey::all().contains(&ConfigKey::NetworkConnections));
+        let mut config = ConfigFile::default();
+        assert_eq!(ConfigKey::NetworkConnections.get(&config), "high");
+        for value in ["max", "low", "high"] {
+            ConfigKey::NetworkConnections
+                .set(&mut config, value)
+                .unwrap();
+            assert_eq!(ConfigKey::NetworkConnections.get(&config), value);
+        }
+        ConfigKey::NetworkConnections
+            .set(&mut config, "LOW")
+            .unwrap();
+        assert_eq!(config.network.connections, NetworkLevel::Low);
+        assert!(ConfigKey::NetworkConnections
+            .set(&mut config, "medium")
+            .is_err());
+        assert_eq!(
+            config.network.connections,
+            NetworkLevel::Low,
             "a rejected value changes nothing"
         );
     }

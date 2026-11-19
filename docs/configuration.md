@@ -12,13 +12,15 @@ The easiest way to configure XEarthLayer is with the interactive setup wizard:
 xearthlayer setup
 ```
 
-The wizard auto-detects your X-Plane installation, system hardware (CPU, memory, storage type), free disk space, and GPU adapters, then recommends optimal settings. The wizard runs five steps:
+The wizard auto-detects your X-Plane installation, system hardware (CPU, memory, storage type), free disk space, and GPU adapters, then recommends optimal settings. The wizard runs seven steps:
 
 1. **X-Plane Custom Scenery**: auto-detected from your X-Plane install, with fallback to manual entry.
 2. **Package Location**: where regional scenery packages live on disk.
 3. **Imagery Provider**: which satellite imagery to stream. Options that need no account are offered first, and the currently configured provider is preselected so re-running setup does not move a working installation. A key or token is requested only for Google Maps and Mapbox, entered without echoing to the terminal, and pressing Enter keeps a credential that is already configured.
-4. **Cache Configuration**: cache directory, disk cache size (defaults to 25% of free space, floored to 10 GB), DDS-to-chunk disk ratio, and memory cache size (defaults to RAM divided by 12, rounded to the nearest whole GB, clamped between 500 MB and a quarter of RAM).
-5. **DDS Encoding**: picks ISPC (CPU) by default, or offers to offload encoding to a secondary GPU when **two or more GPU adapters** are detected. The wizard warns against picking the GPU X-Plane renders on. Single-GPU systems skip the choice and stay on ISPC.
+4. **Network Connections**: how many connections XEarthLayer opens at once (`network.connections`). High, the default, is optimized for capable home routers (TP-Link, Netgear, Asus, Eero, Google, Wyze and the like); Max needs prosumer or enterprise hardware (Ubiquiti, Cisco, Juniper, QNAP and the like) and the wizard warns when it is chosen; Low is for older or low spec home routers with limited bandwidth. The configured level is preselected.
+5. **Cache Configuration**: cache directory, disk cache size (defaults to 25% of free space, floored to 10 GB), DDS-to-chunk disk ratio, and memory cache size (defaults to RAM divided by 12, rounded to the nearest whole GB, clamped between 500 MB and a quarter of RAM).
+6. **DDS Encoding**: picks ISPC (CPU) by default, or offers to offload encoding to a secondary GPU when **two or more GPU adapters** are detected. The wizard warns against picking the GPU X-Plane renders on. Single-GPU systems skip the choice and stay on ISPC.
+7. **Third-party Scenery**: when SimHeaven X-World Pro is detected, whether to give it priority over XEarthLayer's overlays (`packages.xworld_pro`, see [X-World Pro](x-world-pro.md)).
 
 GPU enumeration can take 10–30 seconds on multi-adapter systems while drivers are probed; a spinner shows progress.
 
@@ -412,7 +414,7 @@ Controls package manager behavior.
 | `disable_overlays` | bool | `false` | Suppress XEL overlays at runtime (see notes below) |
 | `xworld_pro` | bool | `false` | Give SimHeaven X-World Pro priority over XEarthLayer overlays (see [X-World Pro](x-world-pro.md)) |
 | `temp_dir` | path | `~/.cache/xearthlayer/tmp` | Temporary directory for downloaded package parts |
-| `concurrent_downloads` | Integer | `5` | Number of concurrent part downloads (1-10) |
+| `concurrent_downloads` | Integer | `5` | Number of concurrent part downloads (1-10), scaled by [`network.connections`](#network) |
 
 **Example:**
 ```ini
@@ -520,6 +522,37 @@ The Status pane leads each feature line with an emoji: 🌐 for the tile process
 symbols = auto
 ```
 
+### [network]
+
+Controls how hard XEarthLayer pushes your local network.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `connections` | high | How many network connections to open: `max`, `high` or `low` |
+
+XEarthLayer downloads each scenery tile as 256 image chunks in parallel, and keeps many connections open to the imagery servers. Some home routers and modems cannot track that many connections and drop the whole network rather than refusing new ones. `max` opens every connection XEarthLayer is designed for, `high` two thirds as many and `low` one third:
+
+| Limit | `max` | `high` | `low` |
+|-------|-------|--------|-------|
+| Imagery requests X-Plane is waiting on | 1024 | 683 | 342 |
+| Imagery requests for prefetch | 1024 | 683 | 342 |
+| Idle connections kept per imagery server | 1024 | 683 | 342 |
+| Package part downloads (`packages.concurrent_downloads` = 5) | 5 | 4 | 2 |
+
+| Level | For |
+|-------|-----|
+| `max` | Prosumer or enterprise network hardware (Ubiquiti, Cisco, Juniper, QNAP and the like) |
+| `high` (default) | Capable home routers (TP-Link, Netgear, Asus, Eero, Google, Wyze and the like) |
+| `low` | Older or low spec home routers with limited bandwidth |
+
+Lower levels load scenery more slowly, so tiles show their placeholder for longer when X-Plane needs many at once. If your network drops out while XEarthLayer is running, choose `low`. The setup wizard asks for this; a change takes effect the next time `xearthlayer run` starts, and for the package manager on its next download.
+
+**Example:**
+```ini
+[network]
+connections = high
+```
+
 ## Complete Example
 
 ```ini
@@ -606,6 +639,10 @@ brightness = 1.0
 [tui]
 ; Status pane symbols: auto, emoji or plain
 symbols = auto
+
+[network]
+; Network connections: max, high (two thirds) or low (one third)
+connections = high
 ```
 
 ## Config CLI Commands
@@ -721,6 +758,7 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `night.enabled` | `true`, `false` | Serve generated night lighting textures |
 | `night.brightness` | 0.5 to 1.5 | Overall lit brightness (development setting) |
 | `tui.symbols` | `auto`, `emoji`, `plain` | Status pane symbols (default `auto`) |
+| `network.connections` | `max`, `high`, `low` | Network connections to open (default `high`) |
 
 ## CLI Overrides
 

@@ -41,6 +41,8 @@ pub struct ConfigFile {
     pub night: NightSettings,
     /// Terminal dashboard settings
     pub tui: TuiSettings,
+    /// Network settings
+    pub network: NetworkSettings,
 }
 
 /// General application settings.
@@ -281,6 +283,15 @@ pub struct TuiSettings {
     /// Symbols on the Status pane: `auto` (default) uses emoji when the
     /// terminal can draw them, `emoji` and `plain` force one set.
     pub symbols: String,
+}
+
+/// Network settings (#367).
+#[derive(Debug, Clone)]
+pub struct NetworkSettings {
+    /// How many of XEarthLayer's usual connections to open: all of them,
+    /// two thirds or one third. Covers imagery downloads on both executor
+    /// lanes and package downloads.
+    pub connections: super::network::NetworkLevel,
 }
 
 /// FUSE filesystem settings for kernel background request limits.

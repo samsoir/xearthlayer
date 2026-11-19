@@ -36,7 +36,9 @@ pub use catalog::{ProviderCredential, ProviderEntry, PROVIDERS};
 pub use factory::{AsyncProviderFactory, AsyncProviderType, ProviderConfig, ProviderFactory};
 pub use go2::{AsyncGo2Provider, Go2Provider};
 pub use google::{AsyncGoogleMapsProvider, GoogleMapsProvider};
-pub use http::{AsyncHttpClient, AsyncReqwestClient, HttpClient, ReqwestClient};
+pub use http::{
+    pool_max_idle_per_host, AsyncHttpClient, AsyncReqwestClient, HttpClient, ReqwestClient,
+};
 pub use mapbox::{AsyncMapBoxProvider, MapBoxProvider};
 pub use types::{AsyncProvider, Provider, ProviderError};
 pub use usgs::{AsyncUsgsProvider, UsgsProvider};

@@ -946,6 +946,14 @@ disk cache. Priorities still order work inside a lane, but they no longer
 mediate between FUSE and prefetch, and there is no prefetch quota inside a shared
 pool (`max_prefetch_fraction` and `prefetch_in_flight` were removed).
 
+Each lane's HTTP semaphore holds `DEFAULT_MAX_CONCURRENT_HTTP` (1024) permits at
+the `network.connections` level (#367): all of them at `max`, two thirds at
+`high`, one third at `low`. The demand lane's arrives in
+`ServiceConfig::chunk_download_config`, the prefetch lane's through
+`LaneSizing::at_network_level`. The level scales only connections; the CPU,
+network-task and disk pools bound work on this host, not load on the user's
+router, and keep their sizes.
+
 **Admission gate.** `ExecutorConfig::admission_gate` is an optional
 `watch::Receiver<bool>`. While it reads `true`, the executor admits no queued
 job: new submissions go to `waiting_for_permit` and stay there. Jobs already

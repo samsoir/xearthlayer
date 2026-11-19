@@ -472,6 +472,19 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
         }
     }
 
+    // [network] section
+    if let Some(section) = ini.section(Some("network")) {
+        if let Some(v) = section.get("connections") {
+            config.network.connections =
+                v.parse().map_err(|reason| ConfigFileError::InvalidValue {
+                    section: "network".to_string(),
+                    key: "connections".to_string(),
+                    value: v.trim().to_string(),
+                    reason,
+                })?;
+        }
+    }
+
     apply_folds(ini, &mut config)?;
 
     Ok(config)
@@ -639,6 +652,57 @@ mod tests {
             ConfigFile::load_from(&config_path).unwrap().tui.symbols,
             "plain"
         );
+    }
+
+    #[test]
+    fn network_connections_round_trips_and_defaults_to_high() {
+        use crate::config::NetworkLevel;
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+        let mut config = ConfigFile::default();
+        assert_eq!(config.network.connections, NetworkLevel::High);
+        for level in NetworkLevel::ALL {
+            config.network.connections = level;
+            config.save_to(&config_path).unwrap();
+            assert_eq!(
+                ConfigFile::load_from(&config_path)
+                    .unwrap()
+                    .network
+                    .connections,
+                level
+            );
+        }
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains("[network]"), "{written}");
+        assert!(
+            written.contains("; How many network connections"),
+            "the key carries its help: {written}"
+        );
+    }
+
+    #[test]
+    fn network_connections_is_case_insensitive_and_rejects_unknown_values() {
+        use crate::config::NetworkLevel;
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.ini");
+        std::fs::write(&path, "[network]\nconnections = Low\n").unwrap();
+        assert_eq!(
+            ConfigFile::load_from(&path).unwrap().network.connections,
+            NetworkLevel::Low
+        );
+        std::fs::write(&path, "[network]\nconnections = medium\n").unwrap();
+        match ConfigFile::load_from(&path) {
+            Err(ConfigFileError::InvalidValue {
+                section,
+                key,
+                reason,
+                ..
+            }) => {
+                assert_eq!((section.as_str(), key.as_str()), ("network", "connections"));
+                assert_eq!(reason, "must be one of: max, high, low");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
     }
 
     #[test]

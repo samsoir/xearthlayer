@@ -74,6 +74,8 @@ pub struct RuntimeBuilder {
     /// `prefetch.capacity_share`: the prefetch lane's size relative to the
     /// demand lane. Clamped to its range when the lanes are sized.
     capacity_share: f64,
+    /// `network.connections`: scales the prefetch lane's HTTP permits (#367).
+    network_level: crate::config::NetworkLevel,
 }
 
 impl RuntimeBuilder {
@@ -101,6 +103,7 @@ impl RuntimeBuilder {
             metrics_client: None,
             download_config: DownloadConfig::default(),
             capacity_share: DEFAULT_PREFETCH_CAPACITY_SHARE,
+            network_level: crate::config::NetworkLevel::default(),
         }
     }
 
@@ -138,6 +141,18 @@ impl RuntimeBuilder {
     pub fn with_capacity_share(mut self, share: f64) -> Self {
         self.capacity_share = share;
         self
+    }
+
+    /// Sets `network.connections`, which scales the prefetch lane's HTTP
+    /// permits (#367). The demand lane's arrive scaled in the download config.
+    pub fn with_network_level(mut self, level: crate::config::NetworkLevel) -> Self {
+        self.network_level = level;
+        self
+    }
+
+    /// Both lanes' sizes: the configured share, then the network level.
+    fn lane_sizing(share: f64, level: crate::config::NetworkLevel) -> LaneSizing {
+        LaneSizing::from_configured_share(share).at_network_level(level)
     }
 
     /// The prefetch lane's download behaviour: the configured timeout and
@@ -200,7 +215,7 @@ impl RuntimeBuilder {
         // Create disk cache adapter
         let disk_cache = Arc::new(DiskCacheAdapter::new(cache_dir, &self.provider_name));
 
-        let sizing = LaneSizing::from_configured_share(self.capacity_share);
+        let sizing = Self::lane_sizing(self.capacity_share, self.network_level);
         let demand_factory = Self::create_factory_with_disk_cache(
             Arc::clone(&async_provider),
             Arc::clone(&self.encoder),
@@ -257,7 +272,7 @@ impl RuntimeBuilder {
             self.format,
         ));
 
-        let sizing = LaneSizing::from_configured_share(self.capacity_share);
+        let sizing = Self::lane_sizing(self.capacity_share, self.network_level);
         let demand_factory = Self::create_factory_without_disk_cache(
             Arc::clone(&async_provider),
             Arc::clone(&self.encoder),
@@ -389,7 +404,7 @@ impl RuntimeBuilder {
 
         let dds_disk_for_daemon = Arc::clone(&dds_disk_bridge);
 
-        let sizing = LaneSizing::from_configured_share(self.capacity_share);
+        let sizing = Self::lane_sizing(self.capacity_share, self.network_level);
         let demand_factory = Self::create_factory_with_bridges(
             Arc::clone(&async_provider),
             Arc::clone(&self.encoder),
@@ -540,6 +555,25 @@ mod tests {
         assert_eq!(
             builder.download_config.max_retries,
             DownloadConfig::default().max_retries
+        );
+    }
+
+    #[test]
+    fn the_network_level_sizes_the_prefetch_connections() {
+        use crate::config::NetworkLevel;
+        let builder = RuntimeBuilder::new("test", DdsFormat::BC1, create_test_encoder());
+        // Defaults to the config default, as the capacity share does.
+        assert_eq!(builder.network_level, NetworkLevel::High);
+        assert_eq!(
+            RuntimeBuilder::lane_sizing(builder.capacity_share, builder.network_level)
+                .prefetch_http_permits,
+            683
+        );
+        let builder = builder.with_network_level(NetworkLevel::Low);
+        assert_eq!(
+            RuntimeBuilder::lane_sizing(builder.capacity_share, builder.network_level)
+                .prefetch_http_permits,
+            342
         );
     }
 
