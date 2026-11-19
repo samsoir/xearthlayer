@@ -256,6 +256,10 @@ pub enum MountError {
 /// A platform backend that can mount the union filesystem.
 pub trait MountBackend: Send + Sync {
     /// Mount `fs` according to `req`, returning a handle to the live mount.
+    /// `fs` must arrive fully wired: past `Arc<dyn UnionFilesystem>` nothing
+    /// can add to it — the builders consume and rebuild a concrete type the
+    /// backend cannot name — so there is no post-wrap configuration path,
+    /// by design.
     fn mount(&self, fs: Arc<dyn UnionFilesystem>, req: MountRequest) -> MountFuture<'_>;
     /// Whether a stale mount at `mountpoint` was recovered. Synchronous, needs
     /// no runtime, and must not panic (see the panic-hook contract below).
@@ -323,6 +327,13 @@ use crate::vfs::{select_backend, UnionFilesystem, MountRequest, MountSession};
         let mount_result = runtime_handle.block_on(backend.mount(fs, request));
 
 ```
+
+`core` is finished work: every wiring — geo index, state observer, lit
+source, pinned-tile budget, metrics, timeout — is applied to the typed
+`OrthoUnionCore` before `Arc::new(core)`. Mount-time statements about that
+configuration (the pinned-budget capacity log, #236) are emitted at this
+wiring site too, while the typed core still exists; the mount call cannot
+log what the type makes unreachable.
 
 This keeps the `cfg` that decides the mount backend in one place.
 Backend specific parameters (fuse3's max_background and congestion_threshold)
