@@ -13,6 +13,25 @@ valid_product() {
     esac
 }
 
+# Prints the absolute path of the entitlements file a binary is signed with,
+# or nothing for a binary that needs none. Only the runtime has any: fuse3
+# dlopens macFUSE's MFMount.framework when it mounts, and the hardened
+# runtime's library validation refuses a framework signed by another team
+# ("mapping process and mapped file (non-platform) have different Team
+# IDs"), so a signed xearthlayer could not mount without
+# com.apple.security.cs.disable-library-validation. The publisher never
+# mounts and keeps library validation.
+entitlements_for() {
+    case "$(basename "$1")" in
+        xearthlayer)
+            local root
+            root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+            echo "$root/pkg/macos/xearthlayer.entitlements"
+            ;;
+        *) ;;
+    esac
+}
+
 # Reads `security find-identity -v` output on stdin and prints
 # "<sha1><TAB><name>" for the one valid identity of the given kind
 # ("Developer ID Application" or "Developer ID Installer"). Zero or several

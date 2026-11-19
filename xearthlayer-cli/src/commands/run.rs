@@ -182,6 +182,19 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
     // - MountManager with load monitor
     // - FUSE request analyzer (if prefetch enabled)
     // - APT aggregator (aircraft position provider)
+    // Signals stop the run cleanly (#314): SIGINT as before, and SIGTERM (a
+    // system shutdown, `kill`, a service manager) and SIGHUP (the terminal
+    // closed), which used to kill the process with the mount still up. Each
+    // raises the flag the dashboard and the headless loop poll. The watch
+    // starts before anything is mounted: started after the scenery index, a
+    // Ctrl+C in the seconds between the mount appearing and the front end
+    // starting got the default action, which killed the process and left the
+    // volume mounted with nothing serving it. A signal during startup is
+    // remembered, and the front end leaves at once and unmounts.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let watch = SignalWatch::start_for_shutdown(Arc::clone(&shutdown))
+        .map_err(|e| CliError::Config(format!("Failed to set signal handler: {}", e)))?;
+
     let mut orchestrator = ServiceOrchestrator::start(orch_config.clone())
         .map_err(|e| CliError::Config(format!("Failed to start service orchestrator: {}", e)))?;
 
@@ -246,14 +259,6 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
         );
         println!();
     }
-
-    // Signals stop the run cleanly (#314): SIGINT as before, and SIGTERM (a
-    // system shutdown, `kill`, a service manager) and SIGHUP (the terminal
-    // closed), which used to kill the process with the mount still up. Each
-    // raises the flag the dashboard and the headless loop poll.
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let watch = SignalWatch::start_for_shutdown(Arc::clone(&shutdown))
-        .map_err(|e| CliError::Config(format!("Failed to set signal handler: {}", e)))?;
 
     let front_end = if use_tui {
         // TUI path: Start dashboard in Loading state, mount with progress, then start prefetcher

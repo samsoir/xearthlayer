@@ -43,6 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The display server's refusal no longer bleeds into the dashboard** ([#358](https://github.com/samsoir/xearthlayer/issues/358)): In a shell with `DISPLAY` set but no usable `XAUTHORITY`, such as a tmux server older than the desktop session, `xearthlayer run` printed "Authorization required, but no authorization protocol specified" at launch and the line then corrupted the dashboard, and `xearthlayer diagnostics` printed it three times under its GPU section. The line is the X server's reason for refusing a connection, written by libxcb straight to the terminal; the connections came from the Vulkan stack during GPU enumeration (Mesa's device-select layer and the NVIDIA driver open the display when one is named), not from anything XEarthLayer asked for. XEarthLayer never presents to a display and chooses its own adapter, so it now removes `DISPLAY` and `WAYLAND_DISPLAY` from its own environment before anything else runs, which also spares enumeration the display round trips. Separately, while the dashboard is up, stderr is pointed at the flight log, so a warning from any library that writes to it, or a panic message, lands in the log instead of on the screen; the terminal gets it back when the dashboard closes.
 
+#### macOS
+
+- **Signed releases can mount through FSKit** ([#369](https://github.com/samsoir/xearthlayer/issues/369)): XEarthLayer's macOS releases are signed with Apple's hardened runtime, which by default refuses to load a library signed by another developer. Mounting through FSKit loads macFUSE's `MFMount.framework`, so a signed release could not mount at all. The error was `MFMount.framework could not be loaded (... have different Team IDs)`, and its hint wrongly suggested updating macFUSE. The `xearthlayer` binary is now signed with the one exception that allows the load, `com.apple.security.cs.disable-library-validation`. `xearthlayer-publish`, which never mounts, keeps the full protection.
+
+#### Stopping XEarthLayer
+
+- **Ctrl+C while `xearthlayer run` is starting no longer leaves the scenery mounted**: `run` only began listening for Ctrl+C, SIGTERM and SIGHUP once startup had finished, several seconds after the scenery appeared in X-Plane's Custom Scenery folder while the scenery index was built. A Ctrl+C in that window ended the process on the spot and left the mount behind with nothing serving it, on Linux and macOS. `run` now listens from the start: a signal during startup is remembered, and XEarthLayer unmounts and exits as soon as startup completes.
+- **Ctrl+C on macOS no longer leaves the scenery mounted** ([#369](https://github.com/samsoir/xearthlayer/issues/369)): With macFUSE's FSKit backend, Ctrl+C could interrupt the call that waits for X-Plane's next file request. XEarthLayer took the interruption for a failed read and stopped serving before it unmounted, logging `read from /dev/fuse failed Interrupted system call` and exiting with an error, which left a mount behind that nothing served. An interrupted wait is now resumed, so XEarthLayer unmounts and exits normally.
+
 ### Removed
 
 #### macOS

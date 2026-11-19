@@ -158,3 +158,20 @@ test_distribution_rejects_unknown_product() {
     render_distribution nope 1.0 >/dev/null 2>&1 || rc=$?
     assert_eq "$rc" 2
 }
+
+test_entitlements_for_the_runtime_is_the_library_validation_file() {
+    assert_eq "$(entitlements_for target/release/xearthlayer)" "$(cd "$SCRIPTS_DIR/../.." && pwd)/pkg/macos/xearthlayer.entitlements"
+}
+
+test_entitlements_for_the_publisher_is_none() {
+    assert_eq "$(entitlements_for target/release/xearthlayer-publish)" ""
+}
+
+test_the_runtime_entitlements_hold_only_disable_library_validation() {
+    local file keys
+    file="$(cd "$SCRIPTS_DIR/../.." && pwd)/pkg/macos/xearthlayer.entitlements"
+    [ -f "$file" ] || fail "missing $file"
+    keys=$(grep -o '<key>[^<]*</key>' "$file")
+    assert_eq "$keys" "<key>com.apple.security.cs.disable-library-validation</key>"
+    assert_contains "$(tr -d ' \t\n' <"$file")" "<key>com.apple.security.cs.disable-library-validation</key><true/>"
+}
