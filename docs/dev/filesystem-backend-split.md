@@ -419,6 +419,14 @@ pub trait UnionFilesystem: Send + Sync {
     /// for source-backed nodes.  Virtual textures have no source to date
     /// them — they stamp fresh timestamps per construction — so their
     /// agreement is on kind, size, permissions, and link count.
+    ///
+    /// For a source-backed node, `attrs` *is* the resolve-and-stat: union
+    /// index first, lazy source fallback second, then the stat — and a
+    /// failed stat answers `NotFound`, since a source that vanished
+    /// mid-flight reads as "nothing here", not as an I/O failure.  A
+    /// backend needing attributes for any reply — getattr, a readdirplus
+    /// upgrade — awaits `attrs(&node)` once and never resolves or stats
+    /// on its own side.
     fn attrs<'a>(
         &'a self,
         node: &'a FsNode,
