@@ -35,13 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### FUSE
 
-- **fuse3 is updated to 0.10.0** ([#155](https://github.com/samsoir/xearthlayer/issues/155)): XEarthLayer's fork of the fuse3 crate now follows the upstream 0.10.0 release, which includes the configurable FUSE kernel limits XEarthLayer contributed earlier this year. The fork is down to three macOS fixes that upstream has not taken yet. Nothing changes in how scenery is mounted or served.
+- **fuse3 is updated to 0.10.0** ([#155](https://github.com/samsoir/xearthlayer/issues/155)): XEarthLayer's fork of the fuse3 crate now follows the upstream 0.10.0 release, which includes the configurable FUSE kernel limits XEarthLayer contributed earlier this year. The fork now carries only macOS work that upstream has not taken yet: the transport for macFUSE's FSKit backend and the fixes it needed. Nothing changes in how scenery is mounted or served on Linux.
 
 ### Fixed
-
-#### Dashboard
-
-- **The running job count is no longer always 0** ([#368](https://github.com/samsoir/xearthlayer/issues/368)): The headless status line (`Tiles: N completed, M running`), the panic report and the telemetry summary showed no jobs at work even during a scene load, because no job ever reported that it had started. The executor now reports each job when it starts and when it leaves, done, failed or killed, so the count is the number of tiles being generated right now, in the demand and prefetch lanes together. Jobs still queued or held back while X-Plane is waiting are not counted. The label reads "running" instead of "active".
 
 #### Packaging
 
@@ -49,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Dashboard
 
+- **The running job count is no longer always 0** ([#368](https://github.com/samsoir/xearthlayer/issues/368)): The headless status line (`Tiles: N completed, M running`), the panic report and the telemetry summary showed no jobs at work even during a scene load, because no job ever reported that it had started. The executor now reports each job when it starts and when it leaves, done, failed or killed, so the count is the number of tiles being generated right now, in the demand and prefetch lanes together. Jobs still queued or held back while X-Plane is waiting are not counted. The label reads "running" instead of "active".
 - **The display server's refusal no longer bleeds into the dashboard** ([#358](https://github.com/samsoir/xearthlayer/issues/358)): In a shell with `DISPLAY` set but no usable `XAUTHORITY`, such as a tmux server older than the desktop session, `xearthlayer run` printed "Authorization required, but no authorization protocol specified" at launch and the line then corrupted the dashboard, and `xearthlayer diagnostics` printed it three times under its GPU section. The line is the X server's reason for refusing a connection, written by libxcb straight to the terminal; the connections came from the Vulkan stack during GPU enumeration (Mesa's device-select layer and the NVIDIA driver open the display when one is named), not from anything XEarthLayer asked for. XEarthLayer never presents to a display and chooses its own adapter, so it now removes `DISPLAY` and `WAYLAND_DISPLAY` from its own environment before anything else runs, which also spares enumeration the display round trips. Separately, while the dashboard is up, stderr is pointed at the flight log, so a warning from any library that writes to it, or a panic message, lands in the log instead of on the screen; the terminal gets it back when the dashboard closes.
 
 #### macOS
